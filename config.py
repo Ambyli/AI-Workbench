@@ -53,6 +53,7 @@ BROWSER_DEBUG_PORT      = int(os.environ.get("BROWSER_DEBUG_PORT", "9222"))
 # Example: C:\ollama\llama-server.exe --model ~/model.gguf --port 8001
 LLAMA_SERVER_CMD = os.environ.get("LLAMA_SERVER_CMD", "")
 LLM_LOG_MAX_LINES = int(os.environ.get("LLM_LOG_MAX_LINES", "200"))
+LOCAL_LLM_URL = os.environ.get("LOCAL_LLM_URL", "http://localhost:8001")
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 

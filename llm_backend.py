@@ -15,18 +15,23 @@ import threading
 from pathlib import Path
 from typing import Callable
 
+import config
 from logging_setup import log
 
 _CLAUDE_SETTINGS = Path.home() / ".claude" / "settings.json"
 _CLAUDE_JSON = Path.home() / ".claude.json"
 
-_LOCAL_LLM_SETTINGS_KEYS = {
-    "claudeCode.disableLoginPrompt": True,
-    "env": {
-        "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
-        "ANTHROPIC_BASE_URL": "http://localhost:8001",
-    },
-}
+
+def _local_llm_settings_keys() -> dict:
+    return {
+        "claudeCode.disableLoginPrompt": True,
+        "env": {
+            "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
+            "ANTHROPIC_BASE_URL": config.LOCAL_LLM_URL,
+        },
+    }
+
+
 _LOCAL_LLM_JSON_KEYS = {
     "primaryApiKey": "sk-dummy-key",
     "hasCompletedOnboarding": True,
@@ -51,7 +56,7 @@ def _write_json(path: Path, data: dict):
 def is_local_llm_active() -> bool:
     """Return True if the local LLM overrides are currently applied."""
     s = _read_json(_CLAUDE_SETTINGS)
-    return s.get("env", {}).get("ANTHROPIC_BASE_URL") == "http://localhost:8001"
+    return s.get("env", {}).get("ANTHROPIC_BASE_URL") == config.LOCAL_LLM_URL
 
 
 def activate_local_llm():
@@ -59,7 +64,7 @@ def activate_local_llm():
     s = _read_json(_CLAUDE_SETTINGS)
     s["claudeCode.disableLoginPrompt"] = True
     env = s.get("env", {})
-    env.update(_LOCAL_LLM_SETTINGS_KEYS["env"])
+    env.update(_local_llm_settings_keys()["env"])
     s["env"] = env
     _write_json(_CLAUDE_SETTINGS, s)
 

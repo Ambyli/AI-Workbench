@@ -49,6 +49,8 @@ def start_chrome(
         f"--user-data-dir={profile_dir}",
         "--no-first-run",
         "--no-default-browser-check",
+        "--no-restore-last-session",
+        "--disable-session-crashed-bubble",
     ]
     if headless:
         args += [

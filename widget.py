@@ -36,6 +36,7 @@ class ClaudeUsageWidget:
             console_available=self._fetcher is not None,
             on_link_browser=self._link_browser,
             on_go_headless=self._go_headless,
+            on_go_visible=self._go_visible,
         )
 
         try:
@@ -122,6 +123,13 @@ class ClaudeUsageWidget:
         if self._fetcher is not None:
             self._fetcher.go_headless()
         log.debug("Finished ClaudeUsageWidget._go_headless")
+
+    def _go_visible(self):
+        """Called when the user clicks 'Go Visible' in the popup."""
+        log.debug("Starting ClaudeUsageWidget._go_visible")
+        if self._fetcher is not None:
+            self._fetcher.go_visible()
+        log.debug("Finished ClaudeUsageWidget._go_visible")
 
     def _quit(self, icon, item):
         log.debug("Starting ClaudeUsageWidget._quit")

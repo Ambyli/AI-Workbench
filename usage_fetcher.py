@@ -146,6 +146,21 @@ class BrowserLinker:
         self._reload_requested.set()
         log.debug("Finished BrowserLinker.fetch_now")
 
+    def _kill_chrome(self, label: str = ""):
+        """Terminate self._proc and wait for it to exit, force-killing if needed."""
+        if self._proc is None:
+            return
+        proc, self._proc = self._proc, None
+        try:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except Exception:
+                proc.kill()
+                proc.wait(timeout=2)
+        except Exception as exc:
+            log.warning("BrowserLinker._kill_chrome%s: %s", f" ({label})" if label else "", exc)
+
     def go_headless(self):
         """Terminate the current Chrome process and relaunch it headlessly.
         Requires a prior successful fetch (sentinel must exist)."""
@@ -156,13 +171,7 @@ class BrowserLinker:
         if not self._chrome_path:
             log.warning("BrowserLinker.go_headless: chrome path not stored")
             return
-        if self._proc is not None:
-            try:
-                self._proc.terminate()
-            except Exception as exc:
-                log.warning("BrowserLinker.go_headless: error terminating Chrome: %s", exc)
-            self._proc = None
-        time.sleep(1)  # let Chrome fully exit before reopening the profile
+        self._kill_chrome("go_headless")
         self._headless = True
         self._proc = start_chrome(
             self._chrome_path,
@@ -173,15 +182,27 @@ class BrowserLinker:
         )
         log.debug("BrowserLinker.go_headless: headless Chrome started (pid=%s)", self._proc.pid)
 
+    def go_visible(self):
+        """Terminate the current headless Chrome process and relaunch it visibly."""
+        log.debug("Starting BrowserLinker.go_visible")
+        if not self._chrome_path:
+            log.warning("BrowserLinker.go_visible: chrome path not stored")
+            return
+        self._kill_chrome("go_visible")
+        self._headless = False
+        self._proc = start_chrome(
+            self._chrome_path,
+            headless=False,
+            debug_port=BROWSER_DEBUG_PORT,
+            profile_dir=BROWSER_PROFILE_DIR,
+            target_url=self.USAGE_URL,
+        )
+        log.debug("BrowserLinker.go_visible: visible Chrome started (pid=%s)", self._proc.pid)
+
     def quit(self):
         """Terminate the managed Chrome process if one was started."""
         log.debug("Starting BrowserLinker.quit")
-        if self._proc is not None:
-            try:
-                self._proc.terminate()
-            except Exception as exc:
-                log.warning("BrowserLinker.quit: error terminating Chrome: %s", exc)
-            self._proc = None
+        self._kill_chrome("quit")
         log.debug("Finished BrowserLinker.quit")
 
     def get_state(self) -> dict:

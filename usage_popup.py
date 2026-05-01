@@ -38,7 +38,7 @@ class UsagePopup:
     GREEN = "#50d490"
 
     def __init__(
-        self, console_available: bool = False, on_link_browser=None, on_go_headless=None
+        self, console_available: bool = False, on_link_browser=None, on_go_headless=None, on_go_visible=None
     ):
         log.debug(
             "Starting UsagePopup.__init__ console_available=%s", console_available
@@ -47,6 +47,7 @@ class UsagePopup:
         self._on_refresh = None
         self._on_link_browser = on_link_browser
         self._on_go_headless = on_go_headless
+        self._on_go_visible = on_go_visible
         self._next_refresh_at: datetime | None = None
         self._refreshing: bool = False
         self._cs_fetched_at: datetime | None = None
@@ -844,8 +845,12 @@ class UsagePopup:
 
     def _on_go_headless_click(self):
         log.debug("Starting UsagePopup._on_go_headless_click")
-        if self._on_go_headless:
-            threading.Thread(target=self._on_go_headless, daemon=True).start()
+        if self._cs_headless_btn and self._cs_headless_btn.cget("text") == "Go Visible":
+            if self._on_go_visible:
+                threading.Thread(target=self._on_go_visible, daemon=True).start()
+        else:
+            if self._on_go_headless:
+                threading.Thread(target=self._on_go_headless, daemon=True).start()
         log.debug("Finished UsagePopup._on_go_headless_click")
 
     # ── Account-stats update (called from BrowserLinker thread) ──────────────
@@ -910,11 +915,14 @@ class UsagePopup:
         # Each branch controls which frame is visible and what the status
         # line (small grey text at the top of the stats frame) shows.
 
-        def _show_headless_btn(visible: bool):
+        def _show_headless_btn(visible: bool, is_headless: bool = False):
             if self._cs_headless_btn is None:
                 return
+            label = "Go Visible" if is_headless else "Go Headless"
+            if self._cs_headless_btn.cget("text") != label:
+                self._cs_headless_btn.config(text=label)
             if visible and not self._cs_headless_btn.winfo_ismapped():
-                self._cs_headless_btn.pack(anchor="w", padx=16, pady=(6, 0))
+                self._cs_headless_btn.pack(anchor="center", pady=(6, 10))
             elif not visible and self._cs_headless_btn.winfo_ismapped():
                 self._cs_headless_btn.pack_forget()
 
@@ -1037,7 +1045,7 @@ class UsagePopup:
 
                 rs = _reset_str(data.get("period_end"))
                 v["cs_reset"].set(f"  {rs}" if rs else "")
-            _show_headless_btn(not state.get("headless", False))
+            _show_headless_btn(True, is_headless=state.get("headless", False))
         log.debug("Finished UsagePopup._apply_console")
 
     # ── Countdown tick ────────────────────────────────────────────────────────

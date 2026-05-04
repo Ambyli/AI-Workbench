@@ -63,6 +63,7 @@ LLAMA_SERVER_CMD = os.environ.get("LLAMA_SERVER_CMD", "")
 LLM_LOG_MAX_LINES = int(os.environ.get("LLM_LOG_MAX_LINES", "200"))
 LLM_URL = os.environ.get("LLM_URL", "http://localhost:8001")
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "sk-no-key-required")
+LLM_MODEL = os.environ.get("LLM_MODEL", "")
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 

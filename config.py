@@ -31,20 +31,28 @@ CLAUDE_DIR = os.path.join(os.path.expanduser("~"), ".claude", "projects")
 # (case-insensitive). Loaded from INCLUDE_PATHS in .env. Empty list = include
 # everything.
 _raw_paths = os.environ.get("INCLUDE_PATHS", "")
-INCLUDE_PATHS: list[str] = [p.strip().lower() for p in _raw_paths.split(",") if p.strip()]
+INCLUDE_PATHS: list[str] = [
+    p.strip().lower() for p in _raw_paths.split(",") if p.strip()
+]
 
 # Days excluded from limit averaging (0=Mon … 6=Sun). Defaults to Sat+Sun.
 _raw_exclude = os.environ.get("EXCLUDE_WEEKDAYS", "5,6")
-EXCLUDE_WEEKDAYS: set[int] = {int(d.strip()) for d in _raw_exclude.split(",") if d.strip()}
+EXCLUDE_WEEKDAYS: set[int] = {
+    int(d.strip()) for d in _raw_exclude.split(",") if d.strip()
+}
 
 # ── Browser linker (CDP) ──────────────────────────────────────────────────────
 
 # Set CONSOLE_FETCHER_ENABLED=true to enable the "Account stats" section.
 # The user clicks "Link Browser" to open Chrome; no headless mode, no Selenium.
-CONSOLE_FETCHER_ENABLED = os.environ.get("CONSOLE_FETCHER_ENABLED", "false").lower() == "true"
+CONSOLE_FETCHER_ENABLED = (
+    os.environ.get("CONSOLE_FETCHER_ENABLED", "false").lower() == "true"
+)
 CONSOLE_REFRESH_MINUTES = int(os.environ.get("CONSOLE_REFRESH_MINUTES", "30"))
-BROWSER_PROFILE_DIR     = os.path.join(os.path.expanduser("~"), ".claude_widget", "chrome_profile")
-BROWSER_DEBUG_PORT      = int(os.environ.get("BROWSER_DEBUG_PORT", "9222"))
+BROWSER_PROFILE_DIR = os.path.join(
+    os.path.expanduser("~"), ".claude_widget", "chrome_profile"
+)
+BROWSER_DEBUG_PORT = int(os.environ.get("BROWSER_DEBUG_PORT", "9222"))
 
 # ── Local LLM server (llama-server / ollama) ──────────────────────────────────
 
@@ -53,7 +61,8 @@ BROWSER_DEBUG_PORT      = int(os.environ.get("BROWSER_DEBUG_PORT", "9222"))
 # Example: C:\ollama\llama-server.exe --model ~/model.gguf --port 8001
 LLAMA_SERVER_CMD = os.environ.get("LLAMA_SERVER_CMD", "")
 LLM_LOG_MAX_LINES = int(os.environ.get("LLM_LOG_MAX_LINES", "200"))
-LOCAL_LLM_URL = os.environ.get("LOCAL_LLM_URL", "http://localhost:8001")
+LLM_URL = os.environ.get("LLM_URL", "http://localhost:8001")
+LLM_API_KEY = os.environ.get("LLM_API_KEY", "sk-no-key-required")
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 

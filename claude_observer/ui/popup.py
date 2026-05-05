@@ -365,23 +365,24 @@ class UsagePopup:
                 fg="#606070",
                 bg=self.BG,
             ).pack(anchor="w", padx=20, pady=(4, 0))
-            # Go Headless button — only shown when status is ok
             self._cs_headless_btn = tk.Button(
                 self._cs_stats_frame,
                 text="Go Headless",
                 command=self._on_go_headless_click,
                 font=("Segoe UI", 8),
                 bg="#2a2a36",
-                fg="#808090",
+                fg="#505060",
                 relief="flat",
                 bd=0,
                 padx=10,
                 pady=3,
                 activebackground="#3a3a48",
                 activeforeground="#c0c0d0",
-                cursor="hand2",
+                disabledforeground="#505060",
+                cursor="",
+                state="disabled",
             )
-            # (packed/hidden dynamically in _apply_console)
+            self._cs_headless_btn.pack(anchor="center", pady=(6, 10))
             tk.Frame(self._cs_stats_frame, height=6, bg=self.BG).pack()
 
         # ── LLM Backend toggle ──
@@ -858,12 +859,15 @@ class UsagePopup:
 
     def _on_go_headless_click(self):
         log.debug("Starting UsagePopup._on_go_headless_click")
-        if self._cs_headless_btn and self._cs_headless_btn.cget("text") == "Go Visible":
-            if self._on_go_visible:
-                threading.Thread(target=self._on_go_visible, daemon=True).start()
-        else:
-            if self._on_go_headless:
-                threading.Thread(target=self._on_go_headless, daemon=True).start()
+        btn = self._cs_headless_btn
+        if btn is None:
+            return
+        going_visible = btn.cget("text") == "Go Visible"
+        callback = self._on_go_visible if going_visible else self._on_go_headless
+        if not callback:
+            return
+        btn.config(state="disabled", fg="#505060", cursor="")
+        threading.Thread(target=callback, daemon=True).start()
         log.debug("Finished UsagePopup._on_go_headless_click")
 
     # ── Account-stats update (called from BrowserLinker thread) ──────────────
@@ -917,36 +921,34 @@ class UsagePopup:
             if self._cs_w_bar:
                 self._draw_bar(self._cs_w_bar, 0, 0)
 
-        def _show_headless_btn(visible: bool, is_headless: bool = False):
-            if self._cs_headless_btn is None:
+        def _update_headless_btn(enabled: bool, is_headless: bool = False):
+            btn = self._cs_headless_btn
+            if btn is None:
                 return
-            label = "Go Visible" if is_headless else "Go Headless"
-            if self._cs_headless_btn.cget("text") != label:
-                self._cs_headless_btn.config(text=label)
-            if visible and not self._cs_headless_btn.winfo_ismapped():
-                self._cs_headless_btn.pack(anchor="center", pady=(6, 10))
-            elif not visible and self._cs_headless_btn.winfo_ismapped():
-                self._cs_headless_btn.pack_forget()
+            if enabled:
+                label = "Go Visible" if is_headless else "Go Headless"
+                btn.config(text=label, state="normal", fg="#808090", cursor="hand2")
+            else:
+                btn.config(state="disabled", fg="#505060", cursor="")
 
         if status == "unlinked":
             _show_link_frame()
-            _show_headless_btn(False)
             return
         elif status == "loading":
             _show_stats_frame()
             v["cs_status"].set("Loading…")
             _clear()
-            _show_headless_btn(False)
+            _update_headless_btn(False)
         elif status == "waiting_login":
             _show_stats_frame()
             v["cs_status"].set("Waiting for login — check Chrome window…")
             _clear()
-            _show_headless_btn(False)
+            _update_headless_btn(False)
         elif status == "error":
             _show_stats_frame()
             short = (error[:60] + "…") if len(error) > 60 else error
             v["cs_status"].set(f"Error: {short}")
-            _show_headless_btn(False)
+            _update_headless_btn(False)
         elif status == "ok" and data:
             _show_stats_frame()
             if fetched_at:
@@ -1034,7 +1036,7 @@ class UsagePopup:
 
                 rs = _reset_str(data.get("period_end"))
                 v["cs_reset"].set(f"  {rs}" if rs else "")
-            _show_headless_btn(True, is_headless=state.get("headless", False))
+            _update_headless_btn(True, is_headless=state.get("headless", False))
         log.debug("Finished UsagePopup._apply_console")
 
     # ── Countdown tick ────────────────────────────────────────────────────────

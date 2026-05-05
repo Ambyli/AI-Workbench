@@ -1,18 +1,13 @@
-.PHONY: run start stop down logs
+DC ?= docker compose -f docker-compose.yml
+UP_FLAGS ?= -d --remove-orphans
 
-CONTAINER_ID_FILE := .container_id
-
-run:
-	./scripts/launch_unsloth.sh | tee $(CONTAINER_ID_FILE)
-
-start:
-	docker start $$(cat $(CONTAINER_ID_FILE))
-
-stop:
-	docker stop $$(cat $(CONTAINER_ID_FILE))
-
+up:
+	$(DC) up $(UP_FLAGS)
 down:
-	docker stop $$(cat $(CONTAINER_ID_FILE)) && docker rm $$(cat $(CONTAINER_ID_FILE)) && rm -f $(CONTAINER_ID_FILE)
-
+	$(DC) stop
+clean:
+	$(DC) down --volumes --remove-orphans
 logs:
-	docker logs -f $$(cat $(CONTAINER_ID_FILE))
+	$(DC) logs -f
+
+.PHONY: run start stop down logs

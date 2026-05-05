@@ -222,7 +222,7 @@ Because `navigator.webdriver` is not set and no ChromeDriver process is involved
 
 ### Refresh interval
 
-Account stats refresh every **30 minutes** by default, independently of the 5-minute local file refresh. Configure with `CONSOLE_REFRESH_MINUTES` in `.env`.
+Account stats refresh runs whenever the fetcher reconnects or the app restarts.
 
 ---
 
@@ -302,49 +302,23 @@ HKCU\Software\Microsoft\Windows\CurrentVersion\Run
 
 ## Configuration
 
-Settings live in `.env` in the same directory as the script:
+All settings live in `config.json` in the project root. Edit the file directly or open the built-in Settings window (right-click the tray icon → **Settings…**). Changes take effect immediately — no restart required.
 
-```env
-# Full command used to launch llama-server (required for the Launch Server button).
-# Split on whitespace and passed directly to the OS — no shell interpolation.
-LLAMA_SERVER_CMD=C:\path\to\llama-server.exe --model C:\path\to\model.gguf --alias "unsloth/Qwen3.5-4B" --temp 0.6 --top-p 0.95 --top-k 20 --min-p 0.00 --port 8001 --kv-unified --cache-type-k q8_0 --cache-type-v q8_0 --flash-attn on --fit on --ctx-size 131072
+| Key | Default | Description |
+|---|---|---|
+| `DEBUG_LOGGING` | `false` | Write DEBUG-level entries to the log file |
+| `REFRESH_INTERVAL_SECONDS` | `300` | Seconds between local token-stat refreshes |
+| `INCLUDE_PATHS` | _(empty)_ | Comma-separated path prefixes to count; empty = all sessions |
+| `EXCLUDE_WEEKDAYS` | `"5,6"` | Weekday numbers excluded from rolling averages (0=Mon, 6=Sun) |
+| `CONSOLE_FETCHER_ENABLED` | `false` | Scrape account stats from claude.ai via CDP |
+| `BROWSER_DEBUG_PORT` | `9222` | Chrome remote-debugging port; change if another process owns 9222 |
+| `LLM_URL` | `"http://localhost:8001"` | Base URL of local llama-server / Ollama |
+| `LLM_API_KEY` | `"sk-no-key-required"` | API key sent to the local server; most servers accept any value |
+| `LLM_MODEL` | _(empty)_ | Model alias passed to Claude Code; must match `--alias` on llama-server |
+| `LLM_LOG_MAX_LINES` | `200` | Max lines kept in the server-output log box |
+| `LLAMA_SERVER_CMD` | _(empty)_ | Full shell command to launch llama-server |
 
-# Maximum lines kept in the LLM Backend server log box (oldest removed first). Default: 200.
-LLM_LOG_MAX_LINES=200
-
-# API key passed to the local LLM server as ANTHROPIC_API_KEY. Default: sk-no-key-required.
-# Most local servers accept any non-empty value.
-LLM_API_KEY=sk-no-key-required
-
-# Model name passed to Claude Code as ANTHROPIC_MODEL when local LLM is active.
-# Must match the --alias value used when launching llama-server.
-# Leave blank to let Claude Code use its default.
-LLM_MODEL=unsloth/Qwen3.5-4B
-
-# Comma-separated path prefixes (case-insensitive).
-# Only sessions whose working directory starts with one of these are counted.
-# Leave blank to include all sessions.
-INCLUDE_PATHS=C:\Users\username\projects\work
-
-# Comma-separated weekday numbers to exclude from limit averaging.
-# 0=Monday, 6=Sunday. These days still appear in totals; they are only
-# excluded from the rolling average baseline.
-# Default: 5,6 (Saturday and Sunday)
-EXCLUDE_WEEKDAYS=5,6
-
-# How often to re-fetch account stats from claude.ai (minutes). Default: 30.
-# Has no effect if requests/websocket-client are not installed.
-CONSOLE_REFRESH_MINUTES=30
-
-# Chrome remote debugging port used by the browser link. Default: 9222.
-# Change this if another process is already using port 9222.
-BROWSER_DEBUG_PORT=9222
-
-# Alternative Chrome path as a last resort. Leave empty to use the default paths.
-# Used in chrome_launcher.py CHROME_PATHS list.
-# Example: C:\Program Files\Google\Chrome Stable\Application\chrome.exe
-CHROME_PATHS_VAR=
-```
+> **`CHROME_PATHS_VAR`** — set as a system environment variable (not in `config.json`) to supply an alternative Chrome executable path. Leave unset to use the built-in defaults.
 
 ### Account filtering
 

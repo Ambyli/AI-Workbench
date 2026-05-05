@@ -16,11 +16,11 @@ UsagePopup(console_available)
 
 import threading
 import tkinter as tk
-from tkinter import ttk
 from datetime import date, datetime, timedelta
 
 from claude_observer.logging_setup import log
 from claude_observer.ui import state as ui_state
+from claude_observer.ui.scrollbar import make_scrollbar
 from claude_observer.llm import backend as llm_backend
 from claude_observer import config
 
@@ -463,7 +463,7 @@ class UsagePopup:
                     ui_state.save(self._ui_state)
                 # First launch — apply saved position if present (overrides taskbar snap)
                 elif self._launch_pos is None:
-                    sx, sy = self._ui_state["window_x"], self._ui_state["window_y"]
+                    sx, sy = self._ui_state.get("window_x"), self._ui_state.get("window_y")
                     if sx is not None and sy is not None:
                         self._win.geometry(f"300x{h}+{sx}+{sy}")
                         self._launch_pos = (sx, sy)
@@ -625,27 +625,7 @@ class UsagePopup:
         # Scrollable log box for server output
         log_frame = tk.Frame(parent, bg=self.BG)
         log_frame.pack(fill="x", padx=16, pady=(0, 8))
-        style = ttk.Style()
-        style.theme_use("default")
-        style.configure(
-            "LLMLog.Vertical.TScrollbar",
-            troughcolor="#13131a",
-            background="#44445a",
-            bordercolor="#13131a",
-            arrowcolor="#13131a",
-            relief="flat",
-            borderwidth=0,
-            padding=0,
-            width=6,
-            arrowsize=0,
-        )
-        style.map(
-            "LLMLog.Vertical.TScrollbar",
-            background=[("active", "#6060a0"), ("!active", "#44445a")],
-        )
-        scrollbar = ttk.Scrollbar(
-            log_frame, orient="vertical", style="LLMLog.Vertical.TScrollbar"
-        )
+        scrollbar = make_scrollbar(log_frame)
         self._server_log = tk.Text(
             log_frame,
             height=6,

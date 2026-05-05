@@ -8,12 +8,12 @@ other module so that all components share the same handler configuration.
 import logging
 from pathlib import Path
 
-from claude_observer.config import DEBUG_LOGGING
+from claude_observer import config as _config
 
 _log_path    = Path(__file__).parent.parent / "claude_usage_widget.log"
 _log_path.unlink(missing_ok=True)
-_file_level  = logging.DEBUG if DEBUG_LOGGING else logging.INFO
-_cons_level  = logging.DEBUG if DEBUG_LOGGING else logging.WARNING
+_file_level  = logging.DEBUG if _config.DEBUG_LOGGING else logging.INFO
+_cons_level  = logging.DEBUG if _config.DEBUG_LOGGING else logging.WARNING
 
 logging.basicConfig(
     level=logging.DEBUG,

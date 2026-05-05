@@ -17,7 +17,7 @@ import os
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 
-from claude_observer.config import CLAUDE_DIR, INCLUDE_PATHS, EXCLUDE_WEEKDAYS
+from claude_observer import config
 from claude_observer.logging_setup import log
 
 
@@ -39,7 +39,7 @@ def _build_daily_totals(since: date) -> tuple[dict, dict | None, dict]:
     project_today: dict = defaultdict(lambda: [0, 0])
     project_cwds: dict[str, str] = {}
 
-    for project in os.scandir(CLAUDE_DIR):
+    for project in os.scandir(config.CLAUDE_DIR):
         if not project.is_dir():
             continue
         for entry in os.scandir(project.path):
@@ -56,8 +56,8 @@ def _build_daily_totals(since: date) -> tuple[dict, dict | None, dict]:
                         if not usage or not usage.get("output_tokens"):
                             continue
                         cwd = obj.get("cwd", "")
-                        if INCLUDE_PATHS:
-                            if not any(cwd.lower().startswith(p) for p in INCLUDE_PATHS):
+                        if config.INCLUDE_PATHS:
+                            if not any(cwd.lower().startswith(p) for p in config.INCLUDE_PATHS):
                                 continue
                         ts_str = obj.get("timestamp", "")
                         if not ts_str:
@@ -141,7 +141,7 @@ def get_usage_summary() -> dict:
     prev_7_days    = [
         (yesterday - timedelta(days=i), _day_total(totals, yesterday - timedelta(days=i)))
         for i in range(7)
-        if (yesterday - timedelta(days=i)).weekday() not in EXCLUDE_WEEKDAYS
+        if (yesterday - timedelta(days=i)).weekday() not in config.EXCLUDE_WEEKDAYS
     ]
     days_with_data = [t for _, t in prev_7_days if t > 0]
     daily_limit    = int(sum(days_with_data) / len(days_with_data)) if days_with_data else 0
@@ -153,7 +153,7 @@ def get_usage_summary() -> dict:
         return sum(
             _day_total(totals, mon + timedelta(days=i))
             for i in range(7)
-            if (mon + timedelta(days=i)).weekday() not in EXCLUDE_WEEKDAYS
+            if (mon + timedelta(days=i)).weekday() not in config.EXCLUDE_WEEKDAYS
         )
 
     prev_7_cal_weeks    = [_cal_week_total(last_week_monday - timedelta(weeks=i)) for i in range(7)]

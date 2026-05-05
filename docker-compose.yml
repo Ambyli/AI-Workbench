@@ -1,0 +1,28 @@
+version: "3.9"
+
+services:
+  unsloth:
+    image: unsloth/unsloth
+    container_name: unsloth
+    restart: unless-stopped
+
+    environment:
+      - JUPYTER_PASSWORD=mypassword
+
+    ports:
+      - "8888:8888"
+      - "8000:8000"
+      - "2222:22"
+
+    volumes:
+      - ./work:/workspace/work
+
+    runtime: nvidia
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

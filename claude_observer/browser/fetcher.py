@@ -22,11 +22,7 @@ import threading
 import time
 from datetime import datetime
 
-from claude_observer.config import (
-    BROWSER_DEBUG_PORT,
-    BROWSER_PROFILE_DIR,
-    DEBUG_LOGGING,
-)
+from claude_observer import config
 from claude_observer.logging_setup import log
 
 from claude_observer.browser.cdp_client import run_cdp_session
@@ -68,7 +64,7 @@ class BrowserLinker:
     @property
     def _interceptor_script(self) -> str:
         """Returns the interceptor JS prefixed with the DEBUG_LOGGING constant."""
-        flag = "true" if DEBUG_LOGGING else "false"
+        flag = "true" if config.DEBUG_LOGGING else "false"
         return f"const DEBUG_LOGGING = {flag};\n" + self._INTERCEPTOR_JS
 
     def __init__(self):
@@ -117,20 +113,20 @@ class BrowserLinker:
             self._notify()
             return
 
-        os.makedirs(BROWSER_PROFILE_DIR, exist_ok=True)
+        os.makedirs(config.BROWSER_PROFILE_DIR, exist_ok=True)
         for lf in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
             try:
-                os.remove(os.path.join(BROWSER_PROFILE_DIR, lf))
+                os.remove(os.path.join(config.BROWSER_PROFILE_DIR, lf))
             except FileNotFoundError:
                 pass
 
         self._chrome_path = chrome
-        self._headless = session_exists(BROWSER_PROFILE_DIR)
+        self._headless = session_exists(config.BROWSER_PROFILE_DIR)
         self._proc = start_chrome(
             chrome,
             headless=self._headless,
-            debug_port=BROWSER_DEBUG_PORT,
-            profile_dir=BROWSER_PROFILE_DIR,
+            debug_port=config.BROWSER_DEBUG_PORT,
+            profile_dir=config.BROWSER_PROFILE_DIR,
             target_url=self.USAGE_URL,
         )
         log.debug("BrowserLinker.launch: Chrome started (pid=%s)", self._proc.pid)
@@ -165,7 +161,7 @@ class BrowserLinker:
         """Terminate the current Chrome process and relaunch it headlessly.
         Requires a prior successful fetch (sentinel must exist)."""
         log.debug("Starting BrowserLinker.go_headless")
-        if not session_exists(BROWSER_PROFILE_DIR):
+        if not session_exists(config.BROWSER_PROFILE_DIR):
             log.warning("BrowserLinker.go_headless: no session sentinel — cannot go headless")
             return
         if not self._chrome_path:
@@ -176,8 +172,8 @@ class BrowserLinker:
         self._proc = start_chrome(
             self._chrome_path,
             headless=True,
-            debug_port=BROWSER_DEBUG_PORT,
-            profile_dir=BROWSER_PROFILE_DIR,
+            debug_port=config.BROWSER_DEBUG_PORT,
+            profile_dir=config.BROWSER_PROFILE_DIR,
             target_url=self.USAGE_URL,
         )
         log.debug("BrowserLinker.go_headless: headless Chrome started (pid=%s)", self._proc.pid)
@@ -193,8 +189,8 @@ class BrowserLinker:
         self._proc = start_chrome(
             self._chrome_path,
             headless=False,
-            debug_port=BROWSER_DEBUG_PORT,
-            profile_dir=BROWSER_PROFILE_DIR,
+            debug_port=config.BROWSER_DEBUG_PORT,
+            profile_dir=config.BROWSER_PROFILE_DIR,
             target_url=self.USAGE_URL,
         )
         log.debug("BrowserLinker.go_visible: visible Chrome started (pid=%s)", self._proc.pid)
@@ -228,7 +224,7 @@ class BrowserLinker:
             self._notify()
             try:
                 run_cdp_session(
-                    debug_port=BROWSER_DEBUG_PORT,
+                    debug_port=config.BROWSER_DEBUG_PORT,
                     interceptor_script=self._interceptor_script,
                     parse_fn=parse_response,
                     on_data=self._on_data,
@@ -243,11 +239,11 @@ class BrowserLinker:
                 # Login timed out — if we were running headless the session
                 # expired. Clear the sentinel and relaunch visibly so the user
                 # can log in again.
-                if session_exists(BROWSER_PROFILE_DIR) and self._chrome_path:
+                if session_exists(config.BROWSER_PROFILE_DIR) and self._chrome_path:
                     log.warning(
                         "BrowserLinker._loop: headless session expired, relaunching visibly"
                     )
-                    clear_session(BROWSER_PROFILE_DIR)
+                    clear_session(config.BROWSER_PROFILE_DIR)
                     self._headless = False
                     try:
                         self._proc.terminate()
@@ -256,8 +252,8 @@ class BrowserLinker:
                     self._proc = start_chrome(
                         self._chrome_path,
                         headless=False,
-                        debug_port=BROWSER_DEBUG_PORT,
-                        profile_dir=BROWSER_PROFILE_DIR,
+                        debug_port=config.BROWSER_DEBUG_PORT,
+                        profile_dir=config.BROWSER_PROFILE_DIR,
                         target_url=self.USAGE_URL,
                     )
                     with self._lock:
@@ -286,7 +282,7 @@ class BrowserLinker:
             self._error = None
             self._status = "ok"
             self._fetched_at = datetime.now()
-        mark_session_ok(BROWSER_PROFILE_DIR)
+        mark_session_ok(config.BROWSER_PROFILE_DIR)
         self._notify()
 
     def _on_cdp_status(self, status: str, error: str | None):

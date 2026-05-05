@@ -13,7 +13,7 @@ import sys
 import threading
 from datetime import datetime, timedelta
 
-from claude_observer.config import CONSOLE_FETCHER_ENABLED, REFRESH_INTERVAL_SECONDS
+from claude_observer import config
 from claude_observer.logging_setup import log
 from claude_observer.system.startup import add_to_startup, remove_from_startup, startup_registered
 from claude_observer.ui.tray_icon import make_tray_icon
@@ -31,7 +31,7 @@ class ClaudeUsageWidget:
         self._stop_event              = threading.Event()
 
         self._fetcher = (BrowserLinker() if BrowserLinker.is_available() else None) \
-            if CONSOLE_FETCHER_ENABLED else None
+            if config.CONSOLE_FETCHER_ENABLED else None
         self._popup   = UsagePopup(
             console_available=self._fetcher is not None,
             on_link_browser=self._link_browser,
@@ -54,6 +54,8 @@ class ClaudeUsageWidget:
                 pystray.MenuItem("Show Usage", self._on_click, default=True),
                 pystray.MenuItem("Refresh Now", self._refresh_now),
                 pystray.MenuItem("Reposition Window", self._reposition_window),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem("Settings...", self._open_settings),
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem(
                     lambda item: "Remove from Startup" if startup_registered() else "Add to Startup",
@@ -131,6 +133,12 @@ class ClaudeUsageWidget:
             self._fetcher.go_visible()
         log.debug("Finished ClaudeUsageWidget._go_visible")
 
+    def _open_settings(self, icon=None, item=None):
+        log.debug("Starting ClaudeUsageWidget._open_settings")
+        from claude_observer.ui.settings_dialog import open_settings_dialog
+        threading.Thread(target=open_settings_dialog, daemon=True).start()
+        log.debug("Finished ClaudeUsageWidget._open_settings")
+
     def _quit(self, icon, item):
         log.debug("Starting ClaudeUsageWidget._quit")
         self._stop_event.set()
@@ -162,7 +170,7 @@ class ClaudeUsageWidget:
             self._icon.title = "Claude Usage — error"
         finally:
             log.debug("Entering finally block in ClaudeUsageWidget._do_refresh")
-            self._next_refresh_at = datetime.now() + timedelta(seconds=REFRESH_INTERVAL_SECONDS)
+            self._next_refresh_at = datetime.now() + timedelta(seconds=config.REFRESH_INTERVAL_SECONDS)
         log.debug("Finished ClaudeUsageWidget._do_refresh")
 
     def _refresh_loop(self, icon):
@@ -170,7 +178,7 @@ class ClaudeUsageWidget:
         icon.visible = True
         while not self._stop_event.is_set():
             self._do_refresh()
-            self._stop_event.wait(REFRESH_INTERVAL_SECONDS)
+            self._stop_event.wait(config.REFRESH_INTERVAL_SECONDS)
 
     def run(self):
         log.debug("Starting ClaudeUsageWidget.run")

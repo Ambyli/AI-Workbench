@@ -1,8 +1,9 @@
-version: "3.9"
-
 services:
   unsloth:
-    image: unsloth/unsloth
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # image: unsloth/unsloth
     container_name: unsloth
     restart: unless-stopped
 
@@ -16,6 +17,7 @@ services:
 
     volumes:
       - ./work:/workspace/work
+      - unsloth_data:/home/unsloth/.unsloth  # persists the llama.cpp build
 
     runtime: nvidia
 
@@ -26,3 +28,5 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+volumes:
+  unsloth_data:

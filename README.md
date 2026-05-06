@@ -289,30 +289,55 @@ To revert to the Anthropic API, remove those keys (or delete the files if they c
 
 ---
 
-## Unsloth Docker — CUDA build workaround
+## Unsloth Docker — CUDA build
 
-The Unsloth Docker image ships a prebuilt `llama.cpp` binary that may lack CUDA support, causing inference to fall back to CPU. If `llama-server` reports no GPU layers loaded, rebuild it with CUDA inside the container:
+The Unsloth Docker image ships a prebuilt `llama.cpp` binary that may lack CUDA support, causing inference to fall back to CPU. The `Dockerfile` and `entrypoint.sh` in this repo automate the fix — the CUDA-enabled binary is compiled at container startup and persisted in a named volume so subsequent restarts skip the build.
+
+### How it works
+
+`docker-compose.yml` builds a custom image from `Dockerfile` instead of pulling `unsloth/unsloth:latest` directly. On first start, `entrypoint.sh`:
+
+1. Removes the prebuilt CPU-only `llama.cpp`
+2. Clones `llama.cpp` from source
+3. Compiles it with `-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89` (RTX 4080 / Ada Lovelace)
+4. Hands off to the original Unsloth entrypoint
+
+The compiled binary lives in the `unsloth_data` named volume (`/home/unsloth/.unsloth`), so the build only runs once — subsequent starts skip straight to launch.
+
+### Starting the container
 
 ```bash
-# Install build dependencies
-apt-get update && apt-get install -y cmake git libcurl4-openssl-dev
-
-# Remove the prebuilt binary
-rm -rf /home/unsloth/.unsloth/llama.cpp
-
-# Clone and build with CUDA support
-git clone https://github.com/ggerganov/llama.cpp /home/unsloth/.unsloth/llama.cpp
-cd /home/unsloth/.unsloth/llama.cpp
-
-# RTX 4080 = compute capability 8.9 (Ada Lovelace)
-cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89
-cmake --build build --config Release -j$(nproc)
-
-# Verify version
-/home/unsloth/.unsloth/llama.cpp/build/bin/llama-server --version 2>&1
+docker compose up --build   # first run — builds the image and compiles llama.cpp
+docker compose up           # subsequent runs — reuses the volume, skips compile
 ```
 
-Adjust `-DCMAKE_CUDA_ARCHITECTURES` for your GPU — `89` is correct for Ada Lovelace (RTX 4080/4090). Use `86` for Ampere (RTX 3080/3090) or `75` for Turing (RTX 2080).
+Or use the Makefile helpers:
+
+| Command | Effect |
+|---|---|
+| `make up` | Start the container in the background (`-d`), removing orphaned containers |
+| `make down` | Stop the container |
+| `make clean` | Stop and delete the container **and the named volume** (forces a full rebuild on next `make up`) |
+| `make logs` | Tail container logs — useful for watching the llama.cpp compile progress on first start |
+
+### GPU compute capability
+
+`89` targets Ada Lovelace (RTX 4080 / 4090). Adjust `-DCMAKE_CUDA_ARCHITECTURES` in `Dockerfile` for other GPUs:
+
+| Architecture | Value | Example GPUs |
+|---|---|---|
+| Ada Lovelace | `89` | RTX 4080, 4090 |
+| Ampere | `86` | RTX 3080, 3090 |
+| Turing | `75` | RTX 2080 |
+
+### Verifying GPU is active
+
+```bash
+docker compose exec unsloth \
+  /home/unsloth/.unsloth/llama.cpp/build/bin/llama-server --version 2>&1
+```
+
+If GPU layers are still not loading, confirm the container has access to the NVIDIA runtime (`runtime: nvidia` in `docker-compose.yml`) and that the host has the NVIDIA Container Toolkit installed.
 
 ---
 

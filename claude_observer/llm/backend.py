@@ -26,7 +26,7 @@ def _local_llm_settings_keys() -> dict:
     env = {
         "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
         "ANTHROPIC_BASE_URL": config.LLM_URL,
-        "ANTHROPIC_API_KEY": config.LLM_API_KEY,
+        "ANTHROPIC_AUTH_TOKEN": config.LLM_API_KEY,
     }
     if config.LLM_MODEL:
         env["ANTHROPIC_MODEL"] = config.LLM_MODEL
@@ -82,7 +82,7 @@ def deactivate_local_llm():
     env = s.get("env", {})
     env.pop("CLAUDE_CODE_ATTRIBUTION_HEADER", None)
     env.pop("ANTHROPIC_BASE_URL", None)
-    env.pop("ANTHROPIC_API_KEY", None)
+    env.pop("ANTHROPIC_AUTH_TOKEN", None)
     env.pop("ANTHROPIC_MODEL", None)
     if not env:
         s.pop("env", None)

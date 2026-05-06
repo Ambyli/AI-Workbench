@@ -254,7 +254,7 @@ The **toggle button** in the LLM Backend section switches between two modes by r
 
 | File | Local LLM (on) | Anthropic API (off) |
 |---|---|---|
-| `~/.claude/settings.json` | Sets `env.ANTHROPIC_BASE_URL`, `env.ANTHROPIC_API_KEY`, `env.ANTHROPIC_MODEL`, and `env.CLAUDE_CODE_ATTRIBUTION_HEADER=0`; sets `claudeCode.disableLoginPrompt=true` | Removes all those keys |
+| `~/.claude/settings.json` | Sets `env.ANTHROPIC_BASE_URL`, `env.ANTHROPIC_AUTH_TOKEN`, `env.ANTHROPIC_MODEL`, and `env.CLAUDE_CODE_ATTRIBUTION_HEADER=0`; sets `claudeCode.disableLoginPrompt=true` | Removes all those keys |
 | `~/.claude.json` | Sets `primaryApiKey=sk-dummy-key` and `hasCompletedOnboarding=true` | Removes those keys |
 
 Claude Code reads `ANTHROPIC_BASE_URL` from its env block on startup, so the change takes effect the next time you start a Claude Code session (no restart of the widget needed).
@@ -268,7 +268,7 @@ To switch to a local LLM manually, add these blocks to `~/.claude/settings.json`
   "claudeCode.disableLoginPrompt": true,
   "env": {
     "ANTHROPIC_BASE_URL": "http://localhost:8001",
-    "ANTHROPIC_API_KEY": "sk-no-key-required",
+    "ANTHROPIC_AUTH_TOKEN": "sk-no-key-required",
     "ANTHROPIC_MODEL": "your-model-alias",
     "CLAUDE_CODE_ATTRIBUTION_HEADER": "0"
   }

@@ -6,11 +6,10 @@ A Windows system tray widget that displays your Claude Code token usage in real 
 
 ## Requirements
 
-```bash
-pip install pystray Pillow
+Dependencies are declared in `pyproject.toml`. Install with:
 
-# Optional — enables the Account stats section (claude.ai/settings/usage browser link)
-pip install requests websocket-client
+```bash
+uv sync
 ```
 
 ## Running
@@ -289,58 +288,6 @@ To revert to the Anthropic API, remove those keys (or delete the files if they c
 
 ---
 
-## Unsloth Docker — CUDA build
-
-The Unsloth Docker image ships a prebuilt `llama.cpp` binary that may lack CUDA support, causing inference to fall back to CPU. The `Dockerfile` and `entrypoint.sh` in this repo automate the fix — the CUDA-enabled binary is compiled at container startup and persisted in a named volume so subsequent restarts skip the build.
-
-### How it works
-
-`docker-compose.yml` builds a custom image from `Dockerfile` instead of pulling `unsloth/unsloth:latest` directly. On first start, `entrypoint.sh`:
-
-1. Removes the prebuilt CPU-only `llama.cpp`
-2. Clones `llama.cpp` from source
-3. Compiles it with `-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89` (RTX 4080 / Ada Lovelace)
-4. Hands off to the original Unsloth entrypoint
-
-The compiled binary lives in the `unsloth_data` named volume (`/home/unsloth/.unsloth`), so the build only runs once — subsequent starts skip straight to launch.
-
-### Starting the container
-
-```bash
-docker compose up --build   # first run — builds the image and compiles llama.cpp
-docker compose up           # subsequent runs — reuses the volume, skips compile
-```
-
-Or use the Makefile helpers:
-
-| Command | Effect |
-|---|---|
-| `make up` | Start the container in the background (`-d`), removing orphaned containers |
-| `make down` | Stop the container |
-| `make clean` | Stop and delete the container **and the named volume** (forces a full rebuild on next `make up`) |
-| `make logs` | Tail container logs — useful for watching the llama.cpp compile progress on first start |
-
-### GPU compute capability
-
-`89` targets Ada Lovelace (RTX 4080 / 4090). Adjust `-DCMAKE_CUDA_ARCHITECTURES` in `Dockerfile` for other GPUs:
-
-| Architecture | Value | Example GPUs |
-|---|---|---|
-| Ada Lovelace | `89` | RTX 4080, 4090 |
-| Ampere | `86` | RTX 3080, 3090 |
-| Turing | `75` | RTX 2080 |
-
-### Verifying GPU is active
-
-```bash
-docker compose exec unsloth \
-  /home/unsloth/.unsloth/llama.cpp/build/bin/llama-server --version 2>&1
-```
-
-If GPU layers are still not loading, confirm the container has access to the NVIDIA runtime (`runtime: nvidia` in `docker-compose.yml`) and that the host has the NVIDIA Container Toolkit installed.
-
----
-
 ## Windows startup
 
 Use **Add to Startup** in the right-click menu to register the widget to launch automatically at login. It runs via `pythonw.exe` so no console window appears. **Remove from Startup** undoes this.
@@ -426,3 +373,9 @@ If both accounts have been used in the same working directory, their sessions wi
 | `widget.py` | `ClaudeUsageWidget` — orchestrates all of the above |
 | `.env` | Local configuration (not committed) |
 | `~/.claude_widget/chrome_profile/` | Persistent Chrome session data (created on first Link Browser click) |
+
+---
+
+## Unsloth Docker
+
+See [UNSLOTH.md](UNSLOTH.md) for setup, build, and GPU configuration instructions.

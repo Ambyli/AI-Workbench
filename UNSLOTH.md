@@ -39,7 +39,7 @@ Or use the Makefile helpers:
 
 ## GPU compute capability
 
-`89` targets Ada Lovelace (RTX 4080 / 4090). Adjust `-DCMAKE_CUDA_ARCHITECTURES` in `Dockerfile` for other GPUs:
+`89` targets Ada Lovelace (RTX 4080 / 4090). Adjust `-DCMAKE_CUDA_ARCHITECTURES` in `Dockerfile` for other GPUs. Full list: https://developer.nvidia.com/cuda-gpus
 
 | Architecture | Value | Example GPUs |
 |---|---|---|

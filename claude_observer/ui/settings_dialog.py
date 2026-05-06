@@ -89,9 +89,17 @@ _FIELDS = [
 _LABEL_W = 158  # px — fixed label column width
 
 
-def open_settings_dialog() -> None:
-    """Open the settings window and block until it is closed."""
-    win = tk.Tk()
+def open_settings_dialog(master=None) -> None:
+    """Open the settings window and block until it is closed.
+
+    When *master* is provided (a live tk.Tk/Toplevel), the dialog runs as a
+    Toplevel on the caller's thread — no second Tcl interpreter is created.
+    When *master* is None a standalone tk.Tk() is used (fallback only).
+    """
+    if master is not None:
+        win = tk.Toplevel(master)
+    else:
+        win = tk.Tk()
     win.overrideredirect(True)
     win.attributes("-topmost", True)
     win.configure(bg=BG)
@@ -368,4 +376,7 @@ def open_settings_dialog() -> None:
     y = (sh - final_h) // 2
     win.geometry(f"360x{final_h}+{x}+{y}")
 
-    win.mainloop()
+    if master is not None:
+        win.wait_window()
+    else:
+        win.mainloop()

@@ -142,6 +142,18 @@ class UsagePopup:
             self._win.after(0, lambda: self._vars["countdown"].set("Refreshing…"))
         log.debug("Finished UsagePopup.start_refresh_display")
 
+    def schedule_on_tk(self, fn) -> bool:
+        """Schedule *fn* to run on the popup's Tk thread. Returns False if no window.
+
+        Tkinter is not thread-safe — calling it from any thread other than the one
+        that created the Tk root will crash or hang. The popup runs its mainloop on
+        a daemon thread, so all tkinter calls from elsewhere must go through after().
+        """
+        if self._win and self._win.winfo_exists():
+            self._win.after(0, fn)
+            return True
+        return False
+
     # ── Window construction (called once) ─────────────────────────────────────
 
     def _build_window(self):

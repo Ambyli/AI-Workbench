@@ -136,7 +136,9 @@ class ClaudeUsageWidget:
     def _open_settings(self, icon=None, item=None):
         log.debug("Starting ClaudeUsageWidget._open_settings")
         from claude_observer.ui.settings_dialog import open_settings_dialog
-        threading.Thread(target=open_settings_dialog, daemon=True).start()
+        popup = self._popup
+        if not popup.schedule_on_tk(lambda: open_settings_dialog(master=popup._win)):
+            threading.Thread(target=open_settings_dialog, daemon=True).start()
         log.debug("Finished ClaudeUsageWidget._open_settings")
 
     def _quit(self, icon, item):

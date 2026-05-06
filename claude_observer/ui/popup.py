@@ -103,7 +103,7 @@ class UsagePopup:
         self._build_window()
         self._apply(usage, error)
         self._fit_window()
-        self._tick()
+        self._win.after(0, self._tick)
         log.debug("Finished UsagePopup.show (entering mainloop)")
         self._win.mainloop()
 

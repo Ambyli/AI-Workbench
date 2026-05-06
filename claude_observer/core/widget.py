@@ -32,6 +32,7 @@ class ClaudeUsageWidget:
 
         self._fetcher = (BrowserLinker() if BrowserLinker.is_available() else None) \
             if config.CONSOLE_FETCHER_ENABLED else None
+        self._settings_dialog = None  # created lazily on first open, then reused
         self._popup   = UsagePopup(
             console_available=self._fetcher is not None,
             on_link_browser=self._link_browser,
@@ -135,10 +136,28 @@ class ClaudeUsageWidget:
 
     def _open_settings(self, icon=None, item=None):
         log.debug("Starting ClaudeUsageWidget._open_settings")
-        from claude_observer.ui.settings_dialog import open_settings_dialog
+        from claude_observer.ui.settings_dialog import SettingsDialog
         popup = self._popup
-        if not popup.schedule_on_tk(lambda: open_settings_dialog(master=popup._win)):
-            threading.Thread(target=open_settings_dialog, daemon=True).start()
+
+        def _on_tk():
+            if self._settings_dialog is None or not self._settings_dialog._win.winfo_exists():
+                self._settings_dialog = SettingsDialog(master=popup._win)
+            else:
+                self._settings_dialog.show()
+
+        if not popup.schedule_on_tk(_on_tk):
+            # Popup not yet created — start it in its own thread, then wait
+            # for the Tk root to be ready before scheduling settings on it.
+            def _open_both():
+                threading.Thread(target=self._open_popup, daemon=True).start()
+                import time
+                for _ in range(50):  # wait up to 5 s
+                    if popup._win and popup._win.winfo_exists():
+                        popup.schedule_on_tk(_on_tk)
+                        return
+                    time.sleep(0.1)
+            threading.Thread(target=_open_both, daemon=True).start()
+
         log.debug("Finished ClaudeUsageWidget._open_settings")
 
     def _quit(self, icon, item):
@@ -146,6 +165,15 @@ class ClaudeUsageWidget:
         self._stop_event.set()
         if self._fetcher is not None:
             self._fetcher.quit()
+        # Destroy the popup Tk root on its own thread. This cascades to all
+        # Toplevel children (including the settings dialog) and causes mainloop()
+        # to return, cleanly exiting the popup thread.
+        win = self._popup._win
+        if win is not None:
+            try:
+                win.after(0, win.destroy)
+            except Exception:
+                pass
         icon.stop()
         log.debug("Finished ClaudeUsageWidget._quit")
 

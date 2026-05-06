@@ -289,6 +289,33 @@ To revert to the Anthropic API, remove those keys (or delete the files if they c
 
 ---
 
+## Unsloth Docker — CUDA build workaround
+
+The Unsloth Docker image ships a prebuilt `llama.cpp` binary that may lack CUDA support, causing inference to fall back to CPU. If `llama-server` reports no GPU layers loaded, rebuild it with CUDA inside the container:
+
+```bash
+# Install build dependencies
+apt-get update && apt-get install -y cmake git libcurl4-openssl-dev
+
+# Remove the prebuilt binary
+rm -rf /home/unsloth/.unsloth/llama.cpp
+
+# Clone and build with CUDA support
+git clone https://github.com/ggerganov/llama.cpp /home/unsloth/.unsloth/llama.cpp
+cd /home/unsloth/.unsloth/llama.cpp
+
+# RTX 4080 = compute capability 8.9 (Ada Lovelace)
+cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89
+cmake --build build --config Release -j$(nproc)
+
+# Verify version
+/home/unsloth/.unsloth/llama.cpp/build/bin/llama-server --version 2>&1
+```
+
+Adjust `-DCMAKE_CUDA_ARCHITECTURES` for your GPU — `89` is correct for Ada Lovelace (RTX 4080/4090). Use `86` for Ampere (RTX 3080/3090) or `75` for Turing (RTX 2080).
+
+---
+
 ## Windows startup
 
 Use **Add to Startup** in the right-click menu to register the widget to launch automatically at login. It runs via `pythonw.exe` so no console window appears. **Remove from Startup** undoes this.

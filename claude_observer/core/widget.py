@@ -164,10 +164,13 @@ class ClaudeUsageWidget:
         log.debug("Starting ClaudeUsageWidget._quit")
         self._stop_event.set()
         from claude_observer.llm.backend import is_local_llm_active, deactivate_local_llm, stop_server
-        if is_local_llm_active():
+        if is_local_llm_active() and not config.KEEP_LLM_ACTIVE:
             stop_server()
             deactivate_local_llm()
             log.debug("Restored Claude API on quit")
+        elif is_local_llm_active():
+            stop_server()
+            log.debug("Stopped server on quit (keeping LLM active)")
         if self._fetcher is not None:
             self._fetcher.quit()
         # Destroy the popup Tk root on its own thread. This cascades to all

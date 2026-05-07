@@ -26,6 +26,7 @@ _DEFAULTS: dict = {
     "LLM_API_KEY": "sk-no-key-required",
     "LLM_MODEL": "",
     "DEBUG_LOGGING": False,
+    "KEEP_LLM_ACTIVE": False,
 }
 
 
@@ -81,6 +82,7 @@ def _apply(raw: dict) -> None:
     mod.LLM_API_KEY              = str(raw.get("LLM_API_KEY", "sk-no-key-required"))
     mod.LLM_MODEL                = str(raw.get("LLM_MODEL", ""))
     mod.DEBUG_LOGGING            = bool(raw.get("DEBUG_LOGGING", False))
+    mod.KEEP_LLM_ACTIVE          = bool(raw.get("KEEP_LLM_ACTIVE", False))
 
     # Parsed from comma-separated raw strings
     raw_paths = str(raw.get("INCLUDE_PATHS", ""))

@@ -87,6 +87,12 @@ _FIELDS = [
         "int",
         "Max lines kept in the server-output log box",
     ),
+    (
+        "KEEP_LLM_ACTIVE",
+        "Keep LLM toggle on quit",
+        "bool",
+        "Leave Claude Code pointed at the local LLM when the app closes",
+    ),
 ]
 
 _LABEL_W = 158  # px — fixed label column width

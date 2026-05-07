@@ -9,5 +9,6 @@
   "LLM_URL": "http://192.168.5.233:8000",
   "LLM_API_KEY": "sk-unsloth-5c5d6e5fdc65021e0ec2571a37928bd9",
   "LLM_MODEL": "unsloth/Qwen3.6-35B-A3B-GGUF",
-  "DEBUG_LOGGING": true
+  "DEBUG_LOGGING": true,
+  "KEEP_LLM_ACTIVE": true
 }

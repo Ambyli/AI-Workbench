@@ -1,32 +1,3 @@
-services:
-  unsloth:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    # image: unsloth/unsloth
-    container_name: unsloth
-    restart: unless-stopped
-
-    environment:
-      - JUPYTER_PASSWORD=mypassword
-
-    ports:
-      - "8888:8888"
-      - "8000:8000"
-      - "2222:22"
-
-    volumes:
-      - ./work:/workspace/work
-      - unsloth_data:/home/unsloth/.unsloth  # persists the llama.cpp build
-
-    runtime: nvidia
-
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-volumes:
-  unsloth_data:
+include:
+  - docker-compose.litellm.yml
+  - docker-compose.unsloth.yml

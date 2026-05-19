@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "System tray widget for monitoring Claude API usage"
 requires-python = ">=3.10"
 dependencies = [
+    "litellm>=1.85.0",
     "Pillow>=12.2.0",
     "pystray>=0.19.5",
     "requests>=2.33.1",

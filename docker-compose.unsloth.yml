@@ -1,0 +1,27 @@
+services:
+  unsloth:
+    build:
+      context: .
+      dockerfile: Dockerfile.unsloth
+    container_name: unsloth
+    restart: unless-stopped
+    environment:
+      - JUPYTER_PASSWORD=mypassword
+    ports:
+      - "8888:8888"
+      - "8000:8000"
+      - "2222:22"
+    volumes:
+      - ./work:/workspace/work
+      - unsloth_data:/home/unsloth/.unsloth
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  unsloth_data:

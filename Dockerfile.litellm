@@ -1,0 +1,5 @@
+FROM docker.litellm.ai/berriai/litellm:main-latest
+
+EXPOSE 4000
+
+CMD ["--config", "/app/config.yaml", "--detailed_debug"]

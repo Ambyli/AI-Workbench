@@ -4,16 +4,17 @@ Windows system tray widget that displays your Claude Code token usage in real ti
 
 ## Requirements
 
-Dependencies are declared in `pyproject.toml`. Install with:
+Dependencies are declared in `pyproject.toml`. Install from the `widget/` directory:
 
 ```bash
+cd widget
 uv sync
 ```
 
 ## Running
 
 ```bash
-python claude_usage_widget.py
+uv run claude_usage_widget.py
 ```
 
 The widget appears in your system tray. Click the icon to open the popup; right-click for the menu.

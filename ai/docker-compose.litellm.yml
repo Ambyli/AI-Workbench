@@ -8,10 +8,9 @@ services:
     ports:
       - "4001:4000"
     environment:
-      DATABASE_URL: ${LITELLM_DATABASE_URL}
       STORE_MODEL_IN_DB: "True"
     env_file:
-      - .env
+      - ../.env
     volumes:
       - ./litellm_config.yaml:/app/config.yaml
     command:

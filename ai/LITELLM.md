@@ -5,7 +5,7 @@ Run a LiteLLM proxy with PostgreSQL for model management and Prometheus for metr
 ### Quick start
 
 ```bash
-docker compose -f docker-compose.litellm.yml up -d
+docker compose -f ai/docker-compose.litellm.yml up -d
 ```
 
 This launches three services:
@@ -31,7 +31,7 @@ The LiteLLM service runs a liveliness probe against `/health/liveliness`. Promet
 ### Stopping
 
 ```bash
-docker compose -f docker-compose.litellm.yml down
+docker compose -f ai/docker-compose.litellm.yml down
 ```
 
 Data in PostgreSQL is persisted in the `litellm_postgres_data` named volume and survives container restarts.

@@ -24,8 +24,8 @@ After installing, restart Docker (`sudo systemctl restart docker`) before procee
 ## Starting the container
 
 ```bash
-docker compose -f docker-compose.unsloth.yml up --build   # first run — builds the image and compiles llama.cpp
-docker compose -f docker-compose.unsloth.yml up            # subsequent runs — reuses the volume, skips compile
+docker compose -f ai/docker-compose.unsloth.yml up --build   # first run — builds the image and compiles llama.cpp
+docker compose -f ai/docker-compose.unsloth.yml up           # subsequent runs — reuses the volume, skips compile
 ```
 
 Or use the Makefile helpers:
@@ -50,8 +50,8 @@ Or use the Makefile helpers:
 ## Verifying GPU is active
 
 ```bash
-docker compose -f docker-compose.unsloth.yml exec unsloth \
+docker compose -f ai/docker-compose.unsloth.yml exec unsloth \
   /home/unsloth/.unsloth/llama.cpp/build/bin/llama-server --version 2>&1
 ```
 
-If GPU layers are still not loading, confirm the container has access to the NVIDIA runtime (`runtime: nvidia` in `docker-compose.unsloth.yml`) and that the host has the NVIDIA Container Toolkit installed.
+If GPU layers are still not loading, confirm the container has access to the NVIDIA runtime (`runtime: nvidia` in `docker/docker-compose.unsloth.yml`) and that the host has the NVIDIA Container Toolkit installed.

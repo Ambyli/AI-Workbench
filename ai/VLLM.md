@@ -5,7 +5,7 @@ Run multiple models simultaneously, each in its own container on a different por
 ### Quick start
 
 ```bash
-docker compose -f docker-compose.vllm.yml up -d
+docker compose -f ai/docker-compose.vllm.yml up -d
 ```
 
 This launches two containers by default:
@@ -31,13 +31,13 @@ curl http://localhost:8003/v1/chat/completions \
 
 ### How it works
 
-Each service in `docker-compose.vllm.yml` is a standalone vLLM instance. The `--model` flag on the command line tells vLLM which HuggingFace model to load. Each container gets its own GPU memory allocation and listens on a different host port, so they run in parallel without conflict.
+Each service in `ai/docker-compose.vllm.yml` is a standalone vLLM instance. The `--model` flag on the command line tells vLLM which HuggingFace model to load. Each container gets its own GPU memory allocation and listens on a different host port, so they run in parallel without conflict.
 
 The HuggingFace token (`HF_TOKEN`) is still read from `.env` so gated models can be downloaded. All other settings (port, model name, context length, GPU utilization) are hardcoded in the compose file.
 
 ### Adding more models
 
-To add a third model, add a new service block to `docker-compose.vllm.yml`:
+To add a third model, add a new service block to `ai/docker-compose.vllm.yml`:
 
 ```yaml
   vllm-mistral:
@@ -74,9 +74,9 @@ Then hit it at `localhost:8004` with `"model": "mistral"` in the request body.
 
 ### Removing a model
 
-Delete the corresponding service block from `docker-compose.vllm.yml`, then:
+Delete the corresponding service block from `ai/docker-compose.vllm.yml`, then:
 
 ```bash
-docker compose -f docker-compose.vllm.yml down
-docker compose -f docker-compose.vllm.yml up -d
+docker compose -f ai/docker-compose.vllm.yml down
+docker compose -f ai/docker-compose.vllm.yml up -d
 ```

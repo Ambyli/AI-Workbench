@@ -33,18 +33,23 @@
 
 # AI Workbench
 
-A local AI development workbench — token usage monitoring, multi-model serving, and MCP tool calling, all on one machine.
+A local AI development workbench — real-time token usage monitoring for claude-code, multi-model serving, and MCP tool calling, all on one machine.
 
 ## Components
 
 | Component | Description | Docs |
 |---|---|---|
-| **Usage Widget** | Python tray app — daily/weekly token totals, per-project breakdown, rolling averages, claude.ai account stats via CDP, local LLM toggle | [USAGE_WIDGET.md](USAGE_WIDGET.md) |
-| **Docker Infrastructure** | Main compose (LiteLLM + Unsloth + vLLM), multi-model serving, GPU configuration | [DOCKER_INFRA.md](DOCKER_INFRA.md) |
-| **LiteLLM + MCP** | Tool-calling workflow with an MCP server — send messages, route tool results, obtain API tokens | [LITELLM_MCP.md](LITELLM_MCP.md) |
+| **Usage Widget** | Python tray app — daily/weekly token totals, per-project breakdown, rolling averages, claude.ai account stats via CDP, local LLM toggle | [widget/USAGE_WIDGET.md](widget/USAGE_WIDGET.md) |
+| **AI Infrastructure** | Main compose (LiteLLM + Unsloth + vLLM), multi-model serving, GPU configuration | [ai/AI_INFRA.md](ai/AI_INFRA.md) |
 
 ## Configuration
 
 All settings live in `config.json` (project root) and `.env`. The widget reads `config.json` at startup and applies changes immediately via the Settings window (tray right-click → **Settings…**).
 
-See the [Usage Widget docs](USAGE_WIDGET.md#configuration) for the full key reference.
+See the [Usage Widget docs](widget/USAGE_WIDGET.md#configuration) for the full key reference.
+
+## Quick start
+
+```bash
+make setup
+```

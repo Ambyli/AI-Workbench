@@ -46,4 +46,19 @@ build-litellm:
 build-unsloth:
 	$(DC) build unsloth
 
-.PHONY: up up-litellm up-unsloth down down-litellm down-unsloth clean clean-litellm clean-unsloth logs logs-litellm logs-unsloth build build-litellm build-unsloth
+up-vllm:
+	$(DC) up -d vllm
+
+down-vllm:
+	$(DC) stop vllm
+
+clean-vllm:
+	$(DC) stop vllm && $(DC) rm -f vllm
+
+logs-vllm:
+	$(DC) logs -f vllm
+
+build-vllm:
+	$(DC) build vllm
+
+.PHONY: up up-litellm up-unsloth up-vllm down down-litellm down-unsloth down-vllm clean clean-litellm clean-unsloth clean-vllm logs logs-litellm logs-unsloth logs-vllm build build-litellm build-unsloth build-vllm

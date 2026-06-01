@@ -53,3 +53,46 @@ See the [Usage Widget docs](widget/USAGE_WIDGET.md#configuration) for the full k
 ```bash
 make setup
 ```
+
+## Docker Compose Commands
+
+### Main stack
+
+```bash
+make up              # Start all services
+make down            # Stop all services
+make clean           # Stop and remove containers + volumes
+make very-clean      # Stop, remove containers, volumes, and images
+make logs            # Follow logs
+make build           # Build images
+```
+
+### LiteLLM
+
+```bash
+make up-litellm      # Start LiteLLM proxy
+make down-litellm    # Stop LiteLLM
+make clean-litellm   # Stop and remove LiteLLM container
+make logs-litellm    # Follow LiteLLM logs
+make build-litellm   # Build LiteLLM image
+```
+
+### Unsloth
+
+```bash
+make up-unsloth      # Start Unsloth
+make down-unsloth    # Stop Unsloth
+make clean-unsloth   # Stop and remove Unsloth container
+make logs-unsloth    # Follow Unsloth logs
+make build-unsloth   # Build Unsloth image
+```
+
+### vLLM
+
+```bash
+make up-vllm         # Start vLLM (Qwen + Llama)
+make down-vllm       # Stop vLLM
+make clean-vllm      # Stop and remove vLLM containers
+make logs-vllm       # Follow vLLM logs
+make build-vllm      # Build vLLM images
+```

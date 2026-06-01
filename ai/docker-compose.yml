@@ -1,4 +1,4 @@
 include:
   - docker-compose.litellm.yml
+  - docker-compose.vllm.yml
 #  - docker-compose.unsloth.yml
-#  - docker-compose.vllm.yml

@@ -376,6 +376,61 @@ If both accounts have been used in the same working directory, their sessions wi
 
 ---
 
+## LiteLLM with Phoenix MCP (Tool Calling)
+
+The Phoenix MCP server exposes database tools via LiteLLM. The model receives tool definitions but LiteLLM does **not** execute the tool calls automatically — you must orchestrate the tool call loop.
+
+### Step 1: Send the user message
+
+```bash
+curl http://localhost:4001/v1/chat/completions \
+  -H "Authorization: Bearer sk-your-master-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3.6",
+    "messages": [{"role": "user", "content": "List all tables in the database"}]
+  }'
+```
+
+The response will have `"finish_reason": "tool_calls"` with a tool call object containing a `tool_call_id`.
+
+### Step 2: Send the tool result back
+
+Call the MCP tool directly (via the Phoenix server), then send the result back to LiteLLM:
+
+```bash
+curl http://localhost:4001/v1/chat/completions \
+  -H "Authorization: Bearer sk-your-master-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3.6",
+    "messages": [
+      {"role": "user", "content": "List all tables in the database"},
+      {"role": "assistant", "tool_calls": [{"function": {"arguments": "{}", "name": "list_tables"}, "id": "CALL_ID_FROM_STEP_1", "type": "function"}]},
+      {"role": "tool", "tool_call_id": "CALL_ID_FROM_STEP_1", "content": "[\"projects\", \"users\"]"}
+    ]
+  }'
+```
+
+Replace the `content` with the actual result from calling the tool on the Phoenix MCP server (`https://phoenix-mcp.com/mcp`).
+
+### Phoenix MCP API Token
+
+The Phoenix MCP server issues long-lived API tokens via a browser-based OAuth flow:
+
+```bash
+# Get a Google login URL
+curl -s https://phoenix-mcp.com/api-token \
+  -H "X-API-Key: your-shared-secret"
+# Open the returned login_url in a browser, sign in, get your API token
+
+# Or exchange a Google access token directly
+curl -X POST https://phoenix-mcp.com/api-token \
+  -H "X-API-Key: your-shared-secret" \
+  -H "Content-Type: application/json" \
+  -d '{"google_token": "<google-access-token>", "expires_in": 0}'
+```
+
 ## Unsloth Docker
 
 See [UNSLOTH.md](UNSLOTH.md) for setup, build, and GPU configuration instructions.

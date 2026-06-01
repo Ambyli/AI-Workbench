@@ -2,6 +2,13 @@ general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
   database_url: os.environ/LITELLM_DATABASE_URL
 
+mcp_servers:
+  phoenix:
+    url: "https://phoenix-mcp.com/mcp"
+    transport: "http"
+    auth_type: "bearer_token"
+    auth_value: "Lx3EkU6kVDMpp0dnfdmuBLQHALpd5gVCXVk4H_yfVch7tXjFI04OmHYgQblbW-W4"
+
 model_list:
   - model_name: os.environ/LITELLM_MODEL_NAME
     litellm_params:

@@ -11,8 +11,8 @@ import os
 import sys
 from pathlib import Path
 
-_CONFIG_PATH = Path(__file__).parent.parent / "config.json"
-_ENV_PATH = Path(__file__).parent.parent / ".env"
+_CONFIG_PATH = Path(__file__).parent.parent.parent / "config.json"
+_ENV_PATH = Path(__file__).parent.parent.parent / ".env"
 
 _DEFAULTS: dict = {
     "REFRESH_INTERVAL_SECONDS": 300,

@@ -1,5 +1,7 @@
 # vLLM — Multi-Model Serving
 
+> **Windows / WSL2 compatibility note:** vLLM v0.22.0+ (the current `latest` image) uses a V1 engine that requires CUDA Unified Virtual Addressing (UVA), which is unavailable in WSL2's paravirtualized GPU driver. Running the latest image on Windows Docker with WSL2 will fail at startup with `RuntimeError: UVA is not available`. Pin the image to `vllm/vllm-openai:v0.6.6` until upstream adds a WSL2-compatible code path.
+
 Run multiple models simultaneously, each in its own container on a different port. Hit any model at the standard OpenAI-compatible endpoint (`/v1/chat/completions`) — pick which model by specifying `"model": "qwen"` or `"model": "llama"` in your request body.
 
 ### Quick start
@@ -12,8 +14,8 @@ This launches two containers by default:
 
 | Container | Port | Model |
 |---|---|---|
-| `vllm-qwen` | `localhost:8002` | `Qwen/Qwen3-4B-A3B-Instruct` |
-| `vllm-llama` | `localhost:8003` | `meta-llama/Llama-3.2-3B-Instruct-AWQ` |
+| `vllm-qwen` | `localhost:8002` | `Qwen/Qwen2.5-3B-Instruct` |
+| `vllm-llama` | `localhost:8003` | `meta-llama/Llama-3.2-3B-Instruct` |
 
 Test with:
 

@@ -53,6 +53,26 @@ services:
 
 Partitions a GPU into fully isolated slices at the hardware level. Each slice gets dedicated memory and compute units. **Requires A100/H100/H100-Pcie/H200** and datacenter drivers.
 
+### Check MIG support
+
+Before setting up, verify your hardware and driver support MIG:
+
+```bash
+# 1. Confirm GPU model (A100/H100/H200 only)
+nvidia-smi -L
+
+# 2. Check if driver supports MIG
+nvidia-smi migCap
+
+# 3. List available MIG profiles (errors out on unsupported hardware)
+migctl device list
+
+# 4. Check current MIG mode
+nvidia-smi -i 0 -query=gpu.mig.current.state
+
+# If all four commands succeed, MIG is supported on this system.
+```
+
 ### Setup (host)
 
 ```bash

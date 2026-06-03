@@ -47,6 +47,56 @@ Or use the Makefile helpers:
 | Ampere | `86` | RTX 3080, 3090 |
 | Turing | `75` | RTX 2080 |
 
+## Removing the custom llama.cpp build
+
+If you no longer need the CUDA-compiled llama.cpp (e.g. you are switching to a different inference backend or the upstream image now ships CUDA support), you can strip out the custom image entirely and revert to pulling `unsloth/unsloth:latest` directly.
+
+**1. Edit `docker-compose.unsloth.yml`**
+
+Replace the `build` directive with a plain `image` reference and remove the `entrypoint` override and the named-volume mount:
+
+```yaml
+# Before (custom image)
+services:
+  unsloth:
+    build:
+      context: .
+      dockerfile: Dockerfile.unsloth
+    entrypoint: ["/entrypoint.sh"]
+    volumes:
+      - unsloth_data:/home/unsloth/.unsloth
+
+# After (stock image)
+services:
+  unsloth:
+    image: unsloth/unsloth:latest
+    # entrypoint and unsloth_data volume lines removed
+```
+
+**2. Remove the volume declaration** at the bottom of `docker-compose.unsloth.yml`:
+
+```yaml
+# Remove this block
+volumes:
+  unsloth_data:
+```
+
+**3. Delete the now-unused files** (optional but clean):
+
+```bash
+rm ai/Dockerfile.unsloth
+rm ai/entrypoint.sh
+```
+
+**4. Tear down and restart cleanly:**
+
+```bash
+docker compose -f ai/docker-compose.unsloth.yml down -v   # removes the old named volume
+docker compose -f ai/docker-compose.unsloth.yml up
+```
+
+> **Tradeoff:** The stock image contains a CPU-only `llama.cpp` binary. If you need GPU inference you must either keep the custom build process or mount a pre-compiled binary from the host.
+
 ## Verifying GPU is active
 
 ```bash

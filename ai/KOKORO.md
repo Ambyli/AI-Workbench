@@ -91,6 +91,35 @@ cd ai/kokoro/app && uv run python app.py
 cd ai/kokoro/api && KOKORO_APP_URL=http://localhost:8085 uv run kokoro_server.py
 ```
 
+### LiteLLM integration
+
+`kokoro-api` exposes a `POST /v1/audio/speech` endpoint that matches the OpenAI TTS API. LiteLLM routes requests with `"model": "kokoro"` to it via the `litellm_config.yaml` entry.
+
+**Example via LiteLLM proxy:**
+
+```bash
+curl http://localhost:4001/v1/audio/speech \
+  -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "kokoro", "input": "Hello world", "voice": "alloy"}' \
+  --output audio.wav
+```
+
+**OpenAI → Kokoro voice mapping:**
+
+| OpenAI voice | Kokoro voice |
+|---|---|
+| `alloy` | `af_heart` |
+| `echo` | `am_adam` |
+| `fable` | `bf_emma` |
+| `onyx` | `am_michael` |
+| `nova` | `af_sarah` |
+| `shimmer` | `af_bella` |
+
+Kokoro voice names (e.g. `af_heart`) can also be passed directly and will be used as-is.
+
+> **Note:** Kokoro only produces WAV output. The `response_format` field is accepted but ignored — the response is always `audio/wav`.
+
 ### Adding voices
 
-Voices come from the `misaki` package bundled with Kokoro. Run `/voices` to see all available names, then pass the name as the `voice` query parameter to `/generate`.
+Voices come from the Kokoro model on HuggingFace. Run `/voices` to see all available names, then pass the name as the `voice` query parameter to `/generate` or as the `voice` field in `/v1/audio/speech`.

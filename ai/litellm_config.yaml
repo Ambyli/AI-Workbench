@@ -17,3 +17,9 @@ model_list:
       api_base: os.environ/LITELLM_API_BASE
       api_key: os.environ/LITELLM_API_KEY
       drop_params: true
+
+  - model_name: kokoro
+    litellm_params:
+      model: openai/kokoro
+      api_base: http://kokoro-api:8000
+      api_key: none

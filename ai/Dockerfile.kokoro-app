@@ -19,9 +19,9 @@ RUN uv sync --no-dev
 
 COPY kokoro/app/app.py .
 
-EXPOSE 8080
+EXPOSE 8085
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
-    CMD curl -f http://localhost:8080/voices || exit 1
+    CMD curl -f http://localhost:8085/voices || exit 1
 
 CMD ["uv", "run", "python", "app.py"]

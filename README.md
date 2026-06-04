@@ -125,5 +125,5 @@ Copy `.env.example` to `.env` and fill in the values.
 | `LITELLM_API_KEY` | _(empty)_ | API key forwarded to the upstream LLM |
 | `LITELLM_API_BASE` | _(empty)_ | Upstream API base URL (must include `/v1` for OpenAI-compatible endpoints) |
 | `LITELLM_DATABASE_URL` | _(empty)_ | PostgreSQL connection string for LiteLLM |
-| `KOKORO_APP_URL` | `http://kokoro-app:8080` | URL the Kokoro API proxy uses to reach the inference container. Set to `http://localhost:8080` for local dev |
+| `KOKORO_APP_URL` | `http://kokoro-app:8085` | URL the Kokoro API proxy uses to reach the inference container. Set to `http://localhost:8080` for local dev |
 | `KOKORO_VOICE` | `af_heart` | Default voice for Kokoro TTS generation |

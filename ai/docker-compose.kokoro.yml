@@ -24,7 +24,7 @@ services:
     container_name: kokoro-api
     restart: unless-stopped
     environment:
-      - KOKORO_APP_URL=http://kokoro-app:8080
+      - KOKORO_APP_URL=${KOKORO_APP_URL}
     ports:
       - "8004:8000"
     depends_on:

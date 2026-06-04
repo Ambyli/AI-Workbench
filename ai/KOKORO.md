@@ -39,7 +39,7 @@ The response is a WAV file. The default voice is `af_heart` if `voice` is omitte
 | Variable | Default | Purpose |
 |---|---|---|
 | `HF_TOKEN` | — | HuggingFace token for downloading model weights on first run |
-| `KOKORO_APP_URL` | `http://kokoro-app:8080` | URL the API proxy uses to reach the inference container. In Docker Compose this resolves via the service name. For local dev set it to `http://localhost:8080` in `.env`. |
+| `KOKORO_APP_URL` | `http://kokoro-app:8085` | URL the API proxy uses to reach the inference container. Resolves via Docker service name in Compose. For local dev, override inline: `KOKORO_APP_URL=http://localhost:8085 uv run kokoro_server.py` |
 
 ### Model loading
 
@@ -80,8 +80,15 @@ ai/
 Each subfolder is an independent `uv` project. For local development:
 
 ```bash
+# Install deps
 cd ai/kokoro/app && uv sync
 cd ai/kokoro/api && uv sync
+
+# Run the inference server (terminal 1)
+cd ai/kokoro/app && uv run python app.py
+
+# Run the API proxy pointing at localhost (terminal 2)
+cd ai/kokoro/api && KOKORO_APP_URL=http://localhost:8085 uv run kokoro_server.py
 ```
 
 ### Adding voices

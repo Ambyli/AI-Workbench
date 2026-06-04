@@ -56,6 +56,10 @@ make setup
 
 ## Docker Compose Commands
 
+Run `make help` to list all available targets, including any service stacks currently registered in the Makefile.
+
+
+
 ### Main stack
 
 ```bash

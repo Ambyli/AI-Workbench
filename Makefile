@@ -1,7 +1,10 @@
 DC = docker compose -f ai/docker-compose.yml --env-file .env
 UP_FLAGS ?= -d --remove-orphans
+SERVICES :=
 
 define service
+SERVICES += $(1)
+
 DC_$(1) := docker compose -f ai/docker-compose.$(1).yml --env-file .env
 
 up-$(1):
@@ -50,4 +53,19 @@ logs:
 build:
 	$(DC) build
 
-.PHONY: setup up down clean very-clean logs build
+help:
+	@echo ""
+	@echo "Main stack:"
+	@echo "  make setup       Install deps and start all services"
+	@echo "  make up          Start"
+	@echo "  make down        Stop"
+	@echo "  make clean       Stop and remove containers + volumes"
+	@echo "  make very-clean  Stop, remove containers, volumes, and images"
+	@echo "  make logs        Follow logs"
+	@echo "  make build       Rebuild images"
+	@echo ""
+	@echo "Service stacks:"
+	@$(foreach s,$(SERVICES),echo "  $(s): up-$(s)  down-$(s)  clean-$(s)  logs-$(s)  build-$(s)";)
+	@echo ""
+
+.PHONY: setup up down clean very-clean logs build help

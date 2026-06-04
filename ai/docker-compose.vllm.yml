@@ -1,5 +1,12 @@
+networks:
+  shared:
+    external: true
+    name: ai_shared
+
 services:
   vllm-llama:
+    networks:
+      - shared
     image: vllm/vllm-openai:v0.6.6
     container_name: vllm-llama
     restart: unless-stopped
@@ -29,6 +36,8 @@ services:
       --gpu-memory-utilization 0.5
 
   vllm-qwen:
+    networks:
+      - shared
     image: vllm/vllm-openai:v0.6.6
     container_name: vllm-qwen
     restart: unless-stopped

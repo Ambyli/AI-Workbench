@@ -1,5 +1,12 @@
+networks:
+  shared:
+    external: true
+    name: ai_shared
+
 services:
   kokoro-app:
+    networks:
+      - shared
     build:
       context: .
       dockerfile: Dockerfile.kokoro-app
@@ -18,6 +25,8 @@ services:
               capabilities: [gpu]
 
   kokoro-api:
+    networks:
+      - shared
     build:
       context: .
       dockerfile: Dockerfile.kokoro-api

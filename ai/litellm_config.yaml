@@ -1,21 +1,21 @@
 general_settings:
-  master_key: os.environ/LITELLM_MASTER_KEY
-  database_url: os.environ/LITELLM_DATABASE_URL
+  master_key: os.environ/DEFAULT_LITELLM_MASTER_KEY
+  database_url: os.environ/DEFAULT_LITELLM_DATABASE_URL
   enable_metrics: true
 
 mcp_servers:
   phoenix:
-    url: "https://phoenix-mcp.com/mcp"
+    url: os.environ/DEFAULT_LITELLM_MCP_PHOENIX_URL
     transport: "http"
     auth_type: "bearer_token"
-    auth_value: "Lx3EkU6kVDMpp0dnfdmuBLQHALpd5gVCXVk4H_yfVch7tXjFI04OmHYgQblbW-W4"
+    auth_value: os.environ/DEFAULT_LITELLM_MCP_PHOENIX_AUTH_VALUE
 
 model_list:
-  - model_name: os.environ/LITELLM_MODEL_NAME
+  - model_name: os.environ/DEFAULT_LITELLM_MODEL_NAME
     litellm_params:
-      model: os.environ/LITELLM_MODEL
-      api_base: os.environ/LITELLM_API_BASE
-      api_key: os.environ/LITELLM_API_KEY
+      model: os.environ/DEFAULT_LITELLM_MODEL
+      api_base: os.environ/DEFAULT_LITELLM_MODEL_API_BASE
+      api_key: os.environ/DEFAULT_LITELLM_MODEL_API_KEY
       drop_params: true
 
   - model_name: kokoro

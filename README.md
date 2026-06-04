@@ -58,6 +58,14 @@ make setup
 
 Run `make help` to list all available targets, including any service stacks currently registered in the Makefile.
 
+### Network
+
+```bash
+make network         # Create shared Docker network (ai_shared)
+```
+
+All containers share a `ai_shared` Docker network so they can resolve each other by container name. `make setup` creates it automatically.
+
 ### Main stack
 
 ```bash
@@ -127,11 +135,12 @@ Copy `.env.example` to `.env` and fill in the values.
 | `BROWSER_DEBUG_PORT` | `9222` | Chrome remote-debugging port for CDP |
 | `KEEP_LLM_ACTIVE` | `true` | Keep the local LLM server running when switching away |
 | `HF_TOKEN` | _(empty)_ | HuggingFace token for gated model downloads (vLLM, LiteLLM) |
-| `LITELLM_MASTER_KEY` | _(empty)_ | Master key for the LiteLLM proxy |
-| `LITELLM_SALT_KEY` | _(empty)_ | Salt key for LiteLLM |
-| `LITELLM_MODEL_NAME` | _(empty)_ | Model alias used in LiteLLM requests |
-| `LITELLM_MODEL` | _(empty)_ | Full model spec (e.g. `openai/unsloth/Qwen3.6-35B-A3B-GGUF`) |
-| `LITELLM_API_KEY` | _(empty)_ | API key forwarded to the upstream LLM |
-| `LITELLM_API_BASE` | _(empty)_ | Upstream API base URL (must include `/v1` for OpenAI-compatible endpoints) |
-| `LITELLM_DATABASE_URL` | _(empty)_ | PostgreSQL connection string for LiteLLM |
+| `DEFAULT_LITELLM_MASTER_KEY` | _(empty)_ | Master key for the LiteLLM proxy |
+| `DEFAULT_LITELLM_MODEL_NAME` | _(empty)_ | Model alias used in LiteLLM requests |
+| `DEFAULT_LITELLM_MODEL` | _(empty)_ | Full model spec (e.g. `openai/unsloth/Qwen3.6-35B-A3B-GGUF`) |
+| `DEFAULT_LITELLM_MODEL_API_KEY` | _(empty)_ | API key forwarded to the upstream LLM |
+| `DEFAULT_LITELLM_MODEL_API_BASE` | _(empty)_ | Upstream API base URL (must include `/v1` for OpenAI-compatible endpoints) |
+| `DEFAULT_LITELLM_DATABASE_URL` | _(empty)_ | PostgreSQL connection string for LiteLLM |
+| `DEFAULT_LITELLM_MCP_PHOENIX_URL` | _(empty)_ | URL for the Phoenix MCP server |
+| `DEFAULT_LITELLM_MCP_PHOENIX_AUTH_VALUE` | _(empty)_ | Bearer token for Phoenix MCP authentication |
 | `KOKORO_APP_URL` | `http://kokoro-app:8085` | URL the Kokoro API proxy uses to reach the inference container. Set to `http://localhost:8080` for local dev |

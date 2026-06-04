@@ -3,3 +3,8 @@ include:
   - docker-compose.vllm.yml
   - docker-compose.kokoro.yml
 #  - docker-compose.unsloth.yml
+
+networks:
+  shared:
+    external: true
+    name: ai_shared

@@ -33,10 +33,13 @@ $(eval $(call service,unsloth,unsloth))
 $(eval $(call service,vllm,vllm-qwen vllm-llama))
 $(eval $(call service,kokoro,kokoro-app kokoro-api))
 
-setup:
+setup: network
 	cd widget && uv sync && cd ..
 	cd widget && uv run claude_usage_widget.py &
 	$(DC) up --build $(UP_FLAGS)
+
+network:
+	docker network create ai_shared 2>/dev/null || true
 
 up:
 	$(DC) up $(UP_FLAGS)
@@ -60,6 +63,7 @@ help:
 	@echo ""
 	@echo "Main stack:"
 	@echo "  make setup       Install deps and start all services"
+	@echo "  make network     Create shared Docker network"
 	@echo "  make up          Start"
 	@echo "  make down        Stop"
 	@echo "  make clean       Stop and remove containers + volumes"

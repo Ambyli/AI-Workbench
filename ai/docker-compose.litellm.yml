@@ -1,5 +1,12 @@
+networks:
+  shared:
+    external: true
+    name: ai_shared
+
 services:
   litellm:
+    networks:
+      - shared
     build:
       context: .
       dockerfile: Dockerfile.litellm

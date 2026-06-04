@@ -1,0 +1,10 @@
+[project]
+name = "kokoro-api"
+version = "0.1.0"
+description = "Stateless FastAPI proxy for the Kokoro TTS app container"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi",
+    "uvicorn",
+    "httpx",
+]

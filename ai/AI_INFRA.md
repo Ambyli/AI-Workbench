@@ -16,3 +16,4 @@ docker compose up -d
 | [LiteLLM + MCP](LITELLM_MCP.md) | Tool-calling workflow — send messages, route tool results, obtain API tokens |
 | [Unsloth](UNSLOTH.md) | `unsloth` | Unsloth environment with CUDA-compiled llama.cpp |
 | [vLLM](VLLM.md) | `vllm-qwen`, `vllm-llama` | Multi-model vLLM serving |
+| [Kokoro](KOKORO.md) | `kokoro-app`, `kokoro-api` | Text-to-speech (Kokoro-82M) |

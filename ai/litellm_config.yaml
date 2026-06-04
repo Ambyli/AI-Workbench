@@ -23,3 +23,4 @@ model_list:
       model: openai/kokoro
       api_base: http://kokoro-api:8000
       api_key: none
+      model_type: audio.speech

@@ -102,6 +102,10 @@ Delete the corresponding `$(eval $(call service,...))` line from the `Makefile`.
 | Service list | Space-separated Docker Compose service names (second argument). These are passed directly to `docker compose up/stop/rm/build`. |
 | Multiple services | All listed services are started/stopped together as a group (e.g. `vllm-qwen vllm-llama`). |
 
+## GPU Compatibility
+
+All inference services (Unsloth, vLLM, Kokoro) require a CUDA-capable NVIDIA GPU. The full list of supported GPUs is at https://developer.nvidia.com/cuda/gpus. The Unsloth build defaults to compute capability `89` (Ada Lovelace — RTX 4080/4090); adjust `Dockerfile.unsloth` for other architectures.
+
 ## Environment Variables
 
 Copy `.env.example` to `.env` and fill in the values.

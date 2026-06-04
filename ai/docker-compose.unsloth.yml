@@ -7,9 +7,12 @@ services:
   unsloth:
     networks:
       - shared
-    build:
-      context: .
-      dockerfile: Dockerfile.unsloth
+    # Uncomment the build section if you want to build the image locally using a Dockerfile
+    # Comment the image section if you are building the image locally
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile.unsloth
+    image: unsloth:latest
     container_name: unsloth
     restart: unless-stopped
     environment:

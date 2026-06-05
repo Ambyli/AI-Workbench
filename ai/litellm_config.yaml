@@ -4,6 +4,10 @@ general_settings:
   enable_metrics: true
 
 mcp_servers:
+  kokoro_tts:
+    url: http://kokoro-api:8000/mcp
+    transport: "http"
+
   phoenix:
     url: os.environ/DEFAULT_LITELLM_MCP_PHOENIX_URL
     transport: "http"

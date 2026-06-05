@@ -7,4 +7,5 @@ dependencies = [
     "fastapi",
     "uvicorn",
     "httpx",
+    "fastmcp>=2.0",
 ]

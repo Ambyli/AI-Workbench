@@ -5,17 +5,20 @@ Exposes an OpenAI-compatible /v1/audio/speech endpoint for LiteLLM routing,
 plus /voices and /generate for direct access.
 """
 
+import base64
 import os
 from typing import Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response
+from fastmcp import FastMCP
 from pydantic import BaseModel
 
 APP_URL = os.environ.get("KOKORO_APP_URL", "http://kokoro-app:8085")
 
 app = FastAPI(title="Kokoro TTS API")
+mcp = FastMCP("Kokoro TTS")
 
 http_timeout = httpx.Timeout(120.0, connect=10.0)
 
@@ -80,6 +83,35 @@ def openai_speech(req: TTSRequest):
         return Response(content=audio_bytes, media_type="audio/wav")
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"Cannot reach kokoro-app: {exc}")
+
+
+@mcp.tool()
+def text_to_speech(text: str, voice: str = "alloy") -> str:
+    """Generate speech audio from text using Kokoro TTS.
+
+    Args:
+        text: The text to convert to speech.
+        voice: Voice name. Options: alloy, echo, fable, onyx, nova, shimmer.
+
+    Returns:
+        A data URI (data:audio/wav;base64,...) containing the generated audio.
+    """
+    kokoro_voice = VOICE_MAP.get(voice, voice)
+    try:
+        r = httpx.post(
+            f"{APP_URL}/generate",
+            params={"text": text, "voice": kokoro_voice},
+            timeout=http_timeout,
+        )
+        r.raise_for_status()
+        data = r.json()
+        audio_bytes = bytes.fromhex(data["audio"])
+        return f"data:audio/wav;base64,{base64.b64encode(audio_bytes).decode()}"
+    except httpx.HTTPError as exc:
+        return f"Error generating audio: {exc}"
+
+
+app.mount("/mcp", mcp.get_asgi_app())
 
 
 if __name__ == "__main__":

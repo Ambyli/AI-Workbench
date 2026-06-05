@@ -1,5 +1,3 @@
-name: ai-litellm
-
 networks:
   shared:
     external: true

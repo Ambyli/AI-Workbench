@@ -1,3 +1,5 @@
+name: ai-unsloth
+
 networks:
   shared:
     external: true

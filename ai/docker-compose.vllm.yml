@@ -1,3 +1,5 @@
+name: ai-vllm
+
 networks:
   shared:
     external: true

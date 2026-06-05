@@ -17,8 +17,10 @@ from pydantic import BaseModel
 
 APP_URL = os.environ.get("KOKORO_APP_URL", "http://kokoro-app:8085")
 
-app = FastAPI(title="Kokoro TTS API")
 mcp = FastMCP("Kokoro TTS")
+mcp_app = mcp.http_app(path="/")
+
+app = FastAPI(title="Kokoro TTS API", lifespan=mcp_app.lifespan)
 
 http_timeout = httpx.Timeout(120.0, connect=10.0)
 
@@ -116,7 +118,7 @@ def text_to_speech(text: str, voice: str = "alloy") -> str:
         return f"Error generating audio: {exc}"
 
 
-app.mount("/mcp", mcp.get_asgi_app())
+app.mount("/mcp", mcp_app)
 
 
 if __name__ == "__main__":

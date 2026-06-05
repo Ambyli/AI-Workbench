@@ -5,7 +5,7 @@ SERVICES :=
 define service
 SERVICES += $(1)
 
-DC_$(1) := docker compose -f ai/docker-compose.$(1).yml --env-file .env -p $(1)
+DC_$(1) := docker compose -f ai/docker-compose.$(1).yml --env-file .env -p ai-$(1)
 
 up-$(1):
 	$$(DC_$(1)) up -d $(2)

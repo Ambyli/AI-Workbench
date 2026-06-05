@@ -1,4 +1,4 @@
-FROM docker.litellm.ai/berriai/litellm:v1.85.3
+FROM docker.litellm.ai/berriai/litellm:v1.87.1
 
 EXPOSE 4000
 

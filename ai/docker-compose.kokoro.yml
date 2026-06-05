@@ -36,6 +36,12 @@ services:
       - KOKORO_APP_URL=${KOKORO_APP_URL}
     ports:
       - "8004:8000"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
     depends_on:
       - kokoro-app
 

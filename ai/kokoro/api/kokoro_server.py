@@ -42,6 +42,11 @@ class TTSRequest(BaseModel):
     speed: Optional[float] = 1.0
 
 
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
 @app.get("/voices")
 def list_voices():
     try:

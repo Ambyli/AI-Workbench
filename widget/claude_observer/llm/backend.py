@@ -27,6 +27,7 @@ def _local_llm_settings_keys() -> dict:
         "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
         "ANTHROPIC_BASE_URL": config.LLM_URL,
         "ANTHROPIC_AUTH_TOKEN": config.LLM_API_KEY,
+        "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
     }
     if config.LLM_MODEL:
         env["ANTHROPIC_MODEL"] = config.LLM_MODEL

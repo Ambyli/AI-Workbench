@@ -34,6 +34,7 @@ services:
     restart: unless-stopped
     environment:
       - KOKORO_APP_URL=${KOKORO_APP_URL}
+      - AUDIO_BASE_URL=${AUDIO_BASE_URL}
     ports:
       - "8004:8000"
     healthcheck:

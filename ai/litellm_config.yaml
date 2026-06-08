@@ -20,7 +20,6 @@ model_list:
       model: os.environ/DEFAULT_LITELLM_MODEL
       api_base: os.environ/DEFAULT_LITELLM_MODEL_API_BASE
       api_key: os.environ/DEFAULT_LITELLM_MODEL_API_KEY
-      drop_params: true
       max_tokens: 262144
 
   - model_name: kokoro

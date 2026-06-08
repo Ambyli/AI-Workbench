@@ -1,3 +1,6 @@
+litellm_settings:
+  drop_params: true
+
 general_settings:
   master_key: os.environ/DEFAULT_LITELLM_MASTER_KEY
   database_url: os.environ/DEFAULT_LITELLM_DATABASE_URL

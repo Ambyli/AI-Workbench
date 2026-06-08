@@ -35,3 +35,7 @@ docker compose -f ai/docker-compose.litellm.yml down
 ```
 
 Data in PostgreSQL is persisted in the `litellm_postgres_data` named volume and survives container restarts.
+
+### `litellm_config.yaml` settings
+
+The proxy configuration file supports a wide range of options for models, routing, rate limits, and more. See the full reference: [LiteLLM Config Settings](https://docs.litellm.ai/docs/proxy/config_settings)

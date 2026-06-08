@@ -2,11 +2,15 @@ litellm_settings:
   num_retries: 3
   request_timeout: 300
   drop_params: true
+  turn_off_message_logging: true
+  json_logs: false
 
 general_settings:
   master_key: os.environ/DEFAULT_LITELLM_MASTER_KEY
   database_url: os.environ/DEFAULT_LITELLM_DATABASE_URL
   enable_metrics: true
+  store_model_in_db: true
+  default_max_tokens: 262144
 
 mcp_servers:
   kokoro_tts:

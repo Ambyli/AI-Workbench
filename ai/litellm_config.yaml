@@ -1,4 +1,6 @@
 litellm_settings:
+  num_retries: 3
+  request_timeout: 300
   drop_params: true
 
 general_settings:

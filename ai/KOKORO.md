@@ -40,6 +40,7 @@ The response is a WAV file. The default voice is `af_heart` if `voice` is omitte
 |---|---|---|
 | `HF_TOKEN` | — | HuggingFace token for downloading model weights on first run |
 | `KOKORO_APP_URL` | `http://kokoro-app:8085` | URL the API proxy uses to reach the inference container. Resolves via Docker service name in Compose. For local dev, override inline: `KOKORO_APP_URL=http://localhost:8085 uv run kokoro_server.py` |
+| `AUDIO_BASE_URL` | `http://localhost:8000` | Base URL returned by the `text_to_speech` MCP tool. Used to build the audio playback link. Override if the server runs on a different host or port. |
 
 ### Model loading
 

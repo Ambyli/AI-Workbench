@@ -38,6 +38,7 @@ Key variables:
 | `LLM_MODEL` | _(empty)_ | Model alias passed to Claude Code |
 | `LLM_LOG_MAX_LINES` | `200` | Max lines in server-output log box |
 | `LLAMA_SERVER_CMD` | _(empty)_ | Full shell command to launch llama-server |
+| `AUDIO_BASE_URL` | `http://localhost:8000` | Base URL returned by Kokoro `text_to_speech` MCP tool |
 
 ## Threading Model — Read Before Touching Anything
 

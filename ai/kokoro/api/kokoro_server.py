@@ -5,13 +5,15 @@ Exposes an OpenAI-compatible /v1/audio/speech endpoint for LiteLLM routing,
 plus /voices and /generate for direct access.
 """
 
-import base64
+import hashlib
 import os
+import threading
+from pathlib import Path
 from typing import Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, Response
 from fastmcp import FastMCP
 from pydantic import BaseModel
 
@@ -35,6 +37,35 @@ VOICE_MAP = {
     "shimmer": "af_bella",
 }
 
+AUDIO_DIR = Path(__file__).parent / "audio"
+AUDIO_BASE_URL = os.environ.get("AUDIO_BASE_URL", "http://localhost:8000")
+_audio_cache: dict[str, str] = {}
+_audio_lock = threading.Lock()
+
+
+def _clean_stale_audio():
+    """Remove all audio files on startup (they're ephemeral)."""
+    if not AUDIO_DIR.exists():
+        return
+    for f in AUDIO_DIR.glob("*.wav"):
+        f.unlink()
+
+
+def _ensure_audio_dir():
+    AUDIO_DIR.mkdir(exist_ok=True)
+
+
+def _save_audio(text: str, voice: str, audio_bytes: bytes) -> str:
+    """Save audio to disk and return the filename."""
+    key = f"{text}|{voice}"
+    with _audio_lock:
+        if key in _audio_cache:
+            return _audio_cache[key]
+        filename = hashlib.md5(key.encode()).hexdigest()[:12] + ".wav"
+        (AUDIO_DIR / filename).write_bytes(audio_bytes)
+        _audio_cache[key] = filename
+        return filename
+
 
 class TTSRequest(BaseModel):
     model: str
@@ -47,6 +78,17 @@ class TTSRequest(BaseModel):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/audio/{filename}")
+def serve_audio(filename: str):
+    # Prevent path traversal
+    if ".." in filename or "/" in filename or "\\" in filename:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    filepath = AUDIO_DIR / filename
+    if not filepath.is_file():
+        raise HTTPException(status_code=404, detail="Audio file not found")
+    return FileResponse(filepath, media_type="audio/wav")
 
 
 @app.get("/voices")
@@ -101,8 +143,10 @@ def text_to_speech(text: str, voice: str = "alloy") -> str:
         voice: Voice name. Options: alloy, echo, fable, onyx, nova, shimmer.
 
     Returns:
-        A data URI (data:audio/wav;base64,...) containing the generated audio.
+        A URL to the generated audio file (set AUDIO_BASE_URL env var to override the default host).
     """
+    _ensure_audio_dir()
+    _clean_stale_audio()
     kokoro_voice = VOICE_MAP.get(voice, voice)
     try:
         r = httpx.post(
@@ -113,7 +157,8 @@ def text_to_speech(text: str, voice: str = "alloy") -> str:
         r.raise_for_status()
         data = r.json()
         audio_bytes = bytes.fromhex(data["audio"])
-        return f"data:audio/wav;base64,{base64.b64encode(audio_bytes).decode()}"
+        filename = _save_audio(text, voice, audio_bytes)
+        return f"{AUDIO_BASE_URL}/audio/{filename}"
     except httpx.HTTPError as exc:
         return f"Error generating audio: {exc}"
 

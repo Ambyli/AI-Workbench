@@ -43,6 +43,10 @@ services:
     restart: unless-stopped
     environment:
       - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN}
+      - VLLM_SLEEP_WHEN_IDLE=1
+      - VLLM_USE_DEEP_GEMM=0
+      - VLLM_USE_FLASHINFER_MOE_FP16=1
+      - VLLM_USE_FLASHINFER_SAMPLER=0
     ports:
       - "${PORT_VLLM_QWEN}:8000"
     volumes:
@@ -59,15 +63,14 @@ services:
       interval: 30s
       timeout: 10s
       retries: 10
-      start_period: 120s
+      start_period: 300s
     command: >
-      unsloth/Qwen3.6-27B-MTP-GGUF:Q6_K
-      --tokenizer Qwen/Qwen3.6-27B
-      --hf-config-path Qwen/Qwen3.6-27B
+      QuantTrio/Qwen3.6-35B-A3B-AWQ
+      --quantization awq
       --served-model-name qwen3.6
       --max-model-len 32768
       --reasoning-parser qwen3
-      --gpu-memory-utilization 0.55
+      --gpu-memory-utilization 0.50
 
   vllm-qwen-vl:
     networks:
@@ -99,6 +102,7 @@ services:
       --dtype float16
       --max-model-len 8192
       --gpu-memory-utilization 0.4
+      --enforce-eager
 
 volumes:
   vllm_data:

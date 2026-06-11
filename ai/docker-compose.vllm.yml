@@ -67,9 +67,10 @@ services:
       QuantTrio/Qwen3.6-35B-A3B-AWQ
       --quantization awq
       --served-model-name qwen3.6
-      --max-model-len 32768
+      --max-model-len 8192
       --reasoning-parser qwen3
       --gpu-memory-utilization 0.52
+      --enforce-eager
 
   vllm-qwen-vl:
     networks:

@@ -12,6 +12,12 @@ general_settings:
   store_model_in_db: true
   default_max_tokens: 262144
   always_include_stream_usage: true
+  pass_through_endpoints:
+    - path: "/v1/quality-check"
+      target: "http://quality-checker:8000"
+      include_subpath: true
+      methods: ["POST"]
+      forward_headers: true
 
 mcp_servers:
   kokoro_tts:

@@ -69,7 +69,7 @@ services:
       --served-model-name qwen3.6
       --max-model-len 32768
       --reasoning-parser qwen3
-      --gpu-memory-utilization 0.50
+      --gpu-memory-utilization 0.52
 
   vllm-qwen-vl:
     networks:

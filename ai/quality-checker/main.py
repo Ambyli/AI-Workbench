@@ -1,60 +1,122 @@
 import asyncio
 import json
 import logging
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, UploadFile, Form
 from fastapi.responses import JSONResponse
+from prometheus_fastapi_instrumentator import Instrumentator
 
+import store
+from analysis import parse_criteria, analyze_upload
 from config import DEFAULT_CRITERIA, LOG_LEVEL
 from logger import logger
+from middleware import CorrelationIDMiddleware, RequestIDFilter, request_id_var
 from models import CompareRequest
-from analysis import parse_criteria, analyze_upload, analyze_input, resolve_example
-from scoring import compute_similarity, combined_score, aggregate
+from workers import job_queue, job_worker, jobs_total, job_queue_depth
+
+# ---------------------------------------------------------------------------
+# Logging setup
+# ---------------------------------------------------------------------------
+
+_filter = RequestIDFilter()
+_handler = logging.StreamHandler()
+_handler.addFilter(_filter)
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s [%(levelname)s] %(name)s %(funcName)s: %(message)s",
+    format="%(asctime)s [%(levelname)s] [%(request_id)s] %(name)s %(funcName)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[_handler],
 )
 logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 logger.info("Starting Document Quality Checker (log level=%s)", LOG_LEVEL)
 
-app = FastAPI(title="Document Quality Checker")
+
+# ---------------------------------------------------------------------------
+# App + lifespan
+# ---------------------------------------------------------------------------
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await store.init_db()
+    worker_task = asyncio.create_task(job_worker())
+    logger.info("lifespan: startup complete")
+    yield
+    worker_task.cancel()
+    logger.info("lifespan: shutdown complete")
 
 
-@app.post("/assess")
+app = FastAPI(title="Document Quality Checker", lifespan=lifespan)
+app.add_middleware(CorrelationIDMiddleware)
+
+Instrumentator(
+    should_group_status_codes=True,
+    excluded_handlers=["/metrics", "/health"],
+).instrument(app).expose(app)
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/assess", status_code=202)
 async def assess_document(
     image: UploadFile,
     criteria: str = Form(
         default=json.dumps(DEFAULT_CRITERIA),
         description=(
-            'JSON array of criterion objects. Each object must have "name" (string) and '
-            'optionally "type" ("quality" or "feature", default "quality"). '
+            'JSON array of criterion objects. Each must have "name" and optionally '
+            '"type" ("quality" or "feature"). '
             'Example: [{"name": "image sharpness", "type": "quality"}, '
             '{"name": "has solar panels", "type": "feature"}]'
         ),
     ),
 ):
-    """Assess a single document image via CV pre-checks + LLM scoring."""
+    """Submit an image assessment job. Returns a job ID immediately.
+
+    Poll GET /jobs/{job_id} for status and results.
+    """
     logger.info("assess_document: filename=%s content_type=%s", image.filename, image.content_type)
 
     criterion_list = parse_criteria(criteria)
     if not criterion_list:
         raise HTTPException(status_code=400, detail="At least one criterion is required")
 
-    result = await analyze_upload(image, criterion_list)
-    response = {
-        "status": "ok",
-        "criteria": [c.model_dump() for c in criterion_list],
-        **result,
-    }
-    logger.info("assess_document: returning status=ok combined_verdict=%s", result["combined_verdict"])
-    return JSONResponse(content=response)
+    contents = await image.read()
+    if not contents:
+        raise HTTPException(status_code=400, detail="Empty image file")
+
+    req_id = request_id_var.get("-")
+    job_id = await store.create_job("assess", req_id)
+
+    await job_queue.put((
+        job_id,
+        "assess",
+        {
+            "image_bytes": contents,
+            "content_type": image.content_type,
+            "filename": image.filename or "upload",
+            "criteria": criterion_list,
+        },
+        req_id,
+    ))
+    job_queue_depth.set(job_queue.qsize())
+    jobs_total.labels(type="assess", status="pending").inc()
+
+    logger.info("assess_document: queued job_id=%s queue_depth=%d", job_id, job_queue.qsize())
+    return JSONResponse(
+        status_code=202,
+        content={"job_id": job_id, "status": "pending"},
+    )
 
 
-@app.post("/assess/compare")
+@app.post("/assess/compare", status_code=202)
 async def assess_with_reference(request: CompareRequest):
-    """Assess an input image against one or more reference examples."""
+    """Submit a comparison job. Returns a job ID immediately.
+
+    Poll GET /jobs/{job_id} for status and results.
+    """
     logger.info("assess_with_reference: %d example(s) aggregation=%s criteria=%s",
                 len(request.examples), request.aggregation,
                 [c.name for c in request.criteria])
@@ -62,55 +124,47 @@ async def assess_with_reference(request: CompareRequest):
     if not request.criteria:
         raise HTTPException(status_code=400, detail="At least one criterion is required")
 
-    input_task = analyze_input(request.image, request.criteria)
-    example_tasks = [resolve_example(ex, request.criteria) for ex in request.examples]
+    req_id = request_id_var.get("-")
+    job_id = await store.create_job("compare", req_id)
 
-    results = await asyncio.gather(input_task, *example_tasks)
-    input_analysis = results[0]
-    example_analyses = results[1:]
+    await job_queue.put((job_id, "compare", request, req_id))
+    job_queue_depth.set(job_queue.qsize())
+    jobs_total.labels(type="compare", status="pending").inc()
 
-    input_overall = input_analysis["llm_assessment"].get("overall_score", 5)
-    logger.debug("assess_with_reference: input overall_score=%s", input_overall)
+    logger.info("assess_with_reference: queued job_id=%s queue_depth=%d", job_id, job_queue.qsize())
+    return JSONResponse(
+        status_code=202,
+        content={"job_id": job_id, "status": "pending"},
+    )
 
-    example_results = []
-    combined_scores = []
 
-    for i, (example, analysis) in enumerate(zip(request.examples, example_analyses)):
-        similarity = compute_similarity(
-            analysis["llm_assessment"],
-            input_analysis["llm_assessment"],
-        )
-        cs = combined_score(input_overall, similarity["similarity_score"], example.weight)
-        combined_scores.append(cs["score"])
-        logger.debug("assess_with_reference: example[%d] weight=%s combined_score=%s verdict=%s",
-                     i, example.weight, cs["score"], cs["verdict"])
-        example_results.append({
-            "index": i,
-            "weight": example.weight,
-            "pre_generated": example.pre_generated_analysis is not None,
-            "example_analysis": analysis,
-            "similarity": similarity,
-            "combined_score": cs["score"],
-            "combined_verdict": cs["verdict"],
-        })
+@app.get("/jobs/{job_id}")
+async def get_job(job_id: str):
+    """Get the status and result of a job."""
+    logger.info("get_job: job_id=%s", job_id)
+    job = await store.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
+    logger.info("get_job: returning job_id=%s status=%s", job_id, job["status"])
+    return JSONResponse(content=job)
 
-    agg = aggregate(combined_scores, request.aggregation)
-    logger.info("assess_with_reference: returning aggregate combined_score=%s verdict=%s",
-                agg["score"], agg["verdict"])
 
-    return JSONResponse(content={
-        "status": "ok",
-        "criteria": [c.model_dump() for c in request.criteria],
-        "aggregation": request.aggregation,
-        "input_analysis": input_analysis,
-        "example_results": example_results,
-        "aggregate": {
-            "method": request.aggregation,
-            "combined_score": agg["score"],
-            "combined_verdict": agg["verdict"],
-            "per_example_combined_scores": combined_scores,
-        },
-    })
+@app.get("/jobs")
+async def list_jobs(limit: int = 20):
+    """List recent jobs (most recent first)."""
+    logger.info("list_jobs: limit=%d", limit)
+    jobs = await store.list_jobs(limit)
+    logger.info("list_jobs: returning %d jobs", len(jobs))
+    return JSONResponse(content={"jobs": jobs, "count": len(jobs)})
+
+
+@app.delete("/jobs/{job_id}", status_code=204)
+async def delete_job(job_id: str):
+    """Delete a job record."""
+    logger.info("delete_job: job_id=%s", job_id)
+    deleted = await store.delete_job(job_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
 
 
 @app.get("/health")

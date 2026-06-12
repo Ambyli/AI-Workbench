@@ -10,4 +10,8 @@ dependencies = [
     "numpy",
     "pydantic",
     "python-multipart",
+    "Pillow",
+    "aiosqlite",
+    "prometheus-client",
+    "prometheus-fastapi-instrumentator",
 ]

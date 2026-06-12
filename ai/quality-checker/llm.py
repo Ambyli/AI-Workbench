@@ -5,12 +5,27 @@ import re
 
 import httpx
 from fastapi import HTTPException
+from prometheus_client import Counter, Histogram
 
 from config import VLLM_QWEN_VL_API, MAX_LLM_RETRIES, HTTP_TIMEOUT, HTTP_CONNECT_TIMEOUT
 from logger import logger
 from models import CriterionInput
 
 _http_timeout = httpx.Timeout(HTTP_TIMEOUT, connect=HTTP_CONNECT_TIMEOUT)
+
+# ---------------------------------------------------------------------------
+# Prometheus metrics
+# ---------------------------------------------------------------------------
+
+llm_calls_total = Counter(
+    "quality_checker_llm_calls_total",
+    "Total LLM API calls by status",
+    ["status"],  # success | retry | failed
+)
+llm_latency = Histogram(
+    "quality_checker_llm_latency_seconds",
+    "LLM API call latency in seconds",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -97,8 +112,8 @@ def build_llm_prompt(image_b64: str, criteria: list[CriterionInput]) -> dict:
         "temperature": 0.1,
         "response_format": {"type": "json_object"},
     }
-    logger.debug("build_llm_prompt: returning prompt with %d message(s), %d quality + %d feature criteria",
-                 len(prompt["messages"]), len(quality_criteria), len(feature_criteria))
+    logger.debug("build_llm_prompt: returning prompt — %d quality + %d feature criteria",
+                 len(quality_criteria), len(feature_criteria))
     return prompt
 
 
@@ -107,20 +122,24 @@ def build_llm_prompt(image_b64: str, criteria: list[CriterionInput]) -> dict:
 # ---------------------------------------------------------------------------
 
 async def call_vllm(prompt: dict) -> dict:
+    import time
     logger.info("call_vllm: posting to %s (max_retries=%d)", VLLM_QWEN_VL_API, MAX_LLM_RETRIES)
 
     last_exc: Exception | None = None
 
     for attempt in range(MAX_LLM_RETRIES):
         logger.info("call_vllm: attempt %d/%d", attempt + 1, MAX_LLM_RETRIES)
+        t0 = time.monotonic()
         try:
             async with httpx.AsyncClient(timeout=_http_timeout) as client:
                 response = await client.post(VLLM_QWEN_VL_API, json=prompt)
                 response.raise_for_status()
                 data = response.json()
 
+            elapsed = time.monotonic() - t0
+            llm_latency.observe(elapsed)
             content = data["choices"][0]["message"]["content"]
-            logger.debug("call_vllm: raw response content[%d chars]", len(content))
+            logger.debug("call_vllm: response[%d chars] in %.2fs", len(content), elapsed)
 
             try:
                 result = json.loads(content)
@@ -133,22 +152,27 @@ async def call_vllm(prompt: dict) -> dict:
             if "assessment" not in result:
                 raise ValueError(f"Response missing 'assessment' key: {content[:200]}")
 
+            llm_calls_total.labels(status="success").inc()
             verdict = result.get("assessment", {}).get("overall_verdict", "unknown")
             score = result.get("assessment", {}).get("overall_score", "unknown")
             logger.info("call_vllm: returning overall_verdict=%s overall_score=%s", verdict, score)
             return result
 
         except httpx.HTTPError as exc:
+            llm_calls_total.labels(status="failed").inc()
             logger.error("call_vllm: HTTP error on attempt %d: %s", attempt + 1, exc)
             raise HTTPException(status_code=502, detail=f"vLLM call failed: {exc}")
         except (KeyError, IndexError) as exc:
+            llm_calls_total.labels(status="failed").inc()
             logger.error("call_vllm: unexpected response format on attempt %d: %s", attempt + 1, exc)
             raise HTTPException(status_code=502, detail=f"Unexpected vLLM response format: {exc}")
         except (json.JSONDecodeError, ValueError) as exc:
+            llm_calls_total.labels(status="retry").inc()
             logger.warning("call_vllm: parse failure on attempt %d: %s", attempt + 1, exc)
             last_exc = exc
 
-    logger.error("call_vllm: all %d attempts failed, returning error sentinel", MAX_LLM_RETRIES)
+    llm_calls_total.labels(status="failed").inc()
+    logger.error("call_vllm: all %d attempts failed", MAX_LLM_RETRIES)
     return {
         "assessment": {
             "overall_verdict": "FAIL",
@@ -171,33 +195,30 @@ def _normalize_criterion_keys(
     per_criterion: dict, criteria: list[CriterionInput]
 ) -> dict:
     requested_names = [c.name for c in criteria]
-    logger.debug("_normalize_criterion_keys: returned_keys=%s requested=%s",
+    logger.debug("_normalize_criterion_keys: returned=%s requested=%s",
                  list(per_criterion.keys()), requested_names)
-
     normalized: dict = {}
+
     for returned_key, value in per_criterion.items():
         if returned_key in requested_names:
             normalized[returned_key] = value
             continue
-
         lower = returned_key.lower().strip()
         exact_ci = next((n for n in requested_names if n.lower().strip() == lower), None)
         if exact_ci:
             if exact_ci != returned_key:
-                logger.debug("_normalize_criterion_keys: case-insensitive match '%s' -> '%s'",
-                             returned_key, exact_ci)
+                logger.debug("_normalize_criterion_keys: case match '%s' -> '%s'", returned_key, exact_ci)
             normalized[exact_ci] = value
             continue
-
         close = difflib.get_close_matches(returned_key, requested_names, n=1, cutoff=0.6)
         if close:
             logger.debug("_normalize_criterion_keys: fuzzy match '%s' -> '%s'", returned_key, close[0])
             normalized[close[0]] = value
         else:
-            logger.warning("_normalize_criterion_keys: no match found for '%s', keeping as-is", returned_key)
+            logger.warning("_normalize_criterion_keys: no match for '%s', keeping as-is", returned_key)
             normalized[returned_key] = value
 
-    logger.debug("_normalize_criterion_keys: returning normalized_keys=%s", list(normalized.keys()))
+    logger.debug("_normalize_criterion_keys: returning keys=%s", list(normalized.keys()))
     return normalized
 
 
@@ -212,6 +233,7 @@ def validate_and_clamp(assessment: dict, criteria: list[CriterionInput]) -> dict
     except (TypeError, ValueError):
         logger.warning("validate_and_clamp: invalid overall_score=%r, defaulting to 5", raw_score)
         overall_score = 5
+
     assessment["overall_score"] = overall_score
     assessment["overall_verdict"] = _verdict_from_score(overall_score)
 

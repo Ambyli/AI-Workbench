@@ -16,9 +16,15 @@ services:
       - "${PORT_QUALITY_CHECKER}:8000"
     environment:
       - VLLM_QWEN_VL_API=http://vllm-qwen-vl:8000/v1/chat/completions
+      - LOG_LEVEL=INFO
+    volumes:
+      - quality_checker_data:/data
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 30s
       timeout: 5s
       start_period: 10s
       retries: 3
+
+volumes:
+  quality_checker_data:

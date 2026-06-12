@@ -16,7 +16,7 @@ general_settings:
     - path: "/v1/quality-check"
       target: "http://quality-checker:8000"
       include_subpath: true
-      methods: ["POST"]
+      methods: ["GET", "POST", "DELETE"]
       forward_headers: true
 
 mcp_servers:

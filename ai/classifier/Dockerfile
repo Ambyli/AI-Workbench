@@ -8,10 +8,10 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 WORKDIR /app
 
-COPY quality-checker/pyproject.toml .
+COPY classifier/pyproject.toml .
 RUN uv sync --no-dev
 
-COPY quality-checker/*.py .
+COPY classifier/*.py .
 
 EXPOSE 8000
 

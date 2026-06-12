@@ -4,21 +4,21 @@ networks:
     name: ai_shared
 
 services:
-  quality-checker:
+  classifier:
     networks:
       - shared
     build:
       context: .
-      dockerfile: quality-checker/Dockerfile
-    container_name: quality-checker
+      dockerfile: classifier/Dockerfile
+    container_name: classifier
     restart: unless-stopped
     ports:
-      - "${PORT_QUALITY_CHECKER}:8000"
+      - "${PORT_CLASSIFIER}:8000"
     environment:
       - VLLM_QWEN_VL_API=http://vllm-qwen-vl:8000/v1/chat/completions
       - LOG_LEVEL=INFO
     volumes:
-      - quality_checker_data:/data
+      - classifier_data:/data
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 30s
@@ -27,4 +27,4 @@ services:
       retries: 3
 
 volumes:
-  quality_checker_data:
+  classifier_data:

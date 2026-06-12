@@ -9,4 +9,5 @@ dependencies = [
     "opencv-python-headless",
     "numpy",
     "pydantic",
+    "python-multipart",
 ]

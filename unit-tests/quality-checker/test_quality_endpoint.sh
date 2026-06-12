@@ -3,7 +3,8 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 IMAGE_PATH="${1:-$SCRIPT_DIR/Neighborhood.jpeg}"
-CRITERIA="${2:-'[{"name":"document legibility","type":"quality"},{"name":"image sharpness","type":"quality"},{"name":"proper exposure","type":"quality"},{"name":"absence of artifacts","type":"quality"}]'}"
+_DEFAULT_CRITERIA='[{"name":"document legibility","type":"quality"},{"name":"image sharpness","type":"quality"},{"name":"proper exposure","type":"quality"},{"name":"absence of artifacts","type":"quality"}]'
+CRITERIA="${2:-$_DEFAULT_CRITERIA}"
 BASE_URL="${3:-http://192.168.5.233:4001}"
 MAX_WAIT="${4:-300}"
 POLL_INTERVAL="${5:-3}"

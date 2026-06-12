@@ -52,6 +52,23 @@ def _verdict_from_score(score: int) -> str:
 # Prompt building
 # ---------------------------------------------------------------------------
 
+def _build_scaffold(criteria: list[CriterionInput]) -> str:
+    """Build a pre-filled JSON scaffold with all criterion names already as keys.
+
+    The model fills in values rather than inventing keys, preventing it from
+    merging or renaming criteria.
+    """
+    per_criterion = {
+        c.name: {"score": 0, "verdict": "...", "confidence": 0, "reason": "..."}
+        for c in criteria
+    }
+    return json.dumps(
+        {"assessment": {"overall_verdict": "...", "overall_score": 0,
+                        "per_criterion_scores": per_criterion}},
+        indent=2,
+    )
+
+
 def build_llm_prompt(image_b64: str, criteria: list[CriterionInput]) -> dict:
     logger.debug("build_llm_prompt: image_b64[%d chars] criteria=%s",
                  len(image_b64), [c.name for c in criteria])
@@ -59,6 +76,7 @@ def build_llm_prompt(image_b64: str, criteria: list[CriterionInput]) -> dict:
     quality_criteria = [c for c in criteria if c.type == "quality"]
     feature_criteria = [c for c in criteria if c.type == "feature"]
 
+    # --- Criteria descriptions ---
     sections = []
     if quality_criteria:
         names = "\n".join(f"  - {c.name}" for c in quality_criteria)
@@ -77,26 +95,37 @@ def build_llm_prompt(image_b64: str, criteria: list[CriterionInput]) -> dict:
             "    'I observe [specific visual evidence]. Therefore, [feature] is [present/absent/uncertain].'\n"
             f"{names}"
         )
-
     criteria_text = "\n\n".join(sections)
+
+    # --- Pre-filled scaffold (improvement 1) ---
+    scaffold = _build_scaffold(criteria)
+
+    # --- Explicit key list (improvement 2) ---
+    key_list = ", ".join(f'"{c.name}"' for c in criteria)
+    n = len(criteria)
+
+    # --- User message combining all four improvements ---
+    user_text = (
+        f"{criteria_text}\n\n"
+        "Fill in the following JSON structure. "
+        "The keys in per_criterion_scores are already defined — "
+        "do NOT change, rename, merge, or add any keys:\n\n"
+        f"{scaffold}\n\n"
+        f"Required keys in per_criterion_scores ({n} total): {key_list}\n\n"
+        # Improvement 4: verification step
+        f"Before returning, verify your JSON contains exactly those {n} keys in "
+        "per_criterion_scores — no more, no fewer, with names spelled exactly as shown. "
+        "If any key is missing or renamed, revise before responding."
+    )
+
+    # --- System prompt with "do not group" instruction (improvement 3) ---
     system_prompt = (
         "You are an image assessment expert. "
-        "Analyze the provided image against each criterion listed below. "
-        "Return ONLY a valid JSON object with this exact structure:\n"
-        '{"assessment": {\n'
-        '  "overall_verdict": "PASS" | "FAIL" | "MARGINAL",\n'
-        '  "overall_score": <1-10>,\n'
-        '  "per_criterion_scores": {\n'
-        '    "<criterion_name>": {\n'
-        '      "score": <1-10>,\n'
-        '      "verdict": "PASS" | "FAIL" | "MARGINAL",\n'
-        '      "confidence": <0-100>,\n'
-        '      "reason": "<concise explanation supporting your score>"\n'
-        '    }\n'
-        '  }\n'
-        '}}\n\n'
-        "Use the criterion name exactly as given as the JSON key. "
-        "Set confidence to a number 0-100: 0 = completely uncertain, 100 = completely certain."
+        "Analyze the provided image and score it against each criterion listed below. "
+        "Score each criterion independently — do NOT group multiple criteria under a "
+        "single key or summarise them together. "
+        "Set confidence to a number 0-100: 0 = completely uncertain, 100 = completely certain. "
+        "Return ONLY a valid JSON object."
     )
 
     prompt = {
@@ -105,15 +134,15 @@ def build_llm_prompt(image_b64: str, criteria: list[CriterionInput]) -> dict:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": [
                 {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
-                {"type": "text", "text": f"{criteria_text}\n\nReturn your assessment as JSON."},
+                {"type": "text", "text": user_text},
             ]},
         ],
         "max_tokens": 2048,
         "temperature": 0.1,
         "response_format": {"type": "json_object"},
     }
-    logger.debug("build_llm_prompt: returning prompt — %d quality + %d feature criteria",
-                 len(quality_criteria), len(feature_criteria))
+    logger.debug("build_llm_prompt: returning prompt — %d quality + %d feature criteria, scaffold keys=%s",
+                 len(quality_criteria), len(feature_criteria), [c.name for c in criteria])
     return prompt
 
 

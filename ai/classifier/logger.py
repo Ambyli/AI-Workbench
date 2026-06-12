@@ -1,3 +1,3 @@
 import logging
 
-logger = logging.getLogger("quality_checker")
+logger = logging.getLogger("classifier")

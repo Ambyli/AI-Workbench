@@ -18,12 +18,12 @@ _http_timeout = httpx.Timeout(HTTP_TIMEOUT, connect=HTTP_CONNECT_TIMEOUT)
 # ---------------------------------------------------------------------------
 
 llm_calls_total = Counter(
-    "quality_checker_llm_calls_total",
+    "classifier_llm_calls_total",
     "Total LLM API calls by status",
     ["status"],  # success | retry | failed
 )
 llm_latency = Histogram(
-    "quality_checker_llm_latency_seconds",
+    "classifier_llm_latency_seconds",
     "LLM API call latency in seconds",
 )
 

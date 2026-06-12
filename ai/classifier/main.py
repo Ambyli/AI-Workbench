@@ -30,7 +30,7 @@ logging.basicConfig(
     handlers=[_handler],
 )
 logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
-logger.info("Starting Document Quality Checker (log level=%s)", LOG_LEVEL)
+logger.info("Starting Document Classifier (log level=%s)", LOG_LEVEL)
 
 
 # ---------------------------------------------------------------------------
@@ -47,7 +47,7 @@ async def lifespan(app: FastAPI):
     logger.info("lifespan: shutdown complete")
 
 
-app = FastAPI(title="Document Quality Checker", lifespan=lifespan)
+app = FastAPI(title="Document Classifier", lifespan=lifespan)
 app.add_middleware(CorrelationIDMiddleware)
 
 Instrumentator(

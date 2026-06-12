@@ -35,7 +35,7 @@ $(eval $(call service,litellm,litellm))
 $(eval $(call service,unsloth,unsloth))
 $(eval $(call service,vllm,vllm-qwen vllm-qwen-vl))
 $(eval $(call service,kokoro,kokoro-app kokoro-api))
-$(eval $(call service,quality-checker,quality-checker))
+$(eval $(call service,classifier,classifier))
 
 setup: network
 	cd widget && uv sync && cd ..

@@ -7,6 +7,6 @@ scrape_configs:
     static_configs:
       - targets: ["litellm:4000"]
 
-  - job_name: "quality-checker"
+  - job_name: "classifier"
     static_configs:
-      - targets: ["quality-checker:8000"]
+      - targets: ["classifier:8000"]

@@ -19,9 +19,9 @@ fi
 
 # Submit job
 SIZE_KB=$(du -k "$IMAGE_PATH" | cut -f1)
-echo "Submitting ${SIZE_KB} KB image to quality-checker..."
+echo "Submitting ${SIZE_KB} KB image to classifier..."
 
-SUBMIT_RESP=$(curl -s -X POST "$BASE_URL/v1/quality-check/assess" \
+SUBMIT_RESP=$(curl -s -X POST "$BASE_URL/v1/classifier/assess" \
     -H "Authorization: Bearer $API_KEY" \
     -F "image=@$IMAGE_PATH" \
     -F "criteria=$CRITERIA")
@@ -42,7 +42,7 @@ while [ "$ELAPSED" -lt "$MAX_WAIT" ]; do
     sleep "$POLL_INTERVAL"
     ELAPSED=$((ELAPSED + POLL_INTERVAL))
 
-    STATUS_RESP=$(curl -s "$BASE_URL/v1/quality-check/jobs/$JOB_ID" \
+    STATUS_RESP=$(curl -s "$BASE_URL/v1/classifier/jobs/$JOB_ID" \
         -H "Authorization: Bearer $API_KEY")
 
     STATUS=$(echo "$STATUS_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['status'])" 2>/dev/null)

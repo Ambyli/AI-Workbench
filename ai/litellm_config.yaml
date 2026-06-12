@@ -13,8 +13,8 @@ general_settings:
   default_max_tokens: 262144
   always_include_stream_usage: true
   pass_through_endpoints:
-    - path: "/v1/quality-check"
-      target: "http://quality-checker:8000"
+    - path: "/v1/classifier"
+      target: "http://classifier:8000"
       include_subpath: true
       methods: ["GET", "POST", "DELETE"]
       forward_headers: true

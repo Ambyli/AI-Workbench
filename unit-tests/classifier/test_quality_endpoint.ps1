@@ -16,9 +16,9 @@ if (-not $ApiKey) {
 
 # Submit job
 $sizeKB = [Math]::Round((Get-Item $ImagePath).Length / 1KB, 1)
-Write-Host "Submitting ${sizeKB} KB image to quality-checker..."
+Write-Host "Submitting ${sizeKB} KB image to classifier..."
 
-$submitRaw = curl.exe -s -X POST "$BaseUrl/v1/quality-check/assess" `
+$submitRaw = curl.exe -s -X POST "$BaseUrl/v1/classifier/assess" `
     -H "Authorization: Bearer $ApiKey" `
     -F "image=@$ImagePath" `
     -F "criteria=$Criteria"
@@ -41,7 +41,7 @@ while ($elapsed -lt $MaxWaitSeconds) {
     Start-Sleep -Seconds $PollIntervalSeconds
     $elapsed += $PollIntervalSeconds
 
-    $statusRaw = curl.exe -s "$BaseUrl/v1/quality-check/jobs/$jobId" `
+    $statusRaw = curl.exe -s "$BaseUrl/v1/classifier/jobs/$jobId" `
         -H "Authorization: Bearer $ApiKey"
 
     $statusObj = $statusRaw | ConvertFrom-Json

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Test the quality-checker /assess endpoint.
+Test the classifier /assess endpoint.
 
 Submits an image as a job and polls until complete, then prints the result.
 
@@ -54,7 +54,7 @@ def load_api_key() -> str:
 
 
 def submit_job(base_url: str, api_key: str, image_path: Path, criteria: list) -> str:
-    url = f"{base_url}/v1/quality-check/assess"
+    url = f"{base_url}/v1/classifier/assess"
     print(f"  POST {url}")
     with image_path.open("rb") as fh:
         resp = requests.post(
@@ -76,7 +76,7 @@ def poll_job(
     max_wait: int,
     poll_interval: int,
 ) -> dict:
-    url = f"{base_url}/v1/quality-check/jobs/{job_id}"
+    url = f"{base_url}/v1/classifier/jobs/{job_id}"
     headers = {"Authorization": f"Bearer {api_key}"}
     elapsed = 0
 
@@ -138,7 +138,7 @@ def print_result(job: dict) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Submit an image to the quality-checker and print the result.",
+        description="Submit an image to the classifier and print the result.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -156,7 +156,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--base-url", default="http://192.168.5.233:4001",
-        help="Base URL of the LiteLLM proxy (or quality-checker directly)",
+        help="Base URL of the LiteLLM proxy (or classifier directly)",
     )
     parser.add_argument(
         "--api-key", default=None,

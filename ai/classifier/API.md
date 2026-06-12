@@ -1,9 +1,9 @@
-# Quality Checker API
+# Classifier API
 
 FastAPI service that assesses image quality via OpenCV pre-checks and Qwen2.5-VL-7B LLM scoring.
 
 Base URL (direct): `http://<host>:8005`
-Base URL (via LiteLLM passthrough): `http://<host>:4001/v1/quality-check`
+Base URL (via LiteLLM passthrough): `http://<host>:4001/v1/classifier`
 
 All passthrough requests require `Authorization: Bearer <master-key>`.
 
@@ -53,7 +53,7 @@ curl http://localhost:8005/assess \
   -F 'criteria=[{"name":"image sharpness","type":"quality"},{"name":"proper exposure","type":"quality"},{"name":"has solar panels","type":"feature"}]'
 
 # Via LiteLLM passthrough
-curl http://localhost:4001/v1/quality-check/assess \
+curl http://localhost:4001/v1/classifier/assess \
   -H "Authorization: Bearer sk-1234" \
   -F "image=@Neighborhood.jpeg" \
   -F 'criteria=[{"name":"image sharpness","type":"quality"},{"name":"proper exposure","type":"quality"},{"name":"has solar panels","type":"feature"}]'
@@ -218,7 +218,7 @@ Where `similarity_score` is a 0–10 scale derived from how closely the per-crit
 ```
 
 ```bash
-curl http://localhost:4001/v1/quality-check/assess/compare \
+curl http://localhost:4001/v1/classifier/assess/compare \
   -H "Authorization: Bearer sk-1234" \
   -H "Content-Type: application/json" \
   -d @request.json

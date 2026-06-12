@@ -21,17 +21,17 @@ from scoring import aggregate, combined_score, compute_similarity
 # ---------------------------------------------------------------------------
 
 jobs_total = Counter(
-    "quality_checker_jobs_total",
+    "classifier_jobs_total",
     "Total jobs by type and final status",
     ["type", "status"],
 )
 job_duration = Histogram(
-    "quality_checker_job_duration_seconds",
+    "classifier_job_duration_seconds",
     "Job processing time in seconds",
     ["type"],
 )
 job_queue_depth = Gauge(
-    "quality_checker_job_queue_depth",
+    "classifier_job_queue_depth",
     "Number of jobs currently waiting in the queue",
 )
 

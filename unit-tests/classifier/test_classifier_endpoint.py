@@ -198,13 +198,17 @@ def print_result(job: dict, criteria: list = None) -> None:
             for name, val in per.items():
                 if not isinstance(val, dict):
                     continue
-                method = val.get("method", "?")
-                conf   = f"  confidence={val.get('confidence', '?')}"
-                print(f"    {name:<35} {val.get('verdict', '?'):<10} "
-                      f"score={val.get('score', '?')}{conf}  [{method}]")
-                reason = val.get("reason", "")
-                if reason:
-                    print(f"      {reason}")
+                verdict = val.get("verdict", "?")
+                if verdict == "SKIPPED":
+                    print(f"    {name:<35} {'SKIPPED':<10}  [{val.get('reason', '')}]")
+                else:
+                    method = val.get("method", "?")
+                    conf   = f"  confidence={val.get('confidence', '?')}"
+                    print(f"    {name:<35} {verdict:<10} "
+                          f"score={val.get('score', '?')}{conf}  [{method}]")
+                    reason = val.get("reason", "")
+                    if reason:
+                        print(f"      {reason}")
 
         breakdown = assessment.get("weighted_score_breakdown")
         if breakdown:

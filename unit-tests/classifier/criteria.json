@@ -1,8 +1,8 @@
-[
-  {"name": "image sharpness",     "type": "llm", "hint": "quality",  "weight": 1.0},
-  {"name": "proper exposure",     "type": "llm", "hint": "quality",  "weight": 1.0},
-  {"name": "absence of artifacts","type": "llm", "hint": "quality",  "weight": 1.0},
-  {"name": "has solar panels",    "type": "llm", "hint": "presence", "weight": 8.0},
-  {"name": "has trees",           "type": "cv",  "hint": "presence", "weight": 1.0},
-  {"name": "has sky",             "type": "cv",  "hint": "presence", "weight": 1.0}
+[  
+  {"name": "has electrical meter",                 "type": "llm", "hint": "presence", "weight": 4.0},
+  {"name": "meter value is readable",              "type": "llm", "hint": "quality",  "weight": 3.0, "depends_on": "has electrical meter"},
+  {"name": "three feet of clearance around meter", "type": "llm", "hint": "presence", "weight": 2.5, "depends_on": "has electrical meter"},
+  {"name": "has overhead point of interconnection","type": "llm", "hint": "presence", "weight": 2.0},
+  {"name": "sharpness",                            "type": "cv",  "hint": "quality",  "weight": 1.0},
+  {"name": "proper exposure",                      "type": "cv",  "hint": "quality",  "weight": 1.0}
 ]

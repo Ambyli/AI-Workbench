@@ -266,6 +266,79 @@ async def _load_bgr_from_input(data: str, type_: str):
 
 
 # ---------------------------------------------------------------------------
+# Dependency resolution
+# ---------------------------------------------------------------------------
+
+def apply_dependencies(assessment: dict, criteria: list[CriterionInput]) -> dict:
+    """Mark dependent criteria SKIPPED if their dependency did not PASS.
+
+    Called after validate_and_clamp() but before compute_weighted_score() so
+    that skipped criteria are excluded from the weighted calculation.
+
+    A criterion is skipped when its depends_on target has any verdict other
+    than PASS — including FAIL, MARGINAL, or SKIPPED (propagating chains).
+    Skipped criteria receive verdict="SKIPPED", score=None, and contribute
+    zero weight to the overall score.
+
+    Multiple passes are run until no further changes occur, which correctly
+    resolves dependency chains of arbitrary depth (A → B → C).
+
+    Args:
+        assessment: Clamped assessment dict containing per_criterion_scores.
+        criteria:   Full criteria list — only entries with depends_on are checked.
+
+    Returns:
+        The same assessment dict with any dependent criteria marked SKIPPED.
+    """
+    per_criterion = assessment.get("per_criterion_scores", {})
+
+    # Quick exit if no criteria have dependencies
+    if not any(c.depends_on for c in criteria):
+        return assessment
+
+    # Map criterion name → depends_on name for fast lookup
+    dependency_map = {c.name: c.depends_on for c in criteria if c.depends_on}
+
+    # Multi-pass to resolve chains: keep iterating until nothing changes
+    changed = True
+    while changed:
+        changed = False
+        for criterion_name, depends_on_name in dependency_map.items():
+            if criterion_name not in per_criterion:
+                continue
+
+            current = per_criterion[criterion_name]
+
+            # Already skipped — nothing to do
+            if isinstance(current, dict) and current.get("verdict") == "SKIPPED":
+                continue
+
+            # Check the dependency's verdict
+            dep_result = per_criterion.get(depends_on_name, {})
+            dep_verdict = dep_result.get("verdict", "FAIL") if isinstance(dep_result, dict) else "FAIL"
+
+            if dep_verdict != "PASS":
+                logger.info(
+                    "apply_dependencies: skipping '%s' — dependency '%s' verdict=%s",
+                    criterion_name, depends_on_name, dep_verdict,
+                )
+                per_criterion[criterion_name] = {
+                    "verdict":    "SKIPPED",
+                    "score":      None,
+                    "confidence": None,
+                    "reason":     (
+                        f"Skipped — dependency '{depends_on_name}' "
+                        f"did not pass (verdict: {dep_verdict})."
+                    ),
+                    "method":     "skipped",
+                }
+                changed = True
+
+    assessment["per_criterion_scores"] = per_criterion
+    return assessment
+
+
+# ---------------------------------------------------------------------------
 # Weighted score calculation
 # ---------------------------------------------------------------------------
 
@@ -289,7 +362,9 @@ def compute_weighted_score(assessment: dict, criteria: list[CriterionInput]) -> 
     matched = [
         (c, per_criterion[c.name])
         for c in criteria
-        if c.name in per_criterion and isinstance(per_criterion[c.name], dict)
+        if c.name in per_criterion
+        and isinstance(per_criterion[c.name], dict)
+        and per_criterion[c.name].get("verdict") != "SKIPPED"
     ]
 
     if not matched:
@@ -480,6 +555,7 @@ async def analyze_bgr(
         },
     }
     combined_assessment = validate_and_clamp(combined_raw, criteria)
+    combined_assessment = apply_dependencies(combined_assessment, criteria)
     combined_assessment = compute_weighted_score(combined_assessment, criteria)
 
     # Step 6 — assemble the final response dict.

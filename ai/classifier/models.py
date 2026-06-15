@@ -74,6 +74,18 @@ class CriterionInput(BaseModel):
             "to the LLM if no detector matches the name and the criterion falls back."
         ),
     )
+    depends_on: Optional[str] = Field(
+        default=None,
+        description=(
+            "Name of another criterion that must PASS (score >= 7) before this "
+            "criterion is evaluated. If the dependency does not pass — including "
+            "if it was itself skipped — this criterion is marked SKIPPED and "
+            "excluded from the weighted score entirely. "
+            "Chains are supported: A → B → C all skip if A fails. "
+            "Future: a minimum score threshold will be configurable here; "
+            "for now PASS verdict is the only qualifying condition."
+        ),
+    )
 
 
 class ImageInput(BaseModel):

@@ -62,6 +62,18 @@ class CriterionInput(BaseModel):
             "Higher values make this criterion matter more. Default 1.0 for equal weighting."
         ),
     )
+    hint: Literal["quality", "presence", "auto"] = Field(
+        default="auto",
+        description=(
+            "Tells the LLM which scoring rubric to apply to this criterion. "
+            "'quality': score image quality 1-10 (1-3=FAIL, 4-6=MARGINAL, 7-10=PASS). "
+            "'presence': detect presence/absence (10=present, 5=uncertain, 1=absent) with "
+            "chain-of-thought reasoning. "
+            "'auto' (default): LLM infers the rubric from the criterion name. "
+            "For type='cv' criteria: hint is ignored when a detector runs, but is passed "
+            "to the LLM if no detector matches the name and the criterion falls back."
+        ),
+    )
 
 
 class ImageInput(BaseModel):

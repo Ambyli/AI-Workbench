@@ -92,6 +92,46 @@ def _verdict_from_score(score: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Hint rubric definitions
+# ---------------------------------------------------------------------------
+
+# Each entry defines the heading, scoring rubric, and any extra instruction
+# the LLM receives for criteria with that hint value.  build_llm_prompt()
+# groups criteria by hint and emits one section per group using these strings.
+# Edit here to change how any hint type is explained to the LLM — no need to
+# touch the prompt-building logic itself.
+
+HINT_RUBRICS: dict[str, dict[str, str]] = {
+    "quality": {
+        "heading": "QUALITY criteria — score image quality on a 1-10 scale",
+        "rubric":  "1-3 = FAIL (poor quality)  |  4-6 = MARGINAL  |  7-10 = PASS (good quality)",
+        "extra":   "",
+    },
+    "presence": {
+        "heading": "PRESENCE criteria — detect whether each feature is present in the image",
+        "rubric":  (
+            "10 = clearly present (PASS)  |  "
+            "5 = uncertain or partially present (MARGINAL)  |  "
+            "1 = clearly absent (FAIL)"
+        ),
+        "extra":   (
+            "For each PRESENCE criterion your 'reason' MUST follow this structure:\n"
+            "  'I observe [specific visual evidence]. "
+            "Therefore [feature] is [present / absent / uncertain].'"
+        ),
+    },
+    "auto": {
+        "heading": "INFERRED criteria — determine the appropriate rubric from the criterion name",
+        "rubric":  (
+            "Quality/clarity criteria (e.g. 'image sharpness'): score quality 1-10.\n"
+            "  Presence/absence criteria (e.g. 'has X'): "
+            "10=present, 5=uncertain, 1=absent."
+        ),
+        "extra":   "",
+    },
+}
+
+# ---------------------------------------------------------------------------
 # Prompt building
 # ---------------------------------------------------------------------------
 
@@ -148,25 +188,28 @@ def build_llm_prompt(image_b64: str, criteria: list[CriterionInput]) -> dict:
         A dict ready to POST to the vLLM /v1/chat/completions endpoint.
     """
     logger.debug(
-        "build_llm_prompt: image_b64[%d chars] criteria=%s",
+        "build_llm_prompt: image_b64[%d chars] criteria=%s hints=%s",
         len(image_b64),
         [c.name for c in criteria],
+        {c.name: c.hint for c in criteria},
     )
 
-    # --- Unified criteria listing ---
-    names = "\n".join(f"  - {c.name}" for c in criteria)
-    criteria_text = (
-        "Evaluate each criterion against the image and score 1-10.\n"
-        "Use the criterion name to determine the appropriate rubric:\n\n"
-        "  For QUALITY criteria (e.g. 'image sharpness', 'proper exposure', 'absence of artifacts'):\n"
-        "    Score the quality level — 1-3 = FAIL (poor), 4-6 = MARGINAL, 7-10 = PASS (good)\n\n"
-        "  For PRESENCE criteria (e.g. 'has solar panels', 'has people'):\n"
-        "    Score presence — 10 = clearly present (PASS), 5 = uncertain or partial (MARGINAL),\n"
-        "    1 = clearly absent (FAIL)\n"
-        "    Your reason MUST follow: 'I observe [specific visual evidence]. "
-        "Therefore [feature] is [present/absent/uncertain].'\n\n"
-        f"Criteria to evaluate:\n{names}"
-    )
+    # --- Group criteria by hint and emit one rubric section per group ---
+    # Ordering: quality → presence → auto, so explicit hints come first.
+    hint_order = ["quality", "presence", "auto"]
+    sections = []
+    for hint_val in hint_order:
+        group = [c for c in criteria if c.hint == hint_val]
+        if not group:
+            continue
+        rubric_def = HINT_RUBRICS[hint_val]
+        names = "\n".join(f"  - {c.name}" for c in group)
+        section = f"{rubric_def['heading']}:\n  {rubric_def['rubric']}"
+        if rubric_def["extra"]:
+            section += f"\n  {rubric_def['extra']}"
+        section += f"\n{names}"
+        sections.append(section)
+    criteria_text = "\n\n".join(sections)
 
     # --- Improvement 1: pre-filled scaffold ---
     scaffold = _build_scaffold(criteria)

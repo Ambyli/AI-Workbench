@@ -15,6 +15,8 @@ This module wires everything together:
     GET  /jobs/{job_id}     — poll for job status and result.
     GET  /jobs              — list recent jobs.
     DELETE /jobs/{job_id}   — delete a job record.
+    GET  /hints             — list all hint values and their LLM rubric definitions.
+    GET  /cv-detectors      — list all registered CV detector names grouped by function.
     GET  /health            — liveness check.
     GET  /metrics           — Prometheus scrape endpoint (added by Instrumentator).
 
@@ -40,6 +42,8 @@ from prometheus_fastapi_instrumentator import Instrumentator
 import store
 from analysis import parse_criteria, analyze_upload
 from config import DEFAULT_CRITERIA, LOG_LEVEL
+from cv import REGISTRY
+from llm import HINT_RUBRICS
 from logger import logger
 from middleware import CorrelationIDMiddleware, RequestIDFilter, request_id_var
 from models import CompareRequest
@@ -261,6 +265,42 @@ async def delete_job(job_id: str):
     deleted = await store.delete_job(job_id)
     if not deleted:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
+
+
+@app.get("/hints")
+def list_hints():
+    """Return all available hint values and their LLM scoring instructions.
+
+    Hints control which rubric the LLM uses when scoring a criterion.
+    Set hint on any criterion (type='llm', or type='cv' as a fallback).
+    """
+    logger.debug("list_hints: returning %d hint definitions", len(HINT_RUBRICS))
+    return JSONResponse(content={"hints": HINT_RUBRICS})
+
+
+@app.get("/cv-detectors")
+def list_cv_detectors():
+    """Return all registered CV detector names, grouped by detector function.
+
+    Use these names as the 'name' field of a criterion with type='cv'.
+    Fuzzy matching is applied at runtime, so near-matches also work.
+    """
+    logger.debug("list_cv_detectors: building detector map from %d registry entries", len(REGISTRY))
+
+    # Group registry names by the underlying function so callers can see
+    # which aliases map to the same detector.
+    grouped: dict[str, list[str]] = {}
+    for name, fn in REGISTRY.items():
+        fn_name = fn.__name__
+        grouped.setdefault(fn_name, []).append(name)
+
+    detectors = [
+        {"function": fn_name, "names": sorted(names)}
+        for fn_name, names in sorted(grouped.items())
+    ]
+
+    logger.debug("list_cv_detectors: returning %d detectors", len(detectors))
+    return JSONResponse(content={"detectors": detectors, "total_names": len(REGISTRY)})
 
 
 @app.get("/health")

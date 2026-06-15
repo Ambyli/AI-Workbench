@@ -1,6 +1,7 @@
 # Classifier API
 
-FastAPI service that assesses image quality via OpenCV pre-checks and Qwen2.5-VL-7B LLM scoring.
+FastAPI service that assesses image quality and features via OpenCV detectors
+and Qwen2.5-VL-7B LLM scoring.
 
 Base URL (direct): `http://<host>:8005`
 Base URL (via LiteLLM passthrough): `http://<host>:4001/v1/classifier`
@@ -9,121 +10,196 @@ All passthrough requests require `Authorization: Bearer <master-key>`.
 
 ---
 
-## Endpoints
+## Async job pattern
 
-### `GET /health`
+`POST /assess` and `POST /assess/compare` return **202 Accepted** immediately
+with a job ID. Poll `GET /jobs/{job_id}` until `status` is `"completed"` or
+`"failed"`, then read the `result` field.
 
-Returns service status.
-
-```bash
-curl http://localhost:8005/health
 ```
-
-```json
-{ "status": "ok" }
+POST /assess  →  {"job_id": "abc123", "status": "pending"}
+                         ↓  poll
+GET /jobs/abc123  →  {"status": "completed", "result": {...}}
 ```
 
 ---
 
-### `POST /assess`
+## `CriterionInput` — shared input object
 
-Assess a single image via CV pre-checks and LLM scoring.
+Used in both `/assess` (as a JSON array string) and `/assess/compare` (as a
+JSON array in the request body).
 
-**Content-Type:** `multipart/form-data`
-
-| Field | Type | Required | Default | Description |
-|---|---|---|---|---|
-| `image` | File | Yes | — | JPEG or PNG image |
-| `criteria` | string (JSON) | No | see below | JSON array of criterion objects. Each has `name`, `type` (`"cv"` or `"llm"`), and optional `weight` (float, default 1.0). |
-
-#### Criterion types
-
-| Type | Scored by | Score mapping | Token cost |
+| Field | Type | Default | Description |
 |---|---|---|---|
-| `llm` | Vision LLM | 1-10; LLM infers quality vs presence rubric from the criterion name | Yes |
-| `cv` | OpenCV detector (by name) | 1-10 deterministic; falls back to `llm` if no detector matches | **None** |
+| `name` | string | — | The criterion to evaluate. Free-form text — the LLM interprets any name. |
+| `type` | `"cv"` \| `"llm"` | `"llm"` | `"llm"`: scored by the vision LLM. `"cv"`: run through a registered OpenCV detector by name; falls back to LLM if no detector matches. |
+| `weight` | float (> 0) | `1.0` | Relative weight in the combined weighted score. Higher = matters more. |
+| `hint` | `"quality"` \| `"presence"` \| `"auto"` | `"auto"` | Tells the LLM which scoring rubric to use. `"quality"`: score image quality 1-10. `"presence"`: detect feature presence/absence. `"auto"`: LLM infers from the criterion name. Ignored for `cv` criteria that match a detector. |
+| `depends_on` | string \| null | `null` | Name of another criterion that must **PASS** (score ≥ 7) before this criterion is evaluated. If the dependency does not pass — including if it was itself skipped — this criterion is marked `SKIPPED` and excluded from the weighted score. Chains are supported: A → B → C all skip if A fails. |
 
-Every result in `per_criterion_scores` includes a `"method"` field showing which path was actually used (`"cv"` or `"llm"`). A `cv` criterion that fell back to the LLM will show `"method": "llm"`.
+### Criterion scoring rubrics
 
-#### Built-in `cv` detectors
+| `hint` | Score mapping | Verdict thresholds |
+|---|---|---|
+| `quality` | 1-10 quality level | 1-3 = FAIL, 4-6 = MARGINAL, 7-10 = PASS |
+| `presence` | 10=clearly present, 5=uncertain, 1=clearly absent | 7-10 = PASS, 4-6 = MARGINAL, 1-3 = FAIL |
+| `auto` | LLM infers from name | Same thresholds |
 
-| Criterion names | Technique |
+### Built-in `cv` detector names
+
+| Names | Technique |
 |---|---|
 | `sharpness`, `is sharp`, `is blurry` | Laplacian variance |
 | `exposure`, `proper exposure`, `is exposed` | Mean pixel intensity |
 | `has trees`, `has vegetation`, `has greenery`, `has plants` | HSV green masking |
 | `has sky` | Upper-region blue/grey analysis |
 | `has faces`, `has people`, `has person` | OpenCV Haar cascade |
-| `has water`, `has pool`, `has swimming pool` | Blue/teal hue + flat-texture (Laplacian) |
+| `has water`, `has pool`, `has swimming pool` | Blue/teal hue + flat-texture |
 | `has text`, `has text regions`, `has writing` | Sobel edge density per block |
 
-All criteria produce a `confidence` field (0-100). CV detectors are deterministic (always 100 for system checks, heuristic for feature detectors).
+Fuzzy name matching is applied, so near-matches also work. See `GET /cv-detectors` for the full live list.
+
+---
+
+## Endpoints
+
+### `GET /health`
+
+Liveness check.
+
+```bash
+curl http://localhost:8005/health
+# → {"status": "ok"}
+```
+
+---
+
+### `GET /hints`
+
+Returns all available hint values and their LLM scoring instructions.
+
+```bash
+curl http://localhost:4001/v1/classifier/hints -H "Authorization: Bearer sk-1234"
+```
+
+```json
+{
+  "hints": {
+    "quality":  {"heading": "...", "rubric": "...", "extra": ""},
+    "presence": {"heading": "...", "rubric": "...", "extra": "...chain-of-thought instruction..."},
+    "auto":     {"heading": "...", "rubric": "...", "extra": ""}
+  }
+}
+```
+
+---
+
+### `GET /cv-detectors`
+
+Returns all registered CV detector functions and their name aliases.
+
+```bash
+curl http://localhost:4001/v1/classifier/cv-detectors -H "Authorization: Bearer sk-1234"
+```
+
+```json
+{
+  "detectors": [
+    {"function": "check_blur",        "names": ["is blurry", "is sharp", "sharpness"]},
+    {"function": "detect_vegetation", "names": ["has greenery", "has plants", "has trees", "has vegetation"]}
+  ],
+  "total_names": 20
+}
+```
+
+---
+
+### `POST /assess`
+
+Submit a single-image assessment job.
+
+**Content-Type:** `multipart/form-data`  
+**Returns:** `202 Accepted` — poll `GET /jobs/{job_id}` for the result.
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `image` | File | Yes | — | JPEG or PNG image |
+| `criteria` | string (JSON array) | No | see defaults | JSON array of `CriterionInput` objects |
 
 **Example request:**
 
 ```bash
-curl http://localhost:8005/assess \
-  -F "image=@Neighborhood.jpeg" \
-  -F 'criteria=[{"name":"image sharpness","type":"llm"},{"name":"has solar panels","type":"llm","weight":3.0},{"name":"has trees","type":"cv"},{"name":"sharpness","type":"cv"}]'
-
-# Via LiteLLM passthrough
 curl http://localhost:4001/v1/classifier/assess \
   -H "Authorization: Bearer sk-1234" \
-  -F "image=@Neighborhood.jpeg" \
-  -F 'criteria=[{"name":"image sharpness","type":"llm"},{"name":"has solar panels","type":"llm","weight":3.0},{"name":"has trees","type":"cv"},{"name":"sharpness","type":"cv"}]'
+  -F "image=@meter.jpg" \
+  -F 'criteria=[
+    {"name":"has electrical meter",                 "type":"llm","hint":"presence","weight":4.0},
+    {"name":"meter value is readable",              "type":"llm","hint":"quality", "weight":3.0,"depends_on":"has electrical meter"},
+    {"name":"three feet of clearance around meter", "type":"llm","hint":"presence","weight":2.5,"depends_on":"has electrical meter"},
+    {"name":"sharpness",                            "type":"cv",                  "weight":1.0}
+  ]'
+# → {"job_id": "abc123", "status": "pending"}
 ```
 
-**Example response:**
+**Polling:**
+
+```bash
+curl http://localhost:4001/v1/classifier/jobs/abc123 -H "Authorization: Bearer sk-1234"
+```
+
+**Result shape** (inside `job.result`):
 
 ```json
 {
-  "status": "ok",
-  "image_info": {
-    "width": 1920,
-    "height": 500,
-    "format": "image/jpeg",
-    "size_bytes": 318243
-  },
-  "cv_pre_checks": {
-    "sharpness": {
-      "criterion": "sharpness",
-      "score": 8,
-      "verdict": "PASS",
-      "detail": "Laplacian variance: 312.4 (threshold: 100.0)"
-    },
-    "exposure": {
-      "criterion": "exposure",
-      "score": 7,
-      "verdict": "PASS",
-      "detail": "Normal exposure (mean: 142.3)"
-    }
-  },
-  "cv_overall_verdict": "PASS",
-  "llm_assessment": {
+  "image_info": {"width": 480, "height": 640, "format": "image/jpeg", "size_bytes": 112400},
+  "assessment": {
     "overall_verdict": "PASS",
-    "overall_score": 8,
+    "overall_score": 9,
     "per_criterion_scores": {
-      "image sharpness": {
-        "score": 8,
-        "verdict": "PASS",
-        "confidence": "high",
-        "reason": "Image is crisp with well-defined edges and fine detail visible"
+      "has electrical meter": {
+        "score": 10, "verdict": "PASS", "confidence": 95, "method": "llm",
+        "reason": "I observe a clearly visible electrical meter on the wall. Therefore has electrical meter is present."
       },
-      "proper exposure": {
-        "score": 7,
-        "verdict": "PASS",
-        "confidence": "high",
-        "reason": "Balanced lighting with natural evening ambience"
+      "meter value is readable": {
+        "score": 8, "verdict": "PASS", "confidence": 80, "method": "llm",
+        "reason": "The meter dial is visible and digits are legible."
       },
-      "has solar panels": {
-        "score": 10,
-        "verdict": "PASS",
-        "confidence": "high",
-        "reason": "Solar panels are clearly visible on the rooftops of all houses"
+      "three feet of clearance around meter": {
+        "score": 7, "verdict": "PASS", "confidence": 70, "method": "llm",
+        "reason": "I observe no obstructions within approximately three feet of the meter."
+      },
+      "sharpness": {
+        "score": 9, "verdict": "PASS", "confidence": 100, "method": "cv",
+        "detail": "Laplacian variance: 412.3 (threshold: 100.0)"
+      }
+    },
+    "weighted_score_breakdown": {
+      "formula": "sum(score * weight) / total_weight",
+      "total_weight": 10.5,
+      "weighted_sum": 93.5,
+      "unrounded_average": 8.9047,
+      "final_score": 9,
+      "per_criterion": {
+        "has electrical meter":                 {"score": 10, "weight": 4.0, "contribution": 40.0},
+        "meter value is readable":              {"score": 8,  "weight": 3.0, "contribution": 24.0},
+        "three feet of clearance around meter": {"score": 7,  "weight": 2.5, "contribution": 17.5},
+        "sharpness":                            {"score": 9,  "weight": 1.0, "contribution": 9.0}
       }
     }
   },
-  "combined_verdict": "PASS"
+  "verdict": "PASS"
+}
+```
+
+**Skipped criterion example** (when `has electrical meter` fails):
+
+```json
+"meter value is readable": {
+  "verdict": "SKIPPED",
+  "score": null,
+  "confidence": null,
+  "method": "skipped",
+  "reason": "Skipped - dependency 'has electrical meter' did not pass (verdict: FAIL)."
 }
 ```
 
@@ -131,183 +207,135 @@ curl http://localhost:4001/v1/classifier/assess \
 
 ### `POST /assess/compare`
 
-Assess an input image against one or more reference examples. Each example has its own weight controlling how much similarity to that example influences its combined score. Examples without `pre_generated_analysis` are analysed concurrently.
+Submit a comparison job — assess an input image against one or more reference examples.
 
-**Content-Type:** `application/json`
-
-#### Top-level fields
+**Content-Type:** `application/json`  
+**Returns:** `202 Accepted` — poll `GET /jobs/{job_id}` for the result.
 
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `image` | `ImageInput` | Yes | — | The input image to assess |
-| `criteria` | `CriterionInput[]` | No | see `/assess` defaults | List of criterion objects with `name` and `type` |
-| `aggregation` | `mean` \| `min` \| `max` | No | `mean` | How to collapse per-example combined scores into one aggregate verdict |
-| `examples` | `ExampleInput[]` | Yes | — | One or more reference images (min 1) |
-
-**Aggregation options:**
-
-| Value | Behaviour | Use when |
-|---|---|---|
-| `mean` | Average of all combined scores | All examples are equally important references |
-| `min` | Lowest combined score wins | Input must be close to every example |
-| `max` | Highest combined score wins | Input only needs to match any one example |
+| `image` | `ImageInput` | Yes | — | The subject image |
+| `criteria` | `CriterionInput[]` | No | defaults | List of criterion objects |
+| `aggregation` | `mean` \| `min` \| `max` | No | `mean` | How to collapse per-example scores into one aggregate |
+| `examples` | `ExampleInput[]` | Yes (min 1) | — | Reference images to compare against |
 
 #### `ImageInput`
 
 | Field | Type | Description |
 |---|---|---|
-| `data` | string | Base64-encoded image or a URL |
-| `type` | `base64` \| `url` | Tells the service how to interpret `data` |
+| `data` | string | Base64-encoded image or a URL (SSRF-checked before fetching) |
+| `type` | `"base64"` \| `"url"` | How to interpret `data` |
 
 #### `ExampleInput`
 
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `data` | string | Yes* | — | Base64-encoded image or a URL |
-| `type` | `base64` \| `url` | Yes* | — | How to interpret `data` |
-| `weight` | float (0.0–1.0) | No | `0.5` | How much similarity to this example affects its combined score.<br>`0.0` = ignore example, use only absolute quality score.<br>`1.0` = ignore absolute quality, use only similarity score. |
-| `pre_generated_analysis` | object | No | `null` | A prior analysis result (from `example_results[n].example_analysis` or a `/assess` response). Skips the LLM call for this example. **Must be from the same classifier version** — see caching note below. |
+| `data` | string | Yes | — | Base64-encoded image or URL |
+| `type` | `"base64"` \| `"url"` | Yes | — | How to interpret `data` |
+| `weight` | float (0.0–1.0) | No | `0.5` | How much similarity to this example influences its combined score. `0.0` = absolute quality only; `1.0` = similarity only. |
+| `pre_generated_analysis` | object | No | `null` | A prior result from `/assess` or `example_results[n].example_analysis`. Skips re-analysis of this example. **Must be from the same classifier version** — see caching note below. |
 
-\* Not required if `pre_generated_analysis` is provided and you don't need the image re-analysed.
+#### Aggregation options
+
+| Value | Behaviour | Use when |
+|---|---|---|
+| `mean` | Average of all combined scores | All examples equally important |
+| `min` | Lowest combined score wins | Input must be close to every example |
+| `max` | Highest combined score wins | Input needs to match any one example |
 
 #### Combined score formula
-
-Each example produces its own combined score:
 
 ```
 combined = (1 - weight) × input_overall_score + weight × similarity_score
 ```
 
-Where `similarity_score` is a 0–10 scale derived from how closely the per-criterion scores of the input match the example. Scores are then aggregated across all examples using the chosen `aggregation` method.
-
-**Verdicts:** `PASS` ≥ 7 · `MARGINAL` 4–6 · `FAIL` < 4
-
----
-
-**Example request — two examples, one pre-generated:**
+**Example request:**
 
 ```json
 {
-  "image": {
-    "data": "<base64-encoded input image>",
-    "type": "base64"
-  },
+  "image": {"data": "<base64>", "type": "base64"},
   "criteria": [
-    {"name": "image sharpness", "type": "quality"},
-    {"name": "proper exposure", "type": "quality"},
-    {"name": "has solar panels", "type": "feature"}
+    {"name": "has electrical meter", "type": "llm", "hint": "presence", "weight": 4.0},
+    {"name": "meter value is readable", "type": "llm", "hint": "quality", "weight": 3.0, "depends_on": "has electrical meter"}
   ],
   "aggregation": "mean",
   "examples": [
-    {
-      "data": "<base64-encoded reference image>",
-      "type": "base64",
-      "weight": 0.8
-    },
-    {
-      "data": "https://example.com/reference2.jpg",
-      "type": "url",
-      "weight": 0.4,
-      "pre_generated_analysis": {
-        "image_info": { "width": 1920, "height": 1080, "format": "image/jpeg", "size_bytes": 245000 },
-        "cv_pre_checks": {
-          "sharpness": { "criterion": "sharpness", "score": 8, "verdict": "PASS", "detail": "Laplacian variance: 312.4 (threshold: 100.0)" },
-          "exposure": { "criterion": "exposure", "score": 7, "verdict": "PASS", "detail": "Normal exposure (mean: 142.3)" }
-        },
-        "cv_overall_verdict": "PASS",
-        "llm_assessment": {
-          "overall_verdict": "PASS",
-          "overall_score": 8,
-          "per_criterion_scores": {
-            "image sharpness": { "score": 8, "verdict": "PASS", "reason": "Crisp edges throughout" },
-            "proper exposure": { "score": 7, "verdict": "PASS", "reason": "Balanced lighting" },
-            "absence of artifacts": { "score": 9, "verdict": "PASS", "reason": "Clean render" }
-          }
-        },
-        "combined_verdict": "PASS"
-      }
-    }
+    {"data": "<base64>", "type": "base64", "weight": 0.5},
+    {"data": "<base64>", "type": "base64", "weight": 0.5, "pre_generated_analysis": {"image_info": {}, "assessment": {}, "verdict": "PASS"}}
   ]
 }
 ```
 
-```bash
-curl http://localhost:4001/v1/classifier/assess/compare \
-  -H "Authorization: Bearer sk-1234" \
-  -H "Content-Type: application/json" \
-  -d @request.json
-```
-
-**Example response:**
+**Result shape** (inside `job.result`):
 
 ```json
 {
   "status": "ok",
-  "criteria": [
-    {"name": "image sharpness", "type": "quality"},
-    {"name": "proper exposure", "type": "quality"},
-    {"name": "has solar panels", "type": "feature"}
-  ],
+  "criteria": [...],
   "aggregation": "mean",
   "input_analysis": {
-    "image_info": { "width": 1920, "height": 500, "format": "image/jpeg", "size_bytes": 318243 },
-    "cv_pre_checks": { "sharpness": { "score": 8, "verdict": "PASS", "detail": "..." }, "exposure": { "score": 7, "verdict": "PASS", "detail": "..." } },
-    "cv_overall_verdict": "PASS",
-    "llm_assessment": {
-      "overall_verdict": "PASS",
-      "overall_score": 8,
-      "per_criterion_scores": {
-        "image sharpness": { "score": 8, "verdict": "PASS", "reason": "..." },
-        "proper exposure": { "score": 7, "verdict": "PASS", "reason": "..." },
-        "absence of artifacts": { "score": 9, "verdict": "PASS", "reason": "..." }
-      }
-    },
-    "combined_verdict": "PASS"
+    "image_info": {"width": 480, "height": 640, "format": "image/jpeg", "size_bytes": 112400},
+    "assessment": {"overall_verdict": "PASS", "overall_score": 9, "per_criterion_scores": {...}, "weighted_score_breakdown": {...}},
+    "verdict": "PASS"
   },
   "example_results": [
     {
       "index": 0,
-      "weight": 0.8,
+      "weight": 0.5,
       "pre_generated": false,
-      "example_analysis": { "...": "same shape as input_analysis" },
+      "example_analysis": {"image_info": {...}, "assessment": {...}, "verdict": "PASS"},
       "similarity": {
-        "overall_similarity": 0.889,
-        "similarity_score": 8.9,
+        "overall_similarity": 0.92,
+        "similarity_score": 9.2,
         "per_criterion": {
-          "image sharpness": { "example_score": 9, "input_score": 8, "similarity": 0.889 },
-          "proper exposure": { "example_score": 7, "input_score": 7, "similarity": 1.0 },
-          "absence of artifacts": { "example_score": 8, "input_score": 9, "similarity": 0.889 }
+          "has electrical meter":    {"example_score": 10, "input_score": 10, "similarity": 1.0},
+          "meter value is readable": {"example_score": 8,  "input_score": 8,  "similarity": 1.0}
         }
       },
-      "combined_score": 8.7,
-      "combined_verdict": "PASS"
-    },
-    {
-      "index": 1,
-      "weight": 0.4,
-      "pre_generated": true,
-      "example_analysis": { "...": "the pre_generated_analysis you passed in" },
-      "similarity": {
-        "overall_similarity": 0.741,
-        "similarity_score": 7.4,
-        "per_criterion": {
-          "image sharpness": { "example_score": 8, "input_score": 8, "similarity": 1.0 },
-          "proper exposure": { "example_score": 7, "input_score": 7, "similarity": 1.0 },
-          "absence of artifacts": { "example_score": 9, "input_score": 9, "similarity": 1.0 }
-        }
-      },
-      "combined_score": 7.8,
+      "combined_score": 9.1,
       "combined_verdict": "PASS"
     }
   ],
   "aggregate": {
     "method": "mean",
-    "combined_score": 8.3,
+    "combined_score": 9.1,
     "combined_verdict": "PASS",
-    "per_example_combined_scores": [8.7, 7.8]
+    "per_example_combined_scores": [9.1]
   }
 }
 ```
+
+---
+
+### `GET /jobs/{job_id}`
+
+Poll for the status and result of a submitted job.
+
+```bash
+curl http://localhost:4001/v1/classifier/jobs/abc123 -H "Authorization: Bearer sk-1234"
+```
+
+```json
+{"id": "abc123", "status": "completed", "type": "assess", "result": {...}, "created_at": "...", "updated_at": "..."}
+```
+
+`status` values: `pending` → `processing` → `completed` | `failed`
+
+---
+
+### `GET /jobs`
+
+List recent jobs (newest first, result blobs excluded).
+
+```bash
+curl "http://localhost:4001/v1/classifier/jobs?limit=10" -H "Authorization: Bearer sk-1234"
+```
+
+---
+
+### `DELETE /jobs/{job_id}`
+
+Delete a job record. Returns `204 No Content`.
 
 ---
 
@@ -315,20 +343,21 @@ curl http://localhost:4001/v1/classifier/assess/compare \
 
 Re-analysing the same reference image on every request wastes LLM tokens. The recommended pattern is:
 
-1. Call `/assess` once on each reference image and save the response.
-2. Pass the saved response as `pre_generated_analysis` in subsequent `/assess/compare` calls.
+1. Call `/assess` once on each reference image and retrieve the result via `GET /jobs/{job_id}`.
+2. Save the `result` object from the job.
+3. Pass the saved result as `pre_generated_analysis` in subsequent `/assess/compare` calls.
 
-The `pre_generated_analysis` field accepts the full object returned under `example_results[n].example_analysis` in any compare response, or the root-level response from `/assess`.
-
-> **Compatibility warning:** `pre_generated_analysis` values must come from the same version of the classifier that is currently running. The internal response structure (e.g. the shape of `assessment.combined`) can change between releases. A stored analysis generated against an older version will cause a runtime error when the compare endpoint tries to access fields that have moved or been renamed. Always re-generate stored analyses after upgrading the classifier.
+> **Compatibility warning:** `pre_generated_analysis` values must come from the same version of the classifier that is currently running. The internal response structure can change between releases. A stored analysis from an older version will cause a runtime error. Always re-generate stored analyses after upgrading the classifier.
 
 ---
 
-## CV pre-check thresholds
+## Verdict thresholds
 
-| Check | Method | PASS threshold |
-|---|---|---|
-| Sharpness | Laplacian variance | ≥ 100.0 |
-| Exposure | Mean pixel intensity | 30.0 – 220.0 |
+| Score | Verdict |
+|---|---|
+| 7–10 | PASS |
+| 4–6 | MARGINAL |
+| 1–3 | FAIL |
+| — | SKIPPED (dependency did not pass) |
 
-These run on every image regardless of the criteria string and are merged into the LLM per-criterion scores if not already present.
+SKIPPED criteria are excluded from the weighted score calculation entirely.

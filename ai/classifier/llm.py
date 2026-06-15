@@ -444,7 +444,7 @@ def validate_and_clamp(assessment: dict, criteria: list[CriterionInput]) -> dict
 
     assessment["per_criterion_scores"] = per_criterion
 
-    # Step 4 — weighted overall score
+    # Step 4 — weighted overall score + transparency breakdown
     # Find all criteria whose names appear in the normalised per_criterion dict
     matched = [
         (c, per_criterion[c.name]) for c in criteria
@@ -455,10 +455,30 @@ def validate_and_clamp(assessment: dict, criteria: list[CriterionInput]) -> dict
         if total_weight > 0:
             # Weighted average of clamped per-criterion scores
             weighted_sum = sum(val["score"] * c.weight for c, val in matched)
-            weighted_score = max(1, min(10, round(weighted_sum / total_weight)))
+            unrounded = weighted_sum / total_weight
+            weighted_score = max(1, min(10, round(unrounded)))
+
             # Step 5 — overwrite the preliminary overall score with the weighted result
             assessment["overall_score"] = weighted_score
             assessment["overall_verdict"] = _verdict_from_score(weighted_score)
+
+            # Attach a full breakdown so callers can audit exactly how the
+            # final score was derived from each criterion's score and weight
+            assessment["weighted_score_breakdown"] = {
+                "formula": "sum(score × weight) / total_weight",
+                "total_weight": round(total_weight, 4),
+                "weighted_sum": round(weighted_sum, 4),
+                "unrounded_average": round(unrounded, 4),
+                "final_score": weighted_score,
+                "per_criterion": {
+                    c.name: {
+                        "score": val["score"],
+                        "weight": c.weight,
+                        "contribution": round(val["score"] * c.weight, 4),
+                    }
+                    for c, val in matched
+                },
+            }
             logger.debug("validate_and_clamp: weighted score=%s weights=%s",
                          weighted_score, {c.name: c.weight for c, _ in matched})
 

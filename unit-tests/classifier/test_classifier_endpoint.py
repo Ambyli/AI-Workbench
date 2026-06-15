@@ -115,21 +115,32 @@ def print_result(job: dict, criteria: list = None) -> None:
         print(f"{'-' * 60}")
 
         per = assessment.get("per_criterion_scores", {})
-        # Build weight lookup from the criteria file if available
-        weight_map = {c["name"]: c.get("weight", 1.0) for c in (criteria or [])}
         if per:
             print("\n  Per-criterion scores:")
             for name, val in per.items():
                 if not isinstance(val, dict):
                     continue
-                weight = weight_map.get(name, 1.0)
-                weight_str = f"  weight={weight}"
                 conf = f"  confidence={val.get('confidence', '?')}"
+                weight = val.get("weight", "")
+                weight_str = f"  weight={weight}" if weight != "" else ""
                 print(f"    {name:<35} {val.get('verdict', '?'):<10} "
                       f"score={val.get('score', '?')}{conf}{weight_str}")
                 reason = val.get("reason", "")
                 if reason:
                     print(f"      {reason}")
+
+        breakdown = assessment.get("weighted_score_breakdown")
+        if breakdown:
+            print(f"\n  Weighted score breakdown  ({breakdown.get('formula')})")
+            print(f"  {'Criterion':<35} {'Score':>5}  {'Weight':>7}  {'Contribution':>12}")
+            print(f"  {'-'*35}  {'-'*5}  {'-'*7}  {'-'*12}")
+            for name, vals in breakdown.get("per_criterion", {}).items():
+                print(f"  {name:<35} {vals['score']:>5}  {vals['weight']:>7}  {vals['contribution']:>12.4f}")
+            print(f"  {'-'*35}  {'-'*5}  {'-'*7}  {'-'*12}")
+            print(f"  {'Total weight':<35} {'':>5}  {breakdown['total_weight']:>7}  "
+                  f"{'Σ = ' + str(round(breakdown['weighted_sum'], 4)):>12}")
+            print(f"  {'Unrounded average':<35} {breakdown['unrounded_average']:>5.4f}")
+            print(f"  {'Final score (rounded)':<35} {breakdown['final_score']:>5}")
 
         print("\n  Full JSON:")
         print(json.dumps(result, indent=2))

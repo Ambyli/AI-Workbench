@@ -2,6 +2,6 @@
   {"name": "image sharpness",     "type": "quality", "weight": 1.0},
   {"name": "proper exposure",     "type": "quality", "weight": 1.0},
   {"name": "absence of artifacts","type": "quality", "weight": 1.0},
-  {"name": "has solar panels",    "type": "feature", "weight": 3.0},
+  {"name": "has solar panels",    "type": "feature", "weight": 8.0},
   {"name": "has trees",           "type": "feature", "weight": 1.0}
 ]

@@ -20,7 +20,7 @@ Process flow position: called by workers._run_compare() after all analyses
 """
 
 from logger import logger
-from llm import _verdict_from_score
+from utils import verdict_from_score as _verdict_from_score
 
 
 def compute_similarity(example_assessment: dict, input_assessment: dict) -> dict:

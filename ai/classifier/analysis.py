@@ -43,6 +43,7 @@ from models import CriterionInput, ImageInput, ExampleInput
 from cv import get_detector
 from llm import encode_image_to_base64, build_llm_prompt, call_vllm, validate_and_clamp
 from ssrf import validate_url
+from utils import verdict_from_score as _verdict_from_score
 
 _http_timeout = httpx.Timeout(HTTP_TIMEOUT, connect=HTTP_CONNECT_TIMEOUT)
 
@@ -241,6 +242,67 @@ async def _load_bgr_from_input(data: str, type_: str):
 
 
 # ---------------------------------------------------------------------------
+# Weighted score calculation
+# ---------------------------------------------------------------------------
+
+def compute_weighted_score(assessment: dict, criteria: list[CriterionInput]) -> dict:
+    """Compute the weighted overall score and attach the breakdown to the assessment.
+
+    Called only on combined_assessment after validate_and_clamp() has already
+    clamped all per-criterion scores.  Overwrites overall_score and
+    overall_verdict with the weighted result and adds weighted_score_breakdown.
+
+    Args:
+        assessment: Clamped assessment dict containing per_criterion_scores.
+        criteria:   Full criteria list providing each criterion's weight.
+
+    Returns:
+        The same assessment dict with overall_score, overall_verdict, and
+        weighted_score_breakdown updated in place.
+    """
+    per_criterion = assessment.get("per_criterion_scores", {})
+    matched = [
+        (c, per_criterion[c.name])
+        for c in criteria
+        if c.name in per_criterion and isinstance(per_criterion[c.name], dict)
+    ]
+
+    if not matched:
+        logger.warning("compute_weighted_score: no matched criteria — skipping")
+        return assessment
+
+    total_weight = sum(c.weight for c, _ in matched)
+    if total_weight == 0:
+        logger.warning("compute_weighted_score: total_weight is 0 — skipping")
+        return assessment
+
+    weighted_sum   = sum(val["score"] * c.weight for c, val in matched)
+    unrounded      = weighted_sum / total_weight
+    weighted_score = max(1, min(10, round(unrounded)))
+
+    assessment["overall_score"]   = weighted_score
+    assessment["overall_verdict"] = _verdict_from_score(weighted_score)
+    assessment["weighted_score_breakdown"] = {
+        "formula":           "sum(score * weight) / total_weight",
+        "total_weight":      round(total_weight, 4),
+        "weighted_sum":      round(weighted_sum, 4),
+        "unrounded_average": round(unrounded, 4),
+        "final_score":       weighted_score,
+        "per_criterion": {
+            c.name: {
+                "score":        val["score"],
+                "weight":       c.weight,
+                "contribution": round(val["score"] * c.weight, 4),
+            }
+            for c, val in matched
+        },
+    }
+    logger.info("compute_weighted_score: final_score=%s weights=%s",
+                weighted_score, {c.name: c.weight for c, _ in matched})
+    return assessment
+
+
+# ---------------------------------------------------------------------------
 # Core analysis pipeline
 # ---------------------------------------------------------------------------
 
@@ -345,7 +407,7 @@ async def analyze_bgr(
         for val in llm_raw.get("assessment", {}).get("per_criterion_scores", {}).values():
             if isinstance(val, dict):
                 val["method"] = "llm"
-        # Validate and clamp LLM assessment using only the LLM-bound criteria
+        # Validate and clamp LLM assessment using only the LLM-bound criteria.
         llm_assessment = validate_and_clamp(llm_raw.get("assessment", {}), llm_criteria)
     else:
         logger.info("analyze_bgr: all criteria resolved via CV — skipping LLM call")
@@ -365,19 +427,27 @@ async def analyze_bgr(
         },
     }
     combined_assessment = validate_and_clamp(combined_raw, criteria)
+    combined_assessment = compute_weighted_score(combined_assessment, criteria)
 
-    # Step 6 — assemble the final response dict
+    # Step 6 — assemble the final response dict.
+    # combined_verdict is derived directly from the weighted_score_breakdown
+    # final_score so the connection between score and verdict is explicit.
+    breakdown = combined_assessment.get("weighted_score_breakdown", {})
+    combined_verdict = combined_assessment.get("overall_verdict", "PASS")
+    logger.debug("analyze_bgr: combined breakdown final_score=%s → verdict=%s",
+                 breakdown.get("final_score"), combined_verdict)
+
     result = {
         "image_info": {
             "width": original_w, "height": original_h,
             "format": content_type, "size_bytes": size_bytes,
         },
         "assessment": {
-            "cv":       cv_assessment,         # CV-only: per-criterion + overall_verdict + overall_score
-            "llm":      llm_assessment,     # LLM-only: per-criterion + overall_verdict + overall_score
-            "combined": combined_assessment, # CV + LLM merged: per-criterion + weighted breakdown
+            "cv":       cv_assessment,       # CV-only: overall_verdict, overall_score, per-criterion
+            "llm":      llm_assessment,      # LLM-only: overall_verdict, overall_score, per-criterion
+            "combined": combined_assessment, # all criteria + weighted_score_breakdown
         },
-        "combined_verdict": combined_assessment.get("overall_verdict", "PASS"),
+        "combined_verdict": combined_verdict,
     }
     logger.info("analyze_bgr: returning combined_verdict=%s cv=%s llm=%s combined=%s",
                 result["combined_verdict"],

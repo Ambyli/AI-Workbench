@@ -13,8 +13,9 @@ This module is responsible for everything that touches the language model:
                                  requested criterion names (handles capitalisation
                                  and minor spelling differences).
   5. validate_and_clamp()      — clamps all LLM scores/confidence values to
-                                 valid ranges, recomputes verdicts from scores,
-                                 and calculates the weighted overall score.
+                                 valid ranges and recomputes verdicts from scores.
+                                 Weighted score calculation is handled separately
+                                 by analysis.compute_weighted_score().
 
 Process flow position: called by analysis.analyze_bgr() after the image is
 ready.  Returns a validated assessment dict that analysis packages into the
@@ -33,6 +34,7 @@ from prometheus_client import Counter, Histogram
 from config import VLLM_QWEN_VL_API, MAX_LLM_RETRIES, HTTP_TIMEOUT, HTTP_CONNECT_TIMEOUT
 from logger import logger
 from models import CriterionInput
+from utils import verdict_from_score as _verdict_from_score
 
 # Shared HTTP timeout applied to every vLLM request
 _http_timeout = httpx.Timeout(HTTP_TIMEOUT, connect=HTTP_CONNECT_TIMEOUT)
@@ -77,18 +79,6 @@ def encode_image_to_base64(image) -> str:
     logger.debug("encode_image_to_base64: returning base64[%d chars]", len(result))
     return result
 
-
-def _verdict_from_score(score: int) -> str:
-    """Map a 1-10 score to a PASS / MARGINAL / FAIL verdict string.
-
-    Thresholds: 7-10 = PASS, 4-6 = MARGINAL, 1-3 = FAIL.
-    Used both to recompute per-criterion verdicts after clamping and to
-    derive the overall verdict from the weighted score.
-    """
-    logger.debug("_verdict_from_score: score=%s", score)
-    verdict = "PASS" if score >= 7 else ("MARGINAL" if score >= 4 else "FAIL")
-    logger.debug("_verdict_from_score: returning %s", verdict)
-    return verdict
 
 
 # ---------------------------------------------------------------------------
@@ -470,27 +460,24 @@ def _normalize_criterion_keys(
 
 
 def validate_and_clamp(assessment: dict, criteria: list[CriterionInput]) -> dict:
-    """Validate, clamp, and recompute the LLM assessment before it leaves this module.
+    """Clamp scores/confidence to valid ranges, normalise criterion keys, and
+    recompute per-criterion verdicts from the clamped scores.
 
-    The LLM can return values outside the expected ranges (e.g. score=12,
-    confidence=-5).  This function corrects those silently rather than failing
-    the request.
+    Does NOT compute the weighted overall score — call compute_weighted_score()
+    separately when a weighted breakdown is needed (i.e. for combined_assessment).
 
     Steps:
-      1. Clamp and normalise per-criterion scores/confidence values.
-      2. Recompute per-criterion verdicts from clamped scores (ignores LLM verdict).
-      3. Normalise criterion keys via _normalize_criterion_keys().
-      4. Compute the weighted overall score from per-criterion scores and weights.
-      5. Derive the overall verdict from the weighted score.
+      1. Clamp raw overall_score to [1, 10]; set preliminary overall_verdict.
+      2. Normalise criterion keys via _normalize_criterion_keys().
+      3. Clamp per-criterion score to [1, 10] and confidence to [0, 100].
+      4. Recompute per-criterion verdict from the clamped score.
 
     Args:
         assessment: Raw assessment dict from call_vllm() (may have bad values).
-        criteria:   The original criteria list, used for key normalisation and
-                    weight lookup.
+        criteria:   Criteria list used for key normalisation.
 
     Returns:
-        Cleaned assessment dict with valid scores, verdicts, and a weighted
-        overall_score that reflects criterion weights.
+        Cleaned assessment dict with valid scores and verdicts.
     """
     logger.info(
         "validate_and_clamp: raw overall_score=%s overall_verdict=%s criteria=%s",
@@ -499,7 +486,7 @@ def validate_and_clamp(assessment: dict, criteria: list[CriterionInput]) -> dict
         [c.name for c in criteria],
     )
 
-    # Step 1a — clamp the raw overall score (will be overwritten in step 4)
+    # Step 1 — clamp raw overall score and set a preliminary verdict
     raw_score = assessment.get("overall_score", 5)
     try:
         overall_score = max(1, min(10, int(raw_score)))
@@ -511,14 +498,15 @@ def validate_and_clamp(assessment: dict, criteria: list[CriterionInput]) -> dict
     assessment["overall_score"] = overall_score
     assessment["overall_verdict"] = _verdict_from_score(overall_score)
 
-    # Step 2+3 — normalise keys and clamp per-criterion values
+    # Step 2 — normalise criterion keys
     per_criterion = _normalize_criterion_keys(
         assessment.get("per_criterion_scores", {}), criteria
     )
+
+    # Step 3+4 — clamp per-criterion scores/confidence and recompute verdicts
     for key, val in per_criterion.items():
         if not isinstance(val, dict):
             continue
-        # Clamp score to [1, 10]
         try:
             score = max(1, min(10, int(val.get("score", 5))))
         except (TypeError, ValueError):
@@ -526,7 +514,6 @@ def validate_and_clamp(assessment: dict, criteria: list[CriterionInput]) -> dict
                 "validate_and_clamp: invalid score for '%s', defaulting to 5", key
             )
             score = 5
-        # Clamp confidence to [0, 100]
         try:
             confidence = max(0, min(100, int(val.get("confidence", 50))))
         except (TypeError, ValueError):
@@ -536,52 +523,9 @@ def validate_and_clamp(assessment: dict, criteria: list[CriterionInput]) -> dict
             confidence = 50
         val["score"] = score
         val["confidence"] = confidence
-        # Recompute verdict from clamped score — don't trust the LLM's verdict string
         val["verdict"] = _verdict_from_score(score)
 
     assessment["per_criterion_scores"] = per_criterion
-
-    # Step 4 — weighted overall score + transparency breakdown
-    # Find all criteria whose names appear in the normalised per_criterion dict
-    matched = [
-        (c, per_criterion[c.name])
-        for c in criteria
-        if c.name in per_criterion and isinstance(per_criterion[c.name], dict)
-    ]
-    if matched:
-        total_weight = sum(c.weight for c, _ in matched)
-        if total_weight > 0:
-            # Weighted average of clamped per-criterion scores
-            weighted_sum = sum(val["score"] * c.weight for c, val in matched)
-            unrounded = weighted_sum / total_weight
-            weighted_score = max(1, min(10, round(unrounded)))
-
-            # Step 5 — overwrite the preliminary overall score with the weighted result
-            assessment["overall_score"] = weighted_score
-            assessment["overall_verdict"] = _verdict_from_score(weighted_score)
-
-            # Attach a full breakdown so callers can audit exactly how the
-            # final score was derived from each criterion's score and weight
-            assessment["weighted_score_breakdown"] = {
-                "formula": "sum(score * weight) / total_weight",
-                "total_weight": round(total_weight, 4),
-                "weighted_sum": round(weighted_sum, 4),
-                "unrounded_average": round(unrounded, 4),
-                "final_score": weighted_score,
-                "per_criterion": {
-                    c.name: {
-                        "score": val["score"],
-                        "weight": c.weight,
-                        "contribution": round(val["score"] * c.weight, 4),
-                    }
-                    for c, val in matched
-                },
-            }
-            logger.debug(
-                "validate_and_clamp: weighted score=%s weights=%s",
-                weighted_score,
-                {c.name: c.weight for c, _ in matched},
-            )
 
     logger.info(
         "validate_and_clamp: returning overall_score=%s overall_verdict=%s keys=%s",
@@ -590,3 +534,5 @@ def validate_and_clamp(assessment: dict, criteria: list[CriterionInput]) -> dict
         list(per_criterion.keys()),
     )
     return assessment
+
+

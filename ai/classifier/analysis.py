@@ -301,22 +301,39 @@ async def analyze_bgr(
     cv_criteria  = [c for c in criteria if c.type == "cv"]
     llm_criteria = [c for c in criteria if c.type == "llm"]
 
-    cv_results: dict = {}
+    # Collect per-criterion CV results in a temporary dict first so we can
+    # compute the overall verdict and score before assembling cv_assessment.
+    _cv_per_criterion: dict = {}
     for c in cv_criteria:
         detector = get_detector(c.name)
         if detector:
             logger.info("analyze_bgr: CV detector running for '%s'", c.name)
             result_dict = detector(image_bgr)
-            result_dict["method"] = "cv"   # confirm which path was used
-            cv_results[c.name] = result_dict
+            result_dict["method"] = "cv"
+            _cv_per_criterion[c.name] = result_dict
         else:
             # No registered detector — fall back to LLM transparently
             logger.warning("analyze_bgr: no CV detector for '%s', falling back to LLM", c.name)
             llm_criteria.append(c)
 
-    if cv_results:
-        logger.debug("analyze_bgr: cv results: %s",
-                     {k: v["verdict"] for k, v in cv_results.items()})
+    # Compute CV overall verdict and score immediately after all detectors have run,
+    # then build cv_assessment with overall_verdict and overall_score first so they
+    # appear at the top of the dict.
+    if _cv_per_criterion:
+        cv_scores   = [r["score"] for r in _cv_per_criterion.values()
+                       if isinstance(r.get("score"), (int, float))]
+        cv_failures = sum(1 for r in _cv_per_criterion.values() if r.get("verdict") == "FAIL")
+        cv_verdict  = "FAIL" if cv_failures >= 2 else ("MARGINAL" if cv_failures == 1 else "PASS")
+        cv_assessment: dict = {
+            "overall_verdict": cv_verdict,
+            "overall_score":   round(sum(cv_scores) / len(cv_scores)) if cv_scores else 5,
+            **_cv_per_criterion,
+        }
+        logger.debug("analyze_bgr: cv_assessment verdict=%s score=%s criteria=%s",
+                     cv_assessment["overall_verdict"], cv_assessment["overall_score"],
+                     {k: v["verdict"] for k, v in _cv_per_criterion.items()})
+    else:
+        cv_assessment: dict = {}
 
     # Step 4 — encode resized image for the LLM prompt
     image_b64 = encode_image_to_base64(image_bgr)
@@ -324,50 +341,49 @@ async def analyze_bgr(
     # Step 5 — call LLM for all LLM-bound criteria (type="llm" + any cv fallbacks).
     # Skip the LLM call entirely if every criterion resolved via CV.
     if llm_criteria:
-        llm_result = await call_vllm(build_llm_prompt(image_b64, llm_criteria))
-        # Tag every LLM-scored entry so the caller knows which path was used
-        for val in llm_result.get("assessment", {}).get("per_criterion_scores", {}).values():
+        llm_raw = await call_vllm(build_llm_prompt(image_b64, llm_criteria))
+        for val in llm_raw.get("assessment", {}).get("per_criterion_scores", {}).values():
             if isinstance(val, dict):
                 val["method"] = "llm"
+        # Validate and clamp LLM assessment using only the LLM-bound criteria
+        llm_assessment = validate_and_clamp(llm_raw.get("assessment", {}), llm_criteria)
     else:
         logger.info("analyze_bgr: all criteria resolved via CV — skipping LLM call")
-        llm_result = {"assessment": {"overall_verdict": "PASS", "overall_score": 5,
-                                     "per_criterion_scores": {}}}
+        llm_assessment = {"overall_verdict": None, "overall_score": None,
+                          "per_criterion_scores": {}}
 
-    # Pre-populate CV results into the raw assessment BEFORE validate_and_clamp
-    # so the weighted overall score includes them alongside LLM scores.
-    raw_assessment = llm_result.get("assessment", {})
-    raw_assessment.setdefault("per_criterion_scores", {}).update(cv_results)
+    # Step 5b — build combined assessment (CV + LLM) and compute the weighted
+    # overall score across ALL criteria.  CV and LLM each stay clean in their
+    # own keys; combined is the single source for the weighted breakdown.
+    cv_criterion_scores = {k: v for k, v in cv_assessment.items() if isinstance(v, dict)}
+    combined_raw = {
+        "overall_verdict": "...",
+        "overall_score": 0,
+        "per_criterion_scores": {
+            **cv_criterion_scores,
+            **llm_assessment.get("per_criterion_scores", {}),
+        },
+    }
+    combined_assessment = validate_and_clamp(combined_raw, criteria)
 
-    # validate_and_clamp receives ALL criteria for correct weight lookup
-    assessment = validate_and_clamp(raw_assessment, criteria)
-
-    # Step 6 — derive CV-level overall verdict and score from whichever criteria
-    # ran through detectors, then fold them into the cv_checks dict itself.
-    if cv_results:
-        cv_scores = [r["score"] for r in cv_results.values() if isinstance(r.get("score"), (int, float))]
-        cv_failures = sum(1 for r in cv_results.values() if r.get("verdict") == "FAIL")
-        cv_verdict = "FAIL" if cv_failures >= 2 else ("MARGINAL" if cv_failures == 1 else "PASS")
-        cv_overall_score = round(sum(cv_scores) / len(cv_scores)) if cv_scores else 5
-        cv_results["overall_verdict"] = cv_verdict
-        cv_results["overall_score"] = cv_overall_score
-
-    # Step 7 — assemble the final response dict
+    # Step 6 — assemble the final response dict
     result = {
         "image_info": {
             "width": original_w, "height": original_h,
             "format": content_type, "size_bytes": size_bytes,
         },
         "assessment": {
-            "cv":  cv_results,   # CV-path results + overall_verdict + overall_score
-            "llm": assessment,   # per-criterion scores, weighted breakdown, overall verdict
+            "cv":       cv_assessment,         # CV-only: per-criterion + overall_verdict + overall_score
+            "llm":      llm_assessment,     # LLM-only: per-criterion + overall_verdict + overall_score
+            "combined": combined_assessment, # CV + LLM merged: per-criterion + weighted breakdown
         },
-        "combined_verdict": assessment.get("overall_verdict", cv_results.get("overall_verdict", "PASS")),
+        "combined_verdict": combined_assessment.get("overall_verdict", "PASS"),
     }
-    logger.info("analyze_bgr: returning combined_verdict=%s cv_verdict=%s llm=%s",
+    logger.info("analyze_bgr: returning combined_verdict=%s cv=%s llm=%s combined=%s",
                 result["combined_verdict"],
-                cv_results.get("overall_verdict", "n/a"),
-                assessment.get("overall_verdict"))
+                cv_assessment.get("overall_verdict", "n/a"),
+                llm_assessment.get("overall_verdict", "n/a"),
+                combined_assessment.get("overall_verdict", "n/a"))
     return result
 
 

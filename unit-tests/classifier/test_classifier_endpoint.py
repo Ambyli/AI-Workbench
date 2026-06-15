@@ -138,25 +138,28 @@ def print_result(job: dict, criteria: list = None) -> None:
     if job["status"] == "completed":
         result     = job.get("result", {})
         assessment = result.get("assessment", {})
-        cv         = assessment.get("cv",  {})
-        llm        = assessment.get("llm", {})
+        cv         = assessment.get("cv",       {})
+        llm        = assessment.get("llm",      {})
+        combined   = assessment.get("combined", {})
         cv_criteria = {k: v for k, v in cv.items() if isinstance(v, dict)}
 
         print(f"\n{'-' * 60}")
-        print(f"  Combined verdict : {result.get('combined_verdict', 'n/a')}")
+        print(f"  Combined verdict : {result.get('combined_verdict', 'n/a')} "
+              f"(score {combined.get('overall_score', '-')})")
         if cv_criteria:
             print(f"  CV overall       : {cv.get('overall_verdict', 'n/a')} "
                   f"(score {cv.get('overall_score', '-')})")
             for name, val in cv_criteria.items():
                 print(f"    {name:<30} {val.get('verdict', '?')}  "
                       f"score={val.get('score', '?')}")
-        print(f"  LLM overall      : {llm.get('overall_verdict', 'n/a')} "
-              f"(score {llm.get('overall_score', '-')})")
+        if llm.get("overall_verdict"):
+            print(f"  LLM overall      : {llm.get('overall_verdict', 'n/a')} "
+                  f"(score {llm.get('overall_score', '-')})")
         print(f"{'-' * 60}")
 
-        per = llm.get("per_criterion_scores", {})
+        per = combined.get("per_criterion_scores", {})
         if per:
-            print("\n  Per-criterion scores:")
+            print("\n  Per-criterion scores (combined):")
             for name, val in per.items():
                 if not isinstance(val, dict):
                     continue
@@ -168,7 +171,7 @@ def print_result(job: dict, criteria: list = None) -> None:
                 if reason:
                     print(f"      {reason}")
 
-        breakdown = llm.get("weighted_score_breakdown")
+        breakdown = combined.get("weighted_score_breakdown")
         if breakdown:
             print(f"\n  Weighted score breakdown  ({breakdown.get('formula')})")
             print(f"  {'Criterion':<35} {'Score':>5}  {'Weight':>7}  {'Contribution':>12}")

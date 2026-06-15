@@ -115,17 +115,17 @@ async def _run_compare(request: CompareRequest) -> dict:
     input_analysis = results[0]
     example_analyses = results[1:]
 
-    # Extract the weighted overall score that validate_and_clamp() computed
-    input_overall = input_analysis["assessment"]["llm"].get("overall_score", 5)
+    # Use the combined assessment (CV + LLM weighted) for scoring and similarity
+    input_overall = input_analysis["assessment"]["combined"].get("overall_score", 5)
 
     example_results = []
     combined_scores = []
 
     for i, (example, analysis) in enumerate(zip(request.examples, example_analyses)):
-        # Compute how similar this example is to the subject image
+        # Compute similarity across all criteria (combined CV + LLM per_criterion_scores)
         similarity = compute_similarity(
-            analysis["assessment"]["llm"],
-            input_analysis["assessment"]["llm"],
+            analysis["assessment"]["combined"],
+            input_analysis["assessment"]["combined"],
         )
         # Blend quality score with similarity score using the example's weight
         cs = combined_score(input_overall, similarity["similarity_score"], example.weight)

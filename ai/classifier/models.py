@@ -40,11 +40,18 @@ class CriterionInput(BaseModel):
     """
 
     name: str = Field(description="The criterion to evaluate.")
-    type: Literal["quality", "feature"] = Field(
-        default="quality",
+    type: Literal["cv", "llm"] = Field(
+        default="llm",
         description=(
-            "'quality': score image quality 1-10 (1-3=FAIL, 4-6=MARGINAL, 7-10=PASS). "
-            "'feature': detect presence/absence (10=clearly present, 5=uncertain, 1=clearly absent)."
+            "'llm': scored by the vision LLM (no detector required). "
+            "'cv': run through a registered OpenCV detector by name — no token cost. "
+            "If no detector matches the criterion name, falls back to 'llm' automatically. "
+            "The result always includes a 'method' field showing which path was actually used. "
+            "Built-in cv names: 'sharpness', 'exposure' / 'proper exposure', "
+            "'has trees' / 'has vegetation' / 'has greenery' / 'has plants', "
+            "'has sky', 'has faces' / 'has people' / 'has person', "
+            "'has water' / 'has pool' / 'has swimming pool', "
+            "'has text' / 'has text regions' / 'has writing'."
         ),
     )
     weight: float = Field(

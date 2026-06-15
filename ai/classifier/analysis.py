@@ -40,7 +40,7 @@ from PIL import Image, ImageOps
 from config import MIN_IMAGE_WIDTH, MIN_IMAGE_HEIGHT, HTTP_TIMEOUT, HTTP_CONNECT_TIMEOUT
 from logger import logger
 from models import CriterionInput, ImageInput, ExampleInput
-from cv import check_blur, check_exposure
+from cv import get_detector
 from llm import encode_image_to_base64, build_llm_prompt, call_vllm, validate_and_clamp
 from ssrf import validate_url
 
@@ -260,10 +260,10 @@ async def analyze_bgr(
     Pipeline steps:
       1. Validate image dimensions (reject too-small images).
       2. Resize to ≤1000px on the long side for LLM efficiency.
-      3. Run deterministic CV pre-checks (blur + exposure).
+      3. Run CV detectors for type="cv" criteria; fall back to LLM if no detector found.
       4. Encode image as base64 JPEG for the LLM prompt.
-      5. Call vLLM and validate/clamp the response.
-      6. Compute the cv_overall_verdict from CV failures.
+      5. Call LLM for type="llm" criteria (and any cv fallbacks); tag results with method="llm".
+      6. Merge CV and LLM results; run validate_and_clamp for weighted scoring.
       7. Assemble and return the final result dict.
 
     Args:
@@ -295,38 +295,70 @@ async def analyze_bgr(
         )
         logger.debug("analyze_bgr: resized to %s", image_bgr.shape)
 
-    # Step 3 — fast deterministic CV checks (always run, regardless of criteria)
-    cv_results = {
-        "sharpness": check_blur(image_bgr),
-        "exposure": check_exposure(image_bgr),
-    }
-    logger.debug("analyze_bgr: cv sharpness=%s exposure=%s",
-                 cv_results["sharpness"]["verdict"], cv_results["exposure"]["verdict"])
+    # Step 3 — partition criteria and run CV detectors for type="cv" criteria.
+    # For each cv criterion: look up the detector by name → run it if found,
+    # fall back to LLM if not.  type="llm" criteria always go to the LLM.
+    cv_criteria  = [c for c in criteria if c.type == "cv"]
+    llm_criteria = [c for c in criteria if c.type == "llm"]
+
+    cv_results: dict = {}
+    for c in cv_criteria:
+        detector = get_detector(c.name)
+        if detector:
+            logger.info("analyze_bgr: CV detector running for '%s'", c.name)
+            result_dict = detector(image_bgr)
+            result_dict["method"] = "cv"   # confirm which path was used
+            cv_results[c.name] = result_dict
+        else:
+            # No registered detector — fall back to LLM transparently
+            logger.warning("analyze_bgr: no CV detector for '%s', falling back to LLM", c.name)
+            llm_criteria.append(c)
+
+    if cv_results:
+        logger.debug("analyze_bgr: cv results: %s",
+                     {k: v["verdict"] for k, v in cv_results.items()})
 
     # Step 4 — encode resized image for the LLM prompt
     image_b64 = encode_image_to_base64(image_bgr)
 
-    # Step 5 — call LLM and validate/clamp the response
-    llm_result = await call_vllm(build_llm_prompt(image_b64, criteria))
-    assessment = validate_and_clamp(llm_result.get("assessment", {}), criteria)
+    # Step 5 — call LLM for all LLM-bound criteria (type="llm" + any cv fallbacks).
+    # Skip the LLM call entirely if every criterion resolved via CV.
+    if llm_criteria:
+        llm_result = await call_vllm(build_llm_prompt(image_b64, llm_criteria))
+        # Tag every LLM-scored entry so the caller knows which path was used
+        for val in llm_result.get("assessment", {}).get("per_criterion_scores", {}).values():
+            if isinstance(val, dict):
+                val["method"] = "llm"
+    else:
+        logger.info("analyze_bgr: all criteria resolved via CV — skipping LLM call")
+        llm_result = {"assessment": {"overall_verdict": "PASS", "overall_score": 5,
+                                     "per_criterion_scores": {}}}
 
-    # Step 6 — derive a CV-level overall verdict from the two CV checks
-    # (both fail → FAIL, one fails → MARGINAL, neither fails → PASS)
-    cv_failures = sum(1 for r in cv_results.values() if r["verdict"] == "FAIL")
-    cv_verdict = "FAIL" if cv_failures >= 2 else ("MARGINAL" if cv_failures == 1 else "PASS")
+    # Pre-populate CV results into the raw assessment BEFORE validate_and_clamp
+    # so the weighted overall score includes them alongside LLM scores.
+    raw_assessment = llm_result.get("assessment", {})
+    raw_assessment.setdefault("per_criterion_scores", {}).update(cv_results)
+
+    # validate_and_clamp receives ALL criteria for correct weight lookup
+    assessment = validate_and_clamp(raw_assessment, criteria)
+
+    # Step 6 — derive a CV-level verdict from whichever criteria ran through detectors
+    cv_failures = sum(1 for r in cv_results.values() if r.get("verdict") == "FAIL")
+    if cv_results:
+        cv_verdict = "FAIL" if cv_failures >= 2 else ("MARGINAL" if cv_failures == 1 else "PASS")
+    else:
+        cv_verdict = "PASS"  # no CV criteria ran — no CV failures by definition
 
     # Step 7 — assemble the final response dict
-    # combined_verdict prefers the LLM's verdict; falls back to cv_verdict if absent
     result = {
         "image_info": {
             "width": original_w, "height": original_h,
             "format": content_type, "size_bytes": size_bytes,
         },
-        "cv_pre_checks": cv_results,          # raw CV measurements
-        "cv_overall_verdict": cv_verdict,     # PASS/MARGINAL/FAIL from CV only
-        "llm_assessment": assessment,         # validated LLM scores per criterion
-        "combined_verdict": cv_verdict if not assessment.get("overall_verdict")
-                            else assessment["overall_verdict"],
+        "cv_checks": cv_results,              # results of any CV-path criteria
+        "cv_overall_verdict": cv_verdict,     # verdict derived from CV checks only
+        "llm_assessment": assessment,         # all per-criterion scores + weighted breakdown
+        "combined_verdict": assessment.get("overall_verdict", cv_verdict),
     }
     logger.info("analyze_bgr: returning combined_verdict=%s cv=%s llm=%s",
                 result["combined_verdict"], cv_verdict, assessment.get("overall_verdict"))

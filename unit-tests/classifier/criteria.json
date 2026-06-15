@@ -1,7 +1,8 @@
 [
-  {"name": "image sharpness",     "type": "quality", "weight": 1.0},
-  {"name": "proper exposure",     "type": "quality", "weight": 1.0},
-  {"name": "absence of artifacts","type": "quality", "weight": 1.0},
-  {"name": "has solar panels",    "type": "feature", "weight": 8.0},
-  {"name": "has trees",           "type": "feature", "weight": 1.0}
+  {"name": "image sharpness",     "type": "llm", "weight": 1.0},
+  {"name": "proper exposure",     "type": "llm", "weight": 1.0},
+  {"name": "absence of artifacts","type": "llm", "weight": 1.0},
+  {"name": "has solar panels",    "type": "llm", "weight": 8.0},
+  {"name": "has trees",           "type": "cv",  "weight": 1.0},
+  {"name": "has sky",             "type": "cv",  "weight": 1.0}
 ]

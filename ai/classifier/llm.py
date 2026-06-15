@@ -56,6 +56,7 @@ llm_latency = Histogram(
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def encode_image_to_base64(image) -> str:
     """JPEG-encode a BGR numpy array and return a base64 string.
 
@@ -69,6 +70,7 @@ def encode_image_to_base64(image) -> str:
         Base64-encoded JPEG string suitable for a data URI.
     """
     import cv2
+
     logger.debug("encode_image_to_base64: image shape=%s", image.shape)
     _, buf = cv2.imencode(".jpg", image)
     result = base64.b64encode(buf).decode("utf-8")
@@ -93,16 +95,16 @@ def _verdict_from_score(score: int) -> str:
 # Prompt building
 # ---------------------------------------------------------------------------
 
+
 def _build_scaffold(criteria: list[CriterionInput]) -> str:
     """Build a pre-filled JSON response template with criterion names as keys.
 
-    Why: Without a scaffold, the LLM sometimes groups multiple criteria under
-    one key (e.g. merging 'image sharpness' and 'proper exposure' into a single
-    'image_quality' entry).  Pre-defining the keys forces the model to fill in
-    values rather than invent structure.
+    Pre-defining the keys prevents the LLM from grouping or renaming criteria.
+    Only the criteria passed in are included — CV-resolved criteria are handled
+    before this is called and are excluded from the LLM prompt.
 
     Args:
-        criteria: The full list of criteria for this request.
+        criteria: The LLM-bound criteria for this request.
 
     Returns:
         A JSON string with 0-valued placeholders for the model to fill in.
@@ -112,8 +114,13 @@ def _build_scaffold(criteria: list[CriterionInput]) -> str:
         for c in criteria
     }
     return json.dumps(
-        {"assessment": {"overall_verdict": "...", "overall_score": 0,
-                        "per_criterion_scores": per_criterion}},
+        {
+            "assessment": {
+                "overall_verdict": "...",
+                "overall_score": 0,
+                "per_criterion_scores": per_criterion,
+            }
+        },
         indent=2,
     )
 
@@ -121,53 +128,45 @@ def _build_scaffold(criteria: list[CriterionInput]) -> str:
 def build_llm_prompt(image_b64: str, criteria: list[CriterionInput]) -> dict:
     """Assemble the full vLLM chat completion request for a set of criteria.
 
-    The prompt applies four reliability improvements:
-      1. Pre-filled scaffold    — keys defined in advance (see _build_scaffold).
-      2. Explicit key list      — repeated after the scaffold to reinforce.
-      3. "Do not group" rule    — system prompt forbids merging criteria.
-      4. Verification step      — user message asks the model to self-check
-                                  before responding.
+    All criteria passed here are LLM-bound (type="llm", or type="cv" with no
+    matching detector).  A unified rubric is used — the LLM infers from the
+    criterion name whether to score quality or detect presence:
+      - Quality criteria (e.g. "image sharpness"): score 1-10 for quality level.
+      - Presence criteria (e.g. "has solar panels"): 10=present, 5=uncertain, 1=absent.
 
-    QUALITY and FEATURE criteria get different scoring rubrics:
-      - QUALITY: 1-10 scale measuring how good the image is.
-      - FEATURE: 1/5/10 scale measuring presence vs absence.
+    The prompt applies four reliability improvements:
+      1. Pre-filled scaffold    — criterion keys defined in advance.
+      2. Explicit key list      — reinforces expected keys.
+      3. "Do not group" rule    — system prompt forbids merging criteria.
+      4. Verification step      — model self-checks before responding.
 
     Args:
         image_b64: Base64-encoded JPEG of the (resized) image.
-        criteria:  List of CriterionInput objects for this request.
+        criteria:  LLM-bound CriterionInput objects.
 
     Returns:
         A dict ready to POST to the vLLM /v1/chat/completions endpoint.
     """
-    logger.debug("build_llm_prompt: image_b64[%d chars] criteria=%s",
-                 len(image_b64), [c.name for c in criteria])
+    logger.debug(
+        "build_llm_prompt: image_b64[%d chars] criteria=%s",
+        len(image_b64),
+        [c.name for c in criteria],
+    )
 
-    # Partition criteria by type so each gets the right rubric
-    quality_criteria = [c for c in criteria if c.type == "quality"]
-    feature_criteria = [c for c in criteria if c.type == "feature"]
-
-    # --- Build criteria description sections ---
-    sections = []
-    if quality_criteria:
-        names = "\n".join(f"  - {c.name}" for c in quality_criteria)
-        sections.append(
-            "QUALITY criteria — score image quality on a 1-10 scale:\n"
-            "  Rubric: 1-3 = FAIL, 4-6 = MARGINAL, 7-10 = PASS\n"
-            f"{names}"
-        )
-    if feature_criteria:
-        names = "\n".join(f"  - {c.name}" for c in feature_criteria)
-        sections.append(
-            "FEATURE criteria — detect whether each feature is present:\n"
-            "  Rubric: 10 = clearly present (PASS), 5 = uncertain or partially present (MARGINAL), "
-            "1 = clearly absent (FAIL)\n"
-            # Chain-of-thought instruction: forces the model to ground its
-            # verdict in observed visual evidence before scoring
-            "  For each feature criterion, your 'reason' MUST follow this structure:\n"
-            "    'I observe [specific visual evidence]. Therefore, [feature] is [present/absent/uncertain].'\n"
-            f"{names}"
-        )
-    criteria_text = "\n\n".join(sections)
+    # --- Unified criteria listing ---
+    names = "\n".join(f"  - {c.name}" for c in criteria)
+    criteria_text = (
+        "Evaluate each criterion against the image and score 1-10.\n"
+        "Use the criterion name to determine the appropriate rubric:\n\n"
+        "  For QUALITY criteria (e.g. 'image sharpness', 'proper exposure', 'absence of artifacts'):\n"
+        "    Score the quality level — 1-3 = FAIL (poor), 4-6 = MARGINAL, 7-10 = PASS (good)\n\n"
+        "  For PRESENCE criteria (e.g. 'has solar panels', 'has people'):\n"
+        "    Score presence — 10 = clearly present (PASS), 5 = uncertain or partial (MARGINAL),\n"
+        "    1 = clearly absent (FAIL)\n"
+        "    Your reason MUST follow: 'I observe [specific visual evidence]. "
+        "Therefore [feature] is [present/absent/uncertain].'\n\n"
+        f"Criteria to evaluate:\n{names}"
+    )
 
     # --- Improvement 1: pre-filled scaffold ---
     scaffold = _build_scaffold(criteria)
@@ -184,7 +183,7 @@ def build_llm_prompt(image_b64: str, criteria: list[CriterionInput]) -> dict:
         "do NOT change, rename, merge, or add any keys:\n\n"
         f"{scaffold}\n\n"
         f"Required keys in per_criterion_scores ({n} total): {key_list}\n\n"
-        # Improvement 4: self-verification step reduces key mismatch errors
+        # Improvement 4: self-verification step
         f"Before returning, verify your JSON contains exactly those {n} keys in "
         "per_criterion_scores — no more, no fewer, with names spelled exactly as shown. "
         "If any key is missing or renamed, revise before responding."
@@ -194,7 +193,6 @@ def build_llm_prompt(image_b64: str, criteria: list[CriterionInput]) -> dict:
     system_prompt = (
         "You are an image assessment expert. "
         "Analyze the provided image and score it against each criterion listed below. "
-        # Explicitly forbid the grouping behaviour we observed in earlier runs
         "Score each criterion independently — do NOT group multiple criteria under a "
         "single key or summarise them together. "
         "Set confidence to a number 0-100: 0 = completely uncertain, 100 = completely certain. "
@@ -205,24 +203,34 @@ def build_llm_prompt(image_b64: str, criteria: list[CriterionInput]) -> dict:
         "model": "Qwen/Qwen2.5-VL-7B-Instruct",
         "messages": [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": [
-                # Embed the image as a data URI so vLLM can process it
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
-                {"type": "text", "text": user_text},
-            ]},
+            {
+                "role": "user",
+                "content": [
+                    # Embed the image as a data URI so vLLM can process it
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"},
+                    },
+                    {"type": "text", "text": user_text},
+                ],
+            },
         ],
         "max_tokens": 2048,
-        "temperature": 0.1,           # low temperature → more deterministic scoring
+        "temperature": 0.1,  # low temperature → more deterministic scoring
         "response_format": {"type": "json_object"},  # forces valid JSON output
     }
-    logger.debug("build_llm_prompt: returning prompt — %d quality + %d feature criteria, scaffold keys=%s",
-                 len(quality_criteria), len(feature_criteria), [c.name for c in criteria])
+    logger.debug(
+        "build_llm_prompt: returning prompt — %d llm criteria, scaffold keys=%s",
+        len(criteria),
+        [c.name for c in criteria],
+    )
     return prompt
 
 
 # ---------------------------------------------------------------------------
 # vLLM call with retry
 # ---------------------------------------------------------------------------
+
 
 async def call_vllm(prompt: dict) -> dict:
     """POST a prompt to the vLLM API and return the parsed assessment dict.
@@ -245,7 +253,10 @@ async def call_vllm(prompt: dict) -> dict:
         HTTPException(502): On HTTP-level failures from vLLM.
     """
     import time
-    logger.info("call_vllm: posting to %s (max_retries=%d)", VLLM_QWEN_VL_API, MAX_LLM_RETRIES)
+
+    logger.info(
+        "call_vllm: posting to %s (max_retries=%d)", VLLM_QWEN_VL_API, MAX_LLM_RETRIES
+    )
 
     last_exc: Exception | None = None
 
@@ -262,7 +273,9 @@ async def call_vllm(prompt: dict) -> dict:
             elapsed = time.monotonic() - t0
             llm_latency.observe(elapsed)
             content = data["choices"][0]["message"]["content"]
-            logger.debug("call_vllm: response[%d chars] in %.2fs", len(content), elapsed)
+            logger.debug(
+                "call_vllm: response[%d chars] in %.2fs", len(content), elapsed
+            )
 
             # Step 2 — parse the JSON response
             # json_object mode should guarantee valid JSON, but keep regex
@@ -282,7 +295,11 @@ async def call_vllm(prompt: dict) -> dict:
             llm_calls_total.labels(status="success").inc()
             verdict = result.get("assessment", {}).get("overall_verdict", "unknown")
             score = result.get("assessment", {}).get("overall_score", "unknown")
-            logger.info("call_vllm: returning overall_verdict=%s overall_score=%s", verdict, score)
+            logger.info(
+                "call_vllm: returning overall_verdict=%s overall_score=%s",
+                verdict,
+                score,
+            )
             return result
 
         except httpx.HTTPError as exc:
@@ -293,12 +310,20 @@ async def call_vllm(prompt: dict) -> dict:
         except (KeyError, IndexError) as exc:
             # Unexpected response shape — not retried
             llm_calls_total.labels(status="failed").inc()
-            logger.error("call_vllm: unexpected response format on attempt %d: %s", attempt + 1, exc)
-            raise HTTPException(status_code=502, detail=f"Unexpected vLLM response format: {exc}")
+            logger.error(
+                "call_vllm: unexpected response format on attempt %d: %s",
+                attempt + 1,
+                exc,
+            )
+            raise HTTPException(
+                status_code=502, detail=f"Unexpected vLLM response format: {exc}"
+            )
         except (json.JSONDecodeError, ValueError) as exc:
             # Parse / structure errors — retry up to MAX_LLM_RETRIES
             llm_calls_total.labels(status="retry").inc()
-            logger.warning("call_vllm: parse failure on attempt %d: %s", attempt + 1, exc)
+            logger.warning(
+                "call_vllm: parse failure on attempt %d: %s", attempt + 1, exc
+            )
             last_exc = exc
 
     # All retries exhausted — return an error sentinel instead of raising
@@ -310,7 +335,9 @@ async def call_vllm(prompt: dict) -> dict:
             "overall_score": 1,
             "per_criterion_scores": {
                 "_llm_error": {
-                    "score": 1, "verdict": "FAIL", "confidence": 0,
+                    "score": 1,
+                    "verdict": "FAIL",
+                    "confidence": 0,
                     "reason": f"LLM parsing failed after {MAX_LLM_RETRIES} attempts: {last_exc}",
                 }
             },
@@ -321,6 +348,7 @@ async def call_vllm(prompt: dict) -> dict:
 # ---------------------------------------------------------------------------
 # Response validation & normalisation
 # ---------------------------------------------------------------------------
+
 
 def _normalize_criterion_keys(
     per_criterion: dict, criteria: list[CriterionInput]
@@ -345,8 +373,11 @@ def _normalize_criterion_keys(
         A new dict with keys remapped to the canonical criterion names.
     """
     requested_names = [c.name for c in criteria]
-    logger.debug("_normalize_criterion_keys: returned=%s requested=%s",
-                 list(per_criterion.keys()), requested_names)
+    logger.debug(
+        "_normalize_criterion_keys: returned=%s requested=%s",
+        list(per_criterion.keys()),
+        requested_names,
+    )
     normalized: dict = {}
 
     for returned_key, value in per_criterion.items():
@@ -357,27 +388,41 @@ def _normalize_criterion_keys(
 
         # 2. Case-insensitive match
         lower = returned_key.lower().strip()
-        exact_ci = next((n for n in requested_names if n.lower().strip() == lower), None)
+        exact_ci = next(
+            (n for n in requested_names if n.lower().strip() == lower), None
+        )
         if exact_ci:
             if exact_ci != returned_key:
-                logger.debug("_normalize_criterion_keys: case match '%s' -> '%s'",
-                             returned_key, exact_ci)
+                logger.debug(
+                    "_normalize_criterion_keys: case match '%s' -> '%s'",
+                    returned_key,
+                    exact_ci,
+                )
             normalized[exact_ci] = value
             continue
 
         # 3. Fuzzy match — handles minor wording differences
-        close = difflib.get_close_matches(returned_key, requested_names, n=1, cutoff=0.6)
+        close = difflib.get_close_matches(
+            returned_key, requested_names, n=1, cutoff=0.6
+        )
         if close:
-            logger.debug("_normalize_criterion_keys: fuzzy match '%s' -> '%s'",
-                         returned_key, close[0])
+            logger.debug(
+                "_normalize_criterion_keys: fuzzy match '%s' -> '%s'",
+                returned_key,
+                close[0],
+            )
             normalized[close[0]] = value
         else:
             # 4. No match — preserve the original key but warn
-            logger.warning("_normalize_criterion_keys: no match for '%s', keeping as-is",
-                           returned_key)
+            logger.warning(
+                "_normalize_criterion_keys: no match for '%s', keeping as-is",
+                returned_key,
+            )
             normalized[returned_key] = value
 
-    logger.debug("_normalize_criterion_keys: returning keys=%s", list(normalized.keys()))
+    logger.debug(
+        "_normalize_criterion_keys: returning keys=%s", list(normalized.keys())
+    )
     return normalized
 
 
@@ -404,16 +449,21 @@ def validate_and_clamp(assessment: dict, criteria: list[CriterionInput]) -> dict
         Cleaned assessment dict with valid scores, verdicts, and a weighted
         overall_score that reflects criterion weights.
     """
-    logger.info("validate_and_clamp: raw overall_score=%s overall_verdict=%s criteria=%s",
-                assessment.get("overall_score"), assessment.get("overall_verdict"),
-                [c.name for c in criteria])
+    logger.info(
+        "validate_and_clamp: raw overall_score=%s overall_verdict=%s criteria=%s",
+        assessment.get("overall_score"),
+        assessment.get("overall_verdict"),
+        [c.name for c in criteria],
+    )
 
     # Step 1a — clamp the raw overall score (will be overwritten in step 4)
     raw_score = assessment.get("overall_score", 5)
     try:
         overall_score = max(1, min(10, int(raw_score)))
     except (TypeError, ValueError):
-        logger.warning("validate_and_clamp: invalid overall_score=%r, defaulting to 5", raw_score)
+        logger.warning(
+            "validate_and_clamp: invalid overall_score=%r, defaulting to 5", raw_score
+        )
         overall_score = 5
     assessment["overall_score"] = overall_score
     assessment["overall_verdict"] = _verdict_from_score(overall_score)
@@ -429,13 +479,17 @@ def validate_and_clamp(assessment: dict, criteria: list[CriterionInput]) -> dict
         try:
             score = max(1, min(10, int(val.get("score", 5))))
         except (TypeError, ValueError):
-            logger.warning("validate_and_clamp: invalid score for '%s', defaulting to 5", key)
+            logger.warning(
+                "validate_and_clamp: invalid score for '%s', defaulting to 5", key
+            )
             score = 5
         # Clamp confidence to [0, 100]
         try:
             confidence = max(0, min(100, int(val.get("confidence", 50))))
         except (TypeError, ValueError):
-            logger.warning("validate_and_clamp: invalid confidence for '%s', defaulting to 50", key)
+            logger.warning(
+                "validate_and_clamp: invalid confidence for '%s', defaulting to 50", key
+            )
             confidence = 50
         val["score"] = score
         val["confidence"] = confidence
@@ -447,7 +501,8 @@ def validate_and_clamp(assessment: dict, criteria: list[CriterionInput]) -> dict
     # Step 4 — weighted overall score + transparency breakdown
     # Find all criteria whose names appear in the normalised per_criterion dict
     matched = [
-        (c, per_criterion[c.name]) for c in criteria
+        (c, per_criterion[c.name])
+        for c in criteria
         if c.name in per_criterion and isinstance(per_criterion[c.name], dict)
     ]
     if matched:
@@ -479,10 +534,16 @@ def validate_and_clamp(assessment: dict, criteria: list[CriterionInput]) -> dict
                     for c, val in matched
                 },
             }
-            logger.debug("validate_and_clamp: weighted score=%s weights=%s",
-                         weighted_score, {c.name: c.weight for c, _ in matched})
+            logger.debug(
+                "validate_and_clamp: weighted score=%s weights=%s",
+                weighted_score,
+                {c.name: c.weight for c, _ in matched},
+            )
 
-    logger.info("validate_and_clamp: returning overall_score=%s overall_verdict=%s keys=%s",
-                assessment["overall_score"], assessment["overall_verdict"],
-                list(per_criterion.keys()))
+    logger.info(
+        "validate_and_clamp: returning overall_score=%s overall_verdict=%s keys=%s",
+        assessment["overall_score"],
+        assessment["overall_verdict"],
+        list(per_criterion.keys()),
+    )
     return assessment

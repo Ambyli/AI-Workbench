@@ -34,29 +34,43 @@ Assess a single image via CV pre-checks and LLM scoring.
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `image` | File | Yes | — | JPEG or PNG image |
-| `criteria` | string (JSON) | No | see below | JSON array of criterion objects. Each has `name` (string) and `type` (`"quality"` or `"feature"`, default `"quality"`). |
+| `criteria` | string (JSON) | No | see below | JSON array of criterion objects. Each has `name`, `type` (`"cv"` or `"llm"`), and optional `weight` (float, default 1.0). |
 
 #### Criterion types
 
-| Type | Behaviour | Score mapping |
-|---|---|---|
-| `quality` | Scores image quality on a 1–10 scale | 1-3 = FAIL, 4-6 = MARGINAL, 7-10 = PASS |
-| `feature` | Detects whether a feature is present | 10 = clearly present (PASS), 5 = uncertain (MARGINAL), 1 = clearly absent (FAIL) |
+| Type | Scored by | Score mapping | Token cost |
+|---|---|---|---|
+| `llm` | Vision LLM | 1-10; LLM infers quality vs presence rubric from the criterion name | Yes |
+| `cv` | OpenCV detector (by name) | 1-10 deterministic; falls back to `llm` if no detector matches | **None** |
 
-`sharpness` and `exposure` are additionally backed by OpenCV measurements (Laplacian variance and mean pixel intensity) and merged into the LLM result. All criteria produce a `confidence` field (`high`/`medium`/`low`).
+Every result in `per_criterion_scores` includes a `"method"` field showing which path was actually used (`"cv"` or `"llm"`). A `cv` criterion that fell back to the LLM will show `"method": "llm"`.
+
+#### Built-in `cv` detectors
+
+| Criterion names | Technique |
+|---|---|
+| `sharpness`, `is sharp`, `is blurry` | Laplacian variance |
+| `exposure`, `proper exposure`, `is exposed` | Mean pixel intensity |
+| `has trees`, `has vegetation`, `has greenery`, `has plants` | HSV green masking |
+| `has sky` | Upper-region blue/grey analysis |
+| `has faces`, `has people`, `has person` | OpenCV Haar cascade |
+| `has water`, `has pool`, `has swimming pool` | Blue/teal hue + flat-texture (Laplacian) |
+| `has text`, `has text regions`, `has writing` | Sobel edge density per block |
+
+All criteria produce a `confidence` field (0-100). CV detectors are deterministic (always 100 for system checks, heuristic for feature detectors).
 
 **Example request:**
 
 ```bash
 curl http://localhost:8005/assess \
   -F "image=@Neighborhood.jpeg" \
-  -F 'criteria=[{"name":"image sharpness","type":"quality"},{"name":"proper exposure","type":"quality"},{"name":"has solar panels","type":"feature"}]'
+  -F 'criteria=[{"name":"image sharpness","type":"llm"},{"name":"has solar panels","type":"llm","weight":3.0},{"name":"has trees","type":"cv"},{"name":"sharpness","type":"cv"}]'
 
 # Via LiteLLM passthrough
 curl http://localhost:4001/v1/classifier/assess \
   -H "Authorization: Bearer sk-1234" \
   -F "image=@Neighborhood.jpeg" \
-  -F 'criteria=[{"name":"image sharpness","type":"quality"},{"name":"proper exposure","type":"quality"},{"name":"has solar panels","type":"feature"}]'
+  -F 'criteria=[{"name":"image sharpness","type":"llm"},{"name":"has solar panels","type":"llm","weight":3.0},{"name":"has trees","type":"cv"},{"name":"sharpness","type":"cv"}]'
 ```
 
 **Example response:**

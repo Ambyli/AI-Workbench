@@ -18,10 +18,19 @@ services:
       OPENAI_API_KEY: "${DEFAULT_LITELLM_MASTER_KEY}"
       ENABLE_OLLAMA_API: "${OPENWEBUI_ENABLE_OLLAMA_API}"
       WEBUI_SECRET_KEY: "${OPENWEBUI_SECRET_KEY}"
+      WEBUI_URL: "${OPENWEBUI_WEBUI_URL}"
       ENABLE_SIGNUP: "${OPENWEBUI_ENABLE_SIGNUP}"
       DEFAULT_USER_ROLE: "${OPENWEBUI_DEFAULT_USER_ROLE}"
       CORS_ALLOW_ORIGIN: "${CORS_ALLOW_ORIGIN}"
       HF_TOKEN: "${HF_TOKEN}"
+
+      # OAuth — Google sign-in. Credentials must be issued in Google Cloud
+      # Console; the redirect URI registered there must be
+      # ${OPENWEBUI_WEBUI_URL}/oauth/google/callback
+      ENABLE_OAUTH_SIGNUP: "${OPENWEBUI_ENABLE_OAUTH_SIGNUP}"
+      OAUTH_MERGE_ACCOUNTS_BY_EMAIL: "${OPENWEBUI_OAUTH_MERGE_ACCOUNTS_BY_EMAIL}"
+      GOOGLE_CLIENT_ID: "${OPENWEBUI_GOOGLE_CLIENT_ID}"
+      GOOGLE_CLIENT_SECRET: "${OPENWEBUI_GOOGLE_CLIENT_SECRET}"
     volumes:
       - openwebui_data:/app/backend/data
     healthcheck:

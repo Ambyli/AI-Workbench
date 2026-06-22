@@ -14,7 +14,7 @@ Or via make:
 make up-openwebui
 ```
 
-Then open `http://localhost:8007`. The first account created becomes the admin. Sign-up is disabled afterwards (see `ENABLE_SIGNUP` below to change this).
+Then open `http://localhost:8007`. The first account created becomes the admin. Subsequent sign-ups land in an approval queue (see [User signup & approval](#user-signup--approval) below).
 
 > Prefer a native window over a browser tab? A standalone desktop client is available at <https://github.com/open-webui/desktop> — point it at `http://localhost:8007` after the container is up.
 
@@ -36,8 +36,13 @@ Every value is sourced from `.env` so configuration lives in one file.
 | `OPENAI_API_KEY` | `DEFAULT_LITELLM_MASTER_KEY` | _(shared with LiteLLM)_ | Reuses the LiteLLM master key — no separate value needed |
 | `ENABLE_OLLAMA_API` | `OPENWEBUI_ENABLE_OLLAMA_API` | `false` | Disables the Ollama discovery probe |
 | `WEBUI_SECRET_KEY` | `OPENWEBUI_SECRET_KEY` | _(placeholder — rotate)_ | Signs sessions; stable value required to avoid log-outs on restart |
-| `ENABLE_SIGNUP` | `OPENWEBUI_ENABLE_SIGNUP` | `false` | Only the first sign-up is allowed when false |
-| `DEFAULT_USER_ROLE` | `OPENWEBUI_DEFAULT_USER_ROLE` | `admin` | Role given to the first (and any subsequent) sign-up |
+| `WEBUI_URL` | `OPENWEBUI_WEBUI_URL` | `http://localhost:8007` | Public base URL; used to build OAuth callback URLs |
+| `ENABLE_SIGNUP` | `OPENWEBUI_ENABLE_SIGNUP` | `true` | New accounts can be created; pair with `DEFAULT_USER_ROLE=pending` for gated access |
+| `DEFAULT_USER_ROLE` | `OPENWEBUI_DEFAULT_USER_ROLE` | `pending` | New signups land in the admin approval queue. First-ever account is always admin regardless of this value |
+| `ENABLE_OAUTH_SIGNUP` | `OPENWEBUI_ENABLE_OAUTH_SIGNUP` | `true` | Master switch for OAuth login flows |
+| `OAUTH_MERGE_ACCOUNTS_BY_EMAIL` | `OPENWEBUI_OAUTH_MERGE_ACCOUNTS_BY_EMAIL` | `true` | OAuth logins are merged into existing local accounts with the same email |
+| `GOOGLE_CLIENT_ID` | `OPENWEBUI_GOOGLE_CLIENT_ID` | _(empty)_ | Google Cloud OAuth 2.0 client ID — see [Google OAuth setup](#google-oauth-setup) |
+| `GOOGLE_CLIENT_SECRET` | `OPENWEBUI_GOOGLE_CLIENT_SECRET` | _(empty)_ | Matching client secret |
 | `CORS_ALLOW_ORIGIN` | `CORS_ALLOW_ORIGIN` | `*` | Tighten to a specific origin if another web app calls Open WebUI's API from the browser |
 | `HF_TOKEN` | `HF_TOKEN` | _(shared with vLLM)_ | Used for gated embedding / RAG model downloads. Same token also drives vLLM gated model downloads |
 
@@ -70,6 +75,51 @@ User data, chat history, and uploaded files are stored in the named volume `open
 ```bash
 docker compose -f ai/docker-compose.openwebui.yml down -v
 ```
+
+### User signup & approval
+
+The deployment is configured so anyone with the URL can register, but new accounts cannot chat until an admin approves them. Workflow:
+
+1. A new user visits `http://localhost:8007` and clicks **Sign up** (or uses Google — see below).
+2. The account is created with role `pending`. The user sees a "waiting for admin approval" screen.
+3. An admin opens **Admin Panel → Users**, finds the pending row, and changes their role to **User**.
+4. The user refreshes; they can now select a model and chat.
+
+To revoke access, set the user's role back to `pending` (silent suspension) or delete the account.
+
+> Want it fully open? Set `OPENWEBUI_DEFAULT_USER_ROLE=user` in `.env`. Want it fully locked? Set `OPENWEBUI_ENABLE_SIGNUP=false`. Either change requires either an Admin Settings toggle on the running container or a volume wipe (see the warning above the env table).
+
+### Google OAuth setup
+
+Open WebUI supports Google sign-in for either of two reasons: skipping password creation, or restricting access to specific Google Workspace domains.
+
+**Create the OAuth client:**
+
+1. Open <https://console.cloud.google.com/apis/credentials> and select (or create) a project.
+2. Click **Create Credentials → OAuth client ID**. App type: **Web application**.
+3. Under **Authorized redirect URIs** add exactly:
+   ```
+   http://localhost:8007/oauth/google/callback
+   ```
+   If `OPENWEBUI_WEBUI_URL` is something other than `http://localhost:8007` (e.g. a public hostname behind a reverse proxy), use that base instead — the path `/oauth/google/callback` is fixed.
+4. Copy the generated **Client ID** and **Client secret** into `.env`:
+   ```
+   OPENWEBUI_GOOGLE_CLIENT_ID=...
+   OPENWEBUI_GOOGLE_CLIENT_SECRET=...
+   ```
+5. Restart the container so the new values take effect:
+   ```bash
+   make down-openwebui && make up-openwebui
+   ```
+
+A **Continue with Google** button appears on the login screen once both values are populated and `OPENWEBUI_ENABLE_OAUTH_SIGNUP=true`.
+
+**First Google login behavior:**
+
+- If a local account with the same email already exists, `OAUTH_MERGE_ACCOUNTS_BY_EMAIL=true` links them — same user, two sign-in methods.
+- If not, a new account is created with role `pending` (per `OPENWEBUI_DEFAULT_USER_ROLE`) and must be approved.
+
+> **About the running container:** Env vars are only read on the *very first* boot — the SQLite store in `openwebui_data` is authoritative afterwards. If you change OAuth settings after the container has been initialized, either toggle the equivalent setting in **Admin Panel → Settings → General** or wipe the volume with `docker compose -f ai/docker-compose.openwebui.yml down -v` and start fresh (this deletes all chat history and users).
 
 ### Adding more LiteLLM models
 

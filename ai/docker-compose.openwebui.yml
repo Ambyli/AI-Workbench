@@ -1,0 +1,41 @@
+networks:
+  shared:
+    external: true
+    name: ai_shared
+
+services:
+  openwebui:
+    image: ghcr.io/open-webui/open-webui:main
+    networks:
+      - shared
+    container_name: openwebui
+    restart: unless-stopped
+    ports:
+      - "${PORT_OPENWEBUI}:8080"
+    environment:
+      # Point Open WebUI at the LiteLLM proxy on the shared network.
+      # LiteLLM is reachable as `litellm:4000` inside ai_shared.
+      OPENAI_API_BASE_URL: "http://litellm:4000/v1"
+      OPENAI_API_KEY: "${DEFAULT_LITELLM_MASTER_KEY}"
+
+      # Disable Ollama discovery — we route everything through LiteLLM.
+      ENABLE_OLLAMA_API: "false"
+
+      # Required for session persistence across container recreations.
+      WEBUI_SECRET_KEY: "${OPENWEBUI_SECRET_KEY}"
+
+      # Lock down the deployment: first sign-up becomes admin, subsequent
+      # sign-ups are disabled. Toggle to "true" if more accounts are needed.
+      ENABLE_SIGNUP: "false"
+      DEFAULT_USER_ROLE: "admin"
+    volumes:
+      - openwebui_data:/app/backend/data
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/health')\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  openwebui_data:

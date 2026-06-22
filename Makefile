@@ -36,6 +36,7 @@ $(eval $(call service,unsloth,unsloth))
 $(eval $(call service,vllm,vllm-qwen vllm-qwen-vl))
 $(eval $(call service,kokoro,kokoro-app kokoro-api))
 $(eval $(call service,classifier,classifier))
+$(eval $(call service,openwebui,openwebui))
 
 setup: network
 	cd widget && uv sync && cd ..

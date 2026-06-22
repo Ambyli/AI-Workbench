@@ -99,11 +99,11 @@ Open WebUI supports Google sign-in for either of two reasons: skipping password 
 
 1. Open <https://console.cloud.google.com/apis/credentials> and select (or create) a project.
 2. Click **Create Credentials → OAuth client ID**. App type: **Web application**.
-3. Under **Authorized redirect URIs** add exactly:
+3. Under **Authorized redirect URIs** add exactly the value matching `OPENWEBUI_WEBUI_URL` with `/oauth/google/callback` appended. For this deployment:
    ```
-   http://localhost:8007/oauth/google/callback
+   https://chat.zeoenergy.com/oauth/google/callback
    ```
-   If `OPENWEBUI_WEBUI_URL` is something other than `http://localhost:8007` (e.g. a public hostname behind a reverse proxy), use that base instead — the path `/oauth/google/callback` is fixed.
+   The path `/oauth/google/callback` is fixed. Google will reject any redirect URI that points at a private IP (`192.168.x.x`, `10.x.x.x`, …) — use a public hostname (via Cloudflare Tunnel, see below) or `localhost` for testing.
 4. Copy the generated **Client ID** and **Client secret** into `.env`:
    ```
    OPENWEBUI_GOOGLE_CLIENT_ID=...
@@ -123,6 +123,49 @@ A **Continue with Google** button appears on the login screen once both values a
 - If not, a new account is created with role `pending` (per `OPENWEBUI_DEFAULT_USER_ROLE`) and must be approved.
 
 > **About the running container:** Env vars are only read on the *very first* boot — the SQLite store in `openwebui_data` is authoritative afterwards. If you change OAuth settings after the container has been initialized, either toggle the equivalent setting in **Admin Panel → Settings → General** or wipe the volume with `docker compose -f ai/docker-compose.openwebui.yml down -v` and start fresh (this deletes all chat history and users).
+
+### Public hostname via Cloudflare Tunnel
+
+For LAN-wide or off-LAN access, Open WebUI is fronted by a Cloudflare Tunnel rather than exposed directly. Cloudflare terminates TLS and routes `https://chat.zeoenergy.com` to `http://localhost:8007` on the host, so:
+
+- No `/etc/hosts` edits on any client.
+- No router port-forwarding.
+- HTTPS for free (Google OAuth requires HTTPS for non-localhost callbacks).
+- Public hostname → Google OAuth accepts the redirect URI.
+
+**Setup (one-time):**
+
+1. In the Cloudflare dashboard go to **Zero Trust → Networks → Tunnels → Create a tunnel**. Pick **Cloudflared** as the connector.
+2. Name it something like `openwebui`, save, then copy the **install token** from the *Linux / Docker* tab.
+3. Paste the token into `.env`:
+   ```
+   CLOUDFLARE_TUNNEL_TOKEN=eyJh...
+   ```
+4. Add a public hostname route on the tunnel:
+   - **Subdomain:** `chat`
+   - **Domain:** `zeoenergy.com`
+   - **Service type:** `HTTP`
+   - **URL:** `localhost:8007`
+5. Cloudflare will auto-create the CNAME DNS record for `chat.zeoenergy.com` pointing at the tunnel.
+6. Start the tunnel container:
+   ```bash
+   make tunnel
+   ```
+   Stop with `make tunnel-down`.
+7. Update `OPENWEBUI_WEBUI_URL=https://chat.zeoenergy.com` and `CORS_ALLOW_ORIGIN=https://chat.zeoenergy.com` in `.env` (already set), then restart Open WebUI:
+   ```bash
+   make down-openwebui && make up-openwebui
+   ```
+8. Update the Google OAuth client's **Authorized redirect URIs** to include `https://chat.zeoenergy.com/oauth/google/callback`.
+
+**Verifying:**
+
+```bash
+docker logs cloudflared --tail 50   # should show "Registered tunnel connection"
+curl -I https://chat.zeoenergy.com   # should return 200 from Open WebUI
+```
+
+If the tunnel is up but the site 502s, the origin URL (`localhost:8007`) is unreachable from the `cloudflared` container — check `make up-openwebui` first.
 
 ### Restricting visible models
 

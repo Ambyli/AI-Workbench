@@ -43,6 +43,7 @@ Every value is sourced from `.env` so configuration lives in one file.
 | `OAUTH_MERGE_ACCOUNTS_BY_EMAIL` | `OPENWEBUI_OAUTH_MERGE_ACCOUNTS_BY_EMAIL` | `true` | OAuth logins are merged into existing local accounts with the same email |
 | `GOOGLE_CLIENT_ID` | `OPENWEBUI_GOOGLE_CLIENT_ID` | _(empty)_ | Google Cloud OAuth 2.0 client ID — see [Google OAuth setup](#google-oauth-setup) |
 | `GOOGLE_CLIENT_SECRET` | `OPENWEBUI_GOOGLE_CLIENT_SECRET` | _(empty)_ | Matching client secret |
+| `OPENID_PROVIDER_URL` | `OPENWEBUI_OPENID_PROVIDER_URL` | Google discovery doc | OIDC discovery document URL; required for clean provider-side logout |
 | `CORS_ALLOW_ORIGIN` | `CORS_ALLOW_ORIGIN` | `*` | Tighten to a specific origin if another web app calls Open WebUI's API from the browser |
 | `HF_TOKEN` | `HF_TOKEN` | _(shared with vLLM)_ | Used for gated embedding / RAG model downloads. Same token also drives vLLM gated model downloads |
 
@@ -107,7 +108,8 @@ Open WebUI supports Google sign-in for either of two reasons: skipping password 
    OPENWEBUI_GOOGLE_CLIENT_ID=...
    OPENWEBUI_GOOGLE_CLIENT_SECRET=...
    ```
-5. Restart the container so the new values take effect:
+5. `OPENWEBUI_OPENID_PROVIDER_URL` is preset to Google's discovery document — leave it alone unless you're swapping providers. Without it, Open WebUI logs `OPENID_PROVIDER_URL not set - logout will not work!` and the logout flow only clears the local cookie.
+6. Restart the container so the new values take effect:
    ```bash
    make down-openwebui && make up-openwebui
    ```

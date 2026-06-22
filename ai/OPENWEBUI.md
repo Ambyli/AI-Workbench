@@ -33,7 +33,7 @@ Every value is sourced from `.env` so configuration lives in one file.
 | Open WebUI env var | `.env` key | Default | Notes |
 |---|---|---|---|
 | `OPENAI_API_BASE_URL` | `OPENWEBUI_OPENAI_API_BASE_URL` | `http://litellm:4000/v1` | Must be the Docker service DNS name in compose, not localhost |
-| `OPENAI_API_KEY` | `DEFAULT_LITELLM_MASTER_KEY` | _(shared with LiteLLM)_ | Reuses the LiteLLM master key — no separate value needed |
+| `OPENAI_API_KEY` | `OPENWEBUI_OPENAI_API_KEY` | _(empty — set to a virtual key)_ | LiteLLM virtual key scoped to the chat models Open WebUI should see. See [Restricting visible models](#restricting-visible-models) |
 | `ENABLE_OLLAMA_API` | `OPENWEBUI_ENABLE_OLLAMA_API` | `false` | Disables the Ollama discovery probe |
 | `WEBUI_SECRET_KEY` | `OPENWEBUI_SECRET_KEY` | _(placeholder — rotate)_ | Signs sessions; stable value required to avoid log-outs on restart |
 | `WEBUI_URL` | `OPENWEBUI_WEBUI_URL` | `http://localhost:8007` | Public base URL; used to build OAuth callback URLs |
@@ -120,6 +120,38 @@ A **Continue with Google** button appears on the login screen once both values a
 - If not, a new account is created with role `pending` (per `OPENWEBUI_DEFAULT_USER_ROLE`) and must be approved.
 
 > **About the running container:** Env vars are only read on the *very first* boot — the SQLite store in `openwebui_data` is authoritative afterwards. If you change OAuth settings after the container has been initialized, either toggle the equivalent setting in **Admin Panel → Settings → General** or wipe the volume with `docker compose -f ai/docker-compose.openwebui.yml down -v` and start fresh (this deletes all chat history and users).
+
+### Restricting visible models
+
+Open WebUI populates its model picker by calling `GET /v1/models` against LiteLLM, using whatever API key it's been given. The LiteLLM **master key** sees every model defined in `litellm_config.yaml` — including non-chat entries like `kokoro` (TTS), which would clutter the picker. The fix is to give Open WebUI a **virtual key** scoped to just the chat models you want it to see.
+
+**Create a virtual key in LiteLLM:**
+
+1. Open the LiteLLM Admin UI at `http://localhost:4001/ui/` and sign in with `DEFAULT_LITELLM_MASTER_KEY`.
+2. Go to **Virtual Keys → Create Key**.
+3. Under **Models**, select only the chat-capable models Open WebUI should expose (e.g. `qwen3.6-unsloth`, `qwen3.6`, `qwen2.5-vl`). Leave audio-only models like `kokoro` unchecked.
+4. (Optional) Give the key a friendly name like `openwebui`, set a budget, set TTL.
+5. Copy the generated key.
+
+Or via the API:
+
+```bash
+curl -X POST http://localhost:4001/key/generate \
+  -H "Authorization: Bearer $DEFAULT_LITELLM_MASTER_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "models": ["qwen3.6-unsloth", "qwen3.6", "qwen2.5-vl"],
+    "key_alias": "openwebui"
+  }'
+```
+
+**Use it in Open WebUI:**
+
+```
+OPENWEBUI_OPENAI_API_KEY=sk-...
+```
+
+Restart the container — `make down-openwebui && make up-openwebui`. After login, only the models on the virtual key's allowlist appear in the chat picker. Adding or removing models later only needs the virtual-key allowlist to be edited; no Open WebUI restart is required (Open WebUI re-fetches `/v1/models` on every page load).
 
 ### Adding more LiteLLM models
 

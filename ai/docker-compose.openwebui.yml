@@ -15,7 +15,7 @@ services:
     environment:
       # All values are sourced from .env — edit there, not here.
       OPENAI_API_BASE_URL: "${OPENWEBUI_OPENAI_API_BASE_URL}"
-      OPENAI_API_KEY: "${DEFAULT_LITELLM_MASTER_KEY}"
+      OPENAI_API_KEY: "${OPENWEBUI_OPENAI_API_KEY}"
       ENABLE_OLLAMA_API: "${OPENWEBUI_ENABLE_OLLAMA_API}"
       WEBUI_SECRET_KEY: "${OPENWEBUI_SECRET_KEY}"
       WEBUI_URL: "${OPENWEBUI_WEBUI_URL}"

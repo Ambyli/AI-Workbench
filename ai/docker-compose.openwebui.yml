@@ -1,0 +1,52 @@
+networks:
+  shared:
+    external: true
+    name: ai_shared
+
+services:
+  openwebui:
+    image: ghcr.io/open-webui/open-webui:main
+    networks:
+      - shared
+    container_name: openwebui
+    restart: unless-stopped
+    ports:
+      - "${PORT_OPENWEBUI}:8080"
+    environment:
+      # All values are sourced from .env — edit there, not here.
+      OPENAI_API_BASE_URL: "${OPENWEBUI_OPENAI_API_BASE_URL}"
+      OPENAI_API_KEY: "${OPENWEBUI_OPENAI_API_KEY}"
+      ENABLE_OLLAMA_API: "${OPENWEBUI_ENABLE_OLLAMA_API}"
+      WEBUI_SECRET_KEY: "${OPENWEBUI_SECRET_KEY}"
+      WEBUI_URL: "${OPENWEBUI_WEBUI_URL}"
+      ENABLE_SIGNUP: "${OPENWEBUI_ENABLE_SIGNUP}"
+      DEFAULT_USER_ROLE: "${OPENWEBUI_DEFAULT_USER_ROLE}"
+      CORS_ALLOW_ORIGIN: "${CORS_ALLOW_ORIGIN}"
+      HF_TOKEN: "${HF_TOKEN}"
+
+      # OAuth — Google sign-in. Credentials must be issued in Google Cloud
+      # Console; the redirect URI registered there must be
+      # ${OPENWEBUI_WEBUI_URL}/oauth/google/callback
+      ENABLE_OAUTH_SIGNUP: "${OPENWEBUI_ENABLE_OAUTH_SIGNUP}"
+      OAUTH_MERGE_ACCOUNTS_BY_EMAIL: "${OPENWEBUI_OAUTH_MERGE_ACCOUNTS_BY_EMAIL}"
+      GOOGLE_CLIENT_ID: "${OPENWEBUI_GOOGLE_CLIENT_ID}"
+      GOOGLE_CLIENT_SECRET: "${OPENWEBUI_GOOGLE_CLIENT_SECRET}"
+      OPENID_PROVIDER_URL: "${OPENWEBUI_OPENID_PROVIDER_URL}"
+
+      # User-Agent for langchain_community outbound HTTP (RAG / web loaders).
+      USER_AGENT: "${OPENWEBUI_USER_AGENT}"
+
+      # MCP handshake timeout (seconds). Raise if a registered MCP server
+      # cold-starts slowly.
+      MCP_INITIALIZE_TIMEOUT: "${OPENWEBUI_MCP_INITIALIZE_TIMEOUT}"
+    volumes:
+      - openwebui_data:/app/backend/data
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/health')\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  openwebui_data:

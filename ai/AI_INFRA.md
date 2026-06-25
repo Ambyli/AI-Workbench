@@ -33,3 +33,4 @@ docker compose up -d
 | [Unsloth](UNSLOTH.md) | `unsloth` | Unsloth environment with CUDA-compiled llama.cpp |
 | [vLLM](VLLM.md) | `vllm-qwen`, `vllm-llama` | Multi-model vLLM serving |
 | [Kokoro](KOKORO.md) | `kokoro-app`, `kokoro-api` | Text-to-speech (Kokoro-82M) |
+| [Open WebUI](OPENWEBUI.md) | `openwebui` | Browser chat UI wired to LiteLLM |

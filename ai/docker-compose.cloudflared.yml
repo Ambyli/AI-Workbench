@@ -1,0 +1,17 @@
+networks:
+  shared:
+    external: true
+    name: ai_shared
+
+services:
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: ai-cloudflared
+    networks:
+      - shared
+    restart: unless-stopped
+    environment:
+      # Token from a Cloudflare Zero Trust tunnel. Read from .env via the
+      # standard --env-file flag in the Makefile macro.
+      TUNNEL_TOKEN: "${CLOUDFLARE_TUNNEL_TOKEN}"
+    command: tunnel --no-autoupdate run

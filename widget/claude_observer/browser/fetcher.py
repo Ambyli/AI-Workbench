@@ -1,10 +1,11 @@
 """
 fetcher.py
 ----------
-Uses Chrome's DevTools Protocol (CDP) to read token-usage data from
-claude.ai/settings/usage.  No Selenium required — communicates directly with
-a visible Chrome window that the user opens by clicking "Link Browser" in the
-widget popup.
+Thin wrapper around ``cdp_interceptor.InterceptorClient`` that preserves the
+BrowserLinker interface the rest of the widget depends on. The claude.ai
+response shapes are parsed by ``response_parser.parse_response``; everything
+else (Chrome launching, CDP session, headless sentinel handling) lives in
+the generic ``cdp_interceptor`` library.
 
 Public API
 ----------
@@ -17,84 +18,43 @@ BrowserLinker()
     .get_state() -> dict
 """
 
-import os
 import threading
-import time
 from datetime import datetime
 
-from claude_observer import config
-from claude_observer.logging_setup import log
+from cdp_interceptor import ChromeNotFoundError, InterceptorClient
 
-from claude_observer.browser.cdp_client import run_cdp_session
-from claude_observer.browser.chrome_launcher import (
-    find_chrome,
-    start_chrome,
-    session_exists,
-    mark_session_ok,
-    clear_session,
-)
+from claude_observer import config
 from claude_observer.browser.response_parser import parse_response
+from claude_observer.logging_setup import log
 
 
 class BrowserLinker:
     """
-    Opens a visible Chrome window at claude.ai/settings/usage and reads usage
-    data via Chrome DevTools Protocol (CDP).
-
-    Flow:
-      1. launch() opens Chrome with --remote-debugging-port and navigates to
-         the usage page.  The window is fully interactive — the user logs in
-         normally if prompted.
-      2. The background loop connects to the open tab via WebSocket CDP,
-         injects a fetch/XHR interceptor, and reads the captured responses.
-      3. The state dict and on_update callback are identical to the old
-         Selenium-based UsageFetcher so the rest of the app is unchanged.
+    Delegates to InterceptorClient. Exposes the same state dict and callback
+    shape the widget has always used so ``core/widget.py`` needs no changes.
     """
 
     USAGE_URL = "https://claude.ai/settings/usage"
-    LOGIN_TIMEOUT = 300  # seconds the user has to log in
-    CAPTURE_TIMEOUT = 30  # seconds to poll for usage data after page load
-    CAPTURE_POLL = 2  # seconds between each poll attempt
-
-    # Loaded once at class definition time so all instances share the same string.
-    _INTERCEPTOR_JS: str = open(
-        os.path.join(os.path.dirname(__file__), "interceptor.js"), encoding="utf-8"
-    ).read()
-
-    @property
-    def _interceptor_script(self) -> str:
-        """Returns the interceptor JS prefixed with the DEBUG_LOGGING constant."""
-        flag = "true" if config.DEBUG_LOGGING else "false"
-        return f"const DEBUG_LOGGING = {flag};\n" + self._INTERCEPTOR_JS
+    LOGIN_TIMEOUT = 300
+    CAPTURE_TIMEOUT = 30
+    CAPTURE_POLL = 2
 
     def __init__(self):
         log.debug("Starting BrowserLinker.__init__")
-        self._proc = None
-        self._chrome_path: str | None = None
         self._data: dict | None = None
         self._error: str | None = None
         self._status = "unlinked"
         self._fetched_at: datetime | None = None
-        self._headless: bool = False
-        self._lock = threading.Lock()
         self._on_update = None
-        self._reload_requested = threading.Event()
+        self._lock = threading.Lock()
+        self._client: InterceptorClient | None = None
         log.debug("Finished BrowserLinker.__init__")
 
     # ── Public ────────────────────────────────────────────────────────────────
 
     @staticmethod
     def is_available() -> bool:
-        """True if requests and websocket-client are both installed."""
-        log.debug("Starting BrowserLinker.is_available")
-        try:
-            import requests  # noqa: F401
-            import websocket  # noqa: F401
-            log.debug("Finished BrowserLinker.is_available: True")
-            return True
-        except ImportError as exc:
-            log.debug("BrowserLinker not available: %s", exc)
-            return False
+        return InterceptorClient.is_available()
 
     def launch(self, on_update):
         """Open Chrome at the usage URL and begin the polling loop.
@@ -102,8 +62,23 @@ class BrowserLinker:
         log.debug("Starting BrowserLinker.launch")
         self._on_update = on_update
 
-        chrome = find_chrome()
-        if chrome is None:
+        self._client = InterceptorClient(
+            profile_dir=config.BROWSER_PROFILE_DIR,
+            debug_port=config.BROWSER_DEBUG_PORT,
+            debug_logging=config.DEBUG_LOGGING,
+            # url_patterns intentionally omitted — parse_response is strict
+            # about body shape, so today's widget lets every capture through
+            # the parser and takes the first match. Preserve that.
+            parse_fn=lambda cap: parse_response(cap.body),
+            on_data=self._on_data,
+            on_status=self._on_cdp_status,
+            login_timeout=self.LOGIN_TIMEOUT,
+            capture_timeout=self.CAPTURE_TIMEOUT,
+            capture_poll=self.CAPTURE_POLL,
+        )
+        try:
+            self._client.launch(self.USAGE_URL)
+        except ChromeNotFoundError:
             log.error("BrowserLinker.launch: Chrome not found")
             with self._lock:
                 self._status = "error"
@@ -111,182 +86,50 @@ class BrowserLinker:
                     "Chrome not found — install Google Chrome to use account stats"
                 )
             self._notify()
-            return
-
-        os.makedirs(config.BROWSER_PROFILE_DIR, exist_ok=True)
-        for lf in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
-            try:
-                os.remove(os.path.join(config.BROWSER_PROFILE_DIR, lf))
-            except FileNotFoundError:
-                pass
-
-        self._chrome_path = chrome
-        self._headless = session_exists(config.BROWSER_PROFILE_DIR)
-        self._proc = start_chrome(
-            chrome,
-            headless=self._headless,
-            debug_port=config.BROWSER_DEBUG_PORT,
-            profile_dir=config.BROWSER_PROFILE_DIR,
-            target_url=self.USAGE_URL,
-        )
-        log.debug("BrowserLinker.launch: Chrome started (pid=%s)", self._proc.pid)
-
-        self._set_status("loading")
-        self._notify()
-        threading.Thread(target=self._loop, daemon=True).start()
         log.debug("Finished BrowserLinker.launch")
 
     def fetch_now(self):
-        """Signal the live CDP session to reload the page."""
-        log.debug("Starting BrowserLinker.fetch_now")
-        self._reload_requested.set()
-        log.debug("Finished BrowserLinker.fetch_now")
-
-    def _kill_chrome(self, label: str = ""):
-        """Terminate self._proc and wait for it to exit, force-killing if needed."""
-        if self._proc is None:
-            return
-        proc, self._proc = self._proc, None
-        try:
-            proc.terminate()
-            try:
-                proc.wait(timeout=3)
-            except Exception:
-                proc.kill()
-                proc.wait(timeout=2)
-        except Exception as exc:
-            log.warning("BrowserLinker._kill_chrome%s: %s", f" ({label})" if label else "", exc)
+        log.debug("BrowserLinker.fetch_now")
+        if self._client is not None:
+            self._client.fetch_now()
 
     def go_headless(self):
-        """Terminate the current Chrome process and relaunch it headlessly.
-        Requires a prior successful fetch (sentinel must exist)."""
-        log.debug("Starting BrowserLinker.go_headless")
-        if not session_exists(config.BROWSER_PROFILE_DIR):
-            log.warning("BrowserLinker.go_headless: no session sentinel — cannot go headless")
-            return
-        if not self._chrome_path:
-            log.warning("BrowserLinker.go_headless: chrome path not stored")
-            return
-        self._kill_chrome("go_headless")
-        self._headless = True
-        self._proc = start_chrome(
-            self._chrome_path,
-            headless=True,
-            debug_port=config.BROWSER_DEBUG_PORT,
-            profile_dir=config.BROWSER_PROFILE_DIR,
-            target_url=self.USAGE_URL,
-        )
-        log.debug("BrowserLinker.go_headless: headless Chrome started (pid=%s)", self._proc.pid)
+        log.debug("BrowserLinker.go_headless")
+        if self._client is not None:
+            self._client.go_headless()
 
     def go_visible(self):
-        """Terminate the current headless Chrome process and relaunch it visibly."""
-        log.debug("Starting BrowserLinker.go_visible")
-        if not self._chrome_path:
-            log.warning("BrowserLinker.go_visible: chrome path not stored")
-            return
-        self._kill_chrome("go_visible")
-        self._headless = False
-        self._proc = start_chrome(
-            self._chrome_path,
-            headless=False,
-            debug_port=config.BROWSER_DEBUG_PORT,
-            profile_dir=config.BROWSER_PROFILE_DIR,
-            target_url=self.USAGE_URL,
-        )
-        log.debug("BrowserLinker.go_visible: visible Chrome started (pid=%s)", self._proc.pid)
+        log.debug("BrowserLinker.go_visible")
+        if self._client is not None:
+            self._client.go_visible()
 
     def quit(self):
-        """Terminate the managed Chrome process if one was started."""
-        log.debug("Starting BrowserLinker.quit")
-        self._kill_chrome("quit")
-        log.debug("Finished BrowserLinker.quit")
+        log.debug("BrowserLinker.quit")
+        if self._client is not None:
+            self._client.quit()
 
     def get_state(self) -> dict:
-        log.debug("Starting BrowserLinker.get_state")
+        client_state = self._client.get_state() if self._client is not None else None
         with self._lock:
-            state = {
+            return {
                 "status": self._status,
                 "data": self._data,
                 "error": self._error,
                 "fetched_at": self._fetched_at,
-                "headless": self._headless,
+                "headless": client_state.headless if client_state is not None else False,
             }
-        log.debug("Finished BrowserLinker.get_state status=%s", state["status"])
-        return state
 
-    # ── Background loop ───────────────────────────────────────────────────────
-
-    def _loop(self):
-        log.debug("Starting BrowserLinker._loop")
-        time.sleep(4)  # give Chrome time to open the tab
-        while True:
-            self._set_status("loading")
-            self._notify()
-            try:
-                run_cdp_session(
-                    debug_port=config.BROWSER_DEBUG_PORT,
-                    interceptor_script=self._interceptor_script,
-                    parse_fn=parse_response,
-                    on_data=self._on_data,
-                    on_status=self._on_cdp_status,
-                    reload_event=self._reload_requested,
-                    login_timeout=self.LOGIN_TIMEOUT,
-                    capture_timeout=self.CAPTURE_TIMEOUT,
-                    capture_poll=self.CAPTURE_POLL,
-                    usage_url=self.USAGE_URL,
-                )
-            except TimeoutError as exc:
-                # Login timed out — if we were running headless the session
-                # expired. Clear the sentinel and relaunch visibly so the user
-                # can log in again.
-                if session_exists(config.BROWSER_PROFILE_DIR) and self._chrome_path:
-                    log.warning(
-                        "BrowserLinker._loop: headless session expired, relaunching visibly"
-                    )
-                    clear_session(config.BROWSER_PROFILE_DIR)
-                    self._headless = False
-                    try:
-                        self._proc.terminate()
-                    except Exception:
-                        pass
-                    self._proc = start_chrome(
-                        self._chrome_path,
-                        headless=False,
-                        debug_port=config.BROWSER_DEBUG_PORT,
-                        profile_dir=config.BROWSER_PROFILE_DIR,
-                        target_url=self.USAGE_URL,
-                    )
-                    with self._lock:
-                        self._error = "Session expired — please log in again"
-                        self._status = "waiting_login"
-                else:
-                    with self._lock:
-                        self._error = str(exc)
-                        self._status = "error"
-                self._notify()
-            except Exception as exc:
-                log.error("Error in BrowserLinker._loop: %s", exc)
-                with self._lock:
-                    self._error = str(exc)
-                    self._status = "error"
-                self._notify()
-            log.debug("BrowserLinker._loop: session ended, reconnecting in 15s")
-            time.sleep(15)
-
-    # ── CDP callbacks ─────────────────────────────────────────────────────────
+    # ── Callbacks from InterceptorClient (worker thread) ──────────────────────
 
     def _on_data(self, parsed: dict):
-        """Called by run_cdp_session whenever fresh usage data is parsed."""
         with self._lock:
             self._data = parsed
             self._error = None
             self._status = "ok"
             self._fetched_at = datetime.now()
-        mark_session_ok(config.BROWSER_PROFILE_DIR)
         self._notify()
 
     def _on_cdp_status(self, status: str, error: str | None):
-        """Called by run_cdp_session to report status changes."""
         with self._lock:
             self._status = status
             if error is not None:
@@ -294,10 +137,6 @@ class BrowserLinker:
         self._notify()
 
     # ── Helpers ───────────────────────────────────────────────────────────────
-
-    def _set_status(self, status: str):
-        with self._lock:
-            self._status = status
 
     def _notify(self):
         if self._on_update:

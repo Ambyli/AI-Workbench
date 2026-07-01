@@ -16,6 +16,7 @@ dependencies = [
 
 [project.scripts]
 claude-usage-observer = "claude_observer.__main__:main"
+cdp-spy               = "cdp_interceptor.spy:main"
 
 [build-system]
 requires = ["setuptools>=68"]
@@ -23,3 +24,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["."]
+include = ["claude_observer*", "cdp_interceptor*"]
+
+[tool.setuptools.package-data]
+cdp_interceptor = ["interceptor.js"]

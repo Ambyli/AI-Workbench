@@ -39,6 +39,8 @@ Key variables:
 | `LLM_LOG_MAX_LINES` | `200` | Max lines in server-output log box |
 | `LLAMA_SERVER_CMD` | _(empty)_ | Full shell command to launch llama-server |
 | `AUDIO_BASE_URL` | `http://localhost:8004` | Base URL returned by Kokoro `text_to_speech` MCP tool |
+| `MADLAD_APP_URL` | `http://madlad-app:8085` | URL the MADLAD proxy uses to reach the inference container |
+| `MADLAD_MODEL` | `jbochi/madlad400-3b-mt` | HuggingFace repo ID for the MADLAD translation checkpoint |
 
 ## Threading Model — Read Before Touching Anything
 

@@ -1,0 +1,12 @@
+[project]
+name = "madlad-api"
+version = "0.1.0"
+description = "Stateless FastAPI proxy for the MADLAD translation app container"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi",
+    "uvicorn",
+    "httpx",
+    "fastmcp>=2.0",
+    "pydantic",
+]

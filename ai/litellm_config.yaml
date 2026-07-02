@@ -24,6 +24,10 @@ mcp_servers:
     url: http://kokoro-api:8000/mcp
     transport: "http"
 
+  madlad_translate:
+    url: http://madlad-api:8000/mcp
+    transport: "http"
+
   phoenix:
     url: os.environ/DEFAULT_LITELLM_MCP_PHOENIX_URL
     transport: "http"

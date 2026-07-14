@@ -105,7 +105,28 @@ cd ai/madlad/api && MADLAD_APP_URL=http://localhost:8085 uv run madlad_server.py
 
 ### LiteLLM integration
 
-`madlad-api` exposes an MCP tool at `/mcp` that any LiteLLM-routed model can call. Registered in `litellm_config.yaml` as the `madlad_translate` MCP server.
+`madlad-api` is exposed through LiteLLM in two ways.
+
+**1. Pass-through HTTP endpoint** (simplest — direct translation without a chat model in the loop):
+
+Anything under `/v1/madlad/*` on LiteLLM is forwarded to `madlad-api` on the internal `ai_shared` network. Headers (including `Authorization`) are forwarded unchanged.
+
+```bash
+# Translate
+curl -X POST "http://localhost:4001/v1/madlad/translate?text=Good+morning&target_lang=ja" \
+  -H "Authorization: Bearer $DEFAULT_LITELLM_MASTER_KEY"
+# {"translated": "おはよう"}
+
+# List supported languages
+curl "http://localhost:4001/v1/madlad/languages" \
+  -H "Authorization: Bearer $DEFAULT_LITELLM_MASTER_KEY"
+```
+
+The `/v1/madlad` prefix is stripped when forwarding — `/v1/madlad/translate` on LiteLLM hits `/translate` on madlad-api.
+
+**2. MCP tool** (for when you want a chat model to decide whether to translate as part of a larger task):
+
+`madlad-api` also exposes an MCP tool at `/mcp` that any LiteLLM-routed model can call. Registered in `litellm_config.yaml` as the `madlad_translate` MCP server.
 
 **Tool signature:**
 

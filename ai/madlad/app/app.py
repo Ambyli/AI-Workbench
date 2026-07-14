@@ -1,7 +1,7 @@
 """MADLAD-400 translation inference server.
 
-Runs a local FastAPI service on port 8085 that loads the MADLAD-400
-translation model via CTranslate2 and exposes /translate and /languages
+Runs a local FastAPI service on port 8085 that loads a pre-converted
+CTranslate2 MADLAD-400 checkpoint and exposes /translate and /languages
 endpoints for internal consumption by the external API container.
 """
 
@@ -9,7 +9,6 @@ import logging
 import os
 import re
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
@@ -17,37 +16,13 @@ from fastapi import FastAPI, HTTPException
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-MODEL_NAME = os.environ.get("MADLAD_MODEL", "jbochi/madlad400-3b-mt")
+MODEL_NAME = os.environ.get("MADLAD_MODEL") or "SoybeanMilk/madlad400-3b-mt-ct2-int8_float16"
 CACHE_DIR = "/root/.cache/huggingface"
-CT2_DIR_SUFFIX = "-ct2-int8"
 
 # Lazy-loaded — initialized on first request to avoid blocking startup.
 _translator = None
 _tokenizer = None
 _languages = None
-
-
-def _get_ct2_dir() -> str:
-    """Download the HF model if needed and convert to CTranslate2 format.
-
-    Cached in the HF cache volume so subsequent starts skip both steps.
-    """
-    from huggingface_hub import snapshot_download
-
-    hf_dir = snapshot_download(MODEL_NAME, cache_dir=CACHE_DIR)
-    ct2_dir = Path(hf_dir).parent / (Path(hf_dir).name + CT2_DIR_SUFFIX)
-
-    if (ct2_dir / "model.bin").exists():
-        logger.info("Reusing existing CT2 conversion at %s", ct2_dir)
-        return str(ct2_dir)
-
-    logger.info("Converting %s to CTranslate2 int8_float16 format (one-time, ~5-10 min)...", MODEL_NAME)
-    from ctranslate2.converters import TransformersConverter
-
-    converter = TransformersConverter(hf_dir, copy_files=["spiece.model", "tokenizer.json", "special_tokens_map.json", "tokenizer_config.json"])
-    converter.convert(str(ct2_dir), quantization="int8_float16", force=False)
-    logger.info("Conversion complete. CT2 model saved to %s", ct2_dir)
-    return str(ct2_dir)
 
 
 def _load():
@@ -57,14 +32,15 @@ def _load():
 
     import ctranslate2
     import sentencepiece as spm
+    from huggingface_hub import snapshot_download
 
-    ct2_dir = _get_ct2_dir()
+    logger.info("Downloading %s ...", MODEL_NAME)
+    model_dir = snapshot_download(MODEL_NAME, cache_dir=CACHE_DIR)
 
-    logger.info("Loading CT2 translator on CUDA...")
-    _translator = ctranslate2.Translator(ct2_dir, device="cuda", compute_type="int8_float16")
+    logger.info("Loading CT2 translator on CUDA from %s", model_dir)
+    _translator = ctranslate2.Translator(model_dir, device="cuda", compute_type="int8_float16")
 
-    spm_path = Path(ct2_dir) / "spiece.model"
-    _tokenizer = spm.SentencePieceProcessor(model_file=str(spm_path))
+    _tokenizer = spm.SentencePieceProcessor(model_file=f"{model_dir}/spiece.model")
 
     lang_pattern = re.compile(r"^<2([a-z]{2,3}(?:_[A-Za-z]+)?)>$")
     _languages = sorted(

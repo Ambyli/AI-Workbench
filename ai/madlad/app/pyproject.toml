@@ -7,9 +7,6 @@ dependencies = [
     "ctranslate2>=4.4.0",
     "sentencepiece",
     "huggingface_hub",
-    "transformers",
-    "torch",
-    "protobuf",
     "fastapi",
     "uvicorn",
 ]

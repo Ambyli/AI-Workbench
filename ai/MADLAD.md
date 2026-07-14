@@ -42,20 +42,19 @@ Source language is auto-detected — no need to specify it.
 |---|---|---|
 | `HF_TOKEN` | — | HuggingFace token for downloading model weights on first run |
 | `MADLAD_APP_URL` | `http://madlad-app:8085` | URL the API proxy uses to reach the inference container. Resolves via Docker service name in Compose. For local dev, override inline: `MADLAD_APP_URL=http://localhost:8085 uv run madlad_server.py` |
-| `MADLAD_MODEL` | `jbochi/madlad400-3b-mt` | HuggingFace repo ID for the MADLAD checkpoint. Try `jbochi/madlad400-7b-mt` or `jbochi/madlad400-10b-mt` for higher quality (larger VRAM footprint). |
+| `MADLAD_MODEL` | `SoybeanMilk/madlad400-3b-mt-ct2-int8_float16` | HuggingFace repo ID for a **pre-converted** CTranslate2 MADLAD checkpoint. Alternatives: `SoybeanMilk/madlad400-10b-mt-ct2-int8_float16` (higher quality, more VRAM), `Nextcloud-AI/madlad400-3b-mt-ct2-int8` (CPU-friendly). |
 
 ### Model loading
 
 The model is **lazy-loaded** on the first `/translate` (or `/languages`) request, not at startup.
 
-**First request is slow (~5-10 minutes):**
-1. Downloads the raw PyTorch checkpoint from HuggingFace (~5 GB for 3B).
-2. Converts to CTranslate2 `int8_float16` format.
-3. Loads the converted model onto the GPU.
+**First request is slow (~1-3 minutes):**
+1. Downloads the pre-converted CTranslate2 checkpoint (~3 GB for the 3B int8_float16 model).
+2. Loads it onto the GPU.
 
-Subsequent starts skip both download and conversion — the CT2 output is cached in the `madlad_data` named volume alongside the HF cache. Restarts of `madlad-app` are fast after the first run.
+Because CT2 checkpoints are consumed directly by `ctranslate2.Translator`, there is no on-the-fly conversion step and no `torch`/`transformers` dependency in the image. Subsequent starts skip the download — the checkpoint is cached in the `madlad_data` named volume. Restarts of `madlad-app` are fast after the first run.
 
-Because of the long first-run window, the Dockerfile healthcheck has a **10-minute** start-up grace period.
+The Dockerfile healthcheck has a **10-minute** start-up grace period to cover slow network conditions on the initial download.
 
 ### Health check
 
@@ -82,7 +81,7 @@ ai/
   Dockerfile.madlad-api      ← builds the proxy container
   madlad/
     app/
-      pyproject.toml         ← app deps (ctranslate2, sentencepiece, transformers, torch, fastapi, uvicorn)
+      pyproject.toml         ← app deps (ctranslate2, sentencepiece, huggingface_hub, fastapi, uvicorn)
       app.py                 ← FastAPI inference server on :8085
     api/
       pyproject.toml         ← api deps (fastapi, uvicorn, httpx, fastmcp)

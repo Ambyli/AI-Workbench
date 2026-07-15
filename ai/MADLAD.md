@@ -58,6 +58,25 @@ Because CT2 checkpoints are consumed directly by `ctranslate2.Translator`, there
 
 The Dockerfile healthcheck has a **10-minute** start-up grace period to cover slow network conditions on the initial download.
 
+### Decoding parameters
+
+Translation quality is controlled by four `ctranslate2.Translator.translate_batch()` parameters in `ai/madlad/app/app.py`. Current defaults are tuned to prevent repetition loops on short inputs while keeping latency reasonable.
+
+| Parameter | Default | Purpose | When to change |
+|---|---|---|---|
+| `beam_size` | `4` | Number of candidate translations explored in parallel; the best-scoring one is returned. `1` = greedy (fastest, prone to loops on short inputs); `4-5` = good quality/speed tradeoff; `8+` = marginal quality gains at 2×+ latency. | Lower to `1-2` if you need faster throughput on long batches. Raise to `5-6` for higher-stakes translation (e.g. formal documents). |
+| `repetition_penalty` | `1.1` | Multiplicative penalty on tokens already emitted in the current translation. `1.0` = no penalty; `>1.0` = discourage repeats. Too aggressive (>1.5) can prevent legitimate repetition and hurt fluency. | Raise to `1.2-1.3` if you still see repetition on some inputs. Lower toward `1.0` if translations feel unnaturally varied or lose valid repeated phrases. |
+| `no_repeat_ngram_size` | `3` | Hard block: no n-gram of this length may repeat in the output. `0` = disabled; `3` blocks 3-word phrase repeats (kills "good morning, good morning" loops); `4-5` is stricter but occasionally suppresses legitimate phrase reuse. | Lower to `0` if translations of technical text (where repeated phrases are correct) come out garbled. Raise to `4` only if `3` isn't catching a specific pattern. |
+| `max_decoding_length` | `1024` | Hard cap on output tokens per translation. Prevents runaway generation on pathological inputs. | Raise if translating long documents get truncated. Lower to reduce worst-case latency on adversarial inputs. |
+
+**How to change**: edit the `_translator.translate_batch(...)` call in `ai/madlad/app/app.py`, then rebuild:
+
+```bash
+docker compose -f ai/docker-compose.madlad.yml up -d --build
+```
+
+**Why the defaults were picked**: greedy decoding (`beam_size=1`, no penalties) is the fastest but fails on short, idiomatic inputs — a common failure was round-trip translation producing loops like `"Good morning, good morning, good morning"`. Beam search plus both repetition guards eliminates the loop class entirely at a ~3-4× latency cost, which is invisible next to the model forward pass itself.
+
 ### Health check
 
 `madlad-app` exposes a `/languages` endpoint that the Docker healthcheck polls every 30 seconds with a 600-second start-up grace period. `madlad-api` exposes a `/health` endpoint that its own healthcheck polls once ready. `madlad-api` only becomes reachable once `madlad-app` responds.
@@ -68,7 +87,7 @@ The Dockerfile healthcheck has a **10-minute** start-up grace period to cover sl
 docker compose -f ai/docker-compose.madlad.yml down
 ```
 
-Model weights and CT2 conversion output in the `madlad_data` volume are preserved. To also delete the cache (forcing full re-download and re-conversion on next start):
+The downloaded checkpoint in the `madlad_data` volume is preserved. To also delete the cache (forcing full re-download on next start):
 
 ```bash
 docker compose -f ai/docker-compose.madlad.yml down -v

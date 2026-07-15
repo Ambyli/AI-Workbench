@@ -90,7 +90,9 @@ def translate(req: TranslateRequest):
     results = _translator.translate_batch(
         [input_tokens],
         max_decoding_length=1024,
-        beam_size=1,
+        beam_size=4,
+        repetition_penalty=1.1,
+        no_repeat_ngram_size=3,
     )
     if not results or not results[0].hypotheses:
         raise HTTPException(status_code=500, detail="No translation produced.")

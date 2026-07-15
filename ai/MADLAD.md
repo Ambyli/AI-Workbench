@@ -30,7 +30,9 @@ Returns 400+ ISO 639-1 language codes.
 **Translate text:**
 
 ```bash
-curl -X POST "http://localhost:8008/translate?text=Hello+world&target_lang=es"
+curl -X POST http://localhost:8008/translate \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Hello world", "target_lang": "es"}'
 # {"translated": "Hola mundo"}
 ```
 
@@ -112,8 +114,10 @@ Anything under `/v1/madlad/*` on LiteLLM is forwarded to `madlad-api` on the int
 
 ```bash
 # Translate
-curl -X POST "http://localhost:4001/v1/madlad/translate?text=Good+morning&target_lang=ja" \
-  -H "Authorization: Bearer $DEFAULT_LITELLM_MASTER_KEY"
+curl -X POST http://localhost:4001/v1/madlad/translate \
+  -H "Authorization: Bearer $DEFAULT_LITELLM_MASTER_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Good morning", "target_lang": "ja"}'
 # {"translated": "おはよう"}
 
 # List supported languages

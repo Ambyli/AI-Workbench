@@ -12,6 +12,7 @@ from contextlib import asynccontextmanager
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -69,16 +70,21 @@ def list_languages():
     return {"languages": _languages}
 
 
+class TranslateRequest(BaseModel):
+    text: str
+    target_lang: str
+
+
 @app.post("/translate")
-def translate(text: str, target_lang: str):
+def translate(req: TranslateRequest):
     _load()
-    if target_lang not in _languages:
+    if req.target_lang not in _languages:
         raise HTTPException(
             status_code=400,
-            detail=f"Unknown target_lang '{target_lang}'. Use /languages to list supported codes.",
+            detail=f"Unknown target_lang '{req.target_lang}'. Use /languages to list supported codes.",
         )
 
-    prompt = f"<2{target_lang}> {text}"
+    prompt = f"<2{req.target_lang}> {req.text}"
     input_tokens = _tokenizer.encode(prompt, out_type=str)
 
     results = _translator.translate_batch(

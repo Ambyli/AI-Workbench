@@ -10,6 +10,7 @@ import os
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastmcp import FastMCP
+from pydantic import BaseModel
 
 APP_URL = os.environ.get("MADLAD_APP_URL", "http://madlad-app:8085")
 
@@ -36,12 +37,17 @@ def list_languages():
         raise HTTPException(status_code=502, detail=f"Cannot reach madlad-app: {exc}")
 
 
+class TranslateRequest(BaseModel):
+    text: str
+    target_lang: str
+
+
 @app.post("/translate")
-def translate_endpoint(text: str, target_lang: str):
+def translate_endpoint(req: TranslateRequest):
     try:
         r = httpx.post(
             f"{APP_URL}/translate",
-            params={"text": text, "target_lang": target_lang},
+            json=req.model_dump(),
             timeout=http_timeout,
         )
         r.raise_for_status()
@@ -65,7 +71,7 @@ def translate(text: str, target_lang: str) -> str:
     try:
         r = httpx.post(
             f"{APP_URL}/translate",
-            params={"text": text, "target_lang": target_lang},
+            json={"text": text, "target_lang": target_lang},
             timeout=http_timeout,
         )
         r.raise_for_status()

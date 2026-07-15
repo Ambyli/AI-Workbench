@@ -8,5 +8,5 @@ dependencies = [
     "soundfile",
     "fastapi",
     "uvicorn",
-    "misaki[en]",
+    "misaki[en,ja,zh]",
 ]

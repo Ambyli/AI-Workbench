@@ -18,19 +18,36 @@ from fastapi.responses import JSONResponse
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Lazy-loaded — initialized on first request to avoid blocking startup.
-_pipeline = None
+# Kokoro language codes — the first character of a voice name identifies its language.
+LANGUAGES: dict[str, str] = {
+    "a": "American English",
+    "b": "British English",
+    "e": "Spanish",
+    "f": "French",
+    "h": "Hindi",
+    "i": "Italian",
+    "j": "Japanese",
+    "p": "Brazilian Portuguese",
+    "z": "Mandarin",
+}
+
+# Lazy-loaded per language — initialized on first request to avoid blocking startup.
+_pipelines: dict = {}
 _voices = None
 
 
-def _get_pipeline():
-    global _pipeline  # noqa: PLW0603
-    if _pipeline is None:
+def _get_pipeline(lang_code: str):
+    if lang_code not in LANGUAGES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown language '{lang_code}'. Supported: {sorted(LANGUAGES)}",
+        )
+    if lang_code not in _pipelines:
         from kokoro import KPipeline
-        logger.info("Loading Kokoro model (first request)...")
-        _pipeline = KPipeline(lang_code="a")
-        logger.info("Kokoro model loaded.")
-    return _pipeline
+        logger.info("Loading Kokoro pipeline for lang_code=%s (%s)...", lang_code, LANGUAGES[lang_code])
+        _pipelines[lang_code] = KPipeline(lang_code=lang_code)
+        logger.info("Kokoro pipeline for lang_code=%s loaded.", lang_code)
+    return _pipelines[lang_code]
 
 
 def _get_voices():
@@ -61,8 +78,13 @@ def list_voices():
     return {"voices": _get_voices()}
 
 
+@app.get("/languages")
+def list_languages():
+    return {"languages": [{"code": code, "name": name} for code, name in LANGUAGES.items()]}
+
+
 @app.post("/generate")
-def generate(text: str, voice: str = "af_heart"):
+def generate(text: str, voice: str = "af_heart", language: str | None = None):
     voices = _get_voices()
     if voice not in voices:
         raise HTTPException(
@@ -70,7 +92,16 @@ def generate(text: str, voice: str = "af_heart"):
             detail=f"Unknown voice '{voice}'. Available: {voices}",
         )
 
-    pipeline = _get_pipeline()
+    if language is None:
+        language = voice[0]
+    elif language != voice[0]:
+        logger.warning(
+            "Language/voice mismatch: language=%s but voice=%s (prefix %s). "
+            "Proceeding as requested; pronunciation may be off.",
+            language, voice, voice[0],
+        )
+
+    pipeline = _get_pipeline(language)
     gen = pipeline(text, voice=voice)
 
     try:

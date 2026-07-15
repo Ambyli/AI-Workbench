@@ -124,3 +124,36 @@ Kokoro voice names (e.g. `af_heart`) can also be passed directly and will be use
 ### Adding voices
 
 Voices come from the Kokoro model on HuggingFace. Run `/voices` to see all available names, then pass the name as the `voice` query parameter to `/generate` or as the `voice` field in `/v1/audio/speech`.
+
+### Language support
+
+Kokoro supports nine languages. Each requires its own `KPipeline`; the app caches one per language and instantiates them lazily on first use.
+
+| Code | Language | Voice prefix |
+|---|---|---|
+| `a` | American English | `af_*`, `am_*` |
+| `b` | British English | `bf_*`, `bm_*` |
+| `e` | Spanish | `ef_*`, `em_*` |
+| `f` | French | `ff_*`, `fm_*` |
+| `h` | Hindi | `hf_*`, `hm_*` |
+| `i` | Italian | `if_*`, `im_*` |
+| `j` | Japanese | `jf_*`, `jm_*` |
+| `p` | Brazilian Portuguese | `pf_*`, `pm_*` |
+| `z` | Mandarin | `zf_*`, `zm_*` |
+
+**Discover:**
+
+```bash
+curl http://localhost:8004/languages
+```
+
+**Generate with an explicit language:**
+
+```bash
+curl -X POST "http://localhost:8004/generate?text=Bonjour&voice=ff_siwis&language=f" \
+  --output fr.wav
+```
+
+The `language` parameter is also accepted on `/v1/audio/speech` as an extension to the OpenAI schema and on the `text_to_speech` MCP tool. If `language` is omitted, it is inferred from the first character of the voice name — so existing callers do not need to change.
+
+Japanese and Mandarin use extra G2P dependencies (`misaki[ja]`, `misaki[zh]`), which are installed as part of `kokoro-app`.

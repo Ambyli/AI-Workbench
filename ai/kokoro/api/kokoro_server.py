@@ -37,6 +37,20 @@ VOICE_MAP = {
     "shimmer": "af_bella",
 }
 
+# Kokoro language codes. Mirror of the catalog in kokoro-app so /languages
+# can respond without a round-trip to the inference container.
+LANGUAGES: dict[str, str] = {
+    "a": "American English",
+    "b": "British English",
+    "e": "Spanish",
+    "f": "French",
+    "h": "Hindi",
+    "i": "Italian",
+    "j": "Japanese",
+    "p": "Brazilian Portuguese",
+    "z": "Mandarin",
+}
+
 AUDIO_DIR = Path(__file__).parent / "audio"
 AUDIO_BASE_URL = os.environ.get("AUDIO_BASE_URL", "http://localhost:8000")
 _audio_cache: dict[str, str] = {}
@@ -73,6 +87,7 @@ class TTSRequest(BaseModel):
     voice: str = "alloy"
     response_format: Optional[str] = "wav"
     speed: Optional[float] = 1.0
+    language: Optional[str] = None
 
 
 @app.get("/health")
@@ -101,14 +116,18 @@ def list_voices():
         raise HTTPException(status_code=502, detail=f"Cannot reach kokoro-app: {exc}")
 
 
+@app.get("/languages")
+def list_languages():
+    return {"languages": [{"code": code, "name": name} for code, name in LANGUAGES.items()]}
+
+
 @app.post("/generate")
-def generate(text: str, voice: str = "af_heart"):
+def generate(text: str, voice: str = "af_heart", language: Optional[str] = None):
+    params = {"text": text, "voice": voice}
+    if language is not None:
+        params["language"] = language
     try:
-        r = httpx.post(
-            f"{APP_URL}/generate",
-            params={"text": text, "voice": voice},
-            timeout=http_timeout,
-        )
+        r = httpx.post(f"{APP_URL}/generate", params=params, timeout=http_timeout)
         r.raise_for_status()
         data = r.json()
         audio_bytes = bytes.fromhex(data["audio"])
@@ -120,12 +139,11 @@ def generate(text: str, voice: str = "af_heart"):
 @app.post("/v1/audio/speech")
 def openai_speech(req: TTSRequest):
     kokoro_voice = VOICE_MAP.get(req.voice, req.voice)
+    params = {"text": req.input, "voice": kokoro_voice}
+    if req.language is not None:
+        params["language"] = req.language
     try:
-        r = httpx.post(
-            f"{APP_URL}/generate",
-            params={"text": req.input, "voice": kokoro_voice},
-            timeout=http_timeout,
-        )
+        r = httpx.post(f"{APP_URL}/generate", params=params, timeout=http_timeout)
         r.raise_for_status()
         data = r.json()
         audio_bytes = bytes.fromhex(data["audio"])
@@ -135,12 +153,17 @@ def openai_speech(req: TTSRequest):
 
 
 @mcp.tool()
-def text_to_speech(text: str, voice: str = "alloy") -> str:
+def text_to_speech(text: str, voice: str = "alloy", language: Optional[str] = None) -> str:
     """Generate speech audio from text using Kokoro TTS.
 
     Args:
         text: The text to convert to speech.
-        voice: Voice name. Options: alloy, echo, fable, onyx, nova, shimmer.
+        voice: Voice name. OpenAI aliases (alloy, echo, fable, onyx, nova, shimmer) map to
+            English voices. Any Kokoro voice can also be passed directly (e.g. jf_alpha,
+            zf_xiaobei, ff_siwis) — see GET /voices.
+        language: Optional Kokoro language code. When omitted it is inferred from the
+            voice-name prefix. Codes: a=American English, b=British English, e=Spanish,
+            f=French, h=Hindi, i=Italian, j=Japanese, p=Brazilian Portuguese, z=Mandarin.
 
     Returns:
         A URL to the generated audio file (set AUDIO_BASE_URL env var to override the default host).
@@ -148,12 +171,11 @@ def text_to_speech(text: str, voice: str = "alloy") -> str:
     _ensure_audio_dir()
     _clean_stale_audio()
     kokoro_voice = VOICE_MAP.get(voice, voice)
+    params = {"text": text, "voice": kokoro_voice}
+    if language is not None:
+        params["language"] = language
     try:
-        r = httpx.post(
-            f"{APP_URL}/generate",
-            params={"text": text, "voice": kokoro_voice},
-            timeout=http_timeout,
-        )
+        r = httpx.post(f"{APP_URL}/generate", params=params, timeout=http_timeout)
         r.raise_for_status()
         data = r.json()
         audio_bytes = bytes.fromhex(data["audio"])

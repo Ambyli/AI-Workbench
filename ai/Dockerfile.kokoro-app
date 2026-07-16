@@ -21,6 +21,11 @@ WORKDIR /app
 COPY kokoro/app/pyproject.toml .
 RUN uv sync --no-dev
 
+# misaki[ja] pulls in fugashi + unidic, but `unidic` is just a downloader —
+# the ~1 GB UniDic dictionary has to be fetched explicitly, otherwise
+# fugashi.Tagger() blows up looking for unidic/dicdir/mecabrc at runtime.
+RUN uv run python -m unidic download
+
 COPY kokoro/app/app.py .
 
 EXPOSE 8085

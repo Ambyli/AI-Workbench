@@ -71,6 +71,14 @@ oauth2-proxy queries Google's Directory API to check whether the signed-in user 
    The compose file mounts this path into the container. **Do not commit this file** — it is a credential.
 4. On the same service account → **Details** tab → copy the **Unique ID** (a long numeric string). You need it for domain-wide delegation, below.
 
+### 3. Enable the Admin SDK API
+
+The service account's group-lookup call is made against the Admin SDK API, which is disabled by default on new Cloud projects. Without it enabled, oauth2-proxy returns 403 to every user with an error like `Admin SDK API has not been used in project <id> before or it is disabled`.
+
+1. Google Cloud Console → **APIs & Services → Library** → search for **Admin SDK API** (or go directly to `https://console.developers.google.com/apis/api/admin.googleapis.com/overview?project=<project-id>`).
+2. Click **Enable**.
+3. Wait ~1 minute for propagation before retrying a login.
+
 ---
 
 ## One-time Google Admin console setup
@@ -88,7 +96,18 @@ Everything below requires super-admin on the Google Workspace tenant that contai
 
 This grants the service account read-only access to group membership across the Workspace, on behalf of the admin user it impersonates (see `OAUTH2_PROXY_GOOGLE_ADMIN_EMAIL` below).
 
-### 2. Access group
+### 2. Impersonated admin must be a **Super Admin**
+
+The email in `OAUTH2_PROXY_GOOGLE_ADMIN_EMAIL` is the identity the service account impersonates when calling the Directory API. Google requires this account to hold the **Super Admin** role for Directory-wide group reads — a regular Admin role, custom admin roles, or "Groups Admin" alone are **not sufficient** and produce a misleading `403: Not Authorized to access this resource/api` at login.
+
+1. Google Admin console → **Directory → Users** → click the account named in `OAUTH2_PROXY_GOOGLE_ADMIN_EMAIL` (e.g. `admin@gosunergy.com`).
+2. Scroll to **Admin roles and privileges** → **Assign roles**.
+3. Toggle **Super Admin** on → **Save**.
+4. Wait ~30 seconds for propagation before retrying a login.
+
+If the account you *want* to use isn't Super Admin and elevating it isn't acceptable, pick a different existing Super Admin (or create a dedicated `oauth2-proxy-svc@yourdomain.com` Super Admin) and update `OAUTH2_PROXY_GOOGLE_ADMIN_EMAIL` in `.env`, then `make clean-oauth2-proxy && make up-oauth2-proxy`.
+
+### 3. Access group
 
 1. Google Admin console → **Directory → Groups** → confirm `zeoai.access@zeoenergy.com` exists.
 2. If creating fresh: **Access type** should be at least **Team** so the service account can enumerate members.
@@ -199,6 +218,7 @@ If a single-sign-on experience is desired, Open WebUI can be switched to trusted
 | oauth2-proxy logs `googleapi: Error 403: Not Authorized` | Domain-wide delegation missing the `admin.directory.group.readonly` scope, or admin email is not a Workspace admin |
 | oauth2-proxy logs `unable to read service account key` | `sa-key.json` is missing from `ai/oauth2-proxy/` on the host, or the JSON is malformed |
 | oauth2-proxy logs `Admin SDK API has not been used in project <id> before or it is disabled` (403) | The Google Cloud project owning the OAuth client + service account doesn't have the Admin SDK API enabled. Enable at `https://console.developers.google.com/apis/api/admin.googleapis.com/overview?project=<project-id>` — activation takes ~1 minute to propagate |
+| oauth2-proxy logs `Not Authorized to access this resource/api, forbidden` (403) *after* Admin SDK API is enabled | The account in `OAUTH2_PROXY_GOOGLE_ADMIN_EMAIL` isn't a **Super Admin**. Directory-wide group reads require the Super Admin role — Admin or Groups Admin alone will fail with this exact error. Grant Super Admin (Admin console → Directory → Users → user → Admin roles → Super Admin), OR change `OAUTH2_PROXY_GOOGLE_ADMIN_EMAIL` to an account that already is |
 | Users still hit Open WebUI directly, bypassing the proxy | Cloudflare tunnel is still routing `chat.zeoenergy.com` to `openwebui:8080` — update the tunnel's public hostname service URL |
 | Revocation not taking effect | `OAUTH2_PROXY_COOKIE_REFRESH` interval hasn't elapsed. Reduce it, or have the user clear cookies for `chat.zeoenergy.com` |
 

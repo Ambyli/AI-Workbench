@@ -1,0 +1,51 @@
+networks:
+  shared:
+    external: true
+    name: ai_shared
+
+services:
+  madlad-app:
+    networks:
+      - shared
+    build:
+      context: .
+      dockerfile: Dockerfile.madlad-app
+    container_name: madlad-app
+    restart: unless-stopped
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN}
+      - MADLAD_MODEL=${MADLAD_MODEL}
+    volumes:
+      - madlad_data:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  madlad-api:
+    networks:
+      - shared
+    build:
+      context: .
+      dockerfile: Dockerfile.madlad-api
+    container_name: madlad-api
+    restart: unless-stopped
+    environment:
+      - MADLAD_APP_URL=${MADLAD_APP_URL}
+    ports:
+      - "${PORT_MADLAD_API}:8000"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    depends_on:
+      - madlad-app
+
+
+volumes:
+  madlad_data:

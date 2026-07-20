@@ -26,8 +26,10 @@ app = FastAPI(title="Kokoro TTS API", lifespan=mcp_app.lifespan)
 
 http_timeout = httpx.Timeout(120.0, connect=10.0)
 
-# Maps OpenAI voice names to Kokoro equivalents.
-# Unrecognised names are passed through so callers can use Kokoro voices directly.
+# Maps OpenAI voice names to Kokoro equivalents. All aliases resolve to English
+# voices — Kokoro voices are language-specific, so callers who want another
+# language must pass a Kokoro voice name directly (see GET /voices or /languages).
+# Unrecognised names are passed through as-is.
 VOICE_MAP = {
     "alloy": "af_heart",
     "echo": "am_adam",
@@ -101,6 +103,16 @@ def list_voices():
         raise HTTPException(status_code=502, detail=f"Cannot reach kokoro-app: {exc}")
 
 
+@app.get("/languages")
+def list_languages():
+    try:
+        r = httpx.get(f"{APP_URL}/languages", timeout=http_timeout)
+        r.raise_for_status()
+        return r.json()
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Cannot reach kokoro-app: {exc}")
+
+
 @app.post("/generate")
 def generate(text: str, voice: str = "af_heart"):
     try:
@@ -140,7 +152,12 @@ def text_to_speech(text: str, voice: str = "alloy") -> str:
 
     Args:
         text: The text to convert to speech.
-        voice: Voice name. Options: alloy, echo, fable, onyx, nova, shimmer.
+        voice: Voice name. OpenAI aliases (alloy, echo, fable, onyx, nova, shimmer)
+            all map to English voices. To speak another language, pass a Kokoro
+            voice name whose prefix identifies the language, e.g.
+            jf_alpha (Japanese), zf_xiaobei (Mandarin), ff_siwis (French).
+            Call GET /languages to see voices grouped by language, or /voices for
+            the flat list.
 
     Returns:
         A URL to the generated audio file (set AUDIO_BASE_URL env var to override the default host).

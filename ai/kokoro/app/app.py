@@ -18,19 +18,36 @@ from fastapi.responses import JSONResponse
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Lazy-loaded — initialized on first request to avoid blocking startup.
-_pipeline = None
+# Kokoro language codes — the first character of a voice name identifies its language.
+LANGUAGES: dict[str, str] = {
+    "a": "American English",
+    "b": "British English",
+    "e": "Spanish",
+    "f": "French",
+    "h": "Hindi",
+    "i": "Italian",
+    "j": "Japanese",
+    "p": "Brazilian Portuguese",
+    "z": "Mandarin",
+}
+
+# Lazy-loaded per language — initialized on first request to avoid blocking startup.
+_pipelines: dict = {}
 _voices = None
 
 
-def _get_pipeline():
-    global _pipeline  # noqa: PLW0603
-    if _pipeline is None:
+def _get_pipeline(lang_code: str):
+    if lang_code not in LANGUAGES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown language '{lang_code}'. Supported: {sorted(LANGUAGES)}",
+        )
+    if lang_code not in _pipelines:
         from kokoro import KPipeline
-        logger.info("Loading Kokoro model (first request)...")
-        _pipeline = KPipeline(lang_code="a")
-        logger.info("Kokoro model loaded.")
-    return _pipeline
+        logger.info("Loading Kokoro pipeline for lang_code=%s (%s)...", lang_code, LANGUAGES[lang_code])
+        _pipelines[lang_code] = KPipeline(lang_code=lang_code)
+        logger.info("Kokoro pipeline for lang_code=%s loaded.", lang_code)
+    return _pipelines[lang_code]
 
 
 def _get_voices():
@@ -61,6 +78,22 @@ def list_voices():
     return {"voices": _get_voices()}
 
 
+@app.get("/languages")
+def list_languages():
+    """Return every language Kokoro supports, with its voices."""
+    grouped: dict[str, list[str]] = {code: [] for code in LANGUAGES}
+    for v in _get_voices():
+        prefix = v[0]
+        if prefix in grouped:
+            grouped[prefix].append(v)
+    return {
+        "languages": [
+            {"code": code, "name": name, "voices": sorted(grouped[code])}
+            for code, name in LANGUAGES.items()
+        ]
+    }
+
+
 @app.post("/generate")
 def generate(text: str, voice: str = "af_heart"):
     voices = _get_voices()
@@ -70,7 +103,7 @@ def generate(text: str, voice: str = "af_heart"):
             detail=f"Unknown voice '{voice}'. Available: {voices}",
         )
 
-    pipeline = _get_pipeline()
+    pipeline = _get_pipeline(voice[0])
     gen = pipeline(text, voice=voice)
 
     try:

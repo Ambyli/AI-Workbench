@@ -1,0 +1,28 @@
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    UV_NO_CACHE=1
+
+# curl for the healthcheck; ca-certificates for HTTPS during uv sync.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+WORKDIR /app
+
+COPY madlad/app/pyproject.toml .
+# uv downloads its own Python 3.11 — no need to install one via apt.
+RUN uv sync --no-dev
+
+COPY madlad/app/app.py .
+
+EXPOSE 8085
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=600s --retries=3 \
+    CMD curl -f http://localhost:8085/languages || exit 1
+
+CMD ["uv", "run", "python", "app.py"]

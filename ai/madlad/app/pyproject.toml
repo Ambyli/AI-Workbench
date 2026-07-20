@@ -1,0 +1,14 @@
+[project]
+name = "madlad-app"
+version = "0.1.0"
+description = "MADLAD-400 translation inference server (CTranslate2)"
+requires-python = ">=3.11"
+dependencies = [
+    "ctranslate2>=4.4.0",
+    "sentencepiece",
+    "huggingface_hub",
+    "langcodes",
+    "language_data",
+    "fastapi",
+    "uvicorn",
+]

@@ -4,10 +4,14 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     UV_NO_CACHE=1
 
-# System deps: espeak-ng for G2P, plus curl for health checks
+# System deps: espeak-ng for G2P, curl for health checks, and a C/C++
+# toolchain + cmake so pyopenjtalk (pulled in by misaki[ja]) can build from
+# source — it ships no wheels for linux/py3.11.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         espeak-ng \
         curl \
+        build-essential \
+        cmake \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
@@ -16,6 +20,11 @@ WORKDIR /app
 
 COPY kokoro/app/pyproject.toml .
 RUN uv sync --no-dev
+
+# misaki[ja] pulls in fugashi + unidic, but `unidic` is just a downloader —
+# the ~1 GB UniDic dictionary has to be fetched explicitly, otherwise
+# fugashi.Tagger() blows up looking for unidic/dicdir/mecabrc at runtime.
+RUN uv run python -m unidic download
 
 COPY kokoro/app/app.py .
 

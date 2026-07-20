@@ -169,6 +169,34 @@ curl -I https://chat.zeoenergy.com     # should return 200 from Open WebUI
 
 If the tunnel is up but the site 502s, the origin URL (`openwebui:8080`) is unreachable from the `cloudflared` container — confirm Open WebUI is running (`make up-openwebui`) and on the same `ai_shared` network.
 
+#### Two tunnel flavors — pick one and know which
+
+Cloudflare tunnels come in two flavors that are edited in completely different places. Getting these confused wastes hours because the "wrong" tunnel's edits silently do nothing.
+
+| Flavor | Config lives in | Edit via |
+|---|---|---|
+| **Locally-managed** | `/etc/cloudflared/config.yml` on the host, paired with a `credentials-file` JSON in `~/.cloudflared/` | Edit the file, then `sudo systemctl restart cloudflared` (systemd) or restart the container (docker w/ bind mount). Dashboard view is **read-only** — edits there do nothing |
+| **Remotely-managed** | Cloudflare Zero Trust dashboard | Dashboard → tunnel → Public Hostnames. Cloudflared connects with a `TUNNEL_TOKEN` and pulls config from the edge |
+
+Which one is live? Check the host:
+
+```bash
+ps aux | grep -i cloudflared | grep -v grep
+systemctl status cloudflared 2>/dev/null | head -5
+```
+
+- Systemd service running → **locally-managed**. Config file is authoritative. If oauth2-proxy is deployed in front of Open WebUI, the `service:` line for `chat.zeoenergy.com` must point at `http://localhost:${PORT_OAUTH2_PROXY}` (typically `4180`) instead of `http://localhost:${PORT_OPENWEBUI}` (typically `8007`). See [`OAUTH2_PROXY.md`](OAUTH2_PROXY.md).
+- Only a `cloudflared` container using `TUNNEL_TOKEN` → **remotely-managed**. Dashboard is authoritative.
+- **Both running** → you have two tunnels. Cloudflare DNS decides which serves `chat.zeoenergy.com` (whichever tunnel UUID is in the CNAME). The other tunnel's config changes have zero effect. Diagnose with `docker logs -f ai-cloudflared` while hitting the site — if no request activity appears, you're editing the wrong tunnel.
+
+#### End-to-end smoke test
+
+```bash
+curl -sfL https://chat.zeoenergy.com/oauth2/ping && echo " → PASS" || echo " → FAIL"
+```
+
+If oauth2-proxy is in the path, this returns `OK → PASS`. If it returns HTML or a 302 to `/oauth/google/login`, the tunnel is bypassing oauth2-proxy — the wrong tunnel's config was edited, or the service URL still points at Open WebUI's port.
+
 ### MCP tools (Phoenix)
 
 Open WebUI v0.6.31+ supports MCP servers over **Streamable HTTP** natively — no `mcpo` proxy or bridge needed. Phoenix already speaks that transport, so connecting it is purely an admin-UI action.

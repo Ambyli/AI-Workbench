@@ -14,6 +14,7 @@ services:
     restart: unless-stopped
     environment:
       - ROOFIX_SESSION_PATH=/data/roofix_session.json
+      - ROOFIX_HEADLESS=${ROOFIX_HEADLESS:-true}
     volumes:
       - roofix_scraper_data:/data
     healthcheck:

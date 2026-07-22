@@ -94,6 +94,7 @@ Ambiguous or thin `Estimate` / `Estimate Complete` events cause the bridge to ca
 | `GMAIL_MCP_TOOL_UNLABEL` | `unlabel_message` | Gmail MCP label-remove tool (used to mark-as-read). |
 | `ROOFIX_SCRAPER_URL` | `http://roofix-scraper:8080` | Sibling scraper service. |
 | `ROOFIX_SESSION_PATH` | `/data/roofix_session.json` | Scraper's persisted Playwright storage_state. |
+| `ROOFIX_HEADLESS` | `true` | Scraper's Chromium mode. Set `false` for local `uv run` sessions to watch the browser scrape in real time. |
 | `FIELD_MAPPING_PATH` | `/app/config/field_mapping.json` | Roofix-event → Phoenix (block_name, status_id) map. |
 | `LOG_DIR` | `/data` | Where the per-tick CSV log lives (mounted volume). |
 

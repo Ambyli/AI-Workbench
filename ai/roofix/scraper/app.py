@@ -12,6 +12,13 @@ Endpoints:
 
 from __future__ import annotations
 
+# Load .env before any module that reads os.environ at import time (scraper.py
+# resolves ROOFIX_HEADLESS at import). find_dotenv walks up from cwd, so this
+# works when uv is launched from ai/roofix/scraper/ — it finds the repo-root
+# .env even though the app lives four levels deep.
+from dotenv import load_dotenv, find_dotenv
+load_dotenv(find_dotenv(usecwd=True))
+
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException

@@ -8,4 +8,5 @@ dependencies = [
     "uvicorn",
     "playwright",
     "pydantic",
+    "python-dotenv",
 ]

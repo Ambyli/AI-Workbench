@@ -9,12 +9,12 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 WORKDIR /app
 
-COPY roofix-scraper/pyproject.toml .
+COPY roofix/scraper/pyproject.toml .
 RUN uv sync --no-dev
 
-COPY roofix-scraper/app.py .
-COPY roofix-scraper/scraper.py .
-COPY roofix-scraper/session.py .
+COPY roofix/scraper/app.py .
+COPY roofix/scraper/scraper.py .
+COPY roofix/scraper/session.py .
 
 EXPOSE 8080
 

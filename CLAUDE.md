@@ -172,16 +172,15 @@ curl -X POST https://phoenix-mcp.com/api-token \
 | Closing app without stopping llama-server | Orphaned server process |
 | Editing `.env` while app is running | No effect until restart |
 
-## Roofix Bridge (Roofix ↔ Phoenix)
+## Roofix ↔ Phoenix Bridge
 
-`ai/roofix-bridge` is a background worker that mirrors Roofix email events into Phoenix. See [`ai/ROOFIX_BRIDGE.md`](ai/ROOFIX_BRIDGE.md) for the operator guide; a few things worth calling out here:
+`ai/roofix/` bundles the Roofix ↔ Phoenix subsystem: `bridge/` (event-sourced worker) and `scraper/` (Playwright proposal fetcher). One compose file (`docker-compose.roofix.yml`) brings up both. See [`ai/ROOFIX.md`](ai/ROOFIX.md) for the operator guide; a few things worth calling out here:
 
-- **Two services, one migration**: the bridge depends on `roofix-scraper` (Playwright, Chromium). Bring the scraper up first.
 - **Default `DRY_RUN=true`**: on first deploy the bridge fetches Gmail, parses, decides, and logs — but does **not** write to Phoenix. Flip to `false` only after inspecting a full tick.
 - **Phoenix MCP writes are speculative**: the bridge assumes tools named `insert_note` and `upsert_project_process_block` will land on the Phoenix MCP. Real names are configurable via `PHOENIX_MCP_TOOL_INSERT_NOTE` / `..._UPSERT_BLOCK` so no code change is needed when the actual tool names are known.
-- **AI fallback via LiteLLM**: `components/brain.py::generate_ai_decision` uses the OpenAI SDK against `http://litellm:4000`. Swapping Claude for a local vLLM model is a LiteLLM config change, not a bridge code change.
+- **AI fallback via LiteLLM**: `roofix/bridge/components/brain.py::generate_ai_decision` uses the OpenAI SDK against `http://litellm:4000`. Swapping Claude for a local vLLM model is a LiteLLM config change, not a bridge code change.
 - **Session refresh is a manual operator flow**: the scraper cannot present a login UI. Run `save_roofix_session.py` locally on a laptop with a visible browser, then POST the resulting JSON to the scraper's `/session/refresh`.
-- **Michael's mapping**: `ai/roofix-bridge/config/field_mapping.json` is a stub. Milestone writes will log "no milestone mapping" and skip until the file is filled in — this is intentional.
+- **Michael's mapping**: `ai/roofix/bridge/config/field_mapping.json` is a stub. Milestone writes will log "no milestone mapping" and skip until the file is filled in — this is intentional.
 
 ## AI Infrastructure — Compose Topology
 

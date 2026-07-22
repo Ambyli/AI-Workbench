@@ -9,12 +9,12 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 WORKDIR /app
 
-COPY roofix-bridge/pyproject.toml .
+COPY roofix/bridge/pyproject.toml .
 RUN uv sync --no-dev
 
-COPY roofix-bridge/app.py .
-COPY roofix-bridge/components ./components
-COPY roofix-bridge/config ./config
+COPY roofix/bridge/app.py .
+COPY roofix/bridge/components ./components
+COPY roofix/bridge/config ./config
 
 EXPOSE 8080
 

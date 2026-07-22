@@ -45,6 +45,9 @@ mcp_servers:
     auth_type: oauth2
     oauth2_flow: authorization_code
     delegate_auth_to_upstream: true
+    authorization_url: "https://accounts.google.com/o/oauth2/v2/auth"
+    token_url: "https://oauth2.googleapis.com/token"
+    scopes: ["https://www.googleapis.com/auth/gmail.modify"]
 
 model_list:
   - model_name: os.environ/DEFAULT_LITELLM_MODEL_NAME

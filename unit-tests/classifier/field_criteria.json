@@ -1,0 +1,569 @@
+{
+  "safetyForm": {
+    "displayName": "Safety Form",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "has text", "type": "cv"},
+      {"name": "document or form clearly visible and in frame", "type": "llm", "weight": 2},
+      {"name": "text is legible", "type": "llm", "weight": 2},
+      {"name": "safety form or official document header visible", "type": "llm", "weight": 1.5}
+    ]
+  },
+  "exclusionZones": {
+    "displayName": "Exclusion Zones",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "safety barrier or exclusion zone roping visible", "type": "llm", "weight": 2.5},
+      {"name": "work area or outdoor site visible", "type": "llm", "weight": 1}
+    ]
+  },
+  "ladderSetup": {
+    "displayName": "Ladder Setup",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "ladder visible leaning against a structure or roofline", "type": "llm", "weight": 2.5},
+      {"name": "ladder extends above the roofline or eave", "type": "llm", "weight": 2}
+    ]
+  },
+  "roofAnchor": {
+    "displayName": "Roof Anchor",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "roof safety anchor or anchor hardware visible on roof surface", "type": "llm", "weight": 2.5},
+      {"name": "anchor is mounted or secured to roof", "type": "llm", "weight": 2}
+    ]
+  },
+  "crewHarnessed": {
+    "displayName": "Crew harnessed and secured to anchor",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "has people", "type": "cv"},
+      {"name": "person or crew member visible in photo", "type": "llm", "weight": 1.5},
+      {"name": "safety harness visible on person", "type": "llm", "weight": 2.5},
+      {"name": "harness lanyard or attachment to anchor point visible", "type": "llm", "weight": 2}
+    ]
+  },
+  "ladderAnchorPatches": {
+    "displayName": "Ladder and Anchor Patches",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "roof surface visible", "type": "llm", "weight": 1},
+      {"name": "patches or sealant visible at roof penetration points", "type": "llm", "weight": 2.5}
+    ]
+  },
+  "frontOfHouseWithAddress": {
+    "displayName": "Front of House with Address",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "has text", "type": "cv"},
+      {"name": "house exterior or front of building visible", "type": "llm", "weight": 1.5},
+      {"name": "street address or house number clearly visible and legible", "type": "llm", "weight": 3}
+    ]
+  },
+  "moduleManufacturerLabel": {
+    "displayName": "Module Manufacturer Label",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "has text", "type": "cv"},
+      {"name": "manufacturer label or sticker visible on solar panel", "type": "llm", "weight": 2},
+      {"name": "make and model text is legible", "type": "llm", "weight": 2.5},
+      {"name": "label fully in frame without clipping", "type": "llm", "weight": 1.5}
+    ]
+  },
+  "moduleSerialNumber": {
+    "displayName": "Module Serial Number",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "has text", "type": "cv"},
+      {"name": "serial number label visible on solar module", "type": "llm", "weight": 2},
+      {"name": "full serial number text is legible", "type": "llm", "weight": 3},
+      {"name": "label fully in frame without clipping", "type": "llm", "weight": 1.5}
+    ]
+  },
+  "mlpeManufactureLabel": {
+    "displayName": "MLPE Manufacturer Label",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "has text", "type": "cv"},
+      {"name": "MLPE device or microinverter label visible", "type": "llm", "weight": 2},
+      {"name": "make and model text is legible", "type": "llm", "weight": 2.5},
+      {"name": "label fully in frame without clipping", "type": "llm", "weight": 1.5}
+    ]
+  },
+  "mlpeSerialNumber": {
+    "displayName": "MLPE Serial Number",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "has text", "type": "cv"},
+      {"name": "serial number label visible on MLPE or microinverter", "type": "llm", "weight": 2},
+      {"name": "full serial number text is legible", "type": "llm", "weight": 3},
+      {"name": "label fully in frame without clipping", "type": "llm", "weight": 1.5}
+    ]
+  },
+  "gatewaySerialNumber": {
+    "displayName": "Gateway Serial Number",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "has text", "type": "cv"},
+      {"name": "gateway or monitoring device label visible", "type": "llm", "weight": 2},
+      {"name": "full serial number or label text is legible", "type": "llm", "weight": 3},
+      {"name": "label fully in frame without clipping", "type": "llm", "weight": 1.5}
+    ]
+  },
+  "railAttachment": {
+    "displayName": "Rail Mounting Attachment",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "solar rail mounting hardware or attachment component visible", "type": "llm", "weight": 2},
+      {"name": "make model or SKU label legible OR component profile clearly shown", "type": "llm", "weight": 2}
+    ]
+  },
+  "railEnd": {
+    "displayName": "Rail End",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "solar rail end cap or rail component visible", "type": "llm", "weight": 2},
+      {"name": "make model or SKU label legible OR component profile clearly shown", "type": "llm", "weight": 2}
+    ]
+  },
+  "railSplice": {
+    "displayName": "Rail Splice",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "rail splice or rail joining component visible", "type": "llm", "weight": 2},
+      {"name": "make model or SKU label legible OR component profile clearly shown", "type": "llm", "weight": 2}
+    ]
+  },
+  "mlpeAttachment": {
+    "displayName": "MLPE Attachment",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "MLPE mounting bracket or attachment hardware visible", "type": "llm", "weight": 2},
+      {"name": "make model or SKU label legible OR component profile clearly shown", "type": "llm", "weight": 2}
+    ]
+  },
+  "midclampsEndclamps": {
+    "displayName": "Midclamps and Endclamps",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "solar panel clamps or mounting hardware visible", "type": "llm", "weight": 2},
+      {"name": "make model or SKU label legible OR component profile clearly shown", "type": "llm", "weight": 2}
+    ]
+  },
+  "preExistingSiteDamageDocumentation": {
+    "displayName": "Pre-Existing Site Damage Documentation",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "damage defect or pre-existing condition visible in photo", "type": "llm", "weight": 2.5}
+    ]
+  },
+  "engineeringApproval": {
+    "displayName": "Engineering Approval for Deviation",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "has text", "type": "cv"},
+      {"name": "digital screen or app interface showing approval message visible", "type": "llm", "weight": 2},
+      {"name": "text or approval status is legible", "type": "llm", "weight": 2}
+    ]
+  },
+  "deviationForm": {
+    "displayName": "Deviation Form",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "has text", "type": "cv"},
+      {"name": "technical drawing plan or document visible", "type": "llm", "weight": 2},
+      {"name": "content is legible", "type": "llm", "weight": 1.5}
+    ]
+  },
+  "teslaMciLocationAndPhoto": {
+    "displayName": "Tesla MCI Map (Tesla inverters only)",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "has text", "type": "cv"},
+      {"name": "electrical diagram or solar array map visible", "type": "llm", "weight": 2},
+      {"name": "branch circuits or MCI locations labeled and legible", "type": "llm", "weight": 2.5}
+    ]
+  },
+  "arrayMap": {
+    "displayName": "Array Map",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "has text", "type": "cv"},
+      {"name": "solar array map or diagram visible", "type": "llm", "weight": 2},
+      {"name": "serial numbers or branch circuit labels legible on map", "type": "llm", "weight": 2.5},
+      {"name": "full map in frame without clipping", "type": "llm", "weight": 1.5}
+    ]
+  },
+  "roofInstallationCloseup": {
+    "displayName": "Roof Mounting Attachment Installation Close-up",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "roof mounting attachment or flashing hardware visible on roof", "type": "llm", "weight": 2.5},
+      {"name": "attachment installation detail clearly shown as closeup", "type": "llm", "weight": 2}
+    ]
+  },
+  "mlpeAttachedToPanelOrRail": {
+    "displayName": "MLPE Attached to Panel or Rail",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "MLPE or microinverter device attached to solar panel or rail visible", "type": "llm", "weight": 2.5},
+      {"name": "attachment or mounting is clearly shown", "type": "llm", "weight": 1.5}
+    ]
+  },
+  "arrayPanelReady": {
+    "displayName": "Array",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "solar rail system or roof mounting hardware installed on roof visible", "type": "llm", "weight": 2},
+      {"name": "wiring or MLPEs visible on rails", "type": "llm", "weight": 1.5},
+      {"name": "full array area in frame", "type": "llm", "weight": 1.5}
+    ]
+  },
+  "egcRuns": {
+    "displayName": "EGC Runs",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "grounding wire or EGC conductor visible on roof or solar installation", "type": "llm", "weight": 2.5},
+      {"name": "grounding path or bonding connection clearly shown", "type": "llm", "weight": 2}
+    ]
+  },
+  "arraySoladeckPhotos": {
+    "displayName": "Array (Soladeck)",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "soladeck or roof junction enclosure visible", "type": "llm", "weight": 2},
+      {"name": "interior wiring connectors or closed cover shown", "type": "llm", "weight": 1.5}
+    ]
+  },
+  "arrayPanelInstall": {
+    "displayName": "Panels Installed",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "solar panels fully installed on roof visible", "type": "llm", "weight": 2.5},
+      {"name": "full array or fire setback area in frame", "type": "llm", "weight": 1.5}
+    ]
+  },
+  "tiltMeasurement": {
+    "displayName": "Tilt measurement (per unique roof pitch)",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "has text", "type": "cv"},
+      {"name": "measuring tool or protractor on solar panel or roof surface visible", "type": "llm", "weight": 2.5},
+      {"name": "angle or degree measurement is legible", "type": "llm", "weight": 2.5}
+    ]
+  },
+  "junctionBoxPhotos": {
+    "displayName": "Junction Box(es)",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "junction box or electrical enclosure visible", "type": "llm", "weight": 2},
+      {"name": "interior wiring and connectors or labeled closed cover visible", "type": "llm", "weight": 2}
+    ]
+  },
+  "rooftopConduitRun": {
+    "displayName": "Rooftop Conduit Run",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "electrical conduit visible on rooftop", "type": "llm", "weight": 2.5},
+      {"name": "conduit run path clearly shown from start to end", "type": "llm", "weight": 2}
+    ]
+  },
+  "atticRuns": {
+    "displayName": "Attic Runs — Start to Finish",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "attic space or interior conduit run visible", "type": "llm", "weight": 2.5},
+      {"name": "wiring or conduit path clearly shown", "type": "llm", "weight": 2}
+    ]
+  },
+  "atticPhotoUnderEachArray": {
+    "displayName": "Attic Photo Under Each Array (only required in Virginia)",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "attic interior or underside of roof visible", "type": "llm", "weight": 2},
+      {"name": "roof attachment fasteners or lag bolts visible from below", "type": "llm", "weight": 2.5}
+    ]
+  },
+  "gatewayPhotos": {
+    "displayName": "Gateway",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "solar gateway or combiner panel enclosure visible", "type": "llm", "weight": 2},
+      {"name": "interior wiring and components or labeled cover shown", "type": "llm", "weight": 2}
+    ]
+  },
+  "splitSystemCombiner": {
+    "displayName": "Split System Combiner Panel",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "electrical combiner panel or enclosure visible", "type": "llm", "weight": 2},
+      {"name": "interior wiring connectors or labeled cover shown", "type": "llm", "weight": 2}
+    ]
+  },
+  "productionMeterPhotos": {
+    "displayName": "Production Meter Photos",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "electrical meter or meter can visible", "type": "llm", "weight": 2.5},
+      {"name": "manufacturer label interior wiring or labeled cover shown", "type": "llm", "weight": 1.5}
+    ]
+  },
+  "secondaryDisconnectPhotos": {
+    "displayName": "Secondary Disconnect(s)",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "electrical disconnect box or enclosure visible", "type": "llm", "weight": 2.5},
+      {"name": "interior wiring connections or labeled cover shown", "type": "llm", "weight": 2}
+    ]
+  },
+  "primaryACDisconnectInteriorBreakerEnclosure": {
+    "displayName": "Interior Breaker Enclosure",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "interior electrical breaker enclosure or box visible", "type": "llm", "weight": 2},
+      {"name": "wiring and breakers or labeled cover shown", "type": "llm", "weight": 2}
+    ]
+  },
+  "primaryACDisconnect": {
+    "displayName": "Primary AC Disconnect",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "AC disconnect switch or enclosure visible", "type": "llm", "weight": 2.5},
+      {"name": "interior wiring connections or labeled cover shown", "type": "llm", "weight": 2}
+    ]
+  },
+  "poiPhotos": {
+    "displayName": "Point of Interconnection (POI) Photos",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "electrical interconnection point or panel visible", "type": "llm", "weight": 2},
+      {"name": "wiring connections breaker or tap visible at interconnection", "type": "llm", "weight": 2},
+      {"name": "labeled cover or circuit directory visible", "type": "llm", "weight": 1}
+    ]
+  },
+  "consumptionCts": {
+    "displayName": "Consumption CTs - Direction & Installation",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "current transformer CT sensor clipped onto electrical wiring visible", "type": "llm", "weight": 2.5},
+      {"name": "wire color coding or tape distinguishing wires visible", "type": "llm", "weight": 1.5}
+    ]
+  },
+  "subPanelPhoto": {
+    "displayName": "Subpanel",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "electrical subpanel visible", "type": "llm", "weight": 2.5},
+      {"name": "interior wiring and labeled circuits or labeled cover shown", "type": "llm", "weight": 2}
+    ]
+  },
+  "mspPhotos": {
+    "displayName": "Main Service Panel (MSP)",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "has text", "type": "cv"},
+      {"name": "main electrical service panel or breaker box visible", "type": "llm", "weight": 2.5},
+      {"name": "interior wiring main breaker or labeled cover shown", "type": "llm", "weight": 2},
+      {"name": "bus rating or manufacturer label legible", "type": "llm", "weight": 1.5}
+    ]
+  },
+  "gesGroundingMethod": {
+    "displayName": "Grounding Electrode System (GES)",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "grounding wire GEC or grounding electrode visible", "type": "llm", "weight": 2.5},
+      {"name": "grounding installation path or electrode connection shown", "type": "llm", "weight": 2}
+    ]
+  },
+  "meterLabeledPhoto": {
+    "displayName": "Meter",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "has text", "type": "cv"},
+      {"name": "utility meter or meter socket visible", "type": "llm", "weight": 2.5},
+      {"name": "meter cover or meter can is labeled", "type": "llm", "weight": 2}
+    ]
+  },
+  "homerunConduitRun": {
+    "displayName": "Homerun Conduit Run",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "electrical conduit visible running from roof to electrical equipment", "type": "llm", "weight": 2.5},
+      {"name": "full conduit path clearly shown", "type": "llm", "weight": 2}
+    ]
+  },
+  "bosPullback": {
+    "displayName": "Electrical Pullback(s)",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "multiple pieces of electrical BOS equipment visible in single frame", "type": "llm", "weight": 2.5},
+      {"name": "wide angle or pullback shot showing installation context", "type": "llm", "weight": 2}
+    ]
+  },
+  "enphaseSystemController": {
+    "displayName": "Enphase System Controller",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "Enphase system controller or electrical enclosure visible", "type": "llm", "weight": 2.5},
+      {"name": "mounting bracket interior wiring or labeled cover shown", "type": "llm", "weight": 1.5}
+    ]
+  },
+  "enphaseLoadController": {
+    "displayName": "Enphase Load Controller",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "Enphase load controller enclosure visible", "type": "llm", "weight": 2.5},
+      {"name": "interior wiring connectors or labeled cover shown", "type": "llm", "weight": 1.5}
+    ]
+  },
+  "batteryCountPhotos": {
+    "displayName": "Batteries Installed",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "battery storage unit or ESS visible", "type": "llm", "weight": 2.5},
+      {"name": "battery mounting bracket wiring connectors or cover shown", "type": "llm", "weight": 1.5}
+    ]
+  },
+  "batteryCommsCable": {
+    "displayName": "Communication Cable Installation",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "communications cable or data cable terminations visible", "type": "llm", "weight": 2.5},
+      {"name": "cable connections between battery or electrical equipment shown", "type": "llm", "weight": 2}
+    ]
+  },
+  "batteryCt": {
+    "displayName": "Battery CT - Location & Direction",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "current transformer CT sensor on battery wiring visible", "type": "llm", "weight": 2.5},
+      {"name": "wiring direction and terminations clearly shown", "type": "llm", "weight": 2}
+    ]
+  },
+  "criticalLoadPanelPhotos": {
+    "displayName": "Critical Load Panel Photos",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "critical load electrical panel visible", "type": "llm", "weight": 2.5},
+      {"name": "interior wiring labeled circuits or closed and labeled cover shown", "type": "llm", "weight": 2}
+    ]
+  },
+  "genericCommissioningPhotos": {
+    "displayName": "Commissioning screenshots",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "has text", "type": "cv"},
+      {"name": "solar system commissioning app or monitoring portal interface shown", "type": "llm", "weight": 2.5},
+      {"name": "device status system data or settings are legible", "type": "llm", "weight": 2}
+    ]
+  },
+  "mpuTrenchPhotos": {
+    "displayName": "Trench Photo(s)",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "trench or excavation in ground visible", "type": "llm", "weight": 2.5},
+      {"name": "depth measurement or trench path shown", "type": "llm", "weight": 1.5}
+    ]
+  },
+  "mpuTreeRemovalPhoto": {
+    "displayName": "Tree Removal Photo(s)",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "has trees", "type": "cv"},
+      {"name": "trees removed or cleared area visible", "type": "llm", "weight": 2.5},
+      {"name": "outdoor site or yard visible", "type": "llm", "weight": 1}
+    ]
+  },
+  "overhead": {
+    "displayName": "Overhead",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "overhead electrical wiring or conduit run visible", "type": "llm", "weight": 2.5},
+      {"name": "attachment points or clearance measurements shown", "type": "llm", "weight": 1.5}
+    ]
+  },
+  "postInstallRoofView": {
+    "displayName": "Post-install view of roof and ground taken from ground",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "has sky", "type": "cv"},
+      {"name": "house roof visible from ground level", "type": "llm", "weight": 2},
+      {"name": "solar panels installed on roof visible", "type": "llm", "weight": 2}
+    ]
+  },
+  "paperworkOnSite": {
+    "displayName": "Paperwork on site",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"},
+      {"name": "has text", "type": "cv"},
+      {"name": "permit permit sticker or installation paperwork document visible", "type": "llm", "weight": 2},
+      {"name": "text on document is legible", "type": "llm", "weight": 1.5}
+    ]
+  },
+  "miscellaneousPhotos": {
+    "displayName": "Miscellaneous photos",
+    "classifierCriteria": [
+      {"name": "image sharpness", "type": "cv"},
+      {"name": "proper exposure", "type": "cv"}
+    ]
+  }
+}

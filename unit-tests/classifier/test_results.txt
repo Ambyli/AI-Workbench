@@ -1,0 +1,1874 @@
+
+======================================================================
+  PASS IMAGE 1/1  |  field: Safety Form  |  image: pass.jpg
+======================================================================
+  Overall verdict: PASS (score 8)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         PASS      score=8    [cv]
+    has text                                                PASS      score=8    [cv]
+    document or form clearly visible and in frame           PASS      score=7    [llm]
+    text is legible                                         MARGINAL  score=6    [llm]
+    safety form or official document header visible         PASS      score=9    [llm]
+  Weighted: sum=65.5  total_weight=8.5  final=8
+
+======================================================================
+  FAIL IMAGE  |  field: Safety Form  |  image: _shared_fail.degraded.jpg
+======================================================================
+  Overall verdict: FAIL (score 1)
+  Per-criterion:
+    image sharpness                                         FAIL      score=1    [cv]
+    proper exposure                                         FAIL      score=2    [cv]
+    has text                                                FAIL      score=1    [cv]
+    document or form clearly visible and in frame           FAIL      score=1    [llm]
+    text is legible                                         FAIL      score=1    [llm]
+    safety form or official document header visible         FAIL      score=1    [llm]
+  Weighted: sum=9.5  total_weight=8.5  final=1
+
+======================================================================
+  PASS IMAGE 1/1  |  field: Exclusion Zones  |  image: pass.jpg
+======================================================================
+  Overall verdict: PASS (score 9)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=6    [cv]
+    safety barrier or exclusion zone roping visible         PASS      score=10   [llm]
+    work area or outdoor site visible                       PASS      score=10   [llm]
+  Weighted: sum=51.0  total_weight=5.5  final=9
+
+======================================================================
+  FAIL IMAGE  |  field: Exclusion Zones  |  image: _shared_fail.degraded.jpg
+======================================================================
+  Overall verdict: FAIL (score 1)
+  Per-criterion:
+    image sharpness                                         FAIL      score=1    [cv]
+    proper exposure                                         FAIL      score=2    [cv]
+    safety barrier or exclusion zone roping visible         FAIL      score=1    [llm]
+    work area or outdoor site visible                       FAIL      score=1    [llm]
+  Weighted: sum=6.5  total_weight=5.5  final=1
+
+======================================================================
+  PASS IMAGE 1/2  |  field: Ladder Setup  |  image: pass.png
+======================================================================
+  Overall verdict: PASS (score 9)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=4    [cv]
+    ladder visible leaning against a structure or roofline  PASS      score=10   [llm]
+    ladder extends above the roofline or eave               PASS      score=9    [llm]
+  Weighted: sum=57.0  total_weight=6.5  final=9
+
+======================================================================
+  PASS IMAGE 2/2  |  field: Ladder Setup  |  image: pass (1).png
+======================================================================
+  Overall verdict: PASS (score 8)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         PASS      score=7    [cv]
+    ladder visible leaning against a structure or roofline  PASS      score=10   [llm]
+    ladder extends above the roofline or eave               MARGINAL  score=5    [llm]
+  Weighted: sum=52.0  total_weight=6.5  final=8
+
+======================================================================
+  FAIL IMAGE  |  field: Ladder Setup  |  image: _shared_fail.degraded.jpg
+======================================================================
+  Overall verdict: FAIL (score 1)
+  Per-criterion:
+    image sharpness                                         FAIL      score=1    [cv]
+    proper exposure                                         FAIL      score=2    [cv]
+    ladder visible leaning against a structure or roofline  FAIL      score=1    [llm]
+    ladder extends above the roofline or eave               FAIL      score=1    [llm]
+  Weighted: sum=7.5  total_weight=6.5  final=1
+
+======================================================================
+  PASS IMAGE 1/1  |  field: Roof Anchor  |  image: pass.jpg
+======================================================================
+  Overall verdict: PASS (score 9)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=5    [cv]
+    roof safety anchor or anchor hardware visible on roof surface PASS      score=10   [llm]
+    anchor is mounted or secured to roof                    PASS      score=10   [llm]
+  Weighted: sum=60.0  total_weight=6.5  final=9
+
+======================================================================
+  FAIL IMAGE  |  field: Roof Anchor  |  image: _shared_fail.degraded.jpg
+======================================================================
+  Overall verdict: FAIL (score 1)
+  Per-criterion:
+    image sharpness                                         FAIL      score=1    [cv]
+    proper exposure                                         FAIL      score=2    [cv]
+    roof safety anchor or anchor hardware visible on roof surface FAIL      score=1    [llm]
+    anchor is mounted or secured to roof                    FAIL      score=1    [llm]
+  Weighted: sum=7.5  total_weight=6.5  final=1
+
+======================================================================
+  PASS IMAGE 1/2  |  field: Crew harnessed and secured to anchor  |  image: pass.jpg
+======================================================================
+  Overall verdict: PASS (score 8)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=5    [cv]
+    has people                                              FAIL      score=1    [cv]
+    person or crew member visible in photo                  PASS      score=10   [llm]
+    safety harness visible on person                        PASS      score=10   [llm]
+    harness lanyard or attachment to anchor point visible   PASS      score=10   [llm]
+  Weighted: sum=76.0  total_weight=9.0  final=8
+
+======================================================================
+  PASS IMAGE 2/2  |  field: Crew harnessed and secured to anchor  |  image: pass.png
+======================================================================
+  Overall verdict: PASS (score 8)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=4    [cv]
+    has people                                              FAIL      score=1    [cv]
+    person or crew member visible in photo                  PASS      score=10   [llm]
+    safety harness visible on person                        PASS      score=10   [llm]
+    harness lanyard or attachment to anchor point visible   PASS      score=10   [llm]
+  Weighted: sum=75.0  total_weight=9.0  final=8
+
+======================================================================
+  FAIL IMAGE  |  field: Crew harnessed and secured to anchor  |  image: _shared_fail.degraded.jpg
+======================================================================
+  Overall verdict: FAIL (score 1)
+  Per-criterion:
+    image sharpness                                         FAIL      score=1    [cv]
+    proper exposure                                         FAIL      score=2    [cv]
+    has people                                              FAIL      score=1    [cv]
+    person or crew member visible in photo                  FAIL      score=1    [llm]
+    safety harness visible on person                        FAIL      score=1    [llm]
+    harness lanyard or attachment to anchor point visible   FAIL      score=1    [llm]
+  Weighted: sum=10.0  total_weight=9.0  final=1
+
+======================================================================
+  PASS IMAGE 1/1  |  field: Ladder and Anchor Patches  |  image: pass.jpg
+======================================================================
+  Overall verdict: MARGINAL (score 6)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=5    [cv]
+    roof surface visible                                    PASS      score=8    [llm]
+    patches or sealant visible at roof penetration points   FAIL      score=3    [llm]
+  Weighted: sum=30.5  total_weight=5.5  final=6
+
+======================================================================
+  FAIL IMAGE  |  field: Ladder and Anchor Patches  |  image: _shared_fail.degraded.jpg
+======================================================================
+  Overall verdict: FAIL (score 1)
+  Per-criterion:
+    image sharpness                                         FAIL      score=1    [cv]
+    proper exposure                                         FAIL      score=2    [cv]
+    roof surface visible                                    FAIL      score=1    [llm]
+    patches or sealant visible at roof penetration points   FAIL      score=1    [llm]
+  Weighted: sum=6.5  total_weight=5.5  final=1
+
+======================================================================
+  PASS IMAGE 1/1  |  field: Front of House with Address  |  image: pass.jpg
+======================================================================
+  Overall verdict: PASS (score 7)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=5    [cv]
+    has text                                                PASS      score=10   [cv]
+    house exterior or front of building visible             PASS      score=10   [llm]
+    street address or house number clearly visible and legible MARGINAL  score=5    [llm]
+  Weighted: sum=55.0  total_weight=7.5  final=7
+
+======================================================================
+  FAIL IMAGE  |  field: Front of House with Address  |  image: _shared_fail.degraded.jpg
+======================================================================
+  Overall verdict: FAIL (score 1)
+  Per-criterion:
+    image sharpness                                         FAIL      score=1    [cv]
+    proper exposure                                         FAIL      score=2    [cv]
+    has text                                                FAIL      score=1    [cv]
+    house exterior or front of building visible             FAIL      score=1    [llm]
+    street address or house number clearly visible and legible FAIL      score=1    [llm]
+  Weighted: sum=8.5  total_weight=7.5  final=1
+
+======================================================================
+  PASS IMAGE 1/1  |  field: Module Manufacturer Label  |  image: pass.jpg
+======================================================================
+  Overall verdict: PASS (score 8)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=5    [cv]
+    has text                                                PASS      score=9    [cv]
+    manufacturer label or sticker visible on solar panel    PASS      score=10   [llm]
+    make and model text is legible                          PASS      score=8    [llm]
+    label fully in frame without clipping                   MARGINAL  score=6    [llm]
+  Weighted: sum=73.0  total_weight=9.0  final=8
+
+======================================================================
+  FAIL IMAGE  |  field: Module Manufacturer Label  |  image: _shared_fail.degraded.jpg
+======================================================================
+  Overall verdict: FAIL (score 1)
+  Per-criterion:
+    image sharpness                                         FAIL      score=1    [cv]
+    proper exposure                                         FAIL      score=2    [cv]
+    has text                                                FAIL      score=1    [cv]
+    manufacturer label or sticker visible on solar panel    FAIL      score=1    [llm]
+    make and model text is legible                          FAIL      score=1    [llm]
+    label fully in frame without clipping                   FAIL      score=1    [llm]
+  Weighted: sum=10.0  total_weight=9.0  final=1
+
+======================================================================
+  PASS IMAGE 1/3  |  field: Module Serial Number  |  image: pass.jpg
+======================================================================
+  Overall verdict: PASS (score 8)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=4    [cv]
+    has text                                                PASS      score=9    [cv]
+    serial number label visible on solar module             PASS      score=10   [llm]
+    full serial number text is legible                      PASS      score=8    [llm]
+    label fully in frame without clipping                   MARGINAL  score=5    [llm]
+  Weighted: sum=74.5  total_weight=9.5  final=8
+
+======================================================================
+  PASS IMAGE 2/3  |  field: Module Serial Number  |  image: pass (1).jpg
+======================================================================
+  Overall verdict: PASS (score 9)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=5    [cv]
+    has text                                                PASS      score=10   [cv]
+    serial number label visible on solar module             PASS      score=10   [llm]
+    full serial number text is legible                      PASS      score=8    [llm]
+    label fully in frame without clipping                   PASS      score=10   [llm]
+  Weighted: sum=84.0  total_weight=9.5  final=9
+
+======================================================================
+  PASS IMAGE 3/3  |  field: Module Serial Number  |  image: pass (2).jpg
+======================================================================
+  Overall verdict: PASS (score 9)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=5    [cv]
+    has text                                                PASS      score=10   [cv]
+    serial number label visible on solar module             PASS      score=10   [llm]
+    full serial number text is legible                      PASS      score=10   [llm]
+    label fully in frame without clipping                   PASS      score=10   [llm]
+  Weighted: sum=90.0  total_weight=9.5  final=9
+
+======================================================================
+  FAIL IMAGE  |  field: Module Serial Number  |  image: _shared_fail.degraded.jpg
+======================================================================
+  Overall verdict: FAIL (score 1)
+  Per-criterion:
+    image sharpness                                         FAIL      score=1    [cv]
+    proper exposure                                         FAIL      score=2    [cv]
+    has text                                                FAIL      score=1    [cv]
+    serial number label visible on solar module             FAIL      score=1    [llm]
+    full serial number text is legible                      FAIL      score=1    [llm]
+    label fully in frame without clipping                   FAIL      score=1    [llm]
+  Weighted: sum=10.5  total_weight=9.5  final=1
+
+======================================================================
+  PASS IMAGE 1/2  |  field: MLPE Manufacturer Label  |  image: pass.jpg
+======================================================================
+  Overall verdict: PASS (score 7)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=5    [cv]
+    has text                                                PASS      score=10   [cv]
+    MLPE device or microinverter label visible              PASS      score=7    [llm]
+    make and model text is legible                          PASS      score=7    [llm]
+    label fully in frame without clipping                   FAIL      score=2    [llm]
+  Weighted: sum=59.5  total_weight=9.0  final=7
+
+======================================================================
+  PASS IMAGE 2/2  |  field: MLPE Manufacturer Label  |  image: pass (1).jpg
+======================================================================
+  Overall verdict: PASS (score 9)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=5    [cv]
+    has text                                                PASS      score=10   [cv]
+    MLPE device or microinverter label visible              PASS      score=10   [llm]
+    make and model text is legible                          PASS      score=8    [llm]
+    label fully in frame without clipping                   PASS      score=8    [llm]
+  Weighted: sum=77.0  total_weight=9.0  final=9
+
+======================================================================
+  FAIL IMAGE  |  field: MLPE Manufacturer Label  |  image: _shared_fail.degraded.jpg
+======================================================================
+  Overall verdict: FAIL (score 1)
+  Per-criterion:
+    image sharpness                                         FAIL      score=1    [cv]
+    proper exposure                                         FAIL      score=2    [cv]
+    has text                                                FAIL      score=1    [cv]
+    MLPE device or microinverter label visible              FAIL      score=1    [llm]
+    make and model text is legible                          FAIL      score=1    [llm]
+    label fully in frame without clipping                   FAIL      score=1    [llm]
+  Weighted: sum=10.0  total_weight=9.0  final=1
+
+======================================================================
+  PASS IMAGE 1/2  |  field: MLPE Serial Number  |  image: pass.jpg
+======================================================================
+  Overall verdict: PASS (score 9)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=5    [cv]
+    has text                                                PASS      score=10   [cv]
+    serial number label visible on MLPE or microinverter    PASS      score=10   [llm]
+    full serial number text is legible                      PASS      score=9    [llm]
+    label fully in frame without clipping                   PASS      score=8    [llm]
+  Weighted: sum=84.0  total_weight=9.5  final=9
+
+======================================================================
+  PASS IMAGE 2/2  |  field: MLPE Serial Number  |  image: pass (1).jpg
+======================================================================
+  Overall verdict: PASS (score 9)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=4    [cv]
+    has text                                                PASS      score=10   [cv]
+    serial number label visible on MLPE or microinverter    PASS      score=10   [llm]
+    full serial number text is legible                      PASS      score=9    [llm]
+    label fully in frame without clipping                   PASS      score=7    [llm]
+  Weighted: sum=81.5  total_weight=9.5  final=9
+
+======================================================================
+  FAIL IMAGE  |  field: MLPE Serial Number  |  image: _shared_fail.degraded.jpg
+======================================================================
+  Overall verdict: FAIL (score 1)
+  Per-criterion:
+    image sharpness                                         FAIL      score=1    [cv]
+    proper exposure                                         FAIL      score=2    [cv]
+    has text                                                FAIL      score=1    [cv]
+    serial number label visible on MLPE or microinverter    FAIL      score=1    [llm]
+    full serial number text is legible                      FAIL      score=1    [llm]
+    label fully in frame without clipping                   FAIL      score=1    [llm]
+  Weighted: sum=10.5  total_weight=9.5  final=1
+
+======================================================================
+  PASS IMAGE 1/4  |  field: Gateway Serial Number  |  image: pass.jpg
+======================================================================
+  Overall verdict: PASS (score 9)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=4    [cv]
+    has text                                                PASS      score=10   [cv]
+    gateway or monitoring device label visible              PASS      score=10   [llm]
+    full serial number or label text is legible             PASS      score=9    [llm]
+    label fully in frame without clipping                   PASS      score=9    [llm]
+  Weighted: sum=84.5  total_weight=9.5  final=9
+
+======================================================================
+  PASS IMAGE 2/4  |  field: Gateway Serial Number  |  image: pass (1).jpg
+======================================================================
+  Overall verdict: PASS (score 9)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=4    [cv]
+    has text                                                PASS      score=10   [cv]
+    gateway or monitoring device label visible              PASS      score=10   [llm]
+    full serial number or label text is legible             PASS      score=10   [llm]
+    label fully in frame without clipping                   PASS      score=10   [llm]
+  Weighted: sum=89.0  total_weight=9.5  final=9
+
+======================================================================
+  PASS IMAGE 3/4  |  field: Gateway Serial Number  |  image: pass (2).jpg
+======================================================================
+  Overall verdict: PASS (score 9)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=6    [cv]
+    has text                                                PASS      score=10   [cv]
+    gateway or monitoring device label visible              PASS      score=10   [llm]
+    full serial number or label text is legible             PASS      score=9    [llm]
+    label fully in frame without clipping                   PASS      score=7    [llm]
+  Weighted: sum=83.5  total_weight=9.5  final=9
+
+======================================================================
+  PASS IMAGE 4/4  |  field: Gateway Serial Number  |  image: pass (3).jpg
+======================================================================
+  Overall verdict: PASS (score 9)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         PASS      score=7    [cv]
+    has text                                                PASS      score=10   [cv]
+    gateway or monitoring device label visible              PASS      score=10   [llm]
+    full serial number or label text is legible             PASS      score=9    [llm]
+    label fully in frame without clipping                   PASS      score=8    [llm]
+  Weighted: sum=86.0  total_weight=9.5  final=9
+
+======================================================================
+  FAIL IMAGE  |  field: Gateway Serial Number  |  image: _shared_fail.degraded.jpg
+======================================================================
+  Overall verdict: FAIL (score 1)
+  Per-criterion:
+    image sharpness                                         FAIL      score=1    [cv]
+    proper exposure                                         FAIL      score=2    [cv]
+    has text                                                FAIL      score=1    [cv]
+    gateway or monitoring device label visible              FAIL      score=1    [llm]
+    full serial number or label text is legible             FAIL      score=1    [llm]
+    label fully in frame without clipping                   FAIL      score=1    [llm]
+  Weighted: sum=10.5  total_weight=9.5  final=1
+
+======================================================================
+  PASS IMAGE 1/2  |  field: Rail Mounting Attachment  |  image: pass.jpg
+======================================================================
+  Overall verdict: MARGINAL (score 6)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=4    [cv]
+    solar rail mounting hardware or attachment component visible PASS      score=10   [llm]
+    make model or SKU label legible OR component profile clearly shown FAIL      score=1    [llm]
+  Weighted: sum=36.0  total_weight=6.0  final=6
+
+======================================================================
+  PASS IMAGE 2/2  |  field: Rail Mounting Attachment  |  image: pass (1).jpg
+======================================================================
+  Overall verdict: MARGINAL (score 6)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=4    [cv]
+    solar rail mounting hardware or attachment component visible PASS      score=10   [llm]
+    make model or SKU label legible OR component profile clearly shown FAIL      score=1    [llm]
+  Weighted: sum=36.0  total_weight=6.0  final=6
+
+======================================================================
+  FAIL IMAGE  |  field: Rail Mounting Attachment  |  image: _shared_fail.degraded.jpg
+======================================================================
+  Overall verdict: FAIL (score 1)
+  Per-criterion:
+    image sharpness                                         FAIL      score=1    [cv]
+    proper exposure                                         FAIL      score=2    [cv]
+    solar rail mounting hardware or attachment component visible FAIL      score=1    [llm]
+    make model or SKU label legible OR component profile clearly shown FAIL      score=1    [llm]
+  Weighted: sum=7.0  total_weight=6.0  final=1
+
+======================================================================
+  PASS IMAGE 1/1  |  field: Rail End  |  image: pass.jpg
+======================================================================
+  Overall verdict: PASS (score 8)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=5    [cv]
+    solar rail end cap or rail component visible            PASS      score=10   [llm]
+    make model or SKU label legible OR component profile clearly shown MARGINAL  score=5    [llm]
+  Weighted: sum=45.0  total_weight=6.0  final=8
+
+======================================================================
+  FAIL IMAGE  |  field: Rail End  |  image: _shared_fail.degraded.jpg
+======================================================================
+  Overall verdict: FAIL (score 1)
+  Per-criterion:
+    image sharpness                                         FAIL      score=1    [cv]
+    proper exposure                                         FAIL      score=2    [cv]
+    solar rail end cap or rail component visible            FAIL      score=1    [llm]
+    make model or SKU label legible OR component profile clearly shown FAIL      score=1    [llm]
+  Weighted: sum=7.0  total_weight=6.0  final=1
+
+======================================================================
+  PASS IMAGE 1/2  |  field: Rail Splice  |  image: pass.jpg
+======================================================================
+  Overall verdict: PASS (score 8)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=5    [cv]
+    rail splice or rail joining component visible           PASS      score=10   [llm]
+    make model or SKU label legible OR component profile clearly shown MARGINAL  score=5    [llm]
+  Weighted: sum=45.0  total_weight=6.0  final=8
+
+======================================================================
+  PASS IMAGE 2/2  |  field: Rail Splice  |  image: pass (1).jpg
+======================================================================
+  Overall verdict: MARGINAL (score 6)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=4    [cv]
+    rail splice or rail joining component visible           PASS      score=10   [llm]
+    make model or SKU label legible OR component profile clearly shown FAIL      score=1    [llm]
+  Weighted: sum=36.0  total_weight=6.0  final=6
+
+======================================================================
+  FAIL IMAGE  |  field: Rail Splice  |  image: _shared_fail.degraded.jpg
+======================================================================
+  Overall verdict: FAIL (score 1)
+  Per-criterion:
+    image sharpness                                         FAIL      score=1    [cv]
+    proper exposure                                         FAIL      score=2    [cv]
+    rail splice or rail joining component visible           FAIL      score=1    [llm]
+    make model or SKU label legible OR component profile clearly shown FAIL      score=1    [llm]
+  Weighted: sum=7.0  total_weight=6.0  final=1
+
+======================================================================
+  PASS IMAGE 1/2  |  field: MLPE Attachment  |  image: pass.jpg
+======================================================================
+  Overall verdict: FAIL (score 3)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=5    [cv]
+    MLPE mounting bracket or attachment hardware visible    FAIL      score=1    [llm]
+    make model or SKU label legible OR component profile clearly shown FAIL      score=1    [llm]
+  Weighted: sum=19.0  total_weight=6.0  final=3
+
+======================================================================
+  PASS IMAGE 2/2  |  field: MLPE Attachment  |  image: pass (1).jpg
+======================================================================
+  Overall verdict: PASS (score 8)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=5    [cv]
+    MLPE mounting bracket or attachment hardware visible    PASS      score=10   [llm]
+    make model or SKU label legible OR component profile clearly shown MARGINAL  score=5    [llm]
+  Weighted: sum=45.0  total_weight=6.0  final=8
+
+======================================================================
+  FAIL IMAGE  |  field: MLPE Attachment  |  image: _shared_fail.degraded.jpg
+======================================================================
+  Overall verdict: FAIL (score 1)
+  Per-criterion:
+    image sharpness                                         FAIL      score=1    [cv]
+    proper exposure                                         FAIL      score=2    [cv]
+    MLPE mounting bracket or attachment hardware visible    FAIL      score=1    [llm]
+    make model or SKU label legible OR component profile clearly shown FAIL      score=1    [llm]
+  Weighted: sum=7.0  total_weight=6.0  final=1
+
+======================================================================
+  PASS IMAGE 1/2  |  field: Midclamps and Endclamps  |  image: pass.jpg
+======================================================================
+  Overall verdict: PASS (score 7)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=4    [cv]
+    solar panel clamps or mounting hardware visible         PASS      score=10   [llm]
+    make model or SKU label legible OR component profile clearly shown MARGINAL  score=5    [llm]
+  Weighted: sum=44.0  total_weight=6.0  final=7
+
+======================================================================
+  PASS IMAGE 2/2  |  field: Midclamps and Endclamps  |  image: pass (1).jpg
+======================================================================
+  Overall verdict: PASS (score 8)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=4    [cv]
+    solar panel clamps or mounting hardware visible         PASS      score=10   [llm]
+    make model or SKU label legible OR component profile clearly shown PASS      score=8    [llm]
+  Weighted: sum=50.0  total_weight=6.0  final=8
+
+======================================================================
+  FAIL IMAGE  |  field: Midclamps and Endclamps  |  image: _shared_fail.degraded.jpg
+======================================================================
+  Overall verdict: FAIL (score 1)
+  Per-criterion:
+    image sharpness                                         FAIL      score=1    [cv]
+    proper exposure                                         FAIL      score=2    [cv]
+    solar panel clamps or mounting hardware visible         FAIL      score=1    [llm]
+    make model or SKU label legible OR component profile clearly shown FAIL      score=1    [llm]
+  Weighted: sum=7.0  total_weight=6.0  final=1
+
+======================================================================
+  PASS IMAGE 1/1  |  field: Tesla MCI Map (Tesla inverters only)  |  image: pass.png
+======================================================================
+  Overall verdict: MARGINAL (score 4)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         PASS      score=9    [cv]
+    has text                                                MARGINAL  score=5    [cv]
+    electrical diagram or solar array map visible           FAIL      score=1    [llm]
+    branch circuits or MCI locations labeled and legible    FAIL      score=1    [llm]
+  Weighted: sum=28.5  total_weight=7.5  final=4
+
+======================================================================
+  FAIL IMAGE  |  field: Tesla MCI Map (Tesla inverters only)  |  image: _shared_fail.degraded.jpg
+======================================================================
+  Overall verdict: FAIL (score 1)
+  Per-criterion:
+    image sharpness                                         FAIL      score=1    [cv]
+    proper exposure                                         FAIL      score=2    [cv]
+    has text                                                FAIL      score=1    [cv]
+    electrical diagram or solar array map visible           FAIL      score=1    [llm]
+    branch circuits or MCI locations labeled and legible    FAIL      score=1    [llm]
+  Weighted: sum=8.5  total_weight=7.5  final=1
+
+======================================================================
+  PASS IMAGE 1/2  |  field: Array Map  |  image: pass.jpg
+======================================================================
+  Overall verdict: MARGINAL (score 6)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=6    [cv]
+    has text                                                PASS      score=10   [cv]
+    solar array map or diagram visible                      PASS      score=7    [llm]
+    serial numbers or branch circuit labels legible on map  MARGINAL  score=4    [llm]
+    full map in frame without clipping                      FAIL      score=2    [llm]
+  Weighted: sum=53.0  total_weight=9.0  final=6
+
+======================================================================
+  PASS IMAGE 2/2  |  field: Array Map  |  image: pass (1).jpg
+======================================================================
+  Overall verdict: MARGINAL (score 5)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=6    [cv]
+    has text                                                PASS      score=10   [cv]
+    solar array map or diagram visible                      MARGINAL  score=5    [llm]
+    serial numbers or branch circuit labels legible on map  FAIL      score=2    [llm]
+    full map in frame without clipping                      FAIL      score=2    [llm]
+  Weighted: sum=44.0  total_weight=9.0  final=5
+
+======================================================================
+  FAIL IMAGE  |  field: Array Map  |  image: _shared_fail.degraded.jpg
+======================================================================
+  Overall verdict: FAIL (score 1)
+  Per-criterion:
+    image sharpness                                         FAIL      score=1    [cv]
+    proper exposure                                         FAIL      score=2    [cv]
+    has text                                                FAIL      score=1    [cv]
+    solar array map or diagram visible                      FAIL      score=1    [llm]
+    serial numbers or branch circuit labels legible on map  FAIL      score=1    [llm]
+    full map in frame without clipping                      FAIL      score=1    [llm]
+  Weighted: sum=10.0  total_weight=9.0  final=1
+
+======================================================================
+  PASS IMAGE 1/2  |  field: Roof Mounting Attachment Installation Close-up  |  image: pass.jpg
+======================================================================
+  Overall verdict: PASS (score 8)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         FAIL      score=3    [cv]
+    roof mounting attachment or flashing hardware visible on roof PASS      score=10   [llm]
+    attachment installation detail clearly shown as closeup PASS      score=7    [llm]
+  Weighted: sum=52.0  total_weight=6.5  final=8
+
+======================================================================
+  PASS IMAGE 2/2  |  field: Roof Mounting Attachment Installation Close-up  |  image: pass (1).jpg
+======================================================================
+  Overall verdict: PASS (score 8)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=4    [cv]
+    roof mounting attachment or flashing hardware visible on roof PASS      score=10   [llm]
+    attachment installation detail clearly shown as closeup PASS      score=8    [llm]
+  Weighted: sum=55.0  total_weight=6.5  final=8
+
+======================================================================
+  FAIL IMAGE  |  field: Roof Mounting Attachment Installation Close-up  |  image: _shared_fail.degraded.jpg
+======================================================================
+  Overall verdict: FAIL (score 1)
+  Per-criterion:
+    image sharpness                                         FAIL      score=1    [cv]
+    proper exposure                                         FAIL      score=2    [cv]
+    roof mounting attachment or flashing hardware visible on roof FAIL      score=1    [llm]
+    attachment installation detail clearly shown as closeup FAIL      score=1    [llm]
+  Weighted: sum=7.5  total_weight=6.5  final=1
+
+======================================================================
+  PASS IMAGE 1/2  |  field: MLPE Attached to Panel or Rail  |  image: pass.jpg
+======================================================================
+  Overall verdict: PASS (score 9)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=6    [cv]
+    MLPE or microinverter device attached to solar panel or rail visible PASS      score=10   [llm]
+    attachment or mounting is clearly shown                 PASS      score=9    [llm]
+  Weighted: sum=54.5  total_weight=6.0  final=9
+
+======================================================================
+  PASS IMAGE 2/2  |  field: MLPE Attached to Panel or Rail  |  image: pass (1).jpg
+======================================================================
+  Overall verdict: MARGINAL (score 5)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=4    [cv]
+    MLPE or microinverter device attached to solar panel or rail visible MARGINAL  score=5    [llm]
+    attachment or mounting is clearly shown                 FAIL      score=2    [llm]
+  Weighted: sum=29.5  total_weight=6.0  final=5
+
+======================================================================
+  FAIL IMAGE  |  field: MLPE Attached to Panel or Rail  |  image: _shared_fail.degraded.jpg
+======================================================================
+  Overall verdict: FAIL (score 1)
+  Per-criterion:
+    image sharpness                                         FAIL      score=1    [cv]
+    proper exposure                                         FAIL      score=2    [cv]
+    MLPE or microinverter device attached to solar panel or rail visible FAIL      score=1    [llm]
+    attachment or mounting is clearly shown                 FAIL      score=1    [llm]
+  Weighted: sum=7.0  total_weight=6.0  final=1
+
+======================================================================
+  PASS IMAGE 1/3  |  field: Array  |  image: pass.jpg
+======================================================================
+  Overall verdict: PASS (score 8)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=6    [cv]
+    solar rail system or roof mounting hardware installed on roof visible PASS      score=10   [llm]
+    wiring or MLPEs visible on rails                        MARGINAL  score=5    [llm]
+    full array area in frame                                PASS      score=7    [llm]
+  Weighted: sum=54.0  total_weight=7.0  final=8
+
+======================================================================
+  PASS IMAGE 2/3  |  field: Array  |  image: pass (1).jpg
+======================================================================
+  Overall verdict: MARGINAL (score 6)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=5    [cv]
+    solar rail system or roof mounting hardware installed on roof visible PASS      score=8    [llm]
+    wiring or MLPEs visible on rails                        FAIL      score=2    [llm]
+    full array area in frame                                MARGINAL  score=4    [llm]
+  Weighted: sum=40.0  total_weight=7.0  final=6
+
+======================================================================
+  PASS IMAGE 3/3  |  field: Array  |  image: pass (2).jpg
+======================================================================
+  Overall verdict: MARGINAL (score 6)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=5    [cv]
+    solar rail system or roof mounting hardware installed on roof visible PASS      score=10   [llm]
+    wiring or MLPEs visible on rails                        MARGINAL  score=5    [llm]
+    full array area in frame                                FAIL      score=2    [llm]
+  Weighted: sum=45.5  total_weight=7.0  final=6
+
+======================================================================
+  FAIL IMAGE  |  field: Array  |  image: _shared_fail.degraded.jpg
+======================================================================
+  Overall verdict: FAIL (score 1)
+  Per-criterion:
+    image sharpness                                         FAIL      score=1    [cv]
+    proper exposure                                         FAIL      score=2    [cv]
+    solar rail system or roof mounting hardware installed on roof visible FAIL      score=1    [llm]
+    wiring or MLPEs visible on rails                        FAIL      score=1    [llm]
+    full array area in frame                                FAIL      score=1    [llm]
+  Weighted: sum=8.0  total_weight=7.0  final=1
+
+======================================================================
+  PASS IMAGE 1/5  |  field: EGC Runs  |  image: pass.jpg
+======================================================================
+  Overall verdict: FAIL (score 3)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=5    [cv]
+    grounding wire or EGC conductor visible on roof or solar installation FAIL      score=1    [llm]
+    grounding path or bonding connection clearly shown      FAIL      score=1    [llm]
+  Weighted: sum=19.5  total_weight=6.5  final=3
+
+======================================================================
+  PASS IMAGE 2/5  |  field: EGC Runs  |  image: pass (1).jpg
+======================================================================
+  Overall verdict: MARGINAL (score 6)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=4    [cv]
+    grounding wire or EGC conductor visible on roof or solar installation PASS      score=7    [llm]
+    grounding path or bonding connection clearly shown      FAIL      score=3    [llm]
+  Weighted: sum=37.5  total_weight=6.5  final=6
+
+======================================================================
+  PASS IMAGE 3/5  |  field: EGC Runs  |  image: pass (2).jpg
+======================================================================
+  Overall verdict: PASS (score 9)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=5    [cv]
+    grounding wire or EGC conductor visible on roof or solar installation PASS      score=10   [llm]
+    grounding path or bonding connection clearly shown      PASS      score=9    [llm]
+  Weighted: sum=58.0  total_weight=6.5  final=9
+
+======================================================================
+  PASS IMAGE 4/5  |  field: EGC Runs  |  image: pass (3).jpg
+======================================================================
+  Overall verdict: FAIL (score 3)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=4    [cv]
+    grounding wire or EGC conductor visible on roof or solar installation FAIL      score=1    [llm]
+    grounding path or bonding connection clearly shown      FAIL      score=1    [llm]
+  Weighted: sum=18.5  total_weight=6.5  final=3
+
+======================================================================
+  PASS IMAGE 5/5  |  field: EGC Runs  |  image: pass (4).jpg
+======================================================================
+  Overall verdict: FAIL (score 3)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=5    [cv]
+    grounding wire or EGC conductor visible on roof or solar installation FAIL      score=1    [llm]
+    grounding path or bonding connection clearly shown      FAIL      score=1    [llm]
+  Weighted: sum=19.5  total_weight=6.5  final=3
+
+======================================================================
+  FAIL IMAGE  |  field: EGC Runs  |  image: _shared_fail.degraded.jpg
+======================================================================
+  Overall verdict: FAIL (score 1)
+  Per-criterion:
+    image sharpness                                         FAIL      score=1    [cv]
+    proper exposure                                         FAIL      score=2    [cv]
+    grounding wire or EGC conductor visible on roof or solar installation FAIL      score=1    [llm]
+    grounding path or bonding connection clearly shown      FAIL      score=1    [llm]
+  Weighted: sum=7.5  total_weight=6.5  final=1
+
+======================================================================
+  PASS IMAGE 1/4  |  field: Array (Soladeck)  |  image: pass.jpg
+======================================================================
+  Overall verdict: PASS (score 9)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         FAIL      score=2    [cv]
+    soladeck or roof junction enclosure visible             PASS      score=10   [llm]
+    interior wiring connectors or closed cover shown        PASS      score=10   [llm]
+  Weighted: sum=47.0  total_weight=5.5  final=9
+
+======================================================================
+  PASS IMAGE 2/4  |  field: Array (Soladeck)  |  image: pass (1).jpg
+======================================================================
+  Overall verdict: PASS (score 8)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=4    [cv]
+    soladeck or roof junction enclosure visible             PASS      score=10   [llm]
+    interior wiring connectors or closed cover shown        MARGINAL  score=5    [llm]
+  Weighted: sum=41.5  total_weight=5.5  final=8
+
+======================================================================
+  PASS IMAGE 3/4  |  field: Array (Soladeck)  |  image: pass (2).jpg
+======================================================================
+  Overall verdict: MARGINAL (score 6)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         FAIL      score=3    [cv]
+    soladeck or roof junction enclosure visible             PASS      score=10   [llm]
+    interior wiring connectors or closed cover shown        FAIL      score=1    [llm]
+  Weighted: sum=34.5  total_weight=5.5  final=6
+
+======================================================================
+  PASS IMAGE 4/4  |  field: Array (Soladeck)  |  image: pass (3).jpg
+======================================================================
+  Overall verdict: MARGINAL (score 6)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         FAIL      score=3    [cv]
+    soladeck or roof junction enclosure visible             PASS      score=10   [llm]
+    interior wiring connectors or closed cover shown        FAIL      score=1    [llm]
+  Weighted: sum=34.5  total_weight=5.5  final=6
+
+======================================================================
+  FAIL IMAGE  |  field: Array (Soladeck)  |  image: _shared_fail.degraded.jpg
+======================================================================
+  Overall verdict: FAIL (score 1)
+  Per-criterion:
+    image sharpness                                         FAIL      score=1    [cv]
+    proper exposure                                         FAIL      score=2    [cv]
+    soladeck or roof junction enclosure visible             FAIL      score=1    [llm]
+    interior wiring connectors or closed cover shown        FAIL      score=1    [llm]
+  Weighted: sum=6.5  total_weight=5.5  final=1
+
+======================================================================
+  PASS IMAGE 1/4  |  field: Panels Installed  |  image: pass.jpg
+======================================================================
+  Overall verdict: PASS (score 8)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=5    [cv]
+    solar panels fully installed on roof visible            PASS      score=10   [llm]
+    full array or fire setback area in frame                MARGINAL  score=5    [llm]
+  Weighted: sum=47.5  total_weight=6.0  final=8
+
+======================================================================
+  PASS IMAGE 2/4  |  field: Panels Installed  |  image: pass (1).jpg
+======================================================================
+  Overall verdict: PASS (score 8)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=5    [cv]
+    solar panels fully installed on roof visible            PASS      score=10   [llm]
+    full array or fire setback area in frame                MARGINAL  score=5    [llm]
+  Weighted: sum=47.5  total_weight=6.0  final=8
+
+======================================================================
+  PASS IMAGE 3/4  |  field: Panels Installed  |  image: pass (2).jpg
+======================================================================
+  Overall verdict: MARGINAL (score 6)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=5    [cv]
+    solar panels fully installed on roof visible            PASS      score=7    [llm]
+    full array or fire setback area in frame                MARGINAL  score=4    [llm]
+  Weighted: sum=38.5  total_weight=6.0  final=6
+
+======================================================================
+  PASS IMAGE 4/4  |  field: Panels Installed  |  image: pass (3).jpg
+======================================================================
+  Overall verdict: PASS (score 8)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=5    [cv]
+    solar panels fully installed on roof visible            PASS      score=10   [llm]
+    full array or fire setback area in frame                MARGINAL  score=5    [llm]
+  Weighted: sum=47.5  total_weight=6.0  final=8
+
+======================================================================
+  FAIL IMAGE  |  field: Panels Installed  |  image: _shared_fail.degraded.jpg
+======================================================================
+  Overall verdict: FAIL (score 1)
+  Per-criterion:
+    image sharpness                                         FAIL      score=1    [cv]
+    proper exposure                                         FAIL      score=2    [cv]
+    solar panels fully installed on roof visible            FAIL      score=1    [llm]
+    full array or fire setback area in frame                FAIL      score=1    [llm]
+  Weighted: sum=7.0  total_weight=6.0  final=1
+
+======================================================================
+  PASS IMAGE 1/2  |  field: Tilt measurement (per unique roof pitch)  |  image: pass.jpg
+======================================================================
+  Overall verdict: PASS (score 9)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=4    [cv]
+    has text                                                PASS      score=10   [cv]
+    measuring tool or protractor on solar panel or roof surface visible PASS      score=10   [llm]
+    angle or degree measurement is legible                  PASS      score=9    [llm]
+  Weighted: sum=71.5  total_weight=8.0  final=9
+
+======================================================================
+  PASS IMAGE 2/2  |  field: Tilt measurement (per unique roof pitch)  |  image: pass (1).jpg
+======================================================================
+  Overall verdict: PASS (score 8)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=5    [cv]
+    has text                                                PASS      score=10   [cv]
+    measuring tool or protractor on solar panel or roof surface visible PASS      score=10   [llm]
+    angle or degree measurement is legible                  PASS      score=7    [llm]
+  Weighted: sum=67.5  total_weight=8.0  final=8
+
+======================================================================
+  FAIL IMAGE  |  field: Tilt measurement (per unique roof pitch)  |  image: _shared_fail.degraded.jpg
+======================================================================
+  Overall verdict: FAIL (score 1)
+  Per-criterion:
+    image sharpness                                         FAIL      score=1    [cv]
+    proper exposure                                         FAIL      score=2    [cv]
+    has text                                                FAIL      score=1    [cv]
+    measuring tool or protractor on solar panel or roof surface visible FAIL      score=1    [llm]
+    angle or degree measurement is legible                  FAIL      score=1    [llm]
+  Weighted: sum=9.0  total_weight=8.0  final=1
+
+======================================================================
+  PASS IMAGE 1/4  |  field: Junction Box(es)  |  image: pass.jpg
+======================================================================
+  Overall verdict: MARGINAL (score 6)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=6    [cv]
+    junction box or electrical enclosure visible            PASS      score=10   [llm]
+    interior wiring and connectors or labeled closed cover visible FAIL      score=1    [llm]
+  Weighted: sum=38.0  total_weight=6.0  final=6
+
+======================================================================
+  PASS IMAGE 2/4  |  field: Junction Box(es)  |  image: pass (1).jpg
+======================================================================
+  Overall verdict: PASS (score 9)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=6    [cv]
+    junction box or electrical enclosure visible            PASS      score=10   [llm]
+    interior wiring and connectors or labeled closed cover visible PASS      score=9    [llm]
+  Weighted: sum=54.0  total_weight=6.0  final=9
+
+======================================================================
+  PASS IMAGE 3/4  |  field: Junction Box(es)  |  image: pass (2).jpg
+======================================================================
+  Overall verdict: PASS (score 9)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=4    [cv]
+    junction box or electrical enclosure visible            PASS      score=10   [llm]
+    interior wiring and connectors or labeled closed cover visible PASS      score=9    [llm]
+  Weighted: sum=52.0  total_weight=6.0  final=9
+
+======================================================================
+  PASS IMAGE 4/4  |  field: Junction Box(es)  |  image: pass (3).jpg
+======================================================================
+  Overall verdict: MARGINAL (score 6)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=6    [cv]
+    junction box or electrical enclosure visible            PASS      score=10   [llm]
+    interior wiring and connectors or labeled closed cover visible FAIL      score=1    [llm]
+  Weighted: sum=38.0  total_weight=6.0  final=6
+
+======================================================================
+  FAIL IMAGE  |  field: Junction Box(es)  |  image: _shared_fail.degraded.jpg
+======================================================================
+  Overall verdict: FAIL (score 1)
+  Per-criterion:
+    image sharpness                                         FAIL      score=1    [cv]
+    proper exposure                                         FAIL      score=2    [cv]
+    junction box or electrical enclosure visible            FAIL      score=1    [llm]
+    interior wiring and connectors or labeled closed cover visible FAIL      score=1    [llm]
+  Weighted: sum=7.0  total_weight=6.0  final=1
+
+======================================================================
+  PASS IMAGE 1/3  |  field: Rooftop Conduit Run  |  image: pass.jpg
+======================================================================
+  Overall verdict: PASS (score 9)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=5    [cv]
+    electrical conduit visible on rooftop                   PASS      score=10   [llm]
+    conduit run path clearly shown from start to end        PASS      score=8    [llm]
+  Weighted: sum=56.0  total_weight=6.5  final=9
+
+======================================================================
+  PASS IMAGE 2/3  |  field: Rooftop Conduit Run  |  image: pass (1).jpg
+======================================================================
+  Overall verdict: PASS (score 7)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=6    [cv]
+    electrical conduit visible on rooftop                   PASS      score=7    [llm]
+    conduit run path clearly shown from start to end        MARGINAL  score=6    [llm]
+  Weighted: sum=45.5  total_weight=6.5  final=7
+
+======================================================================
+  PASS IMAGE 3/3  |  field: Rooftop Conduit Run  |  image: pass (2).jpg
+======================================================================
+  Overall verdict: PASS (score 8)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=6    [cv]
+    electrical conduit visible on rooftop                   PASS      score=10   [llm]
+    conduit run path clearly shown from start to end        MARGINAL  score=5    [llm]
+  Weighted: sum=51.0  total_weight=6.5  final=8
+
+======================================================================
+  FAIL IMAGE  |  field: Rooftop Conduit Run  |  image: _shared_fail.degraded.jpg
+======================================================================
+  Overall verdict: FAIL (score 1)
+  Per-criterion:
+    image sharpness                                         FAIL      score=1    [cv]
+    proper exposure                                         FAIL      score=2    [cv]
+    electrical conduit visible on rooftop                   FAIL      score=1    [llm]
+    conduit run path clearly shown from start to end        FAIL      score=1    [llm]
+  Weighted: sum=7.5  total_weight=6.5  final=1
+
+======================================================================
+  PASS IMAGE 1/3  |  field: Attic Runs — Start to Finish  |  image: pass.jpg
+======================================================================
+  Overall verdict: MARGINAL (score 6)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         FAIL      score=3    [cv]
+    attic space or interior conduit run visible             PASS      score=8    [llm]
+    wiring or conduit path clearly shown                    FAIL      score=2    [llm]
+  Weighted: sum=37.0  total_weight=6.5  final=6
+
+======================================================================
+  PASS IMAGE 2/3  |  field: Attic Runs — Start to Finish  |  image: pass (1).jpg
+======================================================================
+  Overall verdict: MARGINAL (score 6)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=4    [cv]
+    attic space or interior conduit run visible             PASS      score=8    [llm]
+    wiring or conduit path clearly shown                    FAIL      score=3    [llm]
+  Weighted: sum=40.0  total_weight=6.5  final=6
+
+======================================================================
+  PASS IMAGE 3/3  |  field: Attic Runs — Start to Finish  |  image: pass (2).jpg
+======================================================================
+  Overall verdict: PASS (score 7)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         FAIL      score=2    [cv]
+    attic space or interior conduit run visible             PASS      score=8    [llm]
+    wiring or conduit path clearly shown                    MARGINAL  score=6    [llm]
+  Weighted: sum=44.0  total_weight=6.5  final=7
+
+======================================================================
+  FAIL IMAGE  |  field: Attic Runs — Start to Finish  |  image: _shared_fail.degraded.jpg
+======================================================================
+  Overall verdict: FAIL (score 1)
+  Per-criterion:
+    image sharpness                                         FAIL      score=1    [cv]
+    proper exposure                                         FAIL      score=2    [cv]
+    attic space or interior conduit run visible             FAIL      score=1    [llm]
+    wiring or conduit path clearly shown                    FAIL      score=1    [llm]
+  Weighted: sum=7.5  total_weight=6.5  final=1
+
+======================================================================
+  PASS IMAGE 1/3  |  field: Gateway  |  image: pass.jpg
+======================================================================
+  Overall verdict: PASS (score 9)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=5    [cv]
+    solar gateway or combiner panel enclosure visible       PASS      score=10   [llm]
+    interior wiring and components or labeled cover shown   PASS      score=9    [llm]
+  Weighted: sum=53.0  total_weight=6.0  final=9
+
+======================================================================
+  PASS IMAGE 2/3  |  field: Gateway  |  image: pass (1).jpg
+======================================================================
+  Overall verdict: PASS (score 9)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=5    [cv]
+    solar gateway or combiner panel enclosure visible       PASS      score=10   [llm]
+    interior wiring and components or labeled cover shown   PASS      score=10   [llm]
+  Weighted: sum=55.0  total_weight=6.0  final=9
+
+======================================================================
+  PASS IMAGE 3/3  |  field: Gateway  |  image: pass (2).jpg
+======================================================================
+  Overall verdict: MARGINAL (score 6)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=5    [cv]
+    solar gateway or combiner panel enclosure visible       PASS      score=10   [llm]
+    interior wiring and components or labeled cover shown   FAIL      score=1    [llm]
+  Weighted: sum=37.0  total_weight=6.0  final=6
+
+======================================================================
+  FAIL IMAGE  |  field: Gateway  |  image: _shared_fail.degraded.jpg
+======================================================================
+  Overall verdict: FAIL (score 1)
+  Per-criterion:
+    image sharpness                                         FAIL      score=1    [cv]
+    proper exposure                                         FAIL      score=2    [cv]
+    solar gateway or combiner panel enclosure visible       FAIL      score=1    [llm]
+    interior wiring and components or labeled cover shown   FAIL      score=1    [llm]
+  Weighted: sum=7.0  total_weight=6.0  final=1
+
+======================================================================
+  PASS IMAGE 1/6  |  field: Split System Combiner Panel  |  image: pass.jpg
+======================================================================
+  Overall verdict: MARGINAL (score 6)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=6    [cv]
+    electrical combiner panel or enclosure visible          PASS      score=10   [llm]
+    interior wiring connectors or labeled cover shown       FAIL      score=1    [llm]
+  Weighted: sum=38.0  total_weight=6.0  final=6
+
+======================================================================
+  PASS IMAGE 2/6  |  field: Split System Combiner Panel  |  image: pass (1).jpg
+======================================================================
+  Overall verdict: MARGINAL (score 4)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         PASS      score=7    [cv]
+    electrical combiner panel or enclosure visible          FAIL      score=1    [llm]
+    interior wiring connectors or labeled cover shown       FAIL      score=1    [llm]
+  Weighted: sum=21.0  total_weight=6.0  final=4
+
+======================================================================
+  PASS IMAGE 3/6  |  field: Split System Combiner Panel  |  image: pass (2).jpg
+======================================================================
+  Overall verdict: PASS (score 9)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=5    [cv]
+    electrical combiner panel or enclosure visible          PASS      score=10   [llm]
+    interior wiring connectors or labeled cover shown       PASS      score=9    [llm]
+  Weighted: sum=53.0  total_weight=6.0  final=9
+
+======================================================================
+  PASS IMAGE 4/6  |  field: Split System Combiner Panel  |  image: pass (3).jpg
+======================================================================
+  Overall verdict: MARGINAL (score 6)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=6    [cv]
+    electrical combiner panel or enclosure visible          PASS      score=10   [llm]
+    interior wiring connectors or labeled cover shown       FAIL      score=1    [llm]
+  Weighted: sum=38.0  total_weight=6.0  final=6
+
+======================================================================
+  PASS IMAGE 5/6  |  field: Split System Combiner Panel  |  image: pass (4).jpg
+======================================================================
+  Overall verdict: MARGINAL (score 6)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=5    [cv]
+    electrical combiner panel or enclosure visible          PASS      score=10   [llm]
+    interior wiring connectors or labeled cover shown       FAIL      score=1    [llm]
+  Weighted: sum=37.0  total_weight=6.0  final=6
+
+======================================================================
+  PASS IMAGE 6/6  |  field: Split System Combiner Panel  |  image: pass (5).jpg
+======================================================================
+  Overall verdict: PASS (score 8)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=5    [cv]
+    electrical combiner panel or enclosure visible          PASS      score=10   [llm]
+    interior wiring connectors or labeled cover shown       PASS      score=8    [llm]
+  Weighted: sum=51.0  total_weight=6.0  final=8
+
+======================================================================
+  FAIL IMAGE  |  field: Split System Combiner Panel  |  image: _shared_fail.degraded.jpg
+======================================================================
+  Overall verdict: FAIL (score 1)
+  Per-criterion:
+    image sharpness                                         FAIL      score=1    [cv]
+    proper exposure                                         FAIL      score=2    [cv]
+    electrical combiner panel or enclosure visible          FAIL      score=1    [llm]
+    interior wiring connectors or labeled cover shown       FAIL      score=1    [llm]
+  Weighted: sum=7.0  total_weight=6.0  final=1
+
+======================================================================
+  PASS IMAGE 1/3  |  field: Production Meter Photos  |  image: pass.jpg
+======================================================================
+  Overall verdict: PASS (score 9)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=5    [cv]
+    electrical meter or meter can visible                   PASS      score=10   [llm]
+    manufacturer label interior wiring or labeled cover shown PASS      score=10   [llm]
+  Weighted: sum=55.0  total_weight=6.0  final=9
+
+======================================================================
+  PASS IMAGE 2/3  |  field: Production Meter Photos  |  image: pass (1).jpg
+======================================================================
+  Overall verdict: PASS (score 8)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=6    [cv]
+    electrical meter or meter can visible                   PASS      score=10   [llm]
+    manufacturer label interior wiring or labeled cover shown MARGINAL  score=5    [llm]
+  Weighted: sum=48.5  total_weight=6.0  final=8
+
+======================================================================
+  PASS IMAGE 3/3  |  field: Production Meter Photos  |  image: pass (2).jpg
+======================================================================
+  Overall verdict: FAIL (score 3)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=6    [cv]
+    electrical meter or meter can visible                   FAIL      score=1    [llm]
+    manufacturer label interior wiring or labeled cover shown FAIL      score=1    [llm]
+  Weighted: sum=20.0  total_weight=6.0  final=3
+
+======================================================================
+  FAIL IMAGE  |  field: Production Meter Photos  |  image: _shared_fail.degraded.jpg
+======================================================================
+  Overall verdict: FAIL (score 1)
+  Per-criterion:
+    image sharpness                                         FAIL      score=1    [cv]
+    proper exposure                                         FAIL      score=2    [cv]
+    electrical meter or meter can visible                   FAIL      score=1    [llm]
+    manufacturer label interior wiring or labeled cover shown FAIL      score=1    [llm]
+  Weighted: sum=7.0  total_weight=6.0  final=1
+
+======================================================================
+  PASS IMAGE 1/3  |  field: Secondary Disconnect(s)  |  image: pass.jpg
+======================================================================
+  Overall verdict: PASS (score 9)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=6    [cv]
+    electrical disconnect box or enclosure visible          PASS      score=10   [llm]
+    interior wiring connections or labeled cover shown      PASS      score=9    [llm]
+  Weighted: sum=59.0  total_weight=6.5  final=9
+
+======================================================================
+  PASS IMAGE 2/3  |  field: Secondary Disconnect(s)  |  image: pass (1).jpg
+======================================================================
+  Overall verdict: PASS (score 9)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=5    [cv]
+    electrical disconnect box or enclosure visible          PASS      score=10   [llm]
+    interior wiring connections or labeled cover shown      PASS      score=9    [llm]
+  Weighted: sum=58.0  total_weight=6.5  final=9
+
+======================================================================
+  PASS IMAGE 3/3  |  field: Secondary Disconnect(s)  |  image: pass (2).jpg
+======================================================================
+  Overall verdict: PASS (score 7)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=6    [cv]
+    electrical disconnect box or enclosure visible          PASS      score=10   [llm]
+    interior wiring connections or labeled cover shown      FAIL      score=1    [llm]
+  Weighted: sum=43.0  total_weight=6.5  final=7
+
+======================================================================
+  FAIL IMAGE  |  field: Secondary Disconnect(s)  |  image: _shared_fail.degraded.jpg
+======================================================================
+  Overall verdict: FAIL (score 1)
+  Per-criterion:
+    image sharpness                                         FAIL      score=1    [cv]
+    proper exposure                                         FAIL      score=2    [cv]
+    electrical disconnect box or enclosure visible          FAIL      score=1    [llm]
+    interior wiring connections or labeled cover shown      FAIL      score=1    [llm]
+  Weighted: sum=7.5  total_weight=6.5  final=1
+
+======================================================================
+  PASS IMAGE 1/2  |  field: Interior Breaker Enclosure  |  image: pass.jpg
+======================================================================
+  Overall verdict: PASS (score 9)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=6    [cv]
+    interior electrical breaker enclosure or box visible    PASS      score=10   [llm]
+    wiring and breakers or labeled cover shown              PASS      score=10   [llm]
+  Weighted: sum=56.0  total_weight=6.0  final=9
+
+======================================================================
+  PASS IMAGE 2/2  |  field: Interior Breaker Enclosure  |  image: pass (1).jpg
+======================================================================
+  Overall verdict: PASS (score 7)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=4    [cv]
+    interior electrical breaker enclosure or box visible    PASS      score=8    [llm]
+    wiring and breakers or labeled cover shown              MARGINAL  score=6    [llm]
+  Weighted: sum=42.0  total_weight=6.0  final=7
+
+======================================================================
+  FAIL IMAGE  |  field: Interior Breaker Enclosure  |  image: _shared_fail.degraded.jpg
+======================================================================
+  Overall verdict: FAIL (score 1)
+  Per-criterion:
+    image sharpness                                         FAIL      score=1    [cv]
+    proper exposure                                         FAIL      score=2    [cv]
+    interior electrical breaker enclosure or box visible    FAIL      score=1    [llm]
+    wiring and breakers or labeled cover shown              FAIL      score=1    [llm]
+  Weighted: sum=7.0  total_weight=6.0  final=1
+
+======================================================================
+  PASS IMAGE 1/3  |  field: Primary AC Disconnect  |  image: pass.jpg
+======================================================================
+  Overall verdict: PASS (score 7)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=5    [cv]
+    AC disconnect switch or enclosure visible               PASS      score=8    [llm]
+    interior wiring connections or labeled cover shown      MARGINAL  score=6    [llm]
+  Weighted: sum=47.0  total_weight=6.5  final=7
+
+======================================================================
+  PASS IMAGE 2/3  |  field: Primary AC Disconnect  |  image: pass (1).jpg
+======================================================================
+  Overall verdict: MARGINAL (score 6)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=5    [cv]
+    AC disconnect switch or enclosure visible               FAIL      score=3    [llm]
+    interior wiring connections or labeled cover shown      PASS      score=8    [llm]
+  Weighted: sum=38.5  total_weight=6.5  final=6
+
+======================================================================
+  PASS IMAGE 3/3  |  field: Primary AC Disconnect  |  image: pass (2).jpg
+======================================================================
+  Overall verdict: PASS (score 7)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=6    [cv]
+    AC disconnect switch or enclosure visible               PASS      score=10   [llm]
+    interior wiring connections or labeled cover shown      FAIL      score=1    [llm]
+  Weighted: sum=43.0  total_weight=6.5  final=7
+
+======================================================================
+  FAIL IMAGE  |  field: Primary AC Disconnect  |  image: _shared_fail.degraded.jpg
+======================================================================
+  Overall verdict: FAIL (score 1)
+  Per-criterion:
+    image sharpness                                         FAIL      score=1    [cv]
+    proper exposure                                         FAIL      score=2    [cv]
+    AC disconnect switch or enclosure visible               FAIL      score=1    [llm]
+    interior wiring connections or labeled cover shown      FAIL      score=1    [llm]
+  Weighted: sum=7.5  total_weight=6.5  final=1
+
+======================================================================
+  PASS IMAGE 1/3  |  field: Point of Interconnection (POI) Photos  |  image: pass.jpg
+======================================================================
+  Overall verdict: MARGINAL (score 6)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         FAIL      score=3    [cv]
+    electrical interconnection point or panel visible       PASS      score=8    [llm]
+    wiring connections breaker or tap visible at interconnection PASS      score=7    [llm]
+    labeled cover or circuit directory visible              FAIL      score=2    [llm]
+  Weighted: sum=45.0  total_weight=7.0  final=6
+
+======================================================================
+  PASS IMAGE 2/3  |  field: Point of Interconnection (POI) Photos  |  image: pass (1).jpg
+======================================================================
+  Overall verdict: PASS (score 7)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         FAIL      score=3    [cv]
+    electrical interconnection point or panel visible       PASS      score=8    [llm]
+    wiring connections breaker or tap visible at interconnection PASS      score=8    [llm]
+    labeled cover or circuit directory visible              FAIL      score=2    [llm]
+  Weighted: sum=47.0  total_weight=7.0  final=7
+
+======================================================================
+  PASS IMAGE 3/3  |  field: Point of Interconnection (POI) Photos  |  image: pass (2).jpg
+======================================================================
+  Overall verdict: MARGINAL (score 6)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=5    [cv]
+    electrical interconnection point or panel visible       PASS      score=8    [llm]
+    wiring connections breaker or tap visible at interconnection FAIL      score=2    [llm]
+    labeled cover or circuit directory visible              MARGINAL  score=4    [llm]
+  Weighted: sum=39.0  total_weight=7.0  final=6
+
+======================================================================
+  FAIL IMAGE  |  field: Point of Interconnection (POI) Photos  |  image: _shared_fail.degraded.jpg
+======================================================================
+  Overall verdict: FAIL (score 1)
+  Per-criterion:
+    image sharpness                                         FAIL      score=1    [cv]
+    proper exposure                                         FAIL      score=2    [cv]
+    electrical interconnection point or panel visible       FAIL      score=1    [llm]
+    wiring connections breaker or tap visible at interconnection FAIL      score=1    [llm]
+    labeled cover or circuit directory visible              FAIL      score=1    [llm]
+  Weighted: sum=8.0  total_weight=7.0  final=1
+
+======================================================================
+  PASS IMAGE 1/5  |  field: Consumption CTs - Direction & Installation  |  image: pass.jpg
+======================================================================
+  Overall verdict: FAIL (score 3)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=4    [cv]
+    current transformer CT sensor clipped onto electrical wiring visible FAIL      score=1    [llm]
+    wire color coding or tape distinguishing wires visible  FAIL      score=1    [llm]
+  Weighted: sum=18.0  total_weight=6.0  final=3
+
+======================================================================
+  PASS IMAGE 2/5  |  field: Consumption CTs - Direction & Installation  |  image: pass (1).jpg
+======================================================================
+  Overall verdict: MARGINAL (score 4)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=5    [cv]
+    current transformer CT sensor clipped onto electrical wiring visible FAIL      score=1    [llm]
+    wire color coding or tape distinguishing wires visible  MARGINAL  score=5    [llm]
+  Weighted: sum=25.0  total_weight=6.0  final=4
+
+======================================================================
+  PASS IMAGE 3/5  |  field: Consumption CTs - Direction & Installation  |  image: pass (2).jpg
+======================================================================
+  Overall verdict: FAIL (score 3)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=4    [cv]
+    current transformer CT sensor clipped onto electrical wiring visible FAIL      score=1    [llm]
+    wire color coding or tape distinguishing wires visible  FAIL      score=1    [llm]
+  Weighted: sum=18.0  total_weight=6.0  final=3
+
+======================================================================
+  PASS IMAGE 4/5  |  field: Consumption CTs - Direction & Installation  |  image: pass (3).jpg
+======================================================================
+  Overall verdict: PASS (score 7)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=4    [cv]
+    current transformer CT sensor clipped onto electrical wiring visible PASS      score=8    [llm]
+    wire color coding or tape distinguishing wires visible  MARGINAL  score=6    [llm]
+  Weighted: sum=43.0  total_weight=6.0  final=7
+
+======================================================================
+  PASS IMAGE 5/5  |  field: Consumption CTs - Direction & Installation  |  image: pass (4).jpg
+======================================================================
+  Overall verdict: MARGINAL (score 4)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=5    [cv]
+    current transformer CT sensor clipped onto electrical wiring visible FAIL      score=1    [llm]
+    wire color coding or tape distinguishing wires visible  MARGINAL  score=5    [llm]
+  Weighted: sum=25.0  total_weight=6.0  final=4
+
+======================================================================
+  FAIL IMAGE  |  field: Consumption CTs - Direction & Installation  |  image: _shared_fail.degraded.jpg
+======================================================================
+  Overall verdict: FAIL (score 1)
+  Per-criterion:
+    image sharpness                                         FAIL      score=1    [cv]
+    proper exposure                                         FAIL      score=2    [cv]
+    current transformer CT sensor clipped onto electrical wiring visible FAIL      score=1    [llm]
+    wire color coding or tape distinguishing wires visible  FAIL      score=1    [llm]
+  Weighted: sum=7.0  total_weight=6.0  final=1
+
+======================================================================
+  PASS IMAGE 1/6  |  field: Subpanel  |  image: pass.jpg
+======================================================================
+  Overall verdict: FAIL (score 3)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         PASS      score=7    [cv]
+    electrical subpanel visible                             FAIL      score=1    [llm]
+    interior wiring and labeled circuits or labeled cover shown FAIL      score=1    [llm]
+  Weighted: sum=21.5  total_weight=6.5  final=3
+
+======================================================================
+  PASS IMAGE 2/6  |  field: Subpanel  |  image: pass (1).jpg
+======================================================================
+  Overall verdict: PASS (score 7)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=6    [cv]
+    electrical subpanel visible                             PASS      score=8    [llm]
+    interior wiring and labeled circuits or labeled cover shown MARGINAL  score=6    [llm]
+  Weighted: sum=48.0  total_weight=6.5  final=7
+
+======================================================================
+  PASS IMAGE 3/6  |  field: Subpanel  |  image: pass (2).jpg
+======================================================================
+  Overall verdict: MARGINAL (score 6)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=4    [cv]
+    electrical subpanel visible                             PASS      score=7    [llm]
+    interior wiring and labeled circuits or labeled cover shown FAIL      score=3    [llm]
+  Weighted: sum=37.5  total_weight=6.5  final=6
+
+======================================================================
+  PASS IMAGE 4/6  |  field: Subpanel  |  image: pass (3).jpg
+======================================================================
+  Overall verdict: PASS (score 9)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=6    [cv]
+    electrical subpanel visible                             PASS      score=10   [llm]
+    interior wiring and labeled circuits or labeled cover shown PASS      score=9    [llm]
+  Weighted: sum=59.0  total_weight=6.5  final=9
+
+======================================================================
+  PASS IMAGE 5/6  |  field: Subpanel  |  image: pass (4).jpg
+======================================================================
+  Overall verdict: PASS (score 9)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=6    [cv]
+    electrical subpanel visible                             PASS      score=10   [llm]
+    interior wiring and labeled circuits or labeled cover shown PASS      score=10   [llm]
+  Weighted: sum=61.0  total_weight=6.5  final=9
+
+======================================================================
+  PASS IMAGE 6/6  |  field: Subpanel  |  image: pass (5).jpg
+======================================================================
+  Overall verdict: PASS (score 8)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=6    [cv]
+    electrical subpanel visible                             PASS      score=10   [llm]
+    interior wiring and labeled circuits or labeled cover shown MARGINAL  score=5    [llm]
+  Weighted: sum=51.0  total_weight=6.5  final=8
+
+======================================================================
+  FAIL IMAGE  |  field: Subpanel  |  image: _shared_fail.degraded.jpg
+======================================================================
+  Overall verdict: FAIL (score 1)
+  Per-criterion:
+    image sharpness                                         FAIL      score=1    [cv]
+    proper exposure                                         FAIL      score=2    [cv]
+    electrical subpanel visible                             FAIL      score=1    [llm]
+    interior wiring and labeled circuits or labeled cover shown FAIL      score=1    [llm]
+  Weighted: sum=7.5  total_weight=6.5  final=1
+
+======================================================================
+  PASS IMAGE 1/6  |  field: Main Service Panel (MSP)  |  image: pass.jpg
+======================================================================
+  Overall verdict: MARGINAL (score 6)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=6    [cv]
+    has text                                                PASS      score=10   [cv]
+    main electrical service panel or breaker box visible    PASS      score=10   [llm]
+    interior wiring main breaker or labeled cover shown     FAIL      score=1    [llm]
+    bus rating or manufacturer label legible                FAIL      score=1    [llm]
+  Weighted: sum=54.5  total_weight=9.0  final=6
+
+======================================================================
+  PASS IMAGE 2/6  |  field: Main Service Panel (MSP)  |  image: pass (1).jpg
+======================================================================
+  Overall verdict: PASS (score 7)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=6    [cv]
+    has text                                                PASS      score=10   [cv]
+    main electrical service panel or breaker box visible    PASS      score=10   [llm]
+    interior wiring main breaker or labeled cover shown     MARGINAL  score=5    [llm]
+    bus rating or manufacturer label legible                FAIL      score=2    [llm]
+  Weighted: sum=64.0  total_weight=9.0  final=7
+
+======================================================================
+  PASS IMAGE 3/6  |  field: Main Service Panel (MSP)  |  image: pass (2).jpg
+======================================================================
+  Overall verdict: PASS (score 9)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=5    [cv]
+    has text                                                PASS      score=10   [cv]
+    main electrical service panel or breaker box visible    PASS      score=10   [llm]
+    interior wiring main breaker or labeled cover shown     PASS      score=9    [llm]
+    bus rating or manufacturer label legible                PASS      score=7    [llm]
+  Weighted: sum=78.5  total_weight=9.0  final=9
+
+======================================================================
+  PASS IMAGE 4/6  |  field: Main Service Panel (MSP)  |  image: pass (3).jpg
+======================================================================
+  Overall verdict: PASS (score 7)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=4    [cv]
+    has text                                                PASS      score=10   [cv]
+    main electrical service panel or breaker box visible    PASS      score=8    [llm]
+    interior wiring main breaker or labeled cover shown     MARGINAL  score=6    [llm]
+    bus rating or manufacturer label legible                MARGINAL  score=4    [llm]
+  Weighted: sum=62.0  total_weight=9.0  final=7
+
+======================================================================
+  PASS IMAGE 5/6  |  field: Main Service Panel (MSP)  |  image: pass (4).jpg
+======================================================================
+  Overall verdict: MARGINAL (score 6)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=5    [cv]
+    has text                                                PASS      score=8    [cv]
+    main electrical service panel or breaker box visible    PASS      score=7    [llm]
+    interior wiring main breaker or labeled cover shown     FAIL      score=2    [llm]
+    bus rating or manufacturer label legible                PASS      score=9    [llm]
+  Weighted: sum=58.0  total_weight=9.0  final=6
+
+======================================================================
+  PASS IMAGE 6/6  |  field: Main Service Panel (MSP)  |  image: pass (5).jpg
+======================================================================
+  Overall verdict: PASS (score 10)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         PASS      score=8    [cv]
+    has text                                                PASS      score=10   [cv]
+    main electrical service panel or breaker box visible    PASS      score=10   [llm]
+    interior wiring main breaker or labeled cover shown     PASS      score=10   [llm]
+    bus rating or manufacturer label legible                PASS      score=10   [llm]
+  Weighted: sum=88.0  total_weight=9.0  final=10
+
+======================================================================
+  FAIL IMAGE  |  field: Main Service Panel (MSP)  |  image: _shared_fail.degraded.jpg
+======================================================================
+  Overall verdict: FAIL (score 1)
+  Per-criterion:
+    image sharpness                                         FAIL      score=1    [cv]
+    proper exposure                                         FAIL      score=2    [cv]
+    has text                                                FAIL      score=1    [cv]
+    main electrical service panel or breaker box visible    FAIL      score=1    [llm]
+    interior wiring main breaker or labeled cover shown     FAIL      score=1    [llm]
+    bus rating or manufacturer label legible                FAIL      score=1    [llm]
+  Weighted: sum=10.0  total_weight=9.0  final=1
+
+======================================================================
+  PASS IMAGE 1/4  |  field: Grounding Electrode System (GES)  |  image: pass.jpg
+======================================================================
+  Overall verdict: FAIL (score 3)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=5    [cv]
+    grounding wire GEC or grounding electrode visible       FAIL      score=1    [llm]
+    grounding installation path or electrode connection shown FAIL      score=1    [llm]
+  Weighted: sum=19.5  total_weight=6.5  final=3
+
+======================================================================
+  PASS IMAGE 2/4  |  field: Grounding Electrode System (GES)  |  image: pass (1).jpg
+======================================================================
+  Overall verdict: MARGINAL (score 6)
+  Per-criterion:
+    image sharpness                                         MARGINAL  score=6    [cv]
+    proper exposure                                         MARGINAL  score=4    [cv]
+    grounding wire GEC or grounding electrode visible       PASS      score=8    [llm]
+    grounding installation path or electrode connection shown MARGINAL  score=6    [llm]
+  Weighted: sum=42.0  total_weight=6.5  final=6
+
+======================================================================
+  PASS IMAGE 3/4  |  field: Grounding Electrode System (GES)  |  image: pass (2).jpg
+======================================================================
+  Overall verdict: FAIL (score 3)
+  Per-criterion:
+    image sharpness                                         PASS      score=7    [cv]
+    proper exposure                                         PASS      score=9    [cv]
+    grounding wire GEC or grounding electrode visible       FAIL      score=1    [llm]
+    grounding installation path or electrode connection shown FAIL      score=1    [llm]
+  Weighted: sum=20.5  total_weight=6.5  final=3
+
+======================================================================
+  PASS IMAGE 4/4  |  field: Grounding Electrode System (GES)  |  image: pass (3).jpg
+======================================================================
+  Overall verdict: FAIL (score 3)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=6    [cv]
+    grounding wire GEC or grounding electrode visible       FAIL      score=1    [llm]
+    grounding installation path or electrode connection shown FAIL      score=1    [llm]
+  Weighted: sum=20.5  total_weight=6.5  final=3
+
+======================================================================
+  FAIL IMAGE  |  field: Grounding Electrode System (GES)  |  image: _shared_fail.degraded.jpg
+======================================================================
+  Overall verdict: FAIL (score 1)
+  Per-criterion:
+    image sharpness                                         FAIL      score=1    [cv]
+    proper exposure                                         FAIL      score=2    [cv]
+    grounding wire GEC or grounding electrode visible       FAIL      score=1    [llm]
+    grounding installation path or electrode connection shown FAIL      score=1    [llm]
+  Weighted: sum=7.5  total_weight=6.5  final=1
+
+======================================================================
+  PASS IMAGE 1/1  |  field: Meter  |  image: pass.jpg
+======================================================================
+  Overall verdict: PASS (score 9)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=6    [cv]
+    has text                                                PASS      score=10   [cv]
+    utility meter or meter socket visible                   PASS      score=10   [llm]
+    meter cover or meter can is labeled                     PASS      score=10   [llm]
+  Weighted: sum=71.0  total_weight=7.5  final=9
+
+======================================================================
+  FAIL IMAGE  |  field: Meter  |  image: _shared_fail.degraded.jpg
+======================================================================
+  Overall verdict: FAIL (score 1)
+  Per-criterion:
+    image sharpness                                         FAIL      score=1    [cv]
+    proper exposure                                         FAIL      score=2    [cv]
+    has text                                                FAIL      score=1    [cv]
+    utility meter or meter socket visible                   FAIL      score=1    [llm]
+    meter cover or meter can is labeled                     FAIL      score=1    [llm]
+  Weighted: sum=8.5  total_weight=7.5  final=1
+
+======================================================================
+  PASS IMAGE 1/2  |  field: Homerun Conduit Run  |  image: pass.jpg
+======================================================================
+  Overall verdict: MARGINAL (score 5)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=5    [cv]
+    electrical conduit visible running from roof to electrical equipment MARGINAL  score=5    [llm]
+    full conduit path clearly shown                         FAIL      score=2    [llm]
+  Weighted: sum=31.5  total_weight=6.5  final=5
+
+======================================================================
+  PASS IMAGE 2/2  |  field: Homerun Conduit Run  |  image: pass (1).jpg
+======================================================================
+  Overall verdict: MARGINAL (score 6)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=6    [cv]
+    electrical conduit visible running from roof to electrical equipment PASS      score=7    [llm]
+    full conduit path clearly shown                         FAIL      score=3    [llm]
+  Weighted: sum=39.5  total_weight=6.5  final=6
+
+======================================================================
+  FAIL IMAGE  |  field: Homerun Conduit Run  |  image: _shared_fail.degraded.jpg
+======================================================================
+  Overall verdict: FAIL (score 1)
+  Per-criterion:
+    image sharpness                                         FAIL      score=1    [cv]
+    proper exposure                                         FAIL      score=2    [cv]
+    electrical conduit visible running from roof to electrical equipment FAIL      score=1    [llm]
+    full conduit path clearly shown                         FAIL      score=1    [llm]
+  Weighted: sum=7.5  total_weight=6.5  final=1
+
+======================================================================
+  PASS IMAGE 1/3  |  field: Electrical Pullback(s)  |  image: pass.jpg
+======================================================================
+  Overall verdict: PASS (score 8)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=6    [cv]
+    multiple pieces of electrical BOS equipment visible in single frame PASS      score=10   [llm]
+    wide angle or pullback shot showing installation context MARGINAL  score=5    [llm]
+  Weighted: sum=51.0  total_weight=6.5  final=8
+
+======================================================================
+  PASS IMAGE 2/3  |  field: Electrical Pullback(s)  |  image: pass (1).jpg
+======================================================================
+  Overall verdict: PASS (score 7)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=5    [cv]
+    multiple pieces of electrical BOS equipment visible in single frame PASS      score=8    [llm]
+    wide angle or pullback shot showing installation context MARGINAL  score=6    [llm]
+  Weighted: sum=47.0  total_weight=6.5  final=7
+
+======================================================================
+  PASS IMAGE 3/3  |  field: Electrical Pullback(s)  |  image: pass (2).jpg
+======================================================================
+  Overall verdict: PASS (score 8)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=5    [cv]
+    multiple pieces of electrical BOS equipment visible in single frame PASS      score=10   [llm]
+    wide angle or pullback shot showing installation context PASS      score=7    [llm]
+  Weighted: sum=54.0  total_weight=6.5  final=8
+
+======================================================================
+  FAIL IMAGE  |  field: Electrical Pullback(s)  |  image: _shared_fail.degraded.jpg
+======================================================================
+  Overall verdict: FAIL (score 1)
+  Per-criterion:
+    image sharpness                                         FAIL      score=1    [cv]
+    proper exposure                                         FAIL      score=2    [cv]
+    multiple pieces of electrical BOS equipment visible in single frame FAIL      score=1    [llm]
+    wide angle or pullback shot showing installation context FAIL      score=1    [llm]
+  Weighted: sum=7.5  total_weight=6.5  final=1
+
+======================================================================
+  PASS IMAGE 1/2  |  field: Battery CT - Location & Direction  |  image: pass.jpg
+======================================================================
+  Overall verdict: MARGINAL (score 4)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=5    [cv]
+    current transformer CT sensor on battery wiring visible FAIL      score=1    [llm]
+    wiring direction and terminations clearly shown         MARGINAL  score=5    [llm]
+  Weighted: sum=27.5  total_weight=6.5  final=4
+
+======================================================================
+  PASS IMAGE 2/2  |  field: Battery CT - Location & Direction  |  image: pass (1).jpg
+======================================================================
+  Overall verdict: FAIL (score 3)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=4    [cv]
+    current transformer CT sensor on battery wiring visible FAIL      score=1    [llm]
+    wiring direction and terminations clearly shown         FAIL      score=1    [llm]
+  Weighted: sum=18.5  total_weight=6.5  final=3
+
+======================================================================
+  FAIL IMAGE  |  field: Battery CT - Location & Direction  |  image: _shared_fail.degraded.jpg
+======================================================================
+  Overall verdict: FAIL (score 1)
+  Per-criterion:
+    image sharpness                                         FAIL      score=1    [cv]
+    proper exposure                                         FAIL      score=2    [cv]
+    current transformer CT sensor on battery wiring visible FAIL      score=1    [llm]
+    wiring direction and terminations clearly shown         FAIL      score=1    [llm]
+  Weighted: sum=7.5  total_weight=6.5  final=1
+
+======================================================================
+  PASS IMAGE 1/1  |  field: Critical Load Panel Photos  |  image: pass.jpg
+======================================================================
+  Overall verdict: MARGINAL (score 5)
+  Per-criterion:
+    image sharpness                                         PASS      score=10   [cv]
+    proper exposure                                         MARGINAL  score=6    [cv]
+    critical load electrical panel visible                  FAIL      score=3    [llm]
+    interior wiring labeled circuits or closed and labeled cover shown FAIL      score=3    [llm]
+  Weighted: sum=29.5  total_weight=6.5  final=5
+
+======================================================================
+  FAIL IMAGE  |  field: Critical Load Panel Photos  |  image: _shared_fail.degraded.jpg
+======================================================================
+  Overall verdict: FAIL (score 1)
+  Per-criterion:
+    image sharpness                                         FAIL      score=1    [cv]
+    proper exposure                                         FAIL      score=2    [cv]
+    critical load electrical panel visible                  FAIL      score=1    [llm]
+    interior wiring labeled circuits or closed and labeled cover shown FAIL      score=1    [llm]
+  Weighted: sum=7.5  total_weight=6.5  final=1

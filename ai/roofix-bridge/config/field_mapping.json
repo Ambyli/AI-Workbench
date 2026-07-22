@@ -1,0 +1,19 @@
+{
+  "_note": "Roofix event -> Phoenix (block_name, status_id). Owned by Michael; not code. Loaded at runtime by the orchestrator via FIELD_MAPPING_PATH.",
+  "milestones": {
+    "HIC Executed": {"block_name": "phoenix_block_TBD", "status_id": 0},
+    "Job Scheduled": {"block_name": "phoenix_block_TBD", "status_id": 0},
+    "Install Date": {"block_name": "phoenix_block_TBD", "status_id": 0},
+    "Job In Progress": {"block_name": "phoenix_block_TBD", "status_id": 0},
+    "Job Is Complete": {"block_name": "phoenix_block_TBD", "status_id": 0},
+    "Deposit Invoice Sent": {"block_name": "phoenix_block_TBD", "status_id": 0},
+    "Deposit Invoice Paid": {"block_name": "phoenix_block_TBD", "status_id": 0},
+    "Job Approval Confirmed": {"block_name": "phoenix_block_TBD", "status_id": 0}
+  },
+  "project_creation": {
+    "customer_name": "phoenix_field_TBD",
+    "address": "phoenix_field_TBD",
+    "sales_rep": "phoenix_field_TBD",
+    "contract_price": "phoenix_field_TBD"
+  }
+}

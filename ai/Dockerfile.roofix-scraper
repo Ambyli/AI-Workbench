@@ -1,0 +1,21 @@
+FROM mcr.microsoft.com/playwright/python:v1.47.0-jammy
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    UV_NO_CACHE=1 \
+    PYTHONPATH=/app
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+WORKDIR /app
+
+COPY roofix-scraper/pyproject.toml .
+RUN uv sync --no-dev
+
+COPY roofix-scraper/app.py .
+COPY roofix-scraper/scraper.py .
+COPY roofix-scraper/session.py .
+
+EXPOSE 8080
+
+CMD ["uv", "run", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"]

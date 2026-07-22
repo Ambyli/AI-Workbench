@@ -41,6 +41,16 @@ Key variables:
 | `AUDIO_BASE_URL` | `http://localhost:8004` | Base URL returned by Kokoro `text_to_speech` MCP tool |
 | `MADLAD_APP_URL` | `http://madlad-app:8085` | URL the MADLAD proxy uses to reach the inference container |
 | `MADLAD_MODEL` | `SoybeanMilk/madlad400-3b-mt-ct2-int8_float16` | HuggingFace repo ID for the pre-converted CTranslate2 MADLAD checkpoint |
+| `DRY_RUN` | `true` | Roofix Bridge: log decisions but skip Phoenix writes |
+| `AGENT_PHASE` | `0` | Roofix Bridge: `0` = chatter+milestones only; `1` = +create/notify |
+| `TICK_INTERVAL_SECONDS` | `300` | Roofix Bridge: APScheduler cadence |
+| `BRAIN_MODEL` | `qwen3.6` | Roofix Bridge: LiteLLM alias for the AI-fallback brain |
+| `ROOFIX_SENDER` | `no-reply@roofix.io` | Roofix Bridge: Gmail search-query sender (two `o`s) |
+| `GMAIL_MCP_URL` | _(secret)_ | Roofix Bridge: direct Gmail MCP JSON-RPC endpoint |
+| `GMAIL_MCP_AUTH_VALUE` | _(secret)_ | Roofix Bridge: bearer token for Gmail MCP |
+| `PHOENIX_AGENT_USER_ID` | _(unset — required for writes)_ | Roofix Bridge: dedicated Phoenix user id |
+| `PHOENIX_ROOFIX_ID_COLUMN` | `migration_external_id` | Roofix Bridge: column where Roofix ids are stamped |
+| `ROOFIX_SESSION_PATH` | `/data/roofix_session.json` | Roofix Scraper: persisted Playwright storage_state |
 
 ## Threading Model — Read Before Touching Anything
 
@@ -161,6 +171,17 @@ curl -X POST https://phoenix-mcp.com/api-token \
 | Changing `LLM_URL` without re-toggling LLM mode | `is_local_llm_active()` returns false |
 | Closing app without stopping llama-server | Orphaned server process |
 | Editing `.env` while app is running | No effect until restart |
+
+## Roofix Bridge (Roofix ↔ Phoenix)
+
+`ai/roofix-bridge` is a background worker that mirrors Roofix email events into Phoenix. See [`ai/ROOFIX_BRIDGE.md`](ai/ROOFIX_BRIDGE.md) for the operator guide; a few things worth calling out here:
+
+- **Two services, one migration**: the bridge depends on `roofix-scraper` (Playwright, Chromium). Bring the scraper up first.
+- **Default `DRY_RUN=true`**: on first deploy the bridge fetches Gmail, parses, decides, and logs — but does **not** write to Phoenix. Flip to `false` only after inspecting a full tick.
+- **Phoenix MCP writes are speculative**: the bridge assumes tools named `insert_note` and `upsert_project_process_block` will land on the Phoenix MCP. Real names are configurable via `PHOENIX_MCP_TOOL_INSERT_NOTE` / `..._UPSERT_BLOCK` so no code change is needed when the actual tool names are known.
+- **AI fallback via LiteLLM**: `components/brain.py::generate_ai_decision` uses the OpenAI SDK against `http://litellm:4000`. Swapping Claude for a local vLLM model is a LiteLLM config change, not a bridge code change.
+- **Session refresh is a manual operator flow**: the scraper cannot present a login UI. Run `save_roofix_session.py` locally on a laptop with a visible browser, then POST the resulting JSON to the scraper's `/session/refresh`.
+- **Michael's mapping**: `ai/roofix-bridge/config/field_mapping.json` is a stub. Milestone writes will log "no milestone mapping" and skip until the file is filled in — this is intentional.
 
 ## AI Infrastructure — Compose Topology
 

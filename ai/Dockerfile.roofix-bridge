@@ -1,0 +1,21 @@
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    UV_NO_CACHE=1 \
+    PYTHONPATH=/app
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+WORKDIR /app
+
+COPY roofix-bridge/pyproject.toml .
+RUN uv sync --no-dev
+
+COPY roofix-bridge/app.py .
+COPY roofix-bridge/components ./components
+COPY roofix-bridge/config ./config
+
+EXPOSE 8080
+
+CMD ["uv", "run", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"]

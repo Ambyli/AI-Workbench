@@ -1,0 +1,11 @@
+[project]
+name = "roofix-scraper"
+version = "0.1.0"
+description = "Playwright-based scraper for Roofix proposal pages"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi",
+    "uvicorn",
+    "playwright",
+    "pydantic",
+]

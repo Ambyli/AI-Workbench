@@ -1,0 +1,13 @@
+[project]
+name = "roofix-bridge"
+version = "0.1.0"
+description = "Roofix -> Phoenix bridge: parse Roofix emails and mirror events into Phoenix via MCP"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi",
+    "uvicorn",
+    "httpx",
+    "openai",
+    "apscheduler",
+    "pydantic",
+]

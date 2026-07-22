@@ -1,0 +1,43 @@
+networks:
+  shared:
+    external: true
+    name: ai_shared
+
+services:
+  roofix-bridge:
+    networks:
+      - shared
+    build:
+      context: .
+      dockerfile: Dockerfile.roofix-bridge
+    container_name: roofix-bridge
+    restart: unless-stopped
+    environment:
+      - DRY_RUN=${DRY_RUN:-true}
+      - AGENT_PHASE=${AGENT_PHASE:-0}
+      - TICK_INTERVAL_SECONDS=${TICK_INTERVAL_SECONDS:-300}
+      - LITELLM_URL=${LITELLM_URL:-http://litellm:4000}
+      - LITELLM_API_KEY=${DEFAULT_LITELLM_MASTER_KEY}
+      - BRAIN_MODEL=${BRAIN_MODEL:-qwen3.6}
+      - ROOFIX_SENDER=${ROOFIX_SENDER:-no-reply@roofix.io}
+      - GMAIL_MCP_URL=${GMAIL_MCP_URL}
+      - GMAIL_MCP_AUTH_VALUE=${GMAIL_MCP_AUTH_VALUE}
+      - PHOENIX_MCP_URL=${DEFAULT_LITELLM_MCP_PHOENIX_URL}
+      - PHOENIX_MCP_AUTH_VALUE=${DEFAULT_LITELLM_MCP_PHOENIX_AUTH_VALUE}
+      - PHOENIX_AGENT_USER_ID=${PHOENIX_AGENT_USER_ID}
+      - PHOENIX_ROOFIX_ID_COLUMN=${PHOENIX_ROOFIX_ID_COLUMN:-migration_external_id}
+      - ROOFIX_SCRAPER_URL=http://roofix-scraper:8080
+      - LOG_DIR=/data
+    volumes:
+      - roofix_bridge_data:/data
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    depends_on:
+      - roofix-scraper
+
+volumes:
+  roofix_bridge_data:

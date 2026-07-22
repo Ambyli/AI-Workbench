@@ -79,6 +79,7 @@ Ambiguous or thin `Estimate` / `Estimate Complete` events cause the bridge to ca
 | `LITELLM_API_KEY` | _(from `DEFAULT_LITELLM_MASTER_KEY`)_ | Auth for LiteLLM. |
 | `BRAIN_MODEL` | `qwen3.6` | LiteLLM model alias used for AI fallback decisions. |
 | `ROOFIX_SENDER` | `no-reply@roofix.io` | Gmail search-query sender. **Note the two `o`s.** |
+| `LISTENER_QUERY` | `is:unread from:${ROOFIX_SENDER}` | Full Gmail search query. Override to narrow the fetch — e.g. to a single project during first live tests. |
 | `GMAIL_MCP_URL` | _(required)_ | Gmail MCP JSON-RPC endpoint. |
 | `GMAIL_MCP_AUTH_VALUE` | _(required)_ | Bearer token for Gmail MCP. |
 | `PHOENIX_MCP_URL` | _(from `DEFAULT_LITELLM_MCP_PHOENIX_URL`)_ | Phoenix MCP endpoint. |

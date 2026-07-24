@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -20,6 +21,7 @@ from .launcher import (
     BrowserNotFoundError,
     clear_singleton_locks,
     find_browser,
+    kill_chrome_by_profile,
     start_browser,
 )
 from .sentinel import (
@@ -248,27 +250,51 @@ class InterceptorClient:
         return f"const DEBUG_LOGGING = {flag};\n" + base
 
     def _kill_chrome(self, label: str = "") -> None:
-        """Terminate the current Chrome process cleanly, force-kill on hang.
+        """Terminate the current Chrome process AND its children.
 
-        Two-stage shutdown:
-          1. terminate() sends SIGTERM (Windows: CTRL_BREAK). Chrome usually
-             takes ~1s to close all its child processes.
-          2. If it hasn't exited within 3s, escalate to kill() (SIGKILL).
-        Nullifies self._proc first so concurrent callers can't double-kill.
+        On Windows, ``proc.terminate()`` only kills Chrome's main process —
+        its child processes (GPU, renderer, network service) survive as
+        orphans and continue to hold the profile's named mutex. A subsequent
+        relaunch against the same ``--user-data-dir`` then IPC-hands-off the
+        URL to a dying renderer and exits with code 21 (NORMAL_EXIT_PROCESS_
+        NOTIFIED) — no visible window ever appears.
+
+        Fix: kill the whole process tree. On Windows we use ``taskkill /F /T
+        /PID``; elsewhere we fall back to terminate()+kill() on the main
+        process, which is enough on POSIX because setsid isn't in play.
         """
         if self._proc is None:
             return
-        # Move self._proc into a local var before killing — this closes the
-        # window where a concurrent quit() could try to kill the same proc.
+        # Move self._proc into a local var before killing so a concurrent
+        # quit() can't double-kill the same handle.
         proc, self._proc = self._proc, None
+        pid = proc.pid
         try:
-            proc.terminate()
+            if sys.platform == "win32":
+                # /F force-kill, /T kill process tree, /PID target the tree root.
+                # We don't check the returncode: taskkill returns non-zero if
+                # any process was already gone, which is fine — we still want
+                # to reap the main handle below to release the OS resource.
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(pid)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                    timeout=5,
+                )
+            else:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except Exception:
+                    proc.kill()
+
+            # Reap the main handle to release the Popen wait state, whichever
+            # branch we took above.
             try:
                 proc.wait(timeout=3)
             except Exception:
-                # Graceful shutdown didn't complete in 3s; force-kill.
-                proc.kill()
-                proc.wait(timeout=2)
+                pass
         except Exception as exc:
             suffix = f" ({label})" if label else ""
             logger.warning("InterceptorClient._kill_chrome%s: %s", suffix, exc)
@@ -286,12 +312,22 @@ class InterceptorClient:
             logger.warning("relaunch: launch() has not been called yet")
             return
 
+        import os as _os
+        import time as _time
+
+        logger.debug("relaunch: begin headless=%s profile=%s target=%s",
+                     headless, self._profile_dir, self._target_url)
+
         # Signal the worker to stop, then wait briefly for it to exit its
         # inner loops. Chrome dies first so any in-flight CDP calls fail fast.
         self._stop_event.set()
         self._kill_chrome(f"relaunch(headless={headless})")
-        if self._worker is not None and self._worker.is_alive():
+        worker_alive_before = self._worker is not None and self._worker.is_alive()
+        if worker_alive_before:
             self._worker.join(timeout=2)
+        logger.debug("relaunch: kill done, old worker alive_before=%s alive_after=%s",
+                     worker_alive_before,
+                     self._worker is not None and self._worker.is_alive())
 
         # Reset both signals for the fresh worker.
         self._stop_event.clear()
@@ -304,7 +340,26 @@ class InterceptorClient:
         # window. The IPC target (the dead headless Chrome) can't display
         # it, so the visible window never appears. `launch()` does the same
         # thing for the same reason.
+        locks_before = [
+            lf for lf in ("SingletonLock", "SingletonCookie", "SingletonSocket")
+            if _os.path.exists(_os.path.join(self._profile_dir, lf))
+        ]
         clear_singleton_locks(self._profile_dir)
+        locks_after = [
+            lf for lf in ("SingletonLock", "SingletonCookie", "SingletonSocket")
+            if _os.path.exists(_os.path.join(self._profile_dir, lf))
+        ]
+        logger.debug("relaunch: singleton locks before=%s after=%s",
+                     locks_before, locks_after)
+
+        # Windows only: reap any chrome.exe that survived the process-tree kill
+        # (updater, crashpad, utility procs) and is still bound to this profile.
+        # If any linger, the new browser IPC-hands-off to them and exits with
+        # code 21 instead of opening a window. Then wait for the OS to actually
+        # release the mutex.
+        killed = kill_chrome_by_profile(self._profile_dir)
+        logger.debug("relaunch: kill_chrome_by_profile killed=%d", killed)
+        _time.sleep(1.0 if killed else 0.5)
 
         # Update our state to reflect the new mode BEFORE spawning so any
         # get_state() call in between sees consistent data.
@@ -320,8 +375,26 @@ class InterceptorClient:
             profile_dir=self._profile_dir,
             target_url=self._target_url,
         )
-        logger.debug("InterceptorClient._relaunch: Chrome pid=%s headless=%s",
+        logger.debug("relaunch: start_browser returned pid=%s headless=%s",
                      self._proc.pid, headless)
+
+        # Chrome, on Windows, sometimes IPC-hands-off to an existing process
+        # and immediately exits. Poll briefly to detect this — if the launcher
+        # process is gone within 1s, the visible window didn't actually open.
+        for _i in range(5):
+            _time.sleep(0.2)
+            code = self._proc.poll()
+            if code is not None:
+                logger.error(
+                    "relaunch: launcher process exited immediately with code=%s — "
+                    "this usually means Chrome detected a singleton and handed off "
+                    "the URL to an existing (or dying) process. Profile: %s",
+                    code, self._profile_dir,
+                )
+                break
+        else:
+            logger.debug("relaunch: launcher process alive after 1s — new Chrome is up")
+
         self._notify_status()
 
         # Spawn a fresh worker. The old worker's thread object is discarded.

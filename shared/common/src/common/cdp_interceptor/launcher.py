@@ -162,6 +162,48 @@ def start_chrome(
     )
 
 
+def kill_chrome_by_profile(profile_dir: str) -> int:
+    """Windows-only. Find and force-kill every chrome.exe whose command line
+    references *profile_dir*. Returns the number of processes killed.
+
+    Rationale: ``taskkill /F /T /PID <main_pid>`` kills the browser's own
+    process tree, but Chrome sometimes leaves updater / crashpad / utility
+    processes running that aren't reachable from the main tree yet still
+    hold the profile's named mutex. If any of those survive a relaunch,
+    the next Chrome sees "existing browser detected" and IPC-hands-off
+    the URL (exit code 21) instead of opening a visible window.
+
+    No-op on non-Windows platforms.
+    """
+    if sys.platform != "win32":
+        return 0
+
+    # PowerShell reliably enumerates command lines; WMIC is deprecated as of
+    # Windows 11 24H2. `-Filter` narrows on process image at the CIM layer
+    # (fast); `-like` on command line is the slow bit but only runs on
+    # chrome.exe results.
+    escaped = profile_dir.replace("'", "''")
+    script = (
+        "$ErrorActionPreference='SilentlyContinue';"
+        "$procs = Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" |"
+        f" Where-Object {{ $_.CommandLine -like '*{escaped}*' }};"
+        "foreach ($p in $procs) { Stop-Process -Id $p.ProcessId -Force };"
+        "Write-Output $procs.Count"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            capture_output=True, text=True, timeout=10,
+        )
+        count_str = (result.stdout or "").strip().splitlines()[-1:] or ["0"]
+        killed = int(count_str[0]) if count_str[0].isdigit() else 0
+        logger.debug("kill_chrome_by_profile: killed=%d profile=%s", killed, profile_dir)
+        return killed
+    except Exception as exc:
+        logger.warning("kill_chrome_by_profile failed: %s", exc)
+        return 0
+
+
 def clear_singleton_locks(profile_dir: str) -> None:
     """Remove SingletonLock / SingletonCookie / SingletonSocket if present.
 

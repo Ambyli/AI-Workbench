@@ -1,12 +1,12 @@
 [project]
 name = "roofix-scraper"
 version = "0.1.0"
-description = "Playwright-based scraper for Roofix proposal pages"
+description = "Scraper for Roofix proposal pages — CDP-based via common.cdp_interceptor"
 requires-python = ">=3.11"
 dependencies = [
+    "common",
     "fastapi",
     "uvicorn",
-    "playwright",
     "pydantic",
-    "python-dotenv",
+    "python-multipart",  # UploadFile support in FastAPI
 ]

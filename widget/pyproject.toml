@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "System tray widget for monitoring Claude API usage"
 requires-python = ">=3.10"
 dependencies = [
+    "common",
     "litellm>=1.85.0",
     "Pillow>=12.2.0",
     "pystray>=0.19.5",
@@ -11,12 +12,10 @@ dependencies = [
     "selenium>=4.43.0",
     "trio>=0.33.0",
     "trio-websocket>=0.12.2",
-    "websocket-client>=1.9.0",
 ]
 
 [project.scripts]
 claude-usage-observer = "claude_observer.__main__:main"
-cdp-spy               = "cdp_interceptor.spy:main"
 
 [build-system]
 requires = ["setuptools>=68"]
@@ -24,7 +23,4 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["claude_observer*", "cdp_interceptor*"]
-
-[tool.setuptools.package-data]
-cdp_interceptor = ["interceptor.js"]
+include = ["claude_observer*"]

@@ -1,0 +1,10 @@
+[tool.uv.workspace]
+members = [
+    "shared/common",
+    "widget",
+    "ai/roofix/bridge",
+    "ai/roofix/scraper",
+]
+
+[tool.uv.sources]
+common = { workspace = true }

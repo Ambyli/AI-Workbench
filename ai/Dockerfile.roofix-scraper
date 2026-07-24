@@ -1,21 +1,36 @@
-FROM mcr.microsoft.com/playwright/python:v1.47.0-jammy
+# Build context is the REPO ROOT (see ai/docker-compose.roofix.yml: context: ..)
+# so we can copy the shared workspace package alongside the service.
+
+FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     UV_NO_CACHE=1 \
-    PYTHONPATH=/app
+    PYTHONPATH=/app/ai/roofix/scraper
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 WORKDIR /app
 
-COPY roofix/scraper/pyproject.toml .
-RUN uv sync --no-dev
+# Workspace bootstrap: root pyproject declares the members; shared/common
+# lands first so the scraper's `common` dep resolves via the workspace.
+COPY pyproject.toml .
+COPY shared/common ./shared/common
+COPY ai/roofix/scraper/pyproject.toml ./ai/roofix/scraper/
 
-COPY roofix/scraper/app.py .
-COPY roofix/scraper/scraper.py .
-COPY roofix/scraper/session.py .
+# Sync only the scraper's dep graph (transitively pulls common).
+RUN uv sync --package roofix-scraper --no-dev
 
+# Playwright ships a downloader for chromium. --with-deps installs the native
+# libraries chromium needs (libnss3, libatk1, etc.) inside the container so the
+# bundled binary can run headless.
+RUN uv run playwright install chromium --with-deps
+
+# Service code last so a code-only change doesn't invalidate the (slow) sync +
+# playwright layers.
+COPY ai/roofix/scraper/app.py ai/roofix/scraper/profile.py ./ai/roofix/scraper/
+
+WORKDIR /app/ai/roofix/scraper
 EXPOSE 8080
 
 CMD ["uv", "run", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"]

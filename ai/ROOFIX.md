@@ -5,7 +5,7 @@ A two-container subsystem that keeps [Phoenix](https://phoenix-mcp.com) in sync 
 | Container | Purpose |
 |---|---|
 | `roofix-bridge` | Background worker. Fetches Roofix email via Gmail MCP → parses → decides (rules-first, LiteLLM fallback) → writes to Phoenix MCP. Runs its own APScheduler. |
-| `roofix-scraper` | Playwright + Chromium. Fetches Roofix proposal pages on demand (Roofix has no public API). Owns the Roofix login session. |
+| `roofix-scraper` | CDP interceptor (`common.cdp_interceptor`) driving Chrome (Windows dev) or Playwright chromium (Linux Docker). Fetches Roofix proposal pages on demand (Roofix has no public API). Owns the Roofix login session as a `--user-data-dir` profile. |
 
 Both are internal-only — no host ports published by default. The bridge depends on the scraper for hydrating thin `Estimate` / `Estimate Complete` events.
 
@@ -32,8 +32,8 @@ Default `DRY_RUN=true` — the bridge fetches, parses, decides, and logs, but do
 | Endpoint | Purpose |
 |---|---|
 | `GET /health` | Container healthcheck. |
-| `GET /session` | Status of the persisted Roofix session file (present? size?). |
-| `POST /session/refresh` | Accept a Playwright `storage_state` JSON body and persist it to the volume. |
+| `GET /profile` | Status of the persisted Chrome/Chromium profile dir (present? size?). |
+| `POST /profile/refresh` | Multipart upload of a `.tgz` archive of a `--user-data-dir` profile. Unpacks into the volume, replacing the existing profile. |
 | `GET /proposal/{project_id}?tracking_url=...` | Scrape a proposal. Optional `tracking_url` (from the notification email) is used instead of building `roofix.io/project/{id}` — useful when only the tokenized email link is available. |
 
 Reach them from another container on `ai_shared`:
@@ -93,27 +93,36 @@ Ambiguous or thin `Estimate` / `Estimate Complete` events cause the bridge to ca
 | `GMAIL_MCP_TOOL_GET` | `get_message` | Gmail MCP message fetch tool. |
 | `GMAIL_MCP_TOOL_UNLABEL` | `unlabel_message` | Gmail MCP label-remove tool (used to mark-as-read). |
 | `ROOFIX_SCRAPER_URL` | `http://roofix-scraper:8080` | Sibling scraper service. |
-| `ROOFIX_SESSION_PATH` | `/data/roofix_session.json` | Scraper's persisted Playwright storage_state. |
+| `ROOFIX_PROFILE_DIR` | `/data/roofix_profile` | Scraper's `--user-data-dir` (cookies, localStorage, login). |
 | `ROOFIX_HEADLESS` | `true` | Scraper's Chromium mode. Set `false` for local `uv run` sessions to watch the browser scrape in real time. |
+| `ROOFIX_CAPTURE_WINDOW_SECONDS` | `20` | How long each `/proposal/...` call keeps Chrome alive collecting captures before quitting. |
+| `ROOFIX_DEBUG_PORT` | `9223` | CDP remote-debugging port the scraper's Chrome uses. Change if 9223 clashes with something else. |
 | `FIELD_MAPPING_PATH` | `/app/config/field_mapping.json` | Roofix-event → Phoenix (block_name, status_id) map. |
 | `LOG_DIR` | `/data` | Where the per-tick CSV log lives (mounted volume). |
 
-### Session cookies (scraper)
+### Session profile (scraper)
 
-Roofix logins can't happen inside a headless container — no browser UI to complete the flow. Refresh is a two-step operator action:
+The scraper uses `common.cdp_interceptor`'s `--user-data-dir` model — a directory that holds cookies, localStorage, and the "you're logged in" state. Roofix logins can't happen inside a headless container (no browser UI), so a profile is captured *on a laptop* first and shipped into the container.
 
-1. **On your laptop**, run [`save_roofix_session.py`](../../rufix-phoenix-bridge/save_roofix_session.py) from the source repo. A visible Chromium opens, you log into Roofix (including 2FA), then press Enter. It writes `roofix_session.json`.
-2. **POST it to the scraper:**
+1. **On your laptop**, run the `cdp-spy` CLI (installed by the `common` workspace package). A visible Chromium opens; log into Roofix (including 2FA); Ctrl-C to stop.
 
-   ```bash
-   curl -X POST http://<host>:<published-port>/session/refresh \
-     -H "Content-Type: application/json" \
-     -d @roofix_session.json
+   ```powershell
+   cd shared\common
+   uv run cdp-spy --url https://roofix.io --profile-dir "$env:TEMP\roofix_profile"
    ```
 
-   The file is persisted to the `roofix_scraper_data` volume so subsequent restarts reuse it.
+2. **Tar the profile dir and POST it to the scraper.**
 
-Tracking URLs from Roofix notification emails redirect to the proposal without login, so many `/proposal/...` calls succeed without a session — but a session is preferred and required for the direct `roofix.io/project/{id}` path.
+   ```powershell
+   tar czf roofix_profile.tgz -C "$env:TEMP\roofix_profile" .
+
+   curl.exe -X POST "http://<host>:<published-port>/profile/refresh" `
+     -F "archive=@roofix_profile.tgz"
+   ```
+
+   The profile is unpacked into `$ROOFIX_PROFILE_DIR` on the mounted `roofix_scraper_data` volume, replacing anything already there. Subsequent restarts reuse it.
+
+Tracking URLs from Roofix notification emails redirect to the proposal without login, so many `/proposal/...` calls succeed without a profile — but a profile is preferred and required for the direct `roofix.io/project/{id}` path.
 
 ### Verifying it works
 
@@ -190,9 +199,8 @@ ai/
         test_brain.py                 offline brain/rules suite
     scraper/
       pyproject.toml
-      app.py                          FastAPI endpoints
-      scraper.py                      Playwright fetch + response merging
-      session.py                      storage_state load / save
+      app.py                          FastAPI endpoints; wraps common.cdp_interceptor
+      profile.py                      --user-data-dir persistence + .tgz upload
 ```
 
 ### Known limitations / TODOs

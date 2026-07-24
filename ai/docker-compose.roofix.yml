@@ -8,12 +8,12 @@ services:
     networks:
       - shared
     build:
-      context: .
-      dockerfile: Dockerfile.roofix-scraper
+      context: ..
+      dockerfile: ai/Dockerfile.roofix-scraper
     container_name: roofix-scraper
     restart: unless-stopped
     environment:
-      - ROOFIX_SESSION_PATH=/data/roofix_session.json
+      - ROOFIX_PROFILE_DIR=/data/roofix_profile
       - ROOFIX_HEADLESS=${ROOFIX_HEADLESS:-true}
     volumes:
       - roofix_scraper_data:/data
@@ -28,8 +28,8 @@ services:
     networks:
       - shared
     build:
-      context: .
-      dockerfile: Dockerfile.roofix-bridge
+      context: ..
+      dockerfile: ai/Dockerfile.roofix-bridge
     container_name: roofix-bridge
     restart: unless-stopped
     environment:

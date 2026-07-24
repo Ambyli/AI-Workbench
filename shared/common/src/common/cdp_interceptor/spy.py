@@ -19,8 +19,8 @@ import os
 import sys
 import threading
 
-from cdp_interceptor.cdp_session import Capture
-from cdp_interceptor.client import InterceptorClient
+from .cdp_session import Capture
+from .client import InterceptorClient
 
 
 def main() -> int:

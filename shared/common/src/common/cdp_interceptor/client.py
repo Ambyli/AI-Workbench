@@ -15,14 +15,14 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-from cdp_interceptor.cdp_session import Capture, run_session
-from cdp_interceptor.launcher import (
-    ChromeNotFoundError,
+from .cdp_session import Capture, run_session
+from .launcher import (
+    BrowserNotFoundError,
     clear_singleton_locks,
-    find_chrome,
-    start_chrome,
+    find_browser,
+    start_browser,
 )
-from cdp_interceptor.sentinel import (
+from .sentinel import (
     clear_session,
     mark_session_ok,
     session_exists,
@@ -137,24 +137,28 @@ class InterceptorClient:
             logger.warning("InterceptorClient.launch: already running — ignoring")
             return
 
-        # Locate the Chrome executable. `chrome_path` overrides `find_chrome()`
-        # if the caller supplied one; otherwise search default install paths.
-        chrome = self._chrome_path or find_chrome()
-        if chrome is None:
+        # Locate the browser executable. `chrome_path` overrides `find_browser()`
+        # if the caller supplied one; otherwise Windows finds installed Chrome
+        # and Linux/mac finds Playwright's bundled chromium.
+        browser = self._chrome_path or find_browser()
+        if browser is None:
             with self._lock:
                 self._status = "error"
-                self._error = "Chrome not found — install Google Chrome"
+                self._error = (
+                    "No browser found — install Google Chrome (Windows) or "
+                    "run `playwright install chromium` (Linux/mac)"
+                )
             self._notify_status()
-            raise ChromeNotFoundError("No Chrome executable found")
+            raise BrowserNotFoundError("No browser executable found")
 
         # Ensure the profile dir exists and clear any stale singleton locks
         # left over from a prior Chrome crash (see launcher.clear_singleton_locks).
         os.makedirs(self._profile_dir, exist_ok=True)
         clear_singleton_locks(self._profile_dir)
 
-        # Remember the resolved Chrome path and target URL so relaunch/reload
+        # Remember the resolved browser path and target URL so relaunch/reload
         # paths can reuse them without the caller re-supplying.
-        self._chrome_path = chrome
+        self._chrome_path = browser
         self._target_url = target_url
 
         # Reset the shutdown/reload signals from any prior run of this client.
@@ -172,8 +176,8 @@ class InterceptorClient:
 
         # Fork Chrome. Popen returns immediately; Chrome takes ~1-3s to
         # start the debug server, which the worker thread handles by polling.
-        self._proc = start_chrome(
-            chrome,
+        self._proc = start_browser(
+            browser,
             headless=headless,
             debug_port=self._debug_port,
             profile_dir=self._profile_dir,
@@ -293,6 +297,15 @@ class InterceptorClient:
         self._stop_event.clear()
         self._reload_event.clear()
 
+        # Clear the singleton locks left behind by the just-killed Chrome.
+        # Without this, the new browser sees SingletonLock/Cookie/Socket in
+        # the user-data-dir, believes another Chrome is still using this
+        # profile, and hands off the URL via IPC instead of opening a new
+        # window. The IPC target (the dead headless Chrome) can't display
+        # it, so the visible window never appears. `launch()` does the same
+        # thing for the same reason.
+        clear_singleton_locks(self._profile_dir)
+
         # Update our state to reflect the new mode BEFORE spawning so any
         # get_state() call in between sees consistent data.
         with self._lock:
@@ -300,7 +313,7 @@ class InterceptorClient:
             self._status = "loading"
 
         # Launch Chrome again with the new headless flag.
-        self._proc = start_chrome(
+        self._proc = start_browser(
             self._chrome_path,
             headless=headless,
             debug_port=self._debug_port,
@@ -453,7 +466,7 @@ class InterceptorClient:
                         self._status = "waiting_login"
                     # Launch a fresh visible Chrome. The next loop iteration
                     # will connect to it and wait for the user to complete login.
-                    self._proc = start_chrome(
+                    self._proc = start_browser(
                         self._chrome_path,
                         headless=False,
                         debug_port=self._debug_port,

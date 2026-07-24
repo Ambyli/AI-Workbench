@@ -1,0 +1,27 @@
+[project]
+name = "common"
+version = "0.1.0"
+description = "Shared Python utilities for Zeo services (CDP scraping, env loading, logging)"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.33",
+    "websocket-client>=1.9",
+    "playwright>=1.47",
+    "python-dotenv>=1.0",
+]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[project.scripts]
+cdp-spy = "common.cdp_interceptor.spy:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"common.cdp_interceptor" = ["interceptor.js"]

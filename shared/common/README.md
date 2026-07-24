@@ -6,7 +6,7 @@ Shared Python utilities for Zeo services. Consumed via uv workspace by every Pyt
 
 | Module | Purpose |
 |---|---|
-| `common.cdp_interceptor` | Site-agnostic Chrome DevTools Protocol interceptor. Launches Chrome (Windows) or Playwright chromium (Linux/mac), injects a fetch/XHR interceptor, streams captured JSON response bodies to callbacks. See [cdp_interceptor/README.md](src/common/cdp_interceptor/) or the widget's original `USAGE_INTERCEPTOR.md` for the public API. |
+| `common.cdp_interceptor` | Site-agnostic Chrome DevTools Protocol interceptor. Launches Chrome (Windows) or Playwright chromium (Linux/mac), injects a fetch/XHR interceptor, streams captured JSON response bodies to callbacks. See **[src/common/cdp_interceptor/README.md](src/common/cdp_interceptor/README.md)** for CLI usage, Python API, and profile management. |
 | `common.env` | `load_env()` — walk-up `.env` loader. |
 | `common.logging_setup` | `setup_logging(name, log_dir, debug)` — file + console handlers with sensible defaults. |
 

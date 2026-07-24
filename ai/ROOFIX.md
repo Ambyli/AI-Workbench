@@ -102,27 +102,58 @@ Ambiguous or thin `Estimate` / `Estimate Complete` events cause the bridge to ca
 
 ### Session profile (scraper)
 
-The scraper uses `common.cdp_interceptor`'s `--user-data-dir` model — a directory that holds cookies, localStorage, and the "you're logged in" state. Roofix logins can't happen inside a headless container (no browser UI), so a profile is captured *on a laptop* first and shipped into the container.
+The scraper uses `common.cdp_interceptor`'s `--user-data-dir` model — a directory that holds cookies, localStorage, and the "you're logged in" state. Any tool taking `--profile-dir` or `ROOFIX_PROFILE_DIR` points at one of these dirs; same dir + valid cookies = the browser skips the login page.
 
-1. **On your laptop**, run the `cdp-spy` CLI (installed by the `common` workspace package). A visible Chromium opens; log into Roofix (including 2FA); Ctrl-C to stop.
+For the mechanics of *creating* a profile (running `cdp-spy` against a login URL, interactive login, sharing profiles across machines, cross-machine caveats), see **[common/cdp_interceptor/README.md § Profile management](../shared/common/src/common/cdp_interceptor/README.md#profile-management)**. That's the canonical doc; the sections below cover only the Roofix-scraper-specific wiring.
 
-   ```powershell
-   cd shared\common
-   uv run cdp-spy --url https://roofix.io --profile-dir "$env:TEMP\roofix_profile"
-   ```
+#### Local dev flow (`uv run` on your machine)
 
-2. **Tar the profile dir and POST it to the scraper.**
+Once you've captured a Roofix profile (per the cdp_interceptor README), point the scraper at it:
 
-   ```powershell
-   tar czf roofix_profile.tgz -C "$env:TEMP\roofix_profile" .
+```powershell
+# Capture the login once — see cdp_interceptor's Profile management for the details
+uv run cdp-spy --url https://roofix.io --profile-dir "C:\Users\<you>\.zeo\roofix_profile"
 
-   curl.exe -X POST "http://<host>:<published-port>/profile/refresh" `
-     -F "archive=@roofix_profile.tgz"
-   ```
+# Point the scraper at that same path (typically already set in .env)
+$env:ROOFIX_PROFILE_DIR = "C:\Users\<you>\.zeo\roofix_profile"
 
-   The profile is unpacked into `$ROOFIX_PROFILE_DIR` on the mounted `roofix_scraper_data` volume, replacing anything already there. Subsequent restarts reuse it.
+cd ai\roofix\scraper
+uv run uvicorn app:app --port 8080
+```
 
-Tracking URLs from Roofix notification emails redirect to the proposal without login, so many `/proposal/...` calls succeed without a profile — but a profile is preferred and required for the direct `roofix.io/project/{id}` path.
+Every `/proposal/{id}` call reuses the profile — no login prompt until the session expires.
+
+#### Docker flow
+
+The container can't present a login UI, so the flow is capture-locally + upload:
+
+```powershell
+# 1. Capture on your laptop (see cdp_interceptor's Profile management).
+# 2. Tar the profile dir.
+tar czf roofix_profile.tgz -C "C:\Users\<you>\.zeo\roofix_profile" .
+
+# 3. Ship it to the scraper's /profile/refresh endpoint.
+curl.exe -X POST "http://<host>:<published-port>/profile/refresh" `
+  -F "archive=@roofix_profile.tgz"
+```
+
+The scraper unpacks into `$ROOFIX_PROFILE_DIR` (default `/data/roofix_profile`) on the mounted `roofix_scraper_data` Docker volume. **Persistence semantics:** survives `docker compose down`, container restarts, image rebuilds. **Destroyed by:** `docker compose down -v` or `make very-clean-roofix CONFIRM=yes` (both remove the volume).
+
+Tracking URLs from Roofix notification emails redirect to the proposal without login, so many `/proposal/...` calls succeed even without a profile — but a profile is required for the direct `roofix.io/project/{id}` path.
+
+#### When to re-capture
+
+Sessions survive **days to weeks** in practice. You only need a fresh capture when:
+
+1. **First time ever** — no profile exists yet.
+2. **Roofix expired the session** — you'll see `login_wall: true` in the `/proposal/...` response and `landed_url` will contain `/login` or similar. That's the signal.
+3. **You wiped the profile** — deleted the local dir, or `docker compose down -v` removed the volume.
+
+#### Scraper-specific gotchas
+
+- **Concurrent `/proposal` calls collide on the profile dir.** Each request launches a Chrome process against the same `--user-data-dir`, and only one browser can hold the profile at a time. Today this is serialized by the 20-second capture window per request (`ROOFIX_CAPTURE_WINDOW_SECONDS`) — requests naturally queue at HTTP level. If you ever front the scraper with a queue that fans out, add a mutex around `client.launch(...)` in `app.py`, or run separate profile dirs per worker. See [cdp_interceptor § Concurrent access](../shared/common/src/common/cdp_interceptor/README.md#concurrent-access).
+- **`session_sentinel=False`** in `app.py:99`. The scraper opts out of `cdp_interceptor`'s auto-headless-after-first-login toggle: it always launches in the mode dictated by `ROOFIX_HEADLESS`, regardless of whether a login has been captured. Flip to `True` if you want the auto-behavior (visible on first run, headless thereafter).
+- **Cross-machine password caveat.** Cookies in a shipped profile work fine on Linux Docker. Chrome's saved-password blob (`Login Data`) is encrypted with a machine-bound key and won't decrypt inside the container — so don't rely on "the container will auto-fill and log in" if the session ever fully expires. The container reuses cookies only; if they die, you re-capture on your laptop and re-upload.
 
 ### Verifying it works
 

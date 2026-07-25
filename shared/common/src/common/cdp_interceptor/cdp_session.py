@@ -273,10 +273,16 @@ def run_session(
 
         # Decide navigate vs reload. If we're already at the target URL,
         # reload is faster and preserves any SPA state. Otherwise navigate.
+        #
+        # `ignoreCache=True` forces the browser to refetch from the network
+        # instead of serving from the HTTP cache. Without this, page-init
+        # XHRs whose responses were already cached from the initial argv-
+        # driven load never get refetched on the reload — and the interceptor
+        # never sees them. Bubble.io's /api/1.1/init/data is a live example.
         href = eval_str("location.href")
         if nav_url and nav_url in href:
-            logger.debug("cdp_session: already at target, reloading")
-            rpc("Page.reload", {})
+            logger.debug("cdp_session: already at target, reloading (ignoreCache)")
+            rpc("Page.reload", {"ignoreCache": True})
         else:
             logger.debug("cdp_session: navigating to %s", nav_url)
             rpc("Page.navigate", {"url": nav_url})

@@ -17,25 +17,47 @@ event mid-flight.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 from collections import Counter
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import FastAPI
 from pydantic import BaseModel
 
+from common.env import load_env
+from common.logging_setup import CsvLogger, setup_logging
+
+load_env()
+
 from components.gmail_client import GmailMcpClient
-from components.logger import Logger
-from components.orchestrator import process_batch
+from components.orchestrator import LOG_COLUMNS, process_batch
 from components.phoenix_mcp_client import PhoenixMcpClient
 
 
 TICK_INTERVAL_SECONDS = int(os.getenv("TICK_INTERVAL_SECONDS", "300"))
 FIELD_MAPPING_PATH = os.getenv("FIELD_MAPPING_PATH",
                                "/app/config/field_mapping.json")
+LOG_DIR = os.getenv("LOG_DIR", "/data")
+DEBUG_LOGGING = os.getenv("DEBUG_LOGGING", "false").lower() == "true"
+
+# Stdlib logging is what httpx / openai / apscheduler noise flows through,
+# plus the compact one-line echo CsvLogger emits per audit row.
+setup_logging("roofix-bridge", log_dir=LOG_DIR, debug=DEBUG_LOGGING)
+_stdlib_logger = logging.getLogger("roofix-bridge")
+
+# Single CSV audit logger reused across ticks. Schema declared by orchestrator
+# (it's the one writing to it); we pass the same list back in so app + module
+# stay in agreement.
+_audit_log = CsvLogger(
+    path=Path(LOG_DIR) / "agent_log.csv",
+    columns=LOG_COLUMNS,
+    logger=_stdlib_logger,
+)
 
 _STATE_LOCK = threading.Lock()
 _STATE: dict = {
@@ -69,16 +91,15 @@ def _load_milestone_map() -> dict:
 
 def _run_one_batch(raw_emails: Optional[list] = None) -> dict:
     """Run one processing batch. If raw_emails is None, pull from Gmail MCP."""
-    log = Logger()
     milestone_map = _load_milestone_map()
 
     with PhoenixMcpClient() as phoenix, GmailMcpClient() as gmail:
         if raw_emails is None:
             raw_emails = gmail.fetch()
-            log.log("listener", "fetch", True, f"{len(raw_emails)} email(s)")
+            _audit_log.log("listener", "fetch", True, f"{len(raw_emails)} email(s)")
 
         decisions = process_batch(
-            raw_emails, phoenix=phoenix, log=log, milestone_map=milestone_map)
+            raw_emails, phoenix=phoenix, log=_audit_log, milestone_map=milestone_map)
 
     _record_tick(decisions, error=None)
     return {"decisions": decisions, "count": len(decisions)}

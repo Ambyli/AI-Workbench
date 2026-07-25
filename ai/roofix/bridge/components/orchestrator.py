@@ -16,13 +16,25 @@ can be tested with sample emails now and wired to the Gmail MCP on the server.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Callable, Optional
+
+from common.logging_setup import CsvLogger
 
 from components.parser import parse_email
 from components.brain import decide
-from components.logger import Logger
 
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
+
+# CSV audit schema — positional-arg order matches every call site's usage.
+# `timestamp` is auto-prepended by CsvLogger; don't include it here.
+LOG_COLUMNS = ["stage", "action", "ok", "detail", "event_type", "project_ref"]
+
+
+def _default_log() -> CsvLogger:
+    """Fallback CsvLogger for callers (e.g. tests) that don't inject one."""
+    log_dir = os.getenv("LOG_DIR", "/data")
+    return CsvLogger(path=Path(log_dir) / "agent_log.csv", columns=LOG_COLUMNS)
 
 
 def _identity_key(ev: dict) -> str:
@@ -57,7 +69,7 @@ def _resolve_context(ev: dict, phoenix) -> dict:
     return {"found": False, "ambiguous": False}
 
 
-def _execute(decision: dict, ev: dict, phoenix, log: Logger,
+def _execute(decision: dict, ev: dict, phoenix, log: CsvLogger,
              milestone_map: Optional[dict]) -> None:
     action = decision["action"]
     etype = ev.get("event_type", "")
@@ -105,9 +117,9 @@ def _execute(decision: dict, ev: dict, phoenix, log: Logger,
             event_type=etype, project_ref=pref)
 
 
-def process_batch(raw_emails: list, phoenix=None, log: Optional[Logger] = None,
+def process_batch(raw_emails: list, phoenix=None, log: Optional[CsvLogger] = None,
                   milestone_map: Optional[dict] = None) -> list:
-    log = log or Logger()
+    log = log or _default_log()
     decisions = []
 
     parsed = [parse_email(e).as_dict() for e in raw_emails]
@@ -135,9 +147,9 @@ def process_batch(raw_emails: list, phoenix=None, log: Optional[Logger] = None,
 
 
 def run(listener: Callable[[], list], phoenix=None, milestone_map=None,
-        log: Optional[Logger] = None) -> list:
+        log: Optional[CsvLogger] = None) -> list:
     """Production entry: pull a batch from the listener and process it once."""
-    log = log or Logger()
+    log = log or _default_log()
     raw = listener()
     log.log("listener", "fetch", True, f"{len(raw)} email(s)")
     return process_batch(raw, phoenix=phoenix, log=log, milestone_map=milestone_map)

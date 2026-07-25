@@ -96,9 +96,11 @@ Ambiguous or thin `Estimate` / `Estimate Complete` events cause the bridge to ca
 | `ROOFIX_PROFILE_DIR` | `/data/roofix_profile` | Scraper's `--user-data-dir` (cookies, localStorage, login). |
 | `ROOFIX_HEADLESS` | `true` | Scraper's Chromium mode. Set `false` for local `uv run` sessions to watch the browser scrape in real time. |
 | `ROOFIX_CAPTURE_WINDOW_SECONDS` | `20` | How long each `/proposal/...` call keeps Chrome alive collecting captures before quitting. |
+| `ROOFIX_INIT_DATA_URL_PATTERN` | `roofix\.io/api/1\.1/init/data` | Regex the scraper matches captured XHR URLs against to identify the Bubble.io endpoint that carries the full proposal blob. Override if Bubble ever renames the endpoint. |
 | `ROOFIX_DEBUG_PORT` | `9223` | CDP remote-debugging port the scraper's Chrome uses. Change if 9223 clashes with something else. |
 | `FIELD_MAPPING_PATH` | `/app/config/field_mapping.json` | Roofix-event → Phoenix (block_name, status_id) map. |
-| `LOG_DIR` | `/data` | Where the per-tick CSV log lives (mounted volume). |
+| `LOG_DIR` | `/data` | Where per-tick logs live (mounted volume). Two files: `roofix-bridge.log` (stdlib text log; framework messages + compact per-decision echo) and `agent_log.csv` (structured audit trail via `common.logging_setup.CsvLogger`). |
+| `DEBUG_LOGGING` | `false` | When true, promotes the stdlib file log to DEBUG level and the console to DEBUG. |
 
 ### Session profile (scraper)
 
@@ -217,7 +219,6 @@ ai/
         parser.py                     email → normalized event (Contract B)
         brain.py                      rules-first decision + LiteLLM fallback
         orchestrator.py               parse → resolve → decide → execute
-        logger.py                     CSV log to LOG_DIR
         gmail_client.py               Gmail MCP HTTP client
         phoenix_mcp_client.py         Phoenix MCP HTTP client (reads + planned writes)
         roofix_scraper_client.py      Sibling scraper HTTP client

@@ -103,15 +103,21 @@ def start_browser(
     headless: bool,
     debug_port: int,
     profile_dir: str,
-    target_url: str,
+    target_url: str = "about:blank",
 ) -> subprocess.Popen:
-    """Launch a Chromium-family browser with remote debugging enabled and
-    load *target_url* in a new window. Uses an isolated ``--user-data-dir``
-    so this is a distinct process from any regular Chrome the user has open.
+    """Launch a Chromium-family browser with remote debugging enabled.
 
-    Chrome and Chromium accept the same flags — the same argv works whether
-    ``browser_path`` points at a Chrome install (Windows) or Playwright's
-    chromium binary (Linux/mac).
+    Defaults ``target_url`` to ``about:blank`` — callers that want the
+    interceptor script guaranteed to run before any page JS fires should
+    keep the default and use CDP ``Page.navigate`` to load the real target
+    AFTER registering the interceptor. Passing a target URL directly here
+    causes Chrome to load it before the CDP connection is even established,
+    which loses very early XHRs (e.g. Bubble.io's ``/api/1.1/init/data``).
+
+    Uses an isolated ``--user-data-dir`` so this is a distinct process from
+    any regular Chrome the user has open. Chrome and Chromium accept the
+    same flags — the same argv works whether ``browser_path`` points at a
+    Chrome install (Windows) or Playwright's chromium binary (Linux/mac).
     """
     args = [
         browser_path,
@@ -150,7 +156,7 @@ def start_chrome(
     headless: bool,
     debug_port: int,
     profile_dir: str,
-    target_url: str,
+    target_url: str = "about:blank",
 ) -> subprocess.Popen:
     """Backwards-compat alias for ``start_browser``. Windows-focused name."""
     return start_browser(

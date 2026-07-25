@@ -25,9 +25,15 @@ logger = logging.getLogger("cdp_interceptor")
 
 @dataclass
 class Capture:
-    """A single JSON response body captured by the interceptor."""
+    """A single JSON response body captured by the interceptor.
+
+    ``body`` is typed as ``Any`` because JSON can be any of dict, list,
+    string, number, bool, or null. Callers should type-check before assuming
+    a shape — many APIs return top-level arrays (e.g. Bubble.io's init/data
+    returns a 2-element array, not an object).
+    """
     url: str
-    body: dict
+    body: Any
 
 
 def run_session(
@@ -247,9 +253,10 @@ def run_session(
         for item in captured:
             url = item.get("url", "")
             body = item.get("body")
-            # Non-JSON bodies get skipped early; the interceptor only pushes
-            # JSON but the type check guards against corrupt/edge entries.
-            if not isinstance(body, dict):
+            # Skip only when body is missing entirely. Non-dict JSON values
+            # (arrays, strings, numbers) still fire on_capture inside
+            # _process_capture — the caller may want to see them.
+            if body is None:
                 continue
             parsed = _process_capture(Capture(url=url, body=body))
             if parsed:
@@ -445,7 +452,7 @@ def run_session(
             for item in captured[_last_captured_idx:]:
                 url = item.get("url", "")
                 body = item.get("body")
-                if not isinstance(body, dict):
+                if body is None:
                     continue
                 parsed = _process_capture(Capture(url=url, body=body))
                 if parsed and on_data:
@@ -520,7 +527,7 @@ def run_session(
                     payload = _json.loads(msg["params"].get("payload", "{}"))
                     url = payload.get("url", "")
                     body = payload.get("body")
-                    if isinstance(body, dict):
+                    if body is not None:
                         parsed = _process_capture(Capture(url=url, body=body))
                         if parsed and on_data:
                             logger.debug("cdp_session: live update via binding")

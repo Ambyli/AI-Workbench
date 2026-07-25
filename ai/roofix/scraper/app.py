@@ -116,10 +116,17 @@ def proposal(
         URL, whereas on_data only receives the body)."""
         with lock:
             captured_urls.append(cap.url)
-            if _INIT_DATA_RE.search(cap.url) and isinstance(cap.body, dict):
+            if _INIT_DATA_RE.search(cap.url) and cap.body is not None:
                 init_data_bodies.append(cap.body)
-                _log(f"init/data captured  {cap.url[:110]}  "
-                     f"({len(cap.body)} top-level keys)")
+                # Bubble.io's init/data returns a JSON array, not an object.
+                # Log the shape hint so we can eyeball what's in it.
+                if isinstance(cap.body, list):
+                    shape = f"list len={len(cap.body)}"
+                elif isinstance(cap.body, dict):
+                    shape = f"dict keys={len(cap.body)}"
+                else:
+                    shape = f"{type(cap.body).__name__}"
+                _log(f"init/data captured  {cap.url[:110]}  ({shape})")
             else:
                 _log(f"seen (discarded)  {cap.url[:110]}")
 
@@ -138,6 +145,7 @@ def proposal(
         session_sentinel=False,   # scraper doesn't auto-recover — operator uploads profiles
         login_timeout=CAPTURE_WINDOW_SECONDS,
         capture_timeout=CAPTURE_WINDOW_SECONDS,
+        debug_logging=True,       # print [interceptor] traces to browser DevTools console
     )
 
     try:

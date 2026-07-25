@@ -178,14 +178,18 @@ class InterceptorClient:
         with self._lock:
             self._headless = headless
 
-        # Fork Chrome. Popen returns immediately; Chrome takes ~1-3s to
-        # start the debug server, which the worker thread handles by polling.
+        # Fork Chrome pointed at about:blank — the CDP session will navigate
+        # to the real target after registering the interceptor script. This
+        # avoids a race where target-page inline JS (e.g. Bubble.io's
+        # ``initialize_data``) fires before the CDP connection is even open.
+        # Popen returns immediately; Chrome takes ~1-3s to start the debug
+        # server, which the worker thread handles by polling.
         self._proc = start_browser(
             browser,
             headless=headless,
             debug_port=self._debug_port,
             profile_dir=self._profile_dir,
-            target_url=target_url,
+            target_url="about:blank",
         )
         logger.debug("InterceptorClient.launch: Chrome started (pid=%s)", self._proc.pid)
 
@@ -381,13 +385,15 @@ class InterceptorClient:
             self._headless = headless
             self._status = "loading"
 
-        # Launch Chrome again with the new headless flag.
+        # Launch Chrome again with the new headless flag. Same about:blank
+        # pattern as .launch() — cdp_session navigates to self._target_url
+        # after registering the interceptor.
         self._proc = start_browser(
             self._chrome_path,
             headless=headless,
             debug_port=self._debug_port,
             profile_dir=self._profile_dir,
-            target_url=self._target_url,
+            target_url="about:blank",
         )
         logger.debug("relaunch: start_browser returned pid=%s headless=%s",
                      self._proc.pid, headless)

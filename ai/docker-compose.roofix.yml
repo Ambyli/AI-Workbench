@@ -41,16 +41,25 @@ services:
       - BRAIN_MODEL=${BRAIN_MODEL:-qwen3.6}
       - ROOFIX_SENDER=${ROOFIX_SENDER:-no-reply@roofix.io}
       - LISTENER_QUERY=${LISTENER_QUERY:-}
-      - GMAIL_MCP_URL=${GMAIL_MCP_URL}
-      - GMAIL_MCP_AUTH_VALUE=${GMAIL_MCP_AUTH_VALUE}
-      - PHOENIX_MCP_URL=${DEFAULT_LITELLM_MCP_PHOENIX_URL}
-      - PHOENIX_MCP_AUTH_VALUE=${DEFAULT_LITELLM_MCP_PHOENIX_AUTH_VALUE}
+      # Gmail OAuth — credentials.json + token.json live on a mounted config volume.
+      - GMAIL_CREDENTIALS_PATH=/config/credentials.json
+      - GMAIL_TOKEN_PATH=/config/token.json
+      # Phoenix DB — direct psycopg2 access (Phoenix MCP writes not ready yet).
+      - PHOENIX_DB_HOST=${PHOENIX_DB_HOST}
+      - PHOENIX_DB_PORT=${PHOENIX_DB_PORT:-5432}
+      - PHOENIX_DB_NAME=${PHOENIX_DB_NAME}
+      - PHOENIX_DB_USER=${PHOENIX_DB_USER}
+      - PHOENIX_DB_PASSWORD=${PHOENIX_DB_PASSWORD}
+      - PHOENIX_DB_SSLMODE=${PHOENIX_DB_SSLMODE:-require}
       - PHOENIX_AGENT_USER_ID=${PHOENIX_AGENT_USER_ID}
       - PHOENIX_ROOFIX_ID_COLUMN=${PHOENIX_ROOFIX_ID_COLUMN:-migration_external_id}
       - ROOFIX_SCRAPER_URL=http://roofix-scraper:8080
       - LOG_DIR=/data
     volumes:
       - roofix_bridge_data:/data
+      # Read-only mount for OAuth secrets — bind to a host dir you control.
+      # Populate it once with credentials.json + token.json before first run.
+      - ${ROOFIX_BRIDGE_CONFIG_DIR:-./roofix/bridge/config}:/config:ro
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
       interval: 30s

@@ -1,52 +1,88 @@
 """
-GMAIL CLIENT — thin wrapper over the Gmail MCP HTTP endpoint.
+GMAIL CLIENT — direct Gmail API listener via google-auth-oauthlib.
 
-Replaces the old google-auth-oauthlib-based `listener.py`. Same output shape
-(Contract A) so parser + orchestrator are unaffected.
+Reverted from the Gmail MCP variant because the MCP isn't ready in time. When
+a Gmail MCP is available, we can swap back — the Contract A output shape is
+unchanged so the parser/orchestrator don't care which backend delivered the
+mail.
 
-Reads:
-    GMAIL_MCP_URL           MCP endpoint (JSON-RPC 2.0 over HTTP)
-    GMAIL_MCP_AUTH_VALUE    bearer token
-    ROOFIX_SENDER           default "no-reply@roofix.io" (two o's)
-    LISTENER_QUERY          Gmail search query (default "is:unread from:<sender>")
+Produces, per unread Roofix email, the raw shape the parser expects:
+    {
+      "sender": str,        # e.g. "RFX | New Comment <no-reply@roofix.io>"
+      "subject": str,
+      "body_text": str,
+      "body_html": str | None,
+      "timestamp": str,     # ISO
+      "to": [str],
+      "message_id": str,    # Gmail message id (for mark-as-read)
+      "attachments": [{"filename": str, "mime_type": str}],
+    }
 
-Assumed Gmail MCP tool names (configurable via env):
-    GMAIL_MCP_TOOL_SEARCH   default "search_threads"
-    GMAIL_MCP_TOOL_GET      default "get_message"
-    GMAIL_MCP_TOOL_UNLABEL  default "unlabel_message"
+Auth: OAuth 2.0. credentials.json + token.json live in a mounted config/
+volume (git-ignored). credentials.json is the client secrets you download
+from GCP; token.json is the refresh token written on first successful login.
 
-The Contract A shape emitted per unread Roofix email:
-    {sender, subject, body_text, body_html, timestamp, to,
-     message_id, attachments: [{filename, mime_type}]}
+First-time login is INTERACTIVE — run the listener once with a browser
+available, complete the OAuth flow, then ship the resulting token.json into
+the container (or mount the same config path).
 """
 
 from __future__ import annotations
 
-import json
+# Load .env before the module-level env reads below, so this file works both
+# when imported by app.py (which also loads .env) and when run directly as
+# __main__ for the smoke test. load_env is idempotent — safe to call twice.
+from common.env import load_env
+
+load_env()
+
+import base64
 import os
-import uuid
-from typing import Optional
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
-import httpx
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
 
+
+SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
 
 ROOFIX_SENDER = os.getenv("ROOFIX_SENDER", "no-reply@roofix.io")
-LISTENER_QUERY = os.getenv("LISTENER_QUERY", f"is:unread from:{ROOFIX_SENDER}")
+CREDENTIALS_PATH = os.getenv("GMAIL_CREDENTIALS_PATH", "config/credentials.json")
+TOKEN_PATH = os.getenv("GMAIL_TOKEN_PATH", "config/token.json")
+# Search query: unread, from the Roofix sender. Override via env for narrowing.
+QUERY = os.getenv("LISTENER_QUERY") or f"is:unread from:{ROOFIX_SENDER}"
 
-_TOOL_SEARCH = os.getenv("GMAIL_MCP_TOOL_SEARCH", "search_threads")
-_TOOL_GET = os.getenv("GMAIL_MCP_TOOL_GET", "get_message")
-_TOOL_UNLABEL = os.getenv("GMAIL_MCP_TOOL_UNLABEL", "unlabel_message")
 
+class GmailClient:
+    def __init__(self):
+        self._service = None
 
-class GmailMcpClient:
-    def __init__(self, url: Optional[str] = None, auth_value: Optional[str] = None,
-                 timeout: float = 30.0):
-        self.url = (url or os.environ["GMAIL_MCP_URL"]).rstrip("/")
-        self.auth = auth_value or os.environ.get("GMAIL_MCP_AUTH_VALUE", "")
-        self._client = httpx.Client(timeout=timeout)
+    def _auth(self):
+        creds = None
+        if os.path.exists(TOKEN_PATH):
+            creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
+        if not creds or not creds.valid:
+            if creds and creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+            else:
+                flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, SCOPES)
+                creds = flow.run_local_server(port=0)
+            os.makedirs(os.path.dirname(TOKEN_PATH) or ".", exist_ok=True)
+            with open(TOKEN_PATH, "w") as f:
+                f.write(creds.to_json())
+        return creds
+
+    def service(self):
+        if self._service is None:
+            self._service = build("gmail", "v1", credentials=self._auth())
+        return self._service
 
     def close(self) -> None:
-        self._client.close()
+        # Present for API parity with the MCP client's context-manager form.
+        pass
 
     def __enter__(self):
         return self
@@ -54,100 +90,104 @@ class GmailMcpClient:
     def __exit__(self, *exc):
         self.close()
 
-    def _call_tool(self, name: str, arguments: dict) -> dict:
-        headers = {"Content-Type": "application/json"}
-        if self.auth:
-            headers["Authorization"] = f"Bearer {self.auth}"
-        body = {"jsonrpc": "2.0", "id": str(uuid.uuid4()),
-                "method": "tools/call",
-                "params": {"name": name, "arguments": arguments}}
-        resp = self._client.post(self.url, headers=headers, json=body)
-        resp.raise_for_status()
-        env = resp.json()
-        if "error" in env:
-            raise RuntimeError(f"MCP error: {env['error']}")
-        result = env.get("result", {})
-        if result.get("isError"):
-            raise RuntimeError(f"MCP tool '{name}' returned isError=true: {result}")
-        for block in result.get("content", []) or []:
-            if block.get("type") == "text":
-                txt = block.get("text", "")
-                try:
-                    return json.loads(txt)
-                except json.JSONDecodeError:
-                    return {"text": txt}
-        return {}
+    # --- helpers ----------------------------------------------------------------
 
-    # --- Contract A adapters -----------------------------------------------------
+    @staticmethod
+    def _header(headers, name, default=""):
+        for h in headers:
+            if h.get("name", "").lower() == name.lower():
+                return h.get("value", default)
+        return default
 
-    def fetch(self, max_results: int = 25, query: Optional[str] = None) -> list:
-        """Return raw emails matching the query. Does NOT mark them read — the
-        caller marks read only after successful processing so a crash can't
-        silently drop an event."""
-        q = query or LISTENER_QUERY
-        threads = self._call_tool(_TOOL_SEARCH,
-                                  {"query": q, "pageSize": max_results})
-        message_ids = _extract_message_ids(threads)
+    @staticmethod
+    def _decode(data: str) -> str:
+        if not data:
+            return ""
+        return base64.urlsafe_b64decode(data.encode()).decode("utf-8", errors="replace")
 
+    def _extract_bodies(self, payload) -> tuple[str, str | None]:
+        """Return (text, html). Walks multipart parts."""
+        text, html = "", None
+        mimetype = payload.get("mimeType", "")
+        body_data = payload.get("body", {}).get("data")
+        if mimetype == "text/plain" and body_data:
+            text = self._decode(body_data)
+        elif mimetype == "text/html" and body_data:
+            html = self._decode(body_data)
+        for part in payload.get("parts", []) or []:
+            t, h = self._extract_bodies(part)
+            if t and not text:
+                text = t
+            if h and not html:
+                html = h
+        return text, html
+
+    @staticmethod
+    def _attachments(payload) -> list:
         out = []
-        for mid in message_ids[:max_results]:
-            msg = self._call_tool(_TOOL_GET,
-                                  {"messageId": mid, "messageFormat": "FULL_CONTENT"})
-            out.append(_to_contract_a(msg, mid))
+        for part in payload.get("parts", []) or []:
+            fn = part.get("filename")
+            if fn:
+                out.append({"filename": fn, "mime_type": part.get("mimeType", "")})
+            out.extend(GmailClient._attachments(part))
+        return out
+
+    # --- public -----------------------------------------------------------------
+
+    def fetch(self, max_results: int = 25, query: str | None = None) -> list:
+        """Return raw emails (Contract A) for matching mail. Does NOT mark
+        read — the caller marks read only after successful processing, so a
+        crash never silently drops an event."""
+        svc = self.service()
+        q = query or QUERY
+        resp = svc.users().messages().list(
+            userId="me", q=q, maxResults=max_results).execute()
+        out = []
+        for ref in resp.get("messages", []):
+            msg = svc.users().messages().get(
+                userId="me", id=ref["id"], format="full").execute()
+            payload = msg.get("payload", {})
+            headers = payload.get("headers", [])
+            text, html = self._extract_bodies(payload)
+            ts = self._header(headers, "Date")
+            try:
+                ts_iso = parsedate_to_datetime(ts).astimezone(timezone.utc).isoformat()
+            except Exception:
+                ts_iso = datetime.now(timezone.utc).isoformat()
+            out.append({
+                "sender": self._header(headers, "From"),
+                "subject": self._header(headers, "Subject"),
+                "body_text": text or msg.get("snippet", ""),
+                "body_html": html,
+                "timestamp": ts_iso,
+                "to": [a.strip() for a in self._header(headers, "To").split(",") if a],
+                "message_id": ref["id"],
+                "attachments": self._attachments(payload),
+            })
         return out
 
     def mark_read(self, message_id: str) -> None:
-        self._call_tool(_TOOL_UNLABEL,
-                        {"messageId": message_id, "labelIds": ["UNREAD"]})
-
-
-def _extract_message_ids(threads_result: dict) -> list[str]:
-    """search_threads returns a list of threads with nested messages. Collect
-    every message id in every returned thread."""
-    ids: list[str] = []
-    threads = threads_result.get("threads", threads_result.get("value", []))
-    if isinstance(threads, dict):
-        threads = threads.get("threads", [])
-    for t in threads or []:
-        for m in (t.get("messages") or []):
-            mid = m.get("id") or m.get("messageId")
-            if mid:
-                ids.append(mid)
-        # Some MCPs return a flat message id list on the thread instead.
-        for mid in (t.get("messageIds") or []):
-            ids.append(mid)
-    return ids
-
-
-def _to_contract_a(msg: dict, message_id: str) -> dict:
-    """Normalize a Gmail MCP message payload into the parser's expected shape."""
-    subject = msg.get("subject") or msg.get("Subject") or ""
-    sender = msg.get("from") or msg.get("sender") or msg.get("From") or ""
-    to_field = msg.get("to") or msg.get("To") or ""
-    to_list = to_field if isinstance(to_field, list) else [
-        a.strip() for a in str(to_field).split(",") if a.strip()]
-    body_text = msg.get("plaintextBody") or msg.get("body_text") or msg.get("snippet") or ""
-    body_html = msg.get("htmlBody") or msg.get("body_html")
-    timestamp = msg.get("date") or msg.get("timestamp") or ""
-
-    attachments = []
-    for a in (msg.get("attachments") or []):
-        attachments.append({"filename": a.get("filename", ""),
-                            "mime_type": a.get("mimeType", "")})
-
-    return {
-        "sender": sender,
-        "subject": subject,
-        "body_text": body_text,
-        "body_html": body_html,
-        "timestamp": timestamp,
-        "to": to_list,
-        "message_id": msg.get("id") or message_id,
-        "attachments": attachments,
-    }
+        self.service().users().messages().modify(
+            userId="me", id=message_id, body={"removeLabelIds": ["UNREAD"]}).execute()
 
 
 def make_listener_callable(max_results: int = 25):
     """Return a zero-arg callable for orchestrator.run(listener=...)."""
-    gc = GmailMcpClient()
+    gc = GmailClient()
     return lambda: gc.fetch(max_results=max_results)
+
+
+if __name__ == "__main__":
+    # Server / laptop smoke test: print what the listener sees. Marks nothing read.
+    import traceback
+    print(f"GmailClient starting. query={QUERY}")
+    print(f"credentials: {CREDENTIALS_PATH}  token: {TOKEN_PATH}")
+    try:
+        gc = GmailClient()
+        emails = gc.fetch()
+        print(f"\nfetched {len(emails)} email(s)\n")
+        for e in emails[:10]:
+            print(f"- {e['subject'][:70]}  | from {e['sender'][:40]}  | to {e['to']}")
+    except Exception:
+        print("\n!!! Fetch failed:\n")
+        traceback.print_exc()

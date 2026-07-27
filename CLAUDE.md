@@ -46,11 +46,12 @@ Key variables:
 | `TICK_INTERVAL_SECONDS` | `300` | Roofix Bridge: APScheduler cadence |
 | `BRAIN_MODEL` | `qwen3.6` | Roofix Bridge: LiteLLM alias for the AI-fallback brain |
 | `ROOFIX_SENDER` | `no-reply@roofix.io` | Roofix Bridge: Gmail search-query sender (two `o`s) |
-| `GMAIL_MCP_URL` | _(secret)_ | Roofix Bridge: direct Gmail MCP JSON-RPC endpoint |
-| `GMAIL_MCP_AUTH_VALUE` | _(secret)_ | Roofix Bridge: bearer token for Gmail MCP |
+| `GMAIL_CREDENTIALS_PATH` | `/config/credentials.json` | Roofix Bridge: OAuth client-secrets file |
+| `GMAIL_TOKEN_PATH` | `/config/token.json` | Roofix Bridge: OAuth refresh-token file |
+| `PHOENIX_DB_HOST` / `_PORT` / `_NAME` / `_USER` / `_PASSWORD` / `_SSLMODE` | _(secrets)_ | Roofix Bridge: direct psycopg2 connection to Phoenix Postgres |
 | `PHOENIX_AGENT_USER_ID` | _(unset — required for writes)_ | Roofix Bridge: dedicated Phoenix user id |
 | `PHOENIX_ROOFIX_ID_COLUMN` | `migration_external_id` | Roofix Bridge: column where Roofix ids are stamped |
-| `ROOFIX_SESSION_PATH` | `/data/roofix_session.json` | Roofix Scraper: persisted Playwright storage_state |
+| `ROOFIX_PROFILE_DIR` | `/data/roofix_profile` | Roofix Scraper: Chrome `--user-data-dir` |
 
 ## Threading Model — Read Before Touching Anything
 
@@ -177,7 +178,8 @@ curl -X POST https://phoenix-mcp.com/api-token \
 `ai/roofix/` bundles the Roofix ↔ Phoenix subsystem: `bridge/` (event-sourced worker) and `scraper/` (Playwright proposal fetcher). One compose file (`docker-compose.roofix.yml`) brings up both. See [`ai/ROOFIX.md`](ai/ROOFIX.md) for the operator guide; a few things worth calling out here:
 
 - **Default `DRY_RUN=true`**: on first deploy the bridge fetches Gmail, parses, decides, and logs — but does **not** write to Phoenix. Flip to `false` only after inspecting a full tick.
-- **Phoenix MCP writes are speculative**: the bridge assumes tools named `insert_note` and `upsert_project_process_block` will land on the Phoenix MCP. Real names are configurable via `PHOENIX_MCP_TOOL_INSERT_NOTE` / `..._UPSERT_BLOCK` so no code change is needed when the actual tool names are known.
+- **Bridge talks to Phoenix directly (psycopg2), not via MCP**: the earlier MCP variant was reverted because Phoenix MCP write tools weren't ready in time. Bridge needs `PHOENIX_DB_*` env vars set. `DRY_RUN=true` still short-circuits writes.
+- **Bridge talks to Gmail directly (Google API + OAuth), not via MCP**: same reason. Requires `credentials.json` + `token.json` in `ROOFIX_BRIDGE_CONFIG_DIR`. First-time login is interactive — run `python components/gmail_client.py` locally once before shipping the token file into the container. See [ROOFIX.md § Gmail OAuth setup](ai/ROOFIX.md#gmail-oauth-setup).
 - **AI fallback via LiteLLM**: `roofix/bridge/components/brain.py::generate_ai_decision` uses the OpenAI SDK against `http://litellm:4000`. Swapping Claude for a local vLLM model is a LiteLLM config change, not a bridge code change.
 - **Session refresh is a manual operator flow**: the scraper cannot present a login UI. Run `save_roofix_session.py` locally on a laptop with a visible browser, then POST the resulting JSON to the scraper's `/session/refresh`.
 - **Michael's mapping**: `ai/roofix/bridge/config/field_mapping.json` is a stub. Milestone writes will log "no milestone mapping" and skip until the file is filled in — this is intentional.

@@ -7,11 +7,11 @@ Endpoints:
     POST /tick          manual batch trigger; body accepts optional {raw_emails: [...]}
                         for offline / crafted-event testing
 
-Scheduler runs a batch every TICK_INTERVAL_SECONDS. Gmail MCP is polled for
-unread Roofix mail; each email is parsed, the brain decides, and Phoenix MCP is
-called (or DRY_RUN-logged). Everything runs single-threaded inside the FastAPI
-event loop's thread pool — batches are serialized to avoid double-processing an
-event mid-flight.
+Scheduler runs a batch every TICK_INTERVAL_SECONDS. Gmail (via direct Google
+API) is polled for unread Roofix mail; each email is parsed, the brain decides,
+and Phoenix (via direct psycopg2) is written to (or DRY_RUN-logged). Everything
+runs single-threaded inside the FastAPI event loop's thread pool — batches are
+serialized to avoid double-processing an event mid-flight.
 """
 
 from __future__ import annotations
@@ -34,9 +34,9 @@ from common.logging_setup import CsvLogger, setup_logging
 
 load_env()
 
-from components.gmail_client import GmailMcpClient
+from components.gmail_client import GmailClient
 from components.orchestrator import LOG_COLUMNS, process_batch
-from components.phoenix_mcp_client import PhoenixMcpClient
+from components.phoenix_client import PhoenixClient
 
 
 TICK_INTERVAL_SECONDS = int(os.getenv("TICK_INTERVAL_SECONDS", "300"))
@@ -90,10 +90,10 @@ def _load_milestone_map() -> dict:
 
 
 def _run_one_batch(raw_emails: Optional[list] = None) -> dict:
-    """Run one processing batch. If raw_emails is None, pull from Gmail MCP."""
+    """Run one processing batch. If raw_emails is None, pull from Gmail."""
     milestone_map = _load_milestone_map()
 
-    with PhoenixMcpClient() as phoenix, GmailMcpClient() as gmail:
+    with PhoenixClient() as phoenix, GmailClient() as gmail:
         if raw_emails is None:
             raw_emails = gmail.fetch()
             _audit_log.log("listener", "fetch", True, f"{len(raw_emails)} email(s)")

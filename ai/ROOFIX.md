@@ -4,7 +4,7 @@ A two-container subsystem that keeps [Phoenix](https://phoenix-mcp.com) in sync 
 
 | Container | Purpose |
 |---|---|
-| `roofix-bridge` | Background worker. Fetches Roofix email via Gmail MCP → parses → decides (rules-first, LiteLLM fallback) → writes to Phoenix MCP. Runs its own APScheduler. |
+| `roofix-bridge` | Background worker. Fetches Roofix email via direct Gmail API → parses → decides (rules-first, LiteLLM fallback) → writes to Phoenix Postgres via direct psycopg2. Runs its own APScheduler. |
 | `roofix-scraper` | CDP interceptor (`common.cdp_interceptor`) driving Chrome (Windows dev) or Playwright chromium (Linux Docker). Fetches Roofix proposal pages on demand (Roofix has no public API). Owns the Roofix login session as a `--user-data-dir` profile. |
 
 Both are internal-only — no host ports published by default. The bridge depends on the scraper for hydrating thin `Estimate` / `Estimate Complete` events.
@@ -47,24 +47,26 @@ docker exec -it roofix-bridge curl "http://roofix-scraper:8080/proposal/17822463
 ### How it works
 
 ```
-Gmail  →  Gmail MCP  →  ┐
-                        │
-Phoenix DB ↔  Phoenix MCP ┐
-                        │
-                ┌───────┴────────┐
-                │  roofix-bridge │  ── OpenAI SDK ──► litellm
-                └───────┬────────┘
-                        │
-             roofix.io → roofix-scraper
+Gmail (Google API + OAuth) ──┐
+                             │
+Phoenix DB (psycopg2) ◄─────►│
+                             │
+                     ┌───────┴────────┐
+                     │  roofix-bridge │  ── OpenAI SDK ──► litellm
+                     └───────┬────────┘
+                             │
+                  roofix.io → roofix-scraper
 ```
+
+> **Note:** an earlier version routed Gmail and Phoenix through MCP servers. The MCP write tools weren't ready in time for end-to-end testing, so this deploy reverts to direct Gmail API + direct psycopg2. The Contract A / `PhoenixClient.Result` shapes are unchanged so we can swap back to MCP later without touching the orchestrator or brain.
 
 Every `TICK_INTERVAL_SECONDS` (default 300s) the bridge:
 
-1. Fetches unread Roofix emails via the Gmail MCP (`is:unread from:no-reply@roofix.io`).
+1. Fetches unread Roofix emails via Gmail API (`is:unread from:no-reply@roofix.io`).
 2. Parses each into a normalized event (event_type, project_id, customer_name, address, comment_text, ...).
 3. For each event, resolves the corresponding Phoenix project (by Roofix id, else by name + address).
 4. The brain decides: `update_chatter`, `update_milestone`, `ignore`, or `escalate`. Rules handle the clear cases; anything ambiguous escalates to LiteLLM (the "AI fallback"), which returns the same Decision shape.
-5. In DRY_RUN mode, the intended tool + arguments are logged. Otherwise the Phoenix MCP write tools are called.
+5. In DRY_RUN mode, the intended SQL + params are logged. Otherwise the writes are executed via psycopg2.
 
 Ambiguous or thin `Estimate` / `Estimate Complete` events cause the bridge to call the scraper's `/proposal/{id}` to hydrate the full field set from Roofix.
 
@@ -80,18 +82,17 @@ Ambiguous or thin `Estimate` / `Estimate Complete` events cause the bridge to ca
 | `BRAIN_MODEL` | `qwen3.6` | LiteLLM model alias used for AI fallback decisions. |
 | `ROOFIX_SENDER` | `no-reply@roofix.io` | Gmail search-query sender. **Note the two `o`s.** |
 | `LISTENER_QUERY` | `is:unread from:${ROOFIX_SENDER}` | Full Gmail search query. Override to narrow the fetch — e.g. to a single project during first live tests. |
-| `GMAIL_MCP_URL` | _(required)_ | Gmail MCP JSON-RPC endpoint. |
-| `GMAIL_MCP_AUTH_VALUE` | _(required)_ | Bearer token for Gmail MCP. |
-| `PHOENIX_MCP_URL` | _(from `DEFAULT_LITELLM_MCP_PHOENIX_URL`)_ | Phoenix MCP endpoint. |
-| `PHOENIX_MCP_AUTH_VALUE` | _(from `DEFAULT_LITELLM_MCP_PHOENIX_AUTH_VALUE`)_ | Bearer token. |
+| `GMAIL_CREDENTIALS_PATH` | `/config/credentials.json` | OAuth 2.0 client secrets file from GCP. See [Gmail OAuth setup](#gmail-oauth-setup). |
+| `GMAIL_TOKEN_PATH` | `/config/token.json` | Refresh-token file. Written by the first successful login; reused thereafter. |
+| `ROOFIX_BRIDGE_CONFIG_DIR` | `./roofix/bridge/config` | Host dir containing `credentials.json` + `token.json`. Bind-mounted into the container at `/config` read-only. |
+| `PHOENIX_DB_HOST` | _(required)_ | Phoenix Postgres hostname. |
+| `PHOENIX_DB_PORT` | `5432` | Phoenix Postgres port. |
+| `PHOENIX_DB_NAME` | _(required)_ | Database name. |
+| `PHOENIX_DB_USER` | _(required)_ | DB user with read + write on the `phoenix` schema. |
+| `PHOENIX_DB_PASSWORD` | _(required)_ | DB password. |
+| `PHOENIX_DB_SSLMODE` | `require` | psycopg2 SSL mode (`require` / `verify-ca` / `verify-full` / `disable`). |
 | `PHOENIX_AGENT_USER_ID` | _(unset — required for writes)_ | Dedicated Phoenix user id the bridge writes as. Provision manually. |
 | `PHOENIX_ROOFIX_ID_COLUMN` | `migration_external_id` | Where the Roofix project id is stamped on the project row. |
-| `PHOENIX_MCP_TOOL_QUERY` | `run_query` | Phoenix MCP read-only SQL tool name. |
-| `PHOENIX_MCP_TOOL_INSERT_NOTE` | `insert_note` | Assumed name for the (future) Phoenix MCP note-insert tool. |
-| `PHOENIX_MCP_TOOL_UPSERT_BLOCK` | `upsert_project_process_block` | Assumed name for the (future) milestone upsert tool. |
-| `GMAIL_MCP_TOOL_SEARCH` | `search_threads` | Gmail MCP thread search tool. |
-| `GMAIL_MCP_TOOL_GET` | `get_message` | Gmail MCP message fetch tool. |
-| `GMAIL_MCP_TOOL_UNLABEL` | `unlabel_message` | Gmail MCP label-remove tool (used to mark-as-read). |
 | `ROOFIX_SCRAPER_URL` | `http://roofix-scraper:8080` | Sibling scraper service. |
 | `ROOFIX_PROFILE_DIR` | `/data/roofix_profile` | Scraper's `--user-data-dir` (cookies, localStorage, login). |
 | `ROOFIX_HEADLESS` | `true` | Scraper's Chromium mode. Set `false` for local `uv run` sessions to watch the browser scrape in real time. |
@@ -101,6 +102,46 @@ Ambiguous or thin `Estimate` / `Estimate Complete` events cause the bridge to ca
 | `FIELD_MAPPING_PATH` | `/app/config/field_mapping.json` | Roofix-event → Phoenix (block_name, status_id) map. |
 | `LOG_DIR` | `/data` | Where per-tick logs live (mounted volume). Two files: `roofix-bridge.log` (stdlib text log; framework messages + compact per-decision echo) and `agent_log.csv` (structured audit trail via `common.logging_setup.CsvLogger`). |
 | `DEBUG_LOGGING` | `false` | When true, promotes the stdlib file log to DEBUG level and the console to DEBUG. |
+
+### Gmail OAuth setup
+
+The bridge talks to Gmail directly (no MCP), so it needs an OAuth 2.0 client
+secret file plus a saved refresh-token file. Both live in
+`ROOFIX_BRIDGE_CONFIG_DIR` on the host, bind-mounted into `/config` in the
+container.
+
+**One-time setup:**
+
+1. **Create an OAuth client in GCP.** Google Cloud Console → APIs & Services →
+   Credentials → **Create Credentials → OAuth client ID → Desktop app**.
+   Download the JSON, rename to `credentials.json`.
+2. **Enable the Gmail API** on the same GCP project (APIs & Services →
+   Library → Gmail API → Enable).
+3. **Place `credentials.json`** in your host config dir (default:
+   `ai/roofix/bridge/config/credentials.json`). Git-ignored.
+4. **Run the interactive login once, locally**, so `token.json` gets written:
+
+   ```powershell
+   cd ai\roofix\bridge
+   $env:GMAIL_CREDENTIALS_PATH = "$PWD\config\credentials.json"
+   $env:GMAIL_TOKEN_PATH = "$PWD\config\token.json"
+   uv run --package roofix-bridge python components\gmail_client.py
+   ```
+
+   A browser opens; sign in with the inbox account (`rufix@zeoenergy.com`),
+   accept the scope. `token.json` is written next to `credentials.json`.
+
+5. **Deploy.** The compose bind-mount at `${ROOFIX_BRIDGE_CONFIG_DIR}:/config:ro`
+   makes both files visible to the container. Refresh tokens live for months
+   — you re-run the interactive login only if the token is revoked, the
+   scope changes, or Google expires it.
+
+**Scopes:** the client requests `gmail.modify` — read messages + toggle labels.
+Sufficient for polling and mark-as-read.
+
+**Same file, another machine:** OAuth refresh tokens are portable — you can
+capture `token.json` on your laptop and ship it into the container. Nothing
+machine-bound about them (unlike Chrome's saved passwords).
 
 ### Session profile (scraper)
 
@@ -219,8 +260,8 @@ ai/
         parser.py                     email → normalized event (Contract B)
         brain.py                      rules-first decision + LiteLLM fallback
         orchestrator.py               parse → resolve → decide → execute
-        gmail_client.py               Gmail MCP HTTP client
-        phoenix_mcp_client.py         Phoenix MCP HTTP client (reads + planned writes)
+        gmail_client.py               Gmail API listener (OAuth 2.0)
+        phoenix_client.py             Phoenix Postgres client (psycopg2, reads + writes)
         roofix_scraper_client.py      Sibling scraper HTTP client
         notifier.py                   Phase 1 stub — CloudTalk / rep SMS
       config/
@@ -237,7 +278,7 @@ ai/
 
 ### Known limitations / TODOs
 
-- **Phoenix MCP writes are speculative.** The bridge assumes tools named `insert_note` and `upsert_project_process_block` will land on the Phoenix MCP. Until they do, keep `DRY_RUN=true` — the write calls will fail. Real names are configurable via env so no code change is needed when they land.
+- **Phoenix writes are live via psycopg2** — no MCP dependency. The MCP client was reverted because the write tools weren't ready in time. `DRY_RUN=true` still short-circuits writes (returns Result with the intended SQL + params in `.data` for inspection).
 - **`field_mapping.json` is a stub.** Michael owns the Roofix-event → Phoenix (block_name, status_id) mapping. `update_milestone` will log a "no milestone mapping" warning and skip until the file is filled in.
 - **`PHOENIX_AGENT_USER_ID` must be provisioned manually.** Create a dedicated Phoenix agent user and set the env var so writes are attributable.
 - **`SIGNING_EVENTS` set** (`Job Approval Confirmed`, `HIC Executed`) needs Jonathan's confirmation.

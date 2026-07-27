@@ -3,11 +3,15 @@ Tests for components.proposal_extractor.extract_proposal.
 
 Run from ai/roofix/bridge/:   PYTHONPATH=. python tests/test_proposal_extractor.py
 
-Fixtures are real captures from Roofix (see tests/fixtures/):
-    proposal_accepted.json      Robert Shepherd — HIC signed, Job created,
-                                warranty issued, project fully complete
-    proposal_unaccepted.json    Gerald kang — estimate exists but no HIC has
-                                been sent to homeowner yet
+Fixtures are real captures from Roofix (see tests/fixtures/), pruned to the
+doc types the extractor reads and PII-redacted:
+
+  proposal_accepted.json     — Robert Shepherd: HIC executed with signature,
+                                Job complete, warranty issued, stage="customer"
+  proposal_unaccepted.json   — Gerald kang: no HIC / Job / warranty; homeowner
+                                stage="opportunity"; Roofix skips the order1
+                                doc in mget for unaccepted proposals so
+                                identity has to come from the URL
 """
 
 from __future__ import annotations
@@ -20,7 +24,7 @@ from components.proposal_extractor import (
     AcceptanceSignals,
     ExtractedProposal,
     _lookup_id,
-    _split_display_text,
+    _project_id_from_url,
     extract_proposal,
 )
 
@@ -35,22 +39,16 @@ def _load(name: str) -> dict:
 # ── Helper-function tests ─────────────────────────────────────────────────
 
 def _test_lookup_id_strips_bubble_prefix() -> list[str]:
-    problems = []
     got = _lookup_id("1348695171700984260__LOOKUP__1775852280409x179578235196227180")
     if got != "1775852280409x179578235196227180":
-        problems.append(f"LOOKUP strip: got {got!r}")
-    return problems
+        return [f"LOOKUP strip: got {got!r}"]
+    return []
 
 
-def _test_lookup_id_passthrough_non_lookup() -> list[str]:
+def _test_lookup_id_edge_cases() -> list[str]:
     problems = []
     if _lookup_id("plain-string") != "plain-string":
-        problems.append("non-LOOKUP string should pass through unchanged")
-    return problems
-
-
-def _test_lookup_id_none() -> list[str]:
-    problems = []
+        problems.append("non-LOOKUP passthrough failed")
     if _lookup_id(None) is not None:
         problems.append("None input should return None")
     if _lookup_id("") is not None:
@@ -60,55 +58,79 @@ def _test_lookup_id_none() -> list[str]:
     return problems
 
 
-def _test_split_display_text() -> list[str]:
+def _test_project_id_from_url() -> list[str]:
     problems = []
-    n, a = _split_display_text("Robert Shepherd - 324 Whitely Street")
-    if n != "Robert Shepherd" or a != "324 Whitely Street":
-        problems.append(f"simple split: got ({n!r}, {a!r})")
-
-    # Address containing ' - ' — split-on-first-only means address survives.
-    n, a = _split_display_text("Jane Doe - 100-B Main St - Unit 3")
-    if n != "Jane Doe" or a != "100-B Main St - Unit 3":
-        problems.append(f"multi-hyphen split: got ({n!r}, {a!r})")
-
-    n, a = _split_display_text("NoSeparator")
-    if n != "NoSeparator" or a is not None:
-        problems.append(f"no separator: got ({n!r}, {a!r})")
-
-    n, a = _split_display_text("")
-    if n is not None or a is not None:
-        problems.append(f"empty: got ({n!r}, {a!r})")
-
-    n, a = _split_display_text(None)
-    if n is not None or a is not None:
-        problems.append(f"None: got ({n!r}, {a!r})")
-
+    got = _project_id_from_url(
+        "https://roofix.io/project/1781297151690x264388044885887520")
+    if got != "1781297151690x264388044885887520":
+        problems.append(f"project url: got {got!r}")
+    # With trailing garbage / query string
+    got = _project_id_from_url(
+        "https://roofix.io/project/1784846253605x685099068151907800?foo=bar")
+    if got != "1784846253605x685099068151907800":
+        problems.append(f"url with query: got {got!r}")
+    # Non-project URL
+    if _project_id_from_url("https://roofix.io/dashboard") is not None:
+        problems.append("non-project URL should return None")
+    # Empty / None
+    if _project_id_from_url("") is not None or _project_id_from_url(None) is not None:
+        problems.append("empty/None should return None")
     return problems
 
 
-# ── Fixture-based extraction tests ────────────────────────────────────────
+# ── Accepted proposal ─────────────────────────────────────────────────────
 
-def _test_accepted_proposal_extraction() -> list[str]:
+def _test_accepted_extraction() -> list[str]:
     problems = []
     result = extract_proposal(_load("proposal_accepted.json"))
 
     if not result.ok:
         return [f"accepted: ok=False, error={result.error!r}"]
 
+    # Identity
     checks = {
         "roofix_project_id": "1781297151690x264388044885887520",
         "external_ref": "5YS73T",
         "display_text": "Robert Shepherd - 324 Whitely Street",
-        "customer_name": "Robert Shepherd",
-        "address": "324 Whitely Street",
-        "contract_price": 12467.12,
+
+        # Customer (from homeowner doc)
+        "first_name": "Robert",
+        "last_name": "Shepherd",
+        "full_name": "Robert Shepherd",
+        "email": "customer@example.test",       # PII redacted in fixture
+        "phone": "5555550100",                  # PII redacted in fixture
+
+        # Address
+        "street_address": "324 Whitely Street",
+        "city": "Bridgeport",
+        "state": "Ohio",
+        "state_abbr": "OH",
+        "zip_code": "43912",
+        "portal_code": "8K2RXTZVFQ06",
+
+        # Money — proposal side (from order1)
+        "estimated_price": 12467.12,
         "staging_price": 8316.42,
         "markup": 1084.75,
+
+        # Money — contract side (from job1) — DIFFERENT from estimated_price
+        "actual_contract_price": 11382.37,
+
+        # Config — order1
         "funding_type": "home_improvement_loan",
         "financing_provider": "finsurf",
         "trade": "roofing",
         "project_type": "replacement",
         "steep_slope_product": "owens_corning_oakridge_architectural_shingles",
+
+        # Config — job1
+        "job_funding_source": "home_improvement_loan",
+        "shingle_color": "1 Black",
+        "install_date_ms": 1782964800000,
+        "install_scheduled_date_ms": 1782848007617,
+        "job_status": "completed",
+
+        # Related Bubble records — id parts
         "sales_rep_ref": "1775852280409x179578235196227180",
         "estimator_ref": "1665082162814x123302301803753570",
         "office_ref": "1739280246960x280095451129448220",
@@ -116,7 +138,11 @@ def _test_accepted_proposal_extraction() -> list[str]:
         "hic_ref": "1781717783470x922006884046100600",
         "job_ref": "1781719439189x310679958652685630",
         "warranty_ref": "1781719439739x905768511679878700",
+
+        # Acceptance
         "is_accepted": True,
+
+        # Progress tracker
         "stage_completed_internal": "job_moved_to_complete",
         "stage_upcoming_internal": "warranty_documents_sent_to_homeowner",
         "stage_completed_external": "job_moved_to_complete",
@@ -128,12 +154,13 @@ def _test_accepted_proposal_extraction() -> list[str]:
 
     s = result.acceptance_signals
     signal_checks = {
-        "has_hic": True,
-        "has_job": True,
-        "has_warranty": True,
-        "loan_signed": True,
-        "ntp_received": True,
-        "msa_count": 4,
+        "hic_present": True,
+        "hic_executed": True,              # status_option_contingency == "executed"
+        "hic_signature_present": True,     # signature_url_text is set
+        "job_present": True,
+        "job_status": "completed",
+        "homeowner_stage": "customer",
+        "warranty_present": True,
     }
     for k, want in signal_checks.items():
         got = getattr(s, k)
@@ -143,7 +170,9 @@ def _test_accepted_proposal_extraction() -> list[str]:
     return problems
 
 
-def _test_unaccepted_proposal_extraction() -> list[str]:
+# ── Unaccepted proposal ───────────────────────────────────────────────────
+
+def _test_unaccepted_extraction() -> list[str]:
     problems = []
     result = extract_proposal(_load("proposal_unaccepted.json"))
 
@@ -151,25 +180,59 @@ def _test_unaccepted_proposal_extraction() -> list[str]:
         return [f"unaccepted: ok=False, error={result.error!r}"]
 
     checks = {
+        # Identity — order1 IS present in init_data (Roofix's init/data always
+        # emits the current project's order1, even for unaccepted proposals).
+        # mget is the one that skips it for unaccepted; init_data doesn't.
         "roofix_project_id": "1784846253605x685099068151907800",
         "external_ref": "21GGPT",
         "display_text": "Gerald kang - 836 Lasser Drive",
-        "customer_name": "Gerald kang",
-        "address": "836 Lasser Drive",
-        "contract_price": 14076.26,
+
+        # Customer (from homeowner in mget) — the whole point of the switch
+        "first_name": "Gerald",
+        "last_name": "kang",
+        "full_name": "Gerald kang",
+        "street_address": "836 Lasser Drive",
+        "city": "Norfolk",
+        "state": "Virginia",
+        "state_abbr": "VA",
+        "zip_code": "23513",
+
+        # Money — proposal side (from order1) — still available
+        "estimated_price": 14076.26,
         "staging_price": 11677.33,
         "markup": 1575.16,
+
+        # Config (from order1)
         "funding_type": "cash",
-        "financing_provider": None,      # no lender in cash flow
+        "financing_provider": None,   # cash flow has no lender
         "trade": "roofing",
         "project_type": "replacement",
+        "steep_slope_product": "class_2_shingles",
+
+        # People (from order1)
         "sales_rep_ref": "1773870077554x580778452202950700",
         "estimator_ref": "1669661550637x957567333474137500",
         "office_ref": "1739280246960x280095451129448220",
-        "hic_ref": None,                  # ← core signal: no HIC
-        "job_ref": None,                  # ← core signal: no Job
-        "warranty_ref": None,             # ← post-completion, not applicable
-        "is_accepted": False,             # ← THE assertion
+
+        # Money — contract side (from job1, which is absent for unaccepted)
+        "actual_contract_price": None,
+
+        # Job-side fields — job doc absent
+        "job_funding_source": None,
+        "shingle_color": None,
+        "install_date_ms": None,
+        "install_scheduled_date_ms": None,
+        "job_status": None,
+
+        # Related record refs — hic/job/warranty absent from mget for unaccepted
+        "hic_ref": None,
+        "job_ref": None,
+        "warranty_ref": None,
+
+        # Acceptance
+        "is_accepted": False,
+
+        # Progress tracker (from order1)
         "stage_completed_internal": "select_funding_type",
         "stage_upcoming_internal": "hic_sent_to_homeowner",
         "stage_completed_external": "select_funding_type",
@@ -181,12 +244,13 @@ def _test_unaccepted_proposal_extraction() -> list[str]:
 
     s = result.acceptance_signals
     signal_checks = {
-        "has_hic": False,
-        "has_job": False,
-        "has_warranty": False,
-        "loan_signed": False,
-        "ntp_received": False,
-        "msa_count": 0,
+        "hic_present": False,
+        "hic_executed": False,
+        "hic_signature_present": False,
+        "job_present": False,
+        "job_status": None,
+        "homeowner_stage": "opportunity",   # ← the differentiator
+        "warranty_present": False,
     }
     for k, want in signal_checks.items():
         got = getattr(s, k)
@@ -196,30 +260,14 @@ def _test_unaccepted_proposal_extraction() -> list[str]:
     return problems
 
 
-# ── Edge-case tests ───────────────────────────────────────────────────────
+# ── Edge cases ────────────────────────────────────────────────────────────
 
-def _test_missing_init_data() -> list[str]:
-    result = extract_proposal({"url": "https://roofix.io/project/x", "init_data": []})
+def _test_missing_mget_docs() -> list[str]:
+    result = extract_proposal({"url": "https://roofix.io/project/x", "mget_docs": []})
     if result.ok:
-        return ["empty init_data: expected ok=False"]
-    if "init_data" not in (result.error or ""):
-        return [f"empty init_data: error should mention init_data, got {result.error!r}"]
-    return []
-
-
-def _test_no_order_doc() -> list[str]:
-    """User doc present but no custom.order1 — treat as extraction failure."""
-    resp = {
-        "url": "x",
-        "init_data": [
-            {"id": "u1", "type": "user", "version": 1, "data": {"_id": "u1"}},
-        ],
-    }
-    result = extract_proposal(resp)
-    if result.ok:
-        return ["no order doc: expected ok=False"]
-    if "custom.order1" not in (result.error or ""):
-        return [f"no order doc: error should mention custom.order1, got {result.error!r}"]
+        return ["empty mget_docs: expected ok=False"]
+    if "mget_docs" not in (result.error or ""):
+        return [f"empty mget_docs: error should mention mget_docs, got {result.error!r}"]
     return []
 
 
@@ -230,51 +278,132 @@ def _test_none_input() -> list[str]:
     return []
 
 
-def _test_hic_only_still_accepted() -> list[str]:
-    """A proposal where HIC exists but Job hasn't been created yet: still accepted."""
+def _test_url_only_identity() -> list[str]:
+    """If order1 is missing but URL has a project id and homeowner exists,
+    extraction still succeeds with project_id from the URL."""
     resp = {
-        "init_data": [
+        "url": "https://roofix.io/project/1784846253605x685099068151907800",
+        "mget_docs": [
             {
-                "id": "o1",
-                "type": "custom.order1",
-                "data": {
-                    "_id": "o1",
-                    "display_text": "Test - 1 Main St",
-                    "hic_custom_hic": "org__LOOKUP__hic_id_xyz",
-                    # No job_custom_job1
+                "_id": "hw1",
+                "_type": "custom.homeowner",
+                "_source": {
+                    "_id": "hw1", "_type": "custom.homeowner",
+                    "first_name_text": "Jane", "last_name_text": "Doe",
+                    "stage_option_type__contact_": "opportunity",
+                },
+            },
+        ],
+    }
+    result = extract_proposal(resp)
+    problems = []
+    if not result.ok:
+        problems.append(f"url-only: ok=False, error={result.error!r}")
+    if result.roofix_project_id != "1784846253605x685099068151907800":
+        problems.append(f"url-only project_id: got {result.roofix_project_id!r}")
+    if result.first_name != "Jane":
+        problems.append(f"url-only first_name: got {result.first_name!r}")
+    if result.is_accepted:
+        problems.append("url-only + opportunity stage: is_accepted should be False")
+    return problems
+
+
+def _test_hic_executed_alone_is_accepted() -> list[str]:
+    """A hic doc with status=executed is sufficient acceptance, even without
+    a job doc or a customer-stage homeowner."""
+    resp = {
+        "url": "https://roofix.io/project/1234x5678",
+        "mget_docs": [
+            {
+                "_id": "h1",
+                "_type": "custom.hic",
+                "_source": {
+                    "_id": "h1", "_type": "custom.hic",
+                    "status_option_contingency": "executed",
+                    "signature_url_text": "//sig.example/x.png",
                 },
             }
-        ]
+        ],
     }
     result = extract_proposal(resp)
     problems = []
     if not result.is_accepted:
-        problems.append("HIC-only proposal should be accepted")
-    if not result.acceptance_signals.has_hic:
-        problems.append("has_hic should be True")
-    if result.acceptance_signals.has_job:
-        problems.append("has_job should be False when job field absent")
+        problems.append("hic-only executed: expected is_accepted=True")
+    s = result.acceptance_signals
+    if not s.hic_executed:
+        problems.append("signals.hic_executed should be True")
+    if not s.hic_signature_present:
+        problems.append("signals.hic_signature_present should be True")
     return problems
 
 
-def _test_job_only_still_accepted() -> list[str]:
-    """Hypothetical: Job exists without HIC. Still counts as accepted (edge case)."""
+def _test_hic_present_but_not_executed_is_not_accepted() -> list[str]:
+    """A hic doc with status != executed does NOT satisfy the primary signal.
+    Without a job and without customer-stage homeowner, this is not accepted."""
     resp = {
-        "init_data": [
+        "url": "https://roofix.io/project/1234x5678",
+        "mget_docs": [
             {
-                "id": "o1",
-                "type": "custom.order1",
-                "data": {
-                    "_id": "o1",
-                    "display_text": "Test - 1 Main St",
-                    "job_custom_job1": "org__LOOKUP__job_id_xyz",
+                "_id": "h1",
+                "_type": "custom.hic",
+                "_source": {
+                    "_id": "h1", "_type": "custom.hic",
+                    "status_option_contingency": "draft",  # ← not executed
                 },
             }
-        ]
+        ],
+    }
+    result = extract_proposal(resp)
+    problems = []
+    if result.is_accepted:
+        problems.append("hic draft only: expected is_accepted=False")
+    s = result.acceptance_signals
+    if not s.hic_present:
+        problems.append("signals.hic_present should be True (doc exists)")
+    if s.hic_executed:
+        problems.append("signals.hic_executed should be False (status != executed)")
+    return problems
+
+
+def _test_customer_stage_alone_is_accepted() -> list[str]:
+    """Roofix classifies homeowner as 'customer' — that's enough to consider
+    accepted even without hic/job present in this scrape."""
+    resp = {
+        "url": "https://roofix.io/project/1234x5678",
+        "mget_docs": [
+            {
+                "_id": "hw1",
+                "_type": "custom.homeowner",
+                "_source": {
+                    "_id": "hw1", "_type": "custom.homeowner",
+                    "stage_option_type__contact_": "customer",
+                },
+            }
+        ],
     }
     result = extract_proposal(resp)
     if not result.is_accepted:
-        return ["Job-only proposal should still be accepted"]
+        return ["customer-stage: expected is_accepted=True"]
+    return []
+
+
+def _test_job_status_alone_is_accepted() -> list[str]:
+    resp = {
+        "url": "https://roofix.io/project/1234x5678",
+        "mget_docs": [
+            {
+                "_id": "j1",
+                "_type": "custom.job1",
+                "_source": {
+                    "_id": "j1", "_type": "custom.job1",
+                    "status_option_job_status": "in_progress",
+                },
+            }
+        ],
+    }
+    result = extract_proposal(resp)
+    if not result.is_accepted:
+        return ["job-only: expected is_accepted=True"]
     return []
 
 
@@ -282,16 +411,17 @@ def _test_job_only_still_accepted() -> list[str]:
 
 _CASES = [
     ("lookup_id: strips prefix", _test_lookup_id_strips_bubble_prefix),
-    ("lookup_id: non-LOOKUP passthrough", _test_lookup_id_passthrough_non_lookup),
-    ("lookup_id: None / empty / non-string", _test_lookup_id_none),
-    ("split_display_text: various cases", _test_split_display_text),
-    ("extract: accepted proposal", _test_accepted_proposal_extraction),
-    ("extract: unaccepted proposal", _test_unaccepted_proposal_extraction),
-    ("extract: empty init_data", _test_missing_init_data),
-    ("extract: no order doc", _test_no_order_doc),
+    ("lookup_id: edge cases", _test_lookup_id_edge_cases),
+    ("project_id_from_url: various", _test_project_id_from_url),
+    ("extract: accepted proposal (Robert Shepherd)", _test_accepted_extraction),
+    ("extract: unaccepted proposal (Gerald kang)", _test_unaccepted_extraction),
+    ("extract: empty mget_docs", _test_missing_mget_docs),
     ("extract: None input", _test_none_input),
-    ("acceptance: HIC-only is accepted", _test_hic_only_still_accepted),
-    ("acceptance: Job-only is accepted", _test_job_only_still_accepted),
+    ("acceptance: URL-only identity (order1 absent)", _test_url_only_identity),
+    ("acceptance: hic executed alone", _test_hic_executed_alone_is_accepted),
+    ("acceptance: hic draft alone is NOT accepted", _test_hic_present_but_not_executed_is_not_accepted),
+    ("acceptance: customer-stage alone", _test_customer_stage_alone_is_accepted),
+    ("acceptance: job status alone", _test_job_status_alone_is_accepted),
 ]
 
 

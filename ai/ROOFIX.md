@@ -198,6 +198,42 @@ Sessions survive **days to weeks** in practice. You only need a fresh capture wh
 - **`session_sentinel=False`** in `app.py:99`. The scraper opts out of `cdp_interceptor`'s auto-headless-after-first-login toggle: it always launches in the mode dictated by `ROOFIX_HEADLESS`, regardless of whether a login has been captured. Flip to `True` if you want the auto-behavior (visible on first run, headless thereafter).
 - **Cross-machine password caveat.** Cookies in a shipped profile work fine on Linux Docker. Chrome's saved-password blob (`Login Data`) is encrypted with a machine-bound key and won't decrypt inside the container — so don't rely on "the container will auto-fill and log in" if the session ever fully expires. The container reuses cookies only; if they die, you re-capture on your laptop and re-upload.
 
+### Proposal extractor
+
+The bridge takes the raw scraper response (both `init_data` and `mget_docs` fields) and turns it into a Phoenix-writable dataclass via `components.proposal_extractor.extract_proposal`. Pure function, no I/O.
+
+**Why the extractor reads from both `init_data` AND `mget_docs`.** Roofix uses two different endpoints to hydrate a project page and each carries different data:
+
+| Source | Contains | Why we need it |
+|---|---|---|
+| `init_data` (Bubble page-hydrate) | The **current** project's `custom.order1` doc — prices, funding type, progress-tracker stages, product config | mget doesn't reliably fetch the current order1; instead it returns the homeowner's OTHER past orders. init_data is where the current one lives. |
+| `mget_docs` (elasticsearch batch-get) | `custom.homeowner` (customer + full address), `custom.hic` (signature + executed status), `custom.job1` (actual contract price + install date + status), `custom.warranty`, `custom.estimate1` | None of these are in init_data — Bubble only puts the current order1 there. |
+
+If we only read init_data we'd be missing zip/city/state/street, contact info, actual signed contract price, install date, and the HIC signature. Direct answer to "why not just one endpoint."
+
+**Doc types the extractor consumes:**
+
+| Doc type | Field(s) extracted | Notes |
+|---|---|---|
+| `custom.order1` (from init_data) | `_id`, `external_project_id_text`, `display_text`, prices, `funding1_option_funding`, `financing_provider_option_loan_provider`, trade/type/product, sales_rep/estimator/office refs, progress-tracker stages | Filtered by URL project id — Bubble can return prior orders for the same homeowner, we need the current one. |
+| `custom.homeowner` | name (first/last/full), full address (street/city/state/zip), `email_text`, `phone_nmber_text` (Bubble's typo), `stage_option_type__contact_` | The "customer address" data init_data was missing. |
+| `custom.hic` | `status_option_contingency` ("executed" ⇒ signed), `signature_url_text` | Presence of "executed" is the primary acceptance signal. |
+| `custom.job1` | `contract_price_number` (actual signed price, differs from estimate), `install_date_date`, `install_scheduled_date_date`, `status_option_job_status`, `shingle_color_v2_text`, `funding_source_option_funding` | Only present on accepted proposals — a job record only exists post-HIC-signing. |
+| `custom.warranty` | Presence only (ref id) | Confirmation signal. |
+| `custom.estimate1` | Not currently extracted (reserved) | |
+
+**Acceptance rule.** Three-way OR — any one signal is sufficient:
+
+1. `custom.hic` present AND `status_option_contingency == "executed"` — customer signed the contract. Primary and strongest.
+2. `custom.job1` present AND `status_option_job_status` is set — a job record exists, which only happens post-HIC-signing.
+3. `custom.homeowner.stage_option_type__contact_ == "customer"` — Roofix's own CRM classification. Reliable independent signal (unaccepted proposals show `"opportunity"`).
+
+Redundancy is the point: if Roofix changes one field's behavior we still detect acceptance via the others. Individual signals are exposed on `ExtractedProposal.acceptance_signals` for audit / logging.
+
+**Identity when order1 is absent.** For proposals that haven't been through a full lifecycle, init_data may still not contain a current-project order1 (rare edge case). In that case the extractor falls back to extracting the Bubble project id directly from the URL — `roofix.io/project/{id}` regex. Homeowner-only extraction is enough for the bridge to log "unaccepted, skipping."
+
+**PII in fixtures.** The two committed fixtures in `tests/fixtures/proposal_{accepted,unaccepted}.json` are pruned + PII-redacted copies of real captures (email → `customer@example.test`, phone → `5555550100`, HIC signature URL → `//redacted-signature.example/...`). See `_regen_fixtures.py` if you need to refresh them from a new capture.
+
 ### Verifying it works
 
 1. **Offline unit tests** (no Docker, no network):

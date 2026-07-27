@@ -42,13 +42,25 @@ HEADLESS = os.environ.get("ROOFIX_HEADLESS", "true").lower() != "false"
 DEBUG_PORT = int(os.environ.get("ROOFIX_DEBUG_PORT", "9223"))
 CAPTURE_WINDOW_SECONDS = int(os.environ.get("ROOFIX_CAPTURE_WINDOW_SECONDS", "20"))
 
-# The one endpoint that carries the page's full data blob. Override via env
-# if Bubble ever changes the shape.
+# The two endpoints we care about.
+#
+# init/data — Bubble's own page-hydration endpoint. One (or a few duplicate)
+#   responses per page load, each containing the whole page's data in a single
+#   envelope with entries like {id, type, data, version}.
+#
+# elasticsearch/mget — Bubble's batch-get-by-id. Fires MULTIPLE times per page
+#   load with different documents in each call (project in one, customer in
+#   another, estimates in another). We aggregate `docs[]` across all captures.
 INIT_DATA_URL_PATTERN = os.environ.get(
     "ROOFIX_INIT_DATA_URL_PATTERN",
     r"roofix\.io/api/1\.1/init/data",
 )
+MGET_URL_PATTERN = os.environ.get(
+    "ROOFIX_MGET_URL_PATTERN",
+    r"roofix\.io/elasticsearch/mget",
+)
 _INIT_DATA_RE = re.compile(INIT_DATA_URL_PATTERN)
+_MGET_RE = re.compile(MGET_URL_PATTERN)
 
 _LOGIN_URL_MARKERS = ("/login", "/signin", "sign_in", "signup")
 
@@ -106,20 +118,20 @@ def proposal(
     _log(f"start  headless={HEADLESS}  keep_open={keep_open}  url={target_url}")
 
     init_data_bodies: list[dict] = []
+    mget_docs: list[dict] = []            # aggregated across all mget responses
+    mget_capture_count = 0
     captured_urls: list[str] = []   # every JSON XHR/fetch URL — diagnostic
     lock = threading.Lock()
 
     def on_capture(cap: Capture) -> None:
         """Runs for EVERY JSON XHR/fetch — regardless of URL. We use this for
         the "did the endpoint we expected actually fire?" diagnostic list, and
-        also to catch our target endpoint here (since on_capture receives the
-        URL, whereas on_data only receives the body)."""
+        also to catch our target endpoints here."""
+        nonlocal mget_capture_count
         with lock:
             captured_urls.append(cap.url)
             if _INIT_DATA_RE.search(cap.url) and cap.body is not None:
                 init_data_bodies.append(cap.body)
-                # Bubble.io's init/data returns a JSON array, not an object.
-                # Log the shape hint so we can eyeball what's in it.
                 if isinstance(cap.body, list):
                     shape = f"list len={len(cap.body)}"
                 elif isinstance(cap.body, dict):
@@ -127,6 +139,15 @@ def proposal(
                 else:
                     shape = f"{type(cap.body).__name__}"
                 _log(f"init/data captured  {cap.url[:110]}  ({shape})")
+            elif _MGET_RE.search(cap.url) and cap.body is not None:
+                mget_capture_count += 1
+                # mget response is {"docs": [{"_id", "_type", "_source", ...}]}
+                docs = cap.body.get("docs") if isinstance(cap.body, dict) else None
+                if isinstance(docs, list):
+                    mget_docs.extend(docs)
+                    _log(f"mget captured  {cap.url[:110]}  (+{len(docs)} docs)")
+                else:
+                    _log(f"mget captured (no docs[])  {cap.url[:110]}")
             else:
                 _log(f"seen (discarded)  {cap.url[:110]}")
 
@@ -165,6 +186,8 @@ def proposal(
 
     with lock:
         bodies_snapshot = list(init_data_bodies)
+        mget_docs_snapshot = list(mget_docs)
+        mget_count_snapshot = mget_capture_count
         urls_snapshot = list(captured_urls)
 
     login_wall = state.status == "waiting_login" or (
@@ -172,23 +195,39 @@ def proposal(
     )
     latest = bodies_snapshot[-1] if bodies_snapshot else None
 
+    # Diagnostic: doc-type breakdown across all mget docs.
+    mget_type_counts: dict[str, int] = {}
+    for d in mget_docs_snapshot:
+        t = d.get("_type") if isinstance(d, dict) else None
+        mget_type_counts[t or "?"] = mget_type_counts.get(t or "?", 0) + 1
+
     _log(f"done  status={state.status}  login_wall={login_wall}  "
-         f"init_data_captures={len(bodies_snapshot)}  seen_urls={len(urls_snapshot)}")
+         f"init_data_captures={len(bodies_snapshot)}  "
+         f"mget_responses={mget_count_snapshot}  mget_docs={len(mget_docs_snapshot)}  "
+         f"seen_urls={len(urls_snapshot)}")
+    if mget_type_counts:
+        _log(f"mget type breakdown: {mget_type_counts}")
 
     return {
         "url": target_url,
         "status": state.status,
         "error": state.error,
         "login_wall": login_wall,
-        # The single response we care about — the last init/data body observed
-        # (if the page hydrated more than once during the window).
+        # ── init/data — Bubble's page-hydration endpoint ─────────────────
+        # Currently what the extractor reads. Kept during the mget switchover
+        # so we can diff mget's docs against this known-good baseline.
         "init_data": latest,
-        # Every init/data response captured during the window, oldest first.
-        # Usually len 1; may be more if the page navigated / re-hydrated.
         "init_data_all": bodies_snapshot,
         "init_data_count": len(bodies_snapshot),
-        # Every JSON XHR/fetch URL the interceptor saw — for diagnosing
-        # "nothing captured" (the endpoint pattern may have changed).
+        # ── mget — elasticsearch batch-get, aggregated across all captures ──
+        # {"_id", "_type", "_source", "found", ...}-shape entries. If the
+        # union of these across the whole capture window contains fields
+        # missing from init/data (zip code, full address, etc.), we'll
+        # switch the extractor to read from here.
+        "mget_docs": mget_docs_snapshot,
+        "mget_capture_count": mget_count_snapshot,
+        "mget_type_counts": mget_type_counts,
+        # Every JSON XHR/fetch URL the interceptor saw — for diagnostics.
         "captured_urls": urls_snapshot,
     }
 

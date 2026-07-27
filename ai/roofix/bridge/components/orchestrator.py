@@ -32,18 +32,43 @@ LOG_COLUMNS = ["stage", "action", "ok", "detail", "event_type", "project_ref"]
 
 
 def _default_log() -> CsvLogger:
-    """Fallback CsvLogger for callers (e.g. tests) that don't inject one."""
+    """Fallback CsvLogger for callers (e.g. tests) that don't inject one.
+
+    Called by: `process_batch` and `run` when no log is passed in.
+    """
     log_dir = os.getenv("LOG_DIR", "/data")
     return CsvLogger(path=Path(log_dir) / "agent_log.csv", columns=LOG_COLUMNS)
 
 
 def _identity_key(ev: dict) -> str:
+    """Build a grouping key so emails from the same real-world project are batched together.
+
+    Priority: use the explicit `project_id` if present (most reliable).
+    Otherwise fall back to a composite of customer_name + address.
+
+    Called by: `process_batch` (inside the grouping loop).
+    """
     if ev.get("project_id"):
         return f"id:{ev['project_id']}"
     return f"na:{(ev.get('customer_name') or '').lower()}|{(ev.get('address') or '').lower()}"
 
 
 def _resolve_context(ev: dict, phoenix) -> dict:
+    """Look up the Phoenix project that an event belongs to.
+
+    Strategy:
+      1. If the event carries a `project_id`, search by that Roofix external ID.
+      2. Otherwise search by customer identity (name + optional address).
+
+    Returns a dict with:
+      - ``found`` (bool): did we find a matching project?
+      - ``ambiguous`` (bool): were there multiple candidates?
+      - ``phoenix_project_id`` (int, optional): the single-match Phoenix project id.
+      - ``candidate_count`` (int, optional): how many candidates matched.
+      - ``offline`` (bool, optional): True when phoenix client is unavailable.
+
+    Called by: `process_batch` (once per event, inside the per-group loop).
+    """
     if phoenix is None:
         return {"found": False, "offline": True}
     if ev.get("project_id"):
@@ -71,6 +96,21 @@ def _resolve_context(ev: dict, phoenix) -> dict:
 
 def _execute(decision: dict, ev: dict, phoenix, log: CsvLogger,
              milestone_map: Optional[dict]) -> None:
+    """Carry out (or log) the brain's decision for a single event.
+
+    Branches on ``decision["action"]``:
+      - ``"ignore"``        → log the ignore, do nothing else.
+      - ``"escalate"`` / needs_human → log for human review, skip Phoenix write.
+      - ``"update_chatter"`` → call ``phoenix.update_chatter(project_id, note)``.
+      - ``"update_milestone"`` → look up the milestone mapping, call
+        ``phoenix.update_milestone(project_id, block_name, status_id)``.
+      - anything else      → log as unsupported (Phase 0 gate).
+
+    When ``phoenix is None`` or ``DRY_RUN=True``, the Phoenix write is skipped
+    and a dry-run note is logged instead.
+
+    Called by: `process_batch` (once per event, after ``decide()`` returns).
+    """
     action = decision["action"]
     etype = ev.get("event_type", "")
     pref = decision.get("target") or ""
@@ -119,6 +159,29 @@ def _execute(decision: dict, ev: dict, phoenix, log: CsvLogger,
 
 def process_batch(raw_emails: list, phoenix=None, log: Optional[CsvLogger] = None,
                   milestone_map: Optional[dict] = None) -> list:
+    """Process a batch of raw emails through the full pipeline.
+
+    Pipeline per event:
+      1. **Parse** — convert raw email dict into a structured event via ``parse_email()``.
+      2. **Group** — bucket events by project identity (``_identity_key``).
+      3. **Sort** — within each group, order by ``email_timestamp`` (oldest first).
+      4. **Resolve context** — look up the Phoenix project for the event.
+      5. **Decide** — ask the brain what to do (``decide()``).
+      6. **Execute** — carry out or log the decision (_execute).
+
+    Every step is logged to the CsvLogger.
+
+    Called by: `run` (the production entry point) and tests (direct invocation).
+
+    Args:
+        raw_emails: List of raw email dicts from the listener.
+        phoenix: Phoenix client instance (None for offline / dry-run mode).
+        log: CsvLogger for audit trail (falls back to default if omitted).
+        milestone_map: Mapping from roofix event names to Phoenix block/status ids.
+
+    Returns:
+        List of decision dicts (one per event, after ``decide().as_dict()``).
+    """
     log = log or _default_log()
     decisions = []
 
@@ -148,7 +211,27 @@ def process_batch(raw_emails: list, phoenix=None, log: Optional[CsvLogger] = Non
 
 def run(listener: Callable[[], list], phoenix=None, milestone_map=None,
         log: Optional[CsvLogger] = None) -> list:
-    """Production entry: pull a batch from the listener and process it once."""
+    """Production entry point: fetch one batch of emails and process it.
+
+    This is the function called by the scheduler (APS) each tick. It pulls raw
+    emails from the injected ``listener`` callable, logs how many were fetched,
+    then delegates to ``process_batch()`` for the full parse → group → decide →
+    execute pipeline.
+
+    Called by: the APScheduler job in the bridge's main loop (``fetcher.py`` or
+    the scheduler that invokes ``components.orchestrator.run`` every
+    ``TICK_INTERVAL_SECONDS``).
+
+    Args:
+        listener: Callable that returns a list of raw email dicts (e.g. the
+            Gmail client wrapper).
+        phoenix: Phoenix client instance (None for dry-run mode).
+        milestone_map: Mapping from roofix event names to Phoenix block/status ids.
+        log: CsvLogger for audit trail.
+
+    Returns:
+        List of decision dicts (same as ``process_batch``).
+    """
     log = log or _default_log()
     raw = listener()
     log.log("listener", "fetch", True, f"{len(raw)} email(s)")

@@ -87,6 +87,13 @@ class ParsedEvent:
 
 
 def _classify(sender: str, subject: str) -> str:
+    """Determine the event type from the email sender display name or subject line.
+
+    Priority: sender display name ("RFX | New Comment") is the most reliable signal.
+    Falls back to the subject line's leading segment before the first " - ".
+
+    Called by: `parse_email` (first extraction step).
+    """
     m = _SENDER_RE.match(sender or "")
     if m:
         return _normalize_type(m.group("type"))
@@ -96,6 +103,16 @@ def _classify(sender: str, subject: str) -> str:
 
 
 def _normalize_type(t: str) -> str:
+    """Canonicalize event type strings by resolving abbreviations and synonyms.
+
+    Roofix sends inconsistent type labels across sender names and subjects.
+    This maps them to a stable set of canonical types used downstream by the brain.
+
+    Canonical types: "New Comment", "New Task", "Estimate Complete", "Estimate",
+    "Deposit Invoice Sent", "Install Date", "HIC Executed", "Unknown".
+
+    Called by: `_classify`.
+    """
     t = t.strip()
     aliases = {
         "Estimate Comp.": "Estimate Complete",
@@ -112,6 +129,15 @@ def _normalize_type(t: str) -> str:
 
 
 def _extract_project(subject: str, body: str) -> tuple[Optional[str], Optional[str]]:
+    """Extract the project ID and full URL from a ``roofix.io/project/<id>`` link.
+
+    Searches both subject and body (subject first). Returns ``(project_id, full_url)``
+    or ``(None, None)`` if no link is found.
+
+    The project ID format is ``<hex>x<hex>`` (Bubble-style UUIDs).
+
+    Called by: `parse_email`.
+    """
     for text in (subject, body):
         if not text:
             continue
@@ -122,7 +148,17 @@ def _extract_project(subject: str, body: str) -> tuple[Optional[str], Optional[s
 
 
 def _extract_name_address(subject: str, body: str, event_type: str = ""):
-    """Try subject first, then body. Returns (name, address, suffix)."""
+    """Extract customer name and address from the "<Name> - <Address>" pattern.
+
+    Strategy: try subject first, then body. The subject may start with an event-type
+    prefix (e.g. "New Comment - ") which would be mistaken for the name — this function
+    detects and skips that prefix.
+
+    Strips trailing address suffixes like "(Reorder)" and returns them separately as
+    ``address_suffix``. Collapses multiple spaces in names.
+
+    Called by: `parse_email`.
+    """
     candidates = []
     if subject:
         s = subject
@@ -153,6 +189,13 @@ def _extract_name_address(subject: str, body: str, event_type: str = ""):
 
 
 def _extract_comment(body: str) -> tuple[Optional[str], list]:
+    """Extract a quoted comment and any ``@Username`` mentions from the email body.
+
+    Looks for text wrapped in double quotes (``"..."``). Scans the quoted text for
+    ``@Name`` tokens.
+
+    Called by: `parse_email` (only for ``"New Comment"`` events).
+    """
     if not body:
         return None, []
     m = _QUOTE_RE.search(body)
@@ -164,7 +207,27 @@ def _extract_comment(body: str) -> tuple[Optional[str], list]:
 
 
 def parse_email(raw: dict) -> ParsedEvent:
-    """raw is Contract A: {sender, subject, body_text, timestamp, to, ...}."""
+    """Parse a raw email (Contract A) into a structured event (Contract B).
+
+    Pipeline:
+      1. **Classify** — determine event_type from sender name or subject.
+      2. **Extract project** — find ``roofix.io/project/<id>`` link.
+      3. **Extract name/address** — parse "<Name> - <Address>" pattern.
+      4. **Extract comment** — for New Comment events, pull quoted text + @mentions.
+      5. **Extract tracking URL** — find the email's tokenized tracking link.
+      6. **Set parse_complete** — False if the email is too thin to act on
+         (no identity, needs scraping, or missing comment text).
+
+    Called by: `process_batch` in the orchestrator (maps over the raw email list).
+             Also used by tests with sample email dicts.
+
+    Args:
+        raw: Raw email dict with keys like ``sender``, ``subject``,
+            ``body_text``, ``body_html``, ``timestamp``, ``to``.
+
+    Returns:
+        A ``ParsedEvent`` dataclass with all extracted fields populated.
+    """
     sender = raw.get("sender", "")
     subject = _html.unescape(raw.get("subject", "") or "")
     body = _html.unescape(raw.get("body_text", "") or "")

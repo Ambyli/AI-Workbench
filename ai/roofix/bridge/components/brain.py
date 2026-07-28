@@ -176,15 +176,15 @@ def generate_ai_decision(event: dict, context: dict, why: str) -> Decision:
     change with no code change here.
 
     Reads:
-        LITELLM_URL         (default http://litellm:4000)
-        LITELLM_API_KEY     (LiteLLM master or virtual key)
+        ROOFIX_LLM_URL      (default http://litellm:4000)
+        ROOFIX_LLM_API_KEY  (LiteLLM master or virtual key)
         BRAIN_MODEL         (LiteLLM model alias, e.g. "qwen3.6")
     """
     from openai import OpenAI  # local import so rules path has no hard SDK dep
 
     client = OpenAI(
-        base_url=os.environ.get("LITELLM_URL", "http://litellm:4000").rstrip("/") + "/v1",
-        api_key=os.environ["LITELLM_API_KEY"],
+        base_url=os.environ.get("ROOFIX_LLM_URL", "http://litellm:4000").rstrip("/") + "/v1",
+        api_key=os.environ["ROOFIX_LLM_API_KEY"],
     )
     user = json.dumps({"why_escalated": why, "event": event, "phoenix_context": context})
 

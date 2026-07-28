@@ -77,8 +77,8 @@ Ambiguous or thin `Estimate` / `Estimate Complete` events cause the bridge to ca
 | `DRY_RUN` | `true` | When true, decisions are logged but no Phoenix writes happen. |
 | `AGENT_PHASE` | `0` | `0` = chatter + milestones only. `1` (future) = project creation + rep notifications. |
 | `TICK_INTERVAL_SECONDS` | `300` | Scheduler cadence. |
-| `LITELLM_URL` | `http://litellm:4000` | Bridge's LiteLLM base URL (OpenAI-compatible). |
-| `LITELLM_API_KEY` | _(from `DEFAULT_LITELLM_MASTER_KEY`)_ | Auth for LiteLLM. |
+| `ROOFIX_LLM_URL` | `http://litellm:4000` | Bridge's LiteLLM base URL (OpenAI-compatible). |
+| `ROOFIX_LLM_API_KEY` | Auth for LiteLLM. |
 | `BRAIN_MODEL` | `qwen3.6` | LiteLLM model alias used for AI fallback decisions. |
 | `ROOFIX_SENDER` | `no-reply@roofix.io` | Gmail search-query sender. **Note the two `o`s.** |
 | `LISTENER_QUERY` | `is:unread from:${ROOFIX_SENDER}` | Full Gmail search query. Override to narrow the fetch — e.g. to a single project during first live tests. |

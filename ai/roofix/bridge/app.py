@@ -40,10 +40,8 @@ from components.orchestrator import LOG_COLUMNS, process_batch, run as orchestra
 from components.phoenix_client import PhoenixClient
 from components.roofix_scraper_client import RoofixScraperClient
 
-
 TICK_INTERVAL_SECONDS = int(os.getenv("TICK_INTERVAL_SECONDS", "300"))
-FIELD_MAPPING_PATH = os.getenv("FIELD_MAPPING_PATH",
-                               "/app/config/field_mapping.json")
+FIELD_MAPPING_PATH = os.getenv("FIELD_MAPPING_PATH", "/app/config/field_mapping.json")
 LOG_DIR = os.getenv("LOG_DIR", "/data")
 DEBUG_LOGGING = os.getenv("DEBUG_LOGGING", "false").lower() == "true"
 
@@ -107,12 +105,18 @@ def _run_one_batch(raw_emails: Optional[list] = None) -> dict:
 
         # Filter out already-processed emails.
         unprocessed = [
-            e for e in raw_emails
+            e
+            for e in raw_emails
             if not processed_store.is_processed(e.get("message_id"))
         ]
-        _audit_log.log("listener", "filtered", True,
-                       f"{len(unprocessed)} email(s) after filtering processed",
-                       event_type="", project_ref="")
+        _audit_log.log(
+            "listener",
+            "filtered",
+            True,
+            f"{len(unprocessed)} email(s) after filtering processed",
+            event_type="",
+            project_ref="",
+        )
 
         decisions = orchestrator_run(
             listener=lambda: unprocessed,
@@ -141,7 +145,9 @@ def _run_one_batch(raw_emails: Optional[list] = None) -> dict:
 
 def _record_tick(decisions: list, error: Optional[str]) -> None:
     with _STATE_LOCK:
-        _STATE["last_tick_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        _STATE["last_tick_at"] = datetime.now(timezone.utc).isoformat(
+            timespec="seconds"
+        )
         _STATE["last_tick_ok"] = error is None
         _STATE["last_tick_error"] = error
         _STATE["tick_count"] += 1
@@ -161,11 +167,14 @@ def _scheduled_tick() -> None:
 
 
 scheduler = BackgroundScheduler(timezone="UTC")
-scheduler.add_job(_scheduled_tick, "interval",
-                  seconds=TICK_INTERVAL_SECONDS,
-                  id="roofix_bridge_tick",
-                  max_instances=1,
-                  coalesce=True)
+scheduler.add_job(
+    _scheduled_tick,
+    "interval",
+    seconds=TICK_INTERVAL_SECONDS,
+    id="roofix_bridge_tick",
+    max_instances=1,
+    coalesce=True,
+)
 
 app = FastAPI(title="Roofix Bridge")
 
@@ -212,5 +221,21 @@ def tick(req: Optional[TickRequest] = None) -> dict:
 
 
 if __name__ == "__main__":
+    import signal
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+
+    def _shutdown(signum, frame):
+        """Handle Ctrl+C / SIGTERM: stop scheduler, let batch finish, exit clean."""
+        _stdlib_logger.info(
+            "Shutdown signal received (%s). Stopping scheduler...", signum
+        )
+        scheduler.shutdown(wait=True)
+        _stdlib_logger.info("Scheduler stopped. Exiting.")
+        # Exit with the signal's exit code so the OS knows it was interrupted,
+        # not a crash.
+        os._exit(128 + signum)
+
+    signal.signal(signal.SIGINT, _shutdown)
+    signal.signal(signal.SIGTERM, _shutdown)
+
+    uvicorn.run(app, host="0.0.0.0", port=8010)

@@ -58,6 +58,12 @@ class ProcessedStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, isolation_level=None)  # autocommit
         conn.row_factory = sqlite3.Row

@@ -137,15 +137,35 @@ class GmailClient:
     def fetch(self, max_results: int = 25, query: str | None = None) -> list:
         """Return raw emails (Contract A) for matching mail. Does NOT mark
         read — the caller marks read only after successful processing, so a
-        crash never silently drops an event."""
+        crash never silently drops an event.
+
+        Retries on transient API errors (rate limits, precondition failures)
+        with exponential backoff. Skips messages that fail after all retries.
+        """
+        import time
+        from googleapiclient.errors import HttpError
+
         svc = self.service()
         q = query or QUERY
         resp = svc.users().messages().list(
             userId="me", q=q, maxResults=max_results).execute()
         out = []
         for ref in resp.get("messages", []):
-            msg = svc.users().messages().get(
-                userId="me", id=ref["id"], format="full").execute()
+            msg = None
+            retries = 3
+            for attempt in range(retries):
+                try:
+                    msg = svc.users().messages().get(
+                        userId="me", id=ref["id"], format="full").execute()
+                    break
+                except HttpError as e:
+                    if e.resp.status in (429, 500, 502, 503, 504):
+                        wait = 2 ** attempt + 0.5
+                        time.sleep(wait)
+                        continue
+                    raise
+            if msg is None:
+                continue
             payload = msg.get("payload", {})
             headers = payload.get("headers", [])
             text, html = self._extract_bodies(payload)

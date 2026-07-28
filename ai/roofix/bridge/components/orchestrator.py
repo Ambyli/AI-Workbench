@@ -23,6 +23,7 @@ from common.logging_setup import CsvLogger
 
 from components.parser import parse_email
 from components.brain import decide
+from components.proposal_extractor import extract_proposal
 
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 
@@ -156,11 +157,19 @@ def _execute(decision: dict, ev: dict, phoenix, log: CsvLogger,
 
     if action == "create_project":
         tracking_url = decision["payload"].get("tracking_url")
-        if not tracking_url or not scraper_client:
+        if not tracking_url:
             log.log("orchestrator", action, False,
-                    "create_project needs scraper_client and tracking_url",
+                    "create_project missing tracking_url",
                     event_type=etype, project_ref=pref)
             return
+        if not scraper_client:
+            log.log("orchestrator", action, False,
+                    "create_project needs scraper_client",
+                    event_type=etype, project_ref=pref)
+            return
+        log.log("orchestrator", "create_project_start", True,
+                f"starting create_project for {tracking_url}",
+                event_type=etype, project_ref=pref)
 
         # Mark pending before scraping.
         if processed_store:
@@ -187,7 +196,6 @@ def _execute(decision: dict, ev: dict, phoenix, log: CsvLogger,
                 return
 
             # Extract the proposal.
-            from components.proposal_extractor import extract_proposal
             extracted = extract_proposal(scraper_result)
 
             if not extracted.ok:

@@ -67,6 +67,7 @@ class ParsedEvent:
     email_timestamp: Optional[str] = None
     raw_subject: Optional[str] = None
     notes: list = field(default_factory=list)  # parser observations / why-incomplete
+    message_id: Optional[str] = None          # Gmail message id for mark_read tracking
 
     def as_dict(self) -> dict:
         return {
@@ -83,6 +84,7 @@ class ParsedEvent:
             "email_timestamp": self.email_timestamp,
             "raw_subject": self.raw_subject,
             "notes": self.notes,
+            "message_id": self.message_id,
         }
 
 
@@ -223,7 +225,8 @@ def parse_email(raw: dict) -> ParsedEvent:
 
     Args:
         raw: Raw email dict with keys like ``sender``, ``subject``,
-            ``body_text``, ``body_html``, ``timestamp``, ``to``.
+            ``body_text``, ``body_html``, ``timestamp``, ``to``,
+            ``message_id`` (optional, for mark_read tracking).
 
     Returns:
         A ``ParsedEvent`` dataclass with all extracted fields populated.
@@ -254,6 +257,7 @@ def parse_email(raw: dict) -> ParsedEvent:
         mentioned_users=mentions,
         email_timestamp=raw.get("timestamp"),
         raw_subject=subject,
+        message_id=raw.get("message_id"),
     )
     ev.tracking_url = tracking_url
 

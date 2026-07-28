@@ -233,5 +233,20 @@ def proposal(
 
 
 if __name__ == "__main__":
+    import signal
     import uvicorn
+
+    def _shutdown(signum, frame):
+        """Handle Ctrl+C / SIGTERM: close any running Chromium instances."""
+        _log(f"Shutdown signal received ({signum}). Cleaning up...")
+        try:
+            client.quit()
+        except Exception:
+            pass
+        _log("Cleanup complete. Exiting.")
+        os._exit(128 + signum)
+
+    signal.signal(signal.SIGINT, _shutdown)
+    signal.signal(signal.SIGTERM, _shutdown)
+
     uvicorn.run(app, host="0.0.0.0", port=8080)

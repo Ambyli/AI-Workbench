@@ -179,6 +179,7 @@ def generate_ai_decision(event: dict, context: dict, why: str) -> Decision:
         ROOFIX_LLM_URL      (default http://litellm:4000)
         ROOFIX_LLM_API_KEY  (LiteLLM master or virtual key)
         BRAIN_MODEL         (LiteLLM model alias, e.g. "qwen3.6")
+        BRAIN_MAX_TOKENS    (max tokens per AI decision, default 400)
     """
     from openai import OpenAI  # local import so rules path has no hard SDK dep
 
@@ -190,7 +191,7 @@ def generate_ai_decision(event: dict, context: dict, why: str) -> Decision:
 
     resp = client.chat.completions.create(
         model=os.environ.get("BRAIN_MODEL", "qwen3.6"),
-        max_tokens=400,
+        max_tokens=int(os.environ.get("BRAIN_MAX_TOKENS", "400")),
         messages=[
             {"role": "system", "content": _SYSTEM_PROMPT},
             {"role": "user", "content": user},
@@ -199,7 +200,20 @@ def generate_ai_decision(event: dict, context: dict, why: str) -> Decision:
     )
     text = (resp.choices[0].message.content or "").strip()
     text = text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-    data = json.loads(text)
+
+    # Validate the response is actually JSON before parsing
+    if not text:
+        raise ValueError("Empty response from model")
+
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Model returned non-JSON response: {text[:200]}") from e
+
+    # Validate required fields exist
+    if "action" not in data:
+        raise ValueError("Model response missing 'action' field")
+
     return Decision(
         action=data.get("action", "escalate"),
         target=data.get("target"),

@@ -115,8 +115,18 @@ def decide(event: dict, context: dict) -> Decision:
             return Decision("ignore", reasoning=(
                 f"'{etype}' is informational (good/better/best ladder). Phase 0 does "
                 f"not act on estimates; contract value is set by a signing event."))
-        return _escalate_to_ai(event, context,
-            why="Estimate event in Phase 1: new project vs. re-quote of existing?")
+        # Phase 1: if we have a tracking URL, emit create_project. The
+        # orchestrator will scrape, extract, and decide acceptance.
+        tracking_url = event.get("tracking_url")
+        if tracking_url:
+            return Decision("create_project",
+                target=tracking_url,
+                payload={"tracking_url": tracking_url},
+                reasoning=f"'{etype}' with tracking URL — scrape and evaluate acceptance.")
+        # No tracking URL — can't scrape, escalate.
+        return Decision("escalate",
+            reasoning=f"'{etype}' with no tracking URL — cannot scrape proposal.",
+            needs_human=True)
 
     if etype == "New Task":
         return Decision("ignore", reasoning=(

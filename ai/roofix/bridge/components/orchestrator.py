@@ -95,7 +95,8 @@ def _resolve_context(ev: dict, phoenix) -> dict:
 
 
 def _execute(decision: dict, ev: dict, phoenix, log: CsvLogger,
-             milestone_map: Optional[dict]) -> None:
+             milestone_map: Optional[dict],
+             scraper_client=None, processed_store=None) -> None:
     """Carry out (or log) the brain's decision for a single event.
 
     Branches on ``decision["action"]``:
@@ -153,12 +154,112 @@ def _execute(decision: dict, ev: dict, phoenix, log: CsvLogger,
                 event_type=etype, project_ref=pref)
         return
 
+    if action == "create_project":
+        tracking_url = decision["payload"].get("tracking_url")
+        if not tracking_url or not scraper_client:
+            log.log("orchestrator", action, False,
+                    "create_project needs scraper_client and tracking_url",
+                    event_type=etype, project_ref=pref)
+            return
+
+        # Mark pending before scraping.
+        if processed_store:
+            processed_store.mark_pending(ev.get("message_id"), metadata={
+                "tracking_url": tracking_url,
+                "event_type": etype,
+            })
+
+        try:
+            # Scrape the proposal.
+            log.log("scraper", "start", True, f"scraping {tracking_url}",
+                    event_type=etype, project_ref=pref)
+            scraper_result = scraper_client.get_proposal(
+                project_id=None, tracking_url=tracking_url)
+
+            if not scraper_result.get("docs"):
+                log.log("scraper", "no_docs", False,
+                        "scraper returned no docs",
+                        event_type=etype, project_ref=pref)
+                if processed_store:
+                    processed_store.mark_error(ev.get("message_id"), metadata={
+                        "error": "no_docs",
+                    })
+                return
+
+            # Extract the proposal.
+            from components.proposal_extractor import extract_proposal
+            extracted = extract_proposal(scraper_result)
+
+            if not extracted.ok:
+                log.log("extractor", "failed", False, extracted.error,
+                        event_type=etype, project_ref=pref)
+                if processed_store:
+                    processed_store.mark_error(ev.get("message_id"), metadata={
+                        "error": extracted.error,
+                    })
+                return
+
+            log.log("extractor", "ok", True,
+                    f"extracted {extracted.roofix_project_id}, "
+                    f"is_accepted={extracted.is_accepted}",
+                    event_type=etype, project_ref=pref)
+
+            # Only create if accepted.
+            if not extracted.is_accepted:
+                log.log("orchestrator", "not_accepted", True,
+                        "proposal not accepted, skipping create",
+                        event_type=etype, project_ref=pref)
+                if processed_store:
+                    processed_store.mark_ok(ev.get("message_id"), metadata={
+                        "roofix_project_id": extracted.roofix_project_id,
+                        "accepted": False,
+                    })
+                return
+
+            # Call ensure_entity_and_project.
+            if not phoenix:
+                log.log("orchestrator", action, False,
+                        "phoenix client required for create_project",
+                        event_type=etype, project_ref=pref)
+                return
+
+            res = phoenix.ensure_entity_and_project(extracted.__dict__)
+
+            log.log("phoenix", action, res.ok,
+                    (("DRY_RUN " if res.dry_run else "") + res.detail),
+                    event_type=etype, project_ref=pref)
+
+            if res.ok:
+                if processed_store:
+                    processed_store.mark_ok(ev.get("message_id"), metadata={
+                        "roofix_project_id": extracted.roofix_project_id,
+                        "phoenix_entity_id": res.data.get("entity_id"),
+                        "phoenix_project_id": res.data.get("phoenix_project_id"),
+                        "accepted": True,
+                    })
+            else:
+                if processed_store:
+                    processed_store.mark_error(ev.get("message_id"), metadata={
+                        "error": res.detail,
+                    })
+
+        except Exception as e:
+            log.log("orchestrator", action, False,
+                    f"create_project failed: {e}",
+                    event_type=etype, project_ref=pref)
+            if processed_store:
+                processed_store.mark_error(ev.get("message_id"), metadata={
+                    "error": repr(e),
+                })
+        return
+
     log.log("orchestrator", action, False, f"action '{action}' not enabled in Phase 0",
             event_type=etype, project_ref=pref)
 
 
 def process_batch(raw_emails: list, phoenix=None, log: Optional[CsvLogger] = None,
-                  milestone_map: Optional[dict] = None) -> list:
+                  milestone_map: Optional[dict] = None,
+                  scraper_client=None, processed_store=None) -> list:
     """Process a batch of raw emails through the full pipeline.
 
     Pipeline per event:
@@ -178,6 +279,8 @@ def process_batch(raw_emails: list, phoenix=None, log: Optional[CsvLogger] = Non
         phoenix: Phoenix client instance (None for offline / dry-run mode).
         log: CsvLogger for audit trail (falls back to default if omitted).
         milestone_map: Mapping from roofix event names to Phoenix block/status ids.
+        scraper_client: RoofixScraperClient instance for scraping proposals.
+        processed_store: ProcessedStore instance for tracking processed emails.
 
     Returns:
         List of decision dicts (one per event, after ``decide().as_dict()``).
@@ -203,14 +306,17 @@ def process_batch(raw_emails: list, phoenix=None, log: Optional[CsvLogger] = Non
             log.log("brain", d["action"], not d["needs_human"],
                     f"[{d['source']}] {d['reasoning']}",
                     event_type=ev.get("event_type", ""), project_ref=key)
-            _execute(d, ev, phoenix, log, milestone_map)
+            _execute(d, ev, phoenix, log, milestone_map,
+                     scraper_client=scraper_client,
+                     processed_store=processed_store)
             decisions.append(d)
 
     return decisions
 
 
 def run(listener: Callable[[], list], phoenix=None, milestone_map=None,
-        log: Optional[CsvLogger] = None) -> list:
+        log: Optional[CsvLogger] = None,
+        scraper_client=None, processed_store=None) -> list:
     """Production entry point: fetch one batch of emails and process it.
 
     This is the function called by the scheduler (APS) each tick. It pulls raw
@@ -228,6 +334,8 @@ def run(listener: Callable[[], list], phoenix=None, milestone_map=None,
         phoenix: Phoenix client instance (None for dry-run mode).
         milestone_map: Mapping from roofix event names to Phoenix block/status ids.
         log: CsvLogger for audit trail.
+        scraper_client: RoofixScraperClient instance for scraping proposals.
+        processed_store: ProcessedStore instance for tracking processed emails.
 
     Returns:
         List of decision dicts (same as ``process_batch``).
@@ -235,4 +343,14 @@ def run(listener: Callable[[], list], phoenix=None, milestone_map=None,
     log = log or _default_log()
     raw = listener()
     log.log("listener", "fetch", True, f"{len(raw)} email(s)")
-    return process_batch(raw, phoenix=phoenix, log=log, milestone_map=milestone_map)
+
+    # Filter out already-processed emails.
+    if processed_store:
+        raw = [e for e in raw if not processed_store.is_processed(e.get("message_id"))]
+        log.log("listener", "filtered", True,
+                f"{len(raw)} email(s) after filtering processed",
+                event_type="", project_ref="")
+
+    return process_batch(
+        raw, phoenix=phoenix, log=log, milestone_map=milestone_map,
+        scraper_client=scraper_client, processed_store=processed_store)

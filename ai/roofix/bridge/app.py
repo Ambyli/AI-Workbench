@@ -31,12 +31,14 @@ from pydantic import BaseModel
 
 from common.env import load_env
 from common.logging_setup import CsvLogger, setup_logging
+from common.processed_store import ProcessedStore
 
 load_env()
 
 from components.gmail_client import GmailClient
-from components.orchestrator import LOG_COLUMNS, process_batch
+from components.orchestrator import LOG_COLUMNS, process_batch, run as orchestrator_run
 from components.phoenix_client import PhoenixClient
+from components.roofix_scraper_client import RoofixScraperClient
 
 
 TICK_INTERVAL_SECONDS = int(os.getenv("TICK_INTERVAL_SECONDS", "300"))
@@ -93,13 +95,45 @@ def _run_one_batch(raw_emails: Optional[list] = None) -> dict:
     """Run one processing batch. If raw_emails is None, pull from Gmail."""
     milestone_map = _load_milestone_map()
 
-    with PhoenixClient() as phoenix, GmailClient() as gmail:
+    with (
+        PhoenixClient() as phoenix,
+        GmailClient() as gmail,
+        ProcessedStore(Path(LOG_DIR) / "processed.db") as processed_store,
+        RoofixScraperClient() as scraper_client,
+    ):
         if raw_emails is None:
             raw_emails = gmail.fetch()
             _audit_log.log("listener", "fetch", True, f"{len(raw_emails)} email(s)")
 
-        decisions = process_batch(
-            raw_emails, phoenix=phoenix, log=_audit_log, milestone_map=milestone_map)
+        # Filter out already-processed emails.
+        unprocessed = [
+            e for e in raw_emails
+            if not processed_store.is_processed(e.get("message_id"))
+        ]
+        _audit_log.log("listener", "filtered", True,
+                       f"{len(unprocessed)} email(s) after filtering processed",
+                       event_type="", project_ref="")
+
+        decisions = orchestrator_run(
+            listener=lambda: unprocessed,
+            phoenix=phoenix,
+            log=_audit_log,
+            milestone_map=milestone_map,
+            scraper_client=scraper_client,
+            processed_store=processed_store,
+        )
+
+        # Mark successfully processed emails as read.
+        processed_ids = set()
+        for d in decisions:
+            if d.get("action") not in ("ignore", "escalate"):
+                # Find the original email for this decision by matching
+                # the decision's reasoning/payload to the email content.
+                for e in unprocessed:
+                    if e.get("subject") == d.get("payload", {}).get("subject"):
+                        gmail.mark_read(e["message_id"])
+                        processed_ids.add(e["message_id"])
+                        break
 
     _record_tick(decisions, error=None)
     return {"decisions": decisions, "count": len(decisions)}

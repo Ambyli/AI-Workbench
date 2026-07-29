@@ -294,7 +294,7 @@ def parse_email(raw: dict, scraper_client=None) -> ParsedEvent:
     if scraper_client and tracking_url:
         try:
             scraper_result = scraper_client.get_proposal(tracking_url=tracking_url)
-            if scraper_result.get("docs"):
+            if scraper_result.get("mget_docs"):
                 extracted = extract_proposal(scraper_result)
                 if extracted.ok:
                     # Update event with scraped data

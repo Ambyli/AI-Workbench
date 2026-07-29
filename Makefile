@@ -40,7 +40,7 @@ $(eval $(call service,classifier,classifier))
 $(eval $(call service,openwebui,openwebui))
 $(eval $(call service,oauth2-proxy,oauth2-proxy))
 $(eval $(call service,cloudflared,cloudflared))
-$(eval $(call service,roofix,roofix-bridge))
+$(eval $(call service,roofix,roofix))
 $(eval $(call service,interceptor-api,interceptor-api))
 
 setup: network

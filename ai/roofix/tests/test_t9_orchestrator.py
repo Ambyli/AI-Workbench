@@ -11,7 +11,7 @@ Verifies that Phase 1 estimate emails with tracking URLs trigger:
 
 Also verifies Phase 0 still ignores estimates (no scraper call).
 
-Run from ai/roofix/bridge/:
+Run from ai/roofix/:
     PYTHONPATH=../..:. python tests/test_t9_orchestrator.py
 """
 

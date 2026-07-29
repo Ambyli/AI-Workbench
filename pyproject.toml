@@ -2,7 +2,7 @@
 members = [
     "shared/common",
     "widget",
-    "ai/roofix/bridge",
+    "ai/roofix",
     "ai/interceptor-api",
 ]
 

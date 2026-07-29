@@ -8,7 +8,7 @@ This proves the orchestration glue works. The full Estimate → scrape →
 create_project flow requires T9 (orchestrator wiring) — that's a separate
 test once the wiring lands.
 
-Run from ai/roofix/bridge/:
+Run from ai/roofix/:
     PYTHONPATH=. python tests/test_e2e_offline.py
 """
 

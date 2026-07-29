@@ -8,8 +8,8 @@ into roofix_email_samples.py + test_parser.py. Not a pytest test (named
 verify_* so pytest skips it), does NOT mark anything read, does NOT write
 anything to disk.
 
-Run from ai/roofix/bridge/:
-    PYTHONPATH=. uv run --package roofix-bridge python tests/verify_estimate_parser.py
+Run from ai/roofix/:
+    PYTHONPATH=. uv run --package roofix python tests/verify_estimate_parser.py
 
 Optional args:
     --limit N       max emails to inspect (default 5)

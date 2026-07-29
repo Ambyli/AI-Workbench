@@ -13,8 +13,8 @@ Flow:
 Real Gmail account, real state change — that's why the confirmation step is
 required. Only affects ONE message per run (the oldest returned by fetch).
 
-Run from ai/roofix/bridge/:
-    PYTHONPATH=. uv run --package roofix-bridge python tests/verify_mark_read.py
+Run from ai/roofix/:
+    PYTHONPATH=. uv run --package roofix python tests/verify_mark_read.py
 """
 
 from __future__ import annotations

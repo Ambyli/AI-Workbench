@@ -5,7 +5,7 @@ For reads (find_*) and ensure_entity_and_project, we patch the relevant
 methods on individual instances so canned matches can drive the branch
 logic without a real Phoenix connection.
 
-Run from ai/roofix/bridge/:
+Run from ai/roofix/:
     PYTHONPATH=. python tests/test_phoenix_client.py
 """
 

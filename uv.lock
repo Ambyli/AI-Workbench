@@ -12,7 +12,7 @@ members = [
     "claude-usage-observer",
     "common",
     "interceptor-api",
-    "roofix-bridge",
+    "roofix",
 ]
 
 [[package]]
@@ -2762,9 +2762,9 @@ wheels = [
 ]
 
 [[package]]
-name = "roofix-bridge"
+name = "roofix"
 version = "0.1.0"
-source = { virtual = "ai/roofix/bridge" }
+source = { virtual = "ai/roofix" }
 dependencies = [
     { name = "apscheduler" },
     { name = "common" },

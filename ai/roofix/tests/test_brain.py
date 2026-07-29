@@ -1,6 +1,6 @@
 """
 Test the BRAIN's rules + escalation logic in isolation (Contract C). No AI call,
-no Phoenix. Run from ai/roofix-bridge/:  PYTHONPATH=. python tests/test_brain.py
+no Phoenix. Run from ai/roofix/:  PYTHONPATH=. python tests/test_brain.py
 """
 
 import os

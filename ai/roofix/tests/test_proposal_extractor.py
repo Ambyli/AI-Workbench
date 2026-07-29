@@ -1,7 +1,7 @@
 """
 Tests for components.proposal_extractor.extract_proposal.
 
-Run from ai/roofix/bridge/:   PYTHONPATH=. python tests/test_proposal_extractor.py
+Run from ai/roofix/:   PYTHONPATH=. python tests/test_proposal_extractor.py
 
 Fixtures are real captures from Roofix (see tests/fixtures/), pruned to the
 doc types the extractor reads and PII-redacted:

@@ -6,7 +6,7 @@ FROM python:3.11-slim
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     UV_NO_CACHE=1 \
-    PYTHONPATH=/app/ai/roofix/bridge
+    PYTHONPATH=/app/ai/roofix
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
@@ -15,16 +15,16 @@ WORKDIR /app
 # Workspace bootstrap.
 COPY pyproject.toml .
 COPY shared/common ./shared/common
-COPY ai/roofix/bridge/pyproject.toml ./ai/roofix/bridge/
+COPY ai/roofix/pyproject.toml ./ai/roofix/
 
-RUN uv sync --package roofix-bridge --no-dev
+RUN uv sync --package roofix --no-dev
 
 # Service code.
-COPY ai/roofix/bridge/app.py ./ai/roofix/bridge/
-COPY ai/roofix/bridge/components ./ai/roofix/bridge/components
-COPY ai/roofix/bridge/config ./ai/roofix/bridge/config
+COPY ai/roofix/app.py ./ai/roofix/
+COPY ai/roofix/components ./ai/roofix/components
+COPY ai/roofix/config ./ai/roofix/config
 
-WORKDIR /app/ai/roofix/bridge
+WORKDIR /app/ai/roofix
 EXPOSE 8080
 
 CMD ["uv", "run", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"]

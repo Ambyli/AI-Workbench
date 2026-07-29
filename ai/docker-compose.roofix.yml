@@ -4,13 +4,13 @@ networks:
     name: ai_shared
 
 services:
-  roofix-bridge:
+  roofix:
     networks:
       - shared
     build:
       context: ..
-      dockerfile: ai/Dockerfile.roofix-bridge
-    container_name: roofix-bridge
+      dockerfile: ai/Dockerfile.roofix
+    container_name: roofix
     restart: unless-stopped
     environment:
       - DRY_RUN=${DRY_RUN:-true}
@@ -38,10 +38,10 @@ services:
       - INTERCEPTOR_API_URL=${INTERCEPTOR_API_URL:-http://interceptor-api:8080}
       - LOG_DIR=/data
     volumes:
-      - roofix_bridge_data:/data
+      - roofix_data:/data
       # Read-only mount for OAuth secrets — bind to a host dir you control.
       # Populate it once with credentials.json + token.json before first run.
-      - ${ROOFIX_BRIDGE_CONFIG_DIR:-./roofix/bridge/config}:/config:ro
+      - ${ROOFIX_BRIDGE_CONFIG_DIR:-./roofix/config}:/config:ro
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
       interval: 30s
@@ -49,4 +49,4 @@ services:
       start_period: 20s
       retries: 3
 volumes:
-  roofix_bridge_data:
+  roofix_data:

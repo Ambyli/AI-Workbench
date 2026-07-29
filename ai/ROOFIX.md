@@ -4,7 +4,7 @@ A single-container subsystem that keeps [Phoenix](https://phoenix-mcp.com) in sy
 
 | Container | Purpose |
 |---|---|
-| `roofix-bridge` | Background worker. Fetches Roofix email via direct Gmail API → parses → decides (rules-first, LiteLLM fallback) → writes to Phoenix Postgres via direct psycopg2. Runs its own APScheduler. |
+| `roofix` | Background worker. Fetches Roofix email via direct Gmail API → parses → decides (rules-first, LiteLLM fallback) → writes to Phoenix Postgres via direct psycopg2. Runs its own APScheduler. |
 
 Internal-only — no host ports published by default. For proposal-page fetches (Roofix has no public API) the bridge calls the sibling **`interceptor-api`** container (see [INTERCEPTOR_API.md](INTERCEPTOR_API.md)) — a generic CDP-driving service that owns the Roofix login session as a named `--user-data-dir` profile.
 
@@ -24,7 +24,7 @@ Before the bridge can hydrate proposals, upload a Roofix profile to interceptor-
 
 ### Endpoints
 
-**`roofix-bridge:8080`**
+**`roofix:8080`**
 
 | Endpoint | Purpose |
 |---|---|
@@ -35,8 +35,8 @@ Before the bridge can hydrate proposals, upload a Roofix profile to interceptor-
 Reach the bridge from another container on `ai_shared`:
 
 ```bash
-docker exec -it litellm curl http://roofix-bridge:8080/status
-docker exec -it litellm curl -X POST http://roofix-bridge:8080/tick
+docker exec -it litellm curl http://roofix:8080/status
+docker exec -it litellm curl -X POST http://roofix:8080/tick
 ```
 
 For interceptor-api endpoints (proposal capture, profile refresh), see [INTERCEPTOR_API.md](INTERCEPTOR_API.md).
@@ -49,7 +49,7 @@ Gmail (Google API + OAuth) ──┐
 Phoenix DB (psycopg2) ◄─────►│
                              │
                      ┌───────┴────────┐
-                     │  roofix-bridge │  ── OpenAI SDK ──► litellm
+                     │     roofix     │  ── OpenAI SDK ──► litellm
                      └───────┬────────┘
                              │
                              │  POST /capture
@@ -69,7 +69,7 @@ Every `TICK_INTERVAL_SECONDS` (default 300s) the bridge:
 4. The brain decides: `update_chatter`, `update_milestone`, `ignore`, or `escalate`. Rules handle the clear cases; anything ambiguous escalates to LiteLLM (the "AI fallback"), which returns the same Decision shape.
 5. In DRY_RUN mode, the intended SQL + params are logged. Otherwise the writes are executed via psycopg2.
 
-Ambiguous or thin `Estimate` / `Estimate Complete` events cause the bridge to call `RoofixScraperClient.get_proposal(tracking_url)` (`ai/roofix/bridge/components/roofix_scraper_client.py`) — which POSTs the tracking URL + Roofix's Bubble init/data + elasticsearch/mget URL patterns to `interceptor-api`'s `/capture` and reshapes the response into the `init_data` + `mget_docs` dict that `proposal_extractor.extract_proposal` consumes.
+Ambiguous or thin `Estimate` / `Estimate Complete` events cause the bridge to call `RoofixScraperClient.get_proposal(tracking_url)` (`ai/roofix/components/roofix_scraper_client.py`) — which POSTs the tracking URL + Roofix's Bubble init/data + elasticsearch/mget URL patterns to `interceptor-api`'s `/capture` and reshapes the response into the `init_data` + `mget_docs` dict that `proposal_extractor.extract_proposal` consumes.
 
 ### Configuration
 
@@ -85,7 +85,7 @@ Ambiguous or thin `Estimate` / `Estimate Complete` events cause the bridge to ca
 | `LISTENER_QUERY` | `is:unread from:${ROOFIX_SENDER}` | Full Gmail search query. Override to narrow the fetch — e.g. to a single project during first live tests. |
 | `GMAIL_CREDENTIALS_PATH` | `/config/credentials.json` | OAuth 2.0 client secrets file from GCP. See [Gmail OAuth setup](#gmail-oauth-setup). |
 | `GMAIL_TOKEN_PATH` | `/config/token.json` | Refresh-token file. Written by the first successful login; reused thereafter. |
-| `ROOFIX_BRIDGE_CONFIG_DIR` | `./roofix/bridge/config` | Host dir containing `credentials.json` + `token.json`. Bind-mounted into the container at `/config` read-only. |
+| `ROOFIX_BRIDGE_CONFIG_DIR` | `./roofix/config` | Host dir containing `credentials.json` + `token.json`. Bind-mounted into the container at `/config` read-only. |
 | `PHOENIX_DB_HOST` | _(required)_ | Phoenix Postgres hostname. |
 | `PHOENIX_DB_PORT` | `5432` | Phoenix Postgres port. |
 | `PHOENIX_DB_NAME` | _(required)_ | Database name. |
@@ -102,7 +102,7 @@ Ambiguous or thin `Estimate` / `Estimate Complete` events cause the bridge to ca
 | `ROOFIX_INIT_DATA_URL_PATTERN` | `roofix\.io/api/1\.1/init/data` | Regex matched against captured XHR URLs to identify Bubble's page-hydrate endpoint. Override if Bubble ever renames it. |
 | `ROOFIX_MGET_URL_PATTERN` | `roofix\.io/elasticsearch/mget` | Regex matched against captured XHR URLs to identify the batch-get endpoint (customer + HIC + job docs). |
 | `FIELD_MAPPING_PATH` | `/app/config/field_mapping.json` | Roofix-event → Phoenix (block_name, status_id) map. |
-| `LOG_DIR` | `/data` | Where per-tick logs live (mounted volume). Two files: `roofix-bridge.log` (stdlib text log; framework messages + compact per-decision echo) and `agent_log.csv` (structured audit trail via `common.logging_setup.CsvLogger`). |
+| `LOG_DIR` | `/data` | Where per-tick logs live (mounted volume). Two files: `roofix.log` (stdlib text log; framework messages + compact per-decision echo) and `agent_log.csv` (structured audit trail via `common.logging_setup.CsvLogger`). |
 | `DEBUG_LOGGING` | `false` | When true, promotes the stdlib file log to DEBUG level and the console to DEBUG. |
 
 ### Gmail OAuth setup
@@ -120,14 +120,14 @@ container.
 2. **Enable the Gmail API** on the same GCP project (APIs & Services →
    Library → Gmail API → Enable).
 3. **Place `credentials.json`** in your host config dir (default:
-   `ai/roofix/bridge/config/credentials.json`). Git-ignored.
+   `ai/roofix/config/credentials.json`). Git-ignored.
 4. **Run the interactive login once, locally**, so `token.json` gets written:
 
    ```powershell
-   cd ai\roofix\bridge
+   cd ai\roofix
    $env:GMAIL_CREDENTIALS_PATH = "$PWD\config\credentials.json"
    $env:GMAIL_TOKEN_PATH = "$PWD\config\token.json"
-   uv run --package roofix-bridge python components\gmail_client.py
+   uv run --package roofix python components\gmail_client.py
    ```
 
    A browser opens; sign in with the inbox account (`rufix@zeoenergy.com`),
@@ -215,7 +215,7 @@ Redundancy is the point: if Roofix changes one field's behavior we still detect 
 1. **Offline unit tests** (no Docker, no network):
 
    ```bash
-   cd ai/roofix/bridge
+   cd ai/roofix
    PYTHONPATH=. python tests/test_parser.py
    PYTHONPATH=. python tests/test_brain.py
    ```
@@ -226,21 +226,21 @@ Redundancy is the point: if Roofix changes one field's behavior we still detect 
    docker compose -f ai/docker-compose.interceptor-api.yml up -d --build
    docker compose -f ai/docker-compose.roofix.yml up -d --build
    docker exec -it interceptor-api curl http://localhost:8080/health
-   docker exec -it roofix-bridge curl http://localhost:8080/status
+   docker exec -it roofix curl http://localhost:8080/status
    ```
 
 3. **Manual tick against real Gmail**:
 
    ```bash
-   docker exec -it roofix-bridge curl -X POST http://localhost:8080/tick
+   docker exec -it roofix curl -X POST http://localhost:8080/tick
    ```
 
-   Watch `docker logs -f roofix-bridge` — you should see each stage: `listener fetch`, `parser parsed`, `brain <action>`, `phoenix <action>` with `DRY_RUN` prefix on write attempts.
+   Watch `docker logs -f roofix` — you should see each stage: `listener fetch`, `parser parsed`, `brain <action>`, `phoenix <action>` with `DRY_RUN` prefix on write attempts.
 
 4. **Brain fallback path** — send a crafted event to exercise LiteLLM:
 
    ```bash
-   docker exec -it roofix-bridge curl -X POST -H "Content-Type: application/json" \
+   docker exec -it roofix curl -X POST -H "Content-Type: application/json" \
      -d '{"raw_emails":[{"sender":"RFX | Something Weird <no-reply@roofix.io>","subject":"Foo - Jane Doe - 1 Main St","body_text":"..."}]}' \
      http://localhost:8080/tick
    ```
@@ -262,7 +262,7 @@ docker compose -f ai/docker-compose.roofix.yml up -d --build
 ```
 ai/
   docker-compose.roofix.yml
-  Dockerfile.roofix-bridge
+  Dockerfile.roofix
   ROOFIX.md
   roofix/
     bridge/

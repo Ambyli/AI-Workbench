@@ -1,6 +1,6 @@
 """
 Test the PARSER alone against real Roofix email samples (Contract B).
-Run from ai/roofix-bridge/:   PYTHONPATH=. python tests/test_parser.py
+Run from ai/roofix/:   PYTHONPATH=. python tests/test_parser.py
 """
 
 from components.parser import parse_email

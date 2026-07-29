@@ -1,5 +1,5 @@
 [project]
-name = "roofix-bridge"
+name = "roofix"
 version = "0.1.0"
 description = "Roofix -> Phoenix bridge: parse Roofix emails, decide via LiteLLM, mirror events into Phoenix"
 requires-python = ">=3.11"

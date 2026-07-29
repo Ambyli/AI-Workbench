@@ -47,8 +47,8 @@ DEBUG_LOGGING = os.getenv("DEBUG_LOGGING", "false").lower() == "true"
 
 # Stdlib logging is what httpx / openai / apscheduler noise flows through,
 # plus the compact one-line echo CsvLogger emits per audit row.
-setup_logging("roofix-bridge", log_dir=LOG_DIR, debug=DEBUG_LOGGING)
-_stdlib_logger = logging.getLogger("roofix-bridge")
+setup_logging("roofix", log_dir=LOG_DIR, debug=DEBUG_LOGGING)
+_stdlib_logger = logging.getLogger("roofix")
 
 # Single CSV audit logger reused across ticks. Schema declared by orchestrator
 # (it's the one writing to it); we pass the same list back in so app + module
@@ -171,7 +171,7 @@ scheduler.add_job(
     _scheduled_tick,
     "interval",
     seconds=TICK_INTERVAL_SECONDS,
-    id="roofix_bridge_tick",
+    id="roofix_tick",
     max_instances=1,
     coalesce=True,
 )

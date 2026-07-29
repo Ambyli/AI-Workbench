@@ -32,6 +32,7 @@ import html as _html
 from dataclasses import dataclass, field
 from typing import Optional
 
+from components.proposal_extractor import extract_proposal
 
 # Event types whose real data lives behind the proposal link — thin by nature.
 # For these, parse_complete is False unless we already have what we need.
@@ -41,11 +42,13 @@ _NEEDS_SCRAPE_EVENTS = {"Estimate Complete", "Estimate"}
 # corrections. (The brain applies the rule; the parser just classifies.)
 _SENDER_RE = re.compile(r"^\s*RFX\s*\|\s*(?P<type>[^<]+?)\s*<", re.IGNORECASE)
 _PROJECT_URL_RE = re.compile(
-    r"https?://(?:www\.)?roofix\.io/project/(?P<id>[0-9]+x[0-9]+)", re.IGNORECASE)
+    r"https?://(?:www\.)?roofix\.io/project/(?P<id>[0-9]+x[0-9]+)", re.IGNORECASE
+)
 # The email's tokenized tracking link (works without login; redirects to the proposal).
 # Appears as href="http://urlNNNN.roofix.io/ls/click?upn=..." in the HTML body.
 _TRACKING_URL_RE = re.compile(
-    r"https?://url\d+\.roofix\.io/ls/click\?[^\s\"'<>]+", re.IGNORECASE)
+    r"https?://url\d+\.roofix\.io/ls/click\?[^\s\"'<>]+", re.IGNORECASE
+)
 # "<Name> - <Address>" — name on the left of the first " - ", address on the right.
 _NAME_ADDR_RE = re.compile(r"(?P<name>[A-Za-z.''\- ]+?)\s+-\s+(?P<addr>\d[^\n\"\[\]]+)")
 _MENTION_RE = re.compile(r"@([A-Za-z][A-Za-z0-9_]+)")
@@ -60,14 +63,14 @@ class ParsedEvent:
     tracking_url: Optional[str] = None
     customer_name: Optional[str] = None
     address: Optional[str] = None
-    address_suffix: Optional[str] = None      # e.g. "Reorder"
+    address_suffix: Optional[str] = None  # e.g. "Reorder"
     comment_text: Optional[str] = None
     mentioned_users: list = field(default_factory=list)
     parse_complete: bool = False
     email_timestamp: Optional[str] = None
     raw_subject: Optional[str] = None
     notes: list = field(default_factory=list)  # parser observations / why-incomplete
-    message_id: Optional[str] = None          # Gmail message id for mark_read tracking
+    message_id: Optional[str] = None  # Gmail message id for mark_read tracking
 
     def as_dict(self) -> dict:
         return {
@@ -166,11 +169,25 @@ def _extract_name_address(subject: str, body: str, event_type: str = ""):
         s = subject
         if " - " in s:
             head, rest = s.split(" - ", 1)
-            if event_type and (event_type.lower() in head.lower()
-                               or head.lower() in event_type.lower()
-                               or head.lower().startswith(("new project", "new ", "estimate",
-                                                            "install", "hic", "deposit", "job",
-                                                            "send", "select", "submit", "sign"))):
+            if event_type and (
+                event_type.lower() in head.lower()
+                or head.lower() in event_type.lower()
+                or head.lower().startswith(
+                    (
+                        "new project",
+                        "new ",
+                        "estimate",
+                        "install",
+                        "hic",
+                        "deposit",
+                        "job",
+                        "send",
+                        "select",
+                        "submit",
+                        "sign",
+                    )
+                )
+            ):
                 s = rest
         candidates.append(s)
     if body:
@@ -185,7 +202,7 @@ def _extract_name_address(subject: str, body: str, event_type: str = ""):
             sfx = re.search(r"\(([^)]+)\)\s*$", addr)
             if sfx:
                 suffix = sfx.group(1).strip()
-                addr = addr[:sfx.start()].strip()
+                addr = addr[: sfx.start()].strip()
             return name, addr, suffix
     return None, None, None
 
@@ -208,7 +225,7 @@ def _extract_comment(body: str) -> tuple[Optional[str], list]:
     return quote, mentions
 
 
-def parse_email(raw: dict) -> ParsedEvent:
+def parse_email(raw: dict, scraper_client=None) -> ParsedEvent:
     """Parse a raw email (Contract A) into a structured event (Contract B).
 
     Pipeline:
@@ -217,7 +234,9 @@ def parse_email(raw: dict) -> ParsedEvent:
       3. **Extract name/address** — parse "<Name> - <Address>" pattern.
       4. **Extract comment** — for New Comment events, pull quoted text + @mentions.
       5. **Extract tracking URL** — find the email's tokenized tracking link.
-      6. **Set parse_complete** — False if the email is too thin to act on
+      6. **Scrape** (optional) — if ``scraper_client`` is provided, scrape the URL
+         to get better customer_name, address, and project_id.
+      7. **Set parse_complete** — False if the email is too thin to act on
          (no identity, needs scraping, or missing comment text).
 
     Called by: `process_batch` in the orchestrator (maps over the raw email list).
@@ -227,6 +246,7 @@ def parse_email(raw: dict) -> ParsedEvent:
         raw: Raw email dict with keys like ``sender``, ``subject``,
             ``body_text``, ``body_html``, ``timestamp``, ``to``,
             ``message_id`` (optional, for mark_read tracking).
+        scraper_client: Optional RoofixScraperClient for scraping URLs.
 
     Returns:
         A ``ParsedEvent`` dataclass with all extracted fields populated.
@@ -261,13 +281,31 @@ def parse_email(raw: dict) -> ParsedEvent:
     )
     ev.tracking_url = tracking_url
 
+    # Scrape URL for better data if scraper_client is provided
+    if scraper_client and tracking_url:
+        try:
+            scraper_result = scraper_client.get_proposal(tracking_url=tracking_url)
+            if scraper_result.get("docs"):
+                extracted = extract_proposal(scraper_result)
+                if extracted.ok:
+                    # Update event with scraped data
+                    ev.customer_name = extracted.customer_name
+                    ev.address = extracted.address
+                    ev.project_id = extracted.roofix_project_id
+                    ev.parse_complete = True
+                    ev.notes.append("scraped URL for better data")
+        except Exception as e:
+            ev.notes.append(f"scrape failed: {e}")
+
     have_identity = bool(project_id) or bool(name and addr)
     if not have_identity:
         ev.parse_complete = False
         ev.notes.append("no project_id and no name+address — cannot identify project")
     elif event_type in _NEEDS_SCRAPE_EVENTS:
         ev.parse_complete = False
-        ev.notes.append(f"{event_type}: real data is behind the proposal link — needs scrape")
+        ev.notes.append(
+            f"{event_type}: real data is behind the proposal link — needs scrape"
+        )
     elif event_type == "New Comment" and not comment:
         ev.parse_complete = False
         ev.notes.append("New Comment but no quoted text found")

@@ -20,8 +20,9 @@ import httpx
 
 class RoofixScraperClient:
     def __init__(self, url: Optional[str] = None, timeout: float = 60.0):
-        self.url = (url or os.getenv("ROOFIX_SCRAPER_URL",
-                                     "http://roofix-scraper:8080")).rstrip("/")
+        self.url = (
+            url or os.getenv("ROOFIX_SCRAPER_URL", "http://roofix-scraper:8080")
+        ).rstrip("/")
         self._client = httpx.Client(timeout=timeout)
 
     def close(self) -> None:
@@ -44,15 +45,13 @@ class RoofixScraperClient:
         r.raise_for_status()
         return r.json()
 
-    def get_proposal(self, roofix_project_id: str,
-                     tracking_url: Optional[str] = None) -> dict:
+    def get_proposal(self, tracking_url: Optional[str] = None) -> dict:
         """Fetch a proposal by Roofix project id. Optionally pass a tracking_url
         (from the email) if the id-based lookup isn't available."""
         params = {}
         if tracking_url:
             params["tracking_url"] = tracking_url
-        r = self._client.get(f"{self.url}/proposal/{roofix_project_id}",
-                             params=params)
+        r = self._client.get(f"{self.url}/proposal/{roofix_project_id}", params=params)
         r.raise_for_status()
         return r.json()
 

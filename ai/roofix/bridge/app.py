@@ -221,33 +221,34 @@ def tick(req: Optional[TickRequest] = None) -> dict:
 
 
 if __name__ == "__main__":
-    import signal
-    import sys
-    import time
-    import uvicorn
-
-    def _shutdown(signum, frame):
-        """Handle Ctrl+C / SIGTERM: stop scheduler, wait for children, exit clean."""
-        _stdlib_logger.info(
-            "Shutdown signal received (%s). Stopping scheduler...", signum
-        )
-        scheduler.shutdown(wait=True)
-        _stdlib_logger.info("Scheduler stopped. Waiting for child processes...")
-
-        # Give child processes a moment to terminate gracefully
-        for _ in range(10):  # Wait up to 10 seconds
-            import os
-            try:
-                # Try to terminate all child processes (Windows)
-                os.system("taskkill /F /T /PID " + str(os.getpid()))
-            except Exception:
-                pass
-            time.sleep(1)
-
-        _stdlib_logger.info("Exiting.")
-        sys.exit(128 + signum)
-
-    signal.signal(signal.SIGINT, _shutdown)
-    signal.signal(signal.SIGTERM, _shutdown)
-
-    uvicorn.run(app, host="0.0.0.0", port=8010)
+    #    import signal
+    #    import sys
+    #    import time
+    #    import uvicorn
+    #
+    #    def _shutdown(signum, frame):
+    #        """Handle Ctrl+C / SIGTERM: stop scheduler, wait for children, exit clean."""
+    #        _stdlib_logger.info(
+    #            "Shutdown signal received (%s). Stopping scheduler...", signum
+    #        )
+    #        scheduler.shutdown(wait=True)
+    #        _stdlib_logger.info("Scheduler stopped. Waiting for child processes...")
+    #
+    #        # Give child processes a moment to terminate gracefully
+    #        for _ in range(10):  # Wait up to 10 seconds
+    #            import os
+    #            try:
+    #                # Try to terminate all child processes (Windows)
+    #                os.system("taskkill /F /T /PID " + str(os.getpid()))
+    #            except Exception:
+    #                pass
+    #            time.sleep(1)
+    #
+    #        _stdlib_logger.info("Exiting.")
+    #        sys.exit(128 + signum)
+    #
+    #    signal.signal(signal.SIGINT, _shutdown)
+    #    signal.signal(signal.SIGTERM, _shutdown)
+    #
+    #    uvicorn.run(app, host="0.0.0.0", port=8010)
+    tick()

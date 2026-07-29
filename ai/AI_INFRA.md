@@ -35,6 +35,7 @@ Every service in the list below is on the `ai_shared` network unless noted. Port
 | [`docker-compose.classifier.yml`](docker-compose.classifier.yml) | `classifier` | `8005` | [classifier/API.md](classifier/API.md) |
 | [`docker-compose.unsloth.yml`](docker-compose.unsloth.yml) | `unsloth` | `8000` (model — LiteLLM upstream), `8888` (Jupyter), `22` (SSH) | [UNSLOTH.md](UNSLOTH.md) |
 | [`docker-compose.roofix.yml`](docker-compose.roofix.yml) | `roofix-bridge`, `roofix-scraper` | _(internal only)_ | [ROOFIX.md](ROOFIX.md) |
+| [`docker-compose.interceptor-api.yml`](docker-compose.interceptor-api.yml) | `interceptor-api` | _(internal only)_ | [INTERCEPTOR_API.md](INTERCEPTOR_API.md) |
 
 ## Flow diagram
 
@@ -55,6 +56,7 @@ flowchart TB
     GmailMCP["gmail-mcp<br/>(external)"]:::ext
     PhoenixMCP["phoenix-mcp.com<br/>(external MCP)"]:::ext
     Roofix["roofix.io<br/>(Bubble app)"]:::ext
+    ExtSite["target sites<br/>(any URL)"]:::ext
 
     subgraph CFG["docker-compose.cloudflared.yml"]
         CF["cloudflared<br/>tunnel"]:::svc
@@ -93,6 +95,9 @@ flowchart TB
         RB["roofix-bridge<br/>internal :8080"]:::svc
         RS["roofix-scraper<br/>internal :8080"]:::svc
     end
+    subgraph IAG["docker-compose.interceptor-api.yml"]
+        IA["interceptor-api<br/>internal :8080"]:::svc
+    end
 
     Browser --> CF --> O2P --> OWU
     O2P -. OAuth + group check .-> Google
@@ -119,8 +124,11 @@ flowchart TB
     RB   -->|"MCP JSON-RPC"| PhoenixMCP
     LL   -.->|MCP registration| GmailMCP
     LL   -.->|MCP registration| PhoenixMCP
+    LL   -.->|MCP registration| IA
+    LL   ==>|"/v1/interceptor/*"| IA
     GmailMCP -. IMAP/API .-> Gmail
     RS   -. Playwright .-> Roofix
+    IA   -. CDP .-> ExtSite
 
     KAPP -. model download .-> HF
     MAPP -. model download .-> HF
@@ -137,6 +145,7 @@ flowchart TB
 - **Unsloth dual role** — the CUDA-compiled llama.cpp binary serves a chat model at `unsloth:8000` (routed via LiteLLM as the `qwen3.6-unsloth` model entry sourced from `DEFAULT_LITELLM_MODEL_API_BASE`), while Jupyter (`:8888`) and SSH (`:22`) remain available for training / fine-tuning workflows.
 - **Roofix bridge + scraper** — bundled in `docker-compose.roofix.yml`. The bridge is an internal worker that does NOT receive inbound traffic. Its APScheduler ticks every `TICK_INTERVAL_SECONDS` (default 300s); each tick fetches unread Roofix mail via the Gmail MCP, decides per-event (rules first, LiteLLM fallback), and writes back via the Phoenix MCP. Ambiguous email events trigger a proposal fetch against the sibling `roofix-scraper` (Playwright), which owns Roofix session cookies. Both containers expose `:8080` internally only — no host port unless explicitly published.
 - **Gmail MCP is a passthrough, not a proxied identity** — the `LL -.-> GmailMCP` edge uses LiteLLM's `delegate_auth_to_upstream: true` mode. LiteLLM only advertises the endpoint; the OAuth 2.1 flow runs end-to-end between Open WebUI and `gmailmcp.googleapis.com` per user, and LiteLLM forwards the resulting `Authorization: Bearer` header untouched. Users must enable the Gmail tool per-chat (it cannot be a default-enabled tool on a model, because the OAuth browser redirect cannot happen mid-completion).
+- **Interceptor API is a generic CDP capture service** — `interceptor-api` wraps `common.cdp_interceptor` behind an HTTP + MCP surface. Callers pass a URL and a list of URL regex patterns; the service navigates a headless Chrome under a named `--user-data-dir` and returns the JSON XHR/fetch bodies whose URLs matched. LiteLLM exposes it both as an MCP tool (`interceptor.capture_url`) and as a `/v1/interceptor/*` pass-through. Auth is per-profile: operators refresh a profile by uploading a `.tgz` of a captured Chrome user-data-dir to `POST /profiles/{name}/refresh`. Concurrent captures are serialized (409 on collision) because a single container binds one CDP debug port.
 
 ## Ports at a glance
 

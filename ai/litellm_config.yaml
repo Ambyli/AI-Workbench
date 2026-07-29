@@ -23,6 +23,11 @@ general_settings:
       include_subpath: true
       methods: ["GET", "POST"]
       forward_headers: true
+    - path: "/v1/interceptor"
+      target: "http://interceptor-api:8080"
+      include_subpath: true
+      methods: ["GET", "POST", "DELETE"]
+      forward_headers: true
 
 mcp_servers:
   kokoro_tts:
@@ -31,6 +36,10 @@ mcp_servers:
 
   madlad_translate:
     url: http://madlad-api:8000/mcp
+    transport: "http"
+
+  interceptor:
+    url: http://interceptor-api:8080/mcp
     transport: "http"
 
   phoenix:

@@ -1,0 +1,13 @@
+[project]
+name = "interceptor-api"
+version = "0.1.0"
+description = "Generic HTTP/MCP front-end for common.cdp_interceptor — capture JSON XHR/fetch bodies from any URL under a named Chrome profile"
+requires-python = ">=3.11"
+dependencies = [
+    "common",
+    "fastapi",
+    "uvicorn",
+    "pydantic",
+    "python-multipart",
+    "fastmcp",
+]

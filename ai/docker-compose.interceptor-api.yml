@@ -1,0 +1,30 @@
+networks:
+  shared:
+    external: true
+    name: ai_shared
+
+services:
+  interceptor-api:
+    networks:
+      - shared
+    build:
+      context: ..
+      dockerfile: ai/Dockerfile.interceptor-api
+    container_name: interceptor-api
+    restart: unless-stopped
+    environment:
+      - INTERCEPTOR_PROFILES_ROOT=/data/profiles
+      # roofix-scraper uses 9223 — keep this off it so both can coexist.
+      - INTERCEPTOR_DEBUG_PORT=9224
+      - INTERCEPTOR_CAPTURE_WINDOW_SECONDS=${INTERCEPTOR_CAPTURE_WINDOW_SECONDS:-20}
+    volumes:
+      - interceptor_api_data:/data
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+
+volumes:
+  interceptor_api_data:

@@ -117,152 +117,163 @@ def _execute(decision: dict, ev: dict, phoenix, log: CsvLogger,
     etype = ev.get("event_type", "")
     pref = decision.get("target") or ""
 
-    if action == "ignore":
-        log.log("orchestrator", "ignore", True, decision["reasoning"],
-                event_type=etype, project_ref=pref)
-        return
-
-    if decision.get("needs_human") or action == "escalate":
-        log.log("escalate", action, True, "NEEDS HUMAN: " + decision["reasoning"],
-                event_type=etype, project_ref=pref)
-        return
-
-    if phoenix is None:
-        log.log("orchestrator", action, True,
-                "offline dry-run: " + decision["reasoning"],
-                event_type=etype, project_ref=pref)
-        return
-
-    if action == "update_chatter":
-        res = phoenix.update_chatter(int(pref), decision["payload"]["note_text"])
-        log.log("phoenix", action, res.ok,
-                (("DRY_RUN " if res.dry_run else "") + res.detail),
-                event_type=etype, project_ref=pref)
-        return
-
-    if action == "update_milestone":
-        roofix_event = decision["payload"].get("roofix_event", etype)
-        mapping = (milestone_map or {}).get(roofix_event)
-        if not mapping:
-            log.log("phoenix", action, False,
-                    f"no milestone mapping for '{roofix_event}' (needs Michael)",
-                    event_type=etype, project_ref=pref)
-            return
-        res = phoenix.update_milestone(int(pref), mapping["block_name"],
-                                       mapping["status_id"])
-        log.log("phoenix", action, res.ok,
-                (("DRY_RUN " if res.dry_run else "") + res.detail),
-                event_type=etype, project_ref=pref)
-        return
-
-    if action == "create_project":
-        tracking_url = decision["payload"].get("tracking_url")
-        if not tracking_url:
-            log.log("orchestrator", action, False,
-                    "create_project missing tracking_url",
-                    event_type=etype, project_ref=pref)
-            return
-        if not scraper_client:
-            log.log("orchestrator", action, False,
-                    "create_project needs scraper_client",
-                    event_type=etype, project_ref=pref)
-            return
-        log.log("orchestrator", "create_project_start", True,
-                f"starting create_project for {tracking_url}",
-                event_type=etype, project_ref=pref)
-
-        # Mark pending before scraping.
-        if processed_store:
-            processed_store.mark_pending(ev.get("message_id"), metadata={
-                "tracking_url": tracking_url,
-                "event_type": etype,
-            })
-
-        try:
-            # Scrape the proposal.
-            log.log("scraper", "start", True, f"scraping {tracking_url}",
-                    event_type=etype, project_ref=pref)
-            scraper_result = scraper_client.get_proposal(
-                project_id=None, tracking_url=tracking_url)
-
-            if not scraper_result.get("docs"):
-                log.log("scraper", "no_docs", False,
-                        "scraper returned no docs",
-                        event_type=etype, project_ref=pref)
-                if processed_store:
-                    processed_store.mark_error(ev.get("message_id"), metadata={
-                        "error": "no_docs",
-                    })
-                return
-
-            # Extract the proposal.
-            extracted = extract_proposal(scraper_result)
-
-            if not extracted.ok:
-                log.log("extractor", "failed", False, extracted.error,
-                        event_type=etype, project_ref=pref)
-                if processed_store:
-                    processed_store.mark_error(ev.get("message_id"), metadata={
-                        "error": extracted.error,
-                    })
-                return
-
-            log.log("extractor", "ok", True,
-                    f"extracted {extracted.roofix_project_id}, "
-                    f"is_accepted={extracted.is_accepted}",
+    match action:
+        # ── Ignore ────────────────────────────────────────────────────
+        # Log and stop. No Phoenix write, no human review.
+        case "ignore":
+            log.log("orchestrator", "ignore", True, decision["reasoning"],
                     event_type=etype, project_ref=pref)
 
-            # Only create if accepted.
-            if not extracted.is_accepted:
-                log.log("orchestrator", "not_accepted", True,
-                        "proposal not accepted, skipping create",
-                        event_type=etype, project_ref=pref)
-                if processed_store:
-                    processed_store.mark_ok(ev.get("message_id"), metadata={
-                        "roofix_project_id": extracted.roofix_project_id,
-                        "accepted": False,
-                    })
-                return
+        # ── Escalate / Needs human ────────────────────────────────────
+        # Log for human review, skip Phoenix write.
+        case "escalate" | _ if decision.get("needs_human"):
+            log.log("escalate", action, True, "NEEDS HUMAN: " + decision["reasoning"],
+                    event_type=etype, project_ref=pref)
 
-            # Call ensure_entity_and_project.
-            if not phoenix:
-                log.log("orchestrator", action, False,
-                        "phoenix client required for create_project",
-                        event_type=etype, project_ref=pref)
-                return
+        # ── Offline dry-run ───────────────────────────────────────────
+        # If phoenix client is None, log and stop. No Phoenix write.
+        case _ if phoenix is None:
+            log.log("orchestrator", action, True,
+                    "offline dry-run: " + decision["reasoning"],
+                    event_type=etype, project_ref=pref)
 
-            res = phoenix.ensure_entity_and_project(extracted.__dict__)
-
+        # ── Update chatter ────────────────────────────────────────────
+        # Append a note to the Phoenix project's chatter.
+        case "update_chatter":
+            res = phoenix.update_chatter(int(pref), decision["payload"]["note_text"])
             log.log("phoenix", action, res.ok,
                     (("DRY_RUN " if res.dry_run else "") + res.detail),
                     event_type=etype, project_ref=pref)
 
-            if res.ok:
-                if processed_store:
-                    processed_store.mark_ok(ev.get("message_id"), metadata={
-                        "roofix_project_id": extracted.roofix_project_id,
-                        "phoenix_entity_id": res.data.get("entity_id"),
-                        "phoenix_project_id": res.data.get("phoenix_project_id"),
-                        "accepted": True,
-                    })
+        # ── Update milestone ──────────────────────────────────────────
+        # Look up the milestone mapping, then advance the project's milestone.
+        case "update_milestone":
+            roofix_event = decision["payload"].get("roofix_event", etype)
+            mapping = (milestone_map or {}).get(roofix_event)
+            if not mapping:
+                log.log("phoenix", action, False,
+                        f"no milestone mapping for '{roofix_event}' (needs Michael)",
+                        event_type=etype, project_ref=pref)
             else:
+                res = phoenix.update_milestone(int(pref), mapping["block_name"],
+                                               mapping["status_id"])
+                log.log("phoenix", action, res.ok,
+                        (("DRY_RUN " if res.dry_run else "") + res.detail),
+                        event_type=etype, project_ref=pref)
+
+        # ── Create project ────────────────────────────────────────────
+        # Scrape the proposal, extract the data, then create the project in Phoenix.
+        case "create_project":
+            tracking_url = decision["payload"].get("tracking_url")
+            if not tracking_url:
+                log.log("orchestrator", action, False,
+                        "create_project missing tracking_url",
+                        event_type=etype, project_ref=pref)
+                return
+            if not scraper_client:
+                log.log("orchestrator", action, False,
+                        "create_project needs scraper_client",
+                        event_type=etype, project_ref=pref)
+                return
+            log.log("orchestrator", "create_project_start", True,
+                    f"starting create_project for {tracking_url}",
+                    event_type=etype, project_ref=pref)
+
+            # Mark pending before scraping.
+            if processed_store:
+                processed_store.mark_pending(ev.get("message_id"), metadata={
+                    "tracking_url": tracking_url,
+                    "event_type": etype,
+                })
+
+            try:
+                # Scrape the proposal.
+                log.log("scraper", "start", True, f"scraping {tracking_url}",
+                        event_type=etype, project_ref=pref)
+                scraper_result = scraper_client.get_proposal(
+                    project_id=None, tracking_url=tracking_url)
+
+                if not scraper_result.get("docs"):
+                    log.log("scraper", "no_docs", False,
+                            "scraper returned no docs",
+                            event_type=etype, project_ref=pref)
+                    if processed_store:
+                        processed_store.mark_error(ev.get("message_id"), metadata={
+                            "error": "no_docs",
+                        })
+                    return
+
+                # Extract the proposal.
+                extracted = extract_proposal(scraper_result)
+
+                if not extracted.ok:
+                    log.log("extractor", "failed", False, extracted.error,
+                            event_type=etype, project_ref=pref)
+                    if processed_store:
+                        processed_store.mark_error(ev.get("message_id"), metadata={
+                            "error": extracted.error,
+                        })
+                    return
+
+                log.log("extractor", "ok", True,
+                        f"extracted {extracted.roofix_project_id}, "
+                        f"is_accepted={extracted.is_accepted}",
+                        event_type=etype, project_ref=pref)
+
+                # Only create if accepted.
+                if not extracted.is_accepted:
+                    log.log("orchestrator", "not_accepted", True,
+                            "proposal not accepted, skipping create",
+                            event_type=etype, project_ref=pref)
+                    if processed_store:
+                        processed_store.mark_ok(ev.get("message_id"), metadata={
+                            "roofix_project_id": extracted.roofix_project_id,
+                            "accepted": False,
+                        })
+                    return
+
+                # Call ensure_entity_and_project.
+                if not phoenix:
+                    log.log("orchestrator", action, False,
+                            "phoenix client required for create_project",
+                            event_type=etype, project_ref=pref)
+                    return
+
+                res = phoenix.ensure_entity_and_project(extracted.__dict__)
+
+                log.log("phoenix", action, res.ok,
+                        (("DRY_RUN " if res.dry_run else "") + res.detail),
+                        event_type=etype, project_ref=pref)
+
+                if res.ok:
+                    if processed_store:
+                        processed_store.mark_ok(ev.get("message_id"), metadata={
+                            "roofix_project_id": extracted.roofix_project_id,
+                            "phoenix_entity_id": res.data.get("entity_id"),
+                            "phoenix_project_id": res.data.get("phoenix_project_id"),
+                            "accepted": True,
+                        })
+                else:
+                    if processed_store:
+                        processed_store.mark_error(ev.get("message_id"), metadata={
+                            "error": res.detail,
+                        })
+
+            except Exception as e:
+                log.log("orchestrator", action, False,
+                        f"create_project failed: {e}",
+                        event_type=etype, project_ref=pref)
                 if processed_store:
                     processed_store.mark_error(ev.get("message_id"), metadata={
-                        "error": res.detail,
+                        "error": repr(e),
                     })
 
-        except Exception as e:
+        # ── Unsupported action ────────────────────────────────────────
+        # Log and stop. No Phoenix write.
+        case _:
             log.log("orchestrator", action, False,
-                    f"create_project failed: {e}",
+                    f"action '{action}' not enabled in Phase 0",
                     event_type=etype, project_ref=pref)
-            if processed_store:
-                processed_store.mark_error(ev.get("message_id"), metadata={
-                    "error": repr(e),
-                })
-        return
-
-    log.log("orchestrator", action, False, f"action '{action}' not enabled in Phase 0",
-            event_type=etype, project_ref=pref)
 
 
 def process_batch(raw_emails: list, phoenix=None, log: Optional[CsvLogger] = None,
@@ -296,27 +307,45 @@ def process_batch(raw_emails: list, phoenix=None, log: Optional[CsvLogger] = Non
     log = log or _default_log()
     decisions = []
 
+    # ── Step 1: Parse all raw emails into structured events ────────────────
     parsed = [parse_email(e).as_dict() for e in raw_emails]
 
+    # ── Step 2: Group events by project identity ──────────────────────────
+    # Each group contains all events belonging to the same Roofix project.
     groups: dict[str, list] = {}
     for ev in parsed:
         groups.setdefault(_identity_key(ev), []).append(ev)
 
+    # ── Step 3: Process each project group ────────────────────────────────
     for key, evs in groups.items():
+        # Sort events within each group by timestamp (oldest first)
         evs.sort(key=lambda e: e.get("email_timestamp") or "")
+
+        # Process each event in the group
         for ev in evs:
+            # Log the parsed event
             log.log("parser", "parsed", ev.get("parse_complete", False),
                     "; ".join(ev.get("notes", [])) or "ok",
                     event_type=ev.get("event_type", ""),
                     project_ref=key)
+
+            # Resolve the project context from Phoenix
             ctx = _resolve_context(ev, phoenix)
+
+            # Decide what to do based on the event and context
             d = decide(ev, ctx).as_dict()
+
+            # Log the decision
             log.log("brain", d["action"], not d["needs_human"],
                     f"[{d['source']}] {d['reasoning']}",
                     event_type=ev.get("event_type", ""), project_ref=key)
+
+            # Execute the decision
             _execute(d, ev, phoenix, log, milestone_map,
                      scraper_client=scraper_client,
                      processed_store=processed_store)
+
+            # Add the decision to the results
             decisions.append(d)
 
     return decisions

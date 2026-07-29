@@ -37,6 +37,7 @@ PHASE = os.getenv("AGENT_PHASE", "0")
 @dataclass
 class Decision:
     action: str
+    event_type: str
     target: Optional[str] = None
     payload: dict = field(default_factory=dict)
     reasoning: str = ""
@@ -45,7 +46,8 @@ class Decision:
 
     def as_dict(self) -> dict:
         return {
-            "action": self.action, "target": self.target, "payload": self.payload,
+            "action": self.action, "event_type": self.event_type,
+            "target": self.target, "payload": self.payload,
             "reasoning": self.reasoning, "needs_human": self.needs_human,
             "source": self.source,
         }
@@ -73,63 +75,63 @@ def decide(event: dict, context: dict) -> Decision:
 
     if not event.get("parse_complete") and not event.get("project_id") \
             and not (event.get("customer_name") and event.get("address")):
-        return Decision("escalate", reasoning=(
+        return Decision("escalate", event_type=etype, reasoning=(
             "Could not identify a project (no id, no usable name+address)."),
             needs_human=True)
 
     if found and ambiguous:
-        return Decision("escalate", reasoning=(
+        return Decision("escalate", event_type=etype, reasoning=(
             f"Name/address matched {context.get('candidate_count','several')} Phoenix "
             f"projects; refusing to guess which one."), needs_human=True)
 
     if etype == "New Comment":
         if not found:
-            return Decision("escalate", reasoning=(
+            return Decision("escalate", event_type=etype, reasoning=(
                 "Comment for a customer not found in Phoenix. A project may have "
                 "advanced in Roofix without being mirrored here — needs a human to "
                 "decide whether to create it."), needs_human=True)
         note = event.get("comment_text") or ""
         if not note:
-            return Decision("escalate",
+            return Decision("escalate", event_type=etype,
                 reasoning="New Comment but no comment text parsed.", needs_human=True)
         prefix = "[Roofix] "
         mentions = event.get("mentioned_users") or []
         body = note + (f"\n(Mentions: {', '.join(mentions)})" if mentions else "")
-        return Decision("update_chatter",
+        return Decision("update_chatter", event_type=etype,
             target=str(context.get("phoenix_project_id")),
             payload={"note_text": prefix + body},
             reasoning="New Roofix comment relayed to Phoenix chatter (append).")
 
     if etype in MILESTONE_EVENTS:
         if not found:
-            return Decision("escalate", reasoning=(
+            return Decision("escalate", event_type=etype, reasoning=(
                 f"'{etype}' milestone for a project not in Phoenix — needs a human."),
                 needs_human=True)
-        return Decision("update_milestone",
+        return Decision("update_milestone", event_type=etype,
             target=str(context.get("phoenix_project_id")),
             payload={"roofix_event": etype},
             reasoning=f"'{etype}' advances the project's milestone in Phoenix.")
 
     if etype in NEEDS_SCRAPE_EVENTS:
         if PHASE == "0":
-            return Decision("ignore", reasoning=(
+            return Decision("ignore", event_type=etype, reasoning=(
                 f"'{etype}' is informational (good/better/best ladder). Phase 0 does "
                 f"not act on estimates; contract value is set by a signing event."))
         # Phase 1: if we have a tracking URL, emit create_project. The
         # orchestrator will scrape, extract, and decide acceptance.
         tracking_url = event.get("tracking_url")
         if tracking_url:
-            return Decision("create_project",
+            return Decision("create_project", event_type=etype,
                 target=tracking_url,
                 payload={"tracking_url": tracking_url},
                 reasoning=f"'{etype}' with tracking URL — scrape and evaluate acceptance.")
         # No tracking URL — can't scrape, escalate.
-        return Decision("escalate",
+        return Decision("escalate", event_type=etype,
             reasoning=f"'{etype}' with no tracking URL — cannot scrape proposal.",
             needs_human=True)
 
     if etype == "New Task":
-        return Decision("ignore", reasoning=(
+        return Decision("ignore", event_type=etype, reasoning=(
             "New Task is a prompt for a human action in Roofix; Phase 0 takes no "
             "action. (Phase 1 may notify the rep.)"))
 
@@ -138,12 +140,13 @@ def decide(event: dict, context: dict) -> Decision:
 
 
 def _escalate_to_ai(event: dict, context: dict, why: str) -> Decision:
+    etype = event.get("event_type", "Unknown")
     try:
         d = generate_ai_decision(event, context, why)
         d.source = "ai"
         return d
     except Exception as e:
-        return Decision("escalate", source="ai",
+        return Decision("escalate", event_type=etype, source="ai",
             reasoning=f"AI escalation needed ({why}) but model call failed: {e}",
             needs_human=True)
 
@@ -183,6 +186,8 @@ def generate_ai_decision(event: dict, context: dict, why: str) -> Decision:
     """
     from openai import OpenAI  # local import so rules path has no hard SDK dep
 
+    etype = event.get("event_type", "Unknown")
+
     client = OpenAI(
         base_url=os.environ.get("ROOFIX_LLM_URL", "http://litellm:4000").rstrip("/") + "/v1",
         api_key=os.environ["ROOFIX_LLM_API_KEY"],
@@ -216,6 +221,7 @@ def generate_ai_decision(event: dict, context: dict, why: str) -> Decision:
 
     return Decision(
         action=data.get("action", "escalate"),
+        event_type=etype,
         target=data.get("target"),
         payload=data.get("payload", {}) or {},
         reasoning=data.get("reasoning", ""),

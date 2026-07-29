@@ -1,29 +1,87 @@
 """
-ROOFIX SCRAPER CLIENT — thin HTTP client for the sibling roofix-scraper service.
+ROOFIX SCRAPER CLIENT — calls the generic interceptor-api service for Roofix
+proposal captures.
 
-The scraper drives Chrome/Chromium via common.cdp_interceptor and owns the
-Roofix login session as a `--user-data-dir` profile. This client just makes
-the service look like a Python function to the bridge.
+Before this rewrite there was a sibling ``roofix-scraper`` FastAPI service that
+owned Chrome-under-CDP directly. That service was a Roofix-shaped wrapper around
+``common.cdp_interceptor`` — every capability it had is now a strict subset of
+``ai/interceptor-api``'s ``POST /capture``. Rather than run two Chrome-driving
+containers with two profiles to keep fresh, the bridge now talks to
+``interceptor-api`` directly and this client owns the Roofix-specific
+reshaping (init/data + mget aggregation, doc-type counting, login-wall flag).
+
+Public surface intentionally kept small so ``parser.py`` / ``orchestrator.py``
+don't move:
+
+    with RoofixScraperClient() as c:
+        r = c.get_proposal(tracking_url="https://roofix.io/…")
+
+``r`` has the exact same keys the old scraper's ``/proposal/{id}`` response had,
+so ``proposal_extractor.extract_proposal(r)`` keeps working unchanged.
 
 Reads:
-    ROOFIX_SCRAPER_URL   default http://roofix-scraper:8080
+    INTERCEPTOR_API_URL             default http://interceptor-api:8080
+    ROOFIX_INIT_DATA_URL_PATTERN    default roofix\\.io/api/1\\.1/init/data
+    ROOFIX_MGET_URL_PATTERN         default roofix\\.io/elasticsearch/mget
+    ROOFIX_PROFILE_NAME             default "roofix"
+    ROOFIX_CAPTURE_WINDOW_SECONDS   default 30
+    ROOFIX_LOGIN_TIMEOUT            default 300
+    ROOFIX_MAX_MATCHES_PER_PATTERN  default 5
 """
 
 from __future__ import annotations
 
 import os
-from pathlib import Path
-from typing import Optional, Union
+from typing import Optional
 
 import httpx
 
 
+DEFAULT_INTERCEPTOR_URL = "http://interceptor-api:8080"
+DEFAULT_INIT_DATA_PATTERN = os.getenv(
+    "ROOFIX_INIT_DATA_URL_PATTERN", r"roofix\.io/api/1\.1/init/data"
+)
+DEFAULT_MGET_PATTERN = os.getenv(
+    "ROOFIX_MGET_URL_PATTERN", r"roofix\.io/elasticsearch/mget"
+)
+DEFAULT_PROFILE = os.getenv("ROOFIX_PROFILE_NAME", "roofix")
+
+
 class RoofixScraperClient:
-    def __init__(self, url: Optional[str] = None, timeout: float = 60.0):
+    """Thin HTTP wrapper around ``interceptor-api``'s ``POST /capture`` that
+    reshapes the response into the dict shape the bridge's parser + extractor
+    have always consumed."""
+
+    def __init__(
+        self,
+        url: Optional[str] = None,
+        timeout: float = 90.0,
+        *,
+        profile: str = DEFAULT_PROFILE,
+        init_data_pattern: str = DEFAULT_INIT_DATA_PATTERN,
+        mget_pattern: str = DEFAULT_MGET_PATTERN,
+        capture_window_seconds: int = int(
+            os.getenv("ROOFIX_CAPTURE_WINDOW_SECONDS", "30")
+        ),
+        login_timeout: int = int(os.getenv("ROOFIX_LOGIN_TIMEOUT", "300")),
+        max_matches_per_pattern: int = int(
+            os.getenv("ROOFIX_MAX_MATCHES_PER_PATTERN", "5")
+        ),
+    ):
         self.url = (
-            url or os.getenv("ROOFIX_SCRAPER_URL", "http://roofix-scraper:8080")
+            url or os.getenv("INTERCEPTOR_API_URL", DEFAULT_INTERCEPTOR_URL)
         ).rstrip("/")
-        self._client = httpx.Client(timeout=timeout)
+        self.profile = profile
+        self.init_data_pattern = init_data_pattern
+        self.mget_pattern = mget_pattern
+        self.capture_window_seconds = capture_window_seconds
+        self.login_timeout = login_timeout
+        self.max_matches_per_pattern = max_matches_per_pattern
+        # Timeout must exceed capture_window_seconds — interceptor-api blocks
+        # for capture_window_seconds on each request. Add a safety margin.
+        self._client = httpx.Client(
+            timeout=max(timeout, capture_window_seconds + 30.0)
+        )
 
     def close(self) -> None:
         self._client.close()
@@ -34,41 +92,87 @@ class RoofixScraperClient:
     def __exit__(self, *exc):
         self.close()
 
-    def health(self) -> dict:
-        r = self._client.get(f"{self.url}/health")
-        r.raise_for_status()
-        return r.json()
+    def get_proposal(self, tracking_url: str) -> dict:
+        """Load ``tracking_url`` under the Roofix profile in interceptor-api,
+        watch for init/data and elasticsearch/mget XHRs, and return the same
+        response shape the old ``roofix-scraper`` `/proposal/{id}` endpoint did.
 
-    def profile_status(self) -> dict:
-        """Report whether the scraper has a persisted profile loaded."""
-        r = self._client.get(f"{self.url}/profile")
-        r.raise_for_status()
-        return r.json()
-
-    def get_proposal(self, tracking_url: Optional[str] = None) -> dict:
-        """Fetch a proposal by Roofix project id. Optionally pass a tracking_url
-        (from the email) if the id-based lookup isn't available."""
-        params = {}
-        if tracking_url:
-            params["tracking_url"] = tracking_url
-        r = self._client.get(f"{self.url}/proposal/{roofix_project_id}", params=params)
-        r.raise_for_status()
-        return r.json()
-
-    def refresh_profile(self, archive: Union[str, Path, bytes]) -> dict:
-        """Upload a captured Chrome profile (tar.gz of a `--user-data-dir`)
-        to the scraper. Replaces whatever profile was there.
-
-        ``archive`` may be a filesystem path (str/Path) or raw bytes. Login
-        must have been completed OUT-OF-BAND on the operator's laptop before
-        producing the tar — the container cannot present a login UI itself.
+        The old client accepted an optional ``tracking_url`` because Roofix
+        offers two entry points — a stable ``/project/{id}`` URL and a
+        tokenized email link that redirects without login. The tokenized link
+        is what we actually get from Gmail, so ``tracking_url`` is now
+        required. If a project-id lookup is ever needed, build the URL
+        (``https://roofix.io/project/{id}``) upstream and pass it here.
         """
-        if isinstance(archive, (str, Path)):
-            with open(archive, "rb") as fh:
-                files = {"archive": ("profile.tgz", fh, "application/gzip")}
-                r = self._client.post(f"{self.url}/profile/refresh", files=files)
-        else:
-            files = {"archive": ("profile.tgz", archive, "application/gzip")}
-            r = self._client.post(f"{self.url}/profile/refresh", files=files)
+        body = {
+            "url": tracking_url,
+            "url_patterns": [self.init_data_pattern, self.mget_pattern],
+            "profile": self.profile,
+            "capture_window_seconds": self.capture_window_seconds,
+            "keep_open": False,
+            "login_timeout": self.login_timeout,
+            "max_matches_per_pattern": self.max_matches_per_pattern,
+            "debug_logging": False,
+        }
+        r = self._client.post(f"{self.url}/capture", json=body)
         r.raise_for_status()
-        return r.json()
+        return self._reshape(r.json(), tracking_url)
+
+    def _reshape(self, raw: dict, tracking_url: str) -> dict:
+        """Convert an interceptor-api ``/capture`` response into the legacy
+        roofix-scraper ``/proposal/{id}`` shape.
+
+        Direct port of the ``on_capture`` closure + post-processing block that
+        lived in the old ``ai/roofix/scraper/app.py`` (`init_data` last-wins,
+        `mget_docs` flattened across every mget response, `_type` breakdown,
+        `login_wall` derived from status + error string).
+        """
+        matches = raw.get("matches", {}) or {}
+        init_bucket = matches.get(self.init_data_pattern, []) or []
+        mget_bucket = matches.get(self.mget_pattern, []) or []
+
+        init_bodies = [
+            m["body"] for m in init_bucket if isinstance(m, dict) and m.get("body") is not None
+        ]
+
+        mget_docs: list[dict] = []
+        for m in mget_bucket:
+            if not isinstance(m, dict):
+                continue
+            body = m.get("body")
+            if isinstance(body, dict):
+                docs = body.get("docs")
+                if isinstance(docs, list):
+                    mget_docs.extend(docs)
+
+        mget_type_counts: dict[str, int] = {}
+        for d in mget_docs:
+            if isinstance(d, dict):
+                t = d.get("_type")
+            else:
+                t = None
+            mget_type_counts[t or "?"] = mget_type_counts.get(t or "?", 0) + 1
+
+        status = raw.get("status")
+        error = raw.get("error")
+        login_wall = bool(raw.get("login_wall")) or (
+            status == "waiting_login"
+            or (isinstance(error, str) and "login" in error.lower())
+        )
+
+        return {
+            "url": tracking_url,
+            "status": status,
+            "error": error,
+            "login_wall": login_wall,
+            # ── init/data — Bubble's page-hydration endpoint ─────────────────
+            "init_data": init_bodies[-1] if init_bodies else None,
+            "init_data_all": init_bodies,
+            "init_data_count": len(init_bodies),
+            # ── mget — elasticsearch batch-get, aggregated across all captures ──
+            "mget_docs": mget_docs,
+            "mget_capture_count": len(mget_bucket),
+            "mget_type_counts": mget_type_counts,
+            # Every JSON XHR/fetch URL the interceptor saw — diagnostics.
+            "captured_urls": raw.get("captured_urls", []) or [],
+        }

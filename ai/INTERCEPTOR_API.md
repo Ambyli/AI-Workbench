@@ -180,7 +180,7 @@ If you land on the inbox (not the login page), the profile is good to package.
 | Env var | Default | Notes |
 |---|---|---|
 | `INTERCEPTOR_PROFILES_ROOT` | `/data/profiles` | Root under which named profiles live. Backed by the `interceptor_api_data` volume. |
-| `INTERCEPTOR_DEBUG_PORT` | `9224` | CDP debug port inside the container. Chosen to not collide with `roofix-scraper`'s 9223 if the two ever share a network namespace. |
+| `INTERCEPTOR_DEBUG_PORT` | `9224` | CDP debug port inside the container. |
 | `INTERCEPTOR_CAPTURE_WINDOW_SECONDS` | `20` | Default capture window when a request omits `capture_window_seconds`. |
 
 ## Calling from LiteLLM

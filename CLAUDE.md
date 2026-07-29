@@ -51,7 +51,9 @@ Key variables:
 | `PHOENIX_DB_HOST` / `_PORT` / `_NAME` / `_USER` / `_PASSWORD` / `_SSLMODE` | _(secrets)_ | Roofix Bridge: direct psycopg2 connection to Phoenix Postgres |
 | `PHOENIX_AGENT_USER_ID` | _(unset — required for writes)_ | Roofix Bridge: dedicated Phoenix user id |
 | `PHOENIX_ROOFIX_ID_COLUMN` | `migration_external_id` | Roofix Bridge: column where Roofix ids are stamped |
-| `ROOFIX_PROFILE_DIR` | `/data/roofix_profile` | Roofix Scraper: Chrome `--user-data-dir` |
+| `INTERCEPTOR_API_URL` | `http://interceptor-api:8080` | Roofix Bridge → interceptor-api base URL |
+| `ROOFIX_PROFILE_NAME` | `roofix` | Named profile inside interceptor-api holding Roofix session cookies |
+| `INTERCEPTOR_PROFILES_ROOT` | `/data/profiles` | interceptor-api: root under which named `--user-data-dir` profiles live |
 
 ## Threading Model — Read Before Touching Anything
 

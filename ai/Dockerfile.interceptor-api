@@ -1,6 +1,6 @@
 # Build context is the REPO ROOT (see ai/docker-compose.interceptor-api.yml:
 #   context: ..) so we can copy the shared workspace package alongside the
-# service. Same pattern as ai/Dockerfile.roofix-scraper.
+# service.
 
 FROM python:3.11-slim
 

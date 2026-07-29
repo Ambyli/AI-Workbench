@@ -13,7 +13,6 @@ members = [
     "common",
     "interceptor-api",
     "roofix-bridge",
-    "roofix-scraper",
 ]
 
 [[package]]
@@ -2792,27 +2791,6 @@ requires-dist = [
     { name = "openai" },
     { name = "psycopg2-binary" },
     { name = "pydantic" },
-    { name = "uvicorn" },
-]
-
-[[package]]
-name = "roofix-scraper"
-version = "0.1.0"
-source = { virtual = "ai/roofix/scraper" }
-dependencies = [
-    { name = "common" },
-    { name = "fastapi" },
-    { name = "pydantic" },
-    { name = "python-multipart" },
-    { name = "uvicorn" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "common", editable = "shared/common" },
-    { name = "fastapi" },
-    { name = "pydantic" },
-    { name = "python-multipart" },
     { name = "uvicorn" },
 ]
 

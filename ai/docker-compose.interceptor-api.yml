@@ -14,7 +14,6 @@ services:
     restart: unless-stopped
     environment:
       - INTERCEPTOR_PROFILES_ROOT=/data/profiles
-      # roofix-scraper uses 9223 — keep this off it so both can coexist.
       - INTERCEPTOR_DEBUG_PORT=9224
       - INTERCEPTOR_CAPTURE_WINDOW_SECONDS=${INTERCEPTOR_CAPTURE_WINDOW_SECONDS:-20}
     volumes:

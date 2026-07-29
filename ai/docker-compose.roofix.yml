@@ -4,26 +4,6 @@ networks:
     name: ai_shared
 
 services:
-  roofix-scraper:
-    networks:
-      - shared
-    build:
-      context: ..
-      dockerfile: ai/Dockerfile.roofix-scraper
-    container_name: roofix-scraper
-    restart: unless-stopped
-    environment:
-      - ROOFIX_PROFILE_DIR=/data/roofix_profile
-      - ROOFIX_HEADLESS=${ROOFIX_HEADLESS:-true}
-    volumes:
-      - roofix_scraper_data:/data
-    healthcheck:
-      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
-      interval: 30s
-      timeout: 5s
-      start_period: 30s
-      retries: 3
-
   roofix-bridge:
     networks:
       - shared
@@ -53,7 +33,9 @@ services:
       - PHOENIX_DB_SSLMODE=${PHOENIX_DB_SSLMODE:-require}
       - PHOENIX_AGENT_USER_ID=${PHOENIX_AGENT_USER_ID}
       - PHOENIX_ROOFIX_ID_COLUMN=${PHOENIX_ROOFIX_ID_COLUMN:-migration_external_id}
-      - ROOFIX_SCRAPER_URL=http://roofix-scraper:8080
+      # Chrome-under-CDP for proposal fetches now lives in ai/interceptor-api.
+      # Start that compose file separately: `docker compose -f ai/docker-compose.interceptor-api.yml up -d`
+      - INTERCEPTOR_API_URL=${INTERCEPTOR_API_URL:-http://interceptor-api:8080}
       - LOG_DIR=/data
     volumes:
       - roofix_bridge_data:/data
@@ -66,9 +48,5 @@ services:
       timeout: 5s
       start_period: 20s
       retries: 3
-    depends_on:
-      - roofix-scraper
-
 volumes:
-  roofix_scraper_data:
   roofix_bridge_data:

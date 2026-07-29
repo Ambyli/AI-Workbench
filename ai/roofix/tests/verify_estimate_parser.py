@@ -104,7 +104,6 @@ def main() -> int:
         print("\n── Parsed (ParsedEvent) ──")
         print(f"  event_type:     {parsed['event_type']}")
         print(f"  project_id:     {parsed['project_id']}")
-        print(f"  project_url:    {parsed['project_url']}")
         print(f"  tracking_url:   {parsed['tracking_url']}")
         print(f"  customer_name:  {parsed['customer_name']}")
         print(f"  address:        {parsed['address']}")

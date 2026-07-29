@@ -7,7 +7,11 @@ What it extracts:
                   Estimate Complete, Estimate, HIC Executed, Install Date, ...
   project_id      the Bubble-format id from any roofix.io/project/<id> link in the
                   email (subject or body). This is the clean identity key.
-  project_url     the full link, when present.
+  tracking_url    a URL pointing at the proposal, preferentially the tokenized
+                  ``urlNNNN.roofix.io/ls/click?…`` link Roofix embeds in the HTML
+                  body (redirects without login). Falls back to the canonical
+                  ``roofix.io/project/<id>`` link when the email doesn't include a
+                  tokenized one. Either form is what the scraper follows.
   customer_name   parsed from the "<Name> - <Address>" pattern.
   address         the address half of that pattern.
   comment_text    the quoted comment, for New Comment events.
@@ -59,7 +63,6 @@ _QUOTE_RE = re.compile(r"\"(?P<quote>.+?)\"", re.DOTALL)
 class ParsedEvent:
     event_type: str
     project_id: Optional[str] = None
-    project_url: Optional[str] = None
     tracking_url: Optional[str] = None
     customer_name: Optional[str] = None
     address: Optional[str] = None
@@ -76,7 +79,6 @@ class ParsedEvent:
         return {
             "event_type": self.event_type,
             "project_id": self.project_id,
-            "project_url": self.project_url,
             "tracking_url": self.tracking_url,
             "customer_name": self.customer_name,
             "address": self.address,
@@ -133,11 +135,11 @@ def _normalize_type(t: str) -> str:
     return aliases.get(t, t)
 
 
-def _extract_project(subject: str, body: str) -> tuple[Optional[str], Optional[str]]:
-    """Extract the project ID and full URL from a ``roofix.io/project/<id>`` link.
+def _extract_project(subject: str, body: str) -> Optional[str]:
+    """Extract the project ID from a ``roofix.io/project/<id>`` link.
 
-    Searches both subject and body (subject first). Returns ``(project_id, full_url)``
-    or ``(None, None)`` if no link is found.
+    Searches both subject and body (subject first). Returns the project id or
+    ``None`` if no link is found.
 
     The project ID format is ``<hex>x<hex>`` (Bubble-style UUIDs).
 
@@ -148,8 +150,8 @@ def _extract_project(subject: str, body: str) -> tuple[Optional[str], Optional[s
             continue
         m = _PROJECT_URL_RE.search(text)
         if m:
-            return m.group("id"), m.group(0)
-    return None, None
+            return m.group("id")
+    return None
 
 
 def _extract_name_address(subject: str, body: str, event_type: str = ""):
@@ -256,20 +258,28 @@ def parse_email(raw: dict, scraper_client=None) -> ParsedEvent:
     body = _html.unescape(raw.get("body_text", "") or "")
 
     event_type = _classify(sender, subject)
-    project_id, project_url = _extract_project(subject, body)
+    project_id = _extract_project(subject, body)
     name, addr, suffix = _extract_name_address(subject, body, event_type)
     comment, mentions = (None, [])
     if event_type in ("New Comment",):
         comment, mentions = _extract_comment(body)
 
+    # Prefer the tokenized tracking link (works without login). Fall back to the
+    # canonical roofix.io/project/<id> URL if the email doesn't include one — that
+    # form requires a live session but the scraper has a Roofix profile anyway.
     raw_html = raw.get("body_html") or ""
-    tm = _TRACKING_URL_RE.search(raw_html) or _TRACKING_URL_RE.search(body)
+    tm = (
+        _TRACKING_URL_RE.search(raw_html)
+        or _TRACKING_URL_RE.search(body)
+        or _PROJECT_URL_RE.search(subject)
+        or _PROJECT_URL_RE.search(body)
+    )
     tracking_url = tm.group(0) if tm else None
 
     ev = ParsedEvent(
         event_type=event_type,
         project_id=project_id,
-        project_url=project_url or tracking_url,
+        tracking_url=tracking_url,
         customer_name=name,
         address=addr,
         address_suffix=suffix,
@@ -279,7 +289,6 @@ def parse_email(raw: dict, scraper_client=None) -> ParsedEvent:
         raw_subject=subject,
         message_id=raw.get("message_id"),
     )
-    ev.tracking_url = tracking_url
 
     # Scrape URL for better data if scraper_client is provided
     if scraper_client and tracking_url:

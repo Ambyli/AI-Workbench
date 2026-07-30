@@ -32,6 +32,8 @@ docker exec interceptor-api curl -s http://localhost:8080/health
 | `POST` | `/profiles/{name}/refresh` | Upload a `.tgz` of a captured Chrome profile |
 | `DELETE` | `/profiles/{name}` | Wipe one profile |
 | `POST` | `/capture` | Run one capture (see request/response below) |
+| `GET` | `/jobs` | Snapshot of the port pool + currently-running captures |
+| `GET` | `/jobs/{job_id}` | Detail on one in-flight capture (404 if not found) |
 | — | `/mcp` | FastMCP HTTP transport (`capture_url` tool) |
 
 ### `POST /capture`
@@ -57,6 +59,7 @@ Response:
 
 ```json
 {
+  "job_id": "a3f2b1c9d4e5",
   "url": "https://example.com/dashboard",
   "status": "ok",
   "login_wall": false,
@@ -69,9 +72,31 @@ Response:
 }
 ```
 
+`job_id` is a 12-char hex identifier for the capture. During the request's lifetime it shows up in `GET /jobs` (see [Observability](#observability)) and is prefixed onto every log line emitted by that capture — useful for correlating interleaved logs when concurrent captures are running.
+
 Patterns are `re.search`-matched against every JSON XHR/fetch URL the page emits. A capture whose URL matches multiple patterns lands in the bucket of the **first** matching pattern.
 
-Concurrent captures are serialized. If a capture is already running, the endpoint returns **409 Conflict** — retry after the in-flight one finishes.
+## Concurrency
+
+The service handles many `/capture` calls in parallel. Two knobs shape the behavior:
+
+- **Different profiles fully parallel.** A `/capture` against `profile=roofix` and one against `profile=gmail` never contend on each other.
+- **Same profile, fast + slow path.** The first same-profile request in flight takes the fast path — Chrome runs against the base `--user-data-dir` and refreshed session cookies persist to disk. Any concurrent same-profile request falls into the slow path — the service takes a live snapshot of the base profile via `shutil.copytree` into `PROFILES_ROOT/.temp/temp_profile_<uuid>/`, launches Chrome against the clone, and deletes the clone on completion. Raw copy of a live profile is safe: Chrome's SQLite (`Cookies`) and LevelDB (`Local Storage`, `IndexedDB`) stores use journal-based crash recovery, so a mid-write snapshot at worst yields a slightly-stale-but-consistent state, never corruption.
+- **Port pool caps total concurrency.** A bounded pool of CDP debug ports (starting at `INTERCEPTOR_DEBUG_PORT`, sized by `INTERCEPTOR_MAX_CONCURRENT`) is the hard resource ceiling. Every capture — fast or slow — grabs one port from the pool at start and returns it at end. Pool exhausted → **HTTP 429 Too Many Requests** with `retry-later` semantics.
+
+### Resource sizing
+
+Each concurrent slot holds one running Chrome (~200–400 MB RAM) plus, when in a same-profile collision, a live profile-dir clone (typically 20–80 MB disk in `PROFILES_ROOT/.temp`). Setting `INTERCEPTOR_MAX_CONCURRENT=32` means budgeting ~10–13 GB of RAM and ~1–3 GB of ephemeral disk headroom for a fully-saturated fleet. Scale the container's memory limit and volume size accordingly.
+
+### Crash recovery
+
+If Chrome crashes mid-capture (OOM, segfault, container killed) and leaves a stale `SingletonLock` in the base profile dir, `InterceptorClient.launch` clears the lock before every next launch (`shared/common/src/common/cdp_interceptor/client.py:159`, `clear_singleton_locks()`). No manual cleanup needed — the next request self-heals.
+
+If the interceptor-api process itself dies mid-request, temp-profile clones under `PROFILES_ROOT/.temp/` are left behind. They're swept on next startup by the FastAPI lifespan hook, so the volume doesn't accrue orphans across restarts.
+
+### Cookie freshness caveat
+
+Fast-path captures write refreshed session cookies back to the base profile — that's what keeps a `roofix` or `gmail` session warm across days-to-weeks. Slow-path captures write to a doomed clone, so their cookie updates are discarded. Under sustained same-profile burst load (multiple in flight at all times), the base profile stops receiving cookie refreshes and eventually the session expires — re-upload the profile when you see `login_wall: true` in responses.
 
 ## Refreshing a profile (operator flow)
 
@@ -179,8 +204,9 @@ If you land on the inbox (not the login page), the profile is good to package.
 
 | Env var | Default | Notes |
 |---|---|---|
-| `INTERCEPTOR_PROFILES_ROOT` | `/data/profiles` | Root under which named profiles live. Backed by the `interceptor_api_data` volume. |
-| `INTERCEPTOR_DEBUG_PORT` | `9224` | CDP debug port inside the container. |
+| `INTERCEPTOR_PROFILES_ROOT` | `/data/profiles` | Root under which named profiles live. Backed by the `interceptor_api_data` volume. Temp clones live under `<root>/.temp/`. |
+| `INTERCEPTOR_DEBUG_PORT` | `9224` | Base of the CDP debug port pool. Pool spans `[base, base + INTERCEPTOR_MAX_CONCURRENT)`. |
+| `INTERCEPTOR_MAX_CONCURRENT` | `8` | Max simultaneous `/capture` calls. Each slot = one Chrome (~200–400 MB RAM) + on same-profile collision one profile clone (~20–80 MB disk). See [Resource sizing](#resource-sizing). |
 | `INTERCEPTOR_CAPTURE_WINDOW_SECONDS` | `20` | Default capture window when a request omits `capture_window_seconds`. |
 
 ## Calling from LiteLLM
@@ -194,17 +220,67 @@ curl -X POST http://localhost:4001/v1/interceptor/capture `
   -d '{"url":"https://httpbin.org/json","url_patterns":["httpbin\\.org/json"],"profile":"httpbin"}'
 ```
 
-### MCP tool
+### MCP tools
 
-The tool is registered as `interceptor.capture_url` (see `ai/litellm_config.yaml` `mcp_servers.interceptor`). Its signature matches the `/capture` body — pass `url`, `url_patterns`, and `profile` at minimum. The tool returns the same JSON shape as `POST /capture`.
+The `interceptor` MCP server (registered in `ai/litellm_config.yaml` `mcp_servers.interceptor`) exposes four model-invokable tools:
 
-Enable the `interceptor` MCP server on your chat / completion request and the model can call it directly.
+| Tool | Purpose | Args |
+|---|---|---|
+| `capture_url` | Run one capture — same core behavior as `POST /capture` | `url`, `url_patterns`, `profile`, `capture_window_seconds`, `login_timeout`, `max_matches_per_pattern` |
+| `list_profiles` | Discover which named profiles exist — call before `capture_url` if the LLM doesn't know the profile name | *(none)* |
+| `list_jobs` | Snapshot of the port pool + running captures — same shape as `GET /jobs` | *(none)* |
+| `get_job` | Detail on one in-flight capture by id — same shape as `GET /jobs/{job_id}` | `job_id` |
+
+The `keep_open` and `debug_logging` knobs from `POST /capture` are deliberately **not** exposed to MCP — both are operator-only debug flags (`keep_open` requires manual Chrome-kill cleanup; `debug_logging` writes to a DevTools console the LLM can't read).
+
+MCP tools return dicts and never raise — errors surface inside the payload (e.g. `{"error": "no active job …"}` or a `capture_url` response with `status="error"` and an `error` field describing the HTTP-layer failure).
+
+Enable the `interceptor` MCP server on your chat / completion request and the model can call these directly.
+
+## Observability
+
+Every `/capture` invocation gets a 12-char hex `job_id` and shows up in `GET /jobs` for the duration of its run. Two endpoints:
+
+**`GET /jobs`** — snapshot of the port pool + all currently-running captures:
+
+```json
+{
+  "max_concurrent": 8,
+  "active_count": 2,
+  "available": 6,
+  "jobs": [
+    {
+      "job_id": "a3f2b1c9d4e5",
+      "profile": "roofix",
+      "url": "https://roofix.io/project/1234x5678",
+      "started_at": "2026-07-29T15:00:00.123456+00:00",
+      "elapsed_seconds": 12.4,
+      "port": 9224,
+      "used_base_profile": true,
+      "temp_dir": null,
+      "phase": "capturing"
+    }
+  ]
+}
+```
+
+**`GET /jobs/{job_id}`** — same shape as one element of `jobs[]`, or **HTTP 404** if the id isn't currently in flight. Completed captures aren't retained — a 404 means either the id never existed or the capture finished.
+
+`phase` progresses: `"cloning"` (slow path only, during `shutil.copytree`) → `"capturing"` (Chrome running, XHRs being intercepted) → `"cleaning_up"` (temp rmtree + port release). Fast-path captures skip `"cloning"` and go straight to `"capturing"`.
+
+Typical workflow — see what's running, then drill in:
+
+```powershell
+curl http://<host>:8080/jobs                           # count + list all
+curl http://<host>:8080/jobs/a3f2b1c9d4e5              # detail on one
+```
 
 ## Debugging
 
-- **`keep_open: true`** on a `/capture` request leaves Chrome running after the window. Handy for inspecting the DevTools console live. The debug port stays held, so the next `/capture` will 409 until you kill the container's chromium (or restart the container).
+- **`keep_open: true`** on a `/capture` request leaves Chrome running after the capture window. Handy for inspecting the DevTools console live. Cleanup is skipped for that request — the port stays held, the profile lock (fast path) or temp dir (slow path) stays allocated, and the job stays in `GET /jobs` with `phase="capturing"` — until the operator manually kills the container's chromium (or restarts the container). Concurrent captures against a different profile still work; concurrent captures against the same profile will fall into the slow path.
 - **`debug_logging: true`** prepends `const DEBUG_LOGGING = true;` to the injected `interceptor.js`, so `[interceptor]` traces appear in the browser console (visible via `--remote-debugging-port` if you attach a debugger, or in container logs if the JS logs escape via CDP).
 - **`captured_urls`** in the response lists every JSON XHR/fetch URL the interceptor saw — use it to reverse-engineer the right regex when a page fires unfamiliar endpoints.
+- **`job_id` prefix in logs.** Every log line emitted during a capture is tagged `[interceptor-api] [<job_id>] …` — grep for a specific job_id to isolate one capture's timeline out of interleaved concurrent output.
 
 ### Running a capture in visible (non-headless) mode
 
@@ -264,9 +340,11 @@ uv run cdp-spy --url https://roofix.io/project/abc123 --profile-dir C:\data\prof
 
 `cdp-spy` always launches visibly (its `session_sentinel=False` bypasses the gate — see `shared/common/src/common/cdp_interceptor/spy.py:72`) and prints every matched capture to stdout, so you can diff its output against what your `/capture` call returns.
 
-## Limits (v1)
+## Limits
 
-- Single debug port → one in-flight capture per container. Second concurrent call → 409.
+- Port pool caps concurrency; over the cap → HTTP 429.
 - No server-side `parse_fn` — callers get raw response bodies and extract themselves.
 - No streaming captures — `/capture` is one-shot, bounded by `capture_window_seconds`.
 - No public auth on the HTTP surface — the service is only reachable via `ai_shared`.
+- No completed-job history — `GET /jobs/{id}` returns 404 as soon as a capture finishes.
+- No cancellation endpoint — an in-flight capture runs to completion (or until `keep_open` operator cleanup).

@@ -163,7 +163,7 @@ Tracking URLs from Roofix notification emails redirect to the proposal without l
 
 #### When to re-capture
 
-Sessions survive **days to weeks** in practice. Re-capture when:
+Sessions survive **days to weeks** on the fast path (single capture at a time refreshes cookies back to the base profile). Same-profile concurrent captures against interceptor-api use a temp clone and don't contribute cookie freshness to the base profile — under sustained same-profile burst load the base ages faster. Re-capture when:
 
 1. **First time ever** — no `roofix` profile has been uploaded yet.
 2. **Roofix expired the session** — the bridge log shows `login_wall: true` on `/capture` responses.

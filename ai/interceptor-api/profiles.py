@@ -23,12 +23,19 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import sys
 import tarfile
+import time
 from pathlib import Path
 from typing import BinaryIO
+from uuid import uuid4
 
 
 PROFILES_ROOT = os.environ.get("INTERCEPTOR_PROFILES_ROOT", "/data/profiles")
+
+# Temp-profile clones live under a leading-dot subdirectory so they never
+# collide with a real profile name (validator rejects leading dots).
+TEMP_ROOT = Path(PROFILES_ROOT) / ".temp"
 
 # Profile names are used as directory names, so we restrict them to a safe
 # alphabet. Anchored full-match — no path separators, no leading dots.
@@ -116,3 +123,69 @@ def delete_profile(name: str) -> dict:
     if existed:
         shutil.rmtree(p)
     return {"name": name, "deleted": existed}
+
+
+# ── Temp clones for same-profile concurrent captures ───────────────────────
+def clone_profile(name: str) -> Path:
+    """Copy ``PROFILES_ROOT/name`` into a fresh ``TEMP_ROOT/temp_profile_<uuid>``
+    and return the temp dir's path.
+
+    Callers use this on the slow path when the base profile is already in use
+    by another concurrent capture. See ``ai/interceptor-api/app.py`` for the
+    fast/slow path logic.
+
+    Raw ``shutil.copytree`` of a live profile is safe: Chrome's on-disk stores
+    (SQLite ``Cookies``, LevelDB ``Local Storage``/``IndexedDB``) all use
+    journal-based crash recovery, so a mid-write snapshot at worst yields a
+    slightly-stale-but-consistent state, never corruption.
+    """
+    src = profile_path(name)
+    if not src.is_dir():
+        raise FileNotFoundError(f"profile {name!r} not present at {src}")
+    TEMP_ROOT.mkdir(parents=True, exist_ok=True)
+    temp = TEMP_ROOT / f"temp_profile_{uuid4().hex}"
+    shutil.copytree(src, temp)
+    return temp
+
+
+def remove_temp_profile(temp_path: Path) -> None:
+    """Best-effort rmtree with a brief retry loop.
+
+    On Windows (and occasionally Linux under high load) Chrome child processes
+    can hold file handles on the profile dir for a fraction of a second after
+    the launcher process exits. Retry a few times before giving up.
+    """
+    for attempt in range(5):
+        try:
+            shutil.rmtree(temp_path)
+            return
+        except FileNotFoundError:
+            return
+        except PermissionError:
+            time.sleep(0.1 * (attempt + 1))
+        except OSError:
+            time.sleep(0.1 * (attempt + 1))
+    # Final give-up — ignore_errors so the request still returns cleanly.
+    shutil.rmtree(temp_path, ignore_errors=True)
+
+
+def sweep_temp_profiles() -> int:
+    """Delete every child of ``TEMP_ROOT`` — called at startup to clean up
+    clones orphaned by a prior process crash. Returns the count removed."""
+    if not TEMP_ROOT.is_dir():
+        return 0
+    count = 0
+    for child in TEMP_ROOT.iterdir():
+        try:
+            if child.is_dir():
+                shutil.rmtree(child, ignore_errors=True)
+            else:
+                child.unlink(missing_ok=True)
+            count += 1
+        except Exception as exc:
+            print(
+                f"[interceptor-api] sweep_temp_profiles: could not remove {child}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+    return count

@@ -127,17 +127,17 @@ def _run_one_batch(raw_emails: Optional[list] = None) -> dict:
             processed_store=processed_store,
         )
 
-        # Mark successfully processed emails as read.
+        # Mark successfully processed emails as read. The orchestrator stamps
+        # each Decision with the source email's Gmail message id, so we can
+        # look up the target directly — no fragile subject/name matching.
         processed_ids = set()
         for d in decisions:
-            if d.get("action") not in ("ignore", "escalate"):
-                # Find the original email for this decision by matching
-                # the decision's reasoning/payload to the email content.
-                for e in unprocessed:
-                    if e.get("subject") == d.get("payload", {}).get("subject"):
-                        gmail.mark_read(e["message_id"])
-                        processed_ids.add(e["message_id"])
-                        break
+            if d.get("action") in ("ignore", "escalate"):
+                continue
+            mid = d.get("message_id")
+            if mid:
+                gmail.mark_read(mid)
+                processed_ids.add(mid)
 
     _record_tick(decisions, error=None)
     return {"decisions": decisions, "count": len(decisions)}
@@ -221,34 +221,35 @@ def tick(req: Optional[TickRequest] = None) -> dict:
 
 
 if __name__ == "__main__":
-    #    import signal
-    #    import sys
-    #    import time
-    #    import uvicorn
-    #
-    #    def _shutdown(signum, frame):
-    #        """Handle Ctrl+C / SIGTERM: stop scheduler, wait for children, exit clean."""
-    #        _stdlib_logger.info(
-    #            "Shutdown signal received (%s). Stopping scheduler...", signum
-    #        )
-    #        scheduler.shutdown(wait=True)
-    #        _stdlib_logger.info("Scheduler stopped. Waiting for child processes...")
-    #
-    #        # Give child processes a moment to terminate gracefully
-    #        for _ in range(10):  # Wait up to 10 seconds
-    #            import os
-    #            try:
-    #                # Try to terminate all child processes (Windows)
-    #                os.system("taskkill /F /T /PID " + str(os.getpid()))
-    #            except Exception:
-    #                pass
-    #            time.sleep(1)
-    #
-    #        _stdlib_logger.info("Exiting.")
-    #        sys.exit(128 + signum)
-    #
-    #    signal.signal(signal.SIGINT, _shutdown)
-    #    signal.signal(signal.SIGTERM, _shutdown)
-    #
-    #    uvicorn.run(app, host="0.0.0.0", port=8010)
-    tick()
+    import signal
+    import sys
+    import time
+    import uvicorn
+
+    def _shutdown(signum, frame):
+        """Handle Ctrl+C / SIGTERM: stop scheduler, wait for children, exit clean."""
+        _stdlib_logger.info(
+            "Shutdown signal received (%s). Stopping scheduler...", signum
+        )
+        scheduler.shutdown(wait=True)
+        _stdlib_logger.info("Scheduler stopped. Waiting for child processes...")
+
+        # Give child processes a moment to terminate gracefully
+        for _ in range(10):  # Wait up to 10 seconds
+            import os
+
+            try:
+                # Try to terminate all child processes (Windows)
+                os.system("taskkill /F /T /PID " + str(os.getpid()))
+            except Exception:
+                pass
+            time.sleep(1)
+
+        _stdlib_logger.info("Exiting.")
+        sys.exit(128 + signum)
+
+    signal.signal(signal.SIGINT, _shutdown)
+    signal.signal(signal.SIGTERM, _shutdown)
+
+    uvicorn.run(app, host="0.0.0.0", port=8010)
+#    tick()

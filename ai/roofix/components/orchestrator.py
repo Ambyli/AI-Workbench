@@ -393,8 +393,12 @@ def process_batch(raw_emails: list, phoenix=None, log: Optional[CsvLogger] = Non
                                        processed_store):
                     ctx = _resolve_context(ev, phoenix)
 
-            # Decide what to do based on the event and context
-            d = decide(ev, ctx).as_dict()
+            # Decide what to do based on the event and context. Stamp the
+            # source email's Gmail id onto the Decision so app.py can call
+            # mark_read on the right message without reverse-lookups.
+            decision = decide(ev, ctx)
+            decision.message_id = ev.get("message_id")
+            d = decision.as_dict()
 
             # Log the decision
             log.log("brain", d["action"], not d["needs_human"],

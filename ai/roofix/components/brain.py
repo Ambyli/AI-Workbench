@@ -50,6 +50,11 @@ class Decision:
     reasoning: str = ""
     needs_human: bool = False
     source: str = "rule"
+    # The Gmail message id of the email this decision came from. Not set by
+    # the brain (which doesn't care about mail plumbing) — the orchestrator
+    # stamps it after decide() so downstream (app.py) can pair decision→email
+    # for mark_read without reverse-lookups on subject / customer name.
+    message_id: Optional[str] = None
 
     def as_dict(self) -> dict:
         return {
@@ -60,6 +65,7 @@ class Decision:
             "reasoning": self.reasoning,
             "needs_human": self.needs_human,
             "source": self.source,
+            "message_id": self.message_id,
         }
 
 

@@ -25,6 +25,7 @@ Endpoints:
     POST   /capture                       run one capture (see CaptureRequest)
     GET    /jobs                          snapshot of the port pool + running captures
     GET    /jobs/{job_id}                 detail on one in-flight capture (404 if not found)
+    POST   /jobs/{job_id}/cancel          abort an in-flight capture, reclaim its slot
     /mcp                                  FastMCP HTTP transport — exposes tools:
                                           capture_url, list_profiles, list_jobs, get_job
 
@@ -153,6 +154,7 @@ def _register_job(
     used_base_profile: bool,
     temp_dir: Optional[Path],
     phase: str,
+    cancel_event: threading.Event,
 ) -> None:
     with _jobs_lock:
         _active_jobs[job_id] = {
@@ -165,6 +167,7 @@ def _register_job(
             "used_base_profile": used_base_profile,
             "temp_dir": str(temp_dir) if temp_dir is not None else None,
             "phase": phase,
+            "cancel_event": cancel_event,
         }
 
 
@@ -357,6 +360,35 @@ def jobs_get(job_id: str) -> JobInfo:
     return job
 
 
+@app.post("/jobs/{job_id}/cancel")
+def jobs_cancel(job_id: str) -> dict:
+    """Abort an in-flight capture. Signals the running ``_run_capture`` to
+    wake early, terminate Chrome, and clean up. The ``POST /capture`` caller
+    still gets a normal ``CaptureResponse`` back with ``status="cancelled"``
+    plus any partial matches collected before the abort.
+
+    Cancel is also the way to reclaim a hung ``keep_open=true`` capture —
+    the ``keep_open`` cleanup-skip is bypassed when the cancel event is set.
+
+    Returns:
+        200 → ``{"job_id", "cancelled": true, "was_phase": "<phase>"}``
+        404 → job unknown or already completed
+        409 → job already in ``cleaning_up`` (too late to cancel)
+    """
+    with _jobs_lock:
+        job = _active_jobs.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"no active job {job_id!r}")
+        phase = job["phase"]
+        if phase == "cleaning_up":
+            raise HTTPException(
+                status_code=409,
+                detail=f"job {job_id!r} is already cleaning up — too late to cancel",
+            )
+        job["cancel_event"].set()
+    return {"job_id": job_id, "cancelled": True, "was_phase": phase}
+
+
 # ── Capture core (shared by HTTP + MCP) ─────────────────────────────────────
 def _run_capture(req: CaptureRequest) -> CaptureResponse:
     """Perform one capture — handles fast/slow path selection, port pool,
@@ -390,6 +422,7 @@ def _run_capture(req: CaptureRequest) -> CaptureResponse:
         )
 
     job_id = uuid4().hex[:12]
+    cancel_event = threading.Event()
     profile_lock = _get_profile_lock(req.profile)
     used_base = profile_lock.acquire(blocking=False)
 
@@ -406,6 +439,7 @@ def _run_capture(req: CaptureRequest) -> CaptureResponse:
                 used_base_profile=True,
                 temp_dir=None,
                 phase="capturing",
+                cancel_event=cancel_event,
             )
             _log(
                 f"start  profile={req.profile}  path=base  port={port}  "
@@ -421,6 +455,7 @@ def _run_capture(req: CaptureRequest) -> CaptureResponse:
                 used_base_profile=False,
                 temp_dir=None,
                 phase="cloning",
+                cancel_event=cancel_event,
             )
             _log(
                 f"clone  profile={req.profile}  base is in use — cloning to temp",
@@ -488,12 +523,18 @@ def _run_capture(req: CaptureRequest) -> CaptureResponse:
         except BrowserNotFoundError as e:
             raise HTTPException(status_code=500, detail=str(e))
 
-        time.sleep(req.capture_window_seconds)
+        # Wait for the capture window, but wake early if cancelled.
+        # Event.wait returns True on set, False on timeout.
+        cancelled = cancel_event.wait(timeout=req.capture_window_seconds)
         state = client.get_state()
-        if req.keep_open:
+        if cancelled:
+            _log("cancelled — aborting capture and reclaiming slot", job_id=job_id)
+            client.quit()
+        elif req.keep_open:
             _log(
-                "keep_open=true — Chromium left running. Kill it manually to "
-                "free port + profile-lock (fast path) or temp dir (slow path).",
+                "keep_open=true — Chromium left running. Kill it manually or "
+                "POST /jobs/{id}/cancel to reclaim port + profile-lock (fast "
+                "path) or temp dir (slow path).",
                 job_id=job_id,
             )
         else:
@@ -507,8 +548,9 @@ def _run_capture(req: CaptureRequest) -> CaptureResponse:
             matches_snapshot = {k: list(v) for k, v in matches.items()}
             urls_snapshot = list(captured_urls)
 
+        status = "cancelled" if cancelled else state.status
         _log(
-            f"done  status={state.status}  login_wall={login_wall}  "
+            f"done  status={status}  login_wall={login_wall}  "
             f"seen_urls={len(urls_snapshot)}  "
             f"matched={ {k: len(v) for k, v in matches_snapshot.items()} }",
             job_id=job_id,
@@ -517,7 +559,7 @@ def _run_capture(req: CaptureRequest) -> CaptureResponse:
         return CaptureResponse(
             job_id=job_id,
             url=req.url,
-            status=state.status,
+            status=status,
             login_wall=login_wall,
             error=state.error,
             matches=matches_snapshot,
@@ -525,10 +567,10 @@ def _run_capture(req: CaptureRequest) -> CaptureResponse:
         )
     finally:
         _update_job_phase(job_id, "cleaning_up")
-        # Skip cleanup entirely if the caller asked for keep_open — the job
-        # deliberately outlives the request. Job stays in _active_jobs so
-        # /jobs shows the hung capture; port + lock + temp_dir stay held.
-        if not req.keep_open:
+        # Skip cleanup for keep_open=true UNLESS the capture was cancelled.
+        # Cancel is deliberately the way to reclaim a hung keep_open slot.
+        skip_cleanup = req.keep_open and not cancel_event.is_set()
+        if not skip_cleanup:
             if used_base:
                 try:
                     profile_lock.release()

@@ -34,6 +34,7 @@ docker exec interceptor-api curl -s http://localhost:8080/health
 | `POST` | `/capture` | Run one capture (see request/response below) |
 | `GET` | `/jobs` | Snapshot of the port pool + currently-running captures |
 | `GET` | `/jobs/{job_id}` | Detail on one in-flight capture (404 if not found) |
+| `POST` | `/jobs/{job_id}/cancel` | Abort an in-flight capture, reclaim its slot |
 | — | `/mcp` | FastMCP HTTP transport (`capture_url` tool) |
 
 ### `POST /capture`
@@ -275,6 +276,22 @@ curl http://<host>:8080/jobs                           # count + list all
 curl http://<host>:8080/jobs/a3f2b1c9d4e5              # detail on one
 ```
 
+### Cancelling a stuck or long-running capture
+
+**`POST /jobs/{job_id}/cancel`** signals the running capture to wake early, quit Chrome, run cleanup, and return. Operator-only — the MCP surface does NOT expose this (an LLM would need to coordinate across two agents to use it usefully; when a stuck capture happens, an operator handles it).
+
+```powershell
+curl -X POST http://<host>:8080/jobs/a3f2b1c9d4e5/cancel
+# → {"job_id": "a3f2b1c9d4e5", "cancelled": true, "was_phase": "capturing"}
+```
+
+Status codes:
+- **200** — cancel signal delivered; the `POST /capture` caller receives a normal `CaptureResponse` with `status="cancelled"` plus any partial `matches` / `captured_urls` collected before the abort
+- **404** — job unknown or already completed (nothing to cancel)
+- **409** — job already in `cleaning_up` phase (too late — the finally block is running)
+
+Cancel is also the way to reclaim a hung **`keep_open=true`** capture. Normally `keep_open` deliberately skips cleanup (Chrome stays running, port + profile lock stay held, job stays in `/jobs`). Cancel bypasses that: it terminates Chrome and runs full cleanup regardless of `keep_open`.
+
 ## Debugging
 
 - **`keep_open: true`** on a `/capture` request leaves Chrome running after the capture window. Handy for inspecting the DevTools console live. Cleanup is skipped for that request — the port stays held, the profile lock (fast path) or temp dir (slow path) stays allocated, and the job stays in `GET /jobs` with `phase="capturing"` — until the operator manually kills the container's chromium (or restarts the container). Concurrent captures against a different profile still work; concurrent captures against the same profile will fall into the slow path.
@@ -347,4 +364,4 @@ uv run cdp-spy --url https://roofix.io/project/abc123 --profile-dir C:\data\prof
 - No streaming captures — `/capture` is one-shot, bounded by `capture_window_seconds`.
 - No public auth on the HTTP surface — the service is only reachable via `ai_shared`.
 - No completed-job history — `GET /jobs/{id}` returns 404 as soon as a capture finishes.
-- No cancellation endpoint — an in-flight capture runs to completion (or until `keep_open` operator cleanup).
+- No MCP-side cancellation — cancel is HTTP-only. An LLM cannot reclaim a stuck capture it started; that's an operator's job.

@@ -46,13 +46,11 @@ The extractor is pure — no I/O, no external calls.
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
 
 _LOOKUP_SEP = "__LOOKUP__"
-_PROJECT_URL_RE = re.compile(r"/project/([0-9]+x[0-9]+)")
 
 # Roofix doc types the extractor reads.
 _ORDER_TYPE = "custom.order1"
@@ -232,31 +230,23 @@ def _source_by_type_and_id(mget_docs: list, doc_type: str,
     return None
 
 
-def _init_data_order(init_data: list, project_id: Optional[str]) -> dict:
-    """Find the ``custom.order1`` entry in ``init_data`` matching ``project_id``.
+def _init_data_order_entry(init_data: list) -> dict:
+    """Return the first ``custom.order1`` entry in ``init_data`` (the whole
+    entry, not just its ``data``).
 
     init_data entries are shaped ``{id, type, data, version}`` (Bubble's own
-    envelope — different from mget's elasticsearch envelope). The ``data``
-    dict is the same shape as an mget ``_source`` for the same doc type.
+    envelope — different from mget's elasticsearch envelope). The project's
+    Bubble id lives at the *entry level* as ``id`` (no underscore); the
+    ``data`` dict carries the order fields but is not the identity source.
 
-    If ``project_id`` is unset, falls back to the first order1 entry. If no
-    order1 is present at all, returns an empty dict (the extractor treats
-    this as "order-side fields unavailable", not a hard failure).
+    Returns ``{}`` if no order1 entry is present (extractor treats this as
+    "order-side fields unavailable", not a hard failure — identity falls
+    through to the homeowner check).
     """
-    first_order: dict = {}
     for entry in init_data or []:
-        if not isinstance(entry, dict):
-            continue
-        if entry.get("type") != _ORDER_TYPE:
-            continue
-        data = entry.get("data")
-        if not isinstance(data, dict):
-            continue
-        if project_id and data.get("_id") == project_id:
-            return data
-        if not first_order:
-            first_order = data
-    return first_order
+        if isinstance(entry, dict) and entry.get("type") == _ORDER_TYPE:
+            return entry
+    return {}
 
 
 def _num(value: Any) -> Optional[float]:
@@ -277,19 +267,6 @@ def _int(value: Any) -> Optional[int]:
         return int(value)
     except (TypeError, ValueError):
         return None
-
-
-def _project_id_from_url(url: Optional[str]) -> Optional[str]:
-    """Extract the Bubble project id from a ``roofix.io/project/{id}`` URL.
-
-    Roofix skips the ``custom.order1`` doc in mget for proposals that haven't
-    been accepted yet — so the URL is the reliable identity source. Returns
-    None only if the URL isn't a project URL.
-    """
-    if not url:
-        return None
-    m = _PROJECT_URL_RE.search(url)
-    return m.group(1) if m else None
 
 
 # ── Public API ─────────────────────────────────────────────────────────────
@@ -313,15 +290,17 @@ def extract_proposal(scraper_response: dict) -> ExtractedProposal:
         )
 
     # ── Identity anchor ──────────────────────────────────────────────────
-    # URL is the reliable anchor. mget can return other orders (past ones
-    # by the same homeowner) and init/data may or may not carry the current
-    # order1 depending on state.
-    url_project_id = _project_id_from_url(scraper_response.get("url"))
+    # The project's Bubble id lives on the init_data entry with
+    # type == "custom.order1", at the entry-level "id" (no underscore).
+    # The URL is NOT a trusted source — it can carry a slug/link id that
+    # differs from the actual record id.
 
     # ── Order1 — from init_data (authoritative for the current project) ──
-    # init_data's entries are shaped {id, type, data, version}. We want the
-    # data of the one where type==custom.order1 AND id==url_project_id.
-    order = _init_data_order(init_data, url_project_id)
+    # init_data's entries are shaped {id, type, data, version}. We keep the
+    # entry so we can read its top-level "id" for identity, and use its
+    # "data" for order field reads below.
+    order_entry = _init_data_order_entry(init_data)
+    order = order_entry.get("data") or {}
 
     # ── Everything else — from mget_docs ─────────────────────────────────
     homeowner = _first_source_by_type(mget_docs, _HOMEOWNER_TYPE) or {}
@@ -329,13 +308,13 @@ def extract_proposal(scraper_response: dict) -> ExtractedProposal:
     job = _first_source_by_type(mget_docs, _JOB_TYPE)            # None if absent
     warranty = _first_source_by_type(mget_docs, _WARRANTY_TYPE)  # None if absent
 
-    # Identity: prefer order1._id, then URL. Unaccepted proposals with no
-    # order1 in init_data still resolve via URL.
-    roofix_project_id = order.get("_id") or url_project_id
+    # Identity: the custom.order1 entry's top-level id. If there's no order1
+    # entry AND no homeowner, we can't say anything useful about the project.
+    roofix_project_id = order_entry.get("id")
     if not roofix_project_id and not homeowner:
         return ExtractedProposal(
             ok=False,
-            error="no order1 doc, no homeowner, and no project id in URL "
+            error="no custom.order1 entry in init_data and no homeowner "
                   "(login wall? scrape too short?)",
         )
 
@@ -366,7 +345,7 @@ def extract_proposal(scraper_response: dict) -> ExtractedProposal:
     return ExtractedProposal(
         ok=True,
 
-        # Identity — project id from order1 if present, else from URL
+        # Identity — the custom.order1 entry's top-level "id" in init_data
         roofix_project_id=roofix_project_id,
         external_ref=order.get("external_project_id_text"),
         display_text=order.get("display_text"),

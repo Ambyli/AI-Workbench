@@ -154,6 +154,11 @@ FAKE_EXTRACTED_PROPOSAL.ok = True
 FAKE_EXTRACTED_PROPOSAL.error = None
 FAKE_EXTRACTED_PROPOSAL.roofix_project_id = "1781297151690x264388044885887520"
 FAKE_EXTRACTED_PROPOSAL.is_accepted = True
+# The orchestrator's _scrape_and_extract reads full_name / street_address off
+# the ExtractedProposal to merge into the event. Set them explicitly so the
+# MagicMock returns real strings, not auto-generated MagicMock instances.
+FAKE_EXTRACTED_PROPOSAL.full_name = "Test Customer"
+FAKE_EXTRACTED_PROPOSAL.street_address = "100 Test Street"
 FAKE_EXTRACTED_PROPOSAL.acceptance_signals = {
     "has_hic": True,
     "has_job": True,
@@ -367,6 +372,10 @@ def run() -> bool:
             error = None
             roofix_project_id = "1781297151690x264388044885887520"
             is_accepted = False
+            # Same rationale as FAKE_EXTRACTED_PROPOSAL — the merge path reads
+            # these two off the extracted proposal.
+            full_name = "Test Customer"
+            street_address = "100 Test Street"
             __dict__ = {
                 "ok": True, "error": None,
                 "roofix_project_id": "1781297151690x264388044885887520",
@@ -420,7 +429,7 @@ def run() -> bool:
 
     # ── 6. Phase 1: scraper returns no docs → mark error ────────────────────
 
-    @case("Phase 1: scraper returns no docs → mark error in ProcessedStore")
+    @case("Phase 1: scraper returns no docs -> mark error in ProcessedStore")
     def _test_phase1_scraper_no_docs():
         log_path = os.path.join(os.environ["LOG_DIR"], "audit_t9_no_docs.csv")
         audit = CsvLogger(path=log_path, columns=[

@@ -30,7 +30,6 @@ import json
 from dataclasses import dataclass, field
 from typing import Optional
 
-
 PHASE = os.getenv("AGENT_PHASE", "0")
 
 
@@ -46,22 +45,33 @@ class Decision:
 
     def as_dict(self) -> dict:
         return {
-            "action": self.action, "event_type": self.event_type,
-            "target": self.target, "payload": self.payload,
-            "reasoning": self.reasoning, "needs_human": self.needs_human,
+            "action": self.action,
+            "event_type": self.event_type,
+            "target": self.target,
+            "payload": self.payload,
+            "reasoning": self.reasoning,
+            "needs_human": self.needs_human,
             "source": self.source,
         }
 
 
 MILESTONE_EVENTS = {
-    "HIC Executed", "Install Date", "Job Scheduled", "Job In Progress",
-    "Job Is Complete", "Deposit Invoice Sent", "Deposit Invoice Paid",
+    "HIC Executed",
+    "Install Date",
+    "Job Scheduled",
+    "Job In Progress",
+    "Job Is Complete",
+    "Deposit Invoice Sent",
+    "Deposit Invoice Paid",
     "Job Approval Confirmed",
 }
 
-SIGNING_EVENTS = {"Job Approval Confirmed", "HIC Executed"}  # confirm exact set w/ Jonathan
+SIGNING_EVENTS = {
+    "Job Approval Confirmed",
+    "HIC Executed",
+}  # confirm exact set w/ Jonathan
 
-NEEDS_SCRAPE_EVENTS = {"Estimate Complete", "Estimate"}
+NEED_SCRAPE_EVENTS = {"Estimate Complete", "Estimate"}
 
 
 def decide(event: dict, context: dict) -> Decision:
@@ -73,70 +83,120 @@ def decide(event: dict, context: dict) -> Decision:
     found = context.get("found", False)
     ambiguous = context.get("ambiguous", False)
 
-    if not event.get("parse_complete") and not event.get("project_id") \
-            and not (event.get("customer_name") and event.get("address")):
-        return Decision("escalate", event_type=etype, reasoning=(
-            "Could not identify a project (no id, no usable name+address)."),
-            needs_human=True)
+    if (
+        not event.get("parse_complete")
+        and not event.get("project_id")
+        and not (event.get("customer_name") and event.get("address"))
+    ):
+        return Decision(
+            "escalate",
+            event_type=etype,
+            reasoning=("Could not identify a project (no id, no usable name+address)."),
+            needs_human=True,
+        )
 
     if found and ambiguous:
-        return Decision("escalate", event_type=etype, reasoning=(
-            f"Name/address matched {context.get('candidate_count','several')} Phoenix "
-            f"projects; refusing to guess which one."), needs_human=True)
+        return Decision(
+            "escalate",
+            event_type=etype,
+            reasoning=(
+                f"Name/address matched {context.get('candidate_count','several')} Phoenix "
+                f"projects; refusing to guess which one."
+            ),
+            needs_human=True,
+        )
 
     if etype == "New Comment":
         if not found:
-            return Decision("escalate", event_type=etype, reasoning=(
-                "Comment for a customer not found in Phoenix. A project may have "
-                "advanced in Roofix without being mirrored here — needs a human to "
-                "decide whether to create it."), needs_human=True)
+            return Decision(
+                "escalate",
+                event_type=etype,
+                reasoning=(
+                    "Comment for a customer not found in Phoenix. A project may have "
+                    "advanced in Roofix without being mirrored here — needs a human to "
+                    "decide whether to create it."
+                ),
+                needs_human=True,
+            )
         note = event.get("comment_text") or ""
         if not note:
-            return Decision("escalate", event_type=etype,
-                reasoning="New Comment but no comment text parsed.", needs_human=True)
+            return Decision(
+                "escalate",
+                event_type=etype,
+                reasoning="New Comment but no comment text parsed.",
+                needs_human=True,
+            )
         prefix = "[Roofix] "
         mentions = event.get("mentioned_users") or []
         body = note + (f"\n(Mentions: {', '.join(mentions)})" if mentions else "")
-        return Decision("update_chatter", event_type=etype,
+        return Decision(
+            "update_chatter",
+            event_type=etype,
             target=str(context.get("phoenix_project_id")),
             payload={"note_text": prefix + body},
-            reasoning="New Roofix comment relayed to Phoenix chatter (append).")
+            reasoning="New Roofix comment relayed to Phoenix chatter (append).",
+        )
 
     if etype in MILESTONE_EVENTS:
         if not found:
-            return Decision("escalate", event_type=etype, reasoning=(
-                f"'{etype}' milestone for a project not in Phoenix — needs a human."),
-                needs_human=True)
-        return Decision("update_milestone", event_type=etype,
+            return Decision(
+                "escalate",
+                event_type=etype,
+                reasoning=(
+                    f"'{etype}' milestone for a project not in Phoenix — needs a human."
+                ),
+                needs_human=True,
+            )
+        return Decision(
+            "update_milestone",
+            event_type=etype,
             target=str(context.get("phoenix_project_id")),
             payload={"roofix_event": etype},
-            reasoning=f"'{etype}' advances the project's milestone in Phoenix.")
+            reasoning=f"'{etype}' advances the project's milestone in Phoenix.",
+        )
 
-    if etype in NEEDS_SCRAPE_EVENTS:
+    if etype in NEED_SCRAPE_EVENTS:
         if PHASE == "0":
-            return Decision("ignore", event_type=etype, reasoning=(
-                f"'{etype}' is informational (good/better/best ladder). Phase 0 does "
-                f"not act on estimates; contract value is set by a signing event."))
+            return Decision(
+                "ignore",
+                event_type=etype,
+                reasoning=(
+                    f"'{etype}' is informational (good/better/best ladder). Phase 0 does "
+                    f"not act on estimates; contract value is set by a signing event."
+                ),
+            )
         # Phase 1: if we have a tracking URL, emit create_project. The
         # orchestrator will scrape, extract, and decide acceptance.
         tracking_url = event.get("tracking_url")
         if tracking_url:
-            return Decision("create_project", event_type=etype,
+            return Decision(
+                "create_project",
+                event_type=etype,
                 target=tracking_url,
                 payload={"tracking_url": tracking_url},
-                reasoning=f"'{etype}' with tracking URL — scrape and evaluate acceptance.")
+                reasoning=f"'{etype}' with tracking URL — scrape and evaluate acceptance.",
+            )
         # No tracking URL — can't scrape, escalate.
-        return Decision("escalate", event_type=etype,
+        return Decision(
+            "escalate",
+            event_type=etype,
             reasoning=f"'{etype}' with no tracking URL — cannot scrape proposal.",
-            needs_human=True)
+            needs_human=True,
+        )
 
     if etype == "New Task":
-        return Decision("ignore", event_type=etype, reasoning=(
-            "New Task is a prompt for a human action in Roofix; Phase 0 takes no "
-            "action. (Phase 1 may notify the rep.)"))
+        return Decision(
+            "ignore",
+            event_type=etype,
+            reasoning=(
+                "New Task is a prompt for a human action in Roofix; Phase 0 takes no "
+                "action. (Phase 1 may notify the rep.)"
+            ),
+        )
 
-    return _escalate_to_ai(event, context,
-        why=f"No rule confidently handles event_type '{etype}'.")
+    return _escalate_to_ai(
+        event, context, why=f"No rule confidently handles event_type '{etype}'."
+    )
 
 
 def _escalate_to_ai(event: dict, context: dict, why: str) -> Decision:
@@ -146,9 +206,13 @@ def _escalate_to_ai(event: dict, context: dict, why: str) -> Decision:
         d.source = "ai"
         return d
     except Exception as e:
-        return Decision("escalate", event_type=etype, source="ai",
+        return Decision(
+            "escalate",
+            event_type=etype,
+            source="ai",
             reasoning=f"AI escalation needed ({why}) but model call failed: {e}",
-            needs_human=True)
+            needs_human=True,
+        )
 
 
 # === THE SWAP SEAM =================================================================
@@ -189,10 +253,13 @@ def generate_ai_decision(event: dict, context: dict, why: str) -> Decision:
     etype = event.get("event_type", "Unknown")
 
     client = OpenAI(
-        base_url=os.environ.get("ROOFIX_LLM_URL", "http://litellm:4000").rstrip("/") + "/v1",
+        base_url=os.environ.get("ROOFIX_LLM_URL", "http://litellm:4000").rstrip("/")
+        + "/v1",
         api_key=os.environ["ROOFIX_LLM_API_KEY"],
     )
-    user = json.dumps({"why_escalated": why, "event": event, "phoenix_context": context})
+    user = json.dumps(
+        {"why_escalated": why, "event": event, "phoenix_context": context}
+    )
 
     resp = client.chat.completions.create(
         model=os.environ.get("BRAIN_MODEL", "qwen3.6"),

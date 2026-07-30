@@ -44,7 +44,7 @@ EXPECTED = {
                                  "customer_name": "Robert Shepherd",
                                  "parse_complete": True},
     "new_task_with_url_in_body":{"event_type": "New Task",
-                                 "project_id": "1780583972085x1910864934000000000",
+                                 "project_id": None,
                                  "parse_complete": True},
     # ── Real "RFX | Estimate" samples ──────────────────────────────────────────
     # Load-bearing invariants for these:

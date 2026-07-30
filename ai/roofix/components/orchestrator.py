@@ -21,7 +21,7 @@ from typing import Callable, Optional
 
 from common.logging_setup import CsvLogger
 
-from components.parser import parse_email
+from components.parser import parse_email, NEEDS_SCRAPE_EVENTS
 from components.brain import decide
 from components.proposal_extractor import extract_proposal
 
@@ -95,6 +95,104 @@ def _resolve_context(ev: dict, phoenix) -> dict:
     return {"found": False, "ambiguous": False}
 
 
+# Fields the orchestrator forwards from ExtractedProposal into the payload it
+# hands ``phoenix.ensure_entity_and_project``. Kept exhaustive so downstream
+# gets everything the extractor produced — Phoenix ignores keys it doesn't use.
+_EXTRACTED_PAYLOAD_FIELDS = (
+    "roofix_project_id", "is_accepted", "display_text",
+    "customer_name", "full_name", "first_name", "last_name",
+    "email", "phone",
+    "street_address", "city", "state_text", "state_abbr", "zip_code",
+    "contract_price", "actual_contract_price", "funding_type", "trade",
+    "job_status", "hic_status", "hic_signature_present",
+    "acceptance_signals", "error",
+)
+
+
+def _extracted_to_payload(extracted) -> dict:
+    """Convert an ExtractedProposal (or test fake) into a plain dict.
+
+    Uses ``getattr(..., None)`` so it works with the real dataclass, subclass
+    fakes, and MagicMocks. Only the fields ensure_entity_and_project reads (or
+    that a future consumer might read) are copied — that keeps the payload
+    inspectable in audit / debug output.
+    """
+    return {f: getattr(extracted, f, None) for f in _EXTRACTED_PAYLOAD_FIELDS}
+
+
+def _scrape_and_extract(ev: dict, scraper_client, log: "CsvLogger",
+                        key: str, processed_store) -> bool:
+    """Fetch + extract the proposal behind ``ev["tracking_url"]``.
+
+    Preconditions the caller must verify before invoking:
+      * event type is in ``NEEDS_SCRAPE_EVENTS`` (Estimate / Estimate Complete)
+      * ``ev["tracking_url"]`` is present
+      * a scraper_client instance is available
+      * the Phoenix resolve already missed (otherwise the scrape is waste)
+
+    Emits audit rows under ``scraper`` (fetch, no_docs, error) and
+    ``extractor`` (extracted) stages as it goes. On the ``no_docs`` path
+    (scraper returned nothing usable) the event is marked as an error in
+    ``processed_store`` so it doesn't get re-attempted every tick.
+
+    On extractor success, mutates ``ev``:
+      customer_name / address filled in from the scraped proposal,
+      project_id stamped from ``custom.order1``'s top-level id,
+      is_accepted / parse_complete stamped, an audit note appended,
+      ``_extracted_payload`` stashed for ``_execute`` to pass onward to
+      ``phoenix.ensure_entity_and_project``.
+
+    Returns True iff the extraction produced usable data (caller should
+    re-resolve Phoenix context so the brain sees the sharper identity).
+
+    Called by: ``process_batch`` (per event, only on the Phoenix-miss path).
+    """
+    etype = ev.get("event_type", "")
+    try:
+        result = scraper_client.get_proposal(tracking_url=ev["tracking_url"])
+    except Exception as e:
+        log.log("scraper", "error", False, f"exception: {e}",
+                event_type=etype, project_ref=key)
+        ev.setdefault("notes", []).append(f"scrape failed: {e}")
+        return False
+
+    if not result.get("mget_docs"):
+        log.log("scraper", "no_docs", False, "scraper returned no docs",
+                event_type=etype, project_ref=key)
+        if processed_store:
+            processed_store.mark_error(ev.get("message_id"),
+                                       metadata={"error": "no_docs"})
+        ev.setdefault("notes", []).append("scrape returned no docs")
+        return False
+
+    log.log("scraper", "fetched", True,
+            f"{len(result.get('mget_docs') or [])} docs",
+            event_type=etype, project_ref=key)
+
+    extracted = extract_proposal(result)
+    log.log("extractor", "extracted", bool(getattr(extracted, "ok", False)),
+            getattr(extracted, "error", None) or "extraction ok",
+            event_type=etype, project_ref=key)
+    if not getattr(extracted, "ok", False):
+        ev.setdefault("notes", []).append(
+            f"scrape parse failed: {getattr(extracted, 'error', None)}"
+        )
+        return False
+
+    ev["customer_name"] = (
+        getattr(extracted, "full_name", None) or ev.get("customer_name")
+    )
+    ev["address"] = (
+        getattr(extracted, "street_address", None) or ev.get("address")
+    )
+    ev["project_id"] = getattr(extracted, "roofix_project_id", None)
+    ev["is_accepted"] = bool(getattr(extracted, "is_accepted", False))
+    ev["parse_complete"] = True
+    ev["_extracted_payload"] = _extracted_to_payload(extracted)
+    ev.setdefault("notes", []).append("scraped URL for better data")
+    return True
+
+
 def _execute(decision: dict, ev: dict, phoenix, log: CsvLogger,
              milestone_map: Optional[dict],
              processed_store=None) -> None:
@@ -162,20 +260,23 @@ def _execute(decision: dict, ev: dict, phoenix, log: CsvLogger,
                         event_type=etype, project_ref=pref)
 
         # ── Create project ────────────────────────────────────────────
-        # Use the already-scraped data from the parser.
+        # Use the already-scraped data from ``_scrape_and_extract``, which
+        # stashes ``_extracted_payload`` on ev when it succeeds. If the scrape
+        # never ran or failed the payload will be missing — the scrape-side
+        # no_docs path already marked processed_store, so we just bail.
         case "create_project":
-            # The parser already scraped the URL and populated the event.
-            # Check if we have the required data.
-            roofix_project_id = ev.get("project_id")
+            # The scrape step already populated the event with the extracted
+            # proposal dict. Check if we have the required data.
+            payload = ev.get("_extracted_payload") or {}
+            roofix_project_id = payload.get("roofix_project_id")
             if not roofix_project_id:
                 log.log("orchestrator", action, False,
-                        "create_project missing project_id (scraping failed?)",
+                        "create_project missing scraped data (scraping failed?)",
                         event_type=etype, project_ref=pref)
                 return
 
-            # Check if the proposal was accepted
-            is_accepted = ev.get("is_accepted", False)
-            if not is_accepted:
+            # Check if the proposal was accepted.
+            if not payload.get("is_accepted"):
                 log.log("orchestrator", "not_accepted", True,
                         "proposal not accepted, skipping create",
                         event_type=etype, project_ref=pref)
@@ -193,15 +294,10 @@ def _execute(decision: dict, ev: dict, phoenix, log: CsvLogger,
                         event_type=etype, project_ref=pref)
                 return
 
-            # Build the extracted proposal dict from the event data.
-            extracted_data = {
-                "roofix_project_id": roofix_project_id,
-                "customer_name": ev.get("customer_name"),
-                "address": ev.get("address"),
-                # Add other fields as needed from the event/scraped data
-            }
-
-            res = phoenix.ensure_entity_and_project(extracted_data)
+            # Hand the full extracted proposal dict straight to Phoenix — it
+            # reads whichever fields it needs (name, address, contract price,
+            # etc.) and ignores keys it doesn't care about.
+            res = phoenix.ensure_entity_and_project(payload)
 
             log.log("phoenix", action, res.ok,
                     (("DRY_RUN " if res.dry_run else "") + res.detail),
@@ -261,7 +357,9 @@ def process_batch(raw_emails: list, phoenix=None, log: Optional[CsvLogger] = Non
     decisions = []
 
     # ── Step 1: Parse all raw emails into structured events ────────────────
-    parsed = [parse_email(e, scraper_client=scraper_client).as_dict() for e in raw_emails]
+    # Parser is pure: extracts fields from the email only. Scraping and
+    # Phoenix lookups happen below, so we don't pay for them twice.
+    parsed = [parse_email(e).as_dict() for e in raw_emails]
 
     # ── Step 2: Group events by project identity ──────────────────────────
     # Each group contains all events belonging to the same Roofix project.
@@ -282,8 +380,29 @@ def process_batch(raw_emails: list, phoenix=None, log: Optional[CsvLogger] = Non
                     event_type=ev.get("event_type", ""),
                     project_ref=key)
 
-            # Resolve the project context from Phoenix
+            # Resolve the project context from Phoenix — this is the single
+            # authoritative "does Phoenix know this project?" check. Its
+            # result flows straight into decide() below, so the brain sees
+            # the same answer we used to gate the scrape.
             ctx = _resolve_context(ev, phoenix)
+
+            # ── Scrape gate ────────────────────────────────────────────
+            # Only scrape when Phoenix couldn't identify the project AND
+            # the event is one whose real data lives behind the proposal
+            # link (Estimate / Estimate Complete). On success, re-resolve
+            # so the brain sees an updated context (the scrape may have
+            # supplied a project_id or a sharper name+address).
+            # _scrape_and_extract logs its own scraper/extractor audit rows
+            # and marks processed_store on no_docs — we don't wrap those here.
+            if (
+                scraper_client
+                and ev.get("tracking_url")
+                and ev.get("event_type") in NEEDS_SCRAPE_EVENTS
+                and not ctx.get("found")
+            ):
+                if _scrape_and_extract(ev, scraper_client, log, key,
+                                       processed_store):
+                    ctx = _resolve_context(ev, phoenix)
 
             # Decide what to do based on the event and context
             d = decide(ev, ctx).as_dict()
@@ -295,7 +414,6 @@ def process_batch(raw_emails: list, phoenix=None, log: Optional[CsvLogger] = Non
 
             # Execute the decision
             _execute(d, ev, phoenix, log, milestone_map,
-                     scraper_client=scraper_client,
                      processed_store=processed_store)
 
             # Add the decision to the results

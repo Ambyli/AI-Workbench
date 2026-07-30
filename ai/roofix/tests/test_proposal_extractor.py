@@ -10,8 +10,8 @@ doc types the extractor reads and PII-redacted:
                                 Job complete, warranty issued, stage="customer"
   proposal_unaccepted.json   — Gerald kang: no HIC / Job / warranty; homeowner
                                 stage="opportunity"; Roofix skips the order1
-                                doc in mget for unaccepted proposals so
-                                identity has to come from the URL
+                                doc in mget for unaccepted proposals, so
+                                identity comes from init_data's order1 entry
 """
 
 from __future__ import annotations
@@ -24,7 +24,6 @@ from components.proposal_extractor import (
     AcceptanceSignals,
     ExtractedProposal,
     _lookup_id,
-    _project_id_from_url,
     extract_proposal,
 )
 
@@ -55,26 +54,6 @@ def _test_lookup_id_edge_cases() -> list[str]:
         problems.append("empty string should return None")
     if _lookup_id(42) is not None:
         problems.append("non-string input should return None")
-    return problems
-
-
-def _test_project_id_from_url() -> list[str]:
-    problems = []
-    got = _project_id_from_url(
-        "https://roofix.io/project/1781297151690x264388044885887520")
-    if got != "1781297151690x264388044885887520":
-        problems.append(f"project url: got {got!r}")
-    # With trailing garbage / query string
-    got = _project_id_from_url(
-        "https://roofix.io/project/1784846253605x685099068151907800?foo=bar")
-    if got != "1784846253605x685099068151907800":
-        problems.append(f"url with query: got {got!r}")
-    # Non-project URL
-    if _project_id_from_url("https://roofix.io/dashboard") is not None:
-        problems.append("non-project URL should return None")
-    # Empty / None
-    if _project_id_from_url("") is not None or _project_id_from_url(None) is not None:
-        problems.append("empty/None should return None")
     return problems
 
 
@@ -278,9 +257,10 @@ def _test_none_input() -> list[str]:
     return []
 
 
-def _test_url_only_identity() -> list[str]:
-    """If order1 is missing but URL has a project id and homeowner exists,
-    extraction still succeeds with project_id from the URL."""
+def _test_homeowner_only_no_order1() -> list[str]:
+    """If order1 is missing but homeowner exists, extraction still succeeds
+    (homeowner is enough to skip the hard-fail branch) but roofix_project_id
+    is None — the URL is NOT a trusted identity source."""
     resp = {
         "url": "https://roofix.io/project/1784846253605x685099068151907800",
         "mget_docs": [
@@ -298,22 +278,31 @@ def _test_url_only_identity() -> list[str]:
     result = extract_proposal(resp)
     problems = []
     if not result.ok:
-        problems.append(f"url-only: ok=False, error={result.error!r}")
-    if result.roofix_project_id != "1784846253605x685099068151907800":
-        problems.append(f"url-only project_id: got {result.roofix_project_id!r}")
+        problems.append(f"homeowner-only: ok=False, error={result.error!r}")
+    if result.roofix_project_id is not None:
+        problems.append(
+            f"homeowner-only project_id: expected None (URL is not a source), "
+            f"got {result.roofix_project_id!r}")
     if result.first_name != "Jane":
-        problems.append(f"url-only first_name: got {result.first_name!r}")
+        problems.append(f"homeowner-only first_name: got {result.first_name!r}")
     if result.is_accepted:
-        problems.append("url-only + opportunity stage: is_accepted should be False")
+        problems.append("homeowner-only + opportunity stage: is_accepted should be False")
     return problems
 
 
 def _test_hic_executed_alone_is_accepted() -> list[str]:
     """A hic doc with status=executed is sufficient acceptance, even without
-    a job doc or a customer-stage homeowner."""
+    a job doc or a customer-stage homeowner. (A minimal homeowner doc is
+    included so the extractor's identity guard doesn't short-circuit before
+    the acceptance logic runs.)"""
     resp = {
         "url": "https://roofix.io/project/1234x5678",
         "mget_docs": [
+            {
+                "_id": "hw1",
+                "_type": "custom.homeowner",
+                "_source": {"_id": "hw1", "_type": "custom.homeowner"},
+            },
             {
                 "_id": "h1",
                 "_type": "custom.hic",
@@ -322,7 +311,7 @@ def _test_hic_executed_alone_is_accepted() -> list[str]:
                     "status_option_contingency": "executed",
                     "signature_url_text": "//sig.example/x.png",
                 },
-            }
+            },
         ],
     }
     result = extract_proposal(resp)
@@ -344,13 +333,18 @@ def _test_hic_present_but_not_executed_is_not_accepted() -> list[str]:
         "url": "https://roofix.io/project/1234x5678",
         "mget_docs": [
             {
+                "_id": "hw1",
+                "_type": "custom.homeowner",
+                "_source": {"_id": "hw1", "_type": "custom.homeowner"},
+            },
+            {
                 "_id": "h1",
                 "_type": "custom.hic",
                 "_source": {
                     "_id": "h1", "_type": "custom.hic",
-                    "status_option_contingency": "draft",  # ← not executed
+                    "status_option_contingency": "draft",  # not executed
                 },
-            }
+            },
         ],
     }
     result = extract_proposal(resp)
@@ -392,13 +386,18 @@ def _test_job_status_alone_is_accepted() -> list[str]:
         "url": "https://roofix.io/project/1234x5678",
         "mget_docs": [
             {
+                "_id": "hw1",
+                "_type": "custom.homeowner",
+                "_source": {"_id": "hw1", "_type": "custom.homeowner"},
+            },
+            {
                 "_id": "j1",
                 "_type": "custom.job1",
                 "_source": {
                     "_id": "j1", "_type": "custom.job1",
                     "status_option_job_status": "in_progress",
                 },
-            }
+            },
         ],
     }
     result = extract_proposal(resp)
@@ -412,12 +411,11 @@ def _test_job_status_alone_is_accepted() -> list[str]:
 _CASES = [
     ("lookup_id: strips prefix", _test_lookup_id_strips_bubble_prefix),
     ("lookup_id: edge cases", _test_lookup_id_edge_cases),
-    ("project_id_from_url: various", _test_project_id_from_url),
     ("extract: accepted proposal (Robert Shepherd)", _test_accepted_extraction),
     ("extract: unaccepted proposal (Gerald kang)", _test_unaccepted_extraction),
     ("extract: empty mget_docs", _test_missing_mget_docs),
     ("extract: None input", _test_none_input),
-    ("acceptance: URL-only identity (order1 absent)", _test_url_only_identity),
+    ("identity: homeowner only, no order1 -> project_id=None", _test_homeowner_only_no_order1),
     ("acceptance: hic executed alone", _test_hic_executed_alone_is_accepted),
     ("acceptance: hic draft alone is NOT accepted", _test_hic_present_but_not_executed_is_not_accepted),
     ("acceptance: customer-stage alone", _test_customer_stage_alone_is_accepted),

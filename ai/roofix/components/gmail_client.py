@@ -37,7 +37,9 @@ from common.env import load_env
 load_env()
 
 import base64
+import html as _html
 import os
+import re
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 
@@ -48,6 +50,31 @@ from googleapiclient.discovery import build
 
 
 SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
+
+# Cheap HTML -> plaintext for the body fallback: some Roofix notifications
+# have no text/plain part, and without this the message would fall through to
+# Gmail's snippet (hard-capped ~200 chars), truncating comments and quotes.
+_STYLE_SCRIPT_RE = re.compile(
+    r"<(script|style)\b[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL
+)
+_BR_RE = re.compile(r"<br\s*/?>", re.IGNORECASE)
+_BLOCK_CLOSE_RE = re.compile(r"</(p|div|li|tr|h[1-6])>", re.IGNORECASE)
+_TAG_RE = re.compile(r"<[^>]+>")
+_INLINE_WS_RE = re.compile(r"[ \t]+")
+_MULTI_NL_RE = re.compile(r"\n{3,}")
+
+
+def _html_to_text(html: str) -> str:
+    if not html:
+        return ""
+    s = _STYLE_SCRIPT_RE.sub("", html)
+    s = _BR_RE.sub("\n", s)
+    s = _BLOCK_CLOSE_RE.sub("\n", s)
+    s = _TAG_RE.sub("", s)
+    s = _html.unescape(s)
+    s = _INLINE_WS_RE.sub(" ", s)
+    s = _MULTI_NL_RE.sub("\n\n", s)
+    return s.strip()
 
 ROOFIX_SENDER = os.getenv("ROOFIX_SENDER", "no-reply@roofix.io")
 CREDENTIALS_PATH = os.getenv("GMAIL_CREDENTIALS_PATH", "config/credentials.json")
@@ -177,7 +204,7 @@ class GmailClient:
             out.append({
                 "sender": self._header(headers, "From"),
                 "subject": self._header(headers, "Subject"),
-                "body_text": text or msg.get("snippet", ""),
+                "body_text": text or _html_to_text(html) or msg.get("snippet", ""),
                 "body_html": html,
                 "timestamp": ts_iso,
                 "to": [a.strip() for a in self._header(headers, "To").split(",") if a],

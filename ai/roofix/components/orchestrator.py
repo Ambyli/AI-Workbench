@@ -21,15 +21,18 @@ from typing import Callable, Optional
 
 from common.logging_setup import CsvLogger
 
-from components.parser import parse_email, NEEDS_SCRAPE_EVENTS
+from components.parser import parse_email
 from components.brain import decide
 from components.proposal_extractor import extract_proposal
-
-DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
-
-# CSV audit schema — positional-arg order matches every call site's usage.
-# `timestamp` is auto-prepended by CsvLogger; don't include it here.
-LOG_COLUMNS = ["stage", "action", "ok", "detail", "event_type", "project_ref"]
+# All module-level constants moved to components/constants.py — re-imported
+# here so `from components.orchestrator import DRY_RUN` etc. still works and
+# so we don't scatter `os.getenv` calls across the codebase.
+from components.constants import (
+    DRY_RUN,
+    LOG_COLUMNS,
+    NEEDS_SCRAPE_EVENTS,
+    EXTRACTED_PAYLOAD_FIELDS as _EXTRACTED_PAYLOAD_FIELDS,
+)
 
 
 def _default_log() -> CsvLogger:
@@ -93,20 +96,6 @@ def _resolve_context(ev: dict, phoenix) -> dict:
                 return {"found": True, "ambiguous": True,
                         "candidate_count": len(matches)}
     return {"found": False, "ambiguous": False}
-
-
-# Fields the orchestrator forwards from ExtractedProposal into the payload it
-# hands ``phoenix.ensure_entity_and_project``. Kept exhaustive so downstream
-# gets everything the extractor produced — Phoenix ignores keys it doesn't use.
-_EXTRACTED_PAYLOAD_FIELDS = (
-    "roofix_project_id", "is_accepted", "display_text",
-    "customer_name", "full_name", "first_name", "last_name",
-    "email", "phone",
-    "street_address", "city", "state_text", "state_abbr", "zip_code",
-    "contract_price", "actual_contract_price", "funding_type", "trade",
-    "job_status", "hic_status", "hic_signature_present",
-    "acceptance_signals", "error",
-)
 
 
 def _extracted_to_payload(extracted) -> dict:

@@ -50,15 +50,18 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 
-_LOOKUP_SEP = "__LOOKUP__"
-
-# Roofix doc types the extractor reads.
-_ORDER_TYPE = "custom.order1"
-_HOMEOWNER_TYPE = "custom.homeowner"
-_HIC_TYPE = "custom.hic"
-_JOB_TYPE = "custom.job1"
-_WARRANTY_TYPE = "custom.warranty"
-_ESTIMATE_TYPE = "custom.estimate1"
+# Bubble doc types and the Bubble lookup-join separator all live in
+# components/constants.py; re-imported with the local `_underscore` aliases
+# the rest of the module already uses.
+from components.constants import (
+    LOOKUP_SEP as _LOOKUP_SEP,
+    ORDER_TYPE as _ORDER_TYPE,
+    HOMEOWNER_TYPE as _HOMEOWNER_TYPE,
+    HIC_TYPE as _HIC_TYPE,
+    JOB_TYPE as _JOB_TYPE,
+    WARRANTY_TYPE as _WARRANTY_TYPE,
+    ESTIMATE_TYPE as _ESTIMATE_TYPE,
+)
 
 
 @dataclass

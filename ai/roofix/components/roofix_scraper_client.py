@@ -37,14 +37,15 @@ from typing import Optional
 import httpx
 
 
-DEFAULT_INTERCEPTOR_URL = "http://interceptor-api:8080"
-DEFAULT_INIT_DATA_PATTERN = os.getenv(
-    "ROOFIX_INIT_DATA_URL_PATTERN", r"roofix\.io/api/1\.1/init/data"
+# DEFAULT_INTERCEPTOR_URL, DEFAULT_INIT_DATA_PATTERN, DEFAULT_MGET_PATTERN,
+# and DEFAULT_PROFILE all live in components/constants.py; re-imported so
+# `from components.roofix_scraper_client import DEFAULT_PROFILE` still works.
+from components.constants import (
+    DEFAULT_INTERCEPTOR_URL,
+    DEFAULT_INIT_DATA_PATTERN,
+    DEFAULT_MGET_PATTERN,
+    DEFAULT_PROFILE,
 )
-DEFAULT_MGET_PATTERN = os.getenv(
-    "ROOFIX_MGET_URL_PATTERN", r"roofix\.io/elasticsearch/mget"
-)
-DEFAULT_PROFILE = os.getenv("ROOFIX_PROFILE_NAME", "roofix")
 
 
 class RoofixScraperClient:

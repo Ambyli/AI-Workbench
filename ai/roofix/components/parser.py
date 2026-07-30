@@ -31,33 +31,24 @@ Design notes:
 
 from __future__ import annotations
 
-import re
 import html as _html
+import re
 from dataclasses import dataclass, field
 from typing import Optional
 
-# Event types whose real data lives behind the proposal link — thin by nature.
-# For these, parse_complete is False unless we already have what we need.
-# The orchestrator uses this same set to decide when to scrape after a
-# Phoenix-lookup miss; keep it public for that reason.
-NEEDS_SCRAPE_EVENTS = {"Estimate Complete", "Estimate"}
-_NEEDS_SCRAPE_EVENTS = NEEDS_SCRAPE_EVENTS  # legacy alias — still used below
-
-# Roofix sends a good/better/best estimate ladder; these are informational, not
-# corrections. (The brain applies the rule; the parser just classifies.)
-_SENDER_RE = re.compile(r"^\s*RFX\s*\|\s*(?P<type>[^<]+?)\s*<", re.IGNORECASE)
-_PROJECT_URL_RE = re.compile(
-    r"https?://(?:www\.)?roofix\.io/project/(?P<id>[0-9]+x[0-9]+)", re.IGNORECASE
+# All parser-relevant constants live in components/constants.py so the brain
+# and orchestrator share one source of truth. Re-imported at module scope so
+# external code that does `from components.parser import NEEDS_SCRAPE_EVENTS`
+# still works.
+from components.constants import (
+    NEEDS_SCRAPE_EVENTS,
+    SENDER_RE as _SENDER_RE,
+    PROJECT_URL_RE as _PROJECT_URL_RE,
+    TRACKING_URL_RE as _TRACKING_URL_RE,
+    NAME_ADDR_RE as _NAME_ADDR_RE,
+    MENTION_RE as _MENTION_RE,
+    QUOTE_RE as _QUOTE_RE,
 )
-# The email's tokenized tracking link (works without login; redirects to the proposal).
-# Appears as href="http://urlNNNN.roofix.io/ls/click?upn=..." in the HTML body.
-_TRACKING_URL_RE = re.compile(
-    r"https?://url\d+\.roofix\.io/ls/click\?[^\s\"'<>]+", re.IGNORECASE
-)
-# "<Name> - <Address>" — name on the left of the first " - ", address on the right.
-_NAME_ADDR_RE = re.compile(r"(?P<name>[A-Za-z.''\- ]+?)\s+-\s+(?P<addr>\d[^\n\"\[\]]+)")
-_MENTION_RE = re.compile(r"@([A-Za-z][A-Za-z0-9_]+)")
-_QUOTE_RE = re.compile(r"\"(?P<quote>.+?)\"", re.DOTALL)
 
 
 @dataclass
@@ -276,7 +267,7 @@ def parse_email(raw: dict) -> ParsedEvent:
     if not have_identity:
         ev.parse_complete = False
         ev.notes.append("no project_id and no name+address — cannot identify project")
-    elif event_type in _NEEDS_SCRAPE_EVENTS:
+    elif event_type in NEEDS_SCRAPE_EVENTS:
         ev.parse_complete = False
         ev.notes.append(
             f"{event_type}: real data is behind the proposal link — needs scrape"

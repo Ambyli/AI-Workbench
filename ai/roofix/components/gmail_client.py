@@ -39,7 +39,6 @@ load_env()
 import base64
 import html as _html
 import os
-import re
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 
@@ -48,23 +47,29 @@ from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
-
-SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
-
-# Cheap HTML -> plaintext for the body fallback: some Roofix notifications
-# have no text/plain part, and without this the message would fall through to
-# Gmail's snippet (hard-capped ~200 chars), truncating comments and quotes.
-_STYLE_SCRIPT_RE = re.compile(
-    r"<(script|style)\b[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL
+# Constants live in components/constants.py; re-imported here (with the local
+# aliases the rest of the file already uses) so `from components.gmail_client
+# import QUERY` etc. keeps working.
+from components.constants import (
+    GMAIL_SCOPES as SCOPES,
+    ROOFIX_SENDER,
+    GMAIL_CREDENTIALS_PATH as CREDENTIALS_PATH,
+    GMAIL_TOKEN_PATH as TOKEN_PATH,
+    LISTENER_QUERY as QUERY,
+    STYLE_SCRIPT_RE as _STYLE_SCRIPT_RE,
+    BR_RE as _BR_RE,
+    BLOCK_CLOSE_RE as _BLOCK_CLOSE_RE,
+    TAG_RE as _TAG_RE,
+    INLINE_WS_RE as _INLINE_WS_RE,
+    MULTI_NL_RE as _MULTI_NL_RE,
 )
-_BR_RE = re.compile(r"<br\s*/?>", re.IGNORECASE)
-_BLOCK_CLOSE_RE = re.compile(r"</(p|div|li|tr|h[1-6])>", re.IGNORECASE)
-_TAG_RE = re.compile(r"<[^>]+>")
-_INLINE_WS_RE = re.compile(r"[ \t]+")
-_MULTI_NL_RE = re.compile(r"\n{3,}")
 
 
 def _html_to_text(html: str) -> str:
+    """Cheap HTML -> plaintext for the body fallback: some Roofix notifications
+    have no text/plain part, and without this the message would fall through
+    to Gmail's snippet (hard-capped ~200 chars), truncating comments and
+    quotes."""
     if not html:
         return ""
     s = _STYLE_SCRIPT_RE.sub("", html)
@@ -75,12 +80,6 @@ def _html_to_text(html: str) -> str:
     s = _INLINE_WS_RE.sub(" ", s)
     s = _MULTI_NL_RE.sub("\n\n", s)
     return s.strip()
-
-ROOFIX_SENDER = os.getenv("ROOFIX_SENDER", "no-reply@roofix.io")
-CREDENTIALS_PATH = os.getenv("GMAIL_CREDENTIALS_PATH", "config/credentials.json")
-TOKEN_PATH = os.getenv("GMAIL_TOKEN_PATH", "config/token.json")
-# Search query: unread, from the Roofix sender. Override via env for narrowing.
-QUERY = os.getenv("LISTENER_QUERY") or f"is:unread from:{ROOFIX_SENDER}"
 
 
 class GmailClient:

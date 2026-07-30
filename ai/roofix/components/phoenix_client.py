@@ -74,16 +74,20 @@ import psycopg2.extras
 # --- configuration knobs --------------------------------------------------------
 # Values derived from Phoenix data (grep phoenix.object_type / relationship_type
 # / phoenix.project GROUP BY company_id, etc.). Overridable via env for a
-# non-default Phoenix deployment.
+# non-default Phoenix deployment. All live in components/constants.py and are
+# re-imported here so `from components.phoenix_client import COMPANY_ID` and
+# `pc.AGENT_USER_ID = None` (test mutation pattern) keep working.
 
-COMPANY_ID = int(os.getenv("PHOENIX_COMPANY_ID", "1"))
-PROJECT_OBJECT_TYPE_ID = int(os.getenv("PHOENIX_PROJECT_OBJECT_TYPE_ID", "7"))   # "R&R / Roof"
-ENTITY_OBJECT_TYPE_ID = int(os.getenv("PHOENIX_ENTITY_OBJECT_TYPE_ID", "8"))     # "Lead"
-HOMEOWNER_REL_TYPE_ID = int(os.getenv("PHOENIX_HOMEOWNER_REL_TYPE_ID", "7"))     # "Homeowner"
-PROJECT_START_STATUS_ID = int(os.getenv("PHOENIX_PROJECT_START_STATUS_ID", "4")) # "Qualification"
-AGENT_USER_ID = os.getenv("PHOENIX_AGENT_USER_ID")
-_ROOFIX_ID_COLUMN = os.getenv("PHOENIX_ROOFIX_ID_COLUMN", "migration_external_id")
-DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
+from components.constants import (
+    PHOENIX_COMPANY_ID as COMPANY_ID,
+    PHOENIX_PROJECT_OBJECT_TYPE_ID as PROJECT_OBJECT_TYPE_ID,
+    PHOENIX_ENTITY_OBJECT_TYPE_ID as ENTITY_OBJECT_TYPE_ID,
+    PHOENIX_HOMEOWNER_REL_TYPE_ID as HOMEOWNER_REL_TYPE_ID,
+    PHOENIX_PROJECT_START_STATUS_ID as PROJECT_START_STATUS_ID,
+    PHOENIX_AGENT_USER_ID as AGENT_USER_ID,
+    PHOENIX_ROOFIX_ID_COLUMN as _ROOFIX_ID_COLUMN,
+    DRY_RUN,
+)
 
 
 # --- result type ----------------------------------------------------------------

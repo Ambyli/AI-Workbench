@@ -30,7 +30,15 @@ import json
 from dataclasses import dataclass, field
 from typing import Optional
 
-PHASE = os.getenv("AGENT_PHASE", "0")
+# Constants live in components/constants.py; re-imported at module scope so
+# tests that mutate ``brain_mod.PHASE`` still rebind the name locally.
+from components.constants import (
+    PHASE,
+    MILESTONE_EVENTS,
+    SIGNING_EVENTS,
+    NEEDS_SCRAPE_EVENTS,
+    SYSTEM_PROMPT as _SYSTEM_PROMPT,
+)
 
 
 @dataclass
@@ -55,23 +63,8 @@ class Decision:
         }
 
 
-MILESTONE_EVENTS = {
-    "HIC Executed",
-    "Install Date",
-    "Job Scheduled",
-    "Job In Progress",
-    "Job Is Complete",
-    "Deposit Invoice Sent",
-    "Deposit Invoice Paid",
-    "Job Approval Confirmed",
-}
-
-SIGNING_EVENTS = {
-    "Job Approval Confirmed",
-    "HIC Executed",
-}  # confirm exact set w/ Jonathan
-
-NEED_SCRAPE_EVENTS = {"Estimate Complete", "Estimate"}
+# MILESTONE_EVENTS, SIGNING_EVENTS, and NEEDS_SCRAPE_EVENTS all live in
+# components/constants.py — imported at the top of this module.
 
 
 def decide(event: dict, context: dict) -> Decision:
@@ -155,7 +148,7 @@ def decide(event: dict, context: dict) -> Decision:
             reasoning=f"'{etype}' advances the project's milestone in Phoenix.",
         )
 
-    if etype in NEED_SCRAPE_EVENTS:
+    if etype in NEEDS_SCRAPE_EVENTS:
         if PHASE == "0":
             return Decision(
                 "ignore",
@@ -217,21 +210,9 @@ def _escalate_to_ai(event: dict, context: dict, why: str) -> Decision:
 
 # === THE SWAP SEAM =================================================================
 
-_SYSTEM_PROMPT = (
-    "You are the decision layer of an internal agent that mirrors Roofix project "
-    "events into the Phoenix CRM. You NEVER act inside Roofix and NEVER contact "
-    "customers. You return ONE decision as strict JSON, no prose.\n"
-    "Allowed actions: update_chatter, update_milestone, create_project, "
-    "notify_rep, escalate, ignore.\n"
-    "Rules you must honor:\n"
-    "- Comments append; never overwrite.\n"
-    "- Estimate emails are informational options (good/better/best); contract "
-    "value is set by a signing/approval event, not by recency.\n"
-    "- Never fabricate a project from a comment; if a project isn't in Phoenix, "
-    "escalate with needs_human=true.\n"
-    "- When unsure, escalate with needs_human=true. Prefer caution.\n"
-    'Return JSON: {"action","target","payload","reasoning","needs_human"}.'
-)
+# _SYSTEM_PROMPT lives in components/constants.py — imported at the top of
+# this module. The name is aliased with a leading underscore because it's
+# only meant to be read by generate_ai_decision below.
 
 
 def generate_ai_decision(event: dict, context: dict, why: str) -> Decision:

@@ -35,7 +35,6 @@ from typing import Optional
 from components.constants import (
     PHASE,
     MILESTONE_EVENTS,
-    SIGNING_EVENTS,
     SCRAPE_EVENTS,
     IGNORE_EVENTS,
     SYSTEM_PROMPT as _SYSTEM_PROMPT,
@@ -70,8 +69,8 @@ class Decision:
         }
 
 
-# MILESTONE_EVENTS, SIGNING_EVENTS, and SCRAPE_EVENTS all live in
-# components/constants.py — imported at the top of this module.
+# MILESTONE_EVENTS and SCRAPE_EVENTS all live in components/constants.py —
+# imported at the top of this module.
 
 
 async def decide(event: dict, context: dict) -> Decision:
@@ -151,6 +150,7 @@ async def decide(event: dict, context: dict) -> Decision:
                 ),
                 needs_human=True,
             )
+        # Update this project's milestone in Phoenix. With its pairing etype and action to perform specific phoenix tasks in orchestrator.py.
         return Decision(
             "update_milestone",
             event_type=etype,

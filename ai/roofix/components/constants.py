@@ -43,11 +43,6 @@ MILESTONE_EVENTS = {
     "Job Is Complete",
     "Deposit Invoice Sent",
     "Deposit Invoice Paid",
-}
-
-# Contract-value-setting events (signing / approval). Estimate emails are
-# informational options; contract value comes from these, not from recency.
-SIGNING_EVENTS = {
     "Job Approval Confirmed",
     "HIC Executed",
 }
@@ -63,6 +58,7 @@ IGNORE_EVENTS = {
     "Submit Credit Application",
     "Approve Estimate",
     "Please have CPC signed (If applicable)",
+    "Closeout Completed",
 }
 
 

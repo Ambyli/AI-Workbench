@@ -313,7 +313,7 @@ def run() -> bool:
 
         # Patch extract_proposal to return our fake.
         with patch("components.orchestrator.extract_proposal", return_value=FAKE_EXTRACTED_PROPOSAL):
-            decisions = asyncio.run(orchestrator_run(
+            records = asyncio.run(orchestrator_run(
                 listener=lambda: [FAKE_ESTIMATE_EMAIL],
                 phoenix=phoenix,
                 log=audit,
@@ -322,9 +322,9 @@ def run() -> bool:
                 processed_store=processed_store,
             ))
 
-        # Verify decision.
-        assert len(decisions) == 1, len(decisions)
-        d = decisions[0]
+        # Verify decision. Each record now bundles ev + decision.
+        assert len(records) == 1, len(records)
+        d = records[0]["decision"]
         assert d["action"] == "create_project", d
 
         # Verify scraper was called with the tracking URL.
@@ -391,7 +391,7 @@ def run() -> bool:
         not_accepted = FakeExtractedProposal()
 
         with patch("components.orchestrator.extract_proposal", return_value=not_accepted):
-            decisions = asyncio.run(orchestrator_run(
+            records = asyncio.run(orchestrator_run(
                 listener=lambda: [FAKE_ESTIMATE_EMAIL],
                 phoenix=phoenix,
                 log=audit,
@@ -401,8 +401,8 @@ def run() -> bool:
             ))
 
         # Verify decision.
-        assert len(decisions) == 1, len(decisions)
-        d = decisions[0]
+        assert len(records) == 1, len(records)
+        d = records[0]["decision"]
         assert d["action"] == "create_project", d
 
         # Verify ensure_entity_and_project was NOT called.
@@ -447,7 +447,7 @@ def run() -> bool:
         # Make scraper return no docs.
         scraper.get_proposal = AsyncMock(return_value={"docs": [], "mget_docs": []})
 
-        decisions = asyncio.run(orchestrator_run(
+        records = asyncio.run(orchestrator_run(
             listener=lambda: [FAKE_ESTIMATE_EMAIL],
             phoenix=phoenix,
             log=audit,
@@ -457,8 +457,8 @@ def run() -> bool:
         ))
 
         # Verify decision.
-        assert len(decisions) == 1, len(decisions)
-        d = decisions[0]
+        assert len(records) == 1, len(records)
+        d = records[0]["decision"]
         assert d["action"] == "create_project", d
 
         # Verify extractor was NOT called.

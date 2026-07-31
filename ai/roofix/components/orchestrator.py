@@ -575,7 +575,14 @@ async def _process_group(
     milestone events for the same project must apply in order (a later
     chatter append shouldn't race with an earlier one).
 
-    Returns the list of decision dicts produced for this group.
+    Returns a list of ``{"event": <parsed event>, "decision": <decision dict>}``
+    records — one per event in this group. The event is returned alongside
+    the decision so callers (app.py, /tick response, tests) can see the
+    fully-hydrated event that produced the decision — including
+    scraper-populated fields like ``_extracted_payload``. ``_raw_email`` is
+    stripped from the returned event because it holds the entire fetched
+    Gmail message (headers + full HTML body) — big, redundant with what
+    triggered the tick, and rarely useful downstream.
     """
     evs.sort(key=lambda e: e.get("email_timestamp") or "")
     out: list = []
@@ -641,7 +648,11 @@ async def _process_group(
             gmail=gmail,
         )
 
-        out.append(d)
+        # Shallow-copy the ev so we can drop `_raw_email` without mutating
+        # the dict `_execute` just used (also keeps this loop side-effect
+        # free for the caller's copy).
+        ev_out = {k: v for k, v in ev.items() if k != "_raw_email"}
+        out.append({"event": ev_out, "decision": d})
 
     return out
 
@@ -681,8 +692,11 @@ async def process_batch(
         gmail: GmailClient for escalation forwarding.
 
     Returns:
-        List of decision dicts (one per event, after ``decide().as_dict()``).
-        Order: flatten groups in whatever order gather resolved them.
+        List of ``{"event": <parsed event>, "decision": <decision dict>}``
+        records — one per event, in whatever order ``asyncio.gather`` resolves
+        the groups (which preserves the input-iterable order of groups, i.e.
+        first-seen event order). ``event["_raw_email"]`` is stripped from the
+        returned copy; ``event["_extracted_payload"]`` is kept.
     """
     log = log or _default_log()
 
@@ -729,8 +743,8 @@ async def process_batch(
 
     # Flatten. gather() preserves the order of the input iterable, so
     # groups appear in insertion order (which follows first-seen event
-    # order from ``raw_emails``).
-    return [d for group in group_results for d in group]
+    # order from ``raw_emails``). Each item is an {"event", "decision"} record.
+    return [item for group in group_results for item in group]
 
 
 async def run(
@@ -760,7 +774,8 @@ async def run(
         gmail: GmailClient for escalation forwarding.
 
     Returns:
-        List of decision dicts (same as ``process_batch``).
+        List of ``{"event", "decision"}`` records (same shape as
+        ``process_batch``).
     """
     log = log or _default_log()
     raw = listener()

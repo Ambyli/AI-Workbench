@@ -147,7 +147,7 @@ async def _run_one_batch(raw_emails: Optional[list] = None) -> dict:
                     event_type="", project_ref="",
                 )
 
-                decisions = await orchestrator_run(
+                records = await orchestrator_run(
                     listener=lambda: unprocessed,
                     phoenix=phoenix,
                     log=_audit_log,
@@ -173,7 +173,8 @@ async def _run_one_batch(raw_emails: Optional[list] = None) -> dict:
                 # processed_store, so nothing gets re-processed next tick —
                 # this gate only controls Gmail visibility.
                 processed_ids = set()
-                for d in decisions:
+                for item in records:
+                    d = item["decision"]
                     action = d.get("action")
                     if action == "escalate" and not d.get("_forwarded"):
                         continue
@@ -184,11 +185,14 @@ async def _run_one_batch(raw_emails: Optional[list] = None) -> dict:
                         await asyncio.to_thread(gmail.mark_read, mid)
                         processed_ids.add(mid)
 
-        _record_tick(decisions, error=None)
-        return {"decisions": decisions, "count": len(decisions)}
+        _record_tick(records, error=None)
+        return {"records": records, "count": len(records)}
 
 
-def _record_tick(decisions: list, error: Optional[str]) -> None:
+def _record_tick(records: list, error: Optional[str]) -> None:
+    """``records`` is the list of {"event", "decision"} objects returned by
+    ``orchestrator_run``. We only tally decision-side fields here.
+    """
     with _STATE_LOCK:
         _STATE["last_tick_at"] = datetime.now(timezone.utc).isoformat(
             timespec="seconds"
@@ -196,8 +200,9 @@ def _record_tick(decisions: list, error: Optional[str]) -> None:
         _STATE["last_tick_ok"] = error is None
         _STATE["last_tick_error"] = error
         _STATE["tick_count"] += 1
-        _STATE["decisions_total"] += len(decisions)
-        for d in decisions:
+        _STATE["decisions_total"] += len(records)
+        for item in records:
+            d = item["decision"]
             _STATE["decisions_by_action"][d.get("action", "")] += 1
             _STATE["decisions_by_source"][d.get("source", "")] += 1
             if d.get("needs_human") or d.get("action") == "escalate":
@@ -267,7 +272,7 @@ async def tick(req: Optional[TickRequest] = None) -> dict:
         return await _run_one_batch(raw_emails=raw)
     except Exception as e:
         _record_tick([], error=repr(e))
-        return {"error": repr(e), "decisions": [], "count": 0}
+        return {"error": repr(e), "records": [], "count": 0}
 
 
 if __name__ == "__main__":

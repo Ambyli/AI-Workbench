@@ -59,6 +59,7 @@ IGNORE_EVENTS = {
     "Approve Estimate",
     "Please have CPC signed (If applicable)",
     "Closeout Completed",
+    "Send HIC to Homeowner",
 }
 
 

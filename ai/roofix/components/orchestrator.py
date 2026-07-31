@@ -352,6 +352,7 @@ async def _execute(
                         ESCALATION_RECIPIENTS,
                         decision["reasoning"],
                         raw_email,
+                        etype,
                     )
                     forwarded = True
                     log.log(

@@ -216,11 +216,14 @@ class GmailClient:
         self.service().users().messages().modify(
             userId="me", id=message_id, body={"removeLabelIds": ["UNREAD"]}).execute()
 
-    def forward_email(self, to: list[str], reason: str, original: dict) -> None:
+    def forward_email(self, to: list[str], reason: str, original: dict,
+                      event_type: str = "") -> None:
         """Forward `original` (a raw email dict from `fetch()`) to `to`,
-        prefaced with the escalation `reason`. Preserves both text and html
-        parts of the original when available so the recipient sees the full
-        formatting Roofix used.
+        prefaced with the escalation `reason` and the parsed `event_type`
+        (e.g. "New Comment", "HIC Executed") so the operator knows what
+        Roofix event triggered the escalation without having to read the
+        forwarded body. Preserves both text and html parts of the original
+        when available so the recipient sees the full formatting Roofix used.
 
         No-op if `to` is empty. Raises the underlying HttpError on send
         failure — the caller (orchestrator) decides how to handle it.
@@ -243,6 +246,7 @@ class GmailClient:
         header = (
             "[Roofix Bridge] This email was escalated for human review.\n"
             "\n"
+            f"Event type: {event_type or '(unknown)'}\n"
             f"Reason: {reason}\n"
             "\n"
             "--- Forwarded message ---\n"

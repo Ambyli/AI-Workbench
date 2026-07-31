@@ -3,6 +3,7 @@ Test the BRAIN's rules + escalation logic in isolation (Contract C). No AI call,
 no Phoenix. Run from ai/roofix/:  PYTHONPATH=. python tests/test_brain.py
 """
 
+import asyncio
 import os
 os.environ.setdefault("AGENT_PHASE", "0")
 
@@ -32,7 +33,10 @@ def run():
     passed = failed = 0
     for label, ctx, want_action, want_human in CASES:
         ev = parse_email(BY[label]).as_dict()
-        d = decide(ev, ctx).as_dict()
+        # decide() is async now (fallback path awaits AsyncOpenAI). The rules
+        # path doesn't touch any I/O, so asyncio.run per case is fine — it
+        # spins up a loop just long enough to reach the return.
+        d = asyncio.run(decide(ev, ctx)).as_dict()
         ok = d["action"] == want_action and d["needs_human"] == want_human
         ctx_desc = "found" if ctx.get("found") and not ctx.get("ambiguous") else \
                    "ambiguous" if ctx.get("ambiguous") else "not-found"

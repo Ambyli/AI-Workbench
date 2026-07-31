@@ -20,32 +20,48 @@ PRESENT = _PresentSentinel()
 
 
 EXPECTED = {
-    "new_comment_with_mention": {"event_type": "New Comment",
-                                 "customer_name": "LaFonda Mcwilliams Wyatt",
-                                 "mentioned_users": ["Andrew_Lusk"],
-                                 "parse_complete": True},
-    "new_comment_thread":       {"event_type": "New Comment",
-                                 "customer_name": "LaFonda Mcwilliams Wyatt",
-                                 "parse_complete": True},
-    "new_task_select_funding":  {"event_type": "New Task",
-                                 "customer_name": "Debbie Bush",
-                                 "parse_complete": True},
-    "estimate_complete":        {"event_type": "Estimate Complete",
-                                 "customer_name": "David Estes",
-                                 "address_suffix": "Reorder",
-                                 "parse_complete": False},
-    "estimate_in_progress":     {"event_type": "Estimate",
-                                 "customer_name": "Rosa Gonzales",
-                                 "parse_complete": False},
-    "hic_executed":             {"event_type": "HIC Executed",
-                                 "customer_name": "Conner broaddus",
-                                 "parse_complete": True},
-    "install_date_confirmed":   {"event_type": "Install Date",
-                                 "customer_name": "Robert Shepherd",
-                                 "parse_complete": True},
-    "new_task_with_url_in_body":{"event_type": "New Task",
-                                 "project_id": None,
-                                 "parse_complete": True},
+    "new_comment_with_mention": {
+        "event_type": "New Comment",
+        "customer_name": "LaFonda Mcwilliams Wyatt",
+        "mentioned_users": ["Andrew_Lusk"],
+        "parse_complete": True,
+    },
+    "new_comment_thread": {
+        "event_type": "New Comment",
+        "customer_name": "LaFonda Mcwilliams Wyatt",
+        "parse_complete": True,
+    },
+    "new_task_select_funding": {
+        "event_type": "New Task",
+        "customer_name": "Debbie Bush",
+        "parse_complete": True,
+    },
+    "estimate_complete": {
+        "event_type": "Estimate Complete",
+        "customer_name": "David Estes",
+        "address_suffix": "Reorder",
+        "parse_complete": False,
+    },
+    "estimate_in_progress": {
+        "event_type": "Estimate",
+        "customer_name": "Rosa Gonzales",
+        "parse_complete": False,
+    },
+    "hic_executed": {
+        "event_type": "HIC Executed",
+        "customer_name": "Conner broaddus",
+        "parse_complete": True,
+    },
+    "install_date_confirmed": {
+        "event_type": "Install Date",
+        "customer_name": "Robert Shepherd",
+        "parse_complete": True,
+    },
+    "new_task_with_url_in_body": {
+        "event_type": "New Task",
+        "project_id": None,
+        "parse_complete": True,
+    },
     # ── Real "RFX | Estimate" samples ──────────────────────────────────────────
     # Load-bearing invariants for these:
     #   project_id is None — Roofix never puts the raw /project/<id> link in
@@ -53,7 +69,7 @@ EXPECTED = {
     #     tracking URL. Scraper follows the tracking URL to acquire the id.
     #   tracking_url is PRESENT — the scraper's entrypoint. If this breaks,
     #     the Estimate pipeline is dead.
-    #   parse_complete is False — Estimate is in NEEDS_SCRAPE_EVENTS.
+    #   parse_complete is False — Estimate is in SCRAPE_EVENTS.
     "estimate_in_progress_gerald_kang_836_lasser_drive": {
         "event_type": "Estimate",
         "customer_name": "Gerald kang",
@@ -105,8 +121,10 @@ def run():
                 print(f"        {p}")
         else:
             passed += 1
-            print(f"ok    {s['label']:56s} -> {ev['event_type']}, "
-                  f"{ev['customer_name']}, complete={ev['parse_complete']}")
+            print(
+                f"ok    {s['label']:56s} -> {ev['event_type']}, "
+                f"{ev['customer_name']}, complete={ev['parse_complete']}"
+            )
     print(f"\n{passed} passed, {failed} failed")
     return failed == 0
 

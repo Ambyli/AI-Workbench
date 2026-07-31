@@ -15,6 +15,7 @@ can be tested with sample emails now and wired to the Gmail MCP on the server.
 
 from __future__ import annotations
 
+import asyncio
 import os
 from pathlib import Path
 from typing import Callable, Optional
@@ -24,16 +25,26 @@ from common.logging_setup import CsvLogger
 from components.parser import parse_email
 from components.brain import decide
 from components.proposal_extractor import extract_proposal
+
 # All module-level constants moved to components/constants.py — re-imported
 # here so `from components.orchestrator import DRY_RUN` etc. still works and
 # so we don't scatter `os.getenv` calls across the codebase.
 from components.constants import (
     DRY_RUN,
     LOG_COLUMNS,
-    NEEDS_SCRAPE_EVENTS,
+    SCRAPE_EVENTS,
     EXTRACTED_PAYLOAD_FIELDS as _EXTRACTED_PAYLOAD_FIELDS,
     ESCALATION_RECIPIENTS,
+    INTERCEPTOR_MAX_CONCURRENT,
+    SCRAPE_TIMEOUT_SECONDS,
 )
+
+# Bridge-side rate limit on concurrent scrape calls. Constructed fresh at the
+# top of each ``process_batch`` (so it binds to the currently-running event
+# loop) and passed to every coroutine that reaches ``_scrape_and_extract``.
+# MUST match (or be smaller than) interceptor-api's own INTERCEPTOR_MAX_CONCURRENT
+# so we queue locally rather than pounding the server and eating 409s.
+# asyncio.Semaphore serves waiters FIFO → first-come-first-serve automatic.
 
 
 def _default_log() -> CsvLogger:
@@ -58,7 +69,7 @@ def _identity_key(ev: dict) -> str:
     return f"na:{(ev.get('customer_name') or '').lower()}|{(ev.get('address') or '').lower()}"
 
 
-def _resolve_context(ev: dict, phoenix) -> dict:
+async def _resolve_context(ev: dict, phoenix) -> dict:
     """Look up the Phoenix project that an event belongs to.
 
     Strategy:
@@ -72,30 +83,48 @@ def _resolve_context(ev: dict, phoenix) -> dict:
       - ``candidate_count`` (int, optional): how many candidates matched.
       - ``offline`` (bool, optional): True when phoenix client is unavailable.
 
+    Phoenix's psycopg2 client is sync — we wrap its calls in
+    ``asyncio.to_thread`` so a slow DB round-trip doesn't stall the event loop
+    while other event groups continue processing.
+
     Called by: `process_batch` (once per event, inside the per-group loop).
     """
     if phoenix is None:
         return {"found": False, "offline": True}
     if ev.get("project_id"):
-        r = phoenix.find_project_by_roofix_id(ev["project_id"])
+        r = await asyncio.to_thread(phoenix.find_project_by_roofix_id, ev["project_id"])
         if r.ok:
             matches = r.data.get("matches", [])
             if len(matches) == 1:
-                return {"found": True, "ambiguous": False,
-                        "phoenix_project_id": matches[0]["id"]}
+                return {
+                    "found": True,
+                    "ambiguous": False,
+                    "phoenix_project_id": matches[0]["id"],
+                }
             if len(matches) > 1:
-                return {"found": True, "ambiguous": True,
-                        "candidate_count": len(matches)}
+                return {
+                    "found": True,
+                    "ambiguous": True,
+                    "candidate_count": len(matches),
+                }
     if ev.get("customer_name"):
-        r = phoenix.find_project_by_identity(ev["customer_name"], ev.get("address"))
+        r = await asyncio.to_thread(
+            phoenix.find_project_by_identity, ev["customer_name"], ev.get("address")
+        )
         if r.ok:
             matches = r.data.get("matches", [])
             if len(matches) == 1:
-                return {"found": True, "ambiguous": False,
-                        "phoenix_project_id": matches[0]["id"]}
+                return {
+                    "found": True,
+                    "ambiguous": False,
+                    "phoenix_project_id": matches[0]["id"],
+                }
             if len(matches) > 1:
-                return {"found": True, "ambiguous": True,
-                        "candidate_count": len(matches)}
+                return {
+                    "found": True,
+                    "ambiguous": True,
+                    "candidate_count": len(matches),
+                }
     return {"found": False, "ambiguous": False}
 
 
@@ -110,20 +139,34 @@ def _extracted_to_payload(extracted) -> dict:
     return {f: getattr(extracted, f, None) for f in _EXTRACTED_PAYLOAD_FIELDS}
 
 
-def _scrape_and_extract(ev: dict, scraper_client, log: "CsvLogger",
-                        key: str, processed_store) -> bool:
+async def _scrape_and_extract(
+    ev: dict,
+    scraper_client,
+    log: "CsvLogger",
+    key: str,
+    processed_store,
+    scrape_sem: asyncio.Semaphore,
+) -> bool:
     """Fetch + extract the proposal behind ``ev["tracking_url"]``.
 
     Preconditions the caller must verify before invoking:
-      * event type is in ``NEEDS_SCRAPE_EVENTS`` (Estimate / Estimate Complete)
+      * event type is in ``SCRAPE_EVENTS`` (Estimate / Estimate Complete)
       * ``ev["tracking_url"]`` is present
       * a scraper_client instance is available
       * the Phoenix resolve already missed (otherwise the scrape is waste)
 
-    Emits audit rows under ``scraper`` (fetch, no_docs, error) and
-    ``extractor`` (extracted) stages as it goes. On the ``no_docs`` path
-    (scraper returned nothing usable) the event is marked as an error in
-    ``processed_store`` so it doesn't get re-attempted every tick.
+    Concurrency: ``scrape_sem`` (created per-batch by process_batch) rate-limits
+    outbound scrapes to ``INTERCEPTOR_MAX_CONCURRENT``. On a 25-email burst all
+    coroutines call this at once but only 8 hit interceptor-api at a time —
+    the rest queue FIFO inside the semaphore. ``SCRAPE_TIMEOUT_SECONDS``
+    (default 600s) is a safety net; ``asyncio.wait_for`` unblocks the whole
+    coroutine if interceptor-api hangs.
+
+    Emits audit rows under ``scraper`` (fetch, no_docs, error, timeout) and
+    ``extractor`` (extracted) stages as it goes. On the ``no_docs`` /
+    ``timeout`` paths the event is marked as an error in ``processed_store``
+    so it doesn't get re-attempted every tick (until the operator clears the
+    error).
 
     On extractor success, mutates ``ev``:
       customer_name / address filled in from the scraped proposal,
@@ -139,42 +182,86 @@ def _scrape_and_extract(ev: dict, scraper_client, log: "CsvLogger",
     """
     etype = ev.get("event_type", "")
     try:
-        result = scraper_client.get_proposal(tracking_url=ev["tracking_url"])
+        async with scrape_sem:
+            result = await asyncio.wait_for(
+                scraper_client.get_proposal(tracking_url=ev["tracking_url"]),
+                timeout=SCRAPE_TIMEOUT_SECONDS,
+            )
+    except asyncio.TimeoutError:
+        log.log(
+            "scraper",
+            "timeout",
+            False,
+            f"scrape exceeded {SCRAPE_TIMEOUT_SECONDS}s",
+            event_type=etype,
+            project_ref=key,
+        )
+        if processed_store:
+            await asyncio.to_thread(
+                processed_store.mark_error,
+                ev.get("message_id"),
+                {"error": f"scrape_timeout_{SCRAPE_TIMEOUT_SECONDS}s"},
+            )
+        ev.setdefault("notes", []).append(f"scrape timeout ({SCRAPE_TIMEOUT_SECONDS}s)")
+        return False
     except Exception as e:
-        log.log("scraper", "error", False, f"exception: {e}",
-                event_type=etype, project_ref=key)
+        log.log(
+            "scraper",
+            "error",
+            False,
+            f"exception: {e}",
+            event_type=etype,
+            project_ref=key,
+        )
         ev.setdefault("notes", []).append(f"scrape failed: {e}")
         return False
 
     if not result.get("mget_docs"):
-        log.log("scraper", "no_docs", False, "scraper returned no docs",
-                event_type=etype, project_ref=key)
+        log.log(
+            "scraper",
+            "no_docs",
+            False,
+            "scraper returned no docs",
+            event_type=etype,
+            project_ref=key,
+        )
         if processed_store:
-            processed_store.mark_error(ev.get("message_id"),
-                                       metadata={"error": "no_docs"})
+            await asyncio.to_thread(
+                processed_store.mark_error,
+                ev.get("message_id"),
+                {"error": "no_docs"},
+            )
         ev.setdefault("notes", []).append("scrape returned no docs")
         return False
 
-    log.log("scraper", "fetched", True,
-            f"{len(result.get('mget_docs') or [])} docs",
-            event_type=etype, project_ref=key)
+    log.log(
+        "scraper",
+        "fetched",
+        True,
+        f"{len(result.get('mget_docs') or [])} docs",
+        event_type=etype,
+        project_ref=key,
+    )
 
     extracted = extract_proposal(result)
-    log.log("extractor", "extracted", bool(getattr(extracted, "ok", False)),
-            getattr(extracted, "error", None) or "extraction ok",
-            event_type=etype, project_ref=key)
+    log.log(
+        "extractor",
+        "extracted",
+        bool(getattr(extracted, "ok", False)),
+        getattr(extracted, "error", None) or "extraction ok",
+        event_type=etype,
+        project_ref=key,
+    )
     if not getattr(extracted, "ok", False):
         ev.setdefault("notes", []).append(
             f"scrape parse failed: {getattr(extracted, 'error', None)}"
         )
         return False
 
-    ev["customer_name"] = (
-        getattr(extracted, "full_name", None) or ev.get("customer_name")
+    ev["customer_name"] = getattr(extracted, "full_name", None) or ev.get(
+        "customer_name"
     )
-    ev["address"] = (
-        getattr(extracted, "street_address", None) or ev.get("address")
-    )
+    ev["address"] = getattr(extracted, "street_address", None) or ev.get("address")
     ev["project_id"] = getattr(extracted, "roofix_project_id", None)
     ev["is_accepted"] = bool(getattr(extracted, "is_accepted", False))
     ev["parse_complete"] = True
@@ -183,9 +270,15 @@ def _scrape_and_extract(ev: dict, scraper_client, log: "CsvLogger",
     return True
 
 
-def _execute(decision: dict, ev: dict, phoenix, log: CsvLogger,
-             milestone_map: Optional[dict],
-             processed_store=None, gmail=None) -> None:
+async def _execute(
+    decision: dict,
+    ev: dict,
+    phoenix,
+    log: CsvLogger,
+    milestone_map: Optional[dict],
+    processed_store=None,
+    gmail=None,
+) -> None:
     """Carry out (or log) the brain's decision for a single event.
 
     Branches on ``decision["action"]``:
@@ -212,14 +305,24 @@ def _execute(decision: dict, ev: dict, phoenix, log: CsvLogger,
         # mark it read in Gmail is app.py's call (currently rule-source only;
         # AI-decided ignores stay unread for operator review).
         case "ignore":
-            log.log("orchestrator", "ignore", True, decision["reasoning"],
-                    event_type=etype, project_ref=pref)
+            log.log(
+                "orchestrator",
+                "ignore",
+                True,
+                decision["reasoning"],
+                event_type=etype,
+                project_ref=pref,
+            )
             if processed_store:
-                processed_store.mark_ok(ev.get("message_id"), metadata={
-                    "action": "ignore",
-                    "source": decision.get("source", "rule"),
-                    "reasoning": decision["reasoning"],
-                })
+                await asyncio.to_thread(
+                    processed_store.mark_ok,
+                    ev.get("message_id"),
+                    {
+                        "action": "ignore",
+                        "source": decision.get("source", "rule"),
+                        "reasoning": decision["reasoning"],
+                    },
+                )
 
         # ── Escalate / Needs human ────────────────────────────────────
         # Log for human review, skip Phoenix write. Attempt to forward the
@@ -232,46 +335,83 @@ def _execute(decision: dict, ev: dict, phoenix, log: CsvLogger,
         #                    so the operator reviews via the Roofix inbox.
         # In all three sub-cases the email is marked processed exactly once.
         case "escalate" | _ if decision.get("needs_human"):
-            log.log("escalate", action, True, "NEEDS HUMAN: " + decision["reasoning"],
-                    event_type=etype, project_ref=pref)
+            log.log(
+                "escalate",
+                action,
+                True,
+                "NEEDS HUMAN: " + decision["reasoning"],
+                event_type=etype,
+                project_ref=pref,
+            )
             forwarded = False
             raw_email = ev.get("_raw_email")
             if gmail and ESCALATION_RECIPIENTS and raw_email:
                 try:
-                    gmail.forward_email(ESCALATION_RECIPIENTS,
-                                        reason=decision["reasoning"],
-                                        original=raw_email)
+                    await asyncio.to_thread(
+                        gmail.forward_email,
+                        ESCALATION_RECIPIENTS,
+                        decision["reasoning"],
+                        raw_email,
+                    )
                     forwarded = True
-                    log.log("escalate", "forwarded", True,
-                            f"forwarded to {', '.join(ESCALATION_RECIPIENTS)}",
-                            event_type=etype, project_ref=pref)
+                    log.log(
+                        "escalate",
+                        "forwarded",
+                        True,
+                        f"forwarded to {', '.join(ESCALATION_RECIPIENTS)}",
+                        event_type=etype,
+                        project_ref=pref,
+                    )
                 except Exception as e:
-                    log.log("escalate", "forward_failed", False,
-                            f"forward exception: {e}",
-                            event_type=etype, project_ref=pref)
+                    log.log(
+                        "escalate",
+                        "forward_failed",
+                        False,
+                        f"forward exception: {e}",
+                        event_type=etype,
+                        project_ref=pref,
+                    )
             decision["_forwarded"] = forwarded
             if processed_store:
-                processed_store.mark_ok(ev.get("message_id"), metadata={
-                    "action": "escalate",
-                    "forwarded": forwarded,
-                    "source": decision.get("source", "rule"),
-                    "reasoning": decision["reasoning"],
-                })
+                await asyncio.to_thread(
+                    processed_store.mark_ok,
+                    ev.get("message_id"),
+                    {
+                        "action": "escalate",
+                        "forwarded": forwarded,
+                        "source": decision.get("source", "rule"),
+                        "reasoning": decision["reasoning"],
+                    },
+                )
 
         # ── Offline dry-run ───────────────────────────────────────────
         # If phoenix client is None, log and stop. No Phoenix write.
         case _ if phoenix is None:
-            log.log("orchestrator", action, True,
-                    "offline dry-run: " + decision["reasoning"],
-                    event_type=etype, project_ref=pref)
+            log.log(
+                "orchestrator",
+                action,
+                True,
+                "offline dry-run: " + decision["reasoning"],
+                event_type=etype,
+                project_ref=pref,
+            )
 
         # ── Update chatter ────────────────────────────────────────────
         # Append a note to the Phoenix project's chatter.
         case "update_chatter":
-            res = phoenix.update_chatter(int(pref), decision["payload"]["note_text"])
-            log.log("phoenix", action, res.ok,
-                    (("DRY_RUN " if res.dry_run else "") + res.detail),
-                    event_type=etype, project_ref=pref)
+            res = await asyncio.to_thread(
+                phoenix.update_chatter,
+                int(pref),
+                decision["payload"]["note_text"],
+            )
+            log.log(
+                "phoenix",
+                action,
+                res.ok,
+                (("DRY_RUN " if res.dry_run else "") + res.detail),
+                event_type=etype,
+                project_ref=pref,
+            )
 
         # ── Update milestone ──────────────────────────────────────────
         # Look up the milestone mapping, then advance the project's milestone.
@@ -280,15 +420,29 @@ def _execute(decision: dict, ev: dict, phoenix, log: CsvLogger,
         case "update_milestone":
             mapping = (milestone_map or {}).get(etype)
             if not mapping:
-                log.log("phoenix", action, False,
-                        f"no milestone mapping for '{etype}' (needs Michael)",
-                        event_type=etype, project_ref=pref)
+                log.log(
+                    "phoenix",
+                    action,
+                    False,
+                    f"no milestone mapping for '{etype}' (needs Michael)",
+                    event_type=etype,
+                    project_ref=pref,
+                )
             else:
-                res = phoenix.update_milestone(int(pref), mapping["block_name"],
-                                               mapping["status_id"])
-                log.log("phoenix", action, res.ok,
-                        (("DRY_RUN " if res.dry_run else "") + res.detail),
-                        event_type=etype, project_ref=pref)
+                res = await asyncio.to_thread(
+                    phoenix.update_milestone,
+                    int(pref),
+                    mapping["block_name"],
+                    mapping["status_id"],
+                )
+                log.log(
+                    "phoenix",
+                    action,
+                    res.ok,
+                    (("DRY_RUN " if res.dry_run else "") + res.detail),
+                    event_type=etype,
+                    project_ref=pref,
+                )
 
         # ── Create project ────────────────────────────────────────────
         # Use the already-scraped data from ``_scrape_and_extract``, which
@@ -301,52 +455,79 @@ def _execute(decision: dict, ev: dict, phoenix, log: CsvLogger,
             payload = ev.get("_extracted_payload") or {}
             roofix_project_id = payload.get("roofix_project_id")
             if not roofix_project_id:
-                log.log("orchestrator", action, False,
-                        "create_project missing scraped data (scraping failed?)",
-                        event_type=etype, project_ref=pref)
+                log.log(
+                    "orchestrator",
+                    action,
+                    False,
+                    "create_project missing scraped data (scraping failed?)",
+                    event_type=etype,
+                    project_ref=pref,
+                )
                 return
 
             # Check if the proposal was accepted.
             if not payload.get("is_accepted"):
-                log.log("orchestrator", "not_accepted", True,
-                        "proposal not accepted, skipping create",
-                        event_type=etype, project_ref=pref)
+                log.log(
+                    "orchestrator",
+                    "not_accepted",
+                    True,
+                    "proposal not accepted, skipping create",
+                    event_type=etype,
+                    project_ref=pref,
+                )
                 if processed_store:
-                    processed_store.mark_ok(ev.get("message_id"), metadata={
-                        "roofix_project_id": roofix_project_id,
-                        "accepted": False,
-                    })
+                    await asyncio.to_thread(
+                        processed_store.mark_ok,
+                        ev.get("message_id"),
+                        {"roofix_project_id": roofix_project_id, "accepted": False},
+                    )
                 return
 
             # Call ensure_entity_and_project with the scraped data.
             if not phoenix:
-                log.log("orchestrator", action, False,
-                        "phoenix client required for create_project",
-                        event_type=etype, project_ref=pref)
+                log.log(
+                    "orchestrator",
+                    action,
+                    False,
+                    "phoenix client required for create_project",
+                    event_type=etype,
+                    project_ref=pref,
+                )
                 return
 
             # Hand the full extracted proposal dict straight to Phoenix — it
             # reads whichever fields it needs (name, address, contract price,
             # etc.) and ignores keys it doesn't care about.
-            res = phoenix.ensure_entity_and_project(payload)
+            res = await asyncio.to_thread(phoenix.ensure_entity_and_project, payload)
 
-            log.log("phoenix", action, res.ok,
-                    (("DRY_RUN " if res.dry_run else "") + res.detail),
-                    event_type=etype, project_ref=pref)
+            log.log(
+                "phoenix",
+                action,
+                res.ok,
+                (("DRY_RUN " if res.dry_run else "") + res.detail),
+                event_type=etype,
+                project_ref=pref,
+            )
 
             if res.ok:
                 if processed_store:
-                    processed_store.mark_ok(ev.get("message_id"), metadata={
-                        "roofix_project_id": roofix_project_id,
-                        "phoenix_entity_id": res.data.get("entity_id"),
-                        "phoenix_project_id": res.data.get("phoenix_project_id"),
-                        "accepted": True,
-                    })
+                    await asyncio.to_thread(
+                        processed_store.mark_ok,
+                        ev.get("message_id"),
+                        {
+                            "roofix_project_id": roofix_project_id,
+                            "phoenix_entity_id": res.data.get("entity_id"),
+                            "phoenix_project_id": res.data.get("phoenix_project_id"),
+                            "accepted": True,
+                        },
+                    )
             else:
                 if processed_store:
-                    processed_store.mark_error(ev.get("message_id"), metadata={
-                        "error": res.detail,
-                    })
+                    await asyncio.to_thread(
+                        processed_store.mark_error,
+                        ev.get("message_id"),
+                        {"error": res.detail},
+                    )
 
         # ── Unsupported action ────────────────────────────────────────
         # Brain produced something we can't route — most likely an AI
@@ -356,29 +537,135 @@ def _execute(decision: dict, ev: dict, phoenix, log: CsvLogger,
         # give the brain another chance. If the model keeps producing the
         # same garbage the recurring errors are a signal to tune the prompt.
         case _:
-            log.log("orchestrator", action, False,
-                    f"action '{action}' not enabled in Phase 0",
-                    event_type=etype, project_ref=pref)
+            log.log(
+                "orchestrator",
+                action,
+                False,
+                f"action '{action}' not enabled in Phase 0",
+                event_type=etype,
+                project_ref=pref,
+            )
             if processed_store:
-                processed_store.mark_error(ev.get("message_id"), metadata={
-                    "error": f"unsupported action '{action}'",
-                    "source": decision.get("source", "rule"),
-                    "reasoning": decision.get("reasoning", ""),
-                })
+                await asyncio.to_thread(
+                    processed_store.mark_error,
+                    ev.get("message_id"),
+                    {
+                        "error": f"unsupported action '{action}'",
+                        "source": decision.get("source", "rule"),
+                        "reasoning": decision.get("reasoning", ""),
+                    },
+                )
 
 
-def process_batch(raw_emails: list, phoenix=None, log: Optional[CsvLogger] = None,
-                  milestone_map: Optional[dict] = None,
-                  scraper_client=None, processed_store=None, gmail=None) -> list:
+async def _process_group(
+    key: str,
+    evs: list,
+    phoenix,
+    log: CsvLogger,
+    milestone_map: Optional[dict],
+    scraper_client,
+    processed_store,
+    gmail,
+    scrape_sem: asyncio.Semaphore,
+) -> list:
+    """Process one project group's events SEQUENTIALLY (timestamp order).
+
+    Groups run in parallel with each other via ``asyncio.gather`` up in
+    ``process_batch`` — but within a group we serialize because chatter/
+    milestone events for the same project must apply in order (a later
+    chatter append shouldn't race with an earlier one).
+
+    Returns the list of decision dicts produced for this group.
+    """
+    evs.sort(key=lambda e: e.get("email_timestamp") or "")
+    out: list = []
+
+    for ev in evs:
+        log.log(
+            "parser",
+            "parsed",
+            ev.get("parse_complete", False),
+            "; ".join(ev.get("notes", [])) or "ok",
+            event_type=ev.get("event_type", ""),
+            project_ref=key,
+        )
+
+        # Resolve the project context from Phoenix — the single authoritative
+        # "does Phoenix know this project?" check. Its result flows straight
+        # into decide() below, so the brain sees the same answer we used to
+        # gate the scrape.
+        ctx = await _resolve_context(ev, phoenix)
+
+        # ── Scrape gate ────────────────────────────────────────────────
+        # Only scrape when Phoenix couldn't identify the project AND the
+        # event is one whose real data lives behind the proposal link
+        # (Estimate / Estimate Complete). On success, re-resolve so the
+        # brain sees an updated context (the scrape may have supplied a
+        # project_id or a sharper name+address). _scrape_and_extract logs
+        # its own scraper/extractor audit rows and marks processed_store
+        # on no_docs / timeout — we don't wrap those here.
+        if (
+            scraper_client
+            and ev.get("tracking_url")
+            and ev.get("event_type") in SCRAPE_EVENTS
+            and not ctx.get("found")
+        ):
+            if await _scrape_and_extract(
+                ev, scraper_client, log, key, processed_store, scrape_sem
+            ):
+                ctx = await _resolve_context(ev, phoenix)
+
+        # Decide what to do based on the event and context. Stamp the
+        # source email's Gmail id onto the Decision so app.py can call
+        # mark_read on the right message without reverse-lookups.
+        decision = await decide(ev, ctx)
+        decision.message_id = ev.get("message_id")
+        d = decision.as_dict()
+
+        log.log(
+            "brain",
+            d["action"],
+            not d["needs_human"],
+            f"[{d['source']}] {d['reasoning']}",
+            event_type=ev.get("event_type", ""),
+            project_ref=key,
+        )
+
+        await _execute(
+            d,
+            ev,
+            phoenix,
+            log,
+            milestone_map,
+            processed_store=processed_store,
+            gmail=gmail,
+        )
+
+        out.append(d)
+
+    return out
+
+
+async def process_batch(
+    raw_emails: list,
+    phoenix=None,
+    log: Optional[CsvLogger] = None,
+    milestone_map: Optional[dict] = None,
+    scraper_client=None,
+    processed_store=None,
+    gmail=None,
+) -> list:
     """Process a batch of raw emails through the full pipeline.
 
     Pipeline per event:
       1. **Parse** — convert raw email dict into a structured event via ``parse_email()``.
       2. **Group** — bucket events by project identity (``_identity_key``).
-      3. **Sort** — within each group, order by ``email_timestamp`` (oldest first).
-      4. **Resolve context** — look up the Phoenix project for the event.
-      5. **Decide** — ask the brain what to do (``decide()``).
-      6. **Execute** — carry out or log the decision (_execute).
+      3. **Fan out across groups** — ``asyncio.gather`` runs every group
+         concurrently. Groups are independent (they target different Phoenix
+         projects) so this is safe.
+      4. Inside each group ``_process_group`` runs sequentially: resolve
+         context → optional scrape (rate-limited by ``scrape_sem``) → decide
+         → execute → repeat for the next event in the group.
 
     Every step is logged to the CsvLogger.
 
@@ -391,12 +678,13 @@ def process_batch(raw_emails: list, phoenix=None, log: Optional[CsvLogger] = Non
         milestone_map: Mapping from roofix event names to Phoenix block/status ids.
         scraper_client: RoofixScraperClient instance for scraping proposals.
         processed_store: ProcessedStore instance for tracking processed emails.
+        gmail: GmailClient for escalation forwarding.
 
     Returns:
         List of decision dicts (one per event, after ``decide().as_dict()``).
+        Order: flatten groups in whatever order gather resolved them.
     """
     log = log or _default_log()
-    decisions = []
 
     # ── Step 1: Parse all raw emails into structured events ────────────────
     # Parser is pure: extracts fields from the email only. Scraping and
@@ -416,78 +704,50 @@ def process_batch(raw_emails: list, phoenix=None, log: Optional[CsvLogger] = Non
     for ev in parsed:
         groups.setdefault(_identity_key(ev), []).append(ev)
 
-    # ── Step 3: Process each project group ────────────────────────────────
-    for key, evs in groups.items():
-        # Sort events within each group by timestamp (oldest first)
-        evs.sort(key=lambda e: e.get("email_timestamp") or "")
+    # ── Step 3: One semaphore per batch, tied to the current event loop.
+    # Rate-limits scrape calls across ALL groups running concurrently. See
+    # the module docstring at the top of the file for the rationale.
+    scrape_sem = asyncio.Semaphore(INTERCEPTOR_MAX_CONCURRENT)
 
-        # Process each event in the group
-        for ev in evs:
-            # Log the parsed event
-            log.log("parser", "parsed", ev.get("parse_complete", False),
-                    "; ".join(ev.get("notes", [])) or "ok",
-                    event_type=ev.get("event_type", ""),
-                    project_ref=key)
+    # ── Step 4: Fan out across groups (parallel), each group sequential.
+    group_results = await asyncio.gather(
+        *[
+            _process_group(
+                key,
+                evs,
+                phoenix,
+                log,
+                milestone_map,
+                scraper_client,
+                processed_store,
+                gmail,
+                scrape_sem,
+            )
+            for key, evs in groups.items()
+        ]
+    )
 
-            # Resolve the project context from Phoenix — this is the single
-            # authoritative "does Phoenix know this project?" check. Its
-            # result flows straight into decide() below, so the brain sees
-            # the same answer we used to gate the scrape.
-            ctx = _resolve_context(ev, phoenix)
-
-            # ── Scrape gate ────────────────────────────────────────────
-            # Only scrape when Phoenix couldn't identify the project AND
-            # the event is one whose real data lives behind the proposal
-            # link (Estimate / Estimate Complete). On success, re-resolve
-            # so the brain sees an updated context (the scrape may have
-            # supplied a project_id or a sharper name+address).
-            # _scrape_and_extract logs its own scraper/extractor audit rows
-            # and marks processed_store on no_docs — we don't wrap those here.
-            if (
-                scraper_client
-                and ev.get("tracking_url")
-                and ev.get("event_type") in NEEDS_SCRAPE_EVENTS
-                and not ctx.get("found")
-            ):
-                if _scrape_and_extract(ev, scraper_client, log, key,
-                                       processed_store):
-                    ctx = _resolve_context(ev, phoenix)
-
-            # Decide what to do based on the event and context. Stamp the
-            # source email's Gmail id onto the Decision so app.py can call
-            # mark_read on the right message without reverse-lookups.
-            decision = decide(ev, ctx)
-            decision.message_id = ev.get("message_id")
-            d = decision.as_dict()
-
-            # Log the decision
-            log.log("brain", d["action"], not d["needs_human"],
-                    f"[{d['source']}] {d['reasoning']}",
-                    event_type=ev.get("event_type", ""), project_ref=key)
-
-            # Execute the decision
-            _execute(d, ev, phoenix, log, milestone_map,
-                     processed_store=processed_store, gmail=gmail)
-
-            # Add the decision to the results
-            decisions.append(d)
-
-    return decisions
+    # Flatten. gather() preserves the order of the input iterable, so
+    # groups appear in insertion order (which follows first-seen event
+    # order from ``raw_emails``).
+    return [d for group in group_results for d in group]
 
 
-def run(listener: Callable[[], list], phoenix=None, milestone_map=None,
-        log: Optional[CsvLogger] = None,
-        scraper_client=None, processed_store=None, gmail=None) -> list:
+async def run(
+    listener: Callable[[], list],
+    phoenix=None,
+    milestone_map=None,
+    log: Optional[CsvLogger] = None,
+    scraper_client=None,
+    processed_store=None,
+    gmail=None,
+) -> list:
     """Production entry point: fetch one batch of emails and process it.
 
-    This is the function called by the scheduler (APS) each tick. It pulls raw
-    emails from the injected ``listener`` callable, logs how many were fetched,
-    then delegates to ``process_batch()`` for the full parse → group → decide →
-    execute pipeline.
-
-    Called by: the APScheduler job in the bridge's main loop (``fetcher.py`` or
-    the scheduler that invokes ``components.orchestrator.run`` every
-    ``TICK_INTERVAL_SECONDS``).
+    Called by the APScheduler ``AsyncIOScheduler`` job in ``app.py`` every
+    ``TICK_INTERVAL_SECONDS`` and by ``POST /tick``. Both entry points
+    serialize behind ``app._tick_lock`` so a slow tick can't be trampled by
+    a fresh one.
 
     Args:
         listener: Callable that returns a list of raw email dicts (e.g. the
@@ -497,6 +757,7 @@ def run(listener: Callable[[], list], phoenix=None, milestone_map=None,
         log: CsvLogger for audit trail.
         scraper_client: RoofixScraperClient instance for scraping proposals.
         processed_store: ProcessedStore instance for tracking processed emails.
+        gmail: GmailClient for escalation forwarding.
 
     Returns:
         List of decision dicts (same as ``process_batch``).
@@ -508,11 +769,21 @@ def run(listener: Callable[[], list], phoenix=None, milestone_map=None,
     # Filter out already-processed emails.
     if processed_store:
         raw = [e for e in raw if not processed_store.is_processed(e.get("message_id"))]
-        log.log("listener", "filtered", True,
-                f"{len(raw)} email(s) after filtering processed",
-                event_type="", project_ref="")
+        log.log(
+            "listener",
+            "filtered",
+            True,
+            f"{len(raw)} email(s) after filtering processed",
+            event_type="",
+            project_ref="",
+        )
 
-    return process_batch(
-        raw, phoenix=phoenix, log=log, milestone_map=milestone_map,
-        scraper_client=scraper_client, processed_store=processed_store,
-        gmail=gmail)
+    return await process_batch(
+        raw,
+        phoenix=phoenix,
+        log=log,
+        milestone_map=milestone_map,
+        scraper_client=scraper_client,
+        processed_store=processed_store,
+        gmail=gmail,
+    )

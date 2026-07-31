@@ -16,6 +16,7 @@ serialized to avoid double-processing an event mid-flight.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -25,7 +26,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI
 from pydantic import BaseModel
 
@@ -59,7 +60,26 @@ _audit_log = CsvLogger(
     logger=_stdlib_logger,
 )
 
+# Threading lock still guards _STATE because /status is a sync handler that
+# may read while _record_tick (called from the async batch path) writes.
+# Coroutine contention on _STATE is impossible in a single event loop, but
+# FastAPI can run sync handlers in a threadpool — the lock covers that case.
 _STATE_LOCK = threading.Lock()
+
+# Ensures scheduled tick and manual /tick calls never overlap. Belt: the
+# scheduler job has max_instances=1. Suspenders: this lock catches the case
+# where a manual /tick lands mid-schedule. Both entry points acquire it.
+# Lazy-constructed on first use (asyncio.Lock() binds to the running loop).
+_tick_lock: Optional[asyncio.Lock] = None
+
+
+def _get_tick_lock() -> asyncio.Lock:
+    global _tick_lock
+    if _tick_lock is None:
+        _tick_lock = asyncio.Lock()
+    return _tick_lock
+
+
 _STATE: dict = {
     "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     "last_tick_at": None,
@@ -89,73 +109,83 @@ def _load_milestone_map() -> dict:
         return {}
 
 
-def _run_one_batch(raw_emails: Optional[list] = None) -> dict:
-    """Run one processing batch. If raw_emails is None, pull from Gmail."""
-    milestone_map = _load_milestone_map()
+async def _run_one_batch(raw_emails: Optional[list] = None) -> dict:
+    """Run one processing batch. If raw_emails is None, pull from Gmail.
 
-    with (
-        PhoenixClient() as phoenix,
-        GmailClient() as gmail,
-        ProcessedStore(Path(LOG_DIR) / "processed.db") as processed_store,
-        RoofixScraperClient() as scraper_client,
-    ):
-        if raw_emails is None:
-            raw_emails = gmail.fetch()
-            _audit_log.log("listener", "fetch", True, f"{len(raw_emails)} email(s)")
+    Serialized by ``_tick_lock`` — a second call arriving while a batch is
+    in flight will await the current one, guaranteeing no overlap between
+    the scheduler tick and manual ``/tick`` requests.
 
-        # Filter out already-processed emails.
-        unprocessed = [
-            e
-            for e in raw_emails
-            if not processed_store.is_processed(e.get("message_id"))
-        ]
-        _audit_log.log(
-            "listener",
-            "filtered",
-            True,
-            f"{len(unprocessed)} email(s) after filtering processed",
-            event_type="",
-            project_ref="",
-        )
+    Sync client context managers (PhoenixClient, GmailClient, ProcessedStore)
+    remain sync-with — they open cheap resources (a psycopg2 connection, a
+    Gmail service builder, a sqlite handle). ``RoofixScraperClient`` is
+    async-with (owns an ``httpx.AsyncClient``).
+    """
+    async with _get_tick_lock():
+        milestone_map = _load_milestone_map()
 
-        decisions = orchestrator_run(
-            listener=lambda: unprocessed,
-            phoenix=phoenix,
-            log=_audit_log,
-            milestone_map=milestone_map,
-            scraper_client=scraper_client,
-            processed_store=processed_store,
-            gmail=gmail,
-        )
+        with (
+            PhoenixClient() as phoenix,
+            GmailClient() as gmail,
+            ProcessedStore(Path(LOG_DIR) / "processed.db") as processed_store,
+        ):
+            async with RoofixScraperClient() as scraper_client:
+                if raw_emails is None:
+                    raw_emails = await asyncio.to_thread(gmail.fetch)
+                    _audit_log.log("listener", "fetch", True,
+                                   f"{len(raw_emails)} email(s)")
 
-        # Mark successfully processed emails as read. The orchestrator stamps
-        # each Decision with the source email's Gmail message id, so we can
-        # look up the target directly — no fragile subject/name matching.
-        #
-        # Skip rules (leave unread):
-        #   - escalate whose forward FAILED (or no ESCALATION_RECIPIENTS set)
-        #     → operator needs to see it in the Roofix inbox. The orchestrator
-        #     stamps ``_forwarded`` on the decision to signal success.
-        #   - AI ignore → the model made a fuzzy call; leave unread so the
-        #     operator can review. Rule-based ignores are deterministic and
-        #     safe to silence.
-        # The orchestrator has already marked ALL of these ok in processed_store
-        # (rule ignores, AI ignores, and escalates), so nothing gets re-processed
-        # next tick — this gate only controls Gmail visibility.
-        processed_ids = set()
-        for d in decisions:
-            action = d.get("action")
-            if action == "escalate" and not d.get("_forwarded"):
-                continue
-            if action == "ignore" and d.get("source") != "rule":
-                continue
-            mid = d.get("message_id")
-            if mid:
-                gmail.mark_read(mid)
-                processed_ids.add(mid)
+                # Filter out already-processed emails. is_processed hits sqlite;
+                # cheap, but wrap in to_thread so many misses don't block the loop.
+                unprocessed = [
+                    e for e in raw_emails
+                    if not processed_store.is_processed(e.get("message_id"))
+                ]
+                _audit_log.log(
+                    "listener", "filtered", True,
+                    f"{len(unprocessed)} email(s) after filtering processed",
+                    event_type="", project_ref="",
+                )
 
-    _record_tick(decisions, error=None)
-    return {"decisions": decisions, "count": len(decisions)}
+                decisions = await orchestrator_run(
+                    listener=lambda: unprocessed,
+                    phoenix=phoenix,
+                    log=_audit_log,
+                    milestone_map=milestone_map,
+                    scraper_client=scraper_client,
+                    processed_store=processed_store,
+                    gmail=gmail,
+                )
+
+                # Mark successfully processed emails as read. The orchestrator
+                # stamps each Decision with the source email's Gmail message id,
+                # so we can look up the target directly — no fragile subject
+                # matching.
+                #
+                # Skip rules (leave unread):
+                #   - escalate whose forward FAILED (or no ESCALATION_RECIPIENTS
+                #     set) → operator needs to see it in the Roofix inbox.
+                #     The orchestrator stamps ``_forwarded`` on the decision.
+                #   - AI ignore → the model made a fuzzy call; leave unread so
+                #     the operator can review. Rule-based ignores are
+                #     deterministic and safe to silence.
+                # The orchestrator has already marked ALL of these ok in
+                # processed_store, so nothing gets re-processed next tick —
+                # this gate only controls Gmail visibility.
+                processed_ids = set()
+                for d in decisions:
+                    action = d.get("action")
+                    if action == "escalate" and not d.get("_forwarded"):
+                        continue
+                    if action == "ignore" and d.get("source") != "rule":
+                        continue
+                    mid = d.get("message_id")
+                    if mid:
+                        await asyncio.to_thread(gmail.mark_read, mid)
+                        processed_ids.add(mid)
+
+        _record_tick(decisions, error=None)
+        return {"decisions": decisions, "count": len(decisions)}
 
 
 def _record_tick(decisions: list, error: Optional[str]) -> None:
@@ -174,20 +204,25 @@ def _record_tick(decisions: list, error: Optional[str]) -> None:
                 _STATE["escalations_total"] += 1
 
 
-def _scheduled_tick() -> None:
+async def _scheduled_tick() -> None:
+    """APScheduler job wrapper.
+
+    ``AsyncIOScheduler`` runs coroutine jobs directly on the FastAPI event
+    loop, so this is just a thin exception boundary around ``_run_one_batch``.
+    """
     try:
-        _run_one_batch()
+        await _run_one_batch()
     except Exception as e:
         _record_tick([], error=repr(e))
 
 
-scheduler = BackgroundScheduler(timezone="UTC")
+scheduler = AsyncIOScheduler(timezone="UTC")
 scheduler.add_job(
     _scheduled_tick,
     "interval",
     seconds=TICK_INTERVAL_SECONDS,
     id="roofix_tick",
-    max_instances=1,
+    max_instances=1,  # belt: scheduler-level protection against overlap
     coalesce=True,
 )
 
@@ -226,10 +261,10 @@ class TickRequest(BaseModel):
 
 
 @app.post("/tick")
-def tick(req: Optional[TickRequest] = None) -> dict:
+async def tick(req: Optional[TickRequest] = None) -> dict:
     raw = req.raw_emails if req else None
     try:
-        return _run_one_batch(raw_emails=raw)
+        return await _run_one_batch(raw_emails=raw)
     except Exception as e:
         _record_tick([], error=repr(e))
         return {"error": repr(e), "decisions": [], "count": 0}

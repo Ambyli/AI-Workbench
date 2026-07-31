@@ -38,10 +38,10 @@ from typing import Optional
 
 # All parser-relevant constants live in components/constants.py so the brain
 # and orchestrator share one source of truth. Re-imported at module scope so
-# external code that does `from components.parser import NEEDS_SCRAPE_EVENTS`
+# external code that does `from components.parser import SCRAPE_EVENTS`
 # still works.
 from components.constants import (
-    NEEDS_SCRAPE_EVENTS,
+    SCRAPE_EVENTS,
     SENDER_RE as _SENDER_RE,
     PROJECT_URL_RE as _PROJECT_URL_RE,
     TRACKING_URL_RE as _TRACKING_URL_RE,
@@ -267,7 +267,7 @@ def parse_email(raw: dict) -> ParsedEvent:
     if not have_identity:
         ev.parse_complete = False
         ev.notes.append("no project_id and no name+address — cannot identify project")
-    elif event_type in NEEDS_SCRAPE_EVENTS:
+    elif event_type in SCRAPE_EVENTS:
         ev.parse_complete = False
         ev.notes.append(
             f"{event_type}: real data is behind the proposal link — needs scrape"

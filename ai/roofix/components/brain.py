@@ -36,7 +36,8 @@ from components.constants import (
     PHASE,
     MILESTONE_EVENTS,
     SIGNING_EVENTS,
-    NEEDS_SCRAPE_EVENTS,
+    SCRAPE_EVENTS,
+    IGNORE_EVENTS,
     SYSTEM_PROMPT as _SYSTEM_PROMPT,
 )
 
@@ -69,14 +70,18 @@ class Decision:
         }
 
 
-# MILESTONE_EVENTS, SIGNING_EVENTS, and NEEDS_SCRAPE_EVENTS all live in
+# MILESTONE_EVENTS, SIGNING_EVENTS, and SCRAPE_EVENTS all live in
 # components/constants.py — imported at the top of this module.
 
 
-def decide(event: dict, context: dict) -> Decision:
+async def decide(event: dict, context: dict) -> Decision:
     """
     event   = ParsedEvent.as_dict() from the parser.
     context = what Phoenix knows about this project.
+
+    Async because the fallback path (``_escalate_to_ai`` → ``generate_ai_decision``)
+    awaits AsyncOpenAI. The rules path itself does no I/O, so returning from
+    inside a rule is effectively synchronous.
     """
     etype = event.get("event_type", "Unknown")
     found = context.get("found", False)
@@ -153,7 +158,7 @@ def decide(event: dict, context: dict) -> Decision:
             reasoning=f"'{etype}' advances the project's milestone in Phoenix.",
         )
 
-    if etype in NEEDS_SCRAPE_EVENTS:
+    if etype in SCRAPE_EVENTS:
         if PHASE == "0":
             return Decision(
                 "ignore",
@@ -182,25 +187,25 @@ def decide(event: dict, context: dict) -> Decision:
             needs_human=True,
         )
 
-    if etype == "New Task":
+    if etype in IGNORE_EVENTS:
         return Decision(
             "ignore",
             event_type=etype,
             reasoning=(
-                "New Task is a prompt for a human action in Roofix; Phase 0 takes no "
-                "action. (Phase 1 may notify the rep.)"
+                f"'{etype}' is a prompt for a human action in Roofix; Phase 0 "
+                "takes no action. (Phase 1 may notify the rep.)"
             ),
         )
 
-    return _escalate_to_ai(
+    return await _escalate_to_ai(
         event, context, why=f"No rule confidently handles event_type '{etype}'."
     )
 
 
-def _escalate_to_ai(event: dict, context: dict, why: str) -> Decision:
+async def _escalate_to_ai(event: dict, context: dict, why: str) -> Decision:
     etype = event.get("event_type", "Unknown")
     try:
-        d = generate_ai_decision(event, context, why)
+        d = await generate_ai_decision(event, context, why)
         d.source = "ai"
         return d
     except Exception as e:
@@ -220,7 +225,7 @@ def _escalate_to_ai(event: dict, context: dict, why: str) -> Decision:
 # only meant to be read by generate_ai_decision below.
 
 
-def generate_ai_decision(event: dict, context: dict, why: str) -> Decision:
+async def generate_ai_decision(event: dict, context: dict, why: str) -> Decision:
     """
     Ask the model to make a judgment call and return a Decision.
 
@@ -228,17 +233,20 @@ def generate_ai_decision(event: dict, context: dict, why: str) -> Decision:
     the underlying model (Claude -> in-house GPU, etc.) is a LiteLLM config
     change with no code change here.
 
+    Uses AsyncOpenAI so a slow LLM call doesn't tie up the event loop while
+    other events in the same tick continue processing.
+
     Reads:
         ROOFIX_LLM_URL      (default http://litellm:4000)
         ROOFIX_LLM_API_KEY  (LiteLLM master or virtual key)
         BRAIN_MODEL         (LiteLLM model alias, e.g. "qwen3.6")
         BRAIN_MAX_TOKENS    (max tokens per AI decision, default 400)
     """
-    from openai import OpenAI  # local import so rules path has no hard SDK dep
+    from openai import AsyncOpenAI  # local import so rules path has no hard SDK dep
 
     etype = event.get("event_type", "Unknown")
 
-    client = OpenAI(
+    client = AsyncOpenAI(
         base_url=os.environ.get("ROOFIX_LLM_URL", "http://litellm:4000").rstrip("/")
         + "/v1",
         api_key=os.environ["ROOFIX_LLM_API_KEY"],
@@ -247,7 +255,7 @@ def generate_ai_decision(event: dict, context: dict, why: str) -> Decision:
         {"why_escalated": why, "event": event, "phoenix_context": context}
     )
 
-    resp = client.chat.completions.create(
+    resp = await client.chat.completions.create(
         model=os.environ.get("BRAIN_MODEL", "qwen3.6"),
         max_tokens=int(os.environ.get("BRAIN_MAX_TOKENS", "400")),
         messages=[

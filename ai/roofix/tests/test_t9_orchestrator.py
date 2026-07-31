@@ -17,11 +17,12 @@ Run from ai/roofix/:
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 # Set env BEFORE importing anything that reads it.
 os.environ.setdefault("DRY_RUN", "true")
@@ -203,9 +204,14 @@ def _read_audit_csv(log_path):
 
 
 def _make_fake_scraper():
-    """Return a MagicMock that stands in for RoofixScraperClient."""
+    """Return a MagicMock that stands in for RoofixScraperClient.
+
+    ``get_proposal`` is async in the real client — AsyncMock wraps the
+    return value in a coroutine so ``await scraper.get_proposal(...)``
+    resolves to FAKE_SCRAPER_RESULT.
+    """
     scraper = MagicMock()
-    scraper.get_proposal.return_value = FAKE_SCRAPER_RESULT
+    scraper.get_proposal = AsyncMock(return_value=FAKE_SCRAPER_RESULT)
     return scraper
 
 
@@ -270,7 +276,7 @@ def run() -> bool:
         from components.brain import decide
         ev = parse_email(FAKE_ESTIMATE_EMAIL).as_dict()
         ctx = {"found": False, "ambiguous": False}
-        d = decide(ev, ctx).as_dict()
+        d = asyncio.run(decide(ev, ctx)).as_dict()
         assert d["action"] == "create_project", d
         assert d["payload"]["tracking_url"] == "http://url6628.roofix.io/ls/click?upn=FAKE_TOKEN_123"
         assert d["source"] == "rule", d
@@ -287,7 +293,7 @@ def run() -> bool:
             from components.brain import decide
             ev = parse_email(FAKE_ESTIMATE_EMAIL).as_dict()
             ctx = {"found": False, "ambiguous": False}
-            d = decide(ev, ctx).as_dict()
+            d = asyncio.run(decide(ev, ctx)).as_dict()
             assert d["action"] == "ignore", d
             assert "Phase 0" in d["reasoning"], d
         finally:
@@ -307,14 +313,14 @@ def run() -> bool:
 
         # Patch extract_proposal to return our fake.
         with patch("components.orchestrator.extract_proposal", return_value=FAKE_EXTRACTED_PROPOSAL):
-            decisions = orchestrator_run(
+            decisions = asyncio.run(orchestrator_run(
                 listener=lambda: [FAKE_ESTIMATE_EMAIL],
                 phoenix=phoenix,
                 log=audit,
                 milestone_map=None,
                 scraper_client=scraper,
                 processed_store=processed_store,
-            )
+            ))
 
         # Verify decision.
         assert len(decisions) == 1, len(decisions)
@@ -385,14 +391,14 @@ def run() -> bool:
         not_accepted = FakeExtractedProposal()
 
         with patch("components.orchestrator.extract_proposal", return_value=not_accepted):
-            decisions = orchestrator_run(
+            decisions = asyncio.run(orchestrator_run(
                 listener=lambda: [FAKE_ESTIMATE_EMAIL],
                 phoenix=phoenix,
                 log=audit,
                 milestone_map=None,
                 scraper_client=scraper,
                 processed_store=processed_store,
-            )
+            ))
 
         # Verify decision.
         assert len(decisions) == 1, len(decisions)
@@ -422,7 +428,7 @@ def run() -> bool:
         email_no_tracking["body_html"] = "<p>No link here</p>"
         ev = parse_email(email_no_tracking).as_dict()
         ctx = {"found": False, "ambiguous": False}
-        d = decide(ev, ctx).as_dict()
+        d = asyncio.run(decide(ev, ctx)).as_dict()
         assert d["action"] == "escalate", d
         assert d["needs_human"] is True
         assert "no tracking url" in d["reasoning"].lower(), d
@@ -439,16 +445,16 @@ def run() -> bool:
         phoenix = _make_fake_phoenix()
 
         # Make scraper return no docs.
-        scraper.get_proposal.return_value = {"docs": [], "mget_docs": []}
+        scraper.get_proposal = AsyncMock(return_value={"docs": [], "mget_docs": []})
 
-        decisions = orchestrator_run(
+        decisions = asyncio.run(orchestrator_run(
             listener=lambda: [FAKE_ESTIMATE_EMAIL],
             phoenix=phoenix,
             log=audit,
             milestone_map=None,
             scraper_client=scraper,
             processed_store=processed_store,
-        )
+        ))
 
         # Verify decision.
         assert len(decisions) == 1, len(decisions)

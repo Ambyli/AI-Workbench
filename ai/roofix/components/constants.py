@@ -6,7 +6,7 @@ Everything here is either a plain literal, a compiled regex, or an env-var
 read (``os.getenv`` with the same defaults each individual module used to
 have). Consuming modules import from here and re-export the names they used
 to define locally, so external callers (tests, other components) that do
-``from components.parser import NEEDS_SCRAPE_EVENTS`` — or
+``from components.parser import SCRAPE_EVENTS`` — or
 ``pc.AGENT_USER_ID = None`` to mutate a module attribute — keep working.
 """
 
@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import os
 import re
-
 
 # ── Runtime flags ──────────────────────────────────────────────────────────
 # DRY_RUN is read by the orchestrator (skip Phoenix writes) and the phoenix
@@ -34,18 +33,16 @@ LOG_COLUMNS = ["stage", "action", "ok", "detail", "event_type", "project_ref"]
 # Events whose real data lives behind the proposal link — thin by nature.
 # For these the parser sets parse_complete=False and the orchestrator will
 # scrape after a Phoenix-lookup miss.
-NEEDS_SCRAPE_EVENTS = {"Estimate Complete", "Estimate"}
+SCRAPE_EVENTS = {"Estimate Complete", "Estimate"}
 
 # Events the brain routes to a milestone update (via Phoenix block/status).
 MILESTONE_EVENTS = {
-    "HIC Executed",
     "Install Date",
     "Job Scheduled",
     "Job In Progress",
     "Job Is Complete",
     "Deposit Invoice Sent",
     "Deposit Invoice Paid",
-    "Job Approval Confirmed",
 }
 
 # Contract-value-setting events (signing / approval). Estimate emails are
@@ -53,7 +50,20 @@ MILESTONE_EVENTS = {
 SIGNING_EVENTS = {
     "Job Approval Confirmed",
     "HIC Executed",
-}  # confirm exact set w/ Jonathan
+}
+
+# Events the brain deliberately drops. These are Roofix-side prompts for a
+# human action (assign a task, pick a funding option, etc.) that don't
+# correspond to a state change we mirror into Phoenix. Phase 0 takes no
+# action; a future Phase 1 may notify the rep instead.
+IGNORE_EVENTS = {
+    "New Task",
+    "Select Funding",
+    "Estimate Ready for Approval",
+    "Submit Credit Application",
+    "Approve Estimate",
+    "Please have CPC signed (If applicable)",
+}
 
 
 # ── Parser: email-field extraction regexes ─────────────────────────────────
@@ -122,12 +132,22 @@ ESCALATION_RECIPIENTS: list[str] = [
 # relationship_type / phoenix.project GROUP BY company_id, etc.). Overridable
 # via env for a non-default Phoenix deployment.
 PHOENIX_COMPANY_ID = int(os.getenv("PHOENIX_COMPANY_ID", "1"))
-PHOENIX_PROJECT_OBJECT_TYPE_ID = int(os.getenv("PHOENIX_PROJECT_OBJECT_TYPE_ID", "7"))   # "R&R / Roof"
-PHOENIX_ENTITY_OBJECT_TYPE_ID = int(os.getenv("PHOENIX_ENTITY_OBJECT_TYPE_ID", "8"))     # "Lead"
-PHOENIX_HOMEOWNER_REL_TYPE_ID = int(os.getenv("PHOENIX_HOMEOWNER_REL_TYPE_ID", "7"))     # "Homeowner"
-PHOENIX_PROJECT_START_STATUS_ID = int(os.getenv("PHOENIX_PROJECT_START_STATUS_ID", "4"))  # "Qualification"
+PHOENIX_PROJECT_OBJECT_TYPE_ID = int(
+    os.getenv("PHOENIX_PROJECT_OBJECT_TYPE_ID", "7")
+)  # "R&R / Roof"
+PHOENIX_ENTITY_OBJECT_TYPE_ID = int(
+    os.getenv("PHOENIX_ENTITY_OBJECT_TYPE_ID", "8")
+)  # "Lead"
+PHOENIX_HOMEOWNER_REL_TYPE_ID = int(
+    os.getenv("PHOENIX_HOMEOWNER_REL_TYPE_ID", "7")
+)  # "Homeowner"
+PHOENIX_PROJECT_START_STATUS_ID = int(
+    os.getenv("PHOENIX_PROJECT_START_STATUS_ID", "4")
+)  # "Qualification"
 PHOENIX_AGENT_USER_ID = os.getenv("PHOENIX_AGENT_USER_ID")
-PHOENIX_ROOFIX_ID_COLUMN = os.getenv("PHOENIX_ROOFIX_ID_COLUMN", "migration_external_id")
+PHOENIX_ROOFIX_ID_COLUMN = os.getenv(
+    "PHOENIX_ROOFIX_ID_COLUMN", "migration_external_id"
+)
 
 
 # ── Proposal extractor: Bubble document types ──────────────────────────────
@@ -145,13 +165,29 @@ ESTIMATE_TYPE = "custom.estimate1"
 # hands ``phoenix.ensure_entity_and_project``. Kept exhaustive so downstream
 # gets everything the extractor produced — Phoenix ignores keys it doesn't use.
 EXTRACTED_PAYLOAD_FIELDS = (
-    "roofix_project_id", "is_accepted", "display_text",
-    "customer_name", "full_name", "first_name", "last_name",
-    "email", "phone",
-    "street_address", "city", "state_text", "state_abbr", "zip_code",
-    "contract_price", "actual_contract_price", "funding_type", "trade",
-    "job_status", "hic_status", "hic_signature_present",
-    "acceptance_signals", "error",
+    "roofix_project_id",
+    "is_accepted",
+    "display_text",
+    "customer_name",
+    "full_name",
+    "first_name",
+    "last_name",
+    "email",
+    "phone",
+    "street_address",
+    "city",
+    "state_text",
+    "state_abbr",
+    "zip_code",
+    "contract_price",
+    "actual_contract_price",
+    "funding_type",
+    "trade",
+    "job_status",
+    "hic_status",
+    "hic_signature_present",
+    "acceptance_signals",
+    "error",
 )
 
 
@@ -164,6 +200,19 @@ DEFAULT_MGET_PATTERN = os.getenv(
     "ROOFIX_MGET_URL_PATTERN", r"roofix\.io/elasticsearch/mget"
 )
 DEFAULT_PROFILE = os.getenv("ROOFIX_PROFILE_NAME", "roofix")
+
+# Max concurrent scrape requests the bridge will have in flight against
+# interceptor-api. MUST match (or be smaller than) interceptor-api's own
+# INTERCEPTOR_MAX_CONCURRENT — the bridge queues locally so we never blow
+# past the server's cap and get 409'd. asyncio.Semaphore serves acquirers
+# FIFO, so first-come-first-serve is automatic.
+INTERCEPTOR_MAX_CONCURRENT = int(os.getenv("INTERCEPTOR_MAX_CONCURRENT", "8"))
+
+# Timeout on the full scrape (including queue wait + capture + reshape).
+# Extra long by design — the queue wait can be minutes on a burst tick.
+# Reached only if interceptor-api itself hangs or the capture window doesn't
+# resolve; the scraper's own request timeout is capture_window_seconds + 30.
+SCRAPE_TIMEOUT_SECONDS = int(os.getenv("SCRAPE_TIMEOUT_SECONDS", "600"))
 
 
 # ── Brain: LLM system prompt ───────────────────────────────────────────────

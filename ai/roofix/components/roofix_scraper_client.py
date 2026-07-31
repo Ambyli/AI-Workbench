@@ -80,20 +80,20 @@ class RoofixScraperClient:
         self.max_matches_per_pattern = max_matches_per_pattern
         # Timeout must exceed capture_window_seconds — interceptor-api blocks
         # for capture_window_seconds on each request. Add a safety margin.
-        self._client = httpx.Client(
+        self._client = httpx.AsyncClient(
             timeout=max(timeout, capture_window_seconds + 30.0)
         )
 
-    def close(self) -> None:
-        self._client.close()
+    async def aclose(self) -> None:
+        await self._client.aclose()
 
-    def __enter__(self):
+    async def __aenter__(self):
         return self
 
-    def __exit__(self, *exc):
-        self.close()
+    async def __aexit__(self, *exc):
+        await self.aclose()
 
-    def get_proposal(self, tracking_url: str) -> dict:
+    async def get_proposal(self, tracking_url: str) -> dict:
         """Load ``tracking_url`` under the Roofix profile in interceptor-api,
         watch for init/data and elasticsearch/mget XHRs, and return the same
         response shape the old ``roofix-scraper`` `/proposal/{id}` endpoint did.
@@ -115,7 +115,7 @@ class RoofixScraperClient:
             "max_matches_per_pattern": self.max_matches_per_pattern,
             "debug_logging": False,
         }
-        r = self._client.post(f"{self.url}/capture", json=body)
+        r = await self._client.post(f"{self.url}/capture", json=body)
         r.raise_for_status()
         return self._reshape(r.json(), tracking_url)
 

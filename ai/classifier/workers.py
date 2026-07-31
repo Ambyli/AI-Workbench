@@ -45,11 +45,13 @@ from scoring import aggregate, combined_score, compute_similarity
 # ---------------------------------------------------------------------------
 # Prometheus metrics
 # ---------------------------------------------------------------------------
+# These are scraped by Prometheus (see prometheus.yml) and can be visualised
+# in Grafana alongside LiteLLM metrics from the same Prometheus instance.
 
 jobs_total = Counter(
     "classifier_jobs_total",
     "Total jobs by type and final status",
-    ["type", "status"],
+    ["type", "status"],  # type: assess|compare, status: pending|completed|failed
 )
 job_duration = Histogram(
     "classifier_job_duration_seconds",
@@ -64,6 +66,8 @@ job_queue_depth = Gauge(
 # ---------------------------------------------------------------------------
 # In-memory job queue
 # ---------------------------------------------------------------------------
+# Imported by main.py which enqueues jobs. Each item is a 4-tuple:
+#   (job_id: str, job_type: str, job_data: dict|CompareRequest, req_id: str)
 job_queue: asyncio.Queue = asyncio.Queue()
 
 
@@ -88,7 +92,18 @@ def set_registry(registry: SqliteRegistry) -> None:
 # ---------------------------------------------------------------------------
 
 async def _run_assess(job_data: dict) -> dict:
-    """Execute a single-image assessment job."""
+    """Execute a single-image assessment job.
+
+    Decodes the stored image bytes, runs the full analysis pipeline, and
+    returns the result dict that will be persisted to the job store.
+
+    Args:
+        job_data: dict with keys image_bytes, content_type, filename, criteria.
+
+    Returns:
+        Analysis result dict from analyze_bgr().
+    """
+    # Decode bytes → BGR numpy array (includes EXIF correction and magic check)
     bgr = await _bytes_to_bgr(job_data["image_bytes"])
     h, w = bgr.shape[:2]
     return await analyze_bgr(
@@ -100,7 +115,22 @@ async def _run_assess(job_data: dict) -> dict:
 
 
 async def _run_compare(request: CompareRequest) -> dict:
-    """Execute a comparison job against one or more reference examples."""
+    """Execute a comparison job against one or more reference examples.
+
+    Analyses the subject image and all reference examples concurrently using
+    asyncio.gather().  Examples with pre_generated_analysis skip the LLM call
+    entirely (resolve_example handles this).  After gathering all analyses,
+    computes per-example similarity and combined scores, then aggregates.
+
+    Args:
+        request: The original CompareRequest from the HTTP body.
+
+    Returns:
+        Full comparison result dict including per-example breakdowns and
+        an aggregate verdict.
+    """
+    # Analyse the subject image and all examples concurrently.
+    # Pre-generated examples resolve instantly; live examples hit the LLM in parallel.
     input_task = analyze_input(request.image, request.criteria)
     example_tasks = [resolve_example(ex, request.criteria) for ex in request.examples]
     results = await asyncio.gather(input_task, *example_tasks)
@@ -108,16 +138,19 @@ async def _run_compare(request: CompareRequest) -> dict:
     input_analysis = results[0]
     example_analyses = results[1:]
 
+    # Use the assessment (weighted combined) for scoring and similarity
     input_overall = input_analysis["assessment"].get("overall_score", 5)
 
     example_results = []
     combined_scores = []
 
     for i, (example, analysis) in enumerate(zip(request.examples, example_analyses)):
+        # Compute similarity across all criteria
         similarity = compute_similarity(
             analysis["assessment"],
             input_analysis["assessment"],
         )
+        # Blend quality score with similarity score using the example's weight
         cs = combined_score(input_overall, similarity["similarity_score"], example.weight)
         combined_scores.append(cs["score"])
         example_results.append({
@@ -130,6 +163,7 @@ async def _run_compare(request: CompareRequest) -> dict:
             "combined_verdict": cs["verdict"],
         })
 
+    # Collapse per-example scores into a single aggregate verdict
     agg = aggregate(combined_scores, request.aggregation)
     return {
         "status": "ok",
@@ -170,8 +204,10 @@ async def job_worker() -> None:
 
     logger.info("job_worker: started")
     while True:
+        # Block until a job is available in the queue
         job_id, job_type, job_data, req_id = await job_queue.get()
 
+        # Restore the correlation ID so logs are traceable to the originating request
         request_id_var.set(req_id)
         logger.info("job_worker: picked up job_id=%s type=%s queue_remaining=%d",
                     job_id, job_type, job_queue.qsize())
@@ -179,15 +215,16 @@ async def job_worker() -> None:
 
         start = time.monotonic()
         try:
-            # Mark as processing before the expensive LLM call.
+            # Mark as processing before the expensive LLM call
             await _registry.set_phase(job_id, "processing")
 
+            # Dispatch to the correct runner
             if job_type == "assess":
                 result = await _run_assess(job_data)
             else:
                 result = await _run_compare(job_data)
 
-            # set_result also flips phase → "completed" by default.
+            # Persist result and record metrics — set_result also flips phase → "completed"
             await _registry.set_result(job_id, result)
             elapsed = time.monotonic() - start
             jobs_total.labels(type=job_type, status="completed").inc()
@@ -195,7 +232,8 @@ async def job_worker() -> None:
             logger.info("job_worker: job_id=%s completed in %.2fs", job_id, elapsed)
 
         except Exception as exc:
-            # set_error also flips phase → "failed" by default.
+            # Persist error and record metrics — never let an exception kill the worker.
+            # set_error also flips phase → "failed".
             elapsed = time.monotonic() - start
             await _registry.set_error(job_id, str(exc))
             jobs_total.labels(type=job_type, status="failed").inc()
@@ -203,5 +241,6 @@ async def job_worker() -> None:
             logger.error("job_worker: job_id=%s failed after %.2fs: %s", job_id, elapsed, exc)
 
         finally:
+            # Always release the queue slot so qsize() stays accurate
             job_queue.task_done()
             job_queue_depth.set(job_queue.qsize())

@@ -69,6 +69,7 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[_handler],
 )
+# Apply the level directly to the shared logger (basicConfig sets the root level)
 logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 logger.info("Starting Document Classifier (log level=%s)", LOG_LEVEL)
 
@@ -108,13 +109,15 @@ async def lifespan(app: FastAPI):
     On shutdown (when the context exits):
       - Cancel the worker task cleanly.
     """
+    # Startup — registry must be ready before the worker starts accepting jobs
     await jobs_registry.init()
     set_registry(jobs_registry)
     worker_task = asyncio.create_task(job_worker())
     logger.info("lifespan: startup complete")
 
-    yield
+    yield  # server runs here
 
+    # Shutdown — cancel the worker (in-flight jobs will be marked failed on restart)
     worker_task.cancel()
     logger.info("lifespan: shutdown complete")
 
@@ -125,8 +128,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Document Classifier", lifespan=lifespan)
 
+# Attach correlation ID middleware — wraps every request before route handlers run
 app.add_middleware(CorrelationIDMiddleware)
 
+# Auto-instrument all endpoints with HTTP request/latency metrics.
+# /metrics and /health are excluded to avoid polluting the metric set.
 Instrumentator(
     should_group_status_codes=True,
     excluded_handlers=["/metrics", "/health"],
@@ -172,20 +178,24 @@ async def assess_document(
     """
     logger.info("assess_document: filename=%s content_type=%s", image.filename, image.content_type)
 
+    # Step 1 — parse criteria from the multipart form field
     criterion_list = parse_criteria(criteria)
     if not criterion_list:
         raise HTTPException(status_code=400, detail="At least one criterion is required")
 
+    # Step 2 — read image bytes before returning (UploadFile is only readable during the request)
     contents = await image.read()
     if not contents:
         raise HTTPException(status_code=400, detail="Empty image file")
 
+    # Step 3 — create a job record so the caller has an ID to poll
     req_id = request_id_var.get("-")
     job_id = await jobs_registry.register(
         ClassifierMetadata(type="assess", request_id=req_id),
         initial_phase="pending",
     )
 
+    # Step 4 — enqueue; the background worker will pick this up and run the analysis
     await job_queue.put((
         job_id,
         "assess",
@@ -200,6 +210,7 @@ async def assess_document(
     job_queue_depth.set(job_queue.qsize())
     jobs_total.labels(type="assess", status="pending").inc()
 
+    # Step 5 — return immediately; caller polls for the result
     logger.info("assess_document: queued job_id=%s queue_depth=%d", job_id, job_queue.qsize())
     return JSONResponse(
         status_code=202,
@@ -222,19 +233,23 @@ async def assess_with_reference(request: CompareRequest):
                 len(request.examples), request.aggregation,
                 [c.name for c in request.criteria])
 
+    # Step 1 — validate criteria (Pydantic enforces examples min_length=1)
     if not request.criteria:
         raise HTTPException(status_code=400, detail="At least one criterion is required")
 
+    # Step 2 — create job record
     req_id = request_id_var.get("-")
     job_id = await jobs_registry.register(
         ClassifierMetadata(type="compare", request_id=req_id),
         initial_phase="pending",
     )
 
+    # Step 3 — enqueue the full request object (workers._run_compare receives it directly)
     await job_queue.put((job_id, "compare", request, req_id))
     job_queue_depth.set(job_queue.qsize())
     jobs_total.labels(type="compare", status="pending").inc()
 
+    # Step 4 — return immediately
     logger.info("assess_with_reference: queued job_id=%s queue_depth=%d", job_id, job_queue.qsize())
     return JSONResponse(
         status_code=202,

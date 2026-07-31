@@ -150,7 +150,6 @@ def decide(event: dict, context: dict) -> Decision:
             "update_milestone",
             event_type=etype,
             target=str(context.get("phoenix_project_id")),
-            payload={"roofix_event": etype},
             reasoning=f"'{etype}' advances the project's milestone in Phoenix.",
         )
 

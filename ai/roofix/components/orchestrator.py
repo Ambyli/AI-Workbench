@@ -206,10 +206,19 @@ def _execute(decision: dict, ev: dict, phoenix, log: CsvLogger,
 
     match action:
         # ── Ignore ────────────────────────────────────────────────────
-        # Log and stop. No Phoenix write, no human review.
+        # Terminal decision — log, then mark processed so next tick doesn't
+        # re-parse this same email into this same ignore. Whether we ALSO
+        # mark it read in Gmail is app.py's call (currently rule-source only;
+        # AI-decided ignores stay unread for operator review).
         case "ignore":
             log.log("orchestrator", "ignore", True, decision["reasoning"],
                     event_type=etype, project_ref=pref)
+            if processed_store:
+                processed_store.mark_ok(ev.get("message_id"), metadata={
+                    "action": "ignore",
+                    "source": decision.get("source", "rule"),
+                    "reasoning": decision["reasoning"],
+                })
 
         # ── Escalate / Needs human ────────────────────────────────────
         # Log for human review, skip Phoenix write.
@@ -234,12 +243,13 @@ def _execute(decision: dict, ev: dict, phoenix, log: CsvLogger,
 
         # ── Update milestone ──────────────────────────────────────────
         # Look up the milestone mapping, then advance the project's milestone.
+        # The mapping key is the event_type (already stamped on the decision at
+        # the top level — no need to duplicate it inside payload).
         case "update_milestone":
-            roofix_event = decision["payload"].get("roofix_event", etype)
-            mapping = (milestone_map or {}).get(roofix_event)
+            mapping = (milestone_map or {}).get(etype)
             if not mapping:
                 log.log("phoenix", action, False,
-                        f"no milestone mapping for '{roofix_event}' (needs Michael)",
+                        f"no milestone mapping for '{etype}' (needs Michael)",
                         event_type=etype, project_ref=pref)
             else:
                 res = phoenix.update_milestone(int(pref), mapping["block_name"],
@@ -307,11 +317,22 @@ def _execute(decision: dict, ev: dict, phoenix, log: CsvLogger,
                     })
 
         # ── Unsupported action ────────────────────────────────────────
-        # Log and stop. No Phoenix write.
+        # Brain produced something we can't route — most likely an AI
+        # hallucination, occasionally a Phase 1 action leaking into Phase 0.
+        # mark_error (not mark_ok) so it's not silenced: is_processed()
+        # returns False for error rows, so the next tick will re-parse and
+        # give the brain another chance. If the model keeps producing the
+        # same garbage the recurring errors are a signal to tune the prompt.
         case _:
             log.log("orchestrator", action, False,
                     f"action '{action}' not enabled in Phase 0",
                     event_type=etype, project_ref=pref)
+            if processed_store:
+                processed_store.mark_error(ev.get("message_id"), metadata={
+                    "error": f"unsupported action '{action}'",
+                    "source": decision.get("source", "rule"),
+                    "reasoning": decision.get("reasoning", ""),
+                })
 
 
 def process_batch(raw_emails: list, phoenix=None, log: Optional[CsvLogger] = None,

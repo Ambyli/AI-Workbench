@@ -1,13 +1,13 @@
 """
-ROOFIX SCRAPER CLIENT — calls the generic interceptor-api service for Roofix
+ROOFIX SCRAPER CLIENT — calls the generic interceptor service for Roofix
 proposal captures.
 
 Before this rewrite there was a sibling ``roofix-scraper`` FastAPI service that
 owned Chrome-under-CDP directly. That service was a Roofix-shaped wrapper around
 ``common.cdp_interceptor`` — every capability it had is now a strict subset of
-``ai/interceptor-api``'s ``POST /capture``. Rather than run two Chrome-driving
+``ai/interceptor``'s ``POST /capture``. Rather than run two Chrome-driving
 containers with two profiles to keep fresh, the bridge now talks to
-``interceptor-api`` directly and this client owns the Roofix-specific
+``interceptor`` directly and this client owns the Roofix-specific
 reshaping (init/data + mget aggregation, doc-type counting, login-wall flag).
 
 Public surface intentionally kept small so ``parser.py`` / ``orchestrator.py``
@@ -20,7 +20,7 @@ don't move:
 so ``proposal_extractor.extract_proposal(r)`` keeps working unchanged.
 
 Reads:
-    INTERCEPTOR_API_URL             default http://interceptor-api:8080
+    INTERCEPTOR_URL             default http://interceptor:8080
     ROOFIX_INIT_DATA_URL_PATTERN    default roofix\\.io/api/1\\.1/init/data
     ROOFIX_MGET_URL_PATTERN         default roofix\\.io/elasticsearch/mget
     ROOFIX_PROFILE_NAME             default "roofix"
@@ -49,7 +49,7 @@ from components.constants import (
 
 
 class RoofixScraperClient:
-    """Thin HTTP wrapper around ``interceptor-api``'s ``POST /capture`` that
+    """Thin HTTP wrapper around ``interceptor``'s ``POST /capture`` that
     reshapes the response into the dict shape the bridge's parser + extractor
     have always consumed."""
 
@@ -70,7 +70,7 @@ class RoofixScraperClient:
         ),
     ):
         self.url = (
-            url or os.getenv("INTERCEPTOR_API_URL", DEFAULT_INTERCEPTOR_URL)
+            url or os.getenv("INTERCEPTOR_URL", DEFAULT_INTERCEPTOR_URL)
         ).rstrip("/")
         self.profile = profile
         self.init_data_pattern = init_data_pattern
@@ -78,7 +78,7 @@ class RoofixScraperClient:
         self.capture_window_seconds = capture_window_seconds
         self.login_timeout = login_timeout
         self.max_matches_per_pattern = max_matches_per_pattern
-        # Timeout must exceed capture_window_seconds — interceptor-api blocks
+        # Timeout must exceed capture_window_seconds — interceptor blocks
         # for capture_window_seconds on each request. Add a safety margin.
         self._client = httpx.AsyncClient(
             timeout=max(timeout, capture_window_seconds + 30.0)
@@ -94,7 +94,7 @@ class RoofixScraperClient:
         await self.aclose()
 
     async def get_proposal(self, tracking_url: str) -> dict:
-        """Load ``tracking_url`` under the Roofix profile in interceptor-api,
+        """Load ``tracking_url`` under the Roofix profile in interceptor,
         watch for init/data and elasticsearch/mget XHRs, and return the same
         response shape the old ``roofix-scraper`` `/proposal/{id}` endpoint did.
 
@@ -120,7 +120,7 @@ class RoofixScraperClient:
         return self._reshape(r.json(), tracking_url)
 
     def _reshape(self, raw: dict, tracking_url: str) -> dict:
-        """Convert an interceptor-api ``/capture`` response into the legacy
+        """Convert an interceptor ``/capture`` response into the legacy
         roofix-scraper ``/proposal/{id}`` shape.
 
         Direct port of the ``on_capture`` closure + post-processing block that

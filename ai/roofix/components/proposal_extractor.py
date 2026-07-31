@@ -3,7 +3,7 @@ PROPOSAL EXTRACTOR — pulls Phoenix-writable fields from the scraper output.
 
 Input:  the JSON dict returned by ``RoofixScraperClient.get_proposal(tracking_url)``
         (``ai/roofix/components/roofix_scraper_client.py``). That client
-        POSTs to ``interceptor-api``'s ``/capture`` under the hood and reshapes
+        POSTs to ``interceptor``'s ``/capture`` under the hood and reshapes
         the response into the legacy scraper's ``/proposal/{id}`` dict shape.
         The extractor reads from TWO fields on that response:
 

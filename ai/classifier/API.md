@@ -23,7 +23,7 @@ GET /jobs/abc123  →  {"phase": "completed", "result": {...}, "metadata": {...}
 ```
 
 Job tracking is powered by the shared `common.jobs` package
-(`shared/common/src/common/jobs/`), which the interceptor-api service also
+(`shared/common/src/common/jobs/`), which the interceptor service also
 uses. The endpoint shapes and response fields are documented there.
 
 ---

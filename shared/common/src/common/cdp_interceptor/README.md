@@ -94,7 +94,7 @@ Anything that accepts a browser data directory can point at the same path:
 |---|---|
 | `cdp-spy` CLI | `--profile-dir <path>` |
 | `common.cdp_interceptor.InterceptorClient` (Python) | `profile_dir=<path>` constructor arg |
-| `interceptor-api` service | Named profile — `POST /profiles/{name}/refresh` uploads a `.tgz` into `INTERCEPTOR_PROFILES_ROOT/{name}/` |
+| `interceptor` service | Named profile — `POST /profiles/{name}/refresh` uploads a `.tgz` into `INTERCEPTOR_PROFILES_ROOT/{name}/` |
 | Any future tool built on `common.cdp_interceptor` | Whatever env var / arg it exposes |
 
 Same directory + same site + valid cookies → no login prompt. Different sites in the same profile is fine (Chrome scopes cookies per-domain) but conventionally you'd keep one profile per site to keep concerns clean.
@@ -118,7 +118,7 @@ Profile directories are just directories — you can `ls` / `Get-ChildItem` them
 Only three scenarios need a fresh login:
 
 1. **First time ever** — no profile dir exists yet.
-2. **Site expired the session** — you'll see the browser land on the site's login page instead of the target URL. In `interceptor-api` this shows up as `login_wall: true` in the `POST /capture` response.
+2. **Site expired the session** — you'll see the browser land on the site's login page instead of the target URL. In `interceptor` this shows up as `login_wall: true` in the `POST /capture` response.
 3. **You deleted the profile dir** (or ran `docker compose down -v` on a service whose volume held it).
 
 For most sites the cookie TTL is days to weeks — you re-capture rarely.
@@ -136,7 +136,7 @@ tar czf profile.tgz -C "C:\Users\<you>\.zeo\<site>_profile" .
 tar xzf profile.tgz -C "/data/profiles/<name>"
 ```
 
-`interceptor-api`'s `POST /profiles/{name}/refresh` endpoint accepts this tar as a multipart upload and unpacks it into `INTERCEPTOR_PROFILES_ROOT/{name}/`.
+`interceptor`'s `POST /profiles/{name}/refresh` endpoint accepts this tar as a multipart upload and unpacks it into `INTERCEPTOR_PROFILES_ROOT/{name}/`.
 
 **Cross-machine caveat:** cookies and localStorage travel fine. `Login Data` (saved passwords) is encrypted with an OS-level key bound to the originating machine, so imported profiles can't auto-fill on a fresh login page from a different host. This rarely matters because the session cookies alone keep the browser logged in. Just don't rely on "log in from inside the container using an imported saved password."
 
@@ -152,7 +152,7 @@ For Docker services: `docker compose down -v` (or the appropriate `make very-cle
 
 ### Concurrent access
 
-Only **one** browser process can hold a given profile dir at a time — the singleton lock enforces this. If two `.launch()` calls (or two `cdp-spy` runs, or two overlapping HTTP requests against `interceptor-api`) target the same profile-dir concurrently, the second will either:
+Only **one** browser process can hold a given profile dir at a time — the singleton lock enforces this. If two `.launch()` calls (or two `cdp-spy` runs, or two overlapping HTTP requests against `interceptor`) target the same profile-dir concurrently, the second will either:
 
 - Hand its URL off to the first (Chrome's IPC behavior) and exit, or
 - Fail to open if `--remote-debugging-port` collides.

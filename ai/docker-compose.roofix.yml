@@ -69,9 +69,9 @@ services:
       - PHOENIX_DB_SSLMODE=${PHOENIX_DB_SSLMODE:-require}
       - PHOENIX_AGENT_USER_ID=${PHOENIX_AGENT_USER_ID}
       - PHOENIX_ROOFIX_ID_COLUMN=${PHOENIX_ROOFIX_ID_COLUMN:-migration_external_id}
-      # Chrome-under-CDP for proposal fetches now lives in ai/interceptor-api.
-      # Start that compose file separately: `docker compose -f ai/docker-compose.interceptor-api.yml up -d`
-      - INTERCEPTOR_API_URL=${INTERCEPTOR_API_URL:-http://interceptor-api:8080}
+      # Chrome-under-CDP for proposal fetches now lives in ai/interceptor.
+      # Start that compose file separately: `docker compose -f ai/docker-compose.interceptor.yml up -d`
+      - INTERCEPTOR_URL=${INTERCEPTOR_URL:-http://interceptor:8080}
       - LOG_DIR=/data
     volumes:
       - roofix_data:/data

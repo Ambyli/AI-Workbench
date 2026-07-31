@@ -3,7 +3,7 @@ members = [
     "shared/common",
     "widget",
     "ai/roofix",
-    "ai/interceptor-api",
+    "ai/interceptor",
     "ai/classifier",
 ]
 

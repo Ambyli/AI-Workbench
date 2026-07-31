@@ -1,5 +1,5 @@
 """
-interceptor-api — FastAPI + FastMCP wrapper around common.cdp_interceptor.
+interceptor — FastAPI + FastMCP wrapper around common.cdp_interceptor.
 
 Give it a URL and a list of URL regex patterns; it launches Chrome under a
 named profile, injects the interceptor, waits a bounded window, and returns
@@ -83,7 +83,7 @@ def _log(msg: str) -> None:
     """Stderr log line without a job_id (startup / global events). Per-job
     log lines go through ``job.log(...)`` on the registry's ``JobHandle``,
     which prepends the job_id tag automatically."""
-    print(f"[interceptor-api] {msg}", file=sys.stderr, flush=True)
+    print(f"[interceptor] {msg}", file=sys.stderr, flush=True)
 
 
 # ── Port pool ──────────────────────────────────────────────────────────────
@@ -513,7 +513,7 @@ def capture_url(
 
 @mcp.tool()
 def list_profiles() -> dict:
-    """List every named Chrome profile currently uploaded to interceptor-api.
+    """List every named Chrome profile currently uploaded to interceptor.
 
     Use this before ``capture_url`` to see which ``profile`` values are valid.
     Only profiles with ``sentinel_present: true`` are usable — a false value
@@ -532,7 +532,7 @@ def list_profiles() -> dict:
 def list_jobs() -> dict:
     """Return a snapshot of the port pool + all currently-running captures.
 
-    Use this to see how busy interceptor-api is before firing a `capture_url`
+    Use this to see how busy interceptor is before firing a `capture_url`
     (avoids surprise 429s when the pool is exhausted), or to correlate a
     ``job_id`` from a previous response with what's actually still running.
 

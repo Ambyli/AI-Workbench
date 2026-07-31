@@ -5,7 +5,7 @@ Two backends, same conceptual shape:
 
 * ``InMemoryRegistry`` (from ``common.jobs.memory``) — sync, threading-based,
   ephemeral. Jobs auto-unregister when a context manager exits. For services
-  whose captures are synchronous and short-lived, like ``interceptor-api``.
+  whose captures are synchronous and short-lived, like ``interceptor``.
 
 * ``SqliteRegistry`` (from ``common.jobs.sqlite``) — async, ``aiosqlite``-backed,
   persistent. Jobs survive process restarts and only leave the store on

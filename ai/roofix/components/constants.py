@@ -189,8 +189,8 @@ EXTRACTED_PAYLOAD_FIELDS = (
 )
 
 
-# ── Scraper client: interceptor-api defaults ───────────────────────────────
-DEFAULT_INTERCEPTOR_URL = "http://interceptor-api:8080"
+# ── Scraper client: interceptor defaults ───────────────────────────────
+DEFAULT_INTERCEPTOR_URL = "http://interceptor:8080"
 DEFAULT_INIT_DATA_PATTERN = os.getenv(
     "ROOFIX_INIT_DATA_URL_PATTERN", r"roofix\.io/api/1\.1/init/data"
 )
@@ -200,7 +200,7 @@ DEFAULT_MGET_PATTERN = os.getenv(
 DEFAULT_PROFILE = os.getenv("ROOFIX_PROFILE_NAME", "roofix")
 
 # Max concurrent scrape requests the bridge will have in flight against
-# interceptor-api. MUST match (or be smaller than) interceptor-api's own
+# interceptor. MUST match (or be smaller than) interceptor's own
 # INTERCEPTOR_MAX_CONCURRENT — the bridge queues locally so we never blow
 # past the server's cap and get 409'd. asyncio.Semaphore serves acquirers
 # FIFO, so first-come-first-serve is automatic.
@@ -208,7 +208,7 @@ INTERCEPTOR_MAX_CONCURRENT = int(os.getenv("INTERCEPTOR_MAX_CONCURRENT", "8"))
 
 # Timeout on the full scrape (including queue wait + capture + reshape).
 # Extra long by design — the queue wait can be minutes on a burst tick.
-# Reached only if interceptor-api itself hangs or the capture window doesn't
+# Reached only if interceptor itself hangs or the capture window doesn't
 # resolve; the scraper's own request timeout is capture_window_seconds + 30.
 SCRAPE_TIMEOUT_SECONDS = int(os.getenv("SCRAPE_TIMEOUT_SECONDS", "600"))
 

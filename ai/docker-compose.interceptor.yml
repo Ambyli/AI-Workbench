@@ -4,13 +4,13 @@ networks:
     name: ai_shared
 
 services:
-  interceptor-api:
+  interceptor:
     networks:
       - shared
     build:
       context: ..
-      dockerfile: ai/Dockerfile.interceptor-api
-    container_name: interceptor-api
+      dockerfile: ai/Dockerfile.interceptor
+    container_name: interceptor
     restart: unless-stopped
     environment:
       - INTERCEPTOR_PROFILES_ROOT=/data/profiles
@@ -21,7 +21,7 @@ services:
       - INTERCEPTOR_MAX_CONCURRENT=${INTERCEPTOR_MAX_CONCURRENT:-8}
       - INTERCEPTOR_CAPTURE_WINDOW_SECONDS=${INTERCEPTOR_CAPTURE_WINDOW_SECONDS:-20}
     volumes:
-      - interceptor_api_data:/data
+      - interceptor_data:/data
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
       interval: 30s
@@ -30,4 +30,4 @@ services:
       retries: 3
 
 volumes:
-  interceptor_api_data:
+  interceptor_data:

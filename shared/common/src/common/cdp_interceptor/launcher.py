@@ -146,8 +146,18 @@ def start_browser(
     else:
         logger.debug("launcher.start_browser: launching visible")
 
+    # Container-only flags. Chromium as root inside Docker refuses to start
+    # without --no-sandbox, and it crashes on the default 64 MB /dev/shm.
+    # Windows uses the real Chrome install and keeps its own sandbox.
+    if sys.platform != "win32":
+        args += ["--no-sandbox", "--disable-dev-shm-usage"]
+
     args += ["--new-window", target_url]
-    return subprocess.Popen(args, stderr=subprocess.DEVNULL)
+    # stderr inherits the parent's — the interceptor container captures
+    # it, so chromium sandbox / shm / missing-lib failures land in
+    # `docker logs`. Was DEVNULL, which silently swallowed every startup
+    # failure inside the container.
+    return subprocess.Popen(args)
 
 
 def start_chrome(

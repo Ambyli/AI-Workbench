@@ -24,7 +24,7 @@ general_settings:
       methods: ["GET", "POST"]
       forward_headers: true
     - path: "/v1/interceptor"
-      target: "http://interceptor-api:8080"
+      target: "http://interceptor:8080"
       include_subpath: true
       methods: ["GET", "POST", "DELETE"]
       forward_headers: true
@@ -44,7 +44,7 @@ mcp_servers:
     transport: "http"
 
   interceptor:
-    url: http://interceptor-api:8080/mcp
+    url: http://interceptor:8080/mcp
     transport: "http"
 
   phoenix:

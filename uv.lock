@@ -13,7 +13,7 @@ members = [
     "classifier",
     "claude-usage-observer",
     "common",
-    "interceptor-api",
+    "interceptor",
     "roofix",
 ]
 
@@ -1276,9 +1276,9 @@ wheels = [
 ]
 
 [[package]]
-name = "interceptor-api"
+name = "interceptor"
 version = "0.1.0"
-source = { virtual = "ai/interceptor-api" }
+source = { virtual = "ai/interceptor" }
 dependencies = [
     { name = "common" },
     { name = "fastapi" },

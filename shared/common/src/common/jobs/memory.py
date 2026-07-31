@@ -4,7 +4,7 @@ InMemoryRegistry — sync, threading-based, ephemeral job tracking.
 Jobs live only inside a `with registry.job(...) as job:` block. On context
 exit (successful or via exception) the job is unregistered — snapshots of a
 completed job are not retained. This is the right shape for services where
-the caller synchronously waits on the result, like ``interceptor-api`` where
+the caller synchronously waits on the result, like ``interceptor`` where
 ``POST /capture`` blocks until the capture window closes.
 
 Cancellation is via ``threading.Event`` — a caller of `POST /jobs/{id}/cancel`
@@ -124,7 +124,7 @@ class InMemoryRegistry:
         (or the ``job()`` context manager exits, if using that). Callers that
         want auto-cleanup should prefer ``registry.job(...)`` as a ``with``
         block. Callers that need to keep a job "leaked" past the normal
-        request lifetime (e.g. interceptor-api's ``keep_open`` mode) can call
+        request lifetime (e.g. interceptor's ``keep_open`` mode) can call
         ``register`` directly and skip the ``unregister``.
         """
         if isinstance(metadata, BaseModel):

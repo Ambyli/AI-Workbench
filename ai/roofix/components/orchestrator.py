@@ -42,7 +42,7 @@ from components.constants import (
 # Bridge-side rate limit on concurrent scrape calls. Constructed fresh at the
 # top of each ``process_batch`` (so it binds to the currently-running event
 # loop) and passed to every coroutine that reaches ``_scrape_and_extract``.
-# MUST match (or be smaller than) interceptor-api's own INTERCEPTOR_MAX_CONCURRENT
+# MUST match (or be smaller than) interceptor's own INTERCEPTOR_MAX_CONCURRENT
 # so we queue locally rather than pounding the server and eating 409s.
 # asyncio.Semaphore serves waiters FIFO → first-come-first-serve automatic.
 
@@ -157,10 +157,10 @@ async def _scrape_and_extract(
 
     Concurrency: ``scrape_sem`` (created per-batch by process_batch) rate-limits
     outbound scrapes to ``INTERCEPTOR_MAX_CONCURRENT``. On a 25-email burst all
-    coroutines call this at once but only 8 hit interceptor-api at a time —
+    coroutines call this at once but only 8 hit interceptor at a time —
     the rest queue FIFO inside the semaphore. ``SCRAPE_TIMEOUT_SECONDS``
     (default 600s) is a safety net; ``asyncio.wait_for`` unblocks the whole
-    coroutine if interceptor-api hangs.
+    coroutine if interceptor hangs.
 
     Emits audit rows under ``scraper`` (fetch, no_docs, error, timeout) and
     ``extractor`` (extracted) stages as it goes. On the ``no_docs`` /

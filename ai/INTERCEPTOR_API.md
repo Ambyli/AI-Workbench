@@ -1,25 +1,25 @@
-# interceptor-api
+# interceptor
 
 Generic HTTP + MCP front-end for `common.cdp_interceptor`. Give it a URL and a list of URL regex patterns; it opens the URL in a headless Chrome under a named `--user-data-dir`, waits for a bounded window, and returns the JSON XHR/fetch bodies whose URLs matched any pattern.
 
-- **Container**: `interceptor-api` (internal only, port 8080 on `ai_shared`)
-- **Compose file**: `ai/docker-compose.interceptor-api.yml`
-- **Dockerfile**: `ai/Dockerfile.interceptor-api`
-- **Source**: `ai/interceptor-api/{app.py,profiles.py}`
+- **Container**: `interceptor` (internal only, port 8080 on `ai_shared`)
+- **Compose file**: `ai/docker-compose.interceptor.yml`
+- **Dockerfile**: `ai/Dockerfile.interceptor`
+- **Source**: `ai/interceptor/{app.py,profiles.py}`
 - **LiteLLM integration**: both MCP (`interceptor.capture_url`) and pass-through (`/v1/interceptor/*`), configured in `ai/litellm_config.yaml`
 
 ## Bring it up
 
 ```powershell
 docker network create ai_shared     # once, if not already present
-docker compose -f ai/docker-compose.interceptor-api.yml up --build -d
-docker compose -f ai/docker-compose.interceptor-api.yml logs -f interceptor-api
+docker compose -f ai/docker-compose.interceptor.yml up --build -d
+docker compose -f ai/docker-compose.interceptor.yml logs -f interceptor
 ```
 
 Health:
 
 ```powershell
-docker exec interceptor-api curl -s http://localhost:8080/health
+docker exec interceptor curl -s http://localhost:8080/health
 ```
 
 ## Endpoints
@@ -93,7 +93,7 @@ Each concurrent slot holds one running Chrome (~200–400 MB RAM) plus, when in 
 
 If Chrome crashes mid-capture (OOM, segfault, container killed) and leaves a stale `SingletonLock` in the base profile dir, `InterceptorClient.launch` clears the lock before every next launch (`shared/common/src/common/cdp_interceptor/client.py:159`, `clear_singleton_locks()`). No manual cleanup needed — the next request self-heals.
 
-If the interceptor-api process itself dies mid-request, temp-profile clones under `PROFILES_ROOT/.temp/` are left behind. They're swept on next startup by the FastAPI lifespan hook, so the volume doesn't accrue orphans across restarts.
+If the interceptor process itself dies mid-request, temp-profile clones under `PROFILES_ROOT/.temp/` are left behind. They're swept on next startup by the FastAPI lifespan hook, so the volume doesn't accrue orphans across restarts.
 
 ### Cookie freshness caveat
 
@@ -101,7 +101,7 @@ Fast-path captures write refreshed session cookies back to the base profile — 
 
 ## Refreshing a profile (operator flow)
 
-`interceptor-api` cannot present a login UI itself, so profiles are captured on an operator laptop and uploaded. The archive must be a **`.tar.gz`** — the endpoint uses `tarfile.open(mode="r:*")` (see `ai/interceptor-api/profiles.py:64`), which auto-detects gzip/bzip2/xz tar. Plain `.zip` will NOT work.
+`interceptor` cannot present a login UI itself, so profiles are captured on an operator laptop and uploaded. The archive must be a **`.tar.gz`** — the endpoint uses `tarfile.open(mode="r:*")` (see `ai/interceptor/profiles.py:64`), which auto-detects gzip/bzip2/xz tar. Plain `.zip` will NOT work.
 
 Profile names must match `[a-z0-9][a-z0-9_-]{0,63}` — no path separators, no leading dots.
 
@@ -205,7 +205,7 @@ If you land on the inbox (not the login page), the profile is good to package.
 
 | Env var | Default | Notes |
 |---|---|---|
-| `INTERCEPTOR_PROFILES_ROOT` | `/data/profiles` | Root under which named profiles live. Backed by the `interceptor_api_data` volume. Temp clones live under `<root>/.temp/`. |
+| `INTERCEPTOR_PROFILES_ROOT` | `/data/profiles` | Root under which named profiles live. Backed by the `interceptor_data` volume. Temp clones live under `<root>/.temp/`. |
 | `INTERCEPTOR_DEBUG_PORT` | `9224` | Base of the CDP debug port pool. Pool spans `[base, base + INTERCEPTOR_MAX_CONCURRENT)`. |
 | `INTERCEPTOR_MAX_CONCURRENT` | `8` | Max simultaneous `/capture` calls. Each slot = one Chrome (~200–400 MB RAM) + on same-profile collision one profile clone (~20–80 MB disk). See [Resource sizing](#resource-sizing). |
 | `INTERCEPTOR_CAPTURE_WINDOW_SECONDS` | `20` | Default capture window when a request omits `capture_window_seconds`. |
@@ -297,11 +297,11 @@ Cancel is also the way to reclaim a hung **`keep_open=true`** capture. Normally 
 - **`keep_open: true`** on a `/capture` request leaves Chrome running after the capture window. Handy for inspecting the DevTools console live. Cleanup is skipped for that request — the port stays held, the profile lock (fast path) or temp dir (slow path) stays allocated, and the job stays in `GET /jobs` with `phase="capturing"` — until the operator manually kills the container's chromium (or restarts the container). Concurrent captures against a different profile still work; concurrent captures against the same profile will fall into the slow path.
 - **`debug_logging: true`** prepends `const DEBUG_LOGGING = true;` to the injected `interceptor.js`, so `[interceptor]` traces appear in the browser console (visible via `--remote-debugging-port` if you attach a debugger, or in container logs if the JS logs escape via CDP).
 - **`captured_urls`** in the response lists every JSON XHR/fetch URL the interceptor saw — use it to reverse-engineer the right regex when a page fires unfamiliar endpoints.
-- **`job_id` prefix in logs.** Every log line emitted during a capture is tagged `[interceptor-api] [<job_id>] …` — grep for a specific job_id to isolate one capture's timeline out of interleaved concurrent output.
+- **`job_id` prefix in logs.** Every log line emitted during a capture is tagged `[interceptor] [<job_id>] …` — grep for a specific job_id to isolate one capture's timeline out of interleaved concurrent output.
 
 ### Running a capture in visible (non-headless) mode
 
-There's no `headless` field on the capture request — the service always tries to launch headless in production. Headless is gated by `InterceptorClient` on `session_sentinel=True AND session_ok exists in profile_dir` (see `shared/common/src/common/cdp_interceptor/client.py:177`). The service passes `session_sentinel=True` (`ai/interceptor-api/app.py:206`), so headless comes down to whether the `session_ok` sentinel file is present in the profile directory. Uploaded profiles get one written automatically by `unpack_profile()` (`ai/interceptor-api/profiles.py:69`).
+There's no `headless` field on the capture request — the service always tries to launch headless in production. Headless is gated by `InterceptorClient` on `session_sentinel=True AND session_ok exists in profile_dir` (see `shared/common/src/common/cdp_interceptor/client.py:177`). The service passes `session_sentinel=True` (`ai/interceptor/app.py:206`), so headless comes down to whether the `session_ok` sentinel file is present in the profile directory. Uploaded profiles get one written automatically by `unpack_profile()` (`ai/interceptor/profiles.py:69`).
 
 **To force a visible launch when debugging locally**, delete the sentinel before firing `/capture`. This only works on a machine with a display — inside the Docker container there's no display, so a "visible" launch there will fail to open a window.
 
@@ -322,7 +322,7 @@ There's no `headless` field on the capture request — the service always tries 
    Remove-Item "$env:INTERCEPTOR_PROFILES_ROOT\roofix\session_ok"
 
    # Container
-   docker exec interceptor-api rm /data/profiles/roofix/session_ok
+   docker exec interceptor rm /data/profiles/roofix/session_ok
    ```
 
 3. Verify — the response should now show `sentinel_present: false`:

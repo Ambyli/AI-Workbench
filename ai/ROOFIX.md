@@ -6,13 +6,13 @@ A single-container subsystem that keeps [Phoenix](https://phoenix-mcp.com) in sy
 |---|---|
 | `roofix` | Background worker. Fetches Roofix email via direct Gmail API → parses → decides (rules-first, LiteLLM fallback) → writes to Phoenix Postgres via direct psycopg2. Runs its own APScheduler. |
 
-Internal-only — no host ports published by default. For proposal-page fetches (Roofix has no public API) the bridge calls the sibling **`interceptor-api`** container (see [INTERCEPTOR_API.md](INTERCEPTOR_API.md)) — a generic CDP-driving service that owns the Roofix login session as a named `--user-data-dir` profile.
+Internal-only — no host ports published by default. For proposal-page fetches (Roofix has no public API) the bridge calls the sibling **`interceptor`** container (see [INTERCEPTOR_API.md](INTERCEPTOR_API.md)) — a generic CDP-driving service that owns the Roofix login session as a named `--user-data-dir` profile.
 
 ### Quick start
 
 ```bash
-# 1. interceptor-api must be up first — the bridge depends on it for proposal fetches.
-docker compose -f ai/docker-compose.interceptor-api.yml up -d
+# 1. interceptor must be up first — the bridge depends on it for proposal fetches.
+docker compose -f ai/docker-compose.interceptor.yml up -d
 
 # 2. Then the bridge.
 docker compose -f ai/docker-compose.roofix.yml up -d
@@ -20,7 +20,7 @@ docker compose -f ai/docker-compose.roofix.yml up -d
 
 Default `DRY_RUN=true` — the bridge fetches, parses, decides, and logs, but does **not** write to Phoenix. Flip to `false` in `.env` only after watching a full run.
 
-Before the bridge can hydrate proposals, upload a Roofix profile to interceptor-api once — see [INTERCEPTOR_API.md § Refreshing a profile](INTERCEPTOR_API.md#refreshing-a-profile-operator-flow). The uploaded profile lives at `/data/profiles/roofix/` inside the interceptor-api container.
+Before the bridge can hydrate proposals, upload a Roofix profile to interceptor once — see [INTERCEPTOR_API.md § Refreshing a profile](INTERCEPTOR_API.md#refreshing-a-profile-operator-flow). The uploaded profile lives at `/data/profiles/roofix/` inside the interceptor container.
 
 ### Endpoints
 
@@ -39,7 +39,7 @@ docker exec -it litellm curl http://roofix:8080/status
 docker exec -it litellm curl -X POST http://roofix:8080/tick
 ```
 
-For interceptor-api endpoints (proposal capture, profile refresh), see [INTERCEPTOR_API.md](INTERCEPTOR_API.md).
+For interceptor endpoints (proposal capture, profile refresh), see [INTERCEPTOR_API.md](INTERCEPTOR_API.md).
 
 ### How it works
 
@@ -55,7 +55,7 @@ Phoenix DB (psycopg2) ◄─────►│
                              │  POST /capture
                              ▼
                      ┌────────────────┐
-                     │ interceptor-api│  ── CDP ─► roofix.io
+                     │ interceptor│  ── CDP ─► roofix.io
                      └────────────────┘
 ```
 
@@ -69,7 +69,7 @@ Every `TICK_INTERVAL_SECONDS` (default 300s) the bridge:
 4. The brain decides: `update_chatter`, `update_milestone`, `ignore`, or `escalate`. Rules handle the clear cases; anything ambiguous escalates to LiteLLM (the "AI fallback"), which returns the same Decision shape.
 5. In DRY_RUN mode, the intended SQL + params are logged. Otherwise the writes are executed via psycopg2.
 
-Ambiguous or thin `Estimate` / `Estimate Complete` events cause the bridge to call `RoofixScraperClient.get_proposal(tracking_url)` (`ai/roofix/components/roofix_scraper_client.py`) — which POSTs the tracking URL + Roofix's Bubble init/data + elasticsearch/mget URL patterns to `interceptor-api`'s `/capture` and reshapes the response into the `init_data` + `mget_docs` dict that `proposal_extractor.extract_proposal` consumes.
+Ambiguous or thin `Estimate` / `Estimate Complete` events cause the bridge to call `RoofixScraperClient.get_proposal(tracking_url)` (`ai/roofix/components/roofix_scraper_client.py`) — which POSTs the tracking URL + Roofix's Bubble init/data + elasticsearch/mget URL patterns to `interceptor`'s `/capture` and reshapes the response into the `init_data` + `mget_docs` dict that `proposal_extractor.extract_proposal` consumes.
 
 ### Execution matrix (what `_execute` does per action)
 
@@ -117,9 +117,9 @@ Sub-cases that short-circuit before the action branches:
 | `ROOFIX_DB_PASSWORD` | _(required — no default)_ | Password for `roofix-db`. Compose fails to bring the service up if this is empty. Don't commit it to git. |
 | `ROOFIX_DB_NAME` | `roofix` | Database name inside `roofix-db`. |
 | `ROOFIX_DB_HOST_PORT` | `5433` | Host port `roofix-db` binds to (5432 → host `5433` by default) so remote clients can connect. Override to `5432` if that port is free on this host. |
-| `INTERCEPTOR_API_URL` | `http://interceptor-api:8080` | Sibling generic CDP service the bridge POSTs `/capture` to. |
-| `ROOFIX_PROFILE_NAME` | `roofix` | Which named profile inside interceptor-api holds Roofix session cookies. Refresh via `POST /profiles/roofix/refresh` on interceptor-api. |
-| `ROOFIX_CAPTURE_WINDOW_SECONDS` | `30` | How long interceptor-api keeps Chrome alive per `/capture` call collecting XHRs. |
+| `INTERCEPTOR_URL` | `http://interceptor:8080` | Sibling generic CDP service the bridge POSTs `/capture` to. |
+| `ROOFIX_PROFILE_NAME` | `roofix` | Which named profile inside interceptor holds Roofix session cookies. Refresh via `POST /profiles/roofix/refresh` on interceptor. |
+| `ROOFIX_CAPTURE_WINDOW_SECONDS` | `30` | How long interceptor keeps Chrome alive per `/capture` call collecting XHRs. |
 | `ROOFIX_LOGIN_TIMEOUT` | `300` | Seconds to wait for a login redirect to resolve before flagging `login_wall`. |
 | `ROOFIX_MAX_MATCHES_PER_PATTERN` | `5` | Cap on captures per URL pattern returned in one `/capture` response. |
 | `ROOFIX_INIT_DATA_URL_PATTERN` | `roofix\.io/api/1\.1/init/data` | Regex matched against captured XHR URLs to identify Bubble's page-hydrate endpoint. Override if Bubble ever renames it. |
@@ -168,9 +168,9 @@ Sufficient for polling and mark-as-read.
 capture `token.json` on your laptop and ship it into the container. Nothing
 machine-bound about them (unlike Chrome's saved passwords).
 
-### Session profile (Roofix on interceptor-api)
+### Session profile (Roofix on interceptor)
 
-`interceptor-api` owns Roofix's login state as a named profile called `roofix` (configurable via `ROOFIX_PROFILE_NAME`). Every `/capture` call the bridge makes reuses that profile — no login prompt until the session expires.
+`interceptor` owns Roofix's login state as a named profile called `roofix` (configurable via `ROOFIX_PROFILE_NAME`). Every `/capture` call the bridge makes reuses that profile — no login prompt until the session expires.
 
 **Canonical operator guide for capturing + uploading a profile: [INTERCEPTOR_API.md § Refreshing a profile](INTERCEPTOR_API.md#refreshing-a-profile-operator-flow).** In short:
 
@@ -180,21 +180,21 @@ tar czf roofix.tgz -C "C:\Users\<you>\.zeo\roofix_profile" .
 curl -X POST -F "archive=@roofix.tgz" http://<host>:8080/profiles/roofix/refresh
 ```
 
-The archive lands at `/data/profiles/roofix/` inside the interceptor-api container, backed by the `interceptor_api_data` volume. **Persistence:** survives `docker compose down`, restarts, rebuilds. **Destroyed by:** `docker compose -f ai/docker-compose.interceptor-api.yml down -v`.
+The archive lands at `/data/profiles/roofix/` inside the interceptor container, backed by the `interceptor_data` volume. **Persistence:** survives `docker compose down`, restarts, rebuilds. **Destroyed by:** `docker compose -f ai/docker-compose.interceptor.yml down -v`.
 
 Tracking URLs from Roofix notification emails redirect to the proposal without login, so many captures succeed even against an empty profile — but a warm profile is required for direct `roofix.io/project/{id}` fetches and covers you when a tokenized link expires.
 
 #### When to re-capture
 
-Sessions survive **days to weeks** on the fast path (single capture at a time refreshes cookies back to the base profile). Same-profile concurrent captures against interceptor-api use a temp clone and don't contribute cookie freshness to the base profile — under sustained same-profile burst load the base ages faster. Re-capture when:
+Sessions survive **days to weeks** on the fast path (single capture at a time refreshes cookies back to the base profile). Same-profile concurrent captures against interceptor use a temp clone and don't contribute cookie freshness to the base profile — under sustained same-profile burst load the base ages faster. Re-capture when:
 
 1. **First time ever** — no `roofix` profile has been uploaded yet.
 2. **Roofix expired the session** — the bridge log shows `login_wall: true` on `/capture` responses.
-3. **You wiped the volume** — `docker compose -f ai/docker-compose.interceptor-api.yml down -v`.
+3. **You wiped the volume** — `docker compose -f ai/docker-compose.interceptor.yml down -v`.
 
 #### Concurrency + cookie caveats
 
-- **Concurrent `/capture` calls collide on the debug port.** interceptor-api serializes captures with a module-level lock (`ai/interceptor-api/app.py:63`) and returns **HTTP 409** if a capture is already running — the bridge should backoff-and-retry rather than fan out.
+- **Concurrent `/capture` calls collide on the debug port.** interceptor serializes captures with a module-level lock (`ai/interceptor/app.py:63`) and returns **HTTP 409** if a capture is already running — the bridge should backoff-and-retry rather than fan out.
 - **Cross-machine password caveat.** Cookies in a shipped profile work fine on Linux Docker. Chrome's saved-password blob (`Login Data`) is encrypted with a machine-bound key and won't decrypt inside the container — the container reuses cookies only. If they die you re-capture on your laptop and re-upload.
 
 ### Connecting to the processed-store DB
@@ -282,7 +282,7 @@ docker compose -f ai/docker-compose.roofix.yml start roofix
 
 ### Proposal extractor
 
-The bridge takes the reshaped response from `RoofixScraperClient.get_proposal(tracking_url)` — the client wraps `interceptor-api`'s `/capture` and re-derives the legacy `init_data` + `mget_docs` shape — and turns it into a Phoenix-writable dataclass via `components.proposal_extractor.extract_proposal`. Pure function, no I/O.
+The bridge takes the reshaped response from `RoofixScraperClient.get_proposal(tracking_url)` — the client wraps `interceptor`'s `/capture` and re-derives the legacy `init_data` + `mget_docs` shape — and turns it into a Phoenix-writable dataclass via `components.proposal_extractor.extract_proposal`. Pure function, no I/O.
 
 **Why the extractor reads from both `init_data` AND `mget_docs`.** Roofix uses two different endpoints to hydrate a project page and each carries different data:
 
@@ -329,9 +329,9 @@ Redundancy is the point: if Roofix changes one field's behavior we still detect 
 2. **Bring up the stack**:
 
    ```bash
-   docker compose -f ai/docker-compose.interceptor-api.yml up -d --build
+   docker compose -f ai/docker-compose.interceptor.yml up -d --build
    docker compose -f ai/docker-compose.roofix.yml up -d --build
-   docker exec -it interceptor-api curl http://localhost:8080/health
+   docker exec -it interceptor curl http://localhost:8080/health
    docker exec -it roofix curl http://localhost:8080/status
    ```
 
@@ -380,7 +380,7 @@ ai/
         orchestrator.py               parse → resolve → decide → execute
         gmail_client.py               Gmail API listener (OAuth 2.0)
         phoenix_client.py             Phoenix Postgres client (psycopg2, reads + writes)
-        roofix_scraper_client.py      HTTP client → interceptor-api /capture, reshapes to init_data+mget_docs
+        roofix_scraper_client.py      HTTP client → interceptor /capture, reshapes to init_data+mget_docs
         notifier.py                   Phase 1 stub — CloudTalk / rep SMS
       config/
         field_mapping.json            Roofix event → Phoenix milestone map (Michael's file)
@@ -390,7 +390,7 @@ ai/
         test_brain.py                 offline brain/rules suite
 ```
 
-Chrome-under-CDP lives in the sibling `ai/interceptor-api/` service (see `INTERCEPTOR_API.md`).
+Chrome-under-CDP lives in the sibling `ai/interceptor/` service (see `INTERCEPTOR_API.md`).
 
 ### Known limitations / TODOs
 
@@ -398,4 +398,4 @@ Chrome-under-CDP lives in the sibling `ai/interceptor-api/` service (see `INTERC
 - **`field_mapping.json` is a stub.** Michael owns the Roofix-event → Phoenix (block_name, status_id) mapping. `update_milestone` will log a "no milestone mapping" warning and skip until the file is filled in.
 - **`PHOENIX_AGENT_USER_ID` must be provisioned manually.** Create a dedicated Phoenix agent user and set the env var so writes are attributable.
 - **Phase 1** — `create_project` and `notify_rep` paths exist but are stubbed. Wire a CloudTalk MCP when needed.
-- **Session refresh is manual.** interceptor-api cannot present a login UI — operators capture a profile on a laptop and upload the `.tgz` to `/profiles/roofix/refresh` (see [INTERCEPTOR_API.md § Refreshing a profile](INTERCEPTOR_API.md#refreshing-a-profile-operator-flow)).
+- **Session refresh is manual.** interceptor cannot present a login UI — operators capture a profile on a laptop and upload the `.tgz` to `/profiles/roofix/refresh` (see [INTERCEPTOR_API.md § Refreshing a profile](INTERCEPTOR_API.md#refreshing-a-profile-operator-flow)).

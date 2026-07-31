@@ -54,10 +54,10 @@ Key variables:
 | `ROOFIX_DB_HOST_PORT` | `5433` | Roofix Bridge: host port `roofix-db` binds to for remote connections. Default avoids clashing with Phoenix / a local Postgres on 5432. |
 | `PHOENIX_AGENT_USER_ID` | _(unset — required for writes)_ | Roofix Bridge: dedicated Phoenix user id |
 | `PHOENIX_ROOFIX_ID_COLUMN` | `migration_external_id` | Roofix Bridge: column where Roofix ids are stamped |
-| `INTERCEPTOR_API_URL` | `http://interceptor-api:8080` | Roofix Bridge → interceptor-api base URL |
-| `ROOFIX_PROFILE_NAME` | `roofix` | Named profile inside interceptor-api holding Roofix session cookies |
-| `INTERCEPTOR_PROFILES_ROOT` | `/data/profiles` | interceptor-api: root under which named `--user-data-dir` profiles live |
-| `INTERCEPTOR_MAX_CONCURRENT` | `8` | interceptor-api: max simultaneous `/capture` calls (port pool size). Each slot ≈ one Chrome + optional profile clone — see `ai/INTERCEPTOR_API.md § Resource sizing` |
+| `INTERCEPTOR_URL` | `http://interceptor:8080` | Roofix Bridge → interceptor base URL |
+| `ROOFIX_PROFILE_NAME` | `roofix` | Named profile inside interceptor holding Roofix session cookies |
+| `INTERCEPTOR_PROFILES_ROOT` | `/data/profiles` | interceptor: root under which named `--user-data-dir` profiles live |
+| `INTERCEPTOR_MAX_CONCURRENT` | `8` | interceptor: max simultaneous `/capture` calls (port pool size). Each slot ≈ one Chrome + optional profile clone — see `ai/INTERCEPTOR_API.md § Resource sizing` |
 
 ## Threading Model — Read Before Touching Anything
 
@@ -194,18 +194,18 @@ curl -X POST https://phoenix-mcp.com/api-token \
 
 Any Python package or module that could plausibly be reused across multiple projects — current or future — MUST live in `shared/common/`, not in the project directory that first needs it. This includes: scraping / CDP / browser helpers, MCP protocol clients, LiteLLM / model client wrappers, env + logging boilerplate, and cross-cutting utilities.
 
-**Test:** before creating a new module inside `widget/`, `ai/roofix/`, `ai/interceptor-api/`, or any future project dir, ask *"could a second project want this in six months?"* If yes, it goes in `shared/common/` under an appropriate subpackage and the project imports it via the uv workspace (`common = { workspace = true }` in the project's `pyproject.toml`, backed by the root `pyproject.toml`'s `[tool.uv.workspace]` declaration).
+**Test:** before creating a new module inside `widget/`, `ai/roofix/`, `ai/interceptor/`, or any future project dir, ask *"could a second project want this in six months?"* If yes, it goes in `shared/common/` under an appropriate subpackage and the project imports it via the uv workspace (`common = { workspace = true }` in the project's `pyproject.toml`, backed by the root `pyproject.toml`'s `[tool.uv.workspace]` declaration).
 
 Project-specific business logic (Roofix event parsing, brain decision rules, widget's tray UI, etc.) stays in the project directory — the test is reusability, not size.
 
 Adding a new capability to `shared/common/`: create the subpackage under `shared/common/src/common/<name>/`, expose the public API from its `__init__.py`, add tests under `shared/common/tests/`. No pyproject changes needed in consuming projects unless a new external dep is introduced.
 
 **Current shared subpackages:**
-- `common.cdp_interceptor` — Chrome DevTools Protocol interceptor (used by `interceptor-api`, `widget`)
+- `common.cdp_interceptor` — Chrome DevTools Protocol interceptor (used by `interceptor`, `widget`)
 - `common.env` — walk-up `.env` loader
 - `common.logging_setup` — CSV audit logger + stdlib configuration
 - `common.processed_store` — Gmail message-id dedup cache (used by `roofix`)
-- `common.jobs` — id-addressable job tracking with two backends: `InMemoryRegistry` (sync, ephemeral — used by `interceptor-api`) and `SqliteRegistry` (async, persistent — used by `classifier`), plus a `build_router` FastAPI factory for the standard `GET /jobs`, `GET /jobs/{id}`, `POST /jobs/{id}/cancel`, `DELETE /jobs/{id}` endpoints. See [`shared/common/src/common/jobs/__init__.py`](shared/common/src/common/jobs/__init__.py) for backend selection guidance.
+- `common.jobs` — id-addressable job tracking with two backends: `InMemoryRegistry` (sync, ephemeral — used by `interceptor`) and `SqliteRegistry` (async, persistent — used by `classifier`), plus a `build_router` FastAPI factory for the standard `GET /jobs`, `GET /jobs/{id}`, `POST /jobs/{id}/cancel`, `DELETE /jobs/{id}` endpoints. See [`shared/common/src/common/jobs/__init__.py`](shared/common/src/common/jobs/__init__.py) for backend selection guidance.
 
 ## AI Infrastructure — Compose Topology
 

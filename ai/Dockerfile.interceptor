@@ -1,4 +1,4 @@
-# Build context is the REPO ROOT (see ai/docker-compose.interceptor-api.yml:
+# Build context is the REPO ROOT (see ai/docker-compose.interceptor.yml:
 #   context: ..) so we can copy the shared workspace package alongside the
 # service.
 
@@ -7,7 +7,7 @@ FROM python:3.11-slim
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     UV_NO_CACHE=1 \
-    PYTHONPATH=/app/ai/interceptor-api
+    PYTHONPATH=/app/ai/interceptor
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
@@ -17,10 +17,10 @@ WORKDIR /app
 # lands first so the service's `common` dep resolves via the workspace.
 COPY pyproject.toml .
 COPY shared/common ./shared/common
-COPY ai/interceptor-api/pyproject.toml ./ai/interceptor-api/
+COPY ai/interceptor/pyproject.toml ./ai/interceptor/
 
 # Sync only this service's dep graph (transitively pulls common).
-RUN uv sync --package interceptor-api --no-dev
+RUN uv sync --package interceptor --no-dev
 
 # Playwright ships a downloader for chromium. --with-deps installs the native
 # libraries chromium needs (libnss3, libatk1, etc.) inside the container so
@@ -30,9 +30,9 @@ RUN uv run playwright install chromium --with-deps
 
 # Service code last so a code-only change doesn't invalidate the (slow) sync +
 # playwright layers.
-COPY ai/interceptor-api/app.py ai/interceptor-api/profiles.py ./ai/interceptor-api/
+COPY ai/interceptor/app.py ai/interceptor/profiles.py ./ai/interceptor/
 
-WORKDIR /app/ai/interceptor-api
+WORKDIR /app/ai/interceptor
 EXPOSE 8080
 
 CMD ["uv", "run", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"]

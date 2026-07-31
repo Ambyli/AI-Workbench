@@ -1,5 +1,5 @@
 """
-Named-profile management for interceptor-api.
+Named-profile management for interceptor.
 
 Each named profile is a Chrome ``--user-data-dir`` under ``PROFILES_ROOT``.
 Keeping them separate means one container can hold live sessions for
@@ -131,7 +131,7 @@ def clone_profile(name: str) -> Path:
     and return the temp dir's path.
 
     Callers use this on the slow path when the base profile is already in use
-    by another concurrent capture. See ``ai/interceptor-api/app.py`` for the
+    by another concurrent capture. See ``ai/interceptor/app.py`` for the
     fast/slow path logic.
 
     Raw ``shutil.copytree`` of a live profile is safe: Chrome's on-disk stores
@@ -184,7 +184,7 @@ def sweep_temp_profiles() -> int:
             count += 1
         except Exception as exc:
             print(
-                f"[interceptor-api] sweep_temp_profiles: could not remove {child}: {exc}",
+                f"[interceptor] sweep_temp_profiles: could not remove {child}: {exc}",
                 file=sys.stderr,
                 flush=True,
             )

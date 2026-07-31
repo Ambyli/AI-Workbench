@@ -8,8 +8,8 @@ services:
     networks:
       - shared
     build:
-      context: .
-      dockerfile: classifier/Dockerfile
+      context: ..
+      dockerfile: ai/classifier/Dockerfile
     container_name: classifier
     restart: unless-stopped
     ports:

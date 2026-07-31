@@ -197,6 +197,13 @@ Project-specific business logic (Roofix event parsing, brain decision rules, wid
 
 Adding a new capability to `shared/common/`: create the subpackage under `shared/common/src/common/<name>/`, expose the public API from its `__init__.py`, add tests under `shared/common/tests/`. No pyproject changes needed in consuming projects unless a new external dep is introduced.
 
+**Current shared subpackages:**
+- `common.cdp_interceptor` — Chrome DevTools Protocol interceptor (used by `interceptor-api`, `widget`)
+- `common.env` — walk-up `.env` loader
+- `common.logging_setup` — CSV audit logger + stdlib configuration
+- `common.processed_store` — Gmail message-id dedup cache (used by `roofix`)
+- `common.jobs` — id-addressable job tracking with two backends: `InMemoryRegistry` (sync, ephemeral — used by `interceptor-api`) and `SqliteRegistry` (async, persistent — used by `classifier`), plus a `build_router` FastAPI factory for the standard `GET /jobs`, `GET /jobs/{id}`, `POST /jobs/{id}/cancel`, `DELETE /jobs/{id}` endpoints. See [`shared/common/src/common/jobs/__init__.py`](shared/common/src/common/jobs/__init__.py) for backend selection guidance.
+
 ## AI Infrastructure — Compose Topology
 
 The Docker Compose services in `ai/` are documented in [`ai/AI_INFRA.md`](ai/AI_INFRA.md), which contains:

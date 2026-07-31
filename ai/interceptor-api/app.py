@@ -16,6 +16,11 @@ Concurrency (see ai/INTERCEPTOR_API.md § Concurrency for the operator view):
   * Chrome crash recovery is transparent: ``InterceptorClient.launch``
     already calls ``clear_singleton_locks`` before every start.
 
+Job tracking (registry + endpoints) lives in ``common.jobs`` — see
+``shared/common/src/common/jobs/``. Both the ``GET /jobs`` observability
+endpoints and the ``POST /jobs/{id}/cancel`` operator hook are mounted via
+``build_router`` there.
+
 Endpoints:
     GET    /health                        healthcheck
     GET    /profiles                      list all named profiles
@@ -48,10 +53,8 @@ import sys
 import threading
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
-from uuid import uuid4
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastmcp import FastMCP
@@ -62,6 +65,8 @@ from common.cdp_interceptor import (
     Capture,
     InterceptorClient,
 )
+from common.jobs import InMemoryRegistry
+from common.jobs.router import build_router
 
 import profiles
 
@@ -74,13 +79,11 @@ DEFAULT_CAPTURE_WINDOW_SECONDS = int(
 )
 
 
-def _log(msg: str, job_id: Optional[str] = None) -> None:
-    """Emit a stderr log line. If ``job_id`` is set, prefix it so interleaved
-    concurrent-capture logs stay readable."""
-    prefix = f"[interceptor-api]"
-    if job_id:
-        prefix += f" [{job_id}]"
-    print(f"{prefix} {msg}", file=sys.stderr, flush=True)
+def _log(msg: str) -> None:
+    """Stderr log line without a job_id (startup / global events). Per-job
+    log lines go through ``job.log(...)`` on the registry's ``JobHandle``,
+    which prepends the job_id tag automatically."""
+    print(f"[interceptor-api] {msg}", file=sys.stderr, flush=True)
 
 
 # ── Port pool ──────────────────────────────────────────────────────────────
@@ -120,105 +123,21 @@ def _get_profile_lock(name: str) -> threading.Lock:
         return lock
 
 
-# ── Active-job registry ────────────────────────────────────────────────────
-class JobInfo(BaseModel):
-    job_id: str
+# ── Shared job registry ────────────────────────────────────────────────────
+# In-memory backend from common.jobs — auto-mounts GET /jobs, GET /jobs/{id},
+# and POST /jobs/{id}/cancel via build_router below.
+class InterceptorMetadata(BaseModel):
+    """Interceptor-api's per-job metadata payload. Serialized into the
+    ``metadata`` field of ``JobBase`` for ``GET /jobs`` responses."""
+
     profile: str
     url: str
-    started_at: str  # ISO 8601 UTC
-    elapsed_seconds: float
     port: int
     used_base_profile: bool
-    temp_dir: Optional[str]
-    phase: str  # "cloning" | "capturing" | "cleaning_up"
+    temp_dir: Optional[str] = None
 
 
-class JobsListResponse(BaseModel):
-    max_concurrent: int
-    active_count: int
-    available: int
-    jobs: list[JobInfo]
-
-
-# Internal record — mutable, protected by _jobs_lock. Never exposed directly;
-# _snapshot_jobs() copies into immutable JobInfo pydantic models under lock.
-_active_jobs: dict[str, dict[str, Any]] = {}
-_jobs_lock = threading.Lock()
-
-
-def _register_job(
-    job_id: str,
-    profile: str,
-    url: str,
-    port: int,
-    used_base_profile: bool,
-    temp_dir: Optional[Path],
-    phase: str,
-    cancel_event: threading.Event,
-) -> None:
-    with _jobs_lock:
-        _active_jobs[job_id] = {
-            "job_id": job_id,
-            "profile": profile,
-            "url": url,
-            "started_at": datetime.now(timezone.utc).isoformat(),
-            "started_monotonic": time.monotonic(),
-            "port": port,
-            "used_base_profile": used_base_profile,
-            "temp_dir": str(temp_dir) if temp_dir is not None else None,
-            "phase": phase,
-            "cancel_event": cancel_event,
-        }
-
-
-def _update_job_phase(job_id: str, phase: str) -> None:
-    with _jobs_lock:
-        job = _active_jobs.get(job_id)
-        if job is not None:
-            job["phase"] = phase
-
-
-def _unregister_job(job_id: str) -> None:
-    with _jobs_lock:
-        _active_jobs.pop(job_id, None)
-
-
-def _snapshot_jobs() -> list[JobInfo]:
-    now = time.monotonic()
-    with _jobs_lock:
-        return [
-            JobInfo(
-                job_id=j["job_id"],
-                profile=j["profile"],
-                url=j["url"],
-                started_at=j["started_at"],
-                elapsed_seconds=round(now - j["started_monotonic"], 3),
-                port=j["port"],
-                used_base_profile=j["used_base_profile"],
-                temp_dir=j["temp_dir"],
-                phase=j["phase"],
-            )
-            for j in _active_jobs.values()
-        ]
-
-
-def _snapshot_job(job_id: str) -> Optional[JobInfo]:
-    now = time.monotonic()
-    with _jobs_lock:
-        j = _active_jobs.get(job_id)
-        if j is None:
-            return None
-        return JobInfo(
-            job_id=j["job_id"],
-            profile=j["profile"],
-            url=j["url"],
-            started_at=j["started_at"],
-            elapsed_seconds=round(now - j["started_monotonic"], 3),
-            port=j["port"],
-            used_base_profile=j["used_base_profile"],
-            temp_dir=j["temp_dir"],
-            phase=j["phase"],
-        )
+_registry: InMemoryRegistry = InMemoryRegistry(max_concurrent=MAX_CONCURRENT)
 
 
 # ── FastAPI + FastMCP mount ────────────────────────────────────────────────
@@ -242,6 +161,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Interceptor API", lifespan=lifespan)
+app.include_router(build_router(_registry, include_cancel=True))
 
 
 # ── Request / response models ───────────────────────────────────────────────
@@ -270,7 +190,7 @@ class CaptureRequest(BaseModel):
         default=False,
         description="If true, leave Chrome running after the window. Useful "
         "for interactive debugging; the job also stays in GET /jobs until the "
-        "operator manually kills Chrome.",
+        "operator manually kills Chrome (or POSTs /jobs/{id}/cancel).",
     )
     login_timeout: int = Field(default=300, ge=1)
     max_matches_per_pattern: Optional[int] = Field(default=None, ge=1)
@@ -335,60 +255,6 @@ def profiles_delete(name: str) -> dict:
         raise HTTPException(status_code=400, detail=str(e))
 
 
-# ── Job observability endpoints ────────────────────────────────────────────
-@app.get("/jobs", response_model=JobsListResponse)
-def jobs_list() -> JobsListResponse:
-    """Snapshot of the port pool + all currently-running captures.
-    Completed captures are NOT retained — they disappear from the list as
-    soon as they return to their caller."""
-    jobs = _snapshot_jobs()
-    return JobsListResponse(
-        max_concurrent=MAX_CONCURRENT,
-        active_count=len(jobs),
-        available=MAX_CONCURRENT - len(jobs),
-        jobs=jobs,
-    )
-
-
-@app.get("/jobs/{job_id}", response_model=JobInfo)
-def jobs_get(job_id: str) -> JobInfo:
-    """Detail on one in-flight capture. Returns 404 if the id isn't currently
-    active — a completed job returns 404 the moment it finishes."""
-    job = _snapshot_job(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail=f"no active job {job_id!r}")
-    return job
-
-
-@app.post("/jobs/{job_id}/cancel")
-def jobs_cancel(job_id: str) -> dict:
-    """Abort an in-flight capture. Signals the running ``_run_capture`` to
-    wake early, terminate Chrome, and clean up. The ``POST /capture`` caller
-    still gets a normal ``CaptureResponse`` back with ``status="cancelled"``
-    plus any partial matches collected before the abort.
-
-    Cancel is also the way to reclaim a hung ``keep_open=true`` capture —
-    the ``keep_open`` cleanup-skip is bypassed when the cancel event is set.
-
-    Returns:
-        200 → ``{"job_id", "cancelled": true, "was_phase": "<phase>"}``
-        404 → job unknown or already completed
-        409 → job already in ``cleaning_up`` (too late to cancel)
-    """
-    with _jobs_lock:
-        job = _active_jobs.get(job_id)
-        if job is None:
-            raise HTTPException(status_code=404, detail=f"no active job {job_id!r}")
-        phase = job["phase"]
-        if phase == "cleaning_up":
-            raise HTTPException(
-                status_code=409,
-                detail=f"job {job_id!r} is already cleaning up — too late to cancel",
-            )
-        job["cancel_event"].set()
-    return {"job_id": job_id, "cancelled": True, "was_phase": phase}
-
-
 # ── Capture core (shared by HTTP + MCP) ─────────────────────────────────────
 def _run_capture(req: CaptureRequest) -> CaptureResponse:
     """Perform one capture — handles fast/slow path selection, port pool,
@@ -421,60 +287,52 @@ def _run_capture(req: CaptureRequest) -> CaptureResponse:
             ),
         )
 
-    job_id = uuid4().hex[:12]
-    cancel_event = threading.Event()
     profile_lock = _get_profile_lock(req.profile)
     used_base = profile_lock.acquire(blocking=False)
 
     temp_dir: Optional[Path] = None
     profile_dir: str
+    job = None  # populated after we know fast/slow path
     try:
         if used_base:
             profile_dir = str(profiles.profile_path(req.profile))
-            _register_job(
-                job_id=job_id,
-                profile=req.profile,
-                url=req.url,
-                port=port,
-                used_base_profile=True,
-                temp_dir=None,
-                phase="capturing",
-                cancel_event=cancel_event,
+            job = _registry.register(
+                InterceptorMetadata(
+                    profile=req.profile,
+                    url=req.url,
+                    port=port,
+                    used_base_profile=True,
+                    temp_dir=None,
+                ),
+                initial_phase="capturing",
             )
-            _log(
+            job.log(
                 f"start  profile={req.profile}  path=base  port={port}  "
-                f"keep_open={req.keep_open}  patterns={len(compiled)}  url={req.url}",
-                job_id=job_id,
+                f"keep_open={req.keep_open}  patterns={len(compiled)}  url={req.url}"
             )
         else:
-            _register_job(
-                job_id=job_id,
-                profile=req.profile,
-                url=req.url,
-                port=port,
-                used_base_profile=False,
-                temp_dir=None,
-                phase="cloning",
-                cancel_event=cancel_event,
+            job = _registry.register(
+                InterceptorMetadata(
+                    profile=req.profile,
+                    url=req.url,
+                    port=port,
+                    used_base_profile=False,
+                    temp_dir=None,
+                ),
+                initial_phase="cloning",
             )
-            _log(
-                f"clone  profile={req.profile}  base is in use — cloning to temp",
-                job_id=job_id,
-            )
+            job.log(f"clone  profile={req.profile}  base is in use — cloning to temp")
             try:
                 temp_dir = profiles.clone_profile(req.profile)
             except FileNotFoundError as e:
-                _unregister_job(job_id)
+                _registry.unregister(job.job_id)
                 raise HTTPException(status_code=400, detail=str(e))
             profile_dir = str(temp_dir)
-            _update_job_phase(job_id, "capturing")
-            with _jobs_lock:
-                if job_id in _active_jobs:
-                    _active_jobs[job_id]["temp_dir"] = profile_dir
-            _log(
+            job.set_phase("capturing")
+            job.update_metadata(temp_dir=profile_dir)
+            job.log(
                 f"start  profile={req.profile}  path={profile_dir}  port={port}  "
-                f"keep_open={req.keep_open}  patterns={len(compiled)}  url={req.url}",
-                job_id=job_id,
+                f"keep_open={req.keep_open}  patterns={len(compiled)}  url={req.url}"
             )
 
         # ── Collector callbacks ────────────────────────────────────────────
@@ -494,11 +352,11 @@ def _run_capture(req: CaptureRequest) -> CaptureResponse:
                         ):
                             return
                         bucket.append(CaptureMatch(url=cap.url, body=cap.body))
-                        _log(f"match  {pattern_str}  {cap.url[:110]}", job_id=job_id)
+                        job.log(f"match  {pattern_str}  {cap.url[:110]}")
                         return
 
         def on_status(status: str, error: Optional[str]) -> None:
-            _log(f"status  {status}  {error or ''}", job_id=job_id)
+            job.log(f"status  {status}  {error or ''}")
 
         # session_sentinel=True + the sentinel that profiles.unpack_profile
         # writes on upload = InterceptorClient launches headless on the first
@@ -524,18 +382,17 @@ def _run_capture(req: CaptureRequest) -> CaptureResponse:
             raise HTTPException(status_code=500, detail=str(e))
 
         # Wait for the capture window, but wake early if cancelled.
-        # Event.wait returns True on set, False on timeout.
-        cancelled = cancel_event.wait(timeout=req.capture_window_seconds)
+        # wait_or_cancel returns True on cancel, False on timeout.
+        cancelled = job.wait_or_cancel(timeout=req.capture_window_seconds)
         state = client.get_state()
         if cancelled:
-            _log("cancelled — aborting capture and reclaiming slot", job_id=job_id)
+            job.log("cancelled — aborting capture and reclaiming slot")
             client.quit()
         elif req.keep_open:
-            _log(
+            job.log(
                 "keep_open=true — Chromium left running. Kill it manually or "
                 "POST /jobs/{id}/cancel to reclaim port + profile-lock (fast "
-                "path) or temp dir (slow path).",
-                job_id=job_id,
+                "path) or temp dir (slow path)."
             )
         else:
             client.quit()
@@ -549,15 +406,14 @@ def _run_capture(req: CaptureRequest) -> CaptureResponse:
             urls_snapshot = list(captured_urls)
 
         status = "cancelled" if cancelled else state.status
-        _log(
+        job.log(
             f"done  status={status}  login_wall={login_wall}  "
             f"seen_urls={len(urls_snapshot)}  "
-            f"matched={ {k: len(v) for k, v in matches_snapshot.items()} }",
-            job_id=job_id,
+            f"matched={ {k: len(v) for k, v in matches_snapshot.items()} }"
         )
 
         return CaptureResponse(
-            job_id=job_id,
+            job_id=job.job_id,
             url=req.url,
             status=status,
             login_wall=login_wall,
@@ -566,10 +422,13 @@ def _run_capture(req: CaptureRequest) -> CaptureResponse:
             captured_urls=urls_snapshot,
         )
     finally:
-        _update_job_phase(job_id, "cleaning_up")
+        if job is not None:
+            job.set_phase("cleaning_up")
         # Skip cleanup for keep_open=true UNLESS the capture was cancelled.
         # Cancel is deliberately the way to reclaim a hung keep_open slot.
-        skip_cleanup = req.keep_open and not cancel_event.is_set()
+        # When we skip cleanup, the job stays in the registry so /jobs still
+        # shows the hung capture — matching pre-migration behavior.
+        skip_cleanup = req.keep_open and job is not None and not job.is_cancelled()
         if not skip_cleanup:
             if used_base:
                 try:
@@ -579,7 +438,8 @@ def _run_capture(req: CaptureRequest) -> CaptureResponse:
             elif temp_dir is not None:
                 profiles.remove_temp_profile(temp_dir)
             _release_port(port)
-            _unregister_job(job_id)
+            if job is not None:
+                _registry.unregister(job.job_id)
 
 
 @app.post("/capture", response_model=CaptureResponse)
@@ -682,15 +542,9 @@ def list_jobs() -> dict:
     Returns:
         A dict with ``max_concurrent`` (pool size), ``active_count`` (jobs
         currently running), ``available`` (slots free), and ``jobs`` (a list
-        of ``JobInfo`` objects).
+        of ``JobBase`` objects — see common.jobs.model).
     """
-    jobs = _snapshot_jobs()
-    return JobsListResponse(
-        max_concurrent=MAX_CONCURRENT,
-        active_count=len(jobs),
-        available=MAX_CONCURRENT - len(jobs),
-        jobs=jobs,
-    ).model_dump()
+    return _registry.list_all().model_dump()
 
 
 @mcp.tool()
@@ -703,15 +557,16 @@ def get_job(job_id: str) -> dict:
     than raising — completed captures are not retained.
 
     Returns:
-        On success, a ``JobInfo`` dict with ``job_id``, ``profile``, ``url``,
-        ``started_at``, ``elapsed_seconds``, ``port``, ``used_base_profile``,
-        ``temp_dir``, and ``phase`` (``"cloning" | "capturing" | "cleaning_up"``).
+        On success, a ``JobBase`` dict with ``job_id``, ``phase``,
+        ``created_at``, ``updated_at``, ``elapsed_seconds``, ``metadata``
+        (interceptor's own {profile, url, port, used_base_profile, temp_dir}),
+        ``result``, and ``error``.
         On unknown/finished id, ``{"error": "no active job <id>"}``.
     """
-    job = _snapshot_job(job_id)
-    if job is None:
+    snap = _registry.get(job_id)
+    if snap is None:
         return {"error": f"no active job {job_id!r}"}
-    return job.model_dump()
+    return snap.model_dump()
 
 
 app.mount("/mcp", mcp_app)

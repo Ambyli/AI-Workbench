@@ -11,7 +11,13 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["pytest>=8"]
+dev = [
+    "pytest>=8",
+    "aiosqlite",         # for tests/test_jobs_sqlite.py
+    "fastapi",           # for tests/test_jobs_router.py
+    "httpx",             # transitive: FastAPI's TestClient
+    "pydantic",          # transitive: model.py — most consumers already have it
+]
 
 [project.scripts]
 cdp-spy = "common.cdp_interceptor.spy:main"

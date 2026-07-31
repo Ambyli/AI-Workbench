@@ -4,6 +4,7 @@ members = [
     "widget",
     "ai/roofix",
     "ai/interceptor-api",
+    "ai/classifier",
 ]
 
 [tool.uv.sources]

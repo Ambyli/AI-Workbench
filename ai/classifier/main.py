@@ -2,19 +2,19 @@
 
 This module wires everything together:
   - Configures logging with correlation ID injection (middleware.py).
-  - Initialises the SQLite job store and starts the background worker on
-    startup (store.init_db, workers.job_worker).
+  - Initialises the shared ``common.jobs`` SQLite registry and starts the
+    background worker on startup (registry.init, workers.job_worker).
   - Registers the correlation ID middleware so every request gets a
     traceable [request_id] in its logs and response headers.
   - Instruments all HTTP endpoints with Prometheus metrics via
     prometheus_fastapi_instrumentator.
-  - Defines the five API endpoints:
+  - Defines the API endpoints:
 
     POST /assess            — submit a single-image assessment job (async).
     POST /assess/compare    — submit a comparison job against references (async).
-    GET  /jobs/{job_id}     — poll for job status and result.
-    GET  /jobs              — list recent jobs.
-    DELETE /jobs/{job_id}   — delete a job record.
+    GET  /jobs              — list recent jobs (from common.jobs.router).
+    GET  /jobs/{job_id}     — poll for job status and result (from common.jobs.router).
+    DELETE /jobs/{job_id}   — delete a job record (from common.jobs.router).
     GET  /hints             — list all hint values and their LLM rubric definitions.
     GET  /cv-detectors      — list all registered CV detector names grouped by function.
     GET  /health            — liveness check.
@@ -23,11 +23,12 @@ This module wires everything together:
 Overall request flow for /assess:
   1. HTTP request arrives → CorrelationIDMiddleware assigns [request_id].
   2. assess_document() validates criteria, reads image bytes.
-  3. Job record created in SQLite (status=pending).
+  3. Job record created in SQLite via ``jobs_registry.register(..., "pending")``.
   4. Job enqueued into workers.job_queue.
   5. 202 Accepted returned immediately with job_id.
-  6. Background worker dequeues job → runs CV + LLM → stores result.
-  7. Caller polls GET /jobs/{job_id} until status=completed.
+  6. Background worker dequeues job → runs CV + LLM → calls
+     ``jobs_registry.set_result(...)`` on success or ``set_error(...)`` on failure.
+  7. Caller polls GET /jobs/{job_id} until phase="completed" or "failed".
 """
 
 import asyncio
@@ -38,16 +39,19 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, UploadFile, Form
 from fastapi.responses import JSONResponse
 from prometheus_fastapi_instrumentator import Instrumentator
+from pydantic import BaseModel
 
-import store
+from common.jobs.router import build_router
+from common.jobs.sqlite import SqliteRegistry
+
 from analysis import parse_criteria, analyze_upload
-from config import DEFAULT_CRITERIA, LOG_LEVEL
+from config import DB_PATH, DEFAULT_CRITERIA, LOG_LEVEL
 from cv import REGISTRY
 from llm import HINT_RUBRICS
 from logger import logger
 from middleware import CorrelationIDMiddleware, RequestIDFilter, request_id_var
 from models import CompareRequest
-from workers import job_queue, job_worker, jobs_total, job_queue_depth
+from workers import job_queue, job_worker, jobs_total, job_queue_depth, set_registry
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -65,9 +69,27 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[_handler],
 )
-# Apply the level directly to the shared logger (basicConfig sets the root level)
 logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 logger.info("Starting Document Classifier (log level=%s)", LOG_LEVEL)
+
+
+# ---------------------------------------------------------------------------
+# Shared jobs registry — persistent SQLite backend from common.jobs
+# ---------------------------------------------------------------------------
+# One process-wide registry, shared by main.py (endpoints) and workers.py
+# (background worker). Its schema migration from classifier's legacy layout
+# (status → phase, add metadata column) runs idempotently in ``init()``.
+
+class ClassifierMetadata(BaseModel):
+    """Per-job metadata for the classifier. Everything that used to live in
+    the legacy ``type`` + ``request_id`` columns is now stored in the shared
+    ``jobs.metadata`` JSON blob under this shape."""
+
+    type: str        # "assess" | "compare"
+    request_id: str
+
+
+jobs_registry = SqliteRegistry(DB_PATH)
 
 
 # ---------------------------------------------------------------------------
@@ -79,20 +101,20 @@ async def lifespan(app: FastAPI):
     """Manage resources that must exist for the full lifetime of the server.
 
     On startup:
-      - Initialise (or reuse) the SQLite job database.
+      - Initialise (or migrate) the shared SQLite job registry.
+      - Hand the registry to the worker so it can write updates.
       - Start the background job worker as an asyncio Task.
 
     On shutdown (when the context exits):
       - Cancel the worker task cleanly.
     """
-    # Startup — database must be ready before the worker starts accepting jobs
-    await store.init_db()
+    await jobs_registry.init()
+    set_registry(jobs_registry)
     worker_task = asyncio.create_task(job_worker())
     logger.info("lifespan: startup complete")
 
-    yield  # server runs here
+    yield
 
-    # Shutdown — cancel the worker (in-flight jobs will be marked failed on restart)
     worker_task.cancel()
     logger.info("lifespan: shutdown complete")
 
@@ -103,15 +125,20 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Document Classifier", lifespan=lifespan)
 
-# Attach correlation ID middleware — wraps every request before route handlers run
 app.add_middleware(CorrelationIDMiddleware)
 
-# Auto-instrument all endpoints with HTTP request/latency metrics.
-# /metrics and /health are excluded to avoid polluting the metric set.
 Instrumentator(
     should_group_status_codes=True,
     excluded_handlers=["/metrics", "/health"],
 ).instrument(app).expose(app)
+
+# Mount /jobs, /jobs/{id}, DELETE /jobs/{id} — see common.jobs.router.
+# No cancel endpoint: the worker doesn't currently observe a cancel signal
+# mid-analysis. If we later teach the worker to poll for phase="cancelled"
+# and bail out, flip include_cancel=True here.
+app.include_router(
+    build_router(jobs_registry, include_delete=True, include_cancel=False)
+)
 
 
 # ---------------------------------------------------------------------------
@@ -134,32 +161,31 @@ async def assess_document(
     """Submit a single-image assessment job.
 
     Returns 202 Accepted immediately with a job_id.
-    Poll GET /jobs/{job_id} until status is "completed" or "failed".
+    Poll GET /jobs/{job_id} until phase is "completed" or "failed".
 
     Steps:
       1. Parse and validate the criteria JSON.
       2. Read the uploaded image bytes into memory.
-      3. Create a job record in the DB (status=pending).
+      3. Create a job record in the DB (phase=pending) via jobs_registry.
       4. Enqueue the job for background processing.
       5. Return the job_id to the caller.
     """
     logger.info("assess_document: filename=%s content_type=%s", image.filename, image.content_type)
 
-    # Step 1 — parse criteria from the multipart form field
     criterion_list = parse_criteria(criteria)
     if not criterion_list:
         raise HTTPException(status_code=400, detail="At least one criterion is required")
 
-    # Step 2 — read image bytes before returning (UploadFile is only readable during the request)
     contents = await image.read()
     if not contents:
         raise HTTPException(status_code=400, detail="Empty image file")
 
-    # Step 3 — create a job record so the caller has an ID to poll
     req_id = request_id_var.get("-")
-    job_id = await store.create_job("assess", req_id)
+    job_id = await jobs_registry.register(
+        ClassifierMetadata(type="assess", request_id=req_id),
+        initial_phase="pending",
+    )
 
-    # Step 4 — enqueue; the background worker will pick this up and run the analysis
     await job_queue.put((
         job_id,
         "assess",
@@ -174,11 +200,10 @@ async def assess_document(
     job_queue_depth.set(job_queue.qsize())
     jobs_total.labels(type="assess", status="pending").inc()
 
-    # Step 5 — return immediately; caller polls for the result
     logger.info("assess_document: queued job_id=%s queue_depth=%d", job_id, job_queue.qsize())
     return JSONResponse(
         status_code=202,
-        content={"job_id": job_id, "status": "pending"},
+        content={"job_id": job_id, "phase": "pending"},
     )
 
 
@@ -187,84 +212,34 @@ async def assess_with_reference(request: CompareRequest):
     """Submit a comparison job against one or more reference examples.
 
     Returns 202 Accepted immediately with a job_id.
-    Poll GET /jobs/{job_id} until status is "completed" or "failed".
+    Poll GET /jobs/{job_id} until phase is "completed" or "failed".
 
     The entire CompareRequest (including all example images or their
     pre_generated_analysis blobs) is passed through the queue in memory —
     no re-parsing is needed inside the worker.
-
-    Steps:
-      1. Validate that at least one criterion was provided.
-      2. Create a job record in the DB (status=pending).
-      3. Enqueue the full CompareRequest for background processing.
-      4. Return the job_id to the caller.
     """
     logger.info("assess_with_reference: %d example(s) aggregation=%s criteria=%s",
                 len(request.examples), request.aggregation,
                 [c.name for c in request.criteria])
 
-    # Step 1 — validate criteria (Pydantic enforces examples min_length=1)
     if not request.criteria:
         raise HTTPException(status_code=400, detail="At least one criterion is required")
 
-    # Step 2 — create job record
     req_id = request_id_var.get("-")
-    job_id = await store.create_job("compare", req_id)
+    job_id = await jobs_registry.register(
+        ClassifierMetadata(type="compare", request_id=req_id),
+        initial_phase="pending",
+    )
 
-    # Step 3 — enqueue the full request object (workers._run_compare receives it directly)
     await job_queue.put((job_id, "compare", request, req_id))
     job_queue_depth.set(job_queue.qsize())
     jobs_total.labels(type="compare", status="pending").inc()
 
-    # Step 4 — return immediately
     logger.info("assess_with_reference: queued job_id=%s queue_depth=%d", job_id, job_queue.qsize())
     return JSONResponse(
         status_code=202,
-        content={"job_id": job_id, "status": "pending"},
+        content={"job_id": job_id, "phase": "pending"},
     )
-
-
-@app.get("/jobs/{job_id}")
-async def get_job(job_id: str):
-    """Return the current status and result of a job.
-
-    Callers should poll this endpoint after submitting a job.
-    The response includes status and, when completed, the full result dict.
-    """
-    logger.info("get_job: job_id=%s", job_id)
-    job = await store.get_job(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
-    logger.info("get_job: returning job_id=%s status=%s", job_id, job["status"])
-    return JSONResponse(content=job)
-
-
-@app.get("/jobs")
-async def list_jobs(limit: int = 20):
-    """Return the most recent jobs (newest first), without result blobs.
-
-    Useful for monitoring and debugging.  Use GET /jobs/{job_id} for the
-    full result of a specific job.
-    """
-    logger.info("list_jobs: limit=%d", limit)
-    jobs = await store.list_jobs(limit)
-    logger.info("list_jobs: returning %d jobs", len(jobs))
-    return JSONResponse(content={"jobs": jobs, "count": len(jobs)})
-
-
-@app.delete("/jobs/{job_id}", status_code=204)
-async def delete_job(job_id: str):
-    """Permanently delete a job record from the database.
-
-    Returns 204 No Content on success, 404 if the job does not exist.
-    Deleting a job that is currently processing does not stop the worker —
-    the worker will still write its result (which will be an orphaned row
-    if the delete completes first).
-    """
-    logger.info("delete_job: job_id=%s", job_id)
-    deleted = await store.delete_job(job_id)
-    if not deleted:
-        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
 
 
 @app.get("/hints")
@@ -287,8 +262,6 @@ def list_cv_detectors():
     """
     logger.debug("list_cv_detectors: building detector map from %d registry entries", len(REGISTRY))
 
-    # Group registry names by the underlying function so callers can see
-    # which aliases map to the same detector.
     grouped: dict[str, list[str]] = {}
     for name, fn in REGISTRY.items():
         fn_name = fn.__name__

@@ -28,6 +28,11 @@ general_settings:
       include_subpath: true
       methods: ["GET", "POST", "DELETE"]
       forward_headers: true
+    - path: "/v1/roofix"
+      target: "http://roofix:8080"
+      include_subpath: true
+      methods: ["GET", "POST"]
+      forward_headers: true
 
 mcp_servers:
   kokoro_tts:

@@ -23,6 +23,11 @@ general_settings:
       include_subpath: true
       methods: ["GET", "POST"]
       forward_headers: true
+    - path: "/v1/interceptor"
+      target: "http://interceptor-api:8080"
+      include_subpath: true
+      methods: ["GET", "POST", "DELETE"]
+      forward_headers: true
 
 mcp_servers:
   kokoro_tts:
@@ -33,11 +38,22 @@ mcp_servers:
     url: http://madlad-api:8000/mcp
     transport: "http"
 
+  interceptor:
+    url: http://interceptor-api:8080/mcp
+    transport: "http"
+
   phoenix:
     url: os.environ/DEFAULT_LITELLM_MCP_PHOENIX_URL
     transport: "http"
     auth_type: "bearer_token"
     auth_value: os.environ/DEFAULT_LITELLM_MCP_PHOENIX_AUTH_VALUE
+
+  gmail:
+    url: "https://gmailmcp.googleapis.com/mcp/v1"
+    transport: "http"
+    auth_type: oauth2
+    oauth2_flow: authorization_code
+    delegate_auth_to_upstream: true
 
 model_list:
   - model_name: os.environ/DEFAULT_LITELLM_MODEL_NAME

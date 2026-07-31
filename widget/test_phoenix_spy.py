@@ -40,8 +40,8 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from cdp_interceptor import InterceptorClient
-from cdp_interceptor.cdp_session import Capture
+from common.cdp_interceptor import InterceptorClient
+from common.cdp_interceptor.cdp_session import Capture
 
 
 TARGET_URL = "https://phoenix.zeoenergy.com/projects"

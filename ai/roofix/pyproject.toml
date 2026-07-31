@@ -1,0 +1,20 @@
+[project]
+name = "roofix"
+version = "0.1.0"
+description = "Roofix -> Phoenix bridge: parse Roofix emails, decide via LiteLLM, mirror events into Phoenix"
+requires-python = ">=3.11"
+dependencies = [
+    "common",
+    "fastapi",
+    "uvicorn",
+    "httpx",
+    "openai",
+    "apscheduler",
+    "pydantic",
+    # Direct Phoenix DB access (reverted from Phoenix MCP)
+    "psycopg2-binary",
+    # Direct Gmail API (reverted from Gmail MCP)
+    "google-auth",
+    "google-auth-oauthlib",
+    "google-api-python-client",
+]

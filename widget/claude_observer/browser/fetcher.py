@@ -21,7 +21,7 @@ BrowserLinker()
 import threading
 from datetime import datetime
 
-from cdp_interceptor import ChromeNotFoundError, InterceptorClient
+from common.cdp_interceptor import ChromeNotFoundError, InterceptorClient
 
 from claude_observer import config
 from claude_observer.browser.response_parser import parse_response

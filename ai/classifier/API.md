@@ -13,14 +13,18 @@ All passthrough requests require `Authorization: Bearer <master-key>`.
 ## Async job pattern
 
 `POST /assess` and `POST /assess/compare` return **202 Accepted** immediately
-with a job ID. Poll `GET /jobs/{job_id}` until `status` is `"completed"` or
+with a job ID. Poll `GET /jobs/{job_id}` until `phase` is `"completed"` or
 `"failed"`, then read the `result` field.
 
 ```
-POST /assess  →  {"job_id": "abc123", "status": "pending"}
+POST /assess  →  {"job_id": "abc123", "phase": "pending"}
                          ↓  poll
-GET /jobs/abc123  →  {"status": "completed", "result": {...}}
+GET /jobs/abc123  →  {"phase": "completed", "result": {...}, "metadata": {...}}
 ```
+
+Job tracking is powered by the shared `common.jobs` package
+(`shared/common/src/common/jobs/`), which the interceptor-api service also
+uses. The endpoint shapes and response fields are documented there.
 
 ---
 
@@ -138,7 +142,7 @@ curl http://localhost:4001/v1/classifier/assess \
     {"name":"three feet of clearance around meter", "type":"llm","hint":"presence","weight":2.5,"depends_on":"has electrical meter"},
     {"name":"sharpness",                            "type":"cv",                  "weight":1.0}
   ]'
-# → {"job_id": "abc123", "status": "pending"}
+# → {"job_id": "abc123", "phase": "pending"}
 ```
 
 **Polling:**
@@ -316,10 +320,24 @@ curl http://localhost:4001/v1/classifier/jobs/abc123 -H "Authorization: Bearer s
 ```
 
 ```json
-{"id": "abc123", "status": "completed", "type": "assess", "result": {...}, "created_at": "...", "updated_at": "..."}
+{
+  "job_id": "abc123",
+  "phase": "completed",
+  "created_at": "2026-07-30T15:00:00+00:00",
+  "updated_at": "2026-07-30T15:00:07+00:00",
+  "elapsed_seconds": 7.0,
+  "metadata": {"type": "assess", "request_id": "req-xyz"},
+  "result": {...},
+  "error": null
+}
 ```
 
-`status` values: `pending` → `processing` → `completed` | `failed`
+`phase` values: `pending` → `processing` → `completed` | `failed`.
+
+**Response shape migration note.** As of the `common.jobs` extraction, the
+top-level `id` is now `job_id`, `status` is now `phase`, and the previously
+separate `type` + `request_id` columns are nested under `metadata`. Callers
+that parse the response by field name need to update accordingly.
 
 ---
 

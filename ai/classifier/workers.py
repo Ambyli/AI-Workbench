@@ -8,8 +8,9 @@ How it works:
   1. main.py enqueues a tuple (job_id, type, data, request_id) into job_queue.
   2. job_worker() runs as a long-lived asyncio task (started at app startup).
   3. The worker pulls jobs one at a time, calls the appropriate runner, and
-     persists the result (or error) to the SQLite store via store.update_job().
-  4. Callers poll GET /jobs/{job_id} until status is "completed" or "failed".
+     persists the result (or error) to the shared SQLite registry via
+     ``jobs_registry.set_result(...)`` / ``set_error(...)``.
+  4. Callers poll GET /jobs/{job_id} until phase is "completed" or "failed".
 
 Two job runners:
   _run_assess()   — single-image assessment via analysis.analyze_bgr().
@@ -21,14 +22,20 @@ Prometheus metrics track queue depth, job counts, and processing durations.
 Process flow position: started by main.lifespan() at startup; consumes from
 job_queue which is populated by main.assess_document() and
 main.assess_with_reference().
+
+Registry injection: main.py hands the SqliteRegistry instance to this module
+via ``set_registry(...)`` before starting the worker task. This keeps the
+worker de-coupled from ``config.DB_PATH`` construction.
 """
 
 import asyncio
 import time
+from typing import Optional
 
 from prometheus_client import Counter, Gauge, Histogram
 
-import store
+from common.jobs.sqlite import SqliteRegistry
+
 from analysis import analyze_bgr, analyze_input, resolve_example, _bytes_to_bgr
 from logger import logger
 from middleware import request_id_var
@@ -59,9 +66,25 @@ job_queue_depth = Gauge(
 # ---------------------------------------------------------------------------
 # In-memory job queue
 # ---------------------------------------------------------------------------
-# Imported by main.py which enqueues jobs.  Each item is a 4-tuple:
+# Imported by main.py which enqueues jobs. Each item is a 4-tuple:
 #   (job_id: str, job_type: str, job_data: dict|CompareRequest, req_id: str)
 job_queue: asyncio.Queue = asyncio.Queue()
+
+
+# ---------------------------------------------------------------------------
+# Registry injection
+# ---------------------------------------------------------------------------
+# main.py calls set_registry() during lifespan startup so the worker can
+# persist phase / result / error transitions. Kept module-level to preserve
+# the "long-lived asyncio task with no explicit dependency wiring" shape.
+_registry: Optional[SqliteRegistry] = None
+
+
+def set_registry(registry: SqliteRegistry) -> None:
+    """Hand the shared job registry to the worker module. Called once by
+    main.lifespan() before the worker task is started."""
+    global _registry
+    _registry = registry
 
 
 # ---------------------------------------------------------------------------
@@ -165,13 +188,20 @@ async def job_worker() -> None:
     """Long-running coroutine that processes jobs from the in-memory queue.
 
     Started as an asyncio Task by main.lifespan() at app startup and cancelled
-    at shutdown.  Runs forever — one job at a time — updating job state in the
-    SQLite store at each transition: pending → processing → completed|failed.
+    at shutdown. Runs forever — one job at a time — updating job state in the
+    shared SQLite registry at each transition: pending → processing →
+    completed | failed.
 
     The correlation ID from the originating HTTP request is restored into the
     ContextVar before processing so that all log lines for the job carry the
     same [request_id] prefix as the original request.
     """
+    if _registry is None:
+        raise RuntimeError(
+            "job_worker started before set_registry() was called; "
+            "main.lifespan must hand the SqliteRegistry to workers.py first"
+        )
+
     logger.info("job_worker: started")
     while True:
         # Block until a job is available in the queue
@@ -186,7 +216,7 @@ async def job_worker() -> None:
         start = time.monotonic()
         try:
             # Mark as processing before the expensive LLM call
-            await store.update_job(job_id, "processing")
+            await _registry.set_phase(job_id, "processing")
 
             # Dispatch to the correct runner
             if job_type == "assess":
@@ -194,17 +224,18 @@ async def job_worker() -> None:
             else:
                 result = await _run_compare(job_data)
 
-            # Persist result and record metrics
-            await store.update_job(job_id, "completed", result=result)
+            # Persist result and record metrics — set_result also flips phase → "completed"
+            await _registry.set_result(job_id, result)
             elapsed = time.monotonic() - start
             jobs_total.labels(type=job_type, status="completed").inc()
             job_duration.labels(type=job_type).observe(elapsed)
             logger.info("job_worker: job_id=%s completed in %.2fs", job_id, elapsed)
 
         except Exception as exc:
-            # Persist error and record metrics — never let an exception kill the worker
+            # Persist error and record metrics — never let an exception kill the worker.
+            # set_error also flips phase → "failed".
             elapsed = time.monotonic() - start
-            await store.update_job(job_id, "failed", error=str(exc))
+            await _registry.set_error(job_id, str(exc))
             jobs_total.labels(type=job_type, status="failed").inc()
             job_duration.labels(type=job_type).observe(elapsed)
             logger.error("job_worker: job_id=%s failed after %.2fs: %s", job_id, elapsed, exc)

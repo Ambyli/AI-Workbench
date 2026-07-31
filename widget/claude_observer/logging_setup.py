@@ -1,29 +1,18 @@
 """
 logging_setup.py
 ----------------
-Configures the application-wide logger.  Import ``log`` from here in every
-other module so that all components share the same handler configuration.
+Configures the application-wide logger via the shared ``common.logging_setup``
+helper. Import ``log`` from here in every other module so that all components
+share the same handler configuration.
 """
 
-import logging
 from pathlib import Path
 
+from common.logging_setup import setup_logging
 from claude_observer import config as _config
 
-_log_path    = Path(__file__).parent.parent / "claude_usage_widget.log"
-_log_path.unlink(missing_ok=True)
-_file_level  = logging.DEBUG if _config.DEBUG_LOGGING else logging.INFO
-_cons_level  = logging.DEBUG if _config.DEBUG_LOGGING else logging.WARNING
-
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s [%(levelname)s] %(funcName)s: %(message)s",
-    handlers=[
-        logging.FileHandler(_log_path, encoding="utf-8"),
-        logging.StreamHandler(),
-    ],
+log = setup_logging(
+    name="claude_usage_widget",
+    log_dir=Path(__file__).parent.parent,
+    debug=_config.DEBUG_LOGGING,
 )
-logging.getLogger().handlers[0].setLevel(_file_level)   # file: DEBUG or INFO
-logging.getLogger().handlers[1].setLevel(_cons_level)   # console: DEBUG or WARNING
-
-log = logging.getLogger("claude_usage_widget")

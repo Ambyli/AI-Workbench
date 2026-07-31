@@ -41,6 +41,23 @@ Key variables:
 | `AUDIO_BASE_URL` | `http://localhost:8004` | Base URL returned by Kokoro `text_to_speech` MCP tool |
 | `MADLAD_APP_URL` | `http://madlad-app:8085` | URL the MADLAD proxy uses to reach the inference container |
 | `MADLAD_MODEL` | `SoybeanMilk/madlad400-3b-mt-ct2-int8_float16` | HuggingFace repo ID for the pre-converted CTranslate2 MADLAD checkpoint |
+| `DRY_RUN` | `true` | Roofix Bridge: log decisions but skip Phoenix writes |
+| `AGENT_PHASE` | `0` | Roofix Bridge: `0` = chatter+milestones only; `1` = +create/notify |
+| `TICK_INTERVAL_SECONDS` | `300` | Roofix Bridge: APScheduler cadence |
+| `BRAIN_MODEL` | `qwen3.6` | Roofix Bridge: LiteLLM alias for the AI-fallback brain |
+| `ROOFIX_SENDER` | `no-reply@roofix.io` | Roofix Bridge: Gmail search-query sender (two `o`s) |
+| `ESCALATION_RECIPIENTS` | _(empty)_ | Roofix Bridge: comma-separated recipients that receive forwarded escalations. Empty disables forwarding — escalates stay unread in Gmail for direct operator review. |
+| `GMAIL_CREDENTIALS_PATH` | `/config/credentials.json` | Roofix Bridge: OAuth client-secrets file |
+| `GMAIL_TOKEN_PATH` | `/config/token.json` | Roofix Bridge: OAuth refresh-token file |
+| `PHOENIX_DB_HOST` / `_PORT` / `_NAME` / `_USER` / `_PASSWORD` / `_SSLMODE` | _(secrets)_ | Roofix Bridge: direct psycopg2 connection to Phoenix Postgres |
+| `ROOFIX_DB_USER` / `_PASSWORD` / `_NAME` | `roofix` / _(required)_ / `roofix` | Roofix Bridge: credentials for the compose-managed `roofix-db` Postgres backing `ProcessedStore`. Password has no default — compose fails without it. |
+| `ROOFIX_DB_HOST_PORT` | `5433` | Roofix Bridge: host port `roofix-db` binds to for remote connections. Default avoids clashing with Phoenix / a local Postgres on 5432. |
+| `PHOENIX_AGENT_USER_ID` | _(unset — required for writes)_ | Roofix Bridge: dedicated Phoenix user id |
+| `PHOENIX_ROOFIX_ID_COLUMN` | `migration_external_id` | Roofix Bridge: column where Roofix ids are stamped |
+| `INTERCEPTOR_API_URL` | `http://interceptor-api:8080` | Roofix Bridge → interceptor-api base URL |
+| `ROOFIX_PROFILE_NAME` | `roofix` | Named profile inside interceptor-api holding Roofix session cookies |
+| `INTERCEPTOR_PROFILES_ROOT` | `/data/profiles` | interceptor-api: root under which named `--user-data-dir` profiles live |
+| `INTERCEPTOR_MAX_CONCURRENT` | `8` | interceptor-api: max simultaneous `/capture` calls (port pool size). Each slot ≈ one Chrome + optional profile clone — see `ai/INTERCEPTOR_API.md § Resource sizing` |
 
 ## Threading Model — Read Before Touching Anything
 
@@ -161,6 +178,34 @@ curl -X POST https://phoenix-mcp.com/api-token \
 | Changing `LLM_URL` without re-toggling LLM mode | `is_local_llm_active()` returns false |
 | Closing app without stopping llama-server | Orphaned server process |
 | Editing `.env` while app is running | No effect until restart |
+
+## Roofix ↔ Phoenix Bridge
+
+`ai/roofix/` bundles the Roofix ↔ Phoenix subsystem: `bridge/` (event-sourced worker) and `scraper/` (Playwright proposal fetcher). One compose file (`docker-compose.roofix.yml`) brings up both. See [`ai/ROOFIX.md`](ai/ROOFIX.md) for the operator guide; a few things worth calling out here:
+
+- **Default `DRY_RUN=true`**: on first deploy the bridge fetches Gmail, parses, decides, and logs — but does **not** write to Phoenix. Flip to `false` only after inspecting a full tick.
+- **Bridge talks to Phoenix directly (psycopg2), not via MCP**: the earlier MCP variant was reverted because Phoenix MCP write tools weren't ready in time. Bridge needs `PHOENIX_DB_*` env vars set. `DRY_RUN=true` still short-circuits writes.
+- **Bridge talks to Gmail directly (Google API + OAuth), not via MCP**: same reason. Requires `credentials.json` + `token.json` in `ROOFIX_BRIDGE_CONFIG_DIR`. First-time login is interactive — run `python components/gmail_client.py` locally once before shipping the token file into the container. See [ROOFIX.md § Gmail OAuth setup](ai/ROOFIX.md#gmail-oauth-setup).
+- **AI fallback via LiteLLM**: `roofix/components/brain.py::generate_ai_decision` uses the OpenAI SDK against `http://litellm:4000`. Swapping Claude for a local vLLM model is a LiteLLM config change, not a bridge code change.
+- **Session refresh is a manual operator flow**: the scraper cannot present a login UI. Run `save_roofix_session.py` locally on a laptop with a visible browser, then POST the resulting JSON to the scraper's `/session/refresh`.
+- **Michael's mapping**: `ai/roofix/config/field_mapping.json` is a stub. Milestone writes will log "no milestone mapping" and skip until the file is filled in — this is intentional.
+
+## Shared Python code
+
+Any Python package or module that could plausibly be reused across multiple projects — current or future — MUST live in `shared/common/`, not in the project directory that first needs it. This includes: scraping / CDP / browser helpers, MCP protocol clients, LiteLLM / model client wrappers, env + logging boilerplate, and cross-cutting utilities.
+
+**Test:** before creating a new module inside `widget/`, `ai/roofix/`, `ai/interceptor-api/`, or any future project dir, ask *"could a second project want this in six months?"* If yes, it goes in `shared/common/` under an appropriate subpackage and the project imports it via the uv workspace (`common = { workspace = true }` in the project's `pyproject.toml`, backed by the root `pyproject.toml`'s `[tool.uv.workspace]` declaration).
+
+Project-specific business logic (Roofix event parsing, brain decision rules, widget's tray UI, etc.) stays in the project directory — the test is reusability, not size.
+
+Adding a new capability to `shared/common/`: create the subpackage under `shared/common/src/common/<name>/`, expose the public API from its `__init__.py`, add tests under `shared/common/tests/`. No pyproject changes needed in consuming projects unless a new external dep is introduced.
+
+**Current shared subpackages:**
+- `common.cdp_interceptor` — Chrome DevTools Protocol interceptor (used by `interceptor-api`, `widget`)
+- `common.env` — walk-up `.env` loader
+- `common.logging_setup` — CSV audit logger + stdlib configuration
+- `common.processed_store` — Gmail message-id dedup cache (used by `roofix`)
+- `common.jobs` — id-addressable job tracking with two backends: `InMemoryRegistry` (sync, ephemeral — used by `interceptor-api`) and `SqliteRegistry` (async, persistent — used by `classifier`), plus a `build_router` FastAPI factory for the standard `GET /jobs`, `GET /jobs/{id}`, `POST /jobs/{id}/cancel`, `DELETE /jobs/{id}` endpoints. See [`shared/common/src/common/jobs/__init__.py`](shared/common/src/common/jobs/__init__.py) for backend selection guidance.
 
 ## AI Infrastructure — Compose Topology
 

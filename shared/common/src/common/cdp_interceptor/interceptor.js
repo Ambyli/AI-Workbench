@@ -43,33 +43,30 @@ if (!window._fetchInterceptorActive) {
       throw e;
     }
 
-    // Only bother with JSON responses — those are the API calls we
-    // care about (usage data, billing info, org metrics, etc.).
-    const ct = response.headers.get("content-type") || "";
-    if (ct.includes("json")) {
+    // Try to parse the body as JSON regardless of content-type. Some sites
+    // (notably Bubble.io) return JSON with content-type text/plain or nothing
+    // at all, and the strict header check silently drops them. Mirror the
+    // XHR patch's approach: attempt parsing and let JSON.parse decide.
+    // Response bodies can only be consumed once, so we clone before reading.
+    // The original response is returned to the page untouched.
+    try {
+      const clone = response.clone();
+      const text = await clone.text();
+      const json = JSON.parse(text);
+      window._capturedResponses.push({ url: url, body: json });
+      _log("[interceptor] fetch captured & notified:", url, json);
+      // Notify the CDP fetcher if it's listening.  The fetcher may have navigated away and lost the original binding, so this is a best-effort attempt to keep it updated with new captures after a navigation.
       try {
-        // Response bodies can only be consumed once, so we clone
-        // before reading.  The original response is returned to the
-        // page untouched so normal rendering is unaffected.
-        const clone = response.clone();
-        const json = await clone.json();
-        window._capturedResponses.push({ url: url, body: json });
-        _log("[interceptor] fetch captured & notified:", url, json);
-        // Notify the CDP fetcher if it's listening.  The fetcher may have navigated away and lost the original binding, so this is a best-effort attempt to keep it updated with new captures after a navigation.
-        try {
-          window.__cdpNotify(JSON.stringify({ url: url, body: json }));
-        } catch (_) {
-          _log("[interceptor] fetch: failed to notify CDP fetcher for", url);
-        }
+        window.__cdpNotify(JSON.stringify({ url: url, body: json }));
       } catch (_) {
-        _log("[interceptor] fetch: failed to parse JSON body for", url);
+        _log("[interceptor] fetch: failed to notify CDP fetcher for", url);
       }
-    } else {
+    } catch (_) {
       _log(
-        "[interceptor] fetch: skipped non-JSON response for",
+        "[interceptor] fetch: body not JSON, skipping:",
         url,
         "(content-type:",
-        ct,
+        response.headers.get("content-type") || "",
         ")",
       );
     }

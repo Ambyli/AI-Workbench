@@ -113,6 +113,10 @@ Sub-cases that short-circuit before the action branches:
 | `PHOENIX_DB_SSLMODE` | `require` | psycopg2 SSL mode (`require` / `verify-ca` / `verify-full` / `disable`). |
 | `PHOENIX_AGENT_USER_ID` | _(unset — required for writes)_ | Dedicated Phoenix user id the bridge writes as. Provision manually. |
 | `PHOENIX_ROOFIX_ID_COLUMN` | `migration_external_id` | Where the Roofix project id is stamped on the project row. |
+| `ROOFIX_DB_USER` | `roofix` | User for the compose-managed `roofix-db` Postgres backing `ProcessedStore`. |
+| `ROOFIX_DB_PASSWORD` | _(required — no default)_ | Password for `roofix-db`. Compose fails to bring the service up if this is empty. Don't commit it to git. |
+| `ROOFIX_DB_NAME` | `roofix` | Database name inside `roofix-db`. |
+| `ROOFIX_DB_HOST_PORT` | `5433` | Host port `roofix-db` binds to (5432 → host `5433` by default) so remote clients can connect. Override to `5432` if that port is free on this host. |
 | `INTERCEPTOR_API_URL` | `http://interceptor-api:8080` | Sibling generic CDP service the bridge POSTs `/capture` to. |
 | `ROOFIX_PROFILE_NAME` | `roofix` | Which named profile inside interceptor-api holds Roofix session cookies. Refresh via `POST /profiles/roofix/refresh` on interceptor-api. |
 | `ROOFIX_CAPTURE_WINDOW_SECONDS` | `30` | How long interceptor-api keeps Chrome alive per `/capture` call collecting XHRs. |
@@ -192,6 +196,89 @@ Sessions survive **days to weeks** on the fast path (single capture at a time re
 
 - **Concurrent `/capture` calls collide on the debug port.** interceptor-api serializes captures with a module-level lock (`ai/interceptor-api/app.py:63`) and returns **HTTP 409** if a capture is already running — the bridge should backoff-and-retry rather than fan out.
 - **Cross-machine password caveat.** Cookies in a shipped profile work fine on Linux Docker. Chrome's saved-password blob (`Login Data`) is encrypted with a machine-bound key and won't decrypt inside the container — the container reuses cookies only. If they die you re-capture on your laptop and re-upload.
+
+### Connecting to the processed-store DB
+
+The bridge's dedup / audit store lives in a Postgres container (`roofix-db`) that comes up alongside `roofix` when you run the compose file. The port is exposed on the host so you can inspect the store from your laptop without `docker exec`.
+
+**Connection details** (defaults; override via `.env`):
+
+| Field | Value |
+|---|---|
+| Host | `<docker host>` (usually `localhost` if the compose stack runs on your box) |
+| Port | `ROOFIX_DB_HOST_PORT` — default `5433` |
+| Database | `ROOFIX_DB_NAME` — default `roofix` |
+| User | `ROOFIX_DB_USER` — default `roofix` |
+| Password | `ROOFIX_DB_PASSWORD` (required — set in `.env`) |
+
+**psql:**
+
+```bash
+psql "postgresql://roofix:$ROOFIX_DB_PASSWORD@localhost:5433/roofix"
+```
+
+**DBeaver / DataGrip / any Postgres GUI:** create a new Postgres connection with the values above.
+
+**Schema** — single table:
+
+```sql
+CREATE TABLE processed (
+    key           TEXT PRIMARY KEY,      -- Gmail message id
+    processed_at  TIMESTAMPTZ NOT NULL,
+    status        TEXT NOT NULL,         -- 'pending' | 'ok' | 'error'
+    metadata      JSONB NOT NULL         -- action, source, reasoning, forwarded, ...
+);
+CREATE INDEX idx_processed_status ON processed(status);
+```
+
+**Useful queries** — `metadata` is JSONB, so use Postgres's native operators (not `json_extract`):
+
+```sql
+-- Everything, newest first
+SELECT key, status, processed_at, metadata
+FROM processed ORDER BY processed_at DESC LIMIT 50;
+
+-- Counts by status
+SELECT status, COUNT(*) FROM processed GROUP BY status;
+
+-- All escalations, showing whether the forward succeeded
+SELECT key,
+       (metadata->>'forwarded')::bool AS forwarded,
+       metadata->>'reasoning'         AS reasoning
+FROM processed
+WHERE metadata->>'action' = 'escalate';
+
+-- Failed forwards (escalate but forward failed / no recipients)
+SELECT * FROM processed
+WHERE metadata->>'action'   = 'escalate'
+  AND (metadata->>'forwarded')::bool = false;
+
+-- Scrape errors (retry candidates)
+SELECT key, processed_at, metadata->>'error' AS error
+FROM processed WHERE status = 'error';
+
+-- Everything that ran through create_project
+SELECT key,
+       metadata->>'roofix_project_id' AS roofix_id,
+       metadata->>'phoenix_project_id' AS phoenix_id,
+       (metadata->>'accepted')::bool  AS accepted
+FROM processed
+WHERE metadata ? 'roofix_project_id';
+
+-- Reset a specific email so it gets reprocessed next tick
+DELETE FROM processed WHERE key = '19f908fe4c0a892c';
+
+-- Mass-retry all errors
+DELETE FROM processed WHERE status = 'error';
+```
+
+**Concurrency note.** The bridge holds one open connection to this DB. Read-only queries from another client (psql, DBeaver) are safe any time — Postgres MVCC handles them. Bulk writes (`DELETE`, schema changes) are also safe but may briefly contend with a live tick; if you're making destructive changes, prefer stopping the roofix container first:
+
+```bash
+docker compose -f ai/docker-compose.roofix.yml stop roofix
+# ...destructive query...
+docker compose -f ai/docker-compose.roofix.yml start roofix
+```
 
 ### Proposal extractor
 

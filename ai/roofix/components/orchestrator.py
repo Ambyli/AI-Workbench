@@ -605,18 +605,20 @@ async def _process_group(
         ctx = await _resolve_context(ev, phoenix)
 
         # ── Scrape gate ────────────────────────────────────────────────
-        # Only scrape when Phoenix couldn't identify the project AND the
-        # event is one whose real data lives behind the proposal link
-        # (Estimate / Estimate Complete). On success, re-resolve so the
-        # brain sees an updated context (the scrape may have supplied a
-        # project_id or a sharper name+address). _scrape_and_extract logs
-        # its own scraper/extractor audit rows and marks processed_store
-        # on no_docs / timeout — we don't wrap those here.
+        # Scrape when the event is one whose real data lives behind the
+        # proposal link (Estimate / Estimate Complete) AND Phoenix either:
+        #   - couldn't identify the project at all (miss), OR
+        #   - matched multiple candidates (ambiguous) — the scrape gives us
+        #     the authoritative Roofix project id from custom.order1, which
+        #     re-resolves via find_project_by_roofix_id to narrow to one.
+        # Single-match Phoenix hits skip the scrape (already unambiguous).
+        # _scrape_and_extract logs its own scraper/extractor audit rows and
+        # marks processed_store on no_docs / timeout — we don't wrap here.
         if (
             scraper_client
             and ev.get("tracking_url")
             and ev.get("event_type") in SCRAPE_EVENTS
-            and not ctx.get("found")
+            and (not ctx.get("found") or ctx.get("ambiguous"))
         ):
             if await _scrape_and_extract(
                 ev, scraper_client, log, key, processed_store, scrape_sem

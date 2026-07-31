@@ -60,6 +60,7 @@ IGNORE_EVENTS = {
     "Please have CPC signed (If applicable)",
     "Closeout Completed",
     "Send HIC to Homeowner",
+    "Install Date Confirmed",
 }
 
 

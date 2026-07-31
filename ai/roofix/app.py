@@ -32,7 +32,7 @@ from pydantic import BaseModel
 
 from common.env import load_env
 from common.logging_setup import CsvLogger, setup_logging
-from common.processed_store import ProcessedStore
+from common.processed_store import PostgresProcessedStore
 
 load_env()
 
@@ -45,6 +45,19 @@ TICK_INTERVAL_SECONDS = int(os.getenv("TICK_INTERVAL_SECONDS", "300"))
 FIELD_MAPPING_PATH = os.getenv("FIELD_MAPPING_PATH", "/app/config/field_mapping.json")
 LOG_DIR = os.getenv("LOG_DIR", "/data")
 DEBUG_LOGGING = os.getenv("DEBUG_LOGGING", "false").lower() == "true"
+
+# DSN for the ProcessedStore Postgres (compose-managed roofix-db service).
+# Container-side connection — host + port refer to the docker network, not
+# the operator's laptop. Password is required at container start; the
+# compose file will fail to bring up roofix-db without it, so if we reach
+# this line the password is set.
+ROOFIX_DB_DSN = (
+    f"postgresql://{os.environ.get('ROOFIX_DB_USER', 'roofix')}"
+    f":{os.environ.get('ROOFIX_DB_PASSWORD', '')}"
+    f"@{os.environ.get('ROOFIX_DB_HOST', 'roofix-db')}"
+    f":{os.environ.get('ROOFIX_DB_PORT', '5432')}"
+    f"/{os.environ.get('ROOFIX_DB_NAME', 'roofix')}"
+)
 
 # Stdlib logging is what httpx / openai / apscheduler noise flows through,
 # plus the compact one-line echo CsvLogger emits per audit row.
@@ -127,7 +140,7 @@ async def _run_one_batch(raw_emails: Optional[list] = None) -> dict:
         with (
             PhoenixClient() as phoenix,
             GmailClient() as gmail,
-            ProcessedStore(Path(LOG_DIR) / "processed.db") as processed_store,
+            PostgresProcessedStore(ROOFIX_DB_DSN) as processed_store,
         ):
             async with RoofixScraperClient() as scraper_client:
                 if raw_emails is None:

@@ -108,6 +108,14 @@ GMAIL_TOKEN_PATH = os.getenv("GMAIL_TOKEN_PATH", "config/token.json")
 # Listener query: unread, from the Roofix sender. Override via env for narrowing.
 LISTENER_QUERY = os.getenv("LISTENER_QUERY") or f"is:unread from:{ROOFIX_SENDER}"
 
+# Comma-separated recipient list for forwarded escalations. Empty disables
+# forwarding — escalates then stay unread in Gmail for direct operator review.
+# When populated, a successful forward triggers mark_read on the original;
+# a failed forward (or empty list) leaves the original unread so a human sees it.
+ESCALATION_RECIPIENTS: list[str] = [
+    a.strip() for a in os.getenv("ESCALATION_RECIPIENTS", "").split(",") if a.strip()
+]
+
 
 # ── Phoenix client: object/relationship type ids ───────────────────────────
 # Values derived from Phoenix data (grep phoenix.object_type /

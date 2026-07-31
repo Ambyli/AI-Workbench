@@ -125,24 +125,27 @@ def _run_one_batch(raw_emails: Optional[list] = None) -> dict:
             milestone_map=milestone_map,
             scraper_client=scraper_client,
             processed_store=processed_store,
+            gmail=gmail,
         )
 
         # Mark successfully processed emails as read. The orchestrator stamps
         # each Decision with the source email's Gmail message id, so we can
         # look up the target directly — no fragile subject/name matching.
         #
-        # Skip rules:
-        #   - escalate  → needs human; leave unread so it's visible in the inbox.
+        # Skip rules (leave unread):
+        #   - escalate whose forward FAILED (or no ESCALATION_RECIPIENTS set)
+        #     → operator needs to see it in the Roofix inbox. The orchestrator
+        #     stamps ``_forwarded`` on the decision to signal success.
         #   - AI ignore → the model made a fuzzy call; leave unread so the
-        #                 operator can review it. Rule-based ignores are
-        #                 deterministic and safe to silence.
-        # The orchestrator has already marked BOTH rule and AI ignores as ok
-        # in processed_store, so neither will be re-processed next tick — this
-        # gate only controls Gmail visibility.
+        #     operator can review. Rule-based ignores are deterministic and
+        #     safe to silence.
+        # The orchestrator has already marked ALL of these ok in processed_store
+        # (rule ignores, AI ignores, and escalates), so nothing gets re-processed
+        # next tick — this gate only controls Gmail visibility.
         processed_ids = set()
         for d in decisions:
             action = d.get("action")
-            if action == "escalate":
+            if action == "escalate" and not d.get("_forwarded"):
                 continue
             if action == "ignore" and d.get("source") != "rule":
                 continue
@@ -233,35 +236,35 @@ def tick(req: Optional[TickRequest] = None) -> dict:
 
 
 if __name__ == "__main__":
-    # import signal
-    # import sys
-    # import time
-    # import uvicorn
+    import signal
+    import sys
+    import time
+    import uvicorn
 
-    # def _shutdown(signum, frame):
-    #    """Handle Ctrl+C / SIGTERM: stop scheduler, wait for children, exit clean."""
-    #    _stdlib_logger.info(
-    #        "Shutdown signal received (%s). Stopping scheduler...", signum
-    #    )
-    #    scheduler.shutdown(wait=True)
-    #    _stdlib_logger.info("Scheduler stopped. Waiting for child processes...")
+    def _shutdown(signum, frame):
+        """Handle Ctrl+C / SIGTERM: stop scheduler, wait for children, exit clean."""
+        _stdlib_logger.info(
+            "Shutdown signal received (%s). Stopping scheduler...", signum
+        )
+        scheduler.shutdown(wait=True)
+        _stdlib_logger.info("Scheduler stopped. Waiting for child processes...")
 
-    #    # Give child processes a moment to terminate gracefully
-    #    for _ in range(10):  # Wait up to 10 seconds
-    #        import os
+        # Give child processes a moment to terminate gracefully
+        for _ in range(10):  # Wait up to 10 seconds
+            import os
 
-    #        try:
-    #            # Try to terminate all child processes (Windows)
-    #            os.system("taskkill /F /T /PID " + str(os.getpid()))
-    #        except Exception:
-    #            pass
-    #        time.sleep(1)
+            try:
+                # Try to terminate all child processes (Windows)
+                os.system("taskkill /F /T /PID " + str(os.getpid()))
+            except Exception:
+                pass
+            time.sleep(1)
 
-    #    _stdlib_logger.info("Exiting.")
-    #    sys.exit(128 + signum)
+        _stdlib_logger.info("Exiting.")
+        sys.exit(128 + signum)
 
-    # signal.signal(signal.SIGINT, _shutdown)
-    # signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
+    signal.signal(signal.SIGTERM, _shutdown)
 
-    # uvicorn.run(app, host="0.0.0.0", port=8010)
-    tick()
+    uvicorn.run(app, host="0.0.0.0", port=8010)
+# tick()

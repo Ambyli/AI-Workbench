@@ -32,6 +32,7 @@ from components.constants import (
     LOG_COLUMNS,
     NEEDS_SCRAPE_EVENTS,
     EXTRACTED_PAYLOAD_FIELDS as _EXTRACTED_PAYLOAD_FIELDS,
+    ESCALATION_RECIPIENTS,
 )
 
 
@@ -184,7 +185,7 @@ def _scrape_and_extract(ev: dict, scraper_client, log: "CsvLogger",
 
 def _execute(decision: dict, ev: dict, phoenix, log: CsvLogger,
              milestone_map: Optional[dict],
-             processed_store=None) -> None:
+             processed_store=None, gmail=None) -> None:
     """Carry out (or log) the brain's decision for a single event.
 
     Branches on ``decision["action"]``:
@@ -221,10 +222,41 @@ def _execute(decision: dict, ev: dict, phoenix, log: CsvLogger,
                 })
 
         # ── Escalate / Needs human ────────────────────────────────────
-        # Log for human review, skip Phoenix write.
+        # Log for human review, skip Phoenix write. Attempt to forward the
+        # original email to ESCALATION_RECIPIENTS if configured:
+        #   - forward ok  → stamp _forwarded=True (app.py mark_reads it),
+        #                    mark_ok(processed_store).
+        #   - forward err → mark_ok anyway so we don't re-forward next tick;
+        #                    _forwarded stays False so app.py leaves it unread.
+        #   - no recipients → mark_ok, _forwarded=False. Original stays unread
+        #                    so the operator reviews via the Roofix inbox.
+        # In all three sub-cases the email is marked processed exactly once.
         case "escalate" | _ if decision.get("needs_human"):
             log.log("escalate", action, True, "NEEDS HUMAN: " + decision["reasoning"],
                     event_type=etype, project_ref=pref)
+            forwarded = False
+            raw_email = ev.get("_raw_email")
+            if gmail and ESCALATION_RECIPIENTS and raw_email:
+                try:
+                    gmail.forward_email(ESCALATION_RECIPIENTS,
+                                        reason=decision["reasoning"],
+                                        original=raw_email)
+                    forwarded = True
+                    log.log("escalate", "forwarded", True,
+                            f"forwarded to {', '.join(ESCALATION_RECIPIENTS)}",
+                            event_type=etype, project_ref=pref)
+                except Exception as e:
+                    log.log("escalate", "forward_failed", False,
+                            f"forward exception: {e}",
+                            event_type=etype, project_ref=pref)
+            decision["_forwarded"] = forwarded
+            if processed_store:
+                processed_store.mark_ok(ev.get("message_id"), metadata={
+                    "action": "escalate",
+                    "forwarded": forwarded,
+                    "source": decision.get("source", "rule"),
+                    "reasoning": decision["reasoning"],
+                })
 
         # ── Offline dry-run ───────────────────────────────────────────
         # If phoenix client is None, log and stop. No Phoenix write.
@@ -337,7 +369,7 @@ def _execute(decision: dict, ev: dict, phoenix, log: CsvLogger,
 
 def process_batch(raw_emails: list, phoenix=None, log: Optional[CsvLogger] = None,
                   milestone_map: Optional[dict] = None,
-                  scraper_client=None, processed_store=None) -> list:
+                  scraper_client=None, processed_store=None, gmail=None) -> list:
     """Process a batch of raw emails through the full pipeline.
 
     Pipeline per event:
@@ -369,7 +401,14 @@ def process_batch(raw_emails: list, phoenix=None, log: Optional[CsvLogger] = Non
     # ── Step 1: Parse all raw emails into structured events ────────────────
     # Parser is pure: extracts fields from the email only. Scraping and
     # Phoenix lookups happen below, so we don't pay for them twice.
-    parsed = [parse_email(e).as_dict() for e in raw_emails]
+    # ``_raw_email`` is stashed so downstream (escalation forwarding) can
+    # access the original headers + body without a re-fetch. Underscore
+    # marks it as internal — never leaves the orchestrator.
+    parsed = []
+    for e in raw_emails:
+        p = parse_email(e).as_dict()
+        p["_raw_email"] = e
+        parsed.append(p)
 
     # ── Step 2: Group events by project identity ──────────────────────────
     # Each group contains all events belonging to the same Roofix project.
@@ -428,7 +467,7 @@ def process_batch(raw_emails: list, phoenix=None, log: Optional[CsvLogger] = Non
 
             # Execute the decision
             _execute(d, ev, phoenix, log, milestone_map,
-                     processed_store=processed_store)
+                     processed_store=processed_store, gmail=gmail)
 
             # Add the decision to the results
             decisions.append(d)
@@ -438,7 +477,7 @@ def process_batch(raw_emails: list, phoenix=None, log: Optional[CsvLogger] = Non
 
 def run(listener: Callable[[], list], phoenix=None, milestone_map=None,
         log: Optional[CsvLogger] = None,
-        scraper_client=None, processed_store=None) -> list:
+        scraper_client=None, processed_store=None, gmail=None) -> list:
     """Production entry point: fetch one batch of emails and process it.
 
     This is the function called by the scheduler (APS) each tick. It pulls raw
@@ -475,4 +514,5 @@ def run(listener: Callable[[], list], phoenix=None, milestone_map=None,
 
     return process_batch(
         raw, phoenix=phoenix, log=log, milestone_map=milestone_map,
-        scraper_client=scraper_client, processed_store=processed_store)
+        scraper_client=scraper_client, processed_store=processed_store,
+        gmail=gmail)

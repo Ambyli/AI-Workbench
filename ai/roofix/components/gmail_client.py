@@ -216,6 +216,62 @@ class GmailClient:
         self.service().users().messages().modify(
             userId="me", id=message_id, body={"removeLabelIds": ["UNREAD"]}).execute()
 
+    def forward_email(self, to: list[str], reason: str, original: dict) -> None:
+        """Forward `original` (a raw email dict from `fetch()`) to `to`,
+        prefaced with the escalation `reason`. Preserves both text and html
+        parts of the original when available so the recipient sees the full
+        formatting Roofix used.
+
+        No-op if `to` is empty. Raises the underlying HttpError on send
+        failure — the caller (orchestrator) decides how to handle it.
+
+        Uses the same ``gmail.modify`` scope as fetch/mark_read — no re-consent
+        needed on existing tokens.
+        """
+        if not to:
+            return
+        from email.mime.text import MIMEText
+        from email.mime.multipart import MIMEMultipart
+
+        orig_subject = original.get("subject") or "(no subject)"
+        orig_sender = original.get("sender") or ""
+        orig_ts = original.get("timestamp") or ""
+        orig_to = ", ".join(original.get("to") or [])
+        orig_text = original.get("body_text") or ""
+        orig_html = original.get("body_html")
+
+        header = (
+            "[Roofix Bridge] This email was escalated for human review.\n"
+            "\n"
+            f"Reason: {reason}\n"
+            "\n"
+            "--- Forwarded message ---\n"
+            f"From: {orig_sender}\n"
+            f"Date: {orig_ts}\n"
+            f"Subject: {orig_subject}\n"
+            f"To: {orig_to}\n"
+            "\n"
+        )
+
+        text_part = MIMEText(header + orig_text, "plain", "utf-8")
+
+        if orig_html:
+            # Wrap the plaintext header in <pre> for the html part so it still
+            # renders as readable context above the original html body.
+            import html as _std_html
+            html_header = f"<pre>{_std_html.escape(header)}</pre>"
+            msg = MIMEMultipart("alternative")
+            msg.attach(text_part)
+            msg.attach(MIMEText(html_header + orig_html, "html", "utf-8"))
+        else:
+            msg = text_part
+
+        msg["to"] = ", ".join(to)
+        msg["subject"] = f"[Roofix Escalation] {orig_subject}"
+        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+        self.service().users().messages().send(
+            userId="me", body={"raw": raw}).execute()
+
 
 def make_listener_callable(max_results: int = 25):
     """Return a zero-arg callable for orchestrator.run(listener=...)."""

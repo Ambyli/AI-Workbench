@@ -71,6 +71,24 @@ Every `TICK_INTERVAL_SECONDS` (default 300s) the bridge:
 
 Ambiguous or thin `Estimate` / `Estimate Complete` events cause the bridge to call `RoofixScraperClient.get_proposal(tracking_url)` (`ai/roofix/components/roofix_scraper_client.py`) — which POSTs the tracking URL + Roofix's Bubble init/data + elasticsearch/mget URL patterns to `interceptor-api`'s `/capture` and reshapes the response into the `init_data` + `mget_docs` dict that `proposal_extractor.extract_proposal` consumes.
 
+### Execution matrix (what `_execute` does per action)
+
+`orchestrator._execute` receives a Decision from the brain and dispatches on `decision["action"]`. Every branch does three things: (1) log to the CSV audit trail, (2) optionally write to Phoenix, (3) optionally record in `processed_store` and/or (via `app.py`) mark the source email read in Gmail. `mark_read` is decided in `app.py` after `_execute` returns, based on the flags `_execute` stamps on the decision dict.
+
+| `action` | Phoenix write | `processed_store` | Gmail `mark_read` | Notes |
+|---|---|---|---|---|
+| `ignore` | — | `mark_ok({action, source, reasoning})` | only if `source=="rule"` | Terminal. AI-source ignores stay unread so an operator can review the model's judgment. Rule-source ignores are deterministic and safe to silence. |
+| `escalate` / `needs_human=True` | — | `mark_ok({action, forwarded, source, reasoning})` | only if forward succeeded | If `gmail`, `ESCALATION_RECIPIENTS`, and the original email are all available, calls `gmail.forward_email(...)`. On success stamps `decision["_forwarded"]=True` (→ `app.py` marks read). On failure or when no recipients are configured, stamps `False` (→ stays unread for operator review in the Roofix inbox). |
+| `update_chatter` | `phoenix.update_chatter(project_id, note_text)` | — | yes (default) | `target` is the Phoenix project id as str; cast to int. If `phoenix is None` or `DRY_RUN=true`, the write is short-circuited via the Result's `dry_run` flag; the audit row is prefixed `DRY_RUN`. |
+| `update_milestone` | `phoenix.update_milestone(project_id, block_name, status_id)` | — | yes (default) | Looks up the milestone mapping using `event_type` as the key (`FIELD_MAPPING_PATH`). Missing mapping → log a "no milestone mapping for `<event>`" warning and skip the write. |
+| `create_project` (accepted) | `phoenix.ensure_entity_and_project(payload)` | `mark_ok({roofix_project_id, phoenix_entity_id, phoenix_project_id, accepted:True})` on write success; `mark_error({error})` on write failure | yes on success (default) | Uses the `_extracted_payload` stashed by `_scrape_and_extract`. Bails if the payload or `roofix_project_id` is missing (audit row `orchestrator/create_project` with ok=False). |
+| `create_project` (not accepted) | — | `mark_ok({roofix_project_id, accepted:False})` | yes (default) | Proposal wasn't accepted per the extractor's acceptance rule — log `orchestrator/not_accepted` and stop. |
+| _anything else_ | — | `mark_error({error, source, reasoning})` | no (unread) | Most likely an AI hallucination (`"send_email"`, `"call_customer"`, etc.) or a Phase 1 action leaking into Phase 0. `mark_error` (not `mark_ok`) so `is_processed` returns False next tick — the brain gets another chance. Recurring errors here are a signal to tighten `SYSTEM_PROMPT`. |
+
+Sub-cases that short-circuit before the action branches:
+- **Offline dry-run** — when `phoenix is None`, every action other than `ignore` / `escalate` short-circuits with `orchestrator/{action}` ok=True and detail prefixed `offline dry-run:`. No Phoenix write, no `processed_store` write.
+- **Scraper `no_docs`** (upstream of `_execute`, in `_scrape_and_extract`) — the raw email is `mark_error`'d with `{"error": "no_docs"}` so it retries next tick. `_execute` still runs but the `create_project` branch bails because `_extracted_payload` is missing.
+
 ### Configuration
 
 | Variable | Default | Purpose |
@@ -83,6 +101,7 @@ Ambiguous or thin `Estimate` / `Estimate Complete` events cause the bridge to ca
 | `BRAIN_MODEL` | `qwen3.6` | LiteLLM model alias used for AI fallback decisions. |
 | `ROOFIX_SENDER` | `no-reply@roofix.io` | Gmail search-query sender. **Note the two `o`s.** |
 | `LISTENER_QUERY` | `is:unread from:${ROOFIX_SENDER}` | Full Gmail search query. Override to narrow the fetch — e.g. to a single project during first live tests. |
+| `ESCALATION_RECIPIENTS` | _(empty)_ | Comma-separated email addresses. When populated, escalate decisions are forwarded here ("[Roofix Escalation] …") and the original is marked read. When empty (or forward fails) the original stays unread so operators can review it in the Roofix inbox. Either way the email is marked ok in `processed_store` so it won't be re-processed. |
 | `GMAIL_CREDENTIALS_PATH` | `/config/credentials.json` | OAuth 2.0 client secrets file from GCP. See [Gmail OAuth setup](#gmail-oauth-setup). |
 | `GMAIL_TOKEN_PATH` | `/config/token.json` | Refresh-token file. Written by the first successful login; reused thereafter. |
 | `ROOFIX_BRIDGE_CONFIG_DIR` | `./roofix/config` | Host dir containing `credentials.json` + `token.json`. Bind-mounted into the container at `/config` read-only. |

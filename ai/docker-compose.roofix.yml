@@ -77,7 +77,7 @@ services:
       - roofix_data:/data
       # Read-only mount for OAuth secrets — bind to a host dir you control.
       # Populate it once with credentials.json + token.json before first run.
-      - ${ROOFIX_BRIDGE_CONFIG_DIR:-./roofix/config}:/config:ro
+      - ${ROOFIX_BRIDGE_CONFIG_DIR:-./roofix/config}:/config
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
       interval: 30s

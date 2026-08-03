@@ -41,6 +41,10 @@ services:
     container_name: roofix
     restart: unless-stopped
     environment:
+      # When true, setup_logging drops the console handler to DEBUG so
+      # scheduled ticks and audit rows show up in `docker logs roofix`.
+      # False keeps the console at WARNING (production noise floor).
+      - DEBUG_LOGGING=${DEBUG_LOGGING:-false}
       - DRY_RUN=${DRY_RUN:-true}
       - AGENT_PHASE=${AGENT_PHASE:-0}
       - TICK_INTERVAL_SECONDS=${TICK_INTERVAL_SECONDS:-300}

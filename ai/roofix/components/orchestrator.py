@@ -633,32 +633,60 @@ async def _process_group(
         ctx = await _resolve_context(ev, phoenix)
 
         # ── Scrape gate ────────────────────────────────────────────────
-        # Scrape when the event is one whose real data lives behind the
-        # proposal link (Estimate / Estimate Complete) AND Phoenix either:
-        #   - couldn't identify the project at all (miss), OR
-        #   - matched multiple candidates (ambiguous) — the scrape gives us
-        #     the authoritative Roofix project id from custom.order1, which
-        #     re-resolves via find_project_by_roofix_id to narrow to one.
-        # Single-match Phoenix hits skip the scrape (already unambiguous).
-        # _scrape_and_extract logs its own scraper/extractor audit rows and
-        # marks processed_store on no_docs / timeout — we don't wrap here.
-        will_scrape = bool(
-            scraper_client
-            and ev.get("tracking_url")
+        # Two independent reasons to scrape:
+        #
+        #   1. Phoenix MISS on a proposal-linked event (Estimate /
+        #      Estimate Complete). The real project data lives behind the
+        #      tracking URL, so we fetch it and re-resolve to hopefully
+        #      land on a match this time.
+        #
+        #   2. Phoenix AMBIGUOUS (multiple candidate projects) on ANY
+        #      event type. The scrape gives us the authoritative Roofix
+        #      project id from custom.order1; the re-resolve then routes
+        #      via find_project_by_roofix_id and narrows to one.
+        #
+        # Both reasons require a scraper_client and a tracking_url — no
+        # scrape is possible without them. Single-match Phoenix hits skip
+        # the scrape (already unambiguous). _scrape_and_extract logs its
+        # own scraper/extractor audit rows and marks processed_store on
+        # no_docs / timeout — we don't wrap here.
+        has_scrape_prereqs = bool(scraper_client and ev.get("tracking_url"))
+        scrape_for_miss = (
+            has_scrape_prereqs
+            and not ctx.get("found")
             and ev.get("event_type") in SCRAPE_EVENTS
-            and (not ctx.get("found") or ctx.get("ambiguous"))
         )
+        scrape_for_ambiguity = has_scrape_prereqs and ctx.get("ambiguous")
+        will_scrape = scrape_for_miss or scrape_for_ambiguity
+
         if will_scrape:
-            gate_detail = "will scrape (proposal-linked event, project not resolved)"
+            if scrape_for_ambiguity:
+                gate_detail = (
+                    f"will scrape (phoenix returned "
+                    f"{ctx.get('candidate_count', '?')} candidates — need refinement)"
+                )
+            else:
+                gate_detail = (
+                    "will scrape (proposal-linked event, phoenix miss)"
+                )
         else:
             reasons = []
             if not scraper_client:
                 reasons.append("no scraper_client")
             if not ev.get("tracking_url"):
                 reasons.append("no tracking_url")
-            if ev.get("event_type") not in SCRAPE_EVENTS:
+            # Only relevant when neither ambiguity nor a miss triggered a
+            # scrape. Explaining event_type ineligibility here is only
+            # useful on the phoenix-miss path — ambiguity would have
+            # scraped regardless of event_type.
+            if (
+                not ctx.get("ambiguous")
+                and not ctx.get("found")
+                and ev.get("event_type") not in SCRAPE_EVENTS
+            ):
                 reasons.append(
-                    f"event_type {ev.get('event_type')!r} not scrape-eligible"
+                    f"event_type {ev.get('event_type')!r} not scrape-eligible "
+                    "and phoenix miss (nothing to refine)"
                 )
             if ctx.get("found") and not ctx.get("ambiguous"):
                 reasons.append("phoenix resolved unambiguously")

@@ -41,6 +41,22 @@ TEMP_ROOT = Path(PROFILES_ROOT) / ".temp"
 # alphabet. Anchored full-match — no path separators, no leading dots.
 _NAME_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
 
+# Chrome's process-lock artifacts. SingletonSocket is a Unix domain socket
+# (copytree's copy2 raises ENXIO on it). SingletonLock and SingletonCookie
+# are symlinks to <hostname>-<pid> of the Chrome that owns the profile —
+# dangling the instant that Chrome exits, which trips copytree's default
+# follow-symlinks behavior with FileNotFoundError. None are useful in a
+# clone: they encode "this pid holds the lock," which is false by
+# definition once you copy the dir, and the launcher clears any lingering
+# SingletonLock before opening Chrome anyway.
+_SINGLETON_FILES = frozenset({"SingletonSocket", "SingletonLock", "SingletonCookie"})
+
+
+def _ignore_chrome_singletons(_src: str, names: list[str]) -> set[str]:
+    """``shutil.copytree`` ignore callable — filters out the three Chrome
+    singleton artifacts. See ``_SINGLETON_FILES`` for why."""
+    return {n for n in names if n in _SINGLETON_FILES}
+
 
 class InvalidProfileNameError(ValueError):
     pass
@@ -134,17 +150,27 @@ def clone_profile(name: str) -> Path:
     by another concurrent capture. See ``ai/interceptor/app.py`` for the
     fast/slow path logic.
 
-    Raw ``shutil.copytree`` of a live profile is safe: Chrome's on-disk stores
-    (SQLite ``Cookies``, LevelDB ``Local Storage``/``IndexedDB``) all use
-    journal-based crash recovery, so a mid-write snapshot at worst yields a
-    slightly-stale-but-consistent state, never corruption.
+    ``shutil.copytree`` of a live profile is safe for Chrome's on-disk stores
+    (SQLite ``Cookies``, LevelDB ``Local Storage`` / ``IndexedDB``) — they all
+    use journal-based crash recovery, so a mid-write snapshot at worst yields
+    a slightly-stale-but-consistent state, never corruption. What isn't safe
+    is copying Chrome's process-lock files (``Singleton*``); those get
+    filtered out via ``_ignore_chrome_singletons``.
+
+    On any copy failure the partial temp dir is removed before re-raising, so
+    the caller can treat this function as atomic — either it returns a good
+    temp dir or it raises with nothing left behind under ``TEMP_ROOT``.
     """
     src = profile_path(name)
     if not src.is_dir():
         raise FileNotFoundError(f"profile {name!r} not present at {src}")
     TEMP_ROOT.mkdir(parents=True, exist_ok=True)
     temp = TEMP_ROOT / f"temp_profile_{uuid4().hex}"
-    shutil.copytree(src, temp)
+    try:
+        shutil.copytree(src, temp, ignore=_ignore_chrome_singletons)
+    except Exception:
+        shutil.rmtree(temp, ignore_errors=True)
+        raise
     return temp
 
 

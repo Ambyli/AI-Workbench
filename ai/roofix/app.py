@@ -206,6 +206,15 @@ async def _run_one_batch(
                 # The orchestrator has already marked ALL of these ok in
                 # processed_store, so nothing gets re-processed next tick —
                 # this gate only controls Gmail visibility.
+                # Per-message try/except so one transient Gmail hiccup (429,
+                # 5xx, 404 on a message that was deleted between fetch and
+                # mark) can't cascade — pre-fix, a single failure here
+                # abandoned every remaining mark_read for the batch, which
+                # left rows marked `ok` in processed_store but still unread
+                # in Gmail. That drift is what filled the 25-message fetch
+                # window with stuck-unread emails on subsequent ticks.
+                # Failures are logged to the audit CSV so we can see which
+                # ids keep failing; nothing else changes.
                 processed_ids = set()
                 for item in records:
                     d = item["decision"]
@@ -215,9 +224,20 @@ async def _run_one_batch(
                     if action == "ignore" and d.get("source") != "rule":
                         continue
                     mid = d.get("message_id")
-                    if mid:
+                    if not mid:
+                        continue
+                    try:
                         await asyncio.to_thread(gmail.mark_read, mid)
                         processed_ids.add(mid)
+                    except Exception as e:
+                        _audit_log.log(
+                            "gmail",
+                            "mark_read_failed",
+                            False,
+                            f"{mid}: {e}",
+                            event_type=item.get("event", {}).get("event_type", ""),
+                            project_ref="",
+                        )
 
         _record_tick(records, error=None)
         return {"records": records, "count": len(records)}

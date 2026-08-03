@@ -160,6 +160,50 @@ class GmailClient:
 
     # --- public -----------------------------------------------------------------
 
+    def _get_message(self, message_id: str):
+        """Fetch one Gmail message by id with the same retry policy as ``fetch``.
+
+        Returns the raw API dict or ``None`` if all retries exhausted. A
+        non-transient HttpError (e.g. 404) propagates so the caller can
+        distinguish "message doesn't exist" from "transient failure."
+        """
+        import time
+        from googleapiclient.errors import HttpError
+
+        svc = self.service()
+        for attempt in range(3):
+            try:
+                return svc.users().messages().get(
+                    userId="me", id=message_id, format="full").execute()
+            except HttpError as e:
+                if e.resp.status in (429, 500, 502, 503, 504):
+                    time.sleep(2 ** attempt + 0.5)
+                    continue
+                raise
+        return None
+
+    def _to_email_dict(self, msg: dict) -> dict:
+        """Convert a raw Gmail API message dict into the flat "Contract A"
+        dict every downstream component (parser, brain, orchestrator) expects."""
+        payload = msg.get("payload", {})
+        headers = payload.get("headers", [])
+        text, html = self._extract_bodies(payload)
+        ts = self._header(headers, "Date")
+        try:
+            ts_iso = parsedate_to_datetime(ts).astimezone(timezone.utc).isoformat()
+        except Exception:
+            ts_iso = datetime.now(timezone.utc).isoformat()
+        return {
+            "sender": self._header(headers, "From"),
+            "subject": self._header(headers, "Subject"),
+            "body_text": text or _html_to_text(html) or msg.get("snippet", ""),
+            "body_html": html,
+            "timestamp": ts_iso,
+            "to": [a.strip() for a in self._header(headers, "To").split(",") if a],
+            "message_id": msg.get("id"),
+            "attachments": self._attachments(payload),
+        }
+
     def fetch(self, max_results: int = 25, query: str | None = None) -> list:
         """Return raw emails (Contract A) for matching mail. Does NOT mark
         read — the caller marks read only after successful processing, so a
@@ -168,49 +212,35 @@ class GmailClient:
         Retries on transient API errors (rate limits, precondition failures)
         with exponential backoff. Skips messages that fail after all retries.
         """
-        import time
-        from googleapiclient.errors import HttpError
-
         svc = self.service()
         q = query or QUERY
         resp = svc.users().messages().list(
             userId="me", q=q, maxResults=max_results).execute()
         out = []
         for ref in resp.get("messages", []):
-            msg = None
-            retries = 3
-            for attempt in range(retries):
-                try:
-                    msg = svc.users().messages().get(
-                        userId="me", id=ref["id"], format="full").execute()
-                    break
-                except HttpError as e:
-                    if e.resp.status in (429, 500, 502, 503, 504):
-                        wait = 2 ** attempt + 0.5
-                        time.sleep(wait)
-                        continue
-                    raise
+            msg = self._get_message(ref["id"])
             if msg is None:
                 continue
-            payload = msg.get("payload", {})
-            headers = payload.get("headers", [])
-            text, html = self._extract_bodies(payload)
-            ts = self._header(headers, "Date")
-            try:
-                ts_iso = parsedate_to_datetime(ts).astimezone(timezone.utc).isoformat()
-            except Exception:
-                ts_iso = datetime.now(timezone.utc).isoformat()
-            out.append({
-                "sender": self._header(headers, "From"),
-                "subject": self._header(headers, "Subject"),
-                "body_text": text or _html_to_text(html) or msg.get("snippet", ""),
-                "body_html": html,
-                "timestamp": ts_iso,
-                "to": [a.strip() for a in self._header(headers, "To").split(",") if a],
-                "message_id": ref["id"],
-                "attachments": self._attachments(payload),
-            })
+            out.append(self._to_email_dict(msg))
         return out
+
+    def fetch_one(self, message_id: str) -> dict | None:
+        """Return one Contract-A email dict for ``message_id`` regardless of
+        read/unread state, or ``None`` if the message isn't retrievable.
+
+        Used by the manual ``/execute/{message_id}`` endpoint to re-run a
+        specific email through the pipeline — skips the label query used by
+        ``fetch``. A 404 from Gmail (message doesn't exist / not visible to
+        this token) propagates as ``HttpError`` so the caller can 404 too.
+        """
+        from googleapiclient.errors import HttpError
+        try:
+            msg = self._get_message(message_id)
+        except HttpError as e:
+            if e.resp.status == 404:
+                return None
+            raise
+        return self._to_email_dict(msg) if msg else None
 
     def mark_read(self, message_id: str) -> None:
         self.service().users().messages().modify(

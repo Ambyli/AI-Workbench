@@ -31,6 +31,7 @@ Before the bridge can hydrate proposals, upload a Roofix profile to interceptor 
 | `GET /health` | Container healthcheck. |
 | `GET /status` | Last-tick timestamp, per-action decision counts, escalation counts, error count, effective `DRY_RUN` / `AGENT_PHASE`. |
 | `POST /tick` | Manually process one batch now. Body optionally accepts `{"raw_emails": [...]}` (Contract A shape) to process crafted samples without hitting Gmail. |
+| `POST /execute/{message_id}` | Re-run one specific Gmail message through the pipeline. Fetches by id regardless of read/unread state, skips the `processed_store` dedup filter, otherwise runs the same orchestrator path a scheduled tick would (Phoenix writes, `mark_read`, escalation forward — all subject to `DRY_RUN`). Returns `404` if the id isn't visible to the OAuth token, `200 {records, count}` on success. |
 
 Reach the bridge from another container on `ai_shared`:
 

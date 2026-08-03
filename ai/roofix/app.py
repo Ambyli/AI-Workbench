@@ -2,10 +2,13 @@
 Roofix Bridge — FastAPI + APScheduler entry point.
 
 Endpoints:
-    GET  /health        healthcheck (for Docker)
-    GET  /status        last-tick summary, decision counts, error counts
-    POST /tick          manual batch trigger; body accepts optional {raw_emails: [...]}
-                        for offline / crafted-event testing
+    GET  /health                       healthcheck (for Docker)
+    GET  /status                       last-tick summary, decision counts, error counts
+    POST /tick                         manual batch trigger; body accepts optional
+                                       {raw_emails: [...]} for offline / crafted-event testing
+    POST /execute/{message_id}         re-run one specific Gmail message through the
+                                       pipeline, bypassing the processed_store dedup.
+                                       Same actions as a normal tick (subject to DRY_RUN).
 
 Scheduler runs a batch every TICK_INTERVAL_SECONDS. Gmail (via direct Google
 API) is polled for unread Roofix mail; each email is parsed, the brain decides,
@@ -27,7 +30,7 @@ from pathlib import Path
 from typing import Optional
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from common.env import load_env
@@ -122,12 +125,19 @@ def _load_milestone_map() -> dict:
         return {}
 
 
-async def _run_one_batch(raw_emails: Optional[list] = None) -> dict:
+async def _run_one_batch(
+    raw_emails: Optional[list] = None,
+    skip_dedup: bool = False,
+) -> dict:
     """Run one processing batch. If raw_emails is None, pull from Gmail.
 
     Serialized by ``_tick_lock`` — a second call arriving while a batch is
     in flight will await the current one, guaranteeing no overlap between
     the scheduler tick and manual ``/tick`` requests.
+
+    ``skip_dedup=True`` bypasses the ``processed_store.is_processed`` filter
+    so an already-handled email can be re-run. Used by ``/execute/{id}``;
+    normal scheduled ticks leave it False so the dedup guarantee holds.
 
     Sync client context managers (PhoenixClient, GmailClient, ProcessedStore)
     remain sync-with — they open cheap resources (a psycopg2 connection, a
@@ -150,15 +160,25 @@ async def _run_one_batch(raw_emails: Optional[list] = None) -> dict:
 
                 # Filter out already-processed emails. is_processed hits sqlite;
                 # cheap, but wrap in to_thread so many misses don't block the loop.
-                unprocessed = [
-                    e for e in raw_emails
-                    if not processed_store.is_processed(e.get("message_id"))
-                ]
-                _audit_log.log(
-                    "listener", "filtered", True,
-                    f"{len(unprocessed)} email(s) after filtering processed",
-                    event_type="", project_ref="",
-                )
+                # Skipped entirely for manual /execute runs — the caller has
+                # explicitly asked to re-process this id.
+                if skip_dedup:
+                    unprocessed = list(raw_emails)
+                    _audit_log.log(
+                        "listener", "filtered", True,
+                        f"{len(unprocessed)} email(s) (dedup skipped)",
+                        event_type="", project_ref="",
+                    )
+                else:
+                    unprocessed = [
+                        e for e in raw_emails
+                        if not processed_store.is_processed(e.get("message_id"))
+                    ]
+                    _audit_log.log(
+                        "listener", "filtered", True,
+                        f"{len(unprocessed)} email(s) after filtering processed",
+                        event_type="", project_ref="",
+                    )
 
                 records = await orchestrator_run(
                     listener=lambda: unprocessed,
@@ -283,6 +303,34 @@ async def tick(req: Optional[TickRequest] = None) -> dict:
     raw = req.raw_emails if req else None
     try:
         return await _run_one_batch(raw_emails=raw)
+    except Exception as e:
+        _record_tick([], error=repr(e))
+        return {"error": repr(e), "records": [], "count": 0}
+
+
+@app.post("/execute/{message_id}")
+async def execute(message_id: str) -> dict:
+    """Manually run one Gmail message through the full pipeline.
+
+    Fetches ``message_id`` from Gmail regardless of read/unread state,
+    skips the ``processed_store`` dedup, and otherwise runs the same
+    orchestrator path a scheduled tick would — Phoenix writes,
+    ``mark_read``, escalation forwarding all happen normally (subject
+    to ``DRY_RUN``). Serialized with the scheduler via the tick lock.
+
+    Returns 404 if Gmail can't find the id under this token, 200 with
+    the standard ``{records, count}`` shape on success, or 200 with
+    ``{error, ...}`` if the pipeline itself raised.
+    """
+    with GmailClient() as gmail:
+        msg = await asyncio.to_thread(gmail.fetch_one, message_id)
+    if msg is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"message_id {message_id!r} not found in Gmail",
+        )
+    try:
+        return await _run_one_batch(raw_emails=[msg], skip_dedup=True)
     except Exception as e:
         _record_tick([], error=repr(e))
         return {"error": repr(e), "records": [], "count": 0}

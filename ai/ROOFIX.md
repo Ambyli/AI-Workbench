@@ -32,6 +32,7 @@ Before the bridge can hydrate proposals, upload a Roofix profile to interceptor 
 | `GET /status` | Last-tick timestamp, per-action decision counts, escalation counts, error count, effective `DRY_RUN` / `AGENT_PHASE`. |
 | `POST /tick` | Manually process one batch now. Body optionally accepts `{"raw_emails": [...]}` (Contract A shape) to process crafted samples without hitting Gmail. |
 | `POST /execute/{message_id}` | Re-run one specific Gmail message through the pipeline. Fetches by id regardless of read/unread state, skips the `processed_store` dedup filter, otherwise runs the same orchestrator path a scheduled tick would (Phoenix writes, `mark_read`, escalation forward — all subject to `DRY_RUN`). Returns `404` if the id isn't visible to the OAuth token, `200 {records, count}` on success. |
+| `POST /labels/backfill` | One-time repair: applies `ROOFIX_PROCESSED_LABEL` to every `ok` / `error` row currently in processed_store. Idempotent (safe to re-run). Response is `{label, counts: {labeled, skipped, failed}}`. Run this once after upgrading to the labeled-fetch model to sweep the existing stuck-unread backlog out of the `LISTENER_QUERY` window; per-message failures are audit-logged. |
 
 Reach the bridge from another container on `ai_shared`:
 
@@ -102,7 +103,8 @@ Sub-cases that short-circuit before the action branches:
 | `ROOFIX_LLM_API_KEY` | Auth for LiteLLM. |
 | `BRAIN_MODEL` | `qwen3.6` | LiteLLM model alias used for AI fallback decisions. |
 | `ROOFIX_SENDER` | `no-reply@roofix.io` | Gmail search-query sender. **Note the two `o`s.** |
-| `LISTENER_QUERY` | `is:unread from:${ROOFIX_SENDER}` | Full Gmail search query. Override to narrow the fetch — e.g. to a single project during first live tests. |
+| `ROOFIX_PROCESSED_LABEL` | `roofix/processed` | Gmail label the bridge applies to every message it evaluates. Excluded server-side in the default `LISTENER_QUERY` so processed emails don't refill the 25-message fetch window on subsequent ticks. Slash-separated names show as nested folders in Gmail's sidebar. |
+| `LISTENER_QUERY` | `is:unread from:${ROOFIX_SENDER} -label:${ROOFIX_PROCESSED_LABEL}` | Full Gmail search query. Override to narrow the fetch — e.g. to a single project during first live tests. **Keep the `-label:` clause or every processed email will refill the fetch window each tick.** |
 | `ESCALATION_RECIPIENTS` | _(empty)_ | Comma-separated email addresses. When populated, escalate decisions are forwarded here ("[Roofix Escalation] …") and the original is marked read. When empty (or forward fails) the original stays unread so operators can review it in the Roofix inbox. Either way the email is marked ok in `processed_store` so it won't be re-processed. |
 | `GMAIL_CREDENTIALS_PATH` | `/config/credentials.json` | OAuth 2.0 client secrets file from GCP. See [Gmail OAuth setup](#gmail-oauth-setup). |
 | `GMAIL_TOKEN_PATH` | `/config/token.json` | Refresh-token file. Written by the first successful login; reused thereafter. |

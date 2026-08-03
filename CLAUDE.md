@@ -46,6 +46,7 @@ Key variables:
 | `TICK_INTERVAL_SECONDS` | `300` | Roofix Bridge: APScheduler cadence |
 | `BRAIN_MODEL` | `qwen3.6` | Roofix Bridge: LiteLLM alias for the AI-fallback brain |
 | `ROOFIX_SENDER` | `no-reply@roofix.io` | Roofix Bridge: Gmail search-query sender (two `o`s) |
+| `ROOFIX_PROCESSED_LABEL` | `roofix/processed` | Roofix Bridge: Gmail label applied to every message the bridge evaluates; excluded server-side from `LISTENER_QUERY` so already-processed emails don't fill the 25-message fetch window. Backfill existing rows with `POST /labels/backfill`. |
 | `ESCALATION_RECIPIENTS` | _(empty)_ | Roofix Bridge: comma-separated recipients that receive forwarded escalations. Empty disables forwarding — escalates stay unread in Gmail for direct operator review. |
 | `GMAIL_CREDENTIALS_PATH` | `/config/credentials.json` | Roofix Bridge: OAuth client-secrets file |
 | `GMAIL_TOKEN_PATH` | `/config/token.json` | Roofix Bridge: OAuth refresh-token file |

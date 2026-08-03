@@ -85,6 +85,10 @@ def _html_to_text(html: str) -> str:
 class GmailClient:
     def __init__(self):
         self._service = None
+        # Cache of label name → id, populated on first lookup. Gmail label
+        # ids are stable per user, so this only misses once per process
+        # lifetime. Avoids listing all labels on every tick.
+        self._label_id_cache: dict[str, str] = {}
 
     def _auth(self):
         creds = None
@@ -245,6 +249,47 @@ class GmailClient:
     def mark_read(self, message_id: str) -> None:
         self.service().users().messages().modify(
             userId="me", id=message_id, body={"removeLabelIds": ["UNREAD"]}).execute()
+
+    def get_or_create_label(self, name: str) -> str:
+        """Return the Gmail label id for ``name``, creating it if missing.
+
+        Cached in-process — first tick after boot pays for a `labels.list`;
+        subsequent ticks hit the cache. If the operator deletes the label
+        in Gmail's UI while the container is running, we'll try to re-create
+        it on the next call (create() raises 409 on collision, which we
+        treat as "someone else created it in the meantime" and re-list).
+        """
+        cached = self._label_id_cache.get(name)
+        if cached:
+            return cached
+        svc = self.service()
+        listing = svc.users().labels().list(userId="me").execute()
+        for lb in listing.get("labels", []):
+            if lb.get("name") == name:
+                self._label_id_cache[name] = lb["id"]
+                return lb["id"]
+        # Not found — create. `nameSpace/child` in the display name gives
+        # a nested folder in Gmail's sidebar without needing separate calls
+        # for the parent, which matches how operators expect to see it.
+        created = svc.users().labels().create(
+            userId="me",
+            body={
+                "name": name,
+                "labelListVisibility": "labelShow",
+                "messageListVisibility": "show",
+            },
+        ).execute()
+        self._label_id_cache[name] = created["id"]
+        return created["id"]
+
+    def apply_label(self, message_id: str, label_id: str) -> None:
+        """Add a single label to a message. Idempotent — Gmail returns 200
+        with no side effect if the label was already present."""
+        self.service().users().messages().modify(
+            userId="me",
+            id=message_id,
+            body={"addLabelIds": [label_id]},
+        ).execute()
 
     def forward_email(self, to: list[str], reason: str, original: dict,
                       event_type: str = "") -> None:

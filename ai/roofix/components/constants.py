@@ -117,8 +117,23 @@ GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
 ROOFIX_SENDER = os.getenv("ROOFIX_SENDER", "no-reply@roofix.io")
 GMAIL_CREDENTIALS_PATH = os.getenv("GMAIL_CREDENTIALS_PATH", "config/credentials.json")
 GMAIL_TOKEN_PATH = os.getenv("GMAIL_TOKEN_PATH", "config/token.json")
-# Listener query: unread, from the Roofix sender. Override via env for narrowing.
-LISTENER_QUERY = os.getenv("LISTENER_QUERY") or f"is:unread from:{ROOFIX_SENDER}"
+
+# Gmail label the bridge stamps on every message it has evaluated. Excluded
+# from LISTENER_QUERY server-side so already-processed emails don't fill the
+# 25-message fetch window on subsequent ticks — this is what prevents the
+# stuck-unread lockup the operator would otherwise see when escalates (or
+# any deliberately-unread class) accumulate faster than they're cleared.
+# The slash is Gmail's convention for a nested label in the sidebar.
+ROOFIX_PROCESSED_LABEL = os.getenv("ROOFIX_PROCESSED_LABEL", "roofix/processed")
+
+# Listener query: unread, from the Roofix sender, EXCLUDING anything the
+# bridge has already labeled. Override via env for narrowing (e.g. to a
+# single project) — if you override, remember to keep the `-label:` clause
+# or you'll re-fetch every processed email on every tick.
+LISTENER_QUERY = (
+    os.getenv("LISTENER_QUERY")
+    or f"is:unread from:{ROOFIX_SENDER} -label:{ROOFIX_PROCESSED_LABEL}"
+)
 
 # Comma-separated recipient list for forwarded escalations. Empty disables
 # forwarding — escalates then stay unread in Gmail for direct operator review.

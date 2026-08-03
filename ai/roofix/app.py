@@ -9,6 +9,9 @@ Endpoints:
     POST /execute/{message_id}         re-run one specific Gmail message through the
                                        pipeline, bypassing the processed_store dedup.
                                        Same actions as a normal tick (subject to DRY_RUN).
+    POST /labels/backfill              one-time repair: apply ROOFIX_PROCESSED_LABEL
+                                       to every message_id currently in processed_store
+                                       so the labeled-fetch query excludes them.
 
 Scheduler runs a batch every TICK_INTERVAL_SECONDS. Gmail (via direct Google
 API) is polled for unread Roofix mail; each email is parsed, the brain decides,
@@ -39,6 +42,7 @@ from common.processed_store import PostgresProcessedStore
 
 load_env()
 
+from components.constants import ROOFIX_PROCESSED_LABEL
 from components.gmail_client import GmailClient
 from components.orchestrator import LOG_COLUMNS, process_batch, run as orchestrator_run
 from components.phoenix_client import PhoenixClient
@@ -206,6 +210,24 @@ async def _run_one_batch(
                 # The orchestrator has already marked ALL of these ok in
                 # processed_store, so nothing gets re-processed next tick —
                 # this gate only controls Gmail visibility.
+                # Resolve the processed-label id ONCE per batch. Cached
+                # in-process by GmailClient after first lookup, so this is
+                # a no-op on every tick but the first-after-boot.
+                try:
+                    processed_label_id = await asyncio.to_thread(
+                        gmail.get_or_create_label, ROOFIX_PROCESSED_LABEL
+                    )
+                except Exception as e:
+                    processed_label_id = None
+                    _audit_log.log(
+                        "gmail",
+                        "label_lookup_failed",
+                        False,
+                        f"{ROOFIX_PROCESSED_LABEL!r}: {e}",
+                        event_type="",
+                        project_ref="",
+                    )
+
                 # Per-message try/except so one transient Gmail hiccup (429,
                 # 5xx, 404 on a message that was deleted between fetch and
                 # mark) can't cascade — pre-fix, a single failure here
@@ -213,18 +235,45 @@ async def _run_one_batch(
                 # left rows marked `ok` in processed_store but still unread
                 # in Gmail. That drift is what filled the 25-message fetch
                 # window with stuck-unread emails on subsequent ticks.
-                # Failures are logged to the audit CSV so we can see which
-                # ids keep failing; nothing else changes.
+                #
+                # Order: label FIRST (unconditional — every evaluated email
+                # gets tagged so the LISTENER_QUERY's `-label:...` excludes
+                # it next tick), then mark_read only for the classes that
+                # should also disappear from the operator's inbox view.
+                # Failures on either step are audit-logged and skipped;
+                # nothing else changes.
                 processed_ids = set()
                 for item in records:
                     d = item["decision"]
+                    mid = d.get("message_id")
+                    if not mid:
+                        continue
+                    etype = item.get("event", {}).get("event_type", "")
+
+                    # ── Step 1: apply the "we've seen this" label ────────
+                    # Unconditional. Even escalate-not-forwarded and AI-
+                    # ignore rows get labeled — they still need to leave the
+                    # bridge's fetch queue, they just stay unread visually.
+                    if processed_label_id is not None:
+                        try:
+                            await asyncio.to_thread(
+                                gmail.apply_label, mid, processed_label_id
+                            )
+                        except Exception as e:
+                            _audit_log.log(
+                                "gmail",
+                                "apply_label_failed",
+                                False,
+                                f"{mid}: {e}",
+                                event_type=etype,
+                                project_ref="",
+                            )
+
+                    # ── Step 2: mark_read for the "clear from inbox" classes ─
                     action = d.get("action")
                     if action == "escalate" and not d.get("_forwarded"):
                         continue
                     if action == "ignore" and d.get("source") != "rule":
-                        continue
-                    mid = d.get("message_id")
-                    if not mid:
                         continue
                     try:
                         await asyncio.to_thread(gmail.mark_read, mid)
@@ -235,7 +284,7 @@ async def _run_one_batch(
                             "mark_read_failed",
                             False,
                             f"{mid}: {e}",
-                            event_type=item.get("event", {}).get("event_type", ""),
+                            event_type=etype,
                             project_ref="",
                         )
 
@@ -355,6 +404,61 @@ async def execute(message_id: str) -> dict:
     except Exception as e:
         _record_tick([], error=repr(e))
         return {"error": repr(e), "records": [], "count": 0}
+
+
+@app.post("/labels/backfill")
+async def backfill_labels() -> dict:
+    """One-time repair: apply the ``ROOFIX_PROCESSED_LABEL`` Gmail label to
+    every message id currently marked ``ok`` or ``error`` in processed_store.
+
+    Run this once after upgrading to the labeled-fetch model to sweep the
+    existing backlog of stuck-unread rows out of the ``LISTENER_QUERY``
+    window. Safe to re-run — ``apply_label`` is idempotent, so re-labeling
+    already-labeled messages is a no-op on Gmail's side.
+
+    Returns per-status counts: ``labeled`` (Gmail accepted the modify),
+    ``skipped`` (row had no message_id — shouldn't happen for real rows),
+    and ``failed`` (Gmail returned an error, e.g. message deleted). The
+    failed count is not surfaced per-mid in the response body to keep it
+    small; per-mid failures are logged to the audit CSV as
+    ``gmail / apply_label_failed``.
+    """
+    counts = {"labeled": 0, "skipped": 0, "failed": 0}
+    with (
+        GmailClient() as gmail,
+        PostgresProcessedStore(ROOFIX_DB_DSN) as processed_store,
+    ):
+        try:
+            label_id = await asyncio.to_thread(
+                gmail.get_or_create_label, ROOFIX_PROCESSED_LABEL
+            )
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"could not resolve label {ROOFIX_PROCESSED_LABEL!r}: {e}",
+            )
+
+        # Walk every ok + error row. Skip pending (still in-flight).
+        for status_name in ("ok", "error"):
+            for rec in processed_store.list_by_status(status_name):
+                mid = rec.key
+                if not mid:
+                    counts["skipped"] += 1
+                    continue
+                try:
+                    await asyncio.to_thread(gmail.apply_label, mid, label_id)
+                    counts["labeled"] += 1
+                except Exception as e:
+                    counts["failed"] += 1
+                    _audit_log.log(
+                        "gmail",
+                        "apply_label_failed",
+                        False,
+                        f"backfill {mid}: {e}",
+                        event_type="",
+                        project_ref="",
+                    )
+    return {"label": ROOFIX_PROCESSED_LABEL, "counts": counts}
 
 
 if __name__ == "__main__":

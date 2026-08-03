@@ -52,6 +52,10 @@ services:
       - ROOFIX_LLM_API_KEY=${ROOFIX_LLM_API_KEY:-}
       - BRAIN_MODEL=${BRAIN_MODEL:-qwen3.6}
       - ROOFIX_SENDER=${ROOFIX_SENDER:-no-reply@roofix.io}
+      # Gmail label the bridge stamps on every email it has evaluated,
+      # excluded from LISTENER_QUERY server-side so processed emails don't
+      # fill the 25-message fetch window on subsequent ticks.
+      - ROOFIX_PROCESSED_LABEL=${ROOFIX_PROCESSED_LABEL:-roofix/processed}
       - LISTENER_QUERY=${LISTENER_QUERY:-}
       # Comma-separated recipient list for forwarded escalations. Empty disables.
       - ESCALATION_RECIPIENTS=${ESCALATION_RECIPIENTS:-}

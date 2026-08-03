@@ -32,7 +32,7 @@ from components.proposal_extractor import extract_proposal
 from components.constants import (
     DRY_RUN,
     LOG_COLUMNS,
-    SCRAPE_EVENTS,
+    IGNORE_EVENTS,
     EXTRACTED_PAYLOAD_FIELDS as _EXTRACTED_PAYLOAD_FIELDS,
     ESCALATION_RECIPIENTS,
     INTERCEPTOR_MAX_CONCURRENT,
@@ -150,10 +150,13 @@ async def _scrape_and_extract(
     """Fetch + extract the proposal behind ``ev["tracking_url"]``.
 
     Preconditions the caller must verify before invoking:
-      * event type is in ``SCRAPE_EVENTS`` (Estimate / Estimate Complete)
       * ``ev["tracking_url"]`` is present
       * a scraper_client instance is available
-      * the Phoenix resolve already missed (otherwise the scrape is waste)
+      * either the Phoenix resolve missed or returned an ambiguous match —
+        a single-match resolve leaves nothing to refine, so the scrape
+        would be waste
+      * event type is NOT in ``IGNORE_EVENTS`` — those short-circuit before
+        the gate ever runs since the brain ignores them regardless
 
     Concurrency: ``scrape_sem`` (created per-batch by process_batch) rate-limits
     outbound scrapes to ``INTERCEPTOR_MAX_CONCURRENT``. On a 25-email burst all
@@ -661,87 +664,97 @@ async def _process_group(
             project_ref=key,
         )
 
-        # Resolve the project context from Phoenix — the single authoritative
-        # "does Phoenix know this project?" check. Its result flows straight
-        # into decide() below, so the brain sees the same answer we used to
-        # gate the scrape. Stamp the resolved Phoenix id onto ev so both
-        # decide() and the returned record can read it from one place — None
-        # when Phoenix missed or came back ambiguous.
-        ctx = await _resolve_context(ev, phoenix)
-        ev["project_id"] = ctx.get("project_id")
+        etype = ev.get("event_type", "")
 
-        # ── Scrape gate ────────────────────────────────────────────────
-        # Two independent reasons to scrape:
-        #
-        #   1. Phoenix MISS on a proposal-linked event (Estimate /
-        #      Estimate Complete). The real project data lives behind the
-        #      tracking URL, so we fetch it and re-resolve to hopefully
-        #      land on a match this time.
-        #
-        #   2. Phoenix AMBIGUOUS (multiple candidate projects) on ANY
-        #      event type. The scrape gives us the authoritative Roofix
-        #      project id from custom.order1; the re-resolve then routes
-        #      via find_project_by_roofix_id and narrows to one.
-        #
-        # Both reasons require a scraper_client and a tracking_url — no
-        # scrape is possible without them. Single-match Phoenix hits skip
-        # the scrape (already unambiguous). _scrape_and_extract logs its
-        # own scraper/extractor audit rows and marks processed_store on
-        # no_docs / timeout — we don't wrap here.
-        has_scrape_prereqs = bool(scraper_client and ev.get("tracking_url"))
-        scrape_for_miss = (
-            has_scrape_prereqs
-            and not ctx.get("found")
-            and ev.get("event_type") in SCRAPE_EVENTS
-        )
-        scrape_for_ambiguity = has_scrape_prereqs and ctx.get("ambiguous")
-        will_scrape = scrape_for_miss or scrape_for_ambiguity
-
-        if will_scrape:
-            if scrape_for_ambiguity:
-                gate_detail = (
-                    f"will scrape (phoenix returned "
-                    f"{ctx.get('candidate_count', '?')} candidates — need refinement)"
-                )
-            else:
-                gate_detail = "will scrape (proposal-linked event, phoenix miss)"
+        # ── IGNORE_EVENTS short-circuit ────────────────────────────────
+        # These are Roofix-side prompts for a human action (New Task,
+        # Send HIC, Select Funding, …) that the brain ignores regardless
+        # of Phoenix state. Skip both the Phoenix lookup AND the scrape
+        # entirely — neither can change the outcome, and paying for a
+        # ~30s scrape on every ignored miss is pure waste. ``decide()``
+        # still runs below and produces the ignore Decision as usual.
+        # ``ev["project_id"]`` stays at the None it was initialized to;
+        # the audit record shows the abbreviated flow.
+        if etype in IGNORE_EVENTS:
+            ctx = {"found": False, "ambiguous": False}
+            log.log(
+                "orchestrator",
+                "ignore_shortcut",
+                True,
+                f"'{etype}' is ignore-eligible; skipping Phoenix + scrape",
+                event_type=etype,
+                project_ref=key,
+            )
         else:
-            reasons = []
-            if not scraper_client:
-                reasons.append("no scraper_client")
-            if not ev.get("tracking_url"):
-                reasons.append("no tracking_url")
-            # Only relevant when neither ambiguity nor a miss triggered a
-            # scrape. Explaining event_type ineligibility here is only
-            # useful on the phoenix-miss path — ambiguity would have
-            # scraped regardless of event_type.
-            if (
-                not ctx.get("ambiguous")
-                and not ctx.get("found")
-                and ev.get("event_type") not in SCRAPE_EVENTS
-            ):
-                reasons.append(
-                    f"event_type {ev.get('event_type')!r} not scrape-eligible "
-                    "and phoenix miss (nothing to refine)"
-                )
-            if ctx.get("found") and not ctx.get("ambiguous"):
-                reasons.append("phoenix resolved unambiguously")
-            gate_detail = "skip: " + "; ".join(reasons)
-        log.log(
-            "scraper",
-            "gate",
-            True,
-            gate_detail,
-            event_type=ev.get("event_type", ""),
-            project_ref=key,
-        )
+            # Resolve the project context from Phoenix — the single
+            # authoritative "does Phoenix know this project?" check. Its
+            # result flows straight into decide() below, so the brain sees
+            # the same answer we used to gate the scrape. Stamp the
+            # resolved Phoenix id onto ev so both decide() and the returned
+            # record can read it from one place — None when Phoenix missed
+            # or came back ambiguous.
+            ctx = await _resolve_context(ev, phoenix)
+            ev["project_id"] = ctx.get("project_id")
 
-        if will_scrape:
-            if await _scrape_and_extract(
-                ev, scraper_client, log, key, processed_store, scrape_sem
-            ):
-                ctx = await _resolve_context(ev, phoenix)
-                ev["project_id"] = ctx.get("project_id")
+            # ── Scrape gate ────────────────────────────────────────────
+            # Two independent reasons to scrape:
+            #
+            #   1. Phoenix MISS on any acted-on event. The scrape yields
+            #      the authoritative roofix_id from custom.order1; the
+            #      re-resolve routes via ``find_project_by_roofix_id``,
+            #      which forgives the name-drift (extra spaces, middle
+            #      names, address formatting) that the name+address
+            #      lookup can't. For Estimate-family events the scrape
+            #      also carries the proposal data downstream needs.
+            #
+            #   2. Phoenix AMBIGUOUS (multiple candidate projects). Same
+            #      fix path: pin identity by scraped id, re-resolve to
+            #      one row.
+            #
+            # Both require a scraper_client and a tracking_url — no scrape
+            # is possible without them. Single-match Phoenix hits skip
+            # the scrape (already unambiguous). ``IGNORE_EVENTS`` never
+            # reach this gate — they short-circuit above.
+            # ``_scrape_and_extract`` logs its own scraper/extractor audit
+            # rows and marks processed_store on no_docs / timeout — we
+            # don't wrap here.
+            has_scrape_prereqs = bool(scraper_client and ev.get("tracking_url"))
+            scrape_for_miss = has_scrape_prereqs and not ctx.get("found")
+            scrape_for_ambiguity = has_scrape_prereqs and ctx.get("ambiguous")
+            will_scrape = scrape_for_miss or scrape_for_ambiguity
+
+            if will_scrape:
+                if scrape_for_ambiguity:
+                    gate_detail = (
+                        f"will scrape (phoenix returned "
+                        f"{ctx.get('candidate_count', '?')} candidates — need refinement)"
+                    )
+                else:
+                    gate_detail = "will scrape (phoenix miss on identity lookup)"
+            else:
+                reasons = []
+                if not scraper_client:
+                    reasons.append("no scraper_client")
+                if not ev.get("tracking_url"):
+                    reasons.append("no tracking_url")
+                if ctx.get("found") and not ctx.get("ambiguous"):
+                    reasons.append("phoenix resolved unambiguously")
+                gate_detail = "skip: " + "; ".join(reasons)
+            log.log(
+                "scraper",
+                "gate",
+                True,
+                gate_detail,
+                event_type=etype,
+                project_ref=key,
+            )
+
+            if will_scrape:
+                if await _scrape_and_extract(
+                    ev, scraper_client, log, key, processed_store, scrape_sem
+                ):
+                    ctx = await _resolve_context(ev, phoenix)
+                    ev["project_id"] = ctx.get("project_id")
 
         # Decide what to do based on the event and context. Stamp the
         # source email's Gmail id onto the Decision so app.py can call

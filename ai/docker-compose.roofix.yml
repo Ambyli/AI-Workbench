@@ -5,9 +5,9 @@ networks:
 
 services:
   # Postgres backing the bridge's ProcessedStore (dedup / audit for consumed
-  # Gmail events). Exposed on the host at ROOFIX_DB_HOST_PORT (default 5433
-  # to avoid clashing with Phoenix / any local 5432 Postgres) so operators
-  # can query it remotely — psql, DBeaver, dashboards. See ROOFIX.md
+  # Gmail events). Exposed on the host at PORT_ROOFIX_DB (default 5433 — sits
+  # one past litellm_db's 5432 in the PORT REGISTRY in .env) so operators can
+  # query it remotely — psql, DBeaver, dashboards. See ROOFIX.md
   # § "Connecting to the processed-store DB".
   roofix-db:
     image: postgres:16-alpine
@@ -20,7 +20,7 @@ services:
     volumes:
       - roofix_db:/var/lib/postgresql/data
     ports:
-      - "${ROOFIX_DB_HOST_PORT:-5433}:5432"
+      - "${PORT_ROOFIX_DB:-5433}:5432"
     networks:
       - shared
     healthcheck:

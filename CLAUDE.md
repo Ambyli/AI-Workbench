@@ -51,7 +51,7 @@ Key variables:
 | `GMAIL_TOKEN_PATH` | `/config/token.json` | Roofix Bridge: OAuth refresh-token file |
 | `PHOENIX_DB_HOST` / `_PORT` / `_NAME` / `_USER` / `_PASSWORD` / `_SSLMODE` | _(secrets)_ | Roofix Bridge: direct psycopg2 connection to Phoenix Postgres |
 | `ROOFIX_DB_USER` / `_PASSWORD` / `_NAME` | `roofix` / _(required)_ / `roofix` | Roofix Bridge: credentials for the compose-managed `roofix-db` Postgres backing `ProcessedStore`. Password has no default — compose fails without it. |
-| `ROOFIX_DB_HOST_PORT` | `5433` | Roofix Bridge: host port `roofix-db` binds to for remote connections. Default avoids clashing with Phoenix / a local Postgres on 5432. |
+| `PORT_ROOFIX_DB` | `5433` | Roofix Bridge: host port `roofix-db` binds to for remote connections. Lives in the `PORT REGISTRY` block at the top of `.env`. Both Postgres ports (`PORT_POSTGRES=5432` for litellm_db, `PORT_ROOFIX_DB=5433` for roofix-db) are grouped there. |
 | `PHOENIX_AGENT_USER_ID` | _(unset — required for writes)_ | Roofix Bridge: dedicated Phoenix user id |
 | `PHOENIX_ROOFIX_ID_COLUMN` | `migration_external_id` | Roofix Bridge: column where Roofix ids are stamped |
 | `INTERCEPTOR_URL` | `http://interceptor:8080` | Roofix Bridge → interceptor base URL |

@@ -20,7 +20,7 @@ very-clean-$(1):
 		echo "WARNING: This will stop containers, remove all volumes and images for $(1). Type CONFIRM=yes to proceed."; \
 		false; \
 	fi
-	$$(DC_$(1)) down --volumes --rmi all $(2)
+	$$(DC_$(1)) down --volumes --rmi all
 
 logs-$(1):
 	$$(DC_$(1)) logs -f $(2)

@@ -116,7 +116,7 @@ Sub-cases that short-circuit before the action branches:
 | `ROOFIX_DB_USER` | `roofix` | User for the compose-managed `roofix-db` Postgres backing `ProcessedStore`. |
 | `ROOFIX_DB_PASSWORD` | _(required — no default)_ | Password for `roofix-db`. Compose fails to bring the service up if this is empty. Don't commit it to git. |
 | `ROOFIX_DB_NAME` | `roofix` | Database name inside `roofix-db`. |
-| `ROOFIX_DB_HOST_PORT` | `5433` | Host port `roofix-db` binds to (5432 → host `5433` by default) so remote clients can connect. Override to `5432` if that port is free on this host. |
+| `PORT_ROOFIX_DB` | `5433` | Host port `roofix-db` binds to (container 5432 → host `5433`) so remote clients can connect. Lives in the `PORT REGISTRY` block at the top of `.env` alongside `PORT_POSTGRES` (litellm_db, 5432). |
 | `INTERCEPTOR_URL` | `http://interceptor:8080` | Sibling generic CDP service the bridge POSTs `/capture` to. |
 | `ROOFIX_PROFILE_NAME` | `roofix` | Which named profile inside interceptor holds Roofix session cookies. Refresh via `POST /profiles/roofix/refresh` on interceptor. |
 | `ROOFIX_CAPTURE_WINDOW_SECONDS` | `30` | How long interceptor keeps Chrome alive per `/capture` call collecting XHRs. |
@@ -206,7 +206,7 @@ The bridge's dedup / audit store lives in a Postgres container (`roofix-db`) tha
 | Field | Value |
 |---|---|
 | Host | `<docker host>` (usually `localhost` if the compose stack runs on your box) |
-| Port | `ROOFIX_DB_HOST_PORT` — default `5433` |
+| Port | `PORT_ROOFIX_DB` — default `5433` (in `.env`'s PORT REGISTRY block) |
 | Database | `ROOFIX_DB_NAME` — default `roofix` |
 | User | `ROOFIX_DB_USER` — default `roofix` |
 | Password | `ROOFIX_DB_PASSWORD` (required — set in `.env`) |

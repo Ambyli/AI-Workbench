@@ -374,6 +374,15 @@ async def _execute(
             forwarded = False
             raw_email = ev.get("_raw_email")
             if gmail and ESCALATION_RECIPIENTS and raw_email:
+                # Bundle a record for the operator: the parsed event (with
+                # internal ``_``-prefixed fields stripped so we don't leak the
+                # raw email dict twice) plus the brain's decision. Gives the
+                # human the same picture the bridge had when it decided to
+                # escalate — no need to hand-reconstruct it.
+                event_snapshot = {
+                    k: v for k, v in ev.items() if not k.startswith("_")
+                }
+                record = {"event": event_snapshot, "decision": decision}
                 try:
                     await asyncio.to_thread(
                         gmail.forward_email,
@@ -381,6 +390,7 @@ async def _execute(
                         decision["reasoning"],
                         raw_email,
                         etype,
+                        record,
                     )
                     forwarded = True
                     log.log(

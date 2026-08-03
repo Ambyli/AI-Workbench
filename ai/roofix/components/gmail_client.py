@@ -323,13 +323,21 @@ class GmailClient:
         ).execute()
 
     def forward_email(self, to: list[str], reason: str, original: dict,
-                      event_type: str = "") -> None:
+                      event_type: str = "", record: dict | None = None) -> None:
         """Forward `original` (a raw email dict from `fetch()`) to `to`,
-        prefaced with the escalation `reason` and the parsed `event_type`
-        (e.g. "New Comment", "HIC Executed") so the operator knows what
-        Roofix event triggered the escalation without having to read the
-        forwarded body. Preserves both text and html parts of the original
-        when available so the recipient sees the full formatting Roofix used.
+        prefaced with the escalation `reason`, the parsed `event_type`, and
+        (if provided) the ``record`` — the bridge's own view of the parsed
+        event + brain decision so the operator can see what the bridge saw
+        without having to reconstruct it from the raw email.
+
+        ``record`` is rendered as a pretty-printed JSON block between the
+        header and the forwarded original. Typical shape from the caller:
+        ``{"event": {...parsed fields...}, "decision": {...}}``. Include the
+        ctx too if it's in scope. Non-JSON-serializable values are stringified
+        via ``default=str``.
+
+        Preserves both text and html parts of the original when available so
+        the recipient sees the full formatting Roofix used.
 
         No-op if `to` is empty. Raises the underlying HttpError on send
         failure — the caller (orchestrator) decides how to handle it.
@@ -339,6 +347,7 @@ class GmailClient:
         """
         if not to:
             return
+        import json as _json
         from email.mime.text import MIMEText
         from email.mime.multipart import MIMEMultipart
 
@@ -349,12 +358,27 @@ class GmailClient:
         orig_text = original.get("body_text") or ""
         orig_html = original.get("body_html")
 
+        record_block = ""
+        if record is not None:
+            try:
+                record_json = _json.dumps(
+                    record, indent=2, sort_keys=False, default=str
+                )
+            except Exception as e:
+                record_json = f"(record could not be serialized: {e})"
+            record_block = (
+                "--- Bridge record (what the bridge saw + decided) ---\n"
+                f"{record_json}\n"
+                "\n"
+            )
+
         header = (
             "[Roofix Bridge] This email was escalated for human review.\n"
             "\n"
             f"Event type: {event_type or '(unknown)'}\n"
             f"Reason: {reason}\n"
             "\n"
+            f"{record_block}"
             "--- Forwarded message ---\n"
             f"From: {orig_sender}\n"
             f"Date: {orig_ts}\n"

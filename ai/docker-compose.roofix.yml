@@ -15,7 +15,7 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${ROOFIX_DB_USER:-roofix}
-      POSTGRES_PASSWORD: ${ROOFIX_DB_PASSWORD}    # required — no default
+      POSTGRES_PASSWORD: ${ROOFIX_DB_PASSWORD:-roofix}
       POSTGRES_DB: ${ROOFIX_DB_NAME:-roofix}
     volumes:
       - roofix_db:/var/lib/postgresql/data
@@ -55,7 +55,7 @@ services:
       - ROOFIX_DB_HOST=roofix-db
       - ROOFIX_DB_PORT=5432
       - ROOFIX_DB_USER=${ROOFIX_DB_USER:-roofix}
-      - ROOFIX_DB_PASSWORD=${ROOFIX_DB_PASSWORD}
+      - ROOFIX_DB_PASSWORD=${ROOFIX_DB_PASSWORD:-roofix}
       - ROOFIX_DB_NAME=${ROOFIX_DB_NAME:-roofix}
       # Gmail OAuth — credentials.json + token.json live on a mounted config volume.
       - GMAIL_CREDENTIALS_PATH=/config/credentials.json

@@ -48,12 +48,12 @@ DEBUG_LOGGING = os.getenv("DEBUG_LOGGING", "false").lower() == "true"
 
 # DSN for the ProcessedStore Postgres (compose-managed roofix-db service).
 # Container-side connection — host + port refer to the docker network, not
-# the operator's laptop. Password is required at container start; the
-# compose file will fail to bring up roofix-db without it, so if we reach
-# this line the password is set.
+# the operator's laptop. Every field falls back to the same "roofix" dev
+# defaults the compose file uses, so bringing the stack up with an empty
+# .env still yields a working connection string on the shared network.
 ROOFIX_DB_DSN = (
     f"postgresql://{os.environ.get('ROOFIX_DB_USER', 'roofix')}"
-    f":{os.environ.get('ROOFIX_DB_PASSWORD', '')}"
+    f":{os.environ.get('ROOFIX_DB_PASSWORD', 'roofix')}"
     f"@{os.environ.get('ROOFIX_DB_HOST', 'roofix-db')}"
     f":{os.environ.get('ROOFIX_DB_PORT', '5432')}"
     f"/{os.environ.get('ROOFIX_DB_NAME', 'roofix')}"

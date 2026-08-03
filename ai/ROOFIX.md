@@ -114,7 +114,7 @@ Sub-cases that short-circuit before the action branches:
 | `PHOENIX_AGENT_USER_ID` | _(unset — required for writes)_ | Dedicated Phoenix user id the bridge writes as. Provision manually. |
 | `PHOENIX_ROOFIX_ID_COLUMN` | `migration_external_id` | Where the Roofix project id is stamped on the project row. |
 | `ROOFIX_DB_USER` | `roofix` | User for the compose-managed `roofix-db` Postgres backing `ProcessedStore`. |
-| `ROOFIX_DB_PASSWORD` | _(required — no default)_ | Password for `roofix-db`. Compose fails to bring the service up if this is empty. Don't commit it to git. |
+| `ROOFIX_DB_PASSWORD` | `roofix` | Password for `roofix-db`. Defaults to `roofix` in both `docker-compose.roofix.yml` and `ai/roofix/app.py`'s DSN, so the container comes up on a fresh clone. Override for anything past dev. |
 | `ROOFIX_DB_NAME` | `roofix` | Database name inside `roofix-db`. |
 | `PORT_ROOFIX_DB` | `5433` | Host port `roofix-db` binds to (container 5432 → host `5433`) so remote clients can connect. Lives in the `PORT REGISTRY` block at the top of `.env` alongside `PORT_POSTGRES` (litellm_db, 5432). |
 | `INTERCEPTOR_URL` | `http://interceptor:8080` | Sibling generic CDP service the bridge POSTs `/capture` to. |
@@ -209,7 +209,7 @@ The bridge's dedup / audit store lives in a Postgres container (`roofix-db`) tha
 | Port | `PORT_ROOFIX_DB` — default `5433` (in `.env`'s PORT REGISTRY block) |
 | Database | `ROOFIX_DB_NAME` — default `roofix` |
 | User | `ROOFIX_DB_USER` — default `roofix` |
-| Password | `ROOFIX_DB_PASSWORD` (required — set in `.env`) |
+| Password | `ROOFIX_DB_PASSWORD` — default `roofix` (change for anything past dev) |
 
 **psql:**
 

@@ -181,8 +181,33 @@ async def _scrape_and_extract(
     Called by: ``process_batch`` (per event, only on the Phoenix-miss path).
     """
     etype = ev.get("event_type", "")
+    # Instrumentation: log the semaphore state around every scrape acquisition
+    # so we can prove parallelism (or catch serialization). ``_value`` is a
+    # public-ish attribute on asyncio.Semaphore giving the count of remaining
+    # slots BEFORE this coroutine grabs one — subtract from cap for in-flight.
+    _cap = INTERCEPTOR_MAX_CONCURRENT
+    _slots_free_before = getattr(scrape_sem, "_value", -1)
+    _in_flight_before = _cap - _slots_free_before if _slots_free_before >= 0 else -1
+    log.log(
+        "scraper",
+        "sem_wait",
+        True,
+        f"waiting on scrape semaphore  in_flight_before_me={_in_flight_before}/{_cap}",
+        event_type=etype,
+        project_ref=key,
+    )
     try:
         async with scrape_sem:
+            _slots_free_after = getattr(scrape_sem, "_value", -1)
+            _in_flight_after = _cap - _slots_free_after if _slots_free_after >= 0 else -1
+            log.log(
+                "scraper",
+                "sem_acquired",
+                True,
+                f"acquired scrape semaphore  in_flight_including_me={_in_flight_after}/{_cap}",
+                event_type=etype,
+                project_ref=key,
+            )
             result = await asyncio.wait_for(
                 scraper_client.get_proposal(tracking_url=ev["tracking_url"]),
                 timeout=SCRAPE_TIMEOUT_SECONDS,
@@ -809,6 +834,21 @@ async def process_batch(
     groups: dict[str, list] = {}
     for ev in parsed:
         groups.setdefault(_identity_key(ev), []).append(ev)
+
+    # Log the fanout shape so we can see, from the audit trail, how much
+    # parallelism the tick actually has to work with. 25 events in 25 groups
+    # → up to 25 group coroutines running concurrently (scrape-capped at
+    # INTERCEPTOR_MAX_CONCURRENT). 25 events in 1 group → sequential.
+    _group_sizes = sorted((len(evs) for evs in groups.values()), reverse=True)
+    log.log(
+        "orchestrator",
+        "fanout",
+        True,
+        f"{len(parsed)} event(s) → {len(groups)} group(s); sizes={_group_sizes[:10]}"
+        + (f" (+{len(_group_sizes) - 10} more)" if len(_group_sizes) > 10 else ""),
+        event_type="",
+        project_ref="",
+    )
 
     # ── Step 3: One semaphore per batch, tied to the current event loop.
     # Rate-limits scrape calls across ALL groups running concurrently. See

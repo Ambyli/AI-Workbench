@@ -664,8 +664,11 @@ async def _process_group(
         # Resolve the project context from Phoenix — the single authoritative
         # "does Phoenix know this project?" check. Its result flows straight
         # into decide() below, so the brain sees the same answer we used to
-        # gate the scrape.
+        # gate the scrape. Stamp the resolved Phoenix id onto ev so both
+        # decide() and the returned record can read it from one place — None
+        # when Phoenix missed or came back ambiguous.
         ctx = await _resolve_context(ev, phoenix)
+        ev["project_id"] = ctx.get("project_id")
 
         # ── Scrape gate ────────────────────────────────────────────────
         # Two independent reasons to scrape:
@@ -738,6 +741,7 @@ async def _process_group(
                 ev, scraper_client, log, key, processed_store, scrape_sem
             ):
                 ctx = await _resolve_context(ev, phoenix)
+                ev["project_id"] = ctx.get("project_id")
 
         # Decide what to do based on the event and context. Stamp the
         # source email's Gmail id onto the Decision so app.py can call
@@ -767,7 +771,10 @@ async def _process_group(
 
         # Shallow-copy the ev so we can drop `_raw_email` without mutating
         # the dict `_execute` just used (also keeps this loop side-effect
-        # free for the caller's copy).
+        # free for the caller's copy). ``project_id`` was already stamped
+        # onto ev after each ``_resolve_context`` call above — always
+        # present as a key, None when Phoenix missed or came back
+        # ambiguous — so it comes through this copy naturally.
         ev_out = {k: v for k, v in ev.items() if k != "_raw_email"}
         out.append({"event": ev_out, "decision": d})
 
@@ -823,10 +830,16 @@ async def process_batch(
     # ``_raw_email`` is stashed so downstream (escalation forwarding) can
     # access the original headers + body without a re-fetch. Underscore
     # marks it as internal — never leaves the orchestrator.
+    # ``project_id`` is the Phoenix project id — the parser never sets it
+    # (Phoenix identity is not the parser's job; see parser.py docstring).
+    # Initialized to None here so every event carries the key from the
+    # moment it exists; ``_process_group`` fills it in after each
+    # ``_resolve_context`` call.
     parsed = []
     for e in raw_emails:
         p = parse_email(e).as_dict()
         p["_raw_email"] = e
+        p["project_id"] = None
         parsed.append(p)
 
     # ── Step 2: Group events by project identity ──────────────────────────

@@ -614,12 +614,37 @@ async def _process_group(
         # Single-match Phoenix hits skip the scrape (already unambiguous).
         # _scrape_and_extract logs its own scraper/extractor audit rows and
         # marks processed_store on no_docs / timeout — we don't wrap here.
-        if (
+        will_scrape = bool(
             scraper_client
             and ev.get("tracking_url")
             and ev.get("event_type") in SCRAPE_EVENTS
             and (not ctx.get("found") or ctx.get("ambiguous"))
-        ):
+        )
+        if will_scrape:
+            gate_detail = "will scrape (proposal-linked event, project not resolved)"
+        else:
+            reasons = []
+            if not scraper_client:
+                reasons.append("no scraper_client")
+            if not ev.get("tracking_url"):
+                reasons.append("no tracking_url")
+            if ev.get("event_type") not in SCRAPE_EVENTS:
+                reasons.append(
+                    f"event_type {ev.get('event_type')!r} not scrape-eligible"
+                )
+            if ctx.get("found") and not ctx.get("ambiguous"):
+                reasons.append("phoenix resolved unambiguously")
+            gate_detail = "skip: " + "; ".join(reasons)
+        log.log(
+            "scraper",
+            "gate",
+            True,
+            gate_detail,
+            event_type=ev.get("event_type", ""),
+            project_ref=key,
+        )
+
+        if will_scrape:
             if await _scrape_and_extract(
                 ev, scraper_client, log, key, processed_store, scrape_sem
             ):
@@ -758,6 +783,7 @@ async def run(
     scraper_client=None,
     processed_store=None,
     gmail=None,
+    skip_dedup: bool = False,
 ) -> list:
     """Production entry point: fetch one batch of emails and process it.
 
@@ -775,6 +801,9 @@ async def run(
         scraper_client: RoofixScraperClient instance for scraping proposals.
         processed_store: ProcessedStore instance for tracking processed emails.
         gmail: GmailClient for escalation forwarding.
+        skip_dedup: When True, bypass the ``processed_store.is_processed``
+            filter so already-handled emails can be re-run. Used by
+            ``POST /execute/{message_id}``. Default False.
 
     Returns:
         List of ``{"event", "decision"}`` records (same shape as
@@ -784,8 +813,8 @@ async def run(
     raw = listener()
     log.log("listener", "fetch", True, f"{len(raw)} email(s)")
 
-    # Filter out already-processed emails.
-    if processed_store:
+    # Filter out already-processed emails. Skipped for manual re-runs.
+    if processed_store and not skip_dedup:
         raw = [e for e in raw if not processed_store.is_processed(e.get("message_id"))]
         log.log(
             "listener",

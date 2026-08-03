@@ -188,6 +188,7 @@ async def _run_one_batch(
                     scraper_client=scraper_client,
                     processed_store=processed_store,
                     gmail=gmail,
+                    skip_dedup=skip_dedup,
                 )
 
                 # Mark successfully processed emails as read. The orchestrator

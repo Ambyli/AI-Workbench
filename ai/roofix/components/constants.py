@@ -41,10 +41,13 @@ MILESTONE_EVENTS = {
     "Job Scheduled",
     "Job In Progress",
     "Job Is Complete",
+    "Job Completed",
+    "Job Rescheduled",
     "Deposit Invoice Sent",
     "Deposit Invoice Paid",
     "Job Approval Confirmed",
     "HIC Executed",
+    "Execute HIC",
 }
 
 # Events the brain deliberately drops. These are Roofix-side prompts for a
@@ -61,6 +64,7 @@ IGNORE_EVENTS = {
     "Closeout Completed",
     "Send HIC to Homeowner",
     "Install Date Confirmed",
+    "Sign Contingency",
 }
 
 

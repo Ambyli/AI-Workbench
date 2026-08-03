@@ -202,7 +202,9 @@ async def _scrape_and_extract(
     try:
         async with scrape_sem:
             _slots_free_after = getattr(scrape_sem, "_value", -1)
-            _in_flight_after = _cap - _slots_free_after if _slots_free_after >= 0 else -1
+            _in_flight_after = (
+                _cap - _slots_free_after if _slots_free_after >= 0 else -1
+            )
             log.log(
                 "scraper",
                 "sem_acquired",
@@ -354,7 +356,7 @@ async def _execute(
 
         # ── Noop: project already exists in Phoenix ───────────────────
         # Brain emitted this when ``context.get("project_id")`` was
-        # set for a SCRAPE_EVENTS event — Phoenix already has the project,
+        # set for a CREATE_PROJECT_EVENTS event — Phoenix already has the project,
         # so a create would be a duplicate. Terminal decision: audit-log,
         # mark processed. No Phoenix write. app.py will mark the email
         # read (this is a rule-source terminal decision, same class as
@@ -407,9 +409,7 @@ async def _execute(
                 # raw email dict twice) plus the brain's decision. Gives the
                 # human the same picture the bridge had when it decided to
                 # escalate — no need to hand-reconstruct it.
-                event_snapshot = {
-                    k: v for k, v in ev.items() if not k.startswith("_")
-                }
+                event_snapshot = {k: v for k, v in ev.items() if not k.startswith("_")}
                 record = {"event": event_snapshot, "decision": decision}
                 try:
                     await asyncio.to_thread(

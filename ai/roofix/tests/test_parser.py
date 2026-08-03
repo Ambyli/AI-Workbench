@@ -69,7 +69,7 @@ EXPECTED = {
     #     tracking URL. Scraper follows the tracking URL to acquire the id.
     #   tracking_url is PRESENT — the scraper's entrypoint. If this breaks,
     #     the Estimate pipeline is dead.
-    #   parse_complete is False — Estimate is in SCRAPE_EVENTS.
+    #   parse_complete is False — Estimate is in CREATE_PROJECT_EVENTS.
     "estimate_in_progress_gerald_kang_836_lasser_drive": {
         "event_type": "Estimate",
         "customer_name": "Gerald kang",

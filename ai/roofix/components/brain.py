@@ -35,7 +35,7 @@ from typing import Optional
 from components.constants import (
     PHASE,
     MILESTONE_EVENTS,
-    SCRAPE_EVENTS,
+    CREATE_PROJECT_EVENTS,
     IGNORE_EVENTS,
     SYSTEM_PROMPT as _SYSTEM_PROMPT,
 )
@@ -69,7 +69,7 @@ class Decision:
         }
 
 
-# MILESTONE_EVENTS and SCRAPE_EVENTS all live in components/constants.py —
+# MILESTONE_EVENTS and CREATE_PROJECT_EVENTS all live in components/constants.py —
 # imported at the top of this module.
 
 
@@ -158,7 +158,7 @@ async def decide(event: dict, context: dict) -> Decision:
             reasoning=f"'{etype}' advances the project's milestone in Phoenix.",
         )
 
-    if etype in SCRAPE_EVENTS:
+    if etype in CREATE_PROJECT_EVENTS:
         if PHASE == "0":
             return Decision(
                 "ignore",

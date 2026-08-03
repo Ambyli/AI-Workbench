@@ -6,7 +6,7 @@ Everything here is either a plain literal, a compiled regex, or an env-var
 read (``os.getenv`` with the same defaults each individual module used to
 have). Consuming modules import from here and re-export the names they used
 to define locally, so external callers (tests, other components) that do
-``from components.parser import SCRAPE_EVENTS`` — or
+``from components.parser import CREATE_PROJECT_EVENTS`` — or
 ``pc.AGENT_USER_ID = None`` to mutate a module attribute — keep working.
 """
 
@@ -33,7 +33,7 @@ LOG_COLUMNS = ["stage", "action", "ok", "detail", "event_type", "project_ref"]
 # Events whose real data lives behind the proposal link — thin by nature.
 # For these the parser sets parse_complete=False and the orchestrator will
 # scrape after a Phoenix-lookup miss.
-SCRAPE_EVENTS = {"Estimate Complete", "Estimate"}
+CREATE_PROJECT_EVENTS = {"Estimate Complete", "Estimate"}
 
 # Events the brain routes to a milestone update (via Phoenix block/status).
 MILESTONE_EVENTS = {

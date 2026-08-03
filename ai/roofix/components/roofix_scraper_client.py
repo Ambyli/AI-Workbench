@@ -45,6 +45,7 @@ from components.constants import (
     DEFAULT_INIT_DATA_PATTERN,
     DEFAULT_MGET_PATTERN,
     DEFAULT_PROFILE,
+    ORDER_TYPE,
 )
 
 
@@ -124,9 +125,17 @@ class RoofixScraperClient:
         roofix-scraper ``/proposal/{id}`` shape.
 
         Direct port of the ``on_capture`` closure + post-processing block that
-        lived in the old ``ai/roofix/scraper/app.py`` (`init_data` last-wins,
-        `mget_docs` flattened across every mget response, `_type` breakdown,
-        `login_wall` derived from status + error string).
+        lived in the old ``ai/roofix/scraper/app.py`` (`mget_docs` flattened
+        across every mget response, `_type` breakdown, `login_wall` derived
+        from status + error string).
+
+        ``init_data`` selection is *not* naive last-wins: Bubble triggers a
+        fresh init/data whenever the SPA navigates (project page, then
+        occasionally roofix.io home), so a session that ends on the home page
+        would hand the extractor a body containing only a ``user`` doc and no
+        project-identity entry. We pick the last body that actually contains
+        the project-identity doc type, and only fall back to last-wins when
+        no capture holds one (login wall / very short scrape).
         """
         matches = raw.get("matches", {}) or {}
         init_bucket = matches.get(self.init_data_pattern, []) or []
@@ -135,6 +144,17 @@ class RoofixScraperClient:
         init_bodies = [
             m["body"] for m in init_bucket if isinstance(m, dict) and m.get("body") is not None
         ]
+
+        def _has_project_doc(body: object) -> bool:
+            return isinstance(body, list) and any(
+                isinstance(entry, dict) and entry.get("type") == ORDER_TYPE
+                for entry in body
+            )
+
+        selected_init_data = next(
+            (b for b in reversed(init_bodies) if _has_project_doc(b)),
+            init_bodies[-1] if init_bodies else None,
+        )
 
         mget_docs: list[dict] = []
         for m in mget_bucket:
@@ -167,7 +187,7 @@ class RoofixScraperClient:
             "error": error,
             "login_wall": login_wall,
             # ── init/data — Bubble's page-hydration endpoint ─────────────────
-            "init_data": init_bodies[-1] if init_bodies else None,
+            "init_data": selected_init_data,
             "init_data_all": init_bodies,
             "init_data_count": len(init_bodies),
             # ── mget — elasticsearch batch-get, aggregated across all captures ──

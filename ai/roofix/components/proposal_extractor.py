@@ -49,7 +49,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-
 # Bubble doc types and the Bubble lookup-join separator all live in
 # components/constants.py; re-imported with the local `_underscore` aliases
 # the rest of the module already uses.
@@ -71,14 +70,15 @@ class AcceptanceSignals:
     Kept as a separate object so downstream code and log lines can inspect
     *why* something was ruled accepted or not.
     """
+
     # Primary
     hic_present: bool = False
-    hic_executed: bool = False           # hic exists AND status == "executed"
+    hic_executed: bool = False  # hic exists AND status == "executed"
     hic_signature_present: bool = False
 
     # Secondary
     job_present: bool = False
-    job_status: Optional[str] = None     # e.g. "completed", "in_progress"
+    job_status: Optional[str] = None  # e.g. "completed", "in_progress"
 
     # Independent
     homeowner_stage: Optional[str] = None  # "customer" | "opportunity" | ...
@@ -107,13 +107,14 @@ class ExtractedProposal:
     no ``custom.order1`` doc could be located — that's the minimum viable
     identity.
     """
+
     ok: bool = False
     error: Optional[str] = None
 
     # ── Identity ──────────────────────────────────────────────────────────
-    roofix_project_id: Optional[str] = None
-    external_ref: Optional[str] = None      # short human ref ("5YS73T")
-    display_text: Optional[str] = None      # "Name - Address" combined
+    roofix_id: Optional[str] = None
+    external_ref: Optional[str] = None  # short human ref ("5YS73T")
+    display_text: Optional[str] = None  # "Name - Address" combined
 
     # ── Customer (from custom.homeowner) ──────────────────────────────────
     first_name: Optional[str] = None
@@ -125,28 +126,28 @@ class ExtractedProposal:
     # ── Address (from custom.homeowner) ───────────────────────────────────
     street_address: Optional[str] = None
     city: Optional[str] = None
-    state: Optional[str] = None             # "Ohio"
-    state_abbr: Optional[str] = None        # "OH"
+    state: Optional[str] = None  # "Ohio"
+    state_abbr: Optional[str] = None  # "OH"
     zip_code: Optional[str] = None
-    portal_code: Optional[str] = None       # Roofix portal code (not USPS zip)
+    portal_code: Optional[str] = None  # Roofix portal code (not USPS zip)
 
     # ── Money (proposal-side, from custom.order1) ─────────────────────────
-    estimated_price: Optional[float] = None    # order.price__final__number
+    estimated_price: Optional[float] = None  # order.price__final__number
     staging_price: Optional[float] = None
     markup: Optional[float] = None
 
     # ── Money (contract-side, from custom.job1) ───────────────────────────
-    actual_contract_price: Optional[float] = None   # job.contract_price_number
+    actual_contract_price: Optional[float] = None  # job.contract_price_number
 
     # ── Config (from custom.order1) ───────────────────────────────────────
-    funding_type: Optional[str] = None              # proposed
+    funding_type: Optional[str] = None  # proposed
     financing_provider: Optional[str] = None
     trade: Optional[str] = None
     project_type: Optional[str] = None
     steep_slope_product: Optional[str] = None
 
     # ── Config (from custom.job1) ─────────────────────────────────────────
-    job_funding_source: Optional[str] = None        # actual funding used
+    job_funding_source: Optional[str] = None  # actual funding used
     shingle_color: Optional[str] = None
     install_date_ms: Optional[int] = None
     install_scheduled_date_ms: Optional[int] = None
@@ -178,6 +179,7 @@ class ExtractedProposal:
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
+
 def _lookup_id(value: Any) -> Optional[str]:
     """Strip the ``<something>__LOOKUP__`` prefix from a Bubble lookup string.
 
@@ -191,7 +193,7 @@ def _lookup_id(value: Any) -> Optional[str]:
     idx = value.find(_LOOKUP_SEP)
     if idx == -1:
         return value
-    tail = value[idx + len(_LOOKUP_SEP):]
+    tail = value[idx + len(_LOOKUP_SEP) :]
     return tail or None
 
 
@@ -217,8 +219,9 @@ def _first_source_by_type(mget_docs: list, doc_type: str) -> Optional[dict]:
     return None
 
 
-def _source_by_type_and_id(mget_docs: list, doc_type: str,
-                           doc_id: Optional[str]) -> Optional[dict]:
+def _source_by_type_and_id(
+    mget_docs: list, doc_type: str, doc_id: Optional[str]
+) -> Optional[dict]:
     """Find a specific mget doc by (_type, _id). Returns None if either is
     unmatched or ``doc_id`` is falsy."""
     if not doc_id:
@@ -274,6 +277,7 @@ def _int(value: Any) -> Optional[int]:
 
 # ── Public API ─────────────────────────────────────────────────────────────
 
+
 def extract_proposal(scraper_response: dict) -> ExtractedProposal:
     """Extract the Phoenix-writable proposal fields from a scraper response.
 
@@ -289,7 +293,7 @@ def extract_proposal(scraper_response: dict) -> ExtractedProposal:
         return ExtractedProposal(
             ok=False,
             error="scraper response has neither init_data nor mget_docs "
-                  "(empty or missing)",
+            "(empty or missing)",
         )
 
     # ── Identity anchor ──────────────────────────────────────────────────
@@ -307,18 +311,18 @@ def extract_proposal(scraper_response: dict) -> ExtractedProposal:
 
     # ── Everything else — from mget_docs ─────────────────────────────────
     homeowner = _first_source_by_type(mget_docs, _HOMEOWNER_TYPE) or {}
-    hic = _first_source_by_type(mget_docs, _HIC_TYPE)            # None if absent
-    job = _first_source_by_type(mget_docs, _JOB_TYPE)            # None if absent
+    hic = _first_source_by_type(mget_docs, _HIC_TYPE)  # None if absent
+    job = _first_source_by_type(mget_docs, _JOB_TYPE)  # None if absent
     warranty = _first_source_by_type(mget_docs, _WARRANTY_TYPE)  # None if absent
 
     # Identity: the custom.order1 entry's top-level id. If there's no order1
     # entry AND no homeowner, we can't say anything useful about the project.
-    roofix_project_id = order_entry.get("id")
-    if not roofix_project_id and not homeowner:
+    roofix_id = order_entry.get("id")
+    if not roofix_id and not homeowner:
         return ExtractedProposal(
             ok=False,
             error="no custom.order1 entry in init_data and no homeowner "
-                  "(login wall? scrape too short?)",
+            "(login wall? scrape too short?)",
         )
 
     # ── Acceptance signals ────────────────────────────────────────────────
@@ -347,12 +351,10 @@ def extract_proposal(scraper_response: dict) -> ExtractedProposal:
 
     return ExtractedProposal(
         ok=True,
-
         # Identity — the custom.order1 entry's top-level "id" in init_data
-        roofix_project_id=roofix_project_id,
+        roofix_id=roofix_id,
         external_ref=order.get("external_project_id_text"),
         display_text=order.get("display_text"),
-
         # Customer
         first_name=homeowner.get("first_name_text"),
         last_name=homeowner.get("last_name_text"),
@@ -360,7 +362,6 @@ def extract_proposal(scraper_response: dict) -> ExtractedProposal:
         email=homeowner.get("email_text"),
         # Bubble's field is misspelled as "phone_nmber_text" — see it in the docs.
         phone=homeowner.get("phone_nmber_text"),
-
         # Address
         street_address=homeowner.get("street_address_text"),
         city=homeowner.get("city_text"),
@@ -368,47 +369,50 @@ def extract_proposal(scraper_response: dict) -> ExtractedProposal:
         state_abbr=homeowner.get("state_abbr_text"),
         zip_code=homeowner.get("zip_text"),
         portal_code=homeowner.get("portal_code_text"),
-
         # Money — proposal side
         estimated_price=_num(order.get("price__final__number")),
         staging_price=_num(order.get("staging_price_number")),
-        markup=_num(order.get("markup__final__number") or order.get("rfx_markup_number")),
-
+        markup=_num(
+            order.get("markup__final__number") or order.get("rfx_markup_number")
+        ),
         # Money — contract side (from job doc)
         actual_contract_price=_num(job.get("contract_price_number")) if job else None,
-
         # Config — order side
         funding_type=order.get("funding1_option_funding"),
         financing_provider=order.get("financing_provider_option_loan_provider"),
         trade=order.get("trade_option_trade"),
         project_type=order.get("type_option_type__estimate_"),
-        steep_slope_product=order.get("steep_slope_product_option_steep_slope_products"),
-
+        steep_slope_product=order.get(
+            "steep_slope_product_option_steep_slope_products"
+        ),
         # Config — job side
         job_funding_source=job.get("funding_source_option_funding") if job else None,
         shingle_color=job.get("shingle_color_v2_text") if job else None,
         install_date_ms=_int(job.get("install_date_date")) if job else None,
-        install_scheduled_date_ms=_int(job.get("install_scheduled_date_date")) if job else None,
+        install_scheduled_date_ms=(
+            _int(job.get("install_scheduled_date_date")) if job else None
+        ),
         job_status=job_status,
-
         # Related Bubble records
         sales_rep_ref=_lookup_id(order.get("sales_rep_user")),
         estimator_ref=_lookup_id(order.get("estimator_user")),
         office_ref=_lookup_id(order.get("office_custom_office")),
-        homeowner_ref=_lookup_id(order.get("homeowner_custom_homeowner")) or (homeowner.get("_id") if homeowner else None),
+        homeowner_ref=_lookup_id(order.get("homeowner_custom_homeowner"))
+        or (homeowner.get("_id") if homeowner else None),
         hic_ref=hic.get("_id") if hic else None,
         job_ref=job.get("_id") if job else None,
         warranty_ref=warranty.get("_id") if warranty else None,
-
         # Acceptance
         is_accepted=is_accepted,
         acceptance_signals=signals,
-
         # Progress
         stage_completed_internal=order.get(
-            "pts_trigger_type_completed__internal__option_progress_tracker_stage"),
+            "pts_trigger_type_completed__internal__option_progress_tracker_stage"
+        ),
         stage_upcoming_internal=order.get(
-            "pts_trigger_type_upcoming__internal__option_progress_tracker_stage"),
+            "pts_trigger_type_upcoming__internal__option_progress_tracker_stage"
+        ),
         stage_completed_external=order.get(
-            "pts_trigger_type_completed__external__option_progress_tracker_stage"),
+            "pts_trigger_type_completed__external__option_progress_tracker_stage"
+        ),
     )

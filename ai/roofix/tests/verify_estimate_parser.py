@@ -33,13 +33,17 @@ load_env()
 from components.gmail_client import GmailClient
 from components.parser import parse_email
 
-
-DEFAULT_QUERY = 'from:no-reply@roofix.io subject:Estimate newer_than:30d'
+DEFAULT_QUERY = "from:no-reply@roofix.io subject:Estimate newer_than:30d"
 
 
 _CONTRACT_A_FIELDS = (
-    "sender", "to", "subject", "body_text", "body_html",
-    "timestamp", "attachments",
+    "sender",
+    "to",
+    "subject",
+    "body_text",
+    "body_html",
+    "timestamp",
+    "attachments",
 )
 
 
@@ -70,7 +74,9 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--limit", type=int, default=5)
     ap.add_argument("--query", default=DEFAULT_QUERY)
-    ap.add_argument("--emit-python", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument(
+        "--emit-python", action=argparse.BooleanOptionalAction, default=True
+    )
     args = ap.parse_args()
 
     print(f"query: {args.query!r}\nlimit: {args.limit}\n")
@@ -99,11 +105,13 @@ def main() -> int:
         print(f"  to:        {raw.get('to','')}")
         print(f"  timestamp: {raw.get('timestamp','')}")
         print(f"  body_text: {(raw.get('body_text','') or '')[:220]}...")
-        print(f"  body_html: {'<present, ' + str(len(html)) + ' chars>' if html else '<absent>'}")
+        print(
+            f"  body_html: {'<present, ' + str(len(html)) + ' chars>' if html else '<absent>'}"
+        )
 
         print("\n── Parsed (ParsedEvent) ──")
         print(f"  event_type:     {parsed['event_type']}")
-        print(f"  project_id:     {parsed['project_id']}")
+        print(f"  roofix_id:     {parsed['roofix_id']}")
         print(f"  tracking_url:   {parsed['tracking_url']}")
         print(f"  customer_name:  {parsed['customer_name']}")
         print(f"  address:        {parsed['address']}")
@@ -112,7 +120,9 @@ def main() -> int:
         print(f"  notes:          {parsed['notes']}")
 
         if args.emit_python:
-            print("\n── Copy-paste into tests/roofix_email_samples.py's SAMPLES list ──")
+            print(
+                "\n── Copy-paste into tests/roofix_email_samples.py's SAMPLES list ──"
+            )
             print(_to_python_literal(raw, label) + ",")
 
         print()

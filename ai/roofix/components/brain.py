@@ -88,7 +88,7 @@ async def decide(event: dict, context: dict) -> Decision:
 
     if (
         not event.get("parse_complete")
-        and not event.get("project_id")
+        and not event.get("roofix_id")
         and not (event.get("customer_name") and event.get("address"))
     ):
         return Decision(
@@ -135,7 +135,7 @@ async def decide(event: dict, context: dict) -> Decision:
         return Decision(
             "update_chatter",
             event_type=etype,
-            target=str(context.get("phoenix_project_id")),
+            target=str(context.get("project_id")),
             payload={"note_text": prefix + body},
             reasoning="New Roofix comment relayed to Phoenix chatter (append).",
         )
@@ -154,7 +154,7 @@ async def decide(event: dict, context: dict) -> Decision:
         return Decision(
             "update_milestone",
             event_type=etype,
-            target=str(context.get("phoenix_project_id")),
+            target=str(context.get("project_id")),
             reasoning=f"'{etype}' advances the project's milestone in Phoenix.",
         )
 
@@ -174,15 +174,15 @@ async def decide(event: dict, context: dict) -> Decision:
         # to do; a create would just log a duplicate. Terminate with a noop
         # so the response makes the "already found" state explicit instead
         # of hiding it behind a phantom create_project decision.
-        phoenix_project_id = context.get("phoenix_project_id")
-        if phoenix_project_id:
+        project_id = context.get("project_id")
+        if project_id:
             return Decision(
                 "noop_project_exists",
                 event_type=etype,
-                target=str(phoenix_project_id),
+                target=str(project_id),
                 reasoning=(
                     f"'{etype}' — Phoenix already has this project "
-                    f"(id {phoenix_project_id}); no create needed."
+                    f"(id {project_id}); no create needed."
                 ),
             )
         # Phoenix couldn't identify the project. If we have a tracking URL,

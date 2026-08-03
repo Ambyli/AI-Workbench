@@ -39,10 +39,10 @@ Contract D (Orchestrator -> Phoenix):
     update_chatter(project_id, note_text)             -> Result
     update_milestone(project_id, block_name, status)  -> Result
     find_project_by_roofix_id(roofix_id)              -> Result
-    find_project_by_identity(name, address)           -> Result
-    find_entity_by_identity(name, email, street1)     -> Result
-    create_entity(**fields)                           -> Result
-    create_project(**fields)                          -> Result
+    find_project_by_identity(name, address)                   -> Result
+    find_entity_by_identity(name, email, street1)             -> Result
+    create_entity(**fields)                                   -> Result
+    create_project(**fields)                                  -> Result
     link_entity_project(entity_id, project_id)        -> Result
     ensure_entity_and_project(extracted)              -> Result (idempotent
                                                           find-or-create for
@@ -73,7 +73,6 @@ import psycopg2
 import psycopg2.extras
 import psycopg2.pool
 
-
 # --- configuration knobs --------------------------------------------------------
 # Values derived from Phoenix data (grep phoenix.object_type / relationship_type
 # / phoenix.project GROUP BY company_id, etc.). Overridable via env for a
@@ -92,12 +91,13 @@ from components.constants import (
     DRY_RUN,
 )
 
-
 # --- result type ----------------------------------------------------------------
+
 
 @dataclass
 class Result:
     """Every write returns one of these — never a bare bool. Failures surfaced."""
+
     ok: bool
     detail: str = ""
     data: dict = field(default_factory=dict)
@@ -108,6 +108,7 @@ class Result:
 
 
 # --- client ---------------------------------------------------------------------
+
 
 class PhoenixClient:
     def __init__(
@@ -228,7 +229,9 @@ class PhoenixClient:
         except Exception as e:
             return Result(ok=False, detail=f"find_by_roofix_id failed: {e}")
 
-    def find_project_by_identity(self, name: str, street1: Optional[str] = None) -> Result:
+    def find_project_by_identity(
+        self, name: str, street1: Optional[str] = None
+    ) -> Result:
         """Fallback project identity path: case-insensitive project_name (+ street1).
         Returns ALL candidates so the caller can decide; NEVER auto-picks."""
         clauses = ["LOWER(project_name) = LOWER(%s)", "archived = false"]
@@ -292,8 +295,10 @@ class PhoenixClient:
                 clauses.append("LOWER(street1) = LOWER(%s)")
                 params.append(street1.strip())
         else:
-            return Result(ok=False, detail=(
-                "find_entity_by_identity needs at least one of email or name"))
+            return Result(
+                ok=False,
+                detail=("find_entity_by_identity needs at least one of email or name"),
+            )
 
         sql = (
             "SELECT id, first_name, last_name, email, street1, city, postal_code, "
@@ -324,8 +329,11 @@ class PhoenixClient:
             with self._cursor() as cur:
                 cur.execute(sql, (block_name.strip(),))
                 rows = cur.fetchall()
-            return Result(ok=True, detail=f"{len(rows)} match(es)",
-                          data={"matches": [dict(r) for r in rows]})
+            return Result(
+                ok=True,
+                detail=f"{len(rows)} match(es)",
+                data={"matches": [dict(r) for r in rows]},
+            )
         except Exception as e:
             return Result(ok=False, detail=f"resolve_process_block_id failed: {e}")
 
@@ -370,16 +378,22 @@ class PhoenixClient:
                 self._state_cache_by_abbr = {}
                 self._state_cache_by_name = {}
                 return
-            self._state_cache_by_abbr = {r["abbreviation"].upper(): r["id"] for r in rows}
+            self._state_cache_by_abbr = {
+                r["abbreviation"].upper(): r["id"] for r in rows
+            }
             self._state_cache_by_name = {r["state_name"].lower(): r["id"] for r in rows}
 
     # writes ---------------------------------------------------------------------
 
     def _require_agent_user(self) -> Optional[Result]:
         if not AGENT_USER_ID:
-            return Result(ok=False, detail=(
-                "PHOENIX_AGENT_USER_ID is not set. Create a dedicated agent user in "
-                "Phoenix and set it before writing, so rows are attributable."))
+            return Result(
+                ok=False,
+                detail=(
+                    "PHOENIX_AGENT_USER_ID is not set. Create a dedicated agent user in "
+                    "Phoenix and set it before writing, so rows are attributable."
+                ),
+            )
         return None
 
     def _build_note_delta(self, text: str) -> dict:
@@ -387,7 +401,12 @@ class PhoenixClient:
         return {"ops": [{"insert": text if text.endswith("\n") else text + "\n"}]}
 
     def update_chatter(self, project_id: int, note_text: str) -> Result:
-        """Phase 0: append-only insert into `note`."""
+        """Phase 0: append-only insert into `note`.
+
+        ``project_id`` is Phoenix's own integer PK. The ``project_id``
+        column in the ``note`` SQL below is Phoenix's schema — not to be
+        confused with the Roofix Bubble id (which lives on ``project.migration_external_id``).
+        """
         guard = self._require_agent_user()
         if guard is not None:
             return guard
@@ -401,9 +420,12 @@ class PhoenixClient:
         params = (project_id, json.dumps(delta), note_text, int(AGENT_USER_ID))
 
         if self.dry_run:
-            return Result(ok=True, dry_run=True,
-                          detail="DRY_RUN: would insert note",
-                          data={"sql": sql, "params": params})
+            return Result(
+                ok=True,
+                dry_run=True,
+                detail="DRY_RUN: would insert note",
+                data={"sql": sql, "params": params},
+            )
         try:
             with self._cursor() as cur:
                 cur.execute(sql, params)
@@ -412,17 +434,27 @@ class PhoenixClient:
         except Exception as e:
             return Result(ok=False, detail=f"update_chatter failed: {e}")
 
-    def update_milestone(self, project_id: int, block_name: str,
-                         status_id: int) -> Result:
-        """Advance a milestone: upsert project_process_block."""
+    def update_milestone(
+        self, project_id: int, block_name: str, status_id: int
+    ) -> Result:
+        """Advance a milestone: upsert project_process_block.
+
+        ``project_id`` is Phoenix's own integer PK. The ``project_id``
+        column in the SQL below is a Phoenix schema column name — not the
+        Roofix Bubble id.
+        """
         blk = self.resolve_process_block_id(block_name)
         if not blk.ok:
             return blk
         matches = blk.data.get("matches", [])
         if len(matches) != 1:
-            return Result(ok=False, detail=(
-                f"process_block '{block_name}' resolved to {len(matches)} rows; "
-                f"need exactly one (mapping with Michael)."))
+            return Result(
+                ok=False,
+                detail=(
+                    f"process_block '{block_name}' resolved to {len(matches)} rows; "
+                    f"need exactly one (mapping with Michael)."
+                ),
+            )
         process_block_id = matches[0]["id"]
 
         guard = self._require_agent_user()
@@ -440,14 +472,31 @@ class PhoenixClient:
             "object_status_id, created_by_id, date_created, archived) "
             "VALUES (%s, %s, false, %s, %s, NOW(), false) RETURNING id;"
         )
-        up_params = (status_id, int(AGENT_USER_ID), project_id, process_block_id)
-        ins_params = (project_id, process_block_id, status_id, int(AGENT_USER_ID))
+        up_params = (
+            status_id,
+            int(AGENT_USER_ID),
+            project_id,
+            process_block_id,
+        )
+        ins_params = (
+            project_id,
+            process_block_id,
+            status_id,
+            int(AGENT_USER_ID),
+        )
 
         if self.dry_run:
-            return Result(ok=True, dry_run=True,
-                          detail="DRY_RUN: would update-or-insert process block",
-                          data={"update_sql": update_sql, "update_params": up_params,
-                                "insert_sql": insert_sql, "insert_params": ins_params})
+            return Result(
+                ok=True,
+                dry_run=True,
+                detail="DRY_RUN: would update-or-insert process block",
+                data={
+                    "update_sql": update_sql,
+                    "update_params": up_params,
+                    "insert_sql": insert_sql,
+                    "insert_params": ins_params,
+                },
+            )
         try:
             with self._cursor() as cur:
                 cur.execute(update_sql, up_params)
@@ -456,8 +505,11 @@ class PhoenixClient:
                     cur.execute(insert_sql, ins_params)
                     row = cur.fetchone()
                 ppb_id = row["id"]
-            return Result(ok=True, detail="milestone set",
-                          data={"project_process_block_id": ppb_id})
+            return Result(
+                ok=True,
+                detail="milestone set",
+                data={"project_process_block_id": ppb_id},
+            )
         except Exception as e:
             return Result(ok=False, detail=f"update_milestone failed: {e}")
 
@@ -494,17 +546,29 @@ class PhoenixClient:
             "RETURNING id;"
         )
         params = (
-            COMPANY_ID, ENTITY_OBJECT_TYPE_ID,
-            first_name, last_name,
-            email, phone, mobile_phone, street1, street2, city,
-            postal_code, state_id, migration_external_id,
+            COMPANY_ID,
+            ENTITY_OBJECT_TYPE_ID,
+            first_name,
+            last_name,
+            email,
+            phone,
+            mobile_phone,
+            street1,
+            street2,
+            city,
+            postal_code,
+            state_id,
+            migration_external_id,
             int(AGENT_USER_ID),
         )
 
         if self.dry_run:
-            return Result(ok=True, dry_run=True,
-                          detail="DRY_RUN: would insert entity",
-                          data={"sql": sql, "params": params})
+            return Result(
+                ok=True,
+                dry_run=True,
+                detail="DRY_RUN: would insert entity",
+                data={"sql": sql, "params": params},
+            )
         try:
             with self._cursor() as cur:
                 cur.execute(sql, params)
@@ -539,7 +603,11 @@ class PhoenixClient:
         if not project_name:
             return Result(ok=False, detail="project_name is required (NOT NULL)")
 
-        status_id = object_status_id if object_status_id is not None else PROJECT_START_STATUS_ID
+        status_id = (
+            object_status_id
+            if object_status_id is not None
+            else PROJECT_START_STATUS_ID
+        )
 
         sql = (
             "INSERT INTO project ("
@@ -551,21 +619,37 @@ class PhoenixClient:
             "RETURNING id;"
         )
         params = (
-            project_name, COMPANY_ID, PROJECT_OBJECT_TYPE_ID, status_id,
-            street1, street2, city, postal_code, latitude, longitude,
-            state_id, timezone, migration_external_id, migration_entity_id,
+            project_name,
+            COMPANY_ID,
+            PROJECT_OBJECT_TYPE_ID,
+            status_id,
+            street1,
+            street2,
+            city,
+            postal_code,
+            latitude,
+            longitude,
+            state_id,
+            timezone,
+            migration_external_id,
+            migration_entity_id,
             int(AGENT_USER_ID),
         )
 
         if self.dry_run:
-            return Result(ok=True, dry_run=True,
-                          detail="DRY_RUN: would insert project",
-                          data={"sql": sql, "params": params})
+            return Result(
+                ok=True,
+                dry_run=True,
+                detail="DRY_RUN: would insert project",
+                data={"sql": sql, "params": params},
+            )
         try:
             with self._cursor() as cur:
                 cur.execute(sql, params)
                 new_id = cur.fetchone()["id"]
-            return Result(ok=True, detail="project inserted", data={"project_id": new_id})
+            return Result(
+                ok=True, detail="project inserted", data={"project_id": new_id}
+            )
         except Exception as e:
             return Result(ok=False, detail=f"create_project failed: {e}")
 
@@ -591,23 +675,41 @@ class PhoenixClient:
             "  created_by_id, date_created, archived"
             ") VALUES (%s, %s, %s, %s, %s, NOW(), false) RETURNING id;"
         )
-        params = (entity_id, project_id, relationship_type_id, main, int(AGENT_USER_ID))
+        params = (
+            entity_id,
+            project_id,
+            relationship_type_id,
+            main,
+            int(AGENT_USER_ID),
+        )
 
         if self.dry_run:
-            return Result(ok=True, dry_run=True,
-                          detail="DRY_RUN: would link entity → project",
-                          data={"sql": sql, "params": params})
+            return Result(
+                ok=True,
+                dry_run=True,
+                detail="DRY_RUN: would link entity → project",
+                data={"sql": sql, "params": params},
+            )
         try:
             with self._cursor() as cur:
                 cur.execute(sql, params)
                 new_id = cur.fetchone()["id"]
-            return Result(ok=True, detail="entity linked to project",
-                          data={"entity_project_relationship_id": new_id})
+            return Result(
+                ok=True,
+                detail="entity linked to project",
+                data={"entity_project_relationship_id": new_id},
+            )
         except Exception as e:
             return Result(ok=False, detail=f"link_entity_project failed: {e}")
 
     def find_link(self, entity_id: int, project_id: int) -> Result:
-        """Does an entity_project_relationship already exist for this pair?"""
+        """Does an entity_project_relationship already exist for this pair?
+
+        ``project_id`` is Phoenix's integer PK. The ``project_id``
+        column in the SQL below is Phoenix's schema (the ``entity_project_relationship``
+        table happens to use that column name for what is, in fact, the
+        Phoenix project id).
+        """
         sql = (
             "SELECT id, relationship_type_id, main FROM entity_project_relationship "
             "WHERE entity_id = %s AND project_id = %s AND archived = false;"
@@ -616,8 +718,11 @@ class PhoenixClient:
             with self._cursor() as cur:
                 cur.execute(sql, (entity_id, project_id))
                 rows = cur.fetchall()
-            return Result(ok=True, detail=f"{len(rows)} link(s)",
-                          data={"matches": [dict(r) for r in rows]})
+            return Result(
+                ok=True,
+                detail=f"{len(rows)} link(s)",
+                data={"matches": [dict(r) for r in rows]},
+            )
         except Exception as e:
             return Result(ok=False, detail=f"find_link failed: {e}")
 
@@ -626,24 +731,24 @@ class PhoenixClient:
 
         Expects a dict shaped like ExtractedProposal.__dict__ (or the dataclass
         itself's dict form). Reads these fields:
-            roofix_project_id, display_text, customer_name (or full_name),
+            roofix_id, display_text, customer_name (or full_name),
             first_name, last_name, email, phone,
             street_address, city, state_text, state_abbr, zip_code
 
         Flow:
             1. find_entity_by_identity(name, email, street_address).
                0 → create_entity. 1 → use. >1 → escalate.
-            2. find_project_by_roofix_id(roofix_project_id).
+            2. find_project_by_roofix_id(roofix_id).
                0 → create_project + link_entity_project.
                1 → find_link; link only if not already linked. >1 → escalate.
 
         Returns Result.data:
-            entity_id, phoenix_project_id, created_entity (bool),
+            entity_id, project_id, created_entity (bool),
             created_project (bool), created_link (bool)
         """
-        roofix_id = extracted.get("roofix_project_id")
+        roofix_id = extracted.get("roofix_id")
         if not roofix_id:
-            return Result(ok=False, detail="extracted lacks roofix_project_id")
+            return Result(ok=False, detail="extracted lacks roofix_id")
 
         # ── Entity ──────────────────────────────────────────────────────────
         first = extracted.get("first_name")
@@ -661,10 +766,14 @@ class PhoenixClient:
             return ent_r
         ent_matches = ent_r.data.get("matches", [])
         if len(ent_matches) > 1:
-            return Result(ok=False, detail=(
-                f"ambiguous entity match ({len(ent_matches)} candidates) — "
-                f"human review required for name={name!r} email={extracted.get('email')!r}"),
-                data={"entity_matches": ent_matches})
+            return Result(
+                ok=False,
+                detail=(
+                    f"ambiguous entity match ({len(ent_matches)} candidates) — "
+                    f"human review required for name={name!r} email={extracted.get('email')!r}"
+                ),
+                data={"entity_matches": ent_matches},
+            )
 
         created_entity = False
         if len(ent_matches) == 1:
@@ -696,22 +805,26 @@ class PhoenixClient:
             return proj_r
         proj_matches = proj_r.data.get("matches", [])
         if len(proj_matches) > 1:
-            return Result(ok=False, detail=(
-                f"ambiguous project match on roofix_id={roofix_id!r} "
-                f"({len(proj_matches)} candidates) — human review required"),
-                data={"project_matches": proj_matches})
+            return Result(
+                ok=False,
+                detail=(
+                    f"ambiguous project match on roofix_id={roofix_id!r} "
+                    f"({len(proj_matches)} candidates) — human review required"
+                ),
+                data={"project_matches": proj_matches},
+            )
 
         created_project = False
         if len(proj_matches) == 1:
-            phoenix_project_id = proj_matches[0]["id"]
+            project_id = proj_matches[0]["id"]
         else:
             state_id = self.resolve_state_id(
                 state_text=extracted.get("state_text"),
                 state_abbr=extracted.get("state_abbr"),
             )
-            project_name = (extracted.get("display_text")
-                            or name
-                            or f"Roofix project {roofix_id}")
+            project_name = (
+                extracted.get("display_text") or name or f"Roofix project {roofix_id}"
+            )
             cr = self.create_project(
                 project_name=project_name,
                 street1=extracted.get("street_address"),
@@ -723,7 +836,7 @@ class PhoenixClient:
             )
             if not cr.ok:
                 return cr
-            phoenix_project_id = cr.data.get("project_id")
+            project_id = cr.data.get("project_id")
             created_project = True
 
         # ── Link ────────────────────────────────────────────────────────────
@@ -732,16 +845,16 @@ class PhoenixClient:
         # what the link write WOULD look like.
         created_link = False
         if self.dry_run and (created_entity or created_project):
-            lk = self.link_entity_project(entity_id or 0, phoenix_project_id or 0)
+            lk = self.link_entity_project(entity_id or 0, project_id or 0)
             if not lk.ok:
                 return lk
             created_link = True
         elif not self.dry_run:
-            existing = self.find_link(entity_id, phoenix_project_id)
+            existing = self.find_link(entity_id, project_id)
             if not existing.ok:
                 return existing
             if not existing.data.get("matches"):
-                lk = self.link_entity_project(entity_id, phoenix_project_id)
+                lk = self.link_entity_project(entity_id, project_id)
                 if not lk.ok:
                     return lk
                 created_link = True
@@ -749,13 +862,15 @@ class PhoenixClient:
         return Result(
             ok=True,
             dry_run=self.dry_run,
-            detail=(f"{'DRY_RUN: ' if self.dry_run else ''}"
-                    f"entity={'CREATED' if created_entity else 'FOUND'} "
-                    f"project={'CREATED' if created_project else 'FOUND'} "
-                    f"link={'CREATED' if created_link else 'EXISTED'}"),
+            detail=(
+                f"{'DRY_RUN: ' if self.dry_run else ''}"
+                f"entity={'CREATED' if created_entity else 'FOUND'} "
+                f"project={'CREATED' if created_project else 'FOUND'} "
+                f"link={'CREATED' if created_link else 'EXISTED'}"
+            ),
             data={
                 "entity_id": entity_id,
-                "phoenix_project_id": phoenix_project_id,
+                "project_id": project_id,
                 "created_entity": created_entity,
                 "created_project": created_project,
                 "created_link": created_link,

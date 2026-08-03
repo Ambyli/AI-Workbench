@@ -29,7 +29,6 @@ from components.phoenix_client import (  # noqa: E402
     PROJECT_START_STATUS_ID,
 )
 
-
 CASES: list[tuple[str, callable]] = []  # populated by @case
 
 
@@ -37,21 +36,24 @@ def case(label: str):
     def deco(fn):
         CASES.append((label, fn))
         return fn
+
     return deco
 
 
 # ── Constants sanity ─────────────────────────────────────────────────────────
 
+
 @case("constants match Phoenix schema lookup findings")
 def _test_constants():
     assert COMPANY_ID == 1, COMPANY_ID
-    assert PROJECT_OBJECT_TYPE_ID == 7, PROJECT_OBJECT_TYPE_ID   # R&R / Roof
-    assert ENTITY_OBJECT_TYPE_ID == 8, ENTITY_OBJECT_TYPE_ID     # Lead
-    assert HOMEOWNER_REL_TYPE_ID == 7, HOMEOWNER_REL_TYPE_ID     # Homeowner
-    assert PROJECT_START_STATUS_ID == 4, PROJECT_START_STATUS_ID # Qualification
+    assert PROJECT_OBJECT_TYPE_ID == 7, PROJECT_OBJECT_TYPE_ID  # R&R / Roof
+    assert ENTITY_OBJECT_TYPE_ID == 8, ENTITY_OBJECT_TYPE_ID  # Lead
+    assert HOMEOWNER_REL_TYPE_ID == 7, HOMEOWNER_REL_TYPE_ID  # Homeowner
+    assert PROJECT_START_STATUS_ID == 4, PROJECT_START_STATUS_ID  # Qualification
 
 
 # ── create_entity ────────────────────────────────────────────────────────────
+
 
 @case("create_entity DRY_RUN returns sql + all params in order")
 def _test_create_entity_dry_run():
@@ -88,6 +90,7 @@ def _test_create_entity_dry_run():
 def _test_create_entity_requires_agent():
     # Temporarily null the module-level AGENT_USER_ID.
     import components.phoenix_client as pc
+
     saved = pc.AGENT_USER_ID
     pc.AGENT_USER_ID = None
     try:
@@ -99,6 +102,7 @@ def _test_create_entity_requires_agent():
 
 
 # ── create_project ───────────────────────────────────────────────────────────
+
 
 @case("create_project DRY_RUN returns sql + params, applies status default")
 def _test_create_project_dry_run():
@@ -118,7 +122,7 @@ def _test_create_project_dry_run():
     assert p[0] == "Robert Shepherd - 324 Whitely Street"
     assert p[1] == COMPANY_ID
     assert p[2] == PROJECT_OBJECT_TYPE_ID
-    assert p[3] == PROJECT_START_STATUS_ID   # default kicked in
+    assert p[3] == PROJECT_START_STATUS_ID  # default kicked in
 
 
 @case("create_project without project_name is refused")
@@ -131,11 +135,12 @@ def _test_create_project_requires_name():
 @case("create_project override object_status_id is respected")
 def _test_create_project_status_override():
     c = PhoenixClient(dry_run=True)
-    r = c.create_project(project_name="X", object_status_id=61)   # Installation
+    r = c.create_project(project_name="X", object_status_id=61)  # Installation
     assert r.ok and r.data["params"][3] == 61
 
 
 # ── link_entity_project ──────────────────────────────────────────────────────
+
 
 @case("link_entity_project DRY_RUN builds correct SQL + params")
 def _test_link_dry_run():
@@ -147,32 +152,40 @@ def _test_link_dry_run():
     assert p[0] == 42
     assert p[1] == 100
     assert p[2] == HOMEOWNER_REL_TYPE_ID
-    assert p[3] is True   # main
-    assert p[4] == 1399   # agent user id
+    assert p[3] is True  # main
+    assert p[4] == 1399  # agent user id
 
 
 # ── find_entity_by_identity argument validation ──────────────────────────────
 
+
 @case("find_entity_by_identity refuses when no name or email")
 def _test_find_entity_needs_something():
     c = PhoenixClient(dry_run=True)
-    r = c.find_entity_by_identity()   # nothing supplied
+    r = c.find_entity_by_identity()  # nothing supplied
     assert not r.ok and "email or name" in r.detail, r
 
 
 # ── ensure_entity_and_project — the whole flow ───────────────────────────────
 
-def _make_client_with_canned(entity_matches: list, project_matches: list) -> PhoenixClient:
+
+def _make_client_with_canned(
+    entity_matches: list, project_matches: list
+) -> PhoenixClient:
     """Return a PhoenixClient whose finds return canned matches without hitting
     the DB. Also stubs create/link so their DRY_RUN payloads don't need
     real ids."""
     c = PhoenixClient(dry_run=True)
     c.find_entity_by_identity = lambda **kw: Result(
-        ok=True, detail=f"{len(entity_matches)} candidate(s)",
-        data={"matches": entity_matches, "unambiguous": len(entity_matches) == 1})
+        ok=True,
+        detail=f"{len(entity_matches)} candidate(s)",
+        data={"matches": entity_matches, "unambiguous": len(entity_matches) == 1},
+    )
     c.find_project_by_roofix_id = lambda roofix_id: Result(
-        ok=True, detail=f"{len(project_matches)} match(es)",
-        data={"matches": project_matches})
+        ok=True,
+        detail=f"{len(project_matches)} match(es)",
+        data={"matches": project_matches},
+    )
     # State cache stubbed so resolve_state_id doesn't call connect().
     c._state_cache_by_abbr = {"OH": 36, "VA": 47}
     c._state_cache_by_name = {"ohio": 36, "virginia": 47}
@@ -180,7 +193,7 @@ def _make_client_with_canned(entity_matches: list, project_matches: list) -> Pho
 
 
 _ACCEPTED_INPUT = {
-    "roofix_project_id": "1781297151690x264388044885887520",
+    "roofix_id": "1781297151690x264388044885887520",
     "display_text": "Robert Shepherd - 324 Whitely Street",
     "first_name": "Robert",
     "last_name": "Shepherd",
@@ -229,7 +242,7 @@ def _test_ensure_both_exist():
     r = c.ensure_entity_and_project(_ACCEPTED_INPUT)
     assert r.ok, r
     assert r.data["entity_id"] == 555
-    assert r.data["phoenix_project_id"] == 9001
+    assert r.data["project_id"] == 9001
     assert r.data["created_entity"] is False
     assert r.data["created_project"] is False
     # In DRY_RUN, if nothing was created, we skip the link write too
@@ -261,14 +274,15 @@ def _test_ensure_ambiguous_project():
     assert "roofix_id" in r.detail
 
 
-@case("ensure_entity_and_project: missing roofix_project_id is rejected")
+@case("ensure_entity_and_project: missing roofix_id is rejected")
 def _test_ensure_needs_roofix_id():
     c = _make_client_with_canned(entity_matches=[], project_matches=[])
     r = c.ensure_entity_and_project({"first_name": "X"})
-    assert not r.ok and "roofix_project_id" in r.detail
+    assert not r.ok and "roofix_id" in r.detail
 
 
 # ── Runner ───────────────────────────────────────────────────────────────────
+
 
 def run() -> bool:
     passed = failed = 0

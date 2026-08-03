@@ -43,11 +43,11 @@ def test_metadata_round_trip(tmp_path):
     store.record(
         "msg-123",
         status="ok",
-        metadata={"roofix_project_id": "1782x", "phoenix_project_id": 42},
+        metadata={"roofix_id": "1782x", "project_id": 42},
     )
     rec = store.get("msg-123")
     assert rec is not None
-    assert rec.metadata == {"roofix_project_id": "1782x", "phoenix_project_id": 42}
+    assert rec.metadata == {"roofix_id": "1782x", "project_id": 42}
 
 
 def test_record_upserts(tmp_path):
@@ -133,8 +133,8 @@ def test_retry_workflow(tmp_path):
 
     # Attempt 2: succeeds.
     store.mark_pending(msg_id, metadata={"attempt": 2})
-    store.mark_ok(msg_id, metadata={"attempt": 2, "phoenix_project_id": 42})
+    store.mark_ok(msg_id, metadata={"attempt": 2, "project_id": 42})
 
     assert store.is_processed(msg_id) is True
     rec = store.get(msg_id)
-    assert rec.metadata["phoenix_project_id"] == 42
+    assert rec.metadata["project_id"] == 42

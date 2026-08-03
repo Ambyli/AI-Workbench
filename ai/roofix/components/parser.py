@@ -5,7 +5,7 @@ What it extracts:
   event_type      from the "RFX | <type>" sender display name (reliable) with a
                   fallback to the subject. e.g. New Comment, New Task,
                   Estimate Complete, Estimate, HIC Executed, Install Date, ...
-  project_id      the Bubble-format id from any roofix.io/project/<id> link in the
+  roofix_id      the Bubble-format id from any roofix.io/project/<id> link in the
                   email (subject or body). This is the clean identity key.
   tracking_url    a URL pointing at the proposal, preferentially the tokenized
                   ``urlNNNN.roofix.io/ls/click?…`` link Roofix embeds in the HTML
@@ -54,7 +54,7 @@ from components.constants import (
 @dataclass
 class ParsedEvent:
     event_type: str
-    project_id: Optional[str] = None
+    roofix_id: Optional[str] = None
     tracking_url: Optional[str] = None
     customer_name: Optional[str] = None
     address: Optional[str] = None
@@ -70,7 +70,7 @@ class ParsedEvent:
     def as_dict(self) -> dict:
         return {
             "event_type": self.event_type,
-            "project_id": self.project_id,
+            "roofix_id": self.roofix_id,
             "tracking_url": self.tracking_url,
             "customer_name": self.customer_name,
             "address": self.address,
@@ -251,7 +251,7 @@ def parse_email(raw: dict) -> ParsedEvent:
 
     ev = ParsedEvent(
         event_type=event_type,
-        project_id=None,
+        roofix_id=None,
         tracking_url=tracking_url,
         customer_name=name,
         address=addr,
@@ -263,10 +263,10 @@ def parse_email(raw: dict) -> ParsedEvent:
         message_id=raw.get("message_id"),
     )
 
-    have_identity = bool(ev.project_id) or bool(ev.customer_name and ev.address)
+    have_identity = bool(ev.roofix_id) or bool(ev.customer_name and ev.address)
     if not have_identity:
         ev.parse_complete = False
-        ev.notes.append("no project_id and no name+address — cannot identify project")
+        ev.notes.append("no roofix_id and no name+address — cannot identify project")
     elif event_type in SCRAPE_EVENTS:
         ev.parse_complete = False
         ev.notes.append(
@@ -278,7 +278,7 @@ def parse_email(raw: dict) -> ParsedEvent:
     else:
         ev.parse_complete = True
 
-    if ev.customer_name and not ev.project_id:
+    if ev.customer_name and not ev.roofix_id:
         ev.notes.append("identified by name+address only (no link in email)")
 
     return ev

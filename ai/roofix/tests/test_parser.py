@@ -59,12 +59,12 @@ EXPECTED = {
     },
     "new_task_with_url_in_body": {
         "event_type": "New Task",
-        "project_id": None,
+        "roofix_id": None,
         "parse_complete": True,
     },
     # ── Real "RFX | Estimate" samples ──────────────────────────────────────────
     # Load-bearing invariants for these:
-    #   project_id is None — Roofix never puts the raw /project/<id> link in
+    #   roofix_id is None — Roofix never puts the raw /project/<id> link in
     #     Estimate emails; only the tokenized url<NNNN>.roofix.io/ls/click...
     #     tracking URL. Scraper follows the tracking URL to acquire the id.
     #   tracking_url is PRESENT — the scraper's entrypoint. If this breaks,
@@ -74,7 +74,7 @@ EXPECTED = {
         "event_type": "Estimate",
         "customer_name": "Gerald kang",
         "address": "836 Lasser Drive",
-        "project_id": None,
+        "roofix_id": None,
         "tracking_url": PRESENT,
         "parse_complete": False,
     },
@@ -82,7 +82,7 @@ EXPECTED = {
         "event_type": "Estimate",
         "customer_name": "Linda ward",
         "address": "1512 Fairlane Avenue Southwest",
-        "project_id": None,
+        "roofix_id": None,
         "tracking_url": PRESENT,
         "parse_complete": False,
     },
@@ -90,7 +90,7 @@ EXPECTED = {
         "event_type": "Estimate",
         "customer_name": "Cynthia Stoneham",
         "address": "11706 Pierce Court",
-        "project_id": None,
+        "roofix_id": None,
         "tracking_url": PRESENT,
         "parse_complete": False,
     },

@@ -59,13 +59,13 @@ def _default_log() -> CsvLogger:
 def _identity_key(ev: dict) -> str:
     """Build a grouping key so emails from the same real-world project are batched together.
 
-    Priority: use the explicit `project_id` if present (most reliable).
+    Priority: use the explicit `roofix_id` if present (most reliable).
     Otherwise fall back to a composite of customer_name + address.
 
     Called by: `process_batch` (inside the grouping loop).
     """
-    if ev.get("project_id"):
-        return f"id:{ev['project_id']}"
+    if ev.get("roofix_id"):
+        return f"id:{ev['roofix_id']}"
     return f"na:{(ev.get('customer_name') or '').lower()}|{(ev.get('address') or '').lower()}"
 
 
@@ -73,13 +73,13 @@ async def _resolve_context(ev: dict, phoenix) -> dict:
     """Look up the Phoenix project that an event belongs to.
 
     Strategy:
-      1. If the event carries a `project_id`, search by that Roofix external ID.
+      1. If the event carries a `roofix_id`, search by that Roofix external ID.
       2. Otherwise search by customer identity (name + optional address).
 
     Returns a dict with:
       - ``found`` (bool): did we find a matching project?
       - ``ambiguous`` (bool): were there multiple candidates?
-      - ``phoenix_project_id`` (int, optional): the single-match Phoenix project id.
+      - ``project_id`` (int, optional): the single-match Phoenix project id.
       - ``candidate_count`` (int, optional): how many candidates matched.
       - ``offline`` (bool, optional): True when phoenix client is unavailable.
 
@@ -91,15 +91,15 @@ async def _resolve_context(ev: dict, phoenix) -> dict:
     """
     if phoenix is None:
         return {"found": False, "offline": True}
-    if ev.get("project_id"):
-        r = await asyncio.to_thread(phoenix.find_project_by_roofix_id, ev["project_id"])
+    if ev.get("roofix_id"):
+        r = await asyncio.to_thread(phoenix.find_project_by_roofix_id, ev["roofix_id"])
         if r.ok:
             matches = r.data.get("matches", [])
             if len(matches) == 1:
                 return {
                     "found": True,
                     "ambiguous": False,
-                    "phoenix_project_id": matches[0]["id"],
+                    "project_id": matches[0]["id"],
                 }
             if len(matches) > 1:
                 return {
@@ -117,7 +117,7 @@ async def _resolve_context(ev: dict, phoenix) -> dict:
                 return {
                     "found": True,
                     "ambiguous": False,
-                    "phoenix_project_id": matches[0]["id"],
+                    "project_id": matches[0]["id"],
                 }
             if len(matches) > 1:
                 return {
@@ -170,7 +170,7 @@ async def _scrape_and_extract(
 
     On extractor success, mutates ``ev``:
       customer_name / address filled in from the scraped proposal,
-      project_id stamped from ``custom.order1``'s top-level id,
+      roofix_id stamped from ``custom.order1``'s top-level id,
       is_accepted / parse_complete stamped, an audit note appended,
       ``_extracted_payload`` stashed for ``_execute`` to pass onward to
       ``phoenix.ensure_entity_and_project``.
@@ -262,7 +262,7 @@ async def _scrape_and_extract(
         "customer_name"
     )
     ev["address"] = getattr(extracted, "street_address", None) or ev.get("address")
-    ev["project_id"] = getattr(extracted, "roofix_project_id", None)
+    ev["roofix_id"] = getattr(extracted, "roofix_id", None)
     ev["is_accepted"] = bool(getattr(extracted, "is_accepted", False))
     ev["parse_complete"] = True
     ev["_extracted_payload"] = _extracted_to_payload(extracted)
@@ -325,7 +325,7 @@ async def _execute(
                 )
 
         # ── Noop: project already exists in Phoenix ───────────────────
-        # Brain emitted this when ``context.get("phoenix_project_id")`` was
+        # Brain emitted this when ``context.get("project_id")`` was
         # set for a SCRAPE_EVENTS event — Phoenix already has the project,
         # so a create would be a duplicate. Terminal decision: audit-log,
         # mark processed. No Phoenix write. app.py will mark the email
@@ -348,7 +348,7 @@ async def _execute(
                         "action": "noop_project_exists",
                         "source": decision.get("source", "rule"),
                         "reasoning": decision["reasoning"],
-                        "phoenix_project_id": pref,
+                        "project_id": pref,
                     },
                 )
 
@@ -482,8 +482,8 @@ async def _execute(
             # The scrape step already populated the event with the extracted
             # proposal dict. Check if we have the required data.
             payload = ev.get("_extracted_payload") or {}
-            roofix_project_id = payload.get("roofix_project_id")
-            if not roofix_project_id:
+            roofix_id = payload.get("roofix_id")
+            if not roofix_id:
                 log.log(
                     "orchestrator",
                     action,
@@ -508,7 +508,7 @@ async def _execute(
                     await asyncio.to_thread(
                         processed_store.mark_ok,
                         ev.get("message_id"),
-                        {"roofix_project_id": roofix_project_id, "accepted": False},
+                        {"roofix_id": roofix_id, "accepted": False},
                     )
                 return
 
@@ -544,9 +544,9 @@ async def _execute(
                         processed_store.mark_ok,
                         ev.get("message_id"),
                         {
-                            "roofix_project_id": roofix_project_id,
+                            "roofix_id": roofix_id,
                             "phoenix_entity_id": res.data.get("entity_id"),
-                            "phoenix_project_id": res.data.get("phoenix_project_id"),
+                            "project_id": res.data.get("project_id"),
                             "accepted": True,
                         },
                     )
@@ -666,9 +666,7 @@ async def _process_group(
                     f"{ctx.get('candidate_count', '?')} candidates — need refinement)"
                 )
             else:
-                gate_detail = (
-                    "will scrape (proposal-linked event, phoenix miss)"
-                )
+                gate_detail = "will scrape (proposal-linked event, phoenix miss)"
         else:
             reasons = []
             if not scraper_client:

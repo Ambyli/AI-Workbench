@@ -184,7 +184,7 @@ ESTIMATE_TYPE = "custom.estimate1"
 # hands ``phoenix.ensure_entity_and_project``. Kept exhaustive so downstream
 # gets everything the extractor produced — Phoenix ignores keys it doesn't use.
 EXTRACTED_PAYLOAD_FIELDS = (
-    "roofix_project_id",
+    "roofix_id",
     "is_accepted",
     "display_text",
     "customer_name",

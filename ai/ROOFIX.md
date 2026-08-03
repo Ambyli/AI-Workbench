@@ -66,7 +66,7 @@ Phoenix DB (psycopg2) ◄─────►│
 Every `TICK_INTERVAL_SECONDS` (default 300s) the bridge:
 
 1. Fetches unread Roofix emails via Gmail API (`is:unread from:no-reply@roofix.io`).
-2. Parses each into a normalized event (event_type, project_id, customer_name, address, comment_text, ...).
+2. Parses each into a normalized event (event_type, roofix_id, customer_name, address, comment_text, ...).
 3. For each event, resolves the corresponding Phoenix project (by Roofix id, else by name + address).
 4. The brain decides one of: `update_chatter`, `update_milestone`, `create_project`, `noop_project_exists`, `ignore`, or `escalate`. Rules handle the clear cases; anything ambiguous escalates to LiteLLM (the "AI fallback"), which returns the same Decision shape.
 5. In DRY_RUN mode, the intended SQL + params are logged. Otherwise the writes are executed via psycopg2.
@@ -83,9 +83,9 @@ Ambiguous or thin `Estimate` / `Estimate Complete` events cause the bridge to ca
 | `escalate` / `needs_human=True` | — | `mark_ok({action, forwarded, source, reasoning})` | only if forward succeeded | If `gmail`, `ESCALATION_RECIPIENTS`, and the original email are all available, calls `gmail.forward_email(...)`. On success stamps `decision["_forwarded"]=True` (→ `app.py` marks read). On failure or when no recipients are configured, stamps `False` (→ stays unread for operator review in the Roofix inbox). |
 | `update_chatter` | `phoenix.update_chatter(project_id, note_text)` | — | yes (default) | `target` is the Phoenix project id as str; cast to int. If `phoenix is None` or `DRY_RUN=true`, the write is short-circuited via the Result's `dry_run` flag; the audit row is prefixed `DRY_RUN`. |
 | `update_milestone` | `phoenix.update_milestone(project_id, block_name, status_id)` | — | yes (default) | Looks up the milestone mapping using `event_type` as the key (`FIELD_MAPPING_PATH`). Missing mapping → log a "no milestone mapping for `<event>`" warning and skip the write. |
-| `create_project` (accepted) | `phoenix.ensure_entity_and_project(payload)` | `mark_ok({roofix_project_id, phoenix_entity_id, phoenix_project_id, accepted:True})` on write success; `mark_error({error})` on write failure | yes on success (default) | Uses the `_extracted_payload` stashed by `_scrape_and_extract`. Bails if the payload or `roofix_project_id` is missing (audit row `orchestrator/create_project` with ok=False). |
-| `create_project` (not accepted) | — | `mark_ok({roofix_project_id, accepted:False})` | yes (default) | Proposal wasn't accepted per the extractor's acceptance rule — log `orchestrator/not_accepted` and stop. |
-| `noop_project_exists` | — | `mark_ok({action, source, reasoning, phoenix_project_id})` | yes (rule-source terminal) | Emitted by the brain for a `SCRAPE_EVENTS` event when Phoenix already resolved the project — either directly on identity, or after the scrape gate ran and re-resolved via the extracted Roofix id. No create, no scrape re-run. Response `decision.target` is the existing Phoenix project id; use it to distinguish "we already have this" from a fresh `create_project`. |
+| `create_project` (accepted) | `phoenix.ensure_entity_and_project(payload)` | `mark_ok({roofix_id, phoenix_entity_id, project_id, accepted:True})` on write success; `mark_error({error})` on write failure | yes on success (default) | Uses the `_extracted_payload` stashed by `_scrape_and_extract`. Bails if the payload or `roofix_id` is missing (audit row `orchestrator/create_project` with ok=False). |
+| `create_project` (not accepted) | — | `mark_ok({roofix_id, accepted:False})` | yes (default) | Proposal wasn't accepted per the extractor's acceptance rule — log `orchestrator/not_accepted` and stop. |
+| `noop_project_exists` | — | `mark_ok({action, source, reasoning, project_id})` | yes (rule-source terminal) | Emitted by the brain for a `SCRAPE_EVENTS` event when Phoenix already resolved the project — either directly on identity, or after the scrape gate ran and re-resolved via the extracted Roofix id. No create, no scrape re-run. Response `decision.target` is the existing Phoenix project id; use it to distinguish "we already have this" from a fresh `create_project`. |
 | _anything else_ | — | `mark_error({error, source, reasoning})` | no (unread) | Most likely an AI hallucination (`"send_email"`, `"call_customer"`, etc.) or a Phase 1 action leaking into Phase 0. `mark_error` (not `mark_ok`) so `is_processed` returns False next tick — the brain gets another chance. Recurring errors here are a signal to tighten `SYSTEM_PROMPT`. |
 
 Sub-cases that short-circuit before the action branches:
@@ -263,11 +263,11 @@ FROM processed WHERE status = 'error';
 
 -- Everything that ran through create_project
 SELECT key,
-       metadata->>'roofix_project_id' AS roofix_id,
-       metadata->>'phoenix_project_id' AS phoenix_id,
+       metadata->>'roofix_id' AS roofix_id,
+       metadata->>'project_id' AS phoenix_id,
        (metadata->>'accepted')::bool  AS accepted
 FROM processed
-WHERE metadata ? 'roofix_project_id';
+WHERE metadata ? 'roofix_id';
 
 -- Reset a specific email so it gets reprocessed next tick
 DELETE FROM processed WHERE key = '19f908fe4c0a892c';

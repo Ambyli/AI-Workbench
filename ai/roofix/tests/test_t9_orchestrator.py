@@ -31,14 +31,21 @@ os.environ.setdefault("AGENT_PHASE", "1")  # Phase 1 to trigger create_project
 os.environ.setdefault("LOG_DIR", tempfile.mkdtemp(prefix="roofix_t9_"))
 
 # Add shared/common to PYTHONPATH.
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent / "shared" / "common" / "src"))
+sys.path.insert(
+    0,
+    str(
+        Path(__file__).resolve().parent.parent.parent.parent
+        / "shared"
+        / "common"
+        / "src"
+    ),
+)
 
 from common.logging_setup import CsvLogger  # noqa: E402
 from common.processed_store import ProcessedStore  # noqa: E402
 
 from components.parser import parse_email  # noqa: E402
 from components.orchestrator import run as orchestrator_run  # noqa: E402
-
 
 # ── Fake Estimate email with tracking URL ────────────────────────────────────
 
@@ -50,7 +57,7 @@ FAKE_ESTIMATE_EMAIL = {
     "body_text": "Hello, We have received your request to provide an estimate for Test Customer - 100 Test Street",
     "body_html": (
         '<a href="http://url6628.roofix.io/ls/click?upn=FAKE_TOKEN_123">'
-        'View the Project here</a>'
+        "View the Project here</a>"
     ),
     "timestamp": "2026-07-28T10:00:00+00:00",
     "message_id": "fake_message_id_001",
@@ -153,7 +160,7 @@ FAKE_SCRAPER_RESULT = {
 FAKE_EXTRACTED_PROPOSAL = MagicMock()
 FAKE_EXTRACTED_PROPOSAL.ok = True
 FAKE_EXTRACTED_PROPOSAL.error = None
-FAKE_EXTRACTED_PROPOSAL.roofix_project_id = "1781297151690x264388044885887520"
+FAKE_EXTRACTED_PROPOSAL.roofix_id = "1781297151690x264388044885887520"
 FAKE_EXTRACTED_PROPOSAL.is_accepted = True
 # The orchestrator's _scrape_and_extract reads full_name / street_address off
 # the ExtractedProposal to merge into the event. Set them explicitly so the
@@ -168,7 +175,7 @@ FAKE_EXTRACTED_PROPOSAL.acceptance_signals = {
 FAKE_EXTRACTED_PROPOSAL.__dict__ = {
     "ok": True,
     "error": None,
-    "roofix_project_id": "1781297151690x264388044885887520",
+    "roofix_id": "1781297151690x264388044885887520",
     "is_accepted": True,
     "acceptance_signals": {
         "has_hic": True,
@@ -197,8 +204,10 @@ FAKE_EXTRACTED_PROPOSAL.__dict__ = {
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
+
 def _read_audit_csv(log_path):
     import csv
+
     with open(log_path, encoding="utf-8") as f:
         return list(csv.DictReader(f))
 
@@ -224,7 +233,7 @@ def _make_fake_phoenix():
         detail="mocked create",
         data={
             "entity_id": 100,
-            "phoenix_project_id": 200,
+            "project_id": 200,
             "created_entity": True,
             "created_project": True,
             "created_link": True,
@@ -233,9 +242,11 @@ def _make_fake_phoenix():
     # Also need find_project_by_roofix_id and find_project_by_identity for
     # _resolve_context (called before decide in process_batch).
     phoenix.find_project_by_roofix_id.return_value = MagicMock(
-        ok=True, detail="no match", data={"matches": []})
+        ok=True, detail="no match", data={"matches": []}
+    )
     phoenix.find_project_by_identity.return_value = MagicMock(
-        ok=True, detail="no match", data={"matches": []})
+        ok=True, detail="no match", data={"matches": []}
+    )
     return phoenix
 
 
@@ -247,6 +258,7 @@ def _make_fake_gmail():
 
 
 # ── Test cases ───────────────────────────────────────────────────────────────
+
 
 def run() -> bool:
     passed = failed = 0
@@ -267,6 +279,7 @@ def run() -> bool:
             else:
                 passed += 1
                 print(f"ok    {label}")
+
         return deco
 
     # ── 1. Phase 1: estimate with tracking URL → create_project decision ────
@@ -274,11 +287,15 @@ def run() -> bool:
     @case("Phase 1 estimate: brain emits create_project, not ignore")
     def _test_phase1_brain_emits_create_project():
         from components.brain import decide
+
         ev = parse_email(FAKE_ESTIMATE_EMAIL).as_dict()
         ctx = {"found": False, "ambiguous": False}
         d = asyncio.run(decide(ev, ctx)).as_dict()
         assert d["action"] == "create_project", d
-        assert d["payload"]["tracking_url"] == "http://url6628.roofix.io/ls/click?upn=FAKE_TOKEN_123"
+        assert (
+            d["payload"]["tracking_url"]
+            == "http://url6628.roofix.io/ls/click?upn=FAKE_TOKEN_123"
+        )
         assert d["source"] == "rule", d
 
     # ── 2. Phase 0: estimate still ignored ──────────────────────────────────
@@ -287,10 +304,12 @@ def run() -> bool:
     def _test_phase0_still_ignores():
         # Temporarily set AGENT_PHASE to 0.
         import components.brain as brain_mod
+
         saved = brain_mod.PHASE
         brain_mod.PHASE = "0"
         try:
             from components.brain import decide
+
             ev = parse_email(FAKE_ESTIMATE_EMAIL).as_dict()
             ctx = {"found": False, "ambiguous": False}
             d = asyncio.run(decide(ev, ctx)).as_dict()
@@ -304,23 +323,32 @@ def run() -> bool:
     @case("Phase 1: full pipeline calls scraper, extractor, ensure_entity_and_project")
     def _test_full_pipeline_phase1():
         log_path = os.path.join(os.environ["LOG_DIR"], "audit_t9_phase1.csv")
-        audit = CsvLogger(path=log_path, columns=[
-            "stage", "action", "ok", "detail", "event_type", "project_ref"])
-        processed_store = ProcessedStore(Path(os.environ["LOG_DIR"]) / "processed_t9.db")
+        audit = CsvLogger(
+            path=log_path,
+            columns=["stage", "action", "ok", "detail", "event_type", "project_ref"],
+        )
+        processed_store = ProcessedStore(
+            Path(os.environ["LOG_DIR"]) / "processed_t9.db"
+        )
         scraper = _make_fake_scraper()
         phoenix = _make_fake_phoenix()
         gmail = _make_fake_gmail()
 
         # Patch extract_proposal to return our fake.
-        with patch("components.orchestrator.extract_proposal", return_value=FAKE_EXTRACTED_PROPOSAL):
-            records = asyncio.run(orchestrator_run(
-                listener=lambda: [FAKE_ESTIMATE_EMAIL],
-                phoenix=phoenix,
-                log=audit,
-                milestone_map=None,
-                scraper_client=scraper,
-                processed_store=processed_store,
-            ))
+        with patch(
+            "components.orchestrator.extract_proposal",
+            return_value=FAKE_EXTRACTED_PROPOSAL,
+        ):
+            records = asyncio.run(
+                orchestrator_run(
+                    listener=lambda: [FAKE_ESTIMATE_EMAIL],
+                    phoenix=phoenix,
+                    log=audit,
+                    milestone_map=None,
+                    scraper_client=scraper,
+                    processed_store=processed_store,
+                )
+            )
 
         # Verify decision. Each record now bundles ev + decision.
         assert len(records) == 1, len(records)
@@ -330,7 +358,10 @@ def run() -> bool:
         # Verify scraper was called with the tracking URL.
         scraper.get_proposal.assert_called_once()
         call_kwargs = scraper.get_proposal.call_args
-        assert call_kwargs[1].get("tracking_url") == "http://url6628.roofix.io/ls/click?upn=FAKE_TOKEN_123"
+        assert (
+            call_kwargs[1].get("tracking_url")
+            == "http://url6628.roofix.io/ls/click?upn=FAKE_TOKEN_123"
+        )
 
         # Verify extractor was called with the scraper result.
         # (patched, so we can't verify the call directly, but we know it ran
@@ -339,15 +370,17 @@ def run() -> bool:
         # Verify ensure_entity_and_project was called.
         phoenix.ensure_entity_and_project.assert_called_once()
         call_args = phoenix.ensure_entity_and_project.call_args[0][0]
-        assert call_args["roofix_project_id"] == "1781297151690x264388044885887520"
+        assert call_args["roofix_id"] == "1781297151690x264388044885887520"
         assert call_args["is_accepted"] is True
 
         # Verify ProcessedStore was marked ok.
         store_record = processed_store.get("fake_message_id_001")
-        assert store_record is not None, "ProcessedStore should have a record for this message_id"
+        assert (
+            store_record is not None
+        ), "ProcessedStore should have a record for this message_id"
         assert store_record.status == "ok"
         assert store_record.metadata["phoenix_entity_id"] == 100
-        assert store_record.metadata["phoenix_project_id"] == 200
+        assert store_record.metadata["project_id"] == 200
 
         # Verify gmail.mark_read was NOT called by the orchestrator itself
         # (mark_read happens in app._run_one_batch, not in the orchestrator).
@@ -363,12 +396,18 @@ def run() -> bool:
 
     # ── 4. Phase 1: is_accepted=False → skip create, mark ok with accepted=False ──
 
-    @case("Phase 1: is_accepted=False skips create_project, marks ok with accepted=False")
+    @case(
+        "Phase 1: is_accepted=False skips create_project, marks ok with accepted=False"
+    )
     def _test_phase1_not_accepted():
         log_path = os.path.join(os.environ["LOG_DIR"], "audit_t9_not_accepted.csv")
-        audit = CsvLogger(path=log_path, columns=[
-            "stage", "action", "ok", "detail", "event_type", "project_ref"])
-        processed_store = ProcessedStore(Path(os.environ["LOG_DIR"]) / "processed_t9_not_accepted.db")
+        audit = CsvLogger(
+            path=log_path,
+            columns=["stage", "action", "ok", "detail", "event_type", "project_ref"],
+        )
+        processed_store = ProcessedStore(
+            Path(os.environ["LOG_DIR"]) / "processed_t9_not_accepted.db"
+        )
         scraper = _make_fake_scraper()
         phoenix = _make_fake_phoenix()
 
@@ -376,29 +415,34 @@ def run() -> bool:
         class FakeExtractedProposal:
             ok = True
             error = None
-            roofix_project_id = "1781297151690x264388044885887520"
+            roofix_id = "1781297151690x264388044885887520"
             is_accepted = False
             # Same rationale as FAKE_EXTRACTED_PROPOSAL — the merge path reads
             # these two off the extracted proposal.
             full_name = "Test Customer"
             street_address = "100 Test Street"
             __dict__ = {
-                "ok": True, "error": None,
-                "roofix_project_id": "1781297151690x264388044885887520",
+                "ok": True,
+                "error": None,
+                "roofix_id": "1781297151690x264388044885887520",
                 "is_accepted": False,
             }
 
         not_accepted = FakeExtractedProposal()
 
-        with patch("components.orchestrator.extract_proposal", return_value=not_accepted):
-            records = asyncio.run(orchestrator_run(
-                listener=lambda: [FAKE_ESTIMATE_EMAIL],
-                phoenix=phoenix,
-                log=audit,
-                milestone_map=None,
-                scraper_client=scraper,
-                processed_store=processed_store,
-            ))
+        with patch(
+            "components.orchestrator.extract_proposal", return_value=not_accepted
+        ):
+            records = asyncio.run(
+                orchestrator_run(
+                    listener=lambda: [FAKE_ESTIMATE_EMAIL],
+                    phoenix=phoenix,
+                    log=audit,
+                    milestone_map=None,
+                    scraper_client=scraper,
+                    processed_store=processed_store,
+                )
+            )
 
         # Verify decision.
         assert len(records) == 1, len(records)
@@ -416,14 +460,21 @@ def run() -> bool:
 
         # Verify audit trail has the "not_accepted" log.
         rows = _read_audit_csv(log_path)
-        not_accepted_rows = [r for r in rows if r["stage"] == "orchestrator" and r["action"] == "not_accepted"]
-        assert len(not_accepted_rows) == 1, f"Expected 1 not_accepted row, got {not_accepted_rows}"
+        not_accepted_rows = [
+            r
+            for r in rows
+            if r["stage"] == "orchestrator" and r["action"] == "not_accepted"
+        ]
+        assert (
+            len(not_accepted_rows) == 1
+        ), f"Expected 1 not_accepted row, got {not_accepted_rows}"
 
     # ── 5. Phase 1: no tracking URL → escalate ──────────────────────────────
 
     @case("Phase 1: estimate without tracking URL escalates")
     def _test_phase1_no_tracking_url():
         from components.brain import decide
+
         email_no_tracking = dict(FAKE_ESTIMATE_EMAIL)
         email_no_tracking["body_html"] = "<p>No link here</p>"
         ev = parse_email(email_no_tracking).as_dict()
@@ -438,23 +489,29 @@ def run() -> bool:
     @case("Phase 1: scraper returns no docs -> mark error in ProcessedStore")
     def _test_phase1_scraper_no_docs():
         log_path = os.path.join(os.environ["LOG_DIR"], "audit_t9_no_docs.csv")
-        audit = CsvLogger(path=log_path, columns=[
-            "stage", "action", "ok", "detail", "event_type", "project_ref"])
-        processed_store = ProcessedStore(Path(os.environ["LOG_DIR"]) / "processed_t9_no_docs.db")
+        audit = CsvLogger(
+            path=log_path,
+            columns=["stage", "action", "ok", "detail", "event_type", "project_ref"],
+        )
+        processed_store = ProcessedStore(
+            Path(os.environ["LOG_DIR"]) / "processed_t9_no_docs.db"
+        )
         scraper = _make_fake_scraper()
         phoenix = _make_fake_phoenix()
 
         # Make scraper return no docs.
         scraper.get_proposal = AsyncMock(return_value={"docs": [], "mget_docs": []})
 
-        records = asyncio.run(orchestrator_run(
-            listener=lambda: [FAKE_ESTIMATE_EMAIL],
-            phoenix=phoenix,
-            log=audit,
-            milestone_map=None,
-            scraper_client=scraper,
-            processed_store=processed_store,
-        ))
+        records = asyncio.run(
+            orchestrator_run(
+                listener=lambda: [FAKE_ESTIMATE_EMAIL],
+                phoenix=phoenix,
+                log=audit,
+                milestone_map=None,
+                scraper_client=scraper,
+                processed_store=processed_store,
+            )
+        )
 
         # Verify decision.
         assert len(records) == 1, len(records)
@@ -474,7 +531,9 @@ def run() -> bool:
 
         # Verify audit trail has the "no_docs" log.
         rows = _read_audit_csv(log_path)
-        no_docs_rows = [r for r in rows if r["stage"] == "scraper" and r["action"] == "no_docs"]
+        no_docs_rows = [
+            r for r in rows if r["stage"] == "scraper" and r["action"] == "no_docs"
+        ]
         assert len(no_docs_rows) == 1, no_docs_rows
 
     print(f"\n{passed} passed, {failed} failed")

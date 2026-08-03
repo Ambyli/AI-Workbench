@@ -65,6 +65,8 @@ IGNORE_EVENTS = {
     "Send HIC to Homeowner",
     "Install Date Confirmed",
     "Sign Contingency",
+    "Send Loan Docs",
+    "Sign Loan Documents",
 }
 
 

@@ -37,8 +37,10 @@ from common.env import load_env
 load_env()
 
 import base64
+from typing import Optional
 import html as _html
 import os
+import threading
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 
@@ -84,31 +86,60 @@ def _html_to_text(html: str) -> str:
 
 class GmailClient:
     def __init__(self):
-        self._service = None
+        # googleapiclient's Resource / httplib2.Http is documented as NOT
+        # thread-safe. Concurrent .execute() calls from multiple worker
+        # threads on the same service can corrupt httplib2's internal state
+        # (segfault-adjacent). Use threading.local so each thread lazily
+        # builds its own service on first access; underneath, credentials
+        # are shared and refresh is thread-safe per google-auth's design.
+        self._local = threading.local()
+        self._creds: Optional[Credentials] = None
+        self._creds_lock = threading.Lock()
         # Cache of label name → id, populated on first lookup. Gmail label
         # ids are stable per user, so this only misses once per process
-        # lifetime. Avoids listing all labels on every tick.
+        # lifetime. Avoids listing all labels on every tick. CPython's GIL
+        # keeps dict.get / assignment atomic; setdefault handles the race.
         self._label_id_cache: dict[str, str] = {}
 
-    def _auth(self):
-        creds = None
-        if os.path.exists(TOKEN_PATH):
-            creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
-        if not creds or not creds.valid:
-            if creds and creds.expired and creds.refresh_token:
-                creds.refresh(Request())
-            else:
-                flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, SCOPES)
-                creds = flow.run_local_server(port=0)
-            os.makedirs(os.path.dirname(TOKEN_PATH) or ".", exist_ok=True)
-            with open(TOKEN_PATH, "w") as f:
-                f.write(creds.to_json())
-        return creds
+    def _auth(self) -> Credentials:
+        """Load or refresh OAuth credentials.
+
+        Shared across threads — google-auth's Credentials object is
+        documented as thread-safe (refresh uses an internal lock). We
+        additionally guard the token.json read/write pair here so two
+        concurrent expired-token threads don't race on the file.
+        """
+        if self._creds is not None and self._creds.valid:
+            return self._creds
+        with self._creds_lock:
+            if self._creds is not None and self._creds.valid:
+                return self._creds
+            creds = None
+            if os.path.exists(TOKEN_PATH):
+                creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
+            if not creds or not creds.valid:
+                if creds and creds.expired and creds.refresh_token:
+                    creds.refresh(Request())
+                else:
+                    flow = InstalledAppFlow.from_client_secrets_file(
+                        CREDENTIALS_PATH, SCOPES
+                    )
+                    creds = flow.run_local_server(port=0)
+                os.makedirs(os.path.dirname(TOKEN_PATH) or ".", exist_ok=True)
+                with open(TOKEN_PATH, "w") as f:
+                    f.write(creds.to_json())
+            self._creds = creds
+            return creds
 
     def service(self):
-        if self._service is None:
-            self._service = build("gmail", "v1", credentials=self._auth())
-        return self._service
+        """Return the calling thread's Gmail service instance, building it
+        on first access. Each thread gets its own httplib2.Http so parallel
+        ``.execute()`` calls don't clobber each other's connection state."""
+        svc = getattr(self._local, "service", None)
+        if svc is None:
+            svc = build("gmail", "v1", credentials=self._auth(), cache_discovery=False)
+            self._local.service = svc
+        return svc
 
     def close(self) -> None:
         # Present for API parity with the MCP client's context-manager form.

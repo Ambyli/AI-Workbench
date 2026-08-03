@@ -23,10 +23,18 @@ serialized to avoid double-processing an event mid-flight.
 from __future__ import annotations
 
 import asyncio
+import faulthandler
 import json
 import logging
 import os
+import sys
 import threading
+
+# Install faulthandler at import time so any future native crash (SIGSEGV,
+# SIGABRT, SIGBUS from a misbehaving C extension) writes a Python traceback
+# to stderr before the process dies. Costs effectively nothing at runtime;
+# turns "exit code 139, no logs" into "here's the exact call stack."
+faulthandler.enable(file=sys.stderr, all_threads=True)
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path

@@ -64,11 +64,14 @@ load_env()
 
 import json
 import os
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import psycopg2
 import psycopg2.extras
+import psycopg2.pool
 
 
 # --- configuration knobs --------------------------------------------------------
@@ -107,35 +110,63 @@ class Result:
 # --- client ---------------------------------------------------------------------
 
 class PhoenixClient:
-    def __init__(self, dry_run: Optional[bool] = None):
+    def __init__(
+        self,
+        dry_run: Optional[bool] = None,
+        *,
+        min_conns: int = 1,
+        max_conns: int = 16,
+    ):
         self.dry_run = DRY_RUN if dry_run is None else dry_run
-        self._conn = None
+        # Lazy pool: created on first ``_cursor``/``ping`` call so importing
+        # this module (or building an instance for a smoke test) doesn't
+        # require PHOENIX_DB_* env vars to be set yet.
+        self._pool: Optional[psycopg2.pool.ThreadedConnectionPool] = None
+        self._pool_lock = threading.Lock()
+        self._min_conns = min_conns
+        self._max_conns = max_conns
         # State lookup cache: keyed by lowercased text OR uppercased 2-letter
         # abbreviation. Populated lazily on first resolve_state_id call.
+        # Lock guards the initialization race when concurrent readers arrive
+        # before the first cache fill completes.
         self._state_cache_by_abbr: Optional[dict[str, int]] = None
         self._state_cache_by_name: Optional[dict[str, int]] = None
+        self._state_cache_lock = threading.Lock()
 
     # connection -----------------------------------------------------------------
 
-    def connect(self):
-        """Open a connection from env vars. Raises if it can't — fail loud, not silent."""
-        if self._conn and not self._conn.closed:
-            return self._conn
-        self._conn = psycopg2.connect(
-            host=os.environ["PHOENIX_DB_HOST"],
-            port=os.getenv("PHOENIX_DB_PORT", "5432"),
-            dbname=os.environ["PHOENIX_DB_NAME"],
-            user=os.environ["PHOENIX_DB_USER"],
-            password=os.environ["PHOENIX_DB_PASSWORD"],
-            options="-c search_path=phoenix",
-            sslmode=os.getenv("PHOENIX_DB_SSLMODE", "require"),
-        )
-        self._conn.autocommit = False
-        return self._conn
+    def _ensure_pool(self) -> psycopg2.pool.ThreadedConnectionPool:
+        """Open the connection pool lazily on first use.
+
+        ``ThreadedConnectionPool`` (not ``SimpleConnectionPool``) is required
+        here — callers hit ``PhoenixClient`` from multiple worker threads
+        via ``asyncio.to_thread``, and a single shared psycopg2 connection
+        under concurrent use is the C-level segfault this replaces.
+        """
+        if self._pool is not None:
+            return self._pool
+        with self._pool_lock:
+            if self._pool is None:
+                self._pool = psycopg2.pool.ThreadedConnectionPool(
+                    self._min_conns,
+                    self._max_conns,
+                    host=os.environ["PHOENIX_DB_HOST"],
+                    port=os.getenv("PHOENIX_DB_PORT", "5432"),
+                    dbname=os.environ["PHOENIX_DB_NAME"],
+                    user=os.environ["PHOENIX_DB_USER"],
+                    password=os.environ["PHOENIX_DB_PASSWORD"],
+                    options="-c search_path=phoenix",
+                    sslmode=os.getenv("PHOENIX_DB_SSLMODE", "require"),
+                )
+        return self._pool
 
     def close(self):
-        if self._conn and not self._conn.closed:
-            self._conn.close()
+        if self._pool is not None:
+            try:
+                self._pool.closeall()
+            except Exception:
+                pass
+            self._pool = None
 
     def __enter__(self):
         return self
@@ -143,8 +174,28 @@ class PhoenixClient:
     def __exit__(self, *exc):
         self.close()
 
+    @contextmanager
     def _cursor(self):
-        return self.connect().cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        """Borrow a pooled connection, yield a RealDictCursor, commit on
+        clean exit or rollback on exception, return the connection.
+
+        Reads and writes both use this — reads treat the trailing commit
+        as a no-op, and having one path keeps the callers uniform.
+        """
+        pool = self._ensure_pool()
+        conn = pool.getconn()
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                yield cur
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            pool.putconn(conn)
 
     # reads ----------------------------------------------------------------------
 
@@ -303,19 +354,24 @@ class PhoenixClient:
         return None
 
     def _ensure_state_cache(self) -> None:
+        """Populate the state name/abbrev caches once, under a lock so
+        concurrent callers don't each issue the SELECT."""
         if self._state_cache_by_abbr is not None:
             return
-        try:
-            with self._cursor() as cur:
-                cur.execute("SELECT id, state_name, abbreviation FROM state;")
-                rows = cur.fetchall()
-        except Exception:
-            # Cache empty dicts so we don't repeatedly retry a broken DB.
-            self._state_cache_by_abbr = {}
-            self._state_cache_by_name = {}
-            return
-        self._state_cache_by_abbr = {r["abbreviation"].upper(): r["id"] for r in rows}
-        self._state_cache_by_name = {r["state_name"].lower(): r["id"] for r in rows}
+        with self._state_cache_lock:
+            if self._state_cache_by_abbr is not None:
+                return
+            try:
+                with self._cursor() as cur:
+                    cur.execute("SELECT id, state_name, abbreviation FROM state;")
+                    rows = cur.fetchall()
+            except Exception:
+                # Cache empty dicts so we don't repeatedly retry a broken DB.
+                self._state_cache_by_abbr = {}
+                self._state_cache_by_name = {}
+                return
+            self._state_cache_by_abbr = {r["abbreviation"].upper(): r["id"] for r in rows}
+            self._state_cache_by_name = {r["state_name"].lower(): r["id"] for r in rows}
 
     # writes ---------------------------------------------------------------------
 
@@ -349,14 +405,11 @@ class PhoenixClient:
                           detail="DRY_RUN: would insert note",
                           data={"sql": sql, "params": params})
         try:
-            conn = self.connect()
-            with conn.cursor() as cur:
+            with self._cursor() as cur:
                 cur.execute(sql, params)
-                new_id = cur.fetchone()[0]
-            conn.commit()
+                new_id = cur.fetchone()["id"]
             return Result(ok=True, detail="note inserted", data={"note_id": new_id})
         except Exception as e:
-            self.connect().rollback()
             return Result(ok=False, detail=f"update_chatter failed: {e}")
 
     def update_milestone(self, project_id: int, block_name: str,
@@ -396,19 +449,16 @@ class PhoenixClient:
                           data={"update_sql": update_sql, "update_params": up_params,
                                 "insert_sql": insert_sql, "insert_params": ins_params})
         try:
-            conn = self.connect()
-            with conn.cursor() as cur:
+            with self._cursor() as cur:
                 cur.execute(update_sql, up_params)
                 row = cur.fetchone()
                 if row is None:
                     cur.execute(insert_sql, ins_params)
                     row = cur.fetchone()
-                ppb_id = row[0]
-            conn.commit()
+                ppb_id = row["id"]
             return Result(ok=True, detail="milestone set",
                           data={"project_process_block_id": ppb_id})
         except Exception as e:
-            self.connect().rollback()
             return Result(ok=False, detail=f"update_milestone failed: {e}")
 
     def create_entity(
@@ -456,14 +506,11 @@ class PhoenixClient:
                           detail="DRY_RUN: would insert entity",
                           data={"sql": sql, "params": params})
         try:
-            conn = self.connect()
-            with conn.cursor() as cur:
+            with self._cursor() as cur:
                 cur.execute(sql, params)
-                new_id = cur.fetchone()[0]
-            conn.commit()
+                new_id = cur.fetchone()["id"]
             return Result(ok=True, detail="entity inserted", data={"entity_id": new_id})
         except Exception as e:
-            self.connect().rollback()
             return Result(ok=False, detail=f"create_entity failed: {e}")
 
     def create_project(
@@ -515,14 +562,11 @@ class PhoenixClient:
                           detail="DRY_RUN: would insert project",
                           data={"sql": sql, "params": params})
         try:
-            conn = self.connect()
-            with conn.cursor() as cur:
+            with self._cursor() as cur:
                 cur.execute(sql, params)
-                new_id = cur.fetchone()[0]
-            conn.commit()
+                new_id = cur.fetchone()["id"]
             return Result(ok=True, detail="project inserted", data={"project_id": new_id})
         except Exception as e:
-            self.connect().rollback()
             return Result(ok=False, detail=f"create_project failed: {e}")
 
     def link_entity_project(
@@ -554,15 +598,12 @@ class PhoenixClient:
                           detail="DRY_RUN: would link entity → project",
                           data={"sql": sql, "params": params})
         try:
-            conn = self.connect()
-            with conn.cursor() as cur:
+            with self._cursor() as cur:
                 cur.execute(sql, params)
-                new_id = cur.fetchone()[0]
-            conn.commit()
+                new_id = cur.fetchone()["id"]
             return Result(ok=True, detail="entity linked to project",
                           data={"entity_project_relationship_id": new_id})
         except Exception as e:
-            self.connect().rollback()
             return Result(ok=False, detail=f"link_entity_project failed: {e}")
 
     def find_link(self, entity_id: int, project_id: int) -> Result:

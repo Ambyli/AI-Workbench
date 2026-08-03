@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -202,10 +203,13 @@ class PostgresProcessedStore:
     Use when you want operators to query the store remotely (DBeaver, psql,
     dashboards) without shuffling the SQLite file around.
 
-    Holds one persistent psycopg2 connection in autocommit mode. Each call
-    opens a short-lived cursor. Fine for tick-based workloads (a few dozen
-    writes per tick); if you want higher throughput or thread-safety across
-    workers, wrap the connection in a pool at the caller.
+    Backed by ``psycopg2.pool.ThreadedConnectionPool``. Each read/write
+    checks out a connection, uses it, returns it. Safe to share one store
+    instance across worker threads — a segfault at scale in a caller that
+    fanned out via ``asyncio.to_thread`` on a single shared connection is
+    exactly what motivated the pool. Pool size is bounded by ``max_conns``
+    (default 16); a caller pushing more than that concurrently will block
+    until a connection frees.
 
     ``metadata`` is stored as JSONB, so downstream queries can use Postgres's
     native operators:
@@ -225,16 +229,16 @@ class PostgresProcessedStore:
         CREATE INDEX IF NOT EXISTS idx_processed_status ON processed(status);
     """
 
-    def __init__(self, dsn: str) -> None:
+    def __init__(self, dsn: str, *, min_conns: int = 1, max_conns: int = 16) -> None:
         # Local imports so callers that only need the SQLite backend don't
         # incur a psycopg2 dependency.
         import psycopg2
         from psycopg2.extras import RealDictCursor, Json
+        from psycopg2.pool import ThreadedConnectionPool
 
         self._Json = Json
         self._RealDictCursor = RealDictCursor
-        self._conn = psycopg2.connect(dsn)
-        self._conn.autocommit = True
+        self._pool = ThreadedConnectionPool(min_conns, max_conns, dsn)
         self._init_schema()
 
     def __enter__(self):
@@ -242,17 +246,34 @@ class PostgresProcessedStore:
 
     def __exit__(self, *exc):
         try:
-            self._conn.close()
+            self._pool.closeall()
         except Exception:
             pass
         return False
 
-    def _init_schema(self) -> None:
-        with self._conn.cursor() as cur:
-            cur.execute(self.SCHEMA)
-
+    @contextmanager
     def _cursor(self):
-        return self._conn.cursor(cursor_factory=self._RealDictCursor)
+        """Borrow a connection, yield a RealDictCursor, commit-or-rollback,
+        return the connection. Autocommit-like semantics: every ``_cursor``
+        block is its own transaction, so concurrent callers don't share
+        transactional state through the pool."""
+        conn = self._pool.getconn()
+        try:
+            with conn.cursor(cursor_factory=self._RealDictCursor) as cur:
+                yield cur
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            self._pool.putconn(conn)
+
+    def _init_schema(self) -> None:
+        with self._cursor() as cur:
+            cur.execute(self.SCHEMA)
 
     # ── Reads ──────────────────────────────────────────────────────────────
 
@@ -275,15 +296,22 @@ class PostgresProcessedStore:
         return _pg_row_to_record(row) if row else None
 
     def list_by_status(self, status: str) -> Iterator[ProcessedRecord]:
-        """Iterate every row with the given status."""
+        """Iterate every row with the given status.
+
+        Materializes the result set inside the ``_cursor`` context so the
+        connection is returned to the pool before yielding rows to the
+        caller — otherwise a slow consumer could hold a pool slot for the
+        entire iteration.
+        """
         with self._cursor() as cur:
             cur.execute(
                 "SELECT key, processed_at, status, metadata "
                 "FROM processed WHERE status = %s ORDER BY processed_at",
                 (status,),
             )
-            for row in cur:
-                yield _pg_row_to_record(row)
+            rows = cur.fetchall()
+        for row in rows:
+            yield _pg_row_to_record(row)
 
     # ── Writes ─────────────────────────────────────────────────────────────
 
@@ -300,7 +328,7 @@ class PostgresProcessedStore:
             )
         now = datetime.now(timezone.utc)
         meta = metadata or {}
-        with self._conn.cursor() as cur:
+        with self._cursor() as cur:
             cur.execute(
                 "INSERT INTO processed (key, processed_at, status, metadata) "
                 "VALUES (%s, %s, %s, %s) "

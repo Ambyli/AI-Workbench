@@ -324,6 +324,34 @@ async def _execute(
                     },
                 )
 
+        # ── Noop: project already exists in Phoenix ───────────────────
+        # Brain emitted this when ``context.get("phoenix_project_id")`` was
+        # set for a SCRAPE_EVENTS event — Phoenix already has the project,
+        # so a create would be a duplicate. Terminal decision: audit-log,
+        # mark processed. No Phoenix write. app.py will mark the email
+        # read (this is a rule-source terminal decision, same class as
+        # rule-based ignore).
+        case "noop_project_exists":
+            log.log(
+                "orchestrator",
+                "noop_project_exists",
+                True,
+                decision["reasoning"],
+                event_type=etype,
+                project_ref=pref,
+            )
+            if processed_store:
+                await asyncio.to_thread(
+                    processed_store.mark_ok,
+                    ev.get("message_id"),
+                    {
+                        "action": "noop_project_exists",
+                        "source": decision.get("source", "rule"),
+                        "reasoning": decision["reasoning"],
+                        "phoenix_project_id": pref,
+                    },
+                )
+
         # ── Escalate / Needs human ────────────────────────────────────
         # Log for human review, skip Phoenix write. Attempt to forward the
         # original email to ESCALATION_RECIPIENTS if configured:

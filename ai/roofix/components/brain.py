@@ -168,8 +168,27 @@ async def decide(event: dict, context: dict) -> Decision:
                     f"not act on estimates; contract value is set by a signing event."
                 ),
             )
-        # Phase 1: if we have a tracking URL, emit create_project. The
-        # orchestrator will scrape, extract, and decide acceptance.
+        # Phase 1: Phoenix already has this project — either from direct
+        # identity resolution before the scrape gate, or from re-resolving
+        # after the scrape stamped the authoritative Roofix id. Nothing left
+        # to do; a create would just log a duplicate. Terminate with a noop
+        # so the response makes the "already found" state explicit instead
+        # of hiding it behind a phantom create_project decision.
+        phoenix_project_id = context.get("phoenix_project_id")
+        if phoenix_project_id:
+            return Decision(
+                "noop_project_exists",
+                event_type=etype,
+                target=str(phoenix_project_id),
+                reasoning=(
+                    f"'{etype}' — Phoenix already has this project "
+                    f"(id {phoenix_project_id}); no create needed."
+                ),
+            )
+        # Phoenix couldn't identify the project. If we have a tracking URL,
+        # emit create_project — the orchestrator's scrape gate has already
+        # run by this point (or was going to and couldn't); _execute will
+        # use whatever _extracted_payload the scrape produced.
         tracking_url = event.get("tracking_url")
         if tracking_url:
             return Decision(

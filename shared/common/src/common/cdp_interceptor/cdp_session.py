@@ -207,6 +207,17 @@ def run_session(
         # so callers don't need to anchor with ^ / $.
         return any(p.search(url) for p in url_patterns)
 
+    # Compile the login-wall URL patterns once. Entries are regexes matched
+    # with re.search against location.href AFTER navigation (see the login gate
+    # in _navigate_and_capture). Regex — not substring — so callers can anchor
+    # to a bare domain that a substring couldn't tell apart from an in-app URL,
+    # e.g. r"^https?://roofix\.io/?$". An empty list disables detection.
+    _login_res = [re.compile(k) for k in login_url_keywords]
+
+    def _is_login(href: str) -> bool:
+        """True if href matches any login_url_keywords pattern."""
+        return any(rx.search(href) for rx in _login_res)
+
     def _process_capture(cap: Capture) -> Optional[dict]:
         """Run one Capture through the full pipeline:
           1. fire on_capture (unfiltered raw stream — always fires)
@@ -297,6 +308,45 @@ def run_session(
                 winner = parsed
         return winner
 
+    def _await_login_resolved(nav_url: str) -> None:
+        """Handle a login wall detected AFTER navigating to nav_url.
+
+        Signals ``waiting_login``, then polls location.href until the user
+        leaves the login flow (success) or ``login_timeout`` expires. On
+        success we re-navigate to nav_url — the user may have landed on a
+        dashboard rather than the target — so the capture poll can proceed.
+
+        If the caller sets ``stop_event`` mid-wait (e.g. the interceptor's
+        capture window elapsed), we return with status left at ``waiting_login``
+        — that's what surfaces as ``login_wall=true``. On timeout we raise
+        ``TimeoutError``, matching the sentinel-expiry contract
+        ``InterceptorClient._loop`` relies on.
+        """
+        on_status("waiting_login", None)
+        logger.debug("cdp_session: login wall detected — awaiting authentication")
+        deadline = time.time() + login_timeout
+        while time.time() < deadline:
+            if stop_event.is_set():
+                return
+            time.sleep(3)
+            try:
+                href = eval_str("location.href")
+            except Exception:
+                continue
+            if not _is_login(href):
+                logger.debug("cdp_session: login resolved — re-navigating to target")
+                # New document incoming — reset dedup state so post-login
+                # captures (whose per-document seq restarts at 1) aren't
+                # mistaken for the login page's already-delivered ones.
+                _delivered_seqs.clear()
+                rpc("Page.addScriptToEvaluateOnNewDocument", {"source": interceptor_script})
+                rpc("Page.navigate", {"url": nav_url})
+                rpc("Runtime.evaluate", {"expression": interceptor_script})
+                return
+        raise TimeoutError(
+            f"Login timed out ({login_timeout // 60} min) — retry launch"
+        )
+
     def _navigate_and_capture(nav_url: str) -> dict:
         """Initial data capture: pre-register the interceptor, navigate to
         the target URL, then poll window._capturedResponses until we find a
@@ -345,6 +395,22 @@ def run_session(
             time.sleep(capture_poll)
             attempt += 1
 
+            # Post-navigation login-wall check. By now the redirect chain (an
+            # email click-tracker → app → maybe a login bounce) has had at least
+            # one poll interval to settle, so location.href reflects where we
+            # actually landed. If that's a login page, wait it out here instead
+            # of polling fruitlessly for data that won't arrive until the user
+            # authenticates. _await_login_resolved re-navigates to nav_url once
+            # login clears; if it can't (headless, or the caller quits), it
+            # leaves status at 'waiting_login' or raises TimeoutError.
+            try:
+                cur_href = eval_str("location.href")
+            except Exception:
+                cur_href = ""
+            if cur_href and _is_login(cur_href):
+                _await_login_resolved(nav_url)
+                continue
+
             # Serialize the array to a JSON string on the JS side, then parse
             # in Python. Avoids the CDP object-handle protocol which is much
             # more work for the same result.
@@ -368,35 +434,13 @@ def run_session(
     # ── Main session body ─────────────────────────────────────────────────────
 
     try:
-        # ── Step 1: wait for user login if we landed on a login page ──────────
-        # Check current URL against the caller's list of "this means user is
-        # logging in" keywords (e.g. "login", "signin", "/auth", "sso").
-        href = eval_str("location.href")
-        if any(kw in href for kw in login_url_keywords):
-            # Tell the caller we're stalled on login so their UI can react.
-            on_status("waiting_login", None)
-            logger.debug("cdp_session: waiting for user to log in")
-
-            # Poll location.href every 3s until the user navigates away from
-            # the login flow (successful auth) or login_timeout expires.
-            deadline = time.time() + login_timeout
-            while time.time() < deadline:
-                if stop_event.is_set():
-                    return
-                time.sleep(3)
-                href = eval_str("location.href")
-                if not any(kw in href for kw in login_url_keywords):
-                    # No longer on a login URL — login succeeded, break out.
-                    break
-            else:
-                # The `else` on a `while` runs when the loop exits without
-                # `break` — i.e. the timeout was hit. Bubble as TimeoutError
-                # so the outer InterceptorClient can distinguish "login stuck"
-                # from other failures (it uses that to trigger a headless→
-                # visible relaunch when the sentinel says the session existed).
-                raise TimeoutError(
-                    f"Login timed out ({login_timeout // 60} min) — retry launch"
-                )
+        # ── Step 1: login detection moved POST-navigation ─────────────────────
+        # We used to check location.href here, but at this point the browser is
+        # still on about:blank — the real navigation happens in Step 3 — so a
+        # redirect-to-login triggered by loading the target would be missed
+        # entirely on the first pass. The login-wall check now lives inside
+        # _navigate_and_capture, after the target (and any redirect chain) has
+        # settled; see _await_login_resolved.
 
         # ── Step 2: enable the CDP domains we need ────────────────────────────
         # ORDER MATTERS. These calls set up Chrome-side machinery that later

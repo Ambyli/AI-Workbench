@@ -592,11 +592,19 @@ class InterceptorClient:
                 # Any other exception — record it and let the loop retry.
                 # We don't crash the worker because the caller may not have
                 # a way to notice and restart us.
-                logger.error("InterceptorClient._loop: %s", exc)
-                with self._lock:
-                    self._error = str(exc)
-                    self._status = "error"
-                self._notify_status()
+                if stop_event.is_set():
+                    # We're shutting down (e.g. quit() set stop_event and the
+                    # session unwound with RuntimeError('stopped')). Don't mask
+                    # the last meaningful status — notably a post-navigation
+                    # 'waiting_login' that the caller reads as login_wall — with
+                    # a generic error from the teardown.
+                    logger.debug("InterceptorClient._loop: exception during stop: %s", exc)
+                else:
+                    logger.error("InterceptorClient._loop: %s", exc)
+                    with self._lock:
+                        self._error = str(exc)
+                        self._status = "error"
+                    self._notify_status()
 
             # Check for shutdown before waiting — quit() may have been called
             # while we were mid-session; no point sleeping if we're stopping.

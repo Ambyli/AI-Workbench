@@ -5,7 +5,7 @@ Give it a URL and a list of URL regex patterns; it launches Chrome under a
 named profile, injects the interceptor, waits a bounded window, and returns
 the captured JSON bodies bucketed by which pattern matched them.
 
-Concurrency (see ai/INTERCEPTOR_API.md § Concurrency for the operator view):
+Concurrency (see ai/INTERCEPTOR.md § Concurrency for the operator view):
   * Different profiles fully parallel.
   * Same profile: the fast path uses the base ``--user-data-dir`` directly so
     refreshed session cookies persist. Concurrent same-profile requests fall
@@ -494,7 +494,7 @@ def capture_url(
             body lands in the bucket of the first pattern it matches.
         profile: Named profile under ``INTERCEPTOR_PROFILES_ROOT``. Discover
             available names via the ``list_profiles`` tool. Profiles are
-            uploaded out-of-band by an operator (see INTERCEPTOR_API.md).
+            uploaded out-of-band by an operator (see INTERCEPTOR.md).
         capture_window_seconds: How long to run Chrome to collect captures
             (default 20). Increase if the page fires XHRs late.
         login_timeout: Max seconds to wait for a login redirect to resolve

@@ -6,7 +6,7 @@ A single-container subsystem that keeps [Phoenix](https://phoenix-mcp.com) in sy
 |---|---|
 | `roofix` | Background worker. Fetches Roofix email via direct Gmail API → parses → decides (rules-first, LiteLLM fallback) → writes to Phoenix Postgres via direct psycopg2. Runs its own APScheduler. |
 
-Internal-only — no host ports published by default. For proposal-page fetches (Roofix has no public API) the bridge calls the sibling **`interceptor`** container (see [INTERCEPTOR_API.md](INTERCEPTOR_API.md)) — a generic CDP-driving service that owns the Roofix login session as a named `--user-data-dir` profile.
+Internal-only — no host ports published by default. For proposal-page fetches (Roofix has no public API) the bridge calls the sibling **`interceptor`** container (see [INTERCEPTOR.md](INTERCEPTOR.md)) — a generic CDP-driving service that owns the Roofix login session as a named `--user-data-dir` profile.
 
 ### Quick start
 
@@ -20,7 +20,7 @@ docker compose -f ai/docker-compose.roofix.yml up -d
 
 Default `DRY_RUN=true` — the bridge fetches, parses, decides, and logs, but does **not** write to Phoenix. Flip to `false` in `.env` only after watching a full run.
 
-Before the bridge can hydrate proposals, upload a Roofix profile to interceptor once — see [INTERCEPTOR_API.md § Refreshing a profile](INTERCEPTOR_API.md#refreshing-a-profile-operator-flow). The uploaded profile lives at `/data/profiles/roofix/` inside the interceptor container.
+Before the bridge can hydrate proposals, upload a Roofix profile to interceptor once — see [INTERCEPTOR.md § Refreshing a profile](INTERCEPTOR.md#refreshing-a-profile-operator-flow). The uploaded profile lives at `/data/profiles/roofix/` inside the interceptor container.
 
 ### Endpoints
 
@@ -41,7 +41,7 @@ docker exec -it litellm curl http://roofix:8080/status
 docker exec -it litellm curl -X POST http://roofix:8080/tick
 ```
 
-For interceptor endpoints (proposal capture, profile refresh), see [INTERCEPTOR_API.md](INTERCEPTOR_API.md).
+For interceptor endpoints (proposal capture, profile refresh), see [INTERCEPTOR.md](INTERCEPTOR.md).
 
 ### How it works
 
@@ -176,7 +176,7 @@ machine-bound about them (unlike Chrome's saved passwords).
 
 `interceptor` owns Roofix's login state as a named profile called `roofix` (configurable via `ROOFIX_PROFILE_NAME`). Every `/capture` call the bridge makes reuses that profile — no login prompt until the session expires.
 
-**Canonical operator guide for capturing + uploading a profile: [INTERCEPTOR_API.md § Refreshing a profile](INTERCEPTOR_API.md#refreshing-a-profile-operator-flow).** In short:
+**Canonical operator guide for capturing + uploading a profile: [INTERCEPTOR.md § Refreshing a profile](INTERCEPTOR.md#refreshing-a-profile-operator-flow).** In short:
 
 ```powershell
 uv run cdp-spy --url https://roofix.io --profile-dir "C:\Users\<you>\.zeo\roofix_profile"   # log in visibly
@@ -394,7 +394,7 @@ ai/
         test_brain.py                 offline brain/rules suite
 ```
 
-Chrome-under-CDP lives in the sibling `ai/interceptor/` service (see `INTERCEPTOR_API.md`).
+Chrome-under-CDP lives in the sibling `ai/interceptor/` service (see `INTERCEPTOR.md`).
 
 ### Known limitations / TODOs
 
@@ -402,4 +402,4 @@ Chrome-under-CDP lives in the sibling `ai/interceptor/` service (see `INTERCEPTO
 - **`field_mapping.json` is a stub.** Michael owns the Roofix-event → Phoenix (block_name, status_id) mapping. `update_milestone` will log a "no milestone mapping" warning and skip until the file is filled in.
 - **`PHOENIX_AGENT_USER_ID` must be provisioned manually.** Create a dedicated Phoenix agent user and set the env var so writes are attributable.
 - **Phase 1** — `create_project` and `notify_rep` paths exist but are stubbed. Wire a CloudTalk MCP when needed.
-- **Session refresh is manual.** interceptor cannot present a login UI — operators capture a profile on a laptop and upload the `.tgz` to `/profiles/roofix/refresh` (see [INTERCEPTOR_API.md § Refreshing a profile](INTERCEPTOR_API.md#refreshing-a-profile-operator-flow)).
+- **Session refresh is manual.** interceptor cannot present a login UI — operators capture a profile on a laptop and upload the `.tgz` to `/profiles/roofix/refresh` (see [INTERCEPTOR.md § Refreshing a profile](INTERCEPTOR.md#refreshing-a-profile-operator-flow)).

@@ -136,6 +136,30 @@ def start_browser(
         "--no-default-browser-check",
         "--no-restore-last-session",
         "--disable-session-crashed-bubble",
+        # Force Chrome's portable cookie-encryption backend. Left to itself,
+        # Chrome picks a "password store" per environment: with a desktop
+        # session it uses gnome-keyring/kwallet and tags cookie values `v11`,
+        # keying them to a secret that lives in the user's login keyring and
+        # NEVER in the profile dir; with no keyring (any container — no DBus,
+        # no libsecret) it falls back to `basic`, which derives the key from a
+        # constant hardcoded in Chrome's source and tags values `v10`.
+        # A profile captured on a desktop therefore carries v11 cookies that a
+        # container's Chrome cannot decrypt: it reads the rows, fails, and
+        # behaves as logged-out — a login wall that looks exactly like an
+        # expired session. Pinning `basic` everywhere makes the key identical
+        # on both sides, so profiles stay portable host <-> container.
+        # NOTE: this only affects cookies as they are WRITTEN. Switching an
+        # existing profile over does not convert its v11 values — those stay
+        # unreadable, so the profile has to be re-captured (fresh login) once.
+        # The tradeoff: v10's key is a constant, so anyone holding the profile
+        # dir can decrypt its cookies. Treat exported profile archives as
+        # credential material.
+        # On macOS the equivalent backend is the login Keychain; if this is
+        # ever deployed there and profiles need to move between machines,
+        # "--use-mock-keychain" is the corresponding flag to add here.
+        # Ignored on Windows, which uses DPAPI regardless (see
+        # ai/INTERCEPTOR.md § the DPAPI note for that platform's caveat).
+        "--password-store=basic",
     ]
 
     if headless:

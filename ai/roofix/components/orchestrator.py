@@ -128,6 +128,24 @@ async def _resolve_context(ev: dict, phoenix) -> dict:
     return {"found": False, "ambiguous": False}
 
 
+def _note_phoenix_result(ev: dict, ctx: dict) -> None:
+    """Append a human-readable note to ``ev["notes"]`` describing the resolve.
+
+    Called after every ``_resolve_context`` so the audit trail (and returned
+    event record) shows whether Phoenix knew this project. Distinguishes the
+    four states: offline, ambiguous, found, missed.
+    """
+    if ctx.get("offline"):
+        note = "phoenix: offline (no client)"
+    elif ctx.get("ambiguous"):
+        note = f"phoenix: ambiguous ({ctx.get('candidate_count', '?')} candidates)"
+    elif ctx.get("found"):
+        note = f"phoenix: project found (id={ctx.get('project_id')})"
+    else:
+        note = "phoenix: project not found"
+    ev.setdefault("notes", []).append(note)
+
+
 def _extracted_to_payload(extracted) -> dict:
     """Convert an ExtractedProposal (or test fake) into a plain dict.
 
@@ -695,6 +713,7 @@ async def _process_group(
             # or came back ambiguous.
             ctx = await _resolve_context(ev, phoenix)
             ev["project_id"] = ctx.get("project_id")
+            _note_phoenix_result(ev, ctx)
 
             # ── Scrape gate ────────────────────────────────────────────
             # Two independent reasons to scrape:
@@ -755,6 +774,7 @@ async def _process_group(
                 ):
                     ctx = await _resolve_context(ev, phoenix)
                     ev["project_id"] = ctx.get("project_id")
+                    _note_phoenix_result(ev, ctx)
 
         # Decide what to do based on the event and context. Stamp the
         # source email's Gmail id onto the Decision so app.py can call

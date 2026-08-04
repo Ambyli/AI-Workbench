@@ -19,6 +19,7 @@ from typing import Callable, Optional
 from .cdp_session import Capture, run_session
 from .launcher import (
     BrowserNotFoundError,
+    clear_session_restore,
     clear_singleton_locks,
     find_browser,
     kill_chrome_by_profile,
@@ -157,6 +158,10 @@ class InterceptorClient:
         # left over from a prior Chrome crash (see launcher.clear_singleton_locks).
         os.makedirs(self._profile_dir, exist_ok=True)
         clear_singleton_locks(self._profile_dir)
+        # Wipe tab/window restore state so Chrome opens a clean window instead
+        # of reviving whatever tabs the profile last had open. Login (cookies /
+        # storage) is preserved — see launcher.clear_session_restore.
+        clear_session_restore(self._profile_dir)
 
         # Remember the resolved browser path and target URL so relaunch/reload
         # paths can reuse them without the caller re-supplying.
@@ -363,6 +368,9 @@ class InterceptorClient:
             if _os.path.exists(_os.path.join(self._profile_dir, lf))
         ]
         clear_singleton_locks(self._profile_dir)
+        # Same as launch(): drop tab/window restore state so the relaunched
+        # (e.g. headless→visible) browser opens clean, not with revived tabs.
+        clear_session_restore(self._profile_dir)
         locks_after = [
             lf for lf in ("SingletonLock", "SingletonCookie", "SingletonSocket")
             if _os.path.exists(_os.path.join(self._profile_dir, lf))

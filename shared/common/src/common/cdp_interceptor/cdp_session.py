@@ -243,25 +243,59 @@ def run_session(
             logger.warning("cdp_session: parse_fn raised for %s: %s", cap.url, exc)
             return None
 
-    def _find_initial(captured: list) -> Optional[dict]:
-        """Walk the current window._capturedResponses in insertion order.
+    # Sequence ids of captures we've already delivered. interceptor.js stamps
+    # every capture with a monotonic ``seq`` (unique per document) and sends
+    # that same seq on BOTH delivery paths — the Runtime.bindingCalled fast
+    # path and the JS-array poll fallback. Deduping on seq lets the two paths
+    # race freely without either dropping or double-delivering a response.
+    #
+    # This replaces the old high-water-mark index (``_last_captured_idx``),
+    # which advanced to len(array) whenever ANY item was delivered — so a
+    # response that had been appended but not yet delivered (its binding event
+    # still in flight, or destined to be dropped) got marked "seen" and then
+    # skipped by the poll forever. That race is what intermittently lost
+    # elasticsearch/mget. A per-seq set has no such window.
+    _delivered_seqs: set = set()
 
-        First entry whose URL matches url_patterns AND whose parse_fn returns
-        a truthy dict wins. Insertion order = call order in the page — this
-        keeps behavior predictable when multiple responses could parse.
+    def _handle_item(item: dict, *, deliver_on_data: bool) -> Optional[dict]:
+        """Dedup one raw ``{seq, url, body}`` entry by seq, then run it through
+        ``_process_capture`` (which always fires ``on_capture``).
+
+        Returns the parsed dict (or None). Fires ``on_data`` only when
+        ``deliver_on_data`` is set and a parser produced a dict. Entries missing
+        a seq (e.g. an older interceptor.js) fall back to no-dedup handling so
+        nothing is silently dropped.
         """
+        body = item.get("body")
+        if body is None:
+            return None
+        seq = item.get("seq")
+        if seq is not None:
+            if seq in _delivered_seqs:
+                return None
+            _delivered_seqs.add(seq)
+        parsed = _process_capture(Capture(url=item.get("url", ""), body=body))
+        if parsed and deliver_on_data and on_data:
+            on_data(parsed)
+        return parsed
+
+    def _find_initial(captured: list) -> Optional[dict]:
+        """Handle every not-yet-seen entry (deduped by seq) and return the
+        first whose parse produces a dict.
+
+        We do NOT stop at the first parseable dict, because callers rely on
+        ``on_capture`` seeing the full raw stream — app.py collects its
+        url-pattern matches purely from ``on_capture``, so an entry we skip
+        here (e.g. an mget sitting after the winning response in the same
+        batch) would be lost. Every entry is handled; only the returned
+        "winner" is the first dict, and the caller fires on_data for it once.
+        """
+        winner: Optional[dict] = None
         for item in captured:
-            url = item.get("url", "")
-            body = item.get("body")
-            # Skip only when body is missing entirely. Non-dict JSON values
-            # (arrays, strings, numbers) still fire on_capture inside
-            # _process_capture — the caller may want to see them.
-            if body is None:
-                continue
-            parsed = _process_capture(Capture(url=url, body=body))
-            if parsed:
-                return parsed
-        return None
+            parsed = _handle_item(item, deliver_on_data=False)
+            if parsed is not None and winner is None:
+                winner = parsed
+        return winner
 
     def _navigate_and_capture(nav_url: str) -> dict:
         """Initial data capture: pre-register the interceptor, navigate to
@@ -420,8 +454,10 @@ def run_session(
         #
         #   RELIABLE FALLBACK — polling window._capturedResponses every 5s.
         #     Whatever the binding missed will still be sitting in the JS
-        #     array. We track _last_captured_idx so we don't re-process
-        #     items on every poll.
+        #     array. Both paths dedup through _delivered_seqs (keyed by the
+        #     per-document seq interceptor.js stamps on each capture), so an
+        #     item delivered by one path is a no-op on the other and nothing
+        #     is processed twice.
         #
         # We do both. The binding gives snappy updates; the poll guarantees
         # nothing gets dropped.
@@ -435,10 +471,18 @@ def run_session(
             ws.send(_json.dumps({"id": _id[0], "method": method, "params": params or {}}))
 
         def _poll_captured() -> None:
-            """Read window._capturedResponses and process items newer than
-            _last_captured_idx. Idempotent — calling twice with no new items
-            is a no-op."""
-            nonlocal _last_captured_idx
+            """Read window._capturedResponses and deliver any entries not yet
+            in ``_delivered_seqs``. Idempotent — a poll with no new seqs is a
+            no-op.
+
+            We re-scan the full array every tick rather than slicing by a
+            high-water index: a dropped binding event leaves a "hole" (an
+            appended-but-undelivered entry) that a high-water index would jump
+            past permanently. Deduping by seq makes the re-scan cheap in effect
+            (already-delivered seqs return immediately) and, crucially, correct
+            — holes get filled on the next tick. The array is bounded per
+            document: a new page load resets it (and clears _delivered_seqs).
+            """
             try:
                 raw = eval_str("JSON.stringify(window._capturedResponses || [])")
                 captured = _json.loads(raw) if raw else []
@@ -446,30 +490,13 @@ def run_session(
                 # Transient eval failures (e.g. during navigation) — skip
                 # this tick, next one will pick up whatever's there.
                 return
-            # Only process items we haven't seen before. Insertion order is
-            # stable (interceptor.js only ever appends), so slicing by index
-            # is safe.
-            for item in captured[_last_captured_idx:]:
-                url = item.get("url", "")
-                body = item.get("body")
-                if body is None:
-                    continue
-                parsed = _process_capture(Capture(url=url, body=body))
-                if parsed and on_data:
-                    logger.debug("cdp_session: live update via poll (idx=%d)", _last_captured_idx)
-                    on_data(parsed)
-            # Advance the index so the next poll skips items we just handled.
-            _last_captured_idx = len(captured)
+            for item in captured:
+                if _handle_item(item, deliver_on_data=True) is not None:
+                    logger.debug("cdp_session: live update via poll")
 
-        # Initialize the poll index at whatever's already in the array —
-        # otherwise we'd re-process everything the initial-capture phase
-        # already delivered.
-        _last_captured_idx = 0
-        try:
-            raw = eval_str("JSON.stringify(window._capturedResponses || [])")
-            _last_captured_idx = len(_json.loads(raw)) if raw else 0
-        except Exception:
-            pass
+        # No index to prime: every entry the initial-capture phase delivered is
+        # already recorded in _delivered_seqs, so the first poll naturally skips
+        # them and only picks up genuinely new captures.
 
         # 5-second read timeout on the socket. Each timeout is our chance to:
         #   1. check stop_event and exit if the caller asked to quit
@@ -485,7 +512,10 @@ def run_session(
             # ready for the reloaded page's requests.
             if reload_event.is_set():
                 reload_event.clear()
-                _last_captured_idx = 0
+                # New document ⇒ interceptor.js's per-document seq restarts at
+                # 1, so clear the delivered set to avoid colliding with stale
+                # seqs from the previous page.
+                _delivered_seqs.clear()
                 logger.debug("cdp_session: reload requested — navigating")
                 _send("Page.addScriptToEvaluateOnNewDocument", {"source": interceptor_script})
                 _send("Page.navigate", {"url": target_url})
@@ -510,7 +540,10 @@ def run_session(
             # _capturedResponses array.
             if method == "Page.loadEventFired":
                 logger.debug("cdp_session: page loaded — re-registering binding/interceptor")
-                _last_captured_idx = 0
+                # Fresh document ⇒ _capturedResponses is empty and seq restarts
+                # at 1; drop delivered seqs so the new page's captures aren't
+                # mistaken for already-seen ones.
+                _delivered_seqs.clear()
                 _send("Runtime.addBinding", {"name": "__cdpNotify"})
                 _send("Runtime.evaluate", {"expression": interceptor_script})
                 continue
@@ -525,22 +558,13 @@ def run_session(
             ):
                 try:
                     payload = _json.loads(msg["params"].get("payload", "{}"))
-                    url = payload.get("url", "")
-                    body = payload.get("body")
-                    if body is not None:
-                        parsed = _process_capture(Capture(url=url, body=body))
-                        if parsed and on_data:
-                            logger.debug("cdp_session: live update via binding")
-                            on_data(parsed)
-                            # Since we just delivered this capture via the
-                            # binding path, advance the poll index past it
-                            # so the next keep-alive tick doesn't process
-                            # the same item a second time.
-                            try:
-                                raw = eval_str("JSON.stringify(window._capturedResponses || [])")
-                                _last_captured_idx = len(_json.loads(raw)) if raw else _last_captured_idx
-                            except Exception:
-                                pass
+                    # payload carries the same seq as the JS-array entry, so
+                    # _handle_item dedups this delivery against the poll
+                    # fallback — whichever path arrives first wins, the other
+                    # is a no-op. No index bookkeeping: the seq set is the
+                    # single source of truth for what's been delivered.
+                    if _handle_item(payload, deliver_on_data=True) is not None:
+                        logger.debug("cdp_session: live update via binding")
                 except Exception as exc:
                     logger.warning("cdp_session: error processing binding event: %s", exc)
 

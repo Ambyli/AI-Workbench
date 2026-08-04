@@ -24,6 +24,26 @@ if (!window._fetchInterceptorActive) {
   window._fetchInterceptorActive = true;
   _log("[interceptor] first injection — patching fetch and XHR");
 
+  // Record one captured JSON response: stamp it with a monotonic per-document
+  // sequence id, append it to the shared array, and notify the CDP side with
+  // that SAME seq. The seq lets the CDP fetcher dedup a response across its two
+  // delivery paths (the bindingCalled fast path and the array poll fallback)
+  // without dropping or double-delivering — the fast path and the poll can race
+  // freely because both carry the same stable id. ``_capSeq`` lives on window
+  // so it survives re-injection (the guard above skips re-patching) and resets
+  // naturally on a new document, in lockstep with _capturedResponses.
+  const _record = (url, body) => {
+    const seq = (window._capSeq = (window._capSeq | 0) + 1);
+    window._capturedResponses.push({ seq: seq, url: url, body: body });
+    _log("[interceptor] captured & notified:", seq, url, body);
+    // Best-effort: the fetcher may have navigated and lost the binding.
+    try {
+      window.__cdpNotify(JSON.stringify({ seq: seq, url: url, body: body }));
+    } catch (_) {
+      _log("[interceptor] failed to notify CDP fetcher for", url);
+    }
+  };
+
   // ── Patch window.fetch ────────────────────────────────────────────────
   // Save a reference to the real fetch before we overwrite it.
   const _origFetch = window.fetch.bind(window);
@@ -53,14 +73,7 @@ if (!window._fetchInterceptorActive) {
       const clone = response.clone();
       const text = await clone.text();
       const json = JSON.parse(text);
-      window._capturedResponses.push({ url: url, body: json });
-      _log("[interceptor] fetch captured & notified:", url, json);
-      // Notify the CDP fetcher if it's listening.  The fetcher may have navigated away and lost the original binding, so this is a best-effort attempt to keep it updated with new captures after a navigation.
-      try {
-        window.__cdpNotify(JSON.stringify({ url: url, body: json }));
-      } catch (_) {
-        _log("[interceptor] fetch: failed to notify CDP fetcher for", url);
-      }
+      _record(url, json);
     } catch (_) {
       _log(
         "[interceptor] fetch: body not JSON, skipping:",
@@ -97,19 +110,7 @@ if (!window._fetchInterceptorActive) {
     this.addEventListener("load", function () {
       try {
         const json = JSON.parse(this.responseText);
-        window._capturedResponses.push({ url: this._xurl || "", body: json });
-        _log("[interceptor] XHR captured & notified:", this._xurl || "", json);
-        // Notify the CDP fetcher if it's listening.  The fetcher may have navigated away and lost the original binding, so this is a best-effort attempt to keep it updated with new captures after a navigation.
-        try {
-          window.__cdpNotify(
-            JSON.stringify({ url: this._xurl || "", body: json }),
-          );
-        } catch (_) {
-          _log(
-            "[interceptor] XHR: failed to notify CDP fetcher for",
-            this._xurl || "",
-          );
-        }
+        _record(this._xurl || "", json);
       } catch (_) {
         _log(
           "[interceptor] XHR: skipped non-JSON response for",

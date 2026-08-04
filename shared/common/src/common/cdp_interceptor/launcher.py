@@ -20,6 +20,7 @@ Backwards-compat aliases (Windows-only intent):
 
 import logging
 import os
+import shutil
 import subprocess
 import sys
 
@@ -41,6 +42,13 @@ _DEFAULT_WINDOWS_CHROME_PATHS = [
 ]
 
 _SINGLETON_LOCK_FILES = ("SingletonLock", "SingletonCookie", "SingletonSocket")
+
+# Chrome's tab/window restore artifacts. Two generations coexist across
+# versions: legacy flat files, and the modern ``Sessions/`` folder holding
+# ``Session_<ts>`` / ``Tabs_<ts>`` snapshots. We wipe both so a launch never
+# revives the profile's previously-open tabs.
+_SESSION_RESTORE_FILES = ("Current Session", "Current Tabs", "Last Session", "Last Tabs")
+_SESSION_RESTORE_DIRS = ("Sessions",)
 
 
 def _find_windows_chrome(extra_paths: list[str] | None = None) -> str | None:
@@ -128,6 +136,30 @@ def start_browser(
         "--no-default-browser-check",
         "--no-restore-last-session",
         "--disable-session-crashed-bubble",
+        # Force Chrome's portable cookie-encryption backend. Left to itself,
+        # Chrome picks a "password store" per environment: with a desktop
+        # session it uses gnome-keyring/kwallet and tags cookie values `v11`,
+        # keying them to a secret that lives in the user's login keyring and
+        # NEVER in the profile dir; with no keyring (any container — no DBus,
+        # no libsecret) it falls back to `basic`, which derives the key from a
+        # constant hardcoded in Chrome's source and tags values `v10`.
+        # A profile captured on a desktop therefore carries v11 cookies that a
+        # container's Chrome cannot decrypt: it reads the rows, fails, and
+        # behaves as logged-out — a login wall that looks exactly like an
+        # expired session. Pinning `basic` everywhere makes the key identical
+        # on both sides, so profiles stay portable host <-> container.
+        # NOTE: this only affects cookies as they are WRITTEN. Switching an
+        # existing profile over does not convert its v11 values — those stay
+        # unreadable, so the profile has to be re-captured (fresh login) once.
+        # The tradeoff: v10's key is a constant, so anyone holding the profile
+        # dir can decrypt its cookies. Treat exported profile archives as
+        # credential material.
+        # On macOS the equivalent backend is the login Keychain; if this is
+        # ever deployed there and profiles need to move between machines,
+        # "--use-mock-keychain" is the corresponding flag to add here.
+        # Ignored on Windows, which uses DPAPI regardless (see
+        # ai/INTERCEPTOR.md § the DPAPI note for that platform's caveat).
+        "--password-store=basic",
     ]
 
     if headless:
@@ -232,3 +264,41 @@ def clear_singleton_locks(profile_dir: str) -> None:
             os.remove(os.path.join(profile_dir, lf))
         except FileNotFoundError:
             pass
+
+
+def clear_session_restore(profile_dir: str) -> None:
+    """Delete Chrome's tab/window restore state so the browser always opens to
+    a clean window instead of reviving the profile's previously-open tabs.
+
+    Chrome persists open tabs/windows in ``_SESSION_RESTORE_FILES`` (legacy
+    flat files) and the modern ``Sessions/`` folder. We remove both, under the
+    ``Default/`` subdir Chrome actually loads for ``--user-data-dir`` AND at the
+    user-data-dir root, since some captured/uploaded profiles carry a stale copy
+    there too.
+
+    This only clears *tab/window* restore data — cookies, Local Storage and
+    IndexedDB (where the login session lives) are untouched, so an authenticated
+    profile stays authenticated. ``--no-restore-last-session`` alone is not
+    enough: it suppresses crash-restore but not a profile whose "on startup:
+    continue where you left off" preference replays the last session — so we
+    delete the data that replay would read. Also keeps the CDP session from
+    attaching to a restored tab instead of the fresh ``about:blank`` page.
+
+    Safe to call when no browser is using the profile (the launch paths clear
+    singleton locks and restore state together, before spawning Chrome).
+    """
+    for root in (os.path.join(profile_dir, "Default"), profile_dir):
+        for fname in _SESSION_RESTORE_FILES:
+            try:
+                os.remove(os.path.join(root, fname))
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                logger.debug("clear_session_restore: %s: %s", fname, exc)
+        for dname in _SESSION_RESTORE_DIRS:
+            try:
+                shutil.rmtree(os.path.join(root, dname))
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                logger.debug("clear_session_restore: %s/: %s", dname, exc)

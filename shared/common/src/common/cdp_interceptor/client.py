@@ -19,6 +19,7 @@ from typing import Callable, Optional
 from .cdp_session import Capture, run_session
 from .launcher import (
     BrowserNotFoundError,
+    clear_session_restore,
     clear_singleton_locks,
     find_browser,
     kill_chrome_by_profile,
@@ -157,6 +158,10 @@ class InterceptorClient:
         # left over from a prior Chrome crash (see launcher.clear_singleton_locks).
         os.makedirs(self._profile_dir, exist_ok=True)
         clear_singleton_locks(self._profile_dir)
+        # Wipe tab/window restore state so Chrome opens a clean window instead
+        # of reviving whatever tabs the profile last had open. Login (cookies /
+        # storage) is preserved — see launcher.clear_session_restore.
+        clear_session_restore(self._profile_dir)
 
         # Remember the resolved browser path and target URL so relaunch/reload
         # paths can reuse them without the caller re-supplying.
@@ -363,6 +368,9 @@ class InterceptorClient:
             if _os.path.exists(_os.path.join(self._profile_dir, lf))
         ]
         clear_singleton_locks(self._profile_dir)
+        # Same as launch(): drop tab/window restore state so the relaunched
+        # (e.g. headless→visible) browser opens clean, not with revived tabs.
+        clear_session_restore(self._profile_dir)
         locks_after = [
             lf for lf in ("SingletonLock", "SingletonCookie", "SingletonSocket")
             if _os.path.exists(_os.path.join(self._profile_dir, lf))
@@ -584,11 +592,19 @@ class InterceptorClient:
                 # Any other exception — record it and let the loop retry.
                 # We don't crash the worker because the caller may not have
                 # a way to notice and restart us.
-                logger.error("InterceptorClient._loop: %s", exc)
-                with self._lock:
-                    self._error = str(exc)
-                    self._status = "error"
-                self._notify_status()
+                if stop_event.is_set():
+                    # We're shutting down (e.g. quit() set stop_event and the
+                    # session unwound with RuntimeError('stopped')). Don't mask
+                    # the last meaningful status — notably a post-navigation
+                    # 'waiting_login' that the caller reads as login_wall — with
+                    # a generic error from the teardown.
+                    logger.debug("InterceptorClient._loop: exception during stop: %s", exc)
+                else:
+                    logger.error("InterceptorClient._loop: %s", exc)
+                    with self._lock:
+                        self._error = str(exc)
+                        self._status = "error"
+                    self._notify_status()
 
             # Check for shutdown before waiting — quit() may have been called
             # while we were mid-session; no point sleeping if we're stopping.

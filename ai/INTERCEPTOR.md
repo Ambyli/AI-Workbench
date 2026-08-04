@@ -22,6 +22,18 @@ Health:
 docker exec interceptor curl -s http://localhost:8080/health
 ```
 
+### Reaching the service
+
+`docker-compose.interceptor.yml` declares **no `ports:` mapping** — port 8080 is reachable only from inside `ai_shared`. There are three ways in, and picking the wrong one is the single most common source of confusion:
+
+| From | How |
+|---|---|
+| Another container on `ai_shared` | `http://interceptor:8080/...` — what `roofix` uses via `INTERCEPTOR_URL` |
+| Your host | `http://localhost:4001/v1/interceptor/...` — the LiteLLM pass-through (`Authorization: Bearer $DEFAULT_LITELLM_MASTER_KEY`). Forwards GET/POST/DELETE including `multipart/form-data` uploads. |
+| Your host, bypassing LiteLLM | `docker exec interceptor ...` |
+
+**`http://localhost:8080` from the host does NOT reach the container.** If something answers there it's a *different* interceptor — e.g. a bare-metal `cd ai/interceptor && python app.py` run, which is how you'd drive a visible browser during profile capture. Both instances report `"root": "/data/profiles"` in `GET /profiles`, so responses look identical while pointing at completely separate storage: the bare-metal one uses the host directory, the container one uses the `interceptor_data` volume. Check `size_bytes` / `sentinel_present` to tell them apart, and kill the bare-metal process before uploading to the container.
+
 ## Endpoints
 
 | Method | Path | Purpose |
@@ -50,11 +62,23 @@ Request:
   "keep_open": false,
   "login_timeout": 300,
   "max_matches_per_pattern": null,
-  "debug_logging": false
+  "debug_logging": false,
+  "login_url_patterns": ["login", "signin", "/auth"]
 }
 ```
 
+`login_url_patterns` are regexes `re.search`-matched against the tab's `location.href` **after** navigation has settled, to detect a redirect to a login wall. Two things to know:
+
+- **Supplying the field replaces the defaults** (`["login", "signin", "/auth"]`) — it does not merge. Include them yourself if you still want them.
+- **They're full regexes, not substrings**, so you can anchor one at a bare domain that a substring couldn't tell apart from an in-app URL: `^https?://roofix\.io/?$` matches the logged-out root but not `roofix.io/project/…`. Anchor with `/?$` rather than `$` — `location.href` for a bare domain is always normalized with a trailing slash, so `^https?://roofix\.io$` never matches anything.
+
+An empty list disables login detection entirely.
+
+`capture_window_seconds` is a **hard wall**: `app.py` waits exactly that long and then quits Chrome, regardless of what stage the session is in. It must exceed `login_timeout` for a login to have any chance of resolving — otherwise the window closes first and the response comes back `login_wall: true` with `status="waiting_login"`.
+
 Chrome always runs headless in the container. The service writes a `session_ok` sentinel into each uploaded profile so `InterceptorClient` boots straight into headless — an operator only uploads a profile *after* logging in on their laptop, so treating uploaded profiles as session-ready by definition matches reality. If the persisted session expires, `InterceptorClient` detects the login redirect, sets `status="waiting_login"`, and the response comes back with `login_wall: true`; refresh the profile via `POST /profiles/{name}/refresh` and retry.
+
+`login_wall: true` does **not** always mean the session expired. A profile whose cookies were encrypted against a key the container doesn't have produces exactly the same result — Chrome reads the rows, silently fails to decrypt, and browses as an anonymous user. If a profile that demonstrably works on the capture machine hits a login wall in the container, check the cookie encryption version before re-capturing: see [Cookie encryption and portability](#cookie-encryption-and-portability).
 
 Response:
 
@@ -91,7 +115,7 @@ Each concurrent slot holds one running Chrome (~200–400 MB RAM) plus, when in 
 
 ### Crash recovery
 
-If Chrome crashes mid-capture (OOM, segfault, container killed) and leaves a stale `SingletonLock` in the base profile dir, `InterceptorClient.launch` clears the lock before every next launch (`shared/common/src/common/cdp_interceptor/client.py:159`, `clear_singleton_locks()`). No manual cleanup needed — the next request self-heals.
+If Chrome crashes mid-capture (OOM, segfault, container killed) and leaves a stale `SingletonLock` in the base profile dir, `InterceptorClient.launch` clears the lock before every next launch (`shared/common/src/common/cdp_interceptor/client.py:160`, `clear_singleton_locks()`). No manual cleanup needed — the next request self-heals.
 
 If the interceptor process itself dies mid-request, temp-profile clones under `PROFILES_ROOT/.temp/` are left behind. They're swept on next startup by the FastAPI lifespan hook, so the volume doesn't accrue orphans across restarts.
 
@@ -101,7 +125,7 @@ Fast-path captures write refreshed session cookies back to the base profile — 
 
 ## Refreshing a profile (operator flow)
 
-`interceptor` cannot present a login UI itself, so profiles are captured on an operator laptop and uploaded. The archive must be a **`.tar.gz`** — the endpoint uses `tarfile.open(mode="r:*")` (see `ai/interceptor/profiles.py:64`), which auto-detects gzip/bzip2/xz tar. Plain `.zip` will NOT work.
+`interceptor` cannot present a login UI itself, so profiles are captured on an operator laptop and uploaded. The archive must be a **`.tar.gz`** — the endpoint uses `tarfile.open(mode="r:*")` (see `ai/interceptor/profiles.py:126`), which auto-detects gzip/bzip2/xz tar. Plain `.zip` will NOT work.
 
 Profile names must match `[a-z0-9][a-z0-9_-]{0,63}` — no path separators, no leading dots.
 
@@ -122,7 +146,9 @@ You can skip `cdp-spy` and use raw Chrome with `--user-data-dir=C:\tmp\gmail_pro
 
 ### 2. Package the profile as `.tar.gz`
 
-The archive should contain the profile-dir **contents**, not the directory itself — the endpoint extracts into an already-created `/data/profiles/{name}/`. The `-C <dir> .` pattern does that.
+Archive the **whole `--user-data-dir`**, and archive its **contents** rather than the directory itself — the endpoint extracts into an already-created `/data/profiles/{name}/`. The `-C <dir> .` pattern does that.
+
+Do **not** archive just `Default/`. Chrome is launched with `--user-data-dir=<profile dir>` and looks for `Default/` *inside* it; `Local State` sits at the root, and `sentinel.py` looks for `session_ok` at the root too. An archive rooted at `Default/` puts `Cookies` where Chrome never reads it, and Chrome silently creates a fresh empty `Default/` — you get a profile that boots cleanly and is simply logged out.
 
 **Windows 10+ / PowerShell** (bsdtar bundled):
 
@@ -152,11 +178,25 @@ tar tzf gmail.tgz | Select-Object -First 20
 
 ### 3. Upload
 
-The endpoint expects `multipart/form-data` with a single field named `archive`.
+The endpoint expects `multipart/form-data` with a single field named exactly **`archive`**. Any other field name gives a FastAPI **422** with no unpack performed — and because a 422 leaves the existing profile untouched, it's easy to mistake for success if you don't read the response body.
 
-```powershell
-curl -X POST -F "archive=@gmail.tgz" http://<host>:8080/profiles/gmail/refresh
+From the host, via the LiteLLM pass-through (see [Reaching the service](#reaching-the-service) — `http://localhost:8080` is *not* the container):
+
+```bash
+curl -X POST http://localhost:4001/v1/interceptor/profiles/gmail/refresh \
+  -H "Authorization: Bearer $DEFAULT_LITELLM_MASTER_KEY" \
+  -F archive=@gmail.tgz
 ```
+
+Or bypass LiteLLM entirely:
+
+```bash
+docker cp gmail.tgz interceptor:/tmp/gmail.tgz
+docker exec interceptor python3 -c "
+import profiles; print(profiles.unpack_profile('gmail', open('/tmp/gmail.tgz','rb')))"
+```
+
+> **Do not refresh while a capture is in flight against that profile.** `unpack_profile` `shutil.rmtree`s the profile directory without consulting the per-profile lock that `/capture` holds, so a refresh landing mid-capture deletes the `--user-data-dir` out from under a live Chrome and interleaves the extraction with that Chrome's own writes. Check `GET /jobs` first. Related: the wipe happens *before* the archive is validated, so a corrupt or wrong-format upload (a `.zip`, a truncated stream) destroys the working profile and leaves an empty directory behind — which for a session profile means a laptop re-login, not a retry.
 
 Successful response:
 
@@ -183,23 +223,72 @@ The important pieces of a Chrome user-data-dir for auth persistence:
 | `Default/Local Storage/` | localStorage entries |
 | `Default/IndexedDB/` | IndexedDB stores (some sites store tokens here) |
 | `Default/Session Storage/` | sessionStorage |
-| `Local State` | Encryption key ref (needed to decrypt `Cookies` on the same machine) |
+| `Local State` | Profile metadata. On **Windows** it holds the DPAPI-wrapped cookie key; on **Linux/macOS** it holds no key at all (the key lives in the OS keyring) — see below. |
 
-### Portability caveat (Windows → Linux)
+### Cookie encryption and portability
 
-On Windows, Chrome encrypts cookies with a key that's itself encrypted with **DPAPI** (tied to the Windows user account). Cookies captured on a Windows laptop **will not decrypt inside the Linux container**, because DPAPI is Windows-only. Empirically Playwright's bundled chromium tolerates a lot of profile portability, but if a login refuses to stick after a capture-and-upload cycle, DPAPI is the usual cause.
+Read this before concluding a session expired. Chrome never stores cookie values in plaintext, and **the key is not always inside the profile**. Which backend it uses depends on the environment it runs in, and a mismatch between the machine that captured the profile and the machine that consumes it presents as a login wall that is indistinguishable from an expired session.
 
-Workaround: capture the profile inside **WSL2** (or on a Linux host) using Playwright's chromium — that produces a Linux-native profile the container can read directly.
+| Platform | Backend | Where the key lives | Value prefix | Portable? |
+|---|---|---|---|---|
+| Linux, desktop session | gnome-keyring / kwallet (via DBus + libsecret) | user's login keyring — **never in the profile** | `v11` | ❌ |
+| Linux, no keyring (any container) | `basic` | derived from a constant hardcoded in Chrome's source | `v10` | ✅ |
+| macOS | login Keychain | Keychain — not in the profile | `v10` | ❌ |
+| Windows | DPAPI | `Local State`, wrapped against the Windows user account | — | ❌ |
+
+`start_browser` therefore pins **`--password-store=basic`** on every launch (`shared/common/src/common/cdp_interceptor/launcher.py`), which forces the portable `v10` backend on both the capture machine and the container so profiles survive the trip. macOS would additionally need `--use-mock-keychain`; Windows ignores the flag and keeps using DPAPI.
+
+Two consequences worth internalizing:
+
+- **The flag only affects cookies as they are WRITTEN.** Pinning it does not convert `v11` values that already exist — those stay unreadable, so a profile captured before the flag was in place must be **re-captured with a fresh login** once. Re-uploading it unchanged will not help, no matter how it's packaged.
+- **`v10`'s key is a constant**, so anyone holding the profile directory can decrypt its cookies. That is already true of any profile shipped around as a `.tgz` and unpacked into a shared volume, but it makes the archive credential material — store and transfer it accordingly.
+
+**Windows → Linux** remains the hardest case: DPAPI is Windows-only, so a profile captured with real Chrome on a Windows laptop cannot be decrypted in the container at all. Capture inside **WSL2** or on a Linux host using Playwright's chromium instead — but note that a Linux desktop with a working keyring produces `v11` cookies, which are just as unusable in a container. Linux capture only helps *with* `--password-store=basic` in effect, which is why the flag is pinned in the launcher rather than left to the environment.
 
 ### Sanity check before uploading
 
-Spot-check that the profile actually holds the session by re-running `cdp-spy` against the same profile-dir and hitting a page that requires auth:
+**1. Check the cookie encryption version.** This is the cheap, decisive test — it catches the failure mode above before you spend a capture cycle discovering it:
+
+```bash
+python3 -c "
+import sqlite3, collections
+c = sqlite3.connect('/data/profiles/roofix/Default/Cookies')
+print(collections.Counter(p for (p,) in c.execute('select substr(encrypted_value,1,3) from cookies')))"
+```
+
+Expect `v10` on the rows for your target's domain. **`v11` means the profile is not portable** — Chrome wrote those cookies against a keyring key that will not exist in the container. Re-capture with a fresh login (`--password-store=basic` is pinned in the launcher, so any capture through this library produces `v10`).
+
+Reading the DB while Chrome has the profile open is fine — SQLite handles the concurrent read — but copy the file first if you want to be certain of a consistent snapshot.
+
+**2. Spot-check the session itself** by re-running `cdp-spy` against the same profile-dir and hitting a page that requires auth:
 
 ```powershell
 uv run cdp-spy --url https://gmail.com/inbox --profile-dir C:\tmp\gmail_profile
 ```
 
 If you land on the inbox (not the login page), the profile is good to package.
+
+### Alternative: re-capture in place through a local interceptor
+
+When a profile already exists and just needs a fresh login (expired session, or `v11` cookies that must be rewritten as `v10`), you can re-log-in *through* the interceptor instead of setting up a separate `cdp-spy` run. Useful because it exercises the exact same launcher and flags the container will use.
+
+Run the service bare-metal on a machine with a display, pointed at the profile root:
+
+```bash
+cd ai/interceptor && \
+  DISPLAY=:1 XAUTHORITY=/run/user/1000/gdm/Xauthority \
+  ../../.venv/bin/python3 app.py
+```
+
+Then:
+
+1. **Delete the sentinel** so the gate picks a visible launch: `rm <PROFILES_ROOT>/roofix/session_ok`. Confirm with `GET /profiles/roofix` → `sentinel_present: false`.
+2. **Fire `/capture`** with a window long enough to type in, and `login_timeout` **below** `capture_window_seconds` — e.g. `capture_window_seconds: 300`, `login_timeout: 240`. The default 20–30s window closes before you can finish logging in and returns `login_wall: true`.
+3. **Log in** in the Chrome window that opens. The session re-navigates to the target and resumes capturing; you'll typically see the pre-login and post-login responses both captured, which is a handy confirmation that auth took effect.
+4. On the first successful capture, `mark_session_ok` rewrites the sentinel (`client.py:456`) — the profile is session-ready again with no manual step.
+5. **Verify `v10`**, then package and upload per steps 2–3 above.
+
+Because the fast path writes cookies back to the base profile, the refreshed session persists in place — no copy-back needed.
 
 ## Configuration
 
@@ -301,9 +390,16 @@ Cancel is also the way to reclaim a hung **`keep_open=true`** capture. Normally 
 
 ### Running a capture in visible (non-headless) mode
 
-There's no `headless` field on the capture request — the service always tries to launch headless in production. Headless is gated by `InterceptorClient` on `session_sentinel=True AND session_ok exists in profile_dir` (see `shared/common/src/common/cdp_interceptor/client.py:177`). The service passes `session_sentinel=True` (`ai/interceptor/app.py:206`), so headless comes down to whether the `session_ok` sentinel file is present in the profile directory. Uploaded profiles get one written automatically by `unpack_profile()` (`ai/interceptor/profiles.py:69`).
+There's no `headless` field on the capture request — the service always tries to launch headless in production. Headless is gated by `InterceptorClient` on `session_sentinel=True AND session_ok exists in profile_dir` (`shared/common/src/common/cdp_interceptor/client.py:182`). The service passes `session_sentinel=True` (`ai/interceptor/app.py:391`), so headless comes down to whether the `session_ok` sentinel file is present in the profile directory. Uploaded profiles get one written automatically by `unpack_profile()` (`ai/interceptor/profiles.py:131`).
 
-**To force a visible launch when debugging locally**, delete the sentinel before firing `/capture`. This only works on a machine with a display — inside the Docker container there's no display, so a "visible" launch there will fail to open a window.
+**To force a visible launch when debugging locally**, delete the sentinel before firing `/capture`. This only works on a machine with a display — inside the Docker container there's no display, so the launch fails with **`Missing X server or $DISPLAY`** in `docker logs` and the capture returns having seen nothing.
+
+That error string has two distinct causes, and the timing tells them apart:
+
+| When it appears | Cause |
+|---|---|
+| Immediately, with `status="loading"` and `seen_urls=0` | No `session_ok` in the profile → the gate chose visible from the start. Usually means the upload never landed — check `GET /profiles` for `sentinel_present` and `size_bytes`, and confirm you uploaded to the instance you think you did. |
+| After `login_timeout` seconds, following a `waiting_login` status | The headless session hit a login wall and `client.py:559-579` cleared the sentinel and **relaunched visibly** to let a human log in — which cannot work in a container. The underlying problem is the session, not the display. |
 
 1. Confirm the sentinel is present (means the next capture will be headless):
 
@@ -346,7 +442,7 @@ There's no `headless` field on the capture request — the service always tries 
    }
    ```
 
-**One-shot flip.** The sentinel is a one-shot toggle — on the next successful data capture, `InterceptorClient._on_data_inner()` writes it back (`shared/common/src/common/cdp_interceptor/client.py:448`). So the sequence "delete sentinel → run visible capture → observe → next capture goes headless again" is automatic. To force multiple visible runs in a row, delete the sentinel between each call.
+**One-shot flip.** The sentinel is a one-shot toggle — on the next successful data capture, `InterceptorClient._on_data_inner()` writes it back (`shared/common/src/common/cdp_interceptor/client.py:456`). So the sequence "delete sentinel → run visible capture → observe → next capture goes headless again" is automatic. To force multiple visible runs in a row, delete the sentinel between each call.
 
 **Comparing behavior against `cdp-spy` directly.** For iterating on regex patterns or verifying a profile end-to-end without the API in the loop, run `cdp-spy` against the same profile-dir directly:
 

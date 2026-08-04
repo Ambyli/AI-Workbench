@@ -5,7 +5,7 @@ Give it a URL and a list of URL regex patterns; it launches Chrome under a
 named profile, injects the interceptor, waits a bounded window, and returns
 the captured JSON bodies bucketed by which pattern matched them.
 
-Concurrency (see ai/INTERCEPTOR_API.md § Concurrency for the operator view):
+Concurrency (see ai/INTERCEPTOR.md § Concurrency for the operator view):
   * Different profiles fully parallel.
   * Same profile: the fast path uses the base ``--user-data-dir`` directly so
     refreshed session cookies persist. Concurrent same-profile requests fall
@@ -195,6 +195,16 @@ class CaptureRequest(BaseModel):
     login_timeout: int = Field(default=300, ge=1)
     max_matches_per_pattern: Optional[int] = Field(default=None, ge=1)
     debug_logging: bool = Field(default=False)
+    login_url_patterns: list[str] = Field(
+        default_factory=lambda: ["login", "signin", "/auth"],
+        description="Regex patterns matched (re.search) against the tab URL "
+        "AFTER navigation, to detect a redirect to a login wall. Omit to use "
+        "the built-in defaults (login / signin / /auth). Because these are full "
+        "regexes — not substrings — you can anchor one to a bare domain that a "
+        "substring couldn't distinguish from an in-app URL, e.g. "
+        r"'^https?://roofix\.io/?$' matches the logged-out root but not "
+        "'roofix.io/project/...'. An empty list disables login detection.",
+    )
 
 
 class CaptureMatch(BaseModel):
@@ -274,6 +284,14 @@ def _run_capture(req: CaptureRequest) -> CaptureResponse:
         ]
     except re.error as e:
         raise HTTPException(status_code=400, detail=f"invalid url_pattern: {e}")
+
+    # Same fail-fast validation for the login-wall patterns. These are compiled
+    # again inside the interceptor; compile here only to surface a clean 400.
+    try:
+        for p in req.login_url_patterns:
+            re.compile(p)
+    except re.error as e:
+        raise HTTPException(status_code=400, detail=f"invalid login_url_pattern: {e}")
 
     # Reserve a port BEFORE touching anything else. If capacity is out, we're
     # done — 429 the caller.
@@ -374,6 +392,7 @@ def _run_capture(req: CaptureRequest) -> CaptureResponse:
             login_timeout=req.login_timeout,
             capture_timeout=req.capture_window_seconds,
             debug_logging=req.debug_logging,
+            login_url_keywords=tuple(req.login_url_patterns),
         )
 
         try:
@@ -475,7 +494,7 @@ def capture_url(
             body lands in the bucket of the first pattern it matches.
         profile: Named profile under ``INTERCEPTOR_PROFILES_ROOT``. Discover
             available names via the ``list_profiles`` tool. Profiles are
-            uploaded out-of-band by an operator (see INTERCEPTOR_API.md).
+            uploaded out-of-band by an operator (see INTERCEPTOR.md).
         capture_window_seconds: How long to run Chrome to collect captures
             (default 20). Increase if the page fires XHRs late.
         login_timeout: Max seconds to wait for a login redirect to resolve

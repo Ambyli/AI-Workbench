@@ -58,7 +58,7 @@ Key variables:
 | `INTERCEPTOR_URL` | `http://interceptor:8080` | Roofix Bridge → interceptor base URL |
 | `ROOFIX_PROFILE_NAME` | `roofix` | Named profile inside interceptor holding Roofix session cookies |
 | `INTERCEPTOR_PROFILES_ROOT` | `/data/profiles` | interceptor: root under which named `--user-data-dir` profiles live |
-| `INTERCEPTOR_MAX_CONCURRENT` | `8` | interceptor: max simultaneous `/capture` calls (port pool size). Each slot ≈ one Chrome + optional profile clone — see `ai/INTERCEPTOR_API.md § Resource sizing` |
+| `INTERCEPTOR_MAX_CONCURRENT` | `8` | interceptor: max simultaneous `/capture` calls (port pool size). Each slot ≈ one Chrome + optional profile clone — see `ai/INTERCEPTOR.md § Resource sizing` |
 
 ## Threading Model — Read Before Touching Anything
 

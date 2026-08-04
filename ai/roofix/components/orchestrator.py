@@ -46,6 +46,13 @@ from components.constants import (
 # so we queue locally rather than pounding the server and eating 409s.
 # asyncio.Semaphore serves waiters FIFO → first-come-first-serve automatic.
 
+# Sentinel returned by ``_scrape_and_extract`` for transient network failures
+# (DNS, connection refused, socket timeout) — signals the caller to skip
+# ``decide``/``_execute`` for this event on this tick so the next tick can
+# retry. Distinct from ``False`` (non-retryable: parse failed, no_docs,
+# hard timeout) so ambiguous events don't get escalated on a DNS blip.
+_SCRAPE_DEFER = object()
+
 
 def _default_log() -> CsvLogger:
     """Fallback CsvLogger for callers (e.g. tests) that don't inject one.
@@ -196,8 +203,16 @@ async def _scrape_and_extract(
       ``_extracted_payload`` stashed for ``_execute`` to pass onward to
       ``phoenix.ensure_entity_and_project``.
 
-    Returns True iff the extraction produced usable data (caller should
-    re-resolve Phoenix context so the brain sees the sharper identity).
+    Return contract (three-valued):
+      * ``True``  — extraction produced usable data; caller should re-resolve
+        Phoenix context so the brain sees the sharper identity.
+      * ``False`` — non-retryable failure (no_docs, timeout, parse failed).
+        Caller should proceed to ``decide``/``_execute`` with the current
+        ctx; ``processed_store`` has already been marked to prevent re-run.
+      * ``_SCRAPE_DEFER`` — transient network failure (DNS, socket, etc.).
+        Caller should SKIP ``decide``/``_execute`` for this event on this
+        tick so the next tick re-fetches from Gmail and retries.
+        ``processed_store`` is deliberately NOT marked here.
 
     Called by: ``process_batch`` (per event, only on the Phoenix-miss path).
     """
@@ -261,8 +276,8 @@ async def _scrape_and_extract(
             event_type=etype,
             project_ref=key,
         )
-        ev.setdefault("notes", []).append(f"scrape failed: {e}")
-        return False
+        ev.setdefault("notes", []).append(f"scrape failed transient: {e}")
+        return _SCRAPE_DEFER
 
     if not result.get("mget_docs"):
         log.log(
@@ -769,9 +784,27 @@ async def _process_group(
             )
 
             if will_scrape:
-                if await _scrape_and_extract(
+                scrape_result = await _scrape_and_extract(
                     ev, scraper_client, log, key, processed_store, scrape_sem
-                ):
+                )
+                if scrape_result is _SCRAPE_DEFER:
+                    # Transient network failure — don't decide/execute this
+                    # tick. The scrape path did NOT mark processed_store, so
+                    # is_processed() stays False and the next tick will
+                    # re-fetch this email from Gmail and retry. Skipping the
+                    # append also keeps the email unread in Gmail (app.py
+                    # only mark_reads events that appear in the returned
+                    # records).
+                    log.log(
+                        "orchestrator",
+                        "defer",
+                        True,
+                        "transient scrape failure — deferring to next tick",
+                        event_type=etype,
+                        project_ref=key,
+                    )
+                    continue
+                if scrape_result:
                     ctx = await _resolve_context(ev, phoenix)
                     ev["project_id"] = ctx.get("project_id")
                     _note_phoenix_result(ev, ctx)

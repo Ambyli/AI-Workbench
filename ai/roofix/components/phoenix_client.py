@@ -215,7 +215,7 @@ class PhoenixClient:
         col = _ROOFIX_ID_COLUMN
         sql = (
             f"SELECT id, project_name, street1, city, postal_code, object_status_id "
-            f"FROM project WHERE {col} = %s AND archived = false;"
+            f"FROM project WHERE {col} = %s AND archived = false AND object_status_id NOT IN (59);"  # exclude "Cancelled" projects
         )
         try:
             with self._cursor() as cur:
@@ -241,7 +241,9 @@ class PhoenixClient:
             params.append(street1.strip())
         sql = (
             "SELECT id, project_name, street1, city, postal_code, object_status_id "
-            "FROM project WHERE " + " AND ".join(clauses) + ";"
+            "FROM project WHERE "
+            + " AND ".join(clauses)
+            + " AND object_status_id NOT IN (59);"  # exclude "Cancelled" projects
         )
         try:
             with self._cursor() as cur:

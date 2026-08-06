@@ -1,5 +1,5 @@
 litellm_settings:
-  num_retries: 3
+  num_retries: 1
   request_timeout: 300
   drop_params: true
   turn_off_message_logging: true
@@ -67,12 +67,14 @@ model_list:
       api_base: os.environ/DEFAULT_LITELLM_MODEL_API_BASE
       api_key: os.environ/DEFAULT_LITELLM_MODEL_API_KEY
       max_tokens: 262144
+      stream_timeout: 300
 
   - model_name: kokoro
     litellm_params:
       model: openai/kokoro
       api_base: http://kokoro-api:8000/v1
       api_key: none
+      stream_timeout: 300
     model_info:
       mode: audio
 
@@ -82,6 +84,7 @@ model_list:
       api_base: http://vllm-qwen:8000/v1
       api_key: none
       max_tokens: 32768
+      stream_timeout: 300
 
   - model_name: qwen2.5-vl
     litellm_params:
@@ -89,5 +92,6 @@ model_list:
       api_base: http://vllm-qwen-vl:8000/v1
       api_key: none
       max_tokens: 8192
+      stream_timeout: 300
     model_info:
       mode: image

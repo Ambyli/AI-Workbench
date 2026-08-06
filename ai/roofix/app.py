@@ -9,6 +9,9 @@ Endpoints:
     POST /execute/{message_id}         re-run one specific Gmail message through the
                                        pipeline, bypassing the processed_store dedup.
                                        Same actions as a normal tick (subject to DRY_RUN).
+    POST /reset/{message_id}           flip processed_store row to pending, mark the
+                                       email unread in Gmail, remove ROOFIX_PROCESSED_LABEL
+                                       so the next tick re-fetches + re-analyzes it.
     POST /labels/backfill              one-time repair: apply ROOFIX_PROCESSED_LABEL
                                        to every message_id currently in processed_store
                                        so the labeled-fetch query excludes them.
@@ -412,6 +415,99 @@ async def execute(message_id: str) -> dict:
     except Exception as e:
         _record_tick([], error=repr(e))
         return {"error": repr(e), "records": [], "count": 0}
+
+
+@app.post("/reset/{message_id}")
+async def reset(message_id: str) -> dict:
+    """Reset a single email so the next tick re-fetches and re-analyzes it.
+
+    Undoes the three gates the bridge sets after a normal run:
+      1. ``processed_store`` — the row's status is flipped from ``ok``/``error``
+         to ``pending``. ``is_processed()`` returns False for ``pending``,
+         so the bridge-side dedup filter no longer skips this email.
+      2. Gmail label — ``ROOFIX_PROCESSED_LABEL`` is removed so the
+         ``-label:`` clause in ``LISTENER_QUERY`` no longer excludes it.
+      3. Read/unread — the ``UNREAD`` label is re-added so ``is:unread``
+         in ``LISTENER_QUERY`` matches it again.
+
+    All three Gmail modifies are idempotent; safe to call repeatedly. The
+    processed_store transition uses ``mark_pending`` (not delete) so the row's
+    history is preserved.
+
+    Returns ``{message_id, store, gmail: {unread, label_removed}, label}``.
+    404 if the message id isn't visible to the OAuth token (Gmail 404). If
+    processed_store has no row for this id, ``store`` is ``"unchanged"`` and
+    the Gmail side still runs (useful if the row was manually deleted and
+    the label is still stuck on the message).
+
+    Prefer ``POST /execute/{message_id}`` for a one-shot immediate re-run —
+    it needs no cleanup and returns the resulting decision. Use ``/reset``
+    when you want the email to flow through the normal listener path on the
+    next scheduled tick (e.g. as part of a batch, or to sanity-check the
+    LISTENER_QUERY end-to-end).
+    """
+    from googleapiclient.errors import HttpError
+
+    result = {
+        "message_id": message_id,
+        "store": "unchanged",
+        "gmail": {"unread": False, "label_removed": False},
+        "label": ROOFIX_PROCESSED_LABEL,
+    }
+
+    with (
+        GmailClient() as gmail,
+        PostgresProcessedStore(ROOFIX_DB_DSN) as processed_store,
+    ):
+        # Gmail first: a 404 aborts before we touch the store, so we don't
+        # leave a half-reset row pointing at a message that no longer exists.
+        try:
+            await asyncio.to_thread(gmail.mark_unread, message_id)
+            result["gmail"]["unread"] = True
+        except HttpError as e:
+            if e.resp.status == 404:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"message_id {message_id!r} not found in Gmail",
+                )
+            raise
+
+        try:
+            label_id = await asyncio.to_thread(
+                gmail.get_or_create_label, ROOFIX_PROCESSED_LABEL
+            )
+            await asyncio.to_thread(gmail.remove_label, message_id, label_id)
+            result["gmail"]["label_removed"] = True
+        except Exception as e:
+            _audit_log.log(
+                "gmail",
+                "remove_label_failed",
+                False,
+                f"reset {message_id}: {e}",
+                event_type="",
+                project_ref="",
+            )
+
+        existing = await asyncio.to_thread(processed_store.get, message_id)
+        if existing is not None:
+            await asyncio.to_thread(
+                processed_store.mark_pending,
+                message_id,
+                {"action": "reset", "prev_status": existing.status},
+            )
+            result["store"] = "reset"
+
+    _audit_log.log(
+        "orchestrator",
+        "reset",
+        True,
+        f"reset {message_id}: store={result['store']}, "
+        f"unread={result['gmail']['unread']}, "
+        f"label_removed={result['gmail']['label_removed']}",
+        event_type="",
+        project_ref="",
+    )
+    return result
 
 
 @app.post("/labels/backfill")

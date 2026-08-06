@@ -281,6 +281,14 @@ class GmailClient:
         self.service().users().messages().modify(
             userId="me", id=message_id, body={"removeLabelIds": ["UNREAD"]}).execute()
 
+    def mark_unread(self, message_id: str) -> None:
+        """Re-add the ``UNREAD`` system label to a message. Idempotent — Gmail
+        no-ops if the label is already present. Used by the reset endpoint to
+        put a previously-processed email back into the ``LISTENER_QUERY``
+        window so the next tick re-fetches it."""
+        self.service().users().messages().modify(
+            userId="me", id=message_id, body={"addLabelIds": ["UNREAD"]}).execute()
+
     def get_or_create_label(self, name: str) -> str:
         """Return the Gmail label id for ``name``, creating it if missing.
 
@@ -320,6 +328,15 @@ class GmailClient:
             userId="me",
             id=message_id,
             body={"addLabelIds": [label_id]},
+        ).execute()
+
+    def remove_label(self, message_id: str, label_id: str) -> None:
+        """Remove a single label from a message. Idempotent — Gmail returns
+        200 with no side effect if the label wasn't attached."""
+        self.service().users().messages().modify(
+            userId="me",
+            id=message_id,
+            body={"removeLabelIds": [label_id]},
         ).execute()
 
     def forward_email(self, to: list[str], reason: str, original: dict,

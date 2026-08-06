@@ -32,6 +32,7 @@ Before the bridge can hydrate proposals, upload a Roofix profile to interceptor 
 | `GET /status` | Last-tick timestamp, per-action decision counts, escalation counts, error count, effective `DRY_RUN` / `AGENT_PHASE`. |
 | `POST /tick` | Manually process one batch now. Body optionally accepts `{"raw_emails": [...]}` (Contract A shape) to process crafted samples without hitting Gmail. |
 | `POST /execute/{message_id}` | Re-run one specific Gmail message through the pipeline. Fetches by id regardless of read/unread state, skips the `processed_store` dedup filter, otherwise runs the same orchestrator path a scheduled tick would (Phoenix writes, `mark_read`, escalation forward — all subject to `DRY_RUN`). Returns `404` if the id isn't visible to the OAuth token, `200 {records, count}` on success. |
+| `POST /reset/{message_id}` | Clear the three gates so the next scheduled tick re-fetches this email through the normal listener path: flips `processed_store` status to `pending`, removes `ROOFIX_PROCESSED_LABEL`, re-adds the `UNREAD` label. All Gmail modifies are idempotent. Returns `{message_id, store, gmail: {unread, label_removed}, label}`. `store` is `"unchanged"` if there was no processed_store row for the id (Gmail side still runs). `404` if Gmail can't find the id. See [Reanalyzing an email](#reanalyzing-an-email) for when to use this vs `/execute`. |
 | `POST /labels/backfill` | One-time repair: applies `ROOFIX_PROCESSED_LABEL` to every `ok` / `error` row currently in processed_store. Idempotent (safe to re-run). Response is `{label, counts: {labeled, skipped, failed}}`. Run this once after upgrading to the labeled-fetch model to sweep the existing stuck-unread backlog out of the `LISTENER_QUERY` window; per-message failures are audit-logged. |
 
 Reach the bridge from another container on `ai_shared`:
@@ -200,6 +201,34 @@ Sessions survive **days to weeks** on the fast path (single capture at a time re
 
 - **Concurrent `/capture` calls collide on the debug port.** interceptor serializes captures with a module-level lock (`ai/interceptor/app.py:63`) and returns **HTTP 409** if a capture is already running — the bridge should backoff-and-retry rather than fan out.
 - **Cross-machine password caveat.** Cookies in a shipped profile work fine on Linux Docker. Chrome's saved-password blob (`Login Data`) is encrypted with a machine-bound key and won't decrypt inside the container — the container reuses cookies only. If they die you re-capture on your laptop and re-upload.
+
+### Reanalyzing an email
+
+Two independent gates block a previously-processed email from being picked up on the next tick:
+
+1. **Gmail-side** — `LISTENER_QUERY` is `is:unread from:${ROOFIX_SENDER} -label:${ROOFIX_PROCESSED_LABEL}`. A processed email is read (fails `is:unread`) *and* labeled (fails `-label:`), so a normal tick's fetch will skip it.
+2. **Bridge-side** — `processed_store.is_processed(message_id)` filters out any row whose status is `ok`. Even if Gmail hands the email back, the orchestrator drops it before parsing.
+
+Two ways to re-analyze:
+
+**Option A — `POST /execute/{message_id}` (single message, immediate).** Fetches the email by id (ignores `LISTENER_QUERY`) and passes `skip_dedup=True` (ignores `processed_store`). No manual cleanup required. Returns the resulting `{records, count}` synchronously. At the end of the run the normal `mark_read` + label steps happen, so subsequent ticks won't re-process it. Use for one-off replays and debugging.
+
+```bash
+docker exec -it roofix curl -X POST http://localhost:8080/execute/19f908fe4c0a892c
+```
+
+**Option B — `POST /reset/{message_id}` (defer to next tick).** Puts the email back into the listener's fetch window: flips the processed_store row to `pending`, marks unread, removes the label. The next scheduled tick (or a manual `POST /tick`) will re-fetch it via `LISTENER_QUERY` and run the full pipeline. Use when you want to verify the listener query end-to-end, or when re-running as part of a batch.
+
+```bash
+docker exec -it roofix curl -X POST http://localhost:8080/reset/19f908fe4c0a892c
+docker exec -it roofix curl -X POST http://localhost:8080/tick    # optional — else wait for scheduler
+```
+
+Response shape: `{"message_id": "…", "store": "reset" | "unchanged", "gmail": {"unread": true, "label_removed": true}, "label": "roofix/processed"}`. `store` is `"unchanged"` when no row existed for that id in processed_store (Gmail side still runs, useful if the row was deleted manually and the label is still on the message). 404 if the id isn't visible to the OAuth token.
+
+**Manual DB primitive** — for batch replays via SQL, see the [Connecting to the processed-store DB](#connecting-to-the-processed-store-db) section below. `DELETE FROM processed WHERE key = '…'` clears the store row but does **not** touch Gmail — you'll also need to remove the label + mark unread manually (`gmail.remove_label` + `gmail.mark_unread`) or the `LISTENER_QUERY` won't return the email.
+
+**Watch out for escalation-forward duplicates.** If any of the messages you're re-running previously landed on `action=escalate`, the escalate branch in `_execute` re-forwards to `ESCALATION_RECIPIENTS` and re-`mark_ok`s in processed_store. For replay of already-escalated events either (a) blank `ESCALATION_RECIPIENTS` for the replay tick, or (b) filter out message_ids whose prior processed_store metadata has `action=="escalate"` (`SELECT key FROM processed WHERE metadata->>'action'='escalate'`).
 
 ### Connecting to the processed-store DB
 

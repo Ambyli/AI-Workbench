@@ -26,6 +26,7 @@ logs-$(1):
 	$$(DC_$(1)) logs -f $(2)
 
 build-$(1):
+	$$(DC_$(1)) pull --ignore-pull-failures $(2)
 	$$(DC_$(1)) build $(2)
 
 .PHONY: up-$(1) down-$(1) clean-$(1) very-clean-$(1) logs-$(1) build-$(1)
@@ -68,7 +69,7 @@ very-clean:
 	$(foreach s,$(SERVICES),$(DC_$(s)) down --volumes --rmi all;)
 
 build:
-	$(foreach s,$(SERVICES),$(DC_$(s)) build &&) true
+	$(foreach s,$(SERVICES),$(DC_$(s)) pull --ignore-pull-failures && $(DC_$(s)) build &&) true
 
 logs:
 	@echo "Use logs-<service> to follow specific service logs."

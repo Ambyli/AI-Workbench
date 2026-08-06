@@ -257,8 +257,26 @@ Restart the container — `make down-openwebui && make up-openwebui`. After logi
 
 Models are configured in `litellm_config.yaml`, not in Open WebUI. After editing that file and restarting LiteLLM, the new model appears in Open WebUI's model picker automatically — Open WebUI calls `GET /v1/models` against LiteLLM to populate the list.
 
+### Updating the image
+
+The image tag is pinned in `ai/docker-compose.openwebui.yml`:
+
+```yaml
+image: ghcr.io/open-webui/open-webui:v0.11.0
+```
+
+To update:
+
+1. Edit that line to the desired tag (a specific release like `v0.11.1`, or `main` for the rolling upstream tag). Releases are at <https://github.com/open-webui/open-webui/releases>.
+2. Pull the new image and recreate the container:
+   ```bash
+   make build-openwebui   # runs `docker compose pull` under the hood
+   make down-openwebui && make up-openwebui
+   ```
+
+`make build-openwebui` re-pulls whatever tag is currently pinned — useful when the tag is `main` (rolling) or when a release is re-tagged. User data in the `openwebui_data` volume is preserved across updates.
+
 ### Notes
 
-- The image (`ghcr.io/open-webui/open-webui:main`) tracks the rolling `main` tag. Pin to a specific version (e.g. `:v0.4.8`) before relying on this in production.
 - The container does **not** request GPU access — it does no inference of its own, only proxies requests to LiteLLM.
 - If LiteLLM is not running, Open WebUI loads but the model list is empty. Start LiteLLM first (`make up-litellm`).

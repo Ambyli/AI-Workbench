@@ -1,5 +1,11 @@
 SERVICES :=
 
+# Capture positional args after the first goal so callers can narrow a target
+# to specific compose services, e.g. `make up-vllm vllm-qwen`. If no extras are
+# passed, the macro falls back to the default service list from $(2).
+ARGS := $(filter-out $(firstword $(MAKECMDGOALS)),$(MAKECMDGOALS))
+$(foreach a,$(ARGS),$(eval $(a):;@:))
+
 define service
 SERVICES += $(1)
 SERVICES_ARGS_$(1) := $(2)
@@ -7,13 +13,13 @@ SERVICES_ARGS_$(1) := $(2)
 DC_$(1) := docker compose -f ai/docker-compose.$(1).yml --env-file .env -p ai-$(1)
 
 up-$(1):
-	$$(DC_$(1)) up -d $(2)
+	$$(DC_$(1)) up -d $$(if $$(ARGS),$$(ARGS),$(2))
 
 down-$(1):
-	$$(DC_$(1)) stop $(2)
+	$$(DC_$(1)) stop $$(if $$(ARGS),$$(ARGS),$(2))
 
 clean-$(1):
-	$$(DC_$(1)) stop $(2) && $$(DC_$(1)) rm -f $(2)
+	$$(DC_$(1)) stop $$(if $$(ARGS),$$(ARGS),$(2)) && $$(DC_$(1)) rm -f $$(if $$(ARGS),$$(ARGS),$(2))
 
 very-clean-$(1):
 	@if [ "$(CONFIRM)" != "yes" ]; then \
@@ -23,11 +29,11 @@ very-clean-$(1):
 	$$(DC_$(1)) down --volumes --rmi all
 
 logs-$(1):
-	$$(DC_$(1)) logs -f $(2)
+	$$(DC_$(1)) logs -f $$(if $$(ARGS),$$(ARGS),$(2))
 
 build-$(1):
-	$$(DC_$(1)) pull --ignore-pull-failures $(2)
-	$$(DC_$(1)) build $(2)
+	$$(DC_$(1)) pull --ignore-pull-failures $$(if $$(ARGS),$$(ARGS),$(2))
+	$$(DC_$(1)) build $$(if $$(ARGS),$$(ARGS),$(2))
 
 .PHONY: up-$(1) down-$(1) clean-$(1) very-clean-$(1) logs-$(1) build-$(1)
 endef

@@ -72,6 +72,7 @@ services:
       --enable-auto-tool-choice
       --tool-call-parser hermes
       --enable-prefix-caching
+      --max-num-seqs 32
       --gpu-memory-utilization 0.95
 
   vllm-qwen-vl:

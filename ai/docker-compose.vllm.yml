@@ -73,7 +73,7 @@ services:
       --enable-auto-tool-choice
       --tool-call-parser hermes
       --enable-prefix-caching
-      --gpu-memory-utilization 0.92
+      --gpu-memory-utilization 0.95
 
   vllm-qwen-vl:
     networks:

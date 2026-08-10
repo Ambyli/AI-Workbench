@@ -71,9 +71,10 @@ services:
       --max-num-seqs 32
       --reasoning-parser qwen3
       --enable-auto-tool-choice
-      --tool-call-parser hermes
+      --tool-call-parser qwen3_coder
       --enable-prefix-caching
       --gpu-memory-utilization 0.95
+      --default-chat-template-kwargs '{"enable_thinking": true,"preserve_thinking": true}'
 
   vllm-qwen-vl:
     networks:

@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{.StatusCode}} · Zeo AI Chat</title>
+<link rel="icon" type="image/png" href="/assets/Zeo%20Favicon%20Black.png">
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: #0b0b0b;
+    color: #e6e6e6;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+  }
+  .card {
+    width: 100%;
+    max-width: 480px;
+    background: #141414;
+    border: 1px solid #262626;
+    border-radius: 12px;
+    padding: 40px 32px;
+    text-align: center;
+    box-shadow: 0 10px 40px rgba(0,0,0,0.4);
+  }
+  .logo {
+    width: 180px;
+    max-width: 100%;
+    height: auto;
+    filter: invert(1);
+    margin-bottom: 24px;
+  }
+  .status {
+    font-size: 13px;
+    letter-spacing: 0.08em;
+    color: #a3a3a3;
+    text-transform: uppercase;
+    margin: 0 0 6px 0;
+  }
+  h1 {
+    font-size: 22px;
+    font-weight: 600;
+    margin: 0 0 16px 0;
+    color: #ffffff;
+  }
+  .message {
+    font-size: 14px;
+    color: #cccccc;
+    line-height: 1.55;
+    margin: 0 0 24px 0;
+    text-align: left;
+    background: #1a1a1a;
+    border: 1px solid #262626;
+    border-radius: 8px;
+    padding: 14px 16px;
+  }
+  .support {
+    font-size: 14px;
+    color: #a3a3a3;
+    margin: 20px 0 0 0;
+    line-height: 1.5;
+  }
+  .support a {
+    color: #ffffff;
+    text-decoration: underline;
+    text-decoration-color: #444;
+    text-underline-offset: 3px;
+  }
+  .support a:hover { text-decoration-color: #fff; }
+  .actions {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin-top: 24px;
+  }
+  .btn {
+    display: block;
+    width: 100%;
+    padding: 12px 16px;
+    border-radius: 8px;
+    font-size: 15px;
+    font-weight: 600;
+    cursor: pointer;
+    font-family: inherit;
+    text-decoration: none;
+    transition: background 0.15s ease, border-color 0.15s ease;
+    border: 1px solid transparent;
+  }
+  .btn-primary { background: #ffffff; color: #000000; border: none; }
+  .btn-primary:hover { background: #e6e6e6; }
+  .btn-secondary { background: transparent; color: #e6e6e6; border-color: #333; }
+  .btn-secondary:hover { border-color: #666; }
+  form { margin: 0; }
+  .request-id {
+    margin-top: 28px;
+    font-size: 11px;
+    color: #555555;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    word-break: break-all;
+  }
+  .footer {
+    margin-top: 12px;
+    font-size: 12px;
+    color: #666666;
+  }
+</style>
+</head>
+<body>
+  <div class="card">
+    <img class="logo" alt="Zeo Energy" src="/assets/Zeo%20Energy%20Black.png">
+    <p class="status">{{.StatusCode}} · {{.Title}}</p>
+    <h1>Something's blocking your sign-in</h1>
+
+    {{ if .Message }}
+    <div class="message">{{.Message}}</div>
+    {{ end }}
+
+    <p class="support">
+      Locked out? Email <a href="mailto:it@zeoenergy.com?subject=Zeo%20AI%20Chat%20access%20issue">it@zeoenergy.com</a>
+      and include the request ID below.
+    </p>
+
+    {{ if .Redirect }}
+    <div class="actions">
+      <form method="GET" action="{{.ProxyPrefix}}/sign_in">
+        <input type="hidden" name="rd" value="{{.Redirect}}">
+        <button class="btn btn-primary" type="submit">Sign in again</button>
+      </form>
+      <a class="btn btn-secondary" href="{{.Redirect}}">Go back</a>
+    </div>
+    {{ end }}
+
+    {{ if .RequestID }}
+    <p class="request-id">Request ID: {{.RequestID}}</p>
+    {{ end }}
+
+    {{ if and (ne .Footer "-") (ne .Footer "") }}
+    <p class="footer">{{.Footer}}</p>
+    {{ end }}
+  </div>
+</body>
+</html>

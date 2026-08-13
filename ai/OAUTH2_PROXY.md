@@ -6,9 +6,9 @@ Sits between Cloudflare and Open WebUI. Every request to `chat.zeoenergy.com` mu
 
 ```
 Browser  →  Cloudflare (TLS)  →  cloudflared tunnel  →  oauth2-proxy:4180  →  openwebui:8080
-                                                             ↓
-                                                       Google OAuth
-                                                             +
+                                                             ↓                    (default upstream)
+                                                       Google OAuth          ↘  oauth2-assets:80
+                                                             +                    (for /assets/* — skip-auth)
                                                     Google Directory API
                                                     (group membership check)
 ```
@@ -28,6 +28,7 @@ docker compose -f ai/docker-compose.oauth2-proxy.yml --env-file .env -p ai-oauth
 | Container | Port | Purpose |
 |---|---|---|
 | `oauth2-proxy` | `localhost:4180` (`PORT_OAUTH2_PROXY`) → container `4180` | Google login + group membership check; proxies to `openwebui:8080` on the `ai_shared` network |
+| `oauth2-assets` | _(none — internal only)_ | `nginx:alpine` serving the repo's `assets/` folder at `http://oauth2-assets:80/assets/*`. Reached only by oauth2-proxy over `ai_shared`. Powers the logo on the pre-auth sign-in and error pages (see § Branded sign-in and error pages) |
 
 Cloudflare's tunnel reaches oauth2-proxy via the docker host IP on port 4180 (published). Reachable over the `ai_shared` docker network at `http://oauth2-proxy:4180` as well.
 
@@ -139,6 +140,66 @@ Every value is sourced from the root `.env` — edit there, never in the compose
 | `OAUTH2_PROXY_GOOGLE_GROUPS` | `OAUTH2_PROXY_GOOGLE_GROUPS` | `zeoai.access@zeoenergy.com` | User must belong to this group |
 | `OAUTH2_PROXY_GOOGLE_ADMIN_EMAIL` | `OAUTH2_PROXY_GOOGLE_ADMIN_EMAIL` | `admin@gosunergy.com` | Workspace admin the service account impersonates to read group members |
 | `OAUTH2_PROXY_GOOGLE_SERVICE_ACCOUNT_JSON` | `OAUTH2_PROXY_GOOGLE_SERVICE_ACCOUNT_JSON` | `/etc/oauth2-proxy/sa-key.json` | Path **inside the container**; host file is bind-mounted from `ai/oauth2-proxy/sa-key.json` |
+| `OAUTH2_PROXY_CUSTOM_TEMPLATES_DIR` | `OAUTH2_PROXY_CUSTOM_TEMPLATES_DIR` | `/etc/oauth2-proxy/templates` | Path **inside the container**; host directory is bind-mounted from `ai/oauth2-proxy/templates/`. See § Branded sign-in and error pages |
+| `OAUTH2_PROXY_SKIP_AUTH_ROUTES` | `OAUTH2_PROXY_SKIP_AUTH_ROUTES` | `^/assets/` | Regex(es) of paths served WITHOUT authentication. Currently: the `/assets/` prefix so the pre-login sign-in and error pages can load the Zeo logo. Widen with caution — anything matching is fully public |
+
+---
+
+## Branded sign-in and error pages
+
+The default oauth2-proxy sign-in prompt and 403 error page are replaced with two custom templates. They cover the two pages an unauthenticated (or denied) user can see before hitting Open WebUI:
+
+- **`sign_in.html`** — the "Sign in to Zeo AI Chat" landing page shown before Google login.
+- **`error.html`** — the 403/500/etc. page shown when auth fails after Google (CSRF cookie missing, group check refused, callback error, etc.). Includes a `mailto:it@zeoenergy.com` support link so locked-out users know who to contact.
+
+Both files live at `ai/oauth2-proxy/templates/` on the host and are bind-mounted read-only into the container. Activation is a single env var:
+
+```env
+OAUTH2_PROXY_CUSTOM_TEMPLATES_DIR=/etc/oauth2-proxy/templates
+```
+
+The mount is added to the compose file next to the `sa-key.json` mount:
+
+```yaml
+volumes:
+  - ./oauth2-proxy/sa-key.json:/etc/oauth2-proxy/sa-key.json:ro
+  - ./oauth2-proxy/templates:/etc/oauth2-proxy/templates:ro
+```
+
+### How to edit
+
+- **Product name / sign-in copy** → `sign_in.html`.
+- **Support email / error copy** → `error.html`. The `mailto:` link is hardcoded — search for `it@zeoenergy.com`.
+- **Colors and layout** → the `<style>` block at the top of each file. The two files share the same design language; keep them in sync.
+- **Ship both files or neither.** If only one exists, oauth2-proxy silently falls back to the built-in default for the missing page, producing inconsistent styling.
+- **Filenames are exact:** `sign_in.html` and `error.html` (lowercase, snake_case). `signin.html` will be ignored.
+
+Templates are parsed once at container start. After editing, restart:
+
+```bash
+docker compose -f ai/docker-compose.oauth2-proxy.yml --env-file .env -p ai-oauth2-proxy restart oauth2-proxy
+```
+
+### How the logo gets served (the `oauth2-assets` sidecar)
+
+Both templates reference the logo as a plain URL:
+
+```html
+<img class="logo" src="/assets/Zeo%20Energy%20Black.png">
+<link rel="icon" href="/assets/Zeo%20Favicon%20Black.png">
+```
+
+That works despite the pages being served pre-authentication because three things line up:
+
+1. **`oauth2-assets` sidecar** (defined in the same compose file) is `nginx:alpine` with the repo's top-level `assets/` folder bind-mounted at `/usr/share/nginx/html/assets`. It serves `/assets/<file>` at `http://oauth2-assets:80/assets/<file>` on the `ai_shared` network. It is NOT exposed on a host port — only oauth2-proxy talks to it.
+2. **Multi-upstream routing** — `OAUTH2_PROXY_UPSTREAMS=http://openwebui:8080,http://oauth2-assets:80/assets/`. oauth2-proxy uses longest-prefix path matching, so `/assets/*` goes to the sidecar and everything else goes to Open WebUI.
+3. **Skip-auth allowlist** — `OAUTH2_PROXY_SKIP_AUTH_ROUTES=^/assets/`. Without this, oauth2-proxy would redirect the `<img>` request to Google login and the browser would get a redirected image response (broken image icon on the sign-in page). With it, the `/assets/*` upstream is reachable without a session cookie.
+
+**Adding or replacing images.** Drop the file in the repo's top-level `assets/` folder and reference it by URL-encoded name (`/assets/My%20New%20Logo.png`). Nginx picks it up on the next request — no restart needed for asset changes, only for template changes. Filenames with spaces work, they just need URL encoding.
+
+**Widening the skip-auth allowlist is a security decision.** Anything matching `OAUTH2_PROXY_SKIP_AUTH_ROUTES` bypasses group gating entirely. Keeping the regex tight (`^/assets/`) means only static branding is public — not, for example, arbitrary Open WebUI paths.
+
+**Theme note.** The current logo asset is black-on-transparent and gets inverted to white via CSS `filter: invert(1)` on the dark background. If a designed white PNG is added later, drop `filter: invert(1)` from the `.logo` selector in both templates.
 
 ---
 
@@ -221,6 +282,8 @@ If a single-sign-on experience is desired, Open WebUI can be switched to trusted
 | oauth2-proxy logs `Not Authorized to access this resource/api, forbidden` (403) *after* Admin SDK API is enabled | The account in `OAUTH2_PROXY_GOOGLE_ADMIN_EMAIL` isn't a **Super Admin**. Directory-wide group reads require the Super Admin role — Admin or Groups Admin alone will fail with this exact error. Grant Super Admin (Admin console → Directory → Users → user → Admin roles → Super Admin), OR change `OAUTH2_PROXY_GOOGLE_ADMIN_EMAIL` to an account that already is |
 | Users still hit Open WebUI directly, bypassing the proxy | Cloudflare tunnel is still routing `chat.zeoenergy.com` to `openwebui:8080` — update the tunnel's public hostname service URL |
 | Revocation not taking effect | `OAUTH2_PROXY_COOKIE_REFRESH` interval hasn't elapsed. Reduce it, or have the user clear cookies for `chat.zeoenergy.com` |
+| Sign-in page renders blank (200 with empty body) | Template parse error. Check `docker logs oauth2-proxy` at container startup — malformed Go template syntax fails silently at render time |
+| Only one of sign-in / error pages picked up the custom branding | Both `sign_in.html` AND `error.html` must exist in `OAUTH2_PROXY_CUSTOM_TEMPLATES_DIR`. Missing one falls back to the built-in default for that page only |
 
 ### Useful commands
 
@@ -243,3 +306,7 @@ docker exec oauth2-proxy wget -qO- http://openwebui:8080/health
 - `.env` values for `OAUTH2_PROXY_COOKIE_SECRET`, `OPENWEBUI_GOOGLE_CLIENT_SECRET`
 
 Both should be in `.gitignore` already.
+
+## What TO commit
+
+- `ai/oauth2-proxy/templates/sign_in.html` and `ai/oauth2-proxy/templates/error.html` — branded pages, no secrets. The `.gitignore` rule under `ai/oauth2-proxy/` is scoped narrowly to `sa-key.json` on purpose so these templates are tracked. If you widen the ignore to `ai/oauth2-proxy/*` again, the templates will silently disappear from git and the next deploy on a clean checkout will fall back to the default oauth2-proxy pages.

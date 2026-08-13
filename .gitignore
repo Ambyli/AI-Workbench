@@ -9,5 +9,5 @@ __pycache__/
 .claude/
 **/node_modules/
 config.json
-ai/oauth2-proxy/*
+ai/oauth2-proxy/sa-key.json
 unit-tests/classifier/images/*

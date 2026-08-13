@@ -27,7 +27,7 @@ Every service in the list below is on the `ai_shared` network unless noted. Port
 | [`docker-compose.yml`](docker-compose.yml) | _(none — just declares the external `ai_shared` network)_ | — | — |
 | [`docker-compose.litellm.yml`](docker-compose.litellm.yml) | `litellm`, `litellm_db`, `prometheus` | `4001`, `5432`, `9090` | [LITELLM.md](LITELLM.md) · [LITELLM_MCP.md](LITELLM_MCP.md) |
 | [`docker-compose.openwebui.yml`](docker-compose.openwebui.yml) | `openwebui` | `8007` | [OPENWEBUI.md](OPENWEBUI.md) |
-| [`docker-compose.oauth2-proxy.yml`](docker-compose.oauth2-proxy.yml) | `oauth2-proxy` | `4180` | [OAUTH2_PROXY.md](OAUTH2_PROXY.md) |
+| [`docker-compose.oauth2-proxy.yml`](docker-compose.oauth2-proxy.yml) | `oauth2-proxy`, `oauth2-assets` | `4180` _(oauth2-assets is internal-only)_ | [OAUTH2_PROXY.md](OAUTH2_PROXY.md) |
 | [`docker-compose.cloudflared.yml`](docker-compose.cloudflared.yml) | `cloudflared` | _(outbound tunnel — no publish)_ | see [OPENWEBUI.md § Cloudflare Tunnel](OPENWEBUI.md#public-hostname-via-cloudflare-tunnel) |
 | [`docker-compose.vllm.yml`](docker-compose.vllm.yml) | `vllm-qwen`, `vllm-qwen-vl` | `8002`, `8006` | [VLLM.md](VLLM.md) · [GPU_SHARING_GUIDE.md](GPU_SHARING_GUIDE.md) |
 | [`docker-compose.kokoro.yml`](docker-compose.kokoro.yml) | `kokoro-api`, `kokoro-app` (internal) | `8004` | [KOKORO.md](KOKORO.md) |
@@ -63,6 +63,7 @@ flowchart TB
     end
     subgraph O2PG["docker-compose.oauth2-proxy.yml"]
         O2P["oauth2-proxy<br/>:4180"]:::svc
+        OA["oauth2-assets<br/>nginx internal :80<br/>serves ../assets/"]:::svc
     end
     subgraph OWUG["docker-compose.openwebui.yml"]
         OWU["openwebui<br/>:8007"]:::svc
@@ -99,6 +100,7 @@ flowchart TB
     end
 
     Browser --> CF --> O2P --> OWU
+    O2P -->|"/assets/* (skip-auth)"| OA
     O2P -. OAuth + group check .-> Google
     OWU  ==>|OpenAI API<br/>via ai_shared| LL
     CC   ==>|OpenAI API| LL
@@ -137,7 +139,7 @@ flowchart TB
 
 ### Reading the diagram
 
-- **Public entry point** — only `cloudflared` receives inbound traffic from outside the LAN. Every request to `chat.zeoenergy.com` transits `cloudflared → oauth2-proxy → openwebui`.
+- **Public entry point** — only `cloudflared` receives inbound traffic from outside the LAN. Every request to `chat.zeoenergy.com` transits `cloudflared → oauth2-proxy → openwebui`, except `/assets/*` which oauth2-proxy short-circuits to the internal `oauth2-assets` nginx sidecar without requiring a session (used to load the branded logo on the pre-auth sign-in and error pages — see [OAUTH2_PROXY.md § Branded sign-in and error pages](OAUTH2_PROXY.md#branded-sign-in-and-error-pages)).
 - **Fan-out from LiteLLM** — LiteLLM is the single OpenAI-compatible surface. Chat models are served by vLLM and Unsloth (llama.cpp); TTS by Kokoro; translation by MADLAD; image-quality by the classifier. Open WebUI and any external Claude Code / API client both hit LiteLLM the same way.
 - **Two-container app/api pattern** — Kokoro and MADLAD each split into an internal `-app` (model on GPU, blocking) and a `-api` proxy (stateless, non-blocking). Only the `-api` half is published to the host.
 - **Classifier ↔ vLLM** — the classifier is a vLLM client, not a peer; it calls `vllm-qwen-vl` internally for LLM scoring. Its own SQLite job store (`classifier.db` on the `classifier_data` volume) persists async `/assess` job state so callers can poll `GET /jobs/{id}` across restarts.

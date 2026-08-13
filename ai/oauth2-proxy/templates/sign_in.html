@@ -33,6 +33,12 @@
     max-width: 100%;
     height: auto;
     margin-bottom: 28px;
+    /* Knocks out the GIF's solid white background so it blends with the dark
+       card. invert() flips dark-on-white → white-on-black, then screen blend
+       drops the black. Only correct for a monochrome logo — brand colors get
+       inverted too. */
+    filter: invert(1);
+    mix-blend-mode: screen;
   }
   h1 {
     font-size: 20px;
@@ -80,7 +86,7 @@
 </head>
 <body>
   <div class="card">
-    <img class="logo" alt="Zeo Energy" src="/assets/ZEO-gif-transparent.gif">
+    <img class="logo" alt="Zeo Energy" src="/assets/ZEO%20Gif.gif">
     <h1>Sign in to Zeo AI Chat</h1>
     <p class="subtitle">Use your Zeo Energy Google account to continue.</p>
 

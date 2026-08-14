@@ -11,3 +11,4 @@ __pycache__/
 config.json
 ai/oauth2-proxy/sa-key.json
 unit-tests/classifier/images/*
+.ignore*

@@ -66,6 +66,31 @@ def inspect(gif_path: Path) -> None:
     print(f"then re-run with --stop N (0..{len(frames) - 1}).")
 
 
+def strip_netscape_loop(path: Path) -> bool:
+    """Remove the NETSCAPE2.0 loop extension so browsers default to play-once.
+
+    The extension is a 19-byte block:
+        21 FF 0B  "NETSCAPE2.0"  03 01  <loop LE u16>  00
+    Pillow's GIF saver always writes it (loop=0 default = infinite loop;
+    loop=N ≥ 1 is spec-ambiguous, treated as "play N+1 times" by Chrome/FF).
+    With no extension present, all major browsers play the animation exactly
+    once and stop on the final frame.
+    """
+    data = path.read_bytes()
+    marker = b"\x21\xFF\x0BNETSCAPE2.0"
+    idx = data.find(marker)
+    if idx == -1:
+        return False
+    # 11 bytes header + 3 sub-block-size + 1 sub-id + 2 loop count + 1 terminator
+    # But include the 3-byte extension prefix (21 FF 0B) at the start of the marker.
+    # marker itself is 14 bytes (21 FF 0B + "NETSCAPE2.0"). Then 3-byte sub-block
+    # (03 01 XX XX 00) = 5 more bytes. Total block = 19 bytes.
+    end = idx + len(marker) + 5
+    stripped = data[:idx] + data[end:]
+    path.write_bytes(stripped)
+    return True
+
+
 def export(gif_path: Path, stop_frame: int, output_path: Path) -> None:
     frames, durations = load_frames(gif_path)
 
@@ -74,23 +99,23 @@ def export(gif_path: Path, stop_frame: int, output_path: Path) -> None:
 
     kept_frames = frames[: stop_frame + 1]
     kept_durations = durations[: stop_frame + 1]
-    loop = 0
 
     kept_frames[0].save(
         output_path,
         save_all=True,
         append_images=kept_frames[1:] if len(kept_frames) > 1 else [],
         duration=kept_durations,
-        loop=loop,  # play once and freeze on the final frame in browsers
         disposal=2,
         optimize=False,
     )
+
+    stripped = strip_netscape_loop(output_path)
 
     total_ms = sum(kept_durations)
     print(f"Wrote {output_path}")
     print(f"  frames kept: {len(kept_frames)} (of {len(frames)})")
     print(f"  duration:    {total_ms} ms ({total_ms / 1000:.2f}s)")
-    print(f"  loop:        {loop} (browsers freeze on final frame)")
+    print(f"  loop ext:    {'stripped (browsers play once, freeze)' if stripped else 'not present (already play-once)'}")
 
 
 def main() -> None:

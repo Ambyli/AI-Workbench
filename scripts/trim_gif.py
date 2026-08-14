@@ -21,6 +21,7 @@ Two-step workflow:
 
 Requires Pillow (pip install pillow).
 """
+
 from __future__ import annotations
 
 import argparse
@@ -73,13 +74,14 @@ def export(gif_path: Path, stop_frame: int, output_path: Path) -> None:
 
     kept_frames = frames[: stop_frame + 1]
     kept_durations = durations[: stop_frame + 1]
+    loop = 0
 
     kept_frames[0].save(
         output_path,
         save_all=True,
         append_images=kept_frames[1:] if len(kept_frames) > 1 else [],
         duration=kept_durations,
-        loop=1,        # play once and freeze on the final frame in browsers
+        loop=loop,  # play once and freeze on the final frame in browsers
         disposal=2,
         optimize=False,
     )
@@ -88,7 +90,7 @@ def export(gif_path: Path, stop_frame: int, output_path: Path) -> None:
     print(f"Wrote {output_path}")
     print(f"  frames kept: {len(kept_frames)} (of {len(frames)})")
     print(f"  duration:    {total_ms} ms ({total_ms / 1000:.2f}s)")
-    print(f"  loop:        1 (browsers freeze on final frame)")
+    print(f"  loop:        {loop} (browsers freeze on final frame)")
 
 
 def main() -> None:

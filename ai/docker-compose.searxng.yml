@@ -25,9 +25,11 @@ services:
       # and are bind-mounted so edits don't require a rebuild.
       - ./searxng:/etc/searxng:rw
     # Wrapper: substitute $SEARXNG_SECRET into a writable copy of settings.yml
-    # under /tmp, point SEARXNG_SETTINGS_PATH at it, then hand off to the
-    # image's default entrypoint. Keeps the on-disk ai/searxng/settings.yml
-    # secret-free so it can stay tracked in git.
+    # under /tmp, point both __SEARXNG_SETTINGS_PATH (internal env used by the
+    # image's entrypoint + Python app) and SEARXNG_SETTINGS_PATH (historical
+    # alias) at it, then hand off to the image's default entrypoint. Keeps
+    # the on-disk ai/searxng/settings.yml secret-free so it can stay tracked
+    # in git.
     entrypoint:
       - /bin/sh
       - -c
@@ -38,8 +40,9 @@ services:
           exit 1
         fi
         sed "s|\$${SEARXNG_SECRET}|$$SEARXNG_SECRET|g" /etc/searxng/settings.yml > /tmp/searxng-settings.yml
+        export __SEARXNG_SETTINGS_PATH=/tmp/searxng-settings.yml
         export SEARXNG_SETTINGS_PATH=/tmp/searxng-settings.yml
-        exec /sbin/tini -- /usr/local/searxng/dockerfiles/docker-entrypoint.sh
+        exec /usr/local/searxng/entrypoint.sh
     cap_drop:
       - ALL
     cap_add:

@@ -41,6 +41,16 @@ services:
       # MCP handshake timeout (seconds). Raise if a registered MCP server
       # cold-starts slowly.
       MCP_INITIALIZE_TIMEOUT: "${OPENWEBUI_MCP_INITIALIZE_TIMEOUT}"
+
+      # Web search — backed by the searxng container on ai_shared. Only read
+      # on the first boot of a fresh openwebui_data volume; on an existing
+      # install, toggle via Admin Panel → Settings → Web Search. See
+      # ai/SEARXNG.md.
+      ENABLE_WEB_SEARCH: "${OPENWEBUI_ENABLE_WEB_SEARCH}"
+      WEB_SEARCH_ENGINE: "${OPENWEBUI_WEB_SEARCH_ENGINE}"
+      SEARXNG_QUERY_URL: "${OPENWEBUI_SEARXNG_QUERY_URL}"
+      WEB_SEARCH_RESULT_COUNT: "${OPENWEBUI_WEB_SEARCH_RESULT_COUNT}"
+      WEB_SEARCH_CONCURRENT_REQUESTS: "${OPENWEBUI_WEB_SEARCH_CONCURRENT_REQUESTS}"
     volumes:
       - openwebui_data:/app/backend/data
     healthcheck:

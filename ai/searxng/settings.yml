@@ -1,0 +1,28 @@
+use_default_settings: true
+
+general:
+  instance_name: "SearXNG (internal)"
+
+server:
+  # secret_key is a placeholder — the entrypoint wrapper in
+  # docker-compose.searxng.yml sed-substitutes the literal string
+  # `${SEARXNG_SECRET}` below with the value of the SEARXNG_SECRET env var
+  # at container startup, writing the materialized copy to
+  # /tmp/searxng-settings.yml (SEARXNG_SETTINGS_PATH) so the bind-mounted
+  # host file stays pristine and secret-free in git.
+  # Generate the value with `openssl rand -hex 32` and set it in .env.
+  secret_key: "${SEARXNG_SECRET}"
+  limiter: false
+  image_proxy: true
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  default_lang: ""
+  # JSON is off by default upstream; Open WebUI needs it to consume results.
+  formats:
+    - html
+    - json
+
+ui:
+  static_use_hash: true

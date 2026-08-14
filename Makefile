@@ -49,6 +49,7 @@ $(eval $(call service,oauth2-proxy,oauth2-proxy oauth2-assets))
 $(eval $(call service,cloudflared,cloudflared))
 $(eval $(call service,roofix,roofix))
 $(eval $(call service,interceptor,interceptor))
+$(eval $(call service,searxng,searxng))
 
 setup: network
 	cd widget && uv sync && cd ..

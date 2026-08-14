@@ -76,7 +76,6 @@ services:
       --reasoning-parser qwen3
       --enable-auto-tool-choice
       --tool-call-parser qwen3_coder
-      --num-scheduler-steps 8
       --speculative-config '{"method":"qwen3_next_mtp","num_speculative_tokens":2}'
       --default-chat-template-kwargs '{"enable_thinking": true,"preserve_thinking": true}'
 

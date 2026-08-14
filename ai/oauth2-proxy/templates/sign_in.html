@@ -33,12 +33,9 @@
     max-width: 100%;
     height: auto;
     margin-bottom: 28px;
-    /* Knocks out the GIF's solid white background so it blends with the dark
-       card. invert() flips dark-on-white → white-on-black, then screen blend
-       drops the black. Only correct for a monochrome logo — brand colors get
-       inverted too. */
-    filter: invert(1);
-    mix-blend-mode: screen;
+    background: #ffffff;
+    padding: 18px 24px;
+    border-radius: 10px;
   }
   h1 {
     font-size: 20px;

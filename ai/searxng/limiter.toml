@@ -1,0 +1,11 @@
+# SearXNG limiter/botdetection config.
+#
+# server.limiter in settings.yml is false, so most of this file's real
+# purpose (IP rate-limits, bot detection heuristics) is inert. The file
+# exists purely so SearXNG stops emitting
+#   WARNING: searx.botdetection.config: missing config file: /tmp/limiter.toml
+# on every startup. When we flip limiter on later, populate real values
+# per https://docs.searxng.org/admin/searx.limiter.html.
+
+[botdetection.ip_limit]
+# Placeholder — has no effect while server.limiter is false in settings.yml.

@@ -40,6 +40,9 @@ services:
           exit 1
         fi
         sed "s|\$${SEARXNG_SECRET}|$$SEARXNG_SECRET|g" /etc/searxng/settings.yml > /tmp/searxng-settings.yml
+        # SearXNG looks for limiter.toml next to settings.yml, so mirror ours
+        # from the bind mount into /tmp alongside the substituted settings.
+        [ -f /etc/searxng/limiter.toml ] && cp /etc/searxng/limiter.toml /tmp/limiter.toml
         export __SEARXNG_SETTINGS_PATH=/tmp/searxng-settings.yml
         export SEARXNG_SETTINGS_PATH=/tmp/searxng-settings.yml
         exec /usr/local/searxng/entrypoint.sh

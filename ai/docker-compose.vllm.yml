@@ -45,7 +45,7 @@ services:
       - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN}
       - VLLM_SLEEP_WHEN_IDLE=1
       - VLLM_USE_DEEP_GEMM=0
-      - VLLM_USE_FLASHINFER_SAMPLER=0
+      - VLLM_ATTENTION_BACKEND=FLASH_ATTN
     ports:
       - "${PORT_VLLM_QWEN}:8000"
     volumes:
@@ -68,14 +68,16 @@ services:
       --served-model-name qwen3.6
       --dtype auto
       --max-model-len 131072
-      --max-num-seqs 4
+      --max-num-seqs 3
       --gpu-memory-utilization 0.90
       --enable-prefix-caching
       --enable-chunked-prefill
-      --kv-cache-dtype fp8
+      --kv-cache-dtype auto
       --reasoning-parser qwen3
       --enable-auto-tool-choice
       --tool-call-parser qwen3_coder
+      --num-scheduler-steps 8
+      --speculative-config '{"method":"qwen3_next_mtp","num_speculative_tokens":2}'
       --default-chat-template-kwargs '{"enable_thinking": true,"preserve_thinking": true}'
 
   vllm-qwen-vl:

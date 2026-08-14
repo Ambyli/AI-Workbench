@@ -66,7 +66,6 @@ services:
     command: >
       cyankiwi/Qwen3.6-27B-AWQ-INT4
       --served-model-name qwen3.6
-      --quantization awq_marlin
       --dtype auto
       --max-model-len 65536
       --max-num-seqs 4

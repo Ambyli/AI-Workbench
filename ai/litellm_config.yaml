@@ -81,7 +81,22 @@ model_list:
   - model_name: qwen3.6
     litellm_params:
       model: openai/qwen3.6
-      api_base: http://vllm-qwen:8000/v1
+      api_base: http://qwen3.6:8000/v1
+      api_key: none
+      max_tokens: 81920
+      temperature: 0.6
+      top_p: 0.95
+      frequency_penalty: 0
+      presence_penalty: 0
+      extra_body:
+        top_k: 20
+        min_p: 0
+      stream_timeout: 300
+
+  - model_name: qwen3.8
+    litellm_params:
+      model: openai/qwen3.8
+      api_base: http://qwen3.8:8000/v1
       api_key: none
       max_tokens: 81920
       temperature: 0.6

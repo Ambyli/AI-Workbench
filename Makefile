@@ -40,7 +40,7 @@ endef
 
 $(eval $(call service,litellm,litellm))
 $(eval $(call service,unsloth,unsloth))
-$(eval $(call service,vllm,vllm-qwen vllm-qwen-vl))
+$(eval $(call service,vllm,qwen3.8 qwen3.6 vllm-qwen-vl))
 $(eval $(call service,kokoro,kokoro-app kokoro-api))
 $(eval $(call service,madlad,madlad-app madlad-api))
 $(eval $(call service,classifier,classifier))

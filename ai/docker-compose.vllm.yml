@@ -128,9 +128,6 @@ services:
     image: vllm/vllm-openai:latest
     container_name: vllm-qwen-vl
     restart: unless-stopped
-    depends_on:
-      vllm-qwen:
-        condition: service_healthy
     environment:
       - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN}
     ports:

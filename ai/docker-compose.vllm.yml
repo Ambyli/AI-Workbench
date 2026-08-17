@@ -46,7 +46,7 @@ services:
       - VLLM_USE_DEEP_GEMM=0
       - VLLM_ATTENTION_BACKEND=FLASH_ATTN
     ports:
-      - "${PORT_VLLM_QWEN}:8000"
+      - "${PORT_VLLM_QWEN38}:8000"
     volumes:
       - vllm_data:/root/.cache/huggingface
     deploy:
@@ -90,7 +90,7 @@ services:
       - VLLM_USE_DEEP_GEMM=0
       - VLLM_ATTENTION_BACKEND=FLASH_ATTN
     ports:
-      - "${PORT_VLLM_QWEN}:8000"
+      - "${PORT_VLLM_QWEN36}:8000"
     volumes:
       - vllm_data:/root/.cache/huggingface
     deploy:

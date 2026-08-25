@@ -65,9 +65,10 @@ services:
     command: >
       cyankiwi/Qwen3.8-27B-AWQ-INT4
       --served-model-name qwen3.8
+      --tensor-parallel-size 2
       --dtype auto
       --max-model-len 131072
-      --max-num-seqs 3
+      --max-num-seqs 16
       --gpu-memory-utilization 0.90
       --enable-prefix-caching
       --enable-chunked-prefill

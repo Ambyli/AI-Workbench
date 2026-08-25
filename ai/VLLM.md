@@ -86,6 +86,31 @@ Then hit it at `localhost:8004` with `"model": "mistral"` in the request body.
 
 **Guidelines for `--gpu-memory-utilization`:** controls how much of the GPU VRAM vLLM reserves. Lower values leave room for other containers. If you get OOM errors, try `0.7` or `0.8`.
 
+### Tensor parallelism (splitting one model across multiple GPUs)
+
+To run a single model across multiple GPUs for lower latency and larger KV cache, add `--tensor-parallel-size N` to the `command` and **set `shm_size`** on the service:
+
+```yaml
+  qwen3.8:
+    image: vllm/vllm-openai:latest
+    container_name: qwen3.8
+    restart: unless-stopped
+    shm_size: '8gb'          # required for TP > 1
+    # ...
+    command: >
+      cyankiwi/Qwen3.8-27B-AWQ-INT4
+      --tensor-parallel-size 2
+      # ...
+```
+
+**Why `shm_size` is required:** vLLM's tensor-parallel workers coordinate through POSIX shared memory (`/dev/shm`). Docker's default is 64 MiB, which is too small — startup fails with `RuntimeError: Insufficient space in /dev/shm`. `shm_size: '8gb'` gives the container an isolated tmpfs (lazy-allocated, so you only pay for what's actually used).
+
+**Why not `ipc: host`:** it works but shares the host's entire IPC namespace, breaking container isolation and coupling every TP container to the host's shm. `shm_size` is the isolated, security-scan-friendly equivalent — same performance, no coupling.
+
+**Picking TP size:** must divide **both** the model's `num_attention_heads` and `num_key_value_heads`. GQA models often have only 4–8 KV heads, so TP=3 typically fails even when TP=2 and TP=4 work. Check the model's `config.json` before choosing. A6000s support NVLink only in 2-way pairs — TP=2 across an NVLinked pair scales close to linearly; higher TP over PCIe scales sub-linearly.
+
+**One `shm_size` per replica:** if you run multiple containers (data parallel), each needs its own `shm_size` line — they don't share.
+
 ### Removing a model
 
 Delete the corresponding service block from `ai/docker-compose.vllm.yml`, then:

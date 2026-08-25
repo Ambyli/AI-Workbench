@@ -40,6 +40,7 @@ services:
     image: vllm/vllm-openai:latest
     container_name: qwen3.8
     restart: unless-stopped
+    shm_size: '8gb'
     environment:
       - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN}
       - VLLM_SLEEP_WHEN_IDLE=1

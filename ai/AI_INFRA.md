@@ -38,6 +38,7 @@ Every service in the list below is on the `ai_shared` network unless noted. Port
 | [`docker-compose.roofix.yml`](docker-compose.roofix.yml) | `roofix` | _(internal only)_ | [ROOFIX.md](ROOFIX.md) |
 | [`docker-compose.interceptor.yml`](docker-compose.interceptor.yml) | `interceptor` | _(internal only)_ | [INTERCEPTOR.md](INTERCEPTOR.md) |
 | [`docker-compose.searxng.yml`](docker-compose.searxng.yml) | `searxng` | `8009` | [SEARXNG.md](SEARXNG.md) |
+| [`docker-compose.sandbox.yml`](docker-compose.sandbox.yml) | `sandbox-runner`, `sandbox-proxy`, `sandbox-egress`, `sandbox-db` | `8012` (runner), `8011` (proxy), `5434` (db) | [SANDBOX.md](SANDBOX.md) |
 
 ## Flow diagram
 
@@ -107,6 +108,13 @@ flowchart TB
     subgraph SXG["docker-compose.searxng.yml"]
         SX["searxng<br/>:8009"]:::svc
     end
+    subgraph SBG["docker-compose.sandbox.yml<br/>(network-segmented)"]
+        SBR["sandbox-runner<br/>:8012<br/>FastAPI + MCP + docker.sock"]:::svc
+        SBP["sandbox-proxy<br/>:8011<br/>Caddy /{id}/*"]:::svc
+        SBE["sandbox-egress<br/>internal<br/>tinyproxy allowlist"]:::svc
+        SBD[("sandbox-db<br/>postgres :5434<br/>sandbox_state net")]:::store
+        SBX["sandbox-{id}<br/>ephemeral<br/>sandbox_net only"]:::standalone
+    end
 
     Browser --> CF --> O2P --> OWU
     O2P -->|"/assets/* (skip-auth)"| OA
@@ -144,6 +152,14 @@ flowchart TB
     OWU  ==>|"web search"| SX
     SX   -. HTTPS .-> SearchEngines
 
+    LL   -.->|MCP registration| SBR
+    OWU  ==>|"iframe artifact"| SBP
+    SBP  -->|"sandbox_net"| SBX
+    SBR  -->|"docker.sock<br/>spawn/reap"| SBX
+    SBR  -->|"sql (sandbox_state)"| SBD
+    SBX  -->|"HTTP_PROXY"| SBE
+    SBE  -. allowlisted HTTPS .-> HF
+
     KAPP -. model download .-> HF
     MAPP -. model download .-> HF
     VQ   -. model download .-> HF
@@ -163,6 +179,7 @@ flowchart TB
 - **Gmail MCP is a passthrough, not a proxied identity** — the `LL -.-> GmailMCP` edge uses LiteLLM's `delegate_auth_to_upstream: true` mode. LiteLLM only advertises the endpoint; the OAuth 2.1 flow runs end-to-end between Open WebUI and `gmailmcp.googleapis.com` per user, and LiteLLM forwards the resulting `Authorization: Bearer` header untouched. Users must enable the Gmail tool per-chat (it cannot be a default-enabled tool on a model, because the OAuth browser redirect cannot happen mid-completion).
 - **Interceptor API is a generic CDP capture service** — `interceptor` wraps `common.cdp_interceptor` behind an HTTP + MCP surface. Callers pass a URL and a list of URL regex patterns; the service navigates a headless Chrome under a named `--user-data-dir` and returns the JSON XHR/fetch bodies whose URLs matched. LiteLLM exposes it both as an MCP tool (`interceptor.capture_url`) and as a `/v1/interceptor/*` pass-through. Auth is per-profile: operators refresh a profile by uploading a `.tgz` of a captured Chrome user-data-dir to `POST /profiles/{name}/refresh`. Concurrent captures are serialized (409 on collision) because a single container binds one CDP debug port.
 - **SearXNG is Open WebUI's web-search backend, not LiteLLM's** — when a user toggles web search on in the chat composer, Open WebUI calls `http://searxng:8080/search?format=json` server-side, injects the top-N results into the prompt, and only *then* dispatches to LiteLLM. Models never call SearXNG directly, and it is not registered as an MCP tool. SearXNG fans out to public search engines (Google, Bing, DuckDuckGo, …) with no API key of its own — see [SEARXNG.md](SEARXNG.md).
+- **Sandbox subsystem is deliberately off `ai_shared`** — unlike every other product, the sandbox stack (`sandbox-runner`, `sandbox-proxy`, `sandbox-egress`, `sandbox-db`, and every spawned `sandbox-{id}` container) runs on two additional Docker networks: `sandbox_net` (bridge, `internal: true`) and `sandbox_state` (bridge, `internal: true`). Because the model-generated code inside a sandbox is untrusted, sandboxes MUST NOT be able to reach `litellm`, `phoenix-mcp`, `roofix-db`, `interceptor`, etc. `sandbox-runner` is the only container that straddles all three networks — it's the audit boundary and the single privileged consumer of `/var/run/docker.sock`. `sandbox-proxy` (Caddy) bridges `ai_shared → sandbox_net` so Open WebUI can iframe `http://sandbox-proxy/{id}/`. Outbound HTTP from sandboxes is forced through `sandbox-egress` (tinyproxy) with a hard-coded destination allowlist (pypi, npmjs, esm.sh, jsdelivr) — everything else drops. `sandbox-db` sits on `sandbox_state` alone so a container-escape in a sandbox cannot tamper with the job store. See [SANDBOX.md](SANDBOX.md) for the security-invariant checklist that must be re-verified on every change to the subsystem.
 
 ## Ports at a glance
 
@@ -183,3 +200,6 @@ Ports are sourced from `.env` (`PORT_*` variables). Defaults shown; change them 
 | classifier | `8005` |
 | unsloth (Jupyter / model / SSH) | `8888` / `8000` / `22` |
 | searxng | `8009` |
+| sandbox-proxy | `8011` |
+| sandbox-runner | `8012` |
+| sandbox-db (postgres) | `5434` |

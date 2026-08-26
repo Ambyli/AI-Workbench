@@ -1,0 +1,209 @@
+# Sandbox subsystem — interactive app previews for OpenWebUI.
+#
+# Runs untrusted, model-generated code in short-lived containers whose only
+# reachable neighbors are (a) sandbox-proxy in front, (b) sandbox-egress
+# for allowlisted internet, and NOTHING else on the stack. Security is
+# enforced by network segmentation, not by trusting the sandbox process.
+#
+# Three networks (see ai/SANDBOX.md § Network topology for the diagram):
+#
+#   shared        (external, ai_shared)     openwebui / litellm ↔ runner + proxy
+#   sandbox_net   (bridge, internal: true)  runner ↔ proxy ↔ sandboxes ↔ egress
+#   sandbox_state (bridge, internal: true)  runner ↔ sandbox-db (nothing else)
+#
+# `internal: true` on the two private networks means Docker does not attach
+# a default gateway. A sandbox that tries to hit the host or the internet
+# directly has no route; it MUST go through sandbox-egress or nowhere.
+#
+# See ai/SANDBOX.md for the operator runbook and the security-invariant
+# checklist that must be verified after any change here.
+
+networks:
+  shared:
+    external: true
+    name: ai_shared
+  sandbox_net:
+    driver: bridge
+    internal: true
+    name: sandbox_net
+  sandbox_state:
+    driver: bridge
+    internal: true
+    name: sandbox_state
+
+services:
+  # ── State store ─────────────────────────────────────────────────────────
+  # Postgres backing the runner's PostgresRegistry. On sandbox_state only —
+  # not reachable from ai_shared (nothing else needs it) or sandbox_net
+  # (sandboxed code must not tamper with job state). Only sandbox-runner
+  # bridges to this network.
+  #
+  # Host port is published for operator inspection (psql / DBeaver). The
+  # port only exposes the DB on the host loopback — remove the ports: block
+  # entirely if this ever runs on a machine with an untrusted network.
+  sandbox-db:
+    image: postgres:16-alpine
+    container_name: sandbox-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${SANDBOX_DB_USER:-sandbox}
+      POSTGRES_PASSWORD: ${SANDBOX_DB_PASSWORD:-sandbox}
+      POSTGRES_DB: ${SANDBOX_DB_NAME:-sandbox}
+    volumes:
+      - sandbox_db_data:/var/lib/postgresql/data
+    ports:
+      - "${PORT_SANDBOX_DB:-5434}:5432"
+    networks:
+      - sandbox_state
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${SANDBOX_DB_USER:-sandbox}"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ── Ingress reverse proxy ───────────────────────────────────────────────
+  # Caddy. Dual-homed on ai_shared (so openwebui can iframe it) and
+  # sandbox_net (so it can reach the spawned sandbox-{id} containers by
+  # Docker DNS). Statically routes /{sandbox_id}/* to sandbox-{id}:80 —
+  # base images normalize their app port to 80 so Caddy needs no dynamic
+  # config. WebSocket upgrades are default in Caddy (Streamlit + Vite HMR).
+  #
+  # The Caddyfile strips X-Frame-Options and rewrites CSP so OpenWebUI can
+  # embed the served page in an iframe. See ai/sandbox/Caddyfile.
+  sandbox-proxy:
+    image: caddy:2-alpine
+    container_name: sandbox-proxy
+    restart: unless-stopped
+    ports:
+      - "${PORT_SANDBOX_PROXY:-8011}:80"
+    volumes:
+      - ./sandbox/Caddyfile:/etc/caddy/Caddyfile:ro
+      - sandbox_proxy_data:/data
+      - sandbox_proxy_config:/config
+    networks:
+      - shared
+      - sandbox_net
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:80/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ── Allowlist egress proxy ──────────────────────────────────────────────
+  # tinyproxy running on sandbox_net only. Sandboxed containers set
+  # HTTP_PROXY / HTTPS_PROXY to this container; everything else is
+  # unreachable because sandbox_net has no default gateway.
+  #
+  # The allowlist lives in sandbox/tinyproxy.filter — pypi, files.pythonhosted,
+  # registry.npmjs.org, esm.sh, cdn.jsdelivr.net. Add domains there, not here.
+  sandbox-egress:
+    image: dannydirect/tinyproxy:latest
+    container_name: sandbox-egress
+    restart: unless-stopped
+    command: ["ANY"]  # Config in mounted tinyproxy.conf overrides this
+    volumes:
+      - ./sandbox/tinyproxy.conf:/etc/tinyproxy/tinyproxy.conf:ro
+      - ./sandbox/tinyproxy.filter:/etc/tinyproxy/filter:ro
+    networks:
+      - sandbox_net
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8888/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ── Runner: FastAPI + MCP + docker-sock spawner ─────────────────────────
+  # The single privileged component. Talks OpenWebUI / LiteLLM on ai_shared,
+  # sandbox-db on sandbox_state, sandbox-proxy + spawned sandboxes on
+  # sandbox_net. Uses /var/run/docker.sock to spawn short-lived sandbox
+  # containers — this is the audit boundary; nothing else in the sandbox
+  # subsystem has any Docker API access.
+  sandbox-runner:
+    build:
+      context: ..
+      dockerfile: ai/Dockerfile.sandbox-runner
+    container_name: sandbox-runner
+    restart: unless-stopped
+    ports:
+      - "${PORT_SANDBOX_RUNNER:-8012}:8000"
+    environment:
+      - DEBUG_LOGGING=${DEBUG_LOGGING:-false}
+      # Concurrency and lifetime.
+      - SANDBOX_MAX_CONCURRENT=${SANDBOX_MAX_CONCURRENT:-8}
+      - SANDBOX_DEFAULT_TTL_SECONDS=${SANDBOX_DEFAULT_TTL_SECONDS:-900}
+      - SANDBOX_HARD_TTL_SECONDS=${SANDBOX_HARD_TTL_SECONDS:-3600}
+      # Networks the runner will attach spawned sandboxes to. Must exist.
+      - SANDBOX_NET_NAME=sandbox_net
+      # Where the runner tells sandboxes to send outbound HTTP.
+      - SANDBOX_EGRESS_URL=http://sandbox-egress:8888
+      # Public URL prefix used to build the returned preview URL.
+      # openwebui reaches this via ai_shared: http://sandbox-proxy:80
+      - SANDBOX_PROXY_URL=http://sandbox-proxy
+      # PostgresRegistry DSN. Runner assembles it from the parts below if
+      # SANDBOX_DB_DSN isn't set explicitly.
+      - SANDBOX_DB_HOST=sandbox-db
+      - SANDBOX_DB_PORT=5432
+      - SANDBOX_DB_USER=${SANDBOX_DB_USER:-sandbox}
+      - SANDBOX_DB_PASSWORD=${SANDBOX_DB_PASSWORD:-sandbox}
+      - SANDBOX_DB_NAME=${SANDBOX_DB_NAME:-sandbox}
+      - LOG_DIR=/data
+    volumes:
+      # Read-write socket mount — runner spawns and destroys containers.
+      # Do NOT expose this container to the internet.
+      - /var/run/docker.sock:/var/run/docker.sock
+      - sandbox_runner_data:/data
+    networks:
+      - shared
+      - sandbox_net
+      - sandbox_state
+    depends_on:
+      sandbox-db:
+        condition: service_healthy
+      sandbox-proxy:
+        condition: service_started
+      sandbox-egress:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+  # ── Base images for spawned sandboxes ───────────────────────────────────
+  # These are NOT long-running services — they exist so `docker compose
+  # --profile build build` produces the tagged images the runner references
+  # from runtimes.py (sandbox-static:latest, sandbox-python:latest,
+  # sandbox-node:latest). Nothing here is started with `up`.
+  #
+  # Rebuild after editing a base Dockerfile:
+  #   docker compose -f ai/docker-compose.sandbox.yml --profile build build
+  sandbox-static-image:
+    profiles: ["build"]
+    image: sandbox-static:latest
+    build:
+      context: ..
+      dockerfile: ai/Dockerfile.sandbox-static
+    command: ["true"]
+
+  sandbox-python-image:
+    profiles: ["build"]
+    image: sandbox-python:latest
+    build:
+      context: ..
+      dockerfile: ai/Dockerfile.sandbox-python
+    command: ["true"]
+
+  sandbox-node-image:
+    profiles: ["build"]
+    image: sandbox-node:latest
+    build:
+      context: ..
+      dockerfile: ai/Dockerfile.sandbox-node
+    command: ["true"]
+
+volumes:
+  sandbox_db_data:
+  sandbox_runner_data:
+  sandbox_proxy_data:
+  sandbox_proxy_config:

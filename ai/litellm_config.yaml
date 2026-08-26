@@ -33,6 +33,11 @@ general_settings:
       include_subpath: true
       methods: ["GET", "POST"]
       forward_headers: true
+    - path: "/v1/sandbox"
+      target: "http://sandbox-runner:8000"
+      include_subpath: true
+      methods: ["GET", "POST", "DELETE"]
+      forward_headers: true
 
 mcp_servers:
   kokoro_tts:
@@ -45,6 +50,10 @@ mcp_servers:
 
   interceptor:
     url: http://interceptor:8080/mcp
+    transport: "http"
+
+  sandbox:
+    url: http://sandbox-runner:8000/mcp
     transport: "http"
 
   phoenix:

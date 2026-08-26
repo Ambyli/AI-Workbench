@@ -20,6 +20,7 @@ $(eval $(call service,cloudflared,cloudflared))
 $(eval $(call service,roofix,roofix))
 $(eval $(call service,interceptor,interceptor))
 $(eval $(call service,searxng,searxng))
+$(eval $(call service,sandbox,sandbox-db sandbox-egress sandbox-proxy sandbox-runner))
 
 # Parse positional args: first goal is the verb, remaining goals are:
 #   $(STACK) — compose stack name (optional; empty = all stacks)

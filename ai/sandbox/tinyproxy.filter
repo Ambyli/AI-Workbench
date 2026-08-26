@@ -1,0 +1,26 @@
+# sandbox-egress destination allowlist (extended regex, one per line).
+#
+# Every request from a sandboxed container is filtered against this list.
+# If none of these patterns match the destination hostname, tinyproxy
+# returns 403 and no bytes leave sandbox_net.
+#
+# Update by adding a new anchored regex line. Anchor with ^ and $ or a
+# trailing dot-domain match so a typosquat like `pypi.org.attacker.com`
+# is not accepted.
+#
+# Do NOT list the wildcard `.*` here — that would defeat the entire
+# egress model. If a sandbox needs a domain not on this list, the correct
+# fix is to add the specific domain, not to widen the allowlist.
+
+# Python — package index and file host.
+^pypi\.org$
+^files\.pythonhosted\.org$
+^pythonhosted\.org$
+
+# Node — official registry (npmjs) and the widely-used esm.sh CDN for
+# browser-ESM React imports (used by static/single-file React demos).
+^registry\.npmjs\.org$
+^esm\.sh$
+
+# General web CDN commonly needed for React / Vite templates — jsdelivr.
+^cdn\.jsdelivr\.net$

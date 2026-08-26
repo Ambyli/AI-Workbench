@@ -111,6 +111,34 @@ To run a single model across multiple GPUs for lower latency and larger KV cache
 
 **One `shm_size` per replica:** if you run multiple containers (data parallel), each needs its own `shm_size` line — they don't share.
 
+### Custom chat template — qwen3.8
+
+The `qwen3.8` service loads a patched chat template from `ai/config/qwen_fixed_chat_template.jinja`, sourced from [froggeric/Qwen-Fixed-Chat-Templates](https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates). It fixes known bugs in the stock Qwen 3.5/3.6/3.8 templates, most notably:
+
+- **Duplicate blank `<think>` blocks** in conversation history that caused the model to lose reasoning state and re-think from scratch until it hit the token limit.
+- **`enable_thinking=false` crash** on Qwen 3.8.
+- **Runaway token budget** from the `reasoning_effort=xhigh` default (fixed template defaults to `medium`; callers can override per-request).
+- **KV-cache invalidation** on multi-turn reasoning conversations.
+
+Applied via a bind mount and the `--chat-template` flag:
+
+```yaml
+  qwen3.8:
+    # ...
+    volumes:
+      - vllm_data:/root/.cache/huggingface
+      - ./config/qwen_fixed_chat_template.jinja:/config/qwen_fixed_chat_template.jinja:ro
+    command: >
+      # ...
+      --chat-template /config/qwen_fixed_chat_template.jinja
+```
+
+**Updating the template:** re-download the raw file over the existing `ai/config/qwen_fixed_chat_template.jinja` and restart the container. No compose changes needed.
+
+**Reasoning effort:** the fixed template's default is `medium`. To bump it globally, add `--default-chat-template-kwargs '{"reasoning_effort":"xhigh"}'` to the command; to bump per-request, pass `{"reasoning_effort": "xhigh"}` in the client JSON body.
+
+**qwen3.6 uses the stock template.** If it exhibits the same thinking-loop symptoms, mount and apply the same file.
+
 ### Removing a model
 
 Delete the corresponding service block from `ai/docker-compose.vllm.yml`, then:

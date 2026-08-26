@@ -16,7 +16,7 @@ services:
   #   ports:
   #     - "${PORT_LLAMA_SOME_MODEL}:8000"
   #   volumes:
-  #     - llama_data:/root/.cache/llama.cpp
+  #     - llama_data:/root/.cache/huggingface
   #   runtime: nvidia
   #   deploy:
   #     resources:
@@ -45,7 +45,7 @@ services:
     ports:
       - "${PORT_LLAMA_GLM52}:8000"
     volumes:
-      - llama_data:/root/.cache/llama.cpp
+      - llama_data:/root/.cache/huggingface
     runtime: nvidia
     deploy:
       resources:
@@ -66,14 +66,12 @@ services:
       --host 0.0.0.0 --port 8000
       -ngl 999
       --tensor-split 1,1,1
-      --n-cpu-moe 20
+      --n-cpu-moe 45
       -c 32768
       --cache-type-k q4_0
       --cache-type-v q4_0
       --flash-attn on
       --jinja
-      --mlock
-      --no-mmap
 
 volumes:
   llama_data:

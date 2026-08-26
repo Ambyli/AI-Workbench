@@ -113,7 +113,7 @@ model_list:
       model: openai/glm5.2
       api_base: http://glm5.2:8000/v1
       api_key: none
-      max_tokens: 16384
+      max_tokens: 32768
       temperature: 1.0
       top_p: 0.95
       frequency_penalty: 0

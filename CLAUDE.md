@@ -59,6 +59,12 @@ Key variables:
 | `ROOFIX_PROFILE_NAME` | `roofix` | Named profile inside interceptor holding Roofix session cookies |
 | `INTERCEPTOR_PROFILES_ROOT` | `/data/profiles` | interceptor: root under which named `--user-data-dir` profiles live |
 | `INTERCEPTOR_MAX_CONCURRENT` | `8` | interceptor: max simultaneous `/capture` calls (port pool size). Each slot ≈ one Chrome + optional profile clone — see `ai/INTERCEPTOR.md § Resource sizing` |
+| `SANDBOX_MAX_CONCURRENT` | `8` | Sandbox: max simultaneous running sandboxes (`sandbox-runner` returns 429 past this). Each slot ≈ 512 MB RAM + 1 CPU + base-image disk footprint. |
+| `SANDBOX_DEFAULT_TTL_SECONDS` | `900` | Sandbox: default idle TTL. Model can request shorter per-`preview_app`, cannot request longer than `SANDBOX_HARD_TTL_SECONDS`. |
+| `SANDBOX_HARD_TTL_SECONDS` | `3600` | Sandbox: absolute cap on sandbox lifetime. Reaper (`ai/sandbox/reaper.py`) sweeps expired containers every 60s. |
+| `SANDBOX_EGRESS_ALLOWLIST` | _(empty)_ | Sandbox: additive to `ai/sandbox/tinyproxy.filter`. Prefer editing the filter file (source of truth); use this only for per-deployment tweaks. |
+| `SANDBOX_DB_USER` / `_PASSWORD` / `_NAME` | `sandbox` / `sandbox` / `sandbox` | Sandbox: credentials for the compose-managed `sandbox-db` Postgres backing `PostgresRegistry`. Same dev-default guidance as `ROOFIX_DB_*` — override before exposing anything past `sandbox_state`. |
+| `PORT_SANDBOX_RUNNER` / `_PROXY` / `_DB` | `8012` / `8011` / `5434` | Sandbox: host ports. Runner is FastAPI + MCP; proxy is Caddy serving `/{sandbox_id}/*`; db is a Postgres exposed for operator inspection. Postgres ports are grouped: `5432` (litellm_db), `5433` (roofix-db), `5434` (sandbox-db). |
 
 ## Threading Model — Read Before Touching Anything
 
@@ -191,6 +197,17 @@ curl -X POST https://phoenix-mcp.com/api-token \
 - **Session refresh is a manual operator flow**: the scraper cannot present a login UI. Run `save_roofix_session.py` locally on a laptop with a visible browser, then POST the resulting JSON to the scraper's `/session/refresh`.
 - **Michael's mapping**: `ai/roofix/config/field_mapping.json` is a stub. Milestone writes will log "no milestone mapping" and skip until the file is filled in — this is intentional.
 
+## Sandbox subsystem
+
+`ai/sandbox/` runs untrusted, model-generated web apps (Streamlit, Gradio, Flask, FastAPI, Vite+React, Next, Express, static HTML) in short-lived isolated containers and exposes them to Open WebUI as iframe artifacts — the "artifacts panel" pattern, but for anything a real runtime can run. `sandbox-runner` is FastAPI + FastMCP; the model calls `preview_app(runtime, files, entrypoint)` via LiteLLM's MCP registration and gets back a URL to iframe. See [`ai/SANDBOX.md`](ai/SANDBOX.md) for the operator guide. A few things worth calling out here:
+
+- **Network segmentation is the primary security control, not container hardening.** The subsystem uses THREE Docker networks: `ai_shared` (external, so openwebui/litellm can reach the runner + proxy), `sandbox_net` (bridge, `internal: true` — sandboxed containers + the egress proxy), and `sandbox_state` (bridge, `internal: true` — runner ↔ sandbox-db only). `internal: true` means Docker attaches no default gateway; a sandbox that tries to reach `litellm:4000` or `phoenix-mcp` gets no route. If you add a service to `ai/docker-compose.sandbox.yml`, keep the network memberships minimal and re-run the security-invariant checklist in SANDBOX.md.
+- **`sandbox-runner` is the only container with `docker.sock` access.** It's the audit boundary. Any code that opens the socket must live in `ai/sandbox/spawner.py` — that's the review focal point.
+- **Egress is allowlisted, not blocked-by-default.** `sandbox-egress` (tinyproxy) reads [`ai/sandbox/tinyproxy.filter`](ai/sandbox/tinyproxy.filter) with `FilterDefaultDeny Yes`. Adding a new dep source is a filter-file edit + `docker compose restart sandbox-egress`. Never add `.*` — that defeats the model.
+- **Base image port is always 80.** All runtime templates in `ai/sandbox/runtimes.py` bind port 80 so `sandbox-proxy` (Caddy) can statically route `/{sandbox_id}/* → sandbox-{id}:80` with no dynamic config. Adding a new runtime that listens on something else means also adding dynamic Caddy admin-API management — don't unless you have to.
+- **Job state is Postgres (`sandbox-db`), not SQLite.** Concurrent writers, JSONB metadata for operator queries via `psql`, and the DB lives on its own `sandbox_state` network so a container escape in a sandbox can't tamper with job records. `common.jobs.PostgresRegistry` is the reusable backend — any future service that wants Postgres-backed jobs can adopt it.
+- **Idle-TTL enforcement is a known follow-up.** `SANDBOX_HARD_TTL_SECONDS` is enforced by the reaper; `SANDBOX_DEFAULT_TTL_SECONDS` is currently stored on the job record but not yet acted on. Sandboxes get torn down at hard-TTL or on `DELETE /jobs/{id}`, not on idle timeout.
+
 ## Shared Python code
 
 Any Python package or module that could plausibly be reused across multiple projects — current or future — MUST live in `shared/common/`, not in the project directory that first needs it. This includes: scraping / CDP / browser helpers, MCP protocol clients, LiteLLM / model client wrappers, env + logging boilerplate, and cross-cutting utilities.
@@ -206,7 +223,7 @@ Adding a new capability to `shared/common/`: create the subpackage under `shared
 - `common.env` — walk-up `.env` loader
 - `common.logging_setup` — CSV audit logger + stdlib configuration
 - `common.processed_store` — Gmail message-id dedup cache (used by `roofix`)
-- `common.jobs` — id-addressable job tracking with two backends: `InMemoryRegistry` (sync, ephemeral — used by `interceptor`) and `SqliteRegistry` (async, persistent — used by `classifier`), plus a `build_router` FastAPI factory for the standard `GET /jobs`, `GET /jobs/{id}`, `POST /jobs/{id}/cancel`, `DELETE /jobs/{id}` endpoints. See [`shared/common/src/common/jobs/__init__.py`](shared/common/src/common/jobs/__init__.py) for backend selection guidance.
+- `common.jobs` — id-addressable job tracking with three backends: `InMemoryRegistry` (sync, ephemeral — used by `interceptor`), `SqliteRegistry` (async, `aiosqlite`, persistent — used by `classifier`), and `PostgresRegistry` (async, `asyncpg`, persistent, JSONB metadata, real connection pool — used by `sandbox`). Plus a `build_router` FastAPI factory for the standard `GET /jobs`, `GET /jobs/{id}`, `POST /jobs/{id}/cancel`, `DELETE /jobs/{id}` endpoints (auto-detects sync vs async). See [`shared/common/src/common/jobs/__init__.py`](shared/common/src/common/jobs/__init__.py) for backend selection guidance.
 
 ## AI Infrastructure — Compose Topology
 

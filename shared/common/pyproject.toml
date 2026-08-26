@@ -13,7 +13,9 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pytest>=8",
+    "pytest-asyncio",    # for tests/test_jobs_postgres.py (asyncpg is async-native)
     "aiosqlite",         # for tests/test_jobs_sqlite.py
+    "asyncpg",           # for tests/test_jobs_postgres.py
     "fastapi",           # for tests/test_jobs_router.py
     "httpx",             # transitive: FastAPI's TestClient
     "pydantic",          # transitive: model.py — most consumers already have it

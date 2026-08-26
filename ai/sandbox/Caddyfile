@@ -1,0 +1,48 @@
+# sandbox-proxy — ingress reverse proxy for the sandbox subsystem.
+#
+# Routes /{sandbox_id}/*  → sandbox-{sandbox_id}:80  on the sandbox_net
+# network. Base images normalize their app port to 80, so no dynamic
+# config is needed at spawn time — Docker DNS resolves the target and
+# Caddy proxies straight through.
+#
+# WebSocket upgrades work by default; Streamlit and Vite HMR rely on this.
+#
+# The header manipulation below is what lets OpenWebUI iframe the served
+# page. Sites that ship X-Frame-Options: DENY or a restrictive CSP would
+# otherwise refuse to render in the chat panel.
+
+{
+	# Silence the automatic HTTPS attempt — we're plain HTTP behind the
+	# openwebui iframe, and the admin API is not exposed to sandbox_net.
+	auto_https off
+	admin off
+}
+
+:80 {
+	# Health probe target for the compose healthcheck.
+	handle /health {
+		respond "ok" 200
+	}
+
+	# Match /<12-char hex>/... — the runner's job_id format.
+	@sandbox path_regexp sandbox ^/(?P<id>[a-f0-9]{12})(/.*)?$
+	handle @sandbox {
+		# Strip the /{id} prefix before forwarding so the sandbox app
+		# sees requests at "/". Streamlit and Vite both assume they own
+		# the root by default; asking users to configure a base path
+		# would break the "just paste the code" UX.
+		uri strip_prefix /{re.sandbox.id}
+
+		reverse_proxy sandbox-{re.sandbox.id}:80 {
+			# Drop headers that prevent the served page from being
+			# framed by OpenWebUI. `header_down -X` removes an
+			# upstream response header.
+			header_down -X-Frame-Options
+			header_down -Content-Security-Policy
+			header_down Content-Security-Policy "frame-ancestors *"
+		}
+	}
+
+	# Anything else — no sandbox matched. Do NOT act as an open proxy.
+	respond "sandbox not found" 404
+}

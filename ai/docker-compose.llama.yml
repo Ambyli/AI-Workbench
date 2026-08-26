@@ -66,7 +66,10 @@ services:
       --host 0.0.0.0 --port 8000
       -ngl 999
       --tensor-split 1,1,1
-      -ot "blk\.([0-9]|[1-5][0-9]|6[0-3])\.ffn_(gate|down|up)_exps\.=CPU"
+      -ot "blk\.([0-9]|[12][0-9]|3[0-8])\.ffn_(gate|down|up)_exps\.=CPU"
+      -ot "blk\.(39|4[0-9]|5[01])\.ffn_(gate|down|up)_exps\.=CUDA0"
+      -ot "blk\.(5[2-9]|6[0-4])\.ffn_(gate|down|up)_exps\.=CUDA1"
+      -ot "blk\.(6[5-9]|7[0-7])\.ffn_(gate|down|up)_exps\.=CUDA2"
       -c 32768
       --cache-type-k q4_0
       --cache-type-v q4_0

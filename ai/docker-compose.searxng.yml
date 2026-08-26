@@ -5,7 +5,7 @@ networks:
 
 services:
   searxng:
-    # Pinned release tag. Bump this line and run `make build-searxng` to
+    # Pinned release tag. Bump this line and run `make build searxng` to
     # update. Use `:latest` for the rolling upstream tag.
     image: docker.io/searxng/searxng:latest
     networks:

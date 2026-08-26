@@ -16,7 +16,7 @@ Browser  →  Cloudflare (TLS)  →  cloudflared tunnel  →  oauth2-proxy:4180 
 ### Quick start
 
 ```bash
-make up-oauth2-proxy
+make up oauth2-proxy
 ```
 
 Or explicitly:
@@ -106,7 +106,7 @@ The email in `OAUTH2_PROXY_GOOGLE_ADMIN_EMAIL` is the identity the service accou
 3. Toggle **Super Admin** on → **Save**.
 4. Wait ~30 seconds for propagation before retrying a login.
 
-If the account you *want* to use isn't Super Admin and elevating it isn't acceptable, pick a different existing Super Admin (or create a dedicated `oauth2-proxy-svc@yourdomain.com` Super Admin) and update `OAUTH2_PROXY_GOOGLE_ADMIN_EMAIL` in `.env`, then `make clean-oauth2-proxy && make up-oauth2-proxy`.
+If the account you *want* to use isn't Super Admin and elevating it isn't acceptable, pick a different existing Super Admin (or create a dedicated `oauth2-proxy-svc@yourdomain.com` Super Admin) and update `OAUTH2_PROXY_GOOGLE_ADMIN_EMAIL` in `.env`, then `make clean oauth2-proxy && make up oauth2-proxy`.
 
 ### 3. Access group
 
@@ -289,10 +289,10 @@ If a single-sign-on experience is desired, Open WebUI can be switched to trusted
 
 ```bash
 # Follow oauth2-proxy logs
-make logs-oauth2-proxy
+make logs oauth2-proxy
 
 # Restart after config change
-make clean-oauth2-proxy && make up-oauth2-proxy
+make clean oauth2-proxy && make up oauth2-proxy
 
 # Verify the container can reach Open WebUI over the shared network
 docker exec oauth2-proxy wget -qO- http://openwebui:8080/health

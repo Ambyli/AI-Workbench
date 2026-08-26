@@ -148,7 +148,7 @@ Wipe the directory. On next launch a fresh profile is created.
 Remove-Item -Recurse -Force "C:\Users\<you>\.zeo\roofix_profile"
 ```
 
-For Docker services: `docker compose down -v` (or the appropriate `make very-clean-<service> CONFIRM=yes`) removes the volume the profile lived on.
+For Docker services: `docker compose down -v` (or the appropriate `make very-clean <service> CONFIRM=yes`) removes the volume the profile lived on.
 
 ### Concurrent access
 

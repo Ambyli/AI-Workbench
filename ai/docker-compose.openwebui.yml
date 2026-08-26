@@ -5,7 +5,7 @@ networks:
 
 services:
   openwebui:
-    # Pinned release tag. Bump this line and run `make build-openwebui` to
+    # Pinned release tag. Bump this line and run `make build openwebui` to
     # update. Use `:main` for the rolling upstream tag.
     image: ghcr.io/open-webui/open-webui:v0.11.0
     networks:

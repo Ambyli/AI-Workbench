@@ -1,46 +1,16 @@
-SERVICES :=
-
-# Capture positional args after the first goal so callers can narrow a target
-# to specific compose services, e.g. `make up-vllm vllm-qwen`. If no extras are
-# passed, the macro falls back to the default service list from $(2).
-ARGS := $(filter-out $(firstword $(MAKECMDGOALS)),$(MAKECMDGOALS))
-$(foreach a,$(ARGS),$(eval $(a):;@:))
+# Compose stack registry — each call registers a stack and its default service list.
+STACKS :=
 
 define service
-SERVICES += $(1)
-SERVICES_ARGS_$(1) := $(2)
-
+STACKS += $(1)
+STACK_$(1) := $(2)
 DC_$(1) := docker compose -f ai/docker-compose.$(1).yml --env-file .env -p ai-$(1)
-
-up-$(1):
-	$$(DC_$(1)) up -d $$(if $$(ARGS),$$(ARGS),$(2))
-
-down-$(1):
-	$$(DC_$(1)) stop $$(if $$(ARGS),$$(ARGS),$(2))
-
-clean-$(1):
-	$$(DC_$(1)) stop $$(if $$(ARGS),$$(ARGS),$(2)) && $$(DC_$(1)) rm -f $$(if $$(ARGS),$$(ARGS),$(2))
-
-very-clean-$(1):
-	@if [ "$(CONFIRM)" != "yes" ]; then \
-		echo "WARNING: This will stop containers, remove all volumes and images for $(1). Type CONFIRM=yes to proceed."; \
-		false; \
-	fi
-	$$(DC_$(1)) down --volumes --rmi all
-
-logs-$(1):
-	$$(DC_$(1)) logs -f $$(if $$(ARGS),$$(ARGS),$(2))
-
-build-$(1):
-	$$(DC_$(1)) pull --ignore-pull-failures $$(if $$(ARGS),$$(ARGS),$(2))
-	$$(DC_$(1)) build $$(if $$(ARGS),$$(ARGS),$(2))
-
-.PHONY: up-$(1) down-$(1) clean-$(1) very-clean-$(1) logs-$(1) build-$(1)
 endef
 
 $(eval $(call service,litellm,litellm))
 $(eval $(call service,unsloth,unsloth))
 $(eval $(call service,vllm,qwen3.8 qwen3.6 vllm-qwen-vl))
+$(eval $(call service,llama,glm5.2))
 $(eval $(call service,kokoro,kokoro-app kokoro-api))
 $(eval $(call service,madlad,madlad-app madlad-api))
 $(eval $(call service,classifier,classifier))
@@ -51,50 +21,107 @@ $(eval $(call service,roofix,roofix))
 $(eval $(call service,interceptor,interceptor))
 $(eval $(call service,searxng,searxng))
 
-setup: network
-	cd widget && uv sync && cd ..
-	cd widget && uv run claude_usage_widget.py &
-	$(foreach s,$(SERVICES),$(DC_$(s)) up --build -d &&) true
+# Parse positional args: first goal is the verb, remaining goals are:
+#   $(STACK) — compose stack name (optional; empty = all stacks)
+#   $(SVC)   — service filter within that stack (optional; empty = stack defaults)
+ARGS  := $(filter-out $(firstword $(MAKECMDGOALS)),$(MAKECMDGOALS))
+STACK := $(firstword $(ARGS))
+SVC   := $(wordlist 2,999,$(ARGS))
+
+# Swallow each positional arg as a no-op target so Make doesn't try to build it.
+$(foreach a,$(ARGS),$(eval $(a):;@:))
+
+# Guard: error when STACK is set but doesn't match a registered stack.
+# Empty STACK means "operate on all stacks" and skips the check.
+check_stack = $(if $(STACK),$(if $(filter $(STACK),$(STACKS)),,$(error Unknown stack '$(STACK)'. Known stacks: $(STACKS))))
+
+# Selected compose command + services (only meaningful when STACK is set).
+DC       = $(DC_$(STACK))
+SERVICES = $(if $(SVC),$(SVC),$(STACK_$(STACK)))
 
 network:
 	docker network create ai_shared 2>/dev/null || true
 
+setup: network
+	cd widget && uv sync && cd ..
+	cd widget && uv run claude_usage_widget.py &
+	$(foreach s,$(STACKS),$(DC_$(s)) up --build -d &&) true
+
 up: network
-	$(foreach s,$(SERVICES),$(DC_$(s)) up -d &&) true
+	$(check_stack)
+ifdef STACK
+	$(DC) up -d $(SERVICES)
+else
+	$(foreach s,$(STACKS),$(DC_$(s)) up -d &&) true
+endif
 
 down:
-	$(foreach s,$(SERVICES),$(DC_$(s)) stop;)
+	$(check_stack)
+ifdef STACK
+	$(DC) stop $(SERVICES)
+else
+	$(foreach s,$(STACKS),$(DC_$(s)) stop;)
+endif
 
 clean:
-	$(foreach s,$(SERVICES),$(DC_$(s)) stop && $(DC_$(s)) rm -f;)
+	$(check_stack)
+ifdef STACK
+	$(DC) stop $(SERVICES) && $(DC) rm -f $(SERVICES)
+else
+	$(foreach s,$(STACKS),$(DC_$(s)) stop && $(DC_$(s)) rm -f;)
+endif
 
 very-clean:
+	$(check_stack)
 	@if [ "$(CONFIRM)" != "yes" ]; then \
-		echo "WARNING: This will stop containers, remove all volumes and images. Type CONFIRM=yes to proceed."; \
+		echo "WARNING: This will stop containers, remove all volumes and images$(if $(STACK), for $(STACK),). Type CONFIRM=yes to proceed."; \
 		false; \
 	fi
-	$(foreach s,$(SERVICES),$(DC_$(s)) down --volumes --rmi all;)
+ifdef STACK
+	$(DC) down --volumes --rmi all
+else
+	$(foreach s,$(STACKS),$(DC_$(s)) down --volumes --rmi all;)
+endif
 
 build:
-	$(foreach s,$(SERVICES),$(DC_$(s)) pull --ignore-pull-failures && $(DC_$(s)) build &&) true
+	$(check_stack)
+ifdef STACK
+	$(DC) pull --ignore-pull-failures $(SERVICES)
+	$(DC) build $(SERVICES)
+else
+	$(foreach s,$(STACKS),$(DC_$(s)) pull --ignore-pull-failures && $(DC_$(s)) build &&) true
+endif
 
 logs:
-	@echo "Use logs-<service> to follow specific service logs."
-	@echo "Services: $(SERVICES)"
+	$(check_stack)
+ifdef STACK
+	$(DC) logs -f $(SERVICES)
+else
+	@echo "Use: make logs <stack> [service...] to follow specific service logs."
+	@echo "Stacks: $(STACKS)"
+endif
 
 help:
 	@echo ""
-	@echo "Main stack:"
-	@echo "  make setup       Install deps and start all services"
-	@echo "  make network     Create shared Docker network"
-	@echo "  make up          Start all services"
-	@echo "  make down        Stop all services"
-	@echo "  make clean       Stop and remove containers"
-	@echo "  make very-clean  Stop, remove containers, volumes, and images"
-	@echo "  make build       Rebuild all images"
+	@echo "Usage: make <verb> [stack] [service...]"
 	@echo ""
-	@echo "Service stacks:"
-	@$(foreach s,$(SERVICES),echo "  $(s): up-$(s)  down-$(s)  clean-$(s)  very-clean-$(s)  logs-$(s)  build-$(s)";)
+	@echo "Verbs:"
+	@echo "  setup       Install deps and start all services"
+	@echo "  network     Create shared Docker network"
+	@echo "  up          Start services (all stacks, one stack, or specific services)"
+	@echo "  down        Stop services"
+	@echo "  clean       Stop and remove containers"
+	@echo "  very-clean  Stop, remove containers, volumes, and images (needs CONFIRM=yes)"
+	@echo "  build       Rebuild images"
+	@echo "  logs        Follow service logs"
+	@echo ""
+	@echo "Stacks: $(STACKS)"
+	@echo ""
+	@echo "Examples:"
+	@echo "  make up                    # start every stack"
+	@echo "  make up vllm               # start vllm stack (default services)"
+	@echo "  make up vllm qwen3.6       # start only qwen3.6 in vllm stack"
+	@echo "  make logs kokoro           # tail kokoro logs"
 	@echo ""
 
-.PHONY: setup up down clean very-clean build logs help network
+.PHONY: setup network up down clean very-clean build logs help

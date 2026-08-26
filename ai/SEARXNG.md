@@ -11,7 +11,7 @@ docker compose -f ai/docker-compose.searxng.yml --env-file .env up -d
 Or via make:
 
 ```bash
-make up-searxng
+make up searxng
 ```
 
 Then browse `http://localhost:8009` — you should see the SearXNG search page. Try a query in the browser to confirm outbound search is working before wiring up Open WebUI.
@@ -29,7 +29,7 @@ Then browse `http://localhost:8009` — you should see the SearXNG search page. 
 - `search.formats: [html, json]` — JSON output is off by default upstream; Open WebUI needs it.
 - `server.secret_key: "${SEARXNG_SECRET}"` — literal placeholder. The `entrypoint` wrapper in `ai/docker-compose.searxng.yml` reads `$SEARXNG_SECRET` from the container env at startup, sed-substitutes it into a copy of `settings.yml` at `/tmp/searxng-settings.yml`, and points `SEARXNG_SETTINGS_PATH` at that copy — so the bind-mounted host file stays free of the real secret and can be committed to git. If `SEARXNG_SECRET` is unset, the wrapper refuses to boot rather than starting with an unresolved placeholder.
 
-Edits to `settings.yml` take effect on `make down-searxng && make up-searxng` — no rebuild needed because it's a bind-mount.
+Edits to `settings.yml` take effect on `make down searxng && make up searxng` — no rebuild needed because it's a bind-mount.
 
 ### `SEARXNG_SECRET`
 
@@ -76,7 +76,7 @@ Polls `http://localhost:8080/healthz` inside the container every 30 s with a 30 
 ### Stopping
 
 ```bash
-make down-searxng
+make down searxng
 ```
 
 There is no persistent volume beyond the mounted config directory — nothing on-disk state to worry about. `docker compose … down -v` is a no-op here.
@@ -109,8 +109,8 @@ image: docker.io/searxng/searxng:latest
 To bump to a specific release, pick a tag from <https://hub.docker.com/r/searxng/searxng/tags>, edit that line, then:
 
 ```bash
-make build-searxng
-make down-searxng && make up-searxng
+make build searxng
+make down searxng && make up searxng
 ```
 
 ### Notes

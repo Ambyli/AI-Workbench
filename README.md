@@ -66,20 +66,34 @@ make network         # Create shared Docker network (ai_shared)
 
 All containers share a `ai_shared` Docker network so they can resolve each other by container name. `make setup` creates it automatically.
 
-### Main stack
+### Usage
+
+The Makefile follows a `make <verb> [stack] [service...]` convention:
 
 ```bash
-make up              # Start all services
-make down            # Stop all services
-make clean           # Stop and remove containers + volumes
-make very-clean      # Stop, remove containers, volumes, and images
-make logs            # Follow logs
-make build           # Build images
+make <verb>                          # apply verb to every registered stack
+make <verb> <stack>                  # apply verb to one stack (its default services)
+make <verb> <stack> <service> ...    # apply verb to specific services within a stack
 ```
+
+Verbs: `up`, `down`, `clean`, `very-clean`, `logs`, `build`.
+
+```bash
+make up                     # Start every stack
+make up vllm                # Start the vllm stack (default services)
+make up vllm qwen3.6        # Start only qwen3.6 within the vllm stack
+make down                   # Stop every stack
+make clean roofix           # Stop and remove roofix containers + volumes
+make very-clean CONFIRM=yes # Stop everything and remove volumes and images
+make logs kokoro            # Follow logs for the kokoro stack
+make build openwebui        # Rebuild the openwebui stack
+```
+
+Typos are caught: `make up vlm` errors with `Unknown stack 'vlm'` before any Docker command runs.
 
 ## Adding or Removing a Service
 
-The Makefile uses a macro to generate `up-*`, `down-*`, `clean-*`, `very-clean-*`, `logs-*`, and `build-*` targets for each service stack. Adding or removing a service is a two-step change.
+The Makefile uses a macro to register each service stack. Adding or removing a service is a one-line change.
 
 ### Add a service
 
@@ -96,11 +110,11 @@ Example — adding a Whisper stack that runs two containers:
 $(eval $(call service,whisper,whisper-api whisper-worker))
 ```
 
-This immediately makes `make up-whisper`, `make down-whisper`, `make clean-whisper`, `make very-clean-whisper`, `make logs-whisper`, and `make build-whisper` available. The compose file must be named `ai/docker-compose.whisper.yml`.
+This immediately makes the stack usable as `make up whisper`, `make down whisper`, `make clean whisper`, `make very-clean whisper`, `make logs whisper`, and `make build whisper`. The compose file must be named `ai/docker-compose.whisper.yml`.
 
 ### Remove a service
 
-Delete the corresponding `$(eval $(call service,...))` line from the `Makefile`. That's it — all five generated targets disappear with it.
+Delete the corresponding `$(eval $(call service,...))` line from the `Makefile`. That's it — the stack disappears from every verb.
 
 ### Naming rules
 

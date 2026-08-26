@@ -11,7 +11,7 @@ docker compose -f ai/docker-compose.openwebui.yml --env-file .env up -d
 Or via make:
 
 ```bash
-make up-openwebui
+make up openwebui
 ```
 
 Then open `http://localhost:8007`. The first account created becomes the admin. Subsequent sign-ups land in an approval queue (see [User signup & approval](#user-signup--approval) below).
@@ -70,7 +70,7 @@ Polls `http://localhost:8080/health` inside the container every 30s with a 30s s
 ```bash
 docker compose -f ai/docker-compose.openwebui.yml down
 # or
-make down-openwebui
+make down openwebui
 ```
 
 User data, chat history, and uploaded files are stored in the named volume `openwebui_data` and survive restarts. To wipe everything (and force re-reading the env vars on next launch):
@@ -113,7 +113,7 @@ Open WebUI supports Google sign-in for either of two reasons: skipping password 
 5. `OPENWEBUI_OPENID_PROVIDER_URL` is preset to Google's discovery document — leave it alone unless you're swapping providers. Without it, Open WebUI logs `OPENID_PROVIDER_URL not set - logout will not work!` and the logout flow only clears the local cookie.
 6. Restart the container so the new values take effect:
    ```bash
-   make down-openwebui && make up-openwebui
+   make down openwebui && make up openwebui
    ```
 
 A **Continue with Google** button appears on the login screen once both values are populated and `OPENWEBUI_ENABLE_OAUTH_SIGNUP=true`.
@@ -151,12 +151,12 @@ For LAN-wide or off-LAN access, Open WebUI is fronted by a Cloudflare Tunnel rat
 5. Cloudflare will auto-create the CNAME DNS record for `chat.zeoenergy.com` pointing at the tunnel.
 6. Start the tunnel container:
    ```bash
-   make up-cloudflared
+   make up cloudflared
    ```
-   Stop with `make down-cloudflared`. Logs: `make logs-cloudflared`.
+   Stop with `make down cloudflared`. Logs: `make logs cloudflared`.
 7. Update `OPENWEBUI_WEBUI_URL=https://chat.zeoenergy.com` and `CORS_ALLOW_ORIGIN=https://chat.zeoenergy.com` in `.env` (already set), then restart Open WebUI:
    ```bash
-   make down-openwebui && make up-openwebui
+   make down openwebui && make up openwebui
    ```
 8. Update the Google OAuth client's **Authorized redirect URIs** to include `https://chat.zeoenergy.com/oauth/google/callback`.
 
@@ -167,7 +167,7 @@ docker logs ai-cloudflared --tail 50   # should show "Registered tunnel connecti
 curl -I https://chat.zeoenergy.com     # should return 200 from Open WebUI
 ```
 
-If the tunnel is up but the site 502s, the origin URL (`openwebui:8080`) is unreachable from the `cloudflared` container — confirm Open WebUI is running (`make up-openwebui`) and on the same `ai_shared` network.
+If the tunnel is up but the site 502s, the origin URL (`openwebui:8080`) is unreachable from the `cloudflared` container — confirm Open WebUI is running (`make up openwebui`) and on the same `ai_shared` network.
 
 #### Two tunnel flavors — pick one and know which
 
@@ -251,7 +251,7 @@ curl -X POST http://localhost:4001/key/generate \
 OPENWEBUI_OPENAI_API_KEY=sk-...
 ```
 
-Restart the container — `make down-openwebui && make up-openwebui`. After login, only the models on the virtual key's allowlist appear in the chat picker. Adding or removing models later only needs the virtual-key allowlist to be edited; no Open WebUI restart is required (Open WebUI re-fetches `/v1/models` on every page load).
+Restart the container — `make down openwebui && make up openwebui`. After login, only the models on the virtual key's allowlist appear in the chat picker. Adding or removing models later only needs the virtual-key allowlist to be edited; no Open WebUI restart is required (Open WebUI re-fetches `/v1/models` on every page load).
 
 ### Adding more LiteLLM models
 
@@ -270,13 +270,13 @@ To update:
 1. Edit that line to the desired tag (a specific release like `v0.11.1`, or `main` for the rolling upstream tag). Releases are at <https://github.com/open-webui/open-webui/releases>.
 2. Pull the new image and recreate the container:
    ```bash
-   make build-openwebui   # runs `docker compose pull` under the hood
-   make down-openwebui && make up-openwebui
+   make build openwebui   # runs `docker compose pull` under the hood
+   make down openwebui && make up openwebui
    ```
 
-`make build-openwebui` re-pulls whatever tag is currently pinned — useful when the tag is `main` (rolling) or when a release is re-tagged. User data in the `openwebui_data` volume is preserved across updates.
+`make build openwebui` re-pulls whatever tag is currently pinned — useful when the tag is `main` (rolling) or when a release is re-tagged. User data in the `openwebui_data` volume is preserved across updates.
 
 ### Notes
 
 - The container does **not** request GPU access — it does no inference of its own, only proxies requests to LiteLLM.
-- If LiteLLM is not running, Open WebUI loads but the model list is empty. Start LiteLLM first (`make up-litellm`).
+- If LiteLLM is not running, Open WebUI loads but the model list is empty. Start LiteLLM first (`make up litellm`).

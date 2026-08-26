@@ -32,10 +32,10 @@ Or use the Makefile helpers:
 
 | Command | Effect |
 |---|---|
-| `make up` | Start the container in the background (`-d`), removing orphaned containers |
-| `make down` | Stop the container |
-| `make clean` | Stop and delete the container **and the named volume** (forces a full rebuild on next `make up`) |
-| `make logs` | Tail container logs — useful for watching the llama.cpp compile progress on first start |
+| `make up unsloth` | Start the container in the background (`-d`), removing orphaned containers |
+| `make down unsloth` | Stop the container |
+| `make clean unsloth` | Stop and delete the container **and the named volume** (forces a full rebuild on next `make up unsloth`) |
+| `make logs unsloth` | Tail container logs — useful for watching the llama.cpp compile progress on first start |
 
 ## GPU compute capability
 

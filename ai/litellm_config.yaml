@@ -108,6 +108,21 @@ model_list:
         min_p: 0
       stream_timeout: 300
 
+  - model_name: glm5.2
+    litellm_params:
+      model: openai/glm5.2
+      api_base: http://glm5.2:8000/v1
+      api_key: none
+      max_tokens: 16384
+      temperature: 1.0
+      top_p: 0.95
+      frequency_penalty: 0
+      presence_penalty: 0
+      extra_body:
+        top_k: 40
+        min_p: 0
+      stream_timeout: 600
+
   - model_name: qwen2.5-vl
     litellm_params:
       model: openai/Qwen/Qwen2.5-VL-7B-Instruct

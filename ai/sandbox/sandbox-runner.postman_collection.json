@@ -1,22 +1,44 @@
 {
   "info": {
     "name": "sandbox-runner",
-    "description": "sandbox-runner HTTP + MCP endpoints. Set the `baseUrl` collection variable to switch between local (http://localhost:8012) and container-network (http://sandbox-runner:8000) targets. For LiteLLM pass-through, set baseUrl to http://localhost:4001/v1/sandbox and add an Authorization: Bearer sk-... header at the collection level. See ai/sandbox/ENDPOINTS.md for the full reference.",
+    "description": "sandbox-runner endpoints, called through the LiteLLM pass-through registered in ai/litellm/litellm_config.yaml (`pass_through_endpoints` → `/v1/sandbox` → `http://sandbox-runner:8000`, `include_subpath: true`). Every request is authenticated with a Bearer token from a LiteLLM virtual key. Set the collection variables `litellm` (e.g. http://localhost:4001) and `virtual master key` (an sk-… key issued from the LiteLLM Admin UI → Virtual Keys) — every request inherits them via collection-level auth. See ai/sandbox/ENDPOINTS.md for the full endpoint reference and ai/LITELLM.md for issuing virtual keys.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
     "_postman_id": "sandbox-runner-collection"
   },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{virtual master key}}",
+        "type": "string"
+      }
+    ]
+  },
   "variable": [
     {
-      "key": "baseUrl",
-      "value": "http://localhost:8012",
+      "key": "litellm",
+      "value": "http://localhost:4001",
       "type": "string",
-      "description": "Runner base URL. Localhost publish is 8012; on ai_shared it's http://sandbox-runner:8000."
+      "description": "LiteLLM base URL. Localhost publish is 4001 (PORT_LITELLM); on ai_shared it's http://litellm:4000; behind cloudflared it's https://your-litellm-host."
+    },
+    {
+      "key": "virtual master key",
+      "value": "sk-your-litellm-virtual-key",
+      "type": "string",
+      "description": "LiteLLM virtual key (Admin UI → Virtual Keys, or /key/generate API). Scope the key to allow the /v1/sandbox pass-through — most keys created for chat models already do. Sent as `Authorization: Bearer {{virtual master key}}` by the collection-level auth."
     },
     {
       "key": "sandboxId",
       "value": "",
       "type": "string",
       "description": "12-char hex id returned by POST /run. Fill in after spawning to run the /jobs/{id} + DELETE requests."
+    },
+    {
+      "key": "mcpSessionId",
+      "value": "",
+      "type": "string",
+      "description": "MCP session id — paste in the `mcp-session-id` response header value returned by the `MCP — initialize` request. Subsequent MCP calls need it."
     }
   ],
   "item": [
@@ -26,11 +48,11 @@
         "method": "GET",
         "header": [],
         "url": {
-          "raw": "{{baseUrl}}/health",
-          "host": ["{{baseUrl}}"],
-          "path": ["health"]
+          "raw": "{{litellm}}/v1/sandbox/health",
+          "host": ["{{litellm}}"],
+          "path": ["v1", "sandbox", "health"]
         },
-        "description": "Liveness + DB status. Returns {\"status\": \"ok\", \"db\": \"up\"} when the runner can reach sandbox-db; \"degraded\" / \"down\" otherwise. No auth."
+        "description": "Liveness + DB status. Returns {\"status\": \"ok\", \"db\": \"up\"} when the runner can reach sandbox-db; \"degraded\" / \"down\" otherwise."
       },
       "response": []
     },
@@ -47,11 +69,11 @@
           "options": { "raw": { "language": "json" } }
         },
         "url": {
-          "raw": "{{baseUrl}}/run",
-          "host": ["{{baseUrl}}"],
-          "path": ["run"]
+          "raw": "{{litellm}}/v1/sandbox/run",
+          "host": ["{{litellm}}"],
+          "path": ["v1", "sandbox", "run"]
         },
-        "description": "Spawn a static HTML sandbox — nginx serves the files map at /. Returns { sandbox_id, url, expires_at }. The URL is reachable via sandbox-proxy at http://localhost:8011/{sandbox_id}/ from the host, or http://sandbox-proxy/{sandbox_id}/ from ai_shared."
+        "description": "Spawn a static HTML sandbox — nginx serves the files map at /. Returns { sandbox_id, url, expires_at }. The URL uses whatever SANDBOX_PROXY_URL is set to in .env — for browser-reachable iframes, that should be a public URL under the same origin as Open WebUI (e.g. https://chat.zeoenergy.com/sandboxes)."
       },
       "response": []
     },
@@ -68,9 +90,9 @@
           "options": { "raw": { "language": "json" } }
         },
         "url": {
-          "raw": "{{baseUrl}}/run",
-          "host": ["{{baseUrl}}"],
-          "path": ["run"]
+          "raw": "{{litellm}}/v1/sandbox/run",
+          "host": ["{{litellm}}"],
+          "path": ["v1", "sandbox", "run"]
         },
         "description": "Spawn a Streamlit sandbox. Runtime `python` base image has streamlit, gradio, flask, fastapi, pandas, numpy, matplotlib, plotly, requests, pillow pre-installed. Add a requirements.txt to files to install additional deps via sandbox-egress (pypi allowlisted). Cold-start ~2s pre-baked; 20-90s if pip install runs."
       },
@@ -85,13 +107,13 @@
         ],
         "body": {
           "mode": "raw",
-          "raw": "{\n  \"runtime\": \"python\",\n  \"entrypoint\": \"gradio deploy || python -m gradio_app\",\n  \"files\": {\n    \"gradio_app.py\": \"import gradio as gr\\n\\ndef reverse(text):\\n    return text[::-1]\\n\\ngr.Interface(fn=reverse, inputs='text', outputs='text').launch(server_name='0.0.0.0', server_port=80)\\n\",\n    \"requirements.txt\": \"gradio\\n\"\n  }\n}",
+          "raw": "{\n  \"runtime\": \"python\",\n  \"entrypoint\": \"python gradio_app.py\",\n  \"files\": {\n    \"gradio_app.py\": \"import gradio as gr\\n\\ndef reverse(text):\\n    return text[::-1]\\n\\ngr.Interface(fn=reverse, inputs='text', outputs='text').launch(server_name='0.0.0.0', server_port=80)\\n\",\n    \"requirements.txt\": \"gradio\\n\"\n  }\n}",
           "options": { "raw": { "language": "json" } }
         },
         "url": {
-          "raw": "{{baseUrl}}/run",
-          "host": ["{{baseUrl}}"],
-          "path": ["run"]
+          "raw": "{{litellm}}/v1/sandbox/run",
+          "host": ["{{litellm}}"],
+          "path": ["v1", "sandbox", "run"]
         },
         "description": "Illustrates the install-if-present pattern. If files contains a requirements.txt, the base image entrypoint runs `pip install -r requirements.txt` before executing the command. pip goes through HTTP_PROXY=sandbox-egress:8888 and hits the pypi.org / files.pythonhosted.org allowlist."
       },
@@ -110,9 +132,9 @@
           "options": { "raw": { "language": "json" } }
         },
         "url": {
-          "raw": "{{baseUrl}}/run",
-          "host": ["{{baseUrl}}"],
-          "path": ["run"]
+          "raw": "{{litellm}}/v1/sandbox/run",
+          "host": ["{{litellm}}"],
+          "path": ["v1", "sandbox", "run"]
         },
         "description": "Spawn a Node sandbox. Base image has serve, vite, react, react-dom, express, next installed globally so `require('express')` works without a package.json. Add a package.json to files to trigger `npm install` on boot."
       },
@@ -131,9 +153,9 @@
           "options": { "raw": { "language": "json" } }
         },
         "url": {
-          "raw": "{{baseUrl}}/run",
-          "host": ["{{baseUrl}}"],
-          "path": ["run"]
+          "raw": "{{litellm}}/v1/sandbox/run",
+          "host": ["{{litellm}}"],
+          "path": ["v1", "sandbox", "run"]
         },
         "description": "Multi-file Vite + React counter. Vite HMR uses WebSockets — sandbox-proxy (Caddy) forwards them by default, so buttons work end-to-end when iframed."
       },
@@ -145,11 +167,11 @@
         "method": "GET",
         "header": [],
         "url": {
-          "raw": "{{baseUrl}}/jobs",
-          "host": ["{{baseUrl}}"],
-          "path": ["jobs"]
+          "raw": "{{litellm}}/v1/sandbox/jobs",
+          "host": ["{{litellm}}"],
+          "path": ["v1", "sandbox", "jobs"]
         },
-        "description": "List every sandbox in the registry (running + terminal). Fixed limit of 20 in PostgresRegistry.list_all(). Ordered by updated_at DESC. Returns JobsListResponse — see ENDPOINTS.md for the JobBase shape. max_concurrent / available are null (the runner enforces its concurrency cap in-process, not in the registry)."
+        "description": "List every sandbox in the registry (running + terminal). Fixed limit of 20 in PostgresRegistry.list_all(). Ordered by updated_at DESC. Returns JobsListResponse — see ENDPOINTS.md for the JobBase shape."
       },
       "response": []
     },
@@ -159,9 +181,9 @@
         "method": "GET",
         "header": [],
         "url": {
-          "raw": "{{baseUrl}}/jobs/{{sandboxId}}",
-          "host": ["{{baseUrl}}"],
-          "path": ["jobs", "{{sandboxId}}"]
+          "raw": "{{litellm}}/v1/sandbox/jobs/{{sandboxId}}",
+          "host": ["{{litellm}}"],
+          "path": ["v1", "sandbox", "jobs", "{{sandboxId}}"]
         },
         "description": "Snapshot of one sandbox. 404 if unknown. Set the sandboxId collection variable to the id returned by POST /run first."
       },
@@ -173,9 +195,9 @@
         "method": "DELETE",
         "header": [],
         "url": {
-          "raw": "{{baseUrl}}/jobs/{{sandboxId}}",
-          "host": ["{{baseUrl}}"],
-          "path": ["jobs", "{{sandboxId}}"]
+          "raw": "{{litellm}}/v1/sandbox/jobs/{{sandboxId}}",
+          "host": ["{{litellm}}"],
+          "path": ["v1", "sandbox", "jobs", "{{sandboxId}}"]
         },
         "description": "Tear a sandbox down early. Stops the container, removes it, deletes the row, releases the concurrency slot. Returns 204 no body. 404 if the sandbox id is unknown."
       },
@@ -187,11 +209,11 @@
         "method": "GET",
         "header": [],
         "url": {
-          "raw": "{{baseUrl}}/tool/openapi.json",
-          "host": ["{{baseUrl}}"],
-          "path": ["tool", "openapi.json"]
+          "raw": "{{litellm}}/v1/sandbox/tool/openapi.json",
+          "host": ["{{litellm}}"],
+          "path": ["v1", "sandbox", "tool", "openapi.json"]
         },
-        "description": "OpenAPI schema for the OpenWebUI Tool Server integration. Register the tool server in OpenWebUI Admin Panel → Settings → Tools → Add Connection with base URL {{baseUrl}}/tool — OpenWebUI GETs this schema at registration time."
+        "description": "OpenAPI schema for the OpenWebUI Tool Server integration. Note: OpenWebUI ITSELF should point Admin Panel → Settings → Tools → Add Connection directly at http://sandbox-runner:8000/tool (Docker service DNS on ai_shared), NOT at the LiteLLM pass-through — OpenWebUI needs to see the raw HTMLResponse headers and CORS behavior. Use this Postman request only for schema inspection."
       },
       "response": []
     },
@@ -208,17 +230,17 @@
           "options": { "raw": { "language": "json" } }
         },
         "url": {
-          "raw": "{{baseUrl}}/tool/preview_app",
-          "host": ["{{baseUrl}}"],
-          "path": ["tool", "preview_app"]
+          "raw": "{{litellm}}/v1/sandbox/tool/preview_app",
+          "host": ["{{litellm}}"],
+          "path": ["v1", "sandbox", "tool", "preview_app"]
         },
-        "description": "OpenWebUI Rich-UI integration. Returns HTMLResponse with `Content-Disposition: inline` — OpenWebUI renders the response body (an `<iframe>` pointing at sandbox-proxy) as an embedded artifact under the tool call indicator, no model round-trip needed. Response Content-Type is text/html (not JSON). See ai/sandbox/ENDPOINTS.md § OpenWebUI Tool Server for details."
+        "description": "OpenWebUI Rich-UI integration. Returns HTMLResponse with `Content-Disposition: inline` — OpenWebUI renders the response body (an `<iframe>` pointing at sandbox-proxy) as an embedded artifact under the tool call indicator, no model round-trip needed. Response Content-Type is text/html (not JSON). Same warning as /tool/openapi.json — OpenWebUI should register this URL directly on sandbox-runner:8000, not via LiteLLM, so it can see the raw response headers."
       },
       "response": []
     },
     {
       "name": "MCP",
-      "description": "FastMCP JSON-RPC over HTTP. All requests are POST /mcp/ (trailing slash required — the runner responds to POST /mcp with 307 → /mcp/). Every client must send `Accept: application/json, text/event-stream` and start with `initialize`. FastMCP returns responses as SSE events by default; if you need a single JSON response, some clients unwrap the SSE frame automatically.",
+      "description": "FastMCP JSON-RPC over HTTP forwarded through the LiteLLM pass-through. Note that LiteLLM ALSO advertises the sandbox as an MCP server via `mcp_servers.sandbox` in litellm_config.yaml — models see the tool through that path, not this one. The Postman requests below are useful for debugging the transport directly. Every MCP request MUST use trailing-slash (POST /mcp/), MUST send `Accept: application/json, text/event-stream`, and MUST start with an `initialize` call — copy the `mcp-session-id` response header into the `mcpSessionId` collection variable for subsequent calls.",
       "item": [
         {
           "name": "MCP — initialize",
@@ -234,11 +256,11 @@
               "options": { "raw": { "language": "json" } }
             },
             "url": {
-              "raw": "{{baseUrl}}/mcp/",
-              "host": ["{{baseUrl}}"],
-              "path": ["mcp", ""]
+              "raw": "{{litellm}}/v1/sandbox/mcp/",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "sandbox", "mcp", ""]
             },
-            "description": "Handshake. Must be called first. Response body carries serverInfo (name = 'sandbox', version from FastMCP), protocolVersion, and capabilities. Response headers include `mcp-session-id` — copy it into subsequent calls' `Mcp-Session-Id` request header if your client doesn't handle sessions automatically."
+            "description": "MCP handshake. Response headers include `mcp-session-id` — copy it into the `mcpSessionId` collection variable."
           },
           "response": []
         },
@@ -249,7 +271,7 @@
             "header": [
               { "key": "Content-Type", "value": "application/json" },
               { "key": "Accept", "value": "application/json, text/event-stream" },
-              { "key": "Mcp-Session-Id", "value": "{{mcpSessionId}}", "description": "Paste in the mcp-session-id header value returned by initialize." }
+              { "key": "Mcp-Session-Id", "value": "{{mcpSessionId}}" }
             ],
             "body": {
               "mode": "raw",
@@ -257,9 +279,9 @@
               "options": { "raw": { "language": "json" } }
             },
             "url": {
-              "raw": "{{baseUrl}}/mcp/",
-              "host": ["{{baseUrl}}"],
-              "path": ["mcp", ""]
+              "raw": "{{litellm}}/v1/sandbox/mcp/",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "sandbox", "mcp", ""]
             },
             "description": "Enumerate available tools. sandbox-runner exposes exactly one: preview_app."
           },
@@ -280,11 +302,11 @@
               "options": { "raw": { "language": "json" } }
             },
             "url": {
-              "raw": "{{baseUrl}}/mcp/",
-              "host": ["{{baseUrl}}"],
-              "path": ["mcp", ""]
+              "raw": "{{litellm}}/v1/sandbox/mcp/",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "sandbox", "mcp", ""]
             },
-            "description": "Invoke preview_app via MCP. Same effect as POST /run but the model side of the world uses this shape. Result body has { url, sandbox_id, expires_at } wrapped in the JSON-RPC `result.content[0].text` per MCP tool-result spec."
+            "description": "Invoke preview_app via MCP. Result body has a text-content block containing a fenced ```html iframe block ready for OpenWebUI's markdown renderer."
           },
           "response": []
         },
@@ -303,9 +325,9 @@
               "options": { "raw": { "language": "json" } }
             },
             "url": {
-              "raw": "{{baseUrl}}/mcp/",
-              "host": ["{{baseUrl}}"],
-              "path": ["mcp", ""]
+              "raw": "{{litellm}}/v1/sandbox/mcp/",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "sandbox", "mcp", ""]
             },
             "description": "Invoke preview_app for a Python (Streamlit) sandbox via MCP."
           },

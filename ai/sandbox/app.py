@@ -16,6 +16,11 @@ Endpoints:
     GET  /jobs/{id}             one sandbox detail
     DELETE /jobs/{id}           tear down a sandbox early
     /mcp                        FastMCP HTTP transport — preview_app tool
+    /tool/*                     OpenWebUI Tool Server sub-app:
+        GET  /tool/openapi.json      OpenAPI spec for OpenWebUI discovery
+        POST /tool/preview_app       spawn + return HTMLResponse iframe
+                                     with `Content-Disposition: inline`
+                                     for OpenWebUI rich-UI rendering
 """
 
 from __future__ import annotations
@@ -33,6 +38,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 from common.jobs.postgres import PostgresRegistry
@@ -43,7 +50,7 @@ from common.jobs.router import build_router
 # PyPI package that FastMCP itself imports internally (from mcp.types
 # import ...) — that manifests as a confusing "FastMCP server support
 # is not installed" ImportError at startup.
-from sandbox_mcp import build_mcp
+from sandbox_mcp import build_mcp, _render_html_block
 from reaper import Reaper
 from runtimes import RUNTIMES, get_runtime
 from spawner import Spawner
@@ -288,3 +295,102 @@ async def delete_sandbox(sandbox_id: str) -> None:
 # near the top of this file so its lifespan can be composed into
 # FastAPI's). We only need to attach it to the router here.
 app.mount("/mcp", _mcp_app)
+
+
+# ── OpenWebUI Tool Server sub-app ─────────────────────────────────────────
+# Per the OpenWebUI docs (Extensibility → Plugin Development → Rich UI),
+# a Tool Server is a REST service that publishes an OpenAPI schema and
+# returns responses with `Content-Disposition: inline` on paths that
+# should render as embedded iframes in the chat.
+#
+# We mount a full FastAPI sub-app at /tool so:
+#   * OpenAPI is exposed at GET /tool/openapi.json (the sub-app's root)
+#     — that's the URL you point Admin Panel → Settings → Tools →
+#     Add Connection at (base URL: http://sandbox-runner:8000/tool).
+#   * Each POST /tool/<action> becomes one tool in OpenWebUI's picker.
+#   * The response uses fastapi.responses.HTMLResponse with the required
+#     header + the CORS-expose header that lets a browser-side OpenWebUI
+#     read the Content-Disposition value.
+#
+# For the LiteLLM-MCP path (mcp_servers.sandbox), the model receives the
+# same HTML block as text and passes it through — see sandbox_mcp.py.
+tool_app = FastAPI(
+    title="sandbox-runner tools",
+    description=(
+        "OpenWebUI Tool Server exposing the sandbox runner. Register in "
+        "Admin Panel → Settings → Tools → Add Connection with base URL "
+        "http://sandbox-runner:8000/tool. See ai/sandbox/ENDPOINTS.md."
+    ),
+    version="0.1.0",
+)
+
+# CORSMiddleware is needed for the OpenWebUI browser to read the
+# Content-Disposition header — the docs call this out explicitly.
+# We keep origins permissive because access control lives at the
+# network / oauth2-proxy layer, not here.
+tool_app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["Content-Disposition"],
+)
+
+
+class ToolPreviewAppRequest(BaseModel):
+    runtime: str = Field(
+        description=(
+            "One of 'static', 'python', or 'node'. Matches POST /run's "
+            "runtime field."
+        )
+    )
+    files: dict[str, str] = Field(
+        description="Map of relative path → file contents.",
+    )
+    entrypoint: Optional[str] = Field(
+        default=None,
+        description=(
+            "Shell command run inside the sandbox. Must bind to port 80. "
+            "Leave unset to use the runtime's default."
+        ),
+    )
+    ttl_seconds: Optional[int] = Field(
+        default=None,
+        description=(
+            "Idle lifetime in seconds. Server clamps to "
+            "SANDBOX_HARD_TTL_SECONDS."
+        ),
+    )
+
+
+@tool_app.post(
+    "/preview_app",
+    response_class=HTMLResponse,
+    summary="Spawn a sandbox and return an iframe that renders inline in chat",
+    description=(
+        "Spawns a sandbox container from the supplied files + entrypoint "
+        "and returns an HTML iframe pointing at it. The response uses "
+        "Content-Disposition: inline, which OpenWebUI recognizes as a "
+        "rich-UI embed and renders as a sandboxed iframe under the tool "
+        "call. See https://docs.openwebui.com/features/extensibility/"
+        "plugin/development/rich-ui/."
+    ),
+)
+async def tool_preview_app(req: ToolPreviewAppRequest) -> HTMLResponse:
+    result = await _spawn_and_track(
+        req.runtime, req.files, req.entrypoint, req.ttl_seconds
+    )
+    return HTMLResponse(
+        content=_render_html_block(result["url"]),
+        headers={
+            "Content-Disposition": "inline",
+            # Re-declared here even though CORSMiddleware sets it — some
+            # OpenWebUI versions look at the response headers directly
+            # rather than the CORS preflight; belt + suspenders.
+            "Access-Control-Expose-Headers": "Content-Disposition",
+        },
+    )
+
+
+app.mount("/tool", tool_app)

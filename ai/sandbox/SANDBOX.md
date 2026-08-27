@@ -151,11 +151,22 @@ Response:
 
 ### `preview_app` MCP tool
 
-Same shape, exposed for tool-calling models. LiteLLM advertises it via [`ai/litellm/litellm_config.yaml`](../litellm/litellm_config.yaml)'s `mcp_servers.sandbox` entry. Models that use it should wrap the returned URL in a fenced ` ```html ` block containing an `<iframe src="...">` — Open WebUI's artifact renderer picks that up.
+Same fields as `POST /run`, exposed to tool-calling models. LiteLLM advertises it via [`ai/litellm/litellm_config.yaml`](../litellm/litellm_config.yaml)'s `mcp_servers.sandbox` entry.
 
-Add a system prompt on the Qwen model in Open WebUI's Admin → Models → *your model* → System Prompt:
+The tool's return value is a **string** containing a short summary and a fenced ` ```html ` block with the iframe pre-rendered — the model just needs to include the returned string verbatim in its response and Open WebUI's markdown renderer promotes the block into an iframe artifact. No system-prompt tweaks or per-model config required as long as the model follows the tool's docstring.
 
-> When the user asks for an interactive app (with a slider, form, or anything a static HTML block can't express), call `preview_app` with `runtime`, `files`, and an `entrypoint`. Emit a fenced html block containing `<iframe src="URL" width="100%" height="600px"></iframe>` using the returned `url`. Do not paraphrase the URL.
+If model paraphrasing is a problem in practice, use the Tool Server integration below instead — that path bypasses the model entirely.
+
+### OpenWebUI Tool Server
+
+For direct rich-UI rendering (no model round-trip), sandbox-runner also exposes a purpose-built REST endpoint compatible with OpenWebUI's Tool Server integration ([docs](https://docs.openwebui.com/features/extensibility/plugin/development/rich-ui/)).
+
+Register in **Admin Panel → Settings → Tools → Add Connection** with base URL:
+
+- `http://sandbox-runner:8000/tool` (from Open WebUI, on `ai_shared`)
+- `http://localhost:8012/tool` (from the host / local dev)
+
+OpenWebUI discovers the tool schema at `GET /tool/openapi.json` and calls `POST /tool/preview_app`. The response uses `Content-Disposition: inline`, which OpenWebUI recognizes as a rich-UI embed and renders the returned `<iframe>` as an inline sandboxed artifact. See [`ENDPOINTS.md § OpenWebUI Tool Server`](ENDPOINTS.md#openwebui-tool-server-tool) for the full contract.
 
 ## Operator runbook
 

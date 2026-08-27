@@ -1,19 +1,28 @@
 """FastMCP wrapper exposing the ``preview_app`` tool.
 
 Registered on the same FastAPI app under ``/mcp`` so LiteLLM (see
-``ai/litellm/litellm_config.yaml`` — ``mcp_servers.sandbox``) can advertise the
-tool to any Qwen/Claude/GPT model that supports tool calling. The model
-returns the tool result URL wrapped in a fenced ``html`` iframe block,
-which OpenWebUI renders as an artifact.
+``ai/litellm/litellm_config.yaml`` — ``mcp_servers.sandbox``) can advertise
+the tool to any Qwen/Claude/GPT model that supports tool calling.
 
-This module intentionally keeps the tool signature narrow — the shape
-you'd sketch on a napkin — so a small model can pattern-match it:
+## What the tool returns
 
-    preview_app(runtime, files, entrypoint?, ttl_seconds?)
-      → { url, sandbox_id, expires_at }
+Following the OpenWebUI docs (Extensibility → Plugin Development → Rich
+UI), the tool result is a **string** containing a short summary plus a
+fenced ``html`` code block with an ``<iframe>`` pointing at the sandbox
+URL. When the model relays the tool result to the user, OpenWebUI's
+markdown renderer picks up the ``html`` block and turns it into a
+sandboxed iframe artifact — no additional model prompting or plugin
+config required.
 
-Any richer options belong on ``POST /run`` (which operators call from
-curl / scripts) and are not exposed over MCP.
+The URL/sandbox_id/expires_at values are also present in plain text
+inside the same string, so a text-only client (or a model that
+paraphrases) still surfaces the useful information.
+
+If you'd rather have OpenWebUI render the preview directly (bypassing
+the model), configure it as a Tool Server pointed at
+``http://sandbox-runner:8000/tool`` — see ``app.py``'s ``/tool``
+sub-app which returns an ``HTMLResponse`` with ``Content-Disposition:
+inline`` per the same OpenWebUI docs.
 """
 
 from __future__ import annotations
@@ -21,13 +30,25 @@ from __future__ import annotations
 from typing import Optional
 
 from fastmcp import FastMCP
-from pydantic import BaseModel, Field
+from pydantic import Field
 
 
-class PreviewAppResult(BaseModel):
-    url: str
-    sandbox_id: str
-    expires_at: str
+# Fixed iframe height. Cannot use the OpenWebUI-recommended postMessage
+# height-reporter here because the reporter would need to live *inside*
+# the sandbox's HTML (Streamlit, Vite, etc.) — code we don't control.
+# 600px is enough for most demos and still scrolls if the app is taller.
+_IFRAME_HEIGHT_PX = 600
+
+
+def _render_html_block(url: str) -> str:
+    """Return an OpenWebUI-friendly HTML iframe block for the given URL."""
+    return (
+        f'<iframe src="{url}" '
+        f'style="width:100%;height:{_IFRAME_HEIGHT_PX}px;border:0;'
+        f'border-radius:8px;background:#0e1116" '
+        f'allow="clipboard-read; clipboard-write" '
+        f'loading="lazy"></iframe>'
+    )
 
 
 def build_mcp(run_callable) -> FastMCP:
@@ -35,7 +56,7 @@ def build_mcp(run_callable) -> FastMCP:
 
     ``run_callable`` is an async callable ``(RunRequest) → RunResponse``
     provided by ``app.py`` — kept as a parameter rather than an import
-    to avoid a circular dependency between ``mcp.py`` and ``app.py``.
+    to avoid a circular dependency between ``sandbox_mcp.py`` and ``app.py``.
     """
     mcp = FastMCP(name="sandbox")
 
@@ -72,12 +93,19 @@ def build_mcp(run_callable) -> FastMCP:
                 "picks a sensible value (~15 min)."
             ),
         ),
-    ) -> PreviewAppResult:
-        """Build a live, interactive preview of a small app.
+    ) -> str:
+        """Build a live, interactive preview of a small app and return an
+        HTML iframe block that renders it inline in the chat.
 
-        Returns a URL the user can iframe in the chat. The URL is served
-        by sandbox-proxy on the local network — do not paste it to
-        external users; it only works from this OpenWebUI instance.
+        **When you (the model) relay this tool result to the user, include
+        the returned string VERBATIM in your response** — the ```html
+        code block is what makes OpenWebUI render the preview as an
+        embedded iframe artifact. Paraphrasing or removing the block
+        prevents the preview from rendering.
+
+        The iframe URL is served by ``sandbox-proxy`` on the local
+        network. It is not reachable from outside this OpenWebUI
+        deployment; do not paste the URL to external users.
         """
         result = await run_callable(
             runtime=runtime,
@@ -85,6 +113,21 @@ def build_mcp(run_callable) -> FastMCP:
             entrypoint=entrypoint,
             ttl_seconds=ttl_seconds,
         )
-        return PreviewAppResult(**result)
+        url = result["url"]
+        sandbox_id = result["sandbox_id"]
+        expires_at = result["expires_at"]
+        iframe = _render_html_block(url)
+
+        # Wrap in a fenced ```html block so OpenWebUI's markdown renderer
+        # promotes it into an artifact iframe. The plain-text lines above
+        # give the model + user useful context if the html renderer is
+        # unavailable or the model decides to paraphrase.
+        return (
+            f"Preview ready. Sandbox `{sandbox_id}` at {url} "
+            f"(expires {expires_at}).\n\n"
+            "```html\n"
+            f"{iframe}\n"
+            "```"
+        )
 
     return mcp

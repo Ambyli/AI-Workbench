@@ -10,11 +10,13 @@ Everything below is served by [`ai/sandbox/app.py`](app.py). Jobs endpoints are 
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/health` | Liveness + DB status |
-| `POST` | `/run` | Spawn a sandbox; returns URL to iframe |
+| `POST` | `/run` | Spawn a sandbox; returns JSON with URL + id |
 | `GET` | `/jobs` | List every sandbox in the registry (running + terminal) |
 | `GET` | `/jobs/{sandbox_id}` | One sandbox's snapshot |
 | `DELETE` | `/jobs/{sandbox_id}` | Tear a sandbox down early, release its slot |
 | `POST` | `/mcp/` | FastMCP JSON-RPC endpoint — see [MCP section](#mcp) |
+| `GET` | `/tool/openapi.json` | OpenAPI schema for OpenWebUI's Tool Server discovery |
+| `POST` | `/tool/preview_app` | Spawn a sandbox and return an inline-rendered iframe (Content-Disposition: inline) — see [Tool Server section](#openwebui-tool-server-tool) |
 
 There is no `PATCH`/`PUT`/`OPTIONS` surface on this service.
 
@@ -251,14 +253,19 @@ Parameters (same field semantics as `POST /run`):
 | `entrypoint` | string | no |
 | `ttl_seconds` | int | no |
 
-Result:
-```json
-{
-  "url":         "http://sandbox-proxy/a1b2c3d4e5f6/",
-  "sandbox_id":  "a1b2c3d4e5f6",
-  "expires_at":  "2026-08-27T18:15:32.114513+00:00"
-}
+**Result — a single string (not a JSON object)**:
+
 ```
+Preview ready. Sandbox `a1b2c3d4e5f6` at http://sandbox-proxy/a1b2c3d4e5f6/ (expires 2026-08-27T18:15:32.114513+00:00).
+
+```html
+<iframe src="http://sandbox-proxy/a1b2c3d4e5f6/" style="width:100%;height:600px;border:0;border-radius:8px;background:#0e1116" allow="clipboard-read; clipboard-write" loading="lazy"></iframe>
+```
+```
+
+The string is what MCP delivers to the model as `content[0].text`. When the model relays the tool result to the user, OpenWebUI's markdown renderer picks up the ` ```html ` fenced block and promotes it to an inline iframe artifact — no additional model prompting required. The plain-text lines above the block give the model + user useful context if HTML rendering is disabled or the model paraphrases.
+
+**Important:** the tool's docstring instructs the model to include the returned string VERBATIM in its response. If the model paraphrases or drops the ` ```html ` block, the preview won't render. If you find this happens often, consider using the [`/tool/preview_app` REST endpoint](#openwebui-tool-server-tool) instead — that path bypasses the model and lets OpenWebUI render the iframe directly.
 
 ### JSON-RPC method examples
 
@@ -312,6 +319,59 @@ curl -X POST http://localhost:8012/mcp/ \
 ```
 
 Session semantics: the first `initialize` returns a session id in the response headers (`Mcp-Session-Id`). Subsequent calls should include it as a request header. FastMCP handles this automatically for clients that follow the streamable-HTTP spec (LiteLLM, Claude Code, etc.).
+
+---
+
+## OpenWebUI Tool Server (`/tool`)
+
+A separate FastAPI sub-app mounted at `/tool`, purpose-built for OpenWebUI's **rich UI Tool Server** integration (docs: [Extensibility → Plugin Development → Rich UI](https://docs.openwebui.com/features/extensibility/plugin/development/rich-ui/)).
+
+**Register in OpenWebUI:** Admin Panel → Settings → Tools → Add Connection.
+Base URL (on `ai_shared`): `http://sandbox-runner:8000/tool`
+Base URL (from the host): `http://localhost:8012/tool`
+
+OpenWebUI fetches `GET /tool/openapi.json` to discover the tool schema, then calls `POST /tool/preview_app` when the model wants to embed a preview. The response has `Content-Disposition: inline` so OpenWebUI renders it as a sandboxed iframe under the tool call indicator.
+
+### `GET /tool/openapi.json`
+
+Auto-generated OpenAPI 3.0 schema. Used by OpenWebUI at Tool-Server registration time.
+
+**Request:**
+```bash
+curl http://localhost:8012/tool/openapi.json
+```
+
+### `POST /tool/preview_app`
+
+Spawn a sandbox and return the iframe HTML directly (not JSON). Same body as `POST /run`.
+
+**Request:**
+```bash
+curl -X POST http://localhost:8012/tool/preview_app \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "runtime": "static",
+    "files": {"index.html": "<h1>hello from tool server</h1>"}
+  }'
+```
+
+**Response headers:**
+```
+Content-Type: text/html; charset=utf-8
+Content-Disposition: inline
+Access-Control-Expose-Headers: Content-Disposition
+```
+
+**Response body:**
+```html
+<iframe src="http://sandbox-proxy/abc123def456/" style="width:100%;height:600px;border:0;border-radius:8px;background:#0e1116" allow="clipboard-read; clipboard-write" loading="lazy"></iframe>
+```
+
+**Why `Content-Disposition: inline` matters:** without it, OpenWebUI treats the response as a plain text blob and dumps it into the chat instead of rendering the iframe as a rich-UI artifact. Same story for `Access-Control-Expose-Headers` — some OpenWebUI builds check the header from a cross-origin fetch, and browsers hide it from JS unless the server exposes it explicitly.
+
+**How the URL renders:** the outer OpenWebUI iframe is sandboxed with `allow-scripts allow-downloads` by default. The inner `<iframe src="http://sandbox-proxy/...">` is a nested iframe that loads the actual sandbox output. Because OpenWebUI's outer sandbox defaults to `allowSameOrigin=OFF`, dynamic auto-resizing via the `postMessage` height reporter would require a script inside the sandbox app itself — which we don't control. The iframe uses a fixed `height:600px` as a pragmatic default.
+
+**Errors:** same status codes as `POST /run` (`400` unknown runtime, `429` pool full, `500` spawn failure, `504` readiness timeout). Errors return JSON rather than HTML.
 
 ---
 

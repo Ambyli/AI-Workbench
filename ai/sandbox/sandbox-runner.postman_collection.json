@@ -182,6 +182,41 @@
       "response": []
     },
     {
+      "name": "GET /tool/openapi.json",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/tool/openapi.json",
+          "host": ["{{baseUrl}}"],
+          "path": ["tool", "openapi.json"]
+        },
+        "description": "OpenAPI schema for the OpenWebUI Tool Server integration. Register the tool server in OpenWebUI Admin Panel → Settings → Tools → Add Connection with base URL {{baseUrl}}/tool — OpenWebUI GETs this schema at registration time."
+      },
+      "response": []
+    },
+    {
+      "name": "POST /tool/preview_app",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"runtime\": \"static\",\n  \"files\": {\n    \"index.html\": \"<h1>hello from tool server</h1>\"\n  }\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": {
+          "raw": "{{baseUrl}}/tool/preview_app",
+          "host": ["{{baseUrl}}"],
+          "path": ["tool", "preview_app"]
+        },
+        "description": "OpenWebUI Rich-UI integration. Returns HTMLResponse with `Content-Disposition: inline` — OpenWebUI renders the response body (an `<iframe>` pointing at sandbox-proxy) as an embedded artifact under the tool call indicator, no model round-trip needed. Response Content-Type is text/html (not JSON). See ai/sandbox/ENDPOINTS.md § OpenWebUI Tool Server for details."
+      },
+      "response": []
+    },
+    {
       "name": "MCP",
       "description": "FastMCP JSON-RPC over HTTP. All requests are POST /mcp/ (trailing slash required — the runner responds to POST /mcp with 307 → /mcp/). Every client must send `Accept: application/json, text/event-stream` and start with `initialize`. FastMCP returns responses as SSE events by default; if you need a single JSON response, some clients unwrap the SSE frame automatically.",
       "item": [

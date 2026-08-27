@@ -66,6 +66,22 @@ services:
       WEBUI_AUTH_TRUSTED_EMAIL_HEADER: "${OPENWEBUI_WEBUI_AUTH_TRUSTED_EMAIL_HEADER}"
       WEBUI_AUTH_TRUSTED_NAME_HEADER: "${OPENWEBUI_WEBUI_AUTH_TRUSTED_NAME_HEADER}"
 
+      # Post-signout redirect. Without this, "Log out" only clears the
+      # OpenWebUI cookie — the next page load carries the still-valid
+      # oauth2-proxy cookie, X-Forwarded-Email gets re-added, and
+      # trusted-header auth immediately signs the user back in. Setting
+      # this to oauth2-proxy's /oauth2/sign_out endpoint chains the
+      # logouts: OpenWebUI clears its session, then oauth2-proxy clears
+      # its cookie, then the browser lands back on / with no valid
+      # session anywhere and the user sees the Google sign-in page.
+      #
+      # Note: this does NOT sign the user out of Google itself — that
+      # would be too invasive (kicks them out of Gmail, Docs, etc). If
+      # they still have an active Google session, clicking "sign in"
+      # will Google-SSO them straight back in without a password prompt.
+      # This is the expected behavior for a Workspace-gated app.
+      WEBUI_AUTH_SIGNOUT_REDIRECT_URL: "${OPENWEBUI_WEBUI_AUTH_SIGNOUT_REDIRECT_URL}"
+
       # User-Agent for langchain_community outbound HTTP (RAG / web loaders).
       USER_AGENT: "${OPENWEBUI_USER_AGENT}"
 

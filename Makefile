@@ -22,6 +22,14 @@ $(eval $(call service,interceptor,interceptor))
 $(eval $(call service,searxng,searxng))
 $(eval $(call service,sandbox,sandbox-db sandbox-egress sandbox-proxy sandbox-runner))
 
+# Extra compose profiles per stack. `--profile build` gates the sandbox
+# base-image build services (sandbox-static-image, sandbox-python-image,
+# sandbox-node-image) so they don't appear as broken "up" services, but
+# `make build sandbox` MUST include them or `POST /run` later fails with
+# "No such image: sandbox-python:latest". Add other per-stack profile
+# lists here as more stacks need them.
+PROFILES_sandbox := build
+
 # Parse positional args: first goal is the verb, remaining goals are:
 #   $(STACK) — compose stack name (optional; empty = all stacks)
 #   $(SVC)   — service filter within that stack (optional; empty = stack defaults)
@@ -88,9 +96,9 @@ build:
 	$(check_stack)
 ifdef STACK
 	$(DC) pull --ignore-pull-failures $(SERVICES)
-	$(DC) build $(SERVICES)
+	$(DC) $(if $(PROFILES_$(STACK)),$(foreach p,$(PROFILES_$(STACK)),--profile $(p))) build $(if $(SVC),$(SVC))
 else
-	$(foreach s,$(STACKS),$(DC_$(s)) pull --ignore-pull-failures && $(DC_$(s)) build &&) true
+	$(foreach s,$(STACKS),$(DC_$(s)) pull --ignore-pull-failures && $(DC_$(s)) $(if $(PROFILES_$(s)),$(foreach p,$(PROFILES_$(s)),--profile $(p))) build &&) true
 endif
 
 logs:
@@ -122,7 +130,12 @@ help:
 	@echo "  make up                    # start every stack"
 	@echo "  make up vllm               # start vllm stack (default services)"
 	@echo "  make up vllm qwen3.6       # start only qwen3.6 in vllm stack"
+	@echo "  make build sandbox         # build runner + egress + all base images"
 	@echo "  make logs kokoro           # tail kokoro logs"
+	@echo ""
+	@echo "Note: 'make build sandbox' also builds the sandbox base images"
+	@echo "(sandbox-static, sandbox-python, sandbox-node) via the 'build'"
+	@echo "compose profile — required before the runner can spawn anything."
 	@echo ""
 
 .PHONY: setup network up down clean very-clean build logs help

@@ -50,7 +50,7 @@ from common.jobs.router import build_router
 # PyPI package that FastMCP itself imports internally (from mcp.types
 # import ...) — that manifests as a confusing "FastMCP server support
 # is not installed" ImportError at startup.
-from sandbox_mcp import build_mcp, _IFRAME_HEIGHT_PX
+from sandbox_mcp import build_mcp, _IFRAME_HEIGHT_CSS
 from reaper import Reaper
 from runtimes import RUNTIMES, get_runtime
 from spawner import Spawner
@@ -401,7 +401,7 @@ def _render_tool_html(url: str, sandbox_id: str) -> str:
 <body style="margin:0;font-family:system-ui;background:#0e1116;color:#e6edf3">
   <iframe
       src="{url}"
-      style="width:100%;height:{_IFRAME_HEIGHT_PX}px;border:0;display:block;background:#0e1116"
+      style="width:100%;height:{_IFRAME_HEIGHT_CSS};border:0;display:block;background:#0e1116"
       sandbox="allow-scripts allow-forms allow-popups allow-same-origin allow-downloads"
       allow="clipboard-read; clipboard-write"
       loading="lazy"

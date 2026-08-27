@@ -259,7 +259,7 @@ Parameters (same field semantics as `POST /run`):
 Preview ready. Sandbox `a1b2c3d4e5f6` at http://sandbox-proxy/a1b2c3d4e5f6/ (expires 2026-08-27T18:15:32.114513+00:00).
 
 ```html
-<iframe src="http://sandbox-proxy/a1b2c3d4e5f6/" style="width:100%;height:600px;border:0;border-radius:8px;background:#0e1116" allow="clipboard-read; clipboard-write" loading="lazy"></iframe>
+<iframe src="http://sandbox-proxy/a1b2c3d4e5f6/" style="width:100%;height:min(85vh, 900px);border:0;border-radius:8px;background:#0e1116" allow="clipboard-read; clipboard-write" loading="lazy"></iframe>
 ```
 ```
 

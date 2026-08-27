@@ -35,18 +35,19 @@ from pydantic import Field
 from runtimes import describe_runtimes
 
 
-# Fixed iframe height. Cannot use the OpenWebUI-recommended postMessage
-# height-reporter here because the reporter would need to live *inside*
-# the sandbox's HTML (Streamlit, Vite, etc.) — code we don't control.
-# 600px is enough for most demos and still scrolls if the app is taller.
-_IFRAME_HEIGHT_PX = 600
+# Responsive iframe height. Cannot use the OpenWebUI-recommended postMessage
+# height-reporter here because the reporter would need to live *inside* the
+# sandbox's HTML (Streamlit, Vite, etc.) — code we don't control. Instead
+# scale to the viewport with a hard ceiling so a tall preview doesn't push
+# the chat context off-screen.
+_IFRAME_HEIGHT_CSS = "min(85vh, 900px)"
 
 
 def _render_html_block(url: str) -> str:
     """Return an OpenWebUI-friendly HTML iframe block for the given URL."""
     return (
         f'<iframe src="{url}" '
-        f'style="width:100%;height:{_IFRAME_HEIGHT_PX}px;border:0;'
+        f'style="width:100%;height:{_IFRAME_HEIGHT_CSS};border:0;'
         f'border-radius:8px;background:#0e1116" '
         f'allow="clipboard-read; clipboard-write" '
         f'loading="lazy"></iframe>'

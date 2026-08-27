@@ -85,6 +85,29 @@ _reaper: Optional[Reaper] = None
 _slot_sem: Optional[asyncio.Semaphore] = None
 
 
+# ── MCP server + ASGI app ─────────────────────────────────────────────────
+# Build here (module scope, before the FastAPI construction) so we can
+# compose the MCP app's lifespan into ours. The tool implementation
+# (_mcp_run below) references module globals that are populated in the
+# FastAPI lifespan — that's fine because it's called lazily.
+async def _mcp_run(
+    runtime: str,
+    files: dict[str, str],
+    entrypoint: Optional[str],
+    ttl_seconds: Optional[int],
+) -> dict:
+    return await _spawn_and_track(runtime, files, entrypoint, ttl_seconds)
+
+
+_mcp = build_mcp(_mcp_run)
+# path="/" so FastMCP puts its transport at the mount root — mounting
+# the returned ASGI app at /mcp then gives clients a single POST /mcp/
+# endpoint. Without this, FastMCP defaults to /mcp/ inside the mounted
+# app, so the full URL becomes /mcp/mcp/ and every client (including
+# LiteLLM) hits 404 on POST /mcp/.
+_mcp_app = _mcp.http_app(path="/")
+
+
 @asynccontextmanager
 async def lifespan(app_: FastAPI):
     global _registry, _spawner, _reaper, _slot_sem
@@ -100,13 +123,18 @@ async def lifespan(app_: FastAPI):
     app_.include_router(
         build_router(_registry, include_delete=False)
     )
-    try:
-        yield
-    finally:
-        if _reaper is not None:
-            await _reaper.stop()
-        if _registry is not None:
-            await _registry.close()
+    # Compose the MCP app's lifespan — FastMCP's streamable-HTTP
+    # transport initializes session state in its lifespan; skipping this
+    # means POST /mcp/ succeeds at the routing layer but throws inside
+    # the tool handler.
+    async with _mcp_app.lifespan(app_):
+        try:
+            yield
+        finally:
+            if _reaper is not None:
+                await _reaper.stop()
+            if _registry is not None:
+                await _registry.close()
 
 
 app = FastAPI(title="sandbox-runner", lifespan=lifespan)
@@ -256,16 +284,7 @@ async def delete_sandbox(sandbox_id: str) -> None:
 
 
 # ── MCP mount ─────────────────────────────────────────────────────────────
-# Build the MCP server with the shared spawn callable, then mount its ASGI
-# app under /mcp. LiteLLM's mcp_servers entry points at this path.
-async def _mcp_run(
-    runtime: str,
-    files: dict[str, str],
-    entrypoint: Optional[str],
-    ttl_seconds: Optional[int],
-) -> dict:
-    return await _spawn_and_track(runtime, files, entrypoint, ttl_seconds)
-
-
-_mcp = build_mcp(_mcp_run)
-app.mount("/mcp", _mcp.http_app())
+# The MCP ASGI app is built at module import (see the `_mcp_app` block
+# near the top of this file so its lifespan can be composed into
+# FastAPI's). We only need to attach it to the router here.
+app.mount("/mcp", _mcp_app)

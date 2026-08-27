@@ -168,6 +168,48 @@ Register in **Admin Panel → Settings → Tools → Add Connection** with base 
 
 OpenWebUI discovers the tool schema at `GET /tool/openapi.json` and calls `POST /tool/preview_app`. The response uses `Content-Disposition: inline`, which OpenWebUI recognizes as a rich-UI embed and renders the returned `<iframe>` as an inline sandboxed artifact. See [`ENDPOINTS.md § OpenWebUI Tool Server`](ENDPOINTS.md#openwebui-tool-server-tool) for the full contract.
 
+## Public iframe routing
+
+The tool returns an `<iframe src="…">`, and the user's browser is the one that has to fetch that URL. This deployment routes sandbox traffic **under the same origin as Open WebUI**, so the auth cookie flows automatically and there is no cross-origin CSP surprise.
+
+**Traffic path:**
+
+```
+browser ──HTTPS── cloudflared ──HTTP── oauth2-proxy ──HTTP── sandbox-proxy ──HTTP── sandbox-{id}:80
+   (chat.zeoenergy.com/sandboxes/{id}/*)                       (Caddy)          (sandbox_net)
+```
+
+Concretely:
+
+- **`SANDBOX_PROXY_URL=https://chat.zeoenergy.com/sandboxes`** (`.env`) — the runner uses this as the iframe `src` prefix. Set to a public URL under the same host as Open WebUI.
+- **`OAUTH2_PROXY_UPSTREAMS`** (`.env`) includes `http://sandbox-proxy:80/sandboxes/` alongside the openwebui and oauth2-assets upstreams. oauth2-proxy does longest-prefix match — `/sandboxes/*` gets forwarded to sandbox-proxy (path prefix preserved), everything else still goes to openwebui.
+- **`ai/sandbox/Caddyfile`** has a route matcher for `^/sandboxes/(?P<id>[a-f0-9]{12})(/.*)?$` that strips the `/sandboxes/{id}` prefix and reverse-proxies to `sandbox-{id}:80` on `sandbox_net`. The bare `^/(?P<id>…)$` route is kept alongside it so `curl http://localhost:8011/{id}/` still works for host-side debugging.
+
+**Auth behavior:** the `/sandboxes/*` path is **not** in `OAUTH2_PROXY_SKIP_AUTH_ROUTES`, so oauth2-proxy gates it exactly like the rest of Open WebUI. An authenticated browser at `chat.zeoenergy.com` has the `_oauth2_proxy` cookie for the whole domain, so the iframe fetch is silently authorized — the user sees a rendered preview with no extra sign-in step. An anonymous request to `/sandboxes/{id}/` gets the branded Google sign-in page.
+
+**When to change any of this:**
+
+- Different chat host? Update both `SANDBOX_PROXY_URL` and the cookie/redirect settings you already have for that host.
+- Want the sandbox on a separate subdomain (e.g. `sandboxes.zeoenergy.com` via its own cloudflared tunnel, no auth gate)? Set `SANDBOX_PROXY_URL` to that URL, remove the `/sandboxes/` upstream from `OAUTH2_PROXY_UPSTREAMS`, and drop the `/sandboxes/{id}/` route from the Caddyfile (or leave it — it's harmless if unused). This trades single-origin ergonomics for the ability to serve sandboxes without an auth cookie.
+
+**Verifying end-to-end:**
+
+```bash
+# From the host — spawn a sandbox and confirm the returned URL is the public one.
+curl -X POST http://localhost:8012/run \
+  -H 'Content-Type: application/json' \
+  -d '{"runtime":"static","files":{"index.html":"<h1>hi</h1>"}}'
+# Response url should look like https://chat.zeoenergy.com/sandboxes/<id>/
+
+# From any container on ai_shared — confirm both routes serve the same content.
+docker exec <any-ai_shared-container> sh -c \
+  "wget -qO- http://sandbox-proxy/sandboxes/<id>/"
+# → serves the sandbox's HTML.
+
+# From a browser signed in at chat.zeoenergy.com — open the returned URL directly.
+# → serves the sandbox's HTML, no extra sign-in required.
+```
+
 ## Operator runbook
 
 ### First-time setup

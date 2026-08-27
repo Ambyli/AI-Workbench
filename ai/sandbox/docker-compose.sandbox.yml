@@ -156,9 +156,14 @@ services:
       - SANDBOX_NET_NAME=sandbox_net
       # Where the runner tells sandboxes to send outbound HTTP.
       - SANDBOX_EGRESS_URL=http://sandbox-egress:8888
-      # Public URL prefix used to build the returned preview URL.
-      # openwebui reaches this via ai_shared: http://sandbox-proxy:80
-      - SANDBOX_PROXY_URL=http://sandbox-proxy
+      # Public URL prefix used to build the returned preview URL —
+      # this becomes the iframe src the user's browser fetches. The
+      # container-name default only works for host-side smoke tests;
+      # for browsers behind cloudflared, set SANDBOX_PROXY_URL in .env
+      # to a public URL (e.g. https://chat.zeoenergy.com/sandboxes) and
+      # add sandbox-proxy to OAUTH2_PROXY_UPSTREAMS. See ai/sandbox/
+      # SANDBOX.md § Public iframe routing.
+      - SANDBOX_PROXY_URL=${SANDBOX_PROXY_URL:-http://sandbox-proxy}
       # PostgresRegistry DSN. Runner assembles it from the parts below if
       # SANDBOX_DB_DSN isn't set explicitly.
       - SANDBOX_DB_HOST=sandbox-db

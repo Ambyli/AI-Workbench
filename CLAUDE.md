@@ -65,6 +65,7 @@ Key variables:
 | `SANDBOX_EGRESS_ALLOWLIST` | _(empty)_ | Sandbox: additive to `ai/sandbox/tinyproxy.filter`. Prefer editing the filter file (source of truth); use this only for per-deployment tweaks. |
 | `SANDBOX_DB_USER` / `_PASSWORD` / `_NAME` | `sandbox` / `sandbox` / `sandbox` | Sandbox: credentials for the compose-managed `sandbox-db` Postgres backing `PostgresRegistry`. Same dev-default guidance as `ROOFIX_DB_*` — override before exposing anything past `sandbox_state`. |
 | `PORT_SANDBOX_RUNNER` / `_PROXY` / `_DB` | `8012` / `8011` / `5434` | Sandbox: host ports. Runner is FastAPI + MCP; proxy is Caddy serving `/{sandbox_id}/*`; db is a Postgres exposed for operator inspection. Postgres ports are grouped: `5432` (litellm_db), `5433` (roofix-db), `5434` (sandbox-db). |
+| `SANDBOX_PROXY_URL` | `https://chat.zeoenergy.com/sandboxes` | Sandbox: public URL prefix the runner returns as the iframe `src` for previews (via `POST /run`, `/tool/preview_app`, and the `preview_app` MCP tool). This deployment routes sandbox traffic through the same origin as Open WebUI — `oauth2-proxy` has `http://sandbox-proxy:80/sandboxes/` in `OAUTH2_PROXY_UPSTREAMS`, so `chat.zeoenergy.com/sandboxes/{id}/*` is authenticated by the existing session cookie and reverse-proxied to sandbox-proxy. See `ai/sandbox/SANDBOX.md § Public iframe routing` for the full traffic path and how to change deployment topologies. |
 
 ## Threading Model — Read Before Touching Anything
 

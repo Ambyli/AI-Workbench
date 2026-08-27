@@ -108,7 +108,6 @@ services:
   sandbox-egress:
     # Built locally — see Dockerfile.sandbox-egress for why we don't use
     # dannydirect/tinyproxy anymore.
-    image: sandbox-egress:latest
     build:
       context: ..
       dockerfile: sandbox/Dockerfile.sandbox-egress

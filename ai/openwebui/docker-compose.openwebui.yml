@@ -13,7 +13,24 @@ services:
     container_name: openwebui
     restart: unless-stopped
     ports:
-      - "${PORT_OPENWEBUI}:8080"
+      # Bound to 127.0.0.1 (host-loopback) ONLY — NOT 0.0.0.0.
+      #
+      # Trusted-header SSO (WEBUI_AUTH_TRUSTED_EMAIL_HEADER below) makes any
+      # request carrying X-Forwarded-Email auto-log-in as that user. If the
+      # port were published on all interfaces, anyone on the LAN could send
+      # `X-Forwarded-Email: admin@zeoenergy.com` directly to :8007 and land
+      # in that account with no Google prompt at all.
+      #
+      # External access still works: cloudflared → oauth2-proxy → openwebui
+      # all happen over the ai_shared Docker network, none of which uses
+      # this host publish. Only direct-from-host debugging (curl on the
+      # server itself, or a local browser hitting http://localhost:8007)
+      # goes through the loopback binding.
+      #
+      # If you re-open this to 0.0.0.0, you MUST also blank out
+      # OPENWEBUI_WEBUI_AUTH_TRUSTED_EMAIL_HEADER / _NAME_HEADER in .env,
+      # or every LAN device becomes an admin account creator.
+      - "127.0.0.1:${PORT_OPENWEBUI}:8080"
     environment:
       # All values are sourced from .env — edit there, not here.
       OPENAI_API_BASE_URL: "${OPENWEBUI_OPENAI_API_BASE_URL}"
@@ -34,6 +51,20 @@ services:
       GOOGLE_CLIENT_ID: "${OPENWEBUI_GOOGLE_CLIENT_ID}"
       GOOGLE_CLIENT_SECRET: "${OPENWEBUI_GOOGLE_CLIENT_SECRET}"
       OPENID_PROVIDER_URL: "${OPENWEBUI_OPENID_PROVIDER_URL}"
+
+      # Trusted-header SSO from oauth2-proxy. When set, requests carrying
+      # WEBUI_AUTH_TRUSTED_EMAIL_HEADER are auto-authenticated as that
+      # email — first hit creates an account, subsequent hits sign in.
+      # oauth2-proxy sets X-Forwarded-Email / X-Forwarded-User because
+      # OAUTH2_PROXY_PASS_USER_HEADERS=true in .env. Together they turn
+      # the double-login (Google → Google-again-inside-OpenWebUI) into a
+      # single Google-only login.
+      #
+      # SECURITY: OpenWebUI must NOT be reachable except via oauth2-proxy.
+      # Anyone who can hit openwebui:8080 directly can spoof this header.
+      # See ai/openwebui/OPENWEBUI.md § Trusted-header SSO.
+      WEBUI_AUTH_TRUSTED_EMAIL_HEADER: "${OPENWEBUI_WEBUI_AUTH_TRUSTED_EMAIL_HEADER}"
+      WEBUI_AUTH_TRUSTED_NAME_HEADER: "${OPENWEBUI_WEBUI_AUTH_TRUSTED_NAME_HEADER}"
 
       # User-Agent for langchain_community outbound HTTP (RAG / web loaders).
       USER_AGENT: "${OPENWEBUI_USER_AGENT}"

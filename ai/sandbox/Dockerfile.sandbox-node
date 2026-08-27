@@ -49,9 +49,13 @@ ENTRY
 
 RUN chmod +x /usr/local/bin/sandbox-entrypoint.sh
 
-# Non-root user matching the runner's --user 1000:1000. HOME points at
-# /home/sandbox which the runner mounts as a tmpfs.
-RUN useradd --uid 1000 --user-group --create-home --home-dir /home/sandbox sandbox
+# node:20-slim already ships a `node` user at uid 1000, so `useradd
+# --uid 1000` fails "UID is not unique". We only need uid 1000 to
+# exist and /home/sandbox to be writable by it — the name is irrelevant
+# since the runner's `USER 1000:1000` references the uid, not the login
+# name. Skip creation, just prepare the home dir.
+RUN mkdir -p /home/sandbox && \
+    chown 1000:1000 /home/sandbox
 
 USER 1000:1000
 ENV HOME=/home/sandbox \

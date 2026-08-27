@@ -50,7 +50,7 @@ from common.jobs.router import build_router
 # PyPI package that FastMCP itself imports internally (from mcp.types
 # import ...) — that manifests as a confusing "FastMCP server support
 # is not installed" ImportError at startup.
-from sandbox_mcp import build_mcp, _render_html_block
+from sandbox_mcp import build_mcp, _IFRAME_HEIGHT_PX
 from reaper import Reaper
 from runtimes import RUNTIMES, get_runtime
 from spawner import Spawner
@@ -200,7 +200,23 @@ async def _spawn_and_track(
     except KeyError:
         raise HTTPException(
             400,
-            f"unknown runtime {runtime!r}. Valid: {sorted(RUNTIMES)}",
+            f"unknown runtime {runtime!r}. Valid: {sorted(RUNTIMES)}. "
+            "Call list_runtimes for full descriptions.",
+        )
+
+    # Reject an entrypoint on a runtime that doesn't allow one. This is
+    # a targeted guard against a real failure mode we've seen: a model
+    # picks runtime=static and sets entrypoint="python3 -m http.server
+    # 80", nginx never starts, the readiness probe times out at 30s,
+    # and the caller gets an opaque 504. Failing upfront with a
+    # specific message gives the model a corrective signal on retry.
+    if not rt.allows_custom_entrypoint and entrypoint:
+        raise HTTPException(
+            400,
+            f"the {runtime!r} runtime does not accept a custom entrypoint "
+            f"(it uses a fixed process: {rt.default_entrypoint!r}). "
+            "Remove the `entrypoint` field, or switch to runtime=python or "
+            "runtime=node if you need to run a specific command.",
         )
 
     # Fast-fail if the pool is full. wait_for with a short timeout works
@@ -364,17 +380,54 @@ class ToolPreviewAppRequest(BaseModel):
     )
 
 
+def _render_tool_html(url: str, sandbox_id: str) -> str:
+    """Wrap the sandbox iframe in a full HTML document.
+
+    Compared to just ``<iframe src="…">``, this:
+      * Ships as a complete document so OpenWebUI's outer sandboxed
+        iframe treats it as a real page (some sanitizers strip a bare
+        <iframe> tag but leave a document's body iframe alone).
+      * Renders the URL as a visible link fallback so the user can
+        open the preview in a new tab even if the nested iframe is
+        blocked by the outer sandbox attribute (this is the failure
+        mode where "the rendered element is blank" — we've hit it).
+      * Sets ``sandbox`` on the nested iframe explicitly so the browser
+        gives the sandbox app the permissions it needs (scripts, forms,
+        popups) rather than inheriting the parent's restrictive default.
+    """
+    return f"""<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>sandbox preview</title></head>
+<body style="margin:0;font-family:system-ui;background:#0e1116;color:#e6edf3">
+  <iframe
+      src="{url}"
+      style="width:100%;height:{_IFRAME_HEIGHT_PX}px;border:0;display:block;background:#0e1116"
+      sandbox="allow-scripts allow-forms allow-popups allow-same-origin allow-downloads"
+      allow="clipboard-read; clipboard-write"
+      loading="lazy"
+      referrerpolicy="no-referrer"></iframe>
+  <p style="padding:8px 12px;margin:0;font-size:12px;opacity:0.75">
+    Sandbox <code>{sandbox_id}</code> &middot;
+    <a href="{url}" target="_top" style="color:#8ab4f8">Open in new tab</a>
+  </p>
+</body>
+</html>"""
+
+
 @tool_app.post(
     "/preview_app",
     response_class=HTMLResponse,
-    summary="Spawn a sandbox and return an iframe that renders inline in chat",
+    operation_id="preview_app",  # OpenWebUI uses this as the tool name.
+    summary="Spawn a sandbox and render its preview inline",
     description=(
         "Spawns a sandbox container from the supplied files + entrypoint "
-        "and returns an HTML iframe pointing at it. The response uses "
-        "Content-Disposition: inline, which OpenWebUI recognizes as a "
-        "rich-UI embed and renders as a sandboxed iframe under the tool "
-        "call. See https://docs.openwebui.com/features/extensibility/"
-        "plugin/development/rich-ui/."
+        "and returns an HTML page containing an iframe pointing at it. "
+        "The response uses Content-Disposition: inline, which OpenWebUI "
+        "recognizes as a rich-UI embed. See "
+        "https://docs.openwebui.com/features/extensibility/plugin/"
+        "development/rich-ui/. If the model has not seen this deployment "
+        "before, call `list_runtimes` first to see which runtimes are "
+        "available."
     ),
 )
 async def tool_preview_app(req: ToolPreviewAppRequest) -> HTMLResponse:
@@ -382,7 +435,7 @@ async def tool_preview_app(req: ToolPreviewAppRequest) -> HTMLResponse:
         req.runtime, req.files, req.entrypoint, req.ttl_seconds
     )
     return HTMLResponse(
-        content=_render_html_block(result["url"]),
+        content=_render_tool_html(result["url"], result["sandbox_id"]),
         headers={
             "Content-Disposition": "inline",
             # Re-declared here even though CORSMiddleware sets it — some
@@ -391,6 +444,23 @@ async def tool_preview_app(req: ToolPreviewAppRequest) -> HTMLResponse:
             "Access-Control-Expose-Headers": "Content-Disposition",
         },
     )
+
+
+@tool_app.get(
+    "/list_runtimes",
+    operation_id="list_runtimes",  # OpenWebUI uses this as the tool name.
+    summary="Describe the runtimes available on this sandbox deployment",
+    description=(
+        "Returns metadata for each runtime: summary, default entrypoint, "
+        "pre-baked packages, and a minimal example files map. Call this "
+        "BEFORE `preview_app` if you're unsure which runtime fits the "
+        "user's request or which packages are already installed. It "
+        "requires no arguments and does not spawn anything."
+    ),
+)
+async def tool_list_runtimes() -> list[dict]:
+    from runtimes import describe_runtimes as _dr  # lazy: avoid cycle at import
+    return _dr()
 
 
 app.mount("/tool", tool_app)

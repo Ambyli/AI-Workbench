@@ -32,6 +32,8 @@ from typing import Optional
 from fastmcp import FastMCP
 from pydantic import Field
 
+from runtimes import describe_runtimes
+
 
 # Fixed iframe height. Cannot use the OpenWebUI-recommended postMessage
 # height-reporter here because the reporter would need to live *inside*
@@ -61,12 +63,28 @@ def build_mcp(run_callable) -> FastMCP:
     mcp = FastMCP(name="sandbox")
 
     @mcp.tool()
+    async def list_runtimes() -> list[dict]:
+        """Return the sandbox runtimes available on this deployment.
+
+        Each entry describes one runtime's summary, default entrypoint,
+        pre-baked packages, and an example ``files`` map. **Call this
+        FIRST if you're unsure which runtime fits the user's request** —
+        it saves guessing (and the resulting readiness-timeout errors)
+        and shows you which packages are already installed so you don't
+        wastefully include them in requirements.txt.
+        """
+        return describe_runtimes()
+
+    @mcp.tool()
     async def preview_app(
         runtime: str = Field(
             description=(
-                "One of: 'static' (HTML/CSS/JS), 'python' (Streamlit/Gradio/"
-                "Flask/FastAPI), or 'node' (Vite/React/Next/Express). Pick "
-                "the one that fits the framework the user asked for."
+                "One of the names returned by list_runtimes. Currently: "
+                "'static' (HTML/CSS/JS via nginx), 'python' (Streamlit/"
+                "Gradio/Flask/FastAPI), or 'node' (Vite/React/Next/"
+                "Express). Call list_runtimes first if unsure — it "
+                "returns the full runtime schema including which one "
+                "fits a given framework."
             )
         ),
         files: dict[str, str] = Field(
@@ -74,7 +92,8 @@ def build_mcp(run_callable) -> FastMCP:
                 "Map of relative path → file contents. Every file the app "
                 "needs must be included. For Python, add requirements.txt "
                 "if you need packages beyond the pre-baked set. For Node, "
-                "add package.json."
+                "add package.json. list_runtimes returns an example "
+                "files map for each runtime."
             )
         ),
         entrypoint: Optional[str] = Field(
@@ -82,7 +101,10 @@ def build_mcp(run_callable) -> FastMCP:
             description=(
                 "Shell command run inside the sandbox. Must bind to port "
                 "80. Leave unset to use the runtime's default (streamlit "
-                "for python, serve for node, nginx for static)."
+                "for python, serve for node, nginx for static). NOTE: "
+                "the 'static' runtime does NOT accept a custom "
+                "entrypoint — nginx is fixed. Setting one for static "
+                "will return a 400 error."
             ),
         ),
         ttl_seconds: Optional[int] = Field(

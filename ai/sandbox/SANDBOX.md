@@ -14,21 +14,24 @@ If a fenced ` ```html ` block would do the job, prefer that — Open WebUI rende
 
 The single security control that matters is **network segmentation**. Everything else is defense in depth.
 
-Three Docker networks:
+Four Docker networks:
 
 | Network | Type | Members |
 |---|---|---|
 | `ai_shared` | external bridge | openwebui, litellm, `sandbox-runner`, `sandbox-proxy` |
 | `sandbox_net` | bridge, `internal: true` | `sandbox-runner`, `sandbox-proxy`, `sandbox-egress`, every `sandbox-{id}` |
 | `sandbox_state` | bridge, `internal: true` | `sandbox-runner`, `sandbox-db` |
+| `sandbox_egress_out` | bridge (NOT `internal`) | `sandbox-egress` **only** |
 
-`internal: true` means Docker **does not attach a default gateway**. A container on `sandbox_net` that tries to hit the host, the internet, or any container on `ai_shared` has no route — the packets go nowhere.
+`internal: true` means Docker **does not attach a default gateway**. A container on `sandbox_net` or `sandbox_state` that tries to hit the host, the internet, or any container on `ai_shared` has no route — the packets go nowhere.
+
+`sandbox_egress_out` is the exception: it is *not* internal, so it does have a default gateway and can reach the public internet. It exists solely to give `sandbox-egress` its outbound leg after the allowlist filter runs. No sandbox, no state store, and nothing else in the stack attaches to it. Sandboxes reach the internet ONLY by first hitting `sandbox-egress` on `sandbox_net`, passing the filter, and then being forwarded out via `sandbox_egress_out`.
 
 Consequences:
 
 - Sandboxed code cannot reach `litellm`, `phoenix-mcp`, `roofix-db`, `interceptor`, `openwebui`, or any other stack service by name.
 - Sandboxed code cannot reach `sandbox-db` — the job store lives on `sandbox_state`, which sandboxes don't touch. Only `sandbox-runner` bridges to `sandbox_state`.
-- Outbound HTTP from a sandbox must go through `sandbox-egress`, which enforces a domain allowlist (`pypi.org`, `files.pythonhosted.org`, `registry.npmjs.org`, `esm.sh`, `cdn.jsdelivr.net`). Anything else drops.
+- Sandboxed code cannot reach the internet directly — `sandbox_net` has no default gateway, so packets have nowhere to go except `sandbox-egress:8888`, which enforces a domain allowlist (`pypi.org`, `files.pythonhosted.org`, `registry.npmjs.org`, `esm.sh`, `cdn.jsdelivr.net`). Anything else is refused with 403 Filtered.
 
 Per-container hardening (all applied by `spawner.py`):
 
@@ -79,16 +82,24 @@ If any of the "must fail" checks succeeds, revert the change and investigate bef
        │    sandbox-{id-1}  sandbox-{id-2}  ...       │             │
        │           │             │                    │             │
        │           ▼             ▼                    │             │
-       │      sandbox-egress ──► internet             │             │
-       │       (allowlist)                            │             │
+       │      sandbox-egress  (filter here)           │             │
+       │           │                                  │             │
+       └───────────┼──────────────────────────────────┘             │
+                   │                                                │
+                   ▼                                                │
+       ┌──────────────────────────────────────────────┐             │
+       │  sandbox_egress_out (bridge, NOT internal)   │             │
+       │                                              │             │
+       │       sandbox-egress ──► internet            │             │
+       │                          (allowlisted)       │             │
        └──────────────────────────────────────────────┘             │
                                                                     │
                                                                     ▘
 ```
 
-- **`sandbox-runner`** — FastAPI + MCP + `docker.from_env()`. On all three networks. Spawns and reaps `sandbox-{id}` containers. Writes job state to `sandbox-db`. See [`ai/sandbox/app.py`](sandbox/app.py).
+- **`sandbox-runner`** — FastAPI + MCP + `docker.from_env()`. On `ai_shared`, `sandbox_net`, and `sandbox_state`. Spawns and reaps `sandbox-{id}` containers. Writes job state to `sandbox-db`. See [`ai/sandbox/app.py`](sandbox/app.py).
 - **`sandbox-proxy`** — Caddy. Routes `/{sandbox_id}/*` → `sandbox-{id}:80`. Strips `X-Frame-Options` and rewrites CSP so Open WebUI can iframe the result. See [`ai/sandbox/Caddyfile`](sandbox/Caddyfile).
-- **`sandbox-egress`** — tinyproxy. Allowlist enforced by [`tinyproxy.filter`](sandbox/tinyproxy.filter) with `FilterDefaultDeny Yes`.
+- **`sandbox-egress`** — tinyproxy, dual-homed on `sandbox_net` (inbound from sandboxes) and `sandbox_egress_out` (outbound to the internet). Allowlist enforced by [`tinyproxy.filter`](sandbox/tinyproxy.filter) with `FilterDefaultDeny Yes`. Built from [`Dockerfile.sandbox-egress`](sandbox/Dockerfile.sandbox-egress) (alpine + `apk add tinyproxy`) rather than a pulled image, so we own the entrypoint + permission model.
 - **`sandbox-db`** — Postgres 16-alpine. Backing store for `common.jobs.PostgresRegistry`. See [`shared/common/src/common/jobs/postgres.py`](../shared/common/src/common/jobs/postgres.py).
 
 ## Runtimes

@@ -40,6 +40,15 @@ RUN mkdir -p /app && \
     printf '<h1>sandbox ready</h1>\n' > /app/index.html && \
     chown -R 1000:1000 /app
 
+# Redirect nginx's runtime writes to paths uid 1000 can write to.
+# Defaults (/run/nginx.pid, /var/cache/nginx/*, /var/log/nginx/*) are
+# root-owned and fail with EACCES under --user 1000. We rewrite the
+# baked config's `pid` directive and open up the cache/log dirs so the
+# process runs cleanly without needing root or CAP_DAC_OVERRIDE.
+RUN sed -i 's|^pid .*;|pid /tmp/nginx.pid;|' /etc/nginx/nginx.conf && \
+    mkdir -p /var/cache/nginx /var/log/nginx && \
+    chown -R 1000:1000 /var/cache/nginx /var/log/nginx
+
 # nginx normally runs as root to bind :80 (a privileged port). Since the
 # runner sets --cap-drop ALL, we cannot bind :80 as an unprivileged user
 # without CAP_NET_BIND_SERVICE. Use `setcap` here so uid 1000 can bind :80

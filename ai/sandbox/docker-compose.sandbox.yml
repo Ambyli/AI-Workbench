@@ -30,6 +30,15 @@ networks:
     driver: bridge
     internal: true
     name: sandbox_state
+  # Egress-only network. NOT internal — this is the one bridge that
+  # gives sandbox-egress a route to the public internet. Only
+  # sandbox-egress attaches here; no sandbox, no state store, nothing
+  # else. The whole security model of "sandboxes reach the internet
+  # ONLY through the filter" hinges on this being the sole outbound
+  # path (sandbox_net has no default gateway).
+  sandbox_egress_out:
+    driver: bridge
+    name: sandbox_egress_out
 
 services:
   # ── State store ─────────────────────────────────────────────────────────
@@ -97,23 +106,29 @@ services:
   # The allowlist lives in tinyproxy.filter in this dir — pypi, files.pythonhosted,
   # registry.npmjs.org, esm.sh, cdn.jsdelivr.net. Add domains there, not here.
   sandbox-egress:
-    image: dannydirect/tinyproxy:latest
+    # Built locally — see Dockerfile.sandbox-egress for why we don't use
+    # dannydirect/tinyproxy anymore.
+    image: sandbox-egress:latest
+    build:
+      context: ..
+      dockerfile: sandbox/Dockerfile.sandbox-egress
     container_name: sandbox-egress
     restart: unless-stopped
-    # Bypass the image's entrypoint — its /etc/entrypoint.sh script tries
-    # to sed-edit /etc/tinyproxy/tinyproxy.conf to add "Allow $1", which
-    # fails on a read-only bind-mount and dumps the container into a
-    # crash-loop. Overriding entrypoint runs tinyproxy directly against
-    # our mounted config so the allowlist is honored verbatim.
-    entrypoint: ["tinyproxy", "-d", "-c", "/etc/tinyproxy/tinyproxy.conf"]
-    command: []
     volumes:
       - ./tinyproxy.conf:/etc/tinyproxy/tinyproxy.conf:ro
       - ./tinyproxy.filter:/etc/tinyproxy/filter:ro
     networks:
+      # sandbox_net: how sandboxes reach us (internal, no default gateway).
       - sandbox_net
+      # sandbox_egress_out: how WE reach the internet after filtering.
+      - sandbox_egress_out
+    # Healthcheck via a raw TCP connect to the proxy port. `wget --spider
+    # http://localhost:8888/` fails because tinyproxy correctly returns
+    # 400 for a non-proxy request, and busybox wget treats that as an
+    # error. Netcat is present in the busybox binary and gives us a
+    # portable "port is open" probe.
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8888/"]
+      test: ["CMD-SHELL", "nc -z localhost 8888"]
       interval: 30s
       timeout: 5s
       retries: 3

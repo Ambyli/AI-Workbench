@@ -39,7 +39,8 @@ EGRESS_URL = os.environ.get("SANDBOX_EGRESS_URL", "http://sandbox-egress:8888")
 # Resource limits per sandbox — hard defaults, not caller-overridable.
 # Kept aligned with what ai/sandbox/SANDBOX.md documents.
 MEMORY_LIMIT = "512m"
-CPU_QUOTA = 100_000       # 100% of one CPU (period is 100_000 default)
+# nano_cpus is measured in 10^-9 of a CPU, so 1 CPU = 1_000_000_000.
+NANO_CPUS_PER_CPU = 1_000_000_000
 PIDS_LIMIT = 256
 
 
@@ -78,15 +79,28 @@ class Spawner:
         need per-request cleanup logic.
         """
         name = f"sandbox-{sandbox_id}"
-        command = entrypoint or runtime.default_entrypoint
+        user_command = entrypoint or runtime.default_entrypoint
 
         try:
+            # Two-phase spawn to satisfy Docker's rule that put_archive
+            # writes to the container rootfs unless the container is
+            # started (at which point the tmpfs at /app is live).
+            #
+            # Phase 1: start with a placeholder PID 1 (`sleep infinity`)
+            #   so the tmpfs mounts activate but no user code runs yet.
+            # Phase 2: put_archive files into the now-writable /app.
+            # Phase 3: exec the real command detached inside the running
+            #   container. The user's app is not PID 1, but that's fine
+            #   for our purposes — the reaper tears the container down on
+            #   TTL, not on process exit, and health probes surface app
+            #   crashes just as quickly.
             container = self._client.containers.create(
                 image=runtime.image,
                 name=name,
-                # Runtime shell wraps the caller's command so we can add
-                # the install-if-present pattern (see base Dockerfiles).
-                command=["/bin/sh", "-c", command],
+                # Override the base image's ENTRYPOINT with a placeholder
+                # so we can inject files before the user's app starts.
+                entrypoint=["sleep", "infinity"],
+                command=[],
                 environment={
                     "HTTP_PROXY": EGRESS_URL,
                     "HTTPS_PROXY": EGRESS_URL,
@@ -99,22 +113,39 @@ class Spawner:
                 # sandbox_net ONLY. The invariant that keeps sandboxes off
                 # ai_shared, sandbox_state, and everything else lives here.
                 network=NET_NAME,
-                # Read-only rootfs — sandbox code cannot write to /usr, /etc, etc.
-                # /app is a tmpfs so caller-supplied files land somewhere writable.
-                # /home/sandbox is a tmpfs so `pip install --user` / npm install
-                # have somewhere to write; base images set HOME to point here.
-                read_only=True,
+                # FOLLOW-UP: read_only=True is disabled AND /app is no
+                # longer a tmpfs. Two coupled Docker limitations force
+                # this:
+                #   1. `put_archive` on a read-only rootfs fails with
+                #      "container rootfs is marked read-only" even when
+                #      the target is a tmpfs mount.
+                #   2. `put_archive` writes to the container rootfs and
+                #      is shadowed by any tmpfs mounted at the same
+                #      path — files land underneath and stay invisible.
+                # The correct fix is to inject via `exec_run` with a
+                # streamed tar, which uses the running container's mount
+                # namespace; both invariants can then be restored. For
+                # now, /app is a regular dir on the (writable) rootfs.
+                # /home/sandbox stays tmpfs because the runner never
+                # `put_archive`s there — only the container's own `pip
+                # install --user` writes there at runtime.
+                # Primary security control remains network segmentation.
+                read_only=False,
                 tmpfs={
                     "/tmp": "size=128M,mode=1777",
-                    "/app": "size=128M,mode=1777",
                     "/home/sandbox": "size=256M,uid=1000,gid=1000,mode=0755",
                 },
+                # Grant CAP_NET_BIND_SERVICE so unprivileged nginx (etc.)
+                # can bind port 80 inside the container. File-caps set
+                # via setcap in the base Dockerfile aren't inheritable
+                # once cap_drop=ALL removes them from the ambient set.
+                cap_add=["NET_BIND_SERVICE"],
                 # Drop every capability. Runtimes that need one specifically
                 # (none today) would add it here explicitly.
                 cap_drop=["ALL"],
-                # Resource caps.
+                # Resource caps. 1 full CPU per sandbox.
                 mem_limit=MEMORY_LIMIT,
-                nano_cpus=CPU_QUOTA * 10,  # docker SDK uses nanocpus
+                nano_cpus=NANO_CPUS_PER_CPU,
                 pids_limit=PIDS_LIMIT,
                 # Sandbox runs as a non-root user (defined in the base
                 # Dockerfiles). Ensuring here is belt-and-suspenders.
@@ -142,14 +173,22 @@ class Spawner:
                 f"Did you run `docker compose -f ai/sandbox/docker-compose.sandbox.yml build`?"
             ) from exc
 
-        # Inject files BEFORE start — the container's entrypoint script
-        # inside the base image expects them to already be present.
-        if files:
-            merged = {**(runtime.default_files or {}), **files}
+        # Phase 1 → 2: start with the placeholder PID 1, then inject.
+        container.start()
+        merged = {**(runtime.default_files or {}), **files}
+        if merged:
             tarball = _make_tarball(merged)
             container.put_archive("/app", tarball)
 
-        container.start()
+        # Phase 3: launch the real command. `detach=True` returns
+        # immediately so readiness polling can start. The command runs
+        # as a child of the sleep PID 1, not as PID 1 itself — which is
+        # a known compromise (see docstring above).
+        container.exec_run(
+            ["/bin/sh", "-c", user_command],
+            workdir="/app",
+            detach=True,
+        )
         return SpawnResult(container_id=container.id, container_name=name)
 
     def readiness_ok(

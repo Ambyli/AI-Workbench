@@ -36,6 +36,10 @@ services:
       OAUTH2_PROXY_COOKIE_DOMAINS: "${OAUTH2_PROXY_COOKIE_DOMAINS}"
       OAUTH2_PROXY_COOKIE_EXPIRE: "${OAUTH2_PROXY_COOKIE_EXPIRE}"
       OAUTH2_PROXY_COOKIE_REFRESH: "${OAUTH2_PROXY_COOKIE_REFRESH}"
+      # SameSite=none lets the cookie flow in cross-site subresource
+      # requests (needed for sandbox iframes rendered inside OpenWebUI's
+      # tool-result frame). See .env for the full rationale.
+      OAUTH2_PROXY_COOKIE_SAMESITE: "${OAUTH2_PROXY_COOKIE_SAMESITE:-lax}"
 
       # Routing
       OAUTH2_PROXY_UPSTREAMS: "${OAUTH2_PROXY_UPSTREAMS}"

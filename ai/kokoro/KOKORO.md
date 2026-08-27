@@ -5,7 +5,7 @@ Run a two-container text-to-speech stack built on [Kokoro-82M](https://huggingfa
 ### Quick start
 
 ```bash
-docker compose -f ai/docker-compose.kokoro.yml up -d
+docker compose -f ai/kokoro/docker-compose.kokoro.yml up -d
 ```
 
 This launches two containers:
@@ -53,29 +53,28 @@ The model is **lazy-loaded** on the first `/generate` request, not at startup. T
 ### Stopping
 
 ```bash
-docker compose -f ai/docker-compose.kokoro.yml down
+docker compose -f ai/kokoro/docker-compose.kokoro.yml down
 ```
 
 Model weights in the `kokoro_data` volume are preserved. To also delete the cache:
 
 ```bash
-docker compose -f ai/docker-compose.kokoro.yml down -v
+docker compose -f ai/kokoro/docker-compose.kokoro.yml down -v
 ```
 
 ### Project structure
 
 ```
-ai/
+ai/kokoro/
   docker-compose.kokoro.yml
   Dockerfile.kokoro-app      ← builds the inference container
   Dockerfile.kokoro-api      ← builds the proxy container
-  kokoro/
-    app/
-      pyproject.toml         ← app deps (kokoro, soundfile, fastapi, uvicorn, misaki[en])
-      app.py                 ← FastAPI inference server on :8080
-    api/
-      pyproject.toml         ← api deps (fastapi, uvicorn, httpx)
-      kokoro_server.py       ← FastAPI proxy server on :8000
+  app/
+    pyproject.toml           ← app deps (kokoro, soundfile, fastapi, uvicorn, misaki[en])
+    app.py                   ← FastAPI inference server on :8080
+  api/
+    pyproject.toml           ← api deps (fastapi, uvicorn, httpx)
+    kokoro_server.py         ← FastAPI proxy server on :8000
 ```
 
 Each subfolder is an independent `uv` project. For local development:

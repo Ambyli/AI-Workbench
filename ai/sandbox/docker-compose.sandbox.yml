@@ -5,7 +5,7 @@
 # for allowlisted internet, and NOTHING else on the stack. Security is
 # enforced by network segmentation, not by trusting the sandbox process.
 #
-# Three networks (see ai/SANDBOX.md § Network topology for the diagram):
+# Three networks (see ai/sandbox/SANDBOX.md § Network topology for the diagram):
 #
 #   shared        (external, ai_shared)     openwebui / litellm ↔ runner + proxy
 #   sandbox_net   (bridge, internal: true)  runner ↔ proxy ↔ sandboxes ↔ egress
@@ -15,7 +15,7 @@
 # a default gateway. A sandbox that tries to hit the host or the internet
 # directly has no route; it MUST go through sandbox-egress or nowhere.
 #
-# See ai/SANDBOX.md for the operator runbook and the security-invariant
+# See ai/sandbox/SANDBOX.md for the operator runbook and the security-invariant
 # checklist that must be verified after any change here.
 
 networks:
@@ -69,7 +69,7 @@ services:
   # config. WebSocket upgrades are default in Caddy (Streamlit + Vite HMR).
   #
   # The Caddyfile strips X-Frame-Options and rewrites CSP so OpenWebUI can
-  # embed the served page in an iframe. See ai/sandbox/Caddyfile.
+  # embed the served page in an iframe. See Caddyfile in this dir.
   sandbox-proxy:
     image: caddy:2-alpine
     container_name: sandbox-proxy
@@ -77,7 +77,7 @@ services:
     ports:
       - "${PORT_SANDBOX_PROXY:-8011}:80"
     volumes:
-      - ./sandbox/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - sandbox_proxy_data:/data
       - sandbox_proxy_config:/config
     networks:
@@ -94,7 +94,7 @@ services:
   # HTTP_PROXY / HTTPS_PROXY to this container; everything else is
   # unreachable because sandbox_net has no default gateway.
   #
-  # The allowlist lives in sandbox/tinyproxy.filter — pypi, files.pythonhosted,
+  # The allowlist lives in tinyproxy.filter in this dir — pypi, files.pythonhosted,
   # registry.npmjs.org, esm.sh, cdn.jsdelivr.net. Add domains there, not here.
   sandbox-egress:
     image: dannydirect/tinyproxy:latest
@@ -102,8 +102,8 @@ services:
     restart: unless-stopped
     command: ["ANY"]  # Config in mounted tinyproxy.conf overrides this
     volumes:
-      - ./sandbox/tinyproxy.conf:/etc/tinyproxy/tinyproxy.conf:ro
-      - ./sandbox/tinyproxy.filter:/etc/tinyproxy/filter:ro
+      - ./tinyproxy.conf:/etc/tinyproxy/tinyproxy.conf:ro
+      - ./tinyproxy.filter:/etc/tinyproxy/filter:ro
     networks:
       - sandbox_net
     healthcheck:
@@ -120,8 +120,8 @@ services:
   # subsystem has any Docker API access.
   sandbox-runner:
     build:
-      context: ..
-      dockerfile: ai/Dockerfile.sandbox-runner
+      context: ../..
+      dockerfile: ai/sandbox/Dockerfile.sandbox-runner
     container_name: sandbox-runner
     restart: unless-stopped
     ports:
@@ -177,29 +177,29 @@ services:
   # sandbox-node:latest). Nothing here is started with `up`.
   #
   # Rebuild after editing a base Dockerfile:
-  #   docker compose -f ai/docker-compose.sandbox.yml --profile build build
+  #   docker compose -f ai/sandbox/docker-compose.sandbox.yml --profile build build
   sandbox-static-image:
     profiles: ["build"]
     image: sandbox-static:latest
     build:
-      context: ..
-      dockerfile: ai/Dockerfile.sandbox-static
+      context: ../..
+      dockerfile: ai/sandbox/Dockerfile.sandbox-static
     command: ["true"]
 
   sandbox-python-image:
     profiles: ["build"]
     image: sandbox-python:latest
     build:
-      context: ..
-      dockerfile: ai/Dockerfile.sandbox-python
+      context: ../..
+      dockerfile: ai/sandbox/Dockerfile.sandbox-python
     command: ["true"]
 
   sandbox-node-image:
     profiles: ["build"]
     image: sandbox-node:latest
     build:
-      context: ..
-      dockerfile: ai/Dockerfile.sandbox-node
+      context: ../..
+      dockerfile: ai/sandbox/Dockerfile.sandbox-node
     command: ["true"]
 
 volumes:

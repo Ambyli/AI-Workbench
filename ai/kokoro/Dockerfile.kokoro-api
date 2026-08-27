@@ -8,10 +8,10 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 WORKDIR /app
 
-COPY kokoro/api/pyproject.toml .
+COPY ai/kokoro/api/pyproject.toml .
 RUN uv sync --no-dev
 
-COPY kokoro/api/kokoro_server.py .
+COPY ai/kokoro/api/kokoro_server.py .
 
 EXPOSE 8000
 

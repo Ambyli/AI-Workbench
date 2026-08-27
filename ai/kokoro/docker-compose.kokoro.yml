@@ -8,8 +8,8 @@ services:
     networks:
       - shared
     build:
-      context: .
-      dockerfile: Dockerfile.kokoro-app
+      context: ../..
+      dockerfile: ai/kokoro/Dockerfile.kokoro-app
     container_name: kokoro-app
     restart: unless-stopped
     environment:
@@ -28,8 +28,8 @@ services:
     networks:
       - shared
     build:
-      context: .
-      dockerfile: Dockerfile.kokoro-api
+      context: ../..
+      dockerfile: ai/kokoro/Dockerfile.kokoro-api
     container_name: kokoro-api
     restart: unless-stopped
     environment:

@@ -16,20 +16,19 @@ services:
       - "${PORT_SEARXNG}:8080"
     environment:
       # Read at boot by the entrypoint wrapper below and sed-substituted into
-      # the `${SEARXNG_SECRET}` placeholder in ai/searxng/settings.yml.
+      # the `${SEARXNG_SECRET}` placeholder in settings.yml.
       # Generate with `openssl rand -hex 32` and set in .env.
       SEARXNG_SECRET: "${SEARXNG_SECRET}"
       SEARXNG_BASE_URL: "http://localhost:${PORT_SEARXNG}/"
     volumes:
-      # Config files (settings.yml, optional limiter.toml) live in ai/searxng/
+      # Config files (settings.yml, optional limiter.toml) live in this dir
       # and are bind-mounted so edits don't require a rebuild.
-      - ./searxng:/etc/searxng:rw
+      - ./:/etc/searxng:rw
     # Wrapper: substitute $SEARXNG_SECRET into a writable copy of settings.yml
     # under /tmp, point both __SEARXNG_SETTINGS_PATH (internal env used by the
     # image's entrypoint + Python app) and SEARXNG_SETTINGS_PATH (historical
     # alias) at it, then hand off to the image's default entrypoint. Keeps
-    # the on-disk ai/searxng/settings.yml secret-free so it can stay tracked
-    # in git.
+    # the on-disk settings.yml secret-free so it can stay tracked in git.
     entrypoint:
       - /bin/sh
       - -c

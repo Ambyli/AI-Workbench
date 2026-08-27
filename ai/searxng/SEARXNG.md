@@ -5,7 +5,7 @@ Self-hosted metasearch engine that fronts Google/Bing/DuckDuckGo/etc. so Open We
 ### Quick start
 
 ```bash
-docker compose -f ai/docker-compose.searxng.yml --env-file .env up -d
+docker compose -f ai/searxng/docker-compose.searxng.yml --env-file .env up -d
 ```
 
 Or via make:
@@ -27,7 +27,7 @@ Then browse `http://localhost:8009` — you should see the SearXNG search page. 
 - `use_default_settings: true` — inherits upstream defaults, only overrides what we need.
 - `server.limiter: false` — the built-in rate limiter drops server-to-server calls with the wrong headers; disable so Open WebUI can reach `/search` unmolested.
 - `search.formats: [html, json]` — JSON output is off by default upstream; Open WebUI needs it.
-- `server.secret_key: "${SEARXNG_SECRET}"` — literal placeholder. The `entrypoint` wrapper in `ai/docker-compose.searxng.yml` reads `$SEARXNG_SECRET` from the container env at startup, sed-substitutes it into a copy of `settings.yml` at `/tmp/searxng-settings.yml`, and points `SEARXNG_SETTINGS_PATH` at that copy — so the bind-mounted host file stays free of the real secret and can be committed to git. If `SEARXNG_SECRET` is unset, the wrapper refuses to boot rather than starting with an unresolved placeholder.
+- `server.secret_key: "${SEARXNG_SECRET}"` — literal placeholder. The `entrypoint` wrapper in `ai/searxng/docker-compose.searxng.yml` reads `$SEARXNG_SECRET` from the container env at startup, sed-substitutes it into a copy of `settings.yml` at `/tmp/searxng-settings.yml`, and points `SEARXNG_SETTINGS_PATH` at that copy — so the bind-mounted host file stays free of the real secret and can be committed to git. If `SEARXNG_SECRET` is unset, the wrapper refuses to boot rather than starting with an unresolved placeholder.
 
 Edits to `settings.yml` take effect on `make down searxng && make up searxng` — no rebuild needed because it's a bind-mount.
 
@@ -49,7 +49,7 @@ Blank is fine for a first boot but should be rotated before real use.
 
 ### Wiring into Open WebUI
 
-Open WebUI already gets these env vars from `.env` (declared in `ai/docker-compose.openwebui.yml`):
+Open WebUI already gets these env vars from `.env` (declared in `ai/openwebui/docker-compose.openwebui.yml`):
 
 | Open WebUI env var | `.env` key | Default | Notes |
 |---|---|---|---|
@@ -59,7 +59,7 @@ Open WebUI already gets these env vars from `.env` (declared in `ai/docker-compo
 | `WEB_SEARCH_RESULT_COUNT` | `OPENWEBUI_WEB_SEARCH_RESULT_COUNT` | `3` | Results per query fed to the model |
 | `WEB_SEARCH_CONCURRENT_REQUESTS` | `OPENWEBUI_WEB_SEARCH_CONCURRENT_REQUESTS` | `10` | Parallel fetch cap when Open WebUI enriches results |
 
-> **Important — first-boot-only env vars.** Open WebUI reads these on the *very first* boot of the `openwebui_data` volume. On an existing install, changing them here does **nothing** — set them via **Admin Panel → Settings → Web Search** in the running container instead, then click Save. Wiping the volume (`docker compose -f ai/docker-compose.openwebui.yml down -v`) re-arms the env-var path but destroys all users, chats, and uploads.
+> **Important — first-boot-only env vars.** Open WebUI reads these on the *very first* boot of the `openwebui_data` volume. On an existing install, changing them here does **nothing** — set them via **Admin Panel → Settings → Web Search** in the running container instead, then click Save. Wiping the volume (`docker compose -f ai/openwebui/docker-compose.openwebui.yml down -v`) re-arms the env-var path but destroys all users, chats, and uploads.
 
 ### Using it in a chat
 
@@ -100,7 +100,7 @@ docker run --rm --network ai_shared curlimages/curl \
 
 ### Updating the image
 
-The image tag is pinned in `ai/docker-compose.searxng.yml`:
+The image tag is pinned in `ai/searxng/docker-compose.searxng.yml`:
 
 ```yaml
 image: docker.io/searxng/searxng:latest

@@ -6,7 +6,7 @@ can statically route ``/{sandbox_id}/*`` to ``sandbox-{id}:80`` without
 per-sandbox Caddy config.
 
 Adding a new language is a single entry here plus a new Dockerfile in
-``ai/Dockerfile.sandbox-<name>``. The runner enforces that ``runtime``
+``ai/sandbox/Dockerfile.sandbox-<name>``. The runner enforces that ``runtime``
 values from ``POST /run`` and the MCP ``preview_app`` tool are keys in
 this dict — nothing else is spawnable.
 """
@@ -22,7 +22,7 @@ class Runtime:
 
     Attributes:
         image: Docker image tag. Built locally by ``docker compose build``
-            from ``ai/Dockerfile.sandbox-<name>`` — no external registry
+            from ``ai/sandbox/Dockerfile.sandbox-<name>`` — no external registry
             pull, so a compromised upstream can't reach the sandbox subsystem.
         default_entrypoint: Command run inside the container if the caller
             didn't supply one. Must bind to port 80.

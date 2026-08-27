@@ -3,17 +3,17 @@
 Generic HTTP + MCP front-end for `common.cdp_interceptor`. Give it a URL and a list of URL regex patterns; it opens the URL in a headless Chrome under a named `--user-data-dir`, waits for a bounded window, and returns the JSON XHR/fetch bodies whose URLs matched any pattern.
 
 - **Container**: `interceptor` (internal only, port 8080 on `ai_shared`)
-- **Compose file**: `ai/docker-compose.interceptor.yml`
-- **Dockerfile**: `ai/Dockerfile.interceptor`
+- **Compose file**: `ai/interceptor/docker-compose.interceptor.yml`
+- **Dockerfile**: `ai/interceptor/Dockerfile.interceptor`
 - **Source**: `ai/interceptor/{app.py,profiles.py}`
-- **LiteLLM integration**: both MCP (`interceptor.capture_url`) and pass-through (`/v1/interceptor/*`), configured in `ai/litellm_config.yaml`
+- **LiteLLM integration**: both MCP (`interceptor.capture_url`) and pass-through (`/v1/interceptor/*`), configured in `ai/litellm/litellm_config.yaml`
 
 ## Bring it up
 
 ```powershell
 docker network create ai_shared     # once, if not already present
-docker compose -f ai/docker-compose.interceptor.yml up --build -d
-docker compose -f ai/docker-compose.interceptor.yml logs -f interceptor
+docker compose -f ai/interceptor/docker-compose.interceptor.yml up --build -d
+docker compose -f ai/interceptor/docker-compose.interceptor.yml logs -f interceptor
 ```
 
 Health:
@@ -312,7 +312,7 @@ curl -X POST http://localhost:4001/v1/interceptor/capture `
 
 ### MCP tools
 
-The `interceptor` MCP server (registered in `ai/litellm_config.yaml` `mcp_servers.interceptor`) exposes four model-invokable tools:
+The `interceptor` MCP server (registered in `ai/litellm/litellm_config.yaml` `mcp_servers.interceptor`) exposes four model-invokable tools:
 
 | Tool | Purpose | Args |
 |---|---|---|

@@ -140,7 +140,7 @@ Response:
 
 ### `preview_app` MCP tool
 
-Same shape, exposed for tool-calling models. LiteLLM advertises it via [`ai/litellm_config.yaml`](litellm_config.yaml)'s `mcp_servers.sandbox` entry. Models that use it should wrap the returned URL in a fenced ` ```html ` block containing an `<iframe src="...">` — Open WebUI's artifact renderer picks that up.
+Same shape, exposed for tool-calling models. LiteLLM advertises it via [`ai/litellm/litellm_config.yaml`](../litellm/litellm_config.yaml)'s `mcp_servers.sandbox` entry. Models that use it should wrap the returned URL in a fenced ` ```html ` block containing an `<iframe src="...">` — Open WebUI's artifact renderer picks that up.
 
 Add a system prompt on the Qwen model in Open WebUI's Admin → Models → *your model* → System Prompt:
 
@@ -155,10 +155,10 @@ Add a system prompt on the Qwen model in Open WebUI's Admin → Models → *your
 docker network create ai_shared 2>/dev/null || true
 
 # 2. Build the base images for the runtimes.
-docker compose -f ai/docker-compose.sandbox.yml --profile build build
+docker compose -f ai/sandbox/docker-compose.sandbox.yml --profile build build
 
 # 3. Bring up the four running services.
-docker compose -f ai/docker-compose.sandbox.yml up -d
+docker compose -f ai/sandbox/docker-compose.sandbox.yml up -d
 
 # 4. Verify the segmentation invariants — see checklist above.
 docker exec -it $(docker ps -q --filter label=sandbox.managed=true | head -1) sh
@@ -177,13 +177,13 @@ Then open the returned URL in a browser (from the host — reach `sandbox-proxy`
 
 ### Adding a runtime
 
-1. Create `ai/Dockerfile.sandbox-<name>` — non-root user `1000:1000`, `HOME=/home/sandbox`, entrypoint that handles the install-if-present pattern, app binds port 80.
-2. Add an entry to `RUNTIMES` in [`ai/sandbox/runtimes.py`](sandbox/runtimes.py).
+1. Create `ai/sandbox/Dockerfile.sandbox-<name>` — non-root user `1000:1000`, `HOME=/home/sandbox`, entrypoint that handles the install-if-present pattern, app binds port 80.
+2. Add an entry to `RUNTIMES` in [`ai/sandbox/runtimes.py`](runtimes.py).
 3. Add a `sandbox-<name>-image` service with `profiles: ["build"]` in [`docker-compose.sandbox.yml`](docker-compose.sandbox.yml).
 4. Rebuild base images and restart the runner:
    ```bash
-   docker compose -f ai/docker-compose.sandbox.yml --profile build build
-   docker compose -f ai/docker-compose.sandbox.yml up -d --force-recreate sandbox-runner
+   docker compose -f ai/sandbox/docker-compose.sandbox.yml --profile build build
+   docker compose -f ai/sandbox/docker-compose.sandbox.yml up -d --force-recreate sandbox-runner
    ```
 5. Update this file's runtime matrix.
 
@@ -192,7 +192,7 @@ Then open the returned URL in a browser (from the host — reach `sandbox-proxy`
 Edit [`ai/sandbox/tinyproxy.filter`](sandbox/tinyproxy.filter) — one anchored regex per line. Anchor with `^…$` so a typosquat like `pypi.org.attacker.com` is not accepted. Restart `sandbox-egress`:
 
 ```bash
-docker compose -f ai/docker-compose.sandbox.yml restart sandbox-egress
+docker compose -f ai/sandbox/docker-compose.sandbox.yml restart sandbox-egress
 ```
 
 Never add `.*` — that defeats the entire egress model. Add the specific domain the sandbox needs.
@@ -237,14 +237,14 @@ docker logs sandbox-egress | grep '<sandbox_id or IP>'
 ```bash
 # 1. Set SANDBOX_DB_PASSWORD in .env to the new value.
 # 2. Bring the DB down, remove the volume, bring it back up (DEV ONLY — data loss).
-docker compose -f ai/docker-compose.sandbox.yml down sandbox-db
+docker compose -f ai/sandbox/docker-compose.sandbox.yml down sandbox-db
 docker volume rm sandbox_db_data
-docker compose -f ai/docker-compose.sandbox.yml up -d sandbox-db
+docker compose -f ai/sandbox/docker-compose.sandbox.yml up -d sandbox-db
 
 # For prod-style rotation (no data loss), ALTER USER inside psql and update .env
 # then restart just the runner:
 docker exec -it sandbox-db psql -U postgres -c "ALTER USER sandbox WITH PASSWORD 'new-pw';"
-docker compose -f ai/docker-compose.sandbox.yml up -d --force-recreate sandbox-runner
+docker compose -f ai/sandbox/docker-compose.sandbox.yml up -d --force-recreate sandbox-runner
 ```
 
 ## Configuration

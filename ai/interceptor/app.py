@@ -5,7 +5,7 @@ Give it a URL and a list of URL regex patterns; it launches Chrome under a
 named profile, injects the interceptor, waits a bounded window, and returns
 the captured JSON bodies bucketed by which pattern matched them.
 
-Concurrency (see ai/INTERCEPTOR.md § Concurrency for the operator view):
+Concurrency (see ai/interceptor/INTERCEPTOR.md § Concurrency for the operator view):
   * Different profiles fully parallel.
   * Same profile: the fast path uses the base ``--user-data-dir`` directly so
     refreshed session cookies persist. Concurrent same-profile requests fall
@@ -34,7 +34,7 @@ Endpoints:
     /mcp                                  FastMCP HTTP transport — exposes tools:
                                           capture_url, list_profiles, list_jobs, get_job
 
-Registered with LiteLLM in ai/litellm_config.yaml both as an `mcp_servers`
+Registered with LiteLLM in ai/litellm/litellm_config.yaml both as an `mcp_servers`
 entry (model-invokable tool) and as a `pass_through_endpoints` entry
 (``/v1/interceptor/...`` proxied to this service).
 """

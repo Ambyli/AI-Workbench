@@ -1,7 +1,7 @@
 """Spawner — wraps the Docker SDK to launch and reap sandbox containers.
 
 Single point of Docker API access in the sandbox subsystem. This file
-enforces the security invariants that ai/SANDBOX.md documents:
+enforces the security invariants that ai/sandbox/SANDBOX.md documents:
 
 * Sandbox containers are attached ONLY to ``sandbox_net`` — never to
   ``ai_shared`` or ``sandbox_state``.
@@ -13,7 +13,7 @@ enforces the security invariants that ai/SANDBOX.md documents:
   ``put_archive`` API on a tmpfs at ``/app``.
 
 If a change here weakens any of these, the security invariant list in
-``ai/SANDBOX.md`` must be re-run to prove nothing has regressed.
+``ai/sandbox/SANDBOX.md`` must be re-run to prove nothing has regressed.
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ NET_NAME = os.environ.get("SANDBOX_NET_NAME", "sandbox_net")
 EGRESS_URL = os.environ.get("SANDBOX_EGRESS_URL", "http://sandbox-egress:8888")
 
 # Resource limits per sandbox — hard defaults, not caller-overridable.
-# Kept aligned with what ai/SANDBOX.md documents.
+# Kept aligned with what ai/sandbox/SANDBOX.md documents.
 MEMORY_LIMIT = "512m"
 CPU_QUOTA = 100_000       # 100% of one CPU (period is 100_000 default)
 PIDS_LIMIT = 256
@@ -139,7 +139,7 @@ class Spawner:
             # Common cause: image not built yet. Give the operator a hint.
             raise RuntimeError(
                 f"docker create failed for image {runtime.image!r}: {exc}. "
-                f"Did you run `docker compose -f ai/docker-compose.sandbox.yml build`?"
+                f"Did you run `docker compose -f ai/sandbox/docker-compose.sandbox.yml build`?"
             ) from exc
 
         # Inject files BEFORE start — the container's entrypoint script

@@ -13,8 +13,8 @@ services:
     ports:
       - "${PORT_OAUTH2_PROXY}:4180"
     volumes:
-      - ./oauth2-proxy/sa-key.json:/etc/oauth2-proxy/sa-key.json:ro
-      - ./oauth2-proxy/templates:/etc/oauth2-proxy/templates:ro
+      - ./sa-key.json:/etc/oauth2-proxy/sa-key.json:ro
+      - ./templates:/etc/oauth2-proxy/templates:ro
     environment:
       # All values are sourced from .env — edit there, not here.
 
@@ -48,7 +48,7 @@ services:
       OAUTH2_PROXY_GOOGLE_ADMIN_EMAIL: "${OAUTH2_PROXY_GOOGLE_ADMIN_EMAIL}"
       OAUTH2_PROXY_GOOGLE_SERVICE_ACCOUNT_JSON: "${OAUTH2_PROXY_GOOGLE_SERVICE_ACCOUNT_JSON}"
 
-      # Branded sign-in and error pages. See ai/OAUTH2_PROXY.md.
+      # Branded sign-in and error pages. See ai/oauth2-proxy/OAUTH2_PROXY.md.
       OAUTH2_PROXY_CUSTOM_TEMPLATES_DIR: "${OAUTH2_PROXY_CUSTOM_TEMPLATES_DIR}"
 
       # Skip auth for the /assets/ prefix so the sign-in / error pages can
@@ -68,4 +68,4 @@ services:
       - shared
     restart: unless-stopped
     volumes:
-      - ../assets:/usr/share/nginx/html/assets:ro
+      - ../../assets:/usr/share/nginx/html/assets:ro

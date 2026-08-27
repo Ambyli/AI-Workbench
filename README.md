@@ -97,7 +97,7 @@ The Makefile uses a macro to register each service stack. Adding or removing a s
 
 ### Add a service
 
-1. Create `ai/docker-compose.<name>.yml` with the service definition.
+1. Create `ai/<name>/docker-compose.<name>.yml` with the service definition (each service owns its own subdirectory under `ai/`).
 2. Add one line to the `Makefile` with the stack name and the space-separated list of Docker Compose service names to target:
 
 ```makefile
@@ -110,7 +110,7 @@ Example — adding a Whisper stack that runs two containers:
 $(eval $(call service,whisper,whisper-api whisper-worker))
 ```
 
-This immediately makes the stack usable as `make up whisper`, `make down whisper`, `make clean whisper`, `make very-clean whisper`, `make logs whisper`, and `make build whisper`. The compose file must be named `ai/docker-compose.whisper.yml`.
+This immediately makes the stack usable as `make up whisper`, `make down whisper`, `make clean whisper`, `make very-clean whisper`, `make logs whisper`, and `make build whisper`. The compose file must be at `ai/whisper/docker-compose.whisper.yml`.
 
 ### Remove a service
 
@@ -120,13 +120,13 @@ Delete the corresponding `$(eval $(call service,...))` line from the `Makefile`.
 
 | Constraint | Detail |
 |---|---|
-| Stack name | Must match the suffix of the compose filename: `service,foo,...` → `ai/docker-compose.foo.yml` |
+| Stack name | Must match the service directory and the suffix of the compose filename: `service,foo,...` → `ai/foo/docker-compose.foo.yml` |
 | Service list | Space-separated Docker Compose service names (second argument). These are passed directly to `docker compose up/stop/rm/build`. |
 | Multiple services | All listed services are started/stopped together as a group (e.g. `vllm-qwen vllm-llama`). |
 
 ## GPU Compatibility
 
-All inference services (Unsloth, vLLM, Kokoro) require a CUDA-capable NVIDIA GPU. The full list of supported GPUs is at https://developer.nvidia.com/cuda/gpus. The Unsloth build defaults to compute capability `89` (Ada Lovelace — RTX 4080/4090); adjust `Dockerfile.unsloth` for other architectures.
+All inference services (Unsloth, vLLM, Kokoro) require a CUDA-capable NVIDIA GPU. The full list of supported GPUs is at https://developer.nvidia.com/cuda/gpus. The Unsloth build defaults to compute capability `89` (Ada Lovelace — RTX 4080/4090); adjust `ai/unsloth/Dockerfile.unsloth` for other architectures.
 
 ## Environment Variables
 

@@ -6,16 +6,16 @@ A single-container subsystem that keeps [Phoenix](https://phoenix-mcp.com) in sy
 |---|---|
 | `roofix` | Background worker. Fetches Roofix email via direct Gmail API → parses → decides (rules-first, LiteLLM fallback) → writes to Phoenix Postgres via direct psycopg2. Runs its own APScheduler. |
 
-Internal-only — no host ports published by default. For proposal-page fetches (Roofix has no public API) the bridge calls the sibling **`interceptor`** container (see [INTERCEPTOR.md](INTERCEPTOR.md)) — a generic CDP-driving service that owns the Roofix login session as a named `--user-data-dir` profile.
+Internal-only — no host ports published by default. For proposal-page fetches (Roofix has no public API) the bridge calls the sibling **`interceptor`** container (see [INTERCEPTOR.md](../interceptor/INTERCEPTOR.md)) — a generic CDP-driving service that owns the Roofix login session as a named `--user-data-dir` profile.
 
 ### Quick start
 
 ```bash
 # 1. interceptor must be up first — the bridge depends on it for proposal fetches.
-docker compose -f ai/docker-compose.interceptor.yml up -d
+docker compose -f ai/interceptor/docker-compose.interceptor.yml up -d
 
 # 2. Then the bridge.
-docker compose -f ai/docker-compose.roofix.yml up -d
+docker compose -f ai/roofix/docker-compose.roofix.yml up -d
 ```
 
 Default `DRY_RUN=true` — the bridge fetches, parses, decides, and logs, but does **not** write to Phoenix. Flip to `false` in `.env` only after watching a full run.
@@ -42,7 +42,7 @@ docker exec -it litellm curl http://roofix:8080/status
 docker exec -it litellm curl -X POST http://roofix:8080/tick
 ```
 
-For interceptor endpoints (proposal capture, profile refresh), see [INTERCEPTOR.md](INTERCEPTOR.md).
+For interceptor endpoints (proposal capture, profile refresh), see [INTERCEPTOR.md](../interceptor/INTERCEPTOR.md).
 
 ### How it works
 
@@ -185,7 +185,7 @@ tar czf roofix.tgz -C "C:\Users\<you>\.zeo\roofix_profile" .
 curl -X POST -F "archive=@roofix.tgz" http://<host>:8080/profiles/roofix/refresh
 ```
 
-The archive lands at `/data/profiles/roofix/` inside the interceptor container, backed by the `interceptor_data` volume. **Persistence:** survives `docker compose down`, restarts, rebuilds. **Destroyed by:** `docker compose -f ai/docker-compose.interceptor.yml down -v`.
+The archive lands at `/data/profiles/roofix/` inside the interceptor container, backed by the `interceptor_data` volume. **Persistence:** survives `docker compose down`, restarts, rebuilds. **Destroyed by:** `docker compose -f ai/interceptor/docker-compose.interceptor.yml down -v`.
 
 Tracking URLs from Roofix notification emails redirect to the proposal without login, so many captures succeed even against an empty profile — but a warm profile is required for direct `roofix.io/project/{id}` fetches and covers you when a tokenized link expires.
 
@@ -195,7 +195,7 @@ Sessions survive **days to weeks** on the fast path (single capture at a time re
 
 1. **First time ever** — no `roofix` profile has been uploaded yet.
 2. **Roofix expired the session** — the bridge log shows `login_wall: true` on `/capture` responses.
-3. **You wiped the volume** — `docker compose -f ai/docker-compose.interceptor.yml down -v`.
+3. **You wiped the volume** — `docker compose -f ai/interceptor/docker-compose.interceptor.yml down -v`.
 
 #### Concurrency + cookie caveats
 
@@ -308,9 +308,9 @@ DELETE FROM processed WHERE status = 'error';
 **Concurrency note.** The bridge holds one open connection to this DB. Read-only queries from another client (psql, DBeaver) are safe any time — Postgres MVCC handles them. Bulk writes (`DELETE`, schema changes) are also safe but may briefly contend with a live tick; if you're making destructive changes, prefer stopping the roofix container first:
 
 ```bash
-docker compose -f ai/docker-compose.roofix.yml stop roofix
+docker compose -f ai/roofix/docker-compose.roofix.yml stop roofix
 # ...destructive query...
-docker compose -f ai/docker-compose.roofix.yml start roofix
+docker compose -f ai/roofix/docker-compose.roofix.yml start roofix
 ```
 
 ### Proposal extractor
@@ -362,8 +362,8 @@ Redundancy is the point: if Roofix changes one field's behavior we still detect 
 2. **Bring up the stack**:
 
    ```bash
-   docker compose -f ai/docker-compose.interceptor.yml up -d --build
-   docker compose -f ai/docker-compose.roofix.yml up -d --build
+   docker compose -f ai/interceptor/docker-compose.interceptor.yml up -d --build
+   docker compose -f ai/roofix/docker-compose.roofix.yml up -d --build
    docker exec -it interceptor curl http://localhost:8080/health
    docker exec -it roofix curl http://localhost:8080/status
    ```
@@ -393,7 +393,7 @@ Redundancy is the point: if Roofix changes one field's behavior we still detect 
 ### Rebuilding
 
 ```bash
-docker compose -f ai/docker-compose.roofix.yml up -d --build
+docker compose -f ai/roofix/docker-compose.roofix.yml up -d --build
 ```
 
 ### Project structure

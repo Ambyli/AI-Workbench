@@ -4,7 +4,7 @@ STACKS :=
 define service
 STACKS += $(1)
 STACK_$(1) := $(2)
-DC_$(1) := docker compose -f ai/docker-compose.$(1).yml --env-file .env -p ai-$(1)
+DC_$(1) := docker compose -f ai/$(1)/docker-compose.$(1).yml --env-file .env -p ai-$(1)
 endef
 
 $(eval $(call service,litellm,litellm))

@@ -5,7 +5,7 @@ Browser-based chat interface for the LiteLLM proxy. Open WebUI sees LiteLLM as a
 ### Quick start
 
 ```bash
-docker compose -f ai/docker-compose.openwebui.yml --env-file .env up -d
+docker compose -f ai/openwebui/docker-compose.openwebui.yml --env-file .env up -d
 ```
 
 Or via make:
@@ -68,7 +68,7 @@ Polls `http://localhost:8080/health` inside the container every 30s with a 30s s
 ### Stopping
 
 ```bash
-docker compose -f ai/docker-compose.openwebui.yml down
+docker compose -f ai/openwebui/docker-compose.openwebui.yml down
 # or
 make down openwebui
 ```
@@ -76,7 +76,7 @@ make down openwebui
 User data, chat history, and uploaded files are stored in the named volume `openwebui_data` and survive restarts. To wipe everything (and force re-reading the env vars on next launch):
 
 ```bash
-docker compose -f ai/docker-compose.openwebui.yml down -v
+docker compose -f ai/openwebui/docker-compose.openwebui.yml down -v
 ```
 
 ### User signup & approval
@@ -123,7 +123,7 @@ A **Continue with Google** button appears on the login screen once both values a
 - If a local account with the same email already exists, `OAUTH_MERGE_ACCOUNTS_BY_EMAIL=true` links them — same user, two sign-in methods.
 - If not, a new account is created with role `pending` (per `OPENWEBUI_DEFAULT_USER_ROLE`) and must be approved.
 
-> **About the running container:** Env vars are only read on the *very first* boot — the SQLite store in `openwebui_data` is authoritative afterwards. If you change OAuth settings after the container has been initialized, either toggle the equivalent setting in **Admin Panel → Settings → General** or wipe the volume with `docker compose -f ai/docker-compose.openwebui.yml down -v` and start fresh (this deletes all chat history and users).
+> **About the running container:** Env vars are only read on the *very first* boot — the SQLite store in `openwebui_data` is authoritative afterwards. If you change OAuth settings after the container has been initialized, either toggle the equivalent setting in **Admin Panel → Settings → General** or wipe the volume with `docker compose -f ai/openwebui/docker-compose.openwebui.yml down -v` and start fresh (this deletes all chat history and users).
 
 ### Public hostname via Cloudflare Tunnel
 
@@ -259,7 +259,7 @@ Models are configured in `litellm_config.yaml`, not in Open WebUI. After editing
 
 ### Updating the image
 
-The image tag is pinned in `ai/docker-compose.openwebui.yml`:
+The image tag is pinned in `ai/openwebui/docker-compose.openwebui.yml`:
 
 ```yaml
 image: ghcr.io/open-webui/open-webui:v0.11.0

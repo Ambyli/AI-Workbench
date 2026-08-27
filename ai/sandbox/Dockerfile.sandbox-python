@@ -4,13 +4,13 @@
 # runs `pip install -r requirements.txt` on boot via sandbox-egress; this
 # takes 20-90s but subsequent HTTP requests are hot.
 #
-# Built by:   docker compose -f ai/docker-compose.sandbox.yml --profile build build
+# Built by:   docker compose -f ai/sandbox/docker-compose.sandbox.yml --profile build build
 # Tag:        sandbox-python:latest  (referenced from runtimes.py)
 
 FROM python:3.11-slim
 
 # The base package set — matches what runtimes.py's docstring promises.
-# Keep this list in sync with ai/SANDBOX.md § "Pre-baked Python packages"
+# Keep this list in sync with ai/sandbox/SANDBOX.md § "Pre-baked Python packages"
 # so a model relying on the docs isn't surprised.
 #
 # Reasoning for what's pre-baked vs left to requirements.txt:

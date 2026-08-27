@@ -36,8 +36,8 @@ services:
       roofix-db:
         condition: service_healthy
     build:
-      context: ..
-      dockerfile: ai/Dockerfile.roofix
+      context: ../..
+      dockerfile: ai/roofix/Dockerfile.roofix
     container_name: roofix
     restart: unless-stopped
     environment:
@@ -78,14 +78,14 @@ services:
       - PHOENIX_AGENT_USER_ID=${PHOENIX_AGENT_USER_ID}
       - PHOENIX_ROOFIX_ID_COLUMN=${PHOENIX_ROOFIX_ID_COLUMN:-migration_external_id}
       # Chrome-under-CDP for proposal fetches now lives in ai/interceptor.
-      # Start that compose file separately: `docker compose -f ai/docker-compose.interceptor.yml up -d`
+      # Start that compose file separately: `docker compose -f ai/interceptor/docker-compose.interceptor.yml up -d`
       - INTERCEPTOR_URL=${INTERCEPTOR_URL:-http://interceptor:8080}
       - LOG_DIR=/data
     volumes:
       - roofix_data:/data
       # Read-only mount for OAuth secrets — bind to a host dir you control.
       # Populate it once with credentials.json + token.json before first run.
-      - ${ROOFIX_BRIDGE_CONFIG_DIR:-./roofix/config}:/config
+      - ${ROOFIX_BRIDGE_CONFIG_DIR:-./config}:/config
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
       interval: 30s

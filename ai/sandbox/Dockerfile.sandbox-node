@@ -2,13 +2,13 @@
 # scaffolding tools pre-baked so `npm run dev` doesn't need to fetch the
 # framework every time.
 #
-# Built by:   docker compose -f ai/docker-compose.sandbox.yml --profile build build
+# Built by:   docker compose -f ai/sandbox/docker-compose.sandbox.yml --profile build build
 # Tag:        sandbox-node:latest  (referenced from runtimes.py)
 
 FROM node:20-slim
 
 # Package set pre-baked into a global node_modules. Keep in sync with
-# ai/SANDBOX.md § "Pre-baked Node packages".
+# ai/sandbox/SANDBOX.md § "Pre-baked Node packages".
 #
 # Reasoning:
 #   * serve                — quick static server, the default entrypoint.

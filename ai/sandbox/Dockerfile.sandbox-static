@@ -1,7 +1,7 @@
 # Base image for runtime="static" sandboxes — nginx serving whatever
 # HTML/CSS/JS/asset files the runner put_archive'd into /app.
 #
-# Built by:   docker compose -f ai/docker-compose.sandbox.yml build sandbox-static
+# Built by:   docker compose -f ai/sandbox/docker-compose.sandbox.yml build sandbox-static
 # Tag:        sandbox-static:latest  (referenced from runtimes.py)
 #
 # The base image is intentionally tiny — nginx:alpine + a config that

@@ -8,10 +8,10 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 WORKDIR /app
 
-COPY madlad/api/pyproject.toml .
+COPY ai/madlad/api/pyproject.toml .
 RUN uv sync --no-dev
 
-COPY madlad/api/madlad_server.py .
+COPY ai/madlad/api/madlad_server.py .
 
 EXPOSE 8000
 

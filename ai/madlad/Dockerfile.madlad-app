@@ -14,11 +14,11 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 WORKDIR /app
 
-COPY madlad/app/pyproject.toml .
+COPY ai/madlad/app/pyproject.toml .
 # uv downloads its own Python 3.11 — no need to install one via apt.
 RUN uv sync --no-dev
 
-COPY madlad/app/app.py .
+COPY ai/madlad/app/app.py .
 
 EXPOSE 8085
 

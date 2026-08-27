@@ -7,7 +7,7 @@ var, e.g.:
 
 If the env var isn't set the entire module is skipped — matches how
 integration-flavored tests are handled elsewhere in this repo. The
-sandbox subsystem's operator runbook (``ai/SANDBOX.md``) documents how
+sandbox subsystem's operator runbook (``ai/sandbox/SANDBOX.md``) documents how
 to spin up a throwaway Postgres for running these locally.
 
 Each test drops and recreates the ``jobs`` table so tests don't interfere

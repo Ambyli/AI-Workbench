@@ -6,7 +6,7 @@ routes to a short-lived sandbox-{id} container on sandbox_net. The
 network segmentation is what keeps model-generated code from reaching
 litellm, phoenix-mcp, roofix-db, or anything else on the stack.
 
-See ai/SANDBOX.md for the operator guide and the security-invariant
+See ai/sandbox/SANDBOX.md for the operator guide and the security-invariant
 checklist that must be re-verified after any change here.
 
 Endpoints:

@@ -5,7 +5,7 @@ Run a two-container translation stack built on [MADLAD-400](https://huggingface.
 ### Quick start
 
 ```bash
-docker compose -f ai/docker-compose.madlad.yml up -d
+docker compose -f ai/madlad/docker-compose.madlad.yml up -d
 ```
 
 This launches two containers:
@@ -78,7 +78,7 @@ Translation quality is controlled by four `ctranslate2.Translator.translate_batc
 **How to change**: edit the `_translator.translate_batch(...)` call in `ai/madlad/app/app.py`, then rebuild:
 
 ```bash
-docker compose -f ai/docker-compose.madlad.yml up -d --build
+docker compose -f ai/madlad/docker-compose.madlad.yml up -d --build
 ```
 
 **Why the defaults were picked**: greedy decoding (`beam_size=1`, no penalties) is the fastest but fails on short, idiomatic inputs — a common failure was round-trip translation producing loops like `"Good morning, good morning, good morning"`. Beam search plus both repetition guards eliminates the loop class entirely at a ~3-4× latency cost, which is invisible next to the model forward pass itself.
@@ -90,29 +90,28 @@ docker compose -f ai/docker-compose.madlad.yml up -d --build
 ### Stopping
 
 ```bash
-docker compose -f ai/docker-compose.madlad.yml down
+docker compose -f ai/madlad/docker-compose.madlad.yml down
 ```
 
 The downloaded checkpoint in the `madlad_data` volume is preserved. To also delete the cache (forcing full re-download on next start):
 
 ```bash
-docker compose -f ai/docker-compose.madlad.yml down -v
+docker compose -f ai/madlad/docker-compose.madlad.yml down -v
 ```
 
 ### Project structure
 
 ```
-ai/
+ai/madlad/
   docker-compose.madlad.yml
   Dockerfile.madlad-app      ← builds the inference container
   Dockerfile.madlad-api      ← builds the proxy container
-  madlad/
-    app/
-      pyproject.toml         ← app deps (ctranslate2, sentencepiece, huggingface_hub, langcodes, fastapi, uvicorn)
-      app.py                 ← FastAPI inference server on :8085
-    api/
-      pyproject.toml         ← api deps (fastapi, uvicorn, httpx, fastmcp)
-      madlad_server.py       ← FastAPI proxy server on :8000
+  app/
+    pyproject.toml           ← app deps (ctranslate2, sentencepiece, huggingface_hub, langcodes, fastapi, uvicorn)
+    app.py                   ← FastAPI inference server on :8085
+  api/
+    pyproject.toml           ← api deps (fastapi, uvicorn, httpx, fastmcp)
+    madlad_server.py         ← FastAPI proxy server on :8000
 ```
 
 Each subfolder is an independent `uv` project. For local development:

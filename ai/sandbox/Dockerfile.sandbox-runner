@@ -1,5 +1,5 @@
-# Build context is the REPO ROOT (see ai/docker-compose.sandbox.yml:
-#   context: ..) so we can copy the shared workspace package alongside the
+# Build context is the REPO ROOT (see ai/sandbox/docker-compose.sandbox.yml:
+#   context: ../..) so we can copy the shared workspace package alongside the
 # service.
 
 FROM python:3.11-slim

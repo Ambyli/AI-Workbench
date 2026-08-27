@@ -7,7 +7,7 @@ Run multiple models simultaneously, each in its own container on a different por
 ### Quick start
 
 ```bash
-docker compose -f ai/docker-compose.vllm.yml up -d
+docker compose -f ai/vllm/docker-compose.vllm.yml up -d
 ```
 
 This launches two containers by default:
@@ -33,9 +33,9 @@ curl http://localhost:8003/v1/chat/completions \
 
 ### How it works
 
-Each service in `ai/docker-compose.vllm.yml` is a standalone vLLM instance. The `--model` flag on the command line tells vLLM which HuggingFace model to load. Each container gets its own GPU memory allocation and listens on a different host port, so they run in parallel without conflict.
+Each service in `ai/vllm/docker-compose.vllm.yml` is a standalone vLLM instance. The `--model` flag on the command line tells vLLM which HuggingFace model to load. Each container gets its own GPU memory allocation and listens on a different host port, so they run in parallel without conflict.
 
-For strategies on dividing GPU resources between containers (time-slicing, MIG, `--gpu-memory-utilization` tuning), see [GPU_SHARING_GUIDE.md](GPU_SHARING_GUIDE.md).
+For strategies on dividing GPU resources between containers (time-slicing, MIG, `--gpu-memory-utilization` tuning), see [GPU_SHARING_GUIDE.md](../GPU_SHARING_GUIDE.md).
 
 The HuggingFace token (`HF_TOKEN`) is read from `.env` so gated models can be downloaded.
 
@@ -51,7 +51,7 @@ The token only needs **Read** permissions — model access is granted per-model 
 
 ### Adding more models
 
-To add a third model, add a new service block to `ai/docker-compose.vllm.yml`:
+To add a third model, add a new service block to `ai/vllm/docker-compose.vllm.yml`:
 
 ```yaml
   vllm-mistral:
@@ -113,7 +113,7 @@ To run a single model across multiple GPUs for lower latency and larger KV cache
 
 ### Custom chat template — qwen3.8
 
-The `qwen3.8` service loads a patched chat template from `ai/config/qwen_fixed_chat_template.jinja`, sourced from [froggeric/Qwen-Fixed-Chat-Templates](https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates). It fixes known bugs in the stock Qwen 3.5/3.6/3.8 templates, most notably:
+The `qwen3.8` service loads a patched chat template from `ai/vllm/config/qwen_fixed_chat_template.jinja`, sourced from [froggeric/Qwen-Fixed-Chat-Templates](https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates). It fixes known bugs in the stock Qwen 3.5/3.6/3.8 templates, most notably:
 
 - **Duplicate blank `<think>` blocks** in conversation history that caused the model to lose reasoning state and re-think from scratch until it hit the token limit.
 - **`enable_thinking=false` crash** on Qwen 3.8.
@@ -133,7 +133,7 @@ Applied via a bind mount and the `--chat-template` flag:
       --chat-template /config/qwen_fixed_chat_template.jinja
 ```
 
-**Updating the template:** re-download the raw file over the existing `ai/config/qwen_fixed_chat_template.jinja` and restart the container. No compose changes needed.
+**Updating the template:** re-download the raw file over the existing `ai/vllm/config/qwen_fixed_chat_template.jinja` and restart the container. No compose changes needed.
 
 **Reasoning effort:** the fixed template's default is `medium`. To bump it globally, add `--default-chat-template-kwargs '{"reasoning_effort":"xhigh"}'` to the command; to bump per-request, pass `{"reasoning_effort": "xhigh"}` in the client JSON body.
 
@@ -141,9 +141,9 @@ Applied via a bind mount and the `--chat-template` flag:
 
 ### Removing a model
 
-Delete the corresponding service block from `ai/docker-compose.vllm.yml`, then:
+Delete the corresponding service block from `ai/vllm/docker-compose.vllm.yml`, then:
 
 ```bash
-docker compose -f ai/docker-compose.vllm.yml down
-docker compose -f ai/docker-compose.vllm.yml up -d
+docker compose -f ai/vllm/docker-compose.vllm.yml down
+docker compose -f ai/vllm/docker-compose.vllm.yml up -d
 ```

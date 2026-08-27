@@ -8,8 +8,8 @@ services:
     networks:
       - shared
     build:
-      context: .
-      dockerfile: Dockerfile.madlad-app
+      context: ../..
+      dockerfile: ai/madlad/Dockerfile.madlad-app
     container_name: madlad-app
     restart: unless-stopped
     environment:
@@ -29,8 +29,8 @@ services:
     networks:
       - shared
     build:
-      context: .
-      dockerfile: Dockerfile.madlad-api
+      context: ../..
+      dockerfile: ai/madlad/Dockerfile.madlad-api
     container_name: madlad-api
     restart: unless-stopped
     environment:

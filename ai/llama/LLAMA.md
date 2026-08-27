@@ -1,13 +1,13 @@
 # llama.cpp — Multi-Model Serving
 
-Run large GGUF-quantized models on llama.cpp's OpenAI-compatible server. This is the sibling of [VLLM.md](VLLM.md) for models that either don't fit in vLLM's supported precisions or that don't fit in VRAM at all — llama.cpp is the only inference backend in this stack that supports **dynamic sub-2-bit quants** and **MoE expert offload to system RAM**.
+Run large GGUF-quantized models on llama.cpp's OpenAI-compatible server. This is the sibling of [VLLM.md](../vllm/VLLM.md) for models that either don't fit in vLLM's supported precisions or that don't fit in VRAM at all — llama.cpp is the only inference backend in this stack that supports **dynamic sub-2-bit quants** and **MoE expert offload to system RAM**.
 
-Each service in `ai/docker-compose.llama.yml` is a standalone llama-server instance. Hit any model at the standard OpenAI-compatible endpoint (`/v1/chat/completions`) — pick which model by specifying `"model": "glm5.2"` in your request body.
+Each service in `ai/llama/docker-compose.llama.yml` is a standalone llama-server instance. Hit any model at the standard OpenAI-compatible endpoint (`/v1/chat/completions`) — pick which model by specifying `"model": "glm5.2"` in your request body.
 
 ### Quick start
 
 ```bash
-docker compose -f ai/docker-compose.llama.yml up -d
+docker compose -f ai/llama/docker-compose.llama.yml up -d
 # or
 make up llama
 ```
@@ -53,7 +53,7 @@ Reference numbers for the default box (3× RTX A6000 = 144 GB VRAM, ~400 GB RAM)
 
 ### Configuration knobs
 
-The full launch command lives in `ai/docker-compose.llama.yml`. Every flag is set explicitly so behavior can be reviewed at a glance:
+The full launch command lives in `ai/llama/docker-compose.llama.yml`. Every flag is set explicitly so behavior can be reviewed at a glance:
 
 | Flag | Value | Purpose |
 |---|---|---|
@@ -82,14 +82,14 @@ watch -n 1 nvidia-smi --query-gpu=memory.used,memory.total --format=csv
 Restart the container after each change:
 
 ```bash
-docker compose -f ai/docker-compose.llama.yml up -d --force-recreate glm5.2
+docker compose -f ai/llama/docker-compose.llama.yml up -d --force-recreate glm5.2
 ```
 
 There is no rule-of-thumb formula because expert size varies with quant. Two or three iterations should converge you on a value that leaves ~2 GB headroom on the tightest GPU.
 
 ### Switching quants
 
-To swap UD-IQ1_S for a different quant, edit the `-hf` line in `ai/docker-compose.llama.yml`:
+To swap UD-IQ1_S for a different quant, edit the `-hf` line in `ai/llama/docker-compose.llama.yml`:
 
 ```yaml
 command: >
@@ -99,14 +99,14 @@ command: >
 Then recreate:
 
 ```bash
-docker compose -f ai/docker-compose.llama.yml up -d --force-recreate glm5.2
+docker compose -f ai/llama/docker-compose.llama.yml up -d --force-recreate glm5.2
 ```
 
 The new weights download into the same `llama_data` volume; the old ones stay cached unless you `docker volume rm`. This lets you A/B quants without paying the download twice.
 
 ### Adding more models
 
-Add a new service block to `ai/docker-compose.llama.yml`. A commented template lives at the top of the file. Requirements:
+Add a new service block to `ai/llama/docker-compose.llama.yml`. A commented template lives at the top of the file. Requirements:
 
 1. Pick a new host port and add it to the **PORT REGISTRY** block in `.env` (see the vertical alignment of the existing `PORT_*` lines — match the format).
 2. Give the service its own `container_name` and `-a <alias>` so LiteLLM and clients can address it distinctly.

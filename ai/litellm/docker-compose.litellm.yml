@@ -20,7 +20,7 @@ services:
     environment:
       STORE_MODEL_IN_DB: "True"
     env_file:
-      - ../.env
+      - ../../.env
     volumes:
       - ./litellm_config.yaml:/app/config.yaml
     command:

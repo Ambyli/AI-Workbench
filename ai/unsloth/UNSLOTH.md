@@ -24,8 +24,8 @@ After installing, restart Docker (`sudo systemctl restart docker`) before procee
 ## Starting the container
 
 ```bash
-docker compose -f ai/docker-compose.unsloth.yml up --build   # first run — builds the image and compiles llama.cpp
-docker compose -f ai/docker-compose.unsloth.yml up           # subsequent runs — reuses the volume, skips compile
+docker compose -f ai/unsloth/docker-compose.unsloth.yml up --build   # first run — builds the image and compiles llama.cpp
+docker compose -f ai/unsloth/docker-compose.unsloth.yml up           # subsequent runs — reuses the volume, skips compile
 ```
 
 Or use the Makefile helpers:
@@ -84,15 +84,15 @@ volumes:
 **3. Delete the now-unused files** (optional but clean):
 
 ```bash
-rm ai/Dockerfile.unsloth
-rm ai/entrypoint.sh
+rm ai/unsloth/Dockerfile.unsloth
+rm ai/unsloth/entrypoint.sh
 ```
 
 **4. Tear down and restart cleanly:**
 
 ```bash
-docker compose -f ai/docker-compose.unsloth.yml down -v   # removes the old named volume
-docker compose -f ai/docker-compose.unsloth.yml up
+docker compose -f ai/unsloth/docker-compose.unsloth.yml down -v   # removes the old named volume
+docker compose -f ai/unsloth/docker-compose.unsloth.yml up
 ```
 
 > **Tradeoff:** The stock image contains a CPU-only `llama.cpp` binary. If you need GPU inference you must either keep the custom build process or mount a pre-compiled binary from the host.
@@ -100,7 +100,7 @@ docker compose -f ai/docker-compose.unsloth.yml up
 ## Verifying GPU is active
 
 ```bash
-docker compose -f ai/docker-compose.unsloth.yml exec unsloth \
+docker compose -f ai/unsloth/docker-compose.unsloth.yml exec unsloth \
   /home/unsloth/.unsloth/llama.cpp/build/bin/llama-server --version 2>&1
 ```
 

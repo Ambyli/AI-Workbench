@@ -8,8 +8,8 @@ services:
     networks:
       - shared
     build:
-      context: ..
-      dockerfile: ai/Dockerfile.interceptor
+      context: ../..
+      dockerfile: ai/interceptor/Dockerfile.interceptor
     container_name: interceptor
     restart: unless-stopped
     environment:

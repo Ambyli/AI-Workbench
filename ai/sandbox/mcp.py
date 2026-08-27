@@ -1,7 +1,7 @@
 """FastMCP wrapper exposing the ``preview_app`` tool.
 
 Registered on the same FastAPI app under ``/mcp`` so LiteLLM (see
-``ai/litellm_config.yaml`` — ``mcp_servers.sandbox``) can advertise the
+``ai/litellm/litellm_config.yaml`` — ``mcp_servers.sandbox``) can advertise the
 tool to any Qwen/Claude/GPT model that supports tool calling. The model
 returns the tool result URL wrapped in a fenced ``html`` iframe block,
 which OpenWebUI renders as an artifact.

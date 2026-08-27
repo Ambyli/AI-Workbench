@@ -1,0 +1,282 @@
+{
+  "info": {
+    "name": "sandbox-runner",
+    "description": "sandbox-runner HTTP + MCP endpoints. Set the `baseUrl` collection variable to switch between local (http://localhost:8012) and container-network (http://sandbox-runner:8000) targets. For LiteLLM pass-through, set baseUrl to http://localhost:4001/v1/sandbox and add an Authorization: Bearer sk-... header at the collection level. See ai/sandbox/ENDPOINTS.md for the full reference.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "_postman_id": "sandbox-runner-collection"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:8012",
+      "type": "string",
+      "description": "Runner base URL. Localhost publish is 8012; on ai_shared it's http://sandbox-runner:8000."
+    },
+    {
+      "key": "sandboxId",
+      "value": "",
+      "type": "string",
+      "description": "12-char hex id returned by POST /run. Fill in after spawning to run the /jobs/{id} + DELETE requests."
+    }
+  ],
+  "item": [
+    {
+      "name": "GET /health",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/health",
+          "host": ["{{baseUrl}}"],
+          "path": ["health"]
+        },
+        "description": "Liveness + DB status. Returns {\"status\": \"ok\", \"db\": \"up\"} when the runner can reach sandbox-db; \"degraded\" / \"down\" otherwise. No auth."
+      },
+      "response": []
+    },
+    {
+      "name": "POST /run — static HTML",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"runtime\": \"static\",\n  \"files\": {\n    \"index.html\": \"<!doctype html><html><head><title>demo</title></head><body style=\\\"font-family: system-ui; padding: 2rem\\\"><h1>hello sandbox</h1><p>Timestamp: <span id=t></span></p><script>document.getElementById('t').textContent = new Date().toISOString()</script></body></html>\"\n  }\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": {
+          "raw": "{{baseUrl}}/run",
+          "host": ["{{baseUrl}}"],
+          "path": ["run"]
+        },
+        "description": "Spawn a static HTML sandbox — nginx serves the files map at /. Returns { sandbox_id, url, expires_at }. The URL is reachable via sandbox-proxy at http://localhost:8011/{sandbox_id}/ from the host, or http://sandbox-proxy/{sandbox_id}/ from ai_shared."
+      },
+      "response": []
+    },
+    {
+      "name": "POST /run — Python (Streamlit)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"runtime\": \"python\",\n  \"files\": {\n    \"app.py\": \"import streamlit as st\\nimport numpy as np\\nimport pandas as pd\\n\\nst.title('sine wave demo')\\nn = st.slider('samples', 10, 500, 100)\\nfreq = st.slider('frequency', 1, 10, 3)\\nx = np.linspace(0, 2 * np.pi, n)\\ndf = pd.DataFrame({'x': x, 'y': np.sin(freq * x)})\\nst.line_chart(df.set_index('x'))\\n\"\n  },\n  \"ttl_seconds\": 900\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": {
+          "raw": "{{baseUrl}}/run",
+          "host": ["{{baseUrl}}"],
+          "path": ["run"]
+        },
+        "description": "Spawn a Streamlit sandbox. Runtime `python` base image has streamlit, gradio, flask, fastapi, pandas, numpy, matplotlib, plotly, requests, pillow pre-installed. Add a requirements.txt to files to install additional deps via sandbox-egress (pypi allowlisted). Cold-start ~2s pre-baked; 20-90s if pip install runs."
+      },
+      "response": []
+    },
+    {
+      "name": "POST /run — Python with requirements.txt",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"runtime\": \"python\",\n  \"entrypoint\": \"gradio deploy || python -m gradio_app\",\n  \"files\": {\n    \"gradio_app.py\": \"import gradio as gr\\n\\ndef reverse(text):\\n    return text[::-1]\\n\\ngr.Interface(fn=reverse, inputs='text', outputs='text').launch(server_name='0.0.0.0', server_port=80)\\n\",\n    \"requirements.txt\": \"gradio\\n\"\n  }\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": {
+          "raw": "{{baseUrl}}/run",
+          "host": ["{{baseUrl}}"],
+          "path": ["run"]
+        },
+        "description": "Illustrates the install-if-present pattern. If files contains a requirements.txt, the base image entrypoint runs `pip install -r requirements.txt` before executing the command. pip goes through HTTP_PROXY=sandbox-egress:8888 and hits the pypi.org / files.pythonhosted.org allowlist."
+      },
+      "response": []
+    },
+    {
+      "name": "POST /run — Node (Express)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"runtime\": \"node\",\n  \"entrypoint\": \"node server.js\",\n  \"files\": {\n    \"server.js\": \"const express = require('express');\\nconst app = express();\\napp.get('/', (_, res) => res.send('<h1>hello from express</h1>'));\\napp.listen(80, '0.0.0.0', () => console.log('listening on 80'));\\n\"\n  }\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": {
+          "raw": "{{baseUrl}}/run",
+          "host": ["{{baseUrl}}"],
+          "path": ["run"]
+        },
+        "description": "Spawn a Node sandbox. Base image has serve, vite, react, react-dom, express, next installed globally so `require('express')` works without a package.json. Add a package.json to files to trigger `npm install` on boot."
+      },
+      "response": []
+    },
+    {
+      "name": "POST /run — Node (Vite + React)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"runtime\": \"node\",\n  \"entrypoint\": \"npx --yes vite --host 0.0.0.0 --port 80\",\n  \"files\": {\n    \"package.json\": \"{\\\"name\\\":\\\"demo\\\",\\\"type\\\":\\\"module\\\",\\\"scripts\\\":{\\\"dev\\\":\\\"vite\\\"}}\",\n    \"index.html\": \"<!doctype html><html><head><title>vite demo</title></head><body><div id=root></div><script type=module src=/main.jsx></script></body></html>\",\n    \"main.jsx\": \"import React, { useState } from 'react';\\nimport ReactDOM from 'react-dom/client';\\n\\nfunction Counter() {\\n  const [n, setN] = useState(0);\\n  return (<div style={{padding: '2rem', fontFamily: 'system-ui'}}>\\n    <h1>count: {n}</h1>\\n    <button onClick={() => setN(n + 1)}>+</button>\\n    <button onClick={() => setN(0)}>reset</button>\\n  </div>);\\n}\\n\\nReactDOM.createRoot(document.getElementById('root')).render(<Counter />);\\n\"\n  }\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": {
+          "raw": "{{baseUrl}}/run",
+          "host": ["{{baseUrl}}"],
+          "path": ["run"]
+        },
+        "description": "Multi-file Vite + React counter. Vite HMR uses WebSockets — sandbox-proxy (Caddy) forwards them by default, so buttons work end-to-end when iframed."
+      },
+      "response": []
+    },
+    {
+      "name": "GET /jobs",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/jobs",
+          "host": ["{{baseUrl}}"],
+          "path": ["jobs"]
+        },
+        "description": "List every sandbox in the registry (running + terminal). Fixed limit of 20 in PostgresRegistry.list_all(). Ordered by updated_at DESC. Returns JobsListResponse — see ENDPOINTS.md for the JobBase shape. max_concurrent / available are null (the runner enforces its concurrency cap in-process, not in the registry)."
+      },
+      "response": []
+    },
+    {
+      "name": "GET /jobs/{sandboxId}",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/jobs/{{sandboxId}}",
+          "host": ["{{baseUrl}}"],
+          "path": ["jobs", "{{sandboxId}}"]
+        },
+        "description": "Snapshot of one sandbox. 404 if unknown. Set the sandboxId collection variable to the id returned by POST /run first."
+      },
+      "response": []
+    },
+    {
+      "name": "DELETE /jobs/{sandboxId}",
+      "request": {
+        "method": "DELETE",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/jobs/{{sandboxId}}",
+          "host": ["{{baseUrl}}"],
+          "path": ["jobs", "{{sandboxId}}"]
+        },
+        "description": "Tear a sandbox down early. Stops the container, removes it, deletes the row, releases the concurrency slot. Returns 204 no body. 404 if the sandbox id is unknown."
+      },
+      "response": []
+    },
+    {
+      "name": "MCP",
+      "description": "FastMCP JSON-RPC over HTTP. All requests are POST /mcp/ (trailing slash required — the runner responds to POST /mcp with 307 → /mcp/). Every client must send `Accept: application/json, text/event-stream` and start with `initialize`. FastMCP returns responses as SSE events by default; if you need a single JSON response, some clients unwrap the SSE frame automatically.",
+      "item": [
+        {
+          "name": "MCP — initialize",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json, text/event-stream" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 1,\n  \"method\": \"initialize\",\n  \"params\": {\n    \"protocolVersion\": \"2024-11-05\",\n    \"capabilities\": {},\n    \"clientInfo\": { \"name\": \"postman\", \"version\": \"0.0\" }\n  }\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/mcp/",
+              "host": ["{{baseUrl}}"],
+              "path": ["mcp", ""]
+            },
+            "description": "Handshake. Must be called first. Response body carries serverInfo (name = 'sandbox', version from FastMCP), protocolVersion, and capabilities. Response headers include `mcp-session-id` — copy it into subsequent calls' `Mcp-Session-Id` request header if your client doesn't handle sessions automatically."
+          },
+          "response": []
+        },
+        {
+          "name": "MCP — tools/list",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json, text/event-stream" },
+              { "key": "Mcp-Session-Id", "value": "{{mcpSessionId}}", "description": "Paste in the mcp-session-id header value returned by initialize." }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 2,\n  \"method\": \"tools/list\",\n  \"params\": {}\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/mcp/",
+              "host": ["{{baseUrl}}"],
+              "path": ["mcp", ""]
+            },
+            "description": "Enumerate available tools. sandbox-runner exposes exactly one: preview_app."
+          },
+          "response": []
+        },
+        {
+          "name": "MCP — tools/call preview_app (static)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json, text/event-stream" },
+              { "key": "Mcp-Session-Id", "value": "{{mcpSessionId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 3,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"preview_app\",\n    \"arguments\": {\n      \"runtime\": \"static\",\n      \"files\": { \"index.html\": \"<h1>from mcp</h1>\" }\n    }\n  }\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/mcp/",
+              "host": ["{{baseUrl}}"],
+              "path": ["mcp", ""]
+            },
+            "description": "Invoke preview_app via MCP. Same effect as POST /run but the model side of the world uses this shape. Result body has { url, sandbox_id, expires_at } wrapped in the JSON-RPC `result.content[0].text` per MCP tool-result spec."
+          },
+          "response": []
+        },
+        {
+          "name": "MCP — tools/call preview_app (streamlit)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json, text/event-stream" },
+              { "key": "Mcp-Session-Id", "value": "{{mcpSessionId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 4,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"preview_app\",\n    \"arguments\": {\n      \"runtime\": \"python\",\n      \"files\": {\n        \"app.py\": \"import streamlit as st\\nst.title('mcp-spawned streamlit')\\nst.slider('n', 0, 100)\\n\"\n      },\n      \"ttl_seconds\": 600\n    }\n  }\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/mcp/",
+              "host": ["{{baseUrl}}"],
+              "path": ["mcp", ""]
+            },
+            "description": "Invoke preview_app for a Python (Streamlit) sandbox via MCP."
+          },
+          "response": []
+        }
+      ]
+    }
+  ]
+}

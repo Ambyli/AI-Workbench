@@ -15,12 +15,18 @@ WORKDIR /app
 
 # Workspace bootstrap: root pyproject declares the members; shared/common
 # lands first so the service's `common` dep resolves via the workspace.
-COPY pyproject.toml .
+# uv.lock ships with the build so the container gets the same version
+# resolution as the host — without it, uv resolves fresh at build time
+# and transitive extras (e.g. fastmcp-slim[server]) can silently get
+# dropped, surfacing at runtime as "FastMCP server support is not
+# installed" ImportError.
+COPY pyproject.toml uv.lock .
 COPY shared/common ./shared/common
 COPY ai/sandbox/pyproject.toml ./ai/sandbox/
 
-# Sync only this service's dep graph (transitively pulls common).
-RUN uv sync --package sandbox --no-dev
+# --frozen refuses to touch the lockfile: build fails loudly if the
+# pyproject drifted from the lock instead of silently re-resolving.
+RUN uv sync --package sandbox --no-dev --frozen
 
 # Service code last so a code-only change doesn't invalidate the (slow)
 # sync layer.
@@ -28,7 +34,7 @@ COPY ai/sandbox/app.py \
      ai/sandbox/spawner.py \
      ai/sandbox/runtimes.py \
      ai/sandbox/reaper.py \
-     ai/sandbox/mcp.py \
+     ai/sandbox/sandbox_mcp.py \
      ./ai/sandbox/
 
 WORKDIR /app/ai/sandbox

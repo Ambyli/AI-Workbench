@@ -38,7 +38,12 @@ from pydantic import BaseModel, Field
 from common.jobs.postgres import PostgresRegistry
 from common.jobs.router import build_router
 
-from mcp import build_mcp
+# Import name is `sandbox_mcp`, not `mcp`, because `ai/sandbox/` is on
+# sys.path and a module literally named `mcp` would shadow the `mcp`
+# PyPI package that FastMCP itself imports internally (from mcp.types
+# import ...) — that manifests as a confusing "FastMCP server support
+# is not installed" ImportError at startup.
+from sandbox_mcp import build_mcp
 from reaper import Reaper
 from runtimes import RUNTIMES, get_runtime
 from spawner import Spawner

@@ -100,7 +100,13 @@ services:
     image: dannydirect/tinyproxy:latest
     container_name: sandbox-egress
     restart: unless-stopped
-    command: ["ANY"]  # Config in mounted tinyproxy.conf overrides this
+    # Bypass the image's entrypoint — its /etc/entrypoint.sh script tries
+    # to sed-edit /etc/tinyproxy/tinyproxy.conf to add "Allow $1", which
+    # fails on a read-only bind-mount and dumps the container into a
+    # crash-loop. Overriding entrypoint runs tinyproxy directly against
+    # our mounted config so the allowlist is honored verbatim.
+    entrypoint: ["tinyproxy", "-d", "-c", "/etc/tinyproxy/tinyproxy.conf"]
+    command: []
     volumes:
       - ./tinyproxy.conf:/etc/tinyproxy/tinyproxy.conf:ro
       - ./tinyproxy.filter:/etc/tinyproxy/filter:ro

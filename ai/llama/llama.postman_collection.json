@@ -1,0 +1,266 @@
+{
+  "info": {
+    "name": "llama",
+    "description": "llama.cpp `llama-server` endpoints — GGUF-quantized models exposed via an OpenAI-compatible HTTP surface plus llama.cpp-native extras. Every service in `ai/llama/docker-compose.llama.yml` is a standalone llama-server; the default deploy publishes the `glm5.2` container on `localhost:8010` (see `PORT_LLAMA_GLM52` in `.env`) with model alias `glm5.2`. Set the collection variable `llama` to the direct-port base URL (default http://localhost:8010) — no auth is required on the direct port per LLAMA.md.\n\nThe 'Via LiteLLM' folder routes chat through the unified LiteLLM proxy at `{{litellm}}/v1/chat/completions` using the same `glm5.2` alias (registered in `ai/litellm/litellm_config.yaml` → `model_list`). LiteLLM requires bearer auth via a virtual master key.\n\nNotes:\n- `/v1/embeddings` is only mounted when `llama-server` is launched with `--embedding` (or `--pooling`). The current `glm5.2` command in `docker-compose.llama.yml` does NOT enable it, so no embeddings request is included by default. Add `--embedding` to the service `command:` block and uncomment the equivalent request if you need it.\n- First request after container start is slow — llama.cpp runs a warmup pass on the first inference call (see LLAMA.md § Non-obvious constraints).\n- The healthcheck has a 900 s `start_period` to cover the initial GGUF download; `/health` will 503 while the model is still loading.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "_postman_id": "llama-collection"
+  },
+  "variable": [
+    {
+      "key": "llama",
+      "value": "http://localhost:8010",
+      "type": "string",
+      "description": "Direct-port base URL for the `glm5.2` llama-server container. Published on `${PORT_LLAMA_GLM52}` (default 8010) → container port 8000. On `ai_shared` it's http://glm5.2:8000. LLAMA.md § Quick start. No auth required — the port is meant to sit behind LiteLLM."
+    },
+    {
+      "key": "llamaModel",
+      "value": "glm5.2",
+      "type": "string",
+      "description": "Model alias returned by `/v1/models` and required in the `\"model\"` field of chat/completion requests. Set via `-a glm5.2` in the compose `command:` block. If you add more llama-server services (see LLAMA.md § Adding more models), each one carries its own alias."
+    },
+    {
+      "key": "litellm",
+      "value": "http://localhost:4001",
+      "type": "string",
+      "description": "LiteLLM base URL for the 'Via LiteLLM' folder. Localhost publish is 4001 (PORT_LITELLM); on ai_shared it's http://litellm:4000; behind cloudflared it's https://your-litellm-host."
+    },
+    {
+      "key": "virtual master key",
+      "value": "sk-your-litellm-virtual-key",
+      "type": "string",
+      "description": "LiteLLM virtual key (Admin UI → Virtual Keys, or /key/generate API). Scope the key to allow the `glm5.2` model. Sent as `Authorization: Bearer {{virtual master key}}` only by requests inside the 'Via LiteLLM' folder — direct-port requests need no auth."
+    }
+  ],
+  "item": [
+    {
+      "name": "GET /health",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{llama}}/health",
+          "host": ["{{llama}}"],
+          "path": ["health"]
+        },
+        "description": "Liveness probe. Returns `{\"status\":\"ok\"}` once the GGUF weights have finished loading. Returns 503 while the model is still loading — expected during the ~900 s `start_period` on first launch (initial UD-IQ1_S download is ~176 GB). LLAMA.md § No tests."
+      },
+      "response": []
+    },
+    {
+      "name": "GET /v1/models",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{llama}}/v1/models",
+          "host": ["{{llama}}"],
+          "path": ["v1", "models"]
+        },
+        "description": "OpenAI-compatible model listing. Returns `{\"object\":\"list\",\"data\":[{\"id\":\"glm5.2\",\"object\":\"model\",...}]}` where the `id` matches the alias set via `-a` in the compose command (LLAMA.md § Configuration knobs). Use this to sanity-check that the alias the client sends in `\"model\"` matches what llama-server actually advertises."
+      },
+      "response": []
+    },
+    {
+      "name": "GET /props",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{llama}}/props",
+          "host": ["{{llama}}"],
+          "path": ["props"]
+        },
+        "description": "llama.cpp-native server introspection. Returns default sampler params, model alias, model path, embedded chat template, build info, and enabled modalities. Handy for verifying that `--jinja` picked up GLM's chat template (LLAMA.md § Common pitfalls: forgetting `--jinja` gives raw-completion behavior)."
+      },
+      "response": []
+    },
+    {
+      "name": "POST /v1/chat/completions",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"model\": \"{{llamaModel}}\",\n  \"messages\": [\n    { \"role\": \"user\", \"content\": \"Hello!\" }\n  ]\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": {
+          "raw": "{{llama}}/v1/chat/completions",
+          "host": ["{{llama}}"],
+          "path": ["v1", "chat", "completions"]
+        },
+        "description": "OpenAI-compatible chat completion. Response shape mirrors OpenAI: `{id, object:\"chat.completion\", choices:[{message:{role,content},finish_reason}], usage:{...}}`. GLM's chat template is applied server-side because the compose command sets `--jinja` — without that flag the roles are ignored and you get raw-completion behavior (LLAMA.md § Common pitfalls). Add `\"stream\": true` for SSE streaming."
+      },
+      "response": []
+    },
+    {
+      "name": "POST /v1/chat/completions — streaming",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Accept", "value": "text/event-stream" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"model\": \"{{llamaModel}}\",\n  \"messages\": [\n    { \"role\": \"user\", \"content\": \"Write a short haiku about GPUs.\" }\n  ],\n  \"stream\": true\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": {
+          "raw": "{{llama}}/v1/chat/completions",
+          "host": ["{{llama}}"],
+          "path": ["v1", "chat", "completions"]
+        },
+        "description": "OpenAI-compatible chat completion with Server-Sent Events. Response is a stream of `data: {...}` chunks terminated by `data: [DONE]`, each chunk containing a `choices[0].delta.content` fragment. Postman shows the raw event stream in the response body."
+      },
+      "response": []
+    },
+    {
+      "name": "POST /v1/completions",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"model\": \"{{llamaModel}}\",\n  \"prompt\": \"The three primary colors are\",\n  \"max_tokens\": 32,\n  \"temperature\": 0.7\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": {
+          "raw": "{{llama}}/v1/completions",
+          "host": ["{{llama}}"],
+          "path": ["v1", "completions"]
+        },
+        "description": "OpenAI-compatible text completion (legacy, no chat template). Response shape: `{id, object:\"text_completion\", choices:[{text, index, finish_reason}], usage:{...}}`. Prefer `/v1/chat/completions` for anything that should honor GLM's chat template — this endpoint feeds the prompt string verbatim to the model."
+      },
+      "response": []
+    },
+    {
+      "name": "POST /completion (native)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"prompt\": \"Building a website can be done in 10 simple steps:\",\n  \"n_predict\": 64,\n  \"temperature\": 0.7,\n  \"stop\": [\"\\n\\n\"]\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": {
+          "raw": "{{llama}}/completion",
+          "host": ["{{llama}}"],
+          "path": ["completion"]
+        },
+        "description": "llama.cpp-native completion. Distinct from `/v1/completions`: exposes llama.cpp-specific sampler knobs (`n_predict`, `mirostat`, `top_k`, `min_p`, `repeat_penalty`, `grammar`, `json_schema`, `cache_prompt`, `slot_id`, ...) that the OpenAI-shaped endpoints don't. Response shape: `{content, tokens_predicted, tokens_evaluated, timings, stop, ...}`. Add `\"stream\": true` for NDJSON streaming (one `{content, stop}` object per line)."
+      },
+      "response": []
+    },
+    {
+      "name": "POST /tokenize",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"content\": \"Hello, world!\",\n  \"add_special\": false,\n  \"with_pieces\": false\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": {
+          "raw": "{{llama}}/tokenize",
+          "host": ["{{llama}}"],
+          "path": ["tokenize"]
+        },
+        "description": "llama.cpp-native tokenizer. Returns `{\"tokens\": [int, int, ...]}` — the model's tokenization of `content`. Pass `\"add_special\": true` to include BOS/EOS markers, `\"with_pieces\": true` to also get the string piece for each token id. Useful for context-window budgeting before firing a large completion at a 65 k-context server (see `-c 65536` in the compose command)."
+      },
+      "response": []
+    },
+    {
+      "name": "POST /detokenize",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"tokens\": [9707, 11, 1879, 0]\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": {
+          "raw": "{{llama}}/detokenize",
+          "host": ["{{llama}}"],
+          "path": ["detokenize"]
+        },
+        "description": "llama.cpp-native detokenizer. Returns `{\"content\": \"...\"}` — the string reconstructed from the token id array. Inverse of `/tokenize`. Handy when consuming logprobs or streaming diagnostics that surface raw token ids."
+      },
+      "response": []
+    },
+    {
+      "name": "Via LiteLLM",
+      "description": "Chat routed through the unified LiteLLM proxy at `{{litellm}}` instead of hitting the llama-server port directly. LiteLLM's `model_list` entry for `glm5.2` (see `ai/litellm/litellm_config.yaml`) forwards to `http://glm5.2:8000/v1` over the `ai_shared` Docker network. Requires bearer auth via a virtual master key — set the `virtual master key` collection variable. Use this path when you want unified logging / rate-limiting / retries / spend tracking across all backends.",
+      "item": [
+        {
+          "name": "POST /v1/chat/completions (LiteLLM)",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                { "key": "token", "value": "{{virtual master key}}", "type": "string" }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"{{llamaModel}}\",\n  \"messages\": [\n    { \"role\": \"user\", \"content\": \"Hello via LiteLLM!\" }\n  ]\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/chat/completions",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "chat", "completions"]
+            },
+            "description": "Same OpenAI-compatible chat surface as the direct-port `/v1/chat/completions`, but proxied through LiteLLM. The `\"model\"` field must be `glm5.2` — that's the `model_name` LiteLLM matches on to route to the `openai/glm5.2` provider block. LiteLLM strips its virtual key and forwards to llama-server with `api_key: none`. Response shape is identical to the direct call. LLAMA.md § LiteLLM integration."
+          },
+          "response": []
+        },
+        {
+          "name": "POST /v1/chat/completions — streaming (LiteLLM)",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                { "key": "token", "value": "{{virtual master key}}", "type": "string" }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "text/event-stream" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"{{llamaModel}}\",\n  \"messages\": [\n    { \"role\": \"user\", \"content\": \"Stream a two-line poem about tensor cores.\" }\n  ],\n  \"stream\": true\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/chat/completions",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "chat", "completions"]
+            },
+            "description": "Streaming chat via LiteLLM. Same SSE `data: {...}` / `data: [DONE]` shape as the direct-port streaming request; LiteLLM passes chunks through as they arrive from llama-server. Look at LiteLLM logs (`docker logs litellm`) if the stream stalls — the `stream_timeout` in `litellm_config.yaml` caps how long the proxy waits between chunks."
+          },
+          "response": []
+        }
+      ]
+    }
+  ]
+}

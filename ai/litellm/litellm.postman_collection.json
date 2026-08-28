@@ -1,0 +1,532 @@
+{
+  "info": {
+    "name": "litellm",
+    "description": "LiteLLM proxy endpoints for this deployment. Config is in `ai/litellm/litellm_config.yaml`; operator guide in `ai/litellm/LITELLM.md`; MCP tool-call orchestration in `ai/litellm/LITELLM_MCP.md`.\n\nAuth model: the collection's default Bearer is `virtual master key` — an sk-… issued from the LiteLLM Admin UI → Virtual Keys (or `/key/generate`). Admin endpoints (under the `Admin` folder) override at the item level to `litellm master key` — the value of `DEFAULT_LITELLM_MASTER_KEY` in `.env`, which `general_settings.master_key` reads via `os.environ`. Never distribute the master key; use it only for key/user/model management.\n\nSet the collection variables `litellm` (base URL — localhost publish is 4001 = `PORT_LITELLM`; on `ai_shared` it's http://litellm:4000), `virtual master key`, and `litellm master key` before running requests.\n\nModels enabled in this deployment (from `model_list`): `kokoro` (TTS, audio), `qwen3.6`, `qwen3.8`, `glm5.2`, `qwen2.5-vl` (image), `claude-sonnet-5` (Anthropic fallback), plus the env-driven default (`DEFAULT_LITELLM_MODEL_NAME`). Context-window fallbacks route qwen3.6/qwen3.8/glm5.2 → claude-sonnet-5 when the request exceeds the local model's window (see `litellm_settings.context_window_fallbacks`).",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "_postman_id": "litellm-collection"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{virtual master key}}",
+        "type": "string"
+      }
+    ]
+  },
+  "variable": [
+    {
+      "key": "litellm",
+      "value": "http://localhost:4001",
+      "type": "string",
+      "description": "LiteLLM base URL. Localhost publish is 4001 (PORT_LITELLM); on ai_shared it's http://litellm:4000; behind cloudflared it's https://your-litellm-host. See ai/litellm/LITELLM.md § Quick start."
+    },
+    {
+      "key": "virtual master key",
+      "value": "sk-your-litellm-virtual-key",
+      "type": "string",
+      "description": "LiteLLM virtual key (Admin UI → Virtual Keys, or POST /key/generate). Sent as `Authorization: Bearer {{virtual master key}}` by the collection-level auth. Use this for all runtime / model / pass-through / MCP calls."
+    },
+    {
+      "key": "litellm master key",
+      "value": "sk-your-litellm-master-key",
+      "type": "string",
+      "description": "The proxy's admin master key — value of `DEFAULT_LITELLM_MASTER_KEY` in `.env`, read by `general_settings.master_key` in litellm_config.yaml. Required for /key/*, /user/*, /model/* admin endpoints. Do NOT distribute; scope tokens for downstream services via /key/generate instead."
+    },
+    {
+      "key": "keyToken",
+      "value": "",
+      "type": "string",
+      "description": "Virtual-key token returned by POST /key/generate as `key`. Paste in to run /key/info, /key/update, /key/delete without editing each URL."
+    },
+    {
+      "key": "userId",
+      "value": "",
+      "type": "string",
+      "description": "user_id assigned to a virtual key at creation, or a pre-existing user in the LiteLLM DB. Consumed by GET /user/info."
+    }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "description": "Liveness / readiness probes. `/health/liveliness` is the container's docker healthcheck target (see LITELLM.md § Health checks). `/health` runs an actual upstream ping against configured models — slower, use for diagnostics not for uptime dashboards.",
+      "item": [
+        {
+          "name": "GET /health",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{litellm}}/health",
+              "host": ["{{litellm}}"],
+              "path": ["health"]
+            },
+            "description": "Full model-health check — pings every entry in `model_list` and returns healthy/unhealthy counts. Not used by the container healthcheck (which uses /health/liveliness); this exists for operator diagnostics. See LITELLM.md § Health checks."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /health/liveliness",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{litellm}}/health/liveliness",
+              "host": ["{{litellm}}"],
+              "path": ["health", "liveliness"]
+            },
+            "description": "Cheap liveness probe — does not hit upstream models. This is the endpoint the docker healthcheck targets, per LITELLM.md § Health checks."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /health/readiness",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{litellm}}/health/readiness",
+              "host": ["{{litellm}}"],
+              "path": ["health", "readiness"]
+            },
+            "description": "Readiness probe — reports whether the proxy has finished startup (config loaded, DB connection to `litellm_db` established per LITELLM.md § Quick start). Use this to gate compose `depends_on` conditions."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "OpenAI-compatible",
+      "description": "The primary API surface. LiteLLM presents an OpenAI-compatible interface in front of vLLM (qwen3.6, qwen3.8, glm5.2, qwen2.5-vl), Kokoro TTS, and Anthropic (claude-sonnet-5 fallback). Models available are those enumerated under `model_list` in litellm_config.yaml. See LITELLM.md § `litellm_config.yaml` settings for the config schema reference.",
+      "item": [
+        {
+          "name": "POST /v1/chat/completions",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"qwen3.6\",\n  \"messages\": [\n    { \"role\": \"user\", \"content\": \"Say hello in one sentence.\" }\n  ]\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/chat/completions",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "chat", "completions"]
+            },
+            "description": "Standard chat-completion call. `model` must match a `model_name` in `model_list` — this deployment defines qwen3.6, qwen3.8, glm5.2, qwen2.5-vl (image), claude-sonnet-5, kokoro (audio), plus the env-driven `DEFAULT_LITELLM_MODEL_NAME`. If the request exceeds the model's context window, `litellm_settings.context_window_fallbacks` transparently reroutes qwen3.6/qwen3.8/glm5.2 → claude-sonnet-5. Tool calls are supported but not auto-executed — see LITELLM_MCP.md § Step 1/Step 2 for the tool-call loop."
+          },
+          "response": []
+        },
+        {
+          "name": "POST /v1/chat/completions (tool call — step 1)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"qwen3.6\",\n  \"messages\": [\n    { \"role\": \"user\", \"content\": \"List all tables in the database\" }\n  ]\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/chat/completions",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "chat", "completions"]
+            },
+            "description": "Kick off an MCP-backed tool call. When an `mcp_servers` entry is configured (e.g. `phoenix`), the model receives the tool definitions automatically and returns `finish_reason: tool_calls` with a `tool_call_id`. LiteLLM does NOT execute the call — copy the id and follow up with the step-2 request below. See LITELLM_MCP.md § Step 1: Send the user message."
+          },
+          "response": []
+        },
+        {
+          "name": "POST /v1/chat/completions (tool call — step 2)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"qwen3.6\",\n  \"messages\": [\n    { \"role\": \"user\", \"content\": \"List all tables in the database\" },\n    { \"role\": \"assistant\", \"tool_calls\": [ { \"function\": { \"arguments\": \"{}\", \"name\": \"list_tables\" }, \"id\": \"CALL_ID_FROM_STEP_1\", \"type\": \"function\" } ] },\n    { \"role\": \"tool\", \"tool_call_id\": \"CALL_ID_FROM_STEP_1\", \"content\": \"[\\\"projects\\\", \\\"users\\\"]\" }\n  ]\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/chat/completions",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "chat", "completions"]
+            },
+            "description": "Send the tool result back. Replace `CALL_ID_FROM_STEP_1` with the id from the step-1 response, and put the actual MCP-tool result string in the `tool` message's `content`. LiteLLM feeds this back to the model, which returns a natural-language response. See LITELLM_MCP.md § Step 2: Send the tool result back."
+          },
+          "response": []
+        },
+        {
+          "name": "POST /v1/embeddings",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"qwen3.6\",\n  \"input\": \"hello world\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/embeddings",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "embeddings"]
+            },
+            "description": "OpenAI-compatible embeddings endpoint. `model` must be a `model_list` entry whose upstream supports embeddings. LiteLLM proxies to whichever upstream the model resolves to; failures return the upstream error verbatim. See LITELLM.md § `litellm_config.yaml` settings."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /v1/models",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{litellm}}/v1/models",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "models"]
+            },
+            "description": "List models visible to the calling key. Union of the static `model_list` in litellm_config.yaml and any models stored in `litellm_db` (enabled by `general_settings.store_model_in_db: true`). Virtual keys with scoped access only see the models they're allowed to call."
+          },
+          "response": []
+        },
+        {
+          "name": "POST /v1/audio/speech (Kokoro TTS)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"kokoro\",\n  \"input\": \"Hello from Kokoro.\",\n  \"voice\": \"af_bella\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/audio/speech",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "audio", "speech"]
+            },
+            "description": "OpenAI-compatible text-to-speech. Routes to the `kokoro` model entry, which points at `http://kokoro-api:8000/v1` with `mode: audio`. Response is binary audio (use Postman's Send-and-Download). Kokoro also exposes an MCP server registered under `mcp_servers.kokoro_tts` — see the MCP folder for that path."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Admin",
+      "description": "Management endpoints that require the LiteLLM master key. Each item overrides the collection-level Bearer to use `{{litellm master key}}` (value of `DEFAULT_LITELLM_MASTER_KEY` in `.env`, read by `general_settings.master_key`). Use these to issue and revoke virtual keys, inspect users, and enumerate model config from the DB. See LITELLM.md § `litellm_config.yaml` settings and the linked LiteLLM Config Settings reference for the DB-backed model-management flow.",
+      "item": [
+        {
+          "name": "POST /key/generate",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [ { "key": "token", "value": "{{litellm master key}}", "type": "string" } ]
+            },
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"models\": [\"qwen3.6\", \"claude-sonnet-5\"],\n  \"duration\": \"30d\",\n  \"metadata\": { \"purpose\": \"postman-issued\" }\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{litellm}}/key/generate",
+              "host": ["{{litellm}}"],
+              "path": ["key", "generate"]
+            },
+            "description": "Issue a new virtual key. `models` scopes the key to specific `model_list` entries; omit for all models. Response contains a `key` (sk-…) — paste into the `keyToken` collection variable to run the other /key/* requests, or into `virtual master key` to use it for runtime calls. Requires master key. See LITELLM.md § `litellm_config.yaml` settings for the full option reference."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /key/info",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [ { "key": "token", "value": "{{litellm master key}}", "type": "string" } ]
+            },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{litellm}}/key/info?key={{keyToken}}",
+              "host": ["{{litellm}}"],
+              "path": ["key", "info"],
+              "query": [
+                { "key": "key", "value": "{{keyToken}}", "description": "The sk-… token to inspect." }
+              ]
+            },
+            "description": "Inspect a virtual key — allowed models, spend, TPM/RPM limits, expiry, metadata. Requires master key."
+          },
+          "response": []
+        },
+        {
+          "name": "POST /key/update",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [ { "key": "token", "value": "{{litellm master key}}", "type": "string" } ]
+            },
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"key\": \"{{keyToken}}\",\n  \"models\": [\"qwen3.6\", \"qwen3.8\", \"claude-sonnet-5\"],\n  \"metadata\": { \"purpose\": \"postman-issued\", \"updated\": true }\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{litellm}}/key/update",
+              "host": ["{{litellm}}"],
+              "path": ["key", "update"]
+            },
+            "description": "Update a virtual key's allowed models, spend cap, limits, or metadata. `key` in body identifies the target — set the `keyToken` variable first. Requires master key."
+          },
+          "response": []
+        },
+        {
+          "name": "POST /key/delete",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [ { "key": "token", "value": "{{litellm master key}}", "type": "string" } ]
+            },
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"keys\": [\"{{keyToken}}\"]\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{litellm}}/key/delete",
+              "host": ["{{litellm}}"],
+              "path": ["key", "delete"]
+            },
+            "description": "Revoke one or more virtual keys. Deleted keys stop working immediately — any in-flight requests using them 401 on the next call. Requires master key."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /user/info",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [ { "key": "token", "value": "{{litellm master key}}", "type": "string" } ]
+            },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{litellm}}/user/info?user_id={{userId}}",
+              "host": ["{{litellm}}"],
+              "path": ["user", "info"],
+              "query": [
+                { "key": "user_id", "value": "{{userId}}", "description": "User id to look up. Set the `userId` collection variable first." }
+              ]
+            },
+            "description": "Look up a user — aggregated spend, list of keys owned, budget/limits. Requires master key."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /model/info",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [ { "key": "token", "value": "{{litellm master key}}", "type": "string" } ]
+            },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{litellm}}/model/info",
+              "host": ["{{litellm}}"],
+              "path": ["model", "info"]
+            },
+            "description": "Enumerate every model known to the proxy — union of `model_list` in litellm_config.yaml plus DB-stored models (`general_settings.store_model_in_db: true`). Includes upstream `api_base`, mode (chat/audio/image), and litellm params. Requires master key so upstream keys are visible."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Pass-through",
+      "description": "Reverse proxies to internal services declared under `general_settings.pass_through_endpoints` in litellm_config.yaml. Every request keeps the caller's `Authorization` header (`forward_headers: true`) and `include_subpath: true` so anything after the mount prefix is passed through unchanged. This means downstream services see the LiteLLM virtual-key Bearer and can authenticate against it. Five pass-throughs are mounted in this deployment: classifier, madlad, interceptor, roofix, sandbox.",
+      "item": [
+        {
+          "name": "GET /v1/classifier/health",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/health",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "classifier", "health"]
+            },
+            "description": "Pass-through to the classifier service — `pass_through_endpoints` mounts `/v1/classifier` → `http://classifier:8000` with methods GET/POST/DELETE. This is a simple health probe example; anything after `/v1/classifier/` reaches the upstream unchanged."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /v1/madlad/health",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{litellm}}/v1/madlad/health",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "madlad", "health"]
+            },
+            "description": "Pass-through to the MADLAD translation service — `/v1/madlad` → `http://madlad-api:8000` with methods GET/POST. Translation calls (e.g. `POST /v1/madlad/translate`) go through this same mount."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /v1/interceptor/health",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{litellm}}/v1/interceptor/health",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "interceptor", "health"]
+            },
+            "description": "Pass-through to the interceptor (CDP capture service) — `/v1/interceptor` → `http://interceptor:8080` with methods GET/POST/DELETE. Capture calls (`POST /v1/interceptor/capture`) and job endpoints all route through this."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /v1/roofix/health",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{litellm}}/v1/roofix/health",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "roofix", "health"]
+            },
+            "description": "Pass-through to the Roofix ↔ Phoenix bridge — `/v1/roofix` → `http://roofix:8080` with methods GET/POST."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /v1/sandbox/health",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{litellm}}/v1/sandbox/health",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "sandbox", "health"]
+            },
+            "description": "Pass-through to sandbox-runner — `/v1/sandbox` → `http://sandbox-runner:8000` with methods GET/POST/DELETE. Full endpoint catalogue in `ai/sandbox/sandbox-runner.postman_collection.json`; this collection only shows the mount health probe."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "MCP",
+      "description": "LiteLLM advertises MCP servers to clients (Claude Code, Open WebUI, custom apps) via the `mcp_servers` block in litellm_config.yaml. Each entry is mounted at `/mcp/{key}` — the key MUST match the URL path a client points at. LITELLM_MCP.md explains the tool-call loop; LiteLLM only surfaces the tool definitions to the model — YOU orchestrate the actual tool execution and feed the result back with the `tool` role message.\n\nMounted MCP servers in this deployment (from `mcp_servers`):\n- `kokoro_tts` → http://kokoro-api:8000/mcp (TTS)\n- `madlad_translate` → http://madlad-api:8000/mcp (translation)\n- `interceptor` → http://interceptor:8080/mcp (CDP capture)\n- `sandbox` → http://sandbox-runner:8000/mcp (preview_app + get_sandbox_logs — see the sandbox-runner Postman collection's MCP folder for the FastMCP JSON-RPC calls)\n- `phoenix` → env-driven URL, bearer auth via `DEFAULT_LITELLM_MCP_PHOENIX_AUTH_VALUE`\n- `gmail` → https://gmailmcp.googleapis.com/mcp/v1, OAuth2 (authorization_code, delegated to upstream)\n\nRegister these with Claude Code via `claude mcp add --transport http -s user {key} {litellm}/mcp/{key} --header \"Authorization: Bearer sk-…\"` — see LITELLM_MCP.md § Add MCP Servers to Claude Code.",
+      "item": [
+        {
+          "name": "Kokoro TTS MCP — claude mcp add (docs)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{litellm}}/mcp/kokoro_tts",
+              "host": ["{{litellm}}"],
+              "path": ["mcp", "kokoro_tts"]
+            },
+            "description": "URL to register with Claude Code:\n\n    claude mcp add --transport http -s user kokoro {{litellm}}/mcp/kokoro_tts \\\n      --header \"Authorization: Bearer {{virtual master key}}\"\n\nBacked by `mcp_servers.kokoro_tts` → http://kokoro-api:8000/mcp. See LITELLM_MCP.md § Add MCP Servers to Claude Code."
+          },
+          "response": []
+        },
+        {
+          "name": "MADLAD translate MCP — claude mcp add (docs)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{litellm}}/mcp/madlad_translate",
+              "host": ["{{litellm}}"],
+              "path": ["mcp", "madlad_translate"]
+            },
+            "description": "URL to register with Claude Code:\n\n    claude mcp add --transport http -s user madlad {{litellm}}/mcp/madlad_translate \\\n      --header \"Authorization: Bearer {{virtual master key}}\"\n\nBacked by `mcp_servers.madlad_translate` → http://madlad-api:8000/mcp."
+          },
+          "response": []
+        },
+        {
+          "name": "Interceptor MCP — claude mcp add (docs)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{litellm}}/mcp/interceptor",
+              "host": ["{{litellm}}"],
+              "path": ["mcp", "interceptor"]
+            },
+            "description": "URL to register with Claude Code:\n\n    claude mcp add --transport http -s user interceptor {{litellm}}/mcp/interceptor \\\n      --header \"Authorization: Bearer {{virtual master key}}\"\n\nBacked by `mcp_servers.interceptor` → http://interceptor:8080/mcp."
+          },
+          "response": []
+        },
+        {
+          "name": "Sandbox MCP — claude mcp add (docs)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{litellm}}/mcp/sandbox",
+              "host": ["{{litellm}}"],
+              "path": ["mcp", "sandbox"]
+            },
+            "description": "URL to register with Claude Code:\n\n    claude mcp add --transport http -s user sandbox {{litellm}}/mcp/sandbox \\\n      --header \"Authorization: Bearer {{virtual master key}}\"\n\nBacked by `mcp_servers.sandbox` → http://sandbox-runner:8000/mcp. Exposes `preview_app` and `get_sandbox_logs`. For the underlying FastMCP JSON-RPC transport (initialize / tools/list / tools/call), see the MCP folder of `ai/sandbox/sandbox-runner.postman_collection.json`."
+          },
+          "response": []
+        },
+        {
+          "name": "Phoenix MCP — claude mcp add (docs)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{litellm}}/mcp/phoenix",
+              "host": ["{{litellm}}"],
+              "path": ["mcp", "phoenix"]
+            },
+            "description": "URL to register with Claude Code:\n\n    claude mcp add --transport http -s user phoenix {{litellm}}/mcp/phoenix \\\n      --header \"Authorization: Bearer sk-your-phoenix-auth-value\"\n\nBacked by `mcp_servers.phoenix` — `url` from `DEFAULT_LITELLM_MCP_PHOENIX_URL`, bearer token from `DEFAULT_LITELLM_MCP_PHOENIX_AUTH_VALUE`. See LITELLM_MCP.md § Add MCP Servers to Claude Code and § MCP API Token (Phoenix uses browser-based OAuth to mint long-lived tokens)."
+          },
+          "response": []
+        },
+        {
+          "name": "Gmail MCP — claude mcp add (docs)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{litellm}}/mcp/gmail",
+              "host": ["{{litellm}}"],
+              "path": ["mcp", "gmail"]
+            },
+            "description": "URL to register with Claude Code:\n\n    claude mcp add --transport http -s user gmail {{litellm}}/mcp/gmail\n\nBacked by `mcp_servers.gmail` → https://gmailmcp.googleapis.com/mcp/v1 with `auth_type: oauth2`, `oauth2_flow: authorization_code`, and `delegate_auth_to_upstream: true` — LiteLLM does not manage the token; the client completes OAuth against Google directly."
+          },
+          "response": []
+        }
+      ]
+    }
+  ]
+}

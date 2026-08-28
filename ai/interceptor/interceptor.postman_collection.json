@@ -1,0 +1,354 @@
+{
+  "info": {
+    "name": "interceptor",
+    "description": "interceptor endpoints, called through the LiteLLM pass-through registered in ai/litellm/litellm_config.yaml (`pass_through_endpoints` → `/v1/interceptor` → `http://interceptor:8080`, `include_subpath: true`, methods GET/POST/DELETE, `forward_headers: true` — so `multipart/form-data` uploads for /profiles/{name}/refresh forward correctly). Every request is authenticated with a Bearer token from a LiteLLM virtual key. Set the collection variables `litellm` (e.g. http://localhost:4001) and `virtual master key` (an sk-… key issued from the LiteLLM Admin UI → Virtual Keys) — every request inherits them via collection-level auth. See ai/interceptor/INTERCEPTOR.md for the full endpoint reference and ai/litellm/LITELLM.md for issuing virtual keys.\n\nReaching the service: the container has NO `ports:` mapping (INTERCEPTOR.md § Reaching the service). Port 8080 is reachable only from inside `ai_shared`. Options: (1) another `ai_shared` container via `http://interceptor:8080/...`, (2) your host via the LiteLLM pass-through `{{litellm}}/v1/interceptor/...` (what this collection uses), (3) `docker exec interceptor curl ...`. `http://localhost:8080` from the host does NOT reach the container — if something answers there it's a separate bare-metal `python app.py` run against the host's `/data/profiles` (used during profile capture with a visible display).\n\nMCP: LiteLLM ALSO advertises the interceptor as an MCP server via `mcp_servers.interceptor` (url `http://interceptor:8080/mcp`) — models see the four tools (capture_url, list_profiles, list_jobs, get_job) through that path. The MCP requests below are useful for debugging the transport directly.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "_postman_id": "interceptor-collection"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{virtual master key}}",
+        "type": "string"
+      }
+    ]
+  },
+  "variable": [
+    {
+      "key": "litellm",
+      "value": "http://localhost:4001",
+      "type": "string",
+      "description": "LiteLLM base URL. Localhost publish is 4001 (PORT_LITELLM); on ai_shared it's http://litellm:4000; behind cloudflared it's https://your-litellm-host."
+    },
+    {
+      "key": "virtual master key",
+      "value": "sk-your-litellm-virtual-key",
+      "type": "string",
+      "description": "LiteLLM virtual key (Admin UI → Virtual Keys, or /key/generate API). Scope the key to allow the /v1/interceptor pass-through — most keys created for chat models already do. Sent as `Authorization: Bearer {{virtual master key}}` by the collection-level auth."
+    },
+    {
+      "key": "profileName",
+      "value": "example",
+      "type": "string",
+      "description": "Named Chrome profile. Must match `[a-z0-9][a-z0-9_-]{0,63}` (profiles.py:_NAME_RE). Used by GET /profiles/{name}, POST /profiles/{name}/refresh, DELETE /profiles/{name}. Discover valid values via GET /profiles."
+    },
+    {
+      "key": "jobId",
+      "value": "",
+      "type": "string",
+      "description": "12-char hex job_id returned by POST /capture (or listed by GET /jobs). Fill in to run GET /jobs/{job_id} and POST /jobs/{job_id}/cancel. Completed captures are NOT retained — the id is only valid while the capture is in flight."
+    },
+    {
+      "key": "mcpSessionId",
+      "value": "",
+      "type": "string",
+      "description": "MCP transport session id — paste the `mcp-session-id` response header value returned by the `MCP — initialize` request. Subsequent MCP calls need it. This is FastMCP's HTTP-transport session cookie, unrelated to any interceptor job_id."
+    }
+  ],
+  "item": [
+    {
+      "name": "GET /health",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{litellm}}/v1/interceptor/health",
+          "host": ["{{litellm}}"],
+          "path": ["v1", "interceptor", "health"]
+        },
+        "description": "Liveness check. Returns {\"status\": \"ok\"} whenever the FastAPI process is up. No dependency checks — this endpoint does not verify Chrome, the profiles volume, or the port pool. Errors: none from the app itself; a network-level failure means the container isn't running or isn't reachable on ai_shared. See INTERCEPTOR.md § Bring it up."
+      },
+      "response": []
+    },
+    {
+      "name": "GET /profiles",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{litellm}}/v1/interceptor/profiles",
+          "host": ["{{litellm}}"],
+          "path": ["v1", "interceptor", "profiles"]
+        },
+        "description": "List every named Chrome profile currently on disk under `INTERCEPTOR_PROFILES_ROOT` (default /data/profiles, backed by the `interceptor_data` volume). Returns {root, profiles: [{name, path, present, size_bytes, sentinel_present}, ...]}. Directories whose names fail the `[a-z0-9][a-z0-9_-]{0,63}` validator are silently skipped (profiles.py:list_profiles). `sentinel_present: true` means `session_ok` exists at the profile root — required for headless launch. See INTERCEPTOR.md § Endpoints and § Sanity check before uploading. Errors: none — returns an empty list if the root dir is missing."
+      },
+      "response": []
+    },
+    {
+      "name": "GET /profiles/{profileName}",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{litellm}}/v1/interceptor/profiles/:profileName",
+          "host": ["{{litellm}}"],
+          "path": ["v1", "interceptor", "profiles", ":profileName"],
+          "variable": [
+            { "key": "profileName", "value": "example", "description": "Named Chrome profile. Must match [a-z0-9][a-z0-9_-]{0,63}." }
+          ]
+        },
+        "description": "Return one profile's status: {name, path, present, size_bytes, sentinel_present} when the directory exists, or {name, path, present: false, size_bytes: 0} when it doesn't (a missing profile is a 200, not a 404 — see profiles.py:profile_info). Use `sentinel_present` + `size_bytes` to distinguish the container's `/data/profiles` from a bare-metal instance's (both report the same `root`; see INTERCEPTOR.md § Reaching the service).\n\nErrors: 400 if the name fails `[a-z0-9][a-z0-9_-]{0,63}` (InvalidProfileNameError → HTTPException in app.py:profiles_get)."
+      },
+      "response": []
+    },
+    {
+      "name": "POST /profiles/{profileName}/refresh",
+      "request": {
+        "method": "POST",
+        "header": [],
+        "body": {
+          "mode": "formdata",
+          "formdata": [
+            {
+              "key": "archive",
+              "type": "file",
+              "src": "",
+              "description": "Required. A .tgz/.tar.gz of a captured Chrome --user-data-dir. The endpoint uses tarfile.open(mode='r:*') so gzip/bzip2/xz auto-detect. Field name MUST be exactly `archive` — any other name returns 422 with no unpack performed. Archive the CONTENTS of the profile dir (`tar czf x.tgz -C <profile_dir> .`), not the dir itself."
+            }
+          ]
+        },
+        "url": {
+          "raw": "{{litellm}}/v1/interceptor/profiles/:profileName/refresh",
+          "host": ["{{litellm}}"],
+          "path": ["v1", "interceptor", "profiles", ":profileName", "refresh"],
+          "variable": [
+            { "key": "profileName", "value": "example", "description": "Named Chrome profile. Must match [a-z0-9][a-z0-9_-]{0,63}." }
+          ]
+        },
+        "description": "Upload a .tgz of a captured Chrome profile. WIPES any existing `PROFILES_ROOT/{name}` FIRST (unconditional `shutil.rmtree`), then extracts the archive with `filter='data'` (refuses `..` / absolute paths / device files), then writes a `session_ok` sentinel so the next /capture boots straight to headless. Returns {unpacked: true, name, path, present, size_bytes, sentinel_present}.\n\nDo NOT refresh while a capture is in flight against that profile (unpack ignores the per-profile lock — INTERCEPTOR.md § Refreshing a profile). Check GET /jobs first.\n\nErrors: 400 if name fails the validator, 400 if unpack fails (`failed to unpack profile: ...`) — note the profile dir is already wiped before validation of the archive, so a corrupt or wrong-format upload destroys the working profile. See INTERCEPTOR.md § Refreshing a profile and § Cookie encryption and portability (v11 cookies won't decrypt in the container — re-capture with the launcher's `--password-store=basic` pinning in effect)."
+      },
+      "response": []
+    },
+    {
+      "name": "DELETE /profiles/{profileName}",
+      "request": {
+        "method": "DELETE",
+        "header": [],
+        "url": {
+          "raw": "{{litellm}}/v1/interceptor/profiles/:profileName",
+          "host": ["{{litellm}}"],
+          "path": ["v1", "interceptor", "profiles", ":profileName"],
+          "variable": [
+            { "key": "profileName", "value": "example", "description": "Named Chrome profile. Must match [a-z0-9][a-z0-9_-]{0,63}." }
+          ]
+        },
+        "description": "Wipe a named profile from disk. Idempotent — returns {name, deleted: true} if the dir existed, {name, deleted: false} if it didn't (profiles.py:delete_profile). Does NOT check the per-profile lock — do not delete while a capture is in flight against that profile.\n\nErrors: 400 if name fails `[a-z0-9][a-z0-9_-]{0,63}`."
+      },
+      "response": []
+    },
+    {
+      "name": "POST /capture",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"url\": \"https://example.com/dashboard\",\n  \"url_patterns\": [\"example\\\\.com/api/v1/items\", \"example\\\\.com/api/v1/user\"],\n  \"profile\": \"{{profileName}}\",\n  \"capture_window_seconds\": 20,\n  \"keep_open\": false,\n  \"login_timeout\": 300,\n  \"max_matches_per_pattern\": null,\n  \"debug_logging\": false,\n  \"login_url_patterns\": [\"login\", \"signin\", \"/auth\"]\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": {
+          "raw": "{{litellm}}/v1/interceptor/capture",
+          "host": ["{{litellm}}"],
+          "path": ["v1", "interceptor", "capture"]
+        },
+        "description": "Run one capture. Launches Chrome headless under the named profile, navigates to `url`, and returns every JSON XHR/fetch body whose URL matches any of `url_patterns` (re.search — first-matching-pattern wins). `capture_window_seconds` is a HARD wall (1..600, default 20); Chrome quits when it elapses regardless of state. Must exceed `login_timeout` for a session-refresh to have a chance to resolve.\n\n`login_url_patterns` are re.search-matched against the tab URL AFTER navigation to detect a login-wall redirect. Supplying the field REPLACES the defaults (`[\"login\", \"signin\", \"/auth\"]`), does not merge — empty list disables detection. They're full regexes, so `^https?://roofix\\.io/?$` distinguishes the logged-out root from in-app URLs.\n\n`keep_open: true` leaves Chrome + port + profile-lock held after the window closes; reclaim by POST /jobs/{id}/cancel or restart the container. Operator-only (not on MCP). `debug_logging: true` prepends `const DEBUG_LOGGING = true;` to interceptor.js so traces appear in the browser console (operator-only).\n\nReturns CaptureResponse: {job_id, url, status, login_wall, error, matches (pattern → [{url, body}]), captured_urls (every JSON XHR/fetch seen — use to reverse-engineer regexes)}. `login_wall: true` may mean either an expired session OR a v11-cookie-encryption mismatch (INTERCEPTOR.md § Cookie encryption and portability).\n\nErrors: 400 if profile name fails validator, 400 for invalid `url_pattern` or `login_url_pattern` regex (checked before consuming a port), 429 when the port pool is exhausted (`INTERCEPTOR_MAX_CONCURRENT` slots taken — retry later), 500 if Chrome can't be found (`BrowserNotFoundError`). See INTERCEPTOR.md § POST /capture and § Concurrency."
+      },
+      "response": []
+    },
+    {
+      "name": "GET /jobs",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{litellm}}/v1/interceptor/jobs",
+          "host": ["{{litellm}}"],
+          "path": ["v1", "interceptor", "jobs"]
+        },
+        "description": "Snapshot of the port pool + all currently-running captures. Returns {max_concurrent, active_count, available, jobs: [JobBase, ...]} where each JobBase has {job_id, phase, created_at, updated_at, elapsed_seconds, metadata: {profile, url, port, used_base_profile, temp_dir}, result, error}. `phase` progresses `cloning` (slow path only) → `capturing` → `cleaning_up`; fast-path captures skip `cloning`.\n\nCompleted captures are NOT retained — they disappear the moment they return to their caller. Use this before firing /capture to see current load (avoid surprise 429s), or to correlate a `job_id` from a previous response. Mounted by common.jobs.router.build_router. See INTERCEPTOR.md § Observability."
+      },
+      "response": []
+    },
+    {
+      "name": "GET /jobs/{jobId}",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{litellm}}/v1/interceptor/jobs/:jobId",
+          "host": ["{{litellm}}"],
+          "path": ["v1", "interceptor", "jobs", ":jobId"],
+          "variable": [
+            { "key": "jobId", "value": "", "description": "12-char hex job_id returned by POST /capture." }
+          ]
+        },
+        "description": "Detail on one in-flight capture — same JobBase shape as an element of GET /jobs. Set the `jobId` collection variable to a 12-char hex id first.\n\nErrors: 404 if the id isn't currently in flight. A 404 means either the id never existed OR the capture already finished — completed captures aren't retained (INTERCEPTOR.md § Limits: no completed-job history)."
+      },
+      "response": []
+    },
+    {
+      "name": "POST /jobs/{jobId}/cancel",
+      "request": {
+        "method": "POST",
+        "header": [],
+        "url": {
+          "raw": "{{litellm}}/v1/interceptor/jobs/:jobId/cancel",
+          "host": ["{{litellm}}"],
+          "path": ["v1", "interceptor", "jobs", ":jobId", "cancel"],
+          "variable": [
+            { "key": "jobId", "value": "", "description": "12-char hex job_id returned by POST /capture." }
+          ]
+        },
+        "description": "Signal an in-flight capture to wake early, quit Chrome, run cleanup, and return. Operator-only — deliberately NOT exposed on MCP (an LLM can't coordinate cross-agent cancellation). The `POST /capture` caller then receives a normal CaptureResponse with `status=\"cancelled\"` plus any partial matches/captured_urls collected before the abort. Returns {job_id, cancelled: true, was_phase}.\n\nAlso the way to reclaim a hung `keep_open=true` slot — cancel bypasses the skip-cleanup path and always terminates Chrome + releases the port + drops the profile-lock (fast path) or temp dir (slow path).\n\nErrors: 404 if the job is unknown or already completed, 409 if the job is already in `cleaning_up` phase (the finally block is running — too late to cancel). See INTERCEPTOR.md § Cancelling a stuck or long-running capture."
+      },
+      "response": []
+    },
+    {
+      "name": "MCP",
+      "description": "FastMCP JSON-RPC over HTTP forwarded through the LiteLLM pass-through. Note that LiteLLM ALSO advertises the interceptor as an MCP server via `mcp_servers.interceptor` (url `http://interceptor:8080/mcp`) in litellm_config.yaml — models see the tools through that path, not this one. The requests below are useful for debugging the transport directly. Every MCP request MUST use trailing-slash (POST /mcp/), MUST send `Accept: application/json, text/event-stream`, and MUST start with an `initialize` call — copy the `mcp-session-id` response header into the `mcpSessionId` collection variable for subsequent calls.\n\nFour tools are exposed: capture_url, list_profiles, list_jobs, get_job. The `keep_open` and `debug_logging` knobs from POST /capture are deliberately omitted — both are operator-only debug flags. MCP tools return dicts and NEVER raise — errors surface inside the payload (e.g. `status=\"error\"` with an `error` field, or `{\"error\": \"no active job ...\"}`).",
+      "item": [
+        {
+          "name": "MCP — initialize",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json, text/event-stream" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 1,\n  \"method\": \"initialize\",\n  \"params\": {\n    \"protocolVersion\": \"2024-11-05\",\n    \"capabilities\": {},\n    \"clientInfo\": { \"name\": \"postman\", \"version\": \"0.0\" }\n  }\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/interceptor/mcp/",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "interceptor", "mcp", ""]
+            },
+            "description": "MCP handshake. Response headers include `mcp-session-id` — copy it into the `mcpSessionId` collection variable. Required before any tools/list or tools/call."
+          },
+          "response": []
+        },
+        {
+          "name": "MCP — tools/list",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json, text/event-stream" },
+              { "key": "Mcp-Session-Id", "value": "{{mcpSessionId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 2,\n  \"method\": \"tools/list\",\n  \"params\": {}\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/interceptor/mcp/",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "interceptor", "mcp", ""]
+            },
+            "description": "Enumerate available tools. interceptor exposes exactly four: capture_url, list_profiles, list_jobs, get_job."
+          },
+          "response": []
+        },
+        {
+          "name": "MCP — tools/call capture_url",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json, text/event-stream" },
+              { "key": "Mcp-Session-Id", "value": "{{mcpSessionId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 3,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"capture_url\",\n    \"arguments\": {\n      \"url\": \"https://example.com/dashboard\",\n      \"url_patterns\": [\"example\\\\.com/api/v1/items\"],\n      \"profile\": \"{{profileName}}\",\n      \"capture_window_seconds\": 20,\n      \"login_timeout\": 300,\n      \"max_matches_per_pattern\": null\n    }\n  }\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/interceptor/mcp/",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "interceptor", "mcp", ""]
+            },
+            "description": "Model-invokable equivalent of POST /capture. Same core behavior. `keep_open` and `debug_logging` are NOT exposed here — operator-only. HTTPException failures (400 bad regex, 429 pool exhausted, 500 no browser) are wrapped into the return payload as `{status: \"error\", error: \"HTTP <code>: <detail>\", matches: {p: [] for p in url_patterns}, captured_urls: []}` rather than raised — the LLM can then read the error and retry."
+          },
+          "response": []
+        },
+        {
+          "name": "MCP — tools/call list_profiles",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json, text/event-stream" },
+              { "key": "Mcp-Session-Id", "value": "{{mcpSessionId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 4,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"list_profiles\",\n    \"arguments\": {}\n  }\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/interceptor/mcp/",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "interceptor", "mcp", ""]
+            },
+            "description": "Same shape as GET /profiles — {root, profiles: [{name, path, present, size_bytes, sentinel_present}, ...]}. Use before `capture_url` when the model doesn't already know which profile names exist. Only profiles with `sentinel_present: true` are usable headless — a `false` value means the profile hasn't been through the operator upload flow and Chrome would fall back to visible launch (which fails in the container with `Missing X server or $DISPLAY`)."
+          },
+          "response": []
+        },
+        {
+          "name": "MCP — tools/call list_jobs",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json, text/event-stream" },
+              { "key": "Mcp-Session-Id", "value": "{{mcpSessionId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 5,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"list_jobs\",\n    \"arguments\": {}\n  }\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/interceptor/mcp/",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "interceptor", "mcp", ""]
+            },
+            "description": "Same shape as GET /jobs — {max_concurrent, active_count, available, jobs}. Use before firing `capture_url` to see how busy interceptor is (avoids surprise 429s when the pool is exhausted), or to correlate a job_id from a previous response with what's actually still running. Completed captures are NOT retained."
+          },
+          "response": []
+        },
+        {
+          "name": "MCP — tools/call get_job",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json, text/event-stream" },
+              { "key": "Mcp-Session-Id", "value": "{{mcpSessionId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 6,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"get_job\",\n    \"arguments\": {\n      \"job_id\": \"{{jobId}}\"\n    }\n  }\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/interceptor/mcp/",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "interceptor", "mcp", ""]
+            },
+            "description": "Same shape as GET /jobs/{job_id} for an in-flight capture — {job_id, phase, created_at, updated_at, elapsed_seconds, metadata, result, error}. If the id is unknown or the capture has already completed, returns `{\"error\": \"no active job '<id>'\"}` in the payload rather than raising (MCP tools never raise). Note the HTTP endpoint returns 404 in the same case — divergent from MCP by design."
+          },
+          "response": []
+        }
+      ]
+    }
+  ]
+}

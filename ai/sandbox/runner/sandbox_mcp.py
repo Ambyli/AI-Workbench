@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import html
 import json
+import logging
 import secrets
 from typing import Optional
 
@@ -40,6 +41,9 @@ from fastmcp import FastMCP
 from pydantic import Field
 
 from runtimes import describe_runtimes
+
+
+log = logging.getLogger("sandbox-runner.mcp")
 
 
 def _format_diagnostic(detail: dict) -> str:
@@ -59,6 +63,10 @@ def _format_diagnostic(detail: dict) -> str:
 
     Unknown shapes fall back to a JSON dump so we surface *something*
     rather than swallow the error into a bare-error tool response."""
+    log.debug(
+        "_format_diagnostic: error=%r session=%s keys=%s",
+        detail.get("error"), detail.get("session_id"), sorted(detail.keys()),
+    )
     error = detail.get("error", "spawn failed")
     session_id = detail.get("session_id")
     hint = detail.get("hint", "")
@@ -142,6 +150,10 @@ def render_preview_html(url: str, sandbox_id: str, session_id: str) -> str:
     cache_bust = secrets.token_hex(4)
     sep = "&" if "?" in url else "?"
     nav_url = f"{url}{sep}v={cache_bust}"
+    log.debug(
+        "render_preview_html: session=%s sandbox=%s cache_bust=%s",
+        session_id, sandbox_id, cache_bust,
+    )
     safe_url_attr = html.escape(nav_url, quote=True)
     safe_sandbox = html.escape(sandbox_id)
     safe_session = html.escape(session_id)
@@ -189,6 +201,7 @@ def build_mcp(run_callable, logs_callable) -> FastMCP:
         and shows you which packages are already installed so you don't
         wastefully include them in requirements.txt.
         """
+        log.info("MCP tool call: list_runtimes")
         return describe_runtimes()
 
     @mcp.tool()
@@ -392,6 +405,11 @@ def build_mcp(run_callable, logs_callable) -> FastMCP:
         except HTTPException as exc:
             detail = exc.detail
             if isinstance(detail, dict) and detail.get("error"):
+                log.info(
+                    "preview_app: converting HTTPException(status=%d, error=%r) "
+                    "to diagnostic tool response",
+                    exc.status_code, detail.get("error"),
+                )
                 return _format_diagnostic(detail)
             raise
         url = result["url"]
@@ -411,6 +429,12 @@ def build_mcp(run_callable, logs_callable) -> FastMCP:
         # first) because models forget between calls — cheap tokens
         # spent here save far more tokens in resent unchanged files.
         verb = "updated" if reused else "ready"
+        log.info(
+            "MCP tool call: preview_app OK — session=%s sandbox=%s reused=%s "
+            "n_files=%d n_deletes=%d",
+            session_id_out, sandbox_id, reused,
+            len(files or {}), len(deletes or []),
+        )
         n_files = len(files) if files else 0
         if reused:
             hint = (
@@ -478,20 +502,33 @@ def build_mcp(run_callable, logs_callable) -> FastMCP:
         Returns a formatted string with the log tail; returns an
         explicit message if no logs are available (session not
         running, container just spawned with no output yet, etc.)."""
+        log.info(
+            "MCP tool call: get_sandbox_logs session=%s lines=%s",
+            session_id, lines,
+        )
         try:
             data = await logs_callable(session_id=session_id, lines=lines)
         except HTTPException as exc:
             detail = exc.detail
+            log.warning(
+                "get_sandbox_logs: HTTPException %d for session=%s: %s",
+                exc.status_code, session_id, detail,
+            )
             if isinstance(detail, str):
                 return f"logs unavailable: {detail}"
             return f"logs unavailable: {json.dumps(detail, default=str)}"
         text = (data.get("logs") or "").rstrip()
         if not text:
+            log.debug("get_sandbox_logs: no output for session=%s", session_id)
             return (
                 f"No log output yet for session `{session_id}`. The "
                 "container may have just spawned, or the app writes to "
                 "a file instead of stdout."
             )
+        log.debug(
+            "get_sandbox_logs: session=%s returned %d bytes",
+            session_id, len(text),
+        )
         return (
             f"Container logs for session `{session_id}` "
             f"(sandbox `{data.get('sandbox_id')}`, last {data.get('lines_requested')} lines):\n"

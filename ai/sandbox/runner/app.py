@@ -31,6 +31,7 @@ from common.env import load_env
 load_env()
 
 import asyncio
+import logging
 import os
 import re
 import secrets
@@ -46,6 +47,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from common.jobs.postgres import PostgresRegistry
 from common.jobs.router import build_router
+from common.logging_setup import setup_logging
 
 # Import name is `sandbox_mcp`, not `mcp`, because `ai/sandbox/` is on
 # sys.path and a module literally named `mcp` would shadow the `mcp`
@@ -63,6 +65,24 @@ MAX_CONCURRENT = int(os.environ.get("SANDBOX_MAX_CONCURRENT", "8"))
 DEFAULT_TTL_S = int(os.environ.get("SANDBOX_DEFAULT_TTL_SECONDS", "900"))
 HARD_TTL_S = int(os.environ.get("SANDBOX_HARD_TTL_SECONDS", "3600"))
 PROXY_URL = os.environ.get("SANDBOX_PROXY_URL", "http://sandbox-proxy")
+LOG_DIR = os.environ.get("LOG_DIR", "/data")
+DEBUG_LOGGING = os.environ.get("DEBUG_LOGGING", "false").lower() in (
+    "1", "true", "yes", "on",
+)
+
+# Configure the root logger for every runner module. `setup_logging` writes
+# to /data/sandbox-runner.log (file) and stderr (console) with the shared
+# common format `%(asctime)s [%(levelname)s] %(funcName)s: %(message)s`.
+# DEBUG_LOGGING=true lifts both channels to DEBUG so operators can trace
+# request flow through spawn/reap/self-heal; the default INFO/WARNING
+# levels keep the file useful under load without drowning stderr.
+setup_logging("sandbox-runner", log_dir=LOG_DIR, debug=DEBUG_LOGGING)
+log = logging.getLogger("sandbox-runner.app")
+log.info(
+    "runner boot config: MAX_CONCURRENT=%d DEFAULT_TTL_S=%d HARD_TTL_S=%d "
+    "PROXY_URL=%s DEBUG_LOGGING=%s LOG_DIR=%s",
+    MAX_CONCURRENT, DEFAULT_TTL_S, HARD_TTL_S, PROXY_URL, DEBUG_LOGGING, LOG_DIR,
+)
 
 # Sessions are the durable identity of a preview across turns. Regex is
 # both a validation surface (reject anything that could path-inject when
@@ -74,7 +94,9 @@ _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 def _new_session_id() -> str:
     """URL-safe 12-char session id. Enough entropy to avoid collisions
     across concurrent chats without dragging a UUID through log lines."""
-    return secrets.token_urlsafe(9)  # 9 bytes → 12 base64 chars
+    sid = secrets.token_urlsafe(9)  # 9 bytes → 12 base64 chars
+    log.debug("generated new session_id: %s", sid)
+    return sid
 
 
 def _build_dsn() -> str:
@@ -85,14 +107,17 @@ def _build_dsn() -> str:
     Postgres) without touching the individual parts.
     """
     if "SANDBOX_DB_DSN" in os.environ:
+        log.debug("using SANDBOX_DB_DSN env var")
         return os.environ["SANDBOX_DB_DSN"]
+    host = os.environ.get('SANDBOX_DB_HOST', 'sandbox-db')
+    port = os.environ.get('SANDBOX_DB_PORT', '5432')
+    name = os.environ.get('SANDBOX_DB_NAME', 'sandbox')
+    log.debug("DSN assembled from parts: host=%s port=%s db=%s", host, port, name)
     return (
         "postgresql://"
         f"{os.environ.get('SANDBOX_DB_USER', 'sandbox')}:"
         f"{os.environ.get('SANDBOX_DB_PASSWORD', 'sandbox')}@"
-        f"{os.environ.get('SANDBOX_DB_HOST', 'sandbox-db')}:"
-        f"{os.environ.get('SANDBOX_DB_PORT', '5432')}/"
-        f"{os.environ.get('SANDBOX_DB_NAME', 'sandbox')}"
+        f"{host}:{port}/{name}"
     )
 
 
@@ -119,12 +144,19 @@ async def _mcp_run(
     session_id: Optional[str],
     deletes: list[str],
 ) -> dict:
+    log.debug(
+        "MCP preview_app: runtime=%s session_id=%s n_files=%d n_deletes=%d "
+        "entrypoint=%r ttl=%s",
+        runtime, session_id, len(files or {}), len(deletes or []),
+        entrypoint, ttl_seconds,
+    )
     return await _reuse_or_spawn(
         runtime, files, entrypoint, ttl_seconds, session_id, deletes
     )
 
 
 async def _mcp_logs(session_id: str, lines: int) -> dict:
+    log.debug("MCP get_sandbox_logs: session_id=%s lines=%d", session_id, lines)
     return await logs_session(session_id, lines)
 
 
@@ -140,31 +172,42 @@ _mcp_app = _mcp.http_app(path="/")
 @asynccontextmanager
 async def lifespan(app_: FastAPI):
     global _registry, _spawner, _reaper, _slot_sem
+    log.info("lifespan startup: begin")
     _registry = PostgresRegistry(_build_dsn())
     await _registry.init()
+    log.info("Postgres registry initialized")
     await _ensure_session_index(_registry)
     _spawner = Spawner()
+    log.info("Docker spawner initialized")
     _slot_sem = asyncio.Semaphore(MAX_CONCURRENT)
+    log.info("concurrency semaphore initialized: MAX_CONCURRENT=%d", MAX_CONCURRENT)
     _reaper = Reaper(_spawner, _registry, _slot_sem)
     _reaper.start()
+    log.info("reaper started")
     # Mount the jobs router now that the registry is live. Delete is
     # handled by our own endpoint below (needs to stop the container),
     # so we don't ask build_router to add its own.
     app_.include_router(
         build_router(_registry, include_delete=False)
     )
+    log.info("jobs router mounted (delete=False)")
     # Compose the MCP app's lifespan — FastMCP's streamable-HTTP
     # transport initializes session state in its lifespan; skipping this
     # means POST /mcp/ succeeds at the routing layer but throws inside
     # the tool handler.
     async with _mcp_app.lifespan(app_):
+        log.info("lifespan startup: complete, ready to serve")
         try:
             yield
         finally:
+            log.info("lifespan shutdown: begin")
             if _reaper is not None:
                 await _reaper.stop()
+                log.info("reaper stopped")
             if _registry is not None:
                 await _registry.close()
+                log.info("Postgres registry closed")
+            log.info("lifespan shutdown: complete")
 
 
 app = FastAPI(title="sandbox-runner", lifespan=lifespan)
@@ -236,7 +279,8 @@ async def health() -> dict:
         try:
             await _registry.list_all(limit=1)
             ok_db = True
-        except Exception:
+        except Exception as exc:
+            log.warning("health: DB probe failed: %s", exc)
             ok_db = False
     return {
         "status": "ok" if ok_db else "degraded",
@@ -257,6 +301,7 @@ async def _ensure_session_index(registry: PostgresRegistry) -> None:
     row. That's the exact shape the reuse lookup queries."""
     pool = registry._pool
     if pool is None:
+        log.warning("_ensure_session_index: pool not initialized, skipping")
         return
     async with pool.acquire() as conn:
         await conn.execute(
@@ -264,6 +309,7 @@ async def _ensure_session_index(registry: PostgresRegistry) -> None:
             "ON jobs ((metadata->>'session_id')) "
             "WHERE phase = 'running'"
         )
+    log.info("session lookup index ensured (jobs_session_id_running)")
 
 
 async def _find_running_session(session_id: str) -> Optional[dict]:
@@ -279,9 +325,11 @@ async def _find_running_session(session_id: str) -> Optional[dict]:
     populated by the time a job's phase reaches 'running', so a session
     lookup is safe to trust."""
     if _registry is None:
+        log.warning("_find_running_session called before registry init")
         return None
     pool = _registry._pool
     if pool is None:
+        log.warning("_find_running_session: pool not ready")
         return None
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -292,6 +340,7 @@ async def _find_running_session(session_id: str) -> Optional[dict]:
             session_id,
         )
     if row is None:
+        log.debug("_find_running_session: no running row for %s", session_id)
         return None
     meta = row["metadata"]
     if isinstance(meta, str):
@@ -301,6 +350,10 @@ async def _find_running_session(session_id: str) -> Optional[dict]:
     if isinstance(result, str):
         import json
         result = json.loads(result)
+    log.debug(
+        "_find_running_session: session=%s → sandbox=%s container=%s",
+        session_id, row["id"], result.get("container_name"),
+    )
     return {
         "sandbox_id": row["id"],
         "container_name": result.get("container_name"),
@@ -325,7 +378,13 @@ async def _reuse_or_spawn(
     dev server inside reloads itself. Otherwise this falls through to a
     fresh spawn, stamping the session_id (generated if the caller
     omitted one) into the job's metadata so the next call can find it."""
+    log.info(
+        "_reuse_or_spawn: runtime=%s session_id=%s n_files=%d n_deletes=%d "
+        "entrypoint=%r",
+        runtime, session_id, len(files or {}), len(deletes or []), entrypoint,
+    )
     if _registry is None or _spawner is None or _slot_sem is None:
+        log.error("_reuse_or_spawn called before lifespan init")
         raise HTTPException(500, "runner not initialized")
 
     # Session-reuse path — cheap, short-circuits before we touch the
@@ -337,6 +396,12 @@ async def _reuse_or_spawn(
                 _spawner.container_exists, existing["container_name"]
             )
             if alive:
+                log.info(
+                    "reuse path: session=%s → container=%s alive, overlaying "
+                    "%d file(s), removing %d",
+                    session_id, existing["container_name"],
+                    len(files or {}), len(deletes or []),
+                )
                 try:
                     await asyncio.to_thread(
                         _spawner.update_files,
@@ -346,12 +411,17 @@ async def _reuse_or_spawn(
                     )
                 except ValueError as exc:
                     # Path traversal etc. — surface as a 400, not a 500.
+                    log.warning("reuse path: rejected unsafe path: %s", exc)
                     raise HTTPException(400, str(exc))
                 # Bump last_used_at so the reaper's idle-TTL check sees
                 # this activity. The rest of the metadata is untouched.
                 await _registry.update_metadata(
                     existing["sandbox_id"],
                     {"last_used_at": _now_iso()},
+                )
+                log.info(
+                    "reuse path complete: session=%s sandbox=%s reused=True",
+                    session_id, existing["sandbox_id"],
                 )
                 return {
                     "sandbox_id": existing["sandbox_id"],
@@ -364,6 +434,11 @@ async def _reuse_or_spawn(
             # — normal when the reaper hasn't swept yet, or the sandbox
             # crashed out-of-band. Mark it expired and fall through to
             # respawn under the same session_id.
+            log.info(
+                "self-heal: session=%s sandbox=%s row says running but container "
+                "is gone, marking expired and respawning",
+                session_id, existing["sandbox_id"],
+            )
             await _registry.set_phase(existing["sandbox_id"], "expired")
 
     # Spawn path — either no session_id given, or the session_id had no
@@ -374,6 +449,7 @@ async def _reuse_or_spawn(
     try:
         rt = get_runtime(runtime)
     except KeyError:
+        log.warning("unknown runtime requested: %r", runtime)
         raise HTTPException(
             400,
             f"unknown runtime {runtime!r}. Valid: {sorted(RUNTIMES)}. "
@@ -387,6 +463,9 @@ async def _reuse_or_spawn(
     # and the caller gets an opaque 504. Failing upfront with a
     # specific message gives the model a corrective signal on retry.
     if not rt.allows_custom_entrypoint and entrypoint:
+        log.warning(
+            "runtime=%s rejects custom entrypoint %r", runtime, entrypoint
+        )
         raise HTTPException(
             400,
             f"the {runtime!r} runtime does not accept a custom entrypoint "
@@ -402,6 +481,11 @@ async def _reuse_or_spawn(
     # SyntaxError with line/column before we waste 30 s on readiness.
     lint_errors = _lint_python_files(files)
     if lint_errors:
+        log.warning(
+            "static lint failed for session=%s: %d error(s) across %d file(s)",
+            session_id, len(lint_errors),
+            len({e["path"] for e in lint_errors}),
+        )
         raise HTTPException(
             400,
             {
@@ -421,6 +505,10 @@ async def _reuse_or_spawn(
     try:
         await asyncio.wait_for(_slot_sem.acquire(), timeout=0.1)
     except asyncio.TimeoutError:
+        log.warning(
+            "sandbox pool exhausted (MAX_CONCURRENT=%d), rejecting session=%s",
+            MAX_CONCURRENT, session_id,
+        )
         raise HTTPException(429, "sandbox pool exhausted")
 
     ttl = min(ttl_seconds or DEFAULT_TTL_S, HARD_TTL_S)
@@ -439,9 +527,18 @@ async def _reuse_or_spawn(
         initial_phase="spawning",
     )
 
+    log.info(
+        "spawn path: session=%s sandbox=%s runtime=%s ttl=%ds entrypoint=%r",
+        session_id, sandbox_id, runtime, ttl, entrypoint or rt.default_entrypoint,
+    )
+
     try:
         result = await asyncio.to_thread(
             _spawner.spawn, sandbox_id, rt, files, entrypoint
+        )
+        log.info(
+            "container created: sandbox=%s container=%s, polling readiness",
+            sandbox_id, result.container_name,
         )
         await _registry.set_phase(sandbox_id, "starting")
         ready = await asyncio.to_thread(
@@ -456,6 +553,11 @@ async def _reuse_or_spawn(
             # the traceback / npm error / streamlit exception vanishes
             # with the container and the model just sees "did not
             # become ready" with no actionable signal.
+            log.warning(
+                "readiness FAILED: sandbox=%s container=%s did not bind port %d "
+                "within 30s, capturing logs before teardown",
+                sandbox_id, result.container_name, rt.internal_port,
+            )
             logs = await asyncio.to_thread(
                 _spawner.tail_logs, result.container_name, 100
             )
@@ -486,6 +588,10 @@ async def _reuse_or_spawn(
             {"url": url, "container_name": result.container_name},
             phase="running",
         )
+        log.info(
+            "spawn READY: sandbox=%s session=%s url=%s expires=%s",
+            sandbox_id, session_id, url, expires_at.isoformat(),
+        )
         return {
             "sandbox_id": sandbox_id,
             "session_id": session_id,
@@ -494,9 +600,20 @@ async def _reuse_or_spawn(
             "reused": False,
         }
     except HTTPException:
+        # Propagate structured errors (400 lint, 504 readiness). Release
+        # the slot; the sandbox_id row keeps its "failed" phase and gets
+        # reaped by the sweeper later.
         _slot_sem.release()
+        log.debug(
+            "spawn HTTPException propagated (slot released) for sandbox=%s",
+            sandbox_id,
+        )
         raise
     except Exception as exc:
+        log.exception(
+            "spawn EXCEPTION for sandbox=%s session=%s: %s",
+            sandbox_id, session_id, exc,
+        )
         await _registry.set_error(sandbox_id, str(exc))
         _slot_sem.release()
         raise HTTPException(500, f"spawn failed: {exc}")
@@ -520,9 +637,10 @@ def _lint_python_files(files: dict[str, str]) -> list[dict]:
     is where that runs. Static-only, ~1 ms per file even for large
     Streamlit apps."""
     out: list[dict] = []
-    for path, content in files.items():
-        if not path.endswith(".py"):
-            continue
+    py_paths = [p for p in files if p.endswith(".py")]
+    log.debug("_lint_python_files: checking %d .py file(s)", len(py_paths))
+    for path in py_paths:
+        content = files[path]
         # Wrap the display path in angle brackets so Python's SyntaxError
         # doesn't try to read a file with that name off the runner's own
         # filesystem for the ``text`` attribute — otherwise a sandbox
@@ -539,6 +657,10 @@ def _lint_python_files(files: dict[str, str]) -> list[dict]:
             text = ""
             if isinstance(exc.lineno, int) and 1 <= exc.lineno <= len(source_lines):
                 text = source_lines[exc.lineno - 1]
+            log.debug(
+                "lint: %s:%s:%s SyntaxError: %s",
+                path, exc.lineno, exc.offset, exc.msg,
+            )
             out.append({
                 "path": path,
                 "line": exc.lineno,
@@ -549,6 +671,7 @@ def _lint_python_files(files: dict[str, str]) -> list[dict]:
         except Exception as exc:
             # Rare — usually a null byte or encoding surprise. Report it
             # rather than let the container silently fail later.
+            log.warning("lint: %s unexpected %s: %s", path, type(exc).__name__, exc)
             out.append({
                 "path": path,
                 "line": None,
@@ -556,11 +679,18 @@ def _lint_python_files(files: dict[str, str]) -> list[dict]:
                 "message": f"{type(exc).__name__}: {exc}",
                 "text": "",
             })
+    if not out:
+        log.debug("_lint_python_files: all files clean")
     return out
 
 
 @app.post("/run", response_model=RunResponse)
 async def run(req: RunRequest) -> RunResponse:
+    log.debug(
+        "POST /run: runtime=%s session_id=%s n_files=%d n_deletes=%d",
+        req.runtime, req.session_id, len(req.files or {}),
+        len(req.deletes or []),
+    )
     result = await _reuse_or_spawn(
         req.runtime,
         req.files,
@@ -578,11 +708,13 @@ async def delete_session(session_id: str) -> None:
     a session that never existed or has already expired still returns
     204 so the model doesn't have to remember state to clean up."""
     if not _SESSION_ID_RE.match(session_id):
+        log.warning("DELETE /session: invalid session_id: %r", session_id)
         raise HTTPException(400, "invalid session_id")
     if _registry is None or _spawner is None or _slot_sem is None:
         raise HTTPException(500, "runner not initialized")
     existing = await _find_running_session(session_id)
     if existing is None:
+        log.info("DELETE /session: session=%s already gone (noop 204)", session_id)
         return
     if existing["container_name"]:
         await asyncio.to_thread(
@@ -591,6 +723,10 @@ async def delete_session(session_id: str) -> None:
     await _registry.set_phase(existing["sandbox_id"], "closed")
     # The slot was held for the running sandbox — give it back.
     _slot_sem.release()
+    log.info(
+        "DELETE /session: closed session=%s sandbox=%s (slot released)",
+        session_id, existing["sandbox_id"],
+    )
 
 
 # Jobs GET routes are mounted from lifespan(). DELETE lives here so it can
@@ -602,12 +738,18 @@ async def delete_sandbox(sandbox_id: str) -> None:
         raise HTTPException(500, "runner not initialized")
     got = await _registry.get(sandbox_id)
     if got is None:
+        log.warning("DELETE /jobs: unknown sandbox=%s", sandbox_id)
         raise HTTPException(404, f"no sandbox {sandbox_id!r}")
     await asyncio.to_thread(_spawner.stop, f"sandbox-{sandbox_id}")
     await _registry.delete(sandbox_id)
     # Give the slot back to the pool if the sandbox was still running.
-    if got.phase in ("running", "starting", "spawning"):
+    slot_released = got.phase in ("running", "starting", "spawning")
+    if slot_released:
         _slot_sem.release()
+    log.info(
+        "DELETE /jobs: deleted sandbox=%s (was phase=%s, slot_released=%s)",
+        sandbox_id, got.phase, slot_released,
+    )
 
 
 # ── Source-code download ─────────────────────────────────────────────────
@@ -636,13 +778,19 @@ async def download_sandbox_job(sandbox_id: str) -> StreamingResponse:
     self-healed since the download URL was minted, this endpoint returns
     the OLD (dead) sandbox_id's archive — the session endpoint below
     resolves to the current running one instead."""
+    log.info("download by sandbox_id=%s (direct)", sandbox_id)
     if _registry is None or _spawner is None:
         raise HTTPException(500, "runner not initialized")
     job = await _registry.get(sandbox_id)
     if job is None:
+        log.warning("download: unknown sandbox=%s", sandbox_id)
         raise HTTPException(404, f"no sandbox {sandbox_id!r}")
     container_name = (job.result or {}).get("container_name")
     if not container_name:
+        log.warning(
+            "download: sandbox=%s has no container_name (phase=%s)",
+            sandbox_id, job.phase,
+        )
         raise HTTPException(
             409, f"sandbox {sandbox_id!r} has no container to download"
         )
@@ -651,6 +799,7 @@ async def download_sandbox_job(sandbox_id: str) -> StreamingResponse:
             _spawner.export_files, container_name
         )
     except Exception as exc:
+        log.warning("download: container %s gone: %s", container_name, exc)
         raise HTTPException(404, f"container gone: {exc}")
     return _tar_response(stream, sandbox_id)
 
@@ -667,16 +816,23 @@ async def logs_session(session_id: str, lines: int = 100) -> dict:
     fix the code and re-issue ``preview_app`` without needing the user
     to relay the error text."""
     if not _SESSION_ID_RE.match(session_id):
+        log.warning("logs_session: invalid session_id: %r", session_id)
         raise HTTPException(400, "invalid session_id")
     if _registry is None or _spawner is None:
         raise HTTPException(500, "runner not initialized")
     existing = await _find_running_session(session_id)
     if existing is None or not existing.get("container_name"):
+        log.warning("logs_session: no running sandbox for session=%s", session_id)
         raise HTTPException(
             404, f"no running sandbox for session {session_id!r}"
         )
+    clamped = max(1, min(lines, 1000))
     text = await asyncio.to_thread(
-        _spawner.tail_logs, existing["container_name"], max(1, min(lines, 1000))
+        _spawner.tail_logs, existing["container_name"], clamped
+    )
+    log.debug(
+        "logs_session: session=%s sandbox=%s returned %d bytes",
+        session_id, existing["sandbox_id"], len(text),
     )
     return {
         "session_id": session_id,
@@ -695,14 +851,24 @@ async def logs_sandbox_job(sandbox_id: str, lines: int = 100) -> dict:
         raise HTTPException(500, "runner not initialized")
     job = await _registry.get(sandbox_id)
     if job is None:
+        log.warning("logs_sandbox_job: unknown sandbox=%s", sandbox_id)
         raise HTTPException(404, f"no sandbox {sandbox_id!r}")
     container_name = (job.result or {}).get("container_name")
     if not container_name:
+        log.warning(
+            "logs_sandbox_job: sandbox=%s no container (phase=%s)",
+            sandbox_id, job.phase,
+        )
         raise HTTPException(
             409, f"sandbox {sandbox_id!r} has no container to read logs from"
         )
+    clamped = max(1, min(lines, 1000))
     text = await asyncio.to_thread(
-        _spawner.tail_logs, container_name, max(1, min(lines, 1000))
+        _spawner.tail_logs, container_name, clamped
+    )
+    log.debug(
+        "logs_sandbox_job: sandbox=%s returned %d bytes",
+        sandbox_id, len(text),
     )
     return {
         "sandbox_id": sandbox_id,
@@ -717,12 +883,15 @@ async def download_session(session_id: str) -> StreamingResponse:
     under this session_id. Preferred entry point — this URL stays valid
     across self-heal spawns because it resolves the session at request
     time, not at URL-generation time."""
+    log.info("download by session=%s", session_id)
     if not _SESSION_ID_RE.match(session_id):
+        log.warning("download_session: invalid session_id: %r", session_id)
         raise HTTPException(400, "invalid session_id")
     if _registry is None or _spawner is None:
         raise HTTPException(500, "runner not initialized")
     existing = await _find_running_session(session_id)
     if existing is None or not existing.get("container_name"):
+        log.warning("download_session: no running sandbox for %s", session_id)
         raise HTTPException(
             404, f"no running sandbox for session {session_id!r}"
         )
@@ -845,10 +1014,15 @@ class ToolPreviewAppRequest(BaseModel):
     ),
 )
 async def tool_preview_app(req: ToolPreviewAppRequest) -> HTMLResponse:
+    log.debug(
+        "Tool Server /tool/preview_app: runtime=%s session_id=%s n_files=%d",
+        req.runtime, req.session_id, len(req.files or {}),
+    )
     # Session-id validation runs at the pydantic layer for RunRequest but
     # ToolPreviewAppRequest doesn't share that validator — reject invalid
     # ids here so path-injection attempts don't leak through this route.
     if req.session_id and not _SESSION_ID_RE.match(req.session_id):
+        log.warning("tool_preview_app: invalid session_id %r", req.session_id)
         raise HTTPException(400, "invalid session_id")
     result = await _reuse_or_spawn(
         req.runtime,

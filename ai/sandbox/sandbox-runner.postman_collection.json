@@ -215,9 +215,12 @@
         "method": "DELETE",
         "header": [],
         "url": {
-          "raw": "{{litellm}}/v1/sandbox/session/{{sandboxSessionId}}",
+          "raw": "{{litellm}}/v1/sandbox/session/:sandboxSessionId",
           "host": ["{{litellm}}"],
-          "path": ["v1", "sandbox", "session", "{{sandboxSessionId}}"]
+          "path": ["v1", "sandbox", "session", ":sandboxSessionId"],
+          "variable": [
+            { "key": "sandboxSessionId", "value": "", "description": "Persistent session handle returned by POST /run as session_id." }
+          ]
         },
         "description": "Explicitly tear down the running sandbox for a session. Idempotent — returns 204 whether or not the session existed. Distinct from DELETE /jobs/{sandbox_id}: /jobs targets a specific spawn event by its 12-char internal id, while /session targets whatever's currently running under the persistent session handle (may have been respawned via self-heal since the model last saw it). Useful in tests and cleanup scripts; models rarely need it because the reaper's idle-TTL sweep handles silent chats on its own.\n\nErrors: 400 if session_id fails `^[A-Za-z0-9_-]{1,64}$`, 500 if the runner isn't initialized."
       },
@@ -229,9 +232,12 @@
         "method": "GET",
         "header": [],
         "url": {
-          "raw": "{{litellm}}/v1/sandbox/session/{{sandboxSessionId}}/download",
+          "raw": "{{litellm}}/v1/sandbox/session/:sandboxSessionId/download",
           "host": ["{{litellm}}"],
-          "path": ["v1", "sandbox", "session", "{{sandboxSessionId}}", "download"]
+          "path": ["v1", "sandbox", "session", ":sandboxSessionId", "download"],
+          "variable": [
+            { "key": "sandboxSessionId", "value": "", "description": "Persistent session handle returned by POST /run as session_id." }
+          ]
         },
         "description": "Stream the running sandbox's /app back as a tar archive (Content-Type: application/x-tar, Content-Disposition: attachment). Docker daemon does the packing (container.get_archive) so nothing buffers in the runner. Session-based, so this URL keeps working across self-heal spawns — resolves session_id → current container at request time.\n\nAlso exposed publicly via the sandbox-proxy Caddy route at ${SANDBOX_PROXY_URL}/download/{sandboxSessionId} (e.g. https://chat.zeoenergy.com/sandboxes/download/…) so browsers can download the archive with the same oauth2-proxy auth as the preview iframe. preview_app's response text includes this URL on the 'Download source:' line — models share it verbatim when a user asks to save the code.\n\nErrors: 400 if session_id fails `^[A-Za-z0-9_-]{1,64}$`, 404 if there's no running sandbox for this session (never existed, or reaped without self-heal).\n\nPostman note: click 'Send and Download' to save the response as a file. The tar root is `app/`, so `tar -xf sandbox-*.tar` extracts to `./app/`."
       },
@@ -243,11 +249,14 @@
         "method": "GET",
         "header": [],
         "url": {
-          "raw": "{{litellm}}/v1/sandbox/session/{{sandboxSessionId}}/logs?lines=100",
+          "raw": "{{litellm}}/v1/sandbox/session/:sandboxSessionId/logs?lines=100",
           "host": ["{{litellm}}"],
-          "path": ["v1", "sandbox", "session", "{{sandboxSessionId}}", "logs"],
+          "path": ["v1", "sandbox", "session", ":sandboxSessionId", "logs"],
           "query": [
             { "key": "lines", "value": "100", "description": "Trailing lines to return. Default 100, clamped 1..1000." }
+          ],
+          "variable": [
+            { "key": "sandboxSessionId", "value": "", "description": "Persistent session handle returned by POST /run as session_id." }
           ]
         },
         "description": "Return the last N lines of the running sandbox's stdout+stderr. Session-based so this follows self-heal.\n\nHow the logs get there: the runner's two-phase spawn runs the user command via `docker exec` (detached), not as PID 1 (`sleep infinity` is PID 1). container.logs() only sees PID 1's streams, so exec output isn't captured there. The spawn redirects the user command to /tmp/sandbox.log (128 MB tmpfs), and this endpoint runs `tail -n N` inside the container to read it back.\n\nWhich runtimes surface useful output here: Flask (`app.run`), FastAPI + uvicorn, Express, Vite, Next, and any bare `python app.py` all print tracebacks to stdout. STREAMLIT is the exception — it catches user exceptions and renders them in the browser rather than printing to stdout, so this endpoint shows only the 'You can now view your Streamlit app…' banner. For Streamlit apps, inspect the rendered HTML from the sandbox URL to see error text.\n\nResponse (200): {session_id, sandbox_id, lines_requested, logs}. Empty `logs` string means either the container just spawned and hasn't printed anything yet, or the app writes to a file — NOT a failure signal.\n\nErrors: 400 if session_id fails the regex, 404 if there's no running sandbox for this session."
@@ -274,9 +283,12 @@
         "method": "GET",
         "header": [],
         "url": {
-          "raw": "{{litellm}}/v1/sandbox/jobs/{{sandboxId}}",
+          "raw": "{{litellm}}/v1/sandbox/jobs/:sandboxId",
           "host": ["{{litellm}}"],
-          "path": ["v1", "sandbox", "jobs", "{{sandboxId}}"]
+          "path": ["v1", "sandbox", "jobs", ":sandboxId"],
+          "variable": [
+            { "key": "sandboxId", "value": "", "description": "12-char hex id returned by POST /run as sandbox_id." }
+          ]
         },
         "description": "Snapshot of one sandbox. 404 if unknown. Set the sandboxId collection variable to the id returned by POST /run first."
       },
@@ -288,9 +300,12 @@
         "method": "GET",
         "header": [],
         "url": {
-          "raw": "{{litellm}}/v1/sandbox/jobs/{{sandboxId}}/download",
+          "raw": "{{litellm}}/v1/sandbox/jobs/:sandboxId/download",
           "host": ["{{litellm}}"],
-          "path": ["v1", "sandbox", "jobs", "{{sandboxId}}", "download"]
+          "path": ["v1", "sandbox", "jobs", ":sandboxId", "download"],
+          "variable": [
+            { "key": "sandboxId", "value": "", "description": "12-char hex id returned by POST /run as sandbox_id." }
+          ]
         },
         "description": "Direct download by internal sandbox_id — bypasses session resolution. Useful for operators who want to grab the archive from a SPECIFIC spawn event even if the session self-healed to a different container since. Same tar shape as the session variant. Prefer /session/{id}/download for end-user download links because that URL keeps working across self-heal.\n\nErrors: 404 if no sandbox with that id, 409 if the sandbox exists in the registry but never reached the `running` phase (no container to export)."
       },
@@ -302,11 +317,14 @@
         "method": "GET",
         "header": [],
         "url": {
-          "raw": "{{litellm}}/v1/sandbox/jobs/{{sandboxId}}/logs?lines=100",
+          "raw": "{{litellm}}/v1/sandbox/jobs/:sandboxId/logs?lines=100",
           "host": ["{{litellm}}"],
-          "path": ["v1", "sandbox", "jobs", "{{sandboxId}}", "logs"],
+          "path": ["v1", "sandbox", "jobs", ":sandboxId", "logs"],
           "query": [
             { "key": "lines", "value": "100", "description": "Trailing lines. Default 100, clamped 1..1000." }
+          ],
+          "variable": [
+            { "key": "sandboxId", "value": "", "description": "12-char hex id returned by POST /run as sandbox_id." }
           ]
         },
         "description": "Direct log fetch by internal sandbox_id. Useful when the session self-healed to a new container but you want the previous container's output. Same underlying mechanism as /session/{id}/logs (tails /tmp/sandbox.log inside the container). Response body: {sandbox_id, lines_requested, logs}.\n\nErrors: 404 if no sandbox with that id, 409 if the sandbox never reached the `running` phase — no container to read logs from."
@@ -319,9 +337,12 @@
         "method": "DELETE",
         "header": [],
         "url": {
-          "raw": "{{litellm}}/v1/sandbox/jobs/{{sandboxId}}",
+          "raw": "{{litellm}}/v1/sandbox/jobs/:sandboxId",
           "host": ["{{litellm}}"],
-          "path": ["v1", "sandbox", "jobs", "{{sandboxId}}"]
+          "path": ["v1", "sandbox", "jobs", ":sandboxId"],
+          "variable": [
+            { "key": "sandboxId", "value": "", "description": "12-char hex id returned by POST /run as sandbox_id." }
+          ]
         },
         "description": "Tear a sandbox down early. Stops the container, removes it, deletes the row, releases the concurrency slot. Returns 204 no body. 404 if the sandbox id is unknown."
       },

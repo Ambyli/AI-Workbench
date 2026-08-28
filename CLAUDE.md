@@ -243,3 +243,35 @@ The Docker Compose services in `ai/` are documented in [`ai/AI_INFRA.md`](ai/AI_
 4. If the service participates in the public traffic path (Cloudflare → oauth2-proxy → …), extend the "Reading the diagram" bullets so the new hop is called out.
 
 The diagram is the single source of truth for how the AI infrastructure fits together — do not add a new compose file without updating it.
+
+## Postman collections — one per API service
+
+Every service under `ai/` that exposes an HTTP API ships a Postman v2.1 collection alongside its docs — importable directly into Postman for hands-on debugging. The canonical example is [`ai/sandbox/sandbox-runner.postman_collection.json`](ai/sandbox/sandbox-runner.postman_collection.json); use it as the structural template (collection-level bearer auth wired to a `virtual master key` variable, a `litellm` base-URL variable, one `item` per endpoint with a real request body, an `MCP` subfolder when the service exposes JSON-RPC over HTTP).
+
+**Current collections:**
+
+| Service | Collection | Endpoints doc |
+|---|---|---|
+| sandbox-runner | [`ai/sandbox/sandbox-runner.postman_collection.json`](ai/sandbox/sandbox-runner.postman_collection.json) | [`ai/sandbox/ENDPOINTS.md`](ai/sandbox/ENDPOINTS.md) |
+| interceptor | [`ai/interceptor/interceptor.postman_collection.json`](ai/interceptor/interceptor.postman_collection.json) | [`ai/interceptor/INTERCEPTOR.md`](ai/interceptor/INTERCEPTOR.md) |
+| classifier | [`ai/classifier/classifier.postman_collection.json`](ai/classifier/classifier.postman_collection.json) | [`ai/classifier/API.md`](ai/classifier/API.md) |
+| roofix bridge | [`ai/roofix/roofix.postman_collection.json`](ai/roofix/roofix.postman_collection.json) | [`ai/roofix/ROOFIX.md`](ai/roofix/ROOFIX.md) |
+| kokoro (TTS) | [`ai/kokoro/kokoro.postman_collection.json`](ai/kokoro/kokoro.postman_collection.json) | [`ai/kokoro/KOKORO.md`](ai/kokoro/KOKORO.md) |
+| madlad (translate) | [`ai/madlad/madlad.postman_collection.json`](ai/madlad/madlad.postman_collection.json) | [`ai/madlad/MADLAD.md`](ai/madlad/MADLAD.md) |
+| litellm proxy | [`ai/litellm/litellm.postman_collection.json`](ai/litellm/litellm.postman_collection.json) | [`ai/litellm/LITELLM.md`](ai/litellm/LITELLM.md), [`ai/litellm/LITELLM_MCP.md`](ai/litellm/LITELLM_MCP.md) |
+| vllm (per model) | [`ai/vllm/vllm.postman_collection.json`](ai/vllm/vllm.postman_collection.json) | [`ai/vllm/VLLM.md`](ai/vllm/VLLM.md) |
+| llama-server | [`ai/llama/llama.postman_collection.json`](ai/llama/llama.postman_collection.json) | [`ai/llama/LLAMA.md`](ai/llama/LLAMA.md) |
+| searxng | [`ai/searxng/searxng.postman_collection.json`](ai/searxng/searxng.postman_collection.json) | [`ai/searxng/SEARXNG.md`](ai/searxng/SEARXNG.md) |
+
+OpenWebUI is intentionally omitted — it is a UI, not an API. All model traffic it emits already lands on LiteLLM's collection.
+
+**Maintenance rule — keep the collections in sync with the code.** Whenever an API endpoint is added, renamed, removed, or changes its request/response shape, path params, query params, auth mode, or headers, update the corresponding `*.postman_collection.json` in the SAME change:
+
+1. Add / update / remove the `item` under the collection's `item` array (or the appropriate subfolder like `MCP`).
+2. Match the `request.url.path`, `request.method`, `request.header`, and `request.body.raw` to the code exactly — bodies must be valid JSON matching the current Pydantic / FastAPI model.
+3. Update the item's `description` to say WHAT it does, WHAT it returns, WHAT errors are possible, and reference the endpoint's docs section (e.g. `ENDPOINTS.md § …`).
+4. If a new collection-level variable is needed (e.g. a fresh path-param handle like `sessionId`), add it under the collection's top-level `variable` array with a `description` explaining how to populate it.
+5. If routing changes (e.g. a service moves onto a new LiteLLM pass-through prefix, or leaves LiteLLM entirely for a direct-service URL), update the collection's base-URL variable AND the `info.description` note about how requests are authenticated.
+6. If a NEW service under `ai/` starts exposing an HTTP API, create `{service}.postman_collection.json` alongside its docs, add a row to the **Current collections** table above, and structure it after `sandbox-runner.postman_collection.json`.
+
+Collections are the single source of truth for how each service's API is called from outside — do not merge an API-shape change without updating them. The `*.md` endpoint doc and the `*.postman_collection.json` MUST agree; when they don't, the code is authoritative and both must be corrected.

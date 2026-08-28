@@ -1,0 +1,169 @@
+{
+  "info": {
+    "name": "madlad",
+    "description": "MADLAD-400 translation service (madlad-api), called through the LiteLLM pass-through registered in ai/litellm/litellm_config.yaml (`pass_through_endpoints` → `/v1/madlad` → `http://madlad-api:8000`, `include_subpath: true`, methods GET+POST, headers forwarded). Every request is authenticated with a Bearer token from a LiteLLM virtual key. Set the collection variables `litellm` (e.g. http://localhost:4001) and `virtual master key` (an sk-… key issued from the LiteLLM Admin UI → Virtual Keys) — every request inherits them via collection-level auth.\n\nDirect access: if you don't want to go through LiteLLM, override the URL of individual requests to `{{madlad}}` — that variable points at madlad-api's host-published port (default localhost:8008 via PORT_MADLAD_API). The direct path is unauthenticated by default; the /v1/madlad LiteLLM path is authenticated by the virtual key. See ai/madlad/MADLAD.md for the operator guide and ai/litellm/LITELLM.md for issuing virtual keys.\n\nEndpoints: GET /languages (list ~400 supported target codes), POST /translate (auto-detect source, translate to target), GET /health (liveness), plus MCP JSON-RPC at /mcp/ exposing the `translate` tool. Note the request body uses `target_lang` — source language is auto-detected, there is no `src` field.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "_postman_id": "madlad-collection"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{virtual master key}}",
+        "type": "string"
+      }
+    ]
+  },
+  "variable": [
+    {
+      "key": "litellm",
+      "value": "http://localhost:4001",
+      "type": "string",
+      "description": "LiteLLM base URL. Localhost publish is 4001 (PORT_LITELLM); on ai_shared it's http://litellm:4000; behind cloudflared it's https://your-litellm-host. Prefix all pass-through requests with {{litellm}}/v1/madlad/… — LiteLLM strips /v1/madlad and forwards the rest to madlad-api on ai_shared."
+    },
+    {
+      "key": "virtual master key",
+      "value": "sk-your-litellm-virtual-key",
+      "type": "string",
+      "description": "LiteLLM virtual key (Admin UI → Virtual Keys, or /key/generate API). Scope the key to allow the /v1/madlad pass-through — most keys created for chat models already do. Sent as `Authorization: Bearer {{virtual master key}}` by the collection-level auth."
+    },
+    {
+      "key": "madlad",
+      "value": "http://localhost:8008",
+      "type": "string",
+      "description": "Direct-access base URL for madlad-api (bypasses LiteLLM). Host-published port is PORT_MADLAD_API (default 8008); on ai_shared it's http://madlad-api:8000. No auth is enforced at this layer — use only for local debugging inside a trusted network. Swap `{{litellm}}/v1/madlad` for `{{madlad}}` in any request URL to talk to the service directly."
+    },
+    {
+      "key": "mcpSessionId",
+      "value": "",
+      "type": "string",
+      "description": "MCP transport session id — paste in the `mcp-session-id` response header value returned by the `MCP — initialize` request. Subsequent MCP calls need it. FastMCP's HTTP-transport session cookie."
+    }
+  ],
+  "item": [
+    {
+      "name": "GET /health",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{litellm}}/v1/madlad/health",
+          "host": ["{{litellm}}"],
+          "path": ["v1", "madlad", "health"]
+        },
+        "description": "Liveness probe on madlad-api (the proxy container). Returns {\"status\": \"ok\"} once the FastAPI app has started — does NOT verify madlad-app (the inference container) is reachable, since the model is lazy-loaded on the first /translate or /languages call. Docker's own healthcheck for madlad-api polls this endpoint. See MADLAD.md § Health check."
+      },
+      "response": []
+    },
+    {
+      "name": "GET /languages",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{litellm}}/v1/madlad/languages",
+          "host": ["{{litellm}}"],
+          "path": ["v1", "madlad", "languages"]
+        },
+        "description": "List the ~400 target languages MADLAD-400 supports. Response shape: {\"languages\": [{\"code\": \"af\", \"name\": \"Afrikaans\"}, {\"code\": \"am\", \"name\": \"Amharic\"}, …]}. Codes are ISO 639-1 where available, ISO 639-3 for low-resource languages, occasionally with a regional suffix (e.g. `zh_CN`). Names are resolved via the `langcodes` library. Use a returned `code` as `target_lang` in POST /translate.\n\nFirst call after container start triggers the lazy model download (~1-3 min for the ~3 GB CT2 checkpoint). Subsequent calls are instant. Proxied to madlad-app's /languages inside the ai_shared network; returns 502 with `Cannot reach madlad-app: …` if the inference container is down. See MADLAD.md § Supported languages."
+      },
+      "response": []
+    },
+    {
+      "name": "POST /translate",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"text\": \"Good morning\",\n  \"target_lang\": \"ja\"\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": {
+          "raw": "{{litellm}}/v1/madlad/translate",
+          "host": ["{{litellm}}"],
+          "path": ["v1", "madlad", "translate"]
+        },
+        "description": "Translate a single string. Body: {\"text\": string, \"target_lang\": string}. Source language is auto-detected by MADLAD — there is no `src` field. `target_lang` must be one of the codes returned by GET /languages (ISO 639-1 preferred, e.g. `es`, `fr`, `ja`, `zh`, `de`, `pt`, `ar`, `hi`, `ko`).\n\nResponse shape: {\"translated\": \"<string>\"}. First call after container start triggers the ~1-3 min lazy load. Steady-state latency is dominated by the model forward pass; the beam-search + repetition guards default to ~3-4× a greedy decode (see MADLAD.md § Decoding parameters for the current beam_size=4 / repetition_penalty=1.1 / no_repeat_ngram_size=3 / max_decoding_length=1024 defaults and when to tune).\n\nErrors: 400 for malformed JSON, 422 for missing fields, 502 with `Cannot reach madlad-app: …` if the inference container is unreachable. See MADLAD.md § Usage."
+      },
+      "response": []
+    },
+    {
+      "name": "MCP",
+      "description": "FastMCP JSON-RPC over HTTP forwarded through the LiteLLM pass-through. Note that LiteLLM ALSO advertises madlad-api as an MCP server via `mcp_servers.madlad_translate` in litellm_config.yaml (transport: http, url: http://madlad-api:8000/mcp) — models see the `translate` tool through that path, not this one. The Postman requests below are for debugging the transport directly. Every MCP request MUST use trailing-slash (POST /mcp/), MUST send `Accept: application/json, text/event-stream`, and MUST start with an `initialize` call — copy the `mcp-session-id` response header into the `mcpSessionId` collection variable for subsequent calls.\n\nUnlike a chat completions model, MADLAD is tool-only — it does not appear in `model_list` and cannot be called via /v1/chat/completions directly. Use it by asking a chat model to invoke the `translate` tool, then loop the tool result back (see CLAUDE.md § LiteLLM with Phoenix MCP for the two-step pattern).",
+      "item": [
+        {
+          "name": "MCP — initialize",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json, text/event-stream" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 1,\n  \"method\": \"initialize\",\n  \"params\": {\n    \"protocolVersion\": \"2024-11-05\",\n    \"capabilities\": {},\n    \"clientInfo\": { \"name\": \"postman\", \"version\": \"0.0\" }\n  }\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/madlad/mcp/",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "madlad", "mcp", ""]
+            },
+            "description": "MCP handshake. Response headers include `mcp-session-id` — copy it into the `mcpSessionId` collection variable. Response body is a JSON-RPC result advertising FastMCP's server info + capabilities."
+          },
+          "response": []
+        },
+        {
+          "name": "MCP — tools/list",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json, text/event-stream" },
+              { "key": "Mcp-Session-Id", "value": "{{mcpSessionId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 2,\n  \"method\": \"tools/list\",\n  \"params\": {}\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/madlad/mcp/",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "madlad", "mcp", ""]
+            },
+            "description": "Enumerate available tools. madlad-api exposes exactly one: `translate(text: str, target_lang: str) -> str`. `text` is the source (any language, auto-detected); `target_lang` is an ISO 639-1 code (see GET /languages). Returns the translated string, or an `Error translating: …` string on upstream failure (the MCP tool does not raise — it swallows the httpx error into the return value)."
+          },
+          "response": []
+        },
+        {
+          "name": "MCP — tools/call translate",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json, text/event-stream" },
+              { "key": "Mcp-Session-Id", "value": "{{mcpSessionId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 3,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"translate\",\n    \"arguments\": {\n      \"text\": \"Good morning\",\n      \"target_lang\": \"ja\"\n    }\n  }\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/madlad/mcp/",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "madlad", "mcp", ""]
+            },
+            "description": "Invoke the `translate` tool via MCP. Result body has a text-content block containing the translated string (e.g. `おはよう` for the example). Equivalent in effect to POST /translate — same lazy-load behavior on the first call, same beam-search decoding defaults. Difference is transport: this path is what chat models routed through LiteLLM's mcp_servers.madlad_translate hit when they decide to translate mid-conversation. See MADLAD.md § LiteLLM integration for the chat-completions → tool-call round-trip pattern."
+          },
+          "response": []
+        }
+      ]
+    }
+  ]
+}

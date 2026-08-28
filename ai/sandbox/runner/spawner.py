@@ -19,6 +19,7 @@ If a change here weakens any of these, the security invariant list in
 from __future__ import annotations
 
 import io
+import logging
 import os
 import tarfile
 import time
@@ -30,6 +31,9 @@ from docker.errors import APIError, NotFound
 from docker.models.containers import Container
 
 from runtimes import Runtime
+
+
+log = logging.getLogger("sandbox-runner.spawner")
 
 
 # ── Config from env — populated once at module import ────────────────────
@@ -60,6 +64,10 @@ class Spawner:
         # in docker-compose.sandbox.yml). This is the single privileged
         # capability in the subsystem — nothing else has API access.
         self._client = docker.from_env()
+        log.info(
+            "Spawner initialized: net=%s egress=%s mem=%s cpu=1 pids=%d",
+            NET_NAME, EGRESS_URL, MEMORY_LIMIT, PIDS_LIMIT,
+        )
 
     def spawn(
         self,
@@ -80,6 +88,13 @@ class Spawner:
         """
         name = f"sandbox-{sandbox_id}"
         user_command = entrypoint or runtime.default_entrypoint
+        merged_names = sorted(
+            set((runtime.default_files or {}).keys()) | set(files.keys())
+        )
+        log.info(
+            "spawn: name=%s image=%s command=%r files=%s",
+            name, runtime.image, user_command, merged_names,
+        )
 
         try:
             # Two-phase spawn to satisfy Docker's rule that put_archive
@@ -168,6 +183,10 @@ class Spawner:
             )
         except APIError as exc:
             # Common cause: image not built yet. Give the operator a hint.
+            log.error(
+                "spawn: docker create failed for image=%s: %s",
+                runtime.image, exc,
+            )
             raise RuntimeError(
                 f"docker create failed for image {runtime.image!r}: {exc}. "
                 f"Did you run `docker compose -f ai/sandbox/docker-compose.sandbox.yml build`?"
@@ -175,10 +194,15 @@ class Spawner:
 
         # Phase 1 → 2: start with the placeholder PID 1, then inject.
         container.start()
+        log.debug("spawn: container %s created + started (sleep pid1)", name)
         merged = {**(runtime.default_files or {}), **files}
         if merged:
             tarball = _make_tarball(merged)
             container.put_archive("/app", tarball)
+            log.debug(
+                "spawn: put_archive %d file(s) into %s:/app (%d bytes)",
+                len(merged), name, len(tarball),
+            )
 
         # Phase 3: launch the real command. `detach=True` returns
         # immediately so readiness polling can start. The command runs
@@ -197,6 +221,10 @@ class Spawner:
             workdir="/app",
             detach=True,
         )
+        log.debug(
+            "spawn: launched detached user command in %s: %r",
+            name, user_command,
+        )
         return SpawnResult(container_id=container.id, container_name=name)
 
     def readiness_ok(
@@ -211,14 +239,27 @@ class Spawner:
 
         deadline = time.monotonic() + timeout_s
         url = f"http://{container_name}:{port}{path}"
+        log.debug(
+            "readiness_ok: polling %s (deadline %.1fs)", url, timeout_s,
+        )
+        attempts = 0
         while time.monotonic() < deadline:
+            attempts += 1
             try:
                 with urllib.request.urlopen(url, timeout=1) as resp:
                     if 200 <= resp.status < 500:
+                        log.debug(
+                            "readiness_ok: %s replied HTTP %d after %d attempt(s)",
+                            url, resp.status, attempts,
+                        )
                         return True
             except Exception:
                 pass
             time.sleep(0.5)
+        log.debug(
+            "readiness_ok: %s never responded within %.1fs (%d attempts)",
+            url, timeout_s, attempts,
+        )
         return False
 
     def stop(self, container_name: str) -> None:
@@ -228,15 +269,20 @@ class Spawner:
         try:
             container = self._client.containers.get(container_name)
         except NotFound:
+            log.debug("stop: %s already gone (NotFound)", container_name)
             return
         try:
             container.stop(timeout=5)
-        except APIError:
-            pass
+        except APIError as exc:
+            log.debug("stop: %s stop() APIError swallowed: %s", container_name, exc)
         try:
             container.remove(force=True)
-        except (APIError, NotFound):
-            pass
+            log.info("stop: removed container %s", container_name)
+        except (APIError, NotFound) as exc:
+            log.debug(
+                "stop: %s remove() failed: %s (may be already gone)",
+                container_name, exc,
+            )
 
     def container_exists(self, container_name: str) -> bool:
         """Cheap liveness check used by the session-reuse path in the
@@ -248,6 +294,7 @@ class Spawner:
             self._client.containers.get(container_name)
             return True
         except NotFound:
+            log.debug("container_exists: %s NotFound", container_name)
             return False
 
     def export_files(self, container_name: str):
@@ -260,8 +307,13 @@ class Spawner:
         streams incrementally, whereas gzip would need the whole
         archive in-memory to hash. Callers who want gzip can pipe
         through a filter downstream."""
+        log.debug("export_files: %s /app", container_name)
         container = self._client.containers.get(container_name)
-        stream, _stat = container.get_archive("/app")
+        stream, stat = container.get_archive("/app")
+        log.debug(
+            "export_files: %s /app stat=%s",
+            container_name, stat if isinstance(stat, dict) else "?",
+        )
         return stream
 
     def tail_logs(self, container_name: str, n_lines: int = 100) -> str:
@@ -281,6 +333,7 @@ class Spawner:
         try:
             container = self._client.containers.get(container_name)
         except NotFound:
+            log.debug("tail_logs: %s NotFound, returning empty", container_name)
             return ""
         try:
             # Fall back to /dev/null on `tail` errors (file doesn't
@@ -296,12 +349,16 @@ class Spawner:
                     ),
                 ],
             )
-        except APIError:
+        except APIError as exc:
+            log.warning("tail_logs: %s exec_run failed: %s", container_name, exc)
             return ""
         raw = result.output
-        if isinstance(raw, bytes):
-            return raw.decode("utf-8", errors="replace")
-        return str(raw or "")
+        text = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw or "")
+        log.debug(
+            "tail_logs: %s → %d bytes (requested %d lines)",
+            container_name, len(text), n_lines,
+        )
+        return text
 
     def update_files(
         self,
@@ -327,9 +384,20 @@ class Spawner:
                 ["rm", "-rf", f"/app/{safe}"],
                 user="1000:1000",
             )
+            log.debug("update_files: rm -rf /app/%s in %s", safe, container_name)
         if files:
             tarball = _make_tarball(files)
             container.put_archive("/app", tarball)
+            log.info(
+                "update_files: %s ← %d file(s) via put_archive (%d bytes tar); "
+                "removed %d",
+                container_name, len(files), len(tarball), len(deletes),
+            )
+        else:
+            log.info(
+                "update_files: %s deletes-only: %d file(s) removed",
+                container_name, len(deletes),
+            )
 
     def list_managed(self) -> list[Container]:
         """Return every running container this subsystem owns.
@@ -337,9 +405,11 @@ class Spawner:
         Filters on the ``sandbox.managed=true`` label so we never touch
         unrelated containers on the same Docker host.
         """
-        return self._client.containers.list(
+        containers = self._client.containers.list(
             filters={"label": "sandbox.managed=true"}
         )
+        log.debug("list_managed: %d container(s)", len(containers))
+        return containers
 
 
 def _make_tarball(files: dict[str, str]) -> bytes:
@@ -365,5 +435,6 @@ def _safe_relpath(path: str) -> str:
     """Reject anything that would escape ``/app``. Returns the cleaned
     relative path on success, raises ``ValueError`` on rejection."""
     if not path or path.startswith("/") or ".." in path.split("/"):
+        log.warning("_safe_relpath: rejected %r", path)
         raise ValueError(f"unsafe path in files/deletes: {path!r}")
     return path.lstrip("/")

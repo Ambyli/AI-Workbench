@@ -53,9 +53,22 @@ def setup_logging(
         log_path = Path(log_dir) / f"{name}.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
         # Recreate on each call — matches widget's behavior of a fresh log
-        # per session. If you want appending behavior, drop this line.
+        # per session.
+        #
+        # Belt AND suspenders: unlink drops the file (freeing any stale
+        # inode a crashed prior process might still hold open), then
+        # ``mode="w"`` truncates on the FileHandler's own ``open()`` so
+        # even when unlink silently no-ops (permission surprise, docker
+        # volume remount race, a Windows editor tail on the log, etc.)
+        # the new handler starts from byte 0. Without the explicit mode,
+        # FileHandler defaults to ``mode="a"``, which would append to
+        # whatever bytes survived unlink and make the previous run's
+        # tail look like part of this run's boot log — exactly the
+        # "log doesn't clear on subsequent deploy" bug we shipped once.
         log_path.unlink(missing_ok=True)
-        handlers.insert(0, logging.FileHandler(log_path, encoding="utf-8"))
+        handlers.insert(
+            0, logging.FileHandler(log_path, mode="w", encoding="utf-8")
+        )
 
     logging.basicConfig(
         level=logging.DEBUG,

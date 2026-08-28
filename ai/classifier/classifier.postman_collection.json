@@ -1,0 +1,182 @@
+{
+  "info": {
+    "name": "classifier",
+    "description": "Document Classifier endpoints, called through the LiteLLM pass-through registered in ai/litellm/litellm_config.yaml (`pass_through_endpoints` → `/v1/classifier` → `http://classifier:8000`, `include_subpath: true`, methods GET/POST/DELETE, `forward_headers: true`). Every request is authenticated with a Bearer token from a LiteLLM virtual key. Set the collection variables `litellm` (e.g. http://localhost:4001) and `virtual master key` (an sk-… key issued from the LiteLLM Admin UI → Virtual Keys) — every request inherits them via collection-level auth. See ai/classifier/API.md for the full endpoint reference and ai/litellm/LITELLM.md for issuing virtual keys.\n\nDirect base URL (bypassing LiteLLM, only useful inside the ai_shared network or when PORT_CLASSIFIER is published): http://classifier:8000 or http://<host>:${PORT_CLASSIFIER}. All examples in this collection use the LiteLLM pass-through path.\n\nAsync-job pattern: POST /assess and POST /assess/compare both return 202 Accepted immediately with `{job_id, phase: \"pending\"}`. Callers poll GET /jobs/{job_id} until `phase` is `completed` or `failed`, then read the `result` field. Job tracking is powered by the shared `common.jobs` package (SqliteRegistry backend); the `/jobs`, `/jobs/{id}`, and DELETE `/jobs/{id}` routes are mounted via `common.jobs.router.build_router(..., include_delete=True, include_cancel=False)`. Response migration note: the top-level `id` is now `job_id`, `status` is now `phase`, and the previously separate `type` + `request_id` columns are nested under `metadata`. See API.md § `GET /jobs/{job_id}` for the full shape.\n\nCopy the `job_id` from a POST /assess or POST /assess/compare response into the `jobId` collection variable to run the GET/DELETE /jobs/{jobId} requests.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "_postman_id": "classifier-collection"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{virtual master key}}",
+        "type": "string"
+      }
+    ]
+  },
+  "variable": [
+    {
+      "key": "litellm",
+      "value": "http://localhost:4001",
+      "type": "string",
+      "description": "LiteLLM base URL. Localhost publish is 4001 (PORT_LITELLM); on ai_shared it's http://litellm:4000; behind cloudflared it's https://your-litellm-host."
+    },
+    {
+      "key": "virtual master key",
+      "value": "sk-your-litellm-virtual-key",
+      "type": "string",
+      "description": "LiteLLM virtual key (Admin UI → Virtual Keys, or /key/generate API). Scope the key to allow the /v1/classifier pass-through — most keys created for chat models already do. Sent as `Authorization: Bearer {{virtual master key}}` by the collection-level auth, then forwarded to the classifier by LiteLLM because the pass-through has `forward_headers: true`."
+    },
+    {
+      "key": "jobId",
+      "value": "",
+      "type": "string",
+      "description": "job_id returned by POST /assess or POST /assess/compare. Fill in after submitting to run GET /jobs/{jobId} and DELETE /jobs/{jobId}. `phase` values progress pending → processing → completed | failed."
+    }
+  ],
+  "item": [
+    {
+      "name": "GET /health",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{litellm}}/v1/classifier/health",
+          "host": ["{{litellm}}"],
+          "path": ["v1", "classifier", "health"]
+        },
+        "description": "Liveness check used by the Docker healthcheck (`docker-compose.classifier.yml` → `healthcheck.test` hits /health every 30s) and by load balancers. Returns `{\"status\": \"ok\"}` with HTTP 200 whenever the FastAPI process is up. Does NOT probe the SQLite jobs registry, the vLLM backend, or the background worker — a stuck worker will still show `status: ok` here. Excluded from Prometheus instrumentation (see `Instrumentator(excluded_handlers=[\"/metrics\", \"/health\"])` in main.py). See API.md § `GET /health`."
+      },
+      "response": []
+    },
+    {
+      "name": "GET /hints",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{litellm}}/v1/classifier/hints",
+          "host": ["{{litellm}}"],
+          "path": ["v1", "classifier", "hints"]
+        },
+        "description": "Enumerate all available `hint` values and their LLM scoring rubrics. Returns `{\"hints\": {\"quality\": {...}, \"presence\": {...}, \"auto\": {...}}}` where each rubric object has `heading`, `rubric`, and `extra` fields sourced from `llm.HINT_RUBRICS`. Use these values as the `hint` field on a CriterionInput:\n\n- `quality`: score image quality 1-10 (1-3 = FAIL, 4-6 = MARGINAL, 7-10 = PASS).\n- `presence`: detect presence/absence (10=present, 5=uncertain, 1=absent) with chain-of-thought reasoning in `extra`.\n- `auto` (default): LLM infers the rubric from the criterion name.\n\nNo request body. See API.md § `GET /hints`."
+      },
+      "response": []
+    },
+    {
+      "name": "GET /cv-detectors",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{litellm}}/v1/classifier/cv-detectors",
+          "host": ["{{litellm}}"],
+          "path": ["v1", "classifier", "cv-detectors"]
+        },
+        "description": "List every registered OpenCV detector, grouped by underlying detector function. Returns `{\"detectors\": [{\"function\": \"check_blur\", \"names\": [\"is blurry\", \"is sharp\", \"sharpness\"]}, ...], \"total_names\": N}`. Use any of the `names` as the `name` field on a CriterionInput with `type=\"cv\"` — fuzzy matching is applied at runtime, so near-matches also work. If no detector matches, the criterion silently falls back to LLM scoring and the response's `method` field reflects the actual path taken.\n\nBuilt-in detector functions: `check_blur` (Laplacian variance), `check_exposure` (mean pixel intensity), `detect_vegetation` (HSV green masking), `detect_sky`, `detect_faces` (Haar cascade), `detect_water`, `detect_text` (Sobel edge density). See API.md § `Built-in cv detector names`."
+      },
+      "response": []
+    },
+    {
+      "name": "POST /assess",
+      "request": {
+        "method": "POST",
+        "header": [],
+        "body": {
+          "mode": "formdata",
+          "formdata": [
+            {
+              "key": "image",
+              "type": "file",
+              "src": "",
+              "description": "JPEG or PNG image file. Read into memory during the request via `await image.read()`; the worker receives the bytes, so the UploadFile is not stored on disk."
+            },
+            {
+              "key": "criteria",
+              "type": "text",
+              "value": "[{\"name\":\"has electrical meter\",\"type\":\"llm\",\"hint\":\"presence\",\"weight\":4.0},{\"name\":\"meter value is readable\",\"type\":\"llm\",\"hint\":\"quality\",\"weight\":3.0,\"depends_on\":\"has electrical meter\"},{\"name\":\"three feet of clearance around meter\",\"type\":\"llm\",\"hint\":\"presence\",\"weight\":2.5,\"depends_on\":\"has electrical meter\"},{\"name\":\"sharpness\",\"type\":\"cv\",\"weight\":1.0}]",
+              "description": "JSON array of CriterionInput objects. Each must have `name`; optional fields are `type` (`llm` default | `cv`), `weight` (float > 0, default 1.0), `hint` (`quality` | `presence` | `auto` default), and `depends_on` (name of another criterion that must PASS score >= 7 before this one runs — otherwise this criterion is marked SKIPPED and excluded from the weighted score). Chains are supported: A → B → C all skip if A fails. If omitted, `config.DEFAULT_CRITERIA` is used."
+            }
+          ]
+        },
+        "url": {
+          "raw": "{{litellm}}/v1/classifier/assess",
+          "host": ["{{litellm}}"],
+          "path": ["v1", "classifier", "assess"]
+        },
+        "description": "Submit a single-image assessment job. Content-Type is `multipart/form-data`. Returns **202 Accepted** immediately with `{\"job_id\": \"<id>\", \"phase\": \"pending\"}` — this is the async pattern, so poll GET /jobs/{jobId} until `phase` is `completed` or `failed`, then read the `result` field.\n\nServer-side flow (main.py `assess_document`):\n  1. Parse the `criteria` JSON form field via `analysis.parse_criteria`.\n  2. Read the uploaded image bytes into memory (UploadFile is only readable during the request).\n  3. Create a job record in the SQLite jobs registry with `metadata={type: \"assess\", request_id: <req>}` and `initial_phase=\"pending\"`.\n  4. Enqueue `(job_id, \"assess\", {image_bytes, content_type, filename, criteria}, req_id)` into `workers.job_queue`.\n  5. Return `202` with the job_id.\n\nErrors: **400** if the criteria list is empty or the image body is empty; **422** if the criteria JSON is malformed or fails Pydantic validation of CriterionInput.\n\nResult shape once completed: `{image_info, assessment: {overall_verdict, overall_score, per_criterion_scores, weighted_score_breakdown}, verdict}`. SKIPPED criteria appear in `per_criterion_scores` with `verdict: \"SKIPPED\"`, `score: null`, `method: \"skipped\"`, and a reason string, and are excluded from the weighted score. See API.md § `POST /assess`.\n\nPostman note: click the `image` row's file selector to attach a real JPEG/PNG — the placeholder `src` in this template is empty."
+      },
+      "response": []
+    },
+    {
+      "name": "POST /assess/compare",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"image\": {\n    \"data\": \"https://example.com/subject.jpg\",\n    \"type\": \"url\"\n  },\n  \"criteria\": [\n    {\"name\": \"has electrical meter\", \"type\": \"llm\", \"hint\": \"presence\", \"weight\": 4.0},\n    {\"name\": \"meter value is readable\", \"type\": \"llm\", \"hint\": \"quality\", \"weight\": 3.0, \"depends_on\": \"has electrical meter\"},\n    {\"name\": \"sharpness\", \"type\": \"cv\", \"weight\": 1.0}\n  ],\n  \"aggregation\": \"mean\",\n  \"examples\": [\n    {\n      \"data\": \"https://example.com/reference-good.jpg\",\n      \"type\": \"url\",\n      \"weight\": 0.5\n    },\n    {\n      \"data\": \"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=\",\n      \"type\": \"base64\",\n      \"weight\": 0.5\n    }\n  ]\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": {
+          "raw": "{{litellm}}/v1/classifier/assess/compare",
+          "host": ["{{litellm}}"],
+          "path": ["v1", "classifier", "assess", "compare"]
+        },
+        "description": "Submit a comparison job — assess a subject image against one or more reference examples. Content-Type is `application/json`. Body is a CompareRequest (see models.py):\n\n- `image`: ImageInput `{data, type: \"base64\" | \"url\"}`. URL inputs are SSRF-checked before fetching (see ssrf.py).\n- `criteria`: list[CriterionInput], defaults to `config.DEFAULT_CRITERIA` if omitted.\n- `aggregation`: `mean` (default, balanced) | `min` (strictest — must match all examples) | `max` (most lenient — must match any).\n- `examples`: list[ExampleInput] with `min_length=1`. Each has `data`, `type`, `weight` (0.0–1.0, default 0.5 — how much similarity to this example influences the combined score; `0.0` = ignore, `1.0` = similarity only), and optional `pre_generated_analysis` (a prior `result` from /assess to skip re-analysing the reference).\n\nReturns **202 Accepted** immediately with `{\"job_id\": \"<id>\", \"phase\": \"pending\"}`. Poll GET /jobs/{jobId} for the result.\n\nServer-side flow (main.py `assess_with_reference`):\n  1. Validate `request.criteria` non-empty (Pydantic already enforces `examples` min_length=1).\n  2. Create a job record with `metadata={type: \"compare\", request_id: <req>}`.\n  3. Enqueue the full CompareRequest object into `workers.job_queue` — workers._run_compare receives it directly, no re-parsing.\n  4. Return `202` with the job_id.\n\nErrors: **400** if criteria list is empty; **422** if the body fails CompareRequest validation (missing examples, invalid aggregation literal, weight out of range, malformed ImageInput/ExampleInput).\n\nCombined-score formula: `combined = (1 - weight) × input_overall_score + weight × similarity_score`. Result shape: `{status, criteria, aggregation, input_analysis, example_results[], aggregate: {method, combined_score, combined_verdict, per_example_combined_scores}}`. See API.md § `POST /assess/compare`.\n\nCaching: `pre_generated_analysis` values must come from the SAME version of the classifier that is currently running — stored analyses from older versions cause runtime errors. Re-generate after upgrades. See API.md § Caching example analyses."
+      },
+      "response": []
+    },
+    {
+      "name": "GET /jobs",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{litellm}}/v1/classifier/jobs",
+          "host": ["{{litellm}}"],
+          "path": ["v1", "classifier", "jobs"]
+        },
+        "description": "List recent jobs, newest first. Mounted by `common.jobs.router.build_router(jobs_registry, include_delete=True, include_cancel=False)` in main.py; backed by `SqliteRegistry.list_all()`. Returns a JobsListResponse — see `shared/common/src/common/jobs/model.py` for the JobBase shape. Result blobs are excluded from the list response (call GET /jobs/{job_id} to get the full `result` field).\n\nEach job's `metadata` is the ClassifierMetadata blob `{type: \"assess\" | \"compare\", request_id: <req>}` written at submit time — useful for filtering by kind or correlating with the `[request_id]` in server logs (see middleware.py's CorrelationIDMiddleware). See API.md § `GET /jobs`."
+      },
+      "response": []
+    },
+    {
+      "name": "GET /jobs/{jobId}",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{litellm}}/v1/classifier/jobs/:jobId",
+          "host": ["{{litellm}}"],
+          "path": ["v1", "classifier", "jobs", ":jobId"],
+          "variable": [
+            { "key": "jobId", "value": "", "description": "job_id returned by POST /assess or POST /assess/compare." }
+          ]
+        },
+        "description": "Poll for the status and result of a submitted job. Set the `jobId` collection variable to the `job_id` returned by POST /assess or POST /assess/compare first.\n\nResponse shape (JobBase from `common.jobs`):\n  `{job_id, phase, created_at, updated_at, elapsed_seconds, metadata: {type, request_id}, result, error}`\n\n`phase` progression: `pending` → `processing` → `completed` | `failed`.\n\n- While `pending` / `processing`: `result` is null, `error` is null. Keep polling.\n- When `completed`: `result` is the assessment (see POST /assess or POST /assess/compare descriptions for the exact shape).\n- When `failed`: `error` holds the exception message set by the worker via `jobs_registry.set_error(...)`, `result` is null.\n\nErrors: **404** if the `job_id` is unknown (registry.get returned None). Note the response migration: top-level `id` is now `job_id`, `status` is now `phase`, and the previously separate `type` + `request_id` columns are nested under `metadata`. Callers that parse the response by field name need to update accordingly. See API.md § `GET /jobs/{job_id}`."
+      },
+      "response": []
+    },
+    {
+      "name": "DELETE /jobs/{jobId}",
+      "request": {
+        "method": "DELETE",
+        "header": [],
+        "url": {
+          "raw": "{{litellm}}/v1/classifier/jobs/:jobId",
+          "host": ["{{litellm}}"],
+          "path": ["v1", "classifier", "jobs", ":jobId"],
+          "variable": [
+            { "key": "jobId", "value": "", "description": "job_id returned by POST /assess or POST /assess/compare." }
+          ]
+        },
+        "description": "Delete a job record from the SQLite registry. Returns **204 No Content** on success (empty body). Idempotent from the caller's perspective in the sense that once gone the record stays gone — but the underlying `registry.delete` returns False for unknown ids, so a repeat call for the same id returns **404** with `detail: \"no job '<id>'\"`.\n\nNo cancel semantics: the worker doesn't currently observe a cancel signal mid-analysis, so `include_cancel=False` on the mounted router (see main.py). Deleting a job that's still `pending` / `processing` removes the record from the DB but does NOT abort the in-flight worker task — the worker will attempt to write its result/error to a row that no longer exists (logged, but harmless). See API.md § `DELETE /jobs/{job_id}`."
+      },
+      "response": []
+    }
+  ]
+}

@@ -1,0 +1,303 @@
+{
+  "info": {
+    "name": "kokoro",
+    "description": "Kokoro TTS endpoints. The stack is two containers (see ai/kokoro/KOKORO.md): `kokoro-app` runs the Kokoro-82M inference model on an internal-only port and exposes `/voices`, `/languages`, `/generate`; `kokoro-api` is a stateless FastAPI proxy published on `localhost:${PORT_KOKORO_API}` (default 8004) that forwards to it and additionally serves the OpenAI-compatible `/v1/audio/speech`, a `/health` liveness probe, an `/audio/{filename}` cache used by the MCP `text_to_speech` tool, and mounts a FastMCP server at `/mcp`.\n\nTwo base URLs are wired up as collection variables. `kokoro` points at the raw `kokoro-api` service (default http://localhost:8004) — use this for `/voices`, `/languages`, `/generate`, `/health`, and the `/audio/*` + `/mcp` surfaces. `litellm` points at the LiteLLM proxy (default http://localhost:4001) — use this ONLY for the OpenAI-compatible `POST /v1/audio/speech`, which LiteLLM routes to `kokoro-api` via the `model_name: kokoro` entry in ai/litellm/litellm_config.yaml (`openai/kokoro`, `api_base: http://kokoro-api:8000/v1`). Every request inherits collection-level Bearer auth from the `virtual master key` variable — required for the LiteLLM path, ignored by the direct kokoro-api path.\n\n`kokoro-app` is not directly reachable from the host — its endpoints are documented here for reference only and are exercised transparently via `kokoro-api`.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "_postman_id": "kokoro-collection"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{virtual master key}}",
+        "type": "string"
+      }
+    ]
+  },
+  "variable": [
+    {
+      "key": "kokoro",
+      "value": "http://localhost:8004",
+      "type": "string",
+      "description": "Direct `kokoro-api` base URL. Localhost publish is `${PORT_KOKORO_API}` (default 8004); on ai_shared it's http://kokoro-api:8000. Use for /voices, /languages, /generate, /health, /audio/*, /mcp. Bypasses LiteLLM — Authorization header is unused by kokoro-api."
+    },
+    {
+      "key": "litellm",
+      "value": "http://localhost:4001",
+      "type": "string",
+      "description": "LiteLLM base URL. Localhost publish is 4001 (PORT_LITELLM); on ai_shared it's http://litellm:4000. Used only for the OpenAI-compatible /v1/audio/speech route, which LiteLLM forwards to kokoro-api via the `kokoro` model alias in ai/litellm/litellm_config.yaml."
+    },
+    {
+      "key": "virtual master key",
+      "value": "sk-your-litellm-virtual-key",
+      "type": "string",
+      "description": "LiteLLM virtual key (Admin UI → Virtual Keys, or /key/generate). Required for the LiteLLM-routed /v1/audio/speech request. Sent as `Authorization: Bearer {{virtual master key}}` by the collection-level auth; kokoro-api itself does not authenticate, so direct-service requests ignore it."
+    },
+    {
+      "key": "voice",
+      "value": "af_heart",
+      "type": "string",
+      "description": "Kokoro voice name used by the /generate examples. Default `af_heart` (American English). Pick another from GET /voices, or use a language-specific prefix — see KOKORO.md § Language support (a=American, b=British, e=Spanish, f=French, h=Hindi, i=Italian, j=Japanese, p=Brazilian Portuguese, z=Mandarin)."
+    },
+    {
+      "key": "audioFilename",
+      "value": "",
+      "type": "string",
+      "description": "Filename (12-char md5 prefix + `.wav`) returned by the MCP `text_to_speech` tool's URL. Paste the last path segment of the returned `AUDIO_BASE_URL/audio/<name>.wav` here to fetch it via GET /audio/{filename}. Files are ephemeral — kokoro-api clears the audio dir on every text_to_speech call."
+    }
+  ],
+  "item": [
+    {
+      "name": "kokoro-api (public)",
+      "description": "Endpoints published by `kokoro-api` on `${PORT_KOKORO_API}` (default localhost:8004). This is the only container exposed to the host — everything routes through here.",
+      "item": [
+        {
+          "name": "GET /health",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{kokoro}}/health",
+              "host": ["{{kokoro}}"],
+              "path": ["health"]
+            },
+            "description": "Liveness probe for `kokoro-api`. Returns JSON `{\"status\": \"ok\"}` when the proxy process is up — does NOT verify that `kokoro-app` is reachable or that the model has loaded. Response shape: JSON. Used by the Docker healthcheck defined in docker-compose.kokoro.yml (30s interval, 10s start_period). See KOKORO.md § Health check for the model-loading caveat (first /generate request is slow because the model lazy-loads)."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /voices",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{kokoro}}/voices",
+              "host": ["{{kokoro}}"],
+              "path": ["voices"]
+            },
+            "description": "Flat list of every voice the Kokoro model exposes. Proxied verbatim from `kokoro-app`'s /voices (which enumerates `voices/*.pt` files in the hexgrad/Kokoro-82M HF repo the first time it's called and caches the result). Response shape: JSON `{\"voices\": [\"af_heart\", \"am_adam\", ...]}`. Voice names encode their language in the first character — see KOKORO.md § Language support or hit GET /languages for the grouped view. 502 if kokoro-app is unreachable."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /languages",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{kokoro}}/languages",
+              "host": ["{{kokoro}}"],
+              "path": ["languages"]
+            },
+            "description": "All nine languages Kokoro supports, each with its voices grouped underneath. Proxied from `kokoro-app`'s /languages. Response shape: JSON `{\"languages\": [{\"code\": \"a\", \"name\": \"American English\", \"voices\": [...]}, ...]}`. There is no separate `language` request parameter anywhere in the API — language is derived from the voice you pick (first char of the voice name). See KOKORO.md § Language support. 502 if kokoro-app is unreachable."
+          },
+          "response": []
+        },
+        {
+          "name": "POST /generate",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{kokoro}}/generate?text=Hello world&voice={{voice}}",
+              "host": ["{{kokoro}}"],
+              "path": ["generate"],
+              "query": [
+                { "key": "text", "value": "Hello world", "description": "Text to synthesise. Passed straight through to the Kokoro pipeline for the language implied by `voice`." },
+                { "key": "voice", "value": "{{voice}}", "description": "Kokoro voice name (e.g. af_heart, jf_alpha, ff_siwis). Defaults to `af_heart` server-side if omitted. 400 if the voice is unknown — get the full list from GET /voices." }
+              ]
+            },
+            "description": "Raw Kokoro synthesis. Both parameters are QUERY params, not a JSON body — matches KOKORO.md § Usage. Response shape: binary WAV bytes with `Content-Type: audio/wav` (kokoro-api decodes the hex-encoded audio from kokoro-app's JSON response and returns raw bytes). Postman note: click 'Send and Download' to save the response as a .wav file. First call to a given language is slow (KPipeline lazy-loads on first use); subsequent calls in the same process reuse the cached pipeline. 502 if kokoro-app is unreachable, propagated 400 if the voice is unknown."
+          },
+          "response": []
+        },
+        {
+          "name": "POST /v1/audio/speech (OpenAI-compatible, direct)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"kokoro\",\n  \"input\": \"Hello world\",\n  \"voice\": \"alloy\",\n  \"response_format\": \"wav\",\n  \"speed\": 1.0\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{kokoro}}/v1/audio/speech",
+              "host": ["{{kokoro}}"],
+              "path": ["v1", "audio", "speech"]
+            },
+            "description": "OpenAI-compatible TTS endpoint hitting kokoro-api DIRECTLY (bypassing LiteLLM). Useful for testing kokoro-api in isolation without a LiteLLM key. Response shape: binary WAV with `Content-Type: audio/wav`.\n\nRequest body follows the OpenAI TTS schema: `model`, `input`, `voice`, `response_format` (accepted but IGNORED — Kokoro only produces WAV), `speed` (accepted but currently not applied). The `voice` field accepts OpenAI aliases (alloy → af_heart, echo → am_adam, fable → bf_emma, onyx → am_michael, nova → af_sarah, shimmer → af_bella) or any Kokoro voice name pass-through. All OpenAI aliases resolve to English voices — for other languages, pass a Kokoro voice name directly (see KOKORO.md § LiteLLM integration for the mapping table). 502 if kokoro-app is unreachable."
+          },
+          "response": []
+        },
+        {
+          "name": "POST /v1/audio/speech (OpenAI-compatible, via LiteLLM)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"kokoro\",\n  \"input\": \"Hello world\",\n  \"voice\": \"alloy\",\n  \"response_format\": \"wav\",\n  \"speed\": 1.0\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/audio/speech",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "audio", "speech"]
+            },
+            "description": "Same OpenAI-compatible endpoint routed through the LiteLLM proxy. LiteLLM matches `\"model\": \"kokoro\"` against the model alias in ai/litellm/litellm_config.yaml (`model_name: kokoro`, `model: openai/kokoro`, `api_base: http://kokoro-api:8000/v1`) and forwards to kokoro-api. Response shape: binary WAV with `Content-Type: audio/wav`. Requires a valid virtual key in the collection-level Bearer header (set the `virtual master key` variable). Same voice-alias behaviour as the direct route — see KOKORO.md § LiteLLM integration."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /audio/{filename}",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{kokoro}}/audio/:audioFilename",
+              "host": ["{{kokoro}}"],
+              "path": ["audio", ":audioFilename"],
+              "variable": [
+                { "key": "audioFilename", "value": "", "description": "Filename (12-char md5 prefix + .wav) returned by the MCP text_to_speech tool's URL." }
+              ]
+            },
+            "description": "Serve a WAV file previously cached by the MCP `text_to_speech` tool (see MCP subfolder). Response shape: binary WAV with `Content-Type: audio/wav`. Set the `audioFilename` collection variable to the last path segment of the URL returned by `text_to_speech` (e.g. `a1b2c3d4e5f6.wav`).\n\nFiles are ephemeral — kokoro-api's audio directory is cleared on every `text_to_speech` invocation, so a filename returned by one MCP call becomes 404 the moment a new call is made. Path traversal is rejected with 400 (`..`, `/`, `\\`); missing file returns 404."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "kokoro-api MCP",
+      "description": "FastMCP JSON-RPC over HTTP mounted on kokoro-api at `/mcp`. The `kokoro-api` container advertises this server to LiteLLM via `mcp_servers.kokoro_tts` (url `http://kokoro-api:8000/mcp`, transport `http`) in ai/litellm/litellm_config.yaml — models see the tool through that path. The requests below are useful for debugging the transport directly. Every MCP request needs `Accept: application/json, text/event-stream` and must start with `initialize`; copy the `mcp-session-id` response header into `mcpSessionId` for the follow-up calls.",
+      "item": [
+        {
+          "name": "MCP — initialize",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json, text/event-stream" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 1,\n  \"method\": \"initialize\",\n  \"params\": {\n    \"protocolVersion\": \"2024-11-05\",\n    \"capabilities\": {},\n    \"clientInfo\": { \"name\": \"postman\", \"version\": \"0.0\" }\n  }\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{kokoro}}/mcp/",
+              "host": ["{{kokoro}}"],
+              "path": ["mcp", ""]
+            },
+            "description": "MCP handshake. Response headers include `mcp-session-id` — copy the value into the `mcpSessionId` collection variable and reuse it on subsequent MCP calls."
+          },
+          "response": []
+        },
+        {
+          "name": "MCP — tools/list",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json, text/event-stream" },
+              { "key": "Mcp-Session-Id", "value": "{{mcpSessionId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 2,\n  \"method\": \"tools/list\",\n  \"params\": {}\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{kokoro}}/mcp/",
+              "host": ["{{kokoro}}"],
+              "path": ["mcp", ""]
+            },
+            "description": "Enumerate available tools. kokoro-api exposes exactly one: `text_to_speech`."
+          },
+          "response": []
+        },
+        {
+          "name": "MCP — tools/call text_to_speech",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json, text/event-stream" },
+              { "key": "Mcp-Session-Id", "value": "{{mcpSessionId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 3,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"text_to_speech\",\n    \"arguments\": {\n      \"text\": \"Hello from MCP\",\n      \"voice\": \"alloy\"\n    }\n  }\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{kokoro}}/mcp/",
+              "host": ["{{kokoro}}"],
+              "path": ["mcp", ""]
+            },
+            "description": "Synthesise speech and return a URL string. Unlike the raw HTTP endpoints (which return WAV bytes), this tool WRITES the WAV to kokoro-api's audio directory and returns a text URL of the form `${AUDIO_BASE_URL}/audio/<12-char-md5>.wav` — set the `AUDIO_BASE_URL` env var on the container so the returned URL is reachable by the caller (default `http://localhost:8000`, override to your public host if fronted by cloudflared/oauth2-proxy).\n\nArguments: `text` (required), `voice` (defaults to `alloy`). Voice accepts OpenAI aliases (mapped to English Kokoro voices) or any Kokoro voice name pass-through — see KOKORO.md § LiteLLM integration.\n\nSide effect: every call clears kokoro-api's audio directory before writing the new file. Old URLs returned by previous calls will 404 after the next call — treat the returned URL as single-use."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "kokoro-app (internal — reference only)",
+      "description": "Endpoints served by `kokoro-app` on internal port 8085 (`KOKORO_APP_URL`, default `http://kokoro-app:8085`). NOT exposed to the host by docker-compose.kokoro.yml — these are only reachable from other containers on the `ai_shared` network, or via `KOKORO_APP_URL=http://localhost:8085` for local uv-run dev (see KOKORO.md § Project structure). Documented here so operators know what kokoro-api proxies to; requests will fail against a normal Compose deployment.",
+      "item": [
+        {
+          "name": "GET /voices (internal)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "http://kokoro-app:8085/voices",
+              "host": ["http://kokoro-app:8085"],
+              "path": ["voices"]
+            },
+            "description": "Flat voice list. Response shape: JSON `{\"voices\": [...]}`. First call is slow — it queries the hexgrad/Kokoro-82M HuggingFace repo for `voices/*.pt` files. Cached in-process afterward. Also serves as the Compose healthcheck target for `kokoro-app` (30s interval, 120s start_period to allow the initial HF query). Prefer `GET {{kokoro}}/voices` — same data, reachable from the host."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /languages (internal)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "http://kokoro-app:8085/languages",
+              "host": ["http://kokoro-app:8085"],
+              "path": ["languages"]
+            },
+            "description": "Voices grouped by language. Response shape: JSON `{\"languages\": [{\"code\", \"name\", \"voices\"}, ...]}`. See KOKORO.md § Language support for the code table. Prefer `GET {{kokoro}}/languages`."
+          },
+          "response": []
+        },
+        {
+          "name": "POST /generate (internal)",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "http://kokoro-app:8085/generate?text=Hello world&voice={{voice}}",
+              "host": ["http://kokoro-app:8085"],
+              "path": ["generate"],
+              "query": [
+                { "key": "text", "value": "Hello world" },
+                { "key": "voice", "value": "{{voice}}" }
+              ]
+            },
+            "description": "Direct Kokoro inference. Response shape from THIS container is JSON `{\"audio\": \"<hex-encoded-wav-bytes>\"}` — NOT audio bytes. kokoro-api decodes this into raw `audio/wav` before returning to the caller. If you're calling this endpoint directly for debugging, you need to hex-decode the `audio` field to reconstruct the WAV file. Prefer `POST {{kokoro}}/generate` for anything but low-level troubleshooting."
+          },
+          "response": []
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,130 @@
+{
+  "info": {
+    "name": "roofix",
+    "description": "Roofix ↔ Phoenix Bridge endpoints. UNLIKE sandbox-runner, roofix is NOT exposed through a LiteLLM pass-through — it's an internal FastAPI service on the `ai_shared` Docker network only. There is no host port mapping in `ai/roofix/docker-compose.roofix.yml` for the bridge itself (only roofix-db is published, at PORT_ROOFIX_DB=5433). To hit these endpoints from your laptop you must either (a) `docker exec` into another container on ai_shared and curl `http://roofix:8080/...`, or (b) temporarily add a `ports: [\"8080:8080\"]` block to the `roofix` service and `docker compose up -d`. Auth: NONE. The bridge trusts its network — do not expose it to the public internet without an auth proxy in front (oauth2-proxy or equivalent).\n\nSee `ai/roofix/ROOFIX.md § Endpoints` for the endpoint reference and `ai/roofix/ROOFIX.md § Reanalyzing an email` for the /execute vs /reset decision.\n\nDRY_RUN implications: with `DRY_RUN=true` (the default, and what first deploys ship with), the bridge fetches, parses, decides, forwards escalations, and marks Gmail read/labeled — but skips every Phoenix psycopg2 write. `/tick`, `/execute/{message_id}`, and scheduled ticks all honor this flag. Flip `DRY_RUN=false` in `.env` and restart the container to enable writes. `/status` returns the effective value under `dry_run`.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "_postman_id": "roofix-bridge-collection"
+  },
+  "auth": {
+    "type": "noauth"
+  },
+  "variable": [
+    {
+      "key": "roofix",
+      "value": "http://localhost:8080",
+      "type": "string",
+      "description": "Roofix bridge base URL. Default `http://localhost:8080` assumes you've added a host port mapping to the `roofix` service in `ai/roofix/docker-compose.roofix.yml` (it ships with NO port mapping — service is ai_shared-only). Inside the `ai_shared` Docker network it's `http://roofix:8080`. From another compose container: `docker exec -it litellm curl http://roofix:8080/health`."
+    },
+    {
+      "key": "roofixMessageId",
+      "value": "",
+      "type": "string",
+      "description": "Gmail message id for the /execute/{message_id} and /reset/{message_id} requests. This is Gmail's internal id (looks like `18f123456789abcd`), NOT the RFC 822 Message-ID header. Find it via the Gmail API `users.messages.list`, or by looking up a row in the `processed_store` table on roofix-db (the primary key is the Gmail message id). The OAuth token backing the bridge must be able to see the message — 404 otherwise."
+    }
+  ],
+  "item": [
+    {
+      "name": "GET /health",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{roofix}}/health",
+          "host": ["{{roofix}}"],
+          "path": ["health"]
+        },
+        "description": "Liveness probe. Returns `{\"status\": \"ok\"}` unconditionally as long as the FastAPI process is running — does NOT verify Gmail OAuth, Phoenix DB reachability, or the roofix-db connection. Used by the compose healthcheck (`ai/roofix/docker-compose.roofix.yml`). Auth: none (internal). See `ROOFIX.md § Endpoints`."
+      },
+      "response": []
+    },
+    {
+      "name": "GET /status",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{roofix}}/status",
+          "host": ["{{roofix}}"],
+          "path": ["status"]
+        },
+        "description": "Snapshot of the bridge's in-memory tick counters. Returns `{started_at, last_tick_at, last_tick_ok, last_tick_error, tick_count, decisions_total, decisions_by_action, decisions_by_source, escalations_total, phoenix_write_failures, dry_run, agent_phase, tick_interval_seconds}`. `dry_run` reflects the effective env var (`DRY_RUN`, default `true`) — check this before running `/tick` to confirm you're not about to write to Phoenix. Counters are process-local: they reset on container restart. Auth: none (internal). See `ROOFIX.md § Endpoints`."
+      },
+      "response": []
+    },
+    {
+      "name": "POST /tick",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": {
+          "raw": "{{roofix}}/tick",
+          "host": ["{{roofix}}"],
+          "path": ["tick"]
+        },
+        "description": "Manually trigger one processing batch immediately, out-of-band with the APScheduler cadence. With an empty body `{}` (or no body), the bridge fetches unread Roofix mail from Gmail via `LISTENER_QUERY` and runs the full pipeline: parse → resolve project → brain decides → optionally write Phoenix (skipped under `DRY_RUN=true`) → mark Gmail read/labeled. Optionally accepts `{\"raw_emails\": [...]}` (Contract A shape) to feed crafted samples in without touching Gmail — useful for offline testing.\n\nSerialized with the scheduled tick via `_tick_lock` (asyncio.Lock) plus APScheduler's `max_instances=1` — a manual /tick that arrives mid-schedule waits for the in-flight batch to finish, never overlaps. Returns `{records, count}` on success or `{error, records: [], count: 0}` on pipeline failure (still 200). Auth: none (internal). See `ROOFIX.md § Endpoints` and `ROOFIX.md § How it works`."
+      },
+      "response": []
+    },
+    {
+      "name": "POST /execute/{message_id}",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "url": {
+          "raw": "{{roofix}}/execute/:roofixMessageId",
+          "host": ["{{roofix}}"],
+          "path": ["execute", ":roofixMessageId"],
+          "variable": [
+            { "key": "roofixMessageId", "value": "", "description": "Gmail message id for the /execute/{message_id} request." }
+          ]
+        },
+        "description": "Re-run one specific Gmail message through the full pipeline. Fetches by id regardless of read/unread state (uses `gmail.fetch_one`, not the listener query), SKIPS the `processed_store` dedup filter so an already-handled email will be re-processed, and otherwise runs the same orchestrator path a scheduled tick would — Phoenix writes, `mark_read`, escalation forwarding all happen normally (subject to `DRY_RUN=true`, which short-circuits Phoenix writes but still marks Gmail read/labeled and forwards escalations).\n\nReturns 404 if Gmail can't find `message_id` under the bridge's OAuth token, 200 `{records, count}` on success, or 200 `{error, records: [], count: 0}` if the pipeline itself raised. Serialized with the scheduler via the tick lock.\n\nUse this for one-shot immediate re-runs (a bug fix landed, replay a specific event). For queueing an email back into the normal listener path on the next scheduled tick, use `POST /reset/{message_id}` instead. Auth: none (internal). See `ROOFIX.md § Endpoints` and `ROOFIX.md § Reanalyzing an email`."
+      },
+      "response": []
+    },
+    {
+      "name": "POST /reset/{message_id}",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "url": {
+          "raw": "{{roofix}}/reset/:roofixMessageId",
+          "host": ["{{roofix}}"],
+          "path": ["reset", ":roofixMessageId"],
+          "variable": [
+            { "key": "roofixMessageId", "value": "", "description": "Gmail message id for the /reset/{message_id} request." }
+          ]
+        },
+        "description": "Undo the three gates the bridge sets after a normal run so the next scheduled tick re-fetches and re-analyzes this email through the normal listener path:\n  1. `processed_store` — status flipped from `ok`/`error` to `pending` (via `mark_pending`, preserving history). `is_processed()` returns False for `pending`, so the bridge-side dedup no longer skips it.\n  2. Gmail label — `ROOFIX_PROCESSED_LABEL` (default `roofix/processed`) is removed so the `-label:...` clause in `LISTENER_QUERY` no longer excludes it server-side.\n  3. Read/unread — the `UNREAD` label is re-added so `is:unread` in `LISTENER_QUERY` matches it again.\n\nAll three Gmail modifies are idempotent; safe to call repeatedly. Returns `{message_id, store, gmail: {unread, label_removed}, label}`. `store` is `\"unchanged\"` if there was no processed_store row for the id (Gmail side still runs — useful when the row was manually deleted but the label is still stuck on the message). 404 if Gmail can't find the id under the bridge's OAuth token.\n\nDRY_RUN interaction: `/reset` itself makes no Phoenix writes, only touches Gmail + processed_store. The subsequent scheduled tick that re-processes the reset email honors `DRY_RUN=true` normally. Prefer `POST /execute/{message_id}` for a one-shot immediate re-run; use `/reset` when you want the email to flow through the batch path (e.g. end-to-end sanity check of `LISTENER_QUERY`). Auth: none (internal). See `ROOFIX.md § Endpoints` and `ROOFIX.md § Reanalyzing an email`."
+      },
+      "response": []
+    },
+    {
+      "name": "POST /labels/backfill",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "url": {
+          "raw": "{{roofix}}/labels/backfill",
+          "host": ["{{roofix}}"],
+          "path": ["labels", "backfill"]
+        },
+        "description": "One-time repair: apply `ROOFIX_PROCESSED_LABEL` (default `roofix/processed`) to every message_id currently in `processed_store` with status `ok` or `error`. Rows with status `pending` are intentionally skipped (still in-flight).\n\nRun this once after upgrading to the labeled-fetch model to sweep the existing backlog of stuck-unread rows out of the `LISTENER_QUERY` fetch window (Gmail excludes labeled messages server-side, so a fully-backfilled label state means the 25-message-per-tick fetch budget only hits genuinely-new mail). Safe to re-run — Gmail's `apply_label` is idempotent, so re-labeling already-labeled messages is a no-op.\n\nReturns `{label, counts: {labeled, skipped, failed}}`. `skipped` counts rows with a null message_id (shouldn't happen in practice). `failed` counts Gmail modify errors (e.g. message deleted since the row was written) — per-message errors are logged to the audit CSV as `gmail / apply_label_failed` rather than surfaced in the response body. Returns 500 if the label itself can't be resolved (`get_or_create_label` failure — usually an OAuth issue).\n\nDRY_RUN does NOT gate this endpoint — it only touches Gmail labels, not Phoenix. Auth: none (internal). See `ROOFIX.md § Endpoints` and the `ROOFIX_PROCESSED_LABEL` note in `ai/roofix/ROOFIX.md § Configuration`."
+      },
+      "response": []
+    }
+  ]
+}

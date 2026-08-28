@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import time
 from datetime import datetime, timezone
@@ -26,6 +27,8 @@ from common.jobs.postgres import PostgresRegistry
 
 from spawner import Spawner
 
+
+log = logging.getLogger("sandbox-runner.reaper")
 
 SWEEP_INTERVAL_S = 60
 HARD_TTL_S = int(os.environ.get("SANDBOX_HARD_TTL_SECONDS", "3600"))
@@ -59,14 +62,20 @@ class Reaper:
         if self._task is None or self._task.done():
             self._stop.clear()
             self._task = asyncio.create_task(self._loop())
+            log.info(
+                "Reaper started: sweep=%ds hard_ttl=%ds idle_ttl=%ds",
+                SWEEP_INTERVAL_S, HARD_TTL_S, IDLE_TTL_S,
+            )
 
     async def stop(self) -> None:
+        log.info("Reaper stop requested")
         self._stop.set()
         if self._task is not None:
             try:
                 await self._task
-            except Exception:
-                pass
+            except Exception as exc:
+                log.warning("Reaper task raised on stop: %s", exc)
+        log.info("Reaper stopped")
 
     async def _loop(self) -> None:
         while not self._stop.is_set():
@@ -75,7 +84,7 @@ class Reaper:
             except Exception as exc:
                 # Never let the reaper die — a swallowed exception here
                 # would silently disable TTL enforcement. Log and continue.
-                print(f"[reaper] sweep error: {exc}", flush=True)
+                log.exception("sweep error (loop continues): %s", exc)
             try:
                 await asyncio.wait_for(
                     self._stop.wait(), timeout=SWEEP_INTERVAL_S
@@ -87,6 +96,7 @@ class Reaper:
         now = time.time()
         # asyncio-friendly wrapper around the sync docker call.
         containers = await asyncio.to_thread(self._spawner.list_managed)
+        log.debug("sweep: %d managed container(s) considered", len(containers))
         # Track sandbox_ids we've already reaped this sweep so the idle-
         # ttl pass doesn't try to expire the same one the hard-ttl pass
         # just handled (double-release of the semaphore would over-count).
@@ -100,14 +110,13 @@ class Reaper:
             age = now - spawned_at
             if age >= HARD_TTL_S:
                 sandbox_id = c.labels.get("sandbox.id", "")
+                log.info(
+                    "hard-ttl expired: sandbox=%s container=%s age=%ds",
+                    sandbox_id, c.name, int(age),
+                )
                 await self._reap(c.name, sandbox_id)
                 if sandbox_id:
                     reaped.add(sandbox_id)
-                print(
-                    f"[reaper] hard-ttl expired sandbox-{sandbox_id} "
-                    f"(age={int(age)}s)",
-                    flush=True,
-                )
 
         # Idle-TTL pass: read every running job's metadata and expire
         # any whose last_used_at is older than IDLE_TTL_S. Cheap (one
@@ -118,12 +127,11 @@ class Reaper:
         for sandbox_id, container_name in stale:
             if sandbox_id in reaped:
                 continue
-            await self._reap(container_name, sandbox_id)
-            print(
-                f"[reaper] idle-ttl expired sandbox-{sandbox_id} "
-                f"(container={container_name})",
-                flush=True,
+            log.info(
+                "idle-ttl expired: sandbox=%s container=%s",
+                sandbox_id, container_name,
             )
+            await self._reap(container_name, sandbox_id)
 
     async def _reap(self, container_name: str, sandbox_id: str) -> None:
         """Common teardown path used by both the hard-TTL and idle-TTL
@@ -142,6 +150,10 @@ class Reaper:
             await self._registry.set_phase(sandbox_id, "expired")
         if was_holding_slot:
             self._slot_sem.release()
+        log.debug(
+            "_reap: sandbox=%s container=%s slot_released=%s",
+            sandbox_id, container_name, was_holding_slot,
+        )
 
     async def _find_idle(self, now: float) -> list[tuple[str, str]]:
         """Return (sandbox_id, container_name) for running jobs whose
@@ -151,6 +163,7 @@ class Reaper:
         sandbox concepts into the shared library."""
         pool = self._registry._pool
         if pool is None:
+            log.debug("_find_idle: pool not ready, no idle scan this sweep")
             return []
         cutoff = datetime.fromtimestamp(
             now - IDLE_TTL_S, tz=timezone.utc
@@ -171,4 +184,9 @@ class Reaper:
             container_name = result.get("container_name")
             if container_name:
                 out.append((row["id"], container_name))
+        if out:
+            log.debug(
+                "_find_idle: %d idle sandbox(es) older than cutoff %s",
+                len(out), cutoff.isoformat(),
+            )
         return out

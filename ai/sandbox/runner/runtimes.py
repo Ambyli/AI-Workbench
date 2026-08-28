@@ -13,7 +13,11 @@ this dict — nothing else is spawnable.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
+
+
+log = logging.getLogger("sandbox-runner.runtimes")
 
 
 @dataclass(frozen=True)
@@ -160,6 +164,7 @@ def describe_runtimes() -> list[dict]:
     counterpart. Kept as a plain function (not a method) so both call
     sites can import it without pulling in ``FastMCP`` state.
     """
+    log.debug("describe_runtimes: %d entries", len(RUNTIMES))
     return [
         {
             "name": name,
@@ -179,4 +184,6 @@ def get_runtime(name: str) -> Runtime:
     The runner catches this and returns HTTP 400 to the caller so a
     misspelled runtime is a clear user-facing error, not a 500.
     """
-    return RUNTIMES[name]
+    rt = RUNTIMES[name]
+    log.debug("get_runtime(%s) → image=%s", name, rt.image)
+    return rt

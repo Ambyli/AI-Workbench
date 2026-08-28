@@ -230,6 +230,46 @@ class Spawner:
         except (APIError, NotFound):
             pass
 
+    def container_exists(self, container_name: str) -> bool:
+        """Cheap liveness check used by the session-reuse path in the
+        runner. Distinguishes "Postgres says this session is running"
+        from "the container actually still exists on the Docker host" —
+        the two can diverge if the reaper hasn't caught up yet or the
+        container crashed out-of-band."""
+        try:
+            self._client.containers.get(container_name)
+            return True
+        except NotFound:
+            return False
+
+    def update_files(
+        self,
+        container_name: str,
+        files: dict[str, str],
+        deletes: list[str],
+    ) -> None:
+        """Overlay ``files`` onto a running container's ``/app`` and
+        optionally remove entries listed in ``deletes``.
+
+        This is the hot-reload path — the container keeps running, its
+        dev server (streamlit / nginx / vite / etc.) watches the
+        filesystem and reacts on its own. No respawn, no readiness probe.
+
+        ``deletes`` paths are sanitized to reject absolute paths and any
+        ``..`` traversal so a malicious file map can't rm outside
+        ``/app`` even though we run ``rm`` as the unprivileged sandbox
+        user."""
+        container = self._client.containers.get(container_name)
+        for path in deletes:
+            safe = _safe_relpath(path)
+            container.exec_run(
+                ["rm", "-rf", f"/app/{safe}"],
+                user="1000:1000",
+            )
+        if files:
+            tarball = _make_tarball(files)
+            container.put_archive("/app", tarball)
+
     def list_managed(self) -> list[Container]:
         """Return every running container this subsystem owns.
 
@@ -244,14 +284,25 @@ class Spawner:
 def _make_tarball(files: dict[str, str]) -> bytes:
     """Pack ``{path: content}`` into an in-memory tar suitable for
     ``container.put_archive``. Paths are relative to the archive root
-    (which will be extracted at ``/app``)."""
+    (which will be extracted at ``/app``). Path traversal is refused —
+    an absolute path or one containing ``..`` raises ``ValueError``
+    rather than silently writing outside ``/app``."""
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w") as tar:
         for rel_path, content in files.items():
+            safe = _safe_relpath(rel_path)
             data = content.encode("utf-8")
-            info = tarfile.TarInfo(name=rel_path.lstrip("/"))
+            info = tarfile.TarInfo(name=safe)
             info.size = len(data)
             info.mode = 0o644
             info.mtime = int(time.time())
             tar.addfile(info, io.BytesIO(data))
     return buf.getvalue()
+
+
+def _safe_relpath(path: str) -> str:
+    """Reject anything that would escape ``/app``. Returns the cleaned
+    relative path on success, raises ``ValueError`` on rejection."""
+    if not path or path.startswith("/") or ".." in path.split("/"):
+        raise ValueError(f"unsafe path in files/deletes: {path!r}")
+    return path.lstrip("/")

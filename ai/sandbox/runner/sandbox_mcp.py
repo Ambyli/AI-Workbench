@@ -89,13 +89,16 @@ def build_mcp(run_callable) -> FastMCP:
             )
         ),
         files: dict[str, str] = Field(
+            default_factory=dict,
             description=(
-                "Map of relative path → file contents. Every file the app "
-                "needs must be included. For Python, add requirements.txt "
-                "if you need packages beyond the pre-baked set. For Node, "
-                "add package.json. list_runtimes returns an example "
-                "files map for each runtime."
-            )
+                "Map of relative path → file contents. On the FIRST call "
+                "for a preview, include every file the app needs "
+                "(requirements.txt / package.json if extra packages are "
+                "required). On a FOLLOW-UP call with the same "
+                "session_id, include ONLY the file(s) that changed — the "
+                "rest are preserved in the running container. Save "
+                "tokens by not resending unchanged files."
+            ),
         ),
         entrypoint: Optional[str] = Field(
             default=None,
@@ -105,7 +108,8 @@ def build_mcp(run_callable) -> FastMCP:
                 "for python, serve for node, nginx for static). NOTE: "
                 "the 'static' runtime does NOT accept a custom "
                 "entrypoint — nginx is fixed. Setting one for static "
-                "will return a 400 error."
+                "will return a 400 error. Ignored on follow-up calls "
+                "(the entrypoint was fixed at spawn time)."
             ),
         ),
         ttl_seconds: Optional[int] = Field(
@@ -116,15 +120,48 @@ def build_mcp(run_callable) -> FastMCP:
                 "picks a sensible value (~15 min)."
             ),
         ),
+        session_id: Optional[str] = Field(
+            default=None,
+            description=(
+                "Handle for a persistent preview. OMIT on the first "
+                "call — the server generates one and returns it. PASS "
+                "the same value back on follow-up calls to update files "
+                "in place. Same URL, no respawn, dev server "
+                "hot-reloads. The value is printed in the 'Session id: "
+                "…' line of the previous tool response."
+            ),
+        ),
+        deletes: list[str] = Field(
+            default_factory=list,
+            description=(
+                "Relative paths (under /app) to REMOVE from the sandbox. "
+                "Use on follow-up calls when the model renames or drops "
+                "a file — otherwise the old file stays in place. "
+                "Ignored on the first call."
+            ),
+        ),
     ) -> str:
         """Build a live, interactive preview of a small app and return an
         HTML iframe block that renders it inline in the chat.
 
-        **When you (the model) relay this tool result to the user, include
-        the returned string VERBATIM in your response** — the ```html
-        code block is what makes OpenWebUI render the preview as an
-        embedded iframe artifact. Paraphrasing or removing the block
-        prevents the preview from rendering.
+        **Updating an existing preview (this is the common case):** when
+        the user asks you to change something in a preview you already
+        showed them, call ``preview_app`` again with the SAME
+        ``session_id`` from the previous response and ONLY the file(s)
+        that changed. The dev server inside the sandbox hot-reloads on
+        file changes (Streamlit watches mtimes, Vite has HMR, nginx
+        serves live), so the iframe already in the chat updates
+        automatically. Do NOT omit the ``session_id`` on follow-ups — a
+        new session means a new URL, and the user loses their scroll
+        position and any in-app state.
+
+        **When you (the model) relay this tool result to the user,
+        include the returned string VERBATIM in your response** — the
+        ```html code block is what makes OpenWebUI render the preview
+        as an embedded iframe artifact. Paraphrasing or removing the
+        block prevents the preview from rendering. The "Session id:"
+        line above the block is what you (the model) grep back on the
+        next turn — do not remove or reword it.
 
         The iframe URL is served by ``sandbox-proxy`` on the local
         network. It is not reachable from outside this OpenWebUI
@@ -135,19 +172,27 @@ def build_mcp(run_callable) -> FastMCP:
             files=files,
             entrypoint=entrypoint,
             ttl_seconds=ttl_seconds,
+            session_id=session_id,
+            deletes=deletes,
         )
         url = result["url"]
         sandbox_id = result["sandbox_id"]
+        session_id_out = result["session_id"]
         expires_at = result["expires_at"]
+        reused = result.get("reused", False)
         iframe = _render_html_block(url)
 
-        # Wrap in a fenced ```html block so OpenWebUI's markdown renderer
-        # promotes it into an artifact iframe. The plain-text lines above
-        # give the model + user useful context if the html renderer is
-        # unavailable or the model decides to paraphrase.
+        # Session id lives on its own line in a stable "Session id: …"
+        # format so the model can regex it out on the next turn without
+        # depending on the tool-response object being intact. Order of
+        # lines is load-bearing: the caller-visible "Preview ready"
+        # summary first, then the machine-readable session id, then the
+        # fenced html block.
+        verb = "updated" if reused else "ready"
         return (
-            f"Preview ready. Sandbox `{sandbox_id}` at {url} "
-            f"(expires {expires_at}).\n\n"
+            f"Preview {verb}. Sandbox `{sandbox_id}` at {url} "
+            f"(expires {expires_at}).\n"
+            f"Session id: {session_id_out}\n\n"
             "```html\n"
             f"{iframe}\n"
             "```"

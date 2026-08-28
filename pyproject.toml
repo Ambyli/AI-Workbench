@@ -5,7 +5,7 @@ members = [
     "ai/roofix",
     "ai/interceptor",
     "ai/classifier",
-    "ai/sandbox",
+    "ai/sandbox/runner",
 ]
 
 [tool.uv.sources]

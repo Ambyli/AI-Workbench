@@ -6,7 +6,7 @@ can statically route ``/{sandbox_id}/*`` to ``sandbox-{id}:80`` without
 per-sandbox Caddy config.
 
 Adding a new language is a single entry here plus a new Dockerfile in
-``ai/sandbox/Dockerfile.sandbox-<name>``. The runner enforces that ``runtime``
+``ai/sandbox/images/<name>.Dockerfile``. The runner enforces that ``runtime``
 values from ``POST /run`` and the MCP ``preview_app`` tool are keys in
 this dict — nothing else is spawnable.
 """
@@ -22,7 +22,7 @@ class Runtime:
 
     Attributes:
         image: Docker image tag. Built locally by ``docker compose build``
-            from ``ai/sandbox/Dockerfile.sandbox-<name>`` — no external registry
+            from ``ai/sandbox/images/<name>.Dockerfile`` — no external registry
             pull, so a compromised upstream can't reach the sandbox subsystem.
         default_entrypoint: Command run inside the container if the caller
             didn't supply one. Must bind to port 80.
@@ -73,7 +73,9 @@ RUNTIMES: dict[str, Runtime] = {
             "Static HTML/CSS/JS. nginx serves whatever is in the files "
             "map. No runtime, no install step, ~500ms cold start. Use "
             "this for single-page demos, hand-written calculators, "
-            "React-via-esm.sh, anything a browser can render on its own."
+            "React-via-esm.sh, anything a browser can render on its "
+            "own. Hot reload: file overwrite is served on the next "
+            "request — the user just refreshes the iframe."
         ),
         # nginx is fixed — this runtime has no way to run arbitrary
         # entrypoints, and setting one causes a hard-to-diagnose
@@ -103,7 +105,11 @@ RUNTIMES: dict[str, Runtime] = {
             "app.py; override entrypoint to run gradio, flask, "
             "fastapi, or any other server (must bind port 80). Ship "
             "requirements.txt for extra packages — pip install runs "
-            "on boot via the egress allowlist."
+            "on boot via the egress allowlist. Hot reload: Streamlit "
+            "watches mtimes and auto-reruns on file change — no "
+            "browser refresh needed. Flask/FastAPI/Gradio only hot-"
+            "reload when their `--reload` / `debug=True` flag is set; "
+            "pick that entrypoint if you want live edits."
         ),
         prebaked_packages=(
             "streamlit", "gradio", "flask", "fastapi", "uvicorn",
@@ -127,7 +133,10 @@ RUNTIMES: dict[str, Runtime] = {
             "static site (`npx serve`); override entrypoint to run "
             "vite, next, express, or any custom server (must bind "
             "port 80). Ship package.json for extra packages — npm "
-            "install runs on boot via the egress allowlist."
+            "install runs on boot via the egress allowlist. Hot "
+            "reload: `npx serve` reads from disk on every request so "
+            "a browser refresh shows updates — no HMR. Override to "
+            "`npm run dev` (vite / next) for full HMR without refresh."
         ),
         prebaked_packages=(
             "serve", "vite", "react", "react-dom", "express", "next",

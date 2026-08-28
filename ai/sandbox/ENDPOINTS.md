@@ -3,17 +3,18 @@
 Base URL from the host: `http://localhost:8012`
 Base URL on the `ai_shared` Docker network: `http://sandbox-runner:8000`
 
-Everything below is served by [`ai/sandbox/app.py`](app.py). Jobs endpoints are contributed by the shared [`build_router`](../../shared/common/src/common/jobs/router.py) factory in `common.jobs`.
+Everything below is served by [`ai/sandbox/runner/app.py`](app.py). Jobs endpoints are contributed by the shared [`build_router`](../../shared/common/src/common/jobs/router.py) factory in `common.jobs`.
 
 ## Summary
 
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/health` | Liveness + DB status |
-| `POST` | `/run` | Spawn a sandbox; returns JSON with URL + id |
+| `POST` | `/run` | Spawn a sandbox — or update an existing one when `session_id` is passed. Returns JSON with URL, session_id, and `reused` flag |
+| `DELETE` | `/session/{session_id}` | Explicitly tear down a session's running sandbox. Idempotent |
 | `GET` | `/jobs` | List every sandbox in the registry (running + terminal) |
 | `GET` | `/jobs/{sandbox_id}` | One sandbox's snapshot |
-| `DELETE` | `/jobs/{sandbox_id}` | Tear a sandbox down early, release its slot |
+| `DELETE` | `/jobs/{sandbox_id}` | Tear a sandbox down early by internal id, release its slot |
 | `POST` | `/mcp/` | FastMCP JSON-RPC endpoint — see [MCP section](#mcp) |
 | `GET` | `/tool/openapi.json` | OpenAPI schema for OpenWebUI's Tool Server discovery |
 | `POST` | `/tool/preview_app` | Spawn a sandbox and return an inline-rendered iframe (Content-Disposition: inline) — see [Tool Server section](#openwebui-tool-server-tool) |
@@ -53,7 +54,12 @@ Used by the compose healthcheck and by `sandbox-runner`'s own lifecycle checks. 
 
 ## `POST /run`
 
-Spawn a new sandbox running the caller's files under the given runtime. Returns the URL to iframe.
+Spawn a new sandbox — or update an existing one — running the caller's files under the given runtime. Returns the URL to iframe.
+
+Two modes, driven by whether `session_id` is present:
+
+- **First call (no `session_id`)** — server generates one, spawns a fresh container, returns `reused: false`.
+- **Follow-up call (with `session_id`)** — server finds the running container for that session, overlays the file map onto its `/app` via `docker cp`, returns **the same URL** and `reused: true`. No respawn, no readiness probe. The dev server inside reloads on file change (Streamlit auto-reruns, Vite HMR, nginx serves live). If the session's container has already been reaped, the runner self-heals by respawning under the same `session_id`.
 
 **Body:**
 ```json
@@ -61,7 +67,9 @@ Spawn a new sandbox running the caller's files under the given runtime. Returns 
   "runtime":     "static",
   "files":       { "index.html": "<h1>hello</h1>" },
   "entrypoint":  null,
-  "ttl_seconds": 900
+  "ttl_seconds": 900,
+  "session_id":  null,
+  "deletes":     []
 }
 ```
 
@@ -69,21 +77,25 @@ Field semantics:
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
-| `runtime` | string | yes | One of `static`, `python`, `node`. See [`runtimes.py`](runtimes.py) for the current registry. |
-| `files` | `{ path: content }` | yes | Map of relative filesystem paths → text contents. Paths must be relative and are extracted under `/app/` in the sandbox. |
-| `entrypoint` | string | no | Shell command that must bind to port `80` inside the container. Leave `null` to use the runtime's default (nginx for `static`, streamlit for `python`, `serve` for `node`). |
+| `runtime` | string | yes | One of `static`, `python`, `node`. See [`runtimes.py`](runner/runtimes.py) for the current registry. |
+| `files` | `{ path: content }` | no | Map of relative filesystem paths → text contents. On the first call: the initial file set. On a follow-up: an overlay — paths listed here overwrite files in the running container, unlisted files are preserved. Absolute paths and `..` are rejected. |
+| `entrypoint` | string | no | Shell command that must bind to port `80` inside the container. Leave `null` to use the runtime's default. Ignored on follow-up calls — the entrypoint is fixed at spawn time. |
 | `ttl_seconds` | int | no | Idle lifetime. Server clamps to `SANDBOX_HARD_TTL_SECONDS` (3600). Defaults to `SANDBOX_DEFAULT_TTL_SECONDS` (900). |
+| `session_id` | string | no | Persistent handle across turns. Regex `^[A-Za-z0-9_-]{1,64}$`. Omit on first call — the server generates one. Pass the value from the previous response to update in place. |
+| `deletes` | `[path, …]` | no | Relative paths under `/app` to remove on a follow-up call. Same sanitization as `files`. Ignored on the first call. |
 
 **Response (200):**
 ```json
 {
   "sandbox_id": "a1b2c3d4e5f6",
+  "session_id": "bfdYm3_H5SD4",
   "url":        "http://sandbox-proxy/a1b2c3d4e5f6/",
-  "expires_at": "2026-08-27T18:15:32.114513+00:00"
+  "expires_at": "2026-08-27T18:15:32.114513+00:00",
+  "reused":     false
 }
 ```
 
-The returned `url` is reachable at `http://sandbox-proxy` on the `ai_shared` Docker network (i.e. from OpenWebUI). From the host it's at `http://localhost:8011/{sandbox_id}/`.
+The returned `url` is reachable at `http://sandbox-proxy` on the `ai_shared` Docker network (i.e. from OpenWebUI). From the host it's at `http://localhost:8011/{sandbox_id}/`. `reused: true` means the response came from the session-reuse path and the container was NOT respawned.
 
 **Error responses:**
 
@@ -132,6 +144,52 @@ curl -X POST http://localhost:8012/run \
     }
   }'
 ```
+
+Follow-up update in the same session (paste the `session_id` from the first response):
+```bash
+curl -X POST http://localhost:8012/run \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "runtime": "static",
+    "session_id": "bfdYm3_H5SD4",
+    "files": {"index.html": "<h1>updated</h1>"}
+  }'
+# Response: same sandbox_id, same url, "reused": true.
+```
+
+Follow-up with a file delete:
+```bash
+curl -X POST http://localhost:8012/run \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "runtime": "static",
+    "session_id": "bfdYm3_H5SD4",
+    "files": {},
+    "deletes": ["old-page.html"]
+  }'
+```
+
+---
+
+## `DELETE /session/{session_id}`
+
+Explicitly tear down the running sandbox for a session. Idempotent — a session that never existed or has already expired still returns 204 so callers don't have to remember state to clean up.
+
+**Request:**
+```bash
+curl -X DELETE http://localhost:8012/session/bfdYm3_H5SD4
+```
+
+**Response (204):** no body.
+
+**Errors:**
+
+| Status | Meaning |
+|---|---|
+| `400` | `session_id` doesn't match `^[A-Za-z0-9_-]{1,64}$`. |
+| `500` | Runner not initialized (should not normally occur). |
+
+Distinct from `DELETE /jobs/{sandbox_id}` — the jobs endpoint targets a single spawn event by its 12-char internal id, while `/session/{id}` targets whatever's currently running under the persistent session handle (may have been respawned via self-heal since the model last saw it).
 
 ---
 

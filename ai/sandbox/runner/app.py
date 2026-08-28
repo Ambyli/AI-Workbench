@@ -32,6 +32,8 @@ load_env()
 
 import asyncio
 import os
+import re
+import secrets
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -40,7 +42,7 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from common.jobs.postgres import PostgresRegistry
 from common.jobs.router import build_router
@@ -61,6 +63,18 @@ MAX_CONCURRENT = int(os.environ.get("SANDBOX_MAX_CONCURRENT", "8"))
 DEFAULT_TTL_S = int(os.environ.get("SANDBOX_DEFAULT_TTL_SECONDS", "900"))
 HARD_TTL_S = int(os.environ.get("SANDBOX_HARD_TTL_SECONDS", "3600"))
 PROXY_URL = os.environ.get("SANDBOX_PROXY_URL", "http://sandbox-proxy")
+
+# Sessions are the durable identity of a preview across turns. Regex is
+# both a validation surface (reject anything that could path-inject when
+# a caller later uses the id in a URL or filesystem context) and a hint
+# to the model that the id is a short opaque string, not free text.
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _new_session_id() -> str:
+    """URL-safe 12-char session id. Enough entropy to avoid collisions
+    across concurrent chats without dragging a UUID through log lines."""
+    return secrets.token_urlsafe(9)  # 9 bytes → 12 base64 chars
 
 
 def _build_dsn() -> str:
@@ -102,8 +116,12 @@ async def _mcp_run(
     files: dict[str, str],
     entrypoint: Optional[str],
     ttl_seconds: Optional[int],
+    session_id: Optional[str],
+    deletes: list[str],
 ) -> dict:
-    return await _spawn_and_track(runtime, files, entrypoint, ttl_seconds)
+    return await _reuse_or_spawn(
+        runtime, files, entrypoint, ttl_seconds, session_id, deletes
+    )
 
 
 _mcp = build_mcp(_mcp_run)
@@ -120,6 +138,7 @@ async def lifespan(app_: FastAPI):
     global _registry, _spawner, _reaper, _slot_sem
     _registry = PostgresRegistry(_build_dsn())
     await _registry.init()
+    await _ensure_session_index(_registry)
     _spawner = Spawner()
     _slot_sem = asyncio.Semaphore(MAX_CONCURRENT)
     _reaper = Reaper(_spawner, _registry, _slot_sem)
@@ -150,7 +169,15 @@ app = FastAPI(title="sandbox-runner", lifespan=lifespan)
 # ── Request / response models ─────────────────────────────────────────────
 class RunRequest(BaseModel):
     runtime: str = Field(description="One of the keys in runtimes.RUNTIMES")
-    files: dict[str, str] = Field(description="Path → content map")
+    files: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Path → content map. On the first call for a session this is "
+            "the initial file set. On a follow-up call (same session_id) "
+            "it is an overlay — paths given here overwrite files in the "
+            "running container, unlisted files are left alone."
+        ),
+    )
     entrypoint: Optional[str] = Field(
         default=None,
         description="Shell command inside the sandbox; must bind to port 80",
@@ -159,12 +186,40 @@ class RunRequest(BaseModel):
         default=None,
         description="Idle TTL. Server clamps to SANDBOX_HARD_TTL_SECONDS.",
     )
+    session_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Persistent identifier for a preview across turns. Omit on "
+            "the first call; the server generates one and returns it. "
+            "Pass the same value back on follow-up calls to update files "
+            "in place — no respawn, same URL, dev server hot-reloads."
+        ),
+    )
+    deletes: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Relative paths (under /app) to delete on a follow-up call. "
+            "Ignored on the first call. Absolute paths and '..' are "
+            "rejected."
+        ),
+    )
+
+    @field_validator("session_id")
+    @classmethod
+    def _validate_session_id(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and not _SESSION_ID_RE.match(v):
+            raise ValueError(
+                "session_id must match ^[A-Za-z0-9_-]{1,64}$"
+            )
+        return v
 
 
 class RunResponse(BaseModel):
     sandbox_id: str
+    session_id: str
     url: str
     expires_at: str
+    reused: bool = False
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────
@@ -185,15 +240,132 @@ async def health() -> dict:
     }
 
 
-async def _spawn_and_track(
+async def _ensure_session_index(registry: PostgresRegistry) -> None:
+    """Install the functional index that backs session lookup.
+
+    Kept here rather than in ``common.jobs.PostgresRegistry`` because it
+    is sandbox-specific — other consumers of the shared registry (e.g.
+    interceptor) don't have a session concept and shouldn't pay for the
+    index. Idempotent — ``IF NOT EXISTS`` means safe on every startup.
+
+    The predicate ``WHERE phase = 'running'`` keeps the index tiny: only
+    the handful of live sandboxes are indexed, not every historical job
+    row. That's the exact shape the reuse lookup queries."""
+    pool = registry._pool
+    if pool is None:
+        return
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS jobs_session_id_running "
+            "ON jobs ((metadata->>'session_id')) "
+            "WHERE phase = 'running'"
+        )
+
+
+async def _find_running_session(session_id: str) -> Optional[dict]:
+    """Return the newest running sandbox for a session, if any.
+
+    Reads directly through the registry's asyncpg pool because
+    PostgresRegistry doesn't expose metadata-filtered lookup — adding
+    that method would leak sandbox concepts into the shared library.
+
+    Note the two-column read: ``session_id`` + ``expires_at`` live in
+    ``metadata`` (set at ``register`` time), but ``container_name`` +
+    ``url`` live in ``result`` (set at ``set_result`` time). Both are
+    populated by the time a job's phase reaches 'running', so a session
+    lookup is safe to trust."""
+    if _registry is None:
+        return None
+    pool = _registry._pool
+    if pool is None:
+        return None
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, metadata, result "
+            "FROM jobs "
+            "WHERE metadata->>'session_id' = $1 AND phase = 'running' "
+            "ORDER BY created_at DESC LIMIT 1",
+            session_id,
+        )
+    if row is None:
+        return None
+    meta = row["metadata"]
+    if isinstance(meta, str):
+        import json
+        meta = json.loads(meta)
+    result = row["result"] or {}
+    if isinstance(result, str):
+        import json
+        result = json.loads(result)
+    return {
+        "sandbox_id": row["id"],
+        "container_name": result.get("container_name"),
+        "url": result.get("url"),
+        "expires_at": meta.get("expires_at"),
+    }
+
+
+async def _reuse_or_spawn(
     runtime: str,
     files: dict[str, str],
     entrypoint: Optional[str],
     ttl_seconds: Optional[int],
+    session_id: Optional[str],
+    deletes: list[str],
 ) -> dict:
-    """Core spawn path. Called from both POST /run and the MCP tool."""
+    """Session-aware entry point. Called from POST /run, the MCP tool,
+    and the OpenWebUI Tool Server route.
+
+    If ``session_id`` names a still-running sandbox, files are overlaid
+    onto that container's ``/app`` and the same URL is returned — the
+    dev server inside reloads itself. Otherwise this falls through to a
+    fresh spawn, stamping the session_id (generated if the caller
+    omitted one) into the job's metadata so the next call can find it."""
     if _registry is None or _spawner is None or _slot_sem is None:
         raise HTTPException(500, "runner not initialized")
+
+    # Session-reuse path — cheap, short-circuits before we touch the
+    # concurrency semaphore or the runtime validator.
+    if session_id:
+        existing = await _find_running_session(session_id)
+        if existing and existing["container_name"]:
+            alive = await asyncio.to_thread(
+                _spawner.container_exists, existing["container_name"]
+            )
+            if alive:
+                try:
+                    await asyncio.to_thread(
+                        _spawner.update_files,
+                        existing["container_name"],
+                        files,
+                        deletes,
+                    )
+                except ValueError as exc:
+                    # Path traversal etc. — surface as a 400, not a 500.
+                    raise HTTPException(400, str(exc))
+                # Bump last_used_at so the reaper's idle-TTL check sees
+                # this activity. The rest of the metadata is untouched.
+                await _registry.update_metadata(
+                    existing["sandbox_id"],
+                    {"last_used_at": _now_iso()},
+                )
+                return {
+                    "sandbox_id": existing["sandbox_id"],
+                    "session_id": session_id,
+                    "url": existing["url"],
+                    "expires_at": existing["expires_at"],
+                    "reused": True,
+                }
+            # Container is gone but the Postgres row still says "running"
+            # — normal when the reaper hasn't swept yet, or the sandbox
+            # crashed out-of-band. Mark it expired and fall through to
+            # respawn under the same session_id.
+            await _registry.set_phase(existing["sandbox_id"], "expired")
+
+    # Spawn path — either no session_id given, or the session_id had no
+    # live container. Generate one if missing so the caller always gets
+    # a stable handle back.
+    session_id = session_id or _new_session_id()
 
     try:
         rt = get_runtime(runtime)
@@ -229,6 +401,7 @@ async def _spawn_and_track(
 
     ttl = min(ttl_seconds or DEFAULT_TTL_S, HARD_TTL_S)
     expires_at = datetime.now(timezone.utc) + timedelta(seconds=ttl)
+    now_iso = _now_iso()
 
     sandbox_id = await _registry.register(
         {
@@ -236,6 +409,8 @@ async def _spawn_and_track(
             "entrypoint": entrypoint or rt.default_entrypoint,
             "ttl_seconds": ttl,
             "expires_at": expires_at.isoformat(),
+            "session_id": session_id,
+            "last_used_at": now_iso,
         },
         initial_phase="spawning",
     )
@@ -267,8 +442,10 @@ async def _spawn_and_track(
         )
         return {
             "sandbox_id": sandbox_id,
+            "session_id": session_id,
             "url": url,
             "expires_at": expires_at.isoformat(),
+            "reused": False,
         }
     except HTTPException:
         _slot_sem.release()
@@ -281,12 +458,42 @@ async def _spawn_and_track(
     # the reaper (or DELETE /jobs/{id}) tears the sandbox down.
 
 
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
 @app.post("/run", response_model=RunResponse)
 async def run(req: RunRequest) -> RunResponse:
-    result = await _spawn_and_track(
-        req.runtime, req.files, req.entrypoint, req.ttl_seconds
+    result = await _reuse_or_spawn(
+        req.runtime,
+        req.files,
+        req.entrypoint,
+        req.ttl_seconds,
+        req.session_id,
+        req.deletes,
     )
     return RunResponse(**result)
+
+
+@app.delete("/session/{session_id}", status_code=204)
+async def delete_session(session_id: str) -> None:
+    """Explicitly tear down a session's running sandbox. Idempotent —
+    a session that never existed or has already expired still returns
+    204 so the model doesn't have to remember state to clean up."""
+    if not _SESSION_ID_RE.match(session_id):
+        raise HTTPException(400, "invalid session_id")
+    if _registry is None or _spawner is None or _slot_sem is None:
+        raise HTTPException(500, "runner not initialized")
+    existing = await _find_running_session(session_id)
+    if existing is None:
+        return
+    if existing["container_name"]:
+        await asyncio.to_thread(
+            _spawner.stop, existing["container_name"]
+        )
+    await _registry.set_phase(existing["sandbox_id"], "closed")
+    # The slot was held for the running sandbox — give it back.
+    _slot_sem.release()
 
 
 # Jobs GET routes are mounted from lifespan(). DELETE lives here so it can
@@ -362,7 +569,12 @@ class ToolPreviewAppRequest(BaseModel):
         )
     )
     files: dict[str, str] = Field(
-        description="Map of relative path → file contents.",
+        default_factory=dict,
+        description=(
+            "Map of relative path → file contents. On a follow-up call "
+            "with the same session_id, only send the file(s) that "
+            "changed — the rest are preserved."
+        ),
     )
     entrypoint: Optional[str] = Field(
         default=None,
@@ -378,9 +590,23 @@ class ToolPreviewAppRequest(BaseModel):
             "SANDBOX_HARD_TTL_SECONDS."
         ),
     )
+    session_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Reuse the URL from a previous preview_app call. Omit on "
+            "first call. Pass the value from the previous response to "
+            "update files in place (dev server hot-reloads)."
+        ),
+    )
+    deletes: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Relative paths under /app to remove on a follow-up call."
+        ),
+    )
 
 
-def _render_tool_html(url: str, sandbox_id: str) -> str:
+def _render_tool_html(url: str, sandbox_id: str, session_id: str) -> str:
     """Wrap the sandbox iframe in a full HTML document.
 
     Compared to just ``<iframe src="…">``, this:
@@ -408,6 +634,7 @@ def _render_tool_html(url: str, sandbox_id: str) -> str:
       referrerpolicy="no-referrer"></iframe>
   <p style="padding:8px 12px;margin:0;font-size:12px;opacity:0.75">
     Sandbox <code>{sandbox_id}</code> &middot;
+    Session <code>{session_id}</code> &middot;
     <a href="{url}" target="_top" style="color:#8ab4f8">Open in new tab</a>
   </p>
 </body>
@@ -431,11 +658,23 @@ def _render_tool_html(url: str, sandbox_id: str) -> str:
     ),
 )
 async def tool_preview_app(req: ToolPreviewAppRequest) -> HTMLResponse:
-    result = await _spawn_and_track(
-        req.runtime, req.files, req.entrypoint, req.ttl_seconds
+    # Session-id validation runs at the pydantic layer for RunRequest but
+    # ToolPreviewAppRequest doesn't share that validator — reject invalid
+    # ids here so path-injection attempts don't leak through this route.
+    if req.session_id and not _SESSION_ID_RE.match(req.session_id):
+        raise HTTPException(400, "invalid session_id")
+    result = await _reuse_or_spawn(
+        req.runtime,
+        req.files,
+        req.entrypoint,
+        req.ttl_seconds,
+        req.session_id,
+        req.deletes,
     )
     return HTMLResponse(
-        content=_render_tool_html(result["url"], result["sandbox_id"]),
+        content=_render_tool_html(
+            result["url"], result["sandbox_id"], result["session_id"]
+        ),
         headers={
             "Content-Disposition": "inline",
             # Re-declared here even though CORSMiddleware sets it — some

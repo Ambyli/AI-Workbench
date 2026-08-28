@@ -86,7 +86,7 @@ services:
     ports:
       - "${PORT_SANDBOX_PROXY:-8011}:80"
     volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./proxies/Caddyfile:/etc/caddy/Caddyfile:ro
       - sandbox_proxy_data:/data
       - sandbox_proxy_config:/config
     networks:
@@ -109,13 +109,13 @@ services:
     # Built locally — see Dockerfile.sandbox-egress for why we don't use
     # dannydirect/tinyproxy anymore.
     build:
-      context: ..
-      dockerfile: sandbox/Dockerfile.sandbox-egress
+      context: ../..
+      dockerfile: ai/sandbox/proxies/egress.Dockerfile
     container_name: sandbox-egress
     restart: unless-stopped
     volumes:
-      - ./tinyproxy.conf:/etc/tinyproxy/tinyproxy.conf:ro
-      - ./tinyproxy.filter:/etc/tinyproxy/filter:ro
+      - ./proxies/tinyproxy.conf:/etc/tinyproxy/tinyproxy.conf:ro
+      - ./proxies/tinyproxy.filter:/etc/tinyproxy/filter:ro
     networks:
       # sandbox_net: how sandboxes reach us (internal, no default gateway).
       - sandbox_net
@@ -141,7 +141,7 @@ services:
   sandbox-runner:
     build:
       context: ../..
-      dockerfile: ai/sandbox/Dockerfile.sandbox-runner
+      dockerfile: ai/sandbox/runner/Dockerfile
     container_name: sandbox-runner
     restart: unless-stopped
     ports:
@@ -208,7 +208,7 @@ services:
     image: sandbox-static:latest
     build:
       context: ../..
-      dockerfile: ai/sandbox/Dockerfile.sandbox-static
+      dockerfile: ai/sandbox/images/static.Dockerfile
     command: ["true"]
 
   sandbox-python-image:
@@ -216,7 +216,7 @@ services:
     image: sandbox-python:latest
     build:
       context: ../..
-      dockerfile: ai/sandbox/Dockerfile.sandbox-python
+      dockerfile: ai/sandbox/images/python.Dockerfile
     command: ["true"]
 
   sandbox-node-image:
@@ -224,7 +224,7 @@ services:
     image: sandbox-node:latest
     build:
       context: ../..
-      dockerfile: ai/sandbox/Dockerfile.sandbox-node
+      dockerfile: ai/sandbox/images/node.Dockerfile
     command: ["true"]
 
 volumes:

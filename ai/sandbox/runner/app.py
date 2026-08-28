@@ -41,7 +41,7 @@ from typing import Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
 from common.jobs.postgres import PostgresRegistry
@@ -511,6 +511,75 @@ async def delete_sandbox(sandbox_id: str) -> None:
     # Give the slot back to the pool if the sandbox was still running.
     if got.phase in ("running", "starting", "spawning"):
         _slot_sem.release()
+
+
+# ── Source-code download ─────────────────────────────────────────────────
+# Streams the sandbox's /app back to the caller as a plain tar. The Docker
+# daemon does the packing (get_archive) so the runner never buffers the
+# whole archive in memory — chunks pass straight through. The Caddy route
+# /sandboxes/download/{session_id} reverse-proxies to the session variant,
+# so end users get an oauth2-proxy-authenticated download URL that matches
+# the same auth model as the preview iframe.
+def _tar_response(stream, sandbox_id: str) -> StreamingResponse:
+    return StreamingResponse(
+        stream,
+        media_type="application/x-tar",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="sandbox-{sandbox_id}.tar"'
+            ),
+        },
+    )
+
+
+@app.get("/jobs/{sandbox_id}/download")
+async def download_sandbox_job(sandbox_id: str) -> StreamingResponse:
+    """Direct download by sandbox_id. Works whether or not the sandbox
+    still has a session — useful for operator debugging. If the session
+    self-healed since the download URL was minted, this endpoint returns
+    the OLD (dead) sandbox_id's archive — the session endpoint below
+    resolves to the current running one instead."""
+    if _registry is None or _spawner is None:
+        raise HTTPException(500, "runner not initialized")
+    job = await _registry.get(sandbox_id)
+    if job is None:
+        raise HTTPException(404, f"no sandbox {sandbox_id!r}")
+    container_name = (job.result or {}).get("container_name")
+    if not container_name:
+        raise HTTPException(
+            409, f"sandbox {sandbox_id!r} has no container to download"
+        )
+    try:
+        stream = await asyncio.to_thread(
+            _spawner.export_files, container_name
+        )
+    except Exception as exc:
+        raise HTTPException(404, f"container gone: {exc}")
+    return _tar_response(stream, sandbox_id)
+
+
+@app.get("/session/{session_id}/download")
+async def download_session(session_id: str) -> StreamingResponse:
+    """Download the /app tar for whichever sandbox is currently running
+    under this session_id. Preferred entry point — this URL stays valid
+    across self-heal spawns because it resolves the session at request
+    time, not at URL-generation time."""
+    if not _SESSION_ID_RE.match(session_id):
+        raise HTTPException(400, "invalid session_id")
+    if _registry is None or _spawner is None:
+        raise HTTPException(500, "runner not initialized")
+    existing = await _find_running_session(session_id)
+    if existing is None or not existing.get("container_name"):
+        raise HTTPException(
+            404, f"no running sandbox for session {session_id!r}"
+        )
+    try:
+        stream = await asyncio.to_thread(
+            _spawner.export_files, existing["container_name"]
+        )
+    except Exception as exc:
+        raise HTTPException(404, f"container gone: {exc}")
+    return _tar_response(stream, existing["sandbox_id"])
 
 
 # ── MCP mount ─────────────────────────────────────────────────────────────

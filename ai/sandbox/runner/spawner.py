@@ -242,6 +242,20 @@ class Spawner:
         except NotFound:
             return False
 
+    def export_files(self, container_name: str):
+        """Return an iterator that yields tar-format chunks of the
+        container's ``/app`` directory. Consumers stream it straight to
+        an HTTP response — the Docker daemon does the packing.
+
+        Raises ``docker.errors.NotFound`` if the container is gone
+        (caller should surface 404). No compression here; a plain tar
+        streams incrementally, whereas gzip would need the whole
+        archive in-memory to hash. Callers who want gzip can pipe
+        through a filter downstream."""
+        container = self._client.containers.get(container_name)
+        stream, _stat = container.get_archive("/app")
+        return stream
+
     def update_files(
         self,
         container_name: str,

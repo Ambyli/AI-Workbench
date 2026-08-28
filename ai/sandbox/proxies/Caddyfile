@@ -45,6 +45,17 @@
 		respond "ok" 200
 	}
 
+	# Source-code download. Matched BEFORE the sandbox-id route so
+	# `/sandboxes/download/{session_id}` is recognized as a download
+	# request instead of getting parsed as a sandbox id. The runner
+	# owns the export (needs docker.sock), so we reverse-proxy to it;
+	# the browser gets the same oauth2-proxy auth model as previews.
+	@sandbox_download path_regexp sandbox_download ^/sandboxes/download/(?P<session>[A-Za-z0-9_-]{1,64})$
+	handle @sandbox_download {
+		rewrite * /session/{re.sandbox_download.session}/download
+		reverse_proxy sandbox-runner:8000
+	}
+
 	# Namespaced path — this is the one external browsers use via
 	# oauth2-proxy. Match FIRST so the bare /{id}/ pattern doesn't
 	# accidentally interpret "sandboxes" as an id (it wouldn't — hex

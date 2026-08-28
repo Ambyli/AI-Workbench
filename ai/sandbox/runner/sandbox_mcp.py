@@ -250,6 +250,15 @@ def build_mcp(run_callable) -> FastMCP:
         ``files={"new.html": "..."}`` AND ``deletes=["old.html"]``.
         Otherwise both files will exist in /app.
 
+        # DOWNLOADING THE SOURCE
+
+        Every response includes a ``Download source:`` line with a URL
+        that streams the sandbox's ``/app`` back as a plain tar archive.
+        If the user asks to save/download/keep/export the code, share
+        that URL — it's authenticated by the same oauth2-proxy cookie as
+        the preview iframe and stays valid across self-heal spawns
+        because it resolves the session at request time.
+
         # RELAYING THE RESULT
 
         Include the returned string VERBATIM in your response to the
@@ -303,10 +312,19 @@ def build_mcp(run_callable) -> FastMCP:
                 "file(s) you changed — do NOT re-send unchanged files. "
                 "The container keeps running and hot-reloads on file change."
             )
+        # Download URL is derived from the preview URL — the Caddy route
+        # at /sandboxes/download/{session_id} reverse-proxies to the
+        # runner's session-download endpoint. Uses session_id (not
+        # sandbox_id) so the same URL keeps working across self-heal
+        # spawns. Shape: given SANDBOX_PROXY_URL=https://host/sandboxes,
+        # download is https://host/sandboxes/download/{session_id}.
+        proxy_base = url.rsplit("/", 2)[0]
+        download_url = f"{proxy_base}/download/{session_id_out}"
         return (
             f"Preview {verb}. Sandbox `{sandbox_id}` at {url} "
             f"(expires {expires_at}).\n"
             f"Session id: {session_id_out}\n"
+            f"Download source: {download_url}\n"
             f"{hint}\n\n"
             "```html\n"
             f"{iframe}\n"

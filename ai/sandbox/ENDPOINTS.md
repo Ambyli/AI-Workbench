@@ -12,8 +12,10 @@ Everything below is served by [`ai/sandbox/runner/app.py`](app.py). Jobs endpoin
 | `GET` | `/health` | Liveness + DB status |
 | `POST` | `/run` | Spawn a sandbox — or update an existing one when `session_id` is passed. Returns JSON with URL, session_id, and `reused` flag |
 | `DELETE` | `/session/{session_id}` | Explicitly tear down a session's running sandbox. Idempotent |
+| `GET` | `/session/{session_id}/download` | Stream the running sandbox's `/app` as a tar archive. Follows self-heal (resolves session at request time). Also exposed publicly via Caddy at `/sandboxes/download/{session_id}` |
 | `GET` | `/jobs` | List every sandbox in the registry (running + terminal) |
 | `GET` | `/jobs/{sandbox_id}` | One sandbox's snapshot |
+| `GET` | `/jobs/{sandbox_id}/download` | Direct tar download by internal id. Useful for operators; does not follow self-heal |
 | `DELETE` | `/jobs/{sandbox_id}` | Tear a sandbox down early by internal id, release its slot |
 | `POST` | `/mcp/` | FastMCP JSON-RPC endpoint — see [MCP section](#mcp) |
 | `GET` | `/tool/openapi.json` | OpenAPI schema for OpenWebUI's Tool Server discovery |
@@ -190,6 +192,56 @@ curl -X DELETE http://localhost:8012/session/bfdYm3_H5SD4
 | `500` | Runner not initialized (should not normally occur). |
 
 Distinct from `DELETE /jobs/{sandbox_id}` — the jobs endpoint targets a single spawn event by its 12-char internal id, while `/session/{id}` targets whatever's currently running under the persistent session handle (may have been respawned via self-heal since the model last saw it).
+
+---
+
+## `GET /session/{session_id}/download`
+
+Stream the running sandbox's `/app` directory back to the caller as a plain tar archive. The Docker daemon does the packing (via `container.get_archive`) so the runner never buffers the whole archive in memory — chunks pass through as they arrive.
+
+Session-based, so this URL keeps working across self-heal spawns. If the session's original container was reaped between the download URL being minted and the request landing, the endpoint resolves the current running sandbox_id at request time and downloads THAT.
+
+**Request:**
+```bash
+curl -o my-sandbox.tar http://localhost:8012/session/bfdYm3_H5SD4/download
+```
+
+**Response headers:**
+```
+HTTP/1.1 200 OK
+content-type: application/x-tar
+content-disposition: attachment; filename="sandbox-a1b2c3d4e5f6.tar"
+transfer-encoding: chunked
+```
+
+**Response body:** raw tar stream. Extract with `tar -xf sandbox-*.tar` — the archive root is `app/`, so files land at `./app/index.html`, etc.
+
+**Errors:**
+
+| Status | Meaning |
+|---|---|
+| `400` | `session_id` doesn't match `^[A-Za-z0-9_-]{1,64}$`. |
+| `404` | No running sandbox for that session — either it never existed, or it's been reaped and hasn't self-healed. |
+
+**Public URL for end users.** The Caddy proxy exposes this at `${SANDBOX_PROXY_URL}/download/{session_id}` (e.g. `https://chat.zeoenergy.com/sandboxes/download/bfdYm3_H5SD4`) via a dedicated route in `ai/sandbox/proxies/Caddyfile`. The browser gets the same oauth2-proxy auth flow as the preview iframe — no separate credentials, no CORS surprise. `preview_app` includes this URL as a `Download source:` line in its response so the model can share it whenever a user asks to save the code.
+
+---
+
+## `GET /jobs/{sandbox_id}/download`
+
+Direct download by internal sandbox_id — bypasses session resolution. Useful for operators who want to grab the archive from a specific spawn event even if the session self-healed to a different container since. Same tar shape as the session variant.
+
+**Request:**
+```bash
+curl -o my-sandbox.tar http://localhost:8012/jobs/a1b2c3d4e5f6/download
+```
+
+**Errors:**
+
+| Status | Meaning |
+|---|---|
+| `404` | No sandbox with that id. |
+| `409` | Sandbox exists in the registry but never reached the `running` phase (no container yet, or it was reaped). |
 
 ---
 

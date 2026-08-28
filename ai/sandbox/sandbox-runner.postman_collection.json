@@ -224,6 +224,20 @@
       "response": []
     },
     {
+      "name": "GET /session/{sandboxSessionId}/download",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{litellm}}/v1/sandbox/session/{{sandboxSessionId}}/download",
+          "host": ["{{litellm}}"],
+          "path": ["v1", "sandbox", "session", "{{sandboxSessionId}}", "download"]
+        },
+        "description": "Stream the running sandbox's /app back as a tar archive (Content-Type: application/x-tar, Content-Disposition: attachment). Docker daemon does the packing (container.get_archive) so nothing buffers in the runner. Session-based, so this URL keeps working across self-heal spawns — resolves session_id → current container at request time.\n\nAlso exposed publicly via the sandbox-proxy Caddy route at ${SANDBOX_PROXY_URL}/download/{sandboxSessionId} (e.g. https://chat.zeoenergy.com/sandboxes/download/…) so browsers can download the archive with the same oauth2-proxy auth as the preview iframe. preview_app's response text includes this URL on the 'Download source:' line — models share it verbatim when a user asks to save the code.\n\nErrors: 400 if session_id fails `^[A-Za-z0-9_-]{1,64}$`, 404 if there's no running sandbox for this session (never existed, or reaped without self-heal).\n\nPostman note: click 'Send and Download' to save the response as a file. The tar root is `app/`, so `tar -xf sandbox-*.tar` extracts to `./app/`."
+      },
+      "response": []
+    },
+    {
       "name": "GET /jobs",
       "request": {
         "method": "GET",
@@ -248,6 +262,20 @@
           "path": ["v1", "sandbox", "jobs", "{{sandboxId}}"]
         },
         "description": "Snapshot of one sandbox. 404 if unknown. Set the sandboxId collection variable to the id returned by POST /run first."
+      },
+      "response": []
+    },
+    {
+      "name": "GET /jobs/{sandboxId}/download",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{litellm}}/v1/sandbox/jobs/{{sandboxId}}/download",
+          "host": ["{{litellm}}"],
+          "path": ["v1", "sandbox", "jobs", "{{sandboxId}}", "download"]
+        },
+        "description": "Direct download by internal sandbox_id — bypasses session resolution. Useful for operators who want to grab the archive from a SPECIFIC spawn event even if the session self-healed to a different container since. Same tar shape as the session variant. Prefer /session/{id}/download for end-user download links because that URL keeps working across self-heal.\n\nErrors: 404 if no sandbox with that id, 409 if the sandbox exists in the registry but never reached the `running` phase (no container to export)."
       },
       "response": []
     },

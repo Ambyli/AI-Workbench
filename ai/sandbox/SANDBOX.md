@@ -312,6 +312,14 @@ If the session's container has already been reaped when the model calls back (id
 
 Explicit close: `DELETE /session/{session_id}` tears the container down and returns 204 whether or not the session existed. Useful in tests; models rarely need it because the idle-TTL sweeps handle silent chats.
 
+### Downloading source
+
+Every `preview_app` response includes a `Download source:` URL of the form `${SANDBOX_PROXY_URL}/download/{session_id}` (e.g. `https://chat.zeoenergy.com/sandboxes/download/{session_id}`). When a user asks to save, keep, or export the code, the model just shares that URL — the browser downloads a plain tar of the container's `/app` directory, streamed straight from the Docker daemon (no in-memory buffering in the runner).
+
+Auth is oauth2-proxy — same session cookie as the preview iframe — so users don't get a second login prompt. The URL is session-based, so it stays valid across self-heal spawns (resolves session_id → currently-running sandbox_id at request time). Under the hood: the Caddy route in [`proxies/Caddyfile`](proxies/Caddyfile) reverse-proxies `/sandboxes/download/{session_id}` to sandbox-runner's `/session/{session_id}/download` endpoint; the runner calls `Spawner.export_files` which wraps Docker SDK's `container.get_archive("/app")`. There's also a `/jobs/{sandbox_id}/download` variant for operator direct-download by internal id.
+
+Archive shape: `sandbox-{sandbox_id}.tar` with `app/` at the root. Extract with `tar -xf sandbox-*.tar` (Windows 10+ ships `tar` in cmd; every Unix has it).
+
 ### Auditing what a sandbox did
 
 The runner writes to a CSV audit log at `/data/audit.log` inside `sandbox-runner`. Every `/run` and `/mcp preview_app` call is recorded with the runtime, file-name hashes, entrypoint, and returned sandbox_id.

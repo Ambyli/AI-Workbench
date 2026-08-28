@@ -126,8 +126,12 @@ services:
     # 400 for a non-proxy request, and busybox wget treats that as an
     # error. Netcat is present in the busybox binary and gives us a
     # portable "port is open" probe.
+    # Use 127.0.0.1 explicitly — this Alpine base resolves `localhost`
+    # to `::1` (IPv6) and tinyproxy binds IPv4 only, so `nc -z localhost`
+    # dials the wrong stack and reports the container unhealthy while
+    # tinyproxy is actually listening. IPv4 literal skips resolution.
     healthcheck:
-      test: ["CMD-SHELL", "nc -z localhost 8888"]
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 8888"]
       interval: 30s
       timeout: 5s
       retries: 3

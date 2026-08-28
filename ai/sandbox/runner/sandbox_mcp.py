@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import html
 import json
+import secrets
 from typing import Optional
 
 from fastmcp import FastMCP
@@ -66,11 +67,24 @@ def render_preview_html(url: str, sandbox_id: str, session_id: str) -> str:
     update as a distinct artifact and re-opens the split panel if the
     user closed it between turns. Without the nonce, follow-up updates
     with the same URL would produce identical HTML and OpenWebUI would
-    treat them as the *same* artifact — panel wouldn't re-open."""
-    safe_url_attr = html.escape(url, quote=True)
+    treat them as the *same* artifact — panel wouldn't re-open.
+
+    A separate cache-busting nonce goes into the navigation URL's query
+    string. Sandbox_id stays constant across in-place updates, so a
+    byte-identical URL would let the browser serve the previous
+    document from its cache (or the artifact iframe's bfcache) — even
+    with ``Cache-Control: no-store`` set by Caddy, some browsers still
+    reuse a prior document when navigating to the exact same URL.
+    Salting ``?v={hex}`` per response forces a fresh navigation every
+    time. The sandbox app doesn't care about the query string; nginx,
+    Streamlit, Vite, and Express all ignore unknown query params."""
+    cache_bust = secrets.token_hex(4)
+    sep = "&" if "?" in url else "?"
+    nav_url = f"{url}{sep}v={cache_bust}"
+    safe_url_attr = html.escape(nav_url, quote=True)
     safe_sandbox = html.escape(sandbox_id)
     safe_session = html.escape(session_id)
-    js_url = json.dumps(url)
+    js_url = json.dumps(nav_url)
     return (
         f"<!-- preview session={safe_session} sandbox={safe_sandbox} -->\n"
         "<!doctype html>\n"

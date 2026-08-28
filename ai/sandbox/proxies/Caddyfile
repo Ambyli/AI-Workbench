@@ -32,11 +32,22 @@
 	admin off
 }
 
-# Shared reverse-proxy snippet — headers that let OpenWebUI iframe us.
+# Shared reverse-proxy snippet — headers that let OpenWebUI iframe us
+# AND force fresh fetches on every navigation. Sandbox contents change
+# on every model call (put_archive rewrites /app), so any browser or
+# intermediate cache serving a stale response makes hot-reload look
+# broken. Cache-Control: no-store beats every layer of HTTP caching;
+# clearing ETag/Last-Modified prevents conditional revalidation from
+# short-circuiting to 304 Not Modified with the stale body.
 (sandbox_headers) {
 	header_down -X-Frame-Options
 	header_down -Content-Security-Policy
 	header_down Content-Security-Policy "frame-ancestors *"
+	header_down Cache-Control "no-store, no-cache, must-revalidate, max-age=0"
+	header_down Pragma "no-cache"
+	header_down Expires "0"
+	header_down -ETag
+	header_down -Last-Modified
 }
 
 :80 {

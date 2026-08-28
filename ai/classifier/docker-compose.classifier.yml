@@ -1,0 +1,30 @@
+networks:
+  shared:
+    external: true
+    name: ai_shared
+
+services:
+  classifier:
+    networks:
+      - shared
+    build:
+      context: ../..
+      dockerfile: ai/classifier/Dockerfile
+    container_name: classifier
+    restart: unless-stopped
+    ports:
+      - "${PORT_CLASSIFIER}:8000"
+    environment:
+      - VLLM_QWEN_VL_API=http://vllm-qwen-vl:8000/v1/chat/completions
+      - LOG_LEVEL=INFO
+    volumes:
+      - classifier_data:/data
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+volumes:
+  classifier_data:

@@ -1,6 +1,6 @@
-# Build context is the REPO ROOT (see ai/docker-compose.classifier.yml:
-#   context: ..) so we can copy the shared workspace package alongside the
-# service. Same pattern as ai/Dockerfile.interceptor and ai/Dockerfile.roofix.
+# Build context is the REPO ROOT (see ai/classifier/docker-compose.classifier.yml:
+#   context: ../..) so we can copy the shared workspace package alongside the
+# service. Same pattern as ai/interceptor/Dockerfile.interceptor and ai/roofix/Dockerfile.roofix.
 
 FROM python:3.11-slim
 

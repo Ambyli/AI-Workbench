@@ -1,0 +1,111 @@
+networks:
+  shared:
+    external: true
+    name: ai_shared
+
+services:
+  openwebui:
+    # Pinned release tag. Bump this line and run `make build openwebui` to
+    # update. Use `:main` for the rolling upstream tag.
+    image: ghcr.io/open-webui/open-webui:v0.11.1
+    networks:
+      - shared
+    container_name: openwebui
+    restart: unless-stopped
+    ports:
+      # Bound to 127.0.0.1 (host-loopback) ONLY — NOT 0.0.0.0.
+      #
+      # Trusted-header SSO (WEBUI_AUTH_TRUSTED_EMAIL_HEADER below) makes any
+      # request carrying X-Forwarded-Email auto-log-in as that user. If the
+      # port were published on all interfaces, anyone on the LAN could send
+      # `X-Forwarded-Email: admin@zeoenergy.com` directly to :8007 and land
+      # in that account with no Google prompt at all.
+      #
+      # External access still works: cloudflared → oauth2-proxy → openwebui
+      # all happen over the ai_shared Docker network, none of which uses
+      # this host publish. Only direct-from-host debugging (curl on the
+      # server itself, or a local browser hitting http://localhost:8007)
+      # goes through the loopback binding.
+      #
+      # If you re-open this to 0.0.0.0, you MUST also blank out
+      # OPENWEBUI_WEBUI_AUTH_TRUSTED_EMAIL_HEADER / _NAME_HEADER in .env,
+      # or every LAN device becomes an admin account creator.
+      - "127.0.0.1:${PORT_OPENWEBUI}:8080"
+    environment:
+      # All values are sourced from .env — edit there, not here.
+      OPENAI_API_BASE_URL: "${OPENWEBUI_OPENAI_API_BASE_URL}"
+      OPENAI_API_KEY: "${OPENWEBUI_OPENAI_API_KEY}"
+      ENABLE_OLLAMA_API: "${OPENWEBUI_ENABLE_OLLAMA_API}"
+      WEBUI_SECRET_KEY: "${OPENWEBUI_SECRET_KEY}"
+      WEBUI_URL: "${OPENWEBUI_WEBUI_URL}"
+      ENABLE_SIGNUP: "${OPENWEBUI_ENABLE_SIGNUP}"
+      DEFAULT_USER_ROLE: "${OPENWEBUI_DEFAULT_USER_ROLE}"
+      CORS_ALLOW_ORIGIN: "${CORS_ALLOW_ORIGIN}"
+      HF_TOKEN: "${HF_TOKEN}"
+
+      # OAuth — Google sign-in. Credentials must be issued in Google Cloud
+      # Console; the redirect URI registered there must be
+      # ${OPENWEBUI_WEBUI_URL}/oauth/google/callback
+      ENABLE_OAUTH_SIGNUP: "${OPENWEBUI_ENABLE_OAUTH_SIGNUP}"
+      OAUTH_MERGE_ACCOUNTS_BY_EMAIL: "${OPENWEBUI_OAUTH_MERGE_ACCOUNTS_BY_EMAIL}"
+      GOOGLE_CLIENT_ID: "${OPENWEBUI_GOOGLE_CLIENT_ID}"
+      GOOGLE_CLIENT_SECRET: "${OPENWEBUI_GOOGLE_CLIENT_SECRET}"
+      OPENID_PROVIDER_URL: "${OPENWEBUI_OPENID_PROVIDER_URL}"
+
+      # Trusted-header SSO from oauth2-proxy. When set, requests carrying
+      # WEBUI_AUTH_TRUSTED_EMAIL_HEADER are auto-authenticated as that
+      # email — first hit creates an account, subsequent hits sign in.
+      # oauth2-proxy sets X-Forwarded-Email / X-Forwarded-User because
+      # OAUTH2_PROXY_PASS_USER_HEADERS=true in .env. Together they turn
+      # the double-login (Google → Google-again-inside-OpenWebUI) into a
+      # single Google-only login.
+      #
+      # SECURITY: OpenWebUI must NOT be reachable except via oauth2-proxy.
+      # Anyone who can hit openwebui:8080 directly can spoof this header.
+      # See ai/openwebui/OPENWEBUI.md § Trusted-header SSO.
+      WEBUI_AUTH_TRUSTED_EMAIL_HEADER: "${OPENWEBUI_WEBUI_AUTH_TRUSTED_EMAIL_HEADER}"
+      WEBUI_AUTH_TRUSTED_NAME_HEADER: "${OPENWEBUI_WEBUI_AUTH_TRUSTED_NAME_HEADER}"
+
+      # Post-signout redirect. Without this, "Log out" only clears the
+      # OpenWebUI cookie — the next page load carries the still-valid
+      # oauth2-proxy cookie, X-Forwarded-Email gets re-added, and
+      # trusted-header auth immediately signs the user back in. Setting
+      # this to oauth2-proxy's /oauth2/sign_out endpoint chains the
+      # logouts: OpenWebUI clears its session, then oauth2-proxy clears
+      # its cookie, then the browser lands back on / with no valid
+      # session anywhere and the user sees the Google sign-in page.
+      #
+      # Note: this does NOT sign the user out of Google itself — that
+      # would be too invasive (kicks them out of Gmail, Docs, etc). If
+      # they still have an active Google session, clicking "sign in"
+      # will Google-SSO them straight back in without a password prompt.
+      # This is the expected behavior for a Workspace-gated app.
+      WEBUI_AUTH_SIGNOUT_REDIRECT_URL: "${OPENWEBUI_WEBUI_AUTH_SIGNOUT_REDIRECT_URL}"
+
+      # User-Agent for langchain_community outbound HTTP (RAG / web loaders).
+      USER_AGENT: "${OPENWEBUI_USER_AGENT}"
+
+      # MCP handshake timeout (seconds). Raise if a registered MCP server
+      # cold-starts slowly.
+      MCP_INITIALIZE_TIMEOUT: "${OPENWEBUI_MCP_INITIALIZE_TIMEOUT}"
+
+      # Web search — backed by the searxng container on ai_shared. Only read
+      # on the first boot of a fresh openwebui_data volume; on an existing
+      # install, toggle via Admin Panel → Settings → Web Search. See
+      # ai/searxng/SEARXNG.md.
+      ENABLE_WEB_SEARCH: "${OPENWEBUI_ENABLE_WEB_SEARCH}"
+      WEB_SEARCH_ENGINE: "${OPENWEBUI_WEB_SEARCH_ENGINE}"
+      SEARXNG_QUERY_URL: "${OPENWEBUI_SEARXNG_QUERY_URL}"
+      WEB_SEARCH_RESULT_COUNT: "${OPENWEBUI_WEB_SEARCH_RESULT_COUNT}"
+      WEB_SEARCH_CONCURRENT_REQUESTS: "${OPENWEBUI_WEB_SEARCH_CONCURRENT_REQUESTS}"
+    volumes:
+      - openwebui_data:/app/backend/data
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/health')\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  openwebui_data:

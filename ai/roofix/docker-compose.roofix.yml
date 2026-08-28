@@ -1,0 +1,97 @@
+networks:
+  shared:
+    external: true
+    name: ai_shared
+
+services:
+  # Postgres backing the bridge's ProcessedStore (dedup / audit for consumed
+  # Gmail events). Exposed on the host at PORT_ROOFIX_DB (default 5433 — sits
+  # one past litellm_db's 5432 in the PORT REGISTRY in .env) so operators can
+  # query it remotely — psql, DBeaver, dashboards. See ROOFIX.md
+  # § "Connecting to the processed-store DB".
+  roofix-db:
+    image: postgres:16-alpine
+    container_name: roofix-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${ROOFIX_DB_USER:-roofix}
+      POSTGRES_PASSWORD: ${ROOFIX_DB_PASSWORD:-roofix}
+      POSTGRES_DB: ${ROOFIX_DB_NAME:-roofix}
+    volumes:
+      - roofix_db:/var/lib/postgresql/data
+    ports:
+      - "${PORT_ROOFIX_DB:-5433}:5432"
+    networks:
+      - shared
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${ROOFIX_DB_USER:-roofix}"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  roofix:
+    networks:
+      - shared
+    depends_on:
+      roofix-db:
+        condition: service_healthy
+    build:
+      context: ../..
+      dockerfile: ai/roofix/Dockerfile.roofix
+    container_name: roofix
+    restart: unless-stopped
+    environment:
+      # When true, setup_logging drops the console handler to DEBUG so
+      # scheduled ticks and audit rows show up in `docker logs roofix`.
+      # False keeps the console at WARNING (production noise floor).
+      - DEBUG_LOGGING=${DEBUG_LOGGING:-false}
+      - DRY_RUN=${DRY_RUN:-true}
+      - AGENT_PHASE=${AGENT_PHASE:-0}
+      - TICK_INTERVAL_SECONDS=${TICK_INTERVAL_SECONDS:-300}
+      - ROOFIX_LLM_URL=${ROOFIX_LLM_URL:-http://litellm:4000}
+      - ROOFIX_LLM_API_KEY=${ROOFIX_LLM_API_KEY:-}
+      - BRAIN_MODEL=${BRAIN_MODEL:-qwen3.6}
+      - ROOFIX_SENDER=${ROOFIX_SENDER:-no-reply@roofix.io}
+      # Gmail label the bridge stamps on every email it has evaluated,
+      # excluded from LISTENER_QUERY server-side so processed emails don't
+      # fill the 25-message fetch window on subsequent ticks.
+      - ROOFIX_PROCESSED_LABEL=${ROOFIX_PROCESSED_LABEL:-roofix/processed}
+      - LISTENER_QUERY=${LISTENER_QUERY:-}
+      # Comma-separated recipient list for forwarded escalations. Empty disables.
+      - ESCALATION_RECIPIENTS=${ESCALATION_RECIPIENTS:-}
+      # ProcessedStore Postgres (see roofix-db service above)
+      - ROOFIX_DB_HOST=roofix-db
+      - ROOFIX_DB_PORT=5432
+      - ROOFIX_DB_USER=${ROOFIX_DB_USER:-roofix}
+      - ROOFIX_DB_PASSWORD=${ROOFIX_DB_PASSWORD:-roofix}
+      - ROOFIX_DB_NAME=${ROOFIX_DB_NAME:-roofix}
+      # Gmail OAuth — credentials.json + token.json live on a mounted config volume.
+      - GMAIL_CREDENTIALS_PATH=/config/credentials.json
+      - GMAIL_TOKEN_PATH=/config/token.json
+      # Phoenix DB — direct psycopg2 access (Phoenix MCP writes not ready yet).
+      - PHOENIX_DB_HOST=${PHOENIX_DB_HOST}
+      - PHOENIX_DB_PORT=${PHOENIX_DB_PORT:-5432}
+      - PHOENIX_DB_NAME=${PHOENIX_DB_NAME}
+      - PHOENIX_DB_USER=${PHOENIX_DB_USER}
+      - PHOENIX_DB_PASSWORD=${PHOENIX_DB_PASSWORD}
+      - PHOENIX_DB_SSLMODE=${PHOENIX_DB_SSLMODE:-require}
+      - PHOENIX_AGENT_USER_ID=${PHOENIX_AGENT_USER_ID}
+      - PHOENIX_ROOFIX_ID_COLUMN=${PHOENIX_ROOFIX_ID_COLUMN:-migration_external_id}
+      # Chrome-under-CDP for proposal fetches now lives in ai/interceptor.
+      # Start that compose file separately: `docker compose -f ai/interceptor/docker-compose.interceptor.yml up -d`
+      - INTERCEPTOR_URL=${INTERCEPTOR_URL:-http://interceptor:8080}
+      - LOG_DIR=/data
+    volumes:
+      - roofix_data:/data
+      # Read-only mount for OAuth secrets — bind to a host dir you control.
+      # Populate it once with credentials.json + token.json before first run.
+      - ${ROOFIX_BRIDGE_CONFIG_DIR:-./config}:/config
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+volumes:
+  roofix_data:
+  roofix_db:

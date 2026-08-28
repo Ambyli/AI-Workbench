@@ -158,7 +158,7 @@ def start_browser(
         # ever deployed there and profiles need to move between machines,
         # "--use-mock-keychain" is the corresponding flag to add here.
         # Ignored on Windows, which uses DPAPI regardless (see
-        # ai/INTERCEPTOR.md § the DPAPI note for that platform's caveat).
+        # ai/interceptor/INTERCEPTOR.md § the DPAPI note for that platform's caveat).
         "--password-store=basic",
     ]
 

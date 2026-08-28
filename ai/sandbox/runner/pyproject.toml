@@ -1,0 +1,21 @@
+[project]
+name = "sandbox"
+version = "0.1.0"
+description = "Sandbox runner — spawns short-lived containers running model-generated apps, exposes them to OpenWebUI via sandbox-proxy iframe URLs"
+requires-python = ">=3.11"
+dependencies = [
+    "common",
+    "fastapi",
+    "uvicorn",
+    "pydantic",
+    "docker>=7.0",
+    "asyncpg>=0.29",
+    # Depend on fastmcp-slim[server] explicitly, not the "fastmcp" meta-
+    # package. fastmcp 3.x is a thin wrapper that pulls in
+    # fastmcp-slim[client, server], but the [server] extra can silently
+    # get dropped during resolution, which surfaces at runtime as
+    # ImportError: "FastMCP server support is not installed" the moment
+    # sandbox-runner tries to construct FastMCP(). Asking for the extra
+    # directly removes the middle layer where the extra can be lost.
+    "fastmcp-slim[server]>=3.0",
+]

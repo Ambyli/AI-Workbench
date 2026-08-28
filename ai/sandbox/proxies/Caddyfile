@@ -1,0 +1,72 @@
+# sandbox-proxy — ingress reverse proxy for the sandbox subsystem.
+#
+# Routes two path shapes into the same backends:
+#
+#   /{sandbox_id}/*             — "bare" prefix, used by the host publish
+#                                 (http://localhost:8011/{id}/) for
+#                                 operator-local smoke tests.
+#
+#   /sandboxes/{sandbox_id}/*   — "namespaced" prefix. This is what
+#                                 external browsers reach through the
+#                                 cloudflared → oauth2-proxy → sandbox-proxy
+#                                 hop. oauth2-proxy is configured with
+#                                 http://sandbox-proxy:80/sandboxes/ in
+#                                 OAUTH2_PROXY_UPSTREAMS, so requests to
+#                                 chat.zeoenergy.com/sandboxes/{id}/…
+#                                 arrive here with the same path prefix.
+#
+# In both cases we strip the matched prefix before forwarding to
+# sandbox-{id}:80 so the sandbox app (Streamlit, Vite, nginx, …) always
+# sees requests at "/" and doesn't need to know about a base path.
+#
+# WebSocket upgrades work by default; Streamlit and Vite HMR rely on this.
+#
+# The header manipulation below is what lets OpenWebUI iframe the served
+# page. Sites that ship X-Frame-Options: DENY or a restrictive CSP would
+# otherwise refuse to render in the chat panel.
+
+{
+	# Silence the automatic HTTPS attempt — we're plain HTTP behind the
+	# openwebui iframe, and the admin API is not exposed to sandbox_net.
+	auto_https off
+	admin off
+}
+
+# Shared reverse-proxy snippet — headers that let OpenWebUI iframe us.
+(sandbox_headers) {
+	header_down -X-Frame-Options
+	header_down -Content-Security-Policy
+	header_down Content-Security-Policy "frame-ancestors *"
+}
+
+:80 {
+	# Health probe target for the compose healthcheck.
+	handle /health {
+		respond "ok" 200
+	}
+
+	# Namespaced path — this is the one external browsers use via
+	# oauth2-proxy. Match FIRST so the bare /{id}/ pattern doesn't
+	# accidentally interpret "sandboxes" as an id (it wouldn't — hex
+	# won't match — but explicit ordering removes any doubt).
+	@sandbox_ns path_regexp sandbox_ns ^/sandboxes/(?P<id>[a-f0-9]{12})(/.*)?$
+	handle @sandbox_ns {
+		uri strip_prefix /sandboxes/{re.sandbox_ns.id}
+		reverse_proxy sandbox-{re.sandbox_ns.id}:80 {
+			import sandbox_headers
+		}
+	}
+
+	# Bare path — kept so `curl http://localhost:8011/{id}/` still
+	# works for host-side debugging without going through oauth2-proxy.
+	@sandbox path_regexp sandbox ^/(?P<id>[a-f0-9]{12})(/.*)?$
+	handle @sandbox {
+		uri strip_prefix /{re.sandbox.id}
+		reverse_proxy sandbox-{re.sandbox.id}:80 {
+			import sandbox_headers
+		}
+	}
+
+	# Anything else — no sandbox matched. Do NOT act as an open proxy.
+	respond "sandbox not found" 404
+}

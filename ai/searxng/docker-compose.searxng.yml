@@ -1,0 +1,59 @@
+networks:
+  shared:
+    external: true
+    name: ai_shared
+
+services:
+  searxng:
+    # Pinned release tag. Bump this line and run `make build searxng` to
+    # update. Use `:latest` for the rolling upstream tag.
+    image: docker.io/searxng/searxng:latest
+    networks:
+      - shared
+    container_name: searxng
+    restart: unless-stopped
+    ports:
+      - "${PORT_SEARXNG}:8080"
+    environment:
+      # Read at boot by the entrypoint wrapper below and sed-substituted into
+      # the `${SEARXNG_SECRET}` placeholder in settings.yml.
+      # Generate with `openssl rand -hex 32` and set in .env.
+      SEARXNG_SECRET: "${SEARXNG_SECRET}"
+      SEARXNG_BASE_URL: "http://localhost:${PORT_SEARXNG}/"
+    volumes:
+      # Config files (settings.yml, optional limiter.toml) live in this dir
+      # and are bind-mounted so edits don't require a rebuild.
+      - ./:/etc/searxng:rw
+    # Wrapper: substitute $SEARXNG_SECRET into a writable copy of settings.yml
+    # under /tmp, point both __SEARXNG_SETTINGS_PATH (internal env used by the
+    # image's entrypoint + Python app) and SEARXNG_SETTINGS_PATH (historical
+    # alias) at it, then hand off to the image's default entrypoint. Keeps
+    # the on-disk settings.yml secret-free so it can stay tracked in git.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        if [ -z "$$SEARXNG_SECRET" ]; then
+          echo "ERROR: SEARXNG_SECRET is not set — refusing to boot with an unresolved placeholder. Generate one with 'openssl rand -hex 32' and set it in .env." >&2
+          exit 1
+        fi
+        sed "s|\$${SEARXNG_SECRET}|$$SEARXNG_SECRET|g" /etc/searxng/settings.yml > /tmp/searxng-settings.yml
+        # SearXNG looks for limiter.toml next to settings.yml, so mirror ours
+        # from the bind mount into /tmp alongside the substituted settings.
+        [ -f /etc/searxng/limiter.toml ] && cp /etc/searxng/limiter.toml /tmp/limiter.toml
+        export __SEARXNG_SETTINGS_PATH=/tmp/searxng-settings.yml
+        export SEARXNG_SETTINGS_PATH=/tmp/searxng-settings.yml
+        exec /usr/local/searxng/entrypoint.sh
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz')\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s

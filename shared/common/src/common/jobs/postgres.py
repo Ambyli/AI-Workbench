@@ -11,7 +11,7 @@ right shape for services that:
 * want ``metadata``/``result`` to be queryable as JSON (``JSONB``, not
   ``TEXT``), so operators can grep the job table from ``psql``,
 * need the state store to sit in its own network segment for isolation
-  (the sandbox subsystem does this — see ``ai/SANDBOX.md``).
+  (the sandbox subsystem does this — see ``ai/sandbox/SANDBOX.md``).
 
 The public interface matches ``SqliteRegistry`` exactly, so
 ``common.jobs.router.build_router`` mounts it with no changes.

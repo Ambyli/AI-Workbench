@@ -52,7 +52,7 @@ from common.jobs.router import build_router
 # PyPI package that FastMCP itself imports internally (from mcp.types
 # import ...) — that manifests as a confusing "FastMCP server support
 # is not installed" ImportError at startup.
-from sandbox_mcp import build_mcp, _IFRAME_HEIGHT_CSS
+from sandbox_mcp import build_mcp, render_preview_html
 from reaper import Reaper
 from runtimes import RUNTIMES, get_runtime
 from spawner import Spawner
@@ -606,41 +606,6 @@ class ToolPreviewAppRequest(BaseModel):
     )
 
 
-def _render_tool_html(url: str, sandbox_id: str, session_id: str) -> str:
-    """Wrap the sandbox iframe in a full HTML document.
-
-    Compared to just ``<iframe src="…">``, this:
-      * Ships as a complete document so OpenWebUI's outer sandboxed
-        iframe treats it as a real page (some sanitizers strip a bare
-        <iframe> tag but leave a document's body iframe alone).
-      * Renders the URL as a visible link fallback so the user can
-        open the preview in a new tab even if the nested iframe is
-        blocked by the outer sandbox attribute (this is the failure
-        mode where "the rendered element is blank" — we've hit it).
-      * Sets ``sandbox`` on the nested iframe explicitly so the browser
-        gives the sandbox app the permissions it needs (scripts, forms,
-        popups) rather than inheriting the parent's restrictive default.
-    """
-    return f"""<!doctype html>
-<html>
-<head><meta charset="utf-8"><title>sandbox preview</title></head>
-<body style="margin:0;font-family:system-ui;background:#0e1116;color:#e6edf3">
-  <iframe
-      src="{url}"
-      style="width:100%;height:{_IFRAME_HEIGHT_CSS};border:0;display:block;background:#0e1116"
-      sandbox="allow-scripts allow-forms allow-popups allow-same-origin allow-downloads"
-      allow="clipboard-read; clipboard-write"
-      loading="lazy"
-      referrerpolicy="no-referrer"></iframe>
-  <p style="padding:8px 12px;margin:0;font-size:12px;opacity:0.75">
-    Sandbox <code>{sandbox_id}</code> &middot;
-    Session <code>{session_id}</code> &middot;
-    <a href="{url}" target="_top" style="color:#8ab4f8">Open in new tab</a>
-  </p>
-</body>
-</html>"""
-
-
 @tool_app.post(
     "/preview_app",
     response_class=HTMLResponse,
@@ -672,7 +637,7 @@ async def tool_preview_app(req: ToolPreviewAppRequest) -> HTMLResponse:
         req.deletes,
     )
     return HTMLResponse(
-        content=_render_tool_html(
+        content=render_preview_html(
             result["url"], result["sandbox_id"], result["session_id"]
         ),
         headers={

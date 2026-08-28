@@ -22,6 +22,14 @@ $(eval $(call service,interceptor,interceptor))
 $(eval $(call service,searxng,searxng))
 $(eval $(call service,sandbox,sandbox-db sandbox-egress sandbox-proxy sandbox-runner))
 
+# Register every stack + service name as a no-op phony target so shell
+# tab-completion picks them up (bash's make completion reads targets via
+# `make -qp`; only declared targets are candidates). The $(foreach a,$(ARGS),…)
+# swallow below still handles stray goals at invoke time.
+STACK_TARGETS := $(sort $(STACKS) $(foreach s,$(STACKS),$(STACK_$(s))))
+$(foreach n,$(STACK_TARGETS),$(eval $(n):;@:))
+.PHONY: $(STACK_TARGETS)
+
 # Comma constant — Make can't easily embed a literal comma inside a
 # $(subst ...) call without one.
 comma := ,

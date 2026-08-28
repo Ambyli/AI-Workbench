@@ -27,6 +27,8 @@ inline`` per the same OpenWebUI docs.
 
 from __future__ import annotations
 
+import html
+import json
 from typing import Optional
 
 from fastmcp import FastMCP
@@ -35,22 +37,55 @@ from pydantic import Field
 from runtimes import describe_runtimes
 
 
-# Responsive iframe height. Cannot use the OpenWebUI-recommended postMessage
-# height-reporter here because the reporter would need to live *inside* the
-# sandbox's HTML (Streamlit, Vite, etc.) — code we don't control. Instead
-# scale to the viewport with a hard ceiling so a tall preview doesn't push
-# the chat context off-screen.
-_IFRAME_HEIGHT_CSS = "min(85vh, 900px)"
+def render_preview_html(url: str, sandbox_id: str, session_id: str) -> str:
+    """Full HTML document that navigates OpenWebUI's artifact iframe
+    (or the Tool Server response iframe) to the running sandbox URL.
 
+    Shared by both the MCP ``preview_app`` tool (which embeds this in a
+    ``` ```html ``` fenced block) and the OpenWebUI Tool Server route
+    (which returns it as an ``HTMLResponse`` with
+    ``Content-Disposition: inline``). Both consumers get dropped into a
+    sandboxed iframe by OpenWebUI, so returning ``<iframe src=URL>``
+    here would produce TWO iframe layers (OpenWebUI's srcdoc iframe
+    wrapping our iframe wrapping the sandbox). Meta-refresh navigates
+    OpenWebUI's iframe *itself* to the sandbox URL. One iframe, no
+    wrapping.
 
-def _render_html_block(url: str) -> str:
-    """Return an OpenWebUI-friendly HTML iframe block for the given URL."""
+    Three fallback layers, most-preferred first:
+      1. ``<meta http-equiv="refresh">`` — no JS required.
+      2. ``window.location.replace`` — for stricter sandbox flag
+         combinations where meta-refresh is blocked.
+      3. Visible ``<a target="_top">`` link — for the rare case both
+         above are blocked (e.g. no-script, no-refresh sandbox).
+
+    The leading HTML comment carries a per-response nonce (sandbox_id +
+    session_id) so OpenWebUI's ``autoOpenedArtifactIds`` sees each
+    update as a distinct artifact and re-opens the split panel if the
+    user closed it between turns. Without the nonce, follow-up updates
+    with the same URL would produce identical HTML and OpenWebUI would
+    treat them as the *same* artifact — panel wouldn't re-open."""
+    safe_url_attr = html.escape(url, quote=True)
+    safe_sandbox = html.escape(sandbox_id)
+    safe_session = html.escape(session_id)
+    js_url = json.dumps(url)
     return (
-        f'<iframe src="{url}" '
-        f'style="width:100%;height:{_IFRAME_HEIGHT_CSS};border:0;'
-        f'border-radius:8px;background:#0e1116" '
-        f'allow="clipboard-read; clipboard-write" '
-        f'loading="lazy"></iframe>'
+        f"<!-- preview session={safe_session} sandbox={safe_sandbox} -->\n"
+        "<!doctype html>\n"
+        "<html>\n"
+        "<head>\n"
+        '<meta charset="utf-8">\n'
+        "<title>sandbox preview</title>\n"
+        f'<meta http-equiv="refresh" content="0; url={safe_url_attr}">\n'
+        "</head>\n"
+        '<body style="margin:0;font-family:system-ui;padding:1.5rem;'
+        'background:#0e1116;color:#e6edf3">\n'
+        f'<p style="margin:0">Loading sandbox <code>{safe_sandbox}</code> '
+        f"&middot; Session <code>{safe_session}</code>… If it does not "
+        f'appear, <a href="{safe_url_attr}" target="_top" '
+        'style="color:#8ab4f8">open in new tab</a>.</p>\n'
+        f"<script>window.location.replace({js_url})</script>\n"
+        "</body>\n"
+        "</html>"
     )
 
 
@@ -180,7 +215,7 @@ def build_mcp(run_callable) -> FastMCP:
         session_id_out = result["session_id"]
         expires_at = result["expires_at"]
         reused = result.get("reused", False)
-        iframe = _render_html_block(url)
+        iframe = render_preview_html(url, sandbox_id, session_id_out)
 
         # Session id lives on its own line in a stable "Session id: …"
         # format so the model can regex it out on the next turn without

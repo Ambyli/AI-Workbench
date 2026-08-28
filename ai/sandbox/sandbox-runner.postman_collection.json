@@ -368,7 +368,7 @@
               "host": ["{{litellm}}"],
               "path": ["v1", "sandbox", "mcp", ""]
             },
-            "description": "Invoke preview_app via MCP. Result body has a text-content block containing a fenced ```html iframe block ready for OpenWebUI's markdown renderer."
+            "description": "Invoke preview_app via MCP. Result body has a text-content block containing a fenced ```html code block with a self-contained HTML document ready for OpenWebUI's artifacts split-panel (`ContentRenderer.svelte` promotes it via `['html','svg'].includes(normalizedLang)`). The document uses meta-refresh + JS fallback to navigate OpenWebUI's srcdoc iframe to the running sandbox URL — no nested iframe."
           },
           "response": []
         },

@@ -153,7 +153,7 @@ Response:
 
 Same fields as `POST /run`, exposed to tool-calling models. LiteLLM advertises it via [`ai/litellm/litellm_config.yaml`](../litellm/litellm_config.yaml)'s `mcp_servers.sandbox` entry.
 
-The tool's return value is a **string** containing a short summary and a fenced ` ```html ` block with the iframe pre-rendered — the model just needs to include the returned string verbatim in its response and Open WebUI's markdown renderer promotes the block into an iframe artifact. No system-prompt tweaks or per-model config required as long as the model follows the tool's docstring.
+The tool's return value is a **string** containing a short summary and a fenced ` ```html ` block with a small self-contained HTML document — the model includes the returned string verbatim in its response and Open WebUI's markdown renderer promotes the block into a split-panel artifact. No system-prompt tweaks or per-model config required as long as the model follows the tool's docstring.
 
 If model paraphrasing is a problem in practice, use the Tool Server integration below instead — that path bypasses the model entirely.
 
@@ -166,11 +166,31 @@ Register in **Admin Panel → Settings → Tools → Add Connection** with base 
 - `http://sandbox-runner:8000/tool` (from Open WebUI, on `ai_shared`)
 - `http://localhost:8012/tool` (from the host / local dev)
 
-OpenWebUI discovers the tool schema at `GET /tool/openapi.json` and calls `POST /tool/preview_app`. The response uses `Content-Disposition: inline`, which OpenWebUI recognizes as a rich-UI embed and renders the returned `<iframe>` as an inline sandboxed artifact. See [`ENDPOINTS.md § OpenWebUI Tool Server`](ENDPOINTS.md#openwebui-tool-server-tool) for the full contract.
+OpenWebUI discovers the tool schema at `GET /tool/openapi.json` and calls `POST /tool/preview_app`. The response uses `Content-Disposition: inline`, which OpenWebUI recognizes as a rich-UI embed and drops the returned HTML into a sandboxed artifact iframe. See [`ENDPOINTS.md § OpenWebUI Tool Server`](ENDPOINTS.md#openwebui-tool-server-tool) for the full contract.
+
+### How the artifact renders (alignment with the OpenWebUI docs)
+
+Both paths return the **same self-contained HTML document** (see `render_preview_html` in `runner/sandbox_mcp.py`). Design follows OpenWebUI's [Artifacts documentation](https://docs.openwebui.com/features/chat-conversations/chat-features/code-execution/artifacts/):
+
+- **Fence tag is `html`.** OpenWebUI's `ContentRenderer.svelte` promotes only ` ```html ` and ` ```svg ` blocks into artifacts (`['html','svg'].includes(normalizedLang)`). No other tag qualifies.
+- **Content is a "complete webpage."** The doc's supported artifact shapes are single-page HTML websites, SVG, complete webpages (HTML+JS+CSS in one artifact), and ThreeJS/D3 visualizations. We return a full `<!doctype html>` + `<html>` + `<head>` + `<body>` document to hit the "complete webpage" case cleanly.
+- **Rendered via `srcdoc` (not `src`).** OpenWebUI's `Artifacts.svelte` uses `srcdoc={content}` — it does not fetch an external URL. That's why we DON'T put `<iframe src="…">` inside our block. Doing so would render two iframe layers (OpenWebUI's srcdoc wrapping our iframe wrapping the sandbox). Instead the document uses `<meta http-equiv="refresh">` + a JS `location.replace` fallback to navigate the srcdoc iframe itself to the sandbox URL — one iframe layer, no wrapping.
+- **Per-response nonce for hot-reload re-promotion.** OpenWebUI dedupes with `autoOpenedArtifactIds`: once a given artifact opens the panel it won't re-open. A stable-URL follow-up call would otherwise produce byte-identical HTML → identical artifact id → no re-promote if the user closed the panel between turns. The leading `<!-- preview session=… sandbox=… -->` comment changes on every response (sandbox_id changes on self-heal spawns; the session_id nonce ensures a unique fingerprint per call) so each update looks like a fresh artifact.
+
+**One sandbox flag matters for interactive apps.** Under **Admin Panel → Settings → Interface → Artifacts**, four sandbox toggles control what the srcdoc iframe can do:
+
+| Toggle | Default | Sandbox behavior with the meta-refresh approach |
+|---|---|---|
+| iframe Sandbox Allow Scripts | On | Required — the `location.replace` fallback needs this. |
+| iframe Sandbox Allow Forms | On | Fine either way. |
+| iframe Sandbox Allow Downloads | On | Fine either way. |
+| iframe Sandbox Allow Same Origin | **Off** | **Turn ON for Streamlit / Vite / Next / any app doing same-origin WebSocket, XHR, or localStorage.** With it off, the iframe (after navigation) is treated as an opaque origin and same-origin requests to `chat.zeoenergy.com/sandboxes/{id}/` behave cross-origin — Streamlit's hot-reload WebSocket can be rejected on Origin, Vite HMR can fail, apps that touch localStorage break. Static-runtime sandboxes are unaffected. |
+
+There's no security cost to enabling **Allow Same Origin** in this deployment: sandbox URLs are already gated by `oauth2-proxy` and the containers are network-segmented via `internal: true` on `sandbox_net`. The flag only controls whether the *artifact iframe* trusts the origin it navigated to.
 
 ## Public iframe routing
 
-The tool returns an `<iframe src="…">`, and the user's browser is the one that has to fetch that URL. This deployment routes sandbox traffic **under the same origin as Open WebUI**, so the auth cookie flows automatically and there is no cross-origin CSP surprise.
+Because the artifact iframe navigates to `${SANDBOX_PROXY_URL}/{sandbox_id}/`, the user's browser needs to reach that URL. This deployment routes sandbox traffic **under the same origin as Open WebUI**, so the auth cookie flows automatically and there is no cross-origin CSP surprise.
 
 **Traffic path:**
 

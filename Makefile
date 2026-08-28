@@ -22,13 +22,17 @@ $(eval $(call service,interceptor,interceptor))
 $(eval $(call service,searxng,searxng))
 $(eval $(call service,sandbox,sandbox-db sandbox-egress sandbox-proxy sandbox-runner))
 
-# Register every stack + service name as a no-op phony target so shell
-# tab-completion picks them up (bash's make completion reads targets via
-# `make -qp`; only declared targets are candidates). The $(foreach a,$(ARGS),…)
-# swallow below still handles stray goals at invoke time.
-STACK_TARGETS := $(sort $(STACKS) $(foreach s,$(STACKS),$(STACK_$(s))))
-$(foreach n,$(STACK_TARGETS),$(eval $(n):;@:))
-.PHONY: $(STACK_TARGETS)
+# Introspection targets consumed by the `_make_ai_complete` bash completion
+# function (installed once via `eval "$$(make completion-bash)"`). The
+# completion shells out to `make -s list-stacks` for the second positional
+# arg and `make -s list-services <stack>` for the third. Removing these
+# breaks stack/service tab-completion while leaving verb completion working
+# — that's the failure mode we hit before.
+list-stacks:
+	@echo $(STACKS)
+
+list-services:
+	@echo $(if $(STACK),$(STACK_$(STACK)))
 
 # Comma constant — Make can't easily embed a literal comma inside a
 # $(subst ...) call without one.
@@ -160,4 +164,4 @@ help:
 	@echo "to narrow the set — the default of 'all profiles' works for most operators."
 	@echo ""
 
-.PHONY: setup network up down clean very-clean build logs help
+.PHONY: setup network up down clean very-clean build logs help list-stacks list-services

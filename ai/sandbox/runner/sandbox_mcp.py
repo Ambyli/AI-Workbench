@@ -6,13 +6,16 @@ the tool to any Qwen/Claude/GPT model that supports tool calling.
 
 ## What the tool returns
 
-Following the OpenWebUI docs (Extensibility → Plugin Development → Rich
-UI), the tool result is a **string** containing a short summary plus a
-fenced ``html`` code block with an ``<iframe>`` pointing at the sandbox
-URL. When the model relays the tool result to the user, OpenWebUI's
-markdown renderer picks up the ``html`` block and turns it into a
-sandboxed iframe artifact — no additional model prompting or plugin
-config required.
+Following the OpenWebUI Artifacts docs
+(https://docs.openwebui.com/features/chat-conversations/chat-features/code-execution/artifacts/),
+the tool result is a **string** containing a short summary plus a
+fenced ``html`` code block with a self-contained webpage that
+navigates its own srcdoc iframe to the sandbox URL via
+``<meta http-equiv="refresh">`` + JS fallback. When the model relays
+the tool result to the user, OpenWebUI's ContentRenderer picks up the
+``html`` block (``['html','svg'].includes(normalizedLang)``) and
+promotes it into the artifacts split-panel — no additional model
+prompting or plugin config required.
 
 The URL/sandbox_id/expires_at values are also present in plain text
 inside the same string, so a text-only client (or a model that
@@ -176,8 +179,9 @@ def build_mcp(run_callable) -> FastMCP:
             ),
         ),
     ) -> str:
-        """Build a live, interactive preview of a small app and return an
-        HTML iframe block that renders it inline in the chat.
+        """Build a live, interactive preview of a small app and return a
+        fenced ```html block containing a self-contained webpage that
+        OpenWebUI renders in its artifacts split-panel.
 
         **Updating an existing preview (this is the common case):** when
         the user asks you to change something in a preview you already
@@ -192,11 +196,12 @@ def build_mcp(run_callable) -> FastMCP:
 
         **When you (the model) relay this tool result to the user,
         include the returned string VERBATIM in your response** — the
-        ```html code block is what makes OpenWebUI render the preview
-        as an embedded iframe artifact. Paraphrasing or removing the
-        block prevents the preview from rendering. The "Session id:"
-        line above the block is what you (the model) grep back on the
-        next turn — do not remove or reword it.
+        ```html code block is what makes OpenWebUI promote the preview
+        into its artifacts split-panel (see the OpenWebUI Artifacts
+        docs). Paraphrasing or removing the block prevents the preview
+        from rendering. The "Session id:" line above the block is what
+        you (the model) grep back on the next turn — do not remove or
+        reword it.
 
         The iframe URL is served by ``sandbox-proxy`` on the local
         network. It is not reachable from outside this OpenWebUI

@@ -129,13 +129,20 @@ def build_mcp(run_callable) -> FastMCP:
         files: dict[str, str] = Field(
             default_factory=dict,
             description=(
-                "Map of relative path → file contents. On the FIRST call "
-                "for a preview, include every file the app needs "
-                "(requirements.txt / package.json if extra packages are "
-                "required). On a FOLLOW-UP call with the same "
-                "session_id, include ONLY the file(s) that changed — the "
-                "rest are preserved in the running container. Save "
-                "tokens by not resending unchanged files."
+                "Map of relative path → file contents. "
+                "\n\n"
+                "FIRST call (no session_id): include every file the app "
+                "needs — code, requirements.txt / package.json if extra "
+                "packages are required, assets. "
+                "\n\n"
+                "FOLLOW-UP call (with session_id): include ONLY the "
+                "file(s) that changed. Anything you do not list stays in "
+                "the running container's /app and continues to be served. "
+                "Re-sending unchanged files is wasted tokens AND wasted "
+                "container CPU — the file gets rewritten with identical "
+                "bytes but the dev server (Streamlit / Vite) still fires "
+                "a mtime-based reload for it. Ship the diff, not the whole "
+                "project."
             ),
         ),
         entrypoint: Optional[str] = Field(
@@ -179,29 +186,78 @@ def build_mcp(run_callable) -> FastMCP:
             ),
         ),
     ) -> str:
-        """Build a live, interactive preview of a small app and return a
-        fenced ```html block containing a self-contained webpage that
-        OpenWebUI renders in its artifacts split-panel.
+        """Spawn — or update — a live app preview and return a fenced
+        ```html block that OpenWebUI renders in its artifacts split-panel.
 
-        **Updating an existing preview (this is the common case):** when
-        the user asks you to change something in a preview you already
-        showed them, call ``preview_app`` again with the SAME
-        ``session_id`` from the previous response and ONLY the file(s)
-        that changed. The dev server inside the sandbox hot-reloads on
-        file changes (Streamlit watches mtimes, Vite has HMR, nginx
-        serves live), so the iframe already in the chat updates
-        automatically. Do NOT omit the ``session_id`` on follow-ups — a
-        new session means a new URL, and the user loses their scroll
-        position and any in-app state.
+        # DELTA UPDATES — this is how most calls should work
 
-        **When you (the model) relay this tool result to the user,
-        include the returned string VERBATIM in your response** — the
-        ```html code block is what makes OpenWebUI promote the preview
-        into its artifacts split-panel (see the OpenWebUI Artifacts
-        docs). Paraphrasing or removing the block prevents the preview
-        from rendering. The "Session id:" line above the block is what
-        you (the model) grep back on the next turn — do not remove or
-        reword it.
+        This tool has TWO modes, chosen by whether ``session_id`` is
+        present:
+
+        1. FIRST call (no session_id) — you're starting a new preview.
+           Send every file the app needs. The server generates a
+           session_id and returns it.
+
+        2. FOLLOW-UP call (WITH session_id) — you're editing a preview
+           that's already open in the user's artifacts panel. Send ONLY
+           the file(s) that changed. The container keeps running, files
+           you don't list stay in /app untouched, the same URL keeps
+           serving, and the dev server hot-reloads (Streamlit reruns on
+           mtime change, Vite fires HMR, nginx serves the new bytes).
+           The iframe in the user's chat updates in place — same
+           artifact, no new URL, no lost scroll position, no lost in-app
+           state.
+
+        # WORKED EXAMPLE — one initial call, one edit
+
+        User: "Build me a red counter."
+        You:
+            preview_app(
+                runtime="static",
+                files={
+                    "index.html": "<html>...<div id=n>0</div>...</html>",
+                    "style.css":  "#n { color: red; font-size: 4rem; }",
+                    "app.js":     "let n = 0; document.getElementById('n')..."
+                }
+            )
+        Server → "Session id: abc123 …"
+
+        User: "Make it blue."
+        You (correct — DELTA):
+            preview_app(
+                runtime="static",
+                session_id="abc123",       # reuse!
+                files={
+                    "style.css": "#n { color: blue; font-size: 4rem; }"
+                }
+                # DO NOT re-send index.html or app.js.
+                # They are already in /app and unchanged. Sending them
+                # again is wasted tokens and forces a spurious reload.
+            )
+
+        You (WRONG — full rewrite):
+            preview_app(
+                runtime="static",
+                # forgot session_id → new container, new URL, user loses
+                # their state and the panel may not re-open
+                files={"index.html": "...", "style.css": "...", "app.js": "..."}
+            )
+
+        # DELETING or RENAMING files
+
+        The delta model preserves everything you don't list. If the user
+        asks you to rename ``old.html`` to ``new.html``, send
+        ``files={"new.html": "..."}`` AND ``deletes=["old.html"]``.
+        Otherwise both files will exist in /app.
+
+        # RELAYING THE RESULT
+
+        Include the returned string VERBATIM in your response to the
+        user. The ```html block is what makes OpenWebUI promote the
+        preview into its artifacts split-panel. Paraphrasing or removing
+        it prevents the preview from rendering. The "Session id: …" line
+        above the block is what you grep back on the next turn — do not
+        remove or reword it.
 
         The iframe URL is served by ``sandbox-proxy`` on the local
         network. It is not reachable from outside this OpenWebUI
@@ -226,13 +282,32 @@ def build_mcp(run_callable) -> FastMCP:
         # format so the model can regex it out on the next turn without
         # depending on the tool-response object being intact. Order of
         # lines is load-bearing: the caller-visible "Preview ready"
-        # summary first, then the machine-readable session id, then the
-        # fenced html block.
+        # summary first, then the machine-readable session id, then a
+        # one-line reminder of the delta-update rule, then the fenced
+        # html block. The reminder rides on every turn (not just the
+        # first) because models forget between calls — cheap tokens
+        # spent here save far more tokens in resent unchanged files.
         verb = "updated" if reused else "ready"
+        n_files = len(files) if files else 0
+        if reused:
+            hint = (
+                f"You updated {n_files} file(s) in session `{session_id_out}` "
+                "— everything else in /app was preserved. To change more, "
+                f"call preview_app again with session_id=\"{session_id_out}\" "
+                "and ONLY the file(s) that changed."
+            )
+        else:
+            hint = (
+                f"To EDIT this preview on the next turn, call preview_app "
+                f"again with session_id=\"{session_id_out}\" and ONLY the "
+                "file(s) you changed — do NOT re-send unchanged files. "
+                "The container keeps running and hot-reloads on file change."
+            )
         return (
             f"Preview {verb}. Sandbox `{sandbox_id}` at {url} "
             f"(expires {expires_at}).\n"
-            f"Session id: {session_id_out}\n\n"
+            f"Session id: {session_id_out}\n"
+            f"{hint}\n\n"
             "```html\n"
             f"{iframe}\n"
             "```"

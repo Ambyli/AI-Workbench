@@ -124,7 +124,11 @@ async def _mcp_run(
     )
 
 
-_mcp = build_mcp(_mcp_run)
+async def _mcp_logs(session_id: str, lines: int) -> dict:
+    return await logs_session(session_id, lines)
+
+
+_mcp = build_mcp(_mcp_run, _mcp_logs)
 # path="/" so FastMCP puts its transport at the mount root — mounting
 # the returned ASGI app at /mcp then gives clients a single POST /mcp/
 # endpoint. Without this, FastMCP defaults to /mcp/ inside the mounted
@@ -391,6 +395,26 @@ async def _reuse_or_spawn(
             "runtime=node if you need to run a specific command.",
         )
 
+    # Static lint pass — catches syntax errors in ~1 ms without spawning
+    # a container. Python is the only runtime we can lint from inside
+    # the runner (we already have a Python interpreter); Node/HTML would
+    # need shelling out to node/html-tidy. Model gets a specific
+    # SyntaxError with line/column before we waste 30 s on readiness.
+    lint_errors = _lint_python_files(files)
+    if lint_errors:
+        raise HTTPException(
+            400,
+            {
+                "error": "static lint failed",
+                "session_id": session_id,
+                "errors": lint_errors,
+                "hint": (
+                    "Fix the syntax errors above and call preview_app again "
+                    "with the same session_id. No container was spawned."
+                ),
+            },
+        )
+
     # Fast-fail if the pool is full. wait_for with a short timeout works
     # because asyncio.Semaphore.acquire returns immediately when a slot is
     # available; TimeoutError only happens when the pool is genuinely full.
@@ -428,11 +452,33 @@ async def _reuse_or_spawn(
             30.0,  # readiness deadline — enough for pip/npm install-on-boot
         )
         if not ready:
+            # Grab logs BEFORE tearing the container down — otherwise
+            # the traceback / npm error / streamlit exception vanishes
+            # with the container and the model just sees "did not
+            # become ready" with no actionable signal.
+            logs = await asyncio.to_thread(
+                _spawner.tail_logs, result.container_name, 100
+            )
             await asyncio.to_thread(_spawner.stop, result.container_name)
             await _registry.set_error(
-                sandbox_id, "sandbox did not become ready within 30s"
+                sandbox_id,
+                "sandbox did not become ready within 30s\n\n" + logs,
             )
-            raise HTTPException(504, "sandbox did not become ready")
+            raise HTTPException(
+                504,
+                {
+                    "error": "sandbox did not become ready within 30s",
+                    "session_id": session_id,
+                    "logs": logs,
+                    "hint": (
+                        "Read the container logs above to see why the app "
+                        "failed to start (traceback, missing module, port "
+                        "bind error, etc.). Fix the code and call "
+                        "preview_app again with the same session_id — the "
+                        "runner will spawn a fresh container."
+                    ),
+                },
+            )
 
         url = f"{PROXY_URL}/{sandbox_id}/"
         await _registry.set_result(
@@ -460,6 +506,57 @@ async def _reuse_or_spawn(
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _lint_python_files(files: dict[str, str]) -> list[dict]:
+    """Compile every ``.py`` file to catch SyntaxError before we spawn.
+
+    Returns a list of ``{path, line, offset, message}`` entries — empty
+    if everything parses. Uses Python's built-in ``compile()`` so we
+    don't need a separate linter; catches every syntax error the
+    interpreter would raise at import time, plus indentation errors.
+
+    Deliberately does NOT run imports or execute code — the container
+    is where that runs. Static-only, ~1 ms per file even for large
+    Streamlit apps."""
+    out: list[dict] = []
+    for path, content in files.items():
+        if not path.endswith(".py"):
+            continue
+        # Wrap the display path in angle brackets so Python's SyntaxError
+        # doesn't try to read a file with that name off the runner's own
+        # filesystem for the ``text`` attribute — otherwise a sandbox
+        # ``app.py`` collides with the runner's ``app.py`` and the error
+        # text shows runner source instead of the sandbox source.
+        display_name = f"<sandbox:{path}>"
+        try:
+            compile(content, display_name, "exec")
+        except SyntaxError as exc:
+            # Reconstruct the offending line from the source ourselves —
+            # exc.text is unreliable when Python can't find the file on
+            # disk (as it can't, with the angle-bracket name).
+            source_lines = content.splitlines()
+            text = ""
+            if isinstance(exc.lineno, int) and 1 <= exc.lineno <= len(source_lines):
+                text = source_lines[exc.lineno - 1]
+            out.append({
+                "path": path,
+                "line": exc.lineno,
+                "offset": exc.offset,
+                "message": f"{type(exc).__name__}: {exc.msg}",
+                "text": text.rstrip(),
+            })
+        except Exception as exc:
+            # Rare — usually a null byte or encoding surprise. Report it
+            # rather than let the container silently fail later.
+            out.append({
+                "path": path,
+                "line": None,
+                "offset": None,
+                "message": f"{type(exc).__name__}: {exc}",
+                "text": "",
+            })
+    return out
 
 
 @app.post("/run", response_model=RunResponse)
@@ -556,6 +653,62 @@ async def download_sandbox_job(sandbox_id: str) -> StreamingResponse:
     except Exception as exc:
         raise HTTPException(404, f"container gone: {exc}")
     return _tar_response(stream, sandbox_id)
+
+
+@app.get("/session/{session_id}/logs")
+async def logs_session(session_id: str, lines: int = 100) -> dict:
+    """Return the last ``lines`` of the running sandbox's combined
+    stdout+stderr. Session-based so this survives self-heal spawns.
+
+    Model call this when the user reports the app looks broken but
+    ``preview_app`` returned a normal ready response — Streamlit /
+    Flask / Vite dev servers usually print the offending traceback
+    here before rendering an error card in the browser. The model can
+    fix the code and re-issue ``preview_app`` without needing the user
+    to relay the error text."""
+    if not _SESSION_ID_RE.match(session_id):
+        raise HTTPException(400, "invalid session_id")
+    if _registry is None or _spawner is None:
+        raise HTTPException(500, "runner not initialized")
+    existing = await _find_running_session(session_id)
+    if existing is None or not existing.get("container_name"):
+        raise HTTPException(
+            404, f"no running sandbox for session {session_id!r}"
+        )
+    text = await asyncio.to_thread(
+        _spawner.tail_logs, existing["container_name"], max(1, min(lines, 1000))
+    )
+    return {
+        "session_id": session_id,
+        "sandbox_id": existing["sandbox_id"],
+        "lines_requested": lines,
+        "logs": text,
+    }
+
+
+@app.get("/jobs/{sandbox_id}/logs")
+async def logs_sandbox_job(sandbox_id: str, lines: int = 100) -> dict:
+    """Direct log fetch by internal sandbox_id. Useful for operator
+    debugging when you want the logs from a SPECIFIC spawn event even
+    after the session has self-healed to a new container."""
+    if _registry is None or _spawner is None:
+        raise HTTPException(500, "runner not initialized")
+    job = await _registry.get(sandbox_id)
+    if job is None:
+        raise HTTPException(404, f"no sandbox {sandbox_id!r}")
+    container_name = (job.result or {}).get("container_name")
+    if not container_name:
+        raise HTTPException(
+            409, f"sandbox {sandbox_id!r} has no container to read logs from"
+        )
+    text = await asyncio.to_thread(
+        _spawner.tail_logs, container_name, max(1, min(lines, 1000))
+    )
+    return {
+        "sandbox_id": sandbox_id,
+        "lines_requested": lines,
+        "logs": text,
+    }
 
 
 @app.get("/session/{session_id}/download")

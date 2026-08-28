@@ -35,10 +35,71 @@ import json
 import secrets
 from typing import Optional
 
+from fastapi import HTTPException
 from fastmcp import FastMCP
 from pydantic import Field
 
 from runtimes import describe_runtimes
+
+
+def _format_diagnostic(detail: dict) -> str:
+    """Turn a runner HTTPException detail dict into a diagnostic string
+    for the model. Two shapes we handle explicitly:
+
+    Static lint (400): detail = {error, session_id, errors[], hint}
+        where each error is {path,line,offset,message,text}. We format
+        as a compact `path:line:col: message` list plus the offending
+        source line — same shape as a compiler / linter output the
+        model has been trained on, so it can pattern-match a fix.
+
+    Readiness failure (504): detail = {error, session_id, logs, hint}
+        We include the log tail verbatim (that's where the traceback
+        lives) plus the hint. If the log tail is empty, we say so
+        explicitly rather than showing a bare header.
+
+    Unknown shapes fall back to a JSON dump so we surface *something*
+    rather than swallow the error into a bare-error tool response."""
+    error = detail.get("error", "spawn failed")
+    session_id = detail.get("session_id")
+    hint = detail.get("hint", "")
+    lines = [f"preview_app failed: {error}"]
+    if session_id:
+        lines.append(f"Session id: {session_id}")
+
+    if error == "static lint failed":
+        errors = detail.get("errors") or []
+        lines.append("")
+        lines.append(f"Static lint found {len(errors)} error(s):")
+        for e in errors:
+            path = e.get("path", "?")
+            line = e.get("line") or "?"
+            offset = e.get("offset") or "?"
+            msg = e.get("message", "")
+            lines.append(f"  {path}:{line}:{offset}: {msg}")
+            text = e.get("text") or ""
+            if text:
+                lines.append(f"    {text}")
+                if isinstance(e.get("offset"), int):
+                    lines.append("    " + " " * (e["offset"] - 1) + "^")
+    elif error.startswith("sandbox did not become ready"):
+        logs = detail.get("logs") or ""
+        lines.append("")
+        if logs.strip():
+            lines.append("Container logs (last 100 lines):")
+            lines.append("---")
+            lines.append(logs.rstrip())
+            lines.append("---")
+        else:
+            lines.append("(container produced no output before timing out)")
+    else:
+        # Unknown structured error — dump what we know.
+        lines.append("")
+        lines.append(json.dumps(detail, indent=2, default=str))
+
+    if hint:
+        lines.append("")
+        lines.append(hint)
+    return "\n".join(lines)
 
 
 def render_preview_html(url: str, sandbox_id: str, session_id: str) -> str:
@@ -106,12 +167,14 @@ def render_preview_html(url: str, sandbox_id: str, session_id: str) -> str:
     )
 
 
-def build_mcp(run_callable) -> FastMCP:
+def build_mcp(run_callable, logs_callable) -> FastMCP:
     """Build the FastMCP instance wired to the runner's spawn code path.
 
     ``run_callable`` is an async callable ``(RunRequest) → RunResponse``
-    provided by ``app.py`` — kept as a parameter rather than an import
-    to avoid a circular dependency between ``sandbox_mcp.py`` and ``app.py``.
+    and ``logs_callable`` is an async callable
+    ``(session_id, lines) → dict``. Both are provided by ``app.py`` —
+    kept as parameters rather than imports to avoid a circular
+    dependency between ``sandbox_mcp.py`` and ``app.py``.
     """
     mcp = FastMCP(name="sandbox")
 
@@ -264,6 +327,26 @@ def build_mcp(run_callable) -> FastMCP:
         ``files={"new.html": "..."}`` AND ``deletes=["old.html"]``.
         Otherwise both files will exist in /app.
 
+        # WHEN THE PREVIEW LOOKS BROKEN TO THE USER
+
+        Two failure modes and how to debug each:
+
+        1. ``preview_app`` returned an ERROR (400 with lint errors, or
+           504 with container logs). The error response ALREADY contains
+           the diagnostic — read it, fix the code, call ``preview_app``
+           again with the same session_id. No need to call any other
+           tool.
+
+        2. ``preview_app`` returned a normal ready/updated response but
+           the user says the rendered app looks wrong ("undefined is not
+           a function", "the button does nothing", a Streamlit error
+           card in the preview). Call ``get_sandbox_logs(session_id=…)``
+           to fetch the container's stdout+stderr. Streamlit / Flask /
+           Vite dev servers print the Python traceback / JS stack there
+           before rendering an error card. Read the logs, fix the code,
+           call ``preview_app`` again with the same session_id. This
+           saves the user having to copy-paste the error back to you.
+
         # DOWNLOADING THE SOURCE
 
         Every response includes a ``Download source:`` line with a URL
@@ -286,14 +369,31 @@ def build_mcp(run_callable) -> FastMCP:
         network. It is not reachable from outside this OpenWebUI
         deployment; do not paste the URL to external users.
         """
-        result = await run_callable(
-            runtime=runtime,
-            files=files,
-            entrypoint=entrypoint,
-            ttl_seconds=ttl_seconds,
-            session_id=session_id,
-            deletes=deletes,
-        )
+        # Catch HTTPException from _reuse_or_spawn so the model sees a
+        # structured diagnostic tool response rather than an MCP-level
+        # error. Two specific failures we care about:
+        #   400 with detail.error == "static lint failed"
+        #       → SyntaxError caught before spawn. detail.errors is a
+        #         list of {path,line,offset,message,text}.
+        #   504 with detail.error == "sandbox did not become ready"
+        #       → container spawned but didn't bind port 80.
+        #         detail.logs is the tail of container stdout/stderr.
+        # Everything else falls through as-is (500s, 400s from schema,
+        # etc.) since those are already meaningful.
+        try:
+            result = await run_callable(
+                runtime=runtime,
+                files=files,
+                entrypoint=entrypoint,
+                ttl_seconds=ttl_seconds,
+                session_id=session_id,
+                deletes=deletes,
+            )
+        except HTTPException as exc:
+            detail = exc.detail
+            if isinstance(detail, dict) and detail.get("error"):
+                return _format_diagnostic(detail)
+            raise
         url = result["url"]
         sandbox_id = result["sandbox_id"]
         session_id_out = result["session_id"]
@@ -343,6 +443,61 @@ def build_mcp(run_callable) -> FastMCP:
             "```html\n"
             f"{iframe}\n"
             "```"
+        )
+
+    @mcp.tool()
+    async def get_sandbox_logs(
+        session_id: str = Field(
+            description=(
+                "The session_id from a previous preview_app response. "
+                "Must match ^[A-Za-z0-9_-]{1,64}$."
+            )
+        ),
+        lines: int = Field(
+            default=100,
+            description=(
+                "How many trailing log lines to return. Clamped 1..1000. "
+                "Default 100 is enough for most Python/JS tracebacks."
+            ),
+        ),
+    ) -> str:
+        """Fetch the last N lines of the running sandbox's combined
+        stdout+stderr for the given session_id. Use this when the user
+        reports the app looks broken but ``preview_app`` already
+        returned a normal ready response — Streamlit, Flask, Vite, and
+        Next dev servers all print the offending Python traceback / JS
+        stack / import error to stdout before rendering an error card
+        in the browser. Read the logs, fix the code, call
+        ``preview_app`` again with the same session_id.
+
+        Do NOT call this after a ``preview_app`` FAILURE — those
+        already include the container logs in the tool response. Only
+        call this when the container IS running but its output looks
+        wrong to the user.
+
+        Returns a formatted string with the log tail; returns an
+        explicit message if no logs are available (session not
+        running, container just spawned with no output yet, etc.)."""
+        try:
+            data = await logs_callable(session_id=session_id, lines=lines)
+        except HTTPException as exc:
+            detail = exc.detail
+            if isinstance(detail, str):
+                return f"logs unavailable: {detail}"
+            return f"logs unavailable: {json.dumps(detail, default=str)}"
+        text = (data.get("logs") or "").rstrip()
+        if not text:
+            return (
+                f"No log output yet for session `{session_id}`. The "
+                "container may have just spawned, or the app writes to "
+                "a file instead of stdout."
+            )
+        return (
+            f"Container logs for session `{session_id}` "
+            f"(sandbox `{data.get('sandbox_id')}`, last {data.get('lines_requested')} lines):\n"
+            "---\n"
+            f"{text}\n"
+            "---"
         )
 
     return mcp

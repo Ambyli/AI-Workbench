@@ -238,6 +238,23 @@
       "response": []
     },
     {
+      "name": "GET /session/{sandboxSessionId}/logs",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{litellm}}/v1/sandbox/session/{{sandboxSessionId}}/logs?lines=100",
+          "host": ["{{litellm}}"],
+          "path": ["v1", "sandbox", "session", "{{sandboxSessionId}}", "logs"],
+          "query": [
+            { "key": "lines", "value": "100", "description": "Trailing lines to return. Default 100, clamped 1..1000." }
+          ]
+        },
+        "description": "Return the last N lines of the running sandbox's stdout+stderr. Session-based so this follows self-heal.\n\nHow the logs get there: the runner's two-phase spawn runs the user command via `docker exec` (detached), not as PID 1 (`sleep infinity` is PID 1). container.logs() only sees PID 1's streams, so exec output isn't captured there. The spawn redirects the user command to /tmp/sandbox.log (128 MB tmpfs), and this endpoint runs `tail -n N` inside the container to read it back.\n\nWhich runtimes surface useful output here: Flask (`app.run`), FastAPI + uvicorn, Express, Vite, Next, and any bare `python app.py` all print tracebacks to stdout. STREAMLIT is the exception — it catches user exceptions and renders them in the browser rather than printing to stdout, so this endpoint shows only the 'You can now view your Streamlit app…' banner. For Streamlit apps, inspect the rendered HTML from the sandbox URL to see error text.\n\nResponse (200): {session_id, sandbox_id, lines_requested, logs}. Empty `logs` string means either the container just spawned and hasn't printed anything yet, or the app writes to a file — NOT a failure signal.\n\nErrors: 400 if session_id fails the regex, 404 if there's no running sandbox for this session."
+      },
+      "response": []
+    },
+    {
       "name": "GET /jobs",
       "request": {
         "method": "GET",
@@ -276,6 +293,23 @@
           "path": ["v1", "sandbox", "jobs", "{{sandboxId}}", "download"]
         },
         "description": "Direct download by internal sandbox_id — bypasses session resolution. Useful for operators who want to grab the archive from a SPECIFIC spawn event even if the session self-healed to a different container since. Same tar shape as the session variant. Prefer /session/{id}/download for end-user download links because that URL keeps working across self-heal.\n\nErrors: 404 if no sandbox with that id, 409 if the sandbox exists in the registry but never reached the `running` phase (no container to export)."
+      },
+      "response": []
+    },
+    {
+      "name": "GET /jobs/{sandboxId}/logs",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{litellm}}/v1/sandbox/jobs/{{sandboxId}}/logs?lines=100",
+          "host": ["{{litellm}}"],
+          "path": ["v1", "sandbox", "jobs", "{{sandboxId}}", "logs"],
+          "query": [
+            { "key": "lines", "value": "100", "description": "Trailing lines. Default 100, clamped 1..1000." }
+          ]
+        },
+        "description": "Direct log fetch by internal sandbox_id. Useful when the session self-healed to a new container but you want the previous container's output. Same underlying mechanism as /session/{id}/logs (tails /tmp/sandbox.log inside the container). Response body: {sandbox_id, lines_requested, logs}.\n\nErrors: 404 if no sandbox with that id, 409 if the sandbox never reached the `running` phase — no container to read logs from."
       },
       "response": []
     },
@@ -443,6 +477,75 @@
               "path": ["v1", "sandbox", "mcp", ""]
             },
             "description": "Follow-up preview_app call reusing an existing session_id. Response text starts with `Preview updated.` instead of `Preview ready.` and contains the same URL — the running Streamlit process detects the file-change and reruns automatically, no browser refresh needed. Save the sandboxSessionId variable first: run the streamlit call above, copy the Session id from its response, paste into the collection variable, then run this."
+          },
+          "response": []
+        },
+        {
+          "name": "MCP — tools/call preview_app (SYNTAX ERROR — see feedback)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json, text/event-stream" },
+              { "key": "Mcp-Session-Id", "value": "{{mcpSessionId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 6,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"preview_app\",\n    \"arguments\": {\n      \"runtime\": \"python\",\n      \"files\": {\n        \"app.py\": \"import streamlit as st\\nst.title(\\\"x\\\"\\ndef broken(\\n    pass\\n\"\n      }\n    }\n  }\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/sandbox/mcp/",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "sandbox", "mcp", ""]
+            },
+            "description": "Demonstrates the static-lint feedback loop. The Python file has an unclosed `st.title(` call and an incomplete `def broken(`. Before touching Docker, the runner compiles every .py file with Python's built-in `compile()` — SyntaxError is caught in ~1 ms and returned to the model as a compiler-style diagnostic:\n\n    preview_app failed: static lint failed\n    Session id: <fresh-id>\n\n    Static lint found 1 error(s):\n      app.py:3:1: SyntaxError: invalid syntax\n        def broken(\n        ^\n\n    Fix the syntax errors above and call preview_app again with the same session_id. No container was spawned.\n\nModel reads the diagnostic, fixes the code, and calls preview_app again with the same session_id — the session-reuse path handles the retry transparently. No container was spawned so no slot was consumed."
+          },
+          "response": []
+        },
+        {
+          "name": "MCP — tools/call preview_app (RUNTIME ERROR — see feedback)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json, text/event-stream" },
+              { "key": "Mcp-Session-Id", "value": "{{mcpSessionId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 7,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"preview_app\",\n    \"arguments\": {\n      \"runtime\": \"python\",\n      \"entrypoint\": \"python app.py\",\n      \"files\": {\n        \"app.py\": \"from flask import Flask\\nimport this_module_does_not_exist\\napp = Flask(__name__)\\napp.run(host='0.0.0.0', port=80)\\n\"\n      }\n    }\n  }\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/sandbox/mcp/",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "sandbox", "mcp", ""]
+            },
+            "description": "Demonstrates the runtime-error feedback loop. The Python file passes static lint (syntax is valid) but imports a non-existent module — the container spawns, fails at import time, never binds port 80, and the 30 s readiness probe expires. Before tearing the container down, the runner reads /tmp/sandbox.log and returns the traceback to the model:\n\n    preview_app failed: sandbox did not become ready within 30s\n    Session id: <fresh-id>\n\n    Container logs (last 100 lines):\n    ---\n    Traceback (most recent call last):\n      File \"/app/app.py\", line 2, in <module>\n        import this_module_does_not_exist\n    ModuleNotFoundError: No module named 'this_module_does_not_exist'\n    ---\n\n    Read the container logs above… Fix the code and call preview_app again with the same session_id.\n\nThis takes ~30 s (waiting for the readiness timeout). Static lint catches syntax errors instantly; runtime errors require the full spawn."
+          },
+          "response": []
+        },
+        {
+          "name": "MCP — tools/call get_sandbox_logs",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json, text/event-stream" },
+              { "key": "Mcp-Session-Id", "value": "{{mcpSessionId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 8,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"get_sandbox_logs\",\n    \"arguments\": {\n      \"session_id\": \"{{sandboxSessionId}}\",\n      \"lines\": 80\n    }\n  }\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/sandbox/mcp/",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "sandbox", "mcp", ""]
+            },
+            "description": "On-demand log fetch for a running sandbox. Use this when preview_app already returned a normal ready/updated response but the user reports the app looks broken (Flask/FastAPI/Vite/Next tracebacks all print here before the browser renders an error card).\n\nDo NOT call this after a preview_app FAILURE — those already include the container logs in the tool response. Only call when the container is running but its output looks wrong.\n\nSet the sandboxSessionId collection variable to the session_id from a previous preview_app response, then run this. Returns formatted text or an explicit 'no logs available' message.\n\nSTREAMLIT NOTE: Streamlit catches user exceptions and renders them in the browser, not stdout. For Streamlit apps this shows only the startup banner. For everything else, this is where the traceback is."
           },
           "response": []
         }

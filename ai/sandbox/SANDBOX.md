@@ -320,6 +320,18 @@ Auth is oauth2-proxy — same session cookie as the preview iframe — so users 
 
 Archive shape: `sandbox-{sandbox_id}.tar` with `app/` at the root. Extract with `tar -xf sandbox-*.tar` (Windows 10+ ships `tar` in cmd; every Unix has it).
 
+### Error feedback for models
+
+Three layers, in order of cheapness:
+
+1. **Static Python lint (before spawn, ~1 ms).** `_lint_python_files` in [`runner/app.py`](runner/app.py) walks every `.py` file in the request and calls `compile(source, "<sandbox:path>", "exec")`. SyntaxError catches trigger a 400 with a compiler-style diagnostic — path, line, offset, source line, caret — plus the generated `session_id` so a retry with the same id transparently self-heals. Angle-bracket display name stops Python from reading a same-named file off the runner's own disk.
+
+2. **Container logs on readiness failure (30 s spawn timeout).** If the container spawns but never binds port 80 within `readiness_ok`'s deadline, the runner reads the tail of `/tmp/sandbox.log` before tearing the container down and returns it in the 504. Log capture is possible because [`runner/spawner.py`](runner/spawner.py) redirects the user command's stdout+stderr to that file — `container.logs()` only sees PID 1 (`sleep infinity`), so exec streams have to be routed through a file.
+
+3. **On-demand log fetch (for apps that start but render errors).** `GET /session/{id}/logs` and its MCP counterpart `get_sandbox_logs` tail `/tmp/sandbox.log` at request time. Model calls this when `preview_app` returned a normal ready response but the user reports the running app looks broken. Flask / FastAPI / Vite / Next dev servers all print tracebacks to stdout before rendering a browser error card; **Streamlit is the exception** (it catches user exceptions and renders them in-browser only, never on stdout).
+
+The MCP tool wrapper in [`runner/sandbox_mcp.py`](runner/sandbox_mcp.py) catches HTTPExceptions from the runner's spawn path and formats them into text responses instead of MCP-level errors, so the model reads them as normal tool output and can call `preview_app` again with the same `session_id` without any error-handling logic.
+
 ### Auditing what a sandbox did
 
 The runner writes to a CSV audit log at `/data/audit.log` inside `sandbox-runner`. Every `/run` and `/mcp preview_app` call is recorded with the runtime, file-name hashes, entrypoint, and returned sandbox_id.

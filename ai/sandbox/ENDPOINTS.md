@@ -13,9 +13,11 @@ Everything below is served by [`ai/sandbox/runner/app.py`](app.py). Jobs endpoin
 | `POST` | `/run` | Spawn a sandbox — or update an existing one when `session_id` is passed. Returns JSON with URL, session_id, and `reused` flag |
 | `DELETE` | `/session/{session_id}` | Explicitly tear down a session's running sandbox. Idempotent |
 | `GET` | `/session/{session_id}/download` | Stream the running sandbox's `/app` as a tar archive. Follows self-heal (resolves session at request time). Also exposed publicly via Caddy at `/sandboxes/download/{session_id}` |
+| `GET` | `/session/{session_id}/logs` | Return the last N lines (default 100, max 1000) of the running sandbox's stdout+stderr. Follows self-heal. Diagnostic for apps that render errors in-browser only (Flask/Vite/Next tracebacks; Streamlit does not use stdout for user errors) |
 | `GET` | `/jobs` | List every sandbox in the registry (running + terminal) |
 | `GET` | `/jobs/{sandbox_id}` | One sandbox's snapshot |
 | `GET` | `/jobs/{sandbox_id}/download` | Direct tar download by internal id. Useful for operators; does not follow self-heal |
+| `GET` | `/jobs/{sandbox_id}/logs` | Direct log fetch by internal id. Useful when session self-healed to a new container but you want the OLD one's output |
 | `DELETE` | `/jobs/{sandbox_id}` | Tear a sandbox down early by internal id, release its slot |
 | `POST` | `/mcp/` | FastMCP JSON-RPC endpoint — see [MCP section](#mcp) |
 | `GET` | `/tool/openapi.json` | OpenAPI schema for OpenWebUI's Tool Server discovery |
@@ -103,10 +105,42 @@ The returned `url` is reachable at `http://sandbox-proxy` on the `ai_shared` Doc
 
 | Status | Meaning |
 |---|---|
-| `400` | Unknown `runtime` value. |
+| `400` | Unknown `runtime` value, OR **static lint failed on a Python file** (see below). |
 | `429` | Concurrency cap reached (`SANDBOX_MAX_CONCURRENT`, default 8). |
 | `500` | Docker spawn error — image missing, cgroup rejection, etc. |
-| `504` | Sandbox spawned but readiness probe (`GET /` inside container) didn't reply within 30s. Container is torn down before the response returns. |
+| `504` | Sandbox spawned but readiness probe (`GET /` inside container) didn't reply within 30s. Container is torn down before the response returns; **logs are captured first** (see below). |
+
+**Structured error bodies for feedback loops.** Two failure modes carry diagnostic detail in the response body so the caller (usually a model) can self-correct without a human relay:
+
+Static lint (400) — every `.py` file in `files` is compiled with Python's built-in `compile()` before the runner touches Docker. SyntaxError catches trigger a 400 with:
+```json
+{
+  "detail": {
+    "error": "static lint failed",
+    "session_id": "wVLFnur35Okv",
+    "errors": [
+      {"path": "app.py", "line": 3, "offset": 1,
+       "message": "SyntaxError: invalid syntax",
+       "text": "def foo("}
+    ],
+    "hint": "Fix the syntax errors above and call preview_app again with the same session_id. No container was spawned."
+  }
+}
+```
+
+Readiness failure (504) — container spawned but didn't bind port 80 within 30 s. Before teardown, the runner reads the tail of `/tmp/sandbox.log`:
+```json
+{
+  "detail": {
+    "error": "sandbox did not become ready within 30s",
+    "session_id": "79FDwxzMkgr4",
+    "logs": "Traceback (most recent call last):\n  File \"/app/app.py\"…\nModuleNotFoundError: No module named 'missing_pkg'\n",
+    "hint": "Read the container logs above… Fix the code and call preview_app again with the same session_id — the runner will spawn a fresh container."
+  }
+}
+```
+
+Both include a `session_id` so a retry with the same id transparently self-heals via the existing session-reuse path.
 
 **Curl examples:**
 
@@ -227,6 +261,46 @@ transfer-encoding: chunked
 
 ---
 
+## `GET /session/{session_id}/logs`
+
+Return the last `lines` lines of the running sandbox's combined stdout + stderr. Session-based so it follows self-heal spawns.
+
+**How the logs get there.** The runner's two-phase spawn runs the user's command via `docker exec` (detached) rather than as PID 1 (`sleep infinity` is PID 1). `container.logs()` only sees PID 1's streams, so exec output is not captured there. The spawn redirects the user command's stdout + stderr into `/tmp/sandbox.log` inside the container (128 MB tmpfs), and this endpoint runs `tail -n N /tmp/sandbox.log` via a second exec to read them back.
+
+**Which runtimes surface useful output here.** Flask (`app.run()`), FastAPI + uvicorn `--log-level debug`, Express, Vite, Next, and any bare `python app.py` all print tracebacks to stdout — the model gets them via this endpoint. **Streamlit is the exception**: it catches user exceptions and renders them in the browser rather than printing to stdout, so this endpoint shows only the "You can now view your Streamlit app…" banner. For Streamlit apps, the model has to inspect the rendered HTML from the sandbox URL to see error text.
+
+**Query params:**
+
+| Param | Type | Default | Notes |
+|---|---|---|---|
+| `lines` | int | `100` | Clamped 1..1000. 100 is enough for most tracebacks; bump if you need earlier request history. |
+
+**Request:**
+```bash
+curl "http://localhost:8012/session/bfdYm3_H5SD4/logs?lines=50"
+```
+
+**Response (200):**
+```json
+{
+  "session_id": "bfdYm3_H5SD4",
+  "sandbox_id": "a1b2c3d4e5f6",
+  "lines_requested": 50,
+  "logs": "Traceback (most recent call last):\n  File \"/app/app.py\", line 2, in <module>\n    import missing_pkg\nModuleNotFoundError: No module named 'missing_pkg'\n"
+}
+```
+
+Empty `logs` string means either the container just spawned and hasn't printed anything yet, or the app writes to a file inside the container rather than stdout. It is NOT a signal that the sandbox is broken.
+
+**Errors:**
+
+| Status | Meaning |
+|---|---|
+| `400` | `session_id` doesn't match `^[A-Za-z0-9_-]{1,64}$`. |
+| `404` | No running sandbox for that session — never existed, or reaped without self-heal. |
+
+---
+
 ## `GET /jobs/{sandbox_id}/download`
 
 Direct download by internal sandbox_id — bypasses session resolution. Useful for operators who want to grab the archive from a specific spawn event even if the session self-healed to a different container since. Same tar shape as the session variant.
@@ -242,6 +316,28 @@ curl -o my-sandbox.tar http://localhost:8012/jobs/a1b2c3d4e5f6/download
 |---|---|
 | `404` | No sandbox with that id. |
 | `409` | Sandbox exists in the registry but never reached the `running` phase (no container yet, or it was reaped). |
+
+---
+
+## `GET /jobs/{sandbox_id}/logs`
+
+Direct log fetch by internal sandbox_id. Useful when the session self-healed to a new container but you want the previous container's output. Same shape as `/session/{id}/logs`.
+
+**Query params:** same `lines` param (default 100, clamped 1..1000).
+
+**Request:**
+```bash
+curl "http://localhost:8012/jobs/a1b2c3d4e5f6/logs?lines=200"
+```
+
+**Response (200):** same JSON shape as the session variant, minus the `session_id` field.
+
+**Errors:**
+
+| Status | Meaning |
+|---|---|
+| `404` | No sandbox with that id. |
+| `409` | Sandbox exists but never reached the `running` phase — no container to read logs from. |
 
 ---
 
@@ -348,9 +444,9 @@ Base URL on `ai_shared`: `http://sandbox-runner:8000/mcp/`
 
 All requests are JSON-RPC 2.0 over HTTP POST. Response bodies come back as either JSON or Server-Sent Events (`Content-Type: text/event-stream`). Clients must send `Accept: application/json, text/event-stream`.
 
-### Available tool
+### Available tools
 
-Exactly one:
+Three tools are registered — `list_runtimes` (discovery), `preview_app` (spawn / update), and `get_sandbox_logs` (diagnostic).
 
 **`preview_app`** — spawn a sandbox from the shape the model can produce inline.
 
@@ -359,9 +455,28 @@ Parameters (same field semantics as `POST /run`):
 | Param | Type | Required |
 |---|---|---|
 | `runtime` | string | yes |
-| `files` | `{ path: content }` | yes |
+| `files` | `{ path: content }` | no (empty overlay on follow-up calls is valid) |
 | `entrypoint` | string | no |
 | `ttl_seconds` | int | no |
+| `session_id` | string | no |
+| `deletes` | `[path, …]` | no |
+
+**Failure returns.** When the runner raises a 400 (static lint failed) or 504 (readiness failure with logs), the MCP wrapper catches the HTTPException and formats the detail dict into a compiler-style diagnostic string — the tool returns a normal text response, not an MCP-level error, so the model reads it as tool output and can call `preview_app` again with the same `session_id` to retry.
+
+**`get_sandbox_logs`** — fetch the tail of a running sandbox's stdout+stderr on demand.
+
+Parameters:
+
+| Param | Type | Required | Notes |
+|---|---|---|---|
+| `session_id` | string | yes | Must match `^[A-Za-z0-9_-]{1,64}$` |
+| `lines` | int | no | Default 100, clamped 1..1000 |
+
+Use case: `preview_app` returned a normal "ready" response but the user reports the running app looks broken ("the button doesn't work", "undefined is not a function", a Streamlit error card, etc). Flask / FastAPI / Vite / Next dev servers all print the offending Python traceback / JS stack to stdout before rendering an error in the browser. Fetching the logs lets the model diagnose the bug and re-issue `preview_app` without the user having to copy-paste error text back into the chat.
+
+Do NOT call this after a `preview_app` FAILURE — those already include the container logs in the tool response.
+
+**`list_runtimes`** — inventory of installed runtimes, their pre-baked packages, and example `files` maps. No parameters. Model should call this before `preview_app` if it's unsure which runtime fits the user's request.
 
 **Result — a single string (not a JSON object)**:
 

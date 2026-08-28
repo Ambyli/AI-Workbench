@@ -184,8 +184,16 @@ class Spawner:
         # immediately so readiness polling can start. The command runs
         # as a child of the sleep PID 1, not as PID 1 itself — which is
         # a known compromise (see docstring above).
+        #
+        # stdout+stderr are redirected to /tmp/sandbox.log so
+        # ``tail_logs`` can read them later. exec_run's output is NOT
+        # captured in ``container.logs()`` (that only sees PID 1's
+        # streams) — without this redirect the log-tail endpoint would
+        # always return empty, defeating the whole runtime-error
+        # feedback flow. /tmp is a 128 MB tmpfs, so the log can't
+        # runaway-fill anything durable.
         container.exec_run(
-            ["/bin/sh", "-c", user_command],
+            ["/bin/sh", "-c", f"({user_command}) >>/tmp/sandbox.log 2>&1"],
             workdir="/app",
             detach=True,
         )
@@ -255,6 +263,45 @@ class Spawner:
         container = self._client.containers.get(container_name)
         stream, _stat = container.get_archive("/app")
         return stream
+
+    def tail_logs(self, container_name: str, n_lines: int = 100) -> str:
+        """Return the last ``n_lines`` of the sandbox app's combined
+        stdout+stderr, decoded UTF-8.
+
+        Reads ``/tmp/sandbox.log`` inside the container — that's where
+        ``spawn()`` redirects the user's process. ``container.logs()``
+        would only see PID 1 (``sleep infinity``, no output) because
+        the user's command runs via ``exec_run`` in a detached exec
+        session, whose streams don't feed the container's log stream.
+
+        Returns empty string (not error) if the container is gone or
+        the app hasn't printed anything yet — callers should treat "no
+        logs" as "we tried, nothing useful" rather than as a failure
+        to look."""
+        try:
+            container = self._client.containers.get(container_name)
+        except NotFound:
+            return ""
+        try:
+            # Fall back to /dev/null on `tail` errors (file doesn't
+            # exist yet, permission surprise) so we always return a
+            # string instead of raising into the async pool.
+            result = container.exec_run(
+                [
+                    "/bin/sh",
+                    "-c",
+                    (
+                        f"tail -n {int(n_lines)} /tmp/sandbox.log "
+                        "2>/dev/null || true"
+                    ),
+                ],
+            )
+        except APIError:
+            return ""
+        raw = result.output
+        if isinstance(raw, bytes):
+            return raw.decode("utf-8", errors="replace")
+        return str(raw or "")
 
     def update_files(
         self,

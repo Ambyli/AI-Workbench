@@ -4,13 +4,17 @@ litellm_settings:
   drop_params: true
   turn_off_message_logging: true
   json_logs: false
+  context_window_fallbacks:
+    - qwen3.6: ["claude-sonnet-5"]
+    - qwen3.8: ["claude-sonnet-5"]
+    - glm5.2: ["claude-sonnet-5"]
 
 general_settings:
   master_key: os.environ/DEFAULT_LITELLM_MASTER_KEY
   database_url: os.environ/DEFAULT_LITELLM_DATABASE_URL
   enable_metrics: true
   store_model_in_db: true
-  default_max_tokens: 262144
+  default_max_tokens: 16384
   always_include_stream_usage: true
   pass_through_endpoints:
     - path: "/v1/classifier"
@@ -75,7 +79,7 @@ model_list:
       model: os.environ/DEFAULT_LITELLM_MODEL
       api_base: os.environ/DEFAULT_LITELLM_MODEL_API_BASE
       api_key: os.environ/DEFAULT_LITELLM_MODEL_API_KEY
-      max_tokens: 262144
+      max_tokens: 16384
       stream_timeout: 300
 
   - model_name: kokoro
@@ -92,7 +96,7 @@ model_list:
       model: openai/qwen3.6
       api_base: http://qwen3.6:8000/v1
       api_key: none
-      max_tokens: 81920
+      max_tokens: 16384
       temperature: 0.6
       top_p: 0.95
       frequency_penalty: 0
@@ -107,7 +111,7 @@ model_list:
       model: openai/qwen3.8
       api_base: http://qwen3.8:8000/v1
       api_key: none
-      max_tokens: 81920
+      max_tokens: 16384
       temperature: 1.0
       top_p: 0.95
       frequency_penalty: 0
@@ -141,3 +145,9 @@ model_list:
       stream_timeout: 300
     model_info:
       mode: image
+
+  - model_name: claude-sonnet-5
+    litellm_params:
+      model: anthropic/claude-sonnet-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+      stream_timeout: 300

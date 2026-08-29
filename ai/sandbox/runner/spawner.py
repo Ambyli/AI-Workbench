@@ -376,6 +376,115 @@ class Spawner:
         )
         return text
 
+    def write_reload_marker(self, container_name: str) -> None:
+        """Append a boundary line to ``/tmp/sandbox.log``.
+
+        Called by the reuse path in ``app._reuse_or_spawn`` right
+        before ``update_files``. A subsequent
+        ``tail_logs_since_last_marker`` uses this line as an anchor so
+        the response contains only what the dev server printed AFTER
+        the overlay — old tracebacks stay on disk (visible to
+        ``get_sandbox_logs`` and the ``/logs`` endpoints) but don't
+        leak into the preview response.
+
+        The marker is deliberately human-readable and includes a UTC
+        timestamp so an operator tailing the full log can tell which
+        block of output belongs to which reload attempt. That's the
+        payoff over an out-of-band line-count snapshot: the boundary
+        is visible in the artifact everyone else reads too.
+
+        Best-effort: ``NotFound`` / ``APIError`` are swallowed. Worst
+        case ``tail_logs_since_last_marker`` returns empty (no marker
+        to anchor against), which is strictly better than raising."""
+        try:
+            container = self._client.containers.get(container_name)
+        except NotFound:
+            log.debug("write_reload_marker: %s NotFound", container_name)
+            return
+        try:
+            # Timestamp captured inside the container so it uses the
+            # sandbox's clock (base image is UTC). Leading newline
+            # separates the marker cleanly from any partial line the
+            # dev server left un-terminated.
+            container.exec_run(
+                [
+                    "/bin/sh",
+                    "-c",
+                    (
+                        "printf -- '\\n--- preview_app reload %s ---\\n' "
+                        "\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" "
+                        ">> /tmp/sandbox.log"
+                    ),
+                ],
+            )
+        except APIError as exc:
+            log.warning(
+                "write_reload_marker: %s exec failed: %s", container_name, exc
+            )
+            return
+        log.debug("write_reload_marker: %s marker written", container_name)
+
+    def tail_logs_since_last_marker(
+        self, container_name: str, n_lines: int = 100
+    ) -> str:
+        """Return log content written after the LAST
+        ``--- preview_app reload …`` marker.
+
+        Paired with ``write_reload_marker``. If no marker is present
+        (e.g. write failed silently, or the caller skipped it),
+        returns empty — never spills full history into the preview
+        response, which was the whole point of the scheme.
+
+        Trailing ``| tail -n {n_lines}`` bounds response size against
+        a chatty reload (Vite can be verbose on config changes)."""
+        try:
+            container = self._client.containers.get(container_name)
+        except NotFound:
+            log.debug(
+                "tail_logs_since_last_marker: %s NotFound", container_name
+            )
+            return ""
+        try:
+            # awk state machine:
+            #   seen=0    → skip lines until the first marker.
+            #   marker    → reset buf, set seen=1, don't include the
+            #               marker itself in the returned tail.
+            #   otherwise → append to buf if we've seen a marker.
+            # An unmarked file therefore returns empty rather than
+            # dumping full history — the failure mode this exists to
+            # prevent.
+            result = container.exec_run(
+                [
+                    "/bin/sh",
+                    "-c",
+                    (
+                        "awk 'BEGIN{seen=0} "
+                        "/--- preview_app reload /"
+                        "{buf=\"\"; seen=1; next} "
+                        "seen{buf = buf $0 ORS} "
+                        "END{printf \"%s\", buf}' /tmp/sandbox.log "
+                        f"2>/dev/null | tail -n {int(n_lines)} || true"
+                    ),
+                ],
+            )
+        except APIError as exc:
+            log.warning(
+                "tail_logs_since_last_marker: %s exec failed: %s",
+                container_name, exc,
+            )
+            return ""
+        raw = result.output
+        text = (
+            raw.decode("utf-8", errors="replace")
+            if isinstance(raw, bytes)
+            else str(raw or "")
+        )
+        log.debug(
+            "tail_logs_since_last_marker: %s → %d bytes",
+            container_name, len(text),
+        )
+        return text
+
     def update_files(
         self,
         container_name: str,

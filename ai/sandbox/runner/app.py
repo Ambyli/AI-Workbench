@@ -409,6 +409,20 @@ async def _reuse_or_spawn(
                     session_id, existing["container_name"],
                     len(files or {}), len(deletes or []),
                 )
+                # Write a boundary marker to /tmp/sandbox.log BEFORE
+                # the overlay. Downstream `tail_logs_since_last_marker`
+                # anchors on this so the `startup_output` we return
+                # holds only what the dev server printed AFTER the
+                # reload. Old tracebacks stay on disk (get_sandbox_logs
+                # still sees them) but don't leak into the preview
+                # response, which was causing the model to report
+                # "there's an error" after the user had already
+                # corrected it. Marker is visible in the full log too,
+                # so operators can tell exactly when each reload
+                # happened.
+                await asyncio.to_thread(
+                    _spawner.write_reload_marker, existing["container_name"]
+                )
                 try:
                     await asyncio.to_thread(
                         _spawner.update_files,
@@ -426,19 +440,29 @@ async def _reuse_or_spawn(
                     existing["sandbox_id"],
                     {"last_used_at": _now_iso()},
                 )
-                # Grab a fresh tail of the container's stdout so the
-                # tool wrapper can inline it in the response — models
-                # get "did the reload succeed?" feedback without a
-                # second tool call. Snapshot from the runtime record so
-                # we know which runtime this session was originally
-                # spawned under (needed to decide whether to skip logs
-                # for static).
+                # Give the dev server a moment to observe the file
+                # change and print its reload notice / traceback before
+                # we tail. Streamlit takes ~200 ms to notice an mtime
+                # bump; Vite's HMR is faster; nginx doesn't print
+                # anything on file overwrite. 500 ms hits the sweet
+                # spot without adding perceptible latency to the tool
+                # response.
+                await asyncio.sleep(0.5)
+                # Grab everything printed after the marker so the tool
+                # wrapper can inline reload feedback in the response —
+                # models get "did the reload succeed?" without a
+                # second tool call, and without seeing the old error.
+                # Snapshot the runtime from the registry since we need
+                # to know what this session was originally spawned
+                # under (skip-static logic in the MCP wrapper).
                 existing_runtime = (
                     (await _registry.get(existing["sandbox_id"])).metadata.get("runtime")
                     if existing.get("sandbox_id") else None
                 )
                 startup_output = await asyncio.to_thread(
-                    _spawner.tail_logs, existing["container_name"], 40
+                    _spawner.tail_logs_since_last_marker,
+                    existing["container_name"],
+                    40,
                 )
                 log.info(
                     "reuse path complete: session=%s sandbox=%s reused=True "

@@ -267,6 +267,13 @@ class RunResponse(BaseModel):
     url: str
     expires_at: str
     reused: bool = False
+    # Present on every successful spawn/update. `runtime` reflects the
+    # runtime originally spawned under this session (needed by clients
+    # that want to render startup output correctly per runtime).
+    # `startup_output` is a tail of /tmp/sandbox.log — empty when the
+    # container just spawned and has not printed anything yet.
+    runtime: Optional[str] = None
+    startup_output: str = ""
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────
@@ -419,9 +426,24 @@ async def _reuse_or_spawn(
                     existing["sandbox_id"],
                     {"last_used_at": _now_iso()},
                 )
+                # Grab a fresh tail of the container's stdout so the
+                # tool wrapper can inline it in the response — models
+                # get "did the reload succeed?" feedback without a
+                # second tool call. Snapshot from the runtime record so
+                # we know which runtime this session was originally
+                # spawned under (needed to decide whether to skip logs
+                # for static).
+                existing_runtime = (
+                    (await _registry.get(existing["sandbox_id"])).metadata.get("runtime")
+                    if existing.get("sandbox_id") else None
+                )
+                startup_output = await asyncio.to_thread(
+                    _spawner.tail_logs, existing["container_name"], 40
+                )
                 log.info(
-                    "reuse path complete: session=%s sandbox=%s reused=True",
-                    session_id, existing["sandbox_id"],
+                    "reuse path complete: session=%s sandbox=%s reused=True "
+                    "startup_output_bytes=%d",
+                    session_id, existing["sandbox_id"], len(startup_output),
                 )
                 return {
                     "sandbox_id": existing["sandbox_id"],
@@ -429,6 +451,8 @@ async def _reuse_or_spawn(
                     "url": existing["url"],
                     "expires_at": existing["expires_at"],
                     "reused": True,
+                    "runtime": existing_runtime,
+                    "startup_output": startup_output,
                 }
             # Container is gone but the Postgres row still says "running"
             # — normal when the reaper hasn't swept yet, or the sandbox
@@ -588,9 +612,19 @@ async def _reuse_or_spawn(
             {"url": url, "container_name": result.container_name},
             phase="running",
         )
+        # Grab a fresh tail of the container's stdout so the tool
+        # wrapper can inline it in the response. Fetching here (before
+        # returning) means the model gets startup diagnostics in the
+        # same tool response as the URL — no second tool call, no
+        # reliance on the model remembering to check.
+        startup_output = await asyncio.to_thread(
+            _spawner.tail_logs, result.container_name, 40
+        )
         log.info(
-            "spawn READY: sandbox=%s session=%s url=%s expires=%s",
+            "spawn READY: sandbox=%s session=%s url=%s expires=%s "
+            "startup_output_bytes=%d",
             sandbox_id, session_id, url, expires_at.isoformat(),
+            len(startup_output),
         )
         return {
             "sandbox_id": sandbox_id,
@@ -598,6 +632,8 @@ async def _reuse_or_spawn(
             "url": url,
             "expires_at": expires_at.isoformat(),
             "reused": False,
+            "runtime": runtime,
+            "startup_output": startup_output,
         }
     except HTTPException:
         # Propagate structured errors (400 lint, 504 readiness). Release

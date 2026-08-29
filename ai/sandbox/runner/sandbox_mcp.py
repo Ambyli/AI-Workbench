@@ -110,6 +110,88 @@ def _format_diagnostic(detail: dict) -> str:
     return "\n".join(lines)
 
 
+# Substrings that mean "something went wrong at startup" when they show
+# up in the container's stdout tail. Curated to avoid false-positive
+# matches on legitimate framework noise:
+#   - "Warning" is EXCLUDED — npm and pip love to warn about deprecated
+#     packages and semver ranges, and it's not actionable at spawn time
+#   - "Error:" (with colon) is INCLUDED — this is the Python exception
+#     pattern; a bare "error" or "ERROR" would match nginx's access log
+#     entry format
+#   - lowercase "error" is EXCLUDED — same reason as Warning; too noisy
+#     for HTTP access-log style output
+_SUSPICIOUS_STARTUP_MARKERS = (
+    "Traceback (most recent call last)",
+    "Error:",
+    "Exception:",
+    "ImportError",
+    "ModuleNotFoundError",
+    "SyntaxError",
+    "TypeError",
+    "AttributeError",
+    "NameError",
+    "KeyError",
+    "IndexError",
+    "ValueError",
+    "Address already in use",
+    "EADDRINUSE",
+    "Cannot find module",
+    "ENOENT: no such file",
+    "npm ERR!",
+    "FATAL",
+    "panic:",
+    "core dumped",
+    "Segmentation fault",
+    "unhandledPromiseRejection",
+    "Uncaught",
+)
+
+
+def _format_startup_output(runtime: Optional[str], output: str) -> str:
+    """Render the "Startup output" section that rides on every
+    successful ``preview_app`` response.
+
+    Four cases, in order of precedence:
+      1. ``static`` runtime → skip. nginx access logs are noise; there
+         are no user tracebacks to surface.
+      2. output contains a marker from _SUSPICIOUS_STARTUP_MARKERS →
+         inline the whole tail with a ⚠ header so the model reads it
+         and acts on it BEFORE handing back to the user.
+      3. output is non-empty but clean → one-liner acknowledging the
+         check ran. For python we add a hint that streamlit's absence
+         from stdout doesn't imply the app is fine.
+      4. output is empty → one-liner saying so. Container may have
+         just started or the runtime writes to a file instead.
+    """
+    if runtime == "static":
+        return (
+            "Startup output: skipped (static runtime — nginx serves "
+            "files, no application-level output to surface)."
+        )
+    stripped = (output or "").strip()
+    if not stripped:
+        return (
+            "Startup output: (empty — container just spawned, or app "
+            "writes to a file instead of stdout, or runtime is "
+            "streamlit which never writes user tracebacks here)."
+        )
+    lowered = stripped
+    hits = [m for m in _SUSPICIOUS_STARTUP_MARKERS if m in lowered]
+    if hits:
+        return (
+            "Startup output: ⚠ SUSPICIOUS — found "
+            f"{', '.join(hits[:3])}"
+            f"{' (and more)' if len(hits) > 3 else ''}. "
+            "Fix the code and call preview_app again with the SAME "
+            "session_id BEFORE the user has to report it.\n"
+            "```\n"
+            f"{stripped}\n"
+            "```"
+        )
+    n_lines = stripped.count("\n") + 1
+    return f"Startup output: clean ({n_lines} lines)."
+
+
 def render_preview_html(url: str, sandbox_id: str, session_id: str) -> str:
     """Full HTML document that navigates OpenWebUI's artifact iframe
     (or the Tool Server response iframe) to the running sandbox URL.
@@ -278,6 +360,17 @@ def build_mcp(run_callable, logs_callable) -> FastMCP:
     ) -> str:
         """Spawn — or update — a live app preview and return a fenced
         ```html block that OpenWebUI renders in its artifacts split-panel.
+
+        Every successful response also inlines a "Startup output" tail
+        of the container's stdout+stderr so you catch silent failures
+        (import errors, warning-only misconfigurations, tracebacks
+        that surfaced on the first HTTP hit) without a second tool
+        call. If the tail contains error signals, act on them in the
+        SAME turn before the user has to report the problem. If the
+        tail is empty or explicitly labelled "clean", proceed as
+        usual. ``get_sandbox_logs`` still exists for the case where
+        the app breaks later on a user interaction the initial fetch
+        couldn't have triggered.
 
         # DELTA UPDATES — this is how most calls should work
 
@@ -458,12 +551,24 @@ def build_mcp(run_callable, logs_callable) -> FastMCP:
         # download is https://host/sandboxes/download/{session_id}.
         proxy_base = url.rsplit("/", 2)[0]
         download_url = f"{proxy_base}/download/{session_id_out}"
+        # Proactively inline the container's stdout tail so the model
+        # sees startup diagnostics WITHOUT a follow-up tool call. The
+        # runner reads /tmp/sandbox.log after readiness passes; the
+        # helper here decides how to render it: skip for static (nginx
+        # access logs aren't useful signal), a streamlit-specific note
+        # (streamlit hides user tracebacks from stdout, so a "clean"
+        # log doesn't mean much for that runtime), otherwise either
+        # flag as suspicious or acknowledge it's clean.
+        startup_section = _format_startup_output(
+            result.get("runtime"), result.get("startup_output") or ""
+        )
         return (
             f"Preview {verb}. Sandbox `{sandbox_id}` at {url} "
             f"(expires {expires_at}).\n"
             f"Session id: {session_id_out}\n"
             f"Download source: {download_url}\n"
-            f"{hint}\n\n"
+            f"{hint}\n"
+            f"{startup_section}\n\n"
             "```html\n"
             f"{iframe}\n"
             "```"

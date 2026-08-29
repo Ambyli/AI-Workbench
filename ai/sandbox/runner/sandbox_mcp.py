@@ -486,22 +486,51 @@ def build_mcp(run_callable, logs_callable) -> FastMCP:
         ),
     ) -> str:
         """Fetch the last N lines of the running sandbox's combined
-        stdout+stderr for the given session_id. Use this when the user
-        reports the app looks broken but ``preview_app`` already
-        returned a normal ready response — Streamlit, Flask, Vite, and
-        Next dev servers all print the offending Python traceback / JS
-        stack / import error to stdout before rendering an error card
-        in the browser. Read the logs, fix the code, call
-        ``preview_app`` again with the same session_id.
+        stdout+stderr for the given session_id.
+
+        # WHEN TO CALL
+
+        The user reports the running app looks broken (a rendered error
+        card, "undefined is not a function", the button does nothing,
+        etc.) but ``preview_app`` returned a normal ready response.
+        Flask, FastAPI, Express, Vite, and Next dev servers all print
+        the offending Python traceback / JS stack / import error to
+        stdout before rendering the error in the browser — this
+        endpoint surfaces that traceback.
 
         Do NOT call this after a ``preview_app`` FAILURE — those
-        already include the container logs in the tool response. Only
-        call this when the container IS running but its output looks
-        wrong to the user.
+        already include the container logs in the tool response.
 
-        Returns a formatted string with the log tail; returns an
-        explicit message if no logs are available (session not
-        running, container just spawned with no output yet, etc.)."""
+        # STREAMLIT IS THE MAJOR EXCEPTION — DO NOT MISDIAGNOSE
+
+        Streamlit **catches every user exception and renders it in the
+        browser only**. It does not write user tracebacks to stdout.
+        Calling this endpoint on a broken Streamlit app will return an
+        almost-empty log ("You can now view your Streamlit app…" and
+        nothing else). That's NOT evidence the app is healthy — it is
+        evidence Streamlit swallowed the error. If the user reports a
+        Streamlit app is broken:
+
+        1. DO NOT tell the user "there are no errors in the logs".
+        2. DO ask the user to paste the error text the browser is
+           showing them (or a screenshot). Streamlit renders a red
+           box with the Python traceback in it.
+        3. Alternatively, wrap the risky code in
+           ``try: … except Exception as e: st.exception(e); raise``
+           and reissue ``preview_app`` — that pushes the traceback
+           both to the browser AND to stdout so this endpoint sees it.
+
+        For every non-Streamlit Python runtime (Flask, FastAPI,
+        Gradio, bare ``python app.py``) tracebacks land here. Same for
+        every Node runtime.
+
+        # RETURN VALUE
+
+        Returns a formatted string with the log tail. Returns an
+        explicit "no log output yet" message if the file is empty —
+        possible causes: container just spawned and hasn't printed
+        anything yet, the app writes to a file instead of stdout, OR
+        the app is Streamlit (see above)."""
         log.info(
             "MCP tool call: get_sandbox_logs session=%s lines=%s",
             session_id, lines,

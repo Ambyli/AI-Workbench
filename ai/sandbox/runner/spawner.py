@@ -124,6 +124,22 @@ class Spawner:
                     # Base images look at this to skip color codes in logs
                     # captured by the runner.
                     "TERM": "dumb",
+                    # Force Python + Node + npm to use unbuffered stdout.
+                    # We redirect the user command to /tmp/sandbox.log via
+                    # `>>… 2>&1`, and stdout goes block-buffered (4-8 KB)
+                    # when it isn't a TTY — a fresh traceback sits in the
+                    # buffer until it fills, the process exits, or someone
+                    # calls flush(). That's exactly the bug where the
+                    # model calls get_sandbox_logs, sees an empty file,
+                    # and confidently tells the user "no errors here" while
+                    # the browser is showing a crash card. PYTHONUNBUFFERED
+                    # switches CPython to line-buffered even when writing
+                    # to a file; NPM_CONFIG_LOGLEVEL / FORCE_COLOR keep
+                    # Node dev servers from stripping their own diagnostics
+                    # in a `dumb` TERM.
+                    "PYTHONUNBUFFERED": "1",
+                    "NPM_CONFIG_LOGLEVEL": "warn",
+                    "FORCE_COLOR": "0",
                 },
                 # sandbox_net ONLY. The invariant that keeps sandboxes off
                 # ai_shared, sandbox_state, and everything else lives here.

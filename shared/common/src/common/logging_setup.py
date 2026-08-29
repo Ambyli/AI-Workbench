@@ -14,6 +14,11 @@ human-readable text logs stdlib produces.
 DEBUG_LOGGING semantics for ``setup_logging``:
 - File: DEBUG when debug=True, else INFO
 - Console: DEBUG when debug=True, else WARNING
+
+Timestamps are UTC (with a trailing ``Z``) so logs correlate cleanly
+across containers whose base images may ship different TZ configs.
+CsvLogger already stamps its own ``timestamp_utc`` column in ISO 8601
+UTC, so this is consistent with the audit-trail path.
 """
 
 from __future__ import annotations
@@ -21,6 +26,7 @@ from __future__ import annotations
 import csv
 import logging
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Sequence
@@ -70,9 +76,22 @@ def setup_logging(
             0, logging.FileHandler(log_path, mode="w", encoding="utf-8")
         )
 
+    # UTC timestamps for every log line. logging.Formatter uses
+    # `converter` to turn epoch seconds into a struct_time; swapping to
+    # `time.gmtime` makes %(asctime)s render as UTC (with a trailing Z
+    # via datefmt) instead of the host's local zone. This is a global
+    # attribute on the Formatter class — safe to set here because
+    # setup_logging owns the process's logging config, and no other
+    # module in this workspace overrides converter to anything else.
+    # Rationale for going UTC: containers run in whatever TZ the base
+    # image ships with (usually UTC, sometimes not), so relying on
+    # local time produces a mix of zones when correlating logs across
+    # services on the same host. UTC everywhere = one clock.
+    logging.Formatter.converter = time.gmtime
     logging.basicConfig(
         level=logging.DEBUG,
         format="%(asctime)s [%(levelname)s] %(funcName)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%SZ",
         handlers=handlers,
         force=True,  # override any prior basicConfig call
     )

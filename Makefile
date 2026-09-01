@@ -21,6 +21,7 @@ $(eval $(call service,roofix,roofix))
 $(eval $(call service,interceptor,interceptor))
 $(eval $(call service,searxng,searxng))
 $(eval $(call service,sandbox,sandbox-db sandbox-egress sandbox-proxy sandbox-runner))
+$(eval $(call service,n8n,n8n-db n8n))
 
 # Introspection targets consumed by the `_make_ai_complete` bash completion
 # function (installed once via `eval "$$(make completion-bash)"`). The

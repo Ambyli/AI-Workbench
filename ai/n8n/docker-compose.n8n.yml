@@ -41,11 +41,11 @@ services:
     depends_on:
       n8n-db:
         condition: service_healthy
-    # No host port. Traffic arrives via oauth2-proxy at ${N8N_EDITOR_BASE_URL}
-    # — the shared upstream config in OAUTH2_PROXY_UPSTREAMS routes /n8n/* to
-    # n8n:5678. Publishing the port would let anyone on the LAN reach the
-    # editor without SSO. See N8N.md § "Public routing (same-origin under
-    # oauth2-proxy)".
+    # No host port. Traffic arrives via the oauth2-proxy-n8n instance
+    # defined in ai/oauth2-proxy/docker-compose.oauth2-proxy.yml (all SSO
+    # gates live together in that file). Publishing the port would let
+    # anyone on the LAN reach the editor without SSO. See N8N.md
+    # § "Public routing (dedicated oauth2-proxy on subdomain)".
     environment:
       # All values sourced from .env — edit there, not here.
       DB_TYPE: "${N8N_DB_TYPE}"

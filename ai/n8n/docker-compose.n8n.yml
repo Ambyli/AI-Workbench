@@ -1,0 +1,94 @@
+networks:
+  shared:
+    external: true
+    name: ai_shared
+
+services:
+  # Postgres backing n8n's workflow store, execution history, and encrypted
+  # credentials. Exposed on the host at PORT_N8N_DB (default 5435 — sits one
+  # past sandbox-db's 5434 in the PORT REGISTRY in .env) so operators can
+  # query it remotely — psql, DBeaver, dashboards. See N8N.md
+  # § "Connecting to the n8n DB".
+  n8n-db:
+    image: postgres:16-alpine
+    container_name: n8n-db
+    restart: unless-stopped
+    environment:
+      # All values sourced from .env — edit there, not here.
+      POSTGRES_USER: "${N8N_DB_USER}"
+      POSTGRES_PASSWORD: "${N8N_DB_PASSWORD}"
+      POSTGRES_DB: "${N8N_DB_NAME}"
+    volumes:
+      - n8n_db:/var/lib/postgresql/data
+    ports:
+      - "${PORT_N8N_DB}:5432"
+    networks:
+      - shared
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${N8N_DB_USER}"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  n8n:
+    # Pinned release tag. Bump this line and `docker compose ... pull` to
+    # update. Use `:latest` for the rolling upstream tag.
+    image: n8nio/n8n:1.108.2
+    networks:
+      - shared
+    container_name: n8n
+    restart: unless-stopped
+    depends_on:
+      n8n-db:
+        condition: service_healthy
+    # No host port. Traffic arrives via oauth2-proxy at ${N8N_EDITOR_BASE_URL}
+    # — the shared upstream config in OAUTH2_PROXY_UPSTREAMS routes /n8n/* to
+    # n8n:5678. Publishing the port would let anyone on the LAN reach the
+    # editor without SSO. See N8N.md § "Public routing (same-origin under
+    # oauth2-proxy)".
+    environment:
+      # All values sourced from .env — edit there, not here.
+      DB_TYPE: "${N8N_DB_TYPE}"
+      DB_POSTGRESDB_HOST: "${N8N_DB_HOST}"
+      DB_POSTGRESDB_PORT: "${N8N_DB_INTERNAL_PORT}"
+      DB_POSTGRESDB_DATABASE: "${N8N_DB_NAME}"
+      DB_POSTGRESDB_USER: "${N8N_DB_USER}"
+      DB_POSTGRESDB_PASSWORD: "${N8N_DB_PASSWORD}"
+
+      N8N_HOST: "${N8N_HOST}"
+      N8N_PROTOCOL: "${N8N_PROTOCOL}"
+      N8N_PORT: "${N8N_INTERNAL_PORT}"
+      N8N_PATH: "${N8N_PATH}"
+      N8N_EDITOR_BASE_URL: "${N8N_EDITOR_BASE_URL}"
+      WEBHOOK_URL: "${N8N_WEBHOOK_URL}"
+
+      N8N_PROXY_HOPS: "${N8N_PROXY_HOPS}"
+
+      # REQUIRED. Compose refuses to start when unset — see N8N.md
+      # § "First-run checklist" for how to generate + persist.
+      N8N_ENCRYPTION_KEY: "${N8N_ENCRYPTION_KEY:?N8N_ENCRYPTION_KEY must be set; see N8N.md}"
+
+      N8N_USER_MANAGEMENT_DISABLED: "${N8N_USER_MANAGEMENT_DISABLED}"
+      N8N_DIAGNOSTICS_ENABLED: "${N8N_DIAGNOSTICS_ENABLED}"
+      N8N_HIRING_BANNER_ENABLED: "${N8N_HIRING_BANNER_ENABLED}"
+
+      N8N_AI_OPENAI_API_BASE: "${N8N_AI_OPENAI_API_BASE}"
+      N8N_AI_OPENAI_API_KEY: "${DEFAULT_LITELLM_MASTER_KEY}"
+
+      GENERIC_TIMEZONE: "${N8N_TIMEZONE}"
+      TZ: "${N8N_TIMEZONE}"
+    volumes:
+      # /home/node/.n8n holds encryption-key-derived material, binary data
+      # attachments, and the community-nodes install cache. Postgres holds
+      # the actual workflow + credential rows.
+      - n8n_data:/home/node/.n8n
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:5678/healthz > /dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+
+volumes:
+  n8n_data:
+  n8n_db:

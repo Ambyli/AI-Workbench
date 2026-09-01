@@ -39,6 +39,7 @@ Every service in the list below is on the `ai_shared` network unless noted. Port
 | [`interceptor/docker-compose.interceptor.yml`](interceptor/docker-compose.interceptor.yml) | `interceptor` | _(internal only)_ | [INTERCEPTOR.md](interceptor/INTERCEPTOR.md) |
 | [`searxng/docker-compose.searxng.yml`](searxng/docker-compose.searxng.yml) | `searxng` | `8009` | [SEARXNG.md](searxng/SEARXNG.md) |
 | [`sandbox/docker-compose.sandbox.yml`](sandbox/docker-compose.sandbox.yml) | `sandbox-runner`, `sandbox-proxy`, `sandbox-egress`, `sandbox-db` | `8012` (runner), `8011` (proxy), `5434` (db) | [SANDBOX.md](sandbox/SANDBOX.md) |
+| [`n8n/docker-compose.n8n.yml`](n8n/docker-compose.n8n.yml) | `n8n`, `n8n-db` | `5435` (db) — n8n itself reached via oauth2-proxy at `/n8n/` | [N8N.md](n8n/N8N.md) |
 
 ## Flow diagram
 
@@ -115,6 +116,10 @@ flowchart TB
         SBD[("sandbox-db<br/>postgres :5434<br/>sandbox_state net")]:::store
         SBX["sandbox-{id}<br/>ephemeral<br/>sandbox_net only"]:::standalone
     end
+    subgraph N8NG["n8n/docker-compose.n8n.yml"]
+        N8N["n8n<br/>:5678 internal<br/>(via /n8n/)"]:::svc
+        N8NDB[("n8n-db<br/>postgres :5435")]:::store
+    end
 
     Browser --> CF --> O2P --> OWU
     O2P -->|"/assets/* (skip-auth)"| OA
@@ -160,6 +165,10 @@ flowchart TB
     SBX  -->|"HTTP_PROXY"| SBE
     SBE  -. allowlisted HTTPS .-> HF
 
+    O2P  ==>|"/n8n/*<br/>(same-origin cookie)"| N8N
+    N8N  ==>|"OpenAI SDK<br/>AI + LangChain nodes"| LL
+    N8N  --> N8NDB
+
     KAPP -. model download .-> HF
     MAPP -. model download .-> HF
     VQ   -. model download .-> HF
@@ -181,6 +190,7 @@ flowchart TB
 - **SearXNG is Open WebUI's web-search backend, not LiteLLM's** — when a user toggles web search on in the chat composer, Open WebUI calls `http://searxng:8080/search?format=json` server-side, injects the top-N results into the prompt, and only *then* dispatches to LiteLLM. Models never call SearXNG directly, and it is not registered as an MCP tool. SearXNG fans out to public search engines (Google, Bing, DuckDuckGo, …) with no API key of its own — see [SEARXNG.md](searxng/SEARXNG.md).
 - **Sandbox subsystem is deliberately off `ai_shared`** — unlike every other product, the sandbox stack (`sandbox-runner`, `sandbox-proxy`, `sandbox-egress`, `sandbox-db`, and every spawned `sandbox-{id}` container) runs on two additional Docker networks: `sandbox_net` (bridge, `internal: true`) and `sandbox_state` (bridge, `internal: true`). Because the model-generated code inside a sandbox is untrusted, sandboxes MUST NOT be able to reach `litellm`, `phoenix-mcp`, `roofix-db`, `interceptor`, etc. `sandbox-runner` is the only container that straddles all three networks — it's the audit boundary and the single privileged consumer of `/var/run/docker.sock`. `sandbox-proxy` (Caddy) bridges `ai_shared → sandbox_net` so Open WebUI can iframe `http://sandbox-proxy/{id}/`. Outbound HTTP from sandboxes is forced through `sandbox-egress` (tinyproxy) with a hard-coded destination allowlist (pypi, npmjs, esm.sh, jsdelivr) — everything else drops. `sandbox-db` sits on `sandbox_state` alone so a container-escape in a sandbox cannot tamper with the job store. See [SANDBOX.md](sandbox/SANDBOX.md) for the security-invariant checklist that must be re-verified on every change to the subsystem.
 - **Sandbox iframes share the Open WebUI origin** — the iframe `src` returned by `preview_app` is `https://chat.zeoenergy.com/sandboxes/{id}/`, not `http://sandbox-proxy/{id}/`. `oauth2-proxy` has `http://sandbox-proxy:80/sandboxes/` in `OAUTH2_PROXY_UPSTREAMS`, so `chat.zeoenergy.com/sandboxes/*` gets fanned out to sandbox-proxy alongside `chat.zeoenergy.com/*` (openwebui) and `chat.zeoenergy.com/assets/*` (branded sign-in assets). Because the sandbox iframe is same-origin with the chat, the `_oauth2_proxy` cookie is sent automatically — no separate sign-in, no cross-origin CSP surprise. `/sandboxes/*` is NOT in `OAUTH2_PROXY_SKIP_AUTH_ROUTES`, so anonymous requests are still gated. See [SANDBOX.md § Public iframe routing](sandbox/SANDBOX.md#public-iframe-routing) for the traffic-path diagram and how to move to a separate `sandboxes.` subdomain if you want to serve unauthenticated previews.
+- **n8n rides on the same shared hostname under `/n8n/`** — same trick as `/sandboxes/*`, one more entry (`http://n8n:5678/n8n/`) in `OAUTH2_PROXY_UPSTREAMS`. On the n8n side, `N8N_PATH=/n8n/` + `N8N_EDITOR_BASE_URL=https://chat.zeoenergy.com/n8n/` + `WEBHOOK_URL=https://chat.zeoenergy.com/n8n/` (all set in `ai/n8n/docker-compose.n8n.yml`) make the editor's HTML and outbound webhook payloads use the subpath-aware URL. The shared oauth2-proxy cookie means one Google sign-in covers both Open WebUI and n8n; **no Cloudflare tunnel change is needed** because it's the same hostname. n8n's AI / LangChain nodes are preconfigured to talk to LiteLLM (`http://litellm:4000/v1` + `DEFAULT_LITELLM_MASTER_KEY`) so workflows don't need per-credential base-URL entry. Workflow rows, credential blobs, and execution history live in the dedicated `n8n-db` Postgres (`:5435`); credentials are encrypted at rest with `N8N_ENCRYPTION_KEY`, which is load-bearing across restarts — see [N8N.md](n8n/N8N.md).
 
 ## Ports at a glance
 
@@ -204,3 +214,5 @@ Ports are sourced from `.env` (`PORT_*` variables). Defaults shown; change them 
 | sandbox-proxy | `8011` |
 | sandbox-runner | `8012` |
 | sandbox-db (postgres) | `5434` |
+| n8n-db (postgres) | `5435` |
+| n8n | _(none — via oauth2-proxy at `/n8n/`)_ |

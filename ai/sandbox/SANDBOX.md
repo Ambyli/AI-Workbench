@@ -134,10 +134,10 @@ All base images normalize the app port to **80** so `sandbox-proxy` can statical
 
 ## MCP tool flow
 
-The sandbox subsystem exposes an MCP server named `sandbox` with 12 tools. Models compose them into a workflow that maps to the way a human dev works — warm the runtime, iterate silently, hand the user something to look at, tear down.
+The sandbox subsystem exposes an MCP server named `sandbox` with 11 tools. Models compose them into a workflow that maps to the way a human dev works — warm the runtime, iterate silently, hand the user something to look at, tear down.
 
 ```
-get_runtimes    ─── optional, first time on a deployment
+get_runtime_types  ─── optional, first time on a deployment
       │
       ▼
 create          ─── returns session_id + warming URL; env fixed here
@@ -166,7 +166,7 @@ Tool summary:
 
 | Tool | Kind | Purpose |
 |---|---|---|
-| `get_runtimes` | read | Describe available runtimes on this deployment |
+| `get_runtime_types` | read | Describe RUNTIME TYPES this deployment supports (catalog — not a session status check) |
 | `create` | write | Reserve an empty warming container, return session_id + URL |
 | `update_files` | write | Overlay files into a live sandbox; opt-in self-heal; post-update health probe |
 | `get_files` | read | Read files back from `/app` (dir listing when `paths` is omitted) |
@@ -177,7 +177,6 @@ Tool summary:
 | `close` | write | Tear down the session early, release the slot |
 | `list_sessions` | read | Enumerate live sandboxes (recover dropped session_ids) |
 | `run` | write | Convenience: create + update_files + preview in one call |
-| `preview_app` | write (deprecated) | Alias for `run` — kept for one release cycle |
 
 ### Data shapes shared by every write tool
 
@@ -219,8 +218,7 @@ The text form preserves everything a model needs to reply — the fenced ```` ``
 | `GET /jobs/{id}/logs` / `/download` | operator direct-access variants that don't follow self-heal |
 | `/mcp` | FastMCP HTTP transport — exposes every tool listed above |
 | `/tool/run` | OpenWebUI Tool Server — inline HTMLResponse |
-| `/tool/preview_app` | deprecated alias for `/tool/run` |
-| `/tool/get_runtimes` | describe available runtimes (Tool Server variant) |
+| `/tool/get_runtime_types` | describe runtime types (Tool Server variant of `sandbox.get_runtime_types`) |
 
 ### `POST /run` request
 
@@ -259,7 +257,7 @@ Register in **Admin Panel → Settings → Tools → Add Connection** with base 
 - `http://sandbox-runner:8000/tool` (from Open WebUI, on `ai_shared`)
 - `http://localhost:8012/tool` (from the host / local dev)
 
-OpenWebUI discovers the tool schema at `GET /tool/openapi.json` and calls `POST /tool/run` (or the deprecated `POST /tool/preview_app` alias, kept for one release cycle so existing registrations don't break mid-rollout). The response uses `Content-Disposition: inline`, which OpenWebUI recognizes as a rich-UI embed and drops the returned HTML into a sandboxed artifact iframe. See [`ENDPOINTS.md § OpenWebUI Tool Server`](ENDPOINTS.md#openwebui-tool-server-tool) for the full contract.
+OpenWebUI discovers the tool schema at `GET /tool/openapi.json` and calls `POST /tool/run`. The response uses `Content-Disposition: inline`, which OpenWebUI recognizes as a rich-UI embed and drops the returned HTML into a sandboxed artifact iframe. See [`ENDPOINTS.md § OpenWebUI Tool Server`](ENDPOINTS.md#openwebui-tool-server-tool) for the full contract.
 
 ### How the artifact renders (alignment with the OpenWebUI docs)
 
@@ -341,7 +339,7 @@ docker compose -f ai/sandbox/docker-compose.sandbox.yml up -d
 docker exec -it $(docker ps -q --filter label=sandbox.managed=true | head -1) sh
 ```
 
-Nothing spawns a sandbox container until an operator or model calls `POST /run` or `preview_app`. To smoke-test without a model:
+Nothing spawns a sandbox container until an operator or model calls `POST /run` or the `sandbox.run` MCP tool. To smoke-test without a model:
 
 ```bash
 curl -X POST http://localhost:8012/run -H 'Content-Type: application/json' -d '{
@@ -389,7 +387,7 @@ The reaper (`ai/sandbox/runner/reaper.py`) also runs a background sweep every 60
 
 ### Sessions (persistent previews across turns)
 
-`preview_app` accepts an optional `session_id` argument. On the first call the runner generates one and returns it in the response — both as the JSON `session_id` field and as a `Session id: XYZ` line in the rendered text block, so the model can grep it back on the next turn.
+`run` (and `create`) accepts an optional `session_id` argument. On the first call the runner generates one and returns it in the response — both as the JSON `session_id` field and as a `Session id: XYZ` line in the rendered text block, so the model can grep it back on the next turn.
 
 On a follow-up call with the same `session_id`, the runner writes the new file map into the running container's `/app` via `container.put_archive` — no respawn, same URL. The dev server inside detects the file change and reloads:
 
@@ -407,7 +405,7 @@ Explicit close: `DELETE /session/{session_id}` tears the container down and retu
 
 ### Downloading source
 
-Every `preview_app` response includes a `Download source:` URL of the form `${SANDBOX_PROXY_URL}/download/{session_id}` (e.g. `https://chat.zeoenergy.com/sandboxes/download/{session_id}`). When a user asks to save, keep, or export the code, the model just shares that URL — the browser downloads a plain tar of the container's `/app` directory, streamed straight from the Docker daemon (no in-memory buffering in the runner).
+Every `run` / `preview` response includes a `Download source:` URL of the form `${SANDBOX_PROXY_URL}/download/{session_id}` (e.g. `https://chat.zeoenergy.com/sandboxes/download/{session_id}`). When a user asks to save, keep, or export the code, the model just shares that URL — the browser downloads a plain tar of the container's `/app` directory, streamed straight from the Docker daemon (no in-memory buffering in the runner).
 
 Auth is oauth2-proxy — same session cookie as the preview iframe — so users don't get a second login prompt. The URL is session-based, so it stays valid across self-heal spawns (resolves session_id → currently-running sandbox_id at request time). Under the hood: the Caddy route in [`proxies/Caddyfile`](proxies/Caddyfile) reverse-proxies `/sandboxes/download/{session_id}` to sandbox-runner's `/session/{session_id}/download` endpoint; the runner calls `Spawner.export_files` which wraps Docker SDK's `container.get_archive("/app")`. There's also a `/jobs/{sandbox_id}/download` variant for operator direct-download by internal id.
 
@@ -429,7 +427,7 @@ The MCP tool wrappers in [`runner/sandbox_mcp.py`](runner/sandbox_mcp.py) catch 
 
 ### Auditing what a sandbox did
 
-The runner writes to a CSV audit log at `/data/audit.log` inside `sandbox-runner`. Every `/run` and `/mcp preview_app` call is recorded with the runtime, file-name hashes, entrypoint, and returned sandbox_id.
+The runner writes to a CSV audit log at `/data/audit.log` inside `sandbox-runner`. Every `POST /run` and MCP `sandbox.run` / `sandbox.create` call is recorded with the runtime, file-name hashes, entrypoint, and returned sandbox_id.
 
 ```bash
 docker exec sandbox-runner cat /data/audit.log

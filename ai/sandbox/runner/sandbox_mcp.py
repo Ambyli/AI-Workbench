@@ -2,7 +2,7 @@
 
 Tools exposed (all invoked as ``sandbox.<name>``):
 
-    get_runtimes()                  — describe available runtimes
+    get_runtime_types()             — describe available runtime types (catalog)
     create(runtime, ...)            — warm an empty container
     update_files(session_id, ...)   — overlay files, health-probe after
     get_files(session_id, paths?)   — read files back from /app
@@ -13,7 +13,6 @@ Tools exposed (all invoked as ``sandbox.<name>``):
     close(session_id)               — teardown and release slot
     list_sessions()                 — enumerate live sandboxes
     run(runtime, files, ...)        — convenience: create + update + preview
-    preview_app(...)                — deprecated alias for run
 
 Every tool returns a ``ToolResult`` — a list of ``TextContent`` (what the
 model reads) plus a ``structured_content`` JSON payload (what any
@@ -417,28 +416,36 @@ def build_mcp(
 
     mcp = FastMCP(name="sandbox")
 
-    # ── get_runtimes ──
+    # ── get_runtime_types ──
     @mcp.tool()
-    async def get_runtimes() -> ToolResult:
-        """Return the sandbox runtimes available on this deployment.
+    async def get_runtime_types() -> ToolResult:
+        """Describe the RUNTIME TYPES this deployment supports (static,
+        python, node, ...). This is a CATALOG, not a session status
+        check — it does not know about your session, your container, or
+        whether anything is running. It answers "what stacks can I ask
+        `create` or `run` to spawn?"
 
-        Each entry describes one runtime's summary, default entrypoint,
-        pre-baked packages, and an example ``files`` map. **Call this
-        FIRST if you're unsure which runtime fits the user's request** —
-        it saves guessing and shows you which packages are already
-        installed so you don't include them in requirements.txt.
+        Each entry describes one runtime type's summary, default
+        entrypoint, pre-baked packages, and an example ``files`` map.
+        **Call this FIRST if you're unsure which runtime fits the
+        user's request** — it saves guessing and shows you which
+        packages are already installed so you don't include them in
+        requirements.txt.
 
-        Flow: get_runtimes → create → update_files → preview → close.
-        Or the one-shot: get_runtimes → run.
+        For the state of a running sandbox, use ``get_logs``,
+        ``get_files``, or ``list_sessions`` — NOT this tool.
+
+        Flow: get_runtime_types → create → update_files → preview → close.
+        Or the one-shot: get_runtime_types → run.
         """
-        log.info("MCP tool call: get_runtimes")
+        log.info("MCP tool call: get_runtime_types")
         runtimes = describe_runtimes()
-        lines = ["Available runtimes:"]
+        lines = ["Available runtime types:"]
         for rt in runtimes:
             lines.append(f"- {rt['name']}: {rt['summary']}")
         return _tool_result(
             "\n".join(lines),
-            {"runtimes": runtimes},
+            {"runtime_types": runtimes},
         )
 
     # ── create ──
@@ -447,7 +454,7 @@ def build_mcp(
         runtime: str = Field(
             description=(
                 "Runtime for the empty warming container. One of the "
-                "names in get_runtimes."
+                "names in get_runtime_types."
             )
         ),
         ttl_seconds: Optional[int] = Field(
@@ -481,7 +488,7 @@ def build_mcp(
         (or Streamlit's own "warming" script for python) until you call
         ``update_files`` with your real code.
 
-        Flow: get_runtimes → create → update_files (repeat) → preview → close.
+        Flow: get_runtime_types → create → update_files (repeat) → preview → close.
 
         Consumes one slot from SANDBOX_MAX_CONCURRENT.
         """
@@ -550,7 +557,7 @@ def build_mcp(
             silent state loss — env is preserved on respawn, but files
             you installed via ``exec`` are LOST.
 
-        See flow: get_runtimes → create → update_files → preview → close.
+        See flow: get_runtime_types → create → update_files → preview → close.
         """
         log.info(
             "MCP tool call: update_files session=%s n_files=%d recreate=%s",
@@ -890,7 +897,7 @@ def build_mcp(
         recreate_if_gone=true first. Fresh containers have no files to
         anchor on, so respawning inside patch_files would be wrong.
 
-        See flow: get_runtimes → create → update_files → (patch_files |
+        See flow: get_runtime_types → create → update_files → (patch_files |
         update_files loop) → preview → close.
         """
         log.info(
@@ -1058,7 +1065,6 @@ def build_mcp(
         session_id: Optional[str],
         deletes: list[str],
         env: Optional[dict[str, str]],
-        deprecated_note: Optional[str] = None,
     ) -> ToolResult:
         try:
             result = await run_callable(
@@ -1072,15 +1078,7 @@ def build_mcp(
                 recreate_if_gone=True,
             )
         except HTTPException as exc:
-            tr = _handle_http_exception(exc, tool="run")
-            if deprecated_note:
-                # Prepend deprecation note to whatever error text was produced.
-                new_text = (
-                    deprecated_note + "\n\n" +
-                    "".join(getattr(b, "text", "") for b in tr.content)
-                )
-                return _tool_result(new_text, tr.structured_content or {})
-            return tr
+            return _handle_http_exception(exc, tool="run")
 
         url = result["url"]
         sandbox_id = result["sandbox_id"]
@@ -1128,8 +1126,6 @@ def build_mcp(
             f"{iframe}\n"
             "```"
         )
-        if deprecated_note:
-            head = deprecated_note + "\n\n" + head
         return _tool_result(
             head,
             {
@@ -1144,7 +1140,7 @@ def build_mcp(
     async def run(
         runtime: str = Field(
             description=(
-                "Runtime for the sandbox. One of the names in get_runtimes."
+                "Runtime for the sandbox. One of the names in get_runtime_types."
             )
         ),
         files: dict = Field(
@@ -1201,7 +1197,7 @@ def build_mcp(
           * The user pasted code and just wants it running.
           * You have a small, complete app and no separate compose step.
 
-        Prefer the get_runtimes → create → update_files → preview flow
+        Prefer the get_runtime_types → create → update_files → preview flow
         when:
           * The container should warm up while you finish writing code
             (pipelining wins on latency).
@@ -1217,35 +1213,6 @@ def build_mcp(
         )
         return await _run_impl(
             runtime, files, entrypoint, ttl_seconds, session_id, deletes, env,
-        )
-
-    # ── preview_app (deprecated alias for run) ──
-    @mcp.tool(
-        annotations={
-            "title": "preview_app (deprecated — use sandbox.run)",
-        },
-    )
-    async def preview_app(
-        runtime: str = Field(
-            description="Same as sandbox.run.runtime.",
-        ),
-        files: dict = Field(default_factory=dict),
-        entrypoint: Optional[str] = Field(default=None),
-        ttl_seconds: Optional[int] = Field(default=None),
-        session_id: Optional[str] = Field(default=None),
-        deletes: list[str] = Field(default_factory=list),
-        env: Optional[dict[str, str]] = Field(default=None),
-    ) -> ToolResult:
-        """DEPRECATED alias for ``sandbox.run``. Kept for one release cycle
-        so existing LiteLLM / model configurations don't break mid-rollout.
-
-        Behaves identically to ``run``. Prefer ``sandbox.run`` in new code —
-        this tool will be removed in a future release.
-        """
-        log.info("MCP tool call: preview_app (deprecated alias for run)")
-        return await _run_impl(
-            runtime, files, entrypoint, ttl_seconds, session_id, deletes, env,
-            deprecated_note="Deprecated: use sandbox.run",
         )
 
     return mcp

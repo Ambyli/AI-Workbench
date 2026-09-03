@@ -28,9 +28,7 @@ Everything below is served by [`ai/sandbox/runner/app.py`](app.py). Jobs endpoin
 | `POST` | `/mcp/` | FastMCP JSON-RPC endpoint — see [MCP section](#mcp) |
 | `GET` | `/tool/openapi.json` | OpenAPI schema for OpenWebUI's Tool Server discovery |
 | `POST` | `/tool/run` | Spawn a sandbox and return an inline-rendered iframe (Content-Disposition: inline). Primary Tool Server endpoint |
-| `POST` | `/tool/preview_app` | DEPRECATED alias for `/tool/run` — kept for one release cycle |
-| `GET` | `/tool/get_runtimes` | Describe available runtimes (Tool Server variant of `sandbox.get_runtimes`) |
-| `GET` | `/tool/list_runtimes` | DEPRECATED alias for `/tool/get_runtimes` |
+| `GET` | `/tool/get_runtime_types` | Describe runtime types (Tool Server variant of `sandbox.get_runtime_types`) |
 
 There is no `PATCH`/`PUT`/`OPTIONS` surface on this service.
 
@@ -142,7 +140,7 @@ Static lint (400) — every `.py` file in `files` is compiled with Python's buil
        "message": "SyntaxError: invalid syntax",
        "text": "def foo("}
     ],
-    "hint": "Fix the syntax errors above and call preview_app again with the same session_id. No container was spawned."
+    "hint": "Fix the syntax errors above and call run again with the same session_id. No container was spawned."
   }
 }
 ```
@@ -154,7 +152,7 @@ Readiness failure (504) — container spawned but didn't bind port 80 within 30 
     "error": "sandbox did not become ready within 30s",
     "session_id": "79FDwxzMkgr4",
     "logs": "Traceback (most recent call last):\n  File \"/app/app.py\"…\nModuleNotFoundError: No module named 'missing_pkg'\n",
-    "hint": "Read the container logs above… Fix the code and call preview_app again with the same session_id — the runner will spawn a fresh container."
+    "hint": "Read the container logs above… Fix the code and call run again with the same session_id — the runner will spawn a fresh container."
   }
 }
 ```
@@ -522,7 +520,7 @@ transfer-encoding: chunked
 | `400` | `session_id` doesn't match `^[A-Za-z0-9_-]{1,64}$`. |
 | `404` | No running sandbox for that session — either it never existed, or it's been reaped and hasn't self-healed. |
 
-**Public URL for end users.** The Caddy proxy exposes this at `${SANDBOX_PROXY_URL}/download/{session_id}` (e.g. `https://chat.zeoenergy.com/sandboxes/download/bfdYm3_H5SD4`) via a dedicated route in `ai/sandbox/proxies/Caddyfile`. The browser gets the same oauth2-proxy auth flow as the preview iframe — no separate credentials, no CORS surprise. `preview_app` includes this URL as a `Download source:` line in its response so the model can share it whenever a user asks to save the code.
+**Public URL for end users.** The Caddy proxy exposes this at `${SANDBOX_PROXY_URL}/download/{session_id}` (e.g. `https://chat.zeoenergy.com/sandboxes/download/bfdYm3_H5SD4`) via a dedicated route in `ai/sandbox/proxies/Caddyfile`. The browser gets the same oauth2-proxy auth flow as the preview iframe — no separate credentials, no CORS surprise. `run` includes this URL as a `Download source:` line in its response so the model can share it whenever a user asks to save the code.
 
 ---
 
@@ -711,11 +709,11 @@ All requests are JSON-RPC 2.0 over HTTP POST. Response bodies come back as eithe
 
 ### Available tools
 
-Twelve tools registered on the `sandbox` MCP server. Every tool returns a `ToolResult` with a `TextContent` block (what the model reads) plus a `structured_content` payload (machine-readable JSON — see the field breakdowns per tool).
+Eleven tools registered on the `sandbox` MCP server. Every tool returns a `ToolResult` with a `TextContent` block (what the model reads) plus a `structured_content` payload (machine-readable JSON — see the field breakdowns per tool).
 
 | Tool | Backing HTTP endpoint | Purpose |
 |---|---|---|
-| `get_runtimes` | (in-process; no HTTP backing) | Describe available runtimes |
+| `get_runtime_types` | (in-process; no HTTP backing) | Describe runtime types (catalog — not a session status check) |
 | `create` | `POST /create` | Reserve an empty warming container |
 | `update_files` | `POST /session/{id}/files` | Overlay files, run health probe |
 | `get_files` | `GET /session/{id}/files` | Read files back from `/app` |
@@ -726,7 +724,6 @@ Twelve tools registered on the `sandbox` MCP server. Every tool returns a `ToolR
 | `close` | `DELETE /session/{id}` | Teardown and slot release |
 | `list_sessions` | `GET /sessions` | Enumerate live sandboxes |
 | `run` | `POST /run` (with `recreate_if_gone=true`) | One-shot: create + update + preview |
-| `preview_app` | (deprecated alias for `run`) | DEPRECATED — replaced by `run` |
 
 **Failure returns.** When the runner raises a 400 (static lint failed), 404 (session not found), 409 (container gone without `recreate_if_gone`), 504 (readiness failure with logs), or similar, the MCP wrapper catches the HTTPException and formats the detail dict into a diagnostic string. The tool returns a normal text response, not an MCP-level error, so the model reads it as tool output and can call the tool again with the same `session_id` to retry.
 
@@ -756,7 +753,7 @@ Preview ready. Sandbox `a1b2c3d4e5f6` at http://sandbox-proxy/a1b2c3d4e5f6/ (exp
 
 The string is what MCP delivers to the model as `content[0].text`. When the model relays the tool result to the user, OpenWebUI's `ContentRenderer` picks up the ` ```html ` fenced block and promotes it to the artifacts split-panel (see [Artifacts docs](https://docs.openwebui.com/features/chat-conversations/chat-features/code-execution/artifacts/)) — no additional model prompting required. The block is a self-contained HTML document (`<!doctype html>` + meta-refresh to the sandbox URL); OpenWebUI's srcdoc iframe navigates itself to the sandbox rather than nesting another `<iframe>` inside. See [SANDBOX.md § How the artifact renders](SANDBOX.md#how-the-artifact-renders-alignment-with-the-openwebui-docs) for the design rationale and the one admin toggle (`iframe Sandbox Allow Same Origin`) that matters for interactive apps. The plain-text lines above the block give the model + user useful context if HTML rendering is disabled or the model paraphrases.
 
-**Important:** the tool's docstring instructs the model to include the returned string VERBATIM in its response. If the model paraphrases or drops the ` ```html ` block, the preview won't render. If you find this happens often, consider using the [`/tool/preview_app` REST endpoint](#openwebui-tool-server-tool) instead — that path bypasses the model and lets OpenWebUI render the iframe directly.
+**Important:** the tool's docstring instructs the model to include the returned string VERBATIM in its response. If the model paraphrases or drops the ` ```html ` block, the preview won't render. If you find this happens often, consider using the [`/tool/run` REST endpoint](#openwebui-tool-server-tool) instead — that path bypasses the model and lets OpenWebUI render the iframe directly.
 
 ### JSON-RPC method examples
 
@@ -844,7 +841,7 @@ A separate FastAPI sub-app mounted at `/tool`, purpose-built for OpenWebUI's **r
 Base URL (on `ai_shared`): `http://sandbox-runner:8000/tool`
 Base URL (from the host): `http://localhost:8012/tool`
 
-OpenWebUI fetches `GET /tool/openapi.json` to discover the tool schema, then calls `POST /tool/run` when the model wants to embed a preview. The response has `Content-Disposition: inline` so OpenWebUI renders it as a sandboxed iframe under the tool call indicator. `POST /tool/preview_app` is a deprecated alias kept for one release cycle so existing registrations don't break mid-rollout.
+OpenWebUI fetches `GET /tool/openapi.json` to discover the tool schema, then calls `POST /tool/run` when the model wants to embed a preview. The response has `Content-Disposition: inline` so OpenWebUI renders it as a sandboxed iframe under the tool call indicator.
 
 ### `GET /tool/openapi.json`
 
@@ -887,13 +884,9 @@ Access-Control-Expose-Headers: Content-Disposition
 
 **Errors:** same status codes as `POST /run` (`400` unknown runtime, `413` payload too large, `429` pool full, `500` spawn failure, `504` readiness timeout). Errors return JSON rather than HTML.
 
-### `POST /tool/preview_app`
+### `GET /tool/get_runtime_types`
 
-**DEPRECATED alias for `POST /tool/run`.** Kept for one release cycle so existing OpenWebUI Tool Server registrations don't break mid-rollout. Same body, same response shape. Migrate to `/tool/run` at your convenience.
-
-### `GET /tool/get_runtimes`
-
-Describe available runtimes. Same JSON payload as the `sandbox.get_runtimes` MCP tool. `GET /tool/list_runtimes` is a deprecated alias.
+Describe the runtime types (`static`, `python`, `node`, …) this deployment supports. Same JSON payload as the `sandbox.get_runtime_types` MCP tool. This is a catalog, not a session status check — it does not know about any specific sandbox. For a running sandbox's state, use `/session/{id}/logs`, `/session/{id}/files`, or `/sessions`.
 
 ---
 

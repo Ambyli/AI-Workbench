@@ -7,7 +7,7 @@ per-sandbox Caddy config.
 
 Adding a new language is a single entry here plus a new Dockerfile in
 ``ai/sandbox/images/<name>.Dockerfile``. The runner enforces that ``runtime``
-values from ``POST /run`` and the ``preview_app`` / ``create`` / ``update_files``
+values from ``POST /run`` and the ``run`` / ``create`` / ``update_files``
 MCP tools are keys in this dict — nothing else is spawnable.
 """
 
@@ -60,7 +60,7 @@ class Runtime:
             deleted by the real code. Kept minimal so cold start under
             ``create`` is nearly indistinguishable from the empty case.
         summary: One-line human/model-readable description shown by the
-            ``get_runtimes`` tool. Used by models to decide which
+            ``get_runtime_types`` tool. Used by models to decide which
             runtime fits the user's request.
         prebaked_packages: Packages already installed in the base image;
             callers don't need to include them in requirements.txt or
@@ -71,7 +71,7 @@ class Runtime:
             ``static`` where nginx is the fixed process and models
             confusingly try to pass something like
             ``python3 -m http.server`` (which the image doesn't have).
-        example_files: A minimal working ``files`` map the ``get_runtimes``
+        example_files: A minimal working ``files`` map the ``get_runtime_types``
             tool returns so a model can pattern-match a valid request.
     """
 
@@ -200,7 +200,7 @@ RUNTIMES: dict[str, Runtime] = {
 def describe_runtimes() -> list[dict]:
     """Return every runtime as a plain-JSON list.
 
-    Consumed by both the ``get_runtimes`` MCP tool and its REST
+    Consumed by both the ``get_runtime_types`` MCP tool and its REST
     counterpart. Kept as a plain function (not a method) so both call
     sites can import it without pulling in ``FastMCP`` state.
     """

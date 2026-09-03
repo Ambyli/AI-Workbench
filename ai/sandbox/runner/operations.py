@@ -247,7 +247,7 @@ async def _do_create(
         raise HTTPException(
             400,
             f"unknown runtime {runtime!r}. Valid: {sorted(RUNTIMES)}. "
-            "Call get_runtimes for full descriptions.",
+            "Call get_runtime_types for full descriptions.",
         )
 
     if not rt.allows_custom_entrypoint and entrypoint:
@@ -992,7 +992,7 @@ async def _reuse_or_spawn(
         raise HTTPException(
             400,
             f"unknown runtime {runtime!r}. Valid: {sorted(RUNTIMES)}. "
-            "Call get_runtimes for full descriptions.",
+            "Call get_runtime_types for full descriptions.",
         )
 
     if not rt.allows_custom_entrypoint and entrypoint:

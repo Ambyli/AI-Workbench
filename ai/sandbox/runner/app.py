@@ -26,7 +26,7 @@ decorators, mounts. Business logic lives in sibling modules — see
 
 MCP tool surface (all under the ``sandbox`` server):
 
-    get_runtimes()                  — describe available runtimes
+    get_runtime_types()             — describe available runtime types (catalog)
     create(runtime, env?, ...)      — warm an empty container, returns session
     update_files(session_id, files, deletes?, recreate_if_gone?)
                                     — overlay files, health-probe after
@@ -38,7 +38,6 @@ MCP tool surface (all under the ``sandbox`` server):
     close(session_id)               — teardown and release slot
     list_sessions()                 — enumerate live sandboxes globally
     run(runtime, files, ...)        — convenience: create + update + preview
-    preview_app(...)                — deprecated alias for run
 
 HTTP endpoints:
 
@@ -54,9 +53,9 @@ HTTP endpoints:
     POST /session/{id}/patch        strict line-range file edits (patch_files)
     /mcp                            FastMCP HTTP transport
     /tool/*                         OpenWebUI Tool Server sub-app:
-        GET  /tool/openapi.json     OpenAPI spec for OpenWebUI discovery
-        POST /tool/run              spawn + return HTMLResponse iframe
-        POST /tool/preview_app      deprecated alias for /tool/run
+        GET  /tool/openapi.json         OpenAPI spec for OpenWebUI discovery
+        GET  /tool/get_runtime_types    describe runtime types
+        POST /tool/run                  spawn + return HTMLResponse iframe
 """
 
 from __future__ import annotations

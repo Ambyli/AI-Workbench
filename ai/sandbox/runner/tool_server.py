@@ -83,43 +83,19 @@ async def tool_run(req: ToolRunRequest) -> HTMLResponse:
     )
 
 
-@tool_app.post(
-    "/preview_app",
-    response_class=HTMLResponse,
-    operation_id="preview_app",
-    summary="Deprecated alias for /tool/run",
-    description=(
-        "DEPRECATED — use /tool/run. Kept for one release cycle so "
-        "existing OpenWebUI Tool Server registrations don't break "
-        "mid-rollout. Behaves identically to /tool/run."
-    ),
-    deprecated=True,
-)
-async def tool_preview_app(req: ToolRunRequest) -> HTMLResponse:
-    log.info("Tool Server: /tool/preview_app called (deprecated alias)")
-    return await tool_run(req)
-
-
 @tool_app.get(
-    "/get_runtimes",
-    operation_id="get_runtimes",
-    summary="Describe available runtimes",
+    "/get_runtime_types",
+    operation_id="get_runtime_types",
+    summary="Describe available runtime types (catalog)",
     description=(
-        "Returns metadata for each runtime: summary, default entrypoint, "
-        "pre-baked packages, and a minimal example files map."
+        "Returns metadata for each RUNTIME TYPE this deployment supports "
+        "(static, python, node, ...): summary, default entrypoint, "
+        "pre-baked packages, and a minimal example files map. This is a "
+        "catalog, not a session status check — it does not know about any "
+        "specific sandbox. For a running sandbox's state, use /session/"
+        "{id}/logs, /session/{id}/files, or /sessions."
     ),
 )
-async def tool_get_runtimes() -> list[dict]:
+async def tool_get_runtime_types() -> list[dict]:
     from runtimes import describe_runtimes as _dr
     return _dr()
-
-
-# Deprecated alias for the previous name.
-@tool_app.get(
-    "/list_runtimes",
-    operation_id="list_runtimes",
-    summary="Deprecated alias for /tool/get_runtimes",
-    deprecated=True,
-)
-async def tool_list_runtimes() -> list[dict]:
-    return await tool_get_runtimes()

@@ -817,11 +817,7 @@ class Spawner:
         response, which was the whole point of the scheme.
 
         Trailing ``| tail -n {n_lines}`` bounds response size against
-        a chatty reload (Vite can be verbose on config changes).
-
-        Backwards-compat: also matches the older ``preview_app reload``
-        marker written by the pre-refactor codebase, so a session that
-        spanned the deploy still gets clean tail behaviour."""
+        a chatty reload (Vite can be verbose on config changes)."""
         try:
             container = self._client.containers.get(container_name)
         except NotFound:
@@ -837,14 +833,14 @@ class Spawner:
             #   otherwise → append to buf if we've seen a marker.
             # An unmarked file therefore returns empty rather than
             # dumping full history — the failure mode this exists to
-            # prevent. Regex matches both current and legacy markers.
+            # prevent.
             result = container.exec_run(
                 [
                     "/bin/sh",
                     "-c",
                     (
                         "awk 'BEGIN{seen=0} "
-                        "/--- (update_files|preview_app) reload /"
+                        "/--- update_files reload /"
                         "{buf=\"\"; seen=1; next} "
                         "seen{buf = buf $0 ORS} "
                         "END{printf \"%s\", buf}' /tmp/sandbox.log "

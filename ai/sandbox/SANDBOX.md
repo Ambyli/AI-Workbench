@@ -102,6 +102,22 @@ If any of the "must fail" checks succeeds, revert the change and investigate bef
 - **`sandbox-egress`** — tinyproxy, dual-homed on `sandbox_net` (inbound from sandboxes) and `sandbox_egress_out` (outbound to the internet). Allowlist enforced by [`tinyproxy.filter`](proxies/tinyproxy.filter) with `FilterDefaultDeny Yes`. Built from [`Dockerfile.sandbox-egress`](proxies/egress.Dockerfile) (alpine + `apk add tinyproxy`) rather than a pulled image, so we own the entrypoint + permission model.
 - **`sandbox-db`** — Postgres 16-alpine. Backing store for `common.jobs.PostgresRegistry`. See [`shared/common/src/common/jobs/postgres.py`](../shared/common/src/common/jobs/postgres.py).
 
+### Runner file layout
+
+The runner is split across:
+
+- [`app.py`](runner/app.py) — FastAPI orchestration: config, lifespan, endpoint decorators, mounts. MCP bridge callables live here too.
+- [`state.py`](runner/state.py) — module-level singletons (`registry`, `spawner`, `reaper`, `slot_sem`) populated in `lifespan()`.
+- [`models.py`](runner/models.py) — pydantic request/response models and the shared validators (files-map, env). Payload-limit constants (`MAX_FILE_BYTES`, `MAX_PAYLOAD_BYTES`) and the session-id regex live here since the models depend on them.
+- [`operations.py`](runner/operations.py) — `_do_*` core operations shared between HTTP endpoints and MCP tools. `_reuse_or_spawn` (the legacy `POST /run` + `run` MCP path) lives here.
+- [`tool_server.py`](runner/tool_server.py) — OpenWebUI Tool Server sub-app, mounted at `/tool`.
+- [`sandbox_mcp.py`](runner/sandbox_mcp.py) — FastMCP tool surface, mounted at `/mcp`.
+- [`spawner.py`](runner/spawner.py) — Docker interactions (spawn / spawn_empty / update_files / patch_files / exec_command / read_files / probe_health).
+- [`reaper.py`](runner/reaper.py) — TTL and idle-TTL sweeper.
+- [`runtimes.py`](runner/runtimes.py) — runtime registry (`static`, `python`, `node`).
+
+Import graph is strictly one direction: `app.py` → `operations.py` → `state.py` / `models.py` / `spawner.py` / `runtimes.py`. `tool_server.py` also imports `operations.py` and `models.py`. Nothing imports back into `app.py`.
+
 ## Runtimes
 
 Add a new one by adding a Dockerfile + one entry in [`ai/sandbox/runner/runtimes.py`](runner/runtimes.py).

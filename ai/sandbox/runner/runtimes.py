@@ -7,17 +7,32 @@ per-sandbox Caddy config.
 
 Adding a new language is a single entry here plus a new Dockerfile in
 ``ai/sandbox/images/<name>.Dockerfile``. The runner enforces that ``runtime``
-values from ``POST /run`` and the MCP ``preview_app`` tool are keys in
-this dict — nothing else is spawnable.
+values from ``POST /run`` and the ``preview_app`` / ``create`` / ``update_files``
+MCP tools are keys in this dict — nothing else is spawnable.
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 log = logging.getLogger("sandbox-runner.runtimes")
+
+
+# Placeholder body served by every runtime while the model is still writing
+# code. The runtime's ``warming_files`` overrides the specifics (title text,
+# language shim) but the visual identity is intentionally shared so an
+# operator opening the iframe knows immediately what state the sandbox is in.
+_WARMING_HTML_BODY = (
+    "<!doctype html><html><head><meta charset=\"utf-8\"><title>"
+    "sandbox warming</title></head><body style=\""
+    "margin:0;font-family:system-ui;padding:1.5rem;background:#0e1116;"
+    "color:#e6edf3\"><h1 style=\"margin:0 0 0.5rem\">sandbox warming</h1>"
+    "<p style=\"margin:0;opacity:0.8\">the model is preparing your app. "
+    "this placeholder is replaced as soon as <code>update_files</code> "
+    "runs.</p></body></html>"
+)
 
 
 @dataclass(frozen=True)
@@ -39,8 +54,13 @@ class Runtime:
         default_files: Files written into every new sandbox even if the
             caller didn't provide them. Useful for a runtime-specific
             wrapper script the entrypoint invokes.
+        warming_files: Placeholder files written into the container when
+            ``create`` is called without user files. Once the model calls
+            ``update_files`` on the same session, these are overlaid /
+            deleted by the real code. Kept minimal so cold start under
+            ``create`` is nearly indistinguishable from the empty case.
         summary: One-line human/model-readable description shown by the
-            ``list_runtimes`` tool. Used by models to decide which
+            ``get_runtimes`` tool. Used by models to decide which
             runtime fits the user's request.
         prebaked_packages: Packages already installed in the base image;
             callers don't need to include them in requirements.txt or
@@ -51,7 +71,7 @@ class Runtime:
             ``static`` where nginx is the fixed process and models
             confusingly try to pass something like
             ``python3 -m http.server`` (which the image doesn't have).
-        example_files: A minimal working ``files`` map the ``list_runtimes``
+        example_files: A minimal working ``files`` map the ``get_runtimes``
             tool returns so a model can pattern-match a valid request.
     """
 
@@ -64,6 +84,7 @@ class Runtime:
     internal_port: int = 80
     readiness_probe_path: str = "/"
     default_files: dict[str, str] | None = None
+    warming_files: dict[str, str] = field(default_factory=dict)
 
 
 RUNTIMES: dict[str, Runtime] = {
@@ -92,6 +113,10 @@ RUNTIMES: dict[str, Runtime] = {
                 "</body></html>"
             ),
         },
+        # nginx needs at least one file at /app/index.html to satisfy the
+        # readiness probe. The warming file gets overwritten by the model's
+        # own index.html on the first update_files call.
+        warming_files={"index.html": _WARMING_HTML_BODY},
     ),
     # Python 3.11-slim with the common web-app frameworks pre-installed.
     # Entrypoint script (baked into the image) runs ``pip install -r
@@ -126,6 +151,17 @@ RUNTIMES: dict[str, Runtime] = {
                 "st.slider('n', 0, 100)\n"
             ),
         },
+        # Streamlit needs an app.py that imports cleanly and renders SOMETHING
+        # so the readiness probe passes. Minimal single-liner keeps warm-time
+        # under a second.
+        warming_files={
+            "app.py": (
+                "import streamlit as st\n"
+                "st.set_page_config(page_title='warming')\n"
+                "st.markdown('### sandbox warming')\n"
+                "st.markdown('the model is preparing your app.')\n"
+            ),
+        },
     ),
     # Node 20-slim with vite/react/next/express pre-installed globally.
     # Same install-if-present entrypoint pattern for package.json.
@@ -153,6 +189,10 @@ RUNTIMES: dict[str, Runtime] = {
                 "app.listen(80, '0.0.0.0');\n"
             ),
         },
+        # `npx serve -l 80 .` needs an index.html at the root to serve; a
+        # missing file causes the readiness probe to see a 404 which
+        # counts as ready (2xx-4xx) but confuses the user opening the URL.
+        warming_files={"index.html": _WARMING_HTML_BODY},
     ),
 }
 
@@ -160,7 +200,7 @@ RUNTIMES: dict[str, Runtime] = {
 def describe_runtimes() -> list[dict]:
     """Return every runtime as a plain-JSON list.
 
-    Consumed by both the ``list_runtimes`` MCP tool and its REST
+    Consumed by both the ``get_runtimes`` MCP tool and its REST
     counterpart. Kept as a plain function (not a method) so both call
     sites can import it without pulling in ``FastMCP`` state.
     """

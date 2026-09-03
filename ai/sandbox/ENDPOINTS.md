@@ -10,18 +10,26 @@ Everything below is served by [`ai/sandbox/runner/app.py`](app.py). Jobs endpoin
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/health` | Liveness + DB status |
-| `POST` | `/run` | Spawn a sandbox — or update an existing one when `session_id` is passed. Returns JSON with URL, session_id, and `reused` flag |
-| `DELETE` | `/session/{session_id}` | Explicitly tear down a session's running sandbox. Idempotent |
-| `GET` | `/session/{session_id}/download` | Stream the running sandbox's `/app` as a tar archive. Follows self-heal (resolves session at request time). Also exposed publicly via Caddy at `/sandboxes/download/{session_id}` |
-| `GET` | `/session/{session_id}/logs` | Return the last N lines (default 100, max 1000) of the running sandbox's stdout+stderr. Follows self-heal. Diagnostic for apps that render errors in-browser only (Flask/Vite/Next tracebacks; Streamlit does not use stdout for user errors) |
+| `POST` | `/run` | Spawn a sandbox — or update an existing one when `session_id` is passed. Backing endpoint for `sandbox.run`. Returns JSON with URL, session_id, `reused`, `app_status`, `recreated` |
+| `POST` | `/create` | Reserve an empty warming container of the chosen runtime. Backing endpoint for `sandbox.create` |
+| `GET` | `/sessions` | Enumerate live sessions. Backing endpoint for `sandbox.list_sessions` |
+| `POST` | `/session/{session_id}/files` | Overlay files into a live sandbox. Backing endpoint for `sandbox.update_files` |
+| `GET` | `/session/{session_id}/files` | Read files back from `/app` — dir listing when `paths` is omitted, contents inline otherwise. Backing endpoint for `sandbox.get_files` |
+| `POST` | `/session/{session_id}/exec` | Run a non-interactive shell command inside the container. Backing endpoint for `sandbox.exec` |
+| `DELETE` | `/session/{session_id}` | Tear down a session's running sandbox. Backing endpoint for `sandbox.close`. Idempotent |
+| `GET` | `/session/{session_id}/download` | Stream the running sandbox's `/app` as a tar archive. Follows self-heal. Also exposed publicly via Caddy at `/sandboxes/download/{session_id}` |
+| `GET` | `/session/{session_id}/logs` | Return the last N lines (default 100, max 1000) of the running sandbox's stdout+stderr. Follows self-heal. Backing endpoint for `sandbox.get_logs` |
 | `GET` | `/jobs` | List every sandbox in the registry (running + terminal) |
 | `GET` | `/jobs/{sandbox_id}` | One sandbox's snapshot |
-| `GET` | `/jobs/{sandbox_id}/download` | Direct tar download by internal id. Useful for operators; does not follow self-heal |
-| `GET` | `/jobs/{sandbox_id}/logs` | Direct log fetch by internal id. Useful when session self-healed to a new container but you want the OLD one's output |
+| `GET` | `/jobs/{sandbox_id}/download` | Direct tar download by internal id. Does not follow self-heal |
+| `GET` | `/jobs/{sandbox_id}/logs` | Direct log fetch by internal id. Useful when session self-healed but you want the OLD container's output |
 | `DELETE` | `/jobs/{sandbox_id}` | Tear a sandbox down early by internal id, release its slot |
 | `POST` | `/mcp/` | FastMCP JSON-RPC endpoint — see [MCP section](#mcp) |
 | `GET` | `/tool/openapi.json` | OpenAPI schema for OpenWebUI's Tool Server discovery |
-| `POST` | `/tool/preview_app` | Spawn a sandbox and return an inline-rendered iframe (Content-Disposition: inline) — see [Tool Server section](#openwebui-tool-server-tool) |
+| `POST` | `/tool/run` | Spawn a sandbox and return an inline-rendered iframe (Content-Disposition: inline). Primary Tool Server endpoint |
+| `POST` | `/tool/preview_app` | DEPRECATED alias for `/tool/run` — kept for one release cycle |
+| `GET` | `/tool/get_runtimes` | Describe available runtimes (Tool Server variant of `sandbox.get_runtimes`) |
+| `GET` | `/tool/list_runtimes` | DEPRECATED alias for `/tool/get_runtimes` |
 
 There is no `PATCH`/`PUT`/`OPTIONS` surface on this service.
 
@@ -68,12 +76,14 @@ Two modes, driven by whether `session_id` is present:
 **Body:**
 ```json
 {
-  "runtime":     "static",
-  "files":       { "index.html": "<h1>hello</h1>" },
-  "entrypoint":  null,
-  "ttl_seconds": 900,
-  "session_id":  null,
-  "deletes":     []
+  "runtime":            "static",
+  "files":              { "index.html": "<h1>hello</h1>" },
+  "entrypoint":         null,
+  "ttl_seconds":        900,
+  "session_id":         null,
+  "deletes":            [],
+  "env":                null,
+  "recreate_if_gone":   true
 }
 ```
 
@@ -82,11 +92,13 @@ Field semantics:
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `runtime` | string | yes | One of `static`, `python`, `node`. See [`runtimes.py`](runner/runtimes.py) for the current registry. |
-| `files` | `{ path: content }` | no | Map of relative filesystem paths → text contents. On the first call: the initial file set. On a follow-up: an overlay — paths listed here overwrite files in the running container, unlisted files are preserved. Absolute paths and `..` are rejected. |
-| `entrypoint` | string | no | Shell command that must bind to port `80` inside the container. Leave `null` to use the runtime's default. Ignored on follow-up calls — the entrypoint is fixed at spawn time. |
+| `files` | `{ path: str \| {encoding, content} }` | no | Map of relative paths → contents. Values are either UTF-8 strings, or `{"encoding": "base64", "content": "..."}` for binary payloads (images, PDFs, wheels). On the first call: the initial file set. On a follow-up: an overlay — paths listed here overwrite files in the running container, unlisted files are preserved. Absolute paths and `..` are rejected. Per-file cap: `SANDBOX_MAX_FILE_BYTES`; total cap: `SANDBOX_MAX_PAYLOAD_BYTES`. |
+| `entrypoint` | string | no | Shell command that must bind to port `80`. Leave `null` for the runtime's default. Ignored on follow-up calls — the entrypoint is fixed at spawn time. |
 | `ttl_seconds` | int | no | Idle lifetime. Server clamps to `SANDBOX_HARD_TTL_SECONDS` (3600). Defaults to `SANDBOX_DEFAULT_TTL_SECONDS` (900). |
-| `session_id` | string | no | Persistent handle across turns. Regex `^[A-Za-z0-9_-]{1,64}$`. Omit on first call — the server generates one. Pass the value from the previous response to update in place. |
-| `deletes` | `[path, …]` | no | Relative paths under `/app` to remove on a follow-up call. Same sanitization as `files`. Ignored on the first call. |
+| `session_id` | string | no | Persistent handle across turns. Regex `^[A-Za-z0-9_-]{1,64}$`. Omit on first call — the server generates one. |
+| `deletes` | `[path, …]` | no | Relative paths under `/app` to remove. Same sanitization as `files`. Ignored on the first call. |
+| `env` | `{str: str}` | no | Process env vars set inside the container. Immutable after spawn (self-heal replays the recorded env). Reserved keys (`HTTP_PROXY`, `PYTHONUNBUFFERED`, `TERM`, etc.) are rejected. |
+| `recreate_if_gone` | bool | no | Default `true` for backward compat with `POST /run`. If the session's container is gone, silently respawn. Set `false` to force the caller to reason about self-heal explicitly (recommended for direct `update_files` calls, but `/run` keeps the historical default). |
 
 **Response (200):**
 ```json
@@ -95,9 +107,15 @@ Field semantics:
   "session_id": "bfdYm3_H5SD4",
   "url":        "http://sandbox-proxy/a1b2c3d4e5f6/",
   "expires_at": "2026-08-27T18:15:32.114513+00:00",
-  "reused":     false
+  "reused":     false,
+  "runtime":    "static",
+  "startup_output": "",
+  "app_status": { "code": 200, "latency_ms": 0, "note": "readiness ok" },
+  "recreated":  false
 }
 ```
+
+`app_status` on the reuse branch is a live HTTP probe (single-shot GET against the runtime's readiness path, 3 s deadline) — `{ code, latency_ms }` for a real HTTP reply or `{ error }` for a network failure. On a fresh spawn it's a placeholder acknowledging the readiness_ok gate already passed. `recreated: true` means the session was found dead and respawned in place (only possible when `recreate_if_gone: true`).
 
 The returned `url` is reachable at `http://sandbox-proxy` on the `ai_shared` Docker network (i.e. from OpenWebUI). From the host it's at `http://localhost:8011/{sandbox_id}/`. `reused: true` means the response came from the session-reuse path and the container was NOT respawned.
 
@@ -204,6 +222,160 @@ curl -X POST http://localhost:8012/run \
     "deletes": ["old-page.html"]
   }'
 ```
+
+---
+
+## `POST /create`
+
+Reserve an empty warming container of the chosen runtime. Backs the `sandbox.create` MCP tool. Use this when a caller wants to warm a container while it's still composing the code — a subsequent `POST /session/{id}/files` hits a warm container and hot-reloads instantly.
+
+**Body:**
+```json
+{
+  "runtime":     "python",
+  "ttl_seconds": 900,
+  "entrypoint":  null,
+  "env":         { "OPENAI_API_KEY": "sk-..." }
+}
+```
+
+**Response (200):** same shape as `POST /run`. `startup_output` may already carry a Streamlit "You can now view your Streamlit app…" line because the warming file has been running long enough for the dev server to bind port 80.
+
+**Errors:** same status codes as `POST /run` (400 unknown runtime / custom entrypoint on static, 429 pool full, 504 warming container didn't bind port 80).
+
+---
+
+## `GET /sessions`
+
+Enumerate every currently-running sandbox. Backs `sandbox.list_sessions`.
+
+**Response (200):**
+```json
+{
+  "count": 2,
+  "sessions": [
+    {
+      "session_id": "bfdYm3_H5SD4",
+      "sandbox_id": "a1b2c3d4e5f6",
+      "runtime":    "python",
+      "url":        "https://chat.zeoenergy.com/sandboxes/a1b2c3d4e5f6/",
+      "created_at": "...",
+      "updated_at": "...",
+      "expires_at": "...",
+      "last_used_at": "...",
+      "phase":      "running"
+    }
+  ]
+}
+```
+
+Returns EVERY live session globally — no per-user filtering. Documented explicitly so callers don't assume isolation.
+
+---
+
+## `POST /session/{session_id}/files`
+
+Overlay files into a live sandbox. Backs `sandbox.update_files`.
+
+**Body:**
+```json
+{
+  "files":            { "app.py": "import streamlit as st\nst.title('v2')" },
+  "deletes":          ["stale-page.html"],
+  "recreate_if_gone": false
+}
+```
+
+Field semantics:
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `files` | `{ path: str \| {encoding, content} }` | no | Same shape as `POST /run.files`. Absent paths preserved. |
+| `deletes` | `[path, …]` | no | Relative paths under `/app` to remove. |
+| `recreate_if_gone` | bool | no | Default **false** (opt-in self-heal). If true and the container is gone, respawn under the same session_id and reapply the recorded env — files installed via `exec` and non-listed in-container files are LOST. |
+
+**Response (200):** same shape as `POST /run` — `sandbox_id`, `session_id`, `url` (unchanged if the container was alive), `reused: true`, `app_status` from the health probe, `recreated` set true if self-heal ran.
+
+**Errors:**
+
+| Status | Meaning |
+|---|---|
+| `400` | Static lint failed, invalid session_id, or unsafe path in `files`/`deletes`. |
+| `404` | `session_id` never existed. |
+| `409` | Container is gone AND `recreate_if_gone` was false. Body carries an `error`, `session_id`, and remediation hint. |
+| `413` | Payload exceeded `SANDBOX_MAX_FILE_BYTES` / `SANDBOX_MAX_PAYLOAD_BYTES`. |
+
+---
+
+## `GET /session/{session_id}/files`
+
+Read files back from the running sandbox's `/app`. Backs `sandbox.get_files`.
+
+**Query params:**
+
+| Param | Type | Default | Notes |
+|---|---|---|---|
+| `paths` | string | (unset) | Comma-separated relative paths under `/app`. Omit for a directory listing (paths + sizes only). |
+| `max_bytes_per_file` | int | `8192` | Truncate each returned file to this many bytes. Hard cap 65536. |
+
+**Response (200):**
+```json
+{
+  "session_id": "bfdYm3_H5SD4",
+  "sandbox_id": "a1b2c3d4e5f6",
+  "files": [
+    {"path": "app.py", "size": 1247, "encoding": "utf-8",
+     "content": "import streamlit as st\n...", "truncated": false},
+    {"path": "assets/logo.png", "size": 12000, "encoding": "base64",
+     "content": "iVBOR...", "truncated": false}
+  ]
+}
+```
+
+Binary content is base64-encoded — same shape you can round-trip into `POST /session/{id}/files`. Missing paths get an `error: "not found"` entry rather than raising.
+
+**Errors:** 400 on invalid session_id, 404 on no running sandbox.
+
+---
+
+## `POST /session/{session_id}/exec`
+
+Run a non-interactive shell command inside the running container. Backs `sandbox.exec`.
+
+**Body:**
+```json
+{
+  "command":         "pip install requests",
+  "timeout_seconds": 30,
+  "working_dir":     "/app"
+}
+```
+
+Field semantics:
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `command` | string | yes | Run via `sh -c`. Stdin is closed. |
+| `timeout_seconds` | int | no | Default 30, hard cap 120. On timeout the exec is left running; the response is marked `timed_out`. |
+| `working_dir` | string | no | Default `/app`. Must be under `/app` — absolute paths outside and `..` traversal are rejected. |
+
+**Response (200):**
+```json
+{
+  "session_id":  "bfdYm3_H5SD4",
+  "sandbox_id":  "a1b2c3d4e5f6",
+  "command":     "pip install requests",
+  "exit_code":   0,
+  "duration_ms": 2417,
+  "output":      "Collecting requests\n...\nSuccessfully installed requests-2.32.3\n",
+  "truncated":   false,
+  "timed_out":   false
+}
+```
+
+Output is capped at 8 KB; when truncated, the last 8 KB are returned and `truncated: true` is set. See [`SANDBOX.md § Runtime introspection (exec)`](SANDBOX.md#runtime-introspection-exec) for the state-drift, allowlist, and interactivity caveats.
+
+**Errors:** 400 on invalid session_id, empty command, or unsafe `working_dir`; 404 on no running sandbox.
 
 ---
 
@@ -446,37 +618,36 @@ All requests are JSON-RPC 2.0 over HTTP POST. Response bodies come back as eithe
 
 ### Available tools
 
-Three tools are registered — `list_runtimes` (discovery), `preview_app` (spawn / update), and `get_sandbox_logs` (diagnostic).
+Eleven tools registered on the `sandbox` MCP server. Every tool returns a `ToolResult` with a `TextContent` block (what the model reads) plus a `structured_content` payload (machine-readable JSON — see the field breakdowns per tool).
 
-**`preview_app`** — spawn a sandbox from the shape the model can produce inline.
-
-Parameters (same field semantics as `POST /run`):
-
-| Param | Type | Required |
+| Tool | Backing HTTP endpoint | Purpose |
 |---|---|---|
-| `runtime` | string | yes |
-| `files` | `{ path: content }` | no (empty overlay on follow-up calls is valid) |
-| `entrypoint` | string | no |
-| `ttl_seconds` | int | no |
-| `session_id` | string | no |
-| `deletes` | `[path, …]` | no |
+| `get_runtimes` | (in-process; no HTTP backing) | Describe available runtimes |
+| `create` | `POST /create` | Reserve an empty warming container |
+| `update_files` | `POST /session/{id}/files` | Overlay files, run health probe |
+| `get_files` | `GET /session/{id}/files` | Read files back from `/app` |
+| `get_logs` | `GET /session/{id}/logs` | Tail combined stdout+stderr |
+| `exec` | `POST /session/{id}/exec` | Run a non-interactive shell command |
+| `preview` | (in-process; reads from registry only) | Return the iframe artifact HTML |
+| `close` | `DELETE /session/{id}` | Teardown and slot release |
+| `list_sessions` | `GET /sessions` | Enumerate live sandboxes |
+| `run` | `POST /run` (with `recreate_if_gone=true`) | One-shot: create + update + preview |
+| `preview_app` | (deprecated alias for `run`) | DEPRECATED — replaced by `run` |
 
-**Failure returns.** When the runner raises a 400 (static lint failed) or 504 (readiness failure with logs), the MCP wrapper catches the HTTPException and formats the detail dict into a compiler-style diagnostic string — the tool returns a normal text response, not an MCP-level error, so the model reads it as tool output and can call `preview_app` again with the same `session_id` to retry.
+**Failure returns.** When the runner raises a 400 (static lint failed), 404 (session not found), 409 (container gone without `recreate_if_gone`), 504 (readiness failure with logs), or similar, the MCP wrapper catches the HTTPException and formats the detail dict into a diagnostic string. The tool returns a normal text response, not an MCP-level error, so the model reads it as tool output and can call the tool again with the same `session_id` to retry.
 
-**`get_sandbox_logs`** — fetch the tail of a running sandbox's stdout+stderr on demand.
+**Text-shape stability.** `run` and `preview` include a `Session id: <sid>` line and a fenced ```` ```html ```` block — both are load-bearing. Models are instructed to relay the response verbatim so OpenWebUI's `ContentRenderer` promotes the block into the artifacts panel. The `Session id:` line is what the model greps back on the next turn.
 
-Parameters:
+**Structured payload highlights:**
 
-| Param | Type | Required | Notes |
-|---|---|---|---|
-| `session_id` | string | yes | Must match `^[A-Za-z0-9_-]{1,64}$` |
-| `lines` | int | no | Default 100, clamped 1..1000 |
-
-Use case: `preview_app` returned a normal "ready" response but the user reports the running app looks broken ("the button doesn't work", "undefined is not a function", a Streamlit error card, etc). Flask / FastAPI / Vite / Next dev servers all print the offending Python traceback / JS stack to stdout before rendering an error in the browser. Fetching the logs lets the model diagnose the bug and re-issue `preview_app` without the user having to copy-paste error text back into the chat.
-
-Do NOT call this after a `preview_app` FAILURE — those already include the container logs in the tool response.
-
-**`list_runtimes`** — inventory of installed runtimes, their pre-baked packages, and example `files` maps. No parameters. Model should call this before `preview_app` if it's unsure which runtime fits the user's request.
+- `create` / `run` → `{ok, session_id, sandbox_id, url, expires_at, runtime, app_status, reused, recreated}`
+- `update_files` → adds `startup_output`, `app_status`, `recreated` (self-heal flag)
+- `get_files` → `{ok, session_id, sandbox_id, files: [{path, size, encoding, content, truncated, error?}, …]}`
+- `get_logs` → `{ok, session_id, sandbox_id, lines_requested, logs, empty?}`
+- `exec` → `{ok, session_id, sandbox_id, command, exit_code, duration_ms, output, truncated, timed_out}`
+- `preview` → `{ok, session_id, sandbox_id, url, iframe_html, download_url}`
+- `close` → `{ok, session_id, sandbox_id?, was_running}`
+- `list_sessions` → `{ok, count, sessions: [...]}`
 
 **Result — a single string (not a JSON object)**:
 
@@ -524,7 +695,7 @@ curl -X POST http://localhost:8012/mcp/ \
   }'
 ```
 
-**`tools/call`** — invoke `preview_app`.
+**`tools/call`** — invoke `run` (the one-shot).
 ```bash
 curl -X POST http://localhost:8012/mcp/ \
   -H 'Content-Type: application/json' \
@@ -534,13 +705,36 @@ curl -X POST http://localhost:8012/mcp/ \
     "id": 3,
     "method": "tools/call",
     "params": {
-      "name": "preview_app",
+      "name": "run",
       "arguments": {
         "runtime": "static",
         "files": {"index.html": "<h1>from mcp</h1>"}
       }
     }
   }'
+```
+
+Or the pipelined pattern — warm the container first, then send code:
+```bash
+# 1. Reserve a warming Python container
+curl -X POST http://localhost:8012/mcp/ ... \
+  -d '{... "method": "tools/call",
+        "params": {"name": "create",
+                   "arguments": {"runtime": "python"}}}'
+# → returns session_id X
+
+# 2. Overlay code once you've finished writing it (opt-in self-heal off)
+curl -X POST http://localhost:8012/mcp/ ... \
+  -d '{... "method": "tools/call",
+        "params": {"name": "update_files",
+                   "arguments": {"session_id": "X",
+                                 "files": {"app.py": "import streamlit as st..."}}}}'
+
+# 3. Show the user
+curl -X POST http://localhost:8012/mcp/ ... \
+  -d '{... "method": "tools/call",
+        "params": {"name": "preview",
+                   "arguments": {"session_id": "X"}}}'
 ```
 
 Session semantics: the first `initialize` returns a session id in the response headers (`Mcp-Session-Id`). Subsequent calls should include it as a request header. FastMCP handles this automatically for clients that follow the streamable-HTTP spec (LiteLLM, Claude Code, etc.).
@@ -555,7 +749,7 @@ A separate FastAPI sub-app mounted at `/tool`, purpose-built for OpenWebUI's **r
 Base URL (on `ai_shared`): `http://sandbox-runner:8000/tool`
 Base URL (from the host): `http://localhost:8012/tool`
 
-OpenWebUI fetches `GET /tool/openapi.json` to discover the tool schema, then calls `POST /tool/preview_app` when the model wants to embed a preview. The response has `Content-Disposition: inline` so OpenWebUI renders it as a sandboxed iframe under the tool call indicator.
+OpenWebUI fetches `GET /tool/openapi.json` to discover the tool schema, then calls `POST /tool/run` when the model wants to embed a preview. The response has `Content-Disposition: inline` so OpenWebUI renders it as a sandboxed iframe under the tool call indicator. `POST /tool/preview_app` is a deprecated alias kept for one release cycle so existing registrations don't break mid-rollout.
 
 ### `GET /tool/openapi.json`
 
@@ -566,13 +760,13 @@ Auto-generated OpenAPI 3.0 schema. Used by OpenWebUI at Tool-Server registration
 curl http://localhost:8012/tool/openapi.json
 ```
 
-### `POST /tool/preview_app`
+### `POST /tool/run`
 
-Spawn a sandbox and return the iframe HTML directly (not JSON). Same body as `POST /run`.
+Spawn (or update) a sandbox and return the iframe HTML directly (not JSON). Same body as `POST /run`, minus `recreate_if_gone` (implicitly `true` — the Tool Server path is always the one-shot convenience).
 
 **Request:**
 ```bash
-curl -X POST http://localhost:8012/tool/preview_app \
+curl -X POST http://localhost:8012/tool/run \
   -H 'Content-Type: application/json' \
   -d '{
     "runtime": "static",
@@ -596,7 +790,15 @@ Access-Control-Expose-Headers: Content-Disposition
 
 **How the URL renders:** the outer OpenWebUI iframe is sandboxed with `allow-scripts allow-downloads` by default. The inner `<iframe src="http://sandbox-proxy/...">` is a nested iframe that loads the actual sandbox output. Because OpenWebUI's outer sandbox defaults to `allowSameOrigin=OFF`, dynamic auto-resizing via the `postMessage` height reporter would require a script inside the sandbox app itself — which we don't control. The iframe uses a fixed `height:600px` as a pragmatic default.
 
-**Errors:** same status codes as `POST /run` (`400` unknown runtime, `429` pool full, `500` spawn failure, `504` readiness timeout). Errors return JSON rather than HTML.
+**Errors:** same status codes as `POST /run` (`400` unknown runtime, `413` payload too large, `429` pool full, `500` spawn failure, `504` readiness timeout). Errors return JSON rather than HTML.
+
+### `POST /tool/preview_app`
+
+**DEPRECATED alias for `POST /tool/run`.** Kept for one release cycle so existing OpenWebUI Tool Server registrations don't break mid-rollout. Same body, same response shape. Migrate to `/tool/run` at your convenience.
+
+### `GET /tool/get_runtimes`
+
+Describe available runtimes. Same JSON payload as the `sandbox.get_runtimes` MCP tool. `GET /tool/list_runtimes` is a deprecated alias.
 
 ---
 

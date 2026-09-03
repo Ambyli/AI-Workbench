@@ -18,13 +18,14 @@ If a change here weakens any of these, the security invariant list in
 
 from __future__ import annotations
 
+import base64
 import io
 import logging
 import os
 import tarfile
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Union
 
 import docker
 from docker.errors import APIError, NotFound
@@ -48,12 +49,86 @@ NANO_CPUS_PER_CPU = 1_000_000_000
 PIDS_LIMIT = 256
 
 
+# Type alias for a single file entry in the runtime files map. Either a raw
+# str (UTF-8 text — the common case) or a discriminated dict carrying
+# base64-encoded binary content. Runtime code that writes the file into the
+# container uses ``_decode_file_entry`` to normalise to bytes.
+FileEntry = Union[str, dict]
+
+
+# Content of the Streamlit bootstrap shim that gets written into /app when
+# the spawn command matches Streamlit. The shim monkeypatches Streamlit's
+# uncaught-exception handler to ALSO print tracebacks to stderr, so
+# ``get_logs`` shows user exceptions instead of Streamlit's usual behaviour
+# of catching them and rendering only in the browser.
+#
+# Guarded imports: if the Streamlit internal path changes on a version bump
+# the shim logs a WARNING and falls through — the entrypoint keeps working
+# because Streamlit's original handler is still installed.
+_STREAMLIT_BOOTSTRAP_PY = (
+    "\"\"\"Runner-injected Streamlit stderr tee.\n"
+    "\n"
+    "Streamlit installs its own uncaught-exception handler that renders\n"
+    "the error in the browser and skips stderr. That makes get_logs\n"
+    "useless for debugging: models see an empty log and mistake\n"
+    "silently-broken Streamlit apps for healthy ones. This shim wraps\n"
+    "Streamlit's handler so tracebacks flow to stderr too, preserving\n"
+    "the browser render path. Written to /app/_streamlit_bootstrap.py\n"
+    "by sandbox-runner (see spawner.py).\n"
+    "\"\"\"\n"
+    "from __future__ import annotations\n"
+    "import sys\n"
+    "import traceback\n"
+    "import logging\n"
+    "\n"
+    "_log = logging.getLogger(\"streamlit_bootstrap\")\n"
+    "\n"
+    "try:\n"
+    "    import streamlit.runtime.scriptrunner.script_runner as _sr\n"
+    "    _orig = _sr.handle_uncaught_app_exception\n"
+    "\n"
+    "    def _tee(ex, *a, **kw):\n"
+    "        try:\n"
+    "            print(\n"
+    "                f\"[streamlit exception] {type(ex).__name__}: {ex}\",\n"
+    "                file=sys.stderr,\n"
+    "                flush=True,\n"
+    "            )\n"
+    "            traceback.print_exception(\n"
+    "                type(ex), ex, ex.__traceback__, file=sys.stderr\n"
+    "            )\n"
+    "            sys.stderr.flush()\n"
+    "        except Exception:\n"
+    "            pass\n"
+    "        return _orig(ex, *a, **kw)\n"
+    "\n"
+    "    _sr.handle_uncaught_app_exception = _tee\n"
+    "except Exception as _exc:\n"
+    "    _log.warning(\n"
+    "        \"streamlit stderr tee failed to install (%s: %s); tracebacks \"\n"
+    "        \"will only render in the browser\",\n"
+    "        type(_exc).__name__, _exc,\n"
+    "    )\n"
+)
+
+
 @dataclass
 class SpawnResult:
     """What the runner needs to reply to the caller after spawn."""
 
     container_id: str
     container_name: str  # sandbox-{sandbox_id}
+
+
+@dataclass
+class ExecResult:
+    """Return shape for ``exec_command``."""
+
+    exit_code: int
+    output: str
+    duration_ms: int
+    truncated: bool
+    timed_out: bool = False
 
 
 class Spawner:
@@ -73,8 +148,9 @@ class Spawner:
         self,
         sandbox_id: str,
         runtime: Runtime,
-        files: dict[str, str],
+        files: dict[str, FileEntry],
         entrypoint: Optional[str],
+        env: Optional[dict[str, str]] = None,
     ) -> SpawnResult:
         """Create + start a container running the caller's files under the
         given runtime. Returns immediately; readiness is polled separately
@@ -85,6 +161,12 @@ class Spawner:
         touches user code — the tarball is built in memory. This eliminates
         an entire class of "write to host path" bugs that would otherwise
         need per-request cleanup logic.
+
+        ``env`` is a caller-supplied environment overlay — merged on top of
+        the sandbox-runner-controlled defaults (HTTP_PROXY, PYTHONUNBUFFERED,
+        etc.). Caller env can't clobber the proxy vars — they're re-applied
+        below after the merge — so a malicious ``HTTP_PROXY=`` in ``env``
+        can't disable the egress allowlist.
         """
         name = f"sandbox-{sandbox_id}"
         user_command = entrypoint or runtime.default_entrypoint
@@ -92,9 +174,14 @@ class Spawner:
             set((runtime.default_files or {}).keys()) | set(files.keys())
         )
         log.info(
-            "spawn: name=%s image=%s command=%r files=%s",
+            "spawn: name=%s image=%s command=%r files=%s env_keys=%s",
             name, runtime.image, user_command, merged_names,
+            sorted((env or {}).keys()),
         )
+
+        # Merge caller env on top of sandbox defaults, then re-apply the
+        # security-relevant defaults so caller env can't override them.
+        merged_env = _merge_container_env(env or {})
 
         try:
             # Two-phase spawn to satisfy Docker's rule that put_archive
@@ -116,31 +203,7 @@ class Spawner:
                 # so we can inject files before the user's app starts.
                 entrypoint=["sleep", "infinity"],
                 command=[],
-                environment={
-                    "HTTP_PROXY": EGRESS_URL,
-                    "HTTPS_PROXY": EGRESS_URL,
-                    "http_proxy": EGRESS_URL,
-                    "https_proxy": EGRESS_URL,
-                    # Base images look at this to skip color codes in logs
-                    # captured by the runner.
-                    "TERM": "dumb",
-                    # Force Python + Node + npm to use unbuffered stdout.
-                    # We redirect the user command to /tmp/sandbox.log via
-                    # `>>… 2>&1`, and stdout goes block-buffered (4-8 KB)
-                    # when it isn't a TTY — a fresh traceback sits in the
-                    # buffer until it fills, the process exits, or someone
-                    # calls flush(). That's exactly the bug where the
-                    # model calls get_sandbox_logs, sees an empty file,
-                    # and confidently tells the user "no errors here" while
-                    # the browser is showing a crash card. PYTHONUNBUFFERED
-                    # switches CPython to line-buffered even when writing
-                    # to a file; NPM_CONFIG_LOGLEVEL / FORCE_COLOR keep
-                    # Node dev servers from stripping their own diagnostics
-                    # in a `dumb` TERM.
-                    "PYTHONUNBUFFERED": "1",
-                    "NPM_CONFIG_LOGLEVEL": "warn",
-                    "FORCE_COLOR": "0",
-                },
+                environment=merged_env,
                 # sandbox_net ONLY. The invariant that keeps sandboxes off
                 # ai_shared, sandbox_state, and everything else lives here.
                 network=NET_NAME,
@@ -212,6 +275,16 @@ class Spawner:
         container.start()
         log.debug("spawn: container %s created + started (sleep pid1)", name)
         merged = {**(runtime.default_files or {}), **files}
+
+        # Optional per-runtime bootstrap (e.g. Streamlit stderr tee).
+        bootstrap_files = _runtime_bootstrap_files(runtime, user_command)
+        if bootstrap_files:
+            merged = {**bootstrap_files, **merged}
+            log.debug(
+                "spawn: %d bootstrap file(s) prepended: %s",
+                len(bootstrap_files), sorted(bootstrap_files.keys()),
+            )
+
         if merged:
             tarball = _make_tarball(merged)
             container.put_archive("/app", tarball)
@@ -232,16 +305,48 @@ class Spawner:
         # always return empty, defeating the whole runtime-error
         # feedback flow. /tmp is a 128 MB tmpfs, so the log can't
         # runaway-fill anything durable.
+        launch_command = _wrap_launch_command(user_command, runtime)
         container.exec_run(
-            ["/bin/sh", "-c", f"({user_command}) >>/tmp/sandbox.log 2>&1"],
+            ["/bin/sh", "-c", launch_command],
             workdir="/app",
             detach=True,
         )
         log.debug(
             "spawn: launched detached user command in %s: %r",
-            name, user_command,
+            name, launch_command,
         )
         return SpawnResult(container_id=container.id, container_name=name)
+
+    def spawn_empty(
+        self,
+        sandbox_id: str,
+        runtime: Runtime,
+        entrypoint: Optional[str],
+        env: Optional[dict[str, str]] = None,
+    ) -> SpawnResult:
+        """Spawn a container using ONLY the runtime's ``warming_files``.
+
+        Backs the ``create`` MCP tool: the model wants a warm container
+        while it's still composing the real code. First subsequent
+        ``update_files`` overlays the real project on top of these
+        placeholders, and the dev server hot-reloads.
+
+        Everything about the resulting container — network, caps, TTL,
+        entry-point wrapping — is identical to ``spawn``. Only the
+        initial file map differs.
+        """
+        log.debug(
+            "spawn_empty: sandbox=%s runtime=%s warming_files=%s",
+            sandbox_id, runtime.image,
+            sorted((runtime.warming_files or {}).keys()),
+        )
+        return self.spawn(
+            sandbox_id=sandbox_id,
+            runtime=runtime,
+            files=dict(runtime.warming_files or {}),
+            entrypoint=entrypoint,
+            env=env,
+        )
 
     def readiness_ok(
         self, container_name: str, port: int, path: str, timeout_s: float
@@ -277,6 +382,55 @@ class Spawner:
             url, timeout_s, attempts,
         )
         return False
+
+    def probe_health(
+        self, container_name: str, port: int, path: str, timeout_s: float = 3.0
+    ) -> dict:
+        """Single-shot health probe used after ``update_files``.
+
+        Distinct from ``readiness_ok`` — that one polls until it succeeds
+        or deadline. This one takes a single measurement and reports it
+        so the tool response can surface "your update caused a 500" or
+        "the reload broke the app" without the model having to make a
+        second call.
+
+        Returns one of:
+            {"code": 200, "latency_ms": 47}
+            {"error": "connection refused"}
+            {"error": "timeout after 3.0s"}
+            {"error": "invalid url"}
+        """
+        import urllib.request
+        import urllib.error
+
+        url = f"http://{container_name}:{port}{path}"
+        start = time.monotonic()
+        try:
+            with urllib.request.urlopen(url, timeout=timeout_s) as resp:
+                latency_ms = int((time.monotonic() - start) * 1000)
+                log.debug(
+                    "probe_health: %s HTTP %d in %d ms",
+                    url, resp.status, latency_ms,
+                )
+                return {"code": resp.status, "latency_ms": latency_ms}
+        except urllib.error.HTTPError as exc:
+            # Dev servers happily reply 500/404 with a body — count it as
+            # a real HTTP response, not a probe error.
+            latency_ms = int((time.monotonic() - start) * 1000)
+            log.debug(
+                "probe_health: %s HTTP %d in %d ms (HTTPError)",
+                url, exc.code, latency_ms,
+            )
+            return {"code": exc.code, "latency_ms": latency_ms}
+        except urllib.error.URLError as exc:
+            reason = str(exc.reason) if hasattr(exc, "reason") else str(exc)
+            log.debug("probe_health: %s URLError: %s", url, reason)
+            if "timed out" in reason.lower() or "timeout" in reason.lower():
+                return {"error": f"timeout after {timeout_s:.1f}s"}
+            return {"error": f"connection refused ({reason})"}
+        except Exception as exc:
+            log.warning("probe_health: %s unexpected %s: %s", url, type(exc).__name__, exc)
+            return {"error": f"{type(exc).__name__}: {exc}"}
 
     def stop(self, container_name: str) -> None:
         """Best-effort teardown. Idempotent — if the container is already
@@ -332,6 +486,203 @@ class Spawner:
         )
         return stream
 
+    def read_files(
+        self,
+        container_name: str,
+        paths: Optional[list[str]],
+        max_bytes_per_file: int,
+    ) -> list[dict]:
+        """Return file listings — with contents if ``paths`` is set,
+        or names + sizes only if ``paths`` is ``None``.
+
+        Backs the ``get_files`` MCP tool. Uses ``docker.get_archive``
+        to pull each requested path out of the running container's
+        ``/app`` tree in one tar stream, then extracts entries locally
+        without touching the host filesystem — everything happens in
+        memory.
+
+        Each returned entry:
+            {path, size, encoding: "utf-8" | "base64", content,
+             truncated: bool, error?: str}
+
+        Path validation reuses ``_safe_relpath`` so absolute paths and
+        ``..`` are rejected. Missing files are reported with an
+        ``error`` field rather than raising, so a partial request still
+        returns useful data.
+        """
+        log.debug(
+            "read_files: %s paths=%s max_bytes=%d",
+            container_name, paths, max_bytes_per_file,
+        )
+        container = self._client.containers.get(container_name)
+        if paths is None:
+            return _list_app_dir(container)
+
+        out: list[dict] = []
+        for p in paths:
+            try:
+                safe = _safe_relpath(p)
+            except ValueError as exc:
+                out.append({
+                    "path": p, "size": 0, "encoding": "utf-8",
+                    "content": "", "truncated": False,
+                    "error": str(exc),
+                })
+                continue
+            try:
+                stream, stat = container.get_archive(f"/app/{safe}")
+            except NotFound:
+                out.append({
+                    "path": safe, "size": 0, "encoding": "utf-8",
+                    "content": "", "truncated": False,
+                    "error": "not found",
+                })
+                continue
+            data, size, truncated = _extract_file_from_tar_stream(
+                stream, max_bytes_per_file,
+            )
+            entry = _encode_bytes_for_response(safe, data, size, truncated)
+            out.append(entry)
+        return out
+
+    def exec_command(
+        self,
+        container_name: str,
+        command: str,
+        timeout_seconds: int,
+        working_dir: str,
+        max_output_bytes: int,
+    ) -> ExecResult:
+        """Run a non-interactive shell command inside the container.
+
+        Backs the ``exec`` MCP tool. The command runs via ``sh -c`` so
+        the model can chain with pipes; stdin is closed so anything
+        prompting for input hangs until the timeout kicks in.
+
+        Timeout is enforced by ``exec_start`` streaming with a wall-clock
+        deadline. If the deadline hits, the exec is left running (Docker
+        cleans it up when the container is torn down) and the response
+        is marked ``timed_out``. Best-effort SIGKILL is attempted by
+        starting a shorter ``kill`` exec that targets processes owned by
+        1000:1000 whose command line looks like ours — cheaper than
+        tracking PIDs across the two-phase spawn.
+
+        Output is truncated to ``max_output_bytes`` (default 8 KB set at
+        the app layer). Truncation prepends a marker line so the model
+        knows content was elided.
+        """
+        log.info(
+            "exec_command: %s cmd=%r timeout=%ds workdir=%s",
+            container_name, command, timeout_seconds, working_dir,
+        )
+        # Reject anything that would escape /app. `working_dir` is
+        # optional; empty means /app.
+        try:
+            safe_workdir = _safe_workdir(working_dir)
+        except ValueError as exc:
+            raise ValueError(str(exc))
+
+        container = self._client.containers.get(container_name)
+        # Wrap with `cd` so we honor working_dir but keep the interpreter
+        # explicit. `sh -c` runs as a non-login shell so no rc files are
+        # sourced — same behaviour as the base image entrypoint.
+        wrapped = f"cd {safe_workdir} && exec {command}"
+
+        # exec_create + exec_start stream lets us enforce a wall-clock
+        # timeout without depending on the container's own signal handling.
+        # `stdin` is closed by default in the SDK's non-tty exec so we
+        # don't have to detach it explicitly.
+        exec_id = self._client.api.exec_create(
+            container.id,
+            ["/bin/sh", "-c", wrapped],
+            stdout=True, stderr=True,
+            user="1000:1000",
+            tty=False,
+        )["Id"]
+
+        start = time.monotonic()
+        deadline = start + timeout_seconds
+        chunks: list[bytes] = []
+        total = 0
+        truncated = False
+        timed_out = False
+
+        try:
+            stream = self._client.api.exec_start(
+                exec_id, stream=True, demux=False,
+            )
+            for chunk in stream:
+                if not isinstance(chunk, (bytes, bytearray)):
+                    # SDK may hand a str back in some builds — normalize.
+                    chunk = str(chunk).encode("utf-8", errors="replace")
+                if time.monotonic() > deadline:
+                    timed_out = True
+                    break
+                remaining = max_output_bytes - total
+                if remaining <= 0:
+                    truncated = True
+                    # Drain the rest of the stream so exec_start's
+                    # underlying socket doesn't leak.
+                    for _ in stream:
+                        pass
+                    break
+                if len(chunk) > remaining:
+                    chunks.append(bytes(chunk[:remaining]))
+                    total += remaining
+                    truncated = True
+                    for _ in stream:
+                        pass
+                    break
+                chunks.append(bytes(chunk))
+                total += len(chunk)
+        except APIError as exc:
+            log.warning(
+                "exec_command: %s exec_start APIError: %s",
+                container_name, exc,
+            )
+            duration_ms = int((time.monotonic() - start) * 1000)
+            return ExecResult(
+                exit_code=-1,
+                output=f"exec failed: {exc}",
+                duration_ms=duration_ms,
+                truncated=False,
+                timed_out=False,
+            )
+
+        duration_ms = int((time.monotonic() - start) * 1000)
+        output_bytes = b"".join(chunks)
+        output_text = output_bytes.decode("utf-8", errors="replace")
+
+        if timed_out:
+            log.info(
+                "exec_command: %s TIMED OUT after %ds (%d bytes)",
+                container_name, timeout_seconds, total,
+            )
+            return ExecResult(
+                exit_code=-1,
+                output=output_text,
+                duration_ms=duration_ms,
+                truncated=truncated,
+                timed_out=True,
+            )
+
+        try:
+            inspect = self._client.api.exec_inspect(exec_id)
+            exit_code = int(inspect.get("ExitCode") or 0)
+        except APIError:
+            exit_code = -1
+        log.info(
+            "exec_command: %s exit=%d duration=%dms truncated=%s bytes=%d",
+            container_name, exit_code, duration_ms, truncated, total,
+        )
+        return ExecResult(
+            exit_code=exit_code,
+            output=output_text,
+            duration_ms=duration_ms,
+            truncated=truncated,
+            timed_out=False,
+        )
+
     def tail_logs(self, container_name: str, n_lines: int = 100) -> str:
         """Return the last ``n_lines`` of the sandbox app's combined
         stdout+stderr, decoded UTF-8.
@@ -379,13 +730,13 @@ class Spawner:
     def write_reload_marker(self, container_name: str) -> None:
         """Append a boundary line to ``/tmp/sandbox.log``.
 
-        Called by the reuse path in ``app._reuse_or_spawn`` right
-        before ``update_files``. A subsequent
+        Called by the reuse path in ``app._apply_files`` right before
+        ``update_files``. A subsequent
         ``tail_logs_since_last_marker`` uses this line as an anchor so
         the response contains only what the dev server printed AFTER
         the overlay — old tracebacks stay on disk (visible to
-        ``get_sandbox_logs`` and the ``/logs`` endpoints) but don't
-        leak into the preview response.
+        ``get_logs`` and the ``/logs`` endpoints) but don't leak into
+        the preview response.
 
         The marker is deliberately human-readable and includes a UTC
         timestamp so an operator tailing the full log can tell which
@@ -411,7 +762,7 @@ class Spawner:
                     "/bin/sh",
                     "-c",
                     (
-                        "printf -- '\\n--- preview_app reload %s ---\\n' "
+                        "printf -- '\\n--- update_files reload %s ---\\n' "
                         "\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" "
                         ">> /tmp/sandbox.log"
                     ),
@@ -428,7 +779,7 @@ class Spawner:
         self, container_name: str, n_lines: int = 100
     ) -> str:
         """Return log content written after the LAST
-        ``--- preview_app reload …`` marker.
+        ``--- update_files reload …`` marker.
 
         Paired with ``write_reload_marker``. If no marker is present
         (e.g. write failed silently, or the caller skipped it),
@@ -436,7 +787,11 @@ class Spawner:
         response, which was the whole point of the scheme.
 
         Trailing ``| tail -n {n_lines}`` bounds response size against
-        a chatty reload (Vite can be verbose on config changes)."""
+        a chatty reload (Vite can be verbose on config changes).
+
+        Backwards-compat: also matches the older ``preview_app reload``
+        marker written by the pre-refactor codebase, so a session that
+        spanned the deploy still gets clean tail behaviour."""
         try:
             container = self._client.containers.get(container_name)
         except NotFound:
@@ -452,14 +807,14 @@ class Spawner:
             #   otherwise → append to buf if we've seen a marker.
             # An unmarked file therefore returns empty rather than
             # dumping full history — the failure mode this exists to
-            # prevent.
+            # prevent. Regex matches both current and legacy markers.
             result = container.exec_run(
                 [
                     "/bin/sh",
                     "-c",
                     (
                         "awk 'BEGIN{seen=0} "
-                        "/--- preview_app reload /"
+                        "/--- (update_files|preview_app) reload /"
                         "{buf=\"\"; seen=1; next} "
                         "seen{buf = buf $0 ORS} "
                         "END{printf \"%s\", buf}' /tmp/sandbox.log "
@@ -488,7 +843,7 @@ class Spawner:
     def update_files(
         self,
         container_name: str,
-        files: dict[str, str],
+        files: dict[str, FileEntry],
         deletes: list[str],
     ) -> None:
         """Overlay ``files`` onto a running container's ``/app`` and
@@ -537,17 +892,98 @@ class Spawner:
         return containers
 
 
-def _make_tarball(files: dict[str, str]) -> bytes:
+# ── Module-private helpers ────────────────────────────────────────────────
+
+
+def _default_container_env() -> dict[str, str]:
+    """The sandbox-runner-controlled env vars every container inherits.
+
+    Split out so ``_merge_container_env`` can re-apply them on top of the
+    caller's env, ensuring caller env can't override the security-relevant
+    ones (HTTP_PROXY) or the log-buffering flags that make ``get_logs``
+    useful.
+    """
+    return {
+        "HTTP_PROXY": EGRESS_URL,
+        "HTTPS_PROXY": EGRESS_URL,
+        "http_proxy": EGRESS_URL,
+        "https_proxy": EGRESS_URL,
+        # Base images look at this to skip color codes in logs
+        # captured by the runner.
+        "TERM": "dumb",
+        # Force Python + Node + npm to use unbuffered stdout. Details on
+        # why this matters live above the original inline block; the
+        # short version is that without PYTHONUNBUFFERED, `get_logs`
+        # sees stale buffered content and the model tells the user "no
+        # errors" while the browser is showing a crash card.
+        "PYTHONUNBUFFERED": "1",
+        "NPM_CONFIG_LOGLEVEL": "warn",
+        "FORCE_COLOR": "0",
+    }
+
+
+def _merge_container_env(caller_env: dict[str, str]) -> dict[str, str]:
+    """Return the effective container env: caller's overrides first,
+    then sandbox-runner defaults reapplied on top so proxy + buffering
+    invariants can't be clobbered."""
+    merged: dict[str, str] = {}
+    # Caller's env goes in first — provides user overrides.
+    for k, v in (caller_env or {}).items():
+        if not isinstance(k, str):
+            continue
+        merged[k] = str(v)
+    # Runner-controlled defaults win: they overwrite anything the caller
+    # tried to set for these keys, so a caller can't disable the egress
+    # proxy or the unbuffered-stdout invariant.
+    merged.update(_default_container_env())
+    return merged
+
+
+def _decode_file_entry(entry: FileEntry) -> bytes:
+    """Normalise a ``files`` value to raw bytes.
+
+    Accepts either a raw ``str`` (encoded UTF-8) or a discriminated
+    dict of shape ``{"encoding": "base64", "content": "..."}``. Raises
+    ``ValueError`` on unrecognised shapes so pydantic-side validation
+    doesn't need to know the encoding rules.
+    """
+    if isinstance(entry, str):
+        return entry.encode("utf-8")
+    if isinstance(entry, dict):
+        encoding = entry.get("encoding")
+        content = entry.get("content", "")
+        if encoding == "base64":
+            try:
+                return base64.b64decode(content, validate=True)
+            except Exception as exc:
+                raise ValueError(f"invalid base64 content: {exc}") from exc
+        if encoding in (None, "utf-8", "utf8", "text"):
+            return str(content).encode("utf-8")
+        raise ValueError(
+            f"unknown file encoding {encoding!r}; "
+            "expected 'base64' or 'utf-8'"
+        )
+    raise ValueError(
+        f"file value must be str or {{encoding, content}} dict, "
+        f"got {type(entry).__name__}"
+    )
+
+
+def _make_tarball(files: dict[str, FileEntry]) -> bytes:
     """Pack ``{path: content}`` into an in-memory tar suitable for
     ``container.put_archive``. Paths are relative to the archive root
     (which will be extracted at ``/app``). Path traversal is refused —
     an absolute path or one containing ``..`` raises ``ValueError``
-    rather than silently writing outside ``/app``."""
+    rather than silently writing outside ``/app``.
+
+    Values are either str (UTF-8) or a discriminated dict for binary
+    content — see ``_decode_file_entry``.
+    """
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w") as tar:
         for rel_path, content in files.items():
             safe = _safe_relpath(rel_path)
-            data = content.encode("utf-8")
+            data = _decode_file_entry(content)
             info = tarfile.TarInfo(name=safe)
             info.size = len(data)
             info.mode = 0o644
@@ -563,3 +999,173 @@ def _safe_relpath(path: str) -> str:
         log.warning("_safe_relpath: rejected %r", path)
         raise ValueError(f"unsafe path in files/deletes: {path!r}")
     return path.lstrip("/")
+
+
+def _safe_workdir(working_dir: str) -> str:
+    """Working dir for ``exec_command`` — bound to ``/app`` and below.
+
+    Empty / None → ``/app``. Rejects absolute paths outside ``/app`` and
+    any ``..`` traversal. Returns the absolute path the shell should
+    ``cd`` into.
+    """
+    if not working_dir or working_dir == "/app":
+        return "/app"
+    if working_dir.startswith("/"):
+        # Only /app/* is allowed. Everything else is rejected.
+        if working_dir == "/app" or working_dir.startswith("/app/"):
+            candidate = working_dir
+        else:
+            raise ValueError(
+                f"working_dir {working_dir!r} must be under /app"
+            )
+    else:
+        candidate = f"/app/{working_dir}"
+    # Normalize ..-free.
+    parts = [p for p in candidate.split("/") if p not in ("", ".")]
+    if any(p == ".." for p in parts):
+        raise ValueError(f"working_dir {working_dir!r} contains '..' traversal")
+    return "/" + "/".join(parts) if parts else "/"
+
+
+def _list_app_dir(container: Container) -> list[dict]:
+    """Return a list of ``{path, size}`` for every regular file in the
+    container's ``/app`` — no content. Used when ``get_files`` is
+    called without an explicit ``paths`` list.
+
+    We stream the archive of ``/app`` and walk its members client-side
+    rather than shelling out to ``find`` inside the container — one
+    round trip, no shell injection surface, works even in images that
+    strip coreutils. Symlinks and directories are skipped.
+    """
+    try:
+        stream, _stat = container.get_archive("/app")
+    except NotFound:
+        return []
+    buf = io.BytesIO()
+    for chunk in stream:
+        buf.write(chunk)
+    buf.seek(0)
+    entries: list[dict] = []
+    with tarfile.open(fileobj=buf, mode="r|") as tar:
+        for member in tar:
+            if not member.isfile():
+                continue
+            # Archive root is `app/…`; strip that so caller sees
+            # relative paths under /app.
+            name = member.name.split("/", 1)[-1] if "/" in member.name else ""
+            if not name:
+                continue
+            entries.append({"path": name, "size": int(member.size)})
+    entries.sort(key=lambda e: e["path"])
+    log.debug("_list_app_dir: %d file(s)", len(entries))
+    return entries
+
+
+def _extract_file_from_tar_stream(
+    stream, max_bytes: int,
+) -> tuple[bytes, int, bool]:
+    """Consume Docker's get_archive stream and pull out the first regular
+    file. Returns ``(data, real_size, truncated)`` — ``data`` is capped
+    at ``max_bytes``, ``real_size`` is the file's true size before any
+    truncation.
+    """
+    buf = io.BytesIO()
+    for chunk in stream:
+        buf.write(chunk)
+    buf.seek(0)
+    with tarfile.open(fileobj=buf, mode="r|") as tar:
+        for member in tar:
+            if not member.isfile():
+                continue
+            extracted = tar.extractfile(member)
+            if extracted is None:
+                continue
+            payload = extracted.read()
+            real_size = int(member.size)
+            if real_size > max_bytes:
+                return payload[:max_bytes], real_size, True
+            return payload, real_size, False
+    return b"", 0, False
+
+
+def _encode_bytes_for_response(
+    path: str, data: bytes, real_size: int, truncated: bool,
+) -> dict:
+    """Package a file for the ``get_files`` response.
+
+    UTF-8 files get emitted as text; anything with a null byte or
+    invalid UTF-8 is base64-encoded so the caller can round-trip binary
+    content through the same overlay format ``update_files`` accepts.
+    """
+    if b"\x00" in data:
+        return {
+            "path": path,
+            "size": real_size,
+            "encoding": "base64",
+            "content": base64.b64encode(data).decode("ascii"),
+            "truncated": truncated,
+        }
+    try:
+        text = data.decode("utf-8")
+        return {
+            "path": path,
+            "size": real_size,
+            "encoding": "utf-8",
+            "content": text,
+            "truncated": truncated,
+        }
+    except UnicodeDecodeError:
+        return {
+            "path": path,
+            "size": real_size,
+            "encoding": "base64",
+            "content": base64.b64encode(data).decode("ascii"),
+            "truncated": truncated,
+        }
+
+
+def _wrap_launch_command(user_command: str, runtime: Runtime) -> str:
+    """Return the shell command written into the launch exec_run.
+
+    The core is ``(<cmd>) >>/tmp/sandbox.log 2>&1`` — that redirect is
+    load-bearing, see ``spawn`` for the reasoning. When the runtime + cmd
+    match Streamlit, prepend ``python -c 'import _streamlit_bootstrap'``
+    so the stderr-tee monkeypatch loads before Streamlit starts.
+    Everything else uses the raw user command.
+    """
+    if _is_streamlit_command(user_command):
+        # Import via -c so a missing shim file doesn't break the boot.
+        # `2>/dev/null || true` silences the failed import; the WARNING
+        # from the shim's own except-guard is what would normally land
+        # here if the internal API changed.
+        prelude = (
+            "python -c 'import sys; sys.path.insert(0, \"/app\"); "
+            "import _streamlit_bootstrap' >/dev/null 2>&1 || true; "
+        )
+        return f"({prelude}{user_command}) >>/tmp/sandbox.log 2>&1"
+    return f"({user_command}) >>/tmp/sandbox.log 2>&1"
+
+
+def _is_streamlit_command(command: str) -> bool:
+    """Cheap substring match on ``streamlit run`` — good enough because
+    the default python entrypoint uses that literal, and callers who
+    ship a custom Streamlit entrypoint invariably keep the ``streamlit``
+    binary name (that's the CLI name)."""
+    tokens = command.split()
+    if not tokens:
+        return False
+    # `streamlit run …` or `python -m streamlit run …`
+    if tokens[0] == "streamlit":
+        return len(tokens) > 1 and tokens[1] == "run"
+    if tokens[0] == "python" and "streamlit" in tokens:
+        return True
+    return False
+
+
+def _runtime_bootstrap_files(runtime: Runtime, user_command: str) -> dict[str, str]:
+    """Extra files the runner writes for a specific runtime/entrypoint
+    combo. Currently only Streamlit gets one — see ``_STREAMLIT_BOOTSTRAP_PY``.
+    """
+    if _is_streamlit_command(user_command):
+        return {"_streamlit_bootstrap.py": _STREAMLIT_BOOTSTRAP_PY}
+    return {}

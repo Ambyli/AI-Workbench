@@ -116,18 +116,92 @@ If the caller ships `requirements.txt` (python) or `package.json` (node), the ba
 
 All base images normalize the app port to **80** so `sandbox-proxy` can statically route with no per-sandbox Caddy config.
 
-## Endpoints
+## MCP tool flow
+
+The sandbox subsystem exposes an MCP server named `sandbox` with 11 tools. Models compose them into a workflow that maps to the way a human dev works — warm the runtime, iterate silently, hand the user something to look at, tear down.
+
+```
+get_runtimes    ─── optional, first time on a deployment
+      │
+      ▼
+create          ─── returns session_id + warming URL; env fixed here
+      │
+      ▼
+update_files    ─── loop: overlay files; post-update health probe
+      │  ▲              recreate_if_gone=false (default) surfaces respawn choice
+      │  └─── get_files / get_logs / exec (read/modify on demand)
+      │  └─── list_sessions (recover dropped handles)
+      ▼
+preview         ─── show the user the iframe artifact
+      │
+      ▼
+close           ─── optional; TTL reaper handles the rest
+```
+
+Shortcut path when the model already has everything at first mention:
+
+```
+run             ─── create + update_files + preview in one call
+                    (recreate_if_gone implicitly true)
+```
+
+Tool summary:
+
+| Tool | Kind | Purpose |
+|---|---|---|
+| `get_runtimes` | read | Describe available runtimes on this deployment |
+| `create` | write | Reserve an empty warming container, return session_id + URL |
+| `update_files` | write | Overlay files into a live sandbox; opt-in self-heal; post-update health probe |
+| `get_files` | read | Read files back from `/app` (dir listing when `paths` is omitted) |
+| `get_logs` | read | Tail container stdout+stderr for the session |
+| `exec` | write | Run a non-interactive shell command inside the container |
+| `preview` | display | Return the iframe artifact for the user's chat |
+| `close` | write | Tear down the session early, release the slot |
+| `list_sessions` | read | Enumerate live sandboxes (recover dropped session_ids) |
+| `run` | write | Convenience: create + update_files + preview in one call |
+| `preview_app` | write (deprecated) | Alias for `run` — kept for one release cycle |
+
+### Data shapes shared by every write tool
+
+**`files` overlay.** Path → value map. Values are either UTF-8 strings (the common case) OR a discriminated dict `{"encoding": "base64", "content": "..."}` for binary content (images, PDFs, wheels). The pydantic validator enforces per-file (`SANDBOX_MAX_FILE_BYTES`) and total (`SANDBOX_MAX_PAYLOAD_BYTES`) caps at request-parse time — base64 values count their DECODED length. Absolute paths and `..` traversal are rejected downstream in the spawner.
+
+**`env` at create time.** Process env vars set inside the container. Immutable after spawn — a self-heal respawn replays the same env from the job's metadata JSONB, but there is no update path. Reserved keys (`HTTP_PROXY`, `HTTPS_PROXY`, `PYTHONUNBUFFERED`, `NPM_CONFIG_LOGLEVEL`, `FORCE_COLOR`, `TERM`) are rejected at validation — those are runner-controlled invariants that keep the egress allowlist and log buffering working; the spawner re-applies them on top of the merged env even if a validation bypass ever landed.
+
+**`recreate_if_gone` on `update_files`.** OPT-IN self-heal. Default `false` — if the container is gone (crashed, reaped, respawn refused), the tool returns a structured 409 telling the caller to opt in explicitly. Set `true` to accept the state loss: env is preserved, but packages installed via `exec` and any in-container files not in the current `files` map are LOST. `run` implicitly passes `true` because it's the one-shot convenience path.
+
+### Structured tool responses
+
+Every MCP tool returns a `ToolResult` with two channels:
+
+- `content[0]` is a `TextContent` block (what the model sees, same shape as the pre-refactor tool responses).
+- `structured_content` is a JSON payload the caller can parse without regex. Fields depend on the tool: `create` / `run` include `session_id`, `sandbox_id`, `url`, `expires_at`, `runtime`, `app_status`; `update_files` adds `files_written` / `files_deleted` / `recreated`; `exec` returns `exit_code`, `duration_ms`, `output`, `truncated`, `timed_out`; and so on. See [`sandbox_mcp.py`](runner/sandbox_mcp.py) for the exact shapes.
+
+The text form preserves everything a model needs to reply — the fenced ```` ```html ```` block for `preview` / `run`, the `Session id:` line for follow-ups, the health-probe verdict, the startup-output tail. The structured payload is additive.
+
+## HTTP endpoints
 
 `sandbox-runner` exposes:
 
 | Method + path | Purpose |
 |---|---|
 | `GET /health` | healthcheck; reports `db` up/down |
-| `POST /run` | spawn a sandbox, return its URL — see request shape below |
+| `POST /run` | spawn a sandbox — or update an existing one when `session_id` is passed. Backing endpoint for `sandbox.run` |
+| `POST /create` | reserve an empty warming container. Backing endpoint for `sandbox.create` |
+| `GET /sessions` | enumerate live sessions. Backing endpoint for `sandbox.list_sessions` |
+| `POST /session/{id}/files` | overlay files into a running sandbox. Backing endpoint for `sandbox.update_files` |
+| `GET /session/{id}/files` | read files back from `/app`. Backing endpoint for `sandbox.get_files` |
+| `POST /session/{id}/exec` | run a non-interactive shell command inside the container. Backing endpoint for `sandbox.exec` |
+| `GET /session/{id}/logs` | tail container stdout+stderr. Backing endpoint for `sandbox.get_logs` |
+| `GET /session/{id}/download` | stream `/app` as a tar archive (session-based; follows self-heal) |
+| `DELETE /session/{id}` | tear a session's sandbox down early. Backing endpoint for `sandbox.close` |
 | `GET /jobs` | list active + recent sandboxes |
 | `GET /jobs/{id}` | one sandbox detail |
 | `DELETE /jobs/{id}` | tear down a sandbox early, release its slot |
-| `/mcp` | FastMCP HTTP transport — exposes the `preview_app` tool |
+| `GET /jobs/{id}/logs` / `/download` | operator direct-access variants that don't follow self-heal |
+| `/mcp` | FastMCP HTTP transport — exposes every tool listed above |
+| `/tool/run` | OpenWebUI Tool Server — inline HTMLResponse |
+| `/tool/preview_app` | deprecated alias for `/tool/run` |
+| `/tool/get_runtimes` | describe available runtimes (Tool Server variant) |
 
 ### `POST /run` request
 
@@ -149,11 +223,11 @@ Response:
 { "sandbox_id": "a1b2c3d4e5f6", "url": "http://sandbox-proxy/a1b2c3d4e5f6/", "expires_at": "..." }
 ```
 
-### `preview_app` MCP tool
+### Model-facing tool surface
 
-Same fields as `POST /run`, exposed to tool-calling models. LiteLLM advertises it via [`ai/litellm/litellm_config.yaml`](../litellm/litellm_config.yaml)'s `mcp_servers.sandbox` entry.
+Every tool listed in the "MCP tool flow" section above is registered on the `sandbox` MCP server. LiteLLM advertises them via [`ai/litellm/litellm_config.yaml`](../litellm/litellm_config.yaml)'s `mcp_servers.sandbox` entry.
 
-The tool's return value is a **string** containing a short summary and a fenced ` ```html ` block with a small self-contained HTML document — the model includes the returned string verbatim in its response and Open WebUI's markdown renderer promotes the block into a split-panel artifact. No system-prompt tweaks or per-model config required as long as the model follows the tool's docstring.
+Return values are `ToolResult`s with a text block (what the model reads) plus a JSON `structured_content` payload. The text block for `run` / `preview` includes a fenced ` ```html ` code fence containing a self-contained HTML document — the model includes the returned string verbatim in its response and Open WebUI's markdown renderer promotes the block into a split-panel artifact. No system-prompt tweaks or per-model config required as long as the model follows the tool's docstring.
 
 If model paraphrasing is a problem in practice, use the Tool Server integration below instead — that path bypasses the model entirely.
 
@@ -166,7 +240,7 @@ Register in **Admin Panel → Settings → Tools → Add Connection** with base 
 - `http://sandbox-runner:8000/tool` (from Open WebUI, on `ai_shared`)
 - `http://localhost:8012/tool` (from the host / local dev)
 
-OpenWebUI discovers the tool schema at `GET /tool/openapi.json` and calls `POST /tool/preview_app`. The response uses `Content-Disposition: inline`, which OpenWebUI recognizes as a rich-UI embed and drops the returned HTML into a sandboxed artifact iframe. See [`ENDPOINTS.md § OpenWebUI Tool Server`](ENDPOINTS.md#openwebui-tool-server-tool) for the full contract.
+OpenWebUI discovers the tool schema at `GET /tool/openapi.json` and calls `POST /tool/run` (or the deprecated `POST /tool/preview_app` alias, kept for one release cycle so existing registrations don't break mid-rollout). The response uses `Content-Disposition: inline`, which OpenWebUI recognizes as a rich-UI embed and drops the returned HTML into a sandboxed artifact iframe. See [`ENDPOINTS.md § OpenWebUI Tool Server`](ENDPOINTS.md#openwebui-tool-server-tool) for the full contract.
 
 ### How the artifact renders (alignment with the OpenWebUI docs)
 
@@ -328,9 +402,11 @@ Three layers, in order of cheapness:
 
 2. **Container logs on readiness failure (30 s spawn timeout).** If the container spawns but never binds port 80 within `readiness_ok`'s deadline, the runner reads the tail of `/tmp/sandbox.log` before tearing the container down and returns it in the 504. Log capture is possible because [`runner/spawner.py`](runner/spawner.py) redirects the user command's stdout+stderr to that file — `container.logs()` only sees PID 1 (`sleep infinity`), so exec streams have to be routed through a file.
 
-3. **On-demand log fetch (for apps that start but render errors).** `GET /session/{id}/logs` and its MCP counterpart `get_sandbox_logs` tail `/tmp/sandbox.log` at request time. Model calls this when `preview_app` returned a normal ready response but the user reports the running app looks broken. Flask / FastAPI / Vite / Next dev servers all print tracebacks to stdout before rendering a browser error card; **Streamlit is the exception** (it catches user exceptions and renders them in-browser only, never on stdout).
+3. **On-demand log fetch (for apps that start but render errors).** `GET /session/{id}/logs` and its MCP counterpart `get_logs` tail `/tmp/sandbox.log` at request time. Model calls this when `update_files` / `run` returned a normal ready response but the user reports the running app looks broken. Flask / FastAPI / Vite / Next / Express dev servers all print tracebacks to stdout before rendering a browser error card. **Streamlit tracebacks land here too** thanks to the `_streamlit_bootstrap.py` shim: the runner writes it into `/app` at spawn time when the entrypoint is Streamlit, and it monkeypatches `streamlit.runtime.scriptrunner.script_runner.handle_uncaught_app_exception` to also print to stderr before delegating to the original browser-render path. If the shim import fails on a Streamlit version bump, it logs a WARNING and falls through — Streamlit stays functional, just without the tee.
 
-The MCP tool wrapper in [`runner/sandbox_mcp.py`](runner/sandbox_mcp.py) catches HTTPExceptions from the runner's spawn path and formats them into text responses instead of MCP-level errors, so the model reads them as normal tool output and can call `preview_app` again with the same `session_id` without any error-handling logic.
+4. **Post-update HTTP health probe.** `update_files` (and the reuse branch of `run`) runs a single-shot GET against the app's readiness path 500 ms after writing files, and inlines the result — `HTTP 200 in 47 ms` / `HTTP 500` / `connection refused` / `timeout after 3.0s` — in the tool response. Catches "the reload broke everything" in the same tool call without waiting for the user to report anything.
+
+The MCP tool wrappers in [`runner/sandbox_mcp.py`](runner/sandbox_mcp.py) catch HTTPExceptions from the runner's spawn path and format them into text responses instead of MCP-level errors, so the model reads them as normal tool output and can call the tool again with the same `session_id` without any error-handling logic.
 
 ### Auditing what a sandbox did
 
@@ -368,6 +444,43 @@ docker compose -f ai/sandbox/docker-compose.sandbox.yml up -d sandbox-db
 docker exec -it sandbox-db psql -U postgres -c "ALTER USER sandbox WITH PASSWORD 'new-pw';"
 docker compose -f ai/sandbox/docker-compose.sandbox.yml up -d --force-recreate sandbox-runner
 ```
+
+### Runtime introspection (exec)
+
+The `exec` MCP tool (backed by `POST /session/{id}/exec`) runs a non-interactive shell command inside a running sandbox and streams the combined stdout+stderr back with the exit code and duration. It exists to close a real gap in the tool set: when the model forgets a dependency in `requirements.txt`, when a `pip install` needs to run without rebuilding the container, when the model wants to introspect `/app` (`ls -la`, `cat`, `curl http://localhost:80`), or when it needs to invoke framework tooling (`npx prisma generate`, `python migrate.py`).
+
+Design constraints:
+
+- **Non-interactive.** stdin is closed by the SDK's exec_start. A command that prompts for input hangs until the timeout kicks in — models MUST use non-interactive flags (`-y`, `--yes`, `PIP_YES=1`).
+- **Timeout hard-capped at 120 s.** Default 30 s. Enforced by wall-clock deadline on the exec_start stream — the exec is left dangling on timeout (Docker cleans it up when the container is torn down); the tool response is marked `timed_out`.
+- **Output truncated to 8 KB.** Prefixed with `(last 8 KB)` when truncation happened. Enough for pip/npm summaries and most tracebacks; anything longer belongs in `get_logs`.
+- **Runs as 1000:1000.** Matches the base image's non-root user. `sudo` is not available.
+- **State drift on respawn.** Packages installed via `exec` do NOT survive a self-heal respawn — the container is rebuilt from the base image and only `env` is preserved. Models should ALSO write persistent deps to `requirements.txt` / `package.json` via `update_files` when appropriate:
+  ```
+  exec(sid, "pip install requests")                # immediate fix
+  update_files(sid, {"requirements.txt": "..."})   # persist for future respawn
+  ```
+- **Egress allowlist still applies.** A `pip install` from a non-allowlisted index gets a 403 from `sandbox-egress` (tinyproxy). If a network error surfaces here, the fix is to add the source to `ai/sandbox/proxies/tinyproxy.filter`, not to retry.
+- **Counts as activity.** Every `exec` call bumps `last_used_at` so the idle reaper resets.
+
+Security analysis: `exec` opens no new escape path. The sandbox container is isolated by network segmentation, not by command-layer sandboxing — anything the container can do, the model could already do via a `python -c` embedded in the entrypoint. What `exec` opens is CPU/RAM inside the sandbox, already bounded by cgroups and the reaper's TTL.
+
+### Env vars
+
+`create` and `run` accept an optional `env` dict merged into the container environment at spawn time. Two things worth calling out:
+
+- **Immutable after spawn.** There is no update-env path. A self-heal respawn replays the same env from the job's metadata JSONB — that's why env preserves across `update_files(recreate_if_gone=true)` even when in-container files don't. If a caller wants to change env, they close the session and create a new one.
+- **Reserved keys refused at validation.** `HTTP_PROXY`, `HTTPS_PROXY`, `http_proxy`, `https_proxy`, `PYTHONUNBUFFERED`, `NPM_CONFIG_LOGLEVEL`, `FORCE_COLOR`, and `TERM` are runner-controlled. The spawner re-applies them on top of the caller's env even if a validation bypass ever landed, so the egress allowlist and log-buffering invariants can't be turned off by a caller. Anything else is passed through.
+- **Visible in `docker inspect`.** Any operator with access to `sandbox-runner`'s Docker socket can read env values. That's the same access boundary that already holds the docker.sock — no new surface. Secrets in env should still be per-user and time-scoped, not shared long-lived keys.
+
+### Payload limits
+
+Two knobs, both env-tunable:
+
+- `SANDBOX_MAX_FILE_BYTES` (default `1000000`) — per-file cap on every value in the `files` map (post-base64-decode).
+- `SANDBOX_MAX_PAYLOAD_BYTES` (default `10000000`) — total cap across all files in one request.
+
+Enforcement lives in `_validate_files_map` at pydantic validation, so a rejected payload never touches the tarball builder or the container. The 413 response names the largest offending path and the total submitted size so the caller can shrink or split across multiple `update_files` calls. Base64 values count their DECODED length so a client can't smuggle a large blob past the cap by encoding it.
 
 ## Configuration
 

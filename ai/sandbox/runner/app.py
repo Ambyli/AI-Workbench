@@ -1078,9 +1078,21 @@ async def _do_update_files(
                 "session_id": session_id,
                 "errors": lint_errors,
                 "hint": (
-                    "Fix the syntax errors above and call update_files "
-                    "again with the same session_id. Nothing was written "
-                    "into the container."
+                    "Fix the syntax errors above. The lint runs before "
+                    "any container write, so this failure did not touch "
+                    "/app.\n\n"
+                    "PREFERRED for a small edit at a known line — "
+                    "call patch_files with the same session_id. Pass the "
+                    "path, start_line, end_line, the current bytes as "
+                    "`expected`, and your fix as `replacement`. It edits "
+                    "in place instead of re-uploading the file.\n\n"
+                    "If you don't already have the exact current bytes of "
+                    "that range in this turn, call get_files(paths=[...]) "
+                    "first — patch_files requires a byte-for-byte match on "
+                    "`expected`.\n\n"
+                    "Use update_files (whole-file rewrite) only when the "
+                    "fix is a large refactor, a new file, or the target "
+                    "file's content has drifted from what you have."
                 ),
             },
         )

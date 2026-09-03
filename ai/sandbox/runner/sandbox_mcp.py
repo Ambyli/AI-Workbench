@@ -249,8 +249,16 @@ def _format_startup_output(runtime: Optional[str], output: str) -> str:
             "Startup output: ⚠ SUSPICIOUS — found "
             f"{', '.join(hits[:3])}"
             f"{' (and more)' if len(hits) > 3 else ''}. "
-            "Fix the code and call update_files (or `run`) again with "
-            "the SAME session_id BEFORE the user has to report it.\n"
+            "Fix the code with the SAME session_id BEFORE the user has "
+            "to report it.\n\n"
+            "If the traceback points at a specific file:line, PREFER "
+            "patch_files — it edits in place at that line instead of "
+            "re-uploading the file. Call get_files(paths=[...]) first if "
+            "you don't already have the exact current bytes of the range, "
+            "then patch_files with your fix as `replacement`.\n\n"
+            "Use update_files (whole-file rewrite) for large refactors, "
+            "new files, or when the file's content has drifted from what "
+            "you have.\n"
             "```\n"
             f"{stripped}\n"
             "```"
@@ -1087,18 +1095,22 @@ def build_mcp(
         if reused:
             hint = (
                 f"You updated {n_files} file(s) in session `{session_id_out}` "
-                "— everything else in /app was preserved. To iterate silently, "
-                "call update_files with the same session_id and ONLY the "
-                "file(s) you change; call preview to hand the user a fresh "
-                "iframe when you're ready."
+                "— everything else in /app was preserved. To iterate silently: "
+                "prefer patch_files for a small edit at known lines "
+                "(cheapest — no re-upload); use update_files when replacing "
+                "a whole file or adding a new one. Call preview to hand the "
+                "user a fresh iframe when you're ready."
             )
         else:
             hint = (
-                f"To EDIT this preview on the next turn, prefer "
-                f"update_files(session_id=\"{session_id_out}\", files={{...}}) "
-                "with ONLY the file(s) you changed — do NOT re-send unchanged "
-                "files. The container keeps running and hot-reloads on file "
-                "change."
+                f"To EDIT this preview on the next turn: prefer "
+                f"patch_files(session_id=\"{session_id_out}\", patches=[...]) "
+                "for a small edit at known lines — it edits in place with a "
+                "byte-for-byte match on `expected`, no whole-file re-upload. "
+                f"Use update_files(session_id=\"{session_id_out}\", files={{...}}) "
+                "when replacing a whole file, adding a new file, or when your "
+                "picture of the file has drifted. Either way, DO NOT re-send "
+                "unchanged files. The container keeps running and hot-reloads."
             )
         startup_section = _format_startup_output(
             result.get("runtime"), result.get("startup_output") or "",

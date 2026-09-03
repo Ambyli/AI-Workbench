@@ -60,6 +60,10 @@ mcp_servers:
     url: http://sandbox-runner:8000/mcp
     transport: "http"
 
+  trino:
+    url: http://trino-mcp:8080/mcp
+    transport: "http"
+
   phoenix:
     url: os.environ/DEFAULT_LITELLM_MCP_PHOENIX_URL
     transport: "http"

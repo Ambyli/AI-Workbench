@@ -1,0 +1,15 @@
+[project]
+name = "trino-mcp"
+version = "0.1.0"
+description = "FastMCP shim exposing Trino as a SQL tool to LiteLLM-registered models"
+requires-python = ">=3.11"
+dependencies = [
+    "common",
+    "fastapi",
+    "uvicorn",
+    "pydantic",
+    "trino>=0.328",
+    # See sandbox/runner/pyproject.toml for why we pin fastmcp-slim[server]
+    # rather than the meta fastmcp package.
+    "fastmcp-slim[server]>=3.0",
+]

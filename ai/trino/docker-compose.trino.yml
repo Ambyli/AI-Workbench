@@ -1,0 +1,299 @@
+# Trino data lake subsystem.
+#
+# Federated SQL over the three existing Postgres instances (litellm_db,
+# roofix-db, sandbox-db) plus an Iceberg lakehouse on MinIO. Consumers:
+#   * models via LiteLLM MCP (mcp_servers.trino → trino-mcp:8080/mcp)
+#   * humans via Superset behind oauth2-proxy (/superset/*)
+#   * external BI tools via JDBC on PORT_TRINO (LAN-only for now)
+#
+# Two networks:
+#   shared         (external, ai_shared)   trino-coordinator / minio / superset
+#                                          / trino-mcp — anything openwebui,
+#                                          litellm, or a laptop needs to reach.
+#   analytics_net  (bridge, default)       data-plane: trino ↔ hive-metastore
+#                                          ↔ hive-metastore-db, plus minio's
+#                                          second leg so trino reaches it by
+#                                          service DNS without leaving the box.
+#
+# See ai/trino/TRINO.md for the operator runbook.
+
+networks:
+  shared:
+    external: true
+    name: ai_shared
+  analytics_net:
+    driver: bridge
+    name: analytics_net
+
+services:
+  # ── Hive Metastore backing store ────────────────────────────────────────
+  # Dedicated Postgres for HMS's own tables (DBS, TBLS, PARTITIONS, …).
+  # Not shared with litellm_db / roofix-db / sandbox-db — HMS's schema
+  # migrations run on startup and would collide with anything else.
+  #
+  # Port grouping in the PORT REGISTRY block of .env:
+  #   5432 litellm_db, 5433 roofix-db, 5434 sandbox-db, 5435 n8n-db,
+  #   5436 hive-metastore-db, 5437 superset-db
+  hive-metastore-db:
+    image: postgres:16-alpine
+    container_name: hive-metastore-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${HMS_DB_USER:-hive}
+      POSTGRES_PASSWORD: ${HMS_DB_PASSWORD:-hive}
+      POSTGRES_DB: ${HMS_DB_NAME:-metastore}
+    volumes:
+      - hive_metastore_db_data:/var/lib/postgresql/data
+    ports:
+      - "${PORT_HMS_DB:-5436}:5432"
+    networks:
+      - analytics_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${HMS_DB_USER:-hive}"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ── Hive Metastore (thrift on 9083) ─────────────────────────────────────
+  # Standalone HMS — no Hadoop / HiveServer2, just the metastore service
+  # Trino's Iceberg connector consumes over thrift. The image is built
+  # locally so we can bake in the Postgres JDBC driver and the s3a jars
+  # HMS needs to list Iceberg's manifest files on MinIO.
+  #
+  # Internal only. Nothing outside analytics_net should ever talk to HMS
+  # directly — Trino is the sole client.
+  hive-metastore:
+    build:
+      context: ./hive-metastore
+      dockerfile: Dockerfile
+    container_name: hive-metastore
+    restart: unless-stopped
+    environment:
+      HMS_DB_HOST: hive-metastore-db
+      HMS_DB_PORT: 5432
+      HMS_DB_USER: ${HMS_DB_USER:-hive}
+      HMS_DB_PASSWORD: ${HMS_DB_PASSWORD:-hive}
+      HMS_DB_NAME: ${HMS_DB_NAME:-metastore}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-trino}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-trino-dev-only}
+      MINIO_ENDPOINT: http://minio:9000
+    networks:
+      - analytics_net
+    depends_on:
+      hive-metastore-db:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      # HMS binds thrift on 9083. `nc -z` is portable and doesn't require
+      # a thrift client to be present in the image.
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 9083"]
+      interval: 15s
+      timeout: 3s
+      start_period: 30s
+      retries: 5
+
+  # ── MinIO: S3-compatible object store for the Iceberg warehouse ────────
+  # Dual-homed on shared (for external BI tools + operator console) and
+  # analytics_net (for trino / hms to reach it by DNS). Console lives
+  # behind oauth2-proxy — see OAUTH2_PROXY_UPSTREAMS in .env.
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-trino}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-trino-dev-only}
+      # When oauth2-proxy fronts the console at /minio/*, MinIO needs to
+      # know the browser-visible URL so it stops rewriting redirects to
+      # localhost:9001.
+      MINIO_BROWSER_REDIRECT_URL: ${MINIO_BROWSER_REDIRECT_URL:-https://chat.zeoenergy.com/minio}
+    ports:
+      - "${PORT_MINIO_API:-8014}:9000"
+      - "${PORT_MINIO_CONSOLE:-8015}:9001"
+    volumes:
+      - minio_data:/data
+    networks:
+      - shared
+      - analytics_net
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 15s
+      timeout: 3s
+      start_period: 20s
+      retries: 5
+
+  # ── One-shot: create the `warehouse` bucket ────────────────────────────
+  # Runs `mc mb warehouse` then exits. Downstream services wait on
+  # `service_completed_successfully` so nobody tries to write before the
+  # bucket exists. Idempotent — mc mb --ignore-existing is a no-op after
+  # the first run.
+  minio-init:
+    image: minio/mc:latest
+    container_name: minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-trino}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-trino-dev-only}
+    networks:
+      - analytics_net
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD &&
+      mc mb --ignore-existing local/warehouse &&
+      echo 'warehouse bucket ready'
+      "
+
+  # ── Trino coordinator (also the sole worker for now) ───────────────────
+  # Single-node cluster. If we grow to multi-node, add a `trino-worker`
+  # service with `node.properties.node.role=worker`, drop the coordinator's
+  # `discovery.uri` requirement to internal-only, and split catalog mounts
+  # so workers see the same properties files.
+  #
+  # Catalog `.properties` files are mounted read-only under
+  # /etc/trino/catalog/. Adding a new catalog is:
+  #   1. drop a file in ai/trino/catalogs/
+  #   2. docker compose restart trino-coordinator
+  trino-coordinator:
+    image: trinodb/trino:453
+    container_name: trino-coordinator
+    restart: unless-stopped
+    ports:
+      - "${PORT_TRINO:-8013}:8080"
+    volumes:
+      - ./catalogs:/etc/trino/catalog:ro
+      - ./config/config.properties:/etc/trino/config.properties:ro
+      - ./config/jvm.config:/etc/trino/jvm.config:ro
+      - ./config/node.properties:/etc/trino/node.properties:ro
+    environment:
+      HMS_URI: thrift://hive-metastore:9083
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-trino}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-trino-dev-only}
+      # Postgres federation credentials are read from `.env` and
+      # interpolated into catalog/*.properties via envsubst at container
+      # start (see entrypoint override below).
+      LITELLM_DB_USER: llmproxy
+      LITELLM_DB_PASSWORD: dbpassword9090
+      ROOFIX_DB_USER: ${ROOFIX_DB_USER:-roofix}
+      ROOFIX_DB_PASSWORD: ${ROOFIX_DB_PASSWORD:-roofix}
+      ROOFIX_DB_NAME: ${ROOFIX_DB_NAME:-roofix}
+      SANDBOX_DB_USER: ${SANDBOX_DB_USER:-sandbox}
+      SANDBOX_DB_PASSWORD: ${SANDBOX_DB_PASSWORD:-sandbox}
+      SANDBOX_DB_NAME: ${SANDBOX_DB_NAME:-sandbox}
+    networks:
+      - shared
+      - analytics_net
+    depends_on:
+      hive-metastore:
+        condition: service_healthy
+    healthcheck:
+      # Trino exposes /v1/info as soon as the coordinator is up. That's
+      # earlier than /v1/status which requires the discovery loop to
+      # complete on a single-node cluster.
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/v1/info || exit 1"]
+      interval: 15s
+      timeout: 3s
+      start_period: 60s
+      retries: 10
+
+  # ── Trino MCP shim (LiteLLM-facing) ────────────────────────────────────
+  # Thin FastAPI + FastMCP wrapper. Tools:
+  #   list_catalogs, list_schemas, list_tables, describe_table, run_query
+  # Guardrails on run_query: SELECT-only, LIMIT-clamped, timeout-clamped.
+  # LiteLLM registers this at http://trino-mcp:8080/mcp (see
+  # ai/litellm/litellm_config.yaml — mcp_servers.trino).
+  trino-mcp:
+    build:
+      context: ../..
+      dockerfile: ai/trino/Dockerfile.mcp
+    container_name: trino-mcp
+    restart: unless-stopped
+    environment:
+      TRINO_HOST: trino-coordinator
+      TRINO_PORT: 8080
+      TRINO_USER: trino-mcp
+      TRINO_MCP_MAX_ROWS: ${TRINO_MCP_MAX_ROWS:-10000}
+      TRINO_MCP_MAX_RUNTIME_S: ${TRINO_MCP_MAX_RUNTIME_S:-30}
+      DEBUG_LOGGING: ${DEBUG_LOGGING:-false}
+    networks:
+      - shared
+    depends_on:
+      trino-coordinator:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/health')\""]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+  # ── Superset metadata Postgres ─────────────────────────────────────────
+  superset-db:
+    image: postgres:16-alpine
+    container_name: superset-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${SUPERSET_DB_USER:-superset}
+      POSTGRES_PASSWORD: ${SUPERSET_DB_PASSWORD:-superset}
+      POSTGRES_DB: ${SUPERSET_DB_NAME:-superset}
+    volumes:
+      - superset_db_data:/var/lib/postgresql/data
+    ports:
+      - "${PORT_SUPERSET_DB:-5437}:5432"
+    networks:
+      - analytics_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${SUPERSET_DB_USER:-superset}"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ── Superset BI UI ─────────────────────────────────────────────────────
+  # Built locally to preinstall the Trino SQLAlchemy driver + psycopg2 so
+  # the first bootstrap can register the Trino connection non-interactively.
+  #
+  # Header-auth: SUPERSET_AUTH_TYPE=AUTH_REMOTE_USER trusts the
+  # X-Auth-Request-Email header oauth2-proxy sets — no second sign-in.
+  # See ai/trino/superset/superset_config.py for the trust boundary.
+  superset:
+    build:
+      context: ./superset
+      dockerfile: Dockerfile
+    container_name: superset
+    restart: unless-stopped
+    ports:
+      - "${PORT_SUPERSET:-8016}:8088"
+    environment:
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY:-change-me}
+      SUPERSET_DB_USER: ${SUPERSET_DB_USER:-superset}
+      SUPERSET_DB_PASSWORD: ${SUPERSET_DB_PASSWORD:-superset}
+      SUPERSET_DB_NAME: ${SUPERSET_DB_NAME:-superset}
+      # Bootstrap uses this to create a default Trino connection on first
+      # run. Change here — no restart re-registration.
+      TRINO_URL: trino://trino-mcp@trino-coordinator:8080
+      # oauth2-proxy sets this on every authenticated request; Superset
+      # trusts the header to identify the session user.
+      SUPERSET_REMOTE_USER_HEADER: X-Auth-Request-Email
+    networks:
+      - shared
+      - analytics_net
+    depends_on:
+      superset-db:
+        condition: service_healthy
+      trino-coordinator:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8088/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 5
+
+volumes:
+  hive_metastore_db_data:
+  minio_data:
+  superset_db_data:

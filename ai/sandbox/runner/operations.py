@@ -20,14 +20,11 @@ from typing import Optional
 
 from fastapi import HTTPException
 
-from common.jobs.postgres import PostgresRegistry
-
 from constants import (
     DEFAULT_TTL_S,
     EXEC_DEFAULT_TIMEOUT_S,
     EXEC_HARD_TIMEOUT_S,
     EXEC_MAX_OUTPUT_BYTES,
-    GET_FILES_DEFAULT_BYTES,
     GET_FILES_HARD_CAP_BYTES,
     HARD_TTL_S,
     HEALTH_PROBE_TIMEOUT_S,

@@ -29,12 +29,20 @@ COPY ai/sandbox/runner/pyproject.toml ./ai/sandbox/runner/
 RUN uv sync --package sandbox --no-dev --frozen
 
 # Service code last so a code-only change doesn't invalidate the (slow)
-# sync layer.
+# sync layer. Keep this list in sync with ai/sandbox/runner/*.py — the
+# runner directory is refactored into focused modules (see
+# SANDBOX.md § Runner file layout), and any file NOT listed here won't
+# be in the image, giving a ModuleNotFoundError at boot.
 COPY ai/sandbox/runner/app.py \
-     ai/sandbox/runner/spawner.py \
-     ai/sandbox/runner/runtimes.py \
+     ai/sandbox/runner/constants.py \
+     ai/sandbox/runner/models.py \
+     ai/sandbox/runner/operations.py \
      ai/sandbox/runner/reaper.py \
+     ai/sandbox/runner/runtimes.py \
      ai/sandbox/runner/sandbox_mcp.py \
+     ai/sandbox/runner/spawner.py \
+     ai/sandbox/runner/state.py \
+     ai/sandbox/runner/tool_server.py \
      ./ai/sandbox/runner/
 
 WORKDIR /app/ai/sandbox/runner

@@ -79,18 +79,28 @@ from common.jobs.router import build_router
 from common.logging_setup import setup_logging
 
 import state
+from constants import (
+    DEBUG_LOGGING,
+    DEFAULT_TTL_S,
+    EXEC_DEFAULT_TIMEOUT_S,
+    GET_FILES_DEFAULT_BYTES,
+    HARD_TTL_S,
+    LOG_DIR,
+    MAX_CONCURRENT,
+    MAX_FILE_BYTES,
+    MAX_PAYLOAD_BYTES,
+    PROXY_URL,
+    SESSION_ID_RE,
+)
 from models import (
     CreateRequest,
     ExecRequest,
     PatchFilesRequest,
     RunRequest,
     RunResponse,
-    SESSION_ID_RE,
     UpdateFilesRequest,
 )
 from operations import (
-    EXEC_DEFAULT_TIMEOUT_S,
-    GET_FILES_DEFAULT_BYTES,
     _do_close,
     _do_create,
     _do_exec,
@@ -113,22 +123,9 @@ from spawner import Spawner
 from tool_server import tool_app
 
 
-# ── Config from env ───────────────────────────────────────────────────────
-MAX_CONCURRENT = int(os.environ.get("SANDBOX_MAX_CONCURRENT", "8"))
-DEFAULT_TTL_S = int(os.environ.get("SANDBOX_DEFAULT_TTL_SECONDS", "900"))
-HARD_TTL_S = int(os.environ.get("SANDBOX_HARD_TTL_SECONDS", "3600"))
-PROXY_URL = os.environ.get("SANDBOX_PROXY_URL", "http://sandbox-proxy")
-LOG_DIR = os.environ.get("LOG_DIR", "/data")
-DEBUG_LOGGING = os.environ.get("DEBUG_LOGGING", "false").lower() in (
-    "1", "true", "yes", "on",
-)
-
-# Per-file and total-payload caps for update_files / run / POST /run.
-# Same values live in ``models.py`` — they need to be there for the
-# pydantic validators, and are re-read here for parity of log lines
-# and any endpoint code that references them.
-MAX_FILE_BYTES = int(os.environ.get("SANDBOX_MAX_FILE_BYTES", "1000000"))
-MAX_PAYLOAD_BYTES = int(os.environ.get("SANDBOX_MAX_PAYLOAD_BYTES", "10000000"))
+# All config constants live in ``constants.py``; imported above.
+# ``load_env()`` ran before that import so env-derived constants
+# picked up the ``.env`` values, not the defaults.
 
 # Configure the root logger for every runner module. `setup_logging` writes
 # to /data/sandbox-runner.log (file) and stderr (console) with the shared

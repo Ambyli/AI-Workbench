@@ -21,7 +21,6 @@ from __future__ import annotations
 import base64
 import io
 import logging
-import os
 import tarfile
 import time
 from dataclasses import dataclass
@@ -31,22 +30,17 @@ import docker
 from docker.errors import APIError, NotFound
 from docker.models.containers import Container
 
+from constants import (
+    EGRESS_URL,
+    MEMORY_LIMIT,
+    NANO_CPUS_PER_CPU,
+    NET_NAME,
+    PIDS_LIMIT,
+)
 from runtimes import Runtime
 
 
 log = logging.getLogger("sandbox-runner.spawner")
-
-
-# ── Config from env — populated once at module import ────────────────────
-NET_NAME = os.environ.get("SANDBOX_NET_NAME", "sandbox_net")
-EGRESS_URL = os.environ.get("SANDBOX_EGRESS_URL", "http://sandbox-egress:8888")
-
-# Resource limits per sandbox — hard defaults, not caller-overridable.
-# Kept aligned with what ai/sandbox/SANDBOX.md documents.
-MEMORY_LIMIT = "512m"
-# nano_cpus is measured in 10^-9 of a CPU, so 1 CPU = 1_000_000_000.
-NANO_CPUS_PER_CPU = 1_000_000_000
-PIDS_LIMIT = 256
 
 
 # Type alias for a single file entry in the runtime files map. Either a raw

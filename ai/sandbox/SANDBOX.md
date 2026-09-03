@@ -106,9 +106,10 @@ If any of the "must fail" checks succeeds, revert the change and investigate bef
 
 The runner is split across:
 
-- [`app.py`](runner/app.py) — FastAPI orchestration: config, lifespan, endpoint decorators, mounts. MCP bridge callables live here too.
+- [`app.py`](runner/app.py) — FastAPI orchestration: lifespan, endpoint decorators, mounts. MCP bridge callables live here too.
+- [`constants.py`](runner/constants.py) — single source of truth for every configuration knob and compile-time limit (payload caps, TTLs, exec timeouts, container hardening, session-id regex, reserved env keys, etc.). Leaf module — imports only stdlib. Env-derived values are read at first import; `common.env.load_env()` runs before that in `app.py`.
 - [`state.py`](runner/state.py) — module-level singletons (`registry`, `spawner`, `reaper`, `slot_sem`) populated in `lifespan()`.
-- [`models.py`](runner/models.py) — pydantic request/response models and the shared validators (files-map, env). Payload-limit constants (`MAX_FILE_BYTES`, `MAX_PAYLOAD_BYTES`) and the session-id regex live here since the models depend on them.
+- [`models.py`](runner/models.py) — pydantic request/response models and the shared validators (files-map, env). Constants come from `constants.py`.
 - [`operations.py`](runner/operations.py) — `_do_*` core operations shared between HTTP endpoints and MCP tools. `_reuse_or_spawn` (the legacy `POST /run` + `run` MCP path) lives here.
 - [`tool_server.py`](runner/tool_server.py) — OpenWebUI Tool Server sub-app, mounted at `/tool`.
 - [`sandbox_mcp.py`](runner/sandbox_mcp.py) — FastMCP tool surface, mounted at `/mcp`.
@@ -116,7 +117,7 @@ The runner is split across:
 - [`reaper.py`](runner/reaper.py) — TTL and idle-TTL sweeper.
 - [`runtimes.py`](runner/runtimes.py) — runtime registry (`static`, `python`, `node`).
 
-Import graph is strictly one direction: `app.py` → `operations.py` → `state.py` / `models.py` / `spawner.py` / `runtimes.py`. `tool_server.py` also imports `operations.py` and `models.py`. Nothing imports back into `app.py`.
+Import graph is strictly one direction: `app.py` → `operations.py` → `models.py` / `spawner.py` / `runtimes.py` / `state.py` → `constants.py`. `tool_server.py` also imports `operations.py` and `models.py`. `reaper.py` imports `constants.py` and `spawner.py`. Nothing imports back into `app.py`.
 
 ## Runtimes
 

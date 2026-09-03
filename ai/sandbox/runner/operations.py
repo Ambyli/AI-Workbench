@@ -14,7 +14,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -23,45 +22,27 @@ from fastapi import HTTPException
 
 from common.jobs.postgres import PostgresRegistry
 
-from models import FileContent, SESSION_ID_RE
+from constants import (
+    DEFAULT_TTL_S,
+    EXEC_DEFAULT_TIMEOUT_S,
+    EXEC_HARD_TIMEOUT_S,
+    EXEC_MAX_OUTPUT_BYTES,
+    GET_FILES_DEFAULT_BYTES,
+    GET_FILES_HARD_CAP_BYTES,
+    HARD_TTL_S,
+    HEALTH_PROBE_TIMEOUT_S,
+    MAX_CONCURRENT,
+    PROXY_URL,
+    SESSION_ID_RE,
+    UPDATE_SETTLE_S,
+)
+from models import FileContent
 from runtimes import RUNTIMES, get_runtime
 
 import state
 
 
 log = logging.getLogger("sandbox-runner.operations")
-
-# ── Constants (kept in sync with app.py) ──────────────────────────────────
-# These are duplicated here rather than imported from app.py because
-# operations.py sits BELOW app.py in the import graph — app.py imports
-# _do_* from here, so this file can't import from app.py without creating
-# a cycle. Every constant is read from the same env var as app.py's copy,
-# so they stay in sync as long as the env is stable at boot.
-DEFAULT_TTL_S = int(os.environ.get("SANDBOX_DEFAULT_TTL_SECONDS", "900"))
-HARD_TTL_S = int(os.environ.get("SANDBOX_HARD_TTL_SECONDS", "3600"))
-PROXY_URL = os.environ.get("SANDBOX_PROXY_URL", "http://sandbox-proxy")
-MAX_CONCURRENT = int(os.environ.get("SANDBOX_MAX_CONCURRENT", "8"))
-
-# get_files response: default per-file byte cap and a hard cap the caller
-# can't exceed. Kept smaller than MAX_FILE_BYTES because get_files is a
-# READ path — 64 KB is enough to spot-check a source file without paging
-# through the whole payload for something huge like an assets bundle.
-GET_FILES_DEFAULT_BYTES = 8 * 1024
-GET_FILES_HARD_CAP_BYTES = 64 * 1024
-
-# exec_command: model-facing defaults + hard caps.
-EXEC_DEFAULT_TIMEOUT_S = 30
-EXEC_HARD_TIMEOUT_S = 120
-EXEC_MAX_OUTPUT_BYTES = 8 * 1024
-
-# Health-probe deadline used after update_files. Kept tight so the tool
-# response isn't dominated by waiting on a broken app.
-HEALTH_PROBE_TIMEOUT_S = 3.0
-# Post-update settle delay — gives dev servers a moment to notice the
-# file change (Streamlit mtime scan, Vite HMR, nginx cache invalidation)
-# before the probe fires. 500 ms is the same window the pre-refactor
-# code used before its log tail; matches Streamlit's polling cadence.
-UPDATE_SETTLE_S = 0.5
 
 
 # ── Small utilities ───────────────────────────────────────────────────────

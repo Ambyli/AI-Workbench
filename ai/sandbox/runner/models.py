@@ -1,52 +1,26 @@
 """Pydantic request/response models + shared validators for the runner.
 
-The constants referenced by these models (payload caps, reserved env
-keys, the session-id regex) live here rather than in ``app.py`` so
-``models.py`` sits at a leaf in the import graph:
-
-    app.py  ────►  operations.py  ────►  models.py, state.py, ...
-           ────►  models.py
-           ────►  tool_server.py  ────►  operations.py, models.py
-
-Both ``app.py`` and ``operations.py`` import the constants back from
-here for their own logic.
+All configuration constants referenced here live in
+``constants.py`` — this module is a leaf that imports them.
 """
 
 from __future__ import annotations
 
 import base64
 import logging
-import os
-import re
 from typing import Optional, Union
 
 from pydantic import BaseModel, Field, field_validator
 
+from constants import (
+    MAX_FILE_BYTES,
+    MAX_PAYLOAD_BYTES,
+    RESERVED_ENV_KEYS,
+    SESSION_ID_RE,
+)
+
 
 log = logging.getLogger("sandbox-runner.models")
-
-# ── Constants referenced by the models ────────────────────────────────────
-# Per-file and total-payload caps for update_files / run / POST /run.
-# Enforced at pydantic-validation time so a hostile payload never touches
-# the tarball builder. Base64 files count their DECODED length so a client
-# can't smuggle a huge blob past the cap by encoding it.
-MAX_FILE_BYTES = int(os.environ.get("SANDBOX_MAX_FILE_BYTES", "1000000"))
-MAX_PAYLOAD_BYTES = int(os.environ.get("SANDBOX_MAX_PAYLOAD_BYTES", "10000000"))
-
-# Sessions are the durable identity of a preview across turns. Regex is
-# both a validation surface (reject anything that could path-inject when
-# a caller later uses the id in a URL or filesystem context) and a hint
-# to the model that the id is a short opaque string, not free text.
-SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
-
-# Env vars we refuse to accept from the caller — these are runner-controlled
-# invariants (egress proxy, log buffering) and must not be overridable.
-# The spawner reapplies them on top anyway; refusing at the request layer
-# gives the caller a clear error instead of silently discarding their value.
-RESERVED_ENV_KEYS = frozenset({
-    "HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy",
-    "PYTHONUNBUFFERED", "NPM_CONFIG_LOGLEVEL", "FORCE_COLOR", "TERM",
-})
 
 
 # Type alias for the discriminated file map. On the wire it's:

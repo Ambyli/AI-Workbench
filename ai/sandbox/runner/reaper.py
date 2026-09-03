@@ -18,31 +18,17 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import time
 from datetime import datetime, timezone
 from typing import Optional
 
 from common.jobs.postgres import PostgresRegistry
 
+from constants import HARD_TTL_S, IDLE_TTL_S, SWEEP_INTERVAL_S
 from spawner import Spawner
 
 
 log = logging.getLogger("sandbox-runner.reaper")
-
-SWEEP_INTERVAL_S = 60
-HARD_TTL_S = int(os.environ.get("SANDBOX_HARD_TTL_SECONDS", "3600"))
-# Idle TTL bounds "container is up but nobody's touched the session
-# recently" — the reaper tears it down even though hard TTL hasn't hit.
-# Defaults to the same value as SANDBOX_DEFAULT_TTL_SECONDS (15 min) so
-# operators only have to think about one knob unless they want a
-# distinct idle policy.
-IDLE_TTL_S = int(
-    os.environ.get(
-        "SANDBOX_IDLE_TTL_SECONDS",
-        os.environ.get("SANDBOX_DEFAULT_TTL_SECONDS", "900"),
-    )
-)
 
 
 class Reaper:

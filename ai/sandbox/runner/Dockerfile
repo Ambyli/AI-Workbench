@@ -35,6 +35,7 @@ COPY ai/sandbox/runner/app.py \
      ai/sandbox/runner/runtimes.py \
      ai/sandbox/runner/reaper.py \
      ai/sandbox/runner/sandbox_mcp.py \
+     ai/sandbox/runner/tests_runner.py \
      ./ai/sandbox/runner/
 
 WORKDIR /app/ai/sandbox/runner

@@ -32,6 +32,14 @@ log = logging.getLogger("sandbox-runner.reaper")
 
 SWEEP_INTERVAL_S = 60
 HARD_TTL_S = int(os.environ.get("SANDBOX_HARD_TTL_SECONDS", "3600"))
+# Tester companions are meant to be short-lived (one per preview_app
+# call, torn down by spawn_tester's `finally`). This cap is the belt-
+# and-suspenders "we crashed mid-run" cleanup — anything labelled
+# sandbox.role=tester that survives past this is a leak. 5 minutes is
+# generous vs. the 60s default SANDBOX_TEST_TIMEOUT_SECONDS but short
+# enough that a leaked tester doesn't squat a sandbox_net slot for the
+# full hard-TTL hour.
+TESTER_MAX_AGE_S = 300
 # Idle TTL bounds "container is up but nobody's touched the session
 # recently" — the reaper tears it down even though hard TTL hasn't hit.
 # Defaults to the same value as SANDBOX_DEFAULT_TTL_SECONDS (15 min) so
@@ -63,8 +71,9 @@ class Reaper:
             self._stop.clear()
             self._task = asyncio.create_task(self._loop())
             log.info(
-                "Reaper started: sweep=%ds hard_ttl=%ds idle_ttl=%ds",
-                SWEEP_INTERVAL_S, HARD_TTL_S, IDLE_TTL_S,
+                "Reaper started: sweep=%ds hard_ttl=%ds idle_ttl=%ds "
+                "tester_max_age=%ds",
+                SWEEP_INTERVAL_S, HARD_TTL_S, IDLE_TTL_S, TESTER_MAX_AGE_S,
             )
 
     async def stop(self) -> None:
@@ -108,6 +117,21 @@ class Reaper:
             except ValueError:
                 spawned_at = 0
             age = now - spawned_at
+            role = c.labels.get("sandbox.role", "sandbox")
+            # Testers are ephemeral — spawn_tester's finally-block
+            # already tears them down. Anything still here past
+            # TESTER_MAX_AGE_S is a leaked one from a runner crash
+            # mid-exec. Torn down without touching the job registry
+            # (testers have no row of their own) or the concurrency
+            # semaphore (they don't hold a sandbox slot).
+            if role == "tester":
+                if age >= TESTER_MAX_AGE_S:
+                    log.warning(
+                        "leaked tester reaped: container=%s age=%ds",
+                        c.name, int(age),
+                    )
+                    await asyncio.to_thread(self._spawner.stop, c.name)
+                continue
             if age >= HARD_TTL_S:
                 sandbox_id = c.labels.get("sandbox.id", "")
                 log.info(

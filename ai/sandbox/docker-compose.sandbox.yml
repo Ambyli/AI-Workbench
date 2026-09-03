@@ -156,6 +156,13 @@ services:
       - SANDBOX_MAX_CONCURRENT=${SANDBOX_MAX_CONCURRENT:-8}
       - SANDBOX_DEFAULT_TTL_SECONDS=${SANDBOX_DEFAULT_TTL_SECONDS:-900}
       - SANDBOX_HARD_TTL_SECONDS=${SANDBOX_HARD_TTL_SECONDS:-3600}
+      # Mandatory-tests toggle + per-run timeout. See ai/sandbox/SANDBOX.md
+      # § "Behavioral tests". SANDBOX_TESTS_REQUIRED=false disables the
+      # 400-on-missing-tests gate — the tester still runs when tests are
+      # supplied, and results still ride on the response. Use only for
+      # migration windows; leave true in prod.
+      - SANDBOX_TESTS_REQUIRED=${SANDBOX_TESTS_REQUIRED:-true}
+      - SANDBOX_TEST_TIMEOUT_SECONDS=${SANDBOX_TEST_TIMEOUT_SECONDS:-60}
       # Networks the runner will attach spawned sandboxes to. Must exist.
       - SANDBOX_NET_NAME=sandbox_net
       # Where the runner tells sandboxes to send outbound HTTP.
@@ -229,6 +236,19 @@ services:
     build:
       context: ../..
       dockerfile: ai/sandbox/images/node.Dockerfile
+    command: ["true"]
+
+  # Companion image the runner spawns after readiness to execute the
+  # model-supplied behavioral tests against the live preview. Only the
+  # runner references this tag; a tester container is short-lived (one
+  # per preview_app call) and never long-running like the runtime bases.
+  # First build takes ~5 min — chromium download dominates.
+  sandbox-tester-image:
+    profiles: ["build"]
+    image: sandbox-tester:latest
+    build:
+      context: ../..
+      dockerfile: ai/sandbox/images/tester.Dockerfile
     command: ["true"]
 
 volumes:

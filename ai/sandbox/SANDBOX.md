@@ -322,19 +322,48 @@ Archive shape: `sandbox-{sandbox_id}.tar` with `app/` at the root. Extract with 
 
 ### Error feedback for models
 
-Three layers, in order of cheapness:
+Four layers, in order of cheapness:
 
-1. **Static Python lint (before spawn, ~1 ms).** `_lint_python_files` in [`runner/app.py`](runner/app.py) walks every `.py` file in the request and calls `compile(source, "<sandbox:path>", "exec")`. SyntaxError catches trigger a 400 with a compiler-style diagnostic — path, line, offset, source line, caret — plus the generated `session_id` so a retry with the same id transparently self-heals. Angle-bracket display name stops Python from reading a same-named file off the runner's own disk.
+1. **Tests-required gate (before spawn, ~0 ms).** `_validate_tests_present` in [`runner/app.py`](runner/app.py) refuses the call with 400 when the caller ships no file under `tests/` (opt-out via `SANDBOX_TESTS_REQUIRED=false`). The detail body carries a runtime-specific `example` map — a working `tests/…` file the model can copy — plus the generated `session_id` so the retry self-heals via the reuse path. See § Behavioral tests below.
 
-2. **Container logs on readiness failure (30 s spawn timeout).** If the container spawns but never binds port 80 within `readiness_ok`'s deadline, the runner reads the tail of `/tmp/sandbox.log` before tearing the container down and returns it in the 504. Log capture is possible because [`runner/spawner.py`](runner/spawner.py) redirects the user command's stdout+stderr to that file — `container.logs()` only sees PID 1 (`sleep infinity`), so exec streams have to be routed through a file.
+2. **Static Python lint (before spawn, ~1 ms).** `_lint_python_files` in [`runner/app.py`](runner/app.py) walks every `.py` file in the request and calls `compile(source, "<sandbox:path>", "exec")`. SyntaxError catches trigger a 400 with a compiler-style diagnostic — path, line, offset, source line, caret — plus the generated `session_id` so a retry with the same id transparently self-heals. Angle-bracket display name stops Python from reading a same-named file off the runner's own disk.
 
-3. **On-demand log fetch (for apps that start but render errors).** `GET /session/{id}/logs` and its MCP counterpart `get_sandbox_logs` tail `/tmp/sandbox.log` at request time. Model calls this when `preview_app` returned a normal ready response but the user reports the running app looks broken. Flask / FastAPI / Vite / Next dev servers all print tracebacks to stdout before rendering a browser error card; **Streamlit is the exception** (it catches user exceptions and renders them in-browser only, never on stdout).
+3. **Container logs on readiness failure (30 s spawn timeout).** If the container spawns but never binds port 80 within `readiness_ok`'s deadline, the runner reads the tail of `/tmp/sandbox.log` before tearing the container down and returns it in the 504. Log capture is possible because [`runner/spawner.py`](runner/spawner.py) redirects the user command's stdout+stderr to that file — `container.logs()` only sees PID 1 (`sleep infinity`), so exec streams have to be routed through a file.
+
+4. **On-demand log fetch (for apps that start but render errors).** `GET /session/{id}/logs` and its MCP counterpart `get_sandbox_logs` tail `/tmp/sandbox.log` at request time. Model calls this when `preview_app` returned a normal ready response but the user reports the running app looks broken. Flask / FastAPI / Vite / Next dev servers all print tracebacks to stdout before rendering a browser error card; **Streamlit is the exception** (it catches user exceptions and renders them in-browser only, never on stdout).
 
 The MCP tool wrapper in [`runner/sandbox_mcp.py`](runner/sandbox_mcp.py) catches HTTPExceptions from the runner's spawn path and formats them into text responses instead of MCP-level errors, so the model reads them as normal tool output and can call `preview_app` again with the same `session_id` without any error-handling logic.
 
+### Behavioral tests
+
+Every `preview_app` / `POST /run` call must include at least one file under a top-level `tests/` directory (soft-disabled via `SANDBOX_TESTS_REQUIRED=false`). These are executed against the live preview URL BEFORE the response returns, so the model gets pass/fail feedback in the same tool round-trip as the URL — no iteration through the human.
+
+**Execution shape:**
+
+1. Runner splits the caller's `files` map: entries under `tests/` are stashed in the job's Postgres `metadata->>'tests'`, everything else goes into the sandbox's `/app` via `put_archive`.
+2. Sandbox spawns as usual and readiness is awaited.
+3. Runner spawns a companion `sandbox-tester-{sandbox_id}` container on `sandbox_net` from the `sandbox-tester:latest` image. Same security posture as the sandbox: cap-drop, non-root 1000:1000, no host mounts, no docker.sock. See [`ai/sandbox/images/tester.Dockerfile`](images/tester.Dockerfile) for what's baked in (pytest, requests, playwright + chromium, jest, vitest, curl, jq).
+4. Test files are `put_archive`'d into the tester's `/tests`. The runner execs the runtime's `test_command` (declared in [`runner/runtimes.py`](runner/runtimes.py)) with `PREVIEW_URL=http://sandbox-{id}:80/` in the env.
+5. Waits up to `SANDBOX_TEST_TIMEOUT_SECONDS` (default 60s), captures combined stdout+stderr + exit code, then TEARS THE TESTER DOWN. `spawn_tester`'s `finally` handles this on every path — win, fail, timeout, or exception.
+6. Result is inlined on the response as a `tests` object (`ok`, `exit_code`, `output`, `runner`, `duration_s`, `timed_out`). The MCP wrapper's `_format_test_output` renders it as a `Test results:` section next to `Startup output:`.
+
+**Soft-fail is intentional.** A `tests.ok: false` result does NOT withhold the preview URL — the model + operator can still open the running app to inspect what's broken. The response is loudly marked `⚠ FAILED` and the model is expected to iterate on the same `session_id` before showing the user. Hard-fail would trade "the model can debug interactively" for "no bad previews leak" which is the wrong balance for an iterative loop.
+
+**Persistence across turns.** Tests live in `metadata->>'tests'` and are merged on every reuse call. The delta rule applies: send only the tests that changed; `deletes` with a `tests/…` path removes an entry. The merged map runs on every reuse — a first-call test still guards a fifth-call app change.
+
+**Runtime test conventions** (call `list_runtimes` for the current examples):
+
+| Runtime | Test command | Expected shape |
+|---|---|---|
+| `static` | `sh /tests/run.sh` | POSIX shell using `$PREVIEW_URL`, exit non-zero on failure |
+| `python` | `pytest -q --tb=short --color=no /tests` | `tests/test_*.py`, `os.environ["PREVIEW_URL"]`, Playwright pre-installed |
+| `node` | `npx --yes --prefix /home/tester jest …` | `tests/*.test.js`, `process.env.PREVIEW_URL`, Playwright pre-installed |
+
+**Adding a runtime** — populate `test_command`, `test_files_hint`, and `test_example` in [`runner/runtimes.py`](runner/runtimes.py) and rebuild. The tester image already carries the runners; you only need to teach the runtime how to invoke them.
+
 ### Auditing what a sandbox did
 
-The runner writes to a CSV audit log at `/data/audit.log` inside `sandbox-runner`. Every `/run` and `/mcp preview_app` call is recorded with the runtime, file-name hashes, entrypoint, and returned sandbox_id.
+The runner writes to a CSV audit log at `/data/audit.log` inside `sandbox-runner`. Every `POST /run` and `preview_app` call is recorded with the outcome (`spawn` / `reuse` / `tests_missing` / `lint_failed` / `readiness_failed` / `spawn_error`), sandbox_id, session_id, runtime, file counts, and — on success — the test-run outcome (`tests_ok`, `tests_exit_code`, `tests_duration_s`). Columns are declared in [`runner/app.py`](runner/app.py) `_AUDIT_COLUMNS`.
 
 ```bash
 docker exec sandbox-runner cat /data/audit.log

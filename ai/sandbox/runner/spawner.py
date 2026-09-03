@@ -69,6 +69,123 @@ class Spawner:
             NET_NAME, EGRESS_URL, MEMORY_LIMIT, PIDS_LIMIT,
         )
 
+    def _common_container_kwargs(
+        self,
+        *,
+        sandbox_id: str,
+        role: str,
+        working_dir: str,
+        need_bind_service: bool,
+    ) -> dict:
+        """Return the shared ``containers.create`` kwargs that enforce the
+        sandbox security posture — network segmentation, cap-drop,
+        resource caps, non-root user, no host mounts, labels the reaper
+        keys on.
+
+        The one thing callers vary is ``working_dir`` (``/app`` for
+        sandboxes, ``/tests`` for testers) and whether the container
+        needs CAP_NET_BIND_SERVICE (sandboxes bind port 80; testers
+        never listen). ``role`` becomes the ``sandbox.role`` label so
+        the reaper (see ``reaper.py``) can sweep abandoned testers on a
+        shorter clock than sandboxes.
+
+        A single source of truth for these kwargs matters because the
+        security-invariant checklist in ``ai/sandbox/SANDBOX.md`` reads
+        directly from what is set here — a copy-paste divergence between
+        spawn paths would silently regress that checklist for one role
+        and not the other.
+        """
+        kwargs = dict(
+            environment={
+                "HTTP_PROXY": EGRESS_URL,
+                "HTTPS_PROXY": EGRESS_URL,
+                "http_proxy": EGRESS_URL,
+                "https_proxy": EGRESS_URL,
+                # Base images look at this to skip color codes in logs
+                # captured by the runner.
+                "TERM": "dumb",
+                # Force Python + Node + npm to use unbuffered stdout.
+                # We redirect the user command to /tmp/sandbox.log via
+                # `>>… 2>&1`, and stdout goes block-buffered (4-8 KB)
+                # when it isn't a TTY — a fresh traceback sits in the
+                # buffer until it fills, the process exits, or someone
+                # calls flush(). That's exactly the bug where the
+                # model calls get_sandbox_logs, sees an empty file,
+                # and confidently tells the user "no errors here" while
+                # the browser is showing a crash card. PYTHONUNBUFFERED
+                # switches CPython to line-buffered even when writing
+                # to a file; NPM_CONFIG_LOGLEVEL / FORCE_COLOR keep
+                # Node dev servers from stripping their own diagnostics
+                # in a `dumb` TERM.
+                "PYTHONUNBUFFERED": "1",
+                "NPM_CONFIG_LOGLEVEL": "warn",
+                "FORCE_COLOR": "0",
+            },
+            # sandbox_net ONLY. The invariant that keeps sandboxes off
+            # ai_shared, sandbox_state, and everything else lives here.
+            network=NET_NAME,
+            # FOLLOW-UP: read_only=True is disabled AND /app is no
+            # longer a tmpfs. Two coupled Docker limitations force
+            # this:
+            #   1. `put_archive` on a read-only rootfs fails with
+            #      "container rootfs is marked read-only" even when
+            #      the target is a tmpfs mount.
+            #   2. `put_archive` writes to the container rootfs and
+            #      is shadowed by any tmpfs mounted at the same
+            #      path — files land underneath and stay invisible.
+            # The correct fix is to inject via `exec_run` with a
+            # streamed tar, which uses the running container's mount
+            # namespace; both invariants can then be restored. For
+            # now, /app is a regular dir on the (writable) rootfs.
+            # /home/sandbox stays tmpfs because the runner never
+            # `put_archive`s there — only the container's own `pip
+            # install --user` writes there at runtime.
+            # Primary security control remains network segmentation.
+            read_only=False,
+            tmpfs={
+                "/tmp": "size=128M,mode=1777",
+                "/home/sandbox": "size=256M,uid=1000,gid=1000,mode=0755",
+            },
+            # Drop every capability. Runtimes that need one specifically
+            # (none today) would add it here explicitly.
+            cap_drop=["ALL"],
+            # Resource caps. 1 full CPU per container of any role.
+            mem_limit=MEMORY_LIMIT,
+            nano_cpus=NANO_CPUS_PER_CPU,
+            pids_limit=PIDS_LIMIT,
+            # Non-root (base images ship uid 1000). Belt-and-suspenders.
+            user="1000:1000",
+            working_dir=working_dir,
+            # No hostname leakage — every container looks the same from
+            # inside, no info about the host or its siblings.
+            hostname=role,
+            # Don't restart on crash; the runner reaps and returns
+            # a structured error to the caller so the model decides
+            # what to do.
+            restart_policy={"Name": "no"},
+            # Labels used by the reaper to find our containers even if
+            # the runner is restarted mid-flight. `sandbox.role` lets
+            # the reaper apply a different TTL per role.
+            labels={
+                "sandbox.managed": "true",
+                "sandbox.id": sandbox_id,
+                "sandbox.role": role,
+                "sandbox.spawned_at": str(int(time.time())),
+            },
+            detach=True,
+        )
+        # Only sandboxes bind port 80; testers just make outbound HTTP.
+        # Granting NET_BIND_SERVICE unconditionally is harmless but
+        # violates least-privilege — keep it scoped to what actually
+        # needs it.
+        if need_bind_service:
+            # Grant CAP_NET_BIND_SERVICE so unprivileged nginx (etc.)
+            # can bind port 80 inside the container. File-caps set
+            # via setcap in the base Dockerfile aren't inheritable
+            # once cap_drop=ALL removes them from the ambient set.
+            kwargs["cap_add"] = ["NET_BIND_SERVICE"]
+        return kwargs
+
     def spawn(
         self,
         sandbox_id: str,
@@ -116,86 +233,12 @@ class Spawner:
                 # so we can inject files before the user's app starts.
                 entrypoint=["sleep", "infinity"],
                 command=[],
-                environment={
-                    "HTTP_PROXY": EGRESS_URL,
-                    "HTTPS_PROXY": EGRESS_URL,
-                    "http_proxy": EGRESS_URL,
-                    "https_proxy": EGRESS_URL,
-                    # Base images look at this to skip color codes in logs
-                    # captured by the runner.
-                    "TERM": "dumb",
-                    # Force Python + Node + npm to use unbuffered stdout.
-                    # We redirect the user command to /tmp/sandbox.log via
-                    # `>>… 2>&1`, and stdout goes block-buffered (4-8 KB)
-                    # when it isn't a TTY — a fresh traceback sits in the
-                    # buffer until it fills, the process exits, or someone
-                    # calls flush(). That's exactly the bug where the
-                    # model calls get_sandbox_logs, sees an empty file,
-                    # and confidently tells the user "no errors here" while
-                    # the browser is showing a crash card. PYTHONUNBUFFERED
-                    # switches CPython to line-buffered even when writing
-                    # to a file; NPM_CONFIG_LOGLEVEL / FORCE_COLOR keep
-                    # Node dev servers from stripping their own diagnostics
-                    # in a `dumb` TERM.
-                    "PYTHONUNBUFFERED": "1",
-                    "NPM_CONFIG_LOGLEVEL": "warn",
-                    "FORCE_COLOR": "0",
-                },
-                # sandbox_net ONLY. The invariant that keeps sandboxes off
-                # ai_shared, sandbox_state, and everything else lives here.
-                network=NET_NAME,
-                # FOLLOW-UP: read_only=True is disabled AND /app is no
-                # longer a tmpfs. Two coupled Docker limitations force
-                # this:
-                #   1. `put_archive` on a read-only rootfs fails with
-                #      "container rootfs is marked read-only" even when
-                #      the target is a tmpfs mount.
-                #   2. `put_archive` writes to the container rootfs and
-                #      is shadowed by any tmpfs mounted at the same
-                #      path — files land underneath and stay invisible.
-                # The correct fix is to inject via `exec_run` with a
-                # streamed tar, which uses the running container's mount
-                # namespace; both invariants can then be restored. For
-                # now, /app is a regular dir on the (writable) rootfs.
-                # /home/sandbox stays tmpfs because the runner never
-                # `put_archive`s there — only the container's own `pip
-                # install --user` writes there at runtime.
-                # Primary security control remains network segmentation.
-                read_only=False,
-                tmpfs={
-                    "/tmp": "size=128M,mode=1777",
-                    "/home/sandbox": "size=256M,uid=1000,gid=1000,mode=0755",
-                },
-                # Grant CAP_NET_BIND_SERVICE so unprivileged nginx (etc.)
-                # can bind port 80 inside the container. File-caps set
-                # via setcap in the base Dockerfile aren't inheritable
-                # once cap_drop=ALL removes them from the ambient set.
-                cap_add=["NET_BIND_SERVICE"],
-                # Drop every capability. Runtimes that need one specifically
-                # (none today) would add it here explicitly.
-                cap_drop=["ALL"],
-                # Resource caps. 1 full CPU per sandbox.
-                mem_limit=MEMORY_LIMIT,
-                nano_cpus=NANO_CPUS_PER_CPU,
-                pids_limit=PIDS_LIMIT,
-                # Sandbox runs as a non-root user (defined in the base
-                # Dockerfiles). Ensuring here is belt-and-suspenders.
-                user="1000:1000",
-                working_dir="/app",
-                # No hostname leakage — every sandbox looks the same from
-                # inside, no info about the host or other sandboxes.
-                hostname="sandbox",
-                # Don't restart on crash; the runner reaps and returns
-                # 500 to the caller so the model can decide what to do.
-                restart_policy={"Name": "no"},
-                # Labels used by the reaper to find our containers even if
-                # the process is restarted mid-flight.
-                labels={
-                    "sandbox.managed": "true",
-                    "sandbox.id": sandbox_id,
-                    "sandbox.spawned_at": str(int(time.time())),
-                },
-                detach=True,
+                **self._common_container_kwargs(
+                    sandbox_id=sandbox_id,
+                    role="sandbox",
+                    working_dir="/app",
+                    need_bind_service=True,
+                ),
             )
         except APIError as exc:
             # Common cause: image not built yet. Give the operator a hint.
@@ -242,6 +285,155 @@ class Spawner:
             name, user_command,
         )
         return SpawnResult(container_id=container.id, container_name=name)
+
+    def spawn_tester(
+        self,
+        sandbox_id: str,
+        test_files: dict[str, str],
+        test_command: str,
+        env: dict[str, str],
+        timeout_s: float,
+    ) -> tuple[int, str]:
+        """Run the caller's tests in a short-lived companion container
+        and return ``(exit_code, combined_output)``.
+
+        Same security posture as ``spawn`` (sandbox_net only, cap_drop
+        ALL, non-root, no host mounts). Differs in three ways:
+
+          * ``sandbox-tester:latest`` image (pytest + jest + playwright
+            + chromium + curl + jq baked in — see
+            ``ai/sandbox/images/tester.Dockerfile``).
+          * Container name is ``sandbox-tester-{sandbox_id}``.
+          * ``sandbox.role=tester`` label so the reaper can sweep
+            abandoned testers on a shorter clock than sandboxes.
+
+        Execution shape: create + start with the placeholder PID 1
+        (``sleep infinity``), ``put_archive`` the test files into
+        ``/tests``, then ``exec_run`` the runtime's ``test_command``
+        SYNCHRONOUSLY. Sync is right here — the runner's ``_reuse_or_spawn``
+        wraps this call in ``asyncio.to_thread``, and callers want a
+        completed result, not a detached task. Two-phase (placeholder
+        PID 1 → put_archive → exec) mirrors ``spawn``'s dance because
+        ``put_archive`` has the same "container must be started"
+        prerequisite whether or not the ultimate command is long-running.
+
+        On timeout the container is force-removed and ``(-1,
+        "test run timed out after …")`` is returned — never raises for
+        timeouts, so the caller doesn't have to distinguish "test
+        failed" from "test timed out" (both are ``ok=False``). Docker
+        API errors DO raise; those are infrastructure failures the
+        runner should log and surface as 500."""
+        name = f"sandbox-tester-{sandbox_id}"
+        log.info(
+            "spawn_tester: name=%s test_command=%r n_test_files=%d timeout=%.1fs",
+            name, test_command, len(test_files), timeout_s,
+        )
+        # Merge the runner-supplied env (PREVIEW_URL, etc.) over the
+        # security-invariant env from _common_container_kwargs.
+        common = self._common_container_kwargs(
+            sandbox_id=sandbox_id,
+            role="tester",
+            working_dir="/tests",
+            need_bind_service=False,
+        )
+        common["environment"] = {**common["environment"], **env}
+
+        try:
+            container = self._client.containers.create(
+                image="sandbox-tester:latest",
+                name=name,
+                entrypoint=["sleep", "infinity"],
+                command=[],
+                **common,
+            )
+        except APIError as exc:
+            log.error(
+                "spawn_tester: docker create failed for %s: %s", name, exc,
+            )
+            raise RuntimeError(
+                f"docker create failed for sandbox-tester:latest: {exc}. "
+                "Did you run `docker compose -f ai/sandbox/docker-compose.sandbox.yml "
+                "--profile build build`?"
+            ) from exc
+
+        container.start()
+        log.debug("spawn_tester: %s started (sleep pid1)", name)
+        try:
+            if test_files:
+                tarball = _make_tarball(test_files)
+                container.put_archive("/tests", tarball)
+                log.debug(
+                    "spawn_tester: put_archive %d file(s) into %s:/tests (%d bytes)",
+                    len(test_files), name, len(tarball),
+                )
+            # exec_run(detach=False, demux=False) blocks until the
+            # command exits AND returns its combined stdout+stderr — no
+            # /tmp/sandbox.log dance needed because we own the exec
+            # session end-to-end. The exec inherits the container's env
+            # + working_dir, so PREVIEW_URL is visible without an
+            # explicit environment= kwarg. Redirect stderr into stdout
+            # inside the shell so pytest/jest failures land in one
+            # ordered stream for the model to read.
+            start = time.monotonic()
+            deadline = start + timeout_s
+            # docker-py's exec_run doesn't take a timeout — we poll for
+            # completion via wait() on a background exec is awkward.
+            # Instead: run the exec on a background thread of the docker
+            # SDK (`socket=True` returns the stream) and time-bound
+            # ourselves.
+            exec_id = self._client.api.exec_create(
+                container.id,
+                cmd=["/bin/sh", "-c", f"({test_command}) 2>&1"],
+                workdir="/tests",
+                user="1000:1000",
+                tty=False,
+            )["Id"]
+            log.debug("spawn_tester: exec_id=%s", exec_id)
+            # start=False for exec_start with stream=True gives us the
+            # stdout/stderr stream to read. If the read blocks past the
+            # deadline we kill the container.
+            stream = self._client.api.exec_start(
+                exec_id, stream=True, detach=False
+            )
+            buf: list[bytes] = []
+            for chunk in stream:
+                if chunk:
+                    buf.append(chunk)
+                if time.monotonic() > deadline:
+                    log.warning(
+                        "spawn_tester: %s exceeded timeout %.1fs, killing",
+                        name, timeout_s,
+                    )
+                    break
+            output = b"".join(buf).decode("utf-8", errors="replace")
+            # Ask docker for the exit code AFTER draining the stream.
+            info = self._client.api.exec_inspect(exec_id)
+            exit_code = info.get("ExitCode")
+            if exit_code is None:
+                # Still running — timeout path, or exec was killed by
+                # our teardown. Force-close the container to be safe
+                # and report as a timeout to the caller.
+                log.warning(
+                    "spawn_tester: %s exec still running at inspect, treating as timeout",
+                    name,
+                )
+                return (
+                    -1,
+                    output
+                    + f"\n\n[sandbox-tester] test run timed out after {timeout_s:.0f}s",
+                )
+            duration = time.monotonic() - start
+            log.info(
+                "spawn_tester: %s exited with %d in %.1fs (%d bytes of output)",
+                name, exit_code, duration, len(output),
+            )
+            return int(exit_code), output
+        finally:
+            # Always tear down — a tester container has no reason to
+            # outlive its test run, and leaving one on the host would
+            # squat a sandbox_net slot the reaper doesn't sweep for
+            # SANDBOX_HARD_TTL_SECONDS.
+            self.stop(name)
 
     def readiness_ok(
         self, container_name: str, port: int, path: str, timeout_s: float

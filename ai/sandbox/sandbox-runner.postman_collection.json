@@ -71,7 +71,7 @@
         ],
         "body": {
           "mode": "raw",
-          "raw": "{\n  \"runtime\": \"static\",\n  \"files\": {\n    \"index.html\": \"<!doctype html><html><head><title>demo</title></head><body style=\\\"font-family: system-ui; padding: 2rem\\\"><h1>hello sandbox</h1><p>Timestamp: <span id=t></span></p><script>document.getElementById('t').textContent = new Date().toISOString()</script></body></html>\"\n  }\n}",
+          "raw": "{\n  \"runtime\": \"static\",\n  \"files\": {\n    \"index.html\": \"<!doctype html><html><head><title>demo</title></head><body style=\\\"font-family: system-ui; padding: 2rem\\\"><h1>hello sandbox</h1><p>Timestamp: <span id=t></span></p><script>document.getElementById('t').textContent = new Date().toISOString()</script></body></html>\",\n    \"tests/run.sh\": \"#!/bin/sh\\nset -eu\\nbody=$(curl -sf \\\"$PREVIEW_URL\\\")\\necho \\\"$body\\\" | grep -q 'hello sandbox' || { echo 'FAIL' >&2; exit 1; }\\necho OK\\n\"\n  }\n}",
           "options": { "raw": { "language": "json" } }
         },
         "url": {
@@ -79,7 +79,7 @@
           "host": ["{{litellm}}"],
           "path": ["v1", "sandbox", "run"]
         },
-        "description": "Spawn a static HTML sandbox — nginx serves the files map at /. Returns { sandbox_id, session_id, url, expires_at, reused }. The URL uses whatever SANDBOX_PROXY_URL is set to in .env — for browser-reachable iframes, that should be a public URL under the same origin as Open WebUI (e.g. https://chat.zeoenergy.com/sandboxes). Copy the returned `session_id` into the `sandboxSessionId` collection variable to run the 'update in-session' request afterwards."
+        "description": "Spawn a static HTML sandbox — nginx serves the files map at /. Returns { sandbox_id, session_id, url, expires_at, reused, runtime, startup_output, tests }. The URL uses whatever SANDBOX_PROXY_URL is set to in .env — for browser-reachable iframes, that should be a public URL under the same origin as Open WebUI (e.g. https://chat.zeoenergy.com/sandboxes).\n\n**Tests required.** The body must include at least one file under `tests/`; the request above adds `tests/run.sh` (POSIX shell + curl using $PREVIEW_URL) which the sandbox-tester container executes against the live preview before the response returns. On a green run the response body's `tests.ok` is true. Copy the returned `session_id` into the `sandboxSessionId` collection variable to run the 'update in-session' request afterwards — tests persist across turns, so follow-ups don't have to re-send tests/run.sh."
       },
       "response": []
     },
@@ -92,7 +92,7 @@
         ],
         "body": {
           "mode": "raw",
-          "raw": "{\n  \"runtime\": \"python\",\n  \"files\": {\n    \"app.py\": \"import streamlit as st\\nimport numpy as np\\nimport pandas as pd\\n\\nst.title('sine wave demo')\\nn = st.slider('samples', 10, 500, 100)\\nfreq = st.slider('frequency', 1, 10, 3)\\nx = np.linspace(0, 2 * np.pi, n)\\ndf = pd.DataFrame({'x': x, 'y': np.sin(freq * x)})\\nst.line_chart(df.set_index('x'))\\n\"\n  },\n  \"ttl_seconds\": 900\n}",
+          "raw": "{\n  \"runtime\": \"python\",\n  \"files\": {\n    \"app.py\": \"import streamlit as st\\nimport numpy as np\\nimport pandas as pd\\n\\nst.title('sine wave demo')\\nn = st.slider('samples', 10, 500, 100)\\nfreq = st.slider('frequency', 1, 10, 3)\\nx = np.linspace(0, 2 * np.pi, n)\\ndf = pd.DataFrame({'x': x, 'y': np.sin(freq * x)})\\nst.line_chart(df.set_index('x'))\\n\",\n    \"tests/test_ui.py\": \"import os\\nfrom playwright.sync_api import sync_playwright, expect\\n\\n\\ndef test_title_renders():\\n    url = os.environ['PREVIEW_URL']\\n    with sync_playwright() as p:\\n        browser = p.chromium.launch()\\n        page = browser.new_page()\\n        page.goto(url)\\n        expect(page.get_by_text('sine wave demo')).to_be_visible(timeout=15000)\\n        browser.close()\\n\"\n  },\n  \"ttl_seconds\": 900\n}",
           "options": { "raw": { "language": "json" } }
         },
         "url": {
@@ -100,7 +100,7 @@
           "host": ["{{litellm}}"],
           "path": ["v1", "sandbox", "run"]
         },
-        "description": "Spawn a Streamlit sandbox. Runtime `python` base image has streamlit, gradio, flask, fastapi, pandas, numpy, matplotlib, plotly, requests, pillow pre-installed. Add a requirements.txt to files to install additional deps via sandbox-egress (pypi allowlisted). Cold-start ~2s pre-baked; 20-90s if pip install runs."
+        "description": "Spawn a Streamlit sandbox. Runtime `python` base image has streamlit, gradio, flask, fastapi, pandas, numpy, matplotlib, plotly, requests, pillow pre-installed. Add a requirements.txt to files to install additional deps via sandbox-egress (pypi allowlisted). Cold-start ~2s pre-baked; 20-90s if pip install runs.\n\nThe request body includes a `tests/test_ui.py` that uses Playwright + chromium (pre-installed in the sandbox-tester image) to navigate the live Streamlit URL and assert the title is visible. Expect the response's `tests.duration_s` to add ~10-15s on a cold Playwright launch — bump SANDBOX_TEST_TIMEOUT_SECONDS if the default 60s is tight."
       },
       "response": []
     },
@@ -113,7 +113,7 @@
         ],
         "body": {
           "mode": "raw",
-          "raw": "{\n  \"runtime\": \"python\",\n  \"entrypoint\": \"python gradio_app.py\",\n  \"files\": {\n    \"gradio_app.py\": \"import gradio as gr\\n\\ndef reverse(text):\\n    return text[::-1]\\n\\ngr.Interface(fn=reverse, inputs='text', outputs='text').launch(server_name='0.0.0.0', server_port=80)\\n\",\n    \"requirements.txt\": \"gradio\\n\"\n  }\n}",
+          "raw": "{\n  \"runtime\": \"python\",\n  \"entrypoint\": \"python gradio_app.py\",\n  \"files\": {\n    \"gradio_app.py\": \"import gradio as gr\\n\\ndef reverse(text):\\n    return text[::-1]\\n\\ngr.Interface(fn=reverse, inputs='text', outputs='text').launch(server_name='0.0.0.0', server_port=80)\\n\",\n    \"requirements.txt\": \"gradio\\n\",\n    \"tests/test_gradio.py\": \"import os\\nimport requests\\n\\n\\ndef test_gradio_boots():\\n    r = requests.get(os.environ['PREVIEW_URL'], timeout=10)\\n    r.raise_for_status()\\n    assert 'gradio' in r.text.lower(), r.text[:400]\\n\"\n  }\n}",
           "options": { "raw": { "language": "json" } }
         },
         "url": {
@@ -134,7 +134,7 @@
         ],
         "body": {
           "mode": "raw",
-          "raw": "{\n  \"runtime\": \"node\",\n  \"entrypoint\": \"node server.js\",\n  \"files\": {\n    \"server.js\": \"const express = require('express');\\nconst app = express();\\napp.get('/', (_, res) => res.send('<h1>hello from express</h1>'));\\napp.listen(80, '0.0.0.0', () => console.log('listening on 80'));\\n\"\n  }\n}",
+          "raw": "{\n  \"runtime\": \"node\",\n  \"entrypoint\": \"node server.js\",\n  \"files\": {\n    \"server.js\": \"const express = require('express');\\nconst app = express();\\napp.get('/', (_, res) => res.send('<h1>hello from express</h1>'));\\napp.listen(80, '0.0.0.0', () => console.log('listening on 80'));\\n\",\n    \"tests/home.test.js\": \"test('home returns hello', async () => {\\n  const res = await fetch(process.env.PREVIEW_URL);\\n  expect(res.status).toBe(200);\\n  const body = await res.text();\\n  expect(body).toContain('hello from express');\\n}, 15000);\\n\"\n  }\n}",
           "options": { "raw": { "language": "json" } }
         },
         "url": {
@@ -155,7 +155,7 @@
         ],
         "body": {
           "mode": "raw",
-          "raw": "{\n  \"runtime\": \"node\",\n  \"entrypoint\": \"npx --yes vite --host 0.0.0.0 --port 80\",\n  \"files\": {\n    \"package.json\": \"{\\\"name\\\":\\\"demo\\\",\\\"type\\\":\\\"module\\\",\\\"scripts\\\":{\\\"dev\\\":\\\"vite\\\"}}\",\n    \"index.html\": \"<!doctype html><html><head><title>vite demo</title></head><body><div id=root></div><script type=module src=/main.jsx></script></body></html>\",\n    \"main.jsx\": \"import React, { useState } from 'react';\\nimport ReactDOM from 'react-dom/client';\\n\\nfunction Counter() {\\n  const [n, setN] = useState(0);\\n  return (<div style={{padding: '2rem', fontFamily: 'system-ui'}}>\\n    <h1>count: {n}</h1>\\n    <button onClick={() => setN(n + 1)}>+</button>\\n    <button onClick={() => setN(0)}>reset</button>\\n  </div>);\\n}\\n\\nReactDOM.createRoot(document.getElementById('root')).render(<Counter />);\\n\"\n  }\n}",
+          "raw": "{\n  \"runtime\": \"node\",\n  \"entrypoint\": \"npx --yes vite --host 0.0.0.0 --port 80\",\n  \"files\": {\n    \"package.json\": \"{\\\"name\\\":\\\"demo\\\",\\\"type\\\":\\\"module\\\",\\\"scripts\\\":{\\\"dev\\\":\\\"vite\\\"}}\",\n    \"index.html\": \"<!doctype html><html><head><title>vite demo</title></head><body><div id=root></div><script type=module src=/main.jsx></script></body></html>\",\n    \"main.jsx\": \"import React, { useState } from 'react';\\nimport ReactDOM from 'react-dom/client';\\n\\nfunction Counter() {\\n  const [n, setN] = useState(0);\\n  return (<div style={{padding: '2rem', fontFamily: 'system-ui'}}>\\n    <h1>count: {n}</h1>\\n    <button onClick={() => setN(n + 1)}>+</button>\\n    <button onClick={() => setN(0)}>reset</button>\\n  </div>);\\n}\\n\\nReactDOM.createRoot(document.getElementById('root')).render(<Counter />);\\n\",\n    \"tests/counter.test.js\": \"const { chromium } = require('playwright');\\n\\ntest('counter increments on click', async () => {\\n  const browser = await chromium.launch();\\n  const page = await browser.newPage();\\n  await page.goto(process.env.PREVIEW_URL);\\n  await expect(page.getByRole('heading', { name: /count: 0/ })).toBeVisible({ timeout: 15000 });\\n  await page.getByRole('button', { name: '+' }).click();\\n  await expect(page.getByRole('heading', { name: /count: 1/ })).toBeVisible();\\n  await browser.close();\\n}, 30000);\\n\"\n  }\n}",
           "options": { "raw": { "language": "json" } }
         },
         "url": {
@@ -185,6 +185,27 @@
           "path": ["v1", "sandbox", "run"]
         },
         "description": "Update a preview in place. Pass the `session_id` from a previous /run response (via the sandboxSessionId collection variable) and the file(s) that changed. The runner writes them into the running container's /app via docker cp — no respawn. Response has `reused: true` and the SAME sandbox_id + url as the initial spawn. The dev server inside the sandbox reloads on file change: nginx serves the new file on next request, Streamlit auto-reruns, Vite HMR fires without a browser refresh. If the container was already reaped when this call arrives (idle-TTL or manual rm), the runner self-heals — same session_id, new sandbox_id, new url — so callers don't have to distinguish the two cases.\n\n`files` is treated as an overlay: paths listed here overwrite the running container's copies; unlisted files stay put. Save tokens by not resending unchanged files."
+      },
+      "response": []
+    },
+    {
+      "name": "POST /run — missing tests (negative test — expect 400)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"runtime\": \"python\",\n  \"files\": {\n    \"app.py\": \"import streamlit as st\\nst.title('no tests')\\n\"\n  }\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": {
+          "raw": "{{litellm}}/v1/sandbox/run",
+          "host": ["{{litellm}}"],
+          "path": ["v1", "sandbox", "run"]
+        },
+        "description": "Confirms the tests-required gate — the body includes no file under `tests/`, so the runner refuses with HTTP 400 before spawning anything. The response body's `detail` is `{error: \"tests missing\", session_id, runtime, hint, example}` where `example` is a minimal working test file the model can copy. Passing this expectation confirms `SANDBOX_TESTS_REQUIRED=true`. To disable the gate for a migration window, set `SANDBOX_TESTS_REQUIRED=false` in .env and this call will succeed instead."
       },
       "response": []
     },

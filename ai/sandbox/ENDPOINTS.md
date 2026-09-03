@@ -10,7 +10,7 @@ Everything below is served by [`ai/sandbox/runner/app.py`](app.py). Jobs endpoin
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/health` | Liveness + DB status |
-| `POST` | `/run` | Spawn a sandbox — or update an existing one when `session_id` is passed. Returns JSON with URL, session_id, and `reused` flag |
+| `POST` | `/run` | Spawn a sandbox — or update an existing one when `session_id` is passed. Runs behavioral tests before returning. JSON response has URL, session_id, `reused` flag, and a `tests` object with the test-run outcome |
 | `DELETE` | `/session/{session_id}` | Explicitly tear down a session's running sandbox. Idempotent |
 | `GET` | `/session/{session_id}/download` | Stream the running sandbox's `/app` as a tar archive. Follows self-heal (resolves session at request time). Also exposed publicly via Caddy at `/sandboxes/download/{session_id}` |
 | `GET` | `/session/{session_id}/logs` | Return the last N lines (default 100, max 1000) of the running sandbox's stdout+stderr. Follows self-heal. Diagnostic for apps that render errors in-browser only (Flask/Vite/Next tracebacks; Streamlit does not use stdout for user errors) |
@@ -82,30 +82,40 @@ Field semantics:
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `runtime` | string | yes | One of `static`, `python`, `node`. See [`runtimes.py`](runner/runtimes.py) for the current registry. |
-| `files` | `{ path: content }` | no | Map of relative filesystem paths → text contents. On the first call: the initial file set. On a follow-up: an overlay — paths listed here overwrite files in the running container, unlisted files are preserved. Absolute paths and `..` are rejected. |
+| `files` | `{ path: content }` | yes (see note) | Map of relative filesystem paths → text contents. On the first call: the initial file set. On a follow-up: an overlay — paths listed here overwrite files in the running container, unlisted files are preserved. Absolute paths and `..` are rejected. **At least one entry must be a test file under a top-level `tests/` directory** when `SANDBOX_TESTS_REQUIRED=true` — see [Behavioral tests](#behavioral-tests). |
 | `entrypoint` | string | no | Shell command that must bind to port `80` inside the container. Leave `null` to use the runtime's default. Ignored on follow-up calls — the entrypoint is fixed at spawn time. |
 | `ttl_seconds` | int | no | Idle lifetime. Server clamps to `SANDBOX_HARD_TTL_SECONDS` (3600). Defaults to `SANDBOX_DEFAULT_TTL_SECONDS` (900). |
 | `session_id` | string | no | Persistent handle across turns. Regex `^[A-Za-z0-9_-]{1,64}$`. Omit on first call — the server generates one. Pass the value from the previous response to update in place. |
-| `deletes` | `[path, …]` | no | Relative paths under `/app` to remove on a follow-up call. Same sanitization as `files`. Ignored on the first call. |
+| `deletes` | `[path, …]` | no | Relative paths under `/app` to remove on a follow-up call. Same sanitization as `files`. Ignored on the first call. Paths under `tests/` remove entries from the persisted test map. |
 
 **Response (200):**
 ```json
 {
-  "sandbox_id": "a1b2c3d4e5f6",
-  "session_id": "bfdYm3_H5SD4",
-  "url":        "http://sandbox-proxy/a1b2c3d4e5f6/",
-  "expires_at": "2026-08-27T18:15:32.114513+00:00",
-  "reused":     false
+  "sandbox_id":     "a1b2c3d4e5f6",
+  "session_id":     "bfdYm3_H5SD4",
+  "url":            "http://sandbox-proxy/a1b2c3d4e5f6/",
+  "expires_at":     "2026-08-27T18:15:32.114513+00:00",
+  "reused":         false,
+  "runtime":        "static",
+  "startup_output": "",
+  "tests": {
+    "ok":         true,
+    "exit_code":  0,
+    "output":     "OK: landing page renders expected text\n",
+    "runner":     "sh",
+    "duration_s": 0.7,
+    "timed_out":  false
+  }
 }
 ```
 
-The returned `url` is reachable at `http://sandbox-proxy` on the `ai_shared` Docker network (i.e. from OpenWebUI). From the host it's at `http://localhost:8011/{sandbox_id}/`. `reused: true` means the response came from the session-reuse path and the container was NOT respawned.
+The returned `url` is reachable at `http://sandbox-proxy` on the `ai_shared` Docker network (i.e. from OpenWebUI). From the host it's at `http://localhost:8011/{sandbox_id}/`. `reused: true` means the response came from the session-reuse path and the container was NOT respawned. `tests` is `null` only when `SANDBOX_TESTS_REQUIRED=false` AND no `tests/` files were shipped; otherwise the runner always executes the test map and surfaces the outcome here. **A `tests.ok: false` result does NOT prevent the URL from being returned** — soft-fail is intentional so the operator can inspect a partially-broken preview; the model is expected to iterate on the same `session_id` before handing back to the user. See [Behavioral tests](#behavioral-tests).
 
 **Error responses:**
 
 | Status | Meaning |
 |---|---|
-| `400` | Unknown `runtime` value, OR **static lint failed on a Python file** (see below). |
+| `400` | Unknown `runtime` value; **static lint failed on a Python file**; **tests missing** (no file under `tests/` when `SANDBOX_TESTS_REQUIRED=true`) — see below. |
 | `429` | Concurrency cap reached (`SANDBOX_MAX_CONCURRENT`, default 8). |
 | `500` | Docker spawn error — image missing, cgroup rejection, etc. |
 | `504` | Sandbox spawned but readiness probe (`GET /` inside container) didn't reply within 30s. Container is torn down before the response returns; **logs are captured first** (see below). |
@@ -140,28 +150,60 @@ Readiness failure (504) — container spawned but didn't bind port 80 within 30 
 }
 ```
 
-Both include a `session_id` so a retry with the same id transparently self-heals via the existing session-reuse path.
+Tests missing (400) — the request did not include any file under a top-level `tests/` directory AND the deployment has `SANDBOX_TESTS_REQUIRED=true`:
+```json
+{
+  "detail": {
+    "error": "tests missing",
+    "session_id": "9m3lLXq2r0Pt",
+    "runtime": "python",
+    "hint": "This deployment requires model-supplied behavioral tests. Add at least one file under the top-level `tests/` directory that exercises the running preview (navigate, click, assert visible text/data)…",
+    "example": {
+      "tests/test_ui.py": "import os\nfrom playwright.sync_api import sync_playwright, expect\n…"
+    }
+  }
+}
+```
+
+All three include a `session_id` so a retry with the same id transparently self-heals via the existing session-reuse path.
+
+### Behavioral tests
+
+Every call must ship at least one file under a top-level `tests/` directory (soft-disabled when `SANDBOX_TESTS_REQUIRED=false`). The runner:
+
+1. Splits the `files` map: entries under `tests/` are stashed in the job's metadata; everything else goes into the sandbox's `/app`.
+2. Spawns the sandbox as usual and awaits readiness.
+3. Spawns an ephemeral `sandbox-tester-{id}` companion on `sandbox_net` from the `sandbox-tester:latest` image (pytest + jest + Playwright + chromium + curl + jq pre-baked). Puts the test files into the tester's `/tests` and execs the runtime's `test_command` with `PREVIEW_URL=http://sandbox-{id}:80/` in the environment.
+4. Waits up to `SANDBOX_TEST_TIMEOUT_SECONDS` (default 60), tears the tester down (win, fail, or timeout — always), and inlines the result on the response `tests` field.
+
+The tester container gets the same security posture as sandboxes: `sandbox_net` only, cap-drop, non-root 1000:1000, no `docker.sock`. See [`ai/sandbox/SANDBOX.md § Behavioral tests`](SANDBOX.md#behavioral-tests) for the full walkthrough.
+
+On follow-up calls with the same `session_id`, prior tests persist. The delta rule applies to test files too: send only the ones that changed; use `deletes` with a `tests/…` path to remove a test that no longer belongs.
 
 **Curl examples:**
 
-Static HTML:
+Static HTML (with a curl-based test):
 ```bash
 curl -X POST http://localhost:8012/run \
   -H 'Content-Type: application/json' \
   -d '{
     "runtime": "static",
-    "files": {"index.html": "<h1>hello sandbox</h1>"}
+    "files": {
+      "index.html": "<h1>hello sandbox</h1>",
+      "tests/run.sh": "#!/bin/sh\ncurl -sf \"$PREVIEW_URL\" | grep -q \"hello sandbox\"\n"
+    }
   }'
 ```
 
-Streamlit app (Python runtime):
+Streamlit app (Python runtime) with a Playwright test:
 ```bash
 curl -X POST http://localhost:8012/run \
   -H 'Content-Type: application/json' \
   -d '{
     "runtime": "python",
     "files": {
-      "app.py": "import streamlit as st\nst.title(\"demo\")\nst.slider(\"n\", 0, 100)"
+      "app.py": "import streamlit as st\nst.title(\"demo\")\nst.slider(\"n\", 0, 100)",
+      "tests/test_ui.py": "import os\nfrom playwright.sync_api import sync_playwright, expect\n\ndef test_title():\n    with sync_playwright() as p:\n        b = p.chromium.launch()\n        page = b.new_page()\n        page.goto(os.environ[\"PREVIEW_URL\"])\n        expect(page.get_by_text(\"demo\")).to_be_visible(timeout=15000)\n        b.close()\n"
     }
   }'
 ```

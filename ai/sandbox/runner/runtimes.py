@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from typing import Optional
 
 
 log = logging.getLogger("sandbox-runner.runtimes")
@@ -53,6 +54,19 @@ class Runtime:
             ``python3 -m http.server`` (which the image doesn't have).
         example_files: A minimal working ``files`` map the ``list_runtimes``
             tool returns so a model can pattern-match a valid request.
+        test_command: Shell command the sandbox-tester companion container
+            runs against the live preview. ``PREVIEW_URL`` is exported into
+            the tester's env as ``http://sandbox-{id}:80/`` so tests use
+            ``os.environ["PREVIEW_URL"]`` / ``$PREVIEW_URL`` rather than
+            hardcoding an internal hostname. ``None`` means the runtime
+            has no test convention — currently no runtime declares this.
+        test_files_hint: Human-readable filename pattern shown to the
+            model in ``list_runtimes`` and the "tests missing" 400 error.
+            Not used for discovery — anything under a top-level ``tests/``
+            directory is treated as a test file.
+        test_example: Minimal working test file returned in the "tests
+            missing" 400 diagnostic so the model has a concrete shape to
+            copy. Same structure as ``example_files``.
     """
 
     image: str
@@ -64,6 +78,9 @@ class Runtime:
     internal_port: int = 80
     readiness_probe_path: str = "/"
     default_files: dict[str, str] | None = None
+    test_command: Optional[str] = None
+    test_files_hint: str = ""
+    test_example: dict[str, str] | None = None
 
 
 RUNTIMES: dict[str, Runtime] = {
@@ -90,6 +107,27 @@ RUNTIMES: dict[str, Runtime] = {
                 "<!doctype html><html><body>"
                 "<h1>hello sandbox</h1>"
                 "</body></html>"
+            ),
+        },
+        # Static runtime has no test framework of its own — the tester
+        # container runs a shell script that curls the preview and
+        # asserts. For anything richer (JS click flows) the model
+        # should still put a Playwright script here — pytest is present
+        # in the tester image and works against the static preview.
+        test_command="sh /tests/run.sh",
+        test_files_hint="tests/run.sh (POSIX shell, use $PREVIEW_URL)",
+        test_example={
+            "tests/run.sh": (
+                "#!/bin/sh\n"
+                "set -eu\n"
+                "# $PREVIEW_URL is exported by the runner — do not hardcode.\n"
+                "body=$(curl -sf \"$PREVIEW_URL\")\n"
+                "echo \"$body\" | grep -q 'hello sandbox' || {\n"
+                "  echo 'FAIL: expected page to contain \"hello sandbox\"' >&2\n"
+                "  echo \"got: $body\" >&2\n"
+                "  exit 1\n"
+                "}\n"
+                "echo 'OK: landing page renders expected text'\n"
             ),
         },
     ),
@@ -126,6 +164,28 @@ RUNTIMES: dict[str, Runtime] = {
                 "st.slider('n', 0, 100)\n"
             ),
         },
+        # pytest + requests + playwright are pre-installed in the
+        # sandbox-tester image. --tb=short keeps failure output compact
+        # so the whole traceback fits in the model's tool response.
+        test_command="pytest -q --tb=short --color=no /tests",
+        test_files_hint="tests/test_*.py (pytest, use os.environ['PREVIEW_URL'])",
+        test_example={
+            "tests/test_ui.py": (
+                "import os\n"
+                "from playwright.sync_api import sync_playwright, expect\n"
+                "\n"
+                "\n"
+                "def test_page_renders_title():\n"
+                "    url = os.environ['PREVIEW_URL']\n"
+                "    with sync_playwright() as p:\n"
+                "        browser = p.chromium.launch()\n"
+                "        page = browser.new_page()\n"
+                "        page.goto(url)\n"
+                "        # Wait for the Streamlit app shell to mount.\n"
+                "        expect(page.get_by_text('hello')).to_be_visible(timeout=15000)\n"
+                "        browser.close()\n"
+            ),
+        },
     ),
     # Node 20-slim with vite/react/next/express pre-installed globally.
     # Same install-if-present entrypoint pattern for package.json.
@@ -153,6 +213,30 @@ RUNTIMES: dict[str, Runtime] = {
                 "app.listen(80, '0.0.0.0');\n"
             ),
         },
+        # jest is pre-installed globally in the sandbox-tester image; the
+        # --testPathPattern flag scopes discovery to /tests so a stray
+        # test in /app doesn't get picked up. Playwright is also
+        # available for the model that prefers to write end-to-end tests
+        # in JS instead of Python — either works.
+        test_command=(
+            "npx --yes --prefix /home/tester "
+            "jest --config /home/tester/jest.config.json --colors=false /tests"
+        ),
+        test_files_hint="tests/*.test.js (jest, use process.env.PREVIEW_URL)",
+        test_example={
+            "tests/home.test.js": (
+                "const { chromium } = require('playwright');\n"
+                "\n"
+                "test('page renders hello', async () => {\n"
+                "  const url = process.env.PREVIEW_URL;\n"
+                "  const browser = await chromium.launch();\n"
+                "  const page = await browser.newPage();\n"
+                "  await page.goto(url);\n"
+                "  await expect(page.getByText('hello')).toBeVisible({ timeout: 15000 });\n"
+                "  await browser.close();\n"
+                "}, 30000);\n"
+            ),
+        },
     ),
 }
 
@@ -173,6 +257,9 @@ def describe_runtimes() -> list[dict]:
             "allows_custom_entrypoint": rt.allows_custom_entrypoint,
             "prebaked_packages": list(rt.prebaked_packages),
             "example_files": rt.example_files or {},
+            "test_command": rt.test_command,
+            "test_files_hint": rt.test_files_hint,
+            "test_example": rt.test_example or {},
         }
         for name, rt in RUNTIMES.items()
     ]

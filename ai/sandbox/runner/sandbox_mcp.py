@@ -89,6 +89,27 @@ def _format_diagnostic(detail: dict) -> str:
                 lines.append(f"    {text}")
                 if isinstance(e.get("offset"), int):
                     lines.append("    " + " " * (e["offset"] - 1) + "^")
+    elif error == "tests missing":
+        # Mandatory-tests gate. Detail carries the runtime name and a
+        # per-runtime example the model can copy. Render the example
+        # as a fenced block per file so the shape is unambiguous.
+        runtime = detail.get("runtime", "?")
+        example = detail.get("example") or {}
+        lines.append("")
+        lines.append(
+            f"This deployment requires behavioral tests. Runtime `{runtime}` "
+            "expects at least one file under `tests/`. No container was "
+            "spawned."
+        )
+        if example:
+            lines.append("")
+            lines.append("Minimal example — copy this shape and adapt it:")
+            for path, content in example.items():
+                lines.append("")
+                lines.append(f"`{path}`:")
+                lines.append("```")
+                lines.append(content.rstrip())
+                lines.append("```")
     elif error.startswith("sandbox did not become ready"):
         logs = detail.get("logs") or ""
         lines.append("")
@@ -190,6 +211,59 @@ def _format_startup_output(runtime: Optional[str], output: str) -> str:
         )
     n_lines = stripped.count("\n") + 1
     return f"Startup output: clean ({n_lines} lines)."
+
+
+def _format_test_output(tests: Optional[dict]) -> str:
+    """Render the "Test results" section that rides on every successful
+    ``preview_app`` response.
+
+    Four cases:
+      1. ``tests is None`` → deployment skipped test execution because
+         SANDBOX_TESTS_REQUIRED=false AND the caller shipped nothing
+         under ``tests/``. Print a one-liner acknowledging the skip
+         (soft-informational — the operator turned this off, they know).
+      2. ``ok=True`` → one-liner "Test results: passed (runner, Xs)".
+      3. ``ok=False`` AND ``timed_out=True`` → prominent ⚠ block naming
+         the timeout instead of pretending it's a traceback.
+      4. ``ok=False`` AND ``timed_out=False`` → prominent ⚠ block with
+         the runner's output verbatim + a hint to fix and re-call
+         with the same session_id.
+
+    The hint on failure mirrors the same "call preview_app again with
+    the same session_id" pattern used by the lint / readiness diagnostic
+    paths — the model already knows how to iterate on that shape.
+    """
+    if tests is None:
+        return (
+            "Test results: skipped (deployment has SANDBOX_TESTS_REQUIRED=false "
+            "and no files under tests/ were supplied)."
+        )
+    ok = bool(tests.get("ok"))
+    runner = tests.get("runner", "unknown")
+    duration = tests.get("duration_s", 0.0)
+    if ok:
+        return f"Test results: ✓ passed ({runner}, {duration:.1f}s)."
+    if tests.get("timed_out"):
+        return (
+            f"Test results: ⚠ TIMED OUT after {duration:.1f}s "
+            f"({runner}). Speed up the tests or narrow the assertion — "
+            "long-running tests block the response. Fix and call "
+            "preview_app again with the SAME session_id.\n"
+            "```\n"
+            f"{(tests.get('output') or '').rstrip()}\n"
+            "```"
+        )
+    output = (tests.get("output") or "").rstrip()
+    exit_code = tests.get("exit_code", "?")
+    return (
+        f"Test results: ⚠ FAILED (exit {exit_code}, {runner}, "
+        f"{duration:.1f}s). Read the output below, fix the code (or "
+        "the test), and call preview_app again with the SAME "
+        "session_id BEFORE the user has to report the problem.\n"
+        "```\n"
+        f"{output}\n"
+        "```"
+    )
 
 
 def render_preview_html(url: str, sandbox_id: str, session_id: str) -> str:
@@ -305,16 +379,20 @@ def build_mcp(run_callable, logs_callable) -> FastMCP:
                 "\n\n"
                 "FIRST call (no session_id): include every file the app "
                 "needs — code, requirements.txt / package.json if extra "
-                "packages are required, assets. "
+                "packages are required, assets. YOU MUST also include at "
+                "least one file under a top-level `tests/` directory — "
+                "see the docstring's TESTS section for the shape. "
                 "\n\n"
                 "FOLLOW-UP call (with session_id): include ONLY the "
                 "file(s) that changed. Anything you do not list stays in "
                 "the running container's /app and continues to be served. "
-                "Re-sending unchanged files is wasted tokens AND wasted "
-                "container CPU — the file gets rewritten with identical "
-                "bytes but the dev server (Streamlit / Vite) still fires "
-                "a mtime-based reload for it. Ship the diff, not the whole "
-                "project."
+                "Test files under `tests/` follow the SAME delta rule — "
+                "prior tests are preserved unless you explicitly overwrite "
+                "or `deletes` them. Re-sending unchanged files is wasted "
+                "tokens AND wasted container CPU — the file gets rewritten "
+                "with identical bytes but the dev server (Streamlit / Vite) "
+                "still fires a mtime-based reload for it. Ship the diff, "
+                "not the whole project."
             ),
         ),
         entrypoint: Optional[str] = Field(
@@ -371,6 +449,55 @@ def build_mcp(run_callable, logs_callable) -> FastMCP:
         usual. ``get_sandbox_logs`` still exists for the case where
         the app breaks later on a user interaction the initial fetch
         couldn't have triggered.
+
+        # TESTS ARE MANDATORY — read this before your first call
+
+        Every call MUST include at least one file under a top-level
+        ``tests/`` directory. The sandbox runs them against the live
+        preview URL inside an isolated tester container BEFORE returning
+        control to you, and the result rides on every response as a
+        "Test results:" section next to "Startup output:".
+
+        The tester exports ``PREVIEW_URL`` (Python: ``os.environ``,
+        Node: ``process.env``, shell: ``$PREVIEW_URL``) so your tests
+        DO NOT hardcode a hostname. Use it verbatim.
+
+        WHAT MAKES A GOOD TEST — the whole point is catching bugs the
+        USER would otherwise report. Aim for:
+          * Load the page (or the specific route being changed) and
+            assert on visible text / data — "the counter shows 0",
+            "the chart has three bars", "clicking Submit navigates to
+            /thanks". Playwright is pre-installed for exactly this.
+          * If the request added a feature, add a test that exercises
+            that feature end-to-end. "Slider set to 42 makes the
+            output say 'You picked 42'."
+          * If the request fixed a bug, add a regression test for the
+            specific broken state.
+
+        DO NOT ship tautologies. ``assert 1 + 1 == 2`` is worse than
+        no test at all because it makes the response look green while
+        the app is still broken.
+
+        Per-runtime shape (call ``list_runtimes`` for the full example):
+          * static  → ``tests/run.sh`` (POSIX shell + curl + jq)
+          * python  → ``tests/test_*.py`` (pytest + requests +
+                      playwright — chromium is pre-installed)
+          * node    → ``tests/*.test.js`` (jest — playwright + fetch
+                      available; use ``process.env.PREVIEW_URL``)
+
+        The tests-required gate returns a 400 with an example if you
+        forget. When the tests RUN and FAIL, the response is still
+        200 (the URL is still returned) but the response is loudly
+        marked "⚠ FAILED" and you MUST fix the code and call
+        preview_app again with the SAME session_id BEFORE handing the
+        preview back to the user. Do not paraphrase the failure away
+        or claim success when the section says failed.
+
+        On follow-up calls, prior tests persist across turns — the
+        same delta rule as app files applies. If you don't change
+        tests, don't re-send them; they're already attached to the
+        session. If a test is now wrong for the new code, overwrite
+        it (send under the same path) or ``deletes`` it.
 
         # DELTA UPDATES — this is how most calls should work
 
@@ -562,13 +689,18 @@ def build_mcp(run_callable, logs_callable) -> FastMCP:
         startup_section = _format_startup_output(
             result.get("runtime"), result.get("startup_output") or ""
         )
+        # Behavioral-test result. Rides on every successful response so
+        # the model reads the outcome inline with the URL — no second
+        # tool call needed and no risk of the model forgetting to check.
+        test_section = _format_test_output(result.get("tests"))
         return (
             f"Preview {verb}. Sandbox `{sandbox_id}` at {url} "
             f"(expires {expires_at}).\n"
             f"Session id: {session_id_out}\n"
             f"Download source: {download_url}\n"
             f"{hint}\n"
-            f"{startup_section}\n\n"
+            f"{startup_section}\n"
+            f"{test_section}\n\n"
             "```html\n"
             f"{iframe}\n"
             "```"

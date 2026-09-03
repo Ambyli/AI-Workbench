@@ -47,7 +47,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from common.jobs.postgres import PostgresRegistry
 from common.jobs.router import build_router
-from common.logging_setup import setup_logging
+from common.logging_setup import CsvLogger, setup_logging
 
 # Import name is `sandbox_mcp`, not `mcp`, because `ai/sandbox/` is on
 # sys.path and a module literally named `mcp` would shadow the `mcp`
@@ -58,6 +58,12 @@ from sandbox_mcp import build_mcp, render_preview_html
 from reaper import Reaper
 from runtimes import RUNTIMES, get_runtime
 from spawner import Spawner
+from tests_runner import (
+    TestResult,
+    extract_test_files,
+    result_to_dict,
+    run_tests_in_companion,
+)
 
 
 # ── Config from env ───────────────────────────────────────────────────────
@@ -69,6 +75,14 @@ LOG_DIR = os.environ.get("LOG_DIR", "/data")
 DEBUG_LOGGING = os.environ.get("DEBUG_LOGGING", "false").lower() in (
     "1", "true", "yes", "on",
 )
+# Behavioral-test enforcement. See ai/sandbox/SANDBOX.md § Behavioral
+# tests. When True, /run + preview_app return 400 if the caller didn't
+# supply any files under tests/. When False, the tester still runs
+# tests that ARE supplied — this knob only controls the gate.
+TESTS_REQUIRED = os.environ.get("SANDBOX_TESTS_REQUIRED", "true").lower() in (
+    "1", "true", "yes", "on",
+)
+TEST_TIMEOUT_S = float(os.environ.get("SANDBOX_TEST_TIMEOUT_SECONDS", "60"))
 
 # Configure the root logger for every runner module. `setup_logging` writes
 # to /data/sandbox-runner.log (file) and stderr (console) with the shared
@@ -80,8 +94,10 @@ setup_logging("sandbox-runner", log_dir=LOG_DIR, debug=DEBUG_LOGGING)
 log = logging.getLogger("sandbox-runner.app")
 log.info(
     "runner boot config: MAX_CONCURRENT=%d DEFAULT_TTL_S=%d HARD_TTL_S=%d "
-    "PROXY_URL=%s DEBUG_LOGGING=%s LOG_DIR=%s",
+    "PROXY_URL=%s DEBUG_LOGGING=%s LOG_DIR=%s TESTS_REQUIRED=%s "
+    "TEST_TIMEOUT_S=%.1f",
     MAX_CONCURRENT, DEFAULT_TTL_S, HARD_TTL_S, PROXY_URL, DEBUG_LOGGING, LOG_DIR,
+    TESTS_REQUIRED, TEST_TIMEOUT_S,
 )
 
 # Sessions are the durable identity of a preview across turns. Regex is
@@ -129,6 +145,42 @@ _reaper: Optional[Reaper] = None
 # Docker to reject a container-create if resources are exhausted, but this
 # semaphore gives us a clean 429 without paying a docker round-trip first.
 _slot_sem: Optional[asyncio.Semaphore] = None
+# Audit trail — one CSV row per /run + /mcp preview_app call. CsvLogger
+# is not thread-safe, so writes are serialized behind an asyncio.Lock
+# on the runner's event loop.
+_audit: Optional[CsvLogger] = None
+_audit_lock: Optional[asyncio.Lock] = None
+
+
+_AUDIT_COLUMNS = [
+    "event",           # "spawn" / "reuse" / "tests_missing" / "lint_failed"
+                       # / "readiness_failed" / "spawn_error"
+    "sandbox_id",
+    "session_id",
+    "runtime",
+    "n_files",         # total files including tests
+    "n_test_files",
+    "reused",
+    "phase",           # final registry phase, when applicable
+    "tests_ok",
+    "tests_exit_code",
+    "tests_duration_s",
+    "detail",          # short error message when the event was a failure
+]
+
+
+async def _audit_log(**fields) -> None:
+    """Fire-and-forget audit write. Silently drops if the audit logger
+    isn't up yet (module-import order corner case; the info also lands
+    in the stdlib log)."""
+    if _audit is None or _audit_lock is None:
+        return
+    # Defensive: never let audit surface a failure back to the caller.
+    try:
+        async with _audit_lock:
+            await asyncio.to_thread(_audit.log, **fields)
+    except Exception as exc:
+        log.warning("audit_log write failed: %s", exc)
 
 
 # ── MCP server + ASGI app ─────────────────────────────────────────────────
@@ -171,7 +223,7 @@ _mcp_app = _mcp.http_app(path="/")
 
 @asynccontextmanager
 async def lifespan(app_: FastAPI):
-    global _registry, _spawner, _reaper, _slot_sem
+    global _registry, _spawner, _reaper, _slot_sem, _audit, _audit_lock
     log.info("lifespan startup: begin")
     _registry = PostgresRegistry(_build_dsn())
     await _registry.init()
@@ -181,6 +233,15 @@ async def lifespan(app_: FastAPI):
     log.info("Docker spawner initialized")
     _slot_sem = asyncio.Semaphore(MAX_CONCURRENT)
     log.info("concurrency semaphore initialized: MAX_CONCURRENT=%d", MAX_CONCURRENT)
+    # Audit CSV lives alongside the stdlib log under LOG_DIR. Operators
+    # inspect via `docker exec sandbox-runner cat /data/audit.log`.
+    _audit = CsvLogger(
+        path=os.path.join(LOG_DIR, "audit.log"),
+        columns=_AUDIT_COLUMNS,
+        logger=log,
+    )
+    _audit_lock = asyncio.Lock()
+    log.info("audit CSV logger initialized at %s/audit.log", LOG_DIR)
     _reaper = Reaper(_spawner, _registry, _slot_sem)
     _reaper.start()
     log.info("reaper started")
@@ -274,6 +335,12 @@ class RunResponse(BaseModel):
     # container just spawned and has not printed anything yet.
     runtime: Optional[str] = None
     startup_output: str = ""
+    # Result of running the caller-supplied tests against the live
+    # preview inside a sandbox-tester companion container. Shape is
+    # asdict(TestResult) — see tests_runner.TestResult. Absent (None)
+    # only when tests were skipped deployment-wide
+    # (SANDBOX_TESTS_REQUIRED=false AND no files under tests/).
+    tests: Optional[dict] = None
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────
@@ -409,6 +476,44 @@ async def _reuse_or_spawn(
                     session_id, existing["container_name"],
                     len(files or {}), len(deletes or []),
                 )
+                # Split the caller's files/deletes into app + test halves.
+                # Test files never touch the sandbox's /app — they live in
+                # the job's metadata and get put_archived into an ephemeral
+                # sandbox-tester on each call.
+                incoming_tests = extract_test_files(files)
+                app_files = {
+                    k: v for k, v in files.items()
+                    if not k.startswith("tests/")
+                }
+                test_deletes = [d for d in deletes if d.startswith("tests/")]
+                app_deletes = [d for d in deletes if not d.startswith("tests/")]
+                # Load persisted tests from metadata and overlay the
+                # caller's delta. This is the same "delta merge"
+                # contract the app files follow (see update_files) —
+                # unlisted tests are preserved. `deletes` with a
+                # `tests/` prefix removes an entry from the map.
+                existing_snap = await _registry.get(existing["sandbox_id"])
+                prior_tests = (
+                    (existing_snap.metadata.get("tests") or {})
+                    if existing_snap is not None else {}
+                )
+                merged_tests = {**prior_tests, **incoming_tests}
+                for d in test_deletes:
+                    merged_tests.pop(d, None)
+                existing_runtime = (
+                    existing_snap.metadata.get("runtime")
+                    if existing_snap is not None else None
+                )
+                # Enforce the tests-required gate against the MERGED
+                # map, not the delta — a reuse call that only changes
+                # app files should NOT fail the gate as long as the
+                # session still has tests attached.
+                if existing_runtime:
+                    _validate_tests_present(
+                        {**app_files, **merged_tests},
+                        existing_runtime,
+                        session_id,
+                    )
                 # Write a boundary marker to /tmp/sandbox.log BEFORE
                 # the overlay. Downstream `tail_logs_since_last_marker`
                 # anchors on this so the `startup_output` we return
@@ -427,18 +532,19 @@ async def _reuse_or_spawn(
                     await asyncio.to_thread(
                         _spawner.update_files,
                         existing["container_name"],
-                        files,
-                        deletes,
+                        app_files,
+                        app_deletes,
                     )
                 except ValueError as exc:
                     # Path traversal etc. — surface as a 400, not a 500.
                     log.warning("reuse path: rejected unsafe path: %s", exc)
                     raise HTTPException(400, str(exc))
-                # Bump last_used_at so the reaper's idle-TTL check sees
-                # this activity. The rest of the metadata is untouched.
+                # Persist the merged test map + bump last_used_at. Both
+                # go through the same update_metadata call so the reuse
+                # is atomic from the registry's perspective.
                 await _registry.update_metadata(
                     existing["sandbox_id"],
-                    {"last_used_at": _now_iso()},
+                    {"last_used_at": _now_iso(), "tests": merged_tests},
                 )
                 # Give the dev server a moment to observe the file
                 # change and print its reload notice / traceback before
@@ -452,32 +558,60 @@ async def _reuse_or_spawn(
                 # wrapper can inline reload feedback in the response —
                 # models get "did the reload succeed?" without a
                 # second tool call, and without seeing the old error.
-                # Snapshot the runtime from the registry since we need
-                # to know what this session was originally spawned
-                # under (skip-static logic in the MCP wrapper).
-                existing_runtime = (
-                    (await _registry.get(existing["sandbox_id"])).metadata.get("runtime")
-                    if existing.get("sandbox_id") else None
-                )
                 startup_output = await asyncio.to_thread(
                     _spawner.tail_logs_since_last_marker,
                     existing["container_name"],
                     40,
                 )
+                # Run the merged test map against the (now updated)
+                # sandbox. On reuse we DO care about test results —
+                # this is the whole point of the feature: the model
+                # gets feedback that the change didn't break the app
+                # before the user has to click around.
+                test_result = None
+                if existing_runtime and merged_tests:
+                    try:
+                        rt = get_runtime(existing_runtime)
+                    except KeyError:
+                        rt = None
+                    if rt is not None and rt.test_command:
+                        test_result = await run_tests_in_companion(
+                            _spawner,
+                            existing["sandbox_id"],
+                            rt,
+                            merged_tests,
+                            TEST_TIMEOUT_S,
+                        )
                 log.info(
                     "reuse path complete: session=%s sandbox=%s reused=True "
-                    "startup_output_bytes=%d",
+                    "startup_output_bytes=%d tests_ok=%s",
                     session_id, existing["sandbox_id"], len(startup_output),
+                    None if test_result is None else test_result.ok,
                 )
-                return {
-                    "sandbox_id": existing["sandbox_id"],
-                    "session_id": session_id,
-                    "url": existing["url"],
-                    "expires_at": existing["expires_at"],
-                    "reused": True,
-                    "runtime": existing_runtime,
-                    "startup_output": startup_output,
-                }
+                await _audit_log(
+                    event="reuse",
+                    sandbox_id=existing["sandbox_id"],
+                    session_id=session_id,
+                    runtime=existing_runtime or "",
+                    n_files=len(files),
+                    n_test_files=len(merged_tests),
+                    reused=True,
+                    phase="running",
+                    tests_ok="" if test_result is None else test_result.ok,
+                    tests_exit_code="" if test_result is None else test_result.exit_code,
+                    tests_duration_s="" if test_result is None else f"{test_result.duration_s:.2f}",
+                    detail="",
+                )
+                return _build_run_result(
+                    sandbox_id=existing["sandbox_id"],
+                    session_id=session_id,
+                    url=existing["url"],
+                    expires_at=existing["expires_at"],
+                    reused=True,
+                    runtime=existing_runtime,
+                    startup_output=startup_output,
+                    test_result=test_result,
+                )
             # Container is gone but the Postgres row still says "running"
             # — normal when the reaper hasn't swept yet, or the sandbox
             # crashed out-of-band. Mark it expired and fall through to
@@ -522,17 +656,50 @@ async def _reuse_or_spawn(
             "runtime=node if you need to run a specific command.",
         )
 
+    # Mandatory-tests gate — refuse the spawn if the caller didn't
+    # ship at least one file under `tests/`. Runs before the lint pass
+    # so a model that forgot BOTH tests AND fixed syntax gets a single
+    # error (missing tests) instead of a stack of two. Skipped when
+    # SANDBOX_TESTS_REQUIRED=false.
+    _validate_tests_present(files, runtime, session_id)
+
+    # Split files into the app half (goes into /app in the sandbox) and
+    # the test half (stashed in job metadata, put_archived into an
+    # ephemeral tester on this and every future reuse call). Test files
+    # do NOT enter the sandbox's /app — that would leak them via
+    # nginx/express/etc. and pollute the app filesystem for the dev
+    # server's own file watcher.
+    test_files = extract_test_files(files)
+    app_files = {k: v for k, v in files.items() if not k.startswith("tests/")}
+
     # Static lint pass — catches syntax errors in ~1 ms without spawning
     # a container. Python is the only runtime we can lint from inside
     # the runner (we already have a Python interpreter); Node/HTML would
     # need shelling out to node/html-tidy. Model gets a specific
     # SyntaxError with line/column before we waste 30 s on readiness.
-    lint_errors = _lint_python_files(files)
+    # Lint only the app half — test files are executed by pytest/jest
+    # in the tester container and Python's `compile()` doesn't
+    # understand JS-flavored .test.js files anyway.
+    lint_errors = _lint_python_files(app_files)
     if lint_errors:
         log.warning(
             "static lint failed for session=%s: %d error(s) across %d file(s)",
             session_id, len(lint_errors),
             len({e["path"] for e in lint_errors}),
+        )
+        await _audit_log(
+            event="lint_failed",
+            sandbox_id="",
+            session_id=session_id,
+            runtime=runtime,
+            n_files=len(files),
+            n_test_files=len(test_files),
+            reused=False,
+            phase="",
+            tests_ok="",
+            tests_exit_code="",
+            tests_duration_s="",
+            detail=f"{len(lint_errors)} python syntax error(s)",
         )
         raise HTTPException(
             400,
@@ -571,6 +738,9 @@ async def _reuse_or_spawn(
             "expires_at": expires_at.isoformat(),
             "session_id": session_id,
             "last_used_at": now_iso,
+            # Persist test files so reuse calls can run them again
+            # without the caller re-sending the whole map every turn.
+            "tests": test_files,
         },
         initial_phase="spawning",
     )
@@ -582,7 +752,7 @@ async def _reuse_or_spawn(
 
     try:
         result = await asyncio.to_thread(
-            _spawner.spawn, sandbox_id, rt, files, entrypoint
+            _spawner.spawn, sandbox_id, rt, app_files, entrypoint
         )
         log.info(
             "container created: sandbox=%s container=%s, polling readiness",
@@ -614,6 +784,20 @@ async def _reuse_or_spawn(
                 sandbox_id,
                 "sandbox did not become ready within 30s\n\n" + logs,
             )
+            await _audit_log(
+                event="readiness_failed",
+                sandbox_id=sandbox_id,
+                session_id=session_id,
+                runtime=runtime,
+                n_files=len(files),
+                n_test_files=len(test_files),
+                reused=False,
+                phase="failed",
+                tests_ok="",
+                tests_exit_code="",
+                tests_duration_s="",
+                detail="did not bind port within 30s",
+            )
             raise HTTPException(
                 504,
                 {
@@ -644,21 +828,46 @@ async def _reuse_or_spawn(
         startup_output = await asyncio.to_thread(
             _spawner.tail_logs, result.container_name, 40
         )
+        # Behavioral tests — soft-fail. The URL is returned regardless
+        # so the model + operator can inspect what shipped, but a
+        # failing result is loudly surfaced in the response so the
+        # model iterates BEFORE handing back to the user.
+        test_result: Optional[TestResult] = None
+        if test_files and rt.test_command:
+            test_result = await run_tests_in_companion(
+                _spawner, sandbox_id, rt, test_files, TEST_TIMEOUT_S,
+            )
         log.info(
             "spawn READY: sandbox=%s session=%s url=%s expires=%s "
-            "startup_output_bytes=%d",
+            "startup_output_bytes=%d tests_ok=%s",
             sandbox_id, session_id, url, expires_at.isoformat(),
             len(startup_output),
+            None if test_result is None else test_result.ok,
         )
-        return {
-            "sandbox_id": sandbox_id,
-            "session_id": session_id,
-            "url": url,
-            "expires_at": expires_at.isoformat(),
-            "reused": False,
-            "runtime": runtime,
-            "startup_output": startup_output,
-        }
+        await _audit_log(
+            event="spawn",
+            sandbox_id=sandbox_id,
+            session_id=session_id,
+            runtime=runtime,
+            n_files=len(files),
+            n_test_files=len(test_files),
+            reused=False,
+            phase="running",
+            tests_ok="" if test_result is None else test_result.ok,
+            tests_exit_code="" if test_result is None else test_result.exit_code,
+            tests_duration_s="" if test_result is None else f"{test_result.duration_s:.2f}",
+            detail="",
+        )
+        return _build_run_result(
+            sandbox_id=sandbox_id,
+            session_id=session_id,
+            url=url,
+            expires_at=expires_at.isoformat(),
+            reused=False,
+            runtime=runtime,
+            startup_output=startup_output,
+            test_result=test_result,
+        )
     except HTTPException:
         # Propagate structured errors (400 lint, 504 readiness). Release
         # the slot; the sandbox_id row keeps its "failed" phase and gets
@@ -675,6 +884,20 @@ async def _reuse_or_spawn(
             sandbox_id, session_id, exc,
         )
         await _registry.set_error(sandbox_id, str(exc))
+        await _audit_log(
+            event="spawn_error",
+            sandbox_id=sandbox_id,
+            session_id=session_id,
+            runtime=runtime,
+            n_files=len(files),
+            n_test_files=len(test_files),
+            reused=False,
+            phase="failed",
+            tests_ok="",
+            tests_exit_code="",
+            tests_duration_s="",
+            detail=f"{type(exc).__name__}: {exc}",
+        )
         _slot_sem.release()
         raise HTTPException(500, f"spawn failed: {exc}")
     # Slot is intentionally NOT released on success — it's released when
@@ -683,6 +906,116 @@ async def _reuse_or_spawn(
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _build_run_result(
+    *,
+    sandbox_id: str,
+    session_id: str,
+    url: str,
+    expires_at: str,
+    reused: bool,
+    runtime: Optional[str],
+    startup_output: str,
+    test_result: Optional[TestResult],
+) -> dict:
+    """Assemble the dict returned by ``_reuse_or_spawn`` to /run, the MCP
+    tool, and the OpenWebUI Tool Server route.
+
+    Extracted so the spawn path and the reuse path can't drift on
+    fields. Adding a new field to the response ONLY happens here — the
+    RunResponse model + this builder are the single source of truth."""
+    return {
+        "sandbox_id": sandbox_id,
+        "session_id": session_id,
+        "url": url,
+        "expires_at": expires_at,
+        "reused": reused,
+        "runtime": runtime,
+        "startup_output": startup_output,
+        "tests": result_to_dict(test_result),
+    }
+
+
+def _validate_tests_present(
+    files: dict[str, str],
+    runtime_name: str,
+    session_id: str,
+) -> None:
+    """Raise HTTPException(400) if TESTS_REQUIRED is on and the caller
+    didn't include anything under ``tests/``.
+
+    The 400 detail matches the shape ``_lint_python_files`` uses for
+    static lint failures — ``error``, ``session_id``, ``hint``, plus a
+    runtime-specific ``example`` map the MCP wrapper renders as a
+    fenced block so the model has a concrete file to copy.
+
+    No-op when ``TESTS_REQUIRED=false`` or when at least one file
+    starts with the ``tests/`` prefix. Content is not inspected here —
+    the tester container is the authority on whether a test file is
+    actually useful."""
+    if not TESTS_REQUIRED:
+        log.debug("_validate_tests_present: SANDBOX_TESTS_REQUIRED=false, skipping gate")
+        return
+    if extract_test_files(files):
+        return
+    try:
+        rt = get_runtime(runtime_name)
+    except KeyError:
+        # Unknown runtime — let the downstream get_runtime call in
+        # _reuse_or_spawn raise the specific "unknown runtime" error.
+        # We only surface a missing-tests error when we can quote a
+        # per-runtime example, and we can't do that for an unknown
+        # runtime. Fall through.
+        return
+    example = rt.test_example or {}
+    hint = (
+        "This deployment requires model-supplied behavioral tests. Add at "
+        "least one file under the top-level `tests/` directory that "
+        "exercises the running preview (navigate, click, assert visible "
+        f"text/data) — not a tautology like `assert 1+1==2`. Use "
+        f"`{rt.test_files_hint}` if you're unsure of the shape; PREVIEW_URL "
+        "is exported into the tester's env, so tests should read it and "
+        "hit the running app.\n\n"
+        "Call preview_app again with the same session_id and the tests "
+        "included. No container has been spawned yet."
+    )
+    log.warning(
+        "tests missing: session=%s runtime=%s (no file under tests/)",
+        session_id, runtime_name,
+    )
+    # Fire-and-forget audit write. _validate_tests_present is called
+    # from an async caller (both _reuse_or_spawn paths), so
+    # create_task finds the running loop. RuntimeError only happens
+    # if this function is ever invoked from sync test code — silently
+    # skipping the audit there is fine.
+    try:
+        asyncio.create_task(_audit_log(
+            event="tests_missing",
+            sandbox_id="",
+            session_id=session_id,
+            runtime=runtime_name,
+            n_files=len(files),
+            n_test_files=0,
+            reused=False,
+            phase="",
+            tests_ok=False,
+            tests_exit_code="",
+            tests_duration_s="",
+            detail="no files under tests/",
+        ))
+    except RuntimeError:
+        pass
+    raise HTTPException(
+        400,
+        {
+            "error": "tests missing",
+            "session_id": session_id,
+            "runtime": runtime_name,
+            "hint": hint,
+            "example": example,
+        },
+    )
 
 
 def _lint_python_files(files: dict[str, str]) -> list[dict]:

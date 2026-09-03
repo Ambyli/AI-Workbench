@@ -32,6 +32,23 @@ from runtimes import Runtime
 log = logging.getLogger("sandbox-runner.tests_runner")
 
 
+class TestInfrastructureError(Exception):
+    """The tester COULD NOT RUN — image missing, docker daemon unreachable,
+    etc. Distinct from "tests ran and failed": in this case the preview is
+    UNVERIFIED and the caller MUST NOT hand it to the user.
+
+    Carries a human-readable ``detail`` string plus an ``image`` field so
+    the runner's exception handler can turn it into an HTTPException(503)
+    body of the shape ``_format_diagnostic`` in sandbox_mcp knows how to
+    render.
+    """
+
+    def __init__(self, detail: str, image: str = "sandbox-tester:latest"):
+        super().__init__(detail)
+        self.detail = detail
+        self.image = image
+
+
 # The prefix used to identify test files inside the caller's ``files``
 # map. Kept as a module-level constant so any future change (e.g.
 # supporting a top-level ``spec/`` alias) has one edit site and the
@@ -164,30 +181,20 @@ async def run_tests_in_companion(
         )
     except Exception as exc:
         # Infrastructure failure (docker socket gone, image missing,
-        # etc.). Do NOT propagate — tests are meant to be soft-fail,
-        # and turning "tester image not built" into a 500 that hides
-        # the preview URL is worse than reporting it as a test failure
-        # the operator can read in the audit log.
+        # etc.). Raise TestInfrastructureError so the runner tears the
+        # sandbox down and returns 503 — WITHOLDING the preview URL.
+        # A missing tester means "we cannot know if the app works",
+        # which is strictly worse than "tests ran and failed". Soft-
+        # failing here would let the model hand an UNVERIFIED preview
+        # to the user, which is the exact failure mode this whole
+        # feature exists to prevent.
         log.exception(
             "run_tests_in_companion: infrastructure error for sandbox=%s: %s",
             sandbox_id, exc,
         )
-        duration = time.monotonic() - start
-        return TestResult(
-            ok=False,
-            exit_code=-2,
-            output=(
-                f"[sandbox-tester] infrastructure error: {type(exc).__name__}: {exc}\n"
-                "The tester container could not be spawned. Common causes:\n"
-                "  * sandbox-tester:latest image not built (run "
-                "`docker compose -f ai/sandbox/docker-compose.sandbox.yml --profile build build`).\n"
-                "  * docker daemon unreachable.\n"
-                "The preview URL is still valid — this is a test-harness failure, "
-                "not an app failure."
-            ),
-            runner=label,
-            duration_s=duration,
-        )
+        raise TestInfrastructureError(
+            detail=f"{type(exc).__name__}: {exc}",
+        ) from exc
     duration = time.monotonic() - start
     timed_out = exit_code == -1
     ok = exit_code == 0

@@ -89,6 +89,38 @@ def _format_diagnostic(detail: dict) -> str:
                 lines.append(f"    {text}")
                 if isinstance(e.get("offset"), int):
                     lines.append("    " + " " * (e["offset"] - 1) + "^")
+    elif error == "tester unavailable":
+        # Infrastructure failure: the tester image is missing or the
+        # docker daemon is unreachable, so tests DID NOT RUN and the
+        # preview is UNVERIFIED. Render with strong "do not hand off"
+        # wording — this is the exact escape hatch the design has to
+        # close, so the message is deliberately not softened.
+        image = detail.get("image", "sandbox-tester:latest")
+        cause = detail.get("cause", "")
+        sandbox_id = detail.get("sandbox_id", "")
+        lines.append("")
+        lines.append(
+            "⚠ TESTS DID NOT RUN. The preview is UNVERIFIED. DO NOT "
+            "hand this to the user. DO NOT describe features, DO NOT "
+            "narrate what the app does, DO NOT retry silently."
+        )
+        lines.append("")
+        lines.append(
+            f"The sandbox test harness ({image}) could not be started."
+        )
+        if cause:
+            lines.append(f"Cause: {cause}")
+        if sandbox_id:
+            lines.append(
+                f"The sandbox container ({sandbox_id}) has been torn down."
+            )
+        lines.append("")
+        lines.append(
+            "Tell the user: the sandbox test harness is broken and the "
+            "operator needs to build the tester image before you can "
+            "verify anything. Give them the exact command from the hint. "
+            "Do not claim the app works."
+        )
     elif error == "tests missing":
         # Mandatory-tests gate. Detail carries the runtime name and a
         # per-runtime example the model can copy. Render the example
@@ -246,9 +278,11 @@ def _format_test_output(tests: Optional[dict]) -> str:
     if tests.get("timed_out"):
         return (
             f"Test results: ⚠ TIMED OUT after {duration:.1f}s "
-            f"({runner}). Speed up the tests or narrow the assertion — "
-            "long-running tests block the response. Fix and call "
-            "preview_app again with the SAME session_id.\n"
+            f"({runner}). The preview is UNVERIFIED. DO NOT hand it to "
+            "the user, DO NOT describe features, DO NOT include the "
+            "artifact block below. Speed up the tests or narrow the "
+            "assertion — long-running tests block the response — then "
+            "call preview_app again with the SAME session_id.\n"
             "```\n"
             f"{(tests.get('output') or '').rstrip()}\n"
             "```"
@@ -257,9 +291,12 @@ def _format_test_output(tests: Optional[dict]) -> str:
     exit_code = tests.get("exit_code", "?")
     return (
         f"Test results: ⚠ FAILED (exit {exit_code}, {runner}, "
-        f"{duration:.1f}s). Read the output below, fix the code (or "
-        "the test), and call preview_app again with the SAME "
-        "session_id BEFORE the user has to report the problem.\n"
+        f"{duration:.1f}s). The preview is UNVERIFIED. DO NOT hand it "
+        "to the user, DO NOT describe features, DO NOT include the "
+        "artifact block below. Read the output, fix the code (or the "
+        "test), and call preview_app again with the SAME session_id. "
+        "Silent handoff after a failed test is the exact bug this "
+        "gate exists to prevent.\n"
         "```\n"
         f"{output}\n"
         "```"
@@ -449,6 +486,40 @@ def build_mcp(run_callable, logs_callable) -> FastMCP:
         usual. ``get_sandbox_logs`` still exists for the case where
         the app breaks later on a user interaction the initial fetch
         couldn't have triggered.
+
+        # THE TEST RESULTS SECTION IS LOAD-BEARING — READ IT
+
+        Every response carries a `Test results:` section. There are
+        exactly four values it can take, and only ONE of them permits
+        handing the preview to the user:
+
+        1. `✓ passed` — the tests ran and passed. Only in this case
+           may you include the artifact block, describe features, or
+           tell the user what the app does.
+
+        2. `⚠ FAILED` — the tests ran and one or more failed. The
+           preview is UNVERIFIED. DO NOT include the artifact block.
+           DO NOT describe features. DO NOT say "the app works but
+           the tests need fixing" — you do not know that. Read the
+           output, fix the code (or the test), and call preview_app
+           again with the SAME session_id.
+
+        3. `⚠ TIMED OUT` — same rule as ⚠ FAILED. Speed the tests up
+           or narrow the assertion, don't hand off.
+
+        4. A 400/503 error (tests missing / tester unavailable) —
+           these come back as diagnostic tool output, not the
+           preview block. Follow the hint in the message. In the
+           "tester unavailable" case in particular, tell the USER
+           the harness is broken and give them the operator command;
+           do not silently retry, do not claim the app works.
+
+        A non-passing outcome — including infrastructure errors —
+        means the app is UNVERIFIED. Silent handoff after any of
+        those is the exact bug this gate exists to prevent. A
+        rationalization like "the URL is still valid, the tests were
+        just a harness issue" is a bug in your reasoning, not a
+        permitted path.
 
         # TESTS ARE MANDATORY — read this before your first call
 

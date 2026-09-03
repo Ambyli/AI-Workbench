@@ -59,6 +59,7 @@ from reaper import Reaper
 from runtimes import RUNTIMES, get_runtime
 from spawner import Spawner
 from tests_runner import (
+    TestInfrastructureError,
     TestResult,
     extract_test_files,
     result_to_dict,
@@ -151,6 +152,15 @@ _slot_sem: Optional[asyncio.Semaphore] = None
 _audit: Optional[CsvLogger] = None
 _audit_lock: Optional[asyncio.Lock] = None
 
+# Presence of the sandbox-tester image, probed once at lifespan startup
+# (see the `tester probe` block there). When False:
+#   * /health reports tester: down and status: degraded
+#   * /run + preview_app refuse up front with 503
+# Set only during startup — flipping this requires a runner restart, on
+# purpose. Building an image is a one-time operator action; polling for
+# it on every request would hide the misconfiguration.
+_tester_available: bool = False
+
 
 _AUDIT_COLUMNS = [
     "event",           # "spawn" / "reuse" / "tests_missing" / "lint_failed"
@@ -224,6 +234,7 @@ _mcp_app = _mcp.http_app(path="/")
 @asynccontextmanager
 async def lifespan(app_: FastAPI):
     global _registry, _spawner, _reaper, _slot_sem, _audit, _audit_lock
+    global _tester_available
     log.info("lifespan startup: begin")
     _registry = PostgresRegistry(_build_dsn())
     await _registry.init()
@@ -231,6 +242,21 @@ async def lifespan(app_: FastAPI):
     await _ensure_session_index(_registry)
     _spawner = Spawner()
     log.info("Docker spawner initialized")
+    # Tester-image probe. Runs once at boot so a deployment missing the
+    # sandbox-tester:latest image fails LOUDLY here instead of quietly
+    # every request. Without this, the failure mode is "the model
+    # ships an unverified preview and rationalizes it as a harness
+    # issue" — see the review that motivated fix B.
+    _tester_available = await asyncio.to_thread(_spawner.tester_image_present)
+    if not _tester_available:
+        log.error(
+            "TESTER IMAGE MISSING: sandbox-tester:latest is not present. "
+            "The runner will refuse /run + preview_app until it is built. "
+            "Fix: docker compose -f ai/sandbox/docker-compose.sandbox.yml "
+            "--profile build build sandbox-tester-image"
+        )
+    else:
+        log.info("tester image present: sandbox-tester:latest")
     _slot_sem = asyncio.Semaphore(MAX_CONCURRENT)
     log.info("concurrency semaphore initialized: MAX_CONCURRENT=%d", MAX_CONCURRENT)
     # Audit CSV lives alongside the stdlib log under LOG_DIR. Operators
@@ -346,8 +372,12 @@ class RunResponse(BaseModel):
 # ── Endpoints ─────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health() -> dict:
-    # Report degraded if the DB is unreachable so the compose healthcheck
-    # can catch a partial outage. The DB check is a cheap round-trip.
+    # Report degraded if the DB is unreachable OR the tester image is
+    # missing — either makes /run unusable. Compose healthcheck reads
+    # the HTTP status only (200 either way), but operators inspecting
+    # the body see WHICH dependency is broken. Tester probe is the
+    # startup value; a runner restart is required to flip it after
+    # building the image.
     ok_db = False
     if _registry is not None:
         try:
@@ -356,9 +386,11 @@ async def health() -> dict:
         except Exception as exc:
             log.warning("health: DB probe failed: %s", exc)
             ok_db = False
+    ok_all = ok_db and _tester_available
     return {
-        "status": "ok" if ok_db else "degraded",
+        "status": "ok" if ok_all else "degraded",
         "db": "up" if ok_db else "down",
+        "tester": "up" if _tester_available else "down",
     }
 
 
@@ -460,6 +492,40 @@ async def _reuse_or_spawn(
     if _registry is None or _spawner is None or _slot_sem is None:
         log.error("_reuse_or_spawn called before lifespan init")
         raise HTTPException(500, "runner not initialized")
+
+    # Fast-fail if the tester image is missing. Refusing up front keeps
+    # us from spawning a sandbox we can't verify — and gives the model
+    # the exact operator command in a shape sandbox_mcp knows how to
+    # render as a "do not hand off" diagnostic.
+    if TESTS_REQUIRED and not _tester_available:
+        log.error(
+            "tester unavailable: refusing /run for session=%s "
+            "(SANDBOX_TESTS_REQUIRED=true, tester image missing)",
+            session_id,
+        )
+        raise HTTPException(
+            503,
+            {
+                "error": "tester unavailable",
+                "session_id": session_id or "",
+                "image": "sandbox-tester:latest",
+                "cause": (
+                    "sandbox-tester:latest is not built on this "
+                    "deployment (probed at runner startup)."
+                ),
+                "hint": (
+                    "The runner refuses to spawn sandboxes while the "
+                    "test harness is unavailable — an unverified "
+                    "preview is not safe to hand to the user. Operator: "
+                    "run `docker compose -f ai/sandbox/"
+                    "docker-compose.sandbox.yml --profile build build "
+                    "sandbox-tester-image`, then restart sandbox-runner. "
+                    "Tell the user the sandbox test harness is broken "
+                    "and ask them to fix it — do not claim the app "
+                    "works, do not silently retry."
+                ),
+            },
+        )
 
     # Session-reuse path — cheap, short-circuits before we touch the
     # concurrency semaphore or the runtime validator.
@@ -568,6 +634,13 @@ async def _reuse_or_spawn(
                 # this is the whole point of the feature: the model
                 # gets feedback that the change didn't break the app
                 # before the user has to click around.
+                #
+                # TestInfrastructureError (tester image missing / docker
+                # daemon down) is a HARD failure — the preview may work
+                # but we CANNOT verify it, so we withhold the response.
+                # The sandbox itself is left alive; a subsequent call
+                # after the operator fixes the tester will find it and
+                # reuse it.
                 test_result = None
                 if existing_runtime and merged_tests:
                     try:
@@ -575,13 +648,60 @@ async def _reuse_or_spawn(
                     except KeyError:
                         rt = None
                     if rt is not None and rt.test_command:
-                        test_result = await run_tests_in_companion(
-                            _spawner,
-                            existing["sandbox_id"],
-                            rt,
-                            merged_tests,
-                            TEST_TIMEOUT_S,
-                        )
+                        try:
+                            test_result = await run_tests_in_companion(
+                                _spawner,
+                                existing["sandbox_id"],
+                                rt,
+                                merged_tests,
+                                TEST_TIMEOUT_S,
+                            )
+                        except TestInfrastructureError as exc:
+                            log.error(
+                                "reuse path: tester infrastructure error "
+                                "for session=%s sandbox=%s: %s",
+                                session_id, existing["sandbox_id"], exc.detail,
+                            )
+                            await _audit_log(
+                                event="tester_infra_error",
+                                sandbox_id=existing["sandbox_id"],
+                                session_id=session_id,
+                                runtime=existing_runtime or "",
+                                n_files=len(files),
+                                n_test_files=len(merged_tests),
+                                reused=True,
+                                phase="running",
+                                tests_ok="",
+                                tests_exit_code="",
+                                tests_duration_s="",
+                                detail=exc.detail,
+                            )
+                            raise HTTPException(
+                                503,
+                                {
+                                    "error": "tester unavailable",
+                                    "session_id": session_id,
+                                    "sandbox_id": existing["sandbox_id"],
+                                    "image": exc.image,
+                                    "cause": exc.detail,
+                                    "hint": (
+                                        "Sandbox is still running but the "
+                                        "test harness could not verify it. "
+                                        "The preview URL is intentionally "
+                                        "withheld — an unverified preview is "
+                                        "not safe to hand to the user. The "
+                                        "operator must build the tester image "
+                                        "(`docker compose -f ai/sandbox/"
+                                        "docker-compose.sandbox.yml --profile "
+                                        "build build sandbox-tester-image`) "
+                                        "and this preview_app call must be "
+                                        "retried. Tell the user the sandbox "
+                                        "test harness is broken and ask them "
+                                        "to fix it — do not claim the app "
+                                        "works."
+                                    ),
+                                },
+                            )
                 log.info(
                     "reuse path complete: session=%s sandbox=%s reused=True "
                     "startup_output_bytes=%d tests_ok=%s",
@@ -828,15 +948,69 @@ async def _reuse_or_spawn(
         startup_output = await asyncio.to_thread(
             _spawner.tail_logs, result.container_name, 40
         )
-        # Behavioral tests — soft-fail. The URL is returned regardless
-        # so the model + operator can inspect what shipped, but a
-        # failing result is loudly surfaced in the response so the
-        # model iterates BEFORE handing back to the user.
+        # Behavioral tests — soft-fail on test-run outcome, HARD-fail
+        # on tester infrastructure errors. The URL is returned when
+        # tests actually ran (pass or fail — the model reads the
+        # verdict on the response and iterates). But when the TESTER
+        # ITSELF couldn't run (image missing, docker daemon down) we
+        # tear this sandbox down and 503 — an unverified preview is
+        # not safe to hand to the user.
         test_result: Optional[TestResult] = None
         if test_files and rt.test_command:
-            test_result = await run_tests_in_companion(
-                _spawner, sandbox_id, rt, test_files, TEST_TIMEOUT_S,
-            )
+            try:
+                test_result = await run_tests_in_companion(
+                    _spawner, sandbox_id, rt, test_files, TEST_TIMEOUT_S,
+                )
+            except TestInfrastructureError as exc:
+                log.error(
+                    "spawn path: tester infrastructure error for "
+                    "sandbox=%s session=%s: %s",
+                    sandbox_id, session_id, exc.detail,
+                )
+                await asyncio.to_thread(_spawner.stop, result.container_name)
+                await _registry.set_error(
+                    sandbox_id,
+                    f"tester unavailable: {exc.detail}",
+                )
+                await _audit_log(
+                    event="tester_infra_error",
+                    sandbox_id=sandbox_id,
+                    session_id=session_id,
+                    runtime=runtime,
+                    n_files=len(files),
+                    n_test_files=len(test_files),
+                    reused=False,
+                    phase="failed",
+                    tests_ok="",
+                    tests_exit_code="",
+                    tests_duration_s="",
+                    detail=exc.detail,
+                )
+                raise HTTPException(
+                    503,
+                    {
+                        "error": "tester unavailable",
+                        "session_id": session_id,
+                        "sandbox_id": sandbox_id,
+                        "image": exc.image,
+                        "cause": exc.detail,
+                        "hint": (
+                            "The sandbox spawned successfully but the "
+                            "test harness could not verify it. The "
+                            "preview URL is intentionally withheld — an "
+                            "unverified preview is not safe to hand to "
+                            "the user. The operator must build the "
+                            "tester image (`docker compose -f "
+                            "ai/sandbox/docker-compose.sandbox.yml "
+                            "--profile build build "
+                            "sandbox-tester-image`) and this preview_app "
+                            "call must be retried with the same "
+                            "session_id. Tell the user the sandbox test "
+                            "harness is broken and ask them to fix it — "
+                            "do not claim the app works."
+                        ),
+                    },
+                )
         log.info(
             "spawn READY: sandbox=%s session=%s url=%s expires=%s "
             "startup_output_bytes=%d tests_ok=%s",

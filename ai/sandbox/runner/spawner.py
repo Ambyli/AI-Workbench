@@ -492,6 +492,32 @@ class Spawner:
                 container_name, exc,
             )
 
+    def tester_image_present(self, image: str = "sandbox-tester:latest") -> bool:
+        """Return True iff the sandbox-tester image is available locally.
+
+        Called from the runner's ``lifespan`` on boot so a missing tester
+        image is caught ONCE and reported as a runner-level degraded state,
+        rather than blowing up per-request in ``spawn_tester``. If this
+        returns False, ``/run`` will refuse with 503 up front and
+        ``/health`` will report ``tester: down`` — the operator has a
+        single, clear signal to build the image.
+
+        Uses ``images.get`` (not ``list`` + filter) because ``get`` is an
+        O(1) name lookup against the daemon's index and raises NotFound
+        for us to swallow."""
+        try:
+            self._client.images.get(image)
+            return True
+        except NotFound:
+            log.warning("tester_image_present: %s NOT found locally", image)
+            return False
+        except APIError as exc:
+            log.warning(
+                "tester_image_present: docker daemon error probing %s: %s",
+                image, exc,
+            )
+            return False
+
     def container_exists(self, container_name: str) -> bool:
         """Cheap liveness check used by the session-reuse path in the
         runner. Distinguishes "Postgres says this session is running"

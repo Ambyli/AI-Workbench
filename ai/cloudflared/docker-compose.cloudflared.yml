@@ -10,6 +10,13 @@ services:
     networks:
       - shared
     restart: unless-stopped
+    # Lets dashboard ingress rules reach services that listen on the HOST
+    # rather than on ai_shared — e.g. rdp.zeoenergy.com must target
+    # tcp://host.docker.internal:3389, because inside this container
+    # `localhost` is the container itself, not the Docker host.
+    # See CLOUDFLARED.md § "Origin addresses are container-relative".
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       # Token from a Cloudflare Zero Trust tunnel. Read from .env via the
       # standard --env-file flag in the Makefile macro.

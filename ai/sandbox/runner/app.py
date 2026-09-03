@@ -468,6 +468,52 @@ async def _find_running_session(session_id: str) -> Optional[dict]:
     }
 
 
+async def _find_last_session_state(session_id: str) -> Optional[dict]:
+    """Return the latest persisted state for ``session_id`` regardless of
+    phase (except ``closed`` — an explicitly torn-down session must never
+    resurrect).
+
+    Contrast with ``_find_running_session``, which filters
+    ``phase = 'running'`` and returns None once the container is gone. That
+    filter breaks the caller's delta-update mental model: after a readiness
+    failure, a tester-infra failure, or a TTL sweep, the previous row is
+    ``failed`` / ``expired`` and the model's next call — carrying only a
+    fix as a delta — spawns a half-populated sandbox.
+
+    This lookup pulls the prior row's ``app_files`` + ``tests`` from
+    metadata so the caller has continuity across container death:
+    the model sends the fix, the runner merges it with what it already
+    knows, and the fresh spawn has the full state.
+    """
+    if _registry is None:
+        return None
+    pool = _registry._pool
+    if pool is None:
+        return None
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, phase, metadata "
+            "FROM jobs "
+            "WHERE metadata->>'session_id' = $1 AND phase <> 'closed' "
+            "ORDER BY created_at DESC LIMIT 1",
+            session_id,
+        )
+    if row is None:
+        return None
+    meta = row["metadata"]
+    if isinstance(meta, str):
+        import json as _json
+        meta = _json.loads(meta)
+    return {
+        "sandbox_id": row["id"],
+        "phase": row["phase"],
+        "runtime": meta.get("runtime"),
+        "entrypoint": meta.get("entrypoint"),
+        "app_files": meta.get("app_files") or {},
+        "tests": meta.get("tests") or {},
+    }
+
+
 async def _reuse_or_spawn(
     runtime: str,
     files: dict[str, str],
@@ -605,12 +651,28 @@ async def _reuse_or_spawn(
                     # Path traversal etc. — surface as a 400, not a 500.
                     log.warning("reuse path: rejected unsafe path: %s", exc)
                     raise HTTPException(400, str(exc))
-                # Persist the merged test map + bump last_used_at. Both
-                # go through the same update_metadata call so the reuse
-                # is atomic from the registry's perspective.
+                # Persist the merged app + test maps + bump last_used_at.
+                # All three go through a single update_metadata call so
+                # the reuse is atomic from the registry's perspective.
+                # Persisting app_files here is what lets the recovery
+                # path (self-heal after a crash or TTL sweep) reconstruct
+                # the full file set from a caller's delta — without it,
+                # app files live only inside the container and die with
+                # it, forcing the model to resend everything.
+                prior_app_files = (
+                    (existing_snap.metadata.get("app_files") or {})
+                    if existing_snap is not None else {}
+                )
+                merged_app_files = {**prior_app_files, **app_files}
+                for d in app_deletes:
+                    merged_app_files.pop(d, None)
                 await _registry.update_metadata(
                     existing["sandbox_id"],
-                    {"last_used_at": _now_iso(), "tests": merged_tests},
+                    {
+                        "last_used_at": _now_iso(),
+                        "tests": merged_tests,
+                        "app_files": merged_app_files,
+                    },
                 )
                 # Give the dev server a moment to observe the file
                 # change and print its reload notice / traceback before
@@ -745,8 +807,64 @@ async def _reuse_or_spawn(
 
     # Spawn path — either no session_id given, or the session_id had no
     # live container. Generate one if missing so the caller always gets
-    # a stable handle back.
+    # a stable handle back. Preserve the ORIGINAL passed-in value so we
+    # know whether to attempt state recovery: a caller-supplied id means
+    # "resume this session" (and any prior state should be merged in);
+    # a freshly-generated id means "brand new" (nothing to recover).
+    caller_session_id = session_id
     session_id = session_id or _new_session_id()
+
+    # Session recovery — merge caller's delta with any prior state
+    # persisted for this session_id. Prior state is the last row (any
+    # phase except 'closed') registered under the same session_id, so
+    # this covers: readiness failure, tester-infra failure, hard-TTL
+    # reap, idle-TTL reap, or an out-of-band container crash. In all
+    # of those the previous row is not phase='running' and the reuse
+    # path above skipped it — without this step the caller's delta
+    # would spawn a half-populated sandbox and force them to resend
+    # everything, which was the exact "container not persisting" bug
+    # this recovery is meant to fix.
+    if caller_session_id:
+        prior = await _find_last_session_state(caller_session_id)
+        if prior:
+            prior_app = prior.get("app_files") or {}
+            prior_tests = prior.get("tests") or {}
+            incoming_tests_map = extract_test_files(files)
+            incoming_app = {
+                k: v for k, v in files.items() if not k.startswith("tests/")
+            }
+            merged_app = {**prior_app, **incoming_app}
+            merged_tests = {**prior_tests, **incoming_tests_map}
+            for d in deletes:
+                if d.startswith("tests/"):
+                    merged_tests.pop(d, None)
+                else:
+                    merged_app.pop(d, None)
+            log.info(
+                "session recovery: session=%s prior sandbox=%s phase=%s — "
+                "merged caller delta (%d app + %d test) with prior state "
+                "(%d app + %d test) → %d app + %d test",
+                caller_session_id, prior["sandbox_id"], prior["phase"],
+                len(incoming_app), len(incoming_tests_map),
+                len(prior_app), len(prior_tests),
+                len(merged_app), len(merged_tests),
+            )
+            # Rebuild the caller-visible files map from the merged view.
+            # deletes have been applied in-place above, so clear them
+            # for the rest of the flow — otherwise the spawn path would
+            # try to delete files that don't exist in the merged map.
+            files = {**merged_app, **merged_tests}
+            deletes = []
+            # Also carry the prior runtime forward when the caller didn't
+            # specify one that matches. Same runtime on recovery is the
+            # sane default; a caller who genuinely wants to switch
+            # runtimes should start a new session.
+            if prior.get("runtime") and prior["runtime"] != runtime:
+                log.warning(
+                    "session recovery: caller runtime=%r differs from prior "
+                    "runtime=%r for session=%s — using caller's value",
+                    runtime, prior["runtime"], caller_session_id,
+                )
 
     try:
         rt = get_runtime(runtime)
@@ -858,8 +976,12 @@ async def _reuse_or_spawn(
             "expires_at": expires_at.isoformat(),
             "session_id": session_id,
             "last_used_at": now_iso,
-            # Persist test files so reuse calls can run them again
-            # without the caller re-sending the whole map every turn.
+            # Persist BOTH file halves so a caller's future delta can
+            # be merged with the full state — even after container
+            # death (readiness fail, tester-infra fail, TTL sweep).
+            # Without app_files here, only tests survive teardown and
+            # the model has to re-send every app file on retry.
+            "app_files": app_files,
             "tests": test_files,
         },
         initial_phase="spawning",

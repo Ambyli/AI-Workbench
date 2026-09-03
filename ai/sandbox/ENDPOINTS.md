@@ -16,6 +16,7 @@ Everything below is served by [`ai/sandbox/runner/app.py`](app.py). Jobs endpoin
 | `POST` | `/session/{session_id}/files` | Overlay files into a live sandbox. Backing endpoint for `sandbox.update_files` |
 | `GET` | `/session/{session_id}/files` | Read files back from `/app` — dir listing when `paths` is omitted, contents inline otherwise. Backing endpoint for `sandbox.get_files` |
 | `POST` | `/session/{session_id}/exec` | Run a non-interactive shell command inside the container. Backing endpoint for `sandbox.exec` |
+| `POST` | `/session/{session_id}/patch` | Strict line-range file edits (all-or-nothing). Backing endpoint for `sandbox.patch_files` |
 | `DELETE` | `/session/{session_id}` | Tear down a session's running sandbox. Backing endpoint for `sandbox.close`. Idempotent |
 | `GET` | `/session/{session_id}/download` | Stream the running sandbox's `/app` as a tar archive. Follows self-heal. Also exposed publicly via Caddy at `/sandboxes/download/{session_id}` |
 | `GET` | `/session/{session_id}/logs` | Return the last N lines (default 100, max 1000) of the running sandbox's stdout+stderr. Follows self-heal. Backing endpoint for `sandbox.get_logs` |
@@ -379,6 +380,98 @@ Output is capped at 8 KB; when truncated, the last 8 KB are returned and `trunca
 
 ---
 
+## `POST /session/{session_id}/patch`
+
+Strict line-range file edits inside a running sandbox. All-or-nothing across the batch — every patch validates in a dry-run pass first, only then are any files modified. Backs `sandbox.patch_files`.
+
+**Body:**
+```json
+{
+  "patches": [
+    {
+      "path":        "app.py",
+      "start_line":  15,
+      "end_line":    18,
+      "expected":    "def foo(x):\n    return x + 1",
+      "replacement": "def foo(x, y):\n    return x + y",
+      "note":        "add y argument"
+    }
+  ],
+  "recreate_if_gone": false
+}
+```
+
+Field semantics:
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `patches` | list of PatchSpec | yes | At least one patch required. |
+| `patches[].path` | string | yes | Relative to `/app`. Absolute paths and `..` traversal rejected. |
+| `patches[].start_line` | int | yes | 1-indexed inclusive. |
+| `patches[].end_line` | int | yes | 1-indexed inclusive. Must satisfy `start_line <= end_line`. |
+| `patches[].expected` | string | yes | EXACT current content of lines `[start_line, end_line]` joined with `\n`. Byte-for-byte match required. |
+| `patches[].replacement` | string | yes | What to write in place of `expected`. |
+| `patches[].note` | string | no | Free-text; logged for operator debugging, not applied. |
+| `recreate_if_gone` | bool | no | Accepted for interface consistency but has NO effect. A dead container always returns 409 regardless — see behavior notes. |
+
+**Payload limits:** each patch's `expected` + `replacement` UTF-8 bytes count toward `SANDBOX_MAX_FILE_BYTES` (default 1,000,000) individually, and the sum across all patches counts toward `SANDBOX_MAX_PAYLOAD_BYTES` (default 10,000,000). Rejected at pydantic validation before the runner touches the container.
+
+**Response (200):**
+```json
+{
+  "sandbox_id":     "a1b2c3d4e5f6",
+  "session_id":    "bfdYm3_H5SD4",
+  "url":           "https://chat.zeoenergy.com/sandboxes/a1b2c3d4e5f6/",
+  "expires_at":    "2026-09-03T20:15:00+00:00",
+  "runtime":       "python",
+  "hunks_applied": [
+    {"path": "app.py", "start_line": 15, "end_line": 18,
+     "replaced_bytes": 27, "new_bytes": 41}
+  ],
+  "files_touched": ["app.py"],
+  "startup_output": "",
+  "app_status":    {"code": 200, "latency_ms": 47},
+  "recreated":     false
+}
+```
+
+Behavior:
+
+- **Dry-run validation.** For each patch: path safety → file exists (else `missing_file` 409) → target must be UTF-8 (else `binary_file` 409) → line range in bounds (else `out_of_range` 409) → `expected` byte-for-byte matches `\n`-join(current_lines[start_line-1:end_line]) (else `content_mismatch` 409).
+- **Overlap check.** Two patches on the SAME `path` whose `[start_line, end_line]` ranges intersect cause the entire call to be rejected with `overlap` 409. Boundary-touching ranges count as overlapping (e.g. `[10-15]` and `[15-20]`).
+- **Apply pass** only runs if every patch passes. Per-file bottom-up so earlier-line indices stay valid; each file is written in a single `put_archive` so a mid-batch failure doesn't half-write.
+- **Trailing newline preserved.** If the file ended with `\n` before, it does after.
+- **`last_used_at` bumped** only on successful apply.
+- **Post-write health probe** (same as `POST /session/{id}/files`): 500 ms settle → single HTTP probe against the runtime's `readiness_probe_path` on port 80 → result inline in `app_status`.
+- **No self-heal.** `recreate_if_gone` is accepted but ignored — a fresh container has no files to anchor on, so a dead container always returns 409 with a hint to call `update_files` first.
+
+**Structured 409 shape (`content_mismatch`):**
+```json
+{
+  "detail": {
+    "error":         "expected content mismatch",
+    "session_id":    "bfdYm3_H5SD4",
+    "kind":          "content_mismatch",
+    "path":          "app.py",
+    "patch_index":   1,
+    "start_line":    15,
+    "end_line":      18,
+    "expected":      "...caller-supplied text...",
+    "actual":        "...current file content of those lines...",
+    "message":       "Expected content at app.py:15-18 did not match the current file.",
+    "hint":          "The file has changed since you last read it. Call get_files with the affected path, copy the current bytes into `expected`, and reissue patch_files. No files were modified."
+  }
+}
+```
+
+Other `kind` values: `out_of_range` (adds `file_line_count`), `overlap` (adds `other_start_line`/`other_end_line`/`other_patch_index`), `missing_file`, `binary_file`, `unsafe_path`, `bad_expected_type`, `bad_replacement_type`. Each carries a `hint` telling the caller the exact next action.
+
+**Errors:** 400 on invalid session_id or empty `patches`; 404 on session not found; 409 on any dry-run failure or dead container; 413 on payload cap exceeded.
+
+See [`SANDBOX.md § Targeted edits (patch_files)`](SANDBOX.md#targeted-edits-patch_files) for the "when to use vs update_files" flow and worked examples.
+
+---
+
 ## `DELETE /session/{session_id}`
 
 Explicitly tear down the running sandbox for a session. Idempotent — a session that never existed or has already expired still returns 204 so callers don't have to remember state to clean up.
@@ -618,7 +711,7 @@ All requests are JSON-RPC 2.0 over HTTP POST. Response bodies come back as eithe
 
 ### Available tools
 
-Eleven tools registered on the `sandbox` MCP server. Every tool returns a `ToolResult` with a `TextContent` block (what the model reads) plus a `structured_content` payload (machine-readable JSON — see the field breakdowns per tool).
+Twelve tools registered on the `sandbox` MCP server. Every tool returns a `ToolResult` with a `TextContent` block (what the model reads) plus a `structured_content` payload (machine-readable JSON — see the field breakdowns per tool).
 
 | Tool | Backing HTTP endpoint | Purpose |
 |---|---|---|
@@ -628,6 +721,7 @@ Eleven tools registered on the `sandbox` MCP server. Every tool returns a `ToolR
 | `get_files` | `GET /session/{id}/files` | Read files back from `/app` |
 | `get_logs` | `GET /session/{id}/logs` | Tail combined stdout+stderr |
 | `exec` | `POST /session/{id}/exec` | Run a non-interactive shell command |
+| `patch_files` | `POST /session/{id}/patch` | Strict line-range file edits (all-or-nothing) |
 | `preview` | (in-process; reads from registry only) | Return the iframe artifact HTML |
 | `close` | `DELETE /session/{id}` | Teardown and slot release |
 | `list_sessions` | `GET /sessions` | Enumerate live sandboxes |
@@ -645,6 +739,7 @@ Eleven tools registered on the `sandbox` MCP server. Every tool returns a `ToolR
 - `get_files` → `{ok, session_id, sandbox_id, files: [{path, size, encoding, content, truncated, error?}, …]}`
 - `get_logs` → `{ok, session_id, sandbox_id, lines_requested, logs, empty?}`
 - `exec` → `{ok, session_id, sandbox_id, command, exit_code, duration_ms, output, truncated, timed_out}`
+- `patch_files` → `{ok, session_id, sandbox_id, url, expires_at, runtime, hunks_applied: [{path, start_line, end_line, replaced_bytes, new_bytes}], files_touched, startup_output, app_status, recreated: false}` — on failure the payload carries `{ok: false, status: 409, error, session_id, detail: {kind, path, patch_index, start_line?, end_line?, expected?, actual?, file_line_count?, other_start_line?, other_end_line?, other_patch_index?, message, hint}}`
 - `preview` → `{ok, session_id, sandbox_id, url, iframe_html, download_url}`
 - `close` → `{ok, session_id, sandbox_id?, was_running}`
 - `list_sessions` → `{ok, count, sessions: [...]}`

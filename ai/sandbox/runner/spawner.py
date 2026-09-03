@@ -131,6 +131,36 @@ class ExecResult:
     timed_out: bool = False
 
 
+@dataclass
+class HunkResult:
+    """One applied hunk in a ``patch_files`` call."""
+
+    path: str
+    start_line: int
+    end_line: int
+    replaced_bytes: int
+    new_bytes: int
+
+
+@dataclass
+class PatchMismatch:
+    """Structured dry-run failure — no file was modified."""
+
+    kind: str  # "missing_file" | "out_of_range" | "content_mismatch" | "overlap"
+    path: str
+    start_line: Optional[int] = None
+    end_line: Optional[int] = None
+    expected: Optional[str] = None
+    actual: Optional[str] = None
+    file_line_count: Optional[int] = None
+    # For overlap errors — the range of the OTHER patch that intersects.
+    other_start_line: Optional[int] = None
+    other_end_line: Optional[int] = None
+    other_index: Optional[int] = None
+    patch_index: Optional[int] = None
+    message: str = ""
+
+
 class Spawner:
     """Docker SDK wrapper. Constructed once per process, reused per request."""
 
@@ -878,6 +908,257 @@ class Spawner:
                 "update_files: %s deletes-only: %d file(s) removed",
                 container_name, len(deletes),
             )
+
+    def patch_files(
+        self,
+        container_name: str,
+        patches: list[dict],
+    ) -> tuple[list[HunkResult], Optional[PatchMismatch]]:
+        """Line-range strict-validation edits, all-or-nothing.
+
+        Each patch is a dict:
+            {path, start_line, end_line, expected, replacement, note?}
+
+        Line numbers are 1-indexed inclusive. ``expected`` MUST byte-for-byte
+        match ``\n``-join(current_lines[start_line-1 : end_line]) or the
+        entire call is rejected — the runner returns a ``PatchMismatch``
+        describing what it saw so the caller can retry inline.
+
+        Overlap check: two patches on the same ``path`` whose
+        ``[start_line, end_line]`` ranges intersect cause the entire call
+        to be rejected.
+
+        Returns ``(hunks_applied, mismatch)``. If ``mismatch`` is
+        non-None, ``hunks_applied`` is empty — no files were touched.
+
+        Path validation reuses ``_safe_relpath`` — same as ``update_files``
+        and ``deletes``. Line ending on the final line: we split with
+        ``splitlines(keepends=False)`` so the join is trailing-newline-
+        preserving as long as the caller's ``expected`` also omits its
+        trailing newline. If the caller passes a trailing newline, the
+        strict comparison catches it — the model retries with the right
+        shape.
+        """
+        container = self._client.containers.get(container_name)
+
+        # ── Dry-run pass: validate every patch before touching Docker ──
+        # We read every file once and keep the split-line snapshot around
+        # so the apply pass doesn't re-read.
+        file_lines: dict[str, list[str]] = {}
+        file_had_trailing_newline: dict[str, bool] = {}
+
+        # Group patches by path for the overlap check.
+        by_path: dict[str, list[tuple[int, dict]]] = {}
+        for idx, patch in enumerate(patches):
+            path_raw = patch.get("path", "")
+            try:
+                safe = _safe_relpath(path_raw)
+            except ValueError as exc:
+                log.warning(
+                    "patch_files: rejected unsafe path %r at patch #%d: %s",
+                    path_raw, idx + 1, exc,
+                )
+                return [], PatchMismatch(
+                    kind="unsafe_path",
+                    path=path_raw,
+                    patch_index=idx + 1,
+                    message=str(exc),
+                )
+            by_path.setdefault(safe, []).append((idx, patch))
+
+        # Overlap check per file.
+        for safe_path, entries in by_path.items():
+            entries.sort(key=lambda e: (e[1]["start_line"], e[1]["end_line"]))
+            for i in range(1, len(entries)):
+                prev_idx, prev = entries[i - 1]
+                cur_idx, cur = entries[i]
+                if cur["start_line"] <= prev["end_line"]:
+                    log.warning(
+                        "patch_files: overlap on %s — patch #%d [%d-%d] and "
+                        "patch #%d [%d-%d]",
+                        safe_path,
+                        prev_idx + 1, prev["start_line"], prev["end_line"],
+                        cur_idx + 1, cur["start_line"], cur["end_line"],
+                    )
+                    return [], PatchMismatch(
+                        kind="overlap",
+                        path=safe_path,
+                        start_line=cur["start_line"],
+                        end_line=cur["end_line"],
+                        other_start_line=prev["start_line"],
+                        other_end_line=prev["end_line"],
+                        patch_index=cur_idx + 1,
+                        other_index=prev_idx + 1,
+                        message=(
+                            f"Patch #{cur_idx + 1} covers lines "
+                            f"{cur['start_line']}-{cur['end_line']}; "
+                            f"patch #{prev_idx + 1} covers lines "
+                            f"{prev['start_line']}-{prev['end_line']}. "
+                            "Combine them into ONE patch whose expected + "
+                            "replacement cover the merged range."
+                        ),
+                    )
+
+        # File read + line-range + expected-content check for every patch.
+        # Reads are done once per file — the split-line snapshot is cached.
+        for safe_path, entries in by_path.items():
+            if safe_path not in file_lines:
+                try:
+                    stream, _stat = container.get_archive(f"/app/{safe_path}")
+                except NotFound:
+                    idx = entries[0][0]
+                    log.warning(
+                        "patch_files: missing file %r (patch #%d)",
+                        safe_path, idx + 1,
+                    )
+                    return [], PatchMismatch(
+                        kind="missing_file",
+                        path=safe_path,
+                        patch_index=idx + 1,
+                        message=(
+                            "patch_files does not create files; use "
+                            "update_files for new files."
+                        ),
+                    )
+                data, _size, _truncated = _extract_file_from_tar_stream(
+                    stream, 1 << 30,  # effectively unbounded for patching
+                )
+                try:
+                    text = data.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    idx = entries[0][0]
+                    log.warning(
+                        "patch_files: non-utf8 file %r (patch #%d): %s",
+                        safe_path, idx + 1, exc,
+                    )
+                    return [], PatchMismatch(
+                        kind="binary_file",
+                        path=safe_path,
+                        patch_index=idx + 1,
+                        message=(
+                            "cannot patch a non-UTF-8 file. Use "
+                            "update_files to overwrite it entirely."
+                        ),
+                    )
+                # Preserve trailing newline info so the writeback is
+                # byte-faithful. splitlines() drops the trailing empty
+                # entry after a final '\n', so we track it separately.
+                trailing_nl = text.endswith("\n")
+                file_had_trailing_newline[safe_path] = trailing_nl
+                file_lines[safe_path] = text.splitlines()
+
+            lines = file_lines[safe_path]
+            for patch_idx, patch in entries:
+                sl = patch["start_line"]
+                el = patch["end_line"]
+                if not (1 <= sl <= el <= len(lines)):
+                    log.warning(
+                        "patch_files: out of range on %r patch #%d "
+                        "[%d-%d], file has %d lines",
+                        safe_path, patch_idx + 1, sl, el, len(lines),
+                    )
+                    return [], PatchMismatch(
+                        kind="out_of_range",
+                        path=safe_path,
+                        start_line=sl,
+                        end_line=el,
+                        file_line_count=len(lines),
+                        patch_index=patch_idx + 1,
+                        message=(
+                            f"Patch #{patch_idx + 1} targets lines "
+                            f"{sl}-{el}, but {safe_path!r} has only "
+                            f"{len(lines)} line(s)."
+                        ),
+                    )
+                actual = "\n".join(lines[sl - 1 : el])
+                expected = patch.get("expected", "")
+                if not isinstance(expected, str):
+                    return [], PatchMismatch(
+                        kind="bad_expected_type",
+                        path=safe_path,
+                        start_line=sl,
+                        end_line=el,
+                        patch_index=patch_idx + 1,
+                        message="`expected` must be a string",
+                    )
+                if actual != expected:
+                    log.info(
+                        "patch_files: content mismatch on %r patch #%d "
+                        "[%d-%d]", safe_path, patch_idx + 1, sl, el,
+                    )
+                    return [], PatchMismatch(
+                        kind="content_mismatch",
+                        path=safe_path,
+                        start_line=sl,
+                        end_line=el,
+                        expected=expected,
+                        actual=actual,
+                        patch_index=patch_idx + 1,
+                        message=(
+                            f"Expected content at {safe_path}:"
+                            f"{sl}-{el} did not match the current file."
+                        ),
+                    )
+                replacement = patch.get("replacement", "")
+                if not isinstance(replacement, str):
+                    return [], PatchMismatch(
+                        kind="bad_replacement_type",
+                        path=safe_path,
+                        start_line=sl,
+                        end_line=el,
+                        patch_index=patch_idx + 1,
+                        message="`replacement` must be a string",
+                    )
+
+        # ── Apply pass: bottom-up per file so earlier-line numbers stay valid ──
+        # Files are rewritten as a single put_archive so an interrupted
+        # apply never leaves a file half-written.
+        applied: list[HunkResult] = []
+        new_files: dict[str, bytes] = {}
+        for safe_path, entries in by_path.items():
+            lines = list(file_lines[safe_path])  # copy so per-file work is isolated
+            # Sort descending by start_line so early-line indices don't
+            # shift under later replacements.
+            for patch_idx, patch in sorted(
+                entries, key=lambda e: e[1]["start_line"], reverse=True,
+            ):
+                sl = patch["start_line"]
+                el = patch["end_line"]
+                replacement = patch["replacement"]
+                expected = patch["expected"]
+                replacement_lines = replacement.split("\n") if replacement != "" else [""]
+                # Replace lines[sl-1 : el] with replacement_lines.
+                lines[sl - 1 : el] = replacement_lines
+                applied.append(HunkResult(
+                    path=safe_path,
+                    start_line=sl,
+                    end_line=el,
+                    replaced_bytes=len(expected.encode("utf-8")),
+                    new_bytes=len(replacement.encode("utf-8")),
+                ))
+            body = "\n".join(lines)
+            if file_had_trailing_newline.get(safe_path):
+                body += "\n"
+            new_files[safe_path] = body.encode("utf-8")
+
+        # One tarball, one put_archive — atomic w.r.t. Docker's snapshot.
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w") as tar:
+            for rel_path, payload in new_files.items():
+                info = tarfile.TarInfo(name=rel_path)
+                info.size = len(payload)
+                info.mode = 0o644
+                info.mtime = int(time.time())
+                tar.addfile(info, io.BytesIO(payload))
+        container.put_archive("/app", buf.getvalue())
+        log.info(
+            "patch_files: %s ← %d file(s), %d hunk(s) via put_archive "
+            "(%d bytes tar)",
+            container_name, len(new_files), len(applied), buf.tell(),
+        )
+        # Preserve caller-facing order by hunk position (path, start_line).
+        applied.sort(key=lambda h: (h.path, h.start_line))
+        return applied, None
 
     def list_managed(self) -> list[Container]:
         """Return every running container this subsystem owns.

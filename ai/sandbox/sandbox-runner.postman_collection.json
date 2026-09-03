@@ -1,939 +1,1685 @@
 {
-  "info": {
-    "name": "sandbox-runner",
-    "description": "sandbox-runner endpoints, called through the LiteLLM pass-through registered in ai/litellm/litellm_config.yaml (`pass_through_endpoints` → `/v1/sandbox` → `http://sandbox-runner:8000`, `include_subpath: true`). Every request is authenticated with a Bearer token from a LiteLLM virtual key. Set the collection variables `litellm` (e.g. http://localhost:4001) and `virtual master key` (an sk-… key issued from the LiteLLM Admin UI → Virtual Keys) — every request inherits them via collection-level auth. See ai/sandbox/ENDPOINTS.md for the full endpoint reference and ai/litellm/LITELLM.md for issuing virtual keys.\n\nSessions: the workflow is get_runtimes → create → update_files (loop with get_files / get_logs / exec) → preview → close. Or the one-shot: run. First call: omit `session_id`; server generates one and returns it. Follow-up call: pass the same `session_id` back — server writes new files into the running container's /app, returns the same URL, dev server hot-reloads. Set the `sandboxSessionId` collection variable from the first response, then run the follow-up request. See ai/sandbox/SANDBOX.md § MCP tool flow.",
-    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
-    "_postman_id": "sandbox-runner-collection"
-  },
-  "auth": {
-    "type": "bearer",
-    "bearer": [
-      {
-        "key": "token",
-        "value": "{{virtual master key}}",
-        "type": "string"
-      }
-    ]
-  },
-  "variable": [
-    {
-      "key": "litellm",
-      "value": "http://localhost:4001",
-      "type": "string",
-      "description": "LiteLLM base URL. Localhost publish is 4001 (PORT_LITELLM); on ai_shared it's http://litellm:4000; behind cloudflared it's https://your-litellm-host."
-    },
-    {
-      "key": "virtual master key",
-      "value": "sk-your-litellm-virtual-key",
-      "type": "string",
-      "description": "LiteLLM virtual key (Admin UI → Virtual Keys, or /key/generate API). Scope the key to allow the /v1/sandbox pass-through — most keys created for chat models already do. Sent as `Authorization: Bearer {{virtual master key}}` by the collection-level auth."
-    },
-    {
-      "key": "sandboxId",
-      "value": "",
-      "type": "string",
-      "description": "12-char hex id returned by POST /run as `sandbox_id`. Fill in after spawning to run the /jobs/{id} + DELETE /jobs/{id} requests. This changes on every spawn — for a stable handle across turns use `sandboxSessionId`."
-    },
-    {
-      "key": "sandboxSessionId",
-      "value": "",
-      "type": "string",
-      "description": "Persistent session handle returned by POST /run as `session_id`. Paste it here and it's used by the 'update in-session' + 'delete files' + 'DELETE /session' requests below. Passing the same value back to POST /run updates the running container's files in place — same URL, dev server hot-reloads."
-    },
-    {
-      "key": "mcpSessionId",
-      "value": "",
-      "type": "string",
-      "description": "MCP transport session id — paste in the `mcp-session-id` response header value returned by the `MCP — initialize` request. Subsequent MCP calls need it. UNRELATED to `sandboxSessionId` — this one is FastMCP's HTTP-transport session cookie, not the sandbox reuse handle."
-    }
-  ],
-  "item": [
-    {
-      "name": "GET /health",
-      "request": {
-        "method": "GET",
-        "header": [],
-        "url": {
-          "raw": "{{litellm}}/v1/sandbox/health",
-          "host": ["{{litellm}}"],
-          "path": ["v1", "sandbox", "health"]
-        },
-        "description": "Liveness + DB status. Returns {\"status\": \"ok\", \"db\": \"up\"} when the runner can reach sandbox-db; \"degraded\" / \"down\" otherwise."
-      },
-      "response": []
-    },
-    {
-      "name": "POST /run — static HTML",
-      "request": {
-        "method": "POST",
-        "header": [
-          { "key": "Content-Type", "value": "application/json" }
-        ],
-        "body": {
-          "mode": "raw",
-          "raw": "{\n  \"runtime\": \"static\",\n  \"files\": {\n    \"index.html\": \"<!doctype html><html><head><title>demo</title></head><body style=\\\"font-family: system-ui; padding: 2rem\\\"><h1>hello sandbox</h1><p>Timestamp: <span id=t></span></p><script>document.getElementById('t').textContent = new Date().toISOString()</script></body></html>\"\n  }\n}",
-          "options": { "raw": { "language": "json" } }
-        },
-        "url": {
-          "raw": "{{litellm}}/v1/sandbox/run",
-          "host": ["{{litellm}}"],
-          "path": ["v1", "sandbox", "run"]
-        },
-        "description": "Spawn a static HTML sandbox — nginx serves the files map at /. Returns { sandbox_id, session_id, url, expires_at, reused }. The URL uses whatever SANDBOX_PROXY_URL is set to in .env — for browser-reachable iframes, that should be a public URL under the same origin as Open WebUI (e.g. https://chat.zeoenergy.com/sandboxes). Copy the returned `session_id` into the `sandboxSessionId` collection variable to run the 'update in-session' request afterwards."
-      },
-      "response": []
-    },
-    {
-      "name": "POST /run — Python (Streamlit)",
-      "request": {
-        "method": "POST",
-        "header": [
-          { "key": "Content-Type", "value": "application/json" }
-        ],
-        "body": {
-          "mode": "raw",
-          "raw": "{\n  \"runtime\": \"python\",\n  \"files\": {\n    \"app.py\": \"import streamlit as st\\nimport numpy as np\\nimport pandas as pd\\n\\nst.title('sine wave demo')\\nn = st.slider('samples', 10, 500, 100)\\nfreq = st.slider('frequency', 1, 10, 3)\\nx = np.linspace(0, 2 * np.pi, n)\\ndf = pd.DataFrame({'x': x, 'y': np.sin(freq * x)})\\nst.line_chart(df.set_index('x'))\\n\"\n  },\n  \"ttl_seconds\": 900\n}",
-          "options": { "raw": { "language": "json" } }
-        },
-        "url": {
-          "raw": "{{litellm}}/v1/sandbox/run",
-          "host": ["{{litellm}}"],
-          "path": ["v1", "sandbox", "run"]
-        },
-        "description": "Spawn a Streamlit sandbox. Runtime `python` base image has streamlit, gradio, flask, fastapi, pandas, numpy, matplotlib, plotly, requests, pillow pre-installed. Add a requirements.txt to files to install additional deps via sandbox-egress (pypi allowlisted). Cold-start ~2s pre-baked; 20-90s if pip install runs."
-      },
-      "response": []
-    },
-    {
-      "name": "POST /run — Python with requirements.txt",
-      "request": {
-        "method": "POST",
-        "header": [
-          { "key": "Content-Type", "value": "application/json" }
-        ],
-        "body": {
-          "mode": "raw",
-          "raw": "{\n  \"runtime\": \"python\",\n  \"entrypoint\": \"python gradio_app.py\",\n  \"files\": {\n    \"gradio_app.py\": \"import gradio as gr\\n\\ndef reverse(text):\\n    return text[::-1]\\n\\ngr.Interface(fn=reverse, inputs='text', outputs='text').launch(server_name='0.0.0.0', server_port=80)\\n\",\n    \"requirements.txt\": \"gradio\\n\"\n  }\n}",
-          "options": { "raw": { "language": "json" } }
-        },
-        "url": {
-          "raw": "{{litellm}}/v1/sandbox/run",
-          "host": ["{{litellm}}"],
-          "path": ["v1", "sandbox", "run"]
-        },
-        "description": "Illustrates the install-if-present pattern. If files contains a requirements.txt, the base image entrypoint runs `pip install -r requirements.txt` before executing the command. pip goes through HTTP_PROXY=sandbox-egress:8888 and hits the pypi.org / files.pythonhosted.org allowlist."
-      },
-      "response": []
-    },
-    {
-      "name": "POST /run — Node (Express)",
-      "request": {
-        "method": "POST",
-        "header": [
-          { "key": "Content-Type", "value": "application/json" }
-        ],
-        "body": {
-          "mode": "raw",
-          "raw": "{\n  \"runtime\": \"node\",\n  \"entrypoint\": \"node server.js\",\n  \"files\": {\n    \"server.js\": \"const express = require('express');\\nconst app = express();\\napp.get('/', (_, res) => res.send('<h1>hello from express</h1>'));\\napp.listen(80, '0.0.0.0', () => console.log('listening on 80'));\\n\"\n  }\n}",
-          "options": { "raw": { "language": "json" } }
-        },
-        "url": {
-          "raw": "{{litellm}}/v1/sandbox/run",
-          "host": ["{{litellm}}"],
-          "path": ["v1", "sandbox", "run"]
-        },
-        "description": "Spawn a Node sandbox. Base image has serve, vite, react, react-dom, express, next installed globally so `require('express')` works without a package.json. Add a package.json to files to trigger `npm install` on boot."
-      },
-      "response": []
-    },
-    {
-      "name": "POST /run — Node (Vite + React)",
-      "request": {
-        "method": "POST",
-        "header": [
-          { "key": "Content-Type", "value": "application/json" }
-        ],
-        "body": {
-          "mode": "raw",
-          "raw": "{\n  \"runtime\": \"node\",\n  \"entrypoint\": \"npx --yes vite --host 0.0.0.0 --port 80\",\n  \"files\": {\n    \"package.json\": \"{\\\"name\\\":\\\"demo\\\",\\\"type\\\":\\\"module\\\",\\\"scripts\\\":{\\\"dev\\\":\\\"vite\\\"}}\",\n    \"index.html\": \"<!doctype html><html><head><title>vite demo</title></head><body><div id=root></div><script type=module src=/main.jsx></script></body></html>\",\n    \"main.jsx\": \"import React, { useState } from 'react';\\nimport ReactDOM from 'react-dom/client';\\n\\nfunction Counter() {\\n  const [n, setN] = useState(0);\\n  return (<div style={{padding: '2rem', fontFamily: 'system-ui'}}>\\n    <h1>count: {n}</h1>\\n    <button onClick={() => setN(n + 1)}>+</button>\\n    <button onClick={() => setN(0)}>reset</button>\\n  </div>);\\n}\\n\\nReactDOM.createRoot(document.getElementById('root')).render(<Counter />);\\n\"\n  }\n}",
-          "options": { "raw": { "language": "json" } }
-        },
-        "url": {
-          "raw": "{{litellm}}/v1/sandbox/run",
-          "host": ["{{litellm}}"],
-          "path": ["v1", "sandbox", "run"]
-        },
-        "description": "Multi-file Vite + React counter. Vite HMR uses WebSockets — sandbox-proxy (Caddy) forwards them by default, so buttons work end-to-end when iframed."
-      },
-      "response": []
-    },
-    {
-      "name": "POST /run — update in-session (hot reload)",
-      "request": {
-        "method": "POST",
-        "header": [
-          { "key": "Content-Type", "value": "application/json" }
-        ],
-        "body": {
-          "mode": "raw",
-          "raw": "{\n  \"runtime\": \"static\",\n  \"session_id\": \"{{sandboxSessionId}}\",\n  \"files\": {\n    \"index.html\": \"<!doctype html><html><body style=\\\"font-family: system-ui; padding: 2rem\\\"><h1>updated content</h1><p>this replaced the initial file — same URL, no respawn.</p></body></html>\"\n  }\n}",
-          "options": { "raw": { "language": "json" } }
-        },
-        "url": {
-          "raw": "{{litellm}}/v1/sandbox/run",
-          "host": ["{{litellm}}"],
-          "path": ["v1", "sandbox", "run"]
-        },
-        "description": "Update a preview in place. Pass the `session_id` from a previous /run response (via the sandboxSessionId collection variable) and the file(s) that changed. The runner writes them into the running container's /app via docker cp — no respawn. Response has `reused: true` and the SAME sandbox_id + url as the initial spawn. The dev server inside the sandbox reloads on file change: nginx serves the new file on next request, Streamlit auto-reruns, Vite HMR fires without a browser refresh. If the container was already reaped when this call arrives (idle-TTL or manual rm), the runner self-heals — same session_id, new sandbox_id, new url — so callers don't have to distinguish the two cases.\n\n`files` is treated as an overlay: paths listed here overwrite the running container's copies; unlisted files stay put. Save tokens by not resending unchanged files."
-      },
-      "response": []
-    },
-    {
-      "name": "POST /run — delete files in-session",
-      "request": {
-        "method": "POST",
-        "header": [
-          { "key": "Content-Type", "value": "application/json" }
-        ],
-        "body": {
-          "mode": "raw",
-          "raw": "{\n  \"runtime\": \"static\",\n  \"session_id\": \"{{sandboxSessionId}}\",\n  \"files\": {},\n  \"deletes\": [\"old-page.html\"]\n}",
-          "options": { "raw": { "language": "json" } }
-        },
-        "url": {
-          "raw": "{{litellm}}/v1/sandbox/run",
-          "host": ["{{litellm}}"],
-          "path": ["v1", "sandbox", "run"]
-        },
-        "description": "Explicitly remove file(s) from a running sandbox. Use on follow-up calls when the model renames or drops a file — otherwise stale files linger, because overlay semantics on `files` never delete. Paths are relative to /app; absolute paths and '..' return 400. Combine with a `files` map to atomically add + remove in one call.\n\nIgnored on the first call (no session_id) — the container starts fresh from `files` alone, there's nothing to delete."
-      },
-      "response": []
-    },
-    {
-      "name": "POST /create — warm empty container",
-      "request": {
-        "method": "POST",
-        "header": [
-          { "key": "Content-Type", "value": "application/json" }
-        ],
-        "body": {
-          "mode": "raw",
-          "raw": "{\n  \"runtime\": \"python\",\n  \"ttl_seconds\": 900,\n  \"env\": {\n    \"DEMO_MODE\": \"1\"\n  }\n}",
-          "options": { "raw": { "language": "json" } }
-        },
-        "url": {
-          "raw": "{{litellm}}/v1/sandbox/create",
-          "host": ["{{litellm}}"],
-          "path": ["v1", "sandbox", "create"]
-        },
-        "description": "Reserve an empty warming container for the chosen runtime. Backs the sandbox.create MCP tool. Response is the same shape as POST /run — save `session_id` into the `sandboxSessionId` collection variable, then call POST /session/{id}/files with real code.\n\n`env` is stored on the job row and replayed on self-heal respawn. Reserved keys (HTTP_PROXY, PYTHONUNBUFFERED, TERM, etc.) are rejected — those are runner-controlled invariants.\n\nSee ENDPOINTS.md § POST /create."
-      },
-      "response": []
-    },
-    {
-      "name": "GET /sessions — list live sandboxes",
-      "request": {
-        "method": "GET",
-        "header": [],
-        "url": {
-          "raw": "{{litellm}}/v1/sandbox/sessions",
-          "host": ["{{litellm}}"],
-          "path": ["v1", "sandbox", "sessions"]
-        },
-        "description": "Enumerate every currently-running sandbox globally. Backs sandbox.list_sessions. No per-user filtering — returns everything on the deployment. Response: {count, sessions:[…]}. See ENDPOINTS.md § GET /sessions."
-      },
-      "response": []
-    },
-    {
-      "name": "POST /session/{sandboxSessionId}/files — update files (opt-in self-heal)",
-      "request": {
-        "method": "POST",
-        "header": [
-          { "key": "Content-Type", "value": "application/json" }
-        ],
-        "body": {
-          "mode": "raw",
-          "raw": "{\n  \"files\": {\n    \"app.py\": \"import streamlit as st\\nst.title('updated in place')\\n\"\n  },\n  \"deletes\": [],\n  \"recreate_if_gone\": false\n}",
-          "options": { "raw": { "language": "json" } }
-        },
-        "url": {
-          "raw": "{{litellm}}/v1/sandbox/session/:sandboxSessionId/files",
-          "host": ["{{litellm}}"],
-          "path": ["v1", "sandbox", "session", ":sandboxSessionId", "files"],
-          "variable": [
-            { "key": "sandboxSessionId", "value": "", "description": "Persistent session handle returned by POST /run or POST /create." }
-          ]
-        },
-        "description": "Overlay files into a live sandbox. Backs sandbox.update_files. Unlike POST /run, `recreate_if_gone` defaults to FALSE — if the container is gone, the endpoint returns a structured 409 telling you to opt in explicitly. Set to true to accept state loss (env preserved, in-container files and exec-installed packages LOST).\n\n`files` values are UTF-8 str or {encoding:'base64', content:'...'} for binary. Per-file cap SANDBOX_MAX_FILE_BYTES; total SANDBOX_MAX_PAYLOAD_BYTES.\n\nResponse: same shape as POST /run — includes `app_status` from the post-update health probe. See ENDPOINTS.md § POST /session/{session_id}/files."
-      },
-      "response": []
-    },
-    {
-      "name": "GET /session/{sandboxSessionId}/files — list files",
-      "request": {
-        "method": "GET",
-        "header": [],
-        "url": {
-          "raw": "{{litellm}}/v1/sandbox/session/:sandboxSessionId/files",
-          "host": ["{{litellm}}"],
-          "path": ["v1", "sandbox", "session", ":sandboxSessionId", "files"],
-          "variable": [
-            { "key": "sandboxSessionId", "value": "", "description": "Persistent session handle." }
-          ]
-        },
-        "description": "Directory listing of the running sandbox's /app — paths + sizes only, no contents. Backs sandbox.get_files when the model omits `paths`. See ENDPOINTS.md § GET /session/{session_id}/files."
-      },
-      "response": []
-    },
-    {
-      "name": "GET /session/{sandboxSessionId}/files — read specific paths",
-      "request": {
-        "method": "GET",
-        "header": [],
-        "url": {
-          "raw": "{{litellm}}/v1/sandbox/session/:sandboxSessionId/files?paths=app.py,requirements.txt&max_bytes_per_file=8192",
-          "host": ["{{litellm}}"],
-          "path": ["v1", "sandbox", "session", ":sandboxSessionId", "files"],
-          "query": [
-            { "key": "paths", "value": "app.py,requirements.txt", "description": "Comma-separated relative paths under /app." },
-            { "key": "max_bytes_per_file", "value": "8192", "description": "Truncate each returned file to this many bytes. Hard cap 65536." }
-          ],
-          "variable": [
-            { "key": "sandboxSessionId", "value": "", "description": "Persistent session handle." }
-          ]
-        },
-        "description": "Read files back from /app. Binary payloads come back base64-encoded — same shape you can round-trip via POST /session/{id}/files. Missing paths get an `error: 'not found'` entry rather than raising. See ENDPOINTS.md § GET /session/{session_id}/files."
-      },
-      "response": []
-    },
-    {
-      "name": "POST /session/{sandboxSessionId}/exec — pip install",
-      "request": {
-        "method": "POST",
-        "header": [
-          { "key": "Content-Type", "value": "application/json" }
-        ],
-        "body": {
-          "mode": "raw",
-          "raw": "{\n  \"command\": \"pip install requests\",\n  \"timeout_seconds\": 60,\n  \"working_dir\": \"/app\"\n}",
-          "options": { "raw": { "language": "json" } }
-        },
-        "url": {
-          "raw": "{{litellm}}/v1/sandbox/session/:sandboxSessionId/exec",
-          "host": ["{{litellm}}"],
-          "path": ["v1", "sandbox", "session", ":sandboxSessionId", "exec"],
-          "variable": [
-            { "key": "sandboxSessionId", "value": "", "description": "Persistent session handle." }
-          ]
-        },
-        "description": "Run a non-interactive shell command inside the running container. Backs sandbox.exec.\n\nNON-INTERACTIVE: stdin closed. Timeout default 30 s, hard cap 120 s. Output capped at 8 KB (last 8 KB returned when truncated). Runs as 1000:1000.\n\nSTATE DRIFT: packages installed via exec do NOT survive a self-heal respawn — env is preserved, files/packages are not. Prefer writing dependencies into requirements.txt / package.json via POST /session/{id}/files for persistence.\n\nEGRESS: `pip install` still routes through sandbox-egress (allowlist). Non-allowlisted registries return 403 from the proxy.\n\nSee ENDPOINTS.md § POST /session/{session_id}/exec."
-      },
-      "response": []
-    },
-    {
-      "name": "DELETE /session/{sandboxSessionId}",
-      "request": {
-        "method": "DELETE",
-        "header": [],
-        "url": {
-          "raw": "{{litellm}}/v1/sandbox/session/:sandboxSessionId",
-          "host": ["{{litellm}}"],
-          "path": ["v1", "sandbox", "session", ":sandboxSessionId"],
-          "variable": [
-            { "key": "sandboxSessionId", "value": "", "description": "Persistent session handle returned by POST /run as session_id." }
-          ]
-        },
-        "description": "Explicitly tear down the running sandbox for a session. Backs sandbox.close. Idempotent — returns 204 whether or not the session existed. Distinct from DELETE /jobs/{sandbox_id}: /jobs targets a specific spawn event by its 12-char internal id, while /session targets whatever's currently running under the persistent session handle (may have been respawned via self-heal since the model last saw it).\n\nErrors: 400 if session_id fails `^[A-Za-z0-9_-]{1,64}$`, 500 if the runner isn't initialized."
-      },
-      "response": []
-    },
-    {
-      "name": "GET /session/{sandboxSessionId}/download",
-      "request": {
-        "method": "GET",
-        "header": [],
-        "url": {
-          "raw": "{{litellm}}/v1/sandbox/session/:sandboxSessionId/download",
-          "host": ["{{litellm}}"],
-          "path": ["v1", "sandbox", "session", ":sandboxSessionId", "download"],
-          "variable": [
-            { "key": "sandboxSessionId", "value": "", "description": "Persistent session handle returned by POST /run as session_id." }
-          ]
-        },
-        "description": "Stream the running sandbox's /app back as a tar archive (Content-Type: application/x-tar, Content-Disposition: attachment). Docker daemon does the packing (container.get_archive) so nothing buffers in the runner. Session-based, so this URL keeps working across self-heal spawns — resolves session_id → current container at request time.\n\nAlso exposed publicly via the sandbox-proxy Caddy route at ${SANDBOX_PROXY_URL}/download/{sandboxSessionId} (e.g. https://chat.zeoenergy.com/sandboxes/download/…) so browsers can download the archive with the same oauth2-proxy auth as the preview iframe. preview_app's response text includes this URL on the 'Download source:' line — models share it verbatim when a user asks to save the code.\n\nErrors: 400 if session_id fails `^[A-Za-z0-9_-]{1,64}$`, 404 if there's no running sandbox for this session (never existed, or reaped without self-heal).\n\nPostman note: click 'Send and Download' to save the response as a file. The tar root is `app/`, so `tar -xf sandbox-*.tar` extracts to `./app/`."
-      },
-      "response": []
-    },
-    {
-      "name": "GET /session/{sandboxSessionId}/logs",
-      "request": {
-        "method": "GET",
-        "header": [],
-        "url": {
-          "raw": "{{litellm}}/v1/sandbox/session/:sandboxSessionId/logs?lines=100",
-          "host": ["{{litellm}}"],
-          "path": ["v1", "sandbox", "session", ":sandboxSessionId", "logs"],
-          "query": [
-            { "key": "lines", "value": "100", "description": "Trailing lines to return. Default 100, clamped 1..1000." }
-          ],
-          "variable": [
-            { "key": "sandboxSessionId", "value": "", "description": "Persistent session handle returned by POST /run as session_id." }
-          ]
-        },
-        "description": "Return the last N lines of the running sandbox's stdout+stderr. Session-based so this follows self-heal.\n\nHow the logs get there: the runner's two-phase spawn runs the user command via `docker exec` (detached), not as PID 1 (`sleep infinity` is PID 1). container.logs() only sees PID 1's streams, so exec output isn't captured there. The spawn redirects the user command to /tmp/sandbox.log (128 MB tmpfs), and this endpoint runs `tail -n N` inside the container to read it back.\n\nWhich runtimes surface useful output here: Flask (`app.run`), FastAPI + uvicorn, Express, Vite, Next, and any bare `python app.py` all print tracebacks to stdout. STREAMLIT is the exception — it catches user exceptions and renders them in the browser rather than printing to stdout, so this endpoint shows only the 'You can now view your Streamlit app…' banner. For Streamlit apps, inspect the rendered HTML from the sandbox URL to see error text.\n\nResponse (200): {session_id, sandbox_id, lines_requested, logs}. Empty `logs` string means either the container just spawned and hasn't printed anything yet, or the app writes to a file — NOT a failure signal.\n\nErrors: 400 if session_id fails the regex, 404 if there's no running sandbox for this session."
-      },
-      "response": []
-    },
-    {
-      "name": "GET /jobs",
-      "request": {
-        "method": "GET",
-        "header": [],
-        "url": {
-          "raw": "{{litellm}}/v1/sandbox/jobs",
-          "host": ["{{litellm}}"],
-          "path": ["v1", "sandbox", "jobs"]
-        },
-        "description": "List every sandbox in the registry (running + terminal). Fixed limit of 20 in PostgresRegistry.list_all(). Ordered by updated_at DESC. Returns JobsListResponse — see ENDPOINTS.md for the JobBase shape. `metadata->>'session_id'` on each job shows the persistent handle a sandbox was spawned under; multiple 'running' rows can share a session_id only briefly (during self-heal), the reaper normalizes."
-      },
-      "response": []
-    },
-    {
-      "name": "GET /jobs/{sandboxId}",
-      "request": {
-        "method": "GET",
-        "header": [],
-        "url": {
-          "raw": "{{litellm}}/v1/sandbox/jobs/:sandboxId",
-          "host": ["{{litellm}}"],
-          "path": ["v1", "sandbox", "jobs", ":sandboxId"],
-          "variable": [
-            { "key": "sandboxId", "value": "", "description": "12-char hex id returned by POST /run as sandbox_id." }
-          ]
-        },
-        "description": "Snapshot of one sandbox. 404 if unknown. Set the sandboxId collection variable to the id returned by POST /run first."
-      },
-      "response": []
-    },
-    {
-      "name": "GET /jobs/{sandboxId}/download",
-      "request": {
-        "method": "GET",
-        "header": [],
-        "url": {
-          "raw": "{{litellm}}/v1/sandbox/jobs/:sandboxId/download",
-          "host": ["{{litellm}}"],
-          "path": ["v1", "sandbox", "jobs", ":sandboxId", "download"],
-          "variable": [
-            { "key": "sandboxId", "value": "", "description": "12-char hex id returned by POST /run as sandbox_id." }
-          ]
-        },
-        "description": "Direct download by internal sandbox_id — bypasses session resolution. Useful for operators who want to grab the archive from a SPECIFIC spawn event even if the session self-healed to a different container since. Same tar shape as the session variant. Prefer /session/{id}/download for end-user download links because that URL keeps working across self-heal.\n\nErrors: 404 if no sandbox with that id, 409 if the sandbox exists in the registry but never reached the `running` phase (no container to export)."
-      },
-      "response": []
-    },
-    {
-      "name": "GET /jobs/{sandboxId}/logs",
-      "request": {
-        "method": "GET",
-        "header": [],
-        "url": {
-          "raw": "{{litellm}}/v1/sandbox/jobs/:sandboxId/logs?lines=100",
-          "host": ["{{litellm}}"],
-          "path": ["v1", "sandbox", "jobs", ":sandboxId", "logs"],
-          "query": [
-            { "key": "lines", "value": "100", "description": "Trailing lines. Default 100, clamped 1..1000." }
-          ],
-          "variable": [
-            { "key": "sandboxId", "value": "", "description": "12-char hex id returned by POST /run as sandbox_id." }
-          ]
-        },
-        "description": "Direct log fetch by internal sandbox_id. Useful when the session self-healed to a new container but you want the previous container's output. Same underlying mechanism as /session/{id}/logs (tails /tmp/sandbox.log inside the container). Response body: {sandbox_id, lines_requested, logs}.\n\nErrors: 404 if no sandbox with that id, 409 if the sandbox never reached the `running` phase — no container to read logs from."
-      },
-      "response": []
-    },
-    {
-      "name": "DELETE /jobs/{sandboxId}",
-      "request": {
-        "method": "DELETE",
-        "header": [],
-        "url": {
-          "raw": "{{litellm}}/v1/sandbox/jobs/:sandboxId",
-          "host": ["{{litellm}}"],
-          "path": ["v1", "sandbox", "jobs", ":sandboxId"],
-          "variable": [
-            { "key": "sandboxId", "value": "", "description": "12-char hex id returned by POST /run as sandbox_id." }
-          ]
-        },
-        "description": "Tear a sandbox down early. Stops the container, removes it, deletes the row, releases the concurrency slot. Returns 204 no body. 404 if the sandbox id is unknown."
-      },
-      "response": []
-    },
-    {
-      "name": "GET /tool/openapi.json",
-      "request": {
-        "method": "GET",
-        "header": [],
-        "url": {
-          "raw": "{{litellm}}/v1/sandbox/tool/openapi.json",
-          "host": ["{{litellm}}"],
-          "path": ["v1", "sandbox", "tool", "openapi.json"]
-        },
-        "description": "OpenAPI schema for the OpenWebUI Tool Server integration. Note: OpenWebUI ITSELF should point Admin Panel → Settings → Tools → Add Connection directly at http://sandbox-runner:8000/tool (Docker service DNS on ai_shared), NOT at the LiteLLM pass-through — OpenWebUI needs to see the raw HTMLResponse headers and CORS behavior. Use this Postman request only for schema inspection."
-      },
-      "response": []
-    },
-    {
-      "name": "POST /tool/run",
-      "request": {
-        "method": "POST",
-        "header": [
-          { "key": "Content-Type", "value": "application/json" }
-        ],
-        "body": {
-          "mode": "raw",
-          "raw": "{\n  \"runtime\": \"static\",\n  \"files\": {\n    \"index.html\": \"<h1>hello from tool server</h1>\"\n  }\n}",
-          "options": { "raw": { "language": "json" } }
-        },
-        "url": {
-          "raw": "{{litellm}}/v1/sandbox/tool/run",
-          "host": ["{{litellm}}"],
-          "path": ["v1", "sandbox", "tool", "run"]
-        },
-        "description": "OpenWebUI Rich-UI integration (primary Tool Server endpoint). Returns HTMLResponse with `Content-Disposition: inline` — OpenWebUI renders the response body (a self-contained HTML page navigating its own iframe to sandbox-proxy) as an embedded artifact under the tool call indicator, no model round-trip needed. Response Content-Type is text/html (not JSON). OpenWebUI should register this URL directly on sandbox-runner:8000, not via LiteLLM, so it can see the raw response headers.\n\nAccepts the same fields as POST /run (recreate_if_gone implicitly true). Pass session_id on a follow-up call to update the running container in place. See ENDPOINTS.md § POST /tool/run."
-      },
-      "response": []
-    },
-    {
-      "name": "POST /tool/preview_app (DEPRECATED alias for /tool/run)",
-      "request": {
-        "method": "POST",
-        "header": [
-          { "key": "Content-Type", "value": "application/json" }
-        ],
-        "body": {
-          "mode": "raw",
-          "raw": "{\n  \"runtime\": \"static\",\n  \"files\": {\n    \"index.html\": \"<h1>hello from deprecated alias</h1>\"\n  }\n}",
-          "options": { "raw": { "language": "json" } }
-        },
-        "url": {
-          "raw": "{{litellm}}/v1/sandbox/tool/preview_app",
-          "host": ["{{litellm}}"],
-          "path": ["v1", "sandbox", "tool", "preview_app"]
-        },
-        "description": "DEPRECATED alias for POST /tool/run. Kept for one release cycle so existing OpenWebUI Tool Server registrations don't break mid-rollout. Behaves identically to /tool/run. Migrate to /tool/run at your convenience."
-      },
-      "response": []
-    },
-    {
-      "name": "GET /tool/get_runtimes",
-      "request": {
-        "method": "GET",
-        "header": [],
-        "url": {
-          "raw": "{{litellm}}/v1/sandbox/tool/get_runtimes",
-          "host": ["{{litellm}}"],
-          "path": ["v1", "sandbox", "tool", "get_runtimes"]
-        },
-        "description": "Tool Server variant of sandbox.get_runtimes. Returns the same JSON payload as the MCP tool — a list of runtime metadata objects. `GET /tool/list_runtimes` is a deprecated alias with identical behavior."
-      },
-      "response": []
-    },
-    {
-      "name": "MCP",
-      "description": "FastMCP JSON-RPC over HTTP forwarded through the LiteLLM pass-through. Note that LiteLLM ALSO advertises the sandbox as an MCP server via `mcp_servers.sandbox` in litellm_config.yaml — models see the tool through that path, not this one. The Postman requests below are useful for debugging the transport directly. Every MCP request MUST use trailing-slash (POST /mcp/), MUST send `Accept: application/json, text/event-stream`, and MUST start with an `initialize` call — copy the `mcp-session-id` response header into the `mcpSessionId` collection variable for subsequent calls.\n\nTools registered on the sandbox MCP server: get_runtimes, create, update_files, get_files, get_logs, exec, preview, close, list_sessions, run, preview_app (deprecated alias for run). The examples below cover the primary tools; the sandbox.run tool takes the same shape as the older preview_app so its calls are illustrated under the preview_app example blocks too.",
-      "item": [
-        {
-          "name": "MCP — initialize",
-          "request": {
-            "method": "POST",
-            "header": [
-              { "key": "Content-Type", "value": "application/json" },
-              { "key": "Accept", "value": "application/json, text/event-stream" }
-            ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 1,\n  \"method\": \"initialize\",\n  \"params\": {\n    \"protocolVersion\": \"2024-11-05\",\n    \"capabilities\": {},\n    \"clientInfo\": { \"name\": \"postman\", \"version\": \"0.0\" }\n  }\n}",
-              "options": { "raw": { "language": "json" } }
-            },
-            "url": {
-              "raw": "{{litellm}}/v1/sandbox/mcp/",
-              "host": ["{{litellm}}"],
-              "path": ["v1", "sandbox", "mcp", ""]
-            },
-            "description": "MCP handshake. Response headers include `mcp-session-id` — copy it into the `mcpSessionId` collection variable."
-          },
-          "response": []
-        },
-        {
-          "name": "MCP — tools/list",
-          "request": {
-            "method": "POST",
-            "header": [
-              { "key": "Content-Type", "value": "application/json" },
-              { "key": "Accept", "value": "application/json, text/event-stream" },
-              { "key": "Mcp-Session-Id", "value": "{{mcpSessionId}}" }
-            ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 2,\n  \"method\": \"tools/list\",\n  \"params\": {}\n}",
-              "options": { "raw": { "language": "json" } }
-            },
-            "url": {
-              "raw": "{{litellm}}/v1/sandbox/mcp/",
-              "host": ["{{litellm}}"],
-              "path": ["v1", "sandbox", "mcp", ""]
-            },
-            "description": "Enumerate available tools. sandbox-runner exposes exactly one: preview_app."
-          },
-          "response": []
-        },
-        {
-          "name": "MCP — tools/call preview_app (static)",
-          "request": {
-            "method": "POST",
-            "header": [
-              { "key": "Content-Type", "value": "application/json" },
-              { "key": "Accept", "value": "application/json, text/event-stream" },
-              { "key": "Mcp-Session-Id", "value": "{{mcpSessionId}}" }
-            ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 3,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"preview_app\",\n    \"arguments\": {\n      \"runtime\": \"static\",\n      \"files\": { \"index.html\": \"<h1>from mcp</h1>\" }\n    }\n  }\n}",
-              "options": { "raw": { "language": "json" } }
-            },
-            "url": {
-              "raw": "{{litellm}}/v1/sandbox/mcp/",
-              "host": ["{{litellm}}"],
-              "path": ["v1", "sandbox", "mcp", ""]
-            },
-            "description": "Invoke preview_app via MCP. Result body has a text-content block containing a fenced ```html code block with a self-contained HTML document ready for OpenWebUI's artifacts split-panel (`ContentRenderer.svelte` promotes it via `['html','svg'].includes(normalizedLang)`). The document uses meta-refresh + JS fallback to navigate OpenWebUI's srcdoc iframe to the running sandbox URL — no nested iframe."
-          },
-          "response": []
-        },
-        {
-          "name": "MCP — tools/call preview_app (streamlit)",
-          "request": {
-            "method": "POST",
-            "header": [
-              { "key": "Content-Type", "value": "application/json" },
-              { "key": "Accept", "value": "application/json, text/event-stream" },
-              { "key": "Mcp-Session-Id", "value": "{{mcpSessionId}}" }
-            ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 4,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"preview_app\",\n    \"arguments\": {\n      \"runtime\": \"python\",\n      \"files\": {\n        \"app.py\": \"import streamlit as st\\nst.title('mcp-spawned streamlit')\\nst.slider('n', 0, 100)\\n\"\n      },\n      \"ttl_seconds\": 600\n    }\n  }\n}",
-              "options": { "raw": { "language": "json" } }
-            },
-            "url": {
-              "raw": "{{litellm}}/v1/sandbox/mcp/",
-              "host": ["{{litellm}}"],
-              "path": ["v1", "sandbox", "mcp", ""]
-            },
-            "description": "Invoke preview_app for a Python (Streamlit) sandbox via MCP. Response text starts with `Preview ready.` followed by a `Session id: XYZ` line — the model uses that value verbatim in the next call to update the same preview."
-          },
-          "response": []
-        },
-        {
-          "name": "MCP — tools/call preview_app (follow-up update)",
-          "request": {
-            "method": "POST",
-            "header": [
-              { "key": "Content-Type", "value": "application/json" },
-              { "key": "Accept", "value": "application/json, text/event-stream" },
-              { "key": "Mcp-Session-Id", "value": "{{mcpSessionId}}" }
-            ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 5,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"preview_app\",\n    \"arguments\": {\n      \"runtime\": \"python\",\n      \"session_id\": \"{{sandboxSessionId}}\",\n      \"files\": {\n        \"app.py\": \"import streamlit as st\\nst.title('mcp-spawned streamlit — v2')\\nst.slider('n', 0, 200, 50)\\n\"\n      }\n    }\n  }\n}",
-              "options": { "raw": { "language": "json" } }
-            },
-            "url": {
-              "raw": "{{litellm}}/v1/sandbox/mcp/",
-              "host": ["{{litellm}}"],
-              "path": ["v1", "sandbox", "mcp", ""]
-            },
-            "description": "Follow-up preview_app call reusing an existing session_id. Response text starts with `Preview updated.` instead of `Preview ready.` and contains the same URL — the running Streamlit process detects the file-change and reruns automatically, no browser refresh needed. Save the sandboxSessionId variable first: run the streamlit call above, copy the Session id from its response, paste into the collection variable, then run this."
-          },
-          "response": []
-        },
-        {
-          "name": "MCP — tools/call preview_app (SYNTAX ERROR — see feedback)",
-          "request": {
-            "method": "POST",
-            "header": [
-              { "key": "Content-Type", "value": "application/json" },
-              { "key": "Accept", "value": "application/json, text/event-stream" },
-              { "key": "Mcp-Session-Id", "value": "{{mcpSessionId}}" }
-            ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 6,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"preview_app\",\n    \"arguments\": {\n      \"runtime\": \"python\",\n      \"files\": {\n        \"app.py\": \"import streamlit as st\\nst.title(\\\"x\\\"\\ndef broken(\\n    pass\\n\"\n      }\n    }\n  }\n}",
-              "options": { "raw": { "language": "json" } }
-            },
-            "url": {
-              "raw": "{{litellm}}/v1/sandbox/mcp/",
-              "host": ["{{litellm}}"],
-              "path": ["v1", "sandbox", "mcp", ""]
-            },
-            "description": "Demonstrates the static-lint feedback loop. The Python file has an unclosed `st.title(` call and an incomplete `def broken(`. Before touching Docker, the runner compiles every .py file with Python's built-in `compile()` — SyntaxError is caught in ~1 ms and returned to the model as a compiler-style diagnostic:\n\n    preview_app failed: static lint failed\n    Session id: <fresh-id>\n\n    Static lint found 1 error(s):\n      app.py:3:1: SyntaxError: invalid syntax\n        def broken(\n        ^\n\n    Fix the syntax errors above and call preview_app again with the same session_id. No container was spawned.\n\nModel reads the diagnostic, fixes the code, and calls preview_app again with the same session_id — the session-reuse path handles the retry transparently. No container was spawned so no slot was consumed."
-          },
-          "response": []
-        },
-        {
-          "name": "MCP — tools/call preview_app (RUNTIME ERROR — see feedback)",
-          "request": {
-            "method": "POST",
-            "header": [
-              { "key": "Content-Type", "value": "application/json" },
-              { "key": "Accept", "value": "application/json, text/event-stream" },
-              { "key": "Mcp-Session-Id", "value": "{{mcpSessionId}}" }
-            ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 7,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"preview_app\",\n    \"arguments\": {\n      \"runtime\": \"python\",\n      \"entrypoint\": \"python app.py\",\n      \"files\": {\n        \"app.py\": \"from flask import Flask\\nimport this_module_does_not_exist\\napp = Flask(__name__)\\napp.run(host='0.0.0.0', port=80)\\n\"\n      }\n    }\n  }\n}",
-              "options": { "raw": { "language": "json" } }
-            },
-            "url": {
-              "raw": "{{litellm}}/v1/sandbox/mcp/",
-              "host": ["{{litellm}}"],
-              "path": ["v1", "sandbox", "mcp", ""]
-            },
-            "description": "Demonstrates the runtime-error feedback loop. The Python file passes static lint (syntax is valid) but imports a non-existent module — the container spawns, fails at import time, never binds port 80, and the 30 s readiness probe expires. Before tearing the container down, the runner reads /tmp/sandbox.log and returns the traceback to the model:\n\n    preview_app failed: sandbox did not become ready within 30s\n    Session id: <fresh-id>\n\n    Container logs (last 100 lines):\n    ---\n    Traceback (most recent call last):\n      File \"/app/app.py\", line 2, in <module>\n        import this_module_does_not_exist\n    ModuleNotFoundError: No module named 'this_module_does_not_exist'\n    ---\n\n    Read the container logs above… Fix the code and call preview_app again with the same session_id.\n\nThis takes ~30 s (waiting for the readiness timeout). Static lint catches syntax errors instantly; runtime errors require the full spawn."
-          },
-          "response": []
-        },
-        {
-          "name": "MCP — tools/call get_logs",
-          "request": {
-            "method": "POST",
-            "header": [
-              { "key": "Content-Type", "value": "application/json" },
-              { "key": "Accept", "value": "application/json, text/event-stream" },
-              { "key": "Mcp-Session-Id", "value": "{{mcpSessionId}}" }
-            ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 8,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"get_logs\",\n    \"arguments\": {\n      \"session_id\": \"{{sandboxSessionId}}\",\n      \"lines\": 80\n    }\n  }\n}",
-              "options": { "raw": { "language": "json" } }
-            },
-            "url": {
-              "raw": "{{litellm}}/v1/sandbox/mcp/",
-              "host": ["{{litellm}}"],
-              "path": ["v1", "sandbox", "mcp", ""]
-            },
-            "description": "On-demand log fetch for a running sandbox. Use this when update_files / run already returned a normal ready/updated response but the user reports the app looks broken. Flask / FastAPI / Vite / Next tracebacks land here; Streamlit tracebacks now land here too thanks to the _streamlit_bootstrap.py stderr tee installed by the runner at spawn time.\n\nDo NOT call this after an update_files / run FAILURE — those already include the container logs in the tool response. Only call when the container is running but its output looks wrong.\n\nSet the sandboxSessionId collection variable to the session_id from a previous response, then run this."
-          },
-          "response": []
-        },
-        {
-          "name": "MCP — tools/call get_runtimes",
-          "request": {
-            "method": "POST",
-            "header": [
-              { "key": "Content-Type", "value": "application/json" },
-              { "key": "Accept", "value": "application/json, text/event-stream" },
-              { "key": "Mcp-Session-Id", "value": "{{mcpSessionId}}" }
-            ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 10,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"get_runtimes\",\n    \"arguments\": {}\n  }\n}",
-              "options": { "raw": { "language": "json" } }
-            },
-            "url": {
-              "raw": "{{litellm}}/v1/sandbox/mcp/",
-              "host": ["{{litellm}}"],
-              "path": ["v1", "sandbox", "mcp", ""]
-            },
-            "description": "Enumerate runtimes available on this deployment. Same payload as GET /tool/get_runtimes but delivered via the MCP protocol so it's available to any tool-calling model."
-          },
-          "response": []
-        },
-        {
-          "name": "MCP — tools/call create (warm empty python container)",
-          "request": {
-            "method": "POST",
-            "header": [
-              { "key": "Content-Type", "value": "application/json" },
-              { "key": "Accept", "value": "application/json, text/event-stream" },
-              { "key": "Mcp-Session-Id", "value": "{{mcpSessionId}}" }
-            ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 11,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"create\",\n    \"arguments\": {\n      \"runtime\": \"python\",\n      \"ttl_seconds\": 900,\n      \"env\": {\n        \"DEMO_MODE\": \"1\"\n      }\n    }\n  }\n}",
-              "options": { "raw": { "language": "json" } }
-            },
-            "url": {
-              "raw": "{{litellm}}/v1/sandbox/mcp/",
-              "host": ["{{litellm}}"],
-              "path": ["v1", "sandbox", "mcp", ""]
-            },
-            "description": "Reserve an empty warming Python container. Response text starts with `Sandbox created. Session id: <sid>` — copy that id into `sandboxSessionId` and run the update_files call below to overlay your real code. Env is stored on the job row and replayed on self-heal respawn.\n\nSee SANDBOX.md § MCP tool flow for how create / update_files / preview compose into the pipelined pattern."
-          },
-          "response": []
-        },
-        {
-          "name": "MCP — tools/call update_files (overlay)",
-          "request": {
-            "method": "POST",
-            "header": [
-              { "key": "Content-Type", "value": "application/json" },
-              { "key": "Accept", "value": "application/json, text/event-stream" },
-              { "key": "Mcp-Session-Id", "value": "{{mcpSessionId}}" }
-            ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 12,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"update_files\",\n    \"arguments\": {\n      \"session_id\": \"{{sandboxSessionId}}\",\n      \"files\": {\n        \"app.py\": \"import streamlit as st\\nst.title('overlay applied')\\n\"\n      },\n      \"recreate_if_gone\": false\n    }\n  }\n}",
-              "options": { "raw": { "language": "json" } }
-            },
-            "url": {
-              "raw": "{{litellm}}/v1/sandbox/mcp/",
-              "host": ["{{litellm}}"],
-              "path": ["v1", "sandbox", "mcp", ""]
-            },
-            "description": "Overlay files onto a running sandbox. `recreate_if_gone` defaults to false — if the container is gone, a structured 409 diagnostic is returned instead of a silent respawn. Retry with `recreate_if_gone: true` to accept the state loss (env preserved, in-container files and exec-installed packages LOST).\n\nResponse includes `app_status` from the post-update HTTP health probe so you can spot a broken reload immediately."
-          },
-          "response": []
-        },
-        {
-          "name": "MCP — tools/call get_files (list)",
-          "request": {
-            "method": "POST",
-            "header": [
-              { "key": "Content-Type", "value": "application/json" },
-              { "key": "Accept", "value": "application/json, text/event-stream" },
-              { "key": "Mcp-Session-Id", "value": "{{mcpSessionId}}" }
-            ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 13,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"get_files\",\n    \"arguments\": {\n      \"session_id\": \"{{sandboxSessionId}}\"\n    }\n  }\n}",
-              "options": { "raw": { "language": "json" } }
-            },
-            "url": {
-              "raw": "{{litellm}}/v1/sandbox/mcp/",
-              "host": ["{{litellm}}"],
-              "path": ["v1", "sandbox", "mcp", ""]
-            },
-            "description": "Directory listing (paths + sizes only) of the running sandbox's /app. Omit `paths` to get the listing; pass `paths: [...]` to get the contents inline. Binary files come back base64-encoded."
-          },
-          "response": []
-        },
-        {
-          "name": "MCP — tools/call exec (pip install)",
-          "request": {
-            "method": "POST",
-            "header": [
-              { "key": "Content-Type", "value": "application/json" },
-              { "key": "Accept", "value": "application/json, text/event-stream" },
-              { "key": "Mcp-Session-Id", "value": "{{mcpSessionId}}" }
-            ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 14,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"exec\",\n    \"arguments\": {\n      \"session_id\": \"{{sandboxSessionId}}\",\n      \"command\": \"pip install requests\",\n      \"timeout_seconds\": 60,\n      \"working_dir\": \"/app\"\n    }\n  }\n}",
-              "options": { "raw": { "language": "json" } }
-            },
-            "url": {
-              "raw": "{{litellm}}/v1/sandbox/mcp/",
-              "host": ["{{litellm}}"],
-              "path": ["v1", "sandbox", "mcp", ""]
-            },
-            "description": "Run a non-interactive shell command inside the running container. NON-INTERACTIVE — stdin is closed; anything prompting for input hangs until timeout. Output capped at 8 KB. STATE DRIFT: packages installed here do NOT survive self-heal respawn — also write to requirements.txt / package.json via update_files for persistence.\n\nSee SANDBOX.md § Runtime introspection (exec)."
-          },
-          "response": []
-        },
-        {
-          "name": "MCP — tools/call preview",
-          "request": {
-            "method": "POST",
-            "header": [
-              { "key": "Content-Type", "value": "application/json" },
-              { "key": "Accept", "value": "application/json, text/event-stream" },
-              { "key": "Mcp-Session-Id", "value": "{{mcpSessionId}}" }
-            ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 15,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"preview\",\n    \"arguments\": {\n      \"session_id\": \"{{sandboxSessionId}}\"\n    }\n  }\n}",
-              "options": { "raw": { "language": "json" } }
-            },
-            "url": {
-              "raw": "{{litellm}}/v1/sandbox/mcp/",
-              "host": ["{{litellm}}"],
-              "path": ["v1", "sandbox", "mcp", ""]
-            },
-            "description": "Hand the user the iframe artifact. Display-only — does not touch the container, does not self-heal, does not bump last_used_at. Call this ONCE per turn when the model wants to surface the current state; iterate silently with update_files between previews.\n\nResponse text ends with the fenced ```html block that OpenWebUI promotes into the artifacts panel."
-          },
-          "response": []
-        },
-        {
-          "name": "MCP — tools/call close",
-          "request": {
-            "method": "POST",
-            "header": [
-              { "key": "Content-Type", "value": "application/json" },
-              { "key": "Accept", "value": "application/json, text/event-stream" },
-              { "key": "Mcp-Session-Id", "value": "{{mcpSessionId}}" }
-            ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 16,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"close\",\n    \"arguments\": {\n      \"session_id\": \"{{sandboxSessionId}}\"\n    }\n  }\n}",
-              "options": { "raw": { "language": "json" } }
-            },
-            "url": {
-              "raw": "{{litellm}}/v1/sandbox/mcp/",
-              "host": ["{{litellm}}"],
-              "path": ["v1", "sandbox", "mcp", ""]
-            },
-            "description": "Explicit teardown. Idempotent — an unknown or already-closed session returns success with `was_running: false`. Optional in every flow (the reaper handles cleanup on TTL); call it when the user has said they're done."
-          },
-          "response": []
-        },
-        {
-          "name": "MCP — tools/call list_sessions",
-          "request": {
-            "method": "POST",
-            "header": [
-              { "key": "Content-Type", "value": "application/json" },
-              { "key": "Accept", "value": "application/json, text/event-stream" },
-              { "key": "Mcp-Session-Id", "value": "{{mcpSessionId}}" }
-            ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 17,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"list_sessions\",\n    \"arguments\": {}\n  }\n}",
-              "options": { "raw": { "language": "json" } }
-            },
-            "url": {
-              "raw": "{{litellm}}/v1/sandbox/mcp/",
-              "host": ["{{litellm}}"],
-              "path": ["v1", "sandbox", "mcp", ""]
-            },
-            "description": "Enumerate live sandboxes globally. Use this to recover a dropped session_id (chat compacted, model paraphrased away the Session id line, etc.). MULTI-TENANT CAVEAT: returns every session on the deployment, not just yours."
-          },
-          "response": []
-        },
-        {
-          "name": "MCP — tools/call run (one-shot)",
-          "request": {
-            "method": "POST",
-            "header": [
-              { "key": "Content-Type", "value": "application/json" },
-              { "key": "Accept", "value": "application/json, text/event-stream" },
-              { "key": "Mcp-Session-Id", "value": "{{mcpSessionId}}" }
-            ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 18,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"run\",\n    \"arguments\": {\n      \"runtime\": \"static\",\n      \"files\": {\n        \"index.html\": \"<h1>one-shot from run</h1>\"\n      }\n    }\n  }\n}",
-              "options": { "raw": { "language": "json" } }
-            },
-            "url": {
-              "raw": "{{litellm}}/v1/sandbox/mcp/",
-              "host": ["{{litellm}}"],
-              "path": ["v1", "sandbox", "mcp", ""]
-            },
-            "description": "One-shot convenience — create + update_files + preview in a single tool call. Recreate_if_gone is implicitly true. Response includes the same fenced ```html iframe block as `preview` so OpenWebUI promotes it directly. Prefer this when the model has everything ready at first mention; prefer the pipelined get_runtimes → create → update_files → preview flow when there's real iteration to do."
-          },
-          "response": []
-        }
-      ]
-    }
-  ]
+	"info": {
+		"name": "sandbox-runner",
+		"description": "sandbox-runner endpoints, called through the LiteLLM pass-through registered in ai/litellm/litellm_config.yaml (`pass_through_endpoints` → `/v1/sandbox` → `http://sandbox-runner:8000`, `include_subpath: true`). Every request is authenticated with a Bearer token from a LiteLLM virtual key. Set the collection variables `litellm` (e.g. http://localhost:4001) and `virtual master key` (an sk-… key issued from the LiteLLM Admin UI → Virtual Keys) — every request inherits them via collection-level auth. See ai/sandbox/ENDPOINTS.md for the full endpoint reference and ai/litellm/LITELLM.md for issuing virtual keys.\n\nSessions: the workflow is get_runtimes → create → update_files (loop with get_files / get_logs / exec) → preview → close. Or the one-shot: run. First call: omit `session_id`; server generates one and returns it. Follow-up call: pass the same `session_id` back — server writes new files into the running container's /app, returns the same URL, dev server hot-reloads. Set the `sandboxSessionId` collection variable from the first response, then run the follow-up request. See ai/sandbox/SANDBOX.md § MCP tool flow.",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+		"_postman_id": "sandbox-runner-collection"
+	},
+	"auth": {
+		"type": "bearer",
+		"bearer": [
+			{
+				"key": "token",
+				"value": "{{virtual master key}}",
+				"type": "string"
+			}
+		]
+	},
+	"variable": [
+		{
+			"key": "litellm",
+			"value": "http://localhost:4001",
+			"type": "string",
+			"description": "LiteLLM base URL. Localhost publish is 4001 (PORT_LITELLM); on ai_shared it's http://litellm:4000; behind cloudflared it's https://your-litellm-host."
+		},
+		{
+			"key": "virtual master key",
+			"value": "sk-your-litellm-virtual-key",
+			"type": "string",
+			"description": "LiteLLM virtual key (Admin UI → Virtual Keys, or /key/generate API). Scope the key to allow the /v1/sandbox pass-through — most keys created for chat models already do. Sent as `Authorization: Bearer {{virtual master key}}` by the collection-level auth."
+		},
+		{
+			"key": "sandboxId",
+			"value": "",
+			"type": "string",
+			"description": "12-char hex id returned by POST /run as `sandbox_id`. Fill in after spawning to run the /jobs/{id} + DELETE /jobs/{id} requests. This changes on every spawn — for a stable handle across turns use `sandboxSessionId`."
+		},
+		{
+			"key": "sandboxSessionId",
+			"value": "",
+			"type": "string",
+			"description": "Persistent session handle returned by POST /run as `session_id`. Paste it here and it's used by the 'update in-session' + 'delete files' + 'DELETE /session' requests below. Passing the same value back to POST /run updates the running container's files in place — same URL, dev server hot-reloads."
+		},
+		{
+			"key": "mcpSessionId",
+			"value": "",
+			"type": "string",
+			"description": "MCP transport session id — paste in the `mcp-session-id` response header value returned by the `MCP — initialize` request. Subsequent MCP calls need it. UNRELATED to `sandboxSessionId` — this one is FastMCP's HTTP-transport session cookie, not the sandbox reuse handle."
+		}
+	],
+	"item": [
+		{
+			"name": "GET /health",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "{{litellm}}/v1/sandbox/health",
+					"host": [
+						"{{litellm}}"
+					],
+					"path": [
+						"v1",
+						"sandbox",
+						"health"
+					]
+				},
+				"description": "Liveness + DB status. Returns {\"status\": \"ok\", \"db\": \"up\"} when the runner can reach sandbox-db; \"degraded\" / \"down\" otherwise."
+			},
+			"response": []
+		},
+		{
+			"name": "POST /run — static HTML",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n  \"runtime\": \"static\",\n  \"files\": {\n    \"index.html\": \"<!doctype html><html><head><title>demo</title></head><body style=\\\"font-family: system-ui; padding: 2rem\\\"><h1>hello sandbox</h1><p>Timestamp: <span id=t></span></p><script>document.getElementById('t').textContent = new Date().toISOString()</script></body></html>\"\n  }\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "{{litellm}}/v1/sandbox/run",
+					"host": [
+						"{{litellm}}"
+					],
+					"path": [
+						"v1",
+						"sandbox",
+						"run"
+					]
+				},
+				"description": "Spawn a static HTML sandbox — nginx serves the files map at /. Returns { sandbox_id, session_id, url, expires_at, reused }. The URL uses whatever SANDBOX_PROXY_URL is set to in .env — for browser-reachable iframes, that should be a public URL under the same origin as Open WebUI (e.g. https://chat.zeoenergy.com/sandboxes). Copy the returned `session_id` into the `sandboxSessionId` collection variable to run the 'update in-session' request afterwards."
+			},
+			"response": []
+		},
+		{
+			"name": "POST /run — Python (Streamlit)",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n  \"runtime\": \"python\",\n  \"files\": {\n    \"app.py\": \"import streamlit as st\\nimport numpy as np\\nimport pandas as pd\\n\\nst.title('sine wave demo')\\nn = st.slider('samples', 10, 500, 100)\\nfreq = st.slider('frequency', 1, 10, 3)\\nx = np.linspace(0, 2 * np.pi, n)\\ndf = pd.DataFrame({'x': x, 'y': np.sin(freq * x)})\\nst.line_chart(df.set_index('x'))\\n\"\n  },\n  \"ttl_seconds\": 900\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "{{litellm}}/v1/sandbox/run",
+					"host": [
+						"{{litellm}}"
+					],
+					"path": [
+						"v1",
+						"sandbox",
+						"run"
+					]
+				},
+				"description": "Spawn a Streamlit sandbox. Runtime `python` base image has streamlit, gradio, flask, fastapi, pandas, numpy, matplotlib, plotly, requests, pillow pre-installed. Add a requirements.txt to files to install additional deps via sandbox-egress (pypi allowlisted). Cold-start ~2s pre-baked; 20-90s if pip install runs."
+			},
+			"response": []
+		},
+		{
+			"name": "POST /run — Python with requirements.txt",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n  \"runtime\": \"python\",\n  \"entrypoint\": \"python gradio_app.py\",\n  \"files\": {\n    \"gradio_app.py\": \"import gradio as gr\\n\\ndef reverse(text):\\n    return text[::-1]\\n\\ngr.Interface(fn=reverse, inputs='text', outputs='text').launch(server_name='0.0.0.0', server_port=80)\\n\",\n    \"requirements.txt\": \"gradio\\n\"\n  }\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "{{litellm}}/v1/sandbox/run",
+					"host": [
+						"{{litellm}}"
+					],
+					"path": [
+						"v1",
+						"sandbox",
+						"run"
+					]
+				},
+				"description": "Illustrates the install-if-present pattern. If files contains a requirements.txt, the base image entrypoint runs `pip install -r requirements.txt` before executing the command. pip goes through HTTP_PROXY=sandbox-egress:8888 and hits the pypi.org / files.pythonhosted.org allowlist."
+			},
+			"response": []
+		},
+		{
+			"name": "POST /run — Node (Express)",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n  \"runtime\": \"node\",\n  \"entrypoint\": \"node server.js\",\n  \"files\": {\n    \"server.js\": \"const express = require('express');\\nconst app = express();\\napp.get('/', (_, res) => res.send('<h1>hello from express</h1>'));\\napp.listen(80, '0.0.0.0', () => console.log('listening on 80'));\\n\"\n  }\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "{{litellm}}/v1/sandbox/run",
+					"host": [
+						"{{litellm}}"
+					],
+					"path": [
+						"v1",
+						"sandbox",
+						"run"
+					]
+				},
+				"description": "Spawn a Node sandbox. Base image has serve, vite, react, react-dom, express, next installed globally so `require('express')` works without a package.json. Add a package.json to files to trigger `npm install` on boot."
+			},
+			"response": []
+		},
+		{
+			"name": "POST /run — Node (Vite + React)",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n  \"runtime\": \"node\",\n  \"entrypoint\": \"npx --yes vite --host 0.0.0.0 --port 80\",\n  \"files\": {\n    \"package.json\": \"{\\\"name\\\":\\\"demo\\\",\\\"type\\\":\\\"module\\\",\\\"scripts\\\":{\\\"dev\\\":\\\"vite\\\"}}\",\n    \"index.html\": \"<!doctype html><html><head><title>vite demo</title></head><body><div id=root></div><script type=module src=/main.jsx></script></body></html>\",\n    \"main.jsx\": \"import React, { useState } from 'react';\\nimport ReactDOM from 'react-dom/client';\\n\\nfunction Counter() {\\n  const [n, setN] = useState(0);\\n  return (<div style={{padding: '2rem', fontFamily: 'system-ui'}}>\\n    <h1>count: {n}</h1>\\n    <button onClick={() => setN(n + 1)}>+</button>\\n    <button onClick={() => setN(0)}>reset</button>\\n  </div>);\\n}\\n\\nReactDOM.createRoot(document.getElementById('root')).render(<Counter />);\\n\"\n  }\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "{{litellm}}/v1/sandbox/run",
+					"host": [
+						"{{litellm}}"
+					],
+					"path": [
+						"v1",
+						"sandbox",
+						"run"
+					]
+				},
+				"description": "Multi-file Vite + React counter. Vite HMR uses WebSockets — sandbox-proxy (Caddy) forwards them by default, so buttons work end-to-end when iframed."
+			},
+			"response": []
+		},
+		{
+			"name": "POST /run — update in-session (hot reload)",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n  \"runtime\": \"static\",\n  \"session_id\": \"{{sandboxSessionId}}\",\n  \"files\": {\n    \"index.html\": \"<!doctype html><html><body style=\\\"font-family: system-ui; padding: 2rem\\\"><h1>updated content</h1><p>this replaced the initial file — same URL, no respawn.</p></body></html>\"\n  }\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "{{litellm}}/v1/sandbox/run",
+					"host": [
+						"{{litellm}}"
+					],
+					"path": [
+						"v1",
+						"sandbox",
+						"run"
+					]
+				},
+				"description": "Update a preview in place. Pass the `session_id` from a previous /run response (via the sandboxSessionId collection variable) and the file(s) that changed. The runner writes them into the running container's /app via docker cp — no respawn. Response has `reused: true` and the SAME sandbox_id + url as the initial spawn. The dev server inside the sandbox reloads on file change: nginx serves the new file on next request, Streamlit auto-reruns, Vite HMR fires without a browser refresh. If the container was already reaped when this call arrives (idle-TTL or manual rm), the runner self-heals — same session_id, new sandbox_id, new url — so callers don't have to distinguish the two cases.\n\n`files` is treated as an overlay: paths listed here overwrite the running container's copies; unlisted files stay put. Save tokens by not resending unchanged files."
+			},
+			"response": []
+		},
+		{
+			"name": "POST /run — delete files in-session",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n  \"runtime\": \"static\",\n  \"session_id\": \"{{sandboxSessionId}}\",\n  \"files\": {},\n  \"deletes\": [\"old-page.html\"]\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "{{litellm}}/v1/sandbox/run",
+					"host": [
+						"{{litellm}}"
+					],
+					"path": [
+						"v1",
+						"sandbox",
+						"run"
+					]
+				},
+				"description": "Explicitly remove file(s) from a running sandbox. Use on follow-up calls when the model renames or drops a file — otherwise stale files linger, because overlay semantics on `files` never delete. Paths are relative to /app; absolute paths and '..' return 400. Combine with a `files` map to atomically add + remove in one call.\n\nIgnored on the first call (no session_id) — the container starts fresh from `files` alone, there's nothing to delete."
+			},
+			"response": []
+		},
+		{
+			"name": "POST /create — warm empty container",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n  \"runtime\": \"python\",\n  \"ttl_seconds\": 900,\n  \"env\": {\n    \"DEMO_MODE\": \"1\"\n  }\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "{{litellm}}/v1/sandbox/create",
+					"host": [
+						"{{litellm}}"
+					],
+					"path": [
+						"v1",
+						"sandbox",
+						"create"
+					]
+				},
+				"description": "Reserve an empty warming container for the chosen runtime. Backs the sandbox.create MCP tool. Response is the same shape as POST /run — save `session_id` into the `sandboxSessionId` collection variable, then call POST /session/{id}/files with real code.\n\n`env` is stored on the job row and replayed on self-heal respawn. Reserved keys (HTTP_PROXY, PYTHONUNBUFFERED, TERM, etc.) are rejected — those are runner-controlled invariants.\n\nSee ENDPOINTS.md § POST /create."
+			},
+			"response": []
+		},
+		{
+			"name": "GET /sessions — list live sandboxes",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "{{litellm}}/v1/sandbox/sessions",
+					"host": [
+						"{{litellm}}"
+					],
+					"path": [
+						"v1",
+						"sandbox",
+						"sessions"
+					]
+				},
+				"description": "Enumerate every currently-running sandbox globally. Backs sandbox.list_sessions. No per-user filtering — returns everything on the deployment. Response: {count, sessions:[…]}. See ENDPOINTS.md § GET /sessions."
+			},
+			"response": []
+		},
+		{
+			"name": "POST /session/{sandboxSessionId}/files — update files (opt-in self-heal)",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n  \"files\": {\n    \"app.py\": \"import streamlit as st\\nst.title('updated in place')\\n\"\n  },\n  \"deletes\": [],\n  \"recreate_if_gone\": false\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "{{litellm}}/v1/sandbox/session/:sandboxSessionId/files",
+					"host": [
+						"{{litellm}}"
+					],
+					"path": [
+						"v1",
+						"sandbox",
+						"session",
+						":sandboxSessionId",
+						"files"
+					],
+					"variable": [
+						{
+							"key": "sandboxSessionId",
+							"value": "",
+							"description": "Persistent session handle returned by POST /run or POST /create."
+						}
+					]
+				},
+				"description": "Overlay files into a live sandbox. Backs sandbox.update_files. Unlike POST /run, `recreate_if_gone` defaults to FALSE — if the container is gone, the endpoint returns a structured 409 telling you to opt in explicitly. Set to true to accept state loss (env preserved, in-container files and exec-installed packages LOST).\n\n`files` values are UTF-8 str or {encoding:'base64', content:'...'} for binary. Per-file cap SANDBOX_MAX_FILE_BYTES; total SANDBOX_MAX_PAYLOAD_BYTES.\n\nResponse: same shape as POST /run — includes `app_status` from the post-update health probe. See ENDPOINTS.md § POST /session/{session_id}/files."
+			},
+			"response": []
+		},
+		{
+			"name": "GET /session/{sandboxSessionId}/files — list files",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "{{litellm}}/v1/sandbox/session/:sandboxSessionId/files",
+					"host": [
+						"{{litellm}}"
+					],
+					"path": [
+						"v1",
+						"sandbox",
+						"session",
+						":sandboxSessionId",
+						"files"
+					],
+					"variable": [
+						{
+							"key": "sandboxSessionId",
+							"value": "",
+							"description": "Persistent session handle."
+						}
+					]
+				},
+				"description": "Directory listing of the running sandbox's /app — paths + sizes only, no contents. Backs sandbox.get_files when the model omits `paths`. See ENDPOINTS.md § GET /session/{session_id}/files."
+			},
+			"response": []
+		},
+		{
+			"name": "GET /session/{sandboxSessionId}/files — read specific paths",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "{{litellm}}/v1/sandbox/session/:sandboxSessionId/files?paths=app.py,requirements.txt&max_bytes_per_file=8192",
+					"host": [
+						"{{litellm}}"
+					],
+					"path": [
+						"v1",
+						"sandbox",
+						"session",
+						":sandboxSessionId",
+						"files"
+					],
+					"query": [
+						{
+							"key": "paths",
+							"value": "app.py,requirements.txt",
+							"description": "Comma-separated relative paths under /app."
+						},
+						{
+							"key": "max_bytes_per_file",
+							"value": "8192",
+							"description": "Truncate each returned file to this many bytes. Hard cap 65536."
+						}
+					],
+					"variable": [
+						{
+							"key": "sandboxSessionId",
+							"value": "",
+							"description": "Persistent session handle."
+						}
+					]
+				},
+				"description": "Read files back from /app. Binary payloads come back base64-encoded — same shape you can round-trip via POST /session/{id}/files. Missing paths get an `error: 'not found'` entry rather than raising. See ENDPOINTS.md § GET /session/{session_id}/files."
+			},
+			"response": []
+		},
+		{
+			"name": "POST /session/{sandboxSessionId}/exec — pip install",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n  \"command\": \"pip install requests\",\n  \"timeout_seconds\": 60,\n  \"working_dir\": \"/app\"\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "{{litellm}}/v1/sandbox/session/:sandboxSessionId/exec",
+					"host": [
+						"{{litellm}}"
+					],
+					"path": [
+						"v1",
+						"sandbox",
+						"session",
+						":sandboxSessionId",
+						"exec"
+					],
+					"variable": [
+						{
+							"key": "sandboxSessionId",
+							"value": "",
+							"description": "Persistent session handle."
+						}
+					]
+				},
+				"description": "Run a non-interactive shell command inside the running container. Backs sandbox.exec.\n\nNON-INTERACTIVE: stdin closed. Timeout default 30 s, hard cap 120 s. Output capped at 8 KB (last 8 KB returned when truncated). Runs as 1000:1000.\n\nSTATE DRIFT: packages installed via exec do NOT survive a self-heal respawn — env is preserved, files/packages are not. Prefer writing dependencies into requirements.txt / package.json via POST /session/{id}/files for persistence.\n\nEGRESS: `pip install` still routes through sandbox-egress (allowlist). Non-allowlisted registries return 403 from the proxy.\n\nSee ENDPOINTS.md § POST /session/{session_id}/exec."
+			},
+			"response": []
+		},
+		{
+			"name": "POST /session/{sandboxSessionId}/patch — strict line-range edits",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n  \"patches\": [\n    {\n      \"path\": \"app.py\",\n      \"start_line\": 15,\n      \"end_line\": 18,\n      \"expected\": \"def foo(x):\\n    return x + 1\",\n      \"replacement\": \"def foo(x, y):\\n    return x + y\",\n      \"note\": \"add y arg\"\n    }\n  ],\n  \"recreate_if_gone\": false\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "{{litellm}}/v1/sandbox/session/:sandboxSessionId/patch",
+					"host": [
+						"{{litellm}}"
+					],
+					"path": [
+						"v1",
+						"sandbox",
+						"session",
+						":sandboxSessionId",
+						"patch"
+					],
+					"variable": [
+						{
+							"key": "sandboxSessionId",
+							"value": "",
+							"description": "Persistent session handle from create / run / update_files."
+						}
+					]
+				},
+				"description": "Strict line-range edits inside a running sandbox. All-or-nothing.\n\nEach patch specifies `path` (relative under /app), `start_line` / `end_line` (1-indexed inclusive), `expected` (byte-for-byte current content of that range, joined with \\n), and `replacement`. The runner validates every patch in a dry-run pass first (path safety → file exists → UTF-8 → in-bounds range → byte-for-byte `expected` match → no per-file overlap); only if every patch passes does the apply pass run.\n\nByte-for-byte match is strict: no whitespace or trailing-newline lenience. On mismatch the response is 409 with the ACTUAL current content in `detail.actual` so the caller can retry inline. `recreate_if_gone` is accepted but has NO effect — a dead container returns 409 regardless, because a fresh container has no file to anchor on. Call POST /session/{id}/files first (with recreate_if_gone=true) if you need to establish state.\n\nPost-write behavior mirrors POST /session/{id}/files: 500 ms settle + HTTP health probe against the runtime's readiness_probe_path on port 80.\n\nPayload limits: each patch's `expected` + `replacement` UTF-8 bytes count toward SANDBOX_MAX_FILE_BYTES per patch, sum across all patches counts toward SANDBOX_MAX_PAYLOAD_BYTES. Rejected at pydantic validation.\n\nBacks sandbox.patch_files.\n\nSee ENDPOINTS.md § POST /session/{session_id}/patch and SANDBOX.md § Targeted edits (patch_files)."
+			},
+			"response": []
+		},
+		{
+			"name": "DELETE /session/{sandboxSessionId}",
+			"request": {
+				"method": "DELETE",
+				"header": [],
+				"url": {
+					"raw": "{{litellm}}/v1/sandbox/session/:sandboxSessionId",
+					"host": [
+						"{{litellm}}"
+					],
+					"path": [
+						"v1",
+						"sandbox",
+						"session",
+						":sandboxSessionId"
+					],
+					"variable": [
+						{
+							"key": "sandboxSessionId",
+							"value": "",
+							"description": "Persistent session handle returned by POST /run as session_id."
+						}
+					]
+				},
+				"description": "Explicitly tear down the running sandbox for a session. Backs sandbox.close. Idempotent — returns 204 whether or not the session existed. Distinct from DELETE /jobs/{sandbox_id}: /jobs targets a specific spawn event by its 12-char internal id, while /session targets whatever's currently running under the persistent session handle (may have been respawned via self-heal since the model last saw it).\n\nErrors: 400 if session_id fails `^[A-Za-z0-9_-]{1,64}$`, 500 if the runner isn't initialized."
+			},
+			"response": []
+		},
+		{
+			"name": "GET /session/{sandboxSessionId}/download",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "{{litellm}}/v1/sandbox/session/:sandboxSessionId/download",
+					"host": [
+						"{{litellm}}"
+					],
+					"path": [
+						"v1",
+						"sandbox",
+						"session",
+						":sandboxSessionId",
+						"download"
+					],
+					"variable": [
+						{
+							"key": "sandboxSessionId",
+							"value": "",
+							"description": "Persistent session handle returned by POST /run as session_id."
+						}
+					]
+				},
+				"description": "Stream the running sandbox's /app back as a tar archive (Content-Type: application/x-tar, Content-Disposition: attachment). Docker daemon does the packing (container.get_archive) so nothing buffers in the runner. Session-based, so this URL keeps working across self-heal spawns — resolves session_id → current container at request time.\n\nAlso exposed publicly via the sandbox-proxy Caddy route at ${SANDBOX_PROXY_URL}/download/{sandboxSessionId} (e.g. https://chat.zeoenergy.com/sandboxes/download/…) so browsers can download the archive with the same oauth2-proxy auth as the preview iframe. preview_app's response text includes this URL on the 'Download source:' line — models share it verbatim when a user asks to save the code.\n\nErrors: 400 if session_id fails `^[A-Za-z0-9_-]{1,64}$`, 404 if there's no running sandbox for this session (never existed, or reaped without self-heal).\n\nPostman note: click 'Send and Download' to save the response as a file. The tar root is `app/`, so `tar -xf sandbox-*.tar` extracts to `./app/`."
+			},
+			"response": []
+		},
+		{
+			"name": "GET /session/{sandboxSessionId}/logs",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "{{litellm}}/v1/sandbox/session/:sandboxSessionId/logs?lines=100",
+					"host": [
+						"{{litellm}}"
+					],
+					"path": [
+						"v1",
+						"sandbox",
+						"session",
+						":sandboxSessionId",
+						"logs"
+					],
+					"query": [
+						{
+							"key": "lines",
+							"value": "100",
+							"description": "Trailing lines to return. Default 100, clamped 1..1000."
+						}
+					],
+					"variable": [
+						{
+							"key": "sandboxSessionId",
+							"value": "",
+							"description": "Persistent session handle returned by POST /run as session_id."
+						}
+					]
+				},
+				"description": "Return the last N lines of the running sandbox's stdout+stderr. Session-based so this follows self-heal.\n\nHow the logs get there: the runner's two-phase spawn runs the user command via `docker exec` (detached), not as PID 1 (`sleep infinity` is PID 1). container.logs() only sees PID 1's streams, so exec output isn't captured there. The spawn redirects the user command to /tmp/sandbox.log (128 MB tmpfs), and this endpoint runs `tail -n N` inside the container to read it back.\n\nWhich runtimes surface useful output here: Flask (`app.run`), FastAPI + uvicorn, Express, Vite, Next, and any bare `python app.py` all print tracebacks to stdout. STREAMLIT is the exception — it catches user exceptions and renders them in the browser rather than printing to stdout, so this endpoint shows only the 'You can now view your Streamlit app…' banner. For Streamlit apps, inspect the rendered HTML from the sandbox URL to see error text.\n\nResponse (200): {session_id, sandbox_id, lines_requested, logs}. Empty `logs` string means either the container just spawned and hasn't printed anything yet, or the app writes to a file — NOT a failure signal.\n\nErrors: 400 if session_id fails the regex, 404 if there's no running sandbox for this session."
+			},
+			"response": []
+		},
+		{
+			"name": "GET /jobs",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "{{litellm}}/v1/sandbox/jobs",
+					"host": [
+						"{{litellm}}"
+					],
+					"path": [
+						"v1",
+						"sandbox",
+						"jobs"
+					]
+				},
+				"description": "List every sandbox in the registry (running + terminal). Fixed limit of 20 in PostgresRegistry.list_all(). Ordered by updated_at DESC. Returns JobsListResponse — see ENDPOINTS.md for the JobBase shape. `metadata->>'session_id'` on each job shows the persistent handle a sandbox was spawned under; multiple 'running' rows can share a session_id only briefly (during self-heal), the reaper normalizes."
+			},
+			"response": []
+		},
+		{
+			"name": "GET /jobs/{sandboxId}",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "{{litellm}}/v1/sandbox/jobs/:sandboxId",
+					"host": [
+						"{{litellm}}"
+					],
+					"path": [
+						"v1",
+						"sandbox",
+						"jobs",
+						":sandboxId"
+					],
+					"variable": [
+						{
+							"key": "sandboxId",
+							"value": "",
+							"description": "12-char hex id returned by POST /run as sandbox_id."
+						}
+					]
+				},
+				"description": "Snapshot of one sandbox. 404 if unknown. Set the sandboxId collection variable to the id returned by POST /run first."
+			},
+			"response": []
+		},
+		{
+			"name": "GET /jobs/{sandboxId}/download",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "{{litellm}}/v1/sandbox/jobs/:sandboxId/download",
+					"host": [
+						"{{litellm}}"
+					],
+					"path": [
+						"v1",
+						"sandbox",
+						"jobs",
+						":sandboxId",
+						"download"
+					],
+					"variable": [
+						{
+							"key": "sandboxId",
+							"value": "",
+							"description": "12-char hex id returned by POST /run as sandbox_id."
+						}
+					]
+				},
+				"description": "Direct download by internal sandbox_id — bypasses session resolution. Useful for operators who want to grab the archive from a SPECIFIC spawn event even if the session self-healed to a different container since. Same tar shape as the session variant. Prefer /session/{id}/download for end-user download links because that URL keeps working across self-heal.\n\nErrors: 404 if no sandbox with that id, 409 if the sandbox exists in the registry but never reached the `running` phase (no container to export)."
+			},
+			"response": []
+		},
+		{
+			"name": "GET /jobs/{sandboxId}/logs",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "{{litellm}}/v1/sandbox/jobs/:sandboxId/logs?lines=100",
+					"host": [
+						"{{litellm}}"
+					],
+					"path": [
+						"v1",
+						"sandbox",
+						"jobs",
+						":sandboxId",
+						"logs"
+					],
+					"query": [
+						{
+							"key": "lines",
+							"value": "100",
+							"description": "Trailing lines. Default 100, clamped 1..1000."
+						}
+					],
+					"variable": [
+						{
+							"key": "sandboxId",
+							"value": "",
+							"description": "12-char hex id returned by POST /run as sandbox_id."
+						}
+					]
+				},
+				"description": "Direct log fetch by internal sandbox_id. Useful when the session self-healed to a new container but you want the previous container's output. Same underlying mechanism as /session/{id}/logs (tails /tmp/sandbox.log inside the container). Response body: {sandbox_id, lines_requested, logs}.\n\nErrors: 404 if no sandbox with that id, 409 if the sandbox never reached the `running` phase — no container to read logs from."
+			},
+			"response": []
+		},
+		{
+			"name": "DELETE /jobs/{sandboxId}",
+			"request": {
+				"method": "DELETE",
+				"header": [],
+				"url": {
+					"raw": "{{litellm}}/v1/sandbox/jobs/:sandboxId",
+					"host": [
+						"{{litellm}}"
+					],
+					"path": [
+						"v1",
+						"sandbox",
+						"jobs",
+						":sandboxId"
+					],
+					"variable": [
+						{
+							"key": "sandboxId",
+							"value": "",
+							"description": "12-char hex id returned by POST /run as sandbox_id."
+						}
+					]
+				},
+				"description": "Tear a sandbox down early. Stops the container, removes it, deletes the row, releases the concurrency slot. Returns 204 no body. 404 if the sandbox id is unknown."
+			},
+			"response": []
+		},
+		{
+			"name": "GET /tool/openapi.json",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "{{litellm}}/v1/sandbox/tool/openapi.json",
+					"host": [
+						"{{litellm}}"
+					],
+					"path": [
+						"v1",
+						"sandbox",
+						"tool",
+						"openapi.json"
+					]
+				},
+				"description": "OpenAPI schema for the OpenWebUI Tool Server integration. Note: OpenWebUI ITSELF should point Admin Panel → Settings → Tools → Add Connection directly at http://sandbox-runner:8000/tool (Docker service DNS on ai_shared), NOT at the LiteLLM pass-through — OpenWebUI needs to see the raw HTMLResponse headers and CORS behavior. Use this Postman request only for schema inspection."
+			},
+			"response": []
+		},
+		{
+			"name": "POST /tool/run",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n  \"runtime\": \"static\",\n  \"files\": {\n    \"index.html\": \"<h1>hello from tool server</h1>\"\n  }\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "{{litellm}}/v1/sandbox/tool/run",
+					"host": [
+						"{{litellm}}"
+					],
+					"path": [
+						"v1",
+						"sandbox",
+						"tool",
+						"run"
+					]
+				},
+				"description": "OpenWebUI Rich-UI integration (primary Tool Server endpoint). Returns HTMLResponse with `Content-Disposition: inline` — OpenWebUI renders the response body (a self-contained HTML page navigating its own iframe to sandbox-proxy) as an embedded artifact under the tool call indicator, no model round-trip needed. Response Content-Type is text/html (not JSON). OpenWebUI should register this URL directly on sandbox-runner:8000, not via LiteLLM, so it can see the raw response headers.\n\nAccepts the same fields as POST /run (recreate_if_gone implicitly true). Pass session_id on a follow-up call to update the running container in place. See ENDPOINTS.md § POST /tool/run."
+			},
+			"response": []
+		},
+		{
+			"name": "POST /tool/preview_app (DEPRECATED alias for /tool/run)",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n  \"runtime\": \"static\",\n  \"files\": {\n    \"index.html\": \"<h1>hello from deprecated alias</h1>\"\n  }\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "{{litellm}}/v1/sandbox/tool/preview_app",
+					"host": [
+						"{{litellm}}"
+					],
+					"path": [
+						"v1",
+						"sandbox",
+						"tool",
+						"preview_app"
+					]
+				},
+				"description": "DEPRECATED alias for POST /tool/run. Kept for one release cycle so existing OpenWebUI Tool Server registrations don't break mid-rollout. Behaves identically to /tool/run. Migrate to /tool/run at your convenience."
+			},
+			"response": []
+		},
+		{
+			"name": "GET /tool/get_runtimes",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "{{litellm}}/v1/sandbox/tool/get_runtimes",
+					"host": [
+						"{{litellm}}"
+					],
+					"path": [
+						"v1",
+						"sandbox",
+						"tool",
+						"get_runtimes"
+					]
+				},
+				"description": "Tool Server variant of sandbox.get_runtimes. Returns the same JSON payload as the MCP tool — a list of runtime metadata objects. `GET /tool/list_runtimes` is a deprecated alias with identical behavior."
+			},
+			"response": []
+		},
+		{
+			"name": "MCP",
+			"description": "FastMCP JSON-RPC over HTTP forwarded through the LiteLLM pass-through. Note that LiteLLM ALSO advertises the sandbox as an MCP server via `mcp_servers.sandbox` in litellm_config.yaml — models see the tool through that path, not this one. The Postman requests below are useful for debugging the transport directly. Every MCP request MUST use trailing-slash (POST /mcp/), MUST send `Accept: application/json, text/event-stream`, and MUST start with an `initialize` call — copy the `mcp-session-id` response header into the `mcpSessionId` collection variable for subsequent calls.\n\nTools registered on the sandbox MCP server: get_runtimes, create, update_files, get_files, get_logs, exec, preview, close, list_sessions, run, preview_app (deprecated alias for run). The examples below cover the primary tools; the sandbox.run tool takes the same shape as the older preview_app so its calls are illustrated under the preview_app example blocks too.",
+			"item": [
+				{
+					"name": "MCP — initialize",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "Accept",
+								"value": "application/json, text/event-stream"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 1,\n  \"method\": \"initialize\",\n  \"params\": {\n    \"protocolVersion\": \"2024-11-05\",\n    \"capabilities\": {},\n    \"clientInfo\": { \"name\": \"postman\", \"version\": \"0.0\" }\n  }\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{litellm}}/v1/sandbox/mcp/",
+							"host": [
+								"{{litellm}}"
+							],
+							"path": [
+								"v1",
+								"sandbox",
+								"mcp",
+								""
+							]
+						},
+						"description": "MCP handshake. Response headers include `mcp-session-id` — copy it into the `mcpSessionId` collection variable."
+					},
+					"response": []
+				},
+				{
+					"name": "MCP — tools/list",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "Accept",
+								"value": "application/json, text/event-stream"
+							},
+							{
+								"key": "Mcp-Session-Id",
+								"value": "{{mcpSessionId}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 2,\n  \"method\": \"tools/list\",\n  \"params\": {}\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{litellm}}/v1/sandbox/mcp/",
+							"host": [
+								"{{litellm}}"
+							],
+							"path": [
+								"v1",
+								"sandbox",
+								"mcp",
+								""
+							]
+						},
+						"description": "Enumerate available tools. sandbox-runner exposes exactly one: preview_app."
+					},
+					"response": []
+				},
+				{
+					"name": "MCP — tools/call preview_app (static)",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "Accept",
+								"value": "application/json, text/event-stream"
+							},
+							{
+								"key": "Mcp-Session-Id",
+								"value": "{{mcpSessionId}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 3,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"preview_app\",\n    \"arguments\": {\n      \"runtime\": \"static\",\n      \"files\": { \"index.html\": \"<h1>from mcp</h1>\" }\n    }\n  }\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{litellm}}/v1/sandbox/mcp/",
+							"host": [
+								"{{litellm}}"
+							],
+							"path": [
+								"v1",
+								"sandbox",
+								"mcp",
+								""
+							]
+						},
+						"description": "Invoke preview_app via MCP. Result body has a text-content block containing a fenced ```html code block with a self-contained HTML document ready for OpenWebUI's artifacts split-panel (`ContentRenderer.svelte` promotes it via `['html','svg'].includes(normalizedLang)`). The document uses meta-refresh + JS fallback to navigate OpenWebUI's srcdoc iframe to the running sandbox URL — no nested iframe."
+					},
+					"response": []
+				},
+				{
+					"name": "MCP — tools/call preview_app (streamlit)",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "Accept",
+								"value": "application/json, text/event-stream"
+							},
+							{
+								"key": "Mcp-Session-Id",
+								"value": "{{mcpSessionId}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 4,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"preview_app\",\n    \"arguments\": {\n      \"runtime\": \"python\",\n      \"files\": {\n        \"app.py\": \"import streamlit as st\\nst.title('mcp-spawned streamlit')\\nst.slider('n', 0, 100)\\n\"\n      },\n      \"ttl_seconds\": 600\n    }\n  }\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{litellm}}/v1/sandbox/mcp/",
+							"host": [
+								"{{litellm}}"
+							],
+							"path": [
+								"v1",
+								"sandbox",
+								"mcp",
+								""
+							]
+						},
+						"description": "Invoke preview_app for a Python (Streamlit) sandbox via MCP. Response text starts with `Preview ready.` followed by a `Session id: XYZ` line — the model uses that value verbatim in the next call to update the same preview."
+					},
+					"response": []
+				},
+				{
+					"name": "MCP — tools/call preview_app (follow-up update)",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "Accept",
+								"value": "application/json, text/event-stream"
+							},
+							{
+								"key": "Mcp-Session-Id",
+								"value": "{{mcpSessionId}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 5,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"preview_app\",\n    \"arguments\": {\n      \"runtime\": \"python\",\n      \"session_id\": \"{{sandboxSessionId}}\",\n      \"files\": {\n        \"app.py\": \"import streamlit as st\\nst.title('mcp-spawned streamlit — v2')\\nst.slider('n', 0, 200, 50)\\n\"\n      }\n    }\n  }\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{litellm}}/v1/sandbox/mcp/",
+							"host": [
+								"{{litellm}}"
+							],
+							"path": [
+								"v1",
+								"sandbox",
+								"mcp",
+								""
+							]
+						},
+						"description": "Follow-up preview_app call reusing an existing session_id. Response text starts with `Preview updated.` instead of `Preview ready.` and contains the same URL — the running Streamlit process detects the file-change and reruns automatically, no browser refresh needed. Save the sandboxSessionId variable first: run the streamlit call above, copy the Session id from its response, paste into the collection variable, then run this."
+					},
+					"response": []
+				},
+				{
+					"name": "MCP — tools/call preview_app (SYNTAX ERROR — see feedback)",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "Accept",
+								"value": "application/json, text/event-stream"
+							},
+							{
+								"key": "Mcp-Session-Id",
+								"value": "{{mcpSessionId}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 6,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"preview_app\",\n    \"arguments\": {\n      \"runtime\": \"python\",\n      \"files\": {\n        \"app.py\": \"import streamlit as st\\nst.title(\\\"x\\\"\\ndef broken(\\n    pass\\n\"\n      }\n    }\n  }\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{litellm}}/v1/sandbox/mcp/",
+							"host": [
+								"{{litellm}}"
+							],
+							"path": [
+								"v1",
+								"sandbox",
+								"mcp",
+								""
+							]
+						},
+						"description": "Demonstrates the static-lint feedback loop. The Python file has an unclosed `st.title(` call and an incomplete `def broken(`. Before touching Docker, the runner compiles every .py file with Python's built-in `compile()` — SyntaxError is caught in ~1 ms and returned to the model as a compiler-style diagnostic:\n\n    preview_app failed: static lint failed\n    Session id: <fresh-id>\n\n    Static lint found 1 error(s):\n      app.py:3:1: SyntaxError: invalid syntax\n        def broken(\n        ^\n\n    Fix the syntax errors above and call preview_app again with the same session_id. No container was spawned.\n\nModel reads the diagnostic, fixes the code, and calls preview_app again with the same session_id — the session-reuse path handles the retry transparently. No container was spawned so no slot was consumed."
+					},
+					"response": []
+				},
+				{
+					"name": "MCP — tools/call preview_app (RUNTIME ERROR — see feedback)",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "Accept",
+								"value": "application/json, text/event-stream"
+							},
+							{
+								"key": "Mcp-Session-Id",
+								"value": "{{mcpSessionId}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 7,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"preview_app\",\n    \"arguments\": {\n      \"runtime\": \"python\",\n      \"entrypoint\": \"python app.py\",\n      \"files\": {\n        \"app.py\": \"from flask import Flask\\nimport this_module_does_not_exist\\napp = Flask(__name__)\\napp.run(host='0.0.0.0', port=80)\\n\"\n      }\n    }\n  }\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{litellm}}/v1/sandbox/mcp/",
+							"host": [
+								"{{litellm}}"
+							],
+							"path": [
+								"v1",
+								"sandbox",
+								"mcp",
+								""
+							]
+						},
+						"description": "Demonstrates the runtime-error feedback loop. The Python file passes static lint (syntax is valid) but imports a non-existent module — the container spawns, fails at import time, never binds port 80, and the 30 s readiness probe expires. Before tearing the container down, the runner reads /tmp/sandbox.log and returns the traceback to the model:\n\n    preview_app failed: sandbox did not become ready within 30s\n    Session id: <fresh-id>\n\n    Container logs (last 100 lines):\n    ---\n    Traceback (most recent call last):\n      File \"/app/app.py\", line 2, in <module>\n        import this_module_does_not_exist\n    ModuleNotFoundError: No module named 'this_module_does_not_exist'\n    ---\n\n    Read the container logs above… Fix the code and call preview_app again with the same session_id.\n\nThis takes ~30 s (waiting for the readiness timeout). Static lint catches syntax errors instantly; runtime errors require the full spawn."
+					},
+					"response": []
+				},
+				{
+					"name": "MCP — tools/call get_logs",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "Accept",
+								"value": "application/json, text/event-stream"
+							},
+							{
+								"key": "Mcp-Session-Id",
+								"value": "{{mcpSessionId}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 8,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"get_logs\",\n    \"arguments\": {\n      \"session_id\": \"{{sandboxSessionId}}\",\n      \"lines\": 80\n    }\n  }\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{litellm}}/v1/sandbox/mcp/",
+							"host": [
+								"{{litellm}}"
+							],
+							"path": [
+								"v1",
+								"sandbox",
+								"mcp",
+								""
+							]
+						},
+						"description": "On-demand log fetch for a running sandbox. Use this when update_files / run already returned a normal ready/updated response but the user reports the app looks broken. Flask / FastAPI / Vite / Next tracebacks land here; Streamlit tracebacks now land here too thanks to the _streamlit_bootstrap.py stderr tee installed by the runner at spawn time.\n\nDo NOT call this after an update_files / run FAILURE — those already include the container logs in the tool response. Only call when the container is running but its output looks wrong.\n\nSet the sandboxSessionId collection variable to the session_id from a previous response, then run this."
+					},
+					"response": []
+				},
+				{
+					"name": "MCP — tools/call get_runtimes",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "Accept",
+								"value": "application/json, text/event-stream"
+							},
+							{
+								"key": "Mcp-Session-Id",
+								"value": "{{mcpSessionId}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 10,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"get_runtimes\",\n    \"arguments\": {}\n  }\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{litellm}}/v1/sandbox/mcp/",
+							"host": [
+								"{{litellm}}"
+							],
+							"path": [
+								"v1",
+								"sandbox",
+								"mcp",
+								""
+							]
+						},
+						"description": "Enumerate runtimes available on this deployment. Same payload as GET /tool/get_runtimes but delivered via the MCP protocol so it's available to any tool-calling model."
+					},
+					"response": []
+				},
+				{
+					"name": "MCP — tools/call create (warm empty python container)",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "Accept",
+								"value": "application/json, text/event-stream"
+							},
+							{
+								"key": "Mcp-Session-Id",
+								"value": "{{mcpSessionId}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 11,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"create\",\n    \"arguments\": {\n      \"runtime\": \"python\",\n      \"ttl_seconds\": 900,\n      \"env\": {\n        \"DEMO_MODE\": \"1\"\n      }\n    }\n  }\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{litellm}}/v1/sandbox/mcp/",
+							"host": [
+								"{{litellm}}"
+							],
+							"path": [
+								"v1",
+								"sandbox",
+								"mcp",
+								""
+							]
+						},
+						"description": "Reserve an empty warming Python container. Response text starts with `Sandbox created. Session id: <sid>` — copy that id into `sandboxSessionId` and run the update_files call below to overlay your real code. Env is stored on the job row and replayed on self-heal respawn.\n\nSee SANDBOX.md § MCP tool flow for how create / update_files / preview compose into the pipelined pattern."
+					},
+					"response": []
+				},
+				{
+					"name": "MCP — tools/call update_files (overlay)",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "Accept",
+								"value": "application/json, text/event-stream"
+							},
+							{
+								"key": "Mcp-Session-Id",
+								"value": "{{mcpSessionId}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 12,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"update_files\",\n    \"arguments\": {\n      \"session_id\": \"{{sandboxSessionId}}\",\n      \"files\": {\n        \"app.py\": \"import streamlit as st\\nst.title('overlay applied')\\n\"\n      },\n      \"recreate_if_gone\": false\n    }\n  }\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{litellm}}/v1/sandbox/mcp/",
+							"host": [
+								"{{litellm}}"
+							],
+							"path": [
+								"v1",
+								"sandbox",
+								"mcp",
+								""
+							]
+						},
+						"description": "Overlay files onto a running sandbox. `recreate_if_gone` defaults to false — if the container is gone, a structured 409 diagnostic is returned instead of a silent respawn. Retry with `recreate_if_gone: true` to accept the state loss (env preserved, in-container files and exec-installed packages LOST).\n\nResponse includes `app_status` from the post-update HTTP health probe so you can spot a broken reload immediately."
+					},
+					"response": []
+				},
+				{
+					"name": "MCP — tools/call get_files (list)",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "Accept",
+								"value": "application/json, text/event-stream"
+							},
+							{
+								"key": "Mcp-Session-Id",
+								"value": "{{mcpSessionId}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 13,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"get_files\",\n    \"arguments\": {\n      \"session_id\": \"{{sandboxSessionId}}\"\n    }\n  }\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{litellm}}/v1/sandbox/mcp/",
+							"host": [
+								"{{litellm}}"
+							],
+							"path": [
+								"v1",
+								"sandbox",
+								"mcp",
+								""
+							]
+						},
+						"description": "Directory listing (paths + sizes only) of the running sandbox's /app. Omit `paths` to get the listing; pass `paths: [...]` to get the contents inline. Binary files come back base64-encoded."
+					},
+					"response": []
+				},
+				{
+					"name": "MCP — tools/call exec (pip install)",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "Accept",
+								"value": "application/json, text/event-stream"
+							},
+							{
+								"key": "Mcp-Session-Id",
+								"value": "{{mcpSessionId}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 14,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"exec\",\n    \"arguments\": {\n      \"session_id\": \"{{sandboxSessionId}}\",\n      \"command\": \"pip install requests\",\n      \"timeout_seconds\": 60,\n      \"working_dir\": \"/app\"\n    }\n  }\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{litellm}}/v1/sandbox/mcp/",
+							"host": [
+								"{{litellm}}"
+							],
+							"path": [
+								"v1",
+								"sandbox",
+								"mcp",
+								""
+							]
+						},
+						"description": "Run a non-interactive shell command inside the running container. NON-INTERACTIVE — stdin is closed; anything prompting for input hangs until timeout. Output capped at 8 KB. STATE DRIFT: packages installed here do NOT survive self-heal respawn — also write to requirements.txt / package.json via update_files for persistence.\n\nSee SANDBOX.md § Runtime introspection (exec)."
+					},
+					"response": []
+				},
+				{
+					"name": "MCP — tools/call patch_files (strict line-range edit)",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "Accept",
+								"value": "application/json, text/event-stream"
+							},
+							{
+								"key": "Mcp-Session-Id",
+								"value": "{{mcpSessionId}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 15,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"patch_files\",\n    \"arguments\": {\n      \"session_id\": \"{{sandboxSessionId}}\",\n      \"patches\": [\n        {\n          \"path\": \"app.py\",\n          \"start_line\": 15,\n          \"end_line\": 18,\n          \"expected\": \"def foo(x):\\n    return x + 1\",\n          \"replacement\": \"def foo(x, y):\\n    return x + y\",\n          \"note\": \"add y arg\"\n        }\n      ],\n      \"recreate_if_gone\": false\n    }\n  }\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{litellm}}/v1/sandbox/mcp/",
+							"host": [
+								"{{litellm}}"
+							],
+							"path": [
+								"v1",
+								"sandbox",
+								"mcp",
+								""
+							]
+						},
+						"description": "Strict line-range replacement inside a running sandbox. Use AFTER get_files on the target file: copy the current bytes into `expected` byte-for-byte, then send with the new content in `replacement`. Every patch validates in a dry-run pass first (byte-for-byte match, in-bounds range, no per-file overlap); if any fails, no file is modified. Mismatch responses include the actual current content so the model can retry inline without another get_files call.\n\nNot for new files (use update_files instead). Not for large rewrites. Not self-healing — dead container returns 409.\n\nSee SANDBOX.md § Targeted edits (patch_files)."
+					},
+					"response": []
+				},
+				{
+					"name": "MCP — tools/call preview",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "Accept",
+								"value": "application/json, text/event-stream"
+							},
+							{
+								"key": "Mcp-Session-Id",
+								"value": "{{mcpSessionId}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 15,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"preview\",\n    \"arguments\": {\n      \"session_id\": \"{{sandboxSessionId}}\"\n    }\n  }\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{litellm}}/v1/sandbox/mcp/",
+							"host": [
+								"{{litellm}}"
+							],
+							"path": [
+								"v1",
+								"sandbox",
+								"mcp",
+								""
+							]
+						},
+						"description": "Hand the user the iframe artifact. Display-only — does not touch the container, does not self-heal, does not bump last_used_at. Call this ONCE per turn when the model wants to surface the current state; iterate silently with update_files between previews.\n\nResponse text ends with the fenced ```html block that OpenWebUI promotes into the artifacts panel."
+					},
+					"response": []
+				},
+				{
+					"name": "MCP — tools/call close",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "Accept",
+								"value": "application/json, text/event-stream"
+							},
+							{
+								"key": "Mcp-Session-Id",
+								"value": "{{mcpSessionId}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 16,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"close\",\n    \"arguments\": {\n      \"session_id\": \"{{sandboxSessionId}}\"\n    }\n  }\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{litellm}}/v1/sandbox/mcp/",
+							"host": [
+								"{{litellm}}"
+							],
+							"path": [
+								"v1",
+								"sandbox",
+								"mcp",
+								""
+							]
+						},
+						"description": "Explicit teardown. Idempotent — an unknown or already-closed session returns success with `was_running: false`. Optional in every flow (the reaper handles cleanup on TTL); call it when the user has said they're done."
+					},
+					"response": []
+				},
+				{
+					"name": "MCP — tools/call list_sessions",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "Accept",
+								"value": "application/json, text/event-stream"
+							},
+							{
+								"key": "Mcp-Session-Id",
+								"value": "{{mcpSessionId}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 17,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"list_sessions\",\n    \"arguments\": {}\n  }\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{litellm}}/v1/sandbox/mcp/",
+							"host": [
+								"{{litellm}}"
+							],
+							"path": [
+								"v1",
+								"sandbox",
+								"mcp",
+								""
+							]
+						},
+						"description": "Enumerate live sandboxes globally. Use this to recover a dropped session_id (chat compacted, model paraphrased away the Session id line, etc.). MULTI-TENANT CAVEAT: returns every session on the deployment, not just yours."
+					},
+					"response": []
+				},
+				{
+					"name": "MCP — tools/call run (one-shot)",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "Accept",
+								"value": "application/json, text/event-stream"
+							},
+							{
+								"key": "Mcp-Session-Id",
+								"value": "{{mcpSessionId}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 18,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"run\",\n    \"arguments\": {\n      \"runtime\": \"static\",\n      \"files\": {\n        \"index.html\": \"<h1>one-shot from run</h1>\"\n      }\n    }\n  }\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{litellm}}/v1/sandbox/mcp/",
+							"host": [
+								"{{litellm}}"
+							],
+							"path": [
+								"v1",
+								"sandbox",
+								"mcp",
+								""
+							]
+						},
+						"description": "One-shot convenience — create + update_files + preview in a single tool call. Recreate_if_gone is implicitly true. Response includes the same fenced ```html iframe block as `preview` so OpenWebUI promotes it directly. Prefer this when the model has everything ready at first mention; prefer the pipelined get_runtimes → create → update_files → preview flow when there's real iteration to do."
+					},
+					"response": []
+				}
+			]
+		}
+	]
 }

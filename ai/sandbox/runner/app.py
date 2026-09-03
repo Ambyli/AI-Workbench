@@ -18,6 +18,7 @@ MCP tool surface (all under the ``sandbox`` server):
     get_files(session_id, paths?)   — read files back from /app
     get_logs(session_id, lines?)    — tail container stdout+stderr
     exec(session_id, command, ...)  — run non-interactive shell command
+    patch_files(session_id, patches)— strict line-range edits, all-or-nothing
     preview(session_id)             — return the iframe artifact HTML
     close(session_id)               — teardown and release slot
     list_sessions()                 — enumerate live sandboxes globally
@@ -35,6 +36,7 @@ HTTP endpoints:
     POST /session/{id}/files        update_files overlay (JSON)
     GET  /session/{id}/files        list files under /app or read specified paths
     POST /session/{id}/exec         run a shell command in the container
+    POST /session/{id}/patch        strict line-range file edits (patch_files)
     /mcp                            FastMCP HTTP transport
     /tool/*                         OpenWebUI Tool Server sub-app:
         GET  /tool/openapi.json     OpenAPI spec for OpenWebUI discovery
@@ -275,6 +277,18 @@ async def _mcp_exec(
     return await _do_exec(session_id, command, timeout_seconds, working_dir)
 
 
+async def _mcp_patch_files(
+    session_id: str,
+    patches: list[dict],
+    recreate_if_gone: bool,
+) -> dict:
+    log.debug(
+        "MCP patch_files: session=%s n_patches=%d recreate=%s",
+        session_id, len(patches or []), recreate_if_gone,
+    )
+    return await _do_patch_files(session_id, patches, recreate_if_gone)
+
+
 async def _mcp_preview(session_id: str) -> dict:
     log.debug("MCP preview: session=%s", session_id)
     return await _do_preview(session_id)
@@ -297,6 +311,7 @@ _mcp = build_mcp(
     update_files_callable=_mcp_update_files,
     get_files_callable=_mcp_get_files,
     exec_callable=_mcp_exec,
+    patch_files_callable=_mcp_patch_files,
     preview_callable=_mcp_preview,
     close_callable=_mcp_close,
     list_sessions_callable=_mcp_list_sessions,
@@ -605,6 +620,107 @@ class ExecRequest(BaseModel):
     command: str = Field(description="Shell command (sh -c). Non-interactive.")
     timeout_seconds: Optional[int] = Field(default=None)
     working_dir: Optional[str] = Field(default=None)
+
+
+class PatchSpec(BaseModel):
+    """One hunk in a ``patch_files`` call — line-range strict replacement."""
+
+    path: str = Field(
+        description=(
+            "Relative path under /app. Same validation as `deletes` — "
+            "absolute paths and '..' rejected."
+        ),
+    )
+    start_line: int = Field(
+        description="1-indexed, inclusive start of the range to replace.",
+        ge=1,
+    )
+    end_line: int = Field(
+        description="1-indexed, inclusive end of the range to replace.",
+        ge=1,
+    )
+    expected: str = Field(
+        description=(
+            "The EXACT current content of lines [start_line, end_line] "
+            "joined with '\\n'. Byte-for-byte match required — no "
+            "whitespace or trailing-newline lenience. If your view is "
+            "stale, call get_files first."
+        ),
+    )
+    replacement: str = Field(
+        description=(
+            "What to write in place of `expected`. May be shorter, "
+            "longer, or the same length."
+        ),
+    )
+    note: str = Field(
+        default="",
+        description=(
+            "Optional free-text note logged for operator debugging. "
+            "Not applied to the file."
+        ),
+    )
+
+
+class PatchFilesRequest(BaseModel):
+    patches: list[PatchSpec] = Field(
+        description=(
+            "List of patches. All-or-nothing: every patch validates first "
+            "(byte-for-byte + no overlap on the same file); only then are "
+            "any files modified."
+        ),
+    )
+    recreate_if_gone: bool = Field(
+        default=False,
+        description=(
+            "Accepted for interface consistency but has NO effect on this "
+            "tool. patch_files depends on file content that would not "
+            "exist in a fresh container, so a dead container always "
+            "returns 409 regardless. Call update_files first to establish "
+            "file state before reissuing patches."
+        ),
+    )
+
+    @field_validator("patches")
+    @classmethod
+    def _validate_patches(cls, v: list[PatchSpec]) -> list[PatchSpec]:
+        if not v:
+            raise ValueError("patches must contain at least one patch")
+        total = 0
+        per_patch_over: list[tuple[int, str, int]] = []
+        for i, p in enumerate(v):
+            if p.end_line < p.start_line:
+                raise ValueError(
+                    f"patches[{i}]: end_line ({p.end_line}) must be >= "
+                    f"start_line ({p.start_line})"
+                )
+            # Each patch contributes both expected and replacement to the
+            # payload budget. Kept symmetric with `files`: bytes are UTF-8.
+            expected_bytes = len(p.expected.encode("utf-8"))
+            replacement_bytes = len(p.replacement.encode("utf-8"))
+            patch_size = expected_bytes + replacement_bytes
+            if patch_size > MAX_FILE_BYTES:
+                per_patch_over.append((i, p.path, patch_size))
+            total += patch_size
+        if per_patch_over or total > MAX_PAYLOAD_BYTES:
+            parts = ["Rejected: patch_files payload exceeded limits."]
+            parts.append(f"  Individual patch cap: {MAX_FILE_BYTES:,} bytes")
+            if per_patch_over:
+                biggest = max(per_patch_over, key=lambda t: t[2])
+                parts.append(
+                    f"  (largest oversized: patch #{biggest[0] + 1} on "
+                    f"{biggest[1]!r} at {biggest[2]:,} bytes; "
+                    f"{len(per_patch_over)} patch(es) over the cap)"
+                )
+            parts.append(
+                f"  Total payload cap: {MAX_PAYLOAD_BYTES:,} bytes "
+                f"(submitted: {total:,} bytes)"
+            )
+            parts.append(
+                "Shrink or split patches into multiple patch_files calls."
+            )
+            raise ValueError("\n".join(parts))
+        return v
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────
@@ -1205,6 +1321,222 @@ async def _do_exec(
     }
 
 
+async def _do_patch_files(
+    session_id: str,
+    patches: list[dict],
+    recreate_if_gone: bool,
+) -> dict:
+    """Strict line-range replacement across one or more files.
+
+    Two-pass model:
+      1. Dry-run — every patch is validated (path safety, file exists,
+         line range in bounds, expected byte-for-byte match, no overlap).
+         If anything fails, no file is touched and the caller gets a
+         structured 409 with the actual current content when applicable.
+      2. Apply — bottom-up per file so earlier hunks' line indices stay
+         valid. Then a single put_archive per file, followed by the same
+         500 ms settle + HTTP health probe update_files uses.
+
+    ``recreate_if_gone`` is accepted for interface consistency but does
+    NOT trigger a respawn — a fresh container would not have the file
+    the patch anchors on, so callers are told to establish state via
+    update_files first.
+    """
+    if _registry is None or _spawner is None or _slot_sem is None:
+        raise HTTPException(500, "runner not initialized")
+    if not _SESSION_ID_RE.match(session_id):
+        raise HTTPException(400, "invalid session_id")
+    if not patches:
+        raise HTTPException(400, "patches must contain at least one patch")
+
+    existing = await _find_running_session(session_id)
+    if existing is None:
+        raise HTTPException(
+            404,
+            {
+                "error": "session not found",
+                "session_id": session_id,
+                "hint": (
+                    "No running sandbox for this session_id. Call `create` "
+                    "or `run` first, then `update_files` to establish files, "
+                    "then `patch_files` for targeted edits."
+                ),
+            },
+        )
+    alive = await asyncio.to_thread(
+        _spawner.container_exists, existing["container_name"]
+    )
+    if not alive:
+        # patch_files never respawns — a fresh container has no file to
+        # anchor on. Signal 409 no matter what recreate_if_gone says.
+        raise HTTPException(
+            409,
+            {
+                "error": "sandbox container is gone",
+                "session_id": session_id,
+                "hint": (
+                    "patch_files cannot respawn — it depends on files that "
+                    "would not exist in a fresh container. Call "
+                    "update_files first (with recreate_if_gone=true if you "
+                    "want to force a respawn) to establish file state, then "
+                    "reissue your patches."
+                ),
+            },
+        )
+
+    log.info(
+        "patch_files: session=%s sandbox=%s n_patches=%d",
+        session_id, existing["sandbox_id"], len(patches),
+    )
+    try:
+        hunks, mismatch = await asyncio.to_thread(
+            _spawner.patch_files,
+            existing["container_name"],
+            patches,
+        )
+    except ValueError as exc:
+        # Path traversal etc. surfaced by _safe_relpath.
+        log.warning("patch_files: rejected: %s", exc)
+        raise HTTPException(400, str(exc))
+    if mismatch is not None:
+        log.info(
+            "patch_files: rejected pre-apply — kind=%s path=%s patch=%s",
+            mismatch.kind, mismatch.path, mismatch.patch_index,
+        )
+        detail = {
+            "error": _PATCH_KIND_TO_ERROR.get(
+                mismatch.kind, "patch_files validation failed",
+            ),
+            "session_id": session_id,
+            "kind": mismatch.kind,
+            "path": mismatch.path,
+            "patch_index": mismatch.patch_index,
+            "message": mismatch.message,
+        }
+        if mismatch.start_line is not None:
+            detail["start_line"] = mismatch.start_line
+            detail["end_line"] = mismatch.end_line
+        if mismatch.file_line_count is not None:
+            detail["file_line_count"] = mismatch.file_line_count
+        if mismatch.expected is not None:
+            detail["expected"] = mismatch.expected
+            detail["actual"] = mismatch.actual
+        if mismatch.other_start_line is not None:
+            detail["other_start_line"] = mismatch.other_start_line
+            detail["other_end_line"] = mismatch.other_end_line
+            detail["other_patch_index"] = mismatch.other_index
+        # Content mismatch and out-of-range are 409 (client-fixable state
+        # divergence). Missing file, binary file, unsafe path are 4xx too
+        # but carry different semantics; group them all under 409 to keep
+        # the tool response shape consistent (the model reads the `kind`).
+        detail["hint"] = _PATCH_HINT_FOR(mismatch.kind)
+        raise HTTPException(409, detail)
+
+    # Apply succeeded — bump last_used_at, settle, probe.
+    await _registry.update_metadata(
+        existing["sandbox_id"], {"last_used_at": _now_iso()},
+    )
+    await asyncio.sleep(UPDATE_SETTLE_S)
+    rt_name = existing.get("runtime")
+    probe_path = "/"
+    if rt_name and rt_name in RUNTIMES:
+        probe_path = RUNTIMES[rt_name].readiness_probe_path
+    app_status = await asyncio.to_thread(
+        _spawner.probe_health,
+        existing["container_name"],
+        80,
+        probe_path,
+        HEALTH_PROBE_TIMEOUT_S,
+    )
+    startup_output = await asyncio.to_thread(
+        _spawner.tail_logs_since_last_marker,
+        existing["container_name"],
+        40,
+    )
+    hunks_out = [
+        {
+            "path": h.path,
+            "start_line": h.start_line,
+            "end_line": h.end_line,
+            "replaced_bytes": h.replaced_bytes,
+            "new_bytes": h.new_bytes,
+        }
+        for h in hunks
+    ]
+    files_touched = sorted({h["path"] for h in hunks_out})
+    log.info(
+        "patch_files complete: session=%s sandbox=%s files=%d hunks=%d "
+        "app_status=%s",
+        session_id, existing["sandbox_id"], len(files_touched),
+        len(hunks_out), app_status,
+    )
+    return {
+        "sandbox_id": existing["sandbox_id"],
+        "session_id": session_id,
+        "url": existing["url"],
+        "expires_at": existing["expires_at"],
+        "runtime": rt_name,
+        "hunks_applied": hunks_out,
+        "files_touched": files_touched,
+        "startup_output": startup_output,
+        "app_status": app_status,
+        "recreated": False,
+    }
+
+
+# Mapping from PatchMismatch.kind to the `error` string surfaced in the
+# structured tool response. Kept separate so sandbox_mcp can pattern-match
+# without importing the dataclass.
+_PATCH_KIND_TO_ERROR = {
+    "unsafe_path": "unsafe path in patch",
+    "missing_file": "target file does not exist",
+    "binary_file": "cannot patch non-UTF-8 file",
+    "out_of_range": "line range out of bounds",
+    "content_mismatch": "expected content mismatch",
+    "overlap": "overlapping patches on same file",
+    "bad_expected_type": "expected must be a string",
+    "bad_replacement_type": "replacement must be a string",
+}
+
+
+def _PATCH_HINT_FOR(kind: str) -> str:
+    if kind == "missing_file":
+        return (
+            "patch_files does not create files. Call update_files with "
+            "the file's full content to create it first."
+        )
+    if kind == "binary_file":
+        return (
+            "The target file is not UTF-8 (contains a null byte or "
+            "invalid encoding). Use update_files with a base64 payload "
+            "to overwrite it entirely."
+        )
+    if kind == "out_of_range":
+        return (
+            "Call get_files(paths=[<path>]) to refresh your view of the "
+            "file, then reissue patch_files with the correct line range. "
+            "No files were modified."
+        )
+    if kind == "content_mismatch":
+        return (
+            "The file has changed since you last read it. Call get_files "
+            "with the affected path, copy the current bytes into "
+            "`expected`, and reissue patch_files. No files were modified."
+        )
+    if kind == "overlap":
+        return (
+            "Combine the overlapping patches into ONE patch whose "
+            "`expected` and `replacement` cover the merged range. No "
+            "files were modified."
+        )
+    if kind == "unsafe_path":
+        return (
+            "Paths must be relative under /app. '..' and absolute paths "
+            "are rejected. No files were modified."
+        )
+    return "Fix the issue above and reissue patch_files."
+
+
 async def _do_preview(session_id: str) -> dict:
     if _registry is None:
         raise HTTPException(500, "runner not initialized")
@@ -1561,6 +1893,20 @@ async def session_exec(session_id: str, req: ExecRequest) -> dict:
         req.command,
         req.timeout_seconds or EXEC_DEFAULT_TIMEOUT_S,
         req.working_dir or "/app",
+    )
+
+
+@app.post("/session/{session_id}/patch")
+async def session_patch(session_id: str, req: PatchFilesRequest) -> dict:
+    """Strict line-range file edits. All-or-nothing across the batch.
+
+    Every patch must pass byte-for-byte validation against the current
+    file content — see ENDPOINTS.md § POST /session/{id}/patch for the
+    full behavior including the mismatch response shape.
+    """
+    patches_dicts = [p.model_dump() for p in req.patches]
+    return await _do_patch_files(
+        session_id, patches_dicts, req.recreate_if_gone,
     )
 
 

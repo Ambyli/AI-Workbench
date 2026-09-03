@@ -118,7 +118,7 @@ All base images normalize the app port to **80** so `sandbox-proxy` can statical
 
 ## MCP tool flow
 
-The sandbox subsystem exposes an MCP server named `sandbox` with 11 tools. Models compose them into a workflow that maps to the way a human dev works — warm the runtime, iterate silently, hand the user something to look at, tear down.
+The sandbox subsystem exposes an MCP server named `sandbox` with 12 tools. Models compose them into a workflow that maps to the way a human dev works — warm the runtime, iterate silently, hand the user something to look at, tear down.
 
 ```
 get_runtimes    ─── optional, first time on a deployment
@@ -130,6 +130,7 @@ create          ─── returns session_id + warming URL; env fixed here
 update_files    ─── loop: overlay files; post-update health probe
       │  ▲              recreate_if_gone=false (default) surfaces respawn choice
       │  └─── get_files / get_logs / exec (read/modify on demand)
+      │  └─── patch_files (strict line-range edits after get_files)
       │  └─── list_sessions (recover dropped handles)
       ▼
 preview         ─── show the user the iframe artifact
@@ -155,6 +156,7 @@ Tool summary:
 | `get_files` | read | Read files back from `/app` (dir listing when `paths` is omitted) |
 | `get_logs` | read | Tail container stdout+stderr for the session |
 | `exec` | write | Run a non-interactive shell command inside the container |
+| `patch_files` | write | Strict line-range file edits; all-or-nothing; byte-for-byte match required |
 | `preview` | display | Return the iframe artifact for the user's chat |
 | `close` | write | Tear down the session early, release the slot |
 | `list_sessions` | read | Enumerate live sandboxes (recover dropped session_ids) |
@@ -191,6 +193,7 @@ The text form preserves everything a model needs to reply — the fenced ```` ``
 | `POST /session/{id}/files` | overlay files into a running sandbox. Backing endpoint for `sandbox.update_files` |
 | `GET /session/{id}/files` | read files back from `/app`. Backing endpoint for `sandbox.get_files` |
 | `POST /session/{id}/exec` | run a non-interactive shell command inside the container. Backing endpoint for `sandbox.exec` |
+| `POST /session/{id}/patch` | strict line-range file edits (all-or-nothing). Backing endpoint for `sandbox.patch_files` |
 | `GET /session/{id}/logs` | tail container stdout+stderr. Backing endpoint for `sandbox.get_logs` |
 | `GET /session/{id}/download` | stream `/app` as a tar archive (session-based; follows self-heal) |
 | `DELETE /session/{id}` | tear a session's sandbox down early. Backing endpoint for `sandbox.close` |
@@ -464,6 +467,62 @@ Design constraints:
 - **Counts as activity.** Every `exec` call bumps `last_used_at` so the idle reaper resets.
 
 Security analysis: `exec` opens no new escape path. The sandbox container is isolated by network segmentation, not by command-layer sandboxing — anything the container can do, the model could already do via a `python -c` embedded in the entrypoint. What `exec` opens is CPU/RAM inside the sandbox, already bounded by cgroups and the reaper's TTL.
+
+### Targeted edits (patch_files)
+
+The `patch_files` MCP tool (backed by `POST /session/{id}/patch`) does strict line-range replacement inside a running sandbox's `/app`. It exists to close the "small change to a large file" gap in the tool set: when the model is fixing one function in a 40 KB `app.py`, sending the whole file through `update_files` burns tokens and forces a whole-file mtime bump that trips a full dev-server reload.
+
+**When to use `patch_files` vs `update_files`:**
+
+- **`patch_files`** — small targeted edits in files you've called `get_files` on this turn. The rule of thumb: <20–30% of the file changes. Never for new files (patch_files does NOT create files).
+- **`update_files`** — new file, whole-file rewrite, or refactor touching a majority of the file. Overlay semantics, no expected-content check.
+- **Rule the model bakes in:** if you have not called `get_files` on this file in the current turn, use `update_files` instead. The `expected` field must match the current file byte-for-byte.
+
+**Strict byte-for-byte match.** Every patch specifies `path`, `start_line`, `end_line` (both 1-indexed inclusive), `expected`, and `replacement`. The runner reads the current file, extracts `\n`-join(lines[start_line-1 : end_line]), and compares byte-for-byte to `expected`. No whitespace or trailing-newline lenience. Mismatch returns 409 with the ACTUAL current content inline so the model retries in the same turn without a separate `get_files` round trip:
+
+```
+patch_files failed: expected content mismatch at app.py:15-18.
+
+Your `expected`:
+    def foo(x):
+        return x + 1
+
+Actual (currently in file):
+    def foo(x, y):
+        return x + y
+
+No files were modified. Call get_files(paths=["app.py"]) to refresh
+your view, then reissue patch_files with the correct `expected` content.
+The other patches in this call were NOT applied.
+```
+
+**Overlap rejection.** Two patches on the same `path` whose `[start_line, end_line]` ranges intersect cause the entire call to be rejected. Boundary-touching ranges count as overlapping (`[10-15]` and `[15-20]` both include line 15). The response names both patch indices and asks the caller to combine them into ONE patch on the merged range. Auto-merging is not attempted — the semantics of "two overlapping replacements" are ambiguous enough that failing loudly beats guessing.
+
+**Atomicity.** Every patch validates in a dry-run pass BEFORE any file is touched. Only if every patch across every file passes the checks (path safety → file exists → UTF-8 → line range in bounds → expected byte-for-byte match → no per-file overlap) does the apply pass run. If a caller sends 10 patches and #7 fails validation, none of the other 9 are applied.
+
+**Apply order.** Per-file, bottom-up by `start_line` descending — earlier-line indices stay valid under later-line replacements. Each file is written in a single `put_archive`, so a mid-batch failure never leaves a file half-written.
+
+**Post-write behavior.** Same 500 ms settle + HTTP health probe against the runtime's `readiness_probe_path` on port 80 that `update_files` runs. `app_status` in the response tells the caller whether the edit broke the running app. `last_used_at` is bumped only on successful apply — failed dry-runs do not extend TTL.
+
+**No self-heal.** `recreate_if_gone` is accepted in the request shape for interface consistency but has NO effect — a fresh container has no file to anchor on, so patch_files always returns 409 for a dead container with a hint to call `update_files` first (with `recreate_if_gone=true` if a respawn is desired).
+
+**Payload limits.** Same envelope as `update_files`: each patch's UTF-8 `expected` + `replacement` bytes count toward `SANDBOX_MAX_FILE_BYTES` per patch, and the sum across all patches counts toward `SANDBOX_MAX_PAYLOAD_BYTES` — rejected at pydantic validation.
+
+**Worked flow.** Model reads the file, patches a hunk, tries again on mismatch:
+
+```
+1. get_files(session_id=sid, paths=["app.py"])   → returns full file bytes
+2. patch_files(session_id=sid, patches=[{
+       path: "app.py", start_line: 15, end_line: 18,
+       expected: "...exact bytes copied from step 1...",
+       replacement: "...new bytes..."
+   }])                                            → applied; app_status: HTTP 200
+3. If step 2 returned a `content_mismatch`, retry with the `actual`
+   content the 409 response included in the diagnostic. No extra
+   round trip to get_files required.
+```
+
+Fidelity note: `get_files` returns UTF-8 content as raw text with no whitespace or trailing-newline mutation — the bytes you see are the bytes patch_files anchors against.
 
 ### Env vars
 

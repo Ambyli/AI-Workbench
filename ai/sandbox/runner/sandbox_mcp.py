@@ -8,6 +8,7 @@ Tools exposed (all invoked as ``sandbox.<name>``):
     get_files(session_id, paths?)   — read files back from /app
     get_logs(session_id, lines?)    — tail container stdout+stderr
     exec(session_id, command, ...)  — run a non-interactive shell command
+    patch_files(session_id, patches)— strict line-range edits, all-or-nothing
     preview(session_id)             — return the iframe artifact HTML
     close(session_id)               — teardown and release slot
     list_sessions()                 — enumerate live sandboxes
@@ -95,6 +96,94 @@ def _format_diagnostic(detail: dict) -> str:
             lines.append("---")
         else:
             lines.append("(container produced no output before timing out)")
+    elif detail.get("kind") in {
+        "content_mismatch", "out_of_range", "overlap",
+        "missing_file", "binary_file", "unsafe_path",
+        "bad_expected_type", "bad_replacement_type",
+    }:
+        # patch_files-specific structured failures. Rendered instead of
+        # the raw JSON dump the fallback branch uses.
+        kind = detail["kind"]
+        path = detail.get("path", "?")
+        sl = detail.get("start_line")
+        el = detail.get("end_line")
+        patch_idx = detail.get("patch_index")
+        lines.append("")
+        if kind == "content_mismatch":
+            lines.append(
+                f"patch_files failed: expected content mismatch at "
+                f"{path}:{sl}-{el}."
+            )
+            lines.append("")
+            lines.append("Your `expected`:")
+            for src_line in (detail.get("expected") or "").split("\n"):
+                lines.append(f"    {src_line}")
+            lines.append("")
+            lines.append("Actual (currently in file):")
+            for src_line in (detail.get("actual") or "").split("\n"):
+                lines.append(f"    {src_line}")
+            lines.append("")
+            lines.append(
+                "No files were modified. Call get_files(paths=["
+                f"\"{path}\"]) to refresh your view, then reissue "
+                "patch_files with the correct `expected` content. "
+                "The other patches in this call were NOT applied."
+            )
+        elif kind == "out_of_range":
+            lines.append(
+                f"patch_files failed: patch #{patch_idx} on {path} "
+                f"targets lines {sl}-{el}, but the file has "
+                f"{detail.get('file_line_count', '?')} line(s)."
+            )
+            lines.append("")
+            lines.append(
+                "No files were modified. Call get_files(paths=["
+                f"\"{path}\"]) to see the current file, then reissue "
+                "patch_files with a valid line range."
+            )
+        elif kind == "overlap":
+            lines.append(f"patch_files failed: overlapping patches on {path}.")
+            lines.append("")
+            other_idx = detail.get("other_patch_index")
+            other_sl = detail.get("other_start_line")
+            other_el = detail.get("other_end_line")
+            lines.append(f"  Patch #{other_idx} covers lines {other_sl}-{other_el}")
+            lines.append(f"  Patch #{patch_idx} covers lines {sl}-{el}")
+            lines.append(
+                "These overlap. Combine them into ONE patch whose "
+                "`expected` and `replacement` cover the merged range. "
+                "No files were modified."
+            )
+        elif kind == "missing_file":
+            lines.append(
+                f"patch_files failed: {path} does not exist in the sandbox."
+            )
+            lines.append("")
+            lines.append(
+                "patch_files does not create files. Call update_files "
+                "with the file's full content to create it first."
+            )
+        elif kind == "binary_file":
+            lines.append(
+                f"patch_files failed: {path} is not UTF-8 (contains a "
+                "null byte or invalid encoding)."
+            )
+            lines.append("")
+            lines.append(
+                "Use update_files with a base64 payload to overwrite "
+                "the file entirely."
+            )
+        elif kind == "unsafe_path":
+            lines.append(
+                f"patch_files failed: patch #{patch_idx} has an unsafe "
+                f"path {path!r}. Absolute paths and '..' are rejected."
+            )
+        elif kind in ("bad_expected_type", "bad_replacement_type"):
+            field = "expected" if kind == "bad_expected_type" else "replacement"
+            lines.append(
+                f"patch_files failed: patch #{patch_idx} on {path} has "
+                f"a non-string `{field}` field."
+            )
     else:
         # Any other structured error — pass through as JSON so the
         # model doesn't lose information.
@@ -310,6 +399,7 @@ def build_mcp(
     update_files_callable: Callable[..., Any],
     get_files_callable: Callable[..., Any],
     exec_callable: Callable[..., Any],
+    patch_files_callable: Callable[..., Any],
     preview_callable: Callable[..., Any],
     close_callable: Callable[..., Any],
     list_sessions_callable: Callable[..., Any],
@@ -690,6 +780,151 @@ def build_mcp(
         head_lines.append(result["output"] or "(no output)")
         head_lines.append("---")
         return _tool_result("\n".join(head_lines), {"ok": True, **result})
+
+    # ── patch_files ──
+    @mcp.tool()
+    async def patch_files(
+        session_id: str = Field(
+            description=(
+                "The session_id from a previous create / run response."
+            )
+        ),
+        patches: list[dict] = Field(
+            description=(
+                "List of hunks. Each hunk is a dict with fields: "
+                "`path` (relative under /app), `start_line` (1-indexed "
+                "inclusive), `end_line` (1-indexed inclusive), `expected` "
+                "(the EXACT current text of those lines joined with \\n — "
+                "byte-for-byte, no whitespace or trailing-newline lenience), "
+                "`replacement` (what to write in place of `expected`), and "
+                "optional `note` (operator-log only). All-or-nothing: if "
+                "any patch fails validation, NO file is modified."
+            ),
+        ),
+        recreate_if_gone: bool = Field(
+            default=False,
+            description=(
+                "Accepted for interface consistency but has NO effect. "
+                "patch_files depends on files that would not exist in a "
+                "fresh container, so a dead container always returns an "
+                "error. Call update_files first if you need to respawn."
+            ),
+        ),
+    ) -> ToolResult:
+        """Strict line-range replacement inside a running sandbox.
+
+        Use this instead of update_files when:
+          * You've just called get_files on the target file this turn AND
+          * The edit changes a small fraction of the file (<20-30% is a
+            good rule of thumb).
+
+        Use update_files instead when:
+          * The file is new (patch_files does NOT create files).
+          * The rewrite covers most of the file.
+          * You have not called get_files on the target file in this turn.
+
+        # STRICT BYTE-FOR-BYTE MATCH
+
+        `expected` must match `\\n`-join(current_lines[start_line-1:end_line])
+        byte-for-byte. No whitespace or trailing-newline lenience. If it
+        does not match, the tool returns 409 with the ACTUAL current
+        content inline so you can retry in the same turn:
+
+            patch_files failed: expected content mismatch at app.py:15-18.
+            Your `expected`: ...
+            Actual (currently in file): ...
+            No files were modified. Call get_files(paths=["app.py"])...
+
+        The safe pattern is: `get_files(paths=[path])` immediately before
+        every `patch_files` on that file. Copy the range verbatim into
+        `expected`. Do not paraphrase.
+
+        # OVERLAP REJECTION
+
+        Two patches on the SAME `path` whose [start_line, end_line]
+        ranges intersect cause the entire call to be rejected — combine
+        them into ONE patch on the merged range. This includes
+        boundary-touching ranges: patches [10-15] and [15-20] overlap on
+        line 15.
+
+        # ATOMICITY
+
+        Every patch validates in a dry-run pass BEFORE any file is
+        touched. Only if every patch passes are the writes applied
+        (bottom-up per file so earlier-line indices stay valid). If
+        validation fails for any patch, no file is modified.
+
+        # AFTER THE WRITE
+
+        Post-write health probe runs (same as update_files). The
+        response's `app_status` and `startup_output` tell you whether the
+        edit broke the running app — act on ⚠ SUSPICIOUS immediately, in
+        the same turn.
+
+        # WORKED EXAMPLE
+
+        You called `get_files(paths=["app.py"])` and read:
+            10  def greet(name):
+            11      return f"hi, {name}"
+
+        You want to change the message. One patch:
+            {
+                "path": "app.py",
+                "start_line": 11,
+                "end_line": 11,
+                "expected": "    return f\\"hi, {name}\\"",
+                "replacement": "    return f\\"hello, {name}!\\"",
+            }
+
+        # NOT SELF-HEALING
+
+        Dead container? Returns 409, tells you to call update_files with
+        recreate_if_gone=true first. Fresh containers have no files to
+        anchor on, so respawning inside patch_files would be wrong.
+
+        See flow: get_runtimes → create → update_files → (patch_files |
+        update_files loop) → preview → close.
+        """
+        log.info(
+            "MCP tool call: patch_files session=%s n_patches=%d",
+            session_id, len(patches or []),
+        )
+        try:
+            result = await patch_files_callable(
+                session_id, patches, recreate_if_gone,
+            )
+        except HTTPException as exc:
+            return _handle_http_exception(exc, tool="patch_files")
+
+        hunks = result.get("hunks_applied") or []
+        files_touched = result.get("files_touched") or []
+        text_lines = [
+            f"Patched {len(files_touched)} file(s), {len(hunks)} hunk(s) applied. "
+            f"Session `{result['session_id']}`.",
+            f"URL: {result['url']} (unchanged).",
+            _format_app_status(result.get("app_status")),
+            _format_startup_output(
+                result.get("runtime"), result.get("startup_output") or "",
+            ),
+            "",
+            "Applied:",
+        ]
+        # Group hunk ranges by path so the summary reads "app.py: 2 hunks (…)".
+        by_path: dict[str, list[str]] = {}
+        for h in hunks:
+            by_path.setdefault(h["path"], []).append(
+                f"lines {h['start_line']}-{h['end_line']}"
+            )
+        for path in files_touched:
+            ranges = by_path.get(path, [])
+            n = len(ranges)
+            text_lines.append(
+                f"- {path}: {n} hunk(s) ({', '.join(ranges)})"
+            )
+        return _tool_result(
+            "\n".join(text_lines),
+            {"ok": True, **result},
+        )
 
     # ── preview ──
     @mcp.tool()

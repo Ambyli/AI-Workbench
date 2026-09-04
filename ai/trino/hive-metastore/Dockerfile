@@ -21,6 +21,13 @@ ENV POSTGRES_JDBC_VERSION=42.7.4 \
     HADOOP_AWS_VERSION=3.3.6 \
     AWS_SDK_BUNDLE_VERSION=1.12.767
 
+# apache/hive:4.0.0 (eclipse-temurin base) doesn't ship curl; the JDBC /
+# hadoop-aws / aws-sdk downloads below need it. Install once, drop the
+# apt cache to keep the layer small.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
 # Postgres JDBC driver
 RUN curl -fSL \
       "https://jdbc.postgresql.org/download/postgresql-${POSTGRES_JDBC_VERSION}.jar" \

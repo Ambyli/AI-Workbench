@@ -76,8 +76,9 @@ docker compose -f ai/llama/docker-compose.llama.yml up -d --build --force-recrea
 | `-hfd` | `unsloth/Qwen3.8-Flash-Next-GGUF` | Draft repo — the same repo, **no tag**. |
 | `-md` | `MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` | Exact repo-relative path of the head. When `-hfd` is set, `-md` doubles as the HF file selector, so the head auto-downloads into `llama_data` next to the main weights. |
 | `--spec-type` | `draft-mtp` | Explicit. Sidecar auto-discovery only searches the main model's own folder, never `MTP/`, so without this + `-md` you get base speed and no error. |
-| `--spec-draft-n-max` | `2` | README default (the Unsloth docs page shows `5`). Higher drafts more per step but each guess is accepted less often. |
+| `--spec-draft-n-max` | `3` | README default is `2`, the Unsloth docs page shows `5`. Higher drafts more per verify pass but each guess is accepted less often. Keep it at 6 or below: the MoE expert kernel only keeps CUDA graphs enabled for verify batches of 8 tokens or fewer. |
 | `-ngld` | `999` | Draft head fully on GPU. |
+| `-devd` | `CUDA2` | Pin the draft head to the GPU that holds the main model's output layer (the last device under `--tensor-split 1,1,1`). The `shared-*` head borrows that tensor, so co-locating avoids a cross-GPU copy per draft step. |
 
 Things that look like they should work but don't: `-hfd repo:MTP/file.gguf` (the tag is matched as a quant name — that was the `exactly one out of metadata, path_model, and file must be defined` error), and `--spec-type draft-mtp` alone (auto-discovery never finds the head).
 

@@ -146,9 +146,9 @@ model_list:
       extra_body:
         top_k: 20
         min_p: 0
-      stream_timeout: 300
+      stream_timeout: 600
     model_info:
-      max_input_tokens: 114688
+      max_input_tokens: 245760
       max_output_tokens: 16384
 
   - model_name: glm5.2

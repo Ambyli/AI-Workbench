@@ -119,8 +119,9 @@ services:
       --host 0.0.0.0 --port 8000
       -ngl 999
       --tensor-split 1,1,1
-      -c 262144
-      --parallel 2
+      -c 1048576
+      --parallel 4
+      --n-predict 16384
       --cache-type-k q8_0
       --cache-type-v q8_0
       --flash-attn on

@@ -1,0 +1,56 @@
+# syntax=docker/dockerfile:1
+#
+# llama-server from Unsloth's llama.cpp prebuilds
+#   https://github.com/unslothai/llama.cpp/releases
+#
+# Why this exists instead of ghcr.io/ggml-org/llama.cpp:server-cuda:
+#   Qwen3.8-Flash-Next ships MTP (multi-token prediction) draft heads under
+#   MTP/ in unsloth/Qwen3.8-Flash-Next-GGUF. Mainline llama.cpp has no MTP
+#   graph for the `qwen4exp` architecture yet (ggml-org/llama.cpp#28243 and
+#   #27836 are both still open), so on the stock image `--spec-type draft-mtp`
+#   either fails to load the head or silently runs at base speed. Unsloth's
+#   "mix" releases are upstream + a curated set of open PRs, including
+#   unslothai/llama.cpp#144 (MTP for Qwen3.8-Flash-Next).
+#
+# The tarball is a flat directory: llama-server, the shared libs it needs
+# (rpath=$ORIGIN, so no LD_LIBRARY_PATH), and BUILD_INFO.txt. It does NOT
+# bundle CUDA — libcudart.so.12 / libcublas.so.12 come from the nvidia/cuda
+# runtime base, libcuda.so.1 from the host driver via `runtime: nvidia`.
+#
+# Variant guide (linux-x64):
+#   cuda12-portable  sm 70,75,80,86,89,90,100,103,120 — covers RTX A6000 (86).
+#   cuda13-*         needs a CUDA 13 capable host driver (R580+).
+#   *-newer/-older   narrower arch lists; smaller, no functional difference.
+# Built on GitHub's ubuntu-22.04 runner with CUDA 12.8 -> match glibc with an
+# ubuntu22.04 base and the toolkit line with a 12.x runtime image.
+#
+# Pin bumps: change LLAMA_UNSLOTH_TAG in .env (compose passes it as a build
+# arg AND into the image tag), then
+#   docker compose -f ai/llama/docker-compose.llama.yml up -d --build --force-recreate qwen3.8-flash
+
+ARG CUDA_RUNTIME_IMAGE=nvidia/cuda:12.8.1-runtime-ubuntu22.04
+FROM ${CUDA_RUNTIME_IMAGE}
+
+ARG LLAMA_UNSLOTH_TAG=b10796-mix-659e406
+ARG LLAMA_UNSLOTH_VARIANT=cuda12-portable
+
+# libgomp1  — ggml CPU backend (OpenMP)
+# libssl3   — llama.cpp's built-in HTTPS client for -hf / -hfd downloads
+# curl      — compose healthcheck (same as the stock image)
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl libgomp1 libssl3 \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+RUN curl -fsSL "https://github.com/unslothai/llama.cpp/releases/download/${LLAMA_UNSLOTH_TAG}/app-${LLAMA_UNSLOTH_TAG}-linux-x64-${LLAMA_UNSLOTH_VARIANT}.tar.gz" \
+      | tar -xz -C /app \
+ && test -x /app/llama-server \
+ && test -f /app/libggml-cuda.so \
+ && echo "---- BUILD_INFO ----" && cat /app/BUILD_INFO.txt
+
+# Same defaults as ghcr.io/ggml-org/llama.cpp:server-cuda so the compose
+# `command:` block is a drop-in.
+ENV LLAMA_ARG_HOST=0.0.0.0
+
+ENTRYPOINT ["/app/llama-server"]

@@ -38,6 +38,8 @@ Key variables:
 | `LLM_MODEL` | _(empty)_ | Model alias passed to Claude Code |
 | `LLM_LOG_MAX_LINES` | `200` | Max lines in server-output log box |
 | `LLAMA_SERVER_CMD` | _(empty)_ | Full shell command to launch llama-server |
+| `LLAMA_UNSLOTH_TAG` | `b10796-mix-659e406` | llama.cpp stack: [unslothai/llama.cpp release](https://github.com/unslothai/llama.cpp/releases) tag baked into `ai/llama/Dockerfile.llama-unsloth` for the `qwen3.8-flash` service. Needed because MTP speculative decoding for Qwen3.8-Flash-Next is not in mainline llama.cpp; the tag is also part of the local image name, so bumps need `up -d --build`. |
+| `LLAMA_UNSLOTH_VARIANT` | `cuda12-portable` | llama.cpp stack: which prebuilt tarball flavour to install. `cuda12-portable` covers sm 70–120 (RTX A6000 = 86); `cuda13-*` needs an R580+ driver. |
 | `AUDIO_BASE_URL` | `http://localhost:8004` | Base URL returned by Kokoro `text_to_speech` MCP tool |
 | `MADLAD_APP_URL` | `http://madlad-app:8085` | URL the MADLAD proxy uses to reach the inference container |
 | `MADLAD_MODEL` | `SoybeanMilk/madlad400-3b-mt-ct2-int8_float16` | HuggingFace repo ID for the pre-converted CTranslate2 MADLAD checkpoint |

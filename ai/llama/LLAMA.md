@@ -17,7 +17,9 @@ This launches two containers by default:
 | Container | Port | Model | Quant | Weights |
 |---|---|---|---|---|
 | `glm5.2` | `localhost:8010` | Z.ai GLM-5.2 (~753B-A40B MoE) | UD-IQ1_S (~176 GB) | `unsloth/GLM-5.2-GGUF` |
-| `qwen3.8-flash` | `localhost:8017` | Qwen3.8-Flash-Next | UD-Q4_K_XL | `unsloth/Qwen3.8-Flash-Next-GGUF` |
+| `qwen3.8-flash` | `localhost:8017` | Qwen3.8-Flash-Next | UD-Q4_K_XL + MTP `shared-Q8_0` draft head | `unsloth/Qwen3.8-Flash-Next-GGUF` |
+
+`glm5.2` runs the stock `ghcr.io/ggml-org/llama.cpp:server-cuda` image. `qwen3.8-flash` builds a local image from Unsloth's llama.cpp prebuild ([`Dockerfile.llama-unsloth`](Dockerfile.llama-unsloth)) because MTP speculative decoding for this model is not in mainline llama.cpp yet — see [MTP speculative decoding](#qwen38-flash-mtp-speculative-decoding) below. `make up llama` / `docker compose up -d` build it on first run.
 
 Test with:
 
@@ -49,9 +51,59 @@ The service also loads the **shared Qwen chat template** from [`ai/jinja/qwen_fi
 
 The default `UD-Q4_K_XL` quant is the canonical example on the model card; swap the `-hf` tag (e.g. `UD-Q8_0`, `UD-Q2_K_XL`) to change the size/quality tradeoff — full quant list is on the HuggingFace page.
 
+### `qwen3.8-flash` MTP speculative decoding
+
+Qwen3.8-Flash-Next ships **MTP (multi-token prediction) draft heads** in the `MTP/` folder of `unsloth/Qwen3.8-Flash-Next-GGUF`. llama-server runs the small head ahead to propose tokens and the main model verifies them in one forward pass. Verification is exact, so output is unchanged — Unsloth measures **1.3–1.7× tok/s at concurrency 1 with greedy sampling** ([MTP/README.md](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/blob/main/MTP/README.md)).
+
+**Why a custom image.** Mainline llama.cpp has no MTP graph for the `qwen4exp` architecture and no cross-model tensor borrowing — [ggml-org/llama.cpp#28243](https://github.com/ggml-org/llama.cpp/pull/28243) and [#27836](https://github.com/ggml-org/llama.cpp/pull/27836) are still open. On the stock `server-cuda` image the head fails to load (`exactly one out of metadata, path_model, and file must be defined` / `failed to measure the memory of the extra model`) or `--spec-type draft-mtp` silently does nothing. Unsloth's prebuilt **"mix" releases** ([unslothai/llama.cpp/releases](https://github.com/unslothai/llama.cpp/releases)) are upstream plus a curated set of open PRs, including [unslothai/llama.cpp#144](https://github.com/unslothai/llama.cpp/pull/144) (MTP for Qwen3.8-Flash-Next). [`Dockerfile.llama-unsloth`](Dockerfile.llama-unsloth) drops the `linux-x64-cuda12-portable` tarball onto an `nvidia/cuda:12.8.1-runtime-ubuntu22.04` base (matches the GitHub `ubuntu-22.04` + CUDA 12.8 runner it was built on; `sm 70–120` covers the A6000s). Two `.env` keys drive it:
+
+| Key | Default | Notes |
+|---|---|---|
+| `LLAMA_UNSLOTH_TAG` | `b10796-mix-659e406` | Release tag. Also part of the local image tag (`llama-unsloth:<tag>-<variant>`), so a bump forces a rebuild. |
+| `LLAMA_UNSLOTH_VARIANT` | `cuda12-portable` | Tarball flavour. `cuda13-*` needs an R580+ host driver; `-newer` / `-older` are narrower arch lists with no functional difference. |
+
+Upgrade with:
+
+```bash
+docker compose -f ai/llama/docker-compose.llama.yml up -d --build --force-recreate qwen3.8-flash
+```
+
+**How both models get pulled.** The relevant flags in the `command:` block:
+
+| Flag | Value | Purpose |
+|---|---|---|
+| `-hf` | `unsloth/Qwen3.8-Flash-Next-GGUF:UD-Q4_K_XL` | Main model. The part after `:` is a **quant tag**, never a file path. |
+| `-hfd` | `unsloth/Qwen3.8-Flash-Next-GGUF` | Draft repo — the same repo, **no tag**. |
+| `-md` | `MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` | Exact repo-relative path of the head. When `-hfd` is set, `-md` doubles as the HF file selector, so the head auto-downloads into `llama_data` next to the main weights. |
+| `--spec-type` | `draft-mtp` | Explicit. Sidecar auto-discovery only searches the main model's own folder, never `MTP/`, so without this + `-md` you get base speed and no error. |
+| `--spec-draft-n-max` | `2` | README default (the Unsloth docs page shows `5`). Higher drafts more per step but each guess is accepted less often. |
+| `-ngld` | `999` | Draft head fully on GPU. |
+
+Things that look like they should work but don't: `-hfd repo:MTP/file.gguf` (the tag is matched as a quant name — that was the `exactly one out of metadata, path_model, and file must be defined` error), and `--spec-type draft-mtp` alone (auto-discovery never finds the head).
+
+**Which head.** `shared-Q8_0` is the README's recommendation: it borrows the token embedding and output projection from the main model (≈1.3 GB smaller than the self-contained `Q8_0`) and drafts identically. The trade-off is one **expected** error pair at startup — the automatic `--fit` memory probe loads the draft on its own before the main model exists, so there is nothing to borrow from:
+
+```
+E llama_model_load: error loading model: borrow_shared_tensor: this model is a draft head ...
+W operator(): failed to measure the memory of the extra model, fitting without it
+```
+
+Speculation still runs. `-c`, `-ngl` and `--tensor-split` are all set explicitly, so the unmeasured draft only matters if VRAM is already at the edge; switch to the self-contained `MTP/mtp-Qwen3.8-Flash-Next-Q8_0.gguf` if you want a clean fit measurement.
+
+**Confirm it is on.** After the first request, the log should show acceptance stats:
+
+```bash
+make logs llama qwen3.8-flash | grep "draft acceptance"
+# draft acceptance = 0.66139 (325 accepted / 491 generated), mean len = 2.76
+```
+
+If that line never appears, speculation is off — almost always a build without MTP support (i.e. the stock image).
+
+**When it hurts.** Unsloth measured MTP as a **net loss (~0.81–0.87×) at concurrency 8**: a busy model has no idle capacity for a draft to exploit. The service runs `--parallel 4`; if the box regularly has several simultaneous streams, drop `--spec-type` / `-md` / `-hfd` from the command (or lower `--parallel`). Higher sampling temperature also lowers acceptance — the 1.67× headline is a greedy number.
+
 ### First-run download
 
-The `glm5.2` service uses llama-server's `-hf` flag to download the GGUF from HuggingFace on first start. The weights land in the `llama_data` named volume (`/root/.cache/llama.cpp`) so subsequent starts are instant. Expect the first launch to take a while — UD-IQ1_S is ~176 GB across split GGUF files. Follow progress with:
+Both services use llama-server's `-hf` flag (and, for `qwen3.8-flash`, `-hfd` + `-md` for the MTP head) to download GGUFs from HuggingFace on first start. The weights land in the `llama_data` named volume, mounted at `/root/.cache/huggingface` — llama-server keeps a HuggingFace-hub-style cache at `~/.cache/huggingface/hub` (override with `LLAMA_CACHE` or `HF_HUB_CACHE`) — so subsequent starts are instant. Expect the first launch to take a while — UD-IQ1_S is ~176 GB across split GGUF files. Follow progress with:
 
 ```bash
 make logs llama glm5.2
@@ -164,6 +216,8 @@ curl http://localhost:4001/v1/chat/completions \
 ### Non-obvious constraints
 
 - **`ghcr.io/ggml-org/llama.cpp:server-cuda` is a moving tag.** Upstream ships fast and occasionally changes CLI flag names (`--n-cpu-moe` is relatively new — added mid-2026). If you upgrade and see `unrecognized argument`, pin to a specific dated tag from https://github.com/ggml-org/llama.cpp/pkgs/container/llama.cpp.
+- **`qwen3.8-flash` is pinned, `glm5.2` is not.** The Unsloth prebuild is pinned by `LLAMA_UNSLOTH_TAG`; it is a full llama.cpp (`b10796` upstream + patches), so every flag the stock image accepts works there too. The two images can drift apart in flag names independently — check the pinned release when a flag rename appears upstream.
+- **`llama_data` must stay mounted at `/root/.cache/huggingface`.** llama-server writes `-hf` / `-hfd` downloads to `~/.cache/huggingface/hub/models--<owner>--<repo>/` (same layout as the `huggingface_hub` Python library). Mounting the volume anywhere else means a full re-download on every `--force-recreate`.
 - **Split GGUF files auto-resolve via `-hf`.** UD-IQ1_S ships as `*-00001-of-000NN.gguf` chunks. llama-server fetches and stitches them; you don't need to pass any of the individual filenames.
 - **`--mlock` requires the container to have the `IPC_LOCK` capability on kernels that enforce RLIMIT_MEMLOCK.** If model load fails with a mlock error, add `cap_add: [IPC_LOCK]` to the service. Not needed on typical Docker Desktop / systemd setups.
 - **First request after boot is slow even after model load** — llama.cpp does a warmup pass on the first inference call.
@@ -179,6 +233,10 @@ curl http://localhost:4001/v1/chat/completions \
 | Deleting `llama_data` to "free space" | Full re-download of 176 GB on next start. |
 | Running `-hf` behind a proxy without `HF_TOKEN` for gated repos | `unsloth/GLM-5.2-GGUF` is currently public, but any private/gated repo download will 401. |
 | Editing `docker-compose.llama.yml` without `--force-recreate` | Old container keeps running with old flags. |
+| Running `qwen3.8-flash` on the stock `ghcr.io/ggml-org/llama.cpp:server-cuda` image | MTP head cannot load (`exactly one out of metadata, path_model, and file must be defined`) or speculation silently stays off. Keep the `build:` block / `Dockerfile.llama-unsloth`. |
+| Passing the MTP head as an `-hfd` tag (`repo:MTP/file.gguf`) | Tag is matched as a quant name → nothing resolves. Use `-hfd repo` + `-md MTP/file.gguf`. |
+| Bumping `LLAMA_UNSLOTH_TAG` without `--build` | Compose reuses the old local image (the tag is in the image name, so `up -d --build` is required). |
+| Moving the `llama_data` mount off `/root/.cache/huggingface` | Every `--force-recreate` re-downloads all weights. |
 
 ### No tests
 

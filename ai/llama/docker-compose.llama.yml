@@ -119,16 +119,23 @@ services:
     # runs the tiny draft ahead to propose 4-16 tokens per step and the main
     # 125B/6B-active model verifies them in one forward pass — Unsloth claims
     # 1.3-1.7x tok/s uplift with no quality loss.
-    # ⚠ One thing left to verify on first `up --force-recreate`:
-    #   The tag `MTP-Q4_K_M` resolves on the HF repo. If it 404s, the
-    #   likely alternates are `MTP_Q4_K_M`, or a subfolder-style tag
-    #   like `mtp/UD-Q4_K_M`. Check the repo file tree.
-    # (`-hfd` and `-ngld` were already accepted; `--spec-draft-n-max` /
-    # `--spec-draft-n-min` are the renamed speculative-decoding knobs —
-    # llama-server errored on the old `--draft-max` / `--draft-min` names.)
+    # The MTP draft lives at MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf inside
+    # the same repo — MTP/ is a directory containing multiple quants (Q4_K_M,
+    # Q8_0, BF16, plus shared-embedding variants), so the tag after the colon
+    # is the full file path relative to repo root, not a quant tag.
+    #
+    # ⚠ If `-hfd` with a file-path tag still errors on startup, fall back to
+    # the pre-downloaded local-file variant: comment out the `-hfd ...` line
+    # and uncomment the `--model-draft ...` line below, after downloading
+    # the file into the llama_data volume with:
+    #   docker run --rm -v ai-llama_llama_data:/c curlimages/curl \
+    #     -sL -o /c/mtp-Q4_K_M.gguf \
+    #     https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/main/MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf
     command: >
       -hf unsloth/Qwen3.8-Flash-Next-GGUF:UD-Q4_K_XL
-      -hfd unsloth/Qwen3.8-Flash-Next-GGUF:MTP-Q4_K_M
+      -hfd unsloth/Qwen3.8-Flash-Next-GGUF:MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf
+      # Fallback (uncomment after downloading — see comment above):
+      # --model-draft /root/.cache/huggingface/mtp-Q4_K_M.gguf
       -ngld 999
       --spec-draft-n-max 16
       --spec-draft-n-min 4

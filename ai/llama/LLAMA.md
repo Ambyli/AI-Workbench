@@ -99,7 +99,20 @@ make logs llama qwen3.8-flash | grep "draft acceptance"
 
 If that line never appears, speculation is off — almost always a build without MTP support (i.e. the stock image).
 
-**When it hurts.** Unsloth measured MTP as a **net loss (~0.81–0.87×) at concurrency 8**: a busy model has no idle capacity for a draft to exploit. The service runs `--parallel 4`; if the box regularly has several simultaneous streams, drop `--spec-type` / `-md` / `-hfd` from the command (or lower `--parallel`). Higher sampling temperature also lowers acceptance — the 1.67× headline is a greedy number.
+**When it hurts.** Unsloth measured MTP as a **net loss (~0.81–0.87×) at concurrency 8**: a busy model has no idle capacity for a draft to exploit. The service runs `--parallel 2` for that reason — two slots is where MTP still pays off, and it leaves each slot 524k of the 1M context. If the box regularly has several simultaneous streams, drop `--spec-type` / `-md` / `-hfd` from the command rather than raising `--parallel`. Higher sampling temperature also lowers acceptance — the 1.67× headline is a greedy number.
+
+### `qwen3.8-flash` context and output budget
+
+`-c 1048576` is split evenly across `--parallel` slots, so each request gets `1048576 / 2 = 524288` tokens. `--n-predict 65536` is the hard per-request output cap — llama-server clamps any larger client `max_tokens` to it. The LiteLLM entry mirrors the split:
+
+| Setting | Where | Value |
+|---|---|---|
+| Context per slot | llama-server (`-c` / `--parallel`) | 524,288 |
+| `--n-predict` | llama-server | 65,536 |
+| `max_tokens`, `max_output_tokens` | `ai/litellm/litellm_config.yaml` → `qwen3.8-flash` | 65,536 |
+| `max_input_tokens` | same entry | 458,752 |
+
+Why 64k output: Qwen3.8 runs in thinking mode with reasoning preserved, and Unsloth's guidance for Qwen thinking models is a 32k output budget for most prompts and ~80k for hard reasoning. 64k covers nearly everything without starving input. Change `--n-predict`, `max_tokens` / `max_output_tokens`, and `max_input_tokens` **together** — input + output must equal the slot size, and `max_input_tokens` is what `context_window_fallbacks` uses to decide when a request is too big and gets routed to `claude-sonnet-5` (the paid model). Recreate both `qwen3.8-flash` and `litellm` after editing.
 
 ### First-run download
 

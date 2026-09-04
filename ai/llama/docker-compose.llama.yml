@@ -159,6 +159,13 @@ services:
     # Confirm it is active by grepping the log for `draft acceptance =`.
     # Caveat: Unsloth measured MTP as a net LOSS (~0.85x) at concurrency 8 —
     # it pays off for one or two simultaneous streams, not a busy server.
+    # Hence --parallel 2: two slots of 524288 ctx each (-c is split evenly
+    # across slots). --n-predict 65536 is the hard per-request output cap;
+    # the LiteLLM qwen3.8-flash entry mirrors it as max_tokens /
+    # max_output_tokens with max_input_tokens = 524288 - 65536 = 458752.
+    # Change the three together — llama-server clamps any client max_tokens
+    # to --n-predict, and LiteLLM uses max_input_tokens to decide when to
+    # fall back to claude-sonnet-5.
     # Do NOT paste a `#` comment inside the `command: >` block — YAML's
     # folded scalar has no comment syntax and it'll be folded into the
     # command string as a literal `#`, breaking arg parsing.
@@ -174,8 +181,8 @@ services:
       -ngl 999
       --tensor-split 1,1,1
       -c 1048576
-      --parallel 4
-      --n-predict 16384
+      --parallel 2
+      --n-predict 65536
       --cache-type-k q8_0
       --cache-type-v q8_0
       --flash-attn on

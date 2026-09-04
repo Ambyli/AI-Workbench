@@ -138,7 +138,7 @@ model_list:
       model: openai/qwen3.8-flash
       api_base: http://qwen3.8-flash:8000/v1
       api_key: none
-      max_tokens: 16384
+      max_tokens: 65536
       temperature: 1.0
       top_p: 0.95
       frequency_penalty: 0
@@ -148,8 +148,11 @@ model_list:
         min_p: 0
       stream_timeout: 600
     model_info:
-      max_input_tokens: 245760
-      max_output_tokens: 16384
+      # qwen3.8-flash runs -c 1048576 --parallel 2 -> 524288 ctx per slot,
+      # --n-predict 65536. input + output must equal the slot size; keep
+      # these three in sync with ai/llama/docker-compose.llama.yml.
+      max_input_tokens: 458752
+      max_output_tokens: 65536
 
   - model_name: glm5.2
     litellm_params:

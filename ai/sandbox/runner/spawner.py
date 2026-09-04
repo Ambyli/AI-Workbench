@@ -352,7 +352,7 @@ class Spawner:
 
         Backs the ``create`` MCP tool: the model wants a warm container
         while it's still composing the real code. First subsequent
-        ``update_files`` overlays the real project on top of these
+        ``write_files`` overlays the real project on top of these
         placeholders, and the dev server hot-reloads.
 
         Everything about the resulting container — network, caps, TTL,
@@ -410,7 +410,7 @@ class Spawner:
     def probe_health(
         self, container_name: str, port: int, path: str, timeout_s: float = 3.0
     ) -> dict:
-        """Single-shot health probe used after ``update_files``.
+        """Single-shot health probe used after ``write_files``.
 
         Distinct from ``readiness_ok`` — that one polls until it succeeds
         or deadline. This one takes a single measurement and reports it
@@ -755,7 +755,7 @@ class Spawner:
         """Append a boundary line to ``/tmp/sandbox.log``.
 
         Called by the reuse path in ``app._apply_files`` right before
-        ``update_files``. A subsequent
+        ``write_files``. A subsequent
         ``tail_logs_since_last_marker`` uses this line as an anchor so
         the response contains only what the dev server printed AFTER
         the overlay — old tracebacks stay on disk (visible to
@@ -786,7 +786,7 @@ class Spawner:
                     "/bin/sh",
                     "-c",
                     (
-                        "printf -- '\\n--- update_files reload %s ---\\n' "
+                        "printf -- '\\n--- write_files reload %s ---\\n' "
                         "\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" "
                         ">> /tmp/sandbox.log"
                     ),
@@ -844,7 +844,7 @@ class Spawner:
         self, container_name: str, n_lines: int = 100
     ) -> str:
         """Return log content written after the LAST
-        ``--- update_files reload …`` marker.
+        ``--- write_files reload …`` marker.
 
         Paired with ``write_reload_marker``. If no marker is present
         (e.g. write failed silently, or the caller skipped it),
@@ -875,7 +875,7 @@ class Spawner:
                     "-c",
                     (
                         "awk 'BEGIN{seen=0} "
-                        "/--- update_files reload /"
+                        "/--- write_files reload /"
                         "{buf=\"\"; seen=1; next} "
                         "seen{buf = buf $0 ORS} "
                         "END{printf \"%s\", buf}' /tmp/sandbox.log "
@@ -901,7 +901,7 @@ class Spawner:
         )
         return text
 
-    def update_files(
+    def write_files(
         self,
         container_name: str,
         files: dict[str, FileEntry],
@@ -925,18 +925,18 @@ class Spawner:
                 ["rm", "-rf", f"/app/{safe}"],
                 user="1000:1000",
             )
-            log.debug("update_files: rm -rf /app/%s in %s", safe, container_name)
+            log.debug("write_files: rm -rf /app/%s in %s", safe, container_name)
         if files:
             tarball = _make_tarball(files)
             container.put_archive("/app", tarball)
             log.info(
-                "update_files: %s ← %d file(s) via put_archive (%d bytes tar); "
+                "write_files: %s ← %d file(s) via put_archive (%d bytes tar); "
                 "removed %d",
                 container_name, len(files), len(tarball), len(deletes),
             )
         else:
             log.info(
-                "update_files: %s deletes-only: %d file(s) removed",
+                "write_files: %s deletes-only: %d file(s) removed",
                 container_name, len(deletes),
             )
 
@@ -962,7 +962,7 @@ class Spawner:
         Returns ``(hunks_applied, mismatch)``. If ``mismatch`` is
         non-None, ``hunks_applied`` is empty — no files were touched.
 
-        Path validation reuses ``_safe_relpath`` — same as ``update_files``
+        Path validation reuses ``_safe_relpath`` — same as ``write_files``
         and ``deletes``. Line ending on the final line: we split with
         ``splitlines(keepends=False)`` so the join is trailing-newline-
         preserving as long as the caller's ``expected`` also omits its
@@ -1048,7 +1048,7 @@ class Spawner:
                         patch_index=idx + 1,
                         message=(
                             "patch_files does not create files; use "
-                            "update_files for new files."
+                            "write_files for new files."
                         ),
                     )
                 data, _size, _truncated = _extract_file_from_tar_stream(
@@ -1068,7 +1068,7 @@ class Spawner:
                         patch_index=idx + 1,
                         message=(
                             "cannot patch a non-UTF-8 file. Use "
-                            "update_files to overwrite it entirely."
+                            "write_files to overwrite it entirely."
                         ),
                     )
                 # Preserve trailing newline info so the writeback is
@@ -1407,7 +1407,7 @@ def _encode_bytes_for_response(
 
     UTF-8 files get emitted as text; anything with a null byte or
     invalid UTF-8 is base64-encoded so the caller can round-trip binary
-    content through the same overlay format ``update_files`` accepts.
+    content through the same overlay format ``write_files`` accepts.
     """
     if b"\x00" in data:
         return {

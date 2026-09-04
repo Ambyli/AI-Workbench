@@ -359,7 +359,7 @@ async def _do_create(
         raise HTTPException(500, f"spawn failed: {exc}")
 
 
-async def _do_update_files(
+async def _do_write_files(
     session_id: str,
     files: dict[str, FileContent],
     deletes: list[str],
@@ -398,7 +398,7 @@ async def _do_update_files(
                     "that range in this turn, call get_files(paths=[...]) "
                     "first — patch_files requires a byte-for-byte match on "
                     "`expected`.\n\n"
-                    "Use update_files (whole-file rewrite) only when the "
+                    "Use write_files (whole-file rewrite) only when the "
                     "fix is a large refactor, a new file, or the target "
                     "file's content has drifted from what you have."
                 ),
@@ -434,7 +434,7 @@ async def _do_update_files(
                 "session_id": session_id,
                 "hint": (
                     "Sandbox is no longer running (container gone). To keep "
-                    "working under this session_id, call update_files "
+                    "working under this session_id, call write_files "
                     "again with recreate_if_gone=true. The container will "
                     "be respawned FRESH — packages installed via exec and "
                     "in-container files not in your current files map will "
@@ -472,7 +472,7 @@ async def _apply_files_to_running(
     )
     try:
         await asyncio.to_thread(
-            state.spawner.update_files,
+            state.spawner.write_files,
             existing["container_name"],
             files,
             deletes,
@@ -543,7 +543,7 @@ async def _respawn_session(
             {
                 "error": "cannot self-heal: runtime metadata missing",
                 "session_id": session_id,
-                "hint": "Call create + update_files to start fresh.",
+                "hint": "Call create + write_files to start fresh.",
             },
         )
     result = await _reuse_or_spawn(
@@ -608,7 +608,7 @@ async def _do_exec(
                 "session_id": session_id,
                 "hint": (
                     "exec requires a running container. If self-heal "
-                    "should recreate one, call update_files first with "
+                    "should recreate one, call write_files first with "
                     "recreate_if_gone=true — but note that packages you "
                     "install via exec do NOT survive a respawn."
                 ),
@@ -655,12 +655,12 @@ async def _do_patch_files(
          structured 409 with the actual current content when applicable.
       2. Apply — bottom-up per file so earlier hunks' line indices stay
          valid. Then a single put_archive per file, followed by the same
-         500 ms settle + HTTP health probe update_files uses.
+         500 ms settle + HTTP health probe write_files uses.
 
     ``recreate_if_gone`` is accepted for interface consistency but does
     NOT trigger a respawn — a fresh container would not have the file
     the patch anchors on, so callers are told to establish state via
-    update_files first.
+    write_files first.
     """
     if state.registry is None or state.spawner is None or state.slot_sem is None:
         raise HTTPException(500, "runner not initialized")
@@ -678,7 +678,7 @@ async def _do_patch_files(
                 "session_id": session_id,
                 "hint": (
                     "No running sandbox for this session_id. Call `create` "
-                    "or `run` first, then `update_files` to establish files, "
+                    "or `run` first, then `write_files` to establish files, "
                     "then `patch_files` for targeted edits."
                 ),
             },
@@ -697,7 +697,7 @@ async def _do_patch_files(
                 "hint": (
                     "patch_files cannot respawn — it depends on files that "
                     "would not exist in a fresh container. Call "
-                    "update_files first (with recreate_if_gone=true if you "
+                    "write_files first (with recreate_if_gone=true if you "
                     "want to force a respawn) to establish file state, then "
                     "reissue your patches."
                 ),
@@ -822,13 +822,13 @@ _PATCH_KIND_TO_ERROR = {
 def _PATCH_HINT_FOR(kind: str) -> str:
     if kind == "missing_file":
         return (
-            "patch_files does not create files. Call update_files with "
+            "patch_files does not create files. Call write_files with "
             "the file's full content to create it first."
         )
     if kind == "binary_file":
         return (
             "The target file is not UTF-8 (contains a null byte or "
-            "invalid encoding). Use update_files with a base64 payload "
+            "invalid encoding). Use write_files with a base64 payload "
             "to overwrite it entirely."
         )
     if kind == "out_of_range":
@@ -871,7 +871,7 @@ async def _do_preview(session_id: str) -> dict:
                 "session_id": session_id,
                 "hint": (
                     "preview is display-only and does not respawn. If the "
-                    "container died, call update_files with "
+                    "container died, call write_files with "
                     "recreate_if_gone=true first, then call preview again."
                 ),
             },
@@ -1085,7 +1085,7 @@ async def _reuse_or_spawn(
 
     Two branches:
       * ``session_id`` names a live container → overlay + probe. Same shape
-        as ``_do_update_files`` but returns the ``run`` response schema.
+        as ``_do_write_files`` but returns the ``run`` response schema.
       * No session_id, OR the session's container is gone AND
         ``recreate_if_gone`` is true → full spawn.
 

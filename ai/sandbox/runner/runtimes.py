@@ -7,7 +7,7 @@ per-sandbox Caddy config.
 
 Adding a new language is a single entry here plus a new Dockerfile in
 ``ai/sandbox/images/<name>.Dockerfile``. The runner enforces that ``runtime``
-values from ``POST /run`` and the ``run`` / ``create`` / ``update_files``
+values from ``POST /run`` and the ``run`` / ``create`` / ``write_files``
 MCP tools are keys in this dict — nothing else is spawnable.
 """
 
@@ -30,7 +30,7 @@ _WARMING_HTML_BODY = (
     "margin:0;font-family:system-ui;padding:1.5rem;background:#0e1116;"
     "color:#e6edf3\"><h1 style=\"margin:0 0 0.5rem\">sandbox warming</h1>"
     "<p style=\"margin:0;opacity:0.8\">the model is preparing your app. "
-    "this placeholder is replaced as soon as <code>update_files</code> "
+    "this placeholder is replaced as soon as <code>write_files</code> "
     "runs.</p></body></html>"
 )
 
@@ -56,7 +56,7 @@ class Runtime:
             wrapper script the entrypoint invokes.
         warming_files: Placeholder files written into the container when
             ``create`` is called without user files. Once the model calls
-            ``update_files`` on the same session, these are overlaid /
+            ``write_files`` on the same session, these are overlaid /
             deleted by the real code. Kept minimal so cold start under
             ``create`` is nearly indistinguishable from the empty case.
         summary: One-line human/model-readable description shown by the
@@ -115,7 +115,7 @@ RUNTIMES: dict[str, Runtime] = {
         },
         # nginx needs at least one file at /app/index.html to satisfy the
         # readiness probe. The warming file gets overwritten by the model's
-        # own index.html on the first update_files call.
+        # own index.html on the first write_files call.
         warming_files={"index.html": _WARMING_HTML_BODY},
     ),
     # Python 3.11-slim with the common web-app frameworks pre-installed.

@@ -28,7 +28,7 @@ MCP tool surface (all under the ``sandbox`` server):
 
     get_runtime_types()             — describe available runtime types (catalog)
     create(runtime, env?, ...)      — warm an empty container, returns session
-    update_files(session_id, files, deletes?, recreate_if_gone?)
+    write_files(session_id, files, deletes?, recreate_if_gone?)
                                     — overlay files, health-probe after
     get_files(session_id, paths?)   — read files back from /app
     get_logs(session_id, lines?)    — tail container stdout+stderr
@@ -47,7 +47,7 @@ HTTP endpoints:
     GET  /jobs/{id}                 one sandbox detail
     DELETE /jobs/{id}               tear down a sandbox early
     GET  /sessions                  list live sessions (list_sessions backing)
-    POST /session/{id}/files        update_files overlay (JSON)
+    POST /session/{id}/files        write_files overlay (JSON)
     GET  /session/{id}/files        list files under /app or read specified paths
     POST /session/{id}/exec         run a shell command in the container
     POST /session/{id}/patch        strict line-range file edits (patch_files)
@@ -101,7 +101,7 @@ from models import (
     PatchFilesRequest,
     RunRequest,
     RunResponse,
-    UpdateFilesRequest,
+    WriteFilesRequest,
 )
 from operations import (
     _do_browser_log_ingest,
@@ -112,7 +112,7 @@ from operations import (
     _do_list_sessions,
     _do_patch_files,
     _do_preview,
-    _do_update_files,
+    _do_write_files,
     _find_running_session,
     _reuse_or_spawn,
 )
@@ -212,17 +212,17 @@ async def _mcp_create(
     return await _do_create(runtime, ttl_seconds, entrypoint, env)
 
 
-async def _mcp_update_files(
+async def _mcp_write_files(
     session_id: str,
     files: dict,
     deletes: list[str],
     recreate_if_gone: bool,
 ) -> dict:
     log.debug(
-        "MCP update_files: session=%s n_files=%d n_deletes=%d recreate=%s",
+        "MCP write_files: session=%s n_files=%d n_deletes=%d recreate=%s",
         session_id, len(files or {}), len(deletes or []), recreate_if_gone,
     )
-    return await _do_update_files(session_id, files, deletes, recreate_if_gone)
+    return await _do_write_files(session_id, files, deletes, recreate_if_gone)
 
 
 async def _mcp_get_files(
@@ -286,7 +286,7 @@ _mcp = build_mcp(
     run_callable=_mcp_run,
     logs_callable=_mcp_get_logs,
     create_callable=_mcp_create,
-    update_files_callable=_mcp_update_files,
+    write_files_callable=_mcp_write_files,
     get_files_callable=_mcp_get_files,
     exec_callable=_mcp_exec,
     patch_files_callable=_mcp_patch_files,
@@ -421,10 +421,10 @@ async def sessions_list() -> dict:
 
 
 @app.post("/session/{session_id}/files", response_model=RunResponse)
-async def session_update_files(
-    session_id: str, req: UpdateFilesRequest,
+async def session_write_files(
+    session_id: str, req: WriteFilesRequest,
 ) -> RunResponse:
-    result = await _do_update_files(
+    result = await _do_write_files(
         session_id, req.files, req.deletes, req.recreate_if_gone,
     )
     return RunResponse(**result)

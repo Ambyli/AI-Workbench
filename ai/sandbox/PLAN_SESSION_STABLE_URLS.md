@@ -1,17 +1,17 @@
 # Plan: Session-stable preview URLs
 
 **Status:** deferred — design captured, implementation not started.
-**Related:** [SANDBOX.md § Public iframe routing](SANDBOX.md), the `create` / `update_files` / `run` MCP tools.
+**Related:** [SANDBOX.md § Public iframe routing](SANDBOX.md), the `create` / `write_files` / `run` MCP tools.
 
 ## Problem
 
-Today the preview URL returned by `create` / `update_files` / `run` is
+Today the preview URL returned by `create` / `write_files` / `run` is
 
 ```
 <SANDBOX_PROXY_URL>/{sandbox_id}/
 ```
 
-where `sandbox_id` is the internal id of a specific container. When the runner self-heals a session (container crashed / was reaped / update_files respawned with `recreate_if_gone=true`), the new container gets a **new** `sandbox_id`. The URL changes, and:
+where `sandbox_id` is the internal id of a specific container. When the runner self-heals a session (container crashed / was reaped / write_files respawned with `recreate_if_gone=true`), the new container gets a **new** `sandbox_id`. The URL changes, and:
 
 - The `<iframe>` in the artifacts panel loads a new URL. In-flight in-app state is lost regardless (the app itself restarted), but the URL change also breaks any bookmark or link the user copied from the address bar.
 - The download URL (`/sandboxes/download/{session_id}`) already uses `session_id`, so it stays valid across self-heal. The preview URL doesn't — inconsistent surface.
@@ -77,7 +77,7 @@ Caching the session→container mapping in the runner (in-memory dict, invalidat
 Enable Caddy's admin API (`caddy.admin.listen 0.0.0.0:2019` on the internal network). On every session lifecycle event, runner calls:
 
 - **`create`** → `POST /config/apps/http/servers/srv0/routes` with a new route object routing `/session/{sid}/*` to `sandbox-{sandbox_id}:80`.
-- **Self-heal respawn in `update_files`** → `PATCH /config/apps/http/servers/srv0/routes/{route_id}` swapping the container id.
+- **Self-heal respawn in `write_files`** → `PATCH /config/apps/http/servers/srv0/routes/{route_id}` swapping the container id.
 - **`close`** and reaper cleanup → `DELETE /config/apps/http/servers/srv0/routes/{route_id}`.
 
 **Pros:**
@@ -167,7 +167,7 @@ In-memory `dict[session_id, container_name]` with TTL invalidation. Populated on
 
 Invalidation is straightforward because the runner is the ONLY writer of session state — no cross-process cache invalidation problem.
 
-### URL returned by `create` / `update_files` / `run` / `preview`
+### URL returned by `create` / `write_files` / `run` / `preview`
 
 Changes from:
 
@@ -237,7 +237,7 @@ All the WS paths are relative to `/session/{sid}/…` after the Caddy rewrite. T
 - `ai/sandbox/proxies/sandbox-proxy.Caddyfile` — add `handle_path /session/*` route pointing at runner.
 - `ai/sandbox/runner/app.py` — new `/internal/session-proxy/{session_id}/{path:path}` route + WebSocket support. New helper module `session_proxy.py` for the streaming/WS code.
 - `ai/sandbox/runner/session_cache.py` (new) — in-memory session→container cache with lifecycle-event invalidation.
-- `ai/sandbox/runner/app.py` — hook `create`, `_do_update_files` respawn branch, `close`, reaper events to invalidate the cache and emit warming-page during respawns.
+- `ai/sandbox/runner/app.py` — hook `create`, `_do_write_files` respawn branch, `close`, reaper events to invalidate the cache and emit warming-page during respawns.
 - URL generation in `_do_create` / `_apply_files_to_running` / `_respawn_session` — swap `sandbox_id` → `session_id` in the returned `url`. Preserve the sandbox_id form in structured content for operators.
 - `SANDBOX.md § Public iframe routing` — new subsection explaining `/session/` vs `/{sandbox_id}/`.
 - `ENDPOINTS.md` — new row for `/internal/session-proxy` (internal-only, not called by external clients directly).

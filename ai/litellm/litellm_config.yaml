@@ -4,10 +4,12 @@ litellm_settings:
   drop_params: true
   turn_off_message_logging: true
   json_logs: false
+  enable_pre_call_checks: true
   context_window_fallbacks:
-    - qwen3.6: ["claude-sonnet-5"]
-    - qwen3.8: ["claude-sonnet-5"]
-    - glm5.2: ["claude-sonnet-5"]
+    - {"qwen3.6":       ["claude-sonnet-5"]}
+    - {"qwen3.8":       ["claude-sonnet-5"]}
+    - {"qwen3.8-flash": ["claude-sonnet-5"]}
+    - {"glm5.2":        ["claude-sonnet-5"]}
 
 general_settings:
   master_key: os.environ/DEFAULT_LITELLM_MASTER_KEY
@@ -105,6 +107,9 @@ model_list:
         top_k: 20
         min_p: 0
       stream_timeout: 300
+    model_info:
+      max_input_tokens: 114688
+      max_output_tokens: 16384
 
   - model_name: qwen3.8
     litellm_params:
@@ -120,6 +125,27 @@ model_list:
         top_k: 20
         min_p: 0
       stream_timeout: 300
+    model_info:
+      max_input_tokens: 114688
+      max_output_tokens: 16384
+
+  - model_name: qwen3.8-flash
+    litellm_params:
+      model: openai/qwen3.8-flash
+      api_base: http://qwen3.8-flash:8000/v1
+      api_key: none
+      max_tokens: 16384
+      temperature: 1.0
+      top_p: 0.95
+      frequency_penalty: 0
+      presence_penalty: 0
+      extra_body:
+        top_k: 20
+        min_p: 0
+      stream_timeout: 300
+    model_info:
+      max_input_tokens: 114688
+      max_output_tokens: 16384
 
   - model_name: glm5.2
     litellm_params:
@@ -135,6 +161,9 @@ model_list:
         top_k: 40
         min_p: 0
       stream_timeout: 600
+    model_info:
+      max_input_tokens: 32768
+      max_output_tokens: 32768
 
   - model_name: qwen2.5-vl
     litellm_params:

@@ -13,7 +13,7 @@ Everything below is served by [`ai/sandbox/runner/app.py`](app.py). Jobs endpoin
 | `POST` | `/run` | Spawn a sandbox — or update an existing one when `session_id` is passed. Backing endpoint for `sandbox.run`. Returns JSON with URL, session_id, `reused`, `app_status`, `recreated` |
 | `POST` | `/create` | Reserve an empty warming container of the chosen runtime. Backing endpoint for `sandbox.create` |
 | `GET` | `/sessions` | Enumerate live sessions. Backing endpoint for `sandbox.list_sessions` |
-| `POST` | `/session/{session_id}/files` | Overlay files into a live sandbox. Backing endpoint for `sandbox.update_files` |
+| `POST` | `/session/{session_id}/files` | Overlay files into a live sandbox. Backing endpoint for `sandbox.write_files` |
 | `GET` | `/session/{session_id}/files` | Read files back from `/app` — dir listing when `paths` is omitted, contents inline otherwise. Backing endpoint for `sandbox.get_files` |
 | `POST` | `/session/{session_id}/exec` | Run a non-interactive shell command inside the container. Backing endpoint for `sandbox.exec` |
 | `POST` | `/session/{session_id}/patch` | Strict line-range file edits (all-or-nothing). Backing endpoint for `sandbox.patch_files` |
@@ -98,7 +98,7 @@ Field semantics:
 | `session_id` | string | no | Persistent handle across turns. Regex `^[A-Za-z0-9_-]{1,64}$`. Omit on first call — the server generates one. |
 | `deletes` | `[path, …]` | no | Relative paths under `/app` to remove. Same sanitization as `files`. Ignored on the first call. |
 | `env` | `{str: str}` | no | Process env vars set inside the container. Immutable after spawn (self-heal replays the recorded env). Reserved keys (`HTTP_PROXY`, `PYTHONUNBUFFERED`, `TERM`, etc.) are rejected. |
-| `recreate_if_gone` | bool | no | Default `true` for backward compat with `POST /run`. If the session's container is gone, silently respawn. Set `false` to force the caller to reason about self-heal explicitly (recommended for direct `update_files` calls, but `/run` keeps the historical default). |
+| `recreate_if_gone` | bool | no | Default `true` for backward compat with `POST /run`. If the session's container is gone, silently respawn. Set `false` to force the caller to reason about self-heal explicitly (recommended for direct `write_files` calls, but `/run` keeps the historical default). |
 
 **Response (200):**
 ```json
@@ -275,7 +275,7 @@ Returns EVERY live session globally — no per-user filtering. Documented explic
 
 ## `POST /session/{session_id}/files`
 
-Overlay files into a live sandbox. Backs `sandbox.update_files`.
+Overlay files into a live sandbox. Backs `sandbox.write_files`.
 
 **Body:**
 ```json
@@ -442,7 +442,7 @@ Behavior:
 - **Trailing newline preserved.** If the file ended with `\n` before, it does after.
 - **`last_used_at` bumped** only on successful apply.
 - **Post-write health probe** (same as `POST /session/{id}/files`): 500 ms settle → single HTTP probe against the runtime's `readiness_probe_path` on port 80 → result inline in `app_status`.
-- **No self-heal.** `recreate_if_gone` is accepted but ignored — a fresh container has no files to anchor on, so a dead container always returns 409 with a hint to call `update_files` first.
+- **No self-heal.** `recreate_if_gone` is accepted but ignored — a fresh container has no files to anchor on, so a dead container always returns 409 with a hint to call `write_files` first.
 
 **Structured 409 shape (`content_mismatch`):**
 ```json
@@ -467,7 +467,7 @@ Other `kind` values: `out_of_range` (adds `file_line_count`), `overlap` (adds `o
 
 **Errors:** 400 on invalid session_id or empty `patches`; 404 on session not found; 409 on any dry-run failure or dead container; 413 on payload cap exceeded.
 
-See [`SANDBOX.md § Targeted edits (patch_files)`](SANDBOX.md#targeted-edits-patch_files) for the "when to use vs update_files" flow and worked examples.
+See [`SANDBOX.md § Targeted edits (patch_files)`](SANDBOX.md#targeted-edits-patch_files) for the "when to use vs write_files" flow and worked examples.
 
 ---
 
@@ -763,7 +763,7 @@ Eleven tools registered on the `sandbox` MCP server. Every tool returns a `ToolR
 |---|---|---|
 | `get_runtime_types` | (in-process; no HTTP backing) | Describe runtime types (catalog — not a session status check) |
 | `create` | `POST /create` | Reserve an empty warming container |
-| `update_files` | `POST /session/{id}/files` | Overlay files, run health probe |
+| `write_files` | `POST /session/{id}/files` | Overlay files, run health probe |
 | `get_files` | `GET /session/{id}/files` | Read files back from `/app` |
 | `get_logs` | `GET /session/{id}/logs` | Tail combined stdout+stderr |
 | `exec` | `POST /session/{id}/exec` | Run a non-interactive shell command |
@@ -780,7 +780,7 @@ Eleven tools registered on the `sandbox` MCP server. Every tool returns a `ToolR
 **Structured payload highlights:**
 
 - `create` / `run` → `{ok, session_id, sandbox_id, url, expires_at, runtime, app_status, reused, recreated}`
-- `update_files` → adds `startup_output`, `app_status`, `recreated` (self-heal flag)
+- `write_files` → adds `startup_output`, `app_status`, `recreated` (self-heal flag)
 - `get_files` → `{ok, session_id, sandbox_id, files: [{path, size, encoding, content, truncated, error?}, …]}`
 - `get_logs` → `{ok, session_id, sandbox_id, lines_requested, logs, empty?}`
 - `exec` → `{ok, session_id, sandbox_id, command, exit_code, duration_ms, output, truncated, timed_out}`
@@ -866,7 +866,7 @@ curl -X POST http://localhost:8012/mcp/ ... \
 # 2. Overlay code once you've finished writing it (opt-in self-heal off)
 curl -X POST http://localhost:8012/mcp/ ... \
   -d '{... "method": "tools/call",
-        "params": {"name": "update_files",
+        "params": {"name": "write_files",
                    "arguments": {"session_id": "X",
                                  "files": {"app.py": "import streamlit as st..."}}}}'
 

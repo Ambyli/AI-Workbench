@@ -124,7 +124,7 @@ EXEC_MAX_OUTPUT_BYTES = 8 * 1024
 
 # Post-update HTTP health probe deadline. Single-shot GET against the
 # runtime's readiness path — long enough for a slow first render, short
-# enough to keep update_files responsive.
+# enough to keep write_files responsive.
 HEALTH_PROBE_TIMEOUT_S = 3.0
 
 # Gap between writing files into a live container and reading the log

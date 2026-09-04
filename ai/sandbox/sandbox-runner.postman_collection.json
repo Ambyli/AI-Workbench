@@ -1,7 +1,7 @@
 {
 	"info": {
 		"name": "sandbox-runner",
-		"description": "sandbox-runner endpoints, called through the LiteLLM pass-through registered in ai/litellm/litellm_config.yaml (`pass_through_endpoints` → `/v1/sandbox` → `http://sandbox-runner:8000`, `include_subpath: true`). Every request is authenticated with a Bearer token from a LiteLLM virtual key. Set the collection variables `litellm` (e.g. http://localhost:4001) and `virtual master key` (an sk-… key issued from the LiteLLM Admin UI → Virtual Keys) — every request inherits them via collection-level auth. See ai/sandbox/ENDPOINTS.md for the full endpoint reference and ai/litellm/LITELLM.md for issuing virtual keys.\n\nSessions: the workflow is get_runtime_types → create → update_files (loop with get_files / get_logs / exec) → preview → close. Or the one-shot: run. First call: omit `session_id`; server generates one and returns it. Follow-up call: pass the same `session_id` back — server writes new files into the running container's /app, returns the same URL, dev server hot-reloads. Set the `sandboxSessionId` collection variable from the first response, then run the follow-up request. See ai/sandbox/SANDBOX.md § MCP tool flow.",
+		"description": "sandbox-runner endpoints, called through the LiteLLM pass-through registered in ai/litellm/litellm_config.yaml (`pass_through_endpoints` → `/v1/sandbox` → `http://sandbox-runner:8000`, `include_subpath: true`). Every request is authenticated with a Bearer token from a LiteLLM virtual key. Set the collection variables `litellm` (e.g. http://localhost:4001) and `virtual master key` (an sk-… key issued from the LiteLLM Admin UI → Virtual Keys) — every request inherits them via collection-level auth. See ai/sandbox/ENDPOINTS.md for the full endpoint reference and ai/litellm/LITELLM.md for issuing virtual keys.\n\nSessions: the workflow is get_runtime_types → create → write_files (loop with get_files / get_logs / exec) → preview → close. Or the one-shot: run. First call: omit `session_id`; server generates one and returns it. Follow-up call: pass the same `session_id` back — server writes new files into the running container's /app, returns the same URL, dev server hot-reloads. Set the `sandboxSessionId` collection variable from the first response, then run the follow-up request. See ai/sandbox/SANDBOX.md § MCP tool flow.",
 		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
 		"_postman_id": "sandbox-runner-collection"
 	},
@@ -399,7 +399,7 @@
 						}
 					]
 				},
-				"description": "Overlay files into a live sandbox. Backs sandbox.update_files. Unlike POST /run, `recreate_if_gone` defaults to FALSE — if the container is gone, the endpoint returns a structured 409 telling you to opt in explicitly. Set to true to accept state loss (env preserved, in-container files and exec-installed packages LOST).\n\n`files` values are UTF-8 str or {encoding:'base64', content:'...'} for binary. Per-file cap SANDBOX_MAX_FILE_BYTES; total SANDBOX_MAX_PAYLOAD_BYTES.\n\nResponse: same shape as POST /run — includes `app_status` from the post-update health probe. See ENDPOINTS.md § POST /session/{session_id}/files."
+				"description": "Overlay files into a live sandbox. Backs sandbox.write_files. Unlike POST /run, `recreate_if_gone` defaults to FALSE — if the container is gone, the endpoint returns a structured 409 telling you to opt in explicitly. Set to true to accept state loss (env preserved, in-container files and exec-installed packages LOST).\n\n`files` values are UTF-8 str or {encoding:'base64', content:'...'} for binary. Per-file cap SANDBOX_MAX_FILE_BYTES; total SANDBOX_MAX_PAYLOAD_BYTES.\n\nResponse: same shape as POST /run — includes `app_status` from the post-update health probe. See ENDPOINTS.md § POST /session/{session_id}/files."
 			},
 			"response": []
 		},
@@ -551,7 +551,7 @@
 						{
 							"key": "sandboxSessionId",
 							"value": "",
-							"description": "Persistent session handle from create / run / update_files."
+							"description": "Persistent session handle from create / run / write_files."
 						}
 					]
 				},
@@ -915,7 +915,7 @@
 		},
 		{
 			"name": "MCP",
-			"description": "FastMCP JSON-RPC over HTTP forwarded through the LiteLLM pass-through. Note that LiteLLM ALSO advertises the sandbox as an MCP server via `mcp_servers.sandbox` in litellm_config.yaml — models see the tool through that path, not this one. The Postman requests below are useful for debugging the transport directly. Every MCP request MUST use trailing-slash (POST /mcp/), MUST send `Accept: application/json, text/event-stream`, and MUST start with an `initialize` call — copy the `mcp-session-id` response header into the `mcpSessionId` collection variable for subsequent calls.\n\nTools registered on the sandbox MCP server: get_runtime_types, create, update_files, get_files, get_logs, exec, patch_files, preview, close, list_sessions, run. The examples below cover the primary tools.",
+			"description": "FastMCP JSON-RPC over HTTP forwarded through the LiteLLM pass-through. Note that LiteLLM ALSO advertises the sandbox as an MCP server via `mcp_servers.sandbox` in litellm_config.yaml — models see the tool through that path, not this one. The Postman requests below are useful for debugging the transport directly. Every MCP request MUST use trailing-slash (POST /mcp/), MUST send `Accept: application/json, text/event-stream`, and MUST start with an `initialize` call — copy the `mcp-session-id` response header into the `mcpSessionId` collection variable for subsequent calls.\n\nTools registered on the sandbox MCP server: get_runtime_types, create, write_files, get_files, get_logs, exec, patch_files, preview, close, list_sessions, run. The examples below cover the primary tools.",
 			"item": [
 				{
 					"name": "MCP — initialize",
@@ -995,7 +995,7 @@
 								""
 							]
 						},
-						"description": "Enumerate the tools exposed by the sandbox MCP server: get_runtime_types, create, update_files, get_files, get_logs, exec, patch_files, preview, close, list_sessions, run."
+						"description": "Enumerate the tools exposed by the sandbox MCP server: get_runtime_types, create, write_files, get_files, get_logs, exec, patch_files, preview, close, list_sessions, run."
 					},
 					"response": []
 				},
@@ -1038,7 +1038,7 @@
 								""
 							]
 						},
-						"description": "On-demand log fetch for a running sandbox. Use this when update_files / run already returned a normal ready/updated response but the user reports the app looks broken. Flask / FastAPI / Vite / Next tracebacks land here; Streamlit tracebacks now land here too thanks to the _streamlit_bootstrap.py stderr tee installed by the runner at spawn time.\n\nDo NOT call this after an update_files / run FAILURE — those already include the container logs in the tool response. Only call when the container is running but its output looks wrong.\n\nSet the sandboxSessionId collection variable to the session_id from a previous response, then run this."
+						"description": "On-demand log fetch for a running sandbox. Use this when write_files / run already returned a normal ready/updated response but the user reports the app looks broken. Flask / FastAPI / Vite / Next tracebacks land here; Streamlit tracebacks now land here too thanks to the _streamlit_bootstrap.py stderr tee installed by the runner at spawn time.\n\nDo NOT call this after an write_files / run FAILURE — those already include the container logs in the tool response. Only call when the container is running but its output looks wrong.\n\nSet the sandboxSessionId collection variable to the session_id from a previous response, then run this."
 					},
 					"response": []
 				},
@@ -1124,12 +1124,12 @@
 								""
 							]
 						},
-						"description": "Reserve an empty warming Python container. Response text starts with `Sandbox created. Session id: <sid>` — copy that id into `sandboxSessionId` and run the update_files call below to overlay your real code. Env is stored on the job row and replayed on self-heal respawn.\n\nSee SANDBOX.md § MCP tool flow for how create / update_files / preview compose into the pipelined pattern."
+						"description": "Reserve an empty warming Python container. Response text starts with `Sandbox created. Session id: <sid>` — copy that id into `sandboxSessionId` and run the write_files call below to overlay your real code. Env is stored on the job row and replayed on self-heal respawn.\n\nSee SANDBOX.md § MCP tool flow for how create / write_files / preview compose into the pipelined pattern."
 					},
 					"response": []
 				},
 				{
-					"name": "MCP — tools/call update_files (overlay)",
+					"name": "MCP — tools/call write_files (overlay)",
 					"request": {
 						"method": "POST",
 						"header": [
@@ -1148,7 +1148,7 @@
 						],
 						"body": {
 							"mode": "raw",
-							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 12,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"update_files\",\n    \"arguments\": {\n      \"session_id\": \"{{sandboxSessionId}}\",\n      \"files\": {\n        \"app.py\": \"import streamlit as st\\nst.title('overlay applied')\\n\"\n      },\n      \"recreate_if_gone\": false\n    }\n  }\n}",
+							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 12,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"write_files\",\n    \"arguments\": {\n      \"session_id\": \"{{sandboxSessionId}}\",\n      \"files\": {\n        \"app.py\": \"import streamlit as st\\nst.title('overlay applied')\\n\"\n      },\n      \"recreate_if_gone\": false\n    }\n  }\n}",
 							"options": {
 								"raw": {
 									"language": "json"
@@ -1253,7 +1253,7 @@
 								""
 							]
 						},
-						"description": "Run a non-interactive shell command inside the running container. NON-INTERACTIVE — stdin is closed; anything prompting for input hangs until timeout. Output capped at 8 KB. STATE DRIFT: packages installed here do NOT survive self-heal respawn — also write to requirements.txt / package.json via update_files for persistence.\n\nSee SANDBOX.md § Runtime introspection (exec)."
+						"description": "Run a non-interactive shell command inside the running container. NON-INTERACTIVE — stdin is closed; anything prompting for input hangs until timeout. Output capped at 8 KB. STATE DRIFT: packages installed here do NOT survive self-heal respawn — also write to requirements.txt / package.json via write_files for persistence.\n\nSee SANDBOX.md § Runtime introspection (exec)."
 					},
 					"response": []
 				},
@@ -1296,7 +1296,7 @@
 								""
 							]
 						},
-						"description": "Strict line-range replacement inside a running sandbox. Use AFTER get_files on the target file: copy the current bytes into `expected` byte-for-byte, then send with the new content in `replacement`. Every patch validates in a dry-run pass first (byte-for-byte match, in-bounds range, no per-file overlap); if any fails, no file is modified. Mismatch responses include the actual current content so the model can retry inline without another get_files call.\n\nNot for new files (use update_files instead). Not for large rewrites. Not self-healing — dead container returns 409.\n\nSee SANDBOX.md § Targeted edits (patch_files)."
+						"description": "Strict line-range replacement inside a running sandbox. Use AFTER get_files on the target file: copy the current bytes into `expected` byte-for-byte, then send with the new content in `replacement`. Every patch validates in a dry-run pass first (byte-for-byte match, in-bounds range, no per-file overlap); if any fails, no file is modified. Mismatch responses include the actual current content so the model can retry inline without another get_files call.\n\nNot for new files (use write_files instead). Not for large rewrites. Not self-healing — dead container returns 409.\n\nSee SANDBOX.md § Targeted edits (patch_files)."
 					},
 					"response": []
 				},
@@ -1339,7 +1339,7 @@
 								""
 							]
 						},
-						"description": "Hand the user the iframe artifact. Display-only — does not touch the container, does not self-heal, does not bump last_used_at. Call this ONCE per turn when the model wants to surface the current state; iterate silently with update_files between previews.\n\nResponse text ends with the fenced ```html block that OpenWebUI promotes into the artifacts panel."
+						"description": "Hand the user the iframe artifact. Display-only — does not touch the container, does not self-heal, does not bump last_used_at. Call this ONCE per turn when the model wants to surface the current state; iterate silently with write_files between previews.\n\nResponse text ends with the fenced ```html block that OpenWebUI promotes into the artifacts panel."
 					},
 					"response": []
 				},
@@ -1468,7 +1468,7 @@
 								""
 							]
 						},
-						"description": "One-shot convenience — create + update_files + preview in a single tool call. Recreate_if_gone is implicitly true. Response includes the same fenced ```html iframe block as `preview` so OpenWebUI promotes it directly. Prefer this when the model has everything ready at first mention; prefer the pipelined get_runtime_types → create → update_files → preview flow when there's real iteration to do."
+						"description": "One-shot convenience — create + write_files + preview in a single tool call. Recreate_if_gone is implicitly true. Response includes the same fenced ```html iframe block as `preview` so OpenWebUI promotes it directly. Prefer this when the model has everything ready at first mention; prefer the pipelined get_runtime_types → create → write_files → preview flow when there's real iteration to do."
 					},
 					"response": []
 				}

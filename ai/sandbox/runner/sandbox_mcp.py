@@ -4,7 +4,7 @@ Tools exposed (all invoked as ``sandbox.<name>``):
 
     get_runtime_types()             — describe available runtime types (catalog)
     create(runtime, ...)            — warm an empty container
-    update_files(session_id, ...)   — overlay files, health-probe after
+    write_files(session_id, ...)   — overlay files, health-probe after
     get_files(session_id, paths?)   — read files back from /app
     get_logs(session_id, lines?)    — tail container stdout+stderr
     exec(session_id, command, ...)  — run a non-interactive shell command
@@ -53,7 +53,7 @@ def _format_diagnostic(detail: dict) -> str:
 
       "static lint failed" (400)
       "sandbox did not become ready" (504)
-      "sandbox container is gone" (409, new — surfaced by update_files
+      "sandbox container is gone" (409, new — surfaced by write_files
                                    when recreate_if_gone=false and the
                                    container was reaped)
       "no running sandbox for this session" (404)
@@ -159,7 +159,7 @@ def _format_diagnostic(detail: dict) -> str:
             )
             lines.append("")
             lines.append(
-                "patch_files does not create files. Call update_files "
+                "patch_files does not create files. Call write_files "
                 "with the file's full content to create it first."
             )
         elif kind == "binary_file":
@@ -169,7 +169,7 @@ def _format_diagnostic(detail: dict) -> str:
             )
             lines.append("")
             lines.append(
-                "Use update_files with a base64 payload to overwrite "
+                "Use write_files with a base64 payload to overwrite "
                 "the file entirely."
             )
         elif kind == "unsafe_path":
@@ -255,7 +255,7 @@ def _format_startup_output(runtime: Optional[str], output: str) -> str:
             "re-uploading the file. Call get_files(paths=[...]) first if "
             "you don't already have the exact current bytes of the range, "
             "then patch_files with your fix as `replacement`.\n\n"
-            "Use update_files (whole-file rewrite) for large refactors, "
+            "Use write_files (whole-file rewrite) for large refactors, "
             "new files, or when the file's content has drifted from what "
             "you have.\n"
             "```\n"
@@ -403,7 +403,7 @@ def build_mcp(
     run_callable: Callable[..., Any],
     logs_callable: Callable[..., Any],
     create_callable: Callable[..., Any],
-    update_files_callable: Callable[..., Any],
+    write_files_callable: Callable[..., Any],
     get_files_callable: Callable[..., Any],
     exec_callable: Callable[..., Any],
     patch_files_callable: Callable[..., Any],
@@ -435,7 +435,7 @@ def build_mcp(
         For the state of a running sandbox, use ``get_logs``,
         ``get_files``, or ``list_sessions`` — NOT this tool.
 
-        Flow: get_runtime_types → create → update_files → preview → close.
+        Flow: get_runtime_types → create → write_files → preview → close.
         Or the one-shot: get_runtime_types → run.
         """
         log.info("MCP tool call: get_runtime_types")
@@ -481,14 +481,14 @@ def build_mcp(
         """Reserve an empty warming container and return the session
         handle. Use this FIRST when you know you'll need a preview but
         haven't written the code yet — the container starts warming
-        while you finish thinking, so the follow-up ``update_files``
+        while you finish thinking, so the follow-up ``write_files``
         hits a warm container and hot-reloads instantly.
 
         The URL returned serves a "sandbox warming" placeholder page
         (or Streamlit's own "warming" script for python) until you call
-        ``update_files`` with your real code.
+        ``write_files`` with your real code.
 
-        Flow: get_runtime_types → create → update_files (repeat) → preview → close.
+        Flow: get_runtime_types → create → write_files (repeat) → preview → close.
 
         Consumes one slot from SANDBOX_MAX_CONCURRENT.
         """
@@ -503,14 +503,14 @@ def build_mcp(
             f"Runtime: {result['runtime']}. "
             f"URL: {result['url']} (expires {result['expires_at']}).\n"
             "Status: warming — dev server is booting with placeholder files.\n"
-            "Next: call update_files(session_id=\"" + sid + "\", files={...}) "
+            "Next: call write_files(session_id=\"" + sid + "\", files={...}) "
             "with your actual code."
         )
         return _tool_result(text, {"ok": True, **result})
 
-    # ── update_files ──
+    # ── write_files ──
     @mcp.tool()
-    async def update_files(
+    async def write_files(
         session_id: str = Field(
             description=(
                 "The session_id from a previous create / run response."
@@ -557,18 +557,18 @@ def build_mcp(
             silent state loss — env is preserved on respawn, but files
             you installed via ``exec`` are LOST.
 
-        See flow: get_runtime_types → create → update_files → preview → close.
+        See flow: get_runtime_types → create → write_files → preview → close.
         """
         log.info(
-            "MCP tool call: update_files session=%s n_files=%d recreate=%s",
+            "MCP tool call: write_files session=%s n_files=%d recreate=%s",
             session_id, len(files or {}), recreate_if_gone,
         )
         try:
-            result = await update_files_callable(
+            result = await write_files_callable(
                 session_id, files, deletes, recreate_if_gone,
             )
         except HTTPException as exc:
-            return _handle_http_exception(exc, tool="update_files")
+            return _handle_http_exception(exc, tool="write_files")
         text_lines = []
         recreated = result.get("recreated")
         if recreated:
@@ -615,10 +615,10 @@ def build_mcp(
         Call this when you need to verify what's actually on disk — for
         instance before writing an overlay that references code you
         didn't author in this session, or after a ``⚠ recreated``
-        notice from update_files, to rebuild your picture of /app.
+        notice from write_files, to rebuild your picture of /app.
 
         Binary files are returned as base64 with the ``encoding`` field
-        set — the same shape you'd feed back to ``update_files``.
+        set — the same shape you'd feed back to ``write_files``.
         """
         log.info(
             "MCP tool call: get_files session=%s paths=%s",
@@ -657,7 +657,7 @@ def build_mcp(
     async def get_logs(
         session_id: str = Field(
             description=(
-                "The session_id from a previous create / run / update_files "
+                "The session_id from a previous create / run / write_files "
                 "response. Must match ^[A-Za-z0-9_-]{1,64}$."
             )
         ),
@@ -675,7 +675,7 @@ def build_mcp(
 
         Call this when the user reports the running app looks broken
         (rendered error card, "undefined is not a function", the button
-        does nothing, etc.) but the last update_files response returned
+        does nothing, etc.) but the last write_files response returned
         a healthy app_status. Flask, FastAPI, Express, Vite, and Next
         dev servers all print the offending traceback / stack to stdout
         before rendering the browser error. Streamlit's own exception
@@ -701,7 +701,7 @@ def build_mcp(
         ``Content-Security-Policy: script-src 'self'`` refuse the shim
         entirely — no browser events will appear for those.
 
-        Do NOT call this after a create / update_files / run FAILURE —
+        Do NOT call this after a create / write_files / run FAILURE —
         those already include container logs in the tool response.
         """
         log.info(
@@ -772,9 +772,9 @@ def build_mcp(
           1. State DRIFT on respawn — packages installed via exec do NOT
              survive a self-heal respawn. If the model wants the dep to
              persist, ALSO write it to requirements.txt / package.json via
-             update_files:
+             write_files:
                  exec(sid, "pip install requests")             # immediate
-                 update_files(sid, {"requirements.txt": "..."}) # persist
+                 write_files(sid, {"requirements.txt": "..."}) # persist
           2. No interactive commands — anything that reads stdin hangs.
           3. No long-running processes — a `&`-backgrounded process is
              killed when exec finishes. Long-running services belong in
@@ -842,18 +842,18 @@ def build_mcp(
                 "Accepted for interface consistency but has NO effect. "
                 "patch_files depends on files that would not exist in a "
                 "fresh container, so a dead container always returns an "
-                "error. Call update_files first if you need to respawn."
+                "error. Call write_files first if you need to respawn."
             ),
         ),
     ) -> ToolResult:
         """Strict line-range replacement inside a running sandbox.
 
-        Use this instead of update_files when:
+        Use this instead of write_files when:
           * You've just called get_files on the target file this turn AND
           * The edit changes a small fraction of the file (<20-30% is a
             good rule of thumb).
 
-        Use update_files instead when:
+        Use write_files instead when:
           * The file is new (patch_files does NOT create files).
           * The rewrite covers most of the file.
           * You have not called get_files on the target file in this turn.
@@ -891,7 +891,7 @@ def build_mcp(
 
         # AFTER THE WRITE
 
-        Post-write health probe runs (same as update_files). The
+        Post-write health probe runs (same as write_files). The
         response's `app_status` and `startup_output` tell you whether the
         edit broke the running app — act on ⚠ SUSPICIOUS immediately, in
         the same turn.
@@ -913,12 +913,12 @@ def build_mcp(
 
         # NOT SELF-HEALING
 
-        Dead container? Returns 409, tells you to call update_files with
+        Dead container? Returns 409, tells you to call write_files with
         recreate_if_gone=true first. Fresh containers have no files to
         anchor on, so respawning inside patch_files would be wrong.
 
-        See flow: get_runtime_types → create → update_files → (patch_files |
-        update_files loop) → preview → close.
+        See flow: get_runtime_types → create → write_files → (patch_files |
+        write_files loop) → preview → close.
         """
         log.info(
             "MCP tool call: patch_files session=%s n_patches=%d",
@@ -977,12 +977,12 @@ def build_mcp(
 
         Display-only: preview does NOT touch the container, does NOT
         self-heal, and does NOT count as activity (no last_used_at bump
-        happens here — that's update_files / exec / get_logs). If the
+        happens here — that's write_files / exec / get_logs). If the
         container is gone, this returns 404 with a hint to call
-        update_files first with recreate_if_gone=true.
+        write_files first with recreate_if_gone=true.
 
         Call this once per turn when you want the user to see the
-        current state. Iterate with update_files silently between
+        current state. Iterate with write_files silently between
         previews.
         """
         log.info("MCP tool call: preview session=%s", session_id)
@@ -1115,7 +1115,7 @@ def build_mcp(
                 f"You updated {n_files} file(s) in session `{session_id_out}` "
                 "— everything else in /app was preserved. To iterate silently: "
                 "prefer patch_files for a small edit at known lines "
-                "(cheapest — no re-upload); use update_files when replacing "
+                "(cheapest — no re-upload); use write_files when replacing "
                 "a whole file or adding a new one. Call preview to hand the "
                 "user a fresh iframe when you're ready."
             )
@@ -1125,7 +1125,7 @@ def build_mcp(
                 f"patch_files(session_id=\"{session_id_out}\", patches=[...]) "
                 "for a small edit at known lines — it edits in place with a "
                 "byte-for-byte match on `expected`, no whole-file re-upload. "
-                f"Use update_files(session_id=\"{session_id_out}\", files={{...}}) "
+                f"Use write_files(session_id=\"{session_id_out}\", files={{...}}) "
                 "when replacing a whole file, adding a new file, or when your "
                 "picture of the file has drifted. Either way, DO NOT re-send "
                 "unchanged files. The container keeps running and hot-reloads."
@@ -1206,7 +1206,7 @@ def build_mcp(
             ),
         ),
     ) -> ToolResult:
-        """Convenience one-shot: create + update_files + preview.
+        """Convenience one-shot: create + write_files + preview.
 
         Use when you already have all the files ready at first mention
         and don't expect to iterate silently. The response ends with
@@ -1217,7 +1217,7 @@ def build_mcp(
           * The user pasted code and just wants it running.
           * You have a small, complete app and no separate compose step.
 
-        Prefer the get_runtime_types → create → update_files → preview flow
+        Prefer the get_runtime_types → create → write_files → preview flow
         when:
           * The container should warm up while you finish writing code
             (pipelining wins on latency).

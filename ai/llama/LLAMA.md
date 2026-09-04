@@ -142,26 +142,18 @@ Both services share the `llama_data` volume, so downloads for one don't affect t
 
 ### LiteLLM integration
 
-Register `glm5.2` in your LiteLLM config so clients hit it through the unified proxy:
+Both `glm5.2` and `qwen3.8-flash` are pre-registered in [`ai/litellm/litellm_config.yaml`](../litellm/litellm_config.yaml) under `model_list`, and both have a `context_window_fallbacks` entry to `claude-sonnet-5`. Container-name DNS works because LiteLLM and every llama-server sit on `ai_shared`, so the `api_base` values (`http://glm5.2:8000/v1`, `http://qwen3.8-flash:8000/v1`) resolve inside the network.
 
-```yaml
-# litellm_config.yaml
-model_list:
-  - model_name: glm5.2
-    litellm_params:
-      model: openai/glm5.2
-      api_base: http://glm5.2:8000/v1
-      api_key: sk-no-key-required
-```
-
-Both LiteLLM and `glm5.2` sit on `ai_shared`, so container-name DNS resolution works. Once registered, clients hit LiteLLM the same way they hit any other model:
+Clients hit LiteLLM the same way they hit any other model:
 
 ```bash
 curl http://localhost:4001/v1/chat/completions \
   -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"model": "glm5.2", "messages": [{"role": "user", "content": "Hello"}]}'
+  -d '{"model": "qwen3.8-flash", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
+
+**Adding a new llama-server service to LiteLLM** — copy the closest existing entry (`glm5.2` for large-context / long-thinking models, `qwen3.8-flash` for Qwen-family thinking-mode defaults) and change `model_name`, `model:`, and `api_base:` to match your service's `-a <alias>` and `container_name`. Register the fallback in `litellm_settings.context_window_fallbacks` in the same edit.
 
 ### State files (outside the repo)
 

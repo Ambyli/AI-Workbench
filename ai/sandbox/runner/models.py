@@ -98,7 +98,7 @@ def _validate_files_map(files: dict) -> dict:
         )
         parts.append(
             "Shrink files, drop non-essential assets, or split across "
-            "multiple update_files calls."
+            "multiple write_files calls."
         )
         raise ValueError("\n".join(parts))
     return files
@@ -229,7 +229,7 @@ class RunResponse(BaseModel):
     recreated: bool = False
 
 
-class UpdateFilesRequest(BaseModel):
+class WriteFilesRequest(BaseModel):
     files: dict[str, FileContent] = Field(
         default_factory=dict,
         description=(
@@ -329,7 +329,7 @@ class PatchFilesRequest(BaseModel):
             "Accepted for interface consistency but has NO effect on this "
             "tool. patch_files depends on file content that would not "
             "exist in a fresh container, so a dead container always "
-            "returns 409 regardless. Call update_files first to establish "
+            "returns 409 regardless. Call write_files first to establish "
             "file state before reissuing patches."
         ),
     )

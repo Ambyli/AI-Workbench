@@ -113,7 +113,7 @@ The runner is split across:
 - [`operations.py`](runner/operations.py) — `_do_*` core operations shared between HTTP endpoints and MCP tools. `_reuse_or_spawn` (the legacy `POST /run` + `run` MCP path) lives here.
 - [`tool_server.py`](runner/tool_server.py) — OpenWebUI Tool Server sub-app, mounted at `/tool`.
 - [`sandbox_mcp.py`](runner/sandbox_mcp.py) — FastMCP tool surface, mounted at `/mcp`.
-- [`spawner.py`](runner/spawner.py) — Docker interactions (spawn / spawn_empty / update_files / patch_files / exec_command / read_files / probe_health).
+- [`spawner.py`](runner/spawner.py) — Docker interactions (spawn / spawn_empty / write_files / patch_files / exec_command / read_files / probe_health).
 - [`reaper.py`](runner/reaper.py) — TTL and idle-TTL sweeper.
 - [`runtimes.py`](runner/runtimes.py) — runtime registry (`static`, `python`, `node`).
 
@@ -196,7 +196,7 @@ get_runtime_types  ─── optional, first time on a deployment
 create          ─── returns session_id + warming URL; env fixed here
       │
       ▼
-update_files    ─── loop: overlay files; post-update health probe
+write_files    ─── loop: overlay files; post-update health probe
       │  ▲              recreate_if_gone=false (default) surfaces respawn choice
       │  └─── get_files / get_logs / exec (read/modify on demand)
       │  └─── patch_files (strict line-range edits after get_files)
@@ -211,7 +211,7 @@ close           ─── optional; TTL reaper handles the rest
 Shortcut path when the model already has everything at first mention:
 
 ```
-run             ─── create + update_files + preview in one call
+run             ─── create + write_files + preview in one call
                     (recreate_if_gone implicitly true)
 ```
 
@@ -221,7 +221,7 @@ Tool summary:
 |---|---|---|
 | `get_runtime_types` | read | Describe RUNTIME TYPES this deployment supports (catalog — not a session status check) |
 | `create` | write | Reserve an empty warming container, return session_id + URL |
-| `update_files` | write | Overlay files into a live sandbox; opt-in self-heal; post-update health probe |
+| `write_files` | write | Overlay files into a live sandbox; opt-in self-heal; post-update health probe |
 | `get_files` | read | Read files back from `/app` (dir listing when `paths` is omitted) |
 | `get_logs` | read | Tail container stdout+stderr for the session |
 | `exec` | write | Run a non-interactive shell command inside the container |
@@ -229,7 +229,7 @@ Tool summary:
 | `preview` | display | Return the iframe artifact for the user's chat |
 | `close` | write | Tear down the session early, release the slot |
 | `list_sessions` | read | Enumerate live sandboxes (recover dropped session_ids) |
-| `run` | write | Convenience: create + update_files + preview in one call |
+| `run` | write | Convenience: create + write_files + preview in one call |
 
 ### Data shapes shared by every write tool
 
@@ -237,14 +237,14 @@ Tool summary:
 
 **`env` at create time.** Process env vars set inside the container. Immutable after spawn — a self-heal respawn replays the same env from the job's metadata JSONB, but there is no update path. Reserved keys (`HTTP_PROXY`, `HTTPS_PROXY`, `PYTHONUNBUFFERED`, `NPM_CONFIG_LOGLEVEL`, `FORCE_COLOR`, `TERM`) are rejected at validation — those are runner-controlled invariants that keep the egress allowlist and log buffering working; the spawner re-applies them on top of the merged env even if a validation bypass ever landed.
 
-**`recreate_if_gone` on `update_files`.** OPT-IN self-heal. Default `false` — if the container is gone (crashed, reaped, respawn refused), the tool returns a structured 409 telling the caller to opt in explicitly. Set `true` to accept the state loss: env is preserved, but packages installed via `exec` and any in-container files not in the current `files` map are LOST. `run` implicitly passes `true` because it's the one-shot convenience path.
+**`recreate_if_gone` on `write_files`.** OPT-IN self-heal. Default `false` — if the container is gone (crashed, reaped, respawn refused), the tool returns a structured 409 telling the caller to opt in explicitly. Set `true` to accept the state loss: env is preserved, but packages installed via `exec` and any in-container files not in the current `files` map are LOST. `run` implicitly passes `true` because it's the one-shot convenience path.
 
 ### Structured tool responses
 
 Every MCP tool returns a `ToolResult` with two channels:
 
 - `content[0]` is a `TextContent` block (what the model sees, same shape as the pre-refactor tool responses).
-- `structured_content` is a JSON payload the caller can parse without regex. Fields depend on the tool: `create` / `run` include `session_id`, `sandbox_id`, `url`, `expires_at`, `runtime`, `app_status`; `update_files` adds `files_written` / `files_deleted` / `recreated`; `exec` returns `exit_code`, `duration_ms`, `output`, `truncated`, `timed_out`; and so on. See [`sandbox_mcp.py`](runner/sandbox_mcp.py) for the exact shapes.
+- `structured_content` is a JSON payload the caller can parse without regex. Fields depend on the tool: `create` / `run` include `session_id`, `sandbox_id`, `url`, `expires_at`, `runtime`, `app_status`; `write_files` adds `files_written` / `files_deleted` / `recreated`; `exec` returns `exit_code`, `duration_ms`, `output`, `truncated`, `timed_out`; and so on. See [`sandbox_mcp.py`](runner/sandbox_mcp.py) for the exact shapes.
 
 The text form preserves everything a model needs to reply — the fenced ```` ```html ```` block for `preview` / `run`, the `Session id:` line for follow-ups, the health-probe verdict, the startup-output tail. The structured payload is additive.
 
@@ -258,7 +258,7 @@ The text form preserves everything a model needs to reply — the fenced ```` ``
 | `POST /run` | spawn a sandbox — or update an existing one when `session_id` is passed. Backing endpoint for `sandbox.run` |
 | `POST /create` | reserve an empty warming container. Backing endpoint for `sandbox.create` |
 | `GET /sessions` | enumerate live sessions. Backing endpoint for `sandbox.list_sessions` |
-| `POST /session/{id}/files` | overlay files into a running sandbox. Backing endpoint for `sandbox.update_files` |
+| `POST /session/{id}/files` | overlay files into a running sandbox. Backing endpoint for `sandbox.write_files` |
 | `GET /session/{id}/files` | read files back from `/app`. Backing endpoint for `sandbox.get_files` |
 | `POST /session/{id}/exec` | run a non-interactive shell command inside the container. Backing endpoint for `sandbox.exec` |
 | `POST /session/{id}/patch` | strict line-range file edits (all-or-nothing). Backing endpoint for `sandbox.patch_files` |
@@ -472,9 +472,9 @@ Three layers, in order of cheapness:
 
 2. **Container logs on readiness failure (30 s spawn timeout).** If the container spawns but never binds port 80 within `readiness_ok`'s deadline, the runner reads the tail of `/tmp/sandbox.log` before tearing the container down and returns it in the 504. Log capture is possible because [`runner/spawner.py`](runner/spawner.py) redirects the user command's stdout+stderr to that file — `container.logs()` only sees PID 1 (`sleep infinity`), so exec streams have to be routed through a file.
 
-3. **On-demand log fetch (for apps that start but render errors).** `GET /session/{id}/logs` and its MCP counterpart `get_logs` tail `/tmp/sandbox.log` at request time. Model calls this when `update_files` / `run` returned a normal ready response but the user reports the running app looks broken. Flask / FastAPI / Vite / Next / Express dev servers all print tracebacks to stdout before rendering a browser error card. **Streamlit tracebacks land here too** thanks to the `_streamlit_bootstrap.py` shim: the runner writes it into `/app` at spawn time when the entrypoint is Streamlit, and it monkeypatches `streamlit.runtime.scriptrunner.script_runner.handle_uncaught_app_exception` to also print to stderr before delegating to the original browser-render path. If the shim import fails on a Streamlit version bump, it logs a WARNING and falls through — Streamlit stays functional, just without the tee.
+3. **On-demand log fetch (for apps that start but render errors).** `GET /session/{id}/logs` and its MCP counterpart `get_logs` tail `/tmp/sandbox.log` at request time. Model calls this when `write_files` / `run` returned a normal ready response but the user reports the running app looks broken. Flask / FastAPI / Vite / Next / Express dev servers all print tracebacks to stdout before rendering a browser error card. **Streamlit tracebacks land here too** thanks to the `_streamlit_bootstrap.py` shim: the runner writes it into `/app` at spawn time when the entrypoint is Streamlit, and it monkeypatches `streamlit.runtime.scriptrunner.script_runner.handle_uncaught_app_exception` to also print to stderr before delegating to the original browser-render path. If the shim import fails on a Streamlit version bump, it logs a WARNING and falls through — Streamlit stays functional, just without the tee.
 
-4. **Post-update HTTP health probe.** `update_files` (and the reuse branch of `run`) runs a single-shot GET against the app's readiness path 500 ms after writing files, and inlines the result — `HTTP 200 in 47 ms` / `HTTP 500` / `connection refused` / `timeout after 3.0s` — in the tool response. Catches "the reload broke everything" in the same tool call without waiting for the user to report anything.
+4. **Post-update HTTP health probe.** `write_files` (and the reuse branch of `run`) runs a single-shot GET against the app's readiness path 500 ms after writing files, and inlines the result — `HTTP 200 in 47 ms` / `HTTP 500` / `connection refused` / `timeout after 3.0s` — in the tool response. Catches "the reload broke everything" in the same tool call without waiting for the user to report anything.
 
 The MCP tool wrappers in [`runner/sandbox_mcp.py`](runner/sandbox_mcp.py) catch HTTPExceptions from the runner's spawn path and format them into text responses instead of MCP-level errors, so the model reads them as normal tool output and can call the tool again with the same `session_id` without any error-handling logic.
 
@@ -525,10 +525,10 @@ Design constraints:
 - **Timeout hard-capped at 120 s.** Default 30 s. Enforced by wall-clock deadline on the exec_start stream — the exec is left dangling on timeout (Docker cleans it up when the container is torn down); the tool response is marked `timed_out`.
 - **Output truncated to 8 KB.** Prefixed with `(last 8 KB)` when truncation happened. Enough for pip/npm summaries and most tracebacks; anything longer belongs in `get_logs`.
 - **Runs as 1000:1000.** Matches the base image's non-root user. `sudo` is not available.
-- **State drift on respawn.** Packages installed via `exec` do NOT survive a self-heal respawn — the container is rebuilt from the base image and only `env` is preserved. Models should ALSO write persistent deps to `requirements.txt` / `package.json` via `update_files` when appropriate:
+- **State drift on respawn.** Packages installed via `exec` do NOT survive a self-heal respawn — the container is rebuilt from the base image and only `env` is preserved. Models should ALSO write persistent deps to `requirements.txt` / `package.json` via `write_files` when appropriate:
   ```
   exec(sid, "pip install requests")                # immediate fix
-  update_files(sid, {"requirements.txt": "..."})   # persist for future respawn
+  write_files(sid, {"requirements.txt": "..."})   # persist for future respawn
   ```
 - **Egress allowlist still applies.** A `pip install` from a non-allowlisted index gets a 403 from `sandbox-egress` (tinyproxy). If a network error surfaces here, the fix is to add the source to `ai/sandbox/proxies/tinyproxy.filter`, not to retry.
 - **Counts as activity.** Every `exec` call bumps `last_used_at` so the idle reaper resets.
@@ -537,13 +537,13 @@ Security analysis: `exec` opens no new escape path. The sandbox container is iso
 
 ### Targeted edits (patch_files)
 
-The `patch_files` MCP tool (backed by `POST /session/{id}/patch`) does strict line-range replacement inside a running sandbox's `/app`. It exists to close the "small change to a large file" gap in the tool set: when the model is fixing one function in a 40 KB `app.py`, sending the whole file through `update_files` burns tokens and forces a whole-file mtime bump that trips a full dev-server reload.
+The `patch_files` MCP tool (backed by `POST /session/{id}/patch`) does strict line-range replacement inside a running sandbox's `/app`. It exists to close the "small change to a large file" gap in the tool set: when the model is fixing one function in a 40 KB `app.py`, sending the whole file through `write_files` burns tokens and forces a whole-file mtime bump that trips a full dev-server reload.
 
-**When to use `patch_files` vs `update_files`:**
+**When to use `patch_files` vs `write_files`:**
 
 - **`patch_files`** — small targeted edits in files you've called `get_files` on this turn. The rule of thumb: <20–30% of the file changes. Never for new files (patch_files does NOT create files).
-- **`update_files`** — new file, whole-file rewrite, or refactor touching a majority of the file. Overlay semantics, no expected-content check.
-- **Rule the model bakes in:** if you have not called `get_files` on this file in the current turn, use `update_files` instead. The `expected` field must match the current file byte-for-byte.
+- **`write_files`** — new file, whole-file rewrite, or refactor touching a majority of the file. Overlay semantics, no expected-content check.
+- **Rule the model bakes in:** if you have not called `get_files` on this file in the current turn, use `write_files` instead. The `expected` field must match the current file byte-for-byte.
 
 **Strict byte-for-byte match.** Every patch specifies `path`, `start_line`, `end_line` (both 1-indexed inclusive), `expected`, and `replacement`. The runner reads the current file, extracts `\n`-join(lines[start_line-1 : end_line]), and compares byte-for-byte to `expected`. No whitespace or trailing-newline lenience. Mismatch returns 409 with the ACTUAL current content inline so the model retries in the same turn without a separate `get_files` round trip:
 
@@ -569,11 +569,11 @@ The other patches in this call were NOT applied.
 
 **Apply order.** Per-file, bottom-up by `start_line` descending — earlier-line indices stay valid under later-line replacements. Each file is written in a single `put_archive`, so a mid-batch failure never leaves a file half-written.
 
-**Post-write behavior.** Same 500 ms settle + HTTP health probe against the runtime's `readiness_probe_path` on port 80 that `update_files` runs. `app_status` in the response tells the caller whether the edit broke the running app. `last_used_at` is bumped only on successful apply — failed dry-runs do not extend TTL.
+**Post-write behavior.** Same 500 ms settle + HTTP health probe against the runtime's `readiness_probe_path` on port 80 that `write_files` runs. `app_status` in the response tells the caller whether the edit broke the running app. `last_used_at` is bumped only on successful apply — failed dry-runs do not extend TTL.
 
-**No self-heal.** `recreate_if_gone` is accepted in the request shape for interface consistency but has NO effect — a fresh container has no file to anchor on, so patch_files always returns 409 for a dead container with a hint to call `update_files` first (with `recreate_if_gone=true` if a respawn is desired).
+**No self-heal.** `recreate_if_gone` is accepted in the request shape for interface consistency but has NO effect — a fresh container has no file to anchor on, so patch_files always returns 409 for a dead container with a hint to call `write_files` first (with `recreate_if_gone=true` if a respawn is desired).
 
-**Payload limits.** Same envelope as `update_files`: each patch's UTF-8 `expected` + `replacement` bytes count toward `SANDBOX_MAX_FILE_BYTES` per patch, and the sum across all patches counts toward `SANDBOX_MAX_PAYLOAD_BYTES` — rejected at pydantic validation.
+**Payload limits.** Same envelope as `write_files`: each patch's UTF-8 `expected` + `replacement` bytes count toward `SANDBOX_MAX_FILE_BYTES` per patch, and the sum across all patches counts toward `SANDBOX_MAX_PAYLOAD_BYTES` — rejected at pydantic validation.
 
 **Worked flow.** Model reads the file, patches a hunk, tries again on mismatch:
 
@@ -595,7 +595,7 @@ Fidelity note: `get_files` returns UTF-8 content as raw text with no whitespace 
 
 `create` and `run` accept an optional `env` dict merged into the container environment at spawn time. Two things worth calling out:
 
-- **Immutable after spawn.** There is no update-env path. A self-heal respawn replays the same env from the job's metadata JSONB — that's why env preserves across `update_files(recreate_if_gone=true)` even when in-container files don't. If a caller wants to change env, they close the session and create a new one.
+- **Immutable after spawn.** There is no update-env path. A self-heal respawn replays the same env from the job's metadata JSONB — that's why env preserves across `write_files(recreate_if_gone=true)` even when in-container files don't. If a caller wants to change env, they close the session and create a new one.
 - **Reserved keys refused at validation.** `HTTP_PROXY`, `HTTPS_PROXY`, `http_proxy`, `https_proxy`, `PYTHONUNBUFFERED`, `NPM_CONFIG_LOGLEVEL`, `FORCE_COLOR`, and `TERM` are runner-controlled. The spawner re-applies them on top of the caller's env even if a validation bypass ever landed, so the egress allowlist and log-buffering invariants can't be turned off by a caller. Anything else is passed through.
 - **Visible in `docker inspect`.** Any operator with access to `sandbox-runner`'s Docker socket can read env values. That's the same access boundary that already holds the docker.sock — no new surface. Secrets in env should still be per-user and time-scoped, not shared long-lived keys.
 
@@ -606,7 +606,7 @@ Two knobs, both env-tunable:
 - `SANDBOX_MAX_FILE_BYTES` (default `1000000`) — per-file cap on every value in the `files` map (post-base64-decode).
 - `SANDBOX_MAX_PAYLOAD_BYTES` (default `10000000`) — total cap across all files in one request.
 
-Enforcement lives in `_validate_files_map` at pydantic validation, so a rejected payload never touches the tarball builder or the container. The 413 response names the largest offending path and the total submitted size so the caller can shrink or split across multiple `update_files` calls. Base64 values count their DECODED length so a client can't smuggle a large blob past the cap by encoding it.
+Enforcement lives in `_validate_files_map` at pydantic validation, so a rejected payload never touches the tarball builder or the container. The 413 response names the largest offending path and the total submitted size so the caller can shrink or split across multiple `write_files` calls. Base64 values count their DECODED length so a client can't smuggle a large blob past the cap by encoding it.
 
 ## Configuration
 

@@ -166,6 +166,12 @@ services:
     # Change the three together — llama-server clamps any client max_tokens
     # to --n-predict, and LiteLLM uses max_input_tokens to decide when to
     # fall back to claude-sonnet-5.
+    # --split-mode tensor (EXPERIMENTAL in this build) runs the 3 GPUs in
+    # parallel per layer instead of the default `layer` pipeline, where only
+    # one GPU works at a time and each token crosses PCIe twice. Trial for
+    # tok/s — vLLM TP on 2 GPUs did ~70 tok/s, layer-split llama.cpp + MTP
+    # did ~50. If it regresses or fails to load, delete the line to return
+    # to the default. --tensor-split still sets the per-GPU proportions.
     # Do NOT paste a `#` comment inside the `command: >` block — YAML's
     # folded scalar has no comment syntax and it'll be folded into the
     # command string as a literal `#`, breaking arg parsing.
@@ -179,6 +185,7 @@ services:
       -a qwen3.8-flash
       --host 0.0.0.0 --port 8000
       -ngl 999
+      --split-mode tensor
       --tensor-split 1,1,1
       -c 1048576
       --parallel 2

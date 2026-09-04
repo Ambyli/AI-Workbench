@@ -508,6 +508,151 @@ def build_mcp(
         )
         return _tool_result(text, {"ok": True, **result})
 
+    # ── patch_files ──
+    @mcp.tool()
+    async def patch_files(
+        session_id: str = Field(
+            description=(
+                "The session_id from a previous create / run response."
+            )
+        ),
+        patches: list[dict] = Field(
+            description=(
+                "List of hunks. Each hunk is a dict with fields: "
+                "`path` (relative under /app), `start_line` (1-indexed "
+                "inclusive), `end_line` (1-indexed inclusive), `expected` "
+                "(the EXACT current text of those lines joined with \\n — "
+                "byte-for-byte, no whitespace or trailing-newline lenience), "
+                "`replacement` (what to write in place of `expected`), and "
+                "optional `note` (operator-log only). All-or-nothing: if "
+                "any patch fails validation, NO file is modified."
+            ),
+        ),
+        recreate_if_gone: bool = Field(
+            default=False,
+            description=(
+                "Accepted for interface consistency but has NO effect. "
+                "patch_files depends on files that would not exist in a "
+                "fresh container, so a dead container always returns an "
+                "error. Call write_files first if you need to respawn."
+            ),
+        ),
+    ) -> ToolResult:
+        """PRECISE line-range edits inside a running sandbox. **This is
+        the preferred edit tool.** Use it over ``write_files`` whenever
+        you know (or can `get_files` to read) the current bytes of the
+        target range — patching in place is cheaper than re-uploading
+        the whole file.
+
+        Fall back to write_files ONLY when:
+          * The file is new (patch_files does NOT create files).
+          * The rewrite covers most of the file.
+          * You have not called get_files on the target file in this turn
+            and cannot cheaply do so first.
+
+        # STRICT BYTE-FOR-BYTE MATCH
+
+        `expected` must match `\\n`-join(current_lines[start_line-1:end_line])
+        byte-for-byte. No whitespace or trailing-newline lenience. If it
+        does not match, the tool returns 409 with the ACTUAL current
+        content inline so you can retry in the same turn:
+
+            patch_files failed: expected content mismatch at app.py:15-18.
+            Your `expected`: ...
+            Actual (currently in file): ...
+            No files were modified. Call get_files(paths=["app.py"])...
+
+        The safe pattern is: `get_files(paths=[path])` immediately before
+        every `patch_files` on that file. Copy the range verbatim into
+        `expected`. Do not paraphrase.
+
+        # OVERLAP REJECTION
+
+        Two patches on the SAME `path` whose [start_line, end_line]
+        ranges intersect cause the entire call to be rejected — combine
+        them into ONE patch on the merged range. This includes
+        boundary-touching ranges: patches [10-15] and [15-20] overlap on
+        line 15.
+
+        # ATOMICITY
+
+        Every patch validates in a dry-run pass BEFORE any file is
+        touched. Only if every patch passes are the writes applied
+        (bottom-up per file so earlier-line indices stay valid). If
+        validation fails for any patch, no file is modified.
+
+        # AFTER THE WRITE
+
+        Post-write health probe runs (same as write_files). The
+        response's `app_status` and `startup_output` tell you whether the
+        edit broke the running app — act on ⚠ SUSPICIOUS immediately, in
+        the same turn.
+
+        # WORKED EXAMPLE
+
+        You called `get_files(paths=["app.py"])` and read:
+            10  def greet(name):
+            11      return f"hi, {name}"
+
+        You want to change the message. One patch:
+            {
+                "path": "app.py",
+                "start_line": 11,
+                "end_line": 11,
+                "expected": "    return f\\"hi, {name}\\"",
+                "replacement": "    return f\\"hello, {name}!\\"",
+            }
+
+        # NOT SELF-HEALING
+
+        Dead container? Returns 409, tells you to call write_files with
+        recreate_if_gone=true first. Fresh containers have no files to
+        anchor on, so respawning inside patch_files would be wrong.
+
+        See flow: get_runtime_types → create → write_files → (patch_files |
+        write_files loop) → preview → close.
+        """
+        log.info(
+            "MCP tool call: patch_files session=%s n_patches=%d",
+            session_id, len(patches or []),
+        )
+        try:
+            result = await patch_files_callable(
+                session_id, patches, recreate_if_gone,
+            )
+        except HTTPException as exc:
+            return _handle_http_exception(exc, tool="patch_files")
+
+        hunks = result.get("hunks_applied") or []
+        files_touched = result.get("files_touched") or []
+        text_lines = [
+            f"Patched {len(files_touched)} file(s), {len(hunks)} hunk(s) applied. "
+            f"Session `{result['session_id']}`.",
+            f"URL: {result['url']} (unchanged).",
+            _format_app_status(result.get("app_status")),
+            _format_startup_output(
+                result.get("runtime"), result.get("startup_output") or "",
+            ),
+            "",
+            "Applied:",
+        ]
+        # Group hunk ranges by path so the summary reads "app.py: 2 hunks (…)".
+        by_path: dict[str, list[str]] = {}
+        for h in hunks:
+            by_path.setdefault(h["path"], []).append(
+                f"lines {h['start_line']}-{h['end_line']}"
+            )
+        for path in files_touched:
+            ranges = by_path.get(path, [])
+            n = len(ranges)
+            text_lines.append(
+                f"- {path}: {n} hunk(s) ({', '.join(ranges)})"
+            )
+        return _tool_result(
+            "\n".join(text_lines),
+            {"ok": True, **result},
+        )
+
     # ── write_files ──
     @mcp.tool()
     async def write_files(
@@ -519,10 +664,12 @@ def build_mcp(
         files: dict = Field(
             default_factory=dict,
             description=(
-                "Path → content OVERLAY. Files not listed are preserved. "
-                "Values are UTF-8 str, or {\"encoding\":\"base64\","
+                "Path → FULL content. Every listed file is REPLACED "
+                "wholesale. Unlisted files are preserved. Values are "
+                "UTF-8 str, or {\"encoding\":\"base64\","
                 "\"content\":\"...\"} for binaries. Per-file cap: "
-                "SANDBOX_MAX_FILE_BYTES; total cap: SANDBOX_MAX_PAYLOAD_BYTES."
+                "SANDBOX_MAX_FILE_BYTES; total cap: SANDBOX_MAX_PAYLOAD_BYTES. "
+                "For a small edit, PREFER patch_files — no re-upload."
             ),
         ),
         deletes: list[str] = Field(
@@ -541,10 +688,15 @@ def build_mcp(
             ),
         ),
     ) -> ToolResult:
-        """Overlay files into a live sandbox and hot-reload.
+        """REPLACES every file you list, wholesale. **Prefer
+        ``patch_files`` for edits** — it changes only the lines you
+        specify, at a fraction of the token cost. Use write_files only
+        for genuinely new files or when you're rewriting most of a file.
 
         Semantics:
-          * ``files`` is an OVERLAY — unlisted paths are preserved.
+          * ``files`` is a REPLACEMENT set — every listed path is
+            overwritten byte-for-byte with what you supply. Unlisted
+            paths in /app are preserved (this tool doesn't clear /app).
           * ``deletes`` explicitly removes files under /app.
           * Same URL, same session_id — dev server hot-reloads.
           * Runs static Python lint on .py files before writing.
@@ -557,7 +709,8 @@ def build_mcp(
             silent state loss — env is preserved on respawn, but files
             you installed via ``exec`` are LOST.
 
-        See flow: get_runtime_types → create → write_files → preview → close.
+        See flow: get_runtime_types → create → patch_files (edits) /
+        write_files (new files, full rewrites) → preview → close.
         """
         log.info(
             "MCP tool call: write_files session=%s n_files=%d recreate=%s",
@@ -815,151 +968,6 @@ def build_mcp(
         head_lines.append(result["output"] or "(no output)")
         head_lines.append("---")
         return _tool_result("\n".join(head_lines), {"ok": True, **result})
-
-    # ── patch_files ──
-    @mcp.tool()
-    async def patch_files(
-        session_id: str = Field(
-            description=(
-                "The session_id from a previous create / run response."
-            )
-        ),
-        patches: list[dict] = Field(
-            description=(
-                "List of hunks. Each hunk is a dict with fields: "
-                "`path` (relative under /app), `start_line` (1-indexed "
-                "inclusive), `end_line` (1-indexed inclusive), `expected` "
-                "(the EXACT current text of those lines joined with \\n — "
-                "byte-for-byte, no whitespace or trailing-newline lenience), "
-                "`replacement` (what to write in place of `expected`), and "
-                "optional `note` (operator-log only). All-or-nothing: if "
-                "any patch fails validation, NO file is modified."
-            ),
-        ),
-        recreate_if_gone: bool = Field(
-            default=False,
-            description=(
-                "Accepted for interface consistency but has NO effect. "
-                "patch_files depends on files that would not exist in a "
-                "fresh container, so a dead container always returns an "
-                "error. Call write_files first if you need to respawn."
-            ),
-        ),
-    ) -> ToolResult:
-        """Strict line-range replacement inside a running sandbox.
-
-        Use this instead of write_files when:
-          * You've just called get_files on the target file this turn AND
-          * The edit changes a small fraction of the file (<20-30% is a
-            good rule of thumb).
-
-        Use write_files instead when:
-          * The file is new (patch_files does NOT create files).
-          * The rewrite covers most of the file.
-          * You have not called get_files on the target file in this turn.
-
-        # STRICT BYTE-FOR-BYTE MATCH
-
-        `expected` must match `\\n`-join(current_lines[start_line-1:end_line])
-        byte-for-byte. No whitespace or trailing-newline lenience. If it
-        does not match, the tool returns 409 with the ACTUAL current
-        content inline so you can retry in the same turn:
-
-            patch_files failed: expected content mismatch at app.py:15-18.
-            Your `expected`: ...
-            Actual (currently in file): ...
-            No files were modified. Call get_files(paths=["app.py"])...
-
-        The safe pattern is: `get_files(paths=[path])` immediately before
-        every `patch_files` on that file. Copy the range verbatim into
-        `expected`. Do not paraphrase.
-
-        # OVERLAP REJECTION
-
-        Two patches on the SAME `path` whose [start_line, end_line]
-        ranges intersect cause the entire call to be rejected — combine
-        them into ONE patch on the merged range. This includes
-        boundary-touching ranges: patches [10-15] and [15-20] overlap on
-        line 15.
-
-        # ATOMICITY
-
-        Every patch validates in a dry-run pass BEFORE any file is
-        touched. Only if every patch passes are the writes applied
-        (bottom-up per file so earlier-line indices stay valid). If
-        validation fails for any patch, no file is modified.
-
-        # AFTER THE WRITE
-
-        Post-write health probe runs (same as write_files). The
-        response's `app_status` and `startup_output` tell you whether the
-        edit broke the running app — act on ⚠ SUSPICIOUS immediately, in
-        the same turn.
-
-        # WORKED EXAMPLE
-
-        You called `get_files(paths=["app.py"])` and read:
-            10  def greet(name):
-            11      return f"hi, {name}"
-
-        You want to change the message. One patch:
-            {
-                "path": "app.py",
-                "start_line": 11,
-                "end_line": 11,
-                "expected": "    return f\\"hi, {name}\\"",
-                "replacement": "    return f\\"hello, {name}!\\"",
-            }
-
-        # NOT SELF-HEALING
-
-        Dead container? Returns 409, tells you to call write_files with
-        recreate_if_gone=true first. Fresh containers have no files to
-        anchor on, so respawning inside patch_files would be wrong.
-
-        See flow: get_runtime_types → create → write_files → (patch_files |
-        write_files loop) → preview → close.
-        """
-        log.info(
-            "MCP tool call: patch_files session=%s n_patches=%d",
-            session_id, len(patches or []),
-        )
-        try:
-            result = await patch_files_callable(
-                session_id, patches, recreate_if_gone,
-            )
-        except HTTPException as exc:
-            return _handle_http_exception(exc, tool="patch_files")
-
-        hunks = result.get("hunks_applied") or []
-        files_touched = result.get("files_touched") or []
-        text_lines = [
-            f"Patched {len(files_touched)} file(s), {len(hunks)} hunk(s) applied. "
-            f"Session `{result['session_id']}`.",
-            f"URL: {result['url']} (unchanged).",
-            _format_app_status(result.get("app_status")),
-            _format_startup_output(
-                result.get("runtime"), result.get("startup_output") or "",
-            ),
-            "",
-            "Applied:",
-        ]
-        # Group hunk ranges by path so the summary reads "app.py: 2 hunks (…)".
-        by_path: dict[str, list[str]] = {}
-        for h in hunks:
-            by_path.setdefault(h["path"], []).append(
-                f"lines {h['start_line']}-{h['end_line']}"
-            )
-        for path in files_touched:
-            ranges = by_path.get(path, [])
-            n = len(ranges)
-            text_lines.append(
-                f"- {path}: {n} hunk(s) ({', '.join(ranges)})"
-            )
-        return _tool_result(
-            "\n".join(text_lines),
-            {"ok": True, **result},
-        )
 
     # ── preview ──
     @mcp.tool()

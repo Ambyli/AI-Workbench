@@ -124,18 +124,20 @@ services:
     # Q8_0, BF16, plus shared-embedding variants), so the tag after the colon
     # is the full file path relative to repo root, not a quant tag.
     #
-    # ⚠ If `-hfd` with a file-path tag still errors on startup, fall back to
-    # the pre-downloaded local-file variant: comment out the `-hfd ...` line
-    # and uncomment the `--model-draft ...` line below, after downloading
-    # the file into the llama_data volume with:
+    # ⚠ If `-hfd` with a file-path tag still errors on startup, fall back
+    # to the pre-downloaded local-file variant by replacing the `-hfd ...`
+    # line in the command block with:
+    #   --model-draft /root/.cache/huggingface/mtp-Q4_K_M.gguf
+    # after downloading the file into the llama_data volume:
     #   docker run --rm -v ai-llama_llama_data:/c curlimages/curl \
     #     -sL -o /c/mtp-Q4_K_M.gguf \
     #     https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/main/MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf
+    # Do NOT paste a `#` comment inside the `command: >` block — YAML's
+    # folded scalar has no comment syntax and it'll be folded into the
+    # command string as a literal `#`, breaking arg parsing.
     command: >
       -hf unsloth/Qwen3.8-Flash-Next-GGUF:UD-Q4_K_XL
       -hfd unsloth/Qwen3.8-Flash-Next-GGUF:MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf
-      # Fallback (uncomment after downloading — see comment above):
-      # --model-draft /root/.cache/huggingface/mtp-Q4_K_M.gguf
       -ngld 999
       --spec-draft-n-max 16
       --spec-draft-n-min 4

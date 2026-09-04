@@ -87,14 +87,17 @@ services:
     # still open), so the MTP draft head below cannot load there. Unsloth's
     # prebuilt "mix" releases carry the patch (unslothai/llama.cpp#144) — see
     # Dockerfile.llama-unsloth. Bump LLAMA_UNSLOTH_TAG in .env to upgrade, then
-    # `up -d --build --force-recreate qwen3.8-flash`.
+    # `up -d --build --force-recreate qwen3.8-flash`. LLAMA_UNSLOTH_VARIANT and
+    # LLAMA_CUDA_RUNTIME_IMAGE must agree on the CUDA major (13.x here — the
+    # host driver is R580 / CUDA 13.0).
     build:
       context: ../..
       dockerfile: ai/llama/Dockerfile.llama-unsloth
       args:
         LLAMA_UNSLOTH_TAG: ${LLAMA_UNSLOTH_TAG:-b10796-mix-659e406}
-        LLAMA_UNSLOTH_VARIANT: ${LLAMA_UNSLOTH_VARIANT:-cuda12-portable}
-    image: llama-unsloth:${LLAMA_UNSLOTH_TAG:-b10796-mix-659e406}-${LLAMA_UNSLOTH_VARIANT:-cuda12-portable}
+        LLAMA_UNSLOTH_VARIANT: ${LLAMA_UNSLOTH_VARIANT:-cuda13-portable}
+        CUDA_RUNTIME_IMAGE: ${LLAMA_CUDA_RUNTIME_IMAGE:-nvidia/cuda:13.3.1-runtime-ubuntu22.04}
+    image: llama-unsloth:${LLAMA_UNSLOTH_TAG:-b10796-mix-659e406}-${LLAMA_UNSLOTH_VARIANT:-cuda13-portable}
     container_name: qwen3.8-flash
     restart: unless-stopped
     environment:
@@ -146,12 +149,10 @@ services:
     #                         does NOT work (the tag is matched as a quant), and
     #                         sidecar auto-discovery never searches MTP/.
     #   --spec-type draft-mtp explicit; MTP/README.md: "Always pass -md".
-    #   --spec-draft-n-max 3  README default is 2, docs page shows 5. Higher
-    #                         drafts more per verify pass but acceptance per
-    #                         token drops. Keep <= 6: the MoE expert kernel only
-    #                         keeps CUDA graphs enabled for verify batches of
-    #                         <= 8 tokens, and losing graphs costs more than the
-    #                         extra drafts gain. Tuned 2 -> 3 on the A6000 box.
+    #   --spec-draft-n-max 2  README default (docs page shows 5). Higher drafts
+    #                         more per verify pass but acceptance per token
+    #                         drops. Measured on the 3x A6000 box at temp 1.0:
+    #                         2 -> ~50 tok/s, 3 -> ~45 tok/s. Keep at 2.
     #   -devd CUDA2           pin the draft head to the GPU holding the main
     #                         model's output layer (last device under
     #                         --tensor-split 1,1,1). The shared-* head borrows
@@ -188,7 +189,7 @@ services:
       -hfd unsloth/Qwen3.8-Flash-Next-GGUF
       -md MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf
       --spec-type draft-mtp
-      --spec-draft-n-max 3
+      --spec-draft-n-max 2
       -ngld 999
       -devd CUDA2
       -a qwen3.8-flash

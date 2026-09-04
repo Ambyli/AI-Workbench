@@ -17,22 +17,28 @@
 # bundle CUDA — libcudart.so.12 / libcublas.so.12 come from the nvidia/cuda
 # runtime base, libcuda.so.1 from the host driver via `runtime: nvidia`.
 #
-# Variant guide (linux-x64):
-#   cuda12-portable  sm 70,75,80,86,89,90,100,103,120 — covers RTX A6000 (86).
-#   cuda13-*         needs a CUDA 13 capable host driver (R580+).
+# Variant guide (linux-x64) — the base image MUST match the variant's CUDA line,
+# because libggml-cuda.so links libcudart.so.<major> / libcublas.so.<major>:
+#   cuda13-portable  toolkit 13.3, sm 75,80,86,89,90,100,103,120 — RTX A6000 = 86.
+#                    Needs an R580+ host driver (nvidia-smi "CUDA Version: 13.x").
+#                    Base: nvidia/cuda:13.3.1-runtime-ubuntu22.04  (default)
+#   cuda12-portable  toolkit 12.8, sm 70..120. Any R525+ driver.
+#                    Base: nvidia/cuda:12.8.1-runtime-ubuntu22.04
 #   *-newer/-older   narrower arch lists; smaller, no functional difference.
-# Built on GitHub's ubuntu-22.04 runner with CUDA 12.8 -> match glibc with an
-# ubuntu22.04 base and the toolkit line with a 12.x runtime image.
+# All linux-x64 CUDA tarballs are built on GitHub's ubuntu-22.04 runner, so the
+# base stays ubuntu22.04 for glibc/libstdc++ parity. The ldd check below fails
+# the build if the tarball's CUDA libs don't resolve against the chosen base.
 #
-# Pin bumps: change LLAMA_UNSLOTH_TAG in .env (compose passes it as a build
-# arg AND into the image tag), then
+# Pin bumps: change LLAMA_UNSLOTH_TAG / LLAMA_UNSLOTH_VARIANT /
+# LLAMA_CUDA_RUNTIME_IMAGE in .env (compose passes them as build args and puts
+# tag+variant in the image name), then
 #   docker compose -f ai/llama/docker-compose.llama.yml up -d --build --force-recreate qwen3.8-flash
 
-ARG CUDA_RUNTIME_IMAGE=nvidia/cuda:12.8.1-runtime-ubuntu22.04
+ARG CUDA_RUNTIME_IMAGE=nvidia/cuda:13.3.1-runtime-ubuntu22.04
 FROM ${CUDA_RUNTIME_IMAGE}
 
 ARG LLAMA_UNSLOTH_TAG=b10796-mix-659e406
-ARG LLAMA_UNSLOTH_VARIANT=cuda12-portable
+ARG LLAMA_UNSLOTH_VARIANT=cuda13-portable
 
 # libgomp1  — ggml CPU backend (OpenMP)
 # libssl3   — llama.cpp's built-in HTTPS client for -hf / -hfd downloads
@@ -47,7 +53,11 @@ RUN curl -fsSL "https://github.com/unslothai/llama.cpp/releases/download/${LLAMA
       | tar -xz -C /app \
  && test -x /app/llama-server \
  && test -f /app/libggml-cuda.so \
- && echo "---- BUILD_INFO ----" && cat /app/BUILD_INFO.txt
+ && echo "---- BUILD_INFO ----" && cat /app/BUILD_INFO.txt \
+ && echo "---- CUDA lib check ----" \
+ && if ldd /app/libggml-cuda.so | grep -v 'libcuda\.so\.1' | grep 'not found'; then \
+      echo "ERROR: ${LLAMA_UNSLOTH_VARIANT} needs CUDA libs that ${CUDA_RUNTIME_IMAGE} does not provide (see above)" >&2; exit 1; \
+    fi
 
 # Same defaults as ghcr.io/ggml-org/llama.cpp:server-cuda so the compose
 # `command:` block is a drop-in.

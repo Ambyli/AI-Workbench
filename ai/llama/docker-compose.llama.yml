@@ -90,6 +90,10 @@ services:
       - "${PORT_LLAMA_QWEN38_FLASH}:8000"
     volumes:
       - llama_data:/root/.cache/huggingface
+      # Shared Qwen chat template — see ai/jinja/README.md. Same file the vLLM
+      # `qwen3.8` service mounts. Kept read-only; --jinja below tells llama.cpp
+      # to render it with its Jinja engine.
+      - ../jinja/qwen_fixed_chat_template.jinja:/config/qwen_fixed_chat_template.jinja:ro
     runtime: nvidia
     deploy:
       resources:
@@ -120,6 +124,7 @@ services:
       --cache-type-v q4_0
       --flash-attn on
       --jinja
+      --chat-template-file /config/qwen_fixed_chat_template.jinja
       --temp 1.0
       --top-p 0.95
       --top-k 20

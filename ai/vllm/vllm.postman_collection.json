@@ -43,7 +43,7 @@
   "item": [
     {
       "name": "qwen3.8",
-      "description": "Qwen3.8-27B-AWQ-INT4 (cyankiwi/Qwen3.8-27B-AWQ-INT4), served under alias `qwen3.8`. Context: 131072 tokens (--max-model-len). Runs with tensor-parallel-size 2 (shm_size: 8gb required), MTP speculative decoding (num_speculative_tokens=2), qwen3 reasoning parser + qwen3_coder tool parser, and the patched chat template at ai/vllm/config/qwen_fixed_chat_template.jinja (fixes duplicate <think> blocks, enable_thinking=false crash, and runaway reasoning_effort). If the container is stopped: all requests below fail with `ECONNREFUSED localhost:8003`; the LiteLLM-routed variant returns 500 with a upstream connect error since litellm_config.yaml points `qwen3.8` at http://qwen3.8:8000.",
+      "description": "Qwen3.8-27B-AWQ-INT4 (cyankiwi/Qwen3.8-27B-AWQ-INT4), served under alias `qwen3.8`. Context: 131072 tokens (--max-model-len). Runs with tensor-parallel-size 2 (shm_size: 8gb required), MTP speculative decoding (num_speculative_tokens=2), qwen3 reasoning parser + qwen3_coder tool parser, and the patched chat template at ai/jinja/qwen_fixed_chat_template.jinja (fixes duplicate <think> blocks, enable_thinking=false crash, and runaway reasoning_effort). If the container is stopped: all requests below fail with `ECONNREFUSED localhost:8003`; the LiteLLM-routed variant returns 500 with a upstream connect error since litellm_config.yaml points `qwen3.8` at http://qwen3.8:8000.",
       "item": [
         {
           "name": "GET /health",
@@ -119,7 +119,7 @@
     },
     {
       "name": "qwen3.6",
-      "description": "Qwen3.6-27B-AWQ-INT4 (cyankiwi/Qwen3.6-27B-AWQ-INT4), served under alias `qwen3.6`. Context: 131072 tokens (--max-model-len). Single-GPU (no tensor parallelism), MTP speculative decoding (num_speculative_tokens=2), qwen3 reasoning parser + qwen3_coder tool parser, `enable_thinking=true` and `preserve_thinking=true` set via --default-chat-template-kwargs. Uses the STOCK chat template — if it exhibits duplicate <think> blocks or reasoning-loop symptoms, mount ai/vllm/config/qwen_fixed_chat_template.jinja like qwen3.8 does. If the container is stopped: all requests below fail with `ECONNREFUSED localhost:8002`; the LiteLLM-routed variant returns 500 upstream connect error.",
+      "description": "Qwen3.6-27B-AWQ-INT4 (cyankiwi/Qwen3.6-27B-AWQ-INT4), served under alias `qwen3.6`. Context: 131072 tokens (--max-model-len). Single-GPU (no tensor parallelism), MTP speculative decoding (num_speculative_tokens=2), qwen3 reasoning parser + qwen3_coder tool parser, `enable_thinking=true` and `preserve_thinking=true` set via --default-chat-template-kwargs. Uses the STOCK chat template — if it exhibits duplicate <think> blocks or reasoning-loop symptoms, mount ai/jinja/qwen_fixed_chat_template.jinja like qwen3.8 does. If the container is stopped: all requests below fail with `ECONNREFUSED localhost:8002`; the LiteLLM-routed variant returns 500 upstream connect error.",
       "item": [
         {
           "name": "GET /health",

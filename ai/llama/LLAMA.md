@@ -45,6 +45,8 @@ The `qwen3.8-flash` service bakes the **thinking-mode** sampling parameters reco
 
 These are **server defaults** — clients that pass their own `temperature`, `top_p`, etc. in the request body still override them per-call. If you want to switch this service to the non-thinking-mode defaults from the model card (`temperature=0.7, top_p=0.80, presence_penalty=1.5`), edit the `command:` block in `ai/llama/docker-compose.llama.yml` and `docker compose ... up -d --force-recreate qwen3.8-flash`.
 
+The service also loads the **shared Qwen chat template** from [`ai/jinja/qwen_fixed_chat_template.jinja`](../jinja/qwen_fixed_chat_template.jinja) — the same file the vLLM `qwen3.8` service mounts. It's bind-mounted into the container at `/config/qwen_fixed_chat_template.jinja` and passed to llama-server via `--chat-template-file`. `--jinja` stays on so llama.cpp renders the template with its Jinja engine (the built-in template renderer can't handle the full Qwen template). Patching the template once (see [`ai/jinja/README.md`](../jinja/README.md)) fixes both backends — the llama.cpp service picks up the change on the next `--force-recreate`.
+
 The default `UD-Q4_K_XL` quant is the canonical example on the model card; swap the `-hf` tag (e.g. `UD-Q8_0`, `UD-Q2_K_XL`) to change the size/quality tradeoff — full quant list is on the HuggingFace page.
 
 ### First-run download

@@ -50,7 +50,7 @@ services:
       - "${PORT_VLLM_QWEN38}:8000"
     volumes:
       - vllm_data:/root/.cache/huggingface
-      - ./config/qwen_fixed_chat_template.jinja:/config/qwen_fixed_chat_template.jinja:ro
+      - ../jinja/qwen_fixed_chat_template.jinja:/config/qwen_fixed_chat_template.jinja:ro
     deploy:
       resources:
         reservations:

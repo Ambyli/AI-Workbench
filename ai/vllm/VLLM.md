@@ -113,7 +113,7 @@ To run a single model across multiple GPUs for lower latency and larger KV cache
 
 ### Custom chat template — qwen3.8
 
-The `qwen3.8` service loads a patched chat template from `ai/vllm/config/qwen_fixed_chat_template.jinja`, sourced from [froggeric/Qwen-Fixed-Chat-Templates](https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates). It fixes known bugs in the stock Qwen 3.5/3.6/3.8 templates, most notably:
+The `qwen3.8` service loads a patched chat template from [`ai/jinja/qwen_fixed_chat_template.jinja`](../jinja/qwen_fixed_chat_template.jinja), sourced from [froggeric/Qwen-Fixed-Chat-Templates](https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates). The same file is also mounted by the llama.cpp `qwen3.8-flash` service — see [`ai/jinja/README.md`](../jinja/README.md) for the shared-config convention. It fixes known bugs in the stock Qwen 3.5/3.6/3.8 templates, most notably:
 
 - **Duplicate blank `<think>` blocks** in conversation history that caused the model to lose reasoning state and re-think from scratch until it hit the token limit.
 - **`enable_thinking=false` crash** on Qwen 3.8.
@@ -127,13 +127,13 @@ Applied via a bind mount and the `--chat-template` flag:
     # ...
     volumes:
       - vllm_data:/root/.cache/huggingface
-      - ./config/qwen_fixed_chat_template.jinja:/config/qwen_fixed_chat_template.jinja:ro
+      - ../jinja/qwen_fixed_chat_template.jinja:/config/qwen_fixed_chat_template.jinja:ro
     command: >
       # ...
       --chat-template /config/qwen_fixed_chat_template.jinja
 ```
 
-**Updating the template:** re-download the raw file over the existing `ai/vllm/config/qwen_fixed_chat_template.jinja` and restart the container. No compose changes needed.
+**Updating the template:** re-download the raw file over the existing [`ai/jinja/qwen_fixed_chat_template.jinja`](../jinja/qwen_fixed_chat_template.jinja) and restart the container. No compose changes needed. Both vLLM `qwen3.8` and llama.cpp `qwen3.8-flash` bind-mount the same file, so a single update fixes both — recreate the containers you care about (`docker compose -f ai/vllm/docker-compose.vllm.yml up -d --force-recreate qwen3.8` and/or `docker compose -f ai/llama/docker-compose.llama.yml up -d --force-recreate qwen3.8-flash`).
 
 **Reasoning effort:** the fixed template's default is `medium`. To bump it globally, add `--default-chat-template-kwargs '{"reasoning_effort":"xhigh"}'` to the command; to bump per-request, pass `{"reasoning_effort": "xhigh"}` in the client JSON body.
 

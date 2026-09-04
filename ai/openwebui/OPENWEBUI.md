@@ -262,12 +262,12 @@ Models are configured in `litellm_config.yaml`, not in Open WebUI. After editing
 The image tag is pinned in `ai/openwebui/docker-compose.openwebui.yml`:
 
 ```yaml
-image: ghcr.io/open-webui/open-webui:v0.11.0
+image: ghcr.io/open-webui/open-webui:v0.11.3
 ```
 
 To update:
 
-1. Edit that line to the desired tag (a specific release like `v0.11.1`, or `main` for the rolling upstream tag). Releases are at <https://github.com/open-webui/open-webui/releases>.
+1. Edit that line to the desired tag (a specific release like `v0.11.3`, or `main` for the rolling upstream tag). Releases are at <https://github.com/open-webui/open-webui/releases>.
 2. Pull the new image and recreate the container:
    ```bash
    make build openwebui   # runs `docker compose pull` under the hood
@@ -275,6 +275,10 @@ To update:
    ```
 
 `make build openwebui` re-pulls whatever tag is currently pinned — useful when the tag is `main` (rolling) or when a release is re-tagged. User data in the `openwebui_data` volume is preserved across updates.
+
+**Upgrade notes:**
+
+- **v0.11.1 → v0.11.3** (2026-09-04): fixes the frontend stall on reasoning models where the Thinking block stayed open and the reply froze until generation finished ([#29035](https://github.com/open-webui/open-webui/issues/29035), fixed in v0.11.2). v0.11.3 also makes a failed DB migration stop cleanly instead of starting half-updated — some upgrades from 0.11.0–0.11.2 hit this as a missing `chat.timer_at` column ([#29280](https://github.com/open-webui/open-webui/issues/29280)). Snapshot the `openwebui_data` volume before upgrading and check `docker logs openwebui` on first start.
 
 ### Notes
 

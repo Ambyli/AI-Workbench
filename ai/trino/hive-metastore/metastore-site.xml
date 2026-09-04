@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  HMS runtime config. Postgres backend for the metastore's own tables;
+  S3A filesystem for Iceberg manifest validation against MinIO.
+
+  Env-var references are expanded at container start by the base image's
+  entrypoint (see /opt/hive/bin/entrypoint.sh in apache/hive:4.0.0).
+-->
+<configuration>
+  <!-- ── Backing store (hive-metastore-db) ──────────────────────────── -->
+  <property>
+    <name>javax.jdo.option.ConnectionURL</name>
+    <value>jdbc:postgresql://${env.HMS_DB_HOST}:${env.HMS_DB_PORT}/${env.HMS_DB_NAME}</value>
+  </property>
+  <property>
+    <name>javax.jdo.option.ConnectionDriverName</name>
+    <value>org.postgresql.Driver</value>
+  </property>
+  <property>
+    <name>javax.jdo.option.ConnectionUserName</name>
+    <value>${env.HMS_DB_USER}</value>
+  </property>
+  <property>
+    <name>javax.jdo.option.ConnectionPassword</name>
+    <value>${env.HMS_DB_PASSWORD}</value>
+  </property>
+
+  <!-- Default warehouse location on MinIO. Iceberg tables get their own
+       location under this prefix (s3a://warehouse/{db}/{table}/…). -->
+  <property>
+    <name>hive.metastore.warehouse.dir</name>
+    <value>s3a://warehouse/</value>
+  </property>
+
+  <!-- ── S3A filesystem pointing at MinIO ──────────────────────────── -->
+  <property>
+    <name>fs.s3a.endpoint</name>
+    <value>${env.MINIO_ENDPOINT}</value>
+  </property>
+  <property>
+    <name>fs.s3a.access.key</name>
+    <value>${env.MINIO_ROOT_USER}</value>
+  </property>
+  <property>
+    <name>fs.s3a.secret.key</name>
+    <value>${env.MINIO_ROOT_PASSWORD}</value>
+  </property>
+  <property>
+    <name>fs.s3a.path.style.access</name>
+    <value>true</value>
+  </property>
+  <property>
+    <name>fs.s3a.connection.ssl.enabled</name>
+    <value>false</value>
+  </property>
+
+  <!-- Trino's Iceberg connector opens one thrift connection per query;
+       raise the server socket backlog so a burst of concurrent Superset
+       queries doesn't get ECONNREFUSED. -->
+  <property>
+    <name>metastore.server.max.threads</name>
+    <value>200</value>
+  </property>
+</configuration>

@@ -1,0 +1,28 @@
+# Build context is the REPO ROOT (see ai/trino/docker-compose.trino.yml:
+#   context: ../..) so we can copy the shared workspace package alongside
+# the service — same pattern as ai/sandbox/runner/Dockerfile.
+
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    UV_NO_CACHE=1 \
+    PYTHONPATH=/app/ai/trino/mcp
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+WORKDIR /app
+
+# Workspace bootstrap — same shape as sandbox-runner.
+COPY pyproject.toml uv.lock ./
+COPY shared/common ./shared/common
+COPY ai/trino/mcp/pyproject.toml ./ai/trino/mcp/
+
+RUN uv sync --package trino-mcp --no-dev --frozen
+
+COPY ai/trino/mcp/server.py ./ai/trino/mcp/
+
+WORKDIR /app/ai/trino/mcp
+EXPOSE 8080
+
+CMD ["uv", "run", "uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8080"]

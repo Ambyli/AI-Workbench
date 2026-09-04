@@ -6,6 +6,7 @@ members = [
     "ai/interceptor",
     "ai/classifier",
     "ai/sandbox/runner",
+    "ai/trino/mcp",
 ]
 
 [tool.uv.sources]

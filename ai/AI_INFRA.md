@@ -40,6 +40,7 @@ Every service in the list below is on the `ai_shared` network unless noted. Port
 | [`searxng/docker-compose.searxng.yml`](searxng/docker-compose.searxng.yml) | `searxng` | `8009` | [SEARXNG.md](searxng/SEARXNG.md) |
 | [`sandbox/docker-compose.sandbox.yml`](sandbox/docker-compose.sandbox.yml) | `sandbox-runner`, `sandbox-proxy`, `sandbox-egress`, `sandbox-db` | `8012` (runner), `8011` (proxy), `5434` (db) | [SANDBOX.md](sandbox/SANDBOX.md) |
 | [`n8n/docker-compose.n8n.yml`](n8n/docker-compose.n8n.yml) | `n8n`, `n8n-db` | `5435` (db) — n8n itself reached via oauth2-proxy at `/n8n/` | [N8N.md](n8n/N8N.md) |
+| [`trino/docker-compose.trino.yml`](trino/docker-compose.trino.yml) | `trino-coordinator`, `hive-metastore`, `hive-metastore-db`, `minio`, `minio-init`, `trino-mcp`, `superset`, `superset-db` | `8013` (trino), `8014`/`8015` (minio api/console), `8016` (superset), `5436`/`5437` (hms-db / superset-db) — minio-console and superset also reached via oauth2-proxy at `/minio/` and `/superset/` | [TRINO.md](trino/TRINO.md) |
 
 ## Flow diagram
 
@@ -120,6 +121,15 @@ flowchart TB
         N8N["n8n<br/>:5678 internal<br/>(via /n8n/)"]:::svc
         N8NDB[("n8n-db<br/>postgres :5435")]:::store
     end
+    subgraph TRG["trino/docker-compose.trino.yml"]
+        TR["trino-coordinator<br/>:8013<br/>(federated SQL)"]:::svc
+        HMS["hive-metastore<br/>thrift :9083 internal"]:::svc
+        HMSDB[("hive-metastore-db<br/>postgres :5436<br/>analytics_net")]:::store
+        MINIO[("minio<br/>api :8014 / console :8015<br/>iceberg warehouse")]:::store
+        TMCP["trino-mcp<br/>internal :8080<br/>SELECT-only shim"]:::svc
+        SS["superset<br/>:8016 (via /superset/)"]:::svc
+        SSDB[("superset-db<br/>postgres :5437<br/>analytics_net")]:::store
+    end
 
     Browser --> CF --> O2P --> OWU
     O2P -->|"/assets/* (skip-auth)"| OA
@@ -169,6 +179,20 @@ flowchart TB
     N8N  ==>|"OpenAI SDK<br/>AI + LangChain nodes"| LL
     N8N  --> N8NDB
 
+    LL   -.->|MCP registration| TMCP
+    TMCP ==>|"trino DBAPI<br/>SELECT-only"| TR
+    O2P  ==>|"/superset/*<br/>(same-origin cookie)"| SS
+    O2P  ==>|"/minio/*<br/>(same-origin cookie)"| MINIO
+    SS   ==>|"sqlalchemy-trino"| TR
+    SS   --> SSDB
+    TR   -->|"thrift 9083<br/>analytics_net"| HMS
+    HMS  --> HMSDB
+    TR   -->|"s3 API<br/>iceberg parquet"| MINIO
+    HMS  -.->|"s3a validation"| MINIO
+    TR   -.->|"federated<br/>host publish :5432"| DB
+    TR   -.->|"federated<br/>ai_shared"| RB
+    TR   -.->|"federated<br/>host publish :5434"| SBD
+
     KAPP -. model download .-> HF
     MAPP -. model download .-> HF
     VQ   -. model download .-> HF
@@ -192,6 +216,7 @@ flowchart TB
 - **SearXNG is Open WebUI's web-search backend, not LiteLLM's** — when a user toggles web search on in the chat composer, Open WebUI calls `http://searxng:8080/search?format=json` server-side, injects the top-N results into the prompt, and only *then* dispatches to LiteLLM. Models never call SearXNG directly, and it is not registered as an MCP tool. SearXNG fans out to public search engines (Google, Bing, DuckDuckGo, …) with no API key of its own — see [SEARXNG.md](searxng/SEARXNG.md).
 - **Sandbox subsystem is deliberately off `ai_shared`** — unlike every other product, the sandbox stack (`sandbox-runner`, `sandbox-proxy`, `sandbox-egress`, `sandbox-db`, and every spawned `sandbox-{id}` container) runs on two additional Docker networks: `sandbox_net` (bridge, `internal: true`) and `sandbox_state` (bridge, `internal: true`). Because the model-generated code inside a sandbox is untrusted, sandboxes MUST NOT be able to reach `litellm`, `phoenix-mcp`, `roofix-db`, `interceptor`, etc. `sandbox-runner` is the only container that straddles all three networks — it's the audit boundary and the single privileged consumer of `/var/run/docker.sock`. `sandbox-proxy` (Caddy) bridges `ai_shared → sandbox_net` so Open WebUI can iframe `http://sandbox-proxy/{id}/`. Outbound HTTP from sandboxes is forced through `sandbox-egress` (tinyproxy) with a hard-coded destination allowlist (pypi, npmjs, esm.sh, jsdelivr) — everything else drops. `sandbox-db` sits on `sandbox_state` alone so a container-escape in a sandbox cannot tamper with the job store. See [SANDBOX.md](sandbox/SANDBOX.md) for the security-invariant checklist that must be re-verified on every change to the subsystem.
 - **Sandbox iframes share the Open WebUI origin** — the iframe `src` returned by `preview_app` is `https://chat.zeoenergy.com/sandboxes/{id}/`, not `http://sandbox-proxy/{id}/`. `oauth2-proxy` has `http://sandbox-proxy:80/sandboxes/` in `OAUTH2_PROXY_UPSTREAMS`, so `chat.zeoenergy.com/sandboxes/*` gets fanned out to sandbox-proxy alongside `chat.zeoenergy.com/*` (openwebui) and `chat.zeoenergy.com/assets/*` (branded sign-in assets). Because the sandbox iframe is same-origin with the chat, the `_oauth2_proxy` cookie is sent automatically — no separate sign-in, no cross-origin CSP surprise. `/sandboxes/*` is NOT in `OAUTH2_PROXY_SKIP_AUTH_ROUTES`, so anonymous requests are still gated. See [SANDBOX.md § Public iframe routing](sandbox/SANDBOX.md#public-iframe-routing) for the traffic-path diagram and how to move to a separate `sandboxes.` subdomain if you want to serve unauthenticated previews.
+- **Trino data lake bridges `ai_shared` and `analytics_net`** — Trino coordinator, MinIO (API + console), Superset, and `trino-mcp` sit on `ai_shared` so LiteLLM / OpenWebUI / laptops can reach them. The data plane (HMS ↔ HMS-Postgres ↔ Superset-Postgres) lives on `analytics_net` alone. Model-facing SQL flows `LiteLLM → trino-mcp → trino-coordinator`; humans go `oauth2-proxy → superset → trino-coordinator`. The `TR -.-> DB`, `TR -.-> RB`, `TR -.-> SBD` edges are federation reads issued via Trino — dashed because they cross subsystem boundaries. `litellm_db` and `sandbox-db` are reached via `host.docker.internal` on the host publish (they aren't on `ai_shared`) so Trino doesn't have to join `litellm`'s `internal` network or breach `sandbox_state` isolation; `roofix-db` is on `ai_shared` and uses service DNS. `trino-mcp` is SELECT-only — `common.trino.TrinoClient` rejects DDL/DML, spliced `LIMIT` caps result rows at `TRINO_MCP_MAX_ROWS`, and `query_max_execution_time` in session properties caps runtime at `TRINO_MCP_MAX_RUNTIME_S`. Superset uses `AUTH_TYPE=AUTH_REMOTE_USER` (trusts the `X-Auth-Request-Email` header from oauth2-proxy) — the host publish on `PORT_SUPERSET` MUST be loopback-bound or dropped before running on an untrusted network, or anyone on the LAN can spoof the header. See [TRINO.md](trino/TRINO.md) for the operator guide.
 - **n8n rides on the same shared hostname under `/n8n/`** — same trick as `/sandboxes/*`, one more entry (`http://n8n:5678/n8n/`) in `OAUTH2_PROXY_UPSTREAMS`. On the n8n side, `N8N_PATH=/n8n/` + `N8N_EDITOR_BASE_URL=https://chat.zeoenergy.com/n8n/` + `WEBHOOK_URL=https://chat.zeoenergy.com/n8n/` (all set in `ai/n8n/docker-compose.n8n.yml`) make the editor's HTML and outbound webhook payloads use the subpath-aware URL. The shared oauth2-proxy cookie means one Google sign-in covers both Open WebUI and n8n; **no Cloudflare tunnel change is needed** because it's the same hostname. n8n's AI / LangChain nodes are preconfigured to talk to LiteLLM (`http://litellm:4000/v1` + `DEFAULT_LITELLM_MASTER_KEY`) so workflows don't need per-credential base-URL entry. Workflow rows, credential blobs, and execution history live in the dedicated `n8n-db` Postgres (`:5435`); credentials are encrypted at rest with `N8N_ENCRYPTION_KEY`, which is load-bearing across restarts — see [N8N.md](n8n/N8N.md).
 
 ## Ports at a glance
@@ -218,3 +243,9 @@ Ports are sourced from `.env` (`PORT_*` variables). Defaults shown; change them 
 | sandbox-db (postgres) | `5434` |
 | n8n-db (postgres) | `5435` |
 | n8n | _(none — via oauth2-proxy at `/n8n/`)_ |
+| trino-coordinator | `8013` |
+| minio (S3 API / console) | `8014` / `8015` |
+| superset | `8016` _(also via oauth2-proxy at `/superset/`)_ |
+| hive-metastore-db (postgres) | `5436` |
+| superset-db (postgres) | `5437` |
+| trino-mcp | _(none — registered with LiteLLM at `http://trino-mcp:8080/mcp`)_ |

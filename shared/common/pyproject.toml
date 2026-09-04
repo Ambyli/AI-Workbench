@@ -19,6 +19,7 @@ dev = [
     "fastapi",           # for tests/test_jobs_router.py
     "httpx",             # transitive: FastAPI's TestClient
     "pydantic",          # transitive: model.py — most consumers already have it
+    "trino>=0.328",      # for tests/trino/test_client.py
 ]
 
 [project.scripts]

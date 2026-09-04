@@ -119,9 +119,10 @@ services:
       --host 0.0.0.0 --port 8000
       -ngl 999
       --tensor-split 1,1,1
-      -c 131072
-      --cache-type-k q4_0
-      --cache-type-v q4_0
+      -c 262144
+      --parallel 2
+      --cache-type-k q8_0
+      --cache-type-v q8_0
       --flash-attn on
       --jinja
       --chat-template-file /config/qwen_fixed_chat_template.jinja

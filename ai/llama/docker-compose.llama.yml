@@ -98,6 +98,10 @@ services:
         LLAMA_UNSLOTH_VARIANT: ${LLAMA_UNSLOTH_VARIANT:-cuda13-portable}
         CUDA_RUNTIME_IMAGE: ${LLAMA_CUDA_RUNTIME_IMAGE:-nvidia/cuda:13.3.1-runtime-ubuntu22.04}
     image: llama-unsloth:${LLAMA_UNSLOTH_TAG:-b10796-mix-659e406}-${LLAMA_UNSLOTH_VARIANT:-cuda13-portable}
+    # Local-only image name: never try to pull it from a registry. Without
+    # this, `up` / `pull` print "pull access denied for llama-unsloth" before
+    # falling back to the build (harmless, but noisy and confusing).
+    pull_policy: build
     container_name: qwen3.8-flash
     restart: unless-stopped
     environment:

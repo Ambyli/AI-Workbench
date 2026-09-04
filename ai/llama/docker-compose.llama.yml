@@ -77,5 +77,54 @@ services:
       --jinja
       --load-mode none
 
+  qwen3.8-flash:
+    networks:
+      - shared
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    container_name: qwen3.8-flash
+    restart: unless-stopped
+    environment:
+      - HF_TOKEN=${HF_TOKEN}
+      - LLAMA_ARG_HF_TOKEN=${HF_TOKEN}
+    ports:
+      - "${PORT_LLAMA_QWEN38_FLASH}:8000"
+    volumes:
+      - llama_data:/root/.cache/huggingface
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+      start_period: 900s
+    # Sampling defaults are the "Thinking mode" values recommended on
+    # https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF
+    #   temperature=1.0, top_p=0.95, top_k=20, min_p=0.0, presence_penalty=0.0
+    # These are server defaults; clients can override per-request via the
+    # OpenAI-compatible fields (temperature, top_p, ...).
+    command: >
+      -hf unsloth/Qwen3.8-Flash-Next-GGUF:UD-Q4_K_XL
+      -a qwen3.8-flash
+      --host 0.0.0.0 --port 8000
+      -ngl 999
+      --tensor-split 1,1,1
+      -c 131072
+      --cache-type-k q4_0
+      --cache-type-v q4_0
+      --flash-attn on
+      --jinja
+      --temp 1.0
+      --top-p 0.95
+      --top-k 20
+      --min-p 0.0
+      --presence-penalty 0.0
+
 volumes:
   llama_data:

@@ -19,6 +19,12 @@
       "description": "Model alias returned by `/v1/models` and required in the `\"model\"` field of chat/completion requests. Set via `-a glm5.2` in the compose `command:` block. If you add more llama-server services (see LLAMA.md § Adding more models), each one carries its own alias."
     },
     {
+      "key": "llamaQwen38Flash",
+      "value": "http://localhost:8017",
+      "type": "string",
+      "description": "Direct-port base URL for the `qwen3.8-flash` llama-server container. Published on `${PORT_LLAMA_QWEN38_FLASH}` (default 8017) → container port 8000. On `ai_shared` it's http://qwen3.8-flash:8000. Model alias is `qwen3.8-flash`. Launched with the thinking-mode sampling defaults from the Qwen3.8-Flash-Next model card (LLAMA.md § `qwen3.8-flash` sampling defaults)."
+    },
+    {
       "key": "litellm",
       "value": "http://localhost:4001",
       "type": "string",
@@ -92,6 +98,27 @@
           "path": ["v1", "chat", "completions"]
         },
         "description": "OpenAI-compatible chat completion. Response shape mirrors OpenAI: `{id, object:\"chat.completion\", choices:[{message:{role,content},finish_reason}], usage:{...}}`. GLM's chat template is applied server-side because the compose command sets `--jinja` — without that flag the roles are ignored and you get raw-completion behavior (LLAMA.md § Common pitfalls). Add `\"stream\": true` for SSE streaming."
+      },
+      "response": []
+    },
+    {
+      "name": "POST /v1/chat/completions (qwen3.8-flash)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"model\": \"qwen3.8-flash\",\n  \"messages\": [\n    { \"role\": \"user\", \"content\": \"Hello!\" }\n  ]\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": {
+          "raw": "{{llamaQwen38Flash}}/v1/chat/completions",
+          "host": ["{{llamaQwen38Flash}}"],
+          "path": ["v1", "chat", "completions"]
+        },
+        "description": "OpenAI-compatible chat completion against the `qwen3.8-flash` llama-server container (port 8017 by default). The service is launched with thinking-mode sampling defaults (`--temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0`) baked into the compose `command:` block — see LLAMA.md § `qwen3.8-flash` sampling defaults. Override any of those per-request by passing `temperature`, `top_p`, `top_k`, `min_p`, or `presence_penalty` in the JSON body. Add `\"stream\": true` for SSE streaming."
       },
       "response": []
     },

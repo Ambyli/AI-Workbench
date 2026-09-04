@@ -12,11 +12,12 @@ docker compose -f ai/llama/docker-compose.llama.yml up -d
 make up llama
 ```
 
-This launches one container by default:
+This launches two containers by default:
 
 | Container | Port | Model | Quant | Weights |
 |---|---|---|---|---|
 | `glm5.2` | `localhost:8010` | Z.ai GLM-5.2 (~753B-A40B MoE) | UD-IQ1_S (~176 GB) | `unsloth/GLM-5.2-GGUF` |
+| `qwen3.8-flash` | `localhost:8017` | Qwen3.8-Flash-Next | UD-Q4_K_XL | `unsloth/Qwen3.8-Flash-Next-GGUF` |
 
 Test with:
 
@@ -24,7 +25,27 @@ Test with:
 curl http://localhost:8010/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model": "glm5.2", "messages": [{"role": "user", "content": "Hello!"}]}'
+
+curl http://localhost:8017/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "qwen3.8-flash", "messages": [{"role": "user", "content": "Hello!"}]}'
 ```
+
+### `qwen3.8-flash` sampling defaults
+
+The `qwen3.8-flash` service bakes the **thinking-mode** sampling parameters recommended on the [model card](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) into the launch command:
+
+| Flag | Value |
+|---|---|
+| `--temp` | `1.0` |
+| `--top-p` | `0.95` |
+| `--top-k` | `20` |
+| `--min-p` | `0.0` |
+| `--presence-penalty` | `0.0` |
+
+These are **server defaults** — clients that pass their own `temperature`, `top_p`, etc. in the request body still override them per-call. If you want to switch this service to the non-thinking-mode defaults from the model card (`temperature=0.7, top_p=0.80, presence_penalty=1.5`), edit the `command:` block in `ai/llama/docker-compose.llama.yml` and `docker compose ... up -d --force-recreate qwen3.8-flash`.
+
+The default `UD-Q4_K_XL` quant is the canonical example on the model card; swap the `-hf` tag (e.g. `UD-Q8_0`, `UD-Q2_K_XL`) to change the size/quality tradeoff — full quant list is on the HuggingFace page.
 
 ### First-run download
 

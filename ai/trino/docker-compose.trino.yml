@@ -85,9 +85,14 @@ services:
       minio-init:
         condition: service_completed_successfully
     healthcheck:
-      # HMS binds thrift on 9083. `nc -z` is portable and doesn't require
-      # a thrift client to be present in the image.
-      test: ["CMD-SHELL", "nc -z 127.0.0.1 9083"]
+      # HMS binds thrift on 9083. apache/hive:4.0.0 is eclipse-temurin
+      # based and ships NO netcat, so `nc -z` exits 127 ("nc: not found")
+      # forever — the container stays unhealthy and every downstream
+      # `condition: service_healthy` (trino-coordinator → trino-mcp,
+      # superset) never starts. bash IS in the image, so use its
+      # /dev/tcp pseudo-device instead. Must be `bash -c`, not plain
+      # CMD-SHELL: /bin/sh here is dash, which has no /dev/tcp.
+      test: ["CMD-SHELL", "timeout 3 bash -c '</dev/tcp/127.0.0.1/9083' || exit 1"]
       interval: 15s
       timeout: 3s
       start_period: 30s

@@ -66,12 +66,14 @@ from common.env import load_env
 load_env()
 
 import asyncio
+import json
 import logging
 import os
+import re
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 
 from common.jobs.postgres import PostgresRegistry
@@ -80,6 +82,7 @@ from common.logging_setup import setup_logging
 
 import state
 from constants import (
+    BROWSER_LOG_MAX_BODY_BYTES,
     DEBUG_LOGGING,
     DEFAULT_TTL_S,
     EXEC_DEFAULT_TIMEOUT_S,
@@ -101,6 +104,7 @@ from models import (
     UpdateFilesRequest,
 )
 from operations import (
+    _do_browser_log_ingest,
     _do_close,
     _do_create,
     _do_exec,
@@ -464,6 +468,55 @@ async def session_patch(session_id: str, req: PatchFilesRequest) -> dict:
     return await _do_patch_files(
         session_id, patches_dicts, req.recreate_if_gone,
     )
+
+
+# ── Browser log ingest (internal) ────────────────────────────────────────
+# Called by the browser shim (see ai/sandbox/proxies/browser_shim.js)
+# via sandbox-proxy. NOT exposed publicly — only reachable through the
+# Caddy `_browser_log` route which pins on a 12-hex sandbox id.
+#
+# Design points captured here (not the docstring so LSPs don't dump
+# the whole design into hover tooltips):
+#   * Returns 204 regardless of success — the browser doesn't retry and
+#     surfacing a failure would only turn a debugging feature into a
+#     source of network-tab noise for end users.
+#   * Fire-and-forget: we spawn the ingest as an asyncio task so the
+#     endpoint returns immediately. Rate-limit accounting is synchronous
+#     inside _do_browser_log_ingest, so nothing about the response
+#     depends on the docker exec completing.
+#   * Body-byte cap enforced BEFORE JSON parsing — a hostile client
+#     can't DoS us with a 100 MB payload.
+_SANDBOX_ID_RE = re.compile(r"^[a-f0-9]{12}$")
+
+
+@app.post("/internal/browser-log/{sandbox_id}", status_code=204)
+async def browser_log(sandbox_id: str, request: Request) -> Response:
+    """Ingest a batch of shim-produced browser events. Internal — see
+    ai/sandbox/SANDBOX.md § Browser console capture.
+    """
+    if not _SANDBOX_ID_RE.match(sandbox_id):
+        # Silently drop with a 204 so an attacker can't probe for
+        # sandbox_id shape by watching the status code.
+        log.debug("browser-log: rejecting malformed sandbox_id: %r", sandbox_id)
+        return Response(status_code=204)
+    body = await request.body()
+    if len(body) > BROWSER_LOG_MAX_BODY_BYTES:
+        log.warning(
+            "browser-log: body too large (%d bytes) for sandbox=%s, rejecting",
+            len(body), sandbox_id,
+        )
+        raise HTTPException(413, "browser-log body too large")
+    try:
+        payload = json.loads(body) if body else {}
+    except ValueError:
+        log.debug("browser-log: malformed JSON from sandbox=%s, dropping", sandbox_id)
+        return Response(status_code=204)
+    entries = payload.get("entries") if isinstance(payload, dict) else None
+    if not isinstance(entries, list) or not entries:
+        return Response(status_code=204)
+    # Fire and forget so the browser gets its 204 immediately.
+    asyncio.create_task(_do_browser_log_ingest(sandbox_id, entries))
+    return Response(status_code=204)
 
 
 @app.delete("/session/{session_id}", status_code=204)

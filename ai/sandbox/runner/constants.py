@@ -141,3 +141,19 @@ UPDATE_SETTLE_S = 0.5
 MEMORY_LIMIT = "512m"
 NANO_CPUS_PER_CPU = 1_000_000_000
 PIDS_LIMIT = 256
+
+
+# ── Browser log ingest ───────────────────────────────────────────────────
+# Rolling-window cap on the number of browser-side events a single
+# sandbox may forward to the runner. Applied per sandbox_id. Once the
+# window has BROWSER_LOG_RATE_LIMIT_PER_MIN entries in the last 60s,
+# further entries in the same POST are dropped and a single synthetic
+# `[browser rate-limited: N events dropped in the last minute]` line
+# is written in their place. Protects the runner + the container's
+# /tmp/sandbox.log from a debug-loop firehose.
+
+BROWSER_LOG_RATE_LIMIT_PER_MIN = 100
+
+# Sanity cap on the size of a single POST body from the shim. Anything
+# above this and we assume abuse / a runaway loop and reject with 413.
+BROWSER_LOG_MAX_BODY_BYTES = 64 * 1024

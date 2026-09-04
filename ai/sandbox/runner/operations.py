@@ -15,12 +15,15 @@ import asyncio
 import json
 import logging
 import secrets
+import time
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import HTTPException
 
 from constants import (
+    BROWSER_LOG_RATE_LIMIT_PER_MIN,
     DEFAULT_TTL_S,
     EXEC_DEFAULT_TIMEOUT_S,
     EXEC_HARD_TIMEOUT_S,
@@ -40,6 +43,26 @@ import state
 
 
 log = logging.getLogger("sandbox-runner.operations")
+
+
+# ── Browser-log rate limiter (module-scoped, in-process) ─────────────────
+# Keyed by sandbox_id. Each entry is a deque of monotonic timestamps
+# (seconds). We prune the head on every ingest so the window slides.
+#
+# Kept in-process because:
+#   * Ingest is best-effort — a runner restart can drop the counter
+#     with no user-visible consequence beyond a briefly higher rate.
+#   * Cross-process rate limiting (Redis, DB) would drag another
+#     dependency in for a debug-only feature.
+#
+# The dict is bounded implicitly by SANDBOX_MAX_CONCURRENT (there's
+# only ever a handful of live sandbox_ids). Reaper teardown does not
+# purge the dict eagerly — dead sandbox_ids have their deques emptied
+# on the next ingest attempt (which will 404 anyway) and eventually
+# GC'd when the process restarts. If this ever needs eviction, add a
+# TTL sweep here.
+_browser_log_windows: dict[str, deque] = {}
+_BROWSER_LOG_WINDOW_S = 60.0
 
 
 # ── Small utilities ───────────────────────────────────────────────────────
@@ -892,6 +915,160 @@ async def _do_close(session_id: str) -> dict:
 async def _do_list_sessions() -> dict:
     rows = await _list_running_sessions_rows()
     return {"count": len(rows), "sessions": rows}
+
+
+# ── Browser log ingest ───────────────────────────────────────────────────
+#
+# Wire path: shim in the sandbox app → sandbox-proxy → this handler → docker
+# exec into the sandbox container's /tmp/sandbox.log → get_logs surfaces
+# with a `[browser]` prefix. See ai/sandbox/SANDBOX.md § Browser console
+# capture for scope, limits, and known gaps.
+
+_BROWSER_LEVELS = {"error", "warn", "log", "info", "debug"}
+
+
+def _format_browser_entry(entry: dict) -> Optional[str]:
+    """Render one shim-produced entry as a single log line (plus indented
+    stack lines if present). Returns None if the entry is malformed
+    beyond repair — we drop rather than write garbage."""
+    level = entry.get("level")
+    ts_ms = entry.get("ts")
+    message = entry.get("message")
+    if level not in _BROWSER_LEVELS or not isinstance(message, str):
+        return None
+    if not isinstance(ts_ms, (int, float)):
+        ts_ms = time.time() * 1000
+    ts_iso = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc).isoformat()
+
+    # `message` may itself be multi-line (e.g. a stringified object with
+    # embedded newlines). Fold to one physical line so the log is
+    # grep-friendly; the stack (if present) carries the full detail.
+    one_line = message.replace("\n", " ").replace("\r", " ")
+
+    # source/line/col are all optional — the shim omits them for
+    # console.error/warn on a plain string; window.onerror always sets them.
+    tail_parts: list[str] = []
+    source = entry.get("source")
+    line = entry.get("line")
+    col = entry.get("col")
+    if isinstance(source, str) and source:
+        loc = source
+        if isinstance(line, int):
+            loc += f":{line}"
+            if isinstance(col, int):
+                loc += f":{col}"
+        tail_parts.append(f"(at {loc})")
+
+    header = f"[browser] {ts_iso} {level}: {one_line}"
+    if tail_parts:
+        header += "    " + " ".join(tail_parts)
+
+    stack = entry.get("stack")
+    if isinstance(stack, str) and stack.strip():
+        indented = "\n".join("    " + s for s in stack.rstrip().split("\n"))
+        return header + "\n" + indented
+    return header
+
+
+def _slide_browser_window(sandbox_id: str, now: float) -> deque:
+    """Return the sandbox's rolling window with entries older than
+    ``_BROWSER_LOG_WINDOW_S`` seconds pruned from the head."""
+    q = _browser_log_windows.get(sandbox_id)
+    if q is None:
+        q = deque()
+        _browser_log_windows[sandbox_id] = q
+    cutoff = now - _BROWSER_LOG_WINDOW_S
+    while q and q[0] < cutoff:
+        q.popleft()
+    return q
+
+
+async def _write_lines_to_container_log(container_name: str, lines: list[str]) -> None:
+    """Fire-and-forget append to the container's ``/tmp/sandbox.log``
+    via ``spawner.append_to_log``. Swallows every failure — the browser
+    won't retry regardless.
+    """
+    if not lines or state.spawner is None:
+        return
+    payload = "".join(line + "\n" for line in lines)
+    try:
+        await asyncio.to_thread(
+            state.spawner.append_to_log, container_name, payload
+        )
+    except Exception as exc:  # noqa: BLE001 — best-effort ingest
+        log.warning(
+            "browser-log: append to %s failed: %s", container_name, exc,
+        )
+
+
+async def _do_browser_log_ingest(sandbox_id: str, entries: list[dict]) -> None:
+    """Format, rate-limit, and forward browser-side events into the
+    sandbox container's /tmp/sandbox.log.
+
+    Returns None so the endpoint can `await` it (or fire-and-forget with
+    ``asyncio.create_task``) and immediately respond 204. All failure
+    paths are swallowed — the browser never sees an error.
+
+    Rate limit: ``BROWSER_LOG_RATE_LIMIT_PER_MIN`` per sandbox_id per
+    rolling 60 s window. Overage in a single POST is dropped and
+    collapsed into ONE synthetic warn line so the model can see events
+    are being lost.
+    """
+    if state.registry is None or state.spawner is None:
+        log.debug("browser-log: runner not initialized, dropping ingest")
+        return
+    # Cheap 404-equivalent: unknown sandbox_id → drop silently. We don't
+    # raise here so the endpoint stays 204 either way.
+    job = await state.registry.get(sandbox_id)
+    if job is None:
+        log.debug("browser-log: unknown sandbox=%s, dropping %d entries",
+                  sandbox_id, len(entries))
+        return
+    container_name = (job.result or {}).get("container_name")
+    if not container_name:
+        log.debug("browser-log: sandbox=%s has no container, dropping", sandbox_id)
+        return
+
+    now = time.monotonic()
+    window = _slide_browser_window(sandbox_id, now)
+    room = max(0, BROWSER_LOG_RATE_LIMIT_PER_MIN - len(window))
+
+    accepted: list[dict] = []
+    dropped = 0
+    for entry in entries:
+        if not isinstance(entry, dict):
+            dropped += 1
+            continue
+        if room <= 0:
+            dropped += 1
+            continue
+        accepted.append(entry)
+        window.append(now)
+        room -= 1
+
+    lines: list[str] = []
+    for entry in accepted:
+        rendered = _format_browser_entry(entry)
+        if rendered is not None:
+            lines.append(rendered)
+
+    if dropped > 0:
+        # One synthetic line no matter how many were dropped; the model
+        # gets a clear "we're rate-limiting" signal without a flood.
+        ts = datetime.now(tz=timezone.utc).isoformat()
+        lines.append(
+            f"[browser] {ts} warn: [browser rate-limited: {dropped} events "
+            f"dropped in the last minute — cap is {BROWSER_LOG_RATE_LIMIT_PER_MIN}/min]"
+        )
+
+    if not lines:
+        return
+
+    log.debug(
+        "browser-log: sandbox=%s accepted=%d dropped=%d",
+        sandbox_id, len(accepted), dropped,
+    )
+    await _write_lines_to_container_log(container_name, lines)
 
 
 async def _reuse_or_spawn(

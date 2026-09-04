@@ -670,7 +670,8 @@ def build_mcp(
         ),
     ) -> ToolResult:
         """Fetch the last N lines of the running sandbox's combined
-        stdout+stderr.
+        stdout+stderr AND the interleaved browser-side events forwarded
+        by the sandbox-proxy shim.
 
         Call this when the user reports the running app looks broken
         (rendered error card, "undefined is not a function", the button
@@ -680,6 +681,25 @@ def build_mcp(
         before rendering the browser error. Streamlit's own exception
         handler is patched by the runner's bootstrap shim so its
         tracebacks land here too.
+
+        Browser-side events surface as lines prefixed ``[browser]``:
+        ``console.error``, ``console.warn``, ``window.onerror``, and
+        unhandled promise rejections are captured unconditionally.
+        ``console.log`` / ``console.info`` / ``console.debug`` are
+        captured ONLY when the user opened the preview with ``?_debug=1``
+        in the URL — kept off by default so a chatty React app doesn't
+        drown out the server-side output. Browser events are
+        rate-limited to 100/minute per sandbox; overage collapses to a
+        single ``[browser rate-limited: N events dropped]`` line so the
+        agent can see they're being lost.
+
+        Known browser-capture gaps: React error boundaries (they render
+        their own UI without hitting window.onerror), Web Worker errors
+        (window-scoped listeners only), errors inside cross-origin
+        iframes the app embeds, and network failures the app catches
+        and swallows. Apps that ship a strict
+        ``Content-Security-Policy: script-src 'self'`` refuse the shim
+        entirely — no browser events will appear for those.
 
         Do NOT call this after a create / update_files / run FAILURE —
         those already include container logs in the tool response.

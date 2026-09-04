@@ -794,6 +794,49 @@
 			"response": []
 		},
 		{
+			"name": "POST /internal/browser-log/{sandboxId} — browser console ingest (internal)",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n  \"entries\": [\n    {\n      \"level\": \"error\",\n      \"ts\": 1735689600123,\n      \"message\": \"TypeError: Cannot read properties of undefined (reading 'x')\",\n      \"source\": \"app.js\",\n      \"line\": 42,\n      \"col\": 8,\n      \"stack\": \"TypeError: ...\\n    at foo (app.js:42:8)\\n    at bar (app.js:12:3)\"\n    },\n    {\n      \"level\": \"warn\",\n      \"ts\": 1735689600456,\n      \"message\": \"deprecated API call\"\n    }\n  ]\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "{{litellm}}/v1/sandbox/internal/browser-log/:sandboxId",
+					"host": [
+						"{{litellm}}"
+					],
+					"path": [
+						"v1",
+						"sandbox",
+						"internal",
+						"browser-log",
+						":sandboxId"
+					],
+					"variable": [
+						{
+							"key": "sandboxId",
+							"value": "",
+							"description": "12-char hex id of the target sandbox (NOT session_id). The shim inside the browser reads this from the URL path prefix; operators calling this directly need the id from POST /run's `sandbox_id` field."
+						}
+					]
+				},
+				"description": "**INTERNAL.** Ingest browser-side console.error / console.warn / window.onerror / unhandledrejection events. Called by the sandbox-proxy-injected shim in the user's browser, forwarded to the runner through sandbox-proxy — NOT part of the model-facing tool surface. Operators can hit it directly for debugging.\n\nBody: `{entries: [{level, ts, message, source?, line?, col?, stack?}, ...]}`. Each entry becomes one `[browser] {ISO8601-ts} {level}: {message} (at source:line:col)` line appended to the sandbox's `/tmp/sandbox.log`, so it interleaves with server output in the existing `sandbox.get_logs` MCP tool.\n\nRATE LIMIT: `BROWSER_LOG_RATE_LIMIT_PER_MIN` events per sandbox per rolling 60s (default 100). Overage collapses into ONE synthetic `[browser rate-limited: N events dropped]` line. State is in-process only — a runner restart clears every window.\n\nBODY CAP: `BROWSER_LOG_MAX_BODY_BYTES` bytes total (default 65536). Larger requests are refused.\n\nRESPONSE: always **204 No Content**. Malformed body or unknown sandboxId still returns 204 (hides shape probing at the runner; Caddy's `^[a-f0-9]{12}$` matcher does the front-line validation). Ingest is fire-and-forget via `asyncio.create_task` so the browser gets its 204 before the docker exec completes; a runner restart mid-write loses the batch (acceptable for a debug feature).\n\nSee SANDBOX.md § Browser console capture for the full traffic path, scope filters (Content-Type text/html only, streaming responses skipped), CSP known limitation, and the list of what's NOT captured (React error boundaries, Web Workers, cross-origin iframes, silently-caught fetches)."
+			},
+			"response": []
+		},
+		{
 			"name": "GET /tool/openapi.json",
 			"request": {
 				"method": "GET",

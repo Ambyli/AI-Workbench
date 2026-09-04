@@ -80,7 +80,14 @@ services:
   # The Caddyfile strips X-Frame-Options and rewrites CSP so OpenWebUI can
   # embed the served page in an iframe. See Caddyfile in this dir.
   sandbox-proxy:
-    image: caddy:2-alpine
+    # Custom Caddy build with the caddyserver/replace-response plugin
+    # baked in (see ai/sandbox/proxies/Dockerfile). The plugin is what
+    # lets Caddy inject the browser-shim <script> tag into every HTML
+    # response — see SANDBOX.md § Browser console capture.
+    build:
+      context: ../..
+      dockerfile: ai/sandbox/proxies/Dockerfile
+    image: sandbox-proxy:latest
     container_name: sandbox-proxy
     restart: unless-stopped
     ports:

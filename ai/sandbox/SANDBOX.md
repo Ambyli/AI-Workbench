@@ -119,6 +119,58 @@ The runner is split across:
 
 Import graph is strictly one direction: `app.py` → `operations.py` → `models.py` / `spawner.py` / `runtimes.py` / `state.py` → `constants.py`. `tool_server.py` also imports `operations.py` and `models.py`. `reaper.py` imports `constants.py` and `spawner.py`. Nothing imports back into `app.py`.
 
+### Browser console capture
+
+Sandbox apps run in the user's browser, so `console.error`, `console.warn`, `window.onerror`, and unhandled promise rejections would normally die in the user's DevTools with the agent none the wiser. To close that gap, `sandbox-proxy` injects a small shim into every HTML response it serves, and the shim forwards events to `sandbox-runner`, which drops them into the sandbox container's `/tmp/sandbox.log`. From there they're visible to `get_logs` with a `[browser]` prefix — no new MCP tool, no separate discovery.
+
+**Traffic path:**
+
+```
+browser (runs shim)
+   │  navigator.sendBeacon POST { entries: [...] }
+   ▼
+sandbox-proxy → sandbox-runner → docker exec sandbox-{id} sh -c
+                                    "echo '[browser] ...' >> /tmp/sandbox.log"
+                                       │
+                                       ▼
+                            get_logs (existing) surfaces the events
+```
+
+**Pieces:**
+
+- **[`ai/sandbox/proxies/Dockerfile`](proxies/Dockerfile)** — custom Caddy build with the [`caddyserver/replace-response`](https://github.com/caddyserver/replace-response) plugin baked in (stock Caddy can't rewrite response bodies). Rebuild with `docker compose -f ai/sandbox/docker-compose.sandbox.yml build sandbox-proxy` after any change to the plugin, shim, or Caddyfile.
+- **[`ai/sandbox/proxies/browser_shim.js`](proxies/browser_shim.js)** — ~120-line IIFE that wraps `console.*`, adds `window.onerror` + `unhandledrejection` listeners, buffers events for 100 ms, and posts them via `navigator.sendBeacon`. Baked into the sandbox-proxy image at `/srv/shim/browser_shim.js`; served at `/__sandbox_shim__.js`.
+- **[`ai/sandbox/proxies/Caddyfile`](proxies/Caddyfile)** — the `(inject_shim)` snippet uses `replace-response` to insert `<script src="/__sandbox_shim__.js" defer></script>` before `</head>` on every `text/html` response. Two new `_browser_log` routes forward the shim's POST to the runner's `/internal/browser-log/{sandbox_id}`.
+- **[`ai/sandbox/runner/operations.py`](runner/operations.py) `_do_browser_log_ingest`** — validates the payload, rate-limits per sandbox_id, formats entries as `[browser] {ts} {level}: {message}`, and forwards to `spawner.append_to_log` which appends to the container's `/tmp/sandbox.log` via one `docker exec`. Fire-and-forget; the endpoint returns 204 immediately.
+- **Rate limit** — `BROWSER_LOG_RATE_LIMIT_PER_MIN` (default `100`, in [`constants.py`](runner/constants.py)) per sandbox, rolling 60-second window. Overage is dropped and collapsed into a single `[browser rate-limited: N events dropped in the last minute]` line so the agent can tell things are being lost.
+- **Body cap** — `BROWSER_LOG_MAX_BODY_BYTES` (default 64 KiB) rejects oversized posts with a 413 before JSON parsing.
+
+**What IS captured (always):**
+
+- `console.error`, `console.warn`
+- `window.onerror` events (uncaught exceptions bubbling to the window)
+- `unhandledrejection` events (rejected promises with no catch)
+
+**What IS captured (only with `?_debug=1`):**
+
+- `console.log`, `console.info`, `console.debug`
+
+Set by appending `?_debug=1` to the preview URL. Kept off by default because chatty React apps can burn the rate-limit budget on noise before a real error fires.
+
+**What is NOT captured:**
+
+- **React error boundaries** — they render their own UI without hitting `window.onerror`. Ask the user to open DevTools if a boundary swallowed the error.
+- **Web Worker errors** — the shim's listeners are window-scoped only. Workers fire their own `error` event on the Worker object, not on `window`.
+- **Cross-origin iframe errors** — the sandbox app can embed other origins; those iframes run their own scripts and the browser same-origin policy blocks the shim from seeing them.
+- **Network failures the app catches and swallows** — a `try { await fetch(...) } catch { /* silently */ }` doesn't fire `unhandledrejection`. The user's Network tab still shows the request.
+- **CSP-blocked pages** — apps that ship `Content-Security-Policy: script-src 'self'` refuse the injected inline script, so the shim never runs. sandbox-proxy already rewrites `frame-ancestors` to allow OpenWebUI iframing, but it does NOT touch `script-src` because that would silently weaken the app's own protection. Not typical for a dev preview; if you hit it, drop CSP in the app's own `<meta>` tag while iterating.
+- **HTML fragments served with the wrong `Content-Type`** — the plugin only rewrites `text/html*`. A dev server that returns HTML with `Content-Type: text/plain` gets no shim.
+- **Streaming responses** (`Transfer-Encoding: chunked`) — the plugin runs in stream mode but Next.js SSR streams typically don't have a clean `</head>` boundary that survives chunked delivery. If the injection substring never matches, the shim isn't inserted and no browser events appear. Fix by disabling streaming SSR in the sandbox for the pages you're debugging.
+
+**sendBeacon caveat:** fire-and-forget, non-retrying. A brief network blip during page unload can lose the final batch of events. Acceptable for a debugging feature — anything else would need a WebSocket or long-poll and adds real complexity.
+
+**Encoding:** injection happens on the uncompressed body inside Caddy, so gzip/br responses work correctly — Caddy compresses on the way out to the browser after the shim tag is added.
+
 ## Runtimes
 
 Add a new one by adding a Dockerfile + one entry in [`ai/sandbox/runner/runtimes.py`](runner/runtimes.py).

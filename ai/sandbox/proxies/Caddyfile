@@ -24,6 +24,12 @@
 # The header manipulation below is what lets OpenWebUI iframe the served
 # page. Sites that ship X-Frame-Options: DENY or a restrictive CSP would
 # otherwise refuse to render in the chat panel.
+#
+# This build uses the caddyserver/replace-response plugin (baked in by
+# ai/sandbox/proxies/Dockerfile) to inject a `<script>` tag into every
+# HTML response — the shim it points at forwards browser console.error /
+# console.warn / window.onerror / unhandled promise rejections back to
+# sandbox-runner. See § Browser console capture in SANDBOX.md.
 
 {
 	# Silence the automatic HTTPS attempt — we're plain HTTP behind the
@@ -50,10 +56,42 @@
 	header_down -Last-Modified
 }
 
+# Reused replace-response snippet — injected into the two sandbox
+# proxy handlers below. Only rewrites text/html responses (JSON, CSS,
+# JS assets, images stay untouched). Streaming mode keeps memory usage
+# flat regardless of page size.
+#
+# Search token includes the closing `>` so the replacement re-writes
+# the entire `</head>` tag exactly. If a page has no </head> tag at
+# all (rare — some frameworks serve fragments) the rewrite is a no-op
+# and the shim is not injected. Documented in SANDBOX.md.
+(inject_shim) {
+	replace {
+		stream
+		match {
+			header Content-Type text/html*
+		}
+		"</head>" `<script src="/__sandbox_shim__.js" defer></script></head>`
+	}
+}
+
 :80 {
 	# Health probe target for the compose healthcheck.
 	handle /health {
 		respond "ok" 200
+	}
+
+	# The shim itself — served directly by Caddy from the sandbox-proxy
+	# image (COPY in Dockerfile). Matched EARLY so any sandbox_id that
+	# happens to share the prefix can't shadow it. Cache-Control keeps
+	# the browser from re-fetching on every navigation; the shim is
+	# rebuilt only when the sandbox-proxy image is rebuilt.
+	handle /__sandbox_shim__.js {
+		header Content-Type "application/javascript; charset=utf-8"
+		header Cache-Control "public, max-age=3600"
+		root * /srv/shim
+		try_files /browser_shim.js =404
+		file_server
 	}
 
 	# Source-code download. Matched BEFORE the sandbox-id route so
@@ -67,6 +105,25 @@
 		reverse_proxy sandbox-runner:8000
 	}
 
+	# Browser-log ingest — POST from the shim inside the sandbox app.
+	# Matched BEFORE the general sandbox-id route so `_browser_log`
+	# isn't forwarded into the container. Two forms: bare and
+	# namespaced, mirroring the two forms of the sandbox URL prefix.
+	# Body is JSON: {entries: [{level, ts, message, source?, line?, col?, stack?}, ...]}.
+	# Runner responds 204 regardless of ingest result — we never
+	# return a failure to the browser.
+	@browser_log_ns path_regexp browser_log_ns ^/sandboxes/(?P<id>[a-f0-9]{12})/_browser_log$
+	handle @browser_log_ns {
+		rewrite * /internal/browser-log/{re.browser_log_ns.id}
+		reverse_proxy sandbox-runner:8000
+	}
+
+	@browser_log path_regexp browser_log ^/(?P<id>[a-f0-9]{12})/_browser_log$
+	handle @browser_log {
+		rewrite * /internal/browser-log/{re.browser_log.id}
+		reverse_proxy sandbox-runner:8000
+	}
+
 	# Namespaced path — this is the one external browsers use via
 	# oauth2-proxy. Match FIRST so the bare /{id}/ pattern doesn't
 	# accidentally interpret "sandboxes" as an id (it wouldn't — hex
@@ -77,6 +134,7 @@
 		reverse_proxy sandbox-{re.sandbox_ns.id}:80 {
 			import sandbox_headers
 		}
+		import inject_shim
 	}
 
 	# Bare path — kept so `curl http://localhost:8011/{id}/` still
@@ -87,6 +145,7 @@
 		reverse_proxy sandbox-{re.sandbox.id}:80 {
 			import sandbox_headers
 		}
+		import inject_shim
 	}
 
 	# Anything else — no sandbox matched. Do NOT act as an open proxy.

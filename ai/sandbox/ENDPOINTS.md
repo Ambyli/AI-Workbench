@@ -29,6 +29,7 @@ Everything below is served by [`ai/sandbox/runner/app.py`](app.py). Jobs endpoin
 | `GET` | `/tool/openapi.json` | OpenAPI schema for OpenWebUI's Tool Server discovery |
 | `POST` | `/tool/run` | Spawn a sandbox and return an inline-rendered iframe (Content-Disposition: inline). Primary Tool Server endpoint |
 | `GET` | `/tool/get_runtime_types` | Describe runtime types (Tool Server variant of `sandbox.get_runtime_types`) |
+| `POST` | `/internal/browser-log/{sandbox_id}` | **INTERNAL.** Ingest browser-side console.error / console.warn / window.onerror / unhandledrejection events forwarded by the sandbox-proxy shim. Always 204. See [SANDBOX.md § Browser console capture](SANDBOX.md#browser-console-capture) |
 
 There is no `PATCH`/`PUT`/`OPTIONS` surface on this service.
 
@@ -695,6 +696,53 @@ curl -X DELETE http://localhost:8012/jobs/a1b2c3d4e5f6
 |---|---|
 | `404` | No sandbox with that id. |
 | `500` | Runner not initialized (should not normally occur). |
+
+---
+
+## `POST /internal/browser-log/{sandbox_id}`
+
+**INTERNAL — not called by end users or by any MCP tool.** Called only by the shim [`ai/sandbox/proxies/browser_shim.js`](proxies/browser_shim.js) via `sandbox-proxy`. See [SANDBOX.md § Browser console capture](SANDBOX.md#browser-console-capture) for the end-to-end story.
+
+**Path parameter:** `sandbox_id` must match `^[a-f0-9]{12}$` — same shape sandbox-proxy's routing enforces. A mismatch returns 204 silently so an attacker probing at the runner can't distinguish "wrong id shape" from "no such sandbox."
+
+**Body:**
+
+```json
+{
+  "entries": [
+    {
+      "level": "error",
+      "ts": 1735689600123,
+      "message": "TypeError: Cannot read property 'foo' of undefined",
+      "source": "app.js",
+      "line": 42,
+      "col": 8,
+      "stack": "TypeError: Cannot read property 'foo' of undefined\n    at bar (app.js:42:8)\n    at ..."
+    }
+  ]
+}
+```
+
+Fields:
+
+| Field | Required | Notes |
+|---|---|---|
+| `level` | yes | One of `error`, `warn`, `log`, `info`, `debug`. Anything else is dropped. |
+| `ts` | yes | Epoch milliseconds. Non-numeric values are replaced with the runner's own clock. |
+| `message` | yes | Free-form string. Multi-line messages are folded onto one line; use `stack` for the full trace. |
+| `source` | no | Script URL or filename (from `window.onerror`). |
+| `line`, `col` | no | Location within `source`. Rendered as `(at source:line:col)` on the log line. |
+| `stack` | no | Multi-line stack trace. Rendered indented under the log line. |
+
+**Response:** always `204 No Content`. The browser is not going to retry regardless of outcome; surfacing failures would only add network-tab noise for end users.
+
+**Body cap:** requests larger than `BROWSER_LOG_MAX_BODY_BYTES` (default 64 KiB) return `413 Payload Too Large` before JSON parsing.
+
+**Rate limit:** `BROWSER_LOG_RATE_LIMIT_PER_MIN` (default 100) per sandbox_id per rolling 60-second window. Overage is dropped and collapsed into ONE synthetic `[browser rate-limited: N events dropped]` line so the agent can see events are being lost.
+
+**Ingest behavior:** validated entries are formatted as `[browser] {ISO8601-ts} {level}: {message}` and appended to the sandbox container's `/tmp/sandbox.log` via one `docker exec` per POST. From there they surface through the existing `get_logs` tool — no separate MCP tool. Ingest is fire-and-forget: the endpoint returns 204 before the exec completes, so the browser sees a fast response even when the docker socket is momentarily busy.
+
+**Postman.** Included under `POST /internal/browser-log/{sandboxId}` for operators debugging the ingest path directly — the shim inside a sandbox app is the normal caller.
 
 ---
 

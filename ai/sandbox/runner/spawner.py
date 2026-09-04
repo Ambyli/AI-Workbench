@@ -799,6 +799,47 @@ class Spawner:
             return
         log.debug("write_reload_marker: %s marker written", container_name)
 
+    def append_to_log(self, container_name: str, payload: str) -> None:
+        """Append raw text to ``/tmp/sandbox.log`` inside the container.
+
+        Used by the browser-log ingest path — the runner receives a batch
+        of already-formatted `[browser] …` lines from the shim and drops
+        them into the same log that ``get_logs`` reads, so browser events
+        appear interleaved with container output.
+
+        The payload is base64-encoded on the way in so we don't have to
+        reason about shell-escaping of newlines, quotes, backslashes, or
+        control characters that might legitimately appear in a captured
+        stack trace. ``base64 -d`` is available in every base image the
+        subsystem ships (alpine coreutils / debian slim).
+
+        Best-effort: ``NotFound`` / ``APIError`` are swallowed. Losing a
+        batch is preferable to bubbling an error back to a browser that
+        was never going to retry.
+        """
+        if not payload:
+            return
+        try:
+            container = self._client.containers.get(container_name)
+        except NotFound:
+            log.debug("append_to_log: %s NotFound", container_name)
+            return
+        encoded = base64.b64encode(payload.encode("utf-8")).decode("ascii")
+        try:
+            container.exec_run(
+                [
+                    "/bin/sh",
+                    "-c",
+                    f"echo {encoded} | base64 -d >> /tmp/sandbox.log",
+                ],
+            )
+        except APIError as exc:
+            log.warning(
+                "append_to_log: %s exec failed: %s", container_name, exc
+            )
+            return
+        log.debug("append_to_log: %s wrote %d bytes", container_name, len(payload))
+
     def tail_logs_since_last_marker(
         self, container_name: str, n_lines: int = 100
     ) -> str:

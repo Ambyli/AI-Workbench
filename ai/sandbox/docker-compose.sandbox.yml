@@ -87,7 +87,6 @@ services:
     build:
       context: ../..
       dockerfile: ai/sandbox/proxies/Dockerfile
-    image: sandbox-proxy:latest
     container_name: sandbox-proxy
     restart: unless-stopped
     ports:

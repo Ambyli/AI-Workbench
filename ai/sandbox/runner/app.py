@@ -183,19 +183,20 @@ async def _mcp_run(
     deletes: list[str],
     env: Optional[dict[str, str]] = None,
     recreate_if_gone: bool = True,
+    chat_id: Optional[str] = None,
 ) -> dict:
     """MCP-facing bridge to ``_reuse_or_spawn``. All fields already
     validated by the tool wrapper, so this is a thin passthrough."""
     log.debug(
-        "MCP run: runtime=%s session=%s n_files=%d n_deletes=%d "
+        "MCP run: runtime=%s session=%s chat=%s n_files=%d n_deletes=%d "
         "entrypoint=%r ttl=%s recreate_if_gone=%s env_keys=%s",
-        runtime, session_id, len(files or {}), len(deletes or []),
+        runtime, session_id, chat_id, len(files or {}), len(deletes or []),
         entrypoint, ttl_seconds, recreate_if_gone,
         sorted((env or {}).keys()),
     )
     return await _reuse_or_spawn(
         runtime, files, entrypoint, ttl_seconds, session_id, deletes,
-        env=env, recreate_if_gone=recreate_if_gone,
+        env=env, recreate_if_gone=recreate_if_gone, chat_id=chat_id,
     )
 
 
@@ -204,12 +205,13 @@ async def _mcp_create(
     ttl_seconds: Optional[int],
     entrypoint: Optional[str],
     env: Optional[dict[str, str]],
+    chat_id: Optional[str] = None,
 ) -> dict:
     log.debug(
-        "MCP create: runtime=%s ttl=%s entrypoint=%r env_keys=%s",
-        runtime, ttl_seconds, entrypoint, sorted((env or {}).keys()),
+        "MCP create: runtime=%s ttl=%s entrypoint=%r chat=%s env_keys=%s",
+        runtime, ttl_seconds, entrypoint, chat_id, sorted((env or {}).keys()),
     )
-    return await _do_create(runtime, ttl_seconds, entrypoint, env)
+    return await _do_create(runtime, ttl_seconds, entrypoint, env, chat_id=chat_id)
 
 
 async def _mcp_write_files(
@@ -385,7 +387,18 @@ async def _ensure_session_index(registry: PostgresRegistry) -> None:
             "ON jobs ((metadata->>'session_id')) "
             "WHERE phase = 'running'"
         )
-    log.info("session lookup index ensured (jobs_session_id_running)")
+        # Backs the one-create-per-chat guard (_find_active_session_by_chat).
+        # Indexes the spawning/starting/running window — the phases that count
+        # as "this chat already has a create" — not every historical job row.
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS jobs_chat_id_active "
+            "ON jobs ((metadata->>'chat_id')) "
+            "WHERE phase IN ('spawning', 'starting', 'running')"
+        )
+    log.info(
+        "session lookup indexes ensured "
+        "(jobs_session_id_running, jobs_chat_id_active)"
+    )
 
 
 @app.post("/run", response_model=RunResponse)
@@ -404,6 +417,7 @@ async def run(req: RunRequest) -> RunResponse:
         req.deletes,
         env=req.env,
         recreate_if_gone=req.recreate_if_gone,
+        chat_id=req.chat_id,
     )
     return RunResponse(**result)
 
@@ -411,7 +425,9 @@ async def run(req: RunRequest) -> RunResponse:
 @app.post("/create", response_model=RunResponse)
 async def create(req: CreateRequest) -> RunResponse:
     """Warm an empty container. Mirrors the ``create`` MCP tool."""
-    result = await _do_create(req.runtime, req.ttl_seconds, req.entrypoint, req.env)
+    result = await _do_create(
+        req.runtime, req.ttl_seconds, req.entrypoint, req.env, chat_id=req.chat_id,
+    )
     return RunResponse(**result)
 
 

@@ -25,6 +25,7 @@ from .launcher import (
     kill_chrome_by_profile,
     start_browser,
 )
+from .screenshot import Screenshot, ScreenshotError, capture_screenshot
 from .sentinel import (
     clear_session,
     mark_session_ok,
@@ -249,6 +250,42 @@ class InterceptorClient:
                 error=self._error,
                 last_capture_at=self._last_capture_at,
             )
+
+    def screenshot(
+        self,
+        *,
+        format: str = "jpeg",
+        quality: int = 80,
+        full_page: bool = False,
+        scale: float = 1.0,
+        max_height: int = 8000,
+        settle_timeout: float = 5.0,
+        timeout: float = 30.0,
+    ) -> Screenshot:
+        """Screenshot the page tab of the Chrome this client launched.
+
+        Safe to call from any thread while the browser is running — it opens a
+        second, short-lived CDP connection rather than borrowing the worker's
+        (see ``screenshot.py``). Typical use: after the capture window has
+        elapsed and before ``quit()``, so the page has had time to render.
+
+        Raises ``ScreenshotError`` if Chrome isn't running, the tab can't be
+        found, or the capture fails. Parameters are documented on
+        ``common.cdp_interceptor.screenshot.capture_screenshot``.
+        """
+        if self._proc is None:
+            raise ScreenshotError("browser is not running — call launch() first")
+        return capture_screenshot(
+            self._debug_port,
+            format=format,
+            quality=quality,
+            full_page=full_page,
+            scale=scale,
+            max_height=max_height,
+            tab_url_hint=self._target_url or "",
+            settle_timeout=settle_timeout,
+            timeout=timeout,
+        )
 
     # ── Internal ──────────────────────────────────────────────────────────────
 

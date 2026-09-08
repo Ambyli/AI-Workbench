@@ -1,6 +1,6 @@
 # interceptor
 
-Generic HTTP + MCP front-end for `common.cdp_interceptor`. Give it a URL and a list of URL regex patterns; it opens the URL in a headless Chrome under a named `--user-data-dir`, waits for a bounded window, and returns the JSON XHR/fetch bodies whose URLs matched any pattern.
+Generic HTTP + MCP front-end for `common.cdp_interceptor`. Give it a URL and a list of URL regex patterns; it opens the URL in a headless Chrome under a named `--user-data-dir`, waits for a bounded window, and returns the JSON XHR/fetch bodies whose URLs matched any pattern. It can also return a **screenshot** of the rendered page — either alongside the captures (`screenshot` block on `POST /capture`) or on its own (`POST /screenshot` / the `screenshot_url` MCP tool), so an agent can *look at* a page it navigated to. See [Screenshots](#screenshots).
 
 - **Container**: `interceptor` (internal only, port 8080 on `ai_shared`)
 - **Compose file**: `ai/interceptor/docker-compose.interceptor.yml`
@@ -43,11 +43,12 @@ docker exec interceptor curl -s http://localhost:8080/health
 | `GET` | `/profiles/{name}` | One profile's status (size, sentinel) |
 | `POST` | `/profiles/{name}/refresh` | Upload a `.tgz` of a captured Chrome profile |
 | `DELETE` | `/profiles/{name}` | Wipe one profile |
-| `POST` | `/capture` | Run one capture (see request/response below) |
+| `POST` | `/capture` | Run one capture (see request/response below); optional `screenshot` block returns an image too |
+| `POST` | `/screenshot` | Navigate and return a screenshot only — no XHR patterns (see [Screenshots](#screenshots)) |
 | `GET` | `/jobs` | Snapshot of the port pool + currently-running captures |
 | `GET` | `/jobs/{job_id}` | Detail on one in-flight capture (404 if not found) |
 | `POST` | `/jobs/{job_id}/cancel` | Abort an in-flight capture, reclaim its slot |
-| — | `/mcp` | FastMCP HTTP transport (`capture_url` tool) |
+| — | `/mcp` | FastMCP HTTP transport (`capture_url`, `screenshot_url`, `list_profiles`, `list_jobs`, `get_job` tools) |
 
 ### `POST /capture`
 
@@ -63,9 +64,12 @@ Request:
   "login_timeout": 300,
   "max_matches_per_pattern": null,
   "debug_logging": false,
-  "login_url_patterns": ["login", "signin", "/auth"]
+  "login_url_patterns": ["login", "signin", "/auth"],
+  "screenshot": null
 }
 ```
+
+`screenshot` is opt-in. Set it to an options object — `{"format": "jpeg", "quality": 80, "full_page": false, "scale": 1.0, "max_height": 8000}` (all keys optional) — and the response gains a `screenshot` field holding the image taken just before Chrome quits. With `screenshot` set, `url_patterns` may be empty (screenshot-only navigation); without it, an empty `url_patterns` is a 422. Details in [Screenshots](#screenshots).
 
 `login_url_patterns` are regexes `re.search`-matched against the tab's `location.href` **after** navigation has settled, to detect a redirect to a login wall. Two things to know:
 
@@ -93,13 +97,94 @@ Response:
     "example\\.com/api/v1/items": [ { "url": "https://…", "body": { … } } ],
     "example\\.com/api/v1/user":  [ { "url": "https://…", "body": { … } } ]
   },
-  "captured_urls": [ "https://…", "…" ]
+  "captured_urls": [ "https://…", "…" ],
+  "screenshot": null,
+  "screenshot_error": null
 }
 ```
+
+`screenshot` is `null` unless requested; `screenshot_error` is set (and `screenshot` stays `null`) when one was requested but could not be taken — the XHR captures are still returned, an image failure never fails the capture.
 
 `job_id` is a 12-char hex identifier for the capture. During the request's lifetime it shows up in `GET /jobs` (see [Observability](#observability)) and is prefixed onto every log line emitted by that capture — useful for correlating interleaved logs when concurrent captures are running.
 
 Patterns are `re.search`-matched against every JSON XHR/fetch URL the page emits. A capture whose URL matches multiple patterns lands in the bucket of the **first** matching pattern.
+
+## Screenshots
+
+Two ways to get an image of the page:
+
+- **`POST /screenshot`** (MCP: `screenshot_url`) — navigate under a profile, wait `wait_seconds`, return the image. No `url_patterns`. Use it when the point is to *see* the page: layout, a chart, an error banner, whatever isn't in an XHR body.
+- **`screenshot` block on `POST /capture`** (MCP: `capture_url` with `screenshot=true`) — same image, taken at the end of the capture window, returned next to the XHR matches.
+
+### `POST /screenshot`
+
+Request:
+
+```json
+{
+  "url": "https://example.com/dashboard",
+  "profile": "example",
+  "wait_seconds": 15,
+  "format": "jpeg",
+  "quality": 80,
+  "full_page": false,
+  "scale": 1.0,
+  "max_height": 8000,
+  "login_timeout": 300,
+  "login_url_patterns": ["login", "signin", "/auth"]
+}
+```
+
+| Field | Default | Notes |
+|---|---|---|
+| `wait_seconds` | `INTERCEPTOR_SCREENSHOT_WAIT_SECONDS` (15) | How long the page gets to render. Chrome spends the first ~4–5 s booting and navigating, so values under ~8 mostly return blank or half-painted pages. Hard wall, same as `capture_window_seconds`. |
+| `format` | `jpeg` | `jpeg` (~100–300 KB for a viewport), `png` (lossless, often 1–3 MB), `webp`. |
+| `quality` | `80` | jpeg/webp only; ignored for png. |
+| `full_page` | `false` | Whole scrollable document instead of the 1920×1080 headless viewport. |
+| `scale` | `1.0` | Output scale, `0 < scale ≤ 2`. `0.5` halves each axis and roughly quarters the payload — the right default when the image is going into a model context. |
+| `max_height` | `8000` | `full_page` height clamp in CSS px. Chrome refuses clips beyond 16384. |
+
+Response:
+
+```json
+{
+  "job_id": "a3f2b1c9d4e5",
+  "url": "https://example.com/dashboard",
+  "status": "loading",
+  "login_wall": false,
+  "error": null,
+  "screenshot": {
+    "format": "jpeg",
+    "mime_type": "image/jpeg",
+    "width": 1904,
+    "height": 929,
+    "full_page": false,
+    "bytes": 21655,
+    "page_url": "https://example.com/dashboard",
+    "data_base64": "/9j/4AAQ…"
+  },
+  "screenshot_error": null
+}
+```
+
+Things to know:
+
+- **`status: "loading"` is normal here.** `status` is the interceptor's *capture* status; a page that fires no JSON XHRs (static pages, `example.com`) never reaches `"ok"`. Look at `screenshot` / `screenshot_error`, not `status`, to judge the screenshot.
+- **`page_url` is where the tab actually ended up.** A redirect to a login page shows here even when `login_url_patterns` didn't recognise it — and the image is of that login page, which is useful evidence in itself.
+- **`width`/`height` are the requested clip × `scale`**, not decoded from the image; Chrome's rounding can differ by a pixel. The headless viewport is `--window-size=1920,1080` minus browser chrome, so expect ~1904×929 at `scale: 1.0`.
+- **Same slot accounting as `/capture`.** A screenshot job takes one port-pool slot for `wait_seconds`, shows up in `GET /jobs` (phase `capturing` → `screenshot` → `cleaning_up`), and can be cancelled the same way. Pool exhausted → 429.
+
+### How it works
+
+`run_session` owns the CDP WebSocket to the tab and runs it on a private worker thread, so nothing else can issue commands on it. Chrome allows many debugger clients per target and `Page.captureScreenshot` needs no `Page.enable`, so the screenshot opens its **own** short-lived WebSocket to the same tab (`shared/common/src/common/cdp_interceptor/screenshot.py`), waits up to 5 s for `document.readyState == "complete"`, reads `Page.getLayoutMetrics`, captures, and closes. The interceptor session never notices. `InterceptorClient.screenshot()` is the thread-safe entry point; `app.py` calls it after `capture_window_seconds` elapses and before `client.quit()`.
+
+The helper connects by `127.0.0.1` rather than `localhost` (on Windows `localhost` resolves to `::1` first and Chrome only listens on IPv4 — a measured 2 s penalty per connection) while pinning `Origin: http://localhost:<port>` so `--remote-allow-origins` still accepts the handshake.
+
+### On MCP
+
+`capture_url` and `screenshot_url` return the image as an MCP **`ImageContent` block** next to the JSON text block, so a multimodal model can actually look at it. The JSON carries only the metadata (`format`, `mime_type`, `width`, `height`, `full_page`, `bytes`, `page_url`) — the base64 is *not* duplicated into the text. HTTP callers get `data_base64` inline instead.
+
+Payload budgeting for a model context: a 1920×1080 viewport JPEG at quality 80 is ~100–300 KB; `scale: 0.5` brings it to ~30–80 KB with the layout still readable. Prefer `full_page: false` unless the content below the fold is the point.
 
 ## Concurrency
 
@@ -298,6 +383,7 @@ Because the fast path writes cookies back to the base profile, the refreshed ses
 | `INTERCEPTOR_DEBUG_PORT` | `9224` | Base of the CDP debug port pool. Pool spans `[base, base + INTERCEPTOR_MAX_CONCURRENT)`. |
 | `INTERCEPTOR_MAX_CONCURRENT` | `8` | Max simultaneous `/capture` calls. Each slot = one Chrome (~200–400 MB RAM) + on same-profile collision one profile clone (~20–80 MB disk). See [Resource sizing](#resource-sizing). |
 | `INTERCEPTOR_CAPTURE_WINDOW_SECONDS` | `20` | Default capture window when a request omits `capture_window_seconds`. |
+| `INTERCEPTOR_SCREENSHOT_WAIT_SECONDS` | `15` | Default render wait for `POST /screenshot` / `screenshot_url` when a request omits `wait_seconds`. See [Screenshots](#screenshots). |
 
 ## Calling from LiteLLM
 
@@ -312,11 +398,12 @@ curl -X POST http://localhost:4001/v1/interceptor/capture `
 
 ### MCP tools
 
-The `interceptor` MCP server (registered in `ai/litellm/litellm_config.yaml` `mcp_servers.interceptor`) exposes four model-invokable tools:
+The `interceptor` MCP server (registered in `ai/litellm/litellm_config.yaml` `mcp_servers.interceptor`) exposes five model-invokable tools:
 
 | Tool | Purpose | Args |
 |---|---|---|
-| `capture_url` | Run one capture — same core behavior as `POST /capture` | `url`, `url_patterns`, `profile`, `capture_window_seconds`, `login_timeout`, `max_matches_per_pattern` |
+| `capture_url` | Run one capture — same core behavior as `POST /capture`; `screenshot=true` adds an image of the page | `url`, `url_patterns`, `profile`, `capture_window_seconds`, `login_timeout`, `max_matches_per_pattern`, `screenshot`, `screenshot_full_page`, `screenshot_format`, `screenshot_scale` |
+| `screenshot_url` | Navigate and return a screenshot — same core behavior as `POST /screenshot`. Image arrives as an `ImageContent` block (see [Screenshots § On MCP](#on-mcp)) | `url`, `profile`, `wait_seconds`, `full_page`, `format`, `quality`, `scale`, `login_timeout` |
 | `list_profiles` | Discover which named profiles exist — call before `capture_url` if the LLM doesn't know the profile name | *(none)* |
 | `list_jobs` | Snapshot of the port pool + running captures — same shape as `GET /jobs` | *(none)* |
 | `get_job` | Detail on one in-flight capture by id — same shape as `GET /jobs/{job_id}` | `job_id` |
@@ -461,3 +548,4 @@ uv run cdp-spy --url https://roofix.io/project/abc123 --profile-dir C:\data\prof
 - No public auth on the HTTP surface — the service is only reachable via `ai_shared`.
 - No completed-job history — `GET /jobs/{id}` returns 404 as soon as a capture finishes.
 - No MCP-side cancellation — cancel is HTTP-only. An LLM cannot reclaim a stuck capture it started; that's an operator's job.
+- Screenshots are one-shot, taken at the end of the window — there is no "click this, then screenshot" interaction, and no element-level clipping. Viewport is fixed at the headless `1920×1080` window; full-page height is clamped to `max_height` (≤ 16384).

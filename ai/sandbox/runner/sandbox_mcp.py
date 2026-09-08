@@ -477,6 +477,18 @@ def build_mcp(
                 "etc.) are rejected."
             ),
         ),
+        chat_id: Optional[str] = Field(
+            default=None,
+            description=(
+                "Id of the chat you're answering in. Pass it and the "
+                "runner enforces ONE sandbox per chat: if this chat "
+                "already created one, create returns THAT session instead "
+                "of spawning a duplicate (no extra slot used). Use the "
+                "OpenWebUI chat id, or any stable per-conversation string. "
+                "Strongly recommended — it stops a chat from leaking "
+                "containers across turns when the session_id is lost."
+            ),
+        ),
     ) -> ToolResult:
         """Reserve an empty warming container and return the session
         handle. Use this FIRST when you know you'll need a preview but
@@ -488,24 +500,40 @@ def build_mcp(
         (or Streamlit's own "warming" script for python) until you call
         ``write_files`` with your real code.
 
+        Pass ``chat_id`` to guarantee one sandbox per conversation: a
+        second create for the same chat returns the existing session
+        (``duplicate_create_prevented``) rather than spawning again.
+
         Flow: get_runtime_types → create → write_files (repeat) → preview → close.
 
-        Consumes one slot from SANDBOX_MAX_CONCURRENT.
+        Consumes one slot from SANDBOX_MAX_CONCURRENT (except when a
+        duplicate create is short-circuited — that costs nothing).
         """
-        log.info("MCP tool call: create runtime=%s", runtime)
+        log.info("MCP tool call: create runtime=%s chat=%s", runtime, chat_id)
         try:
-            result = await create_callable(runtime, ttl_seconds, entrypoint, env)
+            result = await create_callable(
+                runtime, ttl_seconds, entrypoint, env, chat_id,
+            )
         except HTTPException as exc:
             return _handle_http_exception(exc, tool="create")
         sid = result["session_id"]
-        text = (
-            f"Sandbox created. Session id: {sid}. "
-            f"Runtime: {result['runtime']}. "
-            f"URL: {result['url']} (expires {result['expires_at']}).\n"
-            "Status: warming — dev server is booting with placeholder files.\n"
-            "Next: call write_files(session_id=\"" + sid + "\", files={...}) "
-            "with your actual code."
-        )
+        if result.get("duplicate_create_prevented"):
+            text = (
+                f"This chat already has a sandbox — reusing it instead of "
+                f"creating a second one. Session id: {sid}. "
+                f"Runtime: {result['runtime']}. URL: {result['url']}.\n"
+                "Call write_files(session_id=\"" + sid + "\", files={...}) to "
+                "update it, or preview(session_id=\"" + sid + "\") to show it."
+            )
+        else:
+            text = (
+                f"Sandbox created. Session id: {sid}. "
+                f"Runtime: {result['runtime']}. "
+                f"URL: {result['url']} (expires {result['expires_at']}).\n"
+                "Status: warming — dev server is booting with placeholder files.\n"
+                "Next: call write_files(session_id=\"" + sid + "\", files={...}) "
+                "with your actual code."
+            )
         return _tool_result(text, {"ok": True, **result})
 
     # ── patch_files ──
@@ -1093,6 +1121,7 @@ def build_mcp(
         session_id: Optional[str],
         deletes: list[str],
         env: Optional[dict[str, str]],
+        chat_id: Optional[str] = None,
     ) -> ToolResult:
         try:
             result = await run_callable(
@@ -1104,6 +1133,7 @@ def build_mcp(
                 deletes=deletes,
                 env=env,
                 recreate_if_gone=True,
+                chat_id=chat_id,
             )
         except HTTPException as exc:
             return _handle_http_exception(exc, tool="run")
@@ -1213,6 +1243,16 @@ def build_mcp(
                 "Reserved keys (HTTP_PROXY, PYTHONUNBUFFERED, etc.) rejected."
             ),
         ),
+        chat_id: Optional[str] = Field(
+            default=None,
+            description=(
+                "Id of the chat you're answering in. With no session_id, "
+                "the runner reuses this chat's existing container instead "
+                "of spawning a new one — so repeated run calls in one chat "
+                "update the same preview even if you lost the session_id. "
+                "Pass it on every run for the chat."
+            ),
+        ),
     ) -> ToolResult:
         """Convenience one-shot: create + write_files + preview.
 
@@ -1236,11 +1276,12 @@ def build_mcp(
         the container hot-reloads, self-heal is implicit here.
         """
         log.info(
-            "MCP tool call: run runtime=%s session=%s n_files=%d",
-            runtime, session_id, len(files or {}),
+            "MCP tool call: run runtime=%s session=%s chat=%s n_files=%d",
+            runtime, session_id, chat_id, len(files or {}),
         )
         return await _run_impl(
             runtime, files, entrypoint, ttl_seconds, session_id, deletes, env,
+            chat_id,
         )
 
     return mcp

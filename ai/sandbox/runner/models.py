@@ -13,6 +13,7 @@ from typing import Optional, Union
 from pydantic import BaseModel, Field, field_validator
 
 from constants import (
+    CHAT_ID_RE,
     MAX_FILE_BYTES,
     MAX_PAYLOAD_BYTES,
     RESERVED_ENV_KEYS,
@@ -185,6 +186,16 @@ class RunRequest(BaseModel):
             "caller to reason about self-heal explicitly."
         ),
     )
+    chat_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Id of the chat/conversation this call belongs to. When set "
+            "and no session_id is given, the runner reuses the chat's "
+            "existing live sandbox instead of spawning a second one — so "
+            "one conversation maps to one container. Pass it on every call "
+            "for a chat and you never have to thread session_id yourself."
+        ),
+    )
 
     @field_validator("session_id")
     @classmethod
@@ -192,6 +203,15 @@ class RunRequest(BaseModel):
         if v is not None and not SESSION_ID_RE.match(v):
             raise ValueError(
                 "session_id must match ^[A-Za-z0-9_-]{1,64}$"
+            )
+        return v
+
+    @field_validator("chat_id")
+    @classmethod
+    def _validate_chat_id(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and not CHAT_ID_RE.match(v):
+            raise ValueError(
+                "chat_id must match ^[A-Za-z0-9_.:-]{1,128}$"
             )
         return v
 
@@ -262,11 +282,28 @@ class CreateRequest(BaseModel):
     entrypoint: Optional[str] = None
     ttl_seconds: Optional[int] = None
     env: Optional[dict[str, str]] = None
+    chat_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Id of the chat this create belongs to. When a live sandbox "
+            "already exists for this chat_id, the runner returns THAT "
+            "session instead of spawning a second container "
+            "(duplicate_create_prevented=true in the response). One chat, "
+            "one container."
+        ),
+    )
 
     @field_validator("env")
     @classmethod
     def _validate_env_field(cls, v: Optional[dict]) -> Optional[dict[str, str]]:
         return _validate_env(v)
+
+    @field_validator("chat_id")
+    @classmethod
+    def _validate_chat_id(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and not CHAT_ID_RE.match(v):
+            raise ValueError("chat_id must match ^[A-Za-z0-9_.:-]{1,128}$")
+        return v
 
 
 class ExecRequest(BaseModel):
@@ -400,6 +437,13 @@ class ToolRunRequest(BaseModel):
     session_id: Optional[str] = Field(default=None)
     deletes: list[str] = Field(default_factory=list)
     env: Optional[dict[str, str]] = Field(default=None)
+    chat_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Chat id. With no session_id, reuse the chat's existing "
+            "sandbox instead of spawning a second one."
+        ),
+    )
 
     @field_validator("files")
     @classmethod
@@ -410,3 +454,10 @@ class ToolRunRequest(BaseModel):
     @classmethod
     def _validate_env_field(cls, v: Optional[dict]) -> Optional[dict[str, str]]:
         return _validate_env(v)
+
+    @field_validator("chat_id")
+    @classmethod
+    def _validate_chat_id(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and not CHAT_ID_RE.match(v):
+            raise ValueError("chat_id must match ^[A-Za-z0-9_.:-]{1,128}$")
+        return v

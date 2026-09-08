@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "interceptor",
-    "description": "interceptor endpoints, called through the LiteLLM pass-through registered in ai/litellm/litellm_config.yaml (`pass_through_endpoints` → `/v1/interceptor` → `http://interceptor:8080`, `include_subpath: true`, methods GET/POST/DELETE, `forward_headers: true` — so `multipart/form-data` uploads for /profiles/{name}/refresh forward correctly). Every request is authenticated with a Bearer token from a LiteLLM virtual key. Set the collection variables `litellm` (e.g. http://localhost:4001) and `virtual master key` (an sk-… key issued from the LiteLLM Admin UI → Virtual Keys) — every request inherits them via collection-level auth. See ai/interceptor/INTERCEPTOR.md for the full endpoint reference and ai/litellm/LITELLM.md for issuing virtual keys.\n\nReaching the service: the container has NO `ports:` mapping (INTERCEPTOR.md § Reaching the service). Port 8080 is reachable only from inside `ai_shared`. Options: (1) another `ai_shared` container via `http://interceptor:8080/...`, (2) your host via the LiteLLM pass-through `{{litellm}}/v1/interceptor/...` (what this collection uses), (3) `docker exec interceptor curl ...`. `http://localhost:8080` from the host does NOT reach the container — if something answers there it's a separate bare-metal `python app.py` run against the host's `/data/profiles` (used during profile capture with a visible display).\n\nMCP: LiteLLM ALSO advertises the interceptor as an MCP server via `mcp_servers.interceptor` (url `http://interceptor:8080/mcp`) — models see the four tools (capture_url, list_profiles, list_jobs, get_job) through that path. The MCP requests below are useful for debugging the transport directly.",
+    "description": "interceptor endpoints, called through the LiteLLM pass-through registered in ai/litellm/litellm_config.yaml (`pass_through_endpoints` → `/v1/interceptor` → `http://interceptor:8080`, `include_subpath: true`, methods GET/POST/DELETE, `forward_headers: true` — so `multipart/form-data` uploads for /profiles/{name}/refresh forward correctly). Every request is authenticated with a Bearer token from a LiteLLM virtual key. Set the collection variables `litellm` (e.g. http://localhost:4001) and `virtual master key` (an sk-… key issued from the LiteLLM Admin UI → Virtual Keys) — every request inherits them via collection-level auth. See ai/interceptor/INTERCEPTOR.md for the full endpoint reference and ai/litellm/LITELLM.md for issuing virtual keys.\n\nReaching the service: the container has NO `ports:` mapping (INTERCEPTOR.md § Reaching the service). Port 8080 is reachable only from inside `ai_shared`. Options: (1) another `ai_shared` container via `http://interceptor:8080/...`, (2) your host via the LiteLLM pass-through `{{litellm}}/v1/interceptor/...` (what this collection uses), (3) `docker exec interceptor curl ...`. `http://localhost:8080` from the host does NOT reach the container — if something answers there it's a separate bare-metal `python app.py` run against the host's `/data/profiles` (used during profile capture with a visible display).\n\nMCP: LiteLLM ALSO advertises the interceptor as an MCP server via `mcp_servers.interceptor` (url `http://interceptor:8080/mcp`) — models see the five tools (capture_url, screenshot_url, list_profiles, list_jobs, get_job) through that path. The MCP requests below are useful for debugging the transport directly.\n\nScreenshots: POST /screenshot (and the `screenshot` block on POST /capture) return an image of the rendered page as base64 inside the JSON; the MCP tools deliver it as an ImageContent block instead. See INTERCEPTOR.md § Screenshots.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
     "_postman_id": "interceptor-collection"
   },
@@ -147,7 +147,7 @@
         ],
         "body": {
           "mode": "raw",
-          "raw": "{\n  \"url\": \"https://example.com/dashboard\",\n  \"url_patterns\": [\"example\\\\.com/api/v1/items\", \"example\\\\.com/api/v1/user\"],\n  \"profile\": \"{{profileName}}\",\n  \"capture_window_seconds\": 20,\n  \"keep_open\": false,\n  \"login_timeout\": 300,\n  \"max_matches_per_pattern\": null,\n  \"debug_logging\": false,\n  \"login_url_patterns\": [\"login\", \"signin\", \"/auth\"]\n}",
+          "raw": "{\n  \"url\": \"https://example.com/dashboard\",\n  \"url_patterns\": [\"example\\\\.com/api/v1/items\", \"example\\\\.com/api/v1/user\"],\n  \"profile\": \"{{profileName}}\",\n  \"capture_window_seconds\": 20,\n  \"keep_open\": false,\n  \"login_timeout\": 300,\n  \"max_matches_per_pattern\": null,\n  \"debug_logging\": false,\n  \"login_url_patterns\": [\"login\", \"signin\", \"/auth\"],\n  \"screenshot\": null\n}",
           "options": { "raw": { "language": "json" } }
         },
         "url": {
@@ -155,7 +155,28 @@
           "host": ["{{litellm}}"],
           "path": ["v1", "interceptor", "capture"]
         },
-        "description": "Run one capture. Launches Chrome headless under the named profile, navigates to `url`, and returns every JSON XHR/fetch body whose URL matches any of `url_patterns` (re.search — first-matching-pattern wins). `capture_window_seconds` is a HARD wall (1..600, default 20); Chrome quits when it elapses regardless of state. Must exceed `login_timeout` for a session-refresh to have a chance to resolve.\n\n`login_url_patterns` are re.search-matched against the tab URL AFTER navigation to detect a login-wall redirect. Supplying the field REPLACES the defaults (`[\"login\", \"signin\", \"/auth\"]`), does not merge — empty list disables detection. They're full regexes, so `^https?://roofix\\.io/?$` distinguishes the logged-out root from in-app URLs.\n\n`keep_open: true` leaves Chrome + port + profile-lock held after the window closes; reclaim by POST /jobs/{id}/cancel or restart the container. Operator-only (not on MCP). `debug_logging: true` prepends `const DEBUG_LOGGING = true;` to interceptor.js so traces appear in the browser console (operator-only).\n\nReturns CaptureResponse: {job_id, url, status, login_wall, error, matches (pattern → [{url, body}]), captured_urls (every JSON XHR/fetch seen — use to reverse-engineer regexes)}. `login_wall: true` may mean either an expired session OR a v11-cookie-encryption mismatch (INTERCEPTOR.md § Cookie encryption and portability).\n\nErrors: 400 if profile name fails validator, 400 for invalid `url_pattern` or `login_url_pattern` regex (checked before consuming a port), 429 when the port pool is exhausted (`INTERCEPTOR_MAX_CONCURRENT` slots taken — retry later), 500 if Chrome can't be found (`BrowserNotFoundError`). See INTERCEPTOR.md § POST /capture and § Concurrency."
+        "description": "Run one capture. Launches Chrome headless under the named profile, navigates to `url`, and returns every JSON XHR/fetch body whose URL matches any of `url_patterns` (re.search — first-matching-pattern wins). `capture_window_seconds` is a HARD wall (1..600, default 20); Chrome quits when it elapses regardless of state. Must exceed `login_timeout` for a session-refresh to have a chance to resolve.\n\n`login_url_patterns` are re.search-matched against the tab URL AFTER navigation to detect a login-wall redirect. Supplying the field REPLACES the defaults (`[\"login\", \"signin\", \"/auth\"]`), does not merge — empty list disables detection. They're full regexes, so `^https?://roofix\\.io/?$` distinguishes the logged-out root from in-app URLs.\n\n`keep_open: true` leaves Chrome + port + profile-lock held after the window closes; reclaim by POST /jobs/{id}/cancel or restart the container. Operator-only (not on MCP). `debug_logging: true` prepends `const DEBUG_LOGGING = true;` to interceptor.js so traces appear in the browser console (operator-only).\n\n`screenshot` (optional, default null): set to {format: 'jpeg'|'png'|'webp', quality: 1-100, full_page: bool, scale: 0<s<=2, max_height: 100-16384} — all keys optional — to also capture an image of the page at the end of the window, just before Chrome quits. With `screenshot` set, `url_patterns` may be `[]` (screenshot-only navigation); without it an empty `url_patterns` is a 422.\n\nReturns CaptureResponse: {job_id, url, status, login_wall, error, matches (pattern → [{url, body}]), captured_urls (every JSON XHR/fetch seen — use to reverse-engineer regexes), screenshot ({format, mime_type, width, height, full_page, bytes, page_url, data_base64} or null), screenshot_error (set when a requested screenshot failed — the captures are still valid)}. `login_wall: true` may mean either an expired session OR a v11-cookie-encryption mismatch (INTERCEPTOR.md § Cookie encryption and portability).\n\nErrors: 400 if profile name fails validator, 400 for invalid `url_pattern` or `login_url_pattern` regex (checked before consuming a port), 422 if `url_patterns` is empty and no `screenshot` requested, 429 when the port pool is exhausted (`INTERCEPTOR_MAX_CONCURRENT` slots taken — retry later), 500 if Chrome can't be found (`BrowserNotFoundError`). See INTERCEPTOR.md § POST /capture, § Screenshots and § Concurrency."
+      },
+      "response": []
+    },
+    {
+      "name": "POST /screenshot",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"url\": \"https://example.com/dashboard\",\n  \"profile\": \"{{profileName}}\",\n  \"wait_seconds\": 15,\n  \"format\": \"jpeg\",\n  \"quality\": 80,\n  \"full_page\": false,\n  \"scale\": 1.0,\n  \"max_height\": 8000,\n  \"login_timeout\": 300,\n  \"login_url_patterns\": [\"login\", \"signin\", \"/auth\"]\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": {
+          "raw": "{{litellm}}/v1/interceptor/screenshot",
+          "host": ["{{litellm}}"],
+          "path": ["v1", "interceptor", "screenshot"]
+        },
+        "description": "Navigate to `url` under the named profile, wait `wait_seconds` (1..600, default INTERCEPTOR_SCREENSHOT_WAIT_SECONDS=15 — Chrome spends the first ~4-5s booting and navigating, so values under ~8 mostly capture blank pages), then screenshot the page and quit. No XHR patterns. Internally a screenshot-only POST /capture, so port-pool slots, profile fast/slow path, GET /jobs visibility (phase capturing → screenshot → cleaning_up) and cancel all behave identically.\n\n`format` jpeg (default, ~100-300 KB for a viewport) | png (lossless, often 1-3 MB) | webp. `quality` 1-100 applies to jpeg/webp only. `full_page: true` captures the whole scrollable document clamped to `max_height` CSS px (<= 16384, Chrome's limit) instead of the 1920x1080 headless viewport. `scale` (0 < s <= 2) multiplies the output — 0.5 roughly quarters the payload.\n\nReturns ScreenshotResponse: {job_id, url, status, login_wall, error, screenshot: {format, mime_type, width, height, full_page, bytes, page_url, data_base64} | null, screenshot_error}. `status: 'loading'` is NORMAL for pages that fire no JSON XHRs (static pages) — it is the capture status, not the screenshot's; judge the shot by `screenshot` / `screenshot_error`. `page_url` is where the tab actually landed (redirects, login bounces). `width`/`height` are the requested clip x scale, not decoded from the image.\n\nErrors: 400 bad profile name or invalid `login_url_pattern` regex, 429 port pool exhausted, 500 Chrome not found. A screenshot that fails AFTER navigation (e.g. Chrome crashed) is a 200 with `screenshot: null` + `screenshot_error` set. See INTERCEPTOR.md § Screenshots."
       },
       "response": []
     },
@@ -209,7 +230,7 @@
     },
     {
       "name": "MCP",
-      "description": "FastMCP JSON-RPC over HTTP forwarded through the LiteLLM pass-through. Note that LiteLLM ALSO advertises the interceptor as an MCP server via `mcp_servers.interceptor` (url `http://interceptor:8080/mcp`) in litellm_config.yaml — models see the tools through that path, not this one. The requests below are useful for debugging the transport directly. Every MCP request MUST use trailing-slash (POST /mcp/), MUST send `Accept: application/json, text/event-stream`, and MUST start with an `initialize` call — copy the `mcp-session-id` response header into the `mcpSessionId` collection variable for subsequent calls.\n\nFour tools are exposed: capture_url, list_profiles, list_jobs, get_job. The `keep_open` and `debug_logging` knobs from POST /capture are deliberately omitted — both are operator-only debug flags. MCP tools return dicts and NEVER raise — errors surface inside the payload (e.g. `status=\"error\"` with an `error` field, or `{\"error\": \"no active job ...\"}`).",
+      "description": "FastMCP JSON-RPC over HTTP forwarded through the LiteLLM pass-through. Note that LiteLLM ALSO advertises the interceptor as an MCP server via `mcp_servers.interceptor` (url `http://interceptor:8080/mcp`) in litellm_config.yaml — models see the tools through that path, not this one. The requests below are useful for debugging the transport directly. Every MCP request MUST use trailing-slash (POST /mcp/), MUST send `Accept: application/json, text/event-stream`, and MUST start with an `initialize` call — copy the `mcp-session-id` response header into the `mcpSessionId` collection variable for subsequent calls.\n\nFive tools are exposed: capture_url, screenshot_url, list_profiles, list_jobs, get_job. The `keep_open` and `debug_logging` knobs from POST /capture are deliberately omitted — both are operator-only debug flags. MCP tools NEVER raise — errors surface inside the payload (e.g. `status=\"error\"` with an `error` field, or `{\"error\": \"no active job ...\"}`). capture_url and screenshot_url return a TextContent JSON block plus, when a screenshot was taken, an ImageContent block carrying the image itself (the JSON keeps only the metadata — no base64 duplicated into the text).",
       "item": [
         {
           "name": "MCP — initialize",
@@ -252,7 +273,7 @@
               "host": ["{{litellm}}"],
               "path": ["v1", "interceptor", "mcp", ""]
             },
-            "description": "Enumerate available tools. interceptor exposes exactly four: capture_url, list_profiles, list_jobs, get_job."
+            "description": "Enumerate available tools. interceptor exposes exactly five: capture_url, screenshot_url, list_profiles, list_jobs, get_job."
           },
           "response": []
         },
@@ -267,7 +288,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 3,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"capture_url\",\n    \"arguments\": {\n      \"url\": \"https://example.com/dashboard\",\n      \"url_patterns\": [\"example\\\\.com/api/v1/items\"],\n      \"profile\": \"{{profileName}}\",\n      \"capture_window_seconds\": 20,\n      \"login_timeout\": 300,\n      \"max_matches_per_pattern\": null\n    }\n  }\n}",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 3,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"capture_url\",\n    \"arguments\": {\n      \"url\": \"https://example.com/dashboard\",\n      \"url_patterns\": [\"example\\\\.com/api/v1/items\"],\n      \"profile\": \"{{profileName}}\",\n      \"capture_window_seconds\": 20,\n      \"login_timeout\": 300,\n      \"max_matches_per_pattern\": null,\n      \"screenshot\": false,\n      \"screenshot_full_page\": false,\n      \"screenshot_format\": \"jpeg\",\n      \"screenshot_scale\": 1.0\n    }\n  }\n}",
               "options": { "raw": { "language": "json" } }
             },
             "url": {
@@ -275,7 +296,30 @@
               "host": ["{{litellm}}"],
               "path": ["v1", "interceptor", "mcp", ""]
             },
-            "description": "Model-invokable equivalent of POST /capture. Same core behavior. `keep_open` and `debug_logging` are NOT exposed here — operator-only. HTTPException failures (400 bad regex, 429 pool exhausted, 500 no browser) are wrapped into the return payload as `{status: \"error\", error: \"HTTP <code>: <detail>\", matches: {p: [] for p in url_patterns}, captured_urls: []}` rather than raised — the LLM can then read the error and retry."
+            "description": "Model-invokable equivalent of POST /capture. Same core behavior. `keep_open` and `debug_logging` are NOT exposed here — operator-only. `screenshot: true` additionally captures the page at the end of the window: the result then carries an ImageContent block after the JSON text block, and the JSON's `screenshot` field holds {format, mime_type, width, height, full_page, bytes, page_url} (no base64). `screenshot_full_page`, `screenshot_format` (jpeg|png|webp) and `screenshot_scale` (0 < s <= 2) shape the image. HTTPException / validation failures (400 bad regex, 429 pool exhausted, 500 no browser, invalid scale) are wrapped into the return payload as `{status: \"error\", error: \"...\", matches: {p: [] for p in url_patterns}, captured_urls: [], screenshot: null, screenshot_error: null}` rather than raised — the LLM can then read the error and retry."
+          },
+          "response": []
+        },
+        {
+          "name": "MCP — tools/call screenshot_url",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json, text/event-stream" },
+              { "key": "Mcp-Session-Id", "value": "{{mcpSessionId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 7,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"screenshot_url\",\n    \"arguments\": {\n      \"url\": \"https://example.com/dashboard\",\n      \"profile\": \"{{profileName}}\",\n      \"wait_seconds\": 15,\n      \"full_page\": false,\n      \"format\": \"jpeg\",\n      \"quality\": 80,\n      \"scale\": 1.0,\n      \"login_timeout\": 300\n    }\n  }\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/interceptor/mcp/",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "interceptor", "mcp", ""]
+            },
+            "description": "Model-invokable equivalent of POST /screenshot: navigate under the profile, wait `wait_seconds`, return an image of the rendered page. The result's `content` is [TextContent(JSON), ImageContent(image/<format>)] — the JSON carries {job_id, url, status, login_wall, error, screenshot: {format, mime_type, width, height, full_page, bytes, page_url}, screenshot_error} and the image block carries the pixels, so a multimodal model can look at the page. `status: 'loading'` is normal for pages with no JSON XHRs. `page_url` shows where the tab actually ended up (login bounce etc.). Failures are returned in the payload (`status: 'error'` + `error`, or `screenshot: null` + `screenshot_error`), never raised. See INTERCEPTOR.md § Screenshots."
           },
           "response": []
         },

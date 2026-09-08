@@ -45,6 +45,12 @@
 			"value": "",
 			"type": "string",
 			"description": "MCP transport session id — paste in the `mcp-session-id` response header value returned by the `MCP — initialize` request. Subsequent MCP calls need it. UNRELATED to `sandboxSessionId` — this one is FastMCP's HTTP-transport session cookie, not the sandbox reuse handle."
+		},
+		{
+			"key": "chatId",
+			"value": "",
+			"type": "string",
+			"description": "Optional chat/conversation id (^[A-Za-z0-9_.:-]{1,128}$) for the one-sandbox-per-chat guard. Passed as `chat_id` on POST /create and POST /run (and the create/run MCP tools). When set, a second create for the same chat returns the existing session (`duplicate_create_prevented: true`) instead of spawning a duplicate, and a run with no session_id reuses the chat's running container. Leave empty to keep always-spawn behavior. Distinct from `sandboxSessionId` (the per-preview handle) and `mcpSessionId` (the FastMCP transport cookie)."
 		}
 	],
 	"item": [
@@ -318,7 +324,7 @@
 				],
 				"body": {
 					"mode": "raw",
-					"raw": "{\n  \"runtime\": \"python\",\n  \"ttl_seconds\": 900,\n  \"env\": {\n    \"DEMO_MODE\": \"1\"\n  }\n}",
+					"raw": "{\n  \"runtime\": \"python\",\n  \"ttl_seconds\": 900,\n  \"env\": {\n    \"DEMO_MODE\": \"1\"\n  },\n  \"chat_id\": \"{{chatId}}\"\n}",
 					"options": {
 						"raw": {
 							"language": "json"
@@ -336,7 +342,7 @@
 						"create"
 					]
 				},
-				"description": "Reserve an empty warming container for the chosen runtime. Backs the sandbox.create MCP tool. Response is the same shape as POST /run — save `session_id` into the `sandboxSessionId` collection variable, then call POST /session/{id}/files with real code.\n\n`env` is stored on the job row and replayed on self-heal respawn. Reserved keys (HTTP_PROXY, PYTHONUNBUFFERED, TERM, etc.) are rejected — those are runner-controlled invariants.\n\nSee ENDPOINTS.md § POST /create."
+				"description": "Reserve an empty warming container for the chosen runtime. Backs the sandbox.create MCP tool. Response is the same shape as POST /run — save `session_id` into the `sandboxSessionId` collection variable, then call POST /session/{id}/files with real code.\n\n`env` is stored on the job row and replayed on self-heal respawn. Reserved keys (HTTP_PROXY, PYTHONUNBUFFERED, TERM, etc.) are rejected — those are runner-controlled invariants.\n\n`chat_id` (optional, ^[A-Za-z0-9_.:-]{1,128}$) enforces ONE sandbox per chat: if this chat already has a live sandbox (spawning/starting/running), the runner returns THAT session instead of spawning a second one — response carries `reused: true` and `duplicate_create_prevented: true`, and no concurrency slot is used. Set the `chatId` collection variable to your conversation id. Leave it empty for always-spawn behavior. A duplicate is a 200, not an error.\n\nSee ENDPOINTS.md § POST /create."
 			},
 			"response": []
 		},
@@ -1105,7 +1111,7 @@
 						],
 						"body": {
 							"mode": "raw",
-							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 11,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"create\",\n    \"arguments\": {\n      \"runtime\": \"python\",\n      \"ttl_seconds\": 900,\n      \"env\": {\n        \"DEMO_MODE\": \"1\"\n      }\n    }\n  }\n}",
+							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 11,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"create\",\n    \"arguments\": {\n      \"runtime\": \"python\",\n      \"ttl_seconds\": 900,\n      \"env\": {\n        \"DEMO_MODE\": \"1\"\n      },\n      \"chat_id\": \"{{chatId}}\"\n    }\n  }\n}",
 							"options": {
 								"raw": {
 									"language": "json"
@@ -1449,7 +1455,7 @@
 						],
 						"body": {
 							"mode": "raw",
-							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 18,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"run\",\n    \"arguments\": {\n      \"runtime\": \"static\",\n      \"files\": {\n        \"index.html\": \"<h1>one-shot from run</h1>\"\n      }\n    }\n  }\n}",
+							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 18,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"run\",\n    \"arguments\": {\n      \"runtime\": \"static\",\n      \"files\": {\n        \"index.html\": \"<h1>one-shot from run</h1>\"\n      },\n      \"chat_id\": \"{{chatId}}\"\n    }\n  }\n}",
 							"options": {
 								"raw": {
 									"language": "json"

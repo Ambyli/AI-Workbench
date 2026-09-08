@@ -237,6 +237,13 @@ Tool summary:
 
 **`env` at create time.** Process env vars set inside the container. Immutable after spawn — a self-heal respawn replays the same env from the job's metadata JSONB, but there is no update path. Reserved keys (`HTTP_PROXY`, `HTTPS_PROXY`, `PYTHONUNBUFFERED`, `NPM_CONFIG_LOGLEVEL`, `FORCE_COLOR`, `TERM`) are rejected at validation — those are runner-controlled invariants that keep the egress allowlist and log buffering working; the spawner re-applies them on top of the merged env even if a validation bypass ever landed.
 
+**`chat_id` — one sandbox per chat.** `create`, `run`, and their HTTP endpoints accept an optional `chat_id` (`^[A-Za-z0-9_.:-]{1,128}$` — an Open WebUI chat id, or any stable per-conversation string). It's the durable answer to "the model called `create` twice in one chat and now there are two containers." When a chat already has a live sandbox (phase `spawning`/`starting`/`running`):
+
+- **`create`** returns that existing session instead of spawning — `reused: true`, `duplicate_create_prevented: true`, and **no** concurrency slot consumed. The MCP tool's text says "This chat already has a sandbox — reusing it".
+- **`run`** (given `chat_id` and no explicit `session_id`) resolves the chat's running session and takes the overlay/hot-reload path, so a second `run` updates the same preview rather than spawning a rival.
+
+The guard is a metadata lookup indexed by `jobs_chat_id_active` (a partial index over the `spawning`/`starting`/`running` phases, installed next to `jobs_session_id_running`). It runs before the slot is acquired, so a prevented duplicate is free. The window is best-effort: two `create`s for one chat firing within the same few milliseconds — before the first row exists — can still both spawn, the same non-atomic tradeoff the session index already makes. `chat_id` is stored on the job's metadata and replayed across self-heal respawns, so the chat→container binding survives a reaped-and-recreated container. Omit `chat_id` to keep the historical always-spawn behavior.
+
 **`recreate_if_gone` on `write_files`.** OPT-IN self-heal. Default `false` — if the container is gone (crashed, reaped, respawn refused), the tool returns a structured 409 telling the caller to opt in explicitly. Set `true` to accept the state loss: env is preserved, but packages installed via `exec` and any in-container files not in the current `files` map are LOST. `run` implicitly passes `true` because it's the one-shot convenience path.
 
 ### Structured tool responses

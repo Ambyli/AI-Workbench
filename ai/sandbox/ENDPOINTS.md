@@ -99,6 +99,7 @@ Field semantics:
 | `deletes` | `[path, …]` | no | Relative paths under `/app` to remove. Same sanitization as `files`. Ignored on the first call. |
 | `env` | `{str: str}` | no | Process env vars set inside the container. Immutable after spawn (self-heal replays the recorded env). Reserved keys (`HTTP_PROXY`, `PYTHONUNBUFFERED`, `TERM`, etc.) are rejected. |
 | `recreate_if_gone` | bool | no | Default `true` for backward compat with `POST /run`. If the session's container is gone, silently respawn. Set `false` to force the caller to reason about self-heal explicitly (recommended for direct `write_files` calls, but `/run` keeps the historical default). |
+| `chat_id` | string | no | Chat/conversation id, `^[A-Za-z0-9_.:-]{1,128}$`. When set and **no** `session_id` is given, the runner reuses this chat's existing running container (overlay path) instead of spawning a second one — so repeated `/run` calls in one chat update the same preview even if the caller lost the `session_id`. A fresh spawn records the `chat_id` so the next call converges. |
 
 **Response (200):**
 ```json
@@ -235,13 +236,16 @@ Reserve an empty warming container of the chosen runtime. Backs the `sandbox.cre
   "runtime":     "python",
   "ttl_seconds": 900,
   "entrypoint":  null,
-  "env":         { "OPENAI_API_KEY": "sk-..." }
+  "env":         { "OPENAI_API_KEY": "sk-..." },
+  "chat_id":     "3fa9c1b2-..."
 }
 ```
 
-**Response (200):** same shape as `POST /run`. `startup_output` may already carry a Streamlit "You can now view your Streamlit app…" line because the warming file has been running long enough for the dev server to bind port 80.
+`chat_id` (optional, `^[A-Za-z0-9_.:-]{1,128}$`) scopes **one sandbox per chat**. When a live sandbox already exists for this `chat_id` — in `spawning`, `starting`, or `running` phase — the runner does **not** spawn a second container: it returns that existing session with `reused: true` and `duplicate_create_prevented: true`, and consumes no concurrency slot. Pass the chat/conversation id here on every `create` for that chat and a chat can never leak multiple containers by calling create twice (e.g. after its `session_id` scrolled out of context). Omit it to keep the old always-spawn behavior.
 
-**Errors:** same status codes as `POST /run` (400 unknown runtime / custom entrypoint on static, 429 pool full, 504 warming container didn't bind port 80).
+**Response (200):** same shape as `POST /run`, plus `chat_id` and `duplicate_create_prevented` (echoed on the MCP tool's structured payload). `startup_output` may already carry a Streamlit "You can now view your Streamlit app…" line because the warming file has been running long enough for the dev server to bind port 80.
+
+**Errors:** same status codes as `POST /run` (400 unknown runtime / custom entrypoint on static, 422 malformed `chat_id`, 429 pool full, 504 warming container didn't bind port 80). Note: a duplicate create is **not** an error — it returns 200 with the existing session.
 
 ---
 
@@ -762,7 +766,7 @@ Eleven tools registered on the `sandbox` MCP server. Every tool returns a `ToolR
 | Tool | Backing HTTP endpoint | Purpose |
 |---|---|---|
 | `get_runtime_types` | (in-process; no HTTP backing) | Describe runtime types (catalog — not a session status check) |
-| `create` | `POST /create` | Reserve an empty warming container |
+| `create` | `POST /create` | Reserve an empty warming container (pass `chat_id` for one-per-chat) |
 | `write_files` | `POST /session/{id}/files` | Overlay files, run health probe |
 | `get_files` | `GET /session/{id}/files` | Read files back from `/app` |
 | `get_logs` | `GET /session/{id}/logs` | Tail combined stdout+stderr |
@@ -779,7 +783,7 @@ Eleven tools registered on the `sandbox` MCP server. Every tool returns a `ToolR
 
 **Structured payload highlights:**
 
-- `create` / `run` → `{ok, session_id, sandbox_id, url, expires_at, runtime, app_status, reused, recreated}`
+- `create` / `run` → `{ok, session_id, sandbox_id, url, expires_at, runtime, app_status, reused, recreated, chat_id, duplicate_create_prevented}` — `duplicate_create_prevented: true` means a chat_id was supplied and matched a live sandbox, so this response is the existing session, not a new spawn
 - `write_files` → adds `startup_output`, `app_status`, `recreated` (self-heal flag)
 - `get_files` → `{ok, session_id, sandbox_id, files: [{path, size, encoding, content, truncated, error?}, …]}`
 - `get_logs` → `{ok, session_id, sandbox_id, lines_requested, logs, empty?}`

@@ -71,6 +71,7 @@ async def tool_run(req: ToolRunRequest) -> HTMLResponse:
         req.deletes,
         env=req.env,
         recreate_if_gone=True,
+        chat_id=req.chat_id,
     )
     return HTMLResponse(
         content=render_preview_html(

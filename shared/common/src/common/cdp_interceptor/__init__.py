@@ -27,12 +27,22 @@ from .launcher import (
     find_browser,
     find_chrome,
 )
+from .screenshot import (
+    SCREENSHOT_FORMATS,
+    Screenshot,
+    ScreenshotError,
+    capture_screenshot,
+)
 from .sentinel import session_exists, mark_session_ok, clear_session
 
 __all__ = [
     "InterceptorClient",
     "ClientState",
     "Capture",
+    "Screenshot",
+    "ScreenshotError",
+    "SCREENSHOT_FORMATS",
+    "capture_screenshot",
     "BrowserNotFoundError",
     "ChromeNotFoundError",
     "find_browser",

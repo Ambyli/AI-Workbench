@@ -20,6 +20,9 @@ services:
       # plus, on same-profile collision, ~20-80 MB disk for the profile clone.
       - INTERCEPTOR_MAX_CONCURRENT=${INTERCEPTOR_MAX_CONCURRENT:-8}
       - INTERCEPTOR_CAPTURE_WINDOW_SECONDS=${INTERCEPTOR_CAPTURE_WINDOW_SECONDS:-20}
+      # Default render wait for POST /screenshot + the screenshot_url MCP tool.
+      # Chrome needs ~4-5s of it to boot and navigate before the page paints.
+      - INTERCEPTOR_SCREENSHOT_WAIT_SECONDS=${INTERCEPTOR_SCREENSHOT_WAIT_SECONDS:-15}
     volumes:
       - interceptor_data:/data
     healthcheck:

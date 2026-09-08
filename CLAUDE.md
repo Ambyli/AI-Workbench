@@ -62,6 +62,7 @@ Key variables:
 | `ROOFIX_PROFILE_NAME` | `roofix` | Named profile inside interceptor holding Roofix session cookies |
 | `INTERCEPTOR_PROFILES_ROOT` | `/data/profiles` | interceptor: root under which named `--user-data-dir` profiles live |
 | `INTERCEPTOR_MAX_CONCURRENT` | `8` | interceptor: max simultaneous `/capture` calls (port pool size). Each slot ≈ one Chrome + optional profile clone — see `ai/interceptor/INTERCEPTOR.md § Resource sizing` |
+| `INTERCEPTOR_SCREENSHOT_WAIT_SECONDS` | `15` | interceptor: default seconds `POST /screenshot` / the `screenshot_url` MCP tool let a page render before capturing. Chrome spends the first ~4–5s booting and navigating, so values under ~8 mostly return blank pages. Screenshots ride a second CDP connection (`common.cdp_interceptor.screenshot`) so the XHR-capture session is untouched — see `ai/interceptor/INTERCEPTOR.md § Screenshots`. |
 | `SANDBOX_MAX_CONCURRENT` | `8` | Sandbox: max simultaneous running sandboxes (`sandbox-runner` returns 429 past this). Each slot ≈ 512 MB RAM + 1 CPU + base-image disk footprint. |
 | `SANDBOX_DEFAULT_TTL_SECONDS` | `900` | Sandbox: default idle TTL. Model can request shorter per-`create`/`run`, cannot request longer than `SANDBOX_HARD_TTL_SECONDS`. |
 | `SANDBOX_IDLE_TTL_SECONDS` | _(inherits `SANDBOX_DEFAULT_TTL_SECONDS`)_ | Sandbox: reaper tears down a running sandbox whose `metadata->>'last_used_at'` is older than this. Distinct knob only when you want idle behavior to differ from the per-session default. |

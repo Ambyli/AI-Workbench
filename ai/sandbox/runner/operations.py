@@ -24,6 +24,7 @@ from fastapi import HTTPException
 
 from constants import (
     BROWSER_LOG_RATE_LIMIT_PER_MIN,
+    CHAT_ID_RE,
     DEFAULT_TTL_S,
     EXEC_DEFAULT_TIMEOUT_S,
     EXEC_HARD_TIMEOUT_S,
@@ -185,6 +186,96 @@ async def _find_running_session(session_id: str) -> Optional[dict]:
         "entrypoint": meta.get("entrypoint"),
         "ttl_seconds": meta.get("ttl_seconds"),
         "env": meta.get("env") or {},
+        "chat_id": meta.get("chat_id"),
+    }
+
+
+# Phases a sandbox passes through before it's either serving or dead. A chat
+# "already has a create" if it has a row in any of these — including the brief
+# spawning/starting window, so two near-simultaneous creates for one chat don't
+# both slip past the guard and spawn duplicate containers.
+_ACTIVE_PHASES = ("spawning", "starting", "running")
+
+
+async def _find_active_session_by_chat(chat_id: str) -> Optional[dict]:
+    """Return the newest not-yet-dead sandbox for a chat_id, or None.
+
+    Backs the "one create per chat" guard. Unlike ``_find_running_session``
+    (which matches only phase='running' because it's about reusing a live
+    container), this also matches the spawning/starting window so a duplicate
+    create issued while the first is still warming is caught too.
+
+    ``container_name`` / ``url`` come from ``result`` and are populated only
+    once the row reaches 'running'; for a still-warming row they're None and
+    callers fall back to the deterministic ``{PROXY_URL}/{sandbox_id}/`` URL.
+    """
+    if state.registry is None:
+        log.warning("_find_active_session_by_chat called before registry init")
+        return None
+    pool = state.registry._pool
+    if pool is None:
+        log.warning("_find_active_session_by_chat: pool not ready")
+        return None
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, phase, metadata, result "
+            "FROM jobs "
+            "WHERE metadata->>'chat_id' = $1 AND phase = ANY($2::text[]) "
+            "ORDER BY created_at DESC LIMIT 1",
+            chat_id,
+            list(_ACTIVE_PHASES),
+        )
+    if row is None:
+        log.debug("_find_active_session_by_chat: no active row for chat=%s", chat_id)
+        return None
+    meta = row["metadata"]
+    if isinstance(meta, str):
+        meta = json.loads(meta)
+    result = row["result"] or {}
+    if isinstance(result, str):
+        result = json.loads(result)
+    log.debug(
+        "_find_active_session_by_chat: chat=%s → sandbox=%s phase=%s session=%s",
+        chat_id, row["id"], row["phase"], (meta or {}).get("session_id"),
+    )
+    return {
+        "sandbox_id": row["id"],
+        "phase": row["phase"],
+        "session_id": (meta or {}).get("session_id"),
+        "container_name": result.get("container_name"),
+        "url": result.get("url"),
+        "expires_at": (meta or {}).get("expires_at"),
+        "runtime": (meta or {}).get("runtime"),
+        "entrypoint": (meta or {}).get("entrypoint"),
+        "ttl_seconds": (meta or {}).get("ttl_seconds"),
+        "env": (meta or {}).get("env") or {},
+    }
+
+
+def _existing_session_as_create_response(existing: dict, chat_id: str) -> dict:
+    """Shape an already-live session into the ``create``/``run`` response dict,
+    flagged so the caller can tell the user a duplicate spawn was avoided.
+
+    URL falls back to the deterministic proxy path when the row is still
+    warming (its ``result`` isn't written yet)."""
+    url = existing.get("url") or f"{PROXY_URL}/{existing['sandbox_id']}/"
+    return {
+        "sandbox_id": existing["sandbox_id"],
+        "session_id": existing.get("session_id"),
+        "url": url,
+        "expires_at": existing.get("expires_at"),
+        "reused": True,
+        "runtime": existing.get("runtime"),
+        "startup_output": "",
+        "app_status": {
+            "code": 200,
+            "latency_ms": 0,
+            "note": f"existing sandbox for chat (phase={existing.get('phase')})",
+        },
+        "recreated": False,
+        "warming": existing.get("phase") in ("spawning", "starting"),
+        "duplicate_create_prevented": True,
+        "chat_id": chat_id,
     }
 
 
@@ -234,13 +325,31 @@ async def _do_create(
     ttl_seconds: Optional[int],
     entrypoint: Optional[str],
     env: Optional[dict[str, str]],
+    chat_id: Optional[str] = None,
 ) -> dict:
     """Spawn an empty (warming-files-only) container. Returns the same
     dict shape as ``_reuse_or_spawn`` so downstream renderers don't
     care which entry point they went through.
+
+    ``chat_id`` scopes one create per conversation: if the chat already
+    has an active sandbox, no new container is spawned — the existing
+    session is returned with ``duplicate_create_prevented=true`` and no
+    slot is consumed.
     """
     if state.registry is None or state.spawner is None or state.slot_sem is None:
         raise HTTPException(500, "runner not initialized")
+
+    # One-create-per-chat guard. Runs BEFORE the concurrency slot is taken so a
+    # duplicate create is free and never counts against SANDBOX_MAX_CONCURRENT.
+    if chat_id:
+        existing = await _find_active_session_by_chat(chat_id)
+        if existing:
+            log.info(
+                "create: chat=%s already has sandbox=%s (phase=%s) — returning "
+                "it instead of spawning a duplicate",
+                chat_id, existing["sandbox_id"], existing.get("phase"),
+            )
+            return _existing_session_as_create_response(existing, chat_id)
 
     try:
         rt = get_runtime(runtime)
@@ -278,6 +387,7 @@ async def _do_create(
             "ttl_seconds": ttl,
             "expires_at": expires_at.isoformat(),
             "session_id": session_id,
+            "chat_id": chat_id,
             "last_used_at": now_iso,
             "env": env or {},
             "warmed": True,
@@ -285,8 +395,8 @@ async def _do_create(
         initial_phase="spawning",
     )
     log.info(
-        "create: session=%s sandbox=%s runtime=%s ttl=%ds",
-        session_id, sandbox_id, runtime, ttl,
+        "create: session=%s sandbox=%s runtime=%s ttl=%ds chat=%s",
+        session_id, sandbox_id, runtime, ttl, chat_id,
     )
     try:
         result = await asyncio.to_thread(
@@ -349,6 +459,8 @@ async def _do_create(
             "app_status": {"code": 200, "latency_ms": 0, "note": "warming"},
             "recreated": False,
             "warming": True,
+            "duplicate_create_prevented": False,
+            "chat_id": chat_id,
         }
     except HTTPException:
         raise
@@ -555,6 +667,7 @@ async def _respawn_session(
         deletes=deletes,
         env=existing.get("env") or {},
         recreate_if_gone=True,
+        chat_id=existing.get("chat_id"),
     )
     result["recreated"] = True
     return result
@@ -1080,6 +1193,7 @@ async def _reuse_or_spawn(
     deletes: list[str],
     env: Optional[dict[str, str]] = None,
     recreate_if_gone: bool = True,
+    chat_id: Optional[str] = None,
 ) -> dict:
     """Session-aware entry point retained for HTTP compatibility.
 
@@ -1091,15 +1205,37 @@ async def _reuse_or_spawn(
 
     Kept as a single function so ``POST /run`` and the ``run`` MCP tool
     still work exactly as they did before the redesign.
+
+    ``chat_id`` makes ``run`` one-create-per-chat: when the caller gives a
+    chat_id but no explicit session_id, and the chat already has a live
+    container, we resolve that chat's session_id and take the overlay path
+    instead of spawning a second container.
     """
     log.info(
-        "_reuse_or_spawn: runtime=%s session_id=%s n_files=%d n_deletes=%d "
-        "entrypoint=%r recreate=%s env_keys=%s",
-        runtime, session_id, len(files or {}), len(deletes or []), entrypoint,
-        recreate_if_gone, sorted((env or {}).keys()),
+        "_reuse_or_spawn: runtime=%s session_id=%s chat_id=%s n_files=%d "
+        "n_deletes=%d entrypoint=%r recreate=%s env_keys=%s",
+        runtime, session_id, chat_id, len(files or {}), len(deletes or []),
+        entrypoint, recreate_if_gone, sorted((env or {}).keys()),
     )
     if state.registry is None or state.spawner is None or state.slot_sem is None:
         raise HTTPException(500, "runner not initialized")
+
+    # Resolve an explicit session_id from the chat when the caller didn't pass
+    # one. Only adopt a chat's session if its container is actually running —
+    # a still-warming or dead row falls through to the spawn path (which will
+    # record this chat_id, so the next call converges).
+    if not session_id and chat_id:
+        chat_existing = await _find_active_session_by_chat(chat_id)
+        if (
+            chat_existing
+            and chat_existing.get("phase") == "running"
+            and chat_existing.get("container_name")
+        ):
+            session_id = chat_existing["session_id"]
+            log.info(
+                "run: chat=%s → reusing existing session=%s sandbox=%s",
+                chat_id, session_id, chat_existing["sandbox_id"],
+            )
 
     if session_id:
         existing = await _find_running_session(session_id)
@@ -1202,6 +1338,7 @@ async def _reuse_or_spawn(
             "ttl_seconds": ttl,
             "expires_at": expires_at.isoformat(),
             "session_id": session_id,
+            "chat_id": chat_id,
             "last_used_at": now_iso,
             "env": env or {},
         },
@@ -1209,8 +1346,10 @@ async def _reuse_or_spawn(
     )
 
     log.info(
-        "spawn path: session=%s sandbox=%s runtime=%s ttl=%ds entrypoint=%r",
-        session_id, sandbox_id, runtime, ttl, entrypoint or rt.default_entrypoint,
+        "spawn path: session=%s sandbox=%s runtime=%s ttl=%ds entrypoint=%r "
+        "chat=%s",
+        session_id, sandbox_id, runtime, ttl,
+        entrypoint or rt.default_entrypoint, chat_id,
     )
 
     try:

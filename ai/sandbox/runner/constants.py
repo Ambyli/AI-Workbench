@@ -80,6 +80,8 @@ EGRESS_URL = os.environ.get("SANDBOX_EGRESS_URL", "http://sandbox-egress:8888")
 
 
 # ── Payload limits ────────────────────────────────────────────────────────
+
+
 # Enforced at pydantic-validation time so a hostile payload never touches
 # the tarball builder. Base64 files count their DECODED length so a
 # client can't smuggle a huge blob past the cap by encoding it.
@@ -95,6 +97,23 @@ MAX_PAYLOAD_BYTES = int(os.environ.get("SANDBOX_MAX_PAYLOAD_BYTES", "10000000"))
 # a caller later uses the id in a URL or filesystem context) and a hint
 # to the model that the id is a short opaque string, not free text.
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+# A chat_id scopes "one create per conversation": the caller (Open WebUI, a
+# LiteLLM client, a bot) passes the id of the chat the model is answering in,
+# and the runner refuses to spawn a SECOND container for a chat that already
+# has a live one — it returns the existing session instead. Widened past
+# SESSION_ID_RE to accept the id shapes real chat frontends mint: Open WebUI
+# uses UUIDs (with dots in some builds), so ``.`` and up to 128 chars are
+# allowed. Still validated (not free text) because the id lands in SQL
+# (parameterized) and log lines.
+CHAT_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+
+# Chat / conversation identifiers come from the host UI (OpenWebUI chat
+# ids are UUID-ish; other clients may send opaque tokens). Permissive on
+# characters but bounded, and it lands in a JSONB metadata column plus
+# log lines — never a path or URL — so the regex is about hygiene, not
+# injection.
+CHAT_ID_RE = re.compile(r"^[A-Za-z0-9_.:@-]{1,128}$")
 
 # Env vars we refuse to accept from the caller — these are
 # runner-controlled invariants (egress proxy, log buffering) and must

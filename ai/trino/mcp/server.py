@@ -50,13 +50,14 @@ async def list_catalogs() -> list[str]:
     """Return every catalog Trino can query. Call this first when you
     don't know which data source holds the answer.
 
-    Typical result: ``["ai_agents", "enerflo_leads", "iceberg",
-    "postgres_litellm", "postgres_phoenix", "postgres_roofix",
-    "postgres_sandbox", "system"]``. ``iceberg`` is the lakehouse on
-    MinIO; the ``postgres_*`` entries federate the subsystem Postgres
-    instances plus the Phoenix production DB; ``ai_agents`` and
-    ``enerflo_leads`` are Supabase-hosted Postgres projects. All
-    read-only.
+    Typical result: ``["aws_glue", "iceberg", "postgres_litellm",
+    "postgres_phoenix", "postgres_roofix", "postgres_sandbox",
+    "supabase_ai_agents", "supabase_enerflo_leads", "system"]``.
+    Catalogs are named ``<source>_<dataset>``: ``iceberg`` is the
+    lakehouse on MinIO; ``postgres_*`` federate the subsystem Postgres
+    instances plus the Phoenix production DB; ``supabase_*`` are
+    Supabase-hosted Postgres projects; ``aws_glue`` is the AWS Glue Data
+    Catalog (what Athena queries). All read-only.
     """
     log.info("MCP tool call: list_catalogs")
     _, rows = _client.execute("SHOW CATALOGS")

@@ -142,7 +142,7 @@ Clients that pinned the old fingerprint must re-trust.
 
 | Tool | Purpose |
 |---|---|
-| `list_catalogs()` | Every catalog Trino sees — `ai_agents`, `enerflo_leads`, `iceberg`, `postgres_litellm`, `postgres_phoenix`, `postgres_roofix`, `postgres_sandbox`, `system` |
+| `list_catalogs()` | Every catalog Trino sees — `aws_glue`, `iceberg`, `postgres_litellm`, `postgres_phoenix`, `postgres_roofix`, `postgres_sandbox`, `supabase_ai_agents`, `supabase_enerflo_leads`, `system` |
 | `list_schemas(catalog)` | Schemas under a catalog |
 | `list_tables(catalog, schema)` | Tables under a schema |
 | `describe_table(catalog, schema, table)` | `[{"name":…, "type":…}, …]` |
@@ -157,8 +157,8 @@ tool_call, hits `trino-mcp`'s HTTP endpoint, and sends the result back.
 
 A catalog is one `.properties` file in `ai/trino/catalogs/`. The
 filename (minus `.properties`) becomes the catalog name in SQL, so
-`enerflo_leads.properties` is queried as
-`enerflo_leads.<schema>.<table>`. Every catalog is visible to every
+`supabase_enerflo_leads.properties` is queried as
+`supabase_enerflo_leads.<schema>.<table>`. Every catalog is visible to every
 Trino login and to `trino-mcp` — there is no per-catalog access control
 yet (see [Follow-ups](#follow-ups)).
 
@@ -193,10 +193,15 @@ models get an accurate hint.
 - Underscores only. A hyphen (`my-db`) is legal on disk but
   `my-db.public.t` is a lex error in SQL.
 - Don't shadow `system` or `information_schema`.
-- Convention so far: `postgres_<subsystem>` for our own compose-managed
-  DBs (`postgres_litellm`, `postgres_roofix`, `postgres_sandbox`,
-  `postgres_phoenix`), a plain business name for external data
-  (`ai_agents`, `enerflo_leads`).
+- Convention: `<source>_<dataset>` — name by where the data lives, then
+  what it is. `postgres_<subsystem>` for Postgres instances we run or
+  are handed directly (`postgres_litellm`, `postgres_roofix`,
+  `postgres_sandbox`, `postgres_phoenix`); `supabase_<project>` for
+  Supabase-hosted projects (`supabase_ai_agents`,
+  `supabase_enerflo_leads`); `aws_glue` for the Glue Data Catalog. Don't
+  name catalogs after the tool you used to reach the data before
+  (`athena`) or the owner (`zeo_*`) — every catalog here is ours, so
+  that carries no information.
 
 ### Reaching the database
 
@@ -221,8 +226,8 @@ the port in `.env`.
 
 ### Hosted Postgres gotchas
 
-Learned the hard way on `postgres_phoenix`, `ai_agents`, and
-`enerflo_leads`:
+Learned the hard way on `postgres_phoenix`, `supabase_ai_agents`, and
+`supabase_enerflo_leads`:
 
 - **TLS.** Managed Postgres (Supabase, Phoenix, RDS) rejects plaintext.
   Append `?sslmode=require` to the JDBC URL — the driver defaults to no
@@ -306,6 +311,27 @@ s3.region=us-east-1
 s3.aws-access-key=${ENV:PROD_S3_ACCESS_KEY}
 s3.aws-secret-key=${ENV:PROD_S3_SECRET_KEY}
 ```
+
+**AWS Glue / Athena** (Trino has no Athena connector — read Glue + S3
+directly, which is what Athena itself does; see `aws_glue.properties`):
+
+```properties
+connector.name=hive
+hive.metastore=glue
+hive.metastore.glue.region=${ENV:X_REGION}
+hive.metastore.glue.aws-access-key=${ENV:X_ACCESS_KEY_ID}
+hive.metastore.glue.aws-secret-key=${ENV:X_SECRET_ACCESS_KEY}
+fs.native-s3.enabled=true
+s3.region=${ENV:X_REGION}
+s3.aws-access-key=${ENV:X_ACCESS_KEY_ID}
+s3.aws-secret-key=${ENV:X_SECRET_ACCESS_KEY}
+```
+
+Hive-format tables (Parquet, ORC, CSV, JSON) work as-is. Tables Athena
+created as **Iceberg** fail with "not a Hive table"; for those add a
+second catalog with `connector.name=iceberg` +
+`iceberg.catalog.type=glue` on the same credentials and set
+`hive.iceberg-catalog-name=<that catalog>` here so Trino redirects.
 
 Other first-party connectors (BigQuery, Snowflake, Redshift, ClickHouse,
 MongoDB, Kafka, Delta Lake, …) follow the same shape — `connector.name`

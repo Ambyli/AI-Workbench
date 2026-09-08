@@ -240,7 +240,7 @@ services:
       PHOENIX_DB_PASSWORD: ${PHOENIX_DB_PASSWORD}
       PHOENIX_DB_SSLMODE: ${PHOENIX_DB_SSLMODE:-require}
       # Supabase Postgres for the AI agents project (off-box, TLS
-      # required). Consumed by catalogs/ai_agents.properties.
+      # required). Consumed by catalogs/supabase_ai_agents.properties.
       AI_AGENTS_DB_HOST: ${AI_AGENTS_DB_HOST}
       AI_AGENTS_DB_PORT: ${AI_AGENTS_DB_PORT:-5432}
       AI_AGENTS_DB_NAME: ${AI_AGENTS_DB_NAME:-postgres}
@@ -248,13 +248,18 @@ services:
       AI_AGENTS_DB_PASSWORD: ${AI_AGENTS_DB_PASSWORD}
       AI_AGENTS_DB_SSLMODE: ${AI_AGENTS_DB_SSLMODE:-require}
       # Supabase Postgres holding Enerflo lead data (off-box, TLS
-      # required). Consumed by catalogs/enerflo_leads.properties.
+      # required). Consumed by catalogs/supabase_enerflo_leads.properties.
       ENERFLO_LEADS_DB_HOST: ${ENERFLO_LEADS_DB_HOST}
       ENERFLO_LEADS_DB_PORT: ${ENERFLO_LEADS_DB_PORT:-5432}
       ENERFLO_LEADS_DB_NAME: ${ENERFLO_LEADS_DB_NAME:-postgres}
       ENERFLO_LEADS_DB_USER: ${ENERFLO_LEADS_DB_USER}
       ENERFLO_LEADS_DB_PASSWORD: ${ENERFLO_LEADS_DB_PASSWORD}
       ENERFLO_LEADS_DB_SSLMODE: ${ENERFLO_LEADS_DB_SSLMODE:-require}
+      # AWS Glue Data Catalog + S3 (what Athena queries). Consumed by
+      # catalogs/aws_glue.properties via the Hive connector.
+      AWS_GLUE_REGION: ${AWS_GLUE_REGION:-us-east-1}
+      AWS_GLUE_ACCESS_KEY_ID: ${AWS_GLUE_ACCESS_KEY_ID}
+      AWS_GLUE_SECRET_ACCESS_KEY: ${AWS_GLUE_SECRET_ACCESS_KEY}
     # host.docker.internal is NOT defined by default on Linux Docker (only
     # Docker Desktop injects it). host-gateway maps it to the bridge
     # gateway IP so the postgres_litellm / postgres_sandbox catalogs can

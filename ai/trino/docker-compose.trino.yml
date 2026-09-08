@@ -226,6 +226,15 @@ services:
       SANDBOX_DB_USER: ${SANDBOX_DB_USER:-sandbox}
       SANDBOX_DB_PASSWORD: ${SANDBOX_DB_PASSWORD:-sandbox}
       SANDBOX_DB_NAME: ${SANDBOX_DB_NAME:-sandbox}
+      # Phoenix production Postgres (off-box, read-only role). Same vars
+      # the Roofix bridge uses — one definition in .env feeds both.
+      # Consumed by catalogs/postgres_phoenix.properties.
+      PHOENIX_DB_HOST: ${PHOENIX_DB_HOST}
+      PHOENIX_DB_PORT: ${PHOENIX_DB_PORT:-5432}
+      PHOENIX_DB_NAME: ${PHOENIX_DB_NAME}
+      PHOENIX_DB_USER: ${PHOENIX_DB_USER}
+      PHOENIX_DB_PASSWORD: ${PHOENIX_DB_PASSWORD}
+      PHOENIX_DB_SSLMODE: ${PHOENIX_DB_SSLMODE:-require}
     networks:
       - shared
       - analytics_net

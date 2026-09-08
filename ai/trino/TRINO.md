@@ -2,8 +2,9 @@
 
 Trino coordinator + Hive Metastore + MinIO + Superset + a FastMCP shim,
 brought up by a single compose file. Federates SQL over the three
-existing Postgres instances (`litellm_db`, `roofix-db`, `sandbox-db`)
-plus an Iceberg lakehouse on MinIO. Consumers:
+existing Postgres instances (`litellm_db`, `roofix-db`, `sandbox-db`),
+the off-box Phoenix production Postgres (`postgres_phoenix`, read-only
+role, TLS required), plus an Iceberg lakehouse on MinIO. Consumers:
 
 - **Models** — LiteLLM registers `trino-mcp:8080/mcp` alongside the
   Phoenix MCP, so any tool-calling model can run federated SQL.
@@ -141,7 +142,7 @@ Clients that pinned the old fingerprint must re-trust.
 
 | Tool | Purpose |
 |---|---|
-| `list_catalogs()` | Every catalog Trino sees — `iceberg`, `postgres_litellm`, `postgres_roofix`, `postgres_sandbox`, `system` |
+| `list_catalogs()` | Every catalog Trino sees — `iceberg`, `postgres_litellm`, `postgres_phoenix`, `postgres_roofix`, `postgres_sandbox`, `system` |
 | `list_schemas(catalog)` | Schemas under a catalog |
 | `list_tables(catalog, schema)` | Tables under a schema |
 | `describe_table(catalog, schema, table)` | `[{"name":…, "type":…}, …]` |

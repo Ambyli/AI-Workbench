@@ -53,7 +53,11 @@ services:
     networks:
       - analytics_net
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${HMS_DB_USER:-hive}"]
+      # Pass -d explicitly: pg_isready defaults the database name to the
+      # user name, and there is no database called "hive" here — only
+      # "metastore". Without -d the check still passes but Postgres logs
+      # `FATAL: database "hive" does not exist` every 10 s.
+      test: ["CMD-SHELL", "pg_isready -U ${HMS_DB_USER:-hive} -d ${HMS_DB_NAME:-metastore}"]
       interval: 10s
       timeout: 3s
       retries: 5

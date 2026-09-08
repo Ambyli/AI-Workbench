@@ -239,6 +239,12 @@ services:
       PHOENIX_DB_USER: ${PHOENIX_DB_USER}
       PHOENIX_DB_PASSWORD: ${PHOENIX_DB_PASSWORD}
       PHOENIX_DB_SSLMODE: ${PHOENIX_DB_SSLMODE:-require}
+    # host.docker.internal is NOT defined by default on Linux Docker (only
+    # Docker Desktop injects it). host-gateway maps it to the bridge
+    # gateway IP so the postgres_litellm / postgres_sandbox catalogs can
+    # reach the host-published ports 5432 / 5434.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     networks:
       - shared
       - analytics_net

@@ -50,11 +50,12 @@ async def list_catalogs() -> list[str]:
     """Return every catalog Trino can query. Call this first when you
     don't know which data source holds the answer.
 
-    Typical result: ``["iceberg", "postgres_litellm", "postgres_phoenix",
-    "postgres_roofix", "postgres_sandbox", "system"]``. ``iceberg`` is
-    the lakehouse on MinIO; the ``postgres_*`` entries federate the
-    subsystem Postgres instances plus the Phoenix production DB, all
-    read-only.
+    Typical result: ``["ai_agents", "iceberg", "postgres_litellm",
+    "postgres_phoenix", "postgres_roofix", "postgres_sandbox",
+    "system"]``. ``iceberg`` is the lakehouse on MinIO; the
+    ``postgres_*`` entries federate the subsystem Postgres instances plus
+    the Phoenix production DB; ``ai_agents`` is the Supabase Postgres for
+    the AI agents project. All read-only.
     """
     log.info("MCP tool call: list_catalogs")
     _, rows = _client.execute("SHOW CATALOGS")

@@ -142,7 +142,7 @@ Clients that pinned the old fingerprint must re-trust.
 
 | Tool | Purpose |
 |---|---|
-| `list_catalogs()` | Every catalog Trino sees — `iceberg`, `postgres_litellm`, `postgres_phoenix`, `postgres_roofix`, `postgres_sandbox`, `system` |
+| `list_catalogs()` | Every catalog Trino sees — `ai_agents`, `iceberg`, `postgres_litellm`, `postgres_phoenix`, `postgres_roofix`, `postgres_sandbox`, `system` |
 | `list_schemas(catalog)` | Schemas under a catalog |
 | `list_tables(catalog, schema)` | Tables under a schema |
 | `describe_table(catalog, schema, table)` | `[{"name":…, "type":…}, …]` |

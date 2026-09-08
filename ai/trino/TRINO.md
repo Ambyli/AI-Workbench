@@ -142,7 +142,7 @@ Clients that pinned the old fingerprint must re-trust.
 
 | Tool | Purpose |
 |---|---|
-| `list_catalogs()` | Every catalog Trino sees — `ai_agents`, `iceberg`, `postgres_litellm`, `postgres_phoenix`, `postgres_roofix`, `postgres_sandbox`, `system` |
+| `list_catalogs()` | Every catalog Trino sees — `ai_agents`, `enerflo_leads`, `iceberg`, `postgres_litellm`, `postgres_phoenix`, `postgres_roofix`, `postgres_sandbox`, `system` |
 | `list_schemas(catalog)` | Schemas under a catalog |
 | `list_tables(catalog, schema)` | Tables under a schema |
 | `describe_table(catalog, schema, table)` | `[{"name":…, "type":…}, …]` |
@@ -155,16 +155,140 @@ tool_call, hits `trino-mcp`'s HTTP endpoint, and sends the result back.
 
 ## Adding a catalog
 
-Drop a `.properties` file in `ai/trino/catalogs/`, then:
+A catalog is one `.properties` file in `ai/trino/catalogs/`. The
+filename (minus `.properties`) becomes the catalog name in SQL, so
+`enerflo_leads.properties` is queried as
+`enerflo_leads.<schema>.<table>`. Every catalog is visible to every
+Trino login and to `trino-mcp` — there is no per-catalog access control
+yet (see [Follow-ups](#follow-ups)).
+
+### Checklist
+
+Four files change for a catalog that needs credentials. Do them together
+— a missing step fails only at query time, with an unhelpful error.
+
+| # | File | What |
+|---|---|---|
+| 1 | `ai/trino/catalogs/<name>.properties` | Connector + connection settings. Reference secrets as `${ENV:VAR}`, never inline. |
+| 2 | `ai/trino/docker-compose.trino.yml` | Add each `VAR: ${VAR}` to `trino-coordinator` → `environment:`. `${ENV:VAR}` resolves against the **container** env, not `.env` directly. Skipping this makes the var resolve to empty → auth failure. |
+| 3 | `.env` | Real values, in the `## Trino data lake` block. Note `.env` is gitignored — the box's copy must be edited too. |
+| 4 | `.env.example` | Same keys, placeholder values (`change-me`). Keep the two files' variable lists identical. |
+
+Then, because the container's environment changed, **recreate** rather
+than restart:
 
 ```bash
-docker compose -f ai/trino/docker-compose.trino.yml restart trino-coordinator
+make up trino trino-coordinator      # picks up env + new catalog file
 ```
 
-Example — real S3:
+`docker compose restart trino-coordinator` is enough only when you edit
+an existing `.properties` file without touching env vars.
+
+Also add the new name to the `list_catalogs()` row in
+[MCP tools](#mcp-tools) and the docstring in `ai/trino/mcp/server.py` so
+models get an accurate hint.
+
+### Naming
+
+- Underscores only. A hyphen (`my-db`) is legal on disk but
+  `my-db.public.t` is a lex error in SQL.
+- Don't shadow `system` or `information_schema`.
+- Convention so far: `postgres_<subsystem>` for our own compose-managed
+  DBs (`postgres_litellm`, `postgres_roofix`, `postgres_sandbox`,
+  `postgres_phoenix`), a plain business name for external data
+  (`ai_agents`, `enerflo_leads`).
+
+### Reaching the database
+
+Pick the host form by where the target lives. Getting this wrong is the
+most common failure and shows up as `The connection attempt failed` with
+either an unresolvable hostname or `Network is unreachable` at the
+bottom of the stack trace.
+
+| Target lives… | `connection-url` host | Example |
+|---|---|---|
+| On `ai_shared` (any compose service that joins it) | Docker service DNS | `roofix-db:5432` |
+| On an isolated Docker network (`litellm`'s `internal`, sandbox's `sandbox_state`) | `host.docker.internal:<host-published-port>` | `host.docker.internal:5434` |
+| Off-box (Supabase, RDS, a partner DB) | Public hostname | `aws-1-us-east-1.pooler.supabase.com:5432` |
+
+`host.docker.internal` works because the coordinator has
+`extra_hosts: host.docker.internal:host-gateway` — Linux Docker does not
+define it by default. Do **not** attach `trino-coordinator` to another
+subsystem's internal network just to reach its DB; that breaches the
+isolation those networks exist for (see `ai/sandbox/SANDBOX.md`). The
+operator can sever a `host.docker.internal` read path by unpublishing
+the port in `.env`.
+
+### Hosted Postgres gotchas
+
+Learned the hard way on `postgres_phoenix`, `ai_agents`, and
+`enerflo_leads`:
+
+- **TLS.** Managed Postgres (Supabase, Phoenix, RDS) rejects plaintext.
+  Append `?sslmode=require` to the JDBC URL — the driver defaults to no
+  SSL. We parameterise it as `?sslmode=${ENV:<NAME>_DB_SSLMODE}` with a
+  `require` default in compose.
+- **Supabase is IPv6-only on the direct host.** `db.<ref>.supabase.co`
+  publishes an AAAA record and nothing else; the box has no IPv6 route,
+  so you get `Network is unreachable`. Use the **session pooler**
+  instead: host `aws-N-<region>.pooler.supabase.com`, port `5432`, user
+  `postgres.<project-ref>`. Not port 6543 — that is transaction mode and
+  breaks the JDBC driver's prepared statements. The dashboard's
+  Connect → Session pooler panel shows the exact values.
+- **`$` in passwords.** Compose interpolates `.env` values, so `ab$cd`
+  becomes `ab` plus an empty variable `cd` (with a
+  `WARN … variable is not set` line). Write a literal `$` as `$$`.
+- **`#` in usernames** (Phoenix's `zeo.mcp#ro-phoenix-prod`) is fine in
+  `.properties` and compose. If you ever paste the URL into DBeaver by
+  hand, encode it as `%23`.
+- **Use a read-only role** in the properties file wherever the source
+  offers one. `trino-mcp` is SELECT-only, but a DBeaver login is not —
+  the DB-side role is what actually stops a write.
+
+### Templates
+
+**Postgres — compose-managed, on `ai_shared`:**
 
 ```properties
-# ai/trino/catalogs/s3_prod.properties
+connector.name=postgresql
+connection-url=jdbc:postgresql://<service>:5432/${ENV:X_DB_NAME}
+connection-user=${ENV:X_DB_USER}
+connection-password=${ENV:X_DB_PASSWORD}
+```
+
+**Postgres — hosted / off-box (Supabase, RDS, partner):**
+
+```properties
+connector.name=postgresql
+connection-url=jdbc:postgresql://${ENV:X_DB_HOST}:${ENV:X_DB_PORT}/${ENV:X_DB_NAME}?sslmode=${ENV:X_DB_SSLMODE}
+connection-user=${ENV:X_DB_USER}
+connection-password=${ENV:X_DB_PASSWORD}
+```
+
+with, in `docker-compose.trino.yml` under `trino-coordinator` →
+`environment:`:
+
+```yaml
+X_DB_HOST: ${X_DB_HOST}
+X_DB_PORT: ${X_DB_PORT:-5432}
+X_DB_NAME: ${X_DB_NAME:-postgres}
+X_DB_USER: ${X_DB_USER}
+X_DB_PASSWORD: ${X_DB_PASSWORD}
+X_DB_SSLMODE: ${X_DB_SSLMODE:-require}
+```
+
+**MySQL:**
+
+```properties
+connector.name=mysql
+connection-url=jdbc:mysql://${ENV:X_DB_HOST}:3306
+connection-user=${ENV:X_DB_USER}
+connection-password=${ENV:X_DB_PASSWORD}
+```
+
+**Iceberg on real S3** (shares our Hive Metastore):
+
+```properties
 connector.name=iceberg
 iceberg.catalog.type=hive_metastore
 hive.metastore.uri=thrift://hive-metastore:9083
@@ -174,10 +298,28 @@ s3.aws-access-key=${ENV:PROD_S3_ACCESS_KEY}
 s3.aws-secret-key=${ENV:PROD_S3_SECRET_KEY}
 ```
 
-Then add `PROD_S3_ACCESS_KEY` / `PROD_S3_SECRET_KEY` under the
-Trino data lake block in `.env` and reference them from the coordinator's
-`environment:` in `docker-compose.trino.yml` so they land in the
-container ENV `${ENV:...}` resolves against.
+Other first-party connectors (BigQuery, Snowflake, Redshift, ClickHouse,
+MongoDB, Kafka, Delta Lake, …) follow the same shape — `connector.name`
+from the [Trino connector index](https://trino.io/docs/current/connector.html),
+then per-connector keys. Anything that needs a credentials *file* (e.g.
+BigQuery's service-account JSON) also needs a read-only volume mount on
+the coordinator.
+
+### Verifying
+
+```bash
+# env made it into the container (should print the real value)
+docker exec trino-coordinator printenv X_DB_PASSWORD
+
+# catalog loaded + reachable
+docker exec -it trino-coordinator trino --execute "SHOW SCHEMAS FROM <name>"
+```
+
+If `SHOW CATALOGS` lists it but `SHOW SCHEMAS` fails, the file is fine
+and the problem is network or credentials — read the last line of the
+error, it names the real cause (`host.docker.internal` → missing
+`extra_hosts`; `Network is unreachable` → IPv6-only host; `password
+authentication failed` → wrong secret or unescaped `$`).
 
 ## Header-auth trust boundary
 
@@ -229,6 +371,12 @@ integrity, serde info shape); a manual UPDATE will silently break
   `SSLVerification=NONE` or a pinned `trino.crt`. Replace `tls/trino.pem`
   in the `trino_auth` volume with a CA-issued key+cert PEM when there is
   a stable hostname for the box.
+- **Per-catalog access control** — every `TRINO_JDBC_USERS` login and
+  `trino-mcp` can read every catalog, including Phoenix production and
+  the Supabase projects. Trino's file-based access control
+  (`access-control.name=file` + a `rules.json` mapping users/groups to
+  catalogs and schemas) is the cheap fix once some sources need to be
+  restricted to some people.
 - **Move internal clients to HTTPS** — `trino-mcp`, Superset, and
   `init_warehouse.py` still use the username-only HTTP listener. Giving
   them a service account in `TRINO_JDBC_USERS` and `verify=/etc/trino/auth/tls/trino.crt`

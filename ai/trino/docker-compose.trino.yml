@@ -247,6 +247,14 @@ services:
       AI_AGENTS_DB_USER: ${AI_AGENTS_DB_USER:-postgres}
       AI_AGENTS_DB_PASSWORD: ${AI_AGENTS_DB_PASSWORD}
       AI_AGENTS_DB_SSLMODE: ${AI_AGENTS_DB_SSLMODE:-require}
+      # Supabase Postgres holding Enerflo lead data (off-box, TLS
+      # required). Consumed by catalogs/enerflo_leads.properties.
+      ENERFLO_LEADS_DB_HOST: ${ENERFLO_LEADS_DB_HOST}
+      ENERFLO_LEADS_DB_PORT: ${ENERFLO_LEADS_DB_PORT:-5432}
+      ENERFLO_LEADS_DB_NAME: ${ENERFLO_LEADS_DB_NAME:-postgres}
+      ENERFLO_LEADS_DB_USER: ${ENERFLO_LEADS_DB_USER}
+      ENERFLO_LEADS_DB_PASSWORD: ${ENERFLO_LEADS_DB_PASSWORD}
+      ENERFLO_LEADS_DB_SSLMODE: ${ENERFLO_LEADS_DB_SSLMODE:-require}
     # host.docker.internal is NOT defined by default on Linux Docker (only
     # Docker Desktop injects it). host-gateway maps it to the bridge
     # gateway IP so the postgres_litellm / postgres_sandbox catalogs can

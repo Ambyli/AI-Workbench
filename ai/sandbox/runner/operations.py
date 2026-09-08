@@ -46,6 +46,18 @@ import state
 log = logging.getLogger("sandbox-runner.operations")
 
 
+# asyncpg raises UniqueViolationError when the partial UNIQUE index
+# ``jobs_chat_id_active_uniq`` rejects a second active row for one chat_id —
+# that's the atomic backstop the one-sandbox-per-chat guard relies on. Import
+# defensively so this module still imports in unit environments where asyncpg
+# isn't installed (the real runner always has it).
+try:  # pragma: no cover - trivial import shim
+    from asyncpg.exceptions import UniqueViolationError as _UniqueViolationError
+except Exception:  # asyncpg missing/stubbed
+    class _UniqueViolationError(Exception):
+        """Fallback so ``except _UniqueViolationError`` is always valid."""
+
+
 # ── Browser-log rate limiter (module-scoped, in-process) ─────────────────
 # Keyed by sandbox_id. Each entry is a deque of monotonic timestamps
 # (seconds). We prune the head on every ingest so the window slides.
@@ -369,31 +381,68 @@ async def _do_create(
             "runtime=node if you need to run a specific command.",
         )
 
-    # Concurrency gate — matches the spawn path in _reuse_or_spawn.
-    try:
-        await asyncio.wait_for(state.slot_sem.acquire(), timeout=0.1)
-    except asyncio.TimeoutError:
-        raise HTTPException(429, "sandbox pool exhausted")
-
     session_id = _new_session_id()
     ttl = min(ttl_seconds or DEFAULT_TTL_S, HARD_TTL_S)
     expires_at = datetime.now(timezone.utc) + timedelta(seconds=ttl)
     now_iso = _now_iso()
+    reserve_meta = {
+        "runtime": runtime,
+        "entrypoint": entrypoint or rt.default_entrypoint,
+        "ttl_seconds": ttl,
+        "expires_at": expires_at.isoformat(),
+        "session_id": session_id,
+        "chat_id": chat_id,
+        "last_used_at": now_iso,
+        "env": env or {},
+        "warmed": True,
+    }
 
-    sandbox_id = await state.registry.register(
-        {
-            "runtime": runtime,
-            "entrypoint": entrypoint or rt.default_entrypoint,
-            "ttl_seconds": ttl,
-            "expires_at": expires_at.isoformat(),
-            "session_id": session_id,
-            "chat_id": chat_id,
-            "last_used_at": now_iso,
-            "env": env or {},
-            "warmed": True,
-        },
-        initial_phase="spawning",
-    )
+    # Atomically reserve the chat's one active slot. The pre-check above catches
+    # the common "created twice, seconds apart" case cheaply; THIS is the
+    # backstop for the sub-millisecond race where two creates both pass the
+    # SELECT. The partial UNIQUE index ``jobs_chat_id_active_uniq`` makes the
+    # INSERT the point of mutual exclusion — the loser's register() raises
+    # UniqueViolationError, and we hand back the winner instead of spawning a
+    # second container. The slot is taken per attempt and released if we lose,
+    # so a prevented duplicate still costs nothing. (No chat_id => the indexed
+    # expression is NULL => rows are distinct => unscoped creates never collide.)
+    sandbox_id: Optional[str] = None
+    for _attempt in range(2):
+        try:
+            await asyncio.wait_for(state.slot_sem.acquire(), timeout=0.1)
+        except asyncio.TimeoutError:
+            raise HTTPException(429, "sandbox pool exhausted")
+        try:
+            sandbox_id = await state.registry.register(
+                reserve_meta, initial_phase="spawning"
+            )
+            break
+        except _UniqueViolationError:
+            state.slot_sem.release()
+            existing = (
+                await _find_active_session_by_chat(chat_id) if chat_id else None
+            )
+            if existing:
+                log.info(
+                    "create: chat=%s lost the spawn race to sandbox=%s — "
+                    "returning it instead of spawning a duplicate",
+                    chat_id, existing["sandbox_id"],
+                )
+                return _existing_session_as_create_response(existing, chat_id)
+            # The winner was torn down in the same instant it won — retry once.
+            log.warning(
+                "create: chat=%s hit a unique-violation but found no active "
+                "row; retrying reservation once",
+                chat_id,
+            )
+    if sandbox_id is None:
+        raise HTTPException(
+            409,
+            {
+                "error": "could not reserve a sandbox for this chat — retry",
+                "chat_id": chat_id,
+            },
+        )
     log.info(
         "create: session=%s sandbox=%s runtime=%s ttl=%ds chat=%s",
         session_id, sandbox_id, runtime, ttl, chat_id,
@@ -1318,32 +1367,74 @@ async def _reuse_or_spawn(
             },
         )
 
-    try:
-        await asyncio.wait_for(state.slot_sem.acquire(), timeout=0.1)
-    except asyncio.TimeoutError:
-        log.warning(
-            "sandbox pool exhausted (MAX_CONCURRENT=%d), rejecting session=%s",
-            MAX_CONCURRENT, session_id,
-        )
-        raise HTTPException(429, "sandbox pool exhausted")
-
     ttl = min(ttl_seconds or DEFAULT_TTL_S, HARD_TTL_S)
     expires_at = datetime.now(timezone.utc) + timedelta(seconds=ttl)
     now_iso = _now_iso()
+    reserve_meta = {
+        "runtime": runtime,
+        "entrypoint": entrypoint or rt.default_entrypoint,
+        "ttl_seconds": ttl,
+        "expires_at": expires_at.isoformat(),
+        "session_id": session_id,
+        "chat_id": chat_id,
+        "last_used_at": now_iso,
+        "env": env or {},
+    }
 
-    sandbox_id = await state.registry.register(
-        {
-            "runtime": runtime,
-            "entrypoint": entrypoint or rt.default_entrypoint,
-            "ttl_seconds": ttl,
-            "expires_at": expires_at.isoformat(),
-            "session_id": session_id,
-            "chat_id": chat_id,
-            "last_used_at": now_iso,
-            "env": env or {},
-        },
-        initial_phase="spawning",
-    )
+    # Atomically reserve the chat's active slot (same UNIQUE-index backstop as
+    # _do_create). If a concurrent run for this chat won the race, we lose the
+    # INSERT and route onto the winner instead of spawning a rival: overlay our
+    # files if it's already running, otherwise hand back its (still-warming)
+    # session so the caller keeps iterating on the one container.
+    sandbox_id: Optional[str] = None
+    for _attempt in range(2):
+        try:
+            await asyncio.wait_for(state.slot_sem.acquire(), timeout=0.1)
+        except asyncio.TimeoutError:
+            log.warning(
+                "sandbox pool exhausted (MAX_CONCURRENT=%d), rejecting session=%s",
+                MAX_CONCURRENT, session_id,
+            )
+            raise HTTPException(429, "sandbox pool exhausted")
+        try:
+            sandbox_id = await state.registry.register(
+                reserve_meta, initial_phase="spawning"
+            )
+            break
+        except _UniqueViolationError:
+            state.slot_sem.release()
+            winner = (
+                await _find_active_session_by_chat(chat_id) if chat_id else None
+            )
+            if winner and winner.get("phase") == "running" and winner.get(
+                "container_name"
+            ):
+                log.info(
+                    "run: chat=%s lost the spawn race — overlaying files onto "
+                    "the winner sandbox=%s",
+                    chat_id, winner["sandbox_id"],
+                )
+                return await _apply_files_to_running(winner, files, deletes)
+            if winner:
+                log.info(
+                    "run: chat=%s lost the spawn race to still-warming "
+                    "sandbox=%s — returning it",
+                    chat_id, winner["sandbox_id"],
+                )
+                return _existing_session_as_create_response(winner, chat_id)
+            log.warning(
+                "run: chat=%s hit a unique-violation but found no active row; "
+                "retrying reservation once",
+                chat_id,
+            )
+    if sandbox_id is None:
+        raise HTTPException(
+            409,
+            {
+                "error": "could not reserve a sandbox for this chat — retry",
+                "chat_id": chat_id,
+            },
+        )
 
     log.info(
         "spawn path: session=%s sandbox=%s runtime=%s ttl=%ds entrypoint=%r "

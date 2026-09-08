@@ -387,17 +387,24 @@ async def _ensure_session_index(registry: PostgresRegistry) -> None:
             "ON jobs ((metadata->>'session_id')) "
             "WHERE phase = 'running'"
         )
-        # Backs the one-create-per-chat guard (_find_active_session_by_chat).
-        # Indexes the spawning/starting/running window — the phases that count
-        # as "this chat already has a create" — not every historical job row.
+        # Enforces one-sandbox-per-chat ATOMICALLY. A partial UNIQUE index over
+        # the active phases (spawning/starting/running) means two concurrent
+        # creates for the same chat can't both insert an active row — the
+        # loser's INSERT raises UniqueViolationError, which operations._do_create
+        # / _reuse_or_spawn convert into "return the winner". This closes the
+        # check-then-insert race the plain SELECT lookup can't. Multiple rows
+        # with a NULL chat_id are fine (NULLs are distinct in a UNIQUE index),
+        # so unscoped sandboxes are unaffected. DROP the older NON-unique index
+        # a previous build may have created, then create the unique one.
+        await conn.execute("DROP INDEX IF EXISTS jobs_chat_id_active")
         await conn.execute(
-            "CREATE INDEX IF NOT EXISTS jobs_chat_id_active "
+            "CREATE UNIQUE INDEX IF NOT EXISTS jobs_chat_id_active_uniq "
             "ON jobs ((metadata->>'chat_id')) "
             "WHERE phase IN ('spawning', 'starting', 'running')"
         )
     log.info(
         "session lookup indexes ensured "
-        "(jobs_session_id_running, jobs_chat_id_active)"
+        "(jobs_session_id_running, jobs_chat_id_active_uniq)"
     )
 
 

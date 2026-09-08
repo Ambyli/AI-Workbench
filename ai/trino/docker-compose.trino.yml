@@ -4,7 +4,11 @@
 # roofix-db, sandbox-db) plus an Iceberg lakehouse on MinIO. Consumers:
 #   * models via LiteLLM MCP (mcp_servers.trino → trino-mcp:8080/mcp)
 #   * humans via Superset behind oauth2-proxy (/superset/*)
-#   * external BI tools via JDBC on PORT_TRINO (LAN-only for now)
+#   * external BI tools via JDBC on PORT_TRINO — HTTPS + password auth.
+#     trino-auth-init (one-shot) generates the self-signed cert and the
+#     bcrypt password.db from TRINO_JDBC_USERS; plain HTTP :8080 is never
+#     published (container-network clients only). TRINO.md § JDBC
+#     authentication.
 #
 # Two networks:
 #   shared         (external, ai_shared)   trino-coordinator / minio / superset
@@ -152,6 +156,30 @@ services:
       echo 'warehouse bucket ready'
       "
 
+  # ── One-shot: TLS keystore + password.db for the coordinator ───────────
+  # Writes into the trino_auth volume (mounted read-only by the
+  # coordinator at /etc/trino/auth):
+  #   tls/trino.pem  key + self-signed cert   (generated once)
+  #   tls/trino.crt  cert only, for DBeaver truststores
+  #   password.db    bcrypt lines from TRINO_JDBC_USERS (rebuilt every run)
+  # Editing TRINO_JDBC_USERS + `make up trino trino-auth-init` rotates
+  # credentials live — the coordinator re-reads password.db every 5 s.
+  # No network: it only touches the volume.
+  trino-auth-init:
+    build:
+      context: ./auth-init
+      dockerfile: Dockerfile
+    container_name: trino-auth-init
+    network_mode: none
+    environment:
+      TRINO_JDBC_USERS: ${TRINO_JDBC_USERS:?Set TRINO_JDBC_USERS in .env as user:password[,user2:password2] — see ai/trino/TRINO.md § JDBC authentication}
+      # Add the box's LAN IP / hostname so DBeaver can verify the cert
+      # instead of falling back to SSLVerification=NONE. Only consulted
+      # when tls/trino.pem does not exist yet.
+      TRINO_TLS_SANS: ${TRINO_TLS_SANS:-DNS:trino-coordinator,DNS:localhost,IP:127.0.0.1}
+    volumes:
+      - trino_auth:/auth
+
   # ── Trino coordinator (also the sole worker for now) ───────────────────
   # Single-node cluster. If we grow to multi-node, add a `trino-worker`
   # service with `node.properties.node.role=worker`, drop the coordinator's
@@ -167,13 +195,22 @@ services:
     container_name: trino-coordinator
     restart: unless-stopped
     ports:
-      - "${PORT_TRINO:-8013}:8080"
+      # HTTPS + password auth. The plain-HTTP listener on 8080 is
+      # deliberately NOT published — it authenticates by username only
+      # and exists for trino-mcp / superset inside the Docker networks.
+      - "${PORT_TRINO:-8013}:8443"
     volumes:
       - ./catalogs:/etc/trino/catalog:ro
       - ./config/config.properties:/etc/trino/config.properties:ro
       - ./config/jvm.config:/etc/trino/jvm.config:ro
       - ./config/node.properties:/etc/trino/node.properties:ro
+      - ./config/password-authenticator.properties:/etc/trino/password-authenticator.properties:ro
+      # tls/trino.pem + password.db from trino-auth-init.
+      - trino_auth:/etc/trino/auth:ro
     environment:
+      # Node-to-node secret; mandatory once client auth is enabled.
+      # Referenced from config.properties as ${ENV:TRINO_SHARED_SECRET}.
+      TRINO_SHARED_SECRET: ${TRINO_SHARED_SECRET:?Set TRINO_SHARED_SECRET in .env (openssl rand -hex 32)}
       HMS_URI: thrift://hive-metastore:9083
       MINIO_ENDPOINT: http://minio:9000
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-trino}
@@ -195,10 +232,14 @@ services:
     depends_on:
       hive-metastore:
         condition: service_healthy
+      trino-auth-init:
+        condition: service_completed_successfully
     healthcheck:
       # Trino exposes /v1/info as soon as the coordinator is up. That's
       # earlier than /v1/status which requires the discovery loop to
-      # complete on a single-node cluster.
+      # complete on a single-node cluster. Stays on the internal HTTP
+      # listener — /v1/info is a public resource and 8080 accepts
+      # username-only auth (allow-insecure-over-http in config.properties).
       test: ["CMD-SHELL", "curl -fsS http://localhost:8080/v1/info || exit 1"]
       interval: 15s
       timeout: 3s
@@ -302,3 +343,7 @@ volumes:
   hive_metastore_db_data:
   minio_data:
   superset_db_data:
+  # TLS keystore + password.db written by trino-auth-init, read by the
+  # coordinator. Safe to delete — regenerates on next `up` (clients that
+  # pinned the old cert fingerprint will need to re-trust).
+  trino_auth:

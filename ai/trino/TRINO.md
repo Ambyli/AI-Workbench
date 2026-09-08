@@ -10,12 +10,14 @@ plus an Iceberg lakehouse on MinIO. Consumers:
 - **Humans** — Superset at `chat.zeoenergy.com/superset/` behind
   oauth2-proxy.
 - **External BI tools** — Trino JDBC on `PORT_TRINO` (default 8013),
-  LAN-only for now.
+  HTTPS + password auth. See [§ JDBC authentication](#jdbc-authentication).
 
 ## Quick start
 
 ```bash
 docker network create ai_shared    # once, if you haven't already
+# .env must have TRINO_JDBC_USERS (user:password[,…]) and TRINO_SHARED_SECRET
+# (openssl rand -hex 32) set — compose refuses to start without them.
 docker compose -f ai/trino/docker-compose.trino.yml up -d --build
 # seed the Iceberg lakehouse with a demo table
 docker compose -f ai/trino/docker-compose.trino.yml exec trino-mcp \
@@ -23,8 +25,8 @@ docker compose -f ai/trino/docker-compose.trino.yml exec trino-mcp \
 ```
 
 Rough startup order: `hive-metastore-db` → `minio` → `minio-init`
-(one-shot) → `hive-metastore` → `trino-coordinator` → `trino-mcp` /
-`superset`. The compose file's `depends_on: service_healthy` /
+(one-shot) → `hive-metastore` → `trino-auth-init` (one-shot) →
+`trino-coordinator` → `trino-mcp` / `superset`. The compose file's `depends_on: service_healthy` /
 `service_completed_successfully` conditions handle it; on a cold boot
 the whole stack takes ~90 s.
 
@@ -32,14 +34,106 @@ the whole stack takes ~90 s.
 
 | Service | Endpoint | Notes |
 |---|---|---|
-| Trino web UI | `http://localhost:8013/ui/` | LAN-only; no auth yet |
-| Trino JDBC | `jdbc:trino://localhost:8013?user=<yours>` | For DBeaver / DataGrip |
+| Trino web UI | `https://<host>:8013/ui/` | Self-signed cert; log in with a `TRINO_JDBC_USERS` account |
+| Trino JDBC | `jdbc:trino://<host>:8013?SSL=true&SSLVerification=NONE` | For DBeaver / DataGrip — see [§ JDBC authentication](#jdbc-authentication) |
+| Trino HTTP (internal) | `http://trino-coordinator:8080` | Container networks only, never published; username-only auth for `trino-mcp` / Superset |
 | MinIO API | `http://localhost:8014` | S3-compatible |
 | MinIO console | `https://chat.zeoenergy.com/minio/` | Behind oauth2-proxy |
 | Superset | `https://chat.zeoenergy.com/superset/` | Behind oauth2-proxy |
 | trino-mcp | `http://trino-mcp:8080/mcp` | Internal only, registered with LiteLLM |
 | HMS Postgres | `psql -h localhost -p 5436 -U hive metastore` | Operator inspection only |
 | Superset Postgres | `psql -h localhost -p 5437 -U superset superset` | Operator inspection only |
+
+## JDBC authentication
+
+The coordinator runs two listeners with different trust models:
+
+| Listener | Published? | Auth | Who uses it |
+|---|---|---|---|
+| `:8443` HTTPS | yes — `PORT_TRINO` (8013) | password file (bcrypt) | DBeaver, DataGrip, web UI, laptops |
+| `:8080` HTTP | **no** | username only (`allow-insecure-over-http`) | `trino-mcp`, Superset, `init_warehouse.py`, healthcheck |
+
+Trino disables HTTP entirely once HTTPS + an authenticator are on;
+`http-server.authentication.allow-insecure-over-http=true` in
+`config/config.properties` re-enables it with the insecure (username-only)
+authenticator. That is the same trust posture every other service on
+`ai_shared` already has, and it is only safe because 8080 is never
+published on the host. **Do not add an 8080 port mapping.**
+
+### Accounts
+
+Users live in `TRINO_JDBC_USERS` in `.env` as
+`user:password[,user2:password2]`. The one-shot `trino-auth-init`
+service bcrypt-hashes them into `password.db` inside the `trino_auth`
+volume every time it runs. To add or rotate:
+
+```bash
+# edit TRINO_JDBC_USERS in .env, then re-run just the init container
+make up trino trino-auth-init
+```
+
+The coordinator re-reads `password.db` every 5 s
+(`file.refresh-period`) — no restart. Passwords may not contain `,`, `:`
+or whitespace.
+
+### DBeaver / DataGrip
+
+New connection → **Trino** driver:
+
+| Field | Value |
+|---|---|
+| Host | the Docker host's LAN IP or hostname |
+| Port | `8013` |
+| Username / Password | an entry from `TRINO_JDBC_USERS` |
+| Driver property `SSL` | `true` |
+| Driver property `SSLVerification` | `NONE` (self-signed cert) |
+
+Equivalent URL form:
+
+```
+jdbc:trino://<host>:8013?SSL=true&SSLVerification=NONE
+```
+
+The JDBC driver refuses to send a password over plain HTTP, so `SSL=true`
+is mandatory — a connection without it fails with "Authentication using
+username/password requires SSL to be enabled".
+
+To verify the cert instead of skipping verification, export it and point
+the driver at it (PEM is accepted directly):
+
+```bash
+docker cp trino-coordinator:/etc/trino/auth/tls/trino.crt ./trino.crt
+# DBeaver → Driver properties: SSLVerification=FULL, SSLTrustStorePath=/path/to/trino.crt
+```
+
+Full verification only works if the host you connect to is in the cert's
+SANs — add `IP:<lan-ip>` / `DNS:<hostname>` to `TRINO_TLS_SANS` *before*
+the first `up`, or rotate the cert (below).
+
+### Trino CLI
+
+```bash
+# inside the container, over the internal HTTP listener (no password)
+docker exec -it trino-coordinator trino
+
+# from anywhere on the LAN, over HTTPS
+docker exec -it trino-coordinator trino \
+    --server https://localhost:8443 --insecure --user analyst --password
+```
+
+### Rotating the TLS cert
+
+`trino-auth-init` generates `tls/trino.pem` once and reuses it. To
+regenerate (e.g. after adding SANs):
+
+```bash
+docker compose -f ai/trino/docker-compose.trino.yml run --rm --entrypoint sh \
+    trino-auth-init -c 'rm -f /auth/tls/trino.pem /auth/tls/trino.crt'
+make up trino trino-auth-init
+docker compose -f ai/trino/docker-compose.trino.yml restart trino-coordinator
+```
+
+Clients that pinned the old fingerprint must re-trust.
 
 ## MCP tools
 
@@ -125,11 +219,19 @@ integrity, serde info shape); a manual UPDATE will silently break
 | `hive_metastore_db_data` | HMS's own tables (DBS, TBLS, …) | Never — this maps schema names to Parquet locations |
 | `minio_data` | The actual Parquet files under `warehouse/` | Only after export |
 | `superset_db_data` | Superset dashboards, saved queries, user accounts | Only if you want to start over |
+| `trino_auth` | TLS keystore + `password.db` for the coordinator | Anytime — regenerates on next `up`; BI clients re-trust the new cert |
 
 ## Follow-ups
 
-- **JDBC auth for the Trino coordinator port** — either TCP terminator in
-  front of `PORT_TRINO`, or Trino's built-in password authentication.
+- **Real TLS cert for `PORT_TRINO`** — the coordinator serves a
+  self-signed cert from `trino-auth-init`, so clients need
+  `SSLVerification=NONE` or a pinned `trino.crt`. Replace `tls/trino.pem`
+  in the `trino_auth` volume with a CA-issued key+cert PEM when there is
+  a stable hostname for the box.
+- **Move internal clients to HTTPS** — `trino-mcp`, Superset, and
+  `init_warehouse.py` still use the username-only HTTP listener. Giving
+  them a service account in `TRINO_JDBC_USERS` and `verify=/etc/trino/auth/tls/trino.crt`
+  would let `allow-insecure-over-http` be turned off entirely.
 - **Idle-state teardown for Superset queries** — cancel long-running
   queries when the user disconnects.
 - **Iceberg maintenance** — periodic `optimize`, snapshot expiry,

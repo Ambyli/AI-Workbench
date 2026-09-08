@@ -32,7 +32,6 @@ from constants import (
     GET_FILES_HARD_CAP_BYTES,
     HARD_TTL_S,
     HEALTH_PROBE_TIMEOUT_S,
-    MAX_CONCURRENT,
     PROXY_URL,
     SESSION_ID_RE,
     UPDATE_SETTLE_S,
@@ -149,6 +148,32 @@ def _lint_python_files(files: dict[str, FileContent]) -> list[dict]:
 
 # ── Session lookup helpers ────────────────────────────────────────────────
 
+def _active_pool(where: str):
+    """Return the registry's asyncpg pool, or ``None`` (logging why) when the
+    registry or its pool isn't ready yet. Shared guard for every raw-SQL
+    helper below so the two-line null-check isn't copied at each call site."""
+    if state.registry is None:
+        log.warning("%s called before registry init", where)
+        return None
+    pool = state.registry._pool
+    if pool is None:
+        log.warning("%s: pool not ready", where)
+    return pool
+
+
+def _decode_row(row) -> tuple[dict, dict]:
+    """Split a ``jobs`` row into ``(metadata, result)`` dicts, tolerating the
+    JSONB columns arriving as ``str`` (some asyncpg codec setups) or as an
+    already-decoded ``dict``. ``result`` defaults to ``{}`` when NULL."""
+    meta = row["metadata"]
+    if isinstance(meta, str):
+        meta = json.loads(meta)
+    result = row["result"] or {}
+    if isinstance(result, str):
+        result = json.loads(result)
+    return meta or {}, result
+
+
 async def _find_running_session(session_id: str) -> Optional[dict]:
     """Return the newest running sandbox for a session, if any.
 
@@ -161,12 +186,8 @@ async def _find_running_session(session_id: str) -> Optional[dict]:
     ``container_name`` + ``url`` live in ``result`` (set at
     ``set_result`` time). Both are populated by the time a job's phase
     reaches 'running', so a session lookup is safe to trust."""
-    if state.registry is None:
-        log.warning("_find_running_session called before registry init")
-        return None
-    pool = state.registry._pool
+    pool = _active_pool("_find_running_session")
     if pool is None:
-        log.warning("_find_running_session: pool not ready")
         return None
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -179,12 +200,7 @@ async def _find_running_session(session_id: str) -> Optional[dict]:
     if row is None:
         log.debug("_find_running_session: no running row for %s", session_id)
         return None
-    meta = row["metadata"]
-    if isinstance(meta, str):
-        meta = json.loads(meta)
-    result = row["result"] or {}
-    if isinstance(result, str):
-        result = json.loads(result)
+    meta, result = _decode_row(row)
     log.debug(
         "_find_running_session: session=%s → sandbox=%s container=%s",
         session_id, row["id"], result.get("container_name"),
@@ -221,12 +237,8 @@ async def _find_active_session_by_chat(chat_id: str) -> Optional[dict]:
     once the row reaches 'running'; for a still-warming row they're None and
     callers fall back to the deterministic ``{PROXY_URL}/{sandbox_id}/`` URL.
     """
-    if state.registry is None:
-        log.warning("_find_active_session_by_chat called before registry init")
-        return None
-    pool = state.registry._pool
+    pool = _active_pool("_find_active_session_by_chat")
     if pool is None:
-        log.warning("_find_active_session_by_chat: pool not ready")
         return None
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -240,27 +252,22 @@ async def _find_active_session_by_chat(chat_id: str) -> Optional[dict]:
     if row is None:
         log.debug("_find_active_session_by_chat: no active row for chat=%s", chat_id)
         return None
-    meta = row["metadata"]
-    if isinstance(meta, str):
-        meta = json.loads(meta)
-    result = row["result"] or {}
-    if isinstance(result, str):
-        result = json.loads(result)
+    meta, result = _decode_row(row)
     log.debug(
         "_find_active_session_by_chat: chat=%s → sandbox=%s phase=%s session=%s",
-        chat_id, row["id"], row["phase"], (meta or {}).get("session_id"),
+        chat_id, row["id"], row["phase"], meta.get("session_id"),
     )
     return {
         "sandbox_id": row["id"],
         "phase": row["phase"],
-        "session_id": (meta or {}).get("session_id"),
+        "session_id": meta.get("session_id"),
         "container_name": result.get("container_name"),
         "url": result.get("url"),
-        "expires_at": (meta or {}).get("expires_at"),
-        "runtime": (meta or {}).get("runtime"),
-        "entrypoint": (meta or {}).get("entrypoint"),
-        "ttl_seconds": (meta or {}).get("ttl_seconds"),
-        "env": (meta or {}).get("env") or {},
+        "expires_at": meta.get("expires_at"),
+        "runtime": meta.get("runtime"),
+        "entrypoint": meta.get("entrypoint"),
+        "ttl_seconds": meta.get("ttl_seconds"),
+        "env": meta.get("env") or {},
     }
 
 
@@ -296,9 +303,7 @@ async def _list_running_sessions_rows() -> list[dict]:
     and its HTTP counterpart. Includes every live row across ALL sessions
     globally — until per-user filtering lands, callers are expected to
     reason about global visibility."""
-    if state.registry is None:
-        return []
-    pool = state.registry._pool
+    pool = _active_pool("_list_running_sessions_rows")
     if pool is None:
         return []
     async with pool.acquire() as conn:
@@ -310,24 +315,143 @@ async def _list_running_sessions_rows() -> list[dict]:
         )
     out: list[dict] = []
     for r in rows:
-        meta = r["metadata"]
-        if isinstance(meta, str):
-            meta = json.loads(meta)
-        result = r["result"] or {}
-        if isinstance(result, str):
-            result = json.loads(result)
+        meta, result = _decode_row(r)
         out.append({
-            "session_id": (meta or {}).get("session_id"),
+            "session_id": meta.get("session_id"),
             "sandbox_id": r["id"],
-            "runtime": (meta or {}).get("runtime"),
+            "runtime": meta.get("runtime"),
             "url": result.get("url"),
             "created_at": r["created_at"].isoformat() if r["created_at"] else None,
             "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
-            "expires_at": (meta or {}).get("expires_at"),
-            "last_used_at": (meta or {}).get("last_used_at"),
+            "expires_at": meta.get("expires_at"),
+            "last_used_at": meta.get("last_used_at"),
             "phase": "running",
         })
     return out
+
+
+# ── Spawn helpers shared by _do_create and _reuse_or_spawn ────────────────
+
+def _resolve_runtime(runtime: str, entrypoint: Optional[str]):
+    """Validate the runtime name and the custom-entrypoint rule, returning the
+    runtime spec. Raises ``HTTPException(400)`` with the same messages both
+    spawn paths used to raise inline."""
+    try:
+        rt = get_runtime(runtime)
+    except KeyError:
+        raise HTTPException(
+            400,
+            f"unknown runtime {runtime!r}. Valid: {sorted(RUNTIMES)}. "
+            "Call get_runtime_types for full descriptions.",
+        )
+    if not rt.allows_custom_entrypoint and entrypoint:
+        raise HTTPException(
+            400,
+            f"the {runtime!r} runtime does not accept a custom entrypoint "
+            f"(it uses a fixed process: {rt.default_entrypoint!r}). "
+            "Remove the `entrypoint` field, or switch to runtime=python or "
+            "runtime=node if you need to run a specific command.",
+        )
+    return rt
+
+
+class _LostRace(Exception):
+    """Raised by ``_reserve_active_slot`` when a concurrent create for the same
+    chat won the one-sandbox-per-chat UNIQUE-index race. ``winner`` is that
+    chat's existing active session so the caller can route onto it."""
+
+    def __init__(self, winner: dict) -> None:
+        self.winner = winner
+        super().__init__("lost the chat spawn race")
+
+
+async def _reserve_active_slot(reserve_meta: dict, chat_id: Optional[str]) -> str:
+    """Take a concurrency slot and atomically insert the chat's active job row.
+
+    Returns the new ``sandbox_id``. The partial UNIQUE index
+    ``jobs_chat_id_active_uniq`` is the arbiter: if a concurrent create for the
+    same chat already inserted its active row, ``register()`` raises
+    ``UniqueViolationError`` and we raise ``_LostRace(winner)`` so the caller
+    hands back the winner instead of spawning a rival. The slot is released on
+    a lost race, so a prevented duplicate costs nothing.
+
+    Raises ``HTTPException(429)`` when the pool is exhausted, or ``(409)`` if a
+    violation keeps firing but the winner vanishes on both attempts.
+    """
+    for _attempt in range(2):
+        try:
+            await asyncio.wait_for(state.slot_sem.acquire(), timeout=0.1)
+        except asyncio.TimeoutError:
+            raise HTTPException(429, "sandbox pool exhausted")
+        try:
+            return await state.registry.register(
+                reserve_meta, initial_phase="spawning"
+            )
+        except _UniqueViolationError:
+            state.slot_sem.release()
+            winner = (
+                await _find_active_session_by_chat(chat_id) if chat_id else None
+            )
+            if winner is not None:
+                raise _LostRace(winner)
+            # The winner was torn down in the same instant it won — retry once.
+            log.warning(
+                "chat=%s hit a unique-violation but found no active row; "
+                "retrying reservation once",
+                chat_id,
+            )
+    raise HTTPException(
+        409,
+        {
+            "error": "could not reserve a sandbox for this chat — retry",
+            "chat_id": chat_id,
+        },
+    )
+
+
+async def _await_ready_or_teardown(
+    sandbox_id: str,
+    container_name: str,
+    rt,
+    session_id: str,
+    *,
+    hint: str,
+) -> None:
+    """Mark the sandbox ``starting`` and poll readiness for 30s. On success,
+    return (the caller writes the result). On failure, capture logs, stop the
+    container, mark the job errored, release the slot, and raise
+    ``HTTPException(504)`` with the caller-supplied ``hint``. Shared by both
+    spawn paths so the teardown-on-timeout sequence lives in one place."""
+    await state.registry.set_phase(sandbox_id, "starting")
+    ready = await asyncio.to_thread(
+        state.spawner.readiness_ok,
+        container_name,
+        rt.internal_port,
+        rt.readiness_probe_path,
+        30.0,
+    )
+    if ready:
+        return
+    log.warning(
+        "readiness FAILED: sandbox=%s container=%s did not bind port %d "
+        "within 30s, capturing logs before teardown",
+        sandbox_id, container_name, rt.internal_port,
+    )
+    logs = await asyncio.to_thread(state.spawner.tail_logs, container_name, 100)
+    await asyncio.to_thread(state.spawner.stop, container_name)
+    await state.registry.set_error(
+        sandbox_id, "sandbox did not become ready within 30s\n\n" + logs
+    )
+    state.slot_sem.release()
+    raise HTTPException(
+        504,
+        {
+            "error": "sandbox did not become ready within 30s",
+            "session_id": session_id,
+            "logs": logs,
+            "hint": hint,
+        },
+    )
 
 
 # ── Core operations (used by both HTTP and MCP tools) ─────────────────────
@@ -363,23 +487,7 @@ async def _do_create(
             )
             return _existing_session_as_create_response(existing, chat_id)
 
-    try:
-        rt = get_runtime(runtime)
-    except KeyError:
-        raise HTTPException(
-            400,
-            f"unknown runtime {runtime!r}. Valid: {sorted(RUNTIMES)}. "
-            "Call get_runtime_types for full descriptions.",
-        )
-
-    if not rt.allows_custom_entrypoint and entrypoint:
-        raise HTTPException(
-            400,
-            f"the {runtime!r} runtime does not accept a custom entrypoint "
-            f"(it uses a fixed process: {rt.default_entrypoint!r}). "
-            "Remove the `entrypoint` field, or switch to runtime=python or "
-            "runtime=node if you need to run a specific command.",
-        )
+    rt = _resolve_runtime(runtime, entrypoint)
 
     session_id = _new_session_id()
     ttl = min(ttl_seconds or DEFAULT_TTL_S, HARD_TTL_S)
@@ -398,51 +506,19 @@ async def _do_create(
     }
 
     # Atomically reserve the chat's one active slot. The pre-check above catches
-    # the common "created twice, seconds apart" case cheaply; THIS is the
-    # backstop for the sub-millisecond race where two creates both pass the
-    # SELECT. The partial UNIQUE index ``jobs_chat_id_active_uniq`` makes the
-    # INSERT the point of mutual exclusion — the loser's register() raises
-    # UniqueViolationError, and we hand back the winner instead of spawning a
-    # second container. The slot is taken per attempt and released if we lose,
-    # so a prevented duplicate still costs nothing. (No chat_id => the indexed
-    # expression is NULL => rows are distinct => unscoped creates never collide.)
-    sandbox_id: Optional[str] = None
-    for _attempt in range(2):
-        try:
-            await asyncio.wait_for(state.slot_sem.acquire(), timeout=0.1)
-        except asyncio.TimeoutError:
-            raise HTTPException(429, "sandbox pool exhausted")
-        try:
-            sandbox_id = await state.registry.register(
-                reserve_meta, initial_phase="spawning"
-            )
-            break
-        except _UniqueViolationError:
-            state.slot_sem.release()
-            existing = (
-                await _find_active_session_by_chat(chat_id) if chat_id else None
-            )
-            if existing:
-                log.info(
-                    "create: chat=%s lost the spawn race to sandbox=%s — "
-                    "returning it instead of spawning a duplicate",
-                    chat_id, existing["sandbox_id"],
-                )
-                return _existing_session_as_create_response(existing, chat_id)
-            # The winner was torn down in the same instant it won — retry once.
-            log.warning(
-                "create: chat=%s hit a unique-violation but found no active "
-                "row; retrying reservation once",
-                chat_id,
-            )
-    if sandbox_id is None:
-        raise HTTPException(
-            409,
-            {
-                "error": "could not reserve a sandbox for this chat — retry",
-                "chat_id": chat_id,
-            },
+    # the common "created twice, seconds apart" case cheaply; the UNIQUE-index
+    # backstop inside _reserve_active_slot handles the sub-millisecond race
+    # where two creates both pass the SELECT — the loser raises _LostRace and we
+    # hand back the winner instead of spawning a second container.
+    try:
+        sandbox_id = await _reserve_active_slot(reserve_meta, chat_id)
+    except _LostRace as lost:
+        log.info(
+            "create: chat=%s lost the spawn race to sandbox=%s — returning it "
+            "instead of spawning a duplicate",
+            chat_id, lost.winner["sandbox_id"],
         )
+        return _existing_session_as_create_response(lost.winner, chat_id)
     log.info(
         "create: session=%s sandbox=%s runtime=%s ttl=%ds chat=%s",
         session_id, sandbox_id, runtime, ttl, chat_id,
@@ -451,39 +527,15 @@ async def _do_create(
         result = await asyncio.to_thread(
             state.spawner.spawn_empty, sandbox_id, rt, entrypoint, env
         )
-        await state.registry.set_phase(sandbox_id, "starting")
-        ready = await asyncio.to_thread(
-            state.spawner.readiness_ok,
-            result.container_name,
-            rt.internal_port,
-            rt.readiness_probe_path,
-            30.0,
+        await _await_ready_or_teardown(
+            sandbox_id, result.container_name, rt, session_id,
+            hint=(
+                "The warming container failed to start. Read the container "
+                "logs above; likely a base-image or runtime configuration "
+                "issue (not caller code, since create was called with no "
+                "files). Try a different runtime or contact the operator."
+            ),
         )
-        if not ready:
-            logs = await asyncio.to_thread(
-                state.spawner.tail_logs, result.container_name, 100
-            )
-            await asyncio.to_thread(state.spawner.stop, result.container_name)
-            await state.registry.set_error(
-                sandbox_id,
-                "sandbox did not become ready within 30s\n\n" + logs,
-            )
-            state.slot_sem.release()
-            raise HTTPException(
-                504,
-                {
-                    "error": "sandbox did not become ready within 30s",
-                    "session_id": session_id,
-                    "logs": logs,
-                    "hint": (
-                        "The warming container failed to start. Read the "
-                        "container logs above; likely a base-image or "
-                        "runtime configuration issue (not caller code, since "
-                        "create was called with no files). Try a different "
-                        "runtime or contact the operator."
-                    ),
-                },
-            )
         url = f"{PROXY_URL}/{sandbox_id}/"
         await state.registry.set_result(
             sandbox_id,
@@ -1325,27 +1377,7 @@ async def _reuse_or_spawn(
     # a stable handle back.
     session_id = session_id or _new_session_id()
 
-    try:
-        rt = get_runtime(runtime)
-    except KeyError:
-        log.warning("unknown runtime requested: %r", runtime)
-        raise HTTPException(
-            400,
-            f"unknown runtime {runtime!r}. Valid: {sorted(RUNTIMES)}. "
-            "Call get_runtime_types for full descriptions.",
-        )
-
-    if not rt.allows_custom_entrypoint and entrypoint:
-        log.warning(
-            "runtime=%s rejects custom entrypoint %r", runtime, entrypoint
-        )
-        raise HTTPException(
-            400,
-            f"the {runtime!r} runtime does not accept a custom entrypoint "
-            f"(it uses a fixed process: {rt.default_entrypoint!r}). "
-            "Remove the `entrypoint` field, or switch to runtime=python or "
-            "runtime=node if you need to run a specific command.",
-        )
+    rt = _resolve_runtime(runtime, entrypoint)
 
     lint_errors = _lint_python_files(files)
     if lint_errors:
@@ -1382,59 +1414,26 @@ async def _reuse_or_spawn(
     }
 
     # Atomically reserve the chat's active slot (same UNIQUE-index backstop as
-    # _do_create). If a concurrent run for this chat won the race, we lose the
-    # INSERT and route onto the winner instead of spawning a rival: overlay our
-    # files if it's already running, otherwise hand back its (still-warming)
-    # session so the caller keeps iterating on the one container.
-    sandbox_id: Optional[str] = None
-    for _attempt in range(2):
-        try:
-            await asyncio.wait_for(state.slot_sem.acquire(), timeout=0.1)
-        except asyncio.TimeoutError:
-            log.warning(
-                "sandbox pool exhausted (MAX_CONCURRENT=%d), rejecting session=%s",
-                MAX_CONCURRENT, session_id,
+    # _do_create). If a concurrent run for this chat won the race, route onto
+    # the winner instead of spawning a rival: overlay our files if it's already
+    # running, otherwise hand back its (still-warming) session.
+    try:
+        sandbox_id = await _reserve_active_slot(reserve_meta, chat_id)
+    except _LostRace as lost:
+        winner = lost.winner
+        if winner.get("phase") == "running" and winner.get("container_name"):
+            log.info(
+                "run: chat=%s lost the spawn race — overlaying files onto the "
+                "winner sandbox=%s",
+                chat_id, winner["sandbox_id"],
             )
-            raise HTTPException(429, "sandbox pool exhausted")
-        try:
-            sandbox_id = await state.registry.register(
-                reserve_meta, initial_phase="spawning"
-            )
-            break
-        except _UniqueViolationError:
-            state.slot_sem.release()
-            winner = (
-                await _find_active_session_by_chat(chat_id) if chat_id else None
-            )
-            if winner and winner.get("phase") == "running" and winner.get(
-                "container_name"
-            ):
-                log.info(
-                    "run: chat=%s lost the spawn race — overlaying files onto "
-                    "the winner sandbox=%s",
-                    chat_id, winner["sandbox_id"],
-                )
-                return await _apply_files_to_running(winner, files, deletes)
-            if winner:
-                log.info(
-                    "run: chat=%s lost the spawn race to still-warming "
-                    "sandbox=%s — returning it",
-                    chat_id, winner["sandbox_id"],
-                )
-                return _existing_session_as_create_response(winner, chat_id)
-            log.warning(
-                "run: chat=%s hit a unique-violation but found no active row; "
-                "retrying reservation once",
-                chat_id,
-            )
-    if sandbox_id is None:
-        raise HTTPException(
-            409,
-            {
-                "error": "could not reserve a sandbox for this chat — retry",
-                "chat_id": chat_id,
-            },
+            return await _apply_files_to_running(winner, files, deletes)
+        log.info(
+            "run: chat=%s lost the spawn race to still-warming sandbox=%s — "
+            "returning it",
+            chat_id, winner["sandbox_id"],
         )
+        return _existing_session_as_create_response(winner, chat_id)
 
     log.info(
         "spawn path: session=%s sandbox=%s runtime=%s ttl=%ds entrypoint=%r "
@@ -1451,44 +1450,15 @@ async def _reuse_or_spawn(
             "container created: sandbox=%s container=%s, polling readiness",
             sandbox_id, result.container_name,
         )
-        await state.registry.set_phase(sandbox_id, "starting")
-        ready = await asyncio.to_thread(
-            state.spawner.readiness_ok,
-            result.container_name,
-            rt.internal_port,
-            rt.readiness_probe_path,
-            30.0,
+        await _await_ready_or_teardown(
+            sandbox_id, result.container_name, rt, session_id,
+            hint=(
+                "Read the container logs above to see why the app failed to "
+                "start (traceback, missing module, port bind error, etc.). "
+                "Fix the code and call again with the same session_id — the "
+                "runner will spawn a fresh container."
+            ),
         )
-        if not ready:
-            log.warning(
-                "readiness FAILED: sandbox=%s container=%s did not bind port %d "
-                "within 30s, capturing logs before teardown",
-                sandbox_id, result.container_name, rt.internal_port,
-            )
-            logs = await asyncio.to_thread(
-                state.spawner.tail_logs, result.container_name, 100
-            )
-            await asyncio.to_thread(state.spawner.stop, result.container_name)
-            await state.registry.set_error(
-                sandbox_id,
-                "sandbox did not become ready within 30s\n\n" + logs,
-            )
-            state.slot_sem.release()
-            raise HTTPException(
-                504,
-                {
-                    "error": "sandbox did not become ready within 30s",
-                    "session_id": session_id,
-                    "logs": logs,
-                    "hint": (
-                        "Read the container logs above to see why the app "
-                        "failed to start (traceback, missing module, port "
-                        "bind error, etc.). Fix the code and call again "
-                        "with the same session_id — the runner will spawn "
-                        "a fresh container."
-                    ),
-                },
-            )
 
         url = f"{PROXY_URL}/{sandbox_id}/"
         await state.registry.set_result(

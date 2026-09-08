@@ -241,6 +241,14 @@ Learned the hard way on `postgres_phoenix`, `ai_agents`, and
 - **`#` in usernames** (Phoenix's `zeo.mcp#ro-phoenix-prod`) is fine in
   `.properties` and compose. If you ever paste the URL into DBeaver by
   hand, encode it as `%23`.
+- **Mixed-case table names.** Trino lowercases every identifier, quoted
+  or not. A Prisma / ORM-built schema with tables like
+  `"LiteLLM_ModelTable"` therefore fails with `Table … does not exist`
+  even though `SHOW TABLES` lists it. Add
+  `case-insensitive-name-matching=true` to the catalog — Trino then
+  resolves the lowercase name against the remote catalog. Set on every
+  externally-owned Postgres catalog by default; only errors if two remote
+  names collide ignoring case.
 - **Use a read-only role** in the properties file wherever the source
   offers one. `trino-mcp` is SELECT-only, but a DBeaver login is not —
   the DB-side role is what actually stops a write.
@@ -263,6 +271,7 @@ connector.name=postgresql
 connection-url=jdbc:postgresql://${ENV:X_DB_HOST}:${ENV:X_DB_PORT}/${ENV:X_DB_NAME}?sslmode=${ENV:X_DB_SSLMODE}
 connection-user=${ENV:X_DB_USER}
 connection-password=${ENV:X_DB_PASSWORD}
+case-insensitive-name-matching=true
 ```
 
 with, in `docker-compose.trino.yml` under `trino-coordinator` →

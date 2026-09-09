@@ -55,7 +55,7 @@ To add a third model, add a new service block to `ai/vllm/docker-compose.vllm.ym
 
 ```yaml
   vllm-mistral:
-    image: vllm/vllm-openai:latest
+    image: vllm/vllm-openai:v0.29.0
     container_name: vllm-mistral
     restart: unless-stopped
     environment:
@@ -80,6 +80,8 @@ To add a third model, add a new service block to `ai/vllm/docker-compose.vllm.ym
 
 Then hit it at `localhost:8004` with `"model": "mistral"` in the request body.
 
+**Guidelines for the image tag:** copy the pinned `vllm/vllm-openai:vX.Y.Z` tag from the sibling blocks, never `latest` — `up -d` does not re-pull a cached `latest`, so a model that needs a newer vLLM fails on a stale image with an "invalid tool call parser" / "unknown architecture" error that looks like a typo. If the new model needs a newer release than the siblings use, bump the pin on the new service only and note the reason in a comment.
+
 **Guidelines for picking ports:** use consecutive ports (8002, 8003, 8004…) and make sure none are already in use.
 
 **Guidelines for `--max-model-len`:** larger context lengths need more GPU memory. If a container OOMs on startup, reduce it (e.g. `4096` for 6GB GPUs, `16384` for 24GB+ GPUs).
@@ -92,7 +94,7 @@ To run a single model across multiple GPUs for lower latency and larger KV cache
 
 ```yaml
   qwen3.8:
-    image: vllm/vllm-openai:latest
+    image: vllm/vllm-openai:v0.29.0
     container_name: qwen3.8
     restart: unless-stopped
     shm_size: '8gb'          # required for TP > 1
@@ -145,7 +147,7 @@ The `muse-glimmer` service serves [`meta-models/Muse-Glimmer-30B`](https://huggi
 
 ```yaml
   muse-glimmer:
-    image: vllm/vllm-openai:latest      # needs >= v0.28.0
+    image: vllm/vllm-openai:v0.29.0     # pinned — see below
     shm_size: '8gb'                     # TP > 1
     # ...
     command: >
@@ -162,7 +164,13 @@ The `muse-glimmer` service serves [`meta-models/Muse-Glimmer-30B`](https://huggi
       --speculative-config '{"method":"dflash","model":"meta-models/Muse-Glimmer-30B-assistant","num_speculative_tokens":15}'
 ```
 
-**vLLM version.** Model support, the `muse_glimmer` reasoning + tool-call parsers, and DFlash2 all landed in **vLLM v0.28.0** (2026-08-26; [#51655](https://github.com/vllm-project/vllm/pull/51655), [#52816](https://github.com/vllm-project/vllm/pull/52816)). The `latest` tag satisfies this; if you ever pin, pin to `v0.28.0` or newer. Meta's own recipe is at [recipes.vllm.ai](https://recipes.vllm.ai/meta-models/Muse-Glimmer-30B).
+**vLLM version — pinned, not `latest`.** Model support, the `muse_glimmer` reasoning + tool-call parsers, and DFlash2 all landed in **vLLM v0.28.0** (2026-08-26; [#51655](https://github.com/vllm-project/vllm/pull/51655), [#52816](https://github.com/vllm-project/vllm/pull/52816)); **v0.29.0** (2026-09-09) adds a DFlash draft RoPE-layout fix and a Muse Glimmer LoRA fix, and is what every service in this compose file now pins except `qwen3.8`, which is held at `v0.27.1` (the build it was already running) until it has been tried on v0.29.0. Meta's recipe names `v0.28.0` as the minimum. The whole file moved off `latest` because `docker compose up -d` never re-pulls a `latest` tag that is already cached on the host — a stale pre-0.28 `latest` boots the container and then dies with:
+
+```
+KeyError: 'invalid tool call parser: muse_glimmer (chose from { apertus, ..., qwen3_coder, qwen3_xml, ... })'
+```
+
+If you see that, the running image is too old — it is not a typo in the parser name. Bumping a pin is a deliberate edit + `make up vllm <service>` (compose pulls a tag it doesn't have locally); bump one service at a time so a regression is attributable. Meta's own recipe is at [recipes.vllm.ai](https://recipes.vllm.ai/meta-models/Muse-Glimmer-30B).
 
 **Why TP=2 works.** The text stack has 32 attention heads and **2 KV heads**, so the only legal TP sizes are 1 and 2 (see *Picking TP size* above). Two A6000s (2 × 48 GB) comfortably clear Meta's 72 GB minimum:
 

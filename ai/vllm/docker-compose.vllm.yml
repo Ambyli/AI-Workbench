@@ -4,10 +4,15 @@ networks:
     name: ai_shared
 
 services:
+  # All vLLM services pin an explicit release tag instead of `latest`:
+  # `up -d` never re-pulls a cached `latest`, so a new model / parser /
+  # spec-decode method silently fails on a stale image (e.g.
+  # `KeyError: 'invalid tool call parser: muse_glimmer'`). Bump the tag
+  # deliberately, one service at a time, and re-check VLLM.md § versions.
   # vllm-llama:
   #   networks:
   #     - shared
-  #   image: vllm/vllm-openai:latest
+  #   image: vllm/vllm-openai:v0.29.0
   #   container_name: vllm-llama
   #   restart: unless-stopped
   #   environment:
@@ -37,7 +42,10 @@ services:
   qwen3.8:
     networks:
       - shared
-    image: vllm/vllm-openai:latest
+    # Held at v0.27.1 — the build this service was running (as `latest`) before
+    # the file moved to pinned tags. Bump to match the siblings once qwen3.8 has
+    # been tried on v0.29.0 (Model Runner V2 + FlashInfer all-reduce defaults).
+    image: vllm/vllm-openai:v0.27.1
     container_name: qwen3.8
     restart: unless-stopped
     shm_size: '8gb'
@@ -84,7 +92,7 @@ services:
   qwen3.6:
     networks:
       - shared
-    image: vllm/vllm-openai:latest
+    image: vllm/vllm-openai:v0.29.0
     container_name: qwen3.6
     restart: unless-stopped
     environment:
@@ -128,13 +136,15 @@ services:
   # Muse Glimmer 30B — Meta's dense 29.6B vision-language model (BF16, ~63 GB of
   # weights) sharded across two A6000s with TP=2, plus DFlash block-diffusion
   # speculative decoding via the official 3B drafter. Needs vLLM >= 0.28.0 —
-  # the model, the muse_glimmer parsers, and DFlash2 all landed in that release.
+  # the model, the muse_glimmer parsers, and DFlash2 all landed in that release;
+  # v0.29.0 adds a DFlash draft RoPE-layout fix. A pre-0.28 image fails at
+  # boot with `KeyError: 'invalid tool call parser: muse_glimmer'`.
   # Shares the same GPU pair as qwen3.8 at 0.90 utilisation: run one or the
   # other, not both. See VLLM.md § Muse Glimmer 30B.
   muse-glimmer:
     networks:
       - shared
-    image: vllm/vllm-openai:latest
+    image: vllm/vllm-openai:v0.29.0
     container_name: muse-glimmer
     restart: unless-stopped
     shm_size: '8gb'
@@ -183,7 +193,7 @@ services:
   vllm-qwen-vl:
     networks:
       - shared
-    image: vllm/vllm-openai:latest
+    image: vllm/vllm-openai:v0.29.0
     container_name: vllm-qwen-vl
     restart: unless-stopped
     environment:

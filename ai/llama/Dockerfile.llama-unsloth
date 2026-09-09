@@ -17,7 +17,8 @@
 #     whose head branch also contains the NextN/MTP draft graph for the arch.
 #
 # The tarball is a flat directory: llama-server, the shared libs it needs
-# (rpath=$ORIGIN, so no LD_LIBRARY_PATH), and BUILD_INFO.txt. All linux-x64
+# (rpath=$ORIGIN, so no LD_LIBRARY_PATH), and — CUDA variants only — a
+# BUILD_INFO.txt (the cpu tarball ships none, verified on b10840). All linux-x64
 # tarballs are built on GitHub's ubuntu-22.04 runner, so BASE_IMAGE must be
 # ubuntu 22.04-derived for glibc/libstdc++ parity.
 #
@@ -63,7 +64,12 @@ WORKDIR /app
 RUN curl -fsSL "https://github.com/unslothai/llama.cpp/releases/download/${LLAMA_UNSLOTH_TAG}/app-${LLAMA_UNSLOTH_TAG}-linux-x64-${LLAMA_UNSLOTH_VARIANT}.tar.gz" \
       | tar -xz -C /app \
  && test -x /app/llama-server \
- && echo "---- BUILD_INFO ----" && cat /app/BUILD_INFO.txt \
+ && if [ -f /app/BUILD_INFO.txt ]; then \
+      echo "---- BUILD_INFO ----"; cat /app/BUILD_INFO.txt; \
+    else \
+      echo "---- no BUILD_INFO.txt in ${LLAMA_UNSLOTH_VARIANT} tarball; llama-server --version: ----"; \
+      /app/llama-server --version || true; \
+    fi \
  && if [ -f /app/libggml-cuda.so ]; then \
       echo "---- CUDA lib check ----"; \
       if ldd /app/libggml-cuda.so | grep -v 'libcuda\.so\.1' | grep 'not found'; then \

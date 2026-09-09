@@ -141,6 +141,42 @@ Applied via a bind mount and the `--chat-template` flag:
 
 **qwen3.6 uses the stock template.** If it exhibits the same thinking-loop symptoms, mount and apply the same file.
 
+### Single-GPU qwen3.8 — pinning a service to one card
+
+`qwen3.8-solo` serves the same `cyankiwi/Qwen3.8-27B-AWQ-INT4` as `qwen3.8`, but on one A6000 so it can run **alongside** `muse-glimmer`, which occupies the first two cards. The block is a copy of `qwen3.8` with four differences:
+
+```yaml
+  qwen3.8-solo:
+    # no shm_size — TP=1 has no cross-worker shared memory
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['2']       # instead of count: all
+              capabilities: [gpu]
+    command: >
+      cyankiwi/Qwen3.8-27B-AWQ-INT4
+      --served-model-name qwen3.8-solo
+      # no --tensor-parallel-size
+      --max-num-seqs 3               # was 16 on two cards
+      # ...everything else identical
+```
+
+**`device_ids` vs `count`.** `count: all` exposes every GPU and lets vLLM take the first N it needs — fine when a service owns the box, wrong when two services must share it. `device_ids: ['2']` sets `NVIDIA_VISIBLE_DEVICES=2`, so the container sees exactly one card and vLLM's `cuda:0` *is* host GPU 2. Indices follow `nvidia-smi` order and are 0-based, so "slot 3" is `'2'`. If a driver update or reseat changes enumeration, pin by UUID instead: `nvidia-smi -L` prints `GPU-xxxxxxxx-…` ids that Docker accepts verbatim in `device_ids`. Compose rejects `count` and `device_ids` on the same entry — use one.
+
+**Why 3 sequences.** Qwen3.8-27B is a hybrid: 16 of its 64 layers are full attention (4 KV heads × 256 head_dim), the rest are linear attention with a small fixed state. In BF16 that is 64 KiB of KV per token, so a full 131072-token sequence costs ~8 GiB. One A6000 at 0.90 utilisation leaves ~21 GiB for KV after ~19 GiB of INT4 weights + MTP head and ~3 GiB of activations — roughly 2½ max-length sequences, which is why the cap is 3 (the same figure `qwen3.6`, the same architecture on one card, has run with). As always the cap is a ceiling: a dozen 8k-token chats fit fine; three 128k ones will queue briefly. `--kv-cache-dtype fp8` would double that if you ever need it.
+
+**What can co-run.** With three A6000s and these services at 0.90 utilisation:
+
+| Running | GPUs used | Can add |
+|---|---|---|
+| `muse-glimmer` (TP=2, first two cards) | 0, 1 | `qwen3.8-solo` **or** `qwen3.6` (both TP=1) — but not both, and `qwen3.6` uses `count: all`, so it grabs GPU 0 and collides with muse; give it a `device_ids` too if you want that pairing |
+| `qwen3.8` (TP=2, first two cards) | 0, 1 | `qwen3.8-solo` on GPU 2 — pointless duplication, but it works |
+| `glm5.2` / `qwen3.8-flash` (llama.cpp, `--tensor-split 1,1,1`) | 0, 1, 2 | nothing — they use all three cards |
+
+`qwen3.8` and `qwen3.8-solo` are separate LiteLLM aliases on purpose. Listing both under one `model_name` would make LiteLLM round-robin onto whichever is down and burn a retry + cooldown per request; keep them distinct and point clients at the one that is up.
+
 ### Muse Glimmer 30B — tensor parallel + DFlash speculative decoding
 
 The `muse-glimmer` service serves [`meta-models/Muse-Glimmer-30B`](https://huggingface.co/meta-models/Muse-Glimmer-30B) — Meta's dense 29.6B vision-language model (52-layer text decoder + ~1.8B ViT-G/14 encoder, 131072-token trained context served at 262144 — see *Serving beyond the trained context* below, Apache 2.0, not gated) — in BF16 across two A6000s with [DFlash](https://huggingface.co/meta-models/Muse-Glimmer-30B-assistant) block-diffusion speculative decoding.

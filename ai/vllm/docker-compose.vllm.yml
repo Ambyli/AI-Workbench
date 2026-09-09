@@ -89,6 +89,60 @@ services:
       --speculative-config '{"method":"mtp","num_speculative_tokens":2}'
       --chat-template /config/qwen_fixed_chat_template.jinja
 
+  # Same Qwen3.8-27B-AWQ-INT4 as `qwen3.8`, but on ONE GPU so it can co-run
+  # with muse-glimmer (which takes the first two). Pinned to the third card via
+  # device_ids — that is nvidia-smi index 2 (indices are 0-based; "slot 3" in
+  # nvidia-smi terms). If enumeration order ever changes, swap the index for
+  # the card's UUID from `nvidia-smi -L`, e.g. device_ids: ['GPU-xxxxxxxx-...'].
+  # No shm_size: TP=1 has no cross-worker shared memory. --max-num-seqs 3
+  # matches qwen3.6 (same 27B hybrid architecture on one A6000) — see
+  # VLLM.md § Single-GPU qwen3.8. Same v0.27.1 pin as `qwen3.8` so the two
+  # behave identically.
+  qwen3.8-solo:
+    networks:
+      - shared
+    image: vllm/vllm-openai:v0.27.1
+    container_name: qwen3.8-solo
+    restart: unless-stopped
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN}
+      - VLLM_SLEEP_WHEN_IDLE=1
+      - VLLM_USE_DEEP_GEMM=0
+      - VLLM_ATTENTION_BACKEND=FLASH_ATTN
+    ports:
+      - "${PORT_VLLM_QWEN38_SOLO}:8000"
+    volumes:
+      - vllm_data:/root/.cache/huggingface
+      - ../jinja/qwen_fixed_chat_template.jinja:/config/qwen_fixed_chat_template.jinja:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['2']
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 300s
+    command: >
+      cyankiwi/Qwen3.8-27B-AWQ-INT4
+      --served-model-name qwen3.8-solo
+      --dtype auto
+      --max-model-len 131072
+      --max-num-seqs 3
+      --gpu-memory-utilization 0.90
+      --enable-prefix-caching
+      --enable-chunked-prefill
+      --kv-cache-dtype auto
+      --reasoning-parser qwen3
+      --enable-auto-tool-choice
+      --tool-call-parser qwen3_coder
+      --speculative-config '{"method":"mtp","num_speculative_tokens":2}'
+      --chat-template /config/qwen_fixed_chat_template.jinja
+
   qwen3.6:
     networks:
       - shared

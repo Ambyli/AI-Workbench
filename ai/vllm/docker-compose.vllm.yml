@@ -125,6 +125,61 @@ services:
       --speculative-config '{"method":"mtp","num_speculative_tokens":2}'
       --default-chat-template-kwargs '{"enable_thinking": true,"preserve_thinking": true}'
 
+  # Muse Glimmer 30B — Meta's dense 29.6B vision-language model (BF16, ~63 GB of
+  # weights) sharded across two A6000s with TP=2, plus DFlash block-diffusion
+  # speculative decoding via the official 3B drafter. Needs vLLM >= 0.28.0 —
+  # the model, the muse_glimmer parsers, and DFlash2 all landed in that release.
+  # Shares the same GPU pair as qwen3.8 at 0.90 utilisation: run one or the
+  # other, not both. See VLLM.md § Muse Glimmer 30B.
+  muse-glimmer:
+    networks:
+      - shared
+    image: vllm/vllm-openai:latest
+    container_name: muse-glimmer
+    restart: unless-stopped
+    shm_size: '8gb'
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN}
+      - VLLM_SLEEP_WHEN_IDLE=1
+      - VLLM_USE_DEEP_GEMM=0
+      - VLLM_ATTENTION_BACKEND=FLASH_ATTN
+    ports:
+      - "${PORT_VLLM_MUSE_GLIMMER}:8000"
+    volumes:
+      - vllm_data:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              # TP=2 takes the first two visible GPUs. To pin the NVLinked
+              # pair explicitly, swap `count: all` for `device_ids: ['0', '1']`.
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      # Cold start pulls ~69 GB (target + drafter) then shards it — allow 10 min.
+      start_period: 600s
+    command: >
+      meta-models/Muse-Glimmer-30B
+      --served-model-name muse-glimmer
+      --tensor-parallel-size 2
+      --dtype auto
+      --max-model-len 131072
+      --max-num-seqs 16
+      --gpu-memory-utilization 0.90
+      --enable-prefix-caching
+      --enable-chunked-prefill
+      --kv-cache-dtype auto
+      --generation-config auto
+      --reasoning-parser muse_glimmer
+      --enable-auto-tool-choice
+      --tool-call-parser muse_glimmer
+      --speculative-config '{"method":"dflash","model":"meta-models/Muse-Glimmer-30B-assistant","num_speculative_tokens":15}'
+
   vllm-qwen-vl:
     networks:
       - shared

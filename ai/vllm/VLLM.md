@@ -139,6 +139,58 @@ Applied via a bind mount and the `--chat-template` flag:
 
 **qwen3.6 uses the stock template.** If it exhibits the same thinking-loop symptoms, mount and apply the same file.
 
+### Muse Glimmer 30B — tensor parallel + DFlash speculative decoding
+
+The `muse-glimmer` service serves [`meta-models/Muse-Glimmer-30B`](https://huggingface.co/meta-models/Muse-Glimmer-30B) — Meta's dense 29.6B vision-language model (52-layer text decoder + ~1.8B ViT-G/14 encoder, 131072-token context, Apache 2.0, not gated) — in BF16 across two A6000s with [DFlash](https://huggingface.co/meta-models/Muse-Glimmer-30B-assistant) block-diffusion speculative decoding.
+
+```yaml
+  muse-glimmer:
+    image: vllm/vllm-openai:latest      # needs >= v0.28.0
+    shm_size: '8gb'                     # TP > 1
+    # ...
+    command: >
+      meta-models/Muse-Glimmer-30B
+      --served-model-name muse-glimmer
+      --tensor-parallel-size 2
+      --max-model-len 131072
+      --max-num-seqs 16
+      --gpu-memory-utilization 0.90
+      --generation-config auto
+      --reasoning-parser muse_glimmer
+      --enable-auto-tool-choice
+      --tool-call-parser muse_glimmer
+      --speculative-config '{"method":"dflash","model":"meta-models/Muse-Glimmer-30B-assistant","num_speculative_tokens":15}'
+```
+
+**vLLM version.** Model support, the `muse_glimmer` reasoning + tool-call parsers, and DFlash2 all landed in **vLLM v0.28.0** (2026-08-26; [#51655](https://github.com/vllm-project/vllm/pull/51655), [#52816](https://github.com/vllm-project/vllm/pull/52816)). The `latest` tag satisfies this; if you ever pin, pin to `v0.28.0` or newer. Meta's own recipe is at [recipes.vllm.ai](https://recipes.vllm.ai/meta-models/Muse-Glimmer-30B).
+
+**Why TP=2 works.** The text stack has 32 attention heads and **2 KV heads**, so the only legal TP sizes are 1 and 2 (see *Picking TP size* above). Two A6000s (2 × 48 GB) comfortably clear Meta's 72 GB minimum:
+
+| Item | Total | Per GPU at TP=2 |
+|---|---|---|
+| Target weights, BF16 (29.6B text + 1.8B vision) | ~63 GB | ~31.5 GB |
+| DFlash drafter, BF16 (~3B, 5 layers, 32q/8kv heads) | ~6 GB | ~3 GB |
+| Budget at `--gpu-memory-utilization 0.90` | — | 43.2 GB |
+| Left for KV cache + activations + CUDA graphs | — | ~8.7 GB |
+
+KV cache is cheap on this model: only 13 of the 52 layers are full-attention (the other 39 use a 2048-token sliding window), and with 2 KV heads × 128 head_dim a full 131072-token sequence costs roughly 1.7 GB total across both GPUs. So `--max-model-len 131072` with `--max-num-seqs 16` fits with headroom. If startup OOMs anyway (e.g. after adding `--limit-mm-per-prompt` for multi-image prompts), drop utilisation to `0.85` before touching context length.
+
+**DFlash speculative decoding.** `meta-models/Muse-Glimmer-30B-assistant` is the official drafter — a 5-layer block-diffusion network that reads the target's residual stream at layers {1, 13, 25, 37, 49} and proposes a 16-token block in one forward pass; the target verifies the block in parallel, so output is bit-identical to plain decoding. Configuration is `--speculative-config '{"method":"dflash","model":"<drafter>","num_speculative_tokens":15}'` — the drafter's block size is 16, so **`num_speculative_tokens` is fixed at 15** (block minus the anchor token); it is not a tuning knob here. The drafter is distilled for this exact target checkpoint and must not be paired with a quantised or fine-tuned variant. Meta reports ~3× single-stream speedup on consumer GPUs; expect the gain to shrink as concurrency rises, which is why the recipe halves `--max-num-seqs` when DFlash is on. To disable speculation for A/B testing, remove the `--speculative-config` line and recreate the container. The drafter downloads into the shared `vllm_data` volume alongside the target on first start.
+
+**Parsers and sampling.** `--reasoning-parser muse_glimmer` and `--tool-call-parser muse_glimmer` must run **together** — both key off the model's channel-scoped message framing (reasoning rides special markers, tool calls are emitted as `<atem:function_calls>` blocks, not OpenAI JSON). The reasoning parser forces `skip_special_tokens=False` itself. `--generation-config auto` picks up Meta's published sampling defaults (temperature 1.0, top_p 0.95, top_k 64) from the repo's `generation_config.json`; the model card explicitly warns against greedy decoding. Reasoning depth is set by a system-prompt line `Reasoning strength: low|medium|high|xhigh`, not by a chat-template kwarg. Stock chat template — no jinja mount needed.
+
+**Multimodal.** Text + image input, up to 4096 visual tokens per image. vLLM's default is one image per prompt; add `--limit-mm-per-prompt '{"image": 4}'` to the command if callers need more, and re-check the VRAM table above. LiteLLM registers the alias with `supports_vision: true`.
+
+**GPU scheduling — mutually exclusive with `qwen3.8`.** Both services are TP=2 at 0.90 utilisation on `count: all`, so both land on the first two visible GPUs and cannot co-run. Bring up one or the other:
+
+```bash
+make stop vllm qwen3.8 && make up vllm muse-glimmer
+```
+
+To pin the NVLinked pair explicitly instead of relying on enumeration order, replace `count: all` with `device_ids: ['0', '1']` under `deploy.resources.reservations.devices`.
+
+**Cold start.** First launch pulls ~69 GB (target + drafter) from HuggingFace and then shards it; the healthcheck's `start_period` is 600s for that reason. Subsequent starts load from `vllm_data` in a few minutes.
+
 ### Removing a model
 
 Delete the corresponding service block from `ai/vllm/docker-compose.vllm.yml`, then:

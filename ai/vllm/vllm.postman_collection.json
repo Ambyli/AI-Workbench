@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "vllm",
-    "description": "Per-model vLLM inference servers defined in ai/vllm/docker-compose.vllm.yml. Each container is an isolated vLLM instance exposing the OpenAI-compatible surface (GET /health, GET /v1/models, POST /v1/chat/completions, POST /v1/completions) on its own host port. The direct-port surface has NO auth — vLLM does not implement API keys and nothing sits in front of it at the container port. Treat these URLs as internal-only; the production path is through LiteLLM (see the 'Via LiteLLM' folder), which enforces virtual-key auth, rate limits, and logging.\n\nSet the collection variables `vllm_qwen3_8` (default http://localhost:8003), `vllm_qwen3_6` (default http://localhost:8002), `vllm_qwen_vl` (default http://localhost:8006), `litellm` (default http://localhost:4001), and `virtual master key`. Direct-port requests inherit `auth: noauth`; requests in 'Via LiteLLM' inherit the collection-level bearer token.\n\nSee ai/vllm/VLLM.md for the operator guide (WSL2 UVA warning, HF token setup, adding models, tensor parallelism, the qwen_fixed_chat_template.jinja bug fixes) and ai/litellm/LITELLM.md for issuing virtual keys and the model-alias → upstream mapping.",
+    "description": "Per-model vLLM inference servers defined in ai/vllm/docker-compose.vllm.yml. Each container is an isolated vLLM instance exposing the OpenAI-compatible surface (GET /health, GET /v1/models, POST /v1/chat/completions, POST /v1/completions) on its own host port. The direct-port surface has NO auth — vLLM does not implement API keys and nothing sits in front of it at the container port. Treat these URLs as internal-only; the production path is through LiteLLM (see the 'Via LiteLLM' folder), which enforces virtual-key auth, rate limits, and logging.\n\nSet the collection variables `vllm_qwen3_8` (default http://localhost:8003), `vllm_qwen3_6` (default http://localhost:8002), `vllm_qwen_vl` (default http://localhost:8006), `vllm_muse_glimmer` (default http://localhost:8018), `litellm` (default http://localhost:4001), and `virtual master key`. Direct-port requests inherit `auth: noauth`; requests in 'Via LiteLLM' inherit the collection-level bearer token.\n\nSee ai/vllm/VLLM.md for the operator guide (WSL2 UVA warning, HF token setup, adding models, tensor parallelism, the qwen_fixed_chat_template.jinja bug fixes) and ai/litellm/LITELLM.md for issuing virtual keys and the model-alias → upstream mapping.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
     "_postman_id": "vllm-collection"
   },
@@ -26,6 +26,12 @@
       "value": "http://localhost:8006",
       "type": "string",
       "description": "Direct base URL for the vllm-qwen-vl container (Qwen2.5-VL-7B-Instruct, vision-language). Host publish is PORT_VLLM_QWEN_VL (default 8006); on ai_shared it's http://vllm-qwen-vl:8000. No auth at this surface."
+    },
+    {
+      "key": "vllm_muse_glimmer",
+      "value": "http://localhost:8018",
+      "type": "string",
+      "description": "Direct base URL for the muse-glimmer container (meta-models/Muse-Glimmer-30B, TP=2 + DFlash). Host publish is PORT_VLLM_MUSE_GLIMMER (default 8018); on ai_shared it's http://muse-glimmer:8000. No auth at this surface."
     },
     {
       "key": "litellm",
@@ -91,7 +97,7 @@
               "path": ["v1", "chat", "completions"]
             },
             "description": "Chat completion against qwen3.8 (Qwen3.8-27B-AWQ-INT4, 131072-token context). The `model` field must match the --served-model-name (`qwen3.8`) — vLLM 400s on any other value. Supports `chat_template_kwargs: {\"reasoning_effort\": \"low|medium|high|xhigh\"}` (default `medium` from the fixed template). If the container is stopped: connection refused."
-            },
+          },
           "response": []
         },
         {
@@ -270,6 +276,103 @@
       ]
     },
     {
+      "name": "muse-glimmer",
+      "description": "Muse-Glimmer-30B (meta-models/Muse-Glimmer-30B, BF16), served under alias `muse-glimmer`. Meta's dense 29.6B vision-language model, 131072-token context (--max-model-len). Runs with tensor-parallel-size 2 across two A6000s (shm_size: 8gb required), DFlash speculative decoding via the official meta-models/Muse-Glimmer-30B-assistant drafter (num_speculative_tokens=15, fixed by the drafter's 16-token block), and the paired muse_glimmer reasoning + tool-call parsers (channel-scoped markers / ATEM tool blocks, not OpenAI JSON). Sampling defaults come from --generation-config auto (temperature 1.0, top_p 0.95, top_k 64 — do not run greedy). Mutually exclusive with the qwen3.8 container (same GPU pair at 0.90 utilisation). If the container is stopped: all requests below fail with `ECONNREFUSED localhost:8018`; the LiteLLM-routed variant returns 500 with an upstream connect error since litellm_config.yaml points `muse-glimmer` at http://muse-glimmer:8000. See VLLM.md § Muse Glimmer 30B.",
+      "item": [
+        {
+          "name": "GET /health",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{vllm_muse_glimmer}}/health",
+              "host": ["{{vllm_muse_glimmer}}"],
+              "path": ["health"]
+            },
+            "description": "Liveness probe. Returns 200 with empty body once vLLM finishes loading the target AND the DFlash drafter (start_period: 600s in the compose healthcheck — cold start pulls ~69 GB then shards across two GPUs). Returns connection refused if the container is stopped; returns 503 during startup before the engine is ready."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /v1/models",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{vllm_muse_glimmer}}/v1/models",
+              "host": ["{{vllm_muse_glimmer}}"],
+              "path": ["v1", "models"]
+            },
+            "description": "OpenAI-compatible model list. Returns exactly one entry with id `muse-glimmer` (from --served-model-name); the DFlash drafter is not listed as a servable model. Use this to confirm the served alias before firing chat/completions. If the container is stopped: connection refused."
+          },
+          "response": []
+        },
+        {
+          "name": "POST /v1/chat/completions",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{vllm_muse_glimmer}}/v1/chat/completions",
+              "host": ["{{vllm_muse_glimmer}}"],
+              "path": ["v1", "chat", "completions"]
+            },
+            "description": "Chat completion against muse-glimmer (131072-token context). The `model` field must match the --served-model-name (`muse-glimmer`) — vLLM 400s on any other value. Reasoning is returned in `reasoning_content` (muse_glimmer reasoning parser); depth is controlled by a system-prompt line `Reasoning strength: low|medium|high|xhigh`, not a chat_template_kwarg. Tool calls are parsed by the muse_glimmer tool parser into standard `tool_calls`; multiple calls arrive as consecutive assistant messages. Omit temperature/top_p/top_k to inherit Meta's published defaults via --generation-config auto. Output is bit-identical with or without DFlash — speculation only changes latency. If the container is stopped: connection refused.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"muse-glimmer\",\n  \"messages\": [\n    {\"role\": \"system\", \"content\": \"Reasoning strength: medium\"},\n    {\"role\": \"user\", \"content\": \"Explain DFlash speculative decoding in two sentences.\"}\n  ],\n  \"max_tokens\": 512\n}",
+              "options": { "raw": { "language": "json" } }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "POST /v1/chat/completions (image)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{vllm_muse_glimmer}}/v1/chat/completions",
+              "host": ["{{vllm_muse_glimmer}}"],
+              "path": ["v1", "chat", "completions"]
+            },
+            "description": "Multimodal chat completion — text + image_url content parts. Up to 4096 visual tokens per image; vLLM's default --limit-mm-per-prompt allows one image per request (400 `At most 1 image(s) may be provided in one request` beyond that — raise the limit in docker-compose.vllm.yml if needed). If the container is stopped: connection refused.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"muse-glimmer\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": [\n        {\"type\": \"text\", \"text\": \"What is shown here?\"},\n        {\"type\": \"image_url\", \"image_url\": {\"url\": \"https://upload.wikimedia.org/wikipedia/commons/thumb/4/47/PNG_transparency_demonstration_1.png/280px-PNG_transparency_demonstration_1.png\"}}\n      ]\n    }\n  ],\n  \"max_tokens\": 256\n}",
+              "options": { "raw": { "language": "json" } }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "POST /v1/completions",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{vllm_muse_glimmer}}/v1/completions",
+              "host": ["{{vllm_muse_glimmer}}"],
+              "path": ["v1", "completions"]
+            },
+            "description": "Legacy text-completion endpoint against muse-glimmer (131072-token context). Bypasses the chat template — the prompt is fed verbatim, so the muse_glimmer reasoning/tool parsers don't fire and channel markers may appear raw in the output. Prefer /v1/chat/completions. If the container is stopped: connection refused.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"muse-glimmer\",\n  \"prompt\": \"The three laws of robotics are:\\n1.\",\n  \"max_tokens\": 128\n}",
+              "options": { "raw": { "language": "json" } }
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
       "name": "Via LiteLLM",
       "description": "Production path — same chat completion routed through LiteLLM using the model alias. LiteLLM enforces virtual-key auth (`Authorization: Bearer {{virtual master key}}`), applies rate limits, records spend/logging, and maps the alias in litellm_config.yaml (`model_list.model_name: qwen3.6` → `litellm_params.api_base: http://qwen3.6:8000`) to the upstream container over the ai_shared network. Use this path for anything the model or Open WebUI touches; use the direct-port folders only for isolated debugging.\n\nAuth on this folder overrides the collection default to `Bearer {{virtual master key}}`.",
       "auth": {
@@ -343,6 +446,27 @@
               "path": ["v1", "chat", "completions"]
             },
             "description": "Multimodal chat completion routed through LiteLLM. `model` must match whatever alias litellm_config.yaml maps to vllm-qwen-vl (typically the full HF repo id since the container doesn't set --served-model-name). If the vllm-qwen-vl container is stopped: LiteLLM returns 500 with an upstream connect error."
+          },
+          "response": []
+        },
+        {
+          "name": "POST /v1/chat/completions (muse-glimmer via LiteLLM)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"muse-glimmer\",\n  \"messages\": [\n    {\"role\": \"user\", \"content\": \"Say hi via LiteLLM.\"}\n  ],\n  \"max_tokens\": 128\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/chat/completions",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "chat", "completions"]
+            },
+            "description": "Same muse-glimmer chat completion, routed through LiteLLM. `model` is the alias from litellm_config.yaml (`muse-glimmer` -> http://muse-glimmer:8000/v1), which also injects Meta's sampling defaults (temperature 1.0, top_p 0.95, top_k 64) and advertises `supports_vision: true`. Requires a valid virtual key with access to this alias. If the muse-glimmer container is stopped: LiteLLM returns 500 with an upstream connect error (`connection refused` from http://muse-glimmer:8000)."
           },
           "response": []
         }

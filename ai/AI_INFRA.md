@@ -29,7 +29,7 @@ Every service in the list below is on the `ai_shared` network unless noted. Port
 | [`openwebui/docker-compose.openwebui.yml`](openwebui/docker-compose.openwebui.yml) | `openwebui` | `8007` | [OPENWEBUI.md](openwebui/OPENWEBUI.md) |
 | [`oauth2-proxy/docker-compose.oauth2-proxy.yml`](oauth2-proxy/docker-compose.oauth2-proxy.yml) | `oauth2-proxy`, `oauth2-assets` | `4180` _(oauth2-assets is internal-only)_ | [OAUTH2_PROXY.md](oauth2-proxy/OAUTH2_PROXY.md) |
 | [`cloudflared/docker-compose.cloudflared.yml`](cloudflared/docker-compose.cloudflared.yml) | `cloudflared` | _(outbound tunnel — no publish)_ | [CLOUDFLARED.md](cloudflared/CLOUDFLARED.md) |
-| [`vllm/docker-compose.vllm.yml`](vllm/docker-compose.vllm.yml) | `vllm-qwen`, `vllm-qwen-vl` | `8002`, `8006` | [VLLM.md](vllm/VLLM.md) · [GPU_SHARING_GUIDE.md](GPU_SHARING_GUIDE.md) |
+| [`vllm/docker-compose.vllm.yml`](vllm/docker-compose.vllm.yml) | `qwen3.6`, `qwen3.8`, `vllm-qwen-vl`, `muse-glimmer` | `8002`, `8003`, `8006`, `8018` | [VLLM.md](vllm/VLLM.md) · [GPU_SHARING_GUIDE.md](GPU_SHARING_GUIDE.md) |
 | [`llama/docker-compose.llama.yml`](llama/docker-compose.llama.yml) | `glm5.2`, `qwen3.8-flash` | `8010`, `8017` | [LLAMA.md](llama/LLAMA.md) |
 | [`kokoro/docker-compose.kokoro.yml`](kokoro/docker-compose.kokoro.yml) | `kokoro-api`, `kokoro-app` (internal) | `8004` | [KOKORO.md](kokoro/KOKORO.md) |
 | [`madlad/docker-compose.madlad.yml`](madlad/docker-compose.madlad.yml) | `madlad-api`, `madlad-app` (internal) | `8008` | [MADLAD.md](madlad/MADLAD.md) |
@@ -82,6 +82,7 @@ flowchart TB
     subgraph VG["vllm/docker-compose.vllm.yml"]
         VQ["vllm-qwen<br/>:8002<br/>Qwen3.6-35B-A3B"]:::svc
         VQVL["vllm-qwen-vl<br/>:8006<br/>Qwen2.5-VL-7B"]:::svc
+        VMG["muse-glimmer<br/>:8018<br/>Muse-Glimmer-30B BF16 TP=2<br/>+ DFlash drafter"]:::svc
     end
     subgraph LMG["llama/docker-compose.llama.yml"]
         LGLM["glm5.2<br/>:8010<br/>GLM-5.2 UD-IQ1_S<br/>(llama.cpp + CPU MoE offload)"]:::svc
@@ -141,6 +142,7 @@ flowchart TB
     LL ==>|"model pass-through<br/>qwen3.6-unsloth"| UN
     LL ==> VQ
     LL ==> VQVL
+    LL ==> VMG
     LL ==> LGLM
     LL ==> LQWF
     LL ==>|"/v1/audio/speech"| KAPI
@@ -199,6 +201,7 @@ flowchart TB
     MAPP -. model download .-> HF
     VQ   -. model download .-> HF
     VQVL -. model download .-> HF
+    VMG  -. model + DFlash drafter download .-> HF
     LGLM -. GGUF download .-> HF
     LQWF -. GGUF + MTP head download .-> HF
 ```
@@ -212,6 +215,7 @@ flowchart TB
 - **Two-container app/api pattern** — Kokoro and MADLAD each split into an internal `-app` (model on GPU, blocking) and a `-api` proxy (stateless, non-blocking). Only the `-api` half is published to the host.
 - **Classifier ↔ vLLM** — the classifier is a vLLM client, not a peer; it calls `vllm-qwen-vl` internally for LLM scoring. Its own SQLite job store (`classifier.db` on the `classifier_data` volume) persists async `/assess` job state so callers can poll `GET /jobs/{id}` across restarts.
 - **Unsloth dual role** — the CUDA-compiled llama.cpp binary serves a chat model at `unsloth:8000` (routed via LiteLLM as the `qwen3.6-unsloth` model entry sourced from `DEFAULT_LITELLM_MODEL_API_BASE`), while Jupyter (`:8888`) and SSH (`:22`) remain available for training / fine-tuning workflows.
+- **Muse Glimmer on vLLM with DFlash speculative decoding** — `muse-glimmer` is Meta's dense 29.6B vision-language model served in BF16 across two A6000s (`--tensor-parallel-size 2`) with the official `meta-models/Muse-Glimmer-30B-assistant` DFlash drafter (`--speculative-config '{"method":"dflash",…}'`, 15 draft tokens per verification step). It occupies the same GPU pair as `qwen3.8` at 0.90 utilisation, so the two are mutually exclusive at runtime — bring up one or the other. LiteLLM alias `muse-glimmer`; `supports_vision: true` so Open WebUI offers image upload. See [VLLM.md § Muse Glimmer 30B](vllm/VLLM.md#muse-glimmer-30b--tensor-parallel--dflash-speculative-decoding).
 - **llama.cpp stack for oversize models** — `llama/docker-compose.llama.yml` runs llama-server for models that don't fit any vLLM-supported precision. `glm5.2` uses the stock `ghcr.io/ggml-org/llama.cpp:server-cuda` image; `qwen3.8-flash` builds a local image from Unsloth's llama.cpp prebuild (`llama/Dockerfile.llama-unsloth`, pinned by `LLAMA_UNSLOTH_TAG` in `.env`) because MTP speculative decoding for Qwen3.8-Flash-Next is not in mainline llama.cpp yet — see [LLAMA.md § MTP speculative decoding](llama/LLAMA.md#qwen38-flash-mtp-speculative-decoding). The first inhabitant was `glm5.2` (Z.ai GLM-5.2, 753B-A40B MoE) at UD-IQ1_S (~176 GB), which does not fit in 3× A6000 VRAM alone — `--n-cpu-moe` offloads expert layers into system RAM. Weights auto-download via `-hf` into the `llama_data` named volume on first start. Unlike Unsloth's mixed-purpose container, this stack is inference-only; add new models by copying the commented template block in the compose file. See [LLAMA.md](llama/LLAMA.md) for quant sizing tables and the `--n-cpu-moe` tuning loop.
 - **Roofix bridge** — packaged in `roofix/docker-compose.roofix.yml`. Internal worker; does NOT receive inbound traffic. APScheduler ticks every `TICK_INTERVAL_SECONDS` (default 300s); each tick fetches unread Roofix mail via the Gmail MCP, decides per-event (rules first, LiteLLM fallback), and writes back via the Phoenix MCP. Ambiguous email events trigger a proposal fetch via `RoofixScraperClient` (`ai/roofix/components/roofix_scraper_client.py`), which POSTs to `interceptor`'s `/capture` under the `roofix` named profile. The old `roofix-scraper` service was retired — proposal captures now share the generic `interceptor` container with any other logged-in-site capture use case. Operators refresh the Roofix session by uploading a captured Chrome user-data-dir to `interceptor`'s `/profiles/roofix/refresh` (see [INTERCEPTOR.md](interceptor/INTERCEPTOR.md)).
 - **Gmail MCP is a passthrough, not a proxied identity** — the `LL -.-> GmailMCP` edge uses LiteLLM's `delegate_auth_to_upstream: true` mode. LiteLLM only advertises the endpoint; the OAuth 2.1 flow runs end-to-end between Open WebUI and `gmailmcp.googleapis.com` per user, and LiteLLM forwards the resulting `Authorization: Bearer` header untouched. Users must enable the Gmail tool per-chat (it cannot be a default-enabled tool on a model, because the OAuth browser redirect cannot happen mid-completion).
@@ -233,8 +237,10 @@ Ports are sourced from `.env` (`PORT_*` variables). Defaults shown; change them 
 | litellm_db (postgres) | `5432` |
 | prometheus | `9090` |
 | openwebui | `8007` |
-| vllm-qwen | `8002` |
+| qwen3.6 (vllm) | `8002` |
+| qwen3.8 (vllm) | `8003` |
 | vllm-qwen-vl | `8006` |
+| muse-glimmer (vllm, TP=2 + DFlash) | `8018` |
 | glm5.2 (llama.cpp) | `8010` |
 | qwen3.8-flash (llama.cpp, Unsloth prebuild) | `8017` |
 | kokoro-api | `8004` |

@@ -10,6 +10,7 @@ litellm_settings:
     - {"qwen3.8":       ["claude-sonnet-5"]}
     - {"qwen3.8-flash": ["claude-sonnet-5"]}
     - {"glm5.2":        ["claude-sonnet-5"]}
+    - {"muse-glimmer":  ["claude-sonnet-5"]}
 
 general_settings:
   master_key: os.environ/DEFAULT_LITELLM_MASTER_KEY
@@ -171,6 +172,26 @@ model_list:
     model_info:
       max_input_tokens: 32768
       max_output_tokens: 32768
+
+  - model_name: muse-glimmer
+    litellm_params:
+      model: openai/muse-glimmer
+      api_base: http://muse-glimmer:8000/v1
+      api_key: none
+      max_tokens: 16384
+      # Meta's published sampling: temperature 1.0 / top_p 0.95 / top_k 64.
+      # The model card warns against greedy decoding.
+      temperature: 1.0
+      top_p: 0.95
+      frequency_penalty: 0
+      presence_penalty: 0
+      extra_body:
+        top_k: 64
+      stream_timeout: 300
+    model_info:
+      max_input_tokens: 114688
+      max_output_tokens: 16384
+      supports_vision: true
 
   - model_name: qwen2.5-vl
     litellm_params:

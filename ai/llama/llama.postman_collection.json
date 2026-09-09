@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "llama",
-    "description": "llama.cpp `llama-server` endpoints — GGUF-quantized models exposed via an OpenAI-compatible HTTP surface plus llama.cpp-native extras. Every service in `ai/llama/docker-compose.llama.yml` is a standalone llama-server; the default deploy publishes the `glm5.2` container on `localhost:8010` (see `PORT_LLAMA_GLM52` in `.env`) with model alias `glm5.2`. Set the collection variable `llama` to the direct-port base URL (default http://localhost:8010) — no auth is required on the direct port per LLAMA.md.\n\nThe 'Via LiteLLM' folder routes chat through the unified LiteLLM proxy at `{{litellm}}/v1/chat/completions` using the same `glm5.2` alias (registered in `ai/litellm/litellm_config.yaml` → `model_list`). LiteLLM requires bearer auth via a virtual master key.\n\nNotes:\n- `/v1/embeddings` is only mounted when `llama-server` is launched with `--embedding` (or `--pooling`). The current `glm5.2` command in `docker-compose.llama.yml` does NOT enable it, so no embeddings request is included by default. Add `--embedding` to the service `command:` block and uncomment the equivalent request if you need it.\n- First request after container start is slow — llama.cpp runs a warmup pass on the first inference call (see LLAMA.md § Non-obvious constraints).\n- The healthcheck has a 900 s `start_period` to cover the initial GGUF download; `/health` will 503 while the model is still loading.",
+    "description": "llama.cpp `llama-server` endpoints — GGUF-quantized models exposed via an OpenAI-compatible HTTP surface plus llama.cpp-native extras. Every service in `ai/llama/docker-compose.llama.yml` is a standalone llama-server; the default deploy publishes the `glm5.2` container on `localhost:8010` (see `PORT_LLAMA_GLM52` in `.env`) with model alias `glm5.2`. The other two services are `qwen3.8-flash` on `localhost:8017` (`PORT_LLAMA_QWEN38_FLASH`, variable `llamaQwen38Flash`) and `glm5.3-flash` on `localhost:8020` (`PORT_LLAMA_GLM53_FLASH`, variable `llamaGlm53Flash`) \u2014 the latter is the CPU + RAM-only GLM-5.3-Flash service with no GPU, so budget minutes for time-to-first-token on large prompts. Set the collection variable `llama` to the direct-port base URL (default http://localhost:8010) — no auth is required on the direct port per LLAMA.md.\n\nThe 'Via LiteLLM' folder routes chat through the unified LiteLLM proxy at `{{litellm}}/v1/chat/completions` using the same `glm5.2` alias (registered in `ai/litellm/litellm_config.yaml` → `model_list`). LiteLLM requires bearer auth via a virtual master key.\n\nNotes:\n- `/v1/embeddings` is only mounted when `llama-server` is launched with `--embedding` (or `--pooling`). The current `glm5.2` command in `docker-compose.llama.yml` does NOT enable it, so no embeddings request is included by default. Add `--embedding` to the service `command:` block and uncomment the equivalent request if you need it.\n- First request after container start is slow — llama.cpp runs a warmup pass on the first inference call (see LLAMA.md § Non-obvious constraints).\n- The healthcheck has a 900 s `start_period` to cover the initial GGUF download; `/health` will 503 while the model is still loading.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
     "_postman_id": "llama-collection"
   },
@@ -23,6 +23,12 @@
       "value": "http://localhost:8017",
       "type": "string",
       "description": "Direct-port base URL for the `qwen3.8-flash` llama-server container. Published on `${PORT_LLAMA_QWEN38_FLASH}` (default 8017) → container port 8000. On `ai_shared` it's http://qwen3.8-flash:8000. Model alias is `qwen3.8-flash`. Launched with the thinking-mode sampling defaults from the Qwen3.8-Flash-Next model card (LLAMA.md § `qwen3.8-flash` sampling defaults)."
+    },
+    {
+      "key": "llamaGlm53Flash",
+      "value": "http://localhost:8020",
+      "type": "string",
+      "description": "Direct-port base URL for the `glm5.3-flash` llama-server container. Published on `${PORT_LLAMA_GLM53_FLASH}` (default 8020) \u2192 container port 8000. On `ai_shared` it's http://glm5.3-flash:8000. Model alias is `glm5.3-flash`. This service runs GLM-5.3-Flash entirely on CPU + system RAM (no GPU) with MTP speculative decoding, so expect a long time-to-first-token on big prompts (LLAMA.md \u00a7 `glm5.3-flash` \u2014 GLM-5.3-Flash on CPU and RAM only)."
     },
     {
       "key": "litellm",
@@ -119,6 +125,40 @@
           "path": ["v1", "chat", "completions"]
         },
         "description": "OpenAI-compatible chat completion against the `qwen3.8-flash` llama-server container (port 8017 by default). The service is launched with thinking-mode sampling defaults (`--temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0`) baked into the compose `command:` block — see LLAMA.md § `qwen3.8-flash` sampling defaults. Override any of those per-request by passing `temperature`, `top_p`, `top_k`, `min_p`, or `presence_penalty` in the JSON body. Add `\"stream\": true` for SSE streaming."
+      },
+      "response": []
+    },
+    {
+      "name": "POST /v1/chat/completions (glm5.3-flash)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"model\": \"glm5.3-flash\",\n  \"messages\": [\n    { \"role\": \"user\", \"content\": \"Hello!\" }\n  ],\n  \"chat_template_kwargs\": { \"reasoning_effort\": \"low\" }\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{llamaGlm53Flash}}/v1/chat/completions",
+          "host": [
+            "{{llamaGlm53Flash}}"
+          ],
+          "path": [
+            "v1",
+            "chat",
+            "completions"
+          ]
+        },
+        "description": "OpenAI-compatible chat completion against the `glm5.3-flash` llama-server container (port 8020 by default) \u2014 GLM-5.3-Flash running entirely on CPU + RAM with MTP speculative decoding. Server defaults baked into the compose `command:` block: `--temp 1.0 --top-p 0.95`, chat-template `reasoning_effort=low`, `--reasoning-budget 8192`, `--n-predict 32768`. Override sampling per request via `temperature` / `top_p`; override the thinking level with `chat_template_kwargs: {\"reasoning_effort\": \"low\" | \"high\" | \"max\"}` (anything else is treated as `max`). Streaming (`\"stream\": true`) is strongly recommended \u2014 on a long uncached prompt the first token can take minutes because prompt processing runs on CPU. Errors: 503 while the model is still downloading / mlocking (first start: ~148 GB). LLAMA.md \u00a7 `glm5.3-flash` \u2014 GLM-5.3-Flash on CPU and RAM only."
       },
       "response": []
     },

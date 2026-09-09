@@ -96,7 +96,7 @@ services:
       args:
         LLAMA_UNSLOTH_TAG: ${LLAMA_UNSLOTH_TAG:-b10796-mix-659e406}
         LLAMA_UNSLOTH_VARIANT: ${LLAMA_UNSLOTH_VARIANT:-cuda13-portable}
-        CUDA_RUNTIME_IMAGE: ${LLAMA_CUDA_RUNTIME_IMAGE:-nvidia/cuda:13.3.1-runtime-ubuntu22.04}
+        BASE_IMAGE: ${LLAMA_CUDA_RUNTIME_IMAGE:-nvidia/cuda:13.3.1-runtime-ubuntu22.04}
     image: llama-unsloth:${LLAMA_UNSLOTH_TAG:-b10796-mix-659e406}-${LLAMA_UNSLOTH_VARIANT:-cuda13-portable}
     # Local-only image name: never try to pull it from a registry. Without
     # this, `up` / `pull` print "pull access denied for llama-unsloth" before
@@ -221,6 +221,147 @@ services:
       --presence-penalty 0.0
       --reasoning-budget 8192
       --reasoning-budget-message "Time to stop thinking. Give the final answer or make the tool call now."
+
+  glm5.3-flash:
+    networks:
+      - shared
+    # CPU-ONLY service — no `runtime: nvidia`, no GPU reservation. Weights, KV
+    # cache and the MTP draft head all live in system RAM; the three A6000s
+    # stay free for the vLLM / GPU llama services. Same Dockerfile as
+    # qwen3.8-flash, but the `cpu` tarball flavour on a plain ubuntu:22.04
+    # base (the tarballs are built on GitHub's ubuntu-22.04 runner).
+    #
+    # Why the Unsloth prebuild and not ghcr.io/ggml-org/llama.cpp:server:
+    # mainline has NOT merged the glm5next architecture (GLM-5.3-Flash) —
+    # ggml-org/llama.cpp#27754 is still open (2026-09-09) and the stock image
+    # dies with `unknown model architecture: 'glm5next'`. Unsloth's mix
+    # releases carry #27754; its head branch (unslothai glm5next/upstream)
+    # also contains the NextN/MTP draft graph for this arch, so `--spec-type
+    # draft-mtp` works. Pinned separately from qwen3.8-flash via
+    # LLAMA_UNSLOTH_CPU_TAG so bumping one never rebuilds / re-validates the
+    # other. Bump: edit .env, then
+    #   docker compose -f ai/llama/docker-compose.llama.yml up -d --build --force-recreate glm5.3-flash
+    build:
+      context: ../..
+      dockerfile: ai/llama/Dockerfile.llama-unsloth
+      args:
+        LLAMA_UNSLOTH_TAG: ${LLAMA_UNSLOTH_CPU_TAG:-b10840-mix-d5c17a0}
+        LLAMA_UNSLOTH_VARIANT: cpu
+        BASE_IMAGE: ubuntu:22.04
+    image: llama-unsloth:${LLAMA_UNSLOTH_CPU_TAG:-b10840-mix-d5c17a0}-cpu
+    # Local-only image name: never try to pull it from a registry.
+    pull_policy: build
+    container_name: glm5.3-flash
+    restart: unless-stopped
+    environment:
+      - HF_TOKEN=${HF_TOKEN}
+      - LLAMA_ARG_HF_TOKEN=${HF_TOKEN}
+    ports:
+      - "${PORT_LLAMA_GLM53_FLASH}:8000"
+    volumes:
+      # llama-server stores -hf downloads in a HF-hub layout under
+      # $HOME/.cache/huggingface/hub. Shared with the other llama services.
+      - llama_data:/root/.cache/huggingface
+    # `--load-mode mmap+mlock` below pins the weights so the kernel cannot
+    # page them out under memory pressure (a page-out on a 150 GB working set
+    # means multi-second stalls per token). Docker's default memlock ulimit is
+    # 64 KB, which makes mlock fail with a "failed to mlock" warning and fall
+    # back to plain mmap — lift it here.
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+      # First start downloads ~148 GB (UD-Q3_K_XL) and then pages every byte
+      # into RAM for mlock — well past the GPU services' 900 s.
+      start_period: 1800s
+    # MODEL CHOICE: GLM-5.3-Flash (321B total / 18B active, 288 experts, 8
+    # routed per token) rather than full GLM-5.3 (754B / 40B active). On a
+    # CPU-only ~200 GB box the full model does not fit at any quant (smallest
+    # UD-IQ1_S is 217 GB) and its 40B active params would also read >2x the
+    # bytes per token — CPU decode is memory-bandwidth bound, so tok/s scales
+    # with active bytes, not total size. Z.ai reports Flash beating GLM-5.2 on
+    # their benchmarks anyway.
+    #
+    # QUANT (LLAMA_GLM53_FLASH_QUANT): K-quants only. IQ*_XXS / IQ1 / IQ2 use
+    # codebook lookups with no fast CPU matmul path and run roughly half the
+    # speed of a K-quant of similar size on CPU. Sizes from the model card:
+    #   UD-Q2_K_XL  109 GB  ~78% accuracy retained  — fallback if RAM is tight
+    #   UD-Q3_K_XL  148 GB  (default)               — fits 200 GB with ~50 GB spare
+    #   UD-Q4_K_XL  200 GB  ~93% accuracy retained  — needs a 256 GB+ RAM upgrade
+    # Whatever the quant, the WHOLE file is mlocked: weights + ~10-15 GB for KV,
+    # compute buffers and the draft head must fit in free RAM alongside every
+    # other container on the box — glm5.2's CPU-offloaded experts (blk 0-38 via
+    # -ot, ~70 GB at UD-IQ1_S) do not coexist with this service in 200 GB.
+    #
+    # THREADS / NUMA: -t is left at llama.cpp's default (= physical cores the
+    # container can see). On a dual-socket host add `--numa distribute` (and
+    # drop the page cache first, per the flag's own help text) through
+    # LLAMA_GLM53_FLASH_EXTRA_ARGS — it is the single biggest CPU knob and
+    # cannot be guessed from here.
+    #
+    # MTP SPECULATIVE DECODING: the NextN draft head is embedded in the main
+    # GGUF (blk.45.nextn.* tensors — 45 trunk layers + 1 NextN block), so there
+    # is no -hfd / -md pair like qwen3.8-flash; `--spec-type draft-mtp` alone
+    # makes llama-server load the extra layer and run it as the drafter.
+    # Verification is exact, so output is unchanged. The upstream MTP PR for
+    # this arch (ggml-org/llama.cpp#27917) measures acceptance 0.74 / mean
+    # draft len 4.1 and a 15-30% decode speedup on a heavily CPU-bound box at
+    # n_max 3; Unsloth measures up to 3.3x at long context on GPU. CPU decode
+    # is bandwidth bound, so verifying 3 tokens costs about the same weight
+    # traffic as 1 — n_max 3 rather than the GPU-tuned 2. Confirm it is on
+    # by grepping the log for `draft acceptance =`. If tok/s is worse with
+    # it (many concurrent streams, or high sampling temperature lowering
+    # acceptance), delete the two --spec-* lines.
+    #
+    # CONTEXT / OUTPUT: -c 262144 with --parallel 1 = one 256k slot. KV is
+    # cheap here (MLA/DSA layers + recurrent KDA state), so RAM is not the
+    # limit — CPU prefill is: expect low hundreds of tok/s for prompt
+    # processing, i.e. minutes for a 100k-token prompt (llama-server's slot
+    # prompt cache means only the new suffix is re-processed on follow-ups).
+    # --n-predict 32768 caps output per request; the LiteLLM glm5.3-flash
+    # entry mirrors it (max_tokens / max_output_tokens = 32768,
+    # max_input_tokens = 262144 - 32768 = 229376). Change all three together.
+    #
+    # THINKING: the GGUF's chat template reads reasoning_effort from
+    # --chat-template-kwargs and accepts exactly 'low' | 'high'; anything
+    # else (including 'medium') falls through to 'max'. At CPU speeds a
+    # 'max' think block can run 20k+ tokens = tens of minutes per turn, so
+    # the default is 'low' (LLAMA_GLM53_FLASH_REASONING_EFFORT) plus the
+    # --reasoning-budget hard cap: when 8192 thinking tokens are hit,
+    # llama-server injects --reasoning-budget-message and closes the think
+    # block so the model must answer or call a tool. -1 disables the cap.
+    #
+    # SAMPLING: model card defaults temperature 1.0 / top_p 0.95 (DeepSWE-style
+    # agentic coding: 0.95 / 1.0). Server defaults; clients override per call.
+    #
+    # Deliberately NOT set: -ngl (this build has no GPU backend), -t (see
+    # above), --cache-type-k/-v (MLA KV is small; f16 keeps the DSA indexer
+    # path exact), --flash-attn (auto). NVIDIA-only workarounds from the
+    # #27754 thread (NVIDIA_TF32_OVERRIDE=0, -fa off) do not apply on CPU.
+    # Do NOT paste a `#` comment inside the `command: >` block — YAML's folded
+    # scalar has no comment syntax and it would become a literal argument.
+    command: >
+      -hf unsloth/GLM-5.3-Flash-GGUF:${LLAMA_GLM53_FLASH_QUANT:-UD-Q3_K_XL}
+      -a glm5.3-flash
+      --host 0.0.0.0 --port 8000
+      --spec-type draft-mtp
+      --spec-draft-n-max 3
+      -c 262144
+      --parallel 1
+      --n-predict 32768
+      --load-mode mmap+mlock
+      --jinja
+      --chat-template-kwargs '{"reasoning_effort":"${LLAMA_GLM53_FLASH_REASONING_EFFORT:-low}"}'
+      --reasoning-budget 8192
+      --reasoning-budget-message "Time to stop thinking. Give the final answer or make the tool call now."
+      --temp 1.0
+      --top-p 0.95
+      ${LLAMA_GLM53_FLASH_EXTRA_ARGS:-}
 
 volumes:
   llama_data:

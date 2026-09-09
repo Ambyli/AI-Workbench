@@ -12,14 +12,15 @@ docker compose -f ai/llama/docker-compose.llama.yml up -d
 make up llama
 ```
 
-This launches two containers by default:
+This launches three containers by default:
 
 | Container | Port | Model | Quant | Weights |
 |---|---|---|---|---|
 | `glm5.2` | `localhost:8010` | Z.ai GLM-5.2 (~753B-A40B MoE) | UD-IQ1_S (~176 GB) | `unsloth/GLM-5.2-GGUF` |
 | `qwen3.8-flash` | `localhost:8017` | Qwen3.8-Flash-Next | UD-Q4_K_XL + MTP `shared-Q8_0` draft head | `unsloth/Qwen3.8-Flash-Next-GGUF` |
+| `glm5.3-flash` | `localhost:8020` | Z.ai GLM-5.3-Flash (321B-A18B MoE) — **CPU + RAM only, no GPU** | UD-Q3_K_XL (~148 GB) + embedded MTP head | `unsloth/GLM-5.3-Flash-GGUF` |
 
-`glm5.2` runs the stock `ghcr.io/ggml-org/llama.cpp:server-cuda` image. `qwen3.8-flash` builds a local image from Unsloth's llama.cpp prebuild ([`Dockerfile.llama-unsloth`](Dockerfile.llama-unsloth)) because MTP speculative decoding for this model is not in mainline llama.cpp yet — see [MTP speculative decoding](#qwen38-flash-mtp-speculative-decoding) below. `make up llama` / `docker compose up -d` build it on first run.
+`glm5.2` runs the stock `ghcr.io/ggml-org/llama.cpp:server-cuda` image. `qwen3.8-flash` and `glm5.3-flash` build local images from Unsloth's llama.cpp prebuilds ([`Dockerfile.llama-unsloth`](Dockerfile.llama-unsloth)): the first because MTP speculative decoding for Qwen3.8-Flash-Next is not in mainline llama.cpp yet — see [MTP speculative decoding](#qwen38-flash-mtp-speculative-decoding) below — the second because the GLM-5.3-Flash architecture itself is not merged upstream, and it uses the GPU-free `cpu` tarball flavour — see [`glm5.3-flash` — GLM-5.3-Flash on CPU and RAM only](#glm53-flash--glm-53-flash-on-cpu-and-ram-only). `make up llama` / `docker compose up -d` build both on first run.
 
 Test with:
 
@@ -129,9 +130,77 @@ Why 8192: with the fixed chat template's default `reasoning_effort=medium`, most
 
 Why 64k output: Qwen3.8 runs in thinking mode with reasoning preserved, and Unsloth's guidance for Qwen thinking models is a 32k output budget for most prompts and ~80k for hard reasoning. 64k covers nearly everything without starving input. Change `--n-predict`, `max_tokens` / `max_output_tokens`, and `max_input_tokens` **together** — input + output must equal the slot size, and `max_input_tokens` is what `context_window_fallbacks` uses to decide when a request is too big and gets routed to `claude-sonnet-5` (the paid model). Recreate both `qwen3.8-flash` and `litellm` after editing.
 
+### `glm5.3-flash` — GLM-5.3-Flash on CPU and RAM only
+
+`glm5.3-flash` is the one service in this stack with **no GPU at all**: no `runtime: nvidia`, no device reservation, and a llama.cpp build that has no CUDA backend. Weights, KV cache and the MTP draft head live in system RAM and every matmul runs on the CPU cores. It exists so a frontier-class coding model can sit on the box without taking a single byte of VRAM from the vLLM / GPU llama services.
+
+**Why Flash, not full GLM-5.3.** GLM-5.3 and GLM-5.3-Flash are different models, not two quants of one: GLM-5.3 is 754B total / 40B active (same base as GLM-5.2), GLM-5.3-Flash is 321B total / 18B active (288 experts, 8 routed per token, hybrid KDA linear attention + sparse MLA, 1M context). For a CPU box both numbers point the same way:
+
+- **It has to fit in RAM.** The smallest GLM-5.3 quant (`UD-IQ1_S`) is 217 GB — larger than a 200 GB box before the KV cache exists. GLM-5.3-Flash `UD-Q3_K_XL` is 148 GB.
+- **CPU decode is memory-bandwidth bound.** Each generated token streams every *active* weight through the memory bus, so tok/s scales with active bytes, not total size. 18B active at ~3.5 bpw is ~8 GB/token; 40B active at 1 bpw is ~5 GB/token but at 1-bit quality, and at any usable quant it is 2x+ the bytes. Flash decodes at roughly twice the speed of the full model at a comparable quality quant.
+- Z.ai's own numbers have Flash beating GLM-5.2 on their benchmarks, so nothing is given up relative to the `glm5.2` service.
+
+If more RAM is added later, spend it on a higher Flash quant (`UD-Q4_K_XL`, 200 GB, ~93% accuracy retained on Unsloth's KL-divergence tests) rather than on a 1-bit full GLM-5.3 — same RAM, better quality, twice the tok/s.
+
+**Quant and RAM budget.** The service loads with `--load-mode mmap+mlock`, so the *entire* GGUF is pinned in RAM plus ~10–15 GB for KV, compute buffers and the draft head. Everything else on the box (vLLM pinned buffers, the other llama services, Postgres, …) has to fit in what is left. Only K-quants are sensible on CPU — the `IQ*` families use codebook lookups without a fast CPU matmul path and run at roughly half the speed of a K-quant of the same size.
+
+| `LLAMA_GLM53_FLASH_QUANT` | Weights | Accuracy retained (Unsloth) | RAM you need | Notes |
+|---|---|---|---|---|
+| `UD-Q2_K_XL` | 109 GB | ~78% | ~130 GB | Fallback if the default doesn't fit next to the rest of the box. |
+| **`UD-Q3_K_XL`** _(default)_ | 148 GB | ~85% | ~165 GB | Fits a 200 GB box with ~35 GB for everything else. |
+| `UD-Q4_K_XL` | 200 GB | ~93% | ~220 GB | Needs a 256 GB+ RAM upgrade. Best quality/speed point once you have it. |
+
+> **`glm5.2` and `glm5.3-flash` do not coexist in 200 GB.** `glm5.2` keeps the experts of blocks 0–38 in system RAM via `-ot` (~70 GB at UD-IQ1_S). With `glm5.3-flash` pinning another 148 GB, mlock fails or the kernel OOM-kills one of them. Stop `glm5.2` before starting `glm5.3-flash` (or move to 256 GB+). A `failed to mlock` warning in the log means the pin fell back to plain mmap — the model still runs, but page-outs turn into multi-second stalls.
+
+**Threads and NUMA.** `-t` is left at llama.cpp's default, which is the number of physical cores the container can see — normally the right answer. On a dual-socket host, `--numa distribute` is the single biggest CPU knob (llama.cpp's own help text says to drop the page cache first when switching it on). Both go through `LLAMA_GLM53_FLASH_EXTRA_ARGS`, which is appended verbatim to the command:
+
+```bash
+# .env
+LLAMA_GLM53_FLASH_EXTRA_ARGS=--numa distribute -t 48
+```
+
+**MTP speculative decoding.** GLM-5.3-Flash ships one NextN block (`blk.45.nextn.*`, after the 45 trunk layers) *inside* the main GGUF, so unlike `qwen3.8-flash` there is no `-hfd` / `-md` pair: `--spec-type draft-mtp` alone makes llama-server load the extra layer and run it as the drafter. Verification is exact, so output is unchanged. Upstream's MTP PR for this architecture ([ggml-org/llama.cpp#27917](https://github.com/ggml-org/llama.cpp/pull/27917)) measures acceptance 0.74 / mean draft length 4.1 and a 15–30% decode speedup on a heavily CPU-bound setup at `--spec-draft-n-max 3`; Unsloth measures up to 3.3x at long context on GPU. Because CPU decode is bandwidth bound, verifying three drafted tokens costs about the same weight traffic as one, which is why the service uses `n_max 3` rather than the GPU-tuned 2. Confirm it is active the same way as for `qwen3.8-flash`:
+
+```bash
+make logs llama glm5.3-flash | grep "draft acceptance"
+```
+
+If tok/s is *worse* with it on (many concurrent streams, or a high sampling temperature dragging acceptance down), delete the two `--spec-*` lines from the `command:` block.
+
+**Thinking budget.** The GGUF's chat template reads `reasoning_effort` from `--chat-template-kwargs` and accepts exactly `low` and `high`; any other value — including `medium` — falls through to `max`. At CPU speeds a `max` think block can run 20k+ tokens, i.e. tens of minutes per turn, so the default is `low` (`LLAMA_GLM53_FLASH_REASONING_EFFORT`) with `--reasoning-budget 8192` as a hard cap (same mechanism as `qwen3.8-flash`: when the cap hits, the `--reasoning-budget-message` text is injected and the think block is closed). Raise to `high` for hard problems you are willing to wait for; set the budget to `-1` in the compose to remove the cap.
+
+**Context and output.** `-c 262144 --parallel 1` gives one 256k slot. KV is cheap for this architecture (MLA/DSA layers plus a fixed-size recurrent KDA state), so RAM is not what limits context — CPU prefill is. Expect low hundreds of tok/s for prompt processing, i.e. minutes for a fresh 100k-token prompt; llama-server's slot prompt cache means follow-up turns only re-process the new suffix. `--n-predict 32768` caps output per request, mirrored in the LiteLLM entry:
+
+| Setting | Where | Value |
+|---|---|---|
+| Context (one slot) | llama-server (`-c` / `--parallel`) | 262,144 |
+| `--n-predict` | llama-server | 32,768 |
+| `max_tokens`, `max_output_tokens` | `ai/litellm/litellm_config.yaml` → `glm5.3-flash` | 32,768 |
+| `max_input_tokens` | same entry | 229,376 |
+| `stream_timeout` | same entry | 1800 s — time-to-first-chunk budget; a long uncached prompt on CPU legitimately takes minutes before the first token |
+
+Change `--n-predict`, `max_tokens` / `max_output_tokens`, and `max_input_tokens` together; recreate both `glm5.3-flash` and `litellm` after editing.
+
+**Build pin.** The `glm5next` architecture is **not in mainline llama.cpp** — [ggml-org/llama.cpp#27754](https://github.com/ggml-org/llama.cpp/pull/27754) is still open, and the stock `ghcr.io/ggml-org/llama.cpp:server` image fails with `unknown model architecture: 'glm5next'`. Unsloth's mix releases carry #27754, whose head branch (`unslothai/llama.cpp` `glm5next/upstream`) also contains the NextN/MTP draft graph for the arch. The service builds [`Dockerfile.llama-unsloth`](Dockerfile.llama-unsloth) with the `linux-x64-cpu` tarball on a plain `ubuntu:22.04` base, pinned by its **own** key so it never forces a rebuild or re-validation of `qwen3.8-flash`:
+
+| Key | Default | Notes |
+|---|---|---|
+| `LLAMA_UNSLOTH_CPU_TAG` | `b10840-mix-d5c17a0` | Unsloth release tag ([releases](https://github.com/unslothai/llama.cpp/releases)). Part of the image name (`llama-unsloth:<tag>-cpu`), so a bump forces a rebuild. Verified for this tag: the `cpu` tarball's `libllama.so` contains the `glm5next` arch and its MTP graph, and every flag in the `command:` block is present in the build. |
+| `LLAMA_GLM53_FLASH_QUANT` | `UD-Q3_K_XL` | Quant tag on `unsloth/GLM-5.3-Flash-GGUF` — see the RAM table above. |
+| `LLAMA_GLM53_FLASH_REASONING_EFFORT` | `low` | `low` \| `high` \| `max`. |
+| `LLAMA_GLM53_FLASH_EXTRA_ARGS` | _(empty)_ | Extra llama-server args appended verbatim (`--numa distribute`, `-t N`, `--flash-attn off`, …). |
+
+```bash
+docker compose -f ai/llama/docker-compose.llama.yml up -d --build --force-recreate glm5.3-flash
+```
+
+Deliberately **not** set: `-ngl` (the build has no GPU backend), `--cache-type-k/-v` (KV is small and f16 keeps the DSA indexer path exact), `--flash-attn` (auto). The NVIDIA-only workarounds discussed on #27754 (`NVIDIA_TF32_OVERRIDE=0`, `-fa off`) don't apply on CPU.
+
+**What to expect.** Decode speed is set almost entirely by memory bandwidth: a dual-socket server with 8–12 DDR4/DDR5 channels lands in the high single digits to low teens tok/s before MTP; a desktop with two or four channels is 2–4 tok/s. The `--reasoning-budget` cap and `low` effort are what keep that usable for agentic loops.
+
 ### First-run download
 
-Both services use llama-server's `-hf` flag (and, for `qwen3.8-flash`, `-hfd` + `-md` for the MTP head) to download GGUFs from HuggingFace on first start. The weights land in the `llama_data` named volume, mounted at `/root/.cache/huggingface` — llama-server keeps a HuggingFace-hub-style cache at `~/.cache/huggingface/hub` (override with `LLAMA_CACHE` or `HF_HUB_CACHE`) — so subsequent starts are instant. Expect the first launch to take a while — UD-IQ1_S is ~176 GB across split GGUF files. Follow progress with:
+All services use llama-server's `-hf` flag (and, for `qwen3.8-flash`, `-hfd` + `-md` for the MTP head) to download GGUFs from HuggingFace on first start. The weights land in the `llama_data` named volume, mounted at `/root/.cache/huggingface` — llama-server keeps a HuggingFace-hub-style cache at `~/.cache/huggingface/hub` (override with `LLAMA_CACHE` or `HF_HUB_CACHE`) — so subsequent starts are instant. Expect the first launch to take a while — UD-IQ1_S is ~176 GB across split GGUF files. Follow progress with:
 
 ```bash
 make logs llama glm5.2
@@ -218,11 +287,11 @@ Add a new service block to `ai/llama/docker-compose.llama.yml`. A commented temp
    $(eval $(call service,llama,glm5.2 my-new-model))
    ```
 
-Both services share the `llama_data` volume, so downloads for one don't affect the other.
+All services share the `llama_data` volume, so downloads for one don't affect the others.
 
 ### LiteLLM integration
 
-Both `glm5.2` and `qwen3.8-flash` are pre-registered in [`ai/litellm/litellm_config.yaml`](../litellm/litellm_config.yaml) under `model_list`, and both have a `context_window_fallbacks` entry to `claude-sonnet-5`. Container-name DNS works because LiteLLM and every llama-server sit on `ai_shared`, so the `api_base` values (`http://glm5.2:8000/v1`, `http://qwen3.8-flash:8000/v1`) resolve inside the network.
+`glm5.2`, `qwen3.8-flash` and `glm5.3-flash` are pre-registered in [`ai/litellm/litellm_config.yaml`](../litellm/litellm_config.yaml) under `model_list`, and all three have `fallbacks` and `context_window_fallbacks` entries to `claude-sonnet-5`. Container-name DNS works because LiteLLM and every llama-server sit on `ai_shared`, so the `api_base` values (`http://glm5.2:8000/v1`, `http://qwen3.8-flash:8000/v1`, `http://glm5.3-flash:8000/v1`) resolve inside the network.
 
 Clients hit LiteLLM the same way they hit any other model:
 
@@ -233,7 +302,7 @@ curl http://localhost:4001/v1/chat/completions \
   -d '{"model": "qwen3.8-flash", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
 
-**Adding a new llama-server service to LiteLLM** — copy the closest existing entry (`glm5.2` for large-context / long-thinking models, `qwen3.8-flash` for Qwen-family thinking-mode defaults) and change `model_name`, `model:`, and `api_base:` to match your service's `-a <alias>` and `container_name`. Register the fallback in `litellm_settings.context_window_fallbacks` in the same edit.
+**Adding a new llama-server service to LiteLLM** — copy the closest existing entry (`glm5.2` for large-context / long-thinking models, `qwen3.8-flash` for Qwen-family thinking-mode defaults, `glm5.3-flash` for a slow CPU backend that needs a long `stream_timeout`) and change `model_name`, `model:`, and `api_base:` to match your service's `-a <alias>` and `container_name`. Register the fallback in `litellm_settings.context_window_fallbacks` in the same edit.
 
 ### State files (outside the repo)
 
@@ -244,7 +313,9 @@ curl http://localhost:4001/v1/chat/completions \
 ### Non-obvious constraints
 
 - **`ghcr.io/ggml-org/llama.cpp:server-cuda` is a moving tag.** Upstream ships fast and occasionally changes CLI flag names (`--n-cpu-moe` is relatively new — added mid-2026). If you upgrade and see `unrecognized argument`, pin to a specific dated tag from https://github.com/ggml-org/llama.cpp/pkgs/container/llama.cpp.
-- **`qwen3.8-flash` is pinned, `glm5.2` is not.** The Unsloth prebuild is pinned by `LLAMA_UNSLOTH_TAG`; it is a full llama.cpp (`b10796` upstream + patches), so every flag the stock image accepts works there too. The two images can drift apart in flag names independently — check the pinned release when a flag rename appears upstream.
+- **`qwen3.8-flash` and `glm5.3-flash` are pinned, `glm5.2` is not.** The Unsloth prebuilds are pinned by `LLAMA_UNSLOTH_TAG` (`b10796`, CUDA) and `LLAMA_UNSLOTH_CPU_TAG` (`b10840`, CPU) respectively; each is a full llama.cpp (upstream + patches), so every flag the stock image accepts works there too. The three images can drift apart in flag names independently — check the pinned release when a flag rename appears upstream. The two pins are deliberately separate so bumping one never rebuilds the other.
+- **`glm5.3-flash` needs an unlimited `memlock` ulimit.** `--load-mode mmap+mlock` pins ~150 GB; Docker's default memlock limit is 64 KB, so the compose service sets `ulimits.memlock` to `-1`. If you copy the block for another CPU model, keep it — without it the log shows `failed to mlock` and the weights silently become evictable.
+- **`IQ*` quants are a CPU trap.** They are the smallest files, but the codebook dequant has no fast CPU matmul path — on the CPU-only service a `UD-IQ3_XXS` (120 GB) decodes slower than `UD-Q3_K_XL` (148 GB). Stick to `Q*_K_*` there.
 - **`llama_data` must stay mounted at `/root/.cache/huggingface`.** llama-server writes `-hf` / `-hfd` downloads to `~/.cache/huggingface/hub/models--<owner>--<repo>/` (same layout as the `huggingface_hub` Python library). Mounting the volume anywhere else means a full re-download on every `--force-recreate`.
 - **Split GGUF files auto-resolve via `-hf`.** UD-IQ1_S ships as `*-00001-of-000NN.gguf` chunks. llama-server fetches and stitches them; you don't need to pass any of the individual filenames.
 - **`--mlock` requires the container to have the `IPC_LOCK` capability on kernels that enforce RLIMIT_MEMLOCK.** If model load fails with a mlock error, add `cap_add: [IPC_LOCK]` to the service. Not needed on typical Docker Desktop / systemd setups.
@@ -268,4 +339,4 @@ curl http://localhost:4001/v1/chat/completions \
 
 ### No tests
 
-There is no automated test suite. Verify by hitting `/v1/chat/completions` after `make up llama glm5.2` and confirming a coherent response. `curl http://localhost:8010/health` should return `{"status":"ok"}` once the model has finished loading.
+There is no automated test suite. Verify by hitting `/v1/chat/completions` after `make up llama glm5.2` and confirming a coherent response. `curl http://localhost:8010/health` should return `{"status":"ok"}` once the model has finished loading. For `glm5.3-flash` use port 8020 and expect the first `/health` OK to take a good while after the download — the mlock pass touches every page of the file before the server starts answering.

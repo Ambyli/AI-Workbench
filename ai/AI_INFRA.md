@@ -30,7 +30,7 @@ Every service in the list below is on the `ai_shared` network unless noted. Port
 | [`oauth2-proxy/docker-compose.oauth2-proxy.yml`](oauth2-proxy/docker-compose.oauth2-proxy.yml) | `oauth2-proxy`, `oauth2-assets` | `4180` _(oauth2-assets is internal-only)_ | [OAUTH2_PROXY.md](oauth2-proxy/OAUTH2_PROXY.md) |
 | [`cloudflared/docker-compose.cloudflared.yml`](cloudflared/docker-compose.cloudflared.yml) | `cloudflared` | _(outbound tunnel — no publish)_ | [CLOUDFLARED.md](cloudflared/CLOUDFLARED.md) |
 | [`vllm/docker-compose.vllm.yml`](vllm/docker-compose.vllm.yml) | `qwen3.6`, `qwen3.8`, `qwen3.8-solo`, `vllm-qwen-vl`, `muse-glimmer` | `8002`, `8003`, `8019`, `8006`, `8018` | [VLLM.md](vllm/VLLM.md) · [GPU_SHARING_GUIDE.md](GPU_SHARING_GUIDE.md) |
-| [`llama/docker-compose.llama.yml`](llama/docker-compose.llama.yml) | `glm5.2`, `qwen3.8-flash` | `8010`, `8017` | [LLAMA.md](llama/LLAMA.md) |
+| [`llama/docker-compose.llama.yml`](llama/docker-compose.llama.yml) | `glm5.2`, `qwen3.8-flash`, `glm5.3-flash` | `8010`, `8017`, `8020` | [LLAMA.md](llama/LLAMA.md) |
 | [`kokoro/docker-compose.kokoro.yml`](kokoro/docker-compose.kokoro.yml) | `kokoro-api`, `kokoro-app` (internal) | `8004` | [KOKORO.md](kokoro/KOKORO.md) |
 | [`madlad/docker-compose.madlad.yml`](madlad/docker-compose.madlad.yml) | `madlad-api`, `madlad-app` (internal) | `8008` | [MADLAD.md](madlad/MADLAD.md) |
 | [`classifier/docker-compose.classifier.yml`](classifier/docker-compose.classifier.yml) | `classifier` | `8005` | [classifier/API.md](classifier/API.md) |
@@ -88,6 +88,7 @@ flowchart TB
     subgraph LMG["llama/docker-compose.llama.yml"]
         LGLM["glm5.2<br/>:8010<br/>GLM-5.2 UD-IQ1_S<br/>(llama.cpp + CPU MoE offload)"]:::svc
         LQWF["qwen3.8-flash<br/>:8017<br/>Qwen3.8-Flash-Next UD-Q4_K_XL<br/>+ MTP draft head<br/>(Unsloth llama.cpp prebuild)"]:::svc
+        LGLMF["glm5.3-flash<br/>:8020<br/>GLM-5.3-Flash UD-Q3_K_XL<br/>+ embedded MTP head<br/>CPU + RAM only, no GPU<br/>(Unsloth llama.cpp CPU prebuild)"]:::svc
     end
     subgraph KG["kokoro/docker-compose.kokoro.yml"]
         KAPI["kokoro-api<br/>:8004"]:::svc
@@ -147,6 +148,7 @@ flowchart TB
     LL ==> VQ38S
     LL ==> LGLM
     LL ==> LQWF
+    LL ==> LGLMF
     LL ==>|"/v1/audio/speech"| KAPI
     LL ==>|"/v1/madlad/* + MCP tool"| MAPI
     LL ==>|"/v1/classifier/*"| CLS
@@ -207,6 +209,7 @@ flowchart TB
     VQ38S -. model download .-> HF
     LGLM -. GGUF download .-> HF
     LQWF -. GGUF + MTP head download .-> HF
+    LGLMF -. GGUF download .-> HF
 ```
 
 ### Reading the diagram
@@ -219,7 +222,7 @@ flowchart TB
 - **Classifier ↔ vLLM** — the classifier is a vLLM client, not a peer; it calls `vllm-qwen-vl` internally for LLM scoring. Its own SQLite job store (`classifier.db` on the `classifier_data` volume) persists async `/assess` job state so callers can poll `GET /jobs/{id}` across restarts.
 - **Unsloth dual role** — the CUDA-compiled llama.cpp binary serves a chat model at `unsloth:8000` (routed via LiteLLM as the `qwen3.6-unsloth` model entry sourced from `DEFAULT_LITELLM_MODEL_API_BASE`), while Jupyter (`:8888`) and SSH (`:22`) remain available for training / fine-tuning workflows.
 - **Muse Glimmer on vLLM with DFlash speculative decoding** — `muse-glimmer` is Meta's dense 29.6B vision-language model served in BF16 across two A6000s (`--tensor-parallel-size 2`) with the official `meta-models/Muse-Glimmer-30B-assistant` DFlash drafter (`--speculative-config '{"method":"dflash",…}'`, 15 draft tokens per verification step). It occupies the same GPU pair as `qwen3.8` at 0.90 utilisation, so the two are mutually exclusive at runtime — bring up one or the other. `qwen3.8-solo` is the same Qwen3.8 model on a single card, pinned to the third GPU with `device_ids: ['2']`, so it can run alongside `muse-glimmer` (at the cost of TP=2 throughput and a 3-sequence cap). LiteLLM alias `muse-glimmer`; `supports_vision: true` so Open WebUI offers image upload. See [VLLM.md § Muse Glimmer 30B](vllm/VLLM.md#muse-glimmer-30b--tensor-parallel--dflash-speculative-decoding).
-- **llama.cpp stack for oversize models** — `llama/docker-compose.llama.yml` runs llama-server for models that don't fit any vLLM-supported precision. `glm5.2` uses the stock `ghcr.io/ggml-org/llama.cpp:server-cuda` image; `qwen3.8-flash` builds a local image from Unsloth's llama.cpp prebuild (`llama/Dockerfile.llama-unsloth`, pinned by `LLAMA_UNSLOTH_TAG` in `.env`) because MTP speculative decoding for Qwen3.8-Flash-Next is not in mainline llama.cpp yet — see [LLAMA.md § MTP speculative decoding](llama/LLAMA.md#qwen38-flash-mtp-speculative-decoding). The first inhabitant was `glm5.2` (Z.ai GLM-5.2, 753B-A40B MoE) at UD-IQ1_S (~176 GB), which does not fit in 3× A6000 VRAM alone — `--n-cpu-moe` offloads expert layers into system RAM. Weights auto-download via `-hf` into the `llama_data` named volume on first start. Unlike Unsloth's mixed-purpose container, this stack is inference-only; add new models by copying the commented template block in the compose file. See [LLAMA.md](llama/LLAMA.md) for quant sizing tables and the `--n-cpu-moe` tuning loop.
+- **llama.cpp stack for oversize models** — `llama/docker-compose.llama.yml` runs llama-server for models that don't fit any vLLM-supported precision. `glm5.2` uses the stock `ghcr.io/ggml-org/llama.cpp:server-cuda` image; `qwen3.8-flash` builds a local image from Unsloth's llama.cpp prebuild (`llama/Dockerfile.llama-unsloth`, pinned by `LLAMA_UNSLOTH_TAG` in `.env`) because MTP speculative decoding for Qwen3.8-Flash-Next is not in mainline llama.cpp yet — see [LLAMA.md § MTP speculative decoding](llama/LLAMA.md#qwen38-flash-mtp-speculative-decoding); `glm5.3-flash` builds the same Dockerfile with Unsloth's GPU-free `cpu` tarball (pinned separately by `LLAMA_UNSLOTH_CPU_TAG`) because the GLM-5.3-Flash `glm5next` architecture is not merged upstream at all, and runs GLM-5.3-Flash (321B-A18B) **entirely in system RAM with no GPU reservation** — 148 GB mlocked at UD-Q3_K_XL, with the model's embedded MTP draft head for speculative decoding — see [LLAMA.md § glm5.3-flash](llama/LLAMA.md#glm53-flash--glm-53-flash-on-cpu-and-ram-only). The first inhabitant was `glm5.2` (Z.ai GLM-5.2, 753B-A40B MoE) at UD-IQ1_S (~176 GB), which does not fit in 3× A6000 VRAM alone — `--n-cpu-moe` offloads expert layers into system RAM. Weights auto-download via `-hf` into the `llama_data` named volume on first start. Unlike Unsloth's mixed-purpose container, this stack is inference-only; add new models by copying the commented template block in the compose file. See [LLAMA.md](llama/LLAMA.md) for quant sizing tables and the `--n-cpu-moe` tuning loop.
 - **Roofix bridge** — packaged in `roofix/docker-compose.roofix.yml`. Internal worker; does NOT receive inbound traffic. APScheduler ticks every `TICK_INTERVAL_SECONDS` (default 300s); each tick fetches unread Roofix mail via the Gmail MCP, decides per-event (rules first, LiteLLM fallback), and writes back via the Phoenix MCP. Ambiguous email events trigger a proposal fetch via `RoofixScraperClient` (`ai/roofix/components/roofix_scraper_client.py`), which POSTs to `interceptor`'s `/capture` under the `roofix` named profile. The old `roofix-scraper` service was retired — proposal captures now share the generic `interceptor` container with any other logged-in-site capture use case. Operators refresh the Roofix session by uploading a captured Chrome user-data-dir to `interceptor`'s `/profiles/roofix/refresh` (see [INTERCEPTOR.md](interceptor/INTERCEPTOR.md)).
 - **Gmail MCP is a passthrough, not a proxied identity** — the `LL -.-> GmailMCP` edge uses LiteLLM's `delegate_auth_to_upstream: true` mode. LiteLLM only advertises the endpoint; the OAuth 2.1 flow runs end-to-end between Open WebUI and `gmailmcp.googleapis.com` per user, and LiteLLM forwards the resulting `Authorization: Bearer` header untouched. Users must enable the Gmail tool per-chat (it cannot be a default-enabled tool on a model, because the OAuth browser redirect cannot happen mid-completion).
 - **Interceptor API is a generic CDP capture service** — `interceptor` wraps `common.cdp_interceptor` behind an HTTP + MCP surface. Callers pass a URL and a list of URL regex patterns; the service navigates a headless Chrome under a named `--user-data-dir` and returns the JSON XHR/fetch bodies whose URLs matched — and, on request, a screenshot of the rendered page (`POST /screenshot`, or `screenshot: {...}` on `POST /capture`), delivered to models as an MCP image block. LiteLLM exposes it both as MCP tools (`interceptor.capture_url`, `interceptor.screenshot_url`) and as a `/v1/interceptor/*` pass-through. Auth is per-profile: operators refresh a profile by uploading a `.tgz` of a captured Chrome user-data-dir to `POST /profiles/{name}/refresh`. Concurrent captures are serialized (409 on collision) because a single container binds one CDP debug port.
@@ -247,6 +250,7 @@ Ports are sourced from `.env` (`PORT_*` variables). Defaults shown; change them 
 | qwen3.8-solo (vllm, single GPU) | `8019` |
 | glm5.2 (llama.cpp) | `8010` |
 | qwen3.8-flash (llama.cpp, Unsloth prebuild) | `8017` |
+| glm5.3-flash (llama.cpp, Unsloth CPU prebuild — no GPU) | `8020` |
 | kokoro-api | `8004` |
 | madlad-api | `8008` |
 | classifier | `8005` |

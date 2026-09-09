@@ -3,39 +3,50 @@
 # llama-server from Unsloth's llama.cpp prebuilds
 #   https://github.com/unslothai/llama.cpp/releases
 #
-# Why this exists instead of ghcr.io/ggml-org/llama.cpp:server-cuda:
-#   Qwen3.8-Flash-Next ships MTP (multi-token prediction) draft heads under
-#   MTP/ in unsloth/Qwen3.8-Flash-Next-GGUF. Mainline llama.cpp has no MTP
-#   graph for the `qwen4exp` architecture yet (ggml-org/llama.cpp#28243 and
-#   #27836 are both still open), so on the stock image `--spec-type draft-mtp`
-#   either fails to load the head or silently runs at base speed. Unsloth's
-#   "mix" releases are upstream + a curated set of open PRs, including
-#   unslothai/llama.cpp#144 (MTP for Qwen3.8-Flash-Next).
+# Why this exists instead of ghcr.io/ggml-org/llama.cpp:server[-cuda]:
+#   Unsloth's "mix" releases are upstream + a curated set of open PRs. Two
+#   services need patches that mainline does not carry yet:
+#   - qwen3.8-flash: Qwen3.8-Flash-Next ships MTP draft heads under MTP/ in
+#     unsloth/Qwen3.8-Flash-Next-GGUF. Mainline has no MTP graph for `qwen4exp`
+#     (ggml-org/llama.cpp#28243 / #27836 open), so `--spec-type draft-mtp`
+#     either fails to load the head or silently runs at base speed. The mix
+#     carries unslothai/llama.cpp#144.
+#   - glm5.3-flash: the `glm5next` architecture (GLM-5.3-Flash) is not merged
+#     upstream at all (ggml-org/llama.cpp#27754 open) — the stock image dies
+#     with `unknown model architecture: 'glm5next'`. The mix carries #27754,
+#     whose head branch also contains the NextN/MTP draft graph for the arch.
 #
 # The tarball is a flat directory: llama-server, the shared libs it needs
-# (rpath=$ORIGIN, so no LD_LIBRARY_PATH), and BUILD_INFO.txt. It does NOT
-# bundle CUDA — libcudart.so.12 / libcublas.so.12 come from the nvidia/cuda
-# runtime base, libcuda.so.1 from the host driver via `runtime: nvidia`.
+# (rpath=$ORIGIN, so no LD_LIBRARY_PATH), and BUILD_INFO.txt. All linux-x64
+# tarballs are built on GitHub's ubuntu-22.04 runner, so BASE_IMAGE must be
+# ubuntu 22.04-derived for glibc/libstdc++ parity.
 #
-# Variant guide (linux-x64) — the base image MUST match the variant's CUDA line,
-# because libggml-cuda.so links libcudart.so.<major> / libcublas.so.<major>:
+# Variant guide (linux-x64) — pick BASE_IMAGE to match:
 #   cuda13-portable  toolkit 13.3, sm 75,80,86,89,90,100,103,120 — RTX A6000 = 86.
 #                    Needs an R580+ host driver (nvidia-smi "CUDA Version: 13.x").
-#                    Base: nvidia/cuda:13.3.1-runtime-ubuntu22.04  (default)
+#                    Base: nvidia/cuda:13.3.1-runtime-ubuntu22.04
 #   cuda12-portable  toolkit 12.8, sm 70..120. Any R525+ driver.
 #                    Base: nvidia/cuda:12.8.1-runtime-ubuntu22.04
 #   *-newer/-older   narrower arch lists; smaller, no functional difference.
-# All linux-x64 CUDA tarballs are built on GitHub's ubuntu-22.04 runner, so the
-# base stays ubuntu22.04 for glibc/libstdc++ parity. The ldd check below fails
-# the build if the tarball's CUDA libs don't resolve against the chosen base.
+#   cpu              no GPU backend at all. libggml-cpu-<arch>.so variants
+#                    (sse42 … sapphirerapids / zen4) are picked at runtime by
+#                    CPUID. Base: ubuntu:22.04. Needs no `runtime: nvidia`.
+# CUDA tarballs do NOT bundle CUDA — libcudart.so.<major> / libcublas.so.<major>
+# come from the nvidia/cuda runtime base, libcuda.so.1 from the host driver via
+# `runtime: nvidia`. libggml-cuda.so links libcudart.so.<major>, so the base
+# image MUST match the variant's CUDA line; the ldd check below fails the build
+# if the tarball's CUDA libs don't resolve against the chosen base. The check is
+# skipped for variants that ship no libggml-cuda.so (cpu).
 #
-# Pin bumps: change LLAMA_UNSLOTH_TAG / LLAMA_UNSLOTH_VARIANT /
-# LLAMA_CUDA_RUNTIME_IMAGE in .env (compose passes them as build args and puts
-# tag+variant in the image name), then
-#   docker compose -f ai/llama/docker-compose.llama.yml up -d --build --force-recreate qwen3.8-flash
+# Pin bumps: each service sets its own tag / variant / base through build args
+# in docker-compose.llama.yml (qwen3.8-flash: LLAMA_UNSLOTH_TAG /
+# LLAMA_UNSLOTH_VARIANT / LLAMA_CUDA_RUNTIME_IMAGE; glm5.3-flash:
+# LLAMA_UNSLOTH_CPU_TAG). Tag+variant are part of the image name, so a bump
+# forces a rebuild:
+#   docker compose -f ai/llama/docker-compose.llama.yml up -d --build --force-recreate <service>
 
-ARG CUDA_RUNTIME_IMAGE=nvidia/cuda:13.3.1-runtime-ubuntu22.04
-FROM ${CUDA_RUNTIME_IMAGE}
+ARG BASE_IMAGE=nvidia/cuda:13.3.1-runtime-ubuntu22.04
+FROM ${BASE_IMAGE}
 
 ARG LLAMA_UNSLOTH_TAG=b10796-mix-659e406
 ARG LLAMA_UNSLOTH_VARIANT=cuda13-portable
@@ -52,11 +63,19 @@ WORKDIR /app
 RUN curl -fsSL "https://github.com/unslothai/llama.cpp/releases/download/${LLAMA_UNSLOTH_TAG}/app-${LLAMA_UNSLOTH_TAG}-linux-x64-${LLAMA_UNSLOTH_VARIANT}.tar.gz" \
       | tar -xz -C /app \
  && test -x /app/llama-server \
- && test -f /app/libggml-cuda.so \
  && echo "---- BUILD_INFO ----" && cat /app/BUILD_INFO.txt \
- && echo "---- CUDA lib check ----" \
- && if ldd /app/libggml-cuda.so | grep -v 'libcuda\.so\.1' | grep 'not found'; then \
-      echo "ERROR: ${LLAMA_UNSLOTH_VARIANT} needs CUDA libs that ${CUDA_RUNTIME_IMAGE} does not provide (see above)" >&2; exit 1; \
+ && if [ -f /app/libggml-cuda.so ]; then \
+      echo "---- CUDA lib check ----"; \
+      if ldd /app/libggml-cuda.so | grep -v 'libcuda\.so\.1' | grep 'not found'; then \
+        echo "ERROR: ${LLAMA_UNSLOTH_VARIANT} needs CUDA libs that ${BASE_IMAGE} does not provide (see above)" >&2; exit 1; \
+      fi; \
+    else \
+      echo "---- no libggml-cuda.so in ${LLAMA_UNSLOTH_VARIANT} tarball: CPU-only build ----"; \
+      ls /app/libggml-cpu-*.so >/dev/null; \
+    fi \
+ && echo "---- llama-server lib check ----" \
+ && if ldd /app/llama-server /app/libllama*.so* /app/libggml-base.so* | grep 'not found'; then \
+      echo "ERROR: unresolved shared libs for ${LLAMA_UNSLOTH_VARIANT} on ${BASE_IMAGE} (see above)" >&2; exit 1; \
     fi
 
 # Same defaults as ghcr.io/ggml-org/llama.cpp:server-cuda so the compose

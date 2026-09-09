@@ -143,7 +143,7 @@ Applied via a bind mount and the `--chat-template` flag:
 
 ### Muse Glimmer 30B — tensor parallel + DFlash speculative decoding
 
-The `muse-glimmer` service serves [`meta-models/Muse-Glimmer-30B`](https://huggingface.co/meta-models/Muse-Glimmer-30B) — Meta's dense 29.6B vision-language model (52-layer text decoder + ~1.8B ViT-G/14 encoder, 131072-token context, Apache 2.0, not gated) — in BF16 across two A6000s with [DFlash](https://huggingface.co/meta-models/Muse-Glimmer-30B-assistant) block-diffusion speculative decoding.
+The `muse-glimmer` service serves [`meta-models/Muse-Glimmer-30B`](https://huggingface.co/meta-models/Muse-Glimmer-30B) — Meta's dense 29.6B vision-language model (52-layer text decoder + ~1.8B ViT-G/14 encoder, 131072-token trained context served at 262144 — see *Serving beyond the trained context* below, Apache 2.0, not gated) — in BF16 across two A6000s with [DFlash](https://huggingface.co/meta-models/Muse-Glimmer-30B-assistant) block-diffusion speculative decoding.
 
 ```yaml
   muse-glimmer:
@@ -154,8 +154,8 @@ The `muse-glimmer` service serves [`meta-models/Muse-Glimmer-30B`](https://huggi
       meta-models/Muse-Glimmer-30B
       --served-model-name muse-glimmer
       --tensor-parallel-size 2
-      --max-model-len 131072
-      --max-num-seqs 16
+      --max-model-len 262144           # > config.json; needs VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+      --max-num-seqs 4
       --gpu-memory-utilization 0.90
       --generation-config auto
       --reasoning-parser muse_glimmer
@@ -181,7 +181,9 @@ If you see that, the running image is too old — it is not a typo in the parser
 | Budget at `--gpu-memory-utilization 0.90` | — | 43.2 GB |
 | Left for KV cache + activations + CUDA graphs | — | ~8.7 GB |
 
-KV cache is cheap on this model: only 13 of the 52 layers are full-attention (the other 39 use a 2048-token sliding window), and with 2 KV heads × 128 head_dim a full 131072-token sequence costs roughly 1.7 GB total across both GPUs. So `--max-model-len 131072` with `--max-num-seqs 16` fits with headroom. If startup OOMs anyway (e.g. after adding `--limit-mm-per-prompt` for multi-image prompts), drop utilisation to `0.85` before touching context length.
+KV cache is cheap on this model: only 13 of the 52 layers are full-attention (the other 39 use a 2048-token sliding window), and with 2 KV heads × 128 head_dim a sequence costs about 1 KiB per token per layer — roughly 1.7 GiB per 131072 tokens across both GPUs, so a full 262144-token sequence is ~3.3 GiB. With the ~14–16 GiB KV pool the pair leaves after weights, that is **4 sequences at max length**, which is why `--max-num-seqs` is 4: every admitted request can run to the full context without preemption. `--max-num-seqs` is a ceiling, not a reservation — if you would rather trade guaranteed full-length slots for more concurrency at typical lengths, raise it to 8 and let vLLM queue when KV runs out. At startup vLLM logs `Maximum concurrency for 262144 tokens per request: N`; that N is the real number. If startup OOMs (e.g. after adding `--limit-mm-per-prompt` for multi-image prompts), drop utilisation to `0.85` before touching context length.
+
+**Serving beyond the trained context.** `config.json` says `max_position_embeddings: 131072`, and vLLM refuses a longer `--max-model-len` unless the container sets `VLLM_ALLOW_LONG_MAX_MODEL_LEN=1` (it does). No RoPE scaling / YaRN / `--hf-overrides` is involved, and none is needed: the 13 global layers are **NoPE** (`layer_rope_theta` is `0` for every `full_attention` layer — they carry no positional embedding at all), and the 39 RoPE layers attend only within a 2048-token sliding window, so the largest relative offset any rotary embedding ever encodes is 2048 regardless of sequence length. The DFlash drafter is built the same way (sliding window 2048 on all 5 layers). The model was *trained* to 128K, so quality past that is extrapolation Meta has not benchmarked — treat 128K–256K as usable-but-unvalidated, and if long-prompt recall degrades, drop `--max-model-len` back to `131072`, remove the env var, raise `--max-num-seqs` to 16, and set LiteLLM `max_input_tokens` back to `114688`.
 
 **DFlash speculative decoding.** `meta-models/Muse-Glimmer-30B-assistant` is the official drafter — a 5-layer block-diffusion network that reads the target's residual stream at layers {1, 13, 25, 37, 49} and proposes a 16-token block in one forward pass; the target verifies the block in parallel, so output is bit-identical to plain decoding. Configuration is `--speculative-config '{"method":"dflash","model":"<drafter>","num_speculative_tokens":15}'` — the drafter's block size is 16, so **`num_speculative_tokens` is fixed at 15** (block minus the anchor token); it is not a tuning knob here. The drafter is distilled for this exact target checkpoint and must not be paired with a quantised or fine-tuned variant. Meta reports ~3× single-stream speedup on consumer GPUs; expect the gain to shrink as concurrency rises, which is why the recipe halves `--max-num-seqs` when DFlash is on. To disable speculation for A/B testing, remove the `--speculative-config` line and recreate the container. The drafter downloads into the shared `vllm_data` volume alongside the target on first start.
 

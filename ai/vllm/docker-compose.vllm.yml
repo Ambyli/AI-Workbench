@@ -153,6 +153,11 @@ services:
       - VLLM_SLEEP_WHEN_IDLE=1
       - VLLM_USE_DEEP_GEMM=0
       - VLLM_ATTENTION_BACKEND=FLASH_ATTN
+      # max-model-len below exceeds config.json's max_position_embeddings
+      # (131072). Safe here: the global layers are NoPE and the RoPE layers
+      # only see a 2048-token sliding window, so no absolute position is
+      # ever encoded. vLLM still refuses without this switch.
+      - VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
     ports:
       - "${PORT_VLLM_MUSE_GLIMMER}:8000"
     volumes:
@@ -178,8 +183,8 @@ services:
       --served-model-name muse-glimmer
       --tensor-parallel-size 2
       --dtype auto
-      --max-model-len 131072
-      --max-num-seqs 16
+      --max-model-len 262144
+      --max-num-seqs 4
       --gpu-memory-utilization 0.90
       --enable-prefix-caching
       --enable-chunked-prefill

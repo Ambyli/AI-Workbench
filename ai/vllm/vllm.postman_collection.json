@@ -277,7 +277,7 @@
     },
     {
       "name": "muse-glimmer",
-      "description": "Muse-Glimmer-30B (meta-models/Muse-Glimmer-30B, BF16), served under alias `muse-glimmer`. Meta's dense 29.6B vision-language model, 131072-token context (--max-model-len). Runs with tensor-parallel-size 2 across two A6000s (shm_size: 8gb required), DFlash speculative decoding via the official meta-models/Muse-Glimmer-30B-assistant drafter (num_speculative_tokens=15, fixed by the drafter's 16-token block), and the paired muse_glimmer reasoning + tool-call parsers (channel-scoped markers / ATEM tool blocks, not OpenAI JSON). Sampling defaults come from --generation-config auto (temperature 1.0, top_p 0.95, top_k 64 — do not run greedy). Mutually exclusive with the qwen3.8 container (same GPU pair at 0.90 utilisation). If the container is stopped: all requests below fail with `ECONNREFUSED localhost:8018`; the LiteLLM-routed variant returns 500 with an upstream connect error since litellm_config.yaml points `muse-glimmer` at http://muse-glimmer:8000. See VLLM.md § Muse Glimmer 30B.",
+      "description": "Muse-Glimmer-30B (meta-models/Muse-Glimmer-30B, BF16), served under alias `muse-glimmer`. Meta's dense 29.6B vision-language model, 262144-token context (--max-model-len, above the 131072 trained length — NoPE global layers + 2048-token sliding-window RoPE layers extrapolate without RoPE scaling; VLLM_ALLOW_LONG_MAX_MODEL_LEN=1). --max-num-seqs 4 so every admitted request can run to full length. Runs with tensor-parallel-size 2 across two A6000s (shm_size: 8gb required), DFlash speculative decoding via the official meta-models/Muse-Glimmer-30B-assistant drafter (num_speculative_tokens=15, fixed by the drafter's 16-token block), and the paired muse_glimmer reasoning + tool-call parsers (channel-scoped markers / ATEM tool blocks, not OpenAI JSON). Sampling defaults come from --generation-config auto (temperature 1.0, top_p 0.95, top_k 64 — do not run greedy). Mutually exclusive with the qwen3.8 container (same GPU pair at 0.90 utilisation). If the container is stopped: all requests below fail with `ECONNREFUSED localhost:8018`; the LiteLLM-routed variant returns 500 with an upstream connect error since litellm_config.yaml points `muse-glimmer` at http://muse-glimmer:8000. See VLLM.md § Muse Glimmer 30B.",
       "item": [
         {
           "name": "GET /health",
@@ -319,7 +319,7 @@
               "host": ["{{vllm_muse_glimmer}}"],
               "path": ["v1", "chat", "completions"]
             },
-            "description": "Chat completion against muse-glimmer (131072-token context). The `model` field must match the --served-model-name (`muse-glimmer`) — vLLM 400s on any other value. Reasoning is returned in `reasoning_content` (muse_glimmer reasoning parser); depth is controlled by a system-prompt line `Reasoning strength: low|medium|high|xhigh`, not a chat_template_kwarg. Tool calls are parsed by the muse_glimmer tool parser into standard `tool_calls`; multiple calls arrive as consecutive assistant messages. Omit temperature/top_p/top_k to inherit Meta's published defaults via --generation-config auto. Output is bit-identical with or without DFlash — speculation only changes latency. If the container is stopped: connection refused.",
+            "description": "Chat completion against muse-glimmer (262144-token context). The `model` field must match the --served-model-name (`muse-glimmer`) — vLLM 400s on any other value. Reasoning is returned in `reasoning_content` (muse_glimmer reasoning parser); depth is controlled by a system-prompt line `Reasoning strength: low|medium|high|xhigh`, not a chat_template_kwarg. Tool calls are parsed by the muse_glimmer tool parser into standard `tool_calls`; multiple calls arrive as consecutive assistant messages. Omit temperature/top_p/top_k to inherit Meta's published defaults via --generation-config auto. Output is bit-identical with or without DFlash — speculation only changes latency. If the container is stopped: connection refused.",
             "body": {
               "mode": "raw",
               "raw": "{\n  \"model\": \"muse-glimmer\",\n  \"messages\": [\n    {\"role\": \"system\", \"content\": \"Reasoning strength: medium\"},\n    {\"role\": \"user\", \"content\": \"Explain DFlash speculative decoding in two sentences.\"}\n  ],\n  \"max_tokens\": 512\n}",
@@ -361,7 +361,7 @@
               "host": ["{{vllm_muse_glimmer}}"],
               "path": ["v1", "completions"]
             },
-            "description": "Legacy text-completion endpoint against muse-glimmer (131072-token context). Bypasses the chat template — the prompt is fed verbatim, so the muse_glimmer reasoning/tool parsers don't fire and channel markers may appear raw in the output. Prefer /v1/chat/completions. If the container is stopped: connection refused.",
+            "description": "Legacy text-completion endpoint against muse-glimmer (262144-token context). Bypasses the chat template — the prompt is fed verbatim, so the muse_glimmer reasoning/tool parsers don't fire and channel markers may appear raw in the output. Prefer /v1/chat/completions. If the container is stopped: connection refused.",
             "body": {
               "mode": "raw",
               "raw": "{\n  \"model\": \"muse-glimmer\",\n  \"prompt\": \"The three laws of robotics are:\\n1.\",\n  \"max_tokens\": 128\n}",

@@ -103,6 +103,19 @@ If that line never appears, speculation is off — almost always a build without
 
 **When it hurts.** Unsloth measured MTP as a **net loss (~0.81–0.87×) at concurrency 8**: a busy model has no idle capacity for a draft to exploit. The service runs `--parallel 2` for that reason — two slots is where MTP still pays off, and it leaves each slot 524k of the 1M context. If the box regularly has several simultaneous streams, drop `--spec-type` / `-md` / `-hfd` from the command rather than raising `--parallel`. Higher sampling temperature also lowers acceptance — the 1.67× headline is a greedy number.
 
+### `qwen3.8-flash` reasoning budget
+
+The service caps thinking with two llama-server flags:
+
+| Flag | Value |
+|---|---|
+| `--reasoning-budget` | `8192` |
+| `--reasoning-budget-message` | `"Time to stop thinking. Give the final answer or make the tool call now."` |
+
+`--reasoning-budget N` is the token budget for the think block: `-1` unrestricted (llama-server default), `0` ends thinking immediately, `N>0` caps it. When the cap is reached, llama-server injects the `--reasoning-budget-message` text into the thought stream and emits the end-of-thinking tag, so generation continues straight into the final answer or tool call instead of looping. The budget counts only reasoning tokens — it does not shrink the 65,536-token `--n-predict` output cap in the next section, so a long final answer after a short think is still fine.
+
+Why 8192: with the fixed chat template's default `reasoning_effort=medium`, most agentic turns think for well under 8k tokens; the cap exists to stop the occasional runaway think that otherwise burns the whole output budget and stalls tool loops. Raise it (or set `-1`) for hard-reasoning workloads, then `make up llama qwen3.8-flash` to recreate. Both flags are present in the pinned Unsloth build (`LLAMA_UNSLOTH_TAG=b10796-mix-659e406`); if a future tag drops them, llama-server refuses to start with an unknown-argument error, which the healthcheck surfaces as a restart loop.
+
 ### `qwen3.8-flash` context and output budget
 
 `-c 1048576` is split evenly across `--parallel` slots, so each request gets `1048576 / 2 = 524288` tokens. `--n-predict 65536` is the hard per-request output cap — llama-server clamps any larger client `max_tokens` to it. The LiteLLM entry mirrors the split:

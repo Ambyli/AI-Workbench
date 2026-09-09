@@ -185,6 +185,12 @@ services:
     #   LLAMA_SPLIT_MODE_TENSOR not implemented for architecture 'qwen4exp'
     # `row` is not viable either — MoE expert tensors cannot be row-split, so
     # they all land on the main GPU and 111 GB of experts will not fit.
+    # REASONING BUDGET: --reasoning-budget caps thinking at N tokens; when the
+    # cap is hit llama-server injects --reasoning-budget-message into the
+    # thought stream and closes the think block, so the model must answer or
+    # call a tool. 8192 is well under the 65536 --n-predict output cap, so
+    # long final answers are unaffected. -1 restores unlimited thinking.
+    # Both flags exist in the pinned Unsloth build (b10796-mix-659e406).
     # Do NOT paste a `#` comment inside the `command: >` block — YAML's
     # folded scalar has no comment syntax and it'll be folded into the
     # command string as a literal `#`, breaking arg parsing.
@@ -213,6 +219,8 @@ services:
       --top-k 20
       --min-p 0.0
       --presence-penalty 0.0
+      --reasoning-budget 8192
+      --reasoning-budget-message "Time to stop thinking. Give the final answer or make the tool call now."
 
 volumes:
   llama_data:

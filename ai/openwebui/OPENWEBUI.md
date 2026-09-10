@@ -46,6 +46,7 @@ Every value is sourced from `.env` so configuration lives in one file.
 | `GOOGLE_CLIENT_SECRET` | `OPENWEBUI_GOOGLE_CLIENT_SECRET` | _(empty)_ | Matching client secret |
 | `OPENID_PROVIDER_URL` | `OPENWEBUI_OPENID_PROVIDER_URL` | Google discovery doc | OIDC discovery document URL; required for clean provider-side logout |
 | `OAUTH_AUTO_REDIRECT` | `OPENWEBUI_OAUTH_AUTO_REDIRECT` | `true` | Skip the login page and redirect straight to Google — see [Single sign-on](#single-sign-on) |
+| `ENABLE_LOGIN_FORM` | `OPENWEBUI_ENABLE_LOGIN_FORM` | `false` | Hides the email/password form. **Required** for `OAUTH_AUTO_REDIRECT` to do anything |
 | `OAUTH_UPDATE_NAME_ON_LOGIN` | `OPENWEBUI_OAUTH_UPDATE_NAME_ON_LOGIN` | `true` | Re-read the `name` claim on every login, not just at account creation (upstream default: `false`) |
 | `OAUTH_UPDATE_PICTURE_ON_LOGIN` | `OPENWEBUI_OAUTH_UPDATE_PICTURE_ON_LOGIN` | `true` | Re-read the `picture` claim on every login (upstream default: `false`) |
 | `WEBUI_AUTH_TRUSTED_EMAIL_HEADER` | `OPENWEBUI_WEBUI_AUTH_TRUSTED_EMAIL_HEADER` | _(blank — off)_ | Trusted-header SSO. Deliberately disabled; see [Single sign-on](#single-sign-on) |
@@ -219,14 +220,38 @@ Open WebUI's own OIDC reads `OAUTH_USERNAME_CLAIM` (`name`) and `OAUTH_PICTURE_C
 | Setting | Why |
 |---|---|
 | `OAUTH_AUTO_REDIRECT=true` | No "Continue with Google" click — the login page redirects immediately |
+| `ENABLE_LOGIN_FORM=false` | **Required by the above** — see the precondition list below |
 | `OAUTH_UPDATE_NAME_ON_LOGIN=true` | Existing accounts pick up the real name on next sign-in |
 | `OAUTH_UPDATE_PICTURE_ON_LOGIN=true` | Existing accounts pick up the avatar on next sign-in |
+
+`OAUTH_AUTO_REDIRECT` alone does nothing. The frontend refuses to bounce a user to SSO unless the deployment is unambiguously SSO-only — `src/routes/auth/+page.svelte` requires **all** of:
+
+```js
+$config?.oauth?.auto_redirect && !logout && !form && !error
+  && providers.length === 1                        // only Google is configured
+  && $config?.features?.auth !== false
+  && $config?.features?.enable_login_form === false  // ← the easy one to miss
+  && !$config?.features?.enable_ldap
+  && !$config?.features?.auth_trusted_header         // ← so it also can't coexist
+  && !$config?.onboarding                            //   with trusted-header SSO
+  && !localStorage.token && !document.cookie…token=
+```
+
+Note the `auth_trusted_header` condition: auto-redirect and trusted-header SSO are mutually exclusive by design, which is another reason the two approaches don't mix.
+
+If sign-in lands on Open WebUI's login page instead of bouncing to Google, work down that list — `enable_login_form` is the usual culprit.
+
+#### Break-glass if Google OAuth breaks
+
+`/auth?form=true` suppresses the auto-redirect *and* re-renders the hidden email/password form — `+page.svelte` gates the form on `enable_login_form || enable_ldap || form`. That gets you a login box, but only helps if a local password actually exists: OAuth-created accounts are given a random `uuid4()` as their password and nobody knows it.
+
+So the real recovery path is `OPENWEBUI_ENABLE_LOGIN_FORM=true` in `.env` + `make up openwebui`. If you want a genuine standing break-glass account, set a password on one admin user through Admin Panel → Users *before* you need it.
 
 The last two default to `false` upstream. They are what repairs accounts created while trusted-header SSO was on — those have a numeric name and the placeholder avatar, and heal the next time each person signs in. No admin cleanup, no account deletion.
 
 The second hop is **not** a second login prompt. The user already holds a live Google session and prior consent from clearing oauth2-proxy, so Google returns immediately; with auto-redirect on, the whole thing is a redirect bounce.
 
-> **These apply on a plain recreate.** Unlike `ENABLE_WEB_SEARCH` and the `AUDIO_TTS_*` block, the `OAUTH_*` settings are not first-boot-only. `ENABLE_OAUTH_PERSISTENT_CONFIG` defaults to `false` upstream, and `models/config.py::persistent_enabled_for` short-circuits any key starting with `oauth.`, so they are read from the environment on every boot and never consult the DB. `ENABLE_LOGIN_FORM` is a `ui.*` key and *is* first-boot-only — set it in Admin Panel → Settings if you want the dead email/password form hidden, though auto-redirect means nobody sees that page anyway.
+> **Two different config lifetimes here — don't assume.** The `OAUTH_*` settings are read from the environment on every boot: `ENABLE_OAUTH_PERSISTENT_CONFIG` defaults to `false` upstream, and `models/config.py::persistent_enabled_for` short-circuits any key starting with `oauth.` before it ever reaches the DB. `ENABLE_LOGIN_FORM` is a `ui.*` key and *is* PersistentConfig-backed, like `ENABLE_WEB_SEARCH` and the `AUDIO_TTS_*` block — but the fallback is per-key, not first-boot-only: `Config.get` returns the env-derived default whenever no DB row exists, and rows are only written when a setting is saved through the Admin UI or API. So it applies on recreate on an install where nobody has touched it. If it doesn't take effect, a row exists — set it at Admin Panel → Settings → General instead.
 
 #### Security note
 

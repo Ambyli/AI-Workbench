@@ -72,6 +72,11 @@ services:
       # first-boot-only PersistentConfig store and are read on every boot —
       # unlike ENABLE_WEB_SEARCH and the AUDIO_TTS_* block further down.
       OAUTH_AUTO_REDIRECT: "${OPENWEBUI_OAUTH_AUTO_REDIRECT}"
+      # Required by OAUTH_AUTO_REDIRECT — the frontend only auto-redirects
+      # when the deployment is unambiguously SSO-only. Unlike the oauth.*
+      # keys, this one IS PersistentConfig-backed (ui.*): env applies only
+      # while no DB row exists for it.
+      ENABLE_LOGIN_FORM: "${OPENWEBUI_ENABLE_LOGIN_FORM}"
       OAUTH_UPDATE_NAME_ON_LOGIN: "${OPENWEBUI_OAUTH_UPDATE_NAME_ON_LOGIN}"
       OAUTH_UPDATE_PICTURE_ON_LOGIN: "${OPENWEBUI_OAUTH_UPDATE_PICTURE_ON_LOGIN}"
 

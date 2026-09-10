@@ -27,6 +27,8 @@ Then browse `http://localhost:8009` — you should see the SearXNG search page. 
 - `use_default_settings: true` — inherits upstream defaults, only overrides what we need.
 - `server.limiter: false` — the built-in rate limiter drops server-to-server calls with the wrong headers; disable so Open WebUI can reach `/search` unmolested.
 - `search.formats: [html, json]` — JSON output is off by default upstream; Open WebUI needs it.
+- `outgoing.request_timeout` / `max_request_timeout` — explicit bound on every per-engine outgoing request, instead of relying on whatever the base image's own baked-in defaults happen to be.
+- `engines: [{name: duckduckgo, disabled: true}]` — DDG CAPTCHAs datacenter egress IPs almost unconditionally; see § Troubleshooting below.
 - `server.secret_key: "${SEARXNG_SECRET}"` — literal placeholder. The `entrypoint` wrapper in `ai/searxng/docker-compose.searxng.yml` reads `$SEARXNG_SECRET` from the container env at startup, sed-substitutes it into a copy of `settings.yml` at `/tmp/searxng-settings.yml`, and points `SEARXNG_SETTINGS_PATH` at that copy — so the bind-mounted host file stays free of the real secret and can be committed to git. If `SEARXNG_SECRET` is unset, the wrapper refuses to boot rather than starting with an unresolved placeholder.
 
 Edits to `settings.yml` take effect on `make down searxng && make up searxng` — no rebuild needed because it's a bind-mount.
@@ -58,6 +60,8 @@ Open WebUI already gets these env vars from `.env` (declared in `ai/openwebui/do
 | `SEARXNG_QUERY_URL` | `OPENWEBUI_SEARXNG_QUERY_URL` | `http://searxng:8080/search?q=<query>&format=json` | Must use the Docker service name, not `localhost` |
 | `WEB_SEARCH_RESULT_COUNT` | `OPENWEBUI_WEB_SEARCH_RESULT_COUNT` | `3` | Results per query fed to the model |
 | `WEB_SEARCH_CONCURRENT_REQUESTS` | `OPENWEBUI_WEB_SEARCH_CONCURRENT_REQUESTS` | `10` | Parallel fetch cap when Open WebUI enriches results |
+| `AIOHTTP_CLIENT_TIMEOUT` | `OPENWEBUI_AIOHTTP_CLIENT_TIMEOUT` | `45` | Ceiling (seconds) on Open WebUI's outbound HTTP client — covers `search_web`'s call to searxng and `fetch_url`'s direct page fetch. Read on every boot, not first-boot-only. Upstream default is `300`. |
+| `AIOHTTP_CLIENT_STREAM_IDLE_TIMEOUT` | `OPENWEBUI_AIOHTTP_CLIENT_STREAM_IDLE_TIMEOUT` | `20` | Max seconds allowed between chunks on a streaming fetch before it's aborted. Upstream default is unset (no idle cap). |
 
 > **Important — first-boot-only env vars.** Open WebUI reads these on the *very first* boot of the `openwebui_data` volume. On an existing install, changing them here does **nothing** — set them via **Admin Panel → Settings → Web Search** in the running container instead, then click Save. Wiping the volume (`docker compose -f ai/openwebui/docker-compose.openwebui.yml down -v`) re-arms the env-var path but destroys all users, chats, and uploads.
 
@@ -113,9 +117,18 @@ make build searxng
 make down searxng && make up searxng
 ```
 
+### Troubleshooting: fetch_url / search hangs
+
+Symptom: `searxng` logs a per-engine `WARNING` (e.g. `SearxEngineCaptchaException`, `CAPTCHA (wt-wt) ...` from the `duckduckgo` engine) and, around the same time, a chat's `search_web` or `fetch_url` native tool call sits "pending" in Open WebUI indefinitely with no error ever shown to the model.
+
+These are two separate failures that happen to correlate:
+
+1. **The searxng-side CAPTCHA warning is not what causes the hang.** `outgoing.request_timeout` / `max_request_timeout` (in `settings.yml`) bound every per-engine request, so a CAPTCHA'd or unresponsive engine gets excluded from the response (see `unresponsive_engines` in the JSON body) and `/search` still returns `200` promptly with whatever other engines succeeded. `duckduckgo` is disabled outright in `settings.yml` — datacenter/server egress IPs get CAPTCHA'd by it almost unconditionally, so it was pure log noise and wasted fan-out latency with no chance of ever succeeding here.
+2. **The actual hang is on Open WebUI's side.** `search_web` calls searxng, but `fetch_url` fetches the *target page itself* directly (via the configured Web Loader) — never through searxng. Open WebUI's outbound aiohttp client defaults to a 300s timeout with no idle-stream cap, so `fetch_url` against a site that accepts the connection but never finishes responding (or serves an anti-bot interstitial that never resolves) blocks the tool call for up to 5 minutes with nothing surfaced back to the model — indistinguishable from "forever" in a chat. `OPENWEBUI_AIOHTTP_CLIENT_TIMEOUT` / `OPENWEBUI_AIOHTTP_CLIENT_STREAM_IDLE_TIMEOUT` (wired in `ai/openwebui/docker-compose.openwebui.yml`, unlike the web-search block these are read on every boot) bound this to a much shorter, model-tolerable ceiling so a stuck fetch fails fast and the model can see the error and try something else.
+
 ### Notes
 
 - SearXNG doesn't need a GPU or any secrets besides `SEARXNG_SECRET`. It's stateless — every query fans out to upstream engines fresh.
 - It's not on the LiteLLM fan-out. Models never call SearXNG directly; Open WebUI enriches the prompt with search results server-side before dispatching to LiteLLM.
-- If public search engines start rate-limiting your egress IP, individual engines can be disabled in `settings.yml` under `engines:` — see the [upstream engine list](https://docs.searxng.org/user/configured_engines.html).
+- If public search engines start rate-limiting your egress IP, individual engines can be disabled in `settings.yml` under `engines:` — see the [upstream engine list](https://docs.searxng.org/user/configured_engines.html). `duckduckgo` already is, per the troubleshooting note above.
 - Wider infrastructure map: [`AI_INFRA.md`](AI_INFRA.md).

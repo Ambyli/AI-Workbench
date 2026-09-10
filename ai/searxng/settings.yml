@@ -24,5 +24,28 @@ search:
     - html
     - json
 
+# Bounds every outgoing engine request. Not overriding this means falling
+# back on whatever the searxng/searxng:latest image's own baked-in defaults
+# are (upstream ships request_timeout: 3.0 / max_request_timeout: 10.0) with
+# no local visibility into them. Being explicit here means a bump to the
+# image can't silently change how long a stuck upstream engine is allowed to
+# drag out a /search response.
+outgoing:
+  request_timeout: 5.0
+  max_request_timeout: 10.0
+
+# duckduckgo is disabled: DDG's anti-bot layer CAPTCHAs server/datacenter
+# egress IPs almost unconditionally (SearxEngineCaptchaException in the
+# searxng logs — "CAPTCHA (wt-wt) ..."). searxng catches that per-engine and
+# still returns a 200 with the other engines' results (see
+# `unresponsive_engines` in the JSON body), so this isn't what makes a
+# fetch_url/search_web tool call hang forever in Open WebUI — see
+# SEARXNG.md's troubleshooting note — but it's pure log noise and wasted
+# fan-out latency with zero chance of ever succeeding from this deployment's
+# IP, so there's no reason to keep querying it.
+engines:
+  - name: duckduckgo
+    disabled: true
+
 ui:
   static_use_hash: true

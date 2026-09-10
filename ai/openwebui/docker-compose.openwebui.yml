@@ -99,6 +99,17 @@ services:
       WEB_SEARCH_RESULT_COUNT: "${OPENWEBUI_WEB_SEARCH_RESULT_COUNT}"
       WEB_SEARCH_CONCURRENT_REQUESTS: "${OPENWEBUI_WEB_SEARCH_CONCURRENT_REQUESTS}"
 
+      # Hard ceiling on Open WebUI's outbound aiohttp client — applies to the
+      # search_web call to searxng AND the fetch_url tool's direct page
+      # fetch. Read on every boot (not a first-boot-only PersistentConfig
+      # value like the web-search block above). Without this, a hung
+      # upstream (dead site, anti-bot interstitial, slow TLS handshake)
+      # leaves a tool call "pending" for the 300s upstream default with
+      # nothing ever surfaced to the model. See
+      # ai/searxng/SEARXNG.md § Troubleshooting: fetch_url / search hangs.
+      AIOHTTP_CLIENT_TIMEOUT: "${OPENWEBUI_AIOHTTP_CLIENT_TIMEOUT}"
+      AIOHTTP_CLIENT_STREAM_IDLE_TIMEOUT: "${OPENWEBUI_AIOHTTP_CLIENT_STREAM_IDLE_TIMEOUT}"
+
       # Voice — text-to-speech backed by the kokoro-api container on ai_shared.
       # kokoro-api exposes an OpenAI-compatible POST /v1/audio/speech, so the
       # "openai" engine is used with its base URL pointed at kokoro-api rather

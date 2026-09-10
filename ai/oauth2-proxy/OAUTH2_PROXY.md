@@ -125,8 +125,9 @@ Every value is sourced from the root `.env` — edit there, never in the compose
 | `OAUTH2_PROXY_PROVIDER` | `OAUTH2_PROXY_PROVIDER` | `google` | OAuth provider — only google is exercised here |
 | `OAUTH2_PROXY_HTTP_ADDRESS` | `OAUTH2_PROXY_HTTP_ADDRESS` | `0.0.0.0:4180` | Listener inside the container. Port must equal `PORT_OAUTH2_PROXY` |
 | `OAUTH2_PROXY_REVERSE_PROXY` | `OAUTH2_PROXY_REVERSE_PROXY` | `true` | Trusts `X-Forwarded-*` headers from cloudflared |
-| `OAUTH2_PROXY_PASS_USER_HEADERS` | `OAUTH2_PROXY_PASS_USER_HEADERS` | `true` | Forwards `X-Forwarded-Email` / `X-Forwarded-User` to Open WebUI |
-| `OAUTH2_PROXY_SET_XAUTHREQUEST` | `OAUTH2_PROXY_SET_XAUTHREQUEST` | `true` | Also emits `X-Auth-Request-*` headers |
+| `OAUTH2_PROXY_PASS_USER_HEADERS` | `OAUTH2_PROXY_PASS_USER_HEADERS` | `true` | Forwards `X-Forwarded-Email` / `X-Forwarded-User` — Open WebUI signs users in from the former (trusted-header SSO) |
+| `OAUTH2_PROXY_SET_XAUTHREQUEST` | `OAUTH2_PROXY_SET_XAUTHREQUEST` | `true` | Also emits `X-Auth-Request-*` headers (Superset) |
+| `OAUTH2_PROXY_PASS_ACCESS_TOKEN` | `OAUTH2_PROXY_PASS_ACCESS_TOKEN` | `true` | Forwards the user's Google access token as `X-Forwarded-Access-Token`. Open WebUI's patched trusted-header sign-in presents it to Google to **verify** the identity and fetch name + picture — see [OPENWEBUI.md § Single sign-on](../openwebui/OPENWEBUI.md#single-sign-on). Scopes are `profile email`; it never leaves the Docker network |
 | `OAUTH2_PROXY_CLIENT_ID` | `OPENWEBUI_GOOGLE_CLIENT_ID` | _(reused)_ | Reused from Open WebUI's Google OAuth 2.0 client |
 | `OAUTH2_PROXY_CLIENT_SECRET` | `OPENWEBUI_GOOGLE_CLIENT_SECRET` | _(reused)_ | Same client's secret |
 | `OAUTH2_PROXY_COOKIE_SECRET` | `OAUTH2_PROXY_COOKIE_SECRET` | _(generate)_ | 32-byte URL-safe base64. Signs session cookies. See generator snippet in `.env.example` |
@@ -261,22 +262,18 @@ Expected: `OK → PASS`. If it returns HTML or a redirect to `/oauth/google/logi
 
 ---
 
-## Two gates, one prompt
+## One gate
 
-Open WebUI keeps its own Google OAuth login enabled. After passing the oauth2-proxy gate at Cloudflare's edge, it runs its own OIDC round-trip against the same Google account.
+oauth2-proxy is the only sign-in. Open WebUI runs in trusted-header mode (`WEBUI_AUTH_TRUSTED_EMAIL_HEADER=X-Forwarded-Email`) and accepts the identity this proxy forwards — through a patch that makes it **verify** that identity with Google first, using the access token forwarded by `OAUTH2_PROXY_PASS_ACCESS_TOKEN=true`, and take the user's display name and profile picture from Google while it is there. Users see one Google prompt and land in the app.
 
-This is not a second login prompt. The user already holds a live Google session and prior consent from clearing oauth2-proxy (same OAuth client, same scopes), so Google returns immediately, and `OPENWEBUI_OAUTH_AUTO_REDIRECT=true` skips Open WebUI's own login page — the hop is a redirect bounce, not a form.
+Two things this proxy cannot do on its own, which is why the Open WebUI side is patched:
 
-It *could* still be a second **account chooser**: Google asks which account to use on any authorize request that does not name one, whenever the browser is signed into more than one Google account. Upstream Open WebUI never names one, so this deployment builds its own Open WebUI image with a small patch that forwards the `X-Forwarded-Email` this proxy already sets as the OIDC `login_hint` — Google then selects that session outright. Details, verification, and upgrade procedure: [ai/openwebui/OPENWEBUI.md § Custom image](../openwebui/OPENWEBUI.md#custom-image-login_hint-patch). The first hop can still show a chooser when several *Zeo* accounts are signed in; nothing knows who is arriving before they sign in.
+- It has no display name to forward. For the Google provider `X-Forwarded-User` is Google's `sub` claim (`providers/google.go`: `User: c.Subject`), a 21-digit number; `X-Auth-Request-Preferred-Username` is only populated under `--google-use-organization-id`. Stock Open WebUI used the number as the name — that is where the numeric usernames came from. `WEBUI_AUTH_TRUSTED_NAME_HEADER` is therefore deliberately blank.
+- It has no picture to forward. Nothing in the session (`pkg/apis/sessions/session_state.go::GetClaim`) carries Google's `picture` claim.
 
-Open WebUI *was* switched to trusted-header auth (`WEBUI_AUTH_TRUSTED_EMAIL_HEADER=X-Forwarded-Email`, `WEBUI_AUTH_TRUSTED_NAME_HEADER=X-Forwarded-User`) to collapse the two gates into one. That has been **reverted**, for two reasons beyond the usual "it removes Open WebUI's independent auth layer":
+The access token is the one thing it *can* forward that lets the upstream ask Google for both — and check the asserted e-mail against Google's answer, which stock trusted-header mode never does. Full write-up, verification, and the fallback to Open WebUI's own two-hop OAuth: [ai/openwebui/OPENWEBUI.md § Single sign-on](../openwebui/OPENWEBUI.md#single-sign-on).
 
-- `X-Forwarded-User` carries Google's `sub` claim for this provider (`providers/google.go`: `User: c.Subject`), so every account was created with a 21-digit number as its display name.
-- No proxy header carries Google's `picture` claim, and Open WebUI's trusted-header signup path hardcodes the default avatar — profile pictures were structurally impossible.
-
-Full write-up, including the settings that repair the affected accounts: [ai/openwebui/OPENWEBUI.md § Single sign-on](../openwebui/OPENWEBUI.md#single-sign-on).
-
-`OAUTH2_PROXY_PASS_USER_HEADERS` and `OAUTH2_PROXY_SET_XAUTHREQUEST` stay `true` — Superset consumes `X-Auth-Request-Email`, and the headers are harmless to an upstream that ignores them.
+`OAUTH2_PROXY_SET_XAUTHREQUEST` stays `true` for Superset (`X-Auth-Request-Email`).
 
 ---
 

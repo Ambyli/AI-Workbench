@@ -14,10 +14,13 @@
 #          image) rather than forcing it.
 #
 # Current patches:
-#   0001-oauth-login-hint-header.patch  — OAUTH_LOGIN_HINT_HEADER: forward
-#       the identity oauth2-proxy already verified (X-Forwarded-Email) as the
-#       OIDC login_hint so Google skips its account chooser on the second
-#       sign-in hop. Touches backend/open_webui/env.py and utils/oauth.py.
+#   0002-trusted-header-google-identity.patch — WEBUI_AUTH_TRUSTED_ACCESS_TOKEN_HEADER:
+#       in trusted-header SSO mode, verify the identity oauth2-proxy asserts
+#       against Google (tokeninfo: live, aud == GOOGLE_CLIENT_ID, e-mail
+#       matches) using the forwarded access token, and take the display name
+#       and profile picture from Google's userinfo — on account creation and
+#       on every sign-in. Touches backend/open_webui/env.py,
+#       routers/auths.py, and adds utils/trusted_proxy.py.
 
 ARG OPENWEBUI_VERSION=v0.11.3
 FROM ghcr.io/open-webui/open-webui:${OPENWEBUI_VERSION}
@@ -44,12 +47,13 @@ RUN set -eu; \
     done; \
     python3 -c 'import ast,sys; [ast.parse(open(f).read(), f) for f in sys.argv[1:]]' \
         backend/open_webui/env.py \
-        backend/open_webui/utils/oauth.py; \
-    grep -q "OAUTH_LOGIN_HINT_HEADER" backend/open_webui/utils/oauth.py; \
+        backend/open_webui/routers/auths.py \
+        backend/open_webui/utils/trusted_proxy.py; \
+    grep -q "verify_google_identity" backend/open_webui/routers/auths.py; \
     rm -rf /tmp/zeo-patches
 
 # Record the base and the patch set on the image so `docker image inspect`
 # can tell a patched build from a stock one.
 ARG OPENWEBUI_VERSION
 LABEL org.opencontainers.image.base.name="ghcr.io/open-webui/open-webui:${OPENWEBUI_VERSION}" \
-      com.zeoenergy.openwebui.patches="0001-oauth-login-hint-header"
+      com.zeoenergy.openwebui.patches="0002-trusted-header-google-identity"

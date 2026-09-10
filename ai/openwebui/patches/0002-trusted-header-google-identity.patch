@@ -1,0 +1,203 @@
+Zeo patch 0002 — verify trusted-header sign-ins with Google; take name + picture.
+
+Target: Open WebUI v0.11.3 (ghcr.io/open-webui/open-webui:v0.11.3).
+Applied by ai/openwebui/Dockerfile.openwebui with `patch -p1` from /app.
+
+Adds env var WEBUI_AUTH_TRUSTED_ACCESS_TOKEN_HEADER (default empty = feature
+off, upstream behaviour). When set alongside WEBUI_AUTH_TRUSTED_EMAIL_HEADER,
+the trusted-header sign-in path:
+  * refuses the request unless Google's tokeninfo confirms the forwarded
+    access token is live, issued to GOOGLE_CLIENT_ID, and belongs to the
+    asserted (verified) e-mail;
+  * takes display name and profile picture from Google's userinfo, on account
+    creation AND on every later sign-in (pre-existing accounts self-heal).
+
+Files: backend/open_webui/env.py, backend/open_webui/routers/auths.py,
+       backend/open_webui/utils/trusted_proxy.py (new).
+See ai/openwebui/OPENWEBUI.md § Single sign-on and § Custom image.
+
+--- a/backend/open_webui/env.py	2026-09-10 16:32:19.260859400 -0600
++++ b/backend/open_webui/env.py	2026-09-10 16:32:19.291986200 -0600
+@@ -789,6 +789,15 @@
+ WEBUI_AUTH_TRUSTED_GROUPS_HEADER = os.getenv('WEBUI_AUTH_TRUSTED_GROUPS_HEADER', None)
+ WEBUI_AUTH_TRUSTED_ROLE_HEADER = os.getenv('WEBUI_AUTH_TRUSTED_ROLE_HEADER', None)
+ 
++# ZEO PATCH (ai/openwebui/patches/0002-trusted-header-google-identity.patch).
++# Header carrying the Google OAuth access token of the user the reverse proxy
++# authenticated (oauth2-proxy --pass-access-token: X-Forwarded-Access-Token).
++# When set, a trusted-header sign-in is only accepted after Google confirms
++# the token is live, issued to GOOGLE_CLIENT_ID, and belongs to the e-mail in
++# WEBUI_AUTH_TRUSTED_EMAIL_HEADER; the account's name and picture are taken
++# from Google's userinfo. Empty = upstream behaviour (headers trusted as-is).
++WEBUI_AUTH_TRUSTED_ACCESS_TOKEN_HEADER = os.getenv('WEBUI_AUTH_TRUSTED_ACCESS_TOKEN_HEADER', '').strip()
++
+ # Custom header name for API key authentication.  Defaults to 'x-api-key'.
+ # Useful when Open WebUI sits behind a reverse proxy / API gateway that
+ # already uses the Authorization header for its own authentication — set
+--- a/backend/open_webui/routers/auths.py	2026-09-10 16:32:19.263122700 -0600
++++ b/backend/open_webui/routers/auths.py	2026-09-10 16:32:19.347175200 -0600
+@@ -32,6 +32,7 @@
+     WEBUI_AUTH_COOKIE_SAME_SITE,
+     WEBUI_AUTH_COOKIE_SECURE,
+     WEBUI_AUTH_SIGNOUT_REDIRECT_URL,
++    WEBUI_AUTH_TRUSTED_ACCESS_TOKEN_HEADER,
+     WEBUI_AUTH_TRUSTED_EMAIL_HEADER,
+     WEBUI_AUTH_TRUSTED_GROUPS_HEADER,
+     WEBUI_AUTH_TRUSTED_NAME_HEADER,
+@@ -78,6 +79,7 @@
+ from open_webui.utils.misc import parse_duration, validate_email_format
+ from open_webui.utils.rate_limit import RateLimiter
+ from open_webui.utils.redis import get_redis_client
++from open_webui.utils.trusted_proxy import verify_google_identity
+ from pydantic import BaseModel
+ from sqlalchemy.exc import IntegrityError
+ from sqlalchemy.ext.asyncio import AsyncSession
+@@ -743,13 +745,32 @@
+             except Exception as e:
+                 pass
+ 
++        # ZEO PATCH: do not take the proxy's word for it. Verify the asserted
++        # e-mail against Google using the access token the proxy forwards, and
++        # take the display name and picture from Google's userinfo.
++        trusted_name = None
++        trusted_picture_url = None
++        if WEBUI_AUTH_TRUSTED_ACCESS_TOKEN_HEADER:
++            identity = await verify_google_identity(
++                request.headers.get(WEBUI_AUTH_TRUSTED_ACCESS_TOKEN_HEADER, ''),
++                expected_email=email,
++            )
++            trusted_name = identity['name'] or None
++            trusted_picture_url = identity['picture'] or None
++            if trusted_name:
++                name = trusted_name
++
+         if not await Users.get_user_by_email(email.lower(), db=db):
++            profile_image_url = '/user.png'
++            if trusted_picture_url:
++                profile_image_url = await request.app.state.oauth_manager._process_picture_url(trusted_picture_url)
+             try:
+                 await signup_handler(
+                     request,
+                     email,
+                     str(uuid.uuid4()),
+                     name,
++                    profile_image_url,
+                     db=db,
+                     source='trusted_header',
+                 )
+@@ -759,6 +780,15 @@
+ 
+         user = await Auths.authenticate_user_by_email(email, db=db)
+         if user:
++            # ZEO PATCH: keep name and picture in step with Google on every
++            # sign-in, so accounts created before this patch heal themselves.
++            if trusted_name and trusted_name != user.name:
++                user = await Users.update_user_by_id(user.id, {'name': trusted_name}, db=db) or user
++            if trusted_picture_url:
++                picture = await request.app.state.oauth_manager._process_picture_url(trusted_picture_url)
++                if picture != '/user.png' and picture != user.profile_image_url:
++                    user = await Users.update_user_profile_image_url_by_id(user.id, picture, db=db) or user
++
+             if WEBUI_AUTH_TRUSTED_GROUPS_HEADER:
+                 group_names = request.headers.get(WEBUI_AUTH_TRUSTED_GROUPS_HEADER, '').split(',')
+                 group_names = [name.strip() for name in group_names if name.strip()]
+--- /dev/null	2026-09-10 16:32:19.000000000 -0600
++++ b/backend/open_webui/utils/trusted_proxy.py	2026-09-10 16:32:19.273972700 -0600
+@@ -0,0 +1,97 @@
++"""ZEO PATCH — ai/openwebui/patches/0002-trusted-header-google-identity.patch.
++
++Verify and enrich a trusted-header sign-in using the Google access token the
++authenticating reverse proxy forwards (oauth2-proxy `--pass-access-token`,
++header `X-Forwarded-Access-Token`).
++
++Upstream's trusted-header mode believes WEBUI_AUTH_TRUSTED_EMAIL_HEADER
++unconditionally and has no source for a display name or a profile picture.
++This module asks Google instead:
++
++  1. tokeninfo — the token must be live, issued to OUR OAuth client
++     (aud == GOOGLE_CLIENT_ID), and belong to the same verified e-mail the
++     proxy asserts. Any failure refuses the sign-in with HTTP 401.
++  2. userinfo  — the account's `name` and `picture`. Failure here is not
++     fatal: identity was already verified, the caller just gets no name.
++
++A header-only spoof therefore no longer works even for a caller that can
++reach openwebui:8080 directly — they would need the victim's live Google
++access token for this application.
++"""
++
++import logging
++from typing import Any
++
++import aiohttp
++from fastapi import HTTPException, status
++from open_webui.config import GOOGLE_CLIENT_ID
++from open_webui.env import AIOHTTP_CLIENT_SESSION_SSL
++
++log = logging.getLogger(__name__)
++
++GOOGLE_TOKENINFO_URL = 'https://oauth2.googleapis.com/tokeninfo'
++GOOGLE_USERINFO_URL = 'https://openidconnect.googleapis.com/v1/userinfo'
++_TIMEOUT = aiohttp.ClientTimeout(total=10)
++
++
++def _refuse(reason: str) -> HTTPException:
++    log.warning('Trusted-header sign-in refused: %s', reason)
++    return HTTPException(
++        status.HTTP_401_UNAUTHORIZED,
++        detail='Sign-in could not be verified with Google. Please sign in again.',
++    )
++
++
++async def verify_google_identity(access_token: str, expected_email: str) -> dict[str, str]:
++    """Return {'email', 'name', 'picture'} for a live Google access token.
++
++    Raises HTTPException(401) unless Google confirms the token is valid, was
++    issued to GOOGLE_CLIENT_ID (when set), and belongs to `expected_email`.
++    `name` / `picture` are empty strings when userinfo is unavailable.
++    """
++    access_token = (access_token or '').strip()
++    expected_email = (expected_email or '').strip().lower()
++    if not access_token:
++        raise _refuse('no access token header on the request')
++
++    async with aiohttp.ClientSession(timeout=_TIMEOUT) as session:
++        try:
++            async with session.get(
++                GOOGLE_TOKENINFO_URL,
++                params={'access_token': access_token},
++                ssl=AIOHTTP_CLIENT_SESSION_SSL,
++            ) as resp:
++                if resp.status != 200:
++                    raise _refuse(f'tokeninfo returned HTTP {resp.status}')
++                info: dict[str, Any] = await resp.json()
++        except aiohttp.ClientError as e:
++            raise _refuse(f'tokeninfo unreachable: {e}')
++
++        if GOOGLE_CLIENT_ID and info.get('aud') != GOOGLE_CLIENT_ID:
++            raise _refuse('token was not issued to this application (aud mismatch)')
++
++        token_email = str(info.get('email') or '').strip().lower()
++        if not token_email or token_email != expected_email:
++            raise _refuse('token e-mail does not match the asserted e-mail')
++        # tokeninfo returns this as the string "true", not a JSON boolean.
++        if str(info.get('email_verified', '')).lower() != 'true':
++            raise _refuse('token e-mail is not verified by Google')
++
++        name = ''
++        picture = ''
++        try:
++            async with session.get(
++                GOOGLE_USERINFO_URL,
++                headers={'Authorization': f'Bearer {access_token}'},
++                ssl=AIOHTTP_CLIENT_SESSION_SSL,
++            ) as resp:
++                if resp.status == 200:
++                    profile: dict[str, Any] = await resp.json()
++                    name = str(profile.get('name') or '').strip()
++                    picture = str(profile.get('picture') or '').strip()
++                else:
++                    log.warning('Google userinfo returned HTTP %s; signing in without name/picture', resp.status)
++        except aiohttp.ClientError as e:
++            log.warning('Google userinfo unreachable (%s); signing in without name/picture', e)
++
++    return {'email': token_email, 'name': name, 'picture': picture}

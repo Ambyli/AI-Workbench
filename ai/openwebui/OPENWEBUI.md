@@ -45,13 +45,13 @@ Every value is sourced from `.env` so configuration lives in one file.
 | `GOOGLE_CLIENT_ID` | `OPENWEBUI_GOOGLE_CLIENT_ID` | _(empty)_ | Google Cloud OAuth 2.0 client ID — see [Google OAuth setup](#google-oauth-setup) |
 | `GOOGLE_CLIENT_SECRET` | `OPENWEBUI_GOOGLE_CLIENT_SECRET` | _(empty)_ | Matching client secret |
 | `OPENID_PROVIDER_URL` | `OPENWEBUI_OPENID_PROVIDER_URL` | Google discovery doc | OIDC discovery document URL; required for clean provider-side logout |
-| `OAUTH_LOGIN_HINT_HEADER` | `OPENWEBUI_OAUTH_LOGIN_HINT_HEADER` | `X-Forwarded-Email` | **Zeo patch, not upstream.** Request header forwarded to Google as `login_hint`, so the second sign-in hop skips the account chooser — see [Custom image](#custom-image-login_hint-patch) |
-| `OAUTH_AUTO_REDIRECT` | `OPENWEBUI_OAUTH_AUTO_REDIRECT` | `true` | Skip the login page and redirect straight to Google — see [Single sign-on](#single-sign-on) |
+| `OAUTH_AUTO_REDIRECT` | `OPENWEBUI_OAUTH_AUTO_REDIRECT` | `true` | *Fallback path only* (trusted headers blank): skip the login page and redirect straight to Google |
 | `ENABLE_LOGIN_FORM` | `OPENWEBUI_ENABLE_LOGIN_FORM` | `false` | Hides the email/password form. **Required** for `OAUTH_AUTO_REDIRECT` to do anything |
-| `OAUTH_UPDATE_NAME_ON_LOGIN` | `OPENWEBUI_OAUTH_UPDATE_NAME_ON_LOGIN` | `true` | Re-read the `name` claim on every login, not just at account creation (upstream default: `false`) |
-| `OAUTH_UPDATE_PICTURE_ON_LOGIN` | `OPENWEBUI_OAUTH_UPDATE_PICTURE_ON_LOGIN` | `true` | Re-read the `picture` claim on every login (upstream default: `false`) |
-| `WEBUI_AUTH_TRUSTED_EMAIL_HEADER` | `OPENWEBUI_WEBUI_AUTH_TRUSTED_EMAIL_HEADER` | _(blank — off)_ | Trusted-header SSO. Deliberately disabled; see [Single sign-on](#single-sign-on) |
-| `WEBUI_AUTH_TRUSTED_NAME_HEADER` | `OPENWEBUI_WEBUI_AUTH_TRUSTED_NAME_HEADER` | _(blank — off)_ | ″ |
+| `OAUTH_UPDATE_NAME_ON_LOGIN` | `OPENWEBUI_OAUTH_UPDATE_NAME_ON_LOGIN` | `true` | *Fallback path only*: re-read the `name` claim on every OAuth login (upstream default: `false`) |
+| `OAUTH_UPDATE_PICTURE_ON_LOGIN` | `OPENWEBUI_OAUTH_UPDATE_PICTURE_ON_LOGIN` | `true` | *Fallback path only*: re-read the `picture` claim on every OAuth login (upstream default: `false`) |
+| `WEBUI_AUTH_TRUSTED_EMAIL_HEADER` | `OPENWEBUI_WEBUI_AUTH_TRUSTED_EMAIL_HEADER` | `X-Forwarded-Email` | Trusted-header SSO — sign in as the identity oauth2-proxy verified. See [Single sign-on](#single-sign-on) |
+| `WEBUI_AUTH_TRUSTED_NAME_HEADER` | `OPENWEBUI_WEBUI_AUTH_TRUSTED_NAME_HEADER` | _(blank — deliberate)_ | The only candidate header carries Google's numeric `sub`. Name comes from Google via the patch instead |
+| `WEBUI_AUTH_TRUSTED_ACCESS_TOKEN_HEADER` | `OPENWEBUI_WEBUI_AUTH_TRUSTED_ACCESS_TOKEN_HEADER` | `X-Forwarded-Access-Token` | **Zeo patch, not upstream.** Verify the trusted identity with Google and take name + picture from it — see [Single sign-on](#single-sign-on) |
 | `USER_AGENT` | `OPENWEBUI_USER_AGENT` | `OpenWebUI/1.0 (+github.com/open-webui/open-webui)` | User-Agent applied to outbound HTTP from RAG / web loaders (langchain_community); silences the "USER_AGENT not set" warning |
 | `MCP_INITIALIZE_TIMEOUT` | `OPENWEBUI_MCP_INITIALIZE_TIMEOUT` | `30` | Seconds to wait for an MCP server's initialize handshake; raise for slow cold-starts (upstream default: 10) |
 | `CORS_ALLOW_ORIGIN` | `CORS_ALLOW_ORIGIN` | `*` | Tighten to a specific origin if another web app calls Open WebUI's API from the browser |
@@ -201,52 +201,72 @@ To revoke access, set the user's role back to `pending` (silent suspension) or d
 
 ### Single sign-on
 
-Users hit two gates on the way in: **oauth2-proxy** at the edge (which enforces the Workspace-group membership check) and then **Open WebUI's own Google OIDC**. Both use the same Google account.
+One gate. **oauth2-proxy** at the edge does the Google sign-in and enforces the Workspace-domain and group checks. Open WebUI then accepts that identity through its trusted-header mode — with a patch that makes it **verify** the identity with Google rather than believe the headers, and that takes the display name and profile picture from Google while it is there. Users sign in once and land in Open WebUI with the right name and avatar: no second Google round-trip, no `/auth` page.
 
-That looks redundant, and it briefly wasn't — Open WebUI was switched to trusted-header SSO (`WEBUI_AUTH_TRUSTED_EMAIL_HEADER=X-Forwarded-Email`, `WEBUI_AUTH_TRUSTED_NAME_HEADER=X-Forwarded-User`) so it would accept the identity oauth2-proxy had already verified. **That has been reverted.** It works, but it costs user identity in three ways.
+#### How it works
 
-#### Why trusted-header SSO was reverted
+| Piece | Setting | What it does |
+|---|---|---|
+| oauth2-proxy | `OAUTH2_PROXY_PASS_USER_HEADERS=true` | Sends `X-Forwarded-Email` (and `X-Forwarded-User`, Google's numeric `sub`) on every proxied request |
+| oauth2-proxy | `OAUTH2_PROXY_PASS_ACCESS_TOKEN=true` | Sends the user's live Google access token as `X-Forwarded-Access-Token` |
+| Open WebUI | `WEBUI_AUTH_TRUSTED_EMAIL_HEADER=X-Forwarded-Email` | Upstream trusted-header mode: the frontend auto-signs-in, the backend uses this header as the identity |
+| Open WebUI | `WEBUI_AUTH_TRUSTED_NAME_HEADER=` (blank) | Deliberately unset — `X-Forwarded-User` is a 21-digit number, not a name |
+| Open WebUI | `WEBUI_AUTH_TRUSTED_ACCESS_TOKEN_HEADER=X-Forwarded-Access-Token` | **Zeo patch.** Verifies the token with Google and takes name + picture from it |
 
-**Display names became 21-digit numbers.** oauth2-proxy's Google provider puts Google's `sub` claim in the session user field:
+A trusted-header sign-in happens whenever Open WebUI has no session of its own for the browser — first visit, after its JWT expires, after logout. Each time, the patched `routers/auths.py` does:
+
+1. `GET https://oauth2.googleapis.com/tokeninfo?access_token=…` — the token must be live, its `aud` must equal `GOOGLE_CLIENT_ID` (the one OAuth client both oauth2-proxy and Open WebUI use), its `email` must equal `X-Forwarded-Email`, and `email_verified` must be true. Any failure → HTTP 401, no account created, and a `Trusted-header sign-in refused: <reason>` warning in `docker logs openwebui`.
+2. `GET https://openidconnect.googleapis.com/v1/userinfo` with the token — `name` and `picture`. If this call fails the sign-in still succeeds (identity was already verified), with the e-mail as the display name.
+3. Create the account on first sight with that name and picture (fetched and stored base64 through upstream's own OAuth picture code, MIME allow-list included), or on later sign-ins update the stored name and picture when they differ. Accounts created under the old numeric-name behaviour heal on their next sign-in — no admin cleanup.
+
+Code: `backend/open_webui/utils/trusted_proxy.py` (new) plus one hunk in `routers/auths.py` and one env var in `env.py` — `ai/openwebui/patches/0002-trusted-header-google-identity.patch`, applied by the [custom image](#custom-image-patches).
+
+#### Why a patch is needed at all
+
+Upstream's trusted-header mode has no source for a name or a picture. oauth2-proxy's Google provider can only forward `email`, `user` (Google's `sub`), `groups`, `preferred_username` (unset for Google), and the raw tokens — that is the whole list in `pkg/apis/sessions/session_state.go::GetClaim`. The first attempt at one-gate SSO here used `WEBUI_AUTH_TRUSTED_NAME_HEADER=X-Forwarded-User` and nothing for pictures:
 
 ```go
-// providers/google.go
-Email:        c.Email,
-User:         c.Subject,     // e.g. "117402938475019283746"
+// oauth2-proxy providers/google.go
+Email: c.Email,
+User:  c.Subject,     // e.g. "117402938475019283746"
 ```
-
-`PASS_USER_HEADERS=true` forwards that as `X-Forwarded-User`, and Open WebUI uses the name header verbatim:
-
 ```python
-# routers/auths.py
+# Open WebUI routers/auths.py (upstream)
 name = request.headers.get(WEBUI_AUTH_TRUSTED_NAME_HEADER, email)
-```
-
-`X-Forwarded-User` is an account identifier, not a display name, and no oauth2-proxy header carries the real one. `X-Auth-Request-Preferred-Username` would, but `google.go` only wires `setPreferredUsername` under `--google-use-organization-id`, which this deployment does not set (it uses the service-account JSON purely for the group gate).
-
-**Profile pictures were impossible.** The trusted-header signup path calls `signup_handler()` with no image argument, so every account took the default:
-
-```python
+...
 async def signup_handler(..., profile_image_url: str = '/user.png', ...)
 ```
 
-No header carries Google's `picture` claim, and that code path never fetches one. This was not a misconfiguration — it cannot work in that mode.
+So every account was created as a 21-digit number with the default avatar, and because upstream's signup path only runs once per e-mail, they never corrected themselves. The interim fix was to let Open WebUI run its own Google OIDC as a second hop — correct names and pictures, at the cost of a second Google round-trip and a visible bounce through `/auth`, plus Google's account chooser for anyone with a personal account also signed in. The access token is the one thing oauth2-proxy *can* forward that lets Open WebUI ask Google for the rest — and verify the asserted identity while doing so.
 
-**Names were write-once.** `signup_handler` only runs the first time an email is seen, so a bad name was never corrected on a later login.
+#### Security
 
-#### What runs now
+This is **stronger** than upstream's trusted-header mode, not weaker. Upstream believes any `X-Forwarded-Email` it sees, which is why every container on `ai_shared` is inside the trust boundary and why `PORT_OPENWEBUI` must stay on `127.0.0.1`. With the patch, a sign-in also needs a live Google access token *for that same account, issued to our OAuth client* — something an attacker on the network does not have. The loopback bind stays regardless; it costs nothing and keeps stock behaviour safe if the patch is ever disabled.
 
-Open WebUI's own OIDC reads `OAUTH_USERNAME_CLAIM` (`name`) and `OAUTH_PICTURE_CLAIM` (`picture`) properly. Three settings make it seamless and self-repairing:
+- The Google access token transits `oauth2-proxy → openwebui` inside Docker only. Its scopes are `profile email`; it cannot read mail, Drive, or anything else.
+- `utils/auth.py::get_current_user` still enforces upstream's rule that the session's user must match `X-Forwarded-Email` on every request, so an Open WebUI session cannot outlive a change of identity at the proxy.
+- Password changes are disabled in trusted-header mode (upstream behaviour); accounts hold a random password nobody knows. Intended.
+- If `GOOGLE_CLIENT_ID` were empty the `aud` check would be skipped. It is set here — don't blank it.
+- **Never set `WEBUI_AUTH_TRUSTED_EMAIL_HEADER` without `WEBUI_AUTH_TRUSTED_ACCESS_TOKEN_HEADER`.** That is stock upstream behaviour: numeric names, no pictures, and header spoofing from anything on the network.
 
-| Setting | Why |
-|---|---|
-| `OAUTH_AUTO_REDIRECT=true` | No "Continue with Google" click — the login page redirects immediately |
-| `ENABLE_LOGIN_FORM=false` | **Required by the above** — see the precondition list below |
-| `OAUTH_UPDATE_NAME_ON_LOGIN=true` | Existing accounts pick up the real name on next sign-in |
-| `OAUTH_UPDATE_PICTURE_ON_LOGIN=true` | Existing accounts pick up the avatar on next sign-in |
-| `OAUTH_LOGIN_HINT_HEADER=X-Forwarded-Email` | *(Zeo patch)* Google skips its account chooser on this hop — see [Custom image](#custom-image-login_hint-patch) |
+#### Verifying
 
-`OAUTH_AUTO_REDIRECT` alone does nothing. The frontend refuses to bounce a user to SSO unless the deployment is unambiguously SSO-only — `src/routes/auth/+page.svelte` requires **all** of:
+```bash
+# Patched code is in the running container; headers are wired.
+docker exec openwebui grep -c WEBUI_AUTH_TRUSTED_ACCESS_TOKEN_HEADER /app/backend/open_webui/routers/auths.py   # expect 2
+docker exec openwebui test -f /app/backend/open_webui/utils/trusted_proxy.py && echo patched
+docker exec openwebui printenv WEBUI_AUTH_TRUSTED_EMAIL_HEADER WEBUI_AUTH_TRUSTED_ACCESS_TOKEN_HEADER
+# A healthy sign-in logs nothing here; a refused one says why.
+docker logs openwebui 2>&1 | grep -i "Trusted-header sign-in refused"
+```
+
+Then sign in from a private window: one Google prompt, straight into the app, and Admin Panel → Users shows the real name and avatar.
+
+#### Fallback: two-hop OAuth
+
+Blank `OPENWEBUI_WEBUI_AUTH_TRUSTED_EMAIL_HEADER` **and** `OPENWEBUI_WEBUI_AUTH_TRUSTED_ACCESS_TOKEN_HEADER`, then `make up openwebui`. Open WebUI reverts to its own Google OIDC after the oauth2-proxy gate: `OAUTH_AUTO_REDIRECT=true` + `ENABLE_LOGIN_FORM=false` send users straight to Google, and `OAUTH_UPDATE_NAME_ON_LOGIN` / `OAUTH_UPDATE_PICTURE_ON_LOGIN` keep names and pictures correct on that path. Those four settings are kept configured for exactly this reason. Expect a visible bounce through `/auth?redirect=%2F`, and Google's account chooser on the second hop for browsers signed into several Google accounts.
+
+`OAUTH_AUTO_REDIRECT` alone does nothing — `src/routes/auth/+page.svelte` requires **all** of:
 
 ```js
 $config?.oauth?.auto_redirect && !logout && !form && !error
@@ -254,44 +274,30 @@ $config?.oauth?.auto_redirect && !logout && !form && !error
   && $config?.features?.auth !== false
   && $config?.features?.enable_login_form === false  // ← the easy one to miss
   && !$config?.features?.enable_ldap
-  && !$config?.features?.auth_trusted_header         // ← so it also can't coexist
-  && !$config?.onboarding                            //   with trusted-header SSO
+  && !$config?.features?.auth_trusted_header         // ← auto-redirect and trusted-header
+  && !$config?.onboarding                            //   SSO are mutually exclusive
   && !localStorage.token && !document.cookie…token=
 ```
 
-Note the `auth_trusted_header` condition: auto-redirect and trusted-header SSO are mutually exclusive by design, which is another reason the two approaches don't mix.
-
-If sign-in lands on Open WebUI's login page instead of bouncing to Google, dump the exact inputs the guard sees — `/api/config` from inside the container, with neither oauth2-proxy nor Cloudflare in the way:
+If the fallback lands on Open WebUI's login page instead of bouncing to Google, dump the guard's inputs from inside the container — no oauth2-proxy or Cloudflare in the way:
 
 ```bash
 docker exec openwebui python3 -c "import urllib.request,json;c=json.load(urllib.request.urlopen('http://localhost:8080/api/config'));o=c.get('oauth',{});f=c.get('features',{});print(json.dumps({'auto_redirect':o.get('auto_redirect'),'providers':list(o.get('providers',{})),'enable_login_form':f.get('enable_login_form'),'auth_trusted_header':f.get('auth_trusted_header'),'enable_ldap':f.get('enable_ldap'),'auth':f.get('auth'),'onboarding':c.get('onboarding')},indent=1))"
 ```
 
-Expected: `auto_redirect: true`, `providers: ["google"]`, `enable_login_form: false`, `auth_trusted_header: false`, `enable_ldap: false`, `auth: true`, `onboarding: null`. Whichever field deviates is the cause. A brief flash of `/auth?redirect=%2F` in the address bar before Google is normal — the redirect is client-side, so the page has to load first.
+Expected in fallback mode: `auto_redirect: true`, `providers: ["google"]`, `enable_login_form: false`, `auth_trusted_header: false`, `enable_ldap: false`, `auth: true`, `onboarding: null`. (In normal one-gate mode `auth_trusted_header` is `true` and the frontend signs in immediately without consulting the rest.)
 
-#### Break-glass if Google OAuth breaks
+#### Break-glass if Google itself is unreachable
 
-`/auth?form=true` suppresses the auto-redirect *and* re-renders the hidden email/password form — `+page.svelte` gates the form on `enable_login_form || enable_ldap || form`. That gets you a login box, but only helps if a local password actually exists: OAuth-created accounts are given a random `uuid4()` as their password and nobody knows it.
+Neither mode can sign anyone in without Google. For a local admin login: set `OPENWEBUI_ENABLE_LOGIN_FORM=true`, blank both trusted headers, `make up openwebui`, and use an admin whose password you set in advance through Admin Panel → Users — OAuth- and trusted-header-created accounts have a random `uuid4()` password. Set that password *before* you need it.
 
-So the real recovery path is `OPENWEBUI_ENABLE_LOGIN_FORM=true` in `.env` + `make up openwebui`. If you want a genuine standing break-glass account, set a password on one admin user through Admin Panel → Users *before* you need it.
-
-The last two default to `false` upstream. They are what repairs accounts created while trusted-header SSO was on — those have a numeric name and the placeholder avatar, and heal the next time each person signs in. No admin cleanup, no account deletion.
-
-The second hop is **not** a second login prompt — same OAuth client, same scopes, consent already granted at the oauth2-proxy hop. What Google *would* still show is its **account chooser**, on any authorize request that does not name an account, whenever the browser is signed into more than one Google account. Upstream Open WebUI sends no such hint (`utils/oauth.py::handle_login` passes only static params), so anyone with a personal account also signed in was asked to pick an account twice. This deployment's image carries a small patch that forwards the identity oauth2-proxy has already verified — `X-Forwarded-Email` — as the OIDC `login_hint`, which Google documents as suppressing the chooser and selecting the matching session. See [Custom image](#custom-image-login_hint-patch).
-
-> **Two different config lifetimes here — don't assume.** The `OAUTH_*` settings are read from the environment on every boot: `ENABLE_OAUTH_PERSISTENT_CONFIG` defaults to `false` upstream, and `models/config.py::persistent_enabled_for` short-circuits any key starting with `oauth.` before it ever reaches the DB. `ENABLE_LOGIN_FORM` is a `ui.*` key, so a DB row *can* shadow it — `Config.get` returns the env-derived default only while no row exists. v0.11.3 itself has no Admin Panel toggle for it, but **this install has a row anyway**: the 0.11 reshape migration (`migrations/versions/3ff2c63645b8_reshape_config_to_per_key_rows.py`) flattens the pre-0.11 single-JSON config blob into per-key rows and keeps every key it finds, and older versions dumped the whole config on any admin save. Expect the same for the other `ui.*` keys (`ui.enable_signup`, `ui.default_user_role`, …) — `select key from config order by key` lists exactly which env vars are inert on this install. If `/api/config` reports `enable_login_form: true` while `printenv ENABLE_LOGIN_FORM` says `false`, drop the row:
+> **Config lifetimes — don't assume.** The `OAUTH_*` settings and the `WEBUI_AUTH_TRUSTED_*` headers are read from the environment on every boot (`ENABLE_OAUTH_PERSISTENT_CONFIG` defaults to `false` upstream, and the trusted headers are plain `env.py` constants). `ENABLE_LOGIN_FORM` is a `ui.*` key, so a DB row *can* shadow it — `Config.get` returns the env-derived default only while no row exists. v0.11.3 itself has no Admin Panel toggle for it, but **this install had a row anyway**: the 0.11 reshape migration (`migrations/versions/3ff2c63645b8_reshape_config_to_per_key_rows.py`) flattens the pre-0.11 single-JSON config blob into per-key rows and keeps every key it finds, and older versions dumped the whole config on any admin save. Expect the same for the other `ui.*` keys (`ui.enable_signup`, `ui.default_user_role`, …) — `select key from config order by key` lists exactly which env vars are inert on this install. If `/api/config` reports `enable_login_form: true` while `printenv ENABLE_LOGIN_FORM` says `false`, drop the row:
 >
 > ```bash
 > docker exec openwebui python3 -c "import sqlite3;c=sqlite3.connect('/app/backend/data/webui.db');print(c.execute(\"select key,value from config where key='ui.enable_login_form'\").fetchall())"
 > # non-empty → delete it, then `make up openwebui`
 > docker exec openwebui python3 -c "import sqlite3;c=sqlite3.connect('/app/backend/data/webui.db');c.execute(\"delete from config where key='ui.enable_login_form'\");c.commit()"
 > ```
-
-#### Security note
-
-While the trusted headers were set, anyone able to reach `openwebui:8080` directly could send `X-Forwarded-Email: someone@zeoenergy.com` and land in that account with no Google prompt. That is why `PORT_OPENWEBUI` binds to `127.0.0.1` rather than `0.0.0.0`. With the headers blank the bypass is disarmed, but **the loopback bind stays** — as defense in depth, and so that re-enabling the headers can never silently re-open the hole.
-
-If you do re-enable them, re-read this section first, and verify the bind is still on loopback.
 
 ### Google OAuth setup
 
@@ -495,33 +501,24 @@ docker exec openwebui python3 -c "import urllib.request,json; r=urllib.request.u
 
 If Open WebUI shows "Server Connection Error" on play, `make logs openwebui` — a `502` from kokoro-api means `kokoro-app` is down or still downloading weights (`make logs kokoro`); a name-resolution error means `kokoro-api` isn't on `ai_shared` (`docker network inspect ai_shared`).
 
-### Custom image (login_hint patch)
+### Custom image (patches)
 
-`openwebui` does not run the upstream image directly. [`ai/openwebui/Dockerfile.openwebui`](Dockerfile.openwebui) starts `FROM ghcr.io/open-webui/open-webui:${OPENWEBUI_VERSION}` and applies every [`ai/openwebui/patches/*.patch`](patches/) with `patch -p1` from `/app`, dry-running each first so a hunk that no longer matches **fails the build** instead of shipping unpatched. Nothing else changes — same entrypoint, layout, and user. The result is tagged locally as `openwebui-zeo:<version>` with `pull_policy: build`, so compose never tries to pull it.
+`openwebui` does not run the upstream image directly. [`ai/openwebui/Dockerfile.openwebui`](Dockerfile.openwebui) starts `FROM ghcr.io/open-webui/open-webui:${OPENWEBUI_VERSION}` and applies every [`ai/openwebui/patches/*.patch`](patches/) with `patch -p1` from `/app`, dry-running each first so a hunk that no longer matches **fails the build** instead of shipping unpatched. It then re-parses every patched module and greps for the feature, so a patch that applied to the wrong context also fails. Nothing else changes — same entrypoint, layout, and user. The result is tagged locally as `openwebui-zeo:<version>` with `pull_policy: build`, so compose never tries to pull it.
 
-#### Why
+#### Current patches
 
-Sign-in is two OIDC round-trips to Google: oauth2-proxy's, then Open WebUI's own ([Single sign-on](#single-sign-on) covers why the trusted-header shortcut was dropped). They share one OAuth client and consent is granted once, so the second trip is silent — except that Google shows its account chooser on any authorize request that does not name an account, whenever the browser is signed into more than one Google account. Upstream's `handle_login` in `backend/open_webui/utils/oauth.py` sends only static params, so users with a personal account also signed in were asked to pick an account twice. Google's `login_hint` parameter "suppresses the account chooser and … selects the proper session", and oauth2-proxy already puts the verified email on every proxied request as `X-Forwarded-Email`. The patch connects the two.
+| Patch | What | Files |
+|---|---|---|
+| `0002-trusted-header-google-identity.patch` | Adds `WEBUI_AUTH_TRUSTED_ACCESS_TOKEN_HEADER`. In trusted-header SSO mode, verify the asserted identity with Google using the access token oauth2-proxy forwards, and take display name + picture from Google's userinfo on every sign-in. Rationale and security in [Single sign-on](#single-sign-on) | `backend/open_webui/env.py`, `routers/auths.py`, `utils/trusted_proxy.py` (new) |
 
-#### What `0001-oauth-login-hint-header.patch` does
+(`0001` was a `login_hint` patch for the two-hop OAuth path; it was retired when one-gate SSO replaced that path.)
 
-- `env.py` — adds `OAUTH_LOGIN_HINT_HEADER` (env var, default empty = feature off).
-- `utils/oauth.py::handle_login` — if that header is present on the `/oauth/{provider}/login` request, its value is passed as `login_hint` on the authorize redirect.
-
-That is the whole change. `.env` sets `OPENWEBUI_OAUTH_LOGIN_HINT_HEADER=X-Forwarded-Email`; blank it to disable without rebuilding.
-
-**Security:** the header is a *hint*. Google authenticates whatever account the browser actually holds, the callback is validated exactly as before, and access is still enforced by `OAUTH2_PROXY_EMAIL_DOMAINS` / `OAUTH2_PROXY_GOOGLE_GROUPS`. A spoofed header — which would require reaching `openwebui:8080` directly, and it is loopback-bound — could at most pre-fill the wrong email on Google's page.
-
-#### Verifying
+#### Verifying a build
 
 ```bash
-# Image label records the patch set; the running code contains the feature; env is wired.
 docker image inspect openwebui-zeo:v0.11.3 --format '{{index .Config.Labels "com.zeoenergy.openwebui.patches"}}'
-docker exec openwebui grep -c OAUTH_LOGIN_HINT_HEADER /app/backend/open_webui/utils/oauth.py   # expect 2
-docker exec openwebui printenv OAUTH_LOGIN_HINT_HEADER                                          # expect X-Forwarded-Email
+docker exec openwebui test -f /app/backend/open_webui/utils/trusted_proxy.py && echo patched
 ```
-
-Then, in a browser signed into a Zeo account **and** a personal one, open `chat.zeoenergy.com` in a fresh session: one Google interaction, not two. The first hop (oauth2-proxy) still shows a chooser when several *Zeo* accounts are signed in — nothing knows who is arriving before they have signed in.
 
 #### Regenerating a patch for a new upstream version
 
@@ -531,17 +528,18 @@ Only needed when `make build openwebui` fails at the `--dry-run` step.
 V=v0.12.0   # the tag you are moving to
 curl -sL https://github.com/open-webui/open-webui/archive/refs/tags/$V.tar.gz | tar xz
 cp -r open-webui-${V#v} pristine && cp -r open-webui-${V#v} patched
-patch -p1 -d patched < ai/openwebui/patches/0001-oauth-login-hint-header.patch  # fix rejects by hand in patched/
-{ diff -u pristine/backend/open_webui/env.py         patched/backend/open_webui/env.py
-  diff -u pristine/backend/open_webui/utils/oauth.py patched/backend/open_webui/utils/oauth.py
+patch -p1 -d patched < ai/openwebui/patches/0002-trusted-header-google-identity.patch  # fix rejects by hand in patched/
+{ diff -u pristine/backend/open_webui/env.py           patched/backend/open_webui/env.py
+  diff -u pristine/backend/open_webui/routers/auths.py patched/backend/open_webui/routers/auths.py
+  diff -u /dev/null                                    patched/backend/open_webui/utils/trusted_proxy.py
 } | sed -e 's|^--- pristine/|--- a/|' -e 's|^+++ patched/|+++ b/|' > new.patch
 ```
 
-Paste the header comment from the old patch file back on top, update its `Target:` line, replace the file, and re-run `make build openwebui`.
+Paste the header comment from the old patch file back on top, update its `Target:` line, replace the file, and re-run `make build openwebui`. Read what upstream changed around the rejected hunks before trusting the result — `routers/auths.py` moves between releases.
 
 #### Adding another patch
 
-Number it `0002-….patch`, keep the `a/` / `b/` path prefixes, list it in the Dockerfile header comment and the `com.zeoenergy.openwebui.patches` label, and add a `grep -q` guard in the Dockerfile for something only the patched code contains. Patches apply in filename order.
+Number it `0003-….patch`, keep the `a/` / `b/` path prefixes, list it in the Dockerfile header comment and the `com.zeoenergy.openwebui.patches` label, add its modules to the `ast.parse` list and a `grep -q` guard for something only the patched code contains. Patches apply in filename order.
 
 ### Updating the image
 

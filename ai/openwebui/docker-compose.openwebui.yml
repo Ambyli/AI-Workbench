@@ -25,15 +25,13 @@ services:
     ports:
       # Bound to 127.0.0.1 (host-loopback) ONLY — NOT 0.0.0.0.
       #
-      # Trusted-header SSO (WEBUI_AUTH_TRUSTED_EMAIL_HEADER below) makes any
-      # request carrying X-Forwarded-Email auto-log-in as that user. If the
-      # port were published on all interfaces, anyone on the LAN could send
-      # `X-Forwarded-Email: admin@zeoenergy.com` directly to :8007 and land
-      # in that account with no Google prompt at all.
-      #
-      # Those headers are blank today, so that specific bypass is disarmed —
-      # but the bind stays on loopback as defense in depth, and so that
-      # re-enabling them can never silently re-open the hole.
+      # Trusted-header SSO (WEBUI_AUTH_TRUSTED_EMAIL_HEADER below) signs in
+      # whoever X-Forwarded-Email names. Stock upstream would accept that
+      # header from anyone who can reach :8080; the Zeo patch
+      # (WEBUI_AUTH_TRUSTED_ACCESS_TOKEN_HEADER) additionally demands that
+      # account's live Google access token, so a bare header is no longer
+      # enough. The loopback bind stays regardless — it is free, and it keeps
+      # the stock behaviour safe should the patch ever be disabled.
       #
       # External access still works: cloudflared → oauth2-proxy → openwebui
       # all happen over the ai_shared Docker network, none of which uses
@@ -70,19 +68,12 @@ services:
       GOOGLE_CLIENT_ID: "${OPENWEBUI_GOOGLE_CLIENT_ID}"
       GOOGLE_CLIENT_SECRET: "${OPENWEBUI_GOOGLE_CLIENT_SECRET}"
       OPENID_PROVIDER_URL: "${OPENWEBUI_OPENID_PROVIDER_URL}"
-      # ZEO PATCH (not upstream) — see Dockerfile.openwebui and OPENWEBUI.md
-      # § Custom image. Request header whose value is forwarded to Google as
-      # the OIDC login_hint on the /oauth/google/login redirect, so the second
-      # sign-in hop never shows an account chooser. oauth2-proxy sets
-      # X-Forwarded-Email on every proxied request. Empty disables it.
-      OAUTH_LOGIN_HINT_HEADER: "${OPENWEBUI_OAUTH_LOGIN_HINT_HEADER}"
 
-      # Sign-in behaviour. Open WebUI runs its own Google OIDC using the
-      # credentials above; AUTO_REDIRECT skips its login page so the hop is a
-      # silent redirect (the user already holds a Google session from
-      # oauth2-proxy). UPDATE_NAME/PICTURE_ON_LOGIN re-read the `name` and
-      # `picture` claims on every login rather than only at account creation,
-      # which is what repairs accounts made under the old trusted-header SSO.
+      # FALLBACK sign-in path — only used when the trusted headers further
+      # down are blank. Then Open WebUI runs its own Google OIDC with the
+      # credentials above: AUTO_REDIRECT skips its login page, and
+      # UPDATE_NAME/PICTURE_ON_LOGIN re-read `name` / `picture` on every login.
+      # Kept configured so disabling the trusted-header patch is one edit.
       #
       # These are oauth.* config keys: ENABLE_OAUTH_PERSISTENT_CONFIG defaults
       # to false upstream, so they never read from the DB and env applies on
@@ -97,18 +88,21 @@ services:
       OAUTH_UPDATE_NAME_ON_LOGIN: "${OPENWEBUI_OAUTH_UPDATE_NAME_ON_LOGIN}"
       OAUTH_UPDATE_PICTURE_ON_LOGIN: "${OPENWEBUI_OAUTH_UPDATE_PICTURE_ON_LOGIN}"
 
-      # Trusted-header SSO — deliberately blank in .env, left wired so the
-      # mechanism stays greppable. Enabling it hands Open WebUI a numeric
-      # display name (oauth2-proxy forwards Google's `sub` as
-      # X-Forwarded-User) and no profile picture at all, because that signup
-      # path never sets one. See .env and ai/openwebui/OPENWEBUI.md
-      # § Single sign-on before touching these.
+      # Trusted-header SSO — the ONE gate. oauth2-proxy signs the user in
+      # with Google and forwards X-Forwarded-Email; Open WebUI signs them in
+      # from that. NAME_HEADER stays blank on purpose: oauth2-proxy's
+      # X-Forwarded-User is Google's numeric `sub`, not a name.
       #
-      # SECURITY: while set, anyone who can reach openwebui:8080 directly can
-      # spoof X-Forwarded-Email and log in as any account. That is why the
-      # host publish below is bound to 127.0.0.1.
+      # ACCESS_TOKEN_HEADER is a ZEO PATCH (Dockerfile.openwebui, patch 0002;
+      # OPENWEBUI.md § Single sign-on). With it set, the sign-in is refused
+      # unless Google confirms the forwarded token is live, issued to
+      # GOOGLE_CLIENT_ID, and belongs to X-Forwarded-Email — and the account's
+      # display name + picture are taken from Google's userinfo on every
+      # sign-in. Blank BOTH the email and access-token headers to fall back to
+      # Open WebUI's own two-hop Google OIDC (the OAUTH_* block above).
       WEBUI_AUTH_TRUSTED_EMAIL_HEADER: "${OPENWEBUI_WEBUI_AUTH_TRUSTED_EMAIL_HEADER}"
       WEBUI_AUTH_TRUSTED_NAME_HEADER: "${OPENWEBUI_WEBUI_AUTH_TRUSTED_NAME_HEADER}"
+      WEBUI_AUTH_TRUSTED_ACCESS_TOKEN_HEADER: "${OPENWEBUI_WEBUI_AUTH_TRUSTED_ACCESS_TOKEN_HEADER}"
 
       # Post-signout redirect. Without this, "Log out" only clears the
       # OpenWebUI cookie — the next page load carries the still-valid

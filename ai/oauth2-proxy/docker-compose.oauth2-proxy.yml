@@ -23,9 +23,15 @@ services:
       OAUTH2_PROXY_HTTP_ADDRESS: "${OAUTH2_PROXY_HTTP_ADDRESS}"
       OAUTH2_PROXY_REVERSE_PROXY: "${OAUTH2_PROXY_REVERSE_PROXY}"
 
-      # Identity headers passed to Open WebUI
+      # Identity passed upstream. USER_HEADERS → X-Forwarded-Email /
+      # X-Forwarded-User (Open WebUI trusted-header SSO); XAUTHREQUEST →
+      # X-Auth-Request-* (Superset). PASS_ACCESS_TOKEN → X-Forwarded-Access-
+      # Token, the user's Google access token, which Open WebUI's patched
+      # trusted-header sign-in uses to VERIFY the identity with Google and
+      # fetch name + picture. See ai/openwebui/OPENWEBUI.md § Single sign-on.
       OAUTH2_PROXY_PASS_USER_HEADERS: "${OAUTH2_PROXY_PASS_USER_HEADERS}"
       OAUTH2_PROXY_SET_XAUTHREQUEST: "${OAUTH2_PROXY_SET_XAUTHREQUEST}"
+      OAUTH2_PROXY_PASS_ACCESS_TOKEN: "${OAUTH2_PROXY_PASS_ACCESS_TOKEN}"
 
       # OAuth client — reused from Open WebUI's Google OAuth 2.0 client.
       OAUTH2_PROXY_CLIENT_ID: "${OPENWEBUI_GOOGLE_CLIENT_ID}"

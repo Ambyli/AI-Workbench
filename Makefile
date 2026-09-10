@@ -136,6 +136,15 @@ else
 	@echo "Stacks: $(STACKS)"
 endif
 
+ps:
+	$(check_stack)
+ifdef STACK
+	$(DC) ps $(SERVICES)
+else
+	@echo "Use: make ps <stack> [service...] to list active containers for a stack."
+	@echo "Stacks: $(STACKS)"
+endif
+
 help:
 	@echo ""
 	@echo "Usage: make <verb> [stack] [service...]"
@@ -149,6 +158,7 @@ help:
 	@echo "  very-clean  Stop, remove containers, volumes, and images (needs CONFIRM=yes)"
 	@echo "  build       Rebuild images"
 	@echo "  logs        Follow service logs"
+	@echo "  ps          List active containers for a stack"
 	@echo ""
 	@echo "Stacks: $(STACKS)"
 	@echo ""
@@ -160,10 +170,11 @@ help:
 	@echo "  make build sandbox PROFILES=build      # build only services under the 'build' profile"
 	@echo "  make build sandbox PROFILES=build,x    # build multiple profiles (comma-separated)"
 	@echo "  make logs kokoro                       # tail kokoro logs"
+	@echo "  make ps sandbox                        # list active sandbox containers"
 	@echo ""
 	@echo "Note: 'make build' auto-includes every profile declared in a stack's compose"
 	@echo "file (see 'docker compose config --profiles'). Override with PROFILES=<list>"
 	@echo "to narrow the set — the default of 'all profiles' works for most operators."
 	@echo ""
 
-.PHONY: setup network up down clean very-clean build logs help list-stacks list-services
+.PHONY: setup network up down clean very-clean build logs ps help list-stacks list-services

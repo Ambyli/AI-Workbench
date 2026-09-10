@@ -293,6 +293,7 @@ Full write-up, including the settings that repair the affected accounts: [ai/ope
 | Revocation not taking effect | `OAUTH2_PROXY_COOKIE_REFRESH` interval hasn't elapsed. Reduce it, or have the user clear cookies for `chat.zeoenergy.com` |
 | Sign-in page renders blank (200 with empty body) | Template parse error. Check `docker logs oauth2-proxy` at container startup — malformed Go template syntax fails silently at render time |
 | Only one of sign-in / error pages picked up the custom branding | Both `sign_in.html` AND `error.html` must exist in `OAUTH2_PROXY_CUSTOM_TEMPLATES_DIR`. Missing one falls back to the built-in default for that page only |
+| Anonymous `curl -sI https://chat.zeoenergy.com/static/favicon.png` returns `200` + `cf-cache-status: HIT` instead of `403`; Open WebUI's branded assets stay stale after a recreate | Not oauth2-proxy — Cloudflare's edge cached the authenticated response by file extension. Purge, then add the bypass Cache Rule: [ai/cloudflared/CLOUDFLARED.md § Cache rule](../cloudflared/CLOUDFLARED.md#cache-rule--bypass-for-chatzeoenergycom) |
 
 ### Useful commands
 

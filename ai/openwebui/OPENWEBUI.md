@@ -100,6 +100,8 @@ app.mount('/', SPAStaticFiles(directory=FRONTEND_BUILD_DIR, html=True))  # ~3037
 
 The compose file bind-mounts individual files read-only rather than mounting the whole directory: `STATIC_DIR` also contains `fonts/`, `swagger-ui/`, `assets/`, `user.png`, and `user-import.csv`, all of which a directory mount would hide.
 
+There is a second reason the mounts are single-file **and** read-only: `config.py` wipes and rebuilds `STATIC_DIR` on **every boot** — it unlinks each file, re-copies `/app/build/static/**` over the top, then copies `favicon.png` and `splash.png` a second time (`config.py:99-135`). A writable copy of the branded files would be overwritten seconds after start. With `:ro` bind mounts the unlink fails (a mount point can't be unlinked) and the copy fails with `[Errno 30] Read-only file system`, so the branded bytes survive. Expect roughly ten `An error occurred: [Errno 30] Read-only file system` lines in `docker logs openwebui` at startup — that is the mechanism working, not a fault.
+
 #### Which file drives which surface
 
 | File | Mark | Surface |
@@ -139,7 +141,25 @@ python ai/openwebui/bin/generate_branding.py
 
 Needs Pillow, which the uv workspace already pulls in via `widget/pyproject.toml`; outside the workspace venv, `pip install Pillow`. The script is deterministic — re-running it with unchanged sources rewrites byte-identical files.
 
-Then `make up openwebui` to recreate. Browsers cache favicons aggressively; hard-reload or check in a private window.
+Then `make up openwebui` to recreate — and then purge Cloudflare, or nothing visible changes.
+
+#### Cloudflare caches `/static/*`
+
+`chat.zeoenergy.com` is fronted by Cloudflare, and Cloudflare caches responses by file extension (`.png`, `.ico`, `.svg`, `.css`, `.js`, fonts) **regardless of cookies** unless the origin sends `Cache-Control: private` or `no-store`. Starlette's `StaticFiles` sends neither and oauth2-proxy adds nothing, so every `/static/*` asset sits at the edge for Cloudflare's default 4 h TTL (`Cache-Control: max-age=14400`, `cf-cache-status: HIT`). Recreating the container does nothing to that copy, and neither does a private window. When this branding first shipped, the files were on disk and byte-correct for hours while the edge kept serving the upstream defaults — and a cached **zero-byte** `custom.css`, which is why the in-app mark swap looked broken too.
+
+Two consequences beyond stale branding: the edge serves those cached responses to **anonymous** clients (oauth2-proxy never sees the request), and browsers that loaded the old assets keep them for their own 4 h `max-age` even after a purge.
+
+The permanent fix is a dashboard Cache Rule that bypasses the cache for the hostname — [ai/cloudflared/CLOUDFLARED.md § Cache rule](../cloudflared/CLOUDFLARED.md#cache-rule--bypass-for-chatzeoenergycom). Until that exists, purge after every asset change: Cloudflare dashboard → Caching → Configuration → Purge Everything.
+
+To tell the layers apart:
+
+```bash
+# What the edge serves (run from anywhere). HIT + 21666 bytes is the stale upstream favicon.
+curl -sI https://chat.zeoenergy.com/static/favicon.png | grep -iE 'cf-cache-status|content-length|^age:'
+
+# What the origin serves (run on the box). Expect the sha256 of assets/openwebui/favicon.png.
+docker exec openwebui python3 -c "import urllib.request,hashlib;print(hashlib.sha256(urllib.request.urlopen('http://localhost:8080/static/favicon.png').read()).hexdigest())"
+```
 
 > The same `assets/` folder is bind-mounted by the `oauth2-assets` sidecar and served unauthenticated at `/assets/*` (see [ai/oauth2-proxy/OAUTH2_PROXY.md](../oauth2-proxy/OAUTH2_PROXY.md)), which is how the sign-in page shows the Zeo logo pre-login. `assets/openwebui/*` is therefore also reachable at `/assets/openwebui/*` — harmless, these are public branding files, but don't put anything private there.
 
@@ -239,7 +259,13 @@ $config?.oauth?.auto_redirect && !logout && !form && !error
 
 Note the `auth_trusted_header` condition: auto-redirect and trusted-header SSO are mutually exclusive by design, which is another reason the two approaches don't mix.
 
-If sign-in lands on Open WebUI's login page instead of bouncing to Google, work down that list — `enable_login_form` is the usual culprit.
+If sign-in lands on Open WebUI's login page instead of bouncing to Google, dump the exact inputs the guard sees — `/api/config` from inside the container, with neither oauth2-proxy nor Cloudflare in the way:
+
+```bash
+docker exec openwebui python3 -c "import urllib.request,json;c=json.load(urllib.request.urlopen('http://localhost:8080/api/config'));o=c.get('oauth',{});f=c.get('features',{});print(json.dumps({'auto_redirect':o.get('auto_redirect'),'providers':list(o.get('providers',{})),'enable_login_form':f.get('enable_login_form'),'auth_trusted_header':f.get('auth_trusted_header'),'enable_ldap':f.get('enable_ldap'),'auth':f.get('auth'),'onboarding':c.get('onboarding')},indent=1))"
+```
+
+Expected: `auto_redirect: true`, `providers: ["google"]`, `enable_login_form: false`, `auth_trusted_header: false`, `enable_ldap: false`, `auth: true`, `onboarding: null`. Whichever field deviates is the cause. A brief flash of `/auth?redirect=%2F` in the address bar before Google is normal — the redirect is client-side, so the page has to load first.
 
 #### Break-glass if Google OAuth breaks
 
@@ -251,7 +277,13 @@ The last two default to `false` upstream. They are what repairs accounts created
 
 The second hop is **not** a second login prompt. The user already holds a live Google session and prior consent from clearing oauth2-proxy, so Google returns immediately; with auto-redirect on, the whole thing is a redirect bounce.
 
-> **Two different config lifetimes here — don't assume.** The `OAUTH_*` settings are read from the environment on every boot: `ENABLE_OAUTH_PERSISTENT_CONFIG` defaults to `false` upstream, and `models/config.py::persistent_enabled_for` short-circuits any key starting with `oauth.` before it ever reaches the DB. `ENABLE_LOGIN_FORM` is a `ui.*` key and *is* PersistentConfig-backed, like `ENABLE_WEB_SEARCH` and the `AUDIO_TTS_*` block — but the fallback is per-key, not first-boot-only: `Config.get` returns the env-derived default whenever no DB row exists, and rows are only written when a setting is saved through the Admin UI or API. So it applies on recreate on an install where nobody has touched it. If it doesn't take effect, a row exists — set it at Admin Panel → Settings → General instead.
+> **Two different config lifetimes here — don't assume.** The `OAUTH_*` settings are read from the environment on every boot: `ENABLE_OAUTH_PERSISTENT_CONFIG` defaults to `false` upstream, and `models/config.py::persistent_enabled_for` short-circuits any key starting with `oauth.` before it ever reaches the DB. `ENABLE_LOGIN_FORM` is a `ui.*` key, so a DB row *can* shadow it — `Config.get` returns the env-derived default only while no row exists. But in v0.11.3 nothing writes that row: there is no Admin Panel toggle for it, and only a config import (`POST /api/v1/configs/import`) could create one. On this install a recreate applies it. If `/api/config` still reports `enable_login_form: true`, look for the row and drop it:
+>
+> ```bash
+> docker exec openwebui python3 -c "import sqlite3;c=sqlite3.connect('/app/backend/data/webui.db');print(c.execute(\"select key,value from config where key='ui.enable_login_form'\").fetchall())"
+> # non-empty → delete it, then `make up openwebui`
+> docker exec openwebui python3 -c "import sqlite3;c=sqlite3.connect('/app/backend/data/webui.db');c.execute(\"delete from config where key='ui.enable_login_form'\");c.commit()"
+> ```
 
 #### Security note
 

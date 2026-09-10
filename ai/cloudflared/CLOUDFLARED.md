@@ -115,6 +115,37 @@ existing Google sign-in cookie instead of being exposed unauthenticated.
 
 ---
 
+## Cache rule — bypass for `chat.zeoenergy.com`
+
+Cloudflare caches by file extension by default — `.png`, `.ico`, `.svg`, `.css`,
+`.js`, fonts — for 4 h when the origin sends no `Cache-Control`, and it does so
+**regardless of request cookies**. Everything on `chat.zeoenergy.com` sits behind
+oauth2-proxy, and neither oauth2-proxy nor Open WebUI's static handler sets
+`Cache-Control`, so the edge caches *authenticated* responses and then serves
+them to anyone who asks: an anonymous
+`curl -sI https://chat.zeoenergy.com/static/favicon.png` returns `200` with
+`cf-cache-status: HIT` where oauth2-proxy would have returned `403`. It is also
+why re-branding Open WebUI's `/static/*` assets appears to do nothing for hours
+after a recreate — see
+[ai/openwebui/OPENWEBUI.md § Cloudflare caches /static/*](../openwebui/OPENWEBUI.md#cloudflare-caches-static).
+
+Like the ingress rules, this lives in the dashboard, not the repo:
+
+1. Caching → Cache Rules → Create rule. Name: `chat – bypass (authenticated origin)`.
+2. Match: **Hostname** equals `chat.zeoenergy.com`. Optionally AND **URI Path**
+   does not start with `/assets/` — the unauthenticated logo sidecar is safe to
+   cache.
+3. Cache eligibility: **Bypass cache**. Deploy.
+4. Caching → Configuration → **Purge Everything**, once, to evict what is
+   already cached.
+
+Verify with the `curl -sI` above: `cf-cache-status` should read `DYNAMIC` or
+`BYPASS`, and the anonymous request should get oauth2-proxy's `403`.
+`api.zeoenergy.com` needs no rule — LiteLLM answers JSON on extension-less
+paths, which Cloudflare never caches by default.
+
+---
+
 ## Triage
 
 ```bash

@@ -261,11 +261,20 @@ Expected: `OK → PASS`. If it returns HTML or a redirect to `/oauth/google/logi
 
 ---
 
-## Double-login note
+## Two gates, one prompt
 
-Open WebUI still has its own Google OAuth login enabled. After passing the oauth2-proxy gate at Cloudflare's edge, the user then sees Open WebUI's own Google login screen and signs in a second time with the same account. Same identity, one extra click.
+Open WebUI keeps its own Google OAuth login enabled. After passing the oauth2-proxy gate at Cloudflare's edge, it runs its own OIDC round-trip against the same Google account.
 
-If a single-sign-on experience is desired, Open WebUI can be switched to trusted-header auth (`WEBUI_AUTH_TRUSTED_EMAIL_HEADER=X-Forwarded-Email` etc.) so it accepts the identity that oauth2-proxy has already verified. That change is deliberately not made here — it removes Open WebUI's independent auth layer, and requires guaranteeing that Open WebUI is unreachable except through the proxy.
+This is not a second login prompt. The user already holds a live Google session and prior consent from clearing oauth2-proxy, so Google returns immediately, and `OPENWEBUI_OAUTH_AUTO_REDIRECT=true` skips Open WebUI's own login page — the hop is a redirect bounce, not a form.
+
+Open WebUI *was* switched to trusted-header auth (`WEBUI_AUTH_TRUSTED_EMAIL_HEADER=X-Forwarded-Email`, `WEBUI_AUTH_TRUSTED_NAME_HEADER=X-Forwarded-User`) to collapse the two gates into one. That has been **reverted**, for two reasons beyond the usual "it removes Open WebUI's independent auth layer":
+
+- `X-Forwarded-User` carries Google's `sub` claim for this provider (`providers/google.go`: `User: c.Subject`), so every account was created with a 21-digit number as its display name.
+- No proxy header carries Google's `picture` claim, and Open WebUI's trusted-header signup path hardcodes the default avatar — profile pictures were structurally impossible.
+
+Full write-up, including the settings that repair the affected accounts: [ai/openwebui/OPENWEBUI.md § Single sign-on](../openwebui/OPENWEBUI.md#single-sign-on).
+
+`OAUTH2_PROXY_PASS_USER_HEADERS` and `OAUTH2_PROXY_SET_XAUTHREQUEST` stay `true` — Superset consumes `X-Auth-Request-Email`, and the headers are harmless to an upstream that ignores them.
 
 ---
 

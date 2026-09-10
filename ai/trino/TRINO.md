@@ -373,9 +373,11 @@ this host on an untrusted network:
 2. Drop the `ports:` block entirely and reach Superset only via
    `chat.zeoenergy.com/superset/`.
 
-Same posture as Open WebUI's trusted-header SSO — see
-`CLAUDE.md § Threading Model` (unrelated) and Open WebUI's
-`WEBUI_AUTH_TRUSTED_EMAIL_HEADER` docs for the sibling pattern.
+Superset is now the only service in the stack that trusts a proxy-set
+identity header. Open WebUI used the same pattern via
+`WEBUI_AUTH_TRUSTED_EMAIL_HEADER` and has since been moved to its own OIDC —
+[ai/openwebui/OPENWEBUI.md § Single sign-on](../openwebui/OPENWEBUI.md#single-sign-on)
+covers why, and the reasoning about reachability applies here unchanged.
 
 ## Connecting to the metastore DB
 

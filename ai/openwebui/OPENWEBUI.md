@@ -45,6 +45,11 @@ Every value is sourced from `.env` so configuration lives in one file.
 | `GOOGLE_CLIENT_ID` | `OPENWEBUI_GOOGLE_CLIENT_ID` | _(empty)_ | Google Cloud OAuth 2.0 client ID — see [Google OAuth setup](#google-oauth-setup) |
 | `GOOGLE_CLIENT_SECRET` | `OPENWEBUI_GOOGLE_CLIENT_SECRET` | _(empty)_ | Matching client secret |
 | `OPENID_PROVIDER_URL` | `OPENWEBUI_OPENID_PROVIDER_URL` | Google discovery doc | OIDC discovery document URL; required for clean provider-side logout |
+| `OAUTH_AUTO_REDIRECT` | `OPENWEBUI_OAUTH_AUTO_REDIRECT` | `true` | Skip the login page and redirect straight to Google — see [Single sign-on](#single-sign-on) |
+| `OAUTH_UPDATE_NAME_ON_LOGIN` | `OPENWEBUI_OAUTH_UPDATE_NAME_ON_LOGIN` | `true` | Re-read the `name` claim on every login, not just at account creation (upstream default: `false`) |
+| `OAUTH_UPDATE_PICTURE_ON_LOGIN` | `OPENWEBUI_OAUTH_UPDATE_PICTURE_ON_LOGIN` | `true` | Re-read the `picture` claim on every login (upstream default: `false`) |
+| `WEBUI_AUTH_TRUSTED_EMAIL_HEADER` | `OPENWEBUI_WEBUI_AUTH_TRUSTED_EMAIL_HEADER` | _(blank — off)_ | Trusted-header SSO. Deliberately disabled; see [Single sign-on](#single-sign-on) |
+| `WEBUI_AUTH_TRUSTED_NAME_HEADER` | `OPENWEBUI_WEBUI_AUTH_TRUSTED_NAME_HEADER` | _(blank — off)_ | ″ |
 | `USER_AGENT` | `OPENWEBUI_USER_AGENT` | `OpenWebUI/1.0 (+github.com/open-webui/open-webui)` | User-Agent applied to outbound HTTP from RAG / web loaders (langchain_community); silences the "USER_AGENT not set" warning |
 | `MCP_INITIALIZE_TIMEOUT` | `OPENWEBUI_MCP_INITIALIZE_TIMEOUT` | `30` | Seconds to wait for an MCP server's initialize handshake; raise for slow cold-starts (upstream default: 10) |
 | `CORS_ALLOW_ORIGIN` | `CORS_ALLOW_ORIGIN` | `*` | Tighten to a specific origin if another web app calls Open WebUI's API from the browser |
@@ -171,6 +176,63 @@ The deployment is configured so anyone with the URL can register, but new accoun
 To revoke access, set the user's role back to `pending` (silent suspension) or delete the account.
 
 > Want it fully open? Set `OPENWEBUI_DEFAULT_USER_ROLE=user` in `.env`. Want it fully locked? Set `OPENWEBUI_ENABLE_SIGNUP=false`. Either change requires either an Admin Settings toggle on the running container or a volume wipe (see the warning above the env table).
+
+### Single sign-on
+
+Users hit two gates on the way in: **oauth2-proxy** at the edge (which enforces the Workspace-group membership check) and then **Open WebUI's own Google OIDC**. Both use the same Google account.
+
+That looks redundant, and it briefly wasn't — Open WebUI was switched to trusted-header SSO (`WEBUI_AUTH_TRUSTED_EMAIL_HEADER=X-Forwarded-Email`, `WEBUI_AUTH_TRUSTED_NAME_HEADER=X-Forwarded-User`) so it would accept the identity oauth2-proxy had already verified. **That has been reverted.** It works, but it costs user identity in three ways.
+
+#### Why trusted-header SSO was reverted
+
+**Display names became 21-digit numbers.** oauth2-proxy's Google provider puts Google's `sub` claim in the session user field:
+
+```go
+// providers/google.go
+Email:        c.Email,
+User:         c.Subject,     // e.g. "117402938475019283746"
+```
+
+`PASS_USER_HEADERS=true` forwards that as `X-Forwarded-User`, and Open WebUI uses the name header verbatim:
+
+```python
+# routers/auths.py
+name = request.headers.get(WEBUI_AUTH_TRUSTED_NAME_HEADER, email)
+```
+
+`X-Forwarded-User` is an account identifier, not a display name, and no oauth2-proxy header carries the real one. `X-Auth-Request-Preferred-Username` would, but `google.go` only wires `setPreferredUsername` under `--google-use-organization-id`, which this deployment does not set (it uses the service-account JSON purely for the group gate).
+
+**Profile pictures were impossible.** The trusted-header signup path calls `signup_handler()` with no image argument, so every account took the default:
+
+```python
+async def signup_handler(..., profile_image_url: str = '/user.png', ...)
+```
+
+No header carries Google's `picture` claim, and that code path never fetches one. This was not a misconfiguration — it cannot work in that mode.
+
+**Names were write-once.** `signup_handler` only runs the first time an email is seen, so a bad name was never corrected on a later login.
+
+#### What runs now
+
+Open WebUI's own OIDC reads `OAUTH_USERNAME_CLAIM` (`name`) and `OAUTH_PICTURE_CLAIM` (`picture`) properly. Three settings make it seamless and self-repairing:
+
+| Setting | Why |
+|---|---|
+| `OAUTH_AUTO_REDIRECT=true` | No "Continue with Google" click — the login page redirects immediately |
+| `OAUTH_UPDATE_NAME_ON_LOGIN=true` | Existing accounts pick up the real name on next sign-in |
+| `OAUTH_UPDATE_PICTURE_ON_LOGIN=true` | Existing accounts pick up the avatar on next sign-in |
+
+The last two default to `false` upstream. They are what repairs accounts created while trusted-header SSO was on — those have a numeric name and the placeholder avatar, and heal the next time each person signs in. No admin cleanup, no account deletion.
+
+The second hop is **not** a second login prompt. The user already holds a live Google session and prior consent from clearing oauth2-proxy, so Google returns immediately; with auto-redirect on, the whole thing is a redirect bounce.
+
+> **These apply on a plain recreate.** Unlike `ENABLE_WEB_SEARCH` and the `AUDIO_TTS_*` block, the `OAUTH_*` settings are not first-boot-only. `ENABLE_OAUTH_PERSISTENT_CONFIG` defaults to `false` upstream, and `models/config.py::persistent_enabled_for` short-circuits any key starting with `oauth.`, so they are read from the environment on every boot and never consult the DB. `ENABLE_LOGIN_FORM` is a `ui.*` key and *is* first-boot-only — set it in Admin Panel → Settings if you want the dead email/password form hidden, though auto-redirect means nobody sees that page anyway.
+
+#### Security note
+
+While the trusted headers were set, anyone able to reach `openwebui:8080` directly could send `X-Forwarded-Email: someone@zeoenergy.com` and land in that account with no Google prompt. That is why `PORT_OPENWEBUI` binds to `127.0.0.1` rather than `0.0.0.0`. With the headers blank the bypass is disarmed, but **the loopback bind stays** — as defense in depth, and so that re-enabling the headers can never silently re-open the hole.
+
+If you do re-enable them, re-read this section first, and verify the bind is still on loopback.
 
 ### Google OAuth setup
 

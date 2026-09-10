@@ -21,6 +21,10 @@ services:
       # `X-Forwarded-Email: admin@zeoenergy.com` directly to :8007 and land
       # in that account with no Google prompt at all.
       #
+      # Those headers are blank today, so that specific bypass is disarmed —
+      # but the bind stays on loopback as defense in depth, and so that
+      # re-enabling them can never silently re-open the hole.
+      #
       # External access still works: cloudflared → oauth2-proxy → openwebui
       # all happen over the ai_shared Docker network, none of which uses
       # this host publish. Only direct-from-host debugging (curl on the
@@ -57,17 +61,30 @@ services:
       GOOGLE_CLIENT_SECRET: "${OPENWEBUI_GOOGLE_CLIENT_SECRET}"
       OPENID_PROVIDER_URL: "${OPENWEBUI_OPENID_PROVIDER_URL}"
 
-      # Trusted-header SSO from oauth2-proxy. When set, requests carrying
-      # WEBUI_AUTH_TRUSTED_EMAIL_HEADER are auto-authenticated as that
-      # email — first hit creates an account, subsequent hits sign in.
-      # oauth2-proxy sets X-Forwarded-Email / X-Forwarded-User because
-      # OAUTH2_PROXY_PASS_USER_HEADERS=true in .env. Together they turn
-      # the double-login (Google → Google-again-inside-OpenWebUI) into a
-      # single Google-only login.
+      # Sign-in behaviour. Open WebUI runs its own Google OIDC using the
+      # credentials above; AUTO_REDIRECT skips its login page so the hop is a
+      # silent redirect (the user already holds a Google session from
+      # oauth2-proxy). UPDATE_NAME/PICTURE_ON_LOGIN re-read the `name` and
+      # `picture` claims on every login rather than only at account creation,
+      # which is what repairs accounts made under the old trusted-header SSO.
       #
-      # SECURITY: OpenWebUI must NOT be reachable except via oauth2-proxy.
-      # Anyone who can hit openwebui:8080 directly can spoof this header.
-      # See ai/openwebui/OPENWEBUI.md § Trusted-header SSO.
+      # These are oauth.* config keys, so they bypass Open WebUI's
+      # first-boot-only PersistentConfig store and are read on every boot —
+      # unlike ENABLE_WEB_SEARCH and the AUDIO_TTS_* block further down.
+      OAUTH_AUTO_REDIRECT: "${OPENWEBUI_OAUTH_AUTO_REDIRECT}"
+      OAUTH_UPDATE_NAME_ON_LOGIN: "${OPENWEBUI_OAUTH_UPDATE_NAME_ON_LOGIN}"
+      OAUTH_UPDATE_PICTURE_ON_LOGIN: "${OPENWEBUI_OAUTH_UPDATE_PICTURE_ON_LOGIN}"
+
+      # Trusted-header SSO — deliberately blank in .env, left wired so the
+      # mechanism stays greppable. Enabling it hands Open WebUI a numeric
+      # display name (oauth2-proxy forwards Google's `sub` as
+      # X-Forwarded-User) and no profile picture at all, because that signup
+      # path never sets one. See .env and ai/openwebui/OPENWEBUI.md
+      # § Single sign-on before touching these.
+      #
+      # SECURITY: while set, anyone who can reach openwebui:8080 directly can
+      # spoof X-Forwarded-Email and log in as any account. That is why the
+      # host publish below is bound to 127.0.0.1.
       WEBUI_AUTH_TRUSTED_EMAIL_HEADER: "${OPENWEBUI_WEBUI_AUTH_TRUSTED_EMAIL_HEADER}"
       WEBUI_AUTH_TRUSTED_NAME_HEADER: "${OPENWEBUI_WEBUI_AUTH_TRUSTED_NAME_HEADER}"
 

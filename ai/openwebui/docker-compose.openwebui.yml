@@ -98,6 +98,28 @@ services:
       SEARXNG_QUERY_URL: "${OPENWEBUI_SEARXNG_QUERY_URL}"
       WEB_SEARCH_RESULT_COUNT: "${OPENWEBUI_WEB_SEARCH_RESULT_COUNT}"
       WEB_SEARCH_CONCURRENT_REQUESTS: "${OPENWEBUI_WEB_SEARCH_CONCURRENT_REQUESTS}"
+
+      # Voice — text-to-speech backed by the kokoro-api container on ai_shared.
+      # kokoro-api exposes an OpenAI-compatible POST /v1/audio/speech, so the
+      # "openai" engine is used with its base URL pointed at kokoro-api rather
+      # than LiteLLM. Going direct keeps the `kokoro` model off the chat picker
+      # (the Open WebUI virtual key deliberately excludes it) and needs no key —
+      # kokoro-api has no auth and is only reachable inside ai_shared.
+      # Kokoro returns WAV; Open WebUI transcodes to MP3 itself (pydub/ffmpeg).
+      # Like the web-search block, these are PersistentConfig values: read on
+      # the first boot of a fresh openwebui_data volume only. On an existing
+      # install set them via Admin Panel → Settings → Audio. See
+      # ai/openwebui/OPENWEBUI.md § Voice (TTS via Kokoro).
+      AUDIO_TTS_ENGINE: "${OPENWEBUI_AUDIO_TTS_ENGINE}"
+      AUDIO_TTS_OPENAI_API_BASE_URL: "${OPENWEBUI_AUDIO_TTS_OPENAI_API_BASE_URL}"
+      AUDIO_TTS_OPENAI_API_KEY: "${OPENWEBUI_AUDIO_TTS_OPENAI_API_KEY}"
+      AUDIO_TTS_MODEL: "${OPENWEBUI_AUDIO_TTS_MODEL}"
+      AUDIO_TTS_VOICE: "${OPENWEBUI_AUDIO_TTS_VOICE}"
+      AUDIO_TTS_SPLIT_ON: "${OPENWEBUI_AUDIO_TTS_SPLIT_ON}"
+      # Speech-to-text stays on the built-in local faster-whisper model that
+      # ships inside the Open WebUI image (CPU, downloaded on first use). Only
+      # the model size is exposed here; "base" is the upstream default.
+      WHISPER_MODEL: "${OPENWEBUI_WHISPER_MODEL}"
     volumes:
       - openwebui_data:/app/backend/data
     healthcheck:

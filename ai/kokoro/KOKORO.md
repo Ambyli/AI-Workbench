@@ -120,6 +120,15 @@ Kokoro voice names (e.g. `af_heart`) can also be passed directly and will be use
 
 > **Note:** Kokoro only produces WAV output. The `response_format` field is accepted but ignored — the response is always `audio/wav`.
 
+### Open WebUI integration
+
+Open WebUI uses `kokoro-api` as its text-to-speech engine for read-aloud and Call mode. It talks to `http://kokoro-api:8000/v1/audio/speech` **directly over `ai_shared`**, not through LiteLLM — the Open WebUI virtual key is scoped to chat models and `kokoro` is deliberately kept off the chat picker. Configuration lives in the `OPENWEBUI_AUDIO_TTS_*` block of `.env`; the operator steps (including the Admin Panel path for an existing install) are in [OPENWEBUI.md § Voice (TTS via Kokoro)](../openwebui/OPENWEBUI.md#voice-tts-via-kokoro).
+
+Two behaviours of this service matter for that consumer:
+
+- **WAV only.** `/v1/audio/speech` ignores `response_format` and always returns `audio/wav`. Open WebUI inspects `Content-Type` and transcodes to MP3 with pydub, so this is transparent — but any other OpenAI-TTS client that assumes MP3 bytes will need to do the same.
+- **First chunk only.** `kokoro-app` calls `next()` once on the `KPipeline` generator, so text long enough for Kokoro to split internally (roughly a paragraph, or anything containing newlines) only yields its first segment. Open WebUI's `AUDIO_TTS_SPLIT_ON=punctuation` sends one sentence per request, which sidesteps this. Fixing it properly means concatenating every chunk the generator yields in `app.py`'s `/generate`.
+
 ### Adding voices
 
 Voices come from the Kokoro model on HuggingFace. Run `/voices` to see all available names, then pass the name as the `voice` query parameter to `/generate` or as the `voice` field in `/v1/audio/speech`.

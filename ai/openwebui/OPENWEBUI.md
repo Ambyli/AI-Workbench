@@ -257,6 +257,43 @@ Restart the container — `make down openwebui && make up openwebui`. After logi
 
 Models are configured in `litellm_config.yaml`, not in Open WebUI. After editing that file and restarting LiteLLM, the new model appears in Open WebUI's model picker automatically — Open WebUI calls `GET /v1/models` against LiteLLM to populate the list.
 
+### Voice (TTS via Kokoro)
+
+Open WebUI's read-aloud button and **Call** mode (the headphones icon in the composer) need a text-to-speech engine. This stack uses the Kokoro-82M service in `ai/kokoro/` — `kokoro-api` exposes an OpenAI-compatible `POST /v1/audio/speech`, so Open WebUI's built-in **OpenAI** TTS engine works against it unchanged. Speech-to-text (your microphone in Call mode) stays on the faster-whisper model bundled inside the Open WebUI image; nothing extra to deploy.
+
+**Why direct to `kokoro-api`, not through LiteLLM.** LiteLLM does route `model: kokoro` to the same endpoint, but Open WebUI's `OPENWEBUI_OPENAI_API_KEY` is a virtual key scoped to chat models only (see [Restricting visible models](#restricting-visible-models)) — adding `kokoro` to it would put a TTS entry in the chat model picker, and a second key just for audio is a manual step with nothing to show for it. `kokoro-api` has no auth and is only reachable inside `ai_shared`, so Open WebUI talks to `http://kokoro-api:8000/v1` directly. Same pattern as SearXNG. If you'd rather have TTS calls in LiteLLM's spend logs, create a virtual key scoped to just `kokoro` and set the base URL to `http://litellm:4000/v1` instead.
+
+**Settings** (all in `.env`, passed through by the compose file):
+
+| `.env` key | Value | Notes |
+|---|---|---|
+| `OPENWEBUI_AUDIO_TTS_ENGINE` | `openai` | Open WebUI's OpenAI-compatible engine |
+| `OPENWEBUI_AUDIO_TTS_OPENAI_API_BASE_URL` | `http://kokoro-api:8000/v1` | Open WebUI appends `/audio/speech` |
+| `OPENWEBUI_AUDIO_TTS_OPENAI_API_KEY` | `none` | Any non-empty string; kokoro-api ignores it |
+| `OPENWEBUI_AUDIO_TTS_MODEL` | `kokoro` | Passed as `model`; kokoro-api ignores it |
+| `OPENWEBUI_AUDIO_TTS_VOICE` | `af_heart` | OpenAI alias (`alloy`…`shimmer`, all English) or any Kokoro voice — `curl http://localhost:8004/languages` lists them by language |
+| `OPENWEBUI_AUDIO_TTS_SPLIT_ON` | `punctuation` | One request per sentence. Keep it — Kokoro returns only the first pipeline chunk of a long input, so `none` would truncate long replies |
+| `OPENWEBUI_WHISPER_MODEL` | `base` | STT model size for the bundled faster-whisper (CPU) |
+
+Kokoro only emits WAV. Open WebUI reads the upstream `Content-Type`, sees it isn't MP3, and transcodes with pydub/ffmpeg before caching — no `response_format` handling is needed on either side.
+
+**These are PersistentConfig values.** Like the web-search block, Open WebUI reads them into its database on the **first boot of a fresh `openwebui_data` volume only**. On the existing install they will not take effect from `.env`; set them once in the UI instead:
+
+1. Admin Panel → **Settings → Audio**.
+2. **Text-to-Speech Engine**: `OpenAI`. API Base URL `http://kokoro-api:8000/v1`, API Key `none`.
+3. **TTS Model**: `kokoro`. **TTS Voice**: `af_heart` (or any voice from `/voices`). **Response splitting**: `Punctuation`.
+4. Leave **Speech-to-Text Engine** on the default (`Whisper (Local)`), model `base`.
+5. Save, then open any chat and click the speaker icon under a response — audio should start after a second or two. The very first request is slow while `kokoro-app` lazy-loads the model.
+
+**Smoke test from the box** — proves `kokoro-api` is reachable on `ai_shared` with the exact payload Open WebUI sends:
+
+```bash
+docker exec openwebui python3 -c "import urllib.request,json; r=urllib.request.urlopen(urllib.request.Request('http://kokoro-api:8000/v1/audio/speech', data=json.dumps({'model':'kokoro','input':'Hello from Kokoro','voice':'af_heart'}).encode(), headers={'Content-Type':'application/json','Authorization':'Bearer none'})); print(r.status, r.headers['Content-Type'], len(r.read()))"
+# expect: 200 audio/wav <some tens of KB>
+```
+
+If Open WebUI shows "Server Connection Error" on play, `make logs openwebui` — a `502` from kokoro-api means `kokoro-app` is down or still downloading weights (`make logs kokoro`); a name-resolution error means `kokoro-api` isn't on `ai_shared` (`docker network inspect ai_shared`).
+
 ### Updating the image
 
 The image tag is pinned in `ai/openwebui/docker-compose.openwebui.yml`:

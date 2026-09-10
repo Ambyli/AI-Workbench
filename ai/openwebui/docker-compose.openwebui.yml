@@ -5,9 +5,19 @@ networks:
 
 services:
   openwebui:
-    # Pinned release tag. Bump this line and run `make build openwebui` to
-    # update. Use `:main` for the rolling upstream tag.
-    image: ghcr.io/open-webui/open-webui:v0.11.3
+    # Locally built: upstream's pinned release plus ai/openwebui/patches/*.patch
+    # (Dockerfile.openwebui; OPENWEBUI.md § Custom image). The upstream tag is
+    # OPENWEBUI_VERSION in .env. Bump it, then
+    #   make build openwebui && make up openwebui
+    # A patch that no longer applies fails the build — regenerate it, never force.
+    build:
+      context: ../..
+      dockerfile: ai/openwebui/Dockerfile.openwebui
+      args:
+        OPENWEBUI_VERSION: ${OPENWEBUI_VERSION:-v0.11.3}
+    image: openwebui-zeo:${OPENWEBUI_VERSION:-v0.11.3}
+    # Local-only image name: never try to pull it from a registry.
+    pull_policy: build
     networks:
       - shared
     container_name: openwebui
@@ -60,6 +70,12 @@ services:
       GOOGLE_CLIENT_ID: "${OPENWEBUI_GOOGLE_CLIENT_ID}"
       GOOGLE_CLIENT_SECRET: "${OPENWEBUI_GOOGLE_CLIENT_SECRET}"
       OPENID_PROVIDER_URL: "${OPENWEBUI_OPENID_PROVIDER_URL}"
+      # ZEO PATCH (not upstream) — see Dockerfile.openwebui and OPENWEBUI.md
+      # § Custom image. Request header whose value is forwarded to Google as
+      # the OIDC login_hint on the /oauth/google/login redirect, so the second
+      # sign-in hop never shows an account chooser. oauth2-proxy sets
+      # X-Forwarded-Email on every proxied request. Empty disables it.
+      OAUTH_LOGIN_HINT_HEADER: "${OPENWEBUI_OAUTH_LOGIN_HINT_HEADER}"
 
       # Sign-in behaviour. Open WebUI runs its own Google OIDC using the
       # credentials above; AUTO_REDIRECT skips its login page so the hop is a

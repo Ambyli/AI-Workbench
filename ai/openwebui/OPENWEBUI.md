@@ -45,6 +45,7 @@ Every value is sourced from `.env` so configuration lives in one file.
 | `GOOGLE_CLIENT_ID` | `OPENWEBUI_GOOGLE_CLIENT_ID` | _(empty)_ | Google Cloud OAuth 2.0 client ID — see [Google OAuth setup](#google-oauth-setup) |
 | `GOOGLE_CLIENT_SECRET` | `OPENWEBUI_GOOGLE_CLIENT_SECRET` | _(empty)_ | Matching client secret |
 | `OPENID_PROVIDER_URL` | `OPENWEBUI_OPENID_PROVIDER_URL` | Google discovery doc | OIDC discovery document URL; required for clean provider-side logout |
+| `OAUTH_LOGIN_HINT_HEADER` | `OPENWEBUI_OAUTH_LOGIN_HINT_HEADER` | `X-Forwarded-Email` | **Zeo patch, not upstream.** Request header forwarded to Google as `login_hint`, so the second sign-in hop skips the account chooser — see [Custom image](#custom-image-login_hint-patch) |
 | `OAUTH_AUTO_REDIRECT` | `OPENWEBUI_OAUTH_AUTO_REDIRECT` | `true` | Skip the login page and redirect straight to Google — see [Single sign-on](#single-sign-on) |
 | `ENABLE_LOGIN_FORM` | `OPENWEBUI_ENABLE_LOGIN_FORM` | `false` | Hides the email/password form. **Required** for `OAUTH_AUTO_REDIRECT` to do anything |
 | `OAUTH_UPDATE_NAME_ON_LOGIN` | `OPENWEBUI_OAUTH_UPDATE_NAME_ON_LOGIN` | `true` | Re-read the `name` claim on every login, not just at account creation (upstream default: `false`) |
@@ -243,6 +244,7 @@ Open WebUI's own OIDC reads `OAUTH_USERNAME_CLAIM` (`name`) and `OAUTH_PICTURE_C
 | `ENABLE_LOGIN_FORM=false` | **Required by the above** — see the precondition list below |
 | `OAUTH_UPDATE_NAME_ON_LOGIN=true` | Existing accounts pick up the real name on next sign-in |
 | `OAUTH_UPDATE_PICTURE_ON_LOGIN=true` | Existing accounts pick up the avatar on next sign-in |
+| `OAUTH_LOGIN_HINT_HEADER=X-Forwarded-Email` | *(Zeo patch)* Google skips its account chooser on this hop — see [Custom image](#custom-image-login_hint-patch) |
 
 `OAUTH_AUTO_REDIRECT` alone does nothing. The frontend refuses to bounce a user to SSO unless the deployment is unambiguously SSO-only — `src/routes/auth/+page.svelte` requires **all** of:
 
@@ -275,7 +277,7 @@ So the real recovery path is `OPENWEBUI_ENABLE_LOGIN_FORM=true` in `.env` + `mak
 
 The last two default to `false` upstream. They are what repairs accounts created while trusted-header SSO was on — those have a numeric name and the placeholder avatar, and heal the next time each person signs in. No admin cleanup, no account deletion.
 
-The second hop is **not** a second login prompt. The user already holds a live Google session and prior consent from clearing oauth2-proxy, so Google returns immediately; with auto-redirect on, the whole thing is a redirect bounce.
+The second hop is **not** a second login prompt — same OAuth client, same scopes, consent already granted at the oauth2-proxy hop. What Google *would* still show is its **account chooser**, on any authorize request that does not name an account, whenever the browser is signed into more than one Google account. Upstream Open WebUI sends no such hint (`utils/oauth.py::handle_login` passes only static params), so anyone with a personal account also signed in was asked to pick an account twice. This deployment's image carries a small patch that forwards the identity oauth2-proxy has already verified — `X-Forwarded-Email` — as the OIDC `login_hint`, which Google documents as suppressing the chooser and selecting the matching session. See [Custom image](#custom-image-login_hint-patch).
 
 > **Two different config lifetimes here — don't assume.** The `OAUTH_*` settings are read from the environment on every boot: `ENABLE_OAUTH_PERSISTENT_CONFIG` defaults to `false` upstream, and `models/config.py::persistent_enabled_for` short-circuits any key starting with `oauth.` before it ever reaches the DB. `ENABLE_LOGIN_FORM` is a `ui.*` key, so a DB row *can* shadow it — `Config.get` returns the env-derived default only while no row exists. v0.11.3 itself has no Admin Panel toggle for it, but **this install has a row anyway**: the 0.11 reshape migration (`migrations/versions/3ff2c63645b8_reshape_config_to_per_key_rows.py`) flattens the pre-0.11 single-JSON config blob into per-key rows and keeps every key it finds, and older versions dumped the whole config on any admin save. Expect the same for the other `ui.*` keys (`ui.enable_signup`, `ui.default_user_role`, …) — `select key from config order by key` lists exactly which env vars are inert on this install. If `/api/config` reports `enable_login_form: true` while `printenv ENABLE_LOGIN_FORM` says `false`, drop the row:
 >
@@ -493,24 +495,69 @@ docker exec openwebui python3 -c "import urllib.request,json; r=urllib.request.u
 
 If Open WebUI shows "Server Connection Error" on play, `make logs openwebui` — a `502` from kokoro-api means `kokoro-app` is down or still downloading weights (`make logs kokoro`); a name-resolution error means `kokoro-api` isn't on `ai_shared` (`docker network inspect ai_shared`).
 
+### Custom image (login_hint patch)
+
+`openwebui` does not run the upstream image directly. [`ai/openwebui/Dockerfile.openwebui`](Dockerfile.openwebui) starts `FROM ghcr.io/open-webui/open-webui:${OPENWEBUI_VERSION}` and applies every [`ai/openwebui/patches/*.patch`](patches/) with `patch -p1` from `/app`, dry-running each first so a hunk that no longer matches **fails the build** instead of shipping unpatched. Nothing else changes — same entrypoint, layout, and user. The result is tagged locally as `openwebui-zeo:<version>` with `pull_policy: build`, so compose never tries to pull it.
+
+#### Why
+
+Sign-in is two OIDC round-trips to Google: oauth2-proxy's, then Open WebUI's own ([Single sign-on](#single-sign-on) covers why the trusted-header shortcut was dropped). They share one OAuth client and consent is granted once, so the second trip is silent — except that Google shows its account chooser on any authorize request that does not name an account, whenever the browser is signed into more than one Google account. Upstream's `handle_login` in `backend/open_webui/utils/oauth.py` sends only static params, so users with a personal account also signed in were asked to pick an account twice. Google's `login_hint` parameter "suppresses the account chooser and … selects the proper session", and oauth2-proxy already puts the verified email on every proxied request as `X-Forwarded-Email`. The patch connects the two.
+
+#### What `0001-oauth-login-hint-header.patch` does
+
+- `env.py` — adds `OAUTH_LOGIN_HINT_HEADER` (env var, default empty = feature off).
+- `utils/oauth.py::handle_login` — if that header is present on the `/oauth/{provider}/login` request, its value is passed as `login_hint` on the authorize redirect.
+
+That is the whole change. `.env` sets `OPENWEBUI_OAUTH_LOGIN_HINT_HEADER=X-Forwarded-Email`; blank it to disable without rebuilding.
+
+**Security:** the header is a *hint*. Google authenticates whatever account the browser actually holds, the callback is validated exactly as before, and access is still enforced by `OAUTH2_PROXY_EMAIL_DOMAINS` / `OAUTH2_PROXY_GOOGLE_GROUPS`. A spoofed header — which would require reaching `openwebui:8080` directly, and it is loopback-bound — could at most pre-fill the wrong email on Google's page.
+
+#### Verifying
+
+```bash
+# Image label records the patch set; the running code contains the feature; env is wired.
+docker image inspect openwebui-zeo:v0.11.3 --format '{{index .Config.Labels "com.zeoenergy.openwebui.patches"}}'
+docker exec openwebui grep -c OAUTH_LOGIN_HINT_HEADER /app/backend/open_webui/utils/oauth.py   # expect 2
+docker exec openwebui printenv OAUTH_LOGIN_HINT_HEADER                                          # expect X-Forwarded-Email
+```
+
+Then, in a browser signed into a Zeo account **and** a personal one, open `chat.zeoenergy.com` in a fresh session: one Google interaction, not two. The first hop (oauth2-proxy) still shows a chooser when several *Zeo* accounts are signed in — nothing knows who is arriving before they have signed in.
+
+#### Regenerating a patch for a new upstream version
+
+Only needed when `make build openwebui` fails at the `--dry-run` step.
+
+```bash
+V=v0.12.0   # the tag you are moving to
+curl -sL https://github.com/open-webui/open-webui/archive/refs/tags/$V.tar.gz | tar xz
+cp -r open-webui-${V#v} pristine && cp -r open-webui-${V#v} patched
+patch -p1 -d patched < ai/openwebui/patches/0001-oauth-login-hint-header.patch  # fix rejects by hand in patched/
+{ diff -u pristine/backend/open_webui/env.py         patched/backend/open_webui/env.py
+  diff -u pristine/backend/open_webui/utils/oauth.py patched/backend/open_webui/utils/oauth.py
+} | sed -e 's|^--- pristine/|--- a/|' -e 's|^+++ patched/|+++ b/|' > new.patch
+```
+
+Paste the header comment from the old patch file back on top, update its `Target:` line, replace the file, and re-run `make build openwebui`.
+
+#### Adding another patch
+
+Number it `0002-….patch`, keep the `a/` / `b/` path prefixes, list it in the Dockerfile header comment and the `com.zeoenergy.openwebui.patches` label, and add a `grep -q` guard in the Dockerfile for something only the patched code contains. Patches apply in filename order.
+
 ### Updating the image
 
-The image tag is pinned in `ai/openwebui/docker-compose.openwebui.yml`:
-
-```yaml
-image: ghcr.io/open-webui/open-webui:v0.11.3
-```
+The container runs a locally built image — upstream's pinned release plus the patches above. The upstream tag is `OPENWEBUI_VERSION` in `.env`; the compose file reads it as a build arg and as part of the local image name (`openwebui-zeo:<tag>`).
 
 To update:
 
-1. Edit that line to the desired tag (a specific release like `v0.11.3`, or `main` for the rolling upstream tag). Releases are at <https://github.com/open-webui/open-webui/releases>.
-2. Pull the new image and recreate the container:
+1. Set `OPENWEBUI_VERSION` in `.env` to the desired release tag (releases: <https://github.com/open-webui/open-webui/releases>). Pin a release — `main` under a patch set means every rebuild has a different base.
+2. Rebuild and recreate:
    ```bash
-   make build openwebui   # runs `docker compose pull` under the hood
-   make down openwebui && make up openwebui
+   make build openwebui   # pulls the new upstream tag, applies the patches
+   make up openwebui      # recreates the container on the new image
    ```
+3. If the build stops at `patch --dry-run`, upstream changed code a patch touches. Regenerate the patch (above) and read what changed around it — do not force it.
 
-`make build openwebui` re-pulls whatever tag is currently pinned — useful when the tag is `main` (rolling) or when a release is re-tagged. User data in the `openwebui_data` volume is preserved across updates.
+User data in the `openwebui_data` volume is preserved across updates.
 
 **Upgrade notes:**
 

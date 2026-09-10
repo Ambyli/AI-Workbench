@@ -1,0 +1,55 @@
+# Open WebUI with Zeo patches applied on top of the pinned upstream release.
+#
+# Why a custom image: some deployment needs cannot be met from .env alone.
+# Each such change is a numbered unified diff in ai/openwebui/patches/, and
+# this file is the ONLY place they are applied. Nothing else about the
+# upstream image changes — same entrypoint, same layout, same user.
+#
+# Build:   make build openwebui         (compose: build context is the repo
+#          root, so patches/ is addressable as ai/openwebui/patches/)
+# Bump:    edit OPENWEBUI_VERSION in .env, run `make build openwebui`, then
+#          `make up openwebui`. A patch that no longer applies FAILS the
+#          build loudly at the --dry-run step below — that is deliberate.
+#          Regenerate the patch against the new tag (OPENWEBUI.md § Custom
+#          image) rather than forcing it.
+#
+# Current patches:
+#   0001-oauth-login-hint-header.patch  — OAUTH_LOGIN_HINT_HEADER: forward
+#       the identity oauth2-proxy already verified (X-Forwarded-Email) as the
+#       OIDC login_hint so Google skips its account chooser on the second
+#       sign-in hop. Touches backend/open_webui/env.py and utils/oauth.py.
+
+ARG OPENWEBUI_VERSION=v0.11.3
+FROM ghcr.io/open-webui/open-webui:${OPENWEBUI_VERSION}
+
+# Upstream ends its Dockerfile with `USER $UID:$GID`, 0:0 by default, so we
+# are root here and can write under /app. `patch` ships with build-essential,
+# which upstream installs; the `command -v` guard makes a future base image
+# that drops it fail with an obvious message instead of a confusing one.
+COPY ai/openwebui/patches/*.patch /tmp/zeo-patches/
+
+# Three checks per build, each of which fails the build on its own:
+#   1. --dry-run: every hunk of every patch still matches upstream's code.
+#   2. ast.parse: every patched module still parses (catches a half-applied
+#      hunk that would otherwise only surface at container start).
+#   3. grep: the feature is really present (catches a patch that applied to
+#      the wrong context and changed nothing that matters).
+RUN set -eu; \
+    command -v patch >/dev/null || { echo "patch(1) missing from base image" >&2; exit 1; }; \
+    cd /app; \
+    for p in /tmp/zeo-patches/*.patch; do \
+        echo "==> $(basename "$p")"; \
+        patch -p1 --forward --dry-run < "$p"; \
+        patch -p1 --forward < "$p"; \
+    done; \
+    python3 -c 'import ast,sys; [ast.parse(open(f).read(), f) for f in sys.argv[1:]]' \
+        backend/open_webui/env.py \
+        backend/open_webui/utils/oauth.py; \
+    grep -q "OAUTH_LOGIN_HINT_HEADER" backend/open_webui/utils/oauth.py; \
+    rm -rf /tmp/zeo-patches
+
+# Record the base and the patch set on the image so `docker image inspect`
+# can tell a patched build from a stock one.
+ARG OPENWEBUI_VERSION
+LABEL org.opencontainers.image.base.name="ghcr.io/open-webui/open-webui:${OPENWEBUI_VERSION}" \
+      com.zeoenergy.openwebui.patches="0001-oauth-login-hint-header"

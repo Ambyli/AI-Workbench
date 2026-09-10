@@ -265,7 +265,9 @@ Expected: `OK → PASS`. If it returns HTML or a redirect to `/oauth/google/logi
 
 Open WebUI keeps its own Google OAuth login enabled. After passing the oauth2-proxy gate at Cloudflare's edge, it runs its own OIDC round-trip against the same Google account.
 
-This is not a second login prompt. The user already holds a live Google session and prior consent from clearing oauth2-proxy, so Google returns immediately, and `OPENWEBUI_OAUTH_AUTO_REDIRECT=true` skips Open WebUI's own login page — the hop is a redirect bounce, not a form.
+This is not a second login prompt. The user already holds a live Google session and prior consent from clearing oauth2-proxy (same OAuth client, same scopes), so Google returns immediately, and `OPENWEBUI_OAUTH_AUTO_REDIRECT=true` skips Open WebUI's own login page — the hop is a redirect bounce, not a form.
+
+It *could* still be a second **account chooser**: Google asks which account to use on any authorize request that does not name one, whenever the browser is signed into more than one Google account. Upstream Open WebUI never names one, so this deployment builds its own Open WebUI image with a small patch that forwards the `X-Forwarded-Email` this proxy already sets as the OIDC `login_hint` — Google then selects that session outright. Details, verification, and upgrade procedure: [ai/openwebui/OPENWEBUI.md § Custom image](../openwebui/OPENWEBUI.md#custom-image-login_hint-patch). The first hop can still show a chooser when several *Zeo* accounts are signed in; nothing knows who is arriving before they sign in.
 
 Open WebUI *was* switched to trusted-header auth (`WEBUI_AUTH_TRUSTED_EMAIL_HEADER=X-Forwarded-Email`, `WEBUI_AUTH_TRUSTED_NAME_HEADER=X-Forwarded-User`) to collapse the two gates into one. That has been **reverted**, for two reasons beyond the usual "it removes Open WebUI's independent auth layer":
 

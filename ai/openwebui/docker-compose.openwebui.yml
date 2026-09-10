@@ -75,7 +75,8 @@ services:
       OAUTH_AUTO_REDIRECT: "${OPENWEBUI_OAUTH_AUTO_REDIRECT}"
       # Required by OAUTH_AUTO_REDIRECT — the frontend only auto-redirects
       # when the deployment is unambiguously SSO-only. A ui.* key, so a DB
-      # row could shadow it, but nothing in v0.11.3's Admin UI writes one.
+      # row shadows it — and the 0.11 upgrade migration created one from the
+      # old config blob. See OPENWEBUI.md § Single sign-on before trusting env.
       ENABLE_LOGIN_FORM: "${OPENWEBUI_ENABLE_LOGIN_FORM}"
       OAUTH_UPDATE_NAME_ON_LOGIN: "${OPENWEBUI_OAUTH_UPDATE_NAME_ON_LOGIN}"
       OAUTH_UPDATE_PICTURE_ON_LOGIN: "${OPENWEBUI_OAUTH_UPDATE_PICTURE_ON_LOGIN}"

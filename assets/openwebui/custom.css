@@ -1,0 +1,34 @@
+/* Zeo branding overrides for Open WebUI.
+ *
+ * Loaded on every page by src/app.html:
+ *   <link rel="stylesheet" href="/static/custom.css" />
+ * Upstream ships this file empty; it is the sanctioned customization hook,
+ * so nothing here requires forking or patching the image.
+ *
+ * WHY THIS FILE EXISTS
+ * --------------------
+ * /static/favicon.png does two jobs in Open WebUI v0.11.x:
+ *   1. the browser-tab icon  (src/app.html:9, and re-injected at runtime by
+ *      src/routes/+layout.svelte:1377, which is the one the browser ends up
+ *      using), and
+ *   2. the in-app mark — sidebar logo, default assistant avatar, the auth and
+ *      onboarding screens, notification toasts, and the Models editor default
+ *      profile image.
+ *
+ * One file, two backgrounds. The file itself is the BLACK mark so the browser
+ * tab reads correctly against a light tab strip. The rule below repoints only
+ * the in-app <img> occurrences at the WHITE mark, which is what Open WebUI's
+ * dark UI needs. CSS cannot reach the tab icon, so the split is clean.
+ *
+ * Support: `content: url()` on a regular element is Chrome/Edge 68+, Safari
+ * 10+, Firefox 137+. Anything older just shows the black mark in-app — the
+ * layout is unaffected.
+ *
+ * To go back to a single mark everywhere, drop the custom.css and
+ * zeo-mark-white.png bind mounts from ai/openwebui/docker-compose.openwebui.yml
+ * and swap favicon.png for the white variant.
+ */
+
+img[src$="/static/favicon.png"] {
+	content: url('/static/zeo-mark-white.png');
+}

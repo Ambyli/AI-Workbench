@@ -36,6 +36,11 @@ services:
       OPENAI_API_BASE_URL: "${OPENWEBUI_OPENAI_API_BASE_URL}"
       OPENAI_API_KEY: "${OPENWEBUI_OPENAI_API_KEY}"
       ENABLE_OLLAMA_API: "${OPENWEBUI_ENABLE_OLLAMA_API}"
+      # Display name — tab title, PWA manifest, OpenSearch descriptor.
+      # Open WebUI force-appends " (Open WebUI)" to any value other than
+      # "Open WebUI" itself. Read on EVERY boot, unlike the PersistentConfig
+      # values further down. See ai/openwebui/OPENWEBUI.md § Branding.
+      WEBUI_NAME: "${OPENWEBUI_WEBUI_NAME}"
       WEBUI_SECRET_KEY: "${OPENWEBUI_SECRET_KEY}"
       WEBUI_URL: "${OPENWEBUI_WEBUI_URL}"
       ENABLE_SIGNUP: "${OPENWEBUI_ENABLE_SIGNUP}"
@@ -133,6 +138,29 @@ services:
       WHISPER_MODEL: "${OPENWEBUI_WHISPER_MODEL}"
     volumes:
       - openwebui_data:/app/backend/data
+
+      # Branding. Every /static/* asset is served from STATIC_DIR
+      # (= /app/backend/open_webui/static), which main.py mounts BEFORE the SPA
+      # catch-all — so overwriting /app/build/static/ does nothing, despite what
+      # most guides say. Individual read-only file mounts rather than a
+      # directory mount: the same dir also holds fonts/, swagger-ui/, assets/,
+      # and user.png, which a directory mount would hide.
+      #
+      # Source files are generated from assets/Zeo Favicon {Black,White}.png —
+      # see ai/openwebui/OPENWEBUI.md § Branding for the regeneration recipe
+      # and which file drives which surface.
+      - ../../assets/openwebui/favicon.png:/app/backend/open_webui/static/favicon.png:ro
+      - ../../assets/openwebui/favicon-96x96.png:/app/backend/open_webui/static/favicon-96x96.png:ro
+      - ../../assets/openwebui/favicon.svg:/app/backend/open_webui/static/favicon.svg:ro
+      - ../../assets/openwebui/favicon.ico:/app/backend/open_webui/static/favicon.ico:ro
+      - ../../assets/openwebui/apple-touch-icon.png:/app/backend/open_webui/static/apple-touch-icon.png:ro
+      - ../../assets/openwebui/logo.png:/app/backend/open_webui/static/logo.png:ro
+      - ../../assets/openwebui/splash.png:/app/backend/open_webui/static/splash.png:ro
+      - ../../assets/openwebui/splash-dark.png:/app/backend/open_webui/static/splash-dark.png:ro
+      # custom.css is upstream's own (empty by default) customization hook; it
+      # repoints the in-app <img> uses of favicon.png at the white mark.
+      - ../../assets/openwebui/custom.css:/app/backend/open_webui/static/custom.css:ro
+      - ../../assets/openwebui/zeo-mark-white.png:/app/backend/open_webui/static/zeo-mark-white.png:ro
     healthcheck:
       test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/health')\""]
       interval: 30s

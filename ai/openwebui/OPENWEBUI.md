@@ -37,6 +37,7 @@ Every value is sourced from `.env` so configuration lives in one file.
 | `ENABLE_OLLAMA_API` | `OPENWEBUI_ENABLE_OLLAMA_API` | `false` | Disables the Ollama discovery probe |
 | `WEBUI_SECRET_KEY` | `OPENWEBUI_SECRET_KEY` | _(placeholder — rotate)_ | Signs sessions; stable value required to avoid log-outs on restart |
 | `WEBUI_URL` | `OPENWEBUI_WEBUI_URL` | `http://localhost:8007` | Public base URL; used to build OAuth callback URLs |
+| `WEBUI_NAME` | `OPENWEBUI_WEBUI_NAME` | `Zeo AI Chat` | Tab title, PWA manifest name, OpenSearch descriptor. Renders with a forced ` (Open WebUI)` suffix — see [Branding](#branding) |
 | `ENABLE_SIGNUP` | `OPENWEBUI_ENABLE_SIGNUP` | `true` | New accounts can be created; pair with `DEFAULT_USER_ROLE=pending` for gated access |
 | `DEFAULT_USER_ROLE` | `OPENWEBUI_DEFAULT_USER_ROLE` | `pending` | New signups land in the admin approval queue. First-ever account is always admin regardless of this value |
 | `ENABLE_OAUTH_SIGNUP` | `OPENWEBUI_ENABLE_OAUTH_SIGNUP` | `true` | Master switch for OAuth login flows |
@@ -60,6 +61,85 @@ openssl rand -hex 32
 ```
 
 Paste the output into `OPENWEBUI_SECRET_KEY` in `.env`. The default placeholder (`change-me-run-openssl-rand-hex-32`) is fine for a first boot but should be rotated before any real use.
+
+### Branding
+
+Two independent surfaces: the **name** (one env var) and the **icons** (file mounts). Both are wired up already — this section explains what drives what, so a version bump doesn't silently un-brand the deployment.
+
+#### Name
+
+`OPENWEBUI_WEBUI_NAME` in `.env`. One caveat, from `backend/open_webui/env.py`:
+
+```python
+WEBUI_NAME = os.getenv('WEBUI_NAME', 'Open WebUI')
+if WEBUI_NAME != 'Open WebUI':
+    WEBUI_NAME += ' (Open WebUI)'
+```
+
+So `Zeo AI Chat` renders as **"Zeo AI Chat (Open WebUI)"** everywhere the name appears. The suffix is deliberate and license-backed; removing it means patching the image.
+
+Unlike `ENABLE_WEB_SEARCH`, the `AUDIO_TTS_*` block, and most of this compose file, `WEBUI_NAME` is **not** a first-boot-only `PersistentConfig` value — `main.py` assigns `app.state.WEBUI_NAME` from the env on every boot. A plain `make up openwebui` (recreate) applies a change; no need to wipe `openwebui_data`.
+
+#### Icons — only `STATIC_DIR` matters
+
+`src/app.html` requests `/static/favicon.png`, `/static/favicon-96x96.png`, `/static/favicon.svg`, `/static/favicon.ico`, `/static/apple-touch-icon.png`, `/static/loader.js`, and `/static/custom.css`. In `main.py`:
+
+```python
+app.mount('/static', StaticFiles(directory=STATIC_DIR), name='static')   # ~2989
+...
+app.mount('/', SPAStaticFiles(directory=FRONTEND_BUILD_DIR, html=True))  # ~3037
+```
+
+`STATIC_DIR` resolves to **`/app/backend/open_webui/static`** (the image's `WORKDIR` is `/app/backend` and the Dockerfile does `COPY ./backend .`). Because `/static` is mounted ahead of the SPA catch-all, overwriting `/app/build/static/` — the recipe most blog posts and issue threads give — has **no effect**. Only the backend directory is served.
+
+The compose file bind-mounts individual files read-only rather than mounting the whole directory: `STATIC_DIR` also contains `fonts/`, `swagger-ui/`, `assets/`, `user.png`, and `user-import.csv`, all of which a directory mount would hide.
+
+#### Which file drives which surface
+
+| File | Mark | Surface |
+|---|---|---|
+| `favicon.png` (512²) | black | Browser tab — **and** the in-app mark (see below) |
+| `favicon-96x96.png`, `favicon.svg`, `favicon.ico` | black | Browser tab, other formats. `favicon.svg` must be overridden too, or a browser that prefers SVG shows the upstream logo |
+| `apple-touch-icon.png` (180², opaque white) | black | iOS home screen. Opaque on purpose — iOS composites alpha to black |
+| `logo.png` (500², opaque `#171717`) | white | PWA install icon. Hardcoded in the `/manifest.json` route in `main.py`, not read from `site.webmanifest` |
+| `splash.png` (580×500) | black | Load splash, light theme |
+| `splash-dark.png` (580×500) | white | Load splash, dark theme — Open WebUI's default when no theme is stored |
+| `custom.css` | — | Upstream's own hook, empty by default. Repoints the in-app mark |
+| `zeo-mark-white.png` (512²) | white | Target of the `custom.css` rule; not referenced by upstream |
+
+#### Why there's a `custom.css`
+
+`/static/favicon.png` does double duty in v0.11.x — it is both the browser-tab icon (`app.html`, and re-injected at runtime by `src/routes/+layout.svelte`, which is the one the browser actually settles on) **and** the in-app mark: sidebar logo, default assistant avatar, auth and onboarding screens, notification toasts, and the Models editor default profile image.
+
+One file, two backgrounds. The file itself is the **black** mark so the tab reads correctly; `custom.css` repoints only the in-app `<img>` uses at the **white** mark:
+
+```css
+img[src$="/static/favicon.png"] {
+	content: url('/static/zeo-mark-white.png');
+}
+```
+
+CSS cannot reach the tab icon, so the split is clean. `content: url()` on a regular element needs Chrome/Edge 68+, Safari 10+, or Firefox 137+; older browsers just show the black mark in-app, with no layout change.
+
+To collapse back to one mark everywhere, drop the `custom.css` and `zeo-mark-white.png` mounts and point `favicon.png` at whichever variant you prefer.
+
+#### Regenerating the assets
+
+Everything under `assets/openwebui/` is derived from `assets/Zeo Favicon Black.png` and `assets/Zeo Favicon White.png` (770×663 RGBA). To rebuild after a logo change, re-run the generator — it trims the transparent border, then fits each canvas:
+
+```bash
+python ai/openwebui/bin/generate_branding.py
+```
+
+Needs Pillow, which the uv workspace already pulls in via `widget/pyproject.toml`; outside the workspace venv, `pip install Pillow`. The script is deterministic — re-running it with unchanged sources rewrites byte-identical files.
+
+Then `make up openwebui` to recreate. Browsers cache favicons aggressively; hard-reload or check in a private window.
+
+> The same `assets/` folder is bind-mounted by the `oauth2-assets` sidecar and served unauthenticated at `/assets/*` (see [ai/oauth2-proxy/OAUTH2_PROXY.md](../oauth2-proxy/OAUTH2_PROXY.md)), which is how the sign-in page shows the Zeo logo pre-login. `assets/openwebui/*` is therefore also reachable at `/assets/openwebui/*` — harmless, these are public branding files, but don't put anything private there.
+
+#### License
+
+Open WebUI's license (clause 4) prohibits altering or removing its branding, with an exemption for deployments serving **50 or fewer end users** in any rolling 30-day period — plus separate exemptions for written permission from the copyright holder or an executed enterprise license. Keep an eye on the headcount in Admin Panel → Users; crossing 50 puts this configuration outside the exemption. The forced ` (Open WebUI)` name suffix is left intact regardless.
 
 ### Health check
 

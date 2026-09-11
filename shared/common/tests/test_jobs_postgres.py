@@ -219,3 +219,37 @@ async def test_metadata_is_queryable_jsonb(registry: PostgresRegistry) -> None:
     finally:
         await conn.close()
     assert len(rows) == 2
+
+
+# ── Queue operations ──────────────────────────────────────────────────────
+async def test_claim_next_is_fifo_and_flips_phase(registry: PostgresRegistry) -> None:
+    a = await registry.register(_Meta(type="assess", request_id="a"))
+    b = await registry.register(_Meta(type="assess", request_id="b"))
+
+    first = await registry.claim_next()
+    assert first is not None and first.job_id == a and first.phase == "processing"
+    assert (await registry.get(b)).phase == "pending"
+    second = await registry.claim_next()
+    assert second.job_id == b
+    assert await registry.claim_next() is None
+
+
+async def test_concurrent_claims_never_hand_out_the_same_job(
+    registry: PostgresRegistry,
+) -> None:
+    import asyncio
+
+    ids = {await registry.register(_Meta(type="assess", request_id=str(i))) for i in range(8)}
+    claimed = await asyncio.gather(*(registry.claim_next() for _ in range(12)))
+    got = [j.job_id for j in claimed if j is not None]
+    assert len(got) == 8 and set(got) == ids
+    assert sum(1 for j in claimed if j is None) == 4
+
+
+async def test_reset_phase_and_count_by_phase(registry: PostgresRegistry) -> None:
+    for i in range(3):
+        await registry.register(_Meta(type="assess", request_id=str(i)))
+    await registry.claim_next()
+    assert await registry.count_by_phase() == {"pending": 2, "processing": 1}
+    assert await registry.reset_phase("processing", "pending") == 1
+    assert await registry.count_by_phase() == {"pending": 3}

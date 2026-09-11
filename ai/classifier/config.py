@@ -55,6 +55,29 @@ DB_PATH: str = os.environ.get("DB_PATH", "/data/classifier.db")
 JOB_TTL_HOURS: int = int(os.environ.get("JOB_TTL_HOURS", "24"))
 
 # ---------------------------------------------------------------------------
+# Job queue + workers
+# ---------------------------------------------------------------------------
+# The jobs table in DB_PATH is the queue (see common.jobs.sqlite.claim_next).
+# CLASSIFIER_MAX_CONCURRENT worker tasks each claim one pending job at a
+# time, so at most that many jobs run simultaneously. Size it to what the
+# vision model behind VLLM_QWEN_VL_API can absorb — remember a /assess/compare
+# job with N live examples fans out into N+1 LLM calls of its own.
+#
+# PAYLOAD_DIR holds one JSON file per queued job (image bytes + criteria, or
+# the full CompareRequest) so a job survives a container restart. Files are
+# deleted the moment the job reaches a terminal phase. Defaults to a
+# sibling of DB_PATH so it lands on the same /data volume.
+#
+# WORKER_POLL_INTERVAL_S is the fallback wake-up for idle workers. New jobs
+# posted to this process wake a worker instantly; the poll only matters for
+# rows written by another process (or left behind by a crash).
+MAX_CONCURRENT: int = max(1, int(os.environ.get("CLASSIFIER_MAX_CONCURRENT", "2")))
+PAYLOAD_DIR: str = os.environ.get(
+    "PAYLOAD_DIR", os.path.join(os.path.dirname(DB_PATH) or ".", "payloads")
+)
+WORKER_POLL_INTERVAL_S: float = float(os.environ.get("WORKER_POLL_INTERVAL_S", "1.0"))
+
+# ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
 # Set LOG_LEVEL=DEBUG in docker-compose.classifier.yml to see per-step debug

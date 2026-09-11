@@ -17,6 +17,8 @@ services:
     environment:
       - VLLM_QWEN_VL_API=http://vllm-qwen-vl:8000/v1/chat/completions
       - LOG_LEVEL=INFO
+      # Max jobs analysed simultaneously. Bounded by the vision model's capacity.
+      - CLASSIFIER_MAX_CONCURRENT=${CLASSIFIER_MAX_CONCURRENT:-2}
     volumes:
       - classifier_data:/data
     healthcheck:

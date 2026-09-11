@@ -12,6 +12,12 @@ worker and expose ``POST kickoff → GET /jobs/{id}`` polling — like
 ``classifier``, whose ``/assess`` endpoint returns immediately with a
 ``job_id`` while the actual analysis happens in an asyncio task.
 
+The table doubles as a durable FIFO work queue: producers register jobs in
+``"pending"`` and any number of consumers call ``claim_next()`` to
+atomically take the oldest one. ``reset_phase("processing", "pending")`` at
+startup recovers jobs a crashed process left half-done. See
+``classifier/workers.py`` for the reference consumer.
+
 Optional dep: ``aiosqlite``. If a consumer imports this module without
 having aiosqlite installed, they get a clean ``ImportError`` at import time.
 """
@@ -282,6 +288,83 @@ class SqliteRegistry:
             cur = await db.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
             await db.commit()
             return cur.rowcount > 0
+
+
+    # ── Queue operations ──────────────────────────────────────────────────
+    # These turn the jobs table into a durable work queue: producers
+    # ``register(..., "pending")``, N consumers ``claim_next()`` in a loop.
+    # The claim is atomic across connections AND processes because it runs
+    # under ``BEGIN IMMEDIATE`` (a write lock), so two workers can never
+    # take the same row. sqlite3's default 5 s busy timeout means a second
+    # claimer briefly waits for the lock rather than erroring.
+
+    async def claim_next(
+        self,
+        from_phase: str = "pending",
+        to_phase: str = "processing",
+    ) -> Optional[JobBase]:
+        """Atomically move the oldest job in ``from_phase`` to ``to_phase``
+        and return its snapshot (already reflecting ``to_phase``), or
+        ``None`` when nothing is waiting.
+
+        Oldest is by ``created_at`` then insertion order, so the queue is
+        FIFO. Safe to call concurrently from many asyncio tasks or many
+        processes sharing the same DB file.
+        """
+        async with aiosqlite.connect(self.db_path, isolation_level=None) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                async with db.execute(
+                    "SELECT id FROM jobs WHERE phase = ? "
+                    "ORDER BY created_at ASC, rowid ASC LIMIT 1",
+                    (from_phase,),
+                ) as cur:
+                    picked = await cur.fetchone()
+                if picked is None:
+                    await db.execute("COMMIT")
+                    return None
+                job_id = picked["id"]
+                await db.execute(
+                    "UPDATE jobs SET phase = ?, updated_at = ? WHERE id = ?",
+                    (to_phase, _now_iso(), job_id),
+                )
+                async with db.execute(
+                    "SELECT * FROM jobs WHERE id = ?", (job_id,)
+                ) as cur:
+                    row = await cur.fetchone()
+                await db.execute("COMMIT")
+            except BaseException:
+                await db.execute("ROLLBACK")
+                raise
+        return _row_to_jobbase(row)
+
+    async def reset_phase(self, from_phase: str, to_phase: str) -> int:
+        """Bulk-transition every job in ``from_phase`` to ``to_phase`` and
+        return how many rows moved.
+
+        Typical use is crash recovery at startup: jobs a previous process
+        left in ``"processing"`` go back to ``"pending"`` so the new
+        workers pick them up again instead of leaving them stuck forever.
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                "UPDATE jobs SET phase = ?, updated_at = ? WHERE phase = ?",
+                (to_phase, _now_iso(), from_phase),
+            )
+            await db.commit()
+            return cur.rowcount
+
+    async def count_by_phase(self) -> dict[str, int]:
+        """Return ``{phase: row_count}`` for every phase present. Cheap
+        enough to call after each enqueue/claim to drive a queue-depth
+        gauge."""
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                "SELECT phase, COUNT(*) FROM jobs GROUP BY phase"
+            ) as cur:
+                rows = await cur.fetchall()
+        return {r[0]: r[1] for r in rows}
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────

@@ -2,8 +2,9 @@
 
 This module wires everything together:
   - Configures logging with correlation ID injection (middleware.py).
-  - Initialises the shared ``common.jobs`` SQLite registry and starts the
-    background worker on startup (registry.init, workers.job_worker).
+  - Initialises the shared ``common.jobs`` SQLite registry, requeues any
+    jobs a previous process left mid-flight, and starts CLASSIFIER_MAX_CONCURRENT
+    background workers on startup (registry.init, workers.start_workers).
   - Registers the correlation ID middleware so every request gets a
     traceable [request_id] in its logs and response headers.
   - Instruments all HTTP endpoints with Prometheus metrics via
@@ -23,12 +24,17 @@ This module wires everything together:
 Overall request flow for /assess:
   1. HTTP request arrives → CorrelationIDMiddleware assigns [request_id].
   2. assess_document() validates criteria, reads image bytes.
-  3. Job record created in SQLite via ``jobs_registry.register(..., "pending")``.
-  4. Job enqueued into workers.job_queue.
+  3. Job record created in SQLite via ``jobs_registry.register(..., "staging")``.
+  4. Payload (image bytes + criteria) written to PAYLOAD_DIR/<job_id>.json,
+     then the row is flipped to "pending" and idle workers are woken.
   5. 202 Accepted returned immediately with job_id.
-  6. Background worker dequeues job → runs CV + LLM → calls
+  6. One of the worker tasks atomically claims the row (→ "processing"),
+     reads the payload, runs CV + LLM, and calls
      ``jobs_registry.set_result(...)`` on success or ``set_error(...)`` on failure.
   7. Caller polls GET /jobs/{job_id} until phase="completed" or "failed".
+
+The jobs table IS the queue — see workers.py for why — so up to
+CLASSIFIER_MAX_CONCURRENT jobs run at once and pending work survives restarts.
 """
 
 import asyncio
@@ -51,7 +57,18 @@ from llm import HINT_RUBRICS
 from logger import logger
 from middleware import CorrelationIDMiddleware, RequestIDFilter, request_id_var
 from models import CompareRequest
-from workers import job_queue, job_worker, jobs_total, job_queue_depth, set_registry
+from workers import (
+    build_assess_payload,
+    build_compare_payload,
+    jobs_total,
+    notify_new_job,
+    recover_interrupted,
+    refresh_queue_depth,
+    set_registry,
+    start_workers,
+    sweep_orphan_payloads,
+    write_payload,
+)
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -103,22 +120,32 @@ async def lifespan(app: FastAPI):
 
     On startup:
       - Initialise (or migrate) the shared SQLite job registry.
-      - Hand the registry to the worker so it can write updates.
-      - Start the background job worker as an asyncio Task.
+      - Hand the registry to the worker module so it can claim rows and write updates.
+      - Requeue jobs the previous process left in "processing" / "staging".
+      - Sweep payload files whose job is gone or already terminal.
+      - Start CLASSIFIER_MAX_CONCURRENT worker tasks.
 
     On shutdown (when the context exits):
-      - Cancel the worker task cleanly.
+      - Cancel the worker tasks. Jobs mid-flight stay "processing" in the DB
+        and are requeued by the next startup's recover_interrupted().
     """
-    # Startup — registry must be ready before the worker starts accepting jobs
+    # Startup — registry must be ready before the workers start claiming jobs
     await jobs_registry.init()
     set_registry(jobs_registry)
-    worker_task = asyncio.create_task(job_worker())
+    requeued = await recover_interrupted()
+    swept = await sweep_orphan_payloads()
+    pending = await refresh_queue_depth()
+    logger.info("lifespan: recovery requeued=%d orphan_payloads_removed=%d pending=%d",
+                requeued, swept, pending)
+    worker_tasks = start_workers()
     logger.info("lifespan: startup complete")
 
     yield  # server runs here
 
-    # Shutdown — cancel the worker (in-flight jobs will be marked failed on restart)
-    worker_task.cancel()
+    # Shutdown — cancel the workers and wait for them to unwind
+    for t in worker_tasks:
+        t.cancel()
+    await asyncio.gather(*worker_tasks, return_exceptions=True)
     logger.info("lifespan: shutdown complete")
 
 
@@ -148,6 +175,28 @@ app.include_router(
 
 
 # ---------------------------------------------------------------------------
+# Enqueue helper
+# ---------------------------------------------------------------------------
+
+async def _enqueue(job_id: str, payload: dict) -> int:
+    """Persist ``payload``, publish the job to the workers, return queue depth.
+
+    The row was registered in phase "staging" so no worker can claim it
+    before the payload exists. If the payload write fails the job is marked
+    failed and the caller gets a 500 instead of a job that can never run.
+    """
+    try:
+        await write_payload(job_id, payload)
+    except Exception as exc:
+        logger.error("enqueue: payload write failed for job_id=%s: %s", job_id, exc)
+        await jobs_registry.set_error(job_id, f"could not persist job payload: {exc}")
+        raise HTTPException(status_code=500, detail="Could not persist job payload")
+    await jobs_registry.set_phase(job_id, "pending")
+    notify_new_job()
+    return await refresh_queue_depth()
+
+
+# ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
 
@@ -172,8 +221,8 @@ async def assess_document(
     Steps:
       1. Parse and validate the criteria JSON.
       2. Read the uploaded image bytes into memory.
-      3. Create a job record in the DB (phase=pending) via jobs_registry.
-      4. Enqueue the job for background processing.
+      3. Create a job record in the DB (phase=staging) via jobs_registry.
+      4. Write the payload to disk, flip the row to pending, wake a worker.
       5. Return the job_id to the caller.
     """
     logger.info("assess_document: filename=%s content_type=%s", image.filename, image.content_type)
@@ -192,26 +241,19 @@ async def assess_document(
     req_id = request_id_var.get("-")
     job_id = await jobs_registry.register(
         ClassifierMetadata(type="assess", request_id=req_id),
-        initial_phase="pending",
+        initial_phase="staging",
     )
 
-    # Step 4 — enqueue; the background worker will pick this up and run the analysis
-    await job_queue.put((
+    # Step 4 — enqueue: payload to disk first, THEN flip to pending so a worker
+    # can never claim a row whose payload isn't there yet.
+    depth = await _enqueue(
         job_id,
-        "assess",
-        {
-            "image_bytes": contents,
-            "content_type": image.content_type,
-            "filename": image.filename or "upload",
-            "criteria": criterion_list,
-        },
-        req_id,
-    ))
-    job_queue_depth.set(job_queue.qsize())
+        build_assess_payload(contents, image.content_type, image.filename or "upload", criterion_list),
+    )
     jobs_total.labels(type="assess", status="pending").inc()
 
     # Step 5 — return immediately; caller polls for the result
-    logger.info("assess_document: queued job_id=%s queue_depth=%d", job_id, job_queue.qsize())
+    logger.info("assess_document: queued job_id=%s queue_depth=%d", job_id, depth)
     return JSONResponse(
         status_code=202,
         content={"job_id": job_id, "phase": "pending"},
@@ -226,8 +268,8 @@ async def assess_with_reference(request: CompareRequest):
     Poll GET /jobs/{job_id} until phase is "completed" or "failed".
 
     The entire CompareRequest (including all example images or their
-    pre_generated_analysis blobs) is passed through the queue in memory —
-    no re-parsing is needed inside the worker.
+    pre_generated_analysis blobs) is written to the payload store and
+    re-validated by the worker, so the job survives a restart.
     """
     logger.info("assess_with_reference: %d example(s) aggregation=%s criteria=%s",
                 len(request.examples), request.aggregation,
@@ -241,16 +283,15 @@ async def assess_with_reference(request: CompareRequest):
     req_id = request_id_var.get("-")
     job_id = await jobs_registry.register(
         ClassifierMetadata(type="compare", request_id=req_id),
-        initial_phase="pending",
+        initial_phase="staging",
     )
 
-    # Step 3 — enqueue the full request object (workers._run_compare receives it directly)
-    await job_queue.put((job_id, "compare", request, req_id))
-    job_queue_depth.set(job_queue.qsize())
+    # Step 3 — enqueue the full request object (workers._run_compare re-validates it)
+    depth = await _enqueue(job_id, build_compare_payload(request))
     jobs_total.labels(type="compare", status="pending").inc()
 
     # Step 4 — return immediately
-    logger.info("assess_with_reference: queued job_id=%s queue_depth=%d", job_id, job_queue.qsize())
+    logger.info("assess_with_reference: queued job_id=%s queue_depth=%d", job_id, depth)
     return JSONResponse(
         status_code=202,
         content={"job_id": job_id, "phase": "pending"},

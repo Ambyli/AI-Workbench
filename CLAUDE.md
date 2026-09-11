@@ -49,6 +49,7 @@ Key variables:
 | `AUDIO_BASE_URL` | `http://localhost:8004` | Base URL returned by Kokoro `text_to_speech` MCP tool |
 | `MADLAD_APP_URL` | `http://madlad-app:8085` | URL the MADLAD proxy uses to reach the inference container |
 | `MADLAD_MODEL` | `SoybeanMilk/madlad400-3b-mt-ct2-int8_float16` | HuggingFace repo ID for the pre-converted CTranslate2 MADLAD checkpoint |
+| `CLASSIFIER_MAX_CONCURRENT` | `2` | Classifier: number of worker tasks claiming jobs from the SQLite-backed queue, i.e. max jobs analysed at once. Bounded by the vision model's capacity; a `compare` job with N live examples fans out into N+1 LLM calls of its own. `1` restores strictly serial processing. Jobs are durable: payloads sit in `PAYLOAD_DIR` (default `/data/payloads`) until a terminal phase, and `processing` rows are requeued on startup. See `ai/classifier/API.md § Async job pattern`. |
 | `DRY_RUN` | `true` | Roofix Bridge: log decisions but skip Phoenix writes |
 | `AGENT_PHASE` | `0` | Roofix Bridge: `0` = chatter+milestones only; `1` = +create/notify |
 | `TICK_INTERVAL_SECONDS` | `300` | Roofix Bridge: APScheduler cadence |
@@ -275,7 +276,7 @@ Adding a new capability to `shared/common/`: create the subpackage under `shared
 - `common.env` — walk-up `.env` loader
 - `common.logging_setup` — CSV audit logger + stdlib configuration
 - `common.processed_store` — Gmail message-id dedup cache (used by `roofix`)
-- `common.jobs` — id-addressable job tracking with three backends: `InMemoryRegistry` (sync, ephemeral — used by `interceptor`), `SqliteRegistry` (async, `aiosqlite`, persistent — used by `classifier`), and `PostgresRegistry` (async, `asyncpg`, persistent, JSONB metadata, real connection pool — used by `sandbox`). Plus a `build_router` FastAPI factory for the standard `GET /jobs`, `GET /jobs/{id}`, `POST /jobs/{id}/cancel`, `DELETE /jobs/{id}` endpoints (auto-detects sync vs async). See [`shared/common/src/common/jobs/__init__.py`](shared/common/src/common/jobs/__init__.py) for backend selection guidance.
+- `common.jobs` — id-addressable job tracking with three backends: `InMemoryRegistry` (sync, ephemeral — used by `interceptor`), `SqliteRegistry` (async, `aiosqlite`, persistent — used by `classifier`), and `PostgresRegistry` (async, `asyncpg`, persistent, JSONB metadata, real connection pool — used by `sandbox`). The two persistent backends also act as a durable FIFO work queue via `claim_next()` (atomic across tasks and processes), `reset_phase()` (startup crash recovery), and `count_by_phase()` (queue-depth gauges) — `classifier/workers.py` is the reference consumer. Plus a `build_router` FastAPI factory for the standard `GET /jobs`, `GET /jobs/{id}`, `POST /jobs/{id}/cancel`, `DELETE /jobs/{id}` endpoints (auto-detects sync vs async). See [`shared/common/src/common/jobs/__init__.py`](shared/common/src/common/jobs/__init__.py) for backend selection guidance.
 
 ## AI Infrastructure — Compose Topology
 

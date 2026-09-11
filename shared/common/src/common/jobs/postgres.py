@@ -266,6 +266,65 @@ class PostgresRegistry:
         return status.endswith(" 1")
 
 
+    # ── Queue operations ──────────────────────────────────────────────────
+    # Same contract as ``SqliteRegistry``: the jobs table is a durable FIFO
+    # work queue. ``FOR UPDATE SKIP LOCKED`` lets many workers (tasks,
+    # processes, or replicas) claim concurrently without blocking each
+    # other or ever taking the same row.
+
+    async def claim_next(
+        self,
+        from_phase: str = "pending",
+        to_phase: str = "processing",
+    ) -> Optional[JobBase]:
+        """Atomically move the oldest job in ``from_phase`` to ``to_phase``
+        and return its snapshot (already reflecting ``to_phase``), or
+        ``None`` when nothing is waiting."""
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "UPDATE jobs SET phase = $1, updated_at = $2 "
+                "WHERE id = ("
+                "  SELECT id FROM jobs WHERE phase = $3 "
+                "  ORDER BY created_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED"
+                ") "
+                "RETURNING id, phase, created_at, updated_at, metadata, result, error",
+                to_phase,
+                _now_utc(),
+                from_phase,
+            )
+        if row is None:
+            return None
+        return _row_to_jobbase(row)
+
+    async def reset_phase(self, from_phase: str, to_phase: str) -> int:
+        """Bulk-transition every job in ``from_phase`` to ``to_phase`` and
+        return how many rows moved. Used for crash recovery at startup
+        (``"processing"`` → ``"pending"``)."""
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            status = await conn.execute(
+                "UPDATE jobs SET phase = $1, updated_at = $2 WHERE phase = $3",
+                to_phase,
+                _now_utc(),
+                from_phase,
+            )
+        # asyncpg returns tags like "UPDATE 3".
+        try:
+            return int(status.rsplit(" ", 1)[1])
+        except (IndexError, ValueError):
+            return 0
+
+    async def count_by_phase(self) -> dict[str, int]:
+        """Return ``{phase: row_count}`` for every phase present."""
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT phase, COUNT(*) AS n FROM jobs GROUP BY phase"
+            )
+        return {r["phase"]: r["n"] for r in rows}
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)

@@ -207,3 +207,76 @@ def test_migration_is_idempotent(tmp_path: Path) -> None:
     _run(reg.init())
     _run(reg.init())  # second run: no-op, no errors
     _run(reg.init())  # third
+
+
+# ── Queue operations ──────────────────────────────────────────────────────
+def test_claim_next_is_fifo_and_flips_phase(db_path: str) -> None:
+    reg = SqliteRegistry(db_path)
+    _run(reg.init())
+    a = _run(reg.register(_Meta(type="assess", request_id="a")))
+    b = _run(reg.register(_Meta(type="assess", request_id="b")))
+
+    first = _run(reg.claim_next())
+    assert first is not None
+    assert first.job_id == a
+    assert first.phase == "processing"
+    assert _run(reg.get(a)).phase == "processing"
+    assert _run(reg.get(b)).phase == "pending"
+
+    second = _run(reg.claim_next())
+    assert second.job_id == b
+    assert _run(reg.claim_next()) is None
+
+
+def test_claim_next_ignores_other_phases(db_path: str) -> None:
+    reg = SqliteRegistry(db_path)
+    _run(reg.init())
+    _run(reg.register(_Meta(type="assess", request_id="s"), initial_phase="staging"))
+    done = _run(reg.register(_Meta(type="assess", request_id="d")))
+    _run(reg.set_result(done, {"ok": True}))
+    assert _run(reg.claim_next()) is None
+
+
+def test_concurrent_claims_never_hand_out_the_same_job(db_path: str) -> None:
+    """N workers racing on claim_next must get N distinct jobs, and once the
+    queue is drained every further claim returns None."""
+    reg = SqliteRegistry(db_path)
+    _run(reg.init())
+    ids = {_run(reg.register(_Meta(type="assess", request_id=str(i)))) for i in range(8)}
+
+    async def race():
+        return await asyncio.gather(*(reg.claim_next() for _ in range(12)))
+
+    claimed = _run(race())
+    got = [j.job_id for j in claimed if j is not None]
+    assert len(got) == 8
+    assert set(got) == ids
+    assert sum(1 for j in claimed if j is None) == 4
+
+
+def test_reset_phase_requeues_processing(db_path: str) -> None:
+    reg = SqliteRegistry(db_path)
+    _run(reg.init())
+    a = _run(reg.register(_Meta(type="assess", request_id="a")))
+    b = _run(reg.register(_Meta(type="assess", request_id="b")))
+    done = _run(reg.register(_Meta(type="assess", request_id="c")))
+    _run(reg.claim_next())
+    _run(reg.claim_next())
+    _run(reg.set_result(done, {"ok": True}))
+
+    moved = _run(reg.reset_phase("processing", "pending"))
+    assert moved == 2
+    assert _run(reg.get(a)).phase == "pending"
+    assert _run(reg.get(b)).phase == "pending"
+    assert _run(reg.get(done)).phase == "completed"
+    assert _run(reg.reset_phase("processing", "pending")) == 0
+
+
+def test_count_by_phase(db_path: str) -> None:
+    reg = SqliteRegistry(db_path)
+    _run(reg.init())
+    assert _run(reg.count_by_phase()) == {}
+    for _ in range(3):
+        _run(reg.register(_Meta(type="assess", request_id="x")))
+    _run(reg.claim_next())
+    assert _run(reg.count_by_phase()) == {"pending": 2, "processing": 1}

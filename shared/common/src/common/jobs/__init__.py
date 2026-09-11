@@ -21,6 +21,13 @@ Three backends, same conceptual shape:
 All three backends produce ``JobBase`` snapshots (see ``common.jobs.model``)
 and can be mounted onto a FastAPI app via ``common.jobs.router.build_router``.
 
+The two persistent backends also work as a durable FIFO work queue:
+``claim_next(from_phase, to_phase)`` atomically hands the oldest waiting job
+to exactly one caller (safe across tasks and processes),
+``reset_phase(from, to)`` recovers jobs a crashed worker left mid-flight, and
+``count_by_phase()`` drives queue-depth gauges. ``classifier/workers.py`` is
+the reference consumer — N worker tasks, each looping on ``claim_next``.
+
 Optional deps: ``aiosqlite`` for ``SqliteRegistry``; ``asyncpg`` for
 ``PostgresRegistry``; ``fastapi`` for ``build_router``. Consumers who don't
 use those don't pay the import cost — each submodule imports its optional

@@ -26,6 +26,29 @@ Job tracking is powered by the shared `common.jobs` package
 (`shared/common/src/common/jobs/`), which the interceptor service also
 uses. The endpoint shapes and response fields are documented there.
 
+### Concurrency and durability
+
+The jobs table **is** the queue. `CLASSIFIER_MAX_CONCURRENT` worker tasks
+(default `2`, set in `.env`) each atomically claim the oldest `pending` row and
+run it, so at most that many jobs are analysed at once and a burst of
+submissions drains at that rate. Size it to the vision model: a compare job
+with N live examples issues N+1 LLM calls of its own. Set it to `1` for the
+old strictly-serial behaviour.
+
+Phases: `staging` → `pending` → `processing` → `completed` | `failed`.
+`staging` is the few milliseconds between the row being created and its
+payload landing on disk; workers never claim it.
+
+Job inputs (image bytes + criteria, or the full compare request) are written
+to `PAYLOAD_DIR` (default `/data/payloads`, same volume as the DB) and deleted
+when the job reaches a terminal phase. On startup the service requeues any
+`processing` rows a previous container left behind and sweeps orphaned payload
+files, so a restart mid-job re-runs the job rather than losing it.
+
+Metrics: `classifier_job_queue_depth` (rows in `pending`) and
+`classifier_jobs_in_flight` (rows being processed, never above
+`CLASSIFIER_MAX_CONCURRENT`).
+
 ---
 
 ## `CriterionInput` — shared input object
@@ -332,7 +355,7 @@ curl http://localhost:4001/v1/classifier/jobs/abc123 -H "Authorization: Bearer s
 }
 ```
 
-`phase` values: `pending` → `processing` → `completed` | `failed`.
+`phase` values: `staging` → `pending` → `processing` → `completed` | `failed` (see § Async job pattern).
 
 **Response shape migration note.** As of the `common.jobs` extraction, the
 top-level `id` is now `job_id`, `status` is now `phase`, and the previously

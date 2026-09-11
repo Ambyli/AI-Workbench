@@ -69,6 +69,37 @@ openssl rand -hex 32
 
 Paste the output into `OPENWEBUI_SECRET_KEY` in `.env`. The default placeholder (`change-me-run-openssl-rand-hex-32`) is fine for a first boot but should be rotated before any real use.
 
+### Encryption keys
+
+`WEBUI_SECRET_KEY` does double duty upstream: it signs login sessions **and**, by default, is the key for two things encrypted at rest in `openwebui_data`:
+
+- **`OAUTH_CLIENT_INFO_ENCRYPTION_KEY`** — the dynamically registered OAuth *client* for each MCP tool server (the blob stored in `tool_server.connections`).
+- **`OAUTH_SESSION_TOKEN_ENCRYPTION_KEY`** — each user's MCP access / refresh *tokens*.
+
+Both default to `WEBUI_SECRET_KEY`. That coupling is a trap: rotating the session secret is a routine, low-stakes act (it just logs everyone out), but while the keys are coupled it *also* makes every stored MCP client blob and token undecryptable. Open WebUI doesn't surface this well — the tool still shows "connected" (that check just hits the MCP URL), but enabling it redirects to `GET /oauth/clients/<id>/authorize`, which **404s** because the backend caught an `InvalidToken` while loading the client and skipped it. The log line is:
+
+```
+Failed to lazily add OAuth client mcp:<id> from config: InvalidToken. Stored OAuth client data is invalid; reconnect this tool server.
+```
+
+Note that clicking **Save** on the tool server does **not** fix it. Save re-encrypts the connection from the blob it already has (`resolve_oauth_client_info` → `decrypt_data`), so a dead blob stays dead. Only a real re-registration writes a new one.
+
+This deployment therefore sets both keys **independently** of the session secret (`OPENWEBUI_OAUTH_CLIENT_INFO_ENCRYPTION_KEY`, `OPENWEBUI_OAUTH_SESSION_TOKEN_ENCRYPTION_KEY` in `.env`). Generate each with `openssl rand -hex 32`, set once, and keep stable. The compose file falls back to `WEBUI_SECRET_KEY` when a key is unset, so a half-applied `.env` on the box behaves exactly like stock rather than breaking.
+
+**Recovering after a key change** (or a past secret rotation that used the default):
+
+1. Set both keys in `.env`, then `make up openwebui` (recreate, so the container reads them).
+2. Re-register each MCP tool's OAuth client — a plain Save is not enough:
+   - Admin Panel → Settings → External Tools → the MCP server → in its OAuth section use **Register / Reconnect** (calls `POST /oauth/clients/register`, which runs dynamic registration and writes a fresh blob), then Save.
+   - If there is no such control in your build, delete the tool server connection and add it back. With no stored blob, dynamic registration runs automatically on first use.
+3. Each user clicks **Authorize** once more the next time they enable the tool — their old tokens were encrypted under the old key and cannot be carried over.
+
+Confirm the client loads afterwards:
+
+```bash
+docker logs openwebui 2>&1 | grep -i "Failed to lazily add OAuth client"   # should stop appearing
+```
+
 ### Branding
 
 Two independent surfaces: the **name** (one env var) and the **icons** (file mounts). Both are wired up already — this section explains what drives what, so a version bump doesn't silently un-brand the deployment.

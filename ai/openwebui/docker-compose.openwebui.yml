@@ -54,6 +54,19 @@ services:
       # values further down. See ai/openwebui/OPENWEBUI.md § Branding.
       WEBUI_NAME: "${OPENWEBUI_WEBUI_NAME}"
       WEBUI_SECRET_KEY: "${OPENWEBUI_SECRET_KEY}"
+      # Encryption keys for data at rest in openwebui_data, kept SEPARATE from
+      # the session secret on purpose. Both default to WEBUI_SECRET_KEY
+      # upstream, which means rotating the session secret (which only needs to
+      # log users out) also makes every stored MCP OAuth client blob and every
+      # stored MCP access token undecryptable — the cause of the
+      # /oauth/clients/<id>/authorize 404 after a secret rotation. Setting them
+      # independently decouples the two. The `:-${OPENWEBUI_SECRET_KEY}` keeps
+      # upstream behaviour when the box .env hasn't defined them yet.
+      #   CLIENT_INFO  → the dynamically registered MCP OAuth client (the blob)
+      #   SESSION_TOKEN → each user's MCP access/refresh tokens
+      # See ai/openwebui/OPENWEBUI.md § Encryption keys.
+      OAUTH_CLIENT_INFO_ENCRYPTION_KEY: "${OPENWEBUI_OAUTH_CLIENT_INFO_ENCRYPTION_KEY:-${OPENWEBUI_SECRET_KEY}}"
+      OAUTH_SESSION_TOKEN_ENCRYPTION_KEY: "${OPENWEBUI_OAUTH_SESSION_TOKEN_ENCRYPTION_KEY:-${OPENWEBUI_SECRET_KEY}}"
       WEBUI_URL: "${OPENWEBUI_WEBUI_URL}"
       ENABLE_SIGNUP: "${OPENWEBUI_ENABLE_SIGNUP}"
       DEFAULT_USER_ROLE: "${OPENWEBUI_DEFAULT_USER_ROLE}"

@@ -15,7 +15,7 @@ blend or aggregate multiple scores into a final verdict.
   aggregate()           — collapse a list of per-example combined scores into
                           a single aggregate verdict using mean, min, or max.
 
-Process flow position: called by workers._run_compare() after all analyses
+Process flow position: called by runners.run_compare() after all analyses
 (input + all examples) have been gathered via asyncio.gather().
 """
 

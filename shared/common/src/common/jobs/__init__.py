@@ -25,8 +25,15 @@ The two persistent backends also work as a durable FIFO work queue:
 ``claim_next(from_phase, to_phase)`` atomically hands the oldest waiting job
 to exactly one caller (safe across tasks and processes),
 ``reset_phase(from, to)`` recovers jobs a crashed worker left mid-flight, and
-``count_by_phase()`` drives queue-depth gauges. ``classifier/workers.py`` is
-the reference consumer — N worker tasks, each looping on ``claim_next``.
+``count_by_phase()`` drives queue-depth gauges.
+
+* ``WorkerPool`` (from ``common.jobs.worker``) — N asyncio workers looping on
+  ``claim_next``, with wake/poll, crash recovery, and an ``on_finish`` metrics
+  hook. The consumer supplies ``async handler(JobBase) -> dict``.
+
+* ``FilePayloadStore`` (from ``common.jobs.payloads``) — one JSON file per job
+  for inputs too large for ``metadata`` (images, request bodies), so a queued
+  job survives a restart. ``classifier/workers.py`` wires both together.
 
 Optional deps: ``aiosqlite`` for ``SqliteRegistry``; ``asyncpg`` for
 ``PostgresRegistry``; ``fastapi`` for ``build_router``. Consumers who don't

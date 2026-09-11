@@ -24,7 +24,7 @@ This module orchestrates the full assessment flow for a single image:
   resolve_example()         — return a pre-generated analysis or analyse live;
                               used in /assess/compare to avoid redundant calls.
 
-Process flow position: called by workers.py (_run_assess, _run_compare) after
+Process flow position: called by runners.py (run_assess, run_compare) after
 the job is dequeued.
 """
 

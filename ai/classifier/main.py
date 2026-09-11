@@ -4,7 +4,7 @@ This module wires everything together:
   - Configures logging with correlation ID injection (middleware.py).
   - Initialises the shared ``common.jobs`` SQLite registry, requeues any
     jobs a previous process left mid-flight, and starts CLASSIFIER_MAX_CONCURRENT
-    background workers on startup (registry.init, workers.start_workers).
+    background workers on startup (registry.init, workers.ClassifierQueue).
   - Registers the correlation ID middleware so every request gets a
     traceable [request_id] in its logs and response headers.
   - Instruments all HTTP endpoints with Prometheus metrics via
@@ -33,11 +33,10 @@ Overall request flow for /assess:
      ``jobs_registry.set_result(...)`` on success or ``set_error(...)`` on failure.
   7. Caller polls GET /jobs/{job_id} until phase="completed" or "failed".
 
-The jobs table IS the queue — see workers.py for why — so up to
+The jobs table IS the queue — see workers.py / common.jobs.worker — so up to
 CLASSIFIER_MAX_CONCURRENT jobs run at once and pending work survives restarts.
 """
 
-import asyncio
 import json
 import logging
 from contextlib import asynccontextmanager
@@ -57,18 +56,9 @@ from llm import HINT_RUBRICS
 from logger import logger
 from middleware import CorrelationIDMiddleware, RequestIDFilter, request_id_var
 from models import CompareRequest
-from workers import (
-    build_assess_payload,
-    build_compare_payload,
-    jobs_total,
-    notify_new_job,
-    recover_interrupted,
-    refresh_queue_depth,
-    set_registry,
-    start_workers,
-    sweep_orphan_payloads,
-    write_payload,
-)
+from metrics import jobs_total
+from runners import build_assess_payload, build_compare_payload
+from workers import ClassifierQueue
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -94,9 +84,9 @@ logger.info("Starting Document Classifier (log level=%s)", LOG_LEVEL)
 # ---------------------------------------------------------------------------
 # Shared jobs registry — persistent SQLite backend from common.jobs
 # ---------------------------------------------------------------------------
-# One process-wide registry, shared by main.py (endpoints) and workers.py
-# (background worker). Its schema migration from classifier's legacy layout
-# (status → phase, add metadata column) runs idempotently in ``init()``.
+# One process-wide registry, shared by main.py (endpoints) and the
+# ClassifierQueue (worker pool). Its schema migration from classifier's legacy
+# layout (status → phase, add metadata column) runs idempotently in ``init()``.
 
 class ClassifierMetadata(BaseModel):
     """Per-job metadata for the classifier. Everything that used to live in
@@ -108,6 +98,7 @@ class ClassifierMetadata(BaseModel):
 
 
 jobs_registry = SqliteRegistry(DB_PATH)
+queue = ClassifierQueue(jobs_registry)
 
 
 # ---------------------------------------------------------------------------
@@ -120,32 +111,21 @@ async def lifespan(app: FastAPI):
 
     On startup:
       - Initialise (or migrate) the shared SQLite job registry.
-      - Hand the registry to the worker module so it can claim rows and write updates.
-      - Requeue jobs the previous process left in "processing" / "staging".
-      - Sweep payload files whose job is gone or already terminal.
-      - Start CLASSIFIER_MAX_CONCURRENT worker tasks.
+      - ``queue.start()``: requeue jobs the previous process left in
+        "processing" / "staging", sweep orphan payload files, and start
+        CLASSIFIER_MAX_CONCURRENT worker tasks.
 
     On shutdown (when the context exits):
-      - Cancel the worker tasks. Jobs mid-flight stay "processing" in the DB
-        and are requeued by the next startup's recover_interrupted().
+      - ``queue.stop()``: cancel the worker tasks. Jobs mid-flight stay
+        "processing" in the DB and are requeued by the next startup.
     """
-    # Startup — registry must be ready before the workers start claiming jobs
     await jobs_registry.init()
-    set_registry(jobs_registry)
-    requeued = await recover_interrupted()
-    swept = await sweep_orphan_payloads()
-    pending = await refresh_queue_depth()
-    logger.info("lifespan: recovery requeued=%d orphan_payloads_removed=%d pending=%d",
-                requeued, swept, pending)
-    worker_tasks = start_workers()
+    await queue.start()
     logger.info("lifespan: startup complete")
 
     yield  # server runs here
 
-    # Shutdown — cancel the workers and wait for them to unwind
-    for t in worker_tasks:
-        t.cancel()
-    await asyncio.gather(*worker_tasks, return_exceptions=True)
+    await queue.stop()
     logger.info("lifespan: shutdown complete")
 
 
@@ -186,14 +166,10 @@ async def _enqueue(job_id: str, payload: dict) -> int:
     failed and the caller gets a 500 instead of a job that can never run.
     """
     try:
-        await write_payload(job_id, payload)
-    except Exception as exc:
-        logger.error("enqueue: payload write failed for job_id=%s: %s", job_id, exc)
-        await jobs_registry.set_error(job_id, f"could not persist job payload: {exc}")
+        return await queue.enqueue(job_id, payload)
+    except Exception:
+        # queue.enqueue already logged and marked the job failed
         raise HTTPException(status_code=500, detail="Could not persist job payload")
-    await jobs_registry.set_phase(job_id, "pending")
-    notify_new_job()
-    return await refresh_queue_depth()
 
 
 # ---------------------------------------------------------------------------
@@ -286,7 +262,7 @@ async def assess_with_reference(request: CompareRequest):
         initial_phase="staging",
     )
 
-    # Step 3 — enqueue the full request object (workers._run_compare re-validates it)
+    # Step 3 — enqueue the full request object (runners.run_compare re-validates it)
     depth = await _enqueue(job_id, build_compare_payload(request))
     jobs_total.labels(type="compare", status="pending").inc()
 

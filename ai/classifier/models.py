@@ -16,7 +16,7 @@ Data model relationships
       ├── aggregation: mean|min|max       — how to collapse N example scores
       └── examples  : list[ExampleInput]  — reference images to compare against
 
-Process flow position: imported by analysis.py, main.py, workers.py, and llm.py.
+Process flow position: imported by analysis.py, main.py, runners.py, and llm.py.
 """
 
 from typing import Literal, Optional

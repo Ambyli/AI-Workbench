@@ -16,7 +16,7 @@ The table doubles as a durable FIFO work queue: producers register jobs in
 ``"pending"`` and any number of consumers call ``claim_next()`` to
 atomically take the oldest one. ``reset_phase("processing", "pending")`` at
 startup recovers jobs a crashed process left half-done. See
-``classifier/workers.py`` for the reference consumer.
+``common.jobs.worker.WorkerPool`` for the reference consumer.
 
 Optional dep: ``aiosqlite``. If a consumer imports this module without
 having aiosqlite installed, they get a clean ``ImportError`` at import time.

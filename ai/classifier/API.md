@@ -1,7 +1,13 @@
 # Classifier API
 
 FastAPI service that assesses image quality and features via OpenCV detectors
-and Qwen2.5-VL-7B LLM scoring.
+and vision-LLM scoring. The LLM is Meta's Muse-Glimmer-30B served by the
+`muse-glimmer` vLLM container (`VISION_LLM_API` / `VISION_LLM_MODEL` /
+`VISION_LLM_MAX_TOKENS` in the `## Classifier` block of `.env`); see [VLLM.md § Muse Glimmer 30B](../vllm/VLLM.md#muse-glimmer-30b--tensor-parallel--dflash-speculative-decoding).
+Muse Glimmer's reasoning depth is set per call from `VISION_LLM_REASONING_STRENGTH`
+(default `low`, driven by `CLASSIFIER_REASONING_STRENGTH` in `.env`); its thinking
+is stripped server-side by the `muse_glimmer` reasoning parser, so only the JSON
+answer reaches the classifier.
 
 Base URL (direct): `http://<host>:8005`
 Base URL (via LiteLLM passthrough): `http://<host>:4001/v1/classifier`
@@ -32,7 +38,9 @@ The jobs table **is** the queue. `CLASSIFIER_MAX_CONCURRENT` worker tasks
 (default `2`, set in `.env`) each atomically claim the oldest `pending` row and
 run it, so at most that many jobs are analysed at once and a burst of
 submissions drains at that rate. Size it to the vision model: a compare job
-with N live examples issues N+1 LLM calls of its own. Set it to `1` for the
+with N live examples issues N+1 LLM calls of its own, and `muse-glimmer` runs
+`--max-num-seqs 4`, so anything past four in-flight requests queues inside
+vLLM rather than running in parallel. Set it to `1` for the
 old strictly-serial behaviour.
 
 Phases: `staging` → `pending` → `processing` → `completed` | `failed`.

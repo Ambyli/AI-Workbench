@@ -31,7 +31,15 @@ import httpx
 from fastapi import HTTPException
 from prometheus_client import Counter, Histogram
 
-from config import VLLM_QWEN_VL_API, MAX_LLM_RETRIES, HTTP_TIMEOUT, HTTP_CONNECT_TIMEOUT
+from config import (
+    VISION_LLM_API,
+    VISION_LLM_MODEL,
+    VISION_LLM_REASONING_STRENGTH,
+    VISION_LLM_MAX_TOKENS,
+    MAX_LLM_RETRIES,
+    HTTP_TIMEOUT,
+    HTTP_CONNECT_TIMEOUT,
+)
 from logger import logger
 from models import CriterionInput
 from utils import verdict_from_score as _verdict_from_score
@@ -231,9 +239,13 @@ def build_llm_prompt(image_b64: str, criteria: list[CriterionInput]) -> dict:
         "Set confidence to a number 0-100: 0 = completely uncertain, 100 = completely certain. "
         "Return ONLY a valid JSON object."
     )
+    if VISION_LLM_REASONING_STRENGTH:
+        # Muse Glimmer reads its reasoning depth from this system-prompt line
+        # (see ai/vllm/VLLM.md "Parsers and sampling"). Other models ignore it.
+        system_prompt += f"\nReasoning strength: {VISION_LLM_REASONING_STRENGTH}"
 
     prompt = {
-        "model": "Qwen/Qwen2.5-VL-7B-Instruct",
+        "model": VISION_LLM_MODEL,
         "messages": [
             {"role": "system", "content": system_prompt},
             {
@@ -248,8 +260,14 @@ def build_llm_prompt(image_b64: str, criteria: list[CriterionInput]) -> dict:
                 ],
             },
         ],
-        "max_tokens": 2048,
-        "temperature": 0.1,  # low temperature → more deterministic scoring
+        # Budget covers reasoning + the JSON answer; reasoning is stripped
+        # server-side by --reasoning-parser so `content` is JSON only.
+        "max_tokens": VISION_LLM_MAX_TOKENS,
+        # No temperature override: the server's --generation-config auto applies
+        # Meta's published sampling for Muse Glimmer (temperature 1.0, top_p
+        # 0.95, top_k 64). The model card warns against greedy / near-greedy
+        # decoding, so the old 0.1 is deliberately gone. Consistency comes from
+        # the JSON schema constraint below plus validate_and_clamp().
         "response_format": {"type": "json_object"},  # forces valid JSON output
     }
     logger.debug(
@@ -288,7 +306,10 @@ async def call_vllm(prompt: dict) -> dict:
     import time
 
     logger.info(
-        "call_vllm: posting to %s (max_retries=%d)", VLLM_QWEN_VL_API, MAX_LLM_RETRIES
+        "call_vllm: posting to %s model=%s (max_retries=%d)",
+        VISION_LLM_API,
+        VISION_LLM_MODEL,
+        MAX_LLM_RETRIES,
     )
 
     last_exc: Exception | None = None
@@ -299,13 +320,17 @@ async def call_vllm(prompt: dict) -> dict:
         try:
             # Step 1 — send the request and check HTTP status
             async with httpx.AsyncClient(timeout=_http_timeout) as client:
-                response = await client.post(VLLM_QWEN_VL_API, json=prompt)
+                response = await client.post(VISION_LLM_API, json=prompt)
                 response.raise_for_status()
                 data = response.json()
 
             elapsed = time.monotonic() - t0
             llm_latency.observe(elapsed)
-            content = data["choices"][0]["message"]["content"]
+            # With a reasoning parser the model's thinking lands in
+            # `reasoning_content`; `content` is the answer and can be None if
+            # the budget ran out mid-reasoning. Treat that as a parse failure
+            # so the retry loop fires instead of a 502.
+            content = data["choices"][0]["message"].get("content") or ""
             logger.debug(
                 "call_vllm: response[%d chars] in %.2fs", len(content), elapsed
             )

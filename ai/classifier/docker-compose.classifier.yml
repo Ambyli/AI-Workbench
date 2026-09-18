@@ -15,9 +15,17 @@ services:
     ports:
       - "${PORT_CLASSIFIER}:8000"
     environment:
-      - VLLM_QWEN_VL_API=http://vllm-qwen-vl:8000/v1/chat/completions
+      # Vision model that scores LLM-bound criteria. All four come from the
+      # `## Classifier` block in .env; the defaults here are the muse-glimmer
+      # vLLM container (ai/vllm/docker-compose.vllm.yml). See .env.example for
+      # what each does and how to fall back to vllm-qwen-vl.
+      - VISION_LLM_API=${VISION_LLM_API:-http://muse-glimmer:8000/v1/chat/completions}
+      - VISION_LLM_MODEL=${VISION_LLM_MODEL:-muse-glimmer}
+      - VISION_LLM_MAX_TOKENS=${VISION_LLM_MAX_TOKENS:-8192}
+      - VISION_LLM_REASONING_STRENGTH=${CLASSIFIER_REASONING_STRENGTH:-low}
       - LOG_LEVEL=INFO
-      # Max jobs analysed simultaneously. Bounded by the vision model's capacity.
+      # Max jobs analysed simultaneously. Bounded by the vision model's capacity
+      # (muse-glimmer runs --max-num-seqs 4; extra requests queue inside vLLM).
       - CLASSIFIER_MAX_CONCURRENT=${CLASSIFIER_MAX_CONCURRENT:-2}
     volumes:
       - classifier_data:/data

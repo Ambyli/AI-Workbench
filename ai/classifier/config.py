@@ -9,13 +9,30 @@ Process flow position: loaded first by every other module at import time.
 import os
 
 # ---------------------------------------------------------------------------
-# Upstream LLM — vLLM OpenAI-compatible endpoint
+# Upstream vision LLM — vLLM OpenAI-compatible endpoint
 # ---------------------------------------------------------------------------
-# Points at the vllm-qwen-vl container on the shared Docker network.
-# Change this if you swap the vision model or run vLLM on a different host.
-VLLM_QWEN_VL_API: str = os.environ.get(
-    "VLLM_QWEN_VL_API", "http://vllm-qwen-vl:8000/v1/chat/completions"
+# Points at the muse-glimmer container (meta-models/Muse-Glimmer-30B, served
+# under alias `muse-glimmer`) on the shared Docker network. VISION_LLM_MODEL is
+# the `model` field sent with every chat completion and must match the
+# server's --served-model-name (or the HF repo id when that flag is unset,
+# e.g. `Qwen/Qwen2.5-VL-7B-Instruct` for vllm-qwen-vl). Change both to swap
+# the vision model or run vLLM on a different host.
+#
+# VISION_LLM_REASONING_STRENGTH is a Muse Glimmer-specific knob: the model's
+# reasoning depth is set by a `Reasoning strength: low|medium|high|xhigh`
+# line in the system prompt (not a chat-template kwarg). Reasoning tokens
+# count against max_tokens, so higher settings need a bigger budget. Set it
+# to an empty string for models that don't understand the directive.
+VISION_LLM_API: str = os.environ.get(
+    "VISION_LLM_API", "http://muse-glimmer:8000/v1/chat/completions"
 )
+VISION_LLM_MODEL: str = os.environ.get("VISION_LLM_MODEL", "muse-glimmer")
+VISION_LLM_REASONING_STRENGTH: str = os.environ.get(
+    "VISION_LLM_REASONING_STRENGTH", "low"
+).strip().lower()
+# Completion budget per scoring call. Includes any reasoning the model emits
+# before the JSON answer, so it is deliberately larger than the JSON alone.
+VISION_LLM_MAX_TOKENS: int = int(os.environ.get("VISION_LLM_MAX_TOKENS", "8192"))
 
 # ---------------------------------------------------------------------------
 # OpenCV pre-check thresholds
@@ -60,7 +77,7 @@ JOB_TTL_HOURS: int = int(os.environ.get("JOB_TTL_HOURS", "24"))
 # The jobs table in DB_PATH is the queue (see common.jobs.sqlite.claim_next).
 # CLASSIFIER_MAX_CONCURRENT worker tasks each claim one pending job at a
 # time, so at most that many jobs run simultaneously. Size it to what the
-# vision model behind VLLM_QWEN_VL_API can absorb — remember a /assess/compare
+# vision model behind VISION_LLM_API can absorb — remember a /assess/compare
 # job with N live examples fans out into N+1 LLM calls of its own.
 #
 # PAYLOAD_DIR holds one JSON file per queued job (image bytes + criteria, or

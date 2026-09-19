@@ -22,6 +22,7 @@ $(eval $(call service,interceptor,interceptor))
 $(eval $(call service,searxng,searxng))
 $(eval $(call service,sandbox,sandbox-db sandbox-egress sandbox-proxy sandbox-runner))
 $(eval $(call service,n8n,n8n-db n8n))
+$(eval $(call service,open-terminal,open-terminal))
 $(eval $(call service,trino,hive-metastore-db hive-metastore minio minio-init trino-auth-init trino-coordinator trino-mcp superset-db superset))
 
 # Introspection targets consumed by the `_make_ai_complete` bash completion
@@ -76,6 +77,12 @@ SERVICES = $(if $(SVC),$(SVC),$(STACK_$(STACK)))
 
 network:
 	docker network create ai_shared 2>/dev/null || true
+	# terminal_net is deliberately NOT ai_shared: it joins only open-terminal
+	# and openwebui, keeping the model-driven shell away from litellm,
+	# roofix-db, sandbox-runner (docker.sock), minio and n8n. Plain bridge,
+	# not internal — open-terminal needs a gateway for pip/apt, narrowed by
+	# OPEN_TERMINAL_ALLOWED_DOMAINS. See ai/open-terminal/OPEN_TERMINAL.md.
+	docker network create terminal_net 2>/dev/null || true
 
 setup: network
 	cd widget && uv sync && cd ..

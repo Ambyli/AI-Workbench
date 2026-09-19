@@ -1,0 +1,1544 @@
+{
+  "info": {
+    "name": "open-terminal",
+    "description": "Open Terminal — the code-execution backend for this Open WebUI deployment (`ghcr.io/open-webui/open-terminal`, see ai/open-terminal/OPEN_TERMINAL.md).\n\n**There is no host port and no LiteLLM pass-through.** Unlike every other collection in this repo, these requests do NOT go through `{{litellm}}`. `open-terminal` publishes nothing to the host and sits alone with `openwebui` on the `terminal_net` bridge, because it is a root-capable shell driven by a model — see OPEN_TERMINAL.md § Network isolation. Every production request is proxied by the Open WebUI BACKEND (`backend/open_webui/routers/terminals.py`), which adds `Authorization: Bearer <key>`, `X-User-Id`, and `X-Session-Id` server-side.\n\n**To use this collection you must reach the container yourself.** Pick one:\n\n1. *Preferred, nothing to undo* — run curl from inside openwebui, using this collection as the reference for paths and bodies:\n   `docker exec openwebui curl -fsS -H \"Authorization: Bearer $OPEN_TERMINAL_API_KEY\" http://open-terminal:8000/openapi.json`\n2. *Temporary loopback publish* — add `ports: [\"127.0.0.1:8000:8000\"]` to the `open-terminal` service, `make up open-terminal`, debug, then REMOVE it and recreate. Never bind 0.0.0.0: the bearer token is the only thing between the LAN and a shell.\n3. *Ad-hoc tunnel* — `docker run --rm --network terminal_net -p 127.0.0.1:8000:8000 alpine/socat tcp-listen:8000,fork,reuseaddr tcp-connect:open-terminal:8000`.\n\nThen set the collection variables `openTerminal` (default `http://localhost:8000`) and `openTerminalApiKey` (= `OPEN_TERMINAL_API_KEY` in .env) — every request inherits the bearer token from collection-level auth.\n\n**Multi-user mode is on**, so `X-User-Id` decides which Linux account and `/home/<user>` a call touches. Requests that care about it send the `openTerminalUserId` variable; leave it blank to act as the default `user` account. `X-Session-Id` (`openTerminalSessionId`) scopes the remembered working directory and the process list.\n\nEndpoints marked *“not in the OpenAPI schema”* carry `include_in_schema=False` upstream: they are reachable over HTTP and used by the Open WebUI UI, but they are NOT turned into function-calling tools for the model. The schema'd ones are.\n\nSource of truth for shapes: `open_terminal/main.py` at the tag pinned in `OPEN_TERMINAL_VERSION`.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "_postman_id": "open-terminal-collection"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{openTerminalApiKey}}",
+        "type": "string"
+      }
+    ]
+  },
+  "variable": [
+    {
+      "key": "openTerminal",
+      "value": "http://localhost:8000",
+      "type": "string",
+      "description": "Base URL for open-terminal. There is NO host publish by default — this value assumes you set up one of the three access routes described in the collection description (docker exec, a temporary 127.0.0.1 port, or a socat tunnel). From inside the openwebui container the address is http://open-terminal:8000."
+    },
+    {
+      "key": "openTerminalApiKey",
+      "value": "your-open-terminal-api-key",
+      "type": "string",
+      "description": "OPEN_TERMINAL_API_KEY from .env — the same value ai/openwebui/docker-compose.openwebui.yml interpolates into TERMINAL_SERVER_CONNECTIONS. Sent as `Authorization: Bearer {{openTerminalApiKey}}` by the collection-level auth. Treat it as a root-capable credential: anyone holding it gets a shell on the box."
+    },
+    {
+      "key": "openTerminalUserId",
+      "value": "",
+      "type": "string",
+      "description": "Value for the X-User-Id header. In multi-user mode (OPEN_TERMINAL_MULTI_USER=true) open-terminal maps this to a Linux account and runs the call under `sudo -u`, so it selects which /home/<user> you are operating on. In production it is the Open WebUI user id, set by the backend proxy. Leave blank to act as the default `user` account."
+    },
+    {
+      "key": "openTerminalSessionId",
+      "value": "",
+      "type": "string",
+      "description": "Value for the X-Session-Id header — the chat/session id. Scopes the remembered working directory (GET/POST /files/cwd, and relative-path resolution everywhere else) and the process list from GET /execute. Entries expire after OPEN_TERMINAL_SESSION_CWD_TTL (7 days, refreshed on access). Optional."
+    },
+    {
+      "key": "openTerminalProcessId",
+      "value": "",
+      "type": "string",
+      "description": "Process id returned by POST /execute (format `YYYYMMDD-HHMMSS-<6 hex>`). Paste it here and the status / input / kill requests under Execute pick it up."
+    },
+    {
+      "key": "openTerminalPtyId",
+      "value": "",
+      "type": "string",
+      "description": "8-char interactive PTY session id returned by POST /api/terminals. UNRELATED to openTerminalSessionId — that one is the chat id sent in a header; this one is a live pseudo-terminal handle."
+    }
+  ],
+  "item": [
+    {
+      "name": "Service",
+      "description": "Liveness, capability discovery, and the two documents that shape how the model sees this terminal: the OpenAPI schema (which operations become tools) and the system prompt (what the model is told about the environment).",
+      "item": [
+        {
+          "name": "GET /health",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{openTerminal}}/health",
+              "host": [
+                "{{openTerminal}}"
+              ],
+              "path": [
+                "health"
+              ]
+            },
+            "description": "Liveness probe. The ONLY unauthenticated endpoint — the collection still sends the bearer token, which is ignored here. Returns `{\"status\": \"ok\"}`. This is what the compose healthcheck curls over loopback, which keeps working with the egress firewall on (loopback is ACCEPTed by its first iptables rule). See OPEN_TERMINAL.md § Verifying the connection."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /openapi.json",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{openTerminal}}/openapi.json",
+              "host": [
+                "{{openTerminal}}"
+              ],
+              "path": [
+                "openapi.json"
+              ]
+            },
+            "description": "FastAPI's generated OpenAPI document. This is the contract Open WebUI consumes: `utils/tools.py::set_terminal_servers` fetches `<url><path>` ONCE at startup (path defaults to `/openapi.json`) and turns every operation with `include_in_schema=True` into a native function-calling tool on the model. Endpoints marked `include_in_schema=False` in the source (cwd, mkdir, move, delete, view, serve, archive, upload, ports, terminals) are reachable over HTTP but are UI/client surface, not model tools.\n\nA 401/timeout here is what produces the chat-side 503 “Terminal unavailable” — re-saving the connection in Admin Settings → Integrations → Open Terminal re-runs the fetch. Errors: 401 on a bad key."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /api/config",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{openTerminal}}/api/config",
+              "host": [
+                "{{openTerminal}}"
+              ],
+              "path": [
+                "api",
+                "config"
+              ]
+            },
+            "description": "Feature-flag discovery for clients: `{\"features\": {\"terminal\": bool, \"notebooks\": bool, \"system\": bool}}`, driven by OPEN_TERMINAL_ENABLE_TERMINAL / _ENABLE_NOTEBOOKS / _ENABLE_SYSTEM_PROMPT. Open WebUI's connection **Verify** button falls back to this endpoint to tell a plain Open Terminal apart from the Enterprise “Terminals” orchestrator. Not in the OpenAPI schema."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /system",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{openTerminal}}/system",
+              "host": [
+                "{{openTerminal}}"
+              ],
+              "path": [
+                "system"
+              ]
+            },
+            "description": "Returns `{\"prompt\": \"...\"}` — the generated system prompt describing the shell environment (OS, cwd, installed tooling) with OPEN_TERMINAL_INFO appended. Open WebUI fetches this at startup and injects it for any model with the terminal attached, so it is the cheapest way to see exactly what the model is told about this box.\n\nDisabled (404) when OPEN_TERMINAL_ENABLE_SYSTEM_PROMPT=false. Errors: 401 on a bad key."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /info",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{openTerminal}}/info",
+              "host": [
+                "{{openTerminal}}"
+              ],
+              "path": [
+                "info"
+              ]
+            },
+            "description": "Returns `{\"info\": \"<OPEN_TERMINAL_INFO>\"}` — the operator context string verbatim. **The route only exists when OPEN_TERMINAL_INFO is non-empty**; with it blank you get a 404, not an empty string. Unlike most of the discovery endpoints this one IS in the OpenAPI schema, so it also reaches the model as a `get_info` tool. Set in the `## Open Terminal subsystem` block of .env. Errors: 401 on a bad key."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /ports",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-User-Id",
+                "value": "{{openTerminalUserId}}",
+                "description": "Open WebUI user id. In multi-user mode this selects which Linux account and /home/<user> the call runs against; the openwebui backend sets it automatically. Omit (or clear the variable) to act as the default `user` account."
+              }
+            ],
+            "url": {
+              "raw": "{{openTerminal}}/ports",
+              "host": [
+                "{{openTerminal}}"
+              ],
+              "path": [
+                "ports"
+              ]
+            },
+            "description": "TCP ports currently listening inside the container, as `{\"ports\": [...]}`. In multi-user mode only ports owned by X-User-Id's Linux account are listed; in single-user mode only those owned by descendants of the server process. Backs the “a dev server is running” affordance in the UI.\n\nNote the container publishes no host port and sits alone with openwebui on terminal_net, so anything listening here is reachable only from openwebui. Not in the OpenAPI schema. Errors: 401 on a bad key."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Files",
+      "description": "The file API behind Open WebUI's file-browser sidebar, previews, and chat uploads. Relative paths resolve against the session cwd when X-Session-Id is sent, otherwise against the user's home. Note the split between `/files/read` (LLM-facing: text, extracted document text, or an image; refuses other binaries) and `/files/view` (UI-facing: raw bytes of anything, optional rendered preview).",
+      "item": [
+        {
+          "name": "GET /files/cwd",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-User-Id",
+                "value": "{{openTerminalUserId}}",
+                "description": "Open WebUI user id. In multi-user mode this selects which Linux account and /home/<user> the call runs against; the openwebui backend sets it automatically. Omit (or clear the variable) to act as the default `user` account."
+              },
+              {
+                "key": "X-Session-Id",
+                "value": "{{openTerminalSessionId}}",
+                "description": "Chat/session id. Scopes the remembered working directory (GET/POST /files/cwd) and the process list returned by GET /execute. Optional."
+              }
+            ],
+            "url": {
+              "raw": "{{openTerminal}}/files/cwd",
+              "host": [
+                "{{openTerminal}}"
+              ],
+              "path": [
+                "files",
+                "cwd"
+              ]
+            },
+            "description": "Current working directory for this X-Session-Id, plus `home`, plus an optional `root` object describing the file browser's visual root (driven by OPEN_TERMINAL_FILE_BROWSER_ROOT — `home` by default, an explicit path, `{{home}}/project`, or `filesystem` to opt out).\n\n`root` is a UI hint only: it hides parent navigation above a friendly starting point and does NOT restrict commands or the file APIs. Session cwds expire after OPEN_TERMINAL_SESSION_CWD_TTL (7 days, sliding). Not in the OpenAPI schema. Errors: 401."
+          },
+          "response": []
+        },
+        {
+          "name": "POST /files/cwd",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-User-Id",
+                "value": "{{openTerminalUserId}}",
+                "description": "Open WebUI user id. In multi-user mode this selects which Linux account and /home/<user> the call runs against; the openwebui backend sets it automatically. Omit (or clear the variable) to act as the default `user` account."
+              },
+              {
+                "key": "X-Session-Id",
+                "value": "{{openTerminalSessionId}}",
+                "description": "Chat/session id. Scopes the remembered working directory (GET/POST /files/cwd) and the process list returned by GET /execute. Optional."
+              }
+            ],
+            "url": {
+              "raw": "{{openTerminal}}/files/cwd",
+              "host": [
+                "{{openTerminal}}"
+              ],
+              "path": [
+                "files",
+                "cwd"
+              ]
+            },
+            "description": "Remember a working directory for this X-Session-Id; subsequent relative paths in /files/* and /execute resolve against it. Returns `{\"cwd\": \"<resolved>\"}`. Body is the same one-field shape as /files/mkdir.\n\nErrors: 404 when the directory does not exist (single-user mode only — in multi-user mode the check is skipped because the stat would run as the wrong account), 401.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"path\": \"/home/user/projects\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "GET /files/list",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-User-Id",
+                "value": "{{openTerminalUserId}}",
+                "description": "Open WebUI user id. In multi-user mode this selects which Linux account and /home/<user> the call runs against; the openwebui backend sets it automatically. Omit (or clear the variable) to act as the default `user` account."
+              },
+              {
+                "key": "X-Session-Id",
+                "value": "{{openTerminalSessionId}}",
+                "description": "Chat/session id. Scopes the remembered working directory (GET/POST /files/cwd) and the process list returned by GET /execute. Optional."
+              }
+            ],
+            "url": {
+              "raw": "{{openTerminal}}/files/list?directory=.",
+              "host": [
+                "{{openTerminal}}"
+              ],
+              "path": [
+                "files",
+                "list"
+              ],
+              "query": [
+                {
+                  "key": "directory",
+                  "value": ".",
+                  "description": "Directory to list. Relative paths resolve against the session cwd (or the user's home). Default \".\"."
+                }
+              ]
+            },
+            "description": "Structured listing of a directory: `{\"dir\", \"writable\", \"entries\": [...]}`. Relative paths resolve against the session cwd when X-Session-Id is sent. Exposed to the model as the `list_files` tool. Errors: 404 when the directory does not exist, 401."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /files/read",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-User-Id",
+                "value": "{{openTerminalUserId}}",
+                "description": "Open WebUI user id. In multi-user mode this selects which Linux account and /home/<user> the call runs against; the openwebui backend sets it automatically. Omit (or clear the variable) to act as the default `user` account."
+              },
+              {
+                "key": "X-Session-Id",
+                "value": "{{openTerminalSessionId}}",
+                "description": "Chat/session id. Scopes the remembered working directory (GET/POST /files/cwd) and the process list returned by GET /execute. Optional."
+              }
+            ],
+            "url": {
+              "raw": "{{openTerminal}}/files/read?path=notes.md&start_line=1&end_line=200",
+              "host": [
+                "{{openTerminal}}"
+              ],
+              "path": [
+                "files",
+                "read"
+              ],
+              "query": [
+                {
+                  "key": "path",
+                  "value": "notes.md",
+                  "description": "Path to read. Relative paths resolve against the session cwd."
+                },
+                {
+                  "key": "start_line",
+                  "value": "1",
+                  "description": "First line to return, 1-indexed inclusive (>= 1). Optional."
+                },
+                {
+                  "key": "end_line",
+                  "value": "200",
+                  "description": "Last line to return, 1-indexed inclusive (>= 1). Optional."
+                }
+              ]
+            },
+            "description": "Read a file for LLM consumption: `{\"path\", \"total_lines\", \"content\"}`, optionally narrowed to a line range. Three behaviours by type:\n\n- text → JSON as above\n- documents (PDF, DOCX, PPTX, ODF …) → extracted text, same JSON shape\n- binary whose MIME matches OPEN_TERMINAL_BINARY_MIME_PREFIXES (default `image`) → raw bytes with that Content-Type, so a vision model can look at it\n\nAnything else is refused rather than dumped as bytes. Exposed as the `read_file` tool. Use /files/view instead when you want the original bytes for a UI preview. Errors: 404 not found, 415 unsupported binary type, 401."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /files/view",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-User-Id",
+                "value": "{{openTerminalUserId}}",
+                "description": "Open WebUI user id. In multi-user mode this selects which Linux account and /home/<user> the call runs against; the openwebui backend sets it automatically. Omit (or clear the variable) to act as the default `user` account."
+              }
+            ],
+            "url": {
+              "raw": "{{openTerminal}}/files/view?path=/home/user/report.docx&preview=true",
+              "host": [
+                "{{openTerminal}}"
+              ],
+              "path": [
+                "files",
+                "view"
+              ],
+              "query": [
+                {
+                  "key": "path",
+                  "value": "/home/user/report.docx",
+                  "description": "Path to the file."
+                },
+                {
+                  "key": "preview",
+                  "value": "true",
+                  "description": "Best-effort rendered preview (DOCX/PPTX → PDF). Default false."
+                }
+              ]
+            },
+            "description": "Return the raw bytes of any file with its guessed Content-Type — the UI preview endpoint, with none of /files/read's binary restrictions. With `preview=true`, DOCX and PPTX are rendered to PDF via LibreOffice (present in the default image only); if rendering is unavailable or fails, the original bytes are returned instead, so callers must not assume a PDF came back. Not in the OpenAPI schema. Errors: 404 not found, 401."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /files/serve/:filePath",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-User-Id",
+                "value": "{{openTerminalUserId}}",
+                "description": "Open WebUI user id. In multi-user mode this selects which Linux account and /home/<user> the call runs against; the openwebui backend sets it automatically. Omit (or clear the variable) to act as the default `user` account."
+              }
+            ],
+            "url": {
+              "raw": "{{openTerminal}}/files/serve/:filePath",
+              "host": [
+                "{{openTerminal}}"
+              ],
+              "path": [
+                "files",
+                "serve",
+                ":filePath"
+              ],
+              "variable": [
+                {
+                  "key": "filePath",
+                  "value": "",
+                  "description": "Absolute file path WITHOUT the leading slash, e.g. `home/user/site/index.html`. Postman percent-encodes it as one segment, so for nested paths prefer /files/view?path=… in this collection."
+                }
+              ]
+            },
+            "description": "Path-addressed alias for /files/view (always `preview=false`). It exists so a previewed HTML page can resolve its own relative asset URLs inside an iframe. The path variable is the ABSOLUTE path with its leading slash dropped — `/home/user/site/index.html` is requested as `/files/serve/home/user/site/index.html`. Not in the OpenAPI schema. Errors: 404 not found, 401."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /files/display",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-User-Id",
+                "value": "{{openTerminalUserId}}",
+                "description": "Open WebUI user id. In multi-user mode this selects which Linux account and /home/<user> the call runs against; the openwebui backend sets it automatically. Omit (or clear the variable) to act as the default `user` account."
+              },
+              {
+                "key": "X-Session-Id",
+                "value": "{{openTerminalSessionId}}",
+                "description": "Chat/session id. Scopes the remembered working directory (GET/POST /files/cwd) and the process list returned by GET /execute. Optional."
+              }
+            ],
+            "url": {
+              "raw": "{{openTerminal}}/files/display?path=/home/user/chart.png",
+              "host": [
+                "{{openTerminal}}"
+              ],
+              "path": [
+                "files",
+                "display"
+              ],
+              "query": [
+                {
+                  "key": "path",
+                  "value": "/home/user/chart.png",
+                  "description": "Absolute path to display."
+                }
+              ]
+            },
+            "description": "Ask the CLIENT to show a file to the user. Returns only `{\"path\", \"exists\"}` — it does not serve content. Open WebUI intercepts the tool result and opens its preview pane. Exposed as the `display_file` tool; models are told to use it when the user says “show me” rather than when the model itself needs to read the file. Errors: 401."
+          },
+          "response": []
+        },
+        {
+          "name": "POST /files/write",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-User-Id",
+                "value": "{{openTerminalUserId}}",
+                "description": "Open WebUI user id. In multi-user mode this selects which Linux account and /home/<user> the call runs against; the openwebui backend sets it automatically. Omit (or clear the variable) to act as the default `user` account."
+              },
+              {
+                "key": "X-Session-Id",
+                "value": "{{openTerminalSessionId}}",
+                "description": "Chat/session id. Scopes the remembered working directory (GET/POST /files/cwd) and the process list returned by GET /execute. Optional."
+              }
+            ],
+            "url": {
+              "raw": "{{openTerminal}}/files/write",
+              "host": [
+                "{{openTerminal}}"
+              ],
+              "path": [
+                "files",
+                "write"
+              ]
+            },
+            "description": "Write TEXT content to a path, creating parent directories and overwriting any existing file. Returns `{\"path\", \"size\"}` where size is the UTF-8 byte length. There is no append mode and no binary mode — use /files/upload for bytes. Exposed as the `write_file` tool. Errors: 400 on an OS error (permissions, ENOSPC), 401.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"path\": \"hello.py\",\n  \"content\": \"print('hello from open-terminal')\\n\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "POST /files/replace",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-User-Id",
+                "value": "{{openTerminalUserId}}",
+                "description": "Open WebUI user id. In multi-user mode this selects which Linux account and /home/<user> the call runs against; the openwebui backend sets it automatically. Omit (or clear the variable) to act as the default `user` account."
+              },
+              {
+                "key": "X-Session-Id",
+                "value": "{{openTerminalSessionId}}",
+                "description": "Chat/session id. Scopes the remembered working directory (GET/POST /files/cwd) and the process list returned by GET /execute. Optional."
+              }
+            ],
+            "url": {
+              "raw": "{{openTerminal}}/files/replace",
+              "host": [
+                "{{openTerminal}}"
+              ],
+              "path": [
+                "files",
+                "replace"
+              ]
+            },
+            "description": "Exact find-and-replace inside one file, applied sequentially. Each chunk takes `target` / `replacement` and may narrow the search with `start_line` / `end_line`, or opt into replacing every occurrence with `allow_multiple` (default false — an ambiguous match is an error, not a silent first-hit). This is the surgical-edit tool models should reach for instead of rewriting a file with /files/write. Exposed as `replace_file_content`. Errors: 404 file not found, 400 target not found or ambiguous, 401.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"path\": \"hello.py\",\n  \"replacements\": [\n    {\n      \"target\": \"hello from open-terminal\",\n      \"replacement\": \"hello from the Zeo terminal\",\n      \"allow_multiple\": false\n    }\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "POST /files/mkdir",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-User-Id",
+                "value": "{{openTerminalUserId}}",
+                "description": "Open WebUI user id. In multi-user mode this selects which Linux account and /home/<user> the call runs against; the openwebui backend sets it automatically. Omit (or clear the variable) to act as the default `user` account."
+              }
+            ],
+            "url": {
+              "raw": "{{openTerminal}}/files/mkdir",
+              "host": [
+                "{{openTerminal}}"
+              ],
+              "path": [
+                "files",
+                "mkdir"
+              ]
+            },
+            "description": "Create a directory, parents included. Returns `{\"path\"}`. Idempotent for an existing directory. Not in the OpenAPI schema (models create directories with a shell command instead). Errors: 400 on an OS error, 401.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"path\": \"/home/user/projects/demo\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "POST /files/move",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-User-Id",
+                "value": "{{openTerminalUserId}}",
+                "description": "Open WebUI user id. In multi-user mode this selects which Linux account and /home/<user> the call runs against; the openwebui backend sets it automatically. Omit (or clear the variable) to act as the default `user` account."
+              }
+            ],
+            "url": {
+              "raw": "{{openTerminal}}/files/move",
+              "host": [
+                "{{openTerminal}}"
+              ],
+              "path": [
+                "files",
+                "move"
+              ]
+            },
+            "description": "Move or rename a file or directory. Returns `{\"source\", \"destination\"}`. Deliberately non-destructive: it refuses rather than clobbering. Not in the OpenAPI schema. Errors: 404 source missing, 400 destination's parent directory missing, 409 destination already exists, 401.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"source\": \"/home/user/hello.py\",\n  \"destination\": \"/home/user/projects/demo/hello.py\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "DELETE /files/delete",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "X-User-Id",
+                "value": "{{openTerminalUserId}}",
+                "description": "Open WebUI user id. In multi-user mode this selects which Linux account and /home/<user> the call runs against; the openwebui backend sets it automatically. Omit (or clear the variable) to act as the default `user` account."
+              }
+            ],
+            "url": {
+              "raw": "{{openTerminal}}/files/delete?path=/home/user/projects/demo/hello.py",
+              "host": [
+                "{{openTerminal}}"
+              ],
+              "path": [
+                "files",
+                "delete"
+              ],
+              "query": [
+                {
+                  "key": "path",
+                  "value": "/home/user/projects/demo/hello.py",
+                  "description": "Path to delete."
+                }
+              ]
+            },
+            "description": "Permanently delete a file or directory (recursively). Returns `{\"path\", \"type\"}` where type is `file` or `directory`. No trash, no undo — the `open_terminal_home` volume has no snapshotting. Not in the OpenAPI schema. Errors: 404 path not found, 400 on an OS error, 401."
+          },
+          "response": []
+        },
+        {
+          "name": "POST /files/upload",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-User-Id",
+                "value": "{{openTerminalUserId}}",
+                "description": "Open WebUI user id. In multi-user mode this selects which Linux account and /home/<user> the call runs against; the openwebui backend sets it automatically. Omit (or clear the variable) to act as the default `user` account."
+              }
+            ],
+            "url": {
+              "raw": "{{openTerminal}}/files/upload?directory=/home/user/uploads",
+              "host": [
+                "{{openTerminal}}"
+              ],
+              "path": [
+                "files",
+                "upload"
+              ],
+              "query": [
+                {
+                  "key": "directory",
+                  "value": "/home/user/uploads",
+                  "description": "Destination directory. Created if it does not exist."
+                }
+              ]
+            },
+            "description": "Upload one file via multipart/form-data into `directory`, which is created if missing. The stored filename is the basename of the uploaded file; the `directory` query param controls the location. Returns `{\"path\", \"size\"}`.\n\nThis is what a chat-composer drag-and-drop hits when the connection has `config.chat_uploads: \"filesystem\"` — files land in the user's terminal home instead of Open WebUI's RAG store. In Postman, pick a local file in the `file` form field (the value is left blank on purpose). Errors: 403 permission denied, 400 on an OS error, 401.",
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": [],
+                  "description": "The file to upload. Select one in Postman — the filename's basename becomes the name on disk."
+                }
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "POST /files/archive",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-User-Id",
+                "value": "{{openTerminalUserId}}",
+                "description": "Open WebUI user id. In multi-user mode this selects which Linux account and /home/<user> the call runs against; the openwebui backend sets it automatically. Omit (or clear the variable) to act as the default `user` account."
+              }
+            ],
+            "url": {
+              "raw": "{{openTerminal}}/files/archive",
+              "host": [
+                "{{openTerminal}}"
+              ],
+              "path": [
+                "files",
+                "archive"
+              ]
+            },
+            "description": "Bundle files and/or directories into a single ZIP and stream it back as `application/zip`. Directories are walked recursively. The download filename is derived from the input: the basename for a single path, `download.zip` for several. Backs the file browser's multi-select download. Not in the OpenAPI schema. Errors: 400 empty `paths`, 404 when any path is missing, 401.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"paths\": [\n    \"/home/user/projects/demo\",\n    \"/home/user/notes.md\"\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "POST /files/compare",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-User-Id",
+                "value": "{{openTerminalUserId}}",
+                "description": "Open WebUI user id. In multi-user mode this selects which Linux account and /home/<user> the call runs against; the openwebui backend sets it automatically. Omit (or clear the variable) to act as the default `user` account."
+              },
+              {
+                "key": "X-Session-Id",
+                "value": "{{openTerminalSessionId}}",
+                "description": "Chat/session id. Scopes the remembered working directory (GET/POST /files/cwd) and the process list returned by GET /execute. Optional."
+              }
+            ],
+            "url": {
+              "raw": "{{openTerminal}}/files/compare",
+              "host": [
+                "{{openTerminal}}"
+              ],
+              "path": [
+                "files",
+                "compare"
+              ]
+            },
+            "description": "Diff two files (or a file against supplied content) for the UI's side-by-side view. Not in the OpenAPI schema and not a model tool; the request shape is `CompareRequest` in `open_terminal/main.py` and the diff logic lives in `open_terminal/utils/file_compare.py`. Included here for completeness — check the source for the current field set before relying on it. Errors: 401.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"path\": \"/home/user/hello.py\",\n  \"other_path\": \"/home/user/hello.py.bak\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Search",
+      "description": "Content search (`grep`), pattern search (`glob`), ranked filename search (`search`), and the agent-skills discovery endpoints. The first three are function-calling tools; `/files/matches` and `/skills*` are UI surface only.",
+      "item": [
+        {
+          "name": "GET /files/grep",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-User-Id",
+                "value": "{{openTerminalUserId}}",
+                "description": "Open WebUI user id. In multi-user mode this selects which Linux account and /home/<user> the call runs against; the openwebui backend sets it automatically. Omit (or clear the variable) to act as the default `user` account."
+              },
+              {
+                "key": "X-Session-Id",
+                "value": "{{openTerminalSessionId}}",
+                "description": "Chat/session id. Scopes the remembered working directory (GET/POST /files/cwd) and the process list returned by GET /execute. Optional."
+              }
+            ],
+            "url": {
+              "raw": "{{openTerminal}}/files/grep?query=TODO&path=.&regex=true&case_insensitive=false&include=*.py&match_per_line=true&max_results=50",
+              "host": [
+                "{{openTerminal}}"
+              ],
+              "path": [
+                "files",
+                "grep"
+              ],
+              "query": [
+                {
+                  "key": "query",
+                  "value": "TODO",
+                  "description": "Text or regex to search for. Required."
+                },
+                {
+                  "key": "path",
+                  "value": ".",
+                  "description": "Directory or single file to search. Default \".\"."
+                },
+                {
+                  "key": "regex",
+                  "value": "true",
+                  "description": "Treat `query` as a regex. Set false for a literal search. Default true."
+                },
+                {
+                  "key": "case_insensitive",
+                  "value": "false",
+                  "description": "Case-insensitive matching. Default false."
+                },
+                {
+                  "key": "include",
+                  "value": "*.py",
+                  "description": "Glob filter; repeat the param for several patterns. A file must match at least one."
+                },
+                {
+                  "key": "match_per_line",
+                  "value": "true",
+                  "description": "true = one result per matching line with line numbers; false = matching filenames only. Default true."
+                },
+                {
+                  "key": "max_results",
+                  "value": "50",
+                  "description": "Cap on matches returned, 1-500. Default 50."
+                }
+              ]
+            },
+            "description": "Search file CONTENTS across a directory tree. Returns structured matches with file path, line number, and the matching line; binary files are skipped. Set `match_per_line=false` to get just the list of matching filenames. Exposed as the `grep_search` tool. Errors: 404 search path not found, 400 invalid regex, 401."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /files/glob",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-User-Id",
+                "value": "{{openTerminalUserId}}",
+                "description": "Open WebUI user id. In multi-user mode this selects which Linux account and /home/<user> the call runs against; the openwebui backend sets it automatically. Omit (or clear the variable) to act as the default `user` account."
+              },
+              {
+                "key": "X-Session-Id",
+                "value": "{{openTerminalSessionId}}",
+                "description": "Chat/session id. Scopes the remembered working directory (GET/POST /files/cwd) and the process list returned by GET /execute. Optional."
+              }
+            ],
+            "url": {
+              "raw": "{{openTerminal}}/files/glob?pattern=**/*.py&path=.&exclude=**/node_modules/**&type=any&max_results=50",
+              "host": [
+                "{{openTerminal}}"
+              ],
+              "path": [
+                "files",
+                "glob"
+              ],
+              "query": [
+                {
+                  "key": "pattern",
+                  "value": "**/*.py",
+                  "description": "Glob pattern. Required."
+                },
+                {
+                  "key": "path",
+                  "value": ".",
+                  "description": "Directory to search within. Default \".\"."
+                },
+                {
+                  "key": "exclude",
+                  "value": "**/node_modules/**",
+                  "description": "Glob patterns to exclude; repeat the param for several."
+                },
+                {
+                  "key": "type",
+                  "value": "any",
+                  "description": "Type filter: `file`, `directory`, or `any`. Default any."
+                },
+                {
+                  "key": "max_results",
+                  "value": "50",
+                  "description": "Cap on matches returned, 1-500. Default 50."
+                }
+              ]
+            },
+            "description": "Find files by glob PATTERN. Returns relative path, type, size, and mtime per hit. Use this when you know the shape of the name; use /files/search when you only know part of it. Exposed as the `glob_search` tool. Errors: 404 search directory not found, 401."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /files/search",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-User-Id",
+                "value": "{{openTerminalUserId}}",
+                "description": "Open WebUI user id. In multi-user mode this selects which Linux account and /home/<user> the call runs against; the openwebui backend sets it automatically. Omit (or clear the variable) to act as the default `user` account."
+              },
+              {
+                "key": "X-Session-Id",
+                "value": "{{openTerminalSessionId}}",
+                "description": "Chat/session id. Scopes the remembered working directory (GET/POST /files/cwd) and the process list returned by GET /execute. Optional."
+              }
+            ],
+            "url": {
+              "raw": "{{openTerminal}}/files/search?query=hello&path=.&limit=20&type=any&show_hidden=false",
+              "host": [
+                "{{openTerminal}}"
+              ],
+              "path": [
+                "files",
+                "search"
+              ],
+              "query": [
+                {
+                  "key": "query",
+                  "value": "hello",
+                  "description": "Filename search term. Empty returns a ranked listing."
+                },
+                {
+                  "key": "path",
+                  "value": ".",
+                  "description": "Directory to search within. Default \".\"."
+                },
+                {
+                  "key": "limit",
+                  "value": "20",
+                  "description": "Maximum matches, 1-100. Default 20."
+                },
+                {
+                  "key": "type",
+                  "value": "any",
+                  "description": "Type filter: `file`, `directory`, or `any`. Default any."
+                },
+                {
+                  "key": "show_hidden",
+                  "value": "false",
+                  "description": "Include dotfiles and dot-directories. Default false."
+                }
+              ]
+            },
+            "description": "Fuzzy, RANKED search by filename — the file browser's quick-open box. Prefers git-tracked files where the directory is a repo. Exposed as the `search_files` tool. Errors: 404 search directory not found, 401."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /files/matches",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-User-Id",
+                "value": "{{openTerminalUserId}}",
+                "description": "Open WebUI user id. In multi-user mode this selects which Linux account and /home/<user> the call runs against; the openwebui backend sets it automatically. Omit (or clear the variable) to act as the default `user` account."
+              },
+              {
+                "key": "X-Session-Id",
+                "value": "{{openTerminalSessionId}}",
+                "description": "Chat/session id. Scopes the remembered working directory (GET/POST /files/cwd) and the process list returned by GET /execute. Optional."
+              }
+            ],
+            "url": {
+              "raw": "{{openTerminal}}/files/matches?query=TODO&path=.",
+              "host": [
+                "{{openTerminal}}"
+              ],
+              "path": [
+                "files",
+                "matches"
+              ],
+              "query": [
+                {
+                  "key": "query",
+                  "value": "TODO",
+                  "description": "Text or regex to match."
+                },
+                {
+                  "key": "path",
+                  "value": ".",
+                  "description": "Directory or file to search."
+                }
+              ]
+            },
+            "description": "Companion to /files/grep used by the UI to fetch match context for an already-known query. Not in the OpenAPI schema and not a model tool; parameters mirror the grep endpoint. Check `open_terminal/main.py` for the current signature before depending on it. Errors: 404, 401."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /skills",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-User-Id",
+                "value": "{{openTerminalUserId}}",
+                "description": "Open WebUI user id. In multi-user mode this selects which Linux account and /home/<user> the call runs against; the openwebui backend sets it automatically. Omit (or clear the variable) to act as the default `user` account."
+              }
+            ],
+            "url": {
+              "raw": "{{openTerminal}}/skills",
+              "host": [
+                "{{openTerminal}}"
+              ],
+              "path": [
+                "skills"
+              ]
+            },
+            "description": "List agent “skills” found in the user's home under `.agents/skills`, `.cptr/skills`, `.claude/skills`, or `.codex/skills` — each a directory containing a `SKILL.md`. Returns id, name, description, location, and scope per skill. A user can drop a skill folder into their terminal home and have it show up here. Not in the OpenAPI schema. Errors: 401."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /skills/read",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-User-Id",
+                "value": "{{openTerminalUserId}}",
+                "description": "Open WebUI user id. In multi-user mode this selects which Linux account and /home/<user> the call runs against; the openwebui backend sets it automatically. Omit (or clear the variable) to act as the default `user` account."
+              }
+            ],
+            "url": {
+              "raw": "{{openTerminal}}/skills/read?name=my-skill",
+              "host": [
+                "{{openTerminal}}"
+              ],
+              "path": [
+                "skills",
+                "read"
+              ],
+              "query": [
+                {
+                  "key": "name",
+                  "value": "my-skill",
+                  "description": "Skill name exactly as GET /skills reported it."
+                }
+              ]
+            },
+            "description": "Read one skill by NAME (as returned by GET /skills, not by path): its frontmatter-stripped body plus the list of sibling resource files. Not in the OpenAPI schema. Errors: 404 skill not found, 401."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Execute",
+      "description": "Non-interactive command execution. Commands always run in the background behind an id; `wait` only controls how long the server holds the response open. Output is read non-destructively by offset, so several readers can follow the same process. Processes are scoped by the X-User-Id + X-Session-Id pair — GET /execute with different headers shows a different list.",
+      "item": [
+        {
+          "name": "POST /execute",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-User-Id",
+                "value": "{{openTerminalUserId}}",
+                "description": "Open WebUI user id. In multi-user mode this selects which Linux account and /home/<user> the call runs against; the openwebui backend sets it automatically. Omit (or clear the variable) to act as the default `user` account."
+              },
+              {
+                "key": "X-Session-Id",
+                "value": "{{openTerminalSessionId}}",
+                "description": "Chat/session id. Scopes the remembered working directory (GET/POST /files/cwd) and the process list returned by GET /execute. Optional."
+              }
+            ],
+            "url": {
+              "raw": "{{openTerminal}}/execute?wait=10&tail=200",
+              "host": [
+                "{{openTerminal}}"
+              ],
+              "path": [
+                "execute"
+              ],
+              "query": [
+                {
+                  "key": "wait",
+                  "value": "10",
+                  "description": "Seconds to block before returning, 0-300. Output is included inline if the command finishes in time. Omit to return immediately (subject to OPEN_TERMINAL_EXECUTE_TIMEOUT)."
+                },
+                {
+                  "key": "tail",
+                  "value": "200",
+                  "description": "Return only the last N output entries. Optional, >= 1."
+                }
+              ]
+            },
+            "description": "Run a shell command. The command always starts in the BACKGROUND and is identified by the returned `id`; `wait` only controls how long the server blocks before answering. Supports chaining, pipes, and redirection. Response: `{id, command, status, exit_code, output, truncated, next_offset, log_path}`.\n\nWith `wait` omitted the server falls back to OPEN_TERMINAL_EXECUTE_TIMEOUT (empty in this deployment → return immediately), so the normal flow is: POST /execute → poll GET /execute/{id}/status with the previous `next_offset` until `status` is `done`. In multi-user mode the command runs as X-User-Id's Linux account via `sudo -u`.\n\nEgress is allowlisted (OPEN_TERMINAL_ALLOWED_DOMAINS) — a curl to an unlisted host fails at DNS, not at connect. Exposed as the `run_command` tool. Errors: 401.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"command\": \"python -c \\\"import sys; print(sys.version)\\\"\",\n  \"cwd\": null,\n  \"env\": null\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "POST /execute — with cwd + env",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-User-Id",
+                "value": "{{openTerminalUserId}}",
+                "description": "Open WebUI user id. In multi-user mode this selects which Linux account and /home/<user> the call runs against; the openwebui backend sets it automatically. Omit (or clear the variable) to act as the default `user` account."
+              },
+              {
+                "key": "X-Session-Id",
+                "value": "{{openTerminalSessionId}}",
+                "description": "Chat/session id. Scopes the remembered working directory (GET/POST /files/cwd) and the process list returned by GET /execute. Optional."
+              }
+            ],
+            "url": {
+              "raw": "{{openTerminal}}/execute?wait=30",
+              "host": [
+                "{{openTerminal}}"
+              ],
+              "path": [
+                "execute"
+              ],
+              "query": [
+                {
+                  "key": "wait",
+                  "value": "30",
+                  "description": "Seconds to block before returning, 0-300."
+                }
+              ]
+            },
+            "description": "Same endpoint, showing the optional `cwd` (relative paths resolve against the session cwd) and `env` (extra variables merged into the subprocess environment, not replacing it). Useful for a build step that needs a token or a non-default working directory. Errors: 401.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"command\": \"pip install --quiet httpx && python -c \\\"import httpx; print(httpx.__version__)\\\"\",\n  \"cwd\": \"/home/user/projects/demo\",\n  \"env\": {\n    \"PIP_DISABLE_PIP_VERSION_CHECK\": \"1\"\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "GET /execute",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-User-Id",
+                "value": "{{openTerminalUserId}}",
+                "description": "Open WebUI user id. In multi-user mode this selects which Linux account and /home/<user> the call runs against; the openwebui backend sets it automatically. Omit (or clear the variable) to act as the default `user` account."
+              },
+              {
+                "key": "X-Session-Id",
+                "value": "{{openTerminalSessionId}}",
+                "description": "Chat/session id. Scopes the remembered working directory (GET/POST /files/cwd) and the process list returned by GET /execute. Optional."
+              }
+            ],
+            "url": {
+              "raw": "{{openTerminal}}/execute",
+              "host": [
+                "{{openTerminal}}"
+              ],
+              "path": [
+                "execute"
+              ]
+            },
+            "description": "List tracked processes — running, done, and killed — for THIS X-User-Id and X-Session-Id pair. Both headers participate in the filter, so a request with neither set sees only processes started with neither set. Returns id, command, status, exit_code, log_path. Exposed as the `list_processes` tool. Errors: 401."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /execute/:processId/status",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-User-Id",
+                "value": "{{openTerminalUserId}}",
+                "description": "Open WebUI user id. In multi-user mode this selects which Linux account and /home/<user> the call runs against; the openwebui backend sets it automatically. Omit (or clear the variable) to act as the default `user` account."
+              },
+              {
+                "key": "X-Session-Id",
+                "value": "{{openTerminalSessionId}}",
+                "description": "Chat/session id. Scopes the remembered working directory (GET/POST /files/cwd) and the process list returned by GET /execute. Optional."
+              }
+            ],
+            "url": {
+              "raw": "{{openTerminal}}/execute/:processId/status?wait=10&offset=0&tail=200",
+              "host": [
+                "{{openTerminal}}"
+              ],
+              "path": [
+                "execute",
+                ":processId",
+                "status"
+              ],
+              "query": [
+                {
+                  "key": "wait",
+                  "value": "10",
+                  "description": "Seconds to wait for the process to finish, 0-300. Returns early on exit. Omit to return immediately."
+                },
+                {
+                  "key": "offset",
+                  "value": "0",
+                  "description": "Output entries to skip. Use `next_offset` from the previous response. Default 0."
+                },
+                {
+                  "key": "tail",
+                  "value": "200",
+                  "description": "Return only the last N output entries. Optional, >= 1."
+                }
+              ],
+              "variable": [
+                {
+                  "key": "processId",
+                  "value": "{{openTerminalProcessId}}",
+                  "description": "Process id from POST /execute, e.g. `20260918-143012-a1b2c3`. Paste it into the `openTerminalProcessId` collection variable and it is reused across the execute requests."
+                }
+              ]
+            },
+            "description": "Poll a command: status, exit code, and output SINCE `offset`. Reads are non-consuming — each reader keeps its own offset — so pass back the `next_offset` from the previous response to stream incrementally. `wait` blocks until the process exits or the timeout elapses, whichever comes first.\n\nFinished processes and their JSONL logs are cleaned up after OPEN_TERMINAL_LOG_RETENTION (7 days); logs stop growing past OPEN_TERMINAL_MAX_LOG_SIZE (50 MB) while the process keeps running. Exposed as `get_process_status`. Errors: 404 unknown process (or one owned by a different user/session), 401."
+          },
+          "response": []
+        },
+        {
+          "name": "POST /execute/:processId/input",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-User-Id",
+                "value": "{{openTerminalUserId}}",
+                "description": "Open WebUI user id. In multi-user mode this selects which Linux account and /home/<user> the call runs against; the openwebui backend sets it automatically. Omit (or clear the variable) to act as the default `user` account."
+              },
+              {
+                "key": "X-Session-Id",
+                "value": "{{openTerminalSessionId}}",
+                "description": "Chat/session id. Scopes the remembered working directory (GET/POST /files/cwd) and the process list returned by GET /execute. Optional."
+              }
+            ],
+            "url": {
+              "raw": "{{openTerminal}}/execute/:processId/input",
+              "host": [
+                "{{openTerminal}}"
+              ],
+              "path": [
+                "execute",
+                ":processId",
+                "input"
+              ],
+              "variable": [
+                {
+                  "key": "processId",
+                  "value": "{{openTerminalProcessId}}",
+                  "description": "Process id from POST /execute."
+                }
+              ]
+            },
+            "description": "Send text to a running process's stdin. Newlines are NOT added — include `\\n` to submit a line. Returns `{\"status\": \"ok\"}`. Use this for a command that prompts (an interactive installer, a REPL); for a real shell, use the /api/terminals WebSocket instead. Errors: 404 unknown process, 401.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"input\": \"yes\\n\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "DELETE /execute/:processId",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "X-User-Id",
+                "value": "{{openTerminalUserId}}",
+                "description": "Open WebUI user id. In multi-user mode this selects which Linux account and /home/<user> the call runs against; the openwebui backend sets it automatically. Omit (or clear the variable) to act as the default `user` account."
+              },
+              {
+                "key": "X-Session-Id",
+                "value": "{{openTerminalSessionId}}",
+                "description": "Chat/session id. Scopes the remembered working directory (GET/POST /files/cwd) and the process list returned by GET /execute. Optional."
+              }
+            ],
+            "url": {
+              "raw": "{{openTerminal}}/execute/:processId?force=false",
+              "host": [
+                "{{openTerminal}}"
+              ],
+              "path": [
+                "execute",
+                ":processId"
+              ],
+              "query": [
+                {
+                  "key": "force",
+                  "value": "false",
+                  "description": "Send SIGKILL instead of SIGTERM. Default false."
+                }
+              ],
+              "variable": [
+                {
+                  "key": "processId",
+                  "value": "{{openTerminalProcessId}}",
+                  "description": "Process id from POST /execute."
+                }
+              ]
+            },
+            "description": "Terminate a running command. SIGTERM by default so it can clean up; `force=true` sends SIGKILL. Returns `{\"status\": \"killed\"}` — also for an already-finished process, which is then just marked finished. Exposed as `kill_process`. Errors: 404 unknown process, 401."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Terminals (PTY)",
+      "description": "Interactive pseudo-terminal sessions — the xterm pane in the chat UI — plus the two endpoints a model uses to read from and type into the shell the human already has open.\n\n**The attach endpoint is a WebSocket and cannot be exercised from a collection request.** `GET (ws) /api/terminals/{session_id}` upgrades, then uses FIRST-MESSAGE AUTH: the client's first frame must be the text JSON `{\"type\": \"auth\", \"token\": \"<OPEN_TERMINAL_API_KEY>\"}` — there is no Authorization header on the upgrade, so the collection-level bearer auth does not apply. After that, keystrokes are sent as BINARY frames and PTY output arrives as binary frames; resize with a text frame `{\"type\": \"resize\", \"cols\": 120, \"rows\": 40}`. Use Postman's separate WebSocket request type (New → WebSocket), `websocat`, or the Open WebUI UI itself.\n\nSession count is capped globally by OPEN_TERMINAL_MAX_SESSIONS (16); POST /api/terminals returns 429 past it.",
+      "item": [
+        {
+          "name": "POST /api/terminals",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-User-Id",
+                "value": "{{openTerminalUserId}}",
+                "description": "Open WebUI user id. In multi-user mode this selects which Linux account and /home/<user> the call runs against; the openwebui backend sets it automatically. Omit (or clear the variable) to act as the default `user` account."
+              },
+              {
+                "key": "X-Session-Id",
+                "value": "{{openTerminalSessionId}}",
+                "description": "Chat/session id. Scopes the remembered working directory (GET/POST /files/cwd) and the process list returned by GET /execute. Optional."
+              }
+            ],
+            "url": {
+              "raw": "{{openTerminal}}/api/terminals",
+              "host": [
+                "{{openTerminal}}"
+              ],
+              "path": [
+                "api",
+                "terminals"
+              ]
+            },
+            "description": "Create an interactive PTY session and return its 8-char id. Attach to it over the WebSocket (see this folder's description — not runnable from a Postman collection request). The shell starts in the session cwd when X-Session-Id is set, otherwise in the user's home; in multi-user mode it runs as X-User-Id's Linux account.\n\nDead sessions are pruned before the limit is checked. Not in the OpenAPI schema. Errors: 429 when OPEN_TERMINAL_MAX_SESSIONS (16) live sessions already exist, 503 when no PTY is available (out of PTY devices, or the platform has none), 401."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /api/terminals",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-User-Id",
+                "value": "{{openTerminalUserId}}",
+                "description": "Open WebUI user id. In multi-user mode this selects which Linux account and /home/<user> the call runs against; the openwebui backend sets it automatically. Omit (or clear the variable) to act as the default `user` account."
+              }
+            ],
+            "url": {
+              "raw": "{{openTerminal}}/api/terminals",
+              "host": [
+                "{{openTerminal}}"
+              ],
+              "path": [
+                "api",
+                "terminals"
+              ]
+            },
+            "description": "List the caller's live PTY sessions as `[{id, created_at, pid}]`. Only sessions owned by this X-User-Id are returned, and dead ones are reaped as a side effect of the call. Not in the OpenAPI schema. Errors: 401."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /api/terminals/:terminalSessionId",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-User-Id",
+                "value": "{{openTerminalUserId}}",
+                "description": "Open WebUI user id. In multi-user mode this selects which Linux account and /home/<user> the call runs against; the openwebui backend sets it automatically. Omit (or clear the variable) to act as the default `user` account."
+              }
+            ],
+            "url": {
+              "raw": "{{openTerminal}}/api/terminals/:terminalSessionId",
+              "host": [
+                "{{openTerminal}}"
+              ],
+              "path": [
+                "api",
+                "terminals",
+                ":terminalSessionId"
+              ],
+              "variable": [
+                {
+                  "key": "terminalSessionId",
+                  "value": "{{openTerminalPtyId}}",
+                  "description": "8-char PTY session id returned by POST /api/terminals. Note this is the PTY handle — unrelated to `openTerminalSessionId`, which is the chat/session id sent in the X-Session-Id header."
+                }
+              ]
+            },
+            "description": "Info about one PTY session: `{id, created_at, pid}`. A session owned by someone else is reported as 404, not 403. Not in the OpenAPI schema. Errors: 404 unknown, dead, or not yours; 401."
+          },
+          "response": []
+        },
+        {
+          "name": "DELETE /api/terminals/:terminalSessionId",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "X-User-Id",
+                "value": "{{openTerminalUserId}}",
+                "description": "Open WebUI user id. In multi-user mode this selects which Linux account and /home/<user> the call runs against; the openwebui backend sets it automatically. Omit (or clear the variable) to act as the default `user` account."
+              }
+            ],
+            "url": {
+              "raw": "{{openTerminal}}/api/terminals/:terminalSessionId",
+              "host": [
+                "{{openTerminal}}"
+              ],
+              "path": [
+                "api",
+                "terminals",
+                ":terminalSessionId"
+              ],
+              "variable": [
+                {
+                  "key": "terminalSessionId",
+                  "value": "{{openTerminalPtyId}}",
+                  "description": "8-char PTY session id returned by POST /api/terminals."
+                }
+              ]
+            },
+            "description": "Kill a PTY session and free its slot against OPEN_TERMINAL_MAX_SESSIONS. Returns `{\"status\": \"deleted\"}`. Not in the OpenAPI schema. Errors: 404 unknown or not yours, 401."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /api/terminals/user/output",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-User-Id",
+                "value": "{{openTerminalUserId}}",
+                "description": "Open WebUI user id. In multi-user mode this selects which Linux account and /home/<user> the call runs against; the openwebui backend sets it automatically. Omit (or clear the variable) to act as the default `user` account."
+              },
+              {
+                "key": "X-Session-Id",
+                "value": "{{openTerminalSessionId}}",
+                "description": "Chat/session id. Scopes the remembered working directory (GET/POST /files/cwd) and the process list returned by GET /execute. Optional."
+              }
+            ],
+            "url": {
+              "raw": "{{openTerminal}}/api/terminals/user/output",
+              "host": [
+                "{{openTerminal}}"
+              ],
+              "path": [
+                "api",
+                "terminals",
+                "user",
+                "output"
+              ]
+            },
+            "description": "Read the recent output buffer of the user's ALREADY-CONNECTED shell — the pane they have open in the chat UI — without creating one. Returns `{\"output\": \"...\"}`. This is how a model peeks at what the human is doing before typing into their terminal; models are told to read before sending. Exposed as the `read_user_terminal` tool. Errors: 401 (and a 4xx when the user has no connected shell)."
+          },
+          "response": []
+        },
+        {
+          "name": "POST /api/terminals/user/input",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-User-Id",
+                "value": "{{openTerminalUserId}}",
+                "description": "Open WebUI user id. In multi-user mode this selects which Linux account and /home/<user> the call runs against; the openwebui backend sets it automatically. Omit (or clear the variable) to act as the default `user` account."
+              },
+              {
+                "key": "X-Session-Id",
+                "value": "{{openTerminalSessionId}}",
+                "description": "Chat/session id. Scopes the remembered working directory (GET/POST /files/cwd) and the process list returned by GET /execute. Optional."
+              }
+            ],
+            "url": {
+              "raw": "{{openTerminal}}/api/terminals/user/input",
+              "host": [
+                "{{openTerminal}}"
+              ],
+              "path": [
+                "api",
+                "terminals",
+                "user",
+                "input"
+              ]
+            },
+            "description": "Type literal text into the user's connected shell (or whatever foreground program it is running). Include a real newline to submit. This does NOT create a shell and does NOT wait for the command to finish — read /api/terminals/user/output afterwards. Exposed as the `send_user_terminal_input` tool. Errors: 409 when the user's shell has disconnected, 401.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"input\": \"ls -la\\n\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        }
+      ]
+    }
+  ]
+}

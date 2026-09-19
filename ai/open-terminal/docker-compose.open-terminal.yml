@@ -1,0 +1,159 @@
+networks:
+  # Dedicated bridge for the terminal, mirroring the sandbox subsystem's
+  # posture. open-terminal is a ROOT-capable shell that a model drives, so it
+  # MUST NOT sit on ai_shared: from there it could reach roofix-db and
+  # sandbox-db (dev-default credentials), minio (dev-default root creds),
+  # litellm (every virtual key's model surface), n8n (encrypted credential
+  # store), phoenix-mcp, and sandbox-runner — which mounts docker.sock.
+  #
+  # NOT `internal: true`, unlike sandbox_net: the whole point of the `latest`
+  # image variant is runtime `pip install` / `apt-get install`, so the
+  # container needs a default gateway. Egress is narrowed instead by
+  # OPEN_TERMINAL_ALLOWED_DOMAINS (dnsmasq + iptables, inside the container).
+  #
+  # Only openwebui joins this network besides open-terminal itself — it is
+  # declared in ai/openwebui/docker-compose.openwebui.yml too, and that
+  # service keeps `shared` as well. Created by `make network`.
+  terminal:
+    external: true
+    name: terminal_net
+
+services:
+  open-terminal:
+    # Pinned release tag. Upstream publishes UNPREFIXED semver tags for the
+    # default (fat) variant — `0.13.0`, plus a rolling `0.13` and `latest`.
+    # There is no `v0.13.0` image tag even though the git tag has the `v`
+    # (.github/workflows/docker.yml → docker/metadata-action emits
+    # `type=raw,value=<version><suffix>` from pyproject.toml's version, with
+    # an empty suffix for the default variant, so the registry holds
+    # `0.13.0` / `0.13` / `latest` and never `v0.13.0`).
+    # Never use `latest` here: a cached `latest` on this box has
+    # been stale before. Bump OPEN_TERMINAL_VERSION in .env, then
+    #   make up open-terminal
+    #
+    # The default (fat, ~4 GB) variant is required, not a preference:
+    # `slim` / `alpine` support neither OPEN_TERMINAL_MULTI_USER nor the
+    # runtime package-install env vars.
+    image: ghcr.io/open-webui/open-terminal:${OPEN_TERMINAL_VERSION}
+    container_name: open-terminal
+    restart: unless-stopped
+    networks:
+      - terminal
+    # NO host port, deliberately. Every request arrives from the openwebui
+    # BACKEND over terminal_net (backend/open_webui/routers/terminals.py
+    # proxies them), so the API key never reaches a browser and nothing on
+    # the LAN can talk to the shell. Publishing a port here would hand
+    # anyone who learns OPEN_TERMINAL_API_KEY a root-capable shell.
+    # To debug from the host, `docker exec` into openwebui instead — see
+    # OPEN_TERMINAL.md § Verifying the connection.
+    #
+    # NOTE: do NOT add `security_opt: [no-new-privileges:true]`. The image
+    # runs as the unprivileged `user` account and relies on passwordless
+    # sudo for the egress firewall, runtime package installs, and multi-user
+    # account provisioning — no-new-privileges breaks all three at boot.
+    cap_add:
+      # Required by the egress firewall in the image's entrypoint.sh:
+      # it runs `iptables` + `ipset` + `dnsmasq`, then permanently drops
+      # CAP_NET_ADMIN with `capsh --drop=cap_net_admin` before exec'ing the
+      # server. Dropping from the bounding set additionally needs CAP_SETPCAP,
+      # which is already in Docker's default capability set — add SETPCAP
+      # explicitly only if this host's daemon trims the defaults (the failure
+      # is "unable to raise CAP_SETPCAP for BSET changes" and the container
+      # exits at boot). See OPEN_TERMINAL.md § Troubleshooting.
+      - NET_ADMIN
+    environment:
+      # All values are sourced from .env — edit there, not here.
+
+      # REQUIRED. Compose refuses to start when unset. Presented by the
+      # openwebui backend as `Authorization: Bearer <key>` on every proxied
+      # request; it must match the `key` field of the TERMINAL_SERVER_CONNECTIONS
+      # entry in ai/openwebui/docker-compose.openwebui.yml, which reads the
+      # SAME .env variable so the two can never drift.
+      # Leaving it unset would make open-terminal generate a random key and
+      # log it — and the connection would silently 401.
+      OPEN_TERMINAL_API_KEY: "${OPEN_TERMINAL_API_KEY:?OPEN_TERMINAL_API_KEY must be set; see ai/open-terminal/OPEN_TERMINAL.md}"
+
+      # Per-user Unix accounts. The openwebui proxy forwards each chatter's
+      # Open WebUI user id as X-User-Id; open-terminal maps it to a Linux
+      # account and runs their commands under `sudo -u`, so files and
+      # processes land in their own /home/<user>.
+      #
+      # This is a WORKSPACE separation, NOT a security boundary — upstream
+      # says so explicitly. One kernel, one process list, one network stack;
+      # a determined user reaches root inside the container. Everyone with
+      # access must be trusted at the same level. Real per-user isolation
+      # needs Open WebUI Enterprise "Terminals" (container-per-user).
+      # See OPEN_TERMINAL.md § Security model.
+      OPEN_TERMINAL_MULTI_USER: "${OPEN_TERMINAL_MULTI_USER}"
+
+      # DNS-based egress allowlist. The entrypoint starts a local dnsmasq
+      # that NXDOMAINs everything not listed, adds each resolved IP to an
+      # ipset, and sets iptables OUTPUT to drop anything not in it.
+      # Loopback and ESTABLISHED/RELATED are always allowed, so inbound
+      # requests from openwebui still get their replies.
+      #
+      # Semantics of the variable are three-way and the empty string is NOT
+      # the same as unset:
+      #   unset        → no firewall at all (full internet)
+      #   ""           → block ALL outbound
+      #   "a,b,*.c"    → allowlist (wildcards match the parent + subdomains)
+      # Compose always passes the variable, so blanking it in .env means
+      # "airgap the terminal", not "turn the firewall off".
+      OPEN_TERMINAL_ALLOWED_DOMAINS: "${OPEN_TERMINAL_ALLOWED_DOMAINS}"
+
+      # Cap on concurrent interactive PTY sessions across all users.
+      OPEN_TERMINAL_MAX_SESSIONS: "${OPEN_TERMINAL_MAX_SESSIONS}"
+
+      # Seconds POST /execute waits inline before returning a process id the
+      # model must poll. Set a small number (5-15) if models keep forgetting
+      # to poll via GET /execute/{id}/status.
+      #
+      # The `:-0` is load-bearing. open_terminal/env.py does
+      #   v = os.environ.get("OPEN_TERMINAL_EXECUTE_TIMEOUT", <config default>)
+      #   if v is not None: EXECUTE_TIMEOUT = float(v)
+      # so an env var that is PRESENT BUT EMPTY — which is what compose would
+      # pass for a blank .env value — hits float("") and crashes the server at
+      # import. 0 is the correct stand-in for "unset": the only consumer is
+      # `if wait is None and EXECUTE_TIMEOUT:`, and 0.0 is falsy, so the
+      # behaviour is identical to not configuring it at all.
+      OPEN_TERMINAL_EXECUTE_TIMEOUT: "${OPEN_TERMINAL_EXECUTE_TIMEOUT:-0}"
+
+      # Operator context appended to the system prompt open-terminal serves
+      # at GET /system, which openwebui fetches once at startup and injects
+      # for any model with the terminal attached. Tell the model what box it
+      # is on and what it may not reach.
+      OPEN_TERMINAL_INFO: "${OPEN_TERMINAL_INFO}"
+
+      # Space-separated pip packages installed on EVERY container start
+      # (fat image only). Keep short — this runs before the server binds, so
+      # a long list delays readiness on each recreate. Bake heavy deps into
+      # a derived image instead.
+      OPEN_TERMINAL_PIP_PACKAGES: "${OPEN_TERMINAL_PIP_PACKAGES}"
+    volumes:
+      # Multi-user mode puts every provisioned account under /home/<user>,
+      # so the volume must be mounted at /home, NOT /home/user. Switching
+      # OPEN_TERMINAL_MULTI_USER back to false would need this changed to
+      # /home/user or the single-user home lands inside the volume's root.
+      - open_terminal_home:/home
+    # Plain `docker compose` ignores deploy.resources.limits (that is a Swarm
+    # key), so the limits are expressed with the Compose-v2 service keys that
+    # do apply. Without them a runaway model-issued command starves the box —
+    # open-terminal shares the host with vLLM and llama.cpp.
+    mem_limit: ${OPEN_TERMINAL_MEM_LIMIT}
+    cpus: ${OPEN_TERMINAL_CPUS}
+    pids_limit: ${OPEN_TERMINAL_PIDS_LIMIT}
+    healthcheck:
+      # /health is the one unauthenticated endpoint. Loopback is ACCEPTed by
+      # the egress firewall's first rule, so this keeps working with the
+      # allowlist on. start_period is generous because the entrypoint may
+      # apt/pip-install packages and provision iptables before binding.
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/health > /dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+
+volumes:
+  # Every user's workspace. Survives recreates and image bumps; a
+  # `down -v` wipes everyone's files.
+  open_terminal_home:

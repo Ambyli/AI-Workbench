@@ -3,6 +3,19 @@ networks:
     external: true
     name: ai_shared
 
+  # Second, deliberately narrow network shared ONLY with open-terminal
+  # (ai/open-terminal/docker-compose.open-terminal.yml). The terminal is a
+  # root-capable shell driven by a model, so it is kept off ai_shared — from
+  # there it could reach roofix-db / sandbox-db / minio (all dev-default
+  # credentials), litellm, n8n's credential store, and sandbox-runner, which
+  # mounts docker.sock. openwebui straddles both networks because its backend
+  # is the ONLY thing that proxies terminal traffic; the browser never talks
+  # to open-terminal directly and never sees the API key.
+  # Created by `make network`. See ai/open-terminal/OPEN_TERMINAL.md.
+  terminal:
+    external: true
+    name: terminal_net
+
 services:
   openwebui:
     # Locally built: upstream's pinned release plus ai/openwebui/patches/*.patch
@@ -20,6 +33,9 @@ services:
     pull_policy: build
     networks:
       - shared
+      # Adding terminal_net changes the container's network list, so applying
+      # it needs a RECREATE (`make up openwebui`), not a restart.
+      - terminal
     container_name: openwebui
     restart: unless-stopped
     ports:
@@ -178,6 +194,60 @@ services:
       AUDIO_TTS_MODEL: "${OPENWEBUI_AUDIO_TTS_MODEL}"
       AUDIO_TTS_VOICE: "${OPENWEBUI_AUDIO_TTS_VOICE}"
       AUDIO_TTS_SPLIT_ON: "${OPENWEBUI_AUDIO_TTS_SPLIT_ON}"
+      # Open Terminal — the code-execution backend, replacing the in-browser
+      # Pyodide code interpreter. The JSON list below is what Admin Settings →
+      # Integrations → Open Terminal writes into the DB; it is built INLINE
+      # here (rather than as its own .env variable) so the API key lives in
+      # exactly one place: OPEN_TERMINAL_API_KEY, the same variable
+      # ai/open-terminal/docker-compose.open-terminal.yml feeds the terminal.
+      # The two can therefore never drift.
+      #
+      # Field notes (backend/open_webui/routers/configs.py
+      # ::TerminalServerConnection at v0.11.3):
+      #   url          service DNS on terminal_net — the openwebui BACKEND
+      #                proxies every call (routers/terminals.py), so the
+      #                terminal needs no host port and the browser never sees
+      #                this URL or the key.
+      #   path         openapi.json is fetched once at startup by
+      #                utils/tools.py::set_terminal_servers; its operations
+      #                become native function-calling tools.
+      #   server_type  / policy_id stay null: those select the Enterprise
+      #                "Terminals" orchestrator, not plain Open Terminal.
+      #   config.chat_uploads="filesystem"  files dropped in the chat composer
+      #                land in the user's terminal home instead of Open WebUI's
+      #                RAG store, so the model can actually open them.
+      #   config.access_grants  MUST be non-empty or the connection is private
+      #                and admin-only (utils/access_control::has_connection_access
+      #                treats a missing/empty list as "private"). The
+      #                {principal_type:"user", principal_id:"*"} grant is the
+      #                public-read form used by utils/access_control::has_access.
+      #                Swap in {"principal_type":"group","principal_id":"<id>",
+      #                "permission":"read"} to restrict to an Open WebUI group.
+      #
+      # PersistentConfig caveat, same as ENABLE_WEB_SEARCH and the AUDIO_TTS_*
+      # block above: the key is `terminal_server.connections`, so this env var
+      # is read only on the FIRST boot of a fresh openwebui_data volume. On the
+      # existing install, add/verify the connection in the Admin UI at
+      # Admin Settings → Integrations → Open Terminal (URL http://open-terminal:8000,
+      # key = OPEN_TERMINAL_API_KEY). See ai/open-terminal/OPEN_TERMINAL.md.
+      TERMINAL_SERVER_CONNECTIONS: '[{"id":"zeo-terminal","name":"Zeo Terminal","enabled":true,"url":"http://open-terminal:8000","path":"/openapi.json","key":"${OPEN_TERMINAL_API_KEY}","auth_type":"bearer","server_type":null,"policy_id":null,"config":{"chat_uploads":"filesystem","access_grants":[{"principal_type":"user","principal_id":"*","permission":"read"}]}}]'
+
+      # Turn the legacy Pyodide code interpreter OFF — Open Terminal replaces
+      # it. The two are mutually exclusive in the composer anyway: selecting a
+      # terminal force-clears the Code Interpreter toggle
+      # (src/lib/components/chat/MessageInput.svelte at v0.11.3), so leaving
+      # both on only produces a confusing second button.
+      #
+      # PersistentConfig key `code_interpreter.enable` — first-boot-only, same
+      # caveat as above. On the existing install flip it at
+      # Admin Settings → Code Execution → Code Interpreter.
+      #
+      # NOT touched here: ENABLE_CODE_EXECUTION (`code_execution.enable`, the
+      # "Run" button on a code block in an assistant message). That is a
+      # browser-side pyodide/jupyter execution with no server reach; leaving it
+      # on is harmless and still useful for quick snippets.
+      ENABLE_CODE_INTERPRETER: "${OPENWEBUI_ENABLE_CODE_INTERPRETER}"
+
       # Speech-to-text stays on the built-in local faster-whisper model that
       # ships inside the Open WebUI image (CPU, downloaded on first use). Only
       # the model size is exposed here; "base" is the upstream default.

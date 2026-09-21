@@ -1,0 +1,43 @@
+# Open Terminal with the upstream egress-firewall fix applied on top of the
+# pinned release. Same pattern as ai/openwebui/Dockerfile.openwebui: nothing
+# about the upstream image changes except the one file we patch — same
+# entrypoint path, same layout, same unprivileged `user`.
+#
+# Why a custom image: with OPEN_TERMINAL_ALLOWED_DOMAINS set, upstream's
+# entrypoint.sh (v0.13.0, unchanged on main) ends with
+#     exec capsh --drop=cap_net_admin -- -c "exec open-terminal $*"
+# run as the unprivileged `user`. Dropping from the bounding set needs
+# CAP_SETPCAP in the caller's effective set, which a non-root process never
+# has in Docker no matter what `cap_add` says — so `set -e` kills the
+# container at boot:
+#     unable to raise CAP_SETPCAP for BSET changes: Operation not permitted
+# Upstream issue: https://github.com/open-webui/open-terminal/issues/119
+# Upstream fix (unmerged when written): https://github.com/open-webui/open-terminal/pull/118
+# patch_entrypoint.py applies that PR's two hunks and fails the build if the
+# script no longer matches — see its docstring. When #118 ships in a release,
+# delete this file + patch_entrypoint.py and point the compose `image:` back
+# at ghcr.io/open-webui/open-terminal:${OPEN_TERMINAL_VERSION}.
+#
+# Build:   make build open-terminal   (or just `make up open-terminal` —
+#          pull_policy: build builds it when the local tag is missing)
+# Bump:    edit OPEN_TERMINAL_VERSION in .env, then
+#          make build open-terminal && make up open-terminal
+
+ARG OPEN_TERMINAL_VERSION=0.13.0
+FROM ghcr.io/open-webui/open-terminal:${OPEN_TERMINAL_VERSION}
+
+# Upstream ends with `USER user` and WORKDIR /home/user; entrypoint.sh is
+# root-owned, so switch back for the patch and restore both afterwards.
+USER root
+COPY patch_entrypoint.py /tmp/zeo-patch/patch_entrypoint.py
+RUN set -eu; \
+    python3 /tmp/zeo-patch/patch_entrypoint.py; \
+    bash -n /app/entrypoint.sh; \
+    grep -qF 'exec sudo -E capsh --drop=cap_net_admin --user=user' /app/entrypoint.sh; \
+    rm -rf /tmp/zeo-patch
+USER user
+WORKDIR /home/user
+
+ARG OPEN_TERMINAL_VERSION
+LABEL org.opencontainers.image.base.name="ghcr.io/open-webui/open-terminal:${OPEN_TERMINAL_VERSION}" \
+      com.zeoenergy.open-terminal.patches="open-terminal-pr118-egress-capsh"

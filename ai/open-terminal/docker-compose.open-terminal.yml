@@ -29,12 +29,28 @@ services:
     # `0.13.0` / `0.13` / `latest` and never `v0.13.0`).
     # Never use `latest` here: a cached `latest` on this box has
     # been stale before. Bump OPEN_TERMINAL_VERSION in .env, then
-    #   make up open-terminal
+    #   make build open-terminal && make up open-terminal
     #
     # The default (fat, ~4 GB) variant is required, not a preference:
     # `slim` / `alpine` support neither OPEN_TERMINAL_MULTI_USER nor the
     # runtime package-install env vars.
-    image: ghcr.io/open-webui/open-terminal:${OPEN_TERMINAL_VERSION}
+    #
+    # LOCALLY BUILT, not pulled: upstream's entrypoint crashes at boot
+    # whenever OPEN_TERMINAL_ALLOWED_DOMAINS is set ("unable to raise
+    # CAP_SETPCAP for BSET changes" — open-webui/open-terminal#119, fix in
+    # the unmerged PR #118). Dockerfile.open-terminal applies that fix on top
+    # of the pinned upstream tag and fails the build if the script has
+    # changed shape. Once #118 ships, swap `build:` back to
+    #   image: ghcr.io/open-webui/open-terminal:${OPEN_TERMINAL_VERSION}
+    # and delete the Dockerfile + patch_entrypoint.py.
+    build:
+      context: .
+      dockerfile: Dockerfile.open-terminal
+      args:
+        OPEN_TERMINAL_VERSION: ${OPEN_TERMINAL_VERSION}
+    image: open-terminal-zeo:${OPEN_TERMINAL_VERSION}
+    # Local-only image name: never try to pull it from a registry.
+    pull_policy: build
     container_name: open-terminal
     restart: unless-stopped
     networks:
@@ -55,11 +71,11 @@ services:
       # Required by the egress firewall in the image's entrypoint.sh:
       # it runs `iptables` + `ipset` + `dnsmasq`, then permanently drops
       # CAP_NET_ADMIN with `capsh --drop=cap_net_admin` before exec'ing the
-      # server. Dropping from the bounding set additionally needs CAP_SETPCAP,
-      # which is already in Docker's default capability set — add SETPCAP
-      # explicitly only if this host's daemon trims the defaults (the failure
-      # is "unable to raise CAP_SETPCAP for BSET changes" and the container
-      # exits at boot). See OPEN_TERMINAL.md § Troubleshooting.
+      # server. The drop needs CAP_SETPCAP in the caller's EFFECTIVE set —
+      # root has it from Docker's default set, an unprivileged user never
+      # does, which is exactly the upstream bug Dockerfile.open-terminal
+      # patches (capsh now runs via `sudo -E … --user=user`). Adding SETPCAP
+      # here would NOT have fixed it. See OPEN_TERMINAL.md § Custom image.
       - NET_ADMIN
     environment:
       # All values are sourced from .env — edit there, not here.

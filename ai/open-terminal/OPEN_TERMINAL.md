@@ -27,7 +27,7 @@ The two are **mutually exclusive in the composer**: `src/lib/components/chat/Mes
 
 | Container | Purpose | Network | Host port |
 |---|---|---|---|
-| `open-terminal` | Shell + file API (`ghcr.io/open-webui/open-terminal:${OPEN_TERMINAL_VERSION}`, port 8000 in-container) | `terminal_net` **only** | _(none — by design)_ |
+| `open-terminal` | Shell + file API (`open-terminal-zeo:${OPEN_TERMINAL_VERSION}` — a local build of `ghcr.io/open-webui/open-terminal:${OPEN_TERMINAL_VERSION}` plus one entrypoint fix, see [Custom image](#custom-image-upstream-firewall-fix); port 8000 in-container) | `terminal_net` **only** | _(none — by design)_ |
 
 Plus one change to an existing container: `openwebui` joins `terminal_net` in addition to `ai_shared`.
 
@@ -42,6 +42,33 @@ The **default (fat, ~4 GB)** variant is required, not preferred. `slim` and `alp
 The GitHub release is tagged `v0.13.0`; the **container tag is `0.13.0`**. Upstream's `.github/workflows/docker.yml` feeds `docker/metadata-action` a `type=raw,value=${version}${suffix}` where `version` comes from `pyproject.toml` — so the registry holds `0.13.0`, `0.13`, `latest` (and `-slim` / `-alpine` suffixed siblings), but never `v0.13.0`. Pulling `v0.13.0` fails with a manifest 404.
 
 Do not pin `latest`. A cached `latest` on this box has been stale before.
+
+### Custom image (upstream firewall fix)
+
+`open-terminal` does not run the upstream image directly. [`Dockerfile.open-terminal`](Dockerfile.open-terminal) starts `FROM ghcr.io/open-webui/open-terminal:${OPEN_TERMINAL_VERSION}` and runs [`patch_entrypoint.py`](patch_entrypoint.py) against `/app/entrypoint.sh`. The result is tagged locally as `open-terminal-zeo:<tag>` with `pull_policy: build`, so compose builds it on first `make up open-terminal` and never tries to pull it.
+
+**Why.** With `OPEN_TERMINAL_ALLOWED_DOMAINS` set, upstream's entrypoint finishes the firewall setup and then runs `capsh --drop=cap_net_admin` **as the unprivileged `user`**. Dropping a capability from the bounding set needs `CAP_SETPCAP` in the caller's *effective* set, and a non-root process in Docker has an empty effective set regardless of `cap_add` — so `set -e` kills the container at boot:
+
+```
+Egress firewall active — dropping CAP_NET_ADMIN permanently
+unable to raise CAP_SETPCAP for BSET changes: Operation not permitted
+```
+
+This is upstream [issue #119](https://github.com/open-webui/open-terminal/issues/119), open since May 2026 and still present in 0.13.0; the fix is the unmerged [PR #118](https://github.com/open-webui/open-terminal/pull/118). Adding `SETPCAP` to `cap_add` does **not** help — the bounding set was never the problem.
+
+**What the patch does** (PR #118's two hunks, verbatim in intent):
+
+1. `exec capsh --drop=cap_net_admin -- -c …` → `exec sudo -E capsh --drop=cap_net_admin --user=user -- -c …`. Root has `CAP_SETPCAP`; `-E` carries the `OPEN_TERMINAL_*` environment through sudoers' `env_reset` (the image's rule is `user ALL=(ALL) NOPASSWD:ALL`, which implies `SETENV`); `--user=user` hands the server back to the unprivileged account with `CAP_NET_ADMIN` gone from its bounding set for good. `open-terminal` is installed system-wide (`/usr/local/bin`), so sudo's `secure_path` still finds it.
+2. An explicit `ACCEPT` for dnsmasq → the captured upstream resolver before the blanket port-53 `DROP`. On Docker/Linux the upstream is `127.0.0.11`, already covered by the loopback rule, so this is a no-op here; it matters on hosts whose resolver is not loopback.
+
+The build **fails on purpose** if `entrypoint.sh` no longer contains the exact lines being rewritten, or already contains the fix. Either upstream merged #118 — then delete `Dockerfile.open-terminal` + `patch_entrypoint.py`, replace the `build:` block in the compose with `image: ghcr.io/open-webui/open-terminal:${OPEN_TERMINAL_VERSION}`, and drop `pull_policy: build` — or the script changed shape, in which case read the new entrypoint before touching the strings in `patch_entrypoint.py`.
+
+Verifying a build:
+
+```bash
+docker image inspect open-terminal-zeo:0.13.0 --format '{{index .Config.Labels "com.zeoenergy.open-terminal.patches"}}'
+docker exec open-terminal grep -n 'sudo -E capsh' /app/entrypoint.sh
+```
 
 ## Network isolation
 
@@ -71,19 +98,19 @@ Three properties fall out of that:
 
 ## Egress allowlist
 
-`OPEN_TERMINAL_ALLOWED_DOMAINS` is enforced inside the container by the image's `entrypoint.sh`: a local `dnsmasq` NXDOMAINs everything not listed, each resolved IP is added to an `ipset`, and `iptables OUTPUT` drops anything not in that set. Loopback and `ESTABLISHED,RELATED` are accepted first, so the healthcheck and replies to openwebui keep working. `CAP_NET_ADMIN` is then permanently dropped with `capsh` before the server starts.
+`OPEN_TERMINAL_ALLOWED_DOMAINS` is enforced inside the container by the image's `entrypoint.sh`: a local `dnsmasq` NXDOMAINs everything not listed, each resolved IP is added to an `ipset`, and `iptables OUTPUT` drops anything not in that set. Loopback and `ESTABLISHED,RELATED` are accepted first, so the healthcheck and replies to openwebui keep working. `CAP_NET_ADMIN` is then permanently dropped with `capsh` before the server starts — via the patched `sudo -E capsh … --user=user` line, because upstream's unprivileged `capsh` call crashes (see [Custom image](#custom-image-upstream-firewall-fix)).
 
 Default allowlist:
 
 ```
 pypi.org, files.pythonhosted.org,
-github.com, *.github.com, *.githubusercontent.com,
+github.com, githubusercontent.com,
 registry.npmjs.org,
 deb.debian.org, security.debian.org,
-huggingface.co, *.huggingface.co
+huggingface.co, hf.co
 ```
 
-A leading `*.` matches the parent domain and all subdomains (the entrypoint strips the wildcard and lets dnsmasq's suffix matching do the work).
+Every entry matches the domain **and all of its subdomains** — dnsmasq's suffix matching does that natively, so `github.com` already covers `api.github.com` and `codeload.github.com`, and `githubusercontent.com` covers `raw.` and `objects.`. A leading `*.` is accepted but redundant (the entrypoint strips it), which is why the list above has none. `hf.co` is where Hugging Face's LFS CDN redirects large downloads.
 
 The variable is **three-way, and empty is not "off"**:
 
@@ -129,7 +156,7 @@ Run these on the box, from the repo root.
 
    The same variable feeds both containers — `open-terminal` verifies it, and `openwebui`'s `TERMINAL_SERVER_CONNECTIONS` interpolates it — so they cannot drift. Compose fails fast via `${OPEN_TERMINAL_API_KEY:?…}` if it is empty.
 
-3. **Start the terminal.** First pull is ~4 GB:
+3. **Start the terminal.** The first run pulls the ~4 GB upstream image and builds the patched local one on top (`pull_policy: build` — see [Custom image](#custom-image-upstream-firewall-fix)); `make build open-terminal` does the same step explicitly:
 
    ```bash
    make up open-terminal
@@ -221,6 +248,14 @@ docker exec open-terminal curl -sS -m 5 https://pypi.org/simple/ -o /dev/null -w
 docker exec open-terminal curl -sS -m 5 https://example.com -o /dev/null -w '%{http_code}\n'        # DNS failure
 ```
 
+Confirm the capability drop landed — the server must run as `user`, and `cap_net_admin` must be absent from its bounding set (so even `sudo` inside the terminal cannot undo the firewall):
+
+```bash
+docker exec open-terminal sh -c 'pid=$(pgrep -of "open-terminal run"); ps -o user= -p $pid; capsh --decode=$(grep CapBnd /proc/$pid/status | cut -f2)'
+# user
+# 0x…=cap_chown,…   ← no cap_net_admin in the list
+```
+
 Confirm the isolation holds — these must all fail:
 
 ```bash
@@ -282,7 +317,9 @@ Open WebUI itself is pinned separately by `OPENWEBUI_VERSION` and builds a patch
 
 | Symptom | Cause / fix |
 |---|---|
-| Container exits at boot with `unable to raise CAP_SETPCAP for BSET changes` | The entrypoint's `capsh --drop=cap_net_admin` needs `CAP_SETPCAP`, normally part of Docker's default capability set. A hardened daemon or seccomp profile trimmed it — add `SETPCAP` next to `NET_ADMIN` under `cap_add:`. As a last resort, unset `OPEN_TERMINAL_ALLOWED_DOMAINS` to skip the firewall entirely (and lose egress control). |
+| Container exits at boot with `unable to raise CAP_SETPCAP for BSET changes` right after `Egress firewall active` | You are running the **unpatched upstream image** — upstream bug [#119](https://github.com/open-webui/open-terminal/issues/119): `capsh` is called as the unprivileged user, which can never drop bounding-set capabilities. Adding `SETPCAP` to `cap_add` does not help. Check `docker inspect open-terminal --format '{{.Config.Image}}'` says `open-terminal-zeo:…`, not `ghcr.io/…`; if it doesn't, `make build open-terminal && make up open-terminal`. See [Custom image](#custom-image-upstream-firewall-fix). |
+| `make build open-terminal` stops inside `patch_entrypoint.py` | Upstream's `entrypoint.sh` no longer matches the patch — either PR #118 merged (retire the custom image as described in [Custom image](#custom-image-upstream-firewall-fix)) or the script changed. Read the new script before editing the strings. |
+| Server starts but `docker exec open-terminal ps -o user,cmd` shows it running as `root` | Someone replaced `sudo -E capsh … --user=user` with plain `sudo`, or set `user: root` in the compose. The `--user=user` is what hands the process back to the unprivileged account; restore it. |
 | `WARNING: iptables not found — skipping egress firewall` in the logs | You are on the `slim` / `alpine` / `openshift` variant. Use the default tag. |
 | Container exits at import with `ValueError: could not convert string to float: ''` | Something passed `OPEN_TERMINAL_EXECUTE_TIMEOUT` as an empty string. `open_terminal/env.py` calls `float()` whenever the variable is *present*, so blank ≠ unset. The compose file guards this with `${OPEN_TERMINAL_EXECUTE_TIMEOUT:-0}` — don't remove the `:-0`. `0` is falsy at the only place it is read, so it behaves exactly like unset. |
 | Container exits immediately with `variable OPEN_TERMINAL_API_KEY must be set` | `${OPEN_TERMINAL_API_KEY:?…}` fired. Populate it in `.env` — `openssl rand -hex 32`. |

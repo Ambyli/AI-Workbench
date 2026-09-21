@@ -1,0 +1,50 @@
+# One-shot preparation container for the semantic-router stack.
+#
+# The vllm-sr PyPI package is the CLI only -- the router itself is the Go
+# binary in ghcr.io/vllm-project/semantic-router/vllm-sr. We want the CLI
+# because it owns two things the repo must not reimplement: the config
+# schema (`vllm-sr validate`) and the Envoy config template + generator
+# (cli/templates/envoy.template.yaml + cli/config_generator.py).
+#
+# Pinning both halves to the SAME release is the whole point. If the image
+# tag moves and this does not, the router starts enforcing a schema the
+# validator has never seen.
+#
+# NOTE ON WHAT THIS DOES NOT DO: it does not download model weights.
+# vllm-sr 0.3.0's CLI has no download subcommand -- the full command set is
+# serve / config / validate / model list / eval / status / logs / stop /
+# dashboard / chat (cli/main.py::REGISTERED_COMMANDS), and `vllm-sr model`
+# only has `list`, which prints the configured models. `vllm-sr serve`
+# merely does `os.makedirs(<config_dir>/models)` and bind-mounts it
+# (cli/docker_start.py:458); the ROUTER image fetches its classifier and
+# embedding bundles from Hugging Face on first start, which is why HF_TOKEN
+# and HF_HOME are passed to vllm-sr-router in the compose file rather than
+# here. This container creates and seeds that directory and gets out of the
+# way. The service keeps the name `vllm-sr-models-init` because the volume
+# it seeds is still the models volume and the Makefile registers it.
+
+FROM python:3.12-slim
+
+# Image tag is `v0.3.0`; the PyPI version is `0.3.0`. Strip the leading `v`
+# here so .env carries exactly one version string for the whole subsystem
+# and the two can never drift.
+ARG SEMANTIC_ROUTER_VERSION=v0.3.0
+
+# Never `latest`, never a range: an unpinned CLI would validate against a
+# different schema than the pinned router image enforces.
+RUN set -eux; \
+    PYPI_VERSION="${SEMANTIC_ROUTER_VERSION#v}"; \
+    pip install --no-cache-dir "vllm-sr==${PYPI_VERSION}"; \
+    vllm-sr --version
+
+# cli/commands/validate.py reads the config with the locale encoding and
+# logs non-ASCII on failure. A container with a POSIX locale would report a
+# UnicodeError instead of the real validation error.
+ENV PYTHONUTF8=1 \
+    PYTHONUNBUFFERED=1
+
+COPY prepare.py /usr/local/bin/prepare.py
+
+# No CMD arguments: everything this needs comes from the environment and
+# the bind mounts declared in docker-compose.semantic-router.yml.
+ENTRYPOINT ["python", "/usr/local/bin/prepare.py"]

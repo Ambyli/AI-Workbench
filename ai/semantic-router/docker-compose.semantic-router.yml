@@ -1,0 +1,320 @@
+# vLLM Semantic Router subsystem.
+#
+# Puts the router's bounded multi-model "looper" algorithms behind a single
+# `auto` model in LiteLLM. The router sits BESIDE LiteLLM, not in front of
+# it: LiteLLM stays the one OpenAI surface for Open WebUI, Claude Code, n8n
+# and the Roofix brain, and every candidate the router picks is an existing
+# LiteLLM alias reached at http://litellm:4000/v1.
+#
+# Request path (the loop is deliberate -- see the recursion guard in
+# config.yaml before touching providers.models):
+#
+#   openwebui -> litellm:4000            alias `auto` -> openai/vllm-sr/auto
+#             -> vllm-sr-envoy:8899      listener; Lua bearer check, ext_proc
+#             -> vllm-sr-router:50051    signals -> decision -> looper
+#             -> vllm-sr-envoy:8899      one sub-request per candidate,
+#             -> litellm:4000            steered by the x-selected-model header
+#             -> vLLM / llama.cpp / Anthropic
+#
+# Two networks:
+#   shared      (external, ai_shared)  vllm-sr-envoy, so litellm can call it
+#                                      and it can call litellm back; plus
+#                                      vllm-sr-router, so the litellm stack's
+#                                      prometheus can scrape :9190 and so the
+#                                      router has a route to huggingface.co
+#                                      for its classifier bundles.
+#   router_net  (bridge, internal)     the ext_proc gRPC hop, envoy -> router
+#                                      :50051. HONEST CAVEAT: because both
+#                                      containers ALSO sit on ai_shared, this
+#                                      does not actually hide 50051 from
+#                                      ai_shared peers -- container ports are
+#                                      reachable across any shared bridge
+#                                      whether or not they are published. It
+#                                      is a dedicated, gateway-less segment
+#                                      for the hop and a statement of intent,
+#                                      not a control. Taking the router off
+#                                      ai_shared WOULD hide it, at the cost
+#                                      of the prometheus scrape and the
+#                                      model download path.
+#
+# Only ONE port is published: Envoy's listener on PORT_SEMANTIC_ROUTER.
+# 50051 (gRPC), 8080 (router management API), 9190 (router metrics) and 9901
+# (Envoy admin) are deliberately never mapped -- 9901 alone serves
+# /quitquitquit and a full config dump including the listener bearer token.
+#
+# See ai/semantic-router/SEMANTIC_ROUTER.md for the operator runbook.
+
+networks:
+  shared:
+    external: true
+    name: ai_shared
+  router_net:
+    driver: bridge
+    internal: true
+    name: router_net
+
+services:
+  # -- One-shot preparation ------------------------------------------------
+  # Same shape as ai/trino's trino-auth-init: runs, does its job, exits 0,
+  # and the long-lived services gate on service_completed_successfully.
+  #
+  # It does THREE things, in order:
+  #
+  #   1. `vllm-sr validate --config /work/config.yaml`. The pinned CLI owns
+  #      the config schema, so a field that does not exist in this release
+  #      fails the stack here instead of crash-looping the router. (The
+  #      subcommand is `vllm-sr validate` -- `vllm-sr config validate` does
+  #      not exist in 0.3.0, whatever the plan said.)
+  #
+  #   2. Re-renders the Envoy config from config.yaml with the SAME release's
+  #      generator and diffs it against the checked-in envoy.yaml. Upstream
+  #      generates that file and changes the template between releases;
+  #      checking in a stale render is the failure mode this guards. A
+  #      mismatch prints a unified diff and exits non-zero -- re-render per
+  #      SEMANTIC_ROUTER.md > Re-rendering envoy.yaml, never edit by hand.
+  #
+  #   3. Substitutes SEMANTIC_ROUTER_LISTENER_KEY into the rendered config
+  #      and writes it to the vllm_sr_envoy volume, which is what Envoy
+  #      actually loads. This exists because Envoy has NO environment
+  #      substitution in config files and the generator inlines api_keys
+  #      verbatim into a Lua table -- so the real bearer token can never be
+  #      the thing that is committed. The checked-in envoy.yaml carries the
+  #      placeholder __SEMANTIC_ROUTER_LISTENER_KEY__ instead.
+  #
+  # It does NOT download the classifier bundles. vllm-sr 0.3.0's CLI has no
+  # model-download subcommand at all (the commands are serve / config /
+  # validate / model list / eval / status / logs / stop / dashboard / chat);
+  # `vllm-sr serve` only mkdir's the models directory and mounts it, and the
+  # router image fetches from Hugging Face itself at startup -- which is why
+  # HF_TOKEN / HF_HOME are passed through to the router below. This service
+  # creates and seeds the volume so that download has somewhere to land.
+  # Consequently it needs no network at all: network_mode: none.
+  vllm-sr-models-init:
+    build:
+      context: .
+      dockerfile: Dockerfile.models-init
+      args:
+        # Image tag carries a leading `v`; the PyPI version does not.
+        # Dockerfile strips it so the two can never drift.
+        SEMANTIC_ROUTER_VERSION: ${SEMANTIC_ROUTER_VERSION:-v0.3.0}
+    image: vllm-sr-models-init:${SEMANTIC_ROUTER_VERSION:-v0.3.0}
+    # Local-only image name: never try to pull it from a registry (same as
+    # the llama-unsloth and openwebui-zeo images).
+    pull_policy: build
+    container_name: vllm-sr-models-init
+    restart: "no"
+    network_mode: none
+    environment:
+      # Compose refuses to start the stack without either -- see .env.example.
+      # Both are substituted into the Envoy Lua filter's VALID_KEYS: the
+      # listener key is what LiteLLM's `auto` alias sends, the LiteLLM key
+      # is what the router's own looper sub-requests send (config.yaml >
+      # WHY TWO KEYS). Missing the second one 401s every looper algorithm.
+      SEMANTIC_ROUTER_LISTENER_KEY: ${SEMANTIC_ROUTER_LISTENER_KEY:?Set SEMANTIC_ROUTER_LISTENER_KEY in .env (openssl rand -hex 32) - it is the bearer token Envoy requires on PORT_SEMANTIC_ROUTER. See ai/semantic-router/SEMANTIC_ROUTER.md > Secrets}
+      SEMANTIC_ROUTER_LITELLM_KEY: ${SEMANTIC_ROUTER_LITELLM_KEY:?Set SEMANTIC_ROUTER_LITELLM_KEY in .env to a LiteLLM virtual key scoped to the six candidate aliases. See ai/semantic-router/SEMANTIC_ROUTER.md > Secrets}
+      # The generator reads both of these to place the ext_proc cluster.
+      # They MUST match the values used to produce the checked-in
+      # envoy.yaml or step 2 fails the diff every time.
+      ENVOY_EXTPROC_ADDRESS: vllm-sr-router
+      ENVOY_ROUTER_API_ADDRESS: vllm-sr-router
+      # cli/commands/validate.py reads the config with the locale encoding
+      # and logs a U+274C on failure; force UTF-8 so a container with a
+      # POSIX locale reports the real error instead of a UnicodeError.
+      PYTHONUTF8: "1"
+    volumes:
+      - ./config.yaml:/work/config.yaml:ro
+      - ./envoy.yaml:/work/envoy.yaml:ro
+      - vllm_sr_envoy:/out
+      - vllm_sr_models:/app/models
+
+  # -- Router (ext_proc server) -------------------------------------------
+  # Never gets a `ports:` block. Everything reaches it through Envoy.
+  vllm-sr-router:
+    # Pinned tag, never `latest`. GHCR republishes
+    # ghcr.io/vllm-project/semantic-router/vllm-sr:latest several times a
+    # day, and `up -d` does not re-pull a cached `latest` -- so the box
+    # silently keeps whatever it first pulled while the config it is fed
+    # moves on. This repo has already been burned by exactly that on the
+    # vLLM images (see ai/vllm/docker-compose.vllm.yml). The CLI's own
+    # default in cli/consts.py IS `latest`; do not copy it.
+    image: ghcr.io/vllm-project/semantic-router/vllm-sr:${SEMANTIC_ROUTER_VERSION:-v0.3.0}
+    container_name: vllm-sr-router
+    restart: unless-stopped
+    networks:
+      - shared
+      - router_net
+    # Entrypoint and both arguments are exactly what `vllm-sr serve` runs
+    # (cli/docker_start.py::_build_router_runtime_command): the config path
+    # first, the state directory second.
+    entrypoint: /app/start-router.sh
+    command:
+      - /app/config.yaml
+      - /app/.vllm-sr
+    environment:
+      # Resolved by cli/models.py::BackendRef.resolve_api_key via the
+      # api_key_env on every backend_ref in config.yaml. Scope this virtual
+      # key in the LiteLLM Admin UI to the six candidate aliases and NOTHING
+      # else -- that is the half of the recursion guard LiteLLM enforces.
+      # Put a monthly budget on it too: one remom turn is six model calls.
+      SEMANTIC_ROUTER_LITELLM_KEY: ${SEMANTIC_ROUTER_LITELLM_KEY:?Set SEMANTIC_ROUTER_LITELLM_KEY in .env to a LiteLLM virtual key scoped to qwen3.6/qwen3.8/qwen3.8-solo/qwen3.8-flash/glm5.2/claude-sonnet-5 only. See ai/semantic-router/SEMANTIC_ROUTER.md > Secrets}
+      # The router pulls its own classifier bundles from Hugging Face on
+      # first start -- nothing in the CLI does it ahead of time. HF_HOME
+      # points into the same volume the init service seeded so a recreate
+      # does not re-download. Both names are read by the router image; the
+      # CLI passes them through verbatim
+      # (cli/commands/runtime_support.py::PASSTHROUGH_ENV_RULES).
+      HF_TOKEN: ${HF_TOKEN:-}
+      HF_HOME: /app/models
+    volumes:
+      # Read-only: the router must never rewrite the file the repo owns.
+      - ./config.yaml:/app/config.yaml:ro
+      # /app/.vllm-sr is the router's state directory -- the second CLI
+      # argument above. Flow/looper state and startup_status (file backend,
+      # see config.yaml global.services) live here.
+      - vllm_sr_state:/app/.vllm-sr
+      - vllm_sr_models:/app/models
+    ulimits:
+      # cli/consts.py::DEFAULT_NOFILE_LIMIT. The CLI sets this on every
+      # router container and refuses anything below 8192; the router opens
+      # a socket per in-flight candidate call and the default 1024 on some
+      # hosts is not enough once a remom round fans out.
+      nofile:
+        soft: 65536
+        hard: 65536
+    healthcheck:
+      # The management API on 8080 -- exactly the probe
+      # cli/runtime_lifecycle.py::wait_for_router_health runs via
+      # `docker exec`, which is also why curl is known to exist in this
+      # image. 8080 is never published; this runs inside the container.
+      test: ["CMD", "curl", "-f", "-s", "http://localhost:8080/ready"]
+      interval: 15s
+      timeout: 5s
+      # Generous: the router loads its classifier bundles before it reports
+      # ready, and on a cold volume that includes downloading them.
+      start_period: 600s
+      retries: 10
+    depends_on:
+      vllm-sr-models-init:
+        condition: service_completed_successfully
+
+  # -- Envoy (the only published surface) ---------------------------------
+  vllm-sr-envoy:
+    # Pin a PATCH tag. cli/consts.py defaults to `envoyproxy/envoy:v1.34-latest`
+    # -- a moving tag, same trap as `latest`: a cached copy never re-pulls,
+    # and a fresh box gets a different build than the one this config was
+    # rendered and tested against. v1.34.14 is the newest v1.34 patch.
+    image: envoyproxy/envoy:${SEMANTIC_ROUTER_ENVOY_VERSION:-v1.34.14}
+    container_name: vllm-sr-envoy
+    restart: unless-stopped
+    networks:
+      - shared
+      - router_net
+    ports:
+      # The ONLY published port in this stack. 9901 (admin) stays inside.
+      - "${PORT_SEMANTIC_ROUTER:-8021}:8899"
+    # Bypasses the image's /docker-entrypoint.sh and execs the binary
+    # directly, matching cli/docker_start.py::_build_envoy_runtime_command.
+    # `--log-level debug` is in the CLI's args and is dropped here on
+    # purpose: at debug Envoy logs every ext_proc message, which on a
+    # buffered 100 kB body is unreadable. Add it back temporarily when
+    # chasing a routing bug.
+    entrypoint: /usr/local/bin/envoy
+    command:
+      - -c
+      - /etc/envoy/envoy.yaml
+    volumes:
+      # NOT a bind mount of ./envoy.yaml. The file Envoy loads is the
+      # key-substituted copy vllm-sr-models-init writes into this volume;
+      # the repo's ./envoy.yaml holds the placeholder. Read-only here so
+      # only the init service can ever change it.
+      - vllm_sr_envoy:/etc/envoy:ro
+    healthcheck:
+      # A TCP connect, not an HTTP probe, because this image ships
+      # ca-certificates and tzdata and nothing else -- no curl, no wget
+      # (envoyproxy/envoy distribution/docker/Dockerfile-envoy). It is
+      # Ubuntu 22.04, so bash and /dev/tcp are available; `sh` is dash and
+      # has neither, which is why this is CMD + /bin/bash rather than
+      # CMD-SHELL. It proves the listener is bound and accepting, not that
+      # the ext_proc cluster behind it is healthy -- for that, curl
+      # http://vllm-sr-envoy:9901/ready from any container on ai_shared.
+      test: ["CMD", "/bin/bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8899"]
+      interval: 15s
+      timeout: 5s
+      start_period: 20s
+      retries: 5
+    depends_on:
+      vllm-sr-models-init:
+        condition: service_completed_successfully
+      vllm-sr-router:
+        condition: service_healthy
+
+  # -- Dashboard (optional, profile-gated) ---------------------------------
+  # Not started by `make up semantic-router`; it is not in the stack's
+  # default service list in the Makefile and it sits behind a compose
+  # profile as well. Start it deliberately:
+  #
+  #   docker compose -f ai/semantic-router/docker-compose.semantic-router.yml \
+  #     --env-file .env -p ai-semantic-router --profile dashboard up -d
+  #
+  # `make build semantic-router` DOES pick it up: the Makefile's
+  # profile_flags auto-discovers every declared profile.
+  #
+  # Bound to 127.0.0.1 only. The dashboard can edit the live router config
+  # and has no auth of its own -- reach it over an SSH tunnel, or front it
+  # at chat.zeoenergy.com/vllm-sr/ through OAUTH2_PROXY_UPSTREAMS the way
+  # /n8n/ and /sandboxes/ are done. Never bind it to 0.0.0.0.
+  vllm-sr-dashboard:
+    profiles: [dashboard]
+    image: ghcr.io/vllm-project/semantic-router/dashboard:${SEMANTIC_ROUTER_VERSION:-v0.3.0}
+    container_name: vllm-sr-dashboard
+    restart: unless-stopped
+    networks:
+      - shared
+      - router_net
+    ports:
+      - "127.0.0.1:${PORT_SEMANTIC_ROUTER_DASHBOARD:-8022}:8700"
+    # cli/docker_start.py::_build_dashboard_runtime_command -- entrypoint
+    # plus the single config-path argument.
+    entrypoint: /app/start-dashboard.sh
+    command:
+      - /app/config.yaml
+    environment:
+      # The four TARGET_* URLs the CLI injects
+      # (_build_dashboard_runtime_env). Service DNS, not localhost: in the
+      # CLI's layout every container shares one network and it uses
+      # container names here too.
+      TARGET_ROUTER_API_URL: http://vllm-sr-router:8080
+      TARGET_ROUTER_METRICS_URL: http://vllm-sr-router:9190/metrics
+      TARGET_ENVOY_URL: http://vllm-sr-envoy:8899
+      TARGET_ENVOY_ADMIN_URL: http://vllm-sr-envoy:9901
+      ENVOY_EXTPROC_ADDRESS: vllm-sr-router
+      ENVOY_ROUTER_API_ADDRESS: vllm-sr-router
+      VLLM_SR_ENVOY_CONFIG_PATH: /app/.vllm-sr/envoy.yaml
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - vllm_sr_state:/app/.vllm-sr
+      - vllm_sr_dashboard_data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "-s", "http://localhost:8700/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 5
+    depends_on:
+      vllm-sr-router:
+        condition: service_healthy
+
+volumes:
+  # Router state directory (/app/.vllm-sr): looper/flow state and the
+  # file-backed startup_status store. Safe to delete; regenerates.
+  vllm_sr_state:
+  # Classifier + embedding bundles the router pulls from Hugging Face on
+  # first start, via HF_HOME. Deleting it forces a re-download on the next
+  # start, which is why the router's healthcheck start_period is 600s.
+  vllm_sr_models:
+  # Holds the ONE file Envoy reads: the rendered, key-substituted
+  # envoy.yaml written by vllm-sr-models-init. Never edit in place -- the
+  # init service overwrites it on every `make up semantic-router`.
+  vllm_sr_envoy:
+  # Dashboard-local state. Only mounted under the `dashboard` profile.
+  vllm_sr_dashboard_data:

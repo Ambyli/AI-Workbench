@@ -19,6 +19,11 @@ litellm_settings:
     - {"glm5.2":        ["claude-sonnet-5"]}
     - {"glm5.3-flash":  ["claude-sonnet-5"]}
     - {"muse-glimmer":  ["claude-sonnet-5"]}
+    # `auto` is the semantic router (ai/semantic-router/). Stopping
+    # vllm-sr-envoy, or a router that fails its readiness check, must not
+    # take the chat down -- fall back to the pool's workhorse, then to
+    # Anthropic. Do NOT list a router entrypoint as its own fallback.
+    - {"auto":          ["qwen3.8", "claude-sonnet-5"]}
   context_window_fallbacks:
     - {"qwen3.6":       ["claude-sonnet-5"]}
     - {"qwen3.8":       ["claude-sonnet-5"]}
@@ -27,6 +32,9 @@ litellm_settings:
     - {"glm5.2":        ["claude-sonnet-5"]}
     - {"glm5.3-flash":  ["claude-sonnet-5"]}
     - {"muse-glimmer":  ["claude-sonnet-5"]}
+    # A prompt too long for the router's smallest candidate goes to the
+    # long-context backend directly rather than being routed.
+    - {"auto":          ["qwen3.8-flash"]}
 
 general_settings:
   master_key: os.environ/DEFAULT_LITELLM_MASTER_KEY
@@ -267,3 +275,56 @@ model_list:
       model: anthropic/claude-sonnet-5
       api_key: os.environ/ANTHROPIC_API_KEY
       stream_timeout: 300
+
+  # vLLM Semantic Router (ai/semantic-router/). One model name that picks a
+  # decision from the request's signals and then runs a bounded multi-model
+  # algorithm -- confidence escalation, a parallel ratings fan-out, or a
+  # two-round remom reasoning loop -- over the aliases above.
+  #
+  # `openai/vllm-sr/auto` is not a provider path: `openai/` selects
+  # LiteLLM's OpenAI-compatible client and `vllm-sr/auto` is the literal
+  # model name in the request body. It must equal
+  # global.router.auto_model_name in ai/semantic-router/config.yaml, which
+  # is the ONE name that triggers auto-routing -- every other model name a
+  # caller sends the router is treated as an explicit selection.
+  #
+  # api_base points at Envoy, not at the router: the router is an ext_proc
+  # server behind that listener and has no OpenAI surface of its own.
+  #
+  # RECURSION: the router calls this same LiteLLM back, once per candidate,
+  # with SEMANTIC_ROUTER_LITELLM_KEY. That key is scoped to the six concrete
+  # aliases and must never be able to call `auto`. See
+  # ai/semantic-router/SEMANTIC_ROUTER.md > Recursion guard.
+  #
+  # stream_timeout 1800 (not 300) because Envoy runs ext_proc with BUFFERED
+  # request AND response bodies: nothing comes back until the last candidate
+  # in the round has finished. This is the time-to-first-chunk budget for a
+  # full ratings or remom turn, and it mirrors listeners[0].timeout: 1800s in
+  # the router config. Lowering one without the other produces a LiteLLM
+  # timeout on a request Envoy is still happily serving.
+  #
+  # ONLY ONE ROUTER ALIAS EXISTS ON PURPOSE. vllm-sr 0.3.0 has no
+  # `entrypoints:` block and no per-algorithm model names -- UserConfig is
+  # extra="forbid" over {version, listeners, providers, routing, global,
+  # setup}, and algorithms attach to decisions, which are selected by
+  # signals. So there is no `auto-fusion` / `auto-remom` / `auto-flow` /
+  # `auto-ratings` to point at; the algorithm is chosen by what the user
+  # asks, not by which alias they pick. (Fusion and Workflows do not exist
+  # in this release at all -- the looper set is confidence / ratings /
+  # remom.) Revisit when upstream ships multiple entrypoints.
+  - model_name: auto
+    litellm_params:
+      model: openai/vllm-sr/auto
+      api_base: http://vllm-sr-envoy:8899/v1
+      api_key: os.environ/SEMANTIC_ROUTER_LISTENER_KEY
+      max_tokens: 16384
+      stream_timeout: 1800
+    model_info:
+      # The smallest window any candidate `auto` can actually land on:
+      # qwen3.6 / qwen3.8 / qwen3.8-solo all cap at 114688. glm5.2 is
+      # declared to the router but is not in any decision's modelRefs, so
+      # its 32768 does not bind here. Raising this above the smallest
+      # reachable candidate means the router accepts a prompt one of its own
+      # rungs will reject mid-escalation.
+      max_input_tokens: 114688
+      max_output_tokens: 16384

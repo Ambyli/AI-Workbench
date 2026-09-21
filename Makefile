@@ -24,6 +24,7 @@ $(eval $(call service,sandbox,sandbox-db sandbox-egress sandbox-proxy sandbox-ru
 $(eval $(call service,n8n,n8n-db n8n))
 $(eval $(call service,open-terminal,open-terminal))
 $(eval $(call service,trino,hive-metastore-db hive-metastore minio minio-init trino-auth-init trino-coordinator trino-mcp superset-db superset))
+$(eval $(call service,semantic-router,vllm-sr-models-init vllm-sr-router vllm-sr-envoy))
 
 # Introspection targets consumed by the `_make_ai_complete` bash completion
 # function (installed once via `eval "$$(make completion-bash)"`). The

@@ -1,0 +1,378 @@
+{
+  "info": {
+    "name": "semantic-router",
+    "description": "vLLM Semantic Router (ai/semantic-router/). Two ways in, and they authenticate DIFFERENTLY:\n\n1. Direct at Envoy on {{semanticRouter}} (host publish PORT_SEMANTIC_ROUTER, default http://localhost:8021, container port 8899). Bearer token is {{listener key}} = SEMANTIC_ROUTER_LISTENER_KEY, checked by a Lua filter in the generated Envoy config. The folder 'Envoy listener (direct)' overrides the collection auth with it. This is the debugging path.\n\n2. Through LiteLLM on {{litellm}} as the model `auto`. Bearer token is {{virtual master key}}, a normal LiteLLM virtual key -- LiteLLM attaches the listener key itself. This is what Open WebUI and every other client actually does.\n\nNO OTHER ROUTER PORT IS PUBLISHED. The router's ext_proc gRPC (50051), management API (8080) and metrics (9190), and Envoy's admin (9901), are reachable only from inside the container network. There is no collection item for them on purpose -- if you need one, `docker exec` into a container on ai_shared.\n\nWHY THERE IS ONLY ONE ROUTER ENTRYPOINT: vllm-sr 0.3.0 has no `entrypoints:` block and no per-algorithm model names. Exactly one name, global.router.auto_model_name (`vllm-sr/auto`), triggers routing; the algorithm is then chosen by which DECISION the request's signals match. So there is no /fusion, /remom, /flow or /ratings slug to call, and no auto-fusion / auto-remom alias in LiteLLM. The items below exercise each decision by sending a prompt shaped to trip its signal, which is the only mechanism this release provides. Fusion and Workflows do not exist in 0.3.0 at all -- the looper set is confidence / ratings / remom.\n\nSee ai/semantic-router/SEMANTIC_ROUTER.md for the request path, the recipe table, the concurrency budget, and the recursion guard.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "_postman_id": "semantic-router-collection"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{virtual master key}}",
+        "type": "string"
+      }
+    ]
+  },
+  "variable": [
+    {
+      "key": "semanticRouter",
+      "value": "http://localhost:8021",
+      "type": "string",
+      "description": "Envoy listener base URL. Host publish is PORT_SEMANTIC_ROUTER (8021 by default) mapped to container port 8899; on ai_shared it is http://vllm-sr-envoy:8899. Not fronted by oauth2-proxy -- the listener bearer token is the only thing in front of it, so do not expose 8021 on an untrusted network."
+    },
+    {
+      "key": "listener key",
+      "value": "change-me-run-openssl-rand-hex-32",
+      "type": "string",
+      "description": "SEMANTIC_ROUTER_LISTENER_KEY from .env. Used ONLY by the 'Envoy listener (direct)' folder, which overrides the collection auth with it. Anyone holding it can spend model tokens through the whole candidate pool, Anthropic included -- treat it like a production password. Rotating it is: edit .env, `make up semantic-router` (a recreate, so vllm-sr-models-init re-substitutes it into the Envoy config), then `make up litellm`."
+    },
+    {
+      "key": "litellm",
+      "value": "http://localhost:4001",
+      "type": "string",
+      "description": "LiteLLM base URL. Localhost publish is 4001 (PORT_LITELLM); on ai_shared it is http://litellm:4000; behind cloudflared it is https://your-litellm-host."
+    },
+    {
+      "key": "virtual master key",
+      "value": "sk-your-litellm-virtual-key",
+      "type": "string",
+      "description": "LiteLLM virtual key (Admin UI -> Virtual Keys, or /key/generate). Must be scoped to allow the `auto` alias. This is NOT SEMANTIC_ROUTER_LITELLM_KEY -- that one belongs to the router and is deliberately scoped to the six candidate aliases and nothing else, so using it here would 401 on `auto`. Sent as `Authorization: Bearer {{virtual master key}}` by the collection-level auth."
+    }
+  ],
+  "item": [
+    {
+      "name": "Envoy listener (direct)",
+      "description": "Straight at the router's Envoy listener on {{semanticRouter}}, bypassing LiteLLM. Overrides the collection bearer with {{listener key}}. Use these to decide whether a problem is in the router or in the LiteLLM leg in front of it.",
+      "auth": {
+        "type": "bearer",
+        "bearer": [
+          {
+            "key": "token",
+            "value": "{{listener key}}",
+            "type": "string"
+          }
+        ]
+      },
+      "item": [
+        {
+          "name": "GET /v1/models",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{semanticRouter}}/v1/models",
+              "host": [
+                "{{semanticRouter}}"
+              ],
+              "path": [
+                "v1",
+                "models"
+              ]
+            },
+            "description": "Lists what the router will accept as a `model` value: the auto entrypoint (`vllm-sr/auto`, from global.router.auto_model_name) plus the six concrete candidates, because global.router.include_config_models_in_list is true in config.yaml.\n\nReturns the OpenAI /v1/models shape. 401 with `{\"error\":{\"code\":\"invalid_api_key\"}}` if the bearer token is missing or wrong -- that 401 comes from the Envoy Lua filter, not from the router, so seeing it means Envoy is up and the listener key is the problem. Connection refused means vllm-sr-envoy is not running or PORT_SEMANTIC_ROUTER is not published.\n\nSee SEMANTIC_ROUTER.md > Ports and exposure."
+          },
+          "response": []
+        },
+        {
+          "name": "POST /v1/chat/completions -- vllm-sr/auto (default_confidence path)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"vllm-sr/auto\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"In two sentences, what is a Docker bind mount?\"\n    }\n  ],\n  \"max_tokens\": 512\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{semanticRouter}}/v1/chat/completions",
+              "host": [
+                "{{semanticRouter}}"
+              ],
+              "path": [
+                "v1",
+                "chat",
+                "completions"
+              ]
+            },
+            "description": "The catch-all decision. Nothing in this prompt trips the privacy, code or reasoning keyword signals, so `default_confidence` matches: qwen3.6 answers first and the router only escalates to qwen3.8 and then claude-sonnet-5 while the answer's average token logprob is below the -0.30 threshold. An easy prompt like this one should stop at the first rung.\n\nReturns a normal OpenAI chat completion. Read `route_diagnostics.looper` on the response body to see which decision matched, which algorithm ran, and which candidates were called -- that is the only way to tell the paths apart from the outside. SEMANTIC_ROUTER.md > Reading route_diagnostics.looper.\n\nErrors: 401 (listener key), 504 / empty body past 1800s (a candidate never returned -- check LiteLLM, not the router), 5xx from the router if every candidate failed and on_error did not cover it.\n\nSEMANTIC_ROUTER.md > Recipe table."
+          },
+          "response": []
+        },
+        {
+          "name": "POST /v1/chat/completions -- vllm-sr/auto (privacy_local path)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"vllm-sr/auto\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"A customer gave me their date of birth and bank account number for the financing application. How should I record that in the CRM?\"\n    }\n  ],\n  \"max_tokens\": 512\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{semanticRouter}}/v1/chat/completions",
+              "host": [
+                "{{semanticRouter}}"
+              ],
+              "path": [
+                "v1",
+                "chat",
+                "completions"
+              ]
+            },
+            "description": "Trips the `privacy_kw` signal (priority 300, matched before everything else), so the request goes to qwen3.8 with algorithm `static`: one local call, no fan-out, no escalation, and specifically no Anthropic.\n\nThis is the one item worth verifying in the LiteLLM Admin UI as well as here: after running it, the router's virtual key should show spend against qwen3.8 and NOTHING against claude-sonnet-5. If it does not, the decision did not match -- add the term to `privacy_kw` in config.yaml.\n\nRead `route_diagnostics.looper` on the response body to see which decision matched, which algorithm ran, and which candidates were called -- that is the only way to tell the paths apart from the outside. SEMANTIC_ROUTER.md > Reading route_diagnostics.looper.\n\nSEMANTIC_ROUTER.md > Recipe table."
+          },
+          "response": []
+        },
+        {
+          "name": "POST /v1/chat/completions -- vllm-sr/auto (coding_ratings path)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"vllm-sr/auto\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"This Python function throws a KeyError on the second call. Here is the stack trace and the regex it builds -- what is wrong and how do I fix it?\"\n    }\n  ],\n  \"max_tokens\": 2048\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{semanticRouter}}/v1/chat/completions",
+              "host": [
+                "{{semanticRouter}}"
+              ],
+              "path": [
+                "v1",
+                "chat",
+                "completions"
+              ]
+            },
+            "description": "Trips `code_kw` (priority 200) and runs the `ratings` looper: qwen3.8 and qwen3.8-flash answer in parallel, capped at max_concurrent 2 because qwen3.8-flash has exactly 2 llama.cpp slots.\n\nIMPORTANT -- `ratings` returns SEVERAL entries in `choices`. Open WebUI renders only the first; a raw API client like Postman is the only place you will see the rest, which is the main reason to run this item by hand.\n\nExpect no output at all until both candidates finish: Envoy runs ext_proc with buffered request and response bodies, so time-to-first-token is the SLOWEST candidate, not the fastest.\n\nRead `route_diagnostics.looper` on the response body to see which decision matched, which algorithm ran, and which candidates were called -- that is the only way to tell the paths apart from the outside. SEMANTIC_ROUTER.md > Reading route_diagnostics.looper.\n\nSEMANTIC_ROUTER.md > Recipe table and > Concurrency budget."
+          },
+          "response": []
+        },
+        {
+          "name": "POST /v1/chat/completions -- vllm-sr/auto (reasoning_remom path)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"vllm-sr/auto\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"Prove that the sum of the first n odd integers equals n squared, and derive the step-by-step argument rather than just stating the identity.\"\n    }\n  ],\n  \"max_tokens\": 4096\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{semanticRouter}}/v1/chat/completions",
+              "host": [
+                "{{semanticRouter}}"
+              ],
+              "path": [
+                "v1",
+                "chat",
+                "completions"
+              ]
+            },
+            "description": "Trips `reasoning_kw` (priority 150) and runs `remom` with breadth_schedule [3, 2]: three parallel attempts, then two, then one synthesis call -- SIX model calls for one user turn. This is the most expensive local path in the stack; run it deliberately, not in a loop.\n\n`include_intermediate_responses` is true in config.yaml, so the round-by-round attempts come back in the response body alongside the synthesis.\n\nSlowest item in the collection. If it returns nothing and then 504s, a candidate exceeded the 1800s listener timeout -- check qwen3.8-flash first, it only has 2 slots and this decision asks for 3 concurrent.\n\nRead `route_diagnostics.looper` on the response body to see which decision matched, which algorithm ran, and which candidates were called -- that is the only way to tell the paths apart from the outside. SEMANTIC_ROUTER.md > Reading route_diagnostics.looper.\n\nSEMANTIC_ROUTER.md > Recipe table and > Concurrency budget."
+          },
+          "response": []
+        },
+        {
+          "name": "POST /v1/chat/completions -- explicit candidate (no routing)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"qwen3.8\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"Say hello.\"\n    }\n  ],\n  \"max_tokens\": 64\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{semanticRouter}}/v1/chat/completions",
+              "host": [
+                "{{semanticRouter}}"
+              ],
+              "path": [
+                "v1",
+                "chat",
+                "completions"
+              ]
+            },
+            "description": "Sends a CONCRETE model name instead of the auto entrypoint. Only `vllm-sr/auto` triggers routing; anything else is treated as an explicit selection, and Envoy matches the x-selected-model header the router sets to that model's cluster -- which, for every model in this pool, is litellm:4000.\n\nUse it to bisect: if this works and the `vllm-sr/auto` items do not, the Envoy -> LiteLLM leg is fine and the problem is in decisions or the looper. If this fails too, the router cannot reach LiteLLM -- check SEMANTIC_ROUTER_LITELLM_KEY and its alias scoping.\n\nValid names here are exactly the providers.models entries in config.yaml: qwen3.6, qwen3.8, qwen3.8-solo, qwen3.8-flash, glm5.2, claude-sonnet-5. An unknown name falls through to Envoy's default route, which goes to models[0] (qwen3.6)."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Through LiteLLM",
+      "description": "The production path: model `auto` on {{litellm}}, authenticated with {{virtual master key}} via the collection-level auth. LiteLLM attaches the listener key server-side, so a chat client never sees it.",
+      "item": [
+        {
+          "name": "GET /v1/models -- confirm `auto` is registered",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{litellm}}/v1/models",
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "models"
+              ]
+            },
+            "description": "The router alias should appear as `auto`. If it does not, LiteLLM has not reloaded ai/litellm/litellm_config.yaml (`make up litellm`), or the virtual key in use is not scoped to it.\n\nUses the collection-level bearer, i.e. {{virtual master key}} -- NOT the listener key."
+          },
+          "response": []
+        },
+        {
+          "name": "POST /v1/chat/completions -- model `auto`",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"auto\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"In two sentences, what is a Docker bind mount?\"\n    }\n  ],\n  \"max_tokens\": 512\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/chat/completions",
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "chat",
+                "completions"
+              ]
+            },
+            "description": "The real production path: Open WebUI and every other client call `auto` here, LiteLLM rewrites it to `vllm-sr/auto` and forwards to http://vllm-sr-envoy:8899/v1 with SEMANTIC_ROUTER_LISTENER_KEY attached server-side. The caller never holds the listener key.\n\nCompare the result with the equivalent item in the 'Envoy listener (direct)' folder: identical output means the LiteLLM leg is transparent; a difference means LiteLLM is transforming the body (check drop_params and the alias's max_tokens).\n\nErrors worth knowing: a 400 about context length is `context_window_fallbacks: auto -> [qwen3.8-flash]` NOT firing; a response that is plainly from qwen3.8 rather than the router means `fallbacks: auto -> [qwen3.8, claude-sonnet-5]` fired because vllm-sr-envoy was unreachable. Both are configured in ai/litellm/litellm_config.yaml."
+          },
+          "response": []
+        },
+        {
+          "name": "POST /v1/chat/completions -- model `auto`, streaming",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"auto\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"Write a short shell one-liner that lists the ten largest files under a directory, and explain each part.\"\n    }\n  ],\n  \"stream\": true,\n  \"max_tokens\": 1024\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/chat/completions",
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "chat",
+                "completions"
+              ]
+            },
+            "description": "Same path with stream: true. Worth running because the answer is NOT incremental in the way the caller expects: Envoy buffers the whole ext_proc request and response body, so the stream stays silent for the entire routed turn and then delivers. Open WebUI shows a waiting state throughout.\n\nThis prompt trips `code_kw`, so it is a parallel ratings turn -- the silence is as long as the slower of qwen3.8 / qwen3.8-flash.\n\nIf the stream dies early, the culprit is a stream_timeout below 1800 on the `auto` alias, or a listener timeout below 1800s in config.yaml. The two must stay in step."
+          },
+          "response": []
+        },
+        {
+          "name": "POST /v1/chat/completions -- fallback check (stop vllm-sr-envoy first)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"auto\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"Say hello.\"\n    }\n  ],\n  \"max_tokens\": 64\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/chat/completions",
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "chat",
+                "completions"
+              ]
+            },
+            "description": "Phase 5 validation item, not an everyday call. Run `make down semantic-router vllm-sr-envoy`, then send this: LiteLLM should serve `auto` from qwen3.8 via `fallbacks` rather than returning an error, and the response's model field should say so.\n\nA hard 5xx instead means the `auto` entry is missing from the `fallbacks` map in ai/litellm/litellm_config.yaml -- LiteLLM reports that as 'Available Model Group Fallbacks=None'. Bring Envoy back with `make up semantic-router` afterwards."
+          },
+          "response": []
+        }
+      ]
+    }
+  ]
+}

@@ -4,7 +4,7 @@ This module is the single home for every CV detection function, from the
 always-run system checks (sharpness, exposure) to the opt-in feature
 detectors used with the `cv_feature` criterion type.
 
-System checks (always run in analyze_bgr, regardless of criteria)
+System checks (run for a criterion named "sharpness" / "exposure")
 ------------------------------------------------------------------
     check_blur()       — Laplacian variance → sharpness score
     check_exposure()   — Mean pixel intensity → exposure score
@@ -31,8 +31,11 @@ Adding a new detector
 3. Rebuild the container — no other changes needed.
 
 Process flow position: imported by analysis.py.
-    check_blur / check_exposure  → called unconditionally inside analyze_bgr()
-    get_detector()               → called for each cv_feature criterion
+    get_detector()  → called for each type="cv" criterion inside
+                      analyze_document(); the detector then runs on EVERY page
+                      image of the document (resized to ≤1000px), and the
+                      worst page's result is the one reported. A document with
+                      no page images (.txt / .docx) skips cv criteria entirely.
 """
 
 import difflib

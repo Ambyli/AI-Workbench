@@ -11,25 +11,34 @@ This module wires everything together:
     prometheus_fastapi_instrumentator.
   - Defines the API endpoints:
 
-    POST /assess            — submit a single-image assessment job (async).
+    POST /assess            — submit a single-document assessment job (async).
     POST /assess/compare    — submit a comparison job against references (async).
     GET  /jobs              — list recent jobs (from common.jobs.router).
     GET  /jobs/{job_id}     — poll for job status and result (from common.jobs.router).
     DELETE /jobs/{job_id}   — delete a job record (from common.jobs.router).
     GET  /hints             — list all hint values and their LLM rubric definitions.
     GET  /cv-detectors      — list all registered CV detector names grouped by function.
+    GET  /document-kinds    — supported upload kinds, text-match modes, OCR status.
     GET  /health            — liveness check.
     GET  /metrics           — Prometheus scrape endpoint (added by Instrumentator).
 
+Uploads are documents, not just images: JPEG/PNG, PDF (native or scanned),
+plain text, and .docx all load through ``common.documents`` into a page list
+that may carry an image, a text layer, or both. Criteria then run on whichever
+of those they need — ``cv`` on page images, ``text`` on the text layer
+(OCR-filled when the document is a scan), ``llm`` on one page image plus the
+extracted text.
+
 Overall request flow for /assess:
   1. HTTP request arrives → CorrelationIDMiddleware assigns [request_id].
-  2. assess_document() validates criteria, reads image bytes.
+  2. assess_document() validates criteria and the ocr mode, reads file bytes.
   3. Job record created in SQLite via ``jobs_registry.register(..., "staging")``.
-  4. Payload (image bytes + criteria) written to PAYLOAD_DIR/<job_id>.json,
-     then the row is flipped to "pending" and idle workers are woken.
+  4. Payload (file bytes + criteria + ocr mode) written to
+     PAYLOAD_DIR/<job_id>.json, then the row is flipped to "pending" and idle
+     workers are woken.
   5. 202 Accepted returned immediately with job_id.
   6. One of the worker tasks atomically claims the row (→ "processing"),
-     reads the payload, runs CV + LLM, and calls
+     reads the payload, loads the document, runs OCR + CV + text + LLM, and calls
      ``jobs_registry.set_result(...)`` on success or ``set_error(...)`` on failure.
   7. Caller polls GET /jobs/{job_id} until phase="completed" or "failed".
 
@@ -41,18 +50,38 @@ import json
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, UploadFile, Form
+from typing import Optional
+
+from fastapi import FastAPI, File, HTTPException, UploadFile, Form
 from fastapi.responses import JSONResponse
 from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel
 
+from common.documents import (
+    EXTENSIONS,
+    MAX_PATTERN_CHARS,
+    UnsupportedDocumentError,
+    detect_kind,
+)
 from common.jobs.router import build_router
 from common.jobs.sqlite import SqliteRegistry
 
-from analysis import parse_criteria, analyze_upload
-from config import DB_PATH, DEFAULT_CRITERIA, LOG_LEVEL
+from analysis import (
+    ocr_engine_status,
+    parse_criteria,
+    validate_content_type,
+    validate_text_criteria,
+)
+from config import (
+    DB_PATH,
+    DEFAULT_CRITERIA,
+    DOC_MAX_PAGES,
+    HINT_RUBRICS,
+    LOG_LEVEL,
+    PDF_RENDER_DPI,
+    TEXT_CHAR_BUDGET,
+)
 from cv import REGISTRY
-from llm import HINT_RUBRICS
 from logger import logger
 from middleware import CorrelationIDMiddleware, RequestIDFilter, request_id_var
 from models import CompareRequest
@@ -178,57 +207,121 @@ async def _enqueue(job_id: str, payload: dict) -> int:
 
 @app.post("/assess", status_code=202)
 async def assess_document(
-    image: UploadFile,
+    file: Optional[UploadFile] = File(
+        default=None,
+        description=(
+            "The document to assess: JPEG, PNG, PDF, .txt, or .docx. The kind is "
+            "detected from the bytes, not from this part's filename or content type."
+        ),
+    ),
+    image: Optional[UploadFile] = File(
+        default=None,
+        description="Deprecated alias for 'file', kept so existing callers keep working.",
+    ),
     criteria: str = Form(
         default=json.dumps(DEFAULT_CRITERIA),
         description=(
             'JSON array of criterion objects. Each must have "name" and optionally '
-            '"type" ("quality" or "feature") and "weight" (float, default 1.0). '
-            'Example: [{"name": "image sharpness", "type": "quality", "weight": 1.0}, '
-            '{"name": "has solar panels", "type": "feature", "weight": 3.0}]'
+            '"type" ("llm" default | "cv" | "text"), "hint", "weight" (float, default 1.0), '
+            'and "depends_on". type="text" additionally takes "pattern" (defaults to '
+            '"name"), "match" ("contains" default | "exact" | "regex" | "fuzzy"), '
+            '"case_sensitive", "fuzzy_threshold", and "min_count". '
+            'Example: [{"name": "image sharpness", "type": "cv", "weight": 1.0}, '
+            '{"name": "Notice to Owner", "type": "text", "match": "fuzzy", "weight": 3.0}]'
+        ),
+    ),
+    ocr: str = Form(
+        default="auto",
+        description=(
+            "Text-recognition policy: 'auto' (default — OCR only when text is needed "
+            "and missing), 'always' (OCR every page image), 'never' (skip OCR; text "
+            "criteria then fail with 'no text available')."
         ),
     ),
 ):
-    """Submit a single-image assessment job.
+    """Submit a single-document assessment job.
 
-    Returns 202 Accepted immediately with a job_id.
-    Poll GET /jobs/{job_id} until phase is "completed" or "failed".
+    Accepts JPEG/PNG, PDF, plain text, and .docx. Returns 202 Accepted
+    immediately with a job_id; poll GET /jobs/{job_id} until phase is
+    "completed" or "failed".
 
     Steps:
-      1. Parse and validate the criteria JSON.
-      2. Read the uploaded image bytes into memory.
-      3. Create a job record in the DB (phase=staging) via jobs_registry.
-      4. Write the payload to disk, flip the row to pending, wake a worker.
-      5. Return the job_id to the caller.
+      1. Resolve the uploaded part ('file', or the legacy 'image' alias).
+      2. Parse and validate the criteria JSON and the ocr mode.
+      3. Read the uploaded bytes into memory and detect the document kind
+         from its magic bytes (unsupported kinds are a 400 here, not a
+         failed job).
+      4. Create a job record in the DB (phase=staging) via jobs_registry.
+      5. Write the payload to disk, flip the row to pending, wake a worker.
+      6. Return the job_id to the caller.
     """
-    logger.info("assess_document: filename=%s content_type=%s", image.filename, image.content_type)
+    # Step 1 — 'file' is the current field name; 'image' is the original one
+    # and still accepted, because every existing caller sends it.
+    upload = file or image
+    if upload is None:
+        raise HTTPException(
+            status_code=400,
+            detail="No document uploaded. Send the file as the 'file' multipart field "
+                   "(the legacy name 'image' is also accepted).",
+        )
+    logger.info(
+        "assess_document: filename=%s content_type=%s field=%s ocr=%s",
+        upload.filename,
+        upload.content_type,
+        "file" if file is not None else "image",
+        ocr,
+    )
 
-    # Step 1 — parse criteria from the multipart form field
+    # Step 2 — validate the ocr mode, the declared content type, and criteria
+    if ocr not in ("auto", "always", "never"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid ocr mode '{ocr}'. Expected one of: auto, always, never.",
+        )
+    validate_content_type(upload.content_type)
+
     criterion_list = parse_criteria(criteria)
     if not criterion_list:
         raise HTTPException(status_code=400, detail="At least one criterion is required")
 
-    # Step 2 — read image bytes before returning (UploadFile is only readable during the request)
-    contents = await image.read()
+    # Step 3 — read bytes before returning (UploadFile is only readable during the request)
+    contents = await upload.read()
     if not contents:
-        raise HTTPException(status_code=400, detail="Empty image file")
+        raise HTTPException(status_code=400, detail="Empty document file")
 
-    # Step 3 — create a job record so the caller has an ID to poll
+    # Step 3b — identify the kind from the bytes NOW, so an unsupported upload
+    # (a legacy .doc, a video, a spreadsheet) is a 400 on this request rather
+    # than a job that fails in a worker a minute later. Magic-byte detection is
+    # microseconds; the full load (PDF render, OCR) still happens in the worker.
+    try:
+        kind = detect_kind(contents, filename=upload.filename, content_type=upload.content_type)
+    except UnsupportedDocumentError as exc:
+        logger.warning("assess_document: rejected %s: %s", upload.filename, exc)
+        raise HTTPException(status_code=400, detail=str(exc))
+    logger.info("assess_document: detected kind=%s (%d bytes)", kind, len(contents))
+
+    # Step 4 — create a job record so the caller has an ID to poll
     req_id = request_id_var.get("-")
     job_id = await jobs_registry.register(
         ClassifierMetadata(type="assess", request_id=req_id),
         initial_phase="staging",
     )
 
-    # Step 4 — enqueue: payload to disk first, THEN flip to pending so a worker
+    # Step 5 — enqueue: payload to disk first, THEN flip to pending so a worker
     # can never claim a row whose payload isn't there yet.
     depth = await _enqueue(
         job_id,
-        build_assess_payload(contents, image.content_type, image.filename or "upload", criterion_list),
+        build_assess_payload(
+            contents,
+            upload.content_type,
+            upload.filename or "upload",
+            criterion_list,
+            ocr,
+        ),
     )
     jobs_total.labels(type="assess", status="pending").inc()
 
-    # Step 5 — return immediately; caller polls for the result
+    # Step 6 — return immediately; caller polls for the result
     logger.info("assess_document: queued job_id=%s queue_depth=%d", job_id, depth)
     return JSONResponse(
         status_code=202,
@@ -243,17 +336,23 @@ async def assess_with_reference(request: CompareRequest):
     Returns 202 Accepted immediately with a job_id.
     Poll GET /jobs/{job_id} until phase is "completed" or "failed".
 
-    The entire CompareRequest (including all example images or their
+    Subject and examples may be any supported document kind (JPEG/PNG, PDF,
+    .txt, .docx) and all of them are analysed under the request's single
+    ``ocr`` policy, so their text layers are comparable.
+
+    The entire CompareRequest (including all example documents or their
     pre_generated_analysis blobs) is written to the payload store and
     re-validated by the worker, so the job survives a restart.
     """
-    logger.info("assess_with_reference: %d example(s) aggregation=%s criteria=%s",
-                len(request.examples), request.aggregation,
+    logger.info("assess_with_reference: %d example(s) aggregation=%s ocr=%s criteria=%s",
+                len(request.examples), request.aggregation, request.ocr,
                 [c.name for c in request.criteria])
 
     # Step 1 — validate criteria (Pydantic enforces examples min_length=1)
     if not request.criteria:
         raise HTTPException(status_code=400, detail="At least one criterion is required")
+    # Reject an unusable text pattern now rather than in a worker minutes later
+    validate_text_criteria(request.criteria)
 
     # Step 2 — create job record
     req_id = request_id_var.get("-")
@@ -306,6 +405,98 @@ def list_cv_detectors():
 
     logger.debug("list_cv_detectors: returning %d detectors", len(detectors))
     return JSONResponse(content={"detectors": detectors, "total_names": len(REGISTRY)})
+
+
+@app.get("/document-kinds")
+def list_document_kinds():
+    """Return the upload kinds this service accepts and how they are handled.
+
+    A cheap introspection endpoint, like /hints and /cv-detectors: it answers
+    "what can I send, what will it be able to evaluate, and is OCR actually
+    available right now?" without submitting a job. Nothing here is a
+    per-request setting — the limits come from the container's environment.
+    """
+    logger.debug("list_document_kinds: building capability map")
+
+    kinds = [
+        {
+            "kind": "image",
+            "extensions": EXTENSIONS["image"],
+            "content_types": ["image/jpeg", "image/png"],
+            "detection": "magic bytes: FF D8 FF (JPEG) / 89 50 4E 47 0D 0A 1A 0A (PNG)",
+            "pages": "1",
+            "has_page_images": True,
+            "native_text": False,
+            "notes": "EXIF orientation is applied on load. Text criteria need OCR.",
+        },
+        {
+            "kind": "pdf",
+            "extensions": EXTENSIONS["pdf"],
+            "content_types": ["application/pdf"],
+            "detection": "magic bytes: %PDF- (anywhere in the first 1 KB)",
+            "pages": f"up to CLASSIFIER_DOC_MAX_PAGES ({DOC_MAX_PAGES}); extras are "
+                     "reported in document_info.truncated_pages",
+            "has_page_images": True,
+            "native_text": True,
+            "notes": f"Each page is rendered at {PDF_RENDER_DPI} dpi for cv/llm criteria. "
+                     "A scanned PDF has no native text layer, so OCR fills it in.",
+        },
+        {
+            "kind": "txt",
+            "extensions": EXTENSIONS["txt"],
+            "content_types": ["text/plain"],
+            "detection": "decodes as UTF-8 (BOM allowed), no NUL bytes, mostly printable",
+            "pages": "1",
+            "has_page_images": False,
+            "native_text": True,
+            "notes": "No rendered surface — cv criteria are SKIPPED and the llm call is "
+                     "text-only.",
+        },
+        {
+            "kind": "docx",
+            "extensions": EXTENSIONS["docx"],
+            "content_types": [
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            ],
+            "detection": "ZIP magic PK\\x03\\x04 containing word/document.xml",
+            "pages": "1 (python-docx reads XML, not a laid-out page)",
+            "has_page_images": False,
+            "native_text": True,
+            "notes": "Paragraphs and table cells are extracted in document order; table "
+                     "rows are flattened to 'cell | cell'. cv criteria are SKIPPED.",
+        },
+    ]
+
+    return JSONResponse(
+        content={
+            "kinds": kinds,
+            "unsupported": [
+                {
+                    "kind": "doc",
+                    "reason": "Legacy OLE2 Word files are not readable by python-docx. "
+                              "Convert to .docx and re-upload.",
+                    "detection": "magic bytes: D0 CF 11 E0 A1 B1 1A E1",
+                }
+            ],
+            "text_match_modes": {
+                "contains": "substring anywhere in the document text (default)",
+                "exact": "whole word or whole line (word-boundary anchored)",
+                "regex": f"Python regular expression, max {MAX_PATTERN_CHARS} characters",
+                "fuzzy": "best sliding-window similarity — use this on OCR'd text",
+            },
+            "ocr": {
+                **ocr_engine_status(),
+                "modes": ["auto", "always", "never"],
+                "default": "auto",
+            },
+            "limits": {
+                "max_pages": DOC_MAX_PAGES,
+                "pdf_render_dpi": PDF_RENDER_DPI,
+                "llm_text_char_budget": TEXT_CHAR_BUDGET,
+                "images_per_llm_prompt": 1,
+            },
+        }
+    )
 
 
 @app.get("/health")

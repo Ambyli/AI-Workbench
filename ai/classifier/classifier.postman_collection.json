@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "classifier",
-    "description": "Document Classifier endpoints, called through the LiteLLM pass-through registered in ai/litellm/litellm_config.yaml (`pass_through_endpoints` → `/v1/classifier` → `http://classifier:8000`, `include_subpath: true`, methods GET/POST/DELETE, `forward_headers: true`). Every request is authenticated with a Bearer token from a LiteLLM virtual key. Set the collection variables `litellm` (e.g. http://localhost:4001) and `virtual master key` (an sk-… key issued from the LiteLLM Admin UI → Virtual Keys) — every request inherits them via collection-level auth. See ai/classifier/API.md for the full endpoint reference and ai/litellm/LITELLM.md for issuing virtual keys.\n\nDirect base URL (bypassing LiteLLM, only useful inside the ai_shared network or when PORT_CLASSIFIER is published): http://classifier:8000 or http://<host>:${PORT_CLASSIFIER}. All examples in this collection use the LiteLLM pass-through path.\n\nAsync-job pattern: POST /assess and POST /assess/compare both return 202 Accepted immediately with `{job_id, phase: \"pending\"}`. Callers poll GET /jobs/{job_id} until `phase` is `completed` or `failed`, then read the `result` field. Concurrency: the SQLite jobs table is the queue — `CLASSIFIER_MAX_CONCURRENT` worker tasks (default 2, `.env`) each atomically claim the oldest `pending` row, so at most that many jobs are analysed at once and pending work survives a container restart (payloads live in `/data/payloads` until the job is terminal). Job tracking is powered by the shared `common.jobs` package (SqliteRegistry backend); the `/jobs`, `/jobs/{id}`, and DELETE `/jobs/{id}` routes are mounted via `common.jobs.router.build_router(..., include_delete=True, include_cancel=False)`. Response migration note: the top-level `id` is now `job_id`, `status` is now `phase`, and the previously separate `type` + `request_id` columns are nested under `metadata`. See API.md § `GET /jobs/{job_id}` for the full shape.\n\nCopy the `job_id` from a POST /assess or POST /assess/compare response into the `jobId` collection variable to run the GET/DELETE /jobs/{jobId} requests.",
+    "description": "Document Classifier endpoints — JPEG/PNG, PDF, .txt and .docx uploads scored by OpenCV detectors, deterministic text matching, and vision-LLM criteria — called through the LiteLLM pass-through registered in ai/litellm/litellm_config.yaml (`pass_through_endpoints` → `/v1/classifier` → `http://classifier:8000`, `include_subpath: true`, methods GET/POST/DELETE, `forward_headers: true`). Every request is authenticated with a Bearer token from a LiteLLM virtual key. Set the collection variables `litellm` (e.g. http://localhost:4001) and `virtual master key` (an sk-… key issued from the LiteLLM Admin UI → Virtual Keys) — every request inherits them via collection-level auth. See ai/classifier/API.md for the full endpoint reference and ai/litellm/LITELLM.md for issuing virtual keys.\n\nDirect base URL (bypassing LiteLLM, only useful inside the ai_shared network or when PORT_CLASSIFIER is published): http://classifier:8000 or http://<host>:${PORT_CLASSIFIER}. All examples in this collection use the LiteLLM pass-through path.\n\nAsync-job pattern: POST /assess and POST /assess/compare both return 202 Accepted immediately with `{job_id, phase: \"pending\"}`. Callers poll GET /jobs/{job_id} until `phase` is `completed` or `failed`, then read the `result` field. Concurrency: the SQLite jobs table is the queue — `CLASSIFIER_MAX_CONCURRENT` worker tasks (default 2, `.env`) each atomically claim the oldest `pending` row, so at most that many jobs are analysed at once and pending work survives a container restart (payloads live in `/data/payloads` until the job is terminal). Job tracking is powered by the shared `common.jobs` package (SqliteRegistry backend); the `/jobs`, `/jobs/{id}`, and DELETE `/jobs/{id}` routes are mounted via `common.jobs.router.build_router(..., include_delete=True, include_cancel=False)`. Response migration note: the top-level `id` is now `job_id`, `status` is now `phase`, and the previously separate `type` + `request_id` columns are nested under `metadata`. See API.md § `GET /jobs/{job_id}` for the full shape.\n\nCopy the `job_id` from a POST /assess or POST /assess/compare response into the `jobId` collection variable to run the GET/DELETE /jobs/{jobId} requests.\n\nDocuments: uploads are not limited to images. `common.documents` detects the kind from the bytes (never the filename or Content-Type) and normalises JPEG/PNG, PDF, plain text, and .docx into pages that may carry an image, a text layer, or both — so `cv` criteria run on page images, `text` criteria search the text layer (OCR-filled for scans and photos), and `llm` criteria see ONE page image plus the extracted text (muse-glimmer runs without `--limit-mm-per-prompt`, so vLLM accepts a single image per request). GET /document-kinds reports the live capability list, and the `Documents` folder in this collection has a ready-to-run request per fixture in unit-tests/classifier/documents/. See API.md § Documents.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
     "_postman_id": "classifier-collection"
   },
@@ -60,7 +60,7 @@
           "host": ["{{litellm}}"],
           "path": ["v1", "classifier", "hints"]
         },
-        "description": "Enumerate all available `hint` values and their LLM scoring rubrics. Returns `{\"hints\": {\"quality\": {...}, \"presence\": {...}, \"auto\": {...}}}` where each rubric object has `heading`, `rubric`, and `extra` fields sourced from `llm.HINT_RUBRICS`. Use these values as the `hint` field on a CriterionInput:\n\n- `quality`: score image quality 1-10 (1-3 = FAIL, 4-6 = MARGINAL, 7-10 = PASS).\n- `presence`: detect presence/absence (10=present, 5=uncertain, 1=absent) with chain-of-thought reasoning in `extra`.\n- `auto` (default): LLM infers the rubric from the criterion name.\n\nNo request body. See API.md § `GET /hints`."
+        "description": "Enumerate all available `hint` values and their LLM scoring rubrics. Returns `{\"hints\": {\"quality\": {...}, \"presence\": {...}, \"auto\": {...}}}` where each rubric object has `heading`, `rubric`, and `extra` fields sourced from `config.HINT_RUBRICS`. Use these values as the `hint` field on a CriterionInput:\n\n- `quality`: score image quality 1-10 (1-3 = FAIL, 4-6 = MARGINAL, 7-10 = PASS).\n- `presence`: detect presence/absence (10=present, 5=uncertain, 1=absent) with chain-of-thought reasoning in `extra`.\n- `auto` (default): LLM infers the rubric from the criterion name.\n\nNo request body. See API.md § `GET /hints`."
       },
       "response": []
     },
@@ -74,7 +74,21 @@
           "host": ["{{litellm}}"],
           "path": ["v1", "classifier", "cv-detectors"]
         },
-        "description": "List every registered OpenCV detector, grouped by underlying detector function. Returns `{\"detectors\": [{\"function\": \"check_blur\", \"names\": [\"is blurry\", \"is sharp\", \"sharpness\"]}, ...], \"total_names\": N}`. Use any of the `names` as the `name` field on a CriterionInput with `type=\"cv\"` — fuzzy matching is applied at runtime, so near-matches also work. If no detector matches, the criterion silently falls back to LLM scoring and the response's `method` field reflects the actual path taken.\n\nBuilt-in detector functions: `check_blur` (Laplacian variance), `check_exposure` (mean pixel intensity), `detect_vegetation` (HSV green masking), `detect_sky`, `detect_faces` (Haar cascade), `detect_water`, `detect_text` (Sobel edge density). See API.md § `Built-in cv detector names`."
+        "description": "List every registered OpenCV detector, grouped by underlying detector function. Returns `{\"detectors\": [{\"function\": \"check_blur\", \"names\": [\"is blurry\", \"is sharp\", \"sharpness\"]}, ...], \"total_names\": N}`. Use any of the `names` as the `name` field on a CriterionInput with `type=\"cv\"` — fuzzy matching is applied at runtime, so near-matches also work. If no detector matches, the criterion silently falls back to LLM scoring and the response's `method` field reflects the actual path taken.\n\nBuilt-in detector functions: `check_blur` (Laplacian variance), `check_exposure` (mean pixel intensity), `detect_vegetation` (HSV green masking), `detect_sky`, `detect_faces` (Haar cascade), `detect_water`, `detect_text` (Sobel edge density). See API.md § `Built-in cv detector names`.\n\nNote for documents: cv criteria need page images. An image or a PDF has them (PDF pages are rendered at CLASSIFIER_PDF_RENDER_DPI); a .txt or .docx does not, so cv criteria against those come back SKIPPED with `method: \"skipped\"` and are excluded from the weighted score. On a multi-page document a cv criterion runs on every page and reports the WORST page, with each page's measurement in a `pages` array."
+      },
+      "response": []
+    },
+    {
+      "name": "GET /document-kinds",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{litellm}}/v1/classifier/document-kinds",
+          "host": ["{{litellm}}"],
+          "path": ["v1", "classifier", "document-kinds"]
+        },
+        "description": "Report what this container accepts as an upload and what it can do with it — cheap introspection, like /hints and /cv-detectors; no job is submitted.\n\nReturns `{kinds, unsupported, text_match_modes, ocr, limits}`:\n\n- `kinds`: one entry per supported kind (`image`, `pdf`, `txt`, `docx`) with its `extensions`, `content_types`, the magic-byte `detection` rule, how many `pages` it can produce, `has_page_images`, `native_text`, and notes. Detection is always by bytes — a PDF uploaded as image/png still loads as a PDF.\n- `unsupported`: currently just legacy `.doc` (OLE2, magic `D0 CF 11 E0 A1 B1 1A E1`), rejected with a 400 telling the caller to convert to .docx.\n- `text_match_modes`: the four `match` values a `type: \"text\"` criterion accepts (`contains`, `exact`, `regex` with its 500-character pattern cap, `fuzzy`).\n- `ocr`: `{engine, available, min_native_chars, modes, default}`. `available` is the honest answer — false both when CLASSIFIER_OCR_ENGINE=none and when the engine failed to load. Check it before blaming a failing text criterion on the document.\n- `limits`: `max_pages` (CLASSIFIER_DOC_MAX_PAGES), `pdf_render_dpi`, `llm_text_char_budget`, and `images_per_llm_prompt` (1 — muse-glimmer runs without `--limit-mm-per-prompt`).\n\nNo request body. See API.md § `GET /document-kinds`."
       },
       "response": []
     },
@@ -87,16 +101,29 @@
           "mode": "formdata",
           "formdata": [
             {
+              "key": "file",
+              "type": "file",
+              "src": "unit-tests/classifier/documents/invoice_native.pdf",
+              "description": "The document to assess: JPEG, PNG, PDF, .txt, or .docx. The kind is detected from the bytes (common.documents.detect_kind), never from the filename or the part's Content-Type — a PDF uploaded as image/png still loads as a PDF, and a legacy .doc is rejected with a 400 telling you to convert it. Read into memory during the request via `await upload.read()`; the worker receives the bytes, so the UploadFile is not stored on disk. The `src` here points at a repo fixture — re-select the file in Postman if your working directory differs."
+            },
+            {
               "key": "image",
               "type": "file",
               "src": "",
-              "description": "JPEG or PNG image file. Read into memory during the request via `await image.read()`; the worker receives the bytes, so the UploadFile is not stored on disk."
+              "disabled": true,
+              "description": "Deprecated alias for `file`, still accepted so existing callers keep working. Send one of the two; `file` wins when both are present, and sending neither is a 400."
             },
             {
               "key": "criteria",
               "type": "text",
-              "value": "[{\"name\":\"has electrical meter\",\"type\":\"llm\",\"hint\":\"presence\",\"weight\":4.0},{\"name\":\"meter value is readable\",\"type\":\"llm\",\"hint\":\"quality\",\"weight\":3.0,\"depends_on\":\"has electrical meter\"},{\"name\":\"three feet of clearance around meter\",\"type\":\"llm\",\"hint\":\"presence\",\"weight\":2.5,\"depends_on\":\"has electrical meter\"},{\"name\":\"sharpness\",\"type\":\"cv\",\"weight\":1.0}]",
-              "description": "JSON array of CriterionInput objects. Each must have `name`; optional fields are `type` (`llm` default | `cv`), `weight` (float > 0, default 1.0), `hint` (`quality` | `presence` | `auto` default), and `depends_on` (name of another criterion that must PASS score >= 7 before this one runs — otherwise this criterion is marked SKIPPED and excluded from the weighted score). Chains are supported: A → B → C all skip if A fails. If omitted, `config.DEFAULT_CRITERIA` is used."
+              "value": "[{\"name\":\"Notice to Owner\",\"type\":\"text\",\"match\":\"fuzzy\",\"weight\":3.0},{\"name\":\"total amount\",\"type\":\"text\",\"match\":\"regex\",\"pattern\":\"\\\\$[\\\\d,]+\\\\.\\\\d{2}\",\"weight\":2.0},{\"name\":\"meter value is readable\",\"type\":\"llm\",\"hint\":\"quality\",\"weight\":3.0,\"depends_on\":\"Notice to Owner\"},{\"name\":\"sharpness\",\"type\":\"cv\",\"weight\":1.0}]",
+              "description": "JSON array of CriterionInput objects. Each must have `name`; optional fields are `type` (`llm` default | `cv` | `text`), `weight` (float > 0, default 1.0), `hint` (`quality` | `presence` | `auto` default), and `depends_on` (name of another criterion that must PASS score >= 7 before this one runs — otherwise this criterion is marked SKIPPED and excluded from the weighted score). Chains are supported: A → B → C all skip if A fails.\n\ntype=\"text\" adds `pattern` (defaults to `name`, max 500 chars), `match` (`contains` default | `exact` | `exact` is word/line anchored | `regex` | `fuzzy`), `case_sensitive` (false), `fuzzy_threshold` (0.85), and `min_count` (1). Text criteria are deterministic and cost no tokens; they search the document's native text layer, or the OCR'd text for a scan/photo. Use `fuzzy` on anything OCR'd. An empty, over-long, or invalid regex pattern is rejected with 400 at submit time.\n\nIf omitted, `config.DEFAULT_CRITERIA` is used."
+            },
+            {
+              "key": "ocr",
+              "type": "text",
+              "value": "auto",
+              "description": "Text-recognition policy: `auto` (default — recognise only when text is wanted and missing: a page carries an image whose native text is under CLASSIFIER_OCR_MIN_NATIVE_CHARS AND the request has a text or llm criterion), `always` (recognise every page image, replacing any native text), `never` (skip OCR; text criteria on an image-only document then score 1/FAIL with \"No text available for this document…\"). Anything else is a 400. A deployment with CLASSIFIER_OCR_ENGINE=none behaves as `never` regardless — check GET /document-kinds → `ocr.available`."
             }
           ]
         },
@@ -105,7 +132,7 @@
           "host": ["{{litellm}}"],
           "path": ["v1", "classifier", "assess"]
         },
-        "description": "Submit a single-image assessment job. Content-Type is `multipart/form-data`. Returns **202 Accepted** immediately with `{\"job_id\": \"<id>\", \"phase\": \"pending\"}` — this is the async pattern, so poll GET /jobs/{jobId} until `phase` is `completed` or `failed`, then read the `result` field.\n\nServer-side flow (main.py `assess_document`):\n  1. Parse the `criteria` JSON form field via `analysis.parse_criteria`.\n  2. Read the uploaded image bytes into memory (UploadFile is only readable during the request).\n  3. Create a job record in the SQLite jobs registry with `metadata={type: \"assess\", request_id: <req>}` and `initial_phase=\"staging\"`.\n  4. Write `{image_b64, content_type, filename, criteria}` to `PAYLOAD_DIR/<job_id>.json`, flip the row to `pending`, wake an idle worker (one of `CLASSIFIER_MAX_CONCURRENT`).\n  5. Return `202` with the job_id.\n\nErrors: **400** if the criteria list is empty or the image body is empty; **422** if the criteria JSON is malformed or fails Pydantic validation of CriterionInput.\n\nResult shape once completed: `{image_info, assessment: {overall_verdict, overall_score, per_criterion_scores, weighted_score_breakdown}, verdict}`. SKIPPED criteria appear in `per_criterion_scores` with `verdict: \"SKIPPED\"`, `score: null`, `method: \"skipped\"`, and a reason string, and are excluded from the weighted score. See API.md § `POST /assess`.\n\nPostman note: click the `image` row's file selector to attach a real JPEG/PNG — the placeholder `src` in this template is empty."
+        "description": "Submit a single-document assessment job — JPEG, PNG, PDF, .txt, or .docx. Content-Type is `multipart/form-data`. Returns **202 Accepted** immediately with `{\"job_id\": \"<id>\", \"phase\": \"pending\"}` — this is the async pattern, so poll GET /jobs/{jobId} until `phase` is `completed` or `failed`, then read the `result` field.\n\nServer-side flow (main.py `assess_document`):\n  1. Resolve the upload: the `file` part, or the legacy `image` alias; neither present is a 400.\n  2. Validate the `ocr` mode and the declared content type (allowlist: image/jpeg, image/png, application/pdf, text/plain, the .docx type, application/octet-stream — the magic bytes have the final say).\n  3. Parse the `criteria` JSON form field via `analysis.parse_criteria`, which also compiles any text pattern so a bad regex fails here rather than in a worker.\n  4. Read the uploaded bytes into memory (UploadFile is only readable during the request).\n  5. Create a job record in the SQLite jobs registry with `metadata={type: \"assess\", request_id: <req>}` and `initial_phase=\"staging\"`.\n  6. Write `{file_b64, content_type, filename, criteria, ocr}` to `PAYLOAD_DIR/<job_id>.json`, flip the row to `pending`, wake an idle worker (one of `CLASSIFIER_MAX_CONCURRENT`).\n  7. Return `202` with the job_id.\n\nThe worker then loads the bytes into a Document (kind detection, PDF page rendering at CLASSIFIER_PDF_RENDER_DPI up to CLASSIFIER_DOC_MAX_PAGES, native text extraction), runs OCR if needed, then the cv / text / llm criteria.\n\nErrors: **400** if no file was sent, the criteria list is empty, the body is empty, the `ocr` value is not auto|always|never, a text pattern is unusable, the content type is outside the allowlist, or the bytes are not a supported document (legacy .doc gets its own \"convert to .docx\" message); **422** if the criteria JSON fails Pydantic validation of CriterionInput.\n\nResult shape once completed: `{image_info, document_info, assessment: {overall_verdict, overall_score, per_criterion_scores, weighted_score_breakdown}, verdict}`. `document_info` carries `kind`, `page_count`, `truncated_pages`, per-page `text_source`/`ocr_confidence`/`text_chars`, the `ocr` block (`mode`, `engine`, `ran`, `pages_recognised`), `text_sent_to_llm`, and `llm_image_page`. SKIPPED criteria appear in `per_criterion_scores` with `verdict: \"SKIPPED\"`, `score: null`, `method: \"skipped\"`, and a reason string, and are excluded from the weighted score — either because a `depends_on` did not pass, or because a `cv` criterion was sent against a .txt/.docx, which has no page images. See API.md § `POST /assess`.\n\nPostman note: the `file` row's `src` points at a repo fixture (unit-tests/classifier/documents/invoice_native.pdf). Re-select the file if your working directory differs, and see the `Documents` folder for one ready-to-run request per fixture."
       },
       "response": []
     },
@@ -118,7 +145,7 @@
         ],
         "body": {
           "mode": "raw",
-          "raw": "{\n  \"image\": {\n    \"data\": \"https://example.com/subject.jpg\",\n    \"type\": \"url\"\n  },\n  \"criteria\": [\n    {\"name\": \"has electrical meter\", \"type\": \"llm\", \"hint\": \"presence\", \"weight\": 4.0},\n    {\"name\": \"meter value is readable\", \"type\": \"llm\", \"hint\": \"quality\", \"weight\": 3.0, \"depends_on\": \"has electrical meter\"},\n    {\"name\": \"sharpness\", \"type\": \"cv\", \"weight\": 1.0}\n  ],\n  \"aggregation\": \"mean\",\n  \"examples\": [\n    {\n      \"data\": \"https://example.com/reference-good.jpg\",\n      \"type\": \"url\",\n      \"weight\": 0.5\n    },\n    {\n      \"data\": \"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=\",\n      \"type\": \"base64\",\n      \"weight\": 0.5\n    }\n  ]\n}",
+          "raw": "{\n  \"image\": {\n    \"data\": \"https://example.com/notice.pdf\",\n    \"type\": \"url\"\n  },\n  \"criteria\": [\n    {\"name\": \"Notice to Owner\", \"type\": \"text\", \"match\": \"fuzzy\", \"fuzzy_threshold\": 0.85, \"weight\": 3.0},\n    {\"name\": \"has electrical meter\", \"type\": \"llm\", \"hint\": \"presence\", \"weight\": 4.0},\n    {\"name\": \"meter value is readable\", \"type\": \"llm\", \"hint\": \"quality\", \"weight\": 3.0, \"depends_on\": \"has electrical meter\"},\n    {\"name\": \"sharpness\", \"type\": \"cv\", \"weight\": 1.0}\n  ],\n  \"aggregation\": \"mean\",\n  \"ocr\": \"auto\",\n  \"examples\": [\n    {\n      \"data\": \"https://example.com/reference-good.pdf\",\n      \"type\": \"url\",\n      \"weight\": 0.5\n    },\n    {\n      \"data\": \"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=\",\n      \"type\": \"base64\",\n      \"weight\": 0.5\n    }\n  ]\n}",
           "options": { "raw": { "language": "json" } }
         },
         "url": {
@@ -126,7 +153,7 @@
           "host": ["{{litellm}}"],
           "path": ["v1", "classifier", "assess", "compare"]
         },
-        "description": "Submit a comparison job — assess a subject image against one or more reference examples. Content-Type is `application/json`. Body is a CompareRequest (see models.py):\n\n- `image`: ImageInput `{data, type: \"base64\" | \"url\"}`. URL inputs are SSRF-checked before fetching (see ssrf.py).\n- `criteria`: list[CriterionInput], defaults to `config.DEFAULT_CRITERIA` if omitted.\n- `aggregation`: `mean` (default, balanced) | `min` (strictest — must match all examples) | `max` (most lenient — must match any).\n- `examples`: list[ExampleInput] with `min_length=1`. Each has `data`, `type`, `weight` (0.0–1.0, default 0.5 — how much similarity to this example influences the combined score; `0.0` = ignore, `1.0` = similarity only), and optional `pre_generated_analysis` (a prior `result` from /assess to skip re-analysing the reference).\n\nReturns **202 Accepted** immediately with `{\"job_id\": \"<id>\", \"phase\": \"pending\"}`. Poll GET /jobs/{jobId} for the result.\n\nServer-side flow (main.py `assess_with_reference`):\n  1. Validate `request.criteria` non-empty (Pydantic already enforces `examples` min_length=1).\n  2. Create a job record with `metadata={type: \"compare\", request_id: <req>}` in phase `staging`.\n  3. Write the full CompareRequest to `PAYLOAD_DIR/<job_id>.json`, flip the row to `pending`, wake an idle worker — runners.run_compare re-validates it from disk so the job survives a restart.\n  4. Return `202` with the job_id.\n\nErrors: **400** if criteria list is empty; **422** if the body fails CompareRequest validation (missing examples, invalid aggregation literal, weight out of range, malformed ImageInput/ExampleInput).\n\nCombined-score formula: `combined = (1 - weight) × input_overall_score + weight × similarity_score`. Result shape: `{status, criteria, aggregation, input_analysis, example_results[], aggregate: {method, combined_score, combined_verdict, per_example_combined_scores}}`. See API.md § `POST /assess/compare`.\n\nCaching: `pre_generated_analysis` values must come from the SAME version of the classifier that is currently running — stored analyses from older versions cause runtime errors. Re-generate after upgrades. See API.md § Caching example analyses."
+        "description": "Submit a comparison job — assess a subject document against one or more reference examples. Content-Type is `application/json`. Body is a CompareRequest (see models.py):\n\n- `image`: DocumentInput `{data, type: \"base64\" | \"url\"}` — the field keeps its name for compatibility but accepts any supported kind (JPEG/PNG, PDF, .txt, .docx); the bytes decide, not the URL's extension. URL inputs are SSRF-checked before fetching (see ssrf.py). `ImageInput` remains an alias of `DocumentInput`.\n- `criteria`: list[CriterionInput], defaults to `config.DEFAULT_CRITERIA` if omitted. `type: \"text\"` criteria work here exactly as on /assess.\n- `aggregation`: `mean` (default, balanced) | `min` (strictest — must match all examples) | `max` (most lenient — must match any).\n- `ocr`: `auto` (default) | `always` | `never`, applied to the subject AND every live example so their text layers are comparable.\n- `examples`: list[ExampleInput] with `min_length=1`. Each has `data`, `type`, `weight` (0.0–1.0, default 0.5 — how much similarity to this example influences the combined score; `0.0` = ignore, `1.0` = similarity only), and optional `pre_generated_analysis` (a prior `result` from /assess to skip re-analysing the reference).\n\nReturns **202 Accepted** immediately with `{\"job_id\": \"<id>\", \"phase\": \"pending\"}`. Poll GET /jobs/{jobId} for the result.\n\nServer-side flow (main.py `assess_with_reference`):\n  1. Validate `request.criteria` non-empty (Pydantic already enforces `examples` min_length=1) and compile any text pattern, so a bad regex is a 400 here rather than a failed job.\n  2. Create a job record with `metadata={type: \"compare\", request_id: <req>}` in phase `staging`.\n  3. Write the full CompareRequest to `PAYLOAD_DIR/<job_id>.json`, flip the row to `pending`, wake an idle worker — runners.run_compare re-validates it from disk so the job survives a restart.\n  4. Return `202` with the job_id.\n\nErrors: **400** if criteria list is empty or a text pattern is unusable; **422** if the body fails CompareRequest validation (missing examples, invalid aggregation or ocr literal, weight out of range, malformed DocumentInput/ExampleInput).\n\nCombined-score formula: `combined = (1 - weight) × input_overall_score + weight × similarity_score`. Result shape: `{status, criteria, aggregation, ocr, input_analysis, example_results[], aggregate: {method, combined_score, combined_verdict, per_example_combined_scores}}`; each analysis carries its own `document_info`. See API.md § `POST /assess/compare`.\n\nCaching: `pre_generated_analysis` values must come from the SAME version of the classifier that is currently running — stored analyses from older versions cause runtime errors. Re-generate after upgrades. See API.md § Caching example analyses."
       },
       "response": []
     },
@@ -177,6 +204,258 @@
         "description": "Delete a job record from the SQLite registry. Returns **204 No Content** on success (empty body). Idempotent from the caller's perspective in the sense that once gone the record stays gone — but the underlying `registry.delete` returns False for unknown ids, so a repeat call for the same id returns **404** with `detail: \"no job '<id>'\"`.\n\nNo cancel semantics: the worker doesn't currently observe a cancel signal mid-analysis, so `include_cancel=False` on the mounted router (see main.py). Deleting a job that's still `pending` removes the row before any worker claims it, so it never runs (its payload file is swept at the next startup). Deleting one that's `processing` does NOT abort the in-flight worker task — the worker will attempt to write its result/error to a row that no longer exists (logged, but harmless). See API.md § `DELETE /jobs/{job_id}`."
       },
       "response": []
+    },
+    {
+      "name": "Documents",
+      "description": "One ready-to-run POST /assess per fixture in unit-tests/classifier/documents/ — a native PDF, a scanned PDF (with and without OCR), a .txt, a .docx, a well and a badly photographed letter, and a legacy .doc. Each request already carries criteria tailored to its fixture and states the expected outcome. Regenerate the fixtures with `uv run --package classifier python unit-tests/classifier/documents/make_fixtures.py`; the folder's README.md holds the same table plus curl equivalents.\n\nEvery request is async: the POST returns `{job_id, phase}`, so copy the job_id into the `jobId` collection variable and run GET /jobs/{jobId} to see the result. Postman resolves each `src` relative to its working directory — re-select the file if it cannot find it.",
+      "item": [
+        {
+          "name": "invoice_native.pdf — native text, all four match modes",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": "unit-tests/classifier/documents/invoice_native.pdf",
+                  "description": "2-page PDF with a real text layer and a line-items table."
+                },
+                {
+                  "key": "criteria",
+                  "type": "text",
+                  "value": "[{\"name\":\"Invoice #INV-2026-0042\",\"type\":\"text\",\"match\":\"contains\",\"weight\":3.0},{\"name\":\"Notice to Owner\",\"type\":\"text\",\"match\":\"fuzzy\",\"weight\":3.0},{\"name\":\"Payment Terms: Net 30\",\"type\":\"text\",\"match\":\"exact\",\"weight\":2.0},{\"name\":\"total amount\",\"type\":\"text\",\"match\":\"regex\",\"pattern\":\"\\\\$[\\\\d,]+\\\\.\\\\d{2}\"},{\"name\":\"lien waiver attached\",\"type\":\"text\",\"match\":\"fuzzy\",\"pattern\":\"Lien Waiver Release\"},{\"name\":\"sharpness\",\"type\":\"cv\"},{\"name\":\"document legibility\",\"type\":\"llm\",\"hint\":\"quality\"}]"
+                },
+                { "key": "ocr", "type": "text", "value": "auto" }
+              ]
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/assess",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "classifier", "assess"]
+            },
+            "description": "Expected: overall PASS (~9). `Invoice #INV-2026-0042` PASS 10 (contains), `Notice to Owner` PASS 10 (fuzzy ratio ≈ 0.86 — the document says NOTICE TO OWNER), `Payment Terms: Net 30` PASS 10 on page 1 (`detail.pages` is `[1]`, i.e. the second page), `total amount` PASS 10 with `count: 3` (three dollar amounts), `lien waiver attached` FAIL 1 (best ratio ≈ 0.47, below the 0.5 partial-credit floor), `sharpness` PASS with `detail` ending \"(worst of 2 pages — page N)\", `document legibility` scored by the LLM from page 0's image plus the full text.\n\n`document_info.ocr.ran` is **false**: a native text layer means ocr=auto never loads the models."
+          },
+          "response": []
+        },
+        {
+          "name": "invoice_scanned.pdf — OCR does the work (ocr=auto)",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": "unit-tests/classifier/documents/invoice_scanned.pdf",
+                  "description": "The same invoice as page IMAGES only — no text layer, 2° rotation, light noise."
+                },
+                {
+                  "key": "criteria",
+                  "type": "text",
+                  "value": "[{\"name\":\"Notice to Owner\",\"type\":\"text\",\"match\":\"fuzzy\",\"fuzzy_threshold\":0.8,\"weight\":3.0},{\"name\":\"Invoice #INV-2026-0042\",\"type\":\"text\",\"match\":\"fuzzy\",\"fuzzy_threshold\":0.75},{\"name\":\"Payment Terms: Net 30\",\"type\":\"text\",\"match\":\"fuzzy\",\"fuzzy_threshold\":0.8},{\"name\":\"sharpness\",\"type\":\"cv\"},{\"name\":\"document legibility\",\"type\":\"llm\",\"hint\":\"quality\"}]"
+                },
+                { "key": "ocr", "type": "text", "value": "auto" }
+              ]
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/assess",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "classifier", "assess"]
+            },
+            "description": "Expected: overall PASS (~9) with `document_info.ocr` = `{mode: \"auto\", engine: \"rapidocr\", ran: true, pages_recognised: 2}` and both pages reporting `text_source: \"ocr\"` at confidence ≈ 0.99.\n\nAll three text criteria PASS 10. Note `Invoice #INV-2026-0042` matches at ratio ≈ 0.98 rather than 1.0 — OCR drops the space in `Invoice#INV-…`, which is exactly why fuzzy is the right mode for recognised text. `contains` would have failed on that line."
+          },
+          "response": []
+        },
+        {
+          "name": "invoice_scanned.pdf — same file with ocr=never (expect FAIL)",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": "unit-tests/classifier/documents/invoice_scanned.pdf"
+                },
+                {
+                  "key": "criteria",
+                  "type": "text",
+                  "value": "[{\"name\":\"Notice to Owner\",\"type\":\"text\",\"match\":\"fuzzy\",\"fuzzy_threshold\":0.8,\"weight\":3.0},{\"name\":\"sharpness\",\"type\":\"cv\"}]"
+                },
+                { "key": "ocr", "type": "text", "value": "never" }
+              ]
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/assess",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "classifier", "assess"]
+            },
+            "description": "The control for the previous request. Expected: `Notice to Owner` FAIL 1, confidence 0, `reason` = \"No text available for this document (no native text layer and OCR did not run — ocr=never, or the OCR engine is disabled/unavailable). Re-submit with ocr=auto or always.\" `sharpness` still runs (it needs pixels, not text), and `document_info.ocr.ran` is false.\n\nThe fastest way to confirm OCR is what is doing the work in the ocr=auto run — and the same result you get from a deployment with CLASSIFIER_OCR_ENGINE=none."
+          },
+          "response": []
+        },
+        {
+          "name": "contract.txt — text-only document, cv SKIPS",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": "unit-tests/classifier/documents/contract.txt",
+                  "description": "Plain UTF-8 roofing agreement containing \"Limited Warranty\" and a date."
+                },
+                {
+                  "key": "criteria",
+                  "type": "text",
+                  "value": "[{\"name\":\"Limited Warranty\",\"type\":\"text\",\"weight\":3.0},{\"name\":\"contract date\",\"type\":\"text\",\"match\":\"regex\",\"pattern\":\"\\\\d{4}-\\\\d{2}-\\\\d{2}\"},{\"name\":\"sharpness\",\"type\":\"cv\"},{\"name\":\"mentions a warranty period\",\"type\":\"llm\",\"hint\":\"presence\"}]"
+                },
+                { "key": "ocr", "type": "text", "value": "auto" }
+              ]
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/assess",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "classifier", "assess"]
+            },
+            "description": "Expected: overall PASS (~10). `Limited Warranty` PASS 10 with `count: 3` (heading plus two mentions in clause 2), `contract date` PASS 10 (regex matches 2026-03-14), `sharpness` **SKIPPED** — a .txt has no page images, so the criterion is not applicable and is excluded from the weighted score entirely (not FAIL, which would drag the document down for the wrong reason).\n\n`document_info.llm_image_page` is `null`: the LLM prompt is text-only, and the system prompt tells the model to judge from the text. `ocr.ran` is false — no page images means nothing to recognise."
+          },
+          "response": []
+        },
+        {
+          "name": "proposal.docx — paragraphs + table cells in document order",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": "unit-tests/classifier/documents/proposal.docx",
+                  "description": "Headings, body paragraphs, and a specs table whose second row is System Size / 8.4 kW."
+                },
+                {
+                  "key": "criteria",
+                  "type": "text",
+                  "value": "[{\"name\":\"Roofix Proposal\",\"type\":\"text\",\"weight\":2.0},{\"name\":\"System Size | 8.4 kW\",\"type\":\"text\",\"match\":\"contains\",\"weight\":3.0},{\"name\":\"has faces\",\"type\":\"cv\"},{\"name\":\"states the system size\",\"type\":\"llm\",\"hint\":\"presence\"}]"
+                },
+                { "key": "ocr", "type": "text", "value": "auto" }
+              ]
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/assess",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "classifier", "assess"]
+            },
+            "description": "Expected: overall PASS (~10). `Roofix Proposal` PASS 10 with `count: 2` (title plus the Terms paragraph). `System Size | 8.4 kW` PASS 10 — table rows are flattened to `cell | cell` during extraction, so a row is searchable as one line; this is the criterion to copy when checking a spec table. `has faces` **SKIPPED** (no page images). `states the system size` is scored by the LLM from a text-only prompt.\n\nParagraphs and table cells arrive in document order (the body XML is walked, not python-docx's separate `paragraphs` / `tables` lists), so a table between two headings stays between them."
+          },
+          "response": []
+        },
+        {
+          "name": "photo_of_letter.png — badly shot but readable",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": "unit-tests/classifier/documents/photo_of_letter.png",
+                  "description": "A letter photographed at ~3° skew with an uneven brightness gradient, mild blur, and JPEG noise."
+                },
+                {
+                  "key": "criteria",
+                  "type": "text",
+                  "value": "[{\"name\":\"Notice to Owner\",\"type\":\"text\",\"match\":\"fuzzy\",\"fuzzy_threshold\":0.8,\"weight\":3.0},{\"name\":\"case number\",\"type\":\"text\",\"match\":\"regex\",\"pattern\":\"CASE-\\\\d{5}\",\"weight\":2.0},{\"name\":\"sharpness\",\"type\":\"cv\",\"weight\":2.0},{\"name\":\"proper exposure\",\"type\":\"cv\"},{\"name\":\"document legibility\",\"type\":\"llm\",\"hint\":\"quality\"}]"
+                },
+                { "key": "ocr", "type": "text", "value": "auto" }
+              ]
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/assess",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "classifier", "assess"]
+            },
+            "description": "Expected: overall PASS (~10). OCR recognises the page (`text_source: \"ocr\"`, confidence ≈ 0.99), so `Notice to Owner` PASSes at ratio ≈ 0.88 and `case number` PASSes on CASE-77813. `sharpness` PASS (Laplacian variance ≈ 330 against a threshold of 100) and `proper exposure` PASS (mean ≈ 203 — the gradient stays inside the accepted band).\n\nThis is the everyday field case: a photo of paper that a `text` criterion can still be trusted on."
+          },
+          "response": []
+        },
+        {
+          "name": "photo_of_letter_blurry.png — sharpness FAIL cascades",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": "unit-tests/classifier/documents/photo_of_letter_blurry.png",
+                  "description": "The same letter, heavily out of focus."
+                },
+                {
+                  "key": "criteria",
+                  "type": "text",
+                  "value": "[{\"name\":\"Notice to Owner\",\"type\":\"text\",\"match\":\"fuzzy\",\"fuzzy_threshold\":0.8,\"weight\":3.0},{\"name\":\"case number\",\"type\":\"text\",\"match\":\"regex\",\"pattern\":\"CASE-\\\\d{5}\",\"weight\":2.0},{\"name\":\"sharpness\",\"type\":\"cv\",\"weight\":2.0},{\"name\":\"document legibility\",\"type\":\"llm\",\"hint\":\"quality\",\"depends_on\":\"sharpness\"}]"
+                },
+                { "key": "ocr", "type": "text", "value": "auto" }
+              ]
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/assess",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "classifier", "assess"]
+            },
+            "description": "Expected: overall MARGINAL (~5). `sharpness` FAIL 1 (Laplacian variance ≈ 6). OCR only manages the two large headings (~32 characters), so `Notice to Owner` still PASSes while `case number` FAILs 1 — body text is gone. `document legibility` is **SKIPPED** because its `depends_on: sharpness` did not PASS, which means the LLM is never called at all for this document.\n\nThe pattern worth copying: gate expensive llm criteria behind a cheap `cv` quality check so an unusable photo costs no tokens."
+          },
+          "response": []
+        },
+        {
+          "name": "unsupported_legacy.doc — expect 400",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": "unit-tests/classifier/documents/unsupported_legacy.doc",
+                  "description": "64 bytes starting with the OLE2 magic D0 CF 11 E0 A1 B1 1A E1."
+                },
+                {
+                  "key": "criteria",
+                  "type": "text",
+                  "value": "[{\"name\":\"Notice to Owner\",\"type\":\"text\"}]"
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/assess",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "classifier", "assess"]
+            },
+            "description": "Expected: **400 Bad Request**, no job created, with `detail` = \"Legacy .doc (OLE2 compound) files are not supported. Convert the file to .docx (Word: File → Save As → .docx, or `libreoffice --convert-to docx`) and upload that instead.\"\n\nDetection is by magic bytes, so renaming the file to .docx does not change the outcome — and neither does declaring a different Content-Type. There is no server-side conversion step by design; converting is the caller's job."
+          },
+          "response": []
+        }
+      ]
     }
   ]
 }

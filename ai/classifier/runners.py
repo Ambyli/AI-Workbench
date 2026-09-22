@@ -5,12 +5,15 @@ time (via the ``build_*_payload`` helpers here) and returns the result dict
 that ends up in ``GET /jobs/{id}``'s ``result`` field. Nothing in this module
 knows about the registry, the worker pool, or Prometheus — that is workers.py.
 
-  build_assess_payload()  ↔  run_assess()   — single-image assessment via analysis.analyze_bgr()
+  build_assess_payload()  ↔  run_assess()   — single-document assessment via
+                                              analysis.analyze_document()
   build_compare_payload() ↔  run_compare()  — multi-example comparison via analysis + scoring,
                                               with all examples analysed concurrently.
 
-Payloads round-trip through JSON on disk (``common.jobs.payloads``), so image
+Payloads round-trip through JSON on disk (``common.jobs.payloads``), so file
 bytes are base64 and Pydantic models are dumped to dicts and re-validated here.
+The uploaded file may be a JPEG/PNG, a PDF, a .txt, or a .docx — the bytes are
+stored verbatim and the kind is detected when the worker loads them.
 
 Process flow position: called by workers.handle_job() after a WorkerPool
 worker has claimed the job.
@@ -20,7 +23,7 @@ import asyncio
 import base64
 from typing import Any, Optional
 
-from analysis import analyze_bgr, analyze_input, resolve_example, _bytes_to_bgr
+from analysis import analyze_document, analyze_input, load_document_bytes, resolve_example
 from models import CompareRequest, CriterionInput
 from scoring import aggregate, combined_score, compute_similarity
 
@@ -30,17 +33,24 @@ from scoring import aggregate, combined_score, compute_similarity
 # ---------------------------------------------------------------------------
 
 def build_assess_payload(
-    image_bytes: bytes,
+    file_bytes: bytes,
     content_type: Optional[str],
     filename: str,
     criteria: list[CriterionInput],
+    ocr: str = "auto",
 ) -> dict[str, Any]:
-    """Serialise a POST /assess submission for the payload store."""
+    """Serialise a POST /assess submission for the payload store.
+
+    The bytes are stored under ``file_b64``; ``run_assess`` still accepts the
+    older ``image_b64`` key so a job queued by a previous container version
+    survives the upgrade.
+    """
     return {
-        "image_b64": base64.b64encode(image_bytes).decode("ascii"),
+        "file_b64": base64.b64encode(file_bytes).decode("ascii"),
         "content_type": content_type or "application/octet-stream",
         "filename": filename,
         "criteria": [c.model_dump() for c in criteria],
+        "ocr": ocr,
     }
 
 
@@ -54,22 +64,21 @@ def build_compare_payload(request: CompareRequest) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 async def run_assess(payload: dict[str, Any]) -> dict:
-    """Execute a single-image assessment job from its stored payload.
+    """Execute a single-document assessment job from its stored payload.
 
-    Decodes the image bytes, runs the full analysis pipeline, and returns
-    the result dict that will be persisted to the job store.
+    Decodes the file bytes, loads them into a Document (kind detection, PDF
+    page rendering, text extraction), runs the full analysis pipeline, and
+    returns the result dict that will be persisted to the job store.
     """
-    image_bytes = base64.b64decode(payload["image_b64"])
+    # "image_b64" is the pre-document-support key — still read so jobs queued
+    # by an older container finish after an upgrade.
+    encoded = payload.get("file_b64") or payload["image_b64"]
+    file_bytes = base64.b64decode(encoded)
     criteria = [CriterionInput.model_validate(c) for c in payload["criteria"]]
-    # Decode bytes → BGR numpy array (includes EXIF correction and magic check)
-    bgr = await _bytes_to_bgr(image_bytes)
-    h, w = bgr.shape[:2]
-    return await analyze_bgr(
-        bgr, w, h,
-        payload["content_type"],
-        len(image_bytes),
-        criteria,
+    doc = load_document_bytes(
+        file_bytes, payload.get("filename"), payload.get("content_type")
     )
+    return await analyze_document(doc, criteria, payload.get("ocr", "auto"))
 
 
 async def run_compare(payload: dict[str, Any]) -> dict:
@@ -82,10 +91,13 @@ async def run_compare(payload: dict[str, Any]) -> dict:
     """
     request = CompareRequest.model_validate(payload["request"])
 
-    # Analyse the subject image and all examples concurrently.
+    # Analyse the subject document and all examples concurrently, every one
+    # under the same OCR policy so their text layers are comparable.
     # Pre-generated examples resolve instantly; live examples hit the LLM in parallel.
-    input_task = analyze_input(request.image, request.criteria)
-    example_tasks = [resolve_example(ex, request.criteria) for ex in request.examples]
+    input_task = analyze_input(request.image, request.criteria, request.ocr)
+    example_tasks = [
+        resolve_example(ex, request.criteria, request.ocr) for ex in request.examples
+    ]
     results = await asyncio.gather(input_task, *example_tasks)
 
     input_analysis = results[0]
@@ -122,6 +134,7 @@ async def run_compare(payload: dict[str, Any]) -> dict:
         "status": "ok",
         "criteria": [c.model_dump() for c in request.criteria],
         "aggregation": request.aggregation,
+        "ocr": request.ocr,
         "input_analysis": input_analysis,
         "example_results": example_results,
         "aggregate": {

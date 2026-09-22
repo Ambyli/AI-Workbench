@@ -6,7 +6,7 @@ http://db:5432 could cause the container to reach internal infrastructure.
 
 validate_url() blocks requests to private, loopback, and link-local IP ranges
 by resolving the hostname and checking the resolved IP against a blocklist.
-It is called in analysis._load_bgr_from_input() before any HTTP fetch.
+It is called in analysis._load_bytes_from_input() before any HTTP fetch.
 
 Process flow position: called by analysis.py whenever type="url" is received.
 """
@@ -17,21 +17,10 @@ from urllib.parse import urlparse
 
 from fastapi import HTTPException
 
+from config import BLOCKED_NETWORKS
 from logger import logger
 
-# All private/internal IP ranges that must never be reached from this service.
-_BLOCKED_NETWORKS = [
-    ipaddress.ip_network("10.0.0.0/8"),       # RFC1918 private
-    ipaddress.ip_network("172.16.0.0/12"),     # RFC1918 private
-    ipaddress.ip_network("192.168.0.0/16"),    # RFC1918 private
-    ipaddress.ip_network("127.0.0.0/8"),       # loopback
-    ipaddress.ip_network("169.254.0.0/16"),    # link-local
-    ipaddress.ip_network("0.0.0.0/8"),         # "this" network
-    ipaddress.ip_network("100.64.0.0/10"),     # shared address space (RFC6598)
-    ipaddress.ip_network("::1/128"),           # IPv6 loopback
-    ipaddress.ip_network("fc00::/7"),          # IPv6 unique local
-    ipaddress.ip_network("fe80::/10"),         # IPv6 link-local
-]
+# The blocklist itself (BLOCKED_NETWORKS) lives in config.py § SSRF blocklist.
 
 
 def validate_url(url: str) -> None:
@@ -70,7 +59,7 @@ def validate_url(url: str) -> None:
         ip = ipaddress.ip_address(resolved)
 
         # Step 3 — check against every blocked network
-        for network in _BLOCKED_NETWORKS:
+        for network in BLOCKED_NETWORKS:
             if ip in network:
                 logger.warning("validate_url: blocked SSRF attempt url=%s resolved=%s",
                                url[:120], resolved)

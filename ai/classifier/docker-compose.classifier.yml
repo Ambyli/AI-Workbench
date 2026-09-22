@@ -27,6 +27,16 @@ services:
       # Max jobs analysed simultaneously. Bounded by the vision model's capacity
       # (muse-glimmer runs --max-num-seqs 4; extra requests queue inside vLLM).
       - CLASSIFIER_MAX_CONCURRENT=${CLASSIFIER_MAX_CONCURRENT:-2}
+      # Document support: which OCR engine backs `text` criteria and scanned
+      # PDFs, how many PDF pages are loaded, at what raster density, how much
+      # extracted text the vision prompt may carry, and the native-text
+      # threshold that decides "this page is a scan" in ocr=auto. See the
+      # `## Classifier` block in .env and ai/classifier/API.md § Documents.
+      - CLASSIFIER_OCR_ENGINE=${CLASSIFIER_OCR_ENGINE:-rapidocr}
+      - CLASSIFIER_DOC_MAX_PAGES=${CLASSIFIER_DOC_MAX_PAGES:-20}
+      - CLASSIFIER_PDF_RENDER_DPI=${CLASSIFIER_PDF_RENDER_DPI:-150}
+      - CLASSIFIER_TEXT_CHAR_BUDGET=${CLASSIFIER_TEXT_CHAR_BUDGET:-60000}
+      - CLASSIFIER_OCR_MIN_NATIVE_CHARS=${CLASSIFIER_OCR_MIN_NATIVE_CHARS:-20}
     volumes:
       - classifier_data:/data
     healthcheck:

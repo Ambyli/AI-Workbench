@@ -50,6 +50,13 @@ class Page:
                         "ocr", else None.
         width/height:   Pixel dimensions of ``image_bgr`` (0 when there is no
                         image).
+        ocr_lines:      Per-line OCR detail kept from the recogniser —
+                        ``{"text", "confidence", "box"}`` where ``box`` is a
+                        4-point polygon in THIS page's image pixels. Empty for
+                        native text. It is what lets ``match_text(...,
+                        locate=True)`` map a character offset back to the
+                        polygon it was recognised from, so a text hit can be
+                        drawn on the page instead of merely counted.
     """
 
     index: int
@@ -59,6 +66,7 @@ class Page:
     ocr_confidence: Optional[float] = None
     width: int = 0
     height: int = 0
+    ocr_lines: list[dict] = field(default_factory=list)
 
     def has_image(self) -> bool:
         """True when this page carries a rasterised image."""
@@ -86,6 +94,13 @@ class Document:
                          load.
         truncated_pages: How many pages were dropped because the load hit the
                          ``max_pages`` cap (0 when the whole document loaded).
+        source_bytes:    The original upload, kept ONLY when the caller passed
+                         ``load_document(..., keep_source=True)``. The one
+                         consumer is ``loaders.pdf_text_regions``, which has to
+                         re-open the PDF to ask PyMuPDF where a phrase sits on
+                         the page. Off by default because holding a 40 MB PDF
+                         for the life of a job is a real cost for a feature
+                         most requests never use.
     """
 
     kind: DocumentKind
@@ -94,6 +109,7 @@ class Document:
     content_type: str = "application/octet-stream"
     pages: list[Page] = field(default_factory=list)
     truncated_pages: int = 0
+    source_bytes: Optional[bytes] = None
 
     # ── Text helpers ──────────────────────────────────────────────────────
     def full_text(self, separator: str = "\n\n") -> str:

@@ -280,3 +280,117 @@ def test_count_by_phase(db_path: str) -> None:
         _run(reg.register(_Meta(type="assess", request_id="x")))
     _run(reg.claim_next())
     assert _run(reg.count_by_phase()) == {"pending": 2, "processing": 1}
+
+
+# ── expired_job_ids (retention) ────────────────────────────────────────────
+def _age(reg: SqliteRegistry, job_id: str, hours: float, *, suffix: str = "") -> None:
+    """Backdate a row's created_at, optionally in a different ISO spelling.
+
+    ``suffix="Z"`` writes the same instant the way a producer that used
+    ``strftime`` would; the query has to treat it as equal to ``+00:00``.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    stamp = datetime.now(timezone.utc) - timedelta(hours=hours)
+    text = stamp.isoformat() if not suffix else (
+        stamp.replace(tzinfo=None).isoformat(timespec="seconds") + suffix
+    )
+    with sqlite3.connect(reg.db_path) as conn:
+        conn.execute("UPDATE jobs SET created_at = ? WHERE id = ?", (text, job_id))
+        conn.commit()
+
+
+def _cutoff(hours: float):
+    from datetime import datetime, timedelta, timezone
+
+    return datetime.now(timezone.utc) - timedelta(hours=hours)
+
+
+def test_expired_job_ids_returns_only_aged_terminal_rows(db_path: str) -> None:
+    reg = SqliteRegistry(db_path)
+    _run(reg.init())
+    old = _run(reg.register(_Meta(type="assess", request_id="old")))
+    fresh = _run(reg.register(_Meta(type="assess", request_id="fresh")))
+    running = _run(reg.register(_Meta(type="assess", request_id="run")))
+    _run(reg.set_result(old, {"ok": True}))
+    _run(reg.set_result(fresh, {"ok": True}))
+    _run(reg.set_phase(running, "processing"))
+    _age(reg, old, 48)
+    _age(reg, running, 999)
+
+    assert _run(reg.expired_job_ids(_cutoff(24))) == [old]
+
+
+def test_expired_job_ids_is_unbounded_unless_limited(db_path: str) -> None:
+    reg = SqliteRegistry(db_path)
+    _run(reg.init())
+    ids = []
+    for i in range(7):
+        job_id = _run(reg.register(_Meta(type="assess", request_id=str(i))))
+        _run(reg.set_result(job_id, {"ok": True}))
+        _age(reg, job_id, 48 + i)
+        ids.append(job_id)
+
+    got = _run(reg.expired_job_ids(_cutoff(24)))
+    assert set(got) == set(ids)
+    assert len(_run(reg.expired_job_ids(_cutoff(24), limit=3))) == 3
+
+
+def test_expired_job_ids_is_oldest_first(db_path: str) -> None:
+    reg = SqliteRegistry(db_path)
+    _run(reg.init())
+    newer = _run(reg.register(_Meta(type="assess", request_id="newer")))
+    older = _run(reg.register(_Meta(type="assess", request_id="older")))
+    _run(reg.set_result(newer, {"ok": True}))
+    _run(reg.set_result(older, {"ok": True}))
+    _age(reg, newer, 30)
+    _age(reg, older, 90)
+
+    assert _run(reg.expired_job_ids(_cutoff(24))) == [older, newer]
+
+
+def test_expired_job_ids_treats_a_Z_suffix_as_utc(db_path: str) -> None:
+    """`...T10:00:00Z` and `...T10:00:00+00:00` are the same instant but do
+    NOT sort alike as raw strings — the query compares on the first 19
+    characters so the spelling cannot change the answer."""
+    reg = SqliteRegistry(db_path)
+    _run(reg.init())
+    zed = _run(reg.register(_Meta(type="assess", request_id="z")))
+    offset = _run(reg.register(_Meta(type="assess", request_id="o")))
+    _run(reg.set_result(zed, {"ok": True}))
+    _run(reg.set_result(offset, {"ok": True}))
+    _age(reg, zed, 48, suffix="Z")
+    _age(reg, offset, 48)
+
+    assert set(_run(reg.expired_job_ids(_cutoff(24)))) == {zed, offset}
+    assert _run(reg.expired_job_ids(_cutoff(96))) == []
+
+
+def test_expired_job_ids_honours_the_phase_filter(db_path: str) -> None:
+    reg = SqliteRegistry(db_path)
+    _run(reg.init())
+    failed = _run(reg.register(_Meta(type="assess", request_id="f")))
+    done = _run(reg.register(_Meta(type="assess", request_id="d")))
+    _run(reg.set_error(failed, "boom"))
+    _run(reg.set_result(done, {"ok": True}))
+    _age(reg, failed, 48)
+    _age(reg, done, 48)
+
+    assert _run(reg.expired_job_ids(_cutoff(24), ["failed"])) == [failed]
+    assert _run(reg.expired_job_ids(_cutoff(24), [])) == []
+
+
+def test_expired_job_ids_accepts_a_naive_cutoff(db_path: str) -> None:
+    """A caller that forgot the tzinfo gets UTC, not a TypeError from the
+    comparison — the sweeper is the only caller and it always passes an aware
+    one, but this is a public method now."""
+    from datetime import datetime, timedelta, timezone
+
+    reg = SqliteRegistry(db_path)
+    _run(reg.init())
+    job_id = _run(reg.register(_Meta(type="assess", request_id="n")))
+    _run(reg.set_result(job_id, {"ok": True}))
+    _age(reg, job_id, 48)
+
+    naive = (datetime.now(timezone.utc) - timedelta(hours=24)).replace(tzinfo=None)
+    assert _run(reg.expired_job_ids(naive)) == [job_id]

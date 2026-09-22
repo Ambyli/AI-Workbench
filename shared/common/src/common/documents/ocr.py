@@ -15,7 +15,7 @@ Two pieces:
 ``apply_ocr(document, engine, mode=...)`` is the only function most callers
 need: it walks the pages, decides which ones need recognising, and writes the
 result back onto each ``Page`` (``text``, ``text_source="ocr"``,
-``ocr_confidence``).
+``ocr_confidence``, ``ocr_lines``).
 
 Recognition quality notes (why the preprocessing exists):
   * RapidOCR's detector works on the image as given — a 600px-wide phone photo
@@ -212,6 +212,14 @@ class RapidOCREngine:
         prepared = preprocess_for_ocr(
             image_bgr, grayscale=self._grayscale, min_long_side=self._min_long_side
         )
+        # Boxes come back in the PREPROCESSED image's pixels, which is a
+        # different size whenever ``min_long_side`` upscaled a small page.
+        # Divide them back so every ``box`` this method returns is in the
+        # caller's own image coordinates — Page.ocr_lines, and everything that
+        # localises a text hit, depends on that being true.
+        box_scale = (
+            prepared.shape[1] / image_bgr.shape[1] if image_bgr.shape[1] else 1.0
+        ) or 1.0
         out = self.engine(prepared)
 
         # rapidocr 3.x returns a RapidOCROutput whose txts/scores are tuples,
@@ -225,8 +233,12 @@ class RapidOCREngine:
             conf = float(scores[i]) if i < len(scores) else 0.0
             box = None
             if boxes is not None and i < len(boxes):
-                # numpy array of 4 corner points → plain nested lists.
-                box = [[float(x), float(y)] for x, y in boxes[i]]
+                # numpy array of 4 corner points → plain nested lists, scaled
+                # back out of the preprocessed image's space.
+                box = [
+                    [round(float(x) / box_scale, 2), round(float(y) / box_scale, 2)]
+                    for x, y in boxes[i]
+                ]
             lines.append({"text": str(txt), "confidence": round(conf, 4), "box": box})
 
         text = "\n".join(line["text"] for line in lines)
@@ -290,6 +302,11 @@ def apply_ocr(
         page.text = result.text
         page.text_source = "ocr"
         page.ocr_confidence = result.confidence
+        # Keep the line polygons: ``page.text`` is exactly "\n".join of these
+        # lines, so a character offset into it maps back to a line — and to
+        # the box that line was read from. Dropping them here is what used to
+        # make a text hit unlocalisable.
+        page.ocr_lines = list(result.lines)
         replaced += 1
 
     return replaced

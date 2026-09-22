@@ -28,13 +28,19 @@ import json
 import os
 import time
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 from uuid import uuid4
 
 import aiosqlite
 from pydantic import BaseModel
 
 from .model import JobBase, JobsListResponse
+
+# Phases a retention sweep may delete. A job still pending or processing is
+# never expired, however old — see ``expired_job_ids``. Mirrored by
+# ``common.vision.store._TERMINAL_PHASES``, which decides the same thing for
+# a job snapshot rather than a SQL row.
+_TERMINAL_PHASES = ("completed", "failed", "cancelled")
 
 
 _SCHEMA = """
@@ -354,6 +360,65 @@ class SqliteRegistry:
             )
             await db.commit()
             return cur.rowcount
+
+    # ── Retention ─────────────────────────────────────────────────────────
+    async def expired_job_ids(
+        self,
+        cutoff: datetime,
+        phases: Iterable[str] = _TERMINAL_PHASES,
+        *,
+        limit: Optional[int] = None,
+    ) -> list[str]:
+        """Ids of jobs in ``phases`` whose ``created_at`` predates ``cutoff``.
+
+        The bounded alternative to ``list_all`` for a retention sweep.
+        ``list_all(limit=500)`` drags every row's ``result`` blob through
+        SQLite and still stops at 500 rows, so a service that takes more than
+        500 jobs inside one TTL window never reaches its oldest expired rows.
+        This returns ids only, filtered in SQL, with no ceiling unless one is
+        asked for.
+
+        Timestamps are compared as strings on their first 19 characters —
+        ``YYYY-MM-DDTHH:MM:SS`` — which makes the comparison indifferent to
+        fractional seconds and to a ``Z`` suffix versus ``+00:00`` (two
+        spellings of the same instant that do NOT sort alike as raw strings).
+        Every timestamp this class writes is UTC (``_now_iso``), so truncating
+        the offset is safe; a row written in another zone by something else
+        would be compared as if it were UTC.
+
+        Args:
+            cutoff: Jobs created strictly before this instant are expired. A
+                naive datetime is read as UTC.
+            phases: Phases eligible for expiry. Defaults to the terminal set —
+                a job still pending or processing is never expired, however
+                old, because a queue that backed up should drain, not
+                evaporate.
+            limit:  Optional cap, oldest first. ``None`` returns every match.
+
+        Returns:
+            Job ids, oldest first.
+        """
+        phase_list = list(phases)
+        if not phase_list:
+            return []
+        if cutoff.tzinfo is None:
+            cutoff = cutoff.replace(tzinfo=timezone.utc)
+        cutoff_key = cutoff.astimezone(timezone.utc).isoformat()[:19]
+
+        placeholders = ",".join("?" for _ in phase_list)
+        sql = (
+            f"SELECT id FROM jobs WHERE phase IN ({placeholders}) "
+            "AND substr(created_at, 1, 19) < ? ORDER BY created_at ASC, rowid ASC"
+        )
+        params: list[Any] = [*phase_list, cutoff_key]
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(sql, params) as cur:
+                rows = await cur.fetchall()
+        return [r[0] for r in rows]
 
     async def count_by_phase(self) -> dict[str, int]:
         """Return ``{phase: row_count}`` for every phase present. Cheap

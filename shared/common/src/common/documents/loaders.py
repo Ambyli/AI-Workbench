@@ -228,6 +228,7 @@ def load_document(
     max_pages: int = DEFAULT_MAX_PAGES,
     render_dpi: int = DEFAULT_RENDER_DPI,
     image_decoder: Optional[ImageDecoder] = None,
+    keep_source: bool = False,
 ) -> Document:
     """Detect what ``raw`` is and load it into a ``Document``.
 
@@ -243,6 +244,11 @@ def load_document(
         render_dpi:    Raster density for PDF page renders.
         image_decoder: ``bytes → BGR ndarray`` used for the image kind.
                        Defaults to ``default_image_decoder``.
+        keep_source:   Retain ``raw`` on the Document as ``source_bytes``.
+                       Only needed when the caller will later ask
+                       ``pdf_text_regions`` where a phrase sits — it has to
+                       re-open the file. Costs the document's size in memory
+                       for the life of the job, so leave it off otherwise.
 
     Returns:
         A ``Document`` with at least one page.
@@ -278,4 +284,169 @@ def load_document(
         content_type=guess_content_type(resolved_kind, raw),
         pages=pages,
         truncated_pages=truncated,
+        source_bytes=raw if keep_source else None,
     )
+
+
+# ---------------------------------------------------------------------------
+# Native-PDF geometry for a text hit
+# ---------------------------------------------------------------------------
+
+
+def _normalise_token(token: str) -> str:
+    """Lowercase and strip everything that is not a letter or digit.
+
+    Word-span reconstruction has to compare the matcher's view of the text
+    (``page.get_text("text")``, which carries punctuation and spacing) with
+    PyMuPDF's word list (which splits on whitespace). Comparing on
+    alphanumerics only is what makes ``"$4,850.00"`` line up with the word
+    box PyMuPDF reports for it.
+    """
+    return "".join(ch for ch in token.lower() if ch.isalnum())
+
+
+def _rect_for_snippet(
+    words: list, snippet: str, start_index: int = 0
+) -> tuple[Optional[tuple[float, float, float, float]], int]:
+    """Find the consecutive word run whose text matches ``snippet``.
+
+    Args:
+        words:       PyMuPDF ``page.get_text("words")`` output —
+                     ``(x0, y0, x1, y1, word, block, line, word_no)``.
+        snippet:     The matched substring, as the text matcher saw it.
+        start_index: Where to begin scanning, so repeated matches of the same
+                     phrase return successive occurrences rather than the
+                     first one over and over.
+
+    Returns:
+        ``(rect_or_None, next_start_index)``. The rect is the union of the
+        run's word boxes, in PDF points.
+
+    This is approximate by construction: a phrase that PyMuPDF splits
+    differently from the text layer (hyphenation, a ligature, a column break
+    mid-phrase) will not line up, and the function returns None rather than a
+    plausible-looking wrong rectangle.
+    """
+    tokens = [t for t in (_normalise_token(w) for w in snippet.split()) if t]
+    if not tokens:
+        return None, start_index
+    for i in range(start_index, len(words) - len(tokens) + 1):
+        if all(
+            _normalise_token(words[i + j][4]) == tokens[j] for j in range(len(tokens))
+        ):
+            run = words[i : i + len(tokens)]
+            return (
+                (
+                    min(w[0] for w in run),
+                    min(w[1] for w in run),
+                    max(w[2] for w in run),
+                    max(w[3] for w in run),
+                ),
+                i + len(tokens),
+            )
+    return None, start_index
+
+
+def pdf_text_regions(
+    pdf_bytes: bytes,
+    page: Page,
+    hits: list,
+    *,
+    pattern: str,
+    mode: str = "contains",
+    label: Optional[str] = None,
+    max_regions: int = 200,
+) -> list:
+    """Where a text hit sits on a native PDF page, in page-image pixels.
+
+    Two strategies, picked by match mode — the split the regions plan calls
+    for:
+
+      ``contains`` / ``exact``  PyMuPDF's own ``page.search_for(pattern)``.
+                                Fast and exact for a literal phrase; it is
+                                case-insensitive and ignores word boundaries,
+                                so an ``exact`` criterion's rectangles can be
+                                a superset of its (word-anchored) matches.
+      ``regex`` / ``fuzzy``     word-span reconstruction: each hit's matched
+                                text is lined up against ``get_text("words")``
+                                and the covering word boxes are unioned.
+                                Approximate — see ``_rect_for_snippet``.
+
+    Coordinates are converted from PDF points to the page's rendered pixels
+    (the space every Region lives in), and the original rectangle is kept in
+    ``attrs["pdf_rect"]`` so PDF tooling can use it directly.
+
+    Args:
+        pdf_bytes:   The original PDF (``Document.source_bytes``).
+        page:        The already-loaded page — supplies the index and the
+                     rendered pixel size.
+        hits:        ``TextHit`` objects for this page from
+                     ``match_text(..., locate=True)``.
+        pattern:     The literal searched for (contains/exact modes).
+        mode:        contains | exact | regex | fuzzy.
+        label:       Region label; defaults to ``pattern``.
+        max_regions: Cap on regions returned.
+
+    Returns:
+        ``box`` regions with ``source="pdf-text"`` and ``score=1.0``. Empty
+        when PyMuPDF is unavailable, the page is out of range, or nothing
+        lined up — never an exception, because a missing overlay must not
+        fail the criterion that produced it.
+    """
+    from ..vision.model import Region
+
+    if not pdf_bytes or not page.width or not page.height:
+        return []
+
+    try:
+        import pymupdf
+    except ImportError:  # pragma: no cover - depends on env
+        return []
+
+    region_label = label or pattern
+    regions: list = []
+    try:
+        doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+    except Exception:
+        return []
+    try:
+        if page.index >= doc.page_count:
+            return []
+        pdf_page = doc.load_page(page.index)
+        rect = pdf_page.rect
+        sx = page.width / rect.width if rect.width else 1.0
+        sy = page.height / rect.height if rect.height else 1.0
+
+        found: list[tuple[tuple[float, float, float, float], str, float]] = []
+        if mode in ("contains", "exact") and pattern:
+            for quad in pdf_page.search_for(pattern)[:max_regions]:
+                found.append(((quad.x0, quad.y0, quad.x1, quad.y1), pattern, 1.0))
+        else:
+            words = pdf_page.get_text("words")
+            cursor = 0
+            for hit in hits[:max_regions]:
+                box, cursor = _rect_for_snippet(words, getattr(hit, "text", ""), cursor)
+                if box:
+                    found.append((box, getattr(hit, "text", ""), getattr(hit, "ratio", 1.0)))
+
+        for (x0, y0, x1, y1), text, ratio in found:
+            regions.append(
+                Region(
+                    page=page.index,
+                    kind="box",
+                    points=[(x0 * sx, y0 * sy), (x1 * sx, y1 * sy)],
+                    label=region_label,
+                    score=1.0,
+                    source="pdf-text",
+                    attrs={
+                        "text": text[:120],
+                        "ratio": round(float(ratio), 4),
+                        "pdf_rect": [
+                            round(x0, 2), round(y0, 2), round(x1, 2), round(y1, 2)
+                        ],
+                    },
+                )
+            )
+    finally:
+        doc.close()
+    return regions

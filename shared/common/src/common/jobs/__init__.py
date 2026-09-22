@@ -33,7 +33,7 @@ to exactly one caller (safe across tasks and processes),
 
 * ``FilePayloadStore`` (from ``common.jobs.payloads``) — one JSON file per job
   for inputs too large for ``metadata`` (images, request bodies), so a queued
-  job survives a restart. ``classifier/workers.py`` wires both together.
+  job survives a restart. ``ai/classifier/jobs/queue.py`` wires both together.
 
 Optional deps: ``aiosqlite`` for ``SqliteRegistry``; ``asyncpg`` for
 ``PostgresRegistry``; ``fastapi`` for ``build_router``. Consumers who don't

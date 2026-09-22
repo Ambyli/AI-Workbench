@@ -1,19 +1,13 @@
 {
   "info": {
     "name": "classifier",
-    "description": "Document Classifier endpoints — JPEG/PNG, PDF, .txt and .docx uploads scored by OpenCV detectors, deterministic text matching, and vision-LLM criteria — called through the LiteLLM pass-through registered in ai/litellm/litellm_config.yaml (`pass_through_endpoints` → `/v1/classifier` → `http://classifier:8000`, `include_subpath: true`, methods GET/POST/DELETE, `forward_headers: true`). Every request is authenticated with a Bearer token from a LiteLLM virtual key. Set the collection variables `litellm` (e.g. http://localhost:4001) and `virtual master key` (an sk-… key issued from the LiteLLM Admin UI → Virtual Keys) — every request inherits them via collection-level auth. See ai/classifier/API.md for the full endpoint reference and ai/litellm/LITELLM.md for issuing virtual keys.\n\nDirect base URL (bypassing LiteLLM, only useful inside the ai_shared network or when PORT_CLASSIFIER is published): http://classifier:8000 or http://<host>:${PORT_CLASSIFIER}. All examples in this collection use the LiteLLM pass-through path.\n\nAsync-job pattern: POST /assess and POST /assess/compare both return 202 Accepted immediately with `{job_id, phase: \"pending\"}`. Callers poll GET /jobs/{job_id} until `phase` is `completed` or `failed`, then read the `result` field. Concurrency: the SQLite jobs table is the queue — `CLASSIFIER_MAX_CONCURRENT` worker tasks (default 2, `.env`) each atomically claim the oldest `pending` row, so at most that many jobs are analysed at once and pending work survives a container restart (payloads live in `/data/payloads` until the job is terminal). Job tracking is powered by the shared `common.jobs` package (SqliteRegistry backend); the `/jobs`, `/jobs/{id}`, and DELETE `/jobs/{id}` routes are mounted via `common.jobs.router.build_router(..., include_delete=True, include_cancel=False)`. Response migration note: the top-level `id` is now `job_id`, `status` is now `phase`, and the previously separate `type` + `request_id` columns are nested under `metadata`. See API.md § `GET /jobs/{job_id}` for the full shape.\n\nCopy the `job_id` from a POST /assess or POST /assess/compare response into the `jobId` collection variable to run the GET/DELETE /jobs/{jobId} requests.\n\nDocuments: uploads are not limited to images. `common.documents` detects the kind from the bytes (never the filename or Content-Type) and normalises JPEG/PNG, PDF, plain text, and .docx into pages that may carry an image, a text layer, or both — so `cv` criteria run on page images, `text` criteria search the text layer (OCR-filled for scans and photos), and `llm` criteria see ONE page image plus the extracted text (muse-glimmer runs without `--limit-mm-per-prompt`, so vLLM accepts a single image per request). GET /document-kinds reports the live capability list, and the `Documents` folder in this collection has a ready-to-run request per fixture in unit-tests/classifier/documents/. See API.md § Documents.",
+    "description": "Document Classifier endpoints — JPEG/PNG, PDF, .txt and .docx uploads scored by OpenCV detectors, deterministic text matching, and vision-LLM criteria — called through the LiteLLM pass-through registered in ai/litellm/litellm_config.yaml (`pass_through_endpoints` → `/v1/classifier` → `http://classifier:8000`, `include_subpath: true`, methods GET/POST/DELETE, `forward_headers: true`). Every request is authenticated with a Bearer token from a LiteLLM virtual key. Set the collection variables `litellm` (e.g. http://localhost:4001) and `virtual master key` (an sk-… key issued from the LiteLLM Admin UI → Virtual Keys) — every request inherits them via collection-level auth. See ai/classifier/API.md for the full endpoint reference and ai/litellm/LITELLM.md for issuing virtual keys.\n\nDirect base URL (bypassing LiteLLM, only useful inside the ai_shared network or when PORT_CLASSIFIER is published): http://classifier:8000 or http://<host>:${PORT_CLASSIFIER}. All examples in this collection use the LiteLLM pass-through path.\n\nAsync-job pattern: POST /assess and POST /assess/compare both return 202 Accepted immediately with `{job_id, phase: \"pending\"}`. Callers poll GET /jobs/{job_id} until `phase` is `completed` or `failed`, then read the `result` field. Concurrency: the SQLite jobs table is the queue — `CLASSIFIER_MAX_CONCURRENT` worker tasks (default 2, `.env`) each atomically claim the oldest `pending` row, so at most that many jobs are analysed at once and pending work survives a container restart (payloads live in `/data/payloads` until the job is terminal). Job tracking is powered by the shared `common.jobs` package (SqliteRegistry backend); the `/jobs`, `/jobs/{id}`, and DELETE `/jobs/{id}` routes are mounted via `common.jobs.router.build_router(..., include_delete=True, include_cancel=False)`. Response migration note: the top-level `id` is now `job_id`, `status` is now `phase`, and the previously separate `type` + `request_id` columns are nested under `metadata`. See API.md § `GET /jobs/{job_id}` for the full shape.\n\nCopy the `job_id` from a POST /assess or POST /assess/compare response into the `jobId` collection variable to run the GET/DELETE /jobs/{jobId} requests.\n\nDocuments: uploads are not limited to images. `common.documents` detects the kind from the bytes (never the filename or Content-Type) and normalises JPEG/PNG, PDF, plain text, and .docx into pages that may carry an image, a text layer, or both — so `cv` criteria run on page images, `text` criteria search the text layer (OCR-filled for scans and photos), and `llm` criteria see ONE page image plus the extracted text (muse-glimmer runs without `--limit-mm-per-prompt`, so vLLM accepts a single image per request). GET /document-kinds reports the live capability list, and the `Documents` folder in this collection has a ready-to-run request per fixture in unit-tests/classifier/documents/. See API.md § Documents.\n\nRegions and layers: a criterion result can also say WHERE it found something — boxes and polygons in ORIGINAL page pixels — and the job can render those as an SVG overlay, a transparent PNG layer, and a composited JPEG preview, written to a per-job artifact directory served by the four endpoints in the `Artifacts` folder. It is OFF unless a request asks (`regions` on /assess and /assess/compare, implied on /locate): regions cost detector work and layers cost disk. Sources are `cv` (OpenCV detector geometry), `ocr` (recogniser line polygons), `pdf-text` (PyMuPDF rectangles), and `detector` (the open-vocabulary ai/detector service, when DETECTOR_URL is configured). `llm` adds the vision model's own boxes when `regions.llm_boxes` is set — each one asked for on a 0-1000 grid, validated, and verified by cropping it out of the page and asking whether the feature is visible in the crop alone, with EVERY attempt returned. `diff` is change detection on /assess/compare: what appeared, disappeared or changed between the subject and each live example, reported as `aligned: false` with no regions when the two photos are framed too differently to compare. The `Regions` folder mirrors unit-tests/classifier/regions/. See API.md § Regions and layers.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
     "_postman_id": "classifier-collection"
   },
   "auth": {
     "type": "bearer",
-    "bearer": [
-      {
-        "key": "token",
-        "value": "{{virtual master key}}",
-        "type": "string"
-      }
-    ]
+    "bearer": [{ "key": "token", "value": "{{virtual master key}}", "type": "string" }]
   },
   "variable": [
     {
@@ -32,7 +26,25 @@
       "key": "jobId",
       "value": "",
       "type": "string",
-      "description": "job_id returned by POST /assess or POST /assess/compare. Fill in after submitting to run GET /jobs/{jobId} and DELETE /jobs/{jobId}. `phase` values progress staging → pending → processing → completed | failed (`staging` is the few ms before the payload is on disk; workers never claim it)."
+      "description": "job_id returned by POST /assess, POST /assess/compare, or POST /locate. Fill in after submitting to run GET /jobs/{jobId}, DELETE /jobs/{jobId}, and every request in the Artifacts folder. `phase` values progress staging → pending → processing → completed | failed (`staging` is the few ms before the payload is on disk; workers never claim it)."
+    },
+    {
+      "key": "artifactName",
+      "value": "regions.json",
+      "type": "string",
+      "description": "File name inside a job's artifact directory, used by GET /jobs/{jobId}/artifacts/{artifactName}. Defaults to `regions.json` — the canonical machine-readable layer, keyed by criterion. The others are `manifest.json` (the index, including each criterion's slug), `p{n}.svg` (the overlay), `p{n}.layer.png` (the transparent layer), `p{n}.preview.jpg` (the page with the layer burned in), and `p{n}.base.jpg` (the un-annotated page, present only when the job asked for the preview layer). List them with GET /jobs/{jobId}/artifacts."
+    },
+    {
+      "key": "scene_before_b64",
+      "value": "",
+      "type": "string",
+      "description": "Base64 of unit-tests/classifier/regions/scene_before.png, WITHOUT a data: prefix. Fill it once: `base64 -w0 unit-tests/classifier/regions/scene_before.png` (macOS: `base64 -i ... | tr -d '\\n'`; PowerShell: [Convert]::ToBase64String([IO.File]::ReadAllBytes('...'))), then paste the output into this variable's CURRENT VALUE. It is ~150 KB of text, which is why it is a variable rather than being inlined in the request body."
+    },
+    {
+      "key": "scene_after_b64",
+      "value": "",
+      "type": "string",
+      "description": "Base64 of unit-tests/classifier/regions/scene_after.png, same recipe as scene_before_b64. This is the SUBJECT of the change-detection request — the later photo, with the car that appeared and the shed that went."
     }
   ],
   "item": [
@@ -124,6 +136,13 @@
               "type": "text",
               "value": "auto",
               "description": "Text-recognition policy: `auto` (default — recognise only when text is wanted and missing: a page carries an image whose native text is under CLASSIFIER_OCR_MIN_NATIVE_CHARS AND the request has a text or llm criterion), `always` (recognise every page image, replacing any native text), `never` (skip OCR; text criteria on an image-only document then score 1/FAIL with \"No text available for this document…\"). Anything else is a 400. A deployment with CLASSIFIER_OCR_ENGINE=none behaves as `never` regardless — check GET /document-kinds → `ocr.available`."
+            },
+            {
+              "key": "regions",
+              "type": "text",
+              "value": "svg",
+              "disabled": true,
+              "description": "Where-did-you-find-it options. Absent (or `false`/`0`/`no`/`off`) = OFF, the default. `true` = regions + the SVG layer. A comma list (`svg,png,preview`) = regions + those layers. `none` = regions.json only, no pictures. Or the full object as a JSON string: `{\"enabled\": true, \"layers\": [\"svg\"], \"layers_per_criterion\": false, \"llm_boxes\": false, \"detector\": false}`. An unknown layer name is a **400 at submit time**, not a failed job. `regions.json` and `manifest.json` are always written when enabled, whatever `layers` says. See API.md § Regions and layers."
             }
           ]
         },
@@ -132,7 +151,7 @@
           "host": ["{{litellm}}"],
           "path": ["v1", "classifier", "assess"]
         },
-        "description": "Submit a single-document assessment job — JPEG, PNG, PDF, .txt, or .docx. Content-Type is `multipart/form-data`. Returns **202 Accepted** immediately with `{\"job_id\": \"<id>\", \"phase\": \"pending\"}` — this is the async pattern, so poll GET /jobs/{jobId} until `phase` is `completed` or `failed`, then read the `result` field.\n\nServer-side flow (main.py `assess_document`):\n  1. Resolve the upload: the `file` part, or the legacy `image` alias; neither present is a 400.\n  2. Validate the `ocr` mode and the declared content type (allowlist: image/jpeg, image/png, application/pdf, text/plain, the .docx type, application/octet-stream — the magic bytes have the final say).\n  3. Parse the `criteria` JSON form field via `analysis.parse_criteria`, which also compiles any text pattern so a bad regex fails here rather than in a worker.\n  4. Read the uploaded bytes into memory (UploadFile is only readable during the request).\n  5. Create a job record in the SQLite jobs registry with `metadata={type: \"assess\", request_id: <req>}` and `initial_phase=\"staging\"`.\n  6. Write `{file_b64, content_type, filename, criteria, ocr}` to `PAYLOAD_DIR/<job_id>.json`, flip the row to `pending`, wake an idle worker (one of `CLASSIFIER_MAX_CONCURRENT`).\n  7. Return `202` with the job_id.\n\nThe worker then loads the bytes into a Document (kind detection, PDF page rendering at CLASSIFIER_PDF_RENDER_DPI up to CLASSIFIER_DOC_MAX_PAGES, native text extraction), runs OCR if needed, then the cv / text / llm criteria.\n\nErrors: **400** if no file was sent, the criteria list is empty, the body is empty, the `ocr` value is not auto|always|never, a text pattern is unusable, the content type is outside the allowlist, or the bytes are not a supported document (legacy .doc gets its own \"convert to .docx\" message); **422** if the criteria JSON fails Pydantic validation of CriterionInput.\n\nResult shape once completed: `{image_info, document_info, assessment: {overall_verdict, overall_score, per_criterion_scores, weighted_score_breakdown}, verdict}`. `document_info` carries `kind`, `page_count`, `truncated_pages`, per-page `text_source`/`ocr_confidence`/`text_chars`, the `ocr` block (`mode`, `engine`, `ran`, `pages_recognised`), `text_sent_to_llm`, and `llm_image_page`. SKIPPED criteria appear in `per_criterion_scores` with `verdict: \"SKIPPED\"`, `score: null`, `method: \"skipped\"`, and a reason string, and are excluded from the weighted score — either because a `depends_on` did not pass, or because a `cv` criterion was sent against a .txt/.docx, which has no page images. See API.md § `POST /assess`.\n\nPostman note: the `file` row's `src` points at a repo fixture (unit-tests/classifier/documents/invoice_native.pdf). Re-select the file if your working directory differs, and see the `Documents` folder for one ready-to-run request per fixture."
+        "description": "Submit a single-document assessment job — JPEG, PNG, PDF, .txt, or .docx. Content-Type is `multipart/form-data`. Returns **202 Accepted** immediately with `{\"job_id\": \"<id>\", \"phase\": \"pending\"}` — this is the async pattern, so poll GET /jobs/{jobId} until `phase` is `completed` or `failed`, then read the `result` field.\n\nServer-side flow (api/assess.py `assess_document`):\n  1. Resolve the upload: the `file` part, or the legacy `image` alias; neither present is a 400.\n  2. Validate the `ocr` mode and the declared content type (allowlist: image/jpeg, image/png, application/pdf, text/plain, the .docx type, application/octet-stream — the magic bytes have the final say).\n  3. Parse the `criteria` JSON form field via `analysis.criteria.parse_criteria`, which also compiles any text pattern so a bad regex fails here rather than in a worker.\n  4. Read the uploaded bytes into memory (UploadFile is only readable during the request).\n  5. Create a job record in the SQLite jobs registry with `metadata={type: \"assess\", request_id: <req>}` and `initial_phase=\"staging\"`.\n  6. Write `{file_b64, content_type, filename, criteria, ocr}` to `PAYLOAD_DIR/<job_id>.json`, flip the row to `pending`, wake an idle worker (one of `CLASSIFIER_MAX_CONCURRENT`).\n  7. Return `202` with the job_id.\n\nThe worker then loads the bytes into a Document (kind detection, PDF page rendering at CLASSIFIER_PDF_RENDER_DPI up to CLASSIFIER_DOC_MAX_PAGES, native text extraction), runs OCR if needed, then the cv / text / llm criteria.\n\nErrors: **400** if no file was sent, the criteria list is empty, the body is empty, the `ocr` value is not auto|always|never, a text pattern is unusable, the content type is outside the allowlist, or the bytes are not a supported document (legacy .doc gets its own \"convert to .docx\" message); **422** if the criteria JSON fails Pydantic validation of CriterionInput.\n\nResult shape once completed: `{image_info, document_info, assessment: {overall_verdict, overall_score, per_criterion_scores, weighted_score_breakdown}, verdict}`. `document_info` carries `kind`, `page_count`, `truncated_pages`, per-page `text_source`/`ocr_confidence`/`text_chars`, the `ocr` block (`mode`, `engine`, `ran`, `pages_recognised`), `text_sent_to_llm`, and `llm_image_page`. SKIPPED criteria appear in `per_criterion_scores` with `verdict: \"SKIPPED\"`, `score: null`, `method: \"skipped\"`, and a reason string, and are excluded from the weighted score — either because a `depends_on` did not pass, or because a `cv` criterion was sent against a .txt/.docx, which has no page images. See API.md § `POST /assess`.\n\nPostman note: the `file` row's `src` points at a repo fixture (unit-tests/classifier/documents/invoice_native.pdf). Re-select the file if your working directory differs, and see the `Documents` folder for one ready-to-run request per fixture.\n\nRegions: enable the `regions` form field to additionally collect WHERE each criterion found what it found and render the layers. The result then carries `page_geometry`, an `artifacts` block (files, urls, zip_url, total_bytes, expires_at, dropped, notes), and per-criterion `regions` / `regions_truncated` / `artifacts`. Nothing else about the response changes — the step is strictly additive and reads geometry off results the detectors already produced, so a score can never move because you asked where. See the `Regions` and `Artifacts` folders.\n\nThe field takes a shorthand (`true`, `svg,png,preview`, `none`, `false`) or the full JSON object, which is the only way to reach the two enrichments:\n\n- `\"detector\": true` — hand the open-vocabulary detector (ai/detector) the cv criteria no OpenCV detector matches, and the localisation of llm presence criteria. Needs DETECTOR_URL.\n- `\"llm_boxes\": true` — run the bounding-box enforcement loop for every `llm` criterion with hint presence/auto that the model scored 7 or higher: ask for a box on a 0-1000 grid, validate it (a full-frame box is rejected as a non-answer), crop it out of the ORIGINAL page and ask whether the feature is visible in the crop ALONE, and retry with the rejection as feedback, up to CLASSIFIER_LLM_BBOX_MAX_ATTEMPTS. EVERY attempt comes back — in `localization.attempts` and as a region, rejected ones carrying `attrs.accepted: false` and reachable at `.../artifacts/p0.svg?criterion=<slug>&attempt=n`. It runs AFTER scoring and can never change a score or a verdict; assert that by submitting the same document with it off. Costs up to two small LLM calls per attempt per criterion.\n\n`regions.diff` and `regions.examples` need a reference document, so on this endpoint they are recorded in the manifest and `artifacts.notes` says they were ignored. See API.md § The LLM enforcement loop."
       },
       "response": []
     },
@@ -140,12 +159,10 @@
       "name": "POST /assess/compare",
       "request": {
         "method": "POST",
-        "header": [
-          { "key": "Content-Type", "value": "application/json" }
-        ],
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
         "body": {
           "mode": "raw",
-          "raw": "{\n  \"image\": {\n    \"data\": \"https://example.com/notice.pdf\",\n    \"type\": \"url\"\n  },\n  \"criteria\": [\n    {\"name\": \"Notice to Owner\", \"type\": \"text\", \"match\": \"fuzzy\", \"fuzzy_threshold\": 0.85, \"weight\": 3.0},\n    {\"name\": \"has electrical meter\", \"type\": \"llm\", \"hint\": \"presence\", \"weight\": 4.0},\n    {\"name\": \"meter value is readable\", \"type\": \"llm\", \"hint\": \"quality\", \"weight\": 3.0, \"depends_on\": \"has electrical meter\"},\n    {\"name\": \"sharpness\", \"type\": \"cv\", \"weight\": 1.0}\n  ],\n  \"aggregation\": \"mean\",\n  \"ocr\": \"auto\",\n  \"examples\": [\n    {\n      \"data\": \"https://example.com/reference-good.pdf\",\n      \"type\": \"url\",\n      \"weight\": 0.5\n    },\n    {\n      \"data\": \"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=\",\n      \"type\": \"base64\",\n      \"weight\": 0.5\n    }\n  ]\n}",
+          "raw": "{\n  \"image\": {\n    \"data\": \"https://example.com/notice.pdf\",\n    \"type\": \"url\"\n  },\n  \"criteria\": [\n    {\n      \"name\": \"Notice to Owner\",\n      \"type\": \"text\",\n      \"match\": \"fuzzy\",\n      \"fuzzy_threshold\": 0.85,\n      \"weight\": 3.0\n    },\n    {\n      \"name\": \"has electrical meter\",\n      \"type\": \"llm\",\n      \"hint\": \"presence\",\n      \"weight\": 4.0\n    },\n    {\n      \"name\": \"meter value is readable\",\n      \"type\": \"llm\",\n      \"hint\": \"quality\",\n      \"weight\": 3.0,\n      \"depends_on\": \"has electrical meter\"\n    },\n    {\n      \"name\": \"sharpness\",\n      \"type\": \"cv\",\n      \"weight\": 1.0\n    }\n  ],\n  \"aggregation\": \"mean\",\n  \"ocr\": \"auto\",\n  \"examples\": [\n    {\n      \"data\": \"https://example.com/reference-good.pdf\",\n      \"type\": \"url\",\n      \"weight\": 0.5\n    },\n    {\n      \"data\": \"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=\",\n      \"type\": \"base64\",\n      \"weight\": 0.5\n    }\n  ],\n  \"regions\": {\n    \"enabled\": true,\n    \"layers\": [\n      \"svg\"\n    ],\n    \"detector\": false,\n    \"llm_boxes\": false,\n    \"diff\": false,\n    \"examples\": false\n  }\n}",
           "options": { "raw": { "language": "json" } }
         },
         "url": {
@@ -153,7 +170,57 @@
           "host": ["{{litellm}}"],
           "path": ["v1", "classifier", "assess", "compare"]
         },
-        "description": "Submit a comparison job — assess a subject document against one or more reference examples. Content-Type is `application/json`. Body is a CompareRequest (see models.py):\n\n- `image`: DocumentInput `{data, type: \"base64\" | \"url\"}` — the field keeps its name for compatibility but accepts any supported kind (JPEG/PNG, PDF, .txt, .docx); the bytes decide, not the URL's extension. URL inputs are SSRF-checked before fetching (see ssrf.py). `ImageInput` remains an alias of `DocumentInput`.\n- `criteria`: list[CriterionInput], defaults to `config.DEFAULT_CRITERIA` if omitted. `type: \"text\"` criteria work here exactly as on /assess.\n- `aggregation`: `mean` (default, balanced) | `min` (strictest — must match all examples) | `max` (most lenient — must match any).\n- `ocr`: `auto` (default) | `always` | `never`, applied to the subject AND every live example so their text layers are comparable.\n- `examples`: list[ExampleInput] with `min_length=1`. Each has `data`, `type`, `weight` (0.0–1.0, default 0.5 — how much similarity to this example influences the combined score; `0.0` = ignore, `1.0` = similarity only), and optional `pre_generated_analysis` (a prior `result` from /assess to skip re-analysing the reference).\n\nReturns **202 Accepted** immediately with `{\"job_id\": \"<id>\", \"phase\": \"pending\"}`. Poll GET /jobs/{jobId} for the result.\n\nServer-side flow (main.py `assess_with_reference`):\n  1. Validate `request.criteria` non-empty (Pydantic already enforces `examples` min_length=1) and compile any text pattern, so a bad regex is a 400 here rather than a failed job.\n  2. Create a job record with `metadata={type: \"compare\", request_id: <req>}` in phase `staging`.\n  3. Write the full CompareRequest to `PAYLOAD_DIR/<job_id>.json`, flip the row to `pending`, wake an idle worker — runners.run_compare re-validates it from disk so the job survives a restart.\n  4. Return `202` with the job_id.\n\nErrors: **400** if criteria list is empty or a text pattern is unusable; **422** if the body fails CompareRequest validation (missing examples, invalid aggregation or ocr literal, weight out of range, malformed DocumentInput/ExampleInput).\n\nCombined-score formula: `combined = (1 - weight) × input_overall_score + weight × similarity_score`. Result shape: `{status, criteria, aggregation, ocr, input_analysis, example_results[], aggregate: {method, combined_score, combined_verdict, per_example_combined_scores}}`; each analysis carries its own `document_info`. See API.md § `POST /assess/compare`.\n\nCaching: `pre_generated_analysis` values must come from the SAME version of the classifier that is currently running — stored analyses from older versions cause runtime errors. Re-generate after upgrades. See API.md § Caching example analyses."
+        "description": "Submit a comparison job — assess a subject document against one or more reference examples. Content-Type is `application/json`. Body is a CompareRequest (see api/schemas.py):\n\n- `image`: DocumentInput `{data, type: \"base64\" | \"url\"}` — the field keeps its name for compatibility but accepts any supported kind (JPEG/PNG, PDF, .txt, .docx); the bytes decide, not the URL's extension. URL inputs are SSRF-checked before fetching (see analysis/loading.py). `ImageInput` remains an alias of `DocumentInput`.\n- `criteria`: list[CriterionInput], defaults to `config.DEFAULT_CRITERIA` if omitted. `type: \"text\"` criteria work here exactly as on /assess.\n- `aggregation`: `mean` (default, balanced) | `min` (strictest — must match all examples) | `max` (most lenient — must match any).\n- `ocr`: `auto` (default) | `always` | `never`, applied to the subject AND every live example so their text layers are comparable.\n- `examples`: list[ExampleInput] with `min_length=1`. Each has `data`, `type`, `weight` (0.0–1.0, default 0.5 — how much similarity to this example influences the combined score; `0.0` = ignore, `1.0` = similarity only), and optional `pre_generated_analysis` (a prior `result` from /assess to skip re-analysing the reference).\n\nReturns **202 Accepted** immediately with `{\"job_id\": \"<id>\", \"phase\": \"pending\"}`. Poll GET /jobs/{jobId} for the result.\n\nServer-side flow (api/assess.py `assess_with_reference`):\n  1. Validate `request.criteria` non-empty (Pydantic already enforces `examples` min_length=1) and compile any text pattern, so a bad regex is a 400 here rather than a failed job.\n  2. Create a job record with `metadata={type: \"compare\", request_id: <req>}` in phase `staging`.\n  3. Write the full CompareRequest to `PAYLOAD_DIR/<job_id>.json`, flip the row to `pending`, wake an idle worker — jobs.runners.run_compare re-validates it from disk so the job survives a restart.\n  4. Return `202` with the job_id.\n\nErrors: **400** if criteria list is empty or a text pattern is unusable; **422** if the body fails CompareRequest validation (missing examples, invalid aggregation or ocr literal, weight out of range, malformed DocumentInput/ExampleInput).\n\nCombined-score formula: `combined = (1 - weight) × input_overall_score + weight × similarity_score`. Result shape: `{status, criteria, aggregation, ocr, input_analysis, example_results[], aggregate: {method, combined_score, combined_verdict, per_example_combined_scores}}`; each analysis carries its own `document_info`. See API.md § `POST /assess/compare`.\n\nCaching: `pre_generated_analysis` values must come from the SAME version of the classifier that is currently running — stored analyses from older versions cause runtime errors. Re-generate after upgrades. See API.md § Caching example analyses.\n\n- `regions`: RegionsOptions or omitted (the default, off). Layers are rendered for the SUBJECT document unless `\"examples\": true`, which also collects regions and renders layers for each LIVE example as `e{i}.p{n}.<fmt>` in the same job directory (an example has no job of its own) plus its own `e{i}.regions.json`; off by default because it roughly doubles the artifact volume.\n- `\"diff\": true` adds CHANGE DETECTION between the subject and each live single-image example: ORB features and a RANSAC homography align the two, then a thresholded difference yields `source: \"diff\"` polygons with `attrs.change` of added / removed / changed. They are filed under a synthetic `_diff:e{i}` criterion and rendered as `diff-e{i}-p0.<fmt>`. Under CLASSIFIER_DIFF_MIN_INLIERS (30) the answer is `aligned: false` with a note and NO regions — different framing is reported, not guessed at. Diff regions are NOT criteria: `aggregate`, every `similarity` and every `combined_score` are identical with `diff` on and off, which is the assertion worth making. An example supplied as `pre_generated_analysis` carries no pixels and is skipped with a reason. See the `Regions` folder's change-detection request and API.md § Change detection."
+      },
+      "response": []
+    },
+    {
+      "name": "POST /locate",
+      "request": {
+        "method": "POST",
+        "header": [],
+        "body": {
+          "mode": "formdata",
+          "formdata": [
+            {
+              "key": "file",
+              "type": "file",
+              "src": "unit-tests/classifier/regions/text_blocks.png",
+              "description": "The document to search: JPEG, PNG, PDF, .txt, or .docx, same detection rules as /assess. The `src` here points at a repo fixture — re-select the file in Postman if your working directory differs."
+            },
+            {
+              "key": "image",
+              "type": "file",
+              "src": "",
+              "disabled": true,
+              "description": "Deprecated alias for `file`, accepted for symmetry with /assess. Send one of the two."
+            },
+            {
+              "key": "features",
+              "type": "text",
+              "value": "[\"has text\", {\"name\":\"Notice to Owner\",\"type\":\"text\",\"match\":\"fuzzy\",\"fuzzy_threshold\":0.8}]",
+              "description": "JSON array of what to find. Entries are either BARE STRINGS or full CriterionInput objects, or a mix.\n\nA bare string has no `type`, and defaulting it to `llm` would make the common case return nothing at all (LLM localization is phase 3). So it resolves to whichever path can actually produce geometry: `cv` when a registered OpenCV detector matches the name, else `detector` when DETECTOR_URL is configured (the open-vocabulary service can find anything nameable — `[\"bicycle\"]` returns boxes with NO LLM call), else `llm`. The result's `method` field says which path each feature took.\n\nAn object spelled out in full is taken at its word — which is how a `text` feature sets `match`, `pattern`, `fuzzy_threshold`, and the rest, and how you force `\"type\": \"detector\"` for a name the OpenCV registry would otherwise fuzzy-match at difflib cutoff 0.6.\n\nAn empty array, a non-array, or an entry that fails CriterionInput validation is a 400."
+            },
+            {
+              "key": "ocr",
+              "type": "text",
+              "value": "always",
+              "description": "Text-recognition policy, same three values as /assess. `always` here because the fixture is a PNG with no native text layer and the `Notice to Owner` feature needs OCR to have anything to locate."
+            },
+            {
+              "key": "regions",
+              "type": "text",
+              "value": "svg",
+              "description": "Layer formats. `enabled` is IMPLIED on this endpoint — that is the point of it — so this field only chooses formats: `svg` (default), a comma list, `none` for regions.json only, or the full object as JSON. Sending `false` here does not disable regions; it is normalised back to enabled."
+            }
+          ]
+        },
+        "url": {
+          "raw": "{{litellm}}/v1/classifier/locate",
+          "host": ["{{litellm}}"],
+          "path": ["v1", "classifier", "locate"]
+        },
+        "description": "Submit a scoring-free \"where is X?\" job. Same pipeline as /assess with every judgement taken out: no weighted score, no verdict, no dependency resolution, and no LLM call at all — unless the request sets `regions={\"enabled\":true,\"llm_boxes\":true}`, in which case a presence-only scoring call runs to give the bounding-box enforcement loop a score to gate on and its judgement is then discarded: the feature carries `regions` and `localization`, never a `score` or a `verdict`.\n\n/assess answers \"how good is this document?\" and mentions, if asked, where it looked. /locate answers ONLY \"where is X?\", which is a different job with a different cost profile — a caller who wants boxes for a UI overlay should not have to submit criteria, read a verdict, and throw it away.\n\nReturns **202 Accepted** immediately with `{\"job_id\": \"<id>\", \"phase\": \"pending\"}`; poll GET /jobs/{jobId}. `metadata.type` is `\"locate\"`, and the job uses the same job store, the same artifact directory layout, and the same artifact endpoints as an assess job.\n\n**Result shape** (inside `job.result`): `features` where an assessment would have `assessment`, and no `verdict` anywhere. Each feature keeps `method`, `reason`, `detail`, `regions`, `regions_truncated` and `artifacts`, and loses `score`, `verdict` and `confidence` — \"Green coverage: 14.2% of image\" is a fact about where the thing is, not a verdict on it.\n\nFeature resolution for a BARE STRING: `cv` when a registered OpenCV detector matches the name, else `detector` when DETECTOR_URL is set, else `llm` with `hint: \"presence\"` (\"where is X\" is a presence question by construction), which is what makes the enforcement loop eligible to run for it.\n\nErrors: **400** for missing/unparseable `features`, an empty array, an invalid `ocr` value, an unknown `regions` layer, an empty file, or bytes that are not a supported document.\n\nSee API.md § `POST /locate`."
       },
       "response": []
     },
@@ -181,7 +248,11 @@
           "host": ["{{litellm}}"],
           "path": ["v1", "classifier", "jobs", ":jobId"],
           "variable": [
-            { "key": "jobId", "value": "", "description": "job_id returned by POST /assess or POST /assess/compare." }
+            {
+              "key": "jobId",
+              "value": "",
+              "description": "job_id returned by POST /assess or POST /assess/compare."
+            }
           ]
         },
         "description": "Poll for the status and result of a submitted job. Set the `jobId` collection variable to the `job_id` returned by POST /assess or POST /assess/compare first.\n\nResponse shape (JobBase from `common.jobs`):\n  `{job_id, phase, created_at, updated_at, elapsed_seconds, metadata: {type, request_id}, result, error}`\n\n`phase` progression: `staging` → `pending` → `processing` → `completed` | `failed`. Up to `CLASSIFIER_MAX_CONCURRENT` jobs sit in `processing` at once; a job left in `processing` by a restart is requeued to `pending` on the next startup.\n\n- While `staging` / `pending` / `processing`: `result` is null, `error` is null. Keep polling.\n- When `completed`: `result` is the assessment (see POST /assess or POST /assess/compare descriptions for the exact shape).\n- When `failed`: `error` holds the exception message set by the worker via `jobs_registry.set_error(...)`, `result` is null.\n\nErrors: **404** if the `job_id` is unknown (registry.get returned None). Note the response migration: top-level `id` is now `job_id`, `status` is now `phase`, and the previously separate `type` + `request_id` columns are nested under `metadata`. Callers that parse the response by field name need to update accordingly. See API.md § `GET /jobs/{job_id}`."
@@ -198,10 +269,14 @@
           "host": ["{{litellm}}"],
           "path": ["v1", "classifier", "jobs", ":jobId"],
           "variable": [
-            { "key": "jobId", "value": "", "description": "job_id returned by POST /assess or POST /assess/compare." }
+            {
+              "key": "jobId",
+              "value": "",
+              "description": "job_id returned by POST /assess or POST /assess/compare."
+            }
           ]
         },
-        "description": "Delete a job record from the SQLite registry. Returns **204 No Content** on success (empty body). Idempotent from the caller's perspective in the sense that once gone the record stays gone — but the underlying `registry.delete` returns False for unknown ids, so a repeat call for the same id returns **404** with `detail: \"no job '<id>'\"`.\n\nNo cancel semantics: the worker doesn't currently observe a cancel signal mid-analysis, so `include_cancel=False` on the mounted router (see main.py). Deleting a job that's still `pending` removes the row before any worker claims it, so it never runs (its payload file is swept at the next startup). Deleting one that's `processing` does NOT abort the in-flight worker task — the worker will attempt to write its result/error to a row that no longer exists (logged, but harmless). See API.md § `DELETE /jobs/{job_id}`."
+        "description": "Delete a job record from the SQLite registry. Returns **204 No Content** on success (empty body). Idempotent from the caller's perspective in the sense that once gone the record stays gone — but the underlying `registry.delete` returns False for unknown ids, so a repeat call for the same id returns **404** with `detail: \"no job '<id>'\"`.\n\nNo cancel semantics: the worker doesn't currently observe a cancel signal mid-analysis, so `include_cancel=False` on the mounted router (see main.py). Deleting a job that's still `pending` removes the row before any worker claims it, so it never runs (its payload file is swept at the next startup). Deleting one that's `processing` does NOT abort the in-flight worker task — the worker will attempt to write its result/error to a row that no longer exists (logged, but harmless). See API.md § `DELETE /jobs/{job_id}`.\n\nAlso removes the job's artifact directory, via the `on_delete` hook `common.jobs.router.build_router` grew for exactly this — the router stays about job rows and the classifier plugs the directory cleanup in. To free the disk but KEEP the row and its inline regions, use DELETE /jobs/{jobId}/artifacts instead."
       },
       "response": []
     },
@@ -452,6 +527,503 @@
               "path": ["v1", "classifier", "assess"]
             },
             "description": "Expected: **400 Bad Request**, no job created, with `detail` = \"Legacy .doc (OLE2 compound) files are not supported. Convert the file to .docx (Word: File → Save As → .docx, or `libreoffice --convert-to docx`) and upload that instead.\"\n\nDetection is by magic bytes, so renaming the file to .docx does not change the outcome — and neither does declaring a different Content-Type. There is no server-side conversion step by design; converting is the caller's job."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Artifacts",
+      "description": "The per-job artifact directory: the manifest, one file at a time (optionally re-rendered for a subset of regions), the whole thing as a zip, and an early delete.\n\nAll four live in the classifier (ai/classifier/api/artifacts.py), not in `common.jobs.router` — the router stays about job rows. They share the Authorization posture of every other route: the LiteLLM pass-through does the bearer check, and direct :8005 access is unauthenticated.\n\nEvery request needs a `jobId` from a job submitted WITH `regions` (or any /locate job). A job that never had artifacts answers **404**; one whose directory the sweeper or a DELETE removed answers **410**, so a caller holding a stored URL can tell \"expired\" from \"wrong URL\" without guessing.\n\nBinary streaming through the LiteLLM pass-through is the one thing worth verifying on a new deployment — if a PNG or a zip arrives corrupted, fall back to direct :${PORT_CLASSIFIER} for layer downloads and say so in your runbook.",
+      "item": [
+        {
+          "name": "GET /jobs/:jobId/artifacts",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/jobs/:jobId/artifacts",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "classifier", "jobs", ":jobId", "artifacts"],
+              "variable": [
+                {
+                  "key": "jobId",
+                  "value": "",
+                  "description": "job_id returned by POST /assess, POST /assess/compare, or POST /locate. The job must have been submitted WITH `regions`, or it has no artifact directory and these endpoints answer 404."
+                }
+              ]
+            },
+            "description": "The manifest for a job's artifact directory: `files[]` (name, bytes, content type, url), the criterion → slug map, `page_geometry`, the request's `regions` options, `dropped`, `notes`, `total_bytes`, and `expires_at`.\n\nThe same information as the result's `artifacts` block, fetchable WITHOUT pulling the (possibly large) result — which is the point: a caller that only wants to list the layers should not drag a megabyte of regions through the job store to do it.\n\n**Errors:** 404 when the job is unknown or never had artifacts (submitted without `regions`); 410 when the job exists and its result says it DID have artifacts but the directory is gone — swept past JOB_TTL_HOURS, or explicitly deleted.\n\nSee API.md § `GET /jobs/{job_id}/artifacts`."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /jobs/:jobId/artifacts/:artifactName",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/jobs/:jobId/artifacts/:artifactName",
+              "host": ["{{litellm}}"],
+              "path": [
+                "v1",
+                "classifier",
+                "jobs",
+                ":jobId",
+                "artifacts",
+                ":artifactName"
+              ],
+              "variable": [
+                {
+                  "key": "jobId",
+                  "value": "",
+                  "description": "job_id of a job submitted with `regions`."
+                },
+                {
+                  "key": "artifactName",
+                  "value": "",
+                  "description": "File name from GET /jobs/{jobId}/artifacts. Three families live in one directory: the SUBJECT's own `regions.json`, `manifest.json`, `p0.svg`, `p0.layer.png`, `p0.preview.jpg`, `p0.base.jpg`; change-detection layers `diff-e0-p0.svg` etc. from `regions.diff` on /assess/compare; and, from `regions.examples`, an example's own `e0.p0.svg` plus its `e0.regions.json` (an example's pages are a different coordinate frame, so it gets its own regions file rather than being mixed into the subject's). Validated against a strict pattern AND against the directory, so no path traversal and no listing the volume."
+                }
+              ],
+              "query": [
+                {
+                  "key": "criterion",
+                  "value": "",
+                  "disabled": true,
+                  "description": "Criterion SLUG (not name) — e.g. `has-water-4b21`, from the manifest's criteria map. Repeatable. Filters the re-render to that criterion's regions. An unknown slug is a 400."
+                },
+                {
+                  "key": "source",
+                  "value": "",
+                  "disabled": true,
+                  "description": "Comma list of `cv`, `ocr`, `pdf-text`, `llm`, `detector`, `diff`. Only regions from those sources are drawn."
+                },
+                {
+                  "key": "attempt",
+                  "value": "",
+                  "disabled": true,
+                  "description": "LLM criteria only: the box from enforcement-loop attempt N, accepted or not. This is how a REJECTED box is viewed on its own — the loop stores every attempt, and `artifacts.attempts[]` in the job result carries these URLs ready-made. Non-LLM regions have no attempt and are dropped by this filter, which is what \"show me attempt 2\" means."
+                },
+                {
+                  "key": "accepted",
+                  "value": "",
+                  "disabled": true,
+                  "description": "LLM criteria only, tri-state. `true` — and the DEFAULT whenever any filter is given and no `attempt` is — keeps the accepted attempt, which is the same subset the stored combined layer shows. `false` keeps the REJECTED attempts, for looking at what the loop threw away."
+                }
+              ]
+            },
+            "description": "Stream one file with its content type (`image/svg+xml`, `image/png`, `image/jpeg`, `application/json`).\n\nWith NO query parameters the stored file is streamed as-is. With any of them the layer is **re-rendered from regions.json** by the same `common.vision.render_*` functions that produced the stored one, so a filtered view is always consistent with the combined one.\n\nSVG renders are cheap enough to serve uncached. A filtered PNG or preview for a SINGLE criterion is cached into the directory as `p0.<slug>.layer.png` / `p0.<slug>.preview.jpg` on first request — the same names `regions.layers_per_criterion` pre-renders, so the lazy and eager paths cannot produce different files — and counts against CLASSIFIER_ARTIFACT_MAX_BYTES.\n\n**Errors:** 400 for an unknown criterion slug or a name that is not a renderable layer (you cannot filter manifest.json); 404 for an unknown job or a file not in the directory; 410 when the directory has been swept or deleted. A filtered `preview` needs `p{n}.base.jpg`, which exists only when the job asked for the `preview` layer — without it the response is a 404 that says so and points at the SVG or PNG instead.\n\nSee API.md § `GET /jobs/{job_id}/artifacts/{name}`.\n\nAll three layer families take these filters. `diff-e0-p0.svg` renders from the subject's `regions.json` (the diff is in the subject's coordinate frame and is filed there under `_diff:e0`); `e0.p0.svg` renders from `e0.regions.json`. A `?attempt=` or `?accepted=false` render is deliberately UNcached — it is an inspection, not a hot path, and caching it under the criterion's name would serve the wrong subset to the next caller who asked for the plain one."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /jobs/:jobId/artifacts.zip",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/jobs/:jobId/artifacts.zip",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "classifier", "jobs", ":jobId", "artifacts.zip"],
+              "variable": [
+                {
+                  "key": "jobId",
+                  "value": "",
+                  "description": "job_id of a job submitted with `regions`."
+                }
+              ]
+            },
+            "description": "Every file in the directory as one zip, built on the fly and streamed — nothing extra is stored. The \"download the layers\" path, for Photoshop or a report generator.\n\nEntries are prefixed with the job id, so unpacking several jobs side by side does not collide. Built from the files that are ACTUALLY there, so a job the byte cap trimmed produces a zip of what survived rather than failing.\n\nIn Postman use Send → Save Response → Save to a file; the preview pane cannot show a zip.\n\n**Errors:** 404 unknown job or no directory; 410 swept or deleted.\n\nSee API.md § `GET /jobs/{job_id}/artifacts.zip`."
+          },
+          "response": []
+        },
+        {
+          "name": "DELETE /jobs/:jobId/artifacts",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/jobs/:jobId/artifacts",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "classifier", "jobs", ":jobId", "artifacts"],
+              "variable": [
+                {
+                  "key": "jobId",
+                  "value": "",
+                  "description": "job_id returned by POST /assess, POST /assess/compare, or POST /locate. The job must have been submitted WITH `regions`, or it has no artifact directory and these endpoints answer 404."
+                }
+              ]
+            },
+            "description": "Remove the artifact directory but KEEP the job row and its result — the inline regions (up to CLASSIFIER_INLINE_REGIONS_MAX) survive. For a caller that copied the layers elsewhere and wants the disk back before the TTL.\n\nReturns **204 No Content**. Afterwards the other three artifact endpoints answer **410** for this job, not 404: the job still says it had artifacts, they are simply gone.\n\n**Errors:** 404 when the job is unknown or has no directory.\n\nTo delete the row as well, use DELETE /jobs/{jobId}, which removes both.\n\nSee API.md § `DELETE /jobs/{job_id}/artifacts`."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Regions",
+      "description": "One ready-to-run request per fixture in unit-tests/classifier/regions/, mirroring that folder's README — which lists the exact regions each one should produce, down to approximate bounding boxes. Run one, copy its `job_id` into the `jobId` variable, then use the `Artifacts` folder to fetch the layers.\n\nThe `cv` and `text` rows are deterministic and should reproduce exactly. Anything `llm` does not localise in this build at all (phase 3) and comes back with `\"regions\": []` and `\"artifacts\": null` — no regions must mean a NULL artifacts block, never an empty object implying URLs that would 404.",
+      "item": [
+        {
+          "name": "greenery_and_sky.png — three mask detectors, three polygon sets",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "description": "Repo fixture: unit-tests/classifier/regions/greenery_and_sky.png. Re-select the file in Postman if your working directory differs.",
+                  "src": "unit-tests/classifier/regions/greenery_and_sky.png"
+                },
+                {
+                  "key": "criteria",
+                  "type": "text",
+                  "description": "See the request description for what each entry is expected to localise.",
+                  "value": "[{\"name\":\"has sky\",\"type\":\"cv\"},{\"name\":\"has vegetation\",\"type\":\"cv\"},{\"name\":\"has water\",\"type\":\"cv\"},{\"name\":\"sharpness\",\"type\":\"cv\"}]"
+                },
+                {
+                  "key": "ocr",
+                  "type": "text",
+                  "description": "Text-recognition policy for this fixture.",
+                  "value": "never"
+                },
+                {
+                  "key": "regions",
+                  "type": "text",
+                  "description": "Layer formats for this run — see API.md § Regions and layers for the full option set.",
+                  "value": "svg,png,preview"
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/assess",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "classifier", "assess"]
+            },
+            "description": "Three HSV mask detectors on one 900×700 synthetic scene, plus a whole-page measurement that must produce NOTHING.\n\n**Expect:** `has sky` PASS 10, 1 polygon bounded by roughly (0, 0, 899, 243) — the detector only looks at the top 35% of the page, so the polygon is that band. `has vegetation` PASS 10, 1 polygon around (0, 359, 899, 699) with ~8 vertices after approxPolyDP. `has water` PASS 10 with **2** polygons: the sky band AND the pool at ~(90, 518, 430, 651) — expected and worth understanding, because `detect_water` accepts any blue region whose Laplacian variance is under 200 and a smooth sky qualifies. That is the detector's honest answer, not a fixture flaw.\n\n`sharpness` PASSes with `\"regions\": []` and `\"artifacts\": null`: a whole-page measurement never fabricates a full-page box.\n\nArtifacts written: manifest.json, regions.json, p0.svg, p0.layer.png, p0.preview.jpg, and p0.base.jpg — the un-annotated page, kept only because `preview` was requested, so a FILTERED preview can be re-composited later (a burned-in preview cannot be un-burned)."
+          },
+          "response": []
+        },
+        {
+          "name": "text_blocks.png — merged text-block boxes + OCR line polygons",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "description": "Repo fixture: unit-tests/classifier/regions/text_blocks.png. Re-select the file in Postman if your working directory differs.",
+                  "src": "unit-tests/classifier/regions/text_blocks.png"
+                },
+                {
+                  "key": "criteria",
+                  "type": "text",
+                  "description": "See the request description for what each entry is expected to localise.",
+                  "value": "[{\"name\":\"has text\",\"type\":\"cv\"},{\"name\":\"Notice to Owner\",\"type\":\"text\",\"match\":\"fuzzy\",\"fuzzy_threshold\":0.8},{\"name\":\"total amount\",\"type\":\"text\",\"match\":\"regex\",\"pattern\":\"\\\\$[\\\\d,]+\\\\.\\\\d{2}\"}]"
+                },
+                {
+                  "key": "ocr",
+                  "type": "text",
+                  "description": "Text-recognition policy for this fixture.",
+                  "value": "always"
+                },
+                {
+                  "key": "regions",
+                  "type": "text",
+                  "description": "Layer formats for this run — see API.md § Regions and layers for the full option set.",
+                  "value": "svg"
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/assess",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "classifier", "assess"]
+            },
+            "description": "Two sources on one page: `cv` block boxes and `ocr` line polygons. `ocr=always` because a PNG has no native text layer, so the text criteria have nothing to search otherwise.\n\n**Expect:** `has text` MARGINAL 5 with **4** boxes, one per paragraph cluster — roughly (96,192)-(352,288), (512,192)-(768,256), (512,448)-(800,480) and (96,416)-(256,480). Two columns producing more than one box is the point of this fixture: a single box over the whole page would mean the 32×32 block merge is broken.\n\n`Notice to Owner` PASS 10 with 1—2 polygons, `source: \"ocr\"`, carrying the recogniser's confidence as `score` — a fuzzy window can clip the line above, so two regions is normal. `total amount` PASS 10, 1 `ocr` polygon on the `$4,850.00` line."
+          },
+          "response": []
+        },
+        {
+          "name": "invoice_native.pdf — native PDF rectangles (source=pdf-text)",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "description": "Repo fixture: unit-tests/classifier/documents/invoice_native.pdf. Re-select the file in Postman if your working directory differs.",
+                  "src": "unit-tests/classifier/documents/invoice_native.pdf"
+                },
+                {
+                  "key": "criteria",
+                  "type": "text",
+                  "description": "See the request description for what each entry is expected to localise.",
+                  "value": "[{\"name\":\"Notice to Owner\",\"type\":\"text\",\"match\":\"contains\"},{\"name\":\"total amount\",\"type\":\"text\",\"match\":\"regex\",\"pattern\":\"\\\\$[\\\\d,]+\\\\.\\\\d{2}\"},{\"name\":\"has text\",\"type\":\"cv\"}]"
+                },
+                {
+                  "key": "ocr",
+                  "type": "text",
+                  "description": "Text-recognition policy for this fixture.",
+                  "value": "never"
+                },
+                {
+                  "key": "regions",
+                  "type": "text",
+                  "description": "Layer formats for this run — see API.md § Regions and layers for the full option set.",
+                  "value": "true"
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/assess",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "classifier", "assess"]
+            },
+            "description": "PyMuPDF rectangles instead of OCR polygons. `ocr=never` because the PDF has a native text layer — that is what makes the source `pdf-text`.\n\n**Expect:** `Notice to Owner` 1 box located by `search_for`, with `attrs.pdf_rect` ≈ [60.0, 220.2, 193.8, 239.4] — the region's own `points` are in RENDERED page pixels (1240×1755 at 150 dpi) and `pdf_rect` is the same rectangle in POINTS, so PDF tooling can use it directly.\n\n`total amount` 3 boxes ($1,200.00, $3,650.00, $4,850.00), each reconstructed from the word spans covering the regex match — **approximate by construction**: a phrase PyMuPDF splits differently from the text layer (hyphenation, a ligature, a column break mid-phrase) does not line up, and the region is omitted rather than guessed at.\n\n`has text` produces boxes on BOTH pages even though the score reports the worst one — \"where is the text\" is a different question from \"how much of it is there\".\n\n`page_geometry[0].pdf_points` is [595.2, 842.4] and `working_scale` ≈ 0.569."
+          },
+          "response": []
+        },
+        {
+          "name": "photo_of_letter.png — OCR line polygons on a skewed page",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "description": "Repo fixture: unit-tests/classifier/documents/photo_of_letter.png. Re-select the file in Postman if your working directory differs.",
+                  "src": "unit-tests/classifier/documents/photo_of_letter.png"
+                },
+                {
+                  "key": "criteria",
+                  "type": "text",
+                  "description": "See the request description for what each entry is expected to localise.",
+                  "value": "[{\"name\":\"Notice to Owner\",\"type\":\"text\",\"match\":\"fuzzy\",\"fuzzy_threshold\":0.8}]"
+                },
+                {
+                  "key": "ocr",
+                  "type": "text",
+                  "description": "Text-recognition policy for this fixture.",
+                  "value": "always"
+                },
+                {
+                  "key": "regions",
+                  "type": "text",
+                  "description": "Layer formats for this run — see API.md § Regions and layers for the full option set.",
+                  "value": "svg,preview"
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/assess",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "classifier", "assess"]
+            },
+            "description": "A photographed letter at a 3° skew — the case for polygons rather than boxes.\n\n**Expect:** the heading as an `ocr` polygon at ≈ (67, 197, 360, 244) with `score` ≈ 0.999 (the recogniser's own confidence) and `attrs.text` = \"NOTICE TO OWNER\". The polygon is a real QUADRILATERAL, not a rectangle: it follows the skew, which is exactly what an axis-aligned box could not do.\n\nFetch `p0.preview.jpg` from the Artifacts folder to see it composited over the page."
+          },
+          "response": []
+        },
+        {
+          "name": "Neighborhood.jpeg — a real photo, and the empty-regions case",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "description": "Repo fixture: unit-tests/classifier/Neighborhood.jpeg. Re-select the file in Postman if your working directory differs.",
+                  "src": "unit-tests/classifier/Neighborhood.jpeg"
+                },
+                {
+                  "key": "criteria",
+                  "type": "text",
+                  "description": "See the request description for what each entry is expected to localise.",
+                  "value": "[{\"name\":\"has faces\",\"type\":\"cv\"},{\"name\":\"has sky\",\"type\":\"cv\"}]"
+                },
+                {
+                  "key": "ocr",
+                  "type": "text",
+                  "description": "Text-recognition policy for this fixture.",
+                  "value": "never"
+                },
+                {
+                  "key": "regions",
+                  "type": "text",
+                  "description": "Layer formats for this run — see API.md § Regions and layers for the full option set.",
+                  "value": "svg,preview"
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/assess",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "classifier", "assess"]
+            },
+            "description": "The only honest input for `has faces`: a real street photo. A drawn face does not reliably trip OpenCV's Haar cascade — it was trained on photographs — so there is deliberately no synthetic face fixture.\n\n**Expect:** `has sky` PASS with ~3 polygons. `has faces` usually finds NOTHING on this photo (the people are small and not frontal), in which case it FAILs with `\"regions\": []` and `\"artifacts\": null` — which is the assertion worth making: no regions must mean a null artifacts block, never an empty object implying URLs that would 404."
+          },
+          "response": []
+        },
+        {
+          "name": "Neighborhood.jpeg — regions.detector, scored with no LLM call",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "description": "Repo fixture: unit-tests/classifier/Neighborhood.jpeg. Re-select the file in Postman if your working directory differs.",
+                  "src": "unit-tests/classifier/Neighborhood.jpeg"
+                },
+                {
+                  "key": "criteria",
+                  "type": "text",
+                  "description": "See the request description for what each entry is expected to localise.",
+                  "value": "[{\"name\":\"has roof vent\",\"type\":\"cv\"},{\"name\":\"has bicycle\",\"type\":\"detector\"},{\"name\":\"has sky\",\"type\":\"cv\"},{\"name\":\"has solar panels\",\"type\":\"llm\",\"hint\":\"presence\"}]"
+                },
+                {
+                  "key": "ocr",
+                  "type": "text",
+                  "description": "Text-recognition policy for this fixture.",
+                  "value": "never"
+                },
+                {
+                  "key": "regions",
+                  "type": "text",
+                  "description": "Layer formats for this run — see API.md § Regions and layers for the full option set.",
+                  "value": "{\"enabled\": true, \"detector\": true, \"layers\": [\"svg\", \"preview\"]}"
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/assess",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "classifier", "assess"]
+            },
+            "description": "Phase 2: the open-vocabulary detector (ai/detector) answering the criteria OpenCV cannot.\n\n**Needs DETECTOR_URL set on the classifier container** (`http://detector:8000`). Without it the job still SUCCEEDS — an unreachable enrichment never fails a job — and `result.artifacts.notes` says the service is not configured, which is the other assertion worth making here. Check GET /document-kinds → `regions.detector.configured` first.\n\nFour criteria, four paths. `has roof vent` is a `cv` criterion NO OpenCV detector matches, so with `regions.detector` on it is answered by the detector and SCORED from the boxes. `has bicycle` spells `\"type\": \"detector\"` to name the path outright; as a `cv` criterion it would also reach the service now that `get_detector`'s fuzzy cutoff is 0.8 (`CV_NAME_FUZZY_CUTOFF`) rather than the 0.6 that used to collide it with `has faces`. `has sky` has a real OpenCV detector and is untouched. `has solar panels` is LLM-scored but detector-LOCALISED.\n\n**Expect:** `has roof vent` and `has bicycle` with `\"method\": \"detector\"`, `source=\"detector\"` regions carrying `attrs.detector_score`, and a score of 10 (best box ≥ 0.5) or 7 (above the 0.25 floor) — or 1/FAIL if the detector genuinely finds neither, which on this photo is the likely answer and is still the right assertion: a detector negative is FAILed there and is NOT then re-asked of the vision model, because that would charge a token cost for every absent feature.\n\n`has sky` still reports `\"method\": \"cv\"`. `has solar panels` still reports `\"method\": \"llm\"` — the model scores it, the detector only says where — so its regions (if any) have `source=\"detector\"`.\n\n`result.document_info.detector` reports the model, device, call count and inference time; regions.json carries the same block at the top so a consumer can tell which model drew the boxes. One detector call is made per page image, carrying every label for that page.\n\nSee API.md § The detector and ai/detector/DETECTOR.md."
+          },
+          "response": []
+        },
+        {
+          "name": "POST /locate — text_blocks.png, no score, just the geometry",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "description": "Repo fixture: unit-tests/classifier/regions/text_blocks.png. Re-select the file in Postman if your working directory differs.",
+                  "src": "unit-tests/classifier/regions/text_blocks.png"
+                },
+                {
+                  "key": "features",
+                  "type": "text",
+                  "description": "See the request description for what each entry is expected to localise.",
+                  "value": "[\"has text\", {\"name\":\"Notice to Owner\",\"type\":\"text\",\"match\":\"fuzzy\",\"fuzzy_threshold\":0.8}]"
+                },
+                {
+                  "key": "ocr",
+                  "type": "text",
+                  "description": "Text-recognition policy for this fixture.",
+                  "value": "always"
+                },
+                {
+                  "key": "regions",
+                  "type": "text",
+                  "description": "Layer formats for this run — see API.md § Regions and layers for the full option set.",
+                  "value": "svg"
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/locate",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "classifier", "locate"]
+            },
+            "description": "The same fixture through /locate instead of /assess. Note the field is `features`, not `criteria`, and that entries may be bare names or full objects.\n\n**Expect:** `result.features` with the same regions as the /assess run above, and NO `assessment`, `verdict`, `overall_score` or per-feature `score`/`confidence` anywhere. `metadata.type` is `\"locate\"`.\n\nAdd a feature no OpenCV detector resolves (e.g. `\"bicycle\"`): with DETECTOR_URL set it comes back with `\"method\": \"detector\"` and real boxes and NO LLM call, and without it with `regions: []` and a reason saying LLM localization is phase 3."
+          },
+          "response": []
+        },
+        {
+          "name": "Neighborhood.jpeg — the LLM enforcement loop (regions.llm_boxes)",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "description": "Repo fixture: unit-tests/classifier/Neighborhood.jpeg. Re-select the file in Postman if your working directory differs.",
+                  "src": "unit-tests/classifier/Neighborhood.jpeg"
+                },
+                {
+                  "key": "criteria",
+                  "type": "text",
+                  "description": "Two presence criteria the model can plausibly box, and one quality criterion the loop must IGNORE.",
+                  "value": "[{\"name\": \"solar panels\", \"type\": \"llm\", \"hint\": \"presence\"}, {\"name\": \"a parked car\", \"type\": \"llm\", \"hint\": \"presence\"}, {\"name\": \"image sharpness\", \"type\": \"llm\", \"hint\": \"quality\"}]"
+                },
+                {
+                  "key": "ocr",
+                  "type": "text",
+                  "description": "Text-recognition policy for this fixture.",
+                  "value": "never"
+                },
+                {
+                  "key": "regions",
+                  "type": "text",
+                  "description": "The full object — `llm_boxes` and `detector` are not layer formats, so the comma shorthand cannot express them.",
+                  "value": "{\"enabled\": true, \"layers\": [\"svg\", \"preview\"], \"llm_boxes\": true, \"detector\": true}"
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/assess",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "classifier", "assess"]
+            },
+            "description": "Phase 3: the vision model draws a box, and then has to prove it.\n\nFor each `llm` criterion with hint presence/auto that the scoring call scored 7 or higher, the classifier runs a separate loop: **ask** for `[x1,y1,x2,y2]` on a 0-1000 grid of the same page image → **validate** (four numbers, x1<x2, y1<y2, inside the grid, area between 0.2% and 95% — a full-frame box is a refusal dressed as an answer and is the commonest failure) → **verify** by cropping that box out of the ORIGINAL page, padding it 10%, and sending the CROP ALONE with \"is <criterion> visible in this? 1-10\" → **retry** with the rejection as feedback, up to CLASSIFIER_LLM_BBOX_MAX_ATTEMPTS (3).\n\n**Expect** `per_criterion_scores[\"solar panels\"].localization` with `attempts` (one entry per round: `bbox_grid`, `bbox_px`, `valid`, `reject`, `verify_score`, `verify_reason`, `accepted`), `accepted_attempt` (or `null` when nothing was accepted), and `calls`. `regions` carries EVERY attempt that produced four numbers — the accepted one first, the rejected ones with `attrs.accepted: false`.\n\n**`image sharpness` must have NO attempts at all.** It is a property of the whole page; boxing it would be a fabrication, and the gate skips hint=quality criteria entirely.\n\n**With `\"detector\": true` as well** (needs DETECTOR_URL), each accepted box also carries `attrs.detector_iou` — its overlap with the open-vocabulary detector's best box for the same label. Informational only: it never accepts or rejects. Under ~0.5 the two sources disagree about what the criterion means, which is a wording problem, not a geometry one.\n\n**Viewing a REJECTED box** is the point of returning all of them:\n```\nGET /jobs/:jobId/artifacts/p0.svg?criterion=<slug>&attempt=1\nGET /jobs/:jobId/artifacts/p0.preview.jpg?criterion=<slug>&attempt=1\n```\nwith no `attempt`, `?criterion=<slug>` renders the ACCEPTED box only — the same subset the stored combined `p0.svg` shows. `artifacts.attempts[]` in the result carries those URLs ready-made.\n\n**The assertion worth making:** send the same request with `\"llm_boxes\": false` and compare every `score` and `verdict`. They must be identical. The loop runs AFTER scoring and only adds keys — including in the case where every attempt was rejected.\n\n**Cost:** one ask per attempt plus one verify per attempt whose box validated, each capped at CLASSIFIER_LLM_BBOX_MAX_TOKENS (1024, most of which is reasoning). Run `bin/grounding_experiment.py` on the box for the real hit rate on your model before relying on it.\n\nSee API.md § The LLM enforcement loop."
+          },
+          "response": []
+        },
+        {
+          "name": "scene_before/after — change detection (regions.diff)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"image\": {\n    \"data\": \"{{scene_after_b64}}\",\n    \"type\": \"base64\"\n  },\n  \"criteria\": [\n    {\n      \"name\": \"has sky\",\n      \"type\": \"cv\"\n    }\n  ],\n  \"aggregation\": \"mean\",\n  \"ocr\": \"never\",\n  \"examples\": [\n    {\n      \"data\": \"{{scene_before_b64}}\",\n      \"type\": \"base64\",\n      \"weight\": 0.5\n    }\n  ],\n  \"regions\": {\n    \"enabled\": true,\n    \"layers\": [\n      \"svg\",\n      \"preview\"\n    ],\n    \"diff\": true,\n    \"examples\": true\n  }\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/assess/compare",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "classifier", "assess", "compare"]
+            },
+            "description": "Phase 4: change detection between two photographs of the same scene.\n\n**Fill the two collection variables first.** This endpoint takes JSON, not multipart, so the images have to be base64 in the body — and ~300 KB of base64 inlined in a collection file is unreadable and unmergeable. So the body references `{{scene_after_b64}}` (the SUBJECT) and `{{scene_before_b64}}` (the reference EXAMPLE), and you paste the encoded fixtures into the collection variables once:\n\n```bash\n# Linux\nbase64 -w0 unit-tests/classifier/regions/scene_before.png\nbase64 -w0 unit-tests/classifier/regions/scene_after.png\n# macOS\nbase64 -i unit-tests/classifier/regions/scene_before.png | tr -d '\\n'\n# PowerShell\n[Convert]::ToBase64String([IO.File]::ReadAllBytes('unit-tests/classifier/regions/scene_before.png'))\n```\n\nPostman → the collection → Variables → paste into CURRENT VALUE for `scene_before_b64` and `scene_after_b64`. (Both files are generated by `unit-tests/classifier/regions/make_fixtures.py`; if you would rather host them, swap each object to `{\"data\": \"https://...\", \"type\": \"url\"}` — URL inputs are SSRF-checked before fetching.)\n\n**The fixtures.** One synthetic yard photographed twice: the camera moved ~6 px and rotated ~1°, a red car appeared, and a shed went. The shift is deliberate — two pixel-aligned images would let a diff that never aligns anything look correct.\n\n**Expect** `result.example_results[0].diff` with `aligned: true`, `inliers` around 147, `changes: {added: 1, removed: 2, changed: 0}`, and polygons carrying `source: \"diff\"` and `attrs.change`. The added region sits at roughly (130, 509)-(340, 623) — the car; the removed ones at roughly (704, 322)-(837, 362) and (754, 423)-(790, 471) — the shed's roofline and its door (a flat wall against flat ground does not clear the Otsu threshold in the middle, so it fragments; two regions in the right place is the honest output).\n\n**The house must NOT be a region.** It is in both frames; if it shows up, the homography was not applied.\n\n**Files written** (GET /jobs/:jobId/artifacts): `diff-e0-p0.svg` and `diff-e0-p0.preview.jpg` for the change layer, `e0.p0.svg` and `e0.regions.json` from `\"examples\": true`, alongside the subject's own `p0.*`. All three families take the `?criterion=` / `?source=` filters.\n\n**The assertion worth making:** send the same body with `\"diff\": false` and compare `result.aggregate`. It must be identical. Diff regions are not criteria — they never reach the weighted score or the similarity comparison.\n\n**Negative check:** swap `scene_before_b64` for any unrelated image and the answer must be `aligned: false` with `regions: []` and a note saying the two are probably not views of the same scene — not a page full of boxes.\n\nSee API.md § Change detection and unit-tests/classifier/regions/README.md."
           },
           "response": []
         }

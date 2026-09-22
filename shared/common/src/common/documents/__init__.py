@@ -27,7 +27,18 @@ both. That is this package.
 
     match_text(doc, pattern)  → ``TextMatchResult`` for one of four modes:
                                 contains / exact / regex / fuzzy. Fuzzy is the
-                                one that survives OCR noise.
+                                one that survives OCR noise. Pass
+                                ``locate=True`` and it also reports WHERE:
+                                character offsets in ``hits``, and — for an
+                                OCR'd page — the line polygons in ``regions``
+                                (``common.vision.Region``).
+
+    pdf_text_regions(...)     → the same question for a NATIVE PDF page, which
+                                needs the file itself: PyMuPDF ``search_for``
+                                for literal modes, word-span reconstruction
+                                for regex/fuzzy. Load with
+                                ``keep_source=True`` to have the bytes around
+                                for it.
 
 Typical flow::
 
@@ -59,6 +70,7 @@ from .loaders import (
     ImageDecoder,
     default_image_decoder,
     load_document,
+    pdf_text_regions,
 )
 from .model import Document, Page, TextSource
 from .ocr import (
@@ -74,8 +86,10 @@ from .textmatch import (
     MAX_PATTERN_CHARS,
     InvalidPatternError,
     MatchMode,
+    TextHit,
     TextMatchResult,
     match_text,
+    ocr_line_regions,
 )
 
 __all__ = [
@@ -92,6 +106,7 @@ __all__ = [
     "ImageDecoder",
     "default_image_decoder",
     "load_document",
+    "pdf_text_regions",
     # model
     "Document",
     "Page",
@@ -108,6 +123,8 @@ __all__ = [
     "MAX_PATTERN_CHARS",
     "InvalidPatternError",
     "MatchMode",
+    "TextHit",
     "TextMatchResult",
     "match_text",
+    "ocr_line_regions",
 ]

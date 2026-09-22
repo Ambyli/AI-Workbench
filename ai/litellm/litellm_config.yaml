@@ -41,6 +41,11 @@ general_settings:
       include_subpath: true
       methods: ["GET", "POST", "DELETE"]
       forward_headers: true
+    - path: "/v1/detector"
+      target: "http://detector:8000"
+      include_subpath: true
+      methods: ["GET", "POST"]
+      forward_headers: true
     - path: "/v1/madlad"
       target: "http://madlad-api:8000"
       include_subpath: true
@@ -69,6 +74,10 @@ mcp_servers:
 
   madlad_translate:
     url: http://madlad-api:8000/mcp
+    transport: "http"
+
+  detector:
+    url: http://detector:8000/mcp
     transport: "http"
 
   interceptor:

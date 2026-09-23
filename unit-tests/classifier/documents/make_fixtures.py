@@ -25,6 +25,14 @@ Fixtures produced (see README.md for the criteria/expectations table):
     unsupported_legacy.doc    the OLE2 magic plus padding, to demonstrate the
                               clear "convert to .docx" rejection
 
+The letter both photo fixtures are made from also carries three non-text
+marks — a company logo, a "RECEIVED" stamp, and a signature — so a presence
+criterion ("has a company logo") has something real to find and a known box
+to be checked against. They are drawn from fixed constants, never from the
+RNG, so adding them did not move the noise stream of any other fixture; see
+``LOGO_BOX`` / ``STAMP_CENTER`` / ``SIGNATURE_BOX`` below and the README's
+"Marks on the letter" table.
+
 Dependencies: pymupdf, python-docx, pillow, numpy — all already in
 ai/classifier/pyproject.toml.
 """
@@ -33,6 +41,7 @@ from __future__ import annotations
 
 import datetime
 import io
+import math
 import pathlib
 
 import numpy as np
@@ -118,6 +127,37 @@ LETTER_LINES = [
     "",
     "Total amount claimed: $4,850.00",
 ]
+
+# ── Marks on the letter: logo, stamp, signature ──────────────────────────
+# Drawn on the CLEAN 1000×1300 render, at these exact coordinates, so the box
+# a presence criterion should come back with is known before the photograph
+# step moves it. `_photograph` rotates the page 3° about its centre
+# (500, 650), which displaces a mark by up to ~40 px — the README quotes both
+# the clean box and the rotated one.
+#
+# Every number here is a constant, not an RNG draw: the module-level RNG is
+# consumed by `_photograph` in a fixed order, and taking samples for the
+# signature would have re-rolled the sensor noise of every other fixture.
+
+# Top-left letterhead: a filled navy block with a white roof chevron, plus
+# the company name beside it.
+LOGO_BOX = (95, 26, 436, 88)       # measured ink extent, block + wordmark
+LOGO_MARK_WIDTH = 62               # the filled block; the rest is the wordmark
+LOGO_FILL = (26, 46, 92)
+
+# A circular "RECEIVED" stamp, rotated, composited OVER the body paragraph so
+# it overlaps real text the way a real one does. Red and translucent, outline
+# only, so the text underneath still OCRs.
+STAMP_CENTER = (700, 600)
+STAMP_RADIUS = 118
+STAMP_ANGLE = -18                  # degrees; negative tilts it clockwise
+STAMP_INK = (196, 38, 38)
+STAMP_ALPHA = 185
+
+# A handwritten-looking scribble in the empty space below the body text.
+SIGNATURE_BOX = (120, 946, 520, 1062)
+SIGNATURE_INK = (18, 24, 70)
+SIGNATURE_WIDTH = 5
 
 CONTRACT_TEXT = """ROOFING SERVICES AGREEMENT
 
@@ -376,8 +416,124 @@ def make_proposal_docx() -> pathlib.Path:
     return out
 
 
+def _draw_logo(draw: ImageDraw.ImageDraw) -> None:
+    """Company logo in the top-left margin: a filled block plus a wordmark.
+
+    The block is a rounded navy rectangle with a white roof chevron cut into
+    it — a shape, not text, so a presence criterion asking for "a company
+    logo" has something non-textual to find. The wordmark beside it is drawn
+    at a size the OCR engine reads comfortably, which is deliberate: the
+    fixture should exercise "a logo AND its text", not one or the other.
+    """
+    x0, y0, x1, y1 = LOGO_BOX
+    mark_right = x0 + LOGO_MARK_WIDTH
+    draw.rounded_rectangle([x0, y0, mark_right, y1], radius=8, fill=LOGO_FILL)
+
+    # White chevron ("roof") inside the block, apex up.
+    apex_y = y0 + int((y1 - y0) * 0.28)
+    base_y = y0 + int((y1 - y0) * 0.66)
+    inset = int(LOGO_MARK_WIDTH * 0.18)
+    draw.polygon(
+        [
+            (x0 + inset, base_y),
+            ((x0 + mark_right) / 2, apex_y),
+            (mark_right - inset, base_y),
+            (mark_right - inset, base_y + 9),
+            ((x0 + mark_right) / 2, apex_y + 9),
+            (x0 + inset, base_y + 9),
+        ],
+        fill=(255, 255, 255),
+    )
+    draw.text(
+        (mark_right + 16, y0 + 8),
+        "ACME ROOFING",
+        fill=LOGO_FILL,
+        font=_font(34),
+    )
+
+
+def _stamp_image() -> Image.Image:
+    """The circular "RECEIVED" stamp as a standalone RGBA tile, rotated.
+
+    Built on its own canvas so it can be rotated independently of the page
+    and composited with alpha — a stamp drawn straight onto the page would
+    have to be axis-aligned, and an axis-aligned stamp is the one thing a
+    real one never is.
+    """
+    r = STAMP_RADIUS
+    size = r * 2 + 24
+    tile = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(tile)
+    cx = cy = size / 2.0
+    ink = STAMP_INK + (STAMP_ALPHA,)
+
+    draw.ellipse([cx - r, cy - r, cx + r, cy + r], outline=ink, width=7)
+    draw.ellipse(
+        [cx - r + 16, cy - r + 16, cx + r - 16, cy + r - 16], outline=ink, width=3
+    )
+
+    word_font = _font(38)
+    date_font = _font(22)
+    for text, font, dy in (("RECEIVED", word_font, -26), ("2026-03-18", date_font, 22)):
+        left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
+        draw.text(
+            (cx - (right - left) / 2.0, cy + dy - (bottom - top) / 2.0),
+            text,
+            fill=ink,
+            font=font,
+        )
+
+    return tile.rotate(STAMP_ANGLE, resample=Image.BICUBIC, expand=True)
+
+
+def _signature_points() -> list[tuple[float, float]]:
+    """The signature stroke, as a closed-form curve rather than random walk.
+
+    Two sine components at incommensurate frequencies plus a downward drift
+    give something that reads as handwriting while staying byte-identical on
+    every run — the fixture's whole value is that its box never moves.
+    """
+    x0, y0, x1, y1 = SIGNATURE_BOX
+    span = x1 - x0
+    mid = (y0 + y1) / 2.0
+    amp = (y1 - y0) * 0.36
+    points: list[tuple[float, float]] = []
+    for i in range(241):
+        t = i / 240.0
+        y = (
+            mid
+            + amp * math.sin(t * math.pi * 5.0) * (1.0 - 0.45 * t)
+            + amp * 0.45 * math.sin(t * math.pi * 13.0 + 0.8)
+            - amp * 0.55 * t
+        )
+        points.append((x0 + t * span, y))
+    return points
+
+
+def _draw_signature(draw: ImageDraw.ImageDraw) -> None:
+    """The scribble plus its trailing flourish, in the space below the body."""
+    x0, _y0, x1, y1 = SIGNATURE_BOX
+    draw.line(
+        _signature_points(), fill=SIGNATURE_INK, width=SIGNATURE_WIDTH, joint="curve"
+    )
+    # A flourish under the name — the long tail a signature usually ends with.
+    mid_x = (x0 + x1) / 2.0
+    draw.line(
+        [(x0 + 24, y1 - 10), (mid_x, y1 - 22), (x1 - 34, y1 - 4)],
+        fill=SIGNATURE_INK,
+        width=max(2, SIGNATURE_WIDTH - 2),
+        joint="curve",
+    )
+
+
 def _letter_image() -> Image.Image:
-    """The clean letter render both photo fixtures are made from."""
+    """The clean letter render both photo fixtures are made from.
+
+    Text first, then the logo in the top margin and the signature below the
+    body, then the stamp composited last so it sits OVER the paragraph — the
+    order a real document acquires them in, and the order that makes the
+    stamp overlap text rather than hide behind it.
+    """
     img = Image.new("RGB", (1000, 1300), "white")
     draw = ImageDraw.Draw(img)
     y = 100
@@ -386,6 +542,16 @@ def _letter_image() -> Image.Image:
         if line:
             draw.text((95, y), line, fill=(25, 25, 25), font=_font(size))
         y += int(size * 1.7)
+
+    _draw_logo(draw)
+    _draw_signature(draw)
+
+    stamp = _stamp_image()
+    origin = (
+        int(STAMP_CENTER[0] - stamp.width / 2),
+        int(STAMP_CENTER[1] - stamp.height / 2),
+    )
+    img.paste(stamp, origin, stamp)
     return img
 
 
@@ -410,8 +576,17 @@ def make_photo_of_letter() -> pathlib.Path:
 
 
 def make_photo_of_letter_blurry() -> pathlib.Path:
-    """The same letter, heavily out of focus — sharpness FAILs, OCR degrades."""
-    photo = _photograph(_letter_image(), skew=3.0, blur=4.0, noise=4.0, gradient=0.26)
+    """The same letter, heavily out of focus — sharpness FAILs, OCR degrades.
+
+    Blur is 3.8, not 4.0: this fixture sits deliberately on the detector's
+    cliff (only the two large headings are meant to survive), and the ink the
+    logo / stamp / signature added was enough to push 4.0 over it — the page
+    came back with `ACME ROOFING LLC` alone, which would have flipped the
+    documented `Notice to Owner` PASS to a FAIL for a reason that has nothing
+    to do with the classifier. 3.8 restores "the headings and nothing else"
+    and still measures a Laplacian variance of ~7, far under the 100 floor.
+    """
+    photo = _photograph(_letter_image(), skew=3.0, blur=3.8, noise=4.0, gradient=0.26)
     return _as_photo_png(photo, HERE / "photo_of_letter_blurry.png")
 
 

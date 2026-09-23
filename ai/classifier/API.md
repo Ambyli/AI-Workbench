@@ -1538,3 +1538,35 @@ file, curl examples for all four artifact endpoints, and a list of things that
 should never happen (a region outside the page, a different score with
 `regions` on, `"artifacts": {}` where it should be `null`). Mirrored by the
 Postman collection's **Regions** and **Artifacts** folders.
+
+The collection's **Documents + regions** folder re-sends every document
+fixture with `regions` on, so the same scores come back with the geometry that
+produced them: `pdf-text` rectangles on both pages of the native invoice,
+tilted `ocr` polygons on the scan, all four sources at once on a photographed
+letter that now carries a logo, a `RECEIVED` stamp and a signature at
+documented coordinates, and the two honest negatives — a whole-page
+measurement that produces no box, and a `.txt` / `.docx` with no pixel space
+for one.
+
+### Running the fixtures as a suite
+
+[`unit-tests/classifier/regions_report.py`](../../unit-tests/classifier/regions_report.py)
+executes the collection's folders end to end — submit, poll, download the
+layers — then **re-draws every region from `regions.json` onto the original
+fixture** with `common.vision.annotate` and puts that picture next to the
+service's own `p{n}.preview.jpg`. The two are produced by different code from
+the same numbers, so a difference between them is itself the finding. It
+writes a self-contained `index.html`, a machine-readable `summary.json`, and
+exits non-zero when an expectation in
+[`regions_expected.json`](../../unit-tests/classifier/regions_expected.json)
+does not hold.
+
+```bash
+uv run --package classifier python unit-tests/classifier/regions_report.py
+uv run --package classifier python unit-tests/classifier/regions_report.py --local
+```
+
+`--local` mounts this app in-process with `TestClient` on a throwaway `/data`,
+so everything but the vision model is verifiable with no container and no GPU.
+Setup, how to read the report, and how to add a case:
+[`unit-tests/classifier/REGIONS_REPORT.md`](../../unit-tests/classifier/REGIONS_REPORT.md).

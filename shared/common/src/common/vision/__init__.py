@@ -32,6 +32,12 @@ them in.
                               literal "Photoshop layer".
     render_preview            the page with the layer burned in, JPEG.
 
+    draw_regions              a SECOND opinion on the same geometry: regions
+                              re-drawn onto the original page with a caption
+                              per region (score, verdict, attempt, source).
+                              For review tooling that has to be able to
+                              disagree with the service's own preview.
+
     ArtifactStore             one directory per job: write / list / open /
                               delete / zip, a manifest, a byte cap with a
                               defined drop order, and a TTL sweeper that also
@@ -54,6 +60,15 @@ Dependencies: the model, geometry, palette and store modules are pure stdlib.
 regions and SVG pays nothing for it. Nothing here imports OpenCV or numpy.
 """
 
+from .annotate import (
+    annotate_to_jpeg,
+    default_label,
+    draw_regions,
+    geometry_for_image,
+    is_rejected,
+    regions_from_json,
+    safe_text,
+)
 from .geometry import (
     DEFAULT_GRID,
     box_region,
@@ -131,6 +146,14 @@ __all__ = [
     "render_preview",
     "render_svg",
     "stroke_width",
+    # annotate
+    "annotate_to_jpeg",
+    "default_label",
+    "draw_regions",
+    "geometry_for_image",
+    "is_rejected",
+    "regions_from_json",
+    "safe_text",
     # store
     "ArtifactStore",
     "CONTENT_TYPES",

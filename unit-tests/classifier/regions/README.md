@@ -13,7 +13,17 @@ uv run --package classifier python unit-tests/classifier/regions/make_fixtures.p
 The Postman collection mirrors this folder: `ai/classifier/classifier.postman_collection.json`
 has a **Regions** subfolder with one ready-to-run request per fixture and an
 **Artifacts** subfolder for the four endpoints. Import it, set the `litellm`
-and `virtual master key` variables, and click Send.
+and `virtual master key` variables, and click Send. (The **Documents + regions**
+subfolder does the same for the document fixtures in
+[`../documents/`](../documents/).)
+
+To run the whole lot as a suite and get the regions re-drawn on the original
+fixtures — plus an HTML report and a pass/fail exit code — see
+[`REGIONS_REPORT.md`](../REGIONS_REPORT.md):
+
+```bash
+uv run --package classifier python unit-tests/classifier/regions_report.py
+```
 
 Total size: ~800 KB (every PNG is JPEG round-tripped so PNG can compress the
 texture noise).
@@ -73,7 +83,7 @@ Send it with `-F "regions=svg,png,preview"`.
 | `has sky` | **PASS** 10 | 1 polygon, bbox ≈ `(0, 0, 899, 243)` | The detector only looks at the top 35% of the page, so the polygon is that band |
 | `has vegetation` | **PASS** 10 | 1 polygon, bbox ≈ `(0, 359, 899, 699)` | 8 vertices after `approxPolyDP` — the lumpy top edge survives simplification |
 | `has water` | **PASS** 10 | **2** polygons: the sky band **and** the pool at ≈ `(90, 518, 430, 651)` | Expected, and worth understanding: `detect_water` accepts any blue region whose Laplacian variance is under 200, and a smooth sky qualifies. The detector's honest answer, not a fixture flaw — the pool is the second, smaller one |
-| `sharpness` | PASS | **none** — `"regions": []`, `"artifacts": null` | A whole-page measurement never fabricates a full-page box |
+| `sharpness` | **FAIL** 2 | **none** — `"regions": []`, `"artifacts": null` | A whole-page measurement never fabricates a full-page box. The FAIL is honest, not a flaw: this is a synthetic image of smooth colour ramps, so its Laplacian variance is far under the 100 floor. It is the cleanest demonstration here that a criterion can fail and still correctly produce no geometry |
 
 Artifacts written: `manifest.json`, `regions.json`, `p0.svg`, `p0.layer.png`,
 `p0.preview.jpg`, and `p0.base.jpg` (the un-annotated page, kept only because
@@ -137,10 +147,17 @@ a 3° skew and the OCR box follows it.
 [{"name": "has faces", "type": "cv"}, {"name": "has sky", "type": "cv"}]
 ```
 
-`has sky` returns ~3 polygons. `has faces` usually returns **none** on this
-photo (the people are small and not frontal), in which case the criterion
-FAILs with `"regions": []` and `"artifacts": null` — which is the assertion
-worth making: no regions must mean no artifact block, not an empty one.
+`has sky` returns ~4 polygons.
+
+`has faces` is **cascade- and version-dependent** — do not assert a number.
+On the currently pinned `opencv-python-headless` (4.x, `<5`) it finds **2**
+boxes here and PASSes; on other builds it has found none, which is equally
+correct for a photo whose people are small and not frontal. The assertion
+worth making is the structural one, and it holds either way: when a criterion
+finds nothing it must come back with `"regions": []` and `"artifacts": null`,
+never `"artifacts": {}`. For a guaranteed no-regions case that does not depend
+on a cascade, use `sharpness` on `greenery_and_sky.png` above — a whole-page
+measurement never produces geometry by construction.
 
 ### `../Neighborhood.jpeg` with the detector (phase 2)
 

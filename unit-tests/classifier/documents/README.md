@@ -12,11 +12,18 @@ uv run --package classifier python unit-tests/classifier/documents/make_fixtures
 
 The Postman collection mirrors this folder: `ai/classifier/classifier.postman_collection.json`
 has a **Documents** subfolder with one ready-to-run `POST /assess` per fixture,
-each already pointing at the file path below and carrying the same criteria.
+each already pointing at the file path below and carrying the same criteria,
+and a **Documents + regions** subfolder that re-sends the same fixtures with
+`regions` turned on so the geometry can be looked at rather than read about.
 Import the collection, set the `litellm` and `virtual master key` variables,
 and click Send.
 
-Total size: ~950 KB (the two PNGs dominate; they are JPEG round-tripped so PNG
+Both folders are also runnable as a suite:
+[`regions_report.py`](../REGIONS_REPORT.md) executes every item, downloads the
+layers, re-draws the regions on the original fixtures, and writes an HTML
+accuracy report.
+
+Total size: ~1.2 MB (the two PNGs dominate; they are JPEG round-tripped so PNG
 can compress the sensor noise).
 
 ---
@@ -29,9 +36,50 @@ can compress the sensor noise).
 | [`invoice_scanned.pdf`](invoice_scanned.pdf) | pdf | **none** — OCR required | 2 renders | The scan path: `ocr=auto` detects the missing text layer and recognises both pages |
 | [`contract.txt`](contract.txt) | txt | native | none | Plain text: `cv` criteria SKIP, the LLM call is text-only |
 | [`proposal.docx`](proposal.docx) | docx | native (paragraphs **and** table cells) | none | Document-order extraction; a table row is searchable as `System Size \| 8.4 kW` |
-| [`photo_of_letter.png`](photo_of_letter.png) | image | **none** — OCR required | 1 | A badly photographed letter (3° skew, brightness gradient, mild blur, JPEG noise) that OCR still reads |
+| [`photo_of_letter.png`](photo_of_letter.png) | image | **none** — OCR required | 1 | A badly photographed letter (3° skew, brightness gradient, mild blur, JPEG noise) that OCR still reads. Carries a logo, a stamp and a signature — see below |
 | [`photo_of_letter_blurry.png`](photo_of_letter_blurry.png) | image | **none** — OCR mostly fails | 1 | Sharpness FAIL, partial OCR, and `depends_on` skipping the LLM criterion |
 | [`unsupported_legacy.doc`](unsupported_legacy.doc) | — | — | — | The OLE2 rejection: HTTP 400 telling the caller to convert to .docx |
+
+---
+
+## Marks on the letter
+
+The letter both photo fixtures are rendered from carries three things that are
+**not text**, so a presence criterion ("has a signature") has something real to
+find and a known box to be judged against. Without them every presence
+criterion on this file would correctly come back absent, which tests nothing
+about localisation.
+
+All three are drawn from fixed constants in
+[`make_fixtures.py`](make_fixtures.py) — never from the RNG, so adding them did
+not re-roll the sensor noise of any other fixture — and then the whole page is
+photographed (3° rotation about its centre, brightness gradient, blur, noise),
+which moves each mark. Both boxes are given: use the **photographed** column
+when checking a region the classifier returned.
+
+| Mark | Clean render (1000×1300) | In `photo_of_letter.png` | What it is |
+|---|---|---|---|
+| Company logo | `(95, 26)–(436, 88)` | ≈ `(64, 44)–(406, 110)` | Navy rounded block with a white roof chevron, plus the wordmark `ACME ROOFING`. Top-left margin, above the letterhead line |
+| `RECEIVED` stamp | `(581, 482)–(818, 718)` | ≈ `(579, 472)–(815, 708)` | Two concentric red circles, tilted 18°, reading `RECEIVED` / `2026-03-18`. Centred on `(700, 600)` so it **overlaps the right-hand end of the body paragraph** — outline only and translucent, so the text under it still OCRs |
+| Signature | `(118, 938)–(522, 1059)` | ≈ `(138, 943)–(538, 1070)` | A closed-form scribble plus a trailing flourish, in the empty space below the body text |
+
+Boxes in `photo_of_letter_blurry.png` are within a few pixels of the same
+places; heavy blur smears the edges, so the measured extent runs a little wide.
+
+The logo's wordmark and the stamp's two words are large enough that OCR reads
+them: `photo_of_letter.png` now recognises `ACME ROOFING`, `RECEIVED` and
+`2026-03-18` alongside the letter's own text. That is deliberate — the fixture
+should exercise "a logo **and** its text", not one or the other — and it does
+not disturb the `Notice to Owner` / `CASE-\d{5}` expectations below, both of
+which still match exactly as before.
+
+> **Why the blurry fixture's blur dropped from 4.0 to 3.8.** It sits on the
+> OCR detector's cliff on purpose: only the two large headings are meant to
+> survive. The extra ink from the three marks was enough to push 4.0 over that
+> cliff — the page came back reading `ACME ROOFING LLC` alone, which would
+> have flipped the documented `Notice to Owner` PASS to a FAIL for a reason
+> that has nothing to do with the classifier. 3.8 restores "the headings and
+> nothing else" at a Laplacian variance of ~7, still far under the 100 floor.
 
 ---
 
@@ -147,6 +195,23 @@ what is doing the work.
 | `proper exposure` | **PASS** ~9 (mean ≈ 203) | The brightness gradient stays inside the accepted range |
 | **Overall** | PASS (10), `ocr.ran: true`, `pages_recognised: 1` | |
 
+Three more criteria are worth sending at this file, because it is the only
+fixture here with non-text marks on it (see § Marks on the letter):
+
+```json
+[
+  {"name": "has a signature",     "type": "llm", "hint": "presence"},
+  {"name": "has a company logo",  "type": "llm", "hint": "presence"},
+  {"name": "has an official stamp","type": "llm", "hint": "presence"}
+]
+```
+
+All three should come back **present** (PASS), and with
+`regions={"enabled":true,"layers":["svg","png","preview"],"llm_boxes":true}`
+each should also come back with a box near the corresponding row of the marks
+table. The score is the model's and varies; what is worth asserting is that an
+accepted box overlaps the documented box rather than covering the page.
+
 ### `photo_of_letter_blurry.png`
 
 ```json
@@ -160,8 +225,8 @@ what is doing the work.
 
 | Criterion | Expected | Why |
 |---|---|---|
-| `sharpness` | **FAIL** 1 (variance ≈ 6) | Heavily out of focus |
-| `Notice to Owner` | **PASS** 10 | Only the two large headings survive OCR — and that is one of them |
+| `sharpness` | **FAIL** 1 (variance ≈ 7) | Heavily out of focus |
+| `Notice to Owner` | **PASS** 10 | Only the two large headings and the logo wordmark survive OCR — and that is one of them |
 | `case number` | **FAIL** 1 | Body text is unreadable; OCR returns ~32 characters in total |
 | `document legibility` | **SKIPPED** | `depends_on: sharpness` did not PASS, so the LLM is never called |
 | **Overall** | MARGINAL (5) | |
@@ -262,3 +327,6 @@ The legacy field name still works — `-F "image=@…"` is accepted anywhere
 * See [`ai/classifier/API.md`](../../../ai/classifier/API.md) for the full
   request/response reference, and `GET /document-kinds` for the live capability
   list of a running container.
+* To run every request in this folder (and the region-enabled variants) as one
+  suite and get the annotated pages back, see
+  [`REGIONS_REPORT.md`](../REGIONS_REPORT.md).

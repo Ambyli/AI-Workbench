@@ -52,11 +52,13 @@ async def list_catalogs() -> list[str]:
 
     Typical result: ``["aws_glue", "iceberg", "postgres_litellm",
     "postgres_phoenix", "postgres_roofix", "postgres_sandbox",
-    "supabase_ai_agents", "supabase_enerflo_leads", "system"]``.
+    "postgres_supabase", "supabase_ai_agents", "supabase_enerflo_leads",
+    "system"]``.
     Catalogs are named ``<source>_<dataset>``: ``iceberg`` is the
     lakehouse on MinIO; ``postgres_*`` federate the subsystem Postgres
-    instances plus the Phoenix production DB; ``supabase_*`` are
-    Supabase-hosted Postgres projects; ``aws_glue`` is the AWS Glue Data
+    instances we run (including ``postgres_supabase``, the self-hosted
+    Supabase instance) plus the Phoenix production DB; ``supabase_*`` are
+    Supabase-HOSTED Postgres projects; ``aws_glue`` is the AWS Glue Data
     Catalog (what Athena queries). All read-only.
     """
     log.info("MCP tool call: list_catalogs")

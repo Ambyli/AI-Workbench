@@ -19,7 +19,8 @@ Flow:
   2. One of CLASSIFIER_MAX_CONCURRENT pool workers atomically claims the row
      (→ "processing") and calls ``handle_job``, which reads the payload,
      dispatches on ``metadata.type`` ("assess" | "compare" | "locate") to a
-     runner, and deletes the payload.
+     runner, and deletes the payload once it finishes (a job cancelled by
+     shutdown keeps its payload so the requeued row can be re-run).
   3. The pool persists the result / error (→ "completed" | "failed") and
      calls ``_on_finish`` for metrics.
   4. Callers poll GET /jobs/{job_id}.
@@ -34,6 +35,7 @@ the artifact sweeper — live here rather than in ``main`` so the endpoint
 modules can reach them without importing the app they are mounted on.
 """
 
+import asyncio
 from typing import Any, Optional
 
 from common.jobs.model import JobBase
@@ -119,6 +121,7 @@ class ClassifierQueue:
         # Restore the correlation ID so logs are traceable to the originating request
         request_id_var.set(job.metadata.get("request_id", "-"))
         jobs_in_flight.inc()
+        keep_payload = False
         try:
             payload = await self.payloads.read(job.job_id)
             if payload is None:
@@ -128,9 +131,24 @@ class ClassifierQueue:
                 )
             runner = _RUNNERS.get(job.metadata.get("type", ""), run_assess)
             return await runner(payload)
+        except asyncio.CancelledError:
+            # A shutdown mid-job: `docker compose stop` / `make up classifier`
+            # sends SIGTERM, uvicorn runs the lifespan shutdown, and
+            # `pool.stop()` cancels this task. The row is left in "processing"
+            # on purpose so the next start's `recover()` requeues it — and the
+            # worker that picks it up needs the INPUT to re-run it. Deleting the
+            # payload here is what used to turn every graceful restart into a
+            # "payload missing" failure for the jobs that were in flight.
+            keep_payload = True
+            raise
         finally:
             jobs_in_flight.dec()
-            await self.payloads.delete(job.job_id)
+            if not keep_payload:
+                # Completed or failed: the input is no longer needed. (A hard
+                # kill skips this block entirely, which is also fine — the
+                # startup sweep only removes payloads of terminal or missing
+                # rows, so a "processing" row's payload survives either way.)
+                await self.payloads.delete(job.job_id)
 
     def _on_finish(self, job: JobBase, phase: str, elapsed: float, error: Optional[str]) -> None:
         job_type = job.metadata.get("type", "assess")

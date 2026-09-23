@@ -17,3 +17,12 @@ Caddyfile text eol=lf
 *.py text eol=lf
 *.toml text eol=lf
 entrypoint.sh text eol=lf
+# Vendored Supabase config (ai/supabase/volumes/). The Postgres init scripts
+# use psql's backtick `\set x \`echo "$VAR"\`` trick, which a trailing \r turns
+# into a value with a carriage return baked in — a role password that silently
+# doesn't match. Envoy's pooler.exs and the Deno function sources are read by
+# runtimes with the same intolerance.
+*.sql text eol=lf
+*.exs text eol=lf
+*.ts text eol=lf
+*.jsonc text eol=lf

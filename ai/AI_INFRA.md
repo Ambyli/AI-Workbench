@@ -24,7 +24,7 @@ The `make setup` target creates the network automatically.
 docker network create terminal_net
 ```
 
-`terminal_net` joins exactly two containers — `open-terminal` and `openwebui` — keeping the model-driven shell away from every service on `ai_shared`. See [Open Terminal is off `ai_shared` too](#reading-the-diagram) below and [OPEN_TERMINAL.md](open-terminal/OPEN_TERMINAL.md). The sandbox subsystem's `sandbox_net` / `sandbox_state` / `sandbox_egress_out` are declared inside its own compose file and need no manual creation.
+`terminal_net` joins exactly two containers — `open-terminal` and `openwebui` — keeping the model-driven shell away from every service on `ai_shared`. See [Open Terminal is off `ai_shared` too](#reading-the-diagram) below and [OPEN_TERMINAL.md](open-terminal/OPEN_TERMINAL.md). The sandbox subsystem's `sandbox_net` / `sandbox_state` / `sandbox_egress_out`, Trino's `analytics_net`, and Supabase's `supabase_net` are declared inside their own compose files and need no manual creation.
 
 ## Compose files
 
@@ -51,6 +51,7 @@ Every service in the list below is on the `ai_shared` network unless noted. Port
 | [`n8n/docker-compose.n8n.yml`](n8n/docker-compose.n8n.yml) | `n8n`, `n8n-db` | `5435` (db) — n8n itself reached via oauth2-proxy at `/n8n/` | [N8N.md](n8n/N8N.md) |
 | [`trino/docker-compose.trino.yml`](trino/docker-compose.trino.yml) | `trino-coordinator`, `trino-auth-init`, `hive-metastore`, `hive-metastore-db`, `minio`, `minio-init`, `trino-mcp`, `superset`, `superset-db` | `8013` (trino — HTTPS + password auth), `8014`/`8015` (minio api/console), `8016` (superset), `5436`/`5437` (hms-db / superset-db) — minio-console and superset also reached via oauth2-proxy at `/minio/` and `/superset/` | [TRINO.md](trino/TRINO.md) |
 | [`open-terminal/docker-compose.open-terminal.yml`](open-terminal/docker-compose.open-terminal.yml) | `open-terminal` | _(none — **not on `ai_shared`**; on `terminal_net`, reached only by the openwebui backend)_ | [OPEN_TERMINAL.md](open-terminal/OPEN_TERMINAL.md) |
+| [`supabase/docker-compose.supabase.yml`](supabase/docker-compose.supabase.yml) | `supabase-db`, `supavisor`, `supabase-api` (Envoy), `auth`, `rest`, `realtime`, `storage`, `imgproxy`, `meta`, `studio`, `functions` | `8022` (gateway + Studio), `8023`/`8024` (pooler session/transaction), `5438` (postgres) — only these three join `ai_shared`; the other eight are on `supabase_net` | [SUPABASE.md](supabase/SUPABASE.md) |
 
 ## Flow diagram
 
@@ -151,6 +152,12 @@ flowchart TB
         SS["superset<br/>:8016 (via /superset/)"]:::svc
         SSDB[("superset-db<br/>postgres :5437<br/>analytics_net")]:::store
     end
+    subgraph SUPG["supabase/docker-compose.supabase.yml"]
+        SUPAPI["supabase-api :8022<br/>Envoy gateway<br/>+ Studio basic auth"]:::svc
+        SUPDB[("supabase-db :5438<br/>postgres 17<br/>+ trino_reader role")]:::store
+        SUPPOOL["supavisor :8023 / :8024<br/>session / transaction pooler"]:::svc
+        SUPSVC["auth · rest · realtime<br/>storage · imgproxy · meta<br/>studio · functions<br/>supabase_net only"]:::svc
+    end
 
     Browser --> CF --> O2P --> OWU
     O2P -->|"/assets/* (skip-auth)"| OA
@@ -227,6 +234,15 @@ flowchart TB
     TR   -.->|"federated<br/>host publish :5432"| DB
     TR   -.->|"federated<br/>ai_shared"| RB
     TR   -.->|"federated<br/>host publish :5434"| SBD
+    TR   -.->|"federated<br/>ai_shared, trino_reader"| SUPDB
+
+    LAN["LAN clients<br/>browser · psql · DBeaver"]:::ext
+    LAN ==>|"http :8022"| SUPAPI
+    LAN ==>|"postgres :8023 / :8024"| SUPPOOL
+    LAN -.->|"postgres :5438 (direct)"| SUPDB
+    SUPAPI --> SUPSVC
+    SUPSVC --> SUPDB
+    SUPPOOL --> SUPDB
 
     KAPP -. model download .-> HF
     MAPP -. model download .-> HF
@@ -261,6 +277,7 @@ flowchart TB
 - **Sandbox iframes share the Open WebUI origin** — the iframe `src` returned by `preview_app` is `https://chat.zeoenergy.com/sandboxes/{id}/`, not `http://sandbox-proxy/{id}/`. `oauth2-proxy` has `http://sandbox-proxy:80/sandboxes/` in `OAUTH2_PROXY_UPSTREAMS`, so `chat.zeoenergy.com/sandboxes/*` gets fanned out to sandbox-proxy alongside `chat.zeoenergy.com/*` (openwebui) and `chat.zeoenergy.com/assets/*` (branded sign-in assets). Because the sandbox iframe is same-origin with the chat, the `_oauth2_proxy` cookie is sent automatically — no separate sign-in, no cross-origin CSP surprise. `/sandboxes/*` is NOT in `OAUTH2_PROXY_SKIP_AUTH_ROUTES`, so anonymous requests are still gated. See [SANDBOX.md § Public iframe routing](sandbox/SANDBOX.md#public-iframe-routing) for the traffic-path diagram and how to move to a separate `sandboxes.` subdomain if you want to serve unauthenticated previews.
 - **Trino data lake bridges `ai_shared` and `analytics_net`** — Trino coordinator, MinIO (API + console), Superset, and `trino-mcp` sit on `ai_shared` so LiteLLM / OpenWebUI / laptops can reach them. The data plane (HMS ↔ HMS-Postgres ↔ Superset-Postgres) lives on `analytics_net` alone. Model-facing SQL flows `LiteLLM → trino-mcp → trino-coordinator`; humans go `oauth2-proxy → superset → trino-coordinator`. The `TR -.-> DB`, `TR -.-> RB`, `TR -.-> SBD` edges are federation reads issued via Trino — dashed because they cross subsystem boundaries. `litellm_db` and `sandbox-db` are reached via `host.docker.internal` on the host publish (they aren't on `ai_shared`) so Trino doesn't have to join `litellm`'s `internal` network or breach `sandbox_state` isolation; `roofix-db` is on `ai_shared` and uses service DNS. A fifth catalog, `postgres_phoenix`, reaches the off-box Phoenix production Postgres over its public hostname with the same read-only `PHOENIX_DB_*` credentials the Roofix bridge uses (TLS via `sslmode=require`). `trino-mcp` is SELECT-only — `common.trino.TrinoClient` rejects DDL/DML, spliced `LIMIT` caps result rows at `TRINO_MCP_MAX_ROWS`, and `query_max_execution_time` in session properties caps runtime at `TRINO_MCP_MAX_RUNTIME_S`. Superset uses `AUTH_TYPE=AUTH_REMOTE_USER` (trusts the `X-Auth-Request-Email` header from oauth2-proxy) — the host publish on `PORT_SUPERSET` MUST be loopback-bound or dropped before running on an untrusted network, or anyone on the LAN can spoof the header. `PORT_TRINO` (8013) maps to the coordinator's HTTPS listener with password-file auth; the one-shot `trino-auth-init` service generates the self-signed cert and bcrypt `password.db` from `TRINO_JDBC_USERS`. The coordinator's plain-HTTP `:8080` listener is username-only (for `trino-mcp` / Superset inside the Docker networks) and is never published. See [TRINO.md](trino/TRINO.md) for the operator guide.
 - **Open Terminal is off `ai_shared` too, on its own `terminal_net`** — `open-terminal` is the code-execution backend that replaces the in-browser Pyodide code interpreter, and it runs code a model wrote on behalf of whoever is chatting. Same reasoning as the sandbox subsystem: from `ai_shared` that shell could reach `roofix-db` / `sandbox-db` / `n8n-db` / `minio` on their dev-default credentials, `litellm` and every virtual key's model surface, n8n's encrypted credential store, and `sandbox-runner` — which mounts `docker.sock`. So it joins a dedicated plain bridge, `terminal_net` (created by `make network` next to `ai_shared`), and `openwebui` is the **only** other member. Unlike `sandbox_net` this network is NOT `internal: true`: the whole point of the fat image is runtime `pip` / `apt` installs, so egress is narrowed inside the container instead — `OPEN_TERMINAL_ALLOWED_DOMAINS` drives a dnsmasq + iptables + ipset allowlist, after which `CAP_NET_ADMIN` is permanently dropped. There is **no host port**: the openwebui *backend* proxies every call (`backend/open_webui/routers/terminals.py`), attaching the bearer key and `X-User-Id` server-side, so the browser never sees the key and nothing on the LAN can reach the shell. `OPEN_TERMINAL_MULTI_USER=true` gives each chatter their own Linux account and `/home/<user>` on the `open_terminal_home` volume — a workspace separation, explicitly **not** a security boundary (one kernel, one process list; real per-user isolation needs Open WebUI Enterprise "Terminals"). `docker.sock` is never mounted here. Terminal operations arrive at the model as native function-calling tools, so a model set to legacy function calling gets none of them. See [OPEN_TERMINAL.md](open-terminal/OPEN_TERMINAL.md).
+- **Supabase is LAN-only and bridges `ai_shared` ↔ `supabase_net`** — `supabase/docker-compose.supabase.yml` runs a full self-hosted Supabase (Postgres 17, Envoy gateway, GoTrue, PostgREST, Realtime, Storage + imgproxy, postgres-meta, Studio, Edge Functions, Supavisor). Only three containers join `ai_shared`: `supabase-api` (the Envoy gateway, `:8022`, the single LAN-facing HTTP surface — `/auth/v1`, `/rest/v1`, `/realtime/v1`, `/storage/v1`, `/functions/v1`, and Studio at `/` behind Envoy basic auth), `supavisor` (`:8023` session / `:8024` transaction pooling — clients log in as `postgres.<tenant>`, not `postgres`), and `supabase-db` (`:5438` for direct psql). The other eight services sit on the compose-managed `supabase_net` alone — the `analytics_net` pattern. Their **service keys are upstream's verbatim** (`auth`, `rest`, `realtime`, …) because the vendored Envoy cluster config addresses them by those hostnames, which is why `container_name` deliberately differs from the service key there; Realtime additionally needs the `realtime-dev.supabase-realtime` network alias. Unlike everything else on this diagram there is **no oauth2-proxy / Cloudflare hop** — public exposure is a deliberate follow-up, so the gates today are Envoy's basic auth on Studio and the legacy HS256 `anon` / `service_role` API keys. `supabase-db` is dual-homed onto `ai_shared` for one reason: so `trino-coordinator` reaches it by service DNS (`supabase-db:5432`) as the `postgres_supabase` catalog, using a read-only `trino_reader` role with `BYPASSRLS` — without that flag every RLS-enabled table reads as zero rows in Trino with no error. Upstream's Logflare + Vector analytics override is **not** added: Vector needs `docker.sock`, which only `sandbox-runner` may mount here. See [SUPABASE.md](supabase/SUPABASE.md).
 - **n8n rides on the same shared hostname under `/n8n/`** — same trick as `/sandboxes/*`, one more entry (`http://n8n:5678/n8n/`) in `OAUTH2_PROXY_UPSTREAMS`. On the n8n side, `N8N_PATH=/n8n/` + `N8N_EDITOR_BASE_URL=https://chat.zeoenergy.com/n8n/` + `WEBHOOK_URL=https://chat.zeoenergy.com/n8n/` (all set in `ai/n8n/docker-compose.n8n.yml`) make the editor's HTML and outbound webhook payloads use the subpath-aware URL. The shared oauth2-proxy cookie means one Google sign-in covers both Open WebUI and n8n; **no Cloudflare tunnel change is needed** because it's the same hostname. n8n's AI / LangChain nodes are preconfigured to talk to LiteLLM (`http://litellm:4000/v1` + `DEFAULT_LITELLM_MASTER_KEY`) so workflows don't need per-credential base-URL entry. Workflow rows, credential blobs, and execution history live in the dedicated `n8n-db` Postgres (`:5435`); credentials are encrypted at rest with `N8N_ENCRYPTION_KEY`, which is load-bearing across restarts — see [N8N.md](n8n/N8N.md).
 
 ## Ports at a glance
@@ -300,3 +317,7 @@ Ports are sourced from `.env` (`PORT_*` variables). Defaults shown; change them 
 | superset-db (postgres) | `5437` |
 | trino-mcp | _(none — registered with LiteLLM at `http://trino-mcp:8080/mcp`)_ |
 | open-terminal | _(none — reached only by openwebui over `terminal_net`)_ |
+| supabase-api (Envoy gateway + Studio) | `8022` |
+| supavisor (pooler — session / transaction) | `8023` / `8024` |
+| supabase-db (postgres) | `5438` |
+| supabase auth / rest / realtime / storage / imgproxy / meta / studio / functions | _(none — `supabase_net` only, reached through the gateway on `8022`)_ |

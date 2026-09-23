@@ -126,3 +126,36 @@ def test_dict_metadata_also_accepted():
     with reg.job({"a": 1, "b": "two"}, initial_phase="running") as job:
         snap = reg.get(job.job_id)
         assert snap.metadata == {"a": 1, "b": "two"}
+
+
+# ── expired_job_ids (retention symmetry with SqliteRegistry) ───────────────
+def test_expired_job_ids_matches_the_sqlite_contract():
+    """Same signature, same ordering, same "terminal phases only" rule.
+
+    A job here only exists inside its context block, so the realistic answer
+    is almost always empty — the point is that a consumer swapping backends
+    does not lose its sweep to an AttributeError.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    reg = InMemoryRegistry()
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+    assert reg.expired_job_ids(cutoff) == []
+
+    with reg.job(_Meta(tag="live"), initial_phase="running") as job:
+        # Running, however old: never expired.
+        reg._store[job.job_id].created_at = (
+            datetime.now(timezone.utc) - timedelta(hours=999)
+        ).isoformat()
+        assert reg.expired_job_ids(cutoff) == []
+
+        # Terminal and aged: reported, oldest first.
+        reg._store[job.job_id].phase = "completed"
+        assert reg.expired_job_ids(cutoff) == [job.job_id]
+        assert reg.expired_job_ids(cutoff, ["failed"]) == []
+        assert reg.expired_job_ids(cutoff, limit=0) == []
+
+        # A timestamp nothing can parse is treated as NOT expired: losing a
+        # job to a formatting quirk is worse than keeping a stale record.
+        reg._store[job.job_id].created_at = "not-a-timestamp"
+        assert reg.expired_job_ids(cutoff) == []

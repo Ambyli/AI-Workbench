@@ -5,9 +5,20 @@ members = [
     "ai/roofix",
     "ai/interceptor",
     "ai/classifier",
+    "ai/detector",
     "ai/sandbox/runner",
     "ai/trino/mcp",
 ]
 
 [tool.uv.sources]
 common = { workspace = true }
+
+[tool.uv]
+# rapidocr declares `opencv-python` (the GUI build, which links libGL and
+# libgthread). Every consumer in this workspace already ships
+# opencv-python-headless, and both wheels install the same `cv2` package, so
+# resolving both would land two copies of OpenCV in the classifier image and
+# force libgl1/libglib2.0-0 onto a slim base. The never-true marker drops the
+# GUI build from resolution; rapidocr's `import cv2` then finds the headless
+# wheel, which is all it needs.
+override-dependencies = ["opencv-python ; sys_platform == 'never'"]

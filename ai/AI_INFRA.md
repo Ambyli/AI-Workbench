@@ -42,6 +42,7 @@ Every service in the list below is on the `ai_shared` network unless noted. Port
 | [`kokoro/docker-compose.kokoro.yml`](kokoro/docker-compose.kokoro.yml) | `kokoro-api`, `kokoro-app` (internal) | `8004` | [KOKORO.md](kokoro/KOKORO.md) |
 | [`madlad/docker-compose.madlad.yml`](madlad/docker-compose.madlad.yml) | `madlad-api`, `madlad-app` (internal) | `8008` | [MADLAD.md](madlad/MADLAD.md) |
 | [`classifier/docker-compose.classifier.yml`](classifier/docker-compose.classifier.yml) | `classifier` | `8005` | [classifier/API.md](classifier/API.md) |
+| [`detector/docker-compose.detector.yml`](detector/docker-compose.detector.yml) | `detector` | `8021` | [DETECTOR.md](detector/DETECTOR.md) |
 | [`unsloth/docker-compose.unsloth.yml`](unsloth/docker-compose.unsloth.yml) | `unsloth` | `8000` (model — LiteLLM upstream), `8888` (Jupyter), `22` (SSH) | [UNSLOTH.md](unsloth/UNSLOTH.md) |
 | [`roofix/docker-compose.roofix.yml`](roofix/docker-compose.roofix.yml) | `roofix` | _(internal only)_ | [ROOFIX.md](roofix/ROOFIX.md) |
 | [`interceptor/docker-compose.interceptor.yml`](interceptor/docker-compose.interceptor.yml) | `interceptor` | _(internal only)_ | [INTERCEPTOR.md](interceptor/INTERCEPTOR.md) |
@@ -112,6 +113,9 @@ flowchart TB
         CLS["classifier<br/>:8005"]:::svc
         CLSDB[("classifier.db<br/>sqlite (job store)")]:::store
     end
+    subgraph DTG["detector/docker-compose.detector.yml"]
+        DET["detector<br/>:8021<br/>OWLv2 open-vocabulary boxes<br/>GPU 2, shared with qwen3.8-solo"]:::svc
+    end
     subgraph UG["unsloth/docker-compose.unsloth.yml"]
         UN["unsloth<br/>model :8000 (llama.cpp)<br/>Jupyter :8888 / SSH :22"]:::svc
     end
@@ -165,13 +169,19 @@ flowchart TB
     LL ==>|"/v1/audio/speech"| KAPI
     LL ==>|"/v1/madlad/* + MCP tool"| MAPI
     LL ==>|"/v1/classifier/*"| CLS
+    LL ==>|"/v1/detector/*"| DET
+    LL -.->|MCP registration| DET
     LL --> DB
     PROM -. scrape .-> LL
+    PROM -. scrape .-> CLS
+    PROM -. scrape .-> DET
 
     KAPI --> KAPP
     MAPI --> MAPP
     CLS  -->|VISION_LLM_API| VMG
+    CLS  -->|"DETECTOR_URL<br/>POST /detect"| DET
     CLS  --> CLSDB
+    DET  -. model download .-> HF
 
     RB   ==>|OpenAI SDK<br/>brain fallback| LL
     RB   ==>|"HTTP<br/>/capture"| IA
@@ -235,9 +245,10 @@ flowchart TB
 - **Cloudflare caches by extension, cookies or not** — without a dashboard Cache Rule bypassing `chat.zeoenergy.com`, `.png` / `.css` / `.js` responses that oauth2-proxy authenticated get cached at the edge for 4 h and re-served to anonymous clients, and Open WebUI re-branding looks broken for hours after a recreate. See [CLOUDFLARED.md § Cache rule](cloudflared/CLOUDFLARED.md#cache-rule--bypass-for-chatzeoenergycom).
 - **Exactly one tunnel connector** — `cloudflared` must be the only connector registered for the tunnel on this host. Cloudflare load-balances across every registered connector, so a leftover host-level `cloudflared.service` serving the same tunnel id makes roughly half of all requests return 502 while the rest succeed — an intermittent failure that looks like a Cloudflare outage. Resetting the tunnel token rotates the secret on the existing tunnel; it does **not** create a new one and does **not** evict a duplicate connector. See [CLOUDFLARED.md § Exactly one connector per tunnel](cloudflared/CLOUDFLARED.md#exactly-one-connector-per-tunnel).
 - **Tunnel ingress origins are container-relative** — ingress rules live in the Cloudflare dashboard, not this repo, and are dialed from inside the `cloudflared` container, where `localhost` is the container itself. A container-hosted target uses its **container** port on the service name (`http://litellm:4000`, not the published `localhost:4001`); a host-hosted target uses `host.docker.internal`, which resolves only because the compose file declares `extra_hosts: host.docker.internal:host-gateway`. See [CLOUDFLARED.md § Origin addresses are container-relative](cloudflared/CLOUDFLARED.md#origin-addresses-are-container-relative).
-- **Fan-out from LiteLLM** — LiteLLM is the single OpenAI-compatible surface. Chat models are served by vLLM and Unsloth (llama.cpp); TTS by Kokoro; translation by MADLAD; image-quality by the classifier. Open WebUI and any external Claude Code / API client both hit LiteLLM the same way.
+- **Fan-out from LiteLLM** — LiteLLM is the single OpenAI-compatible surface. Chat models are served by vLLM and Unsloth (llama.cpp); TTS by Kokoro; translation by MADLAD; image-quality by the classifier; text-prompted object boxes by the detector. Open WebUI and any external Claude Code / API client both hit LiteLLM the same way.
 - **Two-container app/api pattern** — Kokoro and MADLAD each split into an internal `-app` (model on GPU, blocking) and a `-api` proxy (stateless, non-blocking). Only the `-api` half is published to the host.
 - **Classifier ↔ vLLM** — the classifier is a vLLM client, not a peer; it calls `muse-glimmer` internally for LLM scoring (`VISION_LLM_API` / `VISION_LLM_MODEL` in the `## Classifier` block of `.env`, passed through by `classifier/docker-compose.classifier.yml`; `vllm-qwen-vl` is still served for LiteLLM's `qwen2.5-vl` alias but the classifier no longer depends on it). Because `muse-glimmer` shares its GPU pair with `qwen3.8`, the classifier only works while `muse-glimmer` is the one running. Its own SQLite job store (`classifier.db` on the `classifier_data` volume) persists async `/assess` job state so callers can poll `GET /jobs/{id}` across restarts.
+- **Detector is the classifier's "where is X" source, and a tool in its own right** — `detector` runs OWLv2 (`google/owlv2-base-patch16-ensemble`, swappable via `DETECTOR_MODEL`) behind FastAPI + FastMCP: POST an image and a list of free-text labels, get boxes back in the image's original pixels. The classifier calls it over `ai_shared` when `DETECTOR_URL` is set and a request asks for `regions.detector` (or a criterion is spelled `"type": "detector"`), which is what lets an arbitrary `has X` feature localise — and be scored — without a vision-LLM call; see [classifier/API.md § Regions and layers](classifier/API.md#regions-and-layers). It is also registered with LiteLLM twice over, as the `detector.detect_objects` MCP tool and as a `/v1/detector/*` pass-through. Placement is deliberate: `device_ids: ['2']`, the same card as `qwen3.8-solo`, whose 0.90 utilisation leaves enough headroom for OWLv2 in fp16 — `count: all` would put it on the `muse-glimmer` pair and fight the model the classifier depends on. `DETECTOR_DEVICE=cpu` is the documented fallback if that pairing proves fragile (a few seconds per image, same image, no rebuild). The default weights are baked into the image and the `detector_data` volume is seeded from it, so a cold container never reaches HuggingFace; only a changed `DETECTOR_MODEL` downloads. **A failed load does not crash the container** — `GET /health` returns 503 with the loader's error, so an unhealthy detector says what is wrong instead of crash-looping, and the classifier degrades to a note either way. See [DETECTOR.md](detector/DETECTOR.md).
 - **Unsloth dual role** — the CUDA-compiled llama.cpp binary serves a chat model at `unsloth:8000` (routed via LiteLLM as the `qwen3.6-unsloth` model entry sourced from `DEFAULT_LITELLM_MODEL_API_BASE`), while Jupyter (`:8888`) and SSH (`:22`) remain available for training / fine-tuning workflows.
 - **Muse Glimmer on vLLM with DFlash speculative decoding** — `muse-glimmer` is Meta's dense 29.6B vision-language model served in BF16 across two A6000s (`--tensor-parallel-size 2`) with the official `meta-models/Muse-Glimmer-30B-assistant` DFlash drafter (`--speculative-config '{"method":"dflash",…}'`, 15 draft tokens per verification step). It occupies the same GPU pair as `qwen3.8` at 0.90 utilisation, so the two are mutually exclusive at runtime — bring up one or the other. `qwen3.8-solo` is the same Qwen3.8 model on a single card, pinned to the third GPU with `device_ids: ['2']`, so it can run alongside `muse-glimmer` (at the cost of TP=2 throughput and a 3-sequence cap). LiteLLM alias `muse-glimmer`; `supports_vision: true` so Open WebUI offers image upload. See [VLLM.md § Muse Glimmer 30B](vllm/VLLM.md#muse-glimmer-30b--tensor-parallel--dflash-speculative-decoding).
 - **llama.cpp stack for oversize models** — `llama/docker-compose.llama.yml` runs llama-server for models that don't fit any vLLM-supported precision. `glm5.2` uses the stock `ghcr.io/ggml-org/llama.cpp:server-cuda` image; `qwen3.8-flash` builds a local image from Unsloth's llama.cpp prebuild (`llama/Dockerfile.llama-unsloth`, pinned by `LLAMA_UNSLOTH_TAG` in `.env`) because MTP speculative decoding for Qwen3.8-Flash-Next is not in mainline llama.cpp yet — see [LLAMA.md § MTP speculative decoding](llama/LLAMA.md#qwen38-flash-mtp-speculative-decoding); `glm5.3-flash` builds the same Dockerfile with Unsloth's GPU-free `cpu` tarball (pinned separately by `LLAMA_UNSLOTH_CPU_TAG`) because the GLM-5.3-Flash `glm5next` architecture is not merged upstream at all, and runs GLM-5.3-Flash (321B-A18B) **entirely in system RAM with no GPU reservation** — 148 GB mlocked at UD-Q3_K_XL, with the model's embedded MTP draft head for speculative decoding — see [LLAMA.md § glm5.3-flash](llama/LLAMA.md#glm53-flash--glm-53-flash-on-cpu-and-ram-only). The first inhabitant was `glm5.2` (Z.ai GLM-5.2, 753B-A40B MoE) at UD-IQ1_S (~176 GB), which does not fit in 3× A6000 VRAM alone — `--n-cpu-moe` offloads expert layers into system RAM. Weights auto-download via `-hf` into the `llama_data` named volume on first start. Unlike Unsloth's mixed-purpose container, this stack is inference-only; add new models by copying the commented template block in the compose file. See [LLAMA.md](llama/LLAMA.md) for quant sizing tables and the `--n-cpu-moe` tuning loop.
@@ -274,6 +285,7 @@ Ports are sourced from `.env` (`PORT_*` variables). Defaults shown; change them 
 | kokoro-api | `8004` |
 | madlad-api | `8008` |
 | classifier | `8005` |
+| detector (OWLv2, GPU 2) | `8021` |
 | unsloth (Jupyter / model / SSH) | `8888` / `8000` / `22` |
 | searxng | `8009` |
 | sandbox-proxy | `8011` |

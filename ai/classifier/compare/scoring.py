@@ -1,8 +1,8 @@
 """Scoring and similarity helpers used by the /assess/compare endpoint.
 
 These functions operate on already-analysed assessment dicts (output of
-analysis.analyze_bgr) and compute how similar two images are and how to
-blend or aggregate multiple scores into a final verdict.
+analysis.pipeline.analyze_document) and compute how similar two documents are and how
+to blend or aggregate multiple scores into a final verdict.
 
   compute_similarity()  — compare two assessments per criterion, returning a
                           0-1 similarity score for each shared criterion and
@@ -15,8 +15,8 @@ blend or aggregate multiple scores into a final verdict.
   aggregate()           — collapse a list of per-example combined scores into
                           a single aggregate verdict using mean, min, or max.
 
-Process flow position: called by runners.run_compare() after all analyses
-(input + all examples) have been gathered via asyncio.gather().
+Process flow position: called by jobs.runners.run_compare() after all
+analyses (input + all examples) have been gathered via asyncio.gather().
 """
 
 from logger import logger

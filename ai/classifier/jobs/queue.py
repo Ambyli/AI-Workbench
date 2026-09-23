@@ -1,22 +1,25 @@
 """Queue glue: wires the shared WorkerPool + FilePayloadStore to the runners.
 
-The classifier uses an async job pattern so that POST /assess and
-POST /assess/compare can return a job ID immediately (202 Accepted) without
-blocking the HTTP connection for the full duration of the LLM call.
+The classifier uses an async job pattern so that POST /assess,
+POST /assess/compare and POST /locate can return a job ID immediately
+(202 Accepted) without blocking the HTTP connection for the full duration of
+the LLM call.
 
 Division of labour:
   common.jobs.worker.WorkerPool      — N claim-and-handle loops, wake/poll, recovery
   common.jobs.payloads.FilePayloadStore — job inputs on disk so the queue survives restarts
-  runners.py                         — the actual assess / compare work
-  metrics.py                         — Prometheus objects shared with main.py
+  jobs.runners                       — the actual assess / compare / locate work
+  metrics.py                         — Prometheus objects shared with the endpoints
   this module                        — ClassifierQueue: enqueue, handle_job, lifecycle
 
 Flow:
-  1. main.py registers a row (phase "staging") and calls ``queue.enqueue()``,
-     which writes the payload, flips the row to "pending", and wakes a worker.
+  1. ``api.assess`` / ``api.locate`` registers a row (phase "staging") and
+     calls ``queue.enqueue()``, which writes the payload, flips the row to
+     "pending", and wakes a worker.
   2. One of CLASSIFIER_MAX_CONCURRENT pool workers atomically claims the row
      (→ "processing") and calls ``handle_job``, which reads the payload,
-     dispatches on ``metadata.type`` to a runner, and deletes the payload.
+     dispatches on ``metadata.type`` ("assess" | "compare" | "locate") to a
+     runner, and deletes the payload.
   3. The pool persists the result / error (→ "completed" | "failed") and
      calls ``_on_finish`` for metrics.
   4. Callers poll GET /jobs/{job_id}.
@@ -25,6 +28,10 @@ Why the DB is the queue, not an asyncio.Queue: an in-memory queue loses every
 pending job on restart and can't be shared across processes. With the
 registry as the queue, ``start()`` requeues rows a previous process left in
 "processing", and the payload on disk means the work can actually be redone.
+
+The three process-wide singletons at the bottom — the registry, the queue and
+the artifact sweeper — live here rather than in ``main`` so the endpoint
+modules can reach them without importing the app they are mounted on.
 """
 
 from typing import Any, Optional
@@ -34,13 +41,14 @@ from common.jobs.payloads import FilePayloadStore
 from common.jobs.sqlite import SqliteRegistry
 from common.jobs.worker import WorkerPool
 
-from config import MAX_CONCURRENT, PAYLOAD_DIR, WORKER_POLL_INTERVAL_S
+from config import DB_PATH, MAX_CONCURRENT, PAYLOAD_DIR, WORKER_POLL_INTERVAL_S
+from jobs.runners import run_assess, run_compare, run_locate
 from logger import logger
 from metrics import job_duration, job_queue_depth, jobs_in_flight, jobs_total
 from middleware import request_id_var
-from runners import run_assess, run_compare
+from regions.sweeper import ArtifactSweeper
 
-_RUNNERS = {"assess": run_assess, "compare": run_compare}
+_RUNNERS = {"assess": run_assess, "compare": run_compare, "locate": run_locate}
 
 
 class ClassifierQueue:
@@ -129,3 +137,17 @@ class ClassifierQueue:
         jobs_total.labels(type=job_type, status=phase).inc()
         job_duration.labels(type=job_type).observe(elapsed)
         # Depth gauge is refreshed by the next enqueue/claim; keep the hook sync + cheap.
+
+
+# ---------------------------------------------------------------------------
+# Process-wide singletons
+# ---------------------------------------------------------------------------
+# One registry for the process, shared by the endpoints (which register and
+# enqueue), the worker pool (which claims and completes), and the artifact
+# sweeper (which prunes expired rows AND their directories). Its schema
+# migration from the classifier's legacy layout (status → phase, add metadata
+# column) runs idempotently in ``init()``, which ``main``'s lifespan calls.
+
+jobs_registry = SqliteRegistry(DB_PATH)
+queue = ClassifierQueue(jobs_registry)
+sweeper = ArtifactSweeper(jobs_registry)

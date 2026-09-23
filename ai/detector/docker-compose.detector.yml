@@ -1,0 +1,65 @@
+networks:
+  shared:
+    external: true
+    name: ai_shared
+
+services:
+  detector:
+    networks:
+      - shared
+    build:
+      context: ../..
+      dockerfile: ai/detector/Dockerfile.detector
+      args:
+        # Which checkpoint is BAKED INTO the image. Keep it equal to
+        # DETECTOR_MODEL below: they can differ, and then the first request
+        # after a recreate downloads the runtime model into detector_data
+        # instead of starting instantly. Changing this needs a rebuild.
+        - DETECTOR_MODEL=${DETECTOR_MODEL:-google/owlv2-base-patch16-ensemble}
+    container_name: detector
+    restart: unless-stopped
+    ports:
+      - "${PORT_DETECTOR}:8000"
+    environment:
+      # Open-vocabulary detector knobs. All five come from the `## Detector`
+      # block in .env; see .env.example for what each does and
+      # ai/detector/DETECTOR.md for the operator guide.
+      - DETECTOR_MODEL=${DETECTOR_MODEL:-google/owlv2-base-patch16-ensemble}
+      - DETECTOR_DEVICE=${DETECTOR_DEVICE:-cuda}
+      - DETECTOR_DEFAULT_THRESHOLD=${DETECTOR_DEFAULT_THRESHOLD:-0.25}
+      - DETECTOR_MAX_IMAGE_SIDE=${DETECTOR_MAX_IMAGE_SIDE:-1024}
+      - DETECTOR_MAX_LABELS=${DETECTOR_MAX_LABELS:-32}
+      - LOG_LEVEL=INFO
+    volumes:
+      # Seeded from the image on first start (Docker copies image content into
+      # an empty named volume), so the baked-in default model is already here
+      # and a cold container never reaches HuggingFace. A later DETECTOR_MODEL
+      # change downloads into this volume and persists across recreates.
+      - detector_data:/opt/hf
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              # GPU 2 ONLY, and it is SHARED with qwen3.8-solo, which runs
+              # there at --gpu-memory-utilization 0.90. OWLv2 base in fp16 is
+              # ~350 MB of weights plus activations, which fits the headroom
+              # that leaves; `count: all` would put it on the muse-glimmer
+              # pair instead and fight the model the classifier depends on.
+              # If the pairing proves fragile, set DETECTOR_DEVICE=cpu — the
+              # documented fallback, a few seconds per image instead of a few
+              # hundred milliseconds, on this same image.
+              device_ids: ['2']
+              capabilities: [gpu]
+    healthcheck:
+      # /health returns 503 until the weights are resident, so an unhealthy
+      # container means "model not loaded", not just "process dead". Long
+      # start_period: a cold volume downloads ~600 MB before it answers 200.
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      start_period: 300s
+      retries: 3
+
+volumes:
+  detector_data:

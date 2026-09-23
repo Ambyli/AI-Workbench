@@ -10,3 +10,7 @@ scrape_configs:
   - job_name: "classifier"
     static_configs:
       - targets: ["classifier:8000"]
+
+  - job_name: "detector"
+    static_configs:
+      - targets: ["detector:8000"]

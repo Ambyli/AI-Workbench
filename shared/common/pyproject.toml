@@ -10,6 +10,23 @@ dependencies = [
     "python-dotenv>=1.0",
 ]
 
+[project.optional-dependencies]
+# common.documents — PDF/DOCX/TXT/image loading, OCR, and text matching.
+# Kept out of the hard dependencies because a consumer that only uses
+# common.jobs or common.env should not pull ~100 MB of ONNX runtime.
+# Install with `uv pip install 'common[documents]'` or list the same packages
+# in the consuming service's own dependencies (ai/classifier does the latter).
+# onnxruntime is NOT a rapidocr dependency in 3.x — the engine is chosen at
+# install time, so it must be requested explicitly here.
+documents = [
+    "pymupdf>=1.28.2",       # PDF text extraction + page rendering
+    "python-docx>=1.2.0",    # .docx paragraphs and tables
+    "pillow>=11.0.0",        # image decode / EXIF / resize
+    "numpy>=1.26",           # page images are BGR ndarrays
+    "rapidocr>=3.9.2,<4",    # OCR front-end (PP-OCRv6 models)
+    "onnxruntime>=1.22.0",   # rapidocr's inference engine
+]
+
 [dependency-groups]
 dev = [
     "pytest>=8",
@@ -20,6 +37,10 @@ dev = [
     "httpx",             # transitive: FastAPI's TestClient
     "pydantic",          # transitive: model.py — most consumers already have it
     "trino>=0.328",      # for tests/trino/test_client.py
+    "pymupdf>=1.28.2",   # for tests/test_documents_*.py (also builds the fixtures)
+    "python-docx>=1.2.0",# for tests/test_documents_*.py
+    "pillow>=11.0.0",    # for tests/test_documents_*.py
+    "numpy>=1.26",       # for tests/test_documents_*.py
 ]
 
 [project.scripts]

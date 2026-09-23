@@ -27,6 +27,56 @@ services:
       # Max jobs analysed simultaneously. Bounded by the vision model's capacity
       # (muse-glimmer runs --max-num-seqs 4; extra requests queue inside vLLM).
       - CLASSIFIER_MAX_CONCURRENT=${CLASSIFIER_MAX_CONCURRENT:-2}
+      # Document support: which OCR engine backs `text` criteria and scanned
+      # PDFs, how many PDF pages are loaded, at what raster density, how much
+      # extracted text the vision prompt may carry, and the native-text
+      # threshold that decides "this page is a scan" in ocr=auto. See the
+      # `## Classifier` block in .env and ai/classifier/API.md § Documents.
+      - CLASSIFIER_OCR_ENGINE=${CLASSIFIER_OCR_ENGINE:-rapidocr}
+      - CLASSIFIER_DOC_MAX_PAGES=${CLASSIFIER_DOC_MAX_PAGES:-20}
+      - CLASSIFIER_PDF_RENDER_DPI=${CLASSIFIER_PDF_RENDER_DPI:-150}
+      - CLASSIFIER_TEXT_CHAR_BUDGET=${CLASSIFIER_TEXT_CHAR_BUDGET:-60000}
+      - CLASSIFIER_OCR_MIN_NATIVE_CHARS=${CLASSIFIER_OCR_MIN_NATIVE_CHARS:-20}
+      # Region layers: where the per-job artifact directories live on the
+      # classifier_data volume, how often the sweeper prunes them (and the
+      # job rows past JOB_TTL_HOURS), the per-job byte cap, and how many
+      # regions per criterion are copied inline into the job result. Regions
+      # are OFF unless a request asks — see ai/classifier/API.md § Regions
+      # and layers.
+      - CLASSIFIER_ARTIFACT_DIR=${CLASSIFIER_ARTIFACT_DIR:-/data/artifacts}
+      - CLASSIFIER_ARTIFACT_SWEEP_INTERVAL_S=${CLASSIFIER_ARTIFACT_SWEEP_INTERVAL_S:-600}
+      - CLASSIFIER_ARTIFACT_MAX_BYTES=${CLASSIFIER_ARTIFACT_MAX_BYTES:-50000000}
+      - CLASSIFIER_INLINE_REGIONS_MAX=${CLASSIFIER_INLINE_REGIONS_MAX:-50}
+      # The LLM bounding-box enforcement loop (regions.llm_boxes): how many
+      # ask/verify rounds a criterion gets, what the verify crop has to score
+      # to be accepted, the box area bounds that reject a full-frame
+      # non-answer, the per-call token budget, and the crop padding. See the
+      # `## Classifier` block in .env and API.md § The LLM enforcement loop.
+      - CLASSIFIER_LLM_BBOX_MAX_ATTEMPTS=${CLASSIFIER_LLM_BBOX_MAX_ATTEMPTS:-3}
+      - CLASSIFIER_LLM_BBOX_VERIFY_PASS=${CLASSIFIER_LLM_BBOX_VERIFY_PASS:-7}
+      - CLASSIFIER_LLM_BBOX_MIN_AREA=${CLASSIFIER_LLM_BBOX_MIN_AREA:-0.002}
+      - CLASSIFIER_LLM_BBOX_MAX_AREA=${CLASSIFIER_LLM_BBOX_MAX_AREA:-0.95}
+      - CLASSIFIER_LLM_BBOX_MAX_TOKENS=${CLASSIFIER_LLM_BBOX_MAX_TOKENS:-1024}
+      - CLASSIFIER_LLM_BBOX_CROP_PAD=${CLASSIFIER_LLM_BBOX_CROP_PAD:-0.10}
+      # Change detection on /assess/compare (regions.diff): the inlier count
+      # below which the two images are reported as NOT aligned rather than
+      # diffed anyway, the change-blob area floor, the pre-difference blur,
+      # and the per-example region cap.
+      - CLASSIFIER_DIFF_MIN_INLIERS=${CLASSIFIER_DIFF_MIN_INLIERS:-30}
+      - CLASSIFIER_DIFF_MIN_AREA=${CLASSIFIER_DIFF_MIN_AREA:-0.001}
+      - CLASSIFIER_DIFF_BLUR=${CLASSIFIER_DIFF_BLUR:-5}
+      - CLASSIFIER_DIFF_MAX_REGIONS=${CLASSIFIER_DIFF_MAX_REGIONS:-40}
+      # Open-vocabulary detector (ai/detector). DETECTOR_URL empty = off, and
+      # a request that asks for regions.detector then still succeeds with a
+      # note. Set it to http://detector:8000 once that stack is up; the two
+      # containers meet on ai_shared. See ai/detector/DETECTOR.md.
+      - DETECTOR_URL=${DETECTOR_URL:-}
+      - DETECTOR_MIN_SCORE=${DETECTOR_MIN_SCORE:-0.25}
+      - DETECTOR_TIMEOUT_S=${DETECTOR_TIMEOUT_S:-30}
+      - DETECTOR_MAX_LABELS_PER_CALL=${DETECTOR_MAX_LABELS_PER_CALL:-16}
+      # Retention. Now enforced rather than informational: the sweeper
+      # deletes a terminal job's artifact directory AND its row past this.
+      - JOB_TTL_HOURS=${JOB_TTL_HOURS:-24}
     volumes:
       - classifier_data:/data
     healthcheck:

@@ -1,0 +1,251 @@
+{
+  "_about": {
+    "what": "What regions_report.py asserts, keyed by Postman item name. Keys starting with an underscore are ignored.",
+    "shape": "{ \"<item name>\": { \"verdict\": \"PASS\"|null, \"http_status\": 400, \"criteria\": { \"<criterion>\": {\"verdict\": \"PASS\"|null, \"min_regions\": 1} } } }",
+    "verdict_null": "A criterion with \"verdict\": null asserts NOTHING about the verdict. Every `llm` row is written that way on purpose: its score comes from a model, and a suite that claims to verify a model's judgement against a fixed answer is lying about what it measured.",
+    "min_regions": "Asserted for the deterministic paths (cv / ocr / pdf-text / diff) where the fixtures' READMEs document a count. For `llm_boxes` rows it is 0 — 'you may produce boxes, and if you do they will be drawn' — so nothing false is claimed either way.",
+    "http_status": "When present, the item is expected to be REJECTED at submit time and nothing else is asserted.",
+    "sources": [
+      "unit-tests/classifier/documents/README.md",
+      "unit-tests/classifier/regions/README.md",
+      "ai/classifier/API.md"
+    ],
+    "adding_a_case": "Add the Postman item, then an entry here. See unit-tests/classifier/REGIONS_REPORT.md."
+  },
+
+  "invoice_native.pdf — native text, all four match modes": {
+    "verdict": "PASS",
+    "criteria": {
+      "Invoice #INV-2026-0042": { "verdict": "PASS" },
+      "Notice to Owner": { "verdict": "PASS" },
+      "Payment Terms: Net 30": { "verdict": "PASS" },
+      "total amount": { "verdict": "PASS" },
+      "lien waiver attached": { "verdict": "FAIL" },
+      "sharpness": { "verdict": "PASS" },
+      "document legibility": { "verdict": null }
+    }
+  },
+
+  "invoice_scanned.pdf — OCR does the work (ocr=auto)": {
+    "verdict": "PASS",
+    "criteria": {
+      "Notice to Owner": { "verdict": "PASS" },
+      "Invoice #INV-2026-0042": { "verdict": "PASS" },
+      "Payment Terms: Net 30": { "verdict": "PASS" },
+      "sharpness": { "verdict": "PASS" },
+      "document legibility": { "verdict": null }
+    }
+  },
+
+  "invoice_scanned.pdf — same file with ocr=never (expect FAIL)": {
+    "verdict": "FAIL",
+    "criteria": {
+      "Notice to Owner": { "verdict": "FAIL" },
+      "sharpness": { "verdict": "PASS" }
+    }
+  },
+
+  "contract.txt — text-only document, cv SKIPS": {
+    "verdict": "PASS",
+    "criteria": {
+      "Limited Warranty": { "verdict": "PASS" },
+      "contract date": { "verdict": "PASS" },
+      "sharpness": { "verdict": "SKIPPED" },
+      "mentions a warranty period": { "verdict": null }
+    }
+  },
+
+  "proposal.docx — paragraphs + table cells in document order": {
+    "verdict": "PASS",
+    "criteria": {
+      "Roofix Proposal": { "verdict": "PASS" },
+      "System Size | 8.4 kW": { "verdict": "PASS" },
+      "has faces": { "verdict": "SKIPPED" },
+      "states the system size": { "verdict": null }
+    }
+  },
+
+  "photo_of_letter.png — badly shot but readable": {
+    "verdict": "PASS",
+    "criteria": {
+      "Notice to Owner": { "verdict": "PASS" },
+      "case number": { "verdict": "PASS" },
+      "sharpness": { "verdict": "PASS" },
+      "proper exposure": { "verdict": "PASS" },
+      "document legibility": { "verdict": null }
+    }
+  },
+
+  "photo_of_letter_blurry.png — sharpness FAIL cascades": {
+    "verdict": "MARGINAL",
+    "criteria": {
+      "Notice to Owner": { "verdict": "PASS" },
+      "case number": { "verdict": "FAIL" },
+      "sharpness": { "verdict": "FAIL" },
+      "document legibility": { "verdict": "SKIPPED" }
+    }
+  },
+
+  "unsupported_legacy.doc — expect 400": {
+    "http_status": 400
+  },
+
+  "greenery_and_sky.png — three mask detectors, three polygon sets": {
+    "verdict": "PASS",
+    "criteria": {
+      "has sky": { "verdict": "PASS", "min_regions": 1 },
+      "has vegetation": { "verdict": "PASS", "min_regions": 1 },
+      "has water": { "verdict": "PASS", "min_regions": 2 },
+      "sharpness": { "verdict": "FAIL", "min_regions": 0 }
+    }
+  },
+
+  "text_blocks.png — merged text-block boxes + OCR line polygons": {
+    "verdict": null,
+    "criteria": {
+      "has text": { "verdict": "MARGINAL", "min_regions": 4 },
+      "Notice to Owner": { "verdict": "PASS", "min_regions": 1 },
+      "total amount": { "verdict": "PASS", "min_regions": 1 }
+    }
+  },
+
+  "invoice_native.pdf — native PDF rectangles (source=pdf-text)": {
+    "verdict": null,
+    "criteria": {
+      "Notice to Owner": { "verdict": "PASS", "min_regions": 1 },
+      "total amount": { "verdict": "PASS", "min_regions": 3 },
+      "has text": { "verdict": null, "min_regions": 1 }
+    }
+  },
+
+  "photo_of_letter.png — OCR line polygons on a skewed page": {
+    "verdict": "PASS",
+    "criteria": {
+      "Notice to Owner": { "verdict": "PASS", "min_regions": 1 }
+    }
+  },
+
+  "Neighborhood.jpeg — a real photo, and the empty-regions case": {
+    "verdict": null,
+    "criteria": {
+      "has sky": { "verdict": "PASS", "min_regions": 1 },
+      "has faces": { "verdict": null, "min_regions": 0 }
+    }
+  },
+
+  "Neighborhood.jpeg — regions.detector, scored with no LLM call": {
+    "verdict": null,
+    "criteria": {
+      "has sky": { "verdict": "PASS", "min_regions": 1 },
+      "has roof vent": { "verdict": null, "min_regions": 0 },
+      "has bicycle": { "verdict": null, "min_regions": 0 },
+      "has solar panels": { "verdict": null, "min_regions": 0 }
+    }
+  },
+
+  "POST /locate — text_blocks.png, no score, just the geometry": {
+    "criteria": {
+      "has text": { "verdict": null, "min_regions": 1 },
+      "Notice to Owner": { "verdict": null, "min_regions": 1 }
+    }
+  },
+
+  "Neighborhood.jpeg — the LLM enforcement loop (regions.llm_boxes)": {
+    "verdict": null,
+    "criteria": {
+      "solar panels": { "verdict": null, "min_regions": 0 },
+      "a parked car": { "verdict": null, "min_regions": 0 },
+      "image sharpness": { "verdict": null, "min_regions": 0 }
+    }
+  },
+
+  "scene_before/after — change detection (regions.diff)": {
+    "verdict": null,
+    "criteria": {
+      "has sky": { "verdict": "PASS", "min_regions": 1 }
+    }
+  },
+
+  "invoice_native.pdf — pdf-text rectangles on BOTH pages": {
+    "verdict": "PASS",
+    "criteria": {
+      "Invoice #INV-2026-0042": { "verdict": "PASS", "min_regions": 1 },
+      "Notice to Owner": { "verdict": "PASS", "min_regions": 1 },
+      "Payment Terms: Net 30": { "verdict": "PASS", "min_regions": 1 },
+      "total amount": { "verdict": "PASS", "min_regions": 3 },
+      "sharpness": { "verdict": "PASS", "min_regions": 0 },
+      "document legibility": { "verdict": null, "min_regions": 0 }
+    }
+  },
+
+  "invoice_scanned.pdf — OCR line polygons on BOTH pages": {
+    "verdict": "PASS",
+    "criteria": {
+      "Notice to Owner": { "verdict": "PASS", "min_regions": 1 },
+      "Invoice #INV-2026-0042": { "verdict": "PASS", "min_regions": 1 },
+      "Payment Terms: Net 30": { "verdict": "PASS", "min_regions": 1 },
+      "sharpness": { "verdict": "PASS", "min_regions": 0 },
+      "document legibility": { "verdict": null, "min_regions": 0 }
+    }
+  },
+
+  "photo_of_letter.png — logo, stamp and signature (llm_boxes + detector)": {
+    "verdict": null,
+    "criteria": {
+      "Notice to Owner": { "verdict": "PASS", "min_regions": 1 },
+      "case number": { "verdict": "PASS", "min_regions": 1 },
+      "has text": { "verdict": null, "min_regions": 1 },
+      "has a signature": { "verdict": null, "min_regions": 0 },
+      "has a company logo": { "verdict": null, "min_regions": 0 },
+      "has an official stamp": { "verdict": null, "min_regions": 0 }
+    }
+  },
+
+  "photo_of_letter_blurry.png — the same marks, degraded": {
+    "verdict": null,
+    "criteria": {
+      "Notice to Owner": { "verdict": "PASS", "min_regions": 1 },
+      "case number": { "verdict": "FAIL", "min_regions": 0 },
+      "has text": { "verdict": null, "min_regions": 0 },
+      "has a signature": { "verdict": null, "min_regions": 0 },
+      "has a company logo": { "verdict": null, "min_regions": 0 },
+      "has an official stamp": { "verdict": null, "min_regions": 0 }
+    }
+  },
+
+  "proposal.docx — no page images, so no geometry": {
+    "verdict": "PASS",
+    "criteria": {
+      "Roofix Proposal": { "verdict": "PASS", "min_regions": 0 },
+      "System Size | 8.4 kW": { "verdict": "PASS", "min_regions": 0 },
+      "has faces": { "verdict": "SKIPPED", "min_regions": 0 }
+    }
+  },
+
+  "contract.txt — snippets instead of rectangles": {
+    "verdict": "PASS",
+    "criteria": {
+      "Limited Warranty": { "verdict": "PASS", "min_regions": 0 },
+      "contract date": { "verdict": "PASS", "min_regions": 0 },
+      "sharpness": { "verdict": "SKIPPED", "min_regions": 0 }
+    }
+  },
+
+  "invoice_native.pdf vs invoice_scanned.pdf — regions for both sides": {
+    "verdict": null,
+    "criteria": {
+      "Notice to Owner": { "verdict": "PASS", "min_regions": 1 },
+      "Invoice #INV-2026-0042": { "verdict": "PASS", "min_regions": 1 },
+      "total amount": { "verdict": "PASS", "min_regions": 3 },
+      "sharpness": { "verdict": "PASS", "min_regions": 0 }
+    }
+  },
+
+  "POST /locate — photo_of_letter.png, mixed features": {
+    "criteria": {
+      "Notice to Owner": { "verdict": null, "min_regions": 1 },
+      "has text": { "verdict": null, "min_regions": 1 },
+      "a signature": { "verdict": null, "min_regions": 0 }
+    }
+  }
+}

@@ -1,0 +1,83 @@
+version: "3.8"
+
+services:
+  chatbot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: zeo-damage-chatbot
+    restart: unless-stopped
+    ports:
+      - "${CHATBOT_PORT:-8000}:8000"
+    environment:
+      - LLM_BACKEND=${LLM_BACKEND:-vllm}
+      - LLM_TIMEOUT_SECONDS=${LLM_TIMEOUT_SECONDS:-60}
+      - VLLM_BASE_URL=${VLLM_BASE_URL:-http://localhost:8000/v1}
+      - VLLM_MODEL=${VLLM_MODEL:-qwen3.8:27b}
+      - VLLM_API_KEY=${VLLM_API_KEY:-}
+      - OLLAMA_HOST=${OLLAMA_HOST:-http://localhost:11434}
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-qwen3.8:27b}
+      - USE_MOCK_LLM=${USE_MOCK_LLM:-0}
+      - CORS_ALLOW_ORIGINS=${CORS_ALLOW_ORIGINS:-http://localhost:8000,http://127.0.0.1:8000}
+      - RATE_LIMIT_REQUESTS=${RATE_LIMIT_REQUESTS:-60}
+      - RATE_LIMIT_WINDOW_SECONDS=${RATE_LIMIT_WINDOW_SECONDS:-60}
+      - SESSION_TTL_SECONDS=${SESSION_TTL_SECONDS:-3600}
+      - MAX_SESSIONS=${MAX_SESSIONS:-5000}
+      - ANSWER_CONFIDENCE_THRESHOLD=${ANSWER_CONFIDENCE_THRESHOLD:-0.7}
+      - CRM_BACKEND=${CRM_BACKEND:-stub}
+      - CRM_MATCH_THRESHOLD=${CRM_MATCH_THRESHOLD:-0.9}
+      - EMAIL_SEND_ENABLED=${EMAIL_SEND_ENABLED:-false}
+      - EMAIL_FROM=${EMAIL_FROM:-service-bot@zeoenergy.com}
+      - MAILBOX_DISPOSITION=${MAILBOX_DISPOSITION:-service-team@zeoenergy.com}
+      - MAILBOX_UNVERIFIED=${MAILBOX_UNVERIFIED:-intake-review@zeoenergy.com}
+      - MAILBOX_SOLAR=${MAILBOX_SOLAR:-performance-team@zeoenergy.com}
+      - CHAT_SEND_ENABLED=${CHAT_SEND_ENABLED:-false}
+      - CHAT_BACKEND=${CHAT_BACKEND:-stub}
+    volumes:
+      - chatbot_uploads:/app/backend/data/uploads
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - zeo-network
+
+  # Optional local vLLM container profile (run with: docker compose --profile vllm up)
+  vllm:
+    image: vllm/vllm-openai:latest
+    container_name: zeo-vllm-server
+    profiles: ["vllm"]
+    restart: unless-stopped
+    ports:
+      - "8001:8000"
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}
+    command: >
+      --model ${VLLM_MODEL:-Qwen/Qwen2.5-27B-Instruct}
+      --dtype auto
+      --max-model-len 4096
+      --trust-remote-code
+      --disable-log-requests
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    networks:
+      - zeo-network
+
+volumes:
+  chatbot_uploads:
+    driver: local
+  hf_cache:
+    driver: local
+
+networks:
+  zeo-network:
+    driver: bridge

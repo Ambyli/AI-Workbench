@@ -1,0 +1,32 @@
+# Git
+.git
+.gitignore
+
+# Python cache & environments
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.venv
+venv
+env
+*.egg-info
+.pytest_cache
+
+# Environment secrets
+.env
+.env.*
+!.env.example
+*.key
+
+# IDE / OS
+.DS_Store
+Thumbs.db
+.idea
+.vscode
+.claude
+
+# Runtime data / temp
+backend/data/uploads/*
+!backend/data/uploads/.gitkeep
+backend/data/chat_notifications.json

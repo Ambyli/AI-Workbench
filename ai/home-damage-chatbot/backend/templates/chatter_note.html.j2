@@ -1,0 +1,70 @@
+{#
+  Salesforce / In-House CRM Chatter Feed Note Template.
+  Plain formatted text with bold/italics, no emojis. Autoescaped with Jinja2.
+#}
+<div class="chatter-post" style="font-family: Arial, Helvetica, sans-serif; font-size: 13px; line-height: 1.5; color: #222; background: #ffffff; padding: 18px; border: 1px solid #d8dde6; border-radius: 4px; max-width: 750px;">
+  
+  <div style="font-size: 12px; color: #555; border-bottom: 1px solid #e5e5e5; padding-bottom: 8px; margin-bottom: 12px;">
+    <strong>Zeo Service Bot (Automated Intake)</strong> &middot; Case #<strong>{{ case_id or 'NEW' }}</strong> &middot; Account #<strong>{{ account_number or 'UNVERIFIED' }}</strong>
+  </div>
+
+  <div style="margin-bottom: 12px;">
+    <strong>SERVICE INTAKE CASE NOTE</strong><br>
+    <strong>Category:</strong> {{ issue_label or 'Service Request' }} | <strong>Priority Tier:</strong> {{ tier_label or 'Standard' }} (Urgency: {{ urgency or 5 }}/10)<br>
+    <strong>Summary:</strong> {{ summary }}
+  </div>
+
+  <div style="margin-bottom: 12px;">
+    <strong>INTAKE DETAILS:</strong><br>
+    &bull; <strong>Account Number:</strong> {{ account_number or 'Unverified Requester' }}<br>
+    &bull; <strong>Requester Name:</strong> {{ customer_name }}<br>
+    &bull; <strong>Contact:</strong> {{ contact }}<br>
+    &bull; <strong>Service Address:</strong> {{ service_address }}<br>
+    &bull; <strong>Disposition Routing:</strong> {{ routed_to or 'service-team@zeoenergy.com' }}
+  </div>
+
+  {% if facts %}
+  <div style="margin-bottom: 12px;">
+    <strong>ISSUE DIAGNOSTIC FACTS:</strong><br>
+    {% for label, val in facts %}
+    &bull; <strong>{{ label }}:</strong> {{ val }}<br>
+    {% endfor %}
+  </div>
+  {% endif %}
+
+  {% if verbatim %}
+  <div style="margin-bottom: 12px;">
+    <strong>CUSTOMER STATEMENT (Untrusted Verbatim):</strong><br>
+    {% for v in verbatim %}
+    <em>&ldquo;{{ v }}&rdquo;</em><br>
+    {% endfor %}
+  </div>
+  {% endif %}
+
+  {% if damage_pointer or attachments %}
+  <div style="margin-top: 14px; border-top: 1px solid #eee; padding-top: 10px;">
+    <strong>ATTACHED PHOTOS & DAMAGE LOCATION:</strong>
+    <div style="display: flex; flex-wrap: wrap; gap: 12px; margin-top: 8px;">
+      {% if damage_pointer %}
+      <div style="border: 1px solid #ccc; border-radius: 4px; padding: 4px; width: 180px; background: #fafafa;">
+        <img src="/uploads/{{ damage_pointer }}" alt="Damage Map Pointer" style="width: 100%; height: 100px; object-fit: cover; display: block;" />
+        <div style="font-size: 11px; color: #444; margin-top: 4px;">Damage Location Pointer</div>
+      </div>
+      {% endif %}
+      {% for att in attachments %}
+        {% set fname = att.filename if att is mapping else att %}
+        {% if fname != damage_pointer %}
+        <div style="border: 1px solid #ccc; border-radius: 4px; padding: 4px; width: 180px; background: #fafafa;">
+          <img src="/uploads/{{ fname }}" alt="{{ fname }}" onerror="this.src='/assets/suburban_house.png'" style="width: 100%; height: 100px; object-fit: cover; display: block;" />
+          <div style="font-size: 11px; color: #444; margin-top: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">{{ fname }}</div>
+        </div>
+        {% endif %}
+      {% endfor %}
+    </div>
+  </div>
+  {% endif %}
+
+  <div style="font-size: 11px; color: #777; margin-top: 12px; border-top: 1px solid #f0f0f0; padding-top: 6px;">
+    <em>Notice: Generated automatically by service intake bot. Images signature-validated, EXIF stripped.</em>
+  </div>
+</div>

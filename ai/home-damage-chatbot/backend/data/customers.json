@@ -1,0 +1,74 @@
+[
+  {
+    "account_number": "ZEO-MOCK-001",
+    "name": "Jane Doe",
+    "service_address": "100 Solar Way, Tampa, FL 33601",
+    "email": "jane.doe@example.com",
+    "phone": "813-555-0101",
+    "system_size": "7.2 kW (18 panels)",
+    "install_date": "2021-04-18"
+  },
+  {
+    "account_number": "ZEO-MOCK-002",
+    "name": "John Smith",
+    "service_address": "200 Sunny Ln, Clearwater, FL 33755",
+    "email": "john.smith@example.com",
+    "phone": "727-555-0102",
+    "system_size": "9.6 kW (24 panels)",
+    "install_date": "2022-09-02"
+  },
+  {
+    "account_number": "ZEO-MOCK-003",
+    "name": "Alex Taylor",
+    "service_address": "300 Panel Rd, Orlando, FL 32801",
+    "email": "alex.taylor@example.com",
+    "phone": "407-555-0103",
+    "system_size": "6.0 kW (15 panels)",
+    "install_date": "2020-11-30"
+  },
+  {
+    "account_number": "ZEO-MOCK-004",
+    "name": "Sam Sample",
+    "service_address": "400 Battery Ct, Sarasota, FL 34236",
+    "email": "sam.sample@example.com",
+    "phone": "941-555-0104",
+    "system_size": "11.4 kW (30 panels)",
+    "install_date": "2023-03-14"
+  },
+  {
+    "account_number": "ZEO-MOCK-005",
+    "name": "Jordan Lee",
+    "service_address": "500 Electric Ave, Lakeland, FL 33801",
+    "email": "jordan.lee@example.com",
+    "phone": "863-555-0105",
+    "system_size": "10.0 kW (25 panels)",
+    "install_date": "2022-06-21"
+  },
+  {
+    "account_number": "ZEO-MOCK-006",
+    "name": "Morgan Bailey",
+    "service_address": "600 Inverter Dr, Bradenton, FL 34205",
+    "email": "morgan.bailey@example.com",
+    "phone": "941-555-0106",
+    "system_size": "8.0 kW (20 panels)",
+    "install_date": "2021-12-08"
+  },
+  {
+    "account_number": "ZEO-MOCK-007",
+    "name": "Casey Miller",
+    "service_address": "700 Voltage Way, Miami, FL 33101",
+    "email": "casey.miller@example.com",
+    "phone": "305-555-0107",
+    "system_size": "5.4 kW (14 panels)",
+    "install_date": "2024-01-10"
+  },
+  {
+    "account_number": "ZEO-MOCK-008",
+    "name": "Taylor Davis",
+    "service_address": "800 Grid St, St. Petersburg, FL 33701",
+    "email": "taylor.davis@example.com",
+    "phone": "727-555-0108",
+    "system_size": "12.0 kW (30 panels)",
+    "install_date": "2023-08-27"
+  }
+]

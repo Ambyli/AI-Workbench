@@ -39,6 +39,7 @@ can compress the sensor noise).
 | [`photo_of_letter.png`](photo_of_letter.png) | image | **none** — OCR required | 1 | A badly photographed letter (3° skew, brightness gradient, mild blur, JPEG noise) that OCR still reads. Carries a logo, a stamp and a signature — see below |
 | [`photo_of_letter_blurry.png`](photo_of_letter_blurry.png) | image | **none** — OCR mostly fails | 1 | Sharpness FAIL, partial OCR, and `depends_on` skipping the LLM criterion |
 | [`unsupported_legacy.doc`](unsupported_legacy.doc) | — | — | — | The OLE2 rejection: HTTP 400 telling the caller to convert to .docx |
+| [`utility_bill.jpeg`](utility_bill.jpeg) | image | **none** — OCR required | 1 (5712×4284, EXIF orientation 6 → upright 4284×5712) | A real phone photo of a utility bill, **not** generated — the one fixture in this folder that is. Drives `regions_report.py --pipeline utility-bill`: is it a bill → where is the amount due → crop and read the figure. Prints **Amount Due $80.49** three times (header, account summary, payment stub); 5.8 MB, same order as `../Neighborhood.jpeg`. See [`../REGIONS_REPORT.md § Pipelines`](../REGIONS_REPORT.md#pipelines) |
 
 ---
 

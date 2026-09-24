@@ -104,8 +104,10 @@ uv run --package classifier python unit-tests/classifier/regions_report.py \
 | `--base-url` | `CLASSIFIER_BASE_URL`, else `http://localhost:4001` | LiteLLM base URL |
 | `--api-key` | `CLASSIFIER_API_KEY`, else `DEFAULT_LITELLM_MASTER_KEY` | Bearer token |
 | `--collection` | `ai/classifier/classifier.postman_collection.json` | Any collection with the same shape works |
-| `--folders` | `Documents,Regions,Documents + regions` | Comma-separated. The **Artifacts** folder is not runnable — its items are parametrised on a `:jobId` that only exists after a submission, and every case here exercises those endpoints itself |
-| `--only` | _(all)_ | Case-insensitive substring of the item name |
+| `--folders` | `Documents,Regions,Documents + regions` | Comma-separated. The **Artifacts** folder is not runnable — its items are parametrised on a `:jobId` that only exists after a submission, and every case here exercises those endpoints itself. When `--pipeline` is given and this is not, no collection folder runs |
+| `--only` | _(all)_ | Case-insensitive substring of the item name. Does not filter pipeline stages |
+| `--pipeline` | _(none)_ | Run a chained pipeline — see [§ Pipelines](#pipelines). Repeatable; `utility-bill` is the one that exists |
+| `--document` | `documents/utility_bill.jpeg` | The document a pipeline runs on. With an ad-hoc file the `amount_due` expectation is **skipped**, not failed — there is nothing to be right against |
 | `--out` | `unit-tests/classifier/reports/<UTC timestamp>/` | Gitignored |
 | `--timeout` | `600` | Seconds to wait for one job to reach a terminal phase |
 | `--expect` | `unit-tests/classifier/regions_expected.json` | |
@@ -231,6 +233,65 @@ carry real numbers, taken from
 
 An item with **no entry at all** fails its coverage check, so a new Postman
 item cannot quietly go unasserted.
+
+---
+
+## Pipelines
+
+The collection can express any single request. It cannot express *"crop the
+region the last job found and send that"* — a request whose body depends on
+the previous answer. A **pipeline** is a short chain of such calls, built at
+run time by the script. Every stage is still an ordinary case: it goes through
+the same submit → poll → download → annotate path, gets its own section in the
+report and its own entry in `regions_expected.json`. Only the glue between
+stages lives in `regions_report.py`.
+
+```bash
+# The committed bill, against the box (all three stages, LLM included)
+uv run --package classifier python unit-tests/classifier/regions_report.py --pipeline utility-bill
+
+# The same chain in-process — no model; the deterministic OCR half decides
+uv run --package classifier python unit-tests/classifier/regions_report.py --pipeline utility-bill --local
+
+# Another bill. The amount-due expectation is skipped; the value is still reported
+uv run --package classifier python unit-tests/classifier/regions_report.py \
+    --pipeline utility-bill --document ~/Downloads/some_bill.jpg --keep-jobs
+```
+
+### `utility-bill` — read the amount due off a photographed bill
+
+The fixture is [`documents/utility_bill.jpeg`](documents/utility_bill.jpeg), a
+phone photo of an Ohio Edison bill (5712×4284, EXIF orientation 6 — the
+service and the script both read it upright at 4284×5712). It prints
+**Amount Due $80.49** three times: the header, the account-summary table, and
+the payment stub.
+
+| Stage | Call | Request | What decides it |
+|---|---|---|---|
+| 1 · is this a utility bill? | `POST /assess` | `ocr=always`, four fuzzy/regex `text` criteria (`Amount Due`, `Account Number`, `billing period`, a usage unit such as `kWh`), an `llm` presence criterion for the document as a whole, an `llm` legibility criterion | Overall **PASS** and the llm presence criterion **PASS**. Under `--local` the llm criteria are dropped, so the text criteria decide alone — `gate.basis` in `summary.json` says which it was. Anything else stops the chain: an amount located on a document that is not a bill is *a* number, which is worse than none |
+| 2 · where is the amount due? | `POST /locate` | fuzzy `text` features `Amount Due` and `Total Due` → OCR line polygons in original page pixels; an `llm` presence feature with `regions.llm_boxes` → the enforcement loop's box | **Candidates**, best first: a label line that already carries a dollar figure (the header), other label lines, then the model's accepted box. Two features on one line collapse to one candidate. None at all stops the chain |
+| 3 · read the figure inside that region | `POST /assess` on a **crop** | The script cuts the top candidate out of the original page — a page-wide strip three line-heights tall around a label line (the figure is on the same row, sometimes at the far right of a table, and a photographed page is rarely level), or a lightly padded box around the model's — and submits it as a new document with a regex `text` criterion for a currency figure, the `Amount Due` label again, and an `llm` criterion asked to state the figure | Every currency figure on every OCR line of the crop, **nearest the label first** (label-heights vertically, crop-widths horizontally; `$`-prefixed before bare decimals, negatives last). The top one is the answer. The model's stated figure is kept beside it as a second opinion and only becomes the answer when OCR read nothing. A crop with no figure moves to the next candidate, up to three — each attempt is its own case |
+
+The report gets a **Pipeline** section above the cases: the answer, what each
+stage decided in one line, the candidate table, every figure read with its
+distance, the stage-2 page with all candidates drawn on it beside the stage-3
+crop with the figures drawn on it, and the chain-level checks. `summary.json`
+carries the same under `pipelines[]`.
+
+Expectations, in `regions_expected.json`:
+
+```json
+"pipeline: utility bill": { "is_utility": true, "region_found": true, "amount_due": "$80.49" }
+```
+
+plus the usual per-stage entries under the three stage names. The chain's
+answer is decided by OCR and a regex, so `amount_due` is a real assertion in
+both modes — the llm rows stay `null` as everywhere else.
+
+**Adding a pipeline** is code, not collection: a `run_<name>_pipeline()` in
+the § Pipelines section that builds `Case`s and feeds them to `run_case()`,
+an entry in the `runners` dict in `main()`, a name in `PIPELINES`, and the
+expectations entries. Keep the stage names stable — they are the keys.
 
 ---
 

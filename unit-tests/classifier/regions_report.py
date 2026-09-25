@@ -758,6 +758,8 @@ def _caption(region: Region, scores: dict[str, dict]) -> str:
                         else f"attempt {attempt} accepted")
         else:
             bits.append(f"attempt {attempt} ✗")
+        if region.attrs.get("refined"):
+            bits.append("refined")
     return " · ".join(bits)
 
 

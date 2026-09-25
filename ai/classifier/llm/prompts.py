@@ -309,8 +309,17 @@ def build_bbox_prompt(
     *,
     feedback: list[str] | None = None,
     grid: float = LLM_BBOX_GRID,
+    gridlines: bool = False,
+    grid_step: int = 100,
+    zoomed: bool = False,
 ) -> dict:
     """Ask for ONE criterion's bounding box on the attached page image.
+
+    Two optional aids, both measured to matter (see config.LLM_BBOX_GRIDLINES):
+    ``gridlines`` says a labelled coordinate grid is drawn on the attached
+    image and tells the model to read positions off it; ``zoomed`` says the
+    image is a crop of a larger page (the refine pass) and that the answer
+    is on THIS image's grid. Neither changes the answer's shape.
 
     One criterion per call rather than all of them at once: a model that has
     to place eight boxes in one JSON object places them worse than a model
@@ -330,11 +339,28 @@ def build_bbox_prompt(
         feedback:  One sentence per previous rejected attempt, newest last.
                    Empty on attempt 1.
         grid:      Grid span (default 1000).
+        gridlines: The attached image carries a labelled grid every
+                   ``grid_step`` units (common.vision.draw_grid_overlay).
+        grid_step: Spacing of that grid, for the sentence that describes it.
+        zoomed:    The attached image is a crop of a larger page.
 
     Returns:
         A dict ready to POST to the vLLM /v1/chat/completions endpoint.
     """
     span = int(grid)
+    aids = ""
+    if gridlines:
+        aids += (
+            f"\nA coordinate grid is drawn over the image: thin red lines every "
+            f"{int(grid_step)} units, numbered along every edge. Read x off the numbers "
+            "along the top and bottom, y off the numbers along the left and right, and "
+            "interpolate between lines.\n"
+        )
+    if zoomed:
+        aids += (
+            "\nThis image is a zoomed-in crop of a larger document, and the feature "
+            f"should be inside it. Answer on THIS image's 0 to {span} grid.\n"
+        )
     scaffold = json.dumps(
         {"bbox": [0, 0, 0, 0], "confidence": 0, "reason": "..."}, indent=2
     )
@@ -352,7 +378,7 @@ def build_bbox_prompt(
         "pixel size. Answer with the tightest rectangle that contains the "
         f"feature, as [x1, y1, x2, y2] with x1 < x2 and y1 < y2, every number "
         f"between 0 and {span}.\n"
-        f"{retry_block}\n"
+        f"{retry_block}{aids}\n"
         "Rules:\n"
         f"  - A box covering the whole image is NOT an answer. Box the feature, "
         "not the photograph.\n"
@@ -394,8 +420,8 @@ def build_bbox_prompt(
         "response_format": {"type": "json_object"},
     }
     logger.debug(
-        "build_bbox_prompt: '%s' grid=%d feedback=%d line(s)",
-        name, span, len(feedback or []),
+        "build_bbox_prompt: '%s' grid=%d feedback=%d line(s) gridlines=%s zoomed=%s",
+        name, span, len(feedback or []), gridlines, zoomed,
     )
     return prompt
 

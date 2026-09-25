@@ -436,7 +436,10 @@ DETECTOR_STRONG_SCORE: float = 0.5
 # LLM_BBOX_CROP_PAD widens the crop by this fraction of the box on each side
 # before the verify call, clamped to the page. A box that clips the feature is
 # common and a padded crop still answers the question that was asked; a padded
-# crop is NOT what gets stored as the region.
+# crop is NOT what gets stored as the region. 0.25 rather than 0.10 because
+# the refine pass draws TIGHT boxes: on a bill header it boxed "before $193.33"
+# — three units off the line, two-thirds of its width — and a 10% crop showed
+# the verifier a line with no "Amount due" on it, which it rightly failed.
 LLM_BBOX_MAX_ATTEMPTS: int = max(
     1, int(os.environ.get("CLASSIFIER_LLM_BBOX_MAX_ATTEMPTS", "3"))
 )
@@ -453,7 +456,40 @@ LLM_BBOX_MAX_TOKENS: int = max(
     64, int(os.environ.get("CLASSIFIER_LLM_BBOX_MAX_TOKENS", "1024"))
 )
 LLM_BBOX_CROP_PAD: float = max(
-    0.0, float(os.environ.get("CLASSIFIER_LLM_BBOX_CROP_PAD", "0.10"))
+    0.0, float(os.environ.get("CLASSIFIER_LLM_BBOX_CROP_PAD", "0.25"))
+)
+
+# LLM_BBOX_GRIDLINES draws a labelled 0-1000 coordinate grid — lines every
+# LLM_BBOX_GRID_STEP units, numbered along every edge — on the copy of the
+# page the ASK call sees, so the model reads a position off a ruler instead
+# of estimating a fraction of the frame. Measured on photographed utility
+# bills (unit-tests/classifier/documents/utility_bill*.jpeg): the bare image
+# put a text line's box 25-100 grid units off on one axis; with the grid the
+# mean error halved. The scoring call and the verify crop never see the grid
+# and it is never stored.
+#
+# LLM_BBOX_REFINE re-asks after a coarse box validates, on a crop of the
+# ORIGINAL page around that box — LLM_BBOX_REFINE_ZOOM × the box on each
+# axis, never less than LLM_BBOX_REFINE_MIN_SPAN of the page — with its own
+# grid, and maps the answer back into the page frame. Same measurement: hits
+# on text lines went from 0/8 to 7/8 and the mean y error from 48 units to
+# 2.4. Costs one extra call per attempt whose coarse box validated; the
+# coarse box is kept when the second answer is unusable, and both are
+# recorded on the attempt (`coarse_bbox_grid`, `refined`).
+def _env_flag(name: str, default: str) -> bool:
+    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
+LLM_BBOX_GRIDLINES: bool = _env_flag("CLASSIFIER_LLM_BBOX_GRIDLINES", "true")
+LLM_BBOX_GRID_STEP: int = max(
+    10, int(os.environ.get("CLASSIFIER_LLM_BBOX_GRID_STEP", "100"))
+)
+LLM_BBOX_REFINE: bool = _env_flag("CLASSIFIER_LLM_BBOX_REFINE", "true")
+LLM_BBOX_REFINE_ZOOM: float = max(
+    1.0, float(os.environ.get("CLASSIFIER_LLM_BBOX_REFINE_ZOOM", "2.5"))
+)
+LLM_BBOX_REFINE_MIN_SPAN: float = min(
+    1.0, max(0.05, float(os.environ.get("CLASSIFIER_LLM_BBOX_REFINE_MIN_SPAN", "0.2")))
 )
 
 # Presence score at or above which a criterion is worth locating. Not an env

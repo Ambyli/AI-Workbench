@@ -79,8 +79,16 @@ def page():
 
 
 def _run(model, monkeypatch, page, **kwargs):
-    """Point the loop at ``model`` and run one criterion through it."""
+    """Point the loop at ``model`` and run one criterion through it.
+
+    The grid overlay and the refine pass are OFF here unless a test turns
+    them on: these tests script the model call by call, and the two aids
+    each change the call sequence — which the tests under "The grid and the
+    refine pass" cover on their own.
+    """
     monkeypatch.setattr(llm_client, "call_vllm_json", model)
+    kwargs.setdefault("gridlines", False)
+    kwargs.setdefault("refine", False)
     return asyncio.run(
         llm_boxes.locate_criterion(
             "has solar panels",
@@ -354,6 +362,165 @@ def test_crop_of_a_missing_image_is_none():
 
 
 # ---------------------------------------------------------------------------
+# The grid and the refine pass
+# ---------------------------------------------------------------------------
+#
+# Both exist because of a measurement (config.LLM_BBOX_GRIDLINES): the bare
+# ask put a text line's box 25-100 grid units off on one axis; a labelled
+# grid halved that, and a second ask on a zoomed crop of the original with
+# its own grid brought it within a few units. What is pinned here is the
+# MECHANICS — the call sequence, the window, the mapping back, what is
+# recorded, and that a failed refine keeps the coarse box — not the model.
+
+
+@pytest.fixture
+def working():
+    """The ≤1000-px page the scoring image came from: half the original."""
+    return np.full((GEOMETRY.height // 2, GEOMETRY.width // 2, 3), 200, dtype=np.uint8)
+
+
+def test_gridlines_change_the_ask_image_and_say_so(monkeypatch, page, working):
+    """With a working image the ask sees a gridded copy, and the prompt tells
+    the model to read the grid; the verify crop is untouched by either."""
+    model = ScriptedModel([
+        {"bbox": GOOD_BOX},
+        {"score": 9, "reason": "panels"},
+    ])
+    _run(model, monkeypatch, page, working_image=working, gridlines=True)
+
+    ask_url = model.calls[0][1]["messages"][1]["content"][0]["image_url"]["url"]
+    assert ask_url != "data:image/jpeg;base64,ZmFrZQ=="
+    assert "coordinate grid is drawn over the image" in model.user_text(0)
+    assert "every 100 units" in model.user_text(0)
+    verify_text = model.user_text(1)
+    assert "coordinate grid" not in verify_text
+
+
+def test_gridlines_without_a_working_image_ask_on_the_bare_page(monkeypatch, page):
+    """No pixels to draw on → the scoring image goes out unchanged, and the
+    prompt must not claim a grid that is not there."""
+    model = ScriptedModel([
+        {"bbox": GOOD_BOX},
+        {"score": 9, "reason": "panels"},
+    ])
+    _run(model, monkeypatch, page, gridlines=True)
+    ask_url = model.calls[0][1]["messages"][1]["content"][0]["image_url"]["url"]
+    assert ask_url == "data:image/jpeg;base64,ZmFrZQ=="
+    assert "coordinate grid" not in model.user_text(0)
+
+
+def test_refine_window_zooms_clamps_and_honours_the_minimum():
+    # 200×200 box × 2.5 = 500 wide, centred on (200, 300): x clamps at 0.
+    assert llm_boxes.refine_window(GOOD_BOX, zoom=2.5, min_span=0.2) == [0.0, 50.0, 450.0, 550.0]
+    # A thin line: 140×14 × 2.5 = 350×35 → the y span rises to the 200 floor.
+    window = llm_boxes.refine_window([400, 500, 540, 514], zoom=2.5, min_span=0.2)
+    assert window == pytest.approx([295.0, 407.0, 645.0, 607.0])
+    # Never past the far edge either.
+    assert llm_boxes.refine_window([900, 900, 1000, 1000], zoom=2.5, min_span=0.2)[2:] == [1000.0, 1000.0]
+
+
+def test_window_to_full_maps_the_crop_frame_back():
+    window = [0.0, 50.0, 450.0, 550.0]
+    assert llm_boxes.window_to_full([400, 400, 600, 600], window) == pytest.approx(
+        [180.0, 250.0, 270.0, 350.0]
+    )
+
+
+def test_crop_window_cuts_the_original_and_fits_the_working_size(page):
+    crop = llm_boxes.crop_window(page, [0.0, 50.0, 450.0, 550.0])
+    # 800×1200 page: x 0-360 px, y 60-660 px → 600 tall, 360 wide; under 1000.
+    assert crop.shape[:2] == (600, 360)
+    big = np.zeros((3000, 4000, 3), dtype=np.uint8)
+    crop = llm_boxes.crop_window(big, [0.0, 0.0, 1000.0, 1000.0])
+    assert max(crop.shape[:2]) == 1000
+    assert llm_boxes.crop_window(None, [0, 0, 100, 100]) is None
+
+
+def test_refine_asks_on_the_zoomed_crop_and_maps_back(monkeypatch, page, working):
+    """ask → refine → verify: the refined box, in the page frame, is what is
+    verified and stored; the coarse box and the window are kept beside it."""
+    model = ScriptedModel([
+        {"bbox": GOOD_BOX, "reason": "roughly there"},          # coarse, page frame
+        {"bbox": [400, 400, 600, 600], "reason": "exactly there"},  # fine, crop frame
+        {"score": 9, "reason": "a solar array fills the crop"},
+    ])
+    regions, loc = _run(model, monkeypatch, page, working_image=working, gridlines=True, refine=True)
+
+    assert model.labels() == [
+        "bbox/has solar panels#1",
+        "refine/has solar panels#1",
+        "verify/has solar panels#1",
+    ]
+    assert loc.calls == 3 and loc.accepted_attempt == 1
+    attempt = loc.attempts[0]
+    assert attempt.refined is True
+    assert attempt.coarse_bbox_grid == [100.0, 200.0, 300.0, 400.0]
+    assert attempt.refine_window_grid == [0.0, 50.0, 450.0, 550.0]
+    assert attempt.bbox_grid == pytest.approx([180.0, 250.0, 270.0, 350.0])
+    # 800×1200 page: x × 0.8, y × 1.2.
+    assert attempt.bbox_px == pytest.approx([144.0, 300.0, 216.0, 420.0])
+    assert regions[0].points == pytest.approx([(144.0, 300.0), (216.0, 420.0)])
+    assert regions[0].attrs["refined"] is True
+
+    # The refine prompt says it is a crop, and carries the grid sentence.
+    refine_text = model.user_text(1)
+    assert "zoomed-in crop" in refine_text and "coordinate grid" in refine_text
+
+    data = attempt.as_dict()
+    assert data["refined"] is True
+    assert data["coarse_bbox_grid"] == [100.0, 200.0, 300.0, 400.0]
+    assert data["refine_window_grid"] == [0.0, 50.0, 450.0, 550.0]
+    assert "refine_reject" not in data
+
+
+def test_refine_failure_keeps_the_coarse_box(monkeypatch, page, working):
+    """An unusable second answer costs a call and changes nothing else."""
+    model = ScriptedModel([
+        {"bbox": GOOD_BOX},
+        None,                                  # the refine call failed
+        {"score": 8, "reason": "panels"},
+    ])
+    regions, loc = _run(model, monkeypatch, page, working_image=working, refine=True)
+    attempt = loc.attempts[0]
+    assert loc.calls == 3 and attempt.accepted is True
+    assert attempt.refined is False
+    assert attempt.bbox_grid == [100.0, 200.0, 300.0, 400.0]
+    assert "usable answer for the refine pass" in attempt.refine_reject
+    assert attempt.as_dict()["refine_reject"] == attempt.refine_reject
+    assert regions[0].attrs["refined"] is False
+
+
+def test_refine_does_not_run_for_a_rejected_coarse_box(monkeypatch, page, working):
+    """Nothing to zoom into when the first answer was the whole frame."""
+    model = ScriptedModel([
+        {"bbox": FULL_FRAME},
+        {"bbox": GOOD_BOX},
+        {"bbox": [400, 400, 600, 600]},
+        {"score": 9, "reason": "panels"},
+    ])
+    _, loc = _run(model, monkeypatch, page, working_image=working, refine=True)
+    assert model.labels() == [
+        "bbox/has solar panels#1",
+        "bbox/has solar panels#2",
+        "refine/has solar panels#2",
+        "verify/has solar panels#2",
+    ]
+    assert loc.attempts[0].coarse_bbox_grid is None
+    assert "coarse_bbox_grid" not in loc.attempts[0].as_dict()
+    assert loc.attempts[1].refined is True
+
+
+def test_refine_without_an_original_image_is_recorded_not_fatal(monkeypatch, working):
+    """The page image is what gets cropped; without it the coarse box stands."""
+    model = ScriptedModel([{"bbox": GOOD_BOX}])
+    _, loc = _run(model, monkeypatch, None, working_image=working, refine=True)
+    attempt = loc.attempts[0]
+    assert attempt.refined is False
+    assert "not available to crop for the refine pass" in attempt.refine_reject
+    assert loc.calls == 1  # no refine call, and no verify call either (no page)
+
+
+# ---------------------------------------------------------------------------
 # The detector cross-check
 # ---------------------------------------------------------------------------
 
@@ -450,6 +617,10 @@ def _analyze(monkeypatch, *, llm_boxes_on, answers, score=10, job_id=None):
 
     monkeypatch.setattr(pipeline, "call_vllm", _scoring_call(score))
     monkeypatch.setattr(llm_client, "call_vllm_json", ScriptedModel(answers))
+    # These tests script ask/verify pairs; the refine pass would consume the
+    # verify answers. The grid changes no call sequence but is off for parity.
+    monkeypatch.setattr(llm_boxes, "LLM_BBOX_REFINE", False)
+    monkeypatch.setattr(llm_boxes, "LLM_BBOX_GRIDLINES", False)
     doc = analysis.load_document_bytes(_png_bytes(), "page.png", "image/png")
     return asyncio.run(
         analysis.analyze_document(

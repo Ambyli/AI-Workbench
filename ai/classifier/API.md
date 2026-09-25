@@ -488,11 +488,20 @@ here trusts the first answer:
 
 ```
 attempt 1 ── ask ────── one criterion, the ONE page image the scoring call
-   │                    used, a box as [x1,y1,x2,y2] on a 0–1000 grid
+   │                    used — with a labelled 0–1000 coordinate grid drawn
+   │                    on it (CLASSIFIER_LLM_BBOX_GRIDLINES, lines every
+   │                    CLASSIFIER_LLM_BBOX_GRID_STEP units, numbered along
+   │                    every edge) — a box as [x1,y1,x2,y2] on that grid
    ├── validate ─────── four finite numbers, x1<x2, y1<y2, inside the grid,
    │                    area between CLASSIFIER_LLM_BBOX_MIN_AREA (0.2%) and
    │                    _MAX_AREA (95%)
-   ├── verify ───────── crop that box out of the ORIGINAL page (+10% padding,
+   ├── refine ───────── (CLASSIFIER_LLM_BBOX_REFINE) crop the ORIGINAL page
+   │                    around the coarse box — _REFINE_ZOOM (2.5) × the box,
+   │                    at least _REFINE_MIN_SPAN (20%) of the page — draw
+   │                    the grid on the crop, ask again, map the answer back
+   │                    into the page frame. An unusable second answer keeps
+   │                    the coarse box; both are recorded
+   ├── verify ───────── crop that box out of the ORIGINAL page (+25% padding,
    │                    CLASSIFIER_LLM_BBOX_CROP_PAD), send the CROP ALONE:
    │                    "is <criterion> visible in this? 1–10". Accept at
    │                    CLASSIFIER_LLM_BBOX_VERIFY_PASS (7)
@@ -509,6 +518,21 @@ The verify call is what makes a box mean something: the page is deliberately
 of a photo it was already told contains the feature is not evidence, while one
 that recognises the feature in 300×300 isolated pixels is. (It is also the
 one-image-per-prompt rule — vLLM accepts one image per request either way.)
+
+**Why the grid and the second pass.** Measured on the two photographed
+utility bills in `unit-tests/classifier/documents/` (80 asks, 8 features, 5
+ways of asking), the coordinate contract itself is sound — synthetic markers
+come back with slope 0.96–1.03 on both axes at every aspect ratio — but on a
+dense real document the model places a text-sized feature with the right x
+and a y that is 25–100 grid units off, on a line 30 units tall, so the
+verify crop lands on the wood grain above the header. Drawing a labelled
+grid on the ask image halved that error; asking a second time on a zoomed
+crop of the original with its own grid brought hits on the four "amount due"
+lines from 0/8 to 7/8 and the mean y error from 48 units to 2.4. Both are on
+by default and both are recorded on the attempt, so a box can always be
+traced back to what the model first said. What the second pass cannot fix is
+*identification*: asked for a logo, a model that boxes the heading naming the
+same company 90 units lower is precisely placed on the wrong thing.
 
 **When it runs.** All four have to hold, or the loop costs nothing:
 
@@ -543,10 +567,12 @@ about the model, and it is renderable on its own:
        "reject": "your previous box [0, 0, 1000, 1000] covered 100% of the image — a full-frame box is not a location; try again, smaller"},
       {"attempt": 2, "bbox_grid": [240, 640, 420, 860], "bbox_px": [216, 448, 378, 602],
        "valid": true, "accepted": true, "verify_score": 9,
-       "verify_reason": "a roof covered in panels", "detector_iou": 0.71}
+       "verify_reason": "a roof covered in panels", "detector_iou": 0.71,
+       "coarse_bbox_grid": [230, 600, 430, 880], "refine_window_grid": [80, 400, 580, 1000],
+       "refined": true}
     ],
     "accepted_attempt": 2,
-    "calls": 3
+    "calls": 4
   },
   "artifacts": {
     "slug": "has-solar-panels-9c1e",
@@ -564,6 +590,13 @@ about the model, and it is renderable on its own:
 `accepted_attempt` is `null` when nothing was accepted; `regions` then holds
 only rejected boxes and the criterion's score is untouched.
 
+`coarse_bbox_grid`, `refine_window_grid` and `refined` appear on an attempt
+whose coarse box validated and so went through the refine pass: `bbox_grid`
+is then the refined box when `refined` is `true`, and the coarse box kept
+(with a `refine_reject` sentence) when it is `false`. An attempt the
+validator rejected never reaches the pass and carries none of the three.
+Each stored region from the loop carries `attrs.refined` the same way.
+
 **The combined layer shows the accepted box only.** Three overlapping boxes
 for one criterion, two of which the loop itself threw away, is not a picture of
 anything — so the stored `p{n}.svg` and any `?criterion=` render with no
@@ -578,8 +611,9 @@ try again, smaller", "the crop of your previous box … did not show <criterion>
 (verify score 3); look elsewhere". Changing them changes the retry behaviour,
 not just the log.
 
-**Cost.** One ask per attempt plus one verify per attempt whose box validated
-— at most six small calls per located criterion, each capped at
+**Cost.** One ask per attempt, plus one refine and one verify per attempt
+whose coarse box validated — at most nine small calls per located criterion
+(six with `CLASSIFIER_LLM_BBOX_REFINE=false`), each capped at
 `CLASSIFIER_LLM_BBOX_MAX_TOKENS` (1024, most of which is reasoning). The job's
 single scoring call is unchanged. Metric:
 `classifier_llm_bbox_attempts_total{outcome=accepted|rejected_invalid|rejected_verify|exhausted}`.

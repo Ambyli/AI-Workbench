@@ -208,6 +208,7 @@ async def run(args) -> dict:
                 geometry=geometry,
                 detector_regions=detector.get(label),
                 max_attempts=args.attempts,
+                working_image=working,
             )
             elapsed = time.monotonic() - t0
             first = loc.attempts[0] if loc.attempts else None

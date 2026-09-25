@@ -488,6 +488,11 @@ async def analyze_document(
             original_image=original_page.image_bgr if original_page else None,
             geometry=geometries[prompt_page],
             detector_regions=region_map,
+            # The same ≤1000-px pixels image_b64 was encoded from, so the loop
+            # can draw its coordinate grid on them for the ask.
+            working_image=next(
+                (img for idx, img in working_images if idx == prompt_page), None
+            ),
         )
         for name, found in llm_regions.items():
             region_map.setdefault(name, []).extend(found)

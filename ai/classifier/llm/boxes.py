@@ -6,12 +6,23 @@ is "somewhere in the top half" — and in every one of those cases the answer is
 four numbers that look exactly like a correct one. A box from a model is a
 claim, not a measurement, so nothing here trusts one:
 
-    ask      one criterion, the ONE page image the scoring call used, a box on
-             a 0-1000 grid.                      (llm.prompts.build_bbox_prompt)
+    ask      one criterion, the ONE page image the scoring call used — with a
+             labelled 0-1000 coordinate grid drawn on it (LLM_BBOX_GRIDLINES,
+             common.vision.draw_grid_overlay) so the model reads a position
+             off a ruler instead of estimating a fraction of the frame — and
+             a box on that grid.                 (llm.prompts.build_bbox_prompt)
     validate four finite numbers, x1 < x2, y1 < y2, inside the grid, area
              between LLM_BBOX_MIN_AREA and LLM_BBOX_MAX_AREA. A full-frame box
              is a refusal dressed as an answer, and it is the single most
              common failure.
+    refine   (LLM_BBOX_REFINE) crop the ORIGINAL page around the coarse box —
+             LLM_BBOX_REFINE_ZOOM × the box on each axis, at least
+             LLM_BBOX_REFINE_MIN_SPAN of the page — draw the grid on the crop,
+             ask again, and map the answer back into the page frame. Measured
+             on photographed bills, the coarse box put a text line 25-100 grid
+             units off on one axis and the refined one lands within a few;
+             the coarse box is kept when the second answer is unusable, and
+             both are recorded (``coarse_bbox_grid``, ``refined``).
     verify    crop that box out of the ORIGINAL page (+LLM_BBOX_CROP_PAD on
              each side), send the crop ALONE, and ask whether the feature is
              visible in it. Accept at LLM_BBOX_VERIFY_PASS or better.
@@ -34,10 +45,11 @@ all (below LLM_BBOX_PRESENCE_MIN the model just said the feature is absent, so
 there is not), and only ever adds keys. A criterion whose every attempt was
 rejected keeps its score and comes back with ``accepted_attempt: null``.
 
-Cost: one ask per attempt, plus one verify per attempt whose box validated —
-so at most ``2 × LLM_BBOX_MAX_ATTEMPTS`` small calls per located criterion, on
-top of the single scoring call the whole job shares. That is why the loop is
-opt-in (``regions.llm_boxes``) and gated on the presence score.
+Cost: one ask per attempt, plus one refine and one verify per attempt whose
+box validated — so at most ``3 × LLM_BBOX_MAX_ATTEMPTS`` small calls per
+located criterion, on top of the single scoring call the whole job shares.
+That is why the loop is opt-in (``regions.llm_boxes``) and gated on the
+presence score.
 
 Process flow position: called from ``analysis.pipeline.analyze_document`` step
 6.5, after the scoring call and before the regions are written.
@@ -49,17 +61,23 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from common.vision import PageGeometry, Region, grid_to_pixels, iou
+from common.vision import PageGeometry, Region, draw_grid_overlay, grid_to_pixels, iou
 
 from api.schemas import CriterionInput
 from config import (
     LLM_BBOX_CROP_PAD,
     LLM_BBOX_GRID,
+    LLM_BBOX_GRID_STEP,
+    LLM_BBOX_GRIDLINES,
     LLM_BBOX_MAX_AREA,
     LLM_BBOX_MAX_ATTEMPTS,
     LLM_BBOX_MIN_AREA,
     LLM_BBOX_PRESENCE_MIN,
+    LLM_BBOX_REFINE,
+    LLM_BBOX_REFINE_MIN_SPAN,
+    LLM_BBOX_REFINE_ZOOM,
     LLM_BBOX_VERIFY_PASS,
+    MAX_WORKING_DIMENSION,
 )
 # Imported as modules, not by name, so a test can script the model by
 # replacing `llm.client.call_vllm_json` — the same reason the pipeline imports
@@ -91,6 +109,12 @@ class BoxAttempt:
         detector_iou:  Overlap with the detector's best box for the same
                        criterion, or None when there was none to compare to.
         accepted:      valid AND verify_score >= LLM_BBOX_VERIFY_PASS.
+        coarse_bbox_grid:   The first answer, before the refine pass moved it.
+                            None when no refine pass ran; then ``bbox_grid``
+                            IS the first answer.
+        refine_window_grid: The page-frame window the refine crop covered.
+        refined:       True when ``bbox_grid`` came from the refine pass.
+        refine_reject: Why the refine answer was not used, when it was not.
     """
 
     attempt: int
@@ -102,6 +126,10 @@ class BoxAttempt:
     verify_reason: Optional[str] = None
     detector_iou: Optional[float] = None
     accepted: bool = False
+    coarse_bbox_grid: Optional[list[float]] = None
+    refine_window_grid: Optional[list[float]] = None
+    refined: bool = False
+    refine_reject: Optional[str] = None
 
     def as_dict(self) -> dict[str, Any]:
         """JSON-safe view for ``localization.attempts`` and regions.json.
@@ -126,6 +154,14 @@ class BoxAttempt:
             out["verify_reason"] = self.verify_reason
         if self.detector_iou is not None:
             out["detector_iou"] = round(self.detector_iou, 4)
+        if self.coarse_bbox_grid is not None:
+            out["coarse_bbox_grid"] = [round(v, 1) for v in self.coarse_bbox_grid]
+            out["refine_window_grid"] = (
+                [round(v, 1) for v in self.refine_window_grid] if self.refine_window_grid else None
+            )
+            out["refined"] = self.refined
+            if self.refine_reject:
+                out["refine_reject"] = self.refine_reject
         return out
 
     def as_region(self, name: str, geometry: PageGeometry) -> Optional[Region]:
@@ -146,6 +182,8 @@ class BoxAttempt:
             attrs["verify_score"] = self.verify_score
         if self.detector_iou is not None:
             attrs["detector_iou"] = round(self.detector_iou, 4)
+        if self.coarse_bbox_grid is not None:
+            attrs["refined"] = self.refined
         if self.reject:
             attrs["reject"] = self.reject
         return Region(
@@ -358,29 +396,51 @@ async def locate_criterion(
     geometry: PageGeometry,
     detector_regions: Optional[list[Region]] = None,
     max_attempts: int = LLM_BBOX_MAX_ATTEMPTS,
+    working_image: Any = None,
+    gridlines: Optional[bool] = None,
+    refine: Optional[bool] = None,
 ) -> tuple[list[Region], Localization]:
-    """Run the full ask → validate → verify → retry loop for one criterion.
+    """Run the full ask → validate → refine → verify → retry loop for one criterion.
 
     Args:
         name:             The criterion to locate.
         image_b64:        Base64 JPEG of the ONE page image the scoring call
                           used — the model has to answer about the picture it
-                          was scored on.
+                          was scored on. This is what the ask sees when there
+                          is no ``working_image`` to draw the grid on.
         original_image:   BGR array of that page at ORIGINAL size, for crops.
         geometry:         That page's frame; the 0-1000 grid converts through
                           it straight into original pixels.
         detector_regions: Phase 2's ``source="detector"`` boxes for the same
                           criterion, for the IoU cross-check. Informational.
         max_attempts:     Override for LLM_BBOX_MAX_ATTEMPTS (tests).
+        working_image:    BGR array of the ≤MAX_WORKING_DIMENSION page the
+                          scoring call's image was encoded from — the same
+                          pixels, so drawing the grid on it changes nothing
+                          the model was scored on. None → no grid on the ask.
+        gridlines:        Draw the grid (default LLM_BBOX_GRIDLINES).
+        refine:           Run the zoomed second pass (default LLM_BBOX_REFINE).
 
     Returns:
         ``(regions, localization)``. ``regions`` holds one Region per attempt
         that had a drawable box, accepted first; ``localization`` records
         every attempt including the undrawable ones.
     """
+    if gridlines is None:
+        gridlines = LLM_BBOX_GRIDLINES
+    if refine is None:
+        refine = LLM_BBOX_REFINE
     loc = Localization()
     feedback: list[str] = []
     best_detector = _best_detector_region(detector_regions)
+
+    ask_b64 = ask_image_b64(image_b64, working_image, gridlines=gridlines)
+    grid_on_ask = ask_b64 is not image_b64
+    if gridlines and not grid_on_ask:
+        logger.debug(
+            "locate_criterion: '%s' — no working image to draw the grid on; "
+            "asking on the bare page image", name,
+        )
 
     for number in range(1, max_attempts + 1):
         attempt = BoxAttempt(attempt=number)
@@ -389,7 +449,10 @@ async def locate_criterion(
         # Step 1 — ask.
         loc.calls += 1
         answer = await client.call_vllm_json(
-            prompts.build_bbox_prompt(image_b64, name, feedback=feedback),
+            prompts.build_bbox_prompt(
+                ask_b64, name, feedback=feedback,
+                gridlines=grid_on_ask, grid_step=LLM_BBOX_GRID_STEP,
+            ),
             label=f"bbox/{name}#{number}",
         )
         if answer is None:
@@ -407,10 +470,7 @@ async def locate_criterion(
         if bbox is not None:
             points = grid_to_pixels(bbox, geometry, LLM_BBOX_GRID)
             attempt.bbox_px = _clamped_box(points, geometry)
-            if best_detector is not None:
-                region = attempt.as_region(name, geometry)
-                if region is not None:
-                    attempt.detector_iou = iou(region, best_detector)
+            _cross_check(attempt, name, geometry, best_detector)
         if reject:
             attempt.reject = reject
             llm_bbox_attempts.labels(outcome="rejected_invalid").inc()
@@ -430,6 +490,58 @@ async def locate_criterion(
             feedback.append(reject)
             continue
         attempt.valid = True
+
+        # Step 2.5 — refine on a zoomed crop of the ORIGINAL page. The coarse
+        # box already validated; the refined one only has to be a usable box
+        # inside the window (no area floor — the whole point is that it may
+        # be a thin text line the coarse box overshot).
+        if refine and bbox is not None:
+            window = refine_window(
+                bbox, zoom=LLM_BBOX_REFINE_ZOOM, min_span=LLM_BBOX_REFINE_MIN_SPAN
+            )
+            attempt.coarse_bbox_grid = list(bbox)
+            attempt.refine_window_grid = window
+            crop = crop_window(original_image, window)
+            if crop is None:
+                attempt.refine_reject = (
+                    "the page image was not available to crop for the refine pass"
+                )
+            else:
+                loc.calls += 1
+                fine = await client.call_vllm_json(
+                    prompts.build_bbox_prompt(
+                        client.encode_image_to_base64(
+                            _with_grid(crop) if gridlines else crop
+                        ),
+                        name, gridlines=gridlines, grid_step=LLM_BBOX_GRID_STEP,
+                        zoomed=True,
+                    ),
+                    label=f"refine/{name}#{number}",
+                )
+                fine_bbox, fine_reject = (
+                    validate_bbox(fine.get("bbox"), present="bbox" in fine)
+                    if isinstance(fine, dict)
+                    else (None, "the model did not return a usable answer for the refine pass")
+                )
+                if fine_bbox is not None and fine_reject is None:
+                    bbox = window_to_full(fine_bbox, window)
+                    attempt.refined = True
+                    attempt.bbox_grid = bbox
+                    attempt.bbox_px = _clamped_box(
+                        grid_to_pixels(bbox, geometry, LLM_BBOX_GRID), geometry
+                    )
+                    logger.info(
+                        "locate_criterion: '%s' attempt %d refined %s → %s (window %s)",
+                        name, number, _fmt(attempt.coarse_bbox_grid), _fmt(bbox), _fmt(window),
+                    )
+                else:
+                    attempt.refine_reject = fine_reject or "unusable refine answer"
+                    logger.info(
+                        "locate_criterion: '%s' attempt %d kept the coarse box %s — "
+                        "refine pass: %s",
+                        name, number, _fmt(bbox), attempt.refine_reject,
+                    )
+            _cross_check(attempt, name, geometry, best_detector)
 
         # Step 3 — verify by crop. The ONE image in this call is the crop.
         crop = crop_for(original_image, attempt.bbox_px or [])
@@ -492,6 +604,7 @@ async def locate_criteria(
     original_image: Any,
     geometry: Optional[PageGeometry],
     detector_regions: Optional[dict[str, list[Region]]] = None,
+    working_image: Any = None,
 ) -> tuple[dict[str, list[Region]], dict[str, dict]]:
     """Run the loop for every criterion that qualifies.
 
@@ -510,6 +623,9 @@ async def locate_criteria(
         original_image:       BGR array of that page at original size.
         geometry:             That page's frame, or None.
         detector_regions:     ``{criterion: [Region, ...]}`` from phase 2.
+        working_image:        BGR array of the ≤MAX_WORKING_DIMENSION page
+                              ``image_b64`` was encoded from, for the grid
+                              overlay. None → the ask sees the bare image.
 
     Returns:
         ``({criterion: [Region, ...]}, {criterion: localization dict})`` —
@@ -541,6 +657,7 @@ async def locate_criteria(
             original_image=original_image,
             geometry=geometry,
             detector_regions=(detector_regions or {}).get(c.name),
+            working_image=working_image,
         )
         regions[c.name] = found
         localizations[c.name] = loc.as_dict()
@@ -548,8 +665,103 @@ async def locate_criteria(
 
 
 # ---------------------------------------------------------------------------
+# The grid, and the refine window
+# ---------------------------------------------------------------------------
+
+
+def ask_image_b64(image_b64: str, working_image: Any, *, gridlines: bool) -> str:
+    """The image the ASK sees: the working page with the grid drawn on it
+    when ``gridlines`` is on and the page is available, else ``image_b64``
+    itself (identity, so a caller can tell which happened with ``is``)."""
+    if not gridlines or working_image is None or getattr(working_image, "size", 0) == 0:
+        return image_b64
+    return client.encode_image_to_base64(_with_grid(working_image))
+
+
+def _with_grid(image_bgr: Any) -> Any:
+    """A BGR array → the same array with the labelled grid burned in, BGR."""
+    import numpy as np
+
+    rgb = np.ascontiguousarray(np.asarray(image_bgr)[:, :, ::-1])
+    gridded = draw_grid_overlay(rgb, grid=LLM_BBOX_GRID, step=LLM_BBOX_GRID_STEP)
+    return np.ascontiguousarray(np.asarray(gridded)[:, :, ::-1])
+
+
+def refine_window(
+    bbox: list[float], *, zoom: float, min_span: float, grid: float = LLM_BBOX_GRID
+) -> list[float]:
+    """The page-frame window the refine crop covers, in grid units.
+
+    ``zoom`` × the coarse box on each axis, centred on it, never narrower
+    than ``min_span`` of the page on either axis, clamped to the page. Wide
+    enough that a coarse box 25-100 units off still has the feature inside
+    the crop; tight enough that the feature is large in the crop, which is
+    what makes the second answer precise.
+    """
+    x1, y1, x2, y2 = bbox
+    cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+    w = max((x2 - x1) * zoom, grid * min_span)
+    h = max((y2 - y1) * zoom, grid * min_span)
+    return [
+        max(0.0, cx - w / 2), max(0.0, cy - h / 2),
+        min(grid, cx + w / 2), min(grid, cy + h / 2),
+    ]
+
+
+def crop_window(image: Any, window: list[float], *, grid: float = LLM_BBOX_GRID) -> Optional[Any]:
+    """Cut a grid-unit ``window`` out of the ORIGINAL page and bring it to
+    the working size, so the refine crop has the same pixel budget as the
+    page the coarse answer came from. None when there is no image."""
+    if image is None or getattr(image, "size", 0) == 0:
+        return None
+    height, width = image.shape[:2]
+    x1, y1, x2, y2 = window
+    left = max(0, int(math.floor(x1 * width / grid)))
+    top = max(0, int(math.floor(y1 * height / grid)))
+    right = min(width, int(math.ceil(x2 * width / grid)))
+    bottom = min(height, int(math.ceil(y2 * height / grid)))
+    right = max(right, left + 1)
+    bottom = max(bottom, top + 1)
+    crop = image[top:bottom, left:right]
+    h, w = crop.shape[:2]
+    if max(h, w) > MAX_WORKING_DIMENSION:
+        import cv2
+
+        scale = MAX_WORKING_DIMENSION / max(h, w)
+        crop = cv2.resize(
+            crop, (max(1, int(w * scale)), max(1, int(h * scale))),
+            interpolation=cv2.INTER_AREA,
+        )
+    return crop
+
+
+def window_to_full(
+    bbox: list[float], window: list[float], *, grid: float = LLM_BBOX_GRID
+) -> list[float]:
+    """A box on the crop's own 0-``grid`` frame → the page's grid frame."""
+    wx1, wy1, wx2, wy2 = window
+    ww, wh = wx2 - wx1, wy2 - wy1
+    x1, y1, x2, y2 = bbox
+    return [
+        wx1 + x1 / grid * ww, wy1 + y1 / grid * wh,
+        wx1 + x2 / grid * ww, wy1 + y2 / grid * wh,
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Small helpers
 # ---------------------------------------------------------------------------
+
+
+def _cross_check(
+    attempt: BoxAttempt, name: str, geometry: PageGeometry, best_detector: Optional[Region]
+) -> None:
+    """Record the IoU against the detector's best box, when there is one."""
+    if best_detector is None or not attempt.bbox_px:
+        return
+    region = attempt.as_region(name, geometry)
+    if region is not None:
+        attempt.detector_iou = iou(region, best_detector)
 
 
 def _clamped_box(points: list[tuple[float, float]], geometry: PageGeometry) -> list[float]:

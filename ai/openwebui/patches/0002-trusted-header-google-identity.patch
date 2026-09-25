@@ -1,6 +1,6 @@
 Zeo patch 0002 — verify trusted-header sign-ins with Google; take name + picture.
 
-Target: Open WebUI v0.11.3 (ghcr.io/open-webui/open-webui:v0.11.3).
+Target: Open WebUI v0.11.4 (ghcr.io/open-webui/open-webui:v0.11.4).
 Applied by ai/openwebui/Dockerfile.openwebui with `patch -p1` from /app.
 
 Adds env var WEBUI_AUTH_TRUSTED_ACCESS_TOKEN_HEADER (default empty = feature
@@ -16,9 +16,9 @@ Files: backend/open_webui/env.py, backend/open_webui/routers/auths.py,
        backend/open_webui/utils/trusted_proxy.py (new).
 See ai/openwebui/OPENWEBUI.md § Single sign-on and § Custom image.
 
---- a/backend/open_webui/env.py	2026-09-10 16:32:19.260859400 -0600
-+++ b/backend/open_webui/env.py	2026-09-10 16:32:19.291986200 -0600
-@@ -789,6 +789,15 @@
+--- a/backend/open_webui/env.py	2026-09-25 13:19:43.866544300 -0600
++++ b/backend/open_webui/env.py	2026-09-25 13:19:44.137500400 -0600
+@@ -804,6 +804,15 @@
  WEBUI_AUTH_TRUSTED_GROUPS_HEADER = os.getenv('WEBUI_AUTH_TRUSTED_GROUPS_HEADER', None)
  WEBUI_AUTH_TRUSTED_ROLE_HEADER = os.getenv('WEBUI_AUTH_TRUSTED_ROLE_HEADER', None)
  
@@ -34,8 +34,8 @@ See ai/openwebui/OPENWEBUI.md § Single sign-on and § Custom image.
  # Custom header name for API key authentication.  Defaults to 'x-api-key'.
  # Useful when Open WebUI sits behind a reverse proxy / API gateway that
  # already uses the Authorization header for its own authentication — set
---- a/backend/open_webui/routers/auths.py	2026-09-10 16:32:19.263122700 -0600
-+++ b/backend/open_webui/routers/auths.py	2026-09-10 16:32:19.347175200 -0600
+--- a/backend/open_webui/routers/auths.py	2026-09-25 13:19:43.870272700 -0600
++++ b/backend/open_webui/routers/auths.py	2026-09-25 13:19:44.430221100 -0600
 @@ -32,6 +32,7 @@
      WEBUI_AUTH_COOKIE_SAME_SITE,
      WEBUI_AUTH_COOKIE_SECURE,
@@ -45,14 +45,14 @@ See ai/openwebui/OPENWEBUI.md § Single sign-on and § Custom image.
      WEBUI_AUTH_TRUSTED_GROUPS_HEADER,
      WEBUI_AUTH_TRUSTED_NAME_HEADER,
 @@ -78,6 +79,7 @@
+ from open_webui.utils.json_codec import JSONCodec
  from open_webui.utils.misc import parse_duration, validate_email_format
  from open_webui.utils.rate_limit import RateLimiter
- from open_webui.utils.redis import get_redis_client
 +from open_webui.utils.trusted_proxy import verify_google_identity
- from pydantic import BaseModel
+ from pydantic import BaseModel, StrictStr, field_validator
  from sqlalchemy.exc import IntegrityError
  from sqlalchemy.ext.asyncio import AsyncSession
-@@ -743,13 +745,32 @@
+@@ -744,13 +746,32 @@
              except Exception as e:
                  pass
  
@@ -85,7 +85,7 @@ See ai/openwebui/OPENWEBUI.md § Single sign-on and § Custom image.
                      db=db,
                      source='trusted_header',
                  )
-@@ -759,6 +780,15 @@
+@@ -760,6 +781,15 @@
  
          user = await Auths.authenticate_user_by_email(email, db=db)
          if user:
@@ -101,8 +101,8 @@ See ai/openwebui/OPENWEBUI.md § Single sign-on and § Custom image.
              if WEBUI_AUTH_TRUSTED_GROUPS_HEADER:
                  group_names = request.headers.get(WEBUI_AUTH_TRUSTED_GROUPS_HEADER, '').split(',')
                  group_names = [name.strip() for name in group_names if name.strip()]
---- /dev/null	2026-09-10 16:32:19.000000000 -0600
-+++ b/backend/open_webui/utils/trusted_proxy.py	2026-09-10 16:32:19.273972700 -0600
+--- /dev/null	2026-09-25 13:20:05.000000000 -0600
++++ b/backend/open_webui/utils/trusted_proxy.py	2026-09-25 13:19:44.210154700 -0600
 @@ -0,0 +1,97 @@
 +"""ZEO PATCH — ai/openwebui/patches/0002-trusted-header-google-identity.patch.
 +

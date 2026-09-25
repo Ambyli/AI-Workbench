@@ -249,29 +249,27 @@
     }
   },
 
-  "_pipelines": "The entries below belong to `--pipeline utility-bill` (regions_report.py § Pipelines). The three stage names are the keys for the per-stage checks, exactly like collection items; `pipeline: utility bill` carries the chain-level assertions: is_utility (stage 1's gate), region_found (stage 2 produced at least one candidate) and amount_due (the figure stage 3 read from the crop, OCR first). The text rows are the deterministic OCR path on unit-tests/classifier/documents/utility_bill.jpeg; the llm rows are null as everywhere else.",
+  "_pipelines": "The entries below belong to `--pipeline utility-bill` (regions_report.py § Pipelines), one set per committed bill in unit-tests/classifier/documents/. Keys are `<stage name> — <file name>` for the per-stage checks, exactly like collection items, and `pipeline: utility bill — <file name>` for the chain-level assertions: is_utility (stage 1's gate), region_found (stage 2 produced at least one candidate) and amount_due (the figure stage 3 read from the crop, OCR first). The text rows are the deterministic OCR path; the llm rows are null as everywhere else. An ad-hoc --document has no entries and its checks are recorded as skipped.",
 
-  "utility bill · 1 — is this a utility bill?": {
+  "utility bill · 1 — is this a utility bill? — utility_bill.jpeg": {
     "verdict": "PASS",
     "criteria": {
       "Amount Due": { "verdict": "PASS", "min_regions": 1 },
       "Account Number": { "verdict": "PASS", "min_regions": 1 },
-      "billing period": { "verdict": "PASS", "min_regions": 1 },
+      "billing period or date": { "verdict": "PASS", "min_regions": 1 },
       "usage units": { "verdict": "PASS", "min_regions": 1 },
       "is a utility bill (electric, gas or water) issued by a utility company": { "verdict": null },
       "document legibility": { "verdict": null }
     }
   },
-
-  "utility bill · 2 — where is the amount due?": {
+  "utility bill · 2 — where is the amount due? — utility_bill.jpeg": {
     "criteria": {
-      "Amount Due": { "verdict": null, "min_regions": 1 },
+      "Amount Due": { "verdict": null, "min_regions": 3 },
       "Total Due": { "verdict": null, "min_regions": 0 },
       "the amount due line: the words 'Amount Due' next to the dollar figure owed": { "verdict": null, "min_regions": 0 }
     }
   },
-
-  "utility bill · 3 — read the amount due inside that region": {
+  "utility bill · 3 — read the amount due inside that region — utility_bill.jpeg": {
     "verdict": null,
     "criteria": {
       "dollar amount": { "verdict": "PASS", "min_regions": 1 },
@@ -279,10 +277,41 @@
       "the amount due dollar figure is legible (state the exact figure in the reason)": { "verdict": null }
     }
   },
-
-  "pipeline: utility bill": {
+  "pipeline: utility bill — utility_bill.jpeg": {
     "is_utility": true,
     "region_found": true,
     "amount_due": "$80.49"
+  },
+
+  "utility bill · 1 — is this a utility bill? — utility_bill_2.jpeg": {
+    "verdict": "PASS",
+    "criteria": {
+      "Amount Due": { "verdict": "PASS", "min_regions": 1 },
+      "Account Number": { "verdict": "PASS", "min_regions": 1 },
+      "billing period or date": { "verdict": "PASS", "min_regions": 1 },
+      "usage units": { "verdict": "PASS", "min_regions": 1 },
+      "is a utility bill (electric, gas or water) issued by a utility company": { "verdict": null },
+      "document legibility": { "verdict": null }
+    }
+  },
+  "utility bill · 2 — where is the amount due? — utility_bill_2.jpeg": {
+    "criteria": {
+      "Amount Due": { "verdict": null, "min_regions": 2 },
+      "Total Due": { "verdict": null, "min_regions": 0 },
+      "the amount due line: the words 'Amount Due' next to the dollar figure owed": { "verdict": null, "min_regions": 0 }
+    }
+  },
+  "utility bill · 3 — read the amount due inside that region — utility_bill_2.jpeg": {
+    "verdict": null,
+    "criteria": {
+      "dollar amount": { "verdict": "PASS", "min_regions": 1 },
+      "Amount Due": { "verdict": "PASS", "min_regions": 1 },
+      "the amount due dollar figure is legible (state the exact figure in the reason)": { "verdict": null }
+    }
+  },
+  "pipeline: utility bill — utility_bill_2.jpeg": {
+    "is_utility": true,
+    "region_found": true,
+    "amount_due": "$193.33"
   }
 }

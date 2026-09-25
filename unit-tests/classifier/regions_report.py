@@ -41,7 +41,7 @@ the suite.
 
 **Pipelines** are the one thing the collection cannot express: a call whose
 request is built from the previous call's answer. ``--pipeline utility-bill``
-runs three chained calls against a photographed utility bill — is this a bill
+runs three chained calls against each committed bill photo — is this a bill
 at all → where is the amount due → read the figure inside that region — with
 the crop between stages 2 and 3 done here, on the original pixels::
 
@@ -53,8 +53,10 @@ the crop between stages 2 and 3 done here, on the original pixels::
         --pipeline utility-bill --document ~/Downloads/some_other_bill.jpg
 
 Each stage is an ordinary case in the report; the pipeline section above them
-shows what each stage decided and the value that came out. See § Pipelines
-below.
+shows what each stage decided and the value that came out. An ad-hoc
+``--document`` (repeatable) replaces the fixture list and has no expectations:
+its checks are recorded as skipped, its answer is still reported. See
+§ Pipelines below.
 """
 
 from __future__ import annotations
@@ -173,6 +175,9 @@ class Case:
     # Key into regions_expected.json when it is not the item name — a pipeline
     # stage retried on a second candidate keeps one expectations entry.
     expect_key: Optional[str] = None
+    # An ad-hoc --document has no entry to be right or wrong against: a missing
+    # expectation is then recorded as skipped instead of failing coverage.
+    adhoc: bool = False
 
     @property
     def slug(self) -> str:
@@ -933,12 +938,26 @@ UTILITY_BILL_PIPELINE = "utility-bill"
 PIPELINES = (UTILITY_BILL_PIPELINE,)
 PIPELINE_FOLDER = "Pipeline: utility bill"
 PIPELINE_EXPECT_KEY = "pipeline: utility bill"
-DEFAULT_UTILITY_BILL = REPO_ROOT / "unit-tests" / "classifier" / "documents" / "utility_bill.jpeg"
 
-# Stage names double as keys into regions_expected.json.
+# The bills the pipeline runs on when --document is not given. Two layouts on
+# purpose: an Ohio Edison bill that prints "Amount Due: $80.49" on one line,
+# and an AEP Ohio bill whose label ("Amount due on or before") and figure
+# ("$193.33") are separate OCR lines on the same row.
+UTILITY_BILL_FIXTURES = (
+    REPO_ROOT / "unit-tests" / "classifier" / "documents" / "utility_bill.jpeg",
+    REPO_ROOT / "unit-tests" / "classifier" / "documents" / "utility_bill_2.jpeg",
+)
+
+# Stage names, suffixed with the document's file name, are the keys into
+# regions_expected.json — the same stage on a different bill has different
+# deterministic answers.
 STAGE_1_NAME = "utility bill · 1 — is this a utility bill?"
 STAGE_2_NAME = "utility bill · 2 — where is the amount due?"
 STAGE_3_NAME = "utility bill · 3 — read the amount due inside that region"
+
+
+def _stage_name(stage: str, document: pathlib.Path) -> str:
+    return f"{stage} — {document.name}"
 
 LABEL_CRITERION = "Amount Due"
 LABEL_FEATURES = ("Amount Due", "Total Due")
@@ -957,7 +976,9 @@ CURRENCY_RE = re.compile(
 STAGE_1_CRITERIA: list[dict] = [
     {"name": LABEL_CRITERION, "type": "text", "match": "fuzzy", "fuzzy_threshold": 0.8, "weight": 3.0},
     {"name": "Account Number", "type": "text", "match": "fuzzy", "fuzzy_threshold": 0.8, "weight": 2.0},
-    {"name": "billing period", "type": "text", "match": "fuzzy", "fuzzy_threshold": 0.8, "weight": 1.0},
+    {"name": "billing period or date", "type": "text", "match": "regex",
+     "pattern": r"(?i)\b(billing (?:period|from|date)|service (?:period|dates?)|bill(?:ing)? mailing date|statement date)\b",
+     "weight": 1.0},
     {"name": "usage units", "type": "text", "match": "regex",
      "pattern": r"(?i)\b(kwh|ccf|hcf|mcf|therms?|gallons?)\b", "weight": 1.0},
     {"name": UTILITY_LLM_CRITERION, "type": "llm", "hint": "presence", "weight": 4.0},
@@ -1010,8 +1031,13 @@ class PipelineResult:
     value_source: Optional[str] = None     # "ocr" | "llm-reason"
     llm_reading: Optional[str] = None
     stopped_at: Optional[str] = None
+    adhoc: bool = False
     notes: list[str] = dataclasses.field(default_factory=list)
     checks: list[dict] = dataclasses.field(default_factory=list)
+
+    @property
+    def expect_key(self) -> str:
+        return f"{PIPELINE_EXPECT_KEY} — {self.document.name}"
 
     @property
     def results(self) -> list[CaseResult]:
@@ -1031,6 +1057,7 @@ def _stage_case(
     *,
     description: str = "",
     expect_key: Optional[str] = None,
+    adhoc: bool = False,
 ) -> Case:
     return Case(
         name=name,
@@ -1044,6 +1071,7 @@ def _stage_case(
         upload=upload,
         subject=upload,
         expect_key=expect_key,
+        adhoc=adhoc,
     )
 
 
@@ -1058,14 +1086,15 @@ def run_utility_bill_pipeline(
     args: argparse.Namespace,
     *,
     first_index: int,
+    adhoc: bool = False,
 ) -> PipelineResult:
     """Gate → locate → read, stopping at the first stage that has no answer."""
-    pipe = PipelineResult(name=UTILITY_BILL_PIPELINE, document=document)
+    pipe = PipelineResult(name=UTILITY_BILL_PIPELINE, document=document, adhoc=adhoc)
     index = first_index
 
     # -- stage 1: is this a utility bill? ------------------------------------
     case = _stage_case(
-        index, STAGE_1_NAME, "/v1/classifier/assess", document,
+        index, _stage_name(STAGE_1_NAME, document), "/v1/classifier/assess", document,
         {
             "ocr": "always",
             "regions": "svg,preview",
@@ -1078,6 +1107,7 @@ def run_utility_bill_pipeline(
             "under --local where it is dropped, on the text criteria alone). "
             "Expect the four text criteria to hit on the OCR'd page."
         ),
+        adhoc=adhoc,
     )
     r1 = run_case(case, transport, out_root, args)
     index += 1
@@ -1101,7 +1131,7 @@ def run_utility_bill_pipeline(
 
     # -- stage 2: where is the amount due? -----------------------------------
     case = _stage_case(
-        index, STAGE_2_NAME, "/v1/classifier/locate", document,
+        index, _stage_name(STAGE_2_NAME, document), "/v1/classifier/locate", document,
         {
             "ocr": "always",
             "regions": _compact(STAGE_2_REGIONS),
@@ -1111,9 +1141,10 @@ def run_utility_bill_pipeline(
             "No judgement, just geometry. The fuzzy text features return the OCR "
             "line polygon of every 'Amount Due' / 'Total Due' on the page; the llm "
             "feature runs the enforcement loop for a model-drawn box. Expect at "
-            "least one OCR region for 'Amount Due' — this bill prints it three "
-            "times (header, account summary, payment stub)."
+            "least one OCR region for 'Amount Due' — a bill prints it more than "
+            "once (header, summary table, payment stub)."
         ),
+        adhoc=adhoc,
     )
     r2 = run_case(case, transport, out_root, args)
     index += 1
@@ -1141,7 +1172,8 @@ def run_utility_bill_pipeline(
         if geometry is None:
             pipe.notes.append(f"candidate {attempt}: no page geometry for page {candidate['page']}")
             continue
-        name = STAGE_3_NAME if attempt == 1 else f"{STAGE_3_NAME} · candidate {attempt}"
+        base = _stage_name(STAGE_3_NAME, document)
+        name = base if attempt == 1 else f"{base} · candidate {attempt}"
         case = _stage_case(
             index, name, "/v1/classifier/assess", None,
             {
@@ -1157,7 +1189,8 @@ def run_utility_bill_pipeline(
                 "The llm criterion is asked to state the figure in its reason, which "
                 "is read back as a second opinion."
             ),
-            expect_key=STAGE_3_NAME,
+            expect_key=base,
+            adhoc=adhoc,
         )
         crop_path = out_root / case.slug / "crop.jpg"
         crop_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1315,10 +1348,19 @@ def _amount_due_candidates(result: CaseResult) -> list[dict]:
             }
         )
 
-    # Within a rank: short lines before long ones — "Amount Due" is a label,
-    # "please pay the Amount Due by the Due Date." is a sentence that mentions
-    # one — then higher OCR confidence first.
-    found.sort(key=lambda c: (c["rank"], len(c["text"].split()) > 6, -(c["score"] or 0.0)))
+    # Within a rank: lines that BEGIN with the label ("Amount Due:", "Amount
+    # due on or before") before lines that merely contain it ("Total Amount
+    # Due At Last Billing" is a different number; "please pay the Amount Due
+    # by the Due Date." is a sentence); short lines before long ones; then
+    # higher OCR confidence first.
+    found.sort(
+        key=lambda c: (
+            c["rank"],
+            not c["text"].strip().lower().startswith(c["feature"].lower()),
+            len(c["text"].split()) > 6,
+            -(c["score"] or 0.0),
+        )
+    )
     unique: list[dict] = []
     for candidate in found:
         if any(
@@ -1451,22 +1493,27 @@ def _llm_reading(result: CaseResult) -> Optional[str]:
     return _normalise_amount(matches[0])
 
 
-def check_pipeline(pipe: PipelineResult, expectations: dict, *, document_overridden: bool) -> None:
+def check_pipeline(pipe: PipelineResult, expectations: dict) -> None:
     """The chain-level assertions; each stage's own checks come from check().
 
-    ``amount_due`` is only asserted for the committed fixture — an ad-hoc
-    ``--document`` has no entry to be right or wrong against, so that check is
-    recorded as skipped rather than failed or silently omitted.
+    An ad-hoc ``--document`` has no entry to be right or wrong against, so
+    its missing entry is recorded as skipped — with the value that WAS read,
+    so the run still says something — rather than failed or silently omitted.
     """
-    expected = expectations.get(PIPELINE_EXPECT_KEY)
+    expected = expectations.get(pipe.expect_key)
     if expected is None:
         pipe.checks.append(
             {
                 "kind": "coverage",
-                "target": PIPELINE_EXPECT_KEY,
-                "ok": False,
-                "expected": "an entry in regions_expected.json",
-                "actual": "none",
+                "target": pipe.expect_key,
+                "ok": pipe.adhoc,
+                "skipped": pipe.adhoc,
+                "expected": "nothing (ad-hoc --document)" if pipe.adhoc
+                else "an entry in regions_expected.json",
+                "actual": (
+                    f"read {pipe.value} via {pipe.value_source}" if pipe.value
+                    else f"nothing read — {pipe.stopped_at}"
+                ) if pipe.adhoc else "none",
             }
         )
         return
@@ -1492,27 +1539,15 @@ def check_pipeline(pipe: PipelineResult, expectations: dict, *, document_overrid
             }
         )
     if "amount_due" in expected:
-        if document_overridden:
-            pipe.checks.append(
-                {
-                    "kind": "pipeline",
-                    "target": "stage 3 · amount due",
-                    "ok": True,
-                    "skipped": True,
-                    "expected": expected["amount_due"],
-                    "actual": f"{pipe.value or 'nothing read'} (ad-hoc --document; not asserted)",
-                }
-            )
-        else:
-            pipe.checks.append(
-                {
-                    "kind": "pipeline",
-                    "target": "stage 3 · amount due",
-                    "ok": pipe.value == expected["amount_due"],
-                    "expected": expected["amount_due"],
-                    "actual": f"{pipe.value} via {pipe.value_source}" if pipe.value else (pipe.stopped_at or None),
-                }
-            )
+        pipe.checks.append(
+            {
+                "kind": "pipeline",
+                "target": "stage 3 · amount due",
+                "ok": pipe.value == expected["amount_due"],
+                "expected": expected["amount_due"],
+                "actual": f"{pipe.value} via {pipe.value_source}" if pipe.value else (pipe.stopped_at or None),
+            }
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1537,6 +1572,18 @@ def check(result: CaseResult, expectations: dict, *, local: bool = False) -> Non
     false is claimed either way.
     """
     expected = expectations.get(result.case.expect_key or result.case.name)
+    if expected is None and result.case.adhoc:
+        result.checks.append(
+            {
+                "kind": "coverage",
+                "target": result.case.name,
+                "ok": True,
+                "skipped": True,
+                "expected": "nothing (ad-hoc --document)",
+                "actual": f"{result.phase}; see the pipeline section for what was read",
+            }
+        )
+        return
     if expected is None:
         result.checks.append(
             {
@@ -2143,7 +2190,8 @@ def _pipeline_block(pipe: PipelineResult) -> str:
     candidate regions, every figure read, the crop, and the chain's checks.
     The stages themselves are ordinary case sections further down."""
     parts = [
-        f'<h2 id="pipeline-{_e(pipe.name)}">Pipeline · {_e(pipe.name)} — {_e(pipe.document.name)}</h2>',
+        f'<h2 id="pipeline-{_e(pipe.name)}-{_e(_slug(pipe.document.name))}">'
+        f"Pipeline · {_e(pipe.name)} — {_e(pipe.document.name)}</h2>",
         f'<p class="meta">document <code>{_e(_rel(pipe.document))}</code> · '
         f"{len(pipe.stages)} stage(s) · "
         + (_e(f"stopped: {pipe.stopped_at}") if pipe.stopped_at else "ran to the end")
@@ -2440,10 +2488,10 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--pipeline", action="append", choices=PIPELINES, default=None,
                         help="Also run a chained pipeline (repeatable). `utility-bill`: is it a "
                              "bill → where is the amount due → read the figure inside that region")
-    parser.add_argument("--document", type=pathlib.Path,
-                        help="Document for --pipeline (default: the committed "
-                             "unit-tests/classifier/documents/utility_bill.jpeg). With an "
-                             "ad-hoc document the amount-due expectation is skipped, not failed")
+    parser.add_argument("--document", type=pathlib.Path, action="append", default=None,
+                        help="Run --pipeline on this document instead of the committed "
+                             "fixtures (repeatable). An ad-hoc document has no expectations: "
+                             "its checks are recorded as skipped and its answer is reported")
     parser.add_argument("--out", type=pathlib.Path,
                         help="Output directory (default: "
                              "unit-tests/classifier/reports/<UTC timestamp>/)")
@@ -2505,9 +2553,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         print("No matching items. Check --folders / --only against the collection.")
         return 2
 
-    document = (args.document or DEFAULT_UTILITY_BILL).resolve()
-    if pipelines_wanted and not document.is_file():
-        raise SystemExit(f"--pipeline: document not found: {document}")
+    adhoc = args.document is not None
+    documents = [p.resolve() for p in (args.document or UTILITY_BILL_FIXTURES)]
+    if pipelines_wanted:
+        for path in documents:
+            if not path.is_file():
+                raise SystemExit(f"--pipeline: document not found: {path}")
 
     expectations = (
         json.loads(args.expect.read_text(encoding="utf-8")) if args.expect.is_file() else {}
@@ -2517,7 +2568,11 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     print(
         f"{len(cases)} case(s)"
-        + (f" + pipeline {', '.join(pipelines_wanted)} on {document.name}" if pipelines_wanted else "")
+        + (
+            f" + pipeline {', '.join(pipelines_wanted)} on "
+            f"{', '.join(d.name for d in documents)}{' (ad-hoc)' if adhoc else ''}"
+            if pipelines_wanted else ""
+        )
         + f" → {out_root}"
     )
     print(f"mode: {'local (in-process TestClient)' if args.local else base_url}\n")
@@ -2556,17 +2611,19 @@ def main(argv: Optional[list[str]] = None) -> int:
         # stage's request is built from the last stage's answer.
         runners = {UTILITY_BILL_PIPELINE: run_utility_bill_pipeline}
         for name in pipelines_wanted:
-            print(f"  · pipeline {name} ({document.name})", flush=True)
-            pipe = runners[name](
-                document, transport, out_root, args, first_index=len(results) + 1
-            )
-            pipelines.append(pipe)
-            results.extend(pipe.results)
+            for document in documents:
+                print(f"  · pipeline {name} ({document.name})", flush=True)
+                pipe = runners[name](
+                    document, transport, out_root, args,
+                    first_index=len(results) + 1, adhoc=adhoc,
+                )
+                pipelines.append(pipe)
+                results.extend(pipe.results)
 
     for result in results:
         check(result, expectations, local=args.local)
     for pipe in pipelines:
-        check_pipeline(pipe, expectations, document_overridden=args.document is not None)
+        check_pipeline(pipe, expectations)
 
     meta = {
         "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),

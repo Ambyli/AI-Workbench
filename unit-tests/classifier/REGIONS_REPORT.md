@@ -107,7 +107,7 @@ uv run --package classifier python unit-tests/classifier/regions_report.py \
 | `--folders` | `Documents,Regions,Documents + regions` | Comma-separated. The **Artifacts** folder is not runnable — its items are parametrised on a `:jobId` that only exists after a submission, and every case here exercises those endpoints itself. When `--pipeline` is given and this is not, no collection folder runs |
 | `--only` | _(all)_ | Case-insensitive substring of the item name. Does not filter pipeline stages |
 | `--pipeline` | _(none)_ | Run a chained pipeline — see [§ Pipelines](#pipelines). Repeatable; `utility-bill` is the one that exists |
-| `--document` | `documents/utility_bill.jpeg` | The document a pipeline runs on. With an ad-hoc file the `amount_due` expectation is **skipped**, not failed — there is nothing to be right against |
+| `--document` | the committed bills | Run the pipeline on this file instead (repeatable). An ad-hoc file has no expectations: its checks are recorded as **skipped**, not failed, and the value it read is still reported |
 | `--out` | `unit-tests/classifier/reports/<UTC timestamp>/` | Gitignored |
 | `--timeout` | `600` | Seconds to wait for one job to reach a terminal phase |
 | `--expect` | `unit-tests/classifier/regions_expected.json` | |
@@ -253,23 +253,25 @@ uv run --package classifier python unit-tests/classifier/regions_report.py --pip
 # The same chain in-process — no model; the deterministic OCR half decides
 uv run --package classifier python unit-tests/classifier/regions_report.py --pipeline utility-bill --local
 
-# Another bill. The amount-due expectation is skipped; the value is still reported
+# Another bill. No expectations for it, so its checks are skipped; the value is still reported
 uv run --package classifier python unit-tests/classifier/regions_report.py \
     --pipeline utility-bill --document ~/Downloads/some_bill.jpg --keep-jobs
 ```
 
 ### `utility-bill` — read the amount due off a photographed bill
 
-The fixture is [`documents/utility_bill.jpeg`](documents/utility_bill.jpeg), a
-phone photo of an Ohio Edison bill (5712×4284, EXIF orientation 6 — the
-service and the script both read it upright at 4284×5712). It prints
-**Amount Due $80.49** three times: the header, the account-summary table, and
-the payment stub.
+Two fixtures, run in turn by default, chosen because they lay the answer out
+differently:
+
+| Fixture | Bill | Layout | Answer |
+|---|---|---|---|
+| [`documents/utility_bill.jpeg`](documents/utility_bill.jpeg) | Ohio Edison, 5712×4284 with EXIF orientation 6 (read upright at 4284×5712) | Label and figure on **one** OCR line — `Amount Due: $80.49` — in the header; the label alone in the account summary and the payment stub | `$80.49` |
+| [`documents/utility_bill_2.jpeg`](documents/utility_bill_2.jpeg) | AEP Ohio, 4032×3024, two pages side by side | Label and figure are **separate** OCR lines on the same row — `Amount due on or before` … `$193.33` — in the header and the stub; `Total Amount Due At Last Billing $201.60` is the decoy a naive "any line containing Amount Due" would fall for | `$193.33` |
 
 | Stage | Call | Request | What decides it |
 |---|---|---|---|
-| 1 · is this a utility bill? | `POST /assess` | `ocr=always`, four fuzzy/regex `text` criteria (`Amount Due`, `Account Number`, `billing period`, a usage unit such as `kWh`), an `llm` presence criterion for the document as a whole, an `llm` legibility criterion | Overall **PASS** and the llm presence criterion **PASS**. Under `--local` the llm criteria are dropped, so the text criteria decide alone — `gate.basis` in `summary.json` says which it was. Anything else stops the chain: an amount located on a document that is not a bill is *a* number, which is worse than none |
-| 2 · where is the amount due? | `POST /locate` | fuzzy `text` features `Amount Due` and `Total Due` → OCR line polygons in original page pixels; an `llm` presence feature with `regions.llm_boxes` → the enforcement loop's box | **Candidates**, best first: a label line that already carries a dollar figure (the header), other label lines, then the model's accepted box. Two features on one line collapse to one candidate. None at all stops the chain |
+| 1 · is this a utility bill? | `POST /assess` | `ocr=always`, four fuzzy/regex `text` criteria (`Amount Due`, `Account Number`, a billing-period-or-date regex covering *Billing Period* / *Billing from* / *Service Period* / *Bill mailing date*, a usage unit such as `kWh`), an `llm` presence criterion for the document as a whole, an `llm` legibility criterion | Overall **PASS** and the llm presence criterion **PASS**. Under `--local` the llm criteria are dropped, so the text criteria decide alone — `gate.basis` in `summary.json` says which it was. Anything else stops the chain: an amount located on a document that is not a bill is *a* number, which is worse than none |
+| 2 · where is the amount due? | `POST /locate` | fuzzy `text` features `Amount Due` and `Total Due` → OCR line polygons in original page pixels; an `llm` presence feature with `regions.llm_boxes` → the enforcement loop's box | **Candidates**, best first: a label line that already carries a dollar figure, then lines that *begin* with the label before lines that merely contain it, short lines before sentences, higher OCR confidence first; the model's accepted box last. Two features on one line collapse to one candidate. None at all stops the chain |
 | 3 · read the figure inside that region | `POST /assess` on a **crop** | The script cuts the top candidate out of the original page — a page-wide strip three line-heights tall around a label line (the figure is on the same row, sometimes at the far right of a table, and a photographed page is rarely level), or a lightly padded box around the model's — and submits it as a new document with a regex `text` criterion for a currency figure, the `Amount Due` label again, and an `llm` criterion asked to state the figure | Every currency figure on every OCR line of the crop, **nearest the label first** (label-heights vertically, crop-widths horizontally; `$`-prefixed before bare decimals, negatives last). The top one is the answer. The model's stated figure is kept beside it as a second opinion and only becomes the answer when OCR read nothing. A crop with no figure moves to the next candidate, up to three — each attempt is its own case |
 
 The report gets a **Pipeline** section above the cases: the answer, what each
@@ -278,15 +280,19 @@ distance, the stage-2 page with all candidates drawn on it beside the stage-3
 crop with the figures drawn on it, and the chain-level checks. `summary.json`
 carries the same under `pipelines[]`.
 
-Expectations, in `regions_expected.json`:
+Expectations, in `regions_expected.json`, one set per fixture:
 
 ```json
-"pipeline: utility bill": { "is_utility": true, "region_found": true, "amount_due": "$80.49" }
+"pipeline: utility bill — utility_bill_2.jpeg": { "is_utility": true, "region_found": true, "amount_due": "$193.33" }
 ```
 
-plus the usual per-stage entries under the three stage names. The chain's
-answer is decided by OCR and a regex, so `amount_due` is a real assertion in
-both modes — the llm rows stay `null` as everywhere else.
+plus the usual per-stage entries under `<stage name> — <file name>`. The
+chain's answer is decided by OCR and a regex, so `amount_due` is a real
+assertion in both modes — the llm rows stay `null` as everywhere else.
+
+**Adding a bill** is: drop the photo in `documents/`, add its path to
+`UTILITY_BILL_FIXTURES` in `regions_report.py`, run it once with `--local` to
+see what the deterministic path produces, and write the four entries.
 
 **Adding a pipeline** is code, not collection: a `run_<name>_pipeline()` in
 the § Pipelines section that builds `Case`s and feeds them to `run_case()`,

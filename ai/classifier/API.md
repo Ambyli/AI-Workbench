@@ -1009,7 +1009,10 @@ curl http://localhost:4001/v1/classifier/assess \
 Errors: **400** for an empty criteria list, an empty file, an unusable text
 pattern, an invalid `ocr` value, an unknown `regions` layer, a content type
 outside the allowlist, or bytes that are not a supported document (including
-legacy `.doc`).
+legacy `.doc`). A page image under `CLASSIFIER_MIN_IMAGE_WIDTH` ×
+`CLASSIFIER_MIN_IMAGE_HEIGHT` (32 × 32 px) on either axis fails the job with
+"Image too small" — a thumbnail guard, low enough that a crop of a single
+text line submitted as its own document passes.
 
 **With regions** — same call plus one field:
 

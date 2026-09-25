@@ -64,10 +64,16 @@ EXPOSURE_HIGH: float = 220.0    # Mean pixel intensity above this → overexpose
 # ---------------------------------------------------------------------------
 # Input image validation
 # ---------------------------------------------------------------------------
-# Images smaller than this are rejected before any processing.
-# Too-small images produce unreliable LLM scores and wasted API calls.
-MIN_IMAGE_WIDTH: int = 100   # pixels
-MIN_IMAGE_HEIGHT: int = 100  # pixels
+# Page images smaller than this on EITHER axis are rejected before any
+# processing (HTTP 400, "Image too small"). A thumbnail-catcher, nothing
+# more: OCR upscales small pages itself, the vision model takes any size,
+# and the working-image step only ever shrinks — so the floor is set where
+# an image stops being a document at all, not where it gets hard. It was
+# 100 × 100, which refused a legitimate input: a crop of one text line
+# submitted as its own document (the utility-bill pipeline's stage 3) is
+# often under 100 px tall and perfectly readable.
+MIN_IMAGE_WIDTH: int = max(1, int(os.environ.get("CLASSIFIER_MIN_IMAGE_WIDTH", "32")))
+MIN_IMAGE_HEIGHT: int = max(1, int(os.environ.get("CLASSIFIER_MIN_IMAGE_HEIGHT", "32")))
 
 # ---------------------------------------------------------------------------
 # Document loading + OCR

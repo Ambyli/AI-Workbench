@@ -41,6 +41,9 @@ times a photo's allowance.
     write_job_artifacts()    — regions.json + base images + manifest, and the
                                ``artifacts`` blocks for the result.
     job_byte_cap()           — this job's cap, from its manifest.
+    FileLabeler / labeler_for() — every file's kind / format / item /
+                               document / criteria, for the result and the
+                               manifest endpoint alike.
     render_layer()           — one layer's bytes, for the lazy renderer.
     layer_name()             — ``p{n}[.<slug>].<suffix>`` for a format.
     base_image_name()        — ``p{n}.base.jpg``.
@@ -54,6 +57,7 @@ and ``job_byte_cap`` by ``api.artifacts``. Nothing here imports ``analysis``.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -278,12 +282,9 @@ def write_job_artifacts(
     text_refs = text_refs or {}
     text_names = {name: [r["name"] for r in refs] for name, refs in text_refs.items()}
 
-    store.write_json(
-        job_id,
-        "regions.json",
-        _regions_json(job_id, items, region_map, criteria, detector,
-                      localizations, text_names),
-    )
+    regions_doc = _regions_json(job_id, items, region_map, criteria, detector,
+                                localizations, text_names)
+    store.write_json(job_id, "regions.json", regions_doc)
     for info in items:
         if info.geometry is not None and info.image_bgr is not None:
             rgb = info.image_bgr[:, :, ::-1]  # the renderer wants RGB, OpenCV holds BGR
@@ -329,6 +330,8 @@ def write_job_artifacts(
     # The item map: n → where the page came from. Added here rather than to
     # common.vision.build_manifest, which knows nothing about documents.
     manifest["items"] = {str(i.item): i.as_map_entry() for i in items}
+    labeler = FileLabeler(regions_doc, manifest["items"])
+    manifest["files"] = labeler.describe(job_id, manifest["files"])
     store.write_json(job_id, "manifest.json", manifest)
 
     files = store.list(job_id)
@@ -336,7 +339,8 @@ def write_job_artifacts(
     item_layers = {i.item: _item_layers(job_id, i, present) for i in items}
     artifacts = {
         "dir": str(store.dir_for(job_id)),
-        "files": [{**f, "url": artifact_url(job_id, f["name"])} for f in files],
+        # Labelled by the same FileLabeler the manifest endpoint uses.
+        "files": labeler.describe(job_id, files),
         "items": [
             {"item": i.item, "layers": item_layers[i.item]}
             for i in items if item_layers[i.item]
@@ -429,6 +433,160 @@ def _criterion_artifacts(
     if text_refs:
         block["text"] = [text_link(job_id, ref) for ref in text_refs]
     return block or None
+
+
+# ---------------------------------------------------------------------------
+# File labels — what each file in the directory is, and whose it is
+# ---------------------------------------------------------------------------
+
+# The name grammar of this directory. ``n`` is the global item, ``i`` the
+# document; a slug is common.vision's lowercase [a-z0-9-] (always ending in
+# a hash, so it can never be "base" or "layer").
+_LAYER_FILE_RE = re.compile(
+    r"^p(?P<item>\d+)\.(?:(?P<slug>[a-z0-9][a-z0-9-]*)\.)?"
+    r"(?P<suffix>svg|layer\.png|preview\.jpg)$"
+)
+_BASE_FILE_RE = re.compile(r"^p(?P<item>\d+)\.base\.jpg$")
+_TEXT_FILE_RE = re.compile(
+    r"^text\.(?:p(?P<item>\d+)|d(?P<document>\d+))\.[A-Za-z0-9_-]+\.json$"
+)
+_FORMAT_FOR_SUFFIX = {suffix: fmt for fmt, suffix in LAYER_FILE_SUFFIXES}
+
+
+class FileLabeler:
+    """Label every file of one job from its ``regions.json`` and item map.
+
+    The ONE place a file name is turned into ``kind`` / ``format`` / ``item``
+    / ``document`` / ``criteria``, used by both the job-result writer
+    (``write_job_artifacts``) and the manifest endpoint, so the two cannot
+    disagree. Everything is derived from the job's own records, never
+    guessed:
+
+      * regions per item — each region's ``page`` in regions.json;
+      * text layers per criterion — regions.json's ``criteria[*].text_layers``
+        (the same names the manifest's criterion map and each criterion's
+        ``artifacts.text`` links carry);
+      * document of an item — the ``items`` map (manifest, else regions.json).
+
+    Args:
+        regions_doc: The parsed regions.json (``criteria``, ``pages``, ``items``).
+        items_map:   ``{"n": {"document", "page", "filename"}}``; defaults to
+                     regions.json's own ``items``.
+    """
+
+    def __init__(self, regions_doc: dict, items_map: Optional[dict] = None) -> None:
+        entries: dict[str, dict] = (regions_doc or {}).get("criteria") or {}
+        self.items_map: dict[str, dict] = dict(
+            items_map if items_map is not None else (regions_doc or {}).get("items") or {}
+        )
+        self.all_names: list[str] = sorted(entries)
+        self.slug_to_name: dict[str, str] = {
+            e.get("slug"): name for name, e in entries.items() if e.get("slug")
+        }
+        self.name_to_slug: dict[str, str] = {v: k for k, v in self.slug_to_name.items()}
+        # item → criteria with at least one region there (any region, rejected
+        # LLM attempts included: they are drawable with ?attempt=).
+        self.region_items: dict[str, set[int]] = {}
+        self.by_item: dict[int, set[str]] = {}
+        # text layer file → criteria that read it.
+        self.text_layers: dict[str, set[str]] = {}
+        self.by_text: dict[str, set[str]] = {}
+        for name, entry in entries.items():
+            items = {int(r.get("page", 0)) for r in entry.get("regions") or []}
+            self.region_items[name] = items
+            for n in items:
+                self.by_item.setdefault(n, set()).add(name)
+            layers = set(entry.get("text_layers") or [])
+            self.text_layers[name] = layers
+            for layer in layers:
+                self.by_text.setdefault(layer, set()).add(name)
+        self.image_items: set[int] = {
+            int(p.get("page", -1)) for p in (regions_doc or {}).get("pages") or []
+        }
+
+    # ── Per item / per document ───────────────────────────────────────────
+    def document_of(self, item: int) -> Optional[int]:
+        entry = self.items_map.get(str(item))
+        return None if entry is None else entry.get("document")
+
+    def items_of_document(self, document: int) -> list[int]:
+        return sorted(
+            int(n) for n, e in self.items_map.items() if e.get("document") == document
+        )
+
+    def text_items(self, layer: str) -> set[int]:
+        """The items a text layer covers: its own for ``text.p{n}``, every page
+        of document i for ``text.d{i}`` (the pages that search joined)."""
+        match = _TEXT_FILE_RE.match(layer)
+        if match is None:
+            return set()
+        if match.group("item") is not None:
+            return {int(match.group("item"))}
+        return set(self.items_of_document(int(match.group("document"))))
+
+    def items_for(self, name: str) -> set[int]:
+        """Items this criterion has regions on or read a text layer for."""
+        items = set(self.region_items.get(name, set()))
+        for layer in self.text_layers.get(name, set()):
+            items |= self.text_items(layer)
+        return items
+
+    # ── One file ──────────────────────────────────────────────────────────
+    def label(self, name: str) -> dict[str, Any]:
+        """``{kind, format?, item, document, criteria}`` for one file name."""
+        if name == "manifest.json":
+            return self._label("manifest", None, None, None, self.all_names)
+        if name == "regions.json":
+            return self._label("regions", None, None, None, self.all_names)
+        match = _TEXT_FILE_RE.match(name)
+        if match:
+            criteria = self.by_text.get(name, set())
+            if match.group("item") is not None:
+                item = int(match.group("item"))
+                return self._label("text", "json", item, self.document_of(item), criteria)
+            return self._label("text", "json", None, int(match.group("document")), criteria)
+        match = _BASE_FILE_RE.match(name)
+        if match:
+            item = int(match.group("item"))
+            return self._label("base", None, item, self.document_of(item),
+                               self.by_item.get(item, set()))
+        match = _LAYER_FILE_RE.match(name)
+        if match:
+            item = int(match.group("item"))
+            fmt = _FORMAT_FOR_SUFFIX[match.group("suffix")]
+            slug = match.group("slug")
+            if slug:
+                owner = self.slug_to_name.get(slug)
+                criteria = {owner} if owner else set()
+            else:
+                criteria = self.by_item.get(item, set())
+            return self._label("layer", fmt, item, self.document_of(item), criteria)
+        return self._label("other", None, None, None, set())
+
+    @staticmethod
+    def _label(kind: str, fmt: Optional[str], item: Optional[int],
+               document: Optional[int], criteria) -> dict[str, Any]:
+        label: dict[str, Any] = {"kind": kind}
+        if fmt:
+            label["format"] = fmt
+        label.update(item=item, document=document, criteria=sorted(criteria))
+        return label
+
+    def describe(self, job_id: str, files: list[dict]) -> list[dict]:
+        """Store entries (``name``, ``bytes``, ``content_type``) → labelled
+        entries with their ``url`` — the shape of ``artifacts.files`` and the
+        manifest endpoint's ``files``."""
+        return [
+            {**f, "url": artifact_url(job_id, f["name"]), **self.label(f["name"])}
+            for f in files
+        ]
+
+
+def labeler_for(job_id: str) -> FileLabeler:
+    """The labeler for a job's directory as it is on disk."""
+    regions_doc = store.read_json(job_id, "regions.json") or {}
+    manifest = store.read_json(job_id, "manifest.json") or {}
+    return FileLabeler(regions_doc, manifest.get("items"))
 
 
 # ---------------------------------------------------------------------------

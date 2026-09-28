@@ -725,7 +725,7 @@ Inside `job.result`, `schema_version: 3` — here for a two-page invoice plus a
 | `verdict` | `assessment.overall_verdict` |
 | `page_geometry` | One entry per item, each with its `item`; `page` equals `item` (the global index the layers are drawn on). An item with no page image (.txt / .docx) has `width` / `height` / `working_scale` / `pdf_points` `null` |
 | `detector` | What the open-vocabulary detector did for the whole job (was `document_info.detector`) |
-| `artifacts` | The job's files and, under `items`, each item's combined layer URLs (items with a page image only) |
+| `artifacts` | The job's files — each [labelled](#file-labels) with `kind`, `format`, `item`, `document`, `criteria`, exactly as the manifest endpoint labels them — and, under `items`, each item's combined layer URLs (items with a page image only) |
 
 **Every criterion has the same keys**, whatever its type or status. The keys
 that existed before describe the AGGREGATED answer:
@@ -860,6 +860,116 @@ A job nobody looks at costs a JSON file, its text layers and a JPEG per page.
 The result's `artifacts.items` (and each criterion's `artifacts.items`) lists
 the layer URLs per item; they work whether or not the file exists yet.
 `artifacts.files` is what is on disk at the time of the result.
+
+### File labels
+
+Every file entry — in the manifest endpoint's `files` and in the result's
+`artifacts.files`, which one function (`regions.artifacts.FileLabeler`)
+writes, so the two cannot disagree — carries, besides `name`, `bytes`,
+`content_type` and `url`:
+
+| Key | Meaning |
+|---|---|
+| `kind` | `manifest` \| `regions` \| `text` \| `layer` \| `base` (`other` for an unrecognised name — no name the service writes produces it) |
+| `format` | Only where it adds information: a layer's `svg` \| `png` \| `preview`, a text layer's `json`. Absent otherwise |
+| `item` | The global item index the file belongs to; `null` for `manifest.json`, `regions.json` and a document-scope `text.d{i}.*` |
+| `document` | The document index — from the manifest's `items` map for an item's file, `i` for `text.d{i}.*`; `null` for the job-wide files |
+| `criteria` | The criterion **names** the file belongs to, sorted |
+
+`criteria`, file by file — derived from `regions.json` and the manifest's
+maps, never guessed from the name:
+
+| File | `criteria` |
+|---|---|
+| `manifest.json`, `regions.json` | every criterion in the job |
+| `text.p{n}.<key>.json`, `text.d{i}.<key>.json` | every criterion whose units read that layer (the manifest's `criteria[*].text_layers`, the criterion's `artifacts.text` links) |
+| `p{n}.svg` / `p{n}.layer.png` / `p{n}.preview.jpg` | every criterion with at least one region on item n (rejected LLM attempts count — they are drawable with `?attempt=`) |
+| `p{n}.<slug>.svg` / `.layer.png` / `.preview.jpg` | exactly that criterion |
+| `p{n}.base.jpg` | every criterion with at least one region on item n |
+
+```json
+{"name": "text.d0.auto.json", "bytes": 1432, "content_type": "application/json",
+ "url": "/jobs/abc123/artifacts/text.d0.auto.json",
+ "kind": "text", "format": "json", "item": null, "document": 0, "criteria": ["split"]}
+```
+
+A document-scope search's layer belongs to the criteria that searched the
+joined string; the per-page `text.p{n}` layers it was joined from are
+labelled with the page-scope criteria that read them.
+
+### One criterion's files — `?criterion=` on the manifest and the zip
+
+`GET /jobs/{id}/artifacts?criterion=<slug>` (repeatable — the union; the same
+slugs and the same **400** for an unknown one as the file endpoint) returns
+the manifest scoped to those criteria:
+
+* `files` — only on-disk entries whose `criteria` intersect the requested
+  ones (so `manifest.json` and `regions.json` are always there), and
+  `total_bytes` their sum;
+* `criteria` — only the requested entries of the criterion map;
+* `items` — only the items they have regions on or read a text layer for (a
+  `text.d{i}` layer counts for every page of document i), same `n →
+  {document, page, filename}` shape;
+* `layers` — `{"<n>": {"<slug>": {svg, png, preview}}}`: that criterion's
+  layer URLs, rendered or not yet (`preview` only when `p{n}.base.jpg`
+  exists), on the items where it has **hits** only — the same pages the
+  scoped zip renders. A page it searched and found nothing on is in `items`
+  (its text file is listed) but has no layer, because there is nothing to
+  draw;
+* `filter` — `{"criterion": [slugs as sent], "criteria": [names]}`, and
+  `zip_url` carries the same query.
+
+For the two-page invoice with `Net 30` found on page 2 only:
+
+```json
+{
+  "job_id": "abc123",
+  "filter": {"criterion": ["net-30-66a1"], "criteria": ["Net 30"]},
+  "criteria": {"Net 30": {"slug": "net-30-66a1", "count": 1, "sources": ["pdf-text"],
+                          "text_layers": ["text.p0.auto.json", "text.p1.auto.json"]}},
+  "items": {"0": {"document": 0, "page": 0, "filename": "invoice.pdf"},
+            "1": {"document": 0, "page": 1, "filename": "invoice.pdf"}},
+  "files": [
+    {"name": "manifest.json", "kind": "manifest", "item": null, "document": null, "criteria": ["Net 30", "split"], "…": "…"},
+    {"name": "p1.base.jpg", "kind": "base", "item": 1, "document": 0, "criteria": ["Net 30"], "…": "…"},
+    {"name": "regions.json", "kind": "regions", "…": "…"},
+    {"name": "text.p0.auto.json", "kind": "text", "format": "json", "item": 0, "document": 0, "criteria": ["Net 30"], "…": "…"},
+    {"name": "text.p1.auto.json", "kind": "text", "format": "json", "item": 1, "…": "…"}
+  ],
+  "layers": {
+    "1": {"net-30-66a1": {"svg": "/jobs/abc123/artifacts/p1.svg?criterion=net-30-66a1",
+                          "png": "/jobs/abc123/artifacts/p1.layer.png?criterion=net-30-66a1",
+                          "preview": "/jobs/abc123/artifacts/p1.preview.jpg?criterion=net-30-66a1"}}
+  },
+  "zip_url": "/jobs/abc123/artifacts.zip?criterion=net-30-66a1",
+  "total_bytes": 81234,
+  "page_geometry": ["…"], "options": {"…": "…"}, "dropped": [], "notes": [], "expires_at": "…"
+}
+```
+
+`page_geometry`, `options`, `dropped`, `notes` and the timestamps are the
+whole job's, unchanged.
+
+`GET /jobs/{id}/artifacts.zip?criterion=<slug>` (repeatable, same validation)
+streams **only** what belongs to those criteria, each entry `<job_id>/<name>`:
+
+| Entry | What |
+|---|---|
+| `regions.json` | Reduced to the requested criteria — generated for the zip; the stored file is never rewritten |
+| `manifest.json` | The scoped manifest above — generated for the zip |
+| `text.*.json` | The text layers those criteria read |
+| `p{n}.base.jpg` | The base image of each item they have regions on |
+| `p{n}.<slug>.svg` / `.layer.png` / `.preview.jpg` | Each requested criterion's own layers on each item it has regions on, all three formats — **rendered and cached first** if nobody has fetched them (the same render-and-cache path, and names, as `GET …/p{n}.<slug>.svg`); preview only where the base exists |
+
+For the example above: `abc123/manifest.json`, `abc123/regions.json`,
+`abc123/text.p0.auto.json`, `abc123/text.p1.auto.json`, `abc123/p1.base.jpg`,
+`abc123/p1.net-30-66a1.svg`, `abc123/p1.net-30-66a1.layer.png`,
+`abc123/p1.net-30-66a1.preview.jpg`. Combined `p{n}.*` layers are not
+included (they draw other criteria too) even when the scoped manifest's
+`files` lists one that is on disk. The zip is built from the files as they
+are, so a byte-capped directory yields what survived (a PNG the cap drops
+straight after rendering is not in it). Without `?criterion=` both endpoints
+are unchanged apart from the labels.
 
 ### The text a criterion searched
 
@@ -1421,19 +1531,25 @@ fails the JOB with "Image too small".
 ### `GET /jobs/{job_id}/artifacts`
 
 The manifest: `files[]` (what is on disk now — name, bytes, content type,
-url), `items` (item n → `{document, page, filename}`), the criterion map
-(`slug`, `count`, `sources`, `text_layers`), `page_geometry`, `options` (which
-layers can be rendered, and `byte_cap`: `per_item` × `items` = `total`),
-`dropped`, `notes`, `total_bytes`, `expires_at`, `zip_url`.
+url, and the [labels](#file-labels) `kind`, `format`, `item`, `document`,
+`criteria`), `items` (item n → `{document, page, filename}`), the criterion
+map (`slug`, `count`, `sources`, `text_layers`), `page_geometry`, `options`
+(which layers can be rendered, and `byte_cap`: `per_item` × `items` =
+`total`), `dropped`, `notes`, `total_bytes`, `expires_at`, `zip_url`.
+
+| Param | Effect |
+|---|---|
+| `criterion=<slug>` (repeatable) | Scope to those criteria (the union): `files`, `criteria`, `items` cut down, plus `layers` and `filter` — see [§ One criterion's files](#one-criterions-files--criterion-on-the-manifest-and-the-zip) |
 
 ```bash
-curl http://localhost:8005/jobs/abc123/artifacts | jq '{files: [.files[].name], criteria}'
+curl http://localhost:8005/jobs/abc123/artifacts | jq '[.files[] | {name, kind, item, criteria}]'
+curl "http://localhost:8005/jobs/abc123/artifacts?criterion=net-30-66a1" | jq '{filter, items, layers}'
 ```
 
 **404** when the job is unknown or has not written its directory yet (still
 queued, running, or failed before it got that far). **410** when its result
 says it *did* have artifacts but the directory is gone — swept past the TTL,
-or explicitly deleted.
+or explicitly deleted. **400** for an unknown slug.
 
 ---
 
@@ -1485,11 +1601,19 @@ the directory was swept or deleted.
 ### `GET /jobs/{job_id}/artifacts.zip`
 
 Every file currently in the directory as one zip, built on the fly and
-streamed. Layers that were never fetched are not in it — fetch them first.
+streamed, each entry `<job_id>/<name>`. Layers that were never fetched are
+not in it — fetch them first.
+
+| Param | Effect |
+|---|---|
+| `criterion=<slug>` (repeatable) | Only what belongs to those criteria: a reduced `regions.json` and the scoped `manifest.json` (both generated for the zip), their text layers, the base images of the items they have regions on, and each criterion's `p{n}.<slug>.*` layers there in all three formats, rendered and cached first when needed — see [§ One criterion's files](#one-criterions-files--criterion-on-the-manifest-and-the-zip) |
 
 ```bash
 curl http://localhost:8005/jobs/abc123/artifacts.zip -o layers.zip && unzip -l layers.zip
+curl "http://localhost:8005/jobs/abc123/artifacts.zip?criterion=net-30-66a1" -o net30.zip
 ```
+
+**404** / **410** as for the manifest; **400** for an unknown slug.
 
 ---
 

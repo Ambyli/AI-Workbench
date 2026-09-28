@@ -680,3 +680,205 @@ def test_document_kinds_reports_items_and_units(client):
     pdf = next(k for k in body["kinds"] if k["kind"] == "pdf")
     assert pdf["pages"].startswith("any — every page is one item")
     assert body["regions"]["artifact_max_bytes_per_item"] > 0
+
+
+# ---------------------------------------------------------------------------
+# Artifact file labels, and ?criterion= on the manifest and the zip
+# ---------------------------------------------------------------------------
+
+# "Net 30" is only on page 2 of the two-page invoice: its regions land on
+# item 1 alone, but it reads the text layer of both items. "split" is a
+# document-scope search (text.d0.auto.json) whose hit spans both pages.
+# "sharpness" localises nothing and reads no text.
+LABEL_CRITERIA = [
+    {"name": "Net 30", "type": "text"},
+    {"name": "split", "type": "text", "options": {"pattern": SPLIT_PHRASE, "scope": "document"}},
+    {"name": "sharpness", "type": "cv"},
+]
+ALL_NAMES = ["Net 30", "sharpness", "split"]
+
+
+def _label_job(client):
+    job = _done(client, client.post(
+        "/assess", files={"file": ("two.pdf", TWO_PAGE, "application/pdf")},
+        data={"criteria": json.dumps(LABEL_CRITERIA)},
+    ))
+    slugs = {name: e["slug"] for name, e in
+             client.get(f"/jobs/{job['job_id']}/artifacts").json()["criteria"].items()}
+    return job, slugs
+
+
+def _labels(files):
+    return {
+        f["name"]: (f["kind"], f.get("format"), f["item"], f["document"], f["criteria"])
+        for f in files
+    }
+
+
+def _zip_names(response, job_id):
+    import io
+    import zipfile
+
+    assert response.status_code == 200, response.text
+    archive = zipfile.ZipFile(io.BytesIO(response.content))
+    names = archive.namelist()
+    assert all(n.startswith(f"{job_id}/") for n in names)
+    return archive, sorted(n.split("/", 1)[1] for n in names)
+
+
+def test_every_artifact_file_is_labelled(client):
+    job, slugs = _label_job(client)
+    job_id = job["job_id"]
+    manifest = client.get(f"/jobs/{job_id}/artifacts").json()
+    # The job result's files are labelled by the same function.
+    assert job["result"]["artifacts"]["files"] == manifest["files"]
+    assert _labels(manifest["files"]) == {
+        "manifest.json": ("manifest", None, None, None, ALL_NAMES),
+        "regions.json": ("regions", None, None, None, ALL_NAMES),
+        "p0.base.jpg": ("base", None, 0, 0, ["split"]),
+        "p1.base.jpg": ("base", None, 1, 0, ["Net 30", "split"]),
+        "text.p0.auto.json": ("text", "json", 0, 0, ["Net 30"]),
+        "text.p1.auto.json": ("text", "json", 1, 0, ["Net 30"]),
+        "text.d0.auto.json": ("text", "json", None, 0, ["split"]),
+    }
+    for f in manifest["files"]:
+        assert f["url"] == f"/jobs/{job_id}/artifacts/{f['name']}"
+        assert {"bytes", "content_type"} <= set(f)
+        assert ("format" in f) == (f["kind"] in ("text", "layer"))
+
+    net = slugs["Net 30"]
+    for name in ("p1.svg", "p0.preview.jpg", f"p1.{net}.layer.png"):
+        assert client.get(f"/jobs/{job_id}/artifacts/{name}").status_code == 200
+    labels = _labels(client.get(f"/jobs/{job_id}/artifacts").json()["files"])
+    assert labels["p1.svg"] == ("layer", "svg", 1, 0, ["Net 30", "split"])
+    assert labels["p0.preview.jpg"] == ("layer", "preview", 0, 0, ["split"])
+    assert labels[f"p1.{net}.layer.png"] == ("layer", "png", 1, 0, ["Net 30"])
+    assert all(kind != "other" for kind, *_ in labels.values())
+
+
+def test_file_labeler_never_says_other_for_a_name_the_service_writes():
+    from regions.artifacts import FileLabeler, base_image_name, layer_name
+
+    doc = {
+        "criteria": {"a": {"slug": "a-1234", "regions": [{"page": 2}],
+                           "text_layers": ["text.d1.auto.json"]}},
+        "pages": [{"page": 2}],
+        "items": {"2": {"document": 1, "page": 0, "filename": "x.png"}},
+    }
+    labeler = FileLabeler(doc)
+    names = ["manifest.json", "regions.json", base_image_name(2), "text.p2.auto-1a2b3c4d.json",
+             "text.d1.auto.json"]
+    names += [layer_name(fmt, slug, 2) for fmt in ("svg", "png", "preview")
+              for slug in (None, "a-1234")]
+    assert all(labeler.label(n)["kind"] != "other" for n in names)
+    assert labeler.label("p2.a-1234.preview.jpg")["criteria"] == ["a"]
+    assert labeler.label("p2.layer.png") == {
+        "kind": "layer", "format": "png", "item": 2, "document": 1, "criteria": ["a"]
+    }
+    assert labeler.label("text.d1.auto.json") == {
+        "kind": "text", "format": "json", "item": None, "document": 1, "criteria": ["a"]
+    }
+    assert labeler.label("stray.bin")["kind"] == "other"
+
+
+def test_manifest_scoped_to_a_criterion(client):
+    job, slugs = _label_job(client)
+    job_id = job["job_id"]
+    net, split = slugs["Net 30"], slugs["split"]
+    whole = client.get(f"/jobs/{job_id}/artifacts").json()
+    assert "layers" not in whole and "filter" not in whole
+    assert whole["zip_url"] == f"/jobs/{job_id}/artifacts.zip"
+
+    scoped = client.get(f"/jobs/{job_id}/artifacts", params={"criterion": net}).json()
+    assert sorted(f["name"] for f in scoped["files"]) == [
+        "manifest.json", "p1.base.jpg", "regions.json", "text.p0.auto.json", "text.p1.auto.json",
+    ]
+    assert list(scoped["criteria"]) == ["Net 30"]
+    assert scoped["items"] == {k: whole["items"][k] for k in ("0", "1")}  # text on 0, regions on 1
+    assert scoped["filter"] == {"criterion": [net], "criteria": ["Net 30"]}
+    assert scoped["zip_url"] == f"/jobs/{job_id}/artifacts.zip?criterion={net}"
+    assert scoped["total_bytes"] == sum(f["bytes"] for f in scoped["files"])
+    # Layers only where the criterion has hits: "Net 30" read page 0's text
+    # but found nothing there, so page 0 is in `items` (its text file is kept)
+    # and not in `layers` — the same pages the scoped zip renders.
+    assert set(scoped["layers"]) == {"1"}
+    for item, by_slug in scoped["layers"].items():
+        assert list(by_slug) == [net]
+        assert by_slug[net] == {
+            "svg": f"/jobs/{job_id}/artifacts/p{item}.svg?criterion={net}",
+            "png": f"/jobs/{job_id}/artifacts/p{item}.layer.png?criterion={net}",
+            "preview": f"/jobs/{job_id}/artifacts/p{item}.preview.jpg?criterion={net}",
+        }
+        for url in by_slug[net].values():  # not rendered yet, and fetchable
+            assert client.get(url).status_code == 200
+
+    # A criterion with no regions and no text: only the job-wide files.
+    none = client.get(f"/jobs/{job_id}/artifacts", params={"criterion": slugs["sharpness"]}).json()
+    assert sorted(f["name"] for f in none["files"]) == ["manifest.json", "regions.json"]
+    assert none["items"] == {} and none["layers"] == {}
+
+    # The union of two.
+    both = client.get(f"/jobs/{job_id}/artifacts",
+                      params=[("criterion", net), ("criterion", split)]).json()
+    assert sorted(both["criteria"]) == ["Net 30", "split"]
+    assert {"text.d0.auto.json", "p0.base.jpg", "text.p0.auto.json"} <= {
+        f["name"] for f in both["files"]
+    }
+    # Page 0 carries only "split", the one with hits there; "Net 30" is on page 1.
+    assert set(both["layers"]["0"]) == {split}
+    assert net in both["layers"]["1"]
+    assert both["filter"]["criterion"] == [net, split]
+
+    bad = client.get(f"/jobs/{job_id}/artifacts", params={"criterion": "nope-0000"})
+    assert bad.status_code == 400 and "unknown criterion slug" in bad.json()["detail"]
+    # The unfiltered manifest is unchanged by all that — apart from the
+    # per-criterion layers the fetches above rendered and cached.
+    after = client.get(f"/jobs/{job_id}/artifacts").json()
+    drop = ("files", "total_bytes")
+    assert {k: v for k, v in after.items() if k not in drop} == \
+        {k: v for k, v in whole.items() if k not in drop}
+
+
+def test_zip_scoped_to_a_criterion(client):
+    job, slugs = _label_job(client)
+    job_id = job["job_id"]
+    net, split = slugs["Net 30"], slugs["split"]
+    stored = client.get(f"/jobs/{job_id}/artifacts/regions.json").content
+
+    archive, names = _zip_names(
+        client.get(f"/jobs/{job_id}/artifacts.zip", params={"criterion": net}), job_id
+    )
+    assert names == sorted([
+        "manifest.json", "regions.json", "text.p0.auto.json", "text.p1.auto.json", "p1.base.jpg",
+        f"p1.{net}.svg", f"p1.{net}.layer.png", f"p1.{net}.preview.jpg",
+    ])
+    reduced = json.loads(archive.read(f"{job_id}/regions.json"))
+    assert list(reduced["criteria"]) == ["Net 30"]
+    assert reduced["pages"] and reduced["items"]
+    zipped_manifest = json.loads(archive.read(f"{job_id}/manifest.json"))
+    assert zipped_manifest["filter"] == {"criterion": [net], "criteria": ["Net 30"]}
+    assert list(zipped_manifest["criteria"]) == ["Net 30"]
+    # Rendered through the file endpoint's cache: the same bytes a GET serves.
+    assert archive.read(f"{job_id}/p1.{net}.svg") == \
+        client.get(f"/jobs/{job_id}/artifacts/p1.{net}.svg").content
+    # The stored regions.json and manifest are untouched.
+    assert client.get(f"/jobs/{job_id}/artifacts/regions.json").content == stored
+    assert "filter" not in client.get(f"/jobs/{job_id}/artifacts/manifest.json").json()
+
+    _, names = _zip_names(client.get(
+        f"/jobs/{job_id}/artifacts.zip", params=[("criterion", net), ("criterion", split)]
+    ), job_id)
+    layers = {f"p{n}.{s}.{suffix}" for suffix in ("svg", "layer.png", "preview.jpg")
+              for n, s in ((1, net), (0, split), (1, split))}
+    assert names == sorted({"manifest.json", "regions.json", "text.p0.auto.json",
+                            "text.p1.auto.json", "text.d0.auto.json", "p0.base.jpg",
+                            "p1.base.jpg"} | layers)
+
+    bad = client.get(f"/jobs/{job_id}/artifacts.zip", params={"criterion": "nope-0000"})
+    assert bad.status_code == 400
+
+    # Unfiltered: every file on disk, as they are.
+    archive, names = _zip_names(client.get(f"/jobs/{job_id}/artifacts.zip"), job_id)
+    on_disk = sorted(f["name"] for f in client.get(f"/jobs/{job_id}/artifacts").json()["files"])
+    assert names == on_disk
+    assert archive.read(f"{job_id}/regions.json") == stored

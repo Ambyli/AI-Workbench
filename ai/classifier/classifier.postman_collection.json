@@ -918,9 +918,17 @@
                   "value": "",
                   "description": "job_id returned by POST /assess (202 body). Paste it here, or set the collection variable `jobId`."
                 }
+              ],
+              "query": [
+                {
+                  "key": "criterion",
+                  "value": "",
+                  "disabled": true,
+                  "description": "Criterion SLUG (not name), from the manifest's `criteria` map or a result's `artifacts.slug`. Repeatable — the union of the criteria given. Scopes the manifest: `files` whose `criteria` intersect them, only those `criteria` entries, only the `items` they have regions on or read a text layer for, plus `layers` and `filter`. An unknown slug is a 400."
+                }
               ]
             },
-            "description": "The manifest: `{job_id, created_at, expires_at, options, criteria, page_geometry, files, total_bytes, dropped, notes, items, zip_url}`. `files` is what is on disk NOW, each with its `url` — layers appear once they have been fetched (they render on first fetch). `criteria` maps each criterion name to its `slug`, region `count`, `sources`, and `text_layers` (the `text.p<n>.<key>.json` / `text.d<i>.<key>.json` files its units used). `items` maps each item n to `{document, page, filename}`; `options.byte_cap` is `{per_item, items, total}` — CLASSIFIER_ARTIFACT_MAX_BYTES is a per-item allowance. Every job writes a directory, so **404** means the job is unknown or has not finished; **410** means it had artifacts and the TTL sweeper or a DELETE removed them. See API.md § `GET /jobs/{job_id}/artifacts`."
+            "description": "The manifest: `{job_id, created_at, expires_at, options, criteria, page_geometry, files, total_bytes, dropped, notes, items, zip_url}`. `files` is what is on disk NOW, each with its `url` — layers appear once they have been fetched (they render on first fetch). Every `files` entry is labelled: `kind` (`manifest` | `regions` | `text` | `layer` | `base`; `other` never occurs for a name the service writes), `format` where it adds information (layers `svg` | `png` | `preview`, text layers `json`; omitted otherwise), `item` (the global item index, `null` for manifest.json, regions.json and document-scope `text.d<i>.*`), `document` (from the `items` map, `i` for `text.d<i>.*`, `null` for job-wide files) and `criteria` (sorted criterion NAMES the file belongs to: every criterion for manifest.json / regions.json; the criteria that read a text layer; every criterion with a region on item n for `p<n>.svg|layer.png|preview.jpg` and `p<n>.base.jpg`; exactly the one criterion for `p<n>.<slug>.*`). The job result's `artifacts.files` carries the same labels (one function writes both). `criteria` maps each criterion name to its `slug`, region `count`, `sources`, and `text_layers` (the `text.p<n>.<key>.json` / `text.d<i>.<key>.json` files its units used). `items` maps each item n to `{document, page, filename}`; `options.byte_cap` is `{per_item, items, total}` — CLASSIFIER_ARTIFACT_MAX_BYTES is a per-item allowance.\n\n**`?criterion=<slug>` (repeatable)** scopes it to those criteria: `files`, `criteria` and `items` cut down as above (`total_bytes` is the scoped files' sum), `layers` — `{\"<n>\": {\"<slug>\": {svg, png, preview}}}`, on each item where that criterion has hits (regions) only — a page it searched without a hit is in `items` but gets no layer — the URLs `p<n>.svg?criterion=<slug>` / `p<n>.layer.png?criterion=<slug>` / `p<n>.preview.jpg?criterion=<slug>` (preview only when `p<n>.base.jpg` exists), fetchable whether or not they are rendered yet — `filter: {criterion: [slugs], criteria: [names]}`, and `zip_url` carrying the same `?criterion=`. Without it the manifest is the whole job.\n\nEvery job writes a directory, so **404** means the job is unknown or has not finished; **410** means it had artifacts and the TTL sweeper or a DELETE removed them; **400** for an unknown slug. See API.md § `GET /jobs/{job_id}/artifacts`."
           },
           "response": []
         },
@@ -1043,9 +1051,17 @@
                   "value": "",
                   "description": "job_id returned by POST /assess (202 body). Paste it here, or set the collection variable `jobId`."
                 }
+              ],
+              "query": [
+                {
+                  "key": "criterion",
+                  "value": "",
+                  "disabled": true,
+                  "description": "Criterion SLUG (not name). Repeatable — the union. Scopes the zip to what belongs to those criteria (see the item description). An unknown slug is a 400."
+                }
               ]
             },
-            "description": "Every file currently in the directory, streamed as one zip (`application/zip`, `Content-Disposition: attachment`). Built from what is on disk, so layers that were never fetched are not in it — fetch them first if you want them. **404** / **410** as for the manifest."
+            "description": "Every file currently in the directory, streamed as one zip (`application/zip`, `Content-Disposition: attachment`), each entry `<job_id>/<name>`. Built from what is on disk, so layers that were never fetched are not in it — fetch them first if you want them.\n\n**`?criterion=<slug>` (repeatable)** streams ONLY what belongs to those criteria: `regions.json` reduced to them and the scoped `manifest.json` (as the manifest's `?criterion=` returns it) — both generated for the zip, the stored files are never rewritten — the text layers they read, the `p<n>.base.jpg` of each item they have regions on, and each criterion's own `p<n>.<slug>.svg` / `.layer.png` / `.preview.jpg` on those items, rendered and cached first if nobody has fetched them (preview only where the base exists). Combined `p<n>.*` layers are not included. A byte-capped directory yields what survived. The manifest's file labels are described on GET /jobs/:jobId/artifacts.\n\n**404** / **410** as for the manifest; **400** for an unknown slug. See API.md § `GET /jobs/{job_id}/artifacts.zip`."
           },
           "response": []
         },

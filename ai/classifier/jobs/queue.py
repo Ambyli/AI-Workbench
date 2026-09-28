@@ -1,26 +1,26 @@
 """Queue glue: wires the shared WorkerPool + FilePayloadStore to the runners.
 
-The classifier uses an async job pattern so that POST /assess,
-POST /assess/compare and POST /locate can return a job ID immediately
-(202 Accepted) without blocking the HTTP connection for the full duration of
-the LLM call.
+The classifier uses an async job pattern so that POST /assess can return a
+job ID immediately (202 Accepted) without blocking the HTTP connection for
+the full duration of the model calls.
 
 Division of labour:
   common.jobs.worker.WorkerPool      — N claim-and-handle loops, wake/poll, recovery
   common.jobs.payloads.FilePayloadStore — job inputs on disk so the queue survives restarts
-  jobs.runners                       — the actual assess / compare / locate work
+  jobs.runners                       — the actual work (run_assess)
   metrics.py                         — Prometheus objects shared with the endpoints
   this module                        — ClassifierQueue: enqueue, handle_job, lifecycle
 
 Flow:
-  1. ``api.assess`` / ``api.locate`` registers a row (phase "staging") and
+  1. ``api.assess`` registers a row (phase "staging") and
      calls ``queue.enqueue()``, which writes the payload, flips the row to
      "pending", and wakes a worker.
   2. One of CLASSIFIER_MAX_CONCURRENT pool workers atomically claims the row
      (→ "processing") and calls ``handle_job``, which reads the payload,
-     dispatches on ``metadata.type`` ("assess" | "compare" | "locate") to a
-     runner, and deletes the payload once it finishes (a job cancelled by
-     shutdown keeps its payload so the requeued row can be re-run).
+     runs ``run_assess``, and deletes the payload once it finishes (a job
+     cancelled by shutdown keeps its payload so the requeued row can be
+     re-run). A row of a removed job type ("compare", "locate" — queued by an
+     older container) fails with a message naming it.
   3. The pool persists the result / error (→ "completed" | "failed") and
      calls ``_on_finish`` for metrics.
   4. Callers poll GET /jobs/{job_id}.
@@ -44,13 +44,14 @@ from common.jobs.sqlite import SqliteRegistry
 from common.jobs.worker import WorkerPool
 
 from config import DB_PATH, MAX_CONCURRENT, PAYLOAD_DIR, WORKER_POLL_INTERVAL_S
-from jobs.runners import run_assess, run_compare, run_locate
+from jobs.runners import run_assess
 from logger import logger
 from metrics import job_duration, job_queue_depth, jobs_in_flight, jobs_total
 from middleware import request_id_var
 from regions.sweeper import ArtifactSweeper
 
-_RUNNERS = {"assess": run_assess, "compare": run_compare, "locate": run_locate}
+# The one job type. Rows of the removed types fail by name (handle_job).
+JOB_TYPE = "assess"
 
 
 class ClassifierQueue:
@@ -129,8 +130,14 @@ class ClassifierQueue:
                     "payload missing — the job's input file was removed or never "
                     "written (usually a restart between enqueue and payload write)"
                 )
-            runner = _RUNNERS.get(job.metadata.get("type", ""), run_assess)
-            return await runner(payload)
+            job_type = job.metadata.get("type", JOB_TYPE)
+            if job_type != JOB_TYPE:
+                raise RuntimeError(
+                    f"job type {job_type!r} no longer exists — /locate and "
+                    "/assess/compare were removed; resubmit to POST /assess"
+                )
+            # Looked up on the module at call time so a test can replace it.
+            return await run_assess(payload)
         except asyncio.CancelledError:
             # A shutdown mid-job: `docker compose stop` / `make up classifier`
             # sends SIGTERM, uvicorn runs the lifespan shutdown, and

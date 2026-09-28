@@ -3,13 +3,11 @@
 Three asks, all of them here so their wording stays consistent with each
 other:
 
-    _build_scaffold()     — a pre-filled JSON response template with the
-                            criterion names as keys, so the model cannot
-                            invent, merge, or rename one.
-    build_llm_prompt()    — the SCORING call: criteria grouped by hint, one
-                            rubric section per group (from
-                            ``config.HINT_RUBRICS``), the document's extracted
-                            text, and at most ONE page image.
+    build_llm_prompt()    — the SCORING call: ONE criterion, the rubric for
+                            its hint (from ``config.HINT_RUBRICS``), the text
+                            layer that criterion's OCR settings produced, and
+                            at most ONE page image. The answer is one flat
+                            JSON object — score, verdict, confidence, reason.
     build_bbox_prompt()   — the enforcement loop's "where is it?": one
                             criterion, one image, a box on a 0-1000 grid, and
                             the previous attempts' rejections as feedback.
@@ -18,28 +16,26 @@ other:
     _system_prompt()      — the shared system prompt for the two small calls,
                             carrying the ``Reasoning strength`` line.
 
-The loop itself is ``llm.boxes``; only the wording lives here, next to the
-scoring prompt it has to stay consistent with. Both small calls are separate
-from the scoring call ON PURPOSE: folding "and give me a box" into the scoring
-prompt would change the JSON the model has to produce for every criterion on
-every job, which is the one prompt in this service that is tuned and working.
+One criterion per scoring call, not all of them in one prompt: each criterion
+is an independent unit of work (see ``analysis.scheduler``), so one that the
+model cannot answer fails alone, a criterion's OCR settings decide what text
+IT sees, and the answer needs no scaffold of keys the model could rename or
+merge. The loop's small calls stay separate from the scoring call for the
+same reason they always were — "and give me a box" would change the JSON the
+scoring call has to produce.
 
 ONE IMAGE PER PROMPT. The vision model (muse-glimmer) is served by vLLM
 WITHOUT ``--limit-mm-per-prompt``, which means a request may contain at most
-one image — a second one fails the whole call. ``build_llm_prompt`` therefore
-takes a single ``image_b64`` (or None, for a text-only document) no matter how
-many pages the document has; ``analysis.llm_eval`` decides which page that is.
-The same rule binds the loop: ``build_bbox_prompt`` attaches the ONE page
-image the scoring call used, and ``build_verify_prompt`` attaches the ONE crop
-— never the page and the crop together. Phase 2: set
-``--limit-mm-per-prompt image=N`` on the vLLM container, then these functions
-can take a list.
+one image — a second one fails the whole call. Documents are single-page, so
+the scoring call attaches THE page image (or none, for .txt / .docx);
+``build_bbox_prompt`` attaches that same page (gridded) or a refine crop, and
+``build_verify_prompt`` attaches the ONE crop — never two images together.
 
 The rubric strings (HINT_RUBRICS) and the extracted-text block heading
 (DOCUMENT_TEXT_HEADING) live in config.py § LLM prompt text, so prompt wording
 can be tuned without touching the assembly logic here.
 
-Process flow position: called by ``analysis.pipeline`` (the scoring prompt)
+Process flow position: called by ``analysis.llm_eval`` (the scoring prompt)
 and ``llm.boxes`` (the other two); the result goes to ``llm.client``.
 """
 
@@ -54,145 +50,73 @@ from config import (
     VISION_LLM_MODEL,
     VISION_LLM_REASONING_STRENGTH,
 )
-from api.schemas import CriterionInput
 from logger import logger
 
-
-def _build_scaffold(criteria: list[CriterionInput]) -> str:
-    """Build a pre-filled JSON response template with criterion names as keys.
-
-    Pre-defining the keys prevents the LLM from grouping or renaming criteria.
-    Only the criteria passed in are included — CV-resolved criteria are handled
-    before this is called and are excluded from the LLM prompt.
-
-    Args:
-        criteria: The LLM-bound criteria for this request.
-
-    Returns:
-        A JSON string with 0-valued placeholders for the model to fill in.
-    """
-    per_criterion = {
-        c.name: {"score": 0, "verdict": "...", "confidence": 0, "reason": "..."}
-        for c in criteria
-    }
-    return json.dumps(
-        {
-            "assessment": {
-                "overall_verdict": "...",
-                "overall_score": 0,
-                "per_criterion_scores": per_criterion,
-            }
-        },
-        indent=2,
-    )
+# The answer the scoring call is asked for, verbatim in the prompt.
+SCORING_SCAFFOLD: dict = {"score": 0, "verdict": "...", "confidence": 0, "reason": "..."}
 
 
 def build_llm_prompt(
     image_b64: str | None,
-    criteria: list[CriterionInput],
+    name: str,
+    hint: str = "auto",
     document_text: str = "",
     *,
     document_kind: str = "image",
-    page_index: int | None = None,
-    page_count: int = 1,
     text_truncated: bool = False,
 ) -> dict:
-    """Assemble the full vLLM chat completion request for a set of criteria.
-
-    All criteria passed here are LLM-bound (type="llm", or type="cv" with no
-    matching detector).  A unified rubric is used — the LLM infers from the
-    criterion name whether to score quality or detect presence:
-      - Quality criteria (e.g. "image sharpness"): score 1-10 for quality level.
-      - Presence criteria (e.g. "has solar panels"): 10=present, 5=uncertain, 1=absent.
-
-    The prompt applies four reliability improvements:
-      1. Pre-filled scaffold    — criterion keys defined in advance.
-      2. Explicit key list      — reinforces expected keys.
-      3. "Do not group" rule    — system prompt forbids merging criteria.
-      4. Verification step      — model self-checks before responding.
+    """Assemble the vLLM chat completion request for ONE criterion.
 
     Document handling:
       * ``document_text`` (already truncated to CLASSIFIER_TEXT_CHAR_BUDGET by
         the caller) is appended as a clearly-labelled block, and the system
         prompt tells the model it may use image and text together.
-      * At most ONE image is attached — vLLM rejects multi-image requests
-        while muse-glimmer runs without ``--limit-mm-per-prompt``. Pass None
+      * At most ONE image is attached — see the module docstring. Pass None
         for a text-only document (.txt / .docx); the content array then holds
-        text only and the JSON response format is unchanged.
+        text only and the response format is unchanged.
 
     Args:
-        image_b64:      Base64-encoded JPEG of one (resized) page image, or
-                        None when the document has no images.
-        criteria:       LLM-bound CriterionInput objects.
-        document_text:  Extracted text for the whole document ("" if none).
+        image_b64:      Base64-encoded JPEG of the (resized) page image, or
+                        None when the document has none.
+        name:           The criterion.
+        hint:           "quality" | "presence" | "auto" — selects the rubric.
+        document_text:  The text layer for this criterion ("" if none).
         document_kind:  "image" | "pdf" | "txt" | "docx", for context.
-        page_index:     Which page the attached image came from (0-based).
-        page_count:     How many pages the document has in total.
         text_truncated: True when document_text was cut at the char budget.
 
     Returns:
         A dict ready to POST to the vLLM /v1/chat/completions endpoint.
     """
     logger.debug(
-        "build_llm_prompt: image_b64[%s] kind=%s page=%s/%s text=%d chars criteria=%s hints=%s",
+        "build_llm_prompt: '%s' hint=%s image_b64[%s] kind=%s text=%d chars",
+        name,
+        hint,
         f"{len(image_b64)} chars" if image_b64 else "none",
         document_kind,
-        page_index,
-        page_count,
         len(document_text),
-        [c.name for c in criteria],
-        {c.name: c.hint for c in criteria},
     )
 
-    # --- Group criteria by hint and emit one rubric section per group ---
-    # Ordering: quality → presence → auto, so explicit hints come first.
-    hint_order = ["quality", "presence", "auto"]
-    sections = []
-    for hint_val in hint_order:
-        group = [c for c in criteria if c.hint == hint_val]
-        if not group:
-            continue
-        rubric_def = HINT_RUBRICS[hint_val]
-        names = "\n".join(f"  - {c.name}" for c in group)
-        section = f"{rubric_def['heading']}:\n  {rubric_def['rubric']}"
-        if rubric_def["extra"]:
-            section += f"\n  {rubric_def['extra']}"
-        section += f"\n{names}"
-        sections.append(section)
-    criteria_text = "\n\n".join(sections)
-
-    # --- Improvement 1: pre-filled scaffold ---
-    scaffold = _build_scaffold(criteria)
-
-    # --- Improvement 2: explicit key list ---
-    key_list = ", ".join(f'"{c.name}"' for c in criteria)
-    n = len(criteria)
+    rubric_def = HINT_RUBRICS.get(hint) or HINT_RUBRICS["auto"]
+    rubric = f"{rubric_def['heading']}:\n  {rubric_def['rubric']}"
+    if rubric_def["extra"]:
+        rubric += f"\n  {rubric_def['extra']}"
 
     # --- Document context: what the model is actually looking at ---
-    # A one-line header so the model knows whether the attached image is the
-    # whole document or one page of many (and that the rest is in the text).
     if document_kind == "image":
         context_line = "You are assessing a single image."
-    elif image_b64 and page_count > 1:
-        context_line = (
-            f"You are assessing a {page_count}-page {document_kind} document. "
-            f"The attached image is page {(page_index or 0) + 1} of {page_count}; "
-            "the extracted text below covers every page."
-        )
     elif image_b64:
         context_line = f"You are assessing a 1-page {document_kind} document."
     else:
         context_line = (
-            f"You are assessing a {document_kind} document that has no page images. "
-            "Judge every criterion from the extracted text below."
+            f"You are assessing a {document_kind} document that has no page image. "
+            "Judge the criterion from the extracted text below."
         )
 
     # --- Extracted text block (truncation already applied by the caller) ---
     text_block = ""
     if document_text.strip():
         truncation_note = (
-            "\n[text truncated at the configured character budget — later pages "
-            "may be missing]"
+            "\n[text truncated at the configured character budget]"
             if text_truncated
             else ""
         )
@@ -203,23 +127,19 @@ def build_llm_prompt(
             "---\n"
         )
 
-    # --- Full user message (improvements 1, 2, and 4) ---
+    scaffold = json.dumps(SCORING_SCAFFOLD, indent=2)
     user_text = (
         f"{context_line}\n\n"
-        f"{criteria_text}"
+        f"{rubric}\n\n"
+        f"CRITERION: {name}"
         f"{text_block}\n\n"
-        "Fill in the following JSON structure. "
-        "The keys in per_criterion_scores are already defined — "
-        "do NOT change, rename, merge, or add any keys:\n\n"
-        f"{scaffold}\n\n"
-        f"Required keys in per_criterion_scores ({n} total): {key_list}\n\n"
-        # Improvement 4: self-verification step
-        f"Before returning, verify your JSON contains exactly those {n} keys in "
-        "per_criterion_scores — no more, no fewer, with names spelled exactly as shown. "
-        "If any key is missing or renamed, revise before responding."
+        "Score this one criterion. Return ONLY this JSON object, filled in — "
+        "'score' is 1-10 on the rubric above, 'verdict' is PASS (7-10), "
+        "MARGINAL (4-6) or FAIL (1-3), 'confidence' is 0-100, and 'reason' "
+        "is one or two sentences of evidence:\n\n"
+        f"{scaffold}"
     )
 
-    # --- System prompt (improvement 3: do-not-group rule) ---
     if document_text.strip():
         # Both modalities are available: say so explicitly, and warn that the
         # text may be OCR output so the model treats near-misses sensibly.
@@ -231,18 +151,16 @@ def build_llm_prompt(
             "errors — judge meaning, not exact spelling. "
             if image_b64
             else
-            "You are given a document as extracted text only — it has no page images. "
-            "Judge every criterion from that text. It may be OCR output and can "
+            "You are given a document as extracted text only — it has no page image. "
+            "Judge the criterion from that text. It may be OCR output and can "
             "contain recognition errors — judge meaning, not exact spelling. "
         )
     else:
-        source_sentence = "Analyze the provided image and score it against each criterion listed below. "
+        source_sentence = "Analyze the provided image and score it against the criterion. "
 
     system_prompt = (
         "You are a document assessment expert. "
         f"{source_sentence}"
-        "Score each criterion independently — do NOT group multiple criteria under a "
-        "single key or summarise them together. "
         "Set confidence to a number 0-100: 0 = completely uncertain, 100 = completely certain. "
         "Return ONLY a valid JSON object."
     )
@@ -251,13 +169,9 @@ def build_llm_prompt(
         # (see ai/vllm/VLLM.md "Parsers and sampling"). Other models ignore it.
         system_prompt += f"\nReasoning strength: {VISION_LLM_REASONING_STRENGTH}"
 
-    # ONE image maximum — see the module docstring. A text-only document
-    # (.txt / .docx, or an image-less request) sends a text-only content array,
-    # which vLLM accepts from a multimodal model without complaint.
     user_content: list[dict] = []
     if image_b64:
         user_content.append(
-            # Embed the image as a data URI so vLLM can process it
             {
                 "type": "image_url",
                 "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"},
@@ -265,7 +179,7 @@ def build_llm_prompt(
         )
     user_content.append({"type": "text", "text": user_text})
 
-    prompt = {
+    return {
         "model": VISION_LLM_MODEL,
         "messages": [
             {"role": "system", "content": system_prompt},
@@ -277,16 +191,10 @@ def build_llm_prompt(
         # No temperature override: the server's --generation-config auto applies
         # Meta's published sampling for Muse Glimmer (temperature 1.0, top_p
         # 0.95, top_k 64). The model card warns against greedy / near-greedy
-        # decoding, so the old 0.1 is deliberately gone. Consistency comes from
-        # the JSON schema constraint below plus validate_and_clamp().
-        "response_format": {"type": "json_object"},  # forces valid JSON output
+        # decoding. Consistency comes from json_object mode plus
+        # llm.validate.clamp_answer().
+        "response_format": {"type": "json_object"},
     }
-    logger.debug(
-        "build_llm_prompt: returning prompt — %d llm criteria, scaffold keys=%s",
-        len(criteria),
-        [c.name for c in criteria],
-    )
-    return prompt
 
 
 def _system_prompt(instruction: str) -> str:

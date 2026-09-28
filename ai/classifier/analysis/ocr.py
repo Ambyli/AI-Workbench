@@ -1,24 +1,23 @@
-"""The OCR engine singleton, and the decision to use it.
+"""The OCR engine singleton.
 
 Loading three ONNX graphs costs about a second, so the engine is built on
 first use and cached for the life of the process — a deployment that only
-scores native PDFs never pays for it, and ``_needs_ocr`` is what keeps that
-promise per job.
+scores native PDFs never pays for it. WHETHER a page is recognised is decided
+per text layer by ``common.documents.needs_recognition`` (called from
+``analysis.context``), and the engine is only fetched when that says yes.
 
     get_ocr_engine()    — the configured engine, or None when OCR is disabled
                           or its dependencies are missing. ``False`` is the
                           "already tried and unavailable" cache value.
     ocr_engine_status() — the introspection blob GET /document-kinds and
                           ``document_info.ocr`` both read.
-    _needs_ocr()        — whether THIS job should spend time on recognition.
 
-Process flow position: step 2 of ``analysis.pipeline.analyze_document``.
-``ocr_engine_status`` is also read by ``api.introspection``.
+Process flow position: read by ``analysis.context`` when a text layer needs
+recognising; ``ocr_engine_status`` by ``api.introspection``.
 """
 
-from common.documents import Document, RapidOCREngine
+from common.documents import RapidOCREngine
 
-from api.schemas import CriterionInput
 from config import OCR_ENGINE, OCR_MIN_NATIVE_CHARS
 from logger import logger
 
@@ -82,34 +81,3 @@ def ocr_engine_status() -> dict:
         "available": get_ocr_engine() is not None,
         "min_native_chars": OCR_MIN_NATIVE_CHARS,
     }
-
-
-def _needs_ocr(doc: Document, criteria: list[CriterionInput], ocr_mode: str) -> bool:
-    """Decide whether this job should spend time on OCR.
-
-    ``always`` — yes, whenever there is a page image at all.
-    ``never``  — no.
-    ``auto``   — yes when text is both WANTED and MISSING:
-                   * wanted: any text criterion (it has nothing to search
-                     otherwise), or any llm criterion on a document whose
-                     pages have no text — a scan the model reads far better
-                     with the recognised text alongside it, and
-                   * missing: at least one page carries an image whose text
-                     layer is under OCR_MIN_NATIVE_CHARS.
-                 A native PDF, a .txt, or a .docx therefore never pays for
-                 loading the OCR models.
-    """
-    if ocr_mode == "never":
-        return False
-    if not doc.has_images():
-        return False  # nothing to recognise: txt/docx have no rendered surface
-    if ocr_mode == "always":
-        return True
-
-    pages_missing_text = any(
-        p.image_bgr is not None and p.text_chars() < OCR_MIN_NATIVE_CHARS
-        for p in doc.pages
-    )
-    if not pages_missing_text:
-        return False
-    return any(c.type in ("text", "llm") for c in criteria)

@@ -9,19 +9,20 @@ per-kind load, and the fetch for a caller-supplied URL.
                                    Advisory: the magic bytes have the final say.
     _validate_image_dimensions() — reject page images too small to assess.
     _decode_image_bgr()          — raw image bytes → BGR numpy array.
-    load_document_bytes()        — raw bytes → Document (kind detection, page
-                                   cap, PDF render DPI).
+    load_document_bytes()        — raw bytes → Document (kind detection, the
+                                   single-page rule, PDF render DPI).
     validate_url()               — the SSRF check on a caller-supplied URL. The
                                    rule itself is ``common.net`` (the detector
                                    service needs the identical one); this is the
                                    classifier-side adapter that supplies
                                    ``config.BLOCKED_NETWORKS`` and turns a
                                    refusal into the HTTP 400 the endpoints return.
-    _load_bytes_from_input()     — base64 or URL → raw bytes.
+    load_input_bytes()           — base64, URL, or inline text → raw bytes.
 
 Process flow position: below the pipeline, above nothing — it imports no
-sibling. Called by ``analysis.pipeline`` and by ``api.assess`` /
-``api.locate`` (``validate_content_type``) before a job is queued.
+sibling. ``load_input_bytes`` / ``validate_content_type`` are called by
+``api.assess`` at submit (the bytes are needed there, for the single-page
+check); ``load_document_bytes`` by ``jobs.runners`` in the worker.
 """
 
 import base64
@@ -38,7 +39,6 @@ from common.net import BlockedURLError, validate_url as _validate_url
 from config import (
     ACCEPTED_CONTENT_TYPES,
     BLOCKED_NETWORKS,
-    DOC_MAX_PAGES,
     HTTP_CONNECT_TIMEOUT,
     HTTP_TIMEOUT,
     MIN_IMAGE_HEIGHT,
@@ -178,16 +178,19 @@ def load_document_bytes(
         raw:          Complete file bytes.
         filename:     Original filename, recorded on the Document.
         content_type: Declared MIME type (error messages only).
-        keep_source:  Retain the raw bytes on the Document. Only set when the
-                      request asked for regions on a document that might be a
-                      native PDF — ``common.documents.pdf_text_regions`` has
-                      to re-open the file to ask PyMuPDF where a phrase is.
+        keep_source:  Retain the raw bytes on the Document — needed for a
+                      native PDF, where ``common.documents.pdf_text_regions``
+                      re-opens the file to ask PyMuPDF where a phrase is.
+                      Regions are always collected now, so the runner always
+                      passes True; for a single page it costs one copy of an
+                      upload the payload already held.
 
     Returns:
-        A ``Document`` with at least one page.
+        A ``Document`` with exactly one page.
 
     Raises:
-        HTTPException(400): Unsupported or unparseable bytes.
+        HTTPException(400): Unsupported or unparseable bytes, or a PDF with
+            more than one page (normally refused at submit already).
     """
     logger.debug(
         "load_document_bytes: %d bytes filename=%s content_type=%s keep_source=%s",
@@ -201,7 +204,7 @@ def load_document_bytes(
             raw,
             filename=filename,
             content_type=content_type,
-            max_pages=DOC_MAX_PAGES,
+            max_pages=1,
             render_dpi=PDF_RENDER_DPI,
             image_decoder=_decode_image_bgr,
             keep_source=keep_source,
@@ -210,11 +213,19 @@ def load_document_bytes(
         logger.warning("load_document_bytes: rejected %s: %s", filename, exc)
         raise HTTPException(status_code=400, detail=str(exc))
 
+    if doc.truncated_pages:
+        # Submit refuses these; a payload that reaches a worker anyway (an
+        # older container's queue) is refused here rather than half-read.
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "only single-page PDFs are supported "
+                f"(this one has {1 + doc.truncated_pages} pages)"
+            ),
+        )
     logger.info(
-        "load_document_bytes: kind=%s pages=%d truncated=%d has_text=%s has_images=%s",
+        "load_document_bytes: kind=%s has_text=%s has_image=%s",
         doc.kind,
-        len(doc.pages),
-        doc.truncated_pages,
         doc.has_text(),
         doc.has_images(),
     )
@@ -240,16 +251,16 @@ def validate_url(url: str) -> None:
     logger.debug("validate_url: url passed SSRF check")
 
 
-async def _load_bytes_from_input(data: str, type_: str) -> bytes:
-    """Fetch the raw document bytes from a base64 string or a remote URL.
+async def load_input_bytes(data: str, type_: str) -> bytes:
+    """The raw document bytes for a base64 string, a remote URL, or inline text.
 
     For URL inputs: performs an SSRF check before fetching (ssrf.validate_url)
     and sets a descriptive User-Agent to avoid 403 responses from servers that
     block default request libraries.
 
     Args:
-        data:  Base64 string or URL string.
-        type_: "base64" or "url".
+        data:  Base64 string, URL string, or the document text itself.
+        type_: "base64", "url", or "text" (encoded as UTF-8 — a .txt).
 
     Returns:
         Raw file bytes (format is determined later, from the bytes themselves).
@@ -259,14 +270,16 @@ async def _load_bytes_from_input(data: str, type_: str) -> bytes:
         HTTPException(502): HTTP error while fetching the URL.
     """
     data_repr = data[:80] if type_ == "url" else f"base64[{len(data)} chars]"
-    logger.debug("_load_bytes_from_input: type=%s data=%s", type_, data_repr)
+    logger.debug("load_input_bytes: type=%s data=%s", type_, data_repr)
 
-    if type_ == "base64":
+    if type_ == "text":
+        raw = data.encode("utf-8")
+    elif type_ == "base64":
         # Decode the base64 payload directly — no network call needed
         try:
             raw = base64.b64decode(data)
         except Exception as exc:
-            logger.error("_load_bytes_from_input: invalid base64 data: %s", exc)
+            logger.error("load_input_bytes: invalid base64 data: %s", exc)
             raise HTTPException(status_code=400, detail=f"Invalid base64 data: {exc}")
     else:
         # SSRF check must pass before we fetch anything
@@ -276,10 +289,10 @@ async def _load_bytes_from_input(data: str, type_: str) -> bytes:
                 r = await client.get(data, headers={"User-Agent": "Classifier/1.0"})
                 r.raise_for_status()
                 raw = r.content
-            logger.debug("_load_bytes_from_input: fetched %d bytes from URL", len(raw))
+            logger.debug("load_input_bytes: fetched %d bytes from URL", len(raw))
         except httpx.HTTPError as exc:
             logger.error(
-                "_load_bytes_from_input: failed to fetch URL '%s': %s", data[:80], exc
+                "load_input_bytes: failed to fetch URL '%s': %s", data[:80], exc
             )
             raise HTTPException(
                 status_code=502, detail=f"Failed to fetch document URL: {exc}"

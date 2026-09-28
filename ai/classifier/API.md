@@ -1,10 +1,12 @@
 # Classifier API
 
-FastAPI service that assesses **documents** — JPEG/PNG photos, PDFs (native or
-scanned), plain text, and .docx — via OpenCV detectors, deterministic text
-matching, and vision-LLM scoring. The LLM is Meta's Muse-Glimmer-30B served by the
-`muse-glimmer` vLLM container (`VISION_LLM_API` / `VISION_LLM_MODEL` /
-`VISION_LLM_MAX_TOKENS` in the `## Classifier` block of `.env`); see [VLLM.md § Muse Glimmer 30B](../vllm/VLLM.md#muse-glimmer-30b--tensor-parallel--dflash-speculative-decoding).
+FastAPI service that assesses **single-page documents** — JPEG/PNG photos, a
+one-page PDF (native or scanned), plain text, and .docx — against a list of
+criteria, each answered by an OpenCV detector, deterministic text matching,
+the open-vocabulary detector, or the vision LLM. The LLM is Meta's
+Muse-Glimmer-30B served by the `muse-glimmer` vLLM container (`VISION_LLM_API`
+/ `VISION_LLM_MODEL` / `VISION_LLM_MAX_TOKENS` in the `## Classifier` block of
+`.env`); see [VLLM.md § Muse Glimmer 30B](../vllm/VLLM.md#muse-glimmer-30b--tensor-parallel--dflash-speculative-decoding).
 Muse Glimmer's reasoning depth is set per call from `VISION_LLM_REASONING_STRENGTH`
 (default `low`, driven by `CLASSIFIER_REASONING_STRENGTH` in `.env`); its thinking
 is stripped server-side by the `muse_glimmer` reasoning parser, so only the JSON
@@ -14,6 +16,11 @@ Base URL (direct): `http://<host>:8005`
 Base URL (via LiteLLM passthrough): `http://<host>:4001/v1/classifier`
 
 All passthrough requests require `Authorization: Bearer <master-key>`.
+
+**One analysis endpoint.** `POST /assess` is the only one. `/locate` and
+`/assess/compare` were removed and answer **404** like any unknown route.
+`/locate`'s job — geometry without a judgement — is now `"score": false` on a
+criterion of `/assess` (see [§ Locate without judging](#locate-without-judging--score-false)).
 
 ---
 
@@ -25,52 +32,51 @@ One level of subpackages, imported by bare name — the container sets
 
 ```
 ai/classifier/
-  main.py            FastAPI app, lifespan, router registration — nothing else
-  config.py          every constant and env knob in the service, one file
-  logger.py          the one "classifier" logger every module imports
-  middleware.py      correlation IDs: the ContextVar, the filter, the middleware
-  metrics.py         the Prometheus objects produced in one module, read in none
-  utils.py           verdict_from_score — the PASS/MARGINAL/FAIL line
-  api/               the HTTP layer
-    schemas.py       CriterionInput, RegionsOptions, CompareRequest, …
-    assess.py        POST /assess, POST /assess/compare
-    locate.py        POST /locate, and the `features` field it parses
-    introspection.py GET /hints, /cv-detectors, /document-kinds, /health
-    artifacts.py     the four /jobs/{id}/artifacts routes
-  analysis/          the pipeline, split by concern
-    criteria.py      parse the criteria JSON, reject a bad pattern at submit
-    loading.py       bytes → Document: content type, EXIF, kind, URL + SSRF
-    ocr.py           the OCR engine singleton, and whether this job needs it
-    geometry.py      the ≤1000-px working frame and the map back to originals
-    cv_eval.py       the `cv` path: one OpenCV detector across every page
-    detector_eval.py the `detector` path: the open-vocabulary service
-    text_eval.py     the `text` path: deterministic search of the text layer
-    llm_eval.py      what the one LLM call gets to see
-    weighting.py     depends_on resolution and the weighted overall score
-    pipeline.py      analyze_document + analyze_upload / _input / resolve_example
-  regions/           "where did you find it" → files and result fields
-    store.py         the one ArtifactStore instance for the process
-    collect.py       visible_regions, attach_regions, diff_criterion_name
-    artifacts.py     regions.json, the rendered layers, the manifest
-    sweeper.py       the TTL task, the DELETE hook, the disk gauges
+  main.py              FastAPI app, lifespan, router registration — nothing else
+  config.py            every constant and env knob in the service, one file
+  logger.py            the one "classifier" logger every module imports
+  middleware.py        correlation IDs: the ContextVar, the filter, the middleware
+  metrics.py           the Prometheus objects produced in one module, read in none
+  utils.py             verdict_from_score — the PASS/MARGINAL/FAIL line
+  api/                 the HTTP layer
+    schemas.py         AssessRequest, DocumentInput, CriterionInput + the cross-criterion rules
+    criterion_options.py  LLMOptions / TextOptions / CVOptions / DetectorOptions: defaults, caps
+    assess.py          POST /assess — JSON or multipart, one model, the submit-time checks
+    introspection.py   GET /criterion-types, /hints, /cv-detectors, /document-kinds, /health
+    artifacts.py       the four /jobs/{id}/artifacts routes and the lazy layer renderer
+  analysis/            the engine
+    loading.py         bytes → Document: content type, EXIF, kind, URL + SSRF, single-page rule
+    ocr.py             the OCR engine singleton
+    geometry.py        the ≤1000-px working image and its PageGeometry
+    context.py         DocumentContext: what every criterion shares, read-only; the OCR memo
+    outcome.py         Outcome — the one shape every evaluator returns
+    cv_eval.py         the `cv` evaluator (and its fallback)
+    text_eval.py       the `text` evaluator
+    llm_eval.py        the `llm` evaluator: one scoring call, then maybe the box loop
+    detector_eval.py   the `detector` evaluator
+    scheduler.py       dependency waves, the per-job cap, error isolation
+    weighting.py       the weighted overall score, and `complete`
+    pipeline.py        analyze_document: context → schedule → weigh → store → assemble
+  regions/             "where did you find it" → files and result fields
+    store.py           the one ArtifactStore instance for the process
+    collect.py         visible_regions, inline_regions
+    artifacts.py       regions.json, text.<key>.json, the base image, the manifest, render_layer
+    sweeper.py         the TTL task, the DELETE hook, the disk gauges
   llm/
-    prompts.py       the scoring prompt, and the loop's two small ones
-    client.py        call_vllm, call_vllm_json, the image encoder, the counters
-    validate.py      key normalisation, score/confidence clamping
-    boxes.py         the bounding-box enforcement loop
-  cv/                REGISTRY + get_detector in __init__.py
-    quality.py       check_blur, check_exposure — whole-page, no regions
-    features.py      vegetation, sky, faces, water, text — each with regions
-    regions.py       the two region shapes the detectors build
+    prompts.py         the single-criterion scoring prompt, and the loop's two small ones
+    client.py          LLM_CALLS (the process-wide limit), call_vllm, call_vllm_json, the encoder
+    validate.py        find the answer, clamp it, derive the verdict from the score
+    boxes.py           the bounding-box enforcement loop
+  cv/                  REGISTRY + get_detector in __init__.py
+    quality.py         check_blur, check_exposure — whole-page, no regions
+    features.py        vegetation, sky, faces, water, text — each with regions
+    regions.py         the two region shapes the detectors build
   detector/
-    client.py        the ai/detector HTTP client (transport only)
-  compare/
-    scoring.py       similarity, the quality/similarity blend, the aggregate
-    diff.py          change detection: ORB + RANSAC, then a pixel difference
+    client.py          the ai/detector HTTP client (transport only)
   jobs/
-    payloads.py      the JSON-safe dict each endpoint stores at enqueue time
-    runners.py       run_assess, run_compare, run_locate
-    queue.py         ClassifierQueue + the registry / queue / sweeper singletons
+    payloads.py        the one payload shape (schema 2)
+    runners.py         run_assess
+    queue.py           ClassifierQueue + the registry / queue / sweeper singletons
   bin/
     grounding_experiment.py   operator tool — runs where the model is
 ```
@@ -78,23 +84,27 @@ ai/classifier/
 Import direction is strictly one way:
 
 ```
-config → logger / metrics / utils → api.schemas
-       → cv, llm, detector, compare, regions → analysis → jobs → api → main
+config → logger / metrics / utils → api.criterion_options → api.schemas
+       → cv, llm, detector, regions → analysis → jobs → api (routers) → main
 ```
 
 `analysis` may import `regions`, `llm`, `cv` and `detector`; `regions` must
-never import `analysis` — that is what keeps region collection additive, so
-asking *where* can never move a score. `api/__init__.py` deliberately imports
-nothing: `regions`, `analysis` and `llm` all import `api.schemas`, and a router
-import there would close the cycle back through `jobs`.
+never import `analysis` — that is what keeps storing geometry additive, so
+asking *where* can never move a score (`analysis.pipeline` hands `regions`
+plain outcomes and a callback). `api/__init__.py` deliberately imports
+nothing: `regions`, `analysis` and `llm` all import `api.schemas`, and a
+router import there would close the cycle back through `jobs`.
+`api.criterion_options` imports `cv` (to know whether a `cv` name has an
+OpenCV detector) and `detector.client` (whether DETECTOR_URL is set); neither
+imports back.
 
 ---
 
 ## Async job pattern
 
-`POST /assess`, `POST /assess/compare`, and `POST /locate` all return
-**202 Accepted** immediately with a job ID. Poll `GET /jobs/{job_id}` until
-`phase` is `"completed"` or `"failed"`, then read the `result` field.
+`POST /assess` returns **202 Accepted** immediately with a job ID. Poll
+`GET /jobs/{job_id}` until `phase` is `"completed"` or `"failed"`, then read
+the `result` field.
 
 ```
 POST /assess  →  {"job_id": "abc123", "phase": "pending"}
@@ -108,76 +118,92 @@ uses. The endpoint shapes and response fields are documented there.
 
 ### Concurrency and durability
 
-The jobs table **is** the queue. `CLASSIFIER_MAX_CONCURRENT` worker tasks
-(default `2`, set in `.env`) each atomically claim the oldest `pending` row and
-run it, so at most that many jobs are analysed at once and a burst of
-submissions drains at that rate. Size it to the vision model: a compare job
-with N live examples issues N+1 LLM calls of its own, and `muse-glimmer` runs
-`--max-num-seqs 4`, so anything past four in-flight requests queues inside
-vLLM rather than running in parallel. Set it to `1` for the
-old strictly-serial behaviour.
+The jobs table **is** the queue. Inside a job, every criterion is its own unit
+of work — criterion + document in, one result out — so there are four limits,
+the last three process-wide (`common.jobs.limits.ConcurrencyLimit`, an
+`asyncio.Semaphore` that is safe across event loops, since every worker runs
+in the one process):
+
+| Knob | Bounds | Default |
+|---|---|---|
+| `CLASSIFIER_MAX_CONCURRENT` | jobs at once — worker tasks each atomically claiming the oldest `pending` row | 4 |
+| `CLASSIFIER_MAX_CRITERIA_PER_JOB` | criteria ONE job evaluates at once. A dependant waiting on its `depends_on` does not hold a slot | 2 |
+| `CLASSIFIER_MAX_LLM_CALLS` | vision-model requests in flight across ALL jobs, every call type — scoring, box ask, refine, verify. Acquired in `llm/client.py` around the HTTP request itself, so no call path gets around it; a retry takes a fresh slot. Size it to the model: `muse-glimmer` runs `--max-num-seqs 4` | 4 |
+| `CLASSIFIER_OCR_WORKERS` | OCR passes at once (one ONNX inference each, in a worker thread) | 4 |
 
 Phases: `staging` → `pending` → `processing` → `completed` | `failed`.
 `staging` is the few milliseconds between the row being created and its
 payload landing on disk; workers never claim it.
 
-Job inputs (image bytes + criteria, or the full compare request) are written
-to `PAYLOAD_DIR` (default `/data/payloads`, same volume as the DB) and deleted
-when the job reaches a terminal phase. On startup the service requeues any
-`processing` rows a previous container left behind and sweeps orphaned payload
-files, so a restart mid-job re-runs the job rather than losing it.
+Job inputs (the document bytes, resolved AT SUBMIT, plus the validated
+criteria) are written to `PAYLOAD_DIR` (default `/data/payloads`, same volume
+as the DB) and deleted when the job reaches a terminal phase. On startup the
+service requeues any `processing` rows a previous container left behind and
+sweeps orphaned payload files, so a restart mid-job re-runs the job rather
+than losing it.
 
-**Retention.** `JOB_TTL_HOURS` (24) is now enforced, not informational: the
-artifact sweeper deletes a terminal job's artifact directory **and its row**
-past the TTL, on startup and every `CLASSIFIER_ARTIFACT_SWEEP_INTERVAL_S`. A
-job still `pending` or `processing` is never swept, however old — a queue that
-backed up for a day should drain, not evaporate.
+**Retention.** `JOB_TTL_HOURS` (24) is enforced: the artifact sweeper deletes a
+terminal job's artifact directory **and its row** past the TTL, on startup and
+every `CLASSIFIER_ARTIFACT_SWEEP_INTERVAL_S`. A job still `pending` or
+`processing` is never swept, however old.
 
-Metrics: `classifier_job_queue_depth` (rows in `pending`) and
-`classifier_jobs_in_flight` (rows being processed, never above
-`CLASSIFIER_MAX_CONCURRENT`).
+Metrics: `classifier_job_queue_depth` (rows in `pending`),
+`classifier_jobs_in_flight` (rows being processed), `classifier_llm_calls_total`
+and `classifier_llm_latency_seconds` (every model request).
+
+### Deploying this version
+
+**Drain the queue before recreating the container.** Payloads are now
+`schema: 2` (one request shape, per-criterion options); a payload queued by an
+older container — an old-shape assess, or any `compare` / `locate` job — is
+refused by the new runner with a message naming why, and the job fails rather
+than half-running. Wait for `classifier_job_queue_depth` to reach 0 (or
+`GET /jobs?phase=pending` to come back empty) before `up -d --force-recreate`.
 
 ---
 
 ## Documents
 
-Every upload — a phone photo, a 12-page PDF, a .txt, a .docx — is normalised by
+Every upload is normalised by
 [`common.documents`](../../shared/common/src/common/documents/__init__.py) into
-a list of **pages**, each of which may carry an image, a text layer, or both.
-Criteria then run against whichever of those they need, so the same criteria
-list works across kinds.
+**one page** that may carry an image, a text layer, or both. Criteria then run
+against whichever of those they need, so the same criteria list works across
+kinds.
 
-| Kind | Extensions | Detected by | Pages | Page images | Native text |
-|---|---|---|---|---|---|
-| `image` | `.jpg` `.jpeg` `.png` | magic bytes `FF D8 FF` / `89 50 4E 47 0D 0A 1A 0A` | 1 | yes (EXIF-rotated) | no — needs OCR |
-| `pdf` | `.pdf` | `%PDF-` in the first 1 KB | up to `CLASSIFIER_DOC_MAX_PAGES` (20) | yes, rendered at `CLASSIFIER_PDF_RENDER_DPI` (150) | yes when the PDF is digital; a scan has none |
-| `txt` | `.txt` | decodes as UTF-8 (BOM ok), no NUL bytes, mostly printable | 1 | **no** | yes |
-| `docx` | `.docx` | ZIP magic `PK\x03\x04` containing `word/document.xml` | 1 | **no** | yes (paragraphs + table cells in document order) |
+| Kind | Extensions | Detected by | Page image | Native text |
+|---|---|---|---|---|
+| `image` | `.jpg` `.jpeg` `.png` | magic bytes `FF D8 FF` / `89 50 4E 47 0D 0A 1A 0A` | yes (EXIF-rotated) | no — needs OCR |
+| `pdf` | `.pdf` | `%PDF-` in the first 1 KB | yes, rendered at `CLASSIFIER_PDF_RENDER_DPI` (150) | yes when the PDF is digital; a scan has none |
+| `txt` | `.txt` | decodes as UTF-8 (BOM ok), no NUL bytes, mostly printable | **no** | yes |
+| `docx` | `.docx` | ZIP magic `PK\x03\x04` containing `word/document.xml` | **no** | yes (paragraphs + table cells in document order) |
 
 **Detection is by content, never by filename or `Content-Type`.** A PDF
-uploaded as `image/png` still loads as a PDF. The declared content type is only
-used for an early allowlist reject (`image/jpeg`, `image/png`,
-`application/pdf`, `text/plain`, the .docx type, `application/octet-stream`, and
-`application/msword` — the last one only so a legacy `.doc` reaches the
-magic-byte check and gets its specific "convert to .docx" 400). The kind is
-detected on the `POST /assess` request itself, so an unsupported file is a 400
-at submit time and never becomes a job.
+uploaded as `image/png` still loads as a PDF. The declared content type of a
+multipart part is only used for an early allowlist reject (`image/jpeg`,
+`image/png`, `application/pdf`, `text/plain`, the .docx type,
+`application/octet-stream`, and `application/msword` — the last one only so a
+legacy `.doc` reaches the magic-byte check and gets its specific "convert to
+.docx" 400). The kind is detected on the `POST /assess` request itself, so an
+unsupported file is a 400 at submit time and never becomes a job.
 
 `GET /document-kinds` returns this table live from a running container, plus
 the OCR engine's actual availability.
 
 ### Limitations
 
+* **Single page only.** A PDF with more than one page is refused at submit —
+  HTTP 400, `only single-page PDFs are supported (this one has N pages)`. The
+  page count is read with PyMuPDF from the cross-reference table
+  (`common.documents.pdf_page_count`), without rendering anything. Photos,
+  `.txt` and `.docx` are one page by nature (python-docx reads XML, not a
+  laid-out page).
 * **Legacy `.doc` is not supported.** An OLE2 file (`D0 CF 11 E0 A1 B1 1A E1`)
-  is rejected with HTTP 400 telling the caller to convert to `.docx`. There is
-  no server-side conversion step.
-* **`.txt` and `.docx` have no page images**, so `cv` criteria against them are
-  marked `SKIPPED` (`method: "skipped"`) and excluded from the weighted score
-  — "not applicable", not "failed". The LLM call for those kinds is text-only.
-* **Only PDFs are multi-page.** python-docx reads XML, not a laid-out page, so
-  a .docx collapses to one page.
-* **PDF pages past the cap are dropped**, with the count reported in
-  `document_info.truncated_pages`.
+  is rejected with HTTP 400 telling the caller to convert to `.docx`.
+* **`.txt` and `.docx` have no page image**, so `cv` and `detector` criteria
+  against them come back `status: "skipped"` and are excluded from the
+  weighted score — "not applicable", not "failed" — the `llm` prompt is
+  text-only, and a `score: false` criterion is refused (there is nowhere to
+  locate anything).
 * **One image per LLM prompt** — see below.
 
 ### OCR
@@ -187,105 +213,178 @@ to search and the vision model would have to read pixels alone. The bundled
 OCR engine (RapidOCR / PP-OCRv6 ONNX, `CLASSIFIER_OCR_ENGINE=rapidocr`, models
 baked into the image at build time) fills that gap.
 
-| `ocr` | Behaviour |
+OCR is a **per-criterion** setting — `options.ocr` on every `text` and `llm`
+criterion — and it decides the text layer that criterion reads:
+
+| `options.ocr` | The criterion's text layer |
 |---|---|
-| `auto` (default) | Recognise only when text is **wanted and missing**: some page carries an image whose native text is under `CLASSIFIER_OCR_MIN_NATIVE_CHARS` (20), *and* the request has a `text` or `llm` criterion. A native PDF / .txt / .docx therefore never loads the models. |
-| `always` | Recognise every page image, replacing any native text layer. |
-| `never` | No OCR. `text` criteria against an image-only document score 1/FAIL with `"No text available for this document…"`. |
+| `auto` (default) | Recognised when the page has an image and its native text is under `CLASSIFIER_OCR_MIN_NATIVE_CHARS` (20); the native text otherwise. A native PDF / .txt / .docx therefore never loads the models. |
+| `always` | Recognised whenever the page has an image, regardless of native text. |
+| `never` | Native text only. A `text` criterion on an image-only document scores 1/FAIL with `"No text available for this document under ocr=never…"`. |
 
-Set it as the `ocr` form field on `/assess` or the `ocr` body field on
-`/assess/compare`; it applies to the subject and every live example.
-`CLASSIFIER_OCR_ENGINE=none` disables OCR deployment-wide regardless of the
-request (`GET /document-kinds` reports `ocr.available: false`).
+**One pass per setting.** The text layers are memoised per job by their
+resolved settings (`analysis.context`): criteria with identical settings share
+ONE recognition pass; different settings each get their own, run concurrently
+up to `CLASSIFIER_OCR_WORKERS`. OCR runs only for criteria that need text — a
+job of `cv` criteria never touches the engine. The layers are produced by
+`common.documents.recognize_text_layer`, which never mutates the page, which
+is what lets two settings coexist on one document.
 
-Per-page provenance comes back in `document_info.pages[*].text_source`
-(`native` | `ocr` | `none`) with `ocr_confidence` (0–1) for recognised pages.
-A `text` criterion's `confidence` is 100 for native text, the recogniser's
-confidence ×100 for OCR'd text, and 0 when there is no text at all.
+`CLASSIFIER_OCR_ENGINE=none` disables OCR deployment-wide (`GET
+/document-kinds` reports `ocr.available: false`); an `auto` / `always`
+criterion then gets the native layer, and `document_info.ocr.layers[].note`
+says OCR was wanted but unavailable.
+
+Every layer the job produced is listed in `document_info.ocr.layers` (`key`,
+`mode`, `ran`, `source`, `chars`, `confidence`, `note`) and stored as
+`text.<key>.json` — see [§ The text a criterion searched](#the-text-a-criterion-searched).
 
 ### What the vision model sees
 
-The LLM call carries the document's extracted text — a
+Each `llm` criterion is **one scoring call of its own**: the page image (the
+≤1000-px working copy) plus the text layer its `options.ocr` produced — a
 `DOCUMENT TEXT (extracted, may contain OCR errors)` block, truncated at
 `CLASSIFIER_TEXT_CHAR_BUDGET` (60 000 characters) with a note when truncated —
-plus **at most one page image**.
+and the rubric its `options.hint` selects. The answer is one flat JSON object,
+`{"score", "verdict", "confidence", "reason"}`; the verdict is always
+recomputed from the clamped score. What was sent is in the result's
+`detail`: `{hint, image_sent, text_sent: {chars, truncated, budget, source}}`.
 
 > **One image per prompt.** `muse-glimmer` is served **without**
 > `--limit-mm-per-prompt`, so vLLM accepts a single image per request; a second
-> one fails the whole call. The page sent is the first page a `text` criterion
-> matched on, else page 0 — reported as `document_info.llm_image_page`.
-> **Phase 2:** set `--limit-mm-per-prompt image=N` on the vLLM container and
-> the prompt builder can send one image per page.
+> one fails the whole call. Documents are single-page, so the page image is
+> the one image.
 
-A document with no page images sends a text-only prompt (still
+A document with no page image sends a text-only prompt (still
 `response_format: json_object`), and the system prompt tells the model to judge
 from the text.
 
 ---
 
-## `CriterionInput` — shared input object
+## Request
 
-Used in both `/assess` (as a JSON array string) and `/assess/compare` (as a
-JSON array in the request body).
+One request, accepted two ways, parsed into ONE pydantic model
+(`api.schemas.AssessRequest`) — so a JSON caller and a multipart caller can
+never be treated differently.
+
+**JSON** (`Content-Type: application/json`):
+
+```json
+{
+  "document": {"type": "base64", "data": "<base64>", "filename": "invoice.pdf"},
+  "criteria": [ … ]
+}
+```
+
+| `document.type` | `data` is | Notes |
+|---|---|---|
+| `base64` | the file, base64-encoded | |
+| `url` | an `http(s)` URL | Fetched **at submit** (the single-page check needs the bytes), after the SSRF check (`common.net`: private, loopback and link-local addresses refused). 400 when blocked, 502 when the fetch fails |
+| `text` | the document text itself | Treated as a `.txt`, UTF-8; `document_info.filename` is `inline.txt` |
+
+`filename` is optional and only recorded in `document_info`.
+
+**Multipart** (`Content-Type: multipart/form-data`):
+
+| Field | Required | Description |
+|---|---|---|
+| `file` | one of `file` / `text` | The document. The legacy name `image` is still accepted |
+| `text` | one of `file` / `text` | Inline text, same as the JSON `type: "text"` |
+| `criteria` | no | The same JSON array as the JSON body's `criteria`, as a string. Omitted: the four default quality criteria |
+
+Any other form field is a 400 — the removed `ocr` and `regions` fields are
+named, with where each went (`options.ocr` on each criterion; regions are
+always stored). A `Content-Type` that is neither JSON nor multipart is
+**415**.
+
+### `CriterionInput`
+
+The top level holds only what every type shares; everything type-specific is
+in `options`:
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `name` | string | — | The criterion to evaluate. Free-form text — the LLM interprets any name; for `type: "text"` it doubles as the default `pattern`. |
-| `type` | `"cv"` \| `"llm"` \| `"text"` \| `"detector"` | `"llm"` | `"llm"`: scored by the vision LLM (one page image + the extracted text). `"cv"`: run through a registered OpenCV detector by name; `SKIPPED` when the document has no page images; when no detector matches it goes to the [open-vocabulary detector](#the-detector) if `regions.detector` is set and `DETECTOR_URL` is configured, and to the LLM otherwise. `"detector"`: always the open-vocabulary detector, using the criterion name as the text prompt — boxes and a score, no tokens, whether or not layers were requested; falls back to the LLM when the service is unconfigured or unreachable. `"text"`: deterministic search of the document's text layer — no tokens. |
-| `weight` | float (> 0) | `1.0` | Relative weight in the combined weighted score. Higher = matters more. |
-| `hint` | `"quality"` \| `"presence"` \| `"auto"` | `"auto"` | Tells the LLM which scoring rubric to use. `"quality"`: score quality 1-10. `"presence"`: detect presence/absence. `"auto"`: LLM infers from the criterion name. Ignored for `cv` criteria that match a detector and for `text` criteria. |
-| `depends_on` | string \| null | `null` | Name of another criterion that must **PASS** (score ≥ 7) before this criterion is evaluated. If the dependency does not pass — including if it was itself skipped — this criterion is marked `SKIPPED` and excluded from the weighted score. Chains are supported: A → B → C all skip if A fails. |
-| `pattern` | string \| null | `null` → `name` | **`type: "text"` only.** What to search for. Literal text for `contains`/`exact`/`fuzzy`; a Python regular expression for `regex`. Max 500 characters. |
-| `match` | `"contains"` \| `"exact"` \| `"regex"` \| `"fuzzy"` | `"contains"` | **`type: "text"` only.** How `pattern` is matched — see the table below. |
-| `case_sensitive` | bool | `false` | **`type: "text"` only.** Case-fold both sides when false. |
-| `fuzzy_threshold` | float 0–1 | `0.85` | **`type: "text"` only.** Similarity a sliding window must reach to count as a hit in `fuzzy` mode. |
-| `min_count` | int ≥ 1 | `1` | **`type: "text"` only.** How many hits are required before the criterion PASSes. |
+| `name` | string (1–200) | — | The criterion. Unique in the request. For `text` it is also the default `pattern`; for `cv` it is matched against the OpenCV registry; for `detector` it is the text prompt |
+| `type` | `llm` \| `text` \| `cv` \| `detector` | `llm` | The evaluation path — see below |
+| `weight` | number > 0 | `1` | Relative weight in the overall score |
+| `depends_on` | string \| null | `null` | Another SCORED criterion that must **PASS** first — see [§ Dependencies](#dependencies) |
+| `score` | bool | `true` | `false` = locate without judging — see [§ Locate without judging](#locate-without-judging--score-false) |
+| `options` | object | `{}` | Per type, below. `GET /criterion-types` serves each type's JSON schema, resolved defaults and caps |
+
+| `type` | `options`, with defaults |
+|---|---|
+| `llm` | `hint` (`quality` \| `presence` \| `auto`, default `auto`), `boxes` (default **`false`** — the [bounding-box loop](#the-llm-enforcement-loop)), `max_attempts` (default and cap `CLASSIFIER_LLM_BBOX_MAX_ATTEMPTS`; may be lowered, never raised), `ocr` (`auto` \| `always` \| `never`, default `auto` — the text layer sent with the prompt) |
+| `text` | `pattern` (default: the name; max 500 characters), `match` (`contains` default \| `exact` \| `regex` \| `fuzzy`), `case_sensitive` (`false`), `fuzzy_threshold` (`0.85`, 0–1), `min_count` (`1`, 1–1000), `ocr` (`auto`) |
+| `cv` | `fallback` (`detector` \| `llm`) — what answers when no OpenCV detector matches the name. Default: `detector` when `DETECTOR_URL` is configured on this container, `llm` otherwise |
+| `detector` | `threshold` (0–1, default `DETECTOR_MIN_SCORE`) |
+
+**Validation** — every one is a **400 at submit**, naming the field, and
+nothing is queued:
+
+* an unknown option key, a value of the wrong type (options are strict: `"2"`
+  is not an integer, `"yes"` is not a boolean), or a value past a cap
+  (`criteria.0: options.max_attempts: max_attempts 9 exceeds this server's cap
+  (CLASSIFIER_LLM_BBOX_MAX_ATTEMPTS=3)…`);
+* an old top-level key (`hint`, `pattern`, `match`, `case_sensitive`,
+  `fuzzy_threshold`, `min_count`) — "these keys moved into 'options'";
+* an unusable text pattern (empty, over 500 characters, an invalid regex),
+  compiled through the matcher's own path;
+* duplicate names; a `depends_on` naming an unknown criterion, itself, or a
+  `score: false` criterion; a dependency cycle (`dependency cycle: a -> c -> b
+  -> a`);
+* `score: false` on a criterion that cannot produce geometry, or on a .txt /
+  .docx;
+* a `detector` criterion (or a `cv` one with an explicit `fallback:
+  "detector"` and no OpenCV match) when `DETECTOR_URL` is empty.
+
+Each result echoes `options_used`: the options after defaults and caps, so
+`pattern` shows the name it defaulted to and `max_attempts` the cap it was
+held to.
+
+### The four types
+
+| `type` | Answered by | Cost |
+|---|---|---|
+| `llm` | One vision-model call for this criterion — the page image + its text layer, the rubric for its `hint`. With `options.boxes` the enforcement loop runs after | 1 call (+ up to 3 per loop attempt) |
+| `text` | `common.documents.match_text` over its text layer (native or OCR'd) | none |
+| `cv` | A registered OpenCV detector on the working image (in a worker thread). With no match, its `fallback`: the detector (scored from boxes) or the llm (default llm options: hint `auto`, no boxes, ocr `auto`). `method` says which answered, and `reason` says a fallback was used | none, or the fallback's |
+| `detector` | The open-vocabulary detector service, one call with the name as the label, scored from the boxes | one detector call |
 
 ### `text` criteria
 
 Deterministic, free (no tokens), and exact about *where* a phrase was found.
-The text searched is the whole document's text layer — native or OCR'd.
 
 | `match` | Semantics | Use it for |
 |---|---|---|
 | `contains` | Substring anywhere (metacharacters are literal) | The default; known exact wording |
 | `exact` | Whole word / whole line, word-boundary anchored | `"Total"` must not match `"Subtotal"` |
-| `regex` | Python `re`, one search per page | Case numbers, dates, dollar amounts |
+| `regex` | Python `re.search` | Case numbers, dates, dollar amounts |
 | `fuzzy` | Best sliding-window similarity (`difflib`) over words | **OCR'd text**, where `Notice to Owner` arrives as `Notlce to 0wner` |
-
-Scoring:
 
 | Situation | Score | Verdict |
 |---|---|---|
 | Found (`count >= min_count`) | `10` | PASS |
 | `fuzzy` near miss, best ratio ≥ 0.5 | `2`–`6`, scaled between the 0.5 floor and `fuzzy_threshold` | FAIL / MARGINAL |
 | Not found (or a fuzzy ratio below 0.5) | `1` | FAIL |
-| Document has no text layer at all | `1` | FAIL, with a reason naming the cause (`ocr=never`, or the engine is disabled) |
+| The text layer is empty | `1` | FAIL, with a reason naming the `ocr` setting |
 
 `confidence` is 100 for native text, the OCR confidence ×100 for recognised
-text, and 0 when there is none. The result's `detail` carries the full match
-record:
+text, and 0 when there is none. `detail` carries the match record:
 
 ```json
-"Notice to Owner": {
-  "score": 10, "verdict": "PASS", "confidence": 99, "method": "text",
-  "reason": "Found 1× on page(s) [0] via fuzzy match (best ratio 0.86).",
-  "detail": {
-    "found": true, "count": 1, "best_ratio": 0.8571,
-    "mode": "fuzzy", "pattern": "Notice to Owner",
-    "pages": [0],
-    "snippets": [{"page": 0, "text": "…33601 NOTICE TO OWNER Under Florida law…", "ratio": 0.8571}],
-    "searched_chars": 577,
-    "case_sensitive": false, "min_count": 1, "fuzzy_threshold": 0.85,
-    "text_source": "ocr"
-  }
+"detail": {
+  "found": true, "count": 1, "best_ratio": 0.8571, "mode": "fuzzy",
+  "pattern": "Notice to Owner",
+  "snippets": [{"text": "…33601 NOTICE TO OWNER Under Florida law…", "ratio": 0.8571}],
+  "searched_chars": 577,
+  "case_sensitive": false, "min_count": 1, "fuzzy_threshold": 0.85, "text_source": "ocr"
 }
 ```
 
-An unusable pattern (empty, longer than 500 characters, or an invalid regex)
-is rejected with **HTTP 400 at submit time**, not as a failed job.
+The exact text searched is not inlined — it is linked, as
+`artifacts.text` (see [§ The text a criterion searched](#the-text-a-criterion-searched)).
 
-### Criterion scoring rubrics
+### Scoring rubrics (`llm`)
 
 | `hint` | Score mapping | Verdict thresholds |
 |---|---|---|
@@ -305,41 +404,179 @@ is rejected with **HTTP 400 at submit time**, not as a failed job.
 | `has water`, `has pool`, `has swimming pool` | Blue/teal hue + flat-texture |
 | `has text`, `has text regions`, `has writing` | Sobel edge density per block |
 
-Fuzzy name matching is applied, so near-matches also work. See `GET /cv-detectors` for the full live list.
+Names are matched exactly (case-insensitive), then by `difflib` at
+`CV_NAME_FUZZY_CUTOFF` (0.8) so typos still land — `has textt` → `has text`.
+Anything less similar uses the criterion's `fallback`. See `GET /cv-detectors`
+for the live list.
+
+### Dependencies
+
+`depends_on` names another **scored** criterion. The scheduler runs criteria
+in waves: a dependant is **not evaluated at all** until its dependency has
+finished; if the dependency's verdict is not PASS (or it errored, or was
+itself skipped) the dependant comes back `status: "skipped"` without being
+evaluated — no model call, no OCR pass — with a reason naming the dependency.
+Chains propagate (A → B → C all skip when A fails). Each dependant waits on
+exactly the criterion it names, so an independent criterion is never held back
+by an unrelated slow one.
+
+### Locate without judging — `score: false`
+
+`score: false` keeps the geometry and drops the judgement: the criterion runs
+exactly as a scored one would and returns its `regions`, but its `score`,
+`verdict` and `confidence` are `null`, it is excluded from the weighted score
+and the overall verdict, and no criterion may depend on it. This is what
+`/locate` used to be:
+
+```json
+"criteria": [
+  {"name": "has text", "type": "cv", "score": false},
+  {"name": "Notice to Owner", "type": "text", "score": false, "options": {"match": "fuzzy", "ocr": "always"}},
+  {"name": "a signature", "type": "llm", "score": false, "options": {"hint": "presence", "boxes": true}}
+]
+```
+
+An `llm` criterion with `score: false` still makes its presence call — the box
+loop gates on it — and then drops the answer. A criterion that cannot produce
+geometry is refused at submit: an `llm` criterion without `options.boxes` (or
+with a `quality` hint — sharpness is not a place), the whole-page `cv`
+measurements (`sharpness`, `exposure`), and a `cv` name that falls back to the
+llm.
+
+---
+
+## Result shape
+
+Inside `job.result`, `schema_version: 2`:
+
+```json
+{
+  "schema_version": 2,
+  "document_info": {
+    "kind": "pdf", "filename": "notice.pdf", "content_type": "application/pdf",
+    "size_bytes": 5102, "width": 1240, "height": 1755, "has_image": true,
+    "native_text_chars": 574,
+    "ocr": {"engine": "rapidocr", "min_native_chars": 20,
+            "layers": [{"key": "auto", "mode": "auto", "ran": false, "source": "native",
+                        "chars": 574, "confidence": null, "note": null}]},
+    "llm_text_char_budget": 60000,
+    "detector": {"configured": false, "url_host": null, "calls": 0, "…": "…", "used": false}
+  },
+  "assessment": {
+    "overall_score": 9,
+    "overall_verdict": "PASS",
+    "complete": true,
+    "weighted_score_breakdown": {
+      "formula": "sum(score * weight) / total_weight",
+      "total_weight": 7.0, "weighted_sum": 64.0, "unrounded_average": 9.1429,
+      "final_score": 9, "partial": false,
+      "excluded": {"where is the signature": "score: false"},
+      "per_criterion": {
+        "Notice to Owner": {"score": 10, "weight": 4.0, "contribution": 40.0},
+        "…": "…"
+      }
+    },
+    "per_criterion_scores": {
+      "Notice to Owner": {
+        "status": "ok", "type": "text", "method": "text", "scored": true,
+        "score": 10, "verdict": "PASS", "confidence": 100,
+        "reason": "Found 1x via fuzzy match (best ratio 0.86).",
+        "detail": {"found": true, "count": 1, "…": "…"},
+        "regions": [{"page": 0, "kind": "box", "source": "pdf-text", "…": "…"}],
+        "regions_truncated": false,
+        "artifacts": {
+          "slug": "notice-to-owner-1f3a",
+          "regions_url": "/jobs/abc123/artifacts/regions.json?criterion=notice-to-owner-1f3a",
+          "layers": {"svg": "/jobs/abc123/artifacts/p0.svg?criterion=notice-to-owner-1f3a", "…": "…"},
+          "attempts": [],
+          "text": {"key": "auto", "url": "/jobs/abc123/artifacts/text.auto.json",
+                   "source": "native", "chars": 574}
+        },
+        "localization": null,
+        "options_used": {"pattern": "Notice to Owner", "match": "fuzzy", "case_sensitive": false,
+                         "fuzzy_threshold": 0.85, "min_count": 1, "ocr": "auto"},
+        "error": null
+      }
+    }
+  },
+  "verdict": "PASS",
+  "page_geometry": {"page": 0, "width": 1240, "height": 1755, "working_scale": 0.5694,
+                    "pdf_points": [595.2, 842.4]},
+  "artifacts": {"files": [ … ], "layers": {"svg": "/jobs/abc123/artifacts/p0.svg", "…": "…"},
+                "zip_url": "/jobs/abc123/artifacts.zip", "…": "…"}
+}
+```
+
+**Every criterion has the same keys**, whatever its type or status:
+
+| Key | Meaning |
+|---|---|
+| `status` | `ok` \| `error` \| `skipped` |
+| `type` | The criterion's `type` |
+| `method` | The path that actually answered — for a `cv` criterion with no OpenCV detector, its fallback's (`detector` / `llm`); `null` when skipped by a dependency |
+| `scored` | The criterion's `score` flag |
+| `score` / `verdict` / `confidence` | The judgement; `null` when not scored (`score: false`, skipped, error) |
+| `reason` / `detail` | One or two sentences / structured diagnostics |
+| `regions` | Where, in original page pixels; capped at `CLASSIFIER_INLINE_REGIONS_MAX` (`regions_truncated` says so) |
+| `artifacts` | Per-criterion links — layer URLs (rendered on first fetch) and `text`, the text layer's link; `null` when there is neither geometry nor text |
+| `localization` | `llm` criteria: the enforcement loop's record, `{"attempts": [], "accepted_attempt": null, "calls": 0}` when it did not run. `null` for the other types |
+| `options_used` | Options after defaults and caps |
+| `error` | Why, when `status` is `error` |
+
+**A failed criterion fails alone.** A model HTTP error, an answer that could
+not be parsed after `MAX_LLM_RETRIES`, a detector outage — each gives that
+criterion `status: "error"` with the message in `error`; the job still
+completes. If any **scored** criterion errored the assessment is incomplete:
+`complete: false`, `overall_score` and `overall_verdict` (and `verdict`)
+`null`, and the partial weighted score of what did succeed is still in
+`weighted_score_breakdown` with `partial: true`. `complete` is `true`
+otherwise — including when nothing was scored at all (every criterion `score:
+false`), where the breakdown is `null`.
+
+`image_info` was removed: its width, height, content type and size are in
+`document_info`. `page_geometry` is a single object (`null` for .txt / .docx);
+`document_info` has no per-page lists, `page_count`, `truncated_pages` or
+`llm_image_page` any more.
+
+**Skipped by a dependency:**
+
+```json
+"meter value is readable": {
+  "status": "skipped", "type": "llm", "method": null, "scored": true,
+  "score": null, "verdict": null, "confidence": null,
+  "reason": "Skipped - dependency 'has electrical meter' did not pass (verdict: FAIL).",
+  "…": "…"
+}
+```
+
+**Not applicable** (a `cv` criterion on a .txt / .docx) is the same shape with
+`method: "cv"` and a reason naming the kind.
 
 ---
 
 ## Regions and layers
 
-A score says *whether*. A **region** says *where*: a box or polygon on a
-specific page, in that page's original pixels, attached to the criterion that
-found it. Ask for them with the `regions` option on `/assess` and
-`/assess/compare`, or use [`/locate`](#post-locate), where they are the whole
-point.
-
-**Off by default.** Regions cost extra detector work and the rendered layers
-cost disk, so a request that does not mention them behaves exactly as before —
-same keys, same scores, same verdicts. Turning them on is strictly additive:
-the geometry is read off the results the detectors and text matchers already
-produced, so a score can never move because you asked where.
+A score says *whether*. A **region** says *where*: a box or polygon in the
+page's original pixels, attached to the criterion that found it. **Every job
+stores them** — there is no option to turn on — and storing them is strictly
+additive: the geometry is read off the results the evaluators already
+produced, so a score can never move because of it.
 
 ### What can localise, and what cannot
 
-| Criterion path | Source | What you get |
+| Criterion | Source | What you get |
 |---|---|---|
 | `cv` — `has faces` | `cv` | One box per Haar detection |
 | `cv` — `has vegetation` / `has sky` / `has water` | `cv` | Simplified contour polygons above a minimum area |
 | `cv` — `has text` | `cv` | Adjacent high-density 32×32 blocks merged into boxes — roughly one per paragraph or column |
 | `cv` — `sharpness` / `exposure` | — | **Nothing.** A whole-page measurement does not fabricate a full-page box |
-| `cv` — a name no OpenCV detector matches, with `regions.detector` on | `detector` | One box per detection from the [open-vocabulary detector](../detector/DETECTOR.md), and the criterion is **scored from them** — no LLM call. See [The detector](#the-detector) |
-| `detector` — any name | `detector` | Same, whether or not layers were requested — the criterion named the path |
-| `text` on an OCR'd page | `ocr` | The OCR line polygon(s) the match landed on, with the recogniser's confidence as `score`. A hit spanning a line break yields one region per line |
-| `text` on a native PDF page | `pdf-text` | PyMuPDF rectangles — `search_for` for `contains`/`exact`, word-span reconstruction for `regex`/`fuzzy`. Carries `attrs.pdf_rect` in **points** as well as page pixels |
+| `cv` — a name no OpenCV detector matches, `fallback: detector` | `detector` | Boxes from the [open-vocabulary detector](#the-detector), and the criterion is **scored from them** — no LLM call |
+| `detector` — any name | `detector` | The same, by name |
+| `text` on an OCR'd layer | `ocr` | The OCR line polygon(s) the match landed on, with the recogniser's confidence as `score`. A hit spanning a line break yields one region per line |
+| `text` on a native PDF | `pdf-text` | PyMuPDF rectangles — `search_for` for `contains`/`exact`, word-span reconstruction for `regex`/`fuzzy`. Carries `attrs.pdf_rect` in **points** as well as page pixels |
 | `text` on `.txt` / `.docx` | — | Nothing — no geometry exists. The hits are still in `detail.snippets` |
-| `llm` with `hint: presence`/`auto`, `regions.detector` on | `detector` | Boxes from the detector. The **model still scores** the criterion; the detector only says where |
-| `llm` with `hint: presence`/`auto` scored ≥ 7, `regions.llm_boxes` on | `llm` | A box the model drew and then confirmed by looking at a crop of it, plus **every rejected attempt**. See [The LLM enforcement loop](#the-llm-enforcement-loop) |
-| `llm` — anything else | — | Nothing. `localization` comes back `{"attempts": [], "accepted_attempt": null, "calls": 0}`, which is the honest answer to "where" for a criterion nobody asked to locate |
-| `/assess/compare` with `regions.diff` | `diff` | Polygons of what appeared, disappeared or changed between the subject and each live example. See [Change detection](#change-detection) |
+| `llm` with `options.boxes`, hint `presence`/`auto`, scored ≥ 7 | `llm` | A box the model drew and then confirmed by looking at a crop of it, plus **every rejected attempt**. See [The LLM enforcement loop](#the-llm-enforcement-loop) |
+| `llm` — anything else | — | Nothing. `localization` is the empty shape |
 
 > **Approximation warning.** PDF `regex`/`fuzzy` rectangles are reconstructed
 > from the word boxes covering the match. A phrase PyMuPDF splits differently
@@ -349,87 +586,108 @@ produced, so a score can never move because you asked where.
 ### Coordinates
 
 Every region is in **original page pixels** — after EXIF transpose for a photo,
-after the raster render for a PDF page. Detectors work on a ≤1000-px working
-image and their output is divided by that page's `working_scale` before it is
-stored, so a consumer never has to know the working size existed. The frame for
-each page comes back in `page_geometry`:
+after the raster render for a PDF. Detectors work on a ≤1000-px working image
+and their output is divided by `working_scale` before it is stored, so a
+consumer never has to know the working size existed. The frame is
+`page_geometry`:
 
 ```json
-"page_geometry": [
-  {"page": 0, "width": 1240, "height": 1755, "working_scale": 0.5694,
-   "pdf_points": [595.2, 842.4]}
-]
+"page_geometry": {"page": 0, "width": 1240, "height": 1755, "working_scale": 0.5694,
+                  "pdf_points": [595.2, 842.4]}
 ```
 
 `pdf_points` is the page's size in points for a PDF and `null` otherwise.
+Regions keep `page: 0` and the layers keep the `p0.` prefix — the shared
+`common.vision` code is page-aware, and a single page is simply page 0.
 
-### The `regions` option
+### What a job writes, and what renders on first fetch
 
-Form field on `/assess` and `/locate`, body field on `/assess/compare`:
+| File | When | Notes |
+|---|---|---|
+| `regions.json` | always | The canonical geometry, keyed by criterion (not a flat list), plus `pages` and what the detector did |
+| `manifest.json` | always | What is in the directory, the criterion → slug map (with each criterion's `text_layer` key), `page_geometry`, `dropped`, `notes`, `expires_at` |
+| `text.<key>.json` | one per distinct text layer | The exact text a criterion searched — see the next section |
+| `p0.base.jpg` | when the page has an image | The un-annotated page, JPEG q85. Every preview is composited from it |
+| `p0.svg` / `p0.layer.png` / `p0.preview.jpg` | **on first fetch** | Rendered from regions.json by `regions.artifacts.render_layer`, then cached in the directory |
+| `p0.<slug>.svg` / `.layer.png` / `.preview.jpg` | **on first fetch** | One criterion's layer, the same way — fetched by name, or as `p0.svg?criterion=<slug>` |
+
+A job nobody looks at costs a JSON file, its text layers and a JPEG. The
+result's `artifacts.layers` (and each criterion's `artifacts.layers`) lists the
+layer URLs; they work whether or not the file exists yet. `artifacts.files` is
+what is on disk at the time of the result.
+
+### The text a criterion searched
+
+A `text` criterion's verdict is only as good as the text it searched — and on
+a scan, that text is OCR output. So every text layer a job produces is stored,
+once per distinct setting, as `text.<key>.json`:
+
+* **Key** — a short, stable name for the settings that produced the layer:
+  `auto`, `always`, `never` (the criterion's `options.ocr`, which
+  `options_used.ocr` agrees with). A non-default OCR setting (none exists per
+  criterion today; `min_native_chars` and the engine are server-level) would
+  add a hash — `auto-1a2b3c4d` — so two settings can never share a file.
+* **Shared** — criteria with identical settings use the same layer and link
+  the same file; nothing is duplicated.
+* **Written for every job whose criteria read text** — native text included
+  (`source: "native"` for a .txt, .docx or digital PDF), written by the OCR
+  memo the moment the layer exists. A job of `cv` criteria only has no text
+  layers.
 
 ```json
-"regions": {
-  "enabled": true,
-  "layers": ["svg", "png", "preview"],
-  "layers_per_criterion": false,
-  "llm_boxes": false,
-  "detector": false,
-  "diff": false,
-  "examples": false
+{
+  "key": "always",
+  "settings": {"mode": "always", "min_native_chars": 20, "engine": "rapidocr"},
+  "source": "ocr",
+  "engine": "rapidocr",
+  "chars": 36,
+  "confidence": 0.9,
+  "text": "NOTICE TO OWNER\nTotal Due $4,850.00",
+  "lines": [
+    {"text": "NOTICE TO OWNER", "polygon": [[40, 100], [360, 100], [360, 140], [40, 140]], "confidence": 0.95},
+    {"text": "Total Due $4,850.00", "polygon": [[40, 200], [520, 200], [520, 240], [40, 240]], "confidence": 0.85}
+  ]
 }
 ```
 
-| Field | Default | Meaning |
-|---|---|---|
-| `enabled` | `true` (in the object) | Collect regions at all. Implied on `/locate` |
-| `layers` | `["svg"]` | Any subset of `svg` / `png` / `preview`. `[]` writes `regions.json` only |
-| `layers_per_criterion` | `false` | Pre-render one file per criterion per page at job time instead of on first fetch. For a pipeline that will pull every one anyway — 8 criteria × 20 pages × 3 formats is a lot of files nobody may open |
-| `llm_boxes` | `false` | Run the [enforcement loop](#the-llm-enforcement-loop) for every `llm` presence criterion the model scored ≥ 7. Costs up to two small LLM calls per attempt per criterion. Never changes a score |
-| `detector` | `false` | Hand the [open-vocabulary detector](#the-detector) the implicit work — see below. Needs `DETECTOR_URL`; without it the request still succeeds and `artifacts.notes` says the service is not configured |
-| `diff` | `false` | **Compare only.** [Change detection](#change-detection) against each live single-image example. On `/assess` or `/locate` it is recorded and `artifacts.notes` says it was ignored |
-| `examples` | `false` | **Compare only.** Also collect regions and render layers for the live examples, as `e{i}.p{n}.<fmt>` in the same job directory. Off by default because it doubles the artifact volume |
+`text` is **byte-for-byte the string `match_text` searched**, so a failed
+match can be diagnosed from the file alone. `lines` are the OCR lines with
+their polygons in ORIGINAL page pixels, and `text` is exactly their
+`"\n".join`; `lines` is empty for native text — a .txt / .docx has no
+geometry, and a native PDF's layer is PyMuPDF's reading-order text, whose line
+geometry is not recorded (hits on it are still located, as `pdf-text`
+regions). `source: "none"` with an empty `text` is a real answer: `ocr:
+never` on a scan.
 
-`regions.json` and `manifest.json` are always written when `enabled` is true,
-whatever `layers` says.
+Each `text` criterion's result links its layer — and so does each `llm`
+criterion, for the layer its prompt carried:
 
-**Shorthand on the multipart endpoints.** Multipart forms carry strings, so
-`regions` accepts four spellings:
+```json
+"artifacts": {"text": {"key": "always", "url": "/jobs/abc123/artifacts/text.always.json",
+                       "source": "ocr", "chars": 36}}
+```
 
-| Value | Means |
-|---|---|
-| absent, `""`, `false`, `0`, `no`, `off` | Off (the default) |
-| `true`, `1`, `yes`, `on` | Regions + the SVG layer |
-| `svg`, `svg,png`, `svg,png,preview` | Regions + those layers |
-| `none` | `regions.json` only, no pictures |
-| `{"enabled": true, "layers": []}` | The full object, as a JSON string |
-
-An unknown layer name is a **400** at submit time, not a failed job.
+The text itself is never inlined in the job result (it can be a whole
+contract); the link plus `chars` is enough. `GET
+/jobs/{id}/artifacts/text.<key>.txt` returns the same `text` as
+`text/plain; charset=utf-8`, rendered from the JSON on each request. The
+files are in the manifest (whose `criteria.<name>.text_layer` says which key
+each criterion used) and the zip, are **never dropped by the byte cap**, and
+go with the job.
 
 ### The detector
 
 `ai/detector` is a text-prompted object detector: an image plus free-text
 labels in, boxes out ([DETECTOR.md](../detector/DETECTOR.md)). It is what lets
-an arbitrary `has X` feature localise — and be *scored* — without a vision-LLM
-call. The classifier reaches it at `DETECTOR_URL`; **empty means off**, and a
-request that asks for it anyway still succeeds with a note.
+an arbitrary `has X` criterion localise — and be *scored* — without a
+vision-LLM call. The classifier reaches it at `DETECTOR_URL`; **empty means
+off**, and then a `detector` criterion is refused at submit and a `cv`
+criterion's fallback resolves to the llm.
 
-Two ways in:
-
-| Spelling | What happens | Needs `regions.detector`? |
-|---|---|---|
-| `{"name": "has roof vent", "type": "detector"}` | Always answered by the detector: boxes **and** a score | no — the criterion named the path |
-| `{"name": "has roof vent", "type": "cv"}` with `regions.detector: true` | Same, when no OpenCV detector matches the name | yes |
-| `{"name": "has solar panels", "type": "llm", "hint": "presence"}` with `regions.detector: true` | Localised only — the **model still scores it** | yes |
-
-> **How a `cv` name is resolved.** Criterion names are matched against the
-> OpenCV registry exactly (case-insensitive), then by `difflib` at cutoff
-> `CV_NAME_FUZZY_CUTOFF` (0.8) so typos still land — `has textt` → `has text`,
-> `has a pool` → `has pool`. Anything less similar falls through to the
-> detector service (with `regions.detector`) or the LLM. The cutoff used to be
-> 0.6, which sent `has solar panels` to the vegetation detector and
-> `has bicycle` to the Haar face cascade; that is fixed. Spell
-> `"type": "detector"` when you want the detector regardless of the registry;
-> `GET /cv-detectors` lists the aliases the registry will grab.
+| Spelling | What happens |
+|---|---|
+| `{"name": "has roof vent", "type": "detector"}` | Answered by the detector at `options.threshold`: boxes **and** a score |
+| `{"name": "has roof vent", "type": "cv"}` | The same, when no OpenCV detector matches the name and the fallback is `detector` (the default while DETECTOR_URL is set), at `DETECTOR_MIN_SCORE` |
 
 **Scoring from boxes.** A detector-scored criterion comes back with
 `method: "detector"`:
@@ -437,46 +695,24 @@ Two ways in:
 | Best box score | Score | Verdict |
 |---|---|---|
 | ≥ `0.5` | 10 | PASS |
-| ≥ `DETECTOR_MIN_SCORE` (0.25) | 7 | PASS — a real finding, but not one to build on |
-| nothing above the floor | 1 | FAIL |
+| ≥ the threshold (`DETECTOR_MIN_SCORE`, 0.25) | 7 | PASS — a real finding, but not one to build on |
+| nothing above the threshold | 1 | FAIL |
 
 `confidence` is the best box score as a percentage, and `detail` carries
-`detector_matches`, `best_score`, `min_score` and `pages`. Each region carries
-`attrs.detector_score`.
+`detector_matches`, `best_score` and `min_score`. Each region carries
+`attrs.detector_score`. **A negative gets no LLM second opinion** — if you want
+the model's judgement, give the criterion `"type": "llm"`.
 
-**A negative gets no LLM second opinion.** A criterion the detector looked for
-and did not find is FAILed there and is **not** then passed to the model.
-Asking both would charge a token cost for every absent feature — which is most
-of them on most documents — and would make the answer depend on which of two
-disagreeing sources is consulted last. If you want the model's opinion on a
-feature, ask for it: give the criterion `"type": "llm"`.
+**A failure fails the criterion.** A connection refused, a timeout, a 503
+while the model loads: the criterion comes back `status: "error"` with the
+client's sentence, and the job is `complete: false`. (There is no silent
+fall-through to the LLM any more — a caller who asked for the detector is told
+it did not answer.)
 
-**Failure is never fatal.** A connection refused, a timeout, a 503 while the
-model loads — all of them leave the job intact: the note lands in
-`artifacts.notes`, and the criteria that were waiting on the detector fall
-back to the vision LLM exactly as they did before this service existed.
-
-**Cost.** One HTTP call per page image, carrying every label wanted for that
-page (split at `DETECTOR_MAX_LABELS_PER_CALL`). The image sent is the ≤1000-px
-working page — the same pixels the OpenCV detectors and the prompt see — and
-the boxes are rescaled into original page pixels on arrival.
-
-**What ran** is reported in `document_info.detector` and, for a job with
-artifacts, at the top of `regions.json`:
-
-```json
-"detector": {
-  "configured": true, "url_host": "detector:8000", "min_score": 0.25,
-  "timeout_seconds": 30.0, "max_labels_per_call": 16,
-  "model": "google/owlv2-base-patch16-ensemble", "device": "cuda",
-  "calls": 1, "labels": 3, "detections": 4, "elapsed_ms": 184.2,
-  "errors": [], "requested": true, "notes": []
-}
-```
-
-`GET /document-kinds` carries the `configured` / `url_host` half of the same
-block, so a caller can check before submitting a job that asks for boxes this
-container cannot produce.
+**Cost.** One HTTP call per detector criterion on the ≤1000-px working page;
+the boxes are rescaled into original page pixels on arrival. What ran is in
+`document_info.detector` and at the top of `regions.json`
+(`model`, `device`, `calls`, `labels`, `detections`, `elapsed_ms`, `errors`).
 
 ### The LLM enforcement loop
 
@@ -487,9 +723,9 @@ one of those is four numbers that look exactly like a correct one. So nothing
 here trusts the first answer:
 
 ```
-attempt 1 ── ask ────── one criterion, the ONE page image the scoring call
-   │                    used — with a labelled 0–1000 coordinate grid drawn
-   │                    on it (CLASSIFIER_LLM_BBOX_GRIDLINES, lines every
+attempt 1 ── ask ────── one criterion, the page image its scoring call used —
+   │                    with a labelled 0–1000 coordinate grid drawn on it
+   │                    (CLASSIFIER_LLM_BBOX_GRIDLINES, lines every
    │                    CLASSIFIER_LLM_BBOX_GRID_STEP units, numbered along
    │                    every edge) — a box as [x1,y1,x2,y2] on that grid
    ├── validate ─────── four finite numbers, x1<x2, y1<y2, inside the grid,
@@ -505,19 +741,15 @@ attempt 1 ── ask ────── one criterion, the ONE page image the sc
    │                    CLASSIFIER_LLM_BBOX_CROP_PAD), send the CROP ALONE:
    │                    "is <criterion> visible in this? 1–10". Accept at
    │                    CLASSIFIER_LLM_BBOX_VERIFY_PASS (7)
-   ├── cross-check ──── IoU against the detector's best box for the same
-   │                    criterion, when `regions.detector` produced one →
-   │                    attrs.detector_iou. Informational: it never accepts
-   │                    or rejects
-   └── retry ────────── re-ask with the rejection as feedback, up to
-                        CLASSIFIER_LLM_BBOX_MAX_ATTEMPTS (3)
+   └── retry ────────── re-ask with the rejection as feedback, up to the
+                        criterion's options.max_attempts (default and cap
+                        CLASSIFIER_LLM_BBOX_MAX_ATTEMPTS, 3)
 ```
 
 The verify call is what makes a box mean something: the page is deliberately
 *not* shown alongside the crop, because a model that names a plausible region
 of a photo it was already told contains the feature is not evidence, while one
-that recognises the feature in 300×300 isolated pixels is. (It is also the
-one-image-per-prompt rule — vLLM accepts one image per request either way.)
+that recognises the feature in 300×300 isolated pixels is.
 
 **Why the grid and the second pass.** Measured on the two photographed
 utility bills in `unit-tests/classifier/documents/` (80 asks, 8 features, 5
@@ -529,33 +761,33 @@ verify crop lands on the wood grain above the header. Drawing a labelled
 grid on the ask image halved that error; asking a second time on a zoomed
 crop of the original with its own grid brought hits on the four "amount due"
 lines from 0/8 to 7/8 and the mean y error from 48 units to 2.4. Both are on
-by default and both are recorded on the attempt, so a box can always be
-traced back to what the model first said. What the second pass cannot fix is
-*identification*: asked for a logo, a model that boxes the heading naming the
-same company 90 units lower is precisely placed on the wrong thing.
+by default and both are recorded on the attempt. What the second pass cannot
+fix is *identification*: asked for a logo, a model that boxes the heading
+naming the same company 90 units lower is precisely placed on the wrong thing.
 
 **When it runs.** All four have to hold, or the loop costs nothing:
 
 | Condition | Why |
 |---|---|
-| `regions.llm_boxes: true` | Up to 2 × 3 extra calls per criterion |
-| the criterion is `type: "llm"` with `hint` `presence` or `auto` | "image sharpness" is a property of the whole page; boxing it would be a fabrication |
-| the scoring call gave it **≥ 7** | Below that the model has just said the feature is absent. Asking the same model where the thing it cannot see is produces a guess |
+| `options.boxes: true` | Off by default — up to 3 extra calls per attempt |
+| hint `presence` or `auto` | "image sharpness" is a property of the whole page; boxing it would be a fabrication |
+| the criterion's scoring call gave it **≥ 7** | Below that the model has just said the feature is absent |
 | the document has a page image | `.txt` / `.docx` have no pixel space for a box |
 
-**It never changes a score or a verdict.** The loop runs *after* the scoring
-call, reads that call's score to decide whether to run at all, and only adds
-keys. A criterion whose every attempt is rejected keeps the score it had.
+**It never changes a score or a verdict.** The loop runs *after* the
+criterion's scoring call, reads that call's score to decide whether to run at
+all, and only adds keys. A criterion whose every attempt is rejected keeps the
+score it had.
 
 **Every attempt comes back**, accepted or not — a rejected box is evidence
 about the model, and it is renderable on its own:
 
 ```json
 "has solar panels": {
-  "score": 9, "verdict": "PASS", "confidence": 85, "method": "llm",
+  "status": "ok", "method": "llm", "score": 9, "verdict": "PASS", "confidence": 85,
   "regions": [
     {"kind": "box", "points": [[216, 448], [378, 602]], "source": "llm", "score": 9,
-     "attrs": {"attempt": 2, "accepted": true, "verify_score": 9, "detector_iou": 0.71}},
+     "attrs": {"attempt": 2, "accepted": true, "verify_score": 9, "refined": true}},
     {"kind": "box", "points": [[0, 0], [900, 700]], "source": "llm", "score": null,
      "attrs": {"attempt": 1, "accepted": false,
                "reject": "your previous box [0, 0, 1000, 1000] covered 100% of the image — a full-frame box is not a location; try again, smaller"}}
@@ -567,7 +799,7 @@ about the model, and it is renderable on its own:
        "reject": "your previous box [0, 0, 1000, 1000] covered 100% of the image — a full-frame box is not a location; try again, smaller"},
       {"attempt": 2, "bbox_grid": [240, 640, 420, 860], "bbox_px": [216, 448, 378, 602],
        "valid": true, "accepted": true, "verify_score": 9,
-       "verify_reason": "a roof covered in panels", "detector_iou": 0.71,
+       "verify_reason": "a roof covered in panels",
        "coarse_bbox_grid": [230, 600, 430, 880], "refine_window_grid": [80, 400, 580, 1000],
        "refined": true}
     ],
@@ -576,14 +808,15 @@ about the model, and it is renderable on its own:
   },
   "artifacts": {
     "slug": "has-solar-panels-9c1e",
-    "pages": [{"page": 0, "svg": "/jobs/abc123/artifacts/p0.svg?criterion=has-solar-panels-9c1e"}],
+    "layers": {"svg": "/jobs/abc123/artifacts/p0.svg?criterion=has-solar-panels-9c1e", "…": "…"},
     "attempts": [
-      {"attempt": 1, "page": 0, "accepted": false,
-       "svg": "/jobs/abc123/artifacts/p0.svg?criterion=has-solar-panels-9c1e&attempt=1"},
-      {"attempt": 2, "page": 0, "accepted": true,
-       "svg": "/jobs/abc123/artifacts/p0.svg?criterion=has-solar-panels-9c1e&attempt=2"}
+      {"attempt": 1, "accepted": false,
+       "svg": "/jobs/abc123/artifacts/p0.svg?criterion=has-solar-panels-9c1e&attempt=1", "…": "…"},
+      {"attempt": 2, "accepted": true,
+       "svg": "/jobs/abc123/artifacts/p0.svg?criterion=has-solar-panels-9c1e&attempt=2", "…": "…"}
     ]
-  }
+  },
+  "options_used": {"hint": "presence", "boxes": true, "max_attempts": 3, "ocr": "auto"}
 }
 ```
 
@@ -593,35 +826,32 @@ only rejected boxes and the criterion's score is untouched.
 `coarse_bbox_grid`, `refine_window_grid` and `refined` appear on an attempt
 whose coarse box validated and so went through the refine pass: `bbox_grid`
 is then the refined box when `refined` is `true`, and the coarse box kept
-(with a `refine_reject` sentence) when it is `false`. An attempt the
-validator rejected never reaches the pass and carries none of the three.
-Each stored region from the loop carries `attrs.refined` the same way.
+(with a `refine_reject` sentence) when it is `false`.
 
-**The combined layer shows the accepted box only.** Three overlapping boxes
-for one criterion, two of which the loop itself threw away, is not a picture of
-anything — so the stored `p{n}.svg` and any `?criterion=` render with no
-explicit `attempt` show the accepted attempt. `?attempt=n` renders attempt *n*
-(accepted or not), and `?accepted=false` renders the rejected ones. `bbox_grid`
-is what the model literally said; `bbox_px` is the same box in original page
-pixels, clamped to the page.
+`attrs.detector_iou` (the IoU against the detector's best box for the same
+criterion) is still computed by `llm.boxes.locate_criterion` when it is handed
+detector regions — `bin/grounding_experiment.py` does — but an `/assess` job
+no longer runs the detector alongside an `llm` criterion, so it does not
+appear in job results.
+
+**The combined layer shows the accepted box only.** `p0.svg` and any
+`?criterion=` render with no explicit `attempt` show the accepted attempt.
+`?attempt=n` renders attempt *n* (accepted or not), and `?accepted=false`
+renders the rejected ones. `bbox_grid` is what the model literally said;
+`bbox_px` is the same box in original page pixels, clamped to the page.
 
 **Rejection wording is the retry's prompt.** Each `reject` is written to be
-read by the model on the next attempt — "a full-frame box is not a location;
-try again, smaller", "the crop of your previous box … did not show <criterion>
-(verify score 3); look elsewhere". Changing them changes the retry behaviour,
-not just the log.
+read by the model on the next attempt. Changing them changes the retry
+behaviour, not just the log.
 
 **Cost.** One ask per attempt, plus one refine and one verify per attempt
-whose coarse box validated — at most nine small calls per located criterion
-(six with `CLASSIFIER_LLM_BBOX_REFINE=false`), each capped at
-`CLASSIFIER_LLM_BBOX_MAX_TOKENS` (1024, most of which is reasoning). The job's
-single scoring call is unchanged. Metric:
+whose coarse box validated — at most `3 × max_attempts` small calls per
+located criterion (`2 ×` with `CLASSIFIER_LLM_BBOX_REFINE=false`), each capped
+at `CLASSIFIER_LLM_BBOX_MAX_TOKENS` (1024) and each counted against
+`CLASSIFIER_MAX_LLM_CALLS`. Metric:
 `classifier_llm_bbox_attempts_total{outcome=accepted|rejected_invalid|rejected_verify|exhausted}`.
 
-**Before trusting it on a new model**, run the grounding experiment — it
-measures, on your images and your criteria, how often attempt 1 validates, how
-often the crop confirms it, and how far the accepted boxes are from the
-detector's:
+**Before trusting it on a new model**, run the grounding experiment:
 
 ```bash
 # On the box (it talks to VISION_LLM_API directly)
@@ -630,218 +860,80 @@ docker compose exec classifier python bin/grounding_experiment.py \
   --images /data/roof-photos --criteria /data/criteria.json --out /data/grounding.json
 ```
 
-If attempt-1 validity is under ~50%, make the detector the primary source
-(`regions.detector`) and keep `llm_boxes` as the fallback for labels it cannot
-name.
-
-### Change detection
-
-`/assess/compare` with `regions.diff: true` answers "what is different in the
-subject compared to this reference?" — as regions, not a number. Classical CV,
-no model:
-
-1. **Align.** ORB keypoints, a ratio-filtered brute-force match, and a RANSAC
-   homography that puts the example onto the subject.
-2. **Difference.** Warp, blur both to grayscale (`CLASSIFIER_DIFF_BLUR`),
-   absolute-difference, Otsu threshold, morphological close, contours over
-   `CLASSIFIER_DIFF_MIN_AREA`. A margin around the frame is excluded: two
-   photos from slightly different places do not overlap there.
-3. **Classify.** Local edge density inside each blob in each image — structure
-   in the subject only is `added`, in the reference only is `removed`, in both
-   is `changed`.
-
-**Different framing is reported, not guessed at.** Under
-`CLASSIFIER_DIFF_MIN_INLIERS` (30) the answer is `aligned: false` with a note
-and **no regions at all**. A diff that skips alignment lights up every edge in
-the scene, and boxing that would be a lie with a rectangle around it.
-
-```json
-"example_results": [
-  {
-    "index": 0, "weight": 0.5, "pre_generated": false,
-    "similarity": { "…": "…" }, "combined_score": 8, "combined_verdict": "PASS",
-    "diff": {
-      "aligned": true, "inliers": 147,
-      "homography": [[1.0, 0.0, 6.1], [0.0, 1.0, 5.9], [0.0, 0.0, 1.0]],
-      "changes": {"added": 1, "removed": 2, "changed": 0},
-      "regions": [
-        {"kind": "polygon", "points": [[130, 509], ["…", "…"]], "source": "diff",
-         "score": 0.2078, "label": "_diff:e0",
-         "attrs": {"change": "added", "area_px": 17564, "bbox": [130, 509, 340, 623]}}
-      ],
-      "regions_truncated": false, "note": null,
-      "artifacts": {"slug": "diff-e0-…",
-                    "pages": [{"page": 0, "svg": "/jobs/abc123/artifacts/diff-e0-p0.svg?criterion=diff-e0-…"}]}
-    }
-  }
-]
-```
-
-**Diff regions are not criteria.** They are filed under a synthetic
-`_diff:e{i}` key so they have somewhere to live in `regions.json` and a slug
-for their layer file, and they never reach the weighted score or the
-similarity comparison. `aggregate` is byte-identical with `diff` on and off.
-
-**Skipped, with a reason, when:** the example was supplied as
-`pre_generated_analysis` (a stored analysis is JSON, not pixels), or either
-side is not a single-image document (a multi-page PDF has no single "the
-image"). Each case sets `diff.note` and adds a line to `artifacts.notes`.
-
-Layers land as `diff-e{i}-p{n}.<fmt>` in the subject's artifact directory and
-are filterable like any other layer. Metric:
-`classifier_diff_jobs_total{aligned=true|false}`.
-
-### Layers for the examples
-
-`regions.examples: true` on `/assess/compare` also collects regions and renders
-layers for each **live** example, into the subject's job directory under an
-`e{i}.` prefix — an example has no job of its own:
-
-```
-/data/artifacts/<job_id>/
-├── p0.svg                 the subject
-├── diff-e0-p0.svg         change detection against example 0
-├── e0.p0.svg              example 0's own regions
-└── e0.regions.json        example 0's geometry, keyed by criterion
-```
-
-`example_results[i].example_analysis.artifacts` lists exactly those files, and
-each of that example's per-criterion `artifacts.regions_url` points at
-`e{i}.regions.json`. An example's pages are their own coordinate frame, which
-is why it gets its own `regions.json` rather than being mixed into the
-subject's `pages` list. Off by default: it roughly doubles the artifact volume.
-
-### Behaviour changes in this build
-
-Two things changed for requests that were already working:
-
-1. **`cv` criteria with no OpenCV detector no longer go straight to the LLM**
-   — but only when `regions.detector` is set AND `DETECTOR_URL` is configured.
-   Such a criterion is then scored by the detector with `method: "detector"`,
-   which means a different score, a different `detail` shape, and **no LLM
-   call for it**. A request that does not set `regions.detector`, or a
-   deployment with no `DETECTOR_URL`, behaves exactly as before.
-2. **`/locate` bare-string features resolve to `detector`** when
-   `DETECTOR_URL` is set and no OpenCV detector matches the name — previously
-   they resolved to `llm` and came back with no regions at all. `["bicycle"]`
-   now returns boxes with no LLM call. A full criterion object is still taken
-   at its word.
-
-`CriterionInput.type` also gained the value `"detector"`. This is additive;
-nothing that validated before stops validating.
-
-Phases 3 and 4 added two more, both opt-in:
-
-3. **`/locate` bare-string features that resolve to `llm` now cost an LLM
-   call** — but only with `regions.llm_boxes` set. The endpoint then makes a
-   presence-only scoring call so the enforcement loop has a score to gate on,
-   and discards its judgement: `features[name]` still carries no `score`,
-   `verdict` or `confidence`, and now carries `localization` and real regions.
-   Without `llm_boxes` no call is made, exactly as before.
-4. **`per_criterion_scores[name].localization` is present for every `llm`
-   criterion** whenever regions are on, as `{"attempts": [],
-   "accepted_attempt": null, "calls": 0}` when the loop did not run — so a
-   consumer can read `accepted_attempt` without first checking whether the key
-   exists. It was the same shape before, minus `calls`.
+If attempt-1 validity is under ~50%, prefer `detector` criteria as the primary
+source and keep `llm` criteria with `options.boxes` for labels the detector
+cannot name.
 
 ### Layer formats
 
 | Format | File | Notes |
 |---|---|---|
-| SVG overlay | `p{n}.svg` | **The default.** `viewBox` is the original page, so it composites over the page image at any size with no transform. One `<g id="c-<slug>" data-criterion="…" data-source="…">` per criterion, `<rect>`/`<polygon>` with `data-source`/`data-score` and a `<title>` tooltip — so a client that downloaded the combined file can still toggle criteria in place. Legend embedded |
-| Transparent PNG | `p{n}.layer.png` | Exactly the page's pixel size, alpha everywhere except strokes and translucent fills. The literal "Photoshop layer" |
-| Composited preview | `p{n}.preview.jpg` | The page with the layer burned in, JPEG q85, with a corner legend. Also writes `p{n}.base.jpg` — a clean copy of the page, because a burned-in preview cannot be un-burned and a *filtered* preview has to be re-composited from something |
-| Regions JSON | `regions.json` | Always written. Keyed by criterion (not a flat list), plus `pages` |
+| SVG overlay | `p0.svg` | `viewBox` is the original page, so it composites over the page image at any size with no transform. One `<g id="c-<slug>" data-criterion="…" data-source="…">` per criterion, `<rect>`/`<polygon>` with `data-source`/`data-score` and a `<title>` tooltip. Legend embedded |
+| Transparent PNG | `p0.layer.png` | Exactly the page's pixel size, alpha everywhere except strokes and translucent fills |
+| Composited preview | `p0.preview.jpg` | `p0.base.jpg` with the layer burned in, JPEG q85, with a corner legend |
+| Regions JSON | `regions.json` | Always written. Keyed by criterion |
 
-Colour is one stable hue per criterion (hashed from the name, so it is the same
-on every page and in every format); the source shows in the stroke — solid for
-`cv`/`detector`/`pdf-text`, dashed for `ocr`, dotted for `llm`, double for
-`diff`.
+Colour is one stable hue per criterion (hashed from the name); the source
+shows in the stroke — solid for `cv`/`detector`/`pdf-text`, dashed for `ocr`,
+dotted for `llm`.
 
 ### Tying a criterion to its artifacts
 
 Every criterion gets a **slug**: its name lowercased with non-alphanumerics
-collapsed to `-`, plus four hex digits of a hash of the exact name, so
-`has faces` and `Has Faces!` cannot collide. The slug is what appears in file
-names, in SVG group ids, and in the `?criterion=` query parameter;
-`manifest.json` carries the slug ↔ name map.
-
-`regions.json` is keyed by criterion:
+collapsed to `-`, plus four hex digits of a hash of the exact name. The slug is
+what appears in file names, in SVG group ids, and in the `?criterion=` query
+parameter; `manifest.json` carries the slug ↔ name map.
 
 ```json
 {
   "job_id": "abc123",
   "pages": [{"page": 0, "width": 900, "height": 700, "working_scale": 1.0, "pdf_points": null}],
+  "detector": null,
   "criteria": {
     "has water": {
-      "slug": "has-water-4b21", "type": "cv", "source": "cv", "sources": ["cv"],
-      "pages": [0], "count": 2,
+      "slug": "has-water-4b21", "type": "cv", "sources": ["cv"], "count": 2,
       "regions": [
         {"page": 0, "kind": "polygon", "points": [[90, 518], [430, 518], [430, 651], [90, 651]],
          "label": "has water", "score": 0.0713, "source": "cv",
          "attrs": {"area_px": 44812, "flat": true}}
       ],
-      "localization": null
+      "localization": null,
+      "text_layer": null
     }
   }
 }
 ```
 
-and each criterion result carries its own `artifacts` block — `null` when the
-criterion found nothing, so an empty object never implies URLs that would 404:
-
-```json
-"has water": {
-  "score": 10, "verdict": "PASS", "confidence": 85, "method": "cv",
-  "detail": "Qualifying water coverage: 41.8% (263,397 px)",
-  "regions": [ … ], "regions_truncated": false,
-  "artifacts": {
-    "slug": "has-water-4b21",
-    "regions_url": "/jobs/abc123/artifacts/regions.json?criterion=has-water-4b21",
-    "pages": [
-      {"page": 0,
-       "svg":     "/jobs/abc123/artifacts/p0.svg?criterion=has-water-4b21",
-       "png":     "/jobs/abc123/artifacts/p0.layer.png?criterion=has-water-4b21",
-       "preview": "/jobs/abc123/artifacts/p0.preview.jpg?criterion=has-water-4b21"}
-    ],
-    "attempts": []
-  }
-}
-```
-
-Only pages where *this* criterion has regions are listed, and only formats that
-were actually written. `attempts` is empty for every path but `llm`; for an
-`llm` criterion that ran the [enforcement loop](#the-llm-enforcement-loop) it
-carries one entry per attempt, with `?attempt=n` on each URL so a **rejected**
-box can be viewed on its own.
+Each criterion result carries its own `artifacts` block — `null` when the
+criterion found nothing and read no text, so an empty object never implies
+URLs that would 404. `layers` holds one URL per format, filtered to the
+criterion; `attempts` is empty for every path but `llm`.
 
 ### Inline vs the directory
 
 | Data | In the artifact directory | Inline in the job result |
 |---|---|---|
-| Per-criterion regions | `regions.json`, complete | `per_criterion_scores[name].regions`, capped at `CLASSIFIER_INLINE_REGIONS_MAX` (50) — past the cap the list is cut and `regions_truncated: true` is set |
-| Per-criterion links | derived from the manifest | `per_criterion_scores[name].artifacts` |
-| LLM localization | `regions.json`, per criterion | `per_criterion_scores[name].localization` — **not capped**: every attempt, always. At most `CLASSIFIER_LLM_BBOX_MAX_ATTEMPTS` small objects |
-| Change detection (compare) | `regions.json` under `_diff:e{i}`, plus `diff-e{i}-p{n}.<fmt>` | `example_results[i].diff` — regions capped at `CLASSIFIER_INLINE_REGIONS_MAX` |
+| Per-criterion regions | `regions.json`, complete | `regions`, capped at `CLASSIFIER_INLINE_REGIONS_MAX` (50), `regions_truncated` |
+| Per-criterion links | derived from the manifest | `artifacts` |
+| The text searched | `text.<key>.json` | only the link and `chars` (`artifacts.text`) |
+| LLM localization | `regions.json`, per criterion | `localization` — **not capped**: every attempt, always |
 | Page geometry | `manifest.json`, `regions.json` | `page_geometry` |
-| Rendered layers | yes | **never** — only their `artifacts.files[]` entries (name, bytes, content type, url) |
-
-Base64 layers are not offered at all — one path to maintain.
+| Rendered layers | once fetched | **never** — only URLs |
 
 ### Disk and retention
 
-`CLASSIFIER_ARTIFACT_MAX_BYTES` (50 MB) caps each job. Over it, files are
-dropped in a fixed order — PNG layers first, then previews and their base
-images — and `regions.json`, `manifest.json` and the SVGs are never dropped,
-because everything else re-renders from them. The manifest's `dropped` list
-and `artifacts.dropped` say what went.
+`CLASSIFIER_ARTIFACT_MAX_BYTES` (50 MB) caps each job, enforced after the job
+writes its directory and after every lazily rendered layer is cached. Over it,
+files are dropped in a fixed order — PNG layers first, then previews and
+`p0.base.jpg` (without which a preview cannot be composited: a 404 that says
+so) — and `regions.json`, `manifest.json`, the `text.<key>.json` layers and
+the SVGs are never dropped. The manifest's `dropped` list and
+`artifacts.dropped` say what went.
 
 A background sweeper runs at startup and every
 `CLASSIFIER_ARTIFACT_SWEEP_INTERVAL_S` (600 s). It deletes artifact
 directories whose job is gone or expired **and the expired job rows
-themselves** — which makes `JOB_TTL_HOURS` (24) a real retention policy for
-the first time. Terminal jobs only: a row still `pending` or `processing` is
-never swept, however old. Gauges: `classifier_artifact_bytes`,
+themselves**. Terminal jobs only. Gauges: `classifier_artifact_bytes`,
 `classifier_artifact_dirs`.
 
 `DELETE /jobs/{id}` removes the directory with the row. `DELETE
@@ -865,9 +957,45 @@ curl http://localhost:8005/health
 
 ---
 
+### `GET /criterion-types`
+
+Every criterion type's options, for THIS container — the schema is generated
+from the same pydantic models `/assess` validates against, so it cannot drift.
+
+```bash
+curl http://localhost:4001/v1/classifier/criterion-types -H "Authorization: Bearer sk-1234"
+```
+
+```json
+{
+  "shared_fields": {"name": "…", "type": "…", "weight": "…", "depends_on": "…", "score": "…"},
+  "types": {
+    "llm": {
+      "options_schema": {"type": "object", "additionalProperties": false,
+                         "properties": {"hint": {"…": "…"}, "boxes": {"…": "…"},
+                                        "max_attempts": {"…": "…"}, "ocr": {"…": "…"}}},
+      "defaults": {"hint": "auto", "boxes": false, "max_attempts": 3, "ocr": "auto"},
+      "caps": {"max_attempts": 3}
+    },
+    "text": {"defaults": {"pattern": "<name>", "match": "contains", "case_sensitive": false,
+                          "fuzzy_threshold": 0.85, "min_count": 1, "ocr": "auto"},
+             "caps": {"pattern_max_chars": 500, "min_count": 1000}, "…": "…"},
+    "cv": {"defaults": {"fallback": "detector"}, "caps": {}, "…": "…"},
+    "detector": {"defaults": {"threshold": 0.25}, "caps": {}, "…": "…"}
+  },
+  "detector_configured": true
+}
+```
+
+`text.defaults.pattern` shows `<name>` because it defaults to the criterion's
+name. `cv.defaults.fallback` is `detector` only while DETECTOR_URL is set.
+
+---
+
 ### `GET /hints`
 
-Returns all available hint values and their LLM scoring instructions.
+Returns every `options.hint` value and the rubric the model is given for it
+(`config.HINT_RUBRICS`, verbatim).
 
 ```bash
 curl http://localhost:4001/v1/classifier/hints -H "Authorization: Bearer sk-1234"
@@ -877,8 +1005,8 @@ curl http://localhost:4001/v1/classifier/hints -H "Authorization: Bearer sk-1234
 {
   "hints": {
     "quality":  {"heading": "...", "rubric": "...", "extra": ""},
-    "presence": {"heading": "...", "rubric": "...", "extra": "...chain-of-thought instruction..."},
-    "auto":     {"heading": "...", "rubric": "...", "extra": ""}
+    "presence": {"heading": "...", "rubric": "...", "extra": "...evidence-first instruction..."},
+    "auto":     {"heading": "...", "rubric": "...", "extra": "..."}
   }
 }
 ```
@@ -907,576 +1035,164 @@ curl http://localhost:4001/v1/classifier/cv-detectors -H "Authorization: Bearer 
 
 ### `GET /document-kinds`
 
-Returns what this container can accept and what it can do with it: the four
-document kinds with their extensions, magic-byte detection rules, and whether
-they carry page images or native text; the `.doc` rejection; the four
-`text_match_modes`; the live OCR status; and the page/DPI/token limits in
-force. Cheap introspection, like `/hints` and `/cv-detectors` — no job is
-submitted.
-
-```bash
-curl http://localhost:4001/v1/classifier/document-kinds -H "Authorization: Bearer sk-1234"
-```
+What this container can accept and do right now: the four kinds (with
+`pdf.pages` saying single-page only), the `.doc` rejection, the accepted
+inputs, the four `text_match_modes`, the live OCR status, the limits, and the
+regions block.
 
 ```json
 {
-  "kinds": [
-    {"kind": "image", "extensions": [".jpg", ".jpeg", ".png"],
-     "detection": "magic bytes: FF D8 FF (JPEG) / 89 50 4E 47 0D 0A 1A 0A (PNG)",
-     "pages": "1", "has_page_images": true, "native_text": false,
-     "notes": "EXIF orientation is applied on load. Text criteria need OCR."},
-    {"kind": "pdf", "…": "…"},
-    {"kind": "txt", "…": "…"},
-    {"kind": "docx", "…": "…"}
-  ],
-  "unsupported": [
-    {"kind": "doc", "reason": "Legacy OLE2 Word files are not readable by python-docx. Convert to .docx and re-upload.",
-     "detection": "magic bytes: D0 CF 11 E0 A1 B1 1A E1"}
-  ],
-  "text_match_modes": {
-    "contains": "substring anywhere in the document text (default)",
-    "exact": "whole word or whole line (word-boundary anchored)",
-    "regex": "Python regular expression, max 500 characters",
-    "fuzzy": "best sliding-window similarity — use this on OCR'd text"
-  },
+  "kinds": [{"kind": "image", "…": "…"}, {"kind": "pdf", "pages": "1 — a PDF with more than one page is refused at submit (400)", "…": "…"}, "…"],
+  "unsupported": [{"kind": "doc", "…": "…"}],
+  "inputs": {"json": ["base64", "url", "text"], "multipart": ["file (or legacy 'image')", "text"]},
+  "text_match_modes": {"contains": "…", "exact": "…", "regex": "…", "fuzzy": "…"},
   "ocr": {"engine": "rapidocr", "available": true, "min_native_chars": 20,
-          "modes": ["auto", "always", "never"], "default": "auto"},
-  "limits": {"max_pages": 20, "pdf_render_dpi": 150,
-             "llm_text_char_budget": 60000, "images_per_llm_prompt": 1},
+          "modes": ["auto", "always", "never"], "default": "auto",
+          "set_on": "each llm / text criterion's options.ocr",
+          "text_layer_artifact": "text.<key>.json per distinct setting"},
+  "limits": {"max_pages": 1, "pdf_render_dpi": 150, "llm_text_char_budget": 60000,
+             "images_per_llm_prompt": 1, "max_concurrent_jobs": 4,
+             "max_criteria_per_job": 2, "max_llm_calls": 4, "ocr_workers": 4},
   "regions": {
-    "enabled_by_default": false,
-    "layers": ["png", "preview", "svg"], "default_layers": ["svg"],
-    "sources": ["cv", "ocr", "pdf-text", "detector", "llm", "diff"],
-    "not_implemented": [],
-    "compare_only": ["diff", "examples"],
-    "llm_boxes": {"max_attempts": 3, "verify_pass": 7, "min_area": 0.002,
-                  "max_area": 0.95, "presence_min_score": 7, "grid": 1000.0},
-    "diff": {"min_inliers": 30, "min_area": 0.001, "max_regions": 40,
-             "changes": ["added", "removed", "changed"]},
-    "detector": {"configured": true, "url_host": "detector:8000",
-                 "min_score": 0.25, "timeout_seconds": 30.0,
-                 "max_labels_per_call": 16},
+    "always_stored": true, "layers": ["png", "preview", "svg"],
+    "layers_rendered": "on first fetch, then cached",
+    "sources": ["cv", "ocr", "pdf-text", "detector", "llm"],
+    "llm_boxes": {"set_on": "each llm criterion's options.boxes", "max_attempts": 3,
+                  "verify_pass": 7, "min_area": 0.002, "max_area": 0.95,
+                  "presence_min_score": 7, "grid": 1000.0},
+    "detector": {"configured": true, "url_host": "detector:8000", "…": "…"},
     "inline_max_per_criterion": 50, "artifact_dir": "/data/artifacts",
-    "artifact_max_bytes": 50000000, "artifact_ttl_hours": 24,
-    "sweep_interval_seconds": 600.0
+    "artifact_max_bytes": 50000000, "artifact_ttl_hours": 24, "sweep_interval_seconds": 600.0
   }
 }
 ```
 
-`regions.detector.configured` is the live answer, not the compiled-in one:
-`detector` is a region source only while `DETECTOR_URL` points at something.
-Check it before submitting a job that asks for boxes this container cannot
-produce. `ocr.available` is the honest answer in the same way: it is `false` when
-`CLASSIFIER_OCR_ENGINE=none` **and** when the engine failed to load, which is
-worth checking before blaming a failing `text` criterion on the document.
+`ocr.available` loads the engine to answer honestly — `false` when
+`CLASSIFIER_OCR_ENGINE=none` **and** when the engine failed to load.
 
 ---
 
 ### `POST /assess`
 
-Submit a single-document assessment job.
+Submit an assessment job. **Returns** `202 Accepted` —
+`{"job_id": "abc123", "phase": "pending"}`; poll `GET /jobs/{job_id}`.
+The request is in [§ Request](#request) and the result in
+[§ Result shape](#result-shape).
 
-**Content-Type:** `multipart/form-data`  
-**Returns:** `202 Accepted` — poll `GET /jobs/{job_id}` for the result.
-
-| Field | Type | Required | Default | Description |
-|---|---|---|---|---|
-| `file` | File | Yes* | — | The document: JPEG, PNG, PDF, `.txt`, or `.docx` |
-| `image` | File | Yes* | — | Deprecated alias for `file`, still accepted so existing callers keep working |
-| `criteria` | string (JSON array) | No | see defaults | JSON array of `CriterionInput` objects |
-| `ocr` | `auto` \| `always` \| `never` | No | `auto` | Text-recognition policy — see § OCR |
-| `regions` | string | No | _(off)_ | Where-did-you-find-it options: `true`, a layer list like `svg,png,preview`, `none` for `regions.json` only, or a JSON object — see [§ Regions and layers](#regions-and-layers) |
-
-\* Send one of `file` / `image`. Sending neither is a **400**; `file` wins if
-both are present.
-
-**Example request:**
+**Multipart:**
 
 ```bash
 curl http://localhost:4001/v1/classifier/assess \
   -H "Authorization: Bearer sk-1234" \
   -F "file=@notice.pdf" \
-  -F "ocr=auto" \
   -F 'criteria=[
-    {"name":"Notice to Owner",                      "type":"text","match":"fuzzy","weight":4.0},
-    {"name":"case number",                          "type":"text","match":"regex","pattern":"CASE-\\d{5}","weight":2.0},
-    {"name":"signature is present",                 "type":"llm","hint":"presence","weight":3.0,"depends_on":"Notice to Owner"},
-    {"name":"sharpness",                            "type":"cv",                  "weight":1.0}
+    {"name":"Notice to Owner", "type":"text","weight":4.0,"options":{"match":"fuzzy"}},
+    {"name":"case number",     "type":"text","weight":2.0,"options":{"match":"regex","pattern":"CASE-\\d{5}"}},
+    {"name":"signature is present","type":"llm","weight":3.0,"depends_on":"Notice to Owner",
+     "options":{"hint":"presence","boxes":true}},
+    {"name":"sharpness","type":"cv"}
   ]'
 # → {"job_id": "abc123", "phase": "pending"}
 ```
 
-Errors: **400** for an empty criteria list, an empty file, an unusable text
-pattern, an invalid `ocr` value, an unknown `regions` layer, a content type
-outside the allowlist, or bytes that are not a supported document (including
-legacy `.doc`). A page image under `CLASSIFIER_MIN_IMAGE_WIDTH` ×
-`CLASSIFIER_MIN_IMAGE_HEIGHT` (32 × 32 px) on either axis fails the job with
-"Image too small" — a thumbnail guard, low enough that a crop of a single
-text line submitted as its own document passes.
-
-**With regions** — same call plus one field:
+**JSON, the same request:**
 
 ```bash
 curl http://localhost:4001/v1/classifier/assess \
-  -H "Authorization: Bearer sk-1234" \
-  -F "file=@yard.jpg" \
-  -F "regions=svg,preview" \
-  -F 'criteria=[{"name":"has sky","type":"cv"},{"name":"has water","type":"cv"}]'
+  -H "Authorization: Bearer sk-1234" -H "Content-Type: application/json" \
+  -d '{"document": {"type": "url", "data": "https://example.com/notice.pdf"},
+       "criteria": [{"name": "Notice to Owner", "type": "text", "options": {"match": "fuzzy"}}]}'
 ```
 
-The result then also carries `page_geometry`, a top-level `artifacts` index,
-and `regions` / `regions_truncated` / `artifacts` on each criterion — see
-[§ Regions and layers](#regions-and-layers).
+**Inline text:** `{"document": {"type": "text", "data": "…"}}`, or `-F "text=…"`
+instead of a file part.
 
-**Polling:**
-
-```bash
-curl http://localhost:4001/v1/classifier/jobs/abc123 -H "Authorization: Bearer sk-1234"
-```
-
-**Result shape** (inside `job.result`):
-
-```json
-{
-  "image_info": {"width": 1240, "height": 1755, "format": "application/pdf", "size_bytes": 193864},
-  "document_info": {
-    "kind": "pdf",
-    "filename": "notice.pdf",
-    "page_count": 2,
-    "truncated_pages": 0,
-    "pages": [
-      {"index": 0, "width": 1240, "height": 1755, "text_source": "ocr", "ocr_confidence": 0.994, "text_chars": 413},
-      {"index": 1, "width": 1240, "height": 1755, "text_source": "ocr", "ocr_confidence": 0.993, "text_chars": 161}
-    ],
-    "ocr": {"mode": "auto", "engine": "rapidocr", "ran": true, "pages_recognised": 2},
-    "text_sent_to_llm": {"chars": 574, "truncated": false, "budget": 60000},
-    "llm_image_page": 0
-  },
-  "assessment": {
-    "overall_verdict": "PASS",
-    "overall_score": 9,
-    "per_criterion_scores": {
-      "has electrical meter": {
-        "score": 10, "verdict": "PASS", "confidence": 95, "method": "llm",
-        "reason": "I observe a clearly visible electrical meter on the wall. Therefore has electrical meter is present."
-      },
-      "meter value is readable": {
-        "score": 8, "verdict": "PASS", "confidence": 80, "method": "llm",
-        "reason": "The meter dial is visible and digits are legible."
-      },
-      "three feet of clearance around meter": {
-        "score": 7, "verdict": "PASS", "confidence": 70, "method": "llm",
-        "reason": "I observe no obstructions within approximately three feet of the meter."
-      },
-      "sharpness": {
-        "score": 9, "verdict": "PASS", "confidence": 100, "method": "cv",
-        "detail": "Laplacian variance: 412.3 (threshold: 100.0)"
-      }
-    },
-    "weighted_score_breakdown": {
-      "formula": "sum(score * weight) / total_weight",
-      "total_weight": 10.5,
-      "weighted_sum": 93.5,
-      "unrounded_average": 8.9047,
-      "final_score": 9,
-      "per_criterion": {
-        "has electrical meter":                 {"score": 10, "weight": 4.0, "contribution": 40.0},
-        "meter value is readable":              {"score": 8,  "weight": 3.0, "contribution": 24.0},
-        "three feet of clearance around meter": {"score": 7,  "weight": 2.5, "contribution": 17.5},
-        "sharpness":                            {"score": 9,  "weight": 1.0, "contribution": 9.0}
-      }
-    }
-  },
-  "verdict": "PASS"
-}
-```
-
-#### `document_info`
-
-| Field | Meaning |
-|---|---|
-| `kind` | `image` \| `pdf` \| `txt` \| `docx`, decided from the bytes |
-| `filename` | What the caller sent; informational only |
-| `page_count` | Pages actually loaded |
-| `truncated_pages` | Pages dropped at the `CLASSIFIER_DOC_MAX_PAGES` cap |
-| `pages[]` | Per page: `index`, `width`/`height` (0 when there is no image), `text_source` (`native` \| `ocr` \| `none`), `ocr_confidence` (0–1 or null), `text_chars` |
-| `ocr` | `mode` (the request's value), `engine`, `ran`, `pages_recognised`. `ran: false` with `mode: auto` means no page needed it |
-| `text_sent_to_llm` | `chars`, `truncated`, and the `budget` in force. All zero/false when no LLM criterion ran |
-| `llm_image_page` | Which page's image went into the prompt, or `null` for a text-only prompt |
-
-`image_info` is retained unchanged for backwards compatibility: page 0's image
-dimensions (0 × 0 for `.txt`/`.docx`), the document's real content type, and
-the upload size. Stored `pre_generated_analysis` blobs therefore keep working.
-
-**Skipped criterion example** (when `has electrical meter` fails):
-
-```json
-"meter value is readable": {
-  "verdict": "SKIPPED",
-  "score": null,
-  "confidence": null,
-  "method": "skipped",
-  "reason": "Skipped - dependency 'has electrical meter' did not pass (verdict: FAIL)."
-}
-```
-
-**Not-applicable criterion example** (a `cv` criterion on a `.txt` / `.docx`,
-which has no page images). Same shape as a dependency skip, so consumers need
-no new branch, and it is likewise excluded from the weighted score:
-
-```json
-"sharpness": {
-  "verdict": "SKIPPED",
-  "score": null,
-  "confidence": null,
-  "method": "skipped",
-  "reason": "Skipped - document has no page images (docx documents are text-only, so OpenCV criteria cannot be evaluated)."
-}
-```
-
----
-
-### `POST /assess/compare`
-
-Submit a comparison job — assess an input document against one or more reference examples.
-
-**Content-Type:** `application/json`  
-**Returns:** `202 Accepted` — poll `GET /jobs/{job_id}` for the result.
-
-| Field | Type | Required | Default | Description |
-|---|---|---|---|---|
-| `image` | `DocumentInput` | Yes | — | The subject document (field name kept as `image` for compatibility) |
-| `criteria` | `CriterionInput[]` | No | defaults | List of criterion objects |
-| `aggregation` | `mean` \| `min` \| `max` | No | `mean` | How to collapse per-example scores into one aggregate |
-| `ocr` | `auto` \| `always` \| `never` | No | `auto` | Text-recognition policy, applied to the subject **and** every live example |
-| `examples` | `ExampleInput[]` | Yes (min 1) | — | Reference documents to compare against |
-| `regions` | `RegionsOptions` \| null | No | `null` | Where-did-you-find-it options as an object (no string shorthand here — this endpoint takes JSON). Regions and layers are collected for the **subject** unless `examples: true`; `diff: true` adds [change detection](#change-detection) against each live example. See [§ Regions and layers](#regions-and-layers) |
-
-#### `DocumentInput` (was `ImageInput`)
-
-| Field | Type | Description |
-|---|---|---|
-| `data` | string | Base64-encoded document bytes or a URL (SSRF-checked before fetching). Any supported kind — the bytes decide, not the URL's extension |
-| `type` | `"base64"` \| `"url"` | How to obtain `data` |
-
-`ImageInput` remains as an alias of `DocumentInput` in `api/schemas.py`, so the
-request shape is unchanged.
-
-#### `ExampleInput`
-
-| Field | Type | Required | Default | Description |
-|---|---|---|---|---|
-| `data` | string | Yes | — | Base64-encoded document bytes or URL |
-| `type` | `"base64"` \| `"url"` | Yes | — | How to interpret `data` |
-| `weight` | float (0.0–1.0) | No | `0.5` | How much similarity to this example influences its combined score. `0.0` = absolute quality only; `1.0` = similarity only. |
-| `pre_generated_analysis` | object | No | `null` | A prior result from `/assess` or `example_results[n].example_analysis`. Skips re-analysis of this example. **Must be from the same classifier version** — see caching note below. |
-
-#### Aggregation options
-
-| Value | Behaviour | Use when |
-|---|---|---|
-| `mean` | Average of all combined scores | All examples equally important |
-| `min` | Lowest combined score wins | Input must be close to every example |
-| `max` | Highest combined score wins | Input needs to match any one example |
-
-#### Combined score formula
-
-```
-combined = (1 - weight) × input_overall_score + weight × similarity_score
-```
-
-**Example request:**
-
-```json
-{
-  "image": {"data": "<base64>", "type": "base64"},
-  "criteria": [
-    {"name": "has electrical meter", "type": "llm", "hint": "presence", "weight": 4.0},
-    {"name": "meter value is readable", "type": "llm", "hint": "quality", "weight": 3.0, "depends_on": "has electrical meter"},
-    {"name": "Notice to Owner", "type": "text", "match": "fuzzy", "weight": 2.0}
-  ],
-  "aggregation": "mean",
-  "ocr": "auto",
-  "examples": [
-    {"data": "<base64>", "type": "base64", "weight": 0.5},
-    {"data": "<base64>", "type": "base64", "weight": 0.5, "pre_generated_analysis": {"image_info": {}, "assessment": {}, "verdict": "PASS"}}
-  ]
-}
-```
-
-**Result shape** (inside `job.result`):
-
-```json
-{
-  "status": "ok",
-  "criteria": [...],
-  "aggregation": "mean",
-  "ocr": "auto",
-  "input_analysis": {
-    "image_info": {"width": 480, "height": 640, "format": "image/jpeg", "size_bytes": 112400},
-    "assessment": {"overall_verdict": "PASS", "overall_score": 9, "per_criterion_scores": {...}, "weighted_score_breakdown": {...}},
-    "verdict": "PASS"
-  },
-  "example_results": [
-    {
-      "index": 0,
-      "weight": 0.5,
-      "pre_generated": false,
-      "example_analysis": {"image_info": {...}, "assessment": {...}, "verdict": "PASS"},
-      "similarity": {
-        "overall_similarity": 0.92,
-        "similarity_score": 9.2,
-        "per_criterion": {
-          "has electrical meter":    {"example_score": 10, "input_score": 10, "similarity": 1.0},
-          "meter value is readable": {"example_score": 8,  "input_score": 8,  "similarity": 1.0}
-        }
-      },
-      "combined_score": 9.1,
-      "combined_verdict": "PASS",
-      "diff": {
-        "aligned": true, "inliers": 147,
-        "homography": [[1.0, 0.0, 6.1], [0.0, 1.0, 5.9], [0.0, 0.0, 1.0]],
-        "changes": {"added": 1, "removed": 2, "changed": 0},
-        "regions": [{"kind": "polygon", "source": "diff", "label": "_diff:e0",
-                     "attrs": {"change": "added", "bbox": [130, 509, 340, 623]}, "…": "…"}],
-        "regions_truncated": false, "note": null,
-        "artifacts": {"slug": "diff-e0-…", "pages": [{"page": 0, "svg": "…"}], "attempts": []}
-      }
-    }
-  ],
-  "aggregate": {
-    "method": "mean",
-    "combined_score": 9.1,
-    "combined_verdict": "PASS",
-    "per_example_combined_scores": [9.1]
-  },
-  "artifacts": { "…": "…" },
-  "page_geometry": [ … ]
-}
-```
-
-`example_results[i].diff` is present only with `regions.diff: true`; see
-[Change detection](#change-detection) for what `aligned: false` means and when
-an example is skipped. Diff regions never reach `similarity`,
-`combined_score` or `aggregate` — those are identical with `diff` on and off.
-`artifacts` / `page_geometry` mirror the subject's, so a caller does not have
-to dig through `input_analysis` for the layer URLs.
-
-When `regions` is set, the subject's `artifacts` and `page_geometry` are
-mirrored at the top level of the compare result as well as living inside
-`input_analysis`, so a caller does not have to dig for the layer URLs.
-
----
-
-### `POST /locate`
-
-Find features, report no judgement. Same pipeline as `/assess` with the
-scoring taken out: no weighted score, no verdict, no dependency resolution,
-and **no LLM call at all** in this build. For callers who want boxes for a UI
-overlay and should not have to submit criteria, read a verdict, and throw it
-away.
-
-**Content-Type:** `multipart/form-data`
-**Returns:** `202 Accepted` — poll `GET /jobs/{job_id}` for the result.
-
-| Field | Type | Required | Default | Description |
-|---|---|---|---|---|
-| `file` | File | Yes* | — | The document: JPEG, PNG, PDF, `.txt`, or `.docx` |
-| `image` | File | Yes* | — | Deprecated alias for `file`, accepted for symmetry with `/assess` |
-| `features` | string (JSON array) | **Yes** | — | What to find. Entries are either bare names or full `CriterionInput` objects — see below |
-| `ocr` | `auto` \| `always` \| `never` | No | `auto` | Text-recognition policy |
-| `regions` | string | No | `true` | Layer formats. `enabled` is implied — that is the endpoint — so this only chooses formats |
-
-\* Send one of `file` / `image`.
-
-**Feature resolution.** A bare string has no `type`, and defaulting it to
-`llm` would send the common case to a vision model that a registered OpenCV
-detector answers for free. So a bare string resolves to whichever path can
-produce geometry most cheaply:
-
-1. `cv` — a registered OpenCV detector matches the name.
-2. `detector` — `DETECTOR_URL` is configured, so the
-   [open-vocabulary detector](#the-detector) can find anything nameable. This
-   is what makes `["bicycle"]` return boxes with **no LLM call at all**.
-3. `llm` — neither, and the name is given `hint: "presence"` ("where is X" is
-   a presence question by construction). With
-   `regions={"enabled":true,"llm_boxes":true}` the
-   [enforcement loop](#the-llm-enforcement-loop) then runs for it: a
-   presence-only scoring call so there is a score to gate on, then ask →
-   validate → verify-by-crop → retry, and the feature comes back with real
-   regions and a `localization` record but still **no score and no verdict**.
-   Without `llm_boxes` no call is made at all and the feature comes back with
-   no regions and a reason naming the option to set.
-
-The result's `method` field says which path each feature took. An object
-spelled out in full is taken at its word — which is how a `text` feature sets
-its `match` mode, and how you force `"type": "detector"` for a name the
-OpenCV registry would otherwise fuzzy-match (see the warning under
-[The detector](#the-detector)).
-
-```bash
-curl http://localhost:4001/v1/classifier/locate \
-  -H "Authorization: Bearer sk-1234" \
-  -F "file=@letter.png" \
-  -F "ocr=always" \
-  -F "regions=svg,preview" \
-  -F 'features=["has text",
-                {"name":"Notice to Owner","type":"text","match":"fuzzy","fuzzy_threshold":0.8}]'
-# → {"job_id": "abc123", "phase": "pending"}
-```
-
-**Result shape** (inside `job.result`) — `features` where an assessment would
-have `assessment`, and no `verdict` anywhere:
-
-```json
-{
-  "status": "ok",
-  "image_info": {"width": 1000, "height": 1300, "format": "image/png", "size_bytes": 412004},
-  "document_info": { "…": "…" },
-  "features": {
-    "has text": {
-      "method": "cv",
-      "detail": "High-density edge blocks: 35/638 (5.5%)",
-      "page": 0,
-      "regions": [{"page": 0, "kind": "box", "points": [[96, 192], [352, 288]],
-                   "label": "has text", "score": 0.0266, "source": "cv",
-                   "attrs": {"blocks": 17}}],
-      "regions_truncated": false,
-      "artifacts": {"slug": "has-text-2c0d", "regions_url": "…", "pages": [ … ], "attempts": []}
-    },
-    "Notice to Owner": {
-      "method": "text",
-      "detail": {"found": true, "count": 1, "…": "…"},
-      "regions": [{"page": 0, "kind": "polygon", "points": [[67, 211], [359, 197], [360, 230], [68, 244]],
-                   "label": "Notice to Owner", "score": 0.9987, "source": "ocr",
-                   "attrs": {"text": "NOTICE TO OWNER", "line": 1, "ratio": 0.93}}],
-      "regions_truncated": false,
-      "artifacts": { "…": "…" }
-    }
-  },
-  "page_geometry": [ … ],
-  "artifacts": { "…": "…" }
-}
-```
-
-`metadata.type` is `"locate"`, and the job uses the same job store, the same
-artifact directory layout, and the same artifact endpoints as an assess job.
-
-An `llm` feature comes back with `"regions": []` and a `reason` naming the
-option to set, unless the request carries
-`regions={"enabled":true,"llm_boxes":true}` — then the
-[enforcement loop](#the-llm-enforcement-loop) runs for it and the feature
-carries `regions` and `localization` (but still no `score` or `verdict`).
-
-Errors: **400** for missing/unparseable `features`, an empty array, an invalid
-`ocr` value, an unknown `regions` layer, an empty file, or bytes that are not a
-supported document.
+**Errors** — all at submit, nothing queued: **400** for every rule in
+[§ Validation](#criterioninput), an empty file, invalid base64, a blocked URL,
+a body that is not a JSON object, both or neither of `file` / `text`, a removed
+form field, an unsupported kind, and a PDF with more than one page; **415** for
+a Content-Type that is neither JSON nor multipart; **502** when a document URL
+cannot be fetched; **500** if the payload could not be persisted. A page image
+under `CLASSIFIER_MIN_IMAGE_WIDTH` × `CLASSIFIER_MIN_IMAGE_HEIGHT` (32 × 32 px)
+fails the JOB with "Image too small".
 
 ---
 
 ### `GET /jobs/{job_id}/artifacts`
 
-The manifest for a job's artifact directory: `files[]` (name, bytes, content
-type, url), the criterion → slug map, `page_geometry`, the request's `regions`
-options, `dropped`, `notes`, `total_bytes`, and `expires_at`. The same
-information as the result's `artifacts` block, fetchable without pulling the
-(possibly large) result.
+The manifest: `files[]` (what is on disk now — name, bytes, content type,
+url), the criterion map (`slug`, `count`, `sources`, `text_layer`),
+`page_geometry`, `options` (which layers can be rendered), `dropped`, `notes`,
+`total_bytes`, `expires_at`, `zip_url`.
 
 ```bash
 curl http://localhost:8005/jobs/abc123/artifacts | jq '{files: [.files[].name], criteria}'
 ```
 
-```json
-{
-  "files": ["manifest.json", "p0.base.jpg", "p0.layer.png", "p0.preview.jpg", "p0.svg", "regions.json"],
-  "criteria": {
-    "has sky":   {"slug": "has-sky-39f0",   "count": 1, "pages": [0], "sources": ["cv"]},
-    "has water": {"slug": "has-water-4b21", "count": 2, "pages": [0], "sources": ["cv"]}
-  }
-}
-```
-
-**404** when the job is unknown or never had artifacts (it was submitted
-without `regions`). **410** when the job exists and its result says it *did*
-have artifacts, but the directory is gone — swept past the TTL, or explicitly
-deleted. The distinction matters: a caller holding a stored URL can tell
-"expired" from "wrong URL" without guessing.
+**404** when the job is unknown or has not written its directory yet (still
+queued, running, or failed before it got that far). **410** when its result
+says it *did* have artifacts but the directory is gone — swept past the TTL,
+or explicitly deleted.
 
 ---
 
 ### `GET /jobs/{job_id}/artifacts/{name}`
 
-Stream one file with its content type (`image/svg+xml`, `image/png`,
-`image/jpeg`, `application/json`). `name` is validated against a strict pattern
-and against the directory — no path traversal, no listing the volume.
+Stream one file with its content type (`application/json`, `image/svg+xml`,
+`image/png`, `image/jpeg`, `text/plain; charset=utf-8`). `name` is validated
+against a strict pattern — no path traversal, no listing the volume.
 
-With no query parameters the stored file is streamed as-is. With any of them
-the layer is **re-rendered from `regions.json`** by the same functions that
-produced the stored one, so a filtered view is always consistent with the
-combined one.
+* A file on disk is streamed as-is.
+* A **layer not rendered yet** — `p0.svg`, `p0.layer.png`, `p0.preview.jpg`,
+  or `p0.<slug>.<suffix>` for one criterion — is rendered from `regions.json`
+  now and cached into the directory.
+* `text.<key>.txt` returns `text.<key>.json`'s `text` as plain text.
+* With any filter, `regions.json` or a combined `p0.*` layer is re-rendered for
+  that subset by the same renderer:
 
 | Param | Effect |
 |---|---|
 | `criterion=<slug>` (repeatable) | Only that criterion's / those criteria's regions |
-| `source=cv,ocr,pdf-text,llm,detector,diff` | Only regions from those sources |
-| `attempt=<n>` | LLM criteria only: the box from [enforcement-loop](#the-llm-enforcement-loop) attempt *n*, accepted or not. This is how a **rejected** box is viewed on its own. Non-LLM regions have no attempt and are dropped by this filter |
-| `accepted=true` \| `false` | LLM criteria only. `true` — **the default whenever any filter is given and no `attempt` is** — keeps the accepted attempt, matching what the stored combined layer shows. `false` keeps the rejected ones |
-
-Three families of layer live in one directory and all three take these
-filters: `p{n}.<fmt>` (the subject), `diff-e{i}-p{n}.<fmt>`
-([change detection](#change-detection)), and `e{i}.p{n}.<fmt>`
-([example layers](#layers-for-the-examples), whose geometry comes from
-`e{i}.regions.json`).
+| `source=cv,ocr,pdf-text,llm,detector` | Only regions from those sources |
+| `attempt=<n>` | LLM criteria only: the box from [enforcement-loop](#the-llm-enforcement-loop) attempt *n*, accepted or not |
+| `accepted=true` \| `false` | LLM criteria only. `true` — the default whenever no `attempt` is given — keeps the accepted attempt; `false` keeps the rejected ones |
 
 ```bash
-# The combined overlay
-curl http://localhost:8005/jobs/abc123/artifacts/p0.svg -o p0.svg
-
-# Just one criterion, re-rendered on demand
-curl "http://localhost:8005/jobs/abc123/artifacts/p0.svg?criterion=has-water-4b21" -o water.svg
-
-# Just that criterion's geometry, no picture
+curl http://localhost:8005/jobs/abc123/artifacts/p0.svg -o p0.svg                       # rendered now
+curl "http://localhost:8005/jobs/abc123/artifacts/p0.svg?criterion=has-water-4b21" -o w.svg
 curl "http://localhost:8005/jobs/abc123/artifacts/regions.json?criterion=has-water-4b21" | jq .
+curl http://localhost:8005/jobs/abc123/artifacts/text.auto.json | jq '{source, chars}'
+curl http://localhost:8005/jobs/abc123/artifacts/text.auto.txt
 ```
 
-SVG renders are cheap enough to serve uncached. A filtered PNG or preview for a
-**single** criterion is cached into the directory as `p0.<slug>.layer.png` /
-`p0.<slug>.preview.jpg` on first request — the same names
-`regions.layers_per_criterion` pre-renders, so the lazy and eager paths cannot
-produce different files — and counts against
-`CLASSIFIER_ARTIFACT_MAX_BYTES`.
+Only the plain single-criterion view is cached (as `p0.<slug>.<suffix>`) — a
+source or attempt filter is a different subset, and caching it under that
+name would serve it back to the next caller who asked for the plain one.
 
-Errors: **400** for an unknown criterion slug or a name that is not a
-renderable layer (you cannot filter `manifest.json`); **404** for an unknown
-job or a file that is not in the directory; **410** when the directory has been
-swept or deleted. A filtered `preview` needs `p{n}.base.jpg`, which exists only
-when the job asked for the `preview` layer — without it the response is a 404
-that says so and points at the SVG or PNG instead.
+Errors: **400** for an unsafe name, an unknown slug, or a filter on a file
+that is not `regions.json` / a combined layer; **404** for an unknown or
+unfinished job, a missing file that is not a layer, a layer on a document with
+no page image, or a preview whose base image the byte cap dropped; **410** when
+the directory was swept or deleted.
 
 ---
 
 ### `GET /jobs/{job_id}/artifacts.zip`
 
-Every file in the directory as one zip, built on the fly and streamed —
-nothing extra is stored. The "download the layers" path. Entries are prefixed
-with the job id, so unpacking several jobs side by side does not collide.
+Every file currently in the directory as one zip, built on the fly and
+streamed. Layers that were never fetched are not in it — fetch them first.
 
 ```bash
 curl http://localhost:8005/jobs/abc123/artifacts.zip -o layers.zip && unzip -l layers.zip
 ```
-
-Built from the files that are actually there, so a job the byte cap trimmed
-produces a zip of what survived rather than failing.
 
 ---
 
 ### `DELETE /jobs/{job_id}/artifacts`
 
 Remove the artifact directory but keep the job row and its result — the inline
-regions (up to `CLASSIFIER_INLINE_REGIONS_MAX`) survive. For a caller that
-copied the layers elsewhere and wants the disk back before the TTL. Returns
-**204**; **404** when the job is unknown or has no directory. Afterwards the
-other artifact endpoints answer **410**.
+regions survive. Returns **204**; **404** when the job is unknown or has no
+directory. Afterwards the other artifact endpoints answer **410**.
 
 ---
 
@@ -1495,24 +1211,24 @@ curl http://localhost:4001/v1/classifier/jobs/abc123 -H "Authorization: Bearer s
   "created_at": "2026-07-30T15:00:00+00:00",
   "updated_at": "2026-07-30T15:00:07+00:00",
   "elapsed_seconds": 7.0,
-  "metadata": {"type": "assess", "request_id": "req-xyz"},   // type: assess | compare | locate
-  "result": {...},
+  "metadata": {"type": "assess", "request_id": "req-xyz"},
+  "result": {"schema_version": 2, "…": "…"},
   "error": null
 }
 ```
 
-`phase` values: `staging` → `pending` → `processing` → `completed` | `failed` (see § Async job pattern).
-
-**Response shape migration note.** As of the `common.jobs` extraction, the
-top-level `id` is now `job_id`, `status` is now `phase`, and the previously
-separate `type` + `request_id` columns are nested under `metadata`. Callers
-that parse the response by field name need to update accordingly.
+`phase` values: `staging` → `pending` → `processing` → `completed` | `failed`
+(see § Async job pattern). A model outage does **not** fail the job — it fails
+the criterion and the job completes with `complete: false`. `failed` means the
+job itself could not run: a thumbnail-sized image, an undecodable file, or a
+payload from an older container (`metadata.type` `compare` / `locate`, or a
+pre-schema-2 assess payload), each with a message saying so.
 
 ---
 
 ### `GET /jobs`
 
-List recent jobs (newest first, result blobs excluded).
+List recent jobs (newest first). `?phase=` filters, `?limit=` caps the page.
 
 ```bash
 curl "http://localhost:4001/v1/classifier/jobs?limit=10" -H "Authorization: Bearer sk-1234"
@@ -1522,26 +1238,10 @@ curl "http://localhost:4001/v1/classifier/jobs?limit=10" -H "Authorization: Bear
 
 ### `DELETE /jobs/{job_id}`
 
-Delete a job record **and its artifact directory**. Returns `204 No Content`;
-**404** when the job is unknown. The directory removal is wired in as
-`common.jobs.router.build_router`'s `on_delete` hook, so a deleted row can
-never leave layer files that nothing points at. A failure in the cleanup is
-logged, not raised — the caller asked for the row to be gone, and it will be.
-
-To free the disk while keeping the row, use
-[`DELETE /jobs/{job_id}/artifacts`](#delete-jobsjob_idartifacts) instead.
-
----
-
-## Caching example analyses
-
-Re-analysing the same reference image on every request wastes LLM tokens. The recommended pattern is:
-
-1. Call `/assess` once on each reference image and retrieve the result via `GET /jobs/{job_id}`.
-2. Save the `result` object from the job.
-3. Pass the saved result as `pre_generated_analysis` in subsequent `/assess/compare` calls.
-
-> **Compatibility warning:** `pre_generated_analysis` values must come from the same version of the classifier that is currently running. The internal response structure can change between releases. A stored analysis from an older version will cause a runtime error. Always re-generate stored analyses after upgrading the classifier.
+Delete a job record **and its artifact directory** (text layers included).
+Returns `204 No Content`; **404** when the job is unknown. The directory
+removal is wired in as `common.jobs.router.build_router`'s `on_delete` hook, so
+a deleted row can never leave files that nothing points at.
 
 ---
 
@@ -1552,9 +1252,10 @@ Re-analysing the same reference image on every request wastes LLM tokens. The re
 | 7–10 | PASS |
 | 4–6 | MARGINAL |
 | 1–3 | FAIL |
-| — | SKIPPED (dependency did not pass, or the criterion is not applicable to this document kind) |
 
-SKIPPED criteria are excluded from the weighted score calculation entirely.
+A criterion that was not evaluated has `status: "skipped"` and a `null`
+verdict; one that failed has `status: "error"`. Neither counts toward the
+weighted score (an error makes the assessment incomplete).
 
 ---
 
@@ -1562,38 +1263,29 @@ SKIPPED criteria are excluded from the weighted score calculation entirely.
 
 [`unit-tests/classifier/documents/`](../../unit-tests/classifier/documents/)
 holds one generated fixture per document kind and failure mode — a native PDF,
-a scanned PDF, a `.txt`, a `.docx`, a well and a badly photographed letter, and
-a legacy `.doc` — each with the criteria to send and the result to expect, plus
-curl examples. The Postman collection's **Documents** folder mirrors it with
-ready-to-run requests.
+a scanned PDF, a `.txt`, a `.docx`, a well and a badly photographed letter, a
+legacy `.doc`, and a two-page PDF that shows the single-page refusal — each
+with the criteria to send and the result to expect, plus curl examples. The
+Postman collection's **Documents** folder mirrors it.
 
 [`unit-tests/classifier/regions/`](../../unit-tests/classifier/regions/) does
 the same for regions: a synthetic scene with sky, vegetation and a pool in
 known places, a two-column text page, and the document fixtures referenced (not
 copied) for the `ocr` and `pdf-text` overlays — with the expected geometry per
 file, curl examples for all four artifact endpoints, and a list of things that
-should never happen (a region outside the page, a different score with
-`regions` on, `"artifacts": {}` where it should be `null`). Mirrored by the
-Postman collection's **Regions** and **Artifacts** folders.
-
-The collection's **Documents + regions** folder re-sends every document
-fixture with `regions` on, so the same scores come back with the geometry that
-produced them: `pdf-text` rectangles on both pages of the native invoice,
-tilted `ocr` polygons on the scan, all four sources at once on a photographed
-letter that now carries a logo, a `RECEIVED` stamp and a signature at
-documented coordinates, and the two honest negatives — a whole-page
-measurement that produces no box, and a `.txt` / `.docx` with no pixel space
-for one.
+should never happen. Mirrored by the collection's **Regions** and **Artifacts**
+folders; **Documents + regions** re-sends the document fixtures with criteria
+chosen for their geometry.
 
 ### Running the fixtures as a suite
 
 [`unit-tests/classifier/regions_report.py`](../../unit-tests/classifier/regions_report.py)
 executes the collection's folders end to end — submit, poll, download the
-layers — then **re-draws every region from `regions.json` onto the original
-fixture** with `common.vision.annotate` and puts that picture next to the
-service's own `p{n}.preview.jpg`. The two are produced by different code from
-the same numbers, so a difference between them is itself the finding. It
-writes a self-contained `index.html`, a machine-readable `summary.json`, and
+geometry and the text layers, fetch the layers (which renders them) — then
+**re-draws every region from `regions.json` onto the original fixture** with
+`common.vision.annotate` and puts that picture next to the service's own
+`p0.preview.jpg`. It writes a self-contained `index.html` (with a link to the
+text each text criterion searched), a machine-readable `summary.json`, and
 exits non-zero when an expectation in
 [`regions_expected.json`](../../unit-tests/classifier/regions_expected.json)
 does not hold.
@@ -1607,3 +1299,7 @@ uv run --package classifier python unit-tests/classifier/regions_report.py --loc
 so everything but the vision model is verifiable with no container and no GPU.
 Setup, how to read the report, and how to add a case:
 [`unit-tests/classifier/REGIONS_REPORT.md`](../../unit-tests/classifier/REGIONS_REPORT.md).
+
+The unit tests (`unit-tests/classifier/test_*.py`) script the model at
+`llm.client._send` / `call_vllm` / `call_vllm_json` and never touch the
+network.

@@ -288,6 +288,29 @@ def load_document(
     )
 
 
+def pdf_page_count(raw: bytes) -> int:
+    """How many pages a PDF has, WITHOUT rendering or extracting any of them.
+
+    Opening a PDF with PyMuPDF parses the cross-reference table, not the page
+    content, so this is milliseconds even for a long document — cheap enough
+    for a request handler that has to refuse a multi-page upload before a
+    worker spends a render on it.
+
+    Raises:
+        UnsupportedDocumentError: PyMuPDF cannot open the stream.
+    """
+    import pymupdf
+
+    try:
+        doc = pymupdf.open(stream=raw, filetype="pdf")
+    except Exception as exc:
+        raise UnsupportedDocumentError(f"Could not open PDF: {exc}") from exc
+    try:
+        return int(doc.page_count)
+    finally:
+        doc.close()
+
+
 # ---------------------------------------------------------------------------
 # Native-PDF geometry for a text hit
 # ---------------------------------------------------------------------------

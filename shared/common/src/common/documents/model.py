@@ -19,8 +19,8 @@ place by ``ocr.apply_ocr``, read by ``textmatch.match_text`` and consumers.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Literal, Optional
+from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING, Any, Iterable, Literal, Mapping, Optional, Union
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, keeps numpy off the import path
     import numpy as np
@@ -162,3 +162,107 @@ class Document:
             if p.index == index:
                 return p
         return None
+
+
+# ---------------------------------------------------------------------------
+# Text layers held OUTSIDE the page
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TextLayer:
+    """One page's text layer, as a value rather than as page state.
+
+    ``ocr.apply_ocr`` writes recognised text INTO a ``Page``, which is right
+    for a caller that wants one text layer per document and wrong for one
+    that wants several: two consumers asking for different OCR settings on
+    the same page would overwrite each other. A ``TextLayer`` is the same
+    four facts — text, provenance, confidence, line polygons — held apart
+    from the page, so any number of them can exist side by side and be
+    applied to a VIEW of the document when something needs to search one
+    (``with_text_layers``).
+
+    Attributes:
+        page:       Zero-based index of the page this layer belongs to.
+        text:       The layer's text ("" when none).
+        source:     "native" | "ocr" | "none" — same meaning as
+                    ``Page.text_source``.
+        confidence: Mean recogniser confidence 0.0-1.0 for an OCR layer,
+                    else None.
+        lines:      OCR line detail (``{"text", "confidence", "box"}``), with
+                    ``text == "\\n".join(line["text"] ...)`` exactly as
+                    ``apply_ocr`` guarantees for ``Page.ocr_lines``. Empty for
+                    native text.
+    """
+
+    page: int
+    text: str = ""
+    source: TextSource = "none"
+    confidence: Optional[float] = None
+    lines: list[dict] = field(default_factory=list)
+
+    @classmethod
+    def of_page(cls, page: Page) -> "TextLayer":
+        """The layer a page currently carries (native text, or none)."""
+        return cls(
+            page=page.index,
+            text=page.text,
+            source=page.text_source,
+            confidence=page.ocr_confidence,
+            lines=list(page.ocr_lines),
+        )
+
+    def chars(self) -> int:
+        """Length of the stripped text — the same signal as ``Page.text_chars``."""
+        return len(self.text.strip())
+
+    def as_dict(self) -> dict[str, Any]:
+        """JSON-safe summary (no line polygons — those belong in regions)."""
+        return {
+            "page": self.page,
+            "source": self.source,
+            "chars": self.chars(),
+            "confidence": self.confidence,
+            "lines": len(self.lines),
+        }
+
+
+def page_with_layer(page: Page, layer: Optional[TextLayer]) -> Page:
+    """A shallow copy of ``page`` carrying ``layer`` as its text.
+
+    The image array is SHARED, not copied — a view costs a dataclass, not a
+    page render. ``None`` returns the page itself.
+    """
+    if layer is None:
+        return page
+    return replace(
+        page,
+        text=layer.text,
+        text_source=layer.source,
+        ocr_confidence=layer.confidence,
+        ocr_lines=list(layer.lines),
+    )
+
+
+def with_text_layers(
+    document: Document,
+    layers: Union[Mapping[int, TextLayer], Iterable[TextLayer], None],
+) -> Document:
+    """A view of ``document`` whose pages carry the given text layers.
+
+    Pages with no layer in ``layers`` keep their own text. The original
+    document is never modified, and the page images are shared, so building
+    a view per text setting is cheap — which is what lets
+    ``textmatch.match_text`` search any number of layers of the same
+    document without a single mutation.
+    """
+    if layers is None:
+        return document
+    if isinstance(layers, Mapping):
+        by_page = dict(layers)
+    else:
+        by_page = {layer.page: layer for layer in layers}
+    return replace(
+        document,
+        pages=[page_with_layer(p, by_page.get(p.index)) for p in document.pages],
+    )

@@ -18,8 +18,8 @@ All detectors share one return dict:
     method     : str   always "cv"
     regions    : list  optional — WHERE the detector found what it scored, in
                        WORKING-IMAGE coordinates (the <=1000-px resize, not the
-                       original page). ``analysis.cv_eval._run_cv_criterion``
-                       divides by that page's ``working_scale`` and stamps the
+                       original page). ``analysis.cv_eval._cv_regions``
+                       divides by the page's ``working_scale`` and stamps the
                        page index, which is what puts them in the original
                        space every stored Region lives in.
 
@@ -32,10 +32,11 @@ Adding a new detector
 4. Rebuild the container — no other changes needed.
 
 Process flow position: ``get_detector`` is called for each type="cv" criterion
-in step 4 of ``analysis.pipeline.analyze_document``; the detector then runs on
-EVERY page image of the document and the worst page's result is the one
-reported. A document with no page images (.txt / .docx) skips cv criteria
-entirely. ``REGISTRY`` is also read by ``api.introspection`` for
+by ``analysis.cv_eval`` (the detector then runs on the page's working image in
+a worker thread; a name with no match uses the criterion's ``options.fallback``)
+and by ``api.criterion_options`` (whether a ``score: false`` cv criterion can
+produce geometry). A document with no page image (.txt / .docx) skips cv
+criteria. ``REGISTRY`` is also read by ``api.introspection`` for
 GET /cv-detectors.
 """
 

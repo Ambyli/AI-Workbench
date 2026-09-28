@@ -1,11 +1,9 @@
 """Client for the open-vocabulary detector service (`ai/detector`).
 
-The detector answers "where is X" for a free-text X. That is the one thing
-this service could not do before: a `has bicycle` criterion had no OpenCV
-detector, so it fell back to the vision LLM, which produced a score and no
-geometry at all. With `DETECTOR_URL` set and `regions.detector` asked for,
-the same criterion comes back with boxes — and, when it is a `cv` criterion,
-with a score that cost no tokens.
+The detector answers "where is X" for a free-text X. It is what lets a
+`has bicycle` criterion — a `detector` criterion, or a `cv` criterion with no
+OpenCV detector whose `options.fallback` is "detector" — come back with boxes
+and a score that cost no tokens.
 
     DetectorUnavailable   — the one exception this module raises. Every
                             caller catches it and degrades; see below.
@@ -17,8 +15,8 @@ with a score that cost no tokens.
 a pipeline that already works. A connection refused, a timeout, a 503 while
 the model loads, a garbled body — all of them become a
 :class:`DetectorUnavailable`, which ``analysis.detector_eval`` turns into
-an ``artifacts.notes`` line and a fall-through to the behaviour of a build with
-no detector at all. A job must never fail because an enrichment did.
+``status: "error"`` for the ONE criterion that asked. A job never fails
+because one criterion's dependency did.
 
 **Batching.** One call per page image, carrying every label wanted for that
 page. The detector embeds each label as its own text query, so N labels in
@@ -33,8 +31,8 @@ pixels and are rescaled into original page pixels here, through the same
 original instead would mean a second JPEG encode of a 12-megapixel photo per
 page for no extra accuracy — the detector resizes to 1024 anyway.
 
-Process flow position: called from ``analysis.detector_eval`` in step 4.5 of
-the pipeline, after the CV detectors and before the LLM call.
+Process flow position: called from ``analysis.detector_eval`` — once per
+detector-answered criterion, with that criterion's name as the one label.
 """
 
 from __future__ import annotations
@@ -58,8 +56,8 @@ from logger import logger
 class DetectorUnavailable(RuntimeError):
     """The detector could not answer. Always caught, never propagated.
 
-    Carries a caller-facing sentence — it ends up verbatim in
-    ``artifacts.notes``, so it names the service and the reason without
+    Carries a caller-facing sentence — it ends up verbatim in the
+    criterion's ``error``, so it names the service and the reason without
     leaking a stack trace into a job result.
     """
 
@@ -176,8 +174,8 @@ async def detect_page(
     """
     if not DETECTOR_URL:
         raise DetectorUnavailable(
-            "regions.detector was requested but DETECTOR_URL is not configured "
-            "on this container, so no source=\"detector\" regions were produced."
+            "the open-vocabulary detector is not configured on this container "
+            "(DETECTOR_URL is empty)"
         )
     if not labels:
         return {}

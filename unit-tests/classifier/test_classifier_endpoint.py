@@ -1,368 +1,546 @@
-#!/usr/bin/env python3
+"""POST /assess end to end, through FastAPI's TestClient, with a scripted model.
+
+No network and no live model: the app runs in-process with its real worker
+pool, SQLite queue and artifact store (all on the session temp directory set
+up by conftest.py), and the vision model is replaced at the transport
+(``llm.client._send``) so the process-wide call limit stays in play.
+
+What is pinned here:
+
+  * the one request, two ways — a JSON body and a multipart form produce the
+    SAME result for the same document and criteria; inline ``text`` works
+    both ways;
+  * the result shape — ``schema_version: 2``, one key set for every
+    criterion whatever its type or status, ``page_geometry`` a single object;
+  * the refusals at submit — a two-page PDF, the removed routes (404), and
+    the validation 400s that need the HTTP layer (the model-level rules are
+    in test_criterion_options.py);
+  * the artifacts every job writes — regions.json, the base image, one
+    ``text.<key>.json`` per distinct text layer (linked from each criterion,
+    never inlined), the lazily rendered layers, and what the byte cap and
+    DELETE do to them;
+  * a model outage fails one criterion, not the job.
+
+Run with::
+
+    UV_LINK_MODE=copy uv run --no-sync --with pytest --package classifier \\
+        python -m pytest unit-tests/classifier/test_classifier_endpoint.py -q -p no:cacheprovider
 """
-Test the classifier endpoints.
 
-Fetches available hints and CV detectors, then submits an image assessment
-job and polls until complete.
+from __future__ import annotations
 
-Usage:
-    python test_classifier_endpoint.py
-    python test_classifier_endpoint.py --image path/to/image.jpg
-    python test_classifier_endpoint.py --criteria-file unit-tests/classifier/criteria.json
-    python test_classifier_endpoint.py --base-url http://192.168.5.233:4001 --max-wait 120
-
-Requires: pip install requests
-"""
-
-import argparse
 import base64
 import json
-import sys
+import pathlib
 import time
-from pathlib import Path
 
-try:
-    import requests
-except ImportError:
-    sys.exit("requests is required: pip install requests")
+import httpx
+import numpy as np
+import pytest
+from fastapi.testclient import TestClient
 
-SCRIPT_DIR = Path(__file__).parent
+from common.documents import OCRResult
 
-DEFAULT_CRITERIA = [
-    {"name": "document legibility", "type": "llm", "hint": "quality"},
-    {"name": "image sharpness",     "type": "llm", "hint": "quality"},
-    {"name": "proper exposure",     "type": "llm", "hint": "quality"},
-    {"name": "absence of artifacts","type": "llm", "hint": "quality"},
+HERE = pathlib.Path(__file__).resolve().parent
+DOCS = HERE / "documents"
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def client():
+    import main
+
+    with TestClient(main.app) as c:
+        yield c
+
+
+def _answer(score=9, reason="I observe it. Therefore it is present."):
+    return {"choices": [{"message": {"content": json.dumps(
+        {"score": score, "verdict": "PASS", "confidence": 80, "reason": reason}
+    )}}]}
+
+
+@pytest.fixture
+def model(monkeypatch):
+    """Script the vision model at the transport. Records every prompt."""
+    from llm import client as llm_client
+
+    calls: list[dict] = []
+
+    async def fake_post(prompt):
+        calls.append(prompt)
+        return _answer()
+
+    monkeypatch.setattr(llm_client, "_send", fake_post)
+    return calls
+
+
+class FakeOCR:
+    """An OCREngine with one known line and box; counts its calls."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def recognize(self, image_bgr):
+        self.calls += 1
+        return OCRResult(
+            text="NOTICE TO OWNER\nTotal Due $4,850.00",
+            confidence=0.9,
+            lines=[
+                {"text": "NOTICE TO OWNER", "confidence": 0.95,
+                 "box": [[40, 100], [360, 100], [360, 140], [40, 140]]},
+                {"text": "Total Due $4,850.00", "confidence": 0.85,
+                 "box": [[40, 200], [520, 200], [520, 240], [40, 240]]},
+            ],
+        )
+
+
+@pytest.fixture
+def fake_ocr(monkeypatch):
+    from analysis import ocr
+
+    engine = FakeOCR()
+    monkeypatch.setattr(ocr, "_ocr_engine", engine)
+    return engine
+
+
+def _png(width=400, height=300, value=180) -> bytes:
+    import cv2
+
+    return cv2.imencode(".png", np.full((height, width, 3), value, dtype=np.uint8))[1].tobytes()
+
+
+def _b64(raw: bytes) -> str:
+    return base64.b64encode(raw).decode("ascii")
+
+
+def _wait(client, job_id: str, timeout: float = 20.0) -> dict:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        job = client.get(f"/jobs/{job_id}").json()
+        if job["phase"] in ("completed", "failed"):
+            return job
+        time.sleep(0.05)
+    raise AssertionError(f"job {job_id} did not finish: {job}")
+
+
+def _run_json(client, document: dict, criteria: list) -> dict:
+    r = client.post("/assess", json={"document": document, "criteria": criteria})
+    assert r.status_code == 202, r.text
+    job = _wait(client, r.json()["job_id"])
+    assert job["phase"] == "completed", job
+    return job
+
+
+def _run_form(client, criteria: list, *, files=None, data=None) -> dict:
+    form = {"criteria": json.dumps(criteria), **(data or {})}
+    r = client.post("/assess", files=files, data=form)
+    assert r.status_code == 202, r.text
+    job = _wait(client, r.json()["job_id"])
+    assert job["phase"] == "completed", job
+    return job
+
+
+def _entries(job) -> dict:
+    return job["result"]["assessment"]["per_criterion_scores"]
+
+
+def _strip_ids(value, job_id: str):
+    """The result with this job's id removed, so two jobs can be compared."""
+    return json.loads(json.dumps(value).replace(job_id, "<job>"))
+
+
+ENTRY_KEYS = {
+    "status", "type", "method", "scored", "score", "verdict", "confidence",
+    "reason", "detail", "regions", "regions_truncated", "artifacts",
+    "localization", "options_used", "error",
+}
+
+TEXT_CRITERIA = [
+    {"name": "Limited Warranty", "type": "text"},
+    {"name": "mentions a warranty", "type": "llm", "options": {"hint": "presence"}},
 ]
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# One request, two encodings
 # ---------------------------------------------------------------------------
 
-def load_api_key() -> str:
-    env_file = (SCRIPT_DIR / "../../.env").resolve()
-    for line in env_file.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("DEFAULT_LITELLM_MASTER_KEY="):
-            value = line.split("=", 1)[1].strip()
-            if " #" in value:
-                value = value[:value.index(" #")].strip()
-            return value
-    sys.exit("ERROR: DEFAULT_LITELLM_MASTER_KEY not found in .env")
+
+def test_json_and_multipart_produce_the_same_result(client, model):
+    raw = (DOCS / "contract.txt").read_bytes()
+    as_json = _run_json(
+        client, {"type": "base64", "data": _b64(raw), "filename": "contract.txt"}, TEXT_CRITERIA
+    )
+    as_form = _run_form(
+        client, TEXT_CRITERIA, files={"file": ("contract.txt", raw, "text/plain")}
+    )
+    a = _strip_ids(as_json["result"], as_json["job_id"])
+    b = _strip_ids(as_form["result"], as_form["job_id"])
+    for result in (a, b):
+        result["artifacts"].pop("expires_at")
+        result["artifacts"].pop("dir")
+        for f in result["artifacts"]["files"]:
+            f.pop("bytes", None)
+    assert a["assessment"] == b["assessment"]
+    assert a["document_info"] == b["document_info"]
+    assert a["verdict"] == b["verdict"] == "PASS"
 
 
-def get(base_url: str, api_key: str, path: str) -> dict:
-    """Perform a GET request to the classifier API and return the JSON body."""
-    url = f"{base_url}/v1/classifier{path}"
-    resp = requests.get(url, headers={"Authorization": f"Bearer {api_key}"}, timeout=10)
-    if not resp.ok:
-        sys.exit(f"GET {path} failed ({resp.status_code}): {resp.text}")
-    return resp.json()
+def test_legacy_image_part_is_still_accepted(client, model):
+    job = _run_form(
+        client, [{"name": "sharpness", "type": "cv"}],
+        files={"image": ("page.png", _png(), "image/png")},
+    )
+    assert _entries(job)["sharpness"]["method"] == "cv"
 
 
-def fetch_hints(base_url: str, api_key: str) -> dict:
-    return get(base_url, api_key, "/hints")
+def test_inline_text_both_ways(client, model):
+    criteria = [{"name": "Notice to Owner", "type": "text"}]
+    via_json = _run_json(client, {"type": "text", "data": "A NOTICE TO OWNER is here."}, criteria)
+    via_form = _run_form(client, criteria, data={"text": "A NOTICE TO OWNER is here."})
+    for job in (via_json, via_form):
+        info = job["result"]["document_info"]
+        assert info["kind"] == "txt" and info["filename"] == "inline.txt"
+        assert _entries(job)["Notice to Owner"]["verdict"] == "PASS"
 
 
-def fetch_cv_detectors(base_url: str, api_key: str) -> dict:
-    return get(base_url, api_key, "/cv-detectors")
+def test_default_criteria_apply_when_omitted(client, model):
+    r = client.post("/assess", files={"file": ("page.png", _png(), "image/png")})
+    assert r.status_code == 202, r.text
+    job = _wait(client, r.json()["job_id"])
+    names = list(_entries(job))
+    assert names == [
+        "document legibility", "image sharpness", "proper exposure", "absence of artifacts"
+    ]
+    assert all(e["options_used"]["hint"] == "quality" for e in _entries(job).values())
 
 
-def encode_image(image_path: Path) -> str:
-    """Base64-encode an image file for use in JSON request bodies."""
-    return base64.b64encode(image_path.read_bytes()).decode()
+# ---------------------------------------------------------------------------
+# The result shape
+# ---------------------------------------------------------------------------
 
 
-def submit_job(base_url: str, api_key: str, image_path: Path, criteria: list) -> str:
-    url = f"{base_url}/v1/classifier/assess"
-    print(f"  POST {url}")
-    with image_path.open("rb") as fh:
-        resp = requests.post(
-            url,
-            headers={"Authorization": f"Bearer {api_key}"},
-            files={"image": (image_path.name, fh, "image/jpeg")},
-            data={"criteria": json.dumps(criteria)},
-            timeout=30,
-        )
-    if not resp.ok:
-        sys.exit(f"Submit failed ({resp.status_code}): {resp.text}")
-    return resp.json()["job_id"]
+def test_every_criterion_has_the_same_keys(client, model, monkeypatch):
+    from llm import client as llm_client
 
+    async def flaky_post(prompt):
+        text = json.dumps(prompt)
+        if "will fail" in text:
+            raise httpx.ConnectError("model down")
+        return _answer()
 
-def poll_job(base_url: str, api_key: str, job_id: str, max_wait: int, poll_interval: int) -> dict:
-    url = f"{base_url}/v1/classifier/jobs/{job_id}"
-    headers = {"Authorization": f"Bearer {api_key}"}
-    elapsed = 0
-
-    while elapsed < max_wait:
-        time.sleep(poll_interval)
-        elapsed += poll_interval
-        resp = requests.get(url, headers=headers, timeout=10)
-        if not resp.ok:
-            sys.exit(f"Poll failed ({resp.status_code}): {resp.text}")
-        data = resp.json()
-        status = data["status"]
-        print(f"  [{elapsed:>4}s] {status}", flush=True)
-        if status in ("completed", "failed"):
-            return data
-
-    sys.exit(f"Timed out after {max_wait}s — last status: {status}")
-
-
-def submit_compare_job(
-    base_url: str,
-    api_key: str,
-    input_path: Path,
-    example_path: Path,
-    criteria: list,
-    example_weight: float = 0.5,
-    aggregation: str = "mean",
-    pre_generated_analysis: dict = None,
-) -> str:
-    """Submit a /assess/compare job and return the job ID.
-
-    If pre_generated_analysis is provided it is passed as the example's
-    pre_generated_analysis — skipping re-analysis of the example image.
-    The example image bytes are always included so the server has them if needed.
-    """
-    url = f"{base_url}/v1/classifier/assess/compare"
-    print(f"  POST {url}")
-
-    body = {
-        "image": {"data": encode_image(input_path), "type": "base64"},
-        "criteria": criteria,
-        "aggregation": aggregation,
-        "examples": [{
-            "data":                  encode_image(example_path),
-            "type":                  "base64",
-            "weight":                example_weight,
-            "pre_generated_analysis": pre_generated_analysis,
-        }],
+    monkeypatch.setattr(llm_client, "_send", flaky_post)
+    job = _run_form(
+        client,
+        [
+            {"name": "sharpness", "type": "cv"},
+            {"name": "has sky", "type": "cv"},
+            {"name": "SOMETHING", "type": "text"},
+            {"name": "has a roof", "type": "llm", "options": {"hint": "presence"}},
+            {"name": "will fail", "type": "llm"},
+            {"name": "after", "type": "text", "depends_on": "SOMETHING"},
+        ],
+        files={"file": ("page.png", _png(), "image/png")},
+    )
+    result = job["result"]
+    assert result["schema_version"] == 2
+    assert isinstance(result["page_geometry"], dict)
+    assert result["page_geometry"]["width"] == 400
+    entries = _entries(job)
+    for name, entry in entries.items():
+        assert set(entry) == ENTRY_KEYS, name
+    assert entries["will fail"]["status"] == "error"
+    assert "model down" in entries["will fail"]["error"]
+    assert entries["after"]["status"] == "skipped"
+    assert entries["has a roof"]["localization"] == {
+        "attempts": [], "accepted_attempt": None, "calls": 0
     }
+    assert entries["sharpness"]["localization"] is None
+    assert "image_info" not in result and "features" not in result
 
-    resp = requests.post(
-        url,
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json=body,
-        timeout=30,
+
+def test_a_model_outage_fails_one_criterion_and_marks_the_job_incomplete(client, monkeypatch):
+    from llm import client as llm_client
+
+    async def down(prompt):
+        raise httpx.ConnectError("connection refused")
+
+    monkeypatch.setattr(llm_client, "_send", down)
+    job = _run_form(
+        client,
+        [
+            {"name": "sharpness", "type": "cv"},
+            {"name": "has a roof", "type": "llm", "options": {"hint": "presence"}},
+        ],
+        files={"file": ("page.png", _png(), "image/png")},
     )
-    if not resp.ok:
-        sys.exit(f"Compare submit failed ({resp.status_code}): {resp.text}")
-    return resp.json()["job_id"]
+    assessment = job["result"]["assessment"]
+    assert job["phase"] == "completed"
+    assert assessment["complete"] is False
+    assert assessment["overall_verdict"] is None and assessment["overall_score"] is None
+    assert job["result"]["verdict"] is None
+    breakdown = assessment["weighted_score_breakdown"]
+    assert breakdown["partial"] is True
+    assert list(breakdown["per_criterion"]) == ["sharpness"]
+    assert breakdown["excluded"] == {"has a roof": "error"}
 
 
 # ---------------------------------------------------------------------------
-# Display helpers
+# Refusals at submit
 # ---------------------------------------------------------------------------
 
-def print_hints(hints_data: dict) -> None:
-    hints = hints_data.get("hints", {})
-    print(f"\n{'=' * 60}")
-    print(f"  Available hints ({len(hints)})")
-    print(f"{'=' * 60}")
-    for name, defn in hints.items():
-        print(f"\n  [{name}]")
-        print(f"    {defn.get('heading', '')}")
-        print(f"    Rubric : {defn.get('rubric', '')}")
-        if defn.get("extra"):
-            print(f"    Extra  : {defn['extra']}")
+
+def test_a_two_page_pdf_is_refused(client):
+    raw = (DOCS / "invoice_two_page.pdf").read_bytes()
+    r = client.post("/assess", files={"file": ("two.pdf", raw, "application/pdf")})
+    assert r.status_code == 400
+    assert "only single-page PDFs are supported (this one has 2 pages)" in r.json()["detail"]
+
+    r = client.post("/assess", json={"document": {"type": "base64", "data": _b64(raw)}})
+    assert r.status_code == 400 and "this one has 2 pages" in r.json()["detail"]
 
 
-def print_cv_detectors(detectors_data: dict) -> None:
-    detectors = detectors_data.get("detectors", [])
-    total = detectors_data.get("total_names", 0)
-    print(f"\n{'=' * 60}")
-    print(f"  Registered CV detectors ({len(detectors)} functions, {total} names)")
-    print(f"{'=' * 60}")
-    for d in detectors:
-        names = ", ".join(d.get("names", []))
-        print(f"  {d['function']:<25}  {names}")
+@pytest.mark.parametrize("path", ["/locate", "/assess/compare"])
+def test_removed_routes_are_404(client, path):
+    assert client.post(path, json={}).status_code == 404
 
 
-def print_result(job: dict, criteria: list = None) -> None:
-    if job["status"] == "completed":
-        result     = job.get("result", {})
-        assessment = result.get("assessment", {})
-
-        print(f"\n{'-' * 60}")
-        print(f"  Verdict          : {result.get('verdict', 'n/a')} "
-              f"(score {assessment.get('overall_score', '-')})")
-        print(f"{'-' * 60}")
-
-        per = assessment.get("per_criterion_scores", {})
-        if per:
-            print("\n  Per-criterion scores:")
-            for name, val in per.items():
-                if not isinstance(val, dict):
-                    continue
-                verdict = val.get("verdict", "?")
-                if verdict == "SKIPPED":
-                    print(f"    {name:<35} {'SKIPPED':<10}  [{val.get('reason', '')}]")
-                else:
-                    method = val.get("method", "?")
-                    conf   = f"  confidence={val.get('confidence', '?')}"
-                    print(f"    {name:<35} {verdict:<10} "
-                          f"score={val.get('score', '?')}{conf}  [{method}]")
-                    reason = val.get("reason", "")
-                    if reason:
-                        print(f"      {reason}")
-
-        breakdown = assessment.get("weighted_score_breakdown")
-        if breakdown:
-            print(f"\n  Weighted score breakdown  ({breakdown.get('formula')})")
-            print(f"  {'Criterion':<35} {'Score':>5}  {'Weight':>7}  {'Contribution':>12}")
-            print(f"  {'-'*35}  {'-'*5}  {'-'*7}  {'-'*12}")
-            for name, vals in breakdown.get("per_criterion", {}).items():
-                print(f"  {name:<35} {vals['score']:>5}  {vals['weight']:>7}  {vals['contribution']:>12.4f}")
-            print(f"  {'-'*35}  {'-'*5}  {'-'*7}  {'-'*12}")
-            print(f"  {'Total weight':<35} {'':>5}  {breakdown['total_weight']:>7}  "
-                  f"{'Σ = ' + str(round(breakdown['weighted_sum'], 4)):>12}")
-            print(f"  {'Unrounded average':<35} {breakdown['unrounded_average']:>5.4f}")
-            print(f"  {'Final score (rounded)':<35} {breakdown['final_score']:>5}")
-
-        print("\n  Full JSON:")
-        print(json.dumps(result, indent=2))
-    else:
-        print(f"\nJob failed: {job.get('error', 'unknown error')}", file=sys.stderr)
-        sys.exit(1)
+def _submit(client, criteria, *, document=None):
+    return client.post(
+        "/assess",
+        json={"document": document or {"type": "text", "data": "hello world"}, "criteria": criteria},
+    )
 
 
-def print_compare_result(job: dict, label: str = "") -> None:
-    if job["status"] == "completed":
-        result = job.get("result", {})
-        agg    = result.get("aggregate", {})
+@pytest.mark.parametrize(
+    "criteria, fragment",
+    [
+        ([{"name": "x", "type": "llm", "options": {"colour": "red"}}], "options.colour: Extra inputs"),
+        ([{"name": "x", "type": "llm", "options": {"boxes": "yes"}}], "options.boxes"),
+        ([{"name": "x", "type": "llm", "options": {"max_attempts": 99}}], "exceeds this server's cap"),
+        ([{"name": "x", "type": "llm", "hint": "presence"}], "moved into 'options'"),
+        ([{"name": "x", "type": "text", "options": {"match": "regex", "pattern": "(["}}],
+         "options.pattern: Invalid regular expression"),
+        ([{"name": "a"}, {"name": "a"}], "duplicate criterion name"),
+        ([{"name": "a", "depends_on": "nope"}], "not a criterion in this request"),
+        ([{"name": "a", "depends_on": "b"}, {"name": "b", "depends_on": "a"}], "dependency cycle"),
+        ([{"name": "a", "type": "llm", "score": False}], "cannot produce any geometry"),
+        ([], "at least 1 item"),
+    ],
+)
+def test_validation_400s(client, criteria, fragment):
+    r = _submit(client, criteria)
+    assert r.status_code == 400, r.text
+    assert fragment in r.json()["detail"]
 
-        header = f"  Comparison result{f' — {label}' if label else ''}"
-        print(f"\n{'-' * 60}")
-        print(header)
-        print(f"  Aggregate verdict : {agg.get('combined_verdict', 'n/a')} "
-              f"(score {agg.get('combined_score', '-')}, method={agg.get('method', '-')})")
-        print(f"{'-' * 60}")
 
-        for ex in result.get("example_results", []):
-            pre = "pre-generated" if ex.get("pre_generated") else "live"
-            print(f"\n  Example {ex['index']}  weight={ex['weight']}  [{pre}]")
-            print(f"    Combined score   : {ex.get('combined_score', '-')} "
-                  f"→ {ex.get('combined_verdict', '-')}")
-            sim = ex.get("similarity", {})
-            print(f"    Overall sim      : {sim.get('overall_similarity', '-')} "
-                  f"(score {sim.get('similarity_score', '-')})")
-            for crit, vals in sim.get("per_criterion", {}).items():
-                print(f"      {crit:<35} sim={vals['similarity']:.3f}  "
-                      f"(example={vals['example_score']} / input={vals['input_score']})")
+def test_score_false_on_a_text_only_document_is_refused(client):
+    r = _submit(client, [{"name": "a", "type": "text", "score": False}])
+    assert r.status_code == 400
+    assert "need a page image" in r.json()["detail"]
 
-        print("\n  Full JSON:")
-        print(json.dumps(result, indent=2))
-    else:
-        print(f"\nCompare job failed: {job.get('error', 'unknown error')}", file=sys.stderr)
-        sys.exit(1)
+
+def test_detector_criteria_need_a_configured_detector(client):
+    r = _submit(client, [{"name": "has bicycle", "type": "detector"}],
+                document={"type": "base64", "data": _b64(_png())})
+    assert r.status_code == 400 and "DETECTOR_URL is empty" in r.json()["detail"]
+
+
+def test_form_level_refusals(client):
+    png = ("page.png", _png(), "image/png")
+    r = client.post("/assess", files={"file": png}, data={"ocr": "always"})
+    assert r.status_code == 400 and "options.ocr" in r.json()["detail"]
+    r = client.post("/assess", files={"file": png}, data={"text": "also this"})
+    assert r.status_code == 400 and "not both" in r.json()["detail"]
+    r = client.post("/assess", data={"criteria": "[]"})
+    assert r.status_code == 400 and "No document" in r.json()["detail"]
+    r = client.post("/assess", files={"file": png}, data={"criteria": "not json"})
+    assert r.status_code == 400 and "not valid JSON" in r.json()["detail"]
+    legacy = (DOCS / "unsupported_legacy.doc").read_bytes()
+    r = client.post("/assess", files={"file": ("old.doc", legacy, "application/msword")})
+    assert r.status_code == 400 and ".docx" in r.json()["detail"]
+
+
+def test_unsupported_content_type_is_415(client):
+    r = client.post("/assess", content=b"x", headers={"content-type": "application/xml"})
+    assert r.status_code == 415
+
+
+def test_criterion_types_describes_every_type(client):
+    body = client.get("/criterion-types").json()
+    assert set(body["types"]) == {"llm", "text", "cv", "detector"}
+    llm = body["types"]["llm"]
+    assert llm["defaults"] == {"hint": "auto", "boxes": False, "max_attempts": 3, "ocr": "auto"}
+    assert llm["caps"] == {"max_attempts": 3}
+    assert "boxes" in llm["options_schema"]["properties"]
+    assert body["types"]["cv"]["defaults"] == {"fallback": "llm"}  # no DETECTOR_URL here
 
 
 # ---------------------------------------------------------------------------
-# Entry point
+# The text a criterion searched
 # ---------------------------------------------------------------------------
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Test the classifier API — fetches capabilities then runs an assessment.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+
+def _artifact_names(client, job) -> list[str]:
+    return [f["name"] for f in client.get(f"/jobs/{job['job_id']}/artifacts").json()["files"]]
+
+
+def test_text_layer_is_written_linked_and_shared(client, model):
+    raw = (DOCS / "contract.txt").read_bytes()
+    job = _run_form(
+        client,
+        [
+            {"name": "Limited Warranty", "type": "text"},
+            {"name": "2026-03-14", "type": "text"},
+            {"name": "mentions a warranty", "type": "llm"},
+        ],
+        files={"file": ("contract.txt", raw, "text/plain")},
     )
-    parser.add_argument("--image", type=Path, default=SCRIPT_DIR / "Neighborhood.jpeg")
-    parser.add_argument("--criteria", type=str, default=None)
-    parser.add_argument("--criteria-file", type=Path, default=None)
-    parser.add_argument("--base-url", default="http://192.168.5.233:4001")
-    parser.add_argument("--api-key", default=None)
-    parser.add_argument("--max-wait", type=int, default=300)
-    parser.add_argument("--poll-interval", type=int, default=3)
-    args = parser.parse_args()
+    names = _artifact_names(client, job)
+    assert [n for n in names if n.startswith("text.")] == ["text.auto.json"]  # ONE shared file
 
-    api_key = args.api_key or load_api_key()
+    entries = _entries(job)
+    for name in ("Limited Warranty", "2026-03-14", "mentions a warranty"):
+        link = entries[name]["artifacts"]["text"]
+        assert link == {
+            "key": "auto",
+            "url": f"/jobs/{job['job_id']}/artifacts/text.auto.json",
+            "source": "native",
+            "chars": len(raw.decode("utf-8")),
+        }
+        assert entries[name]["options_used"]["ocr"] == link["key"]
+        assert "text" not in (entries[name]["detail"] or {})  # never inlined
 
-    if args.criteria_file:
-        criteria = json.loads(args.criteria_file.read_text(encoding="utf-8"))
-    elif args.criteria:
-        criteria = json.loads(args.criteria)
-    else:
-        criteria = DEFAULT_CRITERIA
+    stored = client.get(link["url"])
+    assert stored.status_code == 200
+    assert stored.headers["content-type"].startswith("application/json")
+    payload = stored.json()
+    # Byte-for-byte the string the matcher searched: the document itself.
+    assert payload["text"] == raw.decode("utf-8")
+    assert payload["source"] == "native" and payload["engine"] is None
+    assert payload["settings"]["mode"] == "auto" and payload["lines"] == []
 
-    image = args.image.resolve()
-    if not image.exists():
-        sys.exit(f"Image not found: {image}")
+    plain = client.get(f"/jobs/{job['job_id']}/artifacts/text.auto.txt")
+    assert plain.status_code == 200
+    assert plain.headers["content-type"] == "text/plain; charset=utf-8"
+    assert plain.text == raw.decode("utf-8")
 
-    # --- Fetch and display capabilities ---
-    print(f"\nBase URL : {args.base_url}")
+    manifest = client.get(f"/jobs/{job['job_id']}/artifacts").json()
+    assert manifest["criteria"]["Limited Warranty"]["text_layer"] == "auto"
 
-    print("\nFetching hints...")
-    hints_data = fetch_hints(args.base_url, api_key)
-    print_hints(hints_data)
 
-    print("\nFetching CV detectors...")
-    detectors_data = fetch_cv_detectors(args.base_url, api_key)
-    print_cv_detectors(detectors_data)
-
-    # --- Submit and poll assessment job ---
-    size_kb = image.stat().st_size / 1024
-    print(f"\n{'=' * 60}")
-    print(f"  Assessment")
-    print(f"{'=' * 60}")
-    print(f"\nImage    : {image.name} ({size_kb:.1f} KB)")
-    print(f"Criteria : {[c['name'] for c in criteria]}\n")
-
-    print("Submitting job...")
-    job_id = submit_job(args.base_url, api_key, image, criteria)
-    print(f"Job ID   : {job_id}\n")
-
-    print("Polling for result...")
-    job = poll_job(args.base_url, api_key, job_id, args.max_wait, args.poll_interval)
-
-    print_result(job, criteria)
-
-    # Save the assess result to use as pre_generated_analysis in the first comparison
-    prior_analysis = job.get("result")
-
-    # --- Comparison 1: example uses pre-generated analysis (no re-analysis) ---
-    print(f"\n{'=' * 60}")
-    print(f"  Comparison 1 — pre-generated example analysis")
-    print(f"{'=' * 60}")
-    print(f"\nInput   : {image.name}")
-    print(f"Example : {image.name}  [using cached analysis from assess above]")
-    print(f"Criteria: {[c['name'] for c in criteria]}\n")
-
-    print("Submitting compare job...")
-    cmp_id = submit_compare_job(
-        args.base_url, api_key, image, image, criteria,
-        example_weight=0.5,
-        pre_generated_analysis=prior_analysis,
+def test_different_settings_write_different_layers(client, fake_ocr):
+    raw = (DOCS / "invoice_scanned.pdf").read_bytes()
+    job = _run_form(
+        client,
+        [
+            {"name": "NOTICE TO OWNER", "type": "text", "options": {"ocr": "never"}},
+            {"name": "notice again", "type": "text",
+             "options": {"pattern": "NOTICE TO OWNER", "ocr": "always"}},
+            {"name": "and again", "type": "text",
+             "options": {"pattern": "Total Due", "ocr": "always"}},
+        ],
+        files={"file": ("scan.pdf", raw, "application/pdf")},
     )
-    print(f"Job ID  : {cmp_id}\n")
+    names = sorted(n for n in _artifact_names(client, job) if n.startswith("text."))
+    assert names == ["text.always.json", "text.never.json"]
+    assert fake_ocr.calls == 1  # the two "always" criteria shared ONE pass
 
-    print("Polling for result...")
-    cmp_job = poll_job(args.base_url, api_key, cmp_id, args.max_wait, args.poll_interval)
-    print_compare_result(cmp_job, label="pre-generated example")
+    entries = _entries(job)
+    assert entries["NOTICE TO OWNER"]["artifacts"]["text"]["source"] == "none"
+    assert entries["NOTICE TO OWNER"]["verdict"] == "FAIL"
+    assert entries["notice again"]["artifacts"]["text"]["source"] == "ocr"
+    assert entries["notice again"]["verdict"] == "PASS"
+    # The OCR line polygons became regions on the page.
+    assert entries["notice again"]["regions"][0]["source"] == "ocr"
 
-    # --- Comparison 2: both images analyzed live, no pre-generated analysis ---
-    print(f"\n{'=' * 60}")
-    print(f"  Comparison 2 — fully live (both images re-analyzed)")
-    print(f"{'=' * 60}")
-    print(f"\nInput   : {image.name}")
-    print(f"Example : {image.name}  [analyzed live]")
-    print(f"Criteria: {[c['name'] for c in criteria]}\n")
+    ocr_layer = client.get(f"/jobs/{job['job_id']}/artifacts/text.always.json").json()
+    assert ocr_layer["source"] == "ocr" and ocr_layer["engine"] == "FakeOCR"
+    assert ocr_layer["text"] == "NOTICE TO OWNER\nTotal Due $4,850.00"
+    assert ocr_layer["lines"][0]["polygon"] == [[40, 100], [360, 100], [360, 140], [40, 140]]
+    never = client.get(f"/jobs/{job['job_id']}/artifacts/text.never.json").json()
+    assert never["source"] == "none" and never["text"] == ""
 
-    print("Submitting compare job...")
-    cmp_id2 = submit_compare_job(
-        args.base_url, api_key, image, image, criteria,
-        example_weight=0.5,
-        pre_generated_analysis=None,
+
+@pytest.mark.parametrize("fixture", ["invoice_native.pdf", "proposal.docx", "contract.txt"])
+def test_native_documents_store_a_native_layer(client, fixture):
+    raw = (DOCS / fixture).read_bytes()
+    job = _run_form(
+        client, [{"name": "Tampa", "type": "text"}], files={"file": (fixture, raw, None)}
     )
-    print(f"Job ID  : {cmp_id2}\n")
+    layer = client.get(f"/jobs/{job['job_id']}/artifacts/text.auto.json").json()
+    assert layer["source"] == "native"
+    assert "Tampa" in layer["text"]
+    assert _entries(job)["Tampa"]["verdict"] == "PASS"
 
-    print("Polling for result...")
-    cmp_job2 = poll_job(args.base_url, api_key, cmp_id2, args.max_wait, args.poll_interval)
-    print_compare_result(cmp_job2, label="fully live")
+
+def test_text_layers_survive_the_byte_cap_and_go_with_the_job(client, monkeypatch):
+    from regions.store import store
+
+    monkeypatch.setattr(store, "max_bytes", 1)  # everything droppable goes
+    raw = (DOCS / "invoice_native.pdf").read_bytes()
+    job = _run_form(
+        client, [{"name": "Net 30", "type": "text"}],
+        files={"file": ("invoice.pdf", raw, "application/pdf")},
+    )
+    names = _artifact_names(client, job)
+    assert "text.auto.json" in names and "regions.json" in names
+    assert "p0.base.jpg" not in names  # dropped by the cap
+    assert "p0.base.jpg" in job["result"]["artifacts"]["dropped"]
+
+    job_id = job["job_id"]
+    assert client.delete(f"/jobs/{job_id}").status_code in (200, 204)
+    assert not store.exists(job_id)
+    assert client.get(f"/jobs/{job_id}/artifacts/text.auto.json").status_code == 404
 
 
-if __name__ == "__main__":
-    main()
+# ---------------------------------------------------------------------------
+# Layers render on first fetch
+# ---------------------------------------------------------------------------
+
+
+def test_layers_render_on_first_fetch_and_are_cached(client, model):
+    raw = (DOCS / "invoice_native.pdf").read_bytes()
+    job = _run_form(
+        client, [{"name": "Total Due", "type": "text"}],
+        files={"file": ("invoice.pdf", raw, "application/pdf")},
+    )
+    job_id = job["job_id"]
+    entry = _entries(job)["Total Due"]
+    assert entry["regions"] and entry["regions"][0]["source"] == "pdf-text"
+    assert set(job["result"]["artifacts"]["layers"]) == {"svg", "png", "preview"}
+
+    before = _artifact_names(client, job)
+    assert "p0.svg" not in before and "p0.base.jpg" in before
+
+    svg = client.get(f"/jobs/{job_id}/artifacts/p0.svg")
+    assert svg.status_code == 200 and svg.headers["content-type"] == "image/svg+xml"
+    assert 'data-region-count="' in svg.text
+    png = client.get(f"/jobs/{job_id}/artifacts/p0.layer.png")
+    assert png.status_code == 200 and png.headers["content-type"] == "image/png"
+    preview = client.get(f"/jobs/{job_id}/artifacts/p0.preview.jpg")
+    assert preview.status_code == 200 and preview.headers["content-type"] == "image/jpeg"
+
+    after = _artifact_names(client, job)
+    assert {"p0.svg", "p0.layer.png", "p0.preview.jpg"} <= set(after)
+
+    # A per-criterion view renders and caches under the criterion's name.
+    slug = entry["artifacts"]["slug"]
+    one = client.get(entry["artifacts"]["layers"]["svg"])
+    assert one.status_code == 200
+    by_name = client.get(f"/jobs/{job_id}/artifacts/p0.{slug}.layer.png")
+    assert by_name.status_code == 200
+    assert f"p0.{slug}.layer.png" in _artifact_names(client, job)
+
+
+def test_text_only_documents_have_no_layers(client, model):
+    job = _run_json(client, {"type": "text", "data": "hello"}, [{"name": "hello", "type": "text"}])
+    assert job["result"]["page_geometry"] is None
+    assert job["result"]["artifacts"]["layers"] == {}
+    r = client.get(f"/jobs/{job['job_id']}/artifacts/p0.svg")
+    assert r.status_code == 404 and "no page image" in r.json()["detail"]

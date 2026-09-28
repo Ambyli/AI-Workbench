@@ -12,43 +12,48 @@ This module does four things and nothing else:
 
 Every endpoint handler lives in ``api/``:
 
-    api.assess         POST /assess, POST /assess/compare
-    api.locate         POST /locate
-    api.introspection  GET /hints, /cv-detectors, /document-kinds, /health
+    api.assess         POST /assess — the one analysis endpoint (JSON or
+                       multipart, parsed into one AssessRequest)
+    api.introspection  GET /criterion-types, /hints, /cv-detectors,
+                       /document-kinds, /health
     api.artifacts      the four /jobs/{job_id}/artifacts routes
     common.jobs.router GET /jobs, GET /jobs/{id}, DELETE /jobs/{id}
 
+/locate and /assess/compare were removed and answer 404 like any unknown
+route; /locate's job is ``score: false`` on a criterion of /assess.
+
 Overall request flow for /assess:
   1. HTTP request arrives → CorrelationIDMiddleware assigns [request_id].
-  2. ``api.assess.assess_document`` validates criteria and the ocr mode, and
-     reads the file bytes.
+  2. ``api.assess.assess`` validates the request (per-type criterion
+     options, caps, dependencies), resolves the document bytes (base64,
+     inline text, or an SSRF-checked URL fetch), detects the kind, and
+     refuses a multi-page PDF — all before anything is queued.
   3. Job record created in SQLite via ``jobs_registry.register(..., "staging")``.
-  4. Payload (file bytes + criteria + ocr mode) written to
+  4. Payload (document bytes + validated criteria) written to
      PAYLOAD_DIR/<job_id>.json, then the row is flipped to "pending" and idle
      workers are woken.
   5. 202 Accepted returned immediately with job_id.
-  6. One of the worker tasks atomically claims the row (→ "processing"),
-     reads the payload, loads the document, runs OCR + CV + text + LLM, and calls
-     ``jobs_registry.set_result(...)`` on success or ``set_error(...)`` on failure.
+  6. One of the worker tasks atomically claims the row (→ "processing") and
+     runs ``jobs.runners.run_assess``: load the single-page document, build
+     the shared context, evaluate every criterion independently (dependency
+     waves, CLASSIFIER_MAX_CRITERIA_PER_JOB at once, model calls bounded by
+     CLASSIFIER_MAX_LLM_CALLS and OCR by CLASSIFIER_OCR_WORKERS across the
+     process), weigh, and store the artifacts.
   7. Caller polls GET /jobs/{job_id} until phase="completed" or "failed".
 
 The jobs table IS the queue — see jobs/queue.py and common.jobs.worker — so up
 to CLASSIFIER_MAX_CONCURRENT jobs run at once and pending work survives
 restarts.
 
-Uploads are documents, not just images: JPEG/PNG, PDF (native or scanned),
-plain text, and .docx all load through ``common.documents`` into a page list
-that may carry an image, a text layer, or both. Criteria then run on whichever
-of those they need — ``cv`` on page images, ``text`` on the text layer
-(OCR-filled when the document is a scan), ``llm`` on one page image plus the
-extracted text.
+Uploads are single-page documents: a JPEG/PNG, a one-page PDF (native or
+scanned), plain text, or a .docx, all loaded through ``common.documents``
+into one page that may carry an image, a text layer, or both.
 
-Regions and layers (regions/, common.vision) are opt-in: pass `regions` on
-/assess or /assess/compare — or use /locate, where it is implied — and the job
-additionally writes a per-job artifact directory (regions.json, manifest.json,
-and the requested SVG / PNG / preview layers) served by the four artifact
-routes. A background sweeper prunes those directories, and the expired job
-rows themselves, past JOB_TTL_HOURS.
+Every job writes a per-job artifact directory (regions.json, one
+text.<key>.json per text layer its criteria used, the page's base image,
+manifest.json); the SVG / PNG / preview layers are rendered on first fetch by
+the artifact routes. A background sweeper prunes those directories, and the
+expired job rows themselves, past JOB_TTL_HOURS.
 """
 
 import logging
@@ -60,7 +65,7 @@ from prometheus_fastapi_instrumentator import Instrumentator
 from common.jobs.router import build_router
 
 from api import artifacts as artifacts_api
-from api import assess, introspection, locate
+from api import assess, introspection
 from config import LOG_LEVEL
 from jobs.queue import jobs_registry, queue, sweeper
 from logger import logger
@@ -161,9 +166,7 @@ app.include_router(
 # /jobs/{job_id}, whatever the include order.
 app.include_router(artifacts_api.build_artifacts_router(jobs_registry))
 
-# The endpoints themselves, in the order they were declared when they all
-# lived in this file: /assess and /assess/compare, then /locate, then the
-# introspection routes and /health.
+# The endpoints themselves: /assess, then the introspection routes and
+# /health.
 app.include_router(assess.router)
-app.include_router(locate.router)
 app.include_router(introspection.router)

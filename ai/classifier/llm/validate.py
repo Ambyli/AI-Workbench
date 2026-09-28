@@ -1,189 +1,95 @@
 """Believing the model's answer only as far as it can be checked.
 
-A vision model returns JSON that is usually right and occasionally not: a key
-capitalised differently, a score of 47, a confidence of "high". Both are fixed
-here rather than anywhere else, so every consumer of an assessment can assume
-1-10 scores, 0-100 confidence, and criterion keys spelled exactly as they were
-asked for.
+A vision model returns JSON that is usually right and occasionally not: a
+score of 47, a confidence of "high", the answer wrapped in the multi-criterion
+shape an older prompt asked for. All of it is fixed here, so every consumer of
+an ``llm`` result can assume a 1-10 score, a 0-100 confidence, and a verdict
+that agrees with the score.
 
-    _normalize_criterion_keys() — remap returned keys onto the requested names
-                                  (exact, then case-insensitive, then fuzzy).
-    validate_and_clamp()        — clamp scores and confidence, recompute every
-                                  verdict FROM its clamped score.
+    find_answer()  — the one criterion's answer object inside whatever the
+                     model returned: the flat ``{"score": …}`` the prompt asks
+                     for, or — tolerated — ``{"assessment":
+                     {"per_criterion_scores": {name: {…}}}}``, matched by
+                     name (exact, case-insensitive, fuzzy, or the only entry).
+                     ``ValueError`` when there is none, which ``call_vllm``
+                     treats as a parse failure and retries.
+    clamp_answer() — clamp score and confidence, recompute the verdict FROM
+                     the clamped score, keep the reason as a string.
 
-It does NOT compute the weighted overall score — that is
-``analysis.weighting.compute_weighted_score``, which runs over the merged
-assessment (cv + text + detector + llm), not just this call's half.
+The weighted overall score is not computed here — that is
+``analysis.weighting.compute_weighted_score``, over every criterion.
 
-A SKIPPED entry is left alone on purpose: it carries ``score: None``, and
-clamping would turn it into a middling 5 and drag it back into the weighted
-average.
-
-Process flow position: immediately after ``llm.client.call_vllm`` in step 6,
-and again over the merged assessment in step 7.
+Process flow position: passed to ``llm.client.call_vllm`` as its
+``validator`` by ``analysis.llm_eval``.
 """
 
 import difflib
+from typing import Any
 
-from api.schemas import CriterionInput
 from logger import logger
 from utils import verdict_from_score as _verdict_from_score
 
 
-def _normalize_criterion_keys(
-    per_criterion: dict, criteria: list[CriterionInput]
-) -> dict:
-    """Remap LLM-returned criterion keys to the exact names that were requested.
+def find_answer(raw: Any, name: str) -> dict:
+    """The answer object for criterion ``name`` inside the model's JSON.
 
-    The LLM sometimes returns keys that differ from the requested names:
-      - capitalisation: "Image Sharpness" instead of "image sharpness"
-      - minor wording: "solar_panels" instead of "has solar panels"
-
-    Resolution order (first match wins):
-      1. Exact match — no change needed.
-      2. Case-insensitive match — strip and lower both sides.
-      3. Fuzzy match via difflib (cutoff 0.6) — catches minor spelling diffs.
-      4. No match — keep the key as-is (logged as a warning).
-
-    Args:
-        per_criterion: The dict of criterion scores returned by the LLM.
-        criteria:      The original list of CriterionInput objects.
-
-    Returns:
-        A new dict with keys remapped to the canonical criterion names.
+    Raises:
+        ValueError: No object carrying a ``score`` could be found.
     """
-    requested_names = [c.name for c in criteria]
-    logger.debug(
-        "_normalize_criterion_keys: returned=%s requested=%s",
-        list(per_criterion.keys()),
-        requested_names,
-    )
-    normalized: dict = {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"expected a JSON object, got {type(raw).__name__}")
+    if "score" in raw:
+        return raw
 
-    for returned_key, value in per_criterion.items():
-        # 1. Exact match — most common case after prompt improvements
-        if returned_key in requested_names:
-            normalized[returned_key] = value
-            continue
-
-        # 2. Case-insensitive match
-        lower = returned_key.lower().strip()
-        exact_ci = next(
-            (n for n in requested_names if n.lower().strip() == lower), None
-        )
-        if exact_ci:
-            if exact_ci != returned_key:
-                logger.debug(
-                    "_normalize_criterion_keys: case match '%s' -> '%s'",
-                    returned_key,
-                    exact_ci,
-                )
-            normalized[exact_ci] = value
-            continue
-
-        # 3. Fuzzy match — handles minor wording differences
-        close = difflib.get_close_matches(
-            returned_key, requested_names, n=1, cutoff=0.6
-        )
+    nested = raw.get("assessment", raw)
+    per = nested.get("per_criterion_scores") if isinstance(nested, dict) else None
+    if isinstance(per, dict) and per:
+        entries = {k: v for k, v in per.items() if isinstance(v, dict)}
+        if name in entries:
+            return entries[name]
+        lowered = {k.lower().strip(): k for k in entries}
+        if name.lower().strip() in lowered:
+            return entries[lowered[name.lower().strip()]]
+        close = difflib.get_close_matches(name, list(entries), n=1, cutoff=0.6)
         if close:
-            logger.debug(
-                "_normalize_criterion_keys: fuzzy match '%s' -> '%s'",
-                returned_key,
-                close[0],
-            )
-            normalized[close[0]] = value
-        else:
-            # 4. No match — preserve the original key but warn
-            logger.warning(
-                "_normalize_criterion_keys: no match for '%s', keeping as-is",
-                returned_key,
-            )
-            normalized[returned_key] = value
-
-    logger.debug(
-        "_normalize_criterion_keys: returning keys=%s", list(normalized.keys())
-    )
-    return normalized
+            logger.debug("find_answer: fuzzy key '%s' -> '%s'", close[0], name)
+            return entries[close[0]]
+        if len(entries) == 1:
+            return next(iter(entries.values()))
+    raise ValueError(f"no 'score' for {name!r} in the answer: {str(raw)[:200]}")
 
 
-def validate_and_clamp(assessment: dict, criteria: list[CriterionInput]) -> dict:
-    """Clamp scores/confidence to valid ranges, normalise criterion keys, and
-    recompute per-criterion verdicts from the clamped scores.
+def clamp_answer(entry: dict) -> dict:
+    """Clamp one answer to valid ranges and derive the verdict from the score.
 
-    Does NOT compute the weighted overall score — call compute_weighted_score()
-    separately when a weighted breakdown is needed (i.e. for combined_assessment).
-
-    Steps:
-      1. Clamp raw overall_score to [1, 10]; set preliminary overall_verdict.
-      2. Normalise criterion keys via _normalize_criterion_keys().
-      3. Clamp per-criterion score to [1, 10] and confidence to [0, 100].
-      4. Recompute per-criterion verdict from the clamped score.
-
-    Args:
-        assessment: Raw assessment dict from call_vllm() (may have bad values).
-        criteria:   Criteria list used for key normalisation.
-
-    Returns:
-        Cleaned assessment dict with valid scores and verdicts.
+    A missing or non-numeric score becomes 5 and a missing confidence 50 —
+    logged, because either means the model half-answered.
     """
-    logger.info(
-        "validate_and_clamp: raw overall_score=%s overall_verdict=%s criteria=%s",
-        assessment.get("overall_score"),
-        assessment.get("overall_verdict"),
-        [c.name for c in criteria],
-    )
-
-    # Step 1 — clamp raw overall score and set a preliminary verdict
-    raw_score = assessment.get("overall_score", 5)
     try:
-        overall_score = max(1, min(10, int(raw_score)))
+        score = max(1, min(10, int(round(float(entry.get("score", 5))))))
+    except (TypeError, ValueError):
+        logger.warning("clamp_answer: invalid score %r, defaulting to 5", entry.get("score"))
+        score = 5
+    try:
+        confidence = max(0, min(100, int(round(float(entry.get("confidence", 50))))))
     except (TypeError, ValueError):
         logger.warning(
-            "validate_and_clamp: invalid overall_score=%r, defaulting to 5", raw_score
+            "clamp_answer: invalid confidence %r, defaulting to 50", entry.get("confidence")
         )
-        overall_score = 5
-    assessment["overall_score"] = overall_score
-    assessment["overall_verdict"] = _verdict_from_score(overall_score)
+        confidence = 50
+    reason = entry.get("reason")
+    return {
+        "score": score,
+        "verdict": _verdict_from_score(score),
+        "confidence": confidence,
+        "reason": str(reason) if reason is not None else "",
+    }
 
-    # Step 2 — normalise criterion keys
-    per_criterion = _normalize_criterion_keys(
-        assessment.get("per_criterion_scores", {}), criteria
-    )
 
-    # Step 3+4 — clamp per-criterion scores/confidence and recompute verdicts
-    for key, val in per_criterion.items():
-        if not isinstance(val, dict):
-            continue
-        if val.get("verdict") == "SKIPPED":
-            # Not applicable, not scored: a SKIPPED entry carries score=None on
-            # purpose (apply_dependencies, or a cv criterion on a document with
-            # no page images). Clamping would turn it into a middling 5 and
-            # drag it back into the weighted average.
-            continue
-        try:
-            score = max(1, min(10, int(val.get("score", 5))))
-        except (TypeError, ValueError):
-            logger.warning(
-                "validate_and_clamp: invalid score for '%s', defaulting to 5", key
-            )
-            score = 5
-        try:
-            confidence = max(0, min(100, int(val.get("confidence", 50))))
-        except (TypeError, ValueError):
-            logger.warning(
-                "validate_and_clamp: invalid confidence for '%s', defaulting to 50", key
-            )
-            confidence = 50
-        val["score"] = score
-        val["confidence"] = confidence
-        val["verdict"] = _verdict_from_score(score)
+def answer_validator(name: str):
+    """A ``call_vllm`` validator that extracts and clamps ``name``'s answer."""
 
-    assessment["per_criterion_scores"] = per_criterion
+    def _validate(raw: Any) -> dict:
+        return clamp_answer(find_answer(raw, name))
 
-    logger.info(
-        "validate_and_clamp: returning overall_score=%s overall_verdict=%s keys=%s",
-        assessment["overall_score"],
-        assessment["overall_verdict"],
-        list(per_criterion.keys()),
-    )
-    return assessment
+    return _validate

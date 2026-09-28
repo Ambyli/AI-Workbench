@@ -1,14 +1,25 @@
-"""Talking to the vLLM server: the two calls, and what they cost.
+"""Talking to the vLLM server: one transport, two failure modes, one limit.
 
     encode_image_to_base64() — BGR numpy array -> base64 JPEG for a data URI.
+    LLM_CALLS                — the process-wide limit on model requests in
+                               flight (CLASSIFIER_MAX_LLM_CALLS), across every
+                               job and every call type.
+    _post()                  — ONE HTTP request to VISION_LLM_API (``_send``),
+                               holding a LLM_CALLS slot for exactly its
+                               duration. Every call below goes through it, so
+                               no call path — scoring, box ask, refine,
+                               verify — can get around the limit.
     call_vllm()              — the SCORING call. Retries a parse failure up to
-                               MAX_LLM_RETRIES and, when every attempt fails,
-                               returns an error SENTINEL rather than raising,
-                               so a broken call still produces a scored result.
-    call_vllm_json()         — the generic JSON call the enforcement loop's two
+                               MAX_LLM_RETRIES; raises ``LLMCallError`` on an
+                               HTTP failure or when every attempt was
+                               unparseable. The scheduler turns that into
+                               ``status: "error"`` for the ONE criterion that
+                               asked — a model outage fails that criterion,
+                               never the job.
+    call_vllm_json()         — the generic JSON call the enforcement loop's
                                prompts use. Returns None on failure instead of
-                               a sentinel, because a localisation that could
-                               not be obtained must leave the score it was
+                               raising, because a localisation that could not
+                               be obtained must leave the score it was
                                annotating untouched.
 
 The difference in failure mode between the two is the whole reason they are
@@ -17,22 +28,28 @@ separate functions.
 ``llm_calls_total`` and ``llm_latency`` live here rather than in ``metrics``
 because both calls produce them and nothing else reads them.
 
-Process flow position: ``call_vllm`` is step 6 of
-``analysis.pipeline.analyze_document``; ``call_vllm_json`` is every round of
-``llm.boxes``.
+Tests script the model by replacing ``call_vllm`` / ``call_vllm_json`` (the
+calls) or ``_send`` (the bare transport under ``_post``, which keeps the limit
+in play and measurable).
+
+Process flow position: ``call_vllm`` is the ``llm`` evaluator's scoring call
+(``analysis.llm_eval``); ``call_vllm_json`` is every round of ``llm.boxes``.
 """
 
 import base64
 import json
 import re
+import time
 
 import httpx
-from fastapi import HTTPException
 from prometheus_client import Counter, Histogram
+
+from common.jobs.limits import ConcurrencyLimit
 
 from config import (
     HTTP_CONNECT_TIMEOUT,
     HTTP_TIMEOUT,
+    MAX_LLM_CALLS,
     MAX_LLM_RETRIES,
     VISION_LLM_API,
     VISION_LLM_MODEL,
@@ -41,6 +58,11 @@ from logger import logger
 
 # Shared HTTP timeout applied to every vLLM request
 _http_timeout = httpx.Timeout(HTTP_TIMEOUT, connect=HTTP_CONNECT_TIMEOUT)
+
+# Model requests in flight across the whole process. One slot per HTTP
+# request (a retry takes a fresh slot), so a slow model backs callers up here
+# rather than inside vLLM's own queue.
+LLM_CALLS = ConcurrencyLimit(MAX_LLM_CALLS, name="llm-calls")
 
 # ---------------------------------------------------------------------------
 # Prometheus metrics
@@ -55,6 +77,15 @@ llm_latency = Histogram(
     "classifier_llm_latency_seconds",
     "LLM API call latency in seconds",
 )
+
+
+class LLMCallError(RuntimeError):
+    """The scoring call could not produce an answer.
+
+    Raised for an HTTP failure (the model is down, a 4xx/5xx), an unexpected
+    response shape, or ``MAX_LLM_RETRIES`` unparseable answers. The message
+    is caller-facing: it lands in the criterion's ``error`` field.
+    """
 
 
 def encode_image_to_base64(image) -> str:
@@ -78,135 +109,127 @@ def encode_image_to_base64(image) -> str:
     return result
 
 
-async def call_vllm(prompt: dict) -> dict:
-    """POST a prompt to the vLLM API and return the parsed assessment dict.
+async def _send(prompt: dict) -> dict:
+    """The bare HTTP request: POST one chat completion, return the JSON body.
 
-    Retry logic: JSON parse or structure errors trigger up to MAX_LLM_RETRIES
-    retries with the same prompt.  HTTP errors (model down, network issue) are
-    raised immediately — retrying a dead server is pointless.
-
-    On exhausting all retries, returns an error sentinel dict rather than
-    raising so the caller can still produce a FAIL response with an error
-    reason in per_criterion_scores.
-
-    Args:
-        prompt: The dict produced by build_llm_prompt().
-
-    Returns:
-        Parsed assessment dict  {"assessment": {...}}  or error sentinel.
+    Never called directly — only through ``_post``, which holds the limit.
+    Tests replace THIS function to script the model with the limit in play.
 
     Raises:
-        HTTPException(502): On HTTP-level failures from vLLM.
+        httpx.HTTPError: Transport failures and non-2xx statuses.
     """
-    import time
+    t0 = time.monotonic()
+    async with httpx.AsyncClient(timeout=_http_timeout) as client:
+        response = await client.post(VISION_LLM_API, json=prompt)
+        response.raise_for_status()
+        data = response.json()
+    llm_latency.observe(time.monotonic() - t0)
+    return data
 
+
+async def _post(prompt: dict) -> dict:
+    """One model request holding a ``LLM_CALLS`` slot for exactly its duration.
+
+    Parsing and retry decisions happen outside the slot, so a slow parse
+    never holds a place another job's call could use.
+    """
+    async with LLM_CALLS:
+        return await _send(prompt)
+
+
+def _parse_content(data: dict) -> dict:
+    """The JSON object in a completion's ``content``.
+
+    With a reasoning parser the model's thinking lands in
+    ``reasoning_content``; ``content`` is the answer and can be None if the
+    budget ran out mid-reasoning — treated as a parse failure so the retry
+    fires. The regex fallback survives a model that wraps its JSON in
+    markdown fences despite ``json_object`` mode.
+
+    Raises:
+        KeyError / IndexError: The response is not a chat completion.
+        ValueError: No JSON object in the content.
+    """
+    content = data["choices"][0]["message"].get("content") or ""
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        match = re.search(r"\{[\s\S]*\}", content)
+        if not match:
+            raise ValueError(f"no JSON in response: {content[:200]}")
+        parsed = json.loads(match.group())
+    if not isinstance(parsed, dict):
+        raise ValueError(f"expected a JSON object, got {type(parsed).__name__}")
+    return parsed
+
+
+async def call_vllm(prompt: dict, *, label: str = "", validator=None) -> dict:
+    """The scoring call: the parsed JSON answer, or ``LLMCallError``.
+
+    Parse failures (including an empty ``content``) retry up to
+    MAX_LLM_RETRIES with the same prompt. HTTP errors and a response that is
+    not a chat completion are not retried — retrying a dead server is
+    pointless.
+
+    Args:
+        prompt: The dict produced by ``llm.prompts.build_llm_prompt``.
+        label:     What this call is for, for the log line only.
+        validator: Optional ``parsed -> answer`` function. A ``ValueError``
+                   from it counts as a parse failure and retries, so "valid
+                   JSON but no score in it" gets the same budget as "not
+                   JSON at all". Its return value is what this returns.
+
+    Returns:
+        The model's JSON object, or ``validator``'s result for it.
+
+    Raises:
+        LLMCallError: The call failed; the message says why.
+    """
     logger.info(
-        "call_vllm: posting to %s model=%s (max_retries=%d)",
-        VISION_LLM_API,
-        VISION_LLM_MODEL,
-        MAX_LLM_RETRIES,
+        "call_vllm(%s): posting to %s model=%s (max_retries=%d)",
+        label, VISION_LLM_API, VISION_LLM_MODEL, MAX_LLM_RETRIES,
     )
-
     last_exc: Exception | None = None
-
     for attempt in range(MAX_LLM_RETRIES):
-        logger.info("call_vllm: attempt %d/%d", attempt + 1, MAX_LLM_RETRIES)
-        t0 = time.monotonic()
         try:
-            # Step 1 — send the request and check HTTP status
-            async with httpx.AsyncClient(timeout=_http_timeout) as client:
-                response = await client.post(VISION_LLM_API, json=prompt)
-                response.raise_for_status()
-                data = response.json()
-
-            elapsed = time.monotonic() - t0
-            llm_latency.observe(elapsed)
-            # With a reasoning parser the model's thinking lands in
-            # `reasoning_content`; `content` is the answer and can be None if
-            # the budget ran out mid-reasoning. Treat that as a parse failure
-            # so the retry loop fires instead of a 502.
-            content = data["choices"][0]["message"].get("content") or ""
-            logger.debug(
-                "call_vllm: response[%d chars] in %.2fs", len(content), elapsed
-            )
-
-            # Step 2 — parse the JSON response
-            # json_object mode should guarantee valid JSON, but keep regex
-            # as a fallback in case the model wraps it in markdown fences
-            try:
-                result = json.loads(content)
-            except json.JSONDecodeError:
-                json_match = re.search(r"\{[\s\S]*\}", content)
-                if not json_match:
-                    raise ValueError(f"No JSON found in response: {content[:200]}")
-                result = json.loads(json_match.group())
-
-            # Step 3 — verify the expected top-level key is present
-            if "assessment" not in result:
-                raise ValueError(f"Response missing 'assessment' key: {content[:200]}")
-
+            data = await _post(prompt)
+            result = _parse_content(data)
+            if validator is not None:
+                result = validator(result)
             llm_calls_total.labels(status="success").inc()
-            verdict = result.get("assessment", {}).get("overall_verdict", "unknown")
-            score = result.get("assessment", {}).get("overall_score", "unknown")
-            logger.info(
-                "call_vllm: returning overall_verdict=%s overall_score=%s",
-                verdict,
-                score,
-            )
             return result
-
         except httpx.HTTPError as exc:
-            # HTTP errors (4xx/5xx from vLLM) are not retried — log and raise
             llm_calls_total.labels(status="failed").inc()
-            logger.error("call_vllm: HTTP error on attempt %d: %s", attempt + 1, exc)
-            raise HTTPException(status_code=502, detail=f"vLLM call failed: {exc}")
+            logger.error("call_vllm(%s): HTTP error: %s", label, exc)
+            raise LLMCallError(f"vision model call failed: {exc}") from exc
         except (KeyError, IndexError) as exc:
-            # Unexpected response shape — not retried
             llm_calls_total.labels(status="failed").inc()
-            logger.error(
-                "call_vllm: unexpected response format on attempt %d: %s",
-                attempt + 1,
-                exc,
-            )
-            raise HTTPException(
-                status_code=502, detail=f"Unexpected vLLM response format: {exc}"
-            )
+            logger.error("call_vllm(%s): unexpected response shape: %s", label, exc)
+            raise LLMCallError(f"unexpected vision model response: {exc!r}") from exc
         except (json.JSONDecodeError, ValueError) as exc:
-            # Parse / structure errors — retry up to MAX_LLM_RETRIES
             llm_calls_total.labels(status="retry").inc()
             logger.warning(
-                "call_vllm: parse failure on attempt %d: %s", attempt + 1, exc
+                "call_vllm(%s): parse failure on attempt %d/%d: %s",
+                label, attempt + 1, MAX_LLM_RETRIES, exc,
             )
             last_exc = exc
 
-    # All retries exhausted — return an error sentinel instead of raising
     llm_calls_total.labels(status="failed").inc()
-    logger.error("call_vllm: all %d attempts failed", MAX_LLM_RETRIES)
-    return {
-        "assessment": {
-            "overall_verdict": "FAIL",
-            "overall_score": 1,
-            "per_criterion_scores": {
-                "_llm_error": {
-                    "score": 1,
-                    "verdict": "FAIL",
-                    "confidence": 0,
-                    "reason": f"LLM parsing failed after {MAX_LLM_RETRIES} attempts: {last_exc}",
-                }
-            },
-        }
-    }
+    logger.error("call_vllm(%s): all %d attempts failed", label, MAX_LLM_RETRIES)
+    raise LLMCallError(
+        f"the vision model's answer could not be parsed after {MAX_LLM_RETRIES} "
+        f"attempts: {last_exc}"
+    )
 
 
 async def call_vllm_json(prompt: dict, *, label: str = "") -> dict | None:
     """POST a prompt and return the parsed JSON object, or None.
 
     The difference from :func:`call_vllm` is the failure mode, and it is the
-    whole reason this exists separately. ``call_vllm`` returns a FAIL sentinel
-    assessment so a broken scoring call still produces a scored result; a
-    broken LOCALISATION call must produce nothing at all, because the score it
-    is annotating is already correct and must not move. So: ``None``, which
-    the enforcement loop records as a failed attempt and carries on from.
+    whole reason this exists separately: a broken LOCALISATION call must
+    produce nothing at all, because the score it is annotating is already
+    correct and must not move. So: ``None``, which the enforcement loop
+    records as a failed attempt and carries on from.
 
     HTTP errors are not retried (a dead server stays dead) and are not raised
     either — the loop has to survive them. Parse failures get the same
@@ -219,28 +242,9 @@ async def call_vllm_json(prompt: dict, *, label: str = "") -> dict | None:
     Returns:
         The parsed JSON object, or None when every attempt failed.
     """
-    import time
-
     for attempt in range(MAX_LLM_RETRIES):
-        t0 = time.monotonic()
         try:
-            async with httpx.AsyncClient(timeout=_http_timeout) as client:
-                response = await client.post(VISION_LLM_API, json=prompt)
-                response.raise_for_status()
-                data = response.json()
-            llm_latency.observe(time.monotonic() - t0)
-            # `content` is None when the reasoning parser ate the whole
-            # budget. Treated as a parse failure so the retry fires.
-            content = data["choices"][0]["message"].get("content") or ""
-            try:
-                parsed = json.loads(content)
-            except json.JSONDecodeError:
-                match = re.search(r"\{[\s\S]*\}", content)
-                if not match:
-                    raise ValueError(f"no JSON in response: {content[:200]}")
-                parsed = json.loads(match.group())
-            if not isinstance(parsed, dict):
-                raise ValueError(f"expected a JSON object, got {type(parsed).__name__}")
+            parsed = _parse_content(await _post(prompt))
             llm_calls_total.labels(status="success").inc()
             return parsed
         except httpx.HTTPError as exc:

@@ -1,95 +1,87 @@
-"""Running one OpenCV detector over a document, and keeping its geometry.
+"""The `cv` evaluator: one OpenCV detector on the page, and its geometry.
 
-The `cv` evaluation path. ``cv/`` holds the detectors themselves and knows
-nothing about documents or pages; this module is the bridge — it runs a
-detector across every page image, collapses the per-page results the way a
-multi-page document demands (the worst page wins), and turns the geometry the
-detectors already computed into ``Region`` objects in ORIGINAL page pixels.
+``cv/`` holds the detectors themselves and knows nothing about documents;
+this module is the bridge — it runs the detector on the page's working image
+(in a worker thread, so a slow detector does not hold the event loop other
+criteria are running on) and turns the geometry the detector already computed
+into ``Region`` objects in ORIGINAL page pixels.
 
-    _run_cv_criterion() — one detector, every page, worst page reported.
-    _cv_regions()       — detector output (working-image dicts) → Regions.
+When no OpenCV detector matches the criterion name, ``options.fallback``
+decides what answers instead — resolved at submit to "detector" when
+DETECTOR_URL is configured and "llm" otherwise, unless the caller chose:
 
-Process flow position: step 4 of ``analysis.pipeline.analyze_document``.
+    fallback "detector"  the open-vocabulary detector scores it from its
+                         boxes (``analysis.detector_eval``), at
+                         DETECTOR_MIN_SCORE
+    fallback "llm"       the vision model scores it with the default llm
+                         options (hint auto, no boxes, ocr auto)
+
+The result's ``method`` says which path actually answered.
+
+    evaluate()     — the shared evaluator interface.
+    _cv_regions()  — detector output (working-image dicts) → Regions.
+
+Process flow position: one of the four evaluators ``analysis.scheduler``
+dispatches to.
 """
+
+from __future__ import annotations
+
+import asyncio
 
 from common.vision import PageGeometry, Region, rescale_region
 
+from analysis import detector_eval, llm_eval
+from analysis.context import DocumentContext
+from analysis.outcome import Outcome, skipped
+from api.criterion_options import LLMOptions
+from api.schemas import CriterionInput
+from config import DETECTOR_MIN_SCORE
+from cv import get_detector
 from logger import logger
 
 
-def _run_cv_criterion(
-    detector,
-    name: str,
-    page_images: list[tuple[int, object]],
-    geometries: dict[int, PageGeometry] | None = None,
-) -> tuple[dict, list[Region]]:
-    """Run one CV detector across every page image; the worst page wins.
+async def evaluate(c: CriterionInput, ctx: DocumentContext) -> Outcome:
+    """Run the named OpenCV detector on the page, or the resolved fallback."""
+    detector = get_detector(c.name)
+    if detector is None:
+        fallback = c.resolved_options()["fallback"]
+        logger.info("cv_eval: no OpenCV detector for '%s' — fallback=%s", c.name, fallback)
+        if fallback == "detector":
+            outcome = await detector_eval.evaluate_label(c.name, ctx, DETECTOR_MIN_SCORE)
+        else:
+            outcome = await llm_eval.evaluate_with(
+                c.name, LLMOptions().resolve(c.name), ctx
+            )
+        note = f"No OpenCV detector matches '{c.name}'; answered by the {fallback} fallback."
+        outcome.reason = f"{note} {outcome.reason or ''}".strip()
+        return outcome
 
-    A multi-page document is only as sharp / well-exposed as its worst page —
-    one blurred page of a five-page contract is still an unusable document —
-    so the minimum score is reported, with every page's measurement kept in a
-    ``pages`` list for the caller to inspect.
+    if not ctx.has_image:
+        return skipped(
+            f"Skipped - document has no page image ({ctx.doc.kind} documents are "
+            "text-only, so OpenCV criteria cannot be evaluated).",
+            method="cv",
+        )
 
-    Regions are the exception to "worst page wins": EVERY page's regions are
-    kept, because "where is the vegetation" is a different question from "how
-    much of it is there", and answering only for the worst page would hide
-    most of the document. They are rescaled from the detector's working-image
-    coordinates into original page pixels here — the one place that knows
-    both the detector output and the page geometry.
-
-    Args:
-        detector:    The detector callable from cv.get_detector().
-        name:        Criterion name (used for logging and as the region label).
-        page_images: ``[(page_index, bgr_image), ...]``, already resized.
-        geometries:  ``{page_index: PageGeometry}``; None means the caller did
-                     not ask for regions, so none are built.
-
-    Returns:
-        ``(result, regions)`` — the standard CV result dict (plus ``pages``
-        and ``page``, the index the reported score came from), and the
-        regions in ORIGINAL page pixels.
-    """
-    per_page: list[dict] = []
-    regions: list[Region] = []
-    for index, image in page_images:
-        result = dict(detector(image))
-        result["page"] = index
-        raw_regions = result.pop("regions", None) or []
-        if geometries is not None and index in geometries:
-            regions.extend(_cv_regions(raw_regions, name, geometries[index]))
-        per_page.append(result)
-
-    worst = min(per_page, key=lambda r: r.get("score", 10))
-    merged = dict(worst)
-    merged["method"] = "cv"
-    if len(per_page) > 1:
-        merged["pages"] = [
-            {
-                "index": r["page"],
-                "score": r.get("score"),
-                "verdict": r.get("verdict"),
-                "detail": r.get("detail"),
-            }
-            for r in per_page
-        ]
-        merged["detail"] = (
-            f"{worst.get('detail', '')} "
-            f"(worst of {len(per_page)} pages — page {worst['page']})"
-        ).strip()
+    result = dict(await asyncio.to_thread(detector, ctx.working_image))
+    raw_regions = result.pop("regions", None) or []
+    regions = _cv_regions(raw_regions, c.name, ctx.geometry) if ctx.geometry else []
     logger.debug(
-        "_run_cv_criterion: '%s' pages=%d worst_page=%s score=%s regions=%d",
-        name,
-        len(per_page),
-        worst.get("page"),
-        merged.get("score"),
-        len(regions),
+        "cv_eval: '%s' score=%s regions=%d", c.name, result.get("score"), len(regions)
     )
-    return merged, regions
+    return Outcome(
+        method="cv",
+        score=result.get("score"),
+        verdict=result.get("verdict"),
+        confidence=result.get("confidence"),
+        reason=result.get("reason"),
+        detail=result.get("detail"),
+        regions=regions,
+    )
 
 
-def _cv_regions(
-    raw: list[dict], label: str, geometry: PageGeometry
-) -> list[Region]:
+def _cv_regions(raw: list[dict], label: str, geometry: PageGeometry) -> list[Region]:
     """Detector output (working-image dicts) → Regions in original pixels."""
     regions: list[Region] = []
     for item in raw:

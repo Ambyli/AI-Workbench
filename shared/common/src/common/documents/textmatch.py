@@ -29,10 +29,10 @@ from __future__ import annotations
 import difflib
 import re
 from dataclasses import dataclass, field
-from typing import Literal, Sequence
+from typing import Iterable, Literal, Mapping, Sequence, Union
 
 from ..vision.model import Region
-from .model import Document, Page
+from .model import Document, Page, TextLayer, with_text_layers
 
 MatchMode = Literal["contains", "exact", "regex", "fuzzy"]
 
@@ -452,3 +452,24 @@ def match_text(
 
     result.found = result.count >= max(1, min_count)
     return result
+
+
+def match_text_layers(
+    document: Document,
+    layers: Union[Mapping[int, TextLayer], Iterable[TextLayer], None],
+    pattern: str,
+    mode: MatchMode = "contains",
+    **kwargs,
+) -> TextMatchResult:
+    """``match_text`` over the given text layers instead of the pages' own.
+
+    The layers come from ``ocr.recognize_text_layer`` (or
+    ``TextLayer.of_page``); a page without one keeps its own text. The search
+    runs on a view (``model.with_text_layers``), so ``document`` is never
+    modified and every result — counts, snippets, and under ``locate=True``
+    the OCR line polygons — is exactly what ``match_text`` would have
+    produced had the layers been written into the pages.
+
+    Keyword arguments are ``match_text``'s.
+    """
+    return match_text(with_text_layers(document, layers), pattern, mode, **kwargs)

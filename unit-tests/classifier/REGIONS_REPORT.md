@@ -6,11 +6,14 @@ and renders what came back as a page you can check by eye.
 The classifier already tells you *where* it found something. What it cannot
 tell you is whether that place is **right** — and neither can a reviewer
 reading `regions.json`. So the script submits every collection request, polls
-the job, downloads the layers, and then **re-draws the geometry independently**
-onto the original fixture before putting the two pictures side by side:
+the job, downloads what the job stored (regions.json, the manifest, every
+`text.<key>.json`) and asks for the layers — which the service renders on first
+fetch — and then **re-draws the geometry independently** onto the original
+fixture before putting the two pictures side by side:
 
 ```
-submit → poll → GET /jobs/{id}/artifacts → download layers
+submit → poll → GET /jobs/{id}/artifacts → download regions.json + text layers
+                                         → fetch p0.svg / p0.preview.jpg (rendered now)
                                          → re-draw on the original fixture
                                          → compare with regions_expected.json
                                          → index.html + summary.json + exit code
@@ -45,8 +48,8 @@ What has to be **running** depends on which folders you run:
 | You need | For |
 |---|---|
 | `classifier` | everything |
-| `muse-glimmer` (`VISION_LLM_API`) | any item with an `llm` criterion, and every `regions.llm_boxes` item. Without it those jobs **fail** — `call_vllm` raises rather than degrading |
-| `detector` (`DETECTOR_URL`) | the `regions.detector` items. Without it the job still **succeeds** and `artifacts.notes` says the service is not configured |
+| `muse-glimmer` (`VISION_LLM_API`) | any item with an `llm` criterion (including every `options.boxes` item). Without it those **criteria** come back `status: "error"` and the job completes with `complete: false` — the other criteria still score |
+| `detector` (`DETECTOR_URL`) | the items with a `detector` criterion. Without DETECTOR_URL those are **refused at submit** (400); with it set but the service down, the detector criteria come back `status: "error"` |
 
 Check before a run:
 `curl $CLASSIFIER_BASE_URL/v1/classifier/document-kinds -H "Authorization: Bearer $KEY"`
@@ -64,17 +67,19 @@ writing, the annotation pass, and the report itself.
 
 Two consequences, both stated in the report rather than hidden:
 
-* **`llm` criteria are dropped** from a request before it is sent, so the
+* **`llm` and `detector` criteria are dropped** from a request before it is
+  sent (a `detector` criterion would be a 400 with DETECTOR_URL empty), so the
   `cv` / `text` / OCR geometry — the part that *can* be checked without a GPU
   — still runs. The report notes exactly which criteria were dropped, and
   their expectations are marked **skipped**, not met.
-* **A request that cannot be trimmed fails.** If every criterion is `llm`
-  (the enforcement-loop item), or a `cv` / bare-string feature falls through
-  to the model because no detector service is configured (the
-  `regions.detector` item, and `/locate` with `llm_boxes` on), the job fails
-  with `502: vLLM call failed`. That is recorded as **skipped** too — but only
-  in `--local`, and only when the error names the model server. The same
-  failure against the box counts as a failure.
+* **A criterion that still reaches the model errors, alone.** If every
+  criterion is `llm` (the enforcement-loop item), the request is sent
+  unchanged; and a `cv` name with no OpenCV detector falls back to the llm
+  because no detector is configured. Those criteria come back
+  `status: "error"` naming the vision model, the job completes with
+  `complete: false`, and their checks — and the overall verdict — are
+  recorded as **skipped**. Only in `--local`, and only when the error names
+  the vision model; the same outcome against the box counts as a failure.
 
 ---
 
@@ -105,13 +110,13 @@ uv run --package classifier python unit-tests/classifier/regions_report.py \
 | `--api-key` | `CLASSIFIER_API_KEY`, else `DEFAULT_LITELLM_MASTER_KEY` | Bearer token |
 | `--collection` | `ai/classifier/classifier.postman_collection.json` | Any collection with the same shape works |
 | `--folders` | `Documents,Regions,Documents + regions` | Comma-separated. The **Artifacts** folder is not runnable — its items are parametrised on a `:jobId` that only exists after a submission, and every case here exercises those endpoints itself. When `--pipeline` is given and this is not, no collection folder runs |
-| `--only` | _(all)_ | Case-insensitive substring of the item name. Does not filter pipeline stages |
-| `--pipeline` | _(none)_ | Run a chained pipeline — see [§ Pipelines](#pipelines). Repeatable; `utility-bill` is the one that exists |
-| `--document` | the committed bills | Run the pipeline on this file instead (repeatable). An ad-hoc file has no expectations: its checks are recorded as **skipped**, not failed, and the value it read is still reported |
+| `--only` | _(all)_ | Case-insensitive substring of the item name. Does not filter the `--pipeline` call |
+| `--pipeline` | _(none)_ | Run the amount-due locator — see [§ Pipelines](#pipelines): one `/assess` call per bill asking the vision model where the amount due is, drawn on the page. `utility-bill` is the one that exists |
+| `--document` | the committed bills | Run the pipeline on this file instead (repeatable). An ad-hoc file has no expectations: its checks are recorded as **skipped**, not failed, and where the model put the box is still drawn |
 | `--out` | `unit-tests/classifier/reports/<UTC timestamp>/` | Gitignored |
 | `--timeout` | `600` | Seconds to wait for one job to reach a terminal phase |
 | `--expect` | `unit-tests/classifier/regions_expected.json` | |
-| `--parallel` | `1` | Keep it at or below the box's `CLASSIFIER_MAX_CONCURRENT` (2). A deeper queue does not go faster — it just makes every elapsed number meaningless |
+| `--parallel` | `1` | Keep it at or below the box's `CLASSIFIER_MAX_CONCURRENT` (4). A deeper queue does not go faster — it just makes every elapsed number meaningless |
 | `--local` | off | In-process, see above |
 | `--keep-jobs` | off | Skip the `DELETE /jobs/{id}` cleanup at the end |
 
@@ -133,9 +138,10 @@ reports/2026-09-23T09-48-12Z/
 │   └── job.json
 ├── 03-invoice-native-pdf-pdf-text-.../
 │   ├── job.json  manifest.json  regions.json
-│   ├── p0.svg  p1.svg                  the service's overlays
-│   ├── p0.preview.jpg  p1.preview.jpg  the service's previews
-│   └── p0.annotated.jpg  p1.annotated.jpg   ← drawn by this script
+│   ├── text.never.json                 the exact text the text criteria searched
+│   ├── p0.svg                          the service's overlay (rendered on fetch)
+│   ├── p0.preview.jpg                  the service's preview (rendered on fetch)
+│   └── p0.annotated.jpg                ← drawn by this script
 └── _service/                           --local only: the throwaway DB + artifacts
 ```
 
@@ -150,35 +156,34 @@ where you expected a number means the geometry never got collected.
 
 **Per item**, in order:
 
-1. **Request** — the `regions` option, the `ocr` mode, the fixture, and the
-   criteria as a table (type / hint / match / pattern / weight / depends_on).
-2. **Result** — every criterion with method, score, verdict, confidence,
-   reason, region count, which pages, the `localization` summary
-   (attempts / accepted / calls), and ✓ or ✗ against its expectation. A
-   criterion whose expectation is `null` says *not asserted* rather than a
-   tick — a green tick you did not earn is worse than no tick.
-3. **Examples and change detection** (compare jobs only) — per-example
-   similarity, combined score, `aligned`, `inliers`, the added/removed/changed
-   counts, and links to the `diff-e{i}-p{n}.*` and `e{i}.p{n}.*` layers.
-4. **Geometry, drawn twice** — the annotated page on the left, the service's
+1. **Request** — JSON or multipart, the fixture, and the criteria as a table
+   (type / score / options / weight / depends_on).
+2. **Result** — every criterion with method, score, verdict (or its status
+   when it errored or was skipped), confidence, reason (or the error), region
+   count, which pages, the `localization` summary (attempts / accepted /
+   calls), a **link to the text it searched** (`text.<key>.json`, with its
+   source and length — the file downloaded next to the report), and ✓ or ✗
+   against its expectation. A criterion whose expectation is `null` says *not
+   asserted* rather than a tick — a green tick you did not earn is worse than
+   no tick.
+3. **Geometry, drawn twice** — the annotated page on the left, the service's
    own preview on the right. Each region carries a caption:
 
    ```
    Notice to Owner · 10 PASS · ocr
    has solar panels · 9 PASS · llm · attempt 2 verify=9
    has solar panels · 9 PASS · llm · attempt 1 ✗        (drawn dashed)
-   added · diff · e0
    ```
 
    Colour is one hue per criterion, hashed from the name by
    `common.vision.palette` — the same hue the service uses, so the two
    pictures are comparable at a glance. Stroke says the source: solid
-   `cv`/`detector`/`pdf-text`, dashed `ocr`, dotted `llm`, double `diff`. A
+   `cv`/`detector`/`pdf-text`, dashed `ocr`, dotted `llm`. A
    **rejected** LLM attempt is drawn dashed and unfilled, from the
    `bbox_grid` the model literally answered rather than the clamped box, so
    an overshoot looks like an overshoot.
-5. **Links** to `p{n}.svg`, `regions.json`, `job.json`.
-6. **What the collection says to look for** — the Postman item's own
+4. **Links** to `p0.svg`, `regions.json`, the `text.<key>.json` layers, `job.json`.
+5. **What the collection says to look for** — the Postman item's own
    description, verbatim, so the expected box is next to the drawn one.
 
 ### What to actually look at
@@ -213,8 +218,9 @@ where you expected a number means the geometry never got collected.
 
 | Field | Meaning |
 |---|---|
-| `verdict` | The job's overall verdict (`aggregate.combined_verdict` for a compare). Omit or `null` to assert nothing |
+| `verdict` | The job's overall verdict. Omit or `null` to assert nothing |
 | `http_status` | The item is expected to be **rejected at submit time**; nothing else is asserted |
+| `criteria.<name>.status` | `ok` \| `error` \| `skipped`. A skipped criterion has a null verdict, so this is how a skip is asserted |
 | `criteria.<name>.verdict` | The criterion's verdict. **`null` asserts nothing** |
 | `criteria.<name>.min_regions` | At least this many regions on that criterion |
 
@@ -226,7 +232,7 @@ A suite that pins a model's judgement to a fixed answer is not measuring the
 model, it is measuring whether the model changed — and it will go red on an
 upgrade that made things better. `min_regions` is still asserted for those
 rows, but only as `0`: "you may produce boxes, and if you do they will be
-drawn". The deterministic paths — `cv`, `text`, `ocr`, `pdf-text`, `diff` —
+drawn". The deterministic paths — `cv`, `text`, `ocr`, `pdf-text` —
 carry real numbers, taken from
 [`documents/README.md`](documents/README.md) and
 [`regions/README.md`](regions/README.md).
@@ -238,66 +244,78 @@ item cannot quietly go unasserted.
 
 ## Pipelines
 
-The collection can express any single request. It cannot express *"crop the
-region the last job found and send that"* — a request whose body depends on
-the previous answer. A **pipeline** is a short chain of such calls, built at
-run time by the script. Every stage is still an ordinary case: it goes through
-the same submit → poll → download → annotate path, gets its own section in the
-report and its own entry in `regions_expected.json`. Only the glue between
-stages lives in `regions_report.py`.
+The collection holds fixed requests. `--pipeline utility-bill` is the one case
+it cannot hold: a request built for whatever bill you pass on the command line,
+with a result the report reads more closely than a generic case. It asks the
+vision model **one question — where is the amount due?** — and shows you where
+it answered.
 
 ```bash
-# The committed bill, against the box (all three stages, LLM included)
+# Both committed bills, against the box
 uv run --package classifier python unit-tests/classifier/regions_report.py --pipeline utility-bill
 
-# The same chain in-process — no model; the deterministic OCR half decides
-uv run --package classifier python unit-tests/classifier/regions_report.py --pipeline utility-bill --local
-
-# Another bill. No expectations for it, so its checks are skipped; the value is still reported
+# Your own bill. No expectations for it, so its checks are skipped; the box is still drawn
 uv run --package classifier python unit-tests/classifier/regions_report.py \
     --pipeline utility-bill --document ~/Downloads/some_bill.jpg --keep-jobs
 ```
 
-### `utility-bill` — read the amount due off a photographed bill
+### `utility-bill` — where is the amount due?
 
-Two fixtures, run in turn by default, chosen because they lay the answer out
-differently:
-
-| Fixture | Bill | Layout | Answer |
-|---|---|---|---|
-| [`documents/utility_bill.jpeg`](documents/utility_bill.jpeg) | Ohio Edison, 5712×4284 with EXIF orientation 6 (read upright at 4284×5712) | Label and figure on **one** OCR line — `Amount Due: $80.49` — in the header; the label alone in the account summary and the payment stub | `$80.49` |
-| [`documents/utility_bill_2.jpeg`](documents/utility_bill_2.jpeg) | AEP Ohio, 4032×3024, two pages side by side | Label and figure are **separate** OCR lines on the same row — `Amount due on or before` … `$193.33` — in the header and the stub; `Total Amount Due At Last Billing $201.60` is the decoy a naive "any line containing Amount Due" would fall for | `$193.33` |
-
-| Stage | Call | Request | What decides it |
-|---|---|---|---|
-| 1 · is this a utility bill? | `POST /assess` | `ocr=always`, four fuzzy/regex `text` criteria (`Amount Due`, `Account Number`, a billing-period-or-date regex covering *Billing Period* / *Billing from* / *Service Period* / *Bill mailing date*, a usage unit such as `kWh`), an `llm` presence criterion for the document as a whole, an `llm` legibility criterion | Overall **PASS** and the llm presence criterion **PASS**. Under `--local` the llm criteria are dropped, so the text criteria decide alone — `gate.basis` in `summary.json` says which it was. Anything else stops the chain: an amount located on a document that is not a bill is *a* number, which is worse than none |
-| 2 · where is the amount due? | `POST /locate` | fuzzy `text` features `Amount Due` and `Total Due` → OCR line polygons in original page pixels; an `llm` presence feature with `regions.llm_boxes` → the enforcement loop's box | **Candidates**, best first: a label line that already carries a dollar figure, then lines that *begin* with the label before lines that merely contain it, short lines before sentences, higher OCR confidence first; the model's accepted box last. Two features on one line collapse to one candidate. None at all stops the chain |
-| 3 · read the figure inside that region | `POST /assess` on a **crop** | The script cuts the top candidate out of the original page — a page-wide strip three line-heights tall around a label line (the figure is on the same row, sometimes at the far right of a table, and a photographed page is rarely level), or a lightly padded box around the model's — and submits it as a new document with a regex `text` criterion for a currency figure, the `Amount Due` label again, and an `llm` criterion asked to state the figure | Every currency figure on every OCR line of the crop, **nearest the label first** (label-heights vertically, crop-widths horizontally; `$`-prefixed before bare decimals, negatives last). The top one is the answer. The model's stated figure is kept beside it as a second opinion and only becomes the answer when OCR read nothing. A crop with no figure moves to the next candidate, up to three — each attempt is its own case |
-
-The report gets a **Pipeline** section above the cases: the answer, what each
-stage decided in one line, the candidate table, every figure read with its
-distance, the stage-2 page with all candidates drawn on it beside the stage-3
-crop with the figures drawn on it, and the chain-level checks. `summary.json`
-carries the same under `pipelines[]`.
-
-Expectations, in `regions_expected.json`, one set per fixture:
+**One call per bill:** `POST /assess` with a single criterion:
 
 ```json
-"pipeline: utility bill — utility_bill_2.jpeg": { "is_utility": true, "region_found": true, "amount_due": "$193.33" }
+{"name": "the amount due line: the words 'Amount Due' next to the dollar figure owed",
+ "type": "llm", "score": false, "options": {"hint": "presence", "boxes": true}}
 ```
 
-plus the usual per-stage entries under `<stage name> — <file name>`. The
-chain's answer is decided by OCR and a regex, so `amount_due` is a real
-assertion in both modes — the llm rows stay `null` as everywhere else.
+No OCR criteria, no gate, no crop-and-resubmit. `score: false` locates without
+judging: the classifier still makes the one scoring call, because the
+enforcement loop gates on its presence score, then clears the judgement from
+the result. It then runs the loop: ask on the page with a labelled
+coordinate grid drawn on it, refine on a zoomed crop of the original, verify
+the crop alone, retry with feedback. That is **3 model calls** when attempt 1
+is accepted, which it was on both fixtures, and at most 10.
+
+The report gets a section per bill above the cases:
+
+- **Where it landed:** the accepted box on the 0-1000 grid, which attempt, whether it was refined, the verify score, and what the verifier said it saw.
+- **The page, with every attempt drawn on it** by this script from what the model said. The accepted box is dotted and filled, the stroke every `llm` region gets; rejected attempts are dashed and unfilled.
+- **A zoomed view of the accepted box** on the original pixels, `amount_due_zoom.jpg`, because on a phone photo of a whole bill the full-page picture is too small to tell a line from the one above it.
+- **Every attempt as a table:** the model's first answer on the gridded page, the final box after the refine pass, the verify score, and why it was rejected when it was.
+
+Two fixtures run by default, chosen because they lay the amount due out differently:
+
+| Fixture | Bill | Amount-due lines |
+|---|---|---|
+| [`documents/utility_bill.jpeg`](documents/utility_bill.jpeg) | Ohio Edison, 5712×4284 with EXIF orientation 6 (read upright at 4284×5712) | `Amount Due: $80.49` on one line in the header, and again on the payment stub |
+| [`documents/utility_bill_2.jpeg`](documents/utility_bill_2.jpeg) | AEP Ohio, 4032×3024, two pages side by side | `Amount due on or before` … `$193.33` in the header and on the stub; `Total Amount Due At Last Billing $201.60` in the charges table is a different number |
+
+Expectations, in `regions_expected.json`, one pair per fixture:
+
+```json
+"utility bill — where is the amount due? — utility_bill_2.jpeg": {
+  "criteria": { "the amount due line: …": { "verdict": null, "min_regions": 1 } }
+},
+"pipeline: utility bill — utility_bill_2.jpeg": {
+  "box_accepted": true,
+  "amount_due_boxes_grid": [[360, 142, 495, 172], [373, 641, 511, 671]]
+}
+```
+
+`amount_due_boxes_grid` lists every place the bill prints its amount due,
+hand-measured on the 0-1000 grid of the upright page. The accepted box must
+reach IoU ≥ 0.25 with at least one of them. This is a localisation check, not
+a judgement of the model's opinion: it asks whether the box sits on the words,
+which is what this section exists to show.
+
+Under `--local` there is no vision model. The one criterion is `llm`, so the
+request is sent unchanged, the criterion comes back `status: "error"` naming
+the model, and the checks are recorded as **skipped**, like every other
+all-`llm` case in `--local`.
 
 **Adding a bill** is: drop the photo in `documents/`, add its path to
-`UTILITY_BILL_FIXTURES` in `regions_report.py`, run it once with `--local` to
-see what the deterministic path produces, and write the four entries.
-
-**Adding a pipeline** is code, not collection: a `run_<name>_pipeline()` in
-the § Pipelines section that builds `Case`s and feeds them to `run_case()`,
-an entry in the `runners` dict in `main()`, a name in `PIPELINES`, and the
-expectations entries. Keep the stage names stable — they are the keys.
+`UTILITY_BILL_FIXTURES` in `regions_report.py`, measure its amount-due lines
+on the 0-1000 grid of the upright page, and write the two entries.
 
 ---
 
@@ -313,7 +331,7 @@ Two steps, and neither is in this script:
 
 The collection **is** the suite, so that is all. Two things to know:
 
-* A **base64 body** (`/assess/compare` takes JSON, not multipart) references a
+* A **JSON body** (`POST /assess` with `document.type: "base64"`) references a
   `{{something_b64}}` collection variable. Add the variable to the collection
   *and* a `variable name → repo-relative fixture path` line to `B64_FIXTURES`
   in `regions_report.py`. An unlisted `*_b64` variable is a hard error, not a
@@ -328,7 +346,8 @@ The collection **is** the suite, so that is all. Two things to know:
 ## Related
 
 * [`ai/classifier/API.md`](../../ai/classifier/API.md) — the request/response
-  reference, § Regions and layers in particular.
+  reference, § Regions and layers and § The text a criterion searched in
+  particular.
 * [`documents/README.md`](documents/README.md) — the document fixtures, their
   criteria and expected results, and § Marks on the letter for the logo /
   stamp / signature boxes.

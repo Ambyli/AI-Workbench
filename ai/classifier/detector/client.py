@@ -64,7 +64,7 @@ class DetectorUnavailable(RuntimeError):
 
 @dataclass
 class DetectorStats:
-    """What the job did with the detector, for ``document_info.detector``.
+    """What the job did with the detector, for the result's ``detector`` block.
 
     ``calls`` counts HTTP requests, not labels: a page with 20 labels and a
     cap of 16 is two calls. ``elapsed_ms`` is the detector's own reported

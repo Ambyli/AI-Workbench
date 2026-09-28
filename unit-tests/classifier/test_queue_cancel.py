@@ -9,8 +9,9 @@ delete the payload, while a completed or failed one still must.
 
 Also pinned: the queue runs exactly one job type ("assess"); a row of a
 removed type ("compare" / "locate", queued by an older container) fails with
-a message naming it, and a payload without ``schema: 2`` is refused by the
-runner rather than half-run.
+a message naming it, and a payload without ``schema: 3`` (a list of
+documents) is refused by the runner rather than half-run — schema 2's single
+document included.
 
 Run with::
 
@@ -31,7 +32,7 @@ from common.jobs.sqlite import SqliteRegistry
 from api.schemas import AssessRequest, ClassifierMetadata
 from jobs import queue as queue_module
 from jobs import runners
-from jobs.payloads import PAYLOAD_SCHEMA, build_assess_payload
+from jobs.payloads import PAYLOAD_SCHEMA, SubmittedDocument, build_assess_payload
 
 
 async def _make_queue():
@@ -60,17 +61,20 @@ def _payload(job_id=None) -> dict:
         }
     )
     return build_assess_payload(
-        request, b"Notice to Owner", filename="inline.txt",
-        content_type=None, kind="txt", job_id=job_id,
+        request,
+        [SubmittedDocument(raw=b"Notice to Owner", filename="inline.txt",
+                           content_type=None, kind="txt", pages=1)],
+        job_id=job_id,
     )
 
 
 def test_the_payload_shape():
     payload = _payload("abc")
-    assert payload["schema"] == PAYLOAD_SCHEMA == 2
-    assert set(payload) == {
-        "schema", "file_b64", "filename", "content_type", "kind", "criteria", "job_id"
-    }
+    assert payload["schema"] == PAYLOAD_SCHEMA == 3
+    assert set(payload) == {"schema", "documents", "criteria", "job_id"}
+    (doc,) = payload["documents"]
+    assert set(doc) == {"file_b64", "filename", "content_type", "kind", "pages"}
+    assert doc["pages"] == 1 and doc["kind"] == "txt"
     assert payload["criteria"][0]["options"]["match"] == "contains"
 
 
@@ -101,7 +105,7 @@ async def test_cancelled_job_keeps_its_payload(monkeypatch):
         return {"ok": True, "schema": payload["schema"]}
 
     monkeypatch.setattr(queue_module, "run_assess", finish)
-    assert await q.handle_job(job) == {"ok": True, "schema": 2}
+    assert await q.handle_job(job) == {"ok": True, "schema": 3}
     assert await q.payloads.read(job_id) is None  # consumed on completion
 
 
@@ -147,9 +151,11 @@ async def test_removed_job_types_fail_by_name(monkeypatch, job_type):
 
 @pytest.mark.asyncio
 async def test_a_stale_payload_is_refused_by_the_runner():
-    """An old-shape payload (no schema) must not be run against new code."""
+    """An old-shape payload (no schema, or schema 2) must not be run against new code."""
     with pytest.raises(runners.StalePayloadError, match="resubmit"):
         await runners.run_assess({"file_b64": "", "criteria": [], "ocr": "auto"})
+    with pytest.raises(runners.StalePayloadError, match="payload schema 2"):
+        await runners.run_assess({"schema": 2, "file_b64": "", "criteria": []})
 
 
 @pytest.mark.asyncio
@@ -157,6 +163,7 @@ async def test_the_runner_runs_a_real_payload():
     """End to end below the HTTP layer: a text document, no model involved."""
     result = await runners.run_assess(_payload())
     entry = result["assessment"]["per_criterion_scores"]["Notice to Owner"]
-    assert result["schema_version"] == 2
+    assert result["schema_version"] == 3
+    assert [d["kind"] for d in result["documents"]] == ["txt"]
     assert entry["status"] == "ok" and entry["verdict"] == "PASS"
     assert result["artifacts"] is None  # no job id → nothing written

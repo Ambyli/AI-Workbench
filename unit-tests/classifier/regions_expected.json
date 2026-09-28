@@ -1,7 +1,7 @@
 {
   "_about": {
     "what": "What regions_report.py asserts, keyed by Postman item name. Keys starting with an underscore are ignored.",
-    "shape": "{ \"<item name>\": { \"verdict\": \"PASS\"|null, \"http_status\": 400, \"criteria\": { \"<criterion>\": {\"status\": \"ok\"|\"skipped\"|\"error\", \"verdict\": \"PASS\"|null, \"min_regions\": 1} } } }",
+    "shape": "{ \"<item name>\": { \"verdict\": \"PASS\"|null, \"http_status\": 400, \"criteria\": { \"<criterion>\": {\"status\": \"ok\"|\"skipped\"|\"error\", \"verdict\": \"PASS\"|null, \"min_regions\": 1, \"item_verdicts\": [\"FAIL\", \"PASS\"], \"region_pages\": [0, 1]} } } }",
     "verdict_null": "A criterion with \"verdict\": null asserts NOTHING about the verdict. Every `llm` row is written that way on purpose: its score comes from a model, and a suite that claims to verify a model's judgement against a fixed answer is lying about what it measured.",
     "min_regions": "Asserted for the deterministic paths (cv / ocr / pdf-text) where the fixtures' READMEs document a count. For `options.boxes` rows it is 0 — 'you may produce boxes, and if you do they will be drawn' — so nothing false is claimed either way.",
     "http_status": "When present, the item is expected to be REJECTED at submit time and nothing else is asserted.",
@@ -12,7 +12,8 @@
     ],
     "adding_a_case": "Add the Postman item, then an entry here. See unit-tests/classifier/REGIONS_REPORT.md.",
     "status": "A criterion that is not evaluated has `status: \"skipped\"` and a null verdict (it used to be `verdict: \"SKIPPED\"`), so skipped rows assert the status instead. A `score: false` criterion has a null verdict by design.",
-    "local_mode": "Under --local, `llm` and `detector` criteria are dropped; a criterion that still reaches the model (a cv name with no OpenCV detector falls back to the llm) comes back status: error, and its checks and the overall verdict are recorded as skipped."
+    "local_mode": "Under --local, `llm` and `detector` criteria are dropped; a criterion that still reaches the model (a cv name with no OpenCV detector falls back to the llm) comes back status: error, and its checks and the overall verdict are recorded as skipped.",
+    "per_item": "A request may carry several documents, and every page is one item. \"item_verdicts\" asserts the criterion's per-unit answers in order (one per item — one per document for a text criterion with options.scope \"document\"): a verdict, or \"skipped\" / \"error\" for a unit that did not answer; null asserts nothing. \"region_pages\" is the sorted set of items its regions landed on. The criterion's own \"verdict\" is the AGGREGATED answer."
   },
   "invoice_native.pdf — native text, all four match modes": {
     "verdict": "PASS",
@@ -148,8 +149,102 @@
   "unsupported_legacy.doc — expect 400": {
     "http_status": 400
   },
-  "invoice_two_page.pdf — expect 400 (single-page only)": {
-    "http_status": 400
+  "invoice_two_page.pdf — two items, a sentence across the page break (scope: document)": {
+    "verdict": "MARGINAL",
+    "criteria": {
+      "Net 30": {
+        "verdict": "PASS",
+        "item_verdicts": [
+          "FAIL",
+          "PASS"
+        ],
+        "region_pages": [
+          1
+        ]
+      },
+      "remit to Acme (scope: document)": {
+        "verdict": "PASS",
+        "item_verdicts": [
+          "PASS"
+        ],
+        "min_regions": 2,
+        "region_pages": [
+          0,
+          1
+        ]
+      },
+      "remit to Acme (per page)": {
+        "verdict": "FAIL",
+        "item_verdicts": [
+          "FAIL",
+          "FAIL"
+        ]
+      },
+      "NOTICE TO OWNER on every page": {
+        "verdict": "FAIL",
+        "item_verdicts": [
+          "PASS",
+          "FAIL"
+        ]
+      },
+      "sharpness": {
+        "verdict": "PASS",
+        "item_verdicts": [
+          "PASS",
+          "PASS"
+        ]
+      }
+    }
+  },
+  "invoice_native.pdf + photo_of_letter.png + contract.txt — three documents, one request": {
+    "verdict": "PASS",
+    "criteria": {
+      "Notice to Owner": {
+        "verdict": "PASS",
+        "item_verdicts": [
+          "PASS",
+          "PASS",
+          "FAIL"
+        ],
+        "min_regions": 2,
+        "region_pages": [
+          0,
+          1
+        ]
+      },
+      "Notice to Owner in every document": {
+        "verdict": "FAIL",
+        "item_verdicts": [
+          "PASS",
+          "PASS",
+          "FAIL"
+        ]
+      },
+      "sharpness": {
+        "verdict": "PASS",
+        "item_verdicts": [
+          "PASS",
+          "PASS",
+          "skipped"
+        ]
+      },
+      "has text": {
+        "status": "ok",
+        "min_regions": 1,
+        "region_pages": [
+          0,
+          1
+        ],
+        "item_verdicts": [
+          null,
+          null,
+          "skipped"
+        ]
+      },
+      "mentions a warranty": {
+        "verdict": null
+      }
+    }
   },
   "greenery_and_sky.png — three mask detectors, three polygon sets": {
     "verdict": "PASS",

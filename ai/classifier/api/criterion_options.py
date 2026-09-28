@@ -5,11 +5,25 @@ A criterion's top level holds only what every type shares — ``name``,
 something to one evaluation path lives in ``options``, validated by the model
 for that path:
 
-    llm       LLMOptions       hint, boxes, max_attempts, ocr
+    llm       LLMOptions       hint, boxes, max_attempts, ocr, aggregate
     text      TextOptions      pattern, match, case_sensitive, fuzzy_threshold,
-                               min_count, ocr
-    cv        CVOptions        fallback
-    detector  DetectorOptions  threshold
+                               min_count, ocr, scope, aggregate
+    cv        CVOptions        fallback, aggregate
+    detector  DetectorOptions  threshold, aggregate
+
+``aggregate`` is on every type: how a criterion's per-ITEM results (one per
+page of every document) collapse into one answer — pages into a per-document
+answer, then documents into the request's. A string applies to both levels;
+``{"pages": <rule>, "documents": <rule>}`` sets them apart. Rules:
+
+    any          the best item (highest score): PASS if any item passes
+    worst / all  the lowest item: every item must pass ("all" is an alias)
+    mean         the mean of the scores, verdict from that mean
+    sum          ``text`` only: hit counts added up, then scored against
+                 ``min_count`` (a 400 on any other type)
+
+Omitted levels default from the type (and an ``llm`` criterion's hint) —
+``default_aggregate`` below is the one table.
 
 Every model is ``extra="forbid"`` and ``strict=True``: an unknown key, a
 string where a number belongs, or a value past a server cap is a 400 at
@@ -32,9 +46,9 @@ set) — none of which import back.
 
 from __future__ import annotations
 
-from typing import Any, Literal, Optional
+from typing import Any, ClassVar, Literal, Optional, Union
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from common.documents import MAX_PATTERN_CHARS
 
@@ -61,10 +75,111 @@ NAME_MAX_CHARS: int = 200
 _WHOLE_PAGE_DETECTORS = (check_blur, check_exposure)
 
 
+AggregateRule = Literal["any", "worst", "all", "mean", "sum"]
+AGGREGATE_RULES: tuple[str, ...] = ("any", "worst", "all", "mean", "sum")
+AGGREGATE_LEVELS: tuple[str, ...] = ("pages", "documents")
+
+
+class AggregateSplit(BaseModel):
+    """``{"pages": <rule>, "documents": <rule>}`` — either may be omitted."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    pages: Optional[AggregateRule] = Field(
+        default=None,
+        description="How one document's pages collapse into its answer.",
+    )
+    documents: Optional[AggregateRule] = Field(
+        default=None,
+        description="How the documents' answers collapse into the request's.",
+    )
+
+
+def default_aggregate(type_: str, hint: Optional[str] = None) -> dict[str, str]:
+    """The default rules per level, from the type (and an llm hint).
+
+        llm presence, detector        pages any    documents all
+        llm quality / auto, cv        pages worst  documents worst
+        text                          pages sum    documents sum
+
+    A presence question asks "is it on SOME page" of each document, and then
+    wants every document to have it; a quality question wants every page good.
+    """
+    if type_ == "text":
+        return {"pages": "sum", "documents": "sum"}
+    if type_ == "detector" or (type_ == "llm" and hint == "presence"):
+        return {"pages": "any", "documents": "all"}
+    return {"pages": "worst", "documents": "worst"}
+
+
 class _Options(BaseModel):
     """Shared config: no unknown keys, no silent type coercion."""
 
     model_config = ConfigDict(extra="forbid", strict=True)
+
+    # Only `text` may add hit counts up; every other type's result is a score.
+    _ALLOWS_SUM: ClassVar[bool] = False
+
+    aggregate: Optional[Union[AggregateRule, AggregateSplit]] = Field(
+        default=None,
+        description=(
+            "How the per-item results (one per page of every document) collapse: "
+            "a rule for both levels, or {\"pages\": rule, \"documents\": rule}. "
+            "Rules: 'any' (best item), 'worst' / 'all' (lowest item — every item "
+            "must pass), 'mean' (mean score), 'sum' (text only: hit counts added). "
+            "Omitted levels default from the type — see GET /criterion-types."
+        ),
+    )
+
+    @field_validator("aggregate", mode="before")
+    @classmethod
+    def _aggregate_shape(cls, value: Any) -> Any:
+        """One readable sentence instead of pydantic's union-branch errors."""
+        expected = (
+            f"aggregate must be one of {', '.join(AGGREGATE_RULES)}, or an object "
+            "{\"pages\": rule, \"documents\": rule}"
+        )
+        if value is None or isinstance(value, AggregateSplit):
+            return value
+        if isinstance(value, str):
+            if value not in AGGREGATE_RULES:
+                raise ValueError(f"{expected}; got {value!r}")
+            return value
+        if isinstance(value, dict):
+            stray = sorted(k for k in value if k not in AGGREGATE_LEVELS)
+            if stray:
+                raise ValueError(f"{expected}; unknown level(s) {stray}")
+            for level, rule in value.items():
+                if rule is not None and rule not in AGGREGATE_RULES:
+                    raise ValueError(f"{expected}; got {level}: {rule!r}")
+            return value
+        raise ValueError(f"{expected}; got {type(value).__name__}")
+
+    @model_validator(mode="after")
+    def _sum_is_text_only(self) -> "_Options":
+        if not self._ALLOWS_SUM and "sum" in self._given_rules().values():
+            raise ValueError(
+                "aggregate 'sum' adds text hit counts and is only for text criteria; "
+                "use any, worst / all, or mean"
+            )
+        return self
+
+    def _given_rules(self) -> dict[str, str]:
+        """The levels the caller set explicitly."""
+        agg = self.aggregate
+        if agg is None:
+            return {}
+        if isinstance(agg, str):
+            return {level: agg for level in AGGREGATE_LEVELS}
+        return {
+            level: rule
+            for level, rule in (("pages", agg.pages), ("documents", agg.documents))
+            if rule is not None
+        }
+
+    def resolved_aggregate(self, defaults: dict[str, str]) -> dict[str, str]:
+        """``{"pages", "documents"}`` — explicit levels over the defaults."""
+        return {**defaults, **self._given_rules()}
 
     def resolve(self, name: str) -> dict[str, Any]:  # pragma: no cover - overridden
         raise NotImplementedError
@@ -132,6 +247,7 @@ class LLMOptions(_Options):
             "boxes": self.boxes,
             "max_attempts": self.max_attempts or LLM_BBOX_MAX_ATTEMPTS,
             "ocr": self.ocr,
+            "aggregate": self.resolved_aggregate(default_aggregate("llm", self.hint)),
         }
 
     @classmethod
@@ -184,6 +300,19 @@ class TextOptions(_Options):
         ),
     )
 
+    scope: Literal["page", "document"] = Field(
+        default="page",
+        description=(
+            "'page': one search per page (per item), aggregated. 'document': one "
+            "search over each document's pages joined in page order with a single "
+            "space, so a phrase broken across a page break still matches; hits map "
+            "back to the page they landed on, and only the documents level of "
+            "aggregate applies."
+        ),
+    )
+
+    _ALLOWS_SUM: ClassVar[bool] = True
+
     def resolve(self, name: str) -> dict[str, Any]:
         return {
             "pattern": self.pattern or name,
@@ -192,6 +321,8 @@ class TextOptions(_Options):
             "fuzzy_threshold": self.fuzzy_threshold,
             "min_count": self.min_count,
             "ocr": self.ocr,
+            "scope": self.scope,
+            "aggregate": self.resolved_aggregate(default_aggregate("text")),
         }
 
     @classmethod
@@ -215,7 +346,10 @@ class CVOptions(_Options):
 
     def resolve(self, name: str) -> dict[str, Any]:
         default = "detector" if detector_client.is_configured() else "llm"
-        return {"fallback": self.fallback or default}
+        return {
+            "fallback": self.fallback or default,
+            "aggregate": self.resolved_aggregate(default_aggregate("cv")),
+        }
 
 
 class DetectorOptions(_Options):
@@ -233,7 +367,8 @@ class DetectorOptions(_Options):
 
     def resolve(self, name: str) -> dict[str, Any]:
         return {
-            "threshold": DETECTOR_MIN_SCORE if self.threshold is None else self.threshold
+            "threshold": DETECTOR_MIN_SCORE if self.threshold is None else self.threshold,
+            "aggregate": self.resolved_aggregate(default_aggregate("detector")),
         }
 
 
@@ -301,6 +436,33 @@ def criterion_types() -> dict[str, Any]:
             "weight": "number > 0 (default 1)",
             "depends_on": "name of another scored criterion that must PASS first",
             "score": "bool (default true); false = locate without judging",
+        },
+        # options.aggregate is on every type; this is what the rules mean and
+        # what an omitted level resolves to. `defaults` in each type above is
+        # the same table for a criterion with that type's default options.
+        "aggregate": {
+            "levels": {
+                "pages": "one document's pages (items) → that document's answer",
+                "documents": "the documents' answers → the request's answer",
+            },
+            "rules": {
+                "any": "the best item (highest score) — PASS if any item passes",
+                "worst": "the lowest item — every item must pass",
+                "all": "alias of worst",
+                "mean": "mean of the scores; the verdict comes from the rounded mean",
+                "sum": "text only: hit counts added, then scored against min_count",
+            },
+            "defaults": {
+                "llm (hint presence)": default_aggregate("llm", "presence"),
+                "llm (hint quality / auto)": default_aggregate("llm", "quality"),
+                "cv": default_aggregate("cv"),
+                "detector": default_aggregate("detector"),
+                "text": default_aggregate("text"),
+            },
+            "excluded": "skipped and errored items are left out of an aggregate; any "
+                        "errored item makes the criterion incomplete",
+            "text_scope_document": "a text criterion with options.scope 'document' is "
+                                   "one unit per document, so only the documents rule applies",
         },
         "types": types,
         "detector_configured": detector_client.is_configured(),

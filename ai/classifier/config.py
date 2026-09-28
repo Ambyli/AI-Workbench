@@ -86,9 +86,13 @@ MIN_IMAGE_HEIGHT: int = max(1, int(os.environ.get("CLASSIFIER_MIN_IMAGE_HEIGHT",
 # makes `text` criteria fail on any scan or photo and leaves the vision LLM
 # with no document text to read. There is no third option today.
 #
-# Documents are SINGLE-PAGE: a photo, a .txt and a .docx are one page by
-# nature, and a PDF with more than one page is refused at submit (400, "only
-# single-page PDFs are supported"). There is therefore no page cap.
+# A request carries a LIST of documents, and every page of every document is
+# one ITEM: a photo, a .txt and a .docx count 1 each, a PDF counts its pages
+# (read from the bytes at submit, without rendering). MAX_ITEMS caps the
+# total, INCLUSIVELY — 20 items are accepted, 21 are a 400 at submit whose
+# message gives the per-document breakdown. Each item costs a render (PDF),
+# possibly an OCR pass, and one unit of work per criterion, so this is the
+# knob that bounds one job's size.
 #
 # PDF_RENDER_DPI is the raster density for PDF page renders. 150 is the lowest
 # density at which 8-10pt body text survives OCR; 300 roughly quadruples the
@@ -102,6 +106,7 @@ MIN_IMAGE_HEIGHT: int = max(1, int(os.environ.get("CLASSIFIER_MIN_IMAGE_HEIGHT",
 # OCR_MIN_NATIVE_CHARS is the "does this page already have a text layer?"
 # threshold used by ocr mode "auto". Below it the page is treated as a scan.
 OCR_ENGINE: str = os.environ.get("CLASSIFIER_OCR_ENGINE", "rapidocr").strip().lower()
+MAX_ITEMS: int = max(1, int(os.environ.get("CLASSIFIER_MAX_ITEMS", "20")))
 PDF_RENDER_DPI: int = max(72, int(os.environ.get("CLASSIFIER_PDF_RENDER_DPI", "150")))
 TEXT_CHAR_BUDGET: int = max(0, int(os.environ.get("CLASSIFIER_TEXT_CHAR_BUDGET", "60000")))
 OCR_MIN_NATIVE_CHARS: int = max(
@@ -221,13 +226,16 @@ JOB_TTL_HOURS: int = int(os.environ.get("JOB_TTL_HOURS", "24"))
 # CLASSIFIER_MAX_CONCURRENT worker tasks each claim one pending job at a
 # time, so at most that many jobs run simultaneously.
 #
-# Inside a job, every criterion is its own unit of work. Three more limits
-# bound what those units may do at once, all process-wide (every worker runs
-# in this one process, so an asyncio.Semaphore is the whole mechanism):
+# Inside a job, the unit of work is (criterion, item): one criterion on one
+# page of one document (a `text` criterion with options.scope "document" is
+# one unit per DOCUMENT instead). Three more limits bound what those units
+# may do at once; the last two are process-wide (every worker runs in this
+# one process, so an asyncio.Semaphore is the whole mechanism):
 #
-#   MAX_CRITERIA_PER_JOB  criteria ONE job evaluates at once. A job with ten
-#                         criteria still holds only this many in flight, so
-#                         one big job cannot starve the others.
+#   MAX_UNITS_PER_JOB     units ONE job evaluates at once. A job with ten
+#                         criteria on twenty pages still holds only this many
+#                         in flight, so one big job cannot starve the others.
+#                         A unit waiting on its depends_on holds no slot.
 #   MAX_LLM_CALLS         model calls in flight across ALL jobs, every call
 #                         type — scoring, box ask, refine, verify. Acquired in
 #                         llm/client.py around the HTTP request itself, so no
@@ -246,8 +254,8 @@ JOB_TTL_HOURS: int = int(os.environ.get("JOB_TTL_HOURS", "24"))
 # posted to this process wake a worker instantly; the poll only matters for
 # rows written by another process (or left behind by a crash).
 MAX_CONCURRENT: int = max(1, int(os.environ.get("CLASSIFIER_MAX_CONCURRENT", "4")))
-MAX_CRITERIA_PER_JOB: int = max(
-    1, int(os.environ.get("CLASSIFIER_MAX_CRITERIA_PER_JOB", "2"))
+MAX_UNITS_PER_JOB: int = max(
+    1, int(os.environ.get("CLASSIFIER_MAX_UNITS_PER_JOB", "2"))
 )
 MAX_LLM_CALLS: int = max(1, int(os.environ.get("CLASSIFIER_MAX_LLM_CALLS", "4")))
 OCR_WORKERS: int = max(1, int(os.environ.get("CLASSIFIER_OCR_WORKERS", "4")))
@@ -270,7 +278,10 @@ WORKER_POLL_INTERVAL_S: float = float(os.environ.get("WORKER_POLL_INTERVAL_S", "
 # sweeper runs; the TTL it enforces is JOB_TTL_HOURS above, which the sweeper
 # makes real for the first time — for both directories AND job rows.
 #
-# ARTIFACT_MAX_BYTES is the per-job cap. When a render would exceed it the PNG
+# ARTIFACT_MAX_BYTES is the cap PER ITEM: a job's directory may hold
+# ARTIFACT_MAX_BYTES × its item count (a 20-page PDF gets 20× a photo's
+# allowance, since it has 20 base images and 20 sets of layers). When a render
+# would exceed it the PNG
 # layers are dropped first, then the previews (and the base images kept so a
 # FILTERED preview can be re-rendered); regions.json, manifest.json and the
 # SVGs are never dropped, and the manifest records what went.
@@ -301,9 +312,9 @@ REGION_LAYER_FORMATS: frozenset[str] = frozenset({"svg", "png", "preview"})
 PREVIEW_JPEG_QUALITY: int = 85
 
 # Layer file naming (regions/artifacts.py, api/artifacts.py). Every layer is
-# `p0.<suffix>` (documents are single-page, but the page index stays in the
-# name so the shared common.vision code keeps its page-aware shape), or
-# `p0.<slug>.<suffix>` for one criterion. LAYER_FILE_SUFFIXES maps a format to
+# `p{n}.<suffix>`, n being the job's global ITEM index (every page of every
+# document, in order — the manifest's `items` map says which document and
+# page n is), or `p{n}.<slug>.<suffix>` for one criterion. LAYER_FILE_SUFFIXES maps a format to
 # the suffix it is written under, and it is the one table both the lazy
 # renderer and the per-criterion `artifacts` URLs are built from.
 LAYER_FILE_SUFFIXES: tuple[tuple[str, str], ...] = (

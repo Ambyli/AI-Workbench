@@ -7,24 +7,32 @@ The classifier already tells you *where* it found something. What it cannot
 tell you is whether that place is **right** — and neither can a reviewer
 reading `regions.json`. So the script submits every collection request, polls
 the job, downloads what the job stored (regions.json, the manifest, every
-`text.<key>.json`) and asks for the layers — which the service renders on first
-fetch — and then **re-draws the geometry independently** onto the original
-fixture before putting the two pictures side by side:
+`text.p<n>.<key>.json`) and asks for the layers — which the service renders on
+first fetch — and then **re-draws the geometry independently** onto the
+original fixture before putting the two pictures side by side:
 
 ```
 submit → poll → GET /jobs/{id}/artifacts → download regions.json + text layers
-                                         → fetch p0.svg / p0.preview.jpg (rendered now)
+                                         → fetch p<n>.svg / p<n>.preview.jpg per item (rendered now)
                                          → re-draw on the original fixture
                                          → compare with regions_expected.json
                                          → index.html + summary.json + exit code
 ```
 
-The independence is the whole point. The service's own `p0.preview.jpg` was
+The independence is the whole point. The service's own `p<n>.preview.jpg` was
 drawn by the same code that produced the regions, so it *cannot* disagree with
 them. The annotated JPEG beside it is drawn from `regions.json` by
 [`common.vision.annotate`](../../shared/common/src/common/vision/annotate.py)
 onto the fixture as it exists on disk. If the two differ, one of them is
 wrong, and you can see that without reading a coordinate.
+
+**Several documents, several pages.** A request may carry more than one
+document, and every page of every document is one **item** — `n` in `p<n>`,
+and a region's `page`. The script sends every `file` part the Postman item
+lists (and every `text` field), reads the result's `items` / `documents` map
+to find which fixture and which page each item is, and draws **each item's
+regions on its own page**: `p1.annotated.jpg` of a two-page PDF is page 2 of
+the PDF with page 2's regions, beside the service's `p1.preview.jpg`.
 
 ---
 
@@ -138,10 +146,14 @@ reports/2026-09-23T09-48-12Z/
 │   └── job.json
 ├── 03-invoice-native-pdf-pdf-text-.../
 │   ├── job.json  manifest.json  regions.json
-│   ├── text.never.json                 the exact text the text criteria searched
+│   ├── text.p0.never.json              the exact text the text criteria searched (item 0)
 │   ├── p0.svg                          the service's overlay (rendered on fetch)
 │   ├── p0.preview.jpg                  the service's preview (rendered on fetch)
 │   └── p0.annotated.jpg                ← drawn by this script
+├── 09-invoice-two-page-pdf-two-items-.../
+│   ├── text.p0.auto.json  text.p1.auto.json  text.d0.auto.json   per page, and the joined document
+│   ├── p0.preview.jpg  p1.preview.jpg
+│   └── p0.annotated.jpg  p1.annotated.jpg                        ← one per item
 └── _service/                           --local only: the throwaway DB + artifacts
 ```
 
@@ -156,18 +168,25 @@ where you expected a number means the geometry never got collected.
 
 **Per item**, in order:
 
-1. **Request** — JSON or multipart, the fixture, and the criteria as a table
-   (type / score / options / weight / depends_on).
+1. **Request** — JSON or multipart, the fixture(s) — every document the
+   request carries — and the criteria as a table (type / score / options /
+   weight / depends_on).
 2. **Result** — every criterion with method, score, verdict (or its status
    when it errored or was skipped), confidence, reason (or the error), region
    count, which pages, the `localization` summary (attempts / accepted /
-   calls), a **link to the text it searched** (`text.<key>.json`, with its
-   source and length — the file downloaded next to the report), and ✓ or ✗
-   against its expectation. A criterion whose expectation is `null` says *not
+   calls), **links to the text it searched** (one `text.p<n>.<key>.json` per
+   item — or `text.d<i>.<key>.json` for a scope-document search — with its
+   source and length, downloaded next to the report), and ✓ or ✗ against its
+   expectation. These are the AGGREGATED answers.
+   * **Per item** — for a request with more than one item: one row per item
+     (its document, page, and own weighted score), one column per criterion
+     with that item's unit verdict, score and region count, and each
+     criterion's `aggregate_used` underneath. A scope-document criterion's
+     cell is its one unit for the whole document. A criterion whose expectation is `null` says *not
    asserted* rather than a tick — a green tick you did not earn is worse than
    no tick.
-3. **Geometry, drawn twice** — the annotated page on the left, the service's
-   own preview on the right. Each region carries a caption:
+3. **Geometry, drawn twice** — per item (headed `item n — <file> p<page>`),
+   the annotated page on the left, the service's own preview on the right. Each region carries a caption:
 
    ```
    Notice to Owner · 10 PASS · ocr
@@ -182,7 +201,7 @@ where you expected a number means the geometry never got collected.
    **rejected** LLM attempt is drawn dashed and unfilled, from the
    `bbox_grid` the model literally answered rather than the clamped box, so
    an overshoot looks like an overshoot.
-4. **Links** to `p0.svg`, `regions.json`, the `text.<key>.json` layers, `job.json`.
+4. **Links** to the `p<n>.svg` layers, `regions.json`, the `text.*.json` layers, `job.json`.
 5. **What the collection says to look for** — the Postman item's own
    description, verbatim, so the expected box is next to the drawn one.
 
@@ -222,7 +241,9 @@ where you expected a number means the geometry never got collected.
 | `http_status` | The item is expected to be **rejected at submit time**; nothing else is asserted |
 | `criteria.<name>.status` | `ok` \| `error` \| `skipped`. A skipped criterion has a null verdict, so this is how a skip is asserted |
 | `criteria.<name>.verdict` | The criterion's verdict. **`null` asserts nothing** |
-| `criteria.<name>.min_regions` | At least this many regions on that criterion |
+| `criteria.<name>.min_regions` | At least this many regions on that criterion (over every item) |
+| `criteria.<name>.item_verdicts` | The per-unit answers, in order — one per item, or one per document for a `scope: "document"` text criterion: a verdict, or `skipped` / `error` for a unit that did not answer; `null` in the list asserts nothing |
+| `criteria.<name>.region_pages` | The items (sorted) the criterion's regions landed on |
 
 Keys starting with `_` are ignored — `_about` in the file carries the same
 rules inline, since JSON has no comments.

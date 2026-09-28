@@ -15,19 +15,24 @@ direct `:8005` access is unauthenticated, as today.
 
 Things worth knowing before editing:
 
+  * **One page per ITEM.** ``n`` in every ``p{n}.*`` name is the job's
+    global item index (every page of every document, in order); the
+    manifest's ``items`` map says which document and page each n is.
   * **Layers are rendered on first fetch.** A job writes only regions.json,
-    its text layers, the base image and the manifest. ``p0.svg``,
-    ``p0.layer.png``, ``p0.preview.jpg`` — and the per-criterion
-    ``p0.<slug>.<suffix>`` — are rendered from regions.json by
-    ``regions.artifacts.render_layer`` the first time they are asked for and
-    cached into the directory (so the cache counts against the byte cap, and
-    goes with the job). A filtered request (``?criterion=`` / ``?source=`` /
-    ``?attempt=`` / ``?accepted=``) is rendered by the same function over a
-    subset; only the plain single-criterion view is cached, under the same
-    ``p0.<slug>.<suffix>`` name — the two paths cannot produce different
+    its text layers, one base image per item and the manifest.
+    ``p{n}.svg``, ``p{n}.layer.png``, ``p{n}.preview.jpg`` — and the
+    per-criterion ``p{n}.<slug>.<suffix>`` — are rendered from regions.json
+    by ``regions.artifacts.render_layer`` the first time they are asked for
+    and cached into the directory (so the cache counts against the byte cap
+    — per item, ``regions.artifacts.job_byte_cap`` — and goes with the job).
+    A filtered request (``?criterion=`` / ``?source=`` / ``?attempt=`` /
+    ``?accepted=``) is rendered by the same function over a subset; only the
+    plain single-criterion view is cached, under the same
+    ``p{n}.<slug>.<suffix>`` name — the two paths cannot produce different
     files.
-  * **``text.<key>.txt`` is rendered from ``text.<key>.json``** on every
-    request (plain text, never cached — the JSON is the evidence, this is a
+  * **``text.<name>.txt`` is rendered from ``text.<name>.json``** — e.g.
+    ``text.p0.auto.txt`` or ``text.d1.always.txt`` — on every request
+    (plain text, never cached — the JSON is the evidence, this is a
     convenience view of its ``text`` field).
   * **404 and 410 mean different things.** 404 is "there never was one, or
     the job is unknown / not finished"; 410 is "this job DID have artifacts
@@ -48,19 +53,21 @@ from common.vision import PageGeometry, Region, content_type_for
 
 from config import JOB_TTL_HOURS, LAYER_FILE_SUFFIXES
 from logger import logger
-from regions.artifacts import BASE_IMAGE_NAME, layer_name, render_layer
+from regions.artifacts import base_image_name, job_byte_cap, layer_name, render_layer
 from regions.collect import visible_regions
 from regions.store import store
 from regions.sweeper import _refresh_gauges
 
-# p0.svg | p0.layer.png | p0.preview.jpg, optionally with a criterion slug in
-# the middle: p0.<slug>.svg. Slugs are lowercase [a-z0-9-] (common.vision).
+# p{n}.svg | p{n}.layer.png | p{n}.preview.jpg, optionally with a criterion
+# slug in the middle: p{n}.<slug>.svg. Slugs are lowercase [a-z0-9-]
+# (common.vision); n is the item.
 _SUFFIX_TO_FORMAT = {suffix: fmt for fmt, suffix in LAYER_FILE_SUFFIXES}
 _LAYER_RE = re.compile(
     r"^p(?P<page>\d+)\.(?:(?P<slug>[a-z0-9][a-z0-9-]*)\.)?"
     r"(?P<suffix>svg|layer\.png|preview\.jpg)$"
 )
-_TEXT_TXT_RE = re.compile(r"^text\.(?P<key>[A-Za-z0-9_-]+)\.txt$")
+# text.p{n}.<key>.txt / text.d{i}.<key>.txt → the matching .json's text.
+_TEXT_TXT_RE = re.compile(r"^text\.(?P<key>[A-Za-z0-9_.-]+)\.txt$")
 
 
 # ---------------------------------------------------------------------------
@@ -183,8 +190,9 @@ def _geometry_for(data: dict, page: int) -> PageGeometry:
     raise HTTPException(
         status_code=404,
         detail=(
-            f"no page geometry recorded for page {page} — this document has no "
-            "page image (a .txt / .docx), so there is nothing to draw on"
+            f"no page geometry recorded for page {page} — that item has no page "
+            "image (a .txt / .docx) or does not exist in this job, so there is "
+            "nothing to draw on"
         ),
     )
 
@@ -197,14 +205,14 @@ def _render(job_id: str, fmt: str, geometry: PageGeometry, regions: list[Region]
         raise HTTPException(
             status_code=404,
             detail=(
-                f"the un-annotated base image ({BASE_IMAGE_NAME}) is not in this "
-                "job's directory — the byte cap dropped it — so a preview cannot be "
-                "composited. Request the SVG or PNG layer instead."
+                f"the un-annotated base image ({base_image_name(geometry.page)}) is "
+                "not in this job's directory — the byte cap dropped it — so a preview "
+                "cannot be composited. Request the SVG or PNG layer instead."
             ),
         )
     if cache_name:
         store.write(job_id, cache_name, payload)
-        store.enforce_cap(job_id)
+        store.enforce_cap(job_id, max_bytes=job_byte_cap(job_id))
         _refresh_gauges()
     return Response(content=payload, media_type=content_type_for(cache_name or layer_name(fmt)))
 
@@ -334,14 +342,15 @@ def build_artifacts_router(registry: Any) -> APIRouter:
         if name == "regions.json":
             return JSONResponse(
                 content={"job_id": data.get("job_id", job_id),
-                         "pages": data.get("pages", []), "criteria": kept}
+                         "pages": data.get("pages", []),
+                         "items": data.get("items", {}), "criteria": kept}
             )
         if layer is None or layer.group("slug"):
             raise HTTPException(
                 status_code=400,
                 detail=(
                     f"{name!r} cannot be filtered — filters apply to regions.json and "
-                    "the combined layers p0.svg / p0.layer.png / p0.preview.jpg"
+                    "the combined layers p{n}.svg / p{n}.layer.png / p{n}.preview.jpg"
                 ),
             )
         page = int(layer.group("page"))

@@ -1,10 +1,11 @@
 """The OCR memo: one pass per distinct setting, shared by every criterion.
 
 ``analysis.context.DocumentContext.text_layer`` keys each text layer by its
-resolved OCR settings. Criteria with the same settings must share ONE
-recognition pass (and one ``text.<key>.json``); different settings must each
-get their own, concurrently, bounded by CLASSIFIER_OCR_WORKERS; and a
-criterion that needs no text must not load the engine at all.
+resolved OCR settings, per ITEM. Criteria with the same settings must share
+ONE recognition pass per page (and one ``text.p{n}.<key>.json``); different
+settings must each get their own, concurrently, bounded by
+CLASSIFIER_OCR_WORKERS; each page of a multi-page document has its own memo;
+and a criterion that needs no text must not load the engine at all.
 
 Run with::
 
@@ -208,7 +209,7 @@ def test_criteria_with_identical_settings_share_the_pass_in_a_job(engine):
         CriterionInput(name="TO", type="text", options={"ocr": "auto"}),
     ])
     assert engine.calls == 1
-    assert [p["key"] for p in result["document_info"]["ocr"]["layers"]] == ["auto"]
+    assert [p["key"] for p in result["documents"][0]["document_info"]["ocr"]["layers"]] == ["auto"]
     assert all(
         e["verdict"] == "PASS" for e in result["assessment"]["per_criterion_scores"].values()
     )
@@ -223,7 +224,7 @@ def test_criteria_with_different_settings_each_get_a_pass(engine):
     assert engine.calls == 1  # never does not recognise
     assert entries["NOTICE"]["verdict"] == "FAIL"
     assert entries["OWNER"]["verdict"] == "PASS"
-    assert sorted(p["key"] for p in result["document_info"]["ocr"]["layers"]) == [
+    assert sorted(p["key"] for p in result["documents"][0]["document_info"]["ocr"]["layers"]) == [
         "always", "never"
     ]
 
@@ -234,4 +235,16 @@ def test_criteria_that_need_no_text_never_touch_the_engine(monkeypatch):
 
     monkeypatch.setattr(context_module, "get_ocr_engine", explode)
     result = _run([CriterionInput(name="sharpness", type="cv")])
-    assert result["document_info"]["ocr"]["layers"] == []
+    assert result["documents"][0]["document_info"]["ocr"]["layers"] == []
+
+
+def test_every_item_has_its_own_memo(engine):
+    """Two photos, two criteria with one setting: one pass PER ITEM, not per job."""
+    docs = [analysis.load_document_bytes(_png(), f"p{i}.png", None) for i in range(2)]
+    result = asyncio.run(analysis.analyze_document(docs, [
+        CriterionInput(name="NOTICE", type="text"),
+        CriterionInput(name="OWNER", type="text"),
+    ]))
+    assert engine.calls == 2
+    layers = [d["document_info"]["ocr"]["layers"] for d in result["documents"]]
+    assert [[(p["item"], p["key"]) for p in doc] for doc in layers] == [[(0, "auto")], [(1, "auto")]]

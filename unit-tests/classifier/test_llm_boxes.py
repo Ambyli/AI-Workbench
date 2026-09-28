@@ -722,11 +722,15 @@ def test_pipeline_writes_localization_and_attempt_urls(monkeypatch):
     )
     entry = _entry(result)
     slug = entry["artifacts"]["slug"]
-    attempts = entry["artifacts"]["attempts"]
+    (on_page,) = entry["artifacts"]["items"]  # one item, so one per-item block
+    assert on_page["item"] == 0 and on_page["count"] == 2
+    attempts = on_page["attempts"]
     assert [a["attempt"] for a in attempts] == [1, 2]
     assert attempts[0]["svg"] == f"/jobs/testjob1/artifacts/p0.svg?criterion={slug}&attempt=1"
     assert attempts[0]["accepted"] is False and attempts[1]["accepted"] is True
-    assert entry["artifacts"]["layers"]["svg"] == f"/jobs/testjob1/artifacts/p0.svg?criterion={slug}"
+    assert on_page["layers"]["svg"] == f"/jobs/testjob1/artifacts/p0.svg?criterion={slug}"
+    # The unit's own entry carries the same record as the criterion (one item).
+    assert entry["items"][0]["localization"] == entry["localization"]
 
     store = ArtifactStore(ARTIFACT_DIR)
     stored = store.read_json("testjob1", "regions.json")

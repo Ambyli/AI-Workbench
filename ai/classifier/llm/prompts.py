@@ -26,8 +26,9 @@ scoring call has to produce.
 
 ONE IMAGE PER PROMPT. The vision model (muse-glimmer) is served by vLLM
 WITHOUT ``--limit-mm-per-prompt``, which means a request may contain at most
-one image — a second one fails the whole call. Documents are single-page, so
-the scoring call attaches THE page image (or none, for .txt / .docx);
+one image — a second one fails the whole call. Every call is about ONE item
+(one page of one document), so the scoring call attaches THAT page image (or
+none, for .txt / .docx);
 ``build_bbox_prompt`` attaches that same page (gridded) or a refine crop, and
 ``build_verify_prompt`` attaches the ONE crop — never two images together.
 

@@ -11,7 +11,7 @@ uv run --package classifier python unit-tests/classifier/regions/make_fixtures.p
 ```
 
 Regions are no longer opt-in: **every** `/assess` job stores `regions.json`,
-its text layers (`text.<key>.json`), the page's base image and a manifest.
+its text layers (`text.p<n>.<key>.json`, one per item and setting), each item's base image and a manifest.
 The SVG / PNG / preview layers are rendered on **first fetch** and cached
 into the job directory. There is no `regions` request option any more, and no
 `/locate` — a criterion with `"score": false` is "locate without judging".
@@ -109,7 +109,7 @@ first time each is fetched. No `text.*.json` — no criterion here read text.
 ```
 
 The two text criteria share ONE OCR pass (same settings) and one
-`text.always.json`.
+`text.p0.always.json`.
 
 | Criterion | Score | Regions | Notes |
 |---|---|---|---|
@@ -129,7 +129,7 @@ The two text criteria share ONE OCR pass (same settings) and one
 ```
 
 The PDF has a native text layer, so `ocr: "never"` costs nothing and
-`pdf-text` is the source. The layer is stored once as `text.never.json`
+`pdf-text` is the source. The layer is stored once as `text.p0.never.json`
 (`source: "native"`).
 
 | Criterion | Regions | Notes |
@@ -138,7 +138,7 @@ The PDF has a native text layer, so `ocr: "never"` costs nothing and
 | `total amount` | 3 boxes | `$1,200.00`, `$3,650.00`, `$4,850.00`, each reconstructed from the word spans that cover the regex match — approximate by construction (see `loaders._rect_for_snippet`) |
 | `has text` | several boxes | The text blocks of the one page |
 
-`page_geometry.pdf_points` is `[595.2, 842.4]` (A4) and `working_scale` ≈ `0.569`.
+`page_geometry[0].pdf_points` is `[595.2, 842.4]` (A4) and `working_scale` ≈ `0.569`.
 
 ### `../documents/photo_of_letter.png`
 
@@ -151,7 +151,7 @@ The heading comes back as an `ocr` polygon at ≈ `(67, 197, 360, 244)` with
 `score` ≈ `0.999` (the recogniser's own confidence) and `attrs.text` =
 `"NOTICE TO OWNER"`. The polygon is a real quadrilateral, not a rectangle —
 the page is photographed at a 3° skew and the OCR box follows it. The same
-polygon is in `text.always.json` → `lines[]`.
+polygon is in `text.p0.always.json` → `lines[]`.
 
 ### `../Neighborhood.jpeg`
 
@@ -196,7 +196,7 @@ threshold 0.2, and finds **nothing** for `car` or `swimming pool` — so if you
 want a positive detector assertion, use `house` or `tree` as the criterion
 name rather than the roof vent.
 
-`result.document_info.detector` and the top of `regions.json` both carry
+`result.detector` and the top of `regions.json` both carry
 `{model, device, calls, labels, detections, elapsed_ms, errors}`. One call is
 made per detector criterion. A detector that cannot be reached fails **that
 criterion** (`status: "error"`), and the job reports `complete: false`.
@@ -279,8 +279,8 @@ curl -s "http://localhost:8005/jobs/$job/artifacts/p0.svg?source=cv" -o cv-only.
 curl -s "http://localhost:8005/jobs/$job/artifacts/regions.json?criterion=$slug" | jq .
 
 # The exact text a text criterion searched (for a job that had one)
-curl -s http://localhost:8005/jobs/$job/artifacts/text.auto.json | jq '{source, chars}'
-curl -s http://localhost:8005/jobs/$job/artifacts/text.auto.txt
+curl -s http://localhost:8005/jobs/$job/artifacts/text.p0.auto.json | jq '{source, chars}'
+curl -s http://localhost:8005/jobs/$job/artifacts/text.p0.auto.txt
 
 # Everything as a zip
 curl -s http://localhost:8005/jobs/$job/artifacts.zip -o layers.zip && unzip -l layers.zip
@@ -323,7 +323,7 @@ Worth asserting, because each one is a real failure mode:
   be `null` — an empty object implies URLs that would 404.
 * **A URL in `artifacts.files[]` that 404s.** The list is built from the
   directory *after* the byte cap runs, so a file the cap dropped is absent
-  rather than listed. (`artifacts.layers` URLs are different: they are
+  rather than listed. (`artifacts.items[].layers` URLs are different: they are
   rendered on fetch, so they work whether or not the file exists yet.)
 * **An SVG that will not parse.** Criterion names go into ids, attributes and
   `<title>` tooltips; `xml.etree.ElementTree.fromstring` on any returned SVG
@@ -337,6 +337,6 @@ Worth asserting, because each one is a real failure mode:
 * **The combined layer showing rejected boxes.** `p0.svg` with no query
   parameters, and `?criterion=<slug>` with no `attempt`, must both show the
   ACCEPTED box only.
-* **A `text.<key>.json` whose `text` differs from what was searched.** The
+* **A `text.p<n>.<key>.json` whose `text` differs from what was searched.** The
   file is the evidence for a text criterion's verdict; it is written from the
   exact layer the matcher saw.

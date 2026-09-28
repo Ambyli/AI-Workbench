@@ -8,6 +8,13 @@ this module only collapses it into one number a caller can audit.
                                criteria that COUNT, plus the breakdown, the
                                verdict, and ``complete``.
 
+It runs twice over a result, with the same rules: once per ITEM, over that
+item's own per-criterion outcomes (each item's ``overall_score`` /
+``overall_verdict`` / ``complete``), and once over the AGGREGATED outcomes
+(``analysis.aggregate``) — the assessment's overall score and verdict. A
+document-scope ``text`` criterion has no per-item outcome, so the per-item
+pass lists it under ``excluded`` as not applicable.
+
 What counts: a criterion with ``score: true`` and ``status: "ok"``. Excluded:
 
   * ``score: false``   — located, not judged;
@@ -19,9 +26,13 @@ What counts: a criterion with ``score: true`` and ``status: "ok"``. Excluded:
     and ``overall_verdict`` null, and the partial weighted score of what did
     succeed still shown in ``weighted_score_breakdown`` — a caller must never
     read a verdict that silently ignored a criterion it asked for.
+  * an aggregate with ``complete: False`` — some of its items errored. It
+    still COUNTS (its score is the aggregate of the items that answered), but
+    it makes the assessment incomplete exactly as an error does.
 
 Process flow position: called by ``analysis.pipeline.analyze_document`` after
-``analysis.scheduler.run_criteria``.
+``analysis.scheduler.run_units`` (per item) and ``analysis.aggregate``
+(overall).
 """
 
 from __future__ import annotations
@@ -33,24 +44,40 @@ from utils import verdict_from_score as _verdict_from_score
 
 
 def compute_weighted_score(
-    criteria: list[CriterionInput], outcomes: dict[str, Outcome]
+    criteria: list[CriterionInput],
+    outcomes: dict[str, Outcome],
+    *,
+    not_applicable: dict[str, str] | None = None,
 ) -> dict:
     """The ``assessment`` block's scoring fields.
+
+    Args:
+        criteria:       The request's criteria.
+        outcomes:       ``{name: Outcome}`` for every criterion not in
+                        ``not_applicable``.
+        not_applicable: ``{name: why}`` for criteria that have no outcome at
+                        this level (a document-scope criterion, per item).
+                        Excluded with that reason; never incomplete.
 
     Returns:
         ``{"overall_score", "overall_verdict", "complete",
         "weighted_score_breakdown"}``. The breakdown is None when nothing
         counted at all (every criterion ``score: false``, skipped, or failed).
     """
+    not_applicable = dict(not_applicable or {})
+    present = [c for c in criteria if c.name not in not_applicable]
     counted = [
         (c, outcomes[c.name])
-        for c in criteria
+        for c in present
         if c.score
         and outcomes[c.name].status == "ok"
         and isinstance(outcomes[c.name].score, (int, float))
     ]
     counted_names = {c.name for c, _ in counted}
-    errored = [c.name for c in criteria if c.score and outcomes[c.name].status == "error"]
+    errored = [
+        c.name for c in present
+        if c.score and (outcomes[c.name].status == "error" or not outcomes[c.name].complete)
+    ]
     complete = not errored
 
     breakdown = None
@@ -69,7 +96,9 @@ def compute_weighted_score(
             "partial": not complete,
             "excluded": {
                 c.name: (
-                    "score: false" if not c.score else outcomes[c.name].status
+                    not_applicable[c.name] if c.name in not_applicable
+                    else "score: false" if not c.score
+                    else outcomes[c.name].status
                 )
                 for c in criteria
                 if c.name not in counted_names

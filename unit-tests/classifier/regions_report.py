@@ -10,12 +10,18 @@ submit every request, poll the job, pull the layers, and then **re-draw the
 geometry independently** onto the original fixture before putting the two
 pictures side by side in one HTML page.
 
-The independence is the point. The service's own ``p0.preview.jpg`` was drawn
-by the same code that produced the regions, so it cannot disagree with them.
-The annotated JPEG next to it is drawn from ``regions.json`` by
+The independence is the point. The service's own ``p{n}.preview.jpg`` was
+drawn by the same code that produced the regions, so it cannot disagree with
+them. The annotated JPEG next to it is drawn from ``regions.json`` by
 ``common.vision.annotate`` onto the fixture as it exists on disk — if the two
 differ, one of them is wrong, and that is visible without reading a single
 coordinate.
+
+A request may carry several documents, and every page of every document is
+one ITEM (``n`` in ``p{n}``, the region's ``page``). Each item's regions are
+drawn on that item's own page — page ``j`` of the fixture it came from, found
+through the result's ``items`` / ``documents`` map — and the report shows
+every criterion's per-item results beside the aggregated one.
 
     submit → poll → GET artifacts → download regions.json, the text layers,
                                     and the layers (rendered on first fetch)
@@ -162,10 +168,15 @@ class Case:
     description: str
     headers: dict[str, str]
     form: dict[str, str] = dataclasses.field(default_factory=dict)
-    upload: Optional[pathlib.Path] = None
-    upload_field: str = "file"
+    # Every file part, in collection order: (form field, fixture path). A
+    # request may carry several documents; each is one or more items.
+    uploads: list[tuple[str, pathlib.Path]] = dataclasses.field(default_factory=list)
     json_body: Optional[dict] = None
-    subject: Optional[pathlib.Path] = None   # the document regions belong to
+    # The fixtures the documents' pages are drawn from — the uploads, or the
+    # `*_b64` variables of a JSON body, in order.
+    subjects: list[pathlib.Path] = dataclasses.field(default_factory=list)
+    # Inline `text` form fields, in order — each one is a document.
+    texts: list[str] = dataclasses.field(default_factory=list)
     # Key into regions_expected.json when it is not the item name — a pipeline
     # stage retried on a second candidate keeps one expectations entry.
     expect_key: Optional[str] = None
@@ -176,6 +187,16 @@ class Case:
     @property
     def slug(self) -> str:
         return f"{self.index:02d}-{_slug(self.name)}"
+
+    @property
+    def upload(self) -> Optional[pathlib.Path]:
+        """The first file part — the one document of most cases."""
+        return self.uploads[0][1] if self.uploads else None
+
+    @property
+    def subject(self) -> Optional[pathlib.Path]:
+        """The first document regions are drawn on."""
+        return self.subjects[0] if self.subjects else None
 
     @property
     def endpoint(self) -> str:
@@ -297,9 +318,13 @@ def _build_case(
             if field.get("disabled"):
                 continue
             if field.get("type") == "file":
-                case.upload_field = field["key"]
-                case.upload = REPO_ROOT / field["src"]
-                case.subject = case.upload
+                path = REPO_ROOT / field["src"]
+                case.uploads.append((field["key"], path))
+                case.subjects.append(path)
+            elif field["key"] == "text":
+                # A repeated inline-text field is one document each; kept in
+                # a list so a second one does not overwrite the first.
+                case.texts.append(_substitute(field.get("value") or "", base_url, api_key))
             else:
                 case.form[field["key"]] = _substitute(
                     field.get("value") or "", base_url, api_key
@@ -307,17 +332,17 @@ def _build_case(
     elif body.get("mode") == "raw":
         raw = _substitute(body.get("raw") or "", base_url, api_key)
         case.json_body = json.loads(raw)
-        # The document is whichever fixture the `*_b64` variable stood for —
-        # needed to draw the regions on something.
-        match = re.search(r"\{\{(\w+_b64)\}\}", body.get("raw") or "")
-        if match:
-            case.subject = REPO_ROOT / B64_FIXTURES[match.group(1)]
+        # The documents are whichever fixtures the `*_b64` variables stood
+        # for, in order — needed to draw the regions on something.
+        for name in re.findall(r"\{\{(\w+_b64)\}\}", body.get("raw") or ""):
+            case.subjects.append(REPO_ROOT / B64_FIXTURES[name])
         # Content-Type is set by the client; leaving the collection's copy in
         # place is harmless but duplicated.
         headers.pop("Content-Type", None)
 
-    if case.upload and not case.upload.is_file():
-        raise SystemExit(f"{case.name}: fixture not found: {case.upload}")
+    for _field, path in case.uploads:
+        if not path.is_file():
+            raise SystemExit(f"{case.name}: fixture not found: {path}")
     return case
 
 
@@ -506,17 +531,19 @@ def submit(case: Case, transport: Any) -> Any:
         return transport.request(
             "POST", case.path, json=case.json_body, headers=case.headers
         )
-    files = None
-    if case.upload:
-        files = {
-            case.upload_field: (
-                case.upload.name,
-                case.upload.read_bytes(),
-                "application/octet-stream",
-            )
-        }
+    # A list of (field, file) tuples, so a repeated `file` part is sent as
+    # many times as the collection lists it. (Both requests and httpx put the
+    # plain fields — `criteria`, `text` — before the files; the service keeps
+    # form order, and the documents map in the result says which is which.)
+    files = [
+        (field, (path.name, path.read_bytes(), "application/octet-stream"))
+        for field, path in case.uploads
+    ] or None
+    data: dict[str, Any] = dict(case.form)
+    if case.texts:
+        data["text"] = case.texts if len(case.texts) > 1 else case.texts[0]
     return transport.request(
-        "POST", case.path, data=case.form, files=files, headers=case.headers
+        "POST", case.path, data=data, files=files, headers=case.headers
     )
 
 
@@ -547,8 +574,8 @@ def fetch_artifacts(
     Every job writes a directory, so a 404 means the job never got far enough
     to write one (it failed), and a 410 that it had one and the sweeper or a
     DELETE took it. The layers are rendered on first fetch, so they are
-    requested explicitly from ``result.artifacts.layers`` — that request is
-    also what exercises the lazy renderer.
+    requested explicitly, per item, from ``result.artifacts.items[].layers``
+    — that request is also what exercises the lazy renderer.
     """
     notes: list[str] = []
     response = transport.request("GET", f"/v1/classifier/jobs/{job_id}/artifacts")
@@ -577,11 +604,12 @@ def fetch_artifacts(
         if any(fnmatch.fnmatch(name, pattern) for pattern in ARTIFACT_PATTERNS):
             download(name)
 
-    layers = ((result.get("artifacts") or {}).get("layers")) or {}
-    for fmt in LAYERS_TO_FETCH:
-        link = layers.get(fmt)
-        if link:
-            download(link.rsplit("/", 1)[-1])
+    for item in ((result.get("artifacts") or {}).get("items")) or []:
+        layers = item.get("layers") or {}
+        for fmt in LAYERS_TO_FETCH:
+            link = layers.get(fmt)
+            if link:
+                download(link.rsplit("/", 1)[-1])
     return manifest, saved, notes
 
 
@@ -686,10 +714,52 @@ def overall(result: CaseResult) -> tuple[Optional[str], Optional[float]]:
 
 
 def page_geometries(result: CaseResult) -> list[PageGeometry]:
-    """The page's frame — a single object in the result, a list in regions.json."""
+    """One frame per item with a page image (``page`` is the item index).
+
+    The result's ``page_geometry`` has an entry for EVERY item — a .txt or
+    .docx item's with null sizes — so those are left out; regions.json's
+    ``pages`` is the fallback for a result that did not come back.
+    """
     raw = result.result.get("page_geometry")
-    entries = [raw] if isinstance(raw, dict) else (result.regions_doc.get("pages") or [])
+    if isinstance(raw, dict):  # a schema-2 result
+        raw = [raw]
+    entries = [e for e in (raw or []) if e.get("width")] or (result.regions_doc.get("pages") or [])
     return [PageGeometry.from_dict(entry) for entry in entries]
+
+
+def item_sources(result: CaseResult) -> dict[int, tuple[Optional[pathlib.Path], int, str]]:
+    """Item n → (the fixture its page comes from, the page within it, label).
+
+    The result's ``items`` say which document and page each item is, and
+    ``documents`` name the files. A document is matched to a fixture by file
+    name — the upload order is not the document order when inline ``text``
+    fields are sent too, since HTTP clients put plain fields before files —
+    falling back to position among the case's fixtures.
+    """
+    docs = result.result.get("documents") or []
+    by_name: dict[str, list[pathlib.Path]] = {}
+    for path in result.case.subjects:
+        by_name.setdefault(path.name, []).append(path)
+    fixture_for: dict[int, Optional[pathlib.Path]] = {}
+    unmatched = [p for p in result.case.subjects]
+    for doc in docs:
+        candidates = by_name.get(doc.get("filename") or "") or []
+        path = candidates.pop(0) if candidates else None
+        if path is not None and path in unmatched:
+            unmatched.remove(path)
+        fixture_for[int(doc.get("index", 0))] = path
+    for index, path in list(fixture_for.items()):
+        if path is None and docs[index].get("kind") not in ("txt", "docx") and unmatched:
+            fixture_for[index] = unmatched.pop(0)
+
+    out: dict[int, tuple[Optional[pathlib.Path], int, str]] = {}
+    for entry in result.result.get("items") or []:
+        n, d, page = int(entry["item"]), int(entry.get("document", 0)), int(entry.get("page", 0))
+        out[n] = (fixture_for.get(d), page, f"item {n} — {entry.get('filename')} p{page + 1}")
+    if not out and result.case.subject:  # no result: assume the one document
+        for geometry in page_geometries(result):
+            out[geometry.page] = (result.case.subject, geometry.page, f"page {geometry.page}")
+    return out
 
 
 def _caption(region: Region, scores: dict[str, dict]) -> str:
@@ -745,43 +815,52 @@ def collect_regions(result: CaseResult) -> dict[int, list[Region]]:
             by_page.setdefault(region.page, []).append(region)
 
     geometries = {geom.page: geom for geom in page_geometries(result)}
-    default_page = 0  # documents are single-page
 
     for name, entry in criterion_results(result).items():
-        localization = entry.get("localization") or {}
-        for attempt in localization.get("attempts") or []:
-            bbox = attempt.get("bbox_grid")
-            if not bbox or len(bbox) < 4:
-                continue
-            geometry = geometries.get(default_page)
-            if geometry is None:
-                continue
-            points = grid_to_pixels(bbox, geometry)
-            by_page.setdefault(default_page, []).append(
-                Region(
-                    page=default_page,
-                    kind="box",
-                    points=points,
-                    label=name,
-                    score=attempt.get("verify_score"),
-                    source="llm",
-                    attrs={
-                        "attempt": attempt.get("attempt"),
-                        "accepted": bool(attempt.get("accepted")),
-                        "verify_score": attempt.get("verify_score"),
-                        "reject": attempt.get("reject"),
-                    },
+        # Each unit (item) runs its own loop, so its attempts belong to its
+        # own page; `items[].localization` carries them per item.
+        per_item = [
+            (unit.get("item"), unit.get("localization") or {})
+            for unit in entry.get("items") or []
+            if unit.get("item") is not None and unit.get("localization")
+        ]
+        if not per_item and entry.get("localization"):
+            per_item = [(0, entry["localization"])]  # a schema-2 result
+        for item, localization in per_item:
+            for attempt in localization.get("attempts") or []:
+                bbox = attempt.get("bbox_grid")
+                if not bbox or len(bbox) < 4:
+                    continue
+                geometry = geometries.get(item)
+                if geometry is None:
+                    continue
+                points = grid_to_pixels(bbox, geometry)
+                by_page.setdefault(item, []).append(
+                    Region(
+                        page=item,
+                        kind="box",
+                        points=points,
+                        label=name,
+                        score=attempt.get("verify_score"),
+                        source="llm",
+                        attrs={
+                            "attempt": attempt.get("attempt"),
+                            "accepted": bool(attempt.get("accepted")),
+                            "verify_score": attempt.get("verify_score"),
+                            "reject": attempt.get("reject"),
+                        },
+                    )
                 )
-            )
 
     return by_page
 
 
 def page_image(source: pathlib.Path, page: int, geometry: PageGeometry) -> Optional[Any]:
-    """The ORIGINAL fixture's page, at the size the service reported.
+    """The ORIGINAL fixture's page ``page`` (within that file), at the size
+    the service reported for the item.
 
     A PDF is re-rendered locally rather than read back from the job's
-    ``p0.base.jpg``: the base image is the service's own render, so drawing
+    ``p{n}.base.jpg``: the base image is the service's own render, so drawing
     on it would reintroduce exactly the shared-source problem this script
     exists to avoid. The zoom is taken from ``page_geometry`` rather than from
     ``CLASSIFIER_PDF_RENDER_DPI`` so a container with a different DPI still
@@ -816,24 +895,27 @@ def page_image(source: pathlib.Path, page: int, geometry: PageGeometry) -> Optio
 
 
 def annotate_case(result: CaseResult) -> list[str]:
-    """Write one ``p{n}.annotated.jpg`` per page that has regions."""
-    if not result.case.subject:
+    """Write one ``p{n}.annotated.jpg`` per item that has regions — each
+    item's regions on its OWN page of its own fixture."""
+    if not result.case.subjects:
         return []
     regions_by_page = collect_regions(result)
     if not regions_by_page:
         return []
 
     scores = criterion_results(result)
+    sources = item_sources(result)
     written: list[str] = []
     for geometry in page_geometries(result):
         regions = regions_by_page.get(geometry.page) or []
         if not regions:
             continue
-        base = page_image(result.case.subject, geometry.page, geometry)
+        source, page, label = sources.get(geometry.page, (None, 0, f"item {geometry.page}"))
+        base = page_image(source, page, geometry) if source else None
         if base is None:
             result.notes.append(
-                f"page {geometry.page}: no local render for "
-                f"{result.case.subject.suffix or 'this kind'}, so no annotated image"
+                f"{label}: no local render for "
+                f"{(source.suffix if source else '') or 'this kind'}, so no annotated image"
             )
             continue
         jpeg = annotate_to_jpeg(
@@ -988,8 +1070,8 @@ def run_utility_bill_pipeline(
         ),
         headers={},
         form={"criteria": _compact(LOCATE_CRITERIA)},
-        upload=document,
-        subject=document,
+        uploads=[("file", document)],
+        subjects=[document],
         adhoc=adhoc,
     )
     result = run_case(case, transport, out_root, args)
@@ -1004,7 +1086,11 @@ def run_utility_bill_pipeline(
         pipe.stopped_at = f"the criterion errored: {entry.get('error') or entry.get('reason')}"
         pipe.stages.append(PipelineStage("locate", result, pipe.stopped_at))
         return pipe
-    localization = entry.get("localization") or {}
+    # One document, one page → one unit, whose record the criterion carries
+    # verbatim (an aggregate of one passes straight through). Read the unit's
+    # own entry, so the pipeline reads the same thing a multi-item job would.
+    units = entry.get("items") or []
+    localization = (units[0].get("localization") if units else None) or entry.get("localization") or {}
     pipe.attempts = list(localization.get("attempts") or [])
     pipe.calls = int(localization.get("calls") or 0)
     accepted_n = localization.get("accepted_attempt")
@@ -1057,7 +1143,7 @@ def _zoom_view(result: CaseResult, attempt: dict) -> Optional[str]:
     full-page picture is too small to tell a line from the one above it."""
     from PIL import ImageDraw
 
-    # Documents are single-page, so the page is always 0.
+    # One bill, one page: the accepted box is on item 0, page 0 of the file.
     page = 0
     geometry = next(iter(page_geometries(result)), None)
     box = attempt.get("bbox_px")
@@ -1178,7 +1264,10 @@ def check(result: CaseResult, expectations: dict, *, local: bool = False) -> Non
       * ``http_status`` — for the cases whose whole point is a 400;
       * ``verdict`` — the overall verdict, when it is deterministic;
       * per criterion ``status`` (ok | error | skipped), ``verdict`` and
-        ``min_regions``.
+        ``min_regions`` — plus, for a request with several items,
+        ``item_verdicts`` (one verdict, or status, per unit in order; ``null``
+        asserts nothing) and ``region_pages`` (the items its regions landed
+        on).
 
     A criterion expectation of ``"verdict": null`` asserts nothing. That is
     how every `llm` row is written, because its score depends on a model and a
@@ -1335,6 +1424,35 @@ def check(result: CaseResult, expectations: dict, *, local: bool = False) -> Non
                     "actual": count,
                 }
             )
+        if "item_verdicts" in rule:
+            # One entry per unit, in order: a verdict, or a status for a unit
+            # that did not answer ("skipped" / "error"); null asserts nothing.
+            got = [
+                unit.get("verdict") if unit.get("status") == "ok" else unit.get("status")
+                for unit in entry.get("items") or []
+            ]
+            want = list(rule["item_verdicts"])
+            ok = len(got) == len(want) and all(w is None or w == g for w, g in zip(want, got))
+            result.checks.append(
+                {
+                    "kind": "criterion",
+                    "target": f"{name} · per item",
+                    "ok": ok,
+                    "expected": want,
+                    "actual": got,
+                }
+            )
+        if "region_pages" in rule:
+            pages = sorted({r.get("page", 0) for r in entry.get("regions") or []})
+            result.checks.append(
+                {
+                    "kind": "criterion",
+                    "target": f"{name} · region pages",
+                    "ok": pages == sorted(rule["region_pages"]),
+                    "expected": sorted(rule["region_pages"]),
+                    "actual": pages,
+                }
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1351,6 +1469,8 @@ def region_stats(result: CaseResult) -> dict[str, int]:
 
 
 def llm_stats(result: CaseResult) -> tuple[int, int]:
+    """(attempts, accepted) across every criterion and item — a criterion's
+    localization is already the merge of its items'."""
     attempts = accepted = 0
     for entry in criterion_results(result).values():
         for attempt in (entry.get("localization") or {}).get("attempts") or []:
@@ -1360,8 +1480,19 @@ def llm_stats(result: CaseResult) -> tuple[int, int]:
 
 
 def detector_calls(result: CaseResult) -> int:
-    info = result.result.get("document_info") or {}
-    return int((info.get("detector") or {}).get("calls") or 0)
+    return int((result.result.get("detector") or {}).get("calls") or 0)
+
+
+def text_links(entry: dict) -> list[dict]:
+    """A criterion's text-layer links — a list (one per unit) in schema 3."""
+    text = (entry.get("artifacts") or {}).get("text") or []
+    return [text] if isinstance(text, dict) else list(text)
+
+
+def link_file(link: dict) -> str:
+    """The artifact file name a text link points at (``text.p0.auto.json``)."""
+    url = link.get("url") or ""
+    return url.rsplit("/", 1)[-1] if url else f"text.{link.get('key')}.json"
 
 
 def write_summary_json(
@@ -1403,10 +1534,29 @@ def write_summary_json(
                             {r.get("page", 0) for r in entry.get("regions") or []}
                         ),
                         "localization": _localization_summary(entry),
-                        "text_layer": ((entry.get("artifacts") or {}).get("text") or {}).get("key"),
+                        "text_layers": [link_file(link) for link in text_links(entry)],
+                        "complete": entry.get("complete"),
+                        "aggregate_used": entry.get("aggregate_used"),
+                        "items": [
+                            {
+                                "item": unit.get("item"),
+                                "document": unit.get("document"),
+                                "page": unit.get("page"),
+                                "status": unit.get("status"),
+                                "score": unit.get("score"),
+                                "verdict": unit.get("verdict"),
+                                "regions": unit.get("regions"),
+                            }
+                            for unit in entry.get("items") or []
+                        ],
                     }
                     for name, entry in criterion_results(result).items()
                 },
+                "documents": [
+                    {k: d.get(k) for k in ("index", "filename", "kind", "pages", "items")}
+                    for d in result.result.get("documents") or []
+                ],
+                "item_scores": result.result.get("items") or [],
                 "regions_by_source": region_stats(result),
                 "detector_calls": detector_calls(result),
                 "files": result.files,
@@ -1687,14 +1837,17 @@ def _criteria_result_table(result: CaseResult, expectations: dict) -> str:
             if regions
             else ""
         )
-        text = (entry.get("artifacts") or {}).get("text") or {}
-        text_file = f"text.{text['key']}.json" if text.get("key") else ""
-        text_cell = (
-            f'<a href="{_e(result.case.slug)}/{_e(text_file)}">{_e(text.get("key"))}</a> '
-            f"<span class='skip'>{_e(text.get('source'))}, {_e(text.get('chars'))} chars</span>"
-            if text_file and text_file in result.files
-            else _e(text.get("key") or "")
-        )
+        cells = []
+        for link in text_links(entry):
+            text_file = link_file(link)
+            label = text_file.removeprefix("text.").removesuffix(".json")
+            cells.append(
+                f'<a href="{_e(result.case.slug)}/{_e(text_file)}">{_e(label)}</a> '
+                f"<span class='skip'>{_e(link.get('source'))}, {_e(link.get('chars'))} chars</span>"
+                if text_file in result.files
+                else _e(label)
+            )
+        text_cell = "<br>".join(cells)
         status = entry.get("status") or "ok"
         verdict_cell = (
             _verdict_pill(entry.get("verdict"))
@@ -1725,6 +1878,61 @@ def _criteria_result_table(result: CaseResult, expectations: dict) -> str:
     )
 
 
+def _items_table(result: CaseResult) -> str:
+    """Every criterion's per-item results, one row per item (one column per
+    criterion), with the item's own weighted score — so a multi-page or
+    multi-document case shows WHICH page answered, not only the aggregate."""
+    items = result.result.get("items") or []
+    scores = criterion_results(result)
+    if len(items) < 2 and not any(
+        len(entry.get("items") or []) > 1 for entry in scores.values()
+    ):
+        return ""  # one item: the Result table above already is the item
+    names = list(scores)
+    head = "".join(f"<th>{_e(name)}</th>" for name in names)
+    rows = []
+
+    def cell(unit: Optional[dict]) -> str:
+        if unit is None:
+            return "<td class='skip'>—</td>"
+        status = unit.get("status")
+        if status != "ok":
+            pill = f'<span class="pill {"SKIPPED" if status == "skipped" else "FAIL"}">{_e(status)}</span>'
+        else:
+            pill = _verdict_pill(unit.get("verdict")) + f" {_e(unit.get('score'))}"
+        regions = unit.get("regions")
+        return f"<td>{pill}{f' · {regions} region(s)' if regions else ''}</td>"
+
+    for item in items:
+        n = item.get("item")
+        units = []
+        for name in names:
+            entry = scores[name]
+            unit = next((u for u in entry.get("items") or [] if u.get("item") == n), None)
+            if unit is None:  # a document-scope criterion: its unit covers this item
+                unit = next((u for u in entry.get("items") or []
+                             if u.get("item") is None and n in (u.get("items") or [])), None)
+            units.append(cell(unit))
+        rows.append(
+            "<tr>"
+            f"<td>{_e(n)}</td><td>{_e(item.get('filename'))} p{_e((item.get('page') or 0) + 1)}</td>"
+            f"<td>{_verdict_pill(item.get('overall_verdict'))} {_e(item.get('overall_score') if item.get('overall_score') is not None else '')}"
+            f"{'' if item.get('complete', True) else ' <span class=bad>incomplete</span>'}</td>"
+            + "".join(units) + "</tr>"
+        )
+    used = "; ".join(
+        f"{_e(name)}: pages {_e((entry.get('aggregate_used') or {}).get('pages'))}, "
+        f"documents {_e((entry.get('aggregate_used') or {}).get('documents'))}"
+        for name, entry in scores.items()
+    )
+    return (
+        "<table><thead><tr><th>item</th><th>document · page</th><th>item score</th>"
+        + head + "</tr></thead><tbody>" + "".join(rows) + "</tbody></table>"
+        + f"<p class='meta'>aggregate_used — {used}. A document-scope criterion's cell "
+          "is its one unit for the whole document.</p>"
+    )
+
+
 def _reason(entry: dict) -> str:
     if entry.get("error"):
         return f"error: {entry['error']}"
@@ -1738,14 +1946,17 @@ def _reason(entry: dict) -> str:
 
 
 def _pages_block(result: CaseResult) -> str:
-    """Annotated page beside the service's own preview, per page."""
+    """Annotated page beside the service's own preview, per item."""
     if not result.annotated:
         return ""
     panes = []
-    for name in sorted(result.annotated):
+    sources = item_sources(result)
+    for name in sorted(result.annotated, key=lambda n: int(n.split(".")[0][1:])):
         page = name.split(".")[0]
         slug = result.case.slug
         service = f"{page}.preview.jpg"
+        label = sources.get(int(page[1:]), (None, 0, page))[2]
+        panes.append(f"<h3>{_e(label)}</h3>")
         right = (
             f'<div class="pane"><div class="cap">the service\'s own '
             f'<code>{_e(service)}</code></div>'
@@ -1964,25 +2175,35 @@ def write_html(
             body.append(f'<div class="notes">{_e(note)}</div>')
 
         body.append("<h3>Request</h3>")
+        documents = [f"<code>{_e(_rel(path))}</code>" for _field, path in result.case.uploads]
+        documents += ["inline text"] * len(result.case.texts)
+        if result.case.json_body is not None:
+            documents = [f"<code>{_e(_rel(path))}</code>" for path in result.case.subjects] or documents
         body.append(
             "<p class='meta'>"
             + ("JSON body" if result.case.json_body is not None else "multipart")
-            + (f" · file <code>{_e(_rel(result.case.upload))}</code>" if result.case.upload else "")
+            + (f" · {'document' if len(documents) == 1 else f'{len(documents)} documents'} "
+               + ", ".join(documents) if documents else "")
             + "</p>"
         )
         body.append(_criteria_request_table(result.case))
 
         body.append("<h3>Result</h3>")
         body.append(_criteria_result_table(result, expectations))
+        per_item = _items_table(result)
+        if per_item:
+            body.append("<h3>Per item</h3>")
+            body.append(per_item)
 
         pages = _pages_block(result)
         if pages:
             body.append("<h3>Geometry, drawn twice</h3>")
             body.append(
                 "<p class='meta'>Left: drawn by this script from <code>regions.json</code> "
-                "onto the fixture on disk. Right: the service's own preview. They are "
-                "produced by different code from the same numbers — a difference between "
-                "them is itself the finding.</p>"
+                "onto the fixture on disk — per item, on that item's own page. Right: the "
+                "service's own preview of the same item. They are produced by different "
+                "code from the same numbers — a difference between them is itself the "
+                "finding.</p>"
             )
             body.append(pages)
         body.append(_links_block(result))

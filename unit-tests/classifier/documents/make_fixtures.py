@@ -16,8 +16,11 @@ Fixtures produced (see README.md for the criteria/expectations table):
     invoice_scanned.pdf       the same invoice as a page IMAGE only (no text
                               layer), slightly rotated and noisy → needs OCR
     invoice_two_page.pdf      the invoice split over TWO pages, native text —
-                              kept only to show the single-page rule: POST
-                              /assess refuses it with a 400
+                              two ITEMS in one document. A sentence runs over
+                              the page break ("Please remit the balance to" /
+                              "the Acme Roofing billing office."), so a text
+                              criterion with options.scope "document" finds
+                              it and a page-scope one does not
     contract.txt              plain UTF-8 text, "Limited Warranty" + a date
     proposal.docx             headings, paragraphs, and a table row
                               "System Size | 8.4 kW"
@@ -103,6 +106,14 @@ INVOICE_ROWS = [
 
 # The payment terms. On the single-page invoices they sit below the table;
 # on invoice_two_page.pdf they are page 2.
+#
+# invoice_two_page.pdf only: a sentence split over the page break — the last
+# line of page 1 and the first line of page 2. Neither page contains
+# SPLIT_PHRASE on its own; joined in page order (a document-scope search)
+# they do.
+SPLIT_PAGE_1_TAIL = "Please remit the balance to"
+SPLIT_PAGE_2_HEAD = "the Acme Roofing billing office."
+SPLIT_PHRASE = "remit the balance to the Acme Roofing billing office"
 INVOICE_PAGE_2 = [
     ("Payment Terms: Net 30", 16),
     ("", 12),
@@ -350,14 +361,19 @@ def make_invoice_native() -> pathlib.Path:
 
 
 def make_invoice_two_page() -> pathlib.Path:
-    """The invoice over TWO pages (terms on page 2), for the single-page rule.
+    """The invoice over TWO pages (terms on page 2): two items, one document.
 
-    POST /assess reads the page count without rendering and refuses this with
-    "only single-page PDFs are supported (this one has 2 pages)".
+    POST /assess counts the pages without rendering (2 items against
+    CLASSIFIER_MAX_ITEMS). The last line of page 1 and the first of page 2 are
+    one sentence (SPLIT_PHRASE), for the document-scope text search.
     """
     doc = pymupdf.open()
-    _insert_invoice_head(doc.new_page(), 72.0)
-    _insert_payment_terms(doc.new_page(), 72.0)
+    first = doc.new_page()
+    y = _insert_invoice_head(first, 72.0)
+    first.insert_text((60, y + 24), SPLIT_PAGE_1_TAIL, fontsize=11)
+    second = doc.new_page()
+    second.insert_text((60, 72.0), SPLIT_PAGE_2_HEAD, fontsize=11)
+    _insert_payment_terms(second, 72.0 + 11 * 1.7 + 12)
 
     out = HERE / "invoice_two_page.pdf"
     _pin_pdf_metadata(doc)

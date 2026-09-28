@@ -10,15 +10,17 @@ What is pinned here:
   * the one request, two ways — a JSON body and a multipart form produce the
     SAME result for the same document and criteria; inline ``text`` works
     both ways;
-  * the result shape — ``schema_version: 2``, one key set for every
-    criterion whatever its type or status, ``page_geometry`` a single object;
-  * the refusals at submit — a two-page PDF, the removed routes (404), and
-    the validation 400s that need the HTTP layer (the model-level rules are
-    in test_criterion_options.py);
+  * the result shape — ``schema_version: 3``, one key set for every
+    criterion whatever its type or status, ``page_geometry`` a list with one
+    entry per item;
+  * the refusals at submit — the removed routes (404), and the validation
+    400s that need the HTTP layer (the model-level rules are in
+    test_criterion_options.py; the item cap and the multi-document shapes
+    are in test_multi_items.py);
   * the artifacts every job writes — regions.json, the base image, one
-    ``text.<key>.json`` per distinct text layer (linked from each criterion,
-    never inlined), the lazily rendered layers, and what the byte cap and
-    DELETE do to them;
+    ``text.p{n}.<key>.json`` per item and distinct text layer (linked from
+    each criterion, never inlined), the lazily rendered layers, and what the
+    byte cap and DELETE do to them;
   * a model outage fails one criterion, not the job.
 
 Run with::
@@ -157,7 +159,7 @@ def _strip_ids(value, job_id: str):
 ENTRY_KEYS = {
     "status", "type", "method", "scored", "score", "verdict", "confidence",
     "reason", "detail", "regions", "regions_truncated", "artifacts",
-    "localization", "options_used", "error",
+    "localization", "options_used", "error", "complete", "aggregate_used", "items",
 }
 
 TEXT_CRITERIA = [
@@ -187,7 +189,8 @@ def test_json_and_multipart_produce_the_same_result(client, model):
         for f in result["artifacts"]["files"]:
             f.pop("bytes", None)
     assert a["assessment"] == b["assessment"]
-    assert a["document_info"] == b["document_info"]
+    assert a["documents"] == b["documents"]
+    assert a["items"] == b["items"]
     assert a["verdict"] == b["verdict"] == "PASS"
 
 
@@ -204,7 +207,7 @@ def test_inline_text_both_ways(client, model):
     via_json = _run_json(client, {"type": "text", "data": "A NOTICE TO OWNER is here."}, criteria)
     via_form = _run_form(client, criteria, data={"text": "A NOTICE TO OWNER is here."})
     for job in (via_json, via_form):
-        info = job["result"]["document_info"]
+        (info,) = job["result"]["documents"]
         assert info["kind"] == "txt" and info["filename"] == "inline.txt"
         assert _entries(job)["Notice to Owner"]["verdict"] == "PASS"
 
@@ -248,12 +251,23 @@ def test_every_criterion_has_the_same_keys(client, model, monkeypatch):
         files={"file": ("page.png", _png(), "image/png")},
     )
     result = job["result"]
-    assert result["schema_version"] == 2
-    assert isinstance(result["page_geometry"], dict)
-    assert result["page_geometry"]["width"] == 400
+    assert result["schema_version"] == 3
+    (geometry,) = result["page_geometry"]
+    assert geometry["item"] == 0 and geometry["page"] == 0 and geometry["width"] == 400
+    assert result["documents"] == [{
+        "index": 0, "filename": "page.png", "kind": "image", "pages": 1, "items": [0],
+        "document_info": result["documents"][0]["document_info"],
+    }]
+    assert result["items"] == [{
+        "item": 0, "document": 0, "page": 0, "filename": "page.png",
+        "overall_score": None, "overall_verdict": None, "complete": False,
+    }]
     entries = _entries(job)
     for name, entry in entries.items():
         assert set(entry) == ENTRY_KEYS, name
+        (unit,) = entry["items"]  # one item → one unit
+        assert (unit["item"], unit["document"], unit["page"]) == (0, 0, 0)
+        assert unit["status"] == entry["status"] and unit["score"] == entry["score"]
     assert entries["will fail"]["status"] == "error"
     assert "model down" in entries["will fail"]["error"]
     assert entries["after"]["status"] == "skipped"
@@ -295,14 +309,14 @@ def test_a_model_outage_fails_one_criterion_and_marks_the_job_incomplete(client,
 # ---------------------------------------------------------------------------
 
 
-def test_a_two_page_pdf_is_refused(client):
+def test_a_two_page_pdf_is_two_items_not_a_refusal(client, model):
     raw = (DOCS / "invoice_two_page.pdf").read_bytes()
-    r = client.post("/assess", files={"file": ("two.pdf", raw, "application/pdf")})
-    assert r.status_code == 400
-    assert "only single-page PDFs are supported (this one has 2 pages)" in r.json()["detail"]
-
-    r = client.post("/assess", json={"document": {"type": "base64", "data": _b64(raw)}})
-    assert r.status_code == 400 and "this one has 2 pages" in r.json()["detail"]
+    job = _run_form(client, [{"name": "Net 30", "type": "text"}],
+                    files={"file": ("two.pdf", raw, "application/pdf")})
+    result = job["result"]
+    assert [(i["item"], i["page"]) for i in result["items"]] == [(0, 0), (1, 1)]
+    assert result["documents"][0]["pages"] == 2
+    assert [g["item"] for g in result["page_geometry"]] == [0, 1]
 
 
 @pytest.mark.parametrize("path", ["/locate", "/assess/compare"])
@@ -355,8 +369,6 @@ def test_form_level_refusals(client):
     png = ("page.png", _png(), "image/png")
     r = client.post("/assess", files={"file": png}, data={"ocr": "always"})
     assert r.status_code == 400 and "options.ocr" in r.json()["detail"]
-    r = client.post("/assess", files={"file": png}, data={"text": "also this"})
-    assert r.status_code == 400 and "not both" in r.json()["detail"]
     r = client.post("/assess", data={"criteria": "[]"})
     assert r.status_code == 400 and "No document" in r.json()["detail"]
     r = client.post("/assess", files={"file": png}, data={"criteria": "not json"})
@@ -375,10 +387,12 @@ def test_criterion_types_describes_every_type(client):
     body = client.get("/criterion-types").json()
     assert set(body["types"]) == {"llm", "text", "cv", "detector"}
     llm = body["types"]["llm"]
-    assert llm["defaults"] == {"hint": "auto", "boxes": False, "max_attempts": 3, "ocr": "auto"}
+    assert llm["defaults"] == {"hint": "auto", "boxes": False, "max_attempts": 3, "ocr": "auto",
+                               "aggregate": {"pages": "worst", "documents": "worst"}}
     assert llm["caps"] == {"max_attempts": 3}
     assert "boxes" in llm["options_schema"]["properties"]
-    assert body["types"]["cv"]["defaults"] == {"fallback": "llm"}  # no DETECTOR_URL here
+    assert body["types"]["cv"]["defaults"]["fallback"] == "llm"  # no DETECTOR_URL here
+    assert "aggregate" in body and "rules" in body["aggregate"]
 
 
 # ---------------------------------------------------------------------------
@@ -402,17 +416,20 @@ def test_text_layer_is_written_linked_and_shared(client, model):
         files={"file": ("contract.txt", raw, "text/plain")},
     )
     names = _artifact_names(client, job)
-    assert [n for n in names if n.startswith("text.")] == ["text.auto.json"]  # ONE shared file
+    assert [n for n in names if n.startswith("text.")] == ["text.p0.auto.json"]  # ONE shared file
 
     entries = _entries(job)
     for name in ("Limited Warranty", "2026-03-14", "mentions a warranty"):
-        link = entries[name]["artifacts"]["text"]
+        (link,) = entries[name]["artifacts"]["text"]
         assert link == {
+            "item": 0,
             "key": "auto",
-            "url": f"/jobs/{job['job_id']}/artifacts/text.auto.json",
+            "url": f"/jobs/{job['job_id']}/artifacts/text.p0.auto.json",
             "source": "native",
             "chars": len(raw.decode("utf-8")),
         }
+        # The unit's entry links the same file.
+        assert entries[name]["items"][0]["text_layer"] == {k: v for k, v in link.items() if k != "item"}
         assert entries[name]["options_used"]["ocr"] == link["key"]
         assert "text" not in (entries[name]["detail"] or {})  # never inlined
 
@@ -425,13 +442,14 @@ def test_text_layer_is_written_linked_and_shared(client, model):
     assert payload["source"] == "native" and payload["engine"] is None
     assert payload["settings"]["mode"] == "auto" and payload["lines"] == []
 
-    plain = client.get(f"/jobs/{job['job_id']}/artifacts/text.auto.txt")
+    plain = client.get(f"/jobs/{job['job_id']}/artifacts/text.p0.auto.txt")
     assert plain.status_code == 200
     assert plain.headers["content-type"] == "text/plain; charset=utf-8"
     assert plain.text == raw.decode("utf-8")
 
     manifest = client.get(f"/jobs/{job['job_id']}/artifacts").json()
-    assert manifest["criteria"]["Limited Warranty"]["text_layer"] == "auto"
+    assert manifest["criteria"]["Limited Warranty"]["text_layers"] == ["text.p0.auto.json"]
+    assert manifest["items"] == {"0": {"document": 0, "page": 0, "filename": "contract.txt"}}
 
 
 def test_different_settings_write_different_layers(client, fake_ocr):
@@ -448,22 +466,22 @@ def test_different_settings_write_different_layers(client, fake_ocr):
         files={"file": ("scan.pdf", raw, "application/pdf")},
     )
     names = sorted(n for n in _artifact_names(client, job) if n.startswith("text."))
-    assert names == ["text.always.json", "text.never.json"]
+    assert names == ["text.p0.always.json", "text.p0.never.json"]
     assert fake_ocr.calls == 1  # the two "always" criteria shared ONE pass
 
     entries = _entries(job)
-    assert entries["NOTICE TO OWNER"]["artifacts"]["text"]["source"] == "none"
+    assert entries["NOTICE TO OWNER"]["artifacts"]["text"][0]["source"] == "none"
     assert entries["NOTICE TO OWNER"]["verdict"] == "FAIL"
-    assert entries["notice again"]["artifacts"]["text"]["source"] == "ocr"
+    assert entries["notice again"]["artifacts"]["text"][0]["source"] == "ocr"
     assert entries["notice again"]["verdict"] == "PASS"
     # The OCR line polygons became regions on the page.
     assert entries["notice again"]["regions"][0]["source"] == "ocr"
 
-    ocr_layer = client.get(f"/jobs/{job['job_id']}/artifacts/text.always.json").json()
+    ocr_layer = client.get(f"/jobs/{job['job_id']}/artifacts/text.p0.always.json").json()
     assert ocr_layer["source"] == "ocr" and ocr_layer["engine"] == "FakeOCR"
     assert ocr_layer["text"] == "NOTICE TO OWNER\nTotal Due $4,850.00"
     assert ocr_layer["lines"][0]["polygon"] == [[40, 100], [360, 100], [360, 140], [40, 140]]
-    never = client.get(f"/jobs/{job['job_id']}/artifacts/text.never.json").json()
+    never = client.get(f"/jobs/{job['job_id']}/artifacts/text.p0.never.json").json()
     assert never["source"] == "none" and never["text"] == ""
 
 
@@ -473,7 +491,7 @@ def test_native_documents_store_a_native_layer(client, fixture):
     job = _run_form(
         client, [{"name": "Tampa", "type": "text"}], files={"file": (fixture, raw, None)}
     )
-    layer = client.get(f"/jobs/{job['job_id']}/artifacts/text.auto.json").json()
+    layer = client.get(f"/jobs/{job['job_id']}/artifacts/text.p0.auto.json").json()
     assert layer["source"] == "native"
     assert "Tampa" in layer["text"]
     assert _entries(job)["Tampa"]["verdict"] == "PASS"
@@ -489,14 +507,14 @@ def test_text_layers_survive_the_byte_cap_and_go_with_the_job(client, monkeypatc
         files={"file": ("invoice.pdf", raw, "application/pdf")},
     )
     names = _artifact_names(client, job)
-    assert "text.auto.json" in names and "regions.json" in names
+    assert "text.p0.auto.json" in names and "regions.json" in names
     assert "p0.base.jpg" not in names  # dropped by the cap
     assert "p0.base.jpg" in job["result"]["artifacts"]["dropped"]
 
     job_id = job["job_id"]
     assert client.delete(f"/jobs/{job_id}").status_code in (200, 204)
     assert not store.exists(job_id)
-    assert client.get(f"/jobs/{job_id}/artifacts/text.auto.json").status_code == 404
+    assert client.get(f"/jobs/{job_id}/artifacts/text.p0.auto.json").status_code == 404
 
 
 # ---------------------------------------------------------------------------
@@ -513,7 +531,8 @@ def test_layers_render_on_first_fetch_and_are_cached(client, model):
     job_id = job["job_id"]
     entry = _entries(job)["Total Due"]
     assert entry["regions"] and entry["regions"][0]["source"] == "pdf-text"
-    assert set(job["result"]["artifacts"]["layers"]) == {"svg", "png", "preview"}
+    (page_layers,) = job["result"]["artifacts"]["items"]
+    assert page_layers["item"] == 0 and set(page_layers["layers"]) == {"svg", "png", "preview"}
 
     before = _artifact_names(client, job)
     assert "p0.svg" not in before and "p0.base.jpg" in before
@@ -531,7 +550,7 @@ def test_layers_render_on_first_fetch_and_are_cached(client, model):
 
     # A per-criterion view renders and caches under the criterion's name.
     slug = entry["artifacts"]["slug"]
-    one = client.get(entry["artifacts"]["layers"]["svg"])
+    one = client.get(entry["artifacts"]["items"][0]["layers"]["svg"])
     assert one.status_code == 200
     by_name = client.get(f"/jobs/{job_id}/artifacts/p0.{slug}.layer.png")
     assert by_name.status_code == 200
@@ -540,7 +559,10 @@ def test_layers_render_on_first_fetch_and_are_cached(client, model):
 
 def test_text_only_documents_have_no_layers(client, model):
     job = _run_json(client, {"type": "text", "data": "hello"}, [{"name": "hello", "type": "text"}])
-    assert job["result"]["page_geometry"] is None
-    assert job["result"]["artifacts"]["layers"] == {}
+    assert job["result"]["page_geometry"] == [
+        {"item": 0, "page": 0, "width": None, "height": None,
+         "working_scale": None, "pdf_points": None}
+    ]
+    assert job["result"]["artifacts"]["items"] == []
     r = client.get(f"/jobs/{job['job_id']}/artifacts/p0.svg")
     assert r.status_code == 404 and "no page image" in r.json()["detail"]

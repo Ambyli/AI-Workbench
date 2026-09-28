@@ -1,7 +1,7 @@
 """The `llm` evaluator: ONE scoring call for one criterion, then maybe boxes.
 
-Each ``llm`` criterion is its own unit of work and its own model call: the
-page image (the document is single-page, so there is no page to choose) plus
+Each (``llm`` criterion, item) is its own unit of work and its own model
+call: the item's page image (one page, so there is no page to choose) plus
 the text layer ITS ``options.ocr`` produces, truncated to
 CLASSIFIER_TEXT_CHAR_BUDGET, scored on the rubric ITS ``options.hint``
 selects. A model that cannot answer fails this criterion alone.

@@ -9,8 +9,8 @@ per-kind load, and the fetch for a caller-supplied URL.
                                    Advisory: the magic bytes have the final say.
     _validate_image_dimensions() — reject page images too small to assess.
     _decode_image_bgr()          — raw image bytes → BGR numpy array.
-    load_document_bytes()        — raw bytes → Document (kind detection, the
-                                   single-page rule, PDF render DPI).
+    load_document_bytes()        — raw bytes → Document (kind detection, every
+                                   page up to ``max_pages``, PDF render DPI).
     validate_url()               — the SSRF check on a caller-supplied URL. The
                                    rule itself is ``common.net`` (the detector
                                    service needs the identical one); this is the
@@ -21,8 +21,9 @@ per-kind load, and the fetch for a caller-supplied URL.
 
 Process flow position: below the pipeline, above nothing — it imports no
 sibling. ``load_input_bytes`` / ``validate_content_type`` are called by
-``api.assess`` at submit (the bytes are needed there, for the single-page
-check); ``load_document_bytes`` by ``jobs.runners`` in the worker.
+``api.assess`` at submit (the bytes are needed there, for the item cap — a
+PDF counts its pages); ``load_document_bytes`` by ``jobs.runners`` in the
+worker, once per document.
 """
 
 import base64
@@ -41,6 +42,7 @@ from config import (
     BLOCKED_NETWORKS,
     HTTP_CONNECT_TIMEOUT,
     HTTP_TIMEOUT,
+    MAX_ITEMS,
     MIN_IMAGE_HEIGHT,
     MIN_IMAGE_WIDTH,
     PDF_RENDER_DPI,
@@ -167,6 +169,7 @@ def load_document_bytes(
     content_type: str | None = None,
     *,
     keep_source: bool = False,
+    max_pages: int = MAX_ITEMS,
 ) -> Document:
     """Turn uploaded bytes into a Document, or fail with a 400.
 
@@ -182,15 +185,18 @@ def load_document_bytes(
                       native PDF, where ``common.documents.pdf_text_regions``
                       re-opens the file to ask PyMuPDF where a phrase is.
                       Regions are always collected now, so the runner always
-                      passes True; for a single page it costs one copy of an
-                      upload the payload already held.
+                      passes True; it costs one copy of an upload the payload
+                      already held.
+        max_pages:    Pages to load. The runner passes the count read at
+                      submit, which already passed CLASSIFIER_MAX_ITEMS.
 
     Returns:
-        A ``Document`` with exactly one page.
+        A ``Document`` with every page — each becomes one item.
 
     Raises:
         HTTPException(400): Unsupported or unparseable bytes, or a PDF with
-            more than one page (normally refused at submit already).
+            more pages than ``max_pages`` (the item cap refuses these at
+            submit; one reaching a worker anyway is refused, not truncated).
     """
     logger.debug(
         "load_document_bytes: %d bytes filename=%s content_type=%s keep_source=%s",
@@ -204,7 +210,7 @@ def load_document_bytes(
             raw,
             filename=filename,
             content_type=content_type,
-            max_pages=1,
+            max_pages=max(1, int(max_pages)),
             render_dpi=PDF_RENDER_DPI,
             image_decoder=_decode_image_bgr,
             keep_source=keep_source,
@@ -214,18 +220,20 @@ def load_document_bytes(
         raise HTTPException(status_code=400, detail=str(exc))
 
     if doc.truncated_pages:
-        # Submit refuses these; a payload that reaches a worker anyway (an
-        # older container's queue) is refused here rather than half-read.
+        # Submit counted the pages; a document that has more than that by the
+        # time a worker reads it is refused rather than silently half-read.
         raise HTTPException(
             status_code=400,
             detail=(
-                "only single-page PDFs are supported "
-                f"(this one has {1 + doc.truncated_pages} pages)"
+                f"document {filename or '(unnamed)'} has "
+                f"{len(doc.pages) + doc.truncated_pages} pages, more than the "
+                f"{max_pages} counted at submit"
             ),
         )
     logger.info(
-        "load_document_bytes: kind=%s has_text=%s has_image=%s",
+        "load_document_bytes: kind=%s pages=%d has_text=%s has_image=%s",
         doc.kind,
+        len(doc.pages),
         doc.has_text(),
         doc.has_images(),
     )

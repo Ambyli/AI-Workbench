@@ -1,8 +1,8 @@
 """Per-type criterion options: validation, defaults, caps, and the request rules.
 
 Everything here is model-level (``api.schemas`` / ``api.criterion_options``),
-so it runs without the app. The HTTP layer's own refusals — the multi-page
-PDF, the removed form fields — are in test_classifier_endpoint.py.
+so it runs without the app. The HTTP layer's own refusals — the item cap,
+the removed form fields — are in test_classifier_endpoint.py.
 
 Run with::
 
@@ -55,7 +55,8 @@ def test_type_defaults_to_llm_and_options_resolve():
     c = CriterionInput(name="has a roof")
     assert c.type == "llm"
     assert c.resolved_options() == {
-        "hint": "auto", "boxes": False, "max_attempts": LLM_BBOX_MAX_ATTEMPTS, "ocr": "auto"
+        "hint": "auto", "boxes": False, "max_attempts": LLM_BBOX_MAX_ATTEMPTS, "ocr": "auto",
+        "aggregate": {"pages": "worst", "documents": "worst"},
     }
 
 
@@ -69,23 +70,23 @@ def test_text_pattern_defaults_to_the_name():
 
 def test_detector_threshold_defaults_to_the_env_floor():
     assert CriterionInput(name="x", type="detector").resolved_options() == {
-        "threshold": DETECTOR_MIN_SCORE
+        "threshold": DETECTOR_MIN_SCORE, "aggregate": {"pages": "any", "documents": "all"},
     }
     assert CriterionInput(
         name="x", type="detector", options={"threshold": 0.5}
-    ).resolved_options() == {"threshold": 0.5}
+    ).resolved_options()["threshold"] == 0.5
 
 
 def test_cv_fallback_default_follows_the_detector_configuration(monkeypatch):
     from detector import client as detector_client
 
-    assert CriterionInput(name="has bicycle", type="cv").resolved_options() == {"fallback": "llm"}
+    def fallback(**kw):
+        return CriterionInput(name="has bicycle", type="cv", **kw).resolved_options()["fallback"]
+
+    assert fallback() == "llm"
     monkeypatch.setattr(detector_client, "DETECTOR_URL", "http://detector:8000")
-    assert CriterionInput(name="has bicycle", type="cv").resolved_options() == {
-        "fallback": "detector"
-    }
-    explicit = CriterionInput(name="has bicycle", type="cv", options={"fallback": "llm"})
-    assert explicit.resolved_options() == {"fallback": "llm"}
+    assert fallback() == "detector"
+    assert fallback(options={"fallback": "llm"}) == "llm"
 
 
 def test_options_round_trip_through_a_payload():
@@ -215,6 +216,94 @@ def test_document_input_shape():
         AssessRequest.model_validate({"document": DOC, "regions": True})
 
 
+def test_a_single_document_is_a_one_item_list():
+    request = AssessRequest.model_validate({"document": DOC})
+    assert request.document is None
+    assert [d.data for d in request.documents] == ["hello"]
+    request = AssessRequest.model_validate({"documents": [DOC, {"type": "text", "data": "b"}]})
+    assert [d.data for d in request.documents] == ["hello", "b"]
+
+
+@pytest.mark.parametrize(
+    "body, fragment",
+    [
+        ({"document": DOC, "documents": [DOC]}, "not both"),
+        ({}, "no document"),
+        ({"documents": []}, "at least 1 item"),
+        ({"documents": [{"type": "text", "data": ""}]}, "documents.0.data"),
+    ],
+)
+def test_document_list_refusals(body, fragment):
+    with pytest.raises(ValidationError) as exc:
+        AssessRequest.model_validate(body)
+    assert fragment in validation_message(exc.value)
+
+
+# ── options.aggregate and options.scope ────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "criterion, expected",
+    [
+        ({"name": "x", "type": "llm", "options": {"hint": "presence"}}, ("any", "all")),
+        ({"name": "x", "type": "llm", "options": {"hint": "quality"}}, ("worst", "worst")),
+        ({"name": "x", "type": "llm"}, ("worst", "worst")),  # hint auto
+        ({"name": "sharpness", "type": "cv"}, ("worst", "worst")),
+        ({"name": "x", "type": "detector"}, ("any", "all")),
+        ({"name": "x", "type": "text"}, ("sum", "sum")),
+    ],
+)
+def test_aggregate_defaults_follow_the_table(criterion, expected):
+    rules = CriterionInput.model_validate(criterion).aggregate_rules()
+    assert (rules["pages"], rules["documents"]) == expected
+
+
+def test_aggregate_a_string_sets_both_levels_and_an_object_sets_either():
+    c = CriterionInput(name="x", options={"aggregate": "mean"})
+    assert c.aggregate_rules() == {"pages": "mean", "documents": "mean"}
+    c = CriterionInput(name="x", options={"hint": "presence", "aggregate": {"documents": "any"}})
+    assert c.aggregate_rules() == {"pages": "any", "documents": "any"}
+    c = CriterionInput(name="x", options={"aggregate": {"pages": "all"}})
+    assert c.aggregate_rules() == {"pages": "all", "documents": "worst"}  # all is kept as sent
+    assert c.resolved_options()["aggregate"] == c.aggregate_rules()
+
+
+@pytest.mark.parametrize("type_", ["llm", "cv", "detector"])
+def test_sum_is_refused_off_text(type_):
+    for agg in ("sum", {"pages": "sum"}, {"documents": "sum"}):
+        message = _error({"name": "has sky", "type": type_, "options": {"aggregate": agg}})
+        assert "aggregate 'sum' adds text hit counts and is only for text criteria" in message
+
+
+def test_sum_is_fine_on_text():
+    c = CriterionInput(
+        name="x", type="text", options={"aggregate": {"documents": "sum", "pages": "any"}}
+    )
+    assert c.aggregate_rules() == {"pages": "any", "documents": "sum"}
+
+
+@pytest.mark.parametrize(
+    "agg, fragment",
+    [
+        ("median", "aggregate must be one of any, worst, all, mean, sum"),
+        ({"page": "any"}, "unknown level(s) ['page']"),
+        ({"pages": "best"}, "got pages: 'best'"),
+        (3, "got int"),
+    ],
+)
+def test_bad_aggregates_are_refused(agg, fragment):
+    assert fragment in _error({"name": "x", "options": {"aggregate": agg}})
+
+
+def test_text_scope():
+    assert CriterionInput(name="x", type="text").scope() == "page"
+    c = CriterionInput(name="x", type="text", options={"scope": "document"})
+    assert c.scope() == "document" and c.resolved_options()["scope"] == "document"
+    assert CriterionInput(name="x", type="llm").scope() == "page"
+    assert "options.scope" in _error({"name": "x", "type": "text", "options": {"scope": "book"}})
+    assert "options.scope: Extra inputs" in _error({"name": "x", "options": {"scope": "document"}})
+
+
 # ── GET /criterion-types' payload ──────────────────────────────────────────
 
 
@@ -227,3 +316,9 @@ def test_criterion_types_payload():
     assert payload["types"]["text"]["defaults"]["pattern"] == "<name>"
     assert payload["types"]["text"]["caps"] == {"pattern_max_chars": 500, "min_count": 1000}
     assert payload["types"]["llm"]["caps"] == {"max_attempts": LLM_BBOX_MAX_ATTEMPTS}
+    assert payload["types"]["text"]["defaults"]["aggregate"] == {"pages": "sum", "documents": "sum"}
+    assert payload["types"]["text"]["defaults"]["scope"] == "page"
+    assert payload["aggregate"]["rules"]["all"] == "alias of worst"
+    assert payload["aggregate"]["defaults"]["llm (hint presence)"] == {
+        "pages": "any", "documents": "all"
+    }

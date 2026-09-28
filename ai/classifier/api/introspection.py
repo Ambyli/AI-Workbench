@@ -44,8 +44,9 @@ from config import (
     LLM_BBOX_PRESENCE_MIN,
     LLM_BBOX_VERIFY_PASS,
     MAX_CONCURRENT,
-    MAX_CRITERIA_PER_JOB,
+    MAX_ITEMS,
     MAX_LLM_CALLS,
+    MAX_UNITS_PER_JOB,
     OCR_WORKERS,
     PDF_RENDER_DPI,
     REGION_LAYER_FORMATS,
@@ -123,7 +124,7 @@ def list_document_kinds():
             "extensions": EXTENSIONS["image"],
             "content_types": ["image/jpeg", "image/png"],
             "detection": "magic bytes: FF D8 FF (JPEG) / 89 50 4E 47 0D 0A 1A 0A (PNG)",
-            "pages": "1",
+            "pages": "1 — one item",
             "has_page_images": True,
             "native_text": False,
             "notes": "EXIF orientation is applied on load. Text criteria need OCR.",
@@ -133,7 +134,8 @@ def list_document_kinds():
             "extensions": EXTENSIONS["pdf"],
             "content_types": ["application/pdf"],
             "detection": "magic bytes: %PDF- (anywhere in the first 1 KB)",
-            "pages": "1 — a PDF with more than one page is refused at submit (400)",
+            "pages": "any — every page is one item; the request's total items are "
+                     "capped at CLASSIFIER_MAX_ITEMS (counted at submit, without rendering)",
             "has_page_images": True,
             "native_text": True,
             "notes": f"Each page is rendered at {PDF_RENDER_DPI} dpi for cv/llm criteria. "
@@ -144,11 +146,12 @@ def list_document_kinds():
             "extensions": EXTENSIONS["txt"],
             "content_types": ["text/plain"],
             "detection": "decodes as UTF-8 (BOM allowed), no NUL bytes, mostly printable",
-            "pages": "1",
+            "pages": "1 — one item",
             "has_page_images": False,
             "native_text": True,
             "notes": "No rendered surface — cv and detector criteria are SKIPPED, the "
-                     "llm call is text-only, and score:false criteria are refused.",
+                     "llm call is text-only, and score:false criteria are refused "
+                     "when no document in the request has a page image.",
         },
         {
             "kind": "docx",
@@ -157,7 +160,7 @@ def list_document_kinds():
                 "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
             ],
             "detection": "ZIP magic PK\\x03\\x04 containing word/document.xml",
-            "pages": "1 (python-docx reads XML, not a laid-out page)",
+            "pages": "1 — one item (python-docx reads XML, not a laid-out page)",
             "has_page_images": False,
             "native_text": True,
             "notes": "Paragraphs and table cells are extracted in document order; table "
@@ -184,22 +187,28 @@ def list_document_kinds():
             },
             "inputs": {
                 "json": ["base64", "url", "text"],
-                "multipart": ["file (or legacy 'image')", "text"],
+                "json_shape": "documents: [{type, data, filename?}, ...] — or document: "
+                              "{...} for one; not both",
+                "multipart": ["file (or legacy 'image'), repeatable", "text, repeatable"],
             },
             "ocr": {
                 **ocr_engine_status(),
                 "modes": ["auto", "always", "never"],
                 "default": "auto",
                 "set_on": "each llm / text criterion's options.ocr",
-                "text_layer_artifact": "text.<key>.json per distinct setting",
+                "text_layer_artifact": "text.p<item>.<key>.json per item and distinct "
+                                       "setting; text.d<document>.<key>.json for a "
+                                       "scope-document text search",
             },
             "limits": {
-                "max_pages": 1,
+                "max_items": MAX_ITEMS,
+                "items": "every page of every document is one item; the cap is "
+                         "inclusive and counted at submit",
                 "pdf_render_dpi": PDF_RENDER_DPI,
                 "llm_text_char_budget": TEXT_CHAR_BUDGET,
                 "images_per_llm_prompt": 1,
                 "max_concurrent_jobs": MAX_CONCURRENT,
-                "max_criteria_per_job": MAX_CRITERIA_PER_JOB,
+                "max_units_per_job": MAX_UNITS_PER_JOB,
                 "max_llm_calls": MAX_LLM_CALLS,
                 "ocr_workers": OCR_WORKERS,
             },
@@ -228,7 +237,7 @@ def list_document_kinds():
                 "detector": detector_client.status(),
                 "inline_max_per_criterion": INLINE_REGIONS_MAX,
                 "artifact_dir": ARTIFACT_DIR,
-                "artifact_max_bytes": ARTIFACT_MAX_BYTES,
+                "artifact_max_bytes_per_item": ARTIFACT_MAX_BYTES,
                 "artifact_ttl_hours": JOB_TTL_HOURS,
                 "sweep_interval_seconds": ARTIFACT_SWEEP_INTERVAL_S,
             },

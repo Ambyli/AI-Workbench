@@ -1,4 +1,4 @@
-"""The scheduler: waves, real parallelism, error isolation, and the limits.
+"""The scheduler: units, per-item gating, parallelism, isolation, the limits.
 
 Driven through ``analysis.analyze_document`` on synthetic documents, with the
 vision model scripted at the TRANSPORT (``llm.client._send``) — which is where
@@ -93,14 +93,14 @@ def model(monkeypatch):
 
 
 def test_independent_criteria_run_in_parallel(monkeypatch, model):
-    monkeypatch.setattr(scheduler, "MAX_CRITERIA_PER_JOB", 4)
+    monkeypatch.setattr(scheduler, "MAX_UNITS_PER_JOB", 4)
     monkeypatch.setattr(llm_client.LLM_CALLS, "limit", 8)
     _run([_llm(f"c{i}") for i in range(4)])
     assert model.peak == 4
 
 
 def test_the_per_job_cap_bounds_one_job(monkeypatch, model):
-    monkeypatch.setattr(scheduler, "MAX_CRITERIA_PER_JOB", 2)
+    monkeypatch.setattr(scheduler, "MAX_UNITS_PER_JOB", 2)
     monkeypatch.setattr(llm_client.LLM_CALLS, "limit", 8)
     _run([_llm(f"c{i}") for i in range(6)])
     assert model.peak == 2
@@ -108,7 +108,7 @@ def test_the_per_job_cap_bounds_one_job(monkeypatch, model):
 
 def test_the_global_llm_limit_bounds_every_job_together(monkeypatch, model):
     """Two jobs × three criteria, one limit: in flight never exceeds it."""
-    monkeypatch.setattr(scheduler, "MAX_CRITERIA_PER_JOB", 3)
+    monkeypatch.setattr(scheduler, "MAX_UNITS_PER_JOB", 3)
     monkeypatch.setattr(llm_client.LLM_CALLS, "limit", 2)
     llm_client.LLM_CALLS.reset_peak()
 
@@ -128,7 +128,7 @@ def test_the_global_llm_limit_bounds_every_job_together(monkeypatch, model):
 
 def test_the_llm_limit_also_bounds_the_box_loop(monkeypatch, model):
     """Scoring and the loop's ask/verify calls share one limit."""
-    monkeypatch.setattr(scheduler, "MAX_CRITERIA_PER_JOB", 4)
+    monkeypatch.setattr(scheduler, "MAX_UNITS_PER_JOB", 4)
     monkeypatch.setattr(llm_client.LLM_CALLS, "limit", 1)
     monkeypatch.setattr(llm_boxes, "LLM_BBOX_REFINE", False)
     monkeypatch.setattr(llm_boxes, "LLM_BBOX_GRIDLINES", False)
@@ -200,7 +200,7 @@ def test_an_independent_criterion_is_not_held_back_by_a_slow_chain(monkeypatch):
         return Outcome(method="text", score=10, verdict="PASS", confidence=100)
 
     monkeypatch.setitem(scheduler.EVALUATORS, "text", slow_gate)
-    monkeypatch.setattr(scheduler, "MAX_CRITERIA_PER_JOB", 4)
+    monkeypatch.setattr(scheduler, "MAX_UNITS_PER_JOB", 4)
     _run([
         CriterionInput(name="gate", type="text"),
         CriterionInput(name="after", type="text", depends_on="gate"),
@@ -303,7 +303,7 @@ def test_the_detector_path_scores_from_boxes(monkeypatch):
     assert seen["min_score"] == 0.4
     assert entry["method"] == "detector" and entry["score"] == 10
     assert entry["regions"][0]["source"] == "detector"
-    assert result["document_info"]["detector"]["used"] is True
+    assert result["detector"]["used"] is True
 
 
 def test_a_detector_outage_fails_only_its_criterion(monkeypatch):

@@ -1,4 +1,4 @@
-"""The one shape every evaluator returns.
+"""The one shape every evaluator (and every aggregate) returns.
 
 Four evaluation paths (``cv_eval``, ``text_eval``, ``llm_eval``,
 ``detector_eval``) share one interface::
@@ -55,6 +55,9 @@ class Outcome:
                       (``llm``) — the key names the ``text.<key>.json``
                       artifact holding it. None when no text was used.
         error:        Why, when ``status == "error"``.
+        complete:     False on an AGGREGATE (``analysis.aggregate``) when any
+                      unit under it errored — the answer then ignores part of
+                      what was asked. Always True on a single unit.
     """
 
     status: str = "ok"
@@ -68,6 +71,7 @@ class Outcome:
     localization: Optional[dict] = None
     text_layer: Optional[dict] = None
     error: Optional[str] = None
+    complete: bool = True
 
 
 def skipped(reason: str, method: Optional[str] = None) -> Outcome:

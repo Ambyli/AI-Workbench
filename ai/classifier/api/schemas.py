@@ -5,14 +5,17 @@ caller and a multipart caller can never be treated differently:
 
   POST /assess
     AssessRequest
-      ├── document : DocumentInput          — base64 | url | text
-      └── criteria : list[CriterionInput]   — what to evaluate
+      ├── documents : list[DocumentInput]   — each base64 | url | text
+      │   (document : DocumentInput         — the one-item shorthand)
+      └── criteria  : list[CriterionInput]  — what to evaluate
 
-    JSON body:  {"document": {...}, "criteria": [...]}
-    multipart:  a `file` part (or the legacy `image` alias) or a `text`
-                field, plus a `criteria` field holding the same JSON array.
-                ``api.assess`` turns the upload into a base64 DocumentInput
-                and validates the SAME AssessRequest.
+    JSON body:  {"documents": [{...}, ...], "criteria": [...]}, or
+                {"document": {...}, "criteria": [...]} — a single document is
+                a one-item list; sending both keys is a 400.
+    multipart:  repeated `file` parts (the legacy `image` alias too) and/or
+                repeated `text` fields, plus a `criteria` field holding the
+                same JSON array. ``api.assess`` turns each upload into a
+                base64 DocumentInput and validates the SAME AssessRequest.
 
 A criterion's top level is only what every type shares — ``name``, ``type``,
 ``weight``, ``depends_on``, ``score``; everything type-specific is in
@@ -170,14 +173,25 @@ class CriterionInput(BaseModel):
         """Whether this criterion can produce any geometry at all."""
         return can_locate(self.type, self.name, self.resolved_options())
 
+    def scope(self) -> str:
+        """"document" for a text criterion with options.scope "document" — one
+        unit per DOCUMENT — and "page" (one unit per item) for everything else."""
+        if self.type == "text" and self.options.scope == "document":
+            return "document"
+        return "page"
+
+    def aggregate_rules(self) -> dict[str, str]:
+        """The resolved ``{"pages", "documents"}`` rules (see options.aggregate)."""
+        return dict(self.resolved_options()["aggregate"])
+
 
 class DocumentInput(BaseModel):
-    """The document: base64 bytes, a URL to fetch, or inline text.
+    """One document: base64 bytes, a URL to fetch, or inline text.
 
     The kind (JPEG/PNG, PDF, .txt, .docx) is determined from the BYTES, never
     from a filename or content type. ``text`` is plain text treated as a .txt
     document. A URL is SSRF-checked (``common.net``) before it is fetched, at
-    submit time — the single-page check needs the bytes.
+    submit time — the item cap needs the bytes (a PDF counts its pages).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -195,16 +209,47 @@ class DocumentInput(BaseModel):
 
 
 class AssessRequest(BaseModel):
-    """The whole /assess request — JSON and multipart both land here."""
+    """The whole /assess request — JSON and multipart both land here.
+
+    After validation ``documents`` is ALWAYS the list and ``document`` is
+    None: the single-document shorthand is normalised into a one-item list,
+    so nothing downstream has two shapes to handle.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
-    document: DocumentInput
+    documents: Optional[list[DocumentInput]] = Field(
+        default=None,
+        min_length=1,
+        description=(
+            "The documents, in order. Every page of every document is one item; "
+            "the total is capped at CLASSIFIER_MAX_ITEMS."
+        ),
+    )
+    document: Optional[DocumentInput] = Field(
+        default=None,
+        description="Shorthand for a one-item 'documents' list. Not with 'documents'.",
+    )
     criteria: list[CriterionInput] = Field(
         default_factory=lambda: [CriterionInput.model_validate(c) for c in DEFAULT_CRITERIA],
         min_length=1,
         description="What to evaluate. Omitted: the four default quality criteria.",
     )
+
+    @model_validator(mode="after")
+    def _one_document_list(self) -> "AssessRequest":
+        if self.document is not None and self.documents is not None:
+            raise ValueError(
+                "send either 'document' (one) or 'documents' (a list), not both"
+            )
+        if self.document is None and self.documents is None:
+            raise ValueError(
+                "no document: send 'documents' (a list of {type, data}) or 'document'"
+            )
+        if self.document is not None:
+            self.documents = [self.document]
+            self.document = None
+        return self
 
     @model_validator(mode="after")
     def _cross_criterion_rules(self) -> "AssessRequest":

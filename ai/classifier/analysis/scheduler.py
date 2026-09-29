@@ -57,6 +57,7 @@ from dataclasses import dataclass, field
 from analysis import aggregate, cv_eval, detector_eval, llm_eval, text_eval
 from analysis.context import DocumentContext, DocumentGroup
 from analysis.outcome import Outcome, skipped
+from analysis.result_specs import clear_judgement
 from api.schemas import CriterionInput
 from config import MAX_UNITS_PER_JOB
 from logger import logger
@@ -203,6 +204,10 @@ def _unjudged(c: CriterionInput, outcome: Outcome) -> Outcome:
         outcome.score = None
         outcome.verdict = None
         outcome.confidence = None
+        # An llm criterion's detail.value IS the score; it goes with the rest
+        # of the judgement. A cv measurement or a text count is not a
+        # judgement and stays.
+        outcome.detail = clear_judgement(outcome.detail, outcome.method)
     return outcome
 
 

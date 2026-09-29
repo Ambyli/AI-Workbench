@@ -27,6 +27,7 @@ from __future__ import annotations
 
 from analysis.context import DocumentContext
 from analysis.outcome import Outcome, empty_localization
+from analysis.result_specs import with_metric
 from api.schemas import CriterionInput
 from config import TEXT_CHAR_BUDGET
 # Modules, not names: a test scripts the model by replacing
@@ -85,16 +86,21 @@ async def evaluate_with(name: str, opts: dict, ctx: DocumentContext) -> Outcome:
         verdict=answer["verdict"],
         confidence=answer["confidence"],
         reason=answer["reason"],
-        detail={
-            "hint": opts["hint"],
-            "image_sent": image_b64 is not None,
-            "text_sent": {
-                "chars": len(text),
-                "truncated": truncated,
-                "budget": TEXT_CHAR_BUDGET,
-                "source": layer.source,
+        # The model's headline number is its score; the scheduler clears
+        # `value` for a `score: false` criterion (result_specs.clear_judgement).
+        detail=with_metric(
+            {
+                "hint": opts["hint"],
+                "image_sent": image_b64 is not None,
+                "text_sent": {
+                    "chars": len(text),
+                    "truncated": truncated,
+                    "budget": TEXT_CHAR_BUDGET,
+                    "source": layer.source,
+                },
             },
-        },
+            "llm", answer["score"],
+        ),
         localization=empty_localization(),
         text_layer=ctx.layer_ref(opts["ocr"], layer),
     )

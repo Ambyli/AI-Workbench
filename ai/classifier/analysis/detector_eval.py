@@ -27,6 +27,7 @@ from common.vision import Region
 
 from analysis.context import DocumentContext
 from analysis.outcome import EvaluationError, Outcome, skipped
+from analysis.result_specs import with_metric
 from api.schemas import CriterionInput
 from config import DETECTOR_STRONG_SCORE
 # Imported as a module, not by name: `detector_client.is_configured()` reads
@@ -99,7 +100,11 @@ def _score_from_detector(name: str, regions: list[Region], threshold: float) -> 
                 f"{threshold:.2f} confidence floor. Lower options.threshold, or "
                 'give the criterion type "llm" to have the vision model judge it.'
             ),
-            detail={"detector_matches": 0, "min_score": threshold},
+            # The same keys as a hit, best_score 0 — "looked, found nothing".
+            detail=with_metric(
+                {"detector_matches": 0, "best_score": 0.0, "min_score": threshold},
+                "detector", 0.0,
+            ),
         )
 
     best = max(float(r.score or 0.0) for r in regions)
@@ -114,10 +119,13 @@ def _score_from_detector(name: str, regions: list[Region], threshold: float) -> 
             f"best confidence {best:.2f} (>={DETECTOR_STRONG_SCORE:.2f} scores 10, "
             f"above the {threshold:.2f} floor scores 7)."
         ),
-        detail={
-            "detector_matches": len(regions),
-            "best_score": round(best, 4),
-            "min_score": threshold,
-        },
+        detail=with_metric(
+            {
+                "detector_matches": len(regions),
+                "best_score": round(best, 4),
+                "min_score": threshold,
+            },
+            "detector", round(best, 4),
+        ),
         regions=list(regions),
     )

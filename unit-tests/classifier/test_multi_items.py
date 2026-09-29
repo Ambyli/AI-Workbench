@@ -302,10 +302,21 @@ def test_score_false_needs_an_image_somewhere_in_the_request(client, model):
 
 
 def _ok(score, *, regions=0, item=0, count=None, confidence=70):
+    """A member outcome in the shape the evaluators produce: an llm detail
+    (metric score) by default, a text match record when ``count`` is given."""
+    from analysis.result_specs import with_metric
     from utils import verdict_from_score
 
-    detail = {"count": count, "best_ratio": 1.0 if count else 0.0, "searched_chars": 10,
-              "text_source": "native", "snippets": []} if count is not None else None
+    if count is not None:
+        detail = with_metric({"count": count, "best_ratio": 1.0 if count else 0.0,
+                              "searched_chars": 10, "text_source": "native",
+                              "snippets": [], "mode": "contains", "pattern": "Net 30"},
+                             "text", count)
+    else:
+        detail = with_metric({"hint": "auto", "image_sent": True,
+                              "text_sent": {"chars": 5, "truncated": False,
+                                            "budget": 60000, "source": "native"}},
+                             "llm", score)
     return Outcome(
         method="llm", score=score, verdict=verdict_from_score(score),
         confidence=confidence, reason=f"s{score}", detail=detail,
@@ -345,15 +356,35 @@ def test_each_rule(rule, scores, expected):
 
 def test_mean_reports_its_arithmetic():
     out = aggregate_level(C_LLM, "mean", _members(_ok(3), _ok(9)), "item")
-    assert out.detail["mean"] == 6.0 and out.detail["scores"] == {"item 0": 3, "item 1": 9}
+    assert out.detail["metric"] == "score" and out.detail["value"] == 6.0
+    assert out.detail["aggregate"] == {
+        "rule": "mean", "level": "pages", "from": None,
+        "values": {"item 0": 3, "item 1": 9},
+    }
+    # Only the llm type's stable keys survive a mean; what each page was sent
+    # (text_sent) differs per member and is in items[] instead.
+    assert set(out.detail) == {"metric", "value", "hint", "image_sent", "aggregate"}
     assert out.reason.startswith("mean of 2 item score(s) = 6.00")
 
 
 def test_any_and_worst_say_which_member_they_took():
     out = aggregate_level(C_LLM, "any", _members(_ok(2), _ok(8)), "item")
     assert out.reason.startswith("any of 2 item(s) → item 1: s8")
+    # The chosen member's detail, whole, plus the block.
+    assert out.detail["value"] == 8 and out.detail["text_sent"]["chars"] == 5
+    assert out.detail["aggregate"] == {
+        "rule": "any", "level": "pages", "from": "item 1",
+        "values": {"item 0": 2, "item 1": 8},
+    }
     out = aggregate_level(C_LLM, "all", _members(_ok(2), _ok(8)), "item")
     assert out.reason.startswith("all of 2 item(s) → item 0: s2")
+    assert out.detail["aggregate"]["rule"] == "all" and out.detail["aggregate"]["from"] == "item 0"
+
+
+def test_one_member_has_no_aggregate_block():
+    only = _ok(7)
+    out = aggregate_level(C_LLM, "any", _members(only), "item")
+    assert "aggregate" not in out.detail
 
 
 def test_one_member_passes_straight_through():
@@ -398,7 +429,12 @@ def test_sum_adds_hit_counts_and_rescores():
     members = _members(_ok(1, count=0), _ok(10, count=2), _ok(10, count=1))
     out = aggregate_level(c, "sum", members, "item")
     assert out.detail["count"] == 3 and out.score == 10 and out.verdict == "PASS"
-    assert out.detail["counts"] == {"item 0": 0, "item 1": 2, "item 2": 1}
+    assert out.detail["metric"] == "count" and out.detail["value"] == 3
+    assert out.detail["aggregate"] == {
+        "rule": "sum", "level": "pages", "from": None,
+        "values": {"item 0": 0, "item 1": 2, "item 2": 1},
+    }
+    assert "counts" not in out.detail  # moved into the block
     out = aggregate_level(c, "sum", members[:2], "item")
     assert out.detail["count"] == 2 and out.score == 1 and out.verdict == "FAIL"
 

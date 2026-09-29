@@ -270,7 +270,9 @@ its `options.ocr` produced on that page — a
 and the rubric its `options.hint` selects. The answer is one flat JSON object,
 `{"score", "verdict", "confidence", "reason"}`; the verdict is always
 recomputed from the clamped score. What was sent is in the result's
-`detail`: `{hint, image_sent, text_sent: {chars, truncated, budget, source}}`.
+`detail`: `{metric: "score", value, hint, image_sent, text_sent: {chars, truncated,
+budget, source}}` — `value` is the score, and null for a `score: false`
+criterion (see [§ Result details](#result-details--the-same-shape-on-every-type)).
 
 > **One image per prompt.** `muse-glimmer` is served **without**
 > `--limit-mm-per-prompt`, so vLLM accepts a single image per request; a second
@@ -547,6 +549,7 @@ text, and 0 when there is none. `detail` carries the match record:
 
 ```json
 "detail": {
+  "metric": "count", "value": 1,
   "found": true, "count": 1, "best_ratio": 0.8571, "mode": "fuzzy",
   "pattern": "Notice to Owner",
   "snippets": [{"text": "…33601 NOTICE TO OWNER Under Florida law…", "ratio": 0.8571}],
@@ -555,6 +558,8 @@ text, and 0 when there is none. `detail` carries the match record:
 }
 ```
 
+The same keys come back when there was no text to search at all (`found:
+false`, `count: 0`, `searched_chars: 0`), so a consumer never special-cases it.
 The exact text searched is not inlined — it is linked, as
 `artifacts.text` (see [§ The text a criterion searched](#the-text-a-criterion-searched)).
 
@@ -614,6 +619,43 @@ Names are matched exactly (case-insensitive), then by `difflib` at
 `CV_NAME_FUZZY_CUTOFF` (0.8) so typos still land — `has textt` → `has text`.
 Anything less similar uses the criterion's `fallback`. See `GET /cv-detectors`
 for the live list.
+
+### Result details — the same shape on every type
+
+Every criterion's `detail` is declared, per type, and `GET /criterion-types`
+serves the declaration as each type's `result` block. Two keys are common to
+every type, so the headline number reads the same whatever ran:
+
+| Type | `metric` | `value` is | Other `detail` keys |
+|---|---|---|---|
+| `llm` | `score` | the model's score (**null** for `score: false` — the judgement is not reported) | `hint`, `image_sent`, `text_sent` |
+| `text` | `count` | `detail.count`, the hits | the match record above; `scope`, `separator`, `items_with_hits` with `scope: "document"` |
+| `detector` | `best_score` | `detail.best_score` | `detector_matches`, `min_score` |
+| `cv` | per detector | `detail.measurements[metric]` | `detector`, `measurements`, `thresholds`, `parameters`, `state`, `image` — keys per detector in `GET /cv-detectors` |
+
+A `cv` criterion answered by its `fallback` has the `llm` or `detector`
+shape; `method` says which. An errored or skipped criterion has `detail: null`.
+
+**Aggregates keep the shape.** When a criterion ran on more than one item or
+document, its `detail` is still its type's shape, plus one block:
+
+```json
+"aggregate": {"rule": "any", "level": "documents", "from": "document 1",
+              "values": {"document 0": 3, "document 1": 9}}
+```
+
+| Rule | `detail` |
+|---|---|
+| `any` / `worst` / `all` | The chosen member's detail, whole; `from` names it |
+| `mean` | Only the type's **stable** keys — those that mean the same on every member (a `text` pattern, a `cv` detector's thresholds and parameters, an `llm` hint) — plus `metric` and `value` = the mean of the members' values. For `cv` that is the mean measurement (e.g. mean `mean_intensity`), not the mean score. Per-member keys (`measurements`, `snippets`, `text_sent`) are in `items[]` |
+| `sum` (`text`) | The full match record with the counts added; `values` holds each member's count |
+
+`values` is always each member's `value`, by label (`item n` at the pages
+level, `document n` at the documents level). A single member passes through
+with no `aggregate` block. Each `items[]` entry's `detail` is that unit's own,
+in the unaggregated shape. `unit-tests/classifier/test_result_specs.py` runs
+every type through the pipeline and fails if a `detail` carries a key its
+declaration does not list or misses one it requires.
 
 ### Dependencies
 
@@ -700,8 +742,9 @@ Inside `job.result`, `schema_version: 3` — here for a two-page invoice plus a
         "status": "ok", "type": "text", "method": "text", "scored": true,
         "score": 10, "verdict": "PASS", "confidence": 100,
         "reason": "sum over 2 document(s): Found 2x via contains match.",
-        "detail": {"aggregate": "sum", "found": true, "count": 2,
-                   "counts": {"document 0": 1, "document 1": 1}, "…": "…"},
+        "detail": {"metric": "count", "value": 2, "found": true, "count": 2, "…": "…",
+                   "aggregate": {"rule": "sum", "level": "documents", "from": null,
+                                 "values": {"document 0": 1, "document 1": 1}}},
         "regions": [{"page": 1, "kind": "box", "source": "pdf-text", "…": "…"}],
         "regions_truncated": false,
         "artifacts": {
@@ -1097,7 +1140,8 @@ criterion's fallback resolves to the llm.
 | nothing above the threshold | 1 | FAIL |
 
 `confidence` is the best box score as a percentage, and `detail` carries
-`detector_matches`, `best_score` and `min_score`. Each region carries
+`metric: "best_score"`, `value`, `detector_matches`, `best_score` and
+`min_score` — the same keys when nothing was found, with `best_score: 0`. Each region carries
 `attrs.detector_score`. **A negative gets no LLM second opinion** — if you want
 the model's judgement, give the criterion `"type": "llm"`.
 
@@ -1399,6 +1443,7 @@ curl http://localhost:4001/v1/classifier/criterion-types -H "Authorization: Bear
              "caps": {"pattern_max_chars": 500, "min_count": 1000}, "…": "…"},
     "cv": {"defaults": {"fallback": "detector", "aggregate": {"pages": "worst", "documents": "worst"}},
            "caps": {}, "…": "…"},
+    "…": "every type also carries `result` — see below",
     "detector": {"defaults": {"threshold": 0.25, "aggregate": {"pages": "any", "documents": "all"}},
                  "caps": {}, "…": "…"}
   },
@@ -1410,9 +1455,36 @@ curl http://localhost:4001/v1/classifier/criterion-types -H "Authorization: Bear
                  "cv": {"…": "…"}, "detector": {"…": "…"}, "text": {"pages": "sum", "documents": "sum"}},
     "excluded": "…", "text_scope_document": "…"
   },
+  "aggregate_detail": {"rule": "…", "level": "…", "from": "…", "values": "…"},
   "detector_configured": true
 }
 ```
+
+Each type also carries **`result`**, the shape of the `detail` it returns:
+
+```json
+"result": {
+  "metric": "count", "metric_from": "detail",
+  "fields": {
+    "metric": {"kind": "string", "description": "Name of the headline number", "stable": true},
+    "value": {"kind": "number", "description": "The headline number (…)"},
+    "pattern": {"kind": "string", "description": "What was searched for", "stable": true},
+    "scope": {"kind": "string", "description": "`document` when the pages were searched joined",
+              "when": "options.scope is document", "stable": true},
+    "aggregate": {"kind": "object", "description": "How several members were combined — see `aggregate_detail`",
+                  "when": "the criterion ran on more than one item or document"},
+    "…": "…"
+  },
+  "notes": ["The full text searched is the `text.<key>.json` artifact the result links to."]
+}
+```
+
+`metric_from` says where the headline number lives: `detail` (the `metric`
+names a detail key), `measurements` (a `cv` measurement; its keys per detector
+in `GET /cv-detectors`) or `score` (the `llm` score). A field without `when`
+is always present; `stable` marks what survives a `mean` aggregate.
+`aggregate_detail` describes the block every aggregated `detail` gains. See
+[§ Result details](#result-details--the-same-shape-on-every-type).
 
 `text.defaults.pattern` shows `<name>` because it defaults to the criterion's
 name. `cv.defaults.fallback` is `detector` only while DETECTOR_URL is set.

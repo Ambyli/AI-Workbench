@@ -50,6 +50,7 @@ from common.vision import Region
 
 from analysis.context import DocumentContext, DocumentGroup, JoinedText, document_text_file
 from analysis.outcome import Outcome
+from analysis.result_specs import with_metric
 from api.schemas import CriterionInput
 from config import FUZZY_CREDIT_FLOOR, TEXT_REGION_MAX_HITS
 from logger import logger
@@ -106,7 +107,7 @@ def _no_text(c: CriterionInput, opts: dict, source: str, ref: dict) -> Outcome:
             "native text layer, and OCR did not run or found nothing — "
             "ocr=never, or the OCR engine is disabled/unavailable)."
         ),
-        detail={"pattern": opts["pattern"], "match": opts["match"], "text_source": source},
+        detail=_no_text_detail(opts, source),
         text_layer=ref,
     )
 
@@ -125,6 +126,7 @@ def _match(view: Document, c: CriterionInput, opts: dict, locate: bool):
 
 
 def _detail(res, opts: dict, source: str) -> dict:
+    """The match record, in the declared shape (``analysis.result_specs``)."""
     detail = res.as_dict()
     detail.pop("pages", None)  # one page (or one joined document) per unit
     for snippet in detail.get("snippets", []):
@@ -135,7 +137,29 @@ def _detail(res, opts: dict, source: str) -> dict:
         fuzzy_threshold=opts["fuzzy_threshold"] if opts["match"] == "fuzzy" else None,
         text_source=source,
     )
-    return detail
+    return with_metric(detail, "text", detail.get("count", 0))
+
+
+def _no_text_detail(opts: dict, source: str) -> dict:
+    """The match record for "there was no text to search" — the same keys as
+    any other text result, so a consumer never has to special-case it."""
+    return with_metric(
+        {
+            "found": False,
+            "count": 0,
+            "best_ratio": 0.0,
+            "mode": opts["match"],
+            "pattern": opts["pattern"],
+            "snippets": [],
+            "searched_chars": 0,
+            "case_sensitive": opts["case_sensitive"],
+            "min_count": opts["min_count"],
+            "fuzzy_threshold": opts["fuzzy_threshold"] if opts["match"] == "fuzzy" else None,
+            "text_source": source,
+        },
+        "text",
+        0,
+    )
 
 
 async def evaluate(c: CriterionInput, ctx: DocumentContext) -> Outcome:

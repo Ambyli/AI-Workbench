@@ -63,6 +63,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Optional
 
 from analysis.outcome import Outcome
+from analysis.result_specs import aggregated_detail, member_value, with_metric
 from analysis.text_eval import score_text
 from api.schemas import CriterionInput
 from utils import verdict_from_score
@@ -138,14 +139,22 @@ def aggregate_level(
     tail = (
         f" ({len(errored)} {noun}(s) errored and are excluded)" if errored else ""
     )
+    level = "pages" if noun == "item" else "documents"
+    method = ok[0].outcome.method
     if not scored:
-        # score: false — geometry only, never a judgement.
+        # score: false — geometry only, never a judgement. The detail keeps
+        # its shape (the first located member's) with the members' values.
         rep = ok[0].outcome
         return replace(
             rep,
             score=None, verdict=None, confidence=None,
             reason=f"Located on {sum(1 for m in ok if m.outcome.regions)} of "
                    f"{len(ok)} {noun}(s){tail}. {ok[0].label}: {rep.reason or ''}".strip(),
+            detail=aggregated_detail(
+                method=method, rule=rule, level=level,
+                members=[(m.label, m.outcome.detail) for m in ok],
+                chosen=(ok[0].label, rep.detail),
+            ),
             regions=regions,
             localization=localization,
             text_layer=None,
@@ -153,6 +162,7 @@ def aggregate_level(
         )
 
     which = _rule(rule)
+    members = [(m.label, m.outcome.detail) for m in scored]
     if which in ("any", "worst"):
         pick = max if which == "any" else min
         chosen = pick(scored, key=lambda m: m.outcome.score)
@@ -160,6 +170,11 @@ def aggregate_level(
         return replace(
             rep,
             reason=f"{rule} of {len(scored)} {noun}(s) → {chosen.label}{tail}: {rep.reason or ''}",
+            # The chosen member's detail, whole, plus how it was chosen.
+            detail=aggregated_detail(
+                method=method, rule=rule, level=level, members=members,
+                chosen=(chosen.label, rep.detail),
+            ),
             regions=regions,
             localization=localization,
             text_layer=None,
@@ -171,28 +186,31 @@ def aggregate_level(
         mean = sum(scores) / len(scores)
         score = max(1, min(10, round(mean)))
         confidences = [m.outcome.confidence for m in scored if m.outcome.confidence is not None]
+        # `value` is the mean of the members' headline numbers — their
+        # measurement (cv), count (text), best box (detector) or score (llm).
+        values = [float(v) for v in (member_value(d) for _, d in members)
+                  if isinstance(v, (int, float))]
         return Outcome(
             status="ok",
-            method=scored[0].outcome.method,
+            method=method,
             score=score,
             verdict=verdict_from_score(score),
             confidence=round(sum(confidences) / len(confidences)) if confidences else None,
             reason=f"mean of {len(scored)} {noun} score(s) = {mean:.2f}{tail}.",
-            detail={
-                "aggregate": "mean",
-                "mean": round(mean, 4),
-                "scores": {m.label: m.outcome.score for m in scored},
-            },
+            detail=aggregated_detail(
+                method=method, rule=rule, level=level, members=members,
+                value=round(sum(values) / len(values), 4) if values else None,
+            ),
             regions=regions,
             localization=localization,
             complete=complete,
         )
 
     # sum — text only (refused at submit on every other type).
-    return _sum(c, scored, noun, regions, localization, complete, tail)
+    return _sum(c, scored, noun, level, rule, regions, localization, complete, tail)
 
 
-def _sum(c, scored, noun, regions, localization, complete, tail) -> Outcome:
+def _sum(c, scored, noun, level, rule, regions, localization, complete, tail) -> Outcome:
     opts = c.resolved_options()
     counts = {m.label: int((m.outcome.detail or {}).get("count") or 0) for m in scored}
     count = sum(counts.values())
@@ -206,11 +224,11 @@ def _sum(c, scored, noun, regions, localization, complete, tail) -> Outcome:
                 snippets.append({"from": m.label, **snippet})
     sources = sorted({(m.outcome.detail or {}).get("text_source") for m in scored} - {None})
     confidences = [m.outcome.confidence for m in scored if m.outcome.confidence is not None]
+    # The full match record, counts added; the per-member counts are the
+    # aggregate block's `values` (result_specs.aggregated_detail).
     detail: dict[str, Any] = {
-        "aggregate": "sum",
         "found": count >= max(1, opts["min_count"]),
         "count": count,
-        "counts": counts,
         "best_ratio": round(best, 4),
         "mode": opts["match"],
         "pattern": opts["pattern"],
@@ -228,7 +246,11 @@ def _sum(c, scored, noun, regions, localization, complete, tail) -> Outcome:
         verdict=verdict_from_score(score),
         confidence=min(confidences) if confidences else None,
         reason=f"sum over {len(scored)} {noun}(s){tail}: {reason}",
-        detail=detail,
+        detail=aggregated_detail(
+            method="text", rule=rule, level=level,
+            members=[(m.label, m.outcome.detail) for m in scored],
+            base=with_metric(detail, "text", count),
+        ),
         regions=regions,
         localization=localization,
         complete=complete,

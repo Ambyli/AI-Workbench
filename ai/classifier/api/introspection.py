@@ -69,8 +69,25 @@ def list_criterion_types():
     are resolved for THIS container (a `cv` criterion's fallback depends on
     whether DETECTOR_URL is set); ``caps`` are the server limits a request
     may not exceed.
+
+    Each type also carries ``result``: the shape of the ``detail`` it returns
+    (``analysis.result_specs``) — its headline ``metric``, every field with
+    its JSON kind, when it appears, and whether it survives a ``mean``
+    aggregate — and the payload carries ``aggregate_detail``, the block every
+    aggregated ``detail`` gains. A ``cv`` criterion's measurement keys are
+    per detector: ``GET /cv-detectors``.
     """
-    return JSONResponse(content=criterion_types())
+    # Merged here rather than in api.criterion_options, which the analysis
+    # package imports (through api.schemas): importing analysis there would
+    # close a cycle. This module is the top of the stack.
+    from analysis.result_specs import AGGREGATE_BLOCK, SPECS
+
+    payload = criterion_types()
+    for type_, entry in payload.get("types", {}).items():
+        if type_ in SPECS:
+            entry["result"] = SPECS[type_].as_dict()
+    payload["aggregate_detail"] = dict(AGGREGATE_BLOCK)
+    return JSONResponse(content=payload)
 
 
 @router.get("/hints")

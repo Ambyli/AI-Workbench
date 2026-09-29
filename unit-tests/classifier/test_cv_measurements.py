@@ -30,7 +30,17 @@ import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
-from config import BLUR_THRESHOLD, EXPOSURE_HIGH, EXPOSURE_LOW
+import config
+from config import (
+    BLUR_FULL_SCORE_MULTIPLE,
+    BLUR_THRESHOLD,
+    CV_FACE_PASS_MIN_COUNT,
+    CV_VEGETATION_MARGINAL_FROM,
+    CV_VEGETATION_PASS_ABOVE,
+    DETAIL_FLOAT_DECIMALS,
+    EXPOSURE_HIGH,
+    EXPOSURE_LOW,
+)
 from cv import REGISTRY
 from cv.features import detect_faces, detect_sky, detect_text, detect_vegetation, detect_water
 from cv.quality import check_blur, check_exposure
@@ -175,8 +185,9 @@ def test_numpy_scalars_and_floats_are_normalised():
                   reason="r", metric="m",
                   measurements={"m": np.float64(0.123456789), "n": np.int64(3)},
                   parameters={"range": (np.int64(1), 2.123456789)})
-    assert r["detail"]["measurements"] == {"m": 0.1235, "n": 3}
-    assert r["detail"]["parameters"] == {"range": [1, 2.1235]}
+    places = DETAIL_FLOAT_DECIMALS
+    assert r["detail"]["measurements"] == {"m": round(0.123456789, places), "n": 3}
+    assert r["detail"]["parameters"] == {"range": [1, round(2.123456789, places)]}
     assert type(r["score"]) is int and type(r["confidence"]) is int
 
 
@@ -189,7 +200,7 @@ def test_blur_flat_fails_and_noise_passes():
     flat = _assert_shape(check_blur(_flat()), "check_blur", "laplacian_variance")
     assert flat["value"] == 0.0
     assert flat["thresholds"] == {"pass_at_or_above": BLUR_THRESHOLD,
-                                  "full_score_at": BLUR_THRESHOLD * 3}
+                                  "full_score_at": BLUR_THRESHOLD * BLUR_FULL_SCORE_MULTIPLE}
     sharp = check_blur(_noise())
     assert sharp["verdict"] == "PASS"
     assert sharp["detail"]["value"] >= BLUR_THRESHOLD
@@ -212,7 +223,8 @@ def test_vegetation_counts_its_green_pixels():
     green = _assert_shape(detect_vegetation(_bgr(40, 160, 40)), "detect_vegetation", "green_ratio")
     m = green["measurements"]
     assert m["green_ratio"] == 1.0 and m["green_px"] == m["total_px"] == 400 * 300
-    assert green["thresholds"] == {"pass_above": 0.15, "marginal_from": 0.05}
+    assert green["thresholds"] == {"pass_above": CV_VEGETATION_PASS_ABOVE,
+                                   "marginal_from": CV_VEGETATION_MARGINAL_FROM}
     assert {"hsv_lower", "hsv_upper", "morph_kernel_px"} <= set(green["parameters"])
     grey = detect_vegetation(_flat(128))["detail"]["measurements"]
     assert grey["green_ratio"] == 0.0 and grey["green_px"] == 0
@@ -307,3 +319,60 @@ def test_assess_result_carries_structured_cv_detail(client):
     assert per["exposure"]["detail"]["state"] == "normal"
     # Every per-item entry carries the same structured detail.
     assert per["exposure"]["items"][0]["detail"]["metric"] == "mean_intensity"
+
+
+# ---------------------------------------------------------------------------
+# The reported thresholds ARE the ones the verdict uses
+# ---------------------------------------------------------------------------
+#
+# The cut points live once, in config.py, and both the scoring branch and the
+# reported detail.thresholds read them. These tests pin that: every detector
+# reports config's values, and a coverage detector's verdict flips exactly
+# where its reported threshold says.
+
+_CUTS = {
+    "detect_vegetation": ("CV_VEGETATION_PASS_ABOVE", "CV_VEGETATION_MARGINAL_FROM"),
+    "detect_sky": ("CV_SKY_PASS_ABOVE", "CV_SKY_MARGINAL_FROM"),
+    "detect_water": ("CV_WATER_PASS_ABOVE", "CV_WATER_MARGINAL_FROM"),
+    "detect_text": ("CV_TEXT_PASS_ABOVE", "CV_TEXT_MARGINAL_FROM"),
+}
+
+
+@pytest.mark.parametrize("fn", [detect_vegetation, detect_sky, detect_water, detect_text],
+                         ids=lambda f: f.__name__)
+def test_coverage_detectors_report_configs_cut_points(fn):
+    pass_name, marginal_name = _CUTS[fn.__name__]
+    assert fn(_noise())["detail"]["thresholds"] == {
+        "pass_above": getattr(config, pass_name),
+        "marginal_from": getattr(config, marginal_name),
+    }
+
+
+def test_faces_and_blur_report_configs_values():
+    assert detect_faces(_flat())["detail"]["thresholds"] == {
+        "pass_at_or_above": CV_FACE_PASS_MIN_COUNT
+    }
+    assert check_blur(_flat())["detail"]["thresholds"]["full_score_at"] == (
+        BLUR_THRESHOLD * BLUR_FULL_SCORE_MULTIPLE
+    )
+
+
+def _green_rows(rows, w=400, h=300):
+    """A grey page whose top ``rows`` rows are solid green: green_ratio = rows / h."""
+    img = _flat(128, w, h)
+    img[:rows] = (40, 160, 40)
+    return img
+
+
+@pytest.mark.parametrize("cut, above, below", [
+    (CV_VEGETATION_PASS_ABOVE, "PASS", "MARGINAL"),
+    (CV_VEGETATION_MARGINAL_FROM, "MARGINAL", "FAIL"),
+])
+def test_vegetation_verdict_flips_at_the_reported_threshold(cut, above, below):
+    h = 300
+    rows_above = int(cut * h) + 2
+    rows_below = int(cut * h) - 2
+    hi = detect_vegetation(_green_rows(rows_above, h=h))
+    lo = detect_vegetation(_green_rows(rows_below, h=h))
+    assert hi["detail"]["value"] > cut > lo["detail"]["value"]
+    assert hi["verdict"] == above and lo["verdict"] == below

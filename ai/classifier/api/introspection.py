@@ -80,12 +80,13 @@ def list_criterion_types():
     # Merged here rather than in api.criterion_options, which the analysis
     # package imports (through api.schemas): importing analysis there would
     # close a cycle. This module is the top of the stack.
-    from analysis.result_specs import AGGREGATE_BLOCK, SPECS
+    from analysis.result_specs import AGGREGATE_BLOCK, specs
 
+    declared = specs()  # each type's spec, declared beside its evaluator
     payload = criterion_types()
     for type_, entry in payload.get("types", {}).items():
-        if type_ in SPECS:
-            entry["result"] = SPECS[type_].as_dict()
+        if type_ in declared:
+            entry["result"] = declared[type_].as_dict()
     payload["aggregate_detail"] = dict(AGGREGATE_BLOCK)
     return JSONResponse(content=payload)
 

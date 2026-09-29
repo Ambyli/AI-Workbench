@@ -1,15 +1,25 @@
-"""What a criterion's ``detail`` contains, declared per type.
+"""What a criterion's ``detail`` contains — the declarations and their registry.
 
-``cv`` detectors declare their own shape beside each detector
-(``cv.result.describes``, served by ``GET /cv-detectors``). This module does
-the same for every criterion TYPE, and ``GET /criterion-types`` serves it as
-each type's ``result`` block:
+**The standard.** A result shape is declared NEXT TO THE CODE THAT PRODUCES IT
+and registers itself under the key its consumers look it up by:
 
-    llm       the model's headline number is its score; detail says what the
-              model was sent
-    text      the match record; the headline number is the hit count
-    detector  the open-vocabulary detector's boxes; headline is the best box score
-    cv        the detector's measurement (its keys: GET /cv-detectors)
+    cv detectors   ``@describes(DetectorSpec(...))`` on each detector function
+                   (``cv.result``); the detector REGISTRY is the lookup;
+                   served by ``GET /cv-detectors``
+    criterion      ``@result_spec(ResultSpec(...))`` on each evaluator's
+    types          ``evaluate`` (``analysis.llm_eval`` / ``text_eval`` /
+                   ``detector_eval`` / ``cv_eval``); registered HERE by type
+                   name, the key the aggregator, the scheduler and
+                   ``GET /criterion-types`` start from (a result's ``method``)
+
+Every declaration has a test that runs the real producer and compares:
+``unit-tests/classifier/test_result_specs.py`` for the types,
+``test_cv_measurements.py`` for the detectors.
+
+This module holds what the declarations share — ``FieldSpec``,
+``ResultSpec``, the three fields every type has (``METRIC_FIELD``,
+``VALUE_FIELD``, ``AGGREGATE_FIELD``), the aggregate block — the registry, and
+the helpers that read it. It defines no type's shape itself.
 
 Two keys are common to every type, so a consumer can read the headline number
 without knowing which type ran:
@@ -17,10 +27,9 @@ without knowing which type ran:
     metric   the name of the headline number
     value    that number
 
-For ``text`` and ``detector`` the metric is itself a detail key (``count``,
-``best_score``) and ``value`` equals it. For ``cv`` it is a key of
-``detail.measurements``. For ``llm`` it is ``score`` — the judgement — which
-is why a ``score: false`` llm criterion has ``value: null``
+``metric_from`` says where it lives: a detail key (``text``: ``count``,
+``detector``: ``best_score``), a ``cv`` measurement, or the ``llm`` score —
+which is why a ``score: false`` llm criterion has ``value: null``
 (``clear_judgement``).
 
 **Aggregation** (``analysis.aggregate``) keeps the shape and adds one block,
@@ -33,22 +42,20 @@ is why a ``score: false`` llm criterion has ``value: null``
                  (measurements, snippets, what text was sent) are in ``items[]``
     sum          (text) the full match record, counts added
 
-A single member passes through with no aggregate block — the pre-aggregation
-result exactly.
+A single member passes through with no aggregate block.
 
-``unit-tests/classifier/test_result_specs.py`` runs every type through
-``/assess`` and fails if a ``detail`` carries a key its declaration does not
-list, or misses one it requires.
-
-Process flow position: read by the evaluators (``METRIC``), by
-``analysis.aggregate`` and ``analysis.scheduler``, and by
-``api.criterion_options`` for ``GET /criterion-types``.
+Process flow position: imported by the evaluators (to declare), by
+``analysis.aggregate`` and ``analysis.scheduler`` (to look up), and by
+``api.introspection`` for ``GET /criterion-types``. It imports no evaluator at
+module level — they import it — so the lookups load them on first use
+(``specs()``).
 """
 
 from __future__ import annotations
 
+import importlib
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 
 @dataclass(frozen=True)
@@ -68,6 +75,13 @@ class ResultSpec:
     metric_from: str                # "detail" | "measurements" | "score"
     fields: dict[str, FieldSpec]
     notes: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        missing = {"metric", "value", "aggregate"} - set(self.fields)
+        if missing:
+            raise ValueError(f"{self.type}: every type declares {sorted(missing)}")
+        if self.metric_from == "detail" and self.metric not in self.fields:
+            raise ValueError(f"{self.type}: metric {self.metric!r} is not a declared field")
 
     def required(self) -> set[str]:
         return {k for k, f in self.fields.items() if f.when is None}
@@ -92,117 +106,15 @@ class ResultSpec:
         }
 
 
-_METRIC = FieldSpec("Name of the headline number", "string", stable=True)
-_VALUE = FieldSpec("The headline number (the mean of the members' values under `mean`)", "number")
-_AGG = FieldSpec(
+# The three fields every type declares (ResultSpec refuses one without them).
+METRIC_FIELD = FieldSpec("Name of the headline number", "string", stable=True)
+VALUE_FIELD = FieldSpec(
+    "The headline number (the mean of the members' values under `mean`)", "number"
+)
+AGGREGATE_FIELD = FieldSpec(
     "How several members were combined — see `aggregate_detail`", "object",
     when="the criterion ran on more than one item or document",
 )
-
-SPECS: dict[str, ResultSpec] = {
-    "llm": ResultSpec(
-        type="llm",
-        metric="score",
-        metric_from="score",
-        fields={
-            "metric": _METRIC,
-            "value": FieldSpec(
-                "The model's score, 1-10 — null for a `score: false` criterion, whose "
-                "judgement is not reported", "number",
-            ),
-            "hint": FieldSpec("The rubric the model was asked to use", "string", stable=True),
-            "image_sent": FieldSpec("Whether the page image was attached", "boolean", stable=True),
-            "text_sent": FieldSpec(
-                "The text attached: `{chars, truncated, budget, source}`", "object",
-            ),
-            "aggregate": _AGG,
-        },
-        notes=(
-            "The model's answer is the top-level score / verdict / confidence / reason; "
-            "detail records what it was shown.",
-            "Box-loop results are in `localization`, not `detail`.",
-        ),
-    ),
-    "text": ResultSpec(
-        type="text",
-        metric="count",
-        metric_from="detail",
-        fields={
-            "metric": _METRIC,
-            "value": _VALUE,
-            "found": FieldSpec("Whether count reached min_count", "boolean"),
-            "count": FieldSpec("Hits found (summed across members under `sum`)", "integer"),
-            "best_ratio": FieldSpec(
-                "Best similarity seen, 0-1 — 1.0 for a literal/regex hit", "number",
-            ),
-            "mode": FieldSpec("The match mode used", "string", stable=True),
-            "pattern": FieldSpec("What was searched for", "string", stable=True),
-            "snippets": FieldSpec("Up to 8 context excerpts around the hits", "array"),
-            "searched_chars": FieldSpec("Characters searched", "integer"),
-            "case_sensitive": FieldSpec("Whether matching was case-sensitive", "boolean", stable=True),
-            "min_count": FieldSpec("Hits required to PASS", "integer", stable=True),
-            "fuzzy_threshold": FieldSpec(
-                "Similarity a fuzzy window must reach; null for other modes", "number", stable=True,
-            ),
-            "text_source": FieldSpec(
-                "native | ocr | none — or `mixed` when summed across members that differ",
-                "string",
-            ),
-            "scope": FieldSpec(
-                "`document` when the pages were searched joined", "string",
-                stable=True, when="options.scope is document",
-            ),
-            "separator": FieldSpec(
-                "What joined the pages", "string", stable=True, when="options.scope is document",
-            ),
-            "items_with_hits": FieldSpec(
-                "Items the hits landed on", "array", when="options.scope is document",
-            ),
-            "aggregate": _AGG,
-        },
-        notes=("The full text searched is the `text.<key>.json` artifact the result links to.",),
-    ),
-    "detector": ResultSpec(
-        type="detector",
-        metric="best_score",
-        metric_from="detail",
-        fields={
-            "metric": _METRIC,
-            "value": _VALUE,
-            "detector_matches": FieldSpec("Boxes found at or above min_score", "integer"),
-            "best_score": FieldSpec("The best box's confidence, 0-1; 0 when none", "number"),
-            "min_score": FieldSpec("The confidence floor used", "number", stable=True),
-            "aggregate": _AGG,
-        },
-    ),
-    "cv": ResultSpec(
-        type="cv",
-        metric="(per detector — GET /cv-detectors)",
-        metric_from="measurements",
-        fields={
-            "metric": _METRIC,
-            "value": _VALUE,
-            "detector": FieldSpec("The OpenCV function that ran", "string", stable=True),
-            "measurements": FieldSpec(
-                "Everything the detector counted — its keys: GET /cv-detectors", "object",
-            ),
-            "thresholds": FieldSpec("The lines that decide the verdict", "object", stable=True),
-            "parameters": FieldSpec("Config values it measured with", "object", stable=True),
-            "state": FieldSpec(
-                "A categorical outcome — its values: GET /cv-detectors", "string",
-                when="the detector declares states",
-            ),
-            "image": FieldSpec(
-                "The working-image frame the *_px measurements are in", "object", stable=True,
-            ),
-            "aggregate": _AGG,
-        },
-        notes=(
-            "A cv criterion answered by its `fallback` has the llm or detector shape; "
-            "`method` says which.",
-        ),
-    ),
-}
 
 AGGREGATE_BLOCK: dict[str, str] = {
     "rule": "any | worst | all | mean | sum — the rule that combined the members",
@@ -212,16 +124,78 @@ AGGREGATE_BLOCK: dict[str, str] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# The registry
+# ---------------------------------------------------------------------------
+
+_REGISTRY: dict[str, ResultSpec] = {}
+
+# The modules that declare a type. Imported on first lookup, so a caller that
+# reaches for a spec before anything imported the evaluators still gets all
+# four — and a new type's module only has to be listed here once.
+_DECLARING_MODULES = (
+    "analysis.llm_eval",
+    "analysis.text_eval",
+    "analysis.detector_eval",
+    "analysis.cv_eval",
+)
+_loaded = False
+
+
+def register(spec: ResultSpec) -> ResultSpec:
+    """Register ``spec`` under its type. The same object twice is fine; a
+    DIFFERENT spec for a type already registered is a bug."""
+    existing = _REGISTRY.get(spec.type)
+    if existing is not None and existing is not spec:
+        raise ValueError(f"a result spec for {spec.type!r} is already registered")
+    _REGISTRY[spec.type] = spec
+    return spec
+
+
+def result_spec(spec: ResultSpec) -> Callable[[Callable], Callable]:
+    """Declare the ``detail`` shape an evaluator produces, beside it.
+
+    Registers ``spec`` under ``spec.type`` and attaches it as ``fn.result_spec``;
+    returns the function unchanged.
+    """
+    register(spec)
+
+    def attach(fn: Callable) -> Callable:
+        fn.result_spec = spec  # type: ignore[attr-defined]
+        return fn
+
+    return attach
+
+
+def specs() -> dict[str, ResultSpec]:
+    """Every registered type's spec, loading the declaring modules once."""
+    global _loaded
+    if not _loaded:
+        for module in _DECLARING_MODULES:
+            importlib.import_module(module)
+        _loaded = True
+    return dict(_REGISTRY)
+
+
 def spec_for(method: Optional[str]) -> Optional[ResultSpec]:
     """The result spec for the path that answered (``Outcome.method``)."""
-    return SPECS.get(method or "")
+    if not method:
+        return None
+    return _REGISTRY.get(method) or specs().get(method)
+
+
+# ---------------------------------------------------------------------------
+# Helpers the producers and consumers share
+# ---------------------------------------------------------------------------
 
 
 def with_metric(detail: dict, method: str, value: Any) -> dict:
-    """``detail`` with the type's ``metric`` / ``value`` added."""
-    spec = SPECS[method]
-    return {"metric": spec.metric, "value": value, **{k: v for k, v in detail.items()
-                                                       if k not in ("metric", "value")}}
+    """``detail`` with the type's ``metric`` / ``value`` added, first."""
+    spec = spec_for(method)
+    if spec is None:
+        raise KeyError(f"no result spec registered for {method!r}")
+    rest = {k: v for k, v in detail.items() if k not in ("metric", "value")}
+    return {"metric": spec.metric, "value": value, **rest}
 
 
 def clear_judgement(detail: Any, method: Optional[str]) -> Any:

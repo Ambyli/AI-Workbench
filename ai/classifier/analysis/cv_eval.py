@@ -34,13 +34,56 @@ from common.vision import PageGeometry, Region, rescale_region
 from analysis import detector_eval, llm_eval
 from analysis.context import DocumentContext
 from analysis.outcome import Outcome, skipped
+from analysis.result_specs import (
+    AGGREGATE_FIELD,
+    METRIC_FIELD,
+    VALUE_FIELD,
+    FieldSpec,
+    ResultSpec,
+    result_spec,
+)
 from api.criterion_options import LLMOptions
 from api.schemas import CriterionInput
 from config import DETECTOR_MIN_SCORE
 from cv import get_detector
 from logger import logger
 
+# The detail a `cv` result carries — the detector's own result
+# (cv.result.cv_result) plus the `image` frame added below — declared here and
+# registered by type (analysis.result_specs). Each DETECTOR's measurement
+# keys and states are declared beside that detector (cv.result.describes,
+# GET /cv-detectors). Checked against real output by
+# unit-tests/classifier/test_result_specs.py and test_cv_measurements.py.
+CV_RESULT = ResultSpec(
+    type="cv",
+    metric="(per detector — GET /cv-detectors)",
+    metric_from="measurements",
+    fields={
+        "metric": METRIC_FIELD,
+        "value": VALUE_FIELD,
+        "detector": FieldSpec("The OpenCV function that ran", "string", stable=True),
+        "measurements": FieldSpec(
+            "Everything the detector counted — its keys: GET /cv-detectors", "object",
+        ),
+        "thresholds": FieldSpec("The lines that decide the verdict", "object", stable=True),
+        "parameters": FieldSpec("Config values it measured with", "object", stable=True),
+        "state": FieldSpec(
+            "A categorical outcome — its values: GET /cv-detectors", "string",
+            when="the detector declares states",
+        ),
+        "image": FieldSpec(
+            "The working-image frame the *_px measurements are in", "object", stable=True,
+        ),
+        "aggregate": AGGREGATE_FIELD,
+    },
+    notes=(
+        "A cv criterion answered by its `fallback` has the llm or detector shape; "
+        "`method` says which.",
+    ),
+)
 
+
+@result_spec(CV_RESULT)
 async def evaluate(c: CriterionInput, ctx: DocumentContext) -> Outcome:
     """Run the named OpenCV detector on the page, or the resolved fallback."""
     detector = get_detector(c.name)

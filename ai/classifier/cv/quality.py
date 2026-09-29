@@ -18,7 +18,7 @@ Process flow position: registered in ``cv/__init__.py``'s REGISTRY and run by
 import cv2
 import numpy as np
 
-from config import BLUR_THRESHOLD, EXPOSURE_HIGH, EXPOSURE_LOW
+from config import BLUR_FULL_SCORE_MULTIPLE, BLUR_THRESHOLD, EXPOSURE_HIGH, EXPOSURE_LOW
 from cv.result import DetectorSpec, Measurement, cv_result, describes
 from logger import logger
 
@@ -68,7 +68,9 @@ def check_blur(image) -> dict:
         # Floored at 1: scores are 1-10 everywhere in this service, and a flat
         # or badly blurred page (variance under a tenth of full_score_at) used
         # to score 0 — which then entered the weighted average as a zero.
-        score=max(1, min(10, int(10 * min(variance / (BLUR_THRESHOLD * 3), 1.0)))),
+        score=max(1, min(10, int(
+            10 * min(variance / (BLUR_THRESHOLD * BLUR_FULL_SCORE_MULTIPLE), 1.0)
+        ))),
         verdict="PASS" if variance >= BLUR_THRESHOLD else "FAIL",
         confidence=100,
         reason=f"Laplacian variance: {variance:.1f} (threshold: {BLUR_THRESHOLD})",
@@ -76,7 +78,7 @@ def check_blur(image) -> dict:
         measurements={"laplacian_variance": variance},
         thresholds={
             "pass_at_or_above": BLUR_THRESHOLD,
-            "full_score_at": BLUR_THRESHOLD * 3,
+            "full_score_at": BLUR_THRESHOLD * BLUR_FULL_SCORE_MULTIPLE,
         },
     )
     logger.debug("check_blur: returning score=%s verdict=%s variance=%.1f",

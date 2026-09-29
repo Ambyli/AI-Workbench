@@ -27,7 +27,14 @@ from __future__ import annotations
 
 from analysis.context import DocumentContext
 from analysis.outcome import Outcome, empty_localization
-from analysis.result_specs import with_metric
+from analysis.result_specs import (
+    AGGREGATE_FIELD,
+    METRIC_FIELD,
+    FieldSpec,
+    ResultSpec,
+    result_spec,
+    with_metric,
+)
 from api.schemas import CriterionInput
 from config import TEXT_CHAR_BUDGET
 # Modules, not names: a test scripts the model by replacing
@@ -50,11 +57,41 @@ def _budgeted(text: str) -> tuple[str, bool]:
     return text, False
 
 
+# The detail an `llm` result carries — declared here, beside the code that
+# builds it, and registered by type (analysis.result_specs). Checked against
+# real output by unit-tests/classifier/test_result_specs.py.
+LLM_RESULT = ResultSpec(
+    type="llm",
+    metric="score",
+    metric_from="score",
+    fields={
+        "metric": METRIC_FIELD,
+        "value": FieldSpec(
+            "The model's score, 1-10 — null for a `score: false` criterion, whose "
+            "judgement is not reported", "number",
+        ),
+        "hint": FieldSpec("The rubric the model was asked to use", "string", stable=True),
+        "image_sent": FieldSpec("Whether the page image was attached", "boolean", stable=True),
+        "text_sent": FieldSpec(
+            "The text attached: `{chars, truncated, budget, source}`", "object",
+        ),
+        "aggregate": AGGREGATE_FIELD,
+    },
+    notes=(
+        "The model's answer is the top-level score / verdict / confidence / reason; "
+        "detail records what it was shown.",
+        "Box-loop results are in `localization`, not `detail`.",
+    ),
+)
+
+
+@result_spec(LLM_RESULT)
 async def evaluate(c: CriterionInput, ctx: DocumentContext) -> Outcome:
     """Score ``c`` with one model call; locate it when ``options.boxes``."""
     return await evaluate_with(c.name, c.resolved_options(), ctx)
 
 
+@result_spec(LLM_RESULT)
 async def evaluate_with(name: str, opts: dict, ctx: DocumentContext) -> Outcome:
     """One scoring call under RESOLVED llm options, then the loop if asked.
 

@@ -50,11 +50,64 @@ from common.vision import Region
 
 from analysis.context import DocumentContext, DocumentGroup, JoinedText, document_text_file
 from analysis.outcome import Outcome
-from analysis.result_specs import with_metric
+from analysis.result_specs import (
+    AGGREGATE_FIELD,
+    METRIC_FIELD,
+    VALUE_FIELD,
+    FieldSpec,
+    ResultSpec,
+    result_spec,
+    with_metric,
+)
 from api.schemas import CriterionInput
 from config import FUZZY_CREDIT_FLOOR, TEXT_REGION_MAX_HITS
 from logger import logger
 from utils import verdict_from_score as _verdict_from_score
+
+
+# The detail a `text` result carries — the match record — declared here,
+# beside `_detail` / `_no_text_detail` and the aggregator's sum (which builds
+# the same record), and registered by type (analysis.result_specs). Checked
+# against real output by unit-tests/classifier/test_result_specs.py.
+TEXT_RESULT = ResultSpec(
+    type="text",
+    metric="count",
+    metric_from="detail",
+    fields={
+        "metric": METRIC_FIELD,
+        "value": VALUE_FIELD,
+        "found": FieldSpec("Whether count reached min_count", "boolean"),
+        "count": FieldSpec("Hits found (summed across members under `sum`)", "integer"),
+        "best_ratio": FieldSpec(
+            "Best similarity seen, 0-1 — 1.0 for a literal/regex hit", "number",
+        ),
+        "mode": FieldSpec("The match mode used", "string", stable=True),
+        "pattern": FieldSpec("What was searched for", "string", stable=True),
+        "snippets": FieldSpec("Up to 8 context excerpts around the hits", "array"),
+        "searched_chars": FieldSpec("Characters searched", "integer"),
+        "case_sensitive": FieldSpec("Whether matching was case-sensitive", "boolean", stable=True),
+        "min_count": FieldSpec("Hits required to PASS", "integer", stable=True),
+        "fuzzy_threshold": FieldSpec(
+            "Similarity a fuzzy window must reach; null for other modes", "number", stable=True,
+        ),
+        "text_source": FieldSpec(
+            "native | ocr | none — or `mixed` when summed across members that differ",
+            "string",
+        ),
+        "scope": FieldSpec(
+            "`document` when the pages were searched joined", "string",
+            stable=True, when="options.scope is document",
+        ),
+        "separator": FieldSpec(
+            "What joined the pages", "string", stable=True, when="options.scope is document",
+        ),
+        "items_with_hits": FieldSpec(
+            "Items the hits landed on", "array", when="options.scope is document",
+        ),
+        "aggregate": AGGREGATE_FIELD,
+    },
+    notes=("The full text searched is the `text.<key>.json` artifact the result links to.",),
+)
 
 
 def _confidence(layer: TextLayer) -> int:
@@ -162,6 +215,7 @@ def _no_text_detail(opts: dict, source: str) -> dict:
     )
 
 
+@result_spec(TEXT_RESULT)
 async def evaluate(c: CriterionInput, ctx: DocumentContext) -> Outcome:
     """Score one text criterion against this item's own text layer."""
     opts = c.resolved_options()
@@ -228,6 +282,7 @@ def _text_regions(view: Document, name: str, opts: dict, res) -> list[Region]:
 # ---------------------------------------------------------------------------
 
 
+@result_spec(TEXT_RESULT)
 async def evaluate_document(c: CriterionInput, group: DocumentGroup) -> Outcome:
     """Score one text criterion against a document's pages joined in order."""
     opts = c.resolved_options()

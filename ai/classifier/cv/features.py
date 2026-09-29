@@ -24,6 +24,15 @@ import cv2
 import numpy as np
 
 from config import (
+    CV_FACE_PASS_MIN_COUNT,
+    CV_SKY_MARGINAL_FROM,
+    CV_SKY_PASS_ABOVE,
+    CV_TEXT_MARGINAL_FROM,
+    CV_TEXT_PASS_ABOVE,
+    CV_VEGETATION_MARGINAL_FROM,
+    CV_VEGETATION_PASS_ABOVE,
+    CV_WATER_MARGINAL_FROM,
+    CV_WATER_PASS_ABOVE,
     CV_FACE_MIN_NEIGHBORS_HIGH,
     CV_FACE_MIN_NEIGHBORS_LOW,
     CV_FACE_MIN_SIZE,
@@ -60,9 +69,13 @@ _COVERAGE_THRESHOLDS = {
 }
 
 # Measurement parameters (hue ranges, cascade settings, block sizes, area and
-# texture floors) live in config.py § CV detectors. The scoring curves below —
-# how a coverage ratio becomes 1-10 — are each detector's definition and stay
-# next to the docstring that explains them.
+# texture floors) and the VERDICT CUT POINTS (CV_*_PASS_ABOVE /
+# CV_*_MARGINAL_FROM, CV_FACE_PASS_MIN_COUNT) live in config.py § CV detectors
+# — the cut points because every result reports them as detail.thresholds, and
+# the scoring branch and the report must read the same constant. The curve
+# SHAPE between the cut points (the slopes, the confidence formulas) is each
+# detector's definition, never reported, and stays next to the docstring that
+# explains it.
 
 
 @describes(DetectorSpec(
@@ -106,14 +119,14 @@ def detect_vegetation(image) -> dict:
     green_pixels = cv2.countNonZero(mask)
     ratio = green_pixels / total_pixels
 
-    if ratio > 0.15:
-        score = min(10, int(7 + (ratio - 0.15) / 0.05))
+    if ratio > CV_VEGETATION_PASS_ABOVE:
+        score = min(10, int(7 + (ratio - CV_VEGETATION_PASS_ABOVE) / 0.05))
         verdict, confidence = "PASS", min(95, int(60 + ratio * 150))
-    elif ratio >= 0.05:
-        score = int(4 + (ratio - 0.05) / 0.01)
+    elif ratio >= CV_VEGETATION_MARGINAL_FROM:
+        score = int(4 + (ratio - CV_VEGETATION_MARGINAL_FROM) / 0.01)
         verdict, confidence = "MARGINAL", 65
     else:
-        score = max(1, int(ratio / 0.05 * 3))
+        score = max(1, int(ratio / CV_VEGETATION_MARGINAL_FROM * 3))
         verdict, confidence = "FAIL", 75
 
     result = cv_result(
@@ -126,7 +139,8 @@ def detect_vegetation(image) -> dict:
             "green_px": green_pixels,
             "total_px": total_pixels,
         },
-        thresholds={"pass_above": 0.15, "marginal_from": 0.05},
+        thresholds={"pass_above": CV_VEGETATION_PASS_ABOVE,
+                    "marginal_from": CV_VEGETATION_MARGINAL_FROM},
         parameters={
             "hsv_lower": CV_VEGETATION_HSV_LOWER,
             "hsv_upper": CV_VEGETATION_HSV_UPPER,
@@ -185,14 +199,14 @@ def detect_sky(image) -> dict:
     sky_pixels = cv2.countNonZero(sky_mask)
     ratio = sky_pixels / total
 
-    if ratio > 0.60:
-        score = min(10, int(7 + (ratio - 0.60) / 0.10))
+    if ratio > CV_SKY_PASS_ABOVE:
+        score = min(10, int(7 + (ratio - CV_SKY_PASS_ABOVE) / 0.10))
         verdict, confidence = "PASS", min(90, int(70 + ratio * 20))
-    elif ratio >= 0.30:
-        score = int(4 + (ratio - 0.30) / 0.10)
+    elif ratio >= CV_SKY_MARGINAL_FROM:
+        score = int(4 + (ratio - CV_SKY_MARGINAL_FROM) / 0.10)
         verdict, confidence = "MARGINAL", 65
     else:
-        score = max(1, int(ratio / 0.30 * 3))
+        score = max(1, int(ratio / CV_SKY_MARGINAL_FROM * 3))
         verdict, confidence = "FAIL", 70
 
     result = cv_result(
@@ -211,7 +225,7 @@ def detect_sky(image) -> dict:
             "grey_px": cv2.countNonZero(grey_mask),
             "analysed_px": total,
         },
-        thresholds={"pass_above": 0.60, "marginal_from": 0.30},
+        thresholds={"pass_above": CV_SKY_PASS_ABOVE, "marginal_from": CV_SKY_MARGINAL_FROM},
         parameters={
             "top_fraction": CV_SKY_TOP_FRACTION,
             "blue_hsv_lower": CV_SKY_BLUE_HSV_LOWER,
@@ -300,11 +314,11 @@ def detect_faces(image) -> dict:
     # The boxes that produced the score become the regions. The second,
     # looser pass only runs when the strict one found nothing, so the regions
     # always describe the detections the reported score is based on.
-    boxes = faces_high if n_high >= 1 else ()
+    boxes = faces_high if n_high >= CV_FACE_PASS_MIN_COUNT else ()
     # None, not 0, when the loose pass never ran: "not looked" and "looked and
     # found none" are different facts.
     n_low = None
-    if n_high >= 1:
+    if n_high >= CV_FACE_PASS_MIN_COUNT:
         score, verdict, confidence = 10, "PASS", 85
         state, reason = "high_confidence", f"{n_high} face(s) detected (high confidence)"
     else:
@@ -315,7 +329,7 @@ def detect_faces(image) -> dict:
             minSize=CV_FACE_MIN_SIZE,
         )
         n_low = len(faces_low) if not isinstance(faces_low, tuple) else 0
-        if n_low >= 1:
+        if n_low >= CV_FACE_PASS_MIN_COUNT:
             score, verdict, confidence = 5, "MARGINAL", 55
             state = "low_confidence"
             reason = f"{n_low} possible face(s) detected (lower confidence)"
@@ -325,7 +339,8 @@ def detect_faces(image) -> dict:
             state, reason = "none", "No faces detected"
 
     regions = [
-        _box_region(x, y, w, h, confidence="high" if n_high >= 1 else "low")
+        _box_region(x, y, w, h,
+                    confidence="high" if n_high >= CV_FACE_PASS_MIN_COUNT else "low")
         for x, y, w, h in list(boxes)[:CV_REGION_MAX_PER_DETECTOR]
     ]
     result = cv_result(
@@ -335,11 +350,11 @@ def detect_faces(image) -> dict:
         metric="faces_count",
         measurements={
             # The faces the score is based on: the strict pass's, else the loose one's.
-            "faces_count": n_high if n_high >= 1 else (n_low or 0),
+            "faces_count": n_high if n_high >= CV_FACE_PASS_MIN_COUNT else (n_low or 0),
             "faces_high_count": n_high,
             "faces_low_count": n_low,
         },
-        thresholds={"pass_at_or_above": 1},
+        thresholds={"pass_at_or_above": CV_FACE_PASS_MIN_COUNT},
         parameters=parameters,
         state=state,
         regions=regions,
@@ -433,14 +448,14 @@ def detect_water(image) -> dict:
     regions = [region for _, region in qualifying[:CV_REGION_MAX_PER_DETECTOR]]
     ratio = qualifying_pixels / total_pixels
 
-    if ratio > 0.15:
-        score = min(10, int(7 + (ratio - 0.15) / 0.05))
+    if ratio > CV_WATER_PASS_ABOVE:
+        score = min(10, int(7 + (ratio - CV_WATER_PASS_ABOVE) / 0.05))
         verdict, confidence = "PASS", min(85, int(65 + ratio * 100))
-    elif ratio >= 0.05:
-        score = int(4 + (ratio - 0.05) / 0.033)
+    elif ratio >= CV_WATER_MARGINAL_FROM:
+        score = int(4 + (ratio - CV_WATER_MARGINAL_FROM) / 0.033)
         verdict, confidence = "MARGINAL", 60
     else:
-        score = max(1, int(ratio / 0.05 * 3))
+        score = max(1, int(ratio / CV_WATER_MARGINAL_FROM * 3))
         verdict, confidence = "FAIL", 70
 
     result = cv_result(
@@ -457,7 +472,8 @@ def detect_water(image) -> dict:
             "flat_count": flat,
             "rejected_textured_count": candidates - flat,
         },
-        thresholds={"pass_above": 0.15, "marginal_from": 0.05},
+        thresholds={"pass_above": CV_WATER_PASS_ABOVE,
+                    "marginal_from": CV_WATER_MARGINAL_FROM},
         parameters={
             "hsv_lower": CV_WATER_HSV_LOWER,
             "hsv_upper": CV_WATER_HSV_UPPER,
@@ -550,14 +566,14 @@ def detect_text(image) -> dict:
             for cells, bx, by, bw, bh in blobs[:CV_REGION_MAX_PER_DETECTOR]
         ]
 
-    if ratio > 0.10:
-        score = min(10, int(7 + (ratio - 0.10) / 0.05))
+    if ratio > CV_TEXT_PASS_ABOVE:
+        score = min(10, int(7 + (ratio - CV_TEXT_PASS_ABOVE) / 0.05))
         verdict, confidence = "PASS", min(85, int(65 + ratio * 150))
-    elif ratio >= 0.03:
-        score = int(4 + (ratio - 0.03) / 0.023)
+    elif ratio >= CV_TEXT_MARGINAL_FROM:
+        score = int(4 + (ratio - CV_TEXT_MARGINAL_FROM) / 0.023)
         verdict, confidence = "MARGINAL", 60
     else:
-        score = max(1, int(ratio / 0.03 * 3))
+        score = max(1, int(ratio / CV_TEXT_MARGINAL_FROM * 3))
         verdict, confidence = "FAIL", 75
 
     result = cv_result(
@@ -572,7 +588,7 @@ def detect_text(image) -> dict:
             "total_blocks_count": total_blocks,
             "text_regions_count": len(regions),
         },
-        thresholds={"pass_above": 0.10, "marginal_from": 0.03},
+        thresholds={"pass_above": CV_TEXT_PASS_ABOVE, "marginal_from": CV_TEXT_MARGINAL_FROM},
         parameters={
             "block_px": CV_TEXT_BLOCK_SIZE,
             "block_density": CV_TEXT_BLOCK_DENSITY,

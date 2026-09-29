@@ -27,9 +27,17 @@ from common.vision import Region
 
 from analysis.context import DocumentContext
 from analysis.outcome import EvaluationError, Outcome, skipped
-from analysis.result_specs import with_metric
+from analysis.result_specs import (
+    AGGREGATE_FIELD,
+    METRIC_FIELD,
+    VALUE_FIELD,
+    FieldSpec,
+    ResultSpec,
+    result_spec,
+    with_metric,
+)
 from api.schemas import CriterionInput
-from config import DETECTOR_STRONG_SCORE
+from config import DETAIL_FLOAT_DECIMALS, DETECTOR_STRONG_SCORE
 # Imported as a module, not by name: `detector_client.is_configured()` reads
 # DETECTOR_URL at call time, which is what lets a test point it at a stub.
 from detector import client as detector_client
@@ -37,11 +45,31 @@ from logger import logger
 from utils import verdict_from_score as _verdict_from_score
 
 
+# The detail a `detector` result carries — declared here, beside
+# `_score_from_detector`, and registered by type (analysis.result_specs).
+# Checked against real output by unit-tests/classifier/test_result_specs.py.
+DETECTOR_RESULT = ResultSpec(
+    type="detector",
+    metric="best_score",
+    metric_from="detail",
+    fields={
+        "metric": METRIC_FIELD,
+        "value": VALUE_FIELD,
+        "detector_matches": FieldSpec("Boxes found at or above min_score", "integer"),
+        "best_score": FieldSpec("The best box's confidence, 0-1; 0 when none", "number"),
+        "min_score": FieldSpec("The confidence floor used", "number", stable=True),
+        "aggregate": AGGREGATE_FIELD,
+    },
+)
+
+
+@result_spec(DETECTOR_RESULT)
 async def evaluate(c: CriterionInput, ctx: DocumentContext) -> Outcome:
     """Score ``c`` from the detector's boxes at its resolved threshold."""
     return await evaluate_label(c.name, ctx, c.resolved_options()["threshold"])
 
 
+@result_spec(DETECTOR_RESULT)
 async def evaluate_label(name: str, ctx: DocumentContext, threshold: float) -> Outcome:
     """Ask the detector about ``name`` on the page; score from the boxes.
 
@@ -122,10 +150,10 @@ def _score_from_detector(name: str, regions: list[Region], threshold: float) -> 
         detail=with_metric(
             {
                 "detector_matches": len(regions),
-                "best_score": round(best, 4),
+                "best_score": round(best, DETAIL_FLOAT_DECIMALS),
                 "min_score": threshold,
             },
-            "detector", round(best, 4),
+            "detector", round(best, DETAIL_FLOAT_DECIMALS),
         ),
         regions=list(regions),
     )

@@ -66,6 +66,7 @@ from analysis.outcome import Outcome
 from analysis.result_specs import aggregated_detail, member_value, with_metric
 from analysis.text_eval import score_text
 from api.schemas import CriterionInput
+from config import DETAIL_FLOAT_DECIMALS
 from utils import verdict_from_score
 
 
@@ -199,7 +200,8 @@ def aggregate_level(
             reason=f"mean of {len(scored)} {noun} score(s) = {mean:.2f}{tail}.",
             detail=aggregated_detail(
                 method=method, rule=rule, level=level, members=members,
-                value=round(sum(values) / len(values), 4) if values else None,
+                value=(round(sum(values) / len(values), DETAIL_FLOAT_DECIMALS)
+                       if values else None),
             ),
             regions=regions,
             localization=localization,
@@ -229,7 +231,7 @@ def _sum(c, scored, noun, level, rule, regions, localization, complete, tail) ->
     detail: dict[str, Any] = {
         "found": count >= max(1, opts["min_count"]),
         "count": count,
-        "best_ratio": round(best, 4),
+        "best_ratio": round(best, DETAIL_FLOAT_DECIMALS),
         "mode": opts["match"],
         "pattern": opts["pattern"],
         "snippets": snippets,

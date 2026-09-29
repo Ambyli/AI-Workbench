@@ -55,6 +55,8 @@ ai/classifier/
     context.py         DocumentContext: what every unit on ONE item shares, read-only; the
                        per-item OCR memo; DocumentGroup and the joined text of scope "document"
     outcome.py         Outcome — the one shape every evaluator returns
+    result_specs.py    the registry of each type's declared `detail` shape (declared beside each
+                       evaluator with @result_spec), the aggregate block, and the helpers
     cv_eval.py         the `cv` evaluator (and its fallback)
     text_eval.py       the `text` evaluator (one page, or a document's pages joined)
     llm_eval.py        the `llm` evaluator: one scoring call, then maybe the box loop
@@ -622,8 +624,10 @@ for the live list.
 
 ### Result details — the same shape on every type
 
-Every criterion's `detail` is declared, per type, and `GET /criterion-types`
-serves the declaration as each type's `result` block. Two keys are common to
+Every criterion's `detail` is declared, per type, beside the evaluator that
+builds it (`@result_spec` on `llm_eval` / `text_eval` / `detector_eval` /
+`cv_eval`), and `GET /criterion-types` serves the declaration as each type's
+`result` block. Two keys are common to
 every type, so the headline number reads the same whatever ran:
 
 | Type | `metric` | `value` is | Other `detail` keys |
@@ -655,7 +659,8 @@ level, `document n` at the documents level). A single member passes through
 with no `aggregate` block. Each `items[]` entry's `detail` is that unit's own,
 in the unaggregated shape. `unit-tests/classifier/test_result_specs.py` runs
 every type through the pipeline and fails if a `detail` carries a key its
-declaration does not list or misses one it requires.
+declaration does not list or misses one it requires; it also checks that each
+type's spec is the one its own evaluator declares.
 
 ### Dependencies
 

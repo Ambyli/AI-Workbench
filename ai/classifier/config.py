@@ -57,6 +57,9 @@ VISION_LLM_MAX_TOKENS: int = int(os.environ.get("VISION_LLM_MAX_TOKENS", "8192")
 # the LLM call.  Raise BLUR_THRESHOLD to be stricter about sharpness;
 # widen EXPOSURE_LOW/HIGH to accept a broader range of lighting conditions.
 BLUR_THRESHOLD: float = 100.0   # Laplacian variance below this → blurry → FAIL
+# The sharpness score rises linearly to 10 at this multiple of BLUR_THRESHOLD
+# (reported as detail.thresholds.full_score_at).
+BLUR_FULL_SCORE_MULTIPLE: float = 3.0
 EXPOSURE_LOW: float = 30.0      # Mean pixel intensity below this → underexposed → FAIL
 EXPOSURE_HIGH: float = 220.0    # Mean pixel intensity above this → overexposed → FAIL
 
@@ -322,13 +325,40 @@ LAYER_FILE_SUFFIXES: tuple[tuple[str, str], ...] = (
 )
 
 # ── CV detectors (cv/) ─────────────────────────────────────────────────────
-# Two kinds of number live in a detector. The MEASUREMENT parameters — which
+# Three kinds of number live in a detector. The MEASUREMENT parameters — which
 # hues count as green, how big a blue blob must be, the Haar cascade's search
 # settings, the text block size — are here, because they are what an operator
-# retunes for a new site or camera. The SCORING CURVES (how a coverage ratio
-# maps onto 1-10 and PASS/MARGINAL/FAIL) stay inside each detector next to the
-# docstring that explains them; they are the detector's definition, not its
-# configuration.
+# retunes for a new site or camera. The VERDICT CUT POINTS — the ratio above
+# which a detector PASSes and from which it is MARGINAL — are here too, because
+# every result REPORTS them (detail.thresholds): the scoring branch and the
+# report read the same constant, so a result can never state a threshold the
+# detector does not use. The CURVE SHAPE between the cut points (the slopes,
+# and the confidence formulas) stays inside each detector next to the
+# docstring that explains it; it is never reported, and it is the detector's
+# definition, not its configuration.
+#
+# Coverage cut points: PASS when the ratio is above *_PASS_ABOVE, MARGINAL
+# from *_MARGINAL_FROM up to it, FAIL below. The ratio is the detector's
+# headline metric (green_ratio, sky_ratio of the top band, water_ratio,
+# dense_block_ratio).
+CV_VEGETATION_PASS_ABOVE: float = 0.15
+CV_VEGETATION_MARGINAL_FROM: float = 0.05
+CV_SKY_PASS_ABOVE: float = 0.60
+CV_SKY_MARGINAL_FROM: float = 0.30
+CV_WATER_PASS_ABOVE: float = 0.15
+CV_WATER_MARGINAL_FROM: float = 0.05
+CV_TEXT_PASS_ABOVE: float = 0.10
+CV_TEXT_MARGINAL_FROM: float = 0.03
+# detect_faces PASSes (strict pass) or is MARGINAL (loose pass) at this many
+# faces or more.
+CV_FACE_PASS_MIN_COUNT: int = 1
+#
+# Decimal places every float in a structured result is rounded to — the cv
+# measurements (cv/result.py) and aggregated values (analysis/result_specs.py,
+# analysis/aggregate.py). Enough to compare two pages; not so many that a
+# job result is noise.
+DETAIL_FLOAT_DECIMALS: int = 4
+#
 #
 # detect_vegetation — HSV range for "green" (H 35-85 covers grass through
 # conifer) and the open/close kernel that removes speckle from the mask.

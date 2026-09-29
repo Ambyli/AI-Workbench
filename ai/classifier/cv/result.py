@@ -45,6 +45,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+from config import DETAIL_FLOAT_DECIMALS
+
 
 @dataclass(frozen=True)
 class Measurement:
@@ -102,11 +104,12 @@ def spec_of(fn: Callable) -> Optional[DetectorSpec]:
 
 
 def _clean(value: Any) -> Any:
-    """Plain JSON numbers: numpy scalars to Python, floats rounded to 4 dp."""
+    """Plain JSON numbers: numpy scalars to Python, floats rounded to
+    DETAIL_FLOAT_DECIMALS places."""
     if hasattr(value, "item") and not isinstance(value, (list, tuple, dict)):
         value = value.item()
     if isinstance(value, float):
-        return round(value, 4)
+        return round(value, DETAIL_FLOAT_DECIMALS)
     if isinstance(value, (list, tuple)):
         return [_clean(v) for v in value]
     if isinstance(value, dict):

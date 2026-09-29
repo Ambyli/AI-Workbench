@@ -1,6 +1,8 @@
 """Every criterion type's ``detail`` matches its declaration.
 
-``analysis.result_specs`` declares what each type's ``detail`` carries, and
+Each type's ``detail`` shape is declared beside its evaluator
+(``@result_spec`` in ``analysis.llm_eval`` / ``text_eval`` / ``detector_eval``
+/ ``cv_eval``) and registered by type in ``analysis.result_specs``;
 ``GET /criterion-types`` serves it as each type's ``result`` block. This file
 runs real jobs through ``analysis.analyze_document`` — every type, the edge
 paths (no text to search, a detector that finds nothing, ``score: false``),
@@ -29,7 +31,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import analysis
-from analysis.result_specs import AGGREGATE_BLOCK, SPECS
+from analysis.result_specs import AGGREGATE_BLOCK, specs
 from api.schemas import CriterionInput
 from llm import client as llm_client
 
@@ -82,7 +84,7 @@ def detector(monkeypatch):
 
 def _check(detail, method: str, *, score=None, scored=True, aggregated=False):
     """Assert one ``detail`` matches its type's declaration."""
-    spec = SPECS[method]
+    spec = specs()[method]
     assert isinstance(detail, dict), detail
     keys = set(detail)
     assert keys <= set(spec.fields), (method, sorted(keys - set(spec.fields)))
@@ -237,7 +239,7 @@ def test_criterion_types_serves_each_result_shape():
 
     with TestClient(main.app) as client:
         body = client.get("/criterion-types").json()
-    for type_, spec in SPECS.items():
+    for type_, spec in specs().items():
         result = body["types"][type_]["result"]
         assert result["metric"] == spec.metric
         assert set(result["fields"]) == set(spec.fields)
@@ -246,3 +248,45 @@ def test_criterion_types_serves_each_result_shape():
     assert body["types"]["text"]["result"]["fields"]["pattern"]["stable"] is True
     assert body["types"]["text"]["result"]["fields"]["scope"]["when"]
     assert set(body["aggregate_detail"]) == {"rule", "level", "from", "values"}
+
+
+# ---------------------------------------------------------------------------
+# The standard: declared beside the producer, registered by type
+# ---------------------------------------------------------------------------
+
+
+def test_each_type_is_declared_by_its_own_evaluator():
+    """Every scheduler type has a spec, and that spec is the one its own
+    evaluator module declares — not a copy defined somewhere else."""
+    from analysis import cv_eval, detector_eval, llm_eval, text_eval
+    from analysis.scheduler import EVALUATORS
+
+    declared = specs()
+    assert set(declared) == set(EVALUATORS)
+    for type_, module in {"llm": llm_eval, "text": text_eval,
+                          "detector": detector_eval, "cv": cv_eval}.items():
+        assert module.evaluate.result_spec is declared[type_]
+    # Every public entry point that produces a type's detail carries its spec.
+    assert llm_eval.evaluate_with.result_spec is declared["llm"]
+    assert text_eval.evaluate_document.result_spec is declared["text"]
+    assert detector_eval.evaluate_label.result_spec is declared["detector"]
+
+
+def test_a_second_different_spec_for_a_type_is_refused():
+    from analysis.result_specs import (AGGREGATE_FIELD, METRIC_FIELD, VALUE_FIELD,
+                                       ResultSpec, register)
+
+    impostor = ResultSpec(type="text", metric="value", metric_from="detail",
+                          fields={"metric": METRIC_FIELD, "value": VALUE_FIELD,
+                                  "aggregate": AGGREGATE_FIELD})
+    with pytest.raises(ValueError, match="already registered"):
+        register(impostor)
+    register(specs()["text"])  # the same object again is fine
+
+
+def test_a_spec_missing_the_common_fields_is_refused():
+    from analysis.result_specs import FieldSpec, ResultSpec
+
+    with pytest.raises(ValueError, match="every type declares"):
+        ResultSpec(type="x", metric="n", metric_from="detail",
+                   fields={"n": FieldSpec("n", "integer")})

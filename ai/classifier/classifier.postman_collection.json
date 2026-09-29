@@ -124,7 +124,7 @@
             "cv-detectors"
           ]
         },
-        "description": "Every registered OpenCV detector name, grouped by the function behind it — the names a `type: \"cv\"` criterion is matched against (exact, then difflib at CV_NAME_FUZZY_CUTOFF 0.8). A name that matches none uses the criterion's `options.fallback`. Returns `{detectors: [{function, names}], total_names}`. No errors."
+        "description": "Every registered OpenCV detector name, grouped by the function behind it — the names a `type: \"cv\"` criterion is matched against (exact, then difflib at CV_NAME_FUZZY_CUTOFF 0.8). A name that matches none uses the criterion's `options.fallback`. Returns `{detectors: [{function, names, technique, metric, measurements, thresholds, parameters, states, regions}], total_names}` — each detector's aliases plus the shape of the `detail` it returns: `metric` (the headline key), `measurements` (every key, each `{unit, description}`; units `ratio` 0-1, `px` working-image pixels, `count`, `variance`, `intensity` 0-255), `thresholds` (key → what it decides), `parameters` (keys), `states` (value → meaning; `{}` when the detector has none) and `regions` (what its regions are, or null). Test-checked against the detectors' real output. No errors. See API.md § `GET /cv-detectors`."
       },
       "response": []
     },

@@ -1445,7 +1445,12 @@ curl http://localhost:4001/v1/classifier/hints -H "Authorization: Bearer sk-1234
 
 ### `GET /cv-detectors`
 
-Returns all registered CV detector functions and their name aliases.
+Returns every registered OpenCV detector: its name aliases, and the shape
+of the `detail` it returns — the headline `metric`, every `measurements` key
+with its unit and meaning, the `thresholds` and `parameters` keys, the
+possible `state` values, and what its regions are. See
+[§ Built-in `cv` detector names](#built-in-cv-detector-names) for how a
+result uses them.
 
 ```bash
 curl http://localhost:4001/v1/classifier/cv-detectors -H "Authorization: Bearer sk-1234"
@@ -1454,12 +1459,56 @@ curl http://localhost:4001/v1/classifier/cv-detectors -H "Authorization: Bearer 
 ```json
 {
   "detectors": [
-    {"function": "check_blur",        "names": ["is blurry", "is sharp", "sharpness"]},
-    {"function": "detect_vegetation", "names": ["has greenery", "has plants", "has trees", "has vegetation"]}
+    {
+      "function": "check_exposure",
+      "names": ["exposure", "is exposed", "proper exposure"],
+      "technique": "Mean pixel intensity",
+      "metric": "mean_intensity",
+      "measurements": {
+        "mean_intensity": {"unit": "intensity",
+                           "description": "Mean greyscale value of the page, 0 (black) to 255 (white)"}
+      },
+      "thresholds": {"normal_min": "below this mean the page is underexposed (FAIL)",
+                     "normal_max": "above this mean the page is overexposed (FAIL)"},
+      "parameters": [],
+      "states": {"underexposed": "mean below normal_min",
+                 "normal": "mean within normal_min..normal_max (PASS)",
+                 "overexposed": "mean above normal_max"},
+      "regions": null
+    },
+    {
+      "function": "detect_water",
+      "names": ["has pool", "has swimming pool", "has water"],
+      "technique": "Blue/teal hue + flat-texture",
+      "metric": "water_ratio",
+      "measurements": {
+        "water_ratio": {"unit": "ratio", "description": "Share of the page in blue blobs that passed the flat-texture test"},
+        "rejected_textured_count": {"unit": "count", "description": "Candidates rejected as too textured — a blue car, a shirt"},
+        "…": "…"
+      },
+      "thresholds": {"pass_above": "…", "marginal_from": "…"},
+      "parameters": ["hsv_lower", "hsv_upper", "min_contour_area_px", "max_texture_variance"],
+      "states": {},
+      "regions": "polygons of the qualifying (flat) blobs"
+    }
   ],
   "total_names": 20
 }
 ```
+
+| Field | Meaning |
+|---|---|
+| `metric` | The key a result's `detail.metric` / `detail.value` names — always one of `measurements` |
+| `measurements` | Every key the detector's `detail.measurements` carries, each with a `unit` — `ratio` (0-1), `px` (working-image pixels), `count`, `variance` or `intensity` (0-255) — and a `description` |
+| `thresholds` | Each `detail.thresholds` key and what it decides |
+| `parameters` | The `detail.parameters` keys (config values the detector measured with) |
+| `states` | Each possible `detail.state` value and its meaning; `{}` for a detector with no categorical outcome, whose results carry no `state` |
+| `regions` | What the detector's regions are, or `null` for a whole-page measurement that never boxes anything |
+
+The declarations live beside each detector (`cv.result.describes`), and a
+test runs every detector and fails if its real output uses a key or state
+its declaration does not list — so this endpoint describes exactly what
+`POST /assess` returns.
 
 ---
 

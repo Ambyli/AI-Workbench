@@ -28,12 +28,77 @@ their unit: ``*_ratio`` is 0-1, ``*_px`` is pixels, ``*_count`` a count.
 Pixel figures are in the WORKING image the detector was handed (≤1000 px on
 the long side); ``analysis.cv_eval`` adds that frame as ``detail.image``.
 
-Process flow position: imported by ``cv.quality`` and ``cv.features``.
+What each detector returns is also DECLARED, next to it, with the
+``@describes`` decorator: its technique, headline metric, every measurement
+key (unit and meaning), threshold and parameter keys, and its possible
+states. ``GET /cv-detectors`` serves those declarations, and
+``unit-tests/classifier/test_cv_measurements.py`` runs every detector and
+fails if its real output uses a key or state its declaration does not list —
+so the endpoint cannot drift from the code.
+
+Process flow position: imported by ``cv.quality`` and ``cv.features``; the
+specs are read by ``api.introspection``.
 """
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from dataclasses import dataclass, field
+from typing import Any, Callable, Optional
+
+
+@dataclass(frozen=True)
+class Measurement:
+    """One ``detail.measurements`` key: its unit and what it counts."""
+
+    unit: str            # "ratio" (0-1) | "px" | "count" | "variance" | "intensity"
+    description: str
+
+
+@dataclass(frozen=True)
+class DetectorSpec:
+    """What a detector's ``detail`` contains, declared beside the detector."""
+
+    technique: str
+    metric: str
+    measurements: dict[str, Measurement]
+    thresholds: dict[str, str] = field(default_factory=dict)   # key → meaning
+    parameters: tuple[str, ...] = ()
+    states: dict[str, str] = field(default_factory=dict)       # state → meaning
+    regions: Optional[str] = None                              # what its regions are, or None
+
+    def __post_init__(self) -> None:
+        if self.metric not in self.measurements:
+            raise ValueError(f"metric {self.metric!r} is not one of the declared measurements")
+
+    def as_dict(self) -> dict[str, Any]:
+        """The JSON ``GET /cv-detectors`` serves for this detector."""
+        return {
+            "technique": self.technique,
+            "metric": self.metric,
+            "measurements": {
+                key: {"unit": m.unit, "description": m.description}
+                for key, m in self.measurements.items()
+            },
+            "thresholds": dict(self.thresholds),
+            "parameters": list(self.parameters),
+            "states": dict(self.states),
+            "regions": self.regions,
+        }
+
+
+def describes(spec: DetectorSpec) -> Callable[[Callable], Callable]:
+    """Attach ``spec`` to a detector function as ``fn.spec``; returns it unchanged."""
+
+    def attach(fn: Callable) -> Callable:
+        fn.spec = spec  # type: ignore[attr-defined]
+        return fn
+
+    return attach
+
+
+def spec_of(fn: Callable) -> Optional[DetectorSpec]:
+    """The declared spec of a detector, or None for one that declares none."""
+    return getattr(fn, "spec", None)
 
 
 def _clean(value: Any) -> Any:

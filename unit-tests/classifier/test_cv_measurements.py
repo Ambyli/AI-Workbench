@@ -91,6 +91,79 @@ def test_every_registered_detector_is_structured(fn):
     json.dumps(detail)
 
 
+# ---------------------------------------------------------------------------
+# The declared specs (GET /cv-detectors) match what the detectors return
+# ---------------------------------------------------------------------------
+
+# Images chosen to drive each detector down different branches, so a key or
+# state that only appears on one branch is still checked.
+_SPEC_IMAGES = [
+    _flat(5), _flat(128), _flat(250), _noise(), _stripes(),
+    _bgr(40, 160, 40), _bgr(200, 150, 30), _bgr(230, 180, 120),
+]
+
+
+@pytest.mark.parametrize("fn", sorted(set(REGISTRY.values()), key=lambda f: f.__name__))
+def test_declared_spec_matches_real_output(fn):
+    """Every key and state a detector emits is declared, and every declared
+    measurement / threshold / parameter key is emitted — so the endpoint that
+    serves the spec cannot drift from the code."""
+    from cv.result import spec_of
+
+    spec = spec_of(fn)
+    assert spec is not None, f"{fn.__name__} declares no spec"
+    seen_states = set()
+    for image in _SPEC_IMAGES:
+        detail = fn(image)["detail"]
+        assert detail["metric"] == spec.metric
+        assert set(detail["measurements"]) == set(spec.measurements), fn.__name__
+        assert set(detail["thresholds"]) == set(spec.thresholds), fn.__name__
+        assert set(detail["parameters"]) == set(spec.parameters), fn.__name__
+        if "state" in detail:
+            assert detail["state"] in spec.states, (fn.__name__, detail["state"])
+            seen_states.add(detail["state"])
+        else:
+            assert not spec.states, f"{fn.__name__} declares states but returned none"
+    # A detector with states must have hit at least one of them here.
+    assert not spec.states or seen_states
+
+
+def test_exposure_hits_all_three_declared_states():
+    from cv.result import spec_of
+
+    seen = {check_exposure(img)["detail"]["state"] for img in (_flat(5), _flat(128), _flat(250))}
+    assert seen == set(spec_of(check_exposure).states)
+
+
+def test_units_are_from_the_documented_vocabulary():
+    from cv.result import spec_of
+
+    allowed = {"ratio", "px", "count", "variance", "intensity"}
+    for fn in set(REGISTRY.values()):
+        for key, m in spec_of(fn).measurements.items():
+            assert m.unit in allowed, (fn.__name__, key, m.unit)
+            assert m.description
+
+
+def test_cv_detectors_endpoint_lists_measurements_and_states(client):
+    body = client.get("/cv-detectors").json()
+    by_fn = {d["function"]: d for d in body["detectors"]}
+    assert set(by_fn) == {fn.__name__ for fn in REGISTRY.values()}
+    for d in by_fn.values():
+        assert {"names", "technique", "metric", "measurements", "thresholds",
+                "parameters", "states", "regions"} <= set(d)
+        assert d["metric"] in d["measurements"]
+        for m in d["measurements"].values():
+            assert set(m) == {"unit", "description"}
+    assert by_fn["check_exposure"]["states"].keys() == {"underexposed", "normal", "overexposed"}
+    assert set(by_fn["detect_faces"]["states"]) == {"high_confidence", "low_confidence",
+                                                     "none", "unavailable"}
+    assert by_fn["check_blur"]["states"] == {} and by_fn["check_blur"]["regions"] is None
+    assert by_fn["detect_water"]["measurements"]["rejected_textured_count"]["unit"] == "count"
+    assert "has pool" in by_fn["detect_water"]["names"]
+    assert body["total_names"] == len(REGISTRY)
+
+
 def test_a_metric_that_was_not_measured_is_a_bug():
     with pytest.raises(KeyError):
         cv_result(detector="x", score=1, verdict="FAIL", confidence=0, reason="r",

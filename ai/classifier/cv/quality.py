@@ -19,10 +19,23 @@ import cv2
 import numpy as np
 
 from config import BLUR_THRESHOLD, EXPOSURE_HIGH, EXPOSURE_LOW
-from cv.result import cv_result
+from cv.result import DetectorSpec, Measurement, cv_result, describes
 from logger import logger
 
 
+@describes(DetectorSpec(
+    technique="Laplacian variance",
+    metric="laplacian_variance",
+    measurements={
+        "laplacian_variance": Measurement(
+            "variance", "Variance of the Laplacian of the greyscale page — higher is sharper"
+        ),
+    },
+    thresholds={
+        "pass_at_or_above": "PASS at or above this variance",
+        "full_score_at": "the variance at which the score reaches 10",
+    },
+))
 def check_blur(image) -> dict:
     """Measure image sharpness using the Laplacian operator.
 
@@ -71,6 +84,24 @@ def check_blur(image) -> dict:
     return result
 
 
+@describes(DetectorSpec(
+    technique="Mean pixel intensity",
+    metric="mean_intensity",
+    measurements={
+        "mean_intensity": Measurement(
+            "intensity", "Mean greyscale value of the page, 0 (black) to 255 (white)"
+        ),
+    },
+    thresholds={
+        "normal_min": "below this mean the page is underexposed (FAIL)",
+        "normal_max": "above this mean the page is overexposed (FAIL)",
+    },
+    states={
+        "underexposed": "mean below normal_min",
+        "normal": "mean within normal_min..normal_max (PASS)",
+        "overexposed": "mean above normal_max",
+    },
+))
 def check_exposure(image) -> dict:
     """Check overall image exposure via mean pixel intensity.
 

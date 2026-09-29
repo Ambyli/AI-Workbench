@@ -53,6 +53,7 @@ from config import (
     TEXT_CHAR_BUDGET,
 )
 from cv import REGISTRY
+from cv.result import spec_of
 from detector import client as detector_client
 from logger import logger
 
@@ -94,12 +95,20 @@ def list_cv_detectors():
     logger.debug("list_cv_detectors: building detector map from %d registry entries", len(REGISTRY))
 
     grouped: dict[str, list[str]] = {}
+    functions: dict[str, object] = {}
     for name, fn in REGISTRY.items():
         fn_name = fn.__name__
         grouped.setdefault(fn_name, []).append(name)
+        functions[fn_name] = fn
 
+    # Each detector's declared result shape (cv.result.describes): what its
+    # `detail` carries. Test-checked against the detectors' real output.
     detectors = [
-        {"function": fn_name, "names": sorted(names)}
+        {
+            "function": fn_name,
+            "names": sorted(names),
+            **(spec.as_dict() if (spec := spec_of(functions[fn_name])) else {}),
+        }
         for fn_name, names in sorted(grouped.items())
     ]
 

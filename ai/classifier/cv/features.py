@@ -50,8 +50,14 @@ from config import (
     CV_WATER_MIN_CONTOUR_AREA_PX,
 )
 from cv.regions import _box_region, _mask_regions
-from cv.result import cv_result
+from cv.result import DetectorSpec, Measurement, cv_result, describes
 from logger import logger
+
+# The coverage detectors share their threshold vocabulary.
+_COVERAGE_THRESHOLDS = {
+    "pass_above": "PASS when the ratio is above this",
+    "marginal_from": "MARGINAL from this ratio up to pass_above; FAIL below it",
+}
 
 # Measurement parameters (hue ranges, cascade settings, block sizes, area and
 # texture floors) live in config.py § CV detectors. The scoring curves below —
@@ -59,6 +65,18 @@ from logger import logger
 # next to the docstring that explains them.
 
 
+@describes(DetectorSpec(
+    technique="HSV green masking",
+    metric="green_ratio",
+    measurements={
+        "green_ratio": Measurement("ratio", "Share of the page's pixels inside the green mask"),
+        "green_px": Measurement("px", "Pixels inside the green mask"),
+        "total_px": Measurement("px", "Pixels in the page"),
+    },
+    thresholds=_COVERAGE_THRESHOLDS,
+    parameters=("hsv_lower", "hsv_upper", "morph_kernel_px"),
+    regions="polygons of the green mask",
+))
 def detect_vegetation(image) -> dict:
     """Detect green vegetation (trees, grass, shrubs) via HSV color masking.
 
@@ -122,6 +140,21 @@ def detect_vegetation(image) -> dict:
     return result
 
 
+@describes(DetectorSpec(
+    technique="Upper-region blue/grey analysis",
+    metric="sky_ratio",
+    measurements={
+        "sky_ratio": Measurement("ratio", "Share of the analysed top band that is sky-coloured"),
+        "sky_px": Measurement("px", "Sky-coloured pixels in the band (blue or grey)"),
+        "blue_px": Measurement("px", "Pixels matching the clear-blue range"),
+        "grey_px": Measurement("px", "Pixels matching the overcast-grey range"),
+        "analysed_px": Measurement("px", "Pixels in the top band (top_fraction of the page)"),
+    },
+    thresholds=_COVERAGE_THRESHOLDS,
+    parameters=("top_fraction", "blue_hsv_lower", "blue_hsv_upper",
+                "grey_hsv_lower", "grey_hsv_upper"),
+    regions="polygons of the sky mask in the top band",
+))
 def detect_sky(image) -> dict:
     """Detect sky in the upper portion of the image via blue/grey HSV analysis.
 
@@ -196,6 +229,30 @@ def detect_sky(image) -> dict:
     return result
 
 
+@describes(DetectorSpec(
+    technique="OpenCV Haar cascade",
+    metric="faces_count",
+    measurements={
+        "faces_count": Measurement(
+            "count", "Faces the score is based on: the strict pass's, else the loose pass's"
+        ),
+        "faces_high_count": Measurement(
+            "count", "Faces found by the strict pass (min_neighbors_high); null when unavailable"
+        ),
+        "faces_low_count": Measurement(
+            "count", "Faces found by the loose pass (min_neighbors_low); null when it did not run"
+        ),
+    },
+    thresholds={"pass_at_or_above": "PASS at or above this many strict-pass faces"},
+    parameters=("scale_factor", "min_neighbors_high", "min_neighbors_low", "min_size_px"),
+    states={
+        "high_confidence": "the strict pass found at least one face (PASS)",
+        "low_confidence": "only the loose pass found a face (MARGINAL)",
+        "none": "neither pass found a face (FAIL)",
+        "unavailable": "the Haar cascade file is missing (FAIL, confidence 0)",
+    },
+    regions="one box per detected face",
+))
 def detect_faces(image) -> dict:
     """Detect frontal human faces using OpenCV's Haar cascade classifier.
 
@@ -292,6 +349,24 @@ def detect_faces(image) -> dict:
     return result
 
 
+@describes(DetectorSpec(
+    technique="Blue/teal hue + flat-texture",
+    metric="water_ratio",
+    measurements={
+        "water_ratio": Measurement("ratio", "Share of the page in blue blobs that passed the flat-texture test"),
+        "water_px": Measurement("px", "Area of those qualifying blobs"),
+        "total_px": Measurement("px", "Pixels in the page"),
+        "blue_blobs_count": Measurement("count", "Blue/teal blobs found, of any size"),
+        "candidates_count": Measurement("count", "Blobs large enough to test (min_contour_area_px)"),
+        "flat_count": Measurement("count", "Candidates flat enough to be water"),
+        "rejected_textured_count": Measurement(
+            "count", "Candidates rejected as too textured — a blue car, a shirt"
+        ),
+    },
+    thresholds=_COVERAGE_THRESHOLDS,
+    parameters=("hsv_lower", "hsv_upper", "min_contour_area_px", "max_texture_variance"),
+    regions="polygons of the qualifying (flat) blobs",
+))
 def detect_water(image) -> dict:
     """Detect water or pools via blue/teal color masking + flat-texture validation.
 
@@ -396,6 +471,19 @@ def detect_water(image) -> dict:
     return result
 
 
+@describes(DetectorSpec(
+    technique="Sobel edge density per block",
+    metric="dense_block_ratio",
+    measurements={
+        "dense_block_ratio": Measurement("ratio", "Share of blocks whose edge density is above block_density"),
+        "dense_blocks_count": Measurement("count", "Blocks above block_density"),
+        "total_blocks_count": Measurement("count", "Blocks the page was divided into"),
+        "text_regions_count": Measurement("count", "Merged text regions returned as boxes"),
+    },
+    thresholds=_COVERAGE_THRESHOLDS,
+    parameters=("block_px", "block_density", "edge_threshold", "min_blocks_per_region"),
+    regions="boxes around merged runs of dense blocks — roughly one per paragraph or column",
+))
 def detect_text(image) -> dict:
     """Detect text regions via Sobel edge density analysis.
 

@@ -568,15 +568,47 @@ The exact text searched is not inlined — it is linked, as
 
 ### Built-in `cv` detector names
 
-| Names | Technique |
+| Names | Technique | `detail.metric` | Other `measurements` | `state` |
+|---|---|---|---|---|
+| `sharpness`, `is sharp`, `is blurry` | Laplacian variance | `laplacian_variance` | — | — |
+| `exposure`, `proper exposure`, `is exposed` | Mean pixel intensity | `mean_intensity` (0-255) | — | `underexposed` / `normal` / `overexposed` |
+| `has trees`, `has vegetation`, `has greenery`, `has plants` | HSV green masking | `green_ratio` | `green_px`, `total_px` | — |
+| `has sky` | Upper-region blue/grey analysis | `sky_ratio` (of the top band) | `sky_px`, `blue_px`, `grey_px`, `analysed_px` | — |
+| `has faces`, `has people`, `has person` | OpenCV Haar cascade | `faces_count` | `faces_high_count`, `faces_low_count` (null when the loose pass did not run) | `high_confidence` / `low_confidence` / `none` / `unavailable` |
+| `has water`, `has pool`, `has swimming pool` | Blue/teal hue + flat-texture | `water_ratio` | `water_px`, `total_px`, `blue_blobs_count`, `candidates_count`, `flat_count`, `rejected_textured_count` | — |
+| `has text`, `has text regions`, `has writing` | Sobel edge density per block | `dense_block_ratio` | `dense_blocks_count`, `total_blocks_count`, `text_regions_count` | — |
+
+**A `cv` result is structured.** The sentence a person reads is `reason`;
+the numbers are in `detail`, in the same shape for every detector:
+
+```json
+"sharpness": {
+  "status": "ok", "method": "cv", "score": 9, "verdict": "PASS", "confidence": 100,
+  "reason": "Laplacian variance: 412.3 (threshold: 100.0)",
+  "detail": {
+    "detector": "check_blur",
+    "metric": "laplacian_variance", "value": 412.3141,
+    "measurements": {"laplacian_variance": 412.3141},
+    "thresholds": {"pass_at_or_above": 100.0, "full_score_at": 300.0},
+    "parameters": {},
+    "image": {"width": 1000, "height": 750, "frame": "working", "working_scale": 0.2334}
+  }
+}
+```
+
+| Key | What it is |
 |---|---|
-| `sharpness`, `is sharp`, `is blurry` | Laplacian variance |
-| `exposure`, `proper exposure`, `is exposed` | Mean pixel intensity |
-| `has trees`, `has vegetation`, `has greenery`, `has plants` | HSV green masking |
-| `has sky` | Upper-region blue/grey analysis |
-| `has faces`, `has people`, `has person` | OpenCV Haar cascade |
-| `has water`, `has pool`, `has swimming pool` | Blue/teal hue + flat-texture |
-| `has text`, `has text regions`, `has writing` | Sobel edge density per block |
+| `detector` | The OpenCV function that ran (`GET /cv-detectors` maps names to it) |
+| `metric`, `value` | The headline number and its name — the same two keys on every detector, so pages and jobs compare without knowing which detector ran. Always equal to `measurements[metric]` |
+| `measurements` | Everything the detector counted. Names carry their unit: `*_ratio` is 0-1, `*_px` pixels, `*_count` a count. Floats are rounded to 4 decimal places |
+| `thresholds` | The lines that decide the verdict: `pass_above` / `marginal_from` for the coverage detectors, `pass_at_or_above` / `full_score_at` for sharpness, `normal_min` / `normal_max` for exposure |
+| `parameters` | The config values it measured with — HSV ranges, block sizes, cascade settings — so a result says how it was produced |
+| `state` | A categorical outcome, where the detector has one |
+| `image` | The frame every `*_px` figure is in: the **working** image the detector saw (≤1000 px on the long side), not the original page. Regions are rescaled to original pixels; measurements are not |
+
+Per-item entries in the criterion's `items` carry the same `detail`. A
+`cv` criterion answered by its `fallback` has the detector's or the model's
+`detail` shape instead, and `method` says which.
 
 Names are matched exactly (case-insensitive), then by `difflib` at
 `CV_NAME_FUZZY_CUTOFF` (0.8) so typos still land — `has textt` → `has text`.

@@ -50,6 +50,7 @@ from config import (
     CV_WATER_MIN_CONTOUR_AREA_PX,
 )
 from cv.regions import _box_region, _mask_regions
+from cv.result import cv_result
 from logger import logger
 
 # Measurement parameters (hue ranges, cascade settings, block sizes, area and
@@ -97,13 +98,25 @@ def detect_vegetation(image) -> dict:
         score = max(1, int(ratio / 0.05 * 3))
         verdict, confidence = "FAIL", 75
 
-    result = {
-        "score": score, "verdict": verdict, "confidence": confidence,
-        "detail": f"Green coverage: {ratio:.1%} of image ({green_pixels:,} px)",
-        "method": "cv",
+    result = cv_result(
+        detector="detect_vegetation",
+        score=score, verdict=verdict, confidence=confidence,
+        reason=f"Green coverage: {ratio:.1%} of image ({green_pixels:,} px)",
+        metric="green_ratio",
+        measurements={
+            "green_ratio": ratio,
+            "green_px": green_pixels,
+            "total_px": total_pixels,
+        },
+        thresholds={"pass_above": 0.15, "marginal_from": 0.05},
+        parameters={
+            "hsv_lower": CV_VEGETATION_HSV_LOWER,
+            "hsv_upper": CV_VEGETATION_HSV_UPPER,
+            "morph_kernel_px": CV_VEGETATION_MORPH_KERNEL,
+        },
         # The same mask the ratio was measured from, as polygons.
-        "regions": _mask_regions(mask, image.shape),
-    }
+        regions=_mask_regions(mask, image.shape),
+    )
     logger.debug("detect_vegetation: returning score=%s verdict=%s ratio=%.3f regions=%d",
                  score, verdict, ratio, len(result["regions"]))
     return result
@@ -149,18 +162,35 @@ def detect_sky(image) -> dict:
         score = max(1, int(ratio / 0.30 * 3))
         verdict, confidence = "FAIL", 70
 
-    result = {
-        "score": score, "verdict": verdict, "confidence": confidence,
-        "detail": (
+    result = cv_result(
+        detector="detect_sky",
+        score=score, verdict=verdict, confidence=confidence,
+        reason=(
             f"Sky coverage (upper {CV_SKY_TOP_FRACTION:.0%}): {ratio:.1%} "
             f"({sky_pixels:,} px)"
         ),
-        "method": "cv",
+        metric="sky_ratio",
+        measurements={
+            # Of the analysed band, not the whole page.
+            "sky_ratio": ratio,
+            "sky_px": sky_pixels,
+            "blue_px": cv2.countNonZero(blue_mask),
+            "grey_px": cv2.countNonZero(grey_mask),
+            "analysed_px": total,
+        },
+        thresholds={"pass_above": 0.60, "marginal_from": 0.30},
+        parameters={
+            "top_fraction": CV_SKY_TOP_FRACTION,
+            "blue_hsv_lower": CV_SKY_BLUE_HSV_LOWER,
+            "blue_hsv_upper": CV_SKY_BLUE_HSV_UPPER,
+            "grey_hsv_lower": CV_SKY_GREY_HSV_LOWER,
+            "grey_hsv_upper": CV_SKY_GREY_HSV_UPPER,
+        },
         # The mask covers only the top CV_SKY_TOP_FRACTION of the page, so the contour
         # coordinates are already page-relative — no offset needed — but the
         # area floor is measured against that crop, not the whole image.
-        "regions": _mask_regions(sky_mask, sky_region.shape),
-    }
+        regions=_mask_regions(sky_mask, sky_region.shape),
+    )
     logger.debug("detect_sky: returning score=%s verdict=%s ratio=%.3f regions=%d",
                  score, verdict, ratio, len(result["regions"]))
     return result
@@ -183,11 +213,24 @@ def detect_faces(image) -> dict:
     cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
     face_cascade = cv2.CascadeClassifier(cascade_path)
 
+    parameters = {
+        "scale_factor": CV_FACE_SCALE_FACTOR,
+        "min_neighbors_high": CV_FACE_MIN_NEIGHBORS_HIGH,
+        "min_neighbors_low": CV_FACE_MIN_NEIGHBORS_LOW,
+        "min_size_px": list(CV_FACE_MIN_SIZE),
+    }
     if face_cascade.empty():
         logger.error("detect_faces: Haar cascade file not found at %s", cascade_path)
-        return {"score": 1, "verdict": "FAIL", "confidence": 0,
-                "detail": "Haar cascade file not found — face detection unavailable",
-                "method": "cv", "regions": []}
+        return cv_result(
+            detector="detect_faces",
+            score=1, verdict="FAIL", confidence=0,
+            reason="Haar cascade file not found — face detection unavailable",
+            metric="faces_count",
+            measurements={"faces_count": 0, "faces_high_count": None, "faces_low_count": None},
+            parameters=parameters,
+            state="unavailable",
+            regions=[],
+        )
 
     faces_high = face_cascade.detectMultiScale(
         gray,
@@ -201,9 +244,12 @@ def detect_faces(image) -> dict:
     # looser pass only runs when the strict one found nothing, so the regions
     # always describe the detections the reported score is based on.
     boxes = faces_high if n_high >= 1 else ()
+    # None, not 0, when the loose pass never ran: "not looked" and "looked and
+    # found none" are different facts.
+    n_low = None
     if n_high >= 1:
         score, verdict, confidence = 10, "PASS", 85
-        detail = f"{n_high} face(s) detected (high confidence)"
+        state, reason = "high_confidence", f"{n_high} face(s) detected (high confidence)"
     else:
         faces_low = face_cascade.detectMultiScale(
             gray,
@@ -214,18 +260,33 @@ def detect_faces(image) -> dict:
         n_low = len(faces_low) if not isinstance(faces_low, tuple) else 0
         if n_low >= 1:
             score, verdict, confidence = 5, "MARGINAL", 55
-            detail = f"{n_low} possible face(s) detected (lower confidence)"
+            state = "low_confidence"
+            reason = f"{n_low} possible face(s) detected (lower confidence)"
             boxes = faces_low
         else:
             score, verdict, confidence = 1, "FAIL", 80
-            detail = "No faces detected"
+            state, reason = "none", "No faces detected"
 
     regions = [
         _box_region(x, y, w, h, confidence="high" if n_high >= 1 else "low")
         for x, y, w, h in list(boxes)[:CV_REGION_MAX_PER_DETECTOR]
     ]
-    result = {"score": score, "verdict": verdict, "confidence": confidence,
-              "detail": detail, "method": "cv", "regions": regions}
+    result = cv_result(
+        detector="detect_faces",
+        score=score, verdict=verdict, confidence=confidence,
+        reason=reason,
+        metric="faces_count",
+        measurements={
+            # The faces the score is based on: the strict pass's, else the loose one's.
+            "faces_count": n_high if n_high >= 1 else (n_low or 0),
+            "faces_high_count": n_high,
+            "faces_low_count": n_low,
+        },
+        thresholds={"pass_at_or_above": 1},
+        parameters=parameters,
+        state=state,
+        regions=regions,
+    )
     logger.debug("detect_faces: returning score=%s verdict=%s regions=%d",
                  score, verdict, len(regions))
     return result
@@ -257,6 +318,10 @@ def detect_water(image) -> dict:
 
     qualifying_pixels = 0
     qualifying: list[tuple[float, dict]] = []
+    # How many blue blobs were big enough to test, and how many the
+    # flat-texture test threw out (a blue car, a shirt) — the part of the
+    # decision a bare coverage figure hides.
+    candidates = flat = 0
     for contour in contours:
         area = cv2.contourArea(contour)
         if area < CV_WATER_MIN_CONTOUR_AREA_PX:
@@ -265,7 +330,9 @@ def detect_water(image) -> dict:
         roi = gray[y:y + h, x:x + w]
         if roi.size == 0:
             continue
+        candidates += 1
         if cv2.Laplacian(roi, cv2.CV_64F).var() < CV_WATER_MAX_TEXTURE_VARIANCE:
+            flat += 1
             qualifying_pixels += area
             # Only the contours that passed the flat-texture test are
             # regions — a blue car is excluded from the score, so it must be
@@ -301,12 +368,29 @@ def detect_water(image) -> dict:
         score = max(1, int(ratio / 0.05 * 3))
         verdict, confidence = "FAIL", 70
 
-    result = {
-        "score": score, "verdict": verdict, "confidence": confidence,
-        "detail": f"Qualifying water coverage: {ratio:.1%} ({int(qualifying_pixels):,} px)",
-        "method": "cv",
-        "regions": regions,
-    }
+    result = cv_result(
+        detector="detect_water",
+        score=score, verdict=verdict, confidence=confidence,
+        reason=f"Qualifying water coverage: {ratio:.1%} ({int(qualifying_pixels):,} px)",
+        metric="water_ratio",
+        measurements={
+            "water_ratio": ratio,
+            "water_px": int(qualifying_pixels),
+            "total_px": total_pixels,
+            "blue_blobs_count": len(contours),
+            "candidates_count": candidates,
+            "flat_count": flat,
+            "rejected_textured_count": candidates - flat,
+        },
+        thresholds={"pass_above": 0.15, "marginal_from": 0.05},
+        parameters={
+            "hsv_lower": CV_WATER_HSV_LOWER,
+            "hsv_upper": CV_WATER_HSV_UPPER,
+            "min_contour_area_px": CV_WATER_MIN_CONTOUR_AREA_PX,
+            "max_texture_variance": CV_WATER_MAX_TEXTURE_VARIANCE,
+        },
+        regions=regions,
+    )
     logger.debug("detect_water: returning score=%s verdict=%s ratio=%.3f regions=%d",
                  score, verdict, ratio, len(regions))
     return result
@@ -388,13 +472,27 @@ def detect_text(image) -> dict:
         score = max(1, int(ratio / 0.03 * 3))
         verdict, confidence = "FAIL", 75
 
-    result = {
-        "score": score, "verdict": verdict, "confidence": confidence,
-        "detail": (f"High-density edge blocks: {high_density_blocks}/{total_blocks} "
-                   f"({ratio:.1%})"),
-        "method": "cv",
-        "regions": regions,
-    }
+    result = cv_result(
+        detector="detect_text",
+        score=score, verdict=verdict, confidence=confidence,
+        reason=(f"High-density edge blocks: {high_density_blocks}/{total_blocks} "
+                f"({ratio:.1%})"),
+        metric="dense_block_ratio",
+        measurements={
+            "dense_block_ratio": ratio,
+            "dense_blocks_count": high_density_blocks,
+            "total_blocks_count": total_blocks,
+            "text_regions_count": len(regions),
+        },
+        thresholds={"pass_above": 0.10, "marginal_from": 0.03},
+        parameters={
+            "block_px": CV_TEXT_BLOCK_SIZE,
+            "block_density": CV_TEXT_BLOCK_DENSITY,
+            "edge_threshold": CV_TEXT_EDGE_THRESHOLD,
+            "min_blocks_per_region": CV_TEXT_MIN_BLOCKS,
+        },
+        regions=regions,
+    )
     logger.debug("detect_text: returning score=%s verdict=%s ratio=%.3f regions=%d",
                  score, verdict, ratio, len(regions))
     return result

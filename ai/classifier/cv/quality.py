@@ -19,6 +19,7 @@ import cv2
 import numpy as np
 
 from config import BLUR_THRESHOLD, EXPOSURE_HIGH, EXPOSURE_LOW
+from cv.result import cv_result
 from logger import logger
 
 
@@ -40,21 +41,31 @@ def check_blur(image) -> dict:
         image: BGR numpy array (H×W×3) or grayscale (H×W).
 
     Returns:
-        Standard CV result dict.
+        The ``cv.result`` shape: metric ``laplacian_variance``; thresholds
+        ``pass_at_or_above`` (BLUR_THRESHOLD) and ``full_score_at`` (three
+        times it, where the score reaches 10).
     """
     logger.debug("check_blur: image shape=%s", image.shape)
 
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
     variance = float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
-    result = {
-        "criterion": "sharpness",
-        "score": min(10, int(10 * min(variance / (BLUR_THRESHOLD * 3), 1.0))),
-        "verdict": "PASS" if variance >= BLUR_THRESHOLD else "FAIL",
-        "confidence": 100,
-        "detail": f"Laplacian variance: {variance:.1f} (threshold: {BLUR_THRESHOLD})",
-        "method": "cv",
-    }
+    result = cv_result(
+        detector="check_blur",
+        # Floored at 1: scores are 1-10 everywhere in this service, and a flat
+        # or badly blurred page (variance under a tenth of full_score_at) used
+        # to score 0 — which then entered the weighted average as a zero.
+        score=max(1, min(10, int(10 * min(variance / (BLUR_THRESHOLD * 3), 1.0)))),
+        verdict="PASS" if variance >= BLUR_THRESHOLD else "FAIL",
+        confidence=100,
+        reason=f"Laplacian variance: {variance:.1f} (threshold: {BLUR_THRESHOLD})",
+        metric="laplacian_variance",
+        measurements={"laplacian_variance": variance},
+        thresholds={
+            "pass_at_or_above": BLUR_THRESHOLD,
+            "full_score_at": BLUR_THRESHOLD * 3,
+        },
+    )
     logger.debug("check_blur: returning score=%s verdict=%s variance=%.1f",
                  result["score"], result["verdict"], variance)
     return result
@@ -75,7 +86,9 @@ def check_exposure(image) -> dict:
         image: BGR numpy array (H×W×3) or grayscale (H×W).
 
     Returns:
-        Standard CV result dict.
+        The ``cv.result`` shape: metric ``mean_intensity`` (0-255), thresholds
+        ``normal_min`` / ``normal_max``, and ``state`` one of
+        ``underexposed`` / ``normal`` / ``overexposed``.
     """
     logger.debug("check_exposure: image shape=%s", image.shape)
 
@@ -83,18 +96,27 @@ def check_exposure(image) -> dict:
     mean = float(np.mean(gray))
 
     if mean < EXPOSURE_LOW:
-        result = {"criterion": "exposure", "score": 2, "verdict": "FAIL", "confidence": 100,
-                  "detail": f"Underexposed (mean: {mean:.1f}, min: {EXPOSURE_LOW})",
-                  "method": "cv"}
+        state, score, verdict = "underexposed", 2, "FAIL"
+        reason = f"Underexposed (mean: {mean:.1f}, min: {EXPOSURE_LOW})"
     elif mean > EXPOSURE_HIGH:
-        result = {"criterion": "exposure", "score": 2, "verdict": "FAIL", "confidence": 100,
-                  "detail": f"Overexposed (mean: {mean:.1f}, max: {EXPOSURE_HIGH})",
-                  "method": "cv"}
+        state, score, verdict = "overexposed", 2, "FAIL"
+        reason = f"Overexposed (mean: {mean:.1f}, max: {EXPOSURE_HIGH})"
     else:
+        state, verdict = "normal", "PASS"
         score = int(1 + 9 * (mean - EXPOSURE_LOW) / (EXPOSURE_HIGH - EXPOSURE_LOW))
-        result = {"criterion": "exposure", "score": score, "verdict": "PASS", "confidence": 100,
-                  "detail": f"Normal exposure (mean: {mean:.1f})",
-                  "method": "cv"}
+        reason = f"Normal exposure (mean: {mean:.1f})"
+
+    result = cv_result(
+        detector="check_exposure",
+        score=score,
+        verdict=verdict,
+        confidence=100,
+        reason=reason,
+        metric="mean_intensity",
+        measurements={"mean_intensity": mean},
+        thresholds={"normal_min": EXPOSURE_LOW, "normal_max": EXPOSURE_HIGH},
+        state=state,
+    )
 
     logger.debug("check_exposure: returning score=%s verdict=%s mean=%.1f",
                  result["score"], result["verdict"], mean)

@@ -67,8 +67,19 @@ async def evaluate(c: CriterionInput, ctx: DocumentContext) -> Outcome:
     result = dict(await asyncio.to_thread(detector, ctx.working_image))
     raw_regions = result.pop("regions", None) or []
     regions = _cv_regions(raw_regions, c.name, ctx.geometry) if ctx.geometry else []
+    # The frame every *_px measurement is in: the working image the detector
+    # saw, not the original page (regions are rescaled; measurements are not).
+    detail = dict(result.get("detail") or {})
+    height, width = ctx.working_image.shape[:2]
+    detail["image"] = {
+        "width": int(width),
+        "height": int(height),
+        "frame": "working",
+        "working_scale": ctx.geometry.working_scale if ctx.geometry else 1.0,
+    }
     logger.debug(
-        "cv_eval: '%s' score=%s regions=%d", c.name, result.get("score"), len(regions)
+        "cv_eval: '%s' score=%s %s=%s regions=%d",
+        c.name, result.get("score"), detail.get("metric"), detail.get("value"), len(regions),
     )
     return Outcome(
         method="cv",
@@ -76,7 +87,7 @@ async def evaluate(c: CriterionInput, ctx: DocumentContext) -> Outcome:
         verdict=result.get("verdict"),
         confidence=result.get("confidence"),
         reason=result.get("reason"),
-        detail=result.get("detail"),
+        detail=detail,
         regions=regions,
     )
 

@@ -1,0 +1,236 @@
+"""OpenCV detector results are structured: numbers in ``detail``, words in ``reason``.
+
+Every detector returns the ``cv.result`` shape — ``detail`` carries
+``detector`` / ``metric`` / ``value`` / ``measurements`` / ``thresholds`` /
+``parameters`` (and ``state`` where the outcome is categorical), ``reason``
+carries the sentence ``detail`` used to be. What is pinned here:
+
+  * the common keys, on every registered detector, and that ``value`` is
+    ``measurements[metric]`` — the one pair a consumer can rely on without
+    knowing which detector ran;
+  * each detector's own measurements on a synthetic image with a known
+    answer, so a number that is merely present but wrong is caught;
+  * everything is plain JSON (no numpy scalars leaking into a job result);
+  * through ``/assess``, the result carries ``detail.image`` — the working
+    frame the ``*_px`` figures are in — and the sentence in ``reason``.
+
+Run with::
+
+    UV_LINK_MODE=copy uv run --no-sync --with pytest --package classifier \\
+        python -m pytest unit-tests/classifier/test_cv_measurements.py -q -p no:cacheprovider
+"""
+
+from __future__ import annotations
+
+import json
+import time
+
+import cv2
+import numpy as np
+import pytest
+from fastapi.testclient import TestClient
+
+from config import BLUR_THRESHOLD, EXPOSURE_HIGH, EXPOSURE_LOW
+from cv import REGISTRY
+from cv.features import detect_faces, detect_sky, detect_text, detect_vegetation, detect_water
+from cv.quality import check_blur, check_exposure
+from cv.result import cv_result
+
+COMMON = {"detector", "metric", "value", "measurements", "thresholds", "parameters"}
+
+
+def _flat(value=128, w=400, h=300):
+    return np.full((h, w, 3), value, dtype=np.uint8)
+
+
+def _noise(w=400, h=300, seed=7):
+    return np.random.default_rng(seed).integers(0, 256, (h, w, 3), dtype=np.uint8)
+
+
+def _stripes(w=400, h=300, period=4):
+    """Fine black/white vertical stripes: dense edges everywhere."""
+    img = np.zeros((h, w, 3), dtype=np.uint8)
+    for x in range(0, w, period):
+        img[:, x:x + period // 2] = 255
+    return img
+
+
+def _bgr(b, g, r, w=400, h=300):
+    img = np.zeros((h, w, 3), dtype=np.uint8)
+    img[:] = (b, g, r)
+    return img
+
+
+def _assert_shape(result: dict, detector: str, metric: str) -> dict:
+    assert result["method"] == "cv"
+    assert isinstance(result["reason"], str) and result["reason"]
+    assert isinstance(result["score"], int) and 1 <= result["score"] <= 10
+    assert result["verdict"] in ("PASS", "MARGINAL", "FAIL")
+    detail = result["detail"]
+    assert COMMON <= set(detail)
+    assert detail["detector"] == detector and detail["metric"] == metric
+    assert detail["value"] == detail["measurements"][metric]
+    json.dumps(result.get("regions", []))
+    json.dumps(detail)  # plain JSON — no numpy scalars
+    return detail
+
+
+# ---------------------------------------------------------------------------
+# Every registered detector has the common shape
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("fn", sorted(set(REGISTRY.values()), key=lambda f: f.__name__))
+def test_every_registered_detector_is_structured(fn):
+    result = fn(_noise())
+    detail = result["detail"]
+    assert COMMON <= set(detail), fn.__name__
+    assert detail["detector"] == fn.__name__
+    assert detail["value"] == detail["measurements"][detail["metric"]]
+    assert isinstance(result["reason"], str)
+    json.dumps(detail)
+
+
+def test_a_metric_that_was_not_measured_is_a_bug():
+    with pytest.raises(KeyError):
+        cv_result(detector="x", score=1, verdict="FAIL", confidence=0, reason="r",
+                  metric="missing", measurements={"present": 1})
+
+
+def test_numpy_scalars_and_floats_are_normalised():
+    r = cv_result(detector="x", score=np.int64(5), verdict="MARGINAL", confidence=np.int32(60),
+                  reason="r", metric="m",
+                  measurements={"m": np.float64(0.123456789), "n": np.int64(3)},
+                  parameters={"range": (np.int64(1), 2.123456789)})
+    assert r["detail"]["measurements"] == {"m": 0.1235, "n": 3}
+    assert r["detail"]["parameters"] == {"range": [1, 2.1235]}
+    assert type(r["score"]) is int and type(r["confidence"]) is int
+
+
+# ---------------------------------------------------------------------------
+# Each detector's measurements mean what they say
+# ---------------------------------------------------------------------------
+
+
+def test_blur_flat_fails_and_noise_passes():
+    flat = _assert_shape(check_blur(_flat()), "check_blur", "laplacian_variance")
+    assert flat["value"] == 0.0
+    assert flat["thresholds"] == {"pass_at_or_above": BLUR_THRESHOLD,
+                                  "full_score_at": BLUR_THRESHOLD * 3}
+    sharp = check_blur(_noise())
+    assert sharp["verdict"] == "PASS"
+    assert sharp["detail"]["value"] >= BLUR_THRESHOLD
+    assert "Laplacian variance" in sharp["reason"]
+
+
+@pytest.mark.parametrize(
+    "value, state, verdict",
+    [(5, "underexposed", "FAIL"), (250, "overexposed", "FAIL"), (128, "normal", "PASS")],
+)
+def test_exposure_states(value, state, verdict):
+    result = check_exposure(_flat(value))
+    detail = _assert_shape(result, "check_exposure", "mean_intensity")
+    assert detail["state"] == state and result["verdict"] == verdict
+    assert detail["value"] == float(value)
+    assert detail["thresholds"] == {"normal_min": EXPOSURE_LOW, "normal_max": EXPOSURE_HIGH}
+
+
+def test_vegetation_counts_its_green_pixels():
+    green = _assert_shape(detect_vegetation(_bgr(40, 160, 40)), "detect_vegetation", "green_ratio")
+    m = green["measurements"]
+    assert m["green_ratio"] == 1.0 and m["green_px"] == m["total_px"] == 400 * 300
+    assert green["thresholds"] == {"pass_above": 0.15, "marginal_from": 0.05}
+    assert {"hsv_lower", "hsv_upper", "morph_kernel_px"} <= set(green["parameters"])
+    grey = detect_vegetation(_flat(128))["detail"]["measurements"]
+    assert grey["green_ratio"] == 0.0 and grey["green_px"] == 0
+
+
+def test_sky_measures_the_top_band_only():
+    img = _flat(40)
+    band = int(300 * 0.35)
+    img[:band] = (230, 180, 120)  # a clear-blue top band, in BGR
+    detail = _assert_shape(detect_sky(img), "detect_sky", "sky_ratio")
+    m = detail["measurements"]
+    assert m["analysed_px"] == int(300 * detail["parameters"]["top_fraction"]) * 400
+    assert m["sky_px"] <= m["analysed_px"]
+    assert m["sky_ratio"] == pytest.approx(m["sky_px"] / m["analysed_px"], abs=1e-4)
+    assert m["blue_px"] > 0
+
+
+def test_faces_none_reports_both_passes():
+    result = detect_faces(_flat(128))
+    detail = _assert_shape(result, "detect_faces", "faces_count")
+    assert detail["state"] == "none" and result["verdict"] == "FAIL"
+    assert detail["measurements"] == {"faces_count": 0, "faces_high_count": 0,
+                                      "faces_low_count": 0}
+    assert {"scale_factor", "min_neighbors_high", "min_neighbors_low",
+            "min_size_px"} <= set(detail["parameters"])
+
+
+def test_water_accounts_for_every_blue_blob():
+    img = _flat(40)
+    img[100:250, 50:350] = (200, 150, 30)  # a flat blue/teal pool, in BGR
+    detail = _assert_shape(detect_water(img), "detect_water", "water_ratio")
+    m = detail["measurements"]
+    assert m["candidates_count"] >= 1
+    assert m["flat_count"] + m["rejected_textured_count"] == m["candidates_count"]
+    assert m["water_ratio"] == pytest.approx(m["water_px"] / m["total_px"], abs=1e-4)
+    assert m["water_px"] > 0
+    assert detail["parameters"]["max_texture_variance"] > 0
+
+
+def test_text_counts_dense_blocks():
+    detail = _assert_shape(detect_text(_stripes()), "detect_text", "dense_block_ratio")
+    m = detail["measurements"]
+    assert m["dense_blocks_count"] <= m["total_blocks_count"]
+    assert m["dense_block_ratio"] == pytest.approx(
+        m["dense_blocks_count"] / m["total_blocks_count"], abs=1e-4
+    )
+    assert m["dense_blocks_count"] > 0 and m["text_regions_count"] >= 1
+    assert detect_text(_flat())["detail"]["measurements"]["dense_blocks_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Through /assess: the frame is attached, the sentence is the reason
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def client():
+    import main
+
+    with TestClient(main.app) as c:
+        yield c
+
+
+def test_assess_result_carries_structured_cv_detail(client):
+    img = np.full((1500, 2000, 3), 128, dtype=np.uint8)  # bigger than the working size
+    png = cv2.imencode(".png", img)[1].tobytes()
+    r = client.post(
+        "/assess",
+        files={"file": ("grey.png", png, "image/png")},
+        data={"criteria": json.dumps([{"name": "sharpness", "type": "cv"},
+                                      {"name": "exposure", "type": "cv"}])},
+    )
+    assert r.status_code == 202, r.text
+    job_id = r.json()["job_id"]
+    for _ in range(200):
+        job = client.get(f"/jobs/{job_id}").json()
+        if job["phase"] in ("completed", "failed"):
+            break
+        time.sleep(0.05)
+    assert job["phase"] == "completed", job
+    per = job["result"]["assessment"]["per_criterion_scores"]
+
+    sharp = per["sharpness"]
+    assert sharp["detail"]["detector"] == "check_blur"
+    assert sharp["detail"]["metric"] == "laplacian_variance"
+    assert "Laplacian variance" in sharp["reason"]
+    image = sharp["detail"]["image"]
+    assert image["frame"] == "working"
+    assert max(image["width"], image["height"]) <= 1000       # the working image
+    assert image["working_scale"] == pytest.approx(image["width"] / 2000, abs=1e-3)
+
+    assert per["exposure"]["detail"]["state"] == "normal"
+    # Every per-item entry carries the same structured detail.
+    assert per["exposure"]["items"][0]["detail"]["metric"] == "mean_intensity"

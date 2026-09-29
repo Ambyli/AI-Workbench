@@ -197,8 +197,11 @@ where you expected a number means the geometry never got collected.
    Colour is one hue per criterion, hashed from the name by
    `common.vision.palette` — the same hue the service uses, so the two
    pictures are comparable at a glance. Stroke says the source: solid
-   `cv`/`detector`/`pdf-text`, dashed `ocr`, dotted `llm`. A
-   **rejected** LLM attempt is drawn dashed and unfilled, from the
+   `cv`/`detector`/`pdf-text`, dashed `ocr`, dotted `llm`. The **accepted**
+   LLM attempt is drawn from its `bbox_px` — the box the service stored and
+   cropped for the verify call, in original (upright) page pixels after the
+   refine pass mapped it back — so the picture shows exactly what was
+   verified. A **rejected** attempt is drawn dashed and unfilled, from the
    `bbox_grid` the model literally answered rather than the clamped box, so
    an overshoot looks like an overshoot.
 4. **Links** to the `p<n>.svg` layers, `regions.json`, the `text.*.json` layers, `job.json`.
@@ -294,15 +297,17 @@ judging: the classifier still makes the one scoring call, because the
 enforcement loop gates on its presence score, then clears the judgement from
 the result. It then runs the loop: ask on the page with a labelled
 coordinate grid drawn on it, refine on a zoomed crop of the original, verify
-the crop alone, retry with feedback. That is **3 model calls** when attempt 1
-is accepted, which it was on both fixtures, and at most 10.
+the crop alone, retry with feedback. That is **4 model calls** when attempt 1
+is accepted — the scoring call, then ask, refine, verify (the loop's
+`localization.calls` is 3; the report shows "1 scoring + 3 loop model
+call(s)") — and at most 1 + 3 × `CLASSIFIER_LLM_BBOX_MAX_ATTEMPTS` = 10.
 
 The report gets a section per bill above the cases:
 
 - **Where it landed:** the accepted box on the 0-1000 grid, which attempt, whether it was refined, the verify score, and what the verifier said it saw.
-- **The page, with every attempt drawn on it** by this script from what the model said. The accepted box is dotted and filled, the stroke every `llm` region gets; rejected attempts are dashed and unfilled.
-- **A zoomed view of the accepted box** on the original pixels, `amount_due_zoom.jpg`, because on a phone photo of a whole bill the full-page picture is too small to tell a line from the one above it.
-- **Every attempt as a table:** the model's first answer on the gridded page, the final box after the refine pass, the verify score, and why it was rejected when it was.
+- **The page, with every attempt drawn on it** by this script. The accepted box is drawn from the `bbox_px` the service stored and verified, dotted and filled, the stroke every `llm` region gets; rejected attempts are drawn from the model's own `bbox_grid`, dashed and unfilled.
+- **A zoomed view of the accepted box** on the original pixels, `amount_due_zoom.jpg`, because on a phone photo of a whole bill the full-page picture is too small to tell a line from the one above it. It is cut from the accepted box's own page, read upright (EXIF orientation applied, as the service does), with `ZOOM_PAD` (4 %) of the page on every side; `summary.json` records the window as `zoom_window_px`.
+- **Every attempt as a table:** the model's first answer on the gridded page (`coarse_bbox_grid`, or `bbox_grid` when no refine pass ran), the final box that was verified (`bbox_grid` — the refine answer mapped back onto the page grid, or the first answer again when the refine answer was unusable), whether it was refined (or why the refine answer was not used), the verify score, and the reason — why it was rejected, or what the verifier saw. A multi-page `--document` (a PDF bill) runs the loop once per page; the table then gets an `item` column, and the zoom is cut from the page the accepted box is on.
 
 Two fixtures run by default, chosen because they lay the amount due out differently:
 
@@ -337,6 +342,31 @@ all-`llm` case in `--local`.
 **Adding a bill** is: drop the photo in `documents/`, add its path to
 `UTILITY_BILL_FIXTURES` in `regions_report.py`, measure its amount-due lines
 on the 0-1000 grid of the upright page, and write the two entries.
+
+### The end-to-end proof, with no model
+
+[`test_regions_report_pipeline.py`](test_regions_report_pipeline.py) runs
+this script's own `main(["--local", "--pipeline", "utility-bill", "--out", …])`
+on `utility_bill.jpeg` — the real app, queue, enforcement loop, artifact
+download, drawing, zoom, checks and HTML — with only the vision model
+replaced, at the bare transport `llm.client._send`. The scripted model reads
+each prompt and answers from the hand-measured header line in
+`regions_expected.json`: presence 9 to the scoring call, a loose box to the
+ask on the gridded page, the line on the **crop's own grid** to the refine
+(computed from the window the refine pass must cut, and checked against the
+crop's aspect ratio), and 9 to the verify. It asserts the four calls, the
+accepted box in upright pixels, the verify crop's size, the checks (3/3, none
+skipped, exit 0), the three files, and that `amount_due_zoom.jpg` is the
+upright page cut around the box with the box drawn on it. A second run has
+the verifier reject attempt 1 and accept attempt 2, and checks both attempts
+reach `summary.json`, the drawing and the attempts table.
+
+```bash
+UV_LINK_MODE=copy uv run --no-sync --with pytest --package classifier \
+    python -m pytest unit-tests/classifier/test_regions_report_pipeline.py -q -p no:cacheprovider
+```
+
+It is part of the ordinary `unit-tests/classifier` suite and takes ~15 s.
 
 ---
 

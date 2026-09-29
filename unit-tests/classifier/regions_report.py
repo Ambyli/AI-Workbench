@@ -803,6 +803,11 @@ def collect_regions(result: CaseResult) -> dict[int, list[Region]]:
     carry an ``attempt`` are dropped in favour of the attempt list. Non-attempt
     ``llm`` regions (there should be none) are kept, because silently losing a
     region would defeat the purpose of the picture.
+
+    The ACCEPTED attempt is the exception: it is drawn from ``bbox_px``, the
+    box the service stored and cropped for the verify call (original page
+    pixels, after the refine pass mapped it back), so the picture shows
+    exactly what was verified. A rejected attempt keeps the raw ``bbox_grid``.
     """
     by_page: dict[int, list[Region]] = {}
 
@@ -829,12 +834,16 @@ def collect_regions(result: CaseResult) -> dict[int, list[Region]]:
         for item, localization in per_item:
             for attempt in localization.get("attempts") or []:
                 bbox = attempt.get("bbox_grid")
-                if not bbox or len(bbox) < 4:
-                    continue
                 geometry = geometries.get(item)
                 if geometry is None:
                     continue
-                points = grid_to_pixels(bbox, geometry)
+                stored = attempt.get("bbox_px")
+                if attempt.get("accepted") and stored and len(stored) >= 4:
+                    points = [(stored[0], stored[1]), (stored[2], stored[3])]
+                elif bbox and len(bbox) >= 4:
+                    points = grid_to_pixels(bbox, geometry)
+                else:
+                    continue
                 by_page.setdefault(item, []).append(
                     Region(
                         page=item,
@@ -848,6 +857,7 @@ def collect_regions(result: CaseResult) -> dict[int, list[Region]]:
                             "accepted": bool(attempt.get("accepted")),
                             "verify_score": attempt.get("verify_score"),
                             "reject": attempt.get("reject"),
+                            "refined": bool(attempt.get("refined")),
                         },
                     )
                 )
@@ -1017,8 +1027,10 @@ class PipelineResult:
     stages: list[PipelineStage] = dataclasses.field(default_factory=list)
     attempts: list[dict] = dataclasses.field(default_factory=list)
     accepted: Optional[dict] = None        # the accepted attempt, as the service returned it
-    calls: int = 0                          # model calls the loop made
+    calls: int = 0                          # model calls the loop made (ask/refine/verify)
+    scoring_calls: int = 0                  # one scoring call per item, before the loop
     zoom: Optional[str] = None              # file name of the zoomed view
+    zoom_window_px: Optional[list] = None   # [left, top, right, bottom] of the zoom, upright page px
     best_iou: Optional[float] = None        # accepted box vs the nearest expected box
     stopped_at: Optional[str] = None
     adhoc: bool = False
@@ -1086,17 +1098,29 @@ def run_utility_bill_pipeline(
         pipe.stopped_at = f"the criterion errored: {entry.get('error') or entry.get('reason')}"
         pipe.stages.append(PipelineStage("locate", result, pipe.stopped_at))
         return pipe
-    # One document, one page → one unit, whose record the criterion carries
-    # verbatim (an aggregate of one passes straight through). Read the unit's
-    # own entry, so the pipeline reads the same thing a multi-item job would.
-    units = entry.get("items") or []
-    localization = (units[0].get("localization") if units else None) or entry.get("localization") or {}
-    pipe.attempts = list(localization.get("attempts") or [])
-    pipe.calls = int(localization.get("calls") or 0)
-    accepted_n = localization.get("accepted_attempt")
-    pipe.accepted = next(
-        (a for a in pipe.attempts if a.get("attempt") == accepted_n and a.get("accepted")), None
-    )
+    # Each item (page) ran its own loop, and its record is on its own unit —
+    # one unit for a photo, whose record the criterion also carries verbatim
+    # (an aggregate of one passes straight through); several for a PDF
+    # --document, where the criterion's merged record has no single
+    # accepted_attempt. Reading the units covers both the same way. Every
+    # attempt is tagged with its item so the zoom knows which page to cut.
+    units = [u for u in entry.get("items") or [] if u.get("item") is not None]
+    per_item = [(int(u["item"]), u.get("localization") or {}) for u in units]
+    if not per_item and entry.get("localization"):
+        per_item = [(0, entry["localization"])]  # a pre-schema-3 result
+    pipe.scoring_calls = len(units) or 1
+    for item, localization in per_item:
+        pipe.calls += int(localization.get("calls") or 0)
+        accepted_n = localization.get("accepted_attempt")
+        for attempt in localization.get("attempts") or []:
+            tagged = {"item": item, **attempt}
+            pipe.attempts.append(tagged)
+            if (
+                pipe.accepted is None
+                and attempt.get("accepted")
+                and attempt.get("attempt") == accepted_n
+            ):
+                pipe.accepted = tagged
 
     if pipe.accepted is None:
         pipe.stopped_at = (
@@ -1117,7 +1141,9 @@ def run_utility_bill_pipeline(
         )
     )
     try:
-        pipe.zoom = _zoom_view(result, a)
+        zoomed = _zoom_view(result, a)
+        if zoomed:
+            pipe.zoom, pipe.zoom_window_px = zoomed
     except Exception as exc:  # noqa: BLE001 — a missing picture must not fail the run
         pipe.notes.append(f"zoomed view failed: {exc}")
     return pipe
@@ -1125,6 +1151,21 @@ def run_utility_bill_pipeline(
 
 def _fmt_box(box: list) -> str:
     return "[" + ", ".join(str(int(round(v))) for v in box) + "]"
+
+
+def _attempt_boxes(attempt: dict) -> tuple[Optional[list], Optional[list]]:
+    """(the model's first answer on the gridded page, the final box), both on
+    the page's 0-1000 grid.
+
+    With a refine pass, ``coarse_bbox_grid`` is the first answer and
+    ``bbox_grid`` the final one (the refined box mapped back, or the coarse
+    box again when the refine answer was unusable). Without one —
+    refine off, or the first answer failed validation so there was nothing to
+    refine — ``bbox_grid`` IS the first answer and is also the final box.
+    """
+    final = attempt.get("bbox_grid")
+    first = attempt.get("coarse_bbox_grid") or final
+    return first, final
 
 
 def _box_iou(a: list, b: list) -> float:
@@ -1137,19 +1178,21 @@ def _box_iou(a: list, b: list) -> float:
     return inter / union if union > 0 else 0.0
 
 
-def _zoom_view(result: CaseResult, attempt: dict) -> Optional[str]:
+def _zoom_view(result: CaseResult, attempt: dict) -> Optional[tuple[str, list[int]]]:
     """Crop the ORIGINAL page around the accepted box and draw it, so the
     reader can see the words inside it — on a phone photo of a whole bill the
     full-page picture is too small to tell a line from the one above it."""
     from PIL import ImageDraw
 
-    # One bill, one page: the accepted box is on item 0, page 0 of the file.
-    page = 0
-    geometry = next(iter(page_geometries(result)), None)
+    # The accepted box's own item: page `page` of the fixture it came from,
+    # read upright (EXIF applied) — the frame `bbox_px` is in.
+    item = int(attempt.get("item") or 0)
+    geometry = next((g for g in page_geometries(result) if g.page == item), None)
+    source, page, _label = item_sources(result).get(item, (result.case.subject, 0, ""))
     box = attempt.get("bbox_px")
-    if geometry is None or not box or not result.case.subject:
+    if geometry is None or not box or source is None:
         return None
-    image = page_image(result.case.subject, page, geometry)
+    image = page_image(source, page, geometry)
     if image is None:
         return None
     sx = image.width / geometry.width if geometry.width else 1.0
@@ -1164,7 +1207,7 @@ def _zoom_view(result: CaseResult, attempt: dict) -> Optional[str]:
     draw.rectangle((x1 - left, y1 - top, x2 - left, y2 - top), outline=(0, 170, 60), width=stroke)
     name = "amount_due_zoom.jpg"
     crop.save(result.out_dir / name, format="JPEG", quality=90)
-    return name
+    return name, [left, top, right, bottom]
 
 
 def check_pipeline(pipe: PipelineResult, expectations: dict, *, local: bool = False) -> None:
@@ -1574,9 +1617,15 @@ def _localization_summary(entry: dict) -> Optional[dict]:
     if not localization:
         return None
     attempts = localization.get("attempts") or []
+    accepted = localization.get("accepted_attempt")
+    if accepted is None and localization.get("accepted"):
+        # Several items merged: no single attempt number, one per item instead.
+        accepted = ", ".join(
+            f"item {a.get('item')} #{a.get('attempt')}" for a in localization["accepted"]
+        )
     return {
         "attempts": len(attempts),
-        "accepted_attempt": localization.get("accepted_attempt"),
+        "accepted_attempt": accepted,
         "calls": localization.get("calls"),
     }
 
@@ -1610,8 +1659,10 @@ def _pipeline_summary(pipe: PipelineResult) -> dict:
         "accepted": pipe.accepted,
         "attempts": pipe.attempts,
         "calls": pipe.calls,
+        "scoring_calls": pipe.scoring_calls,
         "best_iou": pipe.best_iou,
         "zoom": pipe.zoom,
+        "zoom_window_px": pipe.zoom_window_px,
         "notes": pipe.notes,
         "checks": pipe.checks,
     }
@@ -1621,19 +1672,22 @@ def print_pipelines(pipelines: Iterable[PipelineResult]) -> None:
     for pipe in pipelines:
         print()
         print(f"pipeline {pipe.name} — {pipe.document.name}")
+        multi = len({a.get("item") for a in pipe.attempts}) > 1
         for attempt in pipe.attempts:
-            coarse = attempt.get("coarse_bbox_grid")
+            first, final = _attempt_boxes(attempt)
+            where = f"item {attempt.get('item')} " if multi else ""
             print(
-                f"  attempt {attempt.get('attempt')}: "
-                + (f"coarse {_fmt_box(coarse)} -> " if coarse else "")
-                + f"{_fmt_box(attempt.get('bbox_grid') or []) if attempt.get('bbox_grid') else 'no box'}"
+                f"  {where}attempt {attempt.get('attempt')}: "
+                + (f"{_fmt_box(first)}" if first else "no box")
+                + (f" -> refined {_fmt_box(final)}" if attempt.get("refined") and final else "")
                 + f"  verify={attempt.get('verify_score')}"
                 + f"  {'ACCEPTED' if attempt.get('accepted') else 'rejected'}"
             )
         if pipe.accepted:
             print(
                 f"  amount due located: {_fmt_box(pipe.accepted.get('bbox_grid') or [])} "
-                f"(attempt {pipe.accepted.get('attempt')}, {pipe.calls} model call(s)"
+                f"(attempt {pipe.accepted.get('attempt')}, "
+                f"{pipe.scoring_calls} scoring + {pipe.calls} loop model call(s)"
                 + (f", IoU {pipe.best_iou}" if pipe.best_iou is not None else "")
                 + ")"
             )
@@ -2020,7 +2074,7 @@ def _pipeline_block(pipe: PipelineResult) -> str:
         f"Where is the amount due? — {_e(pipe.document.name)}</h2>",
         f'<p class="meta">document <code>{_e(_rel(pipe.document))}</code> · one '
         f"<code>POST /assess</code>, one <code>llm</code> criterion with <code>score: false</code> and <code>boxes</code> on · "
-        f"{pipe.calls} model call(s)"
+        f"{pipe.scoring_calls} scoring + {pipe.calls} loop model call(s)"
         + (f' · <a href="#{_e(result.case.slug)}">the call</a>' if result else "")
         + "</p>",
     ]
@@ -2061,33 +2115,42 @@ def _pipeline_block(pipe: PipelineResult) -> str:
 
     if pipe.attempts:
         parts.append("<h3>Attempts</h3>")
+        multi = len({a.get("item") for a in pipe.attempts}) > 1
         rows = []
         for attempt in pipe.attempts:
-            coarse = attempt.get("coarse_bbox_grid")
-            final = attempt.get("bbox_grid")
+            first, final = _attempt_boxes(attempt)
             state = (
                 "<span class='ok'>accepted</span>" if attempt.get("accepted")
                 else "<span class='bad'>rejected</span>"
             )
-            why = attempt.get("reject") or attempt.get("refine_reject") or attempt.get("verify_reason") or ""
+            if attempt.get("refined"):
+                refined = "yes"
+            elif attempt.get("refine_reject"):
+                refined = f"no — {_e(_short(str(attempt['refine_reject']), 120))}"
+            else:
+                refined = ""  # no refine pass ran (refine off, or nothing valid to refine)
+            why = attempt.get("reject") or attempt.get("verify_reason") or ""
             rows.append(
                 "<tr>"
-                f"<td>{_e(attempt.get('attempt'))}</td>"
-                f"<td class='mono'>{_e(_fmt_box(coarse)) if coarse else '—'}</td>"
+                + (f"<td>{_e(attempt.get('item'))}</td>" if multi else "")
+                + f"<td>{_e(attempt.get('attempt'))}</td>"
+                f"<td class='mono'>{_e(_fmt_box(first)) if first else '—'}</td>"
                 f"<td class='mono'>{_e(_fmt_box(final)) if final else '—'}</td>"
-                f"<td>{'yes' if attempt.get('refined') else ''}</td>"
+                f"<td>{refined}</td>"
                 f"<td>{_e(attempt.get('verify_score'))}</td>"
                 f"<td>{state}</td>"
                 f"<td>{_e(_short(str(why), 200))}</td>"
                 "</tr>"
             )
         parts.append(
-            "<table><thead><tr><th>#</th><th>first answer</th><th>final box</th><th>refined</th>"
+            "<table><thead><tr>" + ("<th>item</th>" if multi else "")
+            + "<th>#</th><th>first answer</th><th>final box</th><th>refined</th>"
             "<th>verify</th><th></th><th>reason</th></tr></thead><tbody>"
             + "".join(rows) + "</tbody></table>"
             "<p class='meta'>Boxes are on the 0-1000 grid of the page. The first answer is what "
-            "the model said on the gridded page; the final box is its answer on the zoomed crop, "
-            "mapped back.</p>"
+            "the model said on the gridded page; the final box is what was verified — its answer "
+            "on the zoomed crop, mapped back, or the first answer again when no refine was used. "
+            "The reason is why an attempt was rejected, or what the verifier saw in the crop.</p>"
         )
 
     if pipe.checks:

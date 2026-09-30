@@ -69,6 +69,10 @@ from .annotate import (
     regions_from_json,
     safe_text,
 )
+from .grid_overlay import (
+    DEFAULT_GRID_STEP,
+    draw_grid_overlay,
+)
 from .geometry import (
     DEFAULT_GRID,
     box_region,
@@ -121,6 +125,9 @@ __all__ = [
     "RegionKind",
     "RegionSource",
     "REGION_SOURCES",
+    # grid overlay
+    "DEFAULT_GRID_STEP",
+    "draw_grid_overlay",
     # geometry
     "DEFAULT_GRID",
     "box_region",

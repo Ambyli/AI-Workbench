@@ -10,14 +10,21 @@ submit every request, poll the job, pull the layers, and then **re-draw the
 geometry independently** onto the original fixture before putting the two
 pictures side by side in one HTML page.
 
-The independence is the point. The service's own ``p0.preview.jpg`` was drawn
-by the same code that produced the regions, so it cannot disagree with them.
-The annotated JPEG next to it is drawn from ``regions.json`` by
+The independence is the point. The service's own ``p{n}.preview.jpg`` was
+drawn by the same code that produced the regions, so it cannot disagree with
+them. The annotated JPEG next to it is drawn from ``regions.json`` by
 ``common.vision.annotate`` onto the fixture as it exists on disk — if the two
 differ, one of them is wrong, and that is visible without reading a single
 coordinate.
 
-    submit → poll → GET artifacts → download layers
+A request may carry several documents, and every page of every document is
+one ITEM (``n`` in ``p{n}``, the region's ``page``). Each item's regions are
+drawn on that item's own page — page ``j`` of the fixture it came from, found
+through the result's ``items`` / ``documents`` map — and the report shows
+every criterion's per-item results beside the aggregated one.
+
+    submit → poll → GET artifacts → download regions.json, the text layers,
+                                    and the layers (rendered on first fetch)
                                   → re-draw on the original
                                   → compare against regions_expected.json
                                   → index.html + summary.json + exit code
@@ -39,22 +46,22 @@ Adding a case is: add the Postman item, add an entry to
 ``regions_expected.json``. Nothing here needs to change — the collection IS
 the suite.
 
-**Pipelines** are the one thing the collection cannot express: a call whose
-request is built from the previous call's answer. ``--pipeline utility-bill``
-runs three chained calls against a photographed utility bill — is this a bill
-at all → where is the amount due → read the figure inside that region — with
-the crop between stages 2 and 3 done here, on the original pixels::
+**The amount-due locator** is the one case the collection cannot hold: a
+request built for whatever bill is passed on the command line.
+``--pipeline utility-bill`` makes ONE ``/assess`` call per bill, with a single
+``llm`` criterion (``score: false``, ``options.boxes: true``) asking the vision
+model where the amount due is. The report shows the page with every box the
+model drew — accepted dotted and filled, rejected dashed and unfilled —
+beside a zoomed view of the accepted one::
 
     uv run --package classifier python unit-tests/classifier/regions_report.py \\
         --pipeline utility-bill
     uv run --package classifier python unit-tests/classifier/regions_report.py \\
-        --pipeline utility-bill --local
-    uv run --package classifier python unit-tests/classifier/regions_report.py \\
         --pipeline utility-bill --document ~/Downloads/some_other_bill.jpg
 
-Each stage is an ordinary case in the report; the pipeline section above them
-shows what each stage decided and the value that came out. See § Pipelines
-below.
+An ad-hoc ``--document`` (repeatable) replaces the fixture list and has no
+expectations: its checks are recorded as skipped, and where the model put
+the box is still reported. See § Pipelines below.
 """
 
 from __future__ import annotations
@@ -115,31 +122,26 @@ DEFAULT_FOLDERS = ("Documents", "Regions", "Documents + regions")
 
 # Collection `{{name_b64}}` variable → the fixture whose bytes it stands for.
 #
-# DATA, not derivation: the variable names follow a convention
-# (``scene_before_b64`` ↔ ``regions/scene_before.png``) but two of them cross
-# fixture folders, and a convention that is right four times out of six is a
-# convention that will silently encode the wrong file the first time someone
-# adds the fifth. An unlisted ``*_b64`` variable is a hard error, not a guess.
+# DATA, not derivation: a convention (``invoice_native_b64`` ↔
+# ``documents/invoice_native.pdf``) is right until the first variable that
+# crosses fixture folders. An unlisted ``*_b64`` variable is a hard error, not
+# a guess. The JSON-body items are the only ones that use these.
 B64_FIXTURES: dict[str, str] = {
-    "scene_before_b64": "unit-tests/classifier/regions/scene_before.png",
-    "scene_after_b64": "unit-tests/classifier/regions/scene_after.png",
     "invoice_native_b64": "unit-tests/classifier/documents/invoice_native.pdf",
-    "invoice_scanned_b64": "unit-tests/classifier/documents/invoice_scanned.pdf",
 }
 
-# Artifact files worth pulling down. Everything else in the directory
-# (``p{n}.base.jpg``, per-criterion pre-renders) is derivable from these.
+# Files a job writes that are worth pulling down: the geometry, the manifest,
+# and every text layer (the exact text each text criterion searched).
 ARTIFACT_PATTERNS = (
     "regions.json",
     "manifest.json",
-    "e*.regions.json",
-    "p*.svg",
-    "p*.preview.jpg",
-    "e*.p*.svg",
-    "e*.preview.jpg",
-    "diff-*.svg",
-    "diff-*.jpg",
+    "text.*.json",
 )
+
+# The layers are NOT on disk until something fetches them — the artifact
+# endpoint renders them on first fetch. These two are requested explicitly,
+# from the result's ``artifacts.layers``, whenever the page had an image.
+LAYERS_TO_FETCH = ("svg", "preview")
 
 POLL_INTERVAL_S = 1.5
 TERMINAL_PHASES = ("completed", "failed", "cancelled")
@@ -166,62 +168,54 @@ class Case:
     description: str
     headers: dict[str, str]
     form: dict[str, str] = dataclasses.field(default_factory=dict)
-    upload: Optional[pathlib.Path] = None
-    upload_field: str = "file"
+    # Every file part, in collection order: (form field, fixture path). A
+    # request may carry several documents; each is one or more items.
+    uploads: list[tuple[str, pathlib.Path]] = dataclasses.field(default_factory=list)
     json_body: Optional[dict] = None
-    subject: Optional[pathlib.Path] = None   # the document regions belong to
+    # The fixtures the documents' pages are drawn from — the uploads, or the
+    # `*_b64` variables of a JSON body, in order.
+    subjects: list[pathlib.Path] = dataclasses.field(default_factory=list)
+    # Inline `text` form fields, in order — each one is a document.
+    texts: list[str] = dataclasses.field(default_factory=list)
     # Key into regions_expected.json when it is not the item name — a pipeline
     # stage retried on a second candidate keeps one expectations entry.
     expect_key: Optional[str] = None
+    # An ad-hoc --document has no entry to be right or wrong against: a missing
+    # expectation is then recorded as skipped instead of failing coverage.
+    adhoc: bool = False
 
     @property
     def slug(self) -> str:
         return f"{self.index:02d}-{_slug(self.name)}"
 
     @property
+    def upload(self) -> Optional[pathlib.Path]:
+        """The first file part — the one document of most cases."""
+        return self.uploads[0][1] if self.uploads else None
+
+    @property
+    def subject(self) -> Optional[pathlib.Path]:
+        """The first document regions are drawn on."""
+        return self.subjects[0] if self.subjects else None
+
+    @property
     def endpoint(self) -> str:
         return "/" + "/".join(self.path.strip("/").split("/")[len(PASSTHROUGH_PREFIX):])
 
     @property
-    def criteria_field(self) -> str:
-        """Which field this endpoint spells its criteria list in."""
-        return "features" if "features" in self.form else "criteria"
-
-    @property
-    def raw_criteria(self) -> list:
-        """The criteria / features list exactly as the request carries it.
-
-        Entries may be **bare strings** on `/locate`, and that matters: a bare
-        string has no type because the SERVICE resolves it (cv → detector →
-        llm). Normalising it to ``{"type": "llm"}`` here would make the local
-        run drop ``"has text"``, which an OpenCV detector answers for free.
-        """
+    def criteria(self) -> list[dict]:
+        """The criteria list exactly as the request carries it (JSON or form)."""
         if self.json_body is not None:
             return list(self.json_body.get("criteria") or [])
-        raw = self.form.get("criteria") or self.form.get("features")
+        raw = self.form.get("criteria")
         return json.loads(raw) if raw else []
 
-    @property
-    def criteria(self) -> list[dict]:
-        """:attr:`raw_criteria` as dicts, for display. Bare strings are marked
-        ``(resolved)`` rather than given a type they do not have."""
-        return [
-            {"name": c, "type": "(resolved)"} if isinstance(c, str) else c
-            for c in self.raw_criteria
-        ]
-
     def set_criteria(self, items: list) -> None:
-        """Write a filtered criteria list back into whichever field holds it."""
+        """Write a filtered criteria list back into whichever encoding holds it."""
         if self.json_body is not None:
             self.json_body["criteria"] = items
         else:
-            self.form[self.criteria_field] = json.dumps(items, separators=(",", ":"))
-
-    @property
-    def regions_option(self) -> Any:
-        if self.json_body is not None:
-            return self.json_body.get("regions")
-        return self.form.get("regions")
+            self.form["criteria"] = json.dumps(items, separators=(",", ":"))
 
 
 def _slug(name: str) -> str:
@@ -324,9 +318,13 @@ def _build_case(
             if field.get("disabled"):
                 continue
             if field.get("type") == "file":
-                case.upload_field = field["key"]
-                case.upload = REPO_ROOT / field["src"]
-                case.subject = case.upload
+                path = REPO_ROOT / field["src"]
+                case.uploads.append((field["key"], path))
+                case.subjects.append(path)
+            elif field["key"] == "text":
+                # A repeated inline-text field is one document each; kept in
+                # a list so a second one does not overwrite the first.
+                case.texts.append(_substitute(field.get("value") or "", base_url, api_key))
             else:
                 case.form[field["key"]] = _substitute(
                     field.get("value") or "", base_url, api_key
@@ -334,17 +332,17 @@ def _build_case(
     elif body.get("mode") == "raw":
         raw = _substitute(body.get("raw") or "", base_url, api_key)
         case.json_body = json.loads(raw)
-        # The subject of a compare is whichever fixture the `image` variable
-        # stood for — needed to draw the regions on something.
-        match = re.search(r"\{\{(\w+_b64)\}\}", body.get("raw") or "")
-        if match:
-            case.subject = REPO_ROOT / B64_FIXTURES[match.group(1)]
+        # The documents are whichever fixtures the `*_b64` variables stood
+        # for, in order — needed to draw the regions on something.
+        for name in re.findall(r"\{\{(\w+_b64)\}\}", body.get("raw") or ""):
+            case.subjects.append(REPO_ROOT / B64_FIXTURES[name])
         # Content-Type is set by the client; leaving the collection's copy in
         # place is harmless but duplicated.
         headers.pop("Content-Type", None)
 
-    if case.upload and not case.upload.is_file():
-        raise SystemExit(f"{case.name}: fixture not found: {case.upload}")
+    for _field, path in case.uploads:
+        if not path.is_file():
+            raise SystemExit(f"{case.name}: fixture not found: {path}")
     return case
 
 
@@ -388,8 +386,8 @@ class LocalTransport:
     The point is to be able to verify everything that is not the vision model
     — collection parsing, submission, the queue, OCR, the CV detectors, text
     matching, artifact writing, the annotation pass and the report — without a
-    GPU anywhere. ``llm`` criteria have no server to call; see
-    :func:`_strip_llm_criteria` for what happens to them.
+    GPU anywhere. ``llm`` and ``detector`` criteria have no server to call;
+    see :func:`_strip_remote_criteria` for what happens to them.
 
     Every path the collection produces carries LiteLLM's ``/v1/classifier``
     prefix, which the pass-through supplies and a mounted app does not, so it
@@ -406,8 +404,10 @@ class LocalTransport:
         os.environ["CLASSIFIER_ARTIFACT_DIR"] = str(workdir / "artifacts")
         os.environ.setdefault("CLASSIFIER_OCR_ENGINE", "rapidocr")
         os.environ.setdefault("PYTHONIOENCODING", "utf-8")
-        # Both are network dependencies with nothing behind them here. Empty
-        # DETECTOR_URL is "off", which the service reports as a note.
+        # A network dependency with nothing behind it here. Empty
+        # DETECTOR_URL is "off": `detector` criteria are dropped by
+        # _strip_remote_criteria, and a `cv` criterion's fallback resolves to
+        # the llm.
         os.environ.setdefault("DETECTOR_URL", "")
 
         classifier_dir = REPO_ROOT / "ai" / "classifier"
@@ -472,67 +472,57 @@ class CaseResult:
     def ok(self) -> bool:
         return all(c["ok"] for c in self.checks)
 
-    @property
-    def kind(self) -> str:
-        if self.case.endpoint == "/assess/compare":
-            return "compare"
-        if self.case.endpoint == "/locate":
-            return "locate"
-        return "assess"
 
+def _strip_remote_criteria(case: Case, dropped: list[str]) -> Optional[str]:
+    """Drop the criteria a ``--local`` run has no server for, in place.
 
-def _strip_llm_criteria(case: Case, dropped: list[str]) -> Optional[str]:
-    """Drop ``type: "llm"`` criteria for a ``--local`` run, in place.
+    ``llm`` criteria need the vision model and ``detector`` criteria the
+    open-vocabulary detector; neither is reachable in-process. A failing
+    criterion no longer fails the job (it comes back ``status: "error"``),
+    but a ``detector`` criterion is refused at submit when DETECTOR_URL is
+    empty, and every model call would be a connection error — so both are
+    removed, and the checks can tell "absent because we dropped it" from
+    "absent because the service lost it".
 
-    There is no vision model behind a locally mounted app, and ``call_vllm``
-    raises a 502 rather than degrading — which would fail the whole job and
-    take the `cv` / `text` / OCR geometry down with it, i.e. exactly the part
-    that CAN be checked without a GPU.
-
-    A request whose criteria are ALL ``llm`` is left alone instead: emptying
-    the list would be a 400 at submit time, and a failed job that says
-    "vLLM call failed" is a more honest local outcome than a request that was
-    quietly rewritten into a different request.
-
-    Args:
-        case:    The case to trim, modified in place.
-        dropped: Filled with the names that were removed, so the check pass
-                 can tell "absent because we dropped it" from "absent
-                 because the service lost it" — by then the request itself
-                 no longer mentions them.
+    A request whose criteria would ALL be dropped is sent unchanged instead:
+    emptying the list is a 400, and a job whose criteria all come back
+    ``status: "error"`` is a more honest local outcome than a request that
+    was quietly rewritten into a different one.
 
     Returns a note for the report, or None when nothing was dropped.
     """
-    criteria = case.raw_criteria
+    criteria = case.criteria
     if not criteria:
         return None
-    kept = [c for c in criteria if not _declares_llm(c)]
+    kept = [c for c in criteria if not _needs_remote(c)]
     if not kept:
         return (
-            "local mode: every criterion is `llm` and there is no vision model, "
-            "so the request was sent unchanged and the job is expected to fail"
+            "local mode: every criterion needs the vision model or the detector, "
+            "so the request was sent unchanged and each criterion is expected to "
+            "come back status: error"
         )
     if len(kept) == len(criteria):
         return None
 
-    dropped.extend(c["name"] for c in criteria if _declares_llm(c))
+    dropped.extend(c["name"] for c in criteria if _needs_remote(c))
     case.set_criteria(kept)
     return (
-        f"local mode: dropped {len(dropped)} `llm` criteri{'on' if len(dropped) == 1 else 'a'} "
-        f"({', '.join(dropped)}) — no vision model is reachable in-process"
+        f"local mode: dropped {len(dropped)} criteri{'on' if len(dropped) == 1 else 'a'} "
+        f"({', '.join(dropped)}) — no vision model or detector is reachable in-process"
     )
 
 
-def _declares_llm(criterion: Any) -> bool:
-    """True for an entry that will certainly reach the vision model.
+def _needs_remote(criterion: dict) -> bool:
+    """True for a criterion that will certainly call the model or the detector.
 
-    A bare string is not one: `/locate` resolves it to an OpenCV detector or
-    the open-vocabulary detector first, and only falls through to the model.
-    Dropping it locally would remove geometry that costs nothing to produce.
+    A ``cv`` criterion is not one even when no OpenCV detector matches its
+    name: its fallback resolves to the llm locally and it comes back
+    ``status: "error"``, which the checks record as skipped in local mode.
     """
-    if isinstance(criterion, str):
-        return False
-    return (criterion.get("type") or "llm") == "llm"
+    kind = criterion.get("type") or "llm"
+    if kind in ("llm", "detector"):
+        return True
+    return kind == "cv" and (criterion.get("options") or {}).get("fallback") == "detector"
 
 
 def submit(case: Case, transport: Any) -> Any:
@@ -541,17 +531,19 @@ def submit(case: Case, transport: Any) -> Any:
         return transport.request(
             "POST", case.path, json=case.json_body, headers=case.headers
         )
-    files = None
-    if case.upload:
-        files = {
-            case.upload_field: (
-                case.upload.name,
-                case.upload.read_bytes(),
-                "application/octet-stream",
-            )
-        }
+    # A list of (field, file) tuples, so a repeated `file` part is sent as
+    # many times as the collection lists it. (Both requests and httpx put the
+    # plain fields — `criteria`, `text` — before the files; the service keeps
+    # form order, and the documents map in the result says which is which.)
+    files = [
+        (field, (path.name, path.read_bytes(), "application/octet-stream"))
+        for field, path in case.uploads
+    ] or None
+    data: dict[str, Any] = dict(case.form)
+    if case.texts:
+        data["text"] = case.texts if len(case.texts) > 1 else case.texts[0]
     return transport.request(
-        "POST", case.path, data=case.form, files=files, headers=case.headers
+        "POST", case.path, data=data, files=files, headers=case.headers
     )
 
 
@@ -575,19 +567,20 @@ def poll(transport: Any, job_id: str, timeout_s: float) -> dict:
 
 
 def fetch_artifacts(
-    transport: Any, job_id: str, out_dir: pathlib.Path
+    transport: Any, job_id: str, out_dir: pathlib.Path, result: dict
 ) -> tuple[dict, list[str], list[str]]:
-    """Download the layers worth keeping. A job without regions has none.
+    """Download what the job wrote, then ask for the layers worth looking at.
 
-    A 404 here is the normal answer for a request submitted without
-    ``regions`` — it means "never had artifacts", which is different from the
-    410 that means "had them, they are gone". Both are reported, neither is an
-    error.
+    Every job writes a directory, so a 404 means the job never got far enough
+    to write one (it failed), and a 410 that it had one and the sweeper or a
+    DELETE took it. The layers are rendered on first fetch, so they are
+    requested explicitly, per item, from ``result.artifacts.items[].layers``
+    — that request is also what exercises the lazy renderer.
     """
     notes: list[str] = []
     response = transport.request("GET", f"/v1/classifier/jobs/{job_id}/artifacts")
     if response.status_code == 404:
-        return {}, [], ["no artifact directory (the request did not ask for regions)"]
+        return {}, [], ["no artifact directory (the job did not get far enough to write one)"]
     if response.status_code == 410:
         return {}, [], ["artifact directory is gone (swept past the TTL, or deleted)"]
     if response.status_code != 200:
@@ -595,18 +588,28 @@ def fetch_artifacts(
 
     manifest = response.json()
     saved: list[str] = []
-    for entry in manifest.get("files") or []:
-        name = entry.get("name") or ""
-        if not any(fnmatch.fnmatch(name, pattern) for pattern in ARTIFACT_PATTERNS):
-            continue
+
+    def download(name: str) -> None:
         file_response = transport.request(
             "GET", f"/v1/classifier/jobs/{job_id}/artifacts/{name}"
         )
         if file_response.status_code != 200:
             notes.append(f"{name}: download returned {file_response.status_code}")
-            continue
+            return
         (out_dir / name).write_bytes(file_response.content)
         saved.append(name)
+
+    for entry in manifest.get("files") or []:
+        name = entry.get("name") or ""
+        if any(fnmatch.fnmatch(name, pattern) for pattern in ARTIFACT_PATTERNS):
+            download(name)
+
+    for item in ((result.get("artifacts") or {}).get("items")) or []:
+        layers = item.get("layers") or {}
+        for fmt in LAYERS_TO_FETCH:
+            link = layers.get(fmt)
+            if link:
+                download(link.rsplit("/", 1)[-1])
     return manifest, saved, notes
 
 
@@ -619,7 +622,7 @@ def run_case(
     result = CaseResult(case=case, out_dir=out_dir)
 
     if transport.local:
-        note = _strip_llm_criteria(case, result.dropped_criteria)
+        note = _strip_remote_criteria(case, result.dropped_criteria)
         if note:
             result.notes.append(note)
 
@@ -668,7 +671,7 @@ def run_case(
 
     _write_json(out_dir / "job.json", job)
 
-    manifest, files, notes = fetch_artifacts(transport, job_id, out_dir)
+    manifest, files, notes = fetch_artifacts(transport, job_id, out_dir, result.result)
     result.manifest = manifest
     result.files = files
     result.notes.extend(notes)
@@ -693,24 +696,16 @@ def run_case(
 
 
 def criterion_results(result: CaseResult) -> dict[str, dict]:
-    """The per-criterion block, wherever this endpoint keeps it."""
-    payload = result.result
-    if result.kind == "locate":
-        return dict(payload.get("features") or {})
-    if result.kind == "compare":
-        analysis = payload.get("input_analysis") or {}
-        return dict((analysis.get("assessment") or {}).get("per_criterion_scores") or {})
-    return dict((payload.get("assessment") or {}).get("per_criterion_scores") or {})
+    """The per-criterion block of the result."""
+    return dict(
+        (result.result.get("assessment") or {}).get("per_criterion_scores") or {}
+    )
 
 
 def overall(result: CaseResult) -> tuple[Optional[str], Optional[float]]:
-    """(verdict, score) for the job as a whole, or (None, None) for /locate."""
+    """(verdict, score) for the job as a whole — both None when nothing was
+    scored (every criterion ``score: false``) or the assessment is incomplete."""
     payload = result.result
-    if result.kind == "locate":
-        return None, None
-    if result.kind == "compare":
-        aggregate = payload.get("aggregate") or {}
-        return aggregate.get("combined_verdict"), aggregate.get("combined_score")
     assessment = payload.get("assessment") or {}
     return (
         payload.get("verdict") or assessment.get("overall_verdict"),
@@ -719,21 +714,56 @@ def overall(result: CaseResult) -> tuple[Optional[str], Optional[float]]:
 
 
 def page_geometries(result: CaseResult) -> list[PageGeometry]:
-    raw = result.result.get("page_geometry") or result.regions_doc.get("pages") or []
-    return [PageGeometry.from_dict(entry) for entry in raw]
+    """One frame per item with a page image (``page`` is the item index).
+
+    The result's ``page_geometry`` has an entry for EVERY item — a .txt or
+    .docx item's with null sizes — so those are left out; regions.json's
+    ``pages`` is the fallback for a result that did not come back.
+    """
+    raw = result.result.get("page_geometry")
+    if isinstance(raw, dict):  # a schema-2 result
+        raw = [raw]
+    entries = [e for e in (raw or []) if e.get("width")] or (result.regions_doc.get("pages") or [])
+    return [PageGeometry.from_dict(entry) for entry in entries]
+
+
+def item_sources(result: CaseResult) -> dict[int, tuple[Optional[pathlib.Path], int, str]]:
+    """Item n → (the fixture its page comes from, the page within it, label).
+
+    The result's ``items`` say which document and page each item is, and
+    ``documents`` name the files. A document is matched to a fixture by file
+    name — the upload order is not the document order when inline ``text``
+    fields are sent too, since HTTP clients put plain fields before files —
+    falling back to position among the case's fixtures.
+    """
+    docs = result.result.get("documents") or []
+    by_name: dict[str, list[pathlib.Path]] = {}
+    for path in result.case.subjects:
+        by_name.setdefault(path.name, []).append(path)
+    fixture_for: dict[int, Optional[pathlib.Path]] = {}
+    unmatched = [p for p in result.case.subjects]
+    for doc in docs:
+        candidates = by_name.get(doc.get("filename") or "") or []
+        path = candidates.pop(0) if candidates else None
+        if path is not None and path in unmatched:
+            unmatched.remove(path)
+        fixture_for[int(doc.get("index", 0))] = path
+    for index, path in list(fixture_for.items()):
+        if path is None and docs[index].get("kind") not in ("txt", "docx") and unmatched:
+            fixture_for[index] = unmatched.pop(0)
+
+    out: dict[int, tuple[Optional[pathlib.Path], int, str]] = {}
+    for entry in result.result.get("items") or []:
+        n, d, page = int(entry["item"]), int(entry.get("document", 0)), int(entry.get("page", 0))
+        out[n] = (fixture_for.get(d), page, f"item {n} — {entry.get('filename')} p{page + 1}")
+    if not out and result.case.subject:  # no result: assume the one document
+        for geometry in page_geometries(result):
+            out[geometry.page] = (result.case.subject, geometry.page, f"page {geometry.page}")
+    return out
 
 
 def _caption(region: Region, scores: dict[str, dict]) -> str:
-    """``"<criterion> · <score> <verdict> · <source>"``, plus the loop's state.
-
-    Diff regions have no criterion and no score — they are filed under a
-    synthetic ``_diff:e{i}`` key — so they are captioned by what changed,
-    which is the only thing about them a reviewer can check.
-    """
-    if region.source == "diff":
-        change = region.attrs.get("change") or "changed"
-        return f"{change} · diff · {region.label.replace('_diff:', '')}"
-
+    """``"<criterion> · <score> <verdict> · <source>"``, plus the loop's state."""
     entry = scores.get(region.label) or {}
     bits = [region.label]
     score, verdict = entry.get("score"), entry.get("verdict")
@@ -753,6 +783,8 @@ def _caption(region: Region, scores: dict[str, dict]) -> str:
                         else f"attempt {attempt} accepted")
         else:
             bits.append(f"attempt {attempt} ✗")
+        if region.attrs.get("refined"):
+            bits.append("refined")
     return " · ".join(bits)
 
 
@@ -771,6 +803,11 @@ def collect_regions(result: CaseResult) -> dict[int, list[Region]]:
     carry an ``attempt`` are dropped in favour of the attempt list. Non-attempt
     ``llm`` regions (there should be none) are kept, because silently losing a
     region would defeat the purpose of the picture.
+
+    The ACCEPTED attempt is the exception: it is drawn from ``bbox_px``, the
+    box the service stored and cropped for the verify call (original page
+    pixels, after the refine pass mapped it back), so the picture shows
+    exactly what was verified. A rejected attempt keeps the raw ``bbox_grid``.
     """
     by_page: dict[int, list[Region]] = {}
 
@@ -783,41 +820,54 @@ def collect_regions(result: CaseResult) -> dict[int, list[Region]]:
             by_page.setdefault(region.page, []).append(region)
 
     geometries = {geom.page: geom for geom in page_geometries(result)}
-    llm_page = result.result.get("document_info", {}).get("llm_image_page")
-    default_page = llm_page if isinstance(llm_page, int) else 0
 
     for name, entry in criterion_results(result).items():
-        localization = entry.get("localization") or {}
-        for attempt in localization.get("attempts") or []:
-            bbox = attempt.get("bbox_grid")
-            if not bbox or len(bbox) < 4:
-                continue
-            geometry = geometries.get(default_page)
-            if geometry is None:
-                continue
-            points = grid_to_pixels(bbox, geometry)
-            by_page.setdefault(default_page, []).append(
-                Region(
-                    page=default_page,
-                    kind="box",
-                    points=points,
-                    label=name,
-                    score=attempt.get("verify_score"),
-                    source="llm",
-                    attrs={
-                        "attempt": attempt.get("attempt"),
-                        "accepted": bool(attempt.get("accepted")),
-                        "verify_score": attempt.get("verify_score"),
-                        "reject": attempt.get("reject"),
-                    },
+        # Each unit (item) runs its own loop, so its attempts belong to its
+        # own page; `items[].localization` carries them per item.
+        per_item = [
+            (unit.get("item"), unit.get("localization") or {})
+            for unit in entry.get("items") or []
+            if unit.get("item") is not None and unit.get("localization")
+        ]
+        if not per_item and entry.get("localization"):
+            per_item = [(0, entry["localization"])]  # a schema-2 result
+        for item, localization in per_item:
+            for attempt in localization.get("attempts") or []:
+                bbox = attempt.get("bbox_grid")
+                geometry = geometries.get(item)
+                if geometry is None:
+                    continue
+                stored = attempt.get("bbox_px")
+                if attempt.get("accepted") and stored and len(stored) >= 4:
+                    points = [(stored[0], stored[1]), (stored[2], stored[3])]
+                elif bbox and len(bbox) >= 4:
+                    points = grid_to_pixels(bbox, geometry)
+                else:
+                    continue
+                by_page.setdefault(item, []).append(
+                    Region(
+                        page=item,
+                        kind="box",
+                        points=points,
+                        label=name,
+                        score=attempt.get("verify_score"),
+                        source="llm",
+                        attrs={
+                            "attempt": attempt.get("attempt"),
+                            "accepted": bool(attempt.get("accepted")),
+                            "verify_score": attempt.get("verify_score"),
+                            "reject": attempt.get("reject"),
+                            "refined": bool(attempt.get("refined")),
+                        },
+                    )
                 )
-            )
 
     return by_page
 
 
 def page_image(source: pathlib.Path, page: int, geometry: PageGeometry) -> Optional[Any]:
-    """The ORIGINAL fixture's page, at the size the service reported.
+    """The ORIGINAL fixture's page ``page`` (within that file), at the size
+    the service reported for the item.
 
     A PDF is re-rendered locally rather than read back from the job's
     ``p{n}.base.jpg``: the base image is the service's own render, so drawing
@@ -855,24 +905,27 @@ def page_image(source: pathlib.Path, page: int, geometry: PageGeometry) -> Optio
 
 
 def annotate_case(result: CaseResult) -> list[str]:
-    """Write one ``p{n}.annotated.jpg`` per page that has regions."""
-    if not result.case.subject:
+    """Write one ``p{n}.annotated.jpg`` per item that has regions — each
+    item's regions on its OWN page of its own fixture."""
+    if not result.case.subjects:
         return []
     regions_by_page = collect_regions(result)
     if not regions_by_page:
         return []
 
     scores = criterion_results(result)
+    sources = item_sources(result)
     written: list[str] = []
     for geometry in page_geometries(result):
         regions = regions_by_page.get(geometry.page) or []
         if not regions:
             continue
-        base = page_image(result.case.subject, geometry.page, geometry)
+        source, page, label = sources.get(geometry.page, (None, 0, f"item {geometry.page}"))
+        base = page_image(source, page, geometry) if source else None
         if base is None:
             result.notes.append(
-                f"page {geometry.page}: no local render for "
-                f"{result.case.subject.suffix or 'this kind'}, so no annotated image"
+                f"{label}: no local render for "
+                f"{(source.suffix if source else '') or 'this kind'}, so no annotated image"
             )
             continue
         jpeg = annotate_to_jpeg(
@@ -888,130 +941,105 @@ def annotate_case(result: CaseResult) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Pipelines — calls that depend on the previous call's answer
+# Pipelines — the amount-due locator
 # ---------------------------------------------------------------------------
 #
-# A Postman item can express any single request, but not "crop the region the
-# last job found and send THAT". A pipeline is a short chain of cases built at
-# run time. Every stage is still an ordinary Case that goes through run_case()
-# — same job.json, same layers, same annotated picture, same expectations
-# machinery — and only the glue between stages lives here.
+# A Postman item is one fixed request. ``--pipeline utility-bill`` is the one
+# case the collection cannot hold: a request built for whatever bill is
+# passed on the command line, with a result the report reads more closely
+# than a generic case. It is ONE call:
 #
-# The one pipeline so far reads the amount due off a photographed utility bill:
+#   POST /assess   criteria = [{the amount-due line, type "llm", score: false,
+#                               options: {hint "presence", boxes true}}]
 #
-#   stage 1  POST /assess   is this a utility bill at all?
-#            `text` criteria for the words a bill carries (Amount Due, Account
-#            Number, billing period, a usage unit) plus an `llm` presence
-#            criterion for the document as a whole. Anything but PASS stops the
-#            chain: locating an amount on a document that is not a bill would
-#            find *a* number, which is worse than finding none.
-#   stage 2  POST /locate   where is the amount due?
-#            fuzzy `text` features for the label ("Amount Due", "Total Due") →
-#            OCR line polygons in original page pixels, plus an `llm` presence
-#            feature with regions.llm_boxes for a model-drawn box. Candidates
-#            are ranked: a label line that already contains a dollar figure
-#            first, other label lines next, the model's box last.
-#   stage 3  POST /assess   read the value inside that region.
-#            The candidate is cropped out of the ORIGINAL page by this script —
-#            a page-wide strip around a label line, because on a bill the
-#            figure sits on the same ROW as its label, often at the far right
-#            of a table; a padded box for the model's box — and the crop is
-#            submitted as a new document with a regex `text` criterion for a
-#            currency figure and an `llm` criterion asked to state it. The
-#            answer is the figure on the OCR line nearest the label. The
-#            model's reading is kept beside it as a second opinion and only
-#            becomes the answer when OCR read nothing. A crop that yields no
-#            figure moves on to the next candidate, up to
-#            PIPELINE_MAX_CANDIDATES; each attempt is its own case.
+# `score: false` locates without judging. The service still makes the one
+# scoring call, because the enforcement loop gates on its presence score,
+# then clears the judgement from the result. The loop runs — ask on the gridded page, refine on a
+# zoomed crop, verify the crop — and returns every attempt. No judgement
+# is reported, only geometry: which attempt was accepted, its box, and every
+# rejected one. The report draws all of them on the original page (accepted
+# dotted and filled — the stroke every `llm` region gets — rejected dashed and
+# unfilled, straight from what the model said), plus a zoomed
+# view of the accepted box so a reader can see whether it sits on the words.
 #
-# Under --local the `llm` criteria are dropped, as for every case, so the gate
-# is the text criteria alone, the candidates are OCR-only, and the reading is
-# OCR-only. That is the deterministic half of the chain, and it is the half
-# that decides the answer — so the pipeline's expectations hold in both modes.
+# The expectation is a localisation check, not a model-judgement one: the
+# accepted box must overlap at least one hand-measured amount-due line on
+# the committed fixture (IoU >= BOX_MATCH_IOU). A bill prints the amount due
+# more than once, so every copy is listed and any of them counts.
+#
+# Under --local there is no vision model: the one criterion is `llm`, the
+# request is sent unchanged, and the criterion comes back status "error"
+# naming the model — recorded as skipped, like every other all-`llm` case.
 
 UTILITY_BILL_PIPELINE = "utility-bill"
 PIPELINES = (UTILITY_BILL_PIPELINE,)
 PIPELINE_FOLDER = "Pipeline: utility bill"
 PIPELINE_EXPECT_KEY = "pipeline: utility bill"
-DEFAULT_UTILITY_BILL = REPO_ROOT / "unit-tests" / "classifier" / "documents" / "utility_bill.jpeg"
 
-# Stage names double as keys into regions_expected.json.
-STAGE_1_NAME = "utility bill · 1 — is this a utility bill?"
-STAGE_2_NAME = "utility bill · 2 — where is the amount due?"
-STAGE_3_NAME = "utility bill · 3 — read the amount due inside that region"
-
-LABEL_CRITERION = "Amount Due"
-LABEL_FEATURES = ("Amount Due", "Total Due")
-UTILITY_LLM_CRITERION = "is a utility bill (electric, gas or water) issued by a utility company"
-AMOUNT_DUE_LLM_FEATURE = "the amount due line: the words 'Amount Due' next to the dollar figure owed"
-FIGURE_CRITERION = "dollar amount"
-FIGURE_LLM_CRITERION = "the amount due dollar figure is legible (state the exact figure in the reason)"
-
-# One regex, used twice: sent to the service as stage 3's `text` pattern, and
-# run again here over the OCR lines that came back. Matches "$80.49",
-# "$ 80.49", "-$100.49" and "1,234.56"; not "2026", not "110 163 922 385".
-CURRENCY_RE = re.compile(
-    r"-?\$\s?-?\d{1,3}(?:,\d{3})*\.\d{2}|(?<![\d.$])\d{1,3}(?:,\d{3})*\.\d{2}(?![\d.])"
+# The bills the pipeline runs on when --document is not given.
+UTILITY_BILL_FIXTURES = (
+    REPO_ROOT / "unit-tests" / "classifier" / "documents" / "utility_bill.jpeg",
+    REPO_ROOT / "unit-tests" / "classifier" / "documents" / "utility_bill_2.jpeg",
 )
 
-STAGE_1_CRITERIA: list[dict] = [
-    {"name": LABEL_CRITERION, "type": "text", "match": "fuzzy", "fuzzy_threshold": 0.8, "weight": 3.0},
-    {"name": "Account Number", "type": "text", "match": "fuzzy", "fuzzy_threshold": 0.8, "weight": 2.0},
-    {"name": "billing period", "type": "text", "match": "fuzzy", "fuzzy_threshold": 0.8, "weight": 1.0},
-    {"name": "usage units", "type": "text", "match": "regex",
-     "pattern": r"(?i)\b(kwh|ccf|hcf|mcf|therms?|gallons?)\b", "weight": 1.0},
-    {"name": UTILITY_LLM_CRITERION, "type": "llm", "hint": "presence", "weight": 4.0},
-    {"name": "document legibility", "type": "llm", "hint": "quality", "weight": 1.0},
+# The case name, suffixed with the document's file name, is the key into
+# regions_expected.json — the same question on a different bill has a
+# different right answer.
+LOCATE_NAME = "utility bill — where is the amount due?"
+AMOUNT_DUE_FEATURE = "the amount due line: the words 'Amount Due' next to the dollar figure owed"
+LOCATE_CRITERIA: list[dict] = [
+    {
+        "name": AMOUNT_DUE_FEATURE,
+        "type": "llm",
+        "score": False,
+        "options": {"hint": "presence", "boxes": True},
+    },
 ]
 
-STAGE_2_FEATURES: list[dict] = [
-    {"name": "Amount Due", "type": "text", "match": "fuzzy", "fuzzy_threshold": 0.8},
-    {"name": "Total Due", "type": "text", "match": "fuzzy", "fuzzy_threshold": 0.85},
-    {"name": AMOUNT_DUE_LLM_FEATURE, "type": "llm", "hint": "presence"},
-]
-STAGE_2_REGIONS = {"enabled": True, "layers": ["svg", "preview"], "llm_boxes": True}
+# How much the accepted box has to overlap one of the expected boxes. 0.25 is
+# the line the grounding measurements used for a "hit": a box on the right
+# line that is a little wide or a little short clears it; a box on the line
+# above does not.
+BOX_MATCH_IOU = 0.25
 
-STAGE_3_CRITERIA: list[dict] = [
-    {"name": FIGURE_CRITERION, "type": "text", "match": "regex", "pattern": CURRENCY_RE.pattern, "weight": 3.0},
-    {"name": LABEL_CRITERION, "type": "text", "match": "fuzzy", "fuzzy_threshold": 0.8, "weight": 1.0},
-    {"name": FIGURE_LLM_CRITERION, "type": "llm", "hint": "quality", "weight": 1.0},
-]
+# The zoomed view: the accepted box plus this fraction of the page on every
+# side, so the line above and below are visible for context.
+ZOOM_PAD = 0.04
 
-# Crop padding as multiples of the candidate box. A label line gets a strip
-# as wide as the page and three line-heights tall: the figure is on the same
-# row, possibly far away, and a photographed page is rarely level.
-CROP_PAD_X_LABEL = 8.0
-CROP_PAD_Y_LABEL = 1.0
-CROP_PAD_LLM = 0.15
-PIPELINE_MAX_CANDIDATES = 3
+
+def _locate_name(document: pathlib.Path) -> str:
+    return f"{LOCATE_NAME} — {document.name}"
 
 
 @dataclasses.dataclass
 class PipelineStage:
-    role: str                 # "gate" | "locate" | "read"
+    role: str                 # "locate"
     result: CaseResult
-    decided: str = ""         # one line: what this stage concluded
+    decided: str = ""         # one line: what the call concluded
 
 
 @dataclasses.dataclass
 class PipelineResult:
-    """The chain's own bookkeeping — the stages are ordinary CaseResults."""
+    """What the one /assess call found, read out of its CaseResult."""
 
     name: str
     document: pathlib.Path
     stages: list[PipelineStage] = dataclasses.field(default_factory=list)
-    is_utility: Optional[bool] = None
-    gate: dict = dataclasses.field(default_factory=dict)
-    candidates: list[dict] = dataclasses.field(default_factory=list)
-    region: Optional[dict] = None          # the candidate the value was read from
-    crop: Optional[dict] = None            # the crop that candidate produced
-    readings: list[dict] = dataclasses.field(default_factory=list)
-    value: Optional[str] = None
-    value_source: Optional[str] = None     # "ocr" | "llm-reason"
-    llm_reading: Optional[str] = None
+    attempts: list[dict] = dataclasses.field(default_factory=list)
+    accepted: Optional[dict] = None        # the accepted attempt, as the service returned it
+    calls: int = 0                          # model calls the loop made (ask/refine/verify)
+    scoring_calls: int = 0                  # one scoring call per item, before the loop
+    zoom: Optional[str] = None              # file name of the zoomed view
+    zoom_window_px: Optional[list] = None   # [left, top, right, bottom] of the zoom, upright page px
+    best_iou: Optional[float] = None        # accepted box vs the nearest expected box
     stopped_at: Optional[str] = None
+    adhoc: bool = False
     notes: list[str] = dataclasses.field(default_factory=list)
     checks: list[dict] = dataclasses.field(default_factory=list)
+
+    @property
+    def expect_key(self) -> str:
+        return f"{PIPELINE_EXPECT_KEY} — {self.document.name}"
 
     @property
     def results(self) -> list[CaseResult]:
@@ -1020,31 +1048,6 @@ class PipelineResult:
     @property
     def ok(self) -> bool:
         return all(c["ok"] for c in self.checks)
-
-
-def _stage_case(
-    index: int,
-    name: str,
-    path: str,
-    upload: Optional[pathlib.Path],
-    form: dict[str, str],
-    *,
-    description: str = "",
-    expect_key: Optional[str] = None,
-) -> Case:
-    return Case(
-        name=name,
-        folder=PIPELINE_FOLDER,
-        index=index,
-        method="POST",
-        path=path,
-        description=description,
-        headers={},
-        form=dict(form),
-        upload=upload,
-        subject=upload,
-        expect_key=expect_key,
-    )
 
 
 def _compact(payload: Any) -> str:
@@ -1058,200 +1061,111 @@ def run_utility_bill_pipeline(
     args: argparse.Namespace,
     *,
     first_index: int,
+    adhoc: bool = False,
 ) -> PipelineResult:
-    """Gate → locate → read, stopping at the first stage that has no answer."""
-    pipe = PipelineResult(name=UTILITY_BILL_PIPELINE, document=document)
-    index = first_index
-
-    # -- stage 1: is this a utility bill? ------------------------------------
-    case = _stage_case(
-        index, STAGE_1_NAME, "/v1/classifier/assess", document,
-        {
-            "ocr": "always",
-            "regions": "svg,preview",
-            "criteria": _compact(STAGE_1_CRITERIA),
-        },
+    """Ask the model where the amount due is, and read back every attempt."""
+    pipe = PipelineResult(name=UTILITY_BILL_PIPELINE, document=document, adhoc=adhoc)
+    case = Case(
+        name=_locate_name(document),
+        folder=PIPELINE_FOLDER,
+        index=first_index,
+        method="POST",
+        path="/v1/classifier/assess",
         description=(
-            "Gate for the chain. The text criteria are the words a bill carries; "
-            "the llm presence criterion judges the document as a whole. The chain "
-            "continues only on an overall PASS with that criterion PASSing (or, "
-            "under --local where it is dropped, on the text criteria alone). "
-            "Expect the four text criteria to hit on the OCR'd page."
+            "One /assess call with one `llm` criterion, score: false and "
+            "options.boxes on. The service makes the scoring call it gates on, "
+            "clears the judgement, and runs the enforcement loop: ask on the page with a labelled 0-1000 grid drawn on it, refine on "
+            "a zoomed crop of the original, verify the crop alone. Every attempt comes "
+            "back; the accepted one is dotted and filled in the picture, rejected ones "
+            "dashed and unfilled. "
+            "Expect the accepted box to sit on one of the bill's 'Amount Due' lines."
         ),
+        headers={},
+        form={"criteria": _compact(LOCATE_CRITERIA)},
+        uploads=[("file", document)],
+        subjects=[document],
+        adhoc=adhoc,
     )
-    r1 = run_case(case, transport, out_root, args)
-    index += 1
-    passed, gate = _utility_gate(r1)
-    pipe.gate = gate
-    if r1.phase != "completed":
-        pipe.stages.append(PipelineStage("gate", r1, f"job {r1.phase}: {r1.error or 'no error reported'}"))
-        pipe.stopped_at = "stage 1 did not complete"
+    result = run_case(case, transport, out_root, args)
+
+    if result.phase != "completed":
+        pipe.stopped_at = f"the /assess job {result.phase}: {result.error or 'no error reported'}"
+        pipe.stages.append(PipelineStage("locate", result, pipe.stopped_at))
         return pipe
-    pipe.is_utility = passed
+
+    entry = criterion_results(result).get(AMOUNT_DUE_FEATURE) or {}
+    if entry.get("status") == "error":
+        pipe.stopped_at = f"the criterion errored: {entry.get('error') or entry.get('reason')}"
+        pipe.stages.append(PipelineStage("locate", result, pipe.stopped_at))
+        return pipe
+    # Each item (page) ran its own loop, and its record is on its own unit —
+    # one unit for a photo, whose record the criterion also carries verbatim
+    # (an aggregate of one passes straight through); several for a PDF
+    # --document, where the criterion's merged record has no single
+    # accepted_attempt. Reading the units covers both the same way. Every
+    # attempt is tagged with its item so the zoom knows which page to cut.
+    units = [u for u in entry.get("items") or [] if u.get("item") is not None]
+    per_item = [(int(u["item"]), u.get("localization") or {}) for u in units]
+    if not per_item and entry.get("localization"):
+        per_item = [(0, entry["localization"])]  # a pre-schema-3 result
+    pipe.scoring_calls = len(units) or 1
+    for item, localization in per_item:
+        pipe.calls += int(localization.get("calls") or 0)
+        accepted_n = localization.get("accepted_attempt")
+        for attempt in localization.get("attempts") or []:
+            tagged = {"item": item, **attempt}
+            pipe.attempts.append(tagged)
+            if (
+                pipe.accepted is None
+                and attempt.get("accepted")
+                and attempt.get("attempt") == accepted_n
+            ):
+                pipe.accepted = tagged
+
+    if pipe.accepted is None:
+        pipe.stopped_at = (
+            f"no box accepted after {len(pipe.attempts)} attempt(s)"
+            if pipe.attempts
+            else (entry.get("reason") or "the loop did not run for the feature")
+        )
+        pipe.stages.append(PipelineStage("locate", result, pipe.stopped_at))
+        return pipe
+
+    a = pipe.accepted
     pipe.stages.append(
         PipelineStage(
-            "gate", r1,
-            f"{'utility bill' if passed else 'NOT a utility bill'} — overall "
-            f"{gate.get('overall_verdict')} {gate.get('overall_score')}, judged from {gate.get('basis')}",
+            "locate", result,
+            f"attempt {a.get('attempt')} accepted"
+            + (" (refined)" if a.get("refined") else "")
+            + f", verify {a.get('verify_score')}, box {_fmt_box(a.get('bbox_grid') or [])} on the 0-1000 grid",
         )
     )
-    if not passed:
-        pipe.stopped_at = "stage 1: the document did not pass as a utility bill"
-        return pipe
-
-    # -- stage 2: where is the amount due? -----------------------------------
-    case = _stage_case(
-        index, STAGE_2_NAME, "/v1/classifier/locate", document,
-        {
-            "ocr": "always",
-            "regions": _compact(STAGE_2_REGIONS),
-            "features": _compact(STAGE_2_FEATURES),
-        },
-        description=(
-            "No judgement, just geometry. The fuzzy text features return the OCR "
-            "line polygon of every 'Amount Due' / 'Total Due' on the page; the llm "
-            "feature runs the enforcement loop for a model-drawn box. Expect at "
-            "least one OCR region for 'Amount Due' — this bill prints it three "
-            "times (header, account summary, payment stub)."
-        ),
-    )
-    r2 = run_case(case, transport, out_root, args)
-    index += 1
-    if r2.phase != "completed":
-        pipe.stages.append(PipelineStage("locate", r2, f"job {r2.phase}: {r2.error or 'no error reported'}"))
-        pipe.stopped_at = "stage 2 did not complete"
-        return pipe
-    candidates = _amount_due_candidates(r2)
-    pipe.candidates = candidates
-    pipe.stages.append(
-        PipelineStage(
-            "locate", r2,
-            f"{len(candidates)} candidate region(s): "
-            + (", ".join(f"{c['source']} p{c['page']} {_fmt_box(c['bbox'])}" for c in candidates) or "none"),
-        )
-    )
-    if not candidates:
-        pipe.stopped_at = "stage 2: no region for the amount due"
-        return pipe
-
-    # -- stage 3: read the value inside that region ---------------------------
-    geometries = {g.page: g for g in page_geometries(r2)}
-    for attempt, candidate in enumerate(candidates[:PIPELINE_MAX_CANDIDATES], 1):
-        geometry = geometries.get(candidate["page"])
-        if geometry is None:
-            pipe.notes.append(f"candidate {attempt}: no page geometry for page {candidate['page']}")
-            continue
-        name = STAGE_3_NAME if attempt == 1 else f"{STAGE_3_NAME} · candidate {attempt}"
-        case = _stage_case(
-            index, name, "/v1/classifier/assess", None,
-            {
-                "ocr": "always",
-                "regions": "svg,preview",
-                "criteria": _compact(STAGE_3_CRITERIA),
-            },
-            description=(
-                "The crop of the candidate region, cropped by regions_report.py from "
-                "the original page and submitted as its own document. The regex "
-                "text criterion returns every currency figure in the crop as an OCR "
-                "line region; the answer is the figure on the line nearest the label. "
-                "The llm criterion is asked to state the figure in its reason, which "
-                "is read back as a second opinion."
-            ),
-            expect_key=STAGE_3_NAME,
-        )
-        crop_path = out_root / case.slug / "crop.jpg"
-        crop_path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            crop = _crop_candidate(document, geometry, candidate, crop_path)
-        except Exception as exc:  # noqa: BLE001
-            pipe.notes.append(f"candidate {attempt}: crop failed: {exc}")
-            continue
-        if crop is None:
-            pipe.notes.append(
-                f"candidate {attempt}: no local render for {document.suffix or 'this kind'}, cannot crop"
-            )
-            continue
-        case.upload = crop_path
-        case.subject = crop_path
-        pipe.region = candidate
-        pipe.crop = crop
-
-        r3 = run_case(case, transport, out_root, args)
-        index += 1
-        if r3.phase != "completed":
-            pipe.stages.append(PipelineStage("read", r3, f"job {r3.phase}: {r3.error or 'no error reported'}"))
-            continue
-
-        readings = _read_amount(r3, crop)
-        for reading in readings:
-            reading["candidate"] = attempt
-        pipe.readings.extend(readings)
-        llm_reading = _llm_reading(r3)
-        if llm_reading and not pipe.llm_reading:
-            pipe.llm_reading = llm_reading
-
-        best = next((r for r in readings if r["kind"] == "ocr"), None)
-        if best is None:
-            pipe.stages.append(
-                PipelineStage("read", r3, "no currency figure on any OCR line of the crop"
-                              + (f"; the model read {llm_reading}" if llm_reading else ""))
-            )
-            pipe.notes.append(f"candidate {attempt}: no dollar figure read in the crop")
-            continue
-        pipe.value = best["value"]
-        pipe.value_source = "ocr"
-        pipe.stages.append(
-            PipelineStage(
-                "read", r3,
-                f"{best['value']} on the OCR line {best['line']!r} (distance {best['distance']})"
-                + (f"; the model read {llm_reading}" if llm_reading else ""),
-            )
-        )
-        break
-
-    if pipe.value is None and pipe.llm_reading:
-        pipe.value = pipe.llm_reading
-        pipe.value_source = "llm-reason"
-        pipe.notes.append("OCR read no figure in any crop; the answer is the model's reading alone")
-    if pipe.value is None:
-        pipe.stopped_at = "stage 3: no amount due could be read from the region(s)"
+    try:
+        zoomed = _zoom_view(result, a)
+        if zoomed:
+            pipe.zoom, pipe.zoom_window_px = zoomed
+    except Exception as exc:  # noqa: BLE001 — a missing picture must not fail the run
+        pipe.notes.append(f"zoomed view failed: {exc}")
     return pipe
-
-
-def _utility_gate(result: CaseResult) -> tuple[bool, dict]:
-    """Decide stage 1. Overall PASS, and the llm presence criterion PASS when
-    it was scored — under --local it is dropped, and the text criteria carry
-    the decision alone, which the detail says in so many words."""
-    verdict, score = overall(result)
-    scores = criterion_results(result)
-    llm = scores.get(UTILITY_LLM_CRITERION)
-    detail: dict[str, Any] = {
-        "overall_verdict": verdict,
-        "overall_score": score,
-        "text_criteria": {
-            name: {"verdict": entry.get("verdict"), "score": entry.get("score")}
-            for name, entry in scores.items()
-            if entry.get("method") == "text"
-        },
-        "utility_criterion": (
-            {k: llm.get(k) for k in ("score", "verdict", "confidence", "reason")} if llm else None
-        ),
-    }
-    if llm is None:
-        detail["basis"] = "the text criteria alone (the llm criterion was not scored)"
-        return verdict == "PASS", detail
-    detail["basis"] = "the overall verdict and the llm presence criterion"
-    return verdict == "PASS" and llm.get("verdict") == "PASS", detail
-
-
-def _bounds(points: list) -> list[float]:
-    xs = [float(p[0]) for p in points]
-    ys = [float(p[1]) for p in points]
-    return [min(xs), min(ys), max(xs), max(ys)]
 
 
 def _fmt_box(box: list) -> str:
     return "[" + ", ".join(str(int(round(v))) for v in box) + "]"
+
+
+def _attempt_boxes(attempt: dict) -> tuple[Optional[list], Optional[list]]:
+    """(the model's first answer on the gridded page, the final box), both on
+    the page's 0-1000 grid.
+
+    With a refine pass, ``coarse_bbox_grid`` is the first answer and
+    ``bbox_grid`` the final one (the refined box mapped back, or the coarse
+    box again when the refine answer was unusable). Without one —
+    refine off, or the first answer failed validation so there was nothing to
+    refine — ``bbox_grid`` IS the first answer and is also the final box.
+    """
+    final = attempt.get("bbox_grid")
+    first = attempt.get("coarse_bbox_grid") or final
+    return first, final
 
 
 def _box_iou(a: list, b: list) -> float:
@@ -1264,253 +1178,118 @@ def _box_iou(a: list, b: list) -> float:
     return inter / union if union > 0 else 0.0
 
 
-def _amount_due_candidates(result: CaseResult) -> list[dict]:
-    """Every place stage 2 put the label, best first.
+def _zoom_view(result: CaseResult, attempt: dict) -> Optional[tuple[str, list[int]]]:
+    """Crop the ORIGINAL page around the accepted box and draw it, so the
+    reader can see the words inside it — on a phone photo of a whole bill the
+    full-page picture is too small to tell a line from the one above it."""
+    from PIL import ImageDraw
 
-    Rank 0: an OCR label line that already carries a dollar figure (the header
-    "Amount Due: $80.49") — the crop will contain the answer for certain.
-    Rank 1: any other OCR label line — the figure is on the same row.
-    Rank 2: the model's accepted box — a claim the loop verified by crop, kept
-    as the fallback for a bill whose label OCR could not read.
-    Within a rank, higher OCR confidence first. Two features landing on the
-    same line ("Amount Due" and "Total Due" on "Total Amount Due") collapse to one.
-    """
-    features = criterion_results(result)
-    found: list[dict] = []
-    for name in LABEL_FEATURES:
-        entry = features.get(name) or {}
-        for raw in entry.get("regions") or []:
-            region = Region.from_dict(raw)
-            text = str(region.attrs.get("text") or "")
-            found.append(
-                {
-                    "feature": name,
-                    "source": region.source,
-                    "page": region.page,
-                    "bbox": _bounds(region.points),
-                    "text": text,
-                    "score": region.score,
-                    "has_figure": bool(CURRENCY_RE.search(text)),
-                    "rank": 0 if CURRENCY_RE.search(text) else 1,
-                }
-            )
-
-    entry = features.get(AMOUNT_DUE_LLM_FEATURE) or {}
-    accepted = (entry.get("localization") or {}).get("accepted_attempt")
-    for raw in entry.get("regions") or []:
-        attrs = raw.get("attrs") or {}
-        if not (attrs.get("accepted") or (accepted is not None and attrs.get("attempt") == accepted)):
-            continue
-        region = Region.from_dict(raw)
-        found.append(
-            {
-                "feature": AMOUNT_DUE_LLM_FEATURE,
-                "source": "llm",
-                "page": region.page,
-                "bbox": _bounds(region.points),
-                "text": "",
-                "score": attrs.get("verify_score"),
-                "has_figure": False,
-                "rank": 2,
-            }
-        )
-
-    # Within a rank: short lines before long ones — "Amount Due" is a label,
-    # "please pay the Amount Due by the Due Date." is a sentence that mentions
-    # one — then higher OCR confidence first.
-    found.sort(key=lambda c: (c["rank"], len(c["text"].split()) > 6, -(c["score"] or 0.0)))
-    unique: list[dict] = []
-    for candidate in found:
-        if any(
-            candidate["page"] == kept["page"] and _box_iou(candidate["bbox"], kept["bbox"]) > 0.5
-            for kept in unique
-        ):
-            continue
-        unique.append(candidate)
-    return unique
-
-
-def _crop_candidate(
-    document: pathlib.Path, geometry: PageGeometry, candidate: dict, out_path: pathlib.Path
-) -> Optional[dict]:
-    """Cut the candidate out of the ORIGINAL page and write it as a JPEG.
-
-    The page comes from :func:`page_image`, so it is EXIF-transposed (photo)
-    or re-rendered at the service's size (PDF) — the same frame the regions
-    are in. A label line becomes a page-wide strip; a model box is padded
-    a little on every side. Returns where the label sits INSIDE the crop, so
-    stage 3 can measure distance to it without another OCR hit on the label.
-    """
-    image = page_image(document, candidate["page"], geometry)
+    # The accepted box's own item: page `page` of the fixture it came from,
+    # read upright (EXIF applied) — the frame `bbox_px` is in.
+    item = int(attempt.get("item") or 0)
+    geometry = next((g for g in page_geometries(result) if g.page == item), None)
+    source, page, _label = item_sources(result).get(item, (result.case.subject, 0, ""))
+    box = attempt.get("bbox_px")
+    if geometry is None or not box or source is None:
+        return None
+    image = page_image(source, page, geometry)
     if image is None:
         return None
     sx = image.width / geometry.width if geometry.width else 1.0
     sy = image.height / geometry.height if geometry.height else 1.0
-    x1, y1, x2, y2 = candidate["bbox"]
-    x1, x2, y1, y2 = x1 * sx, x2 * sx, y1 * sy, y2 * sy
-    w, h = max(x2 - x1, 1.0), max(y2 - y1, 1.0)
-    if candidate["source"] == "llm":
-        pad_x, pad_y = w * CROP_PAD_LLM, h * CROP_PAD_LLM
-    else:
-        pad_x, pad_y = w * CROP_PAD_X_LABEL, h * CROP_PAD_Y_LABEL
-    box = (
-        int(max(0, x1 - pad_x)),
-        int(max(0, y1 - pad_y)),
-        int(min(image.width, x2 + pad_x)),
-        int(min(image.height, y2 + pad_y)),
-    )
-    crop = image.crop(box)
-    crop.save(out_path, format="JPEG", quality=92)
-    return {
-        "file": out_path.name,
-        "box": list(box),
-        "width": crop.width,
-        "height": crop.height,
-        "label_in_crop": [x1 - box[0], y1 - box[1], x2 - box[0], y2 - box[1]],
-        "page_scale": [round(sx, 4), round(sy, 4)],
-    }
+    x1, y1, x2, y2 = box[0] * sx, box[1] * sy, box[2] * sx, box[3] * sy
+    pad_x, pad_y = image.width * ZOOM_PAD, image.height * ZOOM_PAD
+    left, top = int(max(0, x1 - pad_x)), int(max(0, y1 - pad_y))
+    right, bottom = int(min(image.width, x2 + pad_x)), int(min(image.height, y2 + pad_y))
+    crop = image.crop((left, top, right, bottom))
+    draw = ImageDraw.Draw(crop)
+    stroke = max(3, round(min(crop.size) / 120))
+    draw.rectangle((x1 - left, y1 - top, x2 - left, y2 - top), outline=(0, 170, 60), width=stroke)
+    name = "amount_due_zoom.jpg"
+    crop.save(result.out_dir / name, format="JPEG", quality=90)
+    return name, [left, top, right, bottom]
 
 
-def _normalise_amount(raw: str) -> str:
-    text = raw.replace(" ", "")
-    negative = text.startswith("-") or "$-" in text
-    digits = text.replace("$", "").replace("-", "")
-    return ("-" if negative else "") + "$" + digits
+def check_pipeline(pipe: PipelineResult, expectations: dict, *, local: bool = False) -> None:
+    """The localisation checks; the case's own checks come from check().
 
-
-def _read_amount(result: CaseResult, crop: dict) -> list[dict]:
-    """Every currency figure in the crop, nearest the label first.
-
-    The regex criterion's regions are OCR lines with their text in
-    ``attrs.text``; the regex is run again over each line here, because a
-    line can carry two figures and the region does not say which one hit.
-    Distance is measured from the label's own position inside the crop, in
-    label-heights vertically (a row apart is far) and crop-widths
-    horizontally (the far end of the same row is near). Figures with a
-    dollar sign outrank bare decimals; a negative outranks nothing.
+    An ad-hoc ``--document`` has no entry to be right or wrong against, so
+    its missing entry is recorded as skipped — with what WAS found, so the
+    run still says something — rather than failed or silently omitted.
     """
-    entry = criterion_results(result).get(FIGURE_CRITERION) or {}
-    lx1, ly1, lx2, ly2 = crop["label_in_crop"]
-    label_cx, label_cy = (lx1 + lx2) / 2, (ly1 + ly2) / 2
-    label_h = max(ly2 - ly1, 1.0)
-    width = max(crop.get("width") or 1, 1)
-
-    readings: list[dict] = []
-    for raw in entry.get("regions") or []:
-        region = Region.from_dict(raw)
-        line = str(region.attrs.get("text") or "")
-        bx1, by1, bx2, by2 = _bounds(region.points)
-        cx, cy = (bx1 + bx2) / 2, (by1 + by2) / 2
-        for match in CURRENCY_RE.finditer(line):
-            value = _normalise_amount(match.group(0))
-            readings.append(
-                {
-                    "kind": "ocr",
-                    "value": value,
-                    "raw": match.group(0),
-                    "line": line,
-                    "bbox": [bx1, by1, bx2, by2],
-                    "dollar": "$" in match.group(0),
-                    "negative": value.startswith("-"),
-                    "distance": round(abs(cy - label_cy) / label_h * 4 + abs(cx - label_cx) / width, 3),
-                    "ocr_confidence": region.score,
-                }
-            )
-    if not readings:
-        # No geometry (it should not happen for a JPEG crop) — the snippets
-        # still say what matched, just not where.
-        for snippet in (entry.get("detail") or {}).get("snippets") or []:
-            for match in CURRENCY_RE.finditer(str(snippet.get("text") or "")):
-                value = _normalise_amount(match.group(0))
-                readings.append(
-                    {
-                        "kind": "ocr-snippet",
-                        "value": value,
-                        "raw": match.group(0),
-                        "line": str(snippet.get("text") or ""),
-                        "bbox": None,
-                        "dollar": "$" in match.group(0),
-                        "negative": value.startswith("-"),
-                        "distance": None,
-                        "ocr_confidence": None,
-                    }
-                )
-    readings.sort(
-        key=lambda r: (r["negative"], not r["dollar"], r["distance"] if r["distance"] is not None else 99.0)
-    )
-    return readings
-
-
-def _llm_reading(result: CaseResult) -> Optional[str]:
-    """The figure the model stated in its reason, if it stated one."""
-    entry = criterion_results(result).get(FIGURE_LLM_CRITERION) or {}
-    matches = [m.group(0) for m in CURRENCY_RE.finditer(str(entry.get("reason") or ""))]
-    if not matches:
-        return None
-    matches.sort(key=lambda m: "$" not in m)
-    return _normalise_amount(matches[0])
-
-
-def check_pipeline(pipe: PipelineResult, expectations: dict, *, document_overridden: bool) -> None:
-    """The chain-level assertions; each stage's own checks come from check().
-
-    ``amount_due`` is only asserted for the committed fixture — an ad-hoc
-    ``--document`` has no entry to be right or wrong against, so that check is
-    recorded as skipped rather than failed or silently omitted.
-    """
-    expected = expectations.get(PIPELINE_EXPECT_KEY)
-    if expected is None:
+    result = pipe.stages[0].result if pipe.stages else None
+    entry = criterion_results(result).get(AMOUNT_DUE_FEATURE) or {} if result else {}
+    if local and (
+        (result is not None and result.phase == "failed")
+        or (
+            entry.get("status") == "error"
+            and "vision model" in str(entry.get("error") or "").lower()
+        )
+    ):
         pipe.checks.append(
             {
-                "kind": "coverage",
-                "target": PIPELINE_EXPECT_KEY,
-                "ok": False,
-                "expected": "an entry in regions_expected.json",
-                "actual": "none",
+                "kind": "pipeline",
+                "target": "amount-due box",
+                "ok": True,
+                "skipped": True,
+                "expected": "an accepted box",
+                "actual": "no vision model is reachable in --local mode",
             }
         )
         return
 
-    if "is_utility" in expected:
+    expected = expectations.get(pipe.expect_key)
+    if expected is None:
+        pipe.checks.append(
+            {
+                "kind": "coverage",
+                "target": pipe.expect_key,
+                "ok": pipe.adhoc,
+                "skipped": pipe.adhoc,
+                "expected": "nothing (ad-hoc --document)" if pipe.adhoc
+                else "an entry in regions_expected.json",
+                "actual": (
+                    f"accepted {_fmt_box(pipe.accepted.get('bbox_grid') or [])}"
+                    if pipe.accepted else f"nothing accepted — {pipe.stopped_at}"
+                ) if pipe.adhoc else "none",
+            }
+        )
+        return
+
+    if expected.get("box_accepted"):
         pipe.checks.append(
             {
                 "kind": "pipeline",
-                "target": "stage 1 · is a utility bill",
-                "ok": pipe.is_utility == expected["is_utility"],
-                "expected": expected["is_utility"],
-                "actual": pipe.is_utility if pipe.is_utility is not None else pipe.stopped_at,
+                "target": "a box was accepted",
+                "ok": pipe.accepted is not None,
+                "expected": True,
+                "actual": True if pipe.accepted else pipe.stopped_at,
             }
         )
-    if expected.get("region_found"):
-        pipe.checks.append(
-            {
-                "kind": "pipeline",
-                "target": "stage 2 · a region for the amount due",
-                "ok": bool(pipe.candidates),
-                "expected": ">= 1 candidate",
-                "actual": len(pipe.candidates) if pipe.candidates else (pipe.stopped_at or 0),
-            }
-        )
-    if "amount_due" in expected:
-        if document_overridden:
+
+    boxes = expected.get("amount_due_boxes_grid") or []
+    if boxes:
+        if pipe.accepted is None or not pipe.accepted.get("bbox_grid"):
             pipe.checks.append(
                 {
                     "kind": "pipeline",
-                    "target": "stage 3 · amount due",
-                    "ok": True,
-                    "skipped": True,
-                    "expected": expected["amount_due"],
-                    "actual": f"{pipe.value or 'nothing read'} (ad-hoc --document; not asserted)",
+                    "target": "the box sits on an amount-due line",
+                    "ok": False,
+                    "expected": f"IoU >= {BOX_MATCH_IOU} with one of {len(boxes)} expected box(es)",
+                    "actual": pipe.stopped_at or "no accepted box",
                 }
             )
         else:
+            got = pipe.accepted["bbox_grid"]
+            scored = sorted(((_box_iou(got, b), b) for b in boxes), key=lambda t: -t[0])
+            pipe.best_iou = round(scored[0][0], 3)
             pipe.checks.append(
                 {
                     "kind": "pipeline",
-                    "target": "stage 3 · amount due",
-                    "ok": pipe.value == expected["amount_due"],
-                    "expected": expected["amount_due"],
-                    "actual": f"{pipe.value} via {pipe.value_source}" if pipe.value else (pipe.stopped_at or None),
+                    "target": "the box sits on an amount-due line",
+                    "ok": scored[0][0] >= BOX_MATCH_IOU,
+                    "expected": f"IoU >= {BOX_MATCH_IOU} with one of {len(boxes)} expected box(es)",
+                    "actual": f"IoU {pipe.best_iou} with {_fmt_box(scored[0][1])} (box {_fmt_box(got)})",
                 }
             )
 
@@ -1527,7 +1306,11 @@ def check(result: CaseResult, expectations: dict, *, local: bool = False) -> Non
 
       * ``http_status`` — for the cases whose whole point is a 400;
       * ``verdict`` — the overall verdict, when it is deterministic;
-      * per criterion ``verdict`` and ``min_regions``.
+      * per criterion ``status`` (ok | error | skipped), ``verdict`` and
+        ``min_regions`` — plus, for a request with several items,
+        ``item_verdicts`` (one verdict, or status, per unit in order; ``null``
+        asserts nothing) and ``region_pages`` (the items its regions landed
+        on).
 
     A criterion expectation of ``"verdict": null`` asserts nothing. That is
     how every `llm` row is written, because its score depends on a model and a
@@ -1537,6 +1320,18 @@ def check(result: CaseResult, expectations: dict, *, local: bool = False) -> Non
     false is claimed either way.
     """
     expected = expectations.get(result.case.expect_key or result.case.name)
+    if expected is None and result.case.adhoc:
+        result.checks.append(
+            {
+                "kind": "coverage",
+                "target": result.case.name,
+                "ok": True,
+                "skipped": True,
+                "expected": "nothing (ad-hoc --document)",
+                "actual": f"{result.phase}; see the pipeline section for what was read",
+            }
+        )
+        return
     if expected is None:
         result.checks.append(
             {
@@ -1561,27 +1356,6 @@ def check(result: CaseResult, expectations: dict, *, local: bool = False) -> Non
         )
         return
 
-    # A local run has no vision model. A request whose criteria are ALL `llm`
-    # cannot be trimmed (that would be a 400), and one `cv` criterion the
-    # detector service would have answered falls back to the model too — so
-    # the job fails with a 502 from `call_vllm`. That is the expected local
-    # outcome, not a regression in the thing this suite measures, so it is
-    # recorded as SKIPPED rather than counted against the run. The guard is
-    # narrow on purpose: only in `--local`, and only when the error names the
-    # model server. The same failure against the box is a real failure.
-    if local and result.phase == "failed" and "vllm" in (result.error or "").lower():
-        result.checks.append(
-            {
-                "kind": "phase",
-                "target": "job",
-                "ok": True,
-                "skipped": True,
-                "expected": "completed",
-                "actual": "failed: no vision model is reachable in --local mode",
-            }
-        )
-        return
-
     if result.phase != "completed":
         result.checks.append(
             {
@@ -1594,8 +1368,34 @@ def check(result: CaseResult, expectations: dict, *, local: bool = False) -> Non
         )
         return
 
+    # A local run has no vision model. A criterion that still reaches it — a
+    # request whose criteria are ALL `llm`, or a `cv` name with no OpenCV
+    # detector falling back to the model — comes back status: "error", and
+    # the assessment is then incomplete (overall verdict null). That is the
+    # expected local outcome, not a regression in what this suite measures,
+    # so those checks are recorded as SKIPPED. The guard is narrow on purpose:
+    # only in `--local`, and only for criteria whose error names the model.
+    # The same failure against the box is a real failure.
+    scores = criterion_results(result)
+    model_down = {
+        name for name, entry in scores.items()
+        if local and entry.get("status") == "error"
+        and "vision model" in str(entry.get("error") or "").lower()
+    }
+
     verdict, _score = overall(result)
-    if expected.get("verdict"):
+    if expected.get("verdict") and model_down:
+        result.checks.append(
+            {
+                "kind": "verdict",
+                "target": "overall",
+                "ok": True,
+                "skipped": True,
+                "expected": expected["verdict"],
+                "actual": f"incomplete: {sorted(model_down)} could not reach a vision model in --local mode",
+            }
+        )
+    elif expected.get("verdict"):
         result.checks.append(
             {
                 "kind": "verdict",
@@ -1606,7 +1406,6 @@ def check(result: CaseResult, expectations: dict, *, local: bool = False) -> Non
             }
         )
 
-    scores = criterion_results(result)
     for name, rule in (expected.get("criteria") or {}).items():
         entry = scores.get(name)
         if entry is None:
@@ -1625,6 +1424,28 @@ def check(result: CaseResult, expectations: dict, *, local: bool = False) -> Non
             )
             continue
 
+        if name in model_down:
+            result.checks.append(
+                {
+                    "kind": "criterion",
+                    "target": name,
+                    "ok": True,
+                    "skipped": True,
+                    "expected": rule,
+                    "actual": "status: error — no vision model is reachable in --local mode",
+                }
+            )
+            continue
+        if rule.get("status"):
+            result.checks.append(
+                {
+                    "kind": "criterion",
+                    "target": f"{name} · status",
+                    "ok": entry.get("status") == rule["status"],
+                    "expected": rule["status"],
+                    "actual": entry.get("status"),
+                }
+            )
         if rule.get("verdict"):
             result.checks.append(
                 {
@@ -1646,6 +1467,35 @@ def check(result: CaseResult, expectations: dict, *, local: bool = False) -> Non
                     "actual": count,
                 }
             )
+        if "item_verdicts" in rule:
+            # One entry per unit, in order: a verdict, or a status for a unit
+            # that did not answer ("skipped" / "error"); null asserts nothing.
+            got = [
+                unit.get("verdict") if unit.get("status") == "ok" else unit.get("status")
+                for unit in entry.get("items") or []
+            ]
+            want = list(rule["item_verdicts"])
+            ok = len(got) == len(want) and all(w is None or w == g for w, g in zip(want, got))
+            result.checks.append(
+                {
+                    "kind": "criterion",
+                    "target": f"{name} · per item",
+                    "ok": ok,
+                    "expected": want,
+                    "actual": got,
+                }
+            )
+        if "region_pages" in rule:
+            pages = sorted({r.get("page", 0) for r in entry.get("regions") or []})
+            result.checks.append(
+                {
+                    "kind": "criterion",
+                    "target": f"{name} · region pages",
+                    "ok": pages == sorted(rule["region_pages"]),
+                    "expected": sorted(rule["region_pages"]),
+                    "actual": pages,
+                }
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1662,6 +1512,8 @@ def region_stats(result: CaseResult) -> dict[str, int]:
 
 
 def llm_stats(result: CaseResult) -> tuple[int, int]:
+    """(attempts, accepted) across every criterion and item — a criterion's
+    localization is already the merge of its items'."""
     attempts = accepted = 0
     for entry in criterion_results(result).values():
         for attempt in (entry.get("localization") or {}).get("attempts") or []:
@@ -1671,8 +1523,19 @@ def llm_stats(result: CaseResult) -> tuple[int, int]:
 
 
 def detector_calls(result: CaseResult) -> int:
-    info = result.result.get("document_info") or {}
-    return int((info.get("detector") or {}).get("calls") or 0)
+    return int((result.result.get("detector") or {}).get("calls") or 0)
+
+
+def text_links(entry: dict) -> list[dict]:
+    """A criterion's text-layer links — a list (one per unit) in schema 3."""
+    text = (entry.get("artifacts") or {}).get("text") or []
+    return [text] if isinstance(text, dict) else list(text)
+
+
+def link_file(link: dict) -> str:
+    """The artifact file name a text link points at (``text.p0.auto.json``)."""
+    url = link.get("url") or ""
+    return url.rsplit("/", 1)[-1] if url else f"text.{link.get('key')}.json"
 
 
 def write_summary_json(
@@ -1704,6 +1567,7 @@ def write_summary_json(
                 "overall": {"verdict": verdict, "score": score},
                 "criteria": {
                     name: {
+                        "status": entry.get("status"),
                         "method": entry.get("method"),
                         "score": entry.get("score"),
                         "verdict": entry.get("verdict"),
@@ -1713,9 +1577,29 @@ def write_summary_json(
                             {r.get("page", 0) for r in entry.get("regions") or []}
                         ),
                         "localization": _localization_summary(entry),
+                        "text_layers": [link_file(link) for link in text_links(entry)],
+                        "complete": entry.get("complete"),
+                        "aggregate_used": entry.get("aggregate_used"),
+                        "items": [
+                            {
+                                "item": unit.get("item"),
+                                "document": unit.get("document"),
+                                "page": unit.get("page"),
+                                "status": unit.get("status"),
+                                "score": unit.get("score"),
+                                "verdict": unit.get("verdict"),
+                                "regions": unit.get("regions"),
+                            }
+                            for unit in entry.get("items") or []
+                        ],
                     }
                     for name, entry in criterion_results(result).items()
                 },
+                "documents": [
+                    {k: d.get(k) for k in ("index", "filename", "kind", "pages", "items")}
+                    for d in result.result.get("documents") or []
+                ],
+                "item_scores": result.result.get("items") or [],
                 "regions_by_source": region_stats(result),
                 "detector_calls": detector_calls(result),
                 "files": result.files,
@@ -1733,9 +1617,15 @@ def _localization_summary(entry: dict) -> Optional[dict]:
     if not localization:
         return None
     attempts = localization.get("attempts") or []
+    accepted = localization.get("accepted_attempt")
+    if accepted is None and localization.get("accepted"):
+        # Several items merged: no single attempt number, one per item instead.
+        accepted = ", ".join(
+            f"item {a.get('item')} #{a.get('attempt')}" for a in localization["accepted"]
+        )
     return {
         "attempts": len(attempts),
-        "accepted_attempt": localization.get("accepted_attempt"),
+        "accepted_attempt": accepted,
         "calls": localization.get("calls"),
     }
 
@@ -1757,30 +1647,22 @@ def tally(
 
 
 def _pipeline_summary(pipe: PipelineResult) -> dict:
+    result = pipe.stages[0].result if pipe.stages else None
     return {
         "name": pipe.name,
         "document": _rel(pipe.document),
+        "feature": AMOUNT_DUE_FEATURE,
+        "slug": result.case.slug if result else None,
+        "phase": result.phase if result else None,
+        "elapsed_s": round(result.elapsed_s, 2) if result else None,
         "stopped_at": pipe.stopped_at,
-        "is_utility": pipe.is_utility,
-        "gate": pipe.gate,
-        "candidates": pipe.candidates,
-        "region": pipe.region,
-        "crop": pipe.crop,
-        "value": pipe.value,
-        "value_source": pipe.value_source,
-        "llm_reading": pipe.llm_reading,
-        "readings": pipe.readings,
-        "stages": [
-            {
-                "role": stage.role,
-                "name": stage.result.case.name,
-                "slug": stage.result.case.slug,
-                "phase": stage.result.phase,
-                "elapsed_s": round(stage.result.elapsed_s, 2),
-                "decided": stage.decided,
-            }
-            for stage in pipe.stages
-        ],
+        "accepted": pipe.accepted,
+        "attempts": pipe.attempts,
+        "calls": pipe.calls,
+        "scoring_calls": pipe.scoring_calls,
+        "best_iou": pipe.best_iou,
+        "zoom": pipe.zoom,
+        "zoom_window_px": pipe.zoom_window_px,
         "notes": pipe.notes,
         "checks": pipe.checks,
     }
@@ -1790,15 +1672,27 @@ def print_pipelines(pipelines: Iterable[PipelineResult]) -> None:
     for pipe in pipelines:
         print()
         print(f"pipeline {pipe.name} — {pipe.document.name}")
-        for number, stage in enumerate(pipe.stages, 1):
-            print(f"  {number} {stage.role:<7} {stage.result.phase:<10} {_clip(stage.decided, 110)}")
-        if pipe.value:
-            line = f"  amount due: {pipe.value} ({pipe.value_source})"
-            if pipe.llm_reading:
-                line += f" · model: {pipe.llm_reading}"
-            print(line)
+        multi = len({a.get("item") for a in pipe.attempts}) > 1
+        for attempt in pipe.attempts:
+            first, final = _attempt_boxes(attempt)
+            where = f"item {attempt.get('item')} " if multi else ""
+            print(
+                f"  {where}attempt {attempt.get('attempt')}: "
+                + (f"{_fmt_box(first)}" if first else "no box")
+                + (f" -> refined {_fmt_box(final)}" if attempt.get("refined") and final else "")
+                + f"  verify={attempt.get('verify_score')}"
+                + f"  {'ACCEPTED' if attempt.get('accepted') else 'rejected'}"
+            )
+        if pipe.accepted:
+            print(
+                f"  amount due located: {_fmt_box(pipe.accepted.get('bbox_grid') or [])} "
+                f"(attempt {pipe.accepted.get('attempt')}, "
+                f"{pipe.scoring_calls} scoring + {pipe.calls} loop model call(s)"
+                + (f", IoU {pipe.best_iou}" if pipe.best_iou is not None else "")
+                + ")"
+            )
         else:
-            print(f"  amount due: not read — {pipe.stopped_at or 'see the stages'}")
+            print(f"  amount due not located — {pipe.stopped_at}")
         for check_row in (c for c in pipe.checks if not c["ok"]):
             print(
                 f"      ! {check_row['target']}: expected {check_row['expected']!r}, "
@@ -1938,22 +1832,22 @@ def _verdict_pill(verdict: Any) -> str:
 def _criteria_request_table(case: Case) -> str:
     rows = []
     for criterion in case.criteria:
+        options = criterion.get("options") or {}
         rows.append(
             "<tr>"
             f"<td>{_e(criterion.get('name'))}</td>"
             f"<td>{_e(criterion.get('type') or 'llm')}</td>"
-            f"<td>{_e(criterion.get('hint') or '')}</td>"
-            f"<td>{_e(criterion.get('match') or '')}</td>"
-            f"<td class='mono'>{_e(criterion.get('pattern') or '')}</td>"
+            f"<td>{'' if criterion.get('score', True) else 'false'}</td>"
+            f"<td class='mono'>{_e(json.dumps(options, ensure_ascii=False) if options else '')}</td>"
             f"<td>{_e(criterion.get('weight') or '')}</td>"
             f"<td>{_e(criterion.get('depends_on') or '')}</td>"
             "</tr>"
         )
     if not rows:
-        return "<p class='skip'>No criteria in this request.</p>"
+        return "<p class='skip'>No criteria in this request (the service's defaults apply).</p>"
     return (
-        "<table><thead><tr><th>criterion</th><th>type</th><th>hint</th><th>match</th>"
-        "<th>pattern</th><th>weight</th><th>depends_on</th></tr></thead><tbody>"
+        "<table><thead><tr><th>criterion</th><th>type</th><th>score</th><th>options</th>"
+        "<th>weight</th><th>depends_on</th></tr></thead><tbody>"
         + "".join(rows)
         + "</tbody></table>"
     )
@@ -1978,7 +1872,14 @@ def _criteria_result_table(result: CaseResult, expectations: dict) -> str:
         )
         rule = expected.get(name) or {}
         want = rule.get("verdict")
-        if want is None:
+        if rule.get("status") and want is None:
+            want_status = rule["status"]
+            check_cell = (
+                f"<span class='ok'>✓ {_e(want_status)}</span>"
+                if entry.get("status") == want_status
+                else f"<span class='bad'>✗ want {_e(want_status)}</span>"
+            )
+        elif want is None:
             check_cell = "<span class='skip'>not asserted</span>"
         elif entry.get("verdict") == want:
             check_cell = f"<span class='ok'>✓ {_e(want)}</span>"
@@ -1990,30 +1891,105 @@ def _criteria_result_table(result: CaseResult, expectations: dict) -> str:
             if regions
             else ""
         )
+        cells = []
+        for link in text_links(entry):
+            text_file = link_file(link)
+            label = text_file.removeprefix("text.").removesuffix(".json")
+            cells.append(
+                f'<a href="{_e(result.case.slug)}/{_e(text_file)}">{_e(label)}</a> '
+                f"<span class='skip'>{_e(link.get('source'))}, {_e(link.get('chars'))} chars</span>"
+                if text_file in result.files
+                else _e(label)
+            )
+        text_cell = "<br>".join(cells)
+        status = entry.get("status") or "ok"
+        verdict_cell = (
+            _verdict_pill(entry.get("verdict"))
+            if status == "ok"
+            else f'<span class="pill {"SKIPPED" if status == "skipped" else "FAIL"}">{_e(status)}</span>'
+        )
         rows.append(
             "<tr>"
             f"<td>{swatch}{_e(name)}</td>"
             f"<td>{_e(entry.get('method'))}</td>"
             f"<td>{_e(entry.get('score'))}</td>"
-            f"<td>{_verdict_pill(entry.get('verdict'))}</td>"
+            f"<td>{verdict_cell}</td>"
             f"<td>{_e(entry.get('confidence'))}</td>"
             f"<td>{_e(_short(_reason(entry), 220))}</td>"
             f"<td>{len(regions)}</td>"
             f"<td>{_e(', '.join(str(p) for p in pages))}</td>"
             f"<td>{_e(loc_text)}</td>"
+            f"<td>{text_cell}</td>"
             f"<td>{check_cell}</td>"
             "</tr>"
         )
     return (
         "<table><thead><tr><th>criterion</th><th>method</th><th>score</th><th>verdict</th>"
-        "<th>conf</th><th>reason / detail</th><th>regions</th><th>pages</th>"
-        "<th>localization</th><th>expected</th></tr></thead><tbody>"
+        "<th>conf</th><th>reason / detail / error</th><th>regions</th><th>pages</th>"
+        "<th>localization</th><th>text searched</th><th>expected</th></tr></thead><tbody>"
         + "".join(rows)
         + "</tbody></table>"
     )
 
 
+def _items_table(result: CaseResult) -> str:
+    """Every criterion's per-item results, one row per item (one column per
+    criterion), with the item's own weighted score — so a multi-page or
+    multi-document case shows WHICH page answered, not only the aggregate."""
+    items = result.result.get("items") or []
+    scores = criterion_results(result)
+    if len(items) < 2 and not any(
+        len(entry.get("items") or []) > 1 for entry in scores.values()
+    ):
+        return ""  # one item: the Result table above already is the item
+    names = list(scores)
+    head = "".join(f"<th>{_e(name)}</th>" for name in names)
+    rows = []
+
+    def cell(unit: Optional[dict]) -> str:
+        if unit is None:
+            return "<td class='skip'>—</td>"
+        status = unit.get("status")
+        if status != "ok":
+            pill = f'<span class="pill {"SKIPPED" if status == "skipped" else "FAIL"}">{_e(status)}</span>'
+        else:
+            pill = _verdict_pill(unit.get("verdict")) + f" {_e(unit.get('score'))}"
+        regions = unit.get("regions")
+        return f"<td>{pill}{f' · {regions} region(s)' if regions else ''}</td>"
+
+    for item in items:
+        n = item.get("item")
+        units = []
+        for name in names:
+            entry = scores[name]
+            unit = next((u for u in entry.get("items") or [] if u.get("item") == n), None)
+            if unit is None:  # a document-scope criterion: its unit covers this item
+                unit = next((u for u in entry.get("items") or []
+                             if u.get("item") is None and n in (u.get("items") or [])), None)
+            units.append(cell(unit))
+        rows.append(
+            "<tr>"
+            f"<td>{_e(n)}</td><td>{_e(item.get('filename'))} p{_e((item.get('page') or 0) + 1)}</td>"
+            f"<td>{_verdict_pill(item.get('overall_verdict'))} {_e(item.get('overall_score') if item.get('overall_score') is not None else '')}"
+            f"{'' if item.get('complete', True) else ' <span class=bad>incomplete</span>'}</td>"
+            + "".join(units) + "</tr>"
+        )
+    used = "; ".join(
+        f"{_e(name)}: pages {_e((entry.get('aggregate_used') or {}).get('pages'))}, "
+        f"documents {_e((entry.get('aggregate_used') or {}).get('documents'))}"
+        for name, entry in scores.items()
+    )
+    return (
+        "<table><thead><tr><th>item</th><th>document · page</th><th>item score</th>"
+        + head + "</tr></thead><tbody>" + "".join(rows) + "</tbody></table>"
+        + f"<p class='meta'>aggregate_used — {used}. A document-scope criterion's cell "
+          "is its one unit for the whole document.</p>"
+    )
+
+
 def _reason(entry: dict) -> str:
+    if entry.get("error"):
+        return f"error: {entry['error']}"
     reason = entry.get("reason")
     if reason:
         return str(reason)
@@ -2024,21 +2000,24 @@ def _reason(entry: dict) -> str:
 
 
 def _pages_block(result: CaseResult) -> str:
-    """Annotated page beside the service's own preview, per page."""
+    """Annotated page beside the service's own preview, per item."""
     if not result.annotated:
         return ""
     panes = []
-    for name in sorted(result.annotated):
+    sources = item_sources(result)
+    for name in sorted(result.annotated, key=lambda n: int(n.split(".")[0][1:])):
         page = name.split(".")[0]
         slug = result.case.slug
         service = f"{page}.preview.jpg"
+        label = sources.get(int(page[1:]), (None, 0, page))[2]
+        panes.append(f"<h3>{_e(label)}</h3>")
         right = (
             f'<div class="pane"><div class="cap">the service\'s own '
             f'<code>{_e(service)}</code></div>'
             f'<img src="{_e(slug)}/{_e(service)}" alt="{_e(service)}"></div>'
             if service in result.files
-            else '<div class="pane"><div class="cap">no <code>preview</code> layer was '
-            "requested for this job</div></div>"
+            else '<div class="pane"><div class="cap">the <code>preview</code> layer could '
+            "not be fetched for this job</div></div>"
         )
         panes.append(
             f'<div class="pages"><div class="pane">'
@@ -2060,59 +2039,6 @@ def _links_block(result: CaseResult) -> str:
     if (result.out_dir / "response.json").is_file():
         links.append(f'<a href="{_e(slug)}/response.json">response.json</a>')
     return f'<div class="links">{"".join(links)}</div>' if links else ""
-
-
-def _examples_block(result: CaseResult) -> str:
-    """Per-example results and the diff layer, for a compare job."""
-    examples = result.result.get("example_results") or []
-    if not examples:
-        return ""
-    rows = []
-    for example in examples:
-        diff = example.get("diff") or {}
-        changes = diff.get("changes") or {}
-        rows.append(
-            "<tr>"
-            f"<td>e{_e(example.get('index'))}</td>"
-            f"<td>{_e(example.get('weight'))}</td>"
-            f"<td>{_e(example.get('pre_generated'))}</td>"
-            f"<td>{_e((example.get('similarity') or {}).get('overall_similarity'))}</td>"
-            f"<td>{_e(example.get('combined_score'))}</td>"
-            f"<td>{_verdict_pill(example.get('combined_verdict'))}</td>"
-            f"<td>{_e(diff.get('aligned'))}</td>"
-            f"<td>{_e(diff.get('inliers'))}</td>"
-            f"<td>{_e(', '.join(f'{k}:{v}' for k, v in changes.items()))}</td>"
-            f"<td>{_e(_short(str(diff.get('note') or ''), 140))}</td>"
-            "</tr>"
-        )
-    table = (
-        "<h3>Examples and change detection</h3>"
-        "<table><thead><tr><th>#</th><th>weight</th><th>pre-generated</th>"
-        "<th>similarity</th><th>combined</th><th>verdict</th><th>aligned</th>"
-        "<th>inliers</th><th>changes</th><th>note</th></tr></thead><tbody>"
-        + "".join(rows)
-        + "</tbody></table>"
-    )
-
-    slug = result.case.slug
-    layers = [
-        n for n in sorted(result.files)
-        if n.startswith("diff-") or n.startswith("e")
-    ]
-    if layers:
-        table += (
-            '<div class="links">'
-            + "".join(f'<a href="{_e(slug)}/{_e(n)}">{_e(n)}</a>' for n in layers)
-            + "</div>"
-        )
-    previews = [n for n in sorted(result.files) if n.endswith(".preview.jpg") and n.startswith(("e", "diff-"))]
-    if previews:
-        table += '<div class="pages">' + "".join(
-            f'<div class="pane"><div class="cap"><code>{_e(n)}</code></div>'
-            f'<img src="{_e(slug)}/{_e(n)}" alt="{_e(n)}"></div>'
-            for n in previews
-        ) + "</div>"
-    return table
 
 
 def _checks_table(checks: list[dict]) -> str:
@@ -2139,129 +2065,96 @@ def _checks_table(checks: list[dict]) -> str:
 
 
 def _pipeline_block(pipe: PipelineResult) -> str:
-    """The chain as one section: the answer, what each stage decided, the
-    candidate regions, every figure read, the crop, and the chain's checks.
-    The stages themselves are ordinary case sections further down."""
+    """The locator as one section: where the model put the amount due, every
+    attempt it made, the page with all of them drawn, and a zoomed view of
+    the accepted box. The call itself is an ordinary case section below."""
+    result = pipe.stages[0].result if pipe.stages else None
     parts = [
-        f'<h2 id="pipeline-{_e(pipe.name)}">Pipeline · {_e(pipe.name)} — {_e(pipe.document.name)}</h2>',
-        f'<p class="meta">document <code>{_e(_rel(pipe.document))}</code> · '
-        f"{len(pipe.stages)} stage(s) · "
-        + (_e(f"stopped: {pipe.stopped_at}") if pipe.stopped_at else "ran to the end")
+        f'<h2 id="pipeline-{_e(pipe.name)}-{_e(_slug(pipe.document.name))}">'
+        f"Where is the amount due? — {_e(pipe.document.name)}</h2>",
+        f'<p class="meta">document <code>{_e(_rel(pipe.document))}</code> · one '
+        f"<code>POST /assess</code>, one <code>llm</code> criterion with <code>score: false</code> and <code>boxes</code> on · "
+        f"{pipe.scoring_calls} scoring + {pipe.calls} loop model call(s)"
+        + (f' · <a href="#{_e(result.case.slug)}">the call</a>' if result else "")
         + "</p>",
-        '<p class="flow">1 · is this a utility bill? → 2 · where is the amount due? → '
-        "3 · crop that region and read the figure inside it</p>",
     ]
 
-    if pipe.value:
-        second = ""
-        if pipe.value_source == "ocr":
-            if pipe.llm_reading is None:
-                second = " · no model reading (not asked, or it stated no figure)"
-            elif pipe.llm_reading == pipe.value:
-                second = f" · the model agrees ({_e(pipe.llm_reading)})"
-            else:
-                second = f" · the model read <strong>{_e(pipe.llm_reading)}</strong> — a disagreement worth a look"
+    if pipe.accepted:
+        a = pipe.accepted
+        iou_text = f" · IoU {pipe.best_iou} with the nearest expected line" if pipe.best_iou is not None else ""
         parts.append(
-            f'<div class="answer">amount due <strong>{_e(pipe.value)}</strong> · read by '
-            f"<code>{_e(pipe.value_source)}</code>{second}</div>"
+            f'<div class="answer">located at <strong>{_e(_fmt_box(a.get("bbox_grid") or []))}</strong> '
+            f"on the 0-1000 grid · attempt {_e(a.get('attempt'))}"
+            f"{' · refined' if a.get('refined') else ''} · verify score {_e(a.get('verify_score'))}"
+            f"{_e(iou_text)}</div>"
         )
+        if a.get("verify_reason"):
+            parts.append(f'<p class="meta">the verifier saw: {_e(a.get("verify_reason"))}</p>')
     else:
         parts.append(
-            f'<div class="err"><strong>no amount due was read</strong> — '
-            f"{_e(pipe.stopped_at or 'see the stages below')}</div>"
+            f'<div class="err"><strong>no box was accepted</strong> — {_e(pipe.stopped_at)}</div>'
         )
     for note in pipe.notes:
         parts.append(f'<div class="notes">{_e(note)}</div>')
 
-    parts.append("<h3>Stages</h3>")
-    rows = []
-    for number, stage in enumerate(pipe.stages, 1):
-        result = stage.result
-        rows.append(
-            "<tr>"
-            f"<td>{number}</td><td>{_e(stage.role)}</td>"
-            f'<td><a href="#{_e(result.case.slug)}">{_e(result.case.name)}</a></td>'
-            f"<td class='mono'>{_e(result.case.endpoint)}</td>"
-            f"<td>{_e(result.phase)}</td><td>{result.elapsed_s:.1f}s</td>"
-            f"<td>{_e(stage.decided)}</td>"
-            "</tr>"
-        )
-    parts.append(
-        "<table><thead><tr><th>#</th><th>role</th><th>case</th><th>endpoint</th><th>phase</th>"
-        "<th>elapsed</th><th>decided</th></tr></thead><tbody>" + "".join(rows) + "</tbody></table>"
-    )
-
-    if pipe.candidates:
-        parts.append("<h3>Candidate regions for the amount due (stage 2, best first)</h3>")
-        rows = []
-        for number, candidate in enumerate(pipe.candidates, 1):
-            chosen = pipe.region is candidate
-            rows.append(
-                "<tr>"
-                f"<td>{number}{' ★' if chosen else ''}</td>"
-                f"<td>{_e(candidate['feature'])}</td><td>{_e(candidate['source'])}</td>"
-                f"<td>{_e(candidate['page'])}</td><td class='mono'>{_e(_fmt_box(candidate['bbox']))}</td>"
-                f"<td>{_e(candidate.get('score'))}</td>"
-                f"<td>{'yes' if candidate.get('has_figure') else ''}</td>"
-                f"<td>{_e(candidate.get('text'))}</td>"
-                "</tr>"
-            )
-        parts.append(
-            "<table><thead><tr><th>#</th><th>feature</th><th>source</th><th>page</th>"
-            "<th>bbox (page px)</th><th>score</th><th>has figure</th><th>OCR line</th></tr></thead>"
-            "<tbody>" + "".join(rows) + "</tbody></table>"
-            "<p class='meta'>★ the candidate the value was read from. Rank: a label line that already "
-            "carries a figure, then other label lines, then the model's box.</p>"
-        )
-
-    if pipe.readings:
-        parts.append("<h3>Figures read inside the crop (stage 3, nearest the label first)</h3>")
-        rows = []
-        for reading in pipe.readings:
-            rows.append(
-                "<tr>"
-                f"<td>{_e(reading.get('candidate'))}</td><td><strong>{_e(reading['value'])}</strong></td>"
-                f"<td>{_e(reading['kind'])}</td><td>{'$' if reading['dollar'] else ''}</td>"
-                f"<td>{_e(reading['distance'])}</td><td>{_e(reading.get('ocr_confidence'))}</td>"
-                f"<td>{_e(reading['line'])}</td>"
-                "</tr>"
-            )
-        parts.append(
-            "<table><thead><tr><th>candidate</th><th>value</th><th>kind</th><th>$</th>"
-            "<th>distance</th><th>OCR conf</th><th>OCR line</th></tr></thead>"
-            "<tbody>" + "".join(rows) + "</tbody></table>"
-            "<p class='meta'>Distance is measured from the label's position inside the crop: "
-            "label-heights vertically (a row apart is far) plus crop-widths horizontally "
-            "(the far end of the same row is near).</p>"
-        )
-
     panes = []
-    locate = next((s for s in pipe.stages if s.role == "locate"), None)
-    if locate and locate.result.annotated:
-        slug = locate.result.case.slug
-        name = sorted(locate.result.annotated)[0]
+    if result and result.annotated:
+        name = sorted(result.annotated)[0]
         panes.append(
-            f'<div class="pane"><div class="cap">stage 2 — every candidate, drawn on the original page</div>'
-            f'<img src="{_e(slug)}/{_e(name)}" alt="{_e(name)}"></div>'
+            f'<div class="pane"><div class="cap">every attempt, drawn on the original page — '
+            f"accepted dotted and filled, rejected dashed and unfilled</div>"
+            f'<img src="{_e(result.case.slug)}/{_e(name)}" alt="{_e(name)}"></div>'
         )
-    read = next((s for s in reversed(pipe.stages) if s.role == "read"), None)
-    if read and pipe.crop:
-        slug = read.result.case.slug
-        crop_name = pipe.crop["file"]
-        shown = sorted(read.result.annotated)[0] if read.result.annotated else crop_name
+    if result and pipe.zoom:
         panes.append(
-            f'<div class="pane"><div class="cap">stage 3 — the crop '
-            f"<code>{_e(_fmt_box(pipe.crop['box']))}</code> of page {_e(pipe.region['page'] if pipe.region else 0)}, "
-            f"{'with the figures it read' if read.result.annotated else 'as submitted'}"
-            f' (<a href="{_e(slug)}/{_e(crop_name)}">clean crop</a>)</div>'
-            f'<img src="{_e(slug)}/{_e(shown)}" alt="{_e(shown)}"></div>'
+            f'<div class="pane"><div class="cap">the accepted box, zoomed on the original</div>'
+            f'<img src="{_e(result.case.slug)}/{_e(pipe.zoom)}" alt="{_e(pipe.zoom)}"></div>'
         )
     if panes:
-        parts.append("<h3>The region, twice</h3>")
         parts.append('<div class="pages">' + "".join(panes) + "</div>")
 
+    if pipe.attempts:
+        parts.append("<h3>Attempts</h3>")
+        multi = len({a.get("item") for a in pipe.attempts}) > 1
+        rows = []
+        for attempt in pipe.attempts:
+            first, final = _attempt_boxes(attempt)
+            state = (
+                "<span class='ok'>accepted</span>" if attempt.get("accepted")
+                else "<span class='bad'>rejected</span>"
+            )
+            if attempt.get("refined"):
+                refined = "yes"
+            elif attempt.get("refine_reject"):
+                refined = f"no — {_e(_short(str(attempt['refine_reject']), 120))}"
+            else:
+                refined = ""  # no refine pass ran (refine off, or nothing valid to refine)
+            why = attempt.get("reject") or attempt.get("verify_reason") or ""
+            rows.append(
+                "<tr>"
+                + (f"<td>{_e(attempt.get('item'))}</td>" if multi else "")
+                + f"<td>{_e(attempt.get('attempt'))}</td>"
+                f"<td class='mono'>{_e(_fmt_box(first)) if first else '—'}</td>"
+                f"<td class='mono'>{_e(_fmt_box(final)) if final else '—'}</td>"
+                f"<td>{refined}</td>"
+                f"<td>{_e(attempt.get('verify_score'))}</td>"
+                f"<td>{state}</td>"
+                f"<td>{_e(_short(str(why), 200))}</td>"
+                "</tr>"
+            )
+        parts.append(
+            "<table><thead><tr>" + ("<th>item</th>" if multi else "")
+            + "<th>#</th><th>first answer</th><th>final box</th><th>refined</th>"
+            "<th>verify</th><th></th><th>reason</th></tr></thead><tbody>"
+            + "".join(rows) + "</tbody></table>"
+            "<p class='meta'>Boxes are on the 0-1000 grid of the page. The first answer is what "
+            "the model said on the gridded page; the final box is what was verified — its answer "
+            "on the zoomed crop, mapped back, or the first answer again when no refine was used. "
+            "The reason is why an attempt was rejected, or what the verifier saw in the crop.</p>"
+        )
+
     if pipe.checks:
-        parts.append("<h3>Chain-level checks</h3>")
+        parts.append("<h3>Checks</h3>")
         parts.append(_checks_table(pipe.checks))
     return "\n".join(parts)
 
@@ -2345,29 +2238,35 @@ def write_html(
             body.append(f'<div class="notes">{_e(note)}</div>')
 
         body.append("<h3>Request</h3>")
-        options = result.case.regions_option
+        documents = [f"<code>{_e(_rel(path))}</code>" for _field, path in result.case.uploads]
+        documents += ["inline text"] * len(result.case.texts)
+        if result.case.json_body is not None:
+            documents = [f"<code>{_e(_rel(path))}</code>" for path in result.case.subjects] or documents
         body.append(
-            "<p class='meta'>regions option: <code>"
-            + _e(json.dumps(options) if isinstance(options, dict) else (options or "(off)"))
-            + "</code>"
-            + (f" · ocr <code>{_e(result.case.form.get('ocr'))}</code>" if result.case.form.get("ocr") else "")
-            + (f" · file <code>{_e(_rel(result.case.upload))}</code>" if result.case.upload else "")
+            "<p class='meta'>"
+            + ("JSON body" if result.case.json_body is not None else "multipart")
+            + (f" · {'document' if len(documents) == 1 else f'{len(documents)} documents'} "
+               + ", ".join(documents) if documents else "")
             + "</p>"
         )
         body.append(_criteria_request_table(result.case))
 
         body.append("<h3>Result</h3>")
         body.append(_criteria_result_table(result, expectations))
-        body.append(_examples_block(result))
+        per_item = _items_table(result)
+        if per_item:
+            body.append("<h3>Per item</h3>")
+            body.append(per_item)
 
         pages = _pages_block(result)
         if pages:
             body.append("<h3>Geometry, drawn twice</h3>")
             body.append(
                 "<p class='meta'>Left: drawn by this script from <code>regions.json</code> "
-                "onto the fixture on disk. Right: the service's own preview. They are "
-                "produced by different code from the same numbers — a difference between "
-                "them is itself the finding.</p>"
+                "onto the fixture on disk — per item, on that item's own page. Right: the "
+                "service's own preview of the same item. They are produced by different "
+                "code from the same numbers — a difference between them is itself the "
+                "finding.</p>"
             )
             body.append(pages)
         body.append(_links_block(result))
@@ -2438,12 +2337,13 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                              "is given and this is not)")
     parser.add_argument("--only", help="Run only items whose name contains this substring")
     parser.add_argument("--pipeline", action="append", choices=PIPELINES, default=None,
-                        help="Also run a chained pipeline (repeatable). `utility-bill`: is it a "
-                             "bill → where is the amount due → read the figure inside that region")
-    parser.add_argument("--document", type=pathlib.Path,
-                        help="Document for --pipeline (default: the committed "
-                             "unit-tests/classifier/documents/utility_bill.jpeg). With an "
-                             "ad-hoc document the amount-due expectation is skipped, not failed")
+                        help="Also run the amount-due locator (repeatable). `utility-bill`: one "
+                             "/assess call per bill asking the vision model where the amount due "
+                             "is, drawn on the page")
+    parser.add_argument("--document", type=pathlib.Path, action="append", default=None,
+                        help="Run --pipeline on this document instead of the committed "
+                             "fixtures (repeatable). An ad-hoc document has no expectations: "
+                             "its checks are recorded as skipped and its answer is reported")
     parser.add_argument("--out", type=pathlib.Path,
                         help="Output directory (default: "
                              "unit-tests/classifier/reports/<UTC timestamp>/)")
@@ -2453,11 +2353,12 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                         help="Expectations JSON")
     parser.add_argument("--parallel", type=int, default=1,
                         help="Cases in flight at once. Keep it at or below the box's "
-                             "CLASSIFIER_MAX_CONCURRENT (2) — a deeper queue only "
+                             "CLASSIFIER_MAX_CONCURRENT (4) — a deeper queue only "
                              "makes every elapsed number meaningless")
     parser.add_argument("--local", action="store_true",
                         help="Mount ai/classifier/main.py in-process instead of using "
-                             "HTTP. No vision model, so `llm` criteria are dropped")
+                             "HTTP. No vision model or detector, so `llm` and "
+                             "`detector` criteria are dropped")
     parser.add_argument("--keep-jobs", action="store_true",
                         help="Skip the DELETE /jobs/{id} cleanup at the end")
     return parser.parse_args(argv)
@@ -2505,9 +2406,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         print("No matching items. Check --folders / --only against the collection.")
         return 2
 
-    document = (args.document or DEFAULT_UTILITY_BILL).resolve()
-    if pipelines_wanted and not document.is_file():
-        raise SystemExit(f"--pipeline: document not found: {document}")
+    adhoc = args.document is not None
+    documents = [p.resolve() for p in (args.document or UTILITY_BILL_FIXTURES)]
+    if pipelines_wanted:
+        for path in documents:
+            if not path.is_file():
+                raise SystemExit(f"--pipeline: document not found: {path}")
 
     expectations = (
         json.loads(args.expect.read_text(encoding="utf-8")) if args.expect.is_file() else {}
@@ -2517,7 +2421,11 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     print(
         f"{len(cases)} case(s)"
-        + (f" + pipeline {', '.join(pipelines_wanted)} on {document.name}" if pipelines_wanted else "")
+        + (
+            f" + pipeline {', '.join(pipelines_wanted)} on "
+            f"{', '.join(d.name for d in documents)}{' (ad-hoc)' if adhoc else ''}"
+            if pipelines_wanted else ""
+        )
         + f" → {out_root}"
     )
     print(f"mode: {'local (in-process TestClient)' if args.local else base_url}\n")
@@ -2556,17 +2464,19 @@ def main(argv: Optional[list[str]] = None) -> int:
         # stage's request is built from the last stage's answer.
         runners = {UTILITY_BILL_PIPELINE: run_utility_bill_pipeline}
         for name in pipelines_wanted:
-            print(f"  · pipeline {name} ({document.name})", flush=True)
-            pipe = runners[name](
-                document, transport, out_root, args, first_index=len(results) + 1
-            )
-            pipelines.append(pipe)
-            results.extend(pipe.results)
+            for document in documents:
+                print(f"  · pipeline {name} ({document.name})", flush=True)
+                pipe = runners[name](
+                    document, transport, out_root, args,
+                    first_index=len(results) + 1, adhoc=adhoc,
+                )
+                pipelines.append(pipe)
+                results.extend(pipe.results)
 
     for result in results:
         check(result, expectations, local=args.local)
     for pipe in pipelines:
-        check_pipeline(pipe, expectations, document_overridden=args.document is not None)
+        check_pipeline(pipe, expectations, local=args.local)
 
     meta = {
         "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),

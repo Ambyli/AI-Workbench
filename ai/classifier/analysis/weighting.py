@@ -1,170 +1,127 @@
-"""Dependency resolution and the weighted overall score.
+"""The weighted overall score, and whether it is complete.
 
-The last two things that happen to a merged assessment, in this order:
-``apply_dependencies`` marks a criterion SKIPPED when the criterion it
-``depends_on`` did not PASS, and ``compute_weighted_score`` then collapses
-what is left into one score — so a skipped criterion is excluded from the
-weighting entirely rather than dragging the document down for the wrong
-reason.
+Dependencies are resolved by the scheduler BEFORE evaluation (a dependant of
+a criterion that did not pass is never run), so what arrives here is final;
+this module only collapses it into one number a caller can audit.
 
-    apply_dependencies()     — resolve depends_on chains, mark SKIPPED.
-    compute_weighted_score() — sum(score x weight) / total_weight, plus the
-                               breakdown a caller can audit.
-    _skipped_result()        — the SKIPPED shape, reused by the pipeline for a
-                               criterion that cannot be evaluated at all.
+    compute_weighted_score() — sum(score x weight) / total_weight over the
+                               criteria that COUNT, plus the breakdown, the
+                               verdict, and ``complete``.
 
-Process flow position: step 7 of ``analysis.pipeline.analyze_document``, after
-``llm.validate.validate_and_clamp`` and before the result is assembled.
+It runs twice over a result, with the same rules: once per ITEM, over that
+item's own per-criterion outcomes (each item's ``overall_score`` /
+``overall_verdict`` / ``complete``), and once over the AGGREGATED outcomes
+(``analysis.aggregate``) — the assessment's overall score and verdict. A
+document-scope ``text`` criterion has no per-item outcome, so the per-item
+pass lists it under ``excluded`` as not applicable.
+
+What counts: a criterion with ``score: true`` and ``status: "ok"``. Excluded:
+
+  * ``score: false``   — located, not judged;
+  * ``status: "skipped"`` — not applicable, or its dependency did not pass;
+    excluding it (rather than scoring it 1) is what keeps "not applicable"
+    from dragging the document down for the wrong reason;
+  * ``status: "error"`` — it has no score to count. Unlike the other two it
+    makes the assessment INCOMPLETE: ``complete: false``, ``overall_score``
+    and ``overall_verdict`` null, and the partial weighted score of what did
+    succeed still shown in ``weighted_score_breakdown`` — a caller must never
+    read a verdict that silently ignored a criterion it asked for.
+  * an aggregate with ``complete: False`` — some of its items errored. It
+    still COUNTS (its score is the aggregate of the items that answered), but
+    it makes the assessment incomplete exactly as an error does.
+
+Process flow position: called by ``analysis.pipeline.analyze_document`` after
+``analysis.scheduler.run_units`` (per item) and ``analysis.aggregate``
+(overall).
 """
 
+from __future__ import annotations
+
+from analysis.outcome import Outcome
 from api.schemas import CriterionInput
 from logger import logger
 from utils import verdict_from_score as _verdict_from_score
 
 
-def apply_dependencies(assessment: dict, criteria: list[CriterionInput]) -> dict:
-    """Mark dependent criteria SKIPPED if their dependency did not PASS.
-
-    Called after validate_and_clamp() but before compute_weighted_score() so
-    that skipped criteria are excluded from the weighted calculation.
-
-    A criterion is skipped when its depends_on target has any verdict other
-    than PASS — including FAIL, MARGINAL, or SKIPPED (propagating chains).
-    Skipped criteria receive verdict="SKIPPED", score=None, and contribute
-    zero weight to the overall score.
-
-    Multiple passes are run until no further changes occur, which correctly
-    resolves dependency chains of arbitrary depth (A → B → C).
+def compute_weighted_score(
+    criteria: list[CriterionInput],
+    outcomes: dict[str, Outcome],
+    *,
+    not_applicable: dict[str, str] | None = None,
+) -> dict:
+    """The ``assessment`` block's scoring fields.
 
     Args:
-        assessment: Clamped assessment dict containing per_criterion_scores.
-        criteria:   Full criteria list — only entries with depends_on are checked.
+        criteria:       The request's criteria.
+        outcomes:       ``{name: Outcome}`` for every criterion not in
+                        ``not_applicable``.
+        not_applicable: ``{name: why}`` for criteria that have no outcome at
+                        this level (a document-scope criterion, per item).
+                        Excluded with that reason; never incomplete.
 
     Returns:
-        The same assessment dict with any dependent criteria marked SKIPPED.
+        ``{"overall_score", "overall_verdict", "complete",
+        "weighted_score_breakdown"}``. The breakdown is None when nothing
+        counted at all (every criterion ``score: false``, skipped, or failed).
     """
-    per_criterion = assessment.get("per_criterion_scores", {})
-
-    # Quick exit if no criteria have dependencies
-    if not any(c.depends_on for c in criteria):
-        return assessment
-
-    # Map criterion name → depends_on name for fast lookup
-    dependency_map = {c.name: c.depends_on for c in criteria if c.depends_on}
-
-    # Multi-pass to resolve chains: keep iterating until nothing changes
-    changed = True
-    while changed:
-        changed = False
-        for criterion_name, depends_on_name in dependency_map.items():
-            if criterion_name not in per_criterion:
-                continue
-
-            current = per_criterion[criterion_name]
-
-            # Already skipped — nothing to do
-            if isinstance(current, dict) and current.get("verdict") == "SKIPPED":
-                continue
-
-            # Check the dependency's verdict
-            dep_result = per_criterion.get(depends_on_name, {})
-            dep_verdict = dep_result.get("verdict", "FAIL") if isinstance(dep_result, dict) else "FAIL"
-
-            if dep_verdict != "PASS":
-                logger.info(
-                    "apply_dependencies: skipping '%s' — dependency '%s' verdict=%s",
-                    criterion_name, depends_on_name, dep_verdict,
-                )
-                per_criterion[criterion_name] = {
-                    "verdict":    "SKIPPED",
-                    "score":      None,
-                    "confidence": None,
-                    "reason":     (
-                        f"Skipped - dependency '{depends_on_name}' "
-                        f"did not pass (verdict: {dep_verdict})."
-                    ),
-                    "method":     "skipped",
-                }
-                changed = True
-
-    assessment["per_criterion_scores"] = per_criterion
-    return assessment
-
-
-def compute_weighted_score(assessment: dict, criteria: list[CriterionInput]) -> dict:
-    """Compute the weighted overall score and attach the breakdown to the assessment.
-
-    Called only on combined_assessment after validate_and_clamp() has already
-    clamped all per-criterion scores.  Overwrites overall_score and
-    overall_verdict with the weighted result and adds weighted_score_breakdown.
-
-    Args:
-        assessment: Clamped assessment dict containing per_criterion_scores.
-        criteria:   Full criteria list providing each criterion's weight.
-
-    Returns:
-        The same assessment dict with overall_score, overall_verdict, and
-        weighted_score_breakdown updated in place.
-    """
-    per_criterion = assessment.get("per_criterion_scores", {})
-    matched = [
-        (c, per_criterion[c.name])
-        for c in criteria
-        if c.name in per_criterion
-        and isinstance(per_criterion[c.name], dict)
-        and per_criterion[c.name].get("verdict") != "SKIPPED"
+    not_applicable = dict(not_applicable or {})
+    present = [c for c in criteria if c.name not in not_applicable]
+    counted = [
+        (c, outcomes[c.name])
+        for c in present
+        if c.score
+        and outcomes[c.name].status == "ok"
+        and isinstance(outcomes[c.name].score, (int, float))
     ]
+    counted_names = {c.name for c, _ in counted}
+    errored = [
+        c.name for c in present
+        if c.score and (outcomes[c.name].status == "error" or not outcomes[c.name].complete)
+    ]
+    complete = not errored
 
-    if not matched:
-        logger.warning("compute_weighted_score: no matched criteria — skipping")
-        return assessment
+    breakdown = None
+    final = None
+    if counted:
+        total_weight = sum(c.weight for c, _ in counted)
+        weighted_sum = sum(o.score * c.weight for c, o in counted)
+        unrounded = weighted_sum / total_weight
+        final = max(1, min(10, round(unrounded)))
+        breakdown = {
+            "formula": "sum(score * weight) / total_weight",
+            "total_weight": round(total_weight, 4),
+            "weighted_sum": round(weighted_sum, 4),
+            "unrounded_average": round(unrounded, 4),
+            "final_score": final,
+            "partial": not complete,
+            "excluded": {
+                c.name: (
+                    not_applicable[c.name] if c.name in not_applicable
+                    else "score: false" if not c.score
+                    else outcomes[c.name].status
+                )
+                for c in criteria
+                if c.name not in counted_names
+            },
+            "per_criterion": {
+                c.name: {
+                    "score": o.score,
+                    "weight": c.weight,
+                    "contribution": round(o.score * c.weight, 4),
+                }
+                for c, o in counted
+            },
+        }
 
-    total_weight = sum(c.weight for c, _ in matched)
-    if total_weight == 0:
-        logger.warning("compute_weighted_score: total_weight is 0 — skipping")
-        return assessment
-
-    weighted_sum = sum(val["score"] * c.weight for c, val in matched)
-    unrounded = weighted_sum / total_weight
-    weighted_score = max(1, min(10, round(unrounded)))
-
-    assessment["overall_score"] = weighted_score
-    assessment["overall_verdict"] = _verdict_from_score(weighted_score)
-    assessment["weighted_score_breakdown"] = {
-        "formula": "sum(score * weight) / total_weight",
-        "total_weight": round(total_weight, 4),
-        "weighted_sum": round(weighted_sum, 4),
-        "unrounded_average": round(unrounded, 4),
-        "final_score": weighted_score,
-        "per_criterion": {
-            c.name: {
-                "score": val["score"],
-                "weight": c.weight,
-                "contribution": round(val["score"] * c.weight, 4),
-            }
-            for c, val in matched
-        },
-    }
+    overall = final if complete else None
+    verdict = _verdict_from_score(overall) if overall is not None else None
     logger.info(
-        "compute_weighted_score: final_score=%s weights=%s",
-        weighted_score,
-        {c.name: c.weight for c, _ in matched},
+        "compute_weighted_score: final=%s complete=%s counted=%d errored=%s",
+        final, complete, len(counted), errored,
     )
-    return assessment
-
-
-def _skipped_result(reason: str) -> dict:
-    """The SKIPPED shape used by apply_dependencies, reused for criteria that
-    cannot be evaluated at all (e.g. a cv criterion on a .docx).
-
-    SKIPPED criteria carry no score and are excluded from the weighted average
-    entirely — which is the right answer for "not applicable", as opposed to
-    FAIL, which would drag the document's score down for the wrong reason.
-    """
     return {
-        "verdict":    "SKIPPED",
-        "score":      None,
-        "confidence": None,
-        "reason":     reason,
-        "method":     "skipped",
+        "overall_score": overall,
+        "overall_verdict": verdict,
+        "complete": complete,
+        "weighted_score_breakdown": breakdown,
     }

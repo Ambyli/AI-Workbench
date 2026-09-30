@@ -46,7 +46,7 @@ import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import SpooledTemporaryFile
-from typing import Any, Iterator, Optional, Sequence
+from typing import Any, Iterable, Iterator, Optional, Sequence
 
 # File names are URL path segments. Anything outside this pattern is refused
 # before it reaches the filesystem — no separators, no leading dot, no "..".
@@ -285,19 +285,53 @@ class ArtifactStore:
         return dropped
 
     # ── Zip view ──────────────────────────────────────────────────────────
-    def zip_chunks(self, job_id: str, chunk_size: int = 64 * 1024) -> Iterator[bytes]:
-        """Yield a zip of every file in the directory, built on the fly.
+    def zip_chunks(
+        self,
+        job_id: str,
+        chunk_size: int = 64 * 1024,
+        *,
+        names: Optional[Iterable[str]] = None,
+        extra: Optional[dict[str, bytes | str]] = None,
+    ) -> Iterator[bytes]:
+        """Yield a zip of the directory's files, built on the fly.
 
         Nothing extra is stored: the archive is assembled into a spooled temp
         file (memory up to 8 MB, then disk) and streamed out, so a 40 MB job
         does not have to be held in RAM twice and no zip is left behind.
+
+        Args:
+            job_id:     The job whose directory is zipped.
+            chunk_size: Bytes per yielded chunk.
+            names:      Keep only these on-disk files (a subset view). A name
+                        that is not on disk is skipped — the zip is built
+                        from the files as they are. None keeps every file.
+            extra:      ``{name: bytes | str}`` entries generated for this zip
+                        only (a filtered index, say). They are written to the
+                        archive, never to the directory, and REPLACE an
+                        on-disk file of the same name inside the zip.
+
+        Every entry is ``<job_id>/<name>``, name-sorted, extras included.
         """
-        entries = self.list(job_id)
+        extra = dict(extra or {})
+        for name in extra:
+            self.path_of(job_id, name)  # same name rules as a stored file
+        wanted = None if names is None else set(names)
+        on_disk = {
+            entry["name"]
+            for entry in self.list(job_id)
+            if (wanted is None or entry["name"] in wanted) and entry["name"] not in extra
+        }
         with SpooledTemporaryFile(max_size=8 * 1024 * 1024) as spool:
             with zipfile.ZipFile(spool, "w", zipfile.ZIP_DEFLATED) as archive:
-                for entry in entries:
-                    path = self.path_of(job_id, entry["name"])
-                    archive.write(path, arcname=f"{job_id}/{entry['name']}")
+                for name in sorted(on_disk | set(extra)):
+                    arcname = f"{job_id}/{name}"
+                    if name in extra:
+                        data = extra[name]
+                        archive.writestr(
+                            arcname, data.encode("utf-8") if isinstance(data, str) else data
+                        )
+                    else:
+                        archive.write(self.path_of(job_id, name), arcname=arcname)
             spool.seek(0)
             while True:
                 chunk = spool.read(chunk_size)

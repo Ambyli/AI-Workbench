@@ -35,6 +35,11 @@ to exactly one caller (safe across tasks and processes),
   for inputs too large for ``metadata`` (images, request bodies), so a queued
   job survives a restart. ``ai/classifier/jobs/queue.py`` wires both together.
 
+* ``ConcurrencyLimit`` (from ``common.jobs.limits``) — a process-wide
+  ``asyncio.Semaphore`` that is safe across event loops and reports its
+  in-flight count and peak. What a job's inner work (model calls, OCR passes,
+  per-job fan-out) is bounded with; the classifier holds two (model calls, OCR passes).
+
 Optional deps: ``aiosqlite`` for ``SqliteRegistry``; ``asyncpg`` for
 ``PostgresRegistry``; ``fastapi`` for ``build_router``. Consumers who don't
 use those don't pay the import cost — each submodule imports its optional

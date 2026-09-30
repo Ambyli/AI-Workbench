@@ -17,6 +17,11 @@ need: it walks the pages, decides which ones need recognising, and writes the
 result back onto each ``Page`` (``text``, ``text_source="ocr"``,
 ``ocr_confidence``, ``ocr_lines``).
 
+``recognize_text_layer(page, engine, mode=...)`` is the non-mutating sibling:
+it returns a ``TextLayer`` and leaves the page alone, for a caller that needs
+several text layers of one page side by side (one per OCR setting). Apply one
+to a view with ``model.with_text_layers`` to search it.
+
 Recognition quality notes (why the preprocessing exists):
   * RapidOCR's detector works on the image as given — a 600px-wide phone photo
     of a letter has ~8px tall glyphs, below what the recogniser resolves. The
@@ -37,7 +42,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, Optional, Protocol, runtime_checkable
 
-from .model import Document
+from .model import Document, Page, TextLayer
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     import numpy as np
@@ -253,6 +258,61 @@ class RapidOCREngine:
 # ---------------------------------------------------------------------------
 
 
+def needs_recognition(
+    page: Page, mode: OCRMode, min_native_chars: int = DEFAULT_MIN_NATIVE_CHARS
+) -> bool:
+    """Whether ``mode`` asks for this page to be recognised at all.
+
+    The one rule both ``apply_ocr`` and ``recognize_text_layer`` apply, so the
+    mutating and the non-mutating paths can never disagree about which pages
+    they touch: a page with no image never is; ``never`` never is; ``always``
+    always is; ``auto`` is when the native text is under ``min_native_chars``.
+    """
+    if page.image_bgr is None or mode == "never":
+        return False
+    if mode == "always":
+        return True
+    return page.text_chars() < min_native_chars
+
+
+def recognize_text_layer(
+    page: Page,
+    engine: Optional[OCREngine],
+    *,
+    mode: OCRMode = "auto",
+    min_native_chars: int = DEFAULT_MIN_NATIVE_CHARS,
+) -> TextLayer:
+    """The text layer ``mode`` gives this page — WITHOUT touching the page.
+
+    The non-mutating sibling of ``apply_ocr``, for a caller that needs more
+    than one text layer of the same page (one per OCR setting, say). Returns:
+
+      * the page's own layer (``TextLayer.of_page``) when the mode does not
+        ask for recognition (see ``needs_recognition``), when ``engine`` is
+        None, or when recognition came back empty — an empty OCR result must
+        not replace a native layer or report itself as ``"ocr"``;
+      * otherwise a fresh ``source="ocr"`` layer with the recogniser's text,
+        mean confidence and line polygons.
+
+    Apply the result to a view of the document with
+    ``model.with_text_layers`` and search it with ``textmatch.match_text``;
+    the regions come out exactly as they would after ``apply_ocr``.
+    """
+    own = TextLayer.of_page(page)
+    if engine is None or not needs_recognition(page, mode, min_native_chars):
+        return own
+    result = engine.recognize(page.image_bgr)
+    if not result:
+        return own
+    return TextLayer(
+        page=page.index,
+        text=result.text,
+        source="ocr",
+        confidence=result.confidence,
+        lines=list(result.lines),
+    )
+
+
 def apply_ocr(
     document: Document,
     engine: Optional[OCREngine],
@@ -290,23 +350,22 @@ def apply_ocr(
 
     replaced = 0
     for page in document.pages:
-        if page.image_bgr is None:
-            continue  # txt/docx pages have nothing to recognise
-        if mode == "auto" and page.text_chars() >= min_native_chars:
-            continue
+        if not needs_recognition(page, mode, min_native_chars):
+            continue  # no image (txt/docx), or auto and the native text is enough
+        layer = recognize_text_layer(
+            page, engine, mode="always", min_native_chars=min_native_chars
+        )
+        if layer.source != "ocr":
+            continue  # recognition came back empty: leave the page as it was
 
-        result = engine.recognize(page.image_bgr)
-        if not result:
-            continue
-
-        page.text = result.text
+        page.text = layer.text
         page.text_source = "ocr"
-        page.ocr_confidence = result.confidence
+        page.ocr_confidence = layer.confidence
         # Keep the line polygons: ``page.text`` is exactly "\n".join of these
         # lines, so a character offset into it maps back to a line — and to
         # the box that line was read from. Dropping them here is what used to
         # make a text hit unlocalisable.
-        page.ocr_lines = list(result.lines)
+        page.ocr_lines = list(layer.lines)
         replaced += 1
 
     return replaced

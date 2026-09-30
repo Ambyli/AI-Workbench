@@ -14,7 +14,8 @@ The Postman collection mirrors this folder: `ai/classifier/classifier.postman_co
 has a **Documents** subfolder with one ready-to-run `POST /assess` per fixture,
 each already pointing at the file path below and carrying the same criteria,
 and a **Documents + regions** subfolder that re-sends the same fixtures with
-`regions` turned on so the geometry can be looked at rather than read about.
+criteria chosen for their geometry, so it can be looked at rather than read
+about (regions are always stored now; the layers render on first fetch).
 Import the collection, set the `litellm` and `virtual master key` variables,
 and click Send.
 
@@ -26,20 +27,28 @@ accuracy report.
 Total size: ~1.2 MB (the two PNGs dominate; they are JPEG round-tripped so PNG
 can compress the sensor noise).
 
+Every fixture but one is a single page — one **item**. A request may carry
+several documents, and every page of every document is one item (up to
+`CLASSIFIER_MAX_ITEMS`, 20); `invoice_two_page.pdf` is the two-item one, and
+the Postman **Documents** folder also sends three of these fixtures in one
+request. See [API.md § Documents, pages and items](../../../ai/classifier/API.md#documents-pages-and-items).
+
 ---
 
 ## Files
 
 | File | Kind | Text layer | Page images | What it exercises |
 |---|---|---|---|---|
-| [`invoice_native.pdf`](invoice_native.pdf) | pdf | native, 2 pages | 2 renders @ `CLASSIFIER_PDF_RENDER_DPI` | Native PDF text extraction, multi-page `cv` (worst page wins), all four text-match modes |
-| [`invoice_scanned.pdf`](invoice_scanned.pdf) | pdf | **none** — OCR required | 2 renders | The scan path: `ocr=auto` detects the missing text layer and recognises both pages |
+| [`invoice_native.pdf`](invoice_native.pdf) | pdf | native, 1 page | 1 render @ `CLASSIFIER_PDF_RENDER_DPI` | Native PDF text extraction, all four text-match modes; the payment terms follow the line-items table on the same page |
+| [`invoice_scanned.pdf`](invoice_scanned.pdf) | pdf | **none** — OCR required | 1 render | The scan path: `options.ocr: "auto"` sees the missing text layer and recognises the page; `"never"` vs `"always"` on two criteria gives two different stored text layers |
+| [`invoice_two_page.pdf`](invoice_two_page.pdf) | pdf | native, **2 pages** | 2 renders — **two items** | Multi-page documents: each page is its own item, criteria are aggregated across them (`options.aggregate`), and a sentence runs over the page break (`Please remit the balance to` / `the Acme Roofing billing office.`) so a `text` criterion with `options.scope: "document"` matches it and a page-scope one does not |
 | [`contract.txt`](contract.txt) | txt | native | none | Plain text: `cv` criteria SKIP, the LLM call is text-only |
 | [`proposal.docx`](proposal.docx) | docx | native (paragraphs **and** table cells) | none | Document-order extraction; a table row is searchable as `System Size \| 8.4 kW` |
 | [`photo_of_letter.png`](photo_of_letter.png) | image | **none** — OCR required | 1 | A badly photographed letter (3° skew, brightness gradient, mild blur, JPEG noise) that OCR still reads. Carries a logo, a stamp and a signature — see below |
 | [`photo_of_letter_blurry.png`](photo_of_letter_blurry.png) | image | **none** — OCR mostly fails | 1 | Sharpness FAIL, partial OCR, and `depends_on` skipping the LLM criterion |
 | [`unsupported_legacy.doc`](unsupported_legacy.doc) | — | — | — | The OLE2 rejection: HTTP 400 telling the caller to convert to .docx |
-| [`utility_bill.jpeg`](utility_bill.jpeg) | image | **none** — OCR required | 1 (5712×4284, EXIF orientation 6 → upright 4284×5712) | A real phone photo of a utility bill, **not** generated — the one fixture in this folder that is. Drives `regions_report.py --pipeline utility-bill`: is it a bill → where is the amount due → crop and read the figure. Prints **Amount Due $80.49** three times (header, account summary, payment stub); 5.8 MB, same order as `../Neighborhood.jpeg`. See [`../REGIONS_REPORT.md § Pipelines`](../REGIONS_REPORT.md#pipelines) |
+| [`utility_bill.jpeg`](utility_bill.jpeg) | image | **none** — OCR required | 1 (5712×4284, EXIF orientation 6 → upright 4284×5712) | A real phone photo of an Ohio Edison bill, **not** generated. Drives `regions_report.py --pipeline utility-bill`, which asks the vision model where the amount due is and draws its boxes. `Amount Due: $80.49` is printed on one line in the header and again on the payment stub. 5.8 MB, same order as `../Neighborhood.jpeg`. See [`../REGIONS_REPORT.md § Pipelines`](../REGIONS_REPORT.md#pipelines) |
+| [`utility_bill_2.jpeg`](utility_bill_2.jpeg) | image | **none** — OCR required | 1 (4032×3024, two pages side by side) | A real phone photo of an AEP Ohio bill, the pipeline's second fixture. Label and figure are **separate** OCR lines on the same row — `Amount due on or before` … `$193.33` — in the header and on the stub; `Total Amount Due At Last Billing $201.60` in the charges table is a different number. 2.6 MB |
 
 ---
 
@@ -95,59 +104,60 @@ with `CLASSIFIER_OCR_ENGINE=rapidocr` and the vision model stubbed at score 8
 
 ```json
 [
-  {"name": "Invoice #INV-2026-0042", "type": "text", "match": "contains", "weight": 3.0},
-  {"name": "Notice to Owner",        "type": "text", "match": "fuzzy",    "weight": 3.0},
-  {"name": "Payment Terms: Net 30",  "type": "text", "match": "exact",    "weight": 2.0},
-  {"name": "total amount",           "type": "text", "match": "regex", "pattern": "\\$[\\d,]+\\.\\d{2}"},
-  {"name": "lien waiver attached",   "type": "text", "match": "fuzzy", "pattern": "Lien Waiver Release"},
+  {"name": "Invoice #INV-2026-0042", "type": "text", "weight": 3.0},
+  {"name": "Notice to Owner",        "type": "text", "weight": 3.0, "options": {"match": "fuzzy"}},
+  {"name": "Payment Terms: Net 30",  "type": "text", "weight": 2.0, "options": {"match": "exact"}},
+  {"name": "total amount",           "type": "text", "options": {"match": "regex", "pattern": "\\$[\\d,]+\\.\\d{2}"}},
+  {"name": "lien waiver attached",   "type": "text", "options": {"match": "fuzzy", "pattern": "Lien Waiver Release"}},
   {"name": "sharpness",              "type": "cv"},
-  {"name": "document legibility",    "type": "llm",  "hint": "quality"}
+  {"name": "document legibility",    "type": "llm", "options": {"hint": "quality"}}
 ]
 ```
 
 | Criterion | Expected | Why |
 |---|---|---|
-| `Invoice #INV-2026-0042` | **PASS** 10, `method: text` | Exact string is in the page-1 text layer |
+| `Invoice #INV-2026-0042` | **PASS** 10, `method: text` | Exact string is in the text layer |
 | `Notice to Owner` | **PASS** 10 (ratio 0.86) | The document says `NOTICE TO OWNER`; fuzzy clears the 0.85 default |
-| `Payment Terms: Net 30` | **PASS** 10 | Whole-line match on **page 2** — `detail.pages` is `[1]` |
+| `Payment Terms: Net 30` | **PASS** 10 | Whole-line match, below the table |
 | `total amount` | **PASS** 10, `count: 3` | Regex finds `$1,200.00`, `$3,650.00`, `$4,850.00` |
 | `lien waiver attached` | **FAIL** 1 (best ratio ≈ 0.47) | Not in the document; below the 0.5 partial-credit floor, so no points |
-| `sharpness` | **PASS** 10, `detail` ends "(worst of 2 pages — page N)" | Rendered text pages are crisp |
-| `document legibility` | LLM-scored | One page image (page 0) plus the full extracted text go to the model |
-| **Overall** | PASS (9) | `document_info.ocr.ran` is **false** — a native text layer needs no OCR |
+| `sharpness` | **PASS** 10 | Rendered text pages are crisp |
+| `document legibility` | LLM-scored | The page image plus this criterion's text layer go to the model — one call for this criterion alone |
+| **Overall** | PASS (9) | `documents[0].document_info.ocr.layers[0].ran` is **false** — a native text layer needs no OCR. All five text criteria share one `text.p0.auto.json` (`source: "native"`) |
 
 ### `invoice_scanned.pdf`
 
 ```json
 [
-  {"name": "Notice to Owner",        "type": "text", "match": "fuzzy", "fuzzy_threshold": 0.8, "weight": 3.0},
-  {"name": "Invoice #INV-2026-0042", "type": "text", "match": "fuzzy", "fuzzy_threshold": 0.75},
-  {"name": "Payment Terms: Net 30",  "type": "text", "match": "fuzzy", "fuzzy_threshold": 0.8},
+  {"name": "Notice to Owner",        "type": "text", "weight": 3.0, "options": {"match": "fuzzy", "fuzzy_threshold": 0.8}},
+  {"name": "Invoice #INV-2026-0042", "type": "text", "options": {"match": "fuzzy", "fuzzy_threshold": 0.75}},
+  {"name": "Payment Terms: Net 30",  "type": "text", "options": {"match": "fuzzy", "fuzzy_threshold": 0.8}},
   {"name": "sharpness",              "type": "cv"},
-  {"name": "document legibility",    "type": "llm",  "hint": "quality"}
+  {"name": "document legibility",    "type": "llm", "options": {"hint": "quality"}}
 ]
 ```
 
 | Criterion | Expected | Why |
 |---|---|---|
-| `Notice to Owner` | **PASS** 10 (ratio ≈ 0.86) | OCR read both pages; `document_info.pages[*].text_source` is `ocr` |
+| `Notice to Owner` | **PASS** 10 (ratio ≈ 0.86) | OCR read the page; `artifacts.text[0].source` is `ocr` |
 | `Invoice #INV-2026-0042` | **PASS** 10 (ratio ≈ 0.98) | OCR drops the space in `Invoice#INV-…` — exactly why fuzzy exists here |
-| `Payment Terms: Net 30` | **PASS** 10 | Page 2, recognised cleanly |
+| `Payment Terms: Net 30` | **PASS** 10 | Recognised cleanly |
 | `sharpness` | **PASS** ~8 | JPEG scan is softer than a native render but well above the threshold |
-| **Overall** | PASS (9), `ocr.ran: true`, `pages_recognised: 2`, page confidence ≈ 0.99 | |
+| **Overall** | PASS (9), one OCR pass (`documents[0].document_info.ocr.layers[0].ran: true`), confidence ≈ 0.99 | Every criterion above uses `ocr: "auto"`, so they share ONE pass and one `text.p0.auto.json` |
 
-Re-send with `ocr=never` to watch every text criterion flip to **FAIL** 1 with
-`"No text available for this document…"` — the fastest way to confirm OCR is
-what is doing the work.
+Set `"ocr": "never"` on one text criterion to watch it flip to **FAIL** 1 with
+`"No text available for this document under ocr=never…"` while the others
+still pass — the job then stores two layers, `text.p0.auto.json` (`source:
+"ocr"`) and `text.p0.never.json` (`source: "none"`).
 
 ### `contract.txt`
 
 ```json
 [
   {"name": "Limited Warranty",  "type": "text", "weight": 3.0},
-  {"name": "contract date",     "type": "text", "match": "regex", "pattern": "\\d{4}-\\d{2}-\\d{2}"},
+  {"name": "contract date",     "type": "text", "options": {"match": "regex", "pattern": "\\d{4}-\\d{2}-\\d{2}"}},
   {"name": "sharpness",         "type": "cv"},
-  {"name": "mentions a warranty period", "type": "llm", "hint": "presence"}
+  {"name": "mentions a warranty period", "type": "llm", "options": {"hint": "presence"}}
 ]
 ```
 
@@ -155,17 +165,17 @@ what is doing the work.
 |---|---|---|
 | `Limited Warranty` | **PASS** 10, `count: 3` | Appears in the heading and twice in clause 2 |
 | `contract date` | **PASS** 10 | Regex matches `2026-03-14` |
-| `sharpness` | **SKIPPED**, `method: skipped` | A .txt has no page images; excluded from the weighted score entirely |
-| `mentions a warranty period` | LLM-scored, **text-only prompt** | `document_info.llm_image_page` is `null` |
+| `sharpness` | **SKIPPED**, `status: "skipped"` | A .txt has no page image; excluded from the weighted score entirely |
+| `mentions a warranty period` | LLM-scored, **text-only prompt** | `detail.image_sent` is `false`; `page_geometry` has one entry with null sizes |
 
 ### `proposal.docx`
 
 ```json
 [
   {"name": "Roofix Proposal",       "type": "text", "weight": 2.0},
-  {"name": "System Size | 8.4 kW",  "type": "text", "match": "contains", "weight": 3.0},
+  {"name": "System Size | 8.4 kW",  "type": "text", "weight": 3.0, "options": {"match": "contains"}},
   {"name": "has faces",             "type": "cv"},
-  {"name": "states the system size","type": "llm",  "hint": "presence"}
+  {"name": "states the system size","type": "llm",  "options": {"hint": "presence"}}
 ]
 ```
 
@@ -180,11 +190,11 @@ what is doing the work.
 
 ```json
 [
-  {"name": "Notice to Owner", "type": "text", "match": "fuzzy", "fuzzy_threshold": 0.8, "weight": 3.0},
-  {"name": "case number",     "type": "text", "match": "regex", "pattern": "CASE-\\d{5}", "weight": 2.0},
+  {"name": "Notice to Owner", "type": "text", "weight": 3.0, "options": {"match": "fuzzy", "fuzzy_threshold": 0.8}},
+  {"name": "case number",     "type": "text", "weight": 2.0, "options": {"match": "regex", "pattern": "CASE-\\d{5}"}},
   {"name": "sharpness",       "type": "cv",   "weight": 2.0},
   {"name": "proper exposure", "type": "cv"},
-  {"name": "document legibility", "type": "llm", "hint": "quality"}
+  {"name": "document legibility", "type": "llm", "options": {"hint": "quality"}}
 ]
 ```
 
@@ -194,21 +204,20 @@ what is doing the work.
 | `case number` | **PASS** 10 | `CASE-77813` survives recognition |
 | `sharpness` | **PASS** ~10 (variance ≈ 330) | Mild blur only |
 | `proper exposure` | **PASS** ~9 (mean ≈ 203) | The brightness gradient stays inside the accepted range |
-| **Overall** | PASS (10), `ocr.ran: true`, `pages_recognised: 1` | |
+| **Overall** | PASS (10), one OCR pass (`text.p0.auto.json`, `source: "ocr"`) | |
 
 Three more criteria are worth sending at this file, because it is the only
 fixture here with non-text marks on it (see § Marks on the letter):
 
 ```json
 [
-  {"name": "has a signature",     "type": "llm", "hint": "presence"},
-  {"name": "has a company logo",  "type": "llm", "hint": "presence"},
-  {"name": "has an official stamp","type": "llm", "hint": "presence"}
+  {"name": "has a signature",      "type": "llm", "options": {"hint": "presence", "boxes": true}},
+  {"name": "has a company logo",   "type": "llm", "options": {"hint": "presence", "boxes": true}},
+  {"name": "has an official stamp","type": "llm", "options": {"hint": "presence", "boxes": true}}
 ]
 ```
 
-All three should come back **present** (PASS), and with
-`regions={"enabled":true,"layers":["svg","png","preview"],"llm_boxes":true}`
+All three should come back **present** (PASS), and — with `options.boxes` —
 each should also come back with a box near the corresponding row of the marks
 table. The score is the model's and varies; what is worth asserting is that an
 accepted box overlaps the documented box rather than covering the page.
@@ -217,10 +226,10 @@ accepted box overlaps the documented box rather than covering the page.
 
 ```json
 [
-  {"name": "Notice to Owner", "type": "text", "match": "fuzzy", "fuzzy_threshold": 0.8, "weight": 3.0},
-  {"name": "case number",     "type": "text", "match": "regex", "pattern": "CASE-\\d{5}", "weight": 2.0},
+  {"name": "Notice to Owner", "type": "text", "weight": 3.0, "options": {"match": "fuzzy", "fuzzy_threshold": 0.8}},
+  {"name": "case number",     "type": "text", "weight": 2.0, "options": {"match": "regex", "pattern": "CASE-\\d{5}"}},
   {"name": "sharpness",       "type": "cv",   "weight": 2.0},
-  {"name": "document legibility", "type": "llm", "hint": "quality", "depends_on": "sharpness"}
+  {"name": "document legibility", "type": "llm", "depends_on": "sharpness", "options": {"hint": "quality"}}
 ]
 ```
 
@@ -229,8 +238,33 @@ accepted box overlaps the documented box rather than covering the page.
 | `sharpness` | **FAIL** 1 (variance ≈ 7) | Heavily out of focus |
 | `Notice to Owner` | **PASS** 10 | Only the two large headings and the logo wordmark survive OCR — and that is one of them |
 | `case number` | **FAIL** 1 | Body text is unreadable; OCR returns ~32 characters in total |
-| `document legibility` | **SKIPPED** | `depends_on: sharpness` did not PASS, so the LLM is never called |
+| `document legibility` | **SKIPPED** | `depends_on: sharpness` did not PASS, so the criterion is never evaluated — no model call |
 | **Overall** | MARGINAL (5) | |
+
+### `invoice_two_page.pdf`
+
+Two pages, two items. Page 1 is the invoice head and table and ends with
+"Please remit the balance to"; page 2 begins "the Acme Roofing billing
+office." and carries the payment terms.
+
+| Criterion | Expected | Why |
+|---|---|---|
+| `Net 30` (`text`) | **PASS** 10 — items FAIL / PASS | Only on page 2; the text default `sum` adds the hits across pages |
+| `remit to Acme` (`text`, `options.scope: "document"`, pattern `remit the balance to the Acme Roofing billing office`) | **PASS** 10 — one unit for the document | The pages are joined with one space and searched as one text; regions on **both** pages (`page` 0 and 1, `pdf-text`), the half of the phrase each holds. Its joined text is `text.d0.auto.json` |
+| the same pattern, page scope | **FAIL** 1 — items FAIL / FAIL | On neither page alone |
+| `NOTICE TO OWNER` with `options.aggregate: "all"` | **FAIL** 1 — items PASS / FAIL | `all` (= `worst`) wants every page |
+| `sharpness` (`cv`) | **PASS** | cv default `worst`: both renders are sharp |
+| **Overall** | MARGINAL (6) | Weighed over the aggregated criteria; each page's own score is in the result's `items` |
+
+### Three documents in one request
+
+`invoice_native.pdf` + `photo_of_letter.png` + `contract.txt` as three
+repeated `file` parts — three items. `Notice to Owner` (fuzzy) PASSes on the
+invoice and the letter and FAILs in the contract: PASS overall under the text
+default (`sum`), FAIL with `options.aggregate: {"documents": "all"}`.
+`sharpness` skips the `.txt` item and takes the worst of the two images
+(PASS). A `has text` locate criterion (`score: false`) has regions on items 0
+and 1 only.
 
 ### `unsupported_legacy.doc`
 
@@ -260,33 +294,34 @@ curl -s $LITELLM/v1/classifier/assess \
   -H "Authorization: Bearer $KEY" \
   -F "file=@$DOCS/invoice_native.pdf" \
   -F 'criteria=[
-    {"name":"Invoice #INV-2026-0042","type":"text","match":"contains","weight":3.0},
-    {"name":"Notice to Owner","type":"text","match":"fuzzy","weight":3.0},
-    {"name":"Payment Terms: Net 30","type":"text","match":"exact","weight":2.0},
-    {"name":"total amount","type":"text","match":"regex","pattern":"\\$[\\d,]+\\.\\d{2}"},
+    {"name":"Invoice #INV-2026-0042","type":"text","weight":3.0},
+    {"name":"Notice to Owner","type":"text","weight":3.0,"options":{"match":"fuzzy"}},
+    {"name":"Payment Terms: Net 30","type":"text","weight":2.0,"options":{"match":"exact"}},
+    {"name":"total amount","type":"text","options":{"match":"regex","pattern":"\\$[\\d,]+\\.\\d{2}"}},
     {"name":"sharpness","type":"cv"},
-    {"name":"document legibility","type":"llm","hint":"quality"}
+    {"name":"document legibility","type":"llm","options":{"hint":"quality"}}
   ]'
 # → {"job_id":"abc123","phase":"pending"}
 
 curl -s $LITELLM/v1/classifier/jobs/abc123 -H "Authorization: Bearer $KEY"
 
+# The exact text the text criteria searched
+curl -s $LITELLM/v1/classifier/jobs/abc123/artifacts/text.p0.auto.txt -H "Authorization: Bearer $KEY"
+
 # 2 — scanned PDF: OCR does the work
 curl -s $LITELLM/v1/classifier/assess \
   -H "Authorization: Bearer $KEY" \
   -F "file=@$DOCS/invoice_scanned.pdf" \
-  -F "ocr=auto" \
   -F 'criteria=[
-    {"name":"Notice to Owner","type":"text","match":"fuzzy","fuzzy_threshold":0.8,"weight":3.0},
-    {"name":"document legibility","type":"llm","hint":"quality"}
+    {"name":"Notice to Owner","type":"text","weight":3.0,"options":{"match":"fuzzy","fuzzy_threshold":0.8}},
+    {"name":"document legibility","type":"llm","options":{"hint":"quality"}}
   ]'
 
-# 3 — the same file with OCR off: every text criterion FAILs with a reason
+# 3 — the same file with OCR off for that criterion: it FAILs with a reason
 curl -s $LITELLM/v1/classifier/assess \
   -H "Authorization: Bearer $KEY" \
   -F "file=@$DOCS/invoice_scanned.pdf" \
-  -F "ocr=never" \
-  -F 'criteria=[{"name":"Notice to Owner","type":"text","match":"fuzzy"}]'
+  -F 'criteria=[{"name":"Notice to Owner","type":"text","options":{"match":"fuzzy","ocr":"never"}}]'
 
 # 4 — .docx: cv criteria SKIP, the LLM prompt is text-only
 curl -s $LITELLM/v1/classifier/assess \
@@ -295,7 +330,7 @@ curl -s $LITELLM/v1/classifier/assess \
   -F 'criteria=[
     {"name":"System Size | 8.4 kW","type":"text","weight":3.0},
     {"name":"has faces","type":"cv"},
-    {"name":"states the system size","type":"llm","hint":"presence"}
+    {"name":"states the system size","type":"llm","options":{"hint":"presence"}}
   ]'
 
 # 5 — legacy .doc: rejected immediately
@@ -303,14 +338,34 @@ curl -s $LITELLM/v1/classifier/assess \
   -H "Authorization: Bearer $KEY" \
   -F "file=@$DOCS/unsupported_legacy.doc" \
   -F 'criteria=[{"name":"Notice to Owner","type":"text"}]'
-# → 400 "Legacy .doc (OLE2 compound) files are not supported…"
+# → 400 "document #0 unsupported_legacy.doc: Legacy .doc (OLE2 compound) files are not supported…"
+
+# 5b — a two-page PDF and a photo: three items, one job; a phrase across the page break
+curl -s $LITELLM/v1/classifier/assess \
+  -H "Authorization: Bearer $KEY" \
+  -F "file=@$DOCS/invoice_two_page.pdf" \
+  -F "file=@$DOCS/photo_of_letter.png" \
+  -F 'criteria=[
+    {"name":"Net 30","type":"text"},
+    {"name":"remit to Acme","type":"text","options":{"pattern":"remit the balance to the Acme Roofing billing office","scope":"document"}},
+    {"name":"sharpness","type":"cv"}
+  ]'
+# → each criterion's `items` has one entry per page (the scope-document one, one per document)
+
+# 6 — the same request as JSON, with the file base64-encoded
+curl -s $LITELLM/v1/classifier/assess \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d "{\"documents\": [{\"type\": \"base64\", \"data\": \"$(base64 -w0 $DOCS/contract.txt)\"}],
+       \"criteria\": [{\"name\": \"Limited Warranty\", \"type\": \"text\"}]}"
 
 # What can this deployment actually handle right now?
 curl -s $LITELLM/v1/classifier/document-kinds -H "Authorization: Bearer $KEY"
 ```
 
 The legacy field name still works — `-F "image=@…"` is accepted anywhere
-`-F "file=@…"` is, so existing scripts keep running.
+`-F "file=@…"` is. The old `ocr` and `regions` form fields are refused with a
+400 naming where each one went (`options.ocr` on each criterion; regions are
+always stored).
 
 ---
 
@@ -320,14 +375,15 @@ The legacy field name still works — `-F "image=@…"` is accepted anywhere
   A 150 dpi render of crisp text has a very high Laplacian variance; a JPEG
   scan has a much lower one. Use `cv` criteria to judge photos, and the text
   layer to judge documents.
-* **`ocr.ran: false` is normal** for `invoice_native.pdf`, `contract.txt`, and
-  `proposal.docx`: `ocr=auto` only loads the OCR models when a page actually
-  has an image and no text.
+* **`ran: false` in `documents[i].document_info.ocr.layers` is normal** for
+  `invoice_native.pdf`, `contract.txt`, and `proposal.docx`: `ocr: "auto"`
+  only loads the OCR models when the page actually has an image and too
+  little native text.
 * **Regenerating changes the bytes only if the recipe changed** — the noise
   generator is seeded (`np.random.default_rng(20260921)`).
 * See [`ai/classifier/API.md`](../../../ai/classifier/API.md) for the full
   request/response reference, and `GET /document-kinds` for the live capability
   list of a running container.
-* To run every request in this folder (and the region-enabled variants) as one
+* To run every request in this folder (and the geometry-focused variants) as one
   suite and get the annotated pages back, see
   [`REGIONS_REPORT.md`](../REGIONS_REPORT.md).

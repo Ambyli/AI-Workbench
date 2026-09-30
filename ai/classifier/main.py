@@ -12,43 +12,52 @@ This module does four things and nothing else:
 
 Every endpoint handler lives in ``api/``:
 
-    api.assess         POST /assess, POST /assess/compare
-    api.locate         POST /locate
-    api.introspection  GET /hints, /cv-detectors, /document-kinds, /health
+    api.assess         POST /assess — the one analysis endpoint (JSON or
+                       multipart, parsed into one AssessRequest)
+    api.introspection  GET /criterion-types, /hints, /cv-detectors,
+                       /document-kinds, /health
     api.artifacts      the four /jobs/{job_id}/artifacts routes
     common.jobs.router GET /jobs, GET /jobs/{id}, DELETE /jobs/{id}
 
+/locate and /assess/compare were removed and answer 404 like any unknown
+route; /locate's job is ``score: false`` on a criterion of /assess.
+
 Overall request flow for /assess:
   1. HTTP request arrives → CorrelationIDMiddleware assigns [request_id].
-  2. ``api.assess.assess_document`` validates criteria and the ocr mode, and
-     reads the file bytes.
+  2. ``api.assess.assess`` validates the request (per-type criterion
+     options, caps, dependencies), resolves every document's bytes (base64,
+     inline text, or an SSRF-checked URL fetch), detects each kind, counts
+     the items (every page of every document) and refuses more than
+     CLASSIFIER_MAX_ITEMS — all before anything is queued.
   3. Job record created in SQLite via ``jobs_registry.register(..., "staging")``.
-  4. Payload (file bytes + criteria + ocr mode) written to
+  4. Payload (every document's bytes + validated criteria) written to
      PAYLOAD_DIR/<job_id>.json, then the row is flipped to "pending" and idle
      workers are woken.
   5. 202 Accepted returned immediately with job_id.
-  6. One of the worker tasks atomically claims the row (→ "processing"),
-     reads the payload, loads the document, runs OCR + CV + text + LLM, and calls
-     ``jobs_registry.set_result(...)`` on success or ``set_error(...)`` on failure.
+  6. One of the worker tasks atomically claims the row (→ "processing") and
+     runs ``jobs.runners.run_assess``: load every page of every document,
+     build one context per item, evaluate every (criterion, item) unit
+     independently (per-item dependency gating, CLASSIFIER_MAX_UNITS_PER_JOB
+     at once, model calls bounded by CLASSIFIER_MAX_LLM_CALLS and OCR by
+     CLASSIFIER_OCR_WORKERS across the process), aggregate each criterion
+     (pages → documents), weigh per item and overall, and store the
+     artifacts.
   7. Caller polls GET /jobs/{job_id} until phase="completed" or "failed".
 
 The jobs table IS the queue — see jobs/queue.py and common.jobs.worker — so up
 to CLASSIFIER_MAX_CONCURRENT jobs run at once and pending work survives
 restarts.
 
-Uploads are documents, not just images: JPEG/PNG, PDF (native or scanned),
-plain text, and .docx all load through ``common.documents`` into a page list
-that may carry an image, a text layer, or both. Criteria then run on whichever
-of those they need — ``cv`` on page images, ``text`` on the text layer
-(OCR-filled when the document is a scan), ``llm`` on one page image plus the
-extracted text.
+A request carries a list of documents: JPEG/PNG photos, PDFs of any page
+count (native or scanned), plain text, and .docx, all loaded through
+``common.documents`` into pages that may carry an image, a text layer, or
+both. Every page of every document is one item.
 
-Regions and layers (regions/, common.vision) are opt-in: pass `regions` on
-/assess or /assess/compare — or use /locate, where it is implied — and the job
-additionally writes a per-job artifact directory (regions.json, manifest.json,
-and the requested SVG / PNG / preview layers) served by the four artifact
-routes. A background sweeper prunes those directories, and the expired job
-rows themselves, past JOB_TTL_HOURS.
+Every job writes a per-job artifact directory (regions.json, one
+text.p<item>.<key>.json per item and text layer its criteria used, one base
+image per item, manifest.json with the item map); the SVG / PNG / preview
+layers are rendered on first fetch by the artifact routes. A background sweeper prunes those directories, and the
+expired job rows themselves, past JOB_TTL_HOURS.
 """
 
 import logging
@@ -60,9 +69,10 @@ from prometheus_fastapi_instrumentator import Instrumentator
 from common.jobs.router import build_router
 
 from api import artifacts as artifacts_api
-from api import assess, introspection, locate
+from api import assess, introspection
 from config import LOG_LEVEL
 from jobs.queue import jobs_registry, queue, sweeper
+from llm import client as llm_client
 from logger import logger
 from middleware import CorrelationIDMiddleware, RequestIDFilter
 from regions.sweeper import delete_artifacts_for_job
@@ -111,6 +121,7 @@ async def lifespan(app: FastAPI):
         "processing" in the DB and are requeued by the next startup.
       - ``sweeper.stop()``: cancel the sweep loop. A sweep is idempotent, so
         an interrupted one is simply redone next boot.
+      - ``llm_client.aclose()``: close the pooled vision-model HTTP client.
     """
     await jobs_registry.init()
     await queue.start()
@@ -121,6 +132,7 @@ async def lifespan(app: FastAPI):
 
     await sweeper.stop()
     await queue.stop()
+    await llm_client.aclose()
     logger.info("lifespan: shutdown complete")
 
 
@@ -161,9 +173,7 @@ app.include_router(
 # /jobs/{job_id}, whatever the include order.
 app.include_router(artifacts_api.build_artifacts_router(jobs_registry))
 
-# The endpoints themselves, in the order they were declared when they all
-# lived in this file: /assess and /assess/compare, then /locate, then the
-# introspection routes and /health.
+# The endpoints themselves: /assess, then the introspection routes and
+# /health.
 app.include_router(assess.router)
-app.include_router(locate.router)
 app.include_router(introspection.router)

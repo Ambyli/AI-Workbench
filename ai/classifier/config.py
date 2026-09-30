@@ -21,7 +21,6 @@ Process flow position: loaded first by every other module at import time.
 
 import ipaddress
 import os
-import re
 
 from common.net import DEFAULT_BLOCKED_NETWORKS
 
@@ -58,16 +57,43 @@ VISION_LLM_MAX_TOKENS: int = int(os.environ.get("VISION_LLM_MAX_TOKENS", "8192")
 # the LLM call.  Raise BLUR_THRESHOLD to be stricter about sharpness;
 # widen EXPOSURE_LOW/HIGH to accept a broader range of lighting conditions.
 BLUR_THRESHOLD: float = 100.0   # Laplacian variance below this → blurry → FAIL
+# The sharpness score rises linearly to 10 at this multiple of BLUR_THRESHOLD
+# (reported as detail.thresholds.full_score_at).
+BLUR_FULL_SCORE_MULTIPLE: float = 3.0
 EXPOSURE_LOW: float = 30.0      # Mean pixel intensity below this → underexposed → FAIL
 EXPOSURE_HIGH: float = 220.0    # Mean pixel intensity above this → overexposed → FAIL
 
 # ---------------------------------------------------------------------------
 # Input image validation
 # ---------------------------------------------------------------------------
-# Images smaller than this are rejected before any processing.
-# Too-small images produce unreliable LLM scores and wasted API calls.
-MIN_IMAGE_WIDTH: int = 100   # pixels
-MIN_IMAGE_HEIGHT: int = 100  # pixels
+# Page images smaller than this on EITHER axis are rejected before any
+# processing (HTTP 400, "Image too small"). A thumbnail-catcher, nothing
+# more: OCR upscales small pages itself, the vision model takes any size,
+# and the working-image step only ever shrinks — so the floor is set where
+# an image stops being a document at all, not where it gets hard. It was
+# 100 × 100, which refused a legitimate input: a crop of one text line
+# submitted as its own document (the utility-bill pipeline's stage 3) is
+# often under 100 px tall and perfectly readable.
+MIN_IMAGE_WIDTH: int = max(1, int(os.environ.get("CLASSIFIER_MIN_IMAGE_WIDTH", "32")))
+MIN_IMAGE_HEIGHT: int = max(1, int(os.environ.get("CLASSIFIER_MIN_IMAGE_HEIGHT", "32")))
+
+# ---------------------------------------------------------------------------
+# Criterion input caps
+# ---------------------------------------------------------------------------
+# Server-side ceilings a request cannot exceed; a value past either is a 422.
+#
+# CRITERION_NAME_MAX_CHARS bounds a criterion's `name`. For `llm` criteria the
+# name IS the prompt text, and it is also slugified into artifact file names,
+# so this is what keeps both bounded. /criterion-types reports the live value.
+#
+# TEXT_MIN_COUNT_CAP bounds a `text` criterion's `options.min_count` (how many
+# matches the text layer must contain). It mirrors the matcher's own guards in
+# common.documents.textmatch; the pattern-length cap (MAX_PATTERN_CHARS) stays
+# there because the matcher enforces it for every caller, not just this one.
+CRITERION_NAME_MAX_CHARS: int = max(
+    1, int(os.environ.get("CLASSIFIER_CRITERION_NAME_MAX_CHARS", "200"))
+)
+TEXT_MIN_COUNT_CAP: int = max(1, int(os.environ.get("CLASSIFIER_TEXT_MIN_COUNT_CAP", "1000")))
 
 # ---------------------------------------------------------------------------
 # Document loading + OCR
@@ -81,9 +107,13 @@ MIN_IMAGE_HEIGHT: int = 100  # pixels
 # makes `text` criteria fail on any scan or photo and leaves the vision LLM
 # with no document text to read. There is no third option today.
 #
-# DOC_MAX_PAGES caps how many PDF pages are loaded and rendered. Pages past
-# the cap are reported in document_info.truncated_pages rather than silently
-# dropped. Raising it multiplies both OCR time and CV work per job.
+# A request carries a LIST of documents, and every page of every document is
+# one ITEM: a photo, a .txt and a .docx count 1 each, a PDF counts its pages
+# (read from the bytes at submit, without rendering). MAX_ITEMS caps the
+# total, INCLUSIVELY — 20 items are accepted, 21 are a 400 at submit whose
+# message gives the per-document breakdown. Each item costs a render (PDF),
+# possibly an OCR pass, and one unit of work per criterion, so this is the
+# knob that bounds one job's size.
 #
 # PDF_RENDER_DPI is the raster density for PDF page renders. 150 is the lowest
 # density at which 8-10pt body text survives OCR; 300 roughly quadruples the
@@ -97,7 +127,7 @@ MIN_IMAGE_HEIGHT: int = 100  # pixels
 # OCR_MIN_NATIVE_CHARS is the "does this page already have a text layer?"
 # threshold used by ocr mode "auto". Below it the page is treated as a scan.
 OCR_ENGINE: str = os.environ.get("CLASSIFIER_OCR_ENGINE", "rapidocr").strip().lower()
-DOC_MAX_PAGES: int = max(1, int(os.environ.get("CLASSIFIER_DOC_MAX_PAGES", "20")))
+MAX_ITEMS: int = max(1, int(os.environ.get("CLASSIFIER_MAX_ITEMS", "20")))
 PDF_RENDER_DPI: int = max(72, int(os.environ.get("CLASSIFIER_PDF_RENDER_DPI", "150")))
 TEXT_CHAR_BUDGET: int = max(0, int(os.environ.get("CLASSIFIER_TEXT_CHAR_BUDGET", "60000")))
 OCR_MIN_NATIVE_CHARS: int = max(
@@ -215,19 +245,44 @@ JOB_TTL_HOURS: int = int(os.environ.get("JOB_TTL_HOURS", "24"))
 # ---------------------------------------------------------------------------
 # The jobs table in DB_PATH is the queue (see common.jobs.sqlite.claim_next).
 # CLASSIFIER_MAX_CONCURRENT worker tasks each claim one pending job at a
-# time, so at most that many jobs run simultaneously. Size it to what the
-# vision model behind VISION_LLM_API can absorb — remember a /assess/compare
-# job with N live examples fans out into N+1 LLM calls of its own.
+# time, so at most that many jobs run simultaneously.
 #
-# PAYLOAD_DIR holds one JSON file per queued job (image bytes + criteria, or
-# the full CompareRequest) so a job survives a container restart. Files are
+# Inside a job, the unit of work is (criterion, item): one criterion on one
+# page of one document (a `text` criterion with options.scope "document" is
+# one unit per DOCUMENT instead). Three more limits bound what those units
+# may do at once; the last two are process-wide (every worker runs in this
+# one process, so an asyncio.Semaphore is the whole mechanism):
+#
+#   MAX_UNITS_PER_JOB     units ONE job evaluates at once. A job with ten
+#                         criteria on twenty pages still holds only this many
+#                         in flight. A unit waiting on its depends_on holds no
+#                         slot. Defaults to MAX_LLM_CALLS' 4, so a lone job
+#                         can fill every model slot; it was 2, which left a
+#                         single job using half the model. Lower it to keep
+#                         one big job from crowding out the others.
+#   MAX_LLM_CALLS         model calls in flight across ALL jobs, every call
+#                         type — scoring, box ask, refine, verify. Acquired in
+#                         llm/client.py around the HTTP request itself, so no
+#                         call path can go around it. Size it to the vision
+#                         model: muse-glimmer admits 4 (--max-num-seqs 4) and
+#                         queues the rest inside vLLM.
+#   OCR_WORKERS           OCR passes at once. Each is one ONNX inference in a
+#                         worker thread; the engine is shared.
+#
+# PAYLOAD_DIR holds one JSON file per queued job (document bytes + the
+# validated request) so a job survives a container restart. Files are
 # deleted the moment the job reaches a terminal phase. Defaults to a
 # sibling of DB_PATH so it lands on the same /data volume.
 #
 # WORKER_POLL_INTERVAL_S is the fallback wake-up for idle workers. New jobs
 # posted to this process wake a worker instantly; the poll only matters for
 # rows written by another process (or left behind by a crash).
-MAX_CONCURRENT: int = max(1, int(os.environ.get("CLASSIFIER_MAX_CONCURRENT", "2")))
+MAX_CONCURRENT: int = max(1, int(os.environ.get("CLASSIFIER_MAX_CONCURRENT", "4")))
+MAX_UNITS_PER_JOB: int = max(
+    1, int(os.environ.get("CLASSIFIER_MAX_UNITS_PER_JOB", "4"))
+)
+MAX_LLM_CALLS: int = max(1, int(os.environ.get("CLASSIFIER_MAX_LLM_CALLS", "4")))
+OCR_WORKERS: int = max(1, int(os.environ.get("CLASSIFIER_OCR_WORKERS", "4")))
 PAYLOAD_DIR: str = os.environ.get(
     "PAYLOAD_DIR", os.path.join(os.path.dirname(DB_PATH) or ".", "payloads")
 )
@@ -237,17 +292,20 @@ WORKER_POLL_INTERVAL_S: float = float(os.environ.get("WORKER_POLL_INTERVAL_S", "
 # Region layers and the artifact directory (regions/, api/artifacts.py)
 # ---------------------------------------------------------------------------
 # Regions answer "where" — a criterion result's list of boxes/polygons in
-# original page pixels, plus the rendered overlays a caller can look at. All
-# of it is OFF unless the request asks (`regions` on /assess and /compare;
-# implied on /locate), because regions cost detector work and layers cost
-# disk.
+# original page pixels, plus the rendered overlays a caller can look at.
+# Every job ALWAYS writes regions.json, manifest.json and the page's
+# un-annotated base image; the SVG / PNG / preview layers are rendered on
+# FIRST FETCH by the artifact endpoint and cached into the job directory.
 #
 # ARTIFACT_DIR is one directory per job on the same /data volume as the DB and
 # the payload store. ARTIFACT_SWEEP_INTERVAL_S is how often the background
 # sweeper runs; the TTL it enforces is JOB_TTL_HOURS above, which the sweeper
 # makes real for the first time — for both directories AND job rows.
 #
-# ARTIFACT_MAX_BYTES is the per-job cap. When a render would exceed it the PNG
+# ARTIFACT_MAX_BYTES is the cap PER ITEM: a job's directory may hold
+# ARTIFACT_MAX_BYTES × its item count (a 20-page PDF gets 20× a photo's
+# allowance, since it has 20 base images and 20 sets of layers). When a render
+# would exceed it the PNG
 # layers are dropped first, then the previews (and the base images kept so a
 # FILTERED preview can be re-rendered); regions.json, manifest.json and the
 # SVGs are never dropped, and the manifest records what went.
@@ -268,9 +326,8 @@ INLINE_REGIONS_MAX: int = max(
     0, int(os.environ.get("CLASSIFIER_INLINE_REGIONS_MAX", "50"))
 )
 
-# Rendered layer formats a request may ask for. "svg" is the default when the
-# shorthand `regions=true` is used; an empty layer list still writes
-# regions.json + manifest.json.
+# Rendered layer formats the artifact endpoint can produce (lazily, on first
+# fetch).
 REGION_LAYER_FORMATS: frozenset[str] = frozenset({"svg", "png", "preview"})
 
 # JPEG quality for `p{n}.preview.jpg` and for the `p{n}.base.jpg` copies kept
@@ -278,27 +335,51 @@ REGION_LAYER_FORMATS: frozenset[str] = frozenset({"svg", "png", "preview"})
 # burned-in preview cannot be un-burned.
 PREVIEW_JPEG_QUALITY: int = 85
 
-# Layer file naming (regions/artifacts.py, api/artifacts.py). Every per-page
-# layer is `p{n}.<suffix>`; LAYER_FILE_SUFFIXES maps a requested format to the
-# suffix it is written under, and it is the one table both the writer and the
-# per-criterion `artifacts` URLs are built from. LAYER_STEM_PREFIX_RE matches
-# what can sit in FRONT of the page number — a compare job's diff layers
-# (`diff-e0-p0.svg`) and, with `regions.examples`, an example's own layers
-# (`e0.p0.svg`) — so the file endpoint can strip it and read the page number
-# the same way for all three families.
+# Layer file naming (regions/artifacts.py, api/artifacts.py). Every layer is
+# `p{n}.<suffix>`, n being the job's global ITEM index (every page of every
+# document, in order — the manifest's `items` map says which document and
+# page n is), or `p{n}.<slug>.<suffix>` for one criterion. LAYER_FILE_SUFFIXES maps a format to
+# the suffix it is written under, and it is the one table both the lazy
+# renderer and the per-criterion `artifacts` URLs are built from.
 LAYER_FILE_SUFFIXES: tuple[tuple[str, str], ...] = (
     ("svg", "svg"), ("png", "layer.png"), ("preview", "preview.jpg")
 )
-LAYER_STEM_PREFIX_RE: re.Pattern[str] = re.compile(r"^(?:diff-e\d+-|e\d+\.)")
 
 # ── CV detectors (cv/) ─────────────────────────────────────────────────────
-# Two kinds of number live in a detector. The MEASUREMENT parameters — which
+# Three kinds of number live in a detector. The MEASUREMENT parameters — which
 # hues count as green, how big a blue blob must be, the Haar cascade's search
 # settings, the text block size — are here, because they are what an operator
-# retunes for a new site or camera. The SCORING CURVES (how a coverage ratio
-# maps onto 1-10 and PASS/MARGINAL/FAIL) stay inside each detector next to the
-# docstring that explains them; they are the detector's definition, not its
-# configuration.
+# retunes for a new site or camera. The VERDICT CUT POINTS — the ratio above
+# which a detector PASSes and from which it is MARGINAL — are here too, because
+# every result REPORTS them (detail.thresholds): the scoring branch and the
+# report read the same constant, so a result can never state a threshold the
+# detector does not use. The CURVE SHAPE between the cut points (the slopes,
+# and the confidence formulas) stays inside each detector next to the
+# docstring that explains it; it is never reported, and it is the detector's
+# definition, not its configuration.
+#
+# Coverage cut points: PASS when the ratio is above *_PASS_ABOVE, MARGINAL
+# from *_MARGINAL_FROM up to it, FAIL below. The ratio is the detector's
+# headline metric (green_ratio, sky_ratio of the top band, water_ratio,
+# dense_block_ratio).
+CV_VEGETATION_PASS_ABOVE: float = 0.15
+CV_VEGETATION_MARGINAL_FROM: float = 0.05
+CV_SKY_PASS_ABOVE: float = 0.60
+CV_SKY_MARGINAL_FROM: float = 0.30
+CV_WATER_PASS_ABOVE: float = 0.15
+CV_WATER_MARGINAL_FROM: float = 0.05
+CV_TEXT_PASS_ABOVE: float = 0.10
+CV_TEXT_MARGINAL_FROM: float = 0.03
+# detect_faces PASSes (strict pass) or is MARGINAL (loose pass) at this many
+# faces or more.
+CV_FACE_PASS_MIN_COUNT: int = 1
+#
+# Decimal places every float in a structured result is rounded to — the cv
+# measurements (cv/result.py) and aggregated values (analysis/result_specs.py,
+# analysis/aggregate.py). Enough to compare two pages; not so many that a
+# job result is noise.
+DETAIL_FLOAT_DECIMALS: int = 4
+#
 #
 # detect_vegetation — HSV range for "green" (H 35-85 covers grass through
 # conifer) and the open/close kernel that removes speckle from the mask.
@@ -369,15 +450,18 @@ CV_NAME_FUZZY_CUTOFF: float = 0.8
 # ── Open-vocabulary detector service (detector/client.py) ──────────────────
 # The `ai/detector` container (OWLv2 by default) turns a free-text label into
 # boxes, which is what lets an arbitrary "has bicycle" criterion localise
-# without a vision LLM. Used only when the request sets `regions.detector`.
+# without a vision LLM. Used by `detector` criteria, and by `cv` criteria with
+# no OpenCV detector when their `fallback` resolves to "detector".
 #
-# DETECTOR_URL empty = the feature is off. A request that asks for
-# `regions.detector` then still succeeds and records a note saying the
-# service is not configured — an unreachable dependency must never fail a
-# job that would otherwise have scored fine.
+# DETECTOR_URL empty = the feature is off. A `detector` criterion (or a `cv`
+# criterion whose `fallback` is explicitly "detector") is then refused at
+# submit with a 400, and a `cv` criterion's default fallback resolves to "llm"
+# instead. A detector that IS configured but fails at run time fails only the
+# criterion that asked it (status "error"), never the job.
 #
-# DETECTOR_MIN_SCORE is the confidence floor sent as the detector's
-# `threshold` AND used to decide whether a `cv` criterion passes on the
+# DETECTOR_MIN_SCORE is the default confidence floor (a `detector`
+# criterion's `options.threshold` overrides it) — sent as the detector's
+# `threshold` AND used to decide whether the criterion passes on the
 # detector's evidence alone. It is deliberately the same number: two floors
 # would mean boxes that count as regions but not as evidence.
 #
@@ -411,15 +495,17 @@ DETECTOR_STRONG_SCORE: float = 0.5
 # attempt is returned, accepted or not — a rejected box is evidence about the
 # model, and the `?attempt=n` artifact filter renders it on its own.
 #
-# The loop runs only when the request sets `regions.llm_boxes`, only for
-# `llm` criteria with hint presence/auto, and only when the model already
+# The loop runs only for `llm` criteria with `options.boxes: true` and hint
+# presence/auto, and only when the model already
 # scored the criterion at or above LLM_BBOX_PRESENCE_MIN — there is nothing to
 # locate about a feature the model just said is absent. It never changes a
 # score or a verdict: it runs AFTER the scoring call and only adds keys.
 #
-# LLM_BBOX_MAX_ATTEMPTS bounds the cost. Each attempt is one ask plus (when
-# the box validates) one verify call, so 3 attempts is at most 6 small calls
-# per criterion on top of the one scoring call for the whole job.
+# LLM_BBOX_MAX_ATTEMPTS bounds the cost, and is also the server cap on a
+# criterion's `options.max_attempts` (which may lower it, never raise it).
+# Each attempt is one ask plus (when the box validates) one refine and one
+# verify call, so 3 attempts is at most 9 small calls per criterion on top of
+# that criterion's one scoring call.
 #
 # LLM_BBOX_VERIFY_PASS is the 1-10 score the crop has to earn. 7 is the same
 # line PASS means everywhere else in this service.
@@ -436,7 +522,10 @@ DETECTOR_STRONG_SCORE: float = 0.5
 # LLM_BBOX_CROP_PAD widens the crop by this fraction of the box on each side
 # before the verify call, clamped to the page. A box that clips the feature is
 # common and a padded crop still answers the question that was asked; a padded
-# crop is NOT what gets stored as the region.
+# crop is NOT what gets stored as the region. 0.25 rather than 0.10 because
+# the refine pass draws TIGHT boxes: on a bill header it boxed "before $193.33"
+# — three units off the line, two-thirds of its width — and a 10% crop showed
+# the verifier a line with no "Amount due" on it, which it rightly failed.
 LLM_BBOX_MAX_ATTEMPTS: int = max(
     1, int(os.environ.get("CLASSIFIER_LLM_BBOX_MAX_ATTEMPTS", "3"))
 )
@@ -453,7 +542,40 @@ LLM_BBOX_MAX_TOKENS: int = max(
     64, int(os.environ.get("CLASSIFIER_LLM_BBOX_MAX_TOKENS", "1024"))
 )
 LLM_BBOX_CROP_PAD: float = max(
-    0.0, float(os.environ.get("CLASSIFIER_LLM_BBOX_CROP_PAD", "0.10"))
+    0.0, float(os.environ.get("CLASSIFIER_LLM_BBOX_CROP_PAD", "0.25"))
+)
+
+# LLM_BBOX_GRIDLINES draws a labelled 0-1000 coordinate grid — lines every
+# LLM_BBOX_GRID_STEP units, numbered along every edge — on the copy of the
+# page the ASK call sees, so the model reads a position off a ruler instead
+# of estimating a fraction of the frame. Measured on photographed utility
+# bills (unit-tests/classifier/documents/utility_bill*.jpeg): the bare image
+# put a text line's box 25-100 grid units off on one axis; with the grid the
+# mean error halved. The scoring call and the verify crop never see the grid
+# and it is never stored.
+#
+# LLM_BBOX_REFINE re-asks after a coarse box validates, on a crop of the
+# ORIGINAL page around that box — LLM_BBOX_REFINE_ZOOM × the box on each
+# axis, never less than LLM_BBOX_REFINE_MIN_SPAN of the page — with its own
+# grid, and maps the answer back into the page frame. Same measurement: hits
+# on text lines went from 0/8 to 7/8 and the mean y error from 48 units to
+# 2.4. Costs one extra call per attempt whose coarse box validated; the
+# coarse box is kept when the second answer is unusable, and both are
+# recorded on the attempt (`coarse_bbox_grid`, `refined`).
+def _env_flag(name: str, default: str) -> bool:
+    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
+LLM_BBOX_GRIDLINES: bool = _env_flag("CLASSIFIER_LLM_BBOX_GRIDLINES", "true")
+LLM_BBOX_GRID_STEP: int = max(
+    10, int(os.environ.get("CLASSIFIER_LLM_BBOX_GRID_STEP", "100"))
+)
+LLM_BBOX_REFINE: bool = _env_flag("CLASSIFIER_LLM_BBOX_REFINE", "true")
+LLM_BBOX_REFINE_ZOOM: float = max(
+    1.0, float(os.environ.get("CLASSIFIER_LLM_BBOX_REFINE_ZOOM", "2.5"))
+)
+LLM_BBOX_REFINE_MIN_SPAN: float = min(
+    1.0, max(0.05, float(os.environ.get("CLASSIFIER_LLM_BBOX_REFINE_MIN_SPAN", "0.2")))
 )
 
 # Presence score at or above which a criterion is worth locating. Not an env
@@ -466,78 +588,6 @@ LLM_BBOX_PRESENCE_MIN: int = 7
 # 0-1 because models emit integers far more reliably than decimals; shared
 # with common.vision.geometry.DEFAULT_GRID, which does the conversion.
 LLM_BBOX_GRID: float = 1000.0
-
-# ── Change detection (compare/diff.py) ─────────────────────────────────────
-# `/assess/compare` with `regions.diff` aligns each live example onto the
-# subject and reports what changed. Classical CV, no model: ORB features +
-# a RANSAC homography, then an absolute difference on blurred grayscale.
-#
-# DIFF_MIN_INLIERS is the honesty threshold. Under it the two photos were not
-# taken from close enough to the same place for a pixel difference to mean
-# anything, and the result says `aligned: false` with NO regions rather than
-# drawing boxes around the parallax.
-#
-# DIFF_MIN_AREA drops specks: a change blob under this fraction of the image
-# is compression noise or a moved leaf, not a finding.
-#
-# DIFF_BLUR is the Gaussian kernel (odd, in pixels) applied before the
-# difference. It is what stops JPEG blocking and a one-pixel alignment error
-# from lighting up every edge in the scene.
-#
-# DIFF_MAX_REGIONS bounds a pathological pair (a re-shot photo at a different
-# time of day differs everywhere) so one example cannot fill the layer.
-DIFF_MIN_INLIERS: int = max(
-    4, int(os.environ.get("CLASSIFIER_DIFF_MIN_INLIERS", "30"))
-)
-DIFF_MIN_AREA: float = float(os.environ.get("CLASSIFIER_DIFF_MIN_AREA", "0.001"))
-DIFF_BLUR: int = max(1, int(os.environ.get("CLASSIFIER_DIFF_BLUR", "5")) | 1)
-DIFF_MAX_REGIONS: int = max(1, int(os.environ.get("CLASSIFIER_DIFF_MAX_REGIONS", "40")))
-
-# The three change classes a diff region is labelled with (`attrs.change`),
-# in the order a reader thinks about them.
-DIFF_CHANGE_ADDED: str = "added"
-DIFF_CHANGE_REMOVED: str = "removed"
-DIFF_CHANGE_CHANGED: str = "changed"
-
-# How much more textured one side has to be than the other before a blob is
-# called added or removed rather than merely changed. 1.6 is deliberately not
-# 1.0: two renderings of the same object at different exposures differ in
-# edge energy by a few per cent, and calling that "added" would be a lie with
-# a box around it.
-DIFF_EDGE_RATIO: float = 1.6
-
-# Alignment. DIFF_ORB_FEATURES is the keypoint budget — 2000 is plenty for a
-# photograph and cheap; more mostly buys matches on JPEG noise.
-# DIFF_LOWE_RATIO is Lowe's ratio for the kNN match filter (the standard
-# 0.75). DIFF_RANSAC_REPROJ_PX is findHomography's inlier tolerance in pixels.
-DIFF_ORB_FEATURES: int = 2000
-DIFF_LOWE_RATIO: float = 0.75
-DIFF_RANSAC_REPROJ_PX: float = 5.0
-
-# Where a difference is NOT measured. Two photos taken from slightly different
-# places do not overlap at the frame edge, and the warp leaves a black border
-# where the reference had no pixels — a strip of "change" hugging the frame is
-# the commonest false positive in the whole method. The valid mask is eroded
-# by DIFF_VALID_ERODE_KERNEL and a frame margin of DIFF_FRAME_MARGIN_FRAC of
-# the short side (at least DIFF_FRAME_MARGIN_MIN_PX) is zeroed.
-DIFF_FRAME_MARGIN_FRAC: float = 0.01
-DIFF_FRAME_MARGIN_MIN_PX: int = 4
-DIFF_VALID_ERODE_KERNEL: int = 9
-
-# Mask clean-up after Otsu: close (kernel, iterations) joins the fragments of
-# one change, then open (kernel) removes what is left of the speckle.
-# DIFF_POLY_EPSILON_FRAC is the approxPolyDP tolerance for the resulting
-# contours, as a fraction of each contour's perimeter.
-DIFF_CLOSE_KERNEL: int = 7
-DIFF_CLOSE_ITERATIONS: int = 2
-DIFF_OPEN_KERNEL: int = 5
-DIFF_POLY_EPSILON_FRAC: float = 0.01
-
-# Prefix for the synthetic criterion name a diff's regions are filed under —
-# `_diff:e0` for the first example. It is not a criterion: it never reaches
-# compute_weighted_score or the similarity comparison, it only needs a key in
-# regions.json and a slug for the layer file name.
-DIFF_CRITERION_PREFIX: str = "_diff:e"
 
 # ── Text-hit regions (analysis/text_eval.py) ───────────────────────────────
 # Cap on regions derived from one text criterion's matches, per page. A regex
@@ -557,8 +607,6 @@ GROUNDING_DEFAULT_CRITERIA: dict[str, list[str]] = {
         "a house", "a tree", "a parked car", "a roof", "the sky",
         "solar panels", "a swimming pool",
     ],
-    "scene_before.png": ["a house", "a shed", "a fence", "the sky"],
-    "scene_after.png": ["a house", "a red car", "a fence", "the sky"],
     "greenery_and_sky.png": ["a swimming pool", "the sky", "vegetation"],
     "text_blocks.png": ["a heading", "a dollar amount", "an email address"],
     "photo_of_letter.png": ["a heading", "a signature", "a printed paragraph"],
@@ -589,12 +637,11 @@ LOG_LEVEL: str = os.environ.get("LOG_LEVEL", "INFO").upper()
 # ---------------------------------------------------------------------------
 # Default criteria (used when the caller omits the criteria field)
 # ---------------------------------------------------------------------------
-# `type` is the evaluation path (llm | cv | text); `hint` is the rubric the
-# LLM applies. The two used to be conflated ("type": "quality"), which no
-# longer validates against CriterionInput — hence the explicit pairing here.
+# `type` is the evaluation path (llm | text | cv | detector); everything
+# type-specific — here the rubric the LLM applies — lives in `options`.
 DEFAULT_CRITERIA: list[dict] = [
-    {"name": "document legibility", "type": "llm", "hint": "quality"},
-    {"name": "image sharpness",     "type": "llm", "hint": "quality"},
-    {"name": "proper exposure",     "type": "llm", "hint": "quality"},
-    {"name": "absence of artifacts","type": "llm", "hint": "quality"},
+    {"name": "document legibility",  "type": "llm", "options": {"hint": "quality"}},
+    {"name": "image sharpness",      "type": "llm", "options": {"hint": "quality"}},
+    {"name": "proper exposure",      "type": "llm", "options": {"hint": "quality"}},
+    {"name": "absence of artifacts", "type": "llm", "options": {"hint": "quality"}},
 ]

@@ -1,44 +1,68 @@
-"""Writing a job's artifact directory: geometry, layers, manifest, URLs.
+"""Writing a job's artifact directory: geometry, text, base images, manifest.
 
-One directory per job under CLASSIFIER_ARTIFACT_DIR, written once while the
-job runs and served afterwards by ``api.artifacts``:
+One directory per job under CLASSIFIER_ARTIFACT_DIR. EVERY job writes it —
+regions are no longer opt-in — and it holds only what cannot be re-derived.
+A job has ITEMS (every page of every document), and the GLOBAL item index n
+is the page index everything here uses, so the shared vision code needs no
+notion of documents:
 
-    regions.json   the canonical geometry, keyed BY CRITERION rather than as a
-                   flat list — which is what makes "give me the artifact for
-                   this criterion" a lookup instead of a client-side filter.
-    p{n}.svg / p{n}.layer.png / p{n}.preview.jpg   the rendered layers the
-                   request asked for, one set per page, plus the
-                   un-annotated ``p{n}.base.jpg`` a FILTERED preview is
-                   re-composited from.
-    manifest.json  what actually survived the byte cap.
+    regions.json          the canonical geometry, keyed BY CRITERION rather
+                          than as a flat list — which is what makes "give me
+                          the artifact for this criterion" a lookup, not a
+                          filter. Every region carries ``page = n``; ``pages``
+                          holds one frame per item that has an image.
+    text.p{n}.<key>.json  one per item and distinct text layer, written by the
+                          item's OCR memo the moment the layer exists (see
+                          ``analysis.context``): the exact string
+                          ``match_text`` searched on that page, where it came
+                          from, and its OCR lines.
+    text.d{i}.<key>.json  a document-scope ``text`` search's joined text —
+                          document i's pages, in order, as one string — with
+                          the segment map back to each page.
+    p{n}.base.jpg         the un-annotated page, for an item with an image:
+                          every preview of that page (combined or filtered) is
+                          composited from it.
+    manifest.json         what is in the directory, ``items`` (n → document,
+                          page, filename), and which criterion used which
+                          text layers.
 
-    _regions_json()          — the canonical file's shape.
-    _artifact_url()          — the (relative) path the file endpoint serves at.
-    write_region_artifacts() — the single-document flow: render, cap, manifest.
-    write_compare_artifacts() — the compare flow's APPEND: diff layers, the
-                               examples' own layers and their own
-                               ``e{i}.regions.json``, and a rewritten manifest.
-    _write_page_layers()     — render and store one page's requested formats.
-    _criterion_artifacts()   — the per-criterion ``artifacts`` block, with one
-                               entry per enforcement-loop attempt.
-    _unimplemented_notes()   — say plainly which requested options this
-                               endpoint could not honour.
+The SVG / PNG / preview LAYERS are not written here at all: ``api.artifacts``
+renders them from regions.json on first fetch and caches them into the same
+directory (``p{n}.svg``, ``p{n}.<slug>.layer.png``, …), so a job that nobody
+looks at costs a JSON file and a JPEG per page.
 
-Order of operations matters: layers are rendered first, THEN the byte cap is
-enforced, THEN the manifest is written from what survived — so the manifest
-can never promise a file the cap removed.
+**The byte cap is per item.** CLASSIFIER_ARTIFACT_MAX_BYTES is multiplied by
+the job's item count (``job_byte_cap``), so a twenty-page PDF gets twenty
+times a photo's allowance.
 
-Blocking (rendering and file I/O), so callers run both writers in a worker
-thread.
+    prepare_job_dir()        — clear a stale directory before a job writes.
+    text_layer_payload()     — the ``text.p{n}.<key>.json`` body.
+    write_text_layer()       — write one, cap-safe (JSON is never dropped).
+    write_job_artifacts()    — regions.json + base images + manifest, and the
+                               ``artifacts`` blocks for the result.
+    job_byte_cap()           — this job's cap, from its manifest.
+    FileLabeler / labeler_for() — every file's kind / format / item /
+                               document / criteria, for the result and the
+                               manifest endpoint alike.
+    render_layer()           — one layer's bytes, for the lazy renderer.
+    layer_name()             — ``p{n}[.<slug>].<suffix>`` for a format.
+    base_image_name()        — ``p{n}.base.jpg``.
 
-Process flow position: ``write_region_artifacts`` is step 9 of
-``analysis.pipeline.analyze_document``; ``write_compare_artifacts`` is
-``jobs.runners.run_compare``'s second pass, after the scoring is frozen.
+Blocking (file I/O and JPEG encodes), so callers run these in a thread.
+
+Process flow position: ``prepare_job_dir`` / ``write_text_layer`` /
+``write_job_artifacts`` are called by ``analysis.pipeline``; ``render_layer``
+and ``job_byte_cap`` by ``api.artifacts``. Nothing here imports ``analysis``.
 """
 
-from common.documents import Document
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from typing import Any, Optional
+
+from common.documents import TextLayer
 from common.vision import (
-    ArtifactStore,
     PageGeometry,
     Region,
     build_manifest,
@@ -48,66 +72,36 @@ from common.vision import (
     slugify_criterion,
 )
 
-from api.schemas import CriterionInput, RegionsOptions
+from api.schemas import CriterionInput
 from config import (
-    ARTIFACT_MAX_BYTES,
-    DIFF_CRITERION_PREFIX,
     JOB_TTL_HOURS,
     LAYER_FILE_SUFFIXES,
     PREVIEW_JPEG_QUALITY,
+    REGION_LAYER_FORMATS,
 )
 from logger import logger
-from regions.collect import visible_regions
 from regions.store import store
 
-
-def _regions_json(
-    job_id: str,
-    geometries: dict[int, PageGeometry],
-    region_map: dict[str, list[Region]],
-    criteria: list[CriterionInput],
-    detector: dict | None = None,
-    localizations: dict[str, dict] | None = None,
-) -> dict:
-    """The canonical ``regions.json``: keyed by criterion, not a flat list.
-
-    Keying by criterion is what makes "give me the artifact for THIS
-    criterion" a lookup rather than a client-side filter — the slug in each
-    entry is the same one that appears in file names, SVG group ids, and the
-    ``?criterion=`` query parameter.
-
-    ``localizations`` is the LLM enforcement loop's record per criterion —
-    every attempt, accepted or not, and which one was accepted. It is stored
-    here in full; the job result carries the same object inline (it is a
-    handful of numbers, never large).
-    """
-    types = {c.name: c.type for c in criteria}
-    entries: dict[str, dict] = {}
-    for name, regions in region_map.items():
-        sources = sorted({r.source for r in regions})
-        entries[name] = {
-            "slug": slugify_criterion(name),
-            "type": types.get(name, "llm"),
-            "source": sources[0] if len(sources) == 1 else (sources or None),
-            "sources": sources,
-            "pages": sorted({r.page for r in regions}),
-            "count": len(regions),
-            "regions": [r.as_dict() for r in regions],
-            "localization": (localizations or {}).get(name),
-        }
-    return {
-        "job_id": job_id,
-        "pages": [geometries[i].as_dict() for i in sorted(geometries)],
-        # Which detector produced the source="detector" regions below, on
-        # what device, and what it cost. Null when it was not used — a
-        # consumer comparing two jobs' geometry needs to know whether the
-        # same model drew the boxes.
-        "detector": detector,
-        "criteria": entries,
-    }
+_SUFFIX = dict(LAYER_FILE_SUFFIXES)
 
 
-def _artifact_url(job_id: str, name: str) -> str:
+@dataclass
+class ItemInfo:
+    """What the writers need to know about one item — plain data, so this
+    package never imports ``analysis``."""
+
+    item: int
+    document: int
+    page: int
+    filename: str
+    geometry: Optional[PageGeometry]
+    image_bgr: Any = None
+
+    def as_map_entry(self) -> dict[str, Any]:
+        return {"document": self.document, "page": self.page, "filename": self.filename}
+
+
+def artifact_url(job_id: str, name: str) -> str:
     """The path the artifact file endpoint serves ``name`` at.
 
     Relative on purpose: the same job is reachable directly on :8005 and
@@ -117,491 +111,503 @@ def _artifact_url(job_id: str, name: str) -> str:
     return f"/jobs/{job_id}/artifacts/{name}"
 
 
-def write_region_artifacts(
+def base_image_name(page: int) -> str:
+    """``p{n}.base.jpg`` — the un-annotated item every preview is built on."""
+    return f"p{page}.base.jpg"
+
+
+def layer_name(fmt: str, slug: Optional[str] = None, page: int = 0) -> str:
+    """``p{n}.svg`` / ``p{n}.<slug>.layer.png`` / … for one format."""
+    middle = f"{slug}." if slug else ""
+    return f"p{page}.{middle}{_SUFFIX[fmt]}"
+
+
+def job_byte_cap(job_id: str) -> int:
+    """CLASSIFIER_ARTIFACT_MAX_BYTES × the job's item count (0 = no cap).
+
+    Read from the manifest, so the lazy renderer caps a directory exactly as
+    the job that wrote it did. A directory with no manifest yet counts as one
+    item.
+    """
+    manifest = store.read_json(job_id, "manifest.json") or {}
+    return per_item_cap() * max(1, len(manifest.get("items") or {}))
+
+
+def per_item_cap() -> int:
+    """The store's cap (CLASSIFIER_ARTIFACT_MAX_BYTES, set in regions.store) —
+    read off the store so the value lives in exactly one place."""
+    return int(store.max_bytes or 0)
+
+
+# ---------------------------------------------------------------------------
+# Before the job, and during it
+# ---------------------------------------------------------------------------
+
+
+def prepare_job_dir(job_id: str) -> None:
+    """A re-run of the same job id must not inherit stale files."""
+    store.delete(job_id)
+
+
+def text_layer_payload(
+    key: str, settings: dict, layer: TextLayer, engine: Optional[str], *, item: int = 0
+) -> dict[str, Any]:
+    """The ``text.p{n}.<key>.json`` body.
+
+    ``text`` is byte-for-byte the string ``match_text`` searched (the layer's
+    own text, unmodified), so a failed match can be diagnosed from this file
+    alone. ``lines`` are the OCR lines with their polygons in ORIGINAL page
+    pixels; empty for native text — a .txt / .docx has no geometry, and a
+    native PDF's layer is PyMuPDF's reading-order text, whose line geometry is
+    not recorded (text hits on it are still located, via
+    ``common.documents.pdf_text_regions``).
+    """
+    return {
+        "key": key,
+        "item": item,
+        "settings": dict(settings),
+        "source": layer.source,
+        "engine": engine,
+        "chars": len(layer.text),
+        "confidence": layer.confidence,
+        "text": layer.text,
+        "lines": [
+            {
+                "text": str(line.get("text", "")),
+                "polygon": line.get("box"),
+                "confidence": line.get("confidence"),
+            }
+            for line in layer.lines
+        ],
+    }
+
+
+def write_text_layer(job_id: str, name: str, payload: dict[str, Any]) -> None:
+    """Write one text layer file. JSON is in the store's never-dropped set."""
+    store.write_json(job_id, name, payload)
+    logger.debug("write_text_layer: job %s wrote %s (%d chars)",
+                 job_id, name, payload.get("chars", 0))
+
+
+# ---------------------------------------------------------------------------
+# After the job
+# ---------------------------------------------------------------------------
+
+
+def _regions_json(
     job_id: str,
-    doc: Document,
-    geometries: dict[int, PageGeometry],
+    items: list[ItemInfo],
     region_map: dict[str, list[Region]],
-    options: RegionsOptions,
     criteria: list[CriterionInput],
-    detector: dict | None = None,
-    extra_notes: list[str] | None = None,
-    localizations: dict[str, dict] | None = None,
-) -> tuple[dict, dict[str, dict | None]]:
-    """Write the job's artifact directory and describe it.
+    detector: Optional[dict],
+    localizations: dict[str, dict],
+    text_names: dict[str, list[str]],
+) -> dict:
+    """The canonical ``regions.json``: keyed by criterion, not a flat list.
 
-    Blocking (rendering and file I/O), so callers run it in a worker thread.
+    ``pages`` holds one frame per item with an image (its ``page`` is the
+    item index); the filtered renderer reads the frame from it.
+    """
+    types = {c.name: c.type for c in criteria}
+    entries: dict[str, dict] = {}
+    for name, regions in region_map.items():
+        sources = sorted({r.source for r in regions})
+        entries[name] = {
+            "slug": slugify_criterion(name),
+            "type": types.get(name, "llm"),
+            "sources": sources,
+            "count": len(regions),
+            "regions": [r.as_dict() for r in regions],
+            "localization": localizations.get(name),
+            "text_layers": text_names.get(name, []),
+        }
+    return {
+        "job_id": job_id,
+        "pages": [i.geometry.as_dict() for i in items if i.geometry is not None],
+        "items": {str(i.item): i.as_map_entry() for i in items},
+        # Which detector produced the source="detector" regions below, on
+        # what device, and what it cost. Null when it was not used.
+        "detector": detector,
+        "criteria": entries,
+    }
 
-    Order of operations matters: layers are rendered first, THEN the byte cap
-    is enforced, THEN the manifest is written from what actually survived —
-    so the manifest can never promise a file the cap removed.
+
+def _item_layers(job_id: str, info: ItemInfo, present: set[str]) -> dict[str, str]:
+    """The combined layer URLs for one item — {} when it has no image."""
+    if info.geometry is None:
+        return {}
+    return {
+        fmt: artifact_url(job_id, layer_name(fmt, page=info.item))
+        for fmt, _ in LAYER_FILE_SUFFIXES
+        if fmt != "preview" or base_image_name(info.item) in present
+    }
+
+
+def write_job_artifacts(
+    job_id: str,
+    items: list[ItemInfo],
+    region_map: dict[str, list[Region]],
+    criteria: list[CriterionInput],
+    *,
+    localizations: Optional[dict[str, dict]] = None,
+    detector: Optional[dict] = None,
+    text_refs: Optional[dict[str, list[dict]]] = None,
+    notes: Optional[list[str]] = None,
+) -> tuple[dict, dict[str, Optional[dict]]]:
+    """Write regions.json, the base images and the manifest; describe them.
+
+    The text layers are already there (written while the units ran). Order
+    matters: files first, THEN the byte cap, THEN the manifest from what
+    survived — so the manifest can never promise a file the cap removed.
 
     Args:
-        job_id:     Directory name under CLASSIFIER_ARTIFACT_DIR.
-        doc:        The analysed document (page images for the previews).
-        geometries: Page frames.
-        region_map: ``{criterion name: [Region, ...]}`` in original pixels.
-        options:    The request's regions options.
-        criteria:   Full criteria list (for the type of each entry).
-        detector:   What the open-vocabulary detector did, or None when it
-                    was not used — recorded in ``regions.json`` so a consumer
-                    can tell which model drew the ``source="detector"`` boxes.
-        extra_notes: Caller-facing sentences to append to the manifest's
-                    ``notes`` (a detector that was asked for and could not be
-                    reached, say). Joined with the not-implemented notes.
-        localizations: ``{criterion name: localization dict}`` from the LLM
-                    enforcement loop, stored whole in ``regions.json``.
+        job_id:        Directory name under CLASSIFIER_ARTIFACT_DIR.
+        items:         Every item, in global order.
+        region_map:    ``{criterion name: [Region, ...]}`` in original pixels,
+                       each region's ``page`` its item; every criterion has an
+                       entry, empty or not.
+        criteria:      The request's criteria.
+        localizations: ``{name: localization}`` from the LLM loop (merged
+                       across items when there are several).
+        detector:      What the detector did, or None when unused.
+        text_refs:     ``{name: [{"item" | "document", "key", "name",
+                       "source", "chars"}, ...]}`` — every text layer each
+                       criterion's units used.
+        notes:         Caller-facing sentences for the manifest.
 
     Returns:
-        ``(artifacts_block, per_criterion)`` — the top-level ``artifacts``
-        object for the result, and ``{criterion name: artifacts block or
-        None}`` for the per-criterion results.
+        ``(artifacts_block, {criterion name: artifacts block or None})``.
     """
-    store.delete(job_id)  # a re-run of the same id must not inherit stale files
+    localizations = localizations or {}
+    text_refs = text_refs or {}
+    text_names = {name: [r["name"] for r in refs] for name, refs in text_refs.items()}
 
-    all_regions = [r for regions in region_map.values() for r in regions]
-    pages_with_regions = sorted({r.page for r in all_regions} & set(geometries))
-    layers = set(options.layers)
+    regions_doc = _regions_json(job_id, items, region_map, criteria, detector,
+                                localizations, text_names)
+    store.write_json(job_id, "regions.json", regions_doc)
+    for info in items:
+        if info.geometry is not None and info.image_bgr is not None:
+            rgb = info.image_bgr[:, :, ::-1]  # the renderer wants RGB, OpenCV holds BGR
+            store.write(
+                job_id,
+                base_image_name(info.item),
+                render_preview(rgb, info.geometry, [], quality=PREVIEW_JPEG_QUALITY),
+            )
 
-    store.write_json(
-        job_id,
-        "regions.json",
-        _regions_json(job_id, geometries, region_map, criteria, detector, localizations),
-    )
-
-    # ── Per-page combined layers ──────────────────────────────────────────
-    # `visible_regions` drops the enforcement loop's REJECTED attempts: they
-    # are all in regions.json and all reachable at `?attempt=n`, but three
-    # overlapping boxes for one criterion is not a readable overlay. The page
-    # list is built from every region so a page whose only findings were
-    # rejected attempts still gets a (near-empty) file for that filter to
-    # render against.
-    for page_index in pages_with_regions:
-        geometry = geometries[page_index]
-        page_regions = visible_regions(r for r in all_regions if r.page == page_index)
-        _write_page_layers(store, job_id, doc, geometry, page_regions, layers, "")
-
-    # ── Optional per-criterion pre-render ─────────────────────────────────
-    if options.layers_per_criterion:
-        for name, regions in region_map.items():
-            if not regions:
-                continue
-            slug = slugify_criterion(name)
-            for page_index in sorted({r.page for r in regions} & set(geometries)):
-                _write_page_layers(
-                    store,
-                    job_id,
-                    doc,
-                    geometries[page_index],
-                    visible_regions(r for r in regions if r.page == page_index),
-                    layers,
-                    f"{slug}.",
-                )
-
-    dropped = store.enforce_cap(job_id)
+    cap = per_item_cap() * max(1, len(items))
+    dropped = store.enforce_cap(job_id, max_bytes=cap)
     if dropped:
         logger.warning(
-            "write_region_artifacts: job %s exceeded CLASSIFIER_ARTIFACT_MAX_BYTES "
-            "(%d) — dropped %s",
-            job_id,
-            ARTIFACT_MAX_BYTES,
-            dropped,
+            "write_job_artifacts: job %s exceeded its cap (%d items × "
+            "CLASSIFIER_ARTIFACT_MAX_BYTES %d) — dropped %s",
+            job_id, len(items), per_item_cap(), dropped,
         )
 
-    notes = _unimplemented_notes(options) + list(extra_notes or [])
     manifest = build_manifest(
         job_id,
         files=store.list(job_id),
-        page_geometry=[geometries[i].as_dict() for i in sorted(geometries)],
-        options=options.as_manifest(),
+        page_geometry=[i.geometry.as_dict() for i in items if i.geometry is not None],
+        options={
+            "layers": (
+                sorted(REGION_LAYER_FORMATS) if any(i.geometry for i in items) else []
+            ),
+            "layers_rendered": "on first fetch, then cached in this directory",
+            "byte_cap": {"per_item": per_item_cap(), "items": len(items), "total": cap},
+        },
         criteria={
             name: {
                 "slug": slugify_criterion(name),
                 "count": len(regions),
-                "pages": sorted({r.page for r in regions}),
                 "sources": sorted({r.source for r in regions}),
+                "text_layers": text_names.get(name, []),
             }
             for name, regions in region_map.items()
         },
         ttl_hours=JOB_TTL_HOURS,
-        notes=notes,
+        notes=list(notes or []),
         dropped=dropped,
     )
+    # The item map: n → where the page came from. Added here rather than to
+    # common.vision.build_manifest, which knows nothing about documents.
+    manifest["items"] = {str(i.item): i.as_map_entry() for i in items}
+    labeler = FileLabeler(regions_doc, manifest["items"])
+    manifest["files"] = labeler.describe(job_id, manifest["files"])
     store.write_json(job_id, "manifest.json", manifest)
 
     files = store.list(job_id)
     present = {f["name"] for f in files}
+    item_layers = {i.item: _item_layers(job_id, i, present) for i in items}
     artifacts = {
         "dir": str(store.dir_for(job_id)),
-        "files": [{**f, "url": _artifact_url(job_id, f["name"])} for f in files],
+        # Labelled by the same FileLabeler the manifest endpoint uses.
+        "files": labeler.describe(job_id, files),
+        "items": [
+            {"item": i.item, "layers": item_layers[i.item]}
+            for i in items if item_layers[i.item]
+        ],
         "zip_url": f"/jobs/{job_id}/artifacts.zip",
         "total_bytes": sum(f["bytes"] for f in files),
         "expires_at": manifest["expires_at"],
         "dropped": dropped,
-        "notes": notes,
+        "notes": list(notes or []),
     }
     per_criterion = {
-        name: _criterion_artifacts(job_id, name, regions, present)
+        name: _criterion_artifacts(job_id, name, regions, text_refs.get(name, []), item_layers)
         for name, regions in region_map.items()
     }
     logger.info(
-        "write_region_artifacts: job %s wrote %d file(s), %d bytes, %d criteria with regions",
-        job_id,
-        len(files),
-        artifacts["total_bytes"],
+        "write_job_artifacts: job %s holds %d file(s), %d bytes, %d item(s), "
+        "%d criteria with regions",
+        job_id, len(files), artifacts["total_bytes"], len(items),
         sum(1 for r in region_map.values() if r),
     )
     return artifacts, per_criterion
 
 
-def write_compare_artifacts(
-    job_id: str,
-    diff_regions: dict[str, list[Region]],
-    subject_doc: Document,
-    subject_geometries: dict[int, PageGeometry],
-    examples: list[dict],
-    options: RegionsOptions,
-    extra_notes: list[str] | None = None,
-) -> tuple[dict | None, dict[str, dict | None], dict[int, dict]]:
-    """Add the compare flow's extra layers to a job directory already written.
-
-    Blocking (rendering and file I/O), so the caller runs it in a thread.
-
-    The subject's ``write_region_artifacts`` has already run — it deletes the
-    directory and writes it fresh, so this cannot run before it. Everything
-    here is therefore an APPEND: two new families of layer file, the diff
-    criteria merged into the existing ``regions.json``, a per-example
-    ``e{i}.regions.json`` (an example's pages are its own coordinate frame and
-    must not be mixed into the subject's ``pages`` list), and a rewritten
-    manifest so nothing promises a file that is not there.
-
-    Args:
-        job_id:             The SUBJECT's job — examples have none of their own.
-        diff_regions:       ``{"_diff:e0": [Region, ...]}`` in the SUBJECT's
-                            original page pixels.
-        subject_doc:        For the diff previews' base pixels.
-        subject_geometries: The subject's page frames.
-        examples:           One dict per example whose layers are wanted:
-                            ``{"index", "document", "geometries",
-                            "region_map", "criteria", "localizations"}``.
-        options:            The request's regions options (which layers).
-        extra_notes:        Sentences to append to the manifest's ``notes``.
-
-    Returns:
-        ``(artifacts, diff_per_criterion, example_artifacts)`` — the refreshed
-        top-level block, the per-criterion blocks for the ``_diff:e{i}``
-        entries, and ``{example index: {"artifacts", "per_criterion"}}``.
-        ``artifacts`` is None when the job has no directory to append to.
-    """
-    data = store.read_json(job_id, "regions.json")
-    manifest = store.manifest(job_id)
-    if data is None or manifest is None:
-        logger.warning(
-            "write_compare_artifacts: job %s has no artifact directory to append "
-            "to — the subject's regions were never written", job_id,
-        )
-        return None, {}, {}
-
-    layers = set(options.layers)
-
-    # ── Diff layers: subject pixels, subject geometry, their own prefix ───
-    for name, regions in diff_regions.items():
-        index = _diff_example_index(name)
-        for page_index in sorted({r.page for r in regions} & set(subject_geometries)):
-            _write_page_layers(
-                store,
-                job_id,
-                subject_doc,
-                subject_geometries[page_index],
-                [r for r in regions if r.page == page_index],
-                layers,
-                "",
-                stem_prefix=f"diff-e{index}-",
-                write_base=False,  # the subject's own p{n}.base.jpg is the base
-            )
-
-    # ── Example layers: the example's own pixels and frames ───────────────
-    example_artifacts: dict[int, dict] = {}
-    for entry in examples:
-        index = entry["index"]
-        prefix = f"e{index}."
-        geometries: dict[int, PageGeometry] = entry.get("geometries") or {}
-        region_map: dict[str, list[Region]] = entry.get("region_map") or {}
-        all_regions = [r for rs in region_map.values() for r in rs]
-        for page_index in sorted({r.page for r in all_regions} & set(geometries)):
-            _write_page_layers(
-                store,
-                job_id,
-                entry["document"],
-                geometries[page_index],
-                visible_regions(r for r in all_regions if r.page == page_index),
-                layers,
-                "",
-                stem_prefix=prefix,
-            )
-        store.write_json(
-            job_id,
-            f"{prefix}regions.json",
-            _regions_json(
-                job_id,
-                geometries,
-                region_map,
-                entry.get("criteria") or [],
-                None,
-                entry.get("localizations") or {},
-            ),
-        )
-        example_artifacts[index] = {"prefix": prefix, "region_map": region_map}
-
-    dropped = list(manifest.get("dropped") or []) + store.enforce_cap(job_id)
-    files = store.list(job_id)
-    present = {f["name"] for f in files}
-    notes = list(manifest.get("notes") or []) + list(extra_notes or [])
-
-    # ── Rewrite the manifest from what actually survived the cap ──────────
-    manifest["files"] = files
-    manifest["total_bytes"] = sum(f["bytes"] for f in files)
-    manifest["dropped"] = dropped
-    manifest["notes"] = notes
-    manifest["criteria"] = {
-        **manifest.get("criteria", {}),
-        **{
-            name: {
-                "slug": slugify_criterion(name),
-                "count": len(regions),
-                "pages": sorted({r.page for r in regions}),
-                "sources": sorted({r.source for r in regions}),
-            }
-            for name, regions in diff_regions.items()
-        },
-    }
-    store.write_json(job_id, "manifest.json", manifest)
-
-    # ── Merge the diff criteria into the subject's regions.json ───────────
-    # In the SUBJECT's file because a diff's coordinates are the subject's;
-    # its `type` is stamped afterwards because `_regions_json` reads types off
-    # a criteria list and `_diff:e0` is not a criterion to be on one.
-    merged = _regions_json(
-        job_id, subject_geometries, diff_regions, [], None, None
+def text_link(job_id: str, ref: dict) -> dict:
+    """One text-layer link: where it is, and what it is."""
+    link = {k: ref[k] for k in ("item", "document") if k in ref}
+    link.update(
+        key=ref["key"],
+        url=artifact_url(job_id, ref["name"]),
+        source=ref["source"],
+        chars=ref["chars"],
     )
-    for entry in merged["criteria"].values():
-        entry["type"] = "diff"
-    data["criteria"] = {**data.get("criteria", {}), **merged["criteria"]}
-    store.write_json(job_id, "regions.json", data)
-
-    artifacts = {
-        "dir": str(store.dir_for(job_id)),
-        "files": [{**f, "url": _artifact_url(job_id, f["name"])} for f in files],
-        "zip_url": f"/jobs/{job_id}/artifacts.zip",
-        "total_bytes": manifest["total_bytes"],
-        "expires_at": manifest["expires_at"],
-        "dropped": dropped,
-        "notes": notes,
-    }
-    diff_per_criterion = {
-        name: _criterion_artifacts(
-            job_id, name, regions, present, f"diff-e{_diff_example_index(name)}-"
-        )
-        for name, regions in diff_regions.items()
-    }
-    for index, entry in example_artifacts.items():
-        prefix = entry["prefix"]
-        entry["artifacts"] = {
-            "dir": str(store.dir_for(job_id)),
-            "files": [
-                {**f, "url": _artifact_url(job_id, f["name"])}
-                for f in files
-                if f["name"].startswith(prefix)
-            ],
-            "zip_url": f"/jobs/{job_id}/artifacts.zip",
-            "expires_at": manifest["expires_at"],
-            "notes": [
-                f"Example {index} has no job of its own: its layers live in the "
-                f"subject's artifact directory under the `{prefix}` prefix."
-            ],
-        }
-        entry["artifacts"]["total_bytes"] = sum(
-            f["bytes"] for f in entry["artifacts"]["files"]
-        )
-        entry["per_criterion"] = {
-            name: _criterion_artifacts(job_id, name, regions, present, prefix)
-            for name, regions in entry["region_map"].items()
-        }
-        entry.pop("region_map")
-
-    logger.info(
-        "write_compare_artifacts: job %s now holds %d file(s), %d bytes "
-        "(%d diff criteria, %d example(s) rendered)",
-        job_id, len(files), manifest["total_bytes"],
-        len(diff_regions), len(example_artifacts),
-    )
-    return artifacts, diff_per_criterion, example_artifacts
-
-
-def _write_page_layers(
-    store: ArtifactStore,
-    job_id: str,
-    doc: Document,
-    geometry: PageGeometry,
-    regions: list[Region],
-    layers: set[str],
-    prefix: str,
-    stem_prefix: str = "",
-    write_base: bool = True,
-) -> None:
-    """Render and store the requested formats for one page.
-
-    ``prefix`` is "" for the combined layer and ``"<slug>."`` for a
-    pre-rendered per-criterion one, which is the same naming the file
-    endpoint uses when it caches a filtered render — so a pre-rendered file
-    and a lazily cached one are the same file.
-
-    ``stem_prefix`` goes in FRONT of the page number and is what gives the
-    compare flow its two extra families in the same directory (§ 0 of the
-    regions plan):
-
-        ""            the subject's own layers — ``p0.svg``
-        "diff-e0-"    change detection against example 0 — ``diff-e0-p0.svg``
-        "e0."         example 0's own layers, with ``regions.examples`` on —
-                      ``e0.p0.svg``
-
-    Examples have no job of their own, so their layers live in the subject's
-    directory; the prefix is what keeps the two from colliding.
-
-    The preview also writes ``{stem_prefix}p{n}.base.jpg``: a preview has its
-    overlay burned into the pixels and cannot be un-burned, so a FILTERED
-    preview has to be composited from a clean copy of the page. ``write_base``
-    is False for the diff layers, whose pixels ARE the subject's page — its
-    ``p{n}.base.jpg`` is already there and a second copy under a diff name
-    would just be the same JPEG against the byte cap twice.
-    """
-    page = doc.page(geometry.page)
-    stem = f"{stem_prefix}p{geometry.page}.{prefix}"
-
-    if "svg" in layers:
-        store.write(job_id, f"{stem}svg", render_svg(geometry, regions))
-    if "png" in layers:
-        store.write(job_id, f"{stem}layer.png", render_png_layer(geometry, regions))
-    if "preview" in layers and page is not None and page.image_bgr is not None:
-        rgb = page.image_bgr[:, :, ::-1]  # the renderer wants RGB, OpenCV holds BGR
-        store.write(
-            job_id,
-            f"{stem}preview.jpg",
-            render_preview(rgb, geometry, regions, quality=PREVIEW_JPEG_QUALITY),
-        )
-        base_name = f"{stem_prefix}p{geometry.page}.base.jpg"
-        if write_base and not prefix and store.open(job_id, base_name) is None:
-            store.write(
-                job_id,
-                base_name,
-                render_preview(rgb, geometry, [], quality=PREVIEW_JPEG_QUALITY),
-            )
-
-
-def _diff_example_index(name: str) -> str:
-    """``_diff:e3`` → ``"3"``; the stem prefix builder's only input."""
-    return name[len(DIFF_CRITERION_PREFIX):] or "0"
+    return link
 
 
 def _criterion_artifacts(
     job_id: str,
     name: str,
     regions: list[Region],
-    present: set[str],
-    stem_prefix: str = "",
-) -> dict | None:
-    """The per-criterion ``artifacts`` block, or None when it has no regions.
+    text_refs: list[dict],
+    item_layers: dict[int, dict[str, str]],
+) -> Optional[dict]:
+    """The per-criterion ``artifacts`` block, or None when there is nothing.
 
-    Only pages where THIS criterion actually has regions are listed, and only
-    formats that were really written (a layer the byte cap dropped, or a
-    format the request never asked for, is simply absent rather than a URL
-    that 404s). The URLs carry ``?criterion=<slug>``, so following one gets a
-    layer filtered to this criterion alone — which for an ``llm`` criterion
-    means its ACCEPTED box, since that is the default when no ``attempt`` is
-    named.
+    Two independent halves:
 
-    ``attempts`` is the other half of returning every attempt: one entry per
-    enforcement-loop attempt that produced a drawable box, carrying
-    ``?criterion=<slug>&attempt=<n>`` so a REJECTED box can be looked at on
-    its own. Absent (empty) for every path but ``llm``.
-
-    ``stem_prefix`` matches ``_write_page_layers``: "" for the subject,
-    ``"e0."`` for an example's own layers in the same directory,
-    ``"diff-e0-"`` for a change-detection layer. An example keeps its own
-    ``e0.regions.json`` — its pages are a different coordinate frame from the
-    subject's — so the ``regions_url`` follows the prefix; a diff is in the
-    subject's frame and stays in the subject's ``regions.json``.
+      * geometry, when the criterion has regions: ``regions_url``, and one
+        ``items`` entry per item the criterion found something on — that
+        item's layer URLs filtered to this criterion (``p{n}.svg?criterion=
+        <slug>``, rendered on first fetch) plus ``attempts``, one per
+        enforcement-loop attempt with a drawable box on that item, each
+        carrying ``&attempt=<n>`` so a REJECTED box can be looked at alone.
+      * ``text``, when the criterion used text layers: one link per layer
+        (per item, or per document for scope "document"). The text itself is
+        never inlined — it can be a whole contract.
     """
-    if not regions:
-        return None
-    slug = slugify_criterion(name)
-    regions_name = (
-        f"{stem_prefix}regions.json"
-        if stem_prefix and not stem_prefix.startswith("diff-")
-        else "regions.json"
-    )
-    pages = []
-    for page_index in sorted({r.page for r in regions}):
-        entry: dict = {"page": page_index}
-        for key, suffix in LAYER_FILE_SUFFIXES:
-            filename = f"{stem_prefix}p{page_index}.{suffix}"
-            if filename in present:
-                entry[key] = f"{_artifact_url(job_id, filename)}?criterion={slug}"
-        pages.append(entry)
+    block: dict[str, Any] = {}
+    if regions:
+        slug = slugify_criterion(name)
+        block["slug"] = slug
+        block["regions_url"] = f"{artifact_url(job_id, 'regions.json')}?criterion={slug}"
+        entries = []
+        for item in sorted({r.page for r in regions}):
+            layers = item_layers.get(item) or {}
+            if not layers:
+                continue
+            on_item = [r for r in regions if r.page == item]
+            numbered = [
+                r for r in on_item
+                if r.source == "llm" and isinstance(r.attrs.get("attempt"), int)
+            ]
+            attempts = [
+                {
+                    "attempt": region.attrs["attempt"],
+                    "accepted": bool(region.attrs.get("accepted")),
+                    **{
+                        fmt: f"{url}?criterion={slug}&attempt={region.attrs['attempt']}"
+                        for fmt, url in layers.items()
+                    },
+                }
+                for region in sorted(numbered, key=lambda r: r.attrs["attempt"])
+            ]
+            entries.append({
+                "item": item,
+                "count": len(on_item),
+                "layers": {fmt: f"{url}?criterion={slug}" for fmt, url in layers.items()},
+                "attempts": attempts,
+            })
+        block["items"] = entries
+    if text_refs:
+        block["text"] = [text_link(job_id, ref) for ref in text_refs]
+    return block or None
 
-    attempts = []
-    numbered = [
-        r for r in regions
-        if r.source == "llm" and isinstance(r.attrs.get("attempt"), int)
-    ]
-    for region in sorted(numbered, key=lambda r: r.attrs["attempt"]):
-        number = region.attrs["attempt"]
-        entry = {
-            "attempt": number,
-            "page": region.page,
-            "accepted": bool(region.attrs.get("accepted")),
+
+# ---------------------------------------------------------------------------
+# File labels — what each file in the directory is, and whose it is
+# ---------------------------------------------------------------------------
+
+# The name grammar of this directory. ``n`` is the global item, ``i`` the
+# document; a slug is common.vision's lowercase [a-z0-9-] (always ending in
+# a hash, so it can never be "base" or "layer").
+_LAYER_FILE_RE = re.compile(
+    r"^p(?P<item>\d+)\.(?:(?P<slug>[a-z0-9][a-z0-9-]*)\.)?"
+    r"(?P<suffix>svg|layer\.png|preview\.jpg)$"
+)
+_BASE_FILE_RE = re.compile(r"^p(?P<item>\d+)\.base\.jpg$")
+_TEXT_FILE_RE = re.compile(
+    r"^text\.(?:p(?P<item>\d+)|d(?P<document>\d+))\.[A-Za-z0-9_-]+\.json$"
+)
+_FORMAT_FOR_SUFFIX = {suffix: fmt for fmt, suffix in LAYER_FILE_SUFFIXES}
+
+
+class FileLabeler:
+    """Label every file of one job from its ``regions.json`` and item map.
+
+    The ONE place a file name is turned into ``kind`` / ``format`` / ``item``
+    / ``document`` / ``criteria``, used by both the job-result writer
+    (``write_job_artifacts``) and the manifest endpoint, so the two cannot
+    disagree. Everything is derived from the job's own records, never
+    guessed:
+
+      * regions per item — each region's ``page`` in regions.json;
+      * text layers per criterion — regions.json's ``criteria[*].text_layers``
+        (the same names the manifest's criterion map and each criterion's
+        ``artifacts.text`` links carry);
+      * document of an item — the ``items`` map (manifest, else regions.json).
+
+    Args:
+        regions_doc: The parsed regions.json (``criteria``, ``pages``, ``items``).
+        items_map:   ``{"n": {"document", "page", "filename"}}``; defaults to
+                     regions.json's own ``items``.
+    """
+
+    def __init__(self, regions_doc: dict, items_map: Optional[dict] = None) -> None:
+        entries: dict[str, dict] = (regions_doc or {}).get("criteria") or {}
+        self.items_map: dict[str, dict] = dict(
+            items_map if items_map is not None else (regions_doc or {}).get("items") or {}
+        )
+        self.all_names: list[str] = sorted(entries)
+        self.slug_to_name: dict[str, str] = {
+            e.get("slug"): name for name, e in entries.items() if e.get("slug")
         }
-        for key, suffix in LAYER_FILE_SUFFIXES:
-            filename = f"{stem_prefix}p{region.page}.{suffix}"
-            if filename in present:
-                entry[key] = (
-                    f"{_artifact_url(job_id, filename)}?criterion={slug}&attempt={number}"
-                )
-        attempts.append(entry)
+        self.name_to_slug: dict[str, str] = {v: k for k, v in self.slug_to_name.items()}
+        # item → criteria with at least one region there (any region, rejected
+        # LLM attempts included: they are drawable with ?attempt=).
+        self.region_items: dict[str, set[int]] = {}
+        self.by_item: dict[int, set[str]] = {}
+        # text layer file → criteria that read it.
+        self.text_layers: dict[str, set[str]] = {}
+        self.by_text: dict[str, set[str]] = {}
+        for name, entry in entries.items():
+            items = {int(r.get("page", 0)) for r in entry.get("regions") or []}
+            self.region_items[name] = items
+            for n in items:
+                self.by_item.setdefault(n, set()).add(name)
+            layers = set(entry.get("text_layers") or [])
+            self.text_layers[name] = layers
+            for layer in layers:
+                self.by_text.setdefault(layer, set()).add(name)
+        self.image_items: set[int] = {
+            int(p.get("page", -1)) for p in (regions_doc or {}).get("pages") or []
+        }
 
-    return {
-        "slug": slug,
-        "regions_url": f"{_artifact_url(job_id, regions_name)}?criterion={slug}",
-        "pages": pages,
-        "attempts": attempts,
-    }
+    # ── Per item / per document ───────────────────────────────────────────
+    def document_of(self, item: int) -> Optional[int]:
+        entry = self.items_map.get(str(item))
+        return None if entry is None else entry.get("document")
+
+    def items_of_document(self, document: int) -> list[int]:
+        return sorted(
+            int(n) for n, e in self.items_map.items() if e.get("document") == document
+        )
+
+    def text_items(self, layer: str) -> set[int]:
+        """The items a text layer covers: its own for ``text.p{n}``, every page
+        of document i for ``text.d{i}`` (the pages that search joined)."""
+        match = _TEXT_FILE_RE.match(layer)
+        if match is None:
+            return set()
+        if match.group("item") is not None:
+            return {int(match.group("item"))}
+        return set(self.items_of_document(int(match.group("document"))))
+
+    def items_for(self, name: str) -> set[int]:
+        """Items this criterion has regions on or read a text layer for."""
+        items = set(self.region_items.get(name, set()))
+        for layer in self.text_layers.get(name, set()):
+            items |= self.text_items(layer)
+        return items
+
+    # ── One file ──────────────────────────────────────────────────────────
+    def label(self, name: str) -> dict[str, Any]:
+        """``{kind, format?, item, document, criteria}`` for one file name."""
+        if name == "manifest.json":
+            return self._label("manifest", None, None, None, self.all_names)
+        if name == "regions.json":
+            return self._label("regions", None, None, None, self.all_names)
+        match = _TEXT_FILE_RE.match(name)
+        if match:
+            criteria = self.by_text.get(name, set())
+            if match.group("item") is not None:
+                item = int(match.group("item"))
+                return self._label("text", "json", item, self.document_of(item), criteria)
+            return self._label("text", "json", None, int(match.group("document")), criteria)
+        match = _BASE_FILE_RE.match(name)
+        if match:
+            item = int(match.group("item"))
+            return self._label("base", None, item, self.document_of(item),
+                               self.by_item.get(item, set()))
+        match = _LAYER_FILE_RE.match(name)
+        if match:
+            item = int(match.group("item"))
+            fmt = _FORMAT_FOR_SUFFIX[match.group("suffix")]
+            slug = match.group("slug")
+            if slug:
+                owner = self.slug_to_name.get(slug)
+                criteria = {owner} if owner else set()
+            else:
+                criteria = self.by_item.get(item, set())
+            return self._label("layer", fmt, item, self.document_of(item), criteria)
+        return self._label("other", None, None, None, set())
+
+    @staticmethod
+    def _label(kind: str, fmt: Optional[str], item: Optional[int],
+               document: Optional[int], criteria) -> dict[str, Any]:
+        label: dict[str, Any] = {"kind": kind}
+        if fmt:
+            label["format"] = fmt
+        label.update(item=item, document=document, criteria=sorted(criteria))
+        return label
+
+    def describe(self, job_id: str, files: list[dict]) -> list[dict]:
+        """Store entries (``name``, ``bytes``, ``content_type``) → labelled
+        entries with their ``url`` — the shape of ``artifacts.files`` and the
+        manifest endpoint's ``files``."""
+        return [
+            {**f, "url": artifact_url(job_id, f["name"]), **self.label(f["name"])}
+            for f in files
+        ]
 
 
-def _unimplemented_notes(options: RegionsOptions) -> list[str]:
-    """Say plainly which requested options this build could not honour.
+def labeler_for(job_id: str) -> FileLabeler:
+    """The labeler for a job's directory as it is on disk."""
+    regions_doc = store.read_json(job_id, "regions.json") or {}
+    manifest = store.read_json(job_id, "manifest.json") or {}
+    return FileLabeler(regions_doc, manifest.get("items"))
 
-    Recorded in the manifest and echoed in ``artifacts.notes`` rather than
-    failing the request: silently dropping a requested option is how a caller
-    ends up debugging an empty ``localization``.
 
-    Every `regions` field is implemented as of phases 3 and 4, so the only
-    entries left are the two that are meaningless on the endpoint they were
-    sent to — `diff` and `examples` are compare-only, and a caller who sets
-    them on `/assess` or `/locate` should be told rather than left wondering.
+# ---------------------------------------------------------------------------
+# The lazy renderer's one entry point
+# ---------------------------------------------------------------------------
+
+
+def render_layer(
+    job_id: str, fmt: str, geometry: PageGeometry, regions: list[Region]
+) -> Optional[bytes]:
+    """One layer's bytes; None for a preview when the base image is gone.
+
+    Every layer — combined, per criterion, per attempt — is produced by this
+    one function over some subset of regions.json, so a filtered view and
+    the unfiltered file can never disagree. ``geometry.page`` is the item.
     """
-    notes: list[str] = []
-    if options.diff:
-        notes.append(
-            "regions.diff was requested on a single-document job. Change "
-            "detection needs a reference to compare against, so it applies to "
-            "/assess/compare only; no diff layers were written."
-        )
-    if options.examples:
-        notes.append(
-            "regions.examples was requested on a single-document job. It "
-            "applies to /assess/compare only; layers were rendered for this "
-            "document alone."
-        )
-    for note in notes:
-        logger.info("regions: %s", note)
-    return notes
+    if fmt == "svg":
+        return render_svg(geometry, regions).encode("utf-8")
+    if fmt == "png":
+        return render_png_layer(geometry, regions)
+    base = store.open(job_id, base_image_name(geometry.page))
+    if base is None:
+        return None
+    return render_preview(base, geometry, regions, quality=PREVIEW_JPEG_QUALITY)

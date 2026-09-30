@@ -208,6 +208,7 @@ async def run(args) -> dict:
                 geometry=geometry,
                 detector_regions=detector.get(label),
                 max_attempts=args.attempts,
+                working_image=working,
             )
             elapsed = time.monotonic() - t0
             first = loc.attempts[0] if loc.attempts else None
@@ -334,8 +335,9 @@ def _print_summary(summary: dict) -> None:
         print(
             "\nAttempt-1 validity is under 50%: most first answers are not usable "
             "boxes. Per the regions plan § 3.3, prefer the open-vocabulary "
-            "detector (regions.detector) as the primary source and keep "
-            "regions.llm_boxes as the fallback for labels it cannot name."
+            "detector (a `detector` criterion) as the primary source and keep "
+            "llm criteria with options.boxes as the fallback for labels it "
+            "cannot name."
         )
     if row["mean_detector_iou"] is not None and row["mean_detector_iou"] < 0.5:
         print(

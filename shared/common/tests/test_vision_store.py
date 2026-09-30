@@ -163,6 +163,32 @@ def test_zip_contains_every_file_under_the_job_id(tmp_path):
         assert json.loads(archive.read("job1/regions.json")) == {"a": 1}
 
 
+def test_zip_subset_and_generated_entries(tmp_path):
+    store = _store(tmp_path)
+    store.write("job1", "regions.json", '{"a": 1}')
+    store.write("job1", "p0.svg", "<svg/>")
+    store.write("job1", "p1.svg", "<svg/>")
+
+    blob = b"".join(store.zip_chunks(
+        "job1",
+        names=["p0.svg", "regions.json", "not-there.png"],
+        extra={"regions.json": '{"a": 2}', "manifest.json": b"{}"},
+    ))
+    with zipfile.ZipFile(io.BytesIO(blob)) as archive:
+        assert archive.namelist() == ["job1/manifest.json", "job1/p0.svg", "job1/regions.json"]
+        # The generated entry replaces the stored one inside the zip only.
+        assert json.loads(archive.read("job1/regions.json")) == {"a": 2}
+    assert store.read_json("job1", "regions.json") == {"a": 1}
+    assert store.open("job1", "manifest.json") is None
+
+
+def test_zip_refuses_an_unsafe_generated_name(tmp_path):
+    store = _store(tmp_path)
+    store.write("job1", "p0.svg", "<svg/>")
+    with pytest.raises(ValueError):
+        b"".join(store.zip_chunks("job1", extra={"../x.json": "{}"}))
+
+
 def test_zip_of_an_empty_job_is_still_a_valid_archive(tmp_path):
     store = _store(tmp_path)
     blob = b"".join(store.zip_chunks("job1"))

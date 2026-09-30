@@ -55,7 +55,6 @@ RUN uv run --no-dev --package classifier python -c "from rapidocr import RapidOC
 COPY ai/classifier/*.py ./ai/classifier/
 COPY ai/classifier/analysis ./ai/classifier/analysis
 COPY ai/classifier/api ./ai/classifier/api
-COPY ai/classifier/compare ./ai/classifier/compare
 COPY ai/classifier/cv ./ai/classifier/cv
 COPY ai/classifier/detector ./ai/classifier/detector
 COPY ai/classifier/jobs ./ai/classifier/jobs

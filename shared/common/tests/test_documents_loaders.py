@@ -154,3 +154,56 @@ def test_document_metadata_records_size_and_filename() -> None:
     doc = load_document(raw, filename="hello.pdf")
     assert doc.size_bytes == len(raw)
     assert doc.filename == "hello.pdf"
+
+
+# ---------------------------------------------------------------------------
+# PyMuPDF from worker threads
+# ---------------------------------------------------------------------------
+
+
+def test_pdfs_load_correctly_from_many_threads_at_once() -> None:
+    """Services call these loaders via asyncio.to_thread, several jobs at once.
+    PyMuPDF is not thread-safe, so every call holds the module's lock; the
+    threaded result must be exactly the serial one."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    import numpy as np
+
+    from common.documents import pdf_page_count
+
+    raw = make_pdf(["alpha page", "beta page", "gamma page"])
+    serial = load_document(raw, filename="s.pdf")
+
+    def load(_: int):
+        assert pdf_page_count(raw) == 3
+        return load_document(raw, filename="t.pdf")
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(load, range(16)))
+
+    for doc in results:
+        assert [p.text for p in doc.pages] == [p.text for p in serial.pages]
+        for got, want in zip(doc.pages, serial.pages):
+            assert (got.width, got.height) == (want.width, want.height)
+            assert np.array_equal(got.image_bgr, want.image_bgr)
+
+
+def test_pdf_calls_hold_the_pymupdf_lock(monkeypatch) -> None:
+    """Every PyMuPDF entry point runs under the lock (re-entrant, so the
+    check can take it too)."""
+    from common.documents import loaders
+
+    held: list[bool] = []
+    real_open = __import__("pymupdf").open
+
+    def spy_open(*args, **kwargs):
+        # An RLock held by this thread can be re-acquired without blocking;
+        # held by nobody it could too — so check ownership directly.
+        held.append(loaders._PYMUPDF_LOCK._is_owned())
+        return real_open(*args, **kwargs)
+
+    raw = make_pdf(["one"])  # before the spy: the fixture itself opens PyMuPDF
+    monkeypatch.setattr("pymupdf.open", spy_open)
+    load_document(raw, filename="x.pdf")
+    loaders.pdf_page_count(raw)
+    assert held == [True, True]

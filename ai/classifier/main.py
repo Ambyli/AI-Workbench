@@ -72,6 +72,7 @@ from api import artifacts as artifacts_api
 from api import assess, introspection
 from config import LOG_LEVEL
 from jobs.queue import jobs_registry, queue, sweeper
+from llm import client as llm_client
 from logger import logger
 from middleware import CorrelationIDMiddleware, RequestIDFilter
 from regions.sweeper import delete_artifacts_for_job
@@ -120,6 +121,7 @@ async def lifespan(app: FastAPI):
         "processing" in the DB and are requeued by the next startup.
       - ``sweeper.stop()``: cancel the sweep loop. A sweep is idempotent, so
         an interrupted one is simply redone next boot.
+      - ``llm_client.aclose()``: close the pooled vision-model HTTP client.
     """
     await jobs_registry.init()
     await queue.start()
@@ -130,6 +132,7 @@ async def lifespan(app: FastAPI):
 
     await sweeper.stop()
     await queue.stop()
+    await llm_client.aclose()
     logger.info("lifespan: shutdown complete")
 
 

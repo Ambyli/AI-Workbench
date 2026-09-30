@@ -174,6 +174,7 @@ class DocumentContext:
     )
     ocr_passes: list[dict] = field(default_factory=list)
     _image_b64: Optional[str] = None
+    _ask_image: Optional["asyncio.Future[str]"] = None
     _layers: dict[str, "asyncio.Future[TextLayer]"] = field(default_factory=dict)
 
     @classmethod
@@ -223,6 +224,41 @@ class DocumentContext:
 
             self._image_b64 = encode_image_to_base64(self.working_image)
         return self._image_b64
+
+    async def ask_image_b64(self) -> Optional[str]:
+        """The page as the box loop's ASK call sees it (grid drawn on it when
+        LLM_BBOX_GRIDLINES is on), built once per item and shared by every
+        located criterion on it. None when no image.
+
+        Drawing the grid and re-encoding is tens of milliseconds of CPU, so it
+        runs in a worker thread; concurrent criteria await the same future,
+        same memo discipline as ``text_layer``.
+        """
+        if self.working_image is None:
+            return None
+        future = self._ask_image
+        if future is None:
+            from llm import boxes
+
+            future = asyncio.get_running_loop().create_future()
+            self._ask_image = future
+            try:
+                built = await asyncio.to_thread(
+                    boxes.ask_image_b64,
+                    self.image_b64(),
+                    self.working_image,
+                    gridlines=boxes.LLM_BBOX_GRIDLINES,
+                )
+                future.set_result(built)
+            except asyncio.CancelledError:
+                self._ask_image = None
+                future.cancel()
+                raise
+            except Exception as exc:
+                future.set_exception(exc)
+                future.exception()
+                raise
+        return await asyncio.shield(future)
 
     # ── Text layers ───────────────────────────────────────────────────────
     async def text_layer(

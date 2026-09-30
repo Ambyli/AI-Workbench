@@ -138,7 +138,7 @@ in the one process):
 | Knob | Bounds | Default |
 |---|---|---|
 | `CLASSIFIER_MAX_CONCURRENT` | jobs at once — worker tasks each atomically claiming the oldest `pending` row | 4 |
-| `CLASSIFIER_MAX_UNITS_PER_JOB` | units ONE job evaluates at once — ten criteria on twenty pages is 200 units, this many in flight. A unit waiting on its `depends_on` does not hold a slot | 2 |
+| `CLASSIFIER_MAX_UNITS_PER_JOB` | units ONE job evaluates at once — ten criteria on twenty pages is 200 units, this many in flight. A unit waiting on its `depends_on` does not hold a slot. Matched to `CLASSIFIER_MAX_LLM_CALLS` so a lone job can fill every model slot | 4 |
 | `CLASSIFIER_MAX_LLM_CALLS` | vision-model requests in flight across ALL jobs, every call type — scoring, box ask, refine, verify. Acquired in `llm/client.py` around the HTTP request itself, so no call path gets around it; a retry takes a fresh slot. Size it to the model: `muse-glimmer` runs `--max-num-seqs 4` | 4 |
 | `CLASSIFIER_OCR_WORKERS` | OCR passes at once (one ONNX inference each, in a worker thread) | 4 |
 
@@ -173,7 +173,7 @@ for `classifier_job_queue_depth` to reach 0 (or `GET /jobs?phase=pending` to
 come back empty) before `up -d --force-recreate`.
 
 **Rename in `.env`.** `CLASSIFIER_MAX_CRITERIA_PER_JOB` is now
-`CLASSIFIER_MAX_UNITS_PER_JOB` (same default, 2) — the old name is not read
+`CLASSIFIER_MAX_UNITS_PER_JOB` (default since raised from 2 to 4) — the old name is not read
 any more. `CLASSIFIER_MAX_ITEMS` (20) is new, and
 `CLASSIFIER_ARTIFACT_MAX_BYTES` is now a per-item allowance.
 

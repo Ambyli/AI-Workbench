@@ -400,6 +400,7 @@ async def locate_criterion(
     working_image: Any = None,
     gridlines: Optional[bool] = None,
     refine: Optional[bool] = None,
+    ask_b64: Optional[str] = None,
 ) -> tuple[list[Region], Localization]:
     """Run the full ask → validate → refine → verify → retry loop for one criterion.
 
@@ -423,6 +424,10 @@ async def locate_criterion(
                           the model was scored on. None → no grid on the ask.
         gridlines:        Draw the grid (default LLM_BBOX_GRIDLINES).
         refine:           Run the zoomed second pass (default LLM_BBOX_REFINE).
+        ask_b64:          The ask image already built by ``ask_image_b64``
+                          (``DocumentContext.ask_image_b64`` memoises it per
+                          item, so N located criteria on a page draw the grid
+                          once). None → built here from ``gridlines``.
 
     Returns:
         ``(regions, localization)``. ``regions`` holds one Region per attempt
@@ -438,7 +443,8 @@ async def locate_criterion(
     feedback: list[str] = []
     best_detector = _best_detector_region(detector_regions)
 
-    ask_b64 = ask_image_b64(image_b64, working_image, gridlines=gridlines)
+    if ask_b64 is None:
+        ask_b64 = ask_image_b64(image_b64, working_image, gridlines=gridlines)
     grid_on_ask = ask_b64 is not image_b64
     if gridlines and not grid_on_ask:
         logger.debug(

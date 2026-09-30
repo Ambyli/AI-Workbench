@@ -255,8 +255,11 @@ JOB_TTL_HOURS: int = int(os.environ.get("JOB_TTL_HOURS", "24"))
 #
 #   MAX_UNITS_PER_JOB     units ONE job evaluates at once. A job with ten
 #                         criteria on twenty pages still holds only this many
-#                         in flight, so one big job cannot starve the others.
-#                         A unit waiting on its depends_on holds no slot.
+#                         in flight. A unit waiting on its depends_on holds no
+#                         slot. Defaults to MAX_LLM_CALLS' 4, so a lone job
+#                         can fill every model slot; it was 2, which left a
+#                         single job using half the model. Lower it to keep
+#                         one big job from crowding out the others.
 #   MAX_LLM_CALLS         model calls in flight across ALL jobs, every call
 #                         type — scoring, box ask, refine, verify. Acquired in
 #                         llm/client.py around the HTTP request itself, so no
@@ -276,7 +279,7 @@ JOB_TTL_HOURS: int = int(os.environ.get("JOB_TTL_HOURS", "24"))
 # rows written by another process (or left behind by a crash).
 MAX_CONCURRENT: int = max(1, int(os.environ.get("CLASSIFIER_MAX_CONCURRENT", "4")))
 MAX_UNITS_PER_JOB: int = max(
-    1, int(os.environ.get("CLASSIFIER_MAX_UNITS_PER_JOB", "2"))
+    1, int(os.environ.get("CLASSIFIER_MAX_UNITS_PER_JOB", "4"))
 )
 MAX_LLM_CALLS: int = max(1, int(os.environ.get("CLASSIFIER_MAX_LLM_CALLS", "4")))
 OCR_WORKERS: int = max(1, int(os.environ.get("CLASSIFIER_OCR_WORKERS", "4")))

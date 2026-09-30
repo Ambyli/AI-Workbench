@@ -709,9 +709,11 @@ def test_mixed_scope_dependencies(client):
 
 
 def test_document_kinds_reports_items_and_units(client):
+    from config import MAX_ITEMS, MAX_UNITS_PER_JOB
+
     body = client.get("/document-kinds").json()
     limits = body["limits"]
-    assert limits["max_items"] == 20 and limits["max_units_per_job"] == 2
+    assert limits["max_items"] == MAX_ITEMS and limits["max_units_per_job"] == MAX_UNITS_PER_JOB
     assert "max_pages" not in limits and "max_criteria_per_job" not in limits
     pdf = next(k for k in body["kinds"] if k["kind"] == "pdf")
     assert pdf["pages"].startswith("any — every page is one item")

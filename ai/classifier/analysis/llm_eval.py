@@ -162,6 +162,7 @@ async def evaluate_with(name: str, opts: dict, ctx: DocumentContext) -> Outcome:
         geometry=ctx.geometry,
         max_attempts=opts["max_attempts"],
         working_image=ctx.working_image,
+        ask_b64=await ctx.ask_image_b64(),
     )
     outcome.regions = regions
     outcome.localization = loc.as_dict()

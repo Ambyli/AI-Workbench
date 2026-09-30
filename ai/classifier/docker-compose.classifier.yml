@@ -30,7 +30,7 @@ services:
       # --max-num-seqs 4), and OCR passes at once. See API.md § Concurrency
       # and durability.
       - CLASSIFIER_MAX_CONCURRENT=${CLASSIFIER_MAX_CONCURRENT:-4}
-      - CLASSIFIER_MAX_UNITS_PER_JOB=${CLASSIFIER_MAX_UNITS_PER_JOB:-2}
+      - CLASSIFIER_MAX_UNITS_PER_JOB=${CLASSIFIER_MAX_UNITS_PER_JOB:-4}
       - CLASSIFIER_MAX_LLM_CALLS=${CLASSIFIER_MAX_LLM_CALLS:-4}
       - CLASSIFIER_OCR_WORKERS=${CLASSIFIER_OCR_WORKERS:-4}
       # Document support: how many items (pages, across every document) one

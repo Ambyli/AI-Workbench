@@ -4,6 +4,7 @@
     LLM_CALLS                — the process-wide limit on model requests in
                                flight (CLASSIFIER_MAX_LLM_CALLS), across every
                                job and every call type.
+    aclose()                 — close the shared HTTP client (app shutdown).
     _post()                  — ONE HTTP request to VISION_LLM_API (``_send``),
                                holding a LLM_CALLS slot for exactly its
                                duration. Every call below goes through it, so
@@ -36,10 +37,12 @@ Process flow position: ``call_vllm`` is the ``llm`` evaluator's scoring call
 (``analysis.llm_eval``); ``call_vllm_json`` is every round of ``llm.boxes``.
 """
 
+import asyncio
 import base64
 import json
 import re
 import time
+import weakref
 
 import httpx
 from prometheus_client import Counter, Histogram
@@ -58,6 +61,32 @@ from logger import logger
 
 # Shared HTTP timeout applied to every vLLM request
 _http_timeout = httpx.Timeout(HTTP_TIMEOUT, connect=HTTP_CONNECT_TIMEOUT)
+
+# One pooled client per event loop, so a model call reuses a kept-alive
+# connection instead of opening a new one. Per loop because an AsyncClient's
+# connections belong to the loop that opened them; in the container there is
+# exactly one, while the tests run several. Weak keys: a finished loop drops
+# its client with it.
+_clients: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, httpx.AsyncClient]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _client() -> httpx.AsyncClient:
+    """This event loop's shared client, created on first use."""
+    loop = asyncio.get_running_loop()
+    client = _clients.get(loop)
+    if client is None or client.is_closed:
+        client = httpx.AsyncClient(timeout=_http_timeout)
+        _clients[loop] = client
+    return client
+
+
+async def aclose() -> None:
+    """Close this event loop's shared client. Called on app shutdown."""
+    client = _clients.pop(asyncio.get_running_loop(), None)
+    if client is not None:
+        await client.aclose()
 
 # Model requests in flight across the whole process. One slot per HTTP
 # request (a retry takes a fresh slot), so a slow model backs callers up here
@@ -119,10 +148,9 @@ async def _send(prompt: dict) -> dict:
         httpx.HTTPError: Transport failures and non-2xx statuses.
     """
     t0 = time.monotonic()
-    async with httpx.AsyncClient(timeout=_http_timeout) as client:
-        response = await client.post(VISION_LLM_API, json=prompt)
-        response.raise_for_status()
-        data = response.json()
+    response = await _client().post(VISION_LLM_API, json=prompt)
+    response.raise_for_status()
+    data = response.json()
     llm_latency.observe(time.monotonic() - t0)
     return data
 

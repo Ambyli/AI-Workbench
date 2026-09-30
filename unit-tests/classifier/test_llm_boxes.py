@@ -14,6 +14,9 @@ What is asserted here, in the order the loop does it:
     still returned, ``accepted_attempt: null``, and the SCORE AND VERDICT
     untouched (the property the whole design rests on);
   * a presence score under the floor skips the loop entirely — no calls at all;
+  * ``options.boxes`` is off by default, ``options.max_attempts`` bounds the
+    loop and can never exceed CLASSIFIER_LLM_BBOX_MAX_ATTEMPTS, and
+    ``score: false`` keeps the geometry while dropping the judgement;
   * the 0-1000 grid converts through a NON-SQUARE page correctly (the axis
     bug that a square fixture would hide);
   * the detector cross-check lands in ``attrs.detector_iou`` when phase 2's
@@ -226,54 +229,30 @@ def test_model_failure_is_a_rejected_attempt_not_an_exception(monkeypatch, page)
 
 
 @pytest.mark.parametrize(
-    "criterion, entry, expected",
+    "hint, entry, expected",
     [
-        (dict(type="llm", hint="presence"), {"score": 10}, True),
-        (dict(type="llm", hint="auto"), {"score": 7}, True),
-        (dict(type="llm", hint="presence"), {"score": 6}, False),
-        (dict(type="llm", hint="quality"), {"score": 10}, False),
-        (dict(type="cv"), {"score": 10}, False),
-        (dict(type="text"), {"score": 10}, False),
-        (dict(type="llm", hint="presence"), {"verdict": "SKIPPED", "score": None}, False),
-        (dict(type="llm", hint="presence"), None, False),
+        ("presence", {"score": 10}, True),
+        ("auto", {"score": 7}, True),
+        ("presence", {"score": 6}, False),
+        ("quality", {"score": 10}, False),
+        ("presence", {"score": None}, False),
+        ("presence", None, False),
     ],
 )
-def test_wants_boxes(criterion, entry, expected):
-    c = CriterionInput(name="has solar panels", **criterion)
-    assert llm_boxes.wants_boxes(c, entry) is expected
+def test_wants_boxes(hint, entry, expected):
+    assert llm_boxes.wants_boxes(hint, entry) is expected
 
 
-def test_low_presence_score_never_calls_the_model(monkeypatch, page):
-    """The model said the feature is absent — there is nothing to locate."""
-    model = ScriptedModel([{"bbox": GOOD_BOX}])
-    monkeypatch.setattr(llm_client, "call_vllm_json", model)
-    regions, locs = asyncio.run(
-        llm_boxes.locate_criteria(
-            [CriterionInput(name="has solar panels", type="llm", hint="presence")],
-            {"has solar panels": {"score": 3, "verdict": "FAIL"}},
-            image_b64="ZmFrZQ==",
-            original_image=page,
-            geometry=GEOMETRY,
-        )
-    )
-    assert regions == {} and locs == {}
-    assert model.calls == []
+def test_max_attempts_is_honoured_and_clamped_to_the_cap(monkeypatch, page):
+    """A criterion's max_attempts lowers the loop's budget; nothing raises it."""
+    rejected = [{"bbox": FULL_FRAME}] * 5
+    model = ScriptedModel(rejected)
+    _, loc = _run(model, monkeypatch, page, max_attempts=2)
+    assert len(loc.attempts) == 2
 
-
-def test_no_page_image_never_calls_the_model(monkeypatch, page):
-    """A .txt / .docx has no pixel space for a box to live in."""
-    model = ScriptedModel([{"bbox": GOOD_BOX}])
-    monkeypatch.setattr(llm_client, "call_vllm_json", model)
-    regions, locs = asyncio.run(
-        llm_boxes.locate_criteria(
-            [CriterionInput(name="has solar panels", type="llm", hint="presence")],
-            {"has solar panels": {"score": 10}},
-            image_b64=None,
-            original_image=None,
-            geometry=None,
-        )
-    )
-    assert regions == {} and locs == {} and model.calls == []
+    model = ScriptedModel(rejected)
+    _, loc = _run(model, monkeypatch, page, max_attempts=99)
+    assert len(loc.attempts) == llm_boxes.LLM_BBOX_MAX_ATTEMPTS
 
 
 # ---------------------------------------------------------------------------
@@ -575,7 +554,7 @@ def test_no_detector_regions_means_no_iou_key(monkeypatch, page):
 
 
 # ---------------------------------------------------------------------------
-# The serialised shape callers actually read
+# The loop inside the pipeline: options.boxes, max_attempts, score: false
 # ---------------------------------------------------------------------------
 
 
@@ -588,57 +567,103 @@ def _png_bytes(width=400, height=600):
     return cv2.imencode(".png", array)[1].tobytes()
 
 
-def _scoring_call(score: int):
-    """A stand-in for ``analysis.pipeline.call_vllm``: one presence criterion,
-    one score."""
+def _scoring_call(score: int, calls: list | None = None):
+    """A stand-in for ``llm.client.call_vllm``: one flat answer, run through
+    the validator the evaluator passes, exactly as the real call does."""
 
-    async def _call(prompt):
-        return {
-            "assessment": {
-                "overall_verdict": "PASS",
-                "overall_score": score,
-                "per_criterion_scores": {
-                    "has solar panels": {
-                        "score": score, "verdict": "PASS", "confidence": 80,
-                        "reason": "I observe panels. Therefore they are present.",
-                    }
-                },
-            }
+    async def _call(prompt, *, label="", validator=None):
+        if calls is not None:
+            calls.append(label)
+        raw = {
+            "score": score, "verdict": "PASS", "confidence": 80,
+            "reason": "I observe panels. Therefore they are present.",
         }
+        return validator(raw) if validator else raw
 
     return _call
 
 
-def _analyze(monkeypatch, *, llm_boxes_on, answers, score=10, job_id=None):
+def _criterion(**options):
+    return CriterionInput(
+        name="has solar panels", type="llm",
+        options={"hint": "presence", **options},
+    )
+
+
+def _analyze(monkeypatch, criterion, *, answers, score=10, job_id=None, scoring_calls=None):
     """Run the whole pipeline on a synthetic PNG with a scripted model."""
     import analysis
-    from analysis import pipeline
-    from api.schemas import RegionsOptions
 
-    monkeypatch.setattr(pipeline, "call_vllm", _scoring_call(score))
-    monkeypatch.setattr(llm_client, "call_vllm_json", ScriptedModel(answers))
+    monkeypatch.setattr(llm_client, "call_vllm", _scoring_call(score, scoring_calls))
+    model = ScriptedModel(answers)
+    monkeypatch.setattr(llm_client, "call_vllm_json", model)
     # These tests script ask/verify pairs; the refine pass would consume the
     # verify answers. The grid changes no call sequence but is off for parity.
     monkeypatch.setattr(llm_boxes, "LLM_BBOX_REFINE", False)
     monkeypatch.setattr(llm_boxes, "LLM_BBOX_GRIDLINES", False)
-    doc = analysis.load_document_bytes(_png_bytes(), "page.png", "image/png")
-    return asyncio.run(
-        analysis.analyze_document(
-            doc,
-            [CriterionInput(name="has solar panels", type="llm", hint="presence")],
-            "never",
-            regions=RegionsOptions(enabled=True, layers=["svg"], llm_boxes=llm_boxes_on),
-            job_id=job_id,
-        )
+    doc = analysis.load_document_bytes(_png_bytes(), "page.png", "image/png", keep_source=True)
+    result = asyncio.run(analysis.analyze_document(doc, [criterion], job_id=job_id))
+    return result, model
+
+
+def _entry(result):
+    return result["assessment"]["per_criterion_scores"]["has solar panels"]
+
+
+def test_boxes_default_off_means_no_loop_calls(monkeypatch):
+    """options.boxes defaults to false: a presence 10 is scored, never boxed."""
+    result, model = _analyze(monkeypatch, _criterion(), answers=[{"bbox": GOOD_BOX}])
+    entry = _entry(result)
+    assert model.calls == []
+    assert entry["options_used"]["boxes"] is False
+    assert entry["localization"] == {"attempts": [], "accepted_attempt": None, "calls": 0}
+    assert entry["regions"] == []
+
+
+def test_low_presence_score_never_calls_the_loop(monkeypatch):
+    """The model said the feature is absent — there is nothing to locate."""
+    result, model = _analyze(
+        monkeypatch, _criterion(boxes=True), answers=[{"bbox": GOOD_BOX}], score=3
     )
+    assert model.calls == []
+    assert _entry(result)["localization"]["calls"] == 0
+
+
+def test_quality_hint_is_never_boxed(monkeypatch):
+    result, model = _analyze(
+        monkeypatch,
+        CriterionInput(name="has solar panels", type="llm",
+                       options={"hint": "quality", "boxes": True}),
+        answers=[{"bbox": GOOD_BOX}],
+    )
+    assert model.calls == []
+
+
+def test_max_attempts_option_bounds_the_pipeline_loop(monkeypatch):
+    result, model = _analyze(
+        monkeypatch, _criterion(boxes=True, max_attempts=1),
+        answers=[{"bbox": FULL_FRAME}, {"bbox": FULL_FRAME}, {"bbox": FULL_FRAME}],
+    )
+    entry = _entry(result)
+    assert entry["options_used"]["max_attempts"] == 1
+    assert len(entry["localization"]["attempts"]) == 1
+    assert len(model.calls) == 1
+
+
+def test_max_attempts_past_the_cap_is_refused_at_validation():
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError) as exc:
+        _criterion(boxes=True, max_attempts=llm_boxes.LLM_BBOX_MAX_ATTEMPTS + 1)
+    assert "exceeds this server's cap" in str(exc.value)
 
 
 def test_pipeline_verdict_is_unchanged_by_an_exhausted_loop(monkeypatch):
     """The loop is additive: three rejected boxes, identical score and verdict."""
-    without = _analyze(monkeypatch, llm_boxes_on=False, answers=[])
-    with_loop = _analyze(
+    without, _ = _analyze(monkeypatch, _criterion(), answers=[])
+    with_loop, _ = _analyze(
         monkeypatch,
-        llm_boxes_on=True,
+        _criterion(boxes=True),
         answers=[
             {"bbox": [100, 200, 300, 400]}, {"score": 3, "reason": "tiles"},
             {"bbox": [400, 200, 600, 400]}, {"score": 2, "reason": "a vent"},
@@ -647,30 +672,36 @@ def test_pipeline_verdict_is_unchanged_by_an_exhausted_loop(monkeypatch):
     )
 
     assert with_loop["verdict"] == without["verdict"]
-    assert (
-        with_loop["assessment"]["overall_score"]
-        == without["assessment"]["overall_score"]
-    )
-    entry = with_loop["assessment"]["per_criterion_scores"]["has solar panels"]
-    base = without["assessment"]["per_criterion_scores"]["has solar panels"]
+    assert with_loop["assessment"]["overall_score"] == without["assessment"]["overall_score"]
+    entry, base = _entry(with_loop), _entry(without)
     assert entry["score"] == base["score"] and entry["verdict"] == base["verdict"]
 
     # …and every attempt is there, all rejected.
     assert entry["localization"]["accepted_attempt"] is None
     assert len(entry["localization"]["attempts"]) == 3
-    assert entry["regions"] and all(
-        r["attrs"]["accepted"] is False for r in entry["regions"]
+    assert entry["regions"] and all(r["attrs"]["accepted"] is False for r in entry["regions"])
+
+
+def test_score_false_locates_without_judging(monkeypatch):
+    """/locate's job: the presence call gates the loop, then is thrown away."""
+    scoring = []
+    result, model = _analyze(
+        monkeypatch,
+        CriterionInput(name="has solar panels", type="llm", score=False,
+                       options={"hint": "presence", "boxes": True}),
+        answers=[{"bbox": GOOD_BOX}, {"score": 9, "reason": "panels"}],
+        scoring_calls=scoring,
     )
-
-
-def test_pipeline_without_llm_boxes_has_the_empty_localization_shape(monkeypatch):
-    """A consumer can read localization.accepted_attempt without branching."""
-    result = _analyze(monkeypatch, llm_boxes_on=False, answers=[])
-    entry = result["assessment"]["per_criterion_scores"]["has solar panels"]
-    assert entry["localization"] == {
-        "attempts": [], "accepted_attempt": None, "calls": 0
-    }
-    assert entry["regions"] == [] and entry["artifacts"] is None
+    entry = _entry(result)
+    assert scoring == ["score/has solar panels"]  # the gate still ran
+    assert entry["score"] is None and entry["verdict"] is None and entry["confidence"] is None
+    assert entry["scored"] is False
+    assert entry["localization"]["accepted_attempt"] == 1
+    assert entry["regions"][0]["source"] == "llm"
+    # Excluded from the weighting, so there is nothing to weigh at all.
+    assert result["assessment"]["overall_score"] is None
+    assert result["assessment"]["complete"] is True
+    assert result["assessment"]["weighted_score_breakdown"] is None
 
 
 def test_pipeline_writes_localization_and_attempt_urls(monkeypatch):
@@ -679,9 +710,9 @@ def test_pipeline_writes_localization_and_attempt_urls(monkeypatch):
     from config import ARTIFACT_DIR
     from regions.collect import visible_regions
 
-    result = _analyze(
+    result, _ = _analyze(
         monkeypatch,
-        llm_boxes_on=True,
+        _criterion(boxes=True),
         answers=[
             {"bbox": FULL_FRAME},
             {"bbox": [100, 200, 300, 400]},
@@ -689,25 +720,27 @@ def test_pipeline_writes_localization_and_attempt_urls(monkeypatch):
         ],
         job_id="testjob1",
     )
-    entry = result["assessment"]["per_criterion_scores"]["has solar panels"]
+    entry = _entry(result)
     slug = entry["artifacts"]["slug"]
-    assert [a["attempt"] for a in entry["artifacts"]["attempts"]] == [1, 2]
-    assert entry["artifacts"]["attempts"][0]["svg"] == (
-        f"/jobs/testjob1/artifacts/p0.svg?criterion={slug}&attempt=1"
-    )
-    assert entry["artifacts"]["attempts"][0]["accepted"] is False
-    assert entry["artifacts"]["attempts"][1]["accepted"] is True
+    (on_page,) = entry["artifacts"]["items"]  # one item, so one per-item block
+    assert on_page["item"] == 0 and on_page["count"] == 2
+    attempts = on_page["attempts"]
+    assert [a["attempt"] for a in attempts] == [1, 2]
+    assert attempts[0]["svg"] == f"/jobs/testjob1/artifacts/p0.svg?criterion={slug}&attempt=1"
+    assert attempts[0]["accepted"] is False and attempts[1]["accepted"] is True
+    assert on_page["layers"]["svg"] == f"/jobs/testjob1/artifacts/p0.svg?criterion={slug}"
+    # The unit's own entry carries the same record as the criterion (one item).
+    assert entry["items"][0]["localization"] == entry["localization"]
 
-    stored = ArtifactStore(ARTIFACT_DIR).read_json("testjob1", "regions.json")
+    store = ArtifactStore(ARTIFACT_DIR)
+    stored = store.read_json("testjob1", "regions.json")
     criterion = stored["criteria"]["has solar panels"]
     assert criterion["localization"]["accepted_attempt"] == 2
     assert criterion["sources"] == ["llm"]
     assert len(criterion["regions"]) == 2
-
-    # The stored combined layer shows the ACCEPTED box only — one <rect> —
-    # which is exactly what the default `?criterion=` filter re-renders.
-    svg = ArtifactStore(ARTIFACT_DIR).open("testjob1", "p0.svg").decode()
-    assert 'data-region-count="1"' in svg
+    # Layers are NOT written at job time any more — only on first fetch.
+    assert store.open("testjob1", "p0.svg") is None
+    assert store.open("testjob1", "p0.base.jpg") is not None
     stored_regions = [Region.from_dict(r) for r in criterion["regions"]]
     assert len(visible_regions(stored_regions)) == 1
 

@@ -21,6 +21,16 @@ both. That is this package.
 
     apply_ocr(doc, engine)    → fills the text layer for pages that lack one
                                 (mode ``auto``), or all of them (``always``).
+
+    recognize_text_layer(page, engine)
+                              → the same decision and recognition, returned
+                                as a ``TextLayer`` WITHOUT mutating the page,
+                                so several OCR settings can coexist on one
+                                document. ``with_text_layers`` builds a
+                                (cheap, image-sharing) view carrying them and
+                                ``match_text_layers`` searches one.
+
+    pdf_page_count(raw)       → a PDF's page count without rendering it.
                                 ``RapidOCREngine`` is the bundled engine;
                                 ``OCREngine`` is the Protocol to implement for
                                 anything else (tests use a fake).
@@ -70,9 +80,17 @@ from .loaders import (
     ImageDecoder,
     default_image_decoder,
     load_document,
+    pdf_page_count,
     pdf_text_regions,
 )
-from .model import Document, Page, TextSource
+from .model import (
+    Document,
+    Page,
+    TextLayer,
+    TextSource,
+    page_with_layer,
+    with_text_layers,
+)
 from .ocr import (
     DEFAULT_MIN_NATIVE_CHARS,
     OCREngine,
@@ -80,7 +98,9 @@ from .ocr import (
     OCRResult,
     RapidOCREngine,
     apply_ocr,
+    needs_recognition,
     preprocess_for_ocr,
+    recognize_text_layer,
 )
 from .textmatch import (
     MAX_PATTERN_CHARS,
@@ -89,6 +109,7 @@ from .textmatch import (
     TextHit,
     TextMatchResult,
     match_text,
+    match_text_layers,
     ocr_line_regions,
 )
 
@@ -106,11 +127,15 @@ __all__ = [
     "ImageDecoder",
     "default_image_decoder",
     "load_document",
+    "pdf_page_count",
     "pdf_text_regions",
     # model
     "Document",
     "Page",
+    "TextLayer",
     "TextSource",
+    "page_with_layer",
+    "with_text_layers",
     # ocr
     "DEFAULT_MIN_NATIVE_CHARS",
     "OCREngine",
@@ -118,7 +143,9 @@ __all__ = [
     "OCRResult",
     "RapidOCREngine",
     "apply_ocr",
+    "needs_recognition",
     "preprocess_for_ocr",
+    "recognize_text_layer",
     # textmatch
     "MAX_PATTERN_CHARS",
     "InvalidPatternError",
@@ -126,5 +153,6 @@ __all__ = [
     "TextHit",
     "TextMatchResult",
     "match_text",
+    "match_text_layers",
     "ocr_line_regions",
 ]

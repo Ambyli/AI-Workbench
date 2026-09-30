@@ -46,13 +46,15 @@ there is not), and only ever adds keys. A criterion whose every attempt was
 rejected keeps its score and comes back with ``accepted_attempt: null``.
 
 Cost: one ask per attempt, plus one refine and one verify per attempt whose
-box validated — so at most ``3 × LLM_BBOX_MAX_ATTEMPTS`` small calls per
-located criterion, on top of the single scoring call the whole job shares.
-That is why the loop is opt-in (``regions.llm_boxes``) and gated on the
-presence score.
+box validated — so at most ``3 × max_attempts`` small calls per located
+criterion, on top of that criterion's own scoring call. That is why the loop
+is opt-in per criterion (``options.boxes``), capped per criterion
+(``options.max_attempts``, never above LLM_BBOX_MAX_ATTEMPTS) and gated on the
+presence score. Every call goes through ``llm.client``, so the process-wide
+CLASSIFIER_MAX_LLM_CALLS limit applies to each one.
 
-Process flow position: called from ``analysis.pipeline.analyze_document`` step
-6.5, after the scoring call and before the regions are written.
+Process flow position: called by the ``llm`` evaluator
+(``analysis.llm_eval``) right after that criterion's scoring call.
 """
 
 from __future__ import annotations
@@ -63,7 +65,6 @@ from typing import Any, Optional
 
 from common.vision import PageGeometry, Region, draw_grid_overlay, grid_to_pixels, iou
 
-from api.schemas import CriterionInput
 from config import (
     LLM_BBOX_CROP_PAD,
     LLM_BBOX_GRID,
@@ -218,27 +219,27 @@ class Localization:
 # ---------------------------------------------------------------------------
 
 
-def wants_boxes(c: CriterionInput, entry: Any) -> bool:
+def wants_boxes(hint: str, entry: Any) -> bool:
     """Is this criterion worth spending the loop's calls on?
 
-    Three conditions, all of them about not paying for a question with no
-    answer:
+    Called only for an ``llm`` criterion with ``options.boxes`` set (a `cv` /
+    `text` / `detector` criterion is localised by a path that measures rather
+    than claims). Two further conditions, both about not paying for a
+    question with no answer:
 
-      * it is an ``llm`` criterion — a `cv` / `text` / `detector` criterion
-        already localised through a path that measures rather than claims;
-      * its hint is ``presence`` or ``auto`` — "image sharpness" is a
+      * the hint is ``presence`` or ``auto`` — "image sharpness" is a
         property of the whole page and boxing it would be a fabrication;
       * the scoring call gave it LLM_BBOX_PRESENCE_MIN or more — below that
         line the model has just said the feature is absent, and asking the
         same model where the thing it cannot see is produces a guess.
 
     Args:
-        c:     The criterion.
-        entry: Its per-criterion result from the scoring call.
+        hint:  The criterion's ``options.hint``.
+        entry: Its scoring-call answer (``{"score", ...}``).
     """
-    if c.type != "llm" or c.hint not in ("presence", "auto"):
+    if hint not in ("presence", "auto"):
         return False
-    if not isinstance(entry, dict) or entry.get("verdict") == "SKIPPED":
+    if not isinstance(entry, dict):
         return False
     score = entry.get("score")
     if not isinstance(score, (int, float)):
@@ -399,6 +400,7 @@ async def locate_criterion(
     working_image: Any = None,
     gridlines: Optional[bool] = None,
     refine: Optional[bool] = None,
+    ask_b64: Optional[str] = None,
 ) -> tuple[list[Region], Localization]:
     """Run the full ask → validate → refine → verify → retry loop for one criterion.
 
@@ -413,13 +415,19 @@ async def locate_criterion(
                           it straight into original pixels.
         detector_regions: Phase 2's ``source="detector"`` boxes for the same
                           criterion, for the IoU cross-check. Informational.
-        max_attempts:     Override for LLM_BBOX_MAX_ATTEMPTS (tests).
+        max_attempts:     The criterion's resolved ``options.max_attempts``
+                          (at most LLM_BBOX_MAX_ATTEMPTS — the options model
+                          refuses more at submit, and this clamps again).
         working_image:    BGR array of the ≤MAX_WORKING_DIMENSION page the
                           scoring call's image was encoded from — the same
                           pixels, so drawing the grid on it changes nothing
                           the model was scored on. None → no grid on the ask.
         gridlines:        Draw the grid (default LLM_BBOX_GRIDLINES).
         refine:           Run the zoomed second pass (default LLM_BBOX_REFINE).
+        ask_b64:          The ask image already built by ``ask_image_b64``
+                          (``DocumentContext.ask_image_b64`` memoises it per
+                          item, so N located criteria on a page draw the grid
+                          once). None → built here from ``gridlines``.
 
     Returns:
         ``(regions, localization)``. ``regions`` holds one Region per attempt
@@ -430,11 +438,13 @@ async def locate_criterion(
         gridlines = LLM_BBOX_GRIDLINES
     if refine is None:
         refine = LLM_BBOX_REFINE
+    max_attempts = max(1, min(int(max_attempts), LLM_BBOX_MAX_ATTEMPTS))
     loc = Localization()
     feedback: list[str] = []
     best_detector = _best_detector_region(detector_regions)
 
-    ask_b64 = ask_image_b64(image_b64, working_image, gridlines=gridlines)
+    if ask_b64 is None:
+        ask_b64 = ask_image_b64(image_b64, working_image, gridlines=gridlines)
     grid_on_ask = ask_b64 is not image_b64
     if gridlines and not grid_on_ask:
         logger.debug(
@@ -594,74 +604,6 @@ async def locate_criterion(
     regions = [r for r in (a.as_region(name, geometry) for a in loc.attempts) if r]
     regions.sort(key=lambda r: not r.attrs.get("accepted"))
     return regions, loc
-
-
-async def locate_criteria(
-    criteria: list[CriterionInput],
-    per_criterion_scores: dict,
-    *,
-    image_b64: Optional[str],
-    original_image: Any,
-    geometry: Optional[PageGeometry],
-    detector_regions: Optional[dict[str, list[Region]]] = None,
-    working_image: Any = None,
-) -> tuple[dict[str, list[Region]], dict[str, dict]]:
-    """Run the loop for every criterion that qualifies.
-
-    Sequentially, not with ``asyncio.gather``: the calls are small but they
-    land on the same vLLM instance the scoring call just used, and a job with
-    eight presence criteria would otherwise open sixteen concurrent requests
-    against a server running ``--max-num-seqs 4``. Several jobs already run in
-    parallel (CLASSIFIER_MAX_CONCURRENT) — the concurrency belongs there.
-
-    Args:
-        criteria:             Every criterion in the request; the gate picks.
-        per_criterion_scores: The scoring call's results, read for the gate
-                              only and never written to.
-        image_b64:            The page image the scoring call attached, or
-                              None (a text-only document — nothing to locate).
-        original_image:       BGR array of that page at original size.
-        geometry:             That page's frame, or None.
-        detector_regions:     ``{criterion: [Region, ...]}`` from phase 2.
-        working_image:        BGR array of the ≤MAX_WORKING_DIMENSION page
-                              ``image_b64`` was encoded from, for the grid
-                              overlay. None → the ask sees the bare image.
-
-    Returns:
-        ``({criterion: [Region, ...]}, {criterion: localization dict})`` —
-        entries only for the criteria that actually ran.
-    """
-    if not image_b64 or geometry is None:
-        return {}, {}
-
-    wanted = [c for c in criteria if wants_boxes(c, per_criterion_scores.get(c.name))]
-    if not wanted:
-        logger.info(
-            "locate_criteria: regions.llm_boxes is on but no criterion qualifies "
-            "(needs type=llm, hint presence/auto, and a presence score >= %d)",
-            LLM_BBOX_PRESENCE_MIN,
-        )
-        return {}, {}
-
-    logger.info(
-        "locate_criteria: running the enforcement loop for %d criterion/criteria "
-        "on page %d: %s",
-        len(wanted), geometry.page, [c.name for c in wanted],
-    )
-    regions: dict[str, list[Region]] = {}
-    localizations: dict[str, dict] = {}
-    for c in wanted:
-        found, loc = await locate_criterion(
-            c.name,
-            image_b64=image_b64,
-            original_image=original_image,
-            geometry=geometry,
-            detector_regions=(detector_regions or {}).get(c.name),
-            working_image=working_image,
-        )
-        regions[c.name] = found
-        localizations[c.name] = loc.as_dict()
-    return regions, localizations
 
 
 # ---------------------------------------------------------------------------

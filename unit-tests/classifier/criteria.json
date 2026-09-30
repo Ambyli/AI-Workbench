@@ -1,8 +1,8 @@
-[  
-  {"name": "has electrical meter",                 "type": "llm", "hint": "presence", "weight": 4.0},
-  {"name": "meter value is readable",              "type": "llm", "hint": "quality",  "weight": 3.0, "depends_on": "has electrical meter"},
-  {"name": "three feet of clearance around meter", "type": "llm", "hint": "presence", "weight": 2.5, "depends_on": "has electrical meter"},
-  {"name": "has overhead point of interconnection","type": "llm", "hint": "presence", "weight": 2.0},
-  {"name": "sharpness",                            "type": "cv",  "hint": "quality",  "weight": 1.0},
-  {"name": "proper exposure",                      "type": "cv",  "hint": "quality",  "weight": 1.0}
+[
+  {"name": "has electrical meter",                  "type": "llm", "weight": 4.0, "options": {"hint": "presence"}},
+  {"name": "meter value is readable",               "type": "llm", "weight": 3.0, "depends_on": "has electrical meter", "options": {"hint": "quality"}},
+  {"name": "three feet of clearance around meter",  "type": "llm", "weight": 2.5, "depends_on": "has electrical meter", "options": {"hint": "presence"}},
+  {"name": "has overhead point of interconnection", "type": "llm", "weight": 2.0, "options": {"hint": "presence"}},
+  {"name": "sharpness",                             "type": "cv",  "weight": 1.0},
+  {"name": "proper exposure",                       "type": "cv",  "weight": 1.0}
 ]

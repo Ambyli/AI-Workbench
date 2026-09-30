@@ -12,9 +12,15 @@ recipe itself changed.
 
 Fixtures produced (see README.md for the criteria/expectations table):
 
-    invoice_native.pdf        2-page PDF with a real text layer and a table
-    invoice_scanned.pdf       the same invoice as page IMAGES only (no text
+    invoice_native.pdf        1-page PDF with a real text layer and a table
+    invoice_scanned.pdf       the same invoice as a page IMAGE only (no text
                               layer), slightly rotated and noisy → needs OCR
+    invoice_two_page.pdf      the invoice split over TWO pages, native text —
+                              two ITEMS in one document. A sentence runs over
+                              the page break ("Please remit the balance to" /
+                              "the Acme Roofing billing office."), so a text
+                              criterion with options.scope "document" finds
+                              it and a page-scope one does not
     contract.txt              plain UTF-8 text, "Limited Warranty" + a date
     proposal.docx             headings, paragraphs, and a table row
                               "System Size | 8.4 kW"
@@ -98,6 +104,16 @@ INVOICE_ROWS = [
     ("Total Due", "", "$4,850.00"),
 ]
 
+# The payment terms. On the single-page invoices they sit below the table;
+# on invoice_two_page.pdf they are page 2.
+#
+# invoice_two_page.pdf only: a sentence split over the page break — the last
+# line of page 1 and the first line of page 2. Neither page contains
+# SPLIT_PHRASE on its own; joined in page order (a document-scope search)
+# they do.
+SPLIT_PAGE_1_TAIL = "Please remit the balance to"
+SPLIT_PAGE_2_HEAD = "the Acme Roofing billing office."
+SPLIT_PHRASE = "remit the balance to the Acme Roofing billing office"
 INVOICE_PAGE_2 = [
     ("Payment Terms: Net 30", 16),
     ("", 12),
@@ -206,16 +222,20 @@ def _font(size: int) -> ImageFont.ImageFont:
         return ImageFont.load_default()
 
 
-def _render_lines(lines: list[tuple[str, int]], width: int, height: int) -> Image.Image:
-    """Draw ``(text, point_size)`` lines onto a white page."""
-    img = Image.new("RGB", (width, height), "white")
-    draw = ImageDraw.Draw(img)
-    y = int(height * 0.07)
+def _draw_lines(draw: ImageDraw.ImageDraw, lines: list[tuple[str, int]], x: int, y: int) -> int:
+    """Draw ``(text, point_size)`` lines from ``y`` down; returns the y below them."""
     for text, size in lines:
         px = int(size * 2.2)  # points → pixels at roughly 150 dpi
         if text:
-            draw.text((int(width * 0.09), y), text, fill=(20, 20, 20), font=_font(px))
+            draw.text((x, y), text, fill=(20, 20, 20), font=_font(px))
         y += int(px * 1.5)
+    return y
+
+
+def _render_lines(lines: list[tuple[str, int]], width: int, height: int) -> Image.Image:
+    """Draw ``(text, point_size)`` lines onto a white page."""
+    img = Image.new("RGB", (width, height), "white")
+    _draw_lines(ImageDraw.Draw(img), lines, int(width * 0.09), int(height * 0.07))
     return img
 
 
@@ -297,17 +317,8 @@ def _jpeg_bytes(img: Image.Image, quality: int = 78) -> bytes:
 # ---------------------------------------------------------------------------
 
 
-def make_invoice_native() -> pathlib.Path:
-    """2-page PDF with a real text layer, including a line-items table.
-
-    PyMuPDF draws the table as text in aligned columns; the extracted text
-    keeps the row together on one line, which is what a `text` criterion
-    searching for "Total Due" needs.
-    """
-    doc = pymupdf.open()
-
-    page = doc.new_page()  # letter, 612×792 pt
-    y = 72.0
+def _insert_invoice_head(page, y: float) -> float:
+    """The letterhead, the notice and the line-items table; returns the y below."""
     for text, size in INVOICE_PAGE_1:
         if text:
             page.insert_text((60, y), text, fontsize=size)
@@ -318,13 +329,29 @@ def make_invoice_native() -> pathlib.Path:
         page.insert_text((400, y), qty, fontsize=11)
         page.insert_text((470, y), amount, fontsize=11)
         y += 20
+    return y
 
-    page2 = doc.new_page()
-    y = 72.0
+
+def _insert_payment_terms(page, y: float) -> float:
     for text, size in INVOICE_PAGE_2:
         if text:
-            page2.insert_text((60, y), text, fontsize=size)
+            page.insert_text((60, y), text, fontsize=size)
         y += size * 1.7
+    return y
+
+
+def make_invoice_native() -> pathlib.Path:
+    """1-page PDF with a real text layer, including a line-items table.
+
+    PyMuPDF draws the table as text in aligned columns; the extracted text
+    keeps the row together on one line, which is what a `text` criterion
+    searching for "Total Due" needs. The payment terms follow the table on the
+    same page — the classifier accepts single-page documents only.
+    """
+    doc = pymupdf.open()
+    page = doc.new_page()  # PyMuPDF default: A4, 595×842 pt
+    y = _insert_invoice_head(page, 72.0)
+    _insert_payment_terms(page, y + 24)
 
     out = HERE / "invoice_native.pdf"
     _pin_pdf_metadata(doc)
@@ -333,26 +360,52 @@ def make_invoice_native() -> pathlib.Path:
     return out
 
 
-def make_invoice_scanned() -> pathlib.Path:
-    """The same invoice as page images only — no text layer, so OCR is required.
+def make_invoice_two_page() -> pathlib.Path:
+    """The invoice over TWO pages (terms on page 2): two items, one document.
 
-    Each page is rendered large, "photographed" (2° rotation + light noise),
+    POST /assess counts the pages without rendering (2 items against
+    CLASSIFIER_MAX_ITEMS). The last line of page 1 and the first of page 2 are
+    one sentence (SPLIT_PHRASE), for the document-scope text search.
+    """
+    doc = pymupdf.open()
+    first = doc.new_page()
+    y = _insert_invoice_head(first, 72.0)
+    first.insert_text((60, y + 24), SPLIT_PAGE_1_TAIL, fontsize=11)
+    second = doc.new_page()
+    second.insert_text((60, 72.0), SPLIT_PAGE_2_HEAD, fontsize=11)
+    _insert_payment_terms(second, 72.0 + 11 * 1.7 + 12)
+
+    out = HERE / "invoice_two_page.pdf"
+    _pin_pdf_metadata(doc)
+    doc.save(out, deflate=True, no_new_id=True)
+    doc.close()
+    return out
+
+
+def make_invoice_scanned() -> pathlib.Path:
+    """The same invoice as a page image only — no text layer, so OCR is required.
+
+    The page is rendered large, "photographed" (2° rotation + light noise),
     JPEG-compressed to keep the file small, and inserted as a full-page image.
     """
-    pages = [
-        _render_lines(INVOICE_PAGE_1, 1240, 1600),
-        _render_lines(INVOICE_PAGE_2, 1240, 1600),
-    ]
-    # Draw the line-items table onto page 1 under the text block.
-    draw = ImageDraw.Draw(pages[0])
-    _draw_table(draw, x=int(1240 * 0.09), y=int(1600 * 0.62), width=int(1240 * 0.82), size=24)
+    width, height = 1240, 1600
+    image = _render_lines(INVOICE_PAGE_1, width, height)
+    draw = ImageDraw.Draw(image)
+    # The line-items table under the text block, then the payment terms.
+    y = _draw_table(draw, x=int(width * 0.09), y=int(height * 0.62), width=int(width * 0.82), size=24)
+    _draw_lines(draw, INVOICE_PAGE_2, int(width * 0.09), y + 24)
 
     doc = pymupdf.open()
-    for image in pages:
-        scan = _photograph(image, skew=2.0, blur=0.5, noise=3.0, gradient=0.10)
-        rect = pymupdf.Rect(0, 0, 612, 792)
-        page = doc.new_page(width=rect.width, height=rect.height)
-        page.insert_image(rect, stream=_jpeg_bytes(scan))
+    scan = _photograph(image, skew=2.0, blur=0.5, noise=3.0, gradient=0.10)
+    rect = pymupdf.Rect(0, 0, 612, 792)
+    page = doc.new_page(width=rect.width, height=rect.height)
+    page.insert_image(rect, stream=_jpeg_bytes(scan))
+
+    # This fixture used to photograph TWO pages. The noise stream is shared
+    # (one seeded RNG), so the draws the old second page consumed are burned
+    # here — without this, every fixture generated after this one (the two
+    # photos of the letter) would change for no reason.
+    RNG.normal(0.0, 3.0, (height, width, 3))
 
     out = HERE / "invoice_scanned.pdf"
     _pin_pdf_metadata(doc)
@@ -601,6 +654,7 @@ def main() -> None:
     builders = [
         make_invoice_native,
         make_invoice_scanned,
+        make_invoice_two_page,
         make_contract_txt,
         make_proposal_docx,
         make_photo_of_letter,

@@ -24,6 +24,11 @@ Design notes worth knowing before editing:
   * The image decoder is injected rather than fixed. ``classifier`` passes its
     EXIF-correcting decoder so a phone photo loads the right way up; anything
     else gets ``default_image_decoder``.
+  * Every PyMuPDF call holds ``_PYMUPDF_LOCK``. PyMuPDF documents itself as
+    not thread-safe (one global MuPDF context), and callers run these
+    functions from worker threads (``asyncio.to_thread``) — several jobs at
+    once. The PDF render holds it per page, not per document, so a 20-page
+    render does not stall a short ``pdf_text_regions`` lookup for seconds.
 
 Requires the ``documents`` extra: ``pymupdf`` (PDF), ``python-docx`` (DOCX),
 ``pillow`` + ``numpy`` (images). Each is imported lazily inside its loader so
@@ -35,6 +40,7 @@ returns is then optionally OCR'd (ocr.py) and searched (textmatch.py).
 
 from __future__ import annotations
 
+import threading
 from typing import TYPE_CHECKING, Callable, Optional
 
 from .detect import DocumentKind, UnsupportedDocumentError, detect_kind, guess_content_type
@@ -52,6 +58,10 @@ ImageDecoder = Callable[[bytes], "np.ndarray"]
 #   150 dpi is the lowest density at which 8-10pt body text survives OCR.
 DEFAULT_MAX_PAGES = 20
 DEFAULT_RENDER_DPI = 150
+
+# PyMuPDF is not thread-safe; every call into it in this module holds this
+# (see the module docstring). Re-entrant so a helper can call another.
+_PYMUPDF_LOCK = threading.RLock()
 
 
 def default_image_decoder(raw: bytes) -> "np.ndarray":
@@ -119,25 +129,30 @@ def _load_pdf(raw: bytes, max_pages: int, render_dpi: int) -> tuple[list[Page], 
     import pymupdf  # PyMuPDF ≥1.24 exposes both `pymupdf` and the legacy `fitz`
 
     try:
-        doc = pymupdf.open(stream=raw, filetype="pdf")
+        with _PYMUPDF_LOCK:
+            doc = pymupdf.open(stream=raw, filetype="pdf")
     except Exception as exc:
         raise UnsupportedDocumentError(f"Could not open PDF: {exc}") from exc
 
     pages: list[Page] = []
     try:
-        total = doc.page_count
+        with _PYMUPDF_LOCK:
+            total = doc.page_count
         limit = min(total, max_pages)
         for i in range(limit):
-            page = doc.load_page(i)
-            # "text" mode = reading-order plain text; no layout boxes, which is
-            # what a search or an LLM prompt wants.
-            native = page.get_text("text") or ""
-            pix = page.get_pixmap(dpi=render_dpi)
-            # pix.samples is a flat RGB(A) buffer; reshape then drop alpha.
-            arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
-                pix.height, pix.width, pix.n
-            )
-            if pix.n == 4:
+            with _PYMUPDF_LOCK:
+                page = doc.load_page(i)
+                # "text" mode = reading-order plain text; no layout boxes,
+                # which is what a search or an LLM prompt wants.
+                native = page.get_text("text") or ""
+                pix = page.get_pixmap(dpi=render_dpi)
+                # pix.samples is a flat RGB(A) buffer; copied out under the
+                # lock with its shape, reshaped and converted outside it.
+                samples = bytes(pix.samples)
+                width, height, channels = pix.width, pix.height, pix.n
+                del pix, page
+            arr = np.frombuffer(samples, dtype=np.uint8).reshape(height, width, channels)
+            if channels == 4:
                 arr = arr[:, :, :3]
             bgr = arr[:, :, ::-1].copy()  # RGB → BGR
             pages.append(
@@ -146,13 +161,14 @@ def _load_pdf(raw: bytes, max_pages: int, render_dpi: int) -> tuple[list[Page], 
                     image_bgr=bgr,
                     text=native,
                     text_source="native" if native.strip() else "none",
-                    width=pix.width,
-                    height=pix.height,
+                    width=width,
+                    height=height,
                 )
             )
         truncated = max(0, total - limit)
     finally:
-        doc.close()
+        with _PYMUPDF_LOCK:
+            doc.close()
     return pages, truncated
 
 
@@ -288,6 +304,30 @@ def load_document(
     )
 
 
+def pdf_page_count(raw: bytes) -> int:
+    """How many pages a PDF has, WITHOUT rendering or extracting any of them.
+
+    Opening a PDF with PyMuPDF parses the cross-reference table, not the page
+    content, so this is milliseconds even for a long document — cheap enough
+    for a request handler that has to refuse a multi-page upload before a
+    worker spends a render on it.
+
+    Raises:
+        UnsupportedDocumentError: PyMuPDF cannot open the stream.
+    """
+    import pymupdf
+
+    with _PYMUPDF_LOCK:
+        try:
+            doc = pymupdf.open(stream=raw, filetype="pdf")
+        except Exception as exc:
+            raise UnsupportedDocumentError(f"Could not open PDF: {exc}") from exc
+        try:
+            return int(doc.page_count)
+        finally:
+            doc.close()
+
+
 # ---------------------------------------------------------------------------
 # Native-PDF geometry for a text hit
 # ---------------------------------------------------------------------------
@@ -405,48 +445,49 @@ def pdf_text_regions(
 
     region_label = label or pattern
     regions: list = []
-    try:
-        doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
-    except Exception:
-        return []
-    try:
-        if page.index >= doc.page_count:
+    with _PYMUPDF_LOCK:
+        try:
+            doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+        except Exception:
             return []
-        pdf_page = doc.load_page(page.index)
-        rect = pdf_page.rect
-        sx = page.width / rect.width if rect.width else 1.0
-        sy = page.height / rect.height if rect.height else 1.0
+        try:
+            if page.index >= doc.page_count:
+                return []
+            pdf_page = doc.load_page(page.index)
+            rect = pdf_page.rect
+            sx = page.width / rect.width if rect.width else 1.0
+            sy = page.height / rect.height if rect.height else 1.0
 
-        found: list[tuple[tuple[float, float, float, float], str, float]] = []
-        if mode in ("contains", "exact") and pattern:
-            for quad in pdf_page.search_for(pattern)[:max_regions]:
-                found.append(((quad.x0, quad.y0, quad.x1, quad.y1), pattern, 1.0))
-        else:
-            words = pdf_page.get_text("words")
-            cursor = 0
-            for hit in hits[:max_regions]:
-                box, cursor = _rect_for_snippet(words, getattr(hit, "text", ""), cursor)
-                if box:
-                    found.append((box, getattr(hit, "text", ""), getattr(hit, "ratio", 1.0)))
+            found: list[tuple[tuple[float, float, float, float], str, float]] = []
+            if mode in ("contains", "exact") and pattern:
+                for quad in pdf_page.search_for(pattern)[:max_regions]:
+                    found.append(((quad.x0, quad.y0, quad.x1, quad.y1), pattern, 1.0))
+            else:
+                words = pdf_page.get_text("words")
+                cursor = 0
+                for hit in hits[:max_regions]:
+                    box, cursor = _rect_for_snippet(words, getattr(hit, "text", ""), cursor)
+                    if box:
+                        found.append((box, getattr(hit, "text", ""), getattr(hit, "ratio", 1.0)))
 
-        for (x0, y0, x1, y1), text, ratio in found:
-            regions.append(
-                Region(
-                    page=page.index,
-                    kind="box",
-                    points=[(x0 * sx, y0 * sy), (x1 * sx, y1 * sy)],
-                    label=region_label,
-                    score=1.0,
-                    source="pdf-text",
-                    attrs={
-                        "text": text[:120],
-                        "ratio": round(float(ratio), 4),
-                        "pdf_rect": [
-                            round(x0, 2), round(y0, 2), round(x1, 2), round(y1, 2)
-                        ],
-                    },
+            for (x0, y0, x1, y1), text, ratio in found:
+                regions.append(
+                    Region(
+                        page=page.index,
+                        kind="box",
+                        points=[(x0 * sx, y0 * sy), (x1 * sx, y1 * sy)],
+                        label=region_label,
+                        score=1.0,
+                        source="pdf-text",
+                        attrs={
+                            "text": text[:120],
+                            "ratio": round(float(ratio), 4),
+                            "pdf_rect": [
+                                round(x0, 2), round(y0, 2), round(x1, 2), round(y1, 2)
+                            ],
+                        },
+                    )
                 )
-            )
-    finally:
-        doc.close()
+        finally:
+            doc.close()
     return regions

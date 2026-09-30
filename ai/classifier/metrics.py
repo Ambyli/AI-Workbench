@@ -9,11 +9,10 @@ every sweep, and whenever a directory is written, cached into, or deleted — so
 "how much disk are the region layers holding?" is answerable from Prometheus
 rather than by exec-ing into the container.
 
-``llm_bbox_attempts`` (llm/boxes.py) and ``diff_jobs`` (compare/diff.py) live
-here for
-the same reason: they are produced in one module and read in none, so a
-counter defined next to its producer would be invisible to anyone looking for
-"what does this service measure".
+``llm_bbox_attempts`` (llm/boxes.py) lives here for the same reason: it is
+produced in one module and read in none, so a counter defined next to its
+producer would be invisible to anyone looking for "what does this service
+measure".
 
 Scraped by Prometheus (see prometheus.yml) and visualised in Grafana alongside
 LiteLLM metrics from the same Prometheus instance.
@@ -24,7 +23,7 @@ from prometheus_client import Counter, Gauge, Histogram
 jobs_total = Counter(
     "classifier_jobs_total",
     "Total jobs by type and final status",
-    ["type", "status"],  # type: assess|compare, status: pending|completed|failed
+    ["type", "status"],  # type: assess, status: pending|completed|failed
 )
 job_duration = Histogram(
     "classifier_job_duration_seconds",
@@ -55,9 +54,4 @@ llm_bbox_attempts = Counter(
     # rejected_verify  — the box was usable but the crop did not show it
     # exhausted        — counted once per criterion that ran out of attempts
     ["outcome"],
-)
-diff_jobs = Counter(
-    "classifier_diff_jobs_total",
-    "Change-detection runs by whether the two images could be aligned",
-    ["aligned"],  # "true" | "false"
 )

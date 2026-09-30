@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Zeo Energy — Service Chatbot & Operations Portal</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+<div class="app">
+
+  <!-- ===================== APP BAR ===================== -->
+  <div class="appbar">
+    <img src="/assets/zeo-energy-horizontal.png" alt="Zeo Energy" class="logo-appbar" />
+    
+    <!-- System Changes / Release Notes Button -->
+    <button type="button" id="btnReleaseNotes" class="top-action-btn" title="View latest upgrades and architecture">
+      <span>🚀</span> Release Notes & Upgrades
+    </button>
+
+    <!-- Queue Simulator Quick Bar -->
+    <div class="queue-pill-bar" id="queueSimBar" title="Live Concurrency & Queue Status">
+      <span id="queueDot" class="queue-indicator-dot"></span>
+      <span>Active: <strong id="activeUserCount">0</strong>/<span id="maxActiveCount">25</span></span>
+      <span style="color:#cbd5e1;">|</span>
+      <span>Queue: <strong id="queuedUserCount">0</strong></span>
+      <button type="button" id="btnSimQueueFill" class="top-action-btn" style="padding:2px 8px; font-size:10px; margin-left:4px;" title="Simulate full active capacity to trigger queue for next user">Simulate Queue</button>
+      <button type="button" id="btnSimQueueFree" class="top-action-btn" style="padding:2px 8px; font-size:10px;" title="Free an active slot to watch queue promotion">Advance Queue</button>
+      <button type="button" id="btnSimQueueReset" class="top-action-btn" style="padding:2px 8px; font-size:10px;" title="Reset queue to 0">Reset</button>
+    </div>
+
+    <div class="flex-spacer"></div>
+
+    <div id="modeWrap" class="mode-wrap">
+      <span class="mode-cap">Mode</span>
+      <div id="modeToggle" class="mode-toggle" role="switch" aria-checked="true" tabindex="0"
+           title="Toggle between Standard and Account Lookup">
+        <span id="modeKnob" class="mode-knob"></span>
+        <span id="optStandard" class="mode-opt">Standard</span>
+        <span id="optLookup" class="mode-opt on">Account Lookup</span>
+      </div>
+    </div>
+
+    <div class="tabs">
+      <button type="button" id="tabChat" class="tab on">Chatbot</button>
+      <button type="button" id="tabEmails" class="tab">Emails <span id="emailCountTab" class="tab-count">0</span></button>
+      <button type="button" id="tabCrm" class="tab">Mock CRM <span id="crmCountTab" class="tab-count" style="background:#2563eb;">0</span></button>
+      <button type="button" id="tabDatabase" class="tab">Database</button>
+    </div>
+  </div>
+
+  <!-- ===================== CHAT TAB ===================== -->
+  <section id="chatTab" class="container-chat">
+    <h1 class="page-title">Service Request</h1>
+
+    <div class="safety-banner" role="alert">
+      If there is any threat of harm to you or anyone at your home, please call <strong>911</strong> immediately.
+    </div>
+
+    <div class="contact-card">
+      <div class="contact-title">Contact Us Directly</div>
+      <div class="contact-item"><strong>Service Dept (Solar):</strong> (727) 349-4057</div>
+      <div class="contact-item"><strong>Nonstandard Dept (Electrical/Roof):</strong> (727) 382-0075</div>
+      <div class="contact-hours">M–F between 9am – 5pm Mountain Time</div>
+      <div class="contact-item"><strong>Email:</strong> nonstandard@zeoenergy.com</div>
+    </div>
+
+    <div class="chat-container">
+      <!-- chat header -->
+      <div class="chat-header">
+        <div class="chat-avatar">
+          <img src="/assets/zeo-energy-horizontal.png" alt="" class="avatar-logo" />
+        </div>
+        <div class="chat-header-info">
+          <div class="chat-bot-name">Zeo Energy Assistant</div>
+          <div class="chat-status"><span class="status-dot"></span>Online · typically replies instantly</div>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px;">
+          <button type="button" id="resetChatBtn" class="btn-reset-chat" title="Start new session">New Chat</button>
+          <span id="modePill" class="mode-pill">Account Lookup</span>
+        </div>
+      </div>
+
+      <div class="chat-body">
+        <div id="chatLog" class="chat-log zeo-scroll"></div>
+
+        <div id="quickReplies" class="quick-replies"></div>
+
+        <div id="attachmentsRow" class="attachments-row" hidden>
+          <span id="attachmentList"></span>
+        </div>
+
+        <form id="chatForm" class="chat-form" autocomplete="off">
+          <button type="button" id="uploadBtn" class="btn-upload" title="Attach photos">Attach</button>
+          <input type="file" id="fileInput" accept="image/*" multiple hidden />
+          <input type="text" id="messageInput" class="input-message" placeholder="Type your message…" />
+          <button type="submit" id="sendBtn" class="btn-send">Send</button>
+        </form>
+      </div>
+    </div>
+
+    <div class="chat-footer">
+      <img src="/assets/zeo-energy-horizontal.png" alt="Zeo Energy" />
+      <div class="footer-note">Prototype · local-LLM service chatbot</div>
+    </div>
+  </section>
+
+  <!-- ===================== EMAILS TAB ===================== -->
+  <section id="emailsTab" class="container-emails" hidden>
+    <div class="email-container">
+      <!-- gmail top bar -->
+      <div class="email-top-bar">
+        <div class="email-menu-icon">☰</div>
+        <div class="email-logo-wrap">
+          <span class="email-logo-icon">✉️</span>
+          <span>Gmail</span>
+        </div>
+        <div class="email-search-bar">
+          <span class="email-search-icon">🔍</span>
+          <span class="email-search-text">in:inbox from:(zeo service)</span>
+        </div>
+        <div class="flex-spacer"></div>
+        <div class="email-avatar-icon">S</div>
+      </div>
+
+      <div class="email-workspace">
+        <!-- sidebar -->
+        <div class="email-sidebar">
+          <div class="email-compose-btn">✏️ Compose</div>
+          <div class="sidebar-item active">
+            <span>📥 Inbox</span>
+            <span id="inboxCount" class="sidebar-item-count">0</span>
+          </div>
+          <div class="sidebar-item">
+            <span>⭐ Starred</span>
+          </div>
+          <div class="sidebar-item">
+            <span>🕓 Snoozed</span>
+          </div>
+          <div class="sidebar-item">
+            <span>📤 Sent</span>
+          </div>
+          <div class="sidebar-item">
+            <span>📄 Drafts</span>
+          </div>
+        </div>
+
+        <!-- main -->
+        <div class="email-main-panel">
+          <!-- INBOX LIST -->
+          <div id="inboxView">
+            <div class="inbox-toolbar">
+              <span>☑</span><span>↻</span><span>⋯</span>
+              <div class="flex-spacer"></div>
+              <span id="inboxRange" class="inbox-range">0 of 0</span>
+              <span>‹</span><span>›</span>
+            </div>
+            <div id="inboxList"></div>
+          </div>
+
+          <!-- MESSAGE OPEN -->
+          <div id="messageView" hidden>
+            <div class="message-toolbar">
+              <span id="msgBack" style="font-size:18px;font-weight:700;cursor:pointer;">←</span>
+              <span>🗄</span><span>🗑</span><span>✉</span><span>🕓</span>
+              <div class="flex-spacer"></div>
+              <span id="msgPos" style="font-size:12px;font-weight:600;"></span>
+              <span id="msgOlder" style="cursor:pointer;">‹</span>
+              <span id="msgNewer" style="cursor:pointer;">›</span>
+            </div>
+            <div id="messageBody" style="padding:20px 28px 28px;"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================== MOCK CRM TAB ===================== -->
+  <section id="crmTab" class="container-crm" hidden>
+    <!-- Header Summary Card -->
+    <div class="crm-header-card">
+      <div class="crm-title-group">
+        <h1>🏢 Mock CRM Case Management</h1>
+        <p>Preview future Salesforce / In-House CRM integration: automated case opening, disposition routing, and rich Chatter feed templates with photo attachments.</p>
+      </div>
+
+      <div class="crm-toolbar">
+        <input type="text" id="crmSearch" class="crm-search-input" placeholder="Search cases or accounts…" />
+        <select id="crmFilterStatus" class="crm-filter-select">
+          <option value="all">All Statuses</option>
+          <option value="pending_disposition">Pending Disposition</option>
+          <option value="in_review">In Review</option>
+          <option value="assigned">Assigned</option>
+          <option value="resolved">Resolved</option>
+        </select>
+        <button type="button" id="crmRefreshBtn" class="top-action-btn">🔄 Refresh</button>
+      </div>
+    </div>
+
+    <!-- CRM Cases Table View -->
+    <div id="crmListView">
+      <div class="crm-table-wrapper">
+        <table class="crm-table">
+          <thead>
+            <tr>
+              <th>Case ID</th>
+              <th>Customer / Account</th>
+              <th>Category</th>
+              <th>Urgency / Priority</th>
+              <th>Status</th>
+              <th>Routed Dept</th>
+              <th>Date</th>
+            </tr>
+          </thead>
+          <tbody id="crmCaseList">
+            <!-- Rendered by JS -->
+          </tbody>
+        </table>
+      </div>
+      <div style="font-size:12px; color:#64748b; margin-top:10px; text-align:right;">
+        Click any case row to inspect the complete case record, Chatter note feed, and photo attachments.
+      </div>
+    </div>
+
+    <!-- CRM Single Case Detail View -->
+    <div id="crmDetailView" style="display:none;">
+      <button type="button" id="crmBackBtn" class="top-action-btn" style="margin-bottom:16px;">
+        ← Back to All Cases
+      </button>
+
+      <div class="crm-detail-container">
+        <!-- Sidebar Account & Case Info -->
+        <div class="crm-side-card">
+          <div style="font-size:11px; text-transform:uppercase; letter-spacing:0.04em; color:#64748b; font-weight:700;">Account Record</div>
+          <h2 id="crmDetCustName" style="margin:4px 0 2px; font-size:18px; font-weight:700; color:#0f172a;">Customer</h2>
+          <div id="crmDetAcctNum" style="font-size:13px; color:#2563eb; font-weight:600; font-family:monospace; margin-bottom:14px;">ZEO-000000</div>
+
+          <div style="font-size:12px; margin-bottom:12px;">
+            <div style="color:#64748b; font-weight:600;">Service Address</div>
+            <div id="crmDetAddress" style="color:#1e293b; margin-top:2px;">—</div>
+          </div>
+
+          <div style="font-size:12px; margin-bottom:12px;">
+            <div style="color:#64748b; font-weight:600;">Contact Details</div>
+            <div id="crmDetContact" style="color:#1e293b; margin-top:2px;">—</div>
+          </div>
+
+          <div style="border-top:1px solid #e2e8f0; padding-top:14px; margin-top:14px;">
+            <div style="color:#64748b; font-size:12px; font-weight:600; margin-bottom:6px;">Workflow Disposition</div>
+            <div style="display:flex; flex-direction:column; gap:8px;">
+              <select id="crmStatusSelect" class="crm-filter-select" style="width:100%;">
+                <option value="pending_disposition">Pending Disposition</option>
+                <option value="in_review">In Review</option>
+                <option value="assigned">Assigned to Field Tech</option>
+                <option value="resolved">Resolved</option>
+              </select>
+              <button type="button" id="crmSaveStatusBtn" class="btn-map-primary" style="padding:6px 12px; font-size:12px;">Update Status</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Main Case Content (Chatter Note + Gmail Previews) -->
+        <div class="crm-main-card">
+          <div class="crm-subtabs">
+            <button type="button" id="subtabChatter" class="crm-subtab-btn active">📝 Chatter Feed Note</button>
+            <button type="button" id="subtabGmail" class="crm-subtab-btn">✉️ Handoff Gmail Preview</button>
+          </div>
+
+          <div id="chatterView">
+            <div id="chatterBody">
+              <!-- Rendered Chatter note template -->
+            </div>
+          </div>
+
+          <div id="caseGmailView" style="display:none;">
+            <div id="caseGmailBody" style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; padding:18px;">
+              <!-- Rendered Gmail template preview -->
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================== DATABASE TAB ===================== -->
+  <section id="databaseTab" class="container-database" hidden>
+    <div class="database-header-wrap">
+      <h1 class="database-title">Customer Accounts</h1>
+      <div class="database-desc">
+        The lookup database queried in <strong>Account Lookup</strong> mode. The model never accesses this table directly — it only parses candidate identifiers. The system authorizes the match and returns a minimal, least-privilege payload.
+      </div>
+    </div>
+
+    <!-- try-it lookup -->
+    <div class="db-lookup-card">
+      <div class="db-lookup-title">Try a lookup query</div>
+      <div class="db-lookup-subtitle">Match requires <strong>name + (address OR email)</strong>. Single-field queries are rejected to prevent enumeration.</div>
+      <div class="db-lookup-form">
+        <input type="text" id="dbName" class="input-db" placeholder="Name" value="Jane Doe" />
+        <input type="text" id="dbAddr" class="input-db" placeholder="Address" value="100 Solar Way, Tampa" />
+        <input type="text" id="dbEmail" class="input-db" placeholder="Email" />
+        <button type="button" id="runLookup" class="btn-db-lookup">Look up</button>
+      </div>
+      <div id="dbResult" hidden></div>
+    </div>
+
+    <!-- table -->
+    <div class="db-table-container">
+      <div class="db-table-header">
+        <div>Account #</div>
+        <div>Name</div>
+        <div>Service address</div>
+        <div>Email</div>
+        <div>System</div>
+      </div>
+      <div id="customerTable"></div>
+    </div>
+
+    <div class="db-table-footer">
+      <div><strong id="customerCount">0</strong> accounts on record</div>
+      <div>Returned on successful match: <strong>account #, address, system, install date</strong> — phone number and private records are withheld.</div>
+    </div>
+  </section>
+
+  <!-- ===================== MAP POINTER MODAL ===================== -->
+  <div id="mapModal" class="map-modal" style="display: none;">
+    <div class="map-modal-content">
+      <div class="map-modal-header">
+        <h2 class="map-modal-title" id="mapModalTitle">Verify Your Home</h2>
+        <button type="button" id="mapModalClose" class="map-modal-close-btn">&times;</button>
+      </div>
+      <div class="map-modal-body">
+        <div class="map-modal-instructions" id="mapModalInstructions">
+          Please verify: Is this your home?
+        </div>
+        <div class="map-modal-address" id="mapModalAddress"></div>
+        
+        <div class="map-view-wrapper">
+          <div class="map-image-container" id="mapImageContainer">
+            <canvas id="mapCanvas" width="650" height="450"></canvas>
+            <div id="mapPin" class="map-pin" style="display: none;">📍</div>
+            <div id="mapLoading" class="map-loading">
+              <div class="map-spinner"></div>
+              <span>Fetching satellite view…</span>
+            </div>
+            <div id="mapError" class="map-error" style="display: none;">
+              <span>Could not load satellite view. Displaying fallback street view.</span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="map-modal-footer" id="mapModalVerifyFooter">
+        <button type="button" id="btnVerifyNo" class="btn-map-secondary">No, this is incorrect</button>
+        <button type="button" id="btnVerifyYes" class="btn-map-primary">Yes, this is my home</button>
+      </div>
+      <div class="map-modal-footer" id="mapModalPointerFooter" style="display: none;">
+        <button type="button" id="mapModalCancel" class="btn-map-secondary">Cancel</button>
+        <button type="button" id="mapModalConfirm" class="btn-map-primary" disabled>Confirm Location</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===================== SYSTEM UPGRADES & RELEASE NOTES MODAL ===================== -->
+  <div id="releaseNotesModal" class="generic-modal" style="display: none;">
+    <div class="generic-modal-content">
+      <div class="generic-modal-header">
+        <h2 style="margin:0; font-size:18px; font-weight:700; display:flex; align-items:center; gap:8px;">
+          <span>🚀</span> Zeo Service Chatbot — System Upgrades & Architecture
+        </h2>
+        <button type="button" id="closeReleaseNotesBtn" class="generic-modal-close">&times;</button>
+      </div>
+      <div class="generic-modal-body">
+        <div style="background:#eff6ff; border:1px solid #bfdbfe; border-radius:8px; padding:14px; margin-bottom:18px;">
+          <strong style="color:#1e40af;">Production System Summary:</strong> All recent architectural enhancements, model integrations, concurrency queueing, and test suites are live in this deployment.
+        </div>
+
+        <h3 style="font-size:15px; margin:16px 0 6px; color:#0f172a;">1. vLLM Engine & Qwen 3.8 27B Model Integration</h3>
+        <ul>
+          <li>OpenAI-compatible client querying <code>/v1/chat/completions</code> with JSON schema structured output decoding at <code>temperature: 0.0</code>.</li>
+          <li>Defaulting to model <code>qwen3.8:27b</code> / <code>Qwen/Qwen2.5-27B-Instruct</code> with automatic fallback on server outages.</li>
+        </ul>
+
+        <h3 style="font-size:15px; margin:16px 0 6px; color:#0f172a;">2. Active User Concurrency Limiting & Real-Time FIFO Queue</h3>
+        <ul>
+          <li>Hard capacity cap on concurrent active users (<code>MAX_ACTIVE_USERS</code>).</li>
+          <li>Overflow users enter a real-time FIFO waiting queue with live position tracking and automatic slot promotion upon session completion or 5-min idle timeout.</li>
+          <li>Simulate load right from the top queue widget bar.</li>
+        </ul>
+
+        <h3 style="font-size:15px; margin:16px 0 6px; color:#0f172a;">3. Production Dockerization & Lifecycle Control</h3>
+        <ul>
+          <li>Multi-stage lightweight Python 3.11 container running as non-root <code>appuser</code>.</li>
+          <li>Cross-platform start/stop scripts (<code>scripts/docker-start.sh</code> / <code>.ps1</code>).</li>
+        </ul>
+
+        <h3 style="font-size:15px; margin:16px 0 6px; color:#0f172a;">4. CRM Case Management & Chatter Note Templates</h3>
+        <ul>
+          <li>Disposition pipeline generates real-time CRM cases with automated routing.</li>
+          <li>Interactive Mock CRM tab displaying formatted Chatter notes, customer verbatim statements, and visual damage photo galleries.</li>
+        </ul>
+
+        <h3 style="font-size:15px; margin:16px 0 6px; color:#0f172a;">5. Comprehensive Security Hardening (8/8 Test Suites Passed)</h3>
+        <ul>
+          <li>Deterministic 911 safety gates, prompt injection XML sandboxing, header magic-byte verification, Pillow EXIF stripping, and rate limiting.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===================== PHOTO ZOOM LIGHTBOX MODAL ===================== -->
+  <div id="photoLightboxModal" class="generic-modal" style="display: none;">
+    <div class="generic-modal-content" style="max-width:800px; background:#0f172a; color:#fff;">
+      <div class="generic-modal-header" style="border-bottom:1px solid #334155;">
+        <h3 id="photoLightboxTitle" style="margin:0; font-size:16px; color:#f1f5f9;">Photo Preview</h3>
+        <button type="button" id="closePhotoLightboxBtn" class="generic-modal-close" style="color:#94a3b8;">&times;</button>
+      </div>
+      <div style="padding:20px; text-align:center; max-height:75vh; overflow:auto;">
+        <img id="photoLightboxImg" src="" alt="Preview" style="max-width:100%; max-height:65vh; border-radius:8px; box-shadow:0 4px 12px rgba(0,0,0,0.5);" />
+      </div>
+    </div>
+  </div>
+
+</div>
+<script src="/app.js?v=7"></script>
+</body>
+</html>

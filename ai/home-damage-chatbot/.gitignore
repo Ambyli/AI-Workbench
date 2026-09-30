@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+*.key
+
+# Runtime uploads (user-submitted images)
+backend/data/uploads/*
+!backend/data/uploads/.gitkeep
+
+# Runtime Google Chat notification feed (regenerated as cases finalize)
+backend/data/chat_notifications.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.claude/
+
+# Internal design/diagram artifacts (not shipped)
+diagrams/
+PR_DESCRIPTION.md

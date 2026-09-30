@@ -1,0 +1,150 @@
+{#
+  Deterministic handoff-email body template.
+  Formatted as a clean, professional HTML business email body (no simulated client chrome).
+  Jinja2 autoescape is ON for all dynamic fields.
+#}
+<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #1e293b; max-width: 640px; margin: 0 auto; line-height: 1.5; font-size: 14px;">
+
+  <!-- Email Header / Case Alert -->
+  <div style="background: #ffffff; border: 1px solid #e2e8f0; border-top: 4px solid {{ tier_color or '#3a8d5b' }}; border-radius: 6px; padding: 18px 20px; margin-bottom: 20px;">
+    <div style="font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: #64748b;">
+      Service Intake Dispatch &middot; {{ mode_label }}
+    </div>
+    <div style="font-size: 18px; font-weight: 700; color: #0f172a; margin-top: 4px;">
+      {{ issue_label }} — {{ tier_label }}
+    </div>
+    <div style="font-size: 13px; color: #475569; margin-top: 4px;">
+      <strong>Urgency:</strong> {{ urgency }}/10{% if safety_flag %} &middot; <span style="color: #c0262b; font-weight: 700;">{{ safety_flag }}</span>{% endif %}
+    </div>
+    <div style="font-size: 13px; color: #334155; margin-top: 8px; padding-top: 8px; border-top: 1px solid #f1f5f9;">
+      {{ summary }}
+    </div>
+  </div>
+
+  {% if unconfirmed %}
+  <div style="background: #fef2f2; border: 1px solid #fecaca; padding: 10px 14px; border-radius: 6px; margin-bottom: 20px; font-size: 13px; color: #991b1b;">
+    <strong>Unverified fields:</strong> {{ unconfirmed|join(', ') }} could not be validated during intake — confirm these directly with the customer before acting.
+  </div>
+  {% endif %}
+
+  <!-- Account & Requester Section -->
+  <div style="margin-bottom: 20px;">
+    <div style="font-size: 13px; font-weight: 700; color: #0f172a; text-transform: uppercase; letter-spacing: 0.03em; margin-bottom: 8px; border-bottom: 2px solid #e2e8f0; padding-bottom: 4px;">
+      Account & Requester Information
+    </div>
+    <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
+      {% if match %}
+      <tr style="background: #f8fafc;">
+        <td style="padding: 6px 8px; width: 180px; color: #64748b; font-weight: 600;">Account Number:</td>
+        <td style="padding: 6px 8px; font-family: monospace; font-weight: 700; color: #2563eb;">{{ match.account_number }} (Verified Match)</td>
+      </tr>
+      <tr>
+        <td style="padding: 6px 8px; color: #64748b; font-weight: 600;">Installed System:</td>
+        <td style="padding: 6px 8px;">{{ match.system_size }} &middot; Installed {{ match.install_date }}</td>
+      </tr>
+      {% elif mode_label == 'Account Lookup' %}
+      <tr style="background: #fffbeb;">
+        <td style="padding: 6px 8px; color: #92400e; font-weight: 600;">CRM Match Status:</td>
+        <td style="padding: 6px 8px; color: #92400e;">Unverified requester (no matching account found)</td>
+      </tr>
+      {% endif %}
+      <tr>
+        <td style="padding: 6px 8px; color: #64748b; font-weight: 600;">Requester Name:</td>
+        <td style="padding: 6px 8px; font-weight: 600; color: #0f172a;">{{ requester_name or '[Not provided]' }}</td>
+      </tr>
+      <tr>
+        <td style="padding: 6px 8px; color: #64748b; font-weight: 600;">Best Contact:</td>
+        <td style="padding: 6px 8px;">{{ contact or '[Not provided]' }}</td>
+      </tr>
+      <tr>
+        <td style="padding: 6px 8px; color: #64748b; font-weight: 600;">Service Address:</td>
+        <td style="padding: 6px 8px;">{{ account_address or '[Not provided]' }}</td>
+      </tr>
+      {% if third_parties %}
+      <tr>
+        <td style="padding: 6px 8px; color: #64748b; font-weight: 600;">Third Parties Contacted:</td>
+        <td style="padding: 6px 8px;">{{ third_parties }}</td>
+      </tr>
+      {% endif %}
+    </table>
+  </div>
+
+  <!-- Issue Diagnostic Facts -->
+  <div style="margin-bottom: 20px;">
+    <div style="font-size: 13px; font-weight: 700; color: #0f172a; text-transform: uppercase; letter-spacing: 0.03em; margin-bottom: 8px; border-bottom: 2px solid #e2e8f0; padding-bottom: 4px;">
+      Issue Details — {{ issue_label }}
+    </div>
+    <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
+      {% for label, value in facts %}
+      <tr style="border-bottom: 1px solid #f1f5f9;">
+        <td style="padding: 6px 8px; width: 180px; color: #64748b; font-weight: 600;">{{ label }}:</td>
+        <td style="padding: 6px 8px; color: #0f172a;">{{ value }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+  </div>
+
+  <!-- Customer Verbatim Statement -->
+  <div style="margin-bottom: 20px;">
+    <div style="font-size: 13px; font-weight: 700; color: #0f172a; text-transform: uppercase; letter-spacing: 0.03em; margin-bottom: 8px; border-bottom: 2px solid #e2e8f0; padding-bottom: 4px;">
+      Customer Description (Untrusted Input)
+    </div>
+    {% if verbatim %}
+      <div style="background: #f8fafc; border-left: 3px solid #cbd5e1; padding: 10px 14px; font-size: 13px; color: #334155; font-style: italic; border-radius: 0 4px 4px 0;">
+        {% for v in verbatim %}
+        <div>&ldquo;{{ v }}&rdquo;</div>
+        {% endfor %}
+      </div>
+    {% else %}
+      <div style="font-size: 13px; color: #94a3b8;">No free-text description provided.</div>
+    {% endif %}
+  </div>
+
+  <!-- Damage Pointer Map -->
+  {% if damage_pointer %}
+  <div style="margin-bottom: 20px;">
+    <div style="font-size: 13px; font-weight: 700; color: #0f172a; text-transform: uppercase; letter-spacing: 0.03em; margin-bottom: 8px; border-bottom: 2px solid #e2e8f0; padding-bottom: 4px;">
+      Damage Location Map
+    </div>
+    <div style="border: 1px solid #e2e8f0; border-radius: 6px; overflow: hidden; max-width: 520px; background: #ffffff;">
+      <img src="/uploads/{{ damage_pointer }}" style="width: 100%; height: auto; display: block;" alt="Damage Location Map" />
+      <div style="padding: 8px 12px; background: #f8fafc; font-size: 12px; color: #475569; border-top: 1px solid #e2e8f0;">
+        Customer-marked pinpoint location for: <strong>{{ account_address }}</strong>
+      </div>
+    </div>
+  </div>
+  {% endif %}
+
+  <!-- Photo Attachments -->
+  {% set has_other_photos = false %}
+  {% for f in attachments %}{% if f != damage_pointer %}{% set has_other_photos = true %}{% endif %}{% endfor %}
+  {% if has_other_photos %}
+  <div style="margin-bottom: 20px;">
+    <div style="font-size: 13px; font-weight: 700; color: #0f172a; text-transform: uppercase; letter-spacing: 0.03em; margin-bottom: 8px; border-bottom: 2px solid #e2e8f0; padding-bottom: 4px;">
+      Attachments
+    </div>
+    <div style="display: flex; flex-wrap: wrap; gap: 12px;">
+      {% for f in attachments %}
+        {% if f != damage_pointer %}
+        <div style="border: 1px solid #cbd5e1; border-radius: 4px; overflow: hidden; background: #ffffff; width: 170px;">
+          <div style="height: 90px; background: #f1f5f9; display: flex; align-items: center; justify-content: center; overflow: hidden;">
+            <img src="/uploads/{{ f }}" style="width: 100%; height: 100%; object-fit: cover;" onerror="this.src='/assets/suburban_house.png'" alt="{{ f }}" />
+          </div>
+          <div style="padding: 6px 8px;">
+            <div style="font-size: 11px; font-weight: 600; color: #1e293b; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">{{ f }}</div>
+            <div style="font-size: 10px; color: #64748b;">Image &middot; EXIF stripped</div>
+          </div>
+        </div>
+        {% endif %}
+      {% endfor %}
+    </div>
+  </div>
+  {% endif %}
+
+  <!-- Email Footer -->
+  <div style="border-top: 1px solid #e2e8f0; padding-top: 14px; margin-top: 24px; font-size: 11px; color: #94a3b8; line-height: 1.4;">
+    <strong>Zeo Energy Automated Service Intake System</strong><br>
+    This automated dispatch was generated from an intake session. All customer descriptions are untrusted inputs. Files were signature-validated and stripped of metadata before archiving.
+  </div>
+
+</div>

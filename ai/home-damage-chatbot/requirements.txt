@@ -1,0 +1,21 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pydantic>=2.6
+jinja2>=3.1
+httpx>=0.27
+python-multipart>=0.0.9
+pillow>=10.2.0
+
+# Config/secrets loading. Optional: backend/config.py falls back to a built-in
+# .env reader if this isn't installed, so the prototype still runs without it.
+pydantic-settings>=2.2
+
+# Google Workspace email delivery (Gmail API). The send path (MIME + photo
+# attachments, draft-then-send) is fully implemented and imported lazily, so it's
+# only needed when EMAIL_SEND_ENABLED=true; the default in-memory Inbox path
+# requires nothing. Uncomment once service-account creds are configured:
+# google-api-python-client>=2.0
+# google-auth>=2.0
+#
+# Google Chat notifications use plain incoming webhooks over httpx (already a
+# dependency above) — no extra package needed for CHAT_BACKEND=webhook.

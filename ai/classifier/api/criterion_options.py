@@ -53,8 +53,10 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from common.documents import MAX_PATTERN_CHARS
 
 from config import (
+    CRITERION_NAME_MAX_CHARS as NAME_MAX_CHARS,
     DETECTOR_MIN_SCORE,
     LLM_BBOX_MAX_ATTEMPTS,
+    TEXT_MIN_COUNT_CAP as MIN_COUNT_CAP,
 )
 from cv import get_detector
 from cv.quality import check_blur, check_exposure
@@ -64,10 +66,8 @@ from detector import client as detector_client
 
 OcrMode = Literal["auto", "always", "never"]
 
-# Server caps a caller cannot exceed. MAX_ATTEMPTS is the env knob itself;
-# the text caps mirror the matcher's own guards (common.documents.textmatch).
-MIN_COUNT_CAP: int = 1000
-NAME_MAX_CHARS: int = 200
+# Server caps a caller cannot exceed — NAME_MAX_CHARS and MIN_COUNT_CAP are
+# the config env knobs under their local names (api.schemas imports them here).
 
 # The two whole-page OpenCV measurements. They score a property of the page,
 # not a thing on it, so they emit no regions — which matters for

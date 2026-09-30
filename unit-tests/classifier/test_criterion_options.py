@@ -24,7 +24,12 @@ from api.criterion_options import (
     criterion_types,
 )
 from api.schemas import AssessRequest, CriterionInput, validation_message
-from config import DETECTOR_MIN_SCORE, LLM_BBOX_MAX_ATTEMPTS
+from config import (
+    CRITERION_NAME_MAX_CHARS,
+    DETECTOR_MIN_SCORE,
+    LLM_BBOX_MAX_ATTEMPTS,
+    TEXT_MIN_COUNT_CAP,
+)
 
 DOC = {"type": "text", "data": "hello"}
 
@@ -314,7 +319,9 @@ def test_criterion_types_payload():
         assert entry["options_schema"]["additionalProperties"] is False, type_
         assert set(entry["defaults"]) <= set(entry["options_schema"]["properties"]), type_
     assert payload["types"]["text"]["defaults"]["pattern"] == "<name>"
-    assert payload["types"]["text"]["caps"] == {"pattern_max_chars": 500, "min_count": 1000}
+    assert payload["types"]["text"]["caps"] == {
+        "pattern_max_chars": 500, "min_count": TEXT_MIN_COUNT_CAP
+    }
     assert payload["types"]["llm"]["caps"] == {"max_attempts": LLM_BBOX_MAX_ATTEMPTS}
     assert payload["types"]["text"]["defaults"]["aggregate"] == {"pages": "sum", "documents": "sum"}
     assert payload["types"]["text"]["defaults"]["scope"] == "page"
@@ -322,3 +329,20 @@ def test_criterion_types_payload():
     assert payload["aggregate"]["defaults"]["llm (hint presence)"] == {
         "pages": "any", "documents": "all"
     }
+
+
+# ── The two input caps are config knobs ────────────────────────────────────
+
+
+def test_criterion_name_cap_is_the_config_knob():
+    CriterionInput(name="x" * CRITERION_NAME_MAX_CHARS, type="llm")
+    with pytest.raises(ValidationError):
+        CriterionInput(name="x" * (CRITERION_NAME_MAX_CHARS + 1), type="llm")
+    assert f"1-{CRITERION_NAME_MAX_CHARS} characters" in criterion_types()["shared_fields"]["name"]
+
+
+def test_text_min_count_cap_is_the_config_knob():
+    ok = {"min_count": TEXT_MIN_COUNT_CAP}
+    CriterionInput(name="total", type="text", options=ok)
+    with pytest.raises(ValidationError):
+        CriterionInput(name="total", type="text", options={"min_count": TEXT_MIN_COUNT_CAP + 1})

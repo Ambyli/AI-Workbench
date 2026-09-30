@@ -47,6 +47,9 @@ services:
       # The thumbnail guard: a page image under this on either axis is a 400.
       - CLASSIFIER_MIN_IMAGE_WIDTH=${CLASSIFIER_MIN_IMAGE_WIDTH:-32}
       - CLASSIFIER_MIN_IMAGE_HEIGHT=${CLASSIFIER_MIN_IMAGE_HEIGHT:-32}
+      # Criterion input caps: longest criterion name, largest text min_count.
+      - CLASSIFIER_CRITERION_NAME_MAX_CHARS=${CLASSIFIER_CRITERION_NAME_MAX_CHARS:-200}
+      - CLASSIFIER_TEXT_MIN_COUNT_CAP=${CLASSIFIER_TEXT_MIN_COUNT_CAP:-1000}
       # Region layers: where the per-job artifact directories live on the
       # classifier_data volume, how often the sweeper prunes them (and the
       # job rows past JOB_TTL_HOURS), the byte cap PER ITEM (a job may hold

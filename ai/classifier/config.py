@@ -78,6 +78,24 @@ MIN_IMAGE_WIDTH: int = max(1, int(os.environ.get("CLASSIFIER_MIN_IMAGE_WIDTH", "
 MIN_IMAGE_HEIGHT: int = max(1, int(os.environ.get("CLASSIFIER_MIN_IMAGE_HEIGHT", "32")))
 
 # ---------------------------------------------------------------------------
+# Criterion input caps
+# ---------------------------------------------------------------------------
+# Server-side ceilings a request cannot exceed; a value past either is a 422.
+#
+# CRITERION_NAME_MAX_CHARS bounds a criterion's `name`. For `llm` criteria the
+# name IS the prompt text, and it is also slugified into artifact file names,
+# so this is what keeps both bounded. /criterion-types reports the live value.
+#
+# TEXT_MIN_COUNT_CAP bounds a `text` criterion's `options.min_count` (how many
+# matches the text layer must contain). It mirrors the matcher's own guards in
+# common.documents.textmatch; the pattern-length cap (MAX_PATTERN_CHARS) stays
+# there because the matcher enforces it for every caller, not just this one.
+CRITERION_NAME_MAX_CHARS: int = max(
+    1, int(os.environ.get("CLASSIFIER_CRITERION_NAME_MAX_CHARS", "200"))
+)
+TEXT_MIN_COUNT_CAP: int = max(1, int(os.environ.get("CLASSIFIER_TEXT_MIN_COUNT_CAP", "1000")))
+
+# ---------------------------------------------------------------------------
 # Document loading + OCR
 # ---------------------------------------------------------------------------
 # The classifier accepts JPEG/PNG, PDF, plain text, and .docx. Everything is

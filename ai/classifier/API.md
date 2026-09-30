@@ -475,7 +475,7 @@ in `options`:
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `name` | string (1–200) | — | The criterion. Unique in the request. For `text` it is also the default `pattern`; for `cv` it is matched against the OpenCV registry; for `detector` it is the text prompt |
+| `name` | string (1–200, `CLASSIFIER_CRITERION_NAME_MAX_CHARS`) | — | The criterion. Unique in the request. For `text` it is also the default `pattern`; for `cv` it is matched against the OpenCV registry; for `detector` it is the text prompt |
 | `type` | `llm` \| `text` \| `cv` \| `detector` | `llm` | The evaluation path — see below |
 | `weight` | number > 0 | `1` | Relative weight in the overall score |
 | `depends_on` | string \| null | `null` | Another SCORED criterion that must **PASS** first — see [§ Dependencies](#dependencies) |
@@ -485,7 +485,7 @@ in `options`:
 | `type` | `options`, with defaults |
 |---|---|
 | `llm` | `hint` (`quality` \| `presence` \| `auto`, default `auto`), `boxes` (default **`false`** — the [bounding-box loop](#the-llm-enforcement-loop)), `max_attempts` (default and cap `CLASSIFIER_LLM_BBOX_MAX_ATTEMPTS`; may be lowered, never raised), `ocr` (`auto` \| `always` \| `never`, default `auto` — the text layer sent with the prompt), `aggregate` |
-| `text` | `pattern` (default: the name; max 500 characters), `match` (`contains` default \| `exact` \| `regex` \| `fuzzy`), `case_sensitive` (`false`), `fuzzy_threshold` (`0.85`, 0–1), `min_count` (`1`, 1–1000), `ocr` (`auto`), `scope` (`page` default \| `document` — [text across pages](#text-across-pages--scope-document)), `aggregate` |
+| `text` | `pattern` (default: the name; max 500 characters), `match` (`contains` default \| `exact` \| `regex` \| `fuzzy`), `case_sensitive` (`false`), `fuzzy_threshold` (`0.85`, 0–1), `min_count` (`1`, 1–1000, `CLASSIFIER_TEXT_MIN_COUNT_CAP`), `ocr` (`auto`), `scope` (`page` default \| `document` — [text across pages](#text-across-pages--scope-document)), `aggregate` |
 | `cv` | `fallback` (`detector` \| `llm`) — what answers when no OpenCV detector matches the name. Default: `detector` when `DETECTOR_URL` is configured on this container, `llm` otherwise. `aggregate` |
 | `detector` | `threshold` (0–1, default `DETECTOR_MIN_SCORE`), `aggregate` |
 

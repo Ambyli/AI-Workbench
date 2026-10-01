@@ -24,7 +24,7 @@
 #
 # TEMPLATE VARIABLES SUBSTITUTED IN THIS RENDER
 #   listeners            [{name: http-8899, address: 0.0.0.0, port: 8899,
-#                          timeout: 1800s, api_keys: [<two placeholders>]}]
+#                          timeout: 840s, api_keys: [<two placeholders>]}]
 #                        Two keys because a looper client would sign its own
 #                        sub-requests with the candidate model's access key
 #                        (the LiteLLM virtual key), and those sub-requests
@@ -65,13 +65,15 @@
 #   cannot see a token until the whole upstream response has arrived, so a
 #   turn produces NO output at all until the chain's answer is complete --
 #   including any time local-private spends queued inside vLLM. That is why
-#   `auto` is slow to first token and why LiteLLM's entry sets
-#   stream_timeout: 1800.
+#   `auto` is slow to first token, and why every timer outside this file
+#   measures time-to-COMPLETE-answer.
 #
-#   Route timeout 1800s comes from listeners[0].timeout. idleTimeout stays
-#   at the template's hard-coded 1200s -- it is not parameterised, so a
-#   single upstream that goes quiet for >20 min is cut regardless. Nothing
-#   in this pool should, but that is the ceiling.
+#   Route timeout and ext_proc message_timeout 840s come from
+#   listeners[0].timeout -- the innermost layer of the budget
+#   Open WebUI 900 > LiteLLM `auto` 870 > Envoy 840 (SEMANTIC_ROUTER.md >
+#   Timeout budget). idleTimeout, the ext_proc grpc_service timeout and the
+#   cluster connect_timeouts stay at the template's hard-coded 1200s -- not
+#   parameterised, and above 840s, so the listener value is the real cap.
 #
 #   The Lua filter is the ONLY thing enforcing the listener bearer token;
 #   the router does not check it. VALID_KEYS below holds TWO literal
@@ -142,7 +144,7 @@ static_resources:
                       exact: "local-general"
                 route:
                   cluster: local_general_cluster
-                  timeout: 1800s
+                  timeout: 840s
                   idleTimeout: 1200s
                   # Rewrite Host header to match upstream server
                   host_rewrite_literal: "litellm:4000"
@@ -164,7 +166,7 @@ static_resources:
                       exact: "local-code"
                 route:
                   cluster: local_code_cluster
-                  timeout: 1800s
+                  timeout: 840s
                   idleTimeout: 1200s
                   # Rewrite Host header to match upstream server
                   host_rewrite_literal: "litellm:4000"
@@ -186,7 +188,7 @@ static_resources:
                       exact: "local-reasoning"
                 route:
                   cluster: local_reasoning_cluster
-                  timeout: 1800s
+                  timeout: 840s
                   idleTimeout: 1200s
                   # Rewrite Host header to match upstream server
                   host_rewrite_literal: "litellm:4000"
@@ -208,7 +210,7 @@ static_resources:
                       exact: "local-private"
                 route:
                   cluster: local_private_cluster
-                  timeout: 1800s
+                  timeout: 840s
                   idleTimeout: 1200s
                   # Rewrite Host header to match upstream server
                   host_rewrite_literal: "litellm:4000"
@@ -230,7 +232,7 @@ static_resources:
                   # Route to first model by default
                   cluster: local_general_cluster
                   
-                  timeout: 1800s
+                  timeout: 840s
                   
                   # Rewrite Host header to match upstream server
                   host_rewrite_literal: "litellm:4000"
@@ -287,7 +289,7 @@ static_resources:
                 response_header_mode: "SEND"
                 request_body_mode: "BUFFERED"
                 response_body_mode: "BUFFERED"
-              message_timeout: 1800s
+              message_timeout: 840s
           - name: envoy.filters.http.router
             typed_config:
               "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router

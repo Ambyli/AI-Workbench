@@ -31,7 +31,7 @@
 # | entrypoint name: every entry here becomes an Envoy route keyed on       |
 # | x-selected-model, so a router entrypoint listed here would route the    |
 # | router's own requests straight back into itself and spin until the     |
-# | 1800 s listener timeout.                                                |
+# | 840 s listener timeout.                                                 |
 # |                                                                         |
 # | The second half of the guard lives in LiteLLM: SEMANTIC_ROUTER_LITELLM  |
 # | _KEY is a virtual key scoped to the FOUR chain aliases below and        |
@@ -59,11 +59,23 @@ version: v0.3
 # bearer-token filter and `timeout` into the route timeout AND the ext_proc
 # message timeout.
 #
-# 1800s even though every decision is now one upstream call: that call is a
-# LiteLLM chain that can walk order 1 -> 2 -> 3, `local-private` deliberately
-# QUEUES inside vLLM when both local models are busy rather than leaving the
-# box, and both local models reason before they answer. LiteLLM's `auto`
-# entry mirrors it with stream_timeout: 1800 -- keep the two in step.
+# 840s is the INNERMOST layer of the `auto` timeout budget, which must stay
+# strictly nested:
+#   Open WebUI 900 (AIOHTTP_CLIENT_TIMEOUT, a hard total incl. streaming)
+#   > LiteLLM `auto` 870 (stream_timeout + timeout)
+#   > this listener 840
+#   > the chain's own per-read limits (240 per local order, 300 for Claude)
+# so Envoy gives up before anything outside it does, and a stalled local
+# order inside the chain times out while the turn still has budget
+# (240 + 240 + 300 = 780 < 840). See SEMANTIC_ROUTER.md > Timeout budget;
+# unit-tests/litellm/test_timeouts.py fails if the order breaks.
+#
+# It must also stay below 1200s: the template hard-codes the route
+# idleTimeout, the ext_proc grpc_service.timeout and the cluster
+# connect_timeout at 1200s (cli/templates/envoy.template.yaml), so anything
+# above that is not the real cap. The value becomes the route `timeout`
+# and the ext_proc `message_timeout` (template lines 48, 71, 85, 140).
+# Bodies are BUFFERED both ways, so this is time-to-complete-answer.
 #
 # api_keys carries PLACEHOLDERS, not real keys. There is no `${VAR}`
 # interpolation anywhere in vllm-sr's config loader (cli/models.py has env
@@ -87,7 +99,7 @@ listeners:
   - name: http-8899
     address: 0.0.0.0
     port: 8899
-    timeout: 1800s
+    timeout: 840s
     api_keys:
       # What LiteLLM's `auto` alias sends. Callers on PORT_SEMANTIC_ROUTER.
       - "__SEMANTIC_ROUTER_LISTENER_KEY__"
@@ -441,9 +453,11 @@ global:
     # re-enabling one routes its sub-requests back through the Envoy
     # listener (where x-selected-model, the timeout and the bearer check
     # apply) instead of falling back to the router's built-in default.
+    # timeout_seconds matches listeners[0].timeout (840s); a sub-request
+    # can never outlive the listener it re-enters anyway.
     looper:
       endpoint: http://vllm-sr-envoy:8899/v1/chat/completions
-      timeout_seconds: 1800
+      timeout_seconds: 840
 
   services:
     # vllm-sr's canonical defaults want a Redis for response_api and a

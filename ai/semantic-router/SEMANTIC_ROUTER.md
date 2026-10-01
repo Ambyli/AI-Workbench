@@ -141,7 +141,40 @@ Concurrency, not model count, is the binding constraint.
 |---|---|
 | `qwen3.8-solo`, `muse-glimmer`, `claude-sonnet-5`, `claude-opus-5-5`, `claude-opus-4-8` | **Concrete aliases are not on the router's key.** They are still LiteLLM aliases and still callable directly by other clients; the router reaches the same backends only as chain deployments. |
 | `qwen3.6`, `qwen3.8`, `qwen3.8-flash`, `glm5.2` | Not in any chain. Adding one is: a new deployment in a chain group in `litellm_config.yaml` (with its own `order`), no router change. |
-| `glm5.3-flash` | CPU-only, one slot, **minutes** to first token on a cold prompt. As a chain deployment it would hold a turn for most of the 1800 s timeout. |
+| `glm5.3-flash` | CPU-only, one slot, **minutes** to first token on a cold prompt. As a chain deployment it would hold a turn for most of the 840 s listener budget ([§ Timeout budget](#timeout-budget)). |
+
+---
+
+## Timeout budget
+
+Every layer sits **strictly inside** the one outside it, so the innermost layer gives up first and the caller gets a real error from the layer that knows why — never Open WebUI's generic "Error submitting message" cutting a turn the chain was still serving.
+
+| Layer | Setting | Value | Kind |
+|---|---|---|---|
+| Open WebUI → LiteLLM | `OPENWEBUI_AIOHTTP_CLIENT_TIMEOUT` / `_STREAM_IDLE_TIMEOUT` (`.env`) | **900 s** / 900 s | aiohttp `ClientTimeout(total=…, sock_read=…)` (v0.11.4 `utils/session_pool.py:43-51`, `routers/openai.py:1658-1667`). `total` is a **hard cap including streaming**. Shared with `search_web` / `fetch_url` / MCP tool servers. |
+| LiteLLM default | `litellm_settings.request_timeout` | 900 s | per-attempt default for anything that sets no timeout of its own |
+| LiteLLM `auto` → Envoy | `stream_timeout` **and** `timeout` on `auto` | **870 s** | `httpx.Timeout`, per read |
+| Envoy → router → chain | `listeners[0].timeout` (`config.yaml`) | **840 s** | route `timeout` + ext_proc `message_timeout` (template `cli/templates/envoy.template.yaml:48,71,85,140`) — a total |
+| Envoy, hard-coded | route `idleTimeout`, ext_proc `grpc_service.timeout`, cluster `connect_timeout` | 1200 s | not parameterised; above 840, so never the binding one |
+| Chain orders 1 and 2 (local) | `stream_timeout` + `timeout` on each deployment | **240 s** | per read — a stall detector |
+| Chain order 3 (Claude) | same | **300 s** | per read |
+
+**Why every outer timer is a time-to-*complete*-answer timer.** Envoy buffers the whole response body for ext_proc, and LiteLLM holds the response headers until the first chunk (`proxy/common_request_processing.py:460-472` at v1.95.0). So on `auto`, Open WebUI receives nothing — no headers, no bytes — until the chain has finished, and both of its timers, and `auto`'s per-read 870, measure the whole turn. The box used to run Open WebUI at 300 / 300: every `auto` turn longer than 5 minutes died with "Error submitting message" (`Messages/Error.svelte:37` fallback text). LiteLLM's timeouts are `httpx.Timeout(x)` — per read, not total; for `stream: true` the value used is request `stream_timeout` > deployment `stream_timeout` > `router_settings.stream_timeout` > `request_timeout`, otherwise `timeout` / `request_timeout` (`router.py:3143-3175`). The standalone aliases keep their own `stream_timeout` (300 / 600 / 1800) as stall detectors; the 15-minute total is Open WebUI's.
+
+**What fails over inside a chain, and what does not** (LiteLLM v1.95.0):
+
+| Situation | What happens |
+|---|---|
+| Local backend is **queueing** (vLLM waiting queue) | Handled **before** any call by the overflow hook ([LITELLM.md § Chain aliases](../litellm/LITELLM.md#chain-aliases-and-the-overflow-hook)) — no timeout is spent. |
+| Timeout **before response headers** (hung connect, a backend that never answers) | `router_settings.model_group_retry_policy: {<chain>: {TimeoutErrorRetries: 0}}` skips the same-order retry, and the order-based fallback tries the next order at once (`router.py:6505-6521` → `6132-6171`). Without it, `num_retries: 1` re-picks order 1 — the order filter still prefers it — and spends a second 240 s there. Three pre-header timeouts in a row cost 240 + 240 + 300 = **780 s < 840**. |
+| Stall **after headers** (vLLM sends them before its first token) | Measured, not just read: the read timeout has no status code, maps to `APIConnectionError` (`exception_mapping_utils.py:482-490`), becomes a `MidStreamFallbackError` (`streaming_handler.py:2153-2217`) and the Router's mid-stream fallback moves to the next order with no same-order retry (`router.py:2066-2150`). If some content had already streamed, the next order is re-prompted with that partial answer as an assistant prefix, so the turn is finished by a different model. |
+| A mid-stream error that maps to a **4xx** | Raised directly, **no** fallback (`streaming_handler.py:2202-2206`). A LiteLLM limitation, not worked around. |
+| Order 3 (Claude) times out, or both `local-private` orders do | Nothing behind it: the turn fails with LiteLLM's error. |
+| Envoy's 840 s fires | Envoy returns 504, which LiteLLM maps to `Timeout` (`exception_mapping_utils.py:465`). `auto` is in `model_group_retry_policy` with `TimeoutErrorRetries: 0` too, so the turn is **not** restarted with ~60 s left; it goes straight to `fallbacks: auto → [local-private]`, which gets whatever remains of Open WebUI's 900 s — usually too little for a full answer, but it stays local and the error, if any, is LiteLLM's rather than a silently doubled turn. |
+
+`unit-tests/litellm/test_timeouts.py` enforces the order (900 > 870 > 840 < 1200, every chain's order 1 < 870, the retry policy on all four chains and `auto`, the `.env.example` values) against the checked-in files — not `.env` — and drives both fail-over rows above against a real v1.95.0 `Router` and local stub upstreams.
+
+**Changing a number.** Keep the nesting, then apply outermost first so no window has an inner layer longer than an outer one: `make up openwebui` (an `.env` change — a recreate), then the LiteLLM recreate in [LITELLM.md § Applying a chain or hook change](../litellm/LITELLM.md#applying-a-chain-or-hook-change), then the router recreate in [§ Applying a config change](#applying-a-config-change) after re-rendering `envoy.yaml`. When *lowering*, reverse it: innermost first.
 
 ---
 
@@ -221,7 +254,7 @@ Both `ENVOY_*_ADDRESS` variables matter: they place the ext_proc cluster. If the
 - `LOGICAL_DNS` + `dns_lookup_family: V4_ONLY`, because `litellm` is a name and not an IP.
 - A **default route** (no `x-selected-model`) to `models[0]` — `local-general`. Reordering `providers.models` changes the fallback target; keep `local-general` first.
 - `request_headers_to_remove` on the virtual host, dropping `x-vsr-looper-request` / `-secret` / `-decision` / `-iteration` and `x-authz-user-id` / `-groups` from every inbound request. This is upstream's own hardening and it is already correct — a caller on 8025 cannot forge a looper control header or spoof an identity.
-- Route `timeout` from `listeners[0].timeout` (1800s). `idleTimeout` stays at the template's hard-coded **1200s** — it is not parameterised, so a single upstream that goes quiet for more than 20 minutes is cut regardless.
+- Route `timeout` and ext_proc `message_timeout` from `listeners[0].timeout` (840s). `idleTimeout`, the ext_proc `grpc_service.timeout` and the cluster `connect_timeout`s stay at the template's hard-coded **1200s** — not parameterised, and above 840s, so the listener value is the real cap. See [§ Timeout budget](#timeout-budget).
 
 ---
 
@@ -229,7 +262,7 @@ Both `ENVOY_*_ADDRESS` variables matter: they place the ext_proc cluster. If the
 
 LiteLLM → router → LiteLLM is the design. Two independent guards keep it from becoming an infinite loop, and **both** must hold:
 
-1. **`providers.models` lists only chain aliases.** Never `auto`, never `vllm-sr/auto`, never any other router entrypoint name. Every entry there becomes an Envoy route keyed on `x-selected-model`, so a router entrypoint listed there would route the router's own requests straight back into itself and spin until the 1800 s listener timeout. The entrypoint name is namespaced `vllm-sr/auto` precisely so a collision is visible.
+1. **`providers.models` lists only chain aliases.** Never `auto`, never `vllm-sr/auto`, never any other router entrypoint name. Every entry there becomes an Envoy route keyed on `x-selected-model`, so a router entrypoint listed there would route the router's own requests straight back into itself and spin until the 840 s listener timeout. The entrypoint name is namespaced `vllm-sr/auto` precisely so a collision is visible.
 2. **`SEMANTIC_ROUTER_LITELLM_KEY` is scoped to the four chain aliases and nothing else**: `local-general`, `local-code`, `local-reasoning`, `local-private`. With that scoping, a mis-edited `config.yaml` 401s on the first request instead of looping — and the router cannot reach a concrete alias that carries a Claude fallback. Give the key a monthly budget too: three of the four chains end in Claude, and a sustained local overload spends it.
 
 The chain deployments call their backends directly, so a chain can never recurse back into `auto` either.

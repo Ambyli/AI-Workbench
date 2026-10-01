@@ -177,7 +177,7 @@ If tok/s is *worse* with it on (many concurrent streams, or a high sampling temp
 | `--n-predict` | llama-server | 32,768 |
 | `max_tokens`, `max_output_tokens` | `ai/litellm/litellm_config.yaml` → `glm5.3-flash` | 32,768 |
 | `max_input_tokens` | same entry | 229,376 |
-| `stream_timeout` | same entry | 1800 s — time-to-first-chunk budget; a long uncached prompt on CPU legitimately takes minutes before the first token |
+| `stream_timeout` | same entry | 1800 s — per-read budget (`httpx.Timeout`), which on a cold prompt means time-to-first-chunk; a long uncached prompt on CPU legitimately takes minutes before the first token. A caller through Open WebUI is cut first by its 900 s **total** (`OPENWEBUI_AIOHTTP_CLIENT_TIMEOUT`, see [SEMANTIC_ROUTER.md § Timeout budget](../semantic-router/SEMANTIC_ROUTER.md#timeout-budget)), so 1800 only matters to direct API callers |
 
 Change `--n-predict`, `max_tokens` / `max_output_tokens`, and `max_input_tokens` together; recreate both `glm5.3-flash` and `litellm` after editing.
 

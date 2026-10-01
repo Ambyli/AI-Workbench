@@ -111,7 +111,7 @@ services:
       # is what the router's own looper sub-requests send (config.yaml >
       # WHY TWO KEYS). Missing the second one 401s every looper algorithm.
       SEMANTIC_ROUTER_LISTENER_KEY: ${SEMANTIC_ROUTER_LISTENER_KEY:?Set SEMANTIC_ROUTER_LISTENER_KEY in .env (openssl rand -hex 32) - it is the bearer token Envoy requires on PORT_SEMANTIC_ROUTER. See ai/semantic-router/SEMANTIC_ROUTER.md > Secrets}
-      SEMANTIC_ROUTER_LITELLM_KEY: ${SEMANTIC_ROUTER_LITELLM_KEY:?Set SEMANTIC_ROUTER_LITELLM_KEY in .env to a LiteLLM virtual key scoped to the six candidate aliases. See ai/semantic-router/SEMANTIC_ROUTER.md > Secrets}
+      SEMANTIC_ROUTER_LITELLM_KEY: ${SEMANTIC_ROUTER_LITELLM_KEY:?Set SEMANTIC_ROUTER_LITELLM_KEY in .env to a LiteLLM virtual key scoped to the five candidate aliases. See ai/semantic-router/SEMANTIC_ROUTER.md > Secrets}
       # The generator reads both of these to place the ext_proc cluster.
       # They MUST match the values used to produce the checked-in
       # envoy.yaml or step 2 fails the diff every time.
@@ -153,10 +153,14 @@ services:
     environment:
       # Resolved by cli/models.py::BackendRef.resolve_api_key via the
       # api_key_env on every backend_ref in config.yaml. Scope this virtual
-      # key in the LiteLLM Admin UI to the six candidate aliases and NOTHING
-      # else -- that is the half of the recursion guard LiteLLM enforces.
-      # Put a monthly budget on it too: one remom turn is six model calls.
-      SEMANTIC_ROUTER_LITELLM_KEY: ${SEMANTIC_ROUTER_LITELLM_KEY:?Set SEMANTIC_ROUTER_LITELLM_KEY in .env to a LiteLLM virtual key scoped to qwen3.6/qwen3.8/qwen3.8-solo/qwen3.8-flash/glm5.2/claude-sonnet-5 only. See ai/semantic-router/SEMANTIC_ROUTER.md > Secrets}
+      # key in the LiteLLM Admin UI to the five candidate aliases --
+      # qwen3.8-solo, muse-glimmer, claude-sonnet-5, claude-opus-4-8,
+      # claude-opus-5-5 -- and NOTHING else; that is the half of the
+      # recursion guard LiteLLM enforces. Put a monthly budget on it too:
+      # three of the five are Anthropic, and LiteLLM's fallbacks turn a dead
+      # local candidate into claude-sonnet-5 calls (SEMANTIC_ROUTER.md >
+      # Fallbacks hide dead candidates).
+      SEMANTIC_ROUTER_LITELLM_KEY: ${SEMANTIC_ROUTER_LITELLM_KEY:?Set SEMANTIC_ROUTER_LITELLM_KEY in .env to a LiteLLM virtual key scoped to qwen3.8-solo/muse-glimmer/claude-sonnet-5/claude-opus-4-8/claude-opus-5-5 only. See ai/semantic-router/SEMANTIC_ROUTER.md > Secrets}
       # The router pulls its own classifier bundles from Hugging Face on
       # first start -- nothing in the CLI does it ahead of time. HF_HOME
       # points into the same volume the init service seeded so a recreate

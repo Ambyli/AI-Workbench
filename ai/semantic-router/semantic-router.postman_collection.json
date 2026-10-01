@@ -38,7 +38,7 @@
       "key": "virtual master key",
       "value": "sk-your-litellm-virtual-key",
       "type": "string",
-      "description": "LiteLLM virtual key (Admin UI -> Virtual Keys, or /key/generate). Must be scoped to allow the `auto` alias. This is NOT SEMANTIC_ROUTER_LITELLM_KEY -- that one belongs to the router and is deliberately scoped to the six candidate aliases and nothing else, so using it here would 401 on `auto`. Sent as `Authorization: Bearer {{virtual master key}}` by the collection-level auth."
+      "description": "LiteLLM virtual key (Admin UI -> Virtual Keys, or /key/generate). Must be scoped to allow the `auto` alias. This is NOT SEMANTIC_ROUTER_LITELLM_KEY -- that one belongs to the router and is deliberately scoped to the five candidate aliases (qwen3.8-solo, muse-glimmer, claude-sonnet-5, claude-opus-4-8, claude-opus-5-5) and nothing else, so using it here would 401 on `auto`. Sent as `Authorization: Bearer {{virtual master key}}` by the collection-level auth."
     }
   ],
   "item": [
@@ -71,7 +71,7 @@
                 "models"
               ]
             },
-            "description": "Lists what the router will accept as a `model` value: the auto entrypoint (`vllm-sr/auto`, from global.router.auto_model_name) plus the six concrete candidates, because global.router.include_config_models_in_list is true in config.yaml.\n\nReturns the OpenAI /v1/models shape. 401 with `{\"error\":{\"code\":\"invalid_api_key\"}}` if the bearer token is missing or wrong -- that 401 comes from the Envoy Lua filter, not from the router, so seeing it means Envoy is up and the listener key is the problem. Connection refused means vllm-sr-envoy is not running or PORT_SEMANTIC_ROUTER is not published.\n\nSee SEMANTIC_ROUTER.md > Ports and exposure."
+            "description": "Lists what the router will accept as a `model` value: the auto entrypoint (`vllm-sr/auto`, from global.router.auto_model_name) plus the five concrete candidates (qwen3.8-solo, muse-glimmer, claude-opus-5-5, claude-sonnet-5, claude-opus-4-8), because global.router.include_config_models_in_list is true in config.yaml.\n\nReturns the OpenAI /v1/models shape. 401 with `{\"error\":{\"code\":\"invalid_api_key\"}}` if the bearer token is missing or wrong -- that 401 comes from the Envoy Lua filter, not from the router, so seeing it means Envoy is up and the listener key is the problem. Connection refused means vllm-sr-envoy is not running or PORT_SEMANTIC_ROUTER is not published.\n\nSee SEMANTIC_ROUTER.md > Ports and exposure."
           },
           "response": []
         },
@@ -105,7 +105,7 @@
                 "completions"
               ]
             },
-            "description": "The catch-all decision. Nothing in this prompt trips the privacy, code or reasoning keyword signals, so `default_confidence` matches: qwen3.6 answers first and the router only escalates to qwen3.8 and then claude-sonnet-5 while the answer's average token logprob is below the -0.30 threshold. An easy prompt like this one should stop at the first rung.\n\nReturns a normal OpenAI chat completion. Read `route_diagnostics.looper` on the response body to see which decision matched, which algorithm ran, and which candidates were called -- that is the only way to tell the paths apart from the outside. SEMANTIC_ROUTER.md > Reading route_diagnostics.looper.\n\nErrors: 401 (listener key), 504 / empty body past 1800s (a candidate never returned -- check LiteLLM, not the router), 5xx from the router if every candidate failed and on_error did not cover it.\n\nSEMANTIC_ROUTER.md > Recipe table."
+            "description": "The catch-all decision. Nothing in this prompt trips the privacy, code or reasoning keyword signals, so `default_confidence` matches: qwen3.8-solo answers first and the router only escalates to claude-opus-5-5 (the one Claude rung, last because Anthropic returns no logprobs) while the answer's average token logprob is below the -0.30 threshold. An easy prompt like this one should stop at the first rung. If it escalates every time, check whether qwen3.8-solo is down: LiteLLM then answers rung one from claude-sonnet-5, which has no logprobs to score, so every turn costs a Sonnet AND an Opus call.\n\nReturns a normal OpenAI chat completion. Read `route_diagnostics.looper` on the response body to see which decision matched, which algorithm ran, and which candidates were called -- that is the only way to tell the paths apart from the outside. SEMANTIC_ROUTER.md > Reading route_diagnostics.looper.\n\nErrors: 401 (listener key), 504 / empty body past 1800s (a candidate never returned -- check LiteLLM, not the router), 5xx from the router if every candidate failed and on_error did not cover it.\n\nSEMANTIC_ROUTER.md > Recipe table."
           },
           "response": []
         },
@@ -139,7 +139,7 @@
                 "completions"
               ]
             },
-            "description": "Trips the `privacy_kw` signal (priority 300, matched before everything else), so the request goes to qwen3.8 with algorithm `static`: one local call, no fan-out, no escalation, and specifically no Anthropic.\n\nThis is the one item worth verifying in the LiteLLM Admin UI as well as here: after running it, the router's virtual key should show spend against qwen3.8 and NOTHING against claude-sonnet-5. If it does not, the decision did not match -- add the term to `privacy_kw` in config.yaml.\n\nRead `route_diagnostics.looper` on the response body to see which decision matched, which algorithm ran, and which candidates were called -- that is the only way to tell the paths apart from the outside. SEMANTIC_ROUTER.md > Reading route_diagnostics.looper.\n\nSEMANTIC_ROUTER.md > Recipe table."
+            "description": "Trips the `privacy_kw` signal (priority 300, matched before everything else), so the request goes to qwen3.8-solo with algorithm `static`: one local call, no fan-out, no escalation, and no Anthropic -- WHILE qwen3.8-solo is up. LiteLLM's `fallbacks` maps qwen3.8-solo -> claude-sonnet-5, so if it is down this PII prompt is answered by Anthropic and the router never knows (known gap; fix is a fallback-free local alias -- SEMANTIC_ROUTER.md > Fallbacks hide dead candidates).\n\nThis is the one item worth verifying in the LiteLLM Admin UI as well as here: after running it, the router's virtual key should show spend against qwen3.8-solo and NOTHING against any Claude alias. If it does not, the decision did not match -- add the term to `privacy_kw` in config.yaml.\n\nRead `route_diagnostics.looper` on the response body to see which decision matched, which algorithm ran, and which candidates were called -- that is the only way to tell the paths apart from the outside. SEMANTIC_ROUTER.md > Reading route_diagnostics.looper.\n\nSEMANTIC_ROUTER.md > Recipe table."
           },
           "response": []
         },
@@ -173,7 +173,7 @@
                 "completions"
               ]
             },
-            "description": "Trips `code_kw` (priority 200) and runs the `ratings` looper: qwen3.8 and qwen3.8-flash answer in parallel, capped at max_concurrent 2 because qwen3.8-flash has exactly 2 llama.cpp slots.\n\nIMPORTANT -- `ratings` returns SEVERAL entries in `choices`. Open WebUI renders only the first; a raw API client like Postman is the only place you will see the rest, which is the main reason to run this item by hand.\n\nExpect no output at all until both candidates finish: Envoy runs ext_proc with buffered request and response bodies, so time-to-first-token is the SLOWEST candidate, not the fastest.\n\nRead `route_diagnostics.looper` on the response body to see which decision matched, which algorithm ran, and which candidates were called -- that is the only way to tell the paths apart from the outside. SEMANTIC_ROUTER.md > Reading route_diagnostics.looper.\n\nSEMANTIC_ROUTER.md > Recipe table and > Concurrency budget."
+            "description": "Trips `code_kw` (priority 200) and runs the `ratings` looper: qwen3.8-solo and muse-glimmer answer in parallel, max_concurrent 2 (one call per candidate). muse-glimmer's 4 vLLM sequences are shared with the classifier, so during a classifier batch this turn queues inside vLLM. If muse-glimmer is down (qwen3.8 holds the GPU pair), LiteLLM silently answers its slot from claude-sonnet-5 -- check spend-by-key.\n\nIMPORTANT -- `ratings` returns SEVERAL entries in `choices`. Open WebUI renders only the first; a raw API client like Postman is the only place you will see the rest, which is the main reason to run this item by hand.\n\nExpect no output at all until both candidates finish: Envoy runs ext_proc with buffered request and response bodies, so time-to-first-token is the SLOWEST candidate, not the fastest.\n\nRead `route_diagnostics.looper` on the response body to see which decision matched, which algorithm ran, and which candidates were called -- that is the only way to tell the paths apart from the outside. SEMANTIC_ROUTER.md > Reading route_diagnostics.looper.\n\nSEMANTIC_ROUTER.md > Recipe table and > Concurrency budget."
           },
           "response": []
         },
@@ -207,7 +207,7 @@
                 "completions"
               ]
             },
-            "description": "Trips `reasoning_kw` (priority 150) and runs `remom` with breadth_schedule [3, 2]: three parallel attempts, then two, then one synthesis call -- SIX model calls for one user turn. This is the most expensive local path in the stack; run it deliberately, not in a loop.\n\n`include_intermediate_responses` is true in config.yaml, so the round-by-round attempts come back in the response body alongside the synthesis.\n\nSlowest item in the collection. If it returns nothing and then 504s, a candidate exceeded the 1800s listener timeout -- check qwen3.8-flash first, it only has 2 slots and this decision asks for 3 concurrent.\n\nRead `route_diagnostics.looper` on the response body to see which decision matched, which algorithm ran, and which candidates were called -- that is the only way to tell the paths apart from the outside. SEMANTIC_ROUTER.md > Reading route_diagnostics.looper.\n\nSEMANTIC_ROUTER.md > Recipe table and > Concurrency budget."
+            "description": "Trips `reasoning_kw` (priority 150) and runs `remom` with breadth_schedule [3, 2]: three parallel attempts, then two, then one synthesis call -- SIX model calls for one user turn. This is the most expensive local path in the stack; run it deliberately, not in a loop.\n\n`include_intermediate_responses` is true in config.yaml, so the round-by-round attempts come back in the response body alongside the synthesis.\n\nSlowest item in the collection. If it returns nothing and then 504s, a candidate exceeded the 1800s listener timeout -- check qwen3.8-solo first (exactly 3 vLLM sequences, which a 3-wide round can fill on its own), then muse-glimmer (4 sequences, shared with the classifier).\n\nRead `route_diagnostics.looper` on the response body to see which decision matched, which algorithm ran, and which candidates were called -- that is the only way to tell the paths apart from the outside. SEMANTIC_ROUTER.md > Reading route_diagnostics.looper.\n\nSEMANTIC_ROUTER.md > Recipe table and > Concurrency budget."
           },
           "response": []
         },
@@ -223,7 +223,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"model\": \"qwen3.8\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"Say hello.\"\n    }\n  ],\n  \"max_tokens\": 64\n}",
+              "raw": "{\n  \"model\": \"qwen3.8-solo\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"Say hello.\"\n    }\n  ],\n  \"max_tokens\": 64\n}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -241,7 +241,7 @@
                 "completions"
               ]
             },
-            "description": "Sends a CONCRETE model name instead of the auto entrypoint. Only `vllm-sr/auto` triggers routing; anything else is treated as an explicit selection, and Envoy matches the x-selected-model header the router sets to that model's cluster -- which, for every model in this pool, is litellm:4000.\n\nUse it to bisect: if this works and the `vllm-sr/auto` items do not, the Envoy -> LiteLLM leg is fine and the problem is in decisions or the looper. If this fails too, the router cannot reach LiteLLM -- check SEMANTIC_ROUTER_LITELLM_KEY and its alias scoping.\n\nValid names here are exactly the providers.models entries in config.yaml: qwen3.6, qwen3.8, qwen3.8-solo, qwen3.8-flash, glm5.2, claude-sonnet-5. An unknown name falls through to Envoy's default route, which goes to models[0] (qwen3.6)."
+            "description": "Sends a CONCRETE model name instead of the auto entrypoint. Only `vllm-sr/auto` triggers routing; anything else is treated as an explicit selection, and Envoy matches the x-selected-model header the router sets to that model's cluster -- which, for every model in this pool, is litellm:4000.\n\nUse it to bisect: if this works and the `vllm-sr/auto` items do not, the Envoy -> LiteLLM leg is fine and the problem is in decisions or the looper. If this fails too, the router cannot reach LiteLLM -- check SEMANTIC_ROUTER_LITELLM_KEY and its alias scoping.\n\nValid names here are exactly the providers.models entries in config.yaml: qwen3.8-solo, muse-glimmer, claude-opus-5-5, claude-sonnet-5, claude-opus-4-8 -- the five aliases SEMANTIC_ROUTER_LITELLM_KEY is scoped to. An unknown name falls through to Envoy's default route, which goes to models[0] (qwen3.8-solo)."
           },
           "response": []
         }
@@ -300,7 +300,7 @@
                 "completions"
               ]
             },
-            "description": "The real production path: Open WebUI and every other client call `auto` here, LiteLLM rewrites it to `vllm-sr/auto` and forwards to http://vllm-sr-envoy:8899/v1 with SEMANTIC_ROUTER_LISTENER_KEY attached server-side. The caller never holds the listener key.\n\nCompare the result with the equivalent item in the 'Envoy listener (direct)' folder: identical output means the LiteLLM leg is transparent; a difference means LiteLLM is transforming the body (check drop_params and the alias's max_tokens).\n\nErrors worth knowing: a 400 about context length is `context_window_fallbacks: auto -> [qwen3.8-flash]` NOT firing; a response that is plainly from qwen3.8 rather than the router means `fallbacks: auto -> [qwen3.8, claude-sonnet-5]` fired because vllm-sr-envoy was unreachable. Both are configured in ai/litellm/litellm_config.yaml."
+            "description": "The real production path: Open WebUI and every other client call `auto` here, LiteLLM rewrites it to `vllm-sr/auto` and forwards to http://vllm-sr-envoy:8899/v1 with SEMANTIC_ROUTER_LISTENER_KEY attached server-side. The caller never holds the listener key.\n\nCompare the result with the equivalent item in the 'Envoy listener (direct)' folder: identical output means the LiteLLM leg is transparent; a difference means LiteLLM is transforming the body (check drop_params and the alias's max_tokens).\n\nErrors worth knowing: a 400 about context length over 114688 tokens is expected today -- `context_window_fallbacks: auto -> [qwen3.8-solo]` targets a model with the same 114688 window, so it cannot help; a response that is plainly from qwen3.8-solo rather than the router means `fallbacks: auto -> [qwen3.8-solo, claude-sonnet-5]` fired because vllm-sr-envoy was unreachable. Both are configured in ai/litellm/litellm_config.yaml."
           },
           "response": []
         },
@@ -334,7 +334,7 @@
                 "completions"
               ]
             },
-            "description": "Same path with stream: true. Worth running because the answer is NOT incremental in the way the caller expects: Envoy buffers the whole ext_proc request and response body, so the stream stays silent for the entire routed turn and then delivers. Open WebUI shows a waiting state throughout.\n\nThis prompt trips `code_kw`, so it is a parallel ratings turn -- the silence is as long as the slower of qwen3.8 / qwen3.8-flash.\n\nIf the stream dies early, the culprit is a stream_timeout below 1800 on the `auto` alias, or a listener timeout below 1800s in config.yaml. The two must stay in step."
+            "description": "Same path with stream: true. Worth running because the answer is NOT incremental in the way the caller expects: Envoy buffers the whole ext_proc request and response body, so the stream stays silent for the entire routed turn and then delivers. Open WebUI shows a waiting state throughout.\n\nThis prompt trips `code_kw`, so it is a parallel ratings turn -- the silence is as long as the slower of qwen3.8-solo / muse-glimmer.\n\nIf the stream dies early, the culprit is a stream_timeout below 1800 on the `auto` alias, or a listener timeout below 1800s in config.yaml. The two must stay in step."
           },
           "response": []
         },
@@ -368,7 +368,7 @@
                 "completions"
               ]
             },
-            "description": "Phase 5 validation item, not an everyday call. Run `make down semantic-router vllm-sr-envoy`, then send this: LiteLLM should serve `auto` from qwen3.8 via `fallbacks` rather than returning an error, and the response's model field should say so.\n\nA hard 5xx instead means the `auto` entry is missing from the `fallbacks` map in ai/litellm/litellm_config.yaml -- LiteLLM reports that as 'Available Model Group Fallbacks=None'. Bring Envoy back with `make up semantic-router` afterwards."
+            "description": "Phase 5 validation item, not an everyday call. Run `make down semantic-router vllm-sr-envoy`, then send this: LiteLLM should serve `auto` from qwen3.8-solo (then claude-sonnet-5) via `fallbacks` rather than returning an error, and the response's model field should say so.\n\nA hard 5xx instead means the `auto` entry is missing from the `fallbacks` map in ai/litellm/litellm_config.yaml -- LiteLLM reports that as 'Available Model Group Fallbacks=None'. Bring Envoy back with `make up semantic-router` afterwards."
           },
           "response": []
         }

@@ -30,18 +30,18 @@
 #                        access key (the LiteLLM virtual key), and those
 #                        sub-requests re-enter this listener -- see
 #                        config.yaml > WHY TWO KEYS.
-#   models               the six providers.models entries -- qwen3.6,
-#                        qwen3.8, qwen3.8-solo, qwen3.8-flash, glm5.2,
-#                        claude-sonnet-5. Each yields ONE route (matched on
+#   models               the five providers.models entries -- qwen3.8-solo,
+#                        muse-glimmer, claude-opus-5-5, claude-sonnet-5,
+#                        claude-opus-4-8. Each yields ONE route (matched on
 #                        the x-selected-model header) and ONE cluster. All
-#                        six clusters resolve to the same upstream,
+#                        five clusters resolve to the same upstream,
 #                        litellm:4000 -- the generator emits a cluster per
 #                        model, not one shared cluster, and there is no knob
 #                        to collapse them.
-#   anthropic_models     [] -- claude-sonnet-5 is declared api_format:
-#                        openai, so it goes through LiteLLM like the rest
-#                        instead of getting a direct api.anthropic.com
-#                        cluster. See config.yaml.
+#   anthropic_models     [] -- all three Claude aliases are declared
+#                        api_format: openai, so they go through LiteLLM like
+#                        the rest instead of getting a direct
+#                        api.anthropic.com cluster. See config.yaml.
 #   extproc_host/_port   vllm-sr-router / 50051, from ENVOY_EXTPROC_ADDRESS.
 #   extproc_cluster_type LOGICAL_DNS (the host is a name, not an IP), which
 #                        also sets dns_lookup_family: V4_ONLY.
@@ -81,7 +81,7 @@
 #   not run; if only looper decisions 401, the second key is missing --
 #   check the init service's logs first either way.
 #
-#   The default route (no x-selected-model) goes to models[0], qwen3.6.
+#   The default route (no x-selected-model) goes to models[0], qwen3.8-solo.
 #   Reordering providers.models therefore changes the fallback target.
 #
 #   admin is on 9901 and is NEVER published -- see the compose file. It
@@ -125,50 +125,6 @@ static_resources:
               - "x-authz-user-groups"
               routes:
               
-              # Route for model: qwen3.6
-              - match:
-                  prefix: "/"
-                  headers:
-                  - name: x-selected-model
-                    string_match:
-                      exact: "qwen3.6"
-                route:
-                  cluster: qwen3.6_cluster
-                  timeout: 1800s
-                  idleTimeout: 1200s
-                  # Rewrite Host header to match upstream server
-                  host_rewrite_literal: "litellm:4000"
-                  
-                  # Prepend path prefix to all requests (e.g., /compatible-mode + /v1/chat/completions = /compatible-mode/v1/chat/completions)
-                  regex_rewrite:
-                    pattern:
-                      google_re2: {}
-                      regex: "^/v1(.*)$"
-                    substitution: "/v1\\1"
-                  
-              
-              # Route for model: qwen3.8
-              - match:
-                  prefix: "/"
-                  headers:
-                  - name: x-selected-model
-                    string_match:
-                      exact: "qwen3.8"
-                route:
-                  cluster: qwen3.8_cluster
-                  timeout: 1800s
-                  idleTimeout: 1200s
-                  # Rewrite Host header to match upstream server
-                  host_rewrite_literal: "litellm:4000"
-                  
-                  # Prepend path prefix to all requests (e.g., /compatible-mode + /v1/chat/completions = /compatible-mode/v1/chat/completions)
-                  regex_rewrite:
-                    pattern:
-                      google_re2: {}
-                      regex: "^/v1(.*)$"
-                    substitution: "/v1\\1"
-                  
-              
               # Route for model: qwen3.8-solo
               - match:
                   prefix: "/"
@@ -191,15 +147,15 @@ static_resources:
                     substitution: "/v1\\1"
                   
               
-              # Route for model: qwen3.8-flash
+              # Route for model: muse-glimmer
               - match:
                   prefix: "/"
                   headers:
                   - name: x-selected-model
                     string_match:
-                      exact: "qwen3.8-flash"
+                      exact: "muse-glimmer"
                 route:
-                  cluster: qwen3.8_flash_cluster
+                  cluster: muse_glimmer_cluster
                   timeout: 1800s
                   idleTimeout: 1200s
                   # Rewrite Host header to match upstream server
@@ -213,15 +169,15 @@ static_resources:
                     substitution: "/v1\\1"
                   
               
-              # Route for model: glm5.2
+              # Route for model: claude-opus-5-5
               - match:
                   prefix: "/"
                   headers:
                   - name: x-selected-model
                     string_match:
-                      exact: "glm5.2"
+                      exact: "claude-opus-5-5"
                 route:
-                  cluster: glm5.2_cluster
+                  cluster: claude_opus_5_5_cluster
                   timeout: 1800s
                   idleTimeout: 1200s
                   # Rewrite Host header to match upstream server
@@ -257,6 +213,28 @@ static_resources:
                     substitution: "/v1\\1"
                   
               
+              # Route for model: claude-opus-4-8
+              - match:
+                  prefix: "/"
+                  headers:
+                  - name: x-selected-model
+                    string_match:
+                      exact: "claude-opus-4-8"
+                route:
+                  cluster: claude_opus_4_8_cluster
+                  timeout: 1800s
+                  idleTimeout: 1200s
+                  # Rewrite Host header to match upstream server
+                  host_rewrite_literal: "litellm:4000"
+                  
+                  # Prepend path prefix to all requests (e.g., /compatible-mode + /v1/chat/completions = /compatible-mode/v1/chat/completions)
+                  regex_rewrite:
+                    pattern:
+                      google_re2: {}
+                      regex: "^/v1(.*)$"
+                    substitution: "/v1\\1"
+                  
+              
               
               # Default route (no x-selected-model header)
               - match:
@@ -264,7 +242,7 @@ static_resources:
                 route:
                   
                   # Route to first model by default
-                  cluster: qwen3.6_cluster
+                  cluster: qwen3.8_solo_cluster
                   
                   timeout: 1800s
                   
@@ -361,56 +339,6 @@ static_resources:
   
 
   
-  # Cluster for model: qwen3.6
-  - name: qwen3.6_cluster
-    connect_timeout: 1200s
-    type: LOGICAL_DNS
-    
-    dns_lookup_family: V4_ONLY
-    
-    lb_policy: ROUND_ROBIN
-    load_assignment:
-      cluster_name: qwen3.6_cluster
-      endpoints:
-      - lb_endpoints:
-        
-        - endpoint:
-            address:
-              socket_address:
-                address: litellm
-                port_value: 4000
-            
-            hostname: "litellm"
-            
-          load_balancing_weight: 1
-        
-    
-  
-  # Cluster for model: qwen3.8
-  - name: qwen3.8_cluster
-    connect_timeout: 1200s
-    type: LOGICAL_DNS
-    
-    dns_lookup_family: V4_ONLY
-    
-    lb_policy: ROUND_ROBIN
-    load_assignment:
-      cluster_name: qwen3.8_cluster
-      endpoints:
-      - lb_endpoints:
-        
-        - endpoint:
-            address:
-              socket_address:
-                address: litellm
-                port_value: 4000
-            
-            hostname: "litellm"
-            
-          load_balancing_weight: 1
-        
-    
-  
   # Cluster for model: qwen3.8-solo
   - name: qwen3.8_solo_cluster
     connect_timeout: 1200s
@@ -436,8 +364,8 @@ static_resources:
         
     
   
-  # Cluster for model: qwen3.8-flash
-  - name: qwen3.8_flash_cluster
+  # Cluster for model: muse-glimmer
+  - name: muse_glimmer_cluster
     connect_timeout: 1200s
     type: LOGICAL_DNS
     
@@ -445,7 +373,7 @@ static_resources:
     
     lb_policy: ROUND_ROBIN
     load_assignment:
-      cluster_name: qwen3.8_flash_cluster
+      cluster_name: muse_glimmer_cluster
       endpoints:
       - lb_endpoints:
         
@@ -461,8 +389,8 @@ static_resources:
         
     
   
-  # Cluster for model: glm5.2
-  - name: glm5.2_cluster
+  # Cluster for model: claude-opus-5-5
+  - name: claude_opus_5_5_cluster
     connect_timeout: 1200s
     type: LOGICAL_DNS
     
@@ -470,7 +398,7 @@ static_resources:
     
     lb_policy: ROUND_ROBIN
     load_assignment:
-      cluster_name: glm5.2_cluster
+      cluster_name: claude_opus_5_5_cluster
       endpoints:
       - lb_endpoints:
         
@@ -496,6 +424,31 @@ static_resources:
     lb_policy: ROUND_ROBIN
     load_assignment:
       cluster_name: claude_sonnet_5_cluster
+      endpoints:
+      - lb_endpoints:
+        
+        - endpoint:
+            address:
+              socket_address:
+                address: litellm
+                port_value: 4000
+            
+            hostname: "litellm"
+            
+          load_balancing_weight: 1
+        
+    
+  
+  # Cluster for model: claude-opus-4-8
+  - name: claude_opus_4_8_cluster
+    connect_timeout: 1200s
+    type: LOGICAL_DNS
+    
+    dns_lookup_family: V4_ONLY
+    
+    lb_policy: ROUND_ROBIN
+    load_assignment:
+      cluster_name: claude_opus_4_8_cluster
       endpoints:
       - lb_endpoints:
         

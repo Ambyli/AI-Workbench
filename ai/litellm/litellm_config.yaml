@@ -285,8 +285,10 @@ model_list:
       api_key: os.environ/ANTHROPIC_API_KEY
       stream_timeout: 300
 
-  # Opt-in only: not in any fallback map or the semantic router pool, so it
-  # is spent only when a caller names it explicitly.
+  # Not in any fallback map, so it is never spent silently on someone
+  # else's behalf. It IS in the semantic router pool: the last rung of the
+  # router's default_confidence ladder (ai/semantic-router/config.yaml), so
+  # an escalated `auto` turn spends it under SEMANTIC_ROUTER_LITELLM_KEY.
   - model_name: claude-opus-5-5
     litellm_params:
       model: anthropic/claude-opus-5-5
@@ -309,8 +311,9 @@ model_list:
   # server behind that listener and has no OpenAI surface of its own.
   #
   # RECURSION: the router calls this same LiteLLM back, once per candidate,
-  # with SEMANTIC_ROUTER_LITELLM_KEY. That key is scoped to the six concrete
-  # aliases and must never be able to call `auto`. See
+  # with SEMANTIC_ROUTER_LITELLM_KEY. That key is scoped to the five concrete
+  # pool aliases (qwen3.8-solo, muse-glimmer, claude-sonnet-5,
+  # claude-opus-4-8, claude-opus-5-5) and must never be able to call `auto`. See
   # ai/semantic-router/SEMANTIC_ROUTER.md > Recursion guard.
   #
   # stream_timeout 1800 (not 300) because Envoy runs ext_proc with BUFFERED
@@ -338,10 +341,10 @@ model_list:
       stream_timeout: 1800
     model_info:
       # The smallest window any candidate `auto` can actually land on:
-      # qwen3.6 / qwen3.8 / qwen3.8-solo all cap at 114688. glm5.2 is
-      # declared to the router but is not in any decision's modelRefs, so
-      # its 32768 does not bind here. Raising this above the smallest
-      # reachable candidate means the router accepts a prompt one of its own
-      # rungs will reject mid-escalation.
+      # qwen3.8-solo caps at 114688 (muse-glimmer is 245760; the Claude
+      # aliases declare none), and qwen3.8-solo is in every decision's
+      # modelRefs. Raising this above the smallest reachable candidate means
+      # the router accepts a prompt one of its own rungs will reject
+      # mid-escalation.
       max_input_tokens: 114688
       max_output_tokens: 16384

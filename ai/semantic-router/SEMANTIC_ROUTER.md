@@ -40,8 +40,8 @@
         ▼
   litellm:4000                       Authorization: Bearer SEMANTIC_ROUTER_LITELLM_KEY
         ▼
-  qwen3.6 / qwen3.8 / qwen3.8-solo / qwen3.8-flash / glm5.2   (vLLM, llama.cpp)
-  claude-sonnet-5                                             (Anthropic, via LiteLLM)
+  qwen3.8-solo / muse-glimmer                                 (vLLM)
+  claude-opus-5-5 / claude-sonnet-5 / claude-opus-4-8         (Anthropic, via LiteLLM)
 ```
 
 Three things fall out of that shape:
@@ -56,27 +56,55 @@ Three things fall out of that shape:
 
 Concurrency, not model count, is the binding constraint. Every parallel algorithm has to fit the slots the backends actually have.
 
+**The pool is whatever `SEMANTIC_ROUTER_LITELLM_KEY` can call** — and that key is scoped to exactly five aliases: `qwen3.8-solo`, `muse-glimmer`, `claude-opus-5-5`, `claude-sonnet-5`, `claude-opus-4-8`. `providers.models` in `config.yaml` lists those five and nothing else; a candidate the key cannot call would 401 at LiteLLM on every sub-request and `on_error: skip` would hide it.
+
 ### Concurrency budget
 
-| LiteLLM alias | Backend | Parallel slots | Logprobs | Role |
-|---|---|---|---|---|
-| `qwen3.6` | vLLM, 1 GPU | 3 | yes | cheap first rung (confidence) |
-| `qwen3.8` | vLLM, TP=2 | 16 | yes | workhorse; static target, panel member |
-| `qwen3.8-solo` | vLLM, 1 GPU (device 2) | 3 | yes | declared, unused by current decisions — the stand-in when `muse-glimmer` holds the pair |
-| `qwen3.8-flash` | llama.cpp, MTP | **2** | verify only | strong reasoner; the real ceiling on every parallel round |
-| `glm5.2` | llama.cpp, CPU MoE offload | 1 | verify only | declared, unused by current decisions — escalation tail if you want one |
-| `claude-sonnet-5` | Anthropic, via LiteLLM | API limits | **no** | last confidence rung |
+| LiteLLM alias | Backend | Parallel slots | Context (`max_input_tokens`) | Logprobs | Role |
+|---|---|---|---|---|---|
+| `qwen3.8-solo` | vLLM, 1 GPU (device 2, shared with the OWLv2 `detector`) | **3** (`--max-num-seqs 3`) | 114688 | yes | the only local text rung: `privacy_local` target, panel member, first confidence rung, Envoy default route |
+| `muse-glimmer` | vLLM, TP=2 on the GPU pair + DFlash | 4 (`--max-num-seqs 4`) — **shared with the classifier** | 245760 | verify | panel member (`coding_ratings`, `reasoning_remom`); down whenever `qwen3.8` holds the pair |
+| `claude-opus-5-5` | Anthropic, via LiteLLM | API limits | not declared | **no** | last (and only Claude) confidence rung |
+| `claude-sonnet-5` | Anthropic, via LiteLLM | API limits | not declared | **no** | declared, used by no decision — but it is what LiteLLM's `fallbacks` substitutes for a dead local candidate |
+| `claude-opus-4-8` | Anthropic, via LiteLLM — alias lives in LiteLLM's **DB** (Admin UI), not `litellm_config.yaml` | API limits | not declared | **no** | declared, used by no decision |
 
-`qwen3.8-flash`'s two slots are why `coding_ratings` sets `max_concurrent: 2`. Raising it does not buy parallelism — it queues inside llama.cpp and every request in the round waits.
+Slot counts are from `ai/vllm/docker-compose.vllm.yml`; context windows mirror `ai/litellm/litellm_config.yaml` and are copied into `routing.modelCards`. No Claude alias carries a `context_window_size`, because LiteLLM declares no `model_info` for any of them.
 
-### Excluded on purpose
+Budget, per decision:
+
+- `coding_ratings` — `max_concurrent: 2` is one call per candidate, all at once.
+- `reasoning_remom` — `max_concurrent: 3` fits the widest round (`breadth_schedule: [3, 2]`) even if all three attempts land on one candidate: `qwen3.8-solo` has exactly 3 sequences. Raising it past 3 can oversubscribe `qwen3.8-solo` on its own.
+- **`muse-glimmer` is contended by the classifier.** The classifier calls `http://muse-glimmer:8000` directly — not through LiteLLM — with up to `CLASSIFIER_MAX_LLM_CALLS=4` requests in flight, which is every one of muse-glimmer's 4 sequences. A router fan-out during a classifier batch queues inside vLLM, and because Envoy buffers bodies, every request in the round pays that wait. None of it shows on LiteLLM's spend-by-key — look at the vLLM logs.
+- `qwen3.8-solo` shares GPU 2 with `detector` (OWLv2, fp16, one inference at a time). That is VRAM headroom and compute contention, not a slot.
+
+### Not in the pool
 
 | Alias | Why |
 |---|---|
+| `qwen3.6`, `qwen3.8`, `qwen3.8-flash`, `glm5.2` | **Not on the router's virtual key.** They are still LiteLLM aliases and still callable directly; the router just cannot reach them. Re-adding one is: scope the key to it in the Admin UI, add it to `providers.models` + `routing.modelCards`, re-render `envoy.yaml`. |
 | `glm5.3-flash` | CPU-only, one slot, **minutes** to first token on a cold prompt. In a parallel round it blocks the whole round. |
-| `muse-glimmer` | Shares its GPU pair with `qwen3.8`; the two cannot run together. The router health-checks *LiteLLM*, not the model behind it, so it would keep selecting a candidate that is not running. |
 
-The mutual exclusion is also why the stack leans on LiteLLM's `fallbacks` and `on_error: skip` rather than router-side ejection: from the router's point of view every alias is always up.
+**`muse-glimmer` is in the pool now, and was not before.** It shares its GPU pair with `qwen3.8` and the two cannot run together; while `qwen3.8` was a candidate, putting both in would have meant always routing to one model that was down. With `qwen3.8` off the key that conflict is gone *inside* the pool — but not on the box. When an operator brings `qwen3.8` up instead, `muse-glimmer` is down, and the router health-checks *LiteLLM*, not the model behind it, so it keeps selecting it. What happens next is the next section.
+
+### Fallbacks hide dead candidates
+
+`ai/litellm/litellm_config.yaml`'s `fallbacks` map applies to the router's sub-requests exactly as it does to any other caller:
+
+```yaml
+fallbacks:
+  - {"qwen3.8-solo":  ["claude-sonnet-5"]}
+  - {"muse-glimmer":  ["claude-sonnet-5"]}
+```
+
+So a dead local candidate does **not** error back to the router. LiteLLM retries once (`num_retries: 1`), then silently answers from `claude-sonnet-5`; the router sees a `200` under the local alias's name and `on_error: skip` never fires. Concretely:
+
+- **`muse-glimmer` down (qwen3.8 holds the pair):** every `muse-glimmer` slot in `coding_ratings` and `reasoning_remom` becomes a `claude-sonnet-5` call. A `remom` turn can quietly spend several Sonnet calls.
+- **`qwen3.8-solo` down:** `privacy_local` sends the PII prompt to Anthropic (see below); every `default_confidence` turn gets a logprob-less Sonnet answer at rung one, which scores as a failure, so it escalates — **every catch-all turn then costs a Sonnet call and an Opus call**.
+- The only authoritative record is **spend-by-key** in the LiteLLM Admin UI. `route_diagnostics.looper` will name the local alias, not the model that answered.
+
+**Known gap — `privacy_local` is not strictly local.** It routes to `qwen3.8-solo` only, but nothing in vllm-sr 0.3.0 can stop LiteLLM's fallback, so if `qwen3.8-solo` fails, PII reaches `claude-sonnet-5`. The fix is a **follow-up, not implemented**: a local-only LiteLLM alias with the same `litellm_params` and **no** `fallbacks` / `context_window_fallbacks` entry (e.g. `qwen3.8-solo-local`), added to the router's key and named as `privacy_local`'s only `modelRefs` entry, so a dead backend fails closed. That also means adding it to `providers.models` + `routing.modelCards` and re-rendering `envoy.yaml`.
+
+This is also why the stack leans on LiteLLM's `fallbacks` and `on_error: skip` rather than router-side ejection: from the router's point of view every alias is always up.
 
 ---
 
@@ -86,18 +114,20 @@ One entrypoint, `vllm-sr/auto`. Which algorithm runs is decided by which **decis
 
 | Priority | Decision | Signal | Algorithm | Candidates | Cost per turn |
 |---|---|---|---|---|---|
-| 300 | `privacy_local` | keyword `privacy_kw` (ssn, credit card, date of birth, bank account, medical record, …) | `static` | `qwen3.8` | 1 call |
-| 200 | `coding_ratings` | keyword `code_kw` (python, sql, docker, stack trace, regex, …) | `ratings`, `max_concurrent: 2` | `qwen3.8` + `qwen3.8-flash` | 2 calls, parallel |
-| 150 | `reasoning_remom` | keyword `reasoning_kw` (prove, derive, theorem, integral, step by step, …) | `remom`, `breadth_schedule: [3, 2]`, `max_concurrent: 3` | `qwen3.8` + `qwen3.8-flash` | **6 calls** (3 + 2 + synthesis) |
-| 10 | `default_confidence` | catch-all (`conditions: []`) | `confidence`, `avg_logprob`, threshold `-0.30` | `qwen3.6` → `qwen3.8` → `claude-sonnet-5` | 1–3 calls, sequential |
+| 300 | `privacy_local` | keyword `privacy_kw` (ssn, credit card, date of birth, bank account, medical record, …) | `static` | `qwen3.8-solo` | 1 local call |
+| 200 | `coding_ratings` | keyword `code_kw` (python, sql, docker, stack trace, regex, …) | `ratings`, `max_concurrent: 2` | `qwen3.8-solo` + `muse-glimmer` | 2 local calls, parallel |
+| 150 | `reasoning_remom` | keyword `reasoning_kw` (prove, derive, theorem, integral, step by step, …) | `remom`, `breadth_schedule: [3, 2]`, `max_concurrent: 3` | `qwen3.8-solo` + `muse-glimmer` | **6 local calls** (3 + 2 + synthesis) |
+| 10 | `default_confidence` | catch-all (`conditions: []`) | `confidence`, `avg_logprob`, threshold `-0.30` | `qwen3.8-solo` → `claude-opus-5-5` | 1 local call; +1 **Opus** call when escalated |
+
+`claude-sonnet-5` and `claude-opus-4-8` are declared in `providers.models` (so an explicit model name passes through the listener) but appear in no decision's `modelRefs`. "Local calls" assumes both local candidates are up — see [§ Fallbacks hide dead candidates](#fallbacks-hide-dead-candidates) for what each row costs when one is not.
 
 Notes that bite:
 
-- **`privacy_local` is about where tokens do *not* go.** It exists so PII and customer data never reach Anthropic. Verify it by spend, not by output: after a PII prompt the router's virtual key should show `qwen3.8` and nothing against `claude-sonnet-5`.
+- **`privacy_local` is about where tokens do *not* go.** It exists so PII and customer data stay on the box. Verify it by spend, not by output: after a PII prompt the router's virtual key should show `qwen3.8-solo` and nothing against any Claude alias. **It is not airtight** — LiteLLM falls `qwen3.8-solo` back to `claude-sonnet-5`, so a dead `qwen3.8-solo` sends the prompt to Anthropic. See [§ Fallbacks hide dead candidates](#fallbacks-hide-dead-candidates) for the gap and the follow-up fix.
 - **`ratings` returns several `choices`.** Open WebUI renders only the first. Use Postman to see the rest. There is no judge and no synthesis in this algorithm — that was Fusion, which does not exist in v0.3.0.
 - **`remom` is the expensive one.** `[3, 2]` plus synthesis is six model calls for one user turn. `include_intermediate_responses: true` means the per-round attempts come back in the body.
 - **`avg_logprob` thresholds are negative.** Closer to zero = more confident (`ConfidenceAlgorithmConfig`, default `-1.0`). A positive threshold makes everything look confident and the ladder never escalates. Tune `-0.30` in [§ Phase 5 validation matrix](#phase-5-validation-matrix) toward a 20–40 % escalation rate.
-- **`claude-sonnet-5` is last on purpose.** Anthropic returns no logprobs, so that rung can be *arrived at* but never *scored*. Moving it earlier means switching `confidence_method` to `margin` or `hybrid`, or the rung scores as a failure and `on_error: skip` silently swallows it.
+- **`claude-opus-5-5` is last on purpose, and it is the only Claude rung.** Anthropic returns no logprobs, so that rung can be *arrived at* but never *scored*. Moving it earlier — or adding a second Claude rung ahead of it — means switching `confidence_method` to `margin` or `hybrid`, or the rung scores as a failure and `on_error: skip` silently swallows it. Escalation goes to Opus, not Sonnet, so every escalated turn is billed at Opus rates; tune the threshold with that in mind. `muse-glimmer` is deliberately not a rung: its logprob pass-through is unverified and it is the candidate most likely to be down.
 - **Signals are keyword-only today (Step 2a).** Lexical, so they miss paraphrases. That is the accepted trade for a stack that routes correctly before any classifier weights are on the box. The Step 2b upgrade to the domain classifier is sketched in a commented block in `config.yaml`.
 
 ---
@@ -148,7 +178,7 @@ Both `ENVOY_*_ADDRESS` variables matter: they place the ext_proc cluster. If the
 - One **route** per `providers.models` entry, matched on `x-selected-model` exact-equals the model name.
 - One **cluster** per model. All of them resolve to `litellm:4000` — the generator emits a cluster per model and there is no knob to collapse them into a shared `litellm_cluster`.
 - `LOGICAL_DNS` + `dns_lookup_family: V4_ONLY`, because `litellm` is a name and not an IP.
-- A **default route** (no `x-selected-model`) to `models[0]` — currently `qwen3.6`. Reordering `providers.models` changes the fallback target.
+- A **default route** (no `x-selected-model`) to `models[0]` — currently `qwen3.8-solo`. Reordering `providers.models` changes the fallback target; keep a local alias first, never a Claude one.
 - `request_headers_to_remove` on the virtual host, dropping `x-vsr-looper-request` / `-secret` / `-decision` / `-iteration` and `x-authz-user-id` / `-groups` from every inbound request. This is upstream's own hardening and it is already correct — a caller on 8025 cannot forge a looper control header or spoof an identity.
 - Route `timeout` from `listeners[0].timeout` (1800s). `idleTimeout` stays at the template's hard-coded **1200s** — it is not parameterised, so a single upstream that goes quiet for more than 20 minutes is cut regardless.
 
@@ -159,16 +189,20 @@ Both `ENVOY_*_ADDRESS` variables matter: they place the ext_proc cluster. If the
 LiteLLM → router → LiteLLM is the design. Two independent guards keep it from becoming an infinite loop, and **both** must hold:
 
 1. **`providers.models` lists only concrete LiteLLM aliases.** Never `auto`, never `vllm-sr/auto`, never any other router entrypoint name. Every entry there becomes an Envoy route keyed on `x-selected-model`, so a router entrypoint listed there would route the router's own sub-requests straight back into itself and spin until the 1800 s listener timeout. The entrypoint name is namespaced `vllm-sr/auto` precisely so a collision is visible.
-2. **`SEMANTIC_ROUTER_LITELLM_KEY` is scoped to the candidates and nothing else.** Create it in the LiteLLM Admin UI restricted to `qwen3.6`, `qwen3.8`, `qwen3.8-solo`, `qwen3.8-flash`, `glm5.2`, `claude-sonnet-5`. With that scoping, a mis-edited `config.yaml` 401s on the first sub-request instead of looping. Give it a monthly budget too — a `remom` turn is six model calls and Anthropic is in the pool.
+2. **`SEMANTIC_ROUTER_LITELLM_KEY` is scoped to the candidates and nothing else.** Create it in the LiteLLM Admin UI restricted to exactly `qwen3.8-solo`, `muse-glimmer`, `claude-sonnet-5`, `claude-opus-4-8`, `claude-opus-5-5`. With that scoping, a mis-edited `config.yaml` 401s on the first sub-request instead of looping. `claude-opus-4-8` is not in `litellm_config.yaml` — it must exist as a model in LiteLLM's DB (Admin UI → Models) for the key to be scoped to it at all. Give the key a monthly budget too — three of its five aliases are Anthropic, an escalated catch-all turn is an Opus call, and a dead local candidate turns panel slots into Sonnet calls ([§ Fallbacks hide dead candidates](#fallbacks-hide-dead-candidates)).
 
 The LiteLLM-side `fallbacks` map deliberately does **not** list a router entrypoint as a fallback target:
 
 ```yaml
 fallbacks:
-  - {"auto": ["qwen3.8", "claude-sonnet-5"]}
+  - {"auto": ["qwen3.8-solo", "claude-sonnet-5"]}
 context_window_fallbacks:
-  - {"auto": ["qwen3.8-flash"]}
+  - {"auto": ["qwen3.8-solo"]}
 ```
+
+These fire on the caller's request to `auto` — under the caller's key, not on the router's sub-requests — so they are independent of the router key's five-alias scoping.
+
+> **Flag:** `context_window_fallbacks: auto -> [qwen3.8-solo]` is a no-op as written. `auto` and `qwen3.8-solo` both declare `max_input_tokens: 114688`, so a prompt too long for `auto` is too long for its fallback as well. A target with a larger window (`muse-glimmer` at 245760, or `qwen3.8-flash` at 458752) would make it do something. Left unchanged here; it is a LiteLLM-side decision.
 
 ---
 
@@ -177,7 +211,7 @@ context_window_fallbacks:
 | Variable | Held by | Notes |
 |---|---|---|
 | `SEMANTIC_ROUTER_LISTENER_KEY` | Envoy (Lua filter) + LiteLLM (`api_key` on the `auto` alias) | Bearer token for `PORT_SEMANTIC_ROUTER`. `openssl rand -hex 32`. Anyone holding it can spend through the whole candidate pool, Anthropic included. |
-| `SEMANTIC_ROUTER_LITELLM_KEY` | `vllm-sr-router` env, resolved via `backend_refs[].api_key_env` — **and** Envoy (Lua filter) | LiteLLM virtual key, scoped to the six candidates. Also a valid bearer on `PORT_SEMANTIC_ROUTER`, because the router's looper sub-requests carry it — see below. See [§ Recursion guard](#recursion-guard). |
+| `SEMANTIC_ROUTER_LITELLM_KEY` | `vllm-sr-router` env, resolved via `backend_refs[].api_key_env` — **and** Envoy (Lua filter) | LiteLLM virtual key, scoped to the five candidates (`qwen3.8-solo`, `muse-glimmer`, `claude-sonnet-5`, `claude-opus-4-8`, `claude-opus-5-5`). Also a valid bearer on `PORT_SEMANTIC_ROUTER`, because the router's looper sub-requests carry it — see below. See [§ Recursion guard](#recursion-guard). |
 
 Both fail the stack when unset (`${VAR:?…}` in the compose file).
 
@@ -247,7 +281,7 @@ The response body carries a `route_diagnostics` object, and its `looper` section
 - **which decision matched** — if a code prompt shows `default_confidence`, the keyword signal missed; add the term to `code_kw`.
 - **which algorithm ran** — should be one of `confidence` / `ratings` / `remom` / `static`, matching [§ Recipe table](#recipe-table).
 - **which candidates were called, and which failed** — `on_error: skip` means a dead candidate is silently dropped, so a `remom` round that quietly degraded to two responses looks fine in the answer and only shows up here.
-- **how far confidence escalated** — a `default_confidence` turn that always reaches `claude-sonnet-5` means the threshold is wrong (remember: negative, closer to zero is more confident).
+- **how far confidence escalated** — a `default_confidence` turn that always reaches `claude-opus-5-5` means the threshold is wrong — or that `qwen3.8-solo` is down and LiteLLM is answering rung one from `claude-sonnet-5`, which has no logprobs to score (check spend-by-key before retuning) (remember: negative, closer to zero is more confident).
 
 Cross-check against the router's own logs (`make logs semantic-router vllm-sr-router`) and against LiteLLM spend-by-key in the Admin UI, which is the authoritative record of what was actually called.
 
@@ -264,7 +298,7 @@ Everything below was derived from the shipped `vllm-sr` 0.3.0 wheel's source, no
 - [ ] Confirm `global.router.auto_model_name: vllm-sr/auto` really is the trigger, and that a request with a concrete model name passes through unrouted.
 - [ ] Hit `/v1/models` and record exactly what it lists.
 - [ ] One request per decision (plain / PII / code / math). Confirm the intended decision matches and capture a full `route_diagnostics.looper` payload.
-- [ ] Confirm logprobs survive LiteLLM for the vLLM aliases and for `qwen3.8-flash` (`"logprobs": true` on a plain LiteLLM call). If they do not, `confidence_method: avg_logprob` is dead and the catch-all decision needs `margin` or a self-verify method instead.
+- [ ] Confirm logprobs survive LiteLLM for `qwen3.8-solo` (the confidence rung) and for `muse-glimmer` (`"logprobs": true` on a plain LiteLLM call). If they do not, `confidence_method: avg_logprob` is dead and the catch-all decision needs `margin` or a self-verify method instead.
 - [ ] Note how the router treats `reasoning_content` from the `qwen3` / `muse_glimmer` reasoning parsers — whether it counts toward the confidence score.
 - [ ] `docker inspect` the CLI-started router and Envoy containers and diff the mounts / env / entrypoint against `docker-compose.semantic-router.yml`.
 - [ ] List `~/.vllm-sr/models` (or wherever the router put them) and record **what** it downloaded and **how big** — this file currently cannot name the bundles or their sizes.
@@ -284,12 +318,13 @@ Manual — there is no test suite anywhere in this repo.
 | Init guards work | Break a field in `config.yaml`, then `make up semantic-router` | init exits non-zero with the CLI's validation error and the router never starts |
 | Envoy drift guard works | Edit `config.yaml` without re-rendering, then `make up semantic-router` | init fails with a unified diff naming the stale file |
 | Each decision answers | Postman `Envoy listener (direct)` folder, all four prompts | 200 with content; `route_diagnostics.looper` names the intended decision and candidates |
-| Decision matching | One prompt per decision | router log shows the intended decision; the PII prompt shows **no** `claude-sonnet-5` spend on the router's virtual key |
-| Confidence escalation | A trivial prompt vs. a hard one | trivial stops at `qwen3.6`; hard escalates; tune `threshold` toward a 20–40 % escalation rate |
-| Concurrency budget | 3 simultaneous `coding_ratings` chats while watching vLLM + llama.cpp logs | no slot starvation, no 5xx; LiteLLM retries stay at 0 |
+| Decision matching | One prompt per decision | router log shows the intended decision; the PII prompt shows `qwen3.8-solo` and **no** Claude spend of any kind on the router's virtual key |
+| Confidence escalation | A trivial prompt vs. a hard one | trivial stops at `qwen3.8-solo`; hard escalates to `claude-opus-5-5`; tune `threshold` toward a 20–40 % escalation rate (every escalation is an Opus call) |
+| Concurrency budget | 3 simultaneous `coding_ratings` chats while watching the `qwen3.8-solo` and `muse-glimmer` vLLM logs — once idle, once during a classifier batch | no 5xx; LiteLLM retries stay at 0; vLLM's waiting-queue depth is the cost of sharing `muse-glimmer` with the classifier |
 | Streaming in Open WebUI | Chat on `auto` | UI shows a waiting state (not an error) while the round runs; the reply renders in full |
-| LiteLLM fallback | `make down semantic-router vllm-sr-envoy`, then call `auto` | LiteLLM serves it from `qwen3.8`; no 5xx |
-| Context-window fallback | Send a prompt over 114688 input tokens to `auto` | routed to `qwen3.8-flash`, not rejected |
+| LiteLLM fallback | `make down semantic-router vllm-sr-envoy`, then call `auto` | LiteLLM serves it from `qwen3.8-solo` (then `claude-sonnet-5`); no 5xx |
+| Context-window fallback | Send a prompt over 114688 input tokens to `auto` | **expected to fail today**: the fallback target `qwen3.8-solo` has the same 114688 window, so the prompt is rejected — see the flag under [§ Recursion guard](#recursion-guard). Passes once the target has a larger window |
+| Silent Anthropic fallback | Bring `qwen3.8` up (so `muse-glimmer` is down), send a `coding_ratings` prompt | answers arrive with no router-side error, and spend-by-key on the router's key shows a `claude-sonnet-5` call where `muse-glimmer` should be — confirms [§ Fallbacks hide dead candidates](#fallbacks-hide-dead-candidates) |
 | Cost visibility | LiteLLM Admin UI → spend by key | sub-requests attributed to the router's virtual key; the Anthropic share is visible |
 | Metrics | `curl localhost:9090` → prometheus targets | the `semantic-router` job is UP against `vllm-sr-router:9190` |
 | Exposure | `ss -ltnp` on the box | only `8025` (and `8026` on loopback if enabled); `50051` / `8080` / `9190` / `9901` absent |
@@ -301,7 +336,7 @@ Manual — there is no test suite anywhere in this repo.
 
 Written from the v0.3.0 wheel's source. **No part of this has been run against a live router.** In descending order of how much it would hurt:
 
-1. **That the looper's sub-requests pass the Envoy bearer check.** `pkg/looper/client.go` (v0.3.0) sets `Authorization: Bearer <accessKey>` from the candidate's backend `api_key`, so the LiteLLM virtual key is in the Lua `VALID_KEYS` table alongside the listener key. What is *not* confirmed by running it: that the Go router really resolves `api_key_env` into that `accessKey` for a `base_url`-style `backend_refs` entry, and that nothing else in the sub-request path (the `x-vsr-looper-*` headers, the per-route Lua) rejects it. If the router log shows 401s from `vllm-sr-envoy` on looper calls, this is where to look. Diagnostic: `docker exec vllm-sr-router curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $SEMANTIC_ROUTER_LITELLM_KEY" -H 'x-selected-model: qwen3.6' -H 'content-type: application/json' -d '{"model":"qwen3.6","messages":[{"role":"user","content":"hi"}]}' http://vllm-sr-envoy:8899/v1/chat/completions` should be `200`, not `401`.
+1. **That the looper's sub-requests pass the Envoy bearer check.** `pkg/looper/client.go` (v0.3.0) sets `Authorization: Bearer <accessKey>` from the candidate's backend `api_key`, so the LiteLLM virtual key is in the Lua `VALID_KEYS` table alongside the listener key. What is *not* confirmed by running it: that the Go router really resolves `api_key_env` into that `accessKey` for a `base_url`-style `backend_refs` entry, and that nothing else in the sub-request path (the `x-vsr-looper-*` headers, the per-route Lua) rejects it. If the router log shows 401s from `vllm-sr-envoy` on looper calls, this is where to look. Diagnostic: `docker exec vllm-sr-router curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $SEMANTIC_ROUTER_LITELLM_KEY" -H 'x-selected-model: qwen3.8-solo' -H 'content-type: application/json' -d '{"model":"qwen3.8-solo","messages":[{"role":"user","content":"hi"}]}' http://vllm-sr-envoy:8899/v1/chat/completions` should be `200`, not `401`.
 2. **The whole `global:` block.** `UserConfig.global_` is `Dict[str, Any]` in the CLI — `vllm-sr validate` does not check inside it, so `global.router.auto_model_name`, `global.router.include_config_models_in_list`, `global.integrations.looper.{endpoint,timeout_seconds}`, `global.services.{response_api,router_replay,startup_status}` and `global.stores.semantic_cache` are all validated only by the **Go router at startup**. The key names come from `cli/config_migration.py::_place_global_block`, which is the CLI's own inventory of canonical keys, but their accepted *shapes* are inferred. If the router refuses to start, this block is the first suspect.
 3. **That `auto_model_name` is really the entrypoint mechanism.** v0.3.0 has no `entrypoints:` block, `UserConfig` is `extra="forbid"`, and this is the only key that looks like "the name that triggers routing". Not confirmed by running it.
 4. **`route_diagnostics.looper`'s field names.** Referenced throughout this document; the shape is not in the wheel.

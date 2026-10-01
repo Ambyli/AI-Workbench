@@ -14,6 +14,7 @@ $(eval $(call service,llama,glm5.2 qwen3.8-flash glm5.3-flash))
 $(eval $(call service,kokoro,kokoro-app kokoro-api))
 $(eval $(call service,madlad,madlad-app madlad-api))
 $(eval $(call service,classifier,classifier))
+$(eval $(call service,detector,detector))
 $(eval $(call service,openwebui,openwebui))
 $(eval $(call service,oauth2-proxy,oauth2-proxy oauth2-assets))
 $(eval $(call service,cloudflared,cloudflared))
@@ -25,6 +26,7 @@ $(eval $(call service,n8n,n8n-db n8n))
 $(eval $(call service,open-terminal,open-terminal))
 $(eval $(call service,trino,hive-metastore-db hive-metastore minio minio-init trino-auth-init trino-coordinator trino-mcp superset-db superset))
 $(eval $(call service,semantic-router,vllm-sr-models-init vllm-sr-router vllm-sr-envoy))
+$(eval $(call service,supabase,supabase-db supavisor auth rest realtime imgproxy storage meta studio supabase-api functions))
 
 # Introspection targets consumed by the `_make_ai_complete` bash completion
 # function (installed once via `eval "$$(make completion-bash)"`). The

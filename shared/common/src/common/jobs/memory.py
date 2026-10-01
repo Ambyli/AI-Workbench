@@ -23,12 +23,16 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Iterator, Optional
+from typing import Any, Iterable, Iterator, Optional
 from uuid import uuid4
 
 from pydantic import BaseModel
 
 from .model import JobBase, JobsListResponse
+
+# Phases a retention sweep may delete — see ``expired_job_ids``. Same set as
+# ``common.jobs.sqlite._TERMINAL_PHASES``.
+_TERMINAL_PHASES = ("completed", "failed", "cancelled")
 
 
 @dataclass
@@ -262,3 +266,52 @@ class InMemoryRegistry:
         context exits. Provided for router symmetry with the SQLite backend.
         Returns ``False`` always."""
         return False
+
+    def expired_job_ids(
+        self,
+        cutoff: datetime,
+        phases: Iterable[str] = _TERMINAL_PHASES,
+        *,
+        limit: Optional[int] = None,
+    ) -> list[str]:
+        """Ids of jobs in ``phases`` created before ``cutoff``, oldest first.
+
+        Same contract as ``SqliteRegistry.expired_job_ids`` so a retention
+        sweep (``common.vision.ArtifactStore.sweep``) can use either backend
+        without branching. In practice this backend rarely has anything to
+        report: jobs here auto-unregister when their context exits, so only a
+        job still inside its block can be seen at all — and those are never in
+        a terminal phase. It exists for symmetry, and so a consumer that
+        swaps backends does not silently lose its sweep.
+
+        An unparseable ``created_at`` is treated as NOT expired: losing a job
+        to a formatting quirk is worse than keeping a stale record one more
+        cycle.
+        """
+        allowed = set(phases)
+        if not allowed:
+            return []
+        if cutoff.tzinfo is None:
+            cutoff = cutoff.replace(tzinfo=timezone.utc)
+
+        with self._lock:
+            candidates = [
+                (j.created_at, j.job_id)
+                for j in self._store.values()
+                if j.phase in allowed
+            ]
+
+        expired: list[tuple[str, str]] = []
+        for created_at, job_id in candidates:
+            try:
+                created = datetime.fromisoformat(str(created_at))
+            except ValueError:
+                continue
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            if created < cutoff:
+                expired.append((created_at, job_id))
+
+        expired.sort()
+        ids = [job_id for _, job_id in expired]
+        return ids[:limit] if limit is not None else ids

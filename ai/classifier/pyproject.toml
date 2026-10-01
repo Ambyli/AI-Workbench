@@ -7,11 +7,20 @@ dependencies = [
     "fastapi",
     "uvicorn",
     "httpx",
-    "opencv-python-headless",
+    # <5: OpenCV 5.0 removed cv2.CascadeClassifier, which detect_faces needs.
+    "opencv-python-headless>=4.10,<5",
     "numpy",
     "pydantic",
     "python-multipart",
     "Pillow",
+    # common.documents — document loading, OCR, and text matching. Listed
+    # here rather than pulled via common[documents] so this service's lock
+    # entry is explicit. rapidocr 3.x does NOT depend on an inference engine,
+    # so onnxruntime has to be requested separately.
+    "pymupdf>=1.28.2",
+    "python-docx>=1.2.0",
+    "rapidocr>=3.9.2,<4",
+    "onnxruntime>=1.22.0",
     "aiosqlite",
     "prometheus-client",
     "prometheus-fastapi-instrumentator",

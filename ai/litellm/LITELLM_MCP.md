@@ -45,6 +45,10 @@ Use `claude mcp add` to connect MCP servers to Claude Code. The server name in t
 claude mcp add --transport http -s user kokoro http://192.168.5.233:4001/mcp/kokoro_tts \
   --header "Authorization: Bearer sk-your-master-key"
 
+# Open-vocabulary detector MCP (tool: detect_objects)
+claude mcp add --transport http -s user detector http://192.168.5.233:4001/mcp/detector \
+  --header "Authorization: Bearer sk-your-master-key"
+
 # Phoenix MCP
 claude mcp add --transport http -s user phoenix http://192.168.5.233:4001/mcp/phoenix \
   --header "Authorization: Bearer sk-your-phoenix-auth-value"

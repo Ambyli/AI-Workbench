@@ -1,0 +1,236 @@
+{
+  "info": {
+    "name": "detector",
+    "description": "Open-vocabulary object detection — POST an image and a list of free-text labels, get boxes back in the image's ORIGINAL pixel coordinates. No fixed class list and no fine-tuning: \"swimming pool\", \"roof vent\" and \"solar panel\" work exactly as well as \"car\" does.\n\nCalled through the LiteLLM pass-through registered in ai/litellm/litellm_config.yaml (`pass_through_endpoints` → `/v1/detector` → `http://detector:8000`, `include_subpath: true`, methods GET/POST, `forward_headers: true`). Every request is authenticated with a Bearer token from a LiteLLM virtual key. Set the collection variables `litellm` (e.g. http://localhost:4001) and `virtual master key` (an sk-… key issued from the LiteLLM Admin UI → Virtual Keys) — every request inherits them via collection-level auth. See ai/detector/DETECTOR.md for the operator guide and ai/litellm/LITELLM.md for issuing virtual keys.\n\nDirect base URL (bypassing LiteLLM, only useful inside the ai_shared network or when PORT_DETECTOR is published): http://detector:8000 or http://<host>:${PORT_DETECTOR} (default 8021). There is NO auth on the service itself — the pass-through is what does the bearer check, so do not publish that port on an untrusted network.\n\nSynchronous, not a job queue: /detect blocks until the model answers (a few hundred ms on the GPU, a few seconds on the DETECTOR_DEVICE=cpu fallback) and returns the boxes inline. One inference runs at a time, so concurrent callers queue.\n\nCoordinates: every `box` is `[x1, y1, x2, y2]`, top-left origin, in the ORIGINAL pixels of the image you sent (after EXIF transpose), clipped to the image. The service's internal resize to DETECTOR_MAX_IMAGE_SIDE and OWLv2's square padding are both undone before the response — see DETECTOR.md § Coordinates.\n\nScores are NOT calibrated probabilities. 0.65 is a confident detection for OWLv2; the same number on another label in another photo means something else. Treat `threshold` as a knob to turn, not a percentage — 0.2–0.3 is the normal working range.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{virtual master key}}",
+        "type": "string"
+      }
+    ]
+  },
+  "variable": [
+    {
+      "key": "litellm",
+      "value": "http://localhost:4001",
+      "type": "string",
+      "description": "LiteLLM base URL. Localhost publish is 4001 (PORT_LITELLM); on ai_shared it's http://litellm:4000; behind cloudflared it's https://your-litellm-host."
+    },
+    {
+      "key": "virtual master key",
+      "value": "sk-your-litellm-virtual-key",
+      "type": "string",
+      "description": "LiteLLM virtual key (Admin UI → Virtual Keys, or /key/generate API). Scope the key to allow the /v1/detector pass-through. Sent as `Authorization: Bearer {{virtual master key}}` by the collection-level auth, then forwarded to the detector by LiteLLM because the pass-through has `forward_headers: true`."
+    },
+    {
+      "key": "imageUrl",
+      "value": "https://upload.wikimedia.org/wikipedia/commons/thumb/a/a9/Example.jpg/800px-Example.jpg",
+      "type": "string",
+      "description": "A PUBLIC http(s) image URL for the JSON-with-URL request. It is SSRF-checked before the fetch (common.net.validate_url): anything resolving to an RFC1918, loopback, or link-local address is a 400, so a LAN or container-name URL will NOT work here on purpose."
+    }
+  ],
+  "item": [
+    {
+      "name": "GET /health",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{litellm}}/v1/detector/health",
+          "host": ["{{litellm}}"],
+          "path": ["v1", "detector", "health"]
+        },
+        "description": "Liveness plus the one thing that actually matters: is the model resident?\n\n**Returns 200** `{\"status\": \"ok\", \"model\", \"family\", \"device\", \"configured_device\", \"loaded\": true, \"error\": null, \"default_threshold\", \"max_image_side\", \"max_labels\"}`.\n\n**Returns 503** with `\"status\": \"degraded\"`, `\"loaded\": false` and the loader's error in `error` while the weights are not resident — during the first-start load, or permanently after a failed one (a bad DETECTOR_MODEL, a Grounding DINO id, no disk). That is deliberate: a container that is up with a failed model load is not healthy, and the Docker healthcheck should fail it rather than route traffic to a service that can only answer 503.\n\n`device` is what is actually in use and is not always `configured_device` — `cuda` on a host where torch sees no GPU falls back to `cpu` with a warning rather than refusing to start. See DETECTOR.md § CPU fallback."
+      },
+      "response": []
+    },
+    {
+      "name": "POST /detect — multipart upload",
+      "request": {
+        "method": "POST",
+        "header": [],
+        "body": {
+          "mode": "formdata",
+          "formdata": [
+            {
+              "key": "file",
+              "type": "file",
+              "description": "Repo fixture: unit-tests/classifier/Neighborhood.jpeg — a 7770×1999 street panorama. Re-select the file in Postman if your working directory differs. Any JPEG/PNG works; images below 32 px on a side are refused with a 400.",
+              "src": "unit-tests/classifier/Neighborhood.jpeg"
+            },
+            {
+              "key": "labels",
+              "type": "text",
+              "description": "A JSON array, a comma list (`tree, house`), or one bare name — all three are accepted, because a multipart form carries strings and an n8n node or a curl user will produce all of them. Duplicates collapse; order and spelling are preserved exactly, because the label is how you match a box back to your own criterion. Capped at DETECTOR_MAX_LABELS (32).",
+              "value": "[\"tree\", \"house\", \"car\", \"swimming pool\"]"
+            },
+            {
+              "key": "threshold",
+              "type": "text",
+              "description": "Confidence floor 0–1. Omit for DETECTOR_DEFAULT_THRESHOLD (0.25). 0.2 is a good starting point on real photos.",
+              "value": "0.2"
+            },
+            {
+              "key": "max_per_label",
+              "type": "text",
+              "description": "Keep at most this many boxes per label, highest score first. Omit to keep every box above the threshold.",
+              "value": "5"
+            }
+          ]
+        },
+        "url": {
+          "raw": "{{litellm}}/v1/detector/detect",
+          "host": ["{{litellm}}"],
+          "path": ["v1", "detector", "detect"]
+        },
+        "description": "Find every requested label in one uploaded image.\n\n**Expect** on this fixture at threshold 0.2: several `house` boxes (best ~0.65) and several `tree` boxes (best ~0.32), and EMPTY lists for `car` and `swimming pool` — which is the assertion worth making. Every requested label gets a key in `by_label` even with no hits, because \"looked and found none\" and \"did not look\" are different answers and a missing key makes them indistinguishable.\n\n**Returns** `model`, `family`, `device`, `elapsed_ms` (inference only, not the round trip), the `threshold` actually applied, `image` (the ORIGINAL size every box is expressed in), `counts`, `by_label`, and `detections` — the same boxes flat in score order, for a caller drawing one overlay.\n\n**Errors:** 400 (bad labels/threshold, undecodable or too-small image, unsupported Content-Type), 503 (model not loaded — check GET /health).\n\nSee ai/detector/DETECTOR.md § POST /detect."
+      },
+      "response": []
+    },
+    {
+      "name": "POST /detect — JSON with a base64 image",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          },
+          "raw": "{\n  \"image\": {\n    \"data\": \"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==\",\n    \"type\": \"base64\"\n  },\n  \"labels\": [\"tree\", \"house\"],\n  \"threshold\": 0.25,\n  \"max_per_label\": 5\n}"
+        },
+        "url": {
+          "raw": "{{litellm}}/v1/detector/detect",
+          "host": ["{{litellm}}"],
+          "path": ["v1", "detector", "detect"]
+        },
+        "description": "The same request as a JSON body — what another service sends. This is the shape ai/classifier/detector/client.py uses: it base64s the ≤1000-px working page image and posts one call per page carrying every label for that page.\n\nThe `data` value shipped here is a 1×1 PNG placeholder so the request is runnable as-is; it will come back with a **400** (\"Image too small\") because images below 32 px on a side are refused — below that the model's answers are noise. Paste a real base64 image to get boxes. A `data:image/png;base64,…` prefix is tolerated.\n\n`image.type` is `base64` or `url`. For `url` see the next request.\n\n**Returns** the same body as the multipart spelling. **Errors:** 400 (invalid base64, undecodable or too-small image), 503 (model not loaded)."
+      },
+      "response": []
+    },
+    {
+      "name": "POST /detect — JSON with an image URL (SSRF-checked)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          },
+          "raw": "{\n  \"image\": {\n    \"data\": \"{{imageUrl}}\",\n    \"type\": \"url\"\n  },\n  \"labels\": \"person, bicycle, dog\",\n  \"threshold\": 0.2\n}"
+        },
+        "url": {
+          "raw": "{{litellm}}/v1/detector/detect",
+          "host": ["{{litellm}}"],
+          "path": ["v1", "detector", "detect"]
+        },
+        "description": "Fetch the image yourself-free: hand the detector a URL and it fetches it.\n\n**The URL is SSRF-checked first** (`common.net.validate_url`). This container sits on `ai_shared`, so an unchecked URL input would be a request to proxy into the private network — anything resolving to an RFC1918, loopback, or link-local address is a **400**, and EVERY resolved address must clear the list, not just the first. A container-name or LAN URL will not work here on purpose; set the `imageUrl` collection variable to a public image.\n\nNote `labels` here is a comma STRING rather than an array — both spellings are accepted in JSON as well as multipart.\n\n**Errors:** 400 (blocked or unresolvable URL, bad scheme, undecodable image), 502 (the remote host failed the fetch or timed out — DETECTOR_FETCH_TIMEOUT, 20 s), 503 (model not loaded)."
+      },
+      "response": []
+    },
+    {
+      "name": "GET /metrics",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{litellm}}/v1/detector/metrics",
+          "host": ["{{litellm}}"],
+          "path": ["v1", "detector", "metrics"]
+        },
+        "description": "Prometheus exposition for the HTTP surface (request counts, latency histograms, in-progress gauge), added by prometheus_fastapi_instrumentator — the same instrumentation the classifier uses.\n\nScraped by the `prometheus` container as the `detector` job (`ai/litellm/prometheus.yml`), so you normally read this in Prometheus rather than here; this request is for checking the endpoint is alive after a recreate.\n\n**Returns** text/plain, not JSON."
+      },
+      "response": []
+    },
+    {
+      "name": "MCP",
+      "description": "The MCP surface, registered with LiteLLM as the `detector` server (`ai/litellm/litellm_config.yaml` → `mcp_servers`). One tool: `detect_objects`.\n\nThese requests speak JSON-RPC 2.0 over HTTP to the service's own `/mcp` endpoint through the pass-through. A model reaching the tool through LiteLLM's MCP routing never builds these by hand — they are here for debugging the tool definition and its answers. LiteLLM does NOT execute tool calls for you; see ai/litellm/LITELLM_MCP.md for the orchestration loop.\n\nMCP requires both `application/json` and `text/event-stream` in Accept.",
+      "item": [
+        {
+          "name": "tools/list",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json, text/event-stream"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              },
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 1,\n  \"method\": \"tools/list\",\n  \"params\": {}\n}"
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/detector/mcp/",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "detector", "mcp", ""]
+            },
+            "description": "List the tools this server exposes.\n\n**Expect** exactly one: `detect_objects`, with an input schema of `image` (string), `labels` (array of strings), `threshold` (number or null) and `max_per_label` (integer or null).\n\nUse this to confirm the tool definition a model will actually see after a change to the `@mcp.tool()` docstring in ai/detector/app.py — the docstring IS the description the model reads."
+          },
+          "response": []
+        },
+        {
+          "name": "tools/call — detect_objects",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json, text/event-stream"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              },
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 2,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"detect_objects\",\n    \"arguments\": {\n      \"image\": \"{{imageUrl}}\",\n      \"labels\": [\"person\", \"bicycle\", \"dog\"],\n      \"threshold\": 0.2,\n      \"max_per_label\": 5\n    }\n  }\n}"
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/detector/mcp/",
+              "host": ["{{litellm}}"],
+              "path": ["v1", "detector", "mcp", ""]
+            },
+            "description": "Call the tool the way a model does.\n\n`image` is an http(s) URL or base64 bytes — **prefer a URL**; base64 of a photo is a very large tool argument and every byte of it goes through the model's context. URLs are SSRF-checked exactly as on POST /detect.\n\n**Returns** the same body as POST /detect as a JSON string, minus the flat `detections` list (redundant with `by_label`, and the bulky half — a model reading this wants \"what, where, how sure\" once).\n\n**Errors are returned as data, not as a JSON-RPC error**: `{\"error\": \"…\", \"status\": 400}`. A tool that raises gives a model nothing to act on, so a blocked URL, a bad label list, or an unloaded model all come back as a readable sentence it can relay or retry against."
+          },
+          "response": []
+        }
+      ]
+    }
+  ]
+}

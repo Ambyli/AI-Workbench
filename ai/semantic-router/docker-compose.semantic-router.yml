@@ -211,7 +211,7 @@ services:
       - router_net
     ports:
       # The ONLY published port in this stack. 9901 (admin) stays inside.
-      - "${PORT_SEMANTIC_ROUTER:-8021}:8899"
+      - "${PORT_SEMANTIC_ROUTER:-8025}:8899"
     # Bypasses the image's /docker-entrypoint.sh and execs the binary
     # directly, matching cli/docker_start.py::_build_envoy_runtime_command.
     # `--log-level debug` is in the CLI's args and is dropped here on
@@ -272,7 +272,7 @@ services:
       - shared
       - router_net
     ports:
-      - "127.0.0.1:${PORT_SEMANTIC_ROUTER_DASHBOARD:-8022}:8700"
+      - "127.0.0.1:${PORT_SEMANTIC_ROUTER_DASHBOARD:-8026}:8700"
     # cli/docker_start.py::_build_dashboard_runtime_command -- entrypoint
     # plus the single config-path argument.
     entrypoint: /app/start-dashboard.sh

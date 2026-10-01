@@ -54,7 +54,7 @@
 #   Header stripping is real and already correct. The virtual host drops
 #   x-vsr-looper-request / -secret / -decision / -iteration and
 #   x-authz-user-id / -groups from every INBOUND request, so a caller on
-#   port 8021 cannot forge a looper control header or spoof an identity.
+#   port 8025 cannot forge a looper control header or spoof an identity.
 #   This is upstream's own hardening, not an addition.
 #
 #   Bodies are BUFFERED in both directions (processing_mode). The router

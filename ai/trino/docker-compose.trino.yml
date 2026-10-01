@@ -255,6 +255,16 @@ services:
       ENERFLO_LEADS_DB_USER: ${ENERFLO_LEADS_DB_USER}
       ENERFLO_LEADS_DB_PASSWORD: ${ENERFLO_LEADS_DB_PASSWORD}
       ENERFLO_LEADS_DB_SSLMODE: ${ENERFLO_LEADS_DB_SSLMODE:-require}
+      # Self-hosted Supabase Postgres (ai/supabase), on ai_shared — reached by
+      # service DNS at supabase-db:5432, no TLS needed on-box. Credentials are
+      # the read-only trino_reader role created by
+      # ai/supabase/volumes/db/trino-reader.sql. Consumed by
+      # catalogs/postgres_supabase.properties. An EMPTY password only fails
+      # this one catalog; an UNSET ${ENV:…} would stop the whole coordinator,
+      # which is why every value here carries a `:-` default.
+      SUPABASE_POSTGRES_DB: ${SUPABASE_POSTGRES_DB:-postgres}
+      SUPABASE_TRINO_READER_USER: ${SUPABASE_TRINO_READER_USER:-trino_reader}
+      SUPABASE_TRINO_READER_PASSWORD: ${SUPABASE_TRINO_READER_PASSWORD:-}
       # AWS Glue Data Catalog + S3 (what Athena queries). Consumed by
       # catalogs/aws_glue.properties via the Hive connector.
       AWS_GLUE_REGION: ${AWS_GLUE_REGION:-us-east-1}

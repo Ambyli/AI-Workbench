@@ -547,7 +547,7 @@ If Open WebUI shows "Server Connection Error" on play, `make logs openwebui` —
 #### Verifying a build
 
 ```bash
-docker image inspect openwebui-zeo:v0.11.3 --format '{{index .Config.Labels "com.zeoenergy.openwebui.patches"}}'
+docker image inspect openwebui-zeo:v0.11.4 --format '{{index .Config.Labels "com.zeoenergy.openwebui.patches"}}'
 docker exec openwebui test -f /app/backend/open_webui/utils/trusted_proxy.py && echo patched
 ```
 
@@ -591,6 +591,7 @@ User data in the `openwebui_data` volume is preserved across updates.
 **Upgrade notes:**
 
 - **v0.11.1 → v0.11.3** (2026-09-04): fixes the frontend stall on reasoning models where the Thinking block stayed open and the reply froze until generation finished ([#29035](https://github.com/open-webui/open-webui/issues/29035), fixed in v0.11.2). v0.11.3 also makes a failed DB migration stop cleanly instead of starting half-updated — some upgrades from 0.11.0–0.11.2 hit this as a missing `chat.timer_at` column ([#29280](https://github.com/open-webui/open-webui/issues/29280)). Snapshot the `openwebui_data` volume before upgrading and check `docker logs openwebui` on first start.
+- **v0.11.3 → v0.11.4** (2026-09-25): patch `0002` was regenerated for this tag. Upstream removed the `get_redis_client` import in `routers/auths.py` that anchored the patch's import hunk, so the old file failed the `--dry-run` step; the patched code itself is unchanged and every API it calls (`signup_handler`'s positional `profile_image_url`, `oauth_manager._process_picture_url`, `Users.update_user_profile_image_url_by_id`, `AIOHTTP_CLIENT_SESSION_SSL`, `GOOGLE_CLIENT_ID`) still exists with the same shape. v0.11.4 still has no native token verification for trusted-header mode, so the patch stays. Also note: v0.11.4 adds `ENABLE_LOGIN_FORM` to the Admin Settings → General save (`POST /api/v1/auths/admin/config` now writes `ui.enable_login_form` when the form sends it), so the shadowing row described in [Break-glass if Google itself is unreachable](#break-glass-if-google-itself-is-unreachable) can reappear after any admin save — re-run the `select key from config` check if the login form comes back.
 
 ### Notes
 

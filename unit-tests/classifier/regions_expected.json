@@ -1,0 +1,606 @@
+{
+  "_about": {
+    "what": "What regions_report.py asserts, keyed by Postman item name. Keys starting with an underscore are ignored.",
+    "shape": "{ \"<item name>\": { \"verdict\": \"PASS\"|null, \"http_status\": 400, \"criteria\": { \"<criterion>\": {\"status\": \"ok\"|\"skipped\"|\"error\", \"verdict\": \"PASS\"|null, \"min_regions\": 1, \"item_verdicts\": [\"FAIL\", \"PASS\"], \"region_pages\": [0, 1]} } } }",
+    "verdict_null": "A criterion with \"verdict\": null asserts NOTHING about the verdict. Every `llm` row is written that way on purpose: its score comes from a model, and a suite that claims to verify a model's judgement against a fixed answer is lying about what it measured.",
+    "min_regions": "Asserted for the deterministic paths (cv / ocr / pdf-text) where the fixtures' READMEs document a count. For `options.boxes` rows it is 0 — 'you may produce boxes, and if you do they will be drawn' — so nothing false is claimed either way.",
+    "http_status": "When present, the item is expected to be REJECTED at submit time and nothing else is asserted.",
+    "sources": [
+      "unit-tests/classifier/documents/README.md",
+      "unit-tests/classifier/regions/README.md",
+      "ai/classifier/API.md"
+    ],
+    "adding_a_case": "Add the Postman item, then an entry here. See unit-tests/classifier/REGIONS_REPORT.md.",
+    "status": "A criterion that is not evaluated has `status: \"skipped\"` and a null verdict (it used to be `verdict: \"SKIPPED\"`), so skipped rows assert the status instead. A `score: false` criterion has a null verdict by design.",
+    "local_mode": "Under --local, `llm` and `detector` criteria are dropped; a criterion that still reaches the model (a cv name with no OpenCV detector falls back to the llm) comes back status: error, and its checks and the overall verdict are recorded as skipped.",
+    "per_item": "A request may carry several documents, and every page is one item. \"item_verdicts\" asserts the criterion's per-unit answers in order (one per item — one per document for a text criterion with options.scope \"document\"): a verdict, or \"skipped\" / \"error\" for a unit that did not answer; null asserts nothing. \"region_pages\" is the sorted set of items its regions landed on. The criterion's own \"verdict\" is the AGGREGATED answer."
+  },
+  "invoice_native.pdf — native text, all four match modes": {
+    "verdict": "PASS",
+    "criteria": {
+      "Invoice #INV-2026-0042": {
+        "verdict": "PASS"
+      },
+      "Notice to Owner": {
+        "verdict": "PASS"
+      },
+      "Payment Terms: Net 30": {
+        "verdict": "PASS"
+      },
+      "total amount": {
+        "verdict": "PASS"
+      },
+      "lien waiver attached": {
+        "verdict": "FAIL"
+      },
+      "sharpness": {
+        "verdict": "PASS"
+      },
+      "document legibility": {
+        "verdict": null
+      }
+    }
+  },
+  "invoice_scanned.pdf — OCR does the work (ocr=auto)": {
+    "verdict": "PASS",
+    "criteria": {
+      "Notice to Owner": {
+        "verdict": "PASS"
+      },
+      "Invoice #INV-2026-0042": {
+        "verdict": "PASS"
+      },
+      "Payment Terms: Net 30": {
+        "verdict": "PASS"
+      },
+      "sharpness": {
+        "verdict": "PASS"
+      },
+      "document legibility": {
+        "verdict": null
+      }
+    }
+  },
+  "invoice_scanned.pdf — ocr never vs always (expect one FAIL)": {
+    "verdict": null,
+    "criteria": {
+      "Notice to Owner": {
+        "verdict": "FAIL"
+      },
+      "Notice to Owner (OCR)": {
+        "verdict": "PASS"
+      },
+      "sharpness": {
+        "verdict": "PASS"
+      }
+    }
+  },
+  "contract.txt — text-only document, cv SKIPS": {
+    "verdict": "PASS",
+    "criteria": {
+      "Limited Warranty": {
+        "verdict": "PASS"
+      },
+      "contract date": {
+        "verdict": "PASS"
+      },
+      "sharpness": {
+        "status": "skipped"
+      },
+      "mentions a warranty period": {
+        "verdict": null
+      }
+    }
+  },
+  "proposal.docx — paragraphs + table cells in document order": {
+    "verdict": "PASS",
+    "criteria": {
+      "Roofix Proposal": {
+        "verdict": "PASS"
+      },
+      "System Size | 8.4 kW": {
+        "verdict": "PASS"
+      },
+      "has faces": {
+        "status": "skipped"
+      },
+      "states the system size": {
+        "verdict": null
+      }
+    }
+  },
+  "photo_of_letter.png — badly shot but readable": {
+    "verdict": "PASS",
+    "criteria": {
+      "Notice to Owner": {
+        "verdict": "PASS"
+      },
+      "case number": {
+        "verdict": "PASS"
+      },
+      "sharpness": {
+        "verdict": "PASS"
+      },
+      "proper exposure": {
+        "verdict": "PASS"
+      },
+      "document legibility": {
+        "verdict": null
+      }
+    }
+  },
+  "photo_of_letter_blurry.png — sharpness FAIL cascades": {
+    "verdict": "MARGINAL",
+    "criteria": {
+      "Notice to Owner": {
+        "verdict": "PASS"
+      },
+      "case number": {
+        "verdict": "FAIL"
+      },
+      "sharpness": {
+        "verdict": "FAIL"
+      },
+      "document legibility": {
+        "status": "skipped"
+      }
+    }
+  },
+  "unsupported_legacy.doc — expect 400": {
+    "http_status": 400
+  },
+  "invoice_two_page.pdf — two items, a sentence across the page break (scope: document)": {
+    "verdict": "MARGINAL",
+    "criteria": {
+      "Net 30": {
+        "verdict": "PASS",
+        "item_verdicts": [
+          "FAIL",
+          "PASS"
+        ],
+        "region_pages": [
+          1
+        ]
+      },
+      "remit to Acme (scope: document)": {
+        "verdict": "PASS",
+        "item_verdicts": [
+          "PASS"
+        ],
+        "min_regions": 2,
+        "region_pages": [
+          0,
+          1
+        ]
+      },
+      "remit to Acme (per page)": {
+        "verdict": "FAIL",
+        "item_verdicts": [
+          "FAIL",
+          "FAIL"
+        ]
+      },
+      "NOTICE TO OWNER on every page": {
+        "verdict": "FAIL",
+        "item_verdicts": [
+          "PASS",
+          "FAIL"
+        ]
+      },
+      "sharpness": {
+        "verdict": "PASS",
+        "item_verdicts": [
+          "PASS",
+          "PASS"
+        ]
+      }
+    }
+  },
+  "invoice_native.pdf + photo_of_letter.png + contract.txt — three documents, one request": {
+    "verdict": "PASS",
+    "criteria": {
+      "Notice to Owner": {
+        "verdict": "PASS",
+        "item_verdicts": [
+          "PASS",
+          "PASS",
+          "FAIL"
+        ],
+        "min_regions": 2,
+        "region_pages": [
+          0,
+          1
+        ]
+      },
+      "Notice to Owner in every document": {
+        "verdict": "FAIL",
+        "item_verdicts": [
+          "PASS",
+          "PASS",
+          "FAIL"
+        ]
+      },
+      "sharpness": {
+        "verdict": "PASS",
+        "item_verdicts": [
+          "PASS",
+          "PASS",
+          "skipped"
+        ]
+      },
+      "has text": {
+        "status": "ok",
+        "min_regions": 1,
+        "region_pages": [
+          0,
+          1
+        ],
+        "item_verdicts": [
+          null,
+          null,
+          "skipped"
+        ]
+      },
+      "mentions a warranty": {
+        "verdict": null
+      }
+    }
+  },
+  "greenery_and_sky.png — three mask detectors, three polygon sets": {
+    "verdict": "PASS",
+    "criteria": {
+      "has sky": {
+        "verdict": "PASS",
+        "min_regions": 1
+      },
+      "has vegetation": {
+        "verdict": "PASS",
+        "min_regions": 1
+      },
+      "has water": {
+        "verdict": "PASS",
+        "min_regions": 2
+      },
+      "sharpness": {
+        "verdict": "FAIL",
+        "min_regions": 0
+      }
+    }
+  },
+  "text_blocks.png — merged text-block boxes + OCR line polygons": {
+    "verdict": null,
+    "criteria": {
+      "has text": {
+        "verdict": "MARGINAL",
+        "min_regions": 4
+      },
+      "Notice to Owner": {
+        "verdict": "PASS",
+        "min_regions": 1
+      },
+      "total amount": {
+        "verdict": "PASS",
+        "min_regions": 1
+      }
+    }
+  },
+  "invoice_native.pdf — native PDF rectangles (source=pdf-text)": {
+    "verdict": null,
+    "criteria": {
+      "Notice to Owner": {
+        "verdict": "PASS",
+        "min_regions": 1
+      },
+      "total amount": {
+        "verdict": "PASS",
+        "min_regions": 3
+      },
+      "has text": {
+        "verdict": null,
+        "min_regions": 1
+      }
+    }
+  },
+  "photo_of_letter.png — OCR line polygons on a skewed page": {
+    "verdict": "PASS",
+    "criteria": {
+      "Notice to Owner": {
+        "verdict": "PASS",
+        "min_regions": 1
+      }
+    }
+  },
+  "Neighborhood.jpeg — a real photo, and the empty-regions case": {
+    "verdict": null,
+    "criteria": {
+      "has sky": {
+        "verdict": "PASS",
+        "min_regions": 1
+      },
+      "has faces": {
+        "verdict": null,
+        "min_regions": 0
+      }
+    }
+  },
+  "Neighborhood.jpeg — the detector, scored with no LLM call": {
+    "verdict": null,
+    "criteria": {
+      "has sky": {
+        "verdict": "PASS",
+        "min_regions": 1
+      },
+      "has roof vent": {
+        "verdict": null,
+        "min_regions": 0
+      },
+      "has bicycle": {
+        "verdict": null,
+        "min_regions": 0
+      }
+    }
+  },
+  "text_blocks.png — locate without judging (score: false)": {
+    "criteria": {
+      "has text": {
+        "verdict": null,
+        "min_regions": 1
+      },
+      "Notice to Owner": {
+        "verdict": null,
+        "min_regions": 1
+      }
+    }
+  },
+  "Neighborhood.jpeg — the LLM enforcement loop (options.boxes)": {
+    "verdict": null,
+    "criteria": {
+      "solar panels": {
+        "verdict": null,
+        "min_regions": 0
+      },
+      "a parked car": {
+        "verdict": null,
+        "min_regions": 0
+      },
+      "image sharpness": {
+        "verdict": null,
+        "min_regions": 0
+      }
+    }
+  },
+  "invoice_native.pdf — pdf-text rectangles": {
+    "verdict": "PASS",
+    "criteria": {
+      "Invoice #INV-2026-0042": {
+        "verdict": "PASS",
+        "min_regions": 1
+      },
+      "Notice to Owner": {
+        "verdict": "PASS",
+        "min_regions": 1
+      },
+      "Payment Terms: Net 30": {
+        "verdict": "PASS",
+        "min_regions": 1
+      },
+      "total amount": {
+        "verdict": "PASS",
+        "min_regions": 3
+      },
+      "sharpness": {
+        "verdict": "PASS",
+        "min_regions": 0
+      },
+      "document legibility": {
+        "verdict": null,
+        "min_regions": 0
+      }
+    }
+  },
+  "invoice_scanned.pdf — OCR line polygons": {
+    "verdict": "PASS",
+    "criteria": {
+      "Notice to Owner": {
+        "verdict": "PASS",
+        "min_regions": 1
+      },
+      "Invoice #INV-2026-0042": {
+        "verdict": "PASS",
+        "min_regions": 1
+      },
+      "Payment Terms: Net 30": {
+        "verdict": "PASS",
+        "min_regions": 1
+      },
+      "sharpness": {
+        "verdict": "PASS",
+        "min_regions": 0
+      },
+      "document legibility": {
+        "verdict": null,
+        "min_regions": 0
+      }
+    }
+  },
+  "photo_of_letter.png — logo, stamp and signature (options.boxes)": {
+    "verdict": null,
+    "criteria": {
+      "Notice to Owner": {
+        "verdict": "PASS",
+        "min_regions": 1
+      },
+      "case number": {
+        "verdict": "PASS",
+        "min_regions": 1
+      },
+      "has text": {
+        "verdict": null,
+        "min_regions": 1
+      },
+      "has a signature": {
+        "verdict": null,
+        "min_regions": 0
+      },
+      "has a company logo": {
+        "verdict": null,
+        "min_regions": 0
+      },
+      "has an official stamp": {
+        "verdict": null,
+        "min_regions": 0
+      }
+    }
+  },
+  "photo_of_letter_blurry.png — the same marks, degraded": {
+    "verdict": null,
+    "criteria": {
+      "Notice to Owner": {
+        "verdict": "PASS",
+        "min_regions": 1
+      },
+      "case number": {
+        "verdict": "FAIL",
+        "min_regions": 0
+      },
+      "has text": {
+        "verdict": null,
+        "min_regions": 0
+      },
+      "has a signature": {
+        "verdict": null,
+        "min_regions": 0
+      },
+      "has a company logo": {
+        "verdict": null,
+        "min_regions": 0
+      },
+      "has an official stamp": {
+        "verdict": null,
+        "min_regions": 0
+      }
+    }
+  },
+  "proposal.docx — no page images, so no geometry": {
+    "verdict": "PASS",
+    "criteria": {
+      "Roofix Proposal": {
+        "verdict": "PASS",
+        "min_regions": 0
+      },
+      "System Size | 8.4 kW": {
+        "verdict": "PASS",
+        "min_regions": 0
+      },
+      "has faces": {
+        "status": "skipped",
+        "min_regions": 0
+      }
+    }
+  },
+  "contract.txt — snippets instead of rectangles": {
+    "verdict": "PASS",
+    "criteria": {
+      "Limited Warranty": {
+        "verdict": "PASS",
+        "min_regions": 0
+      },
+      "contract date": {
+        "verdict": "PASS",
+        "min_regions": 0
+      },
+      "sharpness": {
+        "status": "skipped",
+        "min_regions": 0
+      }
+    }
+  },
+  "invoice_native.pdf as a JSON body — same result as multipart": {
+    "verdict": "PASS",
+    "criteria": {
+      "Notice to Owner": {
+        "verdict": "PASS",
+        "min_regions": 1
+      },
+      "Invoice #INV-2026-0042": {
+        "verdict": "PASS",
+        "min_regions": 1
+      },
+      "total amount": {
+        "verdict": "PASS",
+        "min_regions": 3
+      },
+      "sharpness": {
+        "verdict": "PASS",
+        "min_regions": 0
+      }
+    }
+  },
+  "photo_of_letter.png — locate without judging, mixed types": {
+    "criteria": {
+      "Notice to Owner": {
+        "verdict": null,
+        "min_regions": 1
+      },
+      "has text": {
+        "verdict": null,
+        "min_regions": 1
+      },
+      "a signature": {
+        "verdict": null,
+        "min_regions": 0
+      }
+    }
+  },
+  "_pipelines": "The entries below belong to `--pipeline utility-bill` (regions_report.py § Pipelines): ONE POST /assess per bill with a single llm criterion (score: false, options.boxes: true) asking the vision model where the amount due is. Keys are `utility bill — where is the amount due? — <file name>` for the call itself (like any collection item) and `pipeline: utility bill — <file name>` for the localisation checks: box_accepted (the enforcement loop accepted a box) and amount_due_boxes_grid (every place the bill prints its amount due, hand-measured on the 0-1000 grid of the upright page; the accepted box must reach IoU >= 0.25 with at least one). An ad-hoc --document has no entries and its checks are recorded as skipped.",
+  "utility bill — where is the amount due? — utility_bill.jpeg": {
+    "criteria": {
+      "the amount due line: the words 'Amount Due' next to the dollar figure owed": {
+        "verdict": null,
+        "min_regions": 1
+      }
+    }
+  },
+  "pipeline: utility bill — utility_bill.jpeg": {
+    "box_accepted": true,
+    "amount_due_boxes_grid": [
+      [
+        550,
+        70,
+        698,
+        85
+      ],
+      [
+        603,
+        917,
+        800,
+        932
+      ]
+    ]
+  },
+  "utility bill — where is the amount due? — utility_bill_2.jpeg": {
+    "criteria": {
+      "the amount due line: the words 'Amount Due' next to the dollar figure owed": {
+        "verdict": null,
+        "min_regions": 1
+      }
+    }
+  },
+  "pipeline: utility bill — utility_bill_2.jpeg": {
+    "box_accepted": true,
+    "amount_due_boxes_grid": [
+      [
+        360,
+        142,
+        495,
+        172
+      ],
+      [
+        373,
+        641,
+        511,
+        671
+      ]
+    ]
+  }
+}

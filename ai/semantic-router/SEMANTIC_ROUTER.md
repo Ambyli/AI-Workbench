@@ -149,7 +149,7 @@ Both `ENVOY_*_ADDRESS` variables matter: they place the ext_proc cluster. If the
 - One **cluster** per model. All of them resolve to `litellm:4000` — the generator emits a cluster per model and there is no knob to collapse them into a shared `litellm_cluster`.
 - `LOGICAL_DNS` + `dns_lookup_family: V4_ONLY`, because `litellm` is a name and not an IP.
 - A **default route** (no `x-selected-model`) to `models[0]` — currently `qwen3.6`. Reordering `providers.models` changes the fallback target.
-- `request_headers_to_remove` on the virtual host, dropping `x-vsr-looper-request` / `-secret` / `-decision` / `-iteration` and `x-authz-user-id` / `-groups` from every inbound request. This is upstream's own hardening and it is already correct — a caller on 8021 cannot forge a looper control header or spoof an identity.
+- `request_headers_to_remove` on the virtual host, dropping `x-vsr-looper-request` / `-secret` / `-decision` / `-iteration` and `x-authz-user-id` / `-groups` from every inbound request. This is upstream's own hardening and it is already correct — a caller on 8025 cannot forge a looper control header or spoof an identity.
 - Route `timeout` from `listeners[0].timeout` (1800s). `idleTimeout` stays at the template's hard-coded **1200s** — it is not parameterised, so a single upstream that goes quiet for more than 20 minutes is cut regardless.
 
 ---
@@ -218,14 +218,14 @@ make up semantic-router
 
 | Port | Where | Published? |
 |---|---|---|
-| `8899` (Envoy listener) | `vllm-sr-envoy` | **yes** — `PORT_SEMANTIC_ROUTER`, default `8021` |
+| `8899` (Envoy listener) | `vllm-sr-envoy` | **yes** — `PORT_SEMANTIC_ROUTER`, default `8025` |
 | `9901` (Envoy admin) | `vllm-sr-envoy` | never — serves `/quitquitquit` and a config dump **containing the listener bearer token** |
 | `50051` (ext_proc gRPC) | `vllm-sr-router` | never |
 | `8080` (management API) | `vllm-sr-router` | never — the healthcheck hits it inside the container |
 | `9190` (metrics) | `vllm-sr-router` | never — prometheus scrapes `vllm-sr-router:9190` over `ai_shared` |
 | `8700` (dashboard) | `vllm-sr-dashboard` | `127.0.0.1` only, behind the `dashboard` compose profile |
 
-`8021` is **not** behind oauth2-proxy. The listener bearer token is the only thing in front of it. Do not expose it on an untrusted network; if you want it browser-reachable, front it at `chat.zeoenergy.com/vllm-sr/` through `OAUTH2_PROXY_UPSTREAMS` the way `/n8n/` and `/sandboxes/*` are done.
+`8025` is **not** behind oauth2-proxy. The listener bearer token is the only thing in front of it. Do not expose it on an untrusted network; if you want it browser-reachable, front it at `chat.zeoenergy.com/vllm-sr/` through `OAUTH2_PROXY_UPSTREAMS` the way `/n8n/` and `/sandboxes/*` are done.
 
 The dashboard can edit the live router config and has no auth of its own. Start it deliberately:
 
@@ -292,7 +292,7 @@ Manual — there is no test suite anywhere in this repo.
 | Context-window fallback | Send a prompt over 114688 input tokens to `auto` | routed to `qwen3.8-flash`, not rejected |
 | Cost visibility | LiteLLM Admin UI → spend by key | sub-requests attributed to the router's virtual key; the Anthropic share is visible |
 | Metrics | `curl localhost:9090` → prometheus targets | the `semantic-router` job is UP against `vllm-sr-router:9190` |
-| Exposure | `ss -ltnp` on the box | only `8021` (and `8022` on loopback if enabled); `50051` / `8080` / `9190` / `9901` absent |
+| Exposure | `ss -ltnp` on the box | only `8025` (and `8026` on loopback if enabled); `50051` / `8080` / `9190` / `9901` absent |
 | Key rotation | Change `SEMANTIC_ROUTER_LISTENER_KEY`, `make up semantic-router && make up litellm` | old key 401s at Envoy; `auto` through LiteLLM still works |
 
 ---

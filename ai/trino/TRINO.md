@@ -142,7 +142,7 @@ Clients that pinned the old fingerprint must re-trust.
 
 | Tool | Purpose |
 |---|---|
-| `list_catalogs()` | Every catalog Trino sees — `aws_glue`, `iceberg`, `postgres_litellm`, `postgres_phoenix`, `postgres_roofix`, `postgres_sandbox`, `supabase_ai_agents`, `supabase_enerflo_leads`, `system` |
+| `list_catalogs()` | Every catalog Trino sees — `aws_glue`, `iceberg`, `postgres_litellm`, `postgres_phoenix`, `postgres_roofix`, `postgres_sandbox`, `postgres_supabase`, `supabase_ai_agents`, `supabase_enerflo_leads`, `system` |
 | `list_schemas(catalog)` | Schemas under a catalog |
 | `list_tables(catalog, schema)` | Tables under a schema |
 | `describe_table(catalog, schema, table)` | `[{"name":…, "type":…}, …]` |
@@ -196,9 +196,13 @@ models get an accurate hint.
 - Convention: `<source>_<dataset>` — name by where the data lives, then
   what it is. `postgres_<subsystem>` for Postgres instances we run or
   are handed directly (`postgres_litellm`, `postgres_roofix`,
-  `postgres_sandbox`, `postgres_phoenix`); `supabase_<project>` for
-  Supabase-hosted projects (`supabase_ai_agents`,
-  `supabase_enerflo_leads`); `aws_glue` for the Glue Data Catalog. Don't
+  `postgres_sandbox`, `postgres_phoenix`, `postgres_supabase`);
+  `supabase_<project>` for Supabase-hosted projects (`supabase_ai_agents`,
+  `supabase_enerflo_leads`); `aws_glue` for the Glue Data Catalog. Note the
+  split that `postgres_supabase` sits on: it is the Supabase instance **we**
+  run (`ai/supabase`), so it is named for the Postgres we operate, not for
+  the vendor — `supabase_*` is reserved for projects hosted on
+  supabase.com. Don't
   name catalogs after the tool you used to reach the data before
   (`athena`) or the owner (`zeo_*`) — every catalog here is ours, so
   that carries no information.
@@ -213,6 +217,7 @@ bottom of the stack trace.
 | Target lives… | `connection-url` host | Example |
 |---|---|---|
 | On `ai_shared` (any compose service that joins it) | Docker service DNS | `roofix-db:5432` |
+| On `ai_shared` via a subsystem that dual-homes its DB on purpose | Docker service DNS | `supabase-db:5432` (see [ai/supabase/SUPABASE.md](../supabase/SUPABASE.md); only the `postgres` database is federated — `_supabase`, Supavisor's metadata DB, is not) |
 | On an isolated Docker network (`litellm`'s `internal`, sandbox's `sandbox_state`) | `host.docker.internal:<host-published-port>` | `host.docker.internal:5434` |
 | Off-box (Supabase, RDS, a partner DB) | Public hostname | `aws-1-us-east-1.pooler.supabase.com:5432` |
 

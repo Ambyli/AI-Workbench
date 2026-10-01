@@ -1,7 +1,7 @@
 """Shared utility functions with no intra-package dependencies.
 
-Kept minimal so any module in the classifier package can import from here
-without risking circular imports.
+Kept minimal so any module in the classifier package — at any layer — can
+import from here without risking circular imports.
 """
 
 from logger import logger

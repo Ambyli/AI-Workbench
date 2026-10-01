@@ -1,0 +1,34 @@
+[project]
+name = "detector"
+version = "0.1.0"
+description = "Open-vocabulary (text-prompted) object detection service — OWLv2 behind FastAPI + FastMCP"
+requires-python = ">=3.11"
+dependencies = [
+    "common",
+    "fastapi",
+    "uvicorn",
+    "httpx",
+    "fastmcp>=2.0",
+    "pydantic",
+    "python-multipart",          # POST /detect accepts a multipart upload
+    "Pillow>=11.0.0",            # decode + EXIF transpose + the pre-inference resize
+    "numpy>=1.26",
+    # ── The model stack ────────────────────────────────────────────────────
+    # torch's Linux wheels on PyPI are the CUDA build (2.14 bundles the
+    # `-cu13` runtime libraries), so no extra index is needed to get GPU
+    # support — see ai/detector/DETECTOR.md § Image and CUDA for the driver
+    # floor that implies, and how to pin a CUDA 12 build instead.
+    "torch>=2.14.0,<3",
+    # transformers 5.x renamed Owlv2Processor.post_process_object_detection to
+    # post_process_grounded_object_detection. detectors/owlv2.py resolves
+    # whichever exists, so a 4.x pin also works — 5.17 is what this was built
+    # and verified against.
+    "transformers>=5.17.0,<6",
+    # Owlv2ImageProcessorPil.resize() calls scipy.ndimage for its antialiased
+    # downsample and raises ImportError without it. NOT a declared transformers
+    # dependency, and the failure only surfaces on the first /detect call — so
+    # it is pinned here on purpose.
+    "scipy>=1.14",
+    "prometheus-client",
+    "prometheus-fastapi-instrumentator",
+]

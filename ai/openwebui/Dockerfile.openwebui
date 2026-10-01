@@ -22,7 +22,7 @@
 #       on every sign-in. Touches backend/open_webui/env.py,
 #       routers/auths.py, and adds utils/trusted_proxy.py.
 
-ARG OPENWEBUI_VERSION=v0.11.3
+ARG OPENWEBUI_VERSION=v0.11.4
 FROM ghcr.io/open-webui/open-webui:${OPENWEBUI_VERSION}
 
 # Upstream ends its Dockerfile with `USER $UID:$GID`, 0:0 by default, so we

@@ -1,9 +1,9 @@
 {
   "info": {
+    "_postman_id": "classifier-collection",
     "name": "classifier",
-    "description": "Document Classifier endpoints, called through the LiteLLM pass-through registered in ai/litellm/litellm_config.yaml (`pass_through_endpoints` → `/v1/classifier` → `http://classifier:8000`, `include_subpath: true`, methods GET/POST/DELETE, `forward_headers: true`). Every request is authenticated with a Bearer token from a LiteLLM virtual key. Set the collection variables `litellm` (e.g. http://localhost:4001) and `virtual master key` (an sk-… key issued from the LiteLLM Admin UI → Virtual Keys) — every request inherits them via collection-level auth. See ai/classifier/API.md for the full endpoint reference and ai/litellm/LITELLM.md for issuing virtual keys.\n\nDirect base URL (bypassing LiteLLM, only useful inside the ai_shared network or when PORT_CLASSIFIER is published): http://classifier:8000 or http://<host>:${PORT_CLASSIFIER}. All examples in this collection use the LiteLLM pass-through path.\n\nAsync-job pattern: POST /assess and POST /assess/compare both return 202 Accepted immediately with `{job_id, phase: \"pending\"}`. Callers poll GET /jobs/{job_id} until `phase` is `completed` or `failed`, then read the `result` field. Concurrency: the SQLite jobs table is the queue — `CLASSIFIER_MAX_CONCURRENT` worker tasks (default 2, `.env`) each atomically claim the oldest `pending` row, so at most that many jobs are analysed at once and pending work survives a container restart (payloads live in `/data/payloads` until the job is terminal). Job tracking is powered by the shared `common.jobs` package (SqliteRegistry backend); the `/jobs`, `/jobs/{id}`, and DELETE `/jobs/{id}` routes are mounted via `common.jobs.router.build_router(..., include_delete=True, include_cancel=False)`. Response migration note: the top-level `id` is now `job_id`, `status` is now `phase`, and the previously separate `type` + `request_id` columns are nested under `metadata`. See API.md § `GET /jobs/{job_id}` for the full shape.\n\nCopy the `job_id` from a POST /assess or POST /assess/compare response into the `jobId` collection variable to run the GET/DELETE /jobs/{jobId} requests.",
-    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
-    "_postman_id": "classifier-collection"
+    "description": "Document Classifier — JPEG/PNG photos, PDFs of any page count, .txt and .docx, several documents per request, scored by OpenCV detectors, deterministic text matching, the open-vocabulary detector, and vision-LLM criteria — called through the LiteLLM pass-through registered in ai/litellm/litellm_config.yaml (`pass_through_endpoints` → `/v1/classifier` → `http://classifier:8000`, `include_subpath: true`, methods GET/POST/DELETE, `forward_headers: true`). Every request is authenticated with a Bearer token from a LiteLLM virtual key: set the collection variables `litellm` (e.g. http://localhost:4001) and `virtual master key` (an sk-… key from the LiteLLM Admin UI → Virtual Keys) — every request inherits them via collection-level auth. See ai/classifier/API.md for the full reference and ai/litellm/LITELLM.md for issuing keys.\n\nDirect base URL (bypassing LiteLLM, only inside ai_shared or when PORT_CLASSIFIER is published): http://classifier:8000 or http://<host>:${PORT_CLASSIFIER} — no auth there.\n\nONE analysis endpoint: POST /assess, as JSON (`{documents: [{type: base64|url|text, data}, …], criteria}` — or `{document: {…}}` for one; not both) or multipart (repeated `file` parts and/or `text` fields, plus `criteria` once). `/locate` and `/assess/compare` were removed (404); `/locate`'s job is `score: false` on a criterion. A criterion is `{name, type, weight, depends_on, score, options}` with the type-specific settings in `options` — GET /criterion-types has each type's schema, defaults and caps. Every page of every document is one ITEM (at most CLASSIFIER_MAX_ITEMS = 20 per request, counted at submit; 21 is a 400 with a per-document breakdown); each criterion runs once per item and `options.aggregate` collapses the per-item results — pages → per document → per request (API.md § Documents, pages and items).\n\nAsync-job pattern: POST /assess returns 202 with `{job_id, phase: \"pending\"}`; poll GET /jobs/:jobId until `phase` is `completed` or `failed`. The SQLite jobs table is the queue: CLASSIFIER_MAX_CONCURRENT (default 4) jobs at once; inside a job CLASSIFIER_MAX_UNITS_PER_JOB (2) (criterion, item) units at once; CLASSIFIER_MAX_LLM_CALLS (4) model calls and CLASSIFIER_OCR_WORKERS (4) OCR passes across the whole process. Copy a `job_id` into the `jobId` collection variable to run the GET/DELETE items.\n\nArtifacts: every job stores regions.json, one text.p<n>.<key>.json per item and text layer its criteria used (text.d<i>.<key>.json for a scope-document text search), one p<n>.base.jpg per item with an image, and a manifest with the item map; SVG / PNG / preview layers (p<n>.*) render on first fetch. See the Artifacts folder.\n\nFolders: `Documents` (one request per fixture in unit-tests/classifier/documents/, plus a two-page PDF and a three-document request), `Regions` (fixtures chosen for their geometry), `Documents + regions` (the document fixtures again, geometry-focused), `Artifacts` (the four artifact routes). `unit-tests/classifier/regions_report.py` runs the first three as a suite (REGIONS_REPORT.md).",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "auth": {
     "type": "bearer",
@@ -32,7 +32,19 @@
       "key": "jobId",
       "value": "",
       "type": "string",
-      "description": "job_id returned by POST /assess or POST /assess/compare. Fill in after submitting to run GET /jobs/{jobId} and DELETE /jobs/{jobId}. `phase` values progress staging → pending → processing → completed | failed (`staging` is the few ms before the payload is on disk; workers never claim it)."
+      "description": "job_id returned by POST /assess. Fill in after submitting to run GET /jobs/:jobId, DELETE /jobs/:jobId, and every request in the Artifacts folder. `phase` values progress staging → pending → processing → completed | failed."
+    },
+    {
+      "key": "artifactName",
+      "value": "regions.json",
+      "type": "string",
+      "description": "A file name in the job's artifact directory — see GET /jobs/:jobId/artifacts for the list. n is the job's global ITEM index (every page of every document; the manifest's `items` map says which document and page n is). Written at job time: `regions.json`, `manifest.json`, `p<n>.base.jpg` (per item with a page image), one `text.p<n>.<key>.json` per item and distinct text layer the criteria used (`text.p0.auto.json`, `text.p0.always.json`, `text.p1.never.json`, …), and `text.d<i>.<key>.json` for a scope-document text search. Rendered on FIRST FETCH and then cached: `p<n>.svg`, `p<n>.layer.png`, `p<n>.preview.jpg`, and per criterion `p<n>.<slug>.svg` / `.layer.png` / `.preview.jpg`. Always available as a view: `text.p<n>.<key>.txt` / `text.d<i>.<key>.txt` (the layer's text, plain)."
+    },
+    {
+      "key": "invoice_native_b64",
+      "value": "",
+      "type": "string",
+      "description": "Base64 of unit-tests/classifier/documents/invoice_native.pdf, WITHOUT a data: prefix, for the JSON-body items. Fill it once: `base64 -w0 unit-tests/classifier/documents/invoice_native.pdf` (macOS: `base64 -i … | tr -d '\\n'`; PowerShell: [Convert]::ToBase64String([IO.File]::ReadAllBytes('…'))) and paste the output into this variable's CURRENT VALUE."
     }
   ],
   "item": [
@@ -43,10 +55,36 @@
         "header": [],
         "url": {
           "raw": "{{litellm}}/v1/classifier/health",
-          "host": ["{{litellm}}"],
-          "path": ["v1", "classifier", "health"]
+          "host": [
+            "{{litellm}}"
+          ],
+          "path": [
+            "v1",
+            "classifier",
+            "health"
+          ]
         },
-        "description": "Liveness check used by the Docker healthcheck (`docker-compose.classifier.yml` → `healthcheck.test` hits /health every 30s) and by load balancers. Returns `{\"status\": \"ok\"}` with HTTP 200 whenever the FastAPI process is up. Does NOT probe the SQLite jobs registry, the vLLM backend, or the background worker — a stuck worker will still show `status: ok` here. Excluded from Prometheus instrumentation (see `Instrumentator(excluded_handlers=[\"/metrics\", \"/health\"])` in main.py). See API.md § `GET /health`."
+        "description": "Liveness check used by the Docker healthcheck. Returns `{\"status\": \"ok\"}`. Excluded from the Prometheus request metrics."
+      },
+      "response": []
+    },
+    {
+      "name": "GET /criterion-types",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{litellm}}/v1/classifier/criterion-types",
+          "host": [
+            "{{litellm}}"
+          ],
+          "path": [
+            "v1",
+            "classifier",
+            "criterion-types"
+          ]
+        },
+        "description": "Every criterion type's options, for THIS container: `types.<llm|text|cv|detector>` carries `options_schema` (JSON schema generated from the same pydantic model POST /assess validates against — `additionalProperties: false`, so an unknown key is a 400), `defaults` (resolved: `text.pattern` shows `<name>` because it defaults to the criterion name; `cv.fallback` is `detector` when DETECTOR_URL is configured, else `llm`) and `caps` (server limits a request may not exceed, e.g. `llm.max_attempts` = CLASSIFIER_LLM_BBOX_MAX_ATTEMPTS). Also `shared_fields` (name, type, weight, depends_on, score) and `detector_configured`. No errors. See API.md § `GET /criterion-types`. Also carries `aggregate`: the two levels (pages → per document, documents → per request), what each rule means (`any`, `worst`, `all` = alias of worst, `mean`, `sum` — text only), and the defaults table (llm presence / detector: any + all; llm quality / auto, cv: worst + worst; text: sum + sum). Each type's `defaults` include its resolved `aggregate` (and `scope` for text). Each type also carries `result`: the shape of the `detail` it returns — `metric` (the headline number: `score` for llm, `count` for text, `best_score` for detector, per detector for cv), `metric_from` (`score` | `detail` | `measurements`), and `fields` (every detail key with its JSON `kind`, a `description`, `when` it appears if not always, and `stable` if it survives a `mean` aggregate). The top-level `aggregate_detail` describes the `{rule, level, from, values}` block an aggregated detail gains. cv measurement keys per detector: GET /cv-detectors. See API.md § Result details."
       },
       "response": []
     },
@@ -57,10 +95,16 @@
         "header": [],
         "url": {
           "raw": "{{litellm}}/v1/classifier/hints",
-          "host": ["{{litellm}}"],
-          "path": ["v1", "classifier", "hints"]
+          "host": [
+            "{{litellm}}"
+          ],
+          "path": [
+            "v1",
+            "classifier",
+            "hints"
+          ]
         },
-        "description": "Enumerate all available `hint` values and their LLM scoring rubrics. Returns `{\"hints\": {\"quality\": {...}, \"presence\": {...}, \"auto\": {...}}}` where each rubric object has `heading`, `rubric`, and `extra` fields sourced from `llm.HINT_RUBRICS`. Use these values as the `hint` field on a CriterionInput:\n\n- `quality`: score image quality 1-10 (1-3 = FAIL, 4-6 = MARGINAL, 7-10 = PASS).\n- `presence`: detect presence/absence (10=present, 5=uncertain, 1=absent) with chain-of-thought reasoning in `extra`.\n- `auto` (default): LLM infers the rubric from the criterion name.\n\nNo request body. See API.md § `GET /hints`."
+        "description": "Every `options.hint` value an `llm` criterion may carry (`quality`, `presence`, `auto`) and the rubric text the model is given for each — the table is `config.HINT_RUBRICS`, verbatim. A `cv` criterion that falls back to the llm uses `auto`. No errors. See API.md § `GET /hints`."
       },
       "response": []
     },
@@ -71,10 +115,36 @@
         "header": [],
         "url": {
           "raw": "{{litellm}}/v1/classifier/cv-detectors",
-          "host": ["{{litellm}}"],
-          "path": ["v1", "classifier", "cv-detectors"]
+          "host": [
+            "{{litellm}}"
+          ],
+          "path": [
+            "v1",
+            "classifier",
+            "cv-detectors"
+          ]
         },
-        "description": "List every registered OpenCV detector, grouped by underlying detector function. Returns `{\"detectors\": [{\"function\": \"check_blur\", \"names\": [\"is blurry\", \"is sharp\", \"sharpness\"]}, ...], \"total_names\": N}`. Use any of the `names` as the `name` field on a CriterionInput with `type=\"cv\"` — fuzzy matching is applied at runtime, so near-matches also work. If no detector matches, the criterion silently falls back to LLM scoring and the response's `method` field reflects the actual path taken.\n\nBuilt-in detector functions: `check_blur` (Laplacian variance), `check_exposure` (mean pixel intensity), `detect_vegetation` (HSV green masking), `detect_sky`, `detect_faces` (Haar cascade), `detect_water`, `detect_text` (Sobel edge density). See API.md § `Built-in cv detector names`."
+        "description": "Every registered OpenCV detector name, grouped by the function behind it — the names a `type: \"cv\"` criterion is matched against (exact, then difflib at CV_NAME_FUZZY_CUTOFF 0.8). A name that matches none uses the criterion's `options.fallback`. Returns `{detectors: [{function, names, technique, metric, measurements, thresholds, parameters, states, regions}], total_names}` — each detector's aliases plus the shape of the `detail` it returns: `metric` (the headline key), `measurements` (every key, each `{unit, description}`; units `ratio` 0-1, `px` working-image pixels, `count`, `variance`, `intensity` 0-255), `thresholds` (key → what it decides), `parameters` (keys), `states` (value → meaning; `{}` when the detector has none) and `regions` (what its regions are, or null). Test-checked against the detectors' real output. No errors. See API.md § `GET /cv-detectors`."
+      },
+      "response": []
+    },
+    {
+      "name": "GET /document-kinds",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{litellm}}/v1/classifier/document-kinds",
+          "host": [
+            "{{litellm}}"
+          ],
+          "path": [
+            "v1",
+            "classifier",
+            "document-kinds"
+          ]
+        },
+        "description": "What this container accepts and how it is handled right now: the four kinds (image and .txt/.docx one item each, pdf one item PER PAGE), the refused legacy .doc, the accepted inputs (JSON `documents: [base64 | url | text, …]` or the one-`document` shorthand; multipart repeatable `file` | `text`), the text-match modes, the live OCR status (`ocr.available` loads the engine to answer honestly), the limits (`max_items` = CLASSIFIER_MAX_ITEMS, render DPI, the LLM text budget, and the four concurrency limits: jobs, units per job, model calls, OCR passes), and the regions block (always stored; layers render on first fetch; the llm box-loop bounds; the live detector status; `artifact_max_bytes_per_item`). No errors."
       },
       "response": []
     },
@@ -87,46 +157,259 @@
           "mode": "formdata",
           "formdata": [
             {
-              "key": "image",
+              "key": "file",
               "type": "file",
-              "src": "",
-              "description": "JPEG or PNG image file. Read into memory during the request via `await image.read()`; the worker receives the bytes, so the UploadFile is not stored on disk."
+              "src": "unit-tests/classifier/documents/invoice_native.pdf",
+              "description": "A document: JPEG, PNG, PDF (every page is an item), .txt or .docx. REPEAT the part for more documents — this item sends two. The kind is detected from the bytes (common.documents.detect_kind), never from the filename or Content-Type. The `src` points at a repo fixture — re-select the file if your Postman working directory differs. The legacy part name `image` is also accepted, and repeats too."
+            },
+            {
+              "key": "file",
+              "type": "file",
+              "src": "unit-tests/classifier/documents/photo_of_letter.png",
+              "description": "A second document, as a repeated `file` part: one more item. Parts are taken in form order."
             },
             {
               "key": "criteria",
               "type": "text",
-              "value": "[{\"name\":\"has electrical meter\",\"type\":\"llm\",\"hint\":\"presence\",\"weight\":4.0},{\"name\":\"meter value is readable\",\"type\":\"llm\",\"hint\":\"quality\",\"weight\":3.0,\"depends_on\":\"has electrical meter\"},{\"name\":\"three feet of clearance around meter\",\"type\":\"llm\",\"hint\":\"presence\",\"weight\":2.5,\"depends_on\":\"has electrical meter\"},{\"name\":\"sharpness\",\"type\":\"cv\",\"weight\":1.0}]",
-              "description": "JSON array of CriterionInput objects. Each must have `name`; optional fields are `type` (`llm` default | `cv`), `weight` (float > 0, default 1.0), `hint` (`quality` | `presence` | `auto` default), and `depends_on` (name of another criterion that must PASS score >= 7 before this one runs — otherwise this criterion is marked SKIPPED and excluded from the weighted score). Chains are supported: A → B → C all skip if A fails. If omitted, `config.DEFAULT_CRITERIA` is used."
+              "value": "[{\"name\":\"Notice to Owner\",\"type\":\"text\",\"weight\":3.0,\"options\":{\"match\":\"fuzzy\"}},{\"name\":\"total amount\",\"type\":\"text\",\"weight\":2.0,\"options\":{\"match\":\"regex\",\"pattern\":\"\\\\$[\\\\d,]+\\\\.\\\\d{2}\"}},{\"name\":\"meter value is readable\",\"type\":\"llm\",\"weight\":3.0,\"depends_on\":\"Notice to Owner\",\"options\":{\"hint\":\"quality\"}},{\"name\":\"sharpness\",\"type\":\"cv\"}]",
+              "description": "JSON array of criterion objects — the same shape the JSON body's `criteria` takes, sent ONCE: it covers every document. See GET /criterion-types."
             }
           ]
         },
         "url": {
           "raw": "{{litellm}}/v1/classifier/assess",
-          "host": ["{{litellm}}"],
-          "path": ["v1", "classifier", "assess"]
+          "host": [
+            "{{litellm}}"
+          ],
+          "path": [
+            "v1",
+            "classifier",
+            "assess"
+          ]
         },
-        "description": "Submit a single-image assessment job. Content-Type is `multipart/form-data`. Returns **202 Accepted** immediately with `{\"job_id\": \"<id>\", \"phase\": \"pending\"}` — this is the async pattern, so poll GET /jobs/{jobId} until `phase` is `completed` or `failed`, then read the `result` field.\n\nServer-side flow (main.py `assess_document`):\n  1. Parse the `criteria` JSON form field via `analysis.parse_criteria`.\n  2. Read the uploaded image bytes into memory (UploadFile is only readable during the request).\n  3. Create a job record in the SQLite jobs registry with `metadata={type: \"assess\", request_id: <req>}` and `initial_phase=\"staging\"`.\n  4. Write `{image_b64, content_type, filename, criteria}` to `PAYLOAD_DIR/<job_id>.json`, flip the row to `pending`, wake an idle worker (one of `CLASSIFIER_MAX_CONCURRENT`).\n  5. Return `202` with the job_id.\n\nErrors: **400** if the criteria list is empty or the image body is empty; **422** if the criteria JSON is malformed or fails Pydantic validation of CriterionInput.\n\nResult shape once completed: `{image_info, assessment: {overall_verdict, overall_score, per_criterion_scores, weighted_score_breakdown}, verdict}`. SKIPPED criteria appear in `per_criterion_scores` with `verdict: \"SKIPPED\"`, `score: null`, `method: \"skipped\"`, and a reason string, and are excluded from the weighted score. See API.md § `POST /assess`.\n\nPostman note: click the `image` row's file selector to attach a real JPEG/PNG — the placeholder `src` in this template is empty."
+        "description": "Submit an assessment job — the one analysis endpoint. This item is the multipart form of it: repeated `file` parts (the legacy name `image` is still accepted) and/or repeated `text` fields — each one a document, in form order — plus ONE `criteria` field holding a JSON array. The JSON items below send the SAME request as a body; both are parsed into one `AssessRequest`, so they cannot behave differently. Returns **202 Accepted** with `{\"job_id\", \"phase\": \"pending\"}`; poll GET /jobs/:jobId.\n\n**Items.** Every page of every document is one item — this request is invoice_native.pdf (1 page) + photo_of_letter.png = 2 items. At most CLASSIFIER_MAX_ITEMS (20) per request, INCLUSIVE, counted at submit from the bytes (a PDF's page count without rendering); 21 is a 400 naming each document's pages: `too many items: 21 pages across 11 document(s) exceeds CLASSIFIER_MAX_ITEMS=20 (#0 a.pdf: 2 pages, …)`.\n\nA criterion is `{name, type, weight, depends_on, score, options}` — only the shared fields at the top, everything type-specific in `options` (GET /criterion-types has the schema, defaults and caps):\n  llm: `hint` (quality | presence | auto), `boxes` (default false — the bounding-box loop), `max_attempts` (≤ CLASSIFIER_LLM_BBOX_MAX_ATTEMPTS), `ocr` (auto | always | never — the text layer sent with the prompt), `aggregate`\n  text: `pattern` (default: the name), `match` (contains | exact | regex | fuzzy), `case_sensitive`, `fuzzy_threshold`, `min_count`, `ocr`, `scope` (page | document — document joins a document's pages with one space so a phrase over a page break matches), `aggregate`\n  cv: `fallback` (detector | llm — what answers when no OpenCV detector matches; default detector when DETECTOR_URL is set, else llm), `aggregate`\n  detector: `threshold` (default DETECTOR_MIN_SCORE), `aggregate`\n`aggregate` (every type): a rule for both levels, or `{pages, documents}` — `any` (best item), `worst` / `all` (lowest item; all is an alias), `mean`, `sum` (text only: hit counts added). Defaults: llm presence / detector any + all; llm quality / auto, cv worst + worst; text sum + sum. Skipped and errored units are excluded; any errored unit makes the criterion incomplete.\n`score: false` locates without judging (regions, no score/verdict, excluded from the weighting) — /locate's old job. `depends_on` names another SCORED criterion that must PASS first, gated PER ITEM: the dependant runs on the items where its dependency passed and is SKIPPED (no model call) on the others.\n\nThe unit of work is (criterion, item): one `llm` unit = one model call; up to CLASSIFIER_MAX_UNITS_PER_JOB units run at once; model calls across all jobs are bounded by CLASSIFIER_MAX_LLM_CALLS and OCR passes by CLASSIFIER_OCR_WORKERS. OCR is memoised per item by settings — criteria with the same `ocr` share one pass per page. A unit that fails (model down, unparseable answer, detector outage) gets `status: \"error\"` alone; the job still completes.\n\n**Errors (400 at submit, nothing queued):** unknown / mistyped / over-cap option (named, e.g. `criteria.0: options.max_attempts: max_attempts 9 exceeds this server's cap…`), an `aggregate` that is not a rule or `{pages, documents}`, `sum` on a non-text criterion, an old top-level key (`hint`, `pattern`, … — 'moved into options'), an invalid regex, duplicate names, unknown `depends_on`, a dependency on a `score: false` criterion, a dependency cycle, `score: false` on a criterion that cannot produce geometry or when no document has a page image, a `detector` criterion when DETECTOR_URL is unset, a removed form field (`ocr`, `regions`), no `file` / `text` at all, an empty `text` field, `criteria` sent twice, an unsupported kind (named by document — legacy .doc → convert to .docx), and **more than CLASSIFIER_MAX_ITEMS items**. **415** for a Content-Type that is neither JSON nor multipart. **500** if the payload could not be persisted. `/locate` and `/assess/compare` no longer exist and answer 404.\n\nResult shape (GET /jobs/:jobId → `result`, `schema_version: 3`):\n  `{schema_version, documents, items, assessment: {overall_score, overall_verdict, complete, weighted_score_breakdown, per_criterion_scores}, verdict, page_geometry, detector, artifacts}`\nEvery page of every document is one ITEM, numbered globally in request order. `documents[]` is `{index, filename, kind, pages, items, document_info}` (document_info: content_type, size_bytes, has_image, native_text_chars, ocr.layers per item, ocr.document_layers, llm_text_char_budget). `items[]` is `{item, document, page, filename, overall_score, overall_verdict, complete}` — each item's own weighted score. `page_geometry` is a list, one entry per item (null sizes for a .txt/.docx item); `page` there, a region's `page` and the `p{n}` layer prefix all mean the item.\nEvery entry of `per_criterion_scores` has the SAME keys — the AGGREGATED answer: `status` (ok | error | skipped), `type`, `method`, `scored`, `score`, `verdict`, `confidence`, `reason`, `detail`, `regions` (the union over every item, capped at CLASSIFIER_INLINE_REGIONS_MAX with `regions_truncated`), `artifacts` (`items`: per item, that page's layer URLs filtered to the criterion and its loop `attempts`; `text`: one link per text layer its units read), `localization` (llm: the loop's record — merged across items), `options_used` (with `aggregate` resolved), `error`, `complete` (false when any of its units errored), `aggregate_used` ({pages, documents}), and `items` — one entry per unit: `{item, document, page, status, score, verdict, confidence, reason, detail, error, regions (a COUNT), text_layer, localization (llm)}`.\nThe overall score and verdict are weighed over the AGGREGATED criterion results; `complete` is false when any scored criterion is incomplete, and `overall_score` / `overall_verdict` are then null with the partial score in `weighted_score_breakdown` (`partial: true`). `score: false`, skipped and errored criteria never count toward the score.\n\nSee API.md § `POST /assess` and § Documents, pages and items."
       },
       "response": []
     },
     {
-      "name": "POST /assess/compare",
+      "name": "POST /assess — JSON, base64 document",
       "request": {
         "method": "POST",
         "header": [
-          { "key": "Content-Type", "value": "application/json" }
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
         ],
         "body": {
           "mode": "raw",
-          "raw": "{\n  \"image\": {\n    \"data\": \"https://example.com/subject.jpg\",\n    \"type\": \"url\"\n  },\n  \"criteria\": [\n    {\"name\": \"has electrical meter\", \"type\": \"llm\", \"hint\": \"presence\", \"weight\": 4.0},\n    {\"name\": \"meter value is readable\", \"type\": \"llm\", \"hint\": \"quality\", \"weight\": 3.0, \"depends_on\": \"has electrical meter\"},\n    {\"name\": \"sharpness\", \"type\": \"cv\", \"weight\": 1.0}\n  ],\n  \"aggregation\": \"mean\",\n  \"examples\": [\n    {\n      \"data\": \"https://example.com/reference-good.jpg\",\n      \"type\": \"url\",\n      \"weight\": 0.5\n    },\n    {\n      \"data\": \"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=\",\n      \"type\": \"base64\",\n      \"weight\": 0.5\n    }\n  ]\n}",
-          "options": { "raw": { "language": "json" } }
+          "raw": "{\n  \"documents\": [\n    {\n      \"type\": \"base64\",\n      \"data\": \"{{invoice_native_b64}}\",\n      \"filename\": \"invoice_native.pdf\"\n    }\n  ],\n  \"criteria\": [\n    {\n      \"name\": \"Notice to Owner\",\n      \"type\": \"text\",\n      \"options\": {\n        \"match\": \"fuzzy\"\n      }\n    },\n    {\n      \"name\": \"Payment Terms: Net 30\",\n      \"type\": \"text\",\n      \"options\": {\n        \"match\": \"exact\"\n      }\n    },\n    {\n      \"name\": \"has text\",\n      \"type\": \"cv\"\n    }\n  ]\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
         },
         "url": {
-          "raw": "{{litellm}}/v1/classifier/assess/compare",
-          "host": ["{{litellm}}"],
-          "path": ["v1", "classifier", "assess", "compare"]
+          "raw": "{{litellm}}/v1/classifier/assess",
+          "host": [
+            "{{litellm}}"
+          ],
+          "path": [
+            "v1",
+            "classifier",
+            "assess"
+          ]
         },
-        "description": "Submit a comparison job — assess a subject image against one or more reference examples. Content-Type is `application/json`. Body is a CompareRequest (see models.py):\n\n- `image`: ImageInput `{data, type: \"base64\" | \"url\"}`. URL inputs are SSRF-checked before fetching (see ssrf.py).\n- `criteria`: list[CriterionInput], defaults to `config.DEFAULT_CRITERIA` if omitted.\n- `aggregation`: `mean` (default, balanced) | `min` (strictest — must match all examples) | `max` (most lenient — must match any).\n- `examples`: list[ExampleInput] with `min_length=1`. Each has `data`, `type`, `weight` (0.0–1.0, default 0.5 — how much similarity to this example influences the combined score; `0.0` = ignore, `1.0` = similarity only), and optional `pre_generated_analysis` (a prior `result` from /assess to skip re-analysing the reference).\n\nReturns **202 Accepted** immediately with `{\"job_id\": \"<id>\", \"phase\": \"pending\"}`. Poll GET /jobs/{jobId} for the result.\n\nServer-side flow (main.py `assess_with_reference`):\n  1. Validate `request.criteria` non-empty (Pydantic already enforces `examples` min_length=1).\n  2. Create a job record with `metadata={type: \"compare\", request_id: <req>}` in phase `staging`.\n  3. Write the full CompareRequest to `PAYLOAD_DIR/<job_id>.json`, flip the row to `pending`, wake an idle worker — runners.run_compare re-validates it from disk so the job survives a restart.\n  4. Return `202` with the job_id.\n\nErrors: **400** if criteria list is empty; **422** if the body fails CompareRequest validation (missing examples, invalid aggregation literal, weight out of range, malformed ImageInput/ExampleInput).\n\nCombined-score formula: `combined = (1 - weight) × input_overall_score + weight × similarity_score`. Result shape: `{status, criteria, aggregation, input_analysis, example_results[], aggregate: {method, combined_score, combined_verdict, per_example_combined_scores}}`. See API.md § `POST /assess/compare`.\n\nCaching: `pre_generated_analysis` values must come from the SAME version of the classifier that is currently running — stored analyses from older versions cause runtime errors. Re-generate after upgrades. See API.md § Caching example analyses."
+        "description": "The same request as the multipart POST /assess, as a JSON body: `{\"documents\": [{\"type\": \"base64\", \"data\": \"…\", \"filename\": \"…\"}], \"criteria\": [...]}` — a one-item `documents` list. `filename` is optional and only recorded in `documents[i].filename`. Fill the `invoice_native_b64` collection variable first (see its description). Returns 202 with a job_id. Same errors as POST /assess, plus 400 for invalid base64, both `document` and `documents`, or a body that is not a JSON object. See API.md § Request."
+      },
+      "response": []
+    },
+    {
+      "name": "POST /assess — JSON, document URL",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"document\": {\n    \"type\": \"url\",\n    \"data\": \"https://example.com/invoice.pdf\"\n  },\n  \"criteria\": [\n    {\n      \"name\": \"Invoice\",\n      \"type\": \"text\"\n    },\n    {\n      \"name\": \"document legibility\",\n      \"type\": \"llm\",\n      \"options\": {\n        \"hint\": \"quality\"\n      }\n    }\n  ]\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{litellm}}/v1/classifier/assess",
+          "host": [
+            "{{litellm}}"
+          ],
+          "path": [
+            "v1",
+            "classifier",
+            "assess"
+          ]
+        },
+        "description": "`type: \"url\"` — the service fetches the URL AT SUBMIT (the item cap needs the bytes: a PDF counts its pages), after the SSRF check (common.net: private, loopback and link-local addresses are refused). This item uses the one-document shorthand `{\"document\": {…}}`, which is a one-item `documents` list — sending both keys is a 400. Returns 202. **400** for a blocked or unresolvable URL, **502** when the fetch fails, plus every POST /assess 400. Replace the example URL with a real document."
+      },
+      "response": []
+    },
+    {
+      "name": "POST /assess — JSON, inline text",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"documents\": [\n    {\n      \"type\": \"text\",\n      \"data\": \"ROOFING SERVICES AGREEMENT\\nLimited Warranty: 10 years from 2026-03-14.\"\n    }\n  ],\n  \"criteria\": [\n    {\n      \"name\": \"Limited Warranty\",\n      \"type\": \"text\"\n    },\n    {\n      \"name\": \"contract date\",\n      \"type\": \"text\",\n      \"options\": {\n        \"match\": \"regex\",\n        \"pattern\": \"\\\\d{4}-\\\\d{2}-\\\\d{2}\"\n      }\n    },\n    {\n      \"name\": \"mentions a warranty period\",\n      \"type\": \"llm\",\n      \"options\": {\n        \"hint\": \"presence\"\n      }\n    }\n  ]\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{litellm}}/v1/classifier/assess",
+          "host": [
+            "{{litellm}}"
+          ],
+          "path": [
+            "v1",
+            "classifier",
+            "assess"
+          ]
+        },
+        "description": "`type: \"text\"` — the document IS the string, treated as a .txt (UTF-8), one item. No page image, so `cv` / `detector` units are SKIPPED, `score: false` is refused (no document in the request has an image), and the llm prompt is text-only. `documents[0].filename` is `inline.txt`. Returns 202. Errors as POST /assess."
+      },
+      "response": []
+    },
+    {
+      "name": "POST /assess — multipart, inline text",
+      "request": {
+        "method": "POST",
+        "header": [],
+        "body": {
+          "mode": "formdata",
+          "formdata": [
+            {
+              "key": "text",
+              "type": "text",
+              "value": "NOTICE TO OWNER — Under Florida law, those who work on your property…",
+              "description": "Inline text, treated as a .txt document (one item). Repeatable, and may be mixed with `file` parts — each is one document."
+            },
+            {
+              "key": "criteria",
+              "type": "text",
+              "value": "[{\"name\":\"Notice to Owner\",\"type\":\"text\"}]",
+              "description": "JSON array of criterion objects — the same shape the JSON body's `criteria` takes, sent ONCE: it covers every document. See GET /criterion-types."
+            }
+          ]
+        },
+        "url": {
+          "raw": "{{litellm}}/v1/classifier/assess",
+          "host": [
+            "{{litellm}}"
+          ],
+          "path": [
+            "v1",
+            "classifier",
+            "assess"
+          ]
+        },
+        "description": "The multipart spelling of inline text: a `text` form field instead of (or alongside) a `file` part. Parsed into the same AssessRequest as the JSON `type: \"text\"` document, so the two produce identical results. Returns 202. **400** when there is no `file` / `text` at all, or a `text` field is empty."
+      },
+      "response": []
+    },
+    {
+      "name": "POST /assess — JSON, documents list (a PDF, a URL and inline text)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"documents\": [\n    {\n      \"type\": \"base64\",\n      \"data\": \"{{invoice_native_b64}}\",\n      \"filename\": \"invoice_native.pdf\"\n    },\n    {\n      \"type\": \"url\",\n      \"data\": \"https://example.com/site_photo.jpg\"\n    },\n    {\n      \"type\": \"text\",\n      \"data\": \"NOTICE TO OWNER — Under Florida law, those who work on your property…\"\n    }\n  ],\n  \"criteria\": [\n    {\n      \"name\": \"Notice to Owner\",\n      \"type\": \"text\",\n      \"options\": {\n        \"match\": \"fuzzy\"\n      }\n    },\n    {\n      \"name\": \"Notice to Owner in every document\",\n      \"type\": \"text\",\n      \"options\": {\n        \"pattern\": \"Notice to Owner\",\n        \"match\": \"fuzzy\",\n        \"aggregate\": {\n          \"documents\": \"all\"\n        }\n      }\n    },\n    {\n      \"name\": \"has a signature\",\n      \"type\": \"llm\",\n      \"options\": {\n        \"hint\": \"presence\",\n        \"aggregate\": {\n          \"pages\": \"any\",\n          \"documents\": \"any\"\n        }\n      }\n    },\n    {\n      \"name\": \"sharpness\",\n      \"type\": \"cv\"\n    }\n  ]\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{litellm}}/v1/classifier/assess",
+          "host": [
+            "{{litellm}}"
+          ],
+          "path": [
+            "v1",
+            "classifier",
+            "assess"
+          ]
+        },
+        "description": "Several documents in ONE job: `documents` is a list, each entry `{type: base64 | url | text, data, filename?}`, in order. Every page of every document is one item — here invoice_native.pdf (1 page) + the URL's document + the inline text = 3 items, when the URL is an image or a one-page PDF. Fill `invoice_native_b64` and replace the example URL first.\n\nEach criterion runs once per item and is aggregated: `Notice to Owner` uses the text default (`sum`: hit counts added across items and documents, so ONE hit anywhere passes); `Notice to Owner in every document` keeps the `sum` pages rule but sets `documents: all` (= worst), so every document must have it; `has a signature` is PASS if any page of any document shows one; `sharpness` (cv: worst / worst) is skipped on the text item and excluded, so the worst of the two images decides. Each result entry's `items` lists the per-item answers, and the top-level `items` the per-item scores. Returns 202; same errors as POST /assess (a document is named `#<index> <filename>` in its error). See API.md § Documents, pages and items."
+      },
+      "response": []
+    },
+    {
+      "name": "POST /assess — multipart, repeated files and text fields",
+      "request": {
+        "method": "POST",
+        "header": [],
+        "body": {
+          "mode": "formdata",
+          "formdata": [
+            {
+              "key": "file",
+              "type": "file",
+              "src": "unit-tests/classifier/documents/invoice_two_page.pdf",
+              "description": "Document 0 — a two-page PDF: items 0 and 1."
+            },
+            {
+              "key": "file",
+              "type": "file",
+              "src": "unit-tests/classifier/documents/photo_of_letter.png",
+              "description": "Document 1 — a repeated `file` part: item 2."
+            },
+            {
+              "key": "text",
+              "type": "text",
+              "value": "Payment Terms: Net 30. Questions: billing@acme-roofing.example",
+              "description": "Document 2 — inline text, a repeatable field: item 3."
+            },
+            {
+              "key": "criteria",
+              "type": "text",
+              "value": "[{\"name\":\"Net 30\",\"type\":\"text\"},{\"name\":\"Net 30 on every page\",\"type\":\"text\",\"options\":{\"pattern\":\"Net 30\",\"aggregate\":\"all\"}},{\"name\":\"has text\",\"type\":\"cv\",\"score\":false}]",
+              "description": "JSON array of criterion objects — the same shape the JSON body's `criteria` takes, sent ONCE: it covers every document. See GET /criterion-types."
+            }
+          ]
+        },
+        "url": {
+          "raw": "{{litellm}}/v1/classifier/assess",
+          "host": [
+            "{{litellm}}"
+          ],
+          "path": [
+            "v1",
+            "classifier",
+            "assess"
+          ]
+        },
+        "description": "Repeated multipart parts: two `file` parts and a `text` field are three documents and FOUR items (the PDF has two pages). The service takes them in form order — note that some clients (httpx `files=` / `data=`, requests) send every plain field before every file, which makes the inline text document 0; the result's `documents` / `items` say which is which.\n\n`Net 30` (text, sum): found on the PDF's page 2 and in the text → PASS, `detail.count` 2, `detail.counts` per document. `Net 30 on every page` (`aggregate: \"all\"` at both levels) → FAIL: page 1 of the PDF and the photo do not have it. `has text` (`score: false`) returns block boxes on the PDF pages and the photo, each region with its item as `page`. Returns 202. See API.md § Documents, pages and items."
       },
       "response": []
     },
@@ -137,46 +420,1282 @@
         "header": [],
         "url": {
           "raw": "{{litellm}}/v1/classifier/jobs",
-          "host": ["{{litellm}}"],
-          "path": ["v1", "classifier", "jobs"]
+          "host": [
+            "{{litellm}}"
+          ],
+          "path": [
+            "v1",
+            "classifier",
+            "jobs"
+          ],
+          "query": [
+            {
+              "key": "phase",
+              "value": "completed",
+              "disabled": true,
+              "description": "staging | pending | processing | completed | failed"
+            },
+            {
+              "key": "limit",
+              "value": "20",
+              "disabled": true,
+              "description": "Page size (default 50)."
+            }
+          ]
         },
-        "description": "List recent jobs, newest first. Mounted by `common.jobs.router.build_router(jobs_registry, include_delete=True, include_cancel=False)` in main.py; backed by `SqliteRegistry.list_all()`. Returns a JobsListResponse — see `shared/common/src/common/jobs/model.py` for the JobBase shape. Result blobs are excluded from the list response (call GET /jobs/{job_id} to get the full `result` field).\n\nEach job's `metadata` is the ClassifierMetadata blob `{type: \"assess\" | \"compare\", request_id: <req>}` written at submit time — useful for filtering by kind or correlating with the `[request_id]` in server logs (see middleware.py's CorrelationIDMiddleware). See API.md § `GET /jobs`."
+        "description": "List jobs, newest first (common.jobs.router). Query `phase` filters by phase, `limit` (default 50) caps the page. Each row is `{job_id, phase, created_at, updated_at, elapsed_seconds, metadata: {type, request_id}, result, error}` — `metadata.type` is always `assess` (rows queued by an older container may say `compare` / `locate`; those fail with a message naming the removed type). Results can be large — prefer GET /jobs/:jobId."
       },
       "response": []
     },
     {
-      "name": "GET /jobs/{jobId}",
+      "name": "GET /jobs/:jobId",
       "request": {
         "method": "GET",
         "header": [],
         "url": {
           "raw": "{{litellm}}/v1/classifier/jobs/:jobId",
-          "host": ["{{litellm}}"],
-          "path": ["v1", "classifier", "jobs", ":jobId"],
+          "host": [
+            "{{litellm}}"
+          ],
+          "path": [
+            "v1",
+            "classifier",
+            "jobs",
+            ":jobId"
+          ],
           "variable": [
-            { "key": "jobId", "value": "", "description": "job_id returned by POST /assess or POST /assess/compare." }
+            {
+              "key": "jobId",
+              "value": "",
+              "description": "job_id returned by POST /assess (202 body). Paste it here, or set the collection variable `jobId`."
+            }
           ]
         },
-        "description": "Poll for the status and result of a submitted job. Set the `jobId` collection variable to the `job_id` returned by POST /assess or POST /assess/compare first.\n\nResponse shape (JobBase from `common.jobs`):\n  `{job_id, phase, created_at, updated_at, elapsed_seconds, metadata: {type, request_id}, result, error}`\n\n`phase` progression: `staging` → `pending` → `processing` → `completed` | `failed`. Up to `CLASSIFIER_MAX_CONCURRENT` jobs sit in `processing` at once; a job left in `processing` by a restart is requeued to `pending` on the next startup.\n\n- While `staging` / `pending` / `processing`: `result` is null, `error` is null. Keep polling.\n- When `completed`: `result` is the assessment (see POST /assess or POST /assess/compare descriptions for the exact shape).\n- When `failed`: `error` holds the exception message set by the worker via `jobs_registry.set_error(...)`, `result` is null.\n\nErrors: **404** if the `job_id` is unknown (registry.get returned None). Note the response migration: top-level `id` is now `job_id`, `status` is now `phase`, and the previously separate `type` + `request_id` columns are nested under `metadata`. Callers that parse the response by field name need to update accordingly. See API.md § `GET /jobs/{job_id}`."
+        "description": "Poll one job. `phase` progresses staging → pending → processing → completed | failed. When `completed`, `result` is the assessment:\n\nResult shape (GET /jobs/:jobId → `result`, `schema_version: 3`):\n  `{schema_version, documents, items, assessment: {overall_score, overall_verdict, complete, weighted_score_breakdown, per_criterion_scores}, verdict, page_geometry, detector, artifacts}`\nEvery page of every document is one ITEM, numbered globally in request order. `documents[]` is `{index, filename, kind, pages, items, document_info}` (document_info: content_type, size_bytes, has_image, native_text_chars, ocr.layers per item, ocr.document_layers, llm_text_char_budget). `items[]` is `{item, document, page, filename, overall_score, overall_verdict, complete}` — each item's own weighted score. `page_geometry` is a list, one entry per item (null sizes for a .txt/.docx item); `page` there, a region's `page` and the `p{n}` layer prefix all mean the item.\nEvery entry of `per_criterion_scores` has the SAME keys — the AGGREGATED answer: `status` (ok | error | skipped), `type`, `method`, `scored`, `score`, `verdict`, `confidence`, `reason`, `detail`, `regions` (the union over every item, capped at CLASSIFIER_INLINE_REGIONS_MAX with `regions_truncated`), `artifacts` (`items`: per item, that page's layer URLs filtered to the criterion and its loop `attempts`; `text`: one link per text layer its units read), `localization` (llm: the loop's record — merged across items), `options_used` (with `aggregate` resolved), `error`, `complete` (false when any of its units errored), `aggregate_used` ({pages, documents}), and `items` — one entry per unit: `{item, document, page, status, score, verdict, confidence, reason, detail, error, regions (a COUNT), text_layer, localization (llm)}`.\nThe overall score and verdict are weighed over the AGGREGATED criterion results; `complete` is false when any scored criterion is incomplete, and `overall_score` / `overall_verdict` are then null with the partial score in `weighted_score_breakdown` (`partial: true`). `score: false`, skipped and errored criteria never count toward the score.\n\nA model outage does NOT fail the job — it fails the unit (`status: \"error\"` on that item) and the job completes with `complete: false`. `failed` means the job itself could not run (a thumbnail-sized page image, an undecodable file, a payload from an older container — anything but `schema: 3`). **404** for an unknown job id. See API.md § `GET /jobs/{job_id}`."
       },
       "response": []
     },
     {
-      "name": "DELETE /jobs/{jobId}",
+      "name": "DELETE /jobs/:jobId",
       "request": {
         "method": "DELETE",
         "header": [],
         "url": {
           "raw": "{{litellm}}/v1/classifier/jobs/:jobId",
-          "host": ["{{litellm}}"],
-          "path": ["v1", "classifier", "jobs", ":jobId"],
+          "host": [
+            "{{litellm}}"
+          ],
+          "path": [
+            "v1",
+            "classifier",
+            "jobs",
+            ":jobId"
+          ],
           "variable": [
-            { "key": "jobId", "value": "", "description": "job_id returned by POST /assess or POST /assess/compare." }
+            {
+              "key": "jobId",
+              "value": "",
+              "description": "job_id returned by POST /assess (202 body). Paste it here, or set the collection variable `jobId`."
+            }
           ]
         },
-        "description": "Delete a job record from the SQLite registry. Returns **204 No Content** on success (empty body). Idempotent from the caller's perspective in the sense that once gone the record stays gone — but the underlying `registry.delete` returns False for unknown ids, so a repeat call for the same id returns **404** with `detail: \"no job '<id>'\"`.\n\nNo cancel semantics: the worker doesn't currently observe a cancel signal mid-analysis, so `include_cancel=False` on the mounted router (see main.py). Deleting a job that's still `pending` removes the row before any worker claims it, so it never runs (its payload file is swept at the next startup). Deleting one that's `processing` does NOT abort the in-flight worker task — the worker will attempt to write its result/error to a row that no longer exists (logged, but harmless). See API.md § `DELETE /jobs/{job_id}`."
+        "description": "Delete the job row AND its artifact directory (the router's `on_delete` hook removes the directory first, so no files are left that nothing points at — the `text.*.json` layers go with it). **404** for an unknown job id. A running job is not interrupted. See API.md § `DELETE /jobs/{job_id}`."
       },
       "response": []
+    },
+    {
+      "name": "Documents",
+      "description": "One ready-to-run POST /assess per fixture in unit-tests/classifier/documents/ — a native PDF, a scanned PDF (and a never-vs-always OCR pair), a .txt, a .docx, a well and a badly photographed letter, and the two refusals (a legacy .doc and a two-page PDF). Each carries criteria tailored to its fixture and states the expected outcome; the folder's README.md holds the same table plus curl equivalents. Regenerate the fixtures with `uv run --package classifier python unit-tests/classifier/documents/make_fixtures.py`. Postman resolves each `src` relative to its working directory — re-select the file if it cannot find it.",
+      "item": [
+        {
+          "name": "invoice_native.pdf — native text, all four match modes",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": "unit-tests/classifier/documents/invoice_native.pdf",
+                  "description": "1-page PDF with a real text layer and a line-items table."
+                },
+                {
+                  "key": "criteria",
+                  "type": "text",
+                  "value": "[{\"name\":\"Invoice #INV-2026-0042\",\"type\":\"text\",\"weight\":3.0},{\"name\":\"Notice to Owner\",\"type\":\"text\",\"weight\":3.0,\"options\":{\"match\":\"fuzzy\"}},{\"name\":\"Payment Terms: Net 30\",\"type\":\"text\",\"weight\":2.0,\"options\":{\"match\":\"exact\"}},{\"name\":\"total amount\",\"type\":\"text\",\"options\":{\"match\":\"regex\",\"pattern\":\"\\\\$[\\\\d,]+\\\\.\\\\d{2}\"}},{\"name\":\"lien waiver attached\",\"type\":\"text\",\"options\":{\"match\":\"fuzzy\",\"pattern\":\"Lien Waiver Release\"}},{\"name\":\"sharpness\",\"type\":\"cv\"},{\"name\":\"document legibility\",\"type\":\"llm\",\"options\":{\"hint\":\"quality\"}}]",
+                  "description": "JSON array of criterion objects — the same shape the JSON body's `criteria` takes. See GET /criterion-types."
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/assess",
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "classifier",
+                "assess"
+              ]
+            },
+            "description": "Expected: overall PASS (~9). `Invoice #INV-2026-0042` PASS 10 (contains), `Notice to Owner` PASS 10 (fuzzy ratio ≈ 0.86 — the document says NOTICE TO OWNER), `Payment Terms: Net 30` PASS 10 (whole-line), `total amount` PASS 10 with `count: 3`, `lien waiver attached` FAIL 1 (best ratio ≈ 0.47, below the 0.5 partial-credit floor), `sharpness` PASS, `document legibility` scored by one model call of its own (page image + text layer).\n\n`documents[0].document_info.ocr.layers` has ONE entry, `auto`, with `ran: false` — a native text layer needs no OCR — and every text criterion links the same `artifacts.text[0].url` → `text.p0.auto.json` (`source: \"native\"`)."
+          },
+          "response": []
+        },
+        {
+          "name": "invoice_scanned.pdf — OCR does the work (ocr=auto)",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": "unit-tests/classifier/documents/invoice_scanned.pdf",
+                  "description": "The invoice as a page IMAGE only — no text layer."
+                },
+                {
+                  "key": "criteria",
+                  "type": "text",
+                  "value": "[{\"name\":\"Notice to Owner\",\"type\":\"text\",\"weight\":3.0,\"options\":{\"match\":\"fuzzy\",\"fuzzy_threshold\":0.8}},{\"name\":\"Invoice #INV-2026-0042\",\"type\":\"text\",\"options\":{\"match\":\"fuzzy\",\"fuzzy_threshold\":0.75}},{\"name\":\"Payment Terms: Net 30\",\"type\":\"text\",\"options\":{\"match\":\"fuzzy\",\"fuzzy_threshold\":0.8}},{\"name\":\"sharpness\",\"type\":\"cv\"},{\"name\":\"document legibility\",\"type\":\"llm\",\"options\":{\"hint\":\"quality\"}}]",
+                  "description": "JSON array of criterion objects — the same shape the JSON body's `criteria` takes. See GET /criterion-types."
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/assess",
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "classifier",
+                "assess"
+              ]
+            },
+            "description": "Expected: overall PASS (~9). Every text criterion uses `options.ocr` \"auto\" (the default), so they share ONE OCR pass and one `text.p0.auto.json` (`source: \"ocr\"`, confidence ≈ 0.99). `Invoice #INV-2026-0042` PASSes via fuzzy because OCR drops the space (`Invoice#INV-…`). `sharpness` PASS (~8)."
+          },
+          "response": []
+        },
+        {
+          "name": "invoice_scanned.pdf — ocr never vs always (expect one FAIL)",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": "unit-tests/classifier/documents/invoice_scanned.pdf",
+                  "description": "The document. Its kind is detected from the bytes, never the filename or the part's Content-Type."
+                },
+                {
+                  "key": "criteria",
+                  "type": "text",
+                  "value": "[{\"name\":\"Notice to Owner\",\"type\":\"text\",\"options\":{\"match\":\"fuzzy\",\"ocr\":\"never\"}},{\"name\":\"Notice to Owner (OCR)\",\"type\":\"text\",\"options\":{\"match\":\"fuzzy\",\"pattern\":\"Notice to Owner\",\"ocr\":\"always\"}},{\"name\":\"sharpness\",\"type\":\"cv\"}]",
+                  "description": "JSON array of criterion objects — the same shape the JSON body's `criteria` takes. See GET /criterion-types."
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/assess",
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "classifier",
+                "assess"
+              ]
+            },
+            "description": "Two text criteria, two OCR settings, one document. `Notice to Owner` (`ocr: never`) FAILs 1 with \"No text available for this document under ocr=never…\"; `Notice to Owner (OCR)` (`ocr: always`) PASSes. The job stores TWO text layers — `text.p0.never.json` (`source: \"none\"`, empty text) and `text.p0.always.json` (`source: \"ocr\"`) — and each criterion's `artifacts.text` lists its own. Overall MARGINAL/PASS depending on the weighting; the point is the per-criterion pair."
+          },
+          "response": []
+        },
+        {
+          "name": "contract.txt — text-only document, cv SKIPS",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": "unit-tests/classifier/documents/contract.txt",
+                  "description": "The document. Its kind is detected from the bytes, never the filename or the part's Content-Type."
+                },
+                {
+                  "key": "criteria",
+                  "type": "text",
+                  "value": "[{\"name\":\"Limited Warranty\",\"type\":\"text\",\"weight\":3.0},{\"name\":\"contract date\",\"type\":\"text\",\"options\":{\"match\":\"regex\",\"pattern\":\"\\\\d{4}-\\\\d{2}-\\\\d{2}\"}},{\"name\":\"sharpness\",\"type\":\"cv\"},{\"name\":\"mentions a warranty period\",\"type\":\"llm\",\"options\":{\"hint\":\"presence\"}}]",
+                  "description": "JSON array of criterion objects — the same shape the JSON body's `criteria` takes. See GET /criterion-types."
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/assess",
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "classifier",
+                "assess"
+              ]
+            },
+            "description": "Expected: overall PASS. `Limited Warranty` PASS 10 (`count: 3`), `contract date` PASS 10, `sharpness` `status: \"skipped\"` (a .txt has no page image — excluded from the weighting, `verdict` null), `mentions a warranty period` scored from a text-only prompt (`detail.image_sent: false`). `page_geometry` has one entry with null sizes and `artifacts.items` is empty."
+          },
+          "response": []
+        },
+        {
+          "name": "proposal.docx — paragraphs + table cells in document order",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": "unit-tests/classifier/documents/proposal.docx",
+                  "description": "The document. Its kind is detected from the bytes, never the filename or the part's Content-Type."
+                },
+                {
+                  "key": "criteria",
+                  "type": "text",
+                  "value": "[{\"name\":\"Roofix Proposal\",\"type\":\"text\",\"weight\":2.0},{\"name\":\"System Size | 8.4 kW\",\"type\":\"text\",\"weight\":3.0,\"options\":{\"match\":\"contains\"}},{\"name\":\"has faces\",\"type\":\"cv\"},{\"name\":\"states the system size\",\"type\":\"llm\",\"options\":{\"hint\":\"presence\"}}]",
+                  "description": "JSON array of criterion objects — the same shape the JSON body's `criteria` takes. See GET /criterion-types."
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/assess",
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "classifier",
+                "assess"
+              ]
+            },
+            "description": "Expected: overall PASS. `Roofix Proposal` PASS 10 (`count: 2`), `System Size | 8.4 kW` PASS 10 (table rows are flattened to `cell | cell`), `has faces` skipped (no page image), `states the system size` scored text-only. `text.p0.auto.json` holds the extracted text, `source: \"native\"`."
+          },
+          "response": []
+        },
+        {
+          "name": "photo_of_letter.png — badly shot but readable",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": "unit-tests/classifier/documents/photo_of_letter.png",
+                  "description": "The document. Its kind is detected from the bytes, never the filename or the part's Content-Type."
+                },
+                {
+                  "key": "criteria",
+                  "type": "text",
+                  "value": "[{\"name\":\"Notice to Owner\",\"type\":\"text\",\"weight\":3.0,\"options\":{\"match\":\"fuzzy\",\"fuzzy_threshold\":0.8}},{\"name\":\"case number\",\"type\":\"text\",\"weight\":2.0,\"options\":{\"match\":\"regex\",\"pattern\":\"CASE-\\\\d{5}\"}},{\"name\":\"sharpness\",\"type\":\"cv\",\"weight\":2.0},{\"name\":\"proper exposure\",\"type\":\"cv\"},{\"name\":\"document legibility\",\"type\":\"llm\",\"options\":{\"hint\":\"quality\"}}]",
+                  "description": "JSON array of criterion objects — the same shape the JSON body's `criteria` takes. See GET /criterion-types."
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/assess",
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "classifier",
+                "assess"
+              ]
+            },
+            "description": "Expected: overall PASS (~10). OCR reads the skewed, unevenly lit page (one pass, `text.p0.auto.json`, confidence ≈ 0.99): `Notice to Owner` PASS 10 (ratio ≈ 0.88), `case number` PASS 10 (`CASE-77813`), `sharpness` PASS (~10), `proper exposure` PASS (~9)."
+          },
+          "response": []
+        },
+        {
+          "name": "photo_of_letter_blurry.png — sharpness FAIL cascades",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": "unit-tests/classifier/documents/photo_of_letter_blurry.png",
+                  "description": "The document. Its kind is detected from the bytes, never the filename or the part's Content-Type."
+                },
+                {
+                  "key": "criteria",
+                  "type": "text",
+                  "value": "[{\"name\":\"Notice to Owner\",\"type\":\"text\",\"weight\":3.0,\"options\":{\"match\":\"fuzzy\",\"fuzzy_threshold\":0.8}},{\"name\":\"case number\",\"type\":\"text\",\"weight\":2.0,\"options\":{\"match\":\"regex\",\"pattern\":\"CASE-\\\\d{5}\"}},{\"name\":\"sharpness\",\"type\":\"cv\",\"weight\":2.0},{\"name\":\"document legibility\",\"type\":\"llm\",\"depends_on\":\"sharpness\",\"options\":{\"hint\":\"quality\"}}]",
+                  "description": "JSON array of criterion objects — the same shape the JSON body's `criteria` takes. See GET /criterion-types."
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/assess",
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "classifier",
+                "assess"
+              ]
+            },
+            "description": "Expected: overall MARGINAL (~5). `sharpness` FAIL 1 (variance ≈ 7), `Notice to Owner` PASS 10 (the headings survive OCR), `case number` FAIL 1, and `document legibility` SKIPPED — its `depends_on: sharpness` did not PASS, so it was never evaluated (no model call; `reason` names the dependency)."
+          },
+          "response": []
+        },
+        {
+          "name": "unsupported_legacy.doc — expect 400",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": "unit-tests/classifier/documents/unsupported_legacy.doc",
+                  "description": "The document. Its kind is detected from the bytes, never the filename or the part's Content-Type."
+                },
+                {
+                  "key": "criteria",
+                  "type": "text",
+                  "value": "[{\"name\":\"Notice to Owner\",\"type\":\"text\"}]",
+                  "description": "JSON array of criterion objects — the same shape the JSON body's `criteria` takes. See GET /criterion-types."
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/assess",
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "classifier",
+                "assess"
+              ]
+            },
+            "description": "Expected: **HTTP 400** at submit — \"Legacy .doc (OLE2 compound) files are not supported. Convert the file to .docx…\". Nothing is queued."
+          },
+          "response": []
+        },
+        {
+          "name": "invoice_two_page.pdf — two items, a sentence across the page break (scope: document)",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": "unit-tests/classifier/documents/invoice_two_page.pdf",
+                  "description": "The document: a two-page native PDF — items 0 and 1. Its kind is detected from the bytes, never the filename or the part's Content-Type."
+                },
+                {
+                  "key": "criteria",
+                  "type": "text",
+                  "value": "[{\"name\":\"Net 30\",\"type\":\"text\"},{\"name\":\"remit to Acme (scope: document)\",\"type\":\"text\",\"options\":{\"pattern\":\"remit the balance to the Acme Roofing billing office\",\"scope\":\"document\"}},{\"name\":\"remit to Acme (per page)\",\"type\":\"text\",\"options\":{\"pattern\":\"remit the balance to the Acme Roofing billing office\"}},{\"name\":\"NOTICE TO OWNER on every page\",\"type\":\"text\",\"options\":{\"pattern\":\"NOTICE TO OWNER\",\"aggregate\":\"all\"}},{\"name\":\"sharpness\",\"type\":\"cv\"}]",
+                  "description": "JSON array of criterion objects — the same shape the JSON body's `criteria` takes, sent ONCE: it covers every document. See GET /criterion-types."
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/assess",
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "classifier",
+                "assess"
+              ]
+            },
+            "description": "One document, TWO items (every page is one). Page 1 ends \"Please remit the balance to\" and page 2 begins \"the Acme Roofing billing office.\" — one sentence over the page break.\n\nExpected: `Net 30` PASS 10 (text default `sum`: items FAIL / PASS, 1 hit in total — on page 2); `remit to Acme (scope: document)` PASS 10 — the pages are joined with one space and searched as one text, one `items` entry for the whole document (`item: null`, `items: [0, 1]`), and regions on BOTH pages (`page` 0 and 1, `source: \"pdf-text\"`), the half of the phrase each holds; its joined text is `text.d0.auto.json`; `remit to Acme (per page)` FAIL 1 — on neither page alone; `NOTICE TO OWNER on every page` (`aggregate: \"all\"`) FAIL 1 — PASS on item 0, FAIL on item 1, and all = worst; `sharpness` PASS (cv: worst of the two renders). Overall from the aggregates. The top-level `items` have each page's own score; `text.p0.auto.json` and `text.p1.auto.json` are each page's layer. See API.md § Text across pages — scope: \"document\"."
+          },
+          "response": []
+        },
+        {
+          "name": "invoice_native.pdf + photo_of_letter.png + contract.txt — three documents, one request",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": "unit-tests/classifier/documents/invoice_native.pdf",
+                  "description": "Document 0 — a native one-page PDF: item 0."
+                },
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": "unit-tests/classifier/documents/photo_of_letter.png",
+                  "description": "Document 1 — a photographed letter (OCR): item 1."
+                },
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": "unit-tests/classifier/documents/contract.txt",
+                  "description": "Document 2 — plain text, no page image: item 2."
+                },
+                {
+                  "key": "criteria",
+                  "type": "text",
+                  "value": "[{\"name\":\"Notice to Owner\",\"type\":\"text\",\"options\":{\"match\":\"fuzzy\"}},{\"name\":\"Notice to Owner in every document\",\"type\":\"text\",\"options\":{\"pattern\":\"Notice to Owner\",\"match\":\"fuzzy\",\"aggregate\":{\"documents\":\"all\"}}},{\"name\":\"sharpness\",\"type\":\"cv\"},{\"name\":\"has text\",\"type\":\"cv\",\"score\":false},{\"name\":\"mentions a warranty\",\"type\":\"llm\",\"options\":{\"hint\":\"presence\"}}]",
+                  "description": "JSON array of criterion objects — the same shape the JSON body's `criteria` takes, sent ONCE: it covers every document. See GET /criterion-types."
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/assess",
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "classifier",
+                "assess"
+              ]
+            },
+            "description": "Three documents in one job, three items: a native PDF, a photo that needs OCR, and a .txt. Each criterion runs once per item and is aggregated per its `options.aggregate`.\n\nExpected: `Notice to Owner` PASS 10 (fuzzy, text default `sum` — found on the invoice and the letter, not in the contract; the counts add up); `Notice to Owner in every document` FAIL (`documents: all` — the contract does not say it); `sharpness` PASS (cv worst over the two images — the .txt unit is SKIPPED and excluded); `has text` (`score: false`) regions on items 0 and 1 only; `mentions a warranty` (llm presence: any page, all documents) needs the model. Per-item scores are in the top-level `items`; the Per item table of regions_report.py shows every unit. See API.md § Documents, pages and items."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Artifacts",
+      "description": "The four artifact routes, plus the text-layer view. Every job writes an artifact directory (regions.json, text.p<n>.<key>.json per item and text layer, text.d<i>.<key>.json for a scope-document search, p<n>.base.jpg per item with an image, manifest.json with the `items` map); layers render on first fetch. n is the global item index. Set `jobId` (and `artifactName`) from a completed job.",
+      "item": [
+        {
+          "name": "GET /jobs/:jobId/artifacts",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/jobs/:jobId/artifacts",
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "classifier",
+                "jobs",
+                ":jobId",
+                "artifacts"
+              ],
+              "variable": [
+                {
+                  "key": "jobId",
+                  "value": "",
+                  "description": "job_id returned by POST /assess (202 body). Paste it here, or set the collection variable `jobId`."
+                }
+              ],
+              "query": [
+                {
+                  "key": "criterion",
+                  "value": "",
+                  "disabled": true,
+                  "description": "Criterion SLUG (not name), from the manifest's `criteria` map or a result's `artifacts.slug`. Repeatable — the union of the criteria given. Scopes the manifest: `files` whose `criteria` intersect them, only those `criteria` entries, only the `items` they have regions on or read a text layer for, plus `layers` and `filter`. An unknown slug is a 400."
+                }
+              ]
+            },
+            "description": "The manifest: `{job_id, created_at, expires_at, options, criteria, page_geometry, files, total_bytes, dropped, notes, items, zip_url}`. `files` is what is on disk NOW, each with its `url` — layers appear once they have been fetched (they render on first fetch). Every `files` entry is labelled: `kind` (`manifest` | `regions` | `text` | `layer` | `base`; `other` never occurs for a name the service writes), `format` where it adds information (layers `svg` | `png` | `preview`, text layers `json`; omitted otherwise), `item` (the global item index, `null` for manifest.json, regions.json and document-scope `text.d<i>.*`), `document` (from the `items` map, `i` for `text.d<i>.*`, `null` for job-wide files) and `criteria` (sorted criterion NAMES the file belongs to: every criterion for manifest.json / regions.json; the criteria that read a text layer; every criterion with a region on item n for `p<n>.svg|layer.png|preview.jpg` and `p<n>.base.jpg`; exactly the one criterion for `p<n>.<slug>.*`). The job result's `artifacts.files` carries the same labels (one function writes both). `criteria` maps each criterion name to its `slug`, region `count`, `sources`, and `text_layers` (the `text.p<n>.<key>.json` / `text.d<i>.<key>.json` files its units used). `items` maps each item n to `{document, page, filename}`; `options.byte_cap` is `{per_item, items, total}` — CLASSIFIER_ARTIFACT_MAX_BYTES is a per-item allowance.\n\n**`?criterion=<slug>` (repeatable)** scopes it to those criteria: `files`, `criteria` and `items` cut down as above (`total_bytes` is the scoped files' sum), `layers` — `{\"<n>\": {\"<slug>\": {svg, png, preview}}}`, on each item where that criterion has hits (regions) only — a page it searched without a hit is in `items` but gets no layer — the URLs `p<n>.svg?criterion=<slug>` / `p<n>.layer.png?criterion=<slug>` / `p<n>.preview.jpg?criterion=<slug>` (preview only when `p<n>.base.jpg` exists), fetchable whether or not they are rendered yet — `filter: {criterion: [slugs], criteria: [names]}`, and `zip_url` carrying the same `?criterion=`. Without it the manifest is the whole job.\n\nEvery job writes a directory, so **404** means the job is unknown or has not finished; **410** means it had artifacts and the TTL sweeper or a DELETE removed them; **400** for an unknown slug. See API.md § `GET /jobs/{job_id}/artifacts`."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /jobs/:jobId/artifacts/:artifactName",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/jobs/:jobId/artifacts/:artifactName",
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "classifier",
+                "jobs",
+                ":jobId",
+                "artifacts",
+                ":artifactName"
+              ],
+              "query": [
+                {
+                  "key": "criterion",
+                  "value": "",
+                  "disabled": true,
+                  "description": "Criterion SLUG (not name), from the manifest's `criteria` map or a result's `artifacts.slug`. Repeatable. Filters the render to that criterion's regions. An unknown slug is a 400."
+                },
+                {
+                  "key": "source",
+                  "value": "",
+                  "disabled": true,
+                  "description": "Comma list of `cv`, `ocr`, `pdf-text`, `llm`, `detector`. Only regions from those sources are drawn."
+                },
+                {
+                  "key": "attempt",
+                  "value": "",
+                  "disabled": true,
+                  "description": "LLM criteria only: the box from enforcement-loop attempt N, accepted or not — how a REJECTED box is viewed on its own. `artifacts.attempts[]` in the result carries these URLs ready-made."
+                },
+                {
+                  "key": "accepted",
+                  "value": "",
+                  "disabled": true,
+                  "description": "LLM criteria only. `true` (the default when no `attempt` is given) keeps the accepted attempt; `false` keeps the rejected ones."
+                }
+              ],
+              "variable": [
+                {
+                  "key": "jobId",
+                  "value": "",
+                  "description": "job_id returned by POST /assess (202 body). Paste it here, or set the collection variable `jobId`."
+                },
+                {
+                  "key": "artifactName",
+                  "value": "regions.json",
+                  "description": "A file name in the job's artifact directory — see GET /jobs/:jobId/artifacts for the list. n is the job's global ITEM index (every page of every document; the manifest's `items` map says which document and page n is). Written at job time: `regions.json`, `manifest.json`, `p<n>.base.jpg` (per item with a page image), one `text.p<n>.<key>.json` per item and distinct text layer the criteria used (`text.p0.auto.json`, `text.p0.always.json`, `text.p1.never.json`, …), and `text.d<i>.<key>.json` for a scope-document text search. Rendered on FIRST FETCH and then cached: `p<n>.svg`, `p<n>.layer.png`, `p<n>.preview.jpg`, and per criterion `p<n>.<slug>.svg` / `.layer.png` / `.preview.jpg`. Always available as a view: `text.p<n>.<key>.txt` / `text.d<i>.<key>.txt` (the layer's text, plain)."
+                }
+              ]
+            },
+            "description": "Stream one file with its content type (`application/json`, `image/svg+xml`, `image/png`, `image/jpeg`, `text/plain; charset=utf-8`). n is the job's global item index.\n\n* A file that exists is streamed as-is.\n* A LAYER that does not exist yet — `p<n>.svg`, `p<n>.layer.png`, `p<n>.preview.jpg`, or per criterion `p<n>.<slug>.svg|layer.png|preview.jpg` — is rendered from `regions.json` now and cached into the directory (counting against the job's byte cap: CLASSIFIER_ARTIFACT_MAX_BYTES × its items).\n* With any query filter (`criterion`, `source`, `attempt`, `accepted`) `regions.json` or a combined `p<n>.*` layer is re-rendered for that subset by the same renderer; only the plain single-criterion view is cached (as `p<n>.<slug>.<suffix>`), so the filtered and stored views can never disagree. An `attempt` number is per item — each item's unit runs its own loop.\n* `text.p<n>.<key>.txt` / `text.d<i>.<key>.txt` returns the `text` field of the matching `.json` as plain text.\n\n**Errors:** 400 for an unsafe name, an unknown slug, or a filter on a file that is not regions.json / a combined layer; 404 for an unknown or unfinished job, a missing file that is not a layer, a layer on an item with no page image (.txt/.docx) or no such item, or a preview whose base image the byte cap dropped; 410 when the directory was swept or deleted. See API.md § `GET /jobs/{job_id}/artifacts/{name}`."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /jobs/:jobId/artifacts/:artifactName — text.p0.auto.json (the text a criterion searched)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/jobs/:jobId/artifacts/:artifactName",
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "classifier",
+                "jobs",
+                ":jobId",
+                "artifacts",
+                ":artifactName"
+              ],
+              "variable": [
+                {
+                  "key": "jobId",
+                  "value": "",
+                  "description": "job_id returned by POST /assess (202 body). Paste it here, or set the collection variable `jobId`."
+                },
+                {
+                  "key": "artifactName",
+                  "value": "text.p0.auto.json",
+                  "description": "`text.p<n>.<key>.json` — item n's layer under a setting; the file is in each unit's `items[].text_layer.url` and in the criterion's `artifacts.text[].url` (and the manifest's `criteria.<name>.text_layers`). `text.d<i>.<key>.json` for a scope-document search. Swap `.json` for `.txt` for plain text."
+                }
+              ]
+            },
+            "description": "The exact text a `text` unit searched (and an `llm` unit was sent), as the job stored it. One file per ITEM and distinct text layer, named `text.p<n>.<key>.json` — the key is the settings: `auto`, `always`, `never` (a future non-default OCR setting adds a hash: `auto-1a2b3c4d`) — and shared by every criterion that used those settings on that page. Each unit's entry links its own (`items[].text_layer = {key, url, source, chars}`), the criterion lists them all (`artifacts.text = [{item, key, url, source, chars}, …]`), and `options_used.ocr` agrees with the key.\n\nBody: `{key, item, settings: {mode, min_native_chars, engine}, source: native|ocr|none, engine: \"rapidocr\"|null, chars, confidence, text, lines: [{text, polygon, confidence}]}`. `text` is byte-for-byte the string `match_text` searched, so a failed match can be diagnosed from this file alone. `lines` are the OCR lines with polygons in ORIGINAL page pixels; empty for native text (.txt, .docx, and native PDF text, whose line geometry is not recorded).\n\nA text criterion with `options.scope: \"document\"` searched `text.d<i>.<key>.json` instead: `{key, scope: \"document\", document, settings, separator: \" \", source, chars, text, segments: [{item, page, start, end, page_offset, file}]}` — the document's pages' layers joined in page order, and where each page sits in the joined string.\n\nSet `artifactName` to `text.p0.auto.txt` for the same text as `text/plain; charset=utf-8`. Written for every job whose criteria read text, native or OCR'd; never dropped by the byte cap; deleted with the job. **404** when the job has no layer by that name."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /jobs/:jobId/artifacts.zip",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/jobs/:jobId/artifacts.zip",
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "classifier",
+                "jobs",
+                ":jobId",
+                "artifacts.zip"
+              ],
+              "variable": [
+                {
+                  "key": "jobId",
+                  "value": "",
+                  "description": "job_id returned by POST /assess (202 body). Paste it here, or set the collection variable `jobId`."
+                }
+              ],
+              "query": [
+                {
+                  "key": "criterion",
+                  "value": "",
+                  "disabled": true,
+                  "description": "Criterion SLUG (not name). Repeatable — the union. Scopes the zip to what belongs to those criteria (see the item description). An unknown slug is a 400."
+                }
+              ]
+            },
+            "description": "Every file currently in the directory, streamed as one zip (`application/zip`, `Content-Disposition: attachment`), each entry `<job_id>/<name>`. Built from what is on disk, so layers that were never fetched are not in it — fetch them first if you want them.\n\n**`?criterion=<slug>` (repeatable)** streams ONLY what belongs to those criteria: `regions.json` reduced to them and the scoped `manifest.json` (as the manifest's `?criterion=` returns it) — both generated for the zip, the stored files are never rewritten — the text layers they read, the `p<n>.base.jpg` of each item they have regions on, and each criterion's own `p<n>.<slug>.svg` / `.layer.png` / `.preview.jpg` on those items, rendered and cached first if nobody has fetched them (preview only where the base exists). Combined `p<n>.*` layers are not included. A byte-capped directory yields what survived. The manifest's file labels are described on GET /jobs/:jobId/artifacts.\n\n**404** / **410** as for the manifest; **400** for an unknown slug. See API.md § `GET /jobs/{job_id}/artifacts.zip`."
+          },
+          "response": []
+        },
+        {
+          "name": "DELETE /jobs/:jobId/artifacts",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/jobs/:jobId/artifacts",
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "classifier",
+                "jobs",
+                ":jobId",
+                "artifacts"
+              ],
+              "variable": [
+                {
+                  "key": "jobId",
+                  "value": "",
+                  "description": "job_id returned by POST /assess (202 body). Paste it here, or set the collection variable `jobId`."
+                }
+              ]
+            },
+            "description": "Free the disk and keep the job row: removes the whole artifact directory (regions.json, text layers, base image, cached layers). **204** on success; **404** for an unknown job or one with no directory. Afterwards the artifact routes answer **410**. The inline regions in the result survive."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Regions",
+      "description": "Fixtures chosen for their geometry (unit-tests/classifier/regions/README.md): OpenCV mask polygons, merged text blocks, OCR line polygons, native-PDF rectangles, the detector, `score: false`, and the LLM enforcement loop. Regions are always stored; fetch the layers from `result.artifacts.items[0].layers` (rendered on first fetch).",
+      "item": [
+        {
+          "name": "greenery_and_sky.png — three mask detectors, three polygon sets",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": "unit-tests/classifier/regions/greenery_and_sky.png",
+                  "description": "The document. Its kind is detected from the bytes, never the filename or the part's Content-Type."
+                },
+                {
+                  "key": "criteria",
+                  "type": "text",
+                  "value": "[{\"name\":\"has sky\",\"type\":\"cv\"},{\"name\":\"has vegetation\",\"type\":\"cv\"},{\"name\":\"has water\",\"type\":\"cv\"},{\"name\":\"sharpness\",\"type\":\"cv\"}]",
+                  "description": "JSON array of criterion objects — the same shape the JSON body's `criteria` takes. See GET /criterion-types."
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/assess",
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "classifier",
+                "assess"
+              ]
+            },
+            "description": "Expected: `has sky` PASS with 1 polygon ≈ (0,0)-(899,243); `has vegetation` PASS with 1 polygon ≈ (0,359)-(899,699); `has water` PASS with **2** polygons (the sky band and the pool ≈ (90,518)-(430,651) — detect_water accepts any smooth blue region); `sharpness` FAIL 2 with `regions: []` and `artifacts: null` (a whole-page measurement never fabricates a box). Fetch `p0.svg` / `p0.preview.jpg` from `result.artifacts.items[0].layers` to see them — rendered on first fetch."
+          },
+          "response": []
+        },
+        {
+          "name": "text_blocks.png — merged text-block boxes + OCR line polygons",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": "unit-tests/classifier/regions/text_blocks.png",
+                  "description": "The document. Its kind is detected from the bytes, never the filename or the part's Content-Type."
+                },
+                {
+                  "key": "criteria",
+                  "type": "text",
+                  "value": "[{\"name\":\"has text\",\"type\":\"cv\"},{\"name\":\"Notice to Owner\",\"type\":\"text\",\"options\":{\"match\":\"fuzzy\",\"fuzzy_threshold\":0.8,\"ocr\":\"always\"}},{\"name\":\"total amount\",\"type\":\"text\",\"options\":{\"match\":\"regex\",\"pattern\":\"\\\\$[\\\\d,]+\\\\.\\\\d{2}\",\"ocr\":\"always\"}}]",
+                  "description": "JSON array of criterion objects — the same shape the JSON body's `criteria` takes. See GET /criterion-types."
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/assess",
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "classifier",
+                "assess"
+              ]
+            },
+            "description": "Expected: `has text` MARGINAL 5 with **4** merged block boxes (two columns); `Notice to Owner` PASS with 1–2 `ocr` polygons; `total amount` PASS with 1 `ocr` polygon (the $4,850.00 line). The two text criteria share one OCR pass (`text.p0.always.json`)."
+          },
+          "response": []
+        },
+        {
+          "name": "invoice_native.pdf — native PDF rectangles (source=pdf-text)",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": "unit-tests/classifier/documents/invoice_native.pdf",
+                  "description": "The document. Its kind is detected from the bytes, never the filename or the part's Content-Type."
+                },
+                {
+                  "key": "criteria",
+                  "type": "text",
+                  "value": "[{\"name\":\"Notice to Owner\",\"type\":\"text\",\"options\":{\"ocr\":\"never\"}},{\"name\":\"total amount\",\"type\":\"text\",\"options\":{\"match\":\"regex\",\"pattern\":\"\\\\$[\\\\d,]+\\\\.\\\\d{2}\",\"ocr\":\"never\"}},{\"name\":\"has text\",\"type\":\"cv\"}]",
+                  "description": "JSON array of criterion objects — the same shape the JSON body's `criteria` takes. See GET /criterion-types."
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/assess",
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "classifier",
+                "assess"
+              ]
+            },
+            "description": "Expected: `Notice to Owner` → 1 `pdf-text` box with `attrs.pdf_rect ≈ [60.0, 220.2, 193.8, 239.4]` (points; the region's own points are rendered page pixels, 1240×1755 at 150 dpi); `total amount` → 3 boxes reconstructed from word spans; `has text` → block boxes. `page_geometry[0].pdf_points` ≈ [595.2, 842.4]. The native layer is `text.p0.never.json` (`source: \"native\"`)."
+          },
+          "response": []
+        },
+        {
+          "name": "photo_of_letter.png — OCR line polygons on a skewed page",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": "unit-tests/classifier/documents/photo_of_letter.png",
+                  "description": "The document. Its kind is detected from the bytes, never the filename or the part's Content-Type."
+                },
+                {
+                  "key": "criteria",
+                  "type": "text",
+                  "value": "[{\"name\":\"Notice to Owner\",\"type\":\"text\",\"options\":{\"match\":\"fuzzy\",\"fuzzy_threshold\":0.8,\"ocr\":\"always\"}}]",
+                  "description": "JSON array of criterion objects — the same shape the JSON body's `criteria` takes. See GET /criterion-types."
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/assess",
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "classifier",
+                "assess"
+              ]
+            },
+            "description": "Expected: PASS. The heading comes back as an `ocr` polygon ≈ (67,197)-(360,244), score ≈ 0.999, `attrs.text` \"NOTICE TO OWNER\" — a real quadrilateral that follows the 3° skew. The same polygon is in `text.p0.always.json` → `lines[]`."
+          },
+          "response": []
+        },
+        {
+          "name": "Neighborhood.jpeg — a real photo, and the empty-regions case",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": "unit-tests/classifier/Neighborhood.jpeg",
+                  "description": "The document. Its kind is detected from the bytes, never the filename or the part's Content-Type."
+                },
+                {
+                  "key": "criteria",
+                  "type": "text",
+                  "value": "[{\"name\":\"has faces\",\"type\":\"cv\"},{\"name\":\"has sky\",\"type\":\"cv\"}]",
+                  "description": "JSON array of criterion objects — the same shape the JSON body's `criteria` takes. See GET /criterion-types."
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/assess",
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "classifier",
+                "assess"
+              ]
+            },
+            "description": "Expected: `has sky` PASS with ~4 polygons. `has faces` is cascade-dependent — do not assert a count; when it finds nothing it must come back `regions: []` and `artifacts: null`, never `{}`."
+          },
+          "response": []
+        },
+        {
+          "name": "Neighborhood.jpeg — the detector, scored with no LLM call",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": "unit-tests/classifier/Neighborhood.jpeg",
+                  "description": "The document. Its kind is detected from the bytes, never the filename or the part's Content-Type."
+                },
+                {
+                  "key": "criteria",
+                  "type": "text",
+                  "value": "[{\"name\":\"has roof vent\",\"type\":\"cv\"},{\"name\":\"has bicycle\",\"type\":\"detector\",\"options\":{\"threshold\":0.25}},{\"name\":\"has sky\",\"type\":\"cv\"}]",
+                  "description": "JSON array of criterion objects — the same shape the JSON body's `criteria` takes. See GET /criterion-types."
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/assess",
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "classifier",
+                "assess"
+              ]
+            },
+            "description": "Needs DETECTOR_URL on the container (GET /document-kinds → `regions.detector.configured`); without it the `detector` criterion is a 400 at submit. `has roof vent` has no OpenCV detector, so its `options.fallback` resolves to \"detector\" and it comes back `method: \"detector\"`, scored from the boxes (10 at ≥ 0.5, 7 above the floor, 1 with no LLM call when nothing is found). `has bicycle` names the path outright, with its own threshold. `has sky` stays OpenCV. A detector outage fails only the detector criteria (`status: \"error\"`, `complete: false`)."
+          },
+          "response": []
+        },
+        {
+          "name": "text_blocks.png — locate without judging (score: false)",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": "unit-tests/classifier/regions/text_blocks.png",
+                  "description": "The document. Its kind is detected from the bytes, never the filename or the part's Content-Type."
+                },
+                {
+                  "key": "criteria",
+                  "type": "text",
+                  "value": "[{\"name\":\"has text\",\"type\":\"cv\",\"score\":false},{\"name\":\"Notice to Owner\",\"type\":\"text\",\"score\":false,\"options\":{\"match\":\"fuzzy\",\"fuzzy_threshold\":0.8,\"ocr\":\"always\"}}]",
+                  "description": "JSON array of criterion objects — the same shape the JSON body's `criteria` takes. See GET /criterion-types."
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/assess",
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "classifier",
+                "assess"
+              ]
+            },
+            "description": "What /locate used to do. Both criteria have `score: false`: they run exactly as scored ones and return their regions, but `score` / `verdict` / `confidence` are null and they are excluded from the weighting — so `overall_score` and `verdict` are null and `weighted_score_breakdown` is null. Expected: `has text` 4 boxes, `Notice to Owner` ≥ 1 `ocr` polygon. `score: false` on a criterion that cannot produce geometry (an llm criterion without `options.boxes`, `sharpness`) is a 400."
+          },
+          "response": []
+        },
+        {
+          "name": "Neighborhood.jpeg — the LLM enforcement loop (options.boxes)",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": "unit-tests/classifier/Neighborhood.jpeg",
+                  "description": "The document. Its kind is detected from the bytes, never the filename or the part's Content-Type."
+                },
+                {
+                  "key": "criteria",
+                  "type": "text",
+                  "value": "[{\"name\":\"solar panels\",\"type\":\"llm\",\"options\":{\"hint\":\"presence\",\"boxes\":true}},{\"name\":\"a parked car\",\"type\":\"llm\",\"options\":{\"hint\":\"presence\",\"boxes\":true,\"max_attempts\":2}},{\"name\":\"image sharpness\",\"type\":\"llm\",\"options\":{\"hint\":\"quality\",\"boxes\":true}}]",
+                  "description": "JSON array of criterion objects — the same shape the JSON body's `criteria` takes. See GET /criterion-types."
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/assess",
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "classifier",
+                "assess"
+              ]
+            },
+            "description": "The loop runs per criterion with `options.boxes: true`: ask for a box on a labelled 0-1000 grid → validate → refine on a zoomed crop → verify the crop alone → retry with the rejection as feedback, up to `options.max_attempts` (never more than CLASSIFIER_LLM_BBOX_MAX_ATTEMPTS). Gated on the presence score (≥ 7) and hint presence/auto — `image sharpness` (quality) is never boxed. Model-dependent; the invariants: identical score/verdict with `boxes` off, every attempt in `localization.attempts` and in `regions` (`attrs.accepted`), `a parked car` ≤ 2 attempts, and `artifacts.attempts[n].svg` renders that attempt. Every call counts against CLASSIFIER_MAX_LLM_CALLS."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Documents + regions",
+      "description": "The document fixtures again, with criteria chosen so the geometry can be looked at: pdf-text rectangles, OCR polygons, the marks on the letter with `options.boxes`, the no-geometry kinds, a JSON-body request, and `score: false` across three types.",
+      "item": [
+        {
+          "name": "invoice_native.pdf — pdf-text rectangles",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": "unit-tests/classifier/documents/invoice_native.pdf",
+                  "description": "The document. Its kind is detected from the bytes, never the filename or the part's Content-Type."
+                },
+                {
+                  "key": "criteria",
+                  "type": "text",
+                  "value": "[{\"name\":\"Invoice #INV-2026-0042\",\"type\":\"text\",\"weight\":3.0},{\"name\":\"Notice to Owner\",\"type\":\"text\",\"weight\":3.0,\"options\":{\"match\":\"fuzzy\"}},{\"name\":\"Payment Terms: Net 30\",\"type\":\"text\",\"weight\":2.0,\"options\":{\"match\":\"exact\"}},{\"name\":\"total amount\",\"type\":\"text\",\"options\":{\"match\":\"regex\",\"pattern\":\"\\\\$[\\\\d,]+\\\\.\\\\d{2}\"}},{\"name\":\"sharpness\",\"type\":\"cv\"},{\"name\":\"document legibility\",\"type\":\"llm\",\"options\":{\"hint\":\"quality\"}}]",
+                  "description": "JSON array of criterion objects — the same shape the JSON body's `criteria` takes. See GET /criterion-types."
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/assess",
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "classifier",
+                "assess"
+              ]
+            },
+            "description": "Expected: every text criterion PASS with `pdf-text` boxes (`total amount` 3), `sharpness` PASS with no regions (whole-page), `document legibility` model-scored. One page, one item: `page_geometry` has one entry."
+          },
+          "response": []
+        },
+        {
+          "name": "invoice_scanned.pdf — OCR line polygons",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": "unit-tests/classifier/documents/invoice_scanned.pdf",
+                  "description": "The document. Its kind is detected from the bytes, never the filename or the part's Content-Type."
+                },
+                {
+                  "key": "criteria",
+                  "type": "text",
+                  "value": "[{\"name\":\"Notice to Owner\",\"type\":\"text\",\"weight\":3.0,\"options\":{\"match\":\"fuzzy\",\"fuzzy_threshold\":0.8}},{\"name\":\"Invoice #INV-2026-0042\",\"type\":\"text\",\"options\":{\"match\":\"fuzzy\",\"fuzzy_threshold\":0.75}},{\"name\":\"Payment Terms: Net 30\",\"type\":\"text\",\"options\":{\"match\":\"fuzzy\",\"fuzzy_threshold\":0.8}},{\"name\":\"sharpness\",\"type\":\"cv\"},{\"name\":\"document legibility\",\"type\":\"llm\",\"options\":{\"hint\":\"quality\"}}]",
+                  "description": "JSON array of criterion objects — the same shape the JSON body's `criteria` takes. See GET /criterion-types."
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/assess",
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "classifier",
+                "assess"
+              ]
+            },
+            "description": "Expected: the three text criteria PASS with `ocr` polygons from one shared OCR pass (`text.p0.auto.json`, `source: \"ocr\"`); `sharpness` PASS, no regions."
+          },
+          "response": []
+        },
+        {
+          "name": "photo_of_letter.png — logo, stamp and signature (options.boxes)",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": "unit-tests/classifier/documents/photo_of_letter.png",
+                  "description": "The document. Its kind is detected from the bytes, never the filename or the part's Content-Type."
+                },
+                {
+                  "key": "criteria",
+                  "type": "text",
+                  "value": "[{\"name\":\"Notice to Owner\",\"type\":\"text\",\"options\":{\"match\":\"fuzzy\",\"fuzzy_threshold\":0.8,\"ocr\":\"always\"}},{\"name\":\"case number\",\"type\":\"text\",\"options\":{\"match\":\"regex\",\"pattern\":\"CASE-\\\\d{5}\",\"ocr\":\"always\"}},{\"name\":\"has text\",\"type\":\"cv\"},{\"name\":\"has a signature\",\"type\":\"llm\",\"options\":{\"hint\":\"presence\",\"boxes\":true}},{\"name\":\"has a company logo\",\"type\":\"llm\",\"options\":{\"hint\":\"presence\",\"boxes\":true}},{\"name\":\"has an official stamp\",\"type\":\"llm\",\"options\":{\"hint\":\"presence\",\"boxes\":true}}]",
+                  "description": "JSON array of criterion objects — the same shape the JSON body's `criteria` takes. See GET /criterion-types."
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/assess",
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "classifier",
+                "assess"
+              ]
+            },
+            "description": "The one fixture with non-text marks (documents/README.md § Marks on the letter): logo ≈ (64,44)-(406,110), stamp ≈ (579,472)-(815,708), signature ≈ (138,943)-(538,1070) in the photographed frame. The three llm criteria run the box loop; the text criteria return OCR polygons from one `always` pass. Model-dependent; assert that an accepted box overlaps the documented one rather than covering the page."
+          },
+          "response": []
+        },
+        {
+          "name": "photo_of_letter_blurry.png — the same marks, degraded",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": "unit-tests/classifier/documents/photo_of_letter_blurry.png",
+                  "description": "The document. Its kind is detected from the bytes, never the filename or the part's Content-Type."
+                },
+                {
+                  "key": "criteria",
+                  "type": "text",
+                  "value": "[{\"name\":\"Notice to Owner\",\"type\":\"text\",\"options\":{\"match\":\"fuzzy\",\"fuzzy_threshold\":0.8,\"ocr\":\"always\"}},{\"name\":\"case number\",\"type\":\"text\",\"options\":{\"match\":\"regex\",\"pattern\":\"CASE-\\\\d{5}\",\"ocr\":\"always\"}},{\"name\":\"has text\",\"type\":\"cv\"},{\"name\":\"has a signature\",\"type\":\"llm\",\"options\":{\"hint\":\"presence\",\"boxes\":true}},{\"name\":\"has a company logo\",\"type\":\"llm\",\"options\":{\"hint\":\"presence\",\"boxes\":true}},{\"name\":\"has an official stamp\",\"type\":\"llm\",\"options\":{\"hint\":\"presence\",\"boxes\":true}}]",
+                  "description": "JSON array of criterion objects — the same shape the JSON body's `criteria` takes. See GET /criterion-types."
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/assess",
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "classifier",
+                "assess"
+              ]
+            },
+            "description": "Same criteria on the blurred letter. `Notice to Owner` still PASSes (the headings survive OCR); `case number` FAILs; the marks' boxes, if any, run wide. Model-dependent for the llm rows."
+          },
+          "response": []
+        },
+        {
+          "name": "proposal.docx — no page images, so no geometry",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": "unit-tests/classifier/documents/proposal.docx",
+                  "description": "The document. Its kind is detected from the bytes, never the filename or the part's Content-Type."
+                },
+                {
+                  "key": "criteria",
+                  "type": "text",
+                  "value": "[{\"name\":\"Roofix Proposal\",\"type\":\"text\"},{\"name\":\"System Size | 8.4 kW\",\"type\":\"text\"},{\"name\":\"has faces\",\"type\":\"cv\"}]",
+                  "description": "JSON array of criterion objects — the same shape the JSON body's `criteria` takes. See GET /criterion-types."
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/assess",
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "classifier",
+                "assess"
+              ]
+            },
+            "description": "Expected: PASS. The text criteria PASS with `regions: []` (a .docx has no geometry — the hits are in `detail.snippets` and the text in `text.p0.auto.json`); `has faces` skipped; `page_geometry` sizes null; `artifacts.items` empty."
+          },
+          "response": []
+        },
+        {
+          "name": "contract.txt — snippets instead of rectangles",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": "unit-tests/classifier/documents/contract.txt",
+                  "description": "The document. Its kind is detected from the bytes, never the filename or the part's Content-Type."
+                },
+                {
+                  "key": "criteria",
+                  "type": "text",
+                  "value": "[{\"name\":\"Limited Warranty\",\"type\":\"text\"},{\"name\":\"contract date\",\"type\":\"text\",\"options\":{\"match\":\"regex\",\"pattern\":\"\\\\d{4}-\\\\d{2}-\\\\d{2}\"}},{\"name\":\"sharpness\",\"type\":\"cv\"}]",
+                  "description": "JSON array of criterion objects — the same shape the JSON body's `criteria` takes. See GET /criterion-types."
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/assess",
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "classifier",
+                "assess"
+              ]
+            },
+            "description": "Expected: PASS. Text hits come back as `detail.snippets`, not regions; `sharpness` skipped. `text.p0.auto.json` is the file itself, byte for byte."
+          },
+          "response": []
+        },
+        {
+          "name": "invoice_native.pdf as a JSON body — same result as multipart",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"document\": {\n    \"type\": \"base64\",\n    \"data\": \"{{invoice_native_b64}}\",\n    \"filename\": \"invoice_native.pdf\"\n  },\n  \"criteria\": [\n    {\n      \"name\": \"Notice to Owner\",\n      \"type\": \"text\",\n      \"weight\": 3.0,\n      \"options\": {\n        \"match\": \"fuzzy\"\n      }\n    },\n    {\n      \"name\": \"Invoice #INV-2026-0042\",\n      \"type\": \"text\",\n      \"weight\": 3.0\n    },\n    {\n      \"name\": \"total amount\",\n      \"type\": \"text\",\n      \"options\": {\n        \"match\": \"regex\",\n        \"pattern\": \"\\\\$[\\\\d,]+\\\\.\\\\d{2}\"\n      }\n    },\n    {\n      \"name\": \"sharpness\",\n      \"type\": \"cv\"\n    }\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/assess",
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "classifier",
+                "assess"
+              ]
+            },
+            "description": "The JSON encoding of a multipart request (fill `invoice_native_b64` first). Parsed into the same AssessRequest, so the result is identical to sending the file as a form part: text criteria PASS with `pdf-text` rectangles, `sharpness` PASS."
+          },
+          "response": []
+        },
+        {
+          "name": "photo_of_letter.png — locate without judging, mixed types",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": "unit-tests/classifier/documents/photo_of_letter.png",
+                  "description": "The document. Its kind is detected from the bytes, never the filename or the part's Content-Type."
+                },
+                {
+                  "key": "criteria",
+                  "type": "text",
+                  "value": "[{\"name\":\"Notice to Owner\",\"type\":\"text\",\"score\":false,\"options\":{\"match\":\"fuzzy\",\"fuzzy_threshold\":0.8,\"ocr\":\"always\"}},{\"name\":\"has text\",\"type\":\"cv\",\"score\":false},{\"name\":\"a signature\",\"type\":\"llm\",\"score\":false,\"options\":{\"hint\":\"presence\",\"boxes\":true}}]",
+                  "description": "JSON array of criterion objects — the same shape the JSON body's `criteria` takes. See GET /criterion-types."
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/assess",
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "classifier",
+                "assess"
+              ]
+            },
+            "description": "Replaces the old `/locate` item. All three are `score: false`: geometry only, no score. The llm criterion still makes its presence call (the loop gates on it), then its score/verdict/confidence are dropped. Expected: `Notice to Owner` ≥ 1 `ocr` polygon, `has text` ≥ 1 box, `a signature` 0+ llm boxes (model-dependent). `overall_score` null."
+          },
+          "response": []
+        }
+      ]
     }
   ]
 }

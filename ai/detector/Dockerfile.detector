@@ -1,0 +1,77 @@
+# Build context is the REPO ROOT (see ai/detector/docker-compose.detector.yml:
+#   context: ../..) so we can copy the shared workspace package alongside the
+# service. Same pattern as ai/classifier/Dockerfile.
+#
+# Base image: plain python:3.11-slim, NOT a CUDA base. torch's Linux wheels on
+# PyPI already ARE the CUDA build — 2.14.0 declares nvidia-cudnn-cu13 /
+# nvidia-nccl-cu13 and ships the CUDA 13 userspace libraries inside the wheel —
+# so a CUDA base image would only add a second, unused copy of them. What the
+# HOST must provide is the driver and the container toolkit:
+#
+#   CUDA major   driver floor   how to get it here
+#   ─────────────────────────────────────────────────────────────────────────
+#   13 (default) R580+          the torch>=2.14 pin in pyproject.toml
+#   12           R525+          pin torch==2.9.1 and add
+#                               --extra-index-url https://download.pytorch.org/whl/cu128
+#                               to the uv sync below
+#
+# Same constraint the llama.cpp stack documents for LLAMA_UNSLOTH_VARIANT: this
+# box runs `cuda13-portable`, so it is already on an R580+ driver and the
+# default pin is the right one. Expect a ~7 GB image either way — most of it is
+# the bundled CUDA libraries. DETECTOR_DEVICE=cpu needs none of this and works
+# on the identical image.
+
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    UV_NO_CACHE=1 \
+    PYTHONPATH=/app/ai/detector \
+    # Weights live here. The compose file mounts the `detector_data` named
+    # volume at this path; Docker SEEDS an empty named volume from the image,
+    # so the baked-in default model below lands in the volume on first start
+    # and a later DETECTOR_MODEL change downloads into it and persists.
+    HF_HOME=/opt/hf
+
+# libgomp1 — OpenMP runtime torch links against on a slim base.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+WORKDIR /app
+
+# Workspace bootstrap.
+COPY pyproject.toml .
+COPY shared/common ./shared/common
+COPY ai/detector/pyproject.toml ./ai/detector/
+
+RUN uv sync --package detector --no-dev
+
+# Pre-warm the weights so a cold container never reaches HuggingFace on its
+# first request — the same reasoning as the classifier's RapidOCR warm-up, and
+# the same shape of guard: the second command fails the build if the download
+# silently produced nothing, so a broken warm-up cannot ship as a runtime
+# surprise. ARG rather than ENV so the baked model is a BUILD choice and
+# DETECTOR_MODEL stays a runtime one; the two match by default.
+ARG DETECTOR_MODEL=google/owlv2-base-patch16-ensemble
+RUN uv run --no-dev --package detector python -c "\
+import sys; \
+from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor; \
+AutoProcessor.from_pretrained(sys.argv[1]); \
+AutoModelForZeroShotObjectDetection.from_pretrained(sys.argv[1])" "$DETECTOR_MODEL" \
+    && uv run --no-dev --package detector python -c "\
+import pathlib; \
+files = list(pathlib.Path('/opt/hf').rglob('*.safetensors')) + list(pathlib.Path('/opt/hf').rglob('*.bin')); \
+assert files, 'model warm-up produced no weight files under /opt/hf'; \
+print('detector weights baked in:', [f.name for f in files])"
+
+# Service code.
+COPY ai/detector/*.py ./ai/detector/
+COPY ai/detector/detectors ./ai/detector/detectors
+
+WORKDIR /app/ai/detector
+EXPOSE 8000
+
+CMD ["uv", "run", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]

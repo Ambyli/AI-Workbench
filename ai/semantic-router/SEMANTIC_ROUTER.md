@@ -307,10 +307,11 @@ docker compose -f ai/semantic-router/docker-compose.semantic-router.yml \
 
 ## Seeing what happened to a turn
 
-Two places, and only the second is authoritative about cost:
+Three places, and only the spend log is authoritative about cost:
 
 - **Which decision matched** — the router log (`make logs semantic-router vllm-sr-router`) and the response's `route_diagnostics` object. A code prompt that shows `general` means the keyword signal missed; add the term to `code_kw`. A PII prompt that shows anything but `privacy_local` is the soft spot from [§ The privacy guarantee](#the-privacy-guarantee--and-the-router-down-path) — widen `privacy_kw`.
 - **Which backend answered** — LiteLLM's **spend log** (Admin UI → Logs / spend by key). Filter on `SEMANTIC_ROUTER_LITELLM_KEY`: each row's *model group* is the chain alias and its *model* is the deployment that answered (`openai/qwen3.8-solo`, `openai/muse-glimmer`, `anthropic/claude-sonnet-5`, …). Overflow to Claude shows up only here. `docker logs litellm | grep '\[overflow\]'` shows the hook's spill decisions alongside.
+- **At a glance, in the chat** — every `auto` answer ends with a footer naming the deployment and chain that served it: `*qwen3.8-solo · local-general*`, with ` · overflow (local busy)` / `(local down)` when a Claude deployment answered and ` · router bypassed` when the router was down and `auto` fell back to `local-private`. LiteLLM derives it from the response headers (`llm_provider-x-litellm-model-*`, `llm_provider-x-vsr-*`), strips it again from the next turn's history before the router sees it, and skips tool calls, `response_format` and Open WebUI background tasks — it is cosmetic, not the cost record. Set Open WebUI's Task Model to a non-`auto` model too. Toggle: `AUTO_FOOTER_ENABLED`. [LITELLM.md § The `auto` footer](../litellm/LITELLM.md#the-auto-footer).
 
 > The exact field names inside `route_diagnostics` are **not** verified — see [§ What is still unverified](#what-is-still-unverified).
 
@@ -335,6 +336,7 @@ Manual — there is no end-to-end suite. The overflow hook's logic has unit test
 | Router down → answered locally | `make down semantic-router vllm-sr-envoy`, then call `auto` (Postman item *fallback check*) | answered by `qwen3.8-solo` or `muse-glimmer`; spend log shows model group `local-private` under the **caller's** key, no Claude row |
 | Long prompt | Send a prompt between 114688 and 245760 tokens to `auto` | answered by `muse-glimmer` (pre-call check skipped `qwen3.8-solo`); a prompt over 245760 is refused, never sent to Claude |
 | Streaming in Open WebUI | Chat on `auto` | UI shows a waiting state (not an error) while the turn runs; the reply renders in full |
+| Backend footer | Chat on `auto` in Open WebUI (streams); `curl -si` the same prompt non-streaming; call `local-general` directly; let a new chat generate its title, tags and follow-ups | every `auto` answer ends `---` / `*<model> · <chain>*` and agrees with the response's `llm_provider-x-litellm-model-name` header and the spend log; the direct chain call, the chat title, tags and follow-ups carry **no** footer; the next turn's router log shows no footer text in the prompt |
 | Key scoping | Call `qwen3.8-solo` directly with `SEMANTIC_ROUTER_LITELLM_KEY` | 401 from LiteLLM — the key reaches only the four chains |
 | Metrics | `curl localhost:9090` → prometheus targets | the `semantic-router` job is UP against `vllm-sr-router:9190` |
 | Exposure | `ss -ltnp` on the box | only `8025` (and `8026` on loopback if enabled); `50051` / `8080` / `9190` / `9901` absent |

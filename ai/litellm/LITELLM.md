@@ -23,7 +23,7 @@ The proxy is reachable at `http://localhost:4001`. Configuration is loaded from 
 - `HF_TOKEN` from `.env` — HuggingFace token for gated model downloads
 - `LITELLM_DATABASE_URL` from `.env` — PostgreSQL connection string
 - `litellm_config.yaml` — proxy config with model definitions and routing rules
-- `overflow.py` — the chain-alias overflow hook, mounted at `/app/overflow.py` beside the config (see [§ Chain aliases and the overflow hook](#chain-aliases-and-the-overflow-hook))
+- `overflow.py` — the chain-alias overflow hook and the `auto` footer, mounted at `/app/overflow.py` beside the config (see [§ Chain aliases and the overflow hook](#chain-aliases-and-the-overflow-hook) and [§ The `auto` footer](#the-auto-footer))
 
 ### Health checks
 
@@ -126,3 +126,62 @@ The overflow hook's unit tests live in [`unit-tests/litellm/test_overflow.py`](.
 uv venv /tmp/llvenv && UV_LINK_MODE=copy uv pip install --python /tmp/llvenv litellm==1.95.0 pytest
 /tmp/llvenv/bin/python -m pytest unit-tests/litellm -q -p no:cacheprovider
 ```
+
+### The `auto` footer
+
+When — and only when — a client calls model **`auto`** (the semantic router), the same handler in `overflow.py` appends a footer to the assistant message naming the backend that actually answered:
+
+```
+<answer>
+
+---
+*qwen3.8-solo · local-general*
+```
+
+| Footer | Meaning |
+|---|---|
+| `*qwen3.8-solo · local-general*` | the router chose `local-general`; its order-1 deployment answered |
+| `*muse-glimmer · local-code*` | order 1 was busy, down or failed; order 2 answered |
+| `*claude-sonnet-5 · local-general · overflow (local busy)*` | a Claude deployment answered, and the hook *currently* sees that chain's local backends as busy |
+| `… · overflow (local down)` | … every local backend of the chain is failing its probe |
+| `… · overflow` | Claude answered but the hook has no busy/down verdict (a call-time failure, a stale poller, or a different proxy worker did the spilling) |
+| `*qwen3.8-solo · local-private · router bypassed*` | the router itself failed and `fallbacks: auto -> [local-private]` answered |
+
+**Scope.** Requests whose `model` is `auto`, nothing else: a direct call to a `local-*` chain or any other alias is untouched, and so is the router's own sub-request (it comes back into LiteLLM as `local-*`), so the footer is added exactly once, on the outer response. Provider prefixes are stripped (`anthropic/claude-sonnet-5` → `claude-sonnet-5`).
+
+**How it is derived (LiteLLM v1.95.0).** The inner LiteLLM — the one serving the chain — puts `x-litellm-model-id`, `x-litellm-model-name` (`common_request_processing.py:938-948`) and `x-litellm-model-group` (`router.py:9388`) on its response; Envoy passes them through and the router adds `x-vsr-selected-decision` / `x-vsr-selected-model` (`processor_res_header_mutation.go:249-261`). The outer openai provider keeps every upstream header as `llm_provider-<name>` in `_hidden_params["additional_headers"]` — on the response for JSON (`core_helpers.py:318-319`) and on the stream wrapper for SSE (`openai.py:1072-1079` → `streaming_handler.py:164-171`; both regression-tested against a stand-in upstream). The model id is mapped back to its deployment through the proxy's own router (`llm_router.get_deployment`, `router.py:8577`), because inner and outer are the same proxy; it is the id of the deployment that actually answered, also after an in-group order fallback. The name / group headers are the fallback. **Router bypassed** is read from the outer deployment the proxy stores in `data["deployment"]` (`common_request_processing.py:1707`, resolved from the response's model id): its model group is `local-private`, not `auto` (the outer router also reports `x-litellm-model-group: local-private` and `x-litellm-attempted-fallbacks: 1`). `data["model"]` itself stays `auto` — `route_request` unpacks `**data` into the router (`route_llm_request.py:404`). Busy / down come from this handler's own backend state for the chain, so they are an approximation of *why* Claude answered, not a record.
+
+**Hooks.** Three methods defined directly in the `OverflowHandler` class body — not on a mixin, because the proxy activates `async_post_call_streaming_iterator_hook` and `async_pre_call_hook` only when the name is in the leaf class's `__dict__` (`proxy/utils.py:1718-1745`):
+
+- `async_post_call_success_hook` (non-streaming; `proxy/utils.py:2404-2410` keeps a non-`None` return) appends the footer to each qualifying `message.content`;
+- `async_post_call_streaming_iterator_hook` (the proxy wraps the stream once, `proxy_server.py:7413-7419`, and writes `data: [DONE]` after it ends) yields the footer as an extra `delta.content` chunk right before each qualifying choice's finish chunk — or appends it to the finish chunk's own content when that chunk carries text, so it never lands in front of the last words. A stream that ends without a finish chunk gets it last;
+- `async_pre_call_hook` strips footers from the incoming conversation (below).
+
+**Edge cases.**
+
+- **Skipped:** a choice with tool calls (or `content` empty / `None`); any request with `response_format`; reasoning-only output. `reasoning_content` is never touched.
+- **Open WebUI background tasks are skipped.** v0.11.4 sends title / tags / follow-up / search-query / autocomplete / emoji requests to the *chat* model unless a Task Model is set, and a footer would land in chat titles and break the tags / follow-ups JSON. Its task payloads carry `metadata.task`, but `routers/openai.py` pops `metadata` before the request leaves Open WebUI and forwards no task header — so the prompt is the only signal. Detected: a last user message starting `### Task:` (the default title, tags, image-prompt, follow-up, query and autocomplete templates, `config.py:2211-2340`) or `Your task is to reflect the speaker's likely facial expression` (emoji, `config.py:2439`); a system message starting `Available Tools:` (legacy function calling, `utils/middleware.py:1351-1373`); and, for admin-customised templates, a non-streaming request whose last user message contains a `<chat_history>…</chat_history>` block. MOA is a user-visible answer and is not skipped.
+- **Belt and braces:** set **Admin Settings → Interface → Task Model** (local *and* external) to a non-`auto` model — e.g. `qwen3.8-solo`, or `local-private` if chats may carry customer data. A custom task template that matches none of the patterns above would otherwise get a footer.
+- **Previous footers are stripped** from incoming assistant messages on `auto` requests (string content, or the last text part of list content; `role: "assistant"` only), so the model never sees — and imitates — them and the router's keyword signals never read them. The regex matches only the exact emitted form: a blank line, `---`, then one `*…*` line of at least two ` · `-separated parts, at the very end. A non-streaming answer that imitates the footer has it replaced, not doubled.
+- `n > 1`: once per qualifying choice; never twice for the same response.
+- **Never throws:** any internal error returns the response or stream unmodified. `handler.state()["stats"]` counts `footers`, `footers_stripped` and `footer_errors`.
+- The footer is presentation only: spend logs, token counts and cost are those of the answer without it.
+
+**Toggle.** `AUTO_FOOTER_ENABLED` (default `true`; accepts `true`/`false`/`1`/`0`, also `yes`/`no`/`on`/`off`), passed through the compose `environment:` like the `OVERFLOW_*` variables. Off disables all three hooks, stripping included. A change to `overflow.py` itself needs the recreate in [§ Applying a chain or hook change](#applying-a-chain-or-hook-change).
+
+**Verifying.**
+
+```bash
+# non-streaming: choices[0].message.content ends with the footer, and the
+# llm_provider-x-litellm-model-name / -model-group response headers agree with it
+curl -si http://localhost:4001/v1/chat/completions \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"model":"auto","messages":[{"role":"user","content":"Say hi in five words."}]}'
+
+# streaming: the footer is the last content delta, before the finish chunk and [DONE]
+curl -siN http://localhost:4001/v1/chat/completions \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"model":"auto","stream":true,"messages":[{"role":"user","content":"Say hi in five words."}]}'
+```
+
+Then confirm the negatives: the same call with `"model":"local-general"` has no footer, and a new Open WebUI chat's title, tags and follow-ups carry none. Unit tests: [`unit-tests/litellm/test_auto_footer.py`](../../unit-tests/litellm/test_auto_footer.py), run the same way as the overflow tests (the proxy-plumbing tests additionally need `litellm[proxy]==1.95.0`).

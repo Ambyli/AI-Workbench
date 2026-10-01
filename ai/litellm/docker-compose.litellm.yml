@@ -25,6 +25,11 @@ services:
       OVERFLOW_IDLE_AFTER_S: ${OVERFLOW_IDLE_AFTER_S:-5}
       OVERFLOW_POLL_INTERVAL_S: ${OVERFLOW_POLL_INTERVAL_S:-1}
       OVERFLOW_PROBE_TIMEOUT_S: ${OVERFLOW_PROBE_TIMEOUT_S:-0.75}
+      # The `auto` footer (a "---" rule + "*<model> - <chain>*" line naming
+      # the backend under each answer from the semantic router), also in
+      # overflow.py. true|false|1|0.
+      # See ai/litellm/LITELLM.md > The `auto` footer.
+      AUTO_FOOTER_ENABLED: ${AUTO_FOOTER_ENABLED:-true}
     env_file:
       - ../../.env
     volumes:

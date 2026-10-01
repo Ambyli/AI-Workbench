@@ -223,7 +223,7 @@
     },
     {
       "name": "Chain aliases",
-      "description": "The four LiteLLM chain aliases the semantic router forwards to (ai/litellm/litellm_config.yaml > CHAIN ALIASES). Each is a model group with `order: 1 / 2 / 3` deployments; the overflow hook (ai/litellm/overflow.py) drops a busy or down local deployment so the next order answers. Call them with a key scoped to them (the collection's {{virtual master key}}, or SEMANTIC_ROUTER_LITELLM_KEY). LITELLM.md > Chain aliases and the overflow hook.",
+      "description": "The four LiteLLM chain aliases the semantic router forwards to (ai/litellm/litellm_config.yaml > CHAIN ALIASES). Each is a model group with `order: 1 / 2 / 3` deployments; the overflow hook (ai/litellm/overflow.py) drops a busy or down local deployment so the next order answers. Call them with a key scoped to them (the collection's {{virtual master key}}, or SEMANTIC_ROUTER_LITELLM_KEY). LITELLM.md > Chain aliases and the overflow hook. Called directly, a chain alias gets NO backend footer: the `---` / `*<model> · <chain>*` footer is added only to responses for model `auto` (the semantic router). Here, read the deployment that answered from the `x-litellm-model-name` response header or the spend log. LITELLM.md > The `auto` footer.",
       "item": [
         {
           "name": "POST /v1/chat/completions -- local-general",

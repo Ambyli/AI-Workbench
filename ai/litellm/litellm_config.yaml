@@ -33,8 +33,10 @@ litellm_settings:
     - {"glm5.3-flash":  ["claude-sonnet-5"]}
     - {"muse-glimmer":  ["claude-sonnet-5"]}
     # A prompt too long for the router's smallest candidate goes to the
-    # long-context backend directly rather than being routed.
-    - {"auto":          ["qwen3.8-solo"]}
+    # long-context backend directly rather than being routed. muse-glimmer
+    # (245760) and not qwen3.8-solo: `auto` caps at qwen3.8-solo's 114688,
+    # so qwen3.8-solo here would reject the same prompt a second time.
+    - {"auto":          ["muse-glimmer"]}
 
 general_settings:
   master_key: os.environ/DEFAULT_LITELLM_MASTER_KEY

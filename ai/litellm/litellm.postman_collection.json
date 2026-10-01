@@ -98,7 +98,7 @@
     },
     {
       "name": "OpenAI-compatible",
-      "description": "The primary API surface. LiteLLM presents an OpenAI-compatible interface in front of vLLM (qwen3.6, qwen3.8, glm5.2, qwen2.5-vl), Kokoro TTS, and Anthropic (claude-sonnet-5 fallback). Models available are those enumerated under `model_list` in litellm_config.yaml. See LITELLM.md § `litellm_config.yaml` settings for the config schema reference.",
+      "description": "The primary API surface. LiteLLM presents an OpenAI-compatible interface in front of vLLM (qwen3.6, qwen3.8, glm5.2, qwen2.5-vl), Kokoro TTS, and Anthropic (claude-sonnet-5 fallback, claude-opus-5-5 opt-in). Models available are those enumerated under `model_list` in litellm_config.yaml. See LITELLM.md § `litellm_config.yaml` settings for the config schema reference.",
       "item": [
         {
           "name": "POST /v1/chat/completions",
@@ -117,7 +117,7 @@
               "host": ["{{litellm}}"],
               "path": ["v1", "chat", "completions"]
             },
-            "description": "Standard chat-completion call. `model` must match a `model_name` in `model_list` — this deployment defines qwen3.6, qwen3.8, glm5.2, qwen2.5-vl (image), claude-sonnet-5, kokoro (audio), `auto` (the vLLM Semantic Router - one name that picks a decision from the request and runs a bounded multi-model algorithm over the local aliases; see ai/semantic-router/SEMANTIC_ROUTER.md and its own Postman collection), plus the env-driven `DEFAULT_LITELLM_MODEL_NAME`. If the request exceeds the model's context window, `litellm_settings.context_window_fallbacks` transparently reroutes qwen3.6/qwen3.8/glm5.2 → claude-sonnet-5. Tool calls are supported but not auto-executed — see LITELLM_MCP.md § Step 1/Step 2 for the tool-call loop."
+            "description": "Standard chat-completion call. `model` must match a `model_name` in `model_list` — this deployment defines qwen3.6, qwen3.8, glm5.2, qwen2.5-vl (image), claude-sonnet-5, claude-opus-5-5, kokoro (audio), `auto` (the vLLM Semantic Router - one name that picks a decision from the request and runs a bounded multi-model algorithm over the local aliases; see ai/semantic-router/SEMANTIC_ROUTER.md and its own Postman collection), plus the env-driven `DEFAULT_LITELLM_MODEL_NAME`. If the request exceeds the model's context window, `litellm_settings.context_window_fallbacks` transparently reroutes qwen3.6/qwen3.8/glm5.2 → claude-sonnet-5. Tool calls are supported but not auto-executed — see LITELLM_MCP.md § Step 1/Step 2 for the tool-call loop."
           },
           "response": []
         },

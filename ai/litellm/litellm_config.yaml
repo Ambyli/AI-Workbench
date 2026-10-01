@@ -23,7 +23,7 @@ litellm_settings:
     # vllm-sr-envoy, or a router that fails its readiness check, must not
     # take the chat down -- fall back to the pool's workhorse, then to
     # Anthropic. Do NOT list a router entrypoint as its own fallback.
-    - {"auto":          ["qwen3.8", "claude-sonnet-5"]}
+    - {"auto":          ["qwen3.8-solo", "claude-sonnet-5"]}
   context_window_fallbacks:
     - {"qwen3.6":       ["claude-sonnet-5"]}
     - {"qwen3.8":       ["claude-sonnet-5"]}
@@ -34,7 +34,7 @@ litellm_settings:
     - {"muse-glimmer":  ["claude-sonnet-5"]}
     # A prompt too long for the router's smallest candidate goes to the
     # long-context backend directly rather than being routed.
-    - {"auto":          ["qwen3.8-flash"]}
+    - {"auto":          ["qwen3.8-solo"]}
 
 general_settings:
   master_key: os.environ/DEFAULT_LITELLM_MASTER_KEY
@@ -282,6 +282,14 @@ model_list:
   - model_name: claude-sonnet-5
     litellm_params:
       model: anthropic/claude-sonnet-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+      stream_timeout: 300
+
+  # Opt-in only: not in any fallback map or the semantic router pool, so it
+  # is spent only when a caller names it explicitly.
+  - model_name: claude-opus-5-5
+    litellm_params:
+      model: anthropic/claude-opus-5-5
       api_key: os.environ/ANTHROPIC_API_KEY
       stream_timeout: 300
 

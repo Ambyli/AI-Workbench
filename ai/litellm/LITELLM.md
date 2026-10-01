@@ -89,7 +89,22 @@ The poller starts lazily on the first chain request and is restarted if it ever 
 | `OVERFLOW_POLL_INTERVAL_S` | `1` | probe cadence (floor 0.2). Data older than 5 × this is ignored. |
 | `OVERFLOW_PROBE_TIMEOUT_S` | `0.75` | per-probe timeout; a probe that exceeds it marks the backend **down**. Keep it below the poll interval. |
 
-Set them in `.env` and `make up litellm` (they are passed through the compose `environment:` block). Turning the hook off is removing the `callbacks:` line — the chains then fail over only on real errors.
+Set them in `.env` and `make up litellm` (they are passed through the compose `environment:` block, so a change to them is a compose change and `make up` recreates the container). Turning the hook off is removing the `callbacks:` line — the chains then fail over only on real errors; that is a config-file edit, so apply it as in [§ Applying a chain or hook change](#applying-a-chain-or-hook-change).
+
+#### Changing a chain
+
+- **Reorder** (e.g. make `muse-glimmer` go first in `local-general`): swap the two deployments' `order` values. Nothing else changes — the hook and the order filter read `order` per request.
+- **Change the overflow model** (e.g. `local-code` → `claude-opus-5-5`): replace the order-3 deployment's `litellm_params` with a copy of the other Claude alias's. Never add a Claude deployment to `local-private`.
+- **Change a model's settings** (sampling, `max_input_tokens`, `stream_timeout`): edit the standalone alias **and** every chain copy of it — the chains do not reference the standalone alias, on purpose.
+- The semantic router needs no change for any of these; it only knows the chain's name.
+
+#### Applying a chain or hook change
+
+```bash
+docker compose -f ai/litellm/docker-compose.litellm.yml --env-file .env -p ai-litellm up -d --force-recreate litellm
+```
+
+`litellm_config.yaml` and `overflow.py` are single-file bind mounts and LiteLLM reads both only at startup. `make up litellm` does not recreate a running container for a file *content* change, and `docker restart litellm` keeps the original mount — so an editor or `git pull` that replaced the file (new inode) leaves the container reading the old one. The recreate is the one path that always loads the current files. Then check `docker logs litellm` for an `overflow` import error.
 
 #### Seeing spills
 
@@ -103,7 +118,7 @@ Set them in `.env` and `make up litellm` (they are passed through the compose `e
 2. Decide whether it may reach Claude. If not, give it no Claude deployment and **no** `fallbacks` / `context_window_fallbacks` entry, like `local-private`. If it may, put Claude on the highest order only.
 3. If the semantic router should use it, add it to `providers.models` + `routing.modelCards` in `ai/semantic-router/config.yaml`, re-render `envoy.yaml`, and add the alias to `SEMANTIC_ROUTER_LITELLM_KEY`'s model list in the Admin UI.
 4. Nothing to configure in the hook — it learns backends from the deployments it sees. A non-vLLM local backend (llama.cpp) has no `vllm:num_requests_waiting`; the hook then treats it as **unknown** and never spills on its account, only failing over on real errors.
-5. `make up litellm`, then add a Postman item under **Chain aliases** in `litellm.postman_collection.json`.
+5. Apply it with the recreate in [§ Applying a chain or hook change](#applying-a-chain-or-hook-change) (not `make up litellm`), then add a Postman item under **Chain aliases** in `litellm.postman_collection.json`.
 
 The overflow hook's unit tests live in [`unit-tests/litellm/test_overflow.py`](../../unit-tests/litellm/test_overflow.py) and drive the real v1.95.0 `Router` when `litellm` is installed:
 

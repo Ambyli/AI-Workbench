@@ -167,9 +167,21 @@ The old config had a **known gap**: `privacy_local` routed to `qwen3.8-solo`, an
 1. **Add the signal** under `routing.signals` in `config.yaml`. A keyword signal has exactly four fields — `name`, `operator` (`OR`/`AND`), `keywords`, `case_sensitive`. There is no `method: bm25` and no `bm25_threshold`; those do not exist in this release.
 2. **Point it at a chain alias.** If none of the four fits, add a new chain in `litellm_config.yaml` first ([LITELLM.md § Adding a chain](../litellm/LITELLM.md#adding-a-chain)), add it to `providers.models` + `routing.modelCards`, and scope `SEMANTIC_ROUTER_LITELLM_KEY` to it in the LiteLLM Admin UI. Never point a decision at a concrete alias (`qwen3.8-solo`, `claude-*`): those carry Claude fallbacks.
 3. **Add the decision** under `routing.decisions`. `name`, `description` (**required** — a missing one fails validation), `priority`, `rules`, `modelRefs`, `algorithm: {type: static}`. Give it a priority that slots it correctly against the four above.
-4. **Validate locally** — see below. Then `make up semantic-router` (the init service validates again and gates the router on it).
+4. **Validate locally** — see below — and re-render `envoy.yaml` if `providers.models` changed ([§ Re-rendering envoy.yaml](#re-rendering-envoyyaml)).
+5. **Apply it with a recreate**, not `make up` — see [§ Applying a config change](#applying-a-config-change).
 
-A change to `providers.models` changes the Envoy render. Re-render.
+The same five steps apply to *changing* an existing decision — its keywords, its priority, or which chain it points at. Swapping which local model goes first, or which Claude model is the overflow, is a LiteLLM change, not a router one: edit the chain's `order` values in `litellm_config.yaml` ([LITELLM.md § Chain aliases](../litellm/LITELLM.md#chain-aliases-and-the-overflow-hook)) and `make up litellm` — nothing here needs touching.
+
+### Applying a config change
+
+```bash
+docker compose -f ai/semantic-router/docker-compose.semantic-router.yml --env-file .env -p ai-semantic-router \
+    up -d --force-recreate vllm-sr-models-init vllm-sr-router vllm-sr-envoy
+```
+
+`make up semantic-router` is a plain `docker compose up -d`. It recreates a container only when that container's *compose* definition changed (env, image, mounts) — so it is enough after a `.env` key rotation, but **not** after an edit to `config.yaml` or `envoy.yaml`, whose contents are bind-mounted and invisible to compose. A running router and Envoy would keep the old config, and the init service's validate + drift checks would never gate it.
+
+The router does have a live reload — it watches `/app/config.yaml`'s directory with fsnotify and reloads on change (vllm-sr v0.3.0 `pkg/extproc/server_config_watch.go`). Do not rely on it: `config.yaml` is a **single-file** bind mount, and a `git pull` or an editor that saves by replacing the file gives it a new inode the container never sees; a reload also skips the init service's validation; and Envoy has no reload at all, so a `providers.models` change needs Envoy recreated regardless. The recreate above is the one path that always validates, re-renders-and-diffs, and loads the new config into both containers.
 
 ### Validating a config edit without Docker
 
@@ -200,7 +212,7 @@ Then splice: keep the hand-written comment header at the top of `ai/semantic-rou
 
 Both `ENVOY_*_ADDRESS` variables matter: they place the ext_proc cluster. If they are unset the render points at `127.0.0.1` and the init service's diff fails every time.
 
-**You do not have to remember.** `vllm-sr-models-init` re-renders on every `make up semantic-router` and fails the stack with a unified diff if the checked-in file no longer matches. Never work around that check — it is the only thing standing between a version bump and an Envoy config that routes to the wrong place.
+**You do not have to remember.** `vllm-sr-models-init` re-renders every time it runs — which, after a config edit, means the recreate in [§ Applying a config change](#applying-a-config-change) — and fails the stack with a unified diff if the checked-in file no longer matches. Never work around that check — it is the only thing standing between a version bump and an Envoy config that routes to the wrong place.
 
 ### What the render actually produces
 
@@ -311,8 +323,8 @@ Manual — there is no end-to-end suite. The overflow hook's logic has unit test
 | Check | How | Pass when |
 |---|---|---|
 | Stack comes up clean | `make up semantic-router` on a box with no `vllm_sr_*` volumes | init exits 0; router reports ready; envoy healthy |
-| Init guards work | Break a field in `config.yaml`, then `make up semantic-router` | init exits non-zero with the CLI's validation error and the router never starts |
-| Envoy drift guard works | Edit `config.yaml` without re-rendering, then `make up semantic-router` | init fails with a unified diff naming the stale file |
+| Init guards work | Break a field in `config.yaml`, then the recreate in [§ Applying a config change](#applying-a-config-change) | init exits non-zero with the CLI's validation error and the router never starts |
+| Envoy drift guard works | Change `providers.models` in `config.yaml` without re-rendering, then the recreate | init fails with a unified diff naming the stale file |
 | Hook loaded | `docker logs litellm` after `make up litellm` | no import error for `overflow.handler`; first chain request is followed by `[overflow]` lines only when something spills |
 | Each decision answers | Postman `Envoy listener (direct)` folder, all four prompts | 200 with content; router log names `privacy_local` / `code` / `reasoning` / `general` |
 | Local first | One prompt per decision with both local models idle | spend log on the router's key shows only `openai/qwen3.8-solo` (or `openai/muse-glimmer` for `local-reasoning`) — **zero** Claude rows |

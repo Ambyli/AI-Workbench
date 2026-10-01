@@ -1,20 +1,23 @@
 # vLLM Semantic Router subsystem.
 #
-# Puts the router's bounded multi-model "looper" algorithms behind a single
-# `auto` model in LiteLLM. The router sits BESIDE LiteLLM, not in front of
-# it: LiteLLM stays the one OpenAI surface for Open WebUI, Claude Code, n8n
-# and the Roofix brain, and every candidate the router picks is an existing
-# LiteLLM alias reached at http://litellm:4000/v1.
+# Puts prompt-type routing behind a single `auto` model in LiteLLM. The
+# router sits BESIDE LiteLLM, not in front of it: LiteLLM stays the one
+# OpenAI surface for Open WebUI, Claude Code, n8n and the Roofix brain, and
+# every decision is `static` -- it picks ONE LiteLLM chain alias
+# (local-general / local-code / local-reasoning / local-private), reached at
+# http://litellm:4000/v1. Which backend answers -- local first, Claude only
+# as overflow, never for local-private -- is LiteLLM's job
+# (ai/litellm/litellm_config.yaml + overflow.py).
 #
 # Request path (the loop is deliberate -- see the recursion guard in
 # config.yaml before touching providers.models):
 #
 #   openwebui -> litellm:4000            alias `auto` -> openai/vllm-sr/auto
 #             -> vllm-sr-envoy:8899      listener; Lua bearer check, ext_proc
-#             -> vllm-sr-router:50051    signals -> decision -> looper
-#             -> vllm-sr-envoy:8899      one sub-request per candidate,
-#             -> litellm:4000            steered by the x-selected-model header
-#             -> vLLM / llama.cpp / Anthropic
+#             -> vllm-sr-router:50051    signals -> decision -> chain alias
+#             -> vllm-sr-envoy           routes on x-selected-model
+#             -> litellm:4000            chain group: order 1 -> 2 -> 3
+#             -> vLLM (local) / Anthropic (overflow only)
 #
 # Two networks:
 #   shared      (external, ai_shared)  vllm-sr-envoy, so litellm can call it
@@ -108,10 +111,11 @@ services:
       # Compose refuses to start the stack without either -- see .env.example.
       # Both are substituted into the Envoy Lua filter's VALID_KEYS: the
       # listener key is what LiteLLM's `auto` alias sends, the LiteLLM key
-      # is what the router's own looper sub-requests send (config.yaml >
-      # WHY TWO KEYS). Missing the second one 401s every looper algorithm.
+      # is what a looper sub-request would send (config.yaml > WHY TWO
+      # KEYS -- dormant while every decision is `static`, but prepare.py
+      # still requires both placeholders).
       SEMANTIC_ROUTER_LISTENER_KEY: ${SEMANTIC_ROUTER_LISTENER_KEY:?Set SEMANTIC_ROUTER_LISTENER_KEY in .env (openssl rand -hex 32) - it is the bearer token Envoy requires on PORT_SEMANTIC_ROUTER. See ai/semantic-router/SEMANTIC_ROUTER.md > Secrets}
-      SEMANTIC_ROUTER_LITELLM_KEY: ${SEMANTIC_ROUTER_LITELLM_KEY:?Set SEMANTIC_ROUTER_LITELLM_KEY in .env to a LiteLLM virtual key scoped to the five candidate aliases. See ai/semantic-router/SEMANTIC_ROUTER.md > Secrets}
+      SEMANTIC_ROUTER_LITELLM_KEY: ${SEMANTIC_ROUTER_LITELLM_KEY:?Set SEMANTIC_ROUTER_LITELLM_KEY in .env to a LiteLLM virtual key scoped to the four chain aliases (local-general/local-code/local-reasoning/local-private). See ai/semantic-router/SEMANTIC_ROUTER.md > Secrets}
       # The generator reads both of these to place the ext_proc cluster.
       # They MUST match the values used to produce the checked-in
       # envoy.yaml or step 2 fails the diff every time.
@@ -152,15 +156,16 @@ services:
       - /app/.vllm-sr
     environment:
       # Resolved by cli/models.py::BackendRef.resolve_api_key via the
-      # api_key_env on every backend_ref in config.yaml. Scope this virtual
-      # key in the LiteLLM Admin UI to the five candidate aliases --
-      # qwen3.8-solo, muse-glimmer, claude-sonnet-5, claude-opus-4-8,
-      # claude-opus-5-5 -- and NOTHING else; that is the half of the
-      # recursion guard LiteLLM enforces. Put a monthly budget on it too:
-      # three of the five are Anthropic, and LiteLLM's fallbacks turn a dead
-      # local candidate into claude-sonnet-5 calls (SEMANTIC_ROUTER.md >
-      # Fallbacks hide dead candidates).
-      SEMANTIC_ROUTER_LITELLM_KEY: ${SEMANTIC_ROUTER_LITELLM_KEY:?Set SEMANTIC_ROUTER_LITELLM_KEY in .env to a LiteLLM virtual key scoped to qwen3.8-solo/muse-glimmer/claude-sonnet-5/claude-opus-4-8/claude-opus-5-5 only. See ai/semantic-router/SEMANTIC_ROUTER.md > Secrets}
+      # api_key_env on every backend_ref in config.yaml, and injected by the
+      # router as the Authorization header on every forwarded request.
+      # Scope this virtual key in the LiteLLM Admin UI to the four chain
+      # aliases -- local-general, local-code, local-reasoning,
+      # local-private -- and NOTHING else; that is the half of the
+      # recursion guard LiteLLM enforces, and it keeps the router off the
+      # concrete aliases whose fallbacks lead to Claude. Put a monthly
+      # budget on it too: three of the four chains overflow to Anthropic
+      # when both local models are busy (SEMANTIC_ROUTER.md > Two layers).
+      SEMANTIC_ROUTER_LITELLM_KEY: ${SEMANTIC_ROUTER_LITELLM_KEY:?Set SEMANTIC_ROUTER_LITELLM_KEY in .env to a LiteLLM virtual key scoped to local-general/local-code/local-reasoning/local-private only. See ai/semantic-router/SEMANTIC_ROUTER.md > Secrets}
       # The router pulls its own classifier bundles from Hugging Face on
       # first start -- nothing in the CLI does it ahead of time. HF_HOME
       # points into the same volume the init service seeded so a recreate
@@ -180,8 +185,8 @@ services:
     ulimits:
       # cli/consts.py::DEFAULT_NOFILE_LIMIT. The CLI sets this on every
       # router container and refuses anything below 8192; the router opens
-      # a socket per in-flight candidate call and the default 1024 on some
-      # hosts is not enough once a remom round fans out.
+      # a socket per in-flight upstream call and the default 1024 on some
+      # hosts is not enough under load.
       nofile:
         soft: 65536
         hard: 65536

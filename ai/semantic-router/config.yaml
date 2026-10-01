@@ -1,24 +1,40 @@
 # vLLM Semantic Router -- router configuration (schema version v0.3).
 #
+# +- WHAT THIS FILE DOES NOW -- TWO LAYERS ---------------------------------+
+# | Layer 1 (this file): pick a CHAIN by prompt type. Four `static`          |
+# | decisions, one LiteLLM chain alias each. One upstream call per turn --   |
+# | no looper, no fan-out, no confidence escalation.                         |
+# |                                                                         |
+# | Layer 2 (ai/litellm/litellm_config.yaml + ai/litellm/overflow.py): each  |
+# | chain alias is a LiteLLM model group whose deployments carry            |
+# | `order: 1 / 2 / 3`. Local models are orders 1 and 2; Claude, where a     |
+# | chain has it at all, is order 3. LiteLLM only reaches order 3 when both  |
+# | local deployments are busy (vLLM waiting queue, via the overflow hook)   |
+# | or down. `local-private` has NO Claude deployment and no fallbacks.      |
+# |                                                                         |
+# | Policy this encodes: local models first, for COST; Claude only as        |
+# | overflow, never on a quality judgement; customer / PII data never        |
+# | reaches Claude. See SEMANTIC_ROUTER.md > Two layers.                    |
+# +-------------------------------------------------------------------------+
+#
 # +- RECURSION GUARD -- READ BEFORE EDITING providers.models ----------------+
 # | The traffic path is a deliberate loop:                                  |
 # |                                                                         |
 # |   litellm:4000  (alias `auto`)                                          |
 # |     -> vllm-sr-envoy:8899          (listener, ext_proc)                  |
-# |       -> vllm-sr-router:50051      (signals -> decision -> looper)         |
-# |         -> vllm-sr-envoy:8899      (looper sub-requests, one per         |
-# |           -> litellm:4000           candidate; Envoy steers each by the   |
-# |                                    x-selected-model header)             |
+# |       -> vllm-sr-router:50051      (signals -> decision -> chain alias)  |
+# |     -> litellm:4000                (Envoy forwards the rewritten body to |
+# |                                     the chain alias's cluster)          |
 # |                                                                         |
 # | `providers.models` below must therefore contain ONLY concrete LiteLLM   |
-# | aliases. Never add `auto`, `vllm-sr/auto`, or any other router          |
+# | chain aliases. Never add `auto`, `vllm-sr/auto`, or any other router    |
 # | entrypoint name: every entry here becomes an Envoy route keyed on       |
 # | x-selected-model, so a router entrypoint listed here would route the    |
-# | router's own sub-requests straight back into itself and spin until      |
-# | the 1800 s listener timeout.                                            |
+# | router's own requests straight back into itself and spin until the     |
+# | 1800 s listener timeout.                                                |
 # |                                                                         |
 # | The second half of the guard lives in LiteLLM: SEMANTIC_ROUTER_LITELLM  |
-# | _KEY is a virtual key scoped to the five concrete aliases below and     |
+# | _KEY is a virtual key scoped to the FOUR chain aliases below and        |
 # | NOTHING ELSE -- so even a mis-edit here 401s instead of looping.         |
 # | See ai/semantic-router/SEMANTIC_ROUTER.md > Recursion guard.            |
 # +-------------------------------------------------------------------------+
@@ -43,32 +59,30 @@ version: v0.3
 # bearer-token filter and `timeout` into the route timeout AND the ext_proc
 # message timeout.
 #
-# 1800s because a looper turn serialises several reasoning-model calls (a
-# remom turn is two parallel rounds plus a synthesis, and both local
-# candidates think before they answer), and muse-glimmer's 4 vLLM sequences
-# are shared with the classifier, so a sub-request can queue inside vLLM
-# behind someone else's batch before it even starts. LiteLLM's `auto`
-# entries mirror it with stream_timeout: 1800.
+# 1800s even though every decision is now one upstream call: that call is a
+# LiteLLM chain that can walk order 1 -> 2 -> 3, `local-private` deliberately
+# QUEUES inside vLLM when both local models are busy rather than leaving the
+# box, and both local models reason before they answer. LiteLLM's `auto`
+# entry mirrors it with stream_timeout: 1800 -- keep the two in step.
 #
 # api_keys carries PLACEHOLDERS, not real keys. There is no `${VAR}`
 # interpolation anywhere in vllm-sr's config loader (cli/models.py has env
 # support only on backend_refs.api_key_env), and the generator inlines each
 # api_keys value verbatim into the Envoy Lua filter -- so a real key here
 # would end up committed twice. `vllm-sr-models-init` substitutes both
-# values into the rendered envoy.yaml at container start. The placeholders
-# below are only ever read by the generator; the router itself does not
-# enforce listener auth (Envoy does).
+# values into the rendered envoy.yaml at container start (prepare.py FAILS
+# if either placeholder is missing from the render). The router itself does
+# not enforce listener auth (Envoy does).
 #
-# WHY TWO KEYS. The looper's sub-requests come back in through this same
-# listener, and the router's HTTP client authenticates them with the
-# CANDIDATE MODEL's access key, not the listener key
-# (pkg/looper/client.go::CallModel -- `Authorization: Bearer <accessKey>`,
-# where accessKey is the backend_refs api_key, i.e. SEMANTIC_ROUTER_LITELLM
-# _KEY). The Lua filter checks that bearer against this list, so if the
-# LiteLLM virtual key is not ALSO here, every confidence / ratings / remom
-# sub-request is 401'd by Envoy before it reaches LiteLLM and only the
-# `static` decision works. Upstream's reference config has api_keys: []
-# (no Lua filter at all), which is why this never bites them.
+# WHY TWO KEYS (now dormant). Looper sub-requests come back in through this
+# same listener signed with the CANDIDATE MODEL's access key -- the LiteLLM
+# virtual key -- not the listener key (pkg/looper/client.go::CallModel). No
+# decision below uses a looper any more, so nothing sends that second key
+# today. It stays in the table so prepare.py's placeholder check holds and
+# so re-enabling a looper decision does not silently 401. A `static`
+# decision does not need it: the router rewrites the Authorization header on
+# the forwarded request itself, to `Bearer <backend api key>`
+# (pkg/extproc/processor_req_body_routing.go::appendCredentialHeaders).
 listeners:
   - name: http-8899
     address: 0.0.0.0
@@ -77,67 +91,45 @@ listeners:
     api_keys:
       # What LiteLLM's `auto` alias sends. Callers on PORT_SEMANTIC_ROUTER.
       - "__SEMANTIC_ROUTER_LISTENER_KEY__"
-      # What the router's own looper sub-requests send. See WHY TWO KEYS.
+      # What a looper sub-request would send. See WHY TWO KEYS.
       - "__SEMANTIC_ROUTER_LITELLM_KEY__"
 
 # -- Providers -------------------------------------------------------------
-# Every candidate is an existing LiteLLM alias reached at the SAME upstream,
-# http://litellm:4000/v1. The router never talks to a vLLM or llama.cpp
-# container directly -- that would bypass LiteLLM's fallbacks (qwen3.8 <->
-# muse-glimmer are mutually exclusive on the GPU pair), its spend logs, its
-# virtual keys, and its per-model sampling defaults.
+# Every candidate is a LiteLLM CHAIN alias reached at the SAME upstream,
+# http://litellm:4000/v1. The router never talks to a vLLM container or to
+# Anthropic directly -- the chain's order levels, the overflow hook, the
+# no-Claude guarantee on local-private, spend logs and per-model sampling
+# defaults all live in LiteLLM, and going around it would skip every one.
 #
 # THE POOL IS WHAT SEMANTIC_ROUTER_LITELLM_KEY CAN CALL, and that is exactly
-# five aliases: qwen3.8-solo, muse-glimmer, claude-sonnet-5, claude-opus-4-8,
-# claude-opus-5-5. Listing anything else here gives the router a candidate
-# whose every sub-request 401s at LiteLLM (and on_error: skip swallows it).
+# four aliases: local-general, local-code, local-reasoning, local-private.
+# Listing anything else here gives the router a candidate whose every
+# request 401s at LiteLLM. The concrete aliases (qwen3.8-solo, muse-glimmer,
+# claude-*) are deliberately NOT here and NOT on the key: they carry
+# LiteLLM `fallbacks` to claude-sonnet-5, which is exactly the silent cloud
+# path the chains exist to replace.
 #
 # `name`              -- what the router and Envoy key on (x-selected-model).
 # `provider_model_id` -- the string sent as "model" in the upstream body.
 #                       Identical here: router name == LiteLLM alias.
-# `api_format: openai` on EVERY entry, the three Claude aliases included.
-#   Setting `anthropic` would make the Envoy generator emit a dedicated
-#   anthropic_api_cluster pointed at api.anthropic.com:443 and route around
-#   LiteLLM entirely -- no virtual-key budget, no spend attribution. Anthropic
-#   is reached through LiteLLM's OpenAI-compatible surface like everything
-#   else.
+# `api_format: openai` on EVERY entry. `anthropic` would make the Envoy
+#   generator emit a dedicated anthropic_api_cluster pointed at
+#   api.anthropic.com:443 and route around LiteLLM entirely.
 # `api_key_env` -- resolved from the container environment at read time
 #   (cli/models.py::BackendRef.resolve_api_key), so the key is never in YAML.
+#   It is also the key the router injects on the forwarded request.
 #
 # ORDER MATTERS: models[0] is the Envoy default route (a request with no
-# x-selected-model, or an unknown name, lands there), so the local
-# qwen3.8-solo goes first and never an Anthropic alias.
-#
-# LITELLM FALLBACKS STILL APPLY TO EVERY SUB-REQUEST. ai/litellm/
-# litellm_config.yaml maps both `qwen3.8-solo` and `muse-glimmer` to
-# [claude-sonnet-5] under `fallbacks`. So a candidate that is down does NOT
-# error back to the router: LiteLLM silently answers it from Anthropic, the
-# router sees a 200 under the local alias's name, and on_error: skip never
-# fires. The only record is spend-by-key in the LiteLLM Admin UI. See
-# SEMANTIC_ROUTER.md > Fallbacks hide dead candidates.
-#
-# NOT IN THE POOL (see SEMANTIC_ROUTER.md > Model pool):
-#   qwen3.6, qwen3.8, qwen3.8-flash, glm5.2 -- not on the router's virtual
-#                   key. Re-adding one means scoping the key to it in the
-#                   LiteLLM Admin UI first.
-#   glm5.3-flash  -- CPU-only llama.cpp, minutes to first token on a cold
-#                   prompt. One slot. A parallel loop that includes it blocks
-#                   on it for the whole round timeout.
-#
-# muse-glimmer IS in the pool now that qwen3.8 is not: the two share a GPU
-# pair and cannot co-run, and with qwen3.8 off the key there is no longer a
-# pool member it is mutually exclusive WITH. The caveat that remains: when
-# an operator brings qwen3.8 up instead, muse-glimmer is down, the router
-# (which health-checks LiteLLM, not the model behind it) keeps selecting it,
-# and LiteLLM's fallback quietly turns every muse-glimmer slot into a
-# claude-sonnet-5 call -- see LITELLM FALLBACKS above.
+# x-selected-model, or an unknown name, lands there), and default_model is
+# what a decision-less request resolves to. Both are local-general -- the
+# cheap, local-first chain.
 providers:
   defaults:
-    default_model: qwen3.8-solo
+    default_model: local-general
     default_reasoning_effort: medium
   models:
-    - name: qwen3.8-solo
-      provider_model_id: qwen3.8-solo
+    - name: local-general
+      provider_model_id: local-general
       api_format: openai
       backend_refs:
         - name: litellm
@@ -148,8 +140,8 @@ providers:
           auth_prefix: Bearer
           api_key_env: SEMANTIC_ROUTER_LITELLM_KEY
 
-    - name: muse-glimmer
-      provider_model_id: muse-glimmer
+    - name: local-code
+      provider_model_id: local-code
       api_format: openai
       backend_refs:
         - name: litellm
@@ -160,8 +152,8 @@ providers:
           auth_prefix: Bearer
           api_key_env: SEMANTIC_ROUTER_LITELLM_KEY
 
-    - name: claude-opus-5-5
-      provider_model_id: claude-opus-5-5
+    - name: local-reasoning
+      provider_model_id: local-reasoning
       api_format: openai
       backend_refs:
         - name: litellm
@@ -172,29 +164,11 @@ providers:
           auth_prefix: Bearer
           api_key_env: SEMANTIC_ROUTER_LITELLM_KEY
 
-    # Declared, used by no decision. On the key so an explicit
-    # `"model": "claude-sonnet-5"` sent to the listener passes through, and
-    # so it is one modelRefs edit away from a decision.
-    - name: claude-sonnet-5
-      provider_model_id: claude-sonnet-5
-      api_format: openai
-      backend_refs:
-        - name: litellm
-          base_url: http://litellm:4000/v1
-          protocol: http
-          provider: openai
-          auth_header: Authorization
-          auth_prefix: Bearer
-          api_key_env: SEMANTIC_ROUTER_LITELLM_KEY
-
-    # Declared, used by no decision -- same reasoning as claude-sonnet-5.
-    # NOT defined in ai/litellm/litellm_config.yaml: the alias exists only
-    # in LiteLLM's DB (Admin UI -> Models; store_model_in_db is true). If it
-    # is ever deleted there, the router keeps offering it and every call
-    # to it fails at LiteLLM. Do not add a guessed provider model id to
-    # litellm_config.yaml to "fix" that -- recreate it in the Admin UI.
-    - name: claude-opus-4-8
-      provider_model_id: claude-opus-4-8
+    # Local-only. The LiteLLM group has no Claude deployment and no entry in
+    # `fallbacks` / `context_window_fallbacks`, so a PII prompt that cannot
+    # be served locally fails or queues -- it never leaves the box.
+    - name: local-private
+      provider_model_id: local-private
       api_format: openai
       backend_refs:
         - name: litellm
@@ -209,46 +183,52 @@ providers:
 routing:
   # Context limits. In vllm-sr 0.3.0 these live on routing.modelCards, NOT on
   # providers.models -- `Model` (cli/models.py) has no context field at all;
-  # `RoutingModel` has context_window_size. Values mirror `max_input_tokens`
-  # in ai/litellm/litellm_config.yaml; keep the two in sync or the router
-  # will offer a candidate LiteLLM will reject with a context error.
+  # `RoutingModel` has context_window_size.
+  #
+  # What the Go router does with it at v0.3.0: it is a SCORING input to the
+  # selection algorithms only -- extproc/req_filter_classification.go::
+  # modelContextWindows feeds selection/cache_affinity.go's window-fit
+  # tie-breaker. It is not a hard filter, and a `static` decision never
+  # reads it. The real context gate is LiteLLM's: enable_pre_call_checks
+  # drops any deployment whose model_info.max_input_tokens is too small
+  # before the order filter runs.
+  #
+  # 245760 on every chain = the largest LOCAL window each chain can reach:
+  # all four contain muse-glimmer (--max-model-len 262144, max_input_tokens
+  # 245760 in litellm_config.yaml), and a prompt over qwen3.8-solo's 114688
+  # skips straight to it. Claude windows are deliberately not counted --
+  # LiteLLM declares no model_info for the Claude deployments, and
+  # local-private has none at all. Keep in step with `auto`'s
+  # max_input_tokens in litellm_config.yaml.
   modelCards:
-    - name: qwen3.8-solo
-      context_window_size: 114688
-      description: >-
-        Qwen3.8 27B AWQ pinned to a single A6000 (GPU 2, shared with the
-        OWLv2 detector), so it co-runs with muse-glimmer. 3 parallel slots,
-        emits logprobs. The only local text rung and the default route.
-      tags: [local, vllm, workhorse]
-    - name: muse-glimmer
+    - name: local-general
       context_window_size: 245760
       description: >-
-        Muse Glimmer 30B BF16, tensor-parallel over the GPU pair with DFlash
-        speculative decoding. 4 parallel slots SHARED with the classifier,
-        which calls it directly (not via LiteLLM). Down whenever qwen3.8
-        holds the pair.
-      tags: [local, vllm, reasoner]
-    # No context_window_size for any Claude alias on purpose: ai/litellm/
-    # litellm_config.yaml declares no model_info for claude-sonnet-5 or
-    # claude-opus-5-5, and claude-opus-4-8 is not in that file at all. This
-    # file does not get to invent a number LiteLLM has not committed to. Add
-    # it here and to litellm_config.yaml together, or not at all.
-    - name: claude-opus-5-5
+        LiteLLM chain: qwen3.8-solo (order 1) -> muse-glimmer (order 2) ->
+        claude-sonnet-5 (order 3, overflow only, when both local models are
+        busy or down). The catch-all and the Envoy default route.
+      tags: [chain, local-first, overflow-sonnet]
+    - name: local-code
+      context_window_size: 245760
       description: >-
-        Anthropic Claude Opus 5.5 via LiteLLM. Last (and only Claude) rung
-        of the confidence ladder. No logprobs -- see default_confidence.
-      tags: [api, anthropic, expensive]
-    - name: claude-sonnet-5
+        LiteLLM chain: qwen3.8-solo (order 1) -> muse-glimmer (order 2) ->
+        claude-sonnet-5 (order 3, overflow only). Same ladder as
+        local-general, kept separate so code traffic can be re-tuned and
+        attributed on its own.
+      tags: [chain, local-first, overflow-sonnet]
+    - name: local-reasoning
+      context_window_size: 245760
       description: >-
-        Anthropic Claude Sonnet 5 via LiteLLM. Declared, used by no
-        decision. Also what LiteLLM's fallbacks silently substitute for a
-        dead qwen3.8-solo or muse-glimmer.
-      tags: [api, anthropic, expensive]
-    - name: claude-opus-4-8
+        LiteLLM chain: muse-glimmer (order 1) -> qwen3.8-solo (order 2) ->
+        claude-opus-5-5 (order 3, overflow only). The reasoner leads.
+      tags: [chain, local-first, overflow-opus]
+    - name: local-private
+      context_window_size: 245760
       description: >-
-        Anthropic Claude Opus 4.8 via LiteLLM (alias defined in LiteLLM's
-        DB, not litellm_config.yaml). Declared, used by no decision.
-      tags: [api, anthropic, expensive]
+        LiteLLM chain: qwen3.8-solo (order 1) -> muse-glimmer (order 2) and
+        NOTHING ELSE. No Claude deployment, no fallbacks. When both local
+        models are busy the request queues locally.
+      tags: [chain, local-only, pii]
 
   # -- Signals (Step 2a: keywords only) ------------------------------------
   # Keyword signals need nothing on disk, so the stack routes correctly
@@ -333,7 +313,7 @@ routing:
     #          - name: math
     #            description: Mathematics, proofs, quantitative reasoning.
     #
-    #   2. Swap the rules on `coding_ratings` and `reasoning_remom` from
+    #   2. Swap the rules on `code` and `reasoning` from
     #      `{type: keyword, name: code_kw}` to
     #      `{type: domain, name: computer_science}` (and `math`). The
     #      condition `type` for the domains family is `domain`, singular --
@@ -341,41 +321,41 @@ routing:
     #
     #   3. Confirm the router logs the domain classifier as loaded before
     #      removing the keyword signals, or every request falls through to
-    #      default_confidence with no warning.
+    #      `general` with no warning.
     #
     # Until then the keyword signals ARE the routing. They are lexical and
-    # will miss paraphrases; that is the accepted Step 2a trade.
+    # will miss paraphrases; that is the accepted Step 2a trade. A miss is
+    # cheap now: every decision lands on a local-first chain, and only
+    # privacy_local changes where tokens may go.
 
   # -- Decisions -----------------------------------------------------------
   # Matched highest priority first. `description` is REQUIRED on every
   # decision (cli/models.py::Decision) -- a missing one fails validation.
   #
-  # v0.3.0 ships exactly three looper algorithms -- confidence, ratings,
-  # remom (cli/validator.py::validate_algorithm_configurations). There is no
-  # `fusion` and no `workflows`/`flow`: they appear in the article this plan
-  # came from but not in this release's schema, and AlgorithmConfig is
-  # extra="forbid", so writing one is a hard validation failure, not a
-  # silently-ignored key. See SEMANTIC_ROUTER.md > What is still unverified.
+  # Every decision is `static` with exactly one modelRef: the router picks
+  # the chain, LiteLLM picks the deployment. One upstream call per turn.
+  #
+  # NO LOOPERS, ON PURPOSE. v0.3.0 still ships confidence / ratings / remom
+  # (cli/validator.py::validate_algorithm_configurations), and this file
+  # used to run all three. They were removed for COST: `confidence` escalated
+  # unsure answers to claude-opus-5-5 (a quality judgement buying Claude,
+  # which the policy forbids), and `ratings` / `remom` fanned one turn out to
+  # 2-6 local calls, doubling or worse the load on the two local models --
+  # which is exactly what pushes the overflow hook into spilling to Claude.
+  # Do not re-add a looper without re-reading SEMANTIC_ROUTER.md > Two layers.
   decisions:
     # Priority 300 -- PII / customer data stays on the box.
-    # Static: first (and only) modelRef, no looper, no fan-out. qwen3.8-solo
-    # is the only local text model on the router's key; one call fits its
-    # 3 slots.
-    #
-    # KNOWN GAP -- NOT CLOSED BY THIS CONFIG: LiteLLM's `fallbacks` maps
-    # qwen3.8-solo -> [claude-sonnet-5]. If qwen3.8-solo is down or 5xxs,
-    # LiteLLM answers this "local-only" request from Anthropic and the
-    # router never knows. Nothing in vllm-sr 0.3.0 can forbid a LiteLLM-side
-    # fallback. The fix is a local-only LiteLLM alias with NO fallback entry
-    # (e.g. `qwen3.8-solo-local`, same litellm_params), scoped onto the
-    # router's key and named here instead. Tracked as a follow-up in
-    # SEMANTIC_ROUTER.md > Fallbacks hide dead candidates.
+    # local-private has no Claude deployment and no LiteLLM fallback entry,
+    # so this is the one decision whose purpose is where tokens do NOT go.
+    # The keyword signal is lexical: a PII prompt that trips none of
+    # privacy_kw lands on `general` and CAN overflow to Claude. Widen
+    # privacy_kw (or, for a hard guarantee, have the caller pick
+    # local-private directly) rather than trusting the match.
     - name: privacy_local
       description: >-
-        Requests that mention personally identifying or customer data stay
-        on a local model. No looper, no fan-out -- one call to qwen3.8-solo.
-        This is the only decision whose purpose is where the tokens do NOT
-        go (but see the LiteLLM fallback gap in the comment above).
+        Requests that mention personally identifying or customer data go to
+        the local-private chain: qwen3.8-solo then muse-glimmer, never
+        Claude, not even as overflow.
       priority: 300
       rules:
         operator: AND
@@ -383,37 +363,16 @@ routing:
           - type: keyword
             name: privacy_kw
       modelRefs:
-        - model: qwen3.8-solo
+        - model: local-private
       algorithm:
         type: static
 
     # Priority 200 -- code.
-    #
-    # PLAN DEVIATION: the plan asked for Fusion (panel -> judge -> finalizer,
-    # with quorum_failure_policy / quorum_fallback_target). Fusion does not
-    # exist in vllm-sr 0.3.0. `ratings` is the algorithm this release
-    # actually ships for a bounded parallel fan-out, and its entire schema
-    # is two fields -- max_concurrent and on_error (RatingsAlgorithmConfig,
-    # extra="forbid"). There is no judge, no quorum, and no fallback target,
-    # so the quorum-failure path is covered one level up by LiteLLM's
-    # `fallbacks: auto -> [qwen3.8-solo, claude-sonnet-5]`.
-    #
-    # max_concurrent: 2 = one call per candidate, all at once. It is also the
-    # most this decision should ask of either backend per turn: qwen3.8-solo
-    # has 3 vLLM sequences (--max-num-seqs 3) and muse-glimmer 4
-    # (--max-num-seqs 4) that the classifier can fill on its own
-    # (CLASSIFIER_MAX_LLM_CALLS=4, called directly, not via LiteLLM). Excess
-    # requests queue inside vLLM, and with BUFFERED bodies every request in
-    # the round pays the wait.
-    #
-    # NOTE: ratings returns several choices. Open WebUI renders only the
-    # first. That is why this sits behind `auto` rather than being exposed
-    # as its own chat model.
-    - name: coding_ratings
+    - name: code
       description: >-
-        Code-shaped requests fan out to qwen3.8-solo and muse-glimmer in
-        parallel and come back as a bounded set of candidate answers.
-        Concurrency is 2 -- one call per candidate.
+        Code-shaped requests go to the local-code chain: qwen3.8-solo, then
+        muse-glimmer, then claude-sonnet-5 only when both local models are
+        busy or down.
       priority: 200
       rules:
         operator: AND
@@ -421,34 +380,16 @@ routing:
           - type: keyword
             name: code_kw
       modelRefs:
-        - model: qwen3.8-solo
-        - model: muse-glimmer
+        - model: local-code
       algorithm:
-        type: ratings
-        ratings:
-          max_concurrent: 2
-          on_error: skip
-        on_error: skip
+        type: static
 
     # Priority 150 -- math / science / multi-step reasoning.
-    #
-    # ReMoM = rounds of parallel reasoning attempts, then synthesis.
-    # breadth_schedule [3, 2] means 3 calls in round one, 2 in round two,
-    # then one synthesis call -- 6 model calls for one user turn. That is the
-    # cost ceiling; budget accordingly.
-    #
-    # PLAN DEVIATION: `min_successful_responses` and `round_timeout_seconds`
-    # do not exist on ReMoMAlgorithmConfig in 0.3.0. The round bound this
-    # release gives you is max_concurrent plus the 1800 s listener timeout.
-    # max_concurrent: 3 fits the widest round even if all three attempts
-    # land on one candidate: qwen3.8-solo has exactly 3 sequences, and
-    # muse-glimmer's 4 are shared with the classifier (see coding_ratings).
-    # Raising it past 3 can oversubscribe qwen3.8-solo on its own.
-    - name: reasoning_remom
+    - name: reasoning
       description: >-
-        Math, science and multi-step reasoning run two rounds of parallel
-        attempts over qwen3.8-solo and muse-glimmer, then a synthesis pass.
-        Six model calls per turn -- the most expensive local path.
+        Math, science and multi-step reasoning go to the local-reasoning
+        chain: muse-glimmer first, then qwen3.8-solo, then claude-opus-5-5
+        only when both local models are busy or down.
       priority: 150
       rules:
         operator: AND
@@ -456,66 +397,24 @@ routing:
           - type: keyword
             name: reasoning_kw
       modelRefs:
-        - model: qwen3.8-solo
-        - model: muse-glimmer
+        - model: local-reasoning
       algorithm:
-        type: remom
-        remom:
-          breadth_schedule: [3, 2]
-          model_distribution: weighted
-          max_concurrent: 3
-          include_reasoning: false
-          include_intermediate_responses: true
-          on_error: skip
-        on_error: skip
+        type: static
 
-    # Priority 10 -- catch-all. Cheap first, escalate only when unsure.
-    #
-    # THRESHOLD SIGN: for confidence_method: avg_logprob the threshold is
-    # NEGATIVE and closer to zero means more confident
-    # (cli/algorithms.py::ConfidenceAlgorithmConfig, default -1.0). The plan
-    # specified 0.72, which is a `margin`/`hybrid`-shaped number and would
-    # make every request look confident. -0.30 is a starting point; tune it
-    # in Phase 5 against a 20-40 % escalation rate.
-    #
-    # PLAN DEVIATION: `minimum_candidates`, `escalation_order` and
-    # `token_filter` are not fields on ConfidenceAlgorithmConfig in 0.3.0.
-    # Escalation order is the declared order of modelRefs below, which is
-    # what `escalation_order: declared` would have asked for anyway.
-    #
-    # Two rungs: qwen3.8-solo, then claude-opus-5-5. Exactly one Claude rung,
-    # and it is last on purpose. Anthropic returns no logprobs, so it can
-    # never be *evaluated* for confidence -- only arrived at. If it is ever
-    # moved off the tail, or a second Claude rung is added, switch
-    # confidence_method to `margin` or the rung silently scores as a failure
-    # and on_error: skip swallows it. muse-glimmer is deliberately not a
-    # rung: logprob pass-through for it is unverified and it is the
-    # candidate most likely to be down.
-    #
-    # Escalation is to Opus, not Sonnet: every escalated turn is billed at
-    # Opus rates. And because qwen3.8-solo falls back to claude-sonnet-5 in
-    # LiteLLM, a dead qwen3.8-solo makes rung one a logprob-less Sonnet
-    # answer -- which scores as a failure, as above -- so EVERY catch-all turn then
-    # costs a Sonnet call AND an Opus call. Watch spend-by-key.
-    - name: default_confidence
+    # Priority 10 -- catch-all.
+    - name: general
       description: >-
-        Everything else. Try qwen3.8-solo first; escalate to claude-opus-5-5
-        only while the answer's average token logprob is below threshold.
-        Most turns stop at the first rung.
+        Everything else goes to the local-general chain: qwen3.8-solo, then
+        muse-glimmer, then claude-sonnet-5 only when both local models are
+        busy or down.
       priority: 10
       rules:
         operator: AND
         conditions: []
       modelRefs:
-        - model: qwen3.8-solo
-        - model: claude-opus-5-5
+        - model: local-general
       algorithm:
-        type: confidence
-        confidence:
-          confidence_method: avg_logprob
-          threshold: -0.30
-          on_error: skip
-        on_error: skip
+        type: static
 
 # -- Global ----------------------------------------------------------------
 # `global` is a free-form dict in the CLI's pydantic layer (UserConfig.
@@ -538,10 +437,10 @@ global:
     include_config_models_in_list: true
 
   integrations:
-    # Looper sub-requests go back through the Envoy listener rather than
-    # straight at LiteLLM. That is what lets Envoy resolve each candidate
-    # name via x-selected-model, and it keeps one place where the listener
-    # timeout and the bearer check apply.
+    # DORMANT: no decision uses a looper (see Decisions). Kept so that
+    # re-enabling one routes its sub-requests back through the Envoy
+    # listener (where x-selected-model, the timeout and the bearer check
+    # apply) instead of falling back to the router's built-in default.
     looper:
       endpoint: http://vllm-sr-envoy:8899/v1/chat/completions
       timeout_seconds: 1800

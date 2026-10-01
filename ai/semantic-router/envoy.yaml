@@ -25,23 +25,27 @@
 # TEMPLATE VARIABLES SUBSTITUTED IN THIS RENDER
 #   listeners            [{name: http-8899, address: 0.0.0.0, port: 8899,
 #                          timeout: 1800s, api_keys: [<two placeholders>]}]
-#                        Two keys because the router's looper client signs
-#                        its own sub-requests with the candidate model's
-#                        access key (the LiteLLM virtual key), and those
-#                        sub-requests re-enter this listener -- see
+#                        Two keys because a looper client would sign its own
+#                        sub-requests with the candidate model's access key
+#                        (the LiteLLM virtual key), and those sub-requests
+#                        re-enter this listener. No decision uses a looper
+#                        today, so the second key is dormant -- kept so
+#                        prepare.py's placeholder check holds. See
 #                        config.yaml > WHY TWO KEYS.
-#   models               the five providers.models entries -- qwen3.8-solo,
-#                        muse-glimmer, claude-opus-5-5, claude-sonnet-5,
-#                        claude-opus-4-8. Each yields ONE route (matched on
-#                        the x-selected-model header) and ONE cluster. All
-#                        five clusters resolve to the same upstream,
-#                        litellm:4000 -- the generator emits a cluster per
-#                        model, not one shared cluster, and there is no knob
-#                        to collapse them.
-#   anthropic_models     [] -- all three Claude aliases are declared
-#                        api_format: openai, so they go through LiteLLM like
-#                        the rest instead of getting a direct
-#                        api.anthropic.com cluster. See config.yaml.
+#   models               the four providers.models entries -- the LiteLLM
+#                        CHAIN aliases local-general, local-code,
+#                        local-reasoning, local-private. Each yields ONE
+#                        route (matched on the x-selected-model header) and
+#                        ONE cluster. All four clusters resolve to the same
+#                        upstream, litellm:4000 -- the generator emits a
+#                        cluster per model, not one shared cluster, and
+#                        there is no knob to collapse them. Which backend
+#                        (local or Claude) answers is decided inside LiteLLM
+#                        by each chain's `order` levels, not here.
+#   anthropic_models     [] -- every entry is api_format: openai, so nothing
+#                        gets a direct api.anthropic.com cluster; Claude is
+#                        only ever reached as a chain deployment inside
+#                        LiteLLM. See config.yaml.
 #   extproc_host/_port   vllm-sr-router / 50051, from ENVOY_EXTPROC_ADDRESS.
 #   extproc_cluster_type LOGICAL_DNS (the host is a name, not an IP), which
 #                        also sets dns_lookup_family: V4_ONLY.
@@ -59,9 +63,10 @@
 #
 #   Bodies are BUFFERED in both directions (processing_mode). The router
 #   cannot see a token until the whole upstream response has arrived, so a
-#   ratings or remom turn produces NO output at all until the last candidate
-#   finishes. That is why `auto` is slow to first token and why LiteLLM's
-#   entry sets stream_timeout: 1800.
+#   turn produces NO output at all until the chain's answer is complete --
+#   including any time local-private spends queued inside vLLM. That is why
+#   `auto` is slow to first token and why LiteLLM's entry sets
+#   stream_timeout: 1800.
 #
 #   Route timeout 1800s comes from listeners[0].timeout. idleTimeout stays
 #   at the template's hard-coded 1200s -- it is not parameterised, so a
@@ -71,18 +76,21 @@
 #   The Lua filter is the ONLY thing enforcing the listener bearer token;
 #   the router does not check it. VALID_KEYS below holds TWO literal
 #   placeholders, __SEMANTIC_ROUTER_LISTENER_KEY__ (what LiteLLM's `auto`
-#   alias sends) and __SEMANTIC_ROUTER_LITELLM_KEY__ (what the router's own
-#   looper sub-requests send -- pkg/looper/client.go signs them with the
-#   candidate model's access key, and they re-enter this listener). Envoy
-#   has no environment substitution in config files, and the generator
-#   inlines api_keys verbatim, so neither real key can be checked in.
-#   vllm-sr-models-init substitutes both into the copy Envoy actually loads
-#   (the vllm_sr_envoy volume). If every request 401s, that substitution did
-#   not run; if only looper decisions 401, the second key is missing --
-#   check the init service's logs first either way.
+#   alias sends) and __SEMANTIC_ROUTER_LITELLM_KEY__ (what a looper
+#   sub-request would send -- pkg/looper/client.go signs them with the
+#   candidate model's access key, and they re-enter this listener; dormant
+#   while every decision is `static`). Envoy has no environment
+#   substitution in config files, and the generator inlines api_keys
+#   verbatim, so neither real key can be checked in. vllm-sr-models-init
+#   substitutes both into the copy Envoy actually loads (the vllm_sr_envoy
+#   volume). If every request 401s, that substitution did not run -- check
+#   the init service's logs first. A 401 that comes back from LiteLLM
+#   rather than from this Lua filter means SEMANTIC_ROUTER_LITELLM_KEY is not
+#   scoped to the chain alias the router picked.
 #
-#   The default route (no x-selected-model) goes to models[0], qwen3.8-solo.
-#   Reordering providers.models therefore changes the fallback target.
+#   The default route (no x-selected-model) goes to models[0], local-general.
+#   Reordering providers.models therefore changes the fallback target --
+#   keep local-general (the cheap, local-first catch-all) first.
 #
 #   admin is on 9901 and is NEVER published -- see the compose file. It
 #   exposes /quitquitquit and full config dumps including VALID_KEYS.
@@ -125,15 +133,15 @@ static_resources:
               - "x-authz-user-groups"
               routes:
               
-              # Route for model: qwen3.8-solo
+              # Route for model: local-general
               - match:
                   prefix: "/"
                   headers:
                   - name: x-selected-model
                     string_match:
-                      exact: "qwen3.8-solo"
+                      exact: "local-general"
                 route:
-                  cluster: qwen3.8_solo_cluster
+                  cluster: local_general_cluster
                   timeout: 1800s
                   idleTimeout: 1200s
                   # Rewrite Host header to match upstream server
@@ -147,15 +155,15 @@ static_resources:
                     substitution: "/v1\\1"
                   
               
-              # Route for model: muse-glimmer
+              # Route for model: local-code
               - match:
                   prefix: "/"
                   headers:
                   - name: x-selected-model
                     string_match:
-                      exact: "muse-glimmer"
+                      exact: "local-code"
                 route:
-                  cluster: muse_glimmer_cluster
+                  cluster: local_code_cluster
                   timeout: 1800s
                   idleTimeout: 1200s
                   # Rewrite Host header to match upstream server
@@ -169,15 +177,15 @@ static_resources:
                     substitution: "/v1\\1"
                   
               
-              # Route for model: claude-opus-5-5
+              # Route for model: local-reasoning
               - match:
                   prefix: "/"
                   headers:
                   - name: x-selected-model
                     string_match:
-                      exact: "claude-opus-5-5"
+                      exact: "local-reasoning"
                 route:
-                  cluster: claude_opus_5_5_cluster
+                  cluster: local_reasoning_cluster
                   timeout: 1800s
                   idleTimeout: 1200s
                   # Rewrite Host header to match upstream server
@@ -191,37 +199,15 @@ static_resources:
                     substitution: "/v1\\1"
                   
               
-              # Route for model: claude-sonnet-5
+              # Route for model: local-private
               - match:
                   prefix: "/"
                   headers:
                   - name: x-selected-model
                     string_match:
-                      exact: "claude-sonnet-5"
+                      exact: "local-private"
                 route:
-                  cluster: claude_sonnet_5_cluster
-                  timeout: 1800s
-                  idleTimeout: 1200s
-                  # Rewrite Host header to match upstream server
-                  host_rewrite_literal: "litellm:4000"
-                  
-                  # Prepend path prefix to all requests (e.g., /compatible-mode + /v1/chat/completions = /compatible-mode/v1/chat/completions)
-                  regex_rewrite:
-                    pattern:
-                      google_re2: {}
-                      regex: "^/v1(.*)$"
-                    substitution: "/v1\\1"
-                  
-              
-              # Route for model: claude-opus-4-8
-              - match:
-                  prefix: "/"
-                  headers:
-                  - name: x-selected-model
-                    string_match:
-                      exact: "claude-opus-4-8"
-                route:
-                  cluster: claude_opus_4_8_cluster
+                  cluster: local_private_cluster
                   timeout: 1800s
                   idleTimeout: 1200s
                   # Rewrite Host header to match upstream server
@@ -242,7 +228,7 @@ static_resources:
                 route:
                   
                   # Route to first model by default
-                  cluster: qwen3.8_solo_cluster
+                  cluster: local_general_cluster
                   
                   timeout: 1800s
                   
@@ -339,8 +325,8 @@ static_resources:
   
 
   
-  # Cluster for model: qwen3.8-solo
-  - name: qwen3.8_solo_cluster
+  # Cluster for model: local-general
+  - name: local_general_cluster
     connect_timeout: 1200s
     type: LOGICAL_DNS
     
@@ -348,7 +334,7 @@ static_resources:
     
     lb_policy: ROUND_ROBIN
     load_assignment:
-      cluster_name: qwen3.8_solo_cluster
+      cluster_name: local_general_cluster
       endpoints:
       - lb_endpoints:
         
@@ -364,8 +350,8 @@ static_resources:
         
     
   
-  # Cluster for model: muse-glimmer
-  - name: muse_glimmer_cluster
+  # Cluster for model: local-code
+  - name: local_code_cluster
     connect_timeout: 1200s
     type: LOGICAL_DNS
     
@@ -373,7 +359,7 @@ static_resources:
     
     lb_policy: ROUND_ROBIN
     load_assignment:
-      cluster_name: muse_glimmer_cluster
+      cluster_name: local_code_cluster
       endpoints:
       - lb_endpoints:
         
@@ -389,8 +375,8 @@ static_resources:
         
     
   
-  # Cluster for model: claude-opus-5-5
-  - name: claude_opus_5_5_cluster
+  # Cluster for model: local-reasoning
+  - name: local_reasoning_cluster
     connect_timeout: 1200s
     type: LOGICAL_DNS
     
@@ -398,7 +384,7 @@ static_resources:
     
     lb_policy: ROUND_ROBIN
     load_assignment:
-      cluster_name: claude_opus_5_5_cluster
+      cluster_name: local_reasoning_cluster
       endpoints:
       - lb_endpoints:
         
@@ -414,8 +400,8 @@ static_resources:
         
     
   
-  # Cluster for model: claude-sonnet-5
-  - name: claude_sonnet_5_cluster
+  # Cluster for model: local-private
+  - name: local_private_cluster
     connect_timeout: 1200s
     type: LOGICAL_DNS
     
@@ -423,32 +409,7 @@ static_resources:
     
     lb_policy: ROUND_ROBIN
     load_assignment:
-      cluster_name: claude_sonnet_5_cluster
-      endpoints:
-      - lb_endpoints:
-        
-        - endpoint:
-            address:
-              socket_address:
-                address: litellm
-                port_value: 4000
-            
-            hostname: "litellm"
-            
-          load_balancing_weight: 1
-        
-    
-  
-  # Cluster for model: claude-opus-4-8
-  - name: claude_opus_4_8_cluster
-    connect_timeout: 1200s
-    type: LOGICAL_DNS
-    
-    dns_lookup_family: V4_ONLY
-    
-    lb_policy: ROUND_ROBIN
-    load_assignment:
-      cluster_name: claude_opus_4_8_cluster
+      cluster_name: local_private_cluster
       endpoints:
       - lb_endpoints:
         

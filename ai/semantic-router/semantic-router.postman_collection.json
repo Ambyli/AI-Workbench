@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "semantic-router",
-    "description": "vLLM Semantic Router (ai/semantic-router/). Two ways in, and they authenticate DIFFERENTLY:\n\n1. Direct at Envoy on {{semanticRouter}} (host publish PORT_SEMANTIC_ROUTER, default http://localhost:8025, container port 8899). Bearer token is {{listener key}} = SEMANTIC_ROUTER_LISTENER_KEY, checked by a Lua filter in the generated Envoy config. The folder 'Envoy listener (direct)' overrides the collection auth with it. This is the debugging path.\n\n2. Through LiteLLM on {{litellm}} as the model `auto`. Bearer token is {{virtual master key}}, a normal LiteLLM virtual key -- LiteLLM attaches the listener key itself. This is what Open WebUI and every other client actually does.\n\nNO OTHER ROUTER PORT IS PUBLISHED. The router's ext_proc gRPC (50051), management API (8080) and metrics (9190), and Envoy's admin (9901), are reachable only from inside the container network. There is no collection item for them on purpose -- if you need one, `docker exec` into a container on ai_shared.\n\nWHY THERE IS ONLY ONE ROUTER ENTRYPOINT: vllm-sr 0.3.0 has no `entrypoints:` block and no per-algorithm model names. Exactly one name, global.router.auto_model_name (`vllm-sr/auto`), triggers routing; the algorithm is then chosen by which DECISION the request's signals match. So there is no /fusion, /remom, /flow or /ratings slug to call, and no auto-fusion / auto-remom alias in LiteLLM. The items below exercise each decision by sending a prompt shaped to trip its signal, which is the only mechanism this release provides. Fusion and Workflows do not exist in 0.3.0 at all -- the looper set is confidence / ratings / remom.\n\nSee ai/semantic-router/SEMANTIC_ROUTER.md for the request path, the recipe table, the concurrency budget, and the recursion guard.",
+    "description": "vLLM Semantic Router (ai/semantic-router/). Two ways in, and they authenticate DIFFERENTLY:\n\n1. Direct at Envoy on {{semanticRouter}} (host publish PORT_SEMANTIC_ROUTER, default http://localhost:8025, container port 8899). Bearer token is {{listener key}} = SEMANTIC_ROUTER_LISTENER_KEY, checked by a Lua filter in the generated Envoy config. The folder 'Envoy listener (direct)' overrides the collection auth with it. This is the debugging path.\n\n2. Through LiteLLM on {{litellm}} as the model `auto`. Bearer token is {{virtual master key}}, a normal LiteLLM virtual key -- LiteLLM attaches the listener key itself. This is what Open WebUI and every other client actually does.\n\nTWO LAYERS. The router only picks a CHAIN: four `static` decisions, each forwarding the request (one call, no fan-out) to one LiteLLM chain alias -- privacy_local -> local-private, code -> local-code, reasoning -> local-reasoning, everything else -> local-general. LiteLLM then picks the backend by `order`: local models first (qwen3.8-solo / muse-glimmer), Claude only when BOTH are busy or down (ai/litellm/overflow.py), and never for local-private. The router swaps the Authorization header for SEMANTIC_ROUTER_LITELLM_KEY on the forwarded request, so spend lands on the router's key.\n\nNO OTHER ROUTER PORT IS PUBLISHED. The router's ext_proc gRPC (50051), management API (8080) and metrics (9190), and Envoy's admin (9901), are reachable only from inside the container network. There is no collection item for them on purpose -- if you need one, `docker exec` into a container on ai_shared.\n\nWHY THERE IS ONLY ONE ROUTER ENTRYPOINT: vllm-sr 0.3.0 has no `entrypoints:` block and no per-algorithm model names. Exactly one name, global.router.auto_model_name (`vllm-sr/auto`), triggers routing; which chain is used is chosen by which DECISION the request's signals match. The items below exercise each decision by sending a prompt shaped to trip its signal. The release's looper algorithms (confidence / ratings / remom) are NOT used -- they were removed for cost; Fusion and Workflows do not exist in 0.3.0 at all.\n\nSee ai/semantic-router/SEMANTIC_ROUTER.md for the two layers, the decisions table, the privacy guarantee, and the verification checklist; ai/litellm/LITELLM.md > Chain aliases and the overflow hook for layer 2.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
     "_postman_id": "semantic-router-collection"
   },
@@ -38,7 +38,7 @@
       "key": "virtual master key",
       "value": "sk-your-litellm-virtual-key",
       "type": "string",
-      "description": "LiteLLM virtual key (Admin UI -> Virtual Keys, or /key/generate). Must be scoped to allow the `auto` alias. This is NOT SEMANTIC_ROUTER_LITELLM_KEY -- that one belongs to the router and is deliberately scoped to the five candidate aliases (qwen3.8-solo, muse-glimmer, claude-sonnet-5, claude-opus-4-8, claude-opus-5-5) and nothing else, so using it here would 401 on `auto`. Sent as `Authorization: Bearer {{virtual master key}}` by the collection-level auth."
+      "description": "LiteLLM virtual key (Admin UI -> Virtual Keys, or /key/generate). Must be scoped to allow the `auto` alias. This is NOT SEMANTIC_ROUTER_LITELLM_KEY -- that one belongs to the router and is deliberately scoped to the four chain aliases (local-general, local-code, local-reasoning, local-private) and nothing else, so using it here would 401 on `auto`. Sent as `Authorization: Bearer {{virtual master key}}` by the collection-level auth."
     }
   ],
   "item": [
@@ -71,12 +71,12 @@
                 "models"
               ]
             },
-            "description": "Lists what the router will accept as a `model` value: the auto entrypoint (`vllm-sr/auto`, from global.router.auto_model_name) plus the five concrete candidates (qwen3.8-solo, muse-glimmer, claude-opus-5-5, claude-sonnet-5, claude-opus-4-8), because global.router.include_config_models_in_list is true in config.yaml.\n\nReturns the OpenAI /v1/models shape. 401 with `{\"error\":{\"code\":\"invalid_api_key\"}}` if the bearer token is missing or wrong -- that 401 comes from the Envoy Lua filter, not from the router, so seeing it means Envoy is up and the listener key is the problem. Connection refused means vllm-sr-envoy is not running or PORT_SEMANTIC_ROUTER is not published.\n\nSee SEMANTIC_ROUTER.md > Ports and exposure."
+            "description": "Lists what the router will accept as a `model` value: the auto entrypoint (`vllm-sr/auto`, from global.router.auto_model_name) plus the four chain aliases (local-general, local-code, local-reasoning, local-private), because global.router.include_config_models_in_list is true in config.yaml.\n\nReturns the OpenAI /v1/models shape. 401 with `{\"error\":{\"code\":\"invalid_api_key\"}}` if the bearer token is missing or wrong -- that 401 comes from the Envoy Lua filter, not from the router, so seeing it means Envoy is up and the listener key is the problem. Connection refused means vllm-sr-envoy is not running or PORT_SEMANTIC_ROUTER is not published.\n\nSee SEMANTIC_ROUTER.md > Ports and exposure."
           },
           "response": []
         },
         {
-          "name": "POST /v1/chat/completions -- vllm-sr/auto (default_confidence path)",
+          "name": "POST /v1/chat/completions -- vllm-sr/auto (general -> local-general)",
           "request": {
             "method": "POST",
             "header": [
@@ -105,12 +105,12 @@
                 "completions"
               ]
             },
-            "description": "The catch-all decision. Nothing in this prompt trips the privacy, code or reasoning keyword signals, so `default_confidence` matches: qwen3.8-solo answers first and the router only escalates to claude-opus-5-5 (the one Claude rung, last because Anthropic returns no logprobs) while the answer's average token logprob is below the -0.30 threshold. An easy prompt like this one should stop at the first rung. If it escalates every time, check whether qwen3.8-solo is down: LiteLLM then answers rung one from claude-sonnet-5, which has no logprobs to score, so every turn costs a Sonnet AND an Opus call.\n\nReturns a normal OpenAI chat completion. Read `route_diagnostics.looper` on the response body to see which decision matched, which algorithm ran, and which candidates were called -- that is the only way to tell the paths apart from the outside. SEMANTIC_ROUTER.md > Reading route_diagnostics.looper.\n\nErrors: 401 (listener key), 504 / empty body past 1800s (a candidate never returned -- check LiteLLM, not the router), 5xx from the router if every candidate failed and on_error did not cover it.\n\nSEMANTIC_ROUTER.md > Recipe table."
+            "description": "The catch-all decision `general` (priority 10, `conditions: []`). Nothing in this prompt trips the privacy, code or reasoning keyword signals, so the router forwards it -- one call, `static` -- to the LiteLLM chain `local-general`: qwen3.8-solo (order 1), then muse-glimmer (order 2), then claude-sonnet-5 (order 3) ONLY when both local models are busy (vLLM waiting queue for OVERFLOW_BUSY_AFTER_S) or down. With the box idle the spend log must show openai/qwen3.8-solo and no Claude row.\n\nReturns a normal OpenAI chat completion. Which decision matched is in the router log (`make logs semantic-router vllm-sr-router`) and in the response's `route_diagnostics`; WHICH BACKEND ANSWERED is only in LiteLLM's spend log (Admin UI -> Logs, filter on the router's virtual key): model group = the chain alias, model = the deployment (openai/qwen3.8-solo, openai/muse-glimmer, anthropic/claude-*). SEMANTIC_ROUTER.md > Seeing what happened to a turn.\n\nErrors: 401 from Envoy (listener key wrong / init substitution did not run); 401 from LiteLLM (SEMANTIC_ROUTER_LITELLM_KEY is not scoped to the chain alias the router picked -- it must list local-general, local-code, local-reasoning, local-private); 504 / empty body past 1800s (the chain never answered -- check LiteLLM and the vLLM queues).\n\nSEMANTIC_ROUTER.md > Decisions."
           },
           "response": []
         },
         {
-          "name": "POST /v1/chat/completions -- vllm-sr/auto (privacy_local path)",
+          "name": "POST /v1/chat/completions -- vllm-sr/auto (privacy_local -> local-private)",
           "request": {
             "method": "POST",
             "header": [
@@ -139,12 +139,12 @@
                 "completions"
               ]
             },
-            "description": "Trips the `privacy_kw` signal (priority 300, matched before everything else), so the request goes to qwen3.8-solo with algorithm `static`: one local call, no fan-out, no escalation, and no Anthropic -- WHILE qwen3.8-solo is up. LiteLLM's `fallbacks` maps qwen3.8-solo -> claude-sonnet-5, so if it is down this PII prompt is answered by Anthropic and the router never knows (known gap; fix is a fallback-free local alias -- SEMANTIC_ROUTER.md > Fallbacks hide dead candidates).\n\nThis is the one item worth verifying in the LiteLLM Admin UI as well as here: after running it, the router's virtual key should show spend against qwen3.8-solo and NOTHING against any Claude alias. If it does not, the decision did not match -- add the term to `privacy_kw` in config.yaml.\n\nRead `route_diagnostics.looper` on the response body to see which decision matched, which algorithm ran, and which candidates were called -- that is the only way to tell the paths apart from the outside. SEMANTIC_ROUTER.md > Reading route_diagnostics.looper.\n\nSEMANTIC_ROUTER.md > Recipe table."
+            "description": "Trips the `privacy_kw` signal (priority 300, matched before everything else), so the router forwards the request to the LiteLLM chain `local-private`: qwen3.8-solo, then muse-glimmer, and NOTHING ELSE. local-private has no Claude deployment and no entry in `fallbacks` / `context_window_fallbacks`: with both local models busy it queues locally (expect a slow answer, not a cloud one), with both down it fails.\n\nThis is the one item worth verifying in the LiteLLM Admin UI as well as here: after running it, the spend log must show model group local-private with a LOCAL model (openai/qwen3.8-solo or openai/muse-glimmer) -- a Claude model under local-private must never appear. If the row's model group is local-general instead, the keyword signal missed: add the term to `privacy_kw` in config.yaml.\n\nWhich decision matched is in the router log (`make logs semantic-router vllm-sr-router`) and in the response's `route_diagnostics`; WHICH BACKEND ANSWERED is only in LiteLLM's spend log (Admin UI -> Logs, filter on the router's virtual key): model group = the chain alias, model = the deployment (openai/qwen3.8-solo, openai/muse-glimmer, anthropic/claude-*). SEMANTIC_ROUTER.md > Seeing what happened to a turn.\n\nSEMANTIC_ROUTER.md > The privacy guarantee."
           },
           "response": []
         },
         {
-          "name": "POST /v1/chat/completions -- vllm-sr/auto (coding_ratings path)",
+          "name": "POST /v1/chat/completions -- vllm-sr/auto (code -> local-code)",
           "request": {
             "method": "POST",
             "header": [
@@ -173,12 +173,12 @@
                 "completions"
               ]
             },
-            "description": "Trips `code_kw` (priority 200) and runs the `ratings` looper: qwen3.8-solo and muse-glimmer answer in parallel, max_concurrent 2 (one call per candidate). muse-glimmer's 4 vLLM sequences are shared with the classifier, so during a classifier batch this turn queues inside vLLM. If muse-glimmer is down (qwen3.8 holds the GPU pair), LiteLLM silently answers its slot from claude-sonnet-5 -- check spend-by-key.\n\nIMPORTANT -- `ratings` returns SEVERAL entries in `choices`. Open WebUI renders only the first; a raw API client like Postman is the only place you will see the rest, which is the main reason to run this item by hand.\n\nExpect no output at all until both candidates finish: Envoy runs ext_proc with buffered request and response bodies, so time-to-first-token is the SLOWEST candidate, not the fastest.\n\nRead `route_diagnostics.looper` on the response body to see which decision matched, which algorithm ran, and which candidates were called -- that is the only way to tell the paths apart from the outside. SEMANTIC_ROUTER.md > Reading route_diagnostics.looper.\n\nSEMANTIC_ROUTER.md > Recipe table and > Concurrency budget."
+            "description": "Trips `code_kw` (priority 200): decision `code`, forwarded -- one call, `static` -- to the LiteLLM chain `local-code`: qwen3.8-solo, then muse-glimmer, then claude-sonnet-5 only when both local models are busy or down. Same ladder as local-general, kept as its own group so code traffic can be re-tuned and attributed separately.\n\nExpect no output until the chain has answered: Envoy runs ext_proc with buffered request and response bodies.\n\nWhich decision matched is in the router log (`make logs semantic-router vllm-sr-router`) and in the response's `route_diagnostics`; WHICH BACKEND ANSWERED is only in LiteLLM's spend log (Admin UI -> Logs, filter on the router's virtual key): model group = the chain alias, model = the deployment (openai/qwen3.8-solo, openai/muse-glimmer, anthropic/claude-*). SEMANTIC_ROUTER.md > Seeing what happened to a turn.\n\nSEMANTIC_ROUTER.md > Decisions and > Concurrency budget."
           },
           "response": []
         },
         {
-          "name": "POST /v1/chat/completions -- vllm-sr/auto (reasoning_remom path)",
+          "name": "POST /v1/chat/completions -- vllm-sr/auto (reasoning -> local-reasoning)",
           "request": {
             "method": "POST",
             "header": [
@@ -207,12 +207,12 @@
                 "completions"
               ]
             },
-            "description": "Trips `reasoning_kw` (priority 150) and runs `remom` with breadth_schedule [3, 2]: three parallel attempts, then two, then one synthesis call -- SIX model calls for one user turn. This is the most expensive local path in the stack; run it deliberately, not in a loop.\n\n`include_intermediate_responses` is true in config.yaml, so the round-by-round attempts come back in the response body alongside the synthesis.\n\nSlowest item in the collection. If it returns nothing and then 504s, a candidate exceeded the 1800s listener timeout -- check qwen3.8-solo first (exactly 3 vLLM sequences, which a 3-wide round can fill on its own), then muse-glimmer (4 sequences, shared with the classifier).\n\nRead `route_diagnostics.looper` on the response body to see which decision matched, which algorithm ran, and which candidates were called -- that is the only way to tell the paths apart from the outside. SEMANTIC_ROUTER.md > Reading route_diagnostics.looper.\n\nSEMANTIC_ROUTER.md > Recipe table and > Concurrency budget."
+            "description": "Trips `reasoning_kw` (priority 150): decision `reasoning`, forwarded -- one call, `static` -- to the LiteLLM chain `local-reasoning`: muse-glimmer first (the reasoner), then qwen3.8-solo, then claude-opus-5-5 only when both local models are busy or down. (This used to be a 6-call remom loop; it was removed for cost.)\n\nmuse-glimmer's 4 vLLM sequences are shared with the classifier, so during a classifier batch the overflow hook may mark it busy and this lands on qwen3.8-solo -- check the spend log's model column.\n\nWhich decision matched is in the router log (`make logs semantic-router vllm-sr-router`) and in the response's `route_diagnostics`; WHICH BACKEND ANSWERED is only in LiteLLM's spend log (Admin UI -> Logs, filter on the router's virtual key): model group = the chain alias, model = the deployment (openai/qwen3.8-solo, openai/muse-glimmer, anthropic/claude-*). SEMANTIC_ROUTER.md > Seeing what happened to a turn.\n\nSEMANTIC_ROUTER.md > Decisions and > Concurrency budget."
           },
           "response": []
         },
         {
-          "name": "POST /v1/chat/completions -- explicit candidate (no routing)",
+          "name": "POST /v1/chat/completions -- explicit chain alias (no routing)",
           "request": {
             "method": "POST",
             "header": [
@@ -223,7 +223,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"model\": \"qwen3.8-solo\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"Say hello.\"\n    }\n  ],\n  \"max_tokens\": 64\n}",
+              "raw": "{\n  \"model\": \"local-private\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"Say hello.\"\n    }\n  ],\n  \"max_tokens\": 64\n}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -241,7 +241,7 @@
                 "completions"
               ]
             },
-            "description": "Sends a CONCRETE model name instead of the auto entrypoint. Only `vllm-sr/auto` triggers routing; anything else is treated as an explicit selection, and Envoy matches the x-selected-model header the router sets to that model's cluster -- which, for every model in this pool, is litellm:4000.\n\nUse it to bisect: if this works and the `vllm-sr/auto` items do not, the Envoy -> LiteLLM leg is fine and the problem is in decisions or the looper. If this fails too, the router cannot reach LiteLLM -- check SEMANTIC_ROUTER_LITELLM_KEY and its alias scoping.\n\nValid names here are exactly the providers.models entries in config.yaml: qwen3.8-solo, muse-glimmer, claude-opus-5-5, claude-sonnet-5, claude-opus-4-8 -- the five aliases SEMANTIC_ROUTER_LITELLM_KEY is scoped to. An unknown name falls through to Envoy's default route, which goes to models[0] (qwen3.8-solo)."
+            "description": "Sends a CONCRETE chain alias instead of the auto entrypoint. Only `vllm-sr/auto` triggers routing; anything else is treated as an explicit selection, and Envoy matches the x-selected-model header the router sets to that chain's cluster -- which, for every entry in the pool, is litellm:4000.\n\nUse it to bisect: if this works and the `vllm-sr/auto` items do not, the Envoy -> LiteLLM leg is fine and the problem is in the decisions. If this fails too, the router cannot reach LiteLLM -- check SEMANTIC_ROUTER_LITELLM_KEY and its alias scoping.\n\nValid names here are exactly the providers.models entries in config.yaml: local-general, local-code, local-reasoning, local-private -- the four aliases SEMANTIC_ROUTER_LITELLM_KEY is scoped to. A concrete backend alias (qwen3.8-solo, claude-sonnet-5, ...) is NOT in the pool any more; an unknown name falls through to Envoy's default route, models[0] (local-general). This body uses local-private, so it can never reach Claude."
           },
           "response": []
         }
@@ -300,7 +300,7 @@
                 "completions"
               ]
             },
-            "description": "The real production path: Open WebUI and every other client call `auto` here, LiteLLM rewrites it to `vllm-sr/auto` and forwards to http://vllm-sr-envoy:8899/v1 with SEMANTIC_ROUTER_LISTENER_KEY attached server-side. The caller never holds the listener key.\n\nCompare the result with the equivalent item in the 'Envoy listener (direct)' folder: identical output means the LiteLLM leg is transparent; a difference means LiteLLM is transforming the body (check drop_params and the alias's max_tokens).\n\nErrors worth knowing: a 400 about context length over 114688 tokens is expected today -- `context_window_fallbacks: auto -> [qwen3.8-solo]` targets a model with the same 114688 window, so it cannot help; a response that is plainly from qwen3.8-solo rather than the router means `fallbacks: auto -> [qwen3.8-solo, claude-sonnet-5]` fired because vllm-sr-envoy was unreachable. Both are configured in ai/litellm/litellm_config.yaml."
+            "description": "The real production path: Open WebUI and every other client call `auto` here, LiteLLM rewrites it to `vllm-sr/auto` and forwards to http://vllm-sr-envoy:8899/v1 with SEMANTIC_ROUTER_LISTENER_KEY attached server-side. The router picks a chain alias and the request comes back into LiteLLM under SEMANTIC_ROUTER_LITELLM_KEY. The caller never holds either key.\n\nCompare the result with the equivalent item in the 'Envoy listener (direct)' folder: identical output means the LiteLLM leg is transparent; a difference means LiteLLM is transforming the body (check drop_params and the alias's max_tokens).\n\nErrors worth knowing: `auto` declares max_input_tokens 245760 (muse-glimmer's window, the largest any path can serve locally); a longer prompt is refused, and `context_window_fallbacks: auto -> [local-private]` refuses it too -- it never reaches Claude. If vllm-sr-envoy is unreachable, `fallbacks: auto -> [local-private]` answers locally instead. Both are in ai/litellm/litellm_config.yaml."
           },
           "response": []
         },
@@ -334,7 +334,7 @@
                 "completions"
               ]
             },
-            "description": "Same path with stream: true. Worth running because the answer is NOT incremental in the way the caller expects: Envoy buffers the whole ext_proc request and response body, so the stream stays silent for the entire routed turn and then delivers. Open WebUI shows a waiting state throughout.\n\nThis prompt trips `code_kw`, so it is a parallel ratings turn -- the silence is as long as the slower of qwen3.8-solo / muse-glimmer.\n\nIf the stream dies early, the culprit is a stream_timeout below 1800 on the `auto` alias, or a listener timeout below 1800s in config.yaml. The two must stay in step."
+            "description": "Same path with stream: true. Worth running because the answer is NOT incremental in the way the caller expects: Envoy buffers the whole ext_proc request and response body, so the stream stays silent until the chain has answered and then delivers. Open WebUI shows a waiting state throughout.\n\nThis prompt trips `code_kw`, so it lands on the local-code chain -- one call to qwen3.8-solo (or muse-glimmer / claude-sonnet-5 if the overflow hook spilled).\n\nIf the stream dies early, the culprit is a stream_timeout below 1800 on the `auto` alias, or a listener timeout below 1800s in config.yaml. The two must stay in step."
           },
           "response": []
         },
@@ -368,7 +368,7 @@
                 "completions"
               ]
             },
-            "description": "Phase 5 validation item, not an everyday call. Run `make down semantic-router vllm-sr-envoy`, then send this: LiteLLM should serve `auto` from qwen3.8-solo (then claude-sonnet-5) via `fallbacks` rather than returning an error, and the response's model field should say so.\n\nA hard 5xx instead means the `auto` entry is missing from the `fallbacks` map in ai/litellm/litellm_config.yaml -- LiteLLM reports that as 'Available Model Group Fallbacks=None'. Bring Envoy back with `make up semantic-router` afterwards."
+            "description": "Verification item, not an everyday call. Run `make down semantic-router vllm-sr-envoy`, then send this: LiteLLM should serve `auto` from the local-private chain via `fallbacks: auto -> [local-private]` -- qwen3.8-solo or muse-glimmer, NEVER Claude, because with the router down nothing has checked the prompt for PII. The spend log should show model group local-private under YOUR key with a local model.\n\nA hard 5xx instead means the `auto` entry is missing from the `fallbacks` map in ai/litellm/litellm_config.yaml -- LiteLLM reports that as 'Available Model Group Fallbacks=None' -- or both local models are down too (local-private fails closed by design). Bring Envoy back with `make up semantic-router` afterwards."
           },
           "response": []
         }

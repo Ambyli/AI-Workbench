@@ -23,6 +23,7 @@ The proxy is reachable at `http://localhost:4001`. Configuration is loaded from 
 - `HF_TOKEN` from `.env` — HuggingFace token for gated model downloads
 - `LITELLM_DATABASE_URL` from `.env` — PostgreSQL connection string
 - `litellm_config.yaml` — proxy config with model definitions and routing rules
+- `overflow.py` — the chain-alias overflow hook and the `auto` footer, mounted at `/app/overflow.py` beside the config (see [§ Chain aliases and the overflow hook](#chain-aliases-and-the-overflow-hook) and [§ The `auto` footer](#the-auto-footer))
 
 ### Health checks
 
@@ -39,3 +40,157 @@ Data in PostgreSQL is persisted in the `litellm_postgres_data` named volume and 
 ### `litellm_config.yaml` settings
 
 The proxy configuration file supports a wide range of options for models, routing, rate limits, and more. See the full reference: [LiteLLM Config Settings](https://docs.litellm.ai/docs/proxy/config_settings)
+
+### Chain aliases and the overflow hook
+
+Four model groups exist for the semantic router ([`ai/semantic-router/SEMANTIC_ROUTER.md`](../semantic-router/SEMANTIC_ROUTER.md)) to point at. Each is a **chain**: several deployments under one `model_name`, each with `litellm_params.order`. The policy they encode is *local models first for cost; Claude only when both local models are busy or down; customer / PII data never reaches Claude.*
+
+| Chain alias | order 1 | order 2 | order 3 (overflow only) |
+|---|---|---|---|
+| `local-general` | `qwen3.8-solo` | `muse-glimmer` | `claude-sonnet-5` |
+| `local-code` | `qwen3.8-solo` | `muse-glimmer` | `claude-sonnet-5` |
+| `local-reasoning` | `muse-glimmer` | `qwen3.8-solo` | `claude-opus-5-5` |
+| `local-private` | `qwen3.8-solo` | `muse-glimmer` | **— none —** |
+
+Every deployment calls its backend **directly** (`api_base: http://qwen3.8-solo:8000/v1`, `anthropic/claude-sonnet-5`, …); its `litellm_params` and `model_info` are copies of the standalone alias of the same name. Never point a chain deployment at a LiteLLM alias: it would recurse through the proxy and inherit that alias's `fallbacks: → claude-sonnet-5`. The standalone aliases (`qwen3.8-solo`, `muse-glimmer`, `claude-*`) are unchanged and still callable directly — **when you change one of them, change its chain copies too.**
+
+#### How a deployment is picked (LiteLLM v1.95.0)
+
+`router.py::async_get_healthy_deployments` (10606-10740) filters in this order:
+
+1. **cooldown** — deployments LiteLLM has cooled down after failures are removed;
+2. **overflow hook** — `async_callback_filter_deployments` (10686) calls `ai/litellm/overflow.py`, which drops a local deployment that is busy or down;
+3. **pre-call context check** (10694, `enable_pre_call_checks: true`) — drops any deployment whose `model_info.max_input_tokens` is smaller than the prompt. This is why `max_input_tokens` is set per deployment: a prompt over 114688 tokens skips `qwen3.8-solo` for `muse-glimmer` (245760) with no error and no fallback hop;
+4. **order filter** (10716-10720) — keeps only the **lowest** `order` left.
+
+A deployment that fails *at call time* (connection refused, 5xx) is retried `num_retries` times and then LiteLLM's **order-based fallback** walks the remaining order levels of the same group (`router.py:6132-6182`). A **timeout** is not retried at the same order: `router_settings.model_group_retry_policy` gives each chain `{TimeoutErrorRetries: 0}`, so a pre-header timeout goes straight to the next order (`router.py:6505-6521`), and a stall after headers takes the router's mid-stream fallback to the next order (`router.py:2066-2150`) — see [§ Chain timeouts](#chain-timeouts). So the chains need, and have, **no `fallbacks` entry**. Order-based fallback is skipped for `ContextWindowExceededError` (6134-6148), which is fine — the pre-call check already handled context.
+
+`local-private` has no Claude deployment and no entry in `fallbacks` or `context_window_fallbacks`. Do not add one. `auto`'s two fallback entries point at `local-private`, because when the router is down nothing has checked the prompt for PII.
+
+#### The overflow hook (`overflow.py`)
+
+Mounted at `/app/overflow.py` next to `/app/config.yaml` and registered with `litellm_settings.callbacks: ["overflow.handler"]` (LiteLLM resolves the module relative to the config file's directory, `proxy/types_utils/utils.py:30-56`). It:
+
+- **polls** `<api_base minus /v1>/metrics` on every local backend it has seen in a chain, **concurrently**, about once a second, and sums `vllm:num_requests_waiting` / `vllm:num_requests_running` across label sets;
+- marks a backend **busy** once `waiting > 0` has held for `OVERFLOW_BUSY_AFTER_S`, and clears it once `waiting == 0` has held for `OVERFLOW_IDLE_AFTER_S`;
+- marks a backend **down** when its probe fails (refused, timed out, non-200);
+- treats a backend as **unknown → keep** when it has never been probed, when its data is older than 5 × the poll interval (the poller stopped), or when `/metrics` answers without the vLLM queue metric;
+- per request, and only for a group with ≥ 2 distinct `order` values: drops every deployment with an `api_base` that is busy or down, **never** drops one without an `api_base` (Claude), and if that would leave nothing keeps the busy ones (the request queues in vLLM) or, all down, returns the list unchanged — which is what keeps `local-private` local;
+- never throws (LiteLLM re-raises a filter's exception, `router.py:7366-7384`, which would fail the request) and returns the list unchanged on any internal error.
+
+The poller starts lazily on the first chain request and is restarted if it ever dies. Until it has data, the hook changes nothing — LiteLLM behaves exactly as it would without it.
+
+#### Tuning
+
+| Variable | Default | Effect |
+|---|---|---|
+| `OVERFLOW_BUSY_AFTER_S` | `2` | how long a waiting queue must persist before the backend counts as busy. Lower spills sooner (more Claude spend, less queueing); higher tolerates bursts. |
+| `OVERFLOW_IDLE_AFTER_S` | `5` | how long the queue must stay empty before a busy backend is used again. Keep it above `BUSY_AFTER` so a backend does not flap. |
+| `OVERFLOW_POLL_INTERVAL_S` | `1` | probe cadence (floor 0.2). Data older than 5 × this is ignored. |
+| `OVERFLOW_PROBE_TIMEOUT_S` | `0.75` | per-probe timeout; a probe that exceeds it marks the backend **down**. Keep it below the poll interval. |
+
+Set them in `.env` and `make up litellm` (they are passed through the compose `environment:` block, so a change to them is a compose change and `make up` recreates the container). Turning the hook off is removing the `callbacks:` line — the chains then fail over only on real errors; that is a config-file edit, so apply it as in [§ Applying a chain or hook change](#applying-a-chain-or-hook-change).
+
+#### Changing a chain
+
+- **Reorder** (e.g. make `muse-glimmer` go first in `local-general`): swap the two deployments' `order` values. Nothing else changes — the hook and the order filter read `order` per request.
+- **Change the overflow model** (e.g. `local-code` → `claude-opus-5-5`): replace the order-3 deployment's `litellm_params` with a copy of the other Claude alias's. Never add a Claude deployment to `local-private`.
+- **Change a model's settings** (sampling, `max_input_tokens`): edit the standalone alias **and** every chain copy of it — the chains do not reference the standalone alias, on purpose. **Timeouts are the exception**: chain deployments carry their own `stream_timeout` / `timeout` (the chain's budget, [§ Chain timeouts](#chain-timeouts)), not copies of the standalone alias's.
+- The semantic router needs no change for any of these; it only knows the chain's name.
+
+#### Chain timeouts
+
+Every chain deployment sets **both** `stream_timeout` and `timeout` — 240 s on the local orders 1 and 2, 300 s on the Claude order 3 — and `auto` sets both to 870 s. They are one layer of a strictly nested budget: Open WebUI 900 s (`OPENWEBUI_AIOHTTP_CLIENT_TIMEOUT`, a hard total including streaming, on every chat completion) > `auto` 870 > Envoy listener 840 > the chain's per-read 240 / 300. `litellm_settings.request_timeout: 900` is the per-attempt default for anything that sets none of its own.
+
+- **They are per read, not totals.** LiteLLM passes them as `httpx.Timeout(x)`; for `stream: true` the value used is request `stream_timeout` > deployment `stream_timeout` > `router_settings.stream_timeout` > `request_timeout`, otherwise `timeout` / `request_timeout` (`router.py:3143-3175`). On `auto` the response is buffered by Envoy and its headers held until the first chunk (`proxy/common_request_processing.py:460-472`), so `auto`'s per-read 870 is in practice a time-to-complete-answer limit.
+- **A timeout goes straight to the next order.** `router_settings.model_group_retry_policy: {local-…: {TimeoutErrorRetries: 0}}` (field `RetryPolicy.TimeoutErrorRetries`, `types/router.py:105`; passed through by `proxy_server.py:5012-5016`, which keeps only valid `Router` args). Without it, `num_retries: 1` would re-pick order 1 — the order filter still prefers it — and spend a second 240 s there. Other errors keep `num_retries: 1`. `auto` has the same entry: its timeout firing means the routed turn used its whole budget, and a retry would restart it seconds before Open WebUI's 900 s cap — it goes to `fallbacks: auto → [local-private]` instead. Do **not** use `allowed_fails_policy` for this: it switches every deployment to legacy cooldown.
+- **What falls back, measured against v1.95.0** (`unit-tests/litellm/test_timeouts.py`): a timeout before response headers → next order at once; a stall after headers (vLLM sends them before its first token) → the read timeout maps to `APIConnectionError`, the stream raises `MidStreamFallbackError`, and the Router's mid-stream fallback moves to the next order — re-prompting with the partial answer as an assistant prefix if some content had already streamed. A mid-stream error that maps to a 4xx is raised with no fallback (`streaming_handler.py:2202-2206`). The whole table is in [SEMANTIC_ROUTER.md § Timeout budget](../semantic-router/SEMANTIC_ROUTER.md#timeout-budget).
+- The standalone aliases keep their own `stream_timeout` (300 / 600 / 1800) as stall detectors; a caller through Open WebUI is cut at 900 s total regardless.
+
+#### Applying a chain or hook change
+
+```bash
+docker compose -f ai/litellm/docker-compose.litellm.yml --env-file .env -p ai-litellm up -d --force-recreate litellm
+```
+
+`litellm_config.yaml` and `overflow.py` are single-file bind mounts and LiteLLM reads both only at startup. `make up litellm` does not recreate a running container for a file *content* change, and `docker restart litellm` keeps the original mount — so an editor or `git pull` that replaced the file (new inode) leaves the container reading the old one. The recreate is the one path that always loads the current files. Then check `docker logs litellm` for an `overflow` import error.
+
+#### Seeing spills
+
+- `docker logs litellm 2>&1 | grep '\[overflow\]'` — one INFO line per spill decision (alias, dropped deployment, reason, waiting count, next order), throttled to one per alias/deployment/reason per 30 s with a `(+N similar)` count. An `every deployment is busy/down … keeping …` line is `local-private` (or a chain whose Claude deployment was cooled down) choosing to queue.
+- **LiteLLM Admin UI → Logs / spend by key**: the row's *model group* is the chain alias, its *model* the deployment that answered. Claude overflow is any row with a `local-*` model group and an `anthropic/…` model. A `local-private` row with a Claude model must never exist.
+- In-process state: `handler.state()` returns the per-backend verdict, queue depths, timers and counters (`spills`, `kept_all_overloaded`, `errors`, `poller_restarts`). It lives in the proxy process; it is there for debugging with a REPL or a temporary log line, not as an endpoint.
+
+#### Adding a chain
+
+1. Add one `model_list` entry per rung under a new `model_name` (e.g. `local-vision`), each with `order: N`, its own `api_base` and its own `model_info.max_input_tokens`. Copy the params from the standalone alias; do not reference it.
+2. Decide whether it may reach Claude. If not, give it no Claude deployment and **no** `fallbacks` / `context_window_fallbacks` entry, like `local-private`. If it may, put Claude on the highest order only.
+3. If the semantic router should use it, add it to `providers.models` + `routing.modelCards` in `ai/semantic-router/config.yaml`, re-render `envoy.yaml`, and add the alias to `SEMANTIC_ROUTER_LITELLM_KEY`'s model list in the Admin UI.
+4. Nothing to configure in the hook — it learns backends from the deployments it sees. A non-vLLM local backend (llama.cpp) has no `vllm:num_requests_waiting`; the hook then treats it as **unknown** and never spills on its account, only failing over on real errors.
+5. Apply it with the recreate in [§ Applying a chain or hook change](#applying-a-chain-or-hook-change) (not `make up litellm`), then add a Postman item under **Chain aliases** in `litellm.postman_collection.json`.
+
+The overflow hook's unit tests live in [`unit-tests/litellm/test_overflow.py`](../../unit-tests/litellm/test_overflow.py) and drive the real v1.95.0 `Router` when `litellm` is installed:
+
+```bash
+uv venv /tmp/llvenv && UV_LINK_MODE=copy uv pip install --python /tmp/llvenv litellm==1.95.0 pytest
+/tmp/llvenv/bin/python -m pytest unit-tests/litellm -q -p no:cacheprovider
+```
+
+### The `auto` footer
+
+When — and only when — a client calls model **`auto`** (the semantic router), the same handler in `overflow.py` appends a footer to the assistant message naming the backend that actually answered:
+
+```
+<answer>
+
+---
+*qwen3.8-solo · local-general*
+```
+
+| Footer | Meaning |
+|---|---|
+| `*qwen3.8-solo · local-general*` | the router chose `local-general`; its order-1 deployment answered |
+| `*muse-glimmer · local-code*` | order 1 was busy, down or failed; order 2 answered |
+| `*claude-sonnet-5 · local-general · overflow (local busy)*` | a Claude deployment answered, and the hook *currently* sees that chain's local backends as busy |
+| `… · overflow (local down)` | … every local backend of the chain is failing its probe |
+| `… · overflow` | Claude answered but the hook has no busy/down verdict (a call-time failure, a stale poller, or a different proxy worker did the spilling) |
+| `*qwen3.8-solo · local-private · router bypassed*` | the router itself failed and `fallbacks: auto -> [local-private]` answered |
+
+**Scope.** Requests whose `model` is `auto`, nothing else: a direct call to a `local-*` chain or any other alias is untouched, and so is the router's own sub-request (it comes back into LiteLLM as `local-*`), so the footer is added exactly once, on the outer response. Provider prefixes are stripped (`anthropic/claude-sonnet-5` → `claude-sonnet-5`).
+
+**How it is derived (LiteLLM v1.95.0).** The inner LiteLLM — the one serving the chain — puts `x-litellm-model-id`, `x-litellm-model-name` (`common_request_processing.py:938-948`) and `x-litellm-model-group` (`router.py:9388`) on its response; Envoy passes them through and the router adds `x-vsr-selected-decision` / `x-vsr-selected-model` (`processor_res_header_mutation.go:249-261`). The outer openai provider keeps every upstream header as `llm_provider-<name>` in `_hidden_params["additional_headers"]` — on the response for JSON (`core_helpers.py:318-319`) and on the stream wrapper for SSE (`openai.py:1072-1079` → `streaming_handler.py:164-171`; both regression-tested against a stand-in upstream). The model id is mapped back to its deployment through the proxy's own router (`llm_router.get_deployment`, `router.py:8577`), because inner and outer are the same proxy; it is the id of the deployment that actually answered, also after an in-group order fallback. The name / group headers are the fallback. **Router bypassed** is read from the outer deployment the proxy stores in `data["deployment"]` (`common_request_processing.py:1707`, resolved from the response's model id): its model group is `local-private`, not `auto` (the outer router also reports `x-litellm-model-group: local-private` and `x-litellm-attempted-fallbacks: 1`). `data["model"]` itself stays `auto` — `route_request` unpacks `**data` into the router (`route_llm_request.py:404`). Busy / down come from this handler's own backend state for the chain, so they are an approximation of *why* Claude answered, not a record.
+
+**Hooks.** Three methods defined directly in the `OverflowHandler` class body — not on a mixin, because the proxy activates `async_post_call_streaming_iterator_hook` and `async_pre_call_hook` only when the name is in the leaf class's `__dict__` (`proxy/utils.py:1718-1745`):
+
+- `async_post_call_success_hook` (non-streaming; `proxy/utils.py:2404-2410` keeps a non-`None` return) appends the footer to each qualifying `message.content`;
+- `async_post_call_streaming_iterator_hook` (the proxy wraps the stream once, `proxy_server.py:7413-7419`, and writes `data: [DONE]` after it ends) yields the footer as an extra `delta.content` chunk right before each qualifying choice's finish chunk — or appends it to the finish chunk's own content when that chunk carries text, so it never lands in front of the last words. A stream that ends without a finish chunk gets it last;
+- `async_pre_call_hook` strips footers from the incoming conversation (below).
+
+**Edge cases.**
+
+- **Skipped:** a choice with tool calls (or `content` empty / `None`); any request with `response_format`; reasoning-only output. `reasoning_content` is never touched.
+- **Open WebUI background tasks are skipped.** v0.11.4 sends title / tags / follow-up / search-query / autocomplete / emoji requests to the *chat* model unless a Task Model is set, and a footer would land in chat titles and break the tags / follow-ups JSON. Its task payloads carry `metadata.task`, but `routers/openai.py` pops `metadata` before the request leaves Open WebUI and forwards no task header — so the prompt is the only signal. Detected: a last user message starting `### Task:` (the default title, tags, image-prompt, follow-up, query and autocomplete templates, `config.py:2211-2340`) or `Your task is to reflect the speaker's likely facial expression` (emoji, `config.py:2439`); a system message starting `Available Tools:` (legacy function calling, `utils/middleware.py:1351-1373`); and, for admin-customised templates, a non-streaming request whose last user message contains a `<chat_history>…</chat_history>` block. MOA is a user-visible answer and is not skipped.
+- **Belt and braces:** set **Admin Settings → Interface → Task Model** (local *and* external) to a non-`auto` model — e.g. `qwen3.8-solo`, or `local-private` if chats may carry customer data. A custom task template that matches none of the patterns above would otherwise get a footer.
+- **Previous footers are stripped** from incoming assistant messages on `auto` requests (string content, or the last text part of list content; `role: "assistant"` only), so the model never sees — and imitates — them and the router's keyword signals never read them. The regex matches only the exact emitted form: a blank line, `---`, then one `*…*` line of at least two ` · `-separated parts, at the very end. A non-streaming answer that imitates the footer has it replaced, not doubled.
+- `n > 1`: once per qualifying choice; never twice for the same response.
+- **Never throws:** any internal error returns the response or stream unmodified. `handler.state()["stats"]` counts `footers`, `footers_stripped` and `footer_errors`.
+- The footer is presentation only: spend logs, token counts and cost are those of the answer without it.
+
+**Toggle.** `AUTO_FOOTER_ENABLED` (default `true`; accepts `true`/`false`/`1`/`0`, also `yes`/`no`/`on`/`off`), passed through the compose `environment:` like the `OVERFLOW_*` variables. Off disables all three hooks, stripping included. A change to `overflow.py` itself needs the recreate in [§ Applying a chain or hook change](#applying-a-chain-or-hook-change).
+
+**Verifying.**
+
+```bash
+# non-streaming: choices[0].message.content ends with the footer, and the
+# llm_provider-x-litellm-model-name / -model-group response headers agree with it
+curl -si http://localhost:4001/v1/chat/completions \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"model":"auto","messages":[{"role":"user","content":"Say hi in five words."}]}'
+
+# streaming: the footer is the last content delta, before the finish chunk and [DONE]
+curl -siN http://localhost:4001/v1/chat/completions \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"model":"auto","stream":true,"messages":[{"role":"user","content":"Say hi in five words."}]}'
+```
+
+Then confirm the negatives: the same call with `"model":"local-general"` has no footer, and a new Open WebUI chat's title, tags and follow-ups carry none. Unit tests: [`unit-tests/litellm/test_auto_footer.py`](../../unit-tests/litellm/test_auto_footer.py), run the same way as the overflow tests (the proxy-plumbing tests additionally need `litellm[proxy]==1.95.0`).

@@ -1,10 +1,41 @@
 litellm_settings:
   num_retries: 1
-  request_timeout: 300
+  # TIMEOUT BUDGET -- each layer strictly inside the one outside it:
+  #   Open WebUI 900 (AIOHTTP_CLIENT_TIMEOUT, a hard total incl. streaming)
+  #   > `auto` 870 (below) > Envoy listener 840 (router config.yaml)
+  #   > chain orders 1/2: 240, Claude order 3: 300.
+  # See ai/semantic-router/SEMANTIC_ROUTER.md > Timeout budget.
+  #
+  # Every LiteLLM timeout is passed to httpx as httpx.Timeout(x) -- a
+  # PER-READ inactivity limit, not a total. For `stream: true` the value
+  # used is request stream_timeout > deployment stream_timeout >
+  # router_settings.stream_timeout > request_timeout; otherwise timeout /
+  # request_timeout (router.py:3143-3175 at v1.95.0). The 15-minute TOTAL
+  # is enforced by Open WebUI; request_timeout: 900 is LiteLLM's default
+  # per-attempt timeout for anything that sets none of its own, matched to
+  # Open WebUI so LiteLLM is never the one that cuts a slow-but-alive call.
+  # The per-deployment stream_timeout values below are stall detectors.
+  request_timeout: 900
   drop_params: true
   turn_off_message_logging: true
   json_logs: false
+  # Also the context gate for the chain aliases below: _pre_call_checks
+  # drops any deployment whose model_info.max_input_tokens is smaller than
+  # the prompt BEFORE the order filter picks the lowest order left
+  # (router.py:10694-10720 at v1.95.0), so a long prompt skips qwen3.8-solo
+  # (114688) for muse-glimmer (245760) with no error and no fallback hop.
   enable_pre_call_checks: true
+  # Overflow hook for the chain aliases (local-general / local-code /
+  # local-reasoning / local-private). ai/litellm/overflow.py, mounted at
+  # /app/overflow.py next to /app/config.yaml -- get_instance_fn resolves
+  # "overflow.handler" relative to the config file's directory
+  # (proxy/types_utils/utils.py:30-56). It polls each local vLLM's /metrics
+  # about once a second and, inside a chain, drops a local deployment that
+  # has had a waiting queue for OVERFLOW_BUSY_AFTER_S or whose probe fails,
+  # so LiteLLM's order filter moves to the next order. It never drops a
+  # Claude deployment and never empties a group: local-private queues
+  # locally instead. See ai/litellm/LITELLM.md > Chain aliases.
+  callbacks: ["overflow.handler"]
   # Three independent fallback maps. `fallbacks` fires on generic failures
   # (connection refused while a vLLM container is still loading, 5xx, timeouts)
   # after num_retries is exhausted; `context_window_fallbacks` fires ONLY on
@@ -19,6 +50,24 @@ litellm_settings:
     - {"glm5.2":        ["claude-sonnet-5"]}
     - {"glm5.3-flash":  ["claude-sonnet-5"]}
     - {"muse-glimmer":  ["claude-sonnet-5"]}
+    # `auto` is the semantic router (ai/semantic-router/). Stopping
+    # vllm-sr-envoy, or a router that fails its readiness check, must not
+    # take the chat down -- but with the router gone NOTHING has classified
+    # the prompt, so LiteLLM cannot know whether it carries PII. So the
+    # fallback is local-private: local models only, no Claude, which is
+    # also the cheapest answer. NOT qwen3.8-solo / muse-glimmer: those
+    # aliases chain on to their own `claude-sonnet-5` entries above
+    # (run_async_fallback re-enters with the new model group and re-reads
+    # this map; router_utils/fallback_event_handlers.py:120-137 at v1.95.0,
+    # depth cap ROUTER_MAX_FALLBACKS=5). local-private has no entry in
+    # either map, so the chain stops there. Do NOT list a router entrypoint
+    # as its own fallback.
+    - {"auto":          ["local-private"]}
+    # The chain aliases (local-general / local-code / local-reasoning /
+    # local-private) have NO entry here on purpose: their failover is
+    # in-group, by `order`. A failed order-1 call is retried at order 2
+    # then 3 by the router's order-based fallback (router.py:6132-6182 at
+    # v1.95.0), which runs before -- and instead of needing -- this map.
   context_window_fallbacks:
     - {"qwen3.6":       ["claude-sonnet-5"]}
     - {"qwen3.8":       ["claude-sonnet-5"]}
@@ -27,6 +76,62 @@ litellm_settings:
     - {"glm5.2":        ["claude-sonnet-5"]}
     - {"glm5.3-flash":  ["claude-sonnet-5"]}
     - {"muse-glimmer":  ["claude-sonnet-5"]}
+    # Same reasoning as `auto` under `fallbacks`: a prompt refused for
+    # length has not been classified, so it goes local-only. local-private
+    # reaches muse-glimmer (245760) by itself -- the pre-call check skips
+    # qwen3.8-solo for anything over 114688 -- and a prompt over 245760 is
+    # refused there too, which is the point: it never reaches Claude.
+    - {"auto":          ["local-private"]}
+    # No chain alias appears here either. Inside a chain the pre-call
+    # check already skips too-small deployments, and LiteLLM deliberately
+    # skips order-based fallback for ContextWindowExceededError
+    # (router.py:6132-6148 at v1.95.0). local-private, with no Claude
+    # deployment, therefore FAILS on a prompt over 245760. (The other
+    # chains would hand such a prompt to their Claude deployment, which
+    # declares no window -- but nothing over 245760 reaches a chain via
+    # `auto`, whose own max_input_tokens refuses it first.)
+
+router_settings:
+  # A TIMEOUT inside a chain goes straight to the next `order`, with no
+  # same-order retry. Without this, num_retries: 1 above would re-pick
+  # order 1 first (the order filter still prefers it) and spend a second
+  # 240 s on the backend that just timed out. A per-group RetryPolicy
+  # overrides num_retries for that exception type only
+  # (router_utils/get_retry_from_policy.py; field TimeoutErrorRetries,
+  # types/router.py:105; Router(model_group_retry_policy=...), router.py:331;
+  # applied in async_function_with_retries, router.py:6505-6521, all at
+  # v1.95.0). With 0 retries the Timeout re-raises into the order-based
+  # fallback (router.py:6132-6171), which tries the next order level.
+  # Other errors (connection refused, 5xx) keep num_retries: 1.
+  # The proxy passes every key of this block that is a Router.__init__ arg
+  # through to the Router (proxy_server.py:5012-5016).
+  #
+  # This policy governs a timeout BEFORE response headers. A stall AFTER
+  # headers (vLLM sends them before its first token) surfaces inside the
+  # stream instead. Measured at v1.95.0 against an openai-compatible
+  # deployment: the read timeout has no status code, maps to
+  # APIConnectionError (exception_mapping_utils.py:482-490), is wrapped as
+  # MidStreamFallbackError (streaming_handler.py:2153-2217), and the
+  # Router's mid-stream fallback (router.py:2066-2150) moves to the next
+  # order with no same-order retry -- re-prompting with the partial answer
+  # as a prefix if some content had already streamed. Only a mid-stream
+  # error that maps to a 4xx is raised with no fallback
+  # (streaming_handler.py:2202-2206). Both paths are regression-tested in
+  # unit-tests/litellm/test_timeouts.py. A backend that is merely QUEUEING
+  # is handled earlier, by the overflow hook, before a call is ever made.
+  #
+  # Do NOT use allowed_fails_policy for this: setting it switches every
+  # deployment to legacy cooldown.
+  model_group_retry_policy:
+    local-general:   {TimeoutErrorRetries: 0}
+    local-code:      {TimeoutErrorRetries: 0}
+    local-reasoning: {TimeoutErrorRetries: 0}
+    local-private:   {TimeoutErrorRetries: 0}
+    # `auto` too: its 870 s timeout (or Envoy's 840 s route timeout) firing
+    # means the whole routed turn ran out of budget. A same-group retry would
+    # start the turn again with ~30-60 s left before Open WebUI's 900 s cap
+    # cuts it -- so go straight to `fallbacks: auto -> [local-private]`.
+    auto:            {TimeoutErrorRetries: 0}
 
 general_settings:
   master_key: os.environ/DEFAULT_LITELLM_MASTER_KEY
@@ -230,7 +335,10 @@ model_list:
       # CPU-only backend (ai/llama/docker-compose.llama.yml -> glm5.3-flash):
       # prompt processing runs at low hundreds of tok/s, so time-to-first-token
       # on a long, uncached prompt is minutes, not seconds. 1800 s is the
-      # time-to-first-chunk budget before LiteLLM gives up on the stream.
+      # per-read budget (httpx.Timeout) before LiteLLM gives up on a silent
+      # stream. A caller through Open WebUI is cut at Open WebUI's 900 s
+      # TOTAL first (AIOHTTP_CLIENT_TIMEOUT), so 1800 only matters to
+      # direct API callers.
       stream_timeout: 1800
     model_info:
       # glm5.3-flash runs -c 262144 --parallel 1 -> one 262144 slot,
@@ -276,3 +384,333 @@ model_list:
       model: anthropic/claude-sonnet-5
       api_key: os.environ/ANTHROPIC_API_KEY
       stream_timeout: 300
+
+  # Not in any fallback map, so it is never spent silently on someone
+  # else's behalf. Not on the semantic router's key any more either: the
+  # router reaches Opus only as order 3 of the `local-reasoning` chain
+  # below -- a separate deployment, overflow only.
+  - model_name: claude-opus-5-5
+    litellm_params:
+      model: anthropic/claude-opus-5-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+      stream_timeout: 300
+
+  # =========================================================================
+  # CHAIN ALIASES -- what the semantic router's four decisions point at.
+  # =========================================================================
+  # Policy: local models first, for COST. Claude is reached ONLY when both
+  # local deployments in a chain are busy or down -- never on a quality
+  # judgement. Customer / PII data must NEVER reach Claude (local-private).
+  #
+  #   alias             order 1        order 2        order 3
+  #   local-general     qwen3.8-solo   muse-glimmer   claude-sonnet-5
+  #   local-code        qwen3.8-solo   muse-glimmer   claude-sonnet-5
+  #   local-reasoning   muse-glimmer   qwen3.8-solo   claude-opus-5-5
+  #   local-private     qwen3.8-solo   muse-glimmer   -- NONE --
+  #
+  # HOW A REQUEST PICKS A DEPLOYMENT (LiteLLM v1.95.0,
+  # router.py::async_get_healthy_deployments, 10606-10740):
+  #   cooldown filter -> overflow hook (async_callback_filter_deployments,
+  #   10686) -> pre-call context check (10694) -> order filter (10716-10720:
+  #   keep only the LOWEST `order` still present).
+  # So order 1 answers while it is up and not queueing. The overflow hook
+  # (ai/litellm/overflow.py) drops a local deployment whose vLLM has had a
+  # waiting queue for OVERFLOW_BUSY_AFTER_S, or whose /metrics probe fails;
+  # the order filter then picks order 2, and only with both locals dropped
+  # order 3. The hook never drops a deployment without an api_base (Claude)
+  # and never empties a group.
+  # A deployment that fails AT CALL TIME is retried (num_retries) and then
+  # LiteLLM's order-based fallback walks the remaining order levels of the
+  # same group (router.py:6132-6182) -- no `fallbacks` entry needed, and
+  # none exists for these aliases. A TIMEOUT is not retried at the same
+  # order: router_settings.model_group_retry_policy sends a pre-header
+  # timeout straight to the next order, and a stall after headers takes
+  # the mid-stream fallback to the next order (see router_settings).
+  #
+  # TIMEOUTS. Every chain deployment sets BOTH stream_timeout and timeout
+  # (per-read, httpx.Timeout): 240 on the local orders 1 and 2, 300 on the
+  # Claude order 3. They sit inside the Envoy listener's 840 s route timeout
+  # (ai/semantic-router/config.yaml), so a stalled local backend fails over
+  # while the turn still has budget: three pre-header timeouts in a row cost
+  # 240 + 240 + 300 = 780 s < 840. These are NOT copied from the standalone
+  # aliases (which keep their own stream_timeout) -- they are the chain's
+  # budget. See SEMANTIC_ROUTER.md > Timeout budget.
+  #
+  # EACH DEPLOYMENT CALLS ITS BACKEND DIRECTLY. litellm_params below are
+  # copies of the standalone qwen3.8-solo / muse-glimmer / claude-sonnet-5 /
+  # claude-opus-5-5 entries above (keep them in sync when those change), NOT
+  # references to those aliases: pointing a chain at an alias would recurse
+  # through LiteLLM, and -- worse -- drag in that alias's own
+  # `fallbacks: -> claude-sonnet-5`, which is exactly the silent cloud path
+  # local-private exists to close. The standalone aliases are unchanged and
+  # still callable directly.
+  #
+  # model_info.max_input_tokens is per DEPLOYMENT and load-bearing: it is
+  # what lets enable_pre_call_checks skip qwen3.8-solo (114688) for a long
+  # prompt and land on muse-glimmer (245760). The Claude deployments declare
+  # none, matching their standalone aliases.
+
+  # -- local-general: the catch-all; Envoy's default route --------------------
+  - model_name: local-general
+    litellm_params:
+      model: openai/qwen3.8-solo
+      api_base: http://qwen3.8-solo:8000/v1
+      api_key: none
+      order: 1
+      max_tokens: 16384
+      temperature: 1.0
+      top_p: 0.95
+      frequency_penalty: 0
+      presence_penalty: 0
+      extra_body:
+        top_k: 20
+        min_p: 0
+      stream_timeout: 240
+      timeout: 240
+    model_info:
+      max_input_tokens: 114688
+      max_output_tokens: 16384
+
+  - model_name: local-general
+    litellm_params:
+      model: openai/muse-glimmer
+      api_base: http://muse-glimmer:8000/v1
+      api_key: none
+      order: 2
+      max_tokens: 16384
+      temperature: 1.0
+      top_p: 0.95
+      frequency_penalty: 0
+      presence_penalty: 0
+      extra_body:
+        top_k: 64
+      stream_timeout: 240
+      timeout: 240
+    model_info:
+      max_input_tokens: 245760
+      max_output_tokens: 16384
+      supports_vision: true
+
+  - model_name: local-general
+    litellm_params:
+      model: anthropic/claude-sonnet-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+      order: 3
+      stream_timeout: 300
+      timeout: 300
+
+  # -- local-code: same ladder, separate group for tuning and attribution -----
+  - model_name: local-code
+    litellm_params:
+      model: openai/qwen3.8-solo
+      api_base: http://qwen3.8-solo:8000/v1
+      api_key: none
+      order: 1
+      max_tokens: 16384
+      temperature: 1.0
+      top_p: 0.95
+      frequency_penalty: 0
+      presence_penalty: 0
+      extra_body:
+        top_k: 20
+        min_p: 0
+      stream_timeout: 240
+      timeout: 240
+    model_info:
+      max_input_tokens: 114688
+      max_output_tokens: 16384
+
+  - model_name: local-code
+    litellm_params:
+      model: openai/muse-glimmer
+      api_base: http://muse-glimmer:8000/v1
+      api_key: none
+      order: 2
+      max_tokens: 16384
+      temperature: 1.0
+      top_p: 0.95
+      frequency_penalty: 0
+      presence_penalty: 0
+      extra_body:
+        top_k: 64
+      stream_timeout: 240
+      timeout: 240
+    model_info:
+      max_input_tokens: 245760
+      max_output_tokens: 16384
+      supports_vision: true
+
+  - model_name: local-code
+    litellm_params:
+      model: anthropic/claude-sonnet-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+      order: 3
+      stream_timeout: 300
+      timeout: 300
+
+  # -- local-reasoning: the reasoner leads; Opus is the overflow ---------------
+  - model_name: local-reasoning
+    litellm_params:
+      model: openai/muse-glimmer
+      api_base: http://muse-glimmer:8000/v1
+      api_key: none
+      order: 1
+      max_tokens: 16384
+      temperature: 1.0
+      top_p: 0.95
+      frequency_penalty: 0
+      presence_penalty: 0
+      extra_body:
+        top_k: 64
+      stream_timeout: 240
+      timeout: 240
+    model_info:
+      max_input_tokens: 245760
+      max_output_tokens: 16384
+      supports_vision: true
+
+  - model_name: local-reasoning
+    litellm_params:
+      model: openai/qwen3.8-solo
+      api_base: http://qwen3.8-solo:8000/v1
+      api_key: none
+      order: 2
+      max_tokens: 16384
+      temperature: 1.0
+      top_p: 0.95
+      frequency_penalty: 0
+      presence_penalty: 0
+      extra_body:
+        top_k: 20
+        min_p: 0
+      stream_timeout: 240
+      timeout: 240
+    model_info:
+      max_input_tokens: 114688
+      max_output_tokens: 16384
+
+  - model_name: local-reasoning
+    litellm_params:
+      model: anthropic/claude-opus-5-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+      order: 3
+      stream_timeout: 300
+      timeout: 300
+
+  # -- local-private: LOCAL ONLY ----------------------------------------------
+  # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+  # !! NO CLAUDE DEPLOYMENT, AND NO ENTRY IN `fallbacks` OR                  !!
+  # !! `context_window_fallbacks` -- EVER. This group serves the semantic    !!
+  # !! router's privacy_local decision (PII / customer data) and is the      !!
+  # !! `auto` fallback when the router itself is down, i.e. whenever nobody  !!
+  # !! has checked the prompt for PII. Customer data must never reach       !!
+  # !! Anthropic, so when both local models are busy the overflow hook       !!
+  # !! returns the group unchanged and the request QUEUES inside vLLM, and   !!
+  # !! when both are down it FAILS. Adding a cloud deployment, or a          !!
+  # !! fallback entry for this alias, turns the privacy guarantee into a     !!
+  # !! best-effort hint. Do not, not even "temporarily".                     !!
+  # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+  - model_name: local-private
+    litellm_params:
+      model: openai/qwen3.8-solo
+      api_base: http://qwen3.8-solo:8000/v1
+      api_key: none
+      order: 1
+      max_tokens: 16384
+      temperature: 1.0
+      top_p: 0.95
+      frequency_penalty: 0
+      presence_penalty: 0
+      extra_body:
+        top_k: 20
+        min_p: 0
+      stream_timeout: 240
+      timeout: 240
+    model_info:
+      max_input_tokens: 114688
+      max_output_tokens: 16384
+
+  - model_name: local-private
+    litellm_params:
+      model: openai/muse-glimmer
+      api_base: http://muse-glimmer:8000/v1
+      api_key: none
+      order: 2
+      max_tokens: 16384
+      temperature: 1.0
+      top_p: 0.95
+      frequency_penalty: 0
+      presence_penalty: 0
+      extra_body:
+        top_k: 64
+      stream_timeout: 240
+      timeout: 240
+    model_info:
+      max_input_tokens: 245760
+      max_output_tokens: 16384
+      supports_vision: true
+
+  # vLLM Semantic Router (ai/semantic-router/). One model name that picks a
+  # decision from the request's signals and forwards the request, unchanged
+  # apart from its `model`, to ONE of the four chain aliases above
+  # (privacy_local -> local-private, code -> local-code, reasoning ->
+  # local-reasoning, everything else -> local-general). Every decision is
+  # `static`: one upstream call per turn, no looper fan-out, no confidence
+  # escalation.
+  #
+  # `openai/vllm-sr/auto` is not a provider path: `openai/` selects
+  # LiteLLM's OpenAI-compatible client and `vllm-sr/auto` is the literal
+  # model name in the request body. It must equal
+  # global.router.auto_model_name in ai/semantic-router/config.yaml, which
+  # is the ONE name that triggers auto-routing -- every other model name a
+  # caller sends the router is treated as an explicit selection.
+  #
+  # api_base points at Envoy, not at the router: the router is an ext_proc
+  # server behind that listener and has no OpenAI surface of its own.
+  #
+  # RECURSION: the routed request comes back into this same LiteLLM with
+  # SEMANTIC_ROUTER_LITELLM_KEY (the router rewrites Authorization). That
+  # key is scoped to the FOUR chain aliases (local-general, local-code,
+  # local-reasoning, local-private) and must never be able to call `auto`.
+  # See ai/semantic-router/SEMANTIC_ROUTER.md > Recursion guard.
+  #
+  # stream_timeout AND timeout 870 because Envoy runs ext_proc with BUFFERED
+  # request AND response bodies: nothing comes back until the chain's answer
+  # is complete, including any time local-private spends queued in vLLM --
+  # so this per-read limit is effectively a time-to-complete-answer limit.
+  # `timeout` is set too: a non-streaming `auto` call otherwise fell back to
+  # request_timeout. 870 sits strictly between Open WebUI's 900 s total
+  # (AIOHTTP_CLIENT_TIMEOUT) and listeners[0].timeout: 840s in the router
+  # config, so the innermost layer gives up first: Envoy's route timeout
+  # fires at 840, never this one or Open WebUI's. (Envoy's 504 maps to a
+  # litellm Timeout, exception_mapping_utils.py:465, which num_retries: 1
+  # retries once on `auto` -- Open WebUI's 900 s total then cuts that retry
+  # ~60 s in, so the user sees the error at ~900 s either way.) Keep the
+  # order 900 > 870 > 840 when changing any of the three --
+  # unit-tests/litellm/test_timeouts.py fails otherwise.
+  #
+  # ONLY ONE ROUTER ALIAS EXISTS ON PURPOSE. vllm-sr 0.3.0 has no
+  # `entrypoints:` block and no per-algorithm model names -- UserConfig is
+  # extra="forbid" over {version, listeners, providers, routing, global,
+  # setup}. A caller who wants a specific chain calls it by name instead
+  # (with a key scoped to it).
+  - model_name: auto
+    litellm_params:
+      model: openai/vllm-sr/auto
+      api_base: http://vllm-sr-envoy:8899/v1
+      api_key: os.environ/SEMANTIC_ROUTER_LISTENER_KEY
+      max_tokens: 16384
+      stream_timeout: 870
+      timeout: 870
+    model_info:
+      # The largest prompt every path out of `auto` can still serve LOCALLY:
+      # 245760, muse-glimmer's window. All four chains contain muse-glimmer
+      # and the pre-call check skips qwen3.8-solo (114688) for anything
+      # longer, so each chain -- and local-private, which is where both
+      # `auto` fallbacks land -- reaches 245760 without Claude. A higher
+      # number would let a prompt through that only a Claude deployment
+      # could take (and local-private would refuse); a lower one (the old
+      # 114688) refuses prompts muse-glimmer could answer. Keep in step with
+      # routing.modelCards[].context_window_size in the router config.
+      max_input_tokens: 245760
+      max_output_tokens: 16384

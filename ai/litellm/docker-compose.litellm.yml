@@ -19,10 +19,26 @@ services:
       - "${PORT_LITELLM}:4000"
     environment:
       STORE_MODEL_IN_DB: "True"
+      # Overflow hook for the chain aliases (overflow.py, below). Defaults
+      # match the code; see ai/litellm/LITELLM.md > Chain aliases.
+      OVERFLOW_BUSY_AFTER_S: ${OVERFLOW_BUSY_AFTER_S:-2}
+      OVERFLOW_IDLE_AFTER_S: ${OVERFLOW_IDLE_AFTER_S:-5}
+      OVERFLOW_POLL_INTERVAL_S: ${OVERFLOW_POLL_INTERVAL_S:-1}
+      OVERFLOW_PROBE_TIMEOUT_S: ${OVERFLOW_PROBE_TIMEOUT_S:-0.75}
+      # The `auto` footer (a "---" rule + "*<model> - <chain>*" line naming
+      # the backend under each answer from the semantic router), also in
+      # overflow.py. true|false|1|0.
+      # See ai/litellm/LITELLM.md > The `auto` footer.
+      AUTO_FOOTER_ENABLED: ${AUTO_FOOTER_ENABLED:-true}
     env_file:
       - ../../.env
     volumes:
       - ./litellm_config.yaml:/app/config.yaml
+      # litellm_settings.callbacks: ["overflow.handler"] is resolved relative
+      # to the config file's directory, so this must sit next to
+      # /app/config.yaml. The v1.95.0 runtime image has no /app/overflow.py
+      # of its own to shadow.
+      - ./overflow.py:/app/overflow.py:ro
     command:
       - "--config=/app/config.yaml"
     healthcheck:

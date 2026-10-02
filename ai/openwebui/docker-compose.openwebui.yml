@@ -166,14 +166,17 @@ services:
       WEB_SEARCH_RESULT_COUNT: "${OPENWEBUI_WEB_SEARCH_RESULT_COUNT}"
       WEB_SEARCH_CONCURRENT_REQUESTS: "${OPENWEBUI_WEB_SEARCH_CONCURRENT_REQUESTS}"
 
-      # Hard ceiling on Open WebUI's outbound aiohttp client — applies to the
-      # search_web call to searxng AND the fetch_url tool's direct page
+      # Hard ceiling on Open WebUI's outbound aiohttp client — applies to
+      # EVERY chat completion sent to LiteLLM (total is a hard cap including
+      # streaming; utils/session_pool.py:43-51 at v0.11.4), plus the
+      # search_web call to searxng and the fetch_url tool's direct page
       # fetch. Read on every boot (not a first-boot-only PersistentConfig
-      # value like the web-search block above). Without this, a hung
-      # upstream (dead site, anti-bot interstitial, slow TLS handshake)
-      # leaves a tool call "pending" for the 300s upstream default with
-      # nothing ever surfaced to the model. See
-      # ai/searxng/SEARXNG.md § Troubleshooting: fetch_url / search hangs.
+      # value like the web-search block above). 900 / 900 is the outermost
+      # layer of the `auto` timeout budget (Open WebUI 900 > LiteLLM auto
+      # 870 > Envoy 840) — see .env.example and
+      # ai/semantic-router/SEMANTIC_ROUTER.md § Timeout budget, and
+      # ai/searxng/SEARXNG.md § Troubleshooting: fetch_url / search hangs
+      # for what the shared setting costs fetch_url.
       AIOHTTP_CLIENT_TIMEOUT: "${OPENWEBUI_AIOHTTP_CLIENT_TIMEOUT}"
       AIOHTTP_CLIENT_STREAM_IDLE_TIMEOUT: "${OPENWEBUI_AIOHTTP_CLIENT_STREAM_IDLE_TIMEOUT}"
 

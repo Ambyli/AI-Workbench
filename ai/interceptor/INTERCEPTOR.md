@@ -596,13 +596,15 @@ The `interceptor` MCP server (registered in `ai/litellm/litellm_config.yaml` `mc
 
 | Tool | Purpose | Args |
 |---|---|---|
-| `capture_url` | Run one capture — same core behavior as `POST /capture`; `screenshot=true` adds an image of the page; `page_script` / `actions` drive the page first (see [Page scripts and actions](#page-scripts-and-actions)) | `url`, `url_patterns`, `profile`, `capture_window_seconds`, `login_timeout`, `max_matches_per_pattern`, `screenshot`, `screenshot_full_page`, `screenshot_format`, `screenshot_scale`, `page_script`, `actions` (list of step objects), `stop_when_matched` |
-| `screenshot_url` | Navigate and return a screenshot — same core behavior as `POST /screenshot`. Image arrives as an `ImageContent` block (see [Screenshots § On MCP](#on-mcp)) | `url`, `profile`, `wait_seconds`, `full_page`, `format`, `quality`, `scale`, `login_timeout` |
+| `capture_url` | Run one capture — same core behavior as `POST /capture`; `screenshot=true` adds an image of the page; `page_script` / `actions` drive the page first (see [Page scripts and actions](#page-scripts-and-actions)) | `url`, `url_patterns`, `profile`, `capture_window_seconds`, `login_timeout`, `max_matches_per_pattern`, `screenshot`, `screenshot_full_page`, `screenshot_format`, `screenshot_scale`, `page_script`, `actions` (list of step objects), `stop_when_matched`, `login_url_patterns`, `actions_ready_timeout_seconds` |
+| `screenshot_url` | Navigate and return a screenshot — same core behavior as `POST /screenshot`. Image arrives as an `ImageContent` block (see [Screenshots § On MCP](#on-mcp)) | `url`, `profile`, `wait_seconds`, `full_page`, `format`, `quality`, `scale`, `login_timeout`, `login_url_patterns` |
 | `list_profiles` | Discover which named profiles exist — call before `capture_url` if the LLM doesn't know the profile name | *(none)* |
 | `list_jobs` | Snapshot of the port pool + running captures — same shape as `GET /jobs` | *(none)* |
 | `get_job` | Detail on one in-flight capture by id — same shape as `GET /jobs/{job_id}` | `job_id` |
 
 The `keep_open` and `debug_logging` knobs from `POST /capture` are deliberately **not** exposed to MCP — both are operator-only debug flags (`keep_open` requires manual Chrome-kill cleanup; `debug_logging` writes to a DevTools console the LLM can't read).
+
+`login_url_patterns` on both tools has the same semantics as on `POST /capture`: omit it (or pass `null`) to keep the defaults, pass a list to **replace** them, `[]` to disable detection. Pass the site's SSO host when the defaults don't match it — for Enphase, `["login", "signin", "/auth", "sso\\.enphaseenergy\\.com"]` — or an expired session comes back as an empty result rather than `login_wall: true`.
 
 MCP tools return dicts and never raise — errors surface inside the payload (e.g. `{"error": "no active job …"}` or a `capture_url` response with `status="error"` and an `error` field describing the HTTP-layer failure).
 

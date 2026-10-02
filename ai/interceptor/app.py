@@ -1000,6 +1000,13 @@ def _http_error_text(e: Exception) -> str:
     return f"{type(e).__name__}: {e}"
 
 
+def _login_patterns_kw(patterns: Optional[list[str]]) -> dict:
+    """``login_url_patterns`` for a request model: omitted when the tool caller
+    didn't pass any, so the model's defaults apply (an explicit ``[]`` still
+    disables detection)."""
+    return {} if patterns is None else {"login_url_patterns": patterns}
+
+
 @mcp.tool()
 def capture_url(
     url: str,
@@ -1015,6 +1022,8 @@ def capture_url(
     page_script: Optional[str] = None,
     actions: Optional[list[dict]] = None,
     stop_when_matched: bool = False,
+    login_url_patterns: Optional[list[str]] = None,
+    actions_ready_timeout_seconds: Optional[int] = None,
 ) -> ToolResult:
     """Load a URL under a named Chrome profile and return JSON XHR/fetch bodies
     whose URLs match any of the given regex patterns — optionally with a
@@ -1080,8 +1089,22 @@ def capture_url(
             match and the actions have finished, instead of waiting out
             ``capture_window_seconds``. A click finishes when the mouse is
             released, not when its request completes — if the page also makes
-            matching calls on its own, end ``actions`` with a ``wait_for`` on
-            the element that shows the result.
+            matching calls on its own, end ``actions`` with a step that waits
+            for the response you want — a ``wait_for`` on the element that
+            shows the result, or an ``evaluate`` that polls
+            ``window._capturedResponses`` for a new entry (INTERCEPTOR.md §
+            Worked example) — plus a short ``wait`` so it reaches the service.
+        login_url_patterns: Regexes ``re.search``-matched against the tab URL
+            after navigation to spot a redirect to a login page. Omit for the
+            defaults (``login``, ``signin``, ``/auth``); a list REPLACES them,
+            so include them yourself if you still want them. Add the site's
+            SSO host when it doesn't match those (Enphase:
+            ``sso\\.enphaseenergy\\.com``) — otherwise an expired session
+            looks like an empty result instead of ``login_wall: true``. An
+            empty list disables login detection.
+        actions_ready_timeout_seconds: How long the actions wait for the
+            page to be ready (loaded, off any login page) before giving up.
+            Defaults to ``capture_window_seconds``.
 
     Returns:
         JSON with keys ``job_id``, ``url``, ``status``, ``login_wall``,
@@ -1112,6 +1135,8 @@ def capture_url(
             page_script=page_script,
             actions=actions or [],
             stop_when_matched=stop_when_matched,
+            actions_ready_timeout_seconds=actions_ready_timeout_seconds,
+            **_login_patterns_kw(login_url_patterns),
         )
         return _screenshot_tool_result(_run_capture(req).model_dump())
     except (HTTPException, ValidationError) as e:
@@ -1142,6 +1167,7 @@ def screenshot_url(
     quality: int = 80,
     scale: float = 1.0,
     login_timeout: int = 300,
+    login_url_patterns: Optional[list[str]] = None,
 ) -> ToolResult:
     """Navigate to a URL under a named Chrome profile and return a screenshot
     of the rendered page. Use this to *see* a page — layout, charts, error
@@ -1164,6 +1190,14 @@ def screenshot_url(
         scale: Output scale, 0 < scale <= 2. 0.5 halves each axis.
         login_timeout: Max seconds to wait for a login redirect to resolve
             before returning ``login_wall: true``.
+        login_url_patterns: Regexes ``re.search``-matched against the tab URL
+            after navigation to spot a redirect to a login page. Omit for the
+            defaults (``login``, ``signin``, ``/auth``); a list REPLACES them,
+            so include them yourself if you still want them. Add the site's
+            SSO host when it doesn't match those (Enphase:
+            ``sso\\.enphaseenergy\\.com``) — otherwise an expired session
+            looks like an empty result instead of ``login_wall: true``. An
+            empty list disables login detection.
 
     Returns:
         JSON with ``job_id``, ``url``, ``status``, ``login_wall``, ``error``,
@@ -1184,6 +1218,7 @@ def screenshot_url(
             quality=quality,
             scale=scale,
             login_timeout=login_timeout,
+            **_login_patterns_kw(login_url_patterns),
         )
         return _screenshot_tool_result(_run_screenshot(req).model_dump())
     except (HTTPException, ValidationError) as e:

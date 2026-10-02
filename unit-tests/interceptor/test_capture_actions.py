@@ -95,6 +95,30 @@ def test_mcp_capture_url_returns_bad_actions_in_the_payload(app_mod):
     assert app_mod._port_pool.qsize() == app_mod.MAX_CONCURRENT
 
 
+def test_mcp_tools_pass_login_url_patterns_through(app_mod, monkeypatch):
+    seen: list = []
+
+    def _stop(req):
+        seen.append(req)
+        raise app_mod.HTTPException(status_code=429, detail="stop here")
+
+    monkeypatch.setattr(app_mod, "_run_capture", _stop)
+    sso = ["login", r"sso\.enphaseenergy\.com"]
+
+    app_mod.capture_url(url="https://e.com", url_patterns=["x"], profile="p",
+                        login_url_patterns=sso, actions_ready_timeout_seconds=45)
+    app_mod.capture_url(url="https://e.com", url_patterns=["x"], profile="p")
+    assert seen[0].login_url_patterns == sso
+    assert seen[0].actions_ready_timeout_seconds == 45
+    # Omitted → the model's defaults, not an empty list (which disables detection).
+    assert seen[1].login_url_patterns == ["login", "signin", "/auth"]
+
+    # screenshot_url goes through _run_screenshot, which builds its own
+    # CaptureRequest — the patterns must survive that hop too.
+    app_mod.screenshot_url(url="https://e.com", profile="p", login_url_patterns=sso)
+    assert seen[2].login_url_patterns == sso
+
+
 # ── The capture loop, against a fake InterceptorClient ──────────────────────
 
 class _FakeClient:

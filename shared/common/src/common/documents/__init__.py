@@ -31,6 +31,8 @@ both. That is this package.
                                 ``match_text_layers`` searches one.
 
     pdf_page_count(raw)       → a PDF's page count without rendering it.
+    pdf_page_size(raw, i)     → the pixel size page i WILL render to at a DPI,
+                                without rendering it.
                                 ``RapidOCREngine`` is the bundled engine;
                                 ``OCREngine`` is the Protocol to implement for
                                 anything else (tests use a fake).
@@ -81,6 +83,7 @@ from .loaders import (
     default_image_decoder,
     load_document,
     pdf_page_count,
+    pdf_page_size,
     pdf_text_regions,
 )
 from .model import (
@@ -128,6 +131,7 @@ __all__ = [
     "default_image_decoder",
     "load_document",
     "pdf_page_count",
+    "pdf_page_size",
     "pdf_text_regions",
     # model
     "Document",

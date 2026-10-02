@@ -144,7 +144,9 @@ general_settings:
     - path: "/v1/classifier"
       target: "http://classifier:8000"
       include_subpath: true
-      methods: ["GET", "POST", "DELETE"]
+      # PATCH: PATCH /references/{id} edits a saved reference's title /
+      # description / tags (ai/classifier/API.md § References).
+      methods: ["GET", "POST", "PATCH", "DELETE"]
       forward_headers: true
     - path: "/v1/detector"
       target: "http://detector:8000"

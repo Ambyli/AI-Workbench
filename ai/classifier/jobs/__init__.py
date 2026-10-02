@@ -5,8 +5,9 @@ POST /assess returns 202 immediately, so the work happens here:
     payloads.py  the JSON-safe dict the endpoint stores at enqueue time
                  (document bytes base64'd, the validated criteria dumped) so a
                  queued job survives a restart.
-    runners.py   the actual work: run_assess. It knows nothing about the
-                 registry, the worker pool, or Prometheus.
+    runners.py   the actual work: run_assess, and run_reference (the job
+                 POST /references queues). It knows nothing about the job
+                 registry or the worker pool.
     queue.py     ClassifierQueue — the payload store, the worker pool, and the
                  process-wide registry / queue / sweeper singletons the app
                  and every endpoint share.

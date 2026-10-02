@@ -207,3 +207,21 @@ def test_pdf_calls_hold_the_pymupdf_lock(monkeypatch) -> None:
     load_document(raw, filename="x.pdf")
     loaders.pdf_page_count(raw)
     assert held == [True, True]
+
+
+def test_pdf_page_size_matches_the_render_without_rendering() -> None:
+    """The size a page WILL render to, read from its rectangle — exactly what
+    load_document's raster gives, at the default and at another DPI."""
+    import pytest as _pytest
+
+    from common.documents import pdf_page_size
+
+    raw = make_pdf(["alpha page", "beta page"])
+    for dpi in (150, 97):
+        doc = load_document(raw, filename="s.pdf", render_dpi=dpi)
+        for page in doc.pages:
+            assert pdf_page_size(raw, page.index, render_dpi=dpi) == (page.width, page.height)
+    with _pytest.raises(IndexError):
+        pdf_page_size(raw, 2)
+    with _pytest.raises(UnsupportedDocumentError):
+        pdf_page_size(b"%PDF-1.4 not really", 0)

@@ -589,6 +589,101 @@ LLM_BBOX_PRESENCE_MIN: int = 7
 # with common.vision.geometry.DEFAULT_GRID, which does the conversion.
 LLM_BBOX_GRID: float = 1000.0
 
+# ── References (references/, api/references.py, analysis/references.py) ────
+# A REFERENCE is a stored, reviewed example: one page, the criteria asked of
+# it, the answer each one should get (score / verdict / reason) and where on
+# the page the feature is. It is shown to the vision model beside a
+# candidate as a worked example (a FAIL reference as a counter-example), so
+# the model knows what a criterion means HERE. References are for the llm
+# only; see API.md § References.
+#
+# REFERENCE_DIR is one directory per reference (page.jpg, working.jpg, the
+# per-criterion composites c.<slug>.jpg, regions.json, record.json). It is
+# deliberately NOT under ARTIFACT_DIR: the artifact sweeper deletes every
+# directory whose job row is gone, and a reference must outlive the job that
+# created it. Nothing sweeps this root — a reference is kept until DELETE.
+#
+# REFERENCE_MAX_COUNT caps how many references may exist at once (pending,
+# ready and failed alike); POST /references past it is a 409. With no TTL the
+# count cap is the only thing bounding the disk this root can take.
+#
+# VISION_LLM_MAX_IMAGES_PER_PROMPT is what the vision model admits per
+# request (muse-glimmer's --limit-mm-per-prompt). 3 lets one call carry a
+# PASS example, a FAIL example and the candidate; 2 sends each example in its
+# own call; 1 means the model takes one image, and an /assess that asks for
+# references is refused at submit.
+#
+# REFERENCE_MAX_PER_REQUEST bounds the explicit ids one /assess may list;
+# REFERENCE_MAX_PER_CRITERION bounds how many examples (and so how many
+# scoring calls) one criterion may use.
+#
+# REFERENCE_AUTO_POOL_MAX bounds the candidates `references: "auto"` ranks
+# (newest first; `pool_truncated` says when it cut). The selection call puts
+# a text catalogue of the pool beside the candidate page and asks which
+# apply; REFERENCE_AUTO_MIN_CONFIDENCE (0-100) is the line a match must clear
+# to be used, and REFERENCE_SELECT_MAX_TOKENS its completion budget.
+#
+# REFERENCE_POSITION_* drive the opt-in position check (`options.reference.
+# position: "check"` on an llm criterion with boxes): the candidate's located
+# box and the example's, each as a fraction of its own page, HIT when their
+# IoU reaches POSITION_MIN_IOU (a criterion's `min_iou` overrides it) or
+# their centres are within POSITION_MAX_OFFSET (0-1, centre distance / √2).
+# A MISS caps the score at POSITION_CAP; the cap never raises a score.
+#
+# REFERENCE_DESCRIBE: when a reference is created without a `description`,
+# one single-image call describes the page (for the `auto` catalogue), cut
+# to REFERENCE_DESCRIPTION_MAX_CHARS — which is also the longest description
+# a caller may send.
+REFERENCE_DIR: str = os.environ.get(
+    "CLASSIFIER_REFERENCE_DIR", os.path.join(os.path.dirname(DB_PATH) or ".", "references")
+)
+REFERENCE_MAX_COUNT: int = max(
+    1, int(os.environ.get("CLASSIFIER_REFERENCE_MAX_COUNT", "500"))
+)
+VISION_LLM_MAX_IMAGES_PER_PROMPT: int = max(
+    1, int(os.environ.get("VISION_LLM_MAX_IMAGES_PER_PROMPT", "3"))
+)
+REFERENCE_MAX_PER_REQUEST: int = max(
+    1, int(os.environ.get("CLASSIFIER_REFERENCE_MAX_PER_REQUEST", "10"))
+)
+REFERENCE_MAX_PER_CRITERION: int = max(
+    1, int(os.environ.get("CLASSIFIER_REFERENCE_MAX_PER_CRITERION", "3"))
+)
+REFERENCE_AUTO_POOL_MAX: int = max(
+    1, int(os.environ.get("CLASSIFIER_REFERENCE_AUTO_POOL_MAX", "20"))
+)
+REFERENCE_AUTO_MIN_CONFIDENCE: int = max(
+    0, min(100, int(os.environ.get("CLASSIFIER_REFERENCE_AUTO_MIN_CONFIDENCE", "60")))
+)
+REFERENCE_SELECT_MAX_TOKENS: int = max(
+    64, int(os.environ.get("CLASSIFIER_REFERENCE_SELECT_MAX_TOKENS", "2048"))
+)
+REFERENCE_POSITION_MIN_IOU: float = max(
+    0.0, min(1.0, float(os.environ.get("CLASSIFIER_REFERENCE_POSITION_MIN_IOU", "0.3")))
+)
+REFERENCE_POSITION_MAX_OFFSET: float = max(
+    0.0, min(1.0, float(os.environ.get("CLASSIFIER_REFERENCE_POSITION_MAX_OFFSET", "0.15")))
+)
+REFERENCE_POSITION_CAP: int = max(
+    1, min(10, int(os.environ.get("CLASSIFIER_REFERENCE_POSITION_CAP", "5")))
+)
+REFERENCE_DESCRIBE: bool = _env_flag("CLASSIFIER_REFERENCE_DESCRIBE", "true")
+REFERENCE_DESCRIPTION_MAX_CHARS: int = max(
+    1, int(os.environ.get("CLASSIFIER_REFERENCE_DESCRIPTION_MAX_CHARS", "500"))
+)
+
+# Code constants for references (not env knobs). The describe call's
+# completion budget: the answer is ~one paragraph of JSON, the rest is the
+# model's reasoning. Title / tag bounds keep a catalogue line short.
+# REFERENCE_JPEG_QUALITY is for page.jpg / working.jpg / the composites: a
+# composite is what the model will SEE as the example, so it is kept higher
+# than a preview.
+REFERENCE_DESCRIBE_MAX_TOKENS: int = 1024
+REFERENCE_TITLE_MAX_CHARS: int = 120
+REFERENCE_MAX_TAGS: int = 20
+REFERENCE_TAG_MAX_CHARS: int = 40
+REFERENCE_JPEG_QUALITY: int = 90
+
 # ── Text-hit regions (analysis/text_eval.py) ───────────────────────────────
 # Cap on regions derived from one text criterion's matches, per page. A regex
 # like `\d` on a dense scan would otherwise localise every digit.

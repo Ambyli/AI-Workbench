@@ -13,9 +13,12 @@
     boxes.py     not believing it at all: ask -> validate -> verify by crop ->
                  retry, the bounding-box enforcement loop.
 
-ONE IMAGE PER PROMPT. The model is served by vLLM WITHOUT
-``--limit-mm-per-prompt``, so a request may carry at most one image; a second
-one fails the whole call. Every prompt builder here takes a single image.
+IMAGES PER PROMPT. Every prompt builder here takes ONE image — the page, a
+crop, or (selection) the candidate — except the scoring prompt when the
+request's references guide it, which puts up to
+VISION_LLM_MAX_IMAGES_PER_PROMPT - 1 example images before the candidate. The
+model is served with ``--limit-mm-per-prompt '{"image": 3}'`` for that, and
+the knob must match it (see ``llm.prompts``).
 
 Nothing is re-exported. A caller imports the submodule it means —
 ``from llm import client as llm_client`` — so that a test replacing

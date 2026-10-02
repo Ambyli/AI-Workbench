@@ -94,6 +94,11 @@ def test_stroke_policy_matches_the_documented_table():
     assert stroke_for("ocr")["dash"] is not None
     assert stroke_for("llm")["dash"] is not None
     assert stroke_for("diff")["double"] is True
+    # A person's region: solid like cv, but heavier than every producer.
+    assert stroke_for("manual")["dash"] is None
+    assert stroke_for("manual")["width"] > max(
+        stroke_for(s)["width"] for s in ("cv", "detector", "pdf-text", "ocr", "llm", "diff")
+    )
     # An unknown source renders as plain solid rather than raising.
     assert stroke_for("something-new")["dash"] is None
 

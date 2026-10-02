@@ -7,7 +7,7 @@ the full duration of the model calls.
 Division of labour:
   common.jobs.worker.WorkerPool      — N claim-and-handle loops, wake/poll, recovery
   common.jobs.payloads.FilePayloadStore — job inputs on disk so the queue survives restarts
-  jobs.runners                       — the actual work (run_assess)
+  jobs.runners                       — the actual work (run_assess, run_reference)
   metrics.py                         — Prometheus objects shared with the endpoints
   this module                        — ClassifierQueue: enqueue, handle_job, lifecycle
 
@@ -17,10 +17,14 @@ Flow:
      "pending", and wakes a worker.
   2. One of CLASSIFIER_MAX_CONCURRENT pool workers atomically claims the row
      (→ "processing") and calls ``handle_job``, which reads the payload,
-     runs ``run_assess``, and deletes the payload once it finishes (a job
-     cancelled by shutdown keeps its payload so the requeued row can be
-     re-run). A row of a removed job type ("compare", "locate" — queued by an
-     older container) fails with a message naming it.
+     dispatches on the row's ``metadata.type`` (``JOB_TYPES``: "assess" →
+     ``run_assess``, "reference" → ``run_reference``), and deletes the
+     payload once it finishes (a job cancelled by shutdown keeps its payload
+     so the requeued row can be re-run). A row of a removed job type
+     ("compare", "locate" — queued by an older container) fails with a
+     message naming it. A "reference" job that fails for ANY reason —
+     including a payload that never landed — marks its reference
+     ``failed``; a cancelled one leaves it ``pending`` for the requeue.
   3. The pool persists the result / error (→ "completed" | "failed") and
      calls ``_on_finish`` for metrics.
   4. Callers poll GET /jobs/{job_id}.
@@ -44,14 +48,17 @@ from common.jobs.sqlite import SqliteRegistry
 from common.jobs.worker import WorkerPool
 
 from config import DB_PATH, MAX_CONCURRENT, PAYLOAD_DIR, WORKER_POLL_INTERVAL_S
-from jobs.runners import run_assess
+from jobs.runners import run_assess, run_reference
 from logger import logger
 from metrics import job_duration, job_queue_depth, jobs_in_flight, jobs_total
 from middleware import request_id_var
+from references.store import reference_registry, refresh_gauges
 from regions.sweeper import ArtifactSweeper
 
-# The one job type. Rows of the removed types fail by name (handle_job).
+# The default job type (a row with no metadata.type is an assess), and every
+# type this container runs. Rows of the removed types fail by name.
 JOB_TYPE = "assess"
+JOB_TYPES = frozenset({"assess", "reference"})
 
 
 class ClassifierQueue:
@@ -123,6 +130,7 @@ class ClassifierQueue:
         request_id_var.set(job.metadata.get("request_id", "-"))
         jobs_in_flight.inc()
         keep_payload = False
+        job_type = job.metadata.get("type", JOB_TYPE)
         try:
             payload = await self.payloads.read(job.job_id)
             if payload is None:
@@ -130,13 +138,14 @@ class ClassifierQueue:
                     "payload missing — the job's input file was removed or never "
                     "written (usually a restart between enqueue and payload write)"
                 )
-            job_type = job.metadata.get("type", JOB_TYPE)
-            if job_type != JOB_TYPE:
+            if job_type not in JOB_TYPES:
                 raise RuntimeError(
                     f"job type {job_type!r} no longer exists — /locate and "
                     "/assess/compare were removed; resubmit to POST /assess"
                 )
-            # Looked up on the module at call time so a test can replace it.
+            # Looked up on the module at call time so a test can replace them.
+            if job_type == "reference":
+                return await run_reference(payload)
             return await run_assess(payload)
         except asyncio.CancelledError:
             # A shutdown mid-job: `docker compose stop` / `make up classifier`
@@ -147,6 +156,10 @@ class ClassifierQueue:
             # payload here is what used to turn every graceful restart into a
             # "payload missing" failure for the jobs that were in flight.
             keep_payload = True
+            raise
+        except Exception as exc:
+            if job_type == "reference":
+                await _fail_reference(job, exc)
             raise
         finally:
             jobs_in_flight.dec()
@@ -162,6 +175,20 @@ class ClassifierQueue:
         jobs_total.labels(type=job_type, status=phase).inc()
         job_duration.labels(type=job_type).observe(elapsed)
         # Depth gauge is refreshed by the next enqueue/claim; keep the hook sync + cheap.
+
+
+async def _fail_reference(job: JobBase, exc: BaseException) -> None:
+    """Mark a failed creation job's reference ``failed``. Never raises — the
+    job is failing already, and the startup reconcile is the backstop."""
+    reference_id = job.metadata.get("reference_id")
+    if not reference_id:
+        return
+    try:
+        if await reference_registry.fail(reference_id, f"creation job {job.job_id} failed: {exc}"):
+            logger.warning("queue: reference %s failed with its job %s", reference_id, job.job_id)
+        await refresh_gauges()
+    except Exception as db_exc:  # pragma: no cover — DB unavailable
+        logger.error("queue: could not mark reference %s failed: %s", reference_id, db_exc)
 
 
 # ---------------------------------------------------------------------------

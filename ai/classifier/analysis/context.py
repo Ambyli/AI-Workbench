@@ -26,6 +26,9 @@ once per item, and never written to by an evaluator:
                        original page (None when there is no image)
         image_b64()    the working image as the base64 JPEG the prompts attach,
                        encoded on first use and cached
+        references     the job's ``analysis.references.JobReferences`` (one
+                       object shared by every item), or None when the request
+                       listed no references
     DocumentGroup    one document and its items, in page order — what a
                      ``text`` criterion with ``options.scope: "document"``
                      searches, and what the ``pages`` level of an aggregate
@@ -173,6 +176,9 @@ class DocumentContext:
         default_factory=detector_client.DetectorStats
     )
     ocr_passes: list[dict] = field(default_factory=list)
+    # analysis.references.JobReferences — typed Any so this module does not
+    # import the llm layer through it.
+    references: Any = None
     _image_b64: Optional[str] = None
     _ask_image: Optional["asyncio.Future[str]"] = None
     _layers: dict[str, "asyncio.Future[TextLayer]"] = field(default_factory=dict)

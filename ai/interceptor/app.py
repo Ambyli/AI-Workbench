@@ -28,7 +28,8 @@ Endpoints:
     POST   /profiles/{name}/refresh       upload a .tgz of a captured Chrome profile
     DELETE /profiles/{name}               wipe one profile
     POST   /capture                       run one capture (see CaptureRequest); optional
-                                          ``screenshot`` block returns an image of the page too
+                                          ``screenshot`` block returns an image of the page too,
+                                          optional ``page_script`` / ``actions`` drive the page
     POST   /screenshot                    navigate + screenshot only, no XHR patterns needed
     GET    /jobs                          snapshot of the port pool + running captures
     GET    /jobs/{job_id}                 detail on one in-flight capture (404 if not found)
@@ -42,6 +43,12 @@ Screenshots ride on a SECOND CDP connection to the same tab (see
 and before Chrome quits, so the page has had the whole window to render. MCP
 tools return the image as an ``ImageContent`` block next to the JSON payload;
 the HTTP endpoints return it base64-encoded inside the JSON.
+
+``page_script`` / ``actions`` ride a second CDP connection too (see
+``common.cdp_interceptor.actions``): a helper thread started right after
+launch waits for the page to be ready, then fills / clicks / evaluates, so the
+requests the page fires in response are captured through the normal path.
+``stop_when_matched`` ends the window as soon as every pattern has a match.
 
 Registered with LiteLLM in ai/litellm/litellm_config.yaml both as an `mcp_servers`
 entry (model-invokable tool) and as a `pass_through_endpoints` entry
@@ -64,20 +71,23 @@ import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import Annotated, Any, Literal, Optional, Union
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastmcp import FastMCP
 from fastmcp.tools import ToolResult
 from fastmcp.utilities.types import Image as McpImage
 from mcp.types import TextContent
-from pydantic import BaseModel, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from common.cdp_interceptor import (
+    ActionError,
+    ActionsReport,
     BrowserNotFoundError,
     Capture,
     InterceptorClient,
     ScreenshotError,
+    parse_actions,
 )
 from common.jobs import InMemoryRegistry
 from common.jobs.router import build_router
@@ -154,6 +164,9 @@ class InterceptorMetadata(BaseModel):
     port: int
     used_base_profile: bool
     temp_dir: Optional[str] = None
+    # Set only when the request carries page_script / actions.
+    actions_done: Optional[int] = None
+    actions_total: Optional[int] = None
 
 
 _registry: InMemoryRegistry = InMemoryRegistry(max_concurrent=MAX_CONCURRENT)
@@ -237,6 +250,138 @@ class ScreenshotResult(BaseModel):
     data_base64: Optional[str] = None
 
 
+# ── Browser actions ─────────────────────────────────────────────────────────
+# One model per step type, discriminated on ``type``, so OpenAPI documents each
+# shape and a malformed step is a field-level 422. The models mirror
+# ``common.cdp_interceptor.actions._FIELDS``; ``parse_actions`` re-validates
+# the dumped dicts (press keys, ranges) and is the authority if they drift.
+_SELECTOR_DESC = (
+    "CSS selector, matched in the document AND inside every open shadow root "
+    "(Salesforce LWC / custom elements), each tree on its own — so `input` "
+    "finds an input inside a component, but a descendant combinator never "
+    "crosses a shadow boundary (`lightning-input input` matches nothing; use "
+    "the host `lightning-input` — fill/select descend into it — or "
+    "`input[name=...]`). The first VISIBLE match wins."
+)
+_TEXT_DESC = (
+    "Optional filter on the matches: substring of the element's trimmed text "
+    "(including text rendered in its shadow tree), value, aria-label, "
+    "placeholder or title. Written `/…/flags` it is a JS regex."
+)
+_TIMEOUT_DESC = "Seconds to keep polling for the element before the step fails."
+
+
+class _ActionModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class WaitForAction(_ActionModel):
+    """Poll until an element exists (`attached`) or is visible (`visible`)."""
+    type: Literal["wait_for"]
+    selector: str = Field(..., min_length=1, description=_SELECTOR_DESC)
+    text: Optional[str] = Field(default=None, description=_TEXT_DESC)
+    state: Literal["visible", "attached"] = "visible"
+    timeout_s: float = Field(default=15.0, gt=0, le=600, description=_TIMEOUT_DESC)
+
+
+class FillAction(_ActionModel):
+    """Focus the input (descending into a custom element's shadow root to the
+    real <input>/<textarea>), optionally clear it, type `value` with trusted
+    input events, then fire `change` and blur."""
+    type: Literal["fill"]
+    selector: str = Field(..., min_length=1, description=_SELECTOR_DESC)
+    text: Optional[str] = Field(default=None, description=_TEXT_DESC)
+    value: str = Field(..., description="Text to type.")
+    clear: bool = Field(default=True, description="Empty the field before typing.")
+    timeout_s: float = Field(default=15.0, gt=0, le=600, description=_TIMEOUT_DESC)
+
+
+class ClickAction(_ActionModel):
+    """Scroll the element into view and click its centre. `mouse` (default)
+    sends real pressed/released mouse events; `js` calls `el.click()`."""
+    type: Literal["click"]
+    selector: str = Field(..., min_length=1, description=_SELECTOR_DESC)
+    text: Optional[str] = Field(default=None, description=_TEXT_DESC)
+    method: Literal["mouse", "js"] = "mouse"
+    timeout_s: float = Field(default=15.0, gt=0, le=600, description=_TIMEOUT_DESC)
+
+
+class PressAction(_ActionModel):
+    """Send one key (keyDown + keyUp) to the focused element — or, with
+    `selector`, to that element after focusing it. `fill` blurs the field when
+    it finishes, so pass `selector` to press Enter in a field you just filled."""
+    type: Literal["press"]
+    key: str = Field(
+        ...,
+        description="Enter, Tab, Escape, Backspace, Delete, Space, ArrowUp/Down/"
+        "Left/Right, Home, End, PageUp, PageDown, or a single character.",
+    )
+    selector: Optional[str] = Field(default=None, min_length=1, description=_SELECTOR_DESC)
+    text: Optional[str] = Field(default=None, description=_TEXT_DESC)
+    timeout_s: float = Field(default=15.0, gt=0, le=600, description=_TIMEOUT_DESC)
+
+
+class SelectAction(_ActionModel):
+    """Choose an option of a native <select> by value (or, failing that, by
+    visible text) and fire input + change. Not for lightning-combobox — click
+    it open and click the option instead."""
+    type: Literal["select"]
+    selector: str = Field(..., min_length=1, description=_SELECTOR_DESC)
+    text: Optional[str] = Field(default=None, description=_TEXT_DESC)
+    value: str
+    timeout_s: float = Field(default=15.0, gt=0, le=600, description=_TIMEOUT_DESC)
+
+
+class WaitAction(_ActionModel):
+    """Sleep (cancellable)."""
+    type: Literal["wait"]
+    seconds: float = Field(..., ge=0, le=600)
+
+
+class EvaluateAction(_ActionModel):
+    """Run JS in the page and return its (JSON-serialisable) value. The script
+    is evaluated as an EXPRESSION — wrap multi-statement code in an async IIFE:
+    `(async () => { …; return x; })()`. Promises are awaited."""
+    type: Literal["evaluate"]
+    script: str = Field(..., min_length=1)
+    timeout_s: float = Field(default=15.0, gt=0, le=600)
+
+
+ActionModel = Annotated[
+    Union[WaitForAction, FillAction, ClickAction, PressAction, SelectAction,
+          WaitAction, EvaluateAction],
+    Field(discriminator="type"),
+]
+
+
+class ActionResultModel(BaseModel):
+    index: int = Field(description="Position in `actions`; -1 for `page_script`.")
+    type: str
+    ok: bool
+    elapsed_ms: int
+    error: Optional[str] = Field(
+        default=None,
+        description="Why the step failed; 'skipped' when an earlier step "
+        "failed (or the page never became ready) so it never ran.",
+    )
+    value: Any = Field(
+        default=None,
+        description="evaluate / page_script: the script's return value. DOM "
+        "steps: details of the element acted on.",
+    )
+
+
+class ActionsReportModel(BaseModel):
+    page_script: Optional[ActionResultModel] = None
+    actions: list[ActionResultModel] = Field(default_factory=list)
+    aborted_reason: Optional[str] = Field(
+        default=None,
+        description="null when every step ran and succeeded. Otherwise e.g. "
+        "'not ready: login page …', 'cancelled', 'actions[2] (click) failed: …', "
+        "'capture window ended before actions finished'.",
+    )
+
+
 class CaptureRequest(BaseModel):
     url: str = Field(..., description="URL to navigate to")
     url_patterns: list[str] = Field(
@@ -253,15 +398,6 @@ class CaptureRequest(BaseModel):
         "`screenshot` on the response. A failed screenshot never fails the "
         "capture — it lands in `screenshot_error` instead.",
     )
-
-    @model_validator(mode="after")
-    def _patterns_or_screenshot(self) -> "CaptureRequest":
-        if not self.url_patterns and self.screenshot is None:
-            raise ValueError(
-                "url_patterns must contain at least one pattern unless "
-                "`screenshot` is requested"
-            )
-        return self
     profile: str = Field(
         ...,
         description="Named Chrome profile under INTERCEPTOR_PROFILES_ROOT. "
@@ -293,6 +429,45 @@ class CaptureRequest(BaseModel):
         r"'^https?://roofix\.io/?$' matches the logged-out root but not "
         "'roofix.io/project/...'. An empty list disables login detection.",
     )
+    page_script: Optional[str] = Field(
+        default=None,
+        description="JS evaluated in the page once it is ready (before any "
+        "`actions`). An EXPRESSION — use an async IIFE for multi-statement "
+        "code; promises are awaited and the JSON-serialisable result comes "
+        "back as `actions_report.page_script.value`.",
+    )
+    actions: list[ActionModel] = Field(
+        default_factory=list,
+        description="Ordered browser steps (wait_for / fill / click / press / "
+        "select / wait / evaluate) run once the page is ready, so the page's "
+        "own code fires the requests `url_patterns` is waiting for. Stops at "
+        "the first failed step. See INTERCEPTOR.md § Page scripts and actions.",
+    )
+    actions_ready_timeout_seconds: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=600,
+        description="How long the readiness gate (tab off about:blank, not on "
+        "a login URL, document complete, capture hook installed) may wait "
+        "before the steps are abandoned. Defaults to capture_window_seconds.",
+    )
+    stop_when_matched: bool = Field(
+        default=False,
+        description="End the capture window as soon as every `url_patterns` "
+        "bucket has at least one match (and the actions, if any, have "
+        "finished) instead of waiting it out. Requires url_patterns.",
+    )
+
+    @model_validator(mode="after")
+    def _patterns_or_screenshot(self) -> "CaptureRequest":
+        if not self.url_patterns and self.screenshot is None:
+            raise ValueError(
+                "url_patterns must contain at least one pattern unless "
+                "`screenshot` is requested"
+            )
+        if self.stop_when_matched and not self.url_patterns:
+            raise ValueError("stop_when_matched needs at least one url_pattern to match")
+        return self
 
 
 class CaptureMatch(BaseModel):
@@ -310,6 +485,15 @@ class CaptureResponse(BaseModel):
     captured_urls: list[str]
     screenshot: Optional[ScreenshotResult] = None
     screenshot_error: Optional[str] = None
+    actions_report: Optional[ActionsReportModel] = Field(
+        default=None,
+        description="What page_script / actions did — null unless requested.",
+    )
+    ended_early: bool = Field(
+        default=False,
+        description="True only when stop_when_matched ended the window before "
+        "capture_window_seconds elapsed.",
+    )
 
 
 class ScreenshotRequest(ScreenshotOptions):
@@ -421,6 +605,15 @@ def _run_capture(req: CaptureRequest) -> CaptureResponse:
     except re.error as e:
         raise HTTPException(status_code=400, detail=f"invalid login_url_pattern: {e}")
 
+    # Browser steps: pydantic has already checked each step's shape; the
+    # library re-validates what it alone knows (press key names, ranges).
+    # Still before the port, so a bad step never costs a slot.
+    try:
+        lib_actions = parse_actions([a.model_dump() for a in req.actions])
+    except ActionError as e:
+        raise HTTPException(status_code=400, detail=f"invalid action: {e}")
+    want_actions = bool(lib_actions) or req.page_script is not None
+
     # Reserve a port BEFORE touching anything else. If capacity is out, we're
     # done — 429 the caller.
     port = _acquire_port()
@@ -528,9 +721,89 @@ def _run_capture(req: CaptureRequest) -> CaptureResponse:
         except BrowserNotFoundError as e:
             raise HTTPException(status_code=500, detail=str(e))
 
-        # Wait for the capture window, but wake early if cancelled.
-        # wait_or_cancel returns True on cancel, False on timeout.
-        cancelled = job.wait_or_cancel(timeout=req.capture_window_seconds)
+        # ── Actions (optional) ─────────────────────────────────────────────
+        # Run on a helper thread so this thread keeps owning the window
+        # timing. They ride their own CDP socket and their readiness gate
+        # waits for the worker to navigate + install interceptor.js, so it is
+        # safe to start them the moment Chrome is launched. ``window_over``
+        # doubles as their cancel signal once the window closes.
+        window_over = threading.Event()
+        actions_box: dict[str, ActionsReport] = {}
+        actions_thread: Optional[threading.Thread] = None
+        if want_actions:
+            job.update_metadata(actions_done=0, actions_total=len(lib_actions))
+
+            def _actions_worker() -> None:
+                job.set_phase("actions")
+                try:
+                    actions_box["report"] = client.run_actions(
+                        lib_actions,
+                        page_script=req.page_script,
+                        ready_timeout_s=float(
+                            req.actions_ready_timeout_seconds or req.capture_window_seconds
+                        ),
+                        login_url_patterns=req.login_url_patterns,
+                        cancel=lambda: job.is_cancelled() or window_over.is_set(),
+                        on_progress=lambda done, total: job.update_metadata(
+                            actions_done=done, actions_total=total
+                        ),
+                    )
+                finally:
+                    if not (job.is_cancelled() or window_over.is_set()):
+                        job.set_phase("capturing")
+
+            actions_thread = threading.Thread(
+                target=_actions_worker, name=f"actions-{job.job_id}", daemon=True
+            )
+            actions_thread.start()
+
+        # ── Capture window ─────────────────────────────────────────────────
+        # Short-poll instead of one long wait so the window can end on cancel,
+        # on the deadline, or — with stop_when_matched — as soon as the
+        # actions are done and every pattern bucket has a match.
+        deadline = time.monotonic() + req.capture_window_seconds
+        cancelled = False
+        ended_early = False
+        while True:
+            if job.is_cancelled():
+                cancelled = True
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if req.stop_when_matched and (
+                actions_thread is None or not actions_thread.is_alive()
+            ):
+                with results_lock:
+                    all_matched = all(matches[p] for p, _ in compiled)
+                if all_matched:
+                    ended_early = True
+                    job.log("stop_when_matched — every pattern matched, ending the window early")
+                    break
+            job.wait_or_cancel(timeout=min(0.25, remaining))
+        window_over.set()
+
+        actions_report: Optional[ActionsReportModel] = None
+        if actions_thread is not None:
+            # A step mid-RPC can take up to its own CDP timeout to notice the
+            # cancel; don't let a wedged one hold the slot past that.
+            actions_thread.join(timeout=12)
+            report = actions_box.get("report")
+            if report is None:
+                report = ActionsReport.not_run(
+                    lib_actions, req.page_script,
+                    "actions still running when the capture window ended (abandoned)",
+                )
+            elif report.aborted_reason == "cancelled" and not job.is_cancelled():
+                report.aborted_reason = "capture window ended before actions finished"
+            actions_report = ActionsReportModel.model_validate(report.to_dict())
+            failed = next((r for r in report.actions if not r.ok), None)
+            job.log(
+                f"actions  ran={sum(1 for r in report.actions if r.error != 'skipped')}"
+                f"/{len(report.actions)}  aborted={report.aborted_reason or '-'}"
+                + (f"  first_failure=[{failed.index}] {failed.type}" if failed else "")
+            )
+
         state = client.get_state()
 
         # Screenshot BEFORE quitting Chrome. Runs on its own CDP socket so the
@@ -596,7 +869,8 @@ def _run_capture(req: CaptureRequest) -> CaptureResponse:
             f"done  status={status}  login_wall={login_wall}  "
             f"seen_urls={len(urls_snapshot)}  "
             f"matched={ {k: len(v) for k, v in matches_snapshot.items()} }  "
-            f"screenshot={'yes' if shot_result else ('failed' if shot_error else 'no')}"
+            f"screenshot={'yes' if shot_result else ('failed' if shot_error else 'no')}  "
+            f"ended_early={ended_early}"
         )
 
         return CaptureResponse(
@@ -609,6 +883,8 @@ def _run_capture(req: CaptureRequest) -> CaptureResponse:
             captured_urls=urls_snapshot,
             screenshot=shot_result,
             screenshot_error=shot_error,
+            actions_report=actions_report,
+            ended_early=ended_early,
         )
     finally:
         if job is not None:
@@ -714,10 +990,21 @@ def _http_error_text(e: Exception) -> str:
     if isinstance(e, HTTPException):
         return f"HTTP {e.status_code}: {e.detail}"
     if isinstance(e, ValidationError):
+        # Include the field path — for a bad step it reads
+        # "actions.1.fill.value: Field required", which says which step.
         return "invalid request: " + "; ".join(
-            err.get("msg", str(err)) for err in e.errors()
+            (".".join(str(p) for p in err.get("loc", ())) + ": " if err.get("loc") else "")
+            + err.get("msg", str(err))
+            for err in e.errors()
         )
     return f"{type(e).__name__}: {e}"
+
+
+def _login_patterns_kw(patterns: Optional[list[str]]) -> dict:
+    """``login_url_patterns`` for a request model: omitted when the tool caller
+    didn't pass any, so the model's defaults apply (an explicit ``[]`` still
+    disables detection)."""
+    return {} if patterns is None else {"login_url_patterns": patterns}
 
 
 @mcp.tool()
@@ -732,10 +1019,16 @@ def capture_url(
     screenshot_full_page: bool = False,
     screenshot_format: ScreenshotFormat = "jpeg",
     screenshot_scale: float = 1.0,
+    page_script: Optional[str] = None,
+    actions: Optional[list[dict]] = None,
+    stop_when_matched: bool = False,
+    login_url_patterns: Optional[list[str]] = None,
+    actions_ready_timeout_seconds: Optional[int] = None,
 ) -> ToolResult:
     """Load a URL under a named Chrome profile and return JSON XHR/fetch bodies
     whose URLs match any of the given regex patterns — optionally with a
-    screenshot of the rendered page.
+    screenshot of the rendered page, and optionally after driving the page
+    (fill a form, click a button) so it fires the request you want.
 
     Args:
         url: Fully-qualified URL to navigate to (https://…).
@@ -762,13 +1055,65 @@ def capture_url(
         screenshot_format: "jpeg" (default, small), "png" (lossless), "webp".
         screenshot_scale: Output scale, 0 < scale <= 2. 0.5 quarters the
             payload; use it when detail isn't needed.
+        page_script: JavaScript run in the page once it has loaded, before
+            any ``actions``. It is evaluated as an EXPRESSION; for several
+            statements use an async IIFE, ``(async () => { ...; return x;
+            })()``. Promises are awaited; the JSON-serialisable result comes
+            back as ``actions_report.page_script.value``. Use it to inspect
+            the DOM (e.g. list the form fields before writing ``actions``).
+            Do NOT use it to call the site's API with ``fetch()`` — sites that
+            sign their requests (CSRF tokens) refuse hand-made calls; drive
+            the form with ``actions`` instead.
+        actions: Ordered steps run after the page is ready (off about:blank,
+            not on a login URL, fully loaded, capture hook installed). Each is
+            an object with a ``type``:
+            ``{"type": "wait_for", "selector", "text"?, "state"?: "visible"|"attached", "timeout_s"?}``,
+            ``{"type": "fill", "selector", "value", "text"?, "clear"?: true, "timeout_s"?}``,
+            ``{"type": "click", "selector", "text"?, "method"?: "mouse"|"js", "timeout_s"?}``,
+            ``{"type": "press", "key": "Enter"|"Tab"|"Escape"|…|<one char>, "selector"?, "text"?}``,
+            ``{"type": "select", "selector", "value", "text"?}`` (native <select> only),
+            ``{"type": "wait", "seconds"}``,
+            ``{"type": "evaluate", "script", "timeout_s"?}``.
+            ``selector`` is CSS matched in the document AND inside every open
+            shadow root (Salesforce Lightning / web components), each tree
+            separately — so a descendant combinator never crosses into a
+            component (``lightning-input input`` finds nothing; use
+            ``lightning-input`` or ``input[name=x]``). First visible match
+            wins; ``text`` narrows it by visible text / value /
+            aria-label / placeholder / title (substring, or ``/regex/flags``).
+            ``fill`` types into the real <input> inside a component host with
+            trusted keyboard input; ``click`` sends a real mouse click at the
+            element's centre. ``timeout_s`` defaults to 15. Steps stop at the
+            first failure — read ``actions_report`` to see which and why.
+        stop_when_matched: End as soon as every pattern has at least one
+            match and the actions have finished, instead of waiting out
+            ``capture_window_seconds``. A click finishes when the mouse is
+            released, not when its request completes — if the page also makes
+            matching calls on its own, end ``actions`` with a step that waits
+            for the response you want — a ``wait_for`` on the element that
+            shows the result, or an ``evaluate`` that polls
+            ``window._capturedResponses`` for a new entry (INTERCEPTOR.md §
+            Worked example) — plus a short ``wait`` so it reaches the service.
+        login_url_patterns: Regexes ``re.search``-matched against the tab URL
+            after navigation to spot a redirect to a login page. Omit for the
+            defaults (``login``, ``signin``, ``/auth``); a list REPLACES them,
+            so include them yourself if you still want them. Add the site's
+            SSO host when it doesn't match those (Enphase:
+            ``sso\\.enphaseenergy\\.com``) — otherwise an expired session
+            looks like an empty result instead of ``login_wall: true``. An
+            empty list disables login detection.
+        actions_ready_timeout_seconds: How long the actions wait for the
+            page to be ready (loaded, off any login page) before giving up.
+            Defaults to ``capture_window_seconds``.
 
     Returns:
         JSON with keys ``job_id``, ``url``, ``status``, ``login_wall``,
         ``error``, ``matches`` (pattern → list of {url, body}),
         ``captured_urls`` (every JSON XHR/fetch URL seen, for diagnostics),
-        ``screenshot`` and ``screenshot_error`` — followed by the image block
-        when a screenshot was taken.
+        ``screenshot``, ``screenshot_error``, ``actions_report`` ({page_script,
+        actions: [{index, type, ok, elapsed_ms, error, value}],
+        aborted_reason}, or null) and ``ended_early`` — followed by the image
+        block when a screenshot was taken.
     """
     try:
         req = CaptureRequest(
@@ -787,6 +1132,11 @@ def capture_url(
             )
             if screenshot
             else None,
+            page_script=page_script,
+            actions=actions or [],
+            stop_when_matched=stop_when_matched,
+            actions_ready_timeout_seconds=actions_ready_timeout_seconds,
+            **_login_patterns_kw(login_url_patterns),
         )
         return _screenshot_tool_result(_run_capture(req).model_dump())
     except (HTTPException, ValidationError) as e:
@@ -801,6 +1151,8 @@ def capture_url(
                 "captured_urls": [],
                 "screenshot": None,
                 "screenshot_error": None,
+                "actions_report": None,
+                "ended_early": False,
             }
         )
 
@@ -815,6 +1167,7 @@ def screenshot_url(
     quality: int = 80,
     scale: float = 1.0,
     login_timeout: int = 300,
+    login_url_patterns: Optional[list[str]] = None,
 ) -> ToolResult:
     """Navigate to a URL under a named Chrome profile and return a screenshot
     of the rendered page. Use this to *see* a page — layout, charts, error
@@ -837,6 +1190,14 @@ def screenshot_url(
         scale: Output scale, 0 < scale <= 2. 0.5 halves each axis.
         login_timeout: Max seconds to wait for a login redirect to resolve
             before returning ``login_wall: true``.
+        login_url_patterns: Regexes ``re.search``-matched against the tab URL
+            after navigation to spot a redirect to a login page. Omit for the
+            defaults (``login``, ``signin``, ``/auth``); a list REPLACES them,
+            so include them yourself if you still want them. Add the site's
+            SSO host when it doesn't match those (Enphase:
+            ``sso\\.enphaseenergy\\.com``) — otherwise an expired session
+            looks like an empty result instead of ``login_wall: true``. An
+            empty list disables login detection.
 
     Returns:
         JSON with ``job_id``, ``url``, ``status``, ``login_wall``, ``error``,
@@ -857,6 +1218,7 @@ def screenshot_url(
             quality=quality,
             scale=scale,
             login_timeout=login_timeout,
+            **_login_patterns_kw(login_url_patterns),
         )
         return _screenshot_tool_result(_run_screenshot(req).model_dump())
     except (HTTPException, ValidationError) as e:

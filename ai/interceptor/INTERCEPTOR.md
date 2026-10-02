@@ -1,6 +1,6 @@
 # interceptor
 
-Generic HTTP + MCP front-end for `common.cdp_interceptor`. Give it a URL and a list of URL regex patterns; it opens the URL in a headless Chrome under a named `--user-data-dir`, waits for a bounded window, and returns the JSON XHR/fetch bodies whose URLs matched any pattern. It can also return a **screenshot** of the rendered page — either alongside the captures (`screenshot` block on `POST /capture`) or on its own (`POST /screenshot` / the `screenshot_url` MCP tool), so an agent can *look at* a page it navigated to. See [Screenshots](#screenshots).
+Generic HTTP + MCP front-end for `common.cdp_interceptor`. Give it a URL and a list of URL regex patterns; it opens the URL in a headless Chrome under a named `--user-data-dir`, waits for a bounded window, and returns the JSON XHR/fetch bodies whose URLs matched any pattern. It can also return a **screenshot** of the rendered page — either alongside the captures (`screenshot` block on `POST /capture`) or on its own (`POST /screenshot` / the `screenshot_url` MCP tool), so an agent can *look at* a page it navigated to. See [Screenshots](#screenshots). And it can **drive** the page — run a `page_script`, fill inputs, click buttons — for pages that only fire the request you want after someone interacts with them; the responses those actions provoke come back through the same `matches`. See [Page scripts and actions](#page-scripts-and-actions).
 
 - **Container**: `interceptor` (internal only, port 8080 on `ai_shared`)
 - **Compose file**: `ai/interceptor/docker-compose.interceptor.yml`
@@ -43,7 +43,7 @@ docker exec interceptor curl -s http://localhost:8080/health
 | `GET` | `/profiles/{name}` | One profile's status (size, sentinel) |
 | `POST` | `/profiles/{name}/refresh` | Upload a `.tgz` of a captured Chrome profile |
 | `DELETE` | `/profiles/{name}` | Wipe one profile |
-| `POST` | `/capture` | Run one capture (see request/response below); optional `screenshot` block returns an image too |
+| `POST` | `/capture` | Run one capture (see request/response below); optional `screenshot` block returns an image too; optional `page_script` / `actions` drive the page first (see [Page scripts and actions](#page-scripts-and-actions)) |
 | `POST` | `/screenshot` | Navigate and return a screenshot only — no XHR patterns (see [Screenshots](#screenshots)) |
 | `GET` | `/jobs` | Snapshot of the port pool + currently-running captures |
 | `GET` | `/jobs/{job_id}` | Detail on one in-flight capture (404 if not found) |
@@ -65,9 +65,15 @@ Request:
   "max_matches_per_pattern": null,
   "debug_logging": false,
   "login_url_patterns": ["login", "signin", "/auth"],
-  "screenshot": null
+  "screenshot": null,
+  "page_script": null,
+  "actions": [],
+  "actions_ready_timeout_seconds": null,
+  "stop_when_matched": false
 }
 ```
+
+`page_script`, `actions`, `actions_ready_timeout_seconds` and `stop_when_matched` are covered in [Page scripts and actions](#page-scripts-and-actions); with all four at their defaults a capture behaves exactly as it always has.
 
 `screenshot` is opt-in. Set it to an options object — `{"format": "jpeg", "quality": 80, "full_page": false, "scale": 1.0, "max_height": 8000}` (all keys optional) — and the response gains a `screenshot` field holding the image taken just before Chrome quits. With `screenshot` set, `url_patterns` may be empty (screenshot-only navigation); without it, an empty `url_patterns` is a 422. Details in [Screenshots](#screenshots).
 
@@ -78,7 +84,7 @@ Request:
 
 An empty list disables login detection entirely.
 
-`capture_window_seconds` is a **hard wall**: `app.py` waits exactly that long and then quits Chrome, regardless of what stage the session is in. It must exceed `login_timeout` for a login to have any chance of resolving — otherwise the window closes first and the response comes back `login_wall: true` with `status="waiting_login"`.
+`capture_window_seconds` is a **hard wall**: `app.py` waits exactly that long and then quits Chrome, regardless of what stage the session is in — unless `stop_when_matched` ends it early, or it is cancelled. It must exceed `login_timeout` for a login to have any chance of resolving — otherwise the window closes first and the response comes back `login_wall: true` with `status="waiting_login"`.
 
 Chrome always runs headless in the container. The service writes a `session_ok` sentinel into each uploaded profile so `InterceptorClient` boots straight into headless — an operator only uploads a profile *after* logging in on their laptop, so treating uploaded profiles as session-ready by definition matches reality. If the persisted session expires, `InterceptorClient` detects the login redirect, sets `status="waiting_login"`, and the response comes back with `login_wall: true`; refresh the profile via `POST /profiles/{name}/refresh` and retry.
 
@@ -99,9 +105,13 @@ Response:
   },
   "captured_urls": [ "https://…", "…" ],
   "screenshot": null,
-  "screenshot_error": null
+  "screenshot_error": null,
+  "actions_report": null,
+  "ended_early": false
 }
 ```
+
+`actions_report` is `null` unless `page_script` or `actions` were sent (shape in [Page scripts and actions § The report](#the-report)); `ended_early` is `true` only when `stop_when_matched` closed the window before `capture_window_seconds` elapsed.
 
 `screenshot` is `null` unless requested; `screenshot_error` is set (and `screenshot` stays `null`) when one was requested but could not be taken — the XHR captures are still returned, an image failure never fails the capture.
 
@@ -185,6 +195,190 @@ The helper connects by `127.0.0.1` rather than `localhost` (on Windows `localhos
 `capture_url` and `screenshot_url` return the image as an MCP **`ImageContent` block** next to the JSON text block, so a multimodal model can actually look at it. The JSON carries only the metadata (`format`, `mime_type`, `width`, `height`, `full_page`, `bytes`, `page_url`) — the base64 is *not* duplicated into the text. HTTP callers get `data_base64` inline instead.
 
 Payload budgeting for a model context: a 1920×1080 viewport JPEG at quality 80 is ~100–300 KB; `scale: 0.5` brings it to ~30–80 KB with the layout still readable. Prefer `full_page: false` unless the content below the fold is the point.
+
+## Page scripts and actions
+
+A plain capture only *watches*: it returns the JSON the page fetches on its own. Some pages only make the call you want after a person types into a form and clicks a button — a lookup page, a search box, a "load more". Four optional `POST /capture` fields (also on the `capture_url` MCP tool) cover that:
+
+| Field | Default | What it does |
+|---|---|---|
+| `page_script` | `null` | JS evaluated in the page once it is ready, before any action. Its JSON-serialisable result comes back as `actions_report.page_script.value`. Use it to *inspect* the page — e.g. list the form fields before writing `actions` (see the [discovery example](#worked-example-discover-the-form-then-run-the-lookup)). |
+| `actions` | `[]` | Ordered steps — `wait_for`, `fill`, `click`, `press`, `select`, `wait`, `evaluate` — run once the page is ready. Stops at the first failed step. |
+| `actions_ready_timeout_seconds` | `capture_window_seconds` | How long the [readiness gate](#readiness-gate) may wait before the steps are abandoned. |
+| `stop_when_matched` | `false` | End the window as soon as every `url_patterns` bucket has at least one match and the actions (if any) have finished, instead of waiting out `capture_window_seconds`. Needs at least one pattern (422 otherwise). |
+
+### Why drive the form instead of calling the API from `page_script`
+
+It is tempting to have `page_script` call the endpoint directly with `fetch()`. On sites that sign their API calls this does not work: a Salesforce Experience Cloud (LWR) site's `webruntime/api/apex/execute` refuses a hand-made request with **401** because the `csrf-token` header is added by the LWR runtime itself, from state a page script cannot easily reach. Filling the input and clicking the button makes the page's *own* code send the request with every header it needs — and since `interceptor.js` has already wrapped `window.fetch` / XHR, the response lands in `matches` like any other capture. Nothing about capture changes; the actions only cause the request.
+
+### Step types
+
+| `type` | Fields (`?` = optional) | What happens |
+|---|---|---|
+| `wait_for` | `selector`, `text?`, `state?` (`visible` \| `attached`, default `visible`), `timeout_s?` | Polls the [deep query](#finding-elements) every 250 ms until a match is in that state. |
+| `fill` | `selector`, `value`, `text?`, `clear?` (default `true`), `timeout_s?` | Waits for a visible match, focuses the real `<input>`/`<textarea>` (descending into a component host's shadow root when the selector hit the host, e.g. `lightning-input`), empties it (native value setter + `input` event), types `value` with CDP **`Input.insertText`** — trusted `beforeinput`/`input` events, which is what LWC and React listen to — then fires `change` (`bubbles`, `composed`) and blurs. Fails if focus doesn't land. |
+| `click` | `selector`, `text?`, `method?` (`mouse` \| `js`, default `mouse`), `timeout_s?` | `mouse`: scrolls the element to the centre of the viewport and sends `Input.dispatchMouseEvent` moved / pressed / released (left button, `clickCount: 1`) at the centre of its box — a trusted click, so whatever is on top at that point receives it. `js`: `el.click()`, for an element a modal or overlay covers. |
+| `press` | `key`, `selector?`, `text?`, `timeout_s?` | `Input.dispatchKeyEvent` keyDown + keyUp with the right `code` / `windowsVirtualKeyCode`. Keys: `Enter`, `Tab`, `Escape`, `Backspace`, `Delete`, `Space`, `ArrowUp/Down/Left/Right`, `Home`, `End`, `PageUp`, `PageDown`, or any single character. Goes to the focused element — `fill` blurs its field when done, so pass `selector` to focus a field before pressing `Enter` in it. |
+| `select` | `selector`, `value`, `text?`, `timeout_s?` | Native `<select>` only: picks the option whose value — or, failing that, visible text — equals `value`, fires `input` + `change`. A `lightning-combobox` is not a `<select>`: `click` it open, then `click` the option by `text`. |
+| `wait` | `seconds` | Sleeps (0–600 s, cancellable). |
+| `evaluate` | `script`, `timeout_s?` | `Runtime.evaluate` with `awaitPromise`, `returnByValue`, `userGesture`. The value comes back in that step's `value`; a thrown error fails the step with its message. |
+
+`timeout_s` defaults to **15** per step (max 600). Unknown step types and missing fields are a **422**; an unknown `press` key is a **400** — both before a port is taken.
+
+**Scripts are expressions.** `page_script` and `evaluate.script` are evaluated as given, not wrapped. `document.title` works; several statements need an async IIFE — `(async () => { const x = …; return x; })()`. Promises are awaited. Return plain data (objects, arrays, strings): DOM nodes and functions don't survive `returnByValue`.
+
+### Finding elements
+
+`selector` is ordinary CSS, but it is matched in `document` **and inside every open shadow root**, recursively. Salesforce Lightning Web Components (and most custom-element design systems) render inside native shadow DOM, where `document.querySelector` finds nothing — `input`, `button`, `[placeholder="Serial Number"]`, `lightning-input` all work here because each shadow tree is searched on its own. Because each tree is searched **separately, a combinator never crosses a shadow boundary**: `lightning-input input` matches nothing (the `<input>` lives in the host's shadow tree, not under it), and `c-form lightning-input` only matches when both sit in the same tree. Select either the inner element with an attribute (`input[name="serial"]`) or the component host itself (`lightning-input`) — `fill`, `press` and `select` descend from a host into its shadow tree to the real control — and narrow with `text` rather than long descendant chains. The discovery script's `hosts` column tells you which host an element is inside.
+
+- **`text`** narrows the matches: a substring of the element's trimmed, whitespace-collapsed text (including text rendered in its own shadow tree, so `lightning-button` + `text: "Check"` works), its `value`, `aria-label`, `placeholder` or `title`. Written `/…/flags` it is a JS regex: `"/check\\s+serial/i"`.
+- **The first visible match wins.** Visible = a non-empty bounding box and not `display: none` / `visibility: hidden` (a `display: contents` host borrows its first visible child's box). `state: "attached"` on `wait_for` accepts a hidden match.
+- **A miss says why**: `nothing matches selector "…"`, `3 matched the selector, 0 of those matched the text`, `2 matched the selector, none visible` — usually enough to fix the selector without re-running discovery.
+- Closed shadow roots and iframes are out of reach.
+
+### Readiness gate
+
+No `page_script` and no step runs until **all** of these hold:
+
+1. the tab URL is not `about:blank`;
+2. it does not match `login_url_patterns` (the same regexes the capture uses — so nothing is ever typed into a login form);
+3. `document.readyState === "complete"`;
+4. `window._fetchInterceptorActive === true` — the guard `interceptor.js` sets when it wraps `fetch`/XHR, proving the capture hook is installed **before** anything is clicked.
+
+The gate polls for up to `actions_ready_timeout_seconds`. In a visible run (a profile with no sentinel) this is what waits for a human to log in; headless against an expired session it simply times out, `actions_report.aborted_reason` reads `not ready: login page https://… (gave up after …s)`, and the response has `login_wall: true` as usual.
+
+LWC components often render a beat after `readyState` reaches `complete`. Steps poll, so that is harmless for `wait_for`/`fill`/`click`; a `page_script` runs once, so poll inside it (as the discovery example does) or use a `wait_for` followed by an `evaluate` step.
+
+### Timing, navigation, and `stop_when_matched`
+
+The actions run on a helper thread started right after Chrome launches, on their **own** CDP connection to the tab (`shared/common/src/common/cdp_interceptor/actions.py`, the same second-socket pattern as [Screenshots](#how-it-works)) — so the capture session's socket is untouched. The job's phase is `actions` while they run (`GET /jobs` metadata shows `actions_done` / `actions_total`) and back to `capturing` after. The window keeps counting the whole time: **`capture_window_seconds` must cover the login (if any), the gate, and every step.**
+
+- **A step that navigates** (a submit that reloads) is handled: the next lookup sees the old execution context vanish, re-waits the readiness gate once and retries; a dropped side socket is reopened on the next call. A `page_script` / `evaluate` whose document is destroyed while it runs is re-run once on the new document after the gate passes again — this matters after a visible login, where the gate can pass on the post-login landing page a moment before the capture session re-navigates to the target URL.
+- **The first failure stops the run.** Later steps are reported `ok: false, error: "skipped"`. The capture itself still completes normally — matches, screenshot, cleanup.
+- **When the window ends first**, the running step is stopped and `aborted_reason` reads `capture window ended before actions finished`. `POST /jobs/{id}/cancel` stops them too (`aborted_reason: "cancelled"`).
+- **`stop_when_matched`** checks four times a second: actions done (or none requested) **and** every pattern has ≥ 1 match → the window ends, `ended_early: true`, and the screenshot (if requested) and cleanup run as normal. **A click is "done" when the mouse button is released, not when its request returns.** If the page also makes matching calls on its own during load — a Salesforce site's every Apex call goes to the same `webruntime/api/apex/execute` URL — a load-time match can satisfy the condition the moment the click returns, before the response you wanted arrives. End such `actions` with a `wait_for` on the element that renders the result, so the actions only finish once the answer is on screen.
+
+### The report
+
+```json
+"actions_report": {
+  "page_script": { "index": -1, "type": "page_script", "ok": true, "elapsed_ms": 412, "error": null, "value": [ … ] },
+  "actions": [
+    { "index": 0, "type": "fill",     "ok": true,  "elapsed_ms": 220, "error": null, "value": { "element": "<input id=\"input-12\" name=\"serial\">", "value_length": 12 } },
+    { "index": 1, "type": "click",    "ok": true,  "elapsed_ms": 95,  "error": null, "value": { "element": "<button>", "x": 961.5, "y": 412.0 } },
+    { "index": 2, "type": "wait_for", "ok": false, "elapsed_ms": 15004, "error": "timed out after 15s waiting for '.result' (visible): nothing matches selector \".result\"", "value": null },
+    { "index": 3, "type": "evaluate", "ok": false, "elapsed_ms": 0, "error": "skipped", "value": null }
+  ],
+  "aborted_reason": "actions[2] (wait_for) failed: timed out after 15s waiting for '.result' (visible): …"
+}
+```
+
+`index` is the step's position in `actions` (`-1` for `page_script`). `aborted_reason` is `null` when every step ran and succeeded. `value` for DOM steps describes the element acted on; for `evaluate` / `page_script` it is the script's return value.
+
+### Worked example: discover the form, then run the lookup
+
+**1 — Discovery.** Load the page with a `page_script` that waits (up to 15 s) for an input to render, walks every open shadow root, and returns each `input` / `textarea` / `select` / `button` / `[role=button]` with the details you need to write selectors — `hosts` is the chain of custom-element hosts it sits inside (e.g. `c-feoc-form > lightning-input`). Add a screenshot to see what you're looking at. For a profile that has never logged in, Chrome opens visibly: log in in that window and the gate waits for you (keep `login_timeout` below `capture_window_seconds`). The readable source:
+
+```js
+(async () => {
+  const SEL = 'input, textarea, select, button, [role=button]';
+  const roots = () => {
+    const out = [document], stack = [document];
+    while (stack.length) {
+      for (const el of stack.pop().querySelectorAll('*')) {
+        if (el.shadowRoot) { out.push(el.shadowRoot); stack.push(el.shadowRoot); }
+      }
+    }
+    return out;
+  };
+  const find = () => roots().flatMap(r => Array.from(r.querySelectorAll(SEL)));
+  const until = Date.now() + 15000;
+  let els = find();
+  while (!els.some(e => e.matches('input, textarea')) && Date.now() < until) {
+    await new Promise(r => setTimeout(r, 500));
+    els = find();
+  }
+  const txt = n => (n && (n.innerText || n.textContent) || '').replace(/\s+/g, ' ').trim();
+  const labelOf = el => {
+    if (el.labels && el.labels.length) return txt(el.labels[0]);
+    const by = el.getAttribute('aria-labelledby');
+    if (by) {
+      const root = el.getRootNode();
+      const t = by.split(' ').map(id => root.getElementById(id)).filter(Boolean).map(txt).join(' ');
+      if (t) return t;
+    }
+    return el.getAttribute('aria-label') || '';
+  };
+  const hosts = el => {
+    const out = [];
+    for (let r = el.getRootNode(); r && r.host; r = r.host.getRootNode()) out.unshift(r.host.tagName.toLowerCase());
+    return out.join(' > ');
+  };
+  return els.map(el => {
+    const r = el.getBoundingClientRect();
+    return {
+      tag: el.tagName.toLowerCase(),
+      type: el.getAttribute('type') || '',
+      name: el.getAttribute('name') || '',
+      id: el.id || '',
+      label: labelOf(el),
+      aria_label: el.getAttribute('aria-label') || '',
+      placeholder: el.getAttribute('placeholder') || '',
+      text: (txt(el) || el.value || '').slice(0, 80),
+      visible: r.width > 0 && r.height > 0,
+      hosts: hosts(el)
+    };
+  });
+})()
+```
+
+The same script as a ready-to-send request body (the `page_script` value is that source, JSON-escaped):
+
+```json
+{
+  "url": "https://support.enphase.com/feoc-compliance/",
+  "url_patterns": ["webruntime/api/apex/execute"],
+  "profile": "enphase",
+  "capture_window_seconds": 300,
+  "login_timeout": 240,
+  "login_url_patterns": ["login", "signin", "/auth", "sso\\.enphaseenergy\\.com"],
+  "screenshot": {"full_page": true, "scale": 0.5},
+  "page_script": "(async () => {\n  const SEL = 'input, textarea, select, button, [role=button]';\n  const roots = () => {\n    const out = [document], stack = [document];\n    while (stack.length) {\n      for (const el of stack.pop().querySelectorAll('*')) {\n        if (el.shadowRoot) { out.push(el.shadowRoot); stack.push(el.shadowRoot); }\n      }\n    }\n    return out;\n  };\n  const find = () => roots().flatMap(r => Array.from(r.querySelectorAll(SEL)));\n  const until = Date.now() + 15000;\n  let els = find();\n  while (!els.some(e => e.matches('input, textarea')) && Date.now() < until) {\n    await new Promise(r => setTimeout(r, 500));\n    els = find();\n  }\n  const txt = n => (n && (n.innerText || n.textContent) || '').replace(/\\s+/g, ' ').trim();\n  const labelOf = el => {\n    if (el.labels && el.labels.length) return txt(el.labels[0]);\n    const by = el.getAttribute('aria-labelledby');\n    if (by) {\n      const root = el.getRootNode();\n      const t = by.split(' ').map(id => root.getElementById(id)).filter(Boolean).map(txt).join(' ');\n      if (t) return t;\n    }\n    return el.getAttribute('aria-label') || '';\n  };\n  const hosts = el => {\n    const out = [];\n    for (let r = el.getRootNode(); r && r.host; r = r.host.getRootNode()) out.unshift(r.host.tagName.toLowerCase());\n    return out.join(' > ');\n  };\n  return els.map(el => {\n    const r = el.getBoundingClientRect();\n    return {\n      tag: el.tagName.toLowerCase(),\n      type: el.getAttribute('type') || '',\n      name: el.getAttribute('name') || '',\n      id: el.id || '',\n      label: labelOf(el),\n      aria_label: el.getAttribute('aria-label') || '',\n      placeholder: el.getAttribute('placeholder') || '',\n      text: (txt(el) || el.value || '').slice(0, 80),\n      visible: r.width > 0 && r.height > 0,\n      hosts: hosts(el)\n    };\n  });\n})()"
+}
+```
+
+Without `stop_when_matched` this run lasts the full 300 s (time to log in). Add `"stop_when_matched": true` once the profile is logged in, and it returns as soon as the page script is done and the page has made its first Apex call.
+
+**2 — The lookup.** Discovery on the live page (2026-10-02) found the serial field as a `<textarea placeholder="Serial number">` inside `c-feoc-parent-comp > c-feoc-serial-num`, and a `<button type="submit">Submit</button>` in `c-feoc-parent-comp`. This body is **verified** — it returns the `submitSerialNumbers` result in ~10 s:
+
+```json
+{
+  "url": "https://support.enphase.com/feoc-compliance/",
+  "url_patterns": ["webruntime/api/apex/execute"],
+  "profile": "enphase",
+  "capture_window_seconds": 60,
+  "login_timeout": 30,
+  "login_url_patterns": ["login", "signin", "/auth", "sso\\.enphaseenergy\\.com"],
+  "stop_when_matched": true,
+  "actions": [
+    {"type": "fill", "selector": "textarea[placeholder='Serial number']", "value": "532614044013"},
+    {"type": "evaluate", "script": "(() => { window.__ciN0 = (window._capturedResponses || []).length; return window.__ciN0; })()"},
+    {"type": "click", "selector": "button[type=submit]", "text": "Submit"},
+    {"type": "evaluate", "script": "(async () => { const until = Date.now() + 30000; while (Date.now() < until) { const c = (window._capturedResponses || []).slice(window.__ciN0 || 0).filter(x => /webruntime\\/api\\/apex\\/execute/.test(x.url)); if (c.length) return {new_apex_responses: c.length}; await new Promise(r => setTimeout(r, 250)); } throw new Error('no new apex/execute response within 30s of Submit'); })()", "timeout_s": 35},
+    {"type": "wait", "seconds": 2}
+  ]
+}
+```
+
+The page makes three Apex calls of its own on load (session check, current user, disclaimer text), all on the same `webruntime/api/apex/execute` URL — so `stop_when_matched` is satisfied before Submit is ever clicked, and the actions have to hold the window open until the lookup's own response exists. The two `evaluate` steps do that generically, without knowing anything about the result UI: the first records how many responses `interceptor.js` has captured so far (`window._capturedResponses`), the second waits for a new Apex one to appear after the click. The trailing `wait` gives the capture side time to receive it — the bytes are in the page at that point, but delivery to the service rides the CDP binding (near-instant) with a 5 s poll as fallback, and the window would otherwise close on the load-time matches first.
+
+The answer is the match whose `returnValue` is a JSON **string** of an array (the Apex method returns serialised JSON). Clicking Submit also fetches the definitions text, so it is not simply the last match:
+
+```json
+{"returnValue": "[{\"sn\":\"532614044013\",\"feoc\":\"Yes\",\"sku\":\"IQ8HC-72-M-DOM-US\",\"message\":\"\",\"isChild\":false}]", "cacheable": false}
+```
+
+Several serials can go in one `fill` value separated by newlines or commas (the page says so); each comes back as one element of that array.
 
 ## Concurrency
 
@@ -402,13 +596,15 @@ The `interceptor` MCP server (registered in `ai/litellm/litellm_config.yaml` `mc
 
 | Tool | Purpose | Args |
 |---|---|---|
-| `capture_url` | Run one capture — same core behavior as `POST /capture`; `screenshot=true` adds an image of the page | `url`, `url_patterns`, `profile`, `capture_window_seconds`, `login_timeout`, `max_matches_per_pattern`, `screenshot`, `screenshot_full_page`, `screenshot_format`, `screenshot_scale` |
-| `screenshot_url` | Navigate and return a screenshot — same core behavior as `POST /screenshot`. Image arrives as an `ImageContent` block (see [Screenshots § On MCP](#on-mcp)) | `url`, `profile`, `wait_seconds`, `full_page`, `format`, `quality`, `scale`, `login_timeout` |
+| `capture_url` | Run one capture — same core behavior as `POST /capture`; `screenshot=true` adds an image of the page; `page_script` / `actions` drive the page first (see [Page scripts and actions](#page-scripts-and-actions)) | `url`, `url_patterns`, `profile`, `capture_window_seconds`, `login_timeout`, `max_matches_per_pattern`, `screenshot`, `screenshot_full_page`, `screenshot_format`, `screenshot_scale`, `page_script`, `actions` (list of step objects), `stop_when_matched`, `login_url_patterns`, `actions_ready_timeout_seconds` |
+| `screenshot_url` | Navigate and return a screenshot — same core behavior as `POST /screenshot`. Image arrives as an `ImageContent` block (see [Screenshots § On MCP](#on-mcp)) | `url`, `profile`, `wait_seconds`, `full_page`, `format`, `quality`, `scale`, `login_timeout`, `login_url_patterns` |
 | `list_profiles` | Discover which named profiles exist — call before `capture_url` if the LLM doesn't know the profile name | *(none)* |
 | `list_jobs` | Snapshot of the port pool + running captures — same shape as `GET /jobs` | *(none)* |
 | `get_job` | Detail on one in-flight capture by id — same shape as `GET /jobs/{job_id}` | `job_id` |
 
 The `keep_open` and `debug_logging` knobs from `POST /capture` are deliberately **not** exposed to MCP — both are operator-only debug flags (`keep_open` requires manual Chrome-kill cleanup; `debug_logging` writes to a DevTools console the LLM can't read).
+
+`login_url_patterns` on both tools has the same semantics as on `POST /capture`: omit it (or pass `null`) to keep the defaults, pass a list to **replace** them, `[]` to disable detection. Pass the site's SSO host when the defaults don't match it — for Enphase, `["login", "signin", "/auth", "sso\\.enphaseenergy\\.com"]` — or an expired session comes back as an empty result rather than `login_wall: true`.
 
 MCP tools return dicts and never raise — errors surface inside the payload (e.g. `{"error": "no active job …"}` or a `capture_url` response with `status="error"` and an `error` field describing the HTTP-layer failure).
 
@@ -443,7 +639,7 @@ Every `/capture` invocation gets a 12-char hex `job_id` and shows up in `GET /jo
 
 **`GET /jobs/{job_id}`** — same shape as one element of `jobs[]`, or **HTTP 404** if the id isn't currently in flight. Completed captures aren't retained — a 404 means either the id never existed or the capture finished.
 
-`phase` progresses: `"cloning"` (slow path only, during `shutil.copytree`) → `"capturing"` (Chrome running, XHRs being intercepted) → `"cleaning_up"` (temp rmtree + port release). Fast-path captures skip `"cloning"` and go straight to `"capturing"`.
+`phase` progresses: `"cloning"` (slow path only, during `shutil.copytree`) → `"capturing"` (Chrome running, XHRs being intercepted) → `"cleaning_up"` (temp rmtree + port release). Fast-path captures skip `"cloning"` and go straight to `"capturing"`. A capture with `page_script` / `actions` shows `"actions"` while they run (back to `"capturing"` when they finish), and its `metadata` carries `actions_done` / `actions_total`; one with a screenshot passes through `"screenshot"` just before `"cleaning_up"`.
 
 Typical workflow — see what's running, then drill in:
 
@@ -547,5 +743,6 @@ uv run cdp-spy --url https://roofix.io/project/abc123 --profile-dir C:\data\prof
 - No streaming captures — `/capture` is one-shot, bounded by `capture_window_seconds`.
 - No public auth on the HTTP surface — the service is only reachable via `ai_shared`.
 - No completed-job history — `GET /jobs/{id}` returns 404 as soon as a capture finishes.
+- Actions reach open shadow roots only — not closed shadow roots, not iframes — and `select` handles native `<select>` only. One `page_script` and one action list per capture; there is no conditional branching between steps (use an `evaluate` step for logic).
 - No MCP-side cancellation — cancel is HTTP-only. An LLM cannot reclaim a stuck capture it started; that's an operator's job.
-- Screenshots are one-shot, taken at the end of the window — there is no "click this, then screenshot" interaction, and no element-level clipping. Viewport is fixed at the headless `1920×1080` window; full-page height is clamped to `max_height` (≤ 16384).
+- Screenshots are one-shot, taken at the end of the window (after any `actions`, so "fill, click, then screenshot" works) — but there is no mid-run screenshot and no element-level clipping. Viewport is fixed at the headless `1920×1080` window; full-page height is clamped to `max_height` (≤ 16384).

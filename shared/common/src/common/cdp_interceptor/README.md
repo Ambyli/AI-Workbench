@@ -200,6 +200,9 @@ from common.cdp_interceptor import (
     session_exists,
     mark_session_ok,
     clear_session,
+    # side channels — each opens its own CDP connection to the tab
+    capture_screenshot, Screenshot, ScreenshotError,
+    run_actions, parse_actions, Action, ActionResult, ActionsReport, ActionError,
 )
 ```
 
@@ -319,6 +322,8 @@ Custom JS to inject instead of the bundled `interceptor.js`.
 | `.go_visible() -> None` | Relaunch visibly. |
 | `.quit() -> None` | Terminate the browser, stop the worker. Safe to call multiple times. |
 | `.get_state() -> ClientState` | Snapshot of current status (lock-guarded). |
+| `.screenshot(...) -> Screenshot` | Image of the page tab, over a second CDP connection. Raises `ScreenshotError`. |
+| `.run_actions(actions, *, page_script=None, ready_timeout_s=60, ...) -> ActionsReport` | Fill / click / press / evaluate in the page tab over a second CDP connection — see [Driving the page](#driving-the-page-run_actions). Never raises. |
 | `.is_running` *(property)* | True while the worker thread is alive. |
 | `InterceptorClient.is_available()` *(staticmethod)* | True if `requests` and `websocket-client` are importable. |
 
@@ -429,6 +434,31 @@ client.launch("https://phoenix.zeoenergy.com/projects")
 
 (See `widget/test_phoenix_spy.py` for a full working version.)
 
+### Driving the page (`run_actions`)
+
+For a page that only fires the request you want after someone fills a form and clicks a button, let the page's own code send it — the interceptor captures the response as usual. `run_actions` opens its own short-lived CDP socket to the tab (the worker's socket is untouched), waits for a readiness gate (tab off `about:blank`, not on a login URL, `document.readyState === "complete"`, `window._fetchInterceptorActive === true`), runs an optional `page_script`, then each step in order, stopping at the first failure.
+
+```python
+from common.cdp_interceptor import InterceptorClient, parse_actions
+
+client = InterceptorClient(profile_dir=r"C:\temp\enphase",
+                           url_patterns=[r"webruntime/api/apex/execute"],
+                           on_capture=lambda cap: print(cap.url, cap.body))
+client.launch("https://support.enphase.com/feoc-compliance/")
+report = client.run_actions(
+    parse_actions([
+        {"type": "fill", "selector": "textarea[placeholder='Serial number']", "value": "532614044013"},
+        {"type": "click", "selector": "button[type=submit]", "text": "Submit"},
+        {"type": "wait", "seconds": 10},
+    ]),
+    ready_timeout_s=60,
+)
+print(report.to_dict())   # per-step ok / error / value, plus aborted_reason
+client.quit()
+```
+
+Step types: `wait_for`, `fill`, `click`, `press`, `select`, `wait`, `evaluate`. Element lookup searches the document **and every open shadow root** (each tree separately — a descendant combinator never crosses a shadow boundary), so Lightning Web Components are reachable; `fill` / `click` / `press` use trusted CDP `Input.*` events. Full reference: [`ai/interceptor/INTERCEPTOR.md` § Page scripts and actions](../../../../../ai/interceptor/INTERCEPTOR.md#page-scripts-and-actions).
+
 ### Long-running poller — refresh every 5 minutes
 
 ```python
@@ -477,6 +507,8 @@ logging.basicConfig(level=logging.DEBUG)
 | `client.py` | `InterceptorClient` façade, `Capture`/`ClientState` dataclasses. |
 | `launcher.py` | OS-adaptive `find_browser`, `start_browser`, `clear_singleton_locks`, `kill_chrome_by_profile` (Windows-only). |
 | `cdp_session.py` | `run_session` — the WebSocket loop that talks to the browser. |
+| `screenshot.py` | `capture_screenshot` — page image over a second, short-lived CDP connection. |
+| `actions.py` | `run_actions` / `parse_actions` — readiness gate, `page_script`, and shadow-DOM-piercing fill / click / press / select / evaluate steps over a second CDP connection. |
 | `sentinel.py` | Session-marker file helpers. |
 | `spy.py` | CLI entry point (`cdp-spy` script, or `python -m common.cdp_interceptor.spy`). |
 | `interceptor.js` | Injected JS that patches `fetch`/`XHR`. **DO NOT reformat — injected verbatim.** |

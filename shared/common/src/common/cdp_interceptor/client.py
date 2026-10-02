@@ -14,8 +14,9 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 
+from .actions import Action, ActionsReport, run_actions
 from .cdp_session import Capture, run_session
 from .launcher import (
     BrowserNotFoundError,
@@ -285,6 +286,50 @@ class InterceptorClient:
             tab_url_hint=self._target_url or "",
             settle_timeout=settle_timeout,
             timeout=timeout,
+        )
+
+    def run_actions(
+        self,
+        actions: Sequence[Action],
+        *,
+        page_script: Optional[str] = None,
+        ready_timeout_s: float = 60.0,
+        page_script_timeout_s: float = 30.0,
+        login_url_patterns: Optional[Sequence[str]] = None,
+        cancel: Optional[Callable[[], bool]] = None,
+        on_progress: Optional[Callable[[int, int], None]] = None,
+    ) -> ActionsReport:
+        """Run a ``page_script`` and/or browser actions in the page tab of the
+        Chrome this client launched.
+
+        Safe to call from any thread right after ``launch()`` — like
+        ``screenshot()`` it rides a second CDP connection, and its readiness
+        gate waits for the worker to navigate and install the interceptor
+        before touching the page, so a response the actions provoke is
+        captured through the normal ``on_capture`` path. Blocks until the
+        steps finish, fail, or ``cancel()`` returns True.
+
+        ``login_url_patterns`` defaults to this client's
+        ``login_url_keywords``. Never raises; see
+        ``common.cdp_interceptor.actions.run_actions`` for the details.
+        """
+        if self._proc is None:
+            return ActionsReport.not_run(
+                actions, page_script, "browser is not running — call launch() first"
+            )
+        return run_actions(
+            self._debug_port,
+            actions,
+            page_script=page_script,
+            tab_url_hint=self._target_url or "",
+            login_url_patterns=(
+                login_url_patterns if login_url_patterns is not None
+                else self._login_url_keywords
+            ),
+            ready_timeout_s=ready_timeout_s,
+            page_script_timeout_s=page_script_timeout_s,
+            cancel=cancel,
+            on_progress=on_progress,
         )
 
     # ── Internal ──────────────────────────────────────────────────────────────

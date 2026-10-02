@@ -16,21 +16,30 @@ already known here, and the runner needs it to name the artifact directory.
                              the queue before deploying — see API.md
                              § Deploying.
     SubmittedDocument      — one document as the endpoint resolved it.
-    build_assess_payload() — the one payload shape.
+    build_assess_payload() — an /assess job's payload.
+    build_reference_payload() — a reference creation job's (POST
+                             /references): ONE document and the page of it,
+                             the reference's criteria, and what the submit
+                             already resolved — the caller's breakdown and
+                             regions (in page pixels) over a ``from_job``'s
+                             answers. Same schema number, ``type:
+                             "reference"`` added; the assess payload is
+                             unchanged.
 
 The bytes are the ones resolved AT SUBMIT: a URL was fetched, inline text
 encoded, a multipart upload read — so the worker never touches the network
 for its input, and the item cap already ran on exactly these bytes.
 
-Process flow position: called by ``api.assess`` at submit time; read by
-``jobs.runners.run_assess`` after a worker claims the row.
+Process flow position: called by ``api.assess`` / ``api.references`` at
+submit time; read by ``jobs.runners.run_assess`` / ``run_reference`` after a
+worker claims the row.
 """
 
 import base64
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from api.schemas import AssessRequest
+from api.schemas import AssessRequest, CriterionInput
 
 PAYLOAD_SCHEMA = 3
 
@@ -51,9 +60,16 @@ def build_assess_payload(
     documents: list[SubmittedDocument],
     *,
     job_id: Optional[str] = None,
+    references: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
-    """Serialise one validated submission for the payload store."""
-    return {
+    """Serialise one validated submission for the payload store.
+
+    ``references`` is the plan ``references.resolve`` built at submit; the
+    key is present only when the request listed references, so a plain
+    assess payload keeps exactly its old keys (same schema number — the
+    runner reads the key with ``get``).
+    """
+    payload = {
         "schema": PAYLOAD_SCHEMA,
         "documents": [
             {
@@ -67,4 +83,48 @@ def build_assess_payload(
         ],
         "criteria": [c.model_dump() for c in request.criteria],
         "job_id": job_id,
+    }
+    if references is not None:
+        payload["references"] = references
+    return payload
+
+
+def _document_entry(d: SubmittedDocument) -> dict[str, Any]:
+    return {
+        "file_b64": base64.b64encode(d.raw).decode("ascii"),
+        "filename": d.filename,
+        "content_type": d.content_type or "application/octet-stream",
+        "kind": d.kind,
+        "pages": d.pages,
+    }
+
+
+def build_reference_payload(
+    *,
+    reference_id: str,
+    job_id: str,
+    document: SubmittedDocument,
+    page: int,
+    criteria: list[CriterionInput],
+    supplied: dict[str, dict[str, Any]],
+    source: dict[str, Any],
+    warnings: Optional[list[str]] = None,
+) -> dict[str, Any]:
+    """Serialise one validated POST /references for the payload store.
+
+    ``supplied`` is ``{name: {"breakdown"?, "regions"?, "regions_source"?,
+    "observed"?}}`` exactly as ``references.finalize.merge`` reads it; the
+    regions are already in ORIGINAL page pixels (grid converted at submit).
+    """
+    return {
+        "schema": PAYLOAD_SCHEMA,
+        "type": "reference",
+        "reference_id": reference_id,
+        "job_id": job_id,
+        "document": _document_entry(document),
+        "page": int(page),
+        "criteria": [c.model_dump() for c in criteria],
+        "supplied": supplied,
+        "source": source,
+        "warnings": list(warnings or []),
     }

@@ -25,6 +25,10 @@ notion of documents:
     manifest.json         what is in the directory, ``items`` (n → document,
                           page, filename), and which criterion used which
                           text layers.
+    references.json       only when the request listed references: the plan,
+                          and which composite went into which guided call
+                          (``analysis.references.JobReferences.artifact``).
+                          JSON, so the byte cap never drops it.
 
 The SVG / PNG / preview LAYERS are not written here at all: ``api.artifacts``
 renders them from regions.json on first fetch and caches them into the same
@@ -83,6 +87,9 @@ from logger import logger
 from regions.store import store
 
 _SUFFIX = dict(LAYER_FILE_SUFFIXES)
+
+# The references record a guided job writes (analysis.pipeline).
+REFERENCES_NAME = "references.json"
 
 
 @dataclass
@@ -180,6 +187,11 @@ def text_layer_payload(
             for line in layer.lines
         ],
     }
+
+
+def write_references_json(job_id: str, payload: dict[str, Any]) -> None:
+    """Write ``references.json``. JSON is in the store's never-dropped set."""
+    store.write_json(job_id, REFERENCES_NAME, payload)
 
 
 def write_text_layer(job_id: str, name: str, payload: dict[str, Any]) -> None:
@@ -538,6 +550,8 @@ class FileLabeler:
             return self._label("manifest", None, None, None, self.all_names)
         if name == "regions.json":
             return self._label("regions", None, None, None, self.all_names)
+        if name == REFERENCES_NAME:
+            return self._label("references", None, None, None, self.all_names)
         match = _TEXT_FILE_RE.match(name)
         if match:
             criteria = self.by_text.get(name, set())

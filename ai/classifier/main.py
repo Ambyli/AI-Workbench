@@ -4,8 +4,9 @@ This module does four things and nothing else:
   - Configures logging with correlation ID injection (middleware.py).
   - Builds the app, attaches the correlation ID middleware, and instruments
     every endpoint with Prometheus metrics.
-  - Owns the lifespan: initialise the shared ``common.jobs`` SQLite registry,
-    requeue jobs a previous process left mid-flight, start
+  - Owns the lifespan: initialise the shared ``common.jobs`` SQLite registry
+    and the references table beside it, fail references whose creation job
+    is gone, requeue jobs a previous process left mid-flight, start
     CLASSIFIER_MAX_CONCURRENT workers and the artifact sweeper — and stop them
     again.
   - Mounts the routers.
@@ -17,6 +18,8 @@ Every endpoint handler lives in ``api/``:
     api.introspection  GET /criterion-types, /hints, /cv-detectors,
                        /document-kinds, /health
     api.artifacts      the four /jobs/{job_id}/artifacts routes
+    api.references     POST/GET/PATCH/DELETE /references — saved worked
+                       examples, each built by a "reference" job
     common.jobs.router GET /jobs, GET /jobs/{id}, DELETE /jobs/{id}
 
 /locate and /assess/compare were removed and answer 404 like any unknown
@@ -69,12 +72,15 @@ from prometheus_fastapi_instrumentator import Instrumentator
 from common.jobs.router import build_router
 
 from api import artifacts as artifacts_api
-from api import assess, introspection
+from api import assess, introspection, references as references_api
 from config import LOG_LEVEL
 from jobs.queue import jobs_registry, queue, sweeper
 from llm import client as llm_client
 from logger import logger
 from middleware import CorrelationIDMiddleware, RequestIDFilter
+from references.store import reconcile as reconcile_references
+from references.store import reference_registry
+from references.store import refresh_gauges as refresh_reference_gauges
 from regions.sweeper import delete_artifacts_for_job
 
 # ---------------------------------------------------------------------------
@@ -107,7 +113,11 @@ async def lifespan(app: FastAPI):
     """Manage resources that must exist for the full lifetime of the server.
 
     On startup:
-      - Initialise (or migrate) the shared SQLite job registry.
+      - Initialise (or migrate) the shared SQLite job registry, and create
+        the ``reference_examples`` table in the same DB.
+      - Reconcile references: a ``pending`` one whose creation job is gone or
+        finished without readying it is marked ``failed`` (its job may have
+        expired, or failed while no process was there to record it).
       - ``queue.start()``: requeue jobs the previous process left in
         "processing" / "staging", sweep orphan payload files, and start
         CLASSIFIER_MAX_CONCURRENT worker tasks.
@@ -124,6 +134,11 @@ async def lifespan(app: FastAPI):
       - ``llm_client.aclose()``: close the pooled vision-model HTTP client.
     """
     await jobs_registry.init()
+    await reference_registry.init()
+    failed = await reconcile_references(jobs_registry)
+    if failed:
+        logger.warning("lifespan: %d pending reference(s) reconciled to failed", failed)
+    await refresh_reference_gauges()
     await queue.start()
     await sweeper.start()
     logger.info("lifespan: startup complete")
@@ -173,7 +188,8 @@ app.include_router(
 # /jobs/{job_id}, whatever the include order.
 app.include_router(artifacts_api.build_artifacts_router(jobs_registry))
 
-# The endpoints themselves: /assess, then the introspection routes and
-# /health.
+# The endpoints themselves: /assess, /references, then the introspection
+# routes and /health.
 app.include_router(assess.router)
+app.include_router(references_api.router)
 app.include_router(introspection.router)

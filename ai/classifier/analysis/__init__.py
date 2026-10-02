@@ -16,7 +16,11 @@ in a sibling:
     cv_eval.py       the `cv` evaluator: one OpenCV detector (or its fallback)
     text_eval.py     the `text` evaluator: deterministic search of a text layer
                      (one page, or a document's pages joined)
-    llm_eval.py      the `llm` evaluator: one scoring call, then maybe boxes
+    llm_eval.py      the `llm` evaluator: one scoring call (or its reference-
+                     guided calls, combined), then maybe boxes
+    references.py    a job's reference plan: which examples guide which
+                     criterion, their images, the position check, the result
+                     block — and the reference page's description call
     detector_eval.py the `detector` evaluator: the open-vocabulary service
     scheduler.py     (criterion, item) units, per-item dependency gating, the
                      per-job unit cap, error isolation
@@ -35,6 +39,7 @@ module a function lives in.
 
 from analysis.loading import (
     load_document_bytes,
+    load_document_page,
     load_input_bytes,
     validate_content_type,
 )
@@ -43,6 +48,7 @@ from analysis.pipeline import analyze_document
 __all__ = [
     "analyze_document",
     "load_document_bytes",
+    "load_document_page",
     "load_input_bytes",
     "validate_content_type",
 ]

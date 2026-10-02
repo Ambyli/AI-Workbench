@@ -49,8 +49,15 @@ from config import (
     MAX_UNITS_PER_JOB,
     OCR_WORKERS,
     PDF_RENDER_DPI,
+    REFERENCE_AUTO_MIN_CONFIDENCE,
+    REFERENCE_AUTO_POOL_MAX,
+    REFERENCE_DIR,
+    REFERENCE_MAX_COUNT,
+    REFERENCE_MAX_PER_CRITERION,
+    REFERENCE_MAX_PER_REQUEST,
     REGION_LAYER_FORMATS,
     TEXT_CHAR_BUDGET,
+    VISION_LLM_MAX_IMAGES_PER_PROMPT,
 )
 from cv import REGISTRY
 from cv.result import spec_of
@@ -233,7 +240,10 @@ def list_document_kinds():
                          "inclusive and counted at submit",
                 "pdf_render_dpi": PDF_RENDER_DPI,
                 "llm_text_char_budget": TEXT_CHAR_BUDGET,
-                "images_per_llm_prompt": 1,
+                # What one vision-model request may carry (the candidate plus
+                # reference examples); every call that is not reference-guided
+                # still sends one image.
+                "images_per_llm_prompt": VISION_LLM_MAX_IMAGES_PER_PROMPT,
                 "max_concurrent_jobs": MAX_CONCURRENT,
                 "max_units_per_job": MAX_UNITS_PER_JOB,
                 "max_llm_calls": MAX_LLM_CALLS,
@@ -267,6 +277,22 @@ def list_document_kinds():
                 "artifact_max_bytes_per_item": ARTIFACT_MAX_BYTES,
                 "artifact_ttl_hours": JOB_TTL_HOURS,
                 "sweep_interval_seconds": ARTIFACT_SWEEP_INTERVAL_S,
+            },
+            # Saved worked examples (POST /references) and what an /assess may
+            # ask of them on THIS container.
+            "references": {
+                "enabled": VISION_LLM_MAX_IMAGES_PER_PROMPT >= 2,
+                "images_per_llm_prompt": VISION_LLM_MAX_IMAGES_PER_PROMPT,
+                "contrastive": VISION_LLM_MAX_IMAGES_PER_PROMPT >= 3,
+                "max_count": REFERENCE_MAX_COUNT,
+                "max_per_request": REFERENCE_MAX_PER_REQUEST,
+                "max_per_criterion": REFERENCE_MAX_PER_CRITERION,
+                "auto": True,
+                "auto_pool_max": REFERENCE_AUTO_POOL_MAX,
+                "auto_min_confidence": REFERENCE_AUTO_MIN_CONFIDENCE,
+                "applies_to": "llm criteria, and cv criteria answered by the llm fallback",
+                "dir": REFERENCE_DIR,
+                "retention": "kept until DELETE /references/{id} — never swept",
             },
         }
     )

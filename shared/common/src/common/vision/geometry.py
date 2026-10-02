@@ -13,6 +13,10 @@ Rounding: nothing is rounded here. ``Region.as_dict`` rounds at the
 serialisation boundary; rounding mid-transform would compound across a
 working → original → points chain.
 
+Comparing two regions on DIFFERENT pages (a reference example's box and a
+candidate's) goes through ``normalize_region`` first — each becomes a
+fraction of its own page — and then ``iou`` / ``center_distance``.
+
 Process flow position: called by every region producer before it constructs a
 Region, and by the artifact endpoints when re-deriving PDF rectangles.
 """
@@ -213,3 +217,53 @@ def iou(a: Region, b: Region) -> float:
         return 0.0
     union = (ax2 - ax1) * (ay2 - ay1) + (bx2 - bx1) * (by2 - by1) - inter
     return inter / union if union > 0 else 0.0
+
+
+def normalize_region(region: Region, geometry: PageGeometry) -> Region:
+    """Return a copy of ``region`` in the page's unit square (0–1 on both axes).
+
+    Two regions on pages of different sizes — a reference example's box and
+    a candidate's — are only comparable once each is a fraction of its own
+    page. Each axis is divided by its own dimension, exactly as the 0–1000
+    grid is, so a box in the top-left tenth of a portrait page and of a
+    landscape page normalise to the same numbers. Coordinates are clamped to
+    0–1 (a stored region a hair outside its page must not score an overlap
+    with nothing). A zero-sized geometry yields a degenerate region at the
+    origin rather than a division error.
+
+    Args:
+        region:   A Region in ORIGINAL page pixels.
+        geometry: The page frame ``region`` lives in.
+
+    Returns:
+        A new Region with the same kind, label, source and attrs; the input is
+        not modified. Compare two of them with :func:`iou` and
+        :func:`center_distance`.
+    """
+    sx = 1.0 / geometry.width if geometry.width else 0.0
+    sy = 1.0 / geometry.height if geometry.height else 0.0
+    points = clamp_points([(x * sx, y * sy) for x, y in region.points], 1.0, 1.0)
+    return Region(
+        page=region.page,
+        kind=region.kind,
+        points=points,
+        label=region.label,
+        score=region.score,
+        source=region.source,
+        attrs=dict(region.attrs),
+    )
+
+
+def center_distance(a: Region, b: Region) -> float:
+    """Euclidean distance between the centres of two regions' bounding boxes.
+
+    In whatever units the regions are in: on two :func:`normalize_region`
+    outputs the result runs 0 (same centre) to √2 (opposite corners), so
+    dividing by ``math.sqrt(2)`` gives a 0–1 offset. Bounding boxes, for the
+    same reason as :func:`iou`.
+    """
+    ax1, ay1, ax2, ay2 = a.bounds()
+    bx1, by1, bx2, by2 = b.bounds()
+    dx = (ax1 + ax2) / 2.0 - (bx1 + bx2) / 2.0
+    dy = (ay1 + ay2) / 2.0 - (by1 + by2) / 2.0
+    return (dx * dx + dy * dy) ** 0.5

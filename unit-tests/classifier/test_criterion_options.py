@@ -346,3 +346,62 @@ def test_text_min_count_cap_is_the_config_knob():
     CriterionInput(name="total", type="text", options=ok)
     with pytest.raises(ValidationError):
         CriterionInput(name="total", type="text", options={"min_count": TEXT_MIN_COUNT_CAP + 1})
+
+
+# ── options.reference ──────────────────────────────────────────────────────
+
+
+def test_reference_resolves_only_when_sent():
+    from config import REFERENCE_POSITION_MIN_IOU
+
+    plain = CriterionInput(name="has a roof").resolved_options()
+    assert "reference" not in plain
+    guided = CriterionInput(name="has a roof", options={"reference": {}}).resolved_options()
+    assert guided["reference"] == {
+        "use": True, "criterion": "has a roof", "position": "off",
+        "min_iou": REFERENCE_POSITION_MIN_IOU, "combine": "any",
+    }
+    assert {k: v for k, v in guided.items() if k != "reference"} == plain
+    cv = CriterionInput(name="has a house", type="cv",
+                        options={"reference": {"criterion": "a house", "combine": "mean"}})
+    assert cv.resolved_options()["reference"]["criterion"] == "a house"
+
+
+@pytest.mark.parametrize("criterion, fragment", [
+    ({"name": "x", "type": "text", "options": {"reference": {}}}, "references guide the vision model"),
+    ({"name": "x", "type": "detector", "options": {"reference": {}}}, "references guide the vision model"),
+    ({"name": "sharpness", "type": "cv", "options": {"reference": {}}}, "OpenCV detector"),
+    ({"name": "has a house", "type": "cv", "options": {"fallback": "detector", "reference": {}}},
+     "the detector service"),
+    ({"name": "x", "options": {"reference": {"position": "check"}}}, "needs options.boxes: true"),
+    ({"name": "x", "options": {"hint": "quality", "boxes": True,
+                               "reference": {"position": "check"}}}, "needs options.boxes: true"),
+    ({"name": "x", "type": "cv", "options": {"reference": {"position": "check"}}},
+     "llm fallback runs without boxes"),
+    ({"name": "x", "options": {"reference": {"combine": "sum"}}}, "combine"),
+    ({"name": "x", "options": {"reference": {"min_iou": 2}}}, "min_iou"),
+    ({"name": "x", "options": {"reference": {"guide": True}}}, "guide"),
+])
+def test_bad_references_are_refused(criterion, fragment):
+    with pytest.raises(ValidationError) as exc:
+        CriterionInput.model_validate(criterion)
+    assert fragment in validation_message(exc.value)
+
+
+def test_position_check_with_boxes_is_accepted():
+    c = CriterionInput(name="x", options={"hint": "presence", "boxes": True,
+                                          "reference": {"position": "check", "min_iou": 0.5}})
+    assert c.reference_options()["position"] == "check"
+    assert c.reference_options()["min_iou"] == 0.5
+
+
+def test_criterion_types_has_a_reference_block():
+    from config import REFERENCE_MAX_PER_CRITERION, VISION_LLM_MAX_IMAGES_PER_PROMPT
+
+    block = criterion_types()["reference"]
+    assert block["options_schema"]["additionalProperties"] is False
+    assert set(block["defaults"]) == {"use", "criterion", "position", "min_iou", "combine"}
+    assert block["caps"]["max_per_criterion"] == REFERENCE_MAX_PER_CRITERION
+    assert block["caps"]["images_per_llm_prompt"] == VISION_LLM_MAX_IMAGES_PER_PROMPT
+    assert "reference" in criterion_types()["types"]["llm"]["options_schema"]["properties"]
+    assert "reference" not in criterion_types()["types"]["text"]["options_schema"]["properties"]

@@ -518,7 +518,7 @@
               "host": ["{{litellm}}"],
               "path": ["v1", "classifier", "health"]
             },
-            "description": "Pass-through to the classifier service — `pass_through_endpoints` mounts `/v1/classifier` → `http://classifier:8000` with methods GET/POST/DELETE. This is a simple health probe example; anything after `/v1/classifier/` reaches the upstream unchanged."
+            "description": "Pass-through to the classifier service — `pass_through_endpoints` mounts `/v1/classifier` → `http://classifier:8000` with methods GET/POST/PATCH/DELETE (PATCH is `PATCH /references/{id}`). This is a simple health probe example; anything after `/v1/classifier/` reaches the upstream unchanged."
           },
           "response": []
         },

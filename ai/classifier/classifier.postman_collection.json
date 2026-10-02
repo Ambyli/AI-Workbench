@@ -2,7 +2,7 @@
   "info": {
     "_postman_id": "classifier-collection",
     "name": "classifier",
-    "description": "Document Classifier — JPEG/PNG photos, PDFs of any page count, .txt and .docx, several documents per request, scored by OpenCV detectors, deterministic text matching, the open-vocabulary detector, and vision-LLM criteria — called through the LiteLLM pass-through registered in ai/litellm/litellm_config.yaml (`pass_through_endpoints` → `/v1/classifier` → `http://classifier:8000`, `include_subpath: true`, methods GET/POST/DELETE, `forward_headers: true`). Every request is authenticated with a Bearer token from a LiteLLM virtual key: set the collection variables `litellm` (e.g. http://localhost:4001) and `virtual master key` (an sk-… key from the LiteLLM Admin UI → Virtual Keys) — every request inherits them via collection-level auth. See ai/classifier/API.md for the full reference and ai/litellm/LITELLM.md for issuing keys.\n\nDirect base URL (bypassing LiteLLM, only inside ai_shared or when PORT_CLASSIFIER is published): http://classifier:8000 or http://<host>:${PORT_CLASSIFIER} — no auth there.\n\nONE analysis endpoint: POST /assess, as JSON (`{documents: [{type: base64|url|text, data}, …], criteria}` — or `{document: {…}}` for one; not both) or multipart (repeated `file` parts and/or `text` fields, plus `criteria` once). `/locate` and `/assess/compare` were removed (404); `/locate`'s job is `score: false` on a criterion. A criterion is `{name, type, weight, depends_on, score, options}` with the type-specific settings in `options` — GET /criterion-types has each type's schema, defaults and caps. Every page of every document is one ITEM (at most CLASSIFIER_MAX_ITEMS = 20 per request, counted at submit; 21 is a 400 with a per-document breakdown); each criterion runs once per item and `options.aggregate` collapses the per-item results — pages → per document → per request (API.md § Documents, pages and items).\n\nAsync-job pattern: POST /assess returns 202 with `{job_id, phase: \"pending\"}`; poll GET /jobs/:jobId until `phase` is `completed` or `failed`. The SQLite jobs table is the queue: CLASSIFIER_MAX_CONCURRENT (default 4) jobs at once; inside a job CLASSIFIER_MAX_UNITS_PER_JOB (2) (criterion, item) units at once; CLASSIFIER_MAX_LLM_CALLS (4) model calls and CLASSIFIER_OCR_WORKERS (4) OCR passes across the whole process. Copy a `job_id` into the `jobId` collection variable to run the GET/DELETE items.\n\nArtifacts: every job stores regions.json, one text.p<n>.<key>.json per item and text layer its criteria used (text.d<i>.<key>.json for a scope-document text search), one p<n>.base.jpg per item with an image, and a manifest with the item map; SVG / PNG / preview layers (p<n>.*) render on first fetch. See the Artifacts folder.\n\nFolders: `Documents` (one request per fixture in unit-tests/classifier/documents/, plus a two-page PDF and a three-document request), `Regions` (fixtures chosen for their geometry), `Documents + regions` (the document fixtures again, geometry-focused), `Artifacts` (the four artifact routes). `unit-tests/classifier/regions_report.py` runs the first three as a suite (REGIONS_REPORT.md).",
+    "description": "Document Classifier — JPEG/PNG photos, PDFs of any page count, .txt and .docx, several documents per request, scored by OpenCV detectors, deterministic text matching, the open-vocabulary detector, and vision-LLM criteria — called through the LiteLLM pass-through registered in ai/litellm/litellm_config.yaml (`pass_through_endpoints` → `/v1/classifier` → `http://classifier:8000`, `include_subpath: true`, methods GET/POST/PATCH/DELETE, `forward_headers: true`). Every request is authenticated with a Bearer token from a LiteLLM virtual key: set the collection variables `litellm` (e.g. http://localhost:4001) and `virtual master key` (an sk-… key from the LiteLLM Admin UI → Virtual Keys) — every request inherits them via collection-level auth. See ai/classifier/API.md for the full reference and ai/litellm/LITELLM.md for issuing keys.\n\nDirect base URL (bypassing LiteLLM, only inside ai_shared or when PORT_CLASSIFIER is published): http://classifier:8000 or http://<host>:${PORT_CLASSIFIER} — no auth there.\n\nONE analysis endpoint: POST /assess, as JSON (`{documents: [{type: base64|url|text, data}, …], criteria}` — or `{document: {…}}` for one; not both) or multipart (repeated `file` parts and/or `text` fields, plus `criteria` once). `/locate` and `/assess/compare` were removed (404); `/locate`'s job is `score: false` on a criterion. A criterion is `{name, type, weight, depends_on, score, options}` with the type-specific settings in `options` — GET /criterion-types has each type's schema, defaults and caps. Every page of every document is one ITEM (at most CLASSIFIER_MAX_ITEMS = 20 per request, counted at submit; 21 is a 400 with a per-document breakdown); each criterion runs once per item and `options.aggregate` collapses the per-item results — pages → per document → per request (API.md § Documents, pages and items).\n\nAsync-job pattern: POST /assess returns 202 with `{job_id, phase: \"pending\"}`; poll GET /jobs/:jobId until `phase` is `completed` or `failed`. The SQLite jobs table is the queue: CLASSIFIER_MAX_CONCURRENT (default 4) jobs at once; inside a job CLASSIFIER_MAX_UNITS_PER_JOB (2) (criterion, item) units at once; CLASSIFIER_MAX_LLM_CALLS (4) model calls and CLASSIFIER_OCR_WORKERS (4) OCR passes across the whole process. Copy a `job_id` into the `jobId` collection variable to run the GET/DELETE items.\n\nArtifacts: every job stores regions.json, one text.p<n>.<key>.json per item and text layer its criteria used (text.d<i>.<key>.json for a scope-document text search), one p<n>.base.jpg per item with an image, and a manifest with the item map; SVG / PNG / preview layers (p<n>.*) render on first fetch. See the Artifacts folder.\n\nFolders: `Documents` (one request per fixture in unit-tests/classifier/documents/, plus a two-page PDF and a three-document request), `Regions` (fixtures chosen for their geometry), `Documents + regions` (the document fixtures again, geometry-focused), `Artifacts` (the four artifact routes), `References` (saved worked examples — POST, list, read, files, PATCH, DELETE). `unit-tests/classifier/regions_report.py` runs the first three as a suite (REGIONS_REPORT.md).",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "auth": {
@@ -45,6 +45,18 @@
       "value": "",
       "type": "string",
       "description": "Base64 of unit-tests/classifier/documents/invoice_native.pdf, WITHOUT a data: prefix, for the JSON-body items. Fill it once: `base64 -w0 unit-tests/classifier/documents/invoice_native.pdf` (macOS: `base64 -i … | tr -d '\\n'`; PowerShell: [Convert]::ToBase64String([IO.File]::ReadAllBytes('…'))) and paste the output into this variable's CURRENT VALUE."
+    },
+    {
+      "key": "referenceId",
+      "value": "",
+      "type": "string",
+      "description": "reference_id returned by POST /references (`r` + 12 hex). Fill in to run the References folder's GET / PATCH / DELETE items and the /assess items that list a reference."
+    },
+    {
+      "key": "referenceFile",
+      "value": "record.json",
+      "type": "string",
+      "description": "A reference file name: page.jpg, working.jpg, c.<slug>.jpg (GET /references/:referenceId lists them), regions.json or record.json."
     }
   ],
   "item": [
@@ -414,6 +426,108 @@
       "response": []
     },
     {
+      "name": "POST /assess — JSON, with reference ids",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"documents\": [\n    {\n      \"type\": \"base64\",\n      \"data\": \"{{invoice_native_b64}}\",\n      \"filename\": \"invoice_native.pdf\"\n    }\n  ],\n  \"criteria\": [\n    {\n      \"name\": \"has a company logo\",\n      \"type\": \"llm\",\n      \"options\": {\n        \"hint\": \"presence\",\n        \"boxes\": true,\n        \"reference\": {\n          \"position\": \"check\",\n          \"combine\": \"any\"\n        }\n      }\n    },\n    {\n      \"name\": \"Net 30\",\n      \"type\": \"text\"\n    }\n  ],\n  \"references\": [\n    \"{{referenceId}}\"\n  ]\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{litellm}}/v1/classifier/assess",
+          "host": [
+            "{{litellm}}"
+          ],
+          "path": [
+            "v1",
+            "classifier",
+            "assess"
+          ]
+        },
+        "description": "Guide llm criteria with stored examples. Each llm-answered criterion is matched by name (case-insensitive, or `options.reference.criterion`) to the listed references' usable criteria; with a PASS and a FAIL example the scoring call is ONE contrastive call with three images (example, counter-example, candidate). `options.reference`: use, criterion, position (off | check — needs boxes; a miss caps the score), min_iou, combine (any | all | mean). The answer is in each unit's `detail.reference` and the result's top-level `references`; the job writes references.json. Errors: 400 for every reference rule (no references with options.reference, options.reference on text / detector / OpenCV cv, unknown ids, more than CLASSIFIER_REFERENCE_MAX_PER_CRITERION examples, position check vs a whole-page example, …); 409 a reference not ready. Set `referenceId` first. See API.md § References."
+      },
+      "response": []
+    },
+    {
+      "name": "POST /assess — JSON, criteria inherited from references",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"documents\": [\n    {\n      \"type\": \"base64\",\n      \"data\": \"{{invoice_native_b64}}\",\n      \"filename\": \"invoice_native.pdf\"\n    }\n  ],\n  \"references\": [\n    \"{{referenceId}}\"\n  ]\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{litellm}}/v1/classifier/assess",
+          "host": [
+            "{{litellm}}"
+          ],
+          "path": [
+            "v1",
+            "classifier",
+            "assess"
+          ]
+        },
+        "description": "`criteria` omitted with explicit reference ids → the references' own criteria, merged by name in list order (a name defined differently in two references is a 400 naming both). The result's `request.criteria` shows what ran and `references.inherited` is true. Without references an omitted `criteria` still means the four default quality criteria."
+      },
+      "response": []
+    },
+    {
+      "name": "POST /assess — JSON, references auto with tags",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"documents\": [\n    {\n      \"type\": \"base64\",\n      \"data\": \"{{invoice_native_b64}}\",\n      \"filename\": \"invoice_native.pdf\"\n    }\n  ],\n  \"criteria\": [\n    {\n      \"name\": \"has a company logo\",\n      \"type\": \"llm\",\n      \"options\": {\n        \"hint\": \"presence\"\n      }\n    }\n  ],\n  \"references\": {\n    \"auto\": true,\n    \"tags\": [\n      \"invoices\"\n    ],\n    \"tags_match\": \"any\"\n  }\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{litellm}}/v1/classifier/assess",
+          "host": [
+            "{{litellm}}"
+          ],
+          "path": [
+            "v1",
+            "classifier",
+            "assess"
+          ]
+        },
+        "description": "Let the service pick examples: the pool is fixed at submit (ready references with a usable criterion matching one of these criteria, carrying all / any of the tags, newest first, at most CLASSIFIER_REFERENCE_AUTO_POOL_MAX); each page item then makes ONE selection call (the page as its one image plus a text catalogue of the pool), and each criterion keeps the matches at or above CLASSIFIER_REFERENCE_AUTO_MIN_CONFIDENCE. A failed selection only degrades — the error is in `references.selection`. `criteria` is required (400 without)."
+      },
+      "response": []
+    },
+    {
       "name": "GET /jobs",
       "request": {
         "method": "GET",
@@ -502,6 +616,332 @@
         "description": "Delete the job row AND its artifact directory (the router's `on_delete` hook removes the directory first, so no files are left that nothing points at — the `text.*.json` layers go with it). **404** for an unknown job id. A running job is not interrupted. See API.md § `DELETE /jobs/{job_id}`."
       },
       "response": []
+    },
+    {
+      "name": "References",
+      "description": "Saved worked examples (API.md § References). A reference is ONE page — a JPEG/PNG, or one page of a PDF — with the criteria asked of it, the answer each should get and where the feature is; an /assess that lists it shows the vision model the example beside the candidate. LLM-only: llm criteria and cv names answered by the llm fallback. Creating one runs a `reference` job (visible in GET /jobs); poll GET /references/:referenceId until `status` is ready or failed. Kept until DELETE — never swept. PATCH needs `PATCH` in the LiteLLM /v1/classifier pass-through's methods.",
+      "item": [
+        {
+          "name": "POST /references — JSON, a document page",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"document\": {\n    \"type\": \"base64\",\n    \"data\": \"{{invoice_native_b64}}\",\n    \"filename\": \"invoice_native.pdf\"\n  },\n  \"page\": 0,\n  \"criteria\": [\n    {\n      \"name\": \"has a company logo\",\n      \"type\": \"llm\",\n      \"options\": {\n        \"hint\": \"presence\"\n      }\n    },\n    {\n      \"name\": \"a roof\",\n      \"type\": \"llm\",\n      \"options\": {\n        \"hint\": \"presence\"\n      }\n    }\n  ],\n  \"breakdown\": {\n    \"has a company logo\": {\n      \"score\": 10,\n      \"reason\": \"the logo, top left\"\n    }\n  },\n  \"regions\": {\n    \"has a company logo\": [\n      {\n        \"box\": [\n          40,\n          30,\n          320,\n          140\n        ]\n      }\n    ]\n  },\n  \"region_units\": \"grid\",\n  \"title\": \"Native invoice, logo top left\",\n  \"tags\": [\n    \"invoices\",\n    \"acme\"\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/references",
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "classifier",
+                "references"
+              ]
+            },
+            "description": "Save a worked example from a document. `breakdown` is the answer key (`verdict` optional, must match the score); `regions` says where (`[]` = the whole page; a name left out is located by the creation job); `region_units` px (original page pixels) or grid (0-1000, recommended for PDFs). `a roof` has no breakdown, so the creation job classifies it, and — presence, no regions — locates it with boxes forced on. `description` omitted → generated by one model call (CLASSIFIER_REFERENCE_DESCRIBE). Returns 202 `{reference_id, status: \"pending\", job_id}`. Errors: 400 for any malformed input (a .txt / .docx, a page the PDF does not have, a region off the page, a verdict that disagrees with its score, a breakdown / regions key naming no criterion, grid coordinates past 1000); 409 at CLASSIFIER_REFERENCE_MAX_COUNT. Fill `invoice_native_b64` or swap in your own base64 image. See API.md § References — Creating one."
+          },
+          "response": []
+        },
+        {
+          "name": "POST /references — multipart, an uploaded photo",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": "unit-tests/classifier/Neighborhood.jpeg",
+                  "description": "The example page."
+                },
+                {
+                  "key": "criteria",
+                  "type": "text",
+                  "value": "[{\"name\": \"has a house\", \"type\": \"llm\", \"options\": {\"hint\": \"presence\"}}]",
+                  "description": "JSON array — the same CriterionInput list /assess takes."
+                },
+                {
+                  "key": "breakdown",
+                  "type": "text",
+                  "value": "{\"has a house\": {\"score\": 10, \"reason\": \"two-storey houses along the street\"}}",
+                  "description": "{name: {score, verdict?, reason?}}"
+                },
+                {
+                  "key": "regions",
+                  "type": "text",
+                  "value": "{\"has a house\": []}",
+                  "description": "[] = the whole page is the example."
+                },
+                {
+                  "key": "title",
+                  "type": "text",
+                  "value": "Street of houses"
+                },
+                {
+                  "key": "description",
+                  "type": "text",
+                  "value": "A residential street of detached houses seen from above."
+                },
+                {
+                  "key": "tags",
+                  "type": "text",
+                  "value": "houses"
+                },
+                {
+                  "key": "tags",
+                  "type": "text",
+                  "value": "aerial"
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/references",
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "classifier",
+                "references"
+              ]
+            },
+            "description": "The same request as a form: ONE `file` part (or the legacy `image`), `criteria` / `breakdown` / `regions` as JSON strings, `tags` repeated once per tag (or one JSON array). Everything here is supplied — a breakdown and regions for every criterion, and a description — so the creation job makes NO model call. A `text` field or a second file is a 400. Returns 202. See API.md § References."
+          },
+          "response": []
+        },
+        {
+          "name": "POST /references — from_job, a reviewed /assess job",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"from_job\": \"{{jobId}}\",\n  \"from_job_item\": 0,\n  \"title\": \"Reviewed job, item 0\",\n  \"tags\": [\n    \"reviewed\"\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/references",
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "classifier",
+                "references"
+              ]
+            },
+            "description": "Save item `from_job_item` of a COMPLETED /assess job. The page is the job's p<item>.base.jpg (original pixels); the criteria are the job's `result.request.criteria` (rebuilt from options_used, with a warning, for an older job); each criterion's answer on that item and its accepted regions are taken as supplied, so this usually costs no model call. `breakdown` / `regions` here still win over the job's. Errors: 404 unknown job; 409 not a completed /assess job; 400 an item it does not have or one with no page image; 410 the job's artifacts are gone (TTL sweeper, DELETE, or the byte cap dropped the base image). Set `jobId` first."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /references",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/references?status=ready&limit=50&offset=0",
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "classifier",
+                "references"
+              ],
+              "query": [
+                {
+                  "key": "status",
+                  "value": "ready",
+                  "description": "pending | ready | failed"
+                },
+                {
+                  "key": "tag",
+                  "value": "houses",
+                  "disabled": true,
+                  "description": "Only references with this tag (case-insensitive)."
+                },
+                {
+                  "key": "limit",
+                  "value": "50",
+                  "description": "1-200"
+                },
+                {
+                  "key": "offset",
+                  "value": "0"
+                }
+              ]
+            },
+            "description": "Reference summaries, newest first: `{references: [...], total, limit, offset}`. A summary is reference_id, status, title, description, description_source, tags, job_id, source, error, created_at, updated_at and `criteria` ([{name, type, guides_llm, usable, verdict, score, region_source}]) — never the record. 400 for an unknown status. See API.md § Endpoints."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /references/:referenceId",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/references/:referenceId",
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "classifier",
+                "references",
+                ":referenceId"
+              ],
+              "variable": [
+                {
+                  "key": "referenceId",
+                  "value": "",
+                  "description": "reference_id returned by POST /references (202 body), `r` + 12 hex. Paste it here, or set the collection variable `referenceId`."
+                }
+              ]
+            },
+            "description": "One reference: the summary, the frozen `record` (per criterion: input, slug, guides_llm, expected {score, verdict, reason, source: caller | pipeline}, observed, regions in page pixels, region_source caller | pipeline | whole_page, composite, usable; the page; source; warnings) and `files` with their URLs. `record` is null until ready. 404 for an unknown or malformed id."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /references/:referenceId/files/:referenceFile",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/references/:referenceId/files/:referenceFile",
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "classifier",
+                "references",
+                ":referenceId",
+                "files",
+                ":referenceFile"
+              ],
+              "variable": [
+                {
+                  "key": "referenceId",
+                  "value": "",
+                  "description": "reference_id returned by POST /references (202 body), `r` + 12 hex. Paste it here, or set the collection variable `referenceId`."
+                },
+                {
+                  "key": "referenceFile",
+                  "value": "",
+                  "description": "A reference file: page.jpg, working.jpg, c.<slug>.jpg (one per usable criterion — the names are in GET /references/:referenceId `files`), regions.json or record.json. Anything else is a 400."
+                }
+              ]
+            },
+            "description": "One file of a reference: page.jpg, working.jpg, c.<slug>.jpg (the exact composite an example shows the model), regions.json or record.json. The name is checked against that grammar before the disk is touched — anything else is a 400; a missing file or reference is a 404."
+          },
+          "response": []
+        },
+        {
+          "name": "PATCH /references/:referenceId",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"title\": \"Brick house, front (reviewed)\",\n  \"tags\": [\n    \"houses\",\n    \"reviewed\"\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/references/:referenceId",
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "classifier",
+                "references",
+                ":referenceId"
+              ],
+              "variable": [
+                {
+                  "key": "referenceId",
+                  "value": "",
+                  "description": "reference_id returned by POST /references (202 body), `r` + 12 hex. Paste it here, or set the collection variable `referenceId`."
+                }
+              ]
+            },
+            "description": "Edit the catalogue metadata — `title`, `description`, `tags` — and nothing else: the content (criteria, answers, regions, page) is immutable, so a new answer key is a new reference. An explicit null clears a title or description. Returns the full reference. 400 for an empty body or any other key; 404 unknown. Through LiteLLM this needs PATCH in the pass-through's methods (ai/litellm/litellm_config.yaml)."
+          },
+          "response": []
+        },
+        {
+          "name": "DELETE /references/:referenceId",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/references/:referenceId?",
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "classifier",
+                "references",
+                ":referenceId"
+              ],
+              "query": [
+                {
+                  "key": "force",
+                  "value": "true",
+                  "disabled": true,
+                  "description": "Delete even while a queued or running job reads it; that job's guided units then fail."
+                }
+              ],
+              "variable": [
+                {
+                  "key": "referenceId",
+                  "value": "",
+                  "description": "reference_id returned by POST /references (202 body), `r` + 12 hex. Paste it here, or set the collection variable `referenceId`."
+                }
+              ]
+            },
+            "description": "Delete the reference and its directory. 204; 404 unknown; 409 while a queued or running job reads it — its own creation job while pending, or an /assess listing it (metadata.references: the explicit ids or the auto pool) — naming the jobs. Enable `force=true` to delete anyway."
+          },
+          "response": []
+        }
+      ]
     },
     {
       "name": "Documents",

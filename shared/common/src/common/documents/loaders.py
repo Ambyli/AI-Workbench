@@ -328,6 +328,40 @@ def pdf_page_count(raw: bytes) -> int:
             doc.close()
 
 
+def pdf_page_size(
+    raw: bytes, index: int = 0, *, render_dpi: int = DEFAULT_RENDER_DPI
+) -> tuple[int, int]:
+    """The ``(width, height)`` in pixels page ``index`` renders to at ``render_dpi``.
+
+    The size ``load_document`` would give that page, WITHOUT rendering it:
+    the page rectangle is transformed by the same zoom matrix
+    ``get_pixmap(dpi=…)`` builds and its integer rectangle read off. Lets a
+    request handler check caller-supplied pixel coordinates against a PDF
+    page it has not rasterised yet.
+
+    Raises:
+        UnsupportedDocumentError: PyMuPDF cannot open the stream.
+        IndexError: ``index`` is not a page of this PDF.
+    """
+    import pymupdf
+
+    with _PYMUPDF_LOCK:
+        try:
+            doc = pymupdf.open(stream=raw, filetype="pdf")
+        except Exception as exc:
+            raise UnsupportedDocumentError(f"Could not open PDF: {exc}") from exc
+        try:
+            if not 0 <= index < doc.page_count:
+                raise IndexError(f"page {index} is not in a {doc.page_count}-page PDF")
+            page = doc.load_page(index)
+            zoom = render_dpi / 72.0
+            rect = page.rect * pymupdf.Matrix(zoom, zoom)
+            irect = rect.irect
+            return int(irect.width), int(irect.height)
+        finally:
+            doc.close()
+
+
 # ---------------------------------------------------------------------------
 # Native-PDF geometry for a text hit
 # ---------------------------------------------------------------------------

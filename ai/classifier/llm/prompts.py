@@ -6,13 +6,26 @@ other:
     build_llm_prompt()    — the SCORING call: ONE criterion, the rubric for
                             its hint (from ``config.HINT_RUBRICS``), the text
                             layer that criterion's OCR settings produced, and
-                            at most ONE page image. The answer is one flat
-                            JSON object — score, verdict, confidence, reason.
+                            the ONE candidate page image — preceded, when the
+                            request lists references, by one or two worked
+                            EXAMPLES (``ReferenceExample``), each a captioned
+                            image with its known answer. The answer is one
+                            flat JSON object — score, verdict, confidence,
+                            reason.
+    ReferenceExample      — one example as the prompt needs it: a plain
+                            dataclass, so ``llm`` never imports ``references``.
     build_bbox_prompt()   — the enforcement loop's "where is it?": one
                             criterion, one image, a box on a 0-1000 grid, and
                             the previous attempts' rejections as feedback.
     build_verify_prompt() — the enforcement loop's check: the CROP alone, "is
                             <criterion> visible in this?", 1-10.
+    build_describe_prompt() — a reference example's catalogue line: ONE page
+                            image, "what is this, in a sentence or two" — no
+                            criterion, no judgement.
+    build_reference_selection_prompt() — ``references: "auto"``: ONE image (the
+                            candidate page) and the text catalogue of the
+                            candidate references; "which of these are useful
+                            examples for this page?", ranked with confidences.
     _system_prompt()      — the shared system prompt for the two small calls,
                             carrying the ``Reasoning strength`` line.
 
@@ -24,29 +37,41 @@ merge. The loop's small calls stay separate from the scoring call for the
 same reason they always were — "and give me a box" would change the JSON the
 scoring call has to produce.
 
-ONE IMAGE PER PROMPT. The vision model (muse-glimmer) is served by vLLM
-WITHOUT ``--limit-mm-per-prompt``, which means a request may contain at most
-one image — a second one fails the whole call. Every call is about ONE item
-(one page of one document), so the scoring call attaches THAT page image (or
-none, for .txt / .docx);
-``build_bbox_prompt`` attaches that same page (gridded) or a refine crop, and
-``build_verify_prompt`` attaches the ONE crop — never two images together.
+IMAGES PER PROMPT. Every call is about ONE item (one page of one document),
+and every call that is not reference-guided attaches exactly one image (or
+none, for .txt / .docx): the plain scoring call the page, ``build_bbox_prompt``
+that page (gridded) or a refine crop, ``build_verify_prompt`` the ONE crop,
+``build_describe_prompt`` the reference page,
+``build_reference_selection_prompt`` the candidate page (the references
+themselves are a text catalogue, not images). Only a scoring call WITH
+reference examples carries more — the example composite(s) first, then the
+candidate — and never more than VISION_LLM_MAX_IMAGES_PER_PROMPT, which must
+match muse-glimmer's ``--limit-mm-per-prompt`` (3: a PASS example, a FAIL
+example and the candidate; ``analysis.llm_eval`` plans the calls to fit).
+``build_llm_prompt(..., references=None)`` is byte-for-byte the prompt this
+service sent before references existed, which a test pins.
 
 The rubric strings (HINT_RUBRICS) and the extracted-text block heading
 (DOCUMENT_TEXT_HEADING) live in config.py § LLM prompt text, so prompt wording
 can be tuned without touching the assembly logic here.
 
-Process flow position: called by ``analysis.llm_eval`` (the scoring prompt)
-and ``llm.boxes`` (the other two); the result goes to ``llm.client``.
+Process flow position: called by ``analysis.llm_eval`` (the scoring prompt),
+``llm.boxes`` (the loop's two) and ``analysis.references`` (the describe
+call); the result goes to ``llm.client``.
 """
 
 import json
+from dataclasses import dataclass
+from typing import Optional
 
 from config import (
     DOCUMENT_TEXT_HEADING,
     HINT_RUBRICS,
     LLM_BBOX_GRID,
     LLM_BBOX_MAX_TOKENS,
+    REFERENCE_DESCRIBE_MAX_TOKENS,
+    REFERENCE_DESCRIPTION_MAX_CHARS,
+    REFERENCE_SELECT_MAX_TOKENS,
     VISION_LLM_MAX_TOKENS,
     VISION_LLM_MODEL,
     VISION_LLM_REASONING_STRENGTH,
@@ -55,6 +80,62 @@ from logger import logger
 
 # The answer the scoring call is asked for, verbatim in the prompt.
 SCORING_SCAFFOLD: dict = {"score": 0, "verdict": "...", "confidence": 0, "reason": "..."}
+
+# The text block that separates the examples from what is being scored.
+CANDIDATE_HEADING = "CANDIDATE — score only this image"
+
+# Said once, beside the examples: what an example is for and what it is not.
+REFERENCE_GUARD = (
+    "The image(s) above are reference examples with known answers, shown so you know "
+    "what this criterion means here. Do not reward resemblance the criterion does not "
+    "ask about, and do not score the examples."
+)
+
+
+@dataclass(frozen=True)
+class ReferenceExample:
+    """One worked example for the scoring prompt.
+
+    Attributes:
+        criterion:  The reference criterion's name (the example's question).
+        verdict:    Its expected verdict — PASS, MARGINAL or FAIL.
+        score:      Its expected 1-10 score.
+        reason:     The expected answer's reason ("" when none was given).
+        image_b64:  The composite: the reference's working image with the
+                    criterion's regions drawn on it.
+        whole_page: True when no region was drawn — the whole image is the
+                    example.
+    """
+
+    criterion: str
+    verdict: str
+    score: int
+    reason: str
+    image_b64: str
+    whole_page: bool = False
+
+    def caption(self) -> str:
+        """The sentence shown just before this example's image."""
+        where = (
+            "the whole image is the example" if self.whole_page
+            else "the coloured box outlines it"
+        )
+        why = f": {self.reason}" if self.reason else ""
+        if self.verdict == "FAIL":
+            return (
+                f"REFERENCE EXAMPLE — in this reference '{self.criterion}' was FAIL "
+                f"({self.score}) — an example of what does NOT satisfy the criterion"
+                f"{why}; {where}."
+            )
+        if self.verdict == "MARGINAL":
+            return (
+                f"REFERENCE EXAMPLE — in this reference '{self.criterion}' was MARGINAL "
+                f"({self.score}) — a borderline case{why}; {where}."
+            )
+        return (
+            f"REFERENCE EXAMPLE — in this reference '{self.criterion}' was PASS "
+            f"({self.score}){why}; {where}."
+        )
 
 
 def build_llm_prompt(
@@ -65,6 +146,7 @@ def build_llm_prompt(
     *,
     document_kind: str = "image",
     text_truncated: bool = False,
+    references: Optional[list[ReferenceExample]] = None,
 ) -> dict:
     """Assemble the vLLM chat completion request for ONE criterion.
 
@@ -72,9 +154,14 @@ def build_llm_prompt(
       * ``document_text`` (already truncated to CLASSIFIER_TEXT_CHAR_BUDGET by
         the caller) is appended as a clearly-labelled block, and the system
         prompt tells the model it may use image and text together.
-      * At most ONE image is attached — see the module docstring. Pass None
-        for a text-only document (.txt / .docx); the content array then holds
-        text only and the response format is unchanged.
+      * The candidate is at most ONE image. Pass None for a text-only
+        document (.txt / .docx); the content array then holds text only and
+        the response format is unchanged.
+      * ``references`` (worked examples) come FIRST, each as its caption then
+        its image, followed by the CANDIDATE heading and the candidate image,
+        then the usual text — and one sentence in the system prompt. Only the
+        candidate's text layer is ever sent. None or [] is byte-for-byte the
+        prompt without references (see the module docstring).
 
     Args:
         image_b64:      Base64-encoded JPEG of the (resized) page image, or
@@ -84,12 +171,14 @@ def build_llm_prompt(
         document_text:  The text layer for this criterion ("" if none).
         document_kind:  "image" | "pdf" | "txt" | "docx", for context.
         text_truncated: True when document_text was cut at the char budget.
+        references:     Worked examples to show before the candidate.
 
     Returns:
         A dict ready to POST to the vLLM /v1/chat/completions endpoint.
     """
     logger.debug(
-        "build_llm_prompt: '%s' hint=%s image_b64[%s] kind=%s text=%d chars",
+        "build_llm_prompt: '%s' hint=%s image_b64[%s] kind=%s text=%d chars "
+        f"examples={len(references or [])}",
         name,
         hint,
         f"{len(image_b64)} chars" if image_b64 else "none",
@@ -165,12 +254,29 @@ def build_llm_prompt(
         "Set confidence to a number 0-100: 0 = completely uncertain, 100 = completely certain. "
         "Return ONLY a valid JSON object."
     )
+    if references:
+        system_prompt += (
+            " Reference examples with known answers come first; score ONLY the image "
+            "marked CANDIDATE."
+        )
     if VISION_LLM_REASONING_STRENGTH:
         # Muse Glimmer reads its reasoning depth from this system-prompt line
         # (see ai/vllm/VLLM.md "Parsers and sampling"). Other models ignore it.
         system_prompt += f"\nReasoning strength: {VISION_LLM_REASONING_STRENGTH}"
 
     user_content: list[dict] = []
+    for example in references or []:
+        user_content.append({"type": "text", "text": example.caption()})
+        user_content.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{example.image_b64}"},
+            }
+        )
+    if references:
+        user_content.append(
+            {"type": "text", "text": f"{REFERENCE_GUARD}\n\n{CANDIDATE_HEADING}:"}
+        )
     if image_b64:
         user_content.append(
             {
@@ -344,9 +450,8 @@ def build_verify_prompt(crop_b64: str, name: str) -> dict:
     with no surroundings and still says "solar panels" is.
 
     The crop is the ONE image in this call — the page it came from is
-    deliberately absent, both because vLLM accepts one image per request and
-    because showing the page back would reintroduce exactly the context the
-    check is trying to remove.
+    deliberately absent, because showing the page back would reintroduce
+    exactly the context the check is trying to remove.
 
     Args:
         crop_b64: Base64 JPEG of the padded crop, taken from the ORIGINAL
@@ -393,5 +498,136 @@ def build_verify_prompt(crop_b64: str, name: str) -> dict:
             },
         ],
         "max_tokens": LLM_BBOX_MAX_TOKENS,
+        "response_format": {"type": "json_object"},
+    }
+
+
+def build_describe_prompt(image_b64: str, *, document_kind: str = "image") -> dict:
+    """Ask for a short, neutral description of ONE reference page.
+
+    The description is a catalogue line: it is what ``references: "auto"``
+    reads to decide which stored examples are worth showing beside a
+    candidate, so it names what the page IS and what is distinctive about it
+    — never how good it is, and never an answer to a criterion (the
+    reference's answers are stored separately, and a description that
+    repeated them would bias the selection).
+
+    Args:
+        image_b64:     Base64 JPEG of the working page image — the one image.
+        document_kind: "image" | "pdf", for the opening sentence.
+
+    Returns:
+        A dict ready to POST to the vLLM /v1/chat/completions endpoint.
+    """
+    what = "photo or image" if document_kind == "image" else f"page of a {document_kind}"
+    scaffold = json.dumps({"description": "..."}, indent=2)
+    user_text = (
+        f"Describe this {what} in one or two sentences for a catalogue of example "
+        "documents: what kind of document or scene it is, and the visible features "
+        "that set it apart (layout, notable objects, headings). Be factual and "
+        "specific. Do not judge its quality and do not guess at anything you "
+        f"cannot see. At most {REFERENCE_DESCRIPTION_MAX_CHARS} characters.\n\n"
+        "Return ONLY this JSON object:\n\n"
+        f"{scaffold}"
+    )
+    return {
+        "model": VISION_LLM_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": _system_prompt(
+                    "You write short, factual catalogue descriptions of images. "
+                    "Return ONLY a valid JSON object."
+                ),
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"},
+                    },
+                    {"type": "text", "text": user_text},
+                ],
+            },
+        ],
+        "max_tokens": REFERENCE_DESCRIBE_MAX_TOKENS,
+        "response_format": {"type": "json_object"},
+    }
+
+
+def build_reference_selection_prompt(
+    image_b64: str,
+    catalogue: str,
+    criteria: list[str],
+    *,
+    document_kind: str = "image",
+) -> dict:
+    """Ask which stored references are useful examples for ONE candidate page.
+
+    The candidate page is the ONE image; the references are described in
+    text (``references.render.catalogue_text``: id, title, description, tags,
+    and each usable criterion with its expected verdict). The model ranks
+    the references that show the same kind of document or scene — whose
+    answers would teach it what the criteria mean HERE — with a 0-100
+    confidence each. It does not score anything: the scoring calls come
+    after, with the chosen examples' images.
+
+    Args:
+        image_b64:     Base64 JPEG of the candidate's working page image.
+        catalogue:     The pool as catalogue text.
+        criteria:      The names of the criteria the examples are for.
+        document_kind: "image" | "pdf", for the opening sentence.
+
+    Returns:
+        A dict ready to POST to the vLLM /v1/chat/completions endpoint.
+    """
+    what = "photo or image" if document_kind == "image" else f"{document_kind} page"
+    names = ", ".join(f"'{n}'" for n in criteria)
+    scaffold = json.dumps(
+        {"matches": [{"id": "r0123456789ab", "confidence": 0, "reason": "..."}]}, indent=2
+    )
+    user_text = (
+        f"The attached {what} is about to be assessed against these criteria: {names}.\n\n"
+        "Below is a catalogue of stored reference examples, each with its known answers. "
+        "Pick the references that show the SAME kind of document or scene as the attached "
+        "image, so that their known answers are useful worked examples for judging it. A "
+        "reference about a different kind of thing is not useful, however its answers "
+        "read.\n\n"
+        f"CATALOGUE:\n{catalogue}\n\n"
+        "Rules:\n"
+        "  - List only references that apply, best first; an empty list is a valid answer.\n"
+        "  - 'id' is copied exactly from the catalogue.\n"
+        "  - 'confidence' is 0-100: how sure you are the reference is a useful example here.\n"
+        "  - 'reason' says in one sentence what the image and the reference have in common.\n\n"
+        "Return ONLY this JSON object:\n\n"
+        f"{scaffold}"
+    )
+    logger.debug(
+        "build_reference_selection_prompt: %d criteria, catalogue %d chars",
+        len(criteria), len(catalogue),
+    )
+    return {
+        "model": VISION_LLM_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": _system_prompt(
+                    "You match an image to stored reference examples. You rank catalogue "
+                    "entries; you do not score the image. Return ONLY a valid JSON object."
+                ),
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"},
+                    },
+                    {"type": "text", "text": user_text},
+                ],
+            },
+        ],
+        "max_tokens": REFERENCE_SELECT_MAX_TOKENS,
         "response_format": {"type": "json_object"},
     }

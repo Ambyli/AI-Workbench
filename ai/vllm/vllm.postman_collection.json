@@ -422,7 +422,7 @@
               "host": ["{{vllm_muse_glimmer}}"],
               "path": ["v1", "chat", "completions"]
             },
-            "description": "Multimodal chat completion — text + image_url content parts. Up to 4096 visual tokens per image; vLLM's default --limit-mm-per-prompt allows one image per request (400 `At most 1 image(s) may be provided in one request` beyond that — raise the limit in docker-compose.vllm.yml if needed). If the container is stopped: connection refused.",
+            "description": "Multimodal chat completion — text + image_url content parts. Up to 4096 visual tokens per image; vLLM's default --limit-mm-per-prompt allows one image per request (400 `At most 1 image(s) may be provided in one request` beyond that — raise the limit in docker-compose.vllm.yml if needed); muse-glimmer runs with `--limit-mm-per-prompt '{\"image\": 3}'` for the classifier's reference-guided calls. If the container is stopped: connection refused.",
             "body": {
               "mode": "raw",
               "raw": "{\n  \"model\": \"muse-glimmer\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": [\n        {\"type\": \"text\", \"text\": \"What is shown here?\"},\n        {\"type\": \"image_url\", \"image_url\": {\"url\": \"https://upload.wikimedia.org/wikipedia/commons/thumb/4/47/PNG_transparency_demonstration_1.png/280px-PNG_transparency_demonstration_1.png\"}}\n      ]\n    }\n  ],\n  \"max_tokens\": 256\n}",

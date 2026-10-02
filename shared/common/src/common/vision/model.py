@@ -34,10 +34,14 @@ RegionKind = Literal["box", "polygon"]
 # Where a region came from. The renderer maps each source to a stroke style
 # (see ``common.vision.palette``) so a layer stays readable in one colour per
 # criterion: solid = cv/detector/pdf-text, dashed = ocr, dotted = llm,
-# double = diff.
-RegionSource = Literal["cv", "ocr", "pdf-text", "llm", "detector", "diff"]
+# double = diff, heavy solid = manual. "manual" is a region a PERSON drew —
+# an answer key supplied by a caller (a classifier reference example, say)
+# rather than something any producer found.
+RegionSource = Literal["cv", "ocr", "pdf-text", "llm", "detector", "diff", "manual"]
 
-REGION_SOURCES: tuple[str, ...] = ("cv", "ocr", "pdf-text", "llm", "detector", "diff")
+REGION_SOURCES: tuple[str, ...] = (
+    "cv", "ocr", "pdf-text", "llm", "detector", "diff", "manual",
+)
 
 
 def _as_points(points: Sequence[Any]) -> list[tuple[float, float]]:

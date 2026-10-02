@@ -14,7 +14,10 @@ DETECTOR_URL is configured and "llm" otherwise, unless the caller chose:
                          boxes (``analysis.detector_eval``), at
                          DETECTOR_MIN_SCORE
     fallback "llm"       the vision model scores it with the default llm
-                         options (hint auto, no boxes, ocr auto)
+                         options (hint auto, no boxes, ocr auto) — guided by
+                         the request's references exactly as an llm criterion
+                         is (``options.reference`` on a cv criterion is only
+                         accepted when this is the path that answers)
 
 The result's ``method`` says which path actually answered.
 
@@ -93,8 +96,9 @@ async def evaluate(c: CriterionInput, ctx: DocumentContext) -> Outcome:
         if fallback == "detector":
             outcome = await detector_eval.evaluate_label(c.name, ctx, DETECTOR_MIN_SCORE)
         else:
+            guide = ctx.references.guide(c, ctx.item) if ctx.references is not None else None
             outcome = await llm_eval.evaluate_with(
-                c.name, LLMOptions().resolve(c.name), ctx
+                c.name, LLMOptions().resolve(c.name), ctx, reference=guide
             )
         note = f"No OpenCV detector matches '{c.name}'; answered by the {fallback} fallback."
         outcome.reason = f"{note} {outcome.reason or ''}".strip()

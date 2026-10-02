@@ -10,13 +10,18 @@ from __future__ import annotations
 
 import math
 
+import pytest
+
 from common.vision import (
     PageGeometry,
     Region,
+    REGION_SOURCES,
     box_region,
+    center_distance,
     clamp_points,
     grid_to_pixels,
     iou,
+    normalize_region,
     pixels_to_grid,
     pixels_to_points,
     points_to_pixels,
@@ -167,3 +172,45 @@ def test_iou_half_overlap():
     b = box_region((5, 0, 15, 10), "b")
     # intersection 50, union 150
     assert math.isclose(iou(a, b), 1 / 3, rel_tol=1e-9)
+
+
+# ── comparing regions across pages ─────────────────────────────────────────
+def test_normalize_region_is_a_fraction_of_its_own_page():
+    geom = _geom(width=2000, height=1000)
+    region = box_region((200, 100, 1000, 500), "a", source="manual", attrs={"k": 1})
+    unit = normalize_region(region, geom)
+    assert unit.points == [(0.1, 0.1), (0.5, 0.5)]
+    assert (unit.label, unit.source, unit.attrs) == ("a", "manual", {"k": 1})
+    # The input is untouched.
+    assert region.points == [(200.0, 100.0), (1000.0, 500.0)]
+
+
+def test_the_same_layout_on_two_page_sizes_normalises_identically():
+    portrait = _geom(width=1000, height=2000)
+    landscape = _geom(width=3000, height=1500)
+    a = normalize_region(box_region((100, 200, 300, 600), "a"), portrait)
+    b = normalize_region(box_region((300, 150, 900, 450), "b"), landscape)
+    assert math.isclose(iou(a, b), 1.0)
+    assert center_distance(a, b) == pytest.approx(0.0)
+
+
+def test_normalize_region_clamps_and_survives_a_zero_page():
+    unit = normalize_region(box_region((-10, 0, 1100, 50), "a"), _geom(width=1000, height=100))
+    assert unit.points == [(0.0, 0.0), (1.0, 0.5)]
+    flat = normalize_region(box_region((0, 0, 10, 10), "a"), _geom(width=0, height=0))
+    assert flat.points == [(0.0, 0.0), (0.0, 0.0)]
+
+
+def test_center_distance_spans_zero_to_root_two_on_the_unit_square():
+    top_left = box_region((0, 0, 0, 0), "a")
+    bottom_right = box_region((1, 1, 1, 1), "b")
+    assert center_distance(top_left, top_left) == 0.0
+    assert math.isclose(center_distance(top_left, bottom_right), math.sqrt(2))
+    # Centres (0.25, 0.25) and (0.75, 0.25): half the width apart.
+    left = box_region((0.0, 0.0, 0.5, 0.5), "l")
+    right = box_region((0.5, 0.0, 1.0, 0.5), "r")
+    assert math.isclose(center_distance(left, right), 0.5)
+
+
+def test_manual_is_a_region_source():
+    assert "manual" in REGION_SOURCES

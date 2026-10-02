@@ -44,10 +44,13 @@ ai/classifier/
   api/                 the HTTP layer
     schemas.py         AssessRequest (a documents list), DocumentInput, CriterionInput + the cross-criterion rules
     criterion_options.py  LLMOptions / TextOptions / CVOptions / DetectorOptions: defaults, caps,
-                       options.aggregate and its defaults table
+                       options.aggregate and its defaults table; ReferenceOptions (options.reference)
     assess.py          POST /assess — JSON or multipart, one model, the submit-time checks and the item cap
     introspection.py   GET /criterion-types, /hints, /cv-detectors, /document-kinds, /health
     artifacts.py       the four /jobs/{id}/artifacts routes and the lazy layer renderer
+    reference_schemas.py  ReferenceRequest / ReferencePatch — POST and PATCH /references
+    references.py      the /references routes: save a worked example (a "reference" job
+                       builds it), list, read, files, edit, delete
   analysis/            the engine
     loading.py         bytes → Document: content type, EXIF, kind, URL + SSRF, every page
     ocr.py             the OCR engine singleton
@@ -59,7 +62,11 @@ ai/classifier/
                        evaluator with @result_spec), the aggregate block, and the helpers
     cv_eval.py         the `cv` evaluator (and its fallback)
     text_eval.py       the `text` evaluator (one page, or a document's pages joined)
-    llm_eval.py        the `llm` evaluator: one scoring call, then maybe the box loop
+    llm_eval.py        the `llm` evaluator: one scoring call (or its reference-guided calls,
+                       combined), then maybe the box loop
+    references.py      a job's reference plan (JobReferences): which examples guide which
+                       criterion, the `auto` selection call per item, the position check, the
+                       result block — and the reference page's description call
     detector_eval.py   the `detector` evaluator
     scheduler.py       (criterion, item) units, per-item dependency gating, the per-job unit cap,
                        error isolation
@@ -72,8 +79,17 @@ ai/classifier/
     artifacts.py       regions.json, text.p{n}.<key>.json, the base images, the manifest (item map),
                        the per-item byte cap, render_layer
     sweeper.py         the TTL task, the DELETE hook, the disk gauges
+  references/          stored worked examples — never imports analysis or llm
+    model.py           the Reference row, the id and file-name grammar, guides_llm
+    store.py           ReferenceRegistry (`reference_examples` in classifier.db), the
+                       sweeper-less file store at CLASSIFIER_REFERENCE_DIR, reconcile, gauges
+    resolve.py         an /assess request's `references` against the store, at submit: the
+                       plan the worker follows, inherited criteria, the `auto` pool
+    finalize.py        caller answers + pipeline answers → the frozen record
+    render.py          page.jpg / working.jpg / c.<slug>.jpg, and the `auto` catalogue
   llm/
-    prompts.py         the single-criterion scoring prompt, and the loop's two small ones
+    prompts.py         the single-criterion scoring prompt (with reference examples), the
+                       loop's two small ones, the reference describe and selection prompts
     client.py          LLM_CALLS (the process-wide limit), call_vllm, call_vllm_json, the encoder
     validate.py        find the answer, clamp it, derive the verdict from the score
     boxes.py           the bounding-box enforcement loop
@@ -85,7 +101,7 @@ ai/classifier/
     client.py          the ai/detector HTTP client (transport only)
   jobs/
     payloads.py        the one payload shape (schema 3: a list of documents)
-    runners.py         run_assess
+    runners.py         run_assess, run_reference (the job POST /references queues)
     queue.py           ClassifierQueue + the registry / queue / sweeper singletons
   bin/
     grounding_experiment.py   operator tool — runs where the model is
@@ -95,8 +111,13 @@ Import direction is strictly one way:
 
 ```
 config → logger / metrics / utils → api.criterion_options → api.schemas
-       → cv, llm, detector, regions → analysis → jobs → api (routers) → main
+       → cv, llm, detector, regions, references → analysis → jobs → api (routers) → main
 ```
+
+`references` never imports `analysis` or `llm`: the pipeline side of
+references (the guided calls, the selection, the position check, the
+description) is `analysis.references`, and `llm.prompts.ReferenceExample` is
+a plain dataclass, so the model layer never sees a reference object.
 
 `analysis` may import `regions`, `llm`, `cv` and `detector`; `regions` must
 never import `analysis` — that is what keeps storing geometry additive, so
@@ -164,6 +185,19 @@ and `classifier_llm_latency_seconds` (every model request).
 
 ### Deploying this version
 
+**Recreate `muse-glimmer` FIRST, with `--limit-mm-per-prompt '{"image": 3}'`.**
+A reference-guided scoring call sends up to three images, and a vLLM started
+without the flag rejects every one of them (each guided unit then errors).
+`make up vllm muse-glimmer`, then check its startup log for an OOM or a lower
+`Maximum concurrency` — if either, drop `--gpu-memory-utilization` to `0.85`
+([VLLM.md § Muse Glimmer 30B](../vllm/VLLM.md#muse-glimmer-30b--tensor-parallel--dflash-speculative-decoding))
+— and send one three-image chat completion to it directly. Only then recreate
+the classifier. **`VISION_LLM_MAX_IMAGES_PER_PROMPT` must match the flag**: 3
+with `{"image": 3}`; 2 sends one example per call; 1 (or a vLLM without the
+flag) disables references — `/assess` refuses them at submit. The LiteLLM
+pass-through needs `PATCH` for `PATCH /references/{id}` (`make up litellm`).
+The new tables and directories are created at startup; nothing to migrate.
+
 **Drain the queue before recreating the container.** Payloads are now
 `schema: 3` (a list of documents, each with its kind and page count); a
 payload queued by an older container — a `schema: 2` single-document assess,
@@ -224,7 +258,9 @@ the OCR engine's actual availability.
   is text-only, and a `score: false` criterion is refused when **no**
   document in the request has a page image (there is nowhere to locate
   anything; with a mix, the text-only items simply locate nothing).
-* **One image per LLM prompt** — one unit is one item, so that is its page.
+* **One candidate image per LLM prompt** — one unit is one item, so that is its page.
+  A reference-guided call adds the example image(s) before it
+  ([§ What the vision model sees](#what-the-vision-model-sees)).
 
 ### OCR
 
@@ -276,11 +312,15 @@ recomputed from the clamped score. What was sent is in the result's
 budget, source}}` — `value` is the score, and null for a `score: false`
 criterion (see [§ Result details](#result-details--the-same-shape-on-every-type)).
 
-> **One image per prompt.** `muse-glimmer` is served **without**
-> `--limit-mm-per-prompt`, so vLLM accepts a single image per request; a second
-> one fails the whole call. A unit is one item, so its page image is the one
-> image — a ten-page PDF is ten calls per `llm` criterion, never one call with
-> ten images.
+> **Images per call.** A unit is one item, so its page image is the one
+> CANDIDATE image — a ten-page PDF is ten calls per `llm` criterion, never one
+> call with ten images. Every call that is not reference-guided — the plain
+> scoring call, the box loop's ask / refine / verify, a reference's describe
+> call, the `auto` selection call — sends exactly one image. Only a
+> reference-guided scoring call carries more: up to
+> `VISION_LLM_MAX_IMAGES_PER_PROMPT` (3) — a PASS example, a FAIL example and
+> the candidate ([§ References](#references)). `muse-glimmer` runs with
+> `--limit-mm-per-prompt '{"image": 3}'` for this; the knob must match it.
 
 A document with no page image sends a text-only prompt (still
 `response_format: json_object`), and the system prompt tells the model to judge
@@ -432,9 +472,15 @@ never be treated differently.
     {"type": "url", "data": "https://example.com/roof.jpg"},
     {"type": "text", "data": "Notice to Owner …"}
   ],
-  "criteria": [ … ]
+  "criteria": [ … ],
+  "references": ["r1a2b3c4d5e6f"]
 }
 ```
+
+`references` is optional — stored worked examples to show the vision model
+beside each llm-answered criterion: a list of reference ids, `"auto"`, or
+`{"auto": true, "tags": [...], "tags_match": "all" | "any"}`. See
+[§ References](#references).
 
 `documents` is the list, in order; every page of every document is one
 [item](#documents-pages-and-items). `{"document": {…}}` is still accepted as
@@ -456,7 +502,8 @@ sending neither.
 |---|---|---|
 | `file` | at least one `file` or `text` | A document. **Repeat the part** for more documents. The legacy name `image` is still accepted, and repeats too |
 | `text` | at least one `file` or `text` | Inline text, same as the JSON `type: "text"`. Repeatable; an empty one is a 400 |
-| `criteria` | no | The same JSON array as the JSON body's `criteria`, as a string, **once** — it covers every document. Omitted: the four default quality criteria |
+| `criteria` | no | The same JSON array as the JSON body's `criteria`, as a string, **once** — it covers every document. Omitted: with explicit `references`, the references' criteria ([inherited](#using-them--references-on-assess)); otherwise the four default quality criteria. The form parser no longer fills the defaults in itself, so the model can tell "omitted" from "sent" |
+| `references` | no | **Once**: a JSON array of reference ids, the word `auto`, or the JSON `{"auto": true, …}` object |
 
 The documents are taken in **form order**, `file`, `image` and `text` parts
 interleaved exactly as sent (note that a client building the form from
@@ -484,9 +531,9 @@ in `options`:
 
 | `type` | `options`, with defaults |
 |---|---|
-| `llm` | `hint` (`quality` \| `presence` \| `auto`, default `auto`), `boxes` (default **`false`** — the [bounding-box loop](#the-llm-enforcement-loop)), `max_attempts` (default and cap `CLASSIFIER_LLM_BBOX_MAX_ATTEMPTS`; may be lowered, never raised), `ocr` (`auto` \| `always` \| `never`, default `auto` — the text layer sent with the prompt), `aggregate` |
+| `llm` | `hint` (`quality` \| `presence` \| `auto`, default `auto`), `boxes` (default **`false`** — the [bounding-box loop](#the-llm-enforcement-loop)), `max_attempts` (default and cap `CLASSIFIER_LLM_BBOX_MAX_ATTEMPTS`; may be lowered, never raised), `ocr` (`auto` \| `always` \| `never`, default `auto` — the text layer sent with the prompt), `reference` (how the request's references guide it — [§ References](#references); only with `references`), `aggregate` |
 | `text` | `pattern` (default: the name; max 500 characters), `match` (`contains` default \| `exact` \| `regex` \| `fuzzy`), `case_sensitive` (`false`), `fuzzy_threshold` (`0.85`, 0–1), `min_count` (`1`, 1–1000, `CLASSIFIER_TEXT_MIN_COUNT_CAP`), `ocr` (`auto`), `scope` (`page` default \| `document` — [text across pages](#text-across-pages--scope-document)), `aggregate` |
-| `cv` | `fallback` (`detector` \| `llm`) — what answers when no OpenCV detector matches the name. Default: `detector` when `DETECTOR_URL` is configured on this container, `llm` otherwise. `aggregate` |
+| `cv` | `fallback` (`detector` \| `llm`) — what answers when no OpenCV detector matches the name. Default: `detector` when `DETECTOR_URL` is configured on this container, `llm` otherwise. `reference` (only when the llm fallback is what answers). `aggregate` |
 | `detector` | `threshold` (0–1, default `DETECTOR_MIN_SCORE`), `aggregate` |
 
 `aggregate` is on every type — a rule (`any` \| `worst` \| `all` \| `mean` \|
@@ -513,7 +560,12 @@ nothing is queued:
 * `score: false` on a criterion that cannot produce geometry, or when no
   document in the request has a page image (every one a .txt / .docx);
 * a `detector` criterion (or a `cv` one with an explicit `fallback:
-  "detector"` and no OpenCV match) when `DETECTOR_URL` is empty.
+  "detector"` and no OpenCV match) when `DETECTOR_URL` is empty;
+* every reference rule — `options.reference` on a criterion the model does
+  not answer, or with no `references`; a bad `references` list; and the
+  store-checked ones (unknown ids, a reference not ready — **409**, an
+  inheritance conflict). The full table is in
+  [§ References](#refusals-at-submit).
 
 Each result echoes `options_used`: the options after defaults and caps, so
 `pattern` shows the name it defaulted to and `max_attempts` the cap it was
@@ -523,7 +575,7 @@ held to.
 
 | `type` | Answered by | Cost |
 |---|---|---|
-| `llm` | One vision-model call per item — that page's image + its text layer, the rubric for its `hint`. With `options.boxes` the enforcement loop runs after, on that page | 1 call per item (+ up to 3 per loop attempt) |
+| `llm` | One vision-model call per item — that page's image + its text layer, the rubric for its `hint`. With `options.boxes` the enforcement loop runs after, on that page. Guided by [references](#references), one call per example group instead | 1 call per item (+ up to 3 per loop attempt; guided: `max(#PASS-side, #FAIL)` examples) |
 | `text` | `common.documents.match_text` over its text layer (native or OCR'd) | none |
 | `cv` | A registered OpenCV detector on the working image (in a worker thread). With no match, its `fallback`: the detector (scored from boxes) or the llm (default llm options: hint `auto`, no boxes, ocr `auto`). `method` says which answered, and `reason` says a fallback was used | none, or the fallback's |
 | `detector` | The open-vocabulary detector service, one call per item with the name as the label, scored from the boxes | one detector call per item |
@@ -632,13 +684,42 @@ every type, so the headline number reads the same whatever ran:
 
 | Type | `metric` | `value` is | Other `detail` keys |
 |---|---|---|---|
-| `llm` | `score` | the model's score (**null** for `score: false` — the judgement is not reported) | `hint`, `image_sent`, `text_sent` |
+| `llm` | `score` | the model's score (**null** for `score: false` — the judgement is not reported) | `hint`, `image_sent`, `text_sent`; `reference` when the request listed references (below) |
 | `text` | `count` | `detail.count`, the hits | the match record above; `scope`, `separator`, `items_with_hits` with `scope: "document"` |
 | `detector` | `best_score` | `detail.best_score` | `detector_matches`, `min_score` |
 | `cv` | per detector | `detail.measurements[metric]` | `detector`, `measurements`, `thresholds`, `parameters`, `state`, `image` — keys per detector in `GET /cv-detectors` |
 
 A `cv` criterion answered by its `fallback` has the `llm` or `detector`
 shape; `method` says which. An errored or skipped criterion has `detail: null`.
+
+**`detail.reference`** — on every llm-answered unit of a request that listed
+`references`, declared once as `REFERENCE_FIELD` on the llm type's spec
+(`analysis/result_specs.py`); a `cv` criterion answered by the llm fallback
+has it too, through the llm shape:
+
+```json
+"reference": {
+  "applied": true, "mode": "explicit", "combine": "any",
+  "examples": [{"reference_id": "r1a2b3c4d5e6f", "criterion": "has a house",
+                "expected": {"score": 10, "verdict": "PASS"}, "polarity": "pass",
+                "region": "caller", "call": 0},
+               {"reference_id": "r9f8e7d6c5b4a", "criterion": "has a house",
+                "expected": {"score": 2, "verdict": "FAIL"}, "polarity": "fail",
+                "region": "whole_page", "call": 0}],
+  "calls": [{"call": 0, "images": 3, "score": 9, "verdict": "PASS", "confidence": 80,
+             "reason": "…", "chosen": true, "error": null}],
+  "position": {"status": "miss", "iou": 0.04, "center_offset": 0.41, "min_iou": 0.3,
+               "max_offset": 0.15, "reference_id": "r1a2b3c4d5e6f", "capped_from": 9},
+  "note": null
+}
+```
+
+`applied: false` (empty `examples` / `calls`, a `note` saying why — no matching
+reference, `use: false`, an empty `auto` pool, a failed selection) when the
+criterion scored without an example. `examples[].call` is the call it was
+shown in (`null` past the call cap); `calls[].images` counts the candidate;
+`position` is `null` unless `options.reference.position` is `check`. It is
+**not** a stable key: under `mean` it is only in `items[]`.
 
 **Aggregates keep the shape.** When a criterion ran on more than one item or
 document, its `detail` is still its type's shape, plus one block:
@@ -697,6 +778,267 @@ geometry is refused at submit: an `llm` criterion without `options.boxes` (or
 with a `quality` hint — sharpness is not a place), the whole-page `cv`
 measurements (`sharpness`, `exposure`), and a `cv` name that falls back to the
 llm.
+
+---
+
+## References
+
+A **reference** is a stored, reviewed example: ONE page — a JPEG/PNG, or one
+page of a PDF — with the criteria asked of it, the answer each one should get
+(`score`, `verdict`, `reason`) and where on the page the feature is. An
+`/assess` that lists references shows the vision model those examples **beside
+the candidate**, so the model knows what a criterion means HERE: a reference
+whose `has a house` was PASS (10) with the house boxed teaches "a house" by
+example, and a FAIL reference is a counter-example. The score still answers
+the criterion — an example is guidance, never the answer.
+
+**References guide the vision model only.** They apply to `llm` criteria and
+to `cv` names that fall back to the llm (no OpenCV detector, `fallback`
+resolving to `llm`). A `text`, `detector` or OpenCV-answered `cv` criterion is
+not answered by the model, so `options.reference` on one is a 400: *references
+guide the vision model; this criterion is not answered by it*. A reference
+may still STORE criteria of any type — they are inherited by an `/assess` that
+lists it (below) — but only its llm-answered criteria with an expected answer
+are examples (`usable: true`), and only they get a composite image.
+
+### Creating one — `POST /references`
+
+JSON, or multipart parsed into the same model (`api.reference_schemas.ReferenceRequest`):
+
+```json
+{
+  "document": {"type": "base64", "data": "<base64>", "filename": "house.jpg"},
+  "page": 0,
+  "criteria": [
+    {"name": "has a house", "type": "llm", "options": {"hint": "presence"}},
+    {"name": "a roof", "type": "llm", "options": {"hint": "presence"}}
+  ],
+  "breakdown": {"has a house": {"score": 10, "reason": "a two-storey brick house"}},
+  "regions": {"has a house": [{"box": [120, 80, 940, 700]}]},
+  "region_units": "px",
+  "title": "Brick house, front",
+  "description": "A two-storey brick house photographed from the street.",
+  "tags": ["houses", "exterior"]
+}
+```
+
+| Field | Description |
+|---|---|
+| `document` + `page` | The example page: base64, URL (SSRF-checked, fetched at submit) or — refused — inline text. A JPEG/PNG (page `0`), or page `page` (0-based, default 0) of a PDF. `.txt` / `.docx` are a 400: a reference is shown to the model as an image |
+| `from_job` + `from_job_item` | **Instead of a document**: save item `from_job_item` (default 0) of a completed `/assess` job — see below |
+| `criteria` | The same `CriterionInput` list as `/assess` (the same cross-criterion rules). Required with `document`; with `from_job`, omitted means the job's own. `options.reference` is refused here — a reference's own criteria are never guided |
+| `breakdown` | `{name: {score, verdict?, reason?}}` — the answer key. `verdict` is optional and must be the score's (`score 3` with `verdict PASS` is a 400). Not allowed on a `score: false` criterion. A name left out is classified by the creation job |
+| `regions` | `{name: [{"box": [x1, y1, x2, y2]} \| {"polygon": [[x, y], …]}]}` — where. A name left out is **located** by the creation job; `[]` means **the whole page** is the example |
+| `region_units` | `px` (default — ORIGINAL page pixels, after EXIF rotation; one pixel of overshoot is tolerated and clamped) \| `grid` (0–1000 on both axes; recommended for a PDF page, whose pixel size depends on `CLASSIFIER_PDF_RENDER_DPI`) |
+| `title` / `description` / `tags` | Catalogue metadata, the only editable part (`PATCH`). Title ≤ 120 characters; description ≤ `CLASSIFIER_REFERENCE_DESCRIPTION_MAX_CHARS` (500) — **omitted, it is generated** from the page by one model call when `CLASSIFIER_REFERENCE_DESCRIBE` is on; tags are lowercased, stripped and de-duplicated, at most 20 of ≤ 40 characters |
+
+Multipart: ONE `file` part (or the legacy `image`), and the other keys as
+form fields — `criteria`, `breakdown` and `regions` holding JSON, `page` /
+`from_job_item` integers, `tags` a JSON array or repeated once per tag. A
+`text` field, a second file, or any unknown field is a 400.
+
+**Returns** `202 Accepted` — `{"reference_id": "r1a2b3c4d5e6f", "status":
+"pending", "job_id": "…"}`. Poll `GET /references/{id}` until `status` is
+`ready` or `failed`.
+
+**`from_job`** saves an already reviewed `/assess` job's item as a reference.
+The job's payload is gone by then (it is deleted when the job finishes), so the
+page is the job's `p{item}.base.jpg` — its ORIGINAL pixels, so the job's
+regions apply unchanged (a PDF page is rasterised: its native text is lost and
+a `text` criterion on the reference relies on OCR). The criteria are the job's
+`result.request.criteria`; a job that predates that block has them rebuilt from
+each criterion's `options_used`, with a warning on the reference (`depends_on`
+is not recorded there and is dropped; `weight` is recovered only where the
+breakdown kept it). Every criterion whose type, `score` and resolved options
+match the job's takes the job's answer on that item and its ACCEPTED regions
+there as supplied (`source: "pipeline"`, `observed.job_id`), so a reviewed job
+usually costs no model call at all; the caller's own `breakdown` / `regions`
+still win.
+
+**Refused at submit**, nothing queued:
+
+| Status | When |
+|---|---|
+| 400 | Any malformed input — both or neither of `document` / `from_job`; `page` with `from_job` or `from_job_item` with `document`; `criteria` missing with `document`; a criterion rule; a verdict that disagrees with its score; a breakdown for a `score: false` criterion; a `breakdown` / `regions` key naming no criterion; a malformed box (`x1 < x2`, `y1 < y2`) or polygon (≥ 3 vertices); negative coordinates; grid coordinates past 1000; a pixel region outside the page; a `.txt` / `.docx`; a page the PDF does not have; a page image under the 32 × 32 floor; an item of `from_job` that does not exist or has no page image |
+| 404 | `from_job`: no such job |
+| 409 | `from_job`: the job is not a completed `/assess` job (still running, failed, or a reference job); its criteria no longer validate on this container. **And** `CLASSIFIER_REFERENCE_MAX_COUNT` (500) references already exist |
+| 410 | `from_job`: the job's artifacts are gone — the TTL sweeper or a `DELETE` took the directory, or the byte cap dropped `p{item}.base.jpg` |
+
+### The creation job
+
+`POST /references` queues an ordinary job (`metadata.type: "reference"`,
+`metadata.reference_id`) on the same queue as `/assess`; it is visible in
+`GET /jobs` and writes an ordinary artifact directory while it lives. It:
+
+1. loads the page;
+2. drops the criteria the submit fully supplied — a breakdown (or `score: false`)
+   AND a `regions` key;
+3. strips `depends_on` from the rest, so every one is evaluated on the example
+   (the stored criteria keep theirs);
+4. forces `boxes: true` on presence / auto `llm` criteria that have no
+   supplied regions, so the example is located;
+5. runs the pipeline on what is left;
+6. merges (`references.finalize`): **the caller beats the pipeline**. The
+   expected answer is the breakdown (`source: "caller"`), else the pipeline's
+   answer (`source: "pipeline"`); the regions are the supplied ones
+   (`region_source: "caller"`, drawn with the `manual` stroke), else the
+   pipeline's ACCEPTED regions (`"pipeline"`), else `"whole_page"`. What the
+   pipeline itself answered is kept as `observed`. Disagreement is a
+   **warning**, not a failure — *"'has a house': you said PASS, the model
+   scored the example 3 and located nothing"* — because the caller's review is
+   the answer key;
+7. describes the page with one single-image call when no `description` was
+   sent (a failure is a warning; the reference is readied without one);
+8. renders the files — `page.jpg` (original pixels), `working.jpg` (≤ 1000 px),
+   and one `c.<slug>.jpg` per usable criterion: the working image with that
+   criterion's regions drawn, the exact image an example shows the model,
+   rendered once and never re-derived;
+9. marks the reference `ready`.
+
+An exception marks it `failed` (`error` says why) — including the one hard
+failure of the merge: **no scored criterion ended with an expected answer**
+(nothing was supplied and every model call failed). A shutdown mid-job leaves
+it `pending` for the requeued job to finish; a `pending` reference whose job
+is gone, or finished without readying it, is failed at the next startup.
+After `ready` its content never changes — PATCH edits only `title`,
+`description` and `tags`; a new answer key is a new reference.
+
+### Using them — `references` on `/assess`
+
+| Form | Meaning |
+|---|---|
+| `"references": ["r1a2b3c4d5e6f", …]` | These references, in this order. At most `CLASSIFIER_REFERENCE_MAX_PER_REQUEST` (10), no duplicates |
+| `"references": "auto"` | Let the service pick, per page, from every ready reference |
+| `"references": {"auto": true, "tags": ["houses"], "tags_match": "all" \| "any"}` | The same, from references carrying all / any of these tags (default `any`) |
+
+**Matching.** Each llm-answered criterion is matched by NAME, case-folded, to
+the references' usable criteria — its own name, or
+`options.reference.criterion` when set. A criterion with no match scores
+without an example (`detail.reference.applied: false`, with a note); more
+than `CLASSIFIER_REFERENCE_MAX_PER_CRITERION` (3) matching examples is a 400.
+
+**Inheritance.** With explicit ids and `criteria` **omitted**, the references'
+criteria are the request's — merged by name in list order. The same name with
+a different type, options, weight, `score` or `depends_on` in two references
+is a 400 naming both; the merged list goes back through every request rule.
+This is why an omitted multipart `criteria` field is no longer filled with the
+four default quality criteria by the form parser: with explicit references it
+means "inherit", without references the defaults still apply exactly as
+before.
+
+**`auto`.** Needs `criteria` (an omitted list is a 400 — there is nothing to
+match on). The **pool** is fixed at submit: ready references with a usable
+criterion matching one of the request's llm-answered criteria (by the same
+name rule), filtered by tags, newest first, capped at
+`CLASSIFIER_REFERENCE_AUTO_POOL_MAX` (20; `pool_truncated` says when it cut).
+In the worker, each **item** makes ONE selection call — the candidate page as
+the one image, plus a text catalogue of the pool (id, title, description,
+tags, each usable criterion with its expected verdict and score) — answered
+with a ranked `{"matches": [{"id", "confidence", "reason"}]}`; ids outside
+the pool are dropped and confidences clamped 0–100. It is memoised per item
+and shared by every criterion on it, and it runs before a unit takes its slot.
+Each criterion then keeps the matches that HAVE that criterion with confidence
+≥ `CLASSIFIER_REFERENCE_AUTO_MIN_CONFIDENCE` (60), best first, at most
+`CLASSIFIER_REFERENCE_MAX_PER_CRITERION`. No call is made when the pool is
+empty or the item has no page image. **A failed selection is not fatal**: the
+units score without examples (`applied: false`) and the error is in the
+result's `references.selection`. The selection is only as good as the
+descriptions it reads — give references real titles and descriptions.
+
+**`options.reference`** — on `llm` criteria, and `cv` criteria answered by the
+llm fallback; only with `references` on the request (a 400 otherwise):
+
+| Field | Default | Meaning |
+|---|---|---|
+| `use` | `true` | `false` = score this criterion without examples |
+| `criterion` | its own name | Which reference criterion is the example (case-insensitive). Named but in no listed reference: a 400 |
+| `position` | `off` | `check` = the position check below. Needs `options.boxes: true` and hint `presence` / `auto`; refused on `cv` (its llm fallback runs without boxes) |
+| `min_iou` | `CLASSIFIER_REFERENCE_POSITION_MIN_IOU` (0.3) | Overlap that counts as a position hit |
+| `combine` | `any` | How several examples' answers become one: `any` the best (with its reason), `all` the lowest, `mean` the rounded mean (verdict from it; Python rounding, so 6.5 → 6) |
+
+It is in `options_used` only when sent, so an unguided criterion's result is
+unchanged.
+
+### What the model is shown, and what it costs
+
+A guided criterion's ONE scoring call per item becomes one call per **example
+group**, all in flight together (each takes its own `CLASSIFIER_MAX_LLM_CALLS`
+slot):
+
+* With `VISION_LLM_MAX_IMAGES_PER_PROMPT` ≥ 3 (the default), call *i* pairs the
+  *i*-th PASS-side example (PASS, then MARGINAL, in list or rank order) with
+  the *i*-th FAIL example — **one contrastive call, three images**: the
+  example, the counter-example, the candidate. One polarity only: two images.
+  So one PASS + one FAIL reference is ONE call; two PASS references are two.
+* With `VISION_LLM_MAX_IMAGES_PER_PROMPT` = 2, every example is its own
+  two-image call. With 1, `references` is a 400 at submit.
+
+Each example is shown as its caption then its composite — *"REFERENCE EXAMPLE
+— in this reference 'has a house' was PASS (10): a two-storey brick house; the
+coloured box outlines it"* (or *"the whole image is the example"*), *"… was
+FAIL (2) — an example of what does NOT satisfy the criterion …"* — then *"Do
+not reward resemblance the criterion does not ask about"*, the `CANDIDATE —
+score only this image` heading, the candidate page, and the usual text block.
+Only the candidate's text layer is sent. A call that fails is left out of the
+combination (noted in `detail.reference.note`); when every call fails the unit
+fails exactly as a plain scoring call's failure does. A reference **deleted
+after submit** fails the units it guided (`status: "error"`), nothing else.
+
+The box loop then runs unchanged on the combined score, with one image —
+references never reach the ask, refine or verify calls.
+
+**Cost per guided criterion, per item:** `max(#PASS-side, #FAIL)` scoring
+calls instead of 1 (at three images), plus, under `auto`, one selection call
+per item shared by every criterion.
+
+### The position check
+
+For layouts — bills, forms — where WHERE the feature is matters as much as
+whether it is there. `options.reference.position: "check"` on an `llm`
+criterion with `options.boxes: true`: after the box loop, the unit's ACCEPTED
+box and each PASS-side example's regions are normalised to their own page
+(`common.vision.normalize_region`) and compared pair by pair — the best IoU,
+and the smallest centre distance / √2. No model call.
+
+| `status` | When | Effect |
+|---|---|---|
+| `hit` | IoU ≥ `min_iou`, **or** offset ≤ `CLASSIFIER_REFERENCE_POSITION_MAX_OFFSET` (0.15) | None |
+| `miss` | Neither | The score is capped at `CLASSIFIER_REFERENCE_POSITION_CAP` (5) — `min(score, cap)`, so **a cap never raises a score** — the verdict recomputed, `capped_from` set, and the reason extended |
+| `unlocated` | The loop accepted no box | None |
+| `no_reference_region` | No PASS-side example has a region | None |
+
+A `score: false` criterion reports the check and changes nothing. A `check`
+against an example that is the whole page is a 400 at submit (explicit ids).
+
+### Refusals at submit
+
+| Status | Rule |
+|---|---|
+| 400 | `options.reference` with no `references`; `options.reference` on a `text` / `detector` / OpenCV-answered `cv` criterion; `position: "check"` without `boxes` or with hint `quality`, or on `cv`; an empty list, duplicate ids, a malformed id, more than `CLASSIFIER_REFERENCE_MAX_PER_REQUEST`; `references` while `VISION_LLM_MAX_IMAGES_PER_PROMPT` < 2; unknown ids (all named); an inheritance conflict (both references named); `auto` without `criteria`; an `options.reference.criterion` no listed reference has; more than `CLASSIFIER_REFERENCE_MAX_PER_CRITERION` examples for one criterion; `position: "check"` against a whole-page example |
+| 409 | A listed reference is not `ready` (`pending` or `failed`) |
+
+### Retention
+
+**References are kept until `DELETE /references/{id}`** — there is no TTL.
+They live in their own root, `CLASSIFIER_REFERENCE_DIR`, which nothing sweeps
+(the artifact sweeper deletes every directory whose job row is gone, which is
+exactly what a reference must survive), with their rows in the
+`reference_examples` table of the same `classifier.db`. The creation job
+expires on `JOB_TTL_HOURS` like any job; the reference has already copied what
+it needs. `CLASSIFIER_REFERENCE_MAX_COUNT` (500) is the only bound on their
+disk.
+
+**A reference is a copy of a customer document**, kept indefinitely: its page,
+its working copy and its composites. Treat the directory as you would the
+documents themselves, and delete references nobody needs. `DELETE` is a 409
+while a queued or running job reads the reference (its creation job, or an
+`/assess` that lists it — `metadata.references`); `?force=true` deletes anyway,
+and those jobs' guided units then fail on the missing reference.
+
+Metrics: `classifier_references{status}`, `classifier_reference_bytes`,
+`classifier_reference_dirs`, `classifier_references_created_total{outcome}`,
+`classifier_reference_describe_total{outcome}`,
+`classifier_reference_calls_total{kind=selection|scoring, outcome}`.
 
 ---
 
@@ -806,6 +1148,8 @@ Inside `job.result`, `schema_version: 3` — here for a two-page invoice plus a
 | `page_geometry` | One entry per item, each with its `item`; `page` equals `item` (the global index the layers are drawn on). An item with no page image (.txt / .docx) has `width` / `height` / `working_scale` / `pdf_points` `null` |
 | `detector` | What the open-vocabulary detector did for the whole job (was `document_info.detector`) |
 | `artifacts` | The job's files — each [labelled](#file-labels) with `kind`, `format`, `item`, `document`, `criteria`, exactly as the manifest endpoint labels them — and, under `items`, each item's combined layer URLs (items with a page image only) |
+| `references` | `null` when the request listed none. Otherwise `{mode: explicit \| auto, requested, pool (auto: the ids fixed at submit; else null), pool_truncated, resolved (the ids used — auto: those some item's selection kept), inherited, criteria: {name: {matched, use, combine, position, examples: [{reference_id, criterion, polarity, expected}]}}, selection: [{item, status: ok \| failed \| skipped, matches: [{id, confidence, reason}], dropped, error, reason}], calls (guided scoring calls), selection_calls}`. Under `auto`, `criteria[*].examples` is empty — each item's picks are in `selection` and each unit's `detail.reference` |
+| `request` | `{"criteria": [...]}` — the criteria exactly as validated (`depends_on`, `weight`, every option as sent; inherited ones when `criteria` was omitted). What `POST /references` `from_job` rebuilds a job's criteria from |
 
 **Every criterion has the same keys**, whatever its type or status. The keys
 that existed before describe the AGGREGATED answer:
@@ -935,6 +1279,7 @@ and page each n is.
 | `p{n}.base.jpg` | per item with a page image | The un-annotated page, JPEG q85. Every preview of item n is composited from it |
 | `p{n}.svg` / `p{n}.layer.png` / `p{n}.preview.jpg` | **on first fetch** | Item n's layer, rendered from regions.json by `regions.artifacts.render_layer`, then cached in the directory |
 | `p{n}.<slug>.svg` / `.layer.png` / `.preview.jpg` | **on first fetch** | One criterion's layer on item n, the same way — fetched by name, or as `p{n}.svg?criterion=<slug>` |
+| `references.json` | when the request listed `references` | The plan's summary (the result's `references` block), the `auto` `catalogue`, every item's `selection` with the model's raw answer beside the validated one, and `calls` — which composite (`reference_id`, `criterion`, `composite`, `polarity`) went into which guided call, with its image count, score and error. JSON, so the byte cap never drops it |
 
 A job nobody looks at costs a JSON file, its text layers and a JPEG per page.
 The result's `artifacts.items` (and each criterion's `artifacts.items`) lists
@@ -950,7 +1295,7 @@ writes, so the two cannot disagree — carries, besides `name`, `bytes`,
 
 | Key | Meaning |
 |---|---|
-| `kind` | `manifest` \| `regions` \| `text` \| `layer` \| `base` (`other` for an unrecognised name — no name the service writes produces it) |
+| `kind` | `manifest` \| `regions` \| `references` \| `text` \| `layer` \| `base` (`other` for an unrecognised name — no name the service writes produces it) |
 | `format` | Only where it adds information: a layer's `svg` \| `png` \| `preview`, a text layer's `json`. Absent otherwise |
 | `item` | The global item index the file belongs to; `null` for `manifest.json`, `regions.json` and a document-scope `text.d{i}.*` |
 | `document` | The document index — from the manifest's `items` map for an item's file, `i` for `text.d{i}.*`; `null` for the job-wide files |
@@ -961,7 +1306,7 @@ maps, never guessed from the name:
 
 | File | `criteria` |
 |---|---|
-| `manifest.json`, `regions.json` | every criterion in the job |
+| `manifest.json`, `regions.json`, `references.json` | every criterion in the job |
 | `text.p{n}.<key>.json`, `text.d{i}.<key>.json` | every criterion whose units read that layer (the manifest's `criteria[*].text_layers`, the criterion's `artifacts.text` links) |
 | `p{n}.svg` / `p{n}.layer.png` / `p{n}.preview.jpg` | every criterion with at least one region on item n (rejected LLM attempts count — they are drawable with `?attempt=`) |
 | `p{n}.<slug>.svg` / `.layer.png` / `.preview.jpg` | exactly that criterion |
@@ -1331,7 +1676,9 @@ cannot name.
 
 Colour is one stable hue per criterion (hashed from the name); the source
 shows in the stroke — solid for `cv`/`detector`/`pdf-text`, dashed for `ocr`,
-dotted for `llm`.
+dotted for `llm`, and heavy solid for `manual`: a region a PERSON supplied (a
+reference's `regions`, drawn on its `c.<slug>.jpg` composite). No job produces
+a `manual` region; it only appears in a reference's record and composites.
 
 ### Tying a criterion to its artifacts
 
@@ -1402,6 +1749,14 @@ themselves**. Terminal jobs only. Gauges: `classifier_artifact_bytes`,
 
 `DELETE /jobs/{id}` removes the directory with the row. `DELETE
 /jobs/{id}/artifacts` frees the disk but keeps the row and its inline regions.
+
+**References are exempt.** They live in their own root,
+`CLASSIFIER_REFERENCE_DIR` (`/data/references`, the same volume), which the
+sweeper never touches — it deletes any directory whose job row is gone, and a
+reference outlives its creation job by design. They have no TTL and no byte
+cap; `CLASSIFIER_REFERENCE_MAX_COUNT` bounds them, and they go only through
+`DELETE /references/{id}` ([§ References — Retention](#retention)). Gauges:
+`classifier_reference_bytes`, `classifier_reference_dirs`.
 
 Hand-testing fixtures with expected geometry per file:
 [`unit-tests/classifier/regions/`](../../unit-tests/classifier/regions/).
@@ -1496,6 +1851,12 @@ name. `cv.defaults.fallback` is `detector` only while DETECTOR_URL is set.
 Each type's `defaults.aggregate` is for its default options (an `llm`
 criterion's defaults change with its hint — the top-level `aggregate.defaults`
 has the whole table).
+
+The top-level `reference` block is `options.reference`
+([§ References](#references)): its `options_schema`, `defaults`, `applies_to`,
+`caps` (`max_per_request`, `max_per_criterion`, `images_per_llm_prompt`) and
+the `position` knobs (`min_iou`, `max_offset`, `cap`). `llm` and `cv`
+`options_schema` list `reference`; `text` and `detector` do not.
 
 ---
 
@@ -1611,7 +1972,7 @@ regions block.
           "text_layer_artifact": "text.p<item>.<key>.json per item and distinct setting; text.d<document>.<key>.json for a scope-document text search"},
   "limits": {"max_items": 20, "items": "every page of every document is one item; the cap is inclusive and counted at submit",
              "pdf_render_dpi": 150, "llm_text_char_budget": 60000,
-             "images_per_llm_prompt": 1, "max_concurrent_jobs": 4,
+             "images_per_llm_prompt": 3, "max_concurrent_jobs": 4,
              "max_units_per_job": 2, "max_llm_calls": 4, "ocr_workers": 4},
   "regions": {
     "always_stored": true, "layers": ["png", "preview", "svg"],
@@ -1623,9 +1984,19 @@ regions block.
     "detector": {"configured": true, "url_host": "detector:8000", "…": "…"},
     "inline_max_per_criterion": 50, "artifact_dir": "/data/artifacts",
     "artifact_max_bytes_per_item": 50000000, "artifact_ttl_hours": 24, "sweep_interval_seconds": 600.0
+  },
+  "references": {
+    "enabled": true, "images_per_llm_prompt": 3, "contrastive": true,
+    "max_count": 500, "max_per_request": 10, "max_per_criterion": 3,
+    "auto": true, "auto_pool_max": 20, "auto_min_confidence": 60,
+    "applies_to": "llm criteria, and cv criteria answered by the llm fallback",
+    "dir": "/data/references", "retention": "kept until DELETE /references/{id} — never swept"
   }
 }
 ```
+
+`references.enabled` is false when `VISION_LLM_MAX_IMAGES_PER_PROMPT` is 1;
+`contrastive` (a PASS and a FAIL example in one call) needs 3.
 
 `ocr.available` loads the engine to answer honestly — `false` when
 `CLASSIFIER_OCR_ENGINE=none` **and** when the engine failed to load.
@@ -1672,17 +2043,109 @@ still works — it is a one-item `documents` list.
 **Inline text:** `{"type": "text", "data": "…"}` in `documents`, or `-F
 "text=…"` (repeatable) alongside or instead of file parts.
 
+**With references:** `"references": ["r1a2b3c4d5e6f"]` (or `-F
+'references=["r1a2b3c4d5e6f"]'`); omit `criteria` to inherit the references'
+own; `"references": {"auto": true, "tags": ["houses"]}` lets the service pick
+per page. See [§ References](#references).
+
 **Errors** — all at submit, nothing queued: **400** for every rule in
 [§ Validation](#criterioninput), an empty file or `text` field, invalid
 base64, a blocked URL, a body that is not a JSON object, both or neither of
 `document` / `documents`, no `file` / `text` part at all, `criteria` sent
-twice, a removed form field, an unsupported kind (naming the document), and
-more than `CLASSIFIER_MAX_ITEMS` items ([§ Items and the cap](#items-and-the-cap));
+twice, a removed form field, an unsupported kind (naming the document),
+more than `CLASSIFIER_MAX_ITEMS` items ([§ Items and the cap](#items-and-the-cap)),
+and every reference rule ([§ References — Refusals](#refusals-at-submit));
+**409** when a listed reference is not ready;
 **415** for
 a Content-Type that is neither JSON nor multipart; **502** when a document URL
 cannot be fetched; **500** if the payload could not be persisted. A page image
 under `CLASSIFIER_MIN_IMAGE_WIDTH` × `CLASSIFIER_MIN_IMAGE_HEIGHT` (32 × 32 px)
 fails the JOB with "Image too small".
+
+---
+
+### `POST /references`
+
+Save a worked example. **Returns** `202 Accepted` —
+`{"reference_id": "r1a2b3c4d5e6f", "status": "pending", "job_id": "abc123"}`.
+The body, the creation job and every refusal are in
+[§ References](#references).
+
+```bash
+curl http://localhost:4001/v1/classifier/references \
+  -H "Authorization: Bearer sk-1234" \
+  -F "file=@house.jpg" \
+  -F 'criteria=[{"name":"has a house","type":"llm","options":{"hint":"presence"}}]' \
+  -F 'breakdown={"has a house":{"score":10,"reason":"a two-storey brick house"}}' \
+  -F 'regions={"has a house":[{"box":[120,80,940,700]}]}' \
+  -F "title=Brick house, front" -F "tags=houses" -F "tags=exterior"
+```
+
+From a reviewed job: `{"from_job": "abc123", "from_job_item": 0}` (JSON).
+
+---
+
+### `GET /references`
+
+Summaries, newest first: `{"references": [...], "total", "limit", "offset"}`.
+Each summary is `reference_id`, `status`, `title`, `description`,
+`description_source` (`caller` | `model` | null), `tags`, `job_id`, `source`
+(`{kind: document | from_job, job_id, item}`), `error`, `created_at`,
+`updated_at`, and `criteria` — `[{name, type, guides_llm, usable, verdict,
+score, region_source}]` — never the full record.
+
+| Param | Effect |
+|---|---|
+| `status` | `pending` \| `ready` \| `failed` (anything else is a 400) |
+| `tag` | Only references with this tag (case-insensitive) |
+| `limit` / `offset` | Paging; `limit` 1–200, default 50 |
+
+---
+
+### `GET /references/{reference_id}`
+
+The summary plus `record` — the frozen per-criterion record (`input`, `slug`,
+`guides_llm`, `expected` `{score, verdict, reason, source}`, `observed`,
+`regions` in page pixels, `region_source`, `composite`, `usable`), the page
+(`kind`, `filename`, `page`, `geometry`, `working`), `source`, the creation
+`job_id` and `warnings` — and `files`: `[{name, bytes, content_type, url}]`.
+`record` is null until the reference is ready. **404** for an unknown or
+malformed id.
+
+---
+
+### `GET /references/{reference_id}/files/{name}`
+
+One file: `page.jpg`, `working.jpg`, `c.<slug>.jpg`, `regions.json` or
+`record.json`. The name is checked against that grammar BEFORE the disk is
+touched — anything else (`manifest.json`, `p0.base.jpg`, a dotted or
+traversal name) is a **400**. **404** for an unknown reference or a file that
+is not there (every file is written when the reference becomes ready).
+
+---
+
+### `PATCH /references/{reference_id}`
+
+`{"title"?, "description"?, "tags"?}` — the only editable fields; an explicit
+`null` clears a title or description (a set description becomes
+`description_source: "caller"`). Returns the full reference. **400** for an
+empty body or any other key ("only title, description and tags are editable;
+a new answer key is a new reference"); **404** for an unknown id. Through
+LiteLLM this needs `PATCH` in the `/v1/classifier` pass-through's `methods`
+(`ai/litellm/litellm_config.yaml`).
+
+---
+
+### `DELETE /references/{reference_id}`
+
+Delete the row and its directory. **204**; **404** when unknown; **409** while
+a queued or running job reads it — its own creation job while it is
+`pending`, or an `/assess` listing it (`metadata.references`, which holds the
+explicit ids or the `auto` pool) — naming the jobs.
+
+| Param | Effect |
+|---|---|
+| `force=true` | Delete anyway; the jobs that read it fail their guided units on the missing reference |
 
 ---
 

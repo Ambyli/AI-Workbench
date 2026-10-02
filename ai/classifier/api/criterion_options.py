@@ -5,11 +5,23 @@ A criterion's top level holds only what every type shares — ``name``,
 something to one evaluation path lives in ``options``, validated by the model
 for that path:
 
-    llm       LLMOptions       hint, boxes, max_attempts, ocr, aggregate
+    llm       LLMOptions       hint, boxes, max_attempts, ocr, reference, aggregate
     text      TextOptions      pattern, match, case_sensitive, fuzzy_threshold,
                                min_count, ocr, scope, aggregate
-    cv        CVOptions        fallback, aggregate
+    cv        CVOptions        fallback, reference, aggregate
     detector  DetectorOptions  threshold, aggregate
+
+``reference`` (``ReferenceOptions``) says how the request's ``references`` —
+stored worked examples, see ``references/`` — guide THIS criterion: whether
+at all, which reference criterion is its example, how several examples'
+answers combine, and the opt-in position check. It exists only where the
+vision model answers: ``llm``, and a ``cv`` name that falls back to the llm.
+On ``text`` / ``detector`` it is refused by name ("references guide the
+vision model; ...") rather than as an unknown key, and on a ``cv`` name an
+OpenCV detector or the detector service answers it is refused the same way
+(``api.schemas``). It appears in ``resolve()`` — and so in ``options_used`` —
+only when the caller sent it, so a criterion without it resolves exactly as
+before.
 
 ``aggregate`` is on every type: how a criterion's per-ITEM results (one per
 page of every document) collapse into one answer — pages into a per-document
@@ -56,6 +68,12 @@ from config import (
     CRITERION_NAME_MAX_CHARS as NAME_MAX_CHARS,
     DETECTOR_MIN_SCORE,
     LLM_BBOX_MAX_ATTEMPTS,
+    REFERENCE_MAX_PER_CRITERION,
+    REFERENCE_MAX_PER_REQUEST,
+    REFERENCE_POSITION_CAP,
+    REFERENCE_POSITION_MAX_OFFSET,
+    REFERENCE_POSITION_MIN_IOU,
+    VISION_LLM_MAX_IMAGES_PER_PROMPT,
     TEXT_MIN_COUNT_CAP as MIN_COUNT_CAP,
 )
 from cv import get_detector
@@ -189,6 +207,67 @@ class _Options(BaseModel):
         return {}
 
 
+class ReferenceOptions(BaseModel):
+    """``options.reference`` — how the request's references guide one criterion.
+
+    Only meaningful when the request lists ``references``; sending it without
+    them is a 400. Every field has a default, so ``{}`` means "guided, the
+    defaults" — the same as omitting it on a request that has references.
+    """
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    use: bool = Field(
+        default=True,
+        description="false = score this criterion without examples even though the "
+                    "request lists references.",
+    )
+    criterion: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=NAME_MAX_CHARS,
+        description="Which reference criterion is the example (matched case-insensitively). "
+                    "Defaults to this criterion's own name. Named but in no listed "
+                    "reference: a 400.",
+    )
+    position: Literal["off", "check"] = Field(
+        default="off",
+        description="'check': compare this criterion's located box with the example's "
+                    "(each as a fraction of its own page) — a miss caps the score at "
+                    "CLASSIFIER_REFERENCE_POSITION_CAP. Needs options.boxes: true and a "
+                    "presence / auto hint; no model call.",
+    )
+    min_iou: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Overlap that counts as a position HIT. Defaults to "
+                    "CLASSIFIER_REFERENCE_POSITION_MIN_IOU.",
+    )
+    combine: Literal["any", "all", "mean"] = Field(
+        default="any",
+        description="How several examples' answers become one score: 'any' the best "
+                    "(with its reason), 'all' the lowest, 'mean' the rounded mean.",
+    )
+
+    def resolve(self, name: str) -> dict[str, Any]:
+        return {
+            "use": self.use,
+            "criterion": self.criterion or name,
+            "position": self.position,
+            "min_iou": REFERENCE_POSITION_MIN_IOU if self.min_iou is None else self.min_iou,
+            "combine": self.combine,
+        }
+
+
+def _reference_field() -> Any:
+    return Field(
+        default=None,
+        description="How the request's `references` guide this criterion — see GET "
+                    "/criterion-types `reference`. Only with `references` on the request.",
+    )
+
+
 class LLMOptions(_Options):
     """Options for ``type: "llm"`` — the vision model scores the criterion."""
 
@@ -230,6 +309,19 @@ class LLMOptions(_Options):
         ),
     )
 
+    reference: Optional[ReferenceOptions] = _reference_field()
+
+    @model_validator(mode="after")
+    def _position_needs_boxes(self) -> "LLMOptions":
+        if self.reference is not None and self.reference.position == "check":
+            if not self.boxes or self.hint == "quality":
+                raise ValueError(
+                    "reference.position 'check' compares the LOCATED box with the "
+                    "example's, so it needs options.boxes: true and hint presence or "
+                    "auto (a quality criterion has no location)"
+                )
+        return self
+
     @field_validator("max_attempts")
     @classmethod
     def _cap_attempts(cls, value: Optional[int]) -> Optional[int]:
@@ -242,13 +334,14 @@ class LLMOptions(_Options):
         return value
 
     def resolve(self, name: str) -> dict[str, Any]:
-        return {
+        resolved = {
             "hint": self.hint,
             "boxes": self.boxes,
             "max_attempts": self.max_attempts or LLM_BBOX_MAX_ATTEMPTS,
             "ocr": self.ocr,
             "aggregate": self.resolved_aggregate(default_aggregate("llm", self.hint)),
         }
+        return _with_reference(resolved, self.reference, name)
 
     @classmethod
     def caps(cls) -> dict[str, Any]:
@@ -344,12 +437,25 @@ class CVOptions(_Options):
         ),
     )
 
+    reference: Optional[ReferenceOptions] = _reference_field()
+
+    @model_validator(mode="after")
+    def _no_position_on_cv(self) -> "CVOptions":
+        if self.reference is not None and self.reference.position == "check":
+            raise ValueError(
+                "reference.position 'check' needs a located box, and a cv criterion's "
+                "llm fallback runs without boxes; use an llm criterion with "
+                "options.boxes: true"
+            )
+        return self
+
     def resolve(self, name: str) -> dict[str, Any]:
         default = "detector" if detector_client.is_configured() else "llm"
-        return {
+        resolved = {
             "fallback": self.fallback or default,
             "aggregate": self.resolved_aggregate(default_aggregate("cv")),
         }
+        return _with_reference(resolved, self.reference, name)
 
 
 class DetectorOptions(_Options):
@@ -370,6 +476,34 @@ class DetectorOptions(_Options):
             "threshold": DETECTOR_MIN_SCORE if self.threshold is None else self.threshold,
             "aggregate": self.resolved_aggregate(default_aggregate("detector")),
         }
+
+
+def _with_reference(
+    resolved: dict[str, Any], reference: Optional[ReferenceOptions], name: str
+) -> dict[str, Any]:
+    """``resolved`` plus ``reference`` — only when the caller sent one, so a
+    criterion without it resolves (and echoes ``options_used``) exactly as
+    it always did."""
+    if reference is None:
+        return resolved
+    return {**resolved, "reference": reference.resolve(name)}
+
+
+# The message a reference on a criterion the model does not answer gets.
+NOT_GUIDED = (
+    "references guide the vision model; this criterion is not answered by it"
+)
+
+
+def answered_by_llm(type_: str, name: str, resolved: dict[str, Any]) -> bool:
+    """Whether the vision model answers the criterion — the only kind a
+    reference can guide: ``llm``, or a ``cv`` name with no OpenCV detector
+    whose fallback resolves to the llm."""
+    if type_ == "llm":
+        return True
+    if type_ == "cv":
+        return get_detector(name) is None and resolved.get("fallback") == "llm"
+    return False
 
 
 OPTIONS_MODELS: dict[str, type[_Options]] = {
@@ -465,5 +599,24 @@ def criterion_types() -> dict[str, Any]:
                                    "one unit per document, so only the documents rule applies",
         },
         "types": types,
+        # options.reference: on llm criteria and cv names that fall back to
+        # the llm only. The live caps and knobs of THIS container.
+        "reference": {
+            "options_schema": ReferenceOptions.model_json_schema(),
+            "defaults": ReferenceOptions().resolve("<name>"),
+            "applies_to": "llm criteria, and cv criteria answered by the llm fallback",
+            "requires": "a `references` list on the request",
+            "caps": {
+                "max_per_request": REFERENCE_MAX_PER_REQUEST,
+                "max_per_criterion": REFERENCE_MAX_PER_CRITERION,
+                "images_per_llm_prompt": VISION_LLM_MAX_IMAGES_PER_PROMPT,
+            },
+            "position": {
+                "min_iou": REFERENCE_POSITION_MIN_IOU,
+                "max_offset": REFERENCE_POSITION_MAX_OFFSET,
+                "cap": REFERENCE_POSITION_CAP,
+                "requires": "options.boxes: true and hint presence / auto",
+            },
+        },
         "detector_configured": detector_client.is_configured(),
     }

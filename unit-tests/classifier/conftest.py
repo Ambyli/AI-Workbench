@@ -5,11 +5,12 @@
 them. A test run from the repo root has neither, so this file supplies both —
 and it has to do it at IMPORT time, before any test module runs, because
 ``config.py`` reads ``DB_PATH`` / ``PAYLOAD_DIR`` / ``CLASSIFIER_ARTIFACT_DIR``
-once at import and every other module reads config.
+/ ``CLASSIFIER_REFERENCE_DIR`` once at import and every other module reads
+config.
 
 The defaults are absolute container paths (``/data/classifier.db``). Left
 alone, a test that touched the store would try to create ``/data`` on the
-developer's machine, so all three are pointed at one temp directory for the
+developer's machine, so all four are pointed at one temp directory for the
 whole session. It is deliberately NOT a ``tmp_path`` fixture: the values are
 frozen into module constants at import, so a per-test directory would be
 ignored by everything that matters.
@@ -40,6 +41,8 @@ _DATA = pathlib.Path(tempfile.mkdtemp(prefix="classifier-tests-"))
 os.environ.setdefault("DB_PATH", str(_DATA / "classifier.db"))
 os.environ.setdefault("PAYLOAD_DIR", str(_DATA / "payloads"))
 os.environ.setdefault("CLASSIFIER_ARTIFACT_DIR", str(_DATA / "artifacts"))
+# References have their own, never-swept root (config.REFERENCE_DIR).
+os.environ.setdefault("CLASSIFIER_REFERENCE_DIR", str(_DATA / "references"))
 # No OCR models in a unit test: loading three ONNX graphs costs a second and
 # nothing here asks a question that needs them.
 os.environ.setdefault("CLASSIFIER_OCR_ENGINE", "none")

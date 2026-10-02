@@ -45,6 +45,15 @@ Every region a per-item unit returns is re-stamped ``page = item``: the
 evaluators work in one page's frame, and the global item index is the page
 index the shared vision code (layers, ``p{n}.*`` files) draws on.
 
+With ``references: "auto"``, a unit that uses references first awaits its
+ITEM's selection (``JobReferences.select`` — one call per item, memoised),
+after its dependency gate and before it takes a slot.
+
+When the request lists references, a finished per-item unit then goes through
+``JobReferences.finish`` — the opt-in position check, which may CAP an llm
+score (never raise it) — before ``score: false`` clears the judgement, so a
+locate-only criterion still reports the check.
+
 Process flow position: called by ``analysis.pipeline.analyze_document``
 between building the item contexts and aggregating the results.
 """
@@ -155,6 +164,11 @@ async def run_units(
     async def run_item(c: CriterionInput, ctx: DocumentContext) -> None:
         try:
             outcome = await gate(c, item=ctx.item, document=ctx.document)
+            if outcome is None and ctx.references is not None and ctx.references.needs_selection(c):
+                # references "auto": this item's one selection call, shared by
+                # every unit on it — awaited BEFORE taking a unit slot, so a
+                # unit waiting on it holds nothing. It never raises.
+                await ctx.references.select(ctx)
             if outcome is None:
                 async with slots:
                     outcome = await _evaluate(c, ctx)
@@ -221,6 +235,11 @@ async def _evaluate(c: CriterionInput, ctx: DocumentContext) -> Outcome:
         return _failed(c, exc)
     for region in outcome.regions:
         region.page = ctx.item
+    if ctx.references is not None:
+        try:
+            outcome = ctx.references.finish(c, ctx, outcome)
+        except Exception as exc:  # noqa: BLE001 — the check fails this unit alone
+            return _failed(c, exc)
     return _unjudged(c, outcome)
 
 

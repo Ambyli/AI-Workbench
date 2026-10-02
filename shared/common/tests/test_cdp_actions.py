@@ -1,0 +1,544 @@
+"""Tests for common.cdp_interceptor.actions.
+
+No browser is launched. ``parse_actions`` is tested directly; ``run_actions``
+is exercised end-to-end against a fake WebSocket whose ``FakePage`` answers the
+CDP calls it makes — the readiness probe, the deep-query lookup, the per-step
+JS, and the ``Input.*`` events — and records everything it was sent.
+"""
+
+from __future__ import annotations
+
+import json
+import threading
+import time
+
+import pytest
+
+from common.cdp_interceptor import actions as actions_mod
+from common.cdp_interceptor.actions import (
+    ActionError,
+    ActionsReport,
+    parse_actions,
+    run_actions,
+)
+
+
+# ── parse_actions ─────────────────────────────────────────────────────────────
+
+def test_parse_actions_applies_defaults():
+    acts = parse_actions([
+        {"type": "wait_for", "selector": "input"},
+        {"type": "fill", "selector": "input", "value": "532614044013"},
+        {"type": "click", "selector": "button", "text": "Submit"},
+        {"type": "press", "key": "Enter"},
+        {"type": "wait", "seconds": 1},
+        {"type": "evaluate", "script": "1 + 1"},
+    ])
+    assert [a.type for a in acts] == ["wait_for", "fill", "click", "press", "wait", "evaluate"]
+    assert acts[0].state == "visible" and acts[0].timeout_s == 15.0
+    assert acts[1].clear is True and acts[1].value == "532614044013"
+    assert acts[2].method == "mouse" and acts[2].text == "Submit"
+    assert acts[4].seconds == 1.0
+
+
+def test_parse_actions_ignores_none_values_like_a_model_dump():
+    # A pydantic model_dump() carries every field, unset ones as None.
+    [a] = parse_actions([{"type": "click", "selector": "b", "text": None, "method": None,
+                          "timeout_s": None}])
+    assert a.method == "mouse" and a.text is None and a.timeout_s == 15.0
+
+
+@pytest.mark.parametrize("raw, msg", [
+    ({"type": "hover", "selector": "a"}, "unknown action type"),
+    ({"selector": "a"}, "unknown action type"),
+    ({"type": "fill", "selector": "a"}, "missing required field"),
+    ({"type": "click"}, "missing required field"),
+    ({"type": "click", "selector": "a", "value": "x"}, "unexpected field"),
+    ({"type": "click", "selector": "  "}, "non-empty string"),
+    ({"type": "wait_for", "selector": "a", "state": "hidden"}, "state must be"),
+    ({"type": "click", "selector": "a", "method": "touch"}, "method must be"),
+    ({"type": "press", "key": "NotAKey"}, "key must be"),
+    ({"type": "wait", "seconds": -1}, "seconds must be"),
+    ({"type": "fill", "selector": "a", "value": 5}, "value must be a string"),
+    ({"type": "fill", "selector": "a", "value": "x", "clear": "yes"}, "clear must be"),
+    ({"type": "click", "selector": "a", "timeout_s": 0}, "timeout_s must be"),
+    ({"type": "click", "selector": "a", "timeout_s": True}, "timeout_s must be"),
+])
+def test_parse_actions_rejects_bad_steps(raw, msg):
+    with pytest.raises(ActionError, match=msg) as ei:
+        parse_actions([{"type": "wait", "seconds": 0}, raw])
+    assert "actions[1]" in str(ei.value)
+
+
+def test_parse_actions_accepts_single_character_keys_and_none():
+    assert parse_actions(None) == []
+    [a] = parse_actions([{"type": "press", "key": "a"}])
+    assert a.key == "a"
+
+
+# ── Fake Chrome ──────────────────────────────────────────────────────────────
+
+class WebSocketTimeoutException(Exception):
+    """Same class name _Rpc checks for, so a missing reply reads as a timeout."""
+
+
+READY = {"href": "https://support.example.com/feoc/", "rs": "complete", "hook": True}
+
+
+class FakePage:
+    """Scripted page. Override the hooks per test; every CDP call is recorded
+    as ``(method, params)`` in ``calls``."""
+
+    def __init__(self):
+        self.calls: list[tuple[str, dict]] = []
+        self.probes = [READY]          # consumed in order; the last one repeats
+        self.lookups = [{"ok": True, "matched": 1, "visible": 1, "element": "<input>"}]
+        self.fill_prep = {"focused": True, "element": "<input>"}
+        self.click_box = {"x": 100.0, "y": 50.0, "element": "<button>"}
+        self.eval_result = {"result": {"type": "number", "value": 2}}
+
+    @staticmethod
+    def _next(seq):
+        return seq.pop(0) if len(seq) > 1 else seq[0]
+
+    def value(self, v):
+        return {"result": {"type": "object", "value": v}}
+
+    def respond(self, method: str, params: dict):
+        self.calls.append((method, params))
+        if method != "Runtime.evaluate":
+            return {}
+        expr = params["expression"]
+        if expr == actions_mod._PROBE_JS:
+            return self.value(self._next(self.probes))
+        if actions_mod._FIND_JS in expr:
+            # The deep query reports bad selectors as a value ({error: …}),
+            # not by throwing, so every scripted lookup is returned by value.
+            return self.value(self._next(self.lookups))
+        if actions_mod._FILL_PREP_JS in expr:
+            return self.value(self.fill_prep)
+        if actions_mod._FILL_DONE_JS in expr:
+            return self.value({"element": "<input>", "value_length": 12})
+        if actions_mod._CLICK_PREP_JS in expr:
+            return self.value(self.click_box)
+        if actions_mod._CLICK_JS_JS in expr:
+            return self.value({"element": "<button>"})
+        if actions_mod._FOCUS_JS in expr:
+            return self.value({"focused": True, "element": "<input>"})
+        if actions_mod._SELECT_JS in expr:
+            return self.value({"element": "<select>", "value": "US"})
+        return self.eval_result
+
+    # helpers for assertions
+    def methods(self) -> list[str]:
+        return [m for m, _ in self.calls]
+
+    def lookups_sent(self) -> int:
+        return sum(1 for m, p in self.calls
+                   if m == "Runtime.evaluate" and actions_mod._FIND_JS in p["expression"])
+
+
+class FakeWs:
+    def __init__(self, page: FakePage, drop_after: int | None = None):
+        self.page = page
+        self._queue: list[str] = []
+        self.closed = False
+        self._drop_after = drop_after
+        self._sends = 0
+
+    def settimeout(self, _t):
+        pass
+
+    def send(self, raw: str):
+        self._sends += 1
+        if self._drop_after is not None and self._sends > self._drop_after:
+            raise ConnectionResetError("socket is already closed")
+        msg = json.loads(raw)
+        # An unsolicited event before every reply exercises the skip-other-ids path.
+        self._queue.append(json.dumps({"method": "Runtime.consoleAPICalled", "params": {}}))
+        out = self.page.respond(msg["method"], msg.get("params", {}))
+        reply = out if set(out) == {"error"} else {"result": out}
+        self._queue.append(json.dumps({"id": msg["id"], **reply}))
+
+    def recv(self) -> str:
+        if not self._queue:
+            raise WebSocketTimeoutException()
+        return self._queue.pop(0)
+
+    def close(self):
+        self.closed = True
+
+
+def _patch_chrome(monkeypatch, page: FakePage, sockets=None):
+    """Point actions.py's tab listing / socket opening at the fake. ``sockets``
+    is an optional list of FakeWs handed out one per connect."""
+    opened: list[FakeWs] = []
+
+    def open_ws(url, timeout):
+        ws = sockets.pop(0) if sockets else FakeWs(page)
+        opened.append(ws)
+        return ws
+
+    monkeypatch.setattr(actions_mod, "_list_tabs", lambda port, timeout: [
+        {"type": "page", "url": READY["href"], "webSocketDebuggerUrl": "ws://fake"}
+    ])
+    monkeypatch.setattr(actions_mod, "_open_ws", open_ws)
+    return opened
+
+
+def _run(acts, **kw):
+    kw.setdefault("ready_timeout_s", 2.0)
+    kw.setdefault("poll_interval_s", 0.01)
+    return run_actions(9224, parse_actions(acts), **kw)
+
+
+# ── Readiness gate ───────────────────────────────────────────────────────────
+
+def test_gate_waits_through_blank_loading_and_missing_hook_then_runs(monkeypatch):
+    page = FakePage()
+    page.probes = [
+        {"href": "about:blank", "rs": "complete", "hook": True},
+        {"href": READY["href"], "rs": "loading", "hook": False},
+        {"href": READY["href"], "rs": "complete", "hook": False},
+        READY,
+    ]
+    opened = _patch_chrome(monkeypatch, page)
+
+    report = _run([{"type": "wait_for", "selector": "input"}])
+
+    assert report.ok and report.aborted_reason is None
+    assert [r.ok for r in report.actions] == [True]
+    probes = [m for m, p in page.calls if p.get("expression") == actions_mod._PROBE_JS]
+    assert len(probes) == 4
+    assert page.lookups_sent() == 1
+    assert opened and opened[0].closed  # side socket closed on the way out
+
+
+def test_gate_times_out_and_skips_everything(monkeypatch):
+    page = FakePage()
+    page.probes = [{"href": READY["href"], "rs": "interactive", "hook": True}]
+    _patch_chrome(monkeypatch, page)
+
+    report = _run([{"type": "click", "selector": "b"}, {"type": "wait", "seconds": 0}],
+                  page_script="1", ready_timeout_s=0.2)
+
+    assert report.aborted_reason.startswith("not ready: document.readyState='interactive'")
+    assert report.page_script.error == "skipped"
+    assert [(r.index, r.ok, r.error) for r in report.actions] == [(0, False, "skipped"), (1, False, "skipped")]
+    assert page.lookups_sent() == 0
+
+
+def test_gate_never_acts_on_a_login_page(monkeypatch):
+    page = FakePage()
+    page.probes = [{"href": "https://sso.example.com/login?next=/feoc", "rs": "complete", "hook": True}]
+    _patch_chrome(monkeypatch, page)
+
+    report = _run([{"type": "fill", "selector": "input", "value": "x"}],
+                  ready_timeout_s=0.2, login_url_patterns=[r"sso\.example\.com"])
+
+    assert "login page https://sso.example.com/login" in report.aborted_reason
+    assert page.lookups_sent() == 0
+    assert "Input.insertText" not in page.methods()
+
+
+def test_gate_tolerates_chrome_not_up_yet(monkeypatch):
+    page = FakePage()
+    attempts = {"n": 0}
+
+    def flaky_tabs(port, timeout):
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            raise ConnectionRefusedError("refused")
+        return [{"type": "page", "url": "about:blank", "webSocketDebuggerUrl": "ws://fake"}]
+
+    monkeypatch.setattr(actions_mod, "_list_tabs", flaky_tabs)
+    monkeypatch.setattr(actions_mod, "_open_ws", lambda url, timeout: FakeWs(page))
+
+    report = _run([{"type": "wait", "seconds": 0}])
+    assert report.ok and attempts["n"] == 3
+
+
+# ── Steps ────────────────────────────────────────────────────────────────────
+
+def test_fill_focuses_then_inserts_trusted_text_then_fires_change(monkeypatch):
+    page = FakePage()
+    _patch_chrome(monkeypatch, page)
+
+    report = _run([{"type": "fill", "selector": "lightning-input", "value": "532614044013"}])
+
+    assert report.ok, report.aborted_reason
+    evals = [(m, p) for m, p in page.calls if m != "Runtime.evaluate"
+             or p["expression"] != actions_mod._PROBE_JS]
+    kinds = []
+    for m, p in evals:
+        expr = p.get("expression", "")
+        if actions_mod._FIND_JS in expr:
+            kinds.append("find")
+        elif actions_mod._FILL_PREP_JS in expr:
+            kinds.append("focus+clear")
+            assert expr.endswith("(true)")  # clear defaults on
+        elif actions_mod._FILL_DONE_JS in expr:
+            kinds.append("change+blur")
+        else:
+            kinds.append(m)
+    assert kinds == ["find", "focus+clear", "Input.insertText", "change+blur"]
+    insert = next(p for m, p in page.calls if m == "Input.insertText")
+    assert insert == {"text": "532614044013"}
+    assert report.actions[0].value == {"element": "<input>", "value_length": 12}
+
+
+def test_fill_fails_when_focus_does_not_land(monkeypatch):
+    page = FakePage()
+    page.fill_prep = {"focused": False, "element": "<input>"}
+    _patch_chrome(monkeypatch, page)
+
+    report = _run([{"type": "fill", "selector": "input", "value": "x"}])
+
+    assert not report.ok and "could not focus" in report.actions[0].error
+    assert "Input.insertText" not in page.methods()
+
+
+def test_click_mouse_presses_and_releases_at_box_centre(monkeypatch):
+    page = FakePage()
+    page.click_box = {"x": 412.5, "y": 318.0, "element": "<button>"}
+    _patch_chrome(monkeypatch, page)
+
+    report = _run([{"type": "click", "selector": "button", "text": "Check"}])
+
+    assert report.ok, report.aborted_reason
+    mouse = [p for m, p in page.calls if m == "Input.dispatchMouseEvent"]
+    assert [p["type"] for p in mouse] == ["mouseMoved", "mousePressed", "mouseReleased"]
+    assert all((p["x"], p["y"]) == (412.5, 318.0) for p in mouse)
+    assert mouse[1]["button"] == "left" and mouse[1]["clickCount"] == 1 and mouse[1]["buttons"] == 1
+    assert mouse[2]["button"] == "left" and mouse[2]["clickCount"] == 1
+    # the lookup carries the selector and the text filter, JSON-encoded
+    find = next(p["expression"] for m, p in page.calls
+                if m == "Runtime.evaluate" and actions_mod._FIND_JS in p["expression"])
+    assert find.endswith('("button", "Check", "visible")')
+
+
+def test_click_js_uses_element_click_and_no_input_events(monkeypatch):
+    page = FakePage()
+    _patch_chrome(monkeypatch, page)
+
+    report = _run([{"type": "click", "selector": "button", "method": "js"}])
+
+    assert report.ok
+    assert "Input.dispatchMouseEvent" not in page.methods()
+    assert any(actions_mod._CLICK_JS_JS in p.get("expression", "") for _, p in page.calls)
+
+
+def test_press_enter_sends_keydown_with_carriage_return_then_keyup(monkeypatch):
+    page = FakePage()
+    _patch_chrome(monkeypatch, page)
+
+    report = _run([{"type": "press", "key": "Enter", "selector": "input"}])
+
+    assert report.ok, report.aborted_reason
+    keys = [p for m, p in page.calls if m == "Input.dispatchKeyEvent"]
+    assert [k["type"] for k in keys] == ["keyDown", "keyUp"]
+    assert keys[0]["key"] == "Enter" and keys[0]["windowsVirtualKeyCode"] == 13
+    assert keys[0]["text"] == "\r"
+    assert any(actions_mod._FOCUS_JS in p.get("expression", "") for _, p in page.calls)
+
+
+def test_select_passes_value(monkeypatch):
+    page = FakePage()
+    _patch_chrome(monkeypatch, page)
+
+    report = _run([{"type": "select", "selector": "select", "value": "US"}])
+
+    assert report.ok and report.actions[0].value == {"element": "<select>", "value": "US"}
+    sel = next(p["expression"] for _, p in page.calls if actions_mod._SELECT_JS in p.get("expression", ""))
+    assert sel.endswith('("US")')
+
+
+def test_evaluate_returns_value_with_await_and_user_gesture(monkeypatch):
+    page = FakePage()
+    page.eval_result = {"result": {"type": "object", "value": {"rows": [1, 2]}}}
+    _patch_chrome(monkeypatch, page)
+
+    report = _run([{"type": "evaluate", "script": "(async () => ({rows: [1, 2]}))()"}])
+
+    assert report.ok and report.actions[0].value == {"rows": [1, 2]}
+    params = next(p for m, p in page.calls if p.get("expression", "").startswith("(async"))
+    assert params["awaitPromise"] is True and params["returnByValue"] is True
+    assert params["userGesture"] is True
+
+
+def test_evaluate_exception_fails_the_step(monkeypatch):
+    page = FakePage()
+    page.eval_result = {
+        "result": {"type": "object"},
+        "exceptionDetails": {"text": "Uncaught", "exception": {"description": "TypeError: x is null"}},
+    }
+    _patch_chrome(monkeypatch, page)
+
+    report = _run([{"type": "evaluate", "script": "x.y"}, {"type": "wait", "seconds": 0}])
+
+    assert report.actions[0].error == "TypeError: x is null"
+    assert report.actions[1].error == "skipped"
+    assert report.aborted_reason == "actions[0] (evaluate) failed: TypeError: x is null"
+
+
+def test_page_script_is_rerun_once_when_its_document_navigates_away(monkeypatch):
+    # The gate can pass on a post-login landing page just before the capture
+    # session re-navigates to the target: the script's context is destroyed.
+    page = FakePage()
+    page.eval_result = {"result": {"type": "object", "value": ["fields"]}}
+    _patch_chrome(monkeypatch, page)
+    real_respond = page.respond
+    state = {"armed": True}
+
+    def respond(method, params):
+        if state["armed"] and params.get("expression") == "dump()":
+            state["armed"] = False
+            page.calls.append((method, params))
+            return {"error": {"code": -32000, "message": "Execution context was destroyed."}}
+        return real_respond(method, params)
+
+    page.respond = respond
+    report = _run([], page_script="dump()")
+
+    assert report.ok and report.page_script.value == ["fields"]
+    assert sum(1 for _, p in page.calls if p.get("expression") == "dump()") == 2
+
+
+def test_page_script_runs_first_and_its_value_is_reported(monkeypatch):
+    page = FakePage()
+    page.eval_result = {"result": {"type": "object", "value": [{"tag": "input"}]}}
+    _patch_chrome(monkeypatch, page)
+
+    report = _run([{"type": "wait", "seconds": 0}], page_script="(async () => [])()")
+
+    assert report.page_script.index == -1 and report.page_script.type == "page_script"
+    assert report.page_script.ok and report.page_script.value == [{"tag": "input"}]
+    assert report.ok and report.actions[0].ok
+    assert report.to_dict()["page_script"]["value"] == [{"tag": "input"}]
+
+
+def test_first_failure_skips_the_rest(monkeypatch):
+    page = FakePage()
+    page.lookups = [{"ok": False, "reason": "3 matched the selector, none visible"}]
+    _patch_chrome(monkeypatch, page)
+
+    report = _run([
+        {"type": "wait_for", "selector": "button", "timeout_s": 0.2},
+        {"type": "click", "selector": "button"},
+        {"type": "wait", "seconds": 0},
+    ])
+
+    first, *rest = report.actions
+    assert not first.ok
+    assert "timed out after 0.2s waiting for 'button' (visible): 3 matched the selector, none visible" \
+        in first.error
+    assert [(r.index, r.error) for r in rest] == [(1, "skipped"), (2, "skipped")]
+    assert report.aborted_reason.startswith("actions[0] (wait_for) failed:")
+    assert "Input.dispatchMouseEvent" not in page.methods()
+
+
+def test_invalid_selector_fails_immediately_without_polling(monkeypatch):
+    page = FakePage()
+    page.lookups = [{"error": "invalid selector \"[[\": not a valid selector"}]
+    _patch_chrome(monkeypatch, page)
+
+    t0 = time.monotonic()
+    report = _run([{"type": "wait_for", "selector": "[[", "timeout_s": 5}])
+
+    assert time.monotonic() - t0 < 1.0
+    assert "invalid selector" in report.actions[0].error
+    assert page.lookups_sent() == 1
+
+
+def test_lookup_regates_after_navigation_then_finds_the_element(monkeypatch):
+    page = FakePage()
+    _patch_chrome(monkeypatch, page)
+    # The first lookup lands mid-navigation: CDP has no context for it.
+    real_respond = page.respond
+    state = {"armed": True}
+
+    def respond(method, params):
+        if (state["armed"] and method == "Runtime.evaluate"
+                and actions_mod._FIND_JS in params["expression"]):
+            state["armed"] = False
+            page.calls.append((method, params))
+            return {"error": {"code": -32000, "message": "Cannot find context with specified id"}}
+        return real_respond(method, params)
+
+    page.respond = respond
+    report = _run([{"type": "wait_for", "selector": ".results"}])
+
+    assert report.ok, report.aborted_reason
+    assert page.lookups_sent() == 2
+    probes = [1 for m, p in page.calls if p.get("expression") == actions_mod._PROBE_JS]
+    assert len(probes) == 2  # initial gate + the re-gate after the lost context
+
+
+def test_dropped_side_socket_is_reopened(monkeypatch):
+    page = FakePage()
+    # First socket dies after the gate probe; the lookup's send fails, the
+    # side channel reconnects on the next call and the step still succeeds.
+    sockets = [FakeWs(page, drop_after=1), FakeWs(page)]
+    opened = _patch_chrome(monkeypatch, page, sockets=sockets)
+
+    report = _run([{"type": "wait_for", "selector": "input"}])
+
+    assert report.ok, report.aborted_reason
+    assert len(opened) == 2
+
+
+def test_cancel_stops_a_long_wait_promptly(monkeypatch):
+    page = FakePage()
+    _patch_chrome(monkeypatch, page)
+    flag = threading.Event()
+    threading.Timer(0.2, flag.set).start()
+
+    t0 = time.monotonic()
+    report = _run([{"type": "wait", "seconds": 30}, {"type": "click", "selector": "b"}],
+                  cancel=flag.is_set)
+
+    assert time.monotonic() - t0 < 2.0
+    assert report.actions[0].error == "cancelled"
+    assert report.actions[1].error == "skipped"
+    assert report.aborted_reason == "cancelled"
+
+
+def test_cancel_during_gate(monkeypatch):
+    page = FakePage()
+    page.probes = [{"href": "about:blank", "rs": "complete", "hook": False}]
+    _patch_chrome(monkeypatch, page)
+    flag = threading.Event()
+    threading.Timer(0.1, flag.set).start()
+
+    t0 = time.monotonic()
+    report = _run([{"type": "wait", "seconds": 0}], ready_timeout_s=30, cancel=flag.is_set)
+
+    assert time.monotonic() - t0 < 2.0
+    assert report.aborted_reason == "cancelled"
+
+
+def test_on_progress_counts_executed_steps(monkeypatch):
+    page = FakePage()
+    _patch_chrome(monkeypatch, page)
+    seen = []
+
+    _run([{"type": "wait", "seconds": 0}, {"type": "wait", "seconds": 0}],
+         on_progress=lambda done, total: seen.append((done, total)))
+
+    assert seen == [(1, 2), (2, 2)]
+
+
+def test_not_run_report_lists_every_step_as_skipped():
+    acts = parse_actions([{"type": "wait", "seconds": 0}])
+    r = ActionsReport.not_run(acts, "1", "browser is not running")
+    assert r.aborted_reason == "browser is not running" and not r.ok
+    assert r.page_script.error == "skipped" and r.actions[0].error == "skipped"
+
+
+def test_helper_js_is_a_single_guarded_install():
+    # Every lookup/act expression re-installs the helper (a navigation wipes
+    # window.__ciActions); the guard keeps that idempotent within a document.
+    expr = actions_mod._call_js(actions_mod._FIND_JS, "a", None, "visible")
+    assert expr.startswith(actions_mod._HELPER_JS)
+    assert "window.__ciActions.v === 1" in actions_mod._HELPER_JS
+    assert expr.endswith('window.__ciActions.find("a", null, "visible")')

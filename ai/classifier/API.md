@@ -159,8 +159,8 @@ in the one process):
 | Knob | Bounds | Default |
 |---|---|---|
 | `CLASSIFIER_MAX_CONCURRENT` | jobs at once — worker tasks each atomically claiming the oldest `pending` row | 4 |
-| `CLASSIFIER_MAX_UNITS_PER_JOB` | units ONE job evaluates at once — ten criteria on twenty pages is 200 units, this many in flight. A unit waiting on its `depends_on` does not hold a slot. Matched to `CLASSIFIER_MAX_LLM_CALLS` so a lone job can fill every model slot | 4 |
-| `CLASSIFIER_MAX_LLM_CALLS` | vision-model requests in flight across ALL jobs, every call type — scoring, box ask, refine, verify. Acquired in `llm/client.py` around the HTTP request itself, so no call path gets around it; a retry takes a fresh slot. Size it to the model: `muse-glimmer` runs `--max-num-seqs 4` | 4 |
+| `CLASSIFIER_MAX_UNITS_PER_JOB` | units ONE job evaluates at once — ten criteria on twenty pages is 200 units, this many in flight. A unit waiting on its `depends_on` does not hold a slot. Matched to `CLASSIFIER_MAX_LLM_CALLS` so a lone job can fill every model slot the classifier has | 6 |
+| `CLASSIFIER_MAX_LLM_CALLS` | vision-model requests in flight across ALL jobs, every call type — scoring, box ask, refine, verify. Acquired in `llm/client.py` around the HTTP request itself, so no call path gets around it; a retry takes a fresh slot. Size it to the model: `muse-glimmer` schedules 8 sequences (`--max-num-seqs 8`) and the classifier takes 6, leaving 2 for the LiteLLM chat chains that also use it — their overflow hook spills chat to the next order (eventually Claude) once vLLM's waiting queue stays non-empty, so filling all 8 here would push chat off the local model | 6 |
 | `CLASSIFIER_OCR_WORKERS` | OCR passes at once (one ONNX inference each, in a worker thread) | 4 |
 
 Phases: `staging` → `pending` → `processing` → `completed` | `failed`.
@@ -179,9 +179,45 @@ terminal job's artifact directory **and its row** past the TTL, on startup and
 every `CLASSIFIER_ARTIFACT_SWEEP_INTERVAL_S`. A job still `pending` or
 `processing` is never swept, however old.
 
+**The vLLM request timeout.** `CLASSIFIER_HTTP_TIMEOUT_S` (default 240) bounds
+ONE model request. Responses are not streamed, so it covers the whole
+generation — any wait in vLLM's own queue, prefill, all reasoning tokens and
+the JSON answer — and a timeout is an HTTP error, which is **not** retried: it
+fails that criterion (`status: "error"`), or that box-loop attempt. The wait
+for a `CLASSIFIER_MAX_LLM_CALLS` slot happens before the request and is not
+counted. Raise it if `classifier_llm_call_seconds{outcome="error"}` shows calls
+dying at the limit; lowering `CLASSIFIER_MAX_LLM_CALLS` shortens each call
+instead. Fetching a `type: "url"` document has its own fixed 120 s timeout.
+
 Metrics: `classifier_job_queue_depth` (rows in `pending`),
 `classifier_jobs_in_flight` (rows being processed), `classifier_llm_calls_total`
-and `classifier_llm_latency_seconds` (every model request).
+and `classifier_llm_latency_seconds` (every successful model request,
+unlabelled), plus a per-request breakdown by call **kind** — `score` (a
+scoring call, reference-guided ones included), `ask` / `refine` / `verify`
+(the box loop), `select` (`references: "auto"`), `describe` (a reference's
+description), `other`:
+
+| Metric | What |
+|---|---|
+| `classifier_llm_call_seconds{kind, outcome}` | histogram of each HTTP request's duration (`outcome`: `ok` \| `error`); a parse retry is a second observation |
+| `classifier_llm_prompt_tokens_total{kind}` | `usage.prompt_tokens` |
+| `classifier_llm_cached_prompt_tokens_total{kind}` | `usage.prompt_tokens_details.cached_tokens` — prompt tokens vLLM's prefix cache served. Zero unless `muse-glimmer` runs `--enable-prompt-tokens-details` |
+| `classifier_llm_completion_tokens_total{kind}` | `usage.completion_tokens` (reasoning included) |
+| `classifier_llm_reasoning_tokens_total{kind}` | `usage.completion_tokens_details.reasoning_tokens` (reported because the server runs a reasoning parser) |
+
+The kind is derived from the label each call site already passes (`score/…`,
+`bbox/…`, `refine/…`, `verify/…`, `reference/select…`,
+`reference/describe`), never from a criterion name, so the label set stays
+small. Every request also writes one INFO log line — `llm call kind=score
+label=score/<name> attempt=1 12.34s prompt=… cached=… completion=… reasoning=…`
+— so one slow job can be read call by call. Prefill vs reasoning vs retries:
+`rate(classifier_llm_cached_prompt_tokens_total) /
+rate(classifier_llm_prompt_tokens_total)` is the cache hit share,
+`rate(…reasoning_tokens_total) / rate(…completion_tokens_total)` the share of
+generation spent thinking, and `classifier_llm_call_seconds_count` against
+`classifier_llm_calls_total{status="success"}` the retry overhead. vLLM's own
+`vllm:prefix_cache_queries` / `vllm:prefix_cache_hits` counters (tokens) give
+the server-wide hit rate across chat traffic too.
 
 ### Deploying this version
 
@@ -198,6 +234,16 @@ flag) disables references — `/assess` refuses them at submit. The LiteLLM
 pass-through needs `PATCH` for `PATCH /references/{id}` (`make up litellm`).
 The new tables and directories are created at startup; nothing to migrate.
 
+**Concurrency 4 → 6: recreate `muse-glimmer` before the classifier.** The
+classifier's `CLASSIFIER_MAX_LLM_CALLS` / `CLASSIFIER_MAX_UNITS_PER_JOB`
+defaults are now 6, sized for `muse-glimmer` running `--max-num-seqs 8` (and
+`--enable-prompt-tokens-details`, which fills the cached-token metric). A
+classifier sending 6 calls at a vLLM still admitting 4 keeps vLLM's waiting
+queue non-empty, which makes LiteLLM's overflow hook spill chat traffic off
+`muse-glimmer` — so `make up vllm muse-glimmer` first, confirm the startup log
+still reports `Maximum concurrency for 262144 tokens per request: 4.21x` (or
+close), then recreate the classifier.
+
 **Drain the queue before recreating the container.** Payloads are now
 `schema: 3` (a list of documents, each with its kind and page count); a
 payload queued by an older container — a `schema: 2` single-document assess,
@@ -207,7 +253,7 @@ for `classifier_job_queue_depth` to reach 0 (or `GET /jobs?phase=pending` to
 come back empty) before `up -d --force-recreate`.
 
 **Rename in `.env`.** `CLASSIFIER_MAX_CRITERIA_PER_JOB` is now
-`CLASSIFIER_MAX_UNITS_PER_JOB` (default since raised from 2 to 4) — the old name is not read
+`CLASSIFIER_MAX_UNITS_PER_JOB` (default since raised from 2 to 4, then 6) — the old name is not read
 any more. `CLASSIFIER_MAX_ITEMS` (20) is new, and
 `CLASSIFIER_ARTIFACT_MAX_BYTES` is now a per-item allowance.
 
@@ -325,6 +371,20 @@ criterion (see [§ Result details](#result-details--the-same-shape-on-every-type
 A document with no page image sends a text-only prompt (still
 `response_format: json_object`), and the system prompt tells the model to judge
 from the text.
+
+> **Prompt order is deliberate — prefix caching.** The user message is laid
+> out page image → context line → `DOCUMENT TEXT` block → rubric →
+> `CRITERION: <name>` → instructions and answer scaffold. Everything up to the
+> rubric depends only on the item and the criterion's text layer, so every
+> criterion scored on the same page with the same `options.ocr` sends a
+> byte-identical prefix (system prompt included), and muse-glimmer's
+> `--enable-prefix-caching` serves it from cache instead of re-prefilling up
+> to ~15k tokens of identical text per criterion. Do not move the text block
+> back below the criterion. A reference-guided call puts its examples before
+> the candidate, so its prefix differs per criterion anyway.
+> `classifier_llm_cached_prompt_tokens_total{kind="score"}` (see
+> [§ Concurrency and durability](#concurrency-and-durability)) shows what the
+> cache saved.
 
 ---
 
@@ -1973,7 +2033,7 @@ regions block.
   "limits": {"max_items": 20, "items": "every page of every document is one item; the cap is inclusive and counted at submit",
              "pdf_render_dpi": 150, "llm_text_char_budget": 60000,
              "images_per_llm_prompt": 3, "max_concurrent_jobs": 4,
-             "max_units_per_job": 2, "max_llm_calls": 4, "ocr_workers": 4},
+             "max_units_per_job": 6, "max_llm_calls": 6, "ocr_workers": 4},
   "regions": {
     "always_stored": true, "layers": ["png", "preview", "svg"],
     "layers_rendered": "on first fetch, then cached",

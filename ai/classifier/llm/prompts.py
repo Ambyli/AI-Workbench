@@ -48,8 +48,17 @@ reference examples carries more — the example composite(s) first, then the
 candidate — and never more than VISION_LLM_MAX_IMAGES_PER_PROMPT, which must
 match muse-glimmer's ``--limit-mm-per-prompt`` (3: a PASS example, a FAIL
 example and the candidate; ``analysis.llm_eval`` plans the calls to fit).
-``build_llm_prompt(..., references=None)`` is byte-for-byte the prompt this
-service sent before references existed, which a test pins.
+``build_llm_prompt(..., references=None)`` is byte-for-byte the plain prompt
+— no examples, no extra system sentence — which a test pins by hash.
+
+PREFIX CACHING. The scoring prompt puts everything that depends only on the
+ITEM first — system prompt, page image, context line, DOCUMENT TEXT block —
+and the per-criterion parts (rubric, ``CRITERION:``, instructions) last, so
+every criterion scored on one page with the same text layer shares a
+byte-identical prefix that muse-glimmer's ``--enable-prefix-caching`` serves
+from cache. The text block used to sit after the criterion, which made vLLM
+re-prefill up to ~15k tokens of identical text per criterion. Keep it first;
+``classifier_llm_cached_prompt_tokens_total{kind="score"}`` shows the saving.
 
 The rubric strings (HINT_RUBRICS) and the extracted-text block heading
 (DOCUMENT_TEXT_HEADING) live in config.py § LLM prompt text, so prompt wording
@@ -150,9 +159,16 @@ def build_llm_prompt(
 ) -> dict:
     """Assemble the vLLM chat completion request for ONE criterion.
 
+    The user text is laid out context line → DOCUMENT TEXT block → rubric →
+    ``CRITERION:`` → instructions + answer scaffold, so system prompt, image,
+    context and text form a prefix that is byte-identical for every
+    criterion on the same item and text layer (vLLM prefix caching; see the
+    comment at ``user_text``).
+
     Document handling:
       * ``document_text`` (already truncated to CLASSIFIER_TEXT_CHAR_BUDGET by
-        the caller) is appended as a clearly-labelled block, and the system
+        the caller) is placed as a clearly-labelled block right after the
+        context line, ahead of the rubric and the criterion, and the system
         prompt tells the model it may use image and text together.
       * The candidate is at most ONE image. Pass None for a text-only
         document (.txt / .docx); the content array then holds text only and
@@ -218,11 +234,20 @@ def build_llm_prompt(
         )
 
     scaffold = json.dumps(SCORING_SCAFFOLD, indent=2)
+    # ORDER IS DELIBERATE — prefix caching. Everything up to the rubric
+    # (system prompt, page image, context line, DOCUMENT TEXT block) depends
+    # only on the item and the criterion's text layer, so every criterion on
+    # the same page with the same text layer sends a byte-identical prefix and
+    # muse-glimmer's --enable-prefix-caching serves it from cache instead of
+    # re-prefilling up to ~15k tokens of text per criterion. Only the rubric,
+    # the CRITERION line and the instructions differ. Do not move the text
+    # block back below the criterion. (With reference examples the examples
+    # precede the candidate, so the prefix differs per criterion anyway.)
     user_text = (
-        f"{context_line}\n\n"
-        f"{rubric}\n\n"
-        f"CRITERION: {name}"
+        f"{context_line}"
         f"{text_block}\n\n"
+        f"{rubric}\n\n"
+        f"CRITERION: {name}\n\n"
         "Score this one criterion. Return ONLY this JSON object, filled in — "
         "'score' is 1-10 on the rubric above, 'verdict' is PASS (7-10), "
         "MARGINAL (4-6) or FAIL (1-3), 'confidence' is 0-100, and 'reason' "

@@ -23,15 +23,21 @@ services:
       - VISION_LLM_MODEL=${VISION_LLM_MODEL:-muse-glimmer}
       - VISION_LLM_MAX_TOKENS=${VISION_LLM_MAX_TOKENS:-8192}
       - VISION_LLM_REASONING_STRENGTH=${CLASSIFIER_REASONING_STRENGTH:-low}
+      # Seconds ONE vision-model request may take. Non-streamed, so it covers
+      # the whole generation (queue + prefill + reasoning + answer); a timeout
+      # is an HTTP error and is not retried. See API.md § Concurrency and
+      # durability.
+      - CLASSIFIER_HTTP_TIMEOUT_S=${CLASSIFIER_HTTP_TIMEOUT_S:-240}
       - LOG_LEVEL=INFO
       # The four concurrency limits: jobs at once, (criterion, item) units one
       # job evaluates at once, model calls in flight across ALL jobs (every
       # call type — the vision model is the bottleneck; muse-glimmer runs
-      # --max-num-seqs 4), and OCR passes at once. See API.md § Concurrency
+      # --max-num-seqs 8 and the classifier takes 6, leaving 2 for the
+      # LiteLLM chat chains), and OCR passes at once. See API.md § Concurrency
       # and durability.
       - CLASSIFIER_MAX_CONCURRENT=${CLASSIFIER_MAX_CONCURRENT:-4}
-      - CLASSIFIER_MAX_UNITS_PER_JOB=${CLASSIFIER_MAX_UNITS_PER_JOB:-4}
-      - CLASSIFIER_MAX_LLM_CALLS=${CLASSIFIER_MAX_LLM_CALLS:-4}
+      - CLASSIFIER_MAX_UNITS_PER_JOB=${CLASSIFIER_MAX_UNITS_PER_JOB:-6}
+      - CLASSIFIER_MAX_LLM_CALLS=${CLASSIFIER_MAX_LLM_CALLS:-6}
       - CLASSIFIER_OCR_WORKERS=${CLASSIFIER_OCR_WORKERS:-4}
       # Document support: how many items (pages, across every document) one
       # request may carry, which OCR engine backs `text` criteria and scanned

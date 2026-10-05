@@ -45,8 +45,8 @@ from common.net import BlockedURLError, validate_url as _validate_url
 from config import (
     ACCEPTED_CONTENT_TYPES,
     BLOCKED_NETWORKS,
+    FETCH_TIMEOUT,
     HTTP_CONNECT_TIMEOUT,
-    HTTP_TIMEOUT,
     MAX_ITEMS,
     MIN_IMAGE_HEIGHT,
     MIN_IMAGE_WIDTH,
@@ -54,7 +54,7 @@ from config import (
 )
 from logger import logger
 
-_http_timeout = httpx.Timeout(HTTP_TIMEOUT, connect=HTTP_CONNECT_TIMEOUT)
+_http_timeout = httpx.Timeout(FETCH_TIMEOUT, connect=HTTP_CONNECT_TIMEOUT)
 
 # ACCEPTED_CONTENT_TYPES lives in config.py (§ Document analysis constants)
 # with the rest of the tunables; the SSRF blocklist itself (BLOCKED_NETWORKS)

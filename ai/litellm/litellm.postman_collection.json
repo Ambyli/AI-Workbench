@@ -323,7 +323,7 @@
                 "completions"
               ]
             },
-            "description": "Chain alias `local-reasoning` -- the semantic router's `reasoning` decision. Orders: muse-glimmer (1) -> qwen3.8-solo (2) -> claude-opus-5-5 (3, overflow only). muse-glimmer's 4 sequences are shared with the classifier; during a classifier batch the overflow hook may mark it busy and this lands on qwen3.8-solo.\n\nSpend log: model group local-reasoning; an anthropic/claude-opus-5-5 row is Opus overflow. LITELLM.md > Chain aliases and the overflow hook."
+            "description": "Chain alias `local-reasoning` -- the semantic router's `reasoning` decision. Orders: muse-glimmer (1) -> qwen3.8-solo (2) -> claude-opus-5-5 (3, overflow only). muse-glimmer's 8 sequences are shared with the classifier, which takes at most 6 (CLASSIFIER_MAX_LLM_CALLS) and leaves 2 for chat; when chat needs more than those 2 the overflow hook may mark it busy and this lands on qwen3.8-solo.\n\nSpend log: model group local-reasoning; an anthropic/claude-opus-5-5 row is Opus overflow. LITELLM.md > Chain aliases and the overflow hook."
           },
           "response": []
         },

@@ -193,7 +193,7 @@ HINT_RUBRICS: dict[str, dict[str, str]] = {
             "For each PRESENCE criterion your 'reason' MUST follow this structure:\n"
             "  'I observe [specific visual evidence]. "
             "Therefore [feature] is [present / absent / uncertain].'\n"
-            "  When DOCUMENT TEXT is provided below, a quoted phrase from that text "
+            "  When DOCUMENT TEXT is provided above, a quoted phrase from that text "
             "counts as evidence just as a visual observation does — e.g. "
             "'I observe the line \"Notice to Owner\" in the document text. "
             "Therefore notice to owner is present.' Say which source you used."
@@ -216,18 +216,35 @@ HINT_RUBRICS: dict[str, dict[str, str]] = {
 
 # Header for the extracted-text block in the user message. The rubric text
 # above and API.md both refer to the block by this name, so change all three
-# together.
+# together. The block comes BEFORE the rubric and the criterion (prefix
+# caching — see llm/prompts.py), which is why the presence rubric says
+# "provided above".
 DOCUMENT_TEXT_HEADING: str = "DOCUMENT TEXT (extracted, may contain OCR errors)"
 
 # ---------------------------------------------------------------------------
 # LLM call behaviour
 # ---------------------------------------------------------------------------
 # MAX_LLM_RETRIES: how many times to retry if the LLM returns unparseable JSON.
-# HTTP_TIMEOUT: seconds to wait for the vLLM server to respond.
+# HTTP_TIMEOUT (CLASSIFIER_HTTP_TIMEOUT_S): seconds one vLLM request may take.
+#   It is httpx's per-read timeout, but responses are NOT streamed — vLLM
+#   sends nothing until the answer is complete — so in practice it bounds the
+#   WHOLE generation: any wait in vLLM's own queue, prefill, every reasoning
+#   token, and the JSON answer. A scoring call that spends most of
+#   VISION_LLM_MAX_TOKENS (8192) reasoning while the model is batching
+#   MAX_LLM_CALLS-many others (plus chat) can run past two minutes, and a
+#   timeout is an HTTP error: NOT retried, it fails that criterion
+#   (call_vllm) or that localisation attempt (call_vllm_json). The wait for
+#   an LLM_CALLS slot is outside it (the slot is taken first). Was a
+#   hard-coded 120; 240 leaves room for the 6-wide batch.
 # HTTP_CONNECT_TIMEOUT: seconds to wait while establishing the TCP connection.
+# FETCH_TIMEOUT: seconds to fetch a `type: "url"` document
+#   (analysis/loading.py). Separate from HTTP_TIMEOUT on purpose — a slow
+#   remote file server is not a reason to hold a submit request for four
+#   minutes.
 MAX_LLM_RETRIES: int = 3
-HTTP_TIMEOUT: float = 120.0
+HTTP_TIMEOUT: float = max(1.0, float(os.environ.get("CLASSIFIER_HTTP_TIMEOUT_S", "240")))
 HTTP_CONNECT_TIMEOUT: float = 10.0
+FETCH_TIMEOUT: float = 120.0
 
 # ---------------------------------------------------------------------------
 # Async job store (SQLite)
@@ -256,16 +273,21 @@ JOB_TTL_HOURS: int = int(os.environ.get("JOB_TTL_HOURS", "24"))
 #   MAX_UNITS_PER_JOB     units ONE job evaluates at once. A job with ten
 #                         criteria on twenty pages still holds only this many
 #                         in flight. A unit waiting on its depends_on holds no
-#                         slot. Defaults to MAX_LLM_CALLS' 4, so a lone job
-#                         can fill every model slot; it was 2, which left a
-#                         single job using half the model. Lower it to keep
-#                         one big job from crowding out the others.
+#                         slot. Defaults to MAX_LLM_CALLS' 6, so a lone job
+#                         can fill every model slot the classifier has (it
+#                         was 2, then 4). Lower it to keep one big job from
+#                         crowding out the others.
 #   MAX_LLM_CALLS         model calls in flight across ALL jobs, every call
 #                         type — scoring, box ask, refine, verify. Acquired in
 #                         llm/client.py around the HTTP request itself, so no
 #                         call path can go around it. Size it to the vision
-#                         model: muse-glimmer admits 4 (--max-num-seqs 4) and
-#                         queues the rest inside vLLM.
+#                         model: muse-glimmer schedules 8 (--max-num-seqs 8)
+#                         and the classifier takes 6, leaving 2 for the
+#                         LiteLLM chat chains muse-glimmer also serves — their
+#                         overflow hook spills chat to the next order (and in
+#                         the end to Claude) once vLLM's waiting queue stays
+#                         non-empty, so filling all 8 here would push chat
+#                         off the local model.
 #   OCR_WORKERS           OCR passes at once. Each is one ONNX inference in a
 #                         worker thread; the engine is shared.
 #
@@ -279,9 +301,9 @@ JOB_TTL_HOURS: int = int(os.environ.get("JOB_TTL_HOURS", "24"))
 # rows written by another process (or left behind by a crash).
 MAX_CONCURRENT: int = max(1, int(os.environ.get("CLASSIFIER_MAX_CONCURRENT", "4")))
 MAX_UNITS_PER_JOB: int = max(
-    1, int(os.environ.get("CLASSIFIER_MAX_UNITS_PER_JOB", "4"))
+    1, int(os.environ.get("CLASSIFIER_MAX_UNITS_PER_JOB", "6"))
 )
-MAX_LLM_CALLS: int = max(1, int(os.environ.get("CLASSIFIER_MAX_LLM_CALLS", "4")))
+MAX_LLM_CALLS: int = max(1, int(os.environ.get("CLASSIFIER_MAX_LLM_CALLS", "6")))
 OCR_WORKERS: int = max(1, int(os.environ.get("CLASSIFIER_OCR_WORKERS", "4")))
 PAYLOAD_DIR: str = os.environ.get(
     "PAYLOAD_DIR", os.path.join(os.path.dirname(DB_PATH) or ".", "payloads")

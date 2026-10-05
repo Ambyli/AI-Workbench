@@ -1,10 +1,12 @@
 """The reference-guided scoring prompt, and the pure helpers around it.
 
   * ``build_llm_prompt(references=None)`` (and ``[]``) is BYTE-FOR-BYTE the
-    prompt the service sent before references existed — pinned by hash, for
-    four representative calls. If you change the scoring prompt on purpose,
-    regenerate the hashes with ``_hash(build_llm_prompt(*args, **kwargs))``
-    for each ``GOLDEN`` call and say so in the change.
+    plain prompt — pinned by hash, for four representative calls. If you
+    change the scoring prompt on purpose, regenerate the hashes with
+    ``_hash(build_llm_prompt(*args, **kwargs))`` for each ``GOLDEN`` call and
+    say so in the change.
+  * the prefix-cache layout: two criteria on the same image and text share a
+    serialized prefix running through the whole DOCUMENT TEXT block;
   * with examples: the content order (each caption then its image, the
     CANDIDATE heading, the candidate, then the usual text), the captions per
     verdict, the one system-prompt sentence, and that only the candidate's
@@ -24,19 +26,24 @@ import json
 import pytest
 
 from analysis.references import combine, plan_calls
+from config import DOCUMENT_TEXT_HEADING, HINT_RUBRICS
 from llm.prompts import CANDIDATE_HEADING, ReferenceExample, build_llm_prompt
 from llm.validate import description_validator
 
 # sha256 of json.dumps(build_llm_prompt(*args, **kwargs), sort_keys=True,
-# ensure_ascii=False) on the code BEFORE references were added (default env).
+# ensure_ascii=False) (default env). The two calls WITHOUT document text are
+# still the hashes from before references were added; the two WITH text were
+# regenerated when the DOCUMENT TEXT block moved ahead of the rubric and the
+# criterion for vLLM prefix caching (and the presence rubric's "provided
+# below" became "provided above").
 GOLDEN = [
     ((("ZmFrZQ==", "has a house"), {}),
      "e577ab6fc567d7a15314ea972227b3d4c4066d1fb19964f14f74ac2b524c2249"),
     ((("ZmFrZQ==", "has a house", "presence", "Total due $5"), {"document_kind": "pdf"}),
-     "edb6a534f255d9f59e3c6a7255e4109df7a5b507485f307aaed16415501d1b0f"),
+     "ff79fee2611e44ddcd6c16030c944c64c3bc3d67763b7a3cae1613d83a682f6e"),
     (((None, "mentions a warranty", "auto", "Limited Warranty text"),
       {"document_kind": "txt", "text_truncated": True}),
-     "c42481fa89abba4dbd92959531ef90c465d991510c71c60ba68b9c22352c493a"),
+     "096e85e3692b0d506ccb57ae9fa89d190dda1edbb9b4f8cbfde00cafc038af1f"),
     ((("ZmFrZQ==", "image sharpness", "quality"), {}),
      "08766fcc8c87747f99262f29aa162eae3c5b03755e370df3a291622c3810c20c"),
 ]
@@ -54,6 +61,43 @@ def test_no_references_is_byte_identical_to_before(call, digest, references):
     if references != "omitted":
         kwargs = {**kwargs, "references": references}
     assert _hash(build_llm_prompt(*args, **kwargs)) == digest
+
+
+@pytest.mark.parametrize("document_kind, image", [("pdf", "ZmFrZQ=="), ("txt", None)])
+def test_criteria_on_one_page_share_a_prefix_through_the_document_text(document_kind, image):
+    """Prefix caching: different names AND different hints on the same image
+    and text layer serialize to messages that agree on everything up to the
+    rubric — system prompt, image, context line and the WHOLE text block —
+    so vLLM can serve that prefix from cache for every criterion on a page."""
+    text = "Account 0042\nAmount due $193.33\n" + "Line item text. " * 400
+    first = build_llm_prompt(image, "has a house", "presence", text,
+                             document_kind=document_kind)
+    second = build_llm_prompt(image, "image sharpness is acceptable", "quality", text,
+                              document_kind=document_kind)
+    a = json.dumps(first["messages"], ensure_ascii=False)
+    b = json.dumps(second["messages"], ensure_ascii=False)
+    common = 0
+    while common < min(len(a), len(b)) and a[common] == b[common]:
+        common += 1
+    shared = a[:common]
+
+    assert first["messages"][0] == second["messages"][0]  # same system prompt
+    # The shared prefix runs through the whole text block (json-escaped as
+    # it is serialized) and stops at the rubric, the first per-criterion part.
+    block = json.dumps(f"{DOCUMENT_TEXT_HEADING}:\n---\n{text}\n---\n",
+                       ensure_ascii=False)[1:-1]
+    assert block in shared
+    assert HINT_RUBRICS["presence"]["heading"] not in shared
+    assert HINT_RUBRICS["quality"]["heading"] not in shared
+    assert "CRITERION:" not in shared
+    if image:
+        assert "ZmFrZQ==" in shared
+    # And the per-criterion parts still follow, in order.
+    user = first["messages"][1]["content"][-1]["text"]
+    assert (user.index(DOCUMENT_TEXT_HEADING)
+            < user.index(HINT_RUBRICS["presence"]["heading"])
+            < user.index("CRITERION: has a house")
+            < user.index("Score this one criterion"))
 
 
 def _example(verdict="PASS", score=10, reason="two storeys", whole=False, image="UEFTUw=="):

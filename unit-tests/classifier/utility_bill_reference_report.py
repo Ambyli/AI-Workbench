@@ -45,9 +45,25 @@ Usage (from the repo root)::
     # real; the llm criterion comes back status: error
     uv run --package classifier python unit-tests/classifier/utility_bill_reference_report.py --local
 
-With no candidates given, ``utility_bill.jpeg`` is checked and expected to
-PASS. ``--expect PASS|MARGINAL|FAIL`` asserts the guided verdict of every
-candidate given.
+With no candidates given, the spec's ``candidates`` are run, each with its
+own ``expect`` (the guided verdict) and optional ``expect_changed`` (the
+reference must flip the verdict: guided ≠ baseline). Documents on the
+command line replace them; ``--expect PASS|MARGINAL|FAIL`` then asserts the
+guided verdict of every one.
+
+**An example where the reference decides the answer** —
+``utility_bill_k7_reference.json``. "Is this a utility bill?" is something
+the model already knows, so the default spec's reference has nothing to add
+(PASS 10 either way). The K7 spec asks *"This document is an intake class
+K7 document"* — an internal label the model has never seen, defined ONLY by
+the reference (the AEP bill, PASS 10). Without it the model scores the Ohio
+Edison bill FAIL ("intake class K7 is absent"); with it, PASS ("a
+residential electric bill matching the intake class K7 example"). The
+roofing invoice is FAIL both ways, so the reference teaches a meaning
+rather than passing everything::
+
+    uv run --package classifier python unit-tests/classifier/utility_bill_reference_report.py \\
+        --spec unit-tests/classifier/utility_bill_k7_reference.json
 """
 
 from __future__ import annotations
@@ -70,11 +86,9 @@ if str(HERE) not in sys.path:
 import regions_report as rr  # noqa: E402 — after the path insert; it sets up `common`
 
 from common.env import load_env  # noqa: E402
-from common.vision import slugify_criterion  # noqa: E402
 
 DEFAULT_SPEC = HERE / "utility_bill_reference.json"
-DEFAULT_CANDIDATE = HERE / "documents" / "utility_bill.jpeg"
-DEFAULT_CANDIDATE_EXPECT = "PASS"
+VERDICTS = ("PASS", "MARGINAL", "FAIL")
 FOLDER = "Utility bill, guided by a reference"
 REFERENCE_DIR = "reference"     # under the output root
 REFERENCE_TERMINAL = ("ready", "failed")
@@ -93,6 +107,18 @@ ANSWERS = {
 
 
 @dataclasses.dataclass
+class Candidate:
+    """A document to judge, and what its guided run should come to."""
+
+    document: pathlib.Path
+    expect: Optional[str] = None
+    # The reference must flip the verdict: guided ≠ baseline.
+    expect_changed: bool = False
+    # Passed on the command line rather than listed in the spec.
+    adhoc: bool = False
+
+
+@dataclasses.dataclass
 class Spec:
     """``utility_bill_reference.json``, checked before anything is sent."""
 
@@ -103,6 +129,7 @@ class Spec:
     breakdown: dict[str, dict]
     regions: dict[str, list]
     criteria: list[dict]
+    candidates: list[Candidate] = dataclasses.field(default_factory=list)
 
     @property
     def reference_criteria(self) -> list[dict]:
@@ -144,6 +171,16 @@ def load_spec(path: pathlib.Path, document: Optional[pathlib.Path]) -> Spec:
                 f"{path.name}: {c['name']!r} carries options.reference, which the "
                 "baseline call (no references) would refuse — the guided call matches by name"
             )
+    candidates = []
+    for entry in raw.get("candidates") or []:
+        if entry.get("expect") not in (None, *VERDICTS):
+            raise SystemExit(f"{path.name}: candidate {entry.get('document')!r}: "
+                             f"expect must be one of {VERDICTS}")
+        candidates.append(Candidate(
+            document=(rr.REPO_ROOT / entry["document"]).resolve(),
+            expect=entry.get("expect"),
+            expect_changed=bool(entry.get("expect_changed")),
+        ))
     doc = document or (rr.REPO_ROOT / ref["document"])
     return Spec(
         document=doc.expanduser().resolve(),
@@ -153,6 +190,7 @@ def load_spec(path: pathlib.Path, document: Optional[pathlib.Path]) -> Spec:
         breakdown=breakdown,
         regions=regions,
         criteria=criteria,
+        candidates=candidates,
     )
 
 
@@ -326,7 +364,17 @@ class CandidateResult:
     expect: Optional[str]
     guided: rr.CaseResult
     baseline: Optional[rr.CaseResult] = None
+    expect_changed: bool = False
     checks: list[dict] = dataclasses.field(default_factory=list)
+
+    @property
+    def changed(self) -> Optional[bool]:
+        """Did the reference flip the overall verdict? None when there is no
+        baseline, or either side has no verdict to compare."""
+        if self.baseline is None:
+            return None
+        before, after = rr.overall(self.baseline)[0], rr.overall(self.guided)[0]
+        return None if before is None or after is None else before != after
 
     @property
     def ok(self) -> bool:
@@ -342,18 +390,17 @@ def _assess_case(
         form["references"] = rr._compact([reference_id])
         name = f"guided by the reference — {document.name}"
         description = (
-            "The same criteria with references: [the reference]. The llm criterion "
+            "The same criteria with references: [the reference]. Each llm criterion "
             "matches the reference's criterion by name, so its one scoring call carries "
-            "two images: the reference (with its answer, PASS 10, as the caption) and "
-            "this document. The text criteria are not answered by the model and are "
-            "unchanged."
+            "two images: the reference (captioned with its answer) and this document. "
+            "Text criteria are not answered by the model and are unchanged."
         )
     else:
         name = f"baseline, no reference — {document.name}"
         description = (
-            "One /assess call: the llm criterion 'This document is a utility bill: …' "
-            "(one scoring call, the page as its one image) and four text criteria "
-            "searched in the OCR'd text. No references — the comparison point."
+            "One /assess call with the spec's criteria — each llm criterion one "
+            "scoring call with the page as its one image, each text criterion a search "
+            "of the OCR'd text. No references — the comparison point."
         )
     return rr.Case(
         name=name, folder=FOLDER, index=index, method="POST",
@@ -363,7 +410,7 @@ def _assess_case(
 
 
 def run_candidate(
-    document: pathlib.Path,
+    candidate: Candidate,
     spec: Spec,
     reference_id: Optional[str],
     transport: Any,
@@ -371,9 +418,8 @@ def run_candidate(
     args: argparse.Namespace,
     *,
     first_index: int,
-    expect: Optional[str],
-    adhoc: bool,
 ) -> CandidateResult:
+    document, adhoc = candidate.document, candidate.adhoc
     baseline = None
     index = first_index
     if not args.no_baseline:
@@ -388,7 +434,8 @@ def run_candidate(
                      reference_id=reference_id, adhoc=adhoc),
         transport, out_root, args, keep_remote=True,
     )
-    return CandidateResult(document=document, expect=expect, guided=guided, baseline=baseline)
+    return CandidateResult(document=document, expect=candidate.expect, guided=guided,
+                           baseline=baseline, expect_changed=candidate.expect_changed)
 
 
 def reference_detail(result: rr.CaseResult, name: str) -> dict:
@@ -466,6 +513,22 @@ def check_candidate(cand: CandidateResult, spec: Spec, *, local: bool) -> None:
             "kind": "verdict", "target": "guided overall verdict", "ok": verdict == cand.expect,
             "expected": cand.expect, "actual": actual,
         })
+
+    if cand.expect_changed:
+        target = "the reference changed the verdict"
+        expected = "guided verdict ≠ baseline verdict"
+        before = rr.overall(cand.baseline)[0] if cand.baseline else None
+        if cand.baseline is None:
+            cand.checks.append({"kind": "impact", "target": target, "ok": True, "skipped": True,
+                                "expected": expected, "actual": "--no-baseline: nothing to compare"})
+        elif local and errored:
+            cand.checks.append({"kind": "impact", "target": target, "ok": True, "skipped": True,
+                                "expected": expected,
+                                "actual": "local mode: no vision model, so no verdict to compare"})
+        else:
+            cand.checks.append({"kind": "impact", "target": target, "ok": bool(cand.changed),
+                                "expected": expected,
+                                "actual": f"{before or '—'} → {verdict or '—'}"})
 
 
 def comparison(cand: CandidateResult, spec: Spec) -> list[dict]:
@@ -717,6 +780,12 @@ def _tally(ref: ReferenceResult, cands: list[CandidateResult]) -> tuple[int, int
     return met, len(checks), skipped
 
 
+def _changed_cell(cand: CandidateResult) -> str:
+    if cand.changed is None:
+        return "<span class='skip'>—</span>"
+    return "<span class='ok'>yes</span>" if cand.changed else "no"
+
+
 def write_html(path: pathlib.Path, ref: ReferenceResult, cands: list[CandidateResult],
                spec: Spec, meta: dict) -> None:
     e = rr._e
@@ -734,8 +803,9 @@ def write_html(path: pathlib.Path, ref: ReferenceResult, cands: list[CandidateRe
             f"<td>{rr._verdict_pill(b_verdict) + ' ' + e(b_score) if cand.baseline else '—'}</td>"
             f"<td>{rr._verdict_pill(g_verdict)} {e(g_score if g_score is not None else '')}</td>"
             f"<td>{e(llm_b.get('score') if llm_b else '—')} → {e(llm_g.get('score'))}</td>"
+            f"<td>{_changed_cell(cand)}</td>"
             f"<td>{e(ANSWERS.get(g_verdict or '', '—'))}</td>"
-            f"<td>{e(cand.expect or '—')}</td>"
+            f"<td>{e(cand.expect or '—')}{' · must change' if cand.expect_changed else ''}</td>"
             "</tr>"
         )
     parts = [
@@ -749,7 +819,8 @@ def write_html(path: pathlib.Path, ref: ReferenceResult, cands: list[CandidateRe
         "POST /assess without references, POST /assess with references: [id] → DELETE "
         "/references/{id}</p>",
         "<table><thead><tr><th>candidate</th><th>without the reference</th>"
-        "<th>with the reference</th><th>llm score without → with</th><th>answer</th>"
+        "<th>with the reference</th><th>llm score without → with</th>"
+        "<th>verdict changed?</th><th>answer</th>"
         "<th>expected</th></tr></thead><tbody>" + "".join(rows) + "</tbody></table>",
         f'<p class="tally">{met}/{total} checks met'
         + (f" ({skipped} skipped)" if skipped else "") + "</p>",
@@ -798,6 +869,8 @@ def write_summary_json(path: pathlib.Path, ref: ReferenceResult, cands: list[Can
         {
             "document": rr._rel(cand.document),
             "expect": cand.expect,
+            "expect_changed": cand.expect_changed,
+            "changed": cand.changed,
             "answer": ANSWERS.get(rr.overall(cand.guided)[0] or ""),
             "baseline": call(cand.baseline),
             "guided": call(cand.guided),
@@ -821,8 +894,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("candidates", type=pathlib.Path, nargs="*",
-                        help="Documents to judge (default: documents/utility_bill.jpeg, "
-                             f"expected {DEFAULT_CANDIDATE_EXPECT})")
+                        help="Documents to judge (default: the spec's `candidates`, with "
+                             "their expectations)")
     parser.add_argument("--spec", type=pathlib.Path, default=DEFAULT_SPEC,
                         help="Reference + criteria JSON (default: utility_bill_reference.json)")
     parser.add_argument("--reference", type=pathlib.Path,
@@ -836,8 +909,9 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                         help="Do not DELETE the reference this run created; its id is printed")
     parser.add_argument("--no-baseline", action="store_true",
                         help="Skip the unguided /assess call per candidate")
-    parser.add_argument("--expect", choices=("PASS", "MARGINAL", "FAIL"),
-                        help="Assert this guided overall verdict for every candidate given")
+    parser.add_argument("--expect", choices=VERDICTS,
+                        help="Assert this guided overall verdict for every candidate given "
+                             "on the command line")
     parser.add_argument("--base-url", help="Classifier base URL, LiteLLM pass-through included "
                                            "(default: CLASSIFIER_BASE_URL, else "
                                            f"{rr.DEFAULT_BASE_URL})")
@@ -877,12 +951,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     if not args.reference_id and not spec.document.is_file():
         raise SystemExit(f"reference document not found: {spec.document}")
     if args.candidates:
-        candidates = [(p.expanduser().resolve(), args.expect, True) for p in args.candidates]
+        candidates = [Candidate(p.expanduser().resolve(), expect=args.expect, adhoc=True)
+                      for p in args.candidates]
     else:
-        candidates = [(DEFAULT_CANDIDATE, args.expect or DEFAULT_CANDIDATE_EXPECT, False)]
-    for path, _, _ in candidates:
-        if not path.is_file():
-            raise SystemExit(f"candidate not found: {path}")
+        candidates = spec.candidates
+    if not candidates:
+        raise SystemExit(f"no candidates: pass documents, or list them under `candidates` "
+                         f"in {args.spec.name}")
+    for cand in candidates:
+        if not cand.document.is_file():
+            raise SystemExit(f"candidate not found: {cand.document}")
 
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
     out_root = (args.out or (rr.DEFAULT_REPORTS_DIR / f"utility-bill-reference-{stamp}")).resolve()
@@ -913,12 +991,12 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         if ref.status == "ready":
             index = 1
-            for document, expect, adhoc in candidates:
-                print(f"  · {document.name}: "
+            for candidate in candidates:
+                print(f"  · {candidate.document.name}: "
                       f"{'guided' if args.no_baseline else 'baseline, then guided'}", flush=True)
                 cand = run_candidate(
-                    document, spec, ref.reference_id, transport, out_root, args,
-                    first_index=index, expect=expect, adhoc=adhoc,
+                    candidate, spec, ref.reference_id, transport, out_root, args,
+                    first_index=index,
                 )
                 index += 1 if args.no_baseline else 2
                 check_candidate(cand, spec, local=args.local)
@@ -950,6 +1028,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"{cand.document.name}: {verdict or cand.guided.phase} "
               f"{score if score is not None else ''} — "
               f"{ANSWERS.get(verdict or '', cand.guided.error or 'no answer')}")
+        if cand.changed is not None:
+            before = rr.overall(cand.baseline)
+            print(f"    without the reference: {before[0]} {before[1]} — "
+                  + ("the reference CHANGED the verdict" if cand.changed
+                     else "same verdict either way"))
         def shown(side: Optional[dict]) -> str:
             if side is None:
                 return "—"

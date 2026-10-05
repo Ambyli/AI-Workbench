@@ -425,6 +425,17 @@ The collection **is** the suite, so that is all. Two things to know:
   errors with no model); `test_utility_bill_reference_report.py` drives the
   guided path with a scripted model. Needs a classifier with the references
   API and `VISION_LLM_MAX_IMAGES_PER_PROMPT` ≥ 2.
+
+  That default spec shows the plumbing, not an effect: the model already
+  knows a utility bill, so it is PASS 10 with or without the example.
+  `--spec unit-tests/classifier/utility_bill_k7_reference.json` is the
+  example where **the reference decides the answer**: the criterion is
+  *"This document is an intake class K7 document"*, an internal label only
+  the reference defines. On the box (2026-10-05) the Ohio Edison bill went
+  FAIL 1 → PASS 10 ("a residential electric bill matching the intake class
+  K7 example") and the roofing invoice stayed FAIL 1 both ways. A spec lists
+  its own `candidates`, each with `expect` and optionally `expect_changed`
+  (a check that the guided verdict differs from the baseline).
 * [`ai/classifier/API.md`](../../ai/classifier/API.md) — the request/response
   reference, § Regions and layers and § The text a criterion searched in
   particular.

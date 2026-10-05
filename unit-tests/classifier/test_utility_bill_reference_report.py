@@ -42,9 +42,10 @@ def _content(obj: dict) -> dict:
 
 
 class ScriptedModel:
-    """Scores 7 with no example in view, 10 with one."""
+    """Scores ``baseline`` with no example in view, 10 with one."""
 
-    def __init__(self):
+    def __init__(self, baseline: int = 7):
+        self.baseline = baseline
         self.calls: list[tuple[int, list[str]]] = []   # (images, text parts)
 
     async def __call__(self, prompt: dict) -> dict:
@@ -57,9 +58,10 @@ class ScriptedModel:
                              "reason": "I observe an account number, a billing period, kWh "
                                        "usage and an amount due, laid out like the reference. "
                                        "Therefore a utility bill is present."})
-        return _content({"score": 7, "verdict": "PASS", "confidence": 70,
-                         "reason": "I observe a statement with an amount due. Therefore a "
-                                   "utility bill is likely present."})
+        verdict = "PASS" if self.baseline >= 7 else "MARGINAL" if self.baseline >= 4 else "FAIL"
+        return _content({"score": self.baseline, "verdict": verdict, "confidence": 70,
+                         "reason": "I observe a statement with an amount due. Therefore the "
+                                   "criterion is judged without an example."})
 
 
 @pytest.fixture
@@ -162,3 +164,54 @@ def test_keep_reference_and_no_baseline(monkeypatch, tmp_path, capsys, restore_e
     [cand] = summary["candidates"]
     assert cand["baseline"] is None
     assert cand["comparison"][0]["delta"] is None
+
+
+def test_spec_candidates_and_a_flipped_verdict(monkeypatch, tmp_path, capsys, restore_environ):
+    """The K7 example: an internal label only the reference defines. With no
+    candidates on the command line the spec's own are run, each with its own
+    expectation, and ``expect_changed`` asserts the reference flipped it."""
+    import utility_bill_reference_report as report
+    from llm import client as llm_client
+
+    model = ScriptedModel(baseline=1)
+    monkeypatch.setattr(llm_client, "_send", model)
+    spec = json.loads((HERE / "utility_bill_k7_reference.json").read_text(encoding="utf-8"))
+    # Only the bill: the scripted model cannot tell an invoice from a bill.
+    spec["candidates"] = [c for c in spec["candidates"] if c["document"].endswith("utility_bill.jpeg")]
+    assert spec["candidates"][0]["expect_changed"] is True
+    path = tmp_path / "spec.json"
+    path.write_text(json.dumps(spec), encoding="utf-8")
+    out = tmp_path / "report"
+
+    code = report.main(["--local", "--spec", str(path), "--out", str(out)])
+    stdout = capsys.readouterr().out
+    summary = json.loads((out / "summary.json").read_text(encoding="utf-8"))
+
+    assert code == 0, stdout
+    assert "7/7 checks met\n" in stdout
+    assert "without the reference: FAIL 1 — the reference CHANGED the verdict" in stdout
+    [cand] = summary["candidates"]
+    assert cand["document"].endswith("documents/utility_bill.jpeg")
+    assert (cand["baseline"]["verdict"], cand["guided"]["verdict"]) == ("FAIL", "PASS")
+    assert cand["changed"] is True and cand["expect_changed"] is True
+    impact = next(c for c in cand["checks"] if c["kind"] == "impact")
+    assert impact["ok"] is True and impact["actual"] == "FAIL → PASS"
+
+
+def test_expect_changed_fails_when_the_reference_changes_nothing(
+        monkeypatch, tmp_path, capsys, restore_environ):
+    import utility_bill_reference_report as report
+    from llm import client as llm_client
+
+    monkeypatch.setattr(llm_client, "_send", ScriptedModel(baseline=9))
+    spec = json.loads((HERE / "utility_bill_k7_reference.json").read_text(encoding="utf-8"))
+    spec["candidates"] = spec["candidates"][:1]
+    path = tmp_path / "spec.json"
+    path.write_text(json.dumps(spec), encoding="utf-8")
+
+    code = report.main(["--local", "--spec", str(path), "--out", str(tmp_path / "report")])
+    stdout = capsys.readouterr().out
+
+    assert code == 1, stdout
+    assert "6/7 checks met" in stdout
+    assert "same verdict either way" in stdout

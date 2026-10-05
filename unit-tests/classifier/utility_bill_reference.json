@@ -1,0 +1,29 @@
+{
+  "reference": {
+    "document": "unit-tests/classifier/documents/utility_bill_2.jpeg",
+    "title": "AEP Ohio electric bill (photo, front and back)",
+    "description": "Photo of a two-page AEP Ohio residential electric bill laid side by side on a table: the account summary with the amount due, a kWh usage-history chart, line-item delivery and supplier charges, meter-read details and a tear-off payment stub.",
+    "tags": ["utility-bills", "electric", "reference-report"],
+    "breakdown": {
+      "This document is a utility bill: a statement from an electric, gas or water utility showing an account number, a billing period, metered usage and an amount due": {
+        "score": 10,
+        "reason": "An AEP Ohio residential electric bill: the utility's logo, an account number, a 29-day billing period, metered usage in kWh with a 12-month usage history, line-item delivery and supplier charges, the total amount due with its due date, and a tear-off payment stub."
+      }
+    },
+    "regions": {
+      "This document is a utility bill: a statement from an electric, gas or water utility showing an account number, a billing period, metered usage and an amount due": []
+    }
+  },
+  "criteria": [
+    {"name": "This document is a utility bill: a statement from an electric, gas or water utility showing an account number, a billing period, metered usage and an amount due",
+     "type": "llm", "weight": 3, "options": {"hint": "presence"}},
+    {"name": "states metered usage (kWh, therms, CCF or gallons)", "type": "text",
+     "options": {"pattern": "\\b(kwh|therms?|ccf|gallons)\\b", "match": "regex", "min_count": 2}},
+    {"name": "shows an amount due", "type": "text",
+     "options": {"pattern": "(amount|total|balance)\\s+due", "match": "regex"}},
+    {"name": "shows an account number", "type": "text",
+     "options": {"pattern": "account\\s*(number|no\\.?|#)", "match": "regex"}},
+    {"name": "states a billing or service period", "type": "text",
+     "options": {"pattern": "(billing|service)\\s+(period|from)", "match": "regex"}}
+  ]
+}

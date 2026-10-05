@@ -402,6 +402,10 @@ class LocalTransport:
         os.environ["DB_PATH"] = str(workdir / "classifier.db")
         os.environ["PAYLOAD_DIR"] = str(workdir / "payloads")
         os.environ["CLASSIFIER_ARTIFACT_DIR"] = str(workdir / "artifacts")
+        # References live in their own never-swept root; left at its default
+        # (/data/references) a local run would write customer pages outside
+        # the work directory.
+        os.environ["CLASSIFIER_REFERENCE_DIR"] = str(workdir / "references")
         os.environ.setdefault("CLASSIFIER_OCR_ENGINE", "rapidocr")
         os.environ.setdefault("PYTHONIOENCODING", "utf-8")
         # A network dependency with nothing behind it here. Empty
@@ -614,14 +618,25 @@ def fetch_artifacts(
 
 
 def run_case(
-    case: Case, transport: Any, out_root: pathlib.Path, args: argparse.Namespace
+    case: Case,
+    transport: Any,
+    out_root: pathlib.Path,
+    args: argparse.Namespace,
+    *,
+    keep_remote: bool = False,
 ) -> CaseResult:
-    """Submit, poll, download, annotate — one case, start to finish."""
+    """Submit, poll, download, annotate — one case, start to finish.
+
+    ``keep_remote`` sends the criteria unchanged in local mode too: for a
+    caller whose subject IS the llm criterion, dropping it leaves nothing to
+    report, and a ``status: "error"`` (or a scripted model) is the honest
+    local outcome.
+    """
     out_dir = out_root / case.slug
     out_dir.mkdir(parents=True, exist_ok=True)
     result = CaseResult(case=case, out_dir=out_dir)
 
-    if transport.local:
+    if transport.local and not keep_remote:
         note = _strip_remote_criteria(case, result.dropped_criteria)
         if note:
             result.notes.append(note)

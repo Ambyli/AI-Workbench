@@ -1,0 +1,99 @@
+# INTERNAL DEMO STACK — the chatbot API plus its staff/demo portal (inbox, CRM,
+# customer table) at http://localhost:8000. It is bound to loopback only and must
+# never be exposed publicly.
+#
+# The public-facing Service page mock (website + nginx + this API with the staff API
+# OFF) lives in docker-compose.mock.yml.
+
+services:
+  chatbot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: zeo-damage-chatbot
+    restart: unless-stopped
+    ports:
+      # Loopback only (S-M7): reachable from this machine, not the LAN.
+      - "127.0.0.1:${CHATBOT_PORT:-8000}:8000"
+    environment:
+      - ENABLE_STAFF_API=${ENABLE_STAFF_API:-true}   # demo portal needs the staff API
+      - STAFF_API_KEY=${STAFF_API_KEY:-}
+      - LLM_BACKEND=${LLM_BACKEND:-vllm}
+      - LLM_REQUIRED=${LLM_REQUIRED:-false}
+      - LLM_TIMEOUT_SECONDS=${LLM_TIMEOUT_SECONDS:-12}
+      # Compose service name, NOT localhost: inside this container "localhost" is the
+      # chatbot itself, which made every compose run silently fall back to the mock (S-H4).
+      - VLLM_BASE_URL=${VLLM_BASE_URL:-http://vllm:8000/v1}
+      - VLLM_MODEL=${VLLM_MODEL:-qwen3.8}
+      - VLLM_API_KEY=${VLLM_API_KEY:-}
+      - OLLAMA_HOST=${OLLAMA_HOST:-http://host.docker.internal:11434}
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-qwen3.8:27b}
+      - USE_MOCK_LLM=${USE_MOCK_LLM:-0}
+      - CORS_ALLOW_ORIGINS=${CORS_ALLOW_ORIGINS:-http://localhost:8000,http://127.0.0.1:8000}
+      - RATE_LIMIT_REQUESTS=${RATE_LIMIT_REQUESTS:-60}
+      - RATE_LIMIT_WINDOW_SECONDS=${RATE_LIMIT_WINDOW_SECONDS:-60}
+      - MAX_ACTIVE_USERS=${MAX_ACTIVE_USERS:-3}
+      - MAX_QUEUE_SIZE=${MAX_QUEUE_SIZE:-10}
+      - SESSION_TTL_SECONDS=${SESSION_TTL_SECONDS:-3600}
+      - MAX_SESSIONS=${MAX_SESSIONS:-5000}
+      - ANSWER_CONFIDENCE_THRESHOLD=${ANSWER_CONFIDENCE_THRESHOLD:-0.7}
+      - CRM_BACKEND=${CRM_BACKEND:-stub}
+      - CRM_ADDRESS_MIN_SCORE=${CRM_ADDRESS_MIN_SCORE:-55}
+      - CRM_NAME_MIN_SCORE=${CRM_NAME_MIN_SCORE:-65}
+      - CRM_DB_URL=${CRM_DB_URL:-}
+      - EMAIL_SEND_ENABLED=${EMAIL_SEND_ENABLED:-false}
+      - EMAIL_FROM=${EMAIL_FROM:-service-bot@zeoenergy.com}
+      - MAILBOX_DISPOSITION=${MAILBOX_DISPOSITION:-service-team@zeoenergy.com}
+      - MAILBOX_UNVERIFIED=${MAILBOX_UNVERIFIED:-intake-review@zeoenergy.com}
+      - MAILBOX_SOLAR=${MAILBOX_SOLAR:-performance-team@zeoenergy.com}
+      - CHAT_SEND_ENABLED=${CHAT_SEND_ENABLED:-false}
+      - CHAT_BACKEND=${CHAT_BACKEND:-stub}
+      - RETENTION_DAYS=${RETENTION_DAYS:-30}
+      - GEOCODER=${GEOCODER:-nominatim}
+    volumes:
+      - chatbot_data:/app/data           # runtime data (inbox, feed, uploads) — S-M6
+    networks:
+      - zeo-network
+
+  # Optional local vLLM server (docker compose --profile vllm up). Most setups use the
+  # remote Qwen server via VLLM_BASE_URL instead.
+  vllm:
+    # Pin to a specific tag or digest before any production use (S-M7 / LLM03).
+    image: ${VLLM_IMAGE:-vllm/vllm-openai:latest}
+    container_name: zeo-vllm-server
+    profiles: ["vllm"]
+    restart: unless-stopped
+    # Not published to the host: only the chatbot reaches it over zeo-network (S-M7).
+    expose:
+      - "8000"
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}
+    # --api-key: the OpenAI-compatible endpoint requires the same key the chatbot sends.
+    # --trust-remote-code removed (LLM03): Qwen models are natively supported by vLLM.
+    command: >
+      --model ${VLLM_MODEL:-Qwen/Qwen2.5-27B-Instruct}
+      --dtype auto
+      --max-model-len 4096
+      --api-key ${VLLM_API_KEY:-change-me}
+      --disable-log-requests
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    networks:
+      - zeo-network
+
+volumes:
+  chatbot_data:
+    driver: local
+  hf_cache:
+    driver: local
+
+networks:
+  zeo-network:
+    driver: bridge

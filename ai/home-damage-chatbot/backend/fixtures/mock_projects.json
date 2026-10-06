@@ -1,0 +1,40 @@
+{
+  "_comment": "SYNTHETIC test accounts for the mock page and tests. Shaped like the phoenix project rows the account queries return. Every name and street is invented (solar-themed street names do not exist); cities and ZIPs are real so parsing and scoring behave realistically. Used only when CRM_BACKEND=stub. Never add real customer data here. The scenarios list is the cheat sheet in docs/MOCK_ACCOUNTS.md and is checked by tests/mock_accounts_test.py.",
+  "projects": [
+    {"project_id": "900001", "project_name": "Jane Doe",             "street1": "100 Solar Way",      "street2": "",          "city": "Tampa",           "state": "FL", "postal_code": "33601"},
+    {"project_id": "900002", "project_name": "Marcus Bell",          "street1": "318 Kilowatt Dr",    "street2": "",          "city": "Clearwater",      "state": "FL", "postal_code": "33755"},
+    {"project_id": "900003", "project_name": "John & Maria Alvarez", "street1": "42 Sunbeam Ln",      "street2": "",          "city": "Orlando",         "state": "FL", "postal_code": "32801"},
+    {"project_id": "900004", "project_name": "Hensley Family Trust", "street1": "77 Photon Ct",       "street2": "",          "city": "Sarasota",        "state": "FL", "postal_code": "34236"},
+    {"project_id": "900005", "project_name": "Priya Raman",          "street1": "1500 Inverter Blvd", "street2": "",          "city": "St. Petersburg",  "state": "FL", "postal_code": "33701"},
+    {"project_id": "900006", "project_name": "Priya Raman",          "street1": "1500 Inverter Blvd", "street2": "",          "city": "St. Petersburg",  "state": "FL", "postal_code": "33701"},
+    {"project_id": "900007", "project_name": "Michael Johnson",      "street1": "25 Array Ave",       "street2": "",          "city": "Tampa",           "state": "FL", "postal_code": "33602"},
+    {"project_id": "900008", "project_name": "Michael Johnson",      "street1": "25 Array Ave",       "street2": "",          "city": "Lakeland",        "state": "FL", "postal_code": "33801"},
+    {"project_id": "900009", "project_name": "Laura Chen",           "street1": "300 Voltage St",     "street2": "",          "city": "Tampa",           "state": "FL", "postal_code": "33603"},
+    {"project_id": "900010", "project_name": "Devon Price",          "street1": "88 Battery Blvd",    "street2": "Unit 4B",   "city": "Tampa",           "state": "FL", "postal_code": "33606"},
+    {"project_id": "900011", "project_name": "Grace Kim",            "street1": "PO Box 1180",        "street2": "910 Solstice Ave", "city": "Brandon", "state": "FL", "postal_code": "33511"},
+    {"project_id": "900012", "project_name": "Omar Haddad",          "street1": "720 S Photon Way",   "street2": "",          "city": "Lehi",            "state": "UT", "postal_code": "84043"},
+    {"project_id": "900013", "project_name": "Chris Taylor",         "street1": "12 Panel Ct",        "street2": "",          "city": "Tampa",           "state": "FL", "postal_code": "33604"},
+    {"project_id": "900014", "project_name": "Chris Taylor",         "street1": "12 Panel Ct",        "street2": "",          "city": "Tampa",           "state": "FL", "postal_code": "33612"},
+    {"project_id": "900015", "project_name": "Robert Smith",         "street1": "59 Wattage Way",     "street2": "",          "city": "Tampa",           "state": "FL", "postal_code": "33607"}
+  ],
+  "scenarios": [
+    {"id": "S01", "what": "Clean match",                                 "address": "100 Solar Way, Tampa, FL 33601",          "name": "Jane Doe",             "expect": "900001"},
+    {"id": "S02", "what": "Typos in street, suffix and city",            "address": "318 Kilowat Drive, Clearwatr FL 33755",  "name": "Marcus Bell",          "expect": "900002"},
+    {"id": "S03", "what": "No commas, no ZIP, lower-case name",          "address": "318 Kilowatt Dr Clearwater FL",          "name": "marcus bell",          "expect": "900002"},
+    {"id": "S04", "what": "One person of a couple on the account",       "address": "42 Sunbeam Ln, Orlando, FL 32801",       "name": "Maria Alvarez",        "expect": "900003"},
+    {"id": "S05", "what": "Trust account, customer gives own name",      "address": "77 Photon Ct, Sarasota, FL 34236",       "name": "Robert Hensley",       "expect": null},
+    {"id": "S06", "what": "Trust account, customer gives the trust name", "address": "77 Photon Ct, Sarasota, FL 34236",       "name": "Hensley Family Trust", "expect": "900004"},
+    {"id": "S07", "what": "Two projects on one home (re-install)",       "address": "1500 Inverter Blvd, St. Petersburg, FL 33701", "name": "Priya Raman",   "expect": "900005"},
+    {"id": "S08", "what": "Same name and street, Tampa home",            "address": "25 Array Ave, Tampa, FL 33602",          "name": "Michael Johnson",      "expect": "900007"},
+    {"id": "S09", "what": "Same name and street, Lakeland home",         "address": "25 Array Ave, Lakeland, FL 33801",       "name": "Michael Johnson",      "expect": "900008"},
+    {"id": "S10", "what": "Right house number, wrong street",            "address": "300 Meadow St, Tampa, FL 33603",         "name": "Laura Chen",           "expect": null},
+    {"id": "S11", "what": "Right street, wrong house number",            "address": "302 Voltage St, Tampa, FL 33603",        "name": "Laura Chen",           "expect": null},
+    {"id": "S12", "what": "Unit number typed as Apt",                    "address": "88 Battery Blvd Apt 4B, Tampa, FL 33606", "name": "Devon Price",         "expect": "900010"},
+    {"id": "S13", "what": "Service address stored on street line 2",     "address": "910 Solstice Ave, Brandon, FL 33511",    "name": "Grace Kim",            "expect": "900011"},
+    {"id": "S14", "what": "Directional spelled out",                     "address": "720 South Photon Way, Lehi, UT 84043",   "name": "Omar Haddad",          "expect": "900012"},
+    {"id": "S15", "what": "Two homes too close to call (no ZIP)",        "address": "12 Panel Ct, Tampa, FL",                 "name": "Chris Taylor",         "expect": null},
+    {"id": "S16", "what": "Nickname for the account name",               "address": "59 Wattage Way, Tampa, FL 33607",        "name": "Bob Smith",            "expect": null},
+    {"id": "S17", "what": "Full account name",                           "address": "59 Wattage Way, Tampa, FL 33607",        "name": "Robert Smith",         "expect": "900015"},
+    {"id": "S18", "what": "Real address, wrong person",                  "address": "100 Solar Way, Tampa, FL 33601",         "name": "Nobody Atall",         "expect": null}
+  ]
+}

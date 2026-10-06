@@ -368,13 +368,13 @@ One caveat: a session expiry that happened **before** `login_actions` were in us
 ```json
 "login_url_patterns": ["login", "signin", "/auth", "sso\\.enphaseenergy\\.com"],
 "login_actions": [
-  {"type": "fill", "selector": "input[type=email], input[name=username], #username", "value": "${username}"},
-  {"type": "fill", "selector": "input[type=password]", "value": "${password}"},
-  {"type": "click", "selector": "button[type=submit], input[type=submit]"}
+  {"type": "fill", "selector": "#username", "value": "${username}"},
+  {"type": "fill", "selector": "#password", "value": "${password}"},
+  {"type": "click", "selector": "input[type=submit].button"}
 ]
 ```
 
-with `ai/interceptor/logins/enphase.json` holding `allowed_origins: ["https://sso.enphaseenergy.com"]`. If the page asks for the email first and shows the password on a second page, put a `{"type": "wait_for", "selector": "input[type=password]"}` before the password fill. The selectors are written to match the common shapes of the SSO form; confirm them against the live page (a failed step's error says which one missed). The full lookup with these steps is in the [worked example](#worked-example-discover-the-form-then-run-the-lookup).
+with `ai/interceptor/logins/enphase.json` holding `allowed_origins: ["https://sso.enphaseenergy.com"]`. The selectors were read off the live SSO form (2026-10-06): `https://sso.enphaseenergy.com/login`, one page with `#username` ("Enlighten Username"), `#password` and an `<input type=submit class="button">` "Log in" — no iframe, no shadow DOM. If Enphase changes the form, a failed step's error says which selector missed. The full lookup with these steps is in the [worked example](#worked-example-discover-the-form-then-run-the-lookup).
 
 ### Worked example: discover the form, then run the lookup
 
@@ -481,7 +481,7 @@ The answer is the match whose `returnValue` is a JSON **string** of an array (th
 
 Several serials can go in one `fill` value separated by newlines or commas (the page says so); each comes back as one element of that array.
 
-**3 — The lookup, signing in when the session has expired.** The same body plus [`login_actions`](#login-actions) and a window long enough for the SSO round trip. Needs `ai/interceptor/logins/enphase.json` (see [The credentials file](#the-credentials-file)); the login selectors are still to be confirmed against the live SSO page:
+**3 — The lookup, signing in when the session has expired.** The same body plus [`login_actions`](#login-actions) and a window long enough for the SSO round trip. Needs `ai/interceptor/logins/enphase.json` (see [The credentials file](#the-credentials-file)); the login selectors were read off the live SSO form:
 
 ```json
 {
@@ -492,9 +492,9 @@ Several serials can go in one `fill` value separated by newlines or commas (the 
   "login_timeout": 30,
   "login_url_patterns": ["login", "signin", "/auth", "sso\\.enphaseenergy\\.com"],
   "login_actions": [
-    {"type": "fill", "selector": "input[type=email], input[name=username], #username", "value": "${username}"},
-    {"type": "fill", "selector": "input[type=password]", "value": "${password}"},
-    {"type": "click", "selector": "button[type=submit], input[type=submit]"}
+    {"type": "fill", "selector": "#username", "value": "${username}"},
+    {"type": "fill", "selector": "#password", "value": "${password}"},
+    {"type": "click", "selector": "input[type=submit].button"}
   ],
   "stop_when_matched": true,
   "actions": [

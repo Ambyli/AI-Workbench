@@ -1284,10 +1284,10 @@ def capture_url(
             username or password and never put one in a step. Enphase:
             ``login_url_patterns=["login", "signin", "/auth",
             "sso\\.enphaseenergy\\.com"]``, ``login_actions=[{"type": "fill",
-            "selector": "input[type=email], input[name=username], #username",
-            "value": "${username}"}, {"type": "fill", "selector":
-            "input[type=password]", "value": "${password}"}, {"type": "click",
-            "selector": "button[type=submit], input[type=submit]"}]``. Raise
+            "selector": "#username", "value": "${username}"},
+            {"type": "fill", "selector": "#password", "value":
+            "${password}"}, {"type": "click", "selector":
+            "input[type=submit].button"}]``. Raise
             ``capture_window_seconds`` (~120) so the login, the redirect and
             the page load all fit; the result says what happened in
             ``login_actions_report``.

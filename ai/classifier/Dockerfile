@@ -59,6 +59,7 @@ COPY ai/classifier/cv ./ai/classifier/cv
 COPY ai/classifier/detector ./ai/classifier/detector
 COPY ai/classifier/jobs ./ai/classifier/jobs
 COPY ai/classifier/llm ./ai/classifier/llm
+COPY ai/classifier/references ./ai/classifier/references
 COPY ai/classifier/regions ./ai/classifier/regions
 
 # The operator tools. `bin/` is not imported by the service — it holds scripts

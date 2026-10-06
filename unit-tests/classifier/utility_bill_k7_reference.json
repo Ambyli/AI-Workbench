@@ -1,0 +1,24 @@
+{
+  "reference": {
+    "document": "unit-tests/classifier/documents/utility_bill_2.jpeg",
+    "title": "Intake class K7 — AEP Ohio electric bill (photo)",
+    "description": "Photo of a two-page AEP Ohio residential electric bill laid side by side on a table: the account summary with the amount due, a kWh usage-history chart, line-item delivery and supplier charges, meter-read details and a tear-off payment stub.",
+    "tags": ["intake-k7", "utility-bills", "reference-report"],
+    "breakdown": {
+      "This document is an intake class K7 document": {
+        "score": 10,
+        "reason": "An AEP Ohio residential electric bill: the utility's logo, an account number, a billing period, metered kWh usage with a usage history, line-item charges and the amount due."
+      }
+    },
+    "regions": {
+      "This document is an intake class K7 document": []
+    }
+  },
+  "candidates": [
+    {"document": "unit-tests/classifier/documents/utility_bill.jpeg", "expect": "PASS", "expect_changed": true},
+    {"document": "unit-tests/classifier/documents/invoice_native.pdf", "expect": "FAIL"}
+  ],
+  "criteria": [
+    {"name": "This document is an intake class K7 document", "type": "llm", "options": {"hint": "presence"}}
+  ]
+}

@@ -328,6 +328,40 @@ def pdf_page_count(raw: bytes) -> int:
             doc.close()
 
 
+def pdf_page_size(
+    raw: bytes, index: int = 0, *, render_dpi: int = DEFAULT_RENDER_DPI
+) -> tuple[int, int]:
+    """The ``(width, height)`` in pixels page ``index`` renders to at ``render_dpi``.
+
+    The size ``load_document`` would give that page, WITHOUT rendering it:
+    the page rectangle is transformed by the same zoom matrix
+    ``get_pixmap(dpi=…)`` builds and its integer rectangle read off. Lets a
+    request handler check caller-supplied pixel coordinates against a PDF
+    page it has not rasterised yet.
+
+    Raises:
+        UnsupportedDocumentError: PyMuPDF cannot open the stream.
+        IndexError: ``index`` is not a page of this PDF.
+    """
+    import pymupdf
+
+    with _PYMUPDF_LOCK:
+        try:
+            doc = pymupdf.open(stream=raw, filetype="pdf")
+        except Exception as exc:
+            raise UnsupportedDocumentError(f"Could not open PDF: {exc}") from exc
+        try:
+            if not 0 <= index < doc.page_count:
+                raise IndexError(f"page {index} is not in a {doc.page_count}-page PDF")
+            page = doc.load_page(index)
+            zoom = render_dpi / 72.0
+            rect = page.rect * pymupdf.Matrix(zoom, zoom)
+            irect = rect.irect
+            return int(irect.width), int(irect.height)
+        finally:
+            doc.close()
+
+
 # ---------------------------------------------------------------------------
 # Native-PDF geometry for a text hit
 # ---------------------------------------------------------------------------
@@ -416,6 +450,13 @@ def pdf_text_regions(
     (the space every Region lives in), and the original rectangle is kept in
     ``attrs["pdf_rect"]`` so PDF tooling can use it directly.
 
+    **Rotated pages.** ``search_for`` and ``get_text("words")`` answer in the
+    UNROTATED page space, while the render — and ``page.rect`` — are rotated
+    by the page's ``/Rotate``. Each rectangle is mapped through
+    ``rotation_matrix`` before scaling; without it a ``/Rotate 270`` plan-set
+    sheet put every box on the wrong axis. ``pdf_rect`` stays unrotated,
+    because that is the space PDF tooling (annotations, ``search_for``) uses.
+
     Args:
         pdf_bytes:   The original PDF (``Document.source_bytes``).
         page:        The already-loaded page — supplies the index and the
@@ -454,9 +495,10 @@ def pdf_text_regions(
             if page.index >= doc.page_count:
                 return []
             pdf_page = doc.load_page(page.index)
-            rect = pdf_page.rect
+            rect = pdf_page.rect            # rotated — the render's frame
             sx = page.width / rect.width if rect.width else 1.0
             sy = page.height / rect.height if rect.height else 1.0
+            to_rendered = pdf_page.rotation_matrix  # identity when /Rotate is 0
 
             found: list[tuple[tuple[float, float, float, float], str, float]] = []
             if mode in ("contains", "exact") and pattern:
@@ -471,11 +513,12 @@ def pdf_text_regions(
                         found.append((box, getattr(hit, "text", ""), getattr(hit, "ratio", 1.0)))
 
             for (x0, y0, x1, y1), text, ratio in found:
+                shown = pymupdf.Rect(x0, y0, x1, y1) * to_rendered
                 regions.append(
                     Region(
                         page=page.index,
                         kind="box",
-                        points=[(x0 * sx, y0 * sy), (x1 * sx, y1 * sy)],
+                        points=[(shown.x0 * sx, shown.y0 * sy), (shown.x1 * sx, shown.y1 * sy)],
                         label=region_label,
                         score=1.0,
                         source="pdf-text",

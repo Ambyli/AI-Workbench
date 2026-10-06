@@ -35,20 +35,37 @@ imports nothing (a router import there would close the cycle).
 
 from __future__ import annotations
 
-from typing import Any, Literal, Optional
+import re
+from typing import Any, Literal, Optional, Union
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from common.documents import Document, InvalidPatternError, match_text
 
 from api.criterion_options import (
     LEGACY_TOP_LEVEL_KEYS,
     NAME_MAX_CHARS,
+    NOT_GUIDED,
     OPTIONS_MODELS,
     TextOptions,
+    answered_by_llm,
     can_locate,
 )
-from config import DEFAULT_CRITERIA
+from config import (
+    DEFAULT_CRITERIA,
+    REFERENCE_MAX_PER_REQUEST,
+    REFERENCE_MAX_TAGS,
+    REFERENCE_TAG_MAX_CHARS,
+    VISION_LLM_MAX_IMAGES_PER_PROMPT,
+)
+from cv import get_detector
 
 CriterionType = Literal["llm", "text", "cv", "detector"]
 
@@ -56,12 +73,29 @@ CriterionType = Literal["llm", "text", "cv", "detector"]
 class ClassifierMetadata(BaseModel):
     """Per-job metadata for the classifier, stored in ``jobs.metadata``.
 
-    ``type`` is always "assess" now; rows written by an older container may
-    still say "compare" or "locate", and the worker refuses those by name.
+    ``type`` is "assess" (POST /assess) or "reference" (the creation job
+    POST /references queues); rows written by an older container may still
+    say "compare" or "locate", and the worker refuses those by name.
+
+    ``reference_id`` is set on a "reference" job — the reference it builds.
+    ``references`` lists the reference ids an "assess" job reads, which is
+    what lets DELETE /references/{id} refuse (409) while one is queued or
+    running. Both are left out of the stored JSON when unset, so an assess
+    job's metadata is exactly ``{type, request_id}`` as before.
     """
 
     type: str
     request_id: str
+    reference_id: Optional[str] = None
+    references: Optional[list[str]] = None
+
+    def model_dump(self, **kwargs: Any) -> dict[str, Any]:
+        kwargs.setdefault("exclude_none", True)
+        return super().model_dump(**kwargs)
+
+    def model_dump_json(self, **kwargs: Any) -> str:
+        kwargs.setdefault("exclude_none", True)
+        return super().model_dump_json(**kwargs)
 
 
 def _format_errors(exc: ValidationError, prefix: str = "") -> str:
@@ -156,12 +190,20 @@ class CriterionInput(BaseModel):
             raw = {}
         if not isinstance(raw, dict):
             raise ValueError(f"options must be an object, got {type(raw).__name__}")
+        if "reference" in raw and self.type in ("text", "detector"):
+            raise ValueError(f"options.reference: {NOT_GUIDED} (a {self.type} criterion)")
         try:
             self.options = model.model_validate(raw)
         except ValidationError as exc:
             raise ValueError(_format_errors(exc, "options.")) from None
         if self.type == "text":
             _check_pattern(self.name, self.options)
+        if self.type == "cv" and self.options.reference is not None and not self.guided_by_llm():
+            raise ValueError(
+                f"options.reference: {NOT_GUIDED} — '{self.name}' is answered by "
+                + ("an OpenCV detector" if get_detector(self.name) is not None
+                   else "the detector service (options.fallback)")
+            )
         return self
 
     # ── Resolved values ───────────────────────────────────────────────────
@@ -172,6 +214,15 @@ class CriterionInput(BaseModel):
     def can_locate(self) -> bool:
         """Whether this criterion can produce any geometry at all."""
         return can_locate(self.type, self.name, self.resolved_options())
+
+    def guided_by_llm(self) -> bool:
+        """Whether the vision model answers it — the only criteria a reference
+        can guide (``llm``, or a ``cv`` name answered by the llm fallback)."""
+        return answered_by_llm(self.type, self.name, self.resolved_options())
+
+    def reference_options(self) -> Optional[dict[str, Any]]:
+        """The resolved ``options.reference``, or None when it was not sent."""
+        return self.resolved_options().get("reference")
 
     def scope(self) -> str:
         """"document" for a text criterion with options.scope "document" — one
@@ -208,6 +259,40 @@ class DocumentInput(BaseModel):
     )
 
 
+_REFERENCE_ID_RE = re.compile(r"^r[0-9a-f]{12}$")
+
+
+class AutoReferences(BaseModel):
+    """``references: {"auto": true, "tags": [...], "tags_match": "all" | "any"}``
+    — let the service pick examples from the stored references. ``"auto"``
+    alone is this with no tag filter."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    auto: Literal[True]
+    tags: list[str] = Field(
+        default_factory=list,
+        description="Only references carrying these tags (lowercased).",
+    )
+    tags_match: Literal["all", "any"] = Field(
+        default="any", description="A reference needs all of the tags, or any one."
+    )
+
+    @field_validator("tags")
+    @classmethod
+    def _tags(cls, tags: list[str]) -> list[str]:
+        out: list[str] = []
+        for tag in tags:
+            value = tag.strip().lower()
+            if not value or len(value) > REFERENCE_TAG_MAX_CHARS:
+                raise ValueError(f"each tag is 1-{REFERENCE_TAG_MAX_CHARS} characters")
+            if value not in out:
+                out.append(value)
+        if len(out) > REFERENCE_MAX_TAGS:
+            raise ValueError(f"at most {REFERENCE_MAX_TAGS} tags")
+        return out
+
+
 class AssessRequest(BaseModel):
     """The whole /assess request — JSON and multipart both land here.
 
@@ -233,8 +318,54 @@ class AssessRequest(BaseModel):
     criteria: list[CriterionInput] = Field(
         default_factory=lambda: [CriterionInput.model_validate(c) for c in DEFAULT_CRITERIA],
         min_length=1,
-        description="What to evaluate. Omitted: the four default quality criteria.",
+        description=(
+            "What to evaluate. Omitted: the criteria of the listed `references`, "
+            "merged by name — or, without references, the four default quality criteria."
+        ),
     )
+    references: Optional[Union[list[str], Literal["auto"], AutoReferences]] = Field(
+        default=None,
+        description=(
+            "Stored worked examples (POST /references) to show the vision model beside "
+            "each llm-answered criterion: a list of reference ids, \"auto\", or "
+            "{\"auto\": true, \"tags\": [...], \"tags_match\": \"all\" | \"any\"}."
+        ),
+    )
+
+    def criteria_given(self) -> bool:
+        """Whether the caller sent ``criteria`` (False = the default, or —
+        with explicit references — theirs, inherited at submit)."""
+        return "criteria" in self.model_fields_set
+
+    def reference_ids(self) -> list[str]:
+        """The explicit reference ids, or [] for none / auto."""
+        return list(self.references) if isinstance(self.references, list) else []
+
+    def auto_references(self) -> Optional[AutoReferences]:
+        return self.references if isinstance(self.references, AutoReferences) else None
+
+    @field_validator("references", mode="after")
+    @classmethod
+    def _reference_shape(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        if value == "auto":
+            return AutoReferences(auto=True)
+        if isinstance(value, list):
+            if not value:
+                raise ValueError("references is an empty list; omit it, or list reference ids")
+            bad = [v for v in value if not _REFERENCE_ID_RE.match(v)]
+            if bad:
+                raise ValueError(f"not reference ids (r + 12 hex): {bad}")
+            dupes = sorted({v for v in value if value.count(v) > 1})
+            if dupes:
+                raise ValueError(f"duplicate reference ids: {dupes}")
+            if len(value) > REFERENCE_MAX_PER_REQUEST:
+                raise ValueError(
+                    f"{len(value)} references exceeds CLASSIFIER_REFERENCE_MAX_PER_REQUEST="
+                    f"{REFERENCE_MAX_PER_REQUEST}"
+                )
+        return value
 
     @model_validator(mode="after")
     def _one_document_list(self) -> "AssessRequest":
@@ -253,49 +384,80 @@ class AssessRequest(BaseModel):
 
     @model_validator(mode="after")
     def _cross_criterion_rules(self) -> "AssessRequest":
-        by_name: dict[str, CriterionInput] = {}
-        for c in self.criteria:
-            if c.name in by_name:
-                raise ValueError(f"duplicate criterion name {c.name!r}; names must be unique")
-            by_name[c.name] = c
-
-        for c in self.criteria:
-            if not c.score and not c.can_locate():
-                raise ValueError(
-                    f"criterion {c.name!r} has score: false but cannot produce "
-                    "any geometry, so it would return nothing — "
-                    + _locate_hint(c)
-                )
-            if c.depends_on is None:
-                continue
-            if c.depends_on == c.name:
-                raise ValueError(f"criterion {c.name!r} depends on itself")
-            dep = by_name.get(c.depends_on)
-            if dep is None:
-                raise ValueError(
-                    f"criterion {c.name!r} depends_on {c.depends_on!r}, which is not "
-                    f"a criterion in this request (known: {sorted(by_name)})"
-                )
-            if not dep.score:
-                raise ValueError(
-                    f"criterion {c.name!r} depends_on {c.depends_on!r}, which has "
-                    "score: false — it produces no verdict, so nothing could ever "
-                    "satisfy the dependency"
-                )
-
-        # Cycles: follow each chain; a revisit within one walk is a loop.
-        for c in self.criteria:
-            seen = [c.name]
-            current = c
-            while current.depends_on is not None:
-                nxt = current.depends_on
-                if nxt in seen:
-                    raise ValueError(
-                        "dependency cycle: " + " -> ".join(seen + [nxt])
-                    )
-                seen.append(nxt)
-                current = by_name[nxt]
+        check_criteria_rules(self.criteria)
         return self
+
+    @model_validator(mode="after")
+    def _reference_rules(self) -> "AssessRequest":
+        """The reference rules that need no store lookup (``references.resolve``
+        does the rest, at submit)."""
+        guided = [c.name for c in self.criteria if c.reference_options() is not None]
+        if self.references is None:
+            if guided:
+                raise ValueError(
+                    f"options.reference on {guided} but the request lists no `references`"
+                )
+            return self
+        if VISION_LLM_MAX_IMAGES_PER_PROMPT < 2:
+            raise ValueError(
+                "this container's vision model takes one image per request "
+                f"(VISION_LLM_MAX_IMAGES_PER_PROMPT={VISION_LLM_MAX_IMAGES_PER_PROMPT}), so an "
+                "example cannot be shown beside the candidate; drop `references`"
+            )
+        return self
+
+
+def check_criteria_rules(criteria: list[CriterionInput]) -> None:
+    """The cross-criterion rules, for any request that carries a criteria list.
+
+    Unique names, ``score: false`` only where there is geometry to return,
+    dependencies that exist, are scored and are acyclic. Raises
+    ``ValueError`` (a 400 through the request model that calls it) — shared
+    by ``AssessRequest`` and POST /references' request model so the two can
+    never accept different lists.
+    """
+    by_name: dict[str, CriterionInput] = {}
+    for c in criteria:
+        if c.name in by_name:
+            raise ValueError(f"duplicate criterion name {c.name!r}; names must be unique")
+        by_name[c.name] = c
+
+    for c in criteria:
+        if not c.score and not c.can_locate():
+            raise ValueError(
+                f"criterion {c.name!r} has score: false but cannot produce "
+                "any geometry, so it would return nothing — "
+                + _locate_hint(c)
+            )
+        if c.depends_on is None:
+            continue
+        if c.depends_on == c.name:
+            raise ValueError(f"criterion {c.name!r} depends on itself")
+        dep = by_name.get(c.depends_on)
+        if dep is None:
+            raise ValueError(
+                f"criterion {c.name!r} depends_on {c.depends_on!r}, which is not "
+                f"a criterion in this request (known: {sorted(by_name)})"
+            )
+        if not dep.score:
+            raise ValueError(
+                f"criterion {c.name!r} depends_on {c.depends_on!r}, which has "
+                "score: false — it produces no verdict, so nothing could ever "
+                "satisfy the dependency"
+            )
+
+    # Cycles: follow each chain; a revisit within one walk is a loop.
+    for c in criteria:
+        seen = [c.name]
+        current = c
+        while current.depends_on is not None:
+            nxt = current.depends_on
+            if nxt in seen:
+                raise ValueError(
+                    "dependency cycle: " + " -> ".join(seen + [nxt])
+                )
+            seen.append(nxt)
+            current = by_name[nxt]
 
 
 def _check_pattern(name: str, options: TextOptions) -> None:

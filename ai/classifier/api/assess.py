@@ -11,14 +11,29 @@ JSON caller and a multipart caller take exactly the same path:
                          Both keys at once is a 400.
     multipart/form-data  repeated `file` parts (the legacy `image` alias still
                           works) and/or repeated `text` fields, in form order,
-                          plus a `criteria` field holding the same JSON array.
+                          plus a `criteria` field holding the same JSON array
+                          and an optional `references` field (a JSON array of
+                          reference ids, the word ``auto``, or the JSON
+                          ``{"auto": true, ...}`` object).
+
+Either way, an omitted ``criteria`` is genuinely omitted — the multipart path
+no longer fills in the defaults itself — so the model can tell "the caller
+sent none" from "the caller sent these": with explicit ``references`` the
+listed references' criteria are inherited; without, the four default
+quality criteria apply as before.
 
 Then, before anything is queued — every one of these is a 400 on THIS
 request rather than a job that fails in a worker a minute later:
 
   1. validate the request (per-type options, caps, text patterns, unique
      names, dependencies, cycles, ``score: false`` only where there is
-     geometry) — ``AssessRequest``;
+     geometry, the static reference rules) — ``AssessRequest``;
+  1b. resolve ``references`` against the store (``references.resolve``):
+     unknown ids 400, not-ready 409, inherited criteria merged and
+     re-validated, the per-criterion example cap, position against a
+     whole-page example — the plan the worker follows rides in the payload.
+     ``references: "auto"`` fixes its candidate POOL here (and the catalogue
+     the worker's per-item selection call reads);
   2. resolve every document's bytes: decode base64, encode inline text, or
      fetch the URL (SSRF-checked by ``common.net``) — at submit, because
      step 3 needs them;
@@ -56,7 +71,7 @@ from common.documents import UnsupportedDocumentError, detect_kind, pdf_page_cou
 
 from analysis import load_input_bytes, validate_content_type
 from api.schemas import AssessRequest, ClassifierMetadata, DocumentInput, validation_message
-from config import DEFAULT_CRITERIA, MAX_ITEMS
+from config import MAX_ITEMS
 from cv import get_detector
 # A module, not names: is_configured() reads DETECTOR_URL at call time.
 from detector import client as detector_client
@@ -65,6 +80,8 @@ from jobs.queue import jobs_registry, queue
 from logger import logger
 from metrics import jobs_total
 from middleware import request_id_var
+from references.resolve import ReferenceResolutionError, resolve_references
+from references.store import reference_registry
 
 router = APIRouter(tags=["assess"])
 
@@ -72,7 +89,7 @@ router = APIRouter(tags=["assess"])
 # each occurrence is one document, in form order. Anything else is refused by
 # name, which is how a caller still sending the removed `ocr` / `regions`
 # fields finds out they now live on each criterion.
-_FORM_FIELDS = {"file", "image", "text", "criteria"}
+_FORM_FIELDS = {"file", "image", "text", "criteria", "references"}
 _REMOVED_FORM_FIELDS = {
     "ocr": "each llm / text criterion's options.ocr",
     "regions": "nothing — regions are always stored now, and layers render on first fetch",
@@ -99,6 +116,9 @@ _OPENAPI = {
                                  "description": "Inline text documents — repeat for more"},
                         "criteria": {"type": "string",
                                      "description": "JSON array of criterion objects"},
+                        "references": {"type": "string",
+                                       "description": "JSON array of reference ids, "
+                                                      "'auto', or a JSON {\"auto\": true, ...}"},
                     },
                 }
             },
@@ -173,6 +193,8 @@ async def _from_form(request: Request) -> tuple[AssessRequest, list[_Upload]]:
         )
     if len(form.getlist("criteria")) > 1:
         raise _bad("Send 'criteria' once — one JSON array covers every document")
+    if len(form.getlist("references")) > 1:
+        raise _bad("Send 'references' once — one JSON array of reference ids")
 
     uploads: list[_Upload] = []
     documents: list[dict] = []
@@ -207,19 +229,43 @@ async def _from_form(request: Request) -> tuple[AssessRequest, list[_Upload]]:
             "either may repeat."
         )
 
+    body: dict[str, Any] = {"documents": documents}
     raw_criteria = form.get("criteria")
-    if raw_criteria is None:
-        criteria: Any = DEFAULT_CRITERIA
-    else:
+    # Omitted stays omitted: the model's default (or, with references, the
+    # inherited criteria) applies, and `criteria_given()` can tell.
+    if raw_criteria is not None:
         try:
-            criteria = json.loads(str(raw_criteria))
+            body["criteria"] = json.loads(str(raw_criteria))
         except json.JSONDecodeError as exc:
             raise _bad(
                 f"'criteria' is not valid JSON: {exc}. Expected a JSON array, e.g. "
                 '[{"name": "has solar panels", "type": "llm", "options": {"hint": "presence"}}]'
             )
-    model = _validate({"documents": documents, "criteria": criteria})
+    raw_references = form.get("references")
+    if raw_references is not None:
+        text = str(raw_references).strip()
+        if text == "auto":
+            body["references"] = "auto"
+        else:
+            try:
+                body["references"] = json.loads(text)
+            except json.JSONDecodeError as exc:
+                raise _bad(
+                    f"'references' is not valid JSON: {exc}. Expected a JSON array of "
+                    'reference ids, e.g. ["r0123456789ab"], or the word auto'
+                )
+    model = _validate(body)
     return model, uploads
+
+
+async def _resolve(model: AssessRequest):
+    """The store-checked reference rules; the (maybe inherited) request and
+    the worker's plan."""
+    try:
+        resolved = await resolve_references(model, reference_registry)
+    except ReferenceResolutionError as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail)
+    return resolved
 
 
 def _label(index: int, filename: str) -> str:
@@ -321,6 +367,8 @@ async def assess(request: Request):
             ),
         )
 
+    resolved = await _resolve(model)
+    model = resolved.request
     submitted = _check_documents(model, uploads)
     logger.info(
         "assess: %d document(s) %s, %d item(s), criteria=%s",
@@ -331,10 +379,19 @@ async def assess(request: Request):
     )
 
     job_id = await jobs_registry.register(
-        ClassifierMetadata(type="assess", request_id=request_id_var.get("-")),
+        ClassifierMetadata(
+            type="assess",
+            request_id=request_id_var.get("-"),
+            # The ids this job reads, so DELETE /references/{id} can refuse
+            # while it is queued or running. None (left out) without references.
+            references=resolved.reference_ids or None,
+        ),
         initial_phase="staging",
     )
-    depth = await _enqueue(job_id, build_assess_payload(model, submitted, job_id=job_id))
+    depth = await _enqueue(
+        job_id,
+        build_assess_payload(model, submitted, job_id=job_id, references=resolved.plan),
+    )
     jobs_total.labels(type="assess", status="pending").inc()
     logger.info("assess: queued job_id=%s queue_depth=%d", job_id, depth)
     return JSONResponse(status_code=202, content={"job_id": job_id, "phase": "pending"})

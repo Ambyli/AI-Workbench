@@ -11,6 +11,10 @@ per-kind load, and the fetch for a caller-supplied URL.
     _decode_image_bgr()          — raw image bytes → BGR numpy array.
     load_document_bytes()        — raw bytes → Document (kind detection, every
                                    page up to ``max_pages``, PDF render DPI).
+    load_document_page()         — raw bytes → a ONE-page Document: page
+                                   ``page`` of a PDF (only the pages up to it
+                                   are rendered), or the image. What a
+                                   reference — always one page — is built on.
     validate_url()               — the SSRF check on a caller-supplied URL. The
                                    rule itself is ``common.net`` (the detector
                                    service needs the identical one); this is the
@@ -23,11 +27,12 @@ Process flow position: below the pipeline, above nothing — it imports no
 sibling. ``load_input_bytes`` / ``validate_content_type`` are called by
 ``api.assess`` at submit (the bytes are needed there, for the item cap — a
 PDF counts its pages); ``load_document_bytes`` by ``jobs.runners`` in the
-worker, once per document.
+worker, once per document (``load_document_page`` once per reference).
 """
 
 import base64
 import io
+from dataclasses import replace
 
 import httpx
 import numpy as np
@@ -40,8 +45,8 @@ from common.net import BlockedURLError, validate_url as _validate_url
 from config import (
     ACCEPTED_CONTENT_TYPES,
     BLOCKED_NETWORKS,
+    FETCH_TIMEOUT,
     HTTP_CONNECT_TIMEOUT,
-    HTTP_TIMEOUT,
     MAX_ITEMS,
     MIN_IMAGE_HEIGHT,
     MIN_IMAGE_WIDTH,
@@ -49,7 +54,7 @@ from config import (
 )
 from logger import logger
 
-_http_timeout = httpx.Timeout(HTTP_TIMEOUT, connect=HTTP_CONNECT_TIMEOUT)
+_http_timeout = httpx.Timeout(FETCH_TIMEOUT, connect=HTTP_CONNECT_TIMEOUT)
 
 # ACCEPTED_CONTENT_TYPES lives in config.py (§ Document analysis constants)
 # with the rest of the tunables; the SSRF blocklist itself (BLOCKED_NETWORKS)
@@ -238,6 +243,56 @@ def load_document_bytes(
         doc.has_images(),
     )
     return doc
+
+
+def load_document_page(
+    raw: bytes,
+    filename: str | None = None,
+    content_type: str | None = None,
+    *,
+    page: int = 0,
+    keep_source: bool = True,
+) -> Document:
+    """One page of an upload, as a one-page ``Document`` — or a 400.
+
+    A reference example is ONE page: a JPEG/PNG, or page ``page`` of a PDF.
+    Only the pages up to it are rendered (a PDF's pages render in order),
+    and the result is a view holding just that page, so the pipeline sees a
+    one-item document. ``Page.index`` stays the page's index IN ITS PDF,
+    which is what ``common.documents.pdf_text_regions`` needs to re-open the
+    right page (hence ``keep_source``).
+
+    Raises:
+        HTTPException(400): Unsupported bytes, a text-only kind (.txt /
+            .docx have no page image to show the model), or a page index the
+            document does not have.
+    """
+    try:
+        doc = load_document(
+            raw,
+            filename=filename,
+            content_type=content_type,
+            max_pages=max(1, int(page) + 1),
+            render_dpi=PDF_RENDER_DPI,
+            image_decoder=_decode_image_bgr,
+            keep_source=keep_source,
+        )
+    except UnsupportedDocumentError as exc:
+        logger.warning("load_document_page: rejected %s: %s", filename, exc)
+        raise HTTPException(status_code=400, detail=str(exc))
+    if doc.kind not in ("image", "pdf"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"a {doc.kind} document has no page image; a reference is one "
+                   "JPEG/PNG or one PDF page",
+        )
+    if page >= len(doc.pages):
+        raise HTTPException(
+            status_code=400,
+            detail=f"page {page} is not in {filename or 'the document'} "
+                   f"({len(doc.pages) + doc.truncated_pages} page(s))",
+        )
+    return replace(doc, pages=[doc.pages[page]], truncated_pages=0)
 
 
 def validate_url(url: str) -> None:

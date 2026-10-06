@@ -290,3 +290,76 @@ def test_a_spec_missing_the_common_fields_is_refused():
     with pytest.raises(ValueError, match="every type declares"):
         ResultSpec(type="x", metric="n", metric_from="detail",
                    fields={"n": FieldSpec("n", "integer")})
+
+
+# ---------------------------------------------------------------------------
+# detail.reference — declared once (REFERENCE_FIELD), on the llm type only
+# ---------------------------------------------------------------------------
+
+
+def _guided_plan(name: str) -> dict:
+    """A one-example plan whose composite exists in the reference store —
+    built by hand, so this file needs no reference endpoint."""
+    from references.model import composite_name
+    from references.store import reference_files
+
+    rid = "rfeedfacecafe"
+    reference_files.write(rid, composite_name(name), _png(90))
+    example = {
+        "reference_id": rid, "title": None, "criterion": name,
+        "expected": {"score": 10, "verdict": "PASS", "reason": "it", "source": "caller"},
+        "polarity": "pass", "region_source": "whole_page", "regions": [],
+        "composite": composite_name(name), "geometry": None,
+    }
+    return {
+        "mode": "explicit", "requested": [rid], "pool": None, "pool_truncated": False,
+        "resolved": [rid], "inherited": False,
+        "criteria": {name: {"matched": name, "examples": [example], "options": {
+            "use": True, "criterion": name, "position": "off", "min_iou": 0.3,
+            "combine": "any"}}},
+    }
+
+
+def test_reference_is_declared_on_llm_only():
+    from analysis.result_specs import REFERENCE_FIELD
+
+    declared = specs()
+    assert declared["llm"].fields["reference"] is REFERENCE_FIELD
+    assert not REFERENCE_FIELD.stable and REFERENCE_FIELD.when
+    assert all("reference" not in s.fields for t, s in declared.items() if t != "llm")
+
+
+def test_llm_guided_detail_matches_its_declaration(model):
+    from analysis.result_specs import REFERENCE_DETAIL_KEYS
+
+    c = CriterionInput(name="has a meter", type="llm", options={"hint": "presence"})
+    result = asyncio.run(analysis.analyze_document(
+        [_doc(_png(), "p.png")], [c], references_plan=_guided_plan("has a meter")))
+    entry = _entries(result)["has a meter"]
+    _check_criterion(entry)
+    assert tuple(entry["detail"]["reference"]) == REFERENCE_DETAIL_KEYS
+    assert entry["detail"]["reference"]["applied"] is True
+    assert result["references"]["mode"] == "explicit"
+
+
+def test_cv_llm_fallback_guided_has_the_llm_shape(model):
+    # "has a meter" would fuzzy-match an OpenCV detector; this name matches none.
+    c = CriterionInput(name="has a house", type="cv")
+    result = asyncio.run(analysis.analyze_document(
+        [_doc(_png(), "p.png")], [c], references_plan=_guided_plan("has a house")))
+    entry = _entries(result)["has a house"]
+    assert entry["method"] == "llm"
+    _check_criterion(entry)
+    assert entry["detail"]["reference"]["applied"] is True
+
+
+def test_reference_is_dropped_by_mean_and_kept_in_items(model):
+    c = CriterionInput(name="has a meter", type="llm",
+                       options={"hint": "presence", "aggregate": "mean"})
+    docs = [_doc(_png(), "a.png"), _doc(_png(), "b.png")]
+    result = asyncio.run(analysis.analyze_document(
+        docs, [c], references_plan=_guided_plan("has a meter")))
+    entry = _entries(result)["has a meter"]
+    _check_criterion(entry, aggregated=True)
+    assert "reference" not in entry["detail"]
+    assert all(u["detail"]["reference"]["applied"] for u in entry["items"])

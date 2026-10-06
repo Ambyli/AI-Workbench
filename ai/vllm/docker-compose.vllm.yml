@@ -195,6 +195,18 @@ services:
   # boot with `KeyError: 'invalid tool call parser: muse_glimmer'`.
   # Shares the same GPU pair as qwen3.8 at 0.90 utilisation: run one or the
   # other, not both. See VLLM.md § Muse Glimmer 30B.
+  #
+  # --max-num-seqs 8 is a CEILING on sequences scheduled at once, not a
+  # reservation: the measured KV pool (1,103,211 tokens, 4.21x a full
+  # 262144-token request) holds 8 classifier-sized (~30k-token) calls in
+  # ~22% of it, and longer mixes simply queue inside vLLM. The classifier
+  # takes at most 6 (CLASSIFIER_MAX_LLM_CALLS) so 2 stay free for the
+  # LiteLLM chains this model serves — the overflow hook spills chat away as
+  # soon as vllm:num_requests_waiting stays above 0.
+  # --enable-prompt-tokens-details puts usage.prompt_tokens_details
+  # .cached_tokens in every response, which the classifier records per call
+  # kind (classifier_llm_cached_prompt_tokens_total) to show what the
+  # prefix cache saves.
   muse-glimmer:
     networks:
       - shared
@@ -238,9 +250,10 @@ services:
       --tensor-parallel-size 2
       --dtype auto
       --max-model-len 262144
-      --max-num-seqs 4
+      --max-num-seqs 8
       --gpu-memory-utilization 0.90
       --enable-prefix-caching
+      --enable-prompt-tokens-details
       --enable-chunked-prefill
       --kv-cache-dtype auto
       --generation-config auto
@@ -248,6 +261,7 @@ services:
       --enable-auto-tool-choice
       --tool-call-parser muse_glimmer
       --speculative-config '{"method":"dflash","model":"meta-models/Muse-Glimmer-30B-assistant","num_speculative_tokens":15}'
+      --limit-mm-per-prompt '{"image": 3}'
 
   vllm-qwen-vl:
     networks:

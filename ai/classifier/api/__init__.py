@@ -8,6 +8,10 @@
                          /document-kinds, /health.
     artifacts.py         the four /jobs/{id}/artifacts routes, and the lazy
                          layer renderer behind them.
+    reference_schemas.py ReferenceRequest / ReferencePatch — POST and PATCH
+                         /references.
+    references.py        the /references routes: save a worked example (a
+                         "reference" job builds it), list, read, edit, delete.
 
 Each handler module exposes a ``router`` that ``main`` mounts; ``artifacts``
 exposes a factory instead, because every one of its routes has to look the job

@@ -116,6 +116,26 @@ AGGREGATE_FIELD = FieldSpec(
     when="the criterion ran on more than one item or document",
 )
 
+# `detail.reference` — what the request's references did for one llm-answered
+# unit. Declared once here and listed in the llm type's spec only: a cv
+# criterion answered by the llm fallback returns the llm shape anyway, and no
+# other type is guided. NOT stable (each member has its own examples and
+# calls), so under `mean` it is kept only in `items[]`.
+REFERENCE_FIELD = FieldSpec(
+    "What the request's references did for this unit: `{applied, mode, combine, "
+    "examples: [{reference_id, criterion, expected, polarity, region, call}], "
+    "calls: [{call, images, score, verdict, confidence, reason, chosen, error}], "
+    "position: null | {status, iou, center_offset, min_iou, max_offset, "
+    "reference_id, capped_from}, note}`",
+    "object",
+    when="the request listed `references` (applied: false when no example matched)",
+)
+
+# The keys `detail.reference` always carries, for the tests and for callers.
+REFERENCE_DETAIL_KEYS: tuple[str, ...] = (
+    "applied", "mode", "combine", "examples", "calls", "position", "note",
+)
+
 AGGREGATE_BLOCK: dict[str, str] = {
     "rule": "any | worst | all | mean | sum — the rule that combined the members",
     "level": "pages (one document's items) | documents (the request's documents)",

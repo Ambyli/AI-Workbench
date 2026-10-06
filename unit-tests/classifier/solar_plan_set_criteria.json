@@ -1,0 +1,17 @@
+[
+  {"name": "mentions solar / photovoltaic", "type": "text",
+   "options": {"pattern": "photovoltaic|solar", "match": "regex", "scope": "document", "min_count": 3}},
+  {"name": "has PV/E/S sheet numbers", "type": "text",
+   "options": {"pattern": "\\b(PV|E|S)[ -]?\\d\\.\\d\\b", "match": "regex", "scope": "document", "min_count": 3}},
+  {"name": "cites NEC 690", "type": "text",
+   "options": {"pattern": "NEC\\s*(ARTICLE\\s*)?690", "match": "regex", "scope": "document"}},
+  {"name": "states system size in kW DC", "type": "text",
+   "options": {"pattern": "\\d+(\\.\\d+)?\\s*kW\\s*DC", "match": "regex", "scope": "document"}},
+  {"name": "has a line diagram sheet", "type": "text",
+   "options": {"pattern": "(single|one|three|3|1)[- ]line\\s+diagram", "match": "regex", "scope": "document"}},
+  {"name": "has a site or roof plan", "type": "text",
+   "options": {"pattern": "(site|roof)\\s+plan", "match": "regex", "scope": "document"}},
+  {"name": "This page is the cover sheet of a residential solar PV permit plan set: a title block, PV system specifications (kW DC/AC, modules, inverters) and a sheet index",
+   "type": "llm", "weight": 3, "depends_on": "mentions solar / photovoltaic",
+   "options": {"hint": "presence", "aggregate": "any"}}
+]

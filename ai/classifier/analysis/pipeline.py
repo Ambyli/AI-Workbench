@@ -20,8 +20,11 @@ siblings:
      documents → per request
   5. Weigh: once per item, and once over the           analysis.weighting
      aggregates (the overall score and verdict)
-  6. Store regions.json, the base images, the manifest regions.artifacts
-  7. Assemble the ``schema_version: 3`` result
+  6. Store references.json (when the request listed    regions.artifacts
+     references), regions.json, the base images, the
+     manifest
+  7. Assemble the ``schema_version: 3`` result (with ``request.criteria``,
+     the validated criteria as run)
 
     analyze_document() — the pipeline itself; ``jobs.runners.run_assess`` is
                          its only caller in the service (tests call it with a
@@ -52,6 +55,7 @@ from analysis.context import (
 )
 from analysis.loading import _validate_image_dimensions
 from analysis.outcome import Outcome, empty_localization
+from analysis.references import JobReferences
 from analysis.scheduler import CriterionUnits, run_units
 from analysis.weighting import compute_weighted_score
 from api.schemas import CriterionInput
@@ -65,6 +69,7 @@ from regions.artifacts import (
     text_layer_payload,
     text_link,
     write_job_artifacts,
+    write_references_json,
     write_text_layer,
 )
 from regions.collect import inline_regions
@@ -77,6 +82,7 @@ async def analyze_document(
     criteria: list[CriterionInput],
     *,
     job_id: Optional[str] = None,
+    references_plan: Optional[dict] = None,
 ) -> dict:
     """Run every criterion on every item of ``docs`` and return the job result.
 
@@ -88,6 +94,9 @@ async def analyze_document(
                   (a direct library call) nothing is written to disk and
                   every ``artifacts`` field is None; the result is otherwise
                   identical.
+        references_plan: The plan ``references.resolve`` built at submit (the
+                  payload's ``references`` key), or None. One
+                  ``JobReferences`` is built from it and shared by every item.
 
     Returns:
         The ``schema_version: 3`` result — see API.md § Result shape.
@@ -126,6 +135,7 @@ async def analyze_document(
         return store
 
     detector_stats = detector_client.DetectorStats()
+    job_references = JobReferences(references_plan) if references_plan else None
     items: list[DocumentContext] = []
     groups: list[DocumentGroup] = []
     for i, doc in enumerate(documents):
@@ -137,6 +147,7 @@ async def analyze_document(
                 layer_sink=item_sink(n) if job_id else None,
                 detector_stats=detector_stats,
             )
+            ctx.references = job_references
             items.append(ctx)
             members.append(ctx)
         groups.append(DocumentGroup(
@@ -181,6 +192,10 @@ async def analyze_document(
     detector_used = bool(detector_stats.calls or detector_stats.errors)
     artifacts: Optional[dict] = None
     per_criterion_artifacts: dict[str, Optional[dict]] = {}
+    if job_id and job_references is not None:
+        # Before the manifest, so it lists the file; JSON, so the byte cap
+        # never drops it.
+        await asyncio.to_thread(write_references_json, job_id, job_references.artifact())
     if job_id:
         infos = [
             ItemInfo(
@@ -222,6 +237,12 @@ async def analyze_document(
             "used": detector_used,
         },
         "artifacts": artifacts,
+        # What the request's references did — null when it listed none.
+        "references": job_references.summary() if job_references is not None else None,
+        # The criteria exactly as validated (depends_on, weight, every
+        # option as sent) — what POST /references' `from_job` rebuilds a
+        # reviewed job's criteria from. Additive: nothing else reads it.
+        "request": {"criteria": [c.model_dump(mode="json") for c in criteria]},
     }
     logger.info(
         "analyze_document: verdict=%s overall_score=%s complete=%s items=%d regions=%d",

@@ -15,7 +15,10 @@ them in.
     geometry.*                the transforms between the four spaces: working
                               image, original page, PDF points, and the 0–1000
                               grid a vision model answers on. Plus ``iou`` for
-                              cross-checking two producers' boxes.
+                              cross-checking two producers' boxes, and
+                              ``normalize_region`` + ``center_distance`` for
+                              comparing boxes on two DIFFERENT pages (each as
+                              a fraction of its own page).
 
     slugify_criterion         criterion name → a stable file/id/query handle
                               with a 4-hex hash of the exact name, so
@@ -23,7 +26,8 @@ them in.
     criterion_color /         one hue per criterion (hashed, stable across
     stroke_for                pages and formats); stroke style per source —
                               solid cv/detector/pdf-text, dashed ocr, dotted
-                              llm, double diff.
+                              llm, double diff, heavy solid manual (a region
+                              a person supplied).
 
     render_svg                overlay whose viewBox is the original page, one
                               ``<g id="c-<slug>">`` per criterion so a client
@@ -76,9 +80,11 @@ from .grid_overlay import (
 from .geometry import (
     DEFAULT_GRID,
     box_region,
+    center_distance,
     clamp_points,
     grid_to_pixels,
     iou,
+    normalize_region,
     pixels_to_grid,
     pixels_to_points,
     points_to_pixels,
@@ -131,9 +137,11 @@ __all__ = [
     # geometry
     "DEFAULT_GRID",
     "box_region",
+    "center_distance",
     "clamp_points",
     "grid_to_pixels",
     "iou",
+    "normalize_region",
     "pixels_to_grid",
     "pixels_to_points",
     "points_to_pixels",

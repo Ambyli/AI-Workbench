@@ -23,15 +23,21 @@ services:
       - VISION_LLM_MODEL=${VISION_LLM_MODEL:-muse-glimmer}
       - VISION_LLM_MAX_TOKENS=${VISION_LLM_MAX_TOKENS:-8192}
       - VISION_LLM_REASONING_STRENGTH=${CLASSIFIER_REASONING_STRENGTH:-low}
+      # Seconds ONE vision-model request may take. Non-streamed, so it covers
+      # the whole generation (queue + prefill + reasoning + answer); a timeout
+      # is an HTTP error and is not retried. See API.md § Concurrency and
+      # durability.
+      - CLASSIFIER_HTTP_TIMEOUT_S=${CLASSIFIER_HTTP_TIMEOUT_S:-240}
       - LOG_LEVEL=INFO
       # The four concurrency limits: jobs at once, (criterion, item) units one
       # job evaluates at once, model calls in flight across ALL jobs (every
       # call type — the vision model is the bottleneck; muse-glimmer runs
-      # --max-num-seqs 4), and OCR passes at once. See API.md § Concurrency
+      # --max-num-seqs 8 and the classifier takes 6, leaving 2 for the
+      # LiteLLM chat chains), and OCR passes at once. See API.md § Concurrency
       # and durability.
       - CLASSIFIER_MAX_CONCURRENT=${CLASSIFIER_MAX_CONCURRENT:-4}
-      - CLASSIFIER_MAX_UNITS_PER_JOB=${CLASSIFIER_MAX_UNITS_PER_JOB:-4}
-      - CLASSIFIER_MAX_LLM_CALLS=${CLASSIFIER_MAX_LLM_CALLS:-4}
+      - CLASSIFIER_MAX_UNITS_PER_JOB=${CLASSIFIER_MAX_UNITS_PER_JOB:-6}
+      - CLASSIFIER_MAX_LLM_CALLS=${CLASSIFIER_MAX_LLM_CALLS:-6}
       - CLASSIFIER_OCR_WORKERS=${CLASSIFIER_OCR_WORKERS:-4}
       # Document support: how many items (pages, across every document) one
       # request may carry, which OCR engine backs `text` criteria and scanned
@@ -80,6 +86,27 @@ services:
       - CLASSIFIER_LLM_BBOX_REFINE=${CLASSIFIER_LLM_BBOX_REFINE:-true}
       - CLASSIFIER_LLM_BBOX_REFINE_ZOOM=${CLASSIFIER_LLM_BBOX_REFINE_ZOOM:-2.5}
       - CLASSIFIER_LLM_BBOX_REFINE_MIN_SPAN=${CLASSIFIER_LLM_BBOX_REFINE_MIN_SPAN:-0.2}
+      # References — saved worked examples shown to the vision model beside a
+      # candidate. Their own root on the classifier_data volume (never swept:
+      # a reference is kept until DELETE, so the count cap bounds the disk),
+      # how many images one model request may carry (muse-glimmer's
+      # --limit-mm-per-prompt), the per-request / per-criterion caps, the
+      # `auto` selection, the opt-in position check, and the generated page
+      # description. See the `## Classifier` block in .env and
+      # ai/classifier/API.md § References.
+      - CLASSIFIER_REFERENCE_DIR=${CLASSIFIER_REFERENCE_DIR:-/data/references}
+      - CLASSIFIER_REFERENCE_MAX_COUNT=${CLASSIFIER_REFERENCE_MAX_COUNT:-500}
+      - VISION_LLM_MAX_IMAGES_PER_PROMPT=${VISION_LLM_MAX_IMAGES_PER_PROMPT:-3}
+      - CLASSIFIER_REFERENCE_MAX_PER_REQUEST=${CLASSIFIER_REFERENCE_MAX_PER_REQUEST:-10}
+      - CLASSIFIER_REFERENCE_MAX_PER_CRITERION=${CLASSIFIER_REFERENCE_MAX_PER_CRITERION:-3}
+      - CLASSIFIER_REFERENCE_AUTO_POOL_MAX=${CLASSIFIER_REFERENCE_AUTO_POOL_MAX:-20}
+      - CLASSIFIER_REFERENCE_AUTO_MIN_CONFIDENCE=${CLASSIFIER_REFERENCE_AUTO_MIN_CONFIDENCE:-60}
+      - CLASSIFIER_REFERENCE_SELECT_MAX_TOKENS=${CLASSIFIER_REFERENCE_SELECT_MAX_TOKENS:-2048}
+      - CLASSIFIER_REFERENCE_POSITION_MIN_IOU=${CLASSIFIER_REFERENCE_POSITION_MIN_IOU:-0.3}
+      - CLASSIFIER_REFERENCE_POSITION_MAX_OFFSET=${CLASSIFIER_REFERENCE_POSITION_MAX_OFFSET:-0.15}
+      - CLASSIFIER_REFERENCE_POSITION_CAP=${CLASSIFIER_REFERENCE_POSITION_CAP:-5}
+      - CLASSIFIER_REFERENCE_DESCRIBE=${CLASSIFIER_REFERENCE_DESCRIBE:-true}
+      - CLASSIFIER_REFERENCE_DESCRIPTION_MAX_CHARS=${CLASSIFIER_REFERENCE_DESCRIPTION_MAX_CHARS:-500}
       # Open-vocabulary detector (ai/detector). DETECTOR_URL empty = off: a
       # `detector` criterion is then refused at submit, and a `cv` criterion
       # with no OpenCV detector falls back to the llm. Set it to

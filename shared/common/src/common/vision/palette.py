@@ -43,7 +43,8 @@ SLUG_HASH_CHARS = 4
 _NON_SLUG = re.compile(r"[^a-z0-9]+")
 
 # Stroke policy by region source: (dash pattern, stroke width multiplier,
-# double-line flag). The dash pattern is an SVG ``stroke-dasharray`` value;
+# double-line flag). "manual" (a region a person supplied) differs from the
+# solid producers by weight alone. The dash pattern is an SVG ``stroke-dasharray`` value;
 # the PNG renderer approximates the same pattern with drawn segments.
 _STROKES: dict[str, dict[str, Any]] = {
     "cv":       {"dash": None,      "width": 1.0, "double": False},
@@ -52,6 +53,9 @@ _STROKES: dict[str, dict[str, Any]] = {
     "ocr":      {"dash": (9, 5),    "width": 1.0, "double": False},
     "llm":      {"dash": (2, 5),    "width": 1.2, "double": False},
     "diff":     {"dash": None,      "width": 1.0, "double": True},
+    # A person's answer key, not a producer's finding: solid and heavier than
+    # anything a detector draws, so it reads as "this is where it IS".
+    "manual":   {"dash": None,      "width": 1.8, "double": False},
 }
 
 _DEFAULT_STROKE = {"dash": None, "width": 1.0, "double": False}

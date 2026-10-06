@@ -193,7 +193,7 @@ HINT_RUBRICS: dict[str, dict[str, str]] = {
             "For each PRESENCE criterion your 'reason' MUST follow this structure:\n"
             "  'I observe [specific visual evidence]. "
             "Therefore [feature] is [present / absent / uncertain].'\n"
-            "  When DOCUMENT TEXT is provided below, a quoted phrase from that text "
+            "  When DOCUMENT TEXT is provided above, a quoted phrase from that text "
             "counts as evidence just as a visual observation does — e.g. "
             "'I observe the line \"Notice to Owner\" in the document text. "
             "Therefore notice to owner is present.' Say which source you used."
@@ -216,18 +216,35 @@ HINT_RUBRICS: dict[str, dict[str, str]] = {
 
 # Header for the extracted-text block in the user message. The rubric text
 # above and API.md both refer to the block by this name, so change all three
-# together.
+# together. The block comes BEFORE the rubric and the criterion (prefix
+# caching — see llm/prompts.py), which is why the presence rubric says
+# "provided above".
 DOCUMENT_TEXT_HEADING: str = "DOCUMENT TEXT (extracted, may contain OCR errors)"
 
 # ---------------------------------------------------------------------------
 # LLM call behaviour
 # ---------------------------------------------------------------------------
 # MAX_LLM_RETRIES: how many times to retry if the LLM returns unparseable JSON.
-# HTTP_TIMEOUT: seconds to wait for the vLLM server to respond.
+# HTTP_TIMEOUT (CLASSIFIER_HTTP_TIMEOUT_S): seconds one vLLM request may take.
+#   It is httpx's per-read timeout, but responses are NOT streamed — vLLM
+#   sends nothing until the answer is complete — so in practice it bounds the
+#   WHOLE generation: any wait in vLLM's own queue, prefill, every reasoning
+#   token, and the JSON answer. A scoring call that spends most of
+#   VISION_LLM_MAX_TOKENS (8192) reasoning while the model is batching
+#   MAX_LLM_CALLS-many others (plus chat) can run past two minutes, and a
+#   timeout is an HTTP error: NOT retried, it fails that criterion
+#   (call_vllm) or that localisation attempt (call_vllm_json). The wait for
+#   an LLM_CALLS slot is outside it (the slot is taken first). Was a
+#   hard-coded 120; 240 leaves room for the 6-wide batch.
 # HTTP_CONNECT_TIMEOUT: seconds to wait while establishing the TCP connection.
+# FETCH_TIMEOUT: seconds to fetch a `type: "url"` document
+#   (analysis/loading.py). Separate from HTTP_TIMEOUT on purpose — a slow
+#   remote file server is not a reason to hold a submit request for four
+#   minutes.
 MAX_LLM_RETRIES: int = 3
-HTTP_TIMEOUT: float = 120.0
+HTTP_TIMEOUT: float = max(1.0, float(os.environ.get("CLASSIFIER_HTTP_TIMEOUT_S", "240")))
 HTTP_CONNECT_TIMEOUT: float = 10.0
+FETCH_TIMEOUT: float = 120.0
 
 # ---------------------------------------------------------------------------
 # Async job store (SQLite)
@@ -256,16 +273,21 @@ JOB_TTL_HOURS: int = int(os.environ.get("JOB_TTL_HOURS", "24"))
 #   MAX_UNITS_PER_JOB     units ONE job evaluates at once. A job with ten
 #                         criteria on twenty pages still holds only this many
 #                         in flight. A unit waiting on its depends_on holds no
-#                         slot. Defaults to MAX_LLM_CALLS' 4, so a lone job
-#                         can fill every model slot; it was 2, which left a
-#                         single job using half the model. Lower it to keep
-#                         one big job from crowding out the others.
+#                         slot. Defaults to MAX_LLM_CALLS' 6, so a lone job
+#                         can fill every model slot the classifier has (it
+#                         was 2, then 4). Lower it to keep one big job from
+#                         crowding out the others.
 #   MAX_LLM_CALLS         model calls in flight across ALL jobs, every call
 #                         type — scoring, box ask, refine, verify. Acquired in
 #                         llm/client.py around the HTTP request itself, so no
 #                         call path can go around it. Size it to the vision
-#                         model: muse-glimmer admits 4 (--max-num-seqs 4) and
-#                         queues the rest inside vLLM.
+#                         model: muse-glimmer schedules 8 (--max-num-seqs 8)
+#                         and the classifier takes 6, leaving 2 for the
+#                         LiteLLM chat chains muse-glimmer also serves — their
+#                         overflow hook spills chat to the next order (and in
+#                         the end to Claude) once vLLM's waiting queue stays
+#                         non-empty, so filling all 8 here would push chat
+#                         off the local model.
 #   OCR_WORKERS           OCR passes at once. Each is one ONNX inference in a
 #                         worker thread; the engine is shared.
 #
@@ -279,9 +301,9 @@ JOB_TTL_HOURS: int = int(os.environ.get("JOB_TTL_HOURS", "24"))
 # rows written by another process (or left behind by a crash).
 MAX_CONCURRENT: int = max(1, int(os.environ.get("CLASSIFIER_MAX_CONCURRENT", "4")))
 MAX_UNITS_PER_JOB: int = max(
-    1, int(os.environ.get("CLASSIFIER_MAX_UNITS_PER_JOB", "4"))
+    1, int(os.environ.get("CLASSIFIER_MAX_UNITS_PER_JOB", "6"))
 )
-MAX_LLM_CALLS: int = max(1, int(os.environ.get("CLASSIFIER_MAX_LLM_CALLS", "4")))
+MAX_LLM_CALLS: int = max(1, int(os.environ.get("CLASSIFIER_MAX_LLM_CALLS", "6")))
 OCR_WORKERS: int = max(1, int(os.environ.get("CLASSIFIER_OCR_WORKERS", "4")))
 PAYLOAD_DIR: str = os.environ.get(
     "PAYLOAD_DIR", os.path.join(os.path.dirname(DB_PATH) or ".", "payloads")
@@ -588,6 +610,101 @@ LLM_BBOX_PRESENCE_MIN: int = 7
 # 0-1 because models emit integers far more reliably than decimals; shared
 # with common.vision.geometry.DEFAULT_GRID, which does the conversion.
 LLM_BBOX_GRID: float = 1000.0
+
+# ── References (references/, api/references.py, analysis/references.py) ────
+# A REFERENCE is a stored, reviewed example: one page, the criteria asked of
+# it, the answer each one should get (score / verdict / reason) and where on
+# the page the feature is. It is shown to the vision model beside a
+# candidate as a worked example (a FAIL reference as a counter-example), so
+# the model knows what a criterion means HERE. References are for the llm
+# only; see API.md § References.
+#
+# REFERENCE_DIR is one directory per reference (page.jpg, working.jpg, the
+# per-criterion composites c.<slug>.jpg, regions.json, record.json). It is
+# deliberately NOT under ARTIFACT_DIR: the artifact sweeper deletes every
+# directory whose job row is gone, and a reference must outlive the job that
+# created it. Nothing sweeps this root — a reference is kept until DELETE.
+#
+# REFERENCE_MAX_COUNT caps how many references may exist at once (pending,
+# ready and failed alike); POST /references past it is a 409. With no TTL the
+# count cap is the only thing bounding the disk this root can take.
+#
+# VISION_LLM_MAX_IMAGES_PER_PROMPT is what the vision model admits per
+# request (muse-glimmer's --limit-mm-per-prompt). 3 lets one call carry a
+# PASS example, a FAIL example and the candidate; 2 sends each example in its
+# own call; 1 means the model takes one image, and an /assess that asks for
+# references is refused at submit.
+#
+# REFERENCE_MAX_PER_REQUEST bounds the explicit ids one /assess may list;
+# REFERENCE_MAX_PER_CRITERION bounds how many examples (and so how many
+# scoring calls) one criterion may use.
+#
+# REFERENCE_AUTO_POOL_MAX bounds the candidates `references: "auto"` ranks
+# (newest first; `pool_truncated` says when it cut). The selection call puts
+# a text catalogue of the pool beside the candidate page and asks which
+# apply; REFERENCE_AUTO_MIN_CONFIDENCE (0-100) is the line a match must clear
+# to be used, and REFERENCE_SELECT_MAX_TOKENS its completion budget.
+#
+# REFERENCE_POSITION_* drive the opt-in position check (`options.reference.
+# position: "check"` on an llm criterion with boxes): the candidate's located
+# box and the example's, each as a fraction of its own page, HIT when their
+# IoU reaches POSITION_MIN_IOU (a criterion's `min_iou` overrides it) or
+# their centres are within POSITION_MAX_OFFSET (0-1, centre distance / √2).
+# A MISS caps the score at POSITION_CAP; the cap never raises a score.
+#
+# REFERENCE_DESCRIBE: when a reference is created without a `description`,
+# one single-image call describes the page (for the `auto` catalogue), cut
+# to REFERENCE_DESCRIPTION_MAX_CHARS — which is also the longest description
+# a caller may send.
+REFERENCE_DIR: str = os.environ.get(
+    "CLASSIFIER_REFERENCE_DIR", os.path.join(os.path.dirname(DB_PATH) or ".", "references")
+)
+REFERENCE_MAX_COUNT: int = max(
+    1, int(os.environ.get("CLASSIFIER_REFERENCE_MAX_COUNT", "500"))
+)
+VISION_LLM_MAX_IMAGES_PER_PROMPT: int = max(
+    1, int(os.environ.get("VISION_LLM_MAX_IMAGES_PER_PROMPT", "3"))
+)
+REFERENCE_MAX_PER_REQUEST: int = max(
+    1, int(os.environ.get("CLASSIFIER_REFERENCE_MAX_PER_REQUEST", "10"))
+)
+REFERENCE_MAX_PER_CRITERION: int = max(
+    1, int(os.environ.get("CLASSIFIER_REFERENCE_MAX_PER_CRITERION", "3"))
+)
+REFERENCE_AUTO_POOL_MAX: int = max(
+    1, int(os.environ.get("CLASSIFIER_REFERENCE_AUTO_POOL_MAX", "20"))
+)
+REFERENCE_AUTO_MIN_CONFIDENCE: int = max(
+    0, min(100, int(os.environ.get("CLASSIFIER_REFERENCE_AUTO_MIN_CONFIDENCE", "60")))
+)
+REFERENCE_SELECT_MAX_TOKENS: int = max(
+    64, int(os.environ.get("CLASSIFIER_REFERENCE_SELECT_MAX_TOKENS", "2048"))
+)
+REFERENCE_POSITION_MIN_IOU: float = max(
+    0.0, min(1.0, float(os.environ.get("CLASSIFIER_REFERENCE_POSITION_MIN_IOU", "0.3")))
+)
+REFERENCE_POSITION_MAX_OFFSET: float = max(
+    0.0, min(1.0, float(os.environ.get("CLASSIFIER_REFERENCE_POSITION_MAX_OFFSET", "0.15")))
+)
+REFERENCE_POSITION_CAP: int = max(
+    1, min(10, int(os.environ.get("CLASSIFIER_REFERENCE_POSITION_CAP", "5")))
+)
+REFERENCE_DESCRIBE: bool = _env_flag("CLASSIFIER_REFERENCE_DESCRIBE", "true")
+REFERENCE_DESCRIPTION_MAX_CHARS: int = max(
+    1, int(os.environ.get("CLASSIFIER_REFERENCE_DESCRIPTION_MAX_CHARS", "500"))
+)
+
+# Code constants for references (not env knobs). The describe call's
+# completion budget: the answer is ~one paragraph of JSON, the rest is the
+# model's reasoning. Title / tag bounds keep a catalogue line short.
+# REFERENCE_JPEG_QUALITY is for page.jpg / working.jpg / the composites: a
+# composite is what the model will SEE as the example, so it is kept higher
+# than a preview.
+REFERENCE_DESCRIBE_MAX_TOKENS: int = 1024
+REFERENCE_TITLE_MAX_CHARS: int = 120
+REFERENCE_MAX_TAGS: int = 20
+REFERENCE_TAG_MAX_CHARS: int = 40
+REFERENCE_JPEG_QUALITY: int = 90
 
 # ── Text-hit regions (analysis/text_eval.py) ───────────────────────────────
 # Cap on regions derived from one text criterion's matches, per page. A regex

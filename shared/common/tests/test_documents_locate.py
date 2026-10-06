@@ -192,6 +192,37 @@ def test_pdf_text_regions_reconstructs_a_regex_hit_from_word_spans(native_pdf):
     assert regions[0].attrs["pdf_rect"][1] > 100  # below the first line
 
 
+@pytest.mark.parametrize("rotation", [0, 90, 180, 270])
+def test_pdf_text_regions_lands_on_the_ink_of_a_rotated_page(rotation):
+    """Text extraction answers in the unrotated page space; the render is
+    rotated. A box that was not mapped through the rotation lands on blank
+    paper (a /Rotate 270 plan set put every hit on the wrong axis)."""
+    pymupdf = pytest.importorskip("pymupdf")
+    pdf = pymupdf.open()
+    pdf_page = pdf.new_page(width=612, height=792)
+    pdf_page.insert_text((60, 100), "NOTICE TO OWNER", fontsize=16)
+    pdf_page.insert_text((300, 600), "Total Due $4,850.00", fontsize=12)
+    pdf_page.set_rotation(rotation)
+    blob = pdf.tobytes()
+    pdf.close()
+
+    doc = load_document(blob, "rotated.pdf", keep_source=True)
+    page = doc.pages[0]
+    assert (page.width > page.height) == (rotation in (90, 270))
+
+    for pattern, mode in (("NOTICE TO OWNER", "contains"), (r"\$[\d,]+\.\d{2}", "regex")):
+        res = match_text(doc, pattern, mode, locate=True)
+        regions = pdf_text_regions(blob, page, res.hits, pattern=pattern, mode=mode)
+        assert len(regions) == 1, (rotation, pattern)
+        (x0, y0), (x1, y1) = regions[0].points
+        assert 0 <= x0 < x1 <= page.width and 0 <= y0 < y1 <= page.height
+        # Horizontal text reads along the long side of its box until the page
+        # turns it a quarter.
+        assert ((x1 - x0) > (y1 - y0)) == (rotation in (0, 180)), (rotation, pattern)
+        crop = page.image_bgr[int(y0):int(y1) + 1, int(x0):int(x1) + 1]
+        assert (crop < 128).mean() > 0.05, f"no ink under the {pattern!r} box at /Rotate {rotation}"
+
+
 def test_pdf_text_regions_returns_empty_rather_than_raising(native_pdf):
     doc = load_document(native_pdf, "invoice.pdf", keep_source=True)
     # Nothing to find …

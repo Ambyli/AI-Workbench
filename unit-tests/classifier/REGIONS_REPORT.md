@@ -396,6 +396,46 @@ The collection **is** the suite, so that is all. Two things to know:
 
 ## Related
 
+* [`plan_set_report.py`](plan_set_report.py) — the same machinery (it imports
+  this script's transports, polling, artifact download and drawing) asking one
+  whole-document question of files passed on the command line: *is this a
+  solar plan set?*, with the criteria in
+  [`solar_plan_set_criteria.json`](solar_plan_set_criteria.json). Six
+  `scope: "document"` text criteria plus one `llm` cover-sheet check
+  (`aggregate: any`); `--expect PASS|FAIL`, `--local`, `--keep-jobs` as here.
+  Every page is an item, so a plan set longer than `CLASSIFIER_MAX_ITEMS` is a
+  400 — the report names the knob.
+* [`utility_bill_reference_report.py`](utility_bill_reference_report.py) — the
+  same machinery asking *is this a utility bill?* with a saved example in
+  view. It `POST /references` the AEP Ohio bill (`documents/utility_bill_2.jpeg`)
+  with the answer key from
+  [`utility_bill_reference.json`](utility_bill_reference.json) — PASS 10, the
+  whole page as the region, a supplied description, so creating it costs no
+  model call — then assesses each candidate (default `documents/utility_bill.jpeg`,
+  expected PASS) **twice**: without references, and with `references: [id]`.
+  The criteria are one `llm` "this document is a utility bill" criterion
+  (weight 3, the one the reference guides — one two-image call: the
+  reference's composite, then the candidate) and four OCR `text` criteria
+  (usage units, amount due, account number, billing period). The report puts
+  the two side by side per criterion with the model's reason each time, the
+  `detail.reference` examples and calls, and the composite the model was
+  shown. The reference is a copy of a customer document, so it is
+  `DELETE`d at the end unless `--keep-reference`; `--reference-id` reuses a
+  kept one. `--local` creates the reference for real (the llm criterion
+  errors with no model); `test_utility_bill_reference_report.py` drives the
+  guided path with a scripted model. Needs a classifier with the references
+  API and `VISION_LLM_MAX_IMAGES_PER_PROMPT` ≥ 2.
+
+  That default spec shows the plumbing, not an effect: the model already
+  knows a utility bill, so it is PASS 10 with or without the example.
+  `--spec unit-tests/classifier/utility_bill_k7_reference.json` is the
+  example where **the reference decides the answer**: the criterion is
+  *"This document is an intake class K7 document"*, an internal label only
+  the reference defines. On the box (2026-10-05) the Ohio Edison bill went
+  FAIL 1 → PASS 10 ("a residential electric bill matching the intake class
+  K7 example") and the roofing invoice stayed FAIL 1 both ways. A spec lists
+  its own `candidates`, each with `expect` and optionally `expect_changed`
+  (a check that the guided verdict differs from the baseline).
 * [`ai/classifier/API.md`](../../ai/classifier/API.md) — the request/response
   reference, § Regions and layers and § The text a criterion searched in
   particular.

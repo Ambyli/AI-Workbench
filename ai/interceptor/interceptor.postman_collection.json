@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "interceptor",
-    "description": "interceptor endpoints, called through the LiteLLM pass-through registered in ai/litellm/litellm_config.yaml (`pass_through_endpoints` → `/v1/interceptor` → `http://interceptor:8080`, `include_subpath: true`, methods GET/POST/DELETE, `forward_headers: true` — so `multipart/form-data` uploads for /profiles/{name}/refresh forward correctly). Every request is authenticated with a Bearer token from a LiteLLM virtual key. Set the collection variables `litellm` (e.g. http://localhost:4001) and `virtual master key` (an sk-… key issued from the LiteLLM Admin UI → Virtual Keys) — every request inherits them via collection-level auth. See ai/interceptor/INTERCEPTOR.md for the full endpoint reference and ai/litellm/LITELLM.md for issuing virtual keys.\n\nReaching the service: the container has NO `ports:` mapping (INTERCEPTOR.md § Reaching the service). Port 8080 is reachable only from inside `ai_shared`. Options: (1) another `ai_shared` container via `http://interceptor:8080/...`, (2) your host via the LiteLLM pass-through `{{litellm}}/v1/interceptor/...` (what this collection uses), (3) `docker exec interceptor curl ...`. `http://localhost:8080` from the host does NOT reach the container — if something answers there it's a separate bare-metal `python app.py` run against the host's `/data/profiles` (used during profile capture with a visible display).\n\nMCP: LiteLLM ALSO advertises the interceptor as an MCP server via `mcp_servers.interceptor` (url `http://interceptor:8080/mcp`) — models see the five tools (capture_url, screenshot_url, list_profiles, list_jobs, get_job) through that path. The MCP requests below are useful for debugging the transport directly.\n\nScreenshots: POST /screenshot (and the `screenshot` block on POST /capture) return an image of the rendered page as base64 inside the JSON; the MCP tools deliver it as an ImageContent block instead. See INTERCEPTOR.md § Screenshots.\n\nActions: POST /capture also takes `page_script` / `actions` / `stop_when_matched` to fill inputs and click buttons (through shadow DOM) so the page fires the request you want — see `POST /capture (actions)` and INTERCEPTOR.md § Page scripts and actions.",
+    "description": "interceptor endpoints, called through the LiteLLM pass-through registered in ai/litellm/litellm_config.yaml (`pass_through_endpoints` → `/v1/interceptor` → `http://interceptor:8080`, `include_subpath: true`, methods GET/POST/DELETE, `forward_headers: true` — so `multipart/form-data` uploads for /profiles/{name}/refresh forward correctly). Every request is authenticated with a Bearer token from a LiteLLM virtual key. Set the collection variables `litellm` (e.g. http://localhost:4001) and `virtual master key` (an sk-… key issued from the LiteLLM Admin UI → Virtual Keys) — every request inherits them via collection-level auth. See ai/interceptor/INTERCEPTOR.md for the full endpoint reference and ai/litellm/LITELLM.md for issuing virtual keys.\n\nReaching the service: the container has NO `ports:` mapping (INTERCEPTOR.md § Reaching the service). Port 8080 is reachable only from inside `ai_shared`. Options: (1) another `ai_shared` container via `http://interceptor:8080/...`, (2) your host via the LiteLLM pass-through `{{litellm}}/v1/interceptor/...` (what this collection uses), (3) `docker exec interceptor curl ...`. `http://localhost:8080` from the host does NOT reach the container — if something answers there it's a separate bare-metal `python app.py` run against the host's `/data/profiles` (used during profile capture with a visible display).\n\nMCP: LiteLLM ALSO advertises the interceptor as an MCP server via `mcp_servers.interceptor` (url `http://interceptor:8080/mcp`) — models see the five tools (capture_url, screenshot_url, list_profiles, list_jobs, get_job) through that path. The MCP requests below are useful for debugging the transport directly.\n\nScreenshots: POST /screenshot (and the `screenshot` block on POST /capture) return an image of the rendered page as base64 inside the JSON; the MCP tools deliver it as an ImageContent block instead. See INTERCEPTOR.md § Screenshots.\n\nActions: POST /capture also takes `page_script` / `actions` / `stop_when_matched` to fill inputs and click buttons (through shadow DOM) so the page fires the request you want — see `POST /capture (actions)` and INTERCEPTOR.md § Page scripts and actions.\n\nViewing screenshots: a collection-level post-response script renders `screenshot.data_base64` from POST /capture and POST /screenshot — open the **Visualize** tab in the response pane after sending. The header line shows `page_url`, i.e. where the tab actually was when the image was taken (the end of the capture window).",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
     "_postman_id": "interceptor-collection"
   },
@@ -15,6 +15,30 @@
       }
     ]
   },
+  "event": [
+    {
+      "listen": "test",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// Renders the screenshot from POST /capture and POST /screenshot in the",
+          "// Visualize tab of the response pane. A no-op for every other response",
+          "// (MCP results carry the image as an ImageContent block, not base64 here).",
+          "let body = null;",
+          "try { body = pm.response.json(); } catch (e) { /* not JSON */ }",
+          "const s = body && body.screenshot;",
+          "if (s && s.data_base64) {",
+          "  pm.visualizer.set(",
+          "    `<div style=\"font:12px sans-serif;margin-bottom:6px\">{{url}} — {{w}}×{{h}} {{fmt}}, {{kb}} KB</div>",
+          "     <img style=\"max-width:100%;border:1px solid #ccc\" src=\"data:{{mime}};base64,{{data}}\"/>`,",
+          "    { url: s.page_url, w: s.width, h: s.height, fmt: s.format, kb: Math.round(s.bytes / 1024),",
+          "      mime: s.mime_type, data: s.data_base64 }",
+          "  );",
+          "}"
+        ]
+      }
+    }
+  ],
   "variable": [
     {
       "key": "litellm",

@@ -1,11 +1,12 @@
 # interceptor
 
-Generic HTTP + MCP front-end for `common.cdp_interceptor`. Give it a URL and a list of URL regex patterns; it opens the URL in a headless Chrome under a named `--user-data-dir`, waits for a bounded window, and returns the JSON XHR/fetch bodies whose URLs matched any pattern. It can also return a **screenshot** of the rendered page — either alongside the captures (`screenshot` block on `POST /capture`) or on its own (`POST /screenshot` / the `screenshot_url` MCP tool), so an agent can *look at* a page it navigated to. See [Screenshots](#screenshots). And it can **drive** the page — run a `page_script`, fill inputs, click buttons — for pages that only fire the request you want after someone interacts with them; the responses those actions provoke come back through the same `matches`. See [Page scripts and actions](#page-scripts-and-actions).
+Generic HTTP + MCP front-end for `common.cdp_interceptor`. Give it a URL and a list of URL regex patterns; it opens the URL in a headless Chrome under a named `--user-data-dir`, waits for a bounded window, and returns the JSON XHR/fetch bodies whose URLs matched any pattern. It can also return a **screenshot** of the rendered page — either alongside the captures (`screenshot` block on `POST /capture`) or on its own (`POST /screenshot` / the `screenshot_url` MCP tool), so an agent can *look at* a page it navigated to. See [Screenshots](#screenshots). And it can **drive** the page — run a `page_script`, fill inputs, click buttons — for pages that only fire the request you want after someone interacts with them; the responses those actions provoke come back through the same `matches`. See [Page scripts and actions](#page-scripts-and-actions). When a profile's session has expired it can **sign back in** by itself — `login_actions` fill the login form from server-side credentials the request only names (`${password}`). See [Login actions](#login-actions).
 
 - **Container**: `interceptor` (internal only, port 8080 on `ai_shared`)
 - **Compose file**: `ai/interceptor/docker-compose.interceptor.yml`
 - **Dockerfile**: `ai/interceptor/Dockerfile.interceptor`
-- **Source**: `ai/interceptor/{app.py,profiles.py}`
+- **Source**: `ai/interceptor/{app.py,profiles.py,logins.py}`
+- **Login credentials**: `ai/interceptor/logins/<profile>.json` (checked in, bind-mounted read-only; holds only `${ENV:INTERCEPTOR_LOGIN_…}` references to values in `.env` — see [Login actions](#login-actions))
 - **LiteLLM integration**: both MCP (`interceptor.capture_url`) and pass-through (`/v1/interceptor/*`), configured in `ai/litellm/litellm_config.yaml`
 
 ## Bring it up
@@ -39,8 +40,8 @@ docker exec interceptor curl -s http://localhost:8080/health
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/health` | Liveness |
-| `GET` | `/profiles` | List all named profiles |
-| `GET` | `/profiles/{name}` | One profile's status (size, sentinel) |
+| `GET` | `/profiles` | List all named profiles (with each one's `login_keys` / `login_origins`) |
+| `GET` | `/profiles/{name}` | One profile's status (size, sentinel, `login_keys`, `login_origins`) |
 | `POST` | `/profiles/{name}/refresh` | Upload a `.tgz` of a captured Chrome profile |
 | `DELETE` | `/profiles/{name}` | Wipe one profile |
 | `POST` | `/capture` | Run one capture (see request/response below); optional `screenshot` block returns an image too; optional `page_script` / `actions` drive the page first (see [Page scripts and actions](#page-scripts-and-actions)) |
@@ -69,11 +70,13 @@ Request:
   "page_script": null,
   "actions": [],
   "actions_ready_timeout_seconds": null,
-  "stop_when_matched": false
+  "stop_when_matched": false,
+  "login_actions": [],
+  "login_actions_timeout_seconds": null
 }
 ```
 
-`page_script`, `actions`, `actions_ready_timeout_seconds` and `stop_when_matched` are covered in [Page scripts and actions](#page-scripts-and-actions); with all four at their defaults a capture behaves exactly as it always has.
+`page_script`, `actions`, `actions_ready_timeout_seconds` and `stop_when_matched` are covered in [Page scripts and actions](#page-scripts-and-actions), `login_actions` and `login_actions_timeout_seconds` in [Login actions](#login-actions); with all six at their defaults a capture behaves exactly as it always has.
 
 `screenshot` is opt-in. Set it to an options object — `{"format": "jpeg", "quality": 80, "full_page": false, "scale": 1.0, "max_height": 8000}` (all keys optional) — and the response gains a `screenshot` field holding the image taken just before Chrome quits. With `screenshot` set, `url_patterns` may be empty (screenshot-only navigation); without it, an empty `url_patterns` is a 422. Details in [Screenshots](#screenshots).
 
@@ -86,7 +89,7 @@ An empty list disables login detection entirely.
 
 `capture_window_seconds` is a **hard wall**: `app.py` waits exactly that long and then quits Chrome, regardless of what stage the session is in — unless `stop_when_matched` ends it early, or it is cancelled. It must exceed `login_timeout` for a login to have any chance of resolving — otherwise the window closes first and the response comes back `login_wall: true` with `status="waiting_login"`.
 
-Chrome always runs headless in the container. The service writes a `session_ok` sentinel into each uploaded profile so `InterceptorClient` boots straight into headless — an operator only uploads a profile *after* logging in on their laptop, so treating uploaded profiles as session-ready by definition matches reality. If the persisted session expires, `InterceptorClient` detects the login redirect, sets `status="waiting_login"`, and the response comes back with `login_wall: true`; refresh the profile via `POST /profiles/{name}/refresh` and retry.
+Chrome always runs headless in the container. The service writes a `session_ok` sentinel into each uploaded profile so `InterceptorClient` boots straight into headless — an operator only uploads a profile *after* logging in on their laptop, so treating uploaded profiles as session-ready by definition matches reality. If the persisted session expires, `InterceptorClient` detects the login redirect, sets `status="waiting_login"`, and the response comes back with `login_wall: true`; refresh the profile via `POST /profiles/{name}/refresh` and retry — or, for a site with a plain username/password form, send [`login_actions`](#login-actions) and let the capture sign in itself.
 
 `login_wall: true` does **not** always mean the session expired. A profile whose cookies were encrypted against a key the container doesn't have produces exactly the same result — Chrome reads the rows, silently fails to decrypt, and browses as an anonymous user. If a profile that demonstrably works on the capture machine hits a login wall in the container, check the cookie encryption version before re-capturing: see [Cookie encryption and portability](#cookie-encryption-and-portability).
 
@@ -107,11 +110,12 @@ Response:
   "screenshot": null,
   "screenshot_error": null,
   "actions_report": null,
+  "login_actions_report": null,
   "ended_early": false
 }
 ```
 
-`actions_report` is `null` unless `page_script` or `actions` were sent (shape in [Page scripts and actions § The report](#the-report)); `ended_early` is `true` only when `stop_when_matched` closed the window before `capture_window_seconds` elapsed.
+`actions_report` is `null` unless `page_script` or `actions` were sent (shape in [Page scripts and actions § The report](#the-report)); `login_actions_report` (same shape) is `null` unless `login_actions` were sent **and** the capture hit a login wall; `ended_early` is `true` only when `stop_when_matched` closed the window before `capture_window_seconds` elapsed.
 
 `screenshot` is `null` unless requested; `screenshot_error` is set (and `screenshot` stays `null`) when one was requested but could not be taken — the XHR captures are still returned, an image failure never fails the capture.
 
@@ -141,13 +145,16 @@ Request:
   "scale": 1.0,
   "max_height": 8000,
   "login_timeout": 300,
-  "login_url_patterns": ["login", "signin", "/auth"]
+  "login_url_patterns": ["login", "signin", "/auth"],
+  "login_actions": [],
+  "login_actions_timeout_seconds": null
 }
 ```
 
 | Field | Default | Notes |
 |---|---|---|
 | `wait_seconds` | `INTERCEPTOR_SCREENSHOT_WAIT_SECONDS` (15) | How long the page gets to render. Chrome spends the first ~4–5 s booting and navigating, so values under ~8 mostly return blank or half-painted pages. Hard wall, same as `capture_window_seconds`. |
+| `login_actions` / `login_actions_timeout_seconds` | `[]` / `null` (60) | Same as on `POST /capture` — see [Login actions](#login-actions). `wait_seconds` must then cover the login, the redirect and the page load; the response gains `login_actions_report`. |
 | `format` | `jpeg` | `jpeg` (~100–300 KB for a viewport), `png` (lossless, often 1–3 MB), `webp`. |
 | `quality` | `80` | jpeg/webp only; ignored for png. |
 | `full_page` | `false` | Whole scrollable document instead of the 1920×1080 headless viewport. |
@@ -173,7 +180,8 @@ Response:
     "page_url": "https://example.com/dashboard",
     "data_base64": "/9j/4AAQ…"
   },
-  "screenshot_error": null
+  "screenshot_error": null,
+  "login_actions_report": null
 }
 ```
 
@@ -241,7 +249,7 @@ It is tempting to have `page_script` call the endpoint directly with `fetch()`. 
 No `page_script` and no step runs until **all** of these hold:
 
 1. the tab URL is not `about:blank`;
-2. it does not match `login_url_patterns` (the same regexes the capture uses — so nothing is ever typed into a login form);
+2. it does not match `login_url_patterns` (the same regexes the capture uses — so nothing in `actions` or `page_script` is ever typed into a login form; the only way to act on a login page is [`login_actions`](#login-actions), which have their own gate);
 3. `document.readyState === "complete"`;
 4. `window._fetchInterceptorActive === true` — the guard `interceptor.js` sets when it wraps `fetch`/XHR, proving the capture hook is installed **before** anything is clicked.
 
@@ -274,6 +282,99 @@ The actions run on a helper thread started right after Chrome launches, on their
 ```
 
 `index` is the step's position in `actions` (`-1` for `page_script`). `aborted_reason` is `null` when every step ran and succeeded. `value` for DOM steps describes the element acted on; for `evaluate` / `page_script` it is the script's return value.
+
+### Login actions
+
+A profile's SSO session eventually expires. Without help, the capture then lands on the login page, waits, returns `login_wall: true` — and every lookup on that profile fails until someone re-captures and re-uploads it. For a site with a plain username/password form (no verification code), `login_actions` let the capture sign back in by itself with a dedicated service account:
+
+| Field | Default | What it does |
+|---|---|---|
+| `login_actions` | `[]` | Steps that run **only** if the tab hits a login wall (`login_url_patterns`), once per capture. A `fill` value may reference the profile's stored credentials as `${username}`, `${password}`, … Needs a non-empty `login_url_patterns` (422 otherwise). |
+| `login_actions_timeout_seconds` | `null` (60) | Upper bound on one login run: the login page becoming ready plus every step. 1–600. |
+
+Also on `POST /screenshot` and on both the `capture_url` and `screenshot_url` MCP tools (`login_actions` only there; the timeout keeps its default).
+
+#### The credentials file
+
+One file per profile, `ai/interceptor/logins/<profile>.json` on the host — bind-mounted **read-only** at `/config/logins` and found through `INTERCEPTOR_LOGINS_DIR`:
+
+```json
+{
+  "allowed_origins": ["https://sso.enphaseenergy.com"],
+  "values": {
+    "username": "${ENV:INTERCEPTOR_LOGIN_ENPHASE_USERNAME}",
+    "password": "${ENV:INTERCEPTOR_LOGIN_ENPHASE_PASSWORD}"
+  }
+}
+```
+
+with the credentials themselves in `.env`:
+
+```bash
+INTERCEPTOR_LOGIN_ENPHASE_USERNAME=svc-enphase@zeoenergy.com
+INTERCEPTOR_LOGIN_ENPHASE_PASSWORD=…
+```
+
+- **`allowed_origins` is required and non-empty.** A `fill` in `login_actions` only types into a tab whose `location.origin` is on this list — the password-manager rule. Without it a request could point `login_url_patterns` at `.*` and have the password typed into any site's form. Write bare origins (`scheme://host[:port]`); they are normalised to what `location.origin` reports (lowercase, default port dropped).
+- **`values`** maps reference names (letters, digits, `_`) to **environment references**, `${ENV:INTERCEPTOR_LOGIN_<NAME>}`. A literal credential is refused (the error never echoes it), and only the `INTERCEPTOR_LOGIN_` prefix is resolvable, so a logins file can't pull any other secret in the environment into a fill. The file holds no secrets, so it is **checked in**.
+- **Each variable is set in `.env` and listed in the `environment:` block of `docker-compose.interceptor.yml`** (as `${VAR:-}`, so a missing pair only fails that profile). A variable that is unset or empty in the container is a 400 naming the variable. Write a literal `$` in a `.env` value as `$$` — compose interpolates it. Use an account that exists for this and nothing else.
+- **Adding a profile's login:** add `ai/interceptor/logins/<profile>.json`, add its `INTERCEPTOR_LOGIN_<PROFILE>_*` lines to `.env` / `.env.example` and the compose `environment:` block, then `make up interceptor` (a recreate — the container env changed).
+- **Re-read on every request** — editing the file needs no restart; changing a `.env` value needs `make up interceptor` to reach the container.
+- **Not under `INTERCEPTOR_PROFILES_ROOT`**, deliberately: a profile refresh `rmtree`s the profile directory, and anything under the root is listed as a profile.
+
+`GET /profiles` (and the `list_profiles` MCP tool) show each profile's `login_keys` (the reference names) and `login_origins` — never a value — so a caller can see which `${…}` it may use. An unusable file adds `login_error`.
+
+#### References
+
+- `${key}` is replaced by `values.key` — **only in the `value` of a `fill` step inside `login_actions`**.
+- `$$` is a literal `$`; a `$` followed by anything other than `{` or `$` is literal too (so a CSS `[name$=user]` selector is fine).
+- A `${` anywhere else in `login_actions` (a selector, a `text` filter, a `select` value) is a **400**.
+- In the regular `actions` and `page_script`, `${…}` is plain text and is **never** resolved.
+
+#### Allowed steps
+
+`wait_for`, `fill`, `click`, `press`, `select`, `wait` — **no `evaluate`** (a 422): a script on the login page could read the password field back into the report.
+
+#### What happens
+
+1. The capture navigates; once the URL settles on one that matches `login_url_patterns`, the session reports `waiting_login` and runs `login_actions` on their own CDP connection, behind a **login gate**: a real URL and `document.readyState === "complete"` — unlike the [readiness gate](#readiness-gate) it does not refuse login URLs (that is the point) and does not wait for the capture hook.
+2. Every `fill` first checks `location.origin` against `allowed_origins` — and again, atomically with focusing the field, right before typing. A mismatch fails the step with `origin <o> not allowed for this fill`; nothing is typed.
+3. When the steps finish, the session's usual login wait starts (`login_timeout`, measured from then), sees the tab leave the login URL, and re-navigates to `url` — exactly as after a human login. `actions`, whose gate has been waiting out the login page, then run on the target page as usual.
+4. **One attempt per capture, never retried.** A wrong password or a changed form fails the run once; the usual wait then runs out exactly as it does today, so a bad credential can't lock the account by looping.
+5. Two captures on the same profile never submit the form at the same time (a per-profile login lock), whichever of the fast and slow paths they are on.
+
+**Errors at submit** — all **400**, before a port is taken, and every one names a step or a key, never a value: the profile has no logins file; a value is not an `${ENV:INTERCEPTOR_LOGIN_…}` reference, or names a variable that is unset or empty; a referenced key is missing; `allowed_origins` is missing, empty or not an origin; a `${` outside a fill value; a malformed reference (`${pass`, `${1x}`); an invalid step (e.g. an unknown `press` key).
+
+**Where the secret goes:** into the in-memory steps handed to the browser, and nowhere else. The request — and so every log line, `GET /jobs` record and FastAPI 422 echo — only ever contains `${password}`. A `fill` result reports `{element, value_length}`, never the text. The job log records one line, `login_actions ok=<bool> failed_at=<index/type>`.
+
+#### The report
+
+`login_actions_report` has the same shape as [`actions_report`](#the-report), with steps named `login_actions[i]` in `aborted_reason`. It is `null` unless `login_actions` were sent **and** the capture hit a login wall — so a `null` on a run that sent them is proof the stored session was still good. Typical `aborted_reason` values: `login_actions[1] (fill) failed: origin https://… not allowed for this fill`, `login_actions[0] (fill) failed: timed out after 15s waiting for 'input[type=email]' …` (the form changed — fix the selector), `login_actions did not finish within 60s`, `capture window ended before login_actions finished`.
+
+`login_wall` keeps its meaning: `true` only if the session is still waiting on the login page when the window ends. After a login resolves the status goes back to `loading`, so a target page that fires no JSON no longer reads as a login wall.
+
+#### Timing
+
+Everything happens inside `capture_window_seconds`: the login page loading, the steps, the SSO redirect back, the target page loading, then `actions`. Budget **~120 s** for Enphase. `login_actions_timeout_seconds` caps the login run itself; the `login_timeout` wait after it only matters when a login fails.
+
+#### Fast path vs slow path
+
+On the **fast path** Chrome writes the new session cookies into the base profile, so the next capture finds a valid session and `login_actions_report` comes back `null`. On the **slow path** (same profile already in use, see [Concurrency](#concurrency)) the cookies land in the temporary clone and are discarded — that capture works, but the next one logs in again. A successful capture also rewrites the `session_ok` sentinel.
+
+One caveat: a session expiry that happened **before** `login_actions` were in use has already deleted `session_ok` (the `login_timeout` path does that), and without it Chrome launches visibly — which in the container fails for lack of a display. Re-upload the profile once (any old cookie set will do; `login_actions` log it back in) to restore the sentinel. A failed login that sits out a `login_timeout` shorter than the window does the same thing, exactly as before.
+
+#### Enphase
+
+```json
+"login_url_patterns": ["login", "signin", "/auth", "sso\\.enphaseenergy\\.com"],
+"login_actions": [
+  {"type": "fill", "selector": "input[type=email], input[name=username], #username", "value": "${username}"},
+  {"type": "fill", "selector": "input[type=password]", "value": "${password}"},
+  {"type": "click", "selector": "button[type=submit], input[type=submit]"}
+]
+```
+
+with `ai/interceptor/logins/enphase.json` holding `allowed_origins: ["https://sso.enphaseenergy.com"]`. If the page asks for the email first and shows the password on a second page, put a `{"type": "wait_for", "selector": "input[type=password]"}` before the password fill. The selectors are written to match the common shapes of the SSO form; confirm them against the live page (a failed step's error says which one missed). The full lookup with these steps is in the [worked example](#worked-example-discover-the-form-then-run-the-lookup).
 
 ### Worked example: discover the form, then run the lookup
 
@@ -380,6 +481,34 @@ The answer is the match whose `returnValue` is a JSON **string** of an array (th
 
 Several serials can go in one `fill` value separated by newlines or commas (the page says so); each comes back as one element of that array.
 
+**3 — The lookup, signing in when the session has expired.** The same body plus [`login_actions`](#login-actions) and a window long enough for the SSO round trip. Needs `ai/interceptor/logins/enphase.json` (see [The credentials file](#the-credentials-file)); the login selectors are still to be confirmed against the live SSO page:
+
+```json
+{
+  "url": "https://support.enphase.com/feoc-compliance/",
+  "url_patterns": ["webruntime/api/apex/execute"],
+  "profile": "enphase",
+  "capture_window_seconds": 120,
+  "login_timeout": 30,
+  "login_url_patterns": ["login", "signin", "/auth", "sso\\.enphaseenergy\\.com"],
+  "login_actions": [
+    {"type": "fill", "selector": "input[type=email], input[name=username], #username", "value": "${username}"},
+    {"type": "fill", "selector": "input[type=password]", "value": "${password}"},
+    {"type": "click", "selector": "button[type=submit], input[type=submit]"}
+  ],
+  "stop_when_matched": true,
+  "actions": [
+    {"type": "fill", "selector": "textarea[placeholder='Serial number']", "value": "532614044013"},
+    {"type": "evaluate", "script": "(() => { window.__ciN0 = (window._capturedResponses || []).length; return window.__ciN0; })()"},
+    {"type": "click", "selector": "button[type=submit]", "text": "Submit"},
+    {"type": "evaluate", "script": "(async () => { const until = Date.now() + 30000; while (Date.now() < until) { const c = (window._capturedResponses || []).slice(window.__ciN0 || 0).filter(x => /webruntime\\/api\\/apex\\/execute/.test(x.url)); if (c.length) return {new_apex_responses: c.length}; await new Promise(r => setTimeout(r, 250)); } throw new Error('no new apex/execute response within 30s of Submit'); })()", "timeout_s": 35},
+    {"type": "wait", "seconds": 2}
+  ]
+}
+```
+
+Expect `login_actions_report.aborted_reason: null` and `login_wall: false` when it had to sign in, and `login_actions_report: null` on the next run (the fast path kept the new cookies). `actions_ready_timeout_seconds` defaults to the window, so the serial-number steps wait out the whole login.
+
 ## Concurrency
 
 The service handles many `/capture` calls in parallel. Two knobs shape the behavior:
@@ -400,7 +529,7 @@ If the interceptor process itself dies mid-request, temp-profile clones under `P
 
 ### Cookie freshness caveat
 
-Fast-path captures write refreshed session cookies back to the base profile — that's what keeps a `roofix` or `gmail` session warm across days-to-weeks. Slow-path captures write to a doomed clone, so their cookie updates are discarded. Under sustained same-profile burst load (multiple in flight at all times), the base profile stops receiving cookie refreshes and eventually the session expires — re-upload the profile when you see `login_wall: true` in responses.
+Fast-path captures write refreshed session cookies back to the base profile — that's what keeps a `roofix` or `gmail` session warm across days-to-weeks. Slow-path captures write to a doomed clone, so their cookie updates are discarded. Under sustained same-profile burst load (multiple in flight at all times), the base profile stops receiving cookie refreshes and eventually the session expires — re-upload the profile when you see `login_wall: true` in responses, or have the requests carry [`login_actions`](#login-actions) (a fresh login is only persisted by a fast-path capture).
 
 ## Refreshing a profile (operator flow)
 
@@ -578,6 +707,8 @@ Because the fast path writes cookies back to the base profile, the refreshed ses
 | `INTERCEPTOR_MAX_CONCURRENT` | `8` | Max simultaneous `/capture` calls. Each slot = one Chrome (~200–400 MB RAM) + on same-profile collision one profile clone (~20–80 MB disk). See [Resource sizing](#resource-sizing). |
 | `INTERCEPTOR_CAPTURE_WINDOW_SECONDS` | `20` | Default capture window when a request omits `capture_window_seconds`. |
 | `INTERCEPTOR_SCREENSHOT_WAIT_SECONDS` | `15` | Default render wait for `POST /screenshot` / `screenshot_url` when a request omits `wait_seconds`. See [Screenshots](#screenshots). |
+| `INTERCEPTOR_LOGINS_DIR` | `/config/logins` | Directory holding the per-profile credential files `<profile>.json` that `login_actions` references resolve from. The compose file bind-mounts `ai/interceptor/logins` there read-only; the files are re-read on every request. Kept outside `INTERCEPTOR_PROFILES_ROOT` on purpose. Changing the mount is a recreate: `make build interceptor && make up interceptor`. See [Login actions](#login-actions). |
+| `INTERCEPTOR_LOGIN_<PROFILE>_USERNAME` / `_PASSWORD` | _(empty)_ | The credentials a logins file references as `${ENV:INTERCEPTOR_LOGIN_…}` — today `INTERCEPTOR_LOGIN_ENPHASE_USERNAME` / `_PASSWORD`. Set in `.env`; each must also be listed in the compose `environment:` block (as `${VAR:-}`). Only the `INTERCEPTOR_LOGIN_` prefix is resolvable. Unset or empty → that profile's `login_actions` are a 400 naming the variable. A literal `$` is written `$$`. Changing a value is `make up interceptor`. |
 
 ## Calling from LiteLLM
 
@@ -596,15 +727,17 @@ The `interceptor` MCP server (registered in `ai/litellm/litellm_config.yaml` `mc
 
 | Tool | Purpose | Args |
 |---|---|---|
-| `capture_url` | Run one capture — same core behavior as `POST /capture`; `screenshot=true` adds an image of the page; `page_script` / `actions` drive the page first (see [Page scripts and actions](#page-scripts-and-actions)) | `url`, `url_patterns`, `profile`, `capture_window_seconds`, `login_timeout`, `max_matches_per_pattern`, `screenshot`, `screenshot_full_page`, `screenshot_format`, `screenshot_scale`, `page_script`, `actions` (list of step objects), `stop_when_matched`, `login_url_patterns`, `actions_ready_timeout_seconds` |
-| `screenshot_url` | Navigate and return a screenshot — same core behavior as `POST /screenshot`. Image arrives as an `ImageContent` block (see [Screenshots § On MCP](#on-mcp)) | `url`, `profile`, `wait_seconds`, `full_page`, `format`, `quality`, `scale`, `login_timeout`, `login_url_patterns` |
-| `list_profiles` | Discover which named profiles exist — call before `capture_url` if the LLM doesn't know the profile name | *(none)* |
+| `capture_url` | Run one capture — same core behavior as `POST /capture`; `screenshot=true` adds an image of the page; `page_script` / `actions` drive the page first (see [Page scripts and actions](#page-scripts-and-actions)) | `url`, `url_patterns`, `profile`, `capture_window_seconds`, `login_timeout`, `max_matches_per_pattern`, `screenshot`, `screenshot_full_page`, `screenshot_format`, `screenshot_scale`, `page_script`, `actions` (list of step objects), `stop_when_matched`, `login_url_patterns`, `actions_ready_timeout_seconds`, `login_actions` (see [Login actions](#login-actions)) |
+| `screenshot_url` | Navigate and return a screenshot — same core behavior as `POST /screenshot`. Image arrives as an `ImageContent` block (see [Screenshots § On MCP](#on-mcp)) | `url`, `profile`, `wait_seconds`, `full_page`, `format`, `quality`, `scale`, `login_timeout`, `login_url_patterns`, `login_actions` |
+| `list_profiles` | Discover which named profiles exist — call before `capture_url` if the LLM doesn't know the profile name. Each entry carries `login_keys` / `login_origins`: the `${…}` names its `login_actions` may use | *(none)* |
 | `list_jobs` | Snapshot of the port pool + running captures — same shape as `GET /jobs` | *(none)* |
 | `get_job` | Detail on one in-flight capture by id — same shape as `GET /jobs/{job_id}` | `job_id` |
 
 The `keep_open` and `debug_logging` knobs from `POST /capture` are deliberately **not** exposed to MCP — both are operator-only debug flags (`keep_open` requires manual Chrome-kill cleanup; `debug_logging` writes to a DevTools console the LLM can't read).
 
 `login_url_patterns` on both tools has the same semantics as on `POST /capture`: omit it (or pass `null`) to keep the defaults, pass a list to **replace** them, `[]` to disable detection. Pass the site's SSO host when the defaults don't match it — for Enphase, `["login", "signin", "/auth", "sso\\.enphaseenergy\\.com"]` — or an expired session comes back as an empty result rather than `login_wall: true`.
+
+`login_actions` on both tools take the same step objects as `POST /capture`. The tool docstrings tell the model to write the credentials as references (`${username}`, `${password}` — the names `list_profiles` reports) and never to ask a user for a real username or password; the values never reach the model in either direction.
 
 MCP tools return dicts and never raise — errors surface inside the payload (e.g. `{"error": "no active job …"}` or a `capture_url` response with `status="error"` and an `error` field describing the HTTP-layer failure).
 
@@ -744,5 +877,6 @@ uv run cdp-spy --url https://roofix.io/project/abc123 --profile-dir C:\data\prof
 - No public auth on the HTTP surface — the service is only reachable via `ai_shared`.
 - No completed-job history — `GET /jobs/{id}` returns 404 as soon as a capture finishes.
 - Actions reach open shadow roots only — not closed shadow roots, not iframes — and `select` handles native `<select>` only. One `page_script` and one action list per capture; there is no conditional branching between steps (use an `evaluate` step for logic).
+- `login_actions` handle a plain form login only — one attempt per capture, no verification codes / MFA / CAPTCHA, and (because the form has to be in the top document) not a login form inside an iframe.
 - No MCP-side cancellation — cancel is HTTP-only. An LLM cannot reclaim a stuck capture it started; that's an operator's job.
 - Screenshots are one-shot, taken at the end of the window (after any `actions`, so "fill, click, then screenshot" works) — but there is no mid-run screenshot and no element-level clipping. Viewport is fixed at the headless `1920×1080` window; full-page height is clamped to `max_height` (≤ 16384).

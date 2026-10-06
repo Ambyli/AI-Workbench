@@ -16,11 +16,12 @@ normal capture path with no change to the capture code.
 
 Public API
 ----------
-- ``parse_actions(list[dict]) -> list[Action]`` — validate step dicts up front
-  (raises ``ActionError``) so a bad request fails before a browser is started.
-- ``run_actions(debug_port, actions, ...) -> ActionsReport`` — readiness gate,
-  optional ``page_script``, then each step in order. Never raises: every
-  failure is recorded on the report.
+- ``parse_actions(list[dict], *, label, allowed_types) -> list[Action]`` —
+  validate step dicts up front (raises ``ActionError``) so a bad request fails
+  before a browser is started.
+- ``run_actions(debug_port, actions, ..., gate, fill_origins) -> ActionsReport``
+  — readiness gate, optional ``page_script``, then each step in order. Never
+  raises: every failure is recorded on the report.
 - ``Action``, ``ActionResult``, ``ActionsReport``, ``ActionError``,
   ``ACTION_TYPES``, ``PRESS_KEYS``.
 
@@ -56,6 +57,12 @@ Non-obvious behaviour
   document. The next step's lookup sees "Cannot find context" / "Execution
   context was destroyed", re-waits the readiness gate once, and retries; a
   dropped side socket is reopened on the next call.
+- **Login gate.** ``gate="login"`` is the one mode that acts ON a login page —
+  it is what ``InterceptorClient`` uses for ``login_actions`` when the capture
+  hits a login wall. It needs only a real URL and ``readyState ===
+  "complete"``: it does not refuse login URLs and does not wait for the
+  capture hook. Pair it with ``fill_origins`` so a ``fill`` only types into a
+  page whose ``location.origin`` is on the list (the password-manager rule).
 """
 
 from __future__ import annotations
@@ -65,7 +72,7 @@ import logging
 import re
 import time
 from dataclasses import asdict, dataclass, field
-from typing import Any, Callable, Iterable, Optional, Sequence
+from typing import Any, Callable, Iterable, Literal, Optional, Sequence
 
 # Reused from screenshot.py rather than refactored out of it: test_screenshot.py
 # monkeypatches these names on the screenshot module. Importing them into this
@@ -137,7 +144,9 @@ class Action:
     type: str
     selector: Optional[str] = None
     text: Optional[str] = None
-    value: Optional[str] = None
+    # Kept out of repr: a login fill's value is a resolved credential, and an
+    # Action that ends up in a log line or a traceback must not carry it.
+    value: Optional[str] = field(default=None, repr=False)
     state: str = "visible"            # wait_for: "visible" | "attached"
     clear: bool = True                # fill
     method: str = "mouse"             # click: "mouse" | "js"
@@ -204,23 +213,35 @@ def _is_number(v: Any) -> bool:
     return isinstance(v, (int, float)) and not isinstance(v, bool)
 
 
-def parse_actions(raw: Optional[Iterable[dict]]) -> list[Action]:
+def parse_actions(
+    raw: Optional[Iterable[dict]],
+    *,
+    label: str = "actions",
+    allowed_types: Optional[Iterable[str]] = None,
+) -> list[Action]:
     """Validate a list of step dicts and return ``Action`` objects.
 
-    Raises ``ActionError`` naming the offending step (``actions[i]``) on an
-    unknown ``type``, a missing required field, a field the type doesn't take,
-    a wrong value type, or an unknown ``press`` key. Keys whose value is
-    ``None`` are ignored.
+    Raises ``ActionError`` naming the offending step (``<label>[i]``) on an
+    unknown ``type``, a type outside ``allowed_types`` (when given), a missing
+    required field, a field the type doesn't take, a wrong value type, or an
+    unknown ``press`` key. Keys whose value is ``None`` are ignored.
     """
+    wanted = None if allowed_types is None else set(allowed_types)
+    allowed = tuple(t for t in ACTION_TYPES if wanted is None or t in wanted)
     out: list[Action] = []
     for i, item in enumerate(raw or []):
-        where = f"actions[{i}]"
+        where = f"{label}[{i}]"
         if not isinstance(item, dict):
             raise ActionError(f"{where}: each action must be an object, got {type(item).__name__}")
         type_ = item.get("type")
         if type_ not in _FIELDS:
             raise ActionError(
-                f"{where}: unknown action type {type_!r} — use one of {', '.join(ACTION_TYPES)}"
+                f"{where}: unknown action type {type_!r} — use one of {', '.join(allowed)}"
+            )
+        if type_ not in allowed:
+            raise ActionError(
+                f"{where}: action type {type_!r} is not allowed in {label} — "
+                f"use one of {', '.join(allowed)}"
             )
         where = f"{where} ({type_})"
         required, optional = _FIELDS[type_]
@@ -426,6 +447,9 @@ _PROBE_JS = (
     "hook: window._fetchInterceptorActive === true})"
 )
 
+# fill_origins check, run before a fill touches the page.
+_ORIGIN_JS = "location.origin"
+
 _FIND_JS = "window.__ciActions.find"
 
 _TARGET_GONE = (
@@ -451,7 +475,7 @@ _FILL_PREP_JS = r"""(function (clear) {
     t.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
   }
   window.__ciActionControl = t;
-  return { focused: A.deepActive() === t, element: A.describe(t) };
+  return { focused: A.deepActive() === t, element: A.describe(t), origin: location.origin };
 })"""
 
 _FILL_DONE_JS = r"""(function () {
@@ -627,6 +651,8 @@ class _Ctx:
     login_res: list[re.Pattern]
     cancel: Callable[[], bool]
     poll: float
+    gate: str = "page"                            # "page" | "login"
+    fill_origins: Optional[frozenset[str]] = None  # None = no origin check
 
     def nap(self, seconds: float) -> None:
         """Sleep that wakes for cancel within ~50 ms."""
@@ -647,7 +673,12 @@ def _rpc_budget(deadline: float) -> float:
 def _wait_ready(ctx: _Ctx, deadline: float) -> Optional[str]:
     """Block until the readiness gate passes (returns ``None``), the deadline
     passes (returns the last reason it wasn't ready), or cancel (returns
-    ``"cancelled"``)."""
+    ``"cancelled"``).
+
+    ``ctx.gate == "login"`` drops the login-URL refusal and the capture-hook
+    requirement: login steps run ON the login page, which has no reason to
+    carry ``interceptor.js`` and every reason to match ``login_res``."""
+    login_gate = ctx.gate == "login"
     reason = "not checked yet"
     while True:
         if ctx.cancel():
@@ -658,6 +689,10 @@ def _wait_ready(ctx: _Ctx, deadline: float) -> Optional[str]:
             href = st.get("href") or ""
             if not href or href == "about:blank":
                 reason = f"tab still on {href or 'an empty URL'}"
+            elif login_gate:
+                if st.get("rs") == "complete":
+                    return None
+                reason = f"document.readyState={st.get('rs')!r} at {href}"
             elif any(rx.search(href) for rx in ctx.login_res):
                 reason = f"login page {href}"
             elif st.get("rs") != "complete":
@@ -730,9 +765,20 @@ def _do_wait_for(ctx: _Ctx, a: Action) -> Any:
     return {"element": hit.get("element"), "matched": hit.get("matched"), "visible": hit.get("visible")}
 
 
+def _check_fill_origin(ctx: _Ctx, origin: Any) -> None:
+    if ctx.fill_origins is not None and origin not in ctx.fill_origins:
+        raise _StepFailure(f"origin {origin} not allowed for this fill")
+
+
 def _do_fill(ctx: _Ctx, a: Action) -> Any:
+    if ctx.fill_origins is not None:
+        # Before anything touches the page — a wrong-origin page never even
+        # has a field focused or cleared. Checked again in the prep below,
+        # which runs atomically with the focus, right before the typing.
+        _check_fill_origin(ctx, ctx.side.evaluate(_ORIGIN_JS, timeout=_RPC_TIMEOUT))
     _lookup(ctx, a, "visible")
     prep = _checked(ctx.side.evaluate(_call_js(_FILL_PREP_JS, a.clear), timeout=_RPC_TIMEOUT))
+    _check_fill_origin(ctx, prep.get("origin"))
     if not prep.get("focused"):
         raise _StepFailure(f"could not focus {prep.get('element')} — another element kept focus")
     if a.value:
@@ -868,6 +914,9 @@ def run_actions(
     cancel: Optional[Callable[[], bool]] = None,
     on_progress: Optional[Callable[[int, int], None]] = None,
     poll_interval_s: float = 0.25,
+    gate: Literal["page", "login"] = "page",
+    fill_origins: Optional[Sequence[str]] = None,
+    label: str = "actions",
 ) -> ActionsReport:
     """Drive the page tab of the Chrome on ``debug_port``.
 
@@ -879,8 +928,16 @@ def run_actions(
     own timeout). ``on_progress(done, total)`` fires after each action.
 
     ``login_url_patterns`` are the same regexes the capture uses to spot a
-    login wall; the gate does not run anything while the tab matches one.
-    Never raises.
+    login wall; with the default ``gate="page"`` nothing runs while the tab
+    matches one. ``gate="login"`` is for steps that are MEANT to run on the
+    login page (see the module docstring): it waits only for a real URL and
+    ``readyState === "complete"``, also when re-gating after a navigation.
+
+    ``fill_origins``, when given, restricts every ``fill`` to a tab whose
+    ``location.origin`` is in the list; anything else fails the step with
+    ``origin <o> not allowed for this fill`` before a character is typed.
+    ``label`` names the list in ``aborted_reason`` (``login_actions[1] (fill)
+    failed: …``). Never raises.
     """
     actions = list(actions)
     cancel = cancel or (lambda: False)
@@ -891,7 +948,9 @@ def run_actions(
         return ActionsReport.not_run(actions, page_script, f"invalid login_url_pattern: {exc}")
 
     ctx = _Ctx(side=_Side(debug_port, tab_url_hint), login_res=login_res,
-               cancel=cancel, poll=max(0.01, poll_interval_s))
+               cancel=cancel, poll=max(0.01, poll_interval_s),
+               gate="login" if gate == "login" else "page",
+               fill_origins=None if fill_origins is None else frozenset(fill_origins))
 
     def abort(reason: str, from_index: int) -> ActionsReport:
         report.aborted_reason = reason
@@ -926,7 +985,7 @@ def run_actions(
                     logger.debug("actions: on_progress raised: %s", exc)
             if not res.ok:
                 return abort("cancelled" if res.error == "cancelled"
-                             else f"actions[{i}] ({a.type}) failed: {res.error}", i + 1)
+                             else f"{label}[{i}] ({a.type}) failed: {res.error}", i + 1)
         return report
     except Exception as exc:  # belt and braces — the contract is "never raises"
         logger.warning("actions: run aborted unexpectedly: %r", exc)

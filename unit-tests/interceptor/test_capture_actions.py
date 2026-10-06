@@ -129,8 +129,9 @@ class _FakeClient:
     actions_take = 0.1
     instances: list["_FakeClient"] = []
 
-    def __init__(self, *, on_capture, on_status, **_kw):
+    def __init__(self, *, on_capture, on_status, **kw):
         self._on_capture = on_capture
+        self.kwargs = kw  # everything else the service passed (login_actions, …)
         self.quit_called = False
         self.actions_called_with = None
         _FakeClient.instances.append(self)
@@ -159,6 +160,9 @@ class _FakeClient:
         from common.cdp_interceptor import ClientState
 
         return ClientState(status="ok", headless=True, error=None, last_capture_at=None)
+
+    def get_login_report(self):
+        return None  # no login wall in these tests
 
     def screenshot(self, **_kw):
         from common.cdp_interceptor import ScreenshotError
@@ -228,7 +232,11 @@ def test_without_actions_the_response_is_unchanged(client, app_mod, fake_client)
     assert elapsed >= 1.0  # no stop_when_matched → the full window
     assert body["ended_early"] is False
     assert body["actions_report"] is None
+    assert body["login_actions_report"] is None
     assert fake_client.instances[0].actions_called_with is None
+    # No login_actions → nothing login-related handed to the client.
+    kw = fake_client.instances[0].kwargs
+    assert kw["login_actions"] == [] and kw["login_fill_origins"] == () and kw["login_lock"] is None
     assert len(body["matches"]["api/apex/execute"]) == 1
     _pool_untouched(client, app_mod)
 

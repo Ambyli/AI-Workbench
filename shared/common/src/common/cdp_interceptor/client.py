@@ -80,6 +80,10 @@ class InterceptorClient:
         login_url_keywords: tuple[str, ...] = ("login", "signin", "/auth"),
         chrome_path: Optional[str] = None,
         interceptor_script: Optional[str] = None,
+        login_actions: Sequence[Action] = (),
+        login_fill_origins: Sequence[str] = (),
+        login_actions_timeout_s: float = 60.0,
+        login_lock: Optional[threading.Lock] = None,
     ) -> None:
         self._profile_dir = profile_dir
         self._debug_port = debug_port
@@ -99,6 +103,13 @@ class InterceptorClient:
         self._login_url_keywords = login_url_keywords
         self._chrome_path = chrome_path
         self._interceptor_script_override = interceptor_script
+        # Automated login (see _on_login_wall). The actions arrive with any
+        # credential references already resolved — this object holds secrets
+        # in memory only and never logs or reports a fill's value.
+        self._login_actions: list[Action] = list(login_actions)
+        self._login_fill_origins: tuple[str, ...] = tuple(login_fill_origins)
+        self._login_actions_timeout_s = float(login_actions_timeout_s)
+        self._login_lock = login_lock
 
         # Runtime state (guarded by _lock)
         self._lock = threading.Lock()
@@ -106,6 +117,8 @@ class InterceptorClient:
         self._error: Optional[str] = None
         self._headless = False
         self._last_capture_at: Optional[float] = None
+        self._login_attempted = False
+        self._login_report: Optional[ActionsReport] = None
 
         # Worker plumbing
         self._proc: Optional[subprocess.Popen] = None
@@ -251,6 +264,14 @@ class InterceptorClient:
                 error=self._error,
                 last_capture_at=self._last_capture_at,
             )
+
+    def get_login_report(self) -> Optional[ActionsReport]:
+        """What ``login_actions`` did, or ``None`` if they never started —
+        either none were configured or the session never hit a login wall.
+        While they are still running this is a placeholder report whose
+        ``aborted_reason`` says so; it is replaced when they finish."""
+        with self._lock:
+            return self._login_report
 
     def screenshot(
         self,
@@ -563,6 +584,65 @@ class InterceptorClient:
                 self._error = error
         self._notify_status()
 
+    def _on_login_wall(self, stop_event: threading.Event) -> None:
+        """run_session's ``on_login_wall`` hook: run ``login_actions`` against
+        the login page, once per client.
+
+        Blocks the session thread while it runs — that is the point: the
+        session's own wait (which then sees the tab leave the login URL and
+        re-navigates to the target) only starts once the form is submitted.
+
+        One attempt per client, never retried: a wrong password or a changed
+        form must not hammer the SSO into locking the account. A failed
+        attempt leaves the session waiting exactly as it would for a human.
+        ``login_lock`` (shared per profile by the caller) keeps two captures
+        on the same profile from submitting the form at the same time.
+        """
+        with self._lock:
+            if self._login_attempted or not self._login_actions:
+                return
+            self._login_attempted = True
+            self._login_report = ActionsReport.not_run(
+                self._login_actions, None, "login_actions still running when the capture ended"
+            )
+
+        lock = self._login_lock
+        if lock is not None:
+            while not lock.acquire(timeout=0.25):
+                if stop_event.is_set():
+                    with self._lock:
+                        self._login_report = ActionsReport.not_run(
+                            self._login_actions, None,
+                            "cancelled while another capture on this profile was logging in",
+                        )
+                    return
+        try:
+            budget = self._login_actions_timeout_s
+            deadline = time.monotonic() + budget
+            report = run_actions(
+                self._debug_port,
+                self._login_actions,
+                gate="login",
+                fill_origins=self._login_fill_origins or None,
+                tab_url_hint="",
+                login_url_patterns=self._login_url_keywords,
+                ready_timeout_s=budget,
+                cancel=lambda: stop_event.is_set() or time.monotonic() >= deadline,
+                label="login_actions",
+            )
+            if report.aborted_reason == "cancelled" and not stop_event.is_set():
+                report.aborted_reason = f"login_actions did not finish within {budget:g}s"
+        finally:
+            if lock is not None:
+                lock.release()
+        failed = next((r for r in report.actions if not r.ok), None)
+        logger.debug(
+            "InterceptorClient: login_actions ok=%s failed_at=%s",
+            report.ok, f"{failed.index} ({failed.type})" if failed else "-",
+        )
+        with self._lock:
+            self._login_report = report
+
     def _notify_status(self) -> None:
         """Invoke the user's on_status callback with a lock-guarded snapshot.
         Snapshot-then-release means the callback doesn't hold the lock while
@@ -621,6 +701,10 @@ class InterceptorClient:
                     capture_poll=self._capture_poll,
                     url_patterns=self._url_patterns,
                     login_url_keywords=self._login_url_keywords,
+                    on_login_wall=(
+                        (lambda: self._on_login_wall(stop_event))
+                        if self._login_actions else None
+                    ),
                 )
             except TimeoutError as exc:
                 # TimeoutError specifically means the user didn't complete

@@ -232,6 +232,10 @@ InterceptorClient(
     login_url_keywords: tuple[str, ...] = ("login", "signin", "/auth"),
     chrome_path: str | None = None,
     interceptor_script: str | None = None,
+    login_actions: Sequence[Action] = (),
+    login_fill_origins: Sequence[str] = (),
+    login_actions_timeout_s: float = 60.0,
+    login_lock: threading.Lock | None = None,
 )
 ```
 
@@ -312,6 +316,10 @@ Absolute path to the browser executable. `None` uses `find_browser()` (Windows C
 
 Custom JS to inject instead of the bundled `interceptor.js`.
 
+##### `login_actions`, `login_fill_origins`, `login_actions_timeout_s`, `login_lock`
+
+Automated login. When `login_actions` is non-empty, the first time a session hits a login wall (right after status `"waiting_login"`) the worker runs them with `run_actions(..., gate="login", fill_origins=login_fill_origins)` — on the login page itself — then waits for the URL to leave the login zone exactly as it would for a human (`login_timeout` counts from when the steps finish). One attempt per client, never retried, so a bad password can't lock an account by looping. `login_actions_timeout_s` caps the whole run (gate + steps); `login_lock`, if given, is held while the steps run so callers can stop two clients on the same account submitting the form at once. Pass actions whose credential values are already resolved — this class never logs or reports a fill's value (a fill's result is `{element, value_length}`). Read the outcome with `get_login_report()`. `ai/interceptor` builds these from `login_actions` + a per-profile credentials file; see [INTERCEPTOR.md § Login actions](../../../../../ai/interceptor/INTERCEPTOR.md#login-actions).
+
 #### Methods
 
 | Method | Purpose |
@@ -324,6 +332,7 @@ Custom JS to inject instead of the bundled `interceptor.js`.
 | `.get_state() -> ClientState` | Snapshot of current status (lock-guarded). |
 | `.screenshot(...) -> Screenshot` | Image of the page tab, over a second CDP connection. Raises `ScreenshotError`. |
 | `.run_actions(actions, *, page_script=None, ready_timeout_s=60, ...) -> ActionsReport` | Fill / click / press / evaluate in the page tab over a second CDP connection — see [Driving the page](#driving-the-page-run_actions). Never raises. |
+| `.get_login_report() -> ActionsReport \| None` | What `login_actions` did; `None` if none were configured or no login wall was hit. A placeholder report while they are still running. |
 | `.is_running` *(property)* | True while the worker thread is alive. |
 | `InterceptorClient.is_available()` *(staticmethod)* | True if `requests` and `websocket-client` are importable. |
 
@@ -456,6 +465,8 @@ report = client.run_actions(
 print(report.to_dict())   # per-step ok / error / value, plus aborted_reason
 client.quit()
 ```
+
+Two options exist for login steps (what `InterceptorClient`'s `login_actions` use): `gate="login"` swaps the readiness gate for one that only needs a real URL and `readyState === "complete"` — it acts *on* a login page instead of refusing it, and does not wait for the capture hook — and `fill_origins=[...]` makes every `fill` check `location.origin` against the list first, failing with `origin <o> not allowed for this fill` before anything is typed. `parse_actions(..., label="login_actions", allowed_types=[...])` names the list in errors and refuses step types outside the set.
 
 Step types: `wait_for`, `fill`, `click`, `press`, `select`, `wait`, `evaluate`. Element lookup searches the document **and every open shadow root** (each tree separately — a descendant combinator never crosses a shadow boundary), so Lightning Web Components are reachable; `fill` / `click` / `press` use trusted CDP `Input.*` events. Full reference: [`ai/interceptor/INTERCEPTOR.md` § Page scripts and actions](../../../../../ai/interceptor/INTERCEPTOR.md#page-scripts-and-actions).
 

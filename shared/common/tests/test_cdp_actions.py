@@ -76,6 +76,35 @@ def test_parse_actions_accepts_single_character_keys_and_none():
     assert a.key == "a"
 
 
+LOGIN_TYPES = ("wait_for", "fill", "click", "press", "select", "wait")
+
+
+def test_parse_actions_label_prefixes_errors():
+    with pytest.raises(ActionError, match=r"^login_actions\[1\] \(fill\): missing required field") as ei:
+        parse_actions([{"type": "wait", "seconds": 0}, {"type": "fill", "selector": "a"}],
+                      label="login_actions")
+    assert "actions[1]" not in str(ei.value).replace("login_actions[1]", "")
+
+
+def test_parse_actions_allowed_types_refuses_the_rest():
+    with pytest.raises(ActionError, match=r"login_actions\[0\]: action type 'evaluate' is not allowed") as ei:
+        parse_actions([{"type": "evaluate", "script": "1"}],
+                      label="login_actions", allowed_types=LOGIN_TYPES)
+    assert "evaluate" not in str(ei.value).split("use one of")[1]
+    # An unknown type lists only the allowed ones.
+    with pytest.raises(ActionError, match="use one of wait_for, fill, click, press, select, wait$"):
+        parse_actions([{"type": "hover"}], label="login_actions", allowed_types=LOGIN_TYPES)
+    # And an allowed one still parses.
+    [a] = parse_actions([{"type": "fill", "selector": "#u", "value": "${username}"}],
+                        label="login_actions", allowed_types=LOGIN_TYPES)
+    assert a.value == "${username}"
+
+
+def test_action_repr_hides_the_value():
+    [a] = parse_actions([{"type": "fill", "selector": "#p", "value": "hunter2"}])
+    assert "hunter2" not in repr(a) and "#p" in repr(a)
+
+
 # ── Fake Chrome ──────────────────────────────────────────────────────────────
 
 class WebSocketTimeoutException(Exception):
@@ -96,6 +125,7 @@ class FakePage:
         self.fill_prep = {"focused": True, "element": "<input>"}
         self.click_box = {"x": 100.0, "y": 50.0, "element": "<button>"}
         self.eval_result = {"result": {"type": "number", "value": 2}}
+        self.origins = ["https://support.example.com"]  # location.origin; last repeats
 
     @staticmethod
     def _next(seq):
@@ -111,12 +141,15 @@ class FakePage:
         expr = params["expression"]
         if expr == actions_mod._PROBE_JS:
             return self.value(self._next(self.probes))
+        if expr == actions_mod._ORIGIN_JS:
+            return self.value(self._next(self.origins))
         if actions_mod._FIND_JS in expr:
             # The deep query reports bad selectors as a value ({error: …}),
             # not by throwing, so every scripted lookup is returned by value.
             return self.value(self._next(self.lookups))
         if actions_mod._FILL_PREP_JS in expr:
-            return self.value(self.fill_prep)
+            # The prep reports the origin it focused in; same source as the probe.
+            return self.value({"origin": self._next(self.origins), **self.fill_prep})
         if actions_mod._FILL_DONE_JS in expr:
             return self.value({"element": "<input>", "value_length": 12})
         if actions_mod._CLICK_PREP_JS in expr:
@@ -239,6 +272,125 @@ def test_gate_never_acts_on_a_login_page(monkeypatch):
     assert "login page https://sso.example.com/login" in report.aborted_reason
     assert page.lookups_sent() == 0
     assert "Input.insertText" not in page.methods()
+
+
+SSO = "https://sso.example.com/login?next=/feoc"
+
+
+@pytest.mark.parametrize("gate, acts", [("page", False), ("login", True)])
+def test_login_gate_acts_on_the_login_page_the_default_gate_refuses(monkeypatch, gate, acts):
+    # The login page has no capture hook and matches login_url_patterns:
+    # the default gate waits it out, gate="login" types into it.
+    page = FakePage()
+    page.probes = [{"href": SSO, "rs": "complete", "hook": False}]
+    page.origins = ["https://sso.example.com"]
+    _patch_chrome(monkeypatch, page)
+
+    report = _run([{"type": "fill", "selector": "input[type=password]", "value": "pw"}],
+                  ready_timeout_s=0.2, login_url_patterns=[r"sso\.example\.com"], gate=gate,
+                  fill_origins=["https://sso.example.com"] if gate == "login" else None)
+
+    assert report.ok is acts, report.aborted_reason
+    assert ("Input.insertText" in page.methods()) is acts
+    if not acts:
+        assert "login page https://sso.example.com/login" in report.aborted_reason
+
+
+def test_login_gate_still_waits_for_a_real_url_and_complete(monkeypatch):
+    page = FakePage()
+    page.probes = [
+        {"href": "about:blank", "rs": "complete", "hook": False},
+        {"href": SSO, "rs": "interactive", "hook": False},
+        {"href": SSO, "rs": "complete", "hook": False},
+    ]
+    _patch_chrome(monkeypatch, page)
+
+    report = _run([{"type": "wait", "seconds": 0}], gate="login",
+                  login_url_patterns=[r"sso\.example\.com"])
+
+    assert report.ok
+    assert sum(1 for _, p in page.calls if p.get("expression") == actions_mod._PROBE_JS) == 3
+
+
+def test_login_gate_regate_after_navigation_does_not_refuse_the_login_url(monkeypatch):
+    # A multi-page login (email → password) replaces the document between
+    # steps: the lookup's re-gate must use the login gate too.
+    page = FakePage()
+    page.probes = [{"href": SSO, "rs": "complete", "hook": False}]
+    _patch_chrome(monkeypatch, page)
+    real_respond = page.respond
+    state = {"armed": True}
+
+    def respond(method, params):
+        if (state["armed"] and method == "Runtime.evaluate"
+                and actions_mod._FIND_JS in params["expression"]):
+            state["armed"] = False
+            page.calls.append((method, params))
+            return {"error": {"code": -32000, "message": "Execution context was destroyed."}}
+        return real_respond(method, params)
+
+    page.respond = respond
+    report = _run([{"type": "wait_for", "selector": "input[type=password]", "timeout_s": 1}],
+                  gate="login", login_url_patterns=[r"sso\.example\.com"])
+
+    assert report.ok, report.aborted_reason
+    assert page.lookups_sent() == 2
+
+
+def test_fill_origins_blocks_a_wrong_origin_before_touching_the_page(monkeypatch):
+    page = FakePage()
+    page.probes = [{"href": "https://evil.example.net/login", "rs": "complete", "hook": False}]
+    page.origins = ["https://evil.example.net"]
+    _patch_chrome(monkeypatch, page)
+
+    report = _run([{"type": "fill", "selector": "input", "value": "hunter2"},
+                   {"type": "click", "selector": "button"}],
+                  gate="login", fill_origins=["https://sso.example.com"], label="login_actions")
+
+    assert report.actions[0].error == "origin https://evil.example.net not allowed for this fill"
+    assert report.aborted_reason == (
+        "login_actions[0] (fill) failed: origin https://evil.example.net not allowed for this fill"
+    )
+    assert report.actions[1].error == "skipped"
+    assert page.lookups_sent() == 0
+    assert "Input.insertText" not in page.methods()
+    assert not any(actions_mod._FILL_PREP_JS in p.get("expression", "") for _, p in page.calls)
+    assert "hunter2" not in json.dumps(report.to_dict())
+
+
+def test_fill_origins_allows_the_listed_origin(monkeypatch):
+    page = FakePage()
+    page.origins = ["https://sso.example.com"]
+    _patch_chrome(monkeypatch, page)
+
+    report = _run([{"type": "fill", "selector": "input", "value": "hunter2"}],
+                  fill_origins=["https://sso.example.com"])
+
+    assert report.ok, report.aborted_reason
+    assert next(p for m, p in page.calls if m == "Input.insertText") == {"text": "hunter2"}
+    assert report.actions[0].value == {"element": "<input>", "value_length": 12}
+
+
+def test_fill_origins_rechecks_at_focus_time(monkeypatch):
+    # The page navigated between the origin check and the focus: the prep
+    # reports the new origin and nothing is typed.
+    page = FakePage()
+    page.origins = ["https://sso.example.com", "https://elsewhere.example.org"]
+    _patch_chrome(monkeypatch, page)
+
+    report = _run([{"type": "fill", "selector": "input", "value": "hunter2"}],
+                  fill_origins=["https://sso.example.com"])
+
+    assert report.actions[0].error == "origin https://elsewhere.example.org not allowed for this fill"
+    assert "Input.insertText" not in page.methods()
+
+
+def test_without_fill_origins_no_origin_probe_is_sent(monkeypatch):
+    page = FakePage()
+    _patch_chrome(monkeypatch, page)
+
+    assert _run([{"type": "fill", "selector": "input", "value": "x"}]).ok
+    assert not any(p.get("expression") == actions_mod._ORIGIN_JS for _, p in page.calls)
 
 
 def test_gate_tolerates_chrome_not_up_yet(monkeypatch):

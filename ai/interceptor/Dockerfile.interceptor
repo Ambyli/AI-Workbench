@@ -30,7 +30,7 @@ RUN uv run playwright install chromium --with-deps
 
 # Service code last so a code-only change doesn't invalidate the (slow) sync +
 # playwright layers.
-COPY ai/interceptor/app.py ai/interceptor/profiles.py ./ai/interceptor/
+COPY ai/interceptor/app.py ai/interceptor/profiles.py ai/interceptor/logins.py ./ai/interceptor/
 
 WORKDIR /app/ai/interceptor
 EXPOSE 8080

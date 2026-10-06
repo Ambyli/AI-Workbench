@@ -53,6 +53,7 @@ def run_session(
     url_patterns: Optional[list[re.Pattern]] = None,
     login_url_keywords: tuple[str, ...] = ("login", "signin", "/auth"),
     tab_url_hint: str = "",
+    on_login_wall: Optional[Callable[[], None]] = None,
 ) -> None:
     """Persistent CDP session: initial capture, then live binding-event loop.
 
@@ -87,6 +88,12 @@ def run_session(
     tab_url_hint : str
         Substring used to prefer a specific existing tab when Chrome has
         multiple pages open. Empty = pick any ``type=="page"`` tab.
+    on_login_wall : callable | None
+        Called (no arguments, on this thread) the FIRST time per session that
+        a login wall is detected — right after ``on_status("waiting_login")``
+        and before the wait for the login to resolve. It may block (e.g. run
+        login steps over a second CDP connection); the ``login_timeout`` wait
+        starts when it returns. Exceptions are logged and swallowed.
     """
     # Local imports so the library can be imported for introspection even
     # if the runtime deps are missing (is_available() checks for these).
@@ -268,6 +275,10 @@ def run_session(
     # elasticsearch/mget. A per-seq set has no such window.
     _delivered_seqs: set = set()
 
+    # on_login_wall fires at most once per session (a list so the nested
+    # function can flip it).
+    _login_hook_fired = [False]
+
     def _handle_item(item: dict, *, deliver_on_data: bool) -> Optional[dict]:
         """Dedup one raw ``{seq, url, body}`` entry by seq, then run it through
         ``_process_capture`` (which always fires ``on_capture``).
@@ -321,20 +332,41 @@ def run_session(
         — that's what surfaces as ``login_wall=true``. On timeout we raise
         ``TimeoutError``, matching the sentinel-expiry contract
         ``InterceptorClient._loop`` relies on.
+
+        ``on_login_wall`` (if given) runs once per session, before the wait —
+        typically it fills and submits the login form, and the poll below then
+        sees the tab leave the login URL exactly as it would after a human
+        login. The ``login_timeout`` deadline starts after it returns, so a
+        slow automated login can't eat the wait budget.
         """
         on_status("waiting_login", None)
         logger.debug("cdp_session: login wall detected — awaiting authentication")
+        if on_login_wall is not None and not _login_hook_fired[0]:
+            _login_hook_fired[0] = True
+            try:
+                on_login_wall()
+            except Exception as exc:
+                logger.warning("cdp_session: on_login_wall raised: %s", exc)
         deadline = time.time() + login_timeout
         while time.time() < deadline:
             if stop_event.is_set():
                 return
             time.sleep(3)
+            if stop_event.is_set():
+                return
             try:
                 href = eval_str("location.href")
             except Exception:
                 continue
+            # An empty href is a failed read (rpc timed out, or stopped mid-
+            # call), not a page — it must not count as "login resolved".
+            if not href:
+                continue
             if not _is_login(href):
                 logger.debug("cdp_session: login resolved — re-navigating to target")
+                # Leave "waiting_login": a target page that fires no JSON
+                # would otherwise report a login wall the session got past.
+                on_status("loading", None)
                 # New document incoming — reset dedup state so post-login
                 # captures (whose per-document seq restarts at 1) aren't
                 # mistaken for the login page's already-delivered ones.

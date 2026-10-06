@@ -1,0 +1,7 @@
+{
+  "allowed_origins": ["https://sso.enphaseenergy.com"],
+  "values": {
+    "username": "${ENV:INTERCEPTOR_LOGIN_ENPHASE_USERNAME}",
+    "password": "${ENV:INTERCEPTOR_LOGIN_ENPHASE_PASSWORD}"
+  }
+}

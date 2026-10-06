@@ -50,6 +50,12 @@ launch waits for the page to be ready, then fills / clicks / evaluates, so the
 requests the page fires in response are captured through the normal path.
 ``stop_when_matched`` ends the window as soon as every pattern has a match.
 
+``login_actions`` run only if the tab hits a login wall: the capture session
+calls them (``InterceptorClient``'s ``on_login_wall`` hook) to fill and submit
+the login form, with ``${key}`` references in fill values resolved from the
+profile's server-side logins file (``logins.py``). The request — and so every
+log line, job record and response — only ever carries the reference.
+
 Registered with LiteLLM in ai/litellm/litellm_config.yaml both as an `mcp_servers`
 entry (model-invokable tool) and as a `pass_through_endpoints` entry
 (``/v1/interceptor/...`` proxied to this service).
@@ -81,6 +87,7 @@ from mcp.types import TextContent
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from common.cdp_interceptor import (
+    Action,
     ActionError,
     ActionsReport,
     BrowserNotFoundError,
@@ -92,6 +99,7 @@ from common.cdp_interceptor import (
 from common.jobs import InMemoryRegistry
 from common.jobs.router import build_router
 
+import logins
 import profiles
 
 
@@ -106,6 +114,9 @@ DEFAULT_CAPTURE_WINDOW_SECONDS = int(
 DEFAULT_SCREENSHOT_WAIT_SECONDS = int(
     os.environ.get("INTERCEPTOR_SCREENSHOT_WAIT_SECONDS", "15")
 )
+# Upper bound on one login_actions run (gate + every step) when a request
+# omits login_actions_timeout_seconds.
+DEFAULT_LOGIN_ACTIONS_TIMEOUT_SECONDS = 60
 
 
 def _log(msg: str) -> None:
@@ -149,6 +160,22 @@ def _get_profile_lock(name: str) -> threading.Lock:
         if lock is None:
             lock = threading.Lock()
             _per_profile_locks[name] = lock
+        return lock
+
+
+# Held while login_actions submit a profile's login form, so two captures on
+# the same profile (fast path + a slow-path clone) never log in at once.
+# Separate from the fast/slow-path lock above: that one is held for a whole
+# capture and only ever try-acquired.
+_login_locks: dict[str, threading.Lock] = {}
+
+
+def _get_login_lock(name: str) -> threading.Lock:
+    with _locks_meta_lock:
+        lock = _login_locks.get(name)
+        if lock is None:
+            lock = threading.Lock()
+            _login_locks[name] = lock
         return lock
 
 
@@ -353,6 +380,15 @@ ActionModel = Annotated[
     Field(discriminator="type"),
 ]
 
+# login_actions: the same steps minus `evaluate` — a script on the login page
+# could read the password field back into the report.
+LoginActionModel = Annotated[
+    Union[WaitForAction, FillAction, ClickAction, PressAction, SelectAction,
+          WaitAction],
+    Field(discriminator="type"),
+]
+LOGIN_ACTION_TYPES = ("wait_for", "fill", "click", "press", "select", "wait")
+
 
 class ActionResultModel(BaseModel):
     index: int = Field(description="Position in `actions`; -1 for `page_script`.")
@@ -380,6 +416,26 @@ class ActionsReportModel(BaseModel):
         "'not ready: login page …', 'cancelled', 'actions[2] (click) failed: …', "
         "'capture window ended before actions finished'.",
     )
+
+
+_LOGIN_ACTIONS_DESC = (
+    "Steps (wait_for / fill / click / press / select / wait — no evaluate) run "
+    "ONLY if the tab lands on a login wall (`login_url_patterns`), once per "
+    "capture, to sign in; the session then continues to `url` as it would "
+    "after a human login. A fill `value` may reference the profile's stored "
+    "credentials as `${username}` / `${password}` (`$$` = a literal $) — they "
+    "are resolved server-side from INTERCEPTOR_LOGINS_DIR/<profile>.json, and "
+    "a fill only types into a page whose origin is in that file's "
+    "`allowed_origins`. `${` anywhere else is a 400. `capture_window_seconds` "
+    "must cover the login, the SSO redirect AND the target page load. See "
+    "INTERCEPTOR.md § Login actions."
+)
+_LOGIN_TIMEOUT_DESC = (
+    "Upper bound on one login_actions run — the login page becoming ready plus "
+    "every step (default 60). It runs inside capture_window_seconds, so the "
+    "window must also be long enough for the login, the SSO redirect and the "
+    "target page load."
+)
 
 
 class CaptureRequest(BaseModel):
@@ -457,6 +513,16 @@ class CaptureRequest(BaseModel):
         "bucket has at least one match (and the actions, if any, have "
         "finished) instead of waiting it out. Requires url_patterns.",
     )
+    login_actions: list[LoginActionModel] = Field(
+        default_factory=list,
+        description=_LOGIN_ACTIONS_DESC,
+    )
+    login_actions_timeout_seconds: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=600,
+        description=_LOGIN_TIMEOUT_DESC,
+    )
 
     @model_validator(mode="after")
     def _patterns_or_screenshot(self) -> "CaptureRequest":
@@ -467,6 +533,11 @@ class CaptureRequest(BaseModel):
             )
         if self.stop_when_matched and not self.url_patterns:
             raise ValueError("stop_when_matched needs at least one url_pattern to match")
+        if self.login_actions and not self.login_url_patterns:
+            raise ValueError(
+                "login_actions run only when a login wall is detected — they need "
+                "login_url_patterns (an empty list disables detection)"
+            )
         return self
 
 
@@ -488,6 +559,11 @@ class CaptureResponse(BaseModel):
     actions_report: Optional[ActionsReportModel] = Field(
         default=None,
         description="What page_script / actions did — null unless requested.",
+    )
+    login_actions_report: Optional[ActionsReportModel] = Field(
+        default=None,
+        description="What login_actions did — null unless they were sent AND "
+        "the capture hit a login wall. A fill reports only `value_length`.",
     )
     ended_early: bool = Field(
         default=False,
@@ -518,6 +594,26 @@ class ScreenshotRequest(ScreenshotOptions):
         default_factory=lambda: ["login", "signin", "/auth"],
         description="Same semantics as CaptureRequest.login_url_patterns.",
     )
+    login_actions: list[LoginActionModel] = Field(
+        default_factory=list,
+        description="Same semantics as CaptureRequest.login_actions — "
+        "`wait_seconds` must cover the login, the redirect and the page load.",
+    )
+    login_actions_timeout_seconds: Optional[int] = Field(
+        default=None, ge=1, le=600,
+        description="Same semantics as CaptureRequest.login_actions_timeout_seconds.",
+    )
+
+    @model_validator(mode="after")
+    def _login_actions_need_detection(self) -> "ScreenshotRequest":
+        # Same rule as CaptureRequest — checked here too so it is a 422, not
+        # a 500 from building the CaptureRequest inside _run_screenshot.
+        if self.login_actions and not self.login_url_patterns:
+            raise ValueError(
+                "login_actions run only when a login wall is detected — they need "
+                "login_url_patterns (an empty list disables detection)"
+            )
+        return self
 
 
 class ScreenshotResponse(BaseModel):
@@ -532,6 +628,10 @@ class ScreenshotResponse(BaseModel):
     error: Optional[str]
     screenshot: Optional[ScreenshotResult]
     screenshot_error: Optional[str]
+    login_actions_report: Optional[ActionsReportModel] = Field(
+        default=None,
+        description="Same as CaptureResponse.login_actions_report.",
+    )
 
 
 # ── Health + profile endpoints ──────────────────────────────────────────────
@@ -540,15 +640,33 @@ def health() -> dict:
     return {"status": "ok"}
 
 
+def _with_login_info(entry: dict) -> dict:
+    """Add the reference names and allowed origins of the profile's logins
+    file (never a value), so a caller can see which ``${…}`` its
+    ``login_actions`` may use."""
+    info = logins.describe(entry["name"])
+    out = {**entry, "login_keys": info["keys"], "login_origins": info["allowed_origins"]}
+    if "error" in info:
+        out["login_error"] = info["error"]
+    return out
+
+
+def _profiles_listing() -> dict:
+    return {
+        "root": profiles.PROFILES_ROOT,
+        "profiles": [_with_login_info(p) for p in profiles.list_profiles()],
+    }
+
+
 @app.get("/profiles")
 def profiles_list() -> dict:
-    return {"root": profiles.PROFILES_ROOT, "profiles": profiles.list_profiles()}
+    return _profiles_listing()
 
 
 @app.get("/profiles/{name}")
 def profiles_get(name: str) -> dict:
     try:
-        return profiles.profile_info(name)
+        return _with_login_info(profiles.profile_info(name))
     except profiles.InvalidProfileNameError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -613,6 +731,29 @@ def _run_capture(req: CaptureRequest) -> CaptureResponse:
     except ActionError as e:
         raise HTTPException(status_code=400, detail=f"invalid action: {e}")
     want_actions = bool(lib_actions) or req.page_script is not None
+
+    # Login steps: same library validation (no evaluate), then the profile's
+    # logins file and the ${key} substitution. Resolved by profile NAME, so
+    # the fast path and a slow-path clone use the same credentials. Every
+    # error names a step or a key, never a value — and still no port taken.
+    lib_login_actions: list[Action] = []
+    login_origins: tuple[str, ...] = ()
+    if req.login_actions:
+        try:
+            parsed_login = parse_actions(
+                [a.model_dump() for a in req.login_actions],
+                label="login_actions",
+                allowed_types=LOGIN_ACTION_TYPES,
+            )
+        except ActionError as e:
+            raise HTTPException(status_code=400, detail=f"invalid login_actions: {e}")
+        try:
+            logins.referenced_keys(parsed_login)
+            login_cfg = logins.load(req.profile)
+            lib_login_actions = logins.resolve(parsed_login, login_cfg)
+        except logins.LoginConfigError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        login_origins = login_cfg.allowed_origins
 
     # Reserve a port BEFORE touching anything else. If capacity is out, we're
     # done — 429 the caller.
@@ -714,6 +855,12 @@ def _run_capture(req: CaptureRequest) -> CaptureResponse:
             capture_timeout=req.capture_window_seconds,
             debug_logging=req.debug_logging,
             login_url_keywords=tuple(req.login_url_patterns),
+            login_actions=lib_login_actions,
+            login_fill_origins=login_origins,
+            login_actions_timeout_s=float(
+                req.login_actions_timeout_seconds or DEFAULT_LOGIN_ACTIONS_TIMEOUT_SECONDS
+            ),
+            login_lock=_get_login_lock(req.profile) if lib_login_actions else None,
         )
 
         try:
@@ -856,6 +1003,22 @@ def _run_capture(req: CaptureRequest) -> CaptureResponse:
         else:
             client.quit()
 
+        # Read AFTER quit: the login steps run on the session worker, and
+        # quit() is what stops (and briefly joins) it. A run still going is a
+        # placeholder report saying so (and so is a keep_open one).
+        login_actions_report: Optional[ActionsReportModel] = None
+        if lib_login_actions:
+            login_rep = client.get_login_report()
+            if login_rep is not None:
+                if login_rep.aborted_reason == "cancelled" and not job.is_cancelled():
+                    login_rep.aborted_reason = "capture window ended before login_actions finished"
+                login_actions_report = ActionsReportModel.model_validate(login_rep.to_dict())
+                failed = next((r for r in login_rep.actions if not r.ok), None)
+                job.log(
+                    f"login_actions ok={login_rep.ok} failed_at="
+                    + (f"{failed.index}/{failed.type}" if failed else "-")
+                )
+
         login_wall = state.status == "waiting_login" or (
             state.error is not None and "login" in state.error.lower()
         )
@@ -884,6 +1047,7 @@ def _run_capture(req: CaptureRequest) -> CaptureResponse:
             screenshot=shot_result,
             screenshot_error=shot_error,
             actions_report=actions_report,
+            login_actions_report=login_actions_report,
             ended_early=ended_early,
         )
     finally:
@@ -925,6 +1089,8 @@ def _run_screenshot(req: ScreenshotRequest) -> ScreenshotResponse:
         login_timeout=req.login_timeout,
         debug_logging=False,
         login_url_patterns=req.login_url_patterns,
+        login_actions=req.login_actions,
+        login_actions_timeout_seconds=req.login_actions_timeout_seconds,
         screenshot=ScreenshotOptions(
             format=req.format,
             quality=req.quality,
@@ -942,6 +1108,7 @@ def _run_screenshot(req: ScreenshotRequest) -> ScreenshotResponse:
         error=res.error,
         screenshot=res.screenshot,
         screenshot_error=res.screenshot_error,
+        login_actions_report=res.login_actions_report,
     )
 
 
@@ -1024,6 +1191,7 @@ def capture_url(
     stop_when_matched: bool = False,
     login_url_patterns: Optional[list[str]] = None,
     actions_ready_timeout_seconds: Optional[int] = None,
+    login_actions: Optional[list[dict]] = None,
 ) -> ToolResult:
     """Load a URL under a named Chrome profile and return JSON XHR/fetch bodies
     whose URLs match any of the given regex patterns — optionally with a
@@ -1105,6 +1273,24 @@ def capture_url(
         actions_ready_timeout_seconds: How long the actions wait for the
             page to be ready (loaded, off any login page) before giving up.
             Defaults to ``capture_window_seconds``.
+        login_actions: Steps that run ONLY if the page redirects to a login
+            wall (``login_url_patterns``), to sign in with the profile's
+            stored service account; the capture then continues to ``url``.
+            Same step objects as ``actions`` except ``evaluate``. For the
+            credentials write REFERENCES — ``"value": "${username}"`` and
+            ``"value": "${password}"`` — which the server fills in from its
+            own credentials file; ``list_profiles`` shows the reference names
+            (``login_keys``) each profile has. NEVER ask a user for a real
+            username or password and never put one in a step. Enphase:
+            ``login_url_patterns=["login", "signin", "/auth",
+            "sso\\.enphaseenergy\\.com"]``, ``login_actions=[{"type": "fill",
+            "selector": "input[type=email], input[name=username], #username",
+            "value": "${username}"}, {"type": "fill", "selector":
+            "input[type=password]", "value": "${password}"}, {"type": "click",
+            "selector": "button[type=submit], input[type=submit]"}]``. Raise
+            ``capture_window_seconds`` (~120) so the login, the redirect and
+            the page load all fit; the result says what happened in
+            ``login_actions_report``.
 
     Returns:
         JSON with keys ``job_id``, ``url``, ``status``, ``login_wall``,
@@ -1112,8 +1298,10 @@ def capture_url(
         ``captured_urls`` (every JSON XHR/fetch URL seen, for diagnostics),
         ``screenshot``, ``screenshot_error``, ``actions_report`` ({page_script,
         actions: [{index, type, ok, elapsed_ms, error, value}],
-        aborted_reason}, or null) and ``ended_early`` — followed by the image
-        block when a screenshot was taken.
+        aborted_reason}, or null), ``login_actions_report`` (same shape; null
+        unless ``login_actions`` were sent and a login wall was hit) and
+        ``ended_early`` — followed by the image block when a screenshot was
+        taken.
     """
     try:
         req = CaptureRequest(
@@ -1136,6 +1324,7 @@ def capture_url(
             actions=actions or [],
             stop_when_matched=stop_when_matched,
             actions_ready_timeout_seconds=actions_ready_timeout_seconds,
+            login_actions=login_actions or [],
             **_login_patterns_kw(login_url_patterns),
         )
         return _screenshot_tool_result(_run_capture(req).model_dump())
@@ -1152,6 +1341,7 @@ def capture_url(
                 "screenshot": None,
                 "screenshot_error": None,
                 "actions_report": None,
+                "login_actions_report": None,
                 "ended_early": False,
             }
         )
@@ -1168,6 +1358,7 @@ def screenshot_url(
     scale: float = 1.0,
     login_timeout: int = 300,
     login_url_patterns: Optional[list[str]] = None,
+    login_actions: Optional[list[dict]] = None,
 ) -> ToolResult:
     """Navigate to a URL under a named Chrome profile and return a screenshot
     of the rendered page. Use this to *see* a page — layout, charts, error
@@ -1198,11 +1389,19 @@ def screenshot_url(
             ``sso\\.enphaseenergy\\.com``) — otherwise an expired session
             looks like an empty result instead of ``login_wall: true``. An
             empty list disables login detection.
+        login_actions: Steps that sign in ONLY if the page redirects to a
+            login wall — same as ``capture_url``'s ``login_actions``. Write
+            the credentials as references (``"${username}"``,
+            ``"${password}"``; names in ``list_profiles``' ``login_keys``),
+            NEVER real values, and never ask a user for them. Raise
+            ``wait_seconds`` (~60) so the login, the redirect and the page
+            load fit.
 
     Returns:
         JSON with ``job_id``, ``url``, ``status``, ``login_wall``, ``error``,
         ``screenshot`` ({format, mime_type, width, height, full_page, bytes,
-        page_url}) and ``screenshot_error`` — followed by the image itself as
+        page_url}), ``screenshot_error`` and ``login_actions_report`` (null
+        unless ``login_actions`` ran) — followed by the image itself as
         an image content block. ``page_url`` is where the tab actually ended
         up, so a redirect to a login page is visible even without
         ``login_wall``. ``status: "loading"`` is normal for pages that fire
@@ -1218,6 +1417,7 @@ def screenshot_url(
             quality=quality,
             scale=scale,
             login_timeout=login_timeout,
+            login_actions=login_actions or [],
             **_login_patterns_kw(login_url_patterns),
         )
         return _screenshot_tool_result(_run_screenshot(req).model_dump())
@@ -1231,6 +1431,7 @@ def screenshot_url(
                 "error": _http_error_text(e),
                 "screenshot": None,
                 "screenshot_error": None,
+                "login_actions_report": None,
             }
         )
 
@@ -1244,12 +1445,18 @@ def list_profiles() -> dict:
     means the profile hasn't been through the operator's upload flow and
     Chrome would fail to launch headless.
 
+    ``login_keys`` lists the credential reference names a profile's
+    ``login_actions`` may use (``${username}``, ``${password}``, …) and
+    ``login_origins`` the sites they may be typed into; both are empty when
+    the profile has no stored login. The values themselves are never shown.
+
     Returns:
         A dict with ``root`` (the profiles directory path) and ``profiles``
-        (a list of ``{name, path, present, size_bytes, sentinel_present}``
-        objects, one per named profile).
+        (a list of ``{name, path, present, size_bytes, sentinel_present,
+        login_keys, login_origins}`` objects, one per named profile;
+        ``login_error`` is added when the profile's logins file is unusable).
     """
-    return {"root": profiles.PROFILES_ROOT, "profiles": profiles.list_profiles()}
+    return _profiles_listing()
 
 
 @mcp.tool()

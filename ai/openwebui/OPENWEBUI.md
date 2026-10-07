@@ -459,6 +459,14 @@ In a chat, click the **Tools** icon (paperclip-like) → toggle **phoenix** on. 
 
 > **Heads-up:** Open WebUI's MCP support is parallel to the `mcp_servers` block in `litellm_config.yaml`. The LiteLLM block lets *models routed through LiteLLM* (e.g. Claude Code via the proxy) call Phoenix tools server-side. The Open WebUI registration lets the *Open WebUI chat itself* call Phoenix tools client-side. Both can coexist using the same URL + token; they're not exclusive.
 
+**Phoenix as a model's default tool (OAuth).** Phoenix decides who it authorises, and Open WebUI cannot know that until someone has signed in to Phoenix. Upstream Open WebUI handles a default OAuth tool the user hasn't connected by navigating the whole page to `/oauth/clients/mcp:<id>/authorize` as soon as a new chat opens, then blocking sends until it is connected. Anyone Phoenix doesn't authorise lands on its "not authorised" page on every new chat. Patch `0003` ([Custom image](#custom-image-patches)) changes that:
+
+- **Not connected** (never signed in, refused by Phoenix, or the token expired and couldn't be refreshed): Phoenix is quietly left out of that user's defaults. There is no redirect and no blocked send; the model just answers without it.
+- **Connected**: Phoenix is switched on by default in every new chat, as before.
+- **First connect**: a user Phoenix authorises clicks **phoenix** once in the chat's Integrations menu (the tools icon), where it shows its "connect" state, and signs in. The chat restores the tool after the redirect, and from then on it is a default. Users Phoenix refuses only see the refusal if they click it themselves.
+
+Nothing about the Phoenix connection or the model's tool settings changes: keep Phoenix ticked in Workspace → Models → (model) → Tools. Applies to every OAuth 2.1 MCP server, not just Phoenix.
+
 **If the handshake times out** (you see "MCP server failed to initialize" in the logs), bump `OPENWEBUI_MCP_INITIALIZE_TIMEOUT` in `.env` (currently `30s`, upstream default is `10s`) and restart Open WebUI.
 
 ### Restricting visible models
@@ -543,6 +551,7 @@ If Open WebUI shows "Server Connection Error" on play, `make logs openwebui` —
 | Patch | What | Files |
 |---|---|---|
 | `0002-trusted-header-google-identity.patch` | Adds `WEBUI_AUTH_TRUSTED_ACCESS_TOKEN_HEADER`. In trusted-header SSO mode, verify the asserted identity with Google using the access token oauth2-proxy forwards, and take display name + picture from Google's userinfo on every sign-in. Rationale and security in [Single sign-on](#single-sign-on) | `backend/open_webui/env.py`, `routers/auths.py`, `utils/trusted_proxy.py` (new) |
+| `0003-oauth-mcp-defaults-no-redirect.patch` | A model's default OAuth MCP tools that the user has not connected are dropped from **that user's** `GET /api/models` `toolIds`, so a new chat no longer redirects to the MCP server's authorize page. Always on, no env var. Backend-only because the image ships the Svelte frontend pre-compiled. Details in [MCP tools (Phoenix)](#mcp-tools-phoenix) | `backend/open_webui/main.py`, `utils/mcp_oauth_defaults.py` (new) |
 
 (`0001` was a `login_hint` patch for the two-hop OAuth path; it was retired when one-gate SSO replaced that path.)
 
@@ -551,6 +560,7 @@ If Open WebUI shows "Server Connection Error" on play, `make logs openwebui` —
 ```bash
 docker image inspect openwebui-zeo:v0.11.4 --format '{{index .Config.Labels "com.zeoenergy.openwebui.patches"}}'
 docker exec openwebui test -f /app/backend/open_webui/utils/trusted_proxy.py && echo patched
+docker exec openwebui test -f /app/backend/open_webui/utils/mcp_oauth_defaults.py && echo 0003 patched
 ```
 
 #### Regenerating a patch for a new upstream version
@@ -569,6 +579,8 @@ patch -p1 -d patched < ai/openwebui/patches/0002-trusted-header-google-identity.
 ```
 
 Paste the header comment from the old patch file back on top, update its `Target:` line, replace the file, and re-run `make build openwebui`. Read what upstream changed around the rejected hunks before trusting the result — `routers/auths.py` moves between releases.
+
+For `0003`, regenerate the same way with `main.py` and `utils/mcp_oauth_defaults.py` (new). Before trusting it on a new tag, re-check the three upstream facts it depends on: `Chat.svelte`'s `setDefaults` still reads default tools from `model.info.meta.toolIds` and still redirects on `authenticated === false`; `routers/tools.py::get_tools` still derives `authenticated` from `oauth_client_manager.get_oauth_token(user.id, 'mcp:<id>')` with the tool id `server:mcp:<info.id>`; and the admin model editor still takes `meta` from the saved DB record rather than from `/api/models`. If upstream ships a native "don't auto-redirect" option, retire the patch.
 
 #### Adding another patch
 

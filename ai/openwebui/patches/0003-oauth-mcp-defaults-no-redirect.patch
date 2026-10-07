@@ -1,0 +1,127 @@
+Zeo patch 0003 — a model's default OAuth MCP tools never redirect a new chat.
+
+Target: Open WebUI v0.11.4 (ghcr.io/open-webui/open-webui:v0.11.4).
+Applied by ai/openwebui/Dockerfile.openwebui with `patch -p1` from /app.
+
+Upstream: opening a new chat on a model whose default tools include an
+OAuth 2.1 MCP server (e.g. Phoenix) the user has not connected sends the
+browser straight to /oauth/clients/mcp:<id>/authorize, and blocks sending
+until the integration is connected. Users the MCP server does not authorise
+land on its "not authorised" page on every new chat.
+
+This patch removes unconnected OAuth MCP tool ids from info.meta.toolIds in
+the GET /api/models response, per user, so the chat page never treats them
+as defaults: no redirect, no blocked send, the model runs without the tool.
+The tool is still listed in the chat's Integrations menu in its "connect"
+state; a user the server authorises connects once from there, after which
+the tool is a default again on every new chat. "Connected" uses the same
+oauth_client_manager.get_oauth_token check as GET /api/v1/tools, so the two
+responses cannot disagree. Response only — model rows are never changed.
+
+Backend only on purpose: the upstream image ships the Svelte frontend
+pre-compiled, so patching Chat.svelte would mean rebuilding the bundle.
+
+Files: backend/open_webui/main.py,
+       backend/open_webui/utils/mcp_oauth_defaults.py (new).
+See ai/openwebui/OPENWEBUI.md § MCP tools (Phoenix) and § Custom image.
+
+--- a/backend/open_webui/main.py	2026-10-07 13:40:20.611595400 -0600
++++ b/backend/open_webui/main.py	2026-10-07 13:40:36.600697700 -0600
+@@ -912,6 +912,13 @@
+     # models the caller can actually see.
+     models = await get_filtered_models(models, user)
+ 
++    # ZEO PATCH (ai/openwebui/patches/0003-oauth-mcp-defaults-no-redirect.patch):
++    # drop default OAuth MCP tools this user has not connected, so opening a
++    # chat never redirects to the MCP server's authorize page.
++    from open_webui.utils.mcp_oauth_defaults import drop_unconnected_oauth_tool_defaults
++
++    models = await drop_unconnected_oauth_tool_defaults(request, user, models)
++
+     for model in models:
+         info = model.get('info') if isinstance(model.get('info'), dict) else {}
+         meta = info.get('meta') if isinstance(info.get('meta'), dict) else {}
+--- /dev/null	2026-10-07 13:40:36.000000000 -0600
++++ b/backend/open_webui/utils/mcp_oauth_defaults.py	2026-10-07 13:40:20.613105600 -0600
+@@ -0,0 +1,81 @@
++"""ZEO PATCH (ai/openwebui/patches/0003-oauth-mcp-defaults-no-redirect.patch).
++
++Stops a model's default OAuth MCP tools from hijacking the page.
++
++Upstream: when a new chat opens on a model whose default tools
++(``info.meta.toolIds``) include an OAuth 2.1 MCP server the user has no
++token for, the chat page (``Chat.svelte`` ``setDefaults``) navigates
++straight to ``/oauth/clients/mcp:<id>/authorize`` and then refuses to send
++any message until the integration is connected. For a user the MCP server
++does not authorise, that is a dead end on the server's "not authorised"
++page, every time they open a chat.
++
++This module removes such tool ids from the model list returned to THAT user
++(``GET /api/models``), so the chat page never sees them as defaults: no
++redirect, no blocked send, the model simply runs without the tool. The tool
++stays listed in the chat's Integrations menu with its "connect" state, so a
++user the server does authorise connects once from there; from then on the
++token exists and the tool is a default again.
++
++"Connected" is decided exactly as ``GET /api/v1/tools`` decides its
++``authenticated`` flag (``oauth_client_manager.get_oauth_token``), so the two
++responses cannot disagree — a disagreement would put the redirect back.
++Only the response is changed: model rows in the DB and ``app.state.MODELS``
++are never mutated.
++"""
++
++from __future__ import annotations
++
++import logging
++
++from fastapi import Request
++from open_webui.models.config import Config
++
++log = logging.getLogger(__name__)
++
++_OAUTH_AUTH_TYPES = ('oauth_2.1', 'oauth_2.1_static')
++
++
++async def drop_unconnected_oauth_tool_defaults(request: Request, user, models: list[dict]) -> list[dict]:
++    # tool id ('server:mcp:<info.id>') -> oauth client id ('mcp:<last segment>'),
++    # built the same way routers/tools.py::get_tools builds them.
++    oauth_tools: dict[str, str] = {}
++    for server in await Config.get('tool_server.connections', []) or []:
++        if server.get('type', 'openapi') != 'mcp' or not (server.get('config') or {}).get('enable'):
++            continue
++        if server.get('auth_type', 'none') not in _OAUTH_AUTH_TYPES:
++            continue
++        info_id = (server.get('info') or {}).get('id')
++        if info_id:
++            oauth_tools[f'server:mcp:{info_id}'] = f'mcp:{info_id.split(":")[-1]}'
++
++    if not oauth_tools:
++        return models
++
++    connected: dict[str, bool] = {}
++
++    async def is_connected(tool_id: str) -> bool:
++        if tool_id not in connected:
++            try:
++                token = await request.app.state.oauth_client_manager.get_oauth_token(user.id, oauth_tools[tool_id])
++            except Exception as e:  # never fail the model list over this
++                log.warning(f'OAuth token lookup failed for {tool_id}: {e}')
++                token = None
++            connected[tool_id] = token is not None
++        return connected[tool_id]
++
++    result = []
++    for model in models:
++        info = model.get('info') if isinstance(model.get('info'), dict) else None
++        meta = info.get('meta') if info and isinstance(info.get('meta'), dict) else None
++        tool_ids = meta.get('toolIds') if meta else None
++
++        if isinstance(tool_ids, list) and any(t in oauth_tools for t in tool_ids):
++            kept = [t for t in tool_ids if t not in oauth_tools or await is_connected(t)]
++            if len(kept) != len(tool_ids):
++                # Copy on write: these dicts are shared with app.state.MODELS.
++                model = {**model, 'info': {**info, 'meta': {**meta, 'toolIds': kept}}}
++
++        result.append(model)
++
++    return result

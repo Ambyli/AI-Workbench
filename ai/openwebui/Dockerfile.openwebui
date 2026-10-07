@@ -21,6 +21,13 @@
 #       and profile picture from Google's userinfo — on account creation and
 #       on every sign-in. Touches backend/open_webui/env.py,
 #       routers/auths.py, and adds utils/trusted_proxy.py.
+#   0003-oauth-mcp-defaults-no-redirect.patch — a model's default OAuth MCP
+#       tools (Phoenix) that the user has not connected are dropped from that
+#       user's GET /api/models toolIds, so opening a chat no longer redirects
+#       to the MCP server's authorize page (users it does not authorise were
+#       stranded on its "not authorised" page). Connect once from the chat's
+#       Integrations menu and the tool is a default again. Touches
+#       backend/open_webui/main.py, adds utils/mcp_oauth_defaults.py.
 
 ARG OPENWEBUI_VERSION=v0.11.4
 FROM ghcr.io/open-webui/open-webui:${OPENWEBUI_VERSION}
@@ -48,12 +55,15 @@ RUN set -eu; \
     python3 -c 'import ast,sys; [ast.parse(open(f).read(), f) for f in sys.argv[1:]]' \
         backend/open_webui/env.py \
         backend/open_webui/routers/auths.py \
-        backend/open_webui/utils/trusted_proxy.py; \
+        backend/open_webui/utils/trusted_proxy.py \
+        backend/open_webui/main.py \
+        backend/open_webui/utils/mcp_oauth_defaults.py; \
     grep -q "verify_google_identity" backend/open_webui/routers/auths.py; \
+    grep -q "drop_unconnected_oauth_tool_defaults" backend/open_webui/main.py; \
     rm -rf /tmp/zeo-patches
 
 # Record the base and the patch set on the image so `docker image inspect`
 # can tell a patched build from a stock one.
 ARG OPENWEBUI_VERSION
 LABEL org.opencontainers.image.base.name="ghcr.io/open-webui/open-webui:${OPENWEBUI_VERSION}" \
-      com.zeoenergy.openwebui.patches="0002-trusted-header-google-identity"
+      com.zeoenergy.openwebui.patches="0002-trusted-header-google-identity,0003-oauth-mcp-defaults-no-redirect"

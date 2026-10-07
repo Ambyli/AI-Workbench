@@ -26,7 +26,7 @@
 			"key": "virtual master key",
 			"value": "sk-your-litellm-virtual-key",
 			"type": "string",
-			"description": "LiteLLM virtual key (Admin UI → Virtual Keys, or /key/generate API). Scope the key to allow the /v1/sandbox pass-through — most keys created for chat models already do. Sent as `Authorization: Bearer {{virtual master key}}` by the collection-level auth."
+			"description": "LiteLLM virtual key (Admin UI → Virtual Keys, or /key/generate API). The pass-through runs with `auth: true`, so a non-admin virtual key needs `/v1/sandbox` in its (or its team's) `metadata.allowed_passthrough_routes` — set under `metadata`, by a proxy admin, because the top-level field is Enterprise-only; the master key works without it. Otherwise 403. See ai/litellm/LITELLM.md § Pass-through auth. Sent as `Authorization: Bearer {{virtual master key}}` by the collection-level auth."
 		},
 		{
 			"key": "sandboxId",

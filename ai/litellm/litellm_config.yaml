@@ -140,6 +140,15 @@ general_settings:
   store_model_in_db: true
   default_max_tokens: 16384
   always_include_stream_usage: true
+  # auth: true on every entry. A config-file pass-through WITHOUT it runs no
+  # key check at all (LiteLLM v1.95.0 _register_pass_through_endpoint) — any
+  # caller, keyless, reaches the service, and none of these services has auth
+  # of its own. With it: the master key / proxy-admin keys pass; a virtual key
+  # gets 403 unless its own or its team's metadata lists the route, e.g.
+  #   {"allowed_passthrough_routes": ["/v1/classifier", "/v1/detector"]}
+  # (exact or prefix match). Set it inside `metadata` as a proxy admin — the
+  # top-level `allowed_passthrough_routes` key field is Enterprise-only. See
+  # ai/litellm/LITELLM.md § Pass-through auth.
   pass_through_endpoints:
     - path: "/v1/classifier"
       target: "http://classifier:8000"
@@ -148,31 +157,37 @@ general_settings:
       # description / tags (ai/classifier/API.md § References).
       methods: ["GET", "POST", "PATCH", "DELETE"]
       forward_headers: true
+      auth: true
     - path: "/v1/detector"
       target: "http://detector:8000"
       include_subpath: true
       methods: ["GET", "POST"]
       forward_headers: true
+      auth: true
     - path: "/v1/madlad"
       target: "http://madlad-api:8000"
       include_subpath: true
       methods: ["GET", "POST"]
       forward_headers: true
+      auth: true
     - path: "/v1/interceptor"
       target: "http://interceptor:8080"
       include_subpath: true
       methods: ["GET", "POST", "DELETE"]
       forward_headers: true
+      auth: true
     - path: "/v1/roofix"
       target: "http://roofix:8080"
       include_subpath: true
       methods: ["GET", "POST"]
       forward_headers: true
+      auth: true
     - path: "/v1/sandbox"
       target: "http://sandbox-runner:8000"
       include_subpath: true
       methods: ["GET", "POST", "DELETE"]
       forward_headers: true
+      auth: true
 
 mcp_servers:
   kokoro_tts:

@@ -506,7 +506,7 @@
     },
     {
       "name": "Pass-through",
-      "description": "Reverse proxies to internal services declared under `general_settings.pass_through_endpoints` in litellm_config.yaml. Every request keeps the caller's `Authorization` header (`forward_headers: true`) and `include_subpath: true` so anything after the mount prefix is passed through unchanged. This means downstream services see the LiteLLM virtual-key Bearer and can authenticate against it. Five pass-throughs are mounted in this deployment: classifier, madlad, interceptor, roofix, sandbox.",
+      "description": "Reverse proxies to internal services declared under `general_settings.pass_through_endpoints` in litellm_config.yaml. Every request keeps the caller's `Authorization` header (`forward_headers: true`) and `include_subpath: true` so anything after the mount prefix is passed through unchanged. This means downstream services see the LiteLLM virtual-key Bearer and can authenticate against it. Six pass-throughs are mounted in this deployment: classifier, detector, madlad, interceptor, roofix, sandbox. Every one has `auth: true`: LiteLLM rejects a missing or invalid key (401), and a non-admin virtual key also needs the route in its (or its team's) `metadata.allowed_passthrough_routes` or it gets 403 — the master key needs nothing extra. See ai/litellm/LITELLM.md § Pass-through auth.",
       "item": [
         {
           "name": "GET /v1/classifier/health",

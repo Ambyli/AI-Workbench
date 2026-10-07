@@ -41,6 +41,31 @@ Data in PostgreSQL is persisted in the `litellm_postgres_data` named volume and 
 
 The proxy configuration file supports a wide range of options for models, routing, rate limits, and more. See the full reference: [LiteLLM Config Settings](https://docs.litellm.ai/docs/proxy/config_settings)
 
+### Pass-through auth
+
+`general_settings.pass_through_endpoints` mounts six internal services — `/v1/classifier`, `/v1/detector`, `/v1/madlad`, `/v1/interceptor`, `/v1/roofix`, `/v1/sandbox` — and **every entry carries `auth: true`**. None of those services checks a bearer token itself, so this flag is the only thing between a caller and them.
+
+- **Without it there is no check at all.** A pass-through declared in the config file with no `auth` key registers with no auth dependency (LiteLLM v1.95.0, `_register_pass_through_endpoint`): a keyless request is forwarded. Only endpoints created in the Admin UI default to `auth=True`; config-file entries do not.
+- **With it, the master key and proxy-admin keys pass as before.**
+- **A virtual key additionally needs the route allow-listed** in its own metadata or its team's metadata, or it gets `403 Key/team not allowed to access passthrough route … Configure allowed_passthrough_routes on the team or key.` Matching is exact or prefix, so `/v1/classifier` covers `/v1/classifier/jobs/…`:
+
+  ```json
+  {"allowed_passthrough_routes": ["/v1/classifier", "/v1/detector"]}
+  ```
+
+  **Put it inside `metadata`, not as the top-level field.** `/key/generate` and `/key/update` also accept a top-level `allowed_passthrough_routes`, but that path calls `_premium_user_check` and returns `403 … only available for LiteLLM Enterprise users` on an unlicensed proxy; the same list written into `metadata` is stored as-is and is what the route check reads (`route_checks.py::check_passthrough_route_access`). Either way only a **proxy admin** (the master key) may set it. So: Admin UI → Virtual Keys (or Teams) → edit → the Metadata JSON box, not a dedicated "pass-through routes" field; or
+
+  ```bash
+  curl -X POST http://localhost:4001/key/update \
+    -H "Authorization: Bearer $DEFAULT_LITELLM_MASTER_KEY" -H "Content-Type: application/json" \
+    -d '{"key": "sk-…", "metadata": {"allowed_passthrough_routes": ["/v1/classifier"]}}'
+  ```
+
+  `metadata` in an update **replaces** the key's metadata rather than merging, so include whatever the key already has (`GET /key/info?key=sk-…`). A key with `allowed_routes` set must also allow the route there.
+- **Side effect:** an auth-enforced pass-through is added to LiteLLM's `openai_routes`, so its calls show up per key in spend logs and count against key / team budgets.
+
+Applying a change to this block is `make up litellm`.
+
 ### Chain aliases and the overflow hook
 
 Four model groups exist for the semantic router ([`ai/semantic-router/SEMANTIC_ROUTER.md`](../semantic-router/SEMANTIC_ROUTER.md)) to point at. Each is a **chain**: several deployments under one `model_name`, each with `litellm_params.order`. The policy they encode is *local models first for cost; Claude only when both local models are busy or down; customer / PII data never reaches Claude.*

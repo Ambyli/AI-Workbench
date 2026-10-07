@@ -29,10 +29,12 @@ request, never a creation job that fails a minute later:
   2. CLASSIFIER_REFERENCE_MAX_COUNT references already exist — 409;
   3. the source:
        ``document``  its bytes resolved like /assess (base64, inline text, an
-                     SSRF-checked URL), its kind from the bytes: a JPEG/PNG or
-                     a PDF, ``page`` in range; .txt / .docx are a 400 (a
-                     reference shows the model a page image). The page's pixel
-                     size is read without rendering it.
+                     SSRF-checked URL), its kind from the bytes: a JPEG/PNG,
+                     an SVG, or a PDF with ``page`` in range; .txt / .docx are
+                     a 400 (a reference shows the model a page image). The
+                     page's pixel size is read without rendering it. An SVG's
+                     external images are fetched and inlined here, as for
+                     /assess, when CLASSIFIER_SVG_FETCH_IMAGES is on;
        ``from_job``  404 unknown job; 409 not a completed /assess job; 400 an
                      item it does not have, or one with no page image; 410 its
                      artifacts are gone (the TTL sweeper, a DELETE, or the byte
@@ -76,14 +78,17 @@ from common.documents import (
     detect_kind,
     pdf_page_count,
     pdf_page_size,
+    svg_page_size,
 )
 from common.vision import content_type_for
 
-from analysis import load_input_bytes, validate_content_type
+from analysis import load_input_bytes, resolve_svg_images, validate_content_type
 from analysis.loading import _validate_image_dimensions
 from api.assess import _json_filename
 from api.reference_schemas import ReferencePatch, ReferenceRequest
 from api.schemas import ClassifierMetadata, CriterionInput, check_criteria_rules, validation_message
+# A module, not names: SVG_FETCH_IMAGES is read at call time (see api.assess).
+import config
 from config import (
     LLM_BBOX_GRID,
     LLM_BBOX_MAX_ATTEMPTS,
@@ -124,7 +129,7 @@ _OPENAPI = {
                     "type": "object",
                     "properties": {
                         "file": {"type": "string", "format": "binary",
-                                 "description": "ONE JPEG, PNG or PDF"},
+                                 "description": "ONE JPEG, PNG, SVG or PDF"},
                         "page": {"type": "integer"},
                         "from_job": {"type": "string"},
                         "from_job_item": {"type": "integer"},
@@ -178,6 +183,10 @@ class _Source:
     source: dict[str, Any]
     supplied: dict[str, dict[str, Any]] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
+    # What the submit noticed about the page's FILE (an SVG image not
+    # fetched) — rides on the payload's document entry, not the reference's
+    # own warnings; the creation job merges it into those.
+    document_warnings: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -288,10 +297,11 @@ def _resolve_document(model: ReferenceRequest, upload: _Upload) -> _Source:
         kind = detect_kind(upload.raw, filename=upload.filename, content_type=upload.declared)
     except UnsupportedDocumentError as exc:
         raise _bad(f"document {upload.filename!r}: {exc}")
-    if kind not in ("image", "pdf"):
+    if kind not in ("image", "pdf", "svg"):
         raise _bad(
             f"document {upload.filename!r} is {kind}, which has no page image; a reference "
-            "is one JPEG/PNG or one PDF page — the example is shown to the vision model"
+            "is one JPEG/PNG, one SVG, or one PDF page — the example is shown to the "
+            "vision model"
         )
     page = model.page or 0
     pages = 1
@@ -299,6 +309,13 @@ def _resolve_document(model: ReferenceRequest, upload: _Upload) -> _Source:
         if page != 0:
             raise _bad(f"an image has one page (page 0); got page {page}")
         width, height = _image_size(upload.raw)
+    elif kind == "svg":
+        if page != 0:
+            raise _bad(f"an SVG has one page (page 0); got page {page}")
+        try:
+            width, height = svg_page_size(upload.raw, render_dpi=PDF_RENDER_DPI)
+        except UnsupportedDocumentError as exc:
+            raise _bad(f"document {upload.filename!r}: {exc}")
     else:
         try:
             pages = pdf_page_count(upload.raw)
@@ -539,6 +556,9 @@ async def create_reference(request: Request):
     if model.document is not None:
         assert upload is not None
         src = _resolve_document(model, upload)
+        if src.kind == "svg" and config.SVG_FETCH_IMAGES:
+            # At submit, like /assess: the creation job never fetches.
+            src.raw, src.document_warnings = await resolve_svg_images(src.raw)
     else:
         src = await _resolve_from_job(model)
     _caller_answers(model, src)
@@ -565,7 +585,7 @@ async def create_reference(request: Request):
         job_id=job_id,
         document=SubmittedDocument(
             raw=src.raw, filename=src.filename, content_type=src.declared,
-            kind=src.kind, pages=src.pages,
+            kind=src.kind, pages=src.pages, warnings=list(src.document_warnings),
         ),
         page=src.page,
         criteria=src.criteria,

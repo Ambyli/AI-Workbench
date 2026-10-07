@@ -256,6 +256,7 @@ def test_every_criterion_has_the_same_keys(client, model, monkeypatch):
     assert geometry["item"] == 0 and geometry["page"] == 0 and geometry["width"] == 400
     assert result["documents"] == [{
         "index": 0, "filename": "page.png", "kind": "image", "pages": 1, "items": [0],
+        "warnings": [],
         "document_info": result["documents"][0]["document_info"],
     }]
     assert result["items"] == [{

@@ -9,6 +9,8 @@ is no risk of a stale .pdf drifting from what the loader expects.
   make_pdf              — a text-layer PDF, one page per string (PyMuPDF)
   make_scanned_pdf      — the same text rasterised, so the PDF has NO text
                           layer and only OCR can read it
+  make_svg              — an SVG document as UTF-8 bytes (a string template;
+                          MuPDF renders it)
   make_docx             — paragraphs plus an optional table (python-docx)
   make_document         — a Document assembled directly, for pure-logic tests
                           that should not depend on any parser
@@ -99,6 +101,33 @@ def make_scanned_pdf(pages: Sequence[str], *, dpi: int = 150) -> bytes:
     source.close()
     out.close()
     return raw
+
+
+SVG_NS = 'xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"'
+
+
+def make_svg(
+    body: str = "",
+    *,
+    width: str = "400",
+    height: str = "200",
+    view_box: Optional[str] = None,
+    prolog: str = "",
+) -> bytes:
+    """An SVG document: ``prolog`` (an XML declaration, DOCTYPE, comment …),
+    then a root ``<svg>`` with both namespaces declared, then ``body``.
+
+    Pass ``width=""`` / ``height=""`` to leave the attribute off (so MuPDF
+    falls back to ``view_box``).
+    """
+    attrs = [SVG_NS]
+    if width:
+        attrs.append(f'width="{width}"')
+    if height:
+        attrs.append(f'height="{height}"')
+    if view_box:
+        attrs.append(f'viewBox="{view_box}"')
+    return f'{prolog}<svg {" ".join(attrs)}>{body}</svg>'.encode("utf-8")
 
 
 def make_docx(

@@ -382,6 +382,11 @@ def _document_entry(group: DocumentGroup) -> dict[str, Any]:
         "kind": doc.kind,
         "pages": len(doc.pages),
         "items": [ctx.item for ctx in group.items],
+        # How the document was read that is worth knowing but is not an
+        # error — today an SVG's external references: not rendered (MuPDF
+        # never fetches), or not fetched and why (CLASSIFIER_SVG_FETCH_IMAGES).
+        # [] for every other kind.
+        "warnings": list(doc.warnings),
         "document_info": {
             "content_type": doc.content_type,
             "size_bytes": doc.size_bytes,

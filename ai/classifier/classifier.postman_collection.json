@@ -2,7 +2,7 @@
   "info": {
     "_postman_id": "classifier-collection",
     "name": "classifier",
-    "description": "Document Classifier — JPEG/PNG photos, PDFs of any page count, .txt and .docx, several documents per request, scored by OpenCV detectors, deterministic text matching, the open-vocabulary detector, and vision-LLM criteria — called through the LiteLLM pass-through registered in ai/litellm/litellm_config.yaml (`pass_through_endpoints` → `/v1/classifier` → `http://classifier:8000`, `include_subpath: true`, methods GET/POST/PATCH/DELETE, `forward_headers: true`). Every request is authenticated with a Bearer token from a LiteLLM virtual key: set the collection variables `litellm` (e.g. http://localhost:4001) and `virtual master key` (an sk-… key from the LiteLLM Admin UI → Virtual Keys) — every request inherits them via collection-level auth. See ai/classifier/API.md for the full reference and ai/litellm/LITELLM.md for issuing keys.\n\nDirect base URL (bypassing LiteLLM, only inside ai_shared or when PORT_CLASSIFIER is published): http://classifier:8000 or http://<host>:${PORT_CLASSIFIER} — no auth there.\n\nONE analysis endpoint: POST /assess, as JSON (`{documents: [{type: base64|url|text, data}, …], criteria}` — or `{document: {…}}` for one; not both) or multipart (repeated `file` parts and/or `text` fields, plus `criteria` once). `/locate` and `/assess/compare` were removed (404); `/locate`'s job is `score: false` on a criterion. A criterion is `{name, type, weight, depends_on, score, options}` with the type-specific settings in `options` — GET /criterion-types has each type's schema, defaults and caps. Every page of every document is one ITEM (at most CLASSIFIER_MAX_ITEMS = 20 per request, counted at submit; 21 is a 400 with a per-document breakdown); each criterion runs once per item and `options.aggregate` collapses the per-item results — pages → per document → per request (API.md § Documents, pages and items).\n\nAsync-job pattern: POST /assess returns 202 with `{job_id, phase: \"pending\"}`; poll GET /jobs/:jobId until `phase` is `completed` or `failed`. The SQLite jobs table is the queue: CLASSIFIER_MAX_CONCURRENT (default 4) jobs at once; inside a job CLASSIFIER_MAX_UNITS_PER_JOB (2) (criterion, item) units at once; CLASSIFIER_MAX_LLM_CALLS (4) model calls and CLASSIFIER_OCR_WORKERS (4) OCR passes across the whole process. Copy a `job_id` into the `jobId` collection variable to run the GET/DELETE items.\n\nArtifacts: every job stores regions.json, one text.p<n>.<key>.json per item and text layer its criteria used (text.d<i>.<key>.json for a scope-document text search), one p<n>.base.jpg per item with an image, and a manifest with the item map; SVG / PNG / preview layers (p<n>.*) render on first fetch. See the Artifacts folder.\n\nFolders: `Documents` (one request per fixture in unit-tests/classifier/documents/, plus a two-page PDF and a three-document request), `Regions` (fixtures chosen for their geometry), `Documents + regions` (the document fixtures again, geometry-focused), `Artifacts` (the four artifact routes), `References` (saved worked examples — POST, list, read, files, PATCH, DELETE). `unit-tests/classifier/regions_report.py` runs the first three as a suite (REGIONS_REPORT.md).",
+    "description": "Document Classifier — JPEG/PNG photos, PDFs of any page count, SVG drawings, .txt and .docx, several documents per request, scored by OpenCV detectors, deterministic text matching, the open-vocabulary detector, and vision-LLM criteria — called through the LiteLLM pass-through registered in ai/litellm/litellm_config.yaml (`pass_through_endpoints` → `/v1/classifier` → `http://classifier:8000`, `include_subpath: true`, methods GET/POST/PATCH/DELETE, `forward_headers: true`). Every request is authenticated with a Bearer token from a LiteLLM virtual key: set the collection variables `litellm` (e.g. http://localhost:4001) and `virtual master key` (an sk-… key from the LiteLLM Admin UI → Virtual Keys) — every request inherits them via collection-level auth. See ai/classifier/API.md for the full reference and ai/litellm/LITELLM.md for issuing keys.\n\nDirect base URL (bypassing LiteLLM, only inside ai_shared or when PORT_CLASSIFIER is published): http://classifier:8000 or http://<host>:${PORT_CLASSIFIER} — no auth there.\n\nONE analysis endpoint: POST /assess, as JSON (`{documents: [{type: base64|url|text, data}, …], criteria}` — or `{document: {…}}` for one; not both) or multipart (repeated `file` parts and/or `text` fields, plus `criteria` once). `/locate` and `/assess/compare` were removed (404); `/locate`'s job is `score: false` on a criterion. A criterion is `{name, type, weight, depends_on, score, options}` with the type-specific settings in `options` — GET /criterion-types has each type's schema, defaults and caps. Every page of every document is one ITEM (at most CLASSIFIER_MAX_ITEMS = 20 per request, counted at submit; 21 is a 400 with a per-document breakdown); each criterion runs once per item and `options.aggregate` collapses the per-item results — pages → per document → per request (API.md § Documents, pages and items). An SVG is one item rendered by MuPDF, which never fetches what it links to: each external reference is a line in the result's `documents[].warnings` — or, with CLASSIFIER_SVG_FETCH_IMAGES on, `<image>` links are fetched AT SUBMIT through the SSRF guard and inlined (API.md § External references in SVG).\n\nAsync-job pattern: POST /assess returns 202 with `{job_id, phase: \"pending\"}`; poll GET /jobs/:jobId until `phase` is `completed` or `failed`. The SQLite jobs table is the queue: CLASSIFIER_MAX_CONCURRENT (default 4) jobs at once; inside a job CLASSIFIER_MAX_UNITS_PER_JOB (2) (criterion, item) units at once; CLASSIFIER_MAX_LLM_CALLS (4) model calls and CLASSIFIER_OCR_WORKERS (4) OCR passes across the whole process. Copy a `job_id` into the `jobId` collection variable to run the GET/DELETE items.\n\nArtifacts: every job stores regions.json, one text.p<n>.<key>.json per item and text layer its criteria used (text.d<i>.<key>.json for a scope-document text search), one p<n>.base.jpg per item with an image, and a manifest with the item map; SVG / PNG / preview layers (p<n>.*) render on first fetch. See the Artifacts folder.\n\nFolders: `Documents` (one request per fixture in unit-tests/classifier/documents/, plus a two-page PDF and a three-document request), `Regions` (fixtures chosen for their geometry), `Documents + regions` (the document fixtures again, geometry-focused), `Artifacts` (the four artifact routes), `References` (saved worked examples — POST, list, read, files, PATCH, DELETE). `unit-tests/classifier/regions_report.py` runs the first three as a suite (REGIONS_REPORT.md).",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "auth": {
@@ -156,7 +156,7 @@
             "document-kinds"
           ]
         },
-        "description": "What this container accepts and how it is handled right now: the four kinds (image and .txt/.docx one item each, pdf one item PER PAGE), the refused legacy .doc, the accepted inputs (JSON `documents: [base64 | url | text, …]` or the one-`document` shorthand; multipart repeatable `file` | `text`), the text-match modes, the live OCR status (`ocr.available` loads the engine to answer honestly), the limits (`max_items` = CLASSIFIER_MAX_ITEMS, render DPI, the LLM text budget, and the four concurrency limits: jobs, units per job, model calls, OCR passes), and the regions block (always stored; layers render on first fetch; the llm box-loop bounds; the live detector status; `artifact_max_bytes_per_item`). No errors."
+        "description": "What this container accepts and how it is handled right now: the five kinds (image, svg and .txt/.docx one item each, pdf one item PER PAGE — the svg entry's `external_images` is the live CLASSIFIER_SVG_FETCH_* setting), the refused legacy .doc and .svgz, the accepted inputs (JSON `documents: [base64 | url | text, …]` or the one-`document` shorthand; multipart repeatable `file` | `text`), the text-match modes, the live OCR status (`ocr.available` loads the engine to answer honestly), the limits (`max_items` = CLASSIFIER_MAX_ITEMS, render DPI, `svg_max_render_pixels`, the LLM text budget, and the four concurrency limits: jobs, units per job, model calls, OCR passes), and the regions block (always stored; layers render on first fetch; the llm box-loop bounds; the live detector status; `artifact_max_bytes_per_item`). No errors."
       },
       "response": []
     },
@@ -172,7 +172,7 @@
               "key": "file",
               "type": "file",
               "src": "unit-tests/classifier/documents/invoice_native.pdf",
-              "description": "A document: JPEG, PNG, PDF (every page is an item), .txt or .docx. REPEAT the part for more documents — this item sends two. The kind is detected from the bytes (common.documents.detect_kind), never from the filename or Content-Type. The `src` points at a repo fixture — re-select the file if your Postman working directory differs. The legacy part name `image` is also accepted, and repeats too."
+              "description": "A document: JPEG, PNG, PDF (every page is an item), SVG, .txt or .docx. REPEAT the part for more documents — this item sends two. The kind is detected from the bytes (common.documents.detect_kind), never from the filename or Content-Type. The `src` points at a repo fixture — re-select the file if your Postman working directory differs. The legacy part name `image` is also accepted, and repeats too."
             },
             {
               "key": "file",
@@ -1203,6 +1203,43 @@
               ]
             },
             "description": "Expected: overall MARGINAL (~5). `sharpness` FAIL 1 (variance ≈ 7), `Notice to Owner` PASS 10 (the headings survive OCR), `case number` FAIL 1, and `document legibility` SKIPPED — its `depends_on: sharpness` did not PASS, so it was never evaluated (no model call; `reason` names the dependency)."
+          },
+          "response": []
+        },
+        {
+          "name": "diagram.svg — an SVG drawing: native <text>, a drawn data: image, an external link",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": "unit-tests/classifier/documents/diagram.svg",
+                  "description": "The document. Its kind is detected from the bytes (UTF-8 XML whose first element is <svg>), never the filename or the part's Content-Type — `image/svg+xml` is on the declared-type allowlist."
+                },
+                {
+                  "key": "criteria",
+                  "type": "text",
+                  "value": "[{\"name\":\"System Size: 8.4 kW\",\"type\":\"text\",\"weight\":3.0},{\"name\":\"markup is not text\",\"type\":\"text\",\"options\":{\"pattern\":\"xlink:href\"}},{\"name\":\"sharpness\",\"type\":\"cv\"},{\"name\":\"shows a solar panel array\",\"type\":\"llm\",\"options\":{\"hint\":\"presence\",\"boxes\":true}}]",
+                  "description": "JSON array of criterion objects — the same shape the JSON body's `criteria` takes. See GET /criterion-types."
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/assess",
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "classifier",
+                "assess"
+              ]
+            },
+            "description": "An SVG is ONE item, rendered by MuPDF like a one-page PDF at CLASSIFIER_PDF_RENDER_DPI (capped at 25 000 000 pixels), with its `<text>` elements as the native text layer. Expected: `documents[0].kind` = `svg`, one item. `System Size: 8.4 kW` PASS 10 with a `pdf-text` box where the label is drawn; `markup is not text` FAIL 1 — the XML is never searched, only the drawing's words; `sharpness` scores the render; the llm criterion sees the panels. The green badge is an embedded `data:` PNG and IS drawn; the company logo is an EXTERNAL `<image>` and is NOT — MuPDF fetches nothing an SVG links to — so `documents[0].warnings` is `[\"external image not rendered: https://assets.acme-roofing.example/logo.png\"]`. With CLASSIFIER_SVG_FETCH_IMAGES=true the submit tries the link instead (SSRF-checked, no redirects, PNG/JPEG only); the `.example` host never resolves, so the warning becomes `external image not fetched (blocked: URL hostname 'assets.acme-roofing.example' could not be resolved: …)`. A gzip'd `.svgz` is a 400 (decompress it first). See API.md § External references in SVG."
           },
           "response": []
         },

@@ -6,7 +6,7 @@ split into ITEMS — every page of every document — and the unit of work is
 in a sibling:
 
     loading.py       bytes -> Document (content type, EXIF, kind, URL fetch,
-                     every page)
+                     every page), and the submit-time SVG image inliner
     ocr.py           the OCR engine singleton
     geometry.py      the <=1000-px working frame and the map back to originals
     context.py       what every unit on one item shares, computed once,
@@ -41,6 +41,7 @@ from analysis.loading import (
     load_document_bytes,
     load_document_page,
     load_input_bytes,
+    resolve_svg_images,
     validate_content_type,
 )
 from analysis.pipeline import analyze_document
@@ -50,5 +51,6 @@ __all__ = [
     "load_document_bytes",
     "load_document_page",
     "load_input_bytes",
+    "resolve_svg_images",
     "validate_content_type",
 ]

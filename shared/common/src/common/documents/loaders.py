@@ -8,16 +8,25 @@ and dispatches to the per-kind loader:
                              EXIF-aware decode path), no text layer.
     pdf   → ``_load_pdf``    per-page native text via PyMuPDF plus a raster
                              render at ``render_dpi``, capped at ``max_pages``.
+    svg   → ``_load_svg``    one page, rendered by MuPDF like a one-page PDF
+                             (native text from ``<text>``, a raster render
+                             capped at ``max_render_pixels``), plus a warning
+                             per external reference it did not draw.
     txt   → ``_load_txt``    one page, text only, no image.
     docx  → ``_load_docx``   one page, paragraphs and table cells in document
                              order, no image.
 
 Design notes worth knowing before editing:
 
-  * Only PDFs are multi-page. .docx has no page concept until it is laid out
-    (python-docx reads the XML, not a renderer), and .txt has none at all, so
-    both collapse to a single page. Callers that need per-page text for those
-    kinds have to render them first — out of scope here.
+  * Only PDFs are multi-page. An SVG is one drawing — one page. .docx has
+    no page concept until it is laid out (python-docx reads the XML, not a
+    renderer), and .txt has none at all, so both collapse to a single page.
+    Callers that need per-page text for those kinds have to render them
+    first — out of scope here.
+  * An SVG is rendered by MuPDF, which fetches NOTHING an SVG points at
+    (http, ``file://``, paths, ``<use>``, CSS imports, XXE — see ``svg.py``).
+    That is a property this module relies on and the tests pin; a service
+    that wants remote images inlines them as ``data:`` URIs BEFORE loading.
   * Nothing in this module imports OpenCV. Images are handled with PIL and
     numpy so the package stays usable in services that only depend on one of
     the two OpenCV wheels (or neither).
@@ -30,7 +39,7 @@ Design notes worth knowing before editing:
     once. The PDF render holds it per page, not per document, so a 20-page
     render does not stall a short ``pdf_text_regions`` lookup for seconds.
 
-Requires the ``documents`` extra: ``pymupdf`` (PDF), ``python-docx`` (DOCX),
+Requires the ``documents`` extra: ``pymupdf`` (PDF, SVG), ``python-docx`` (DOCX),
 ``pillow`` + ``numpy`` (images). Each is imported lazily inside its loader so
 a consumer that only handles .txt pays for none of them.
 
@@ -40,11 +49,13 @@ returns is then optionally OCR'd (ocr.py) and searched (textmatch.py).
 
 from __future__ import annotations
 
+import math
 import threading
 from typing import TYPE_CHECKING, Callable, Optional
 
 from .detect import DocumentKind, UnsupportedDocumentError, detect_kind, guess_content_type
 from .model import Document, Page
+from .svg import find_external_refs
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     import numpy as np
@@ -56,8 +67,21 @@ ImageDecoder = Callable[[bytes], "np.ndarray"]
 # Defaults, deliberately conservative:
 #   20 pages keeps a 200-page contract from turning into 200 OCR passes.
 #   150 dpi is the lowest density at which 8-10pt body text survives OCR.
+#   25 megapixels bounds ONE SVG render (≈75 MB as RGB). An SVG declares its
+#   own size, and ``width="1000000"`` is three characters more than
+#   ``width="1000"``: past the cap the zoom is scaled down so the render fits,
+#   instead of MuPDF refusing (or allocating) a terapixel. PDFs are not capped
+#   — large-format plan sets render at their DPI as they always have.
 DEFAULT_MAX_PAGES = 20
 DEFAULT_RENDER_DPI = 150
+DEFAULT_MAX_RENDER_PIXELS = 25_000_000
+
+# How many external SVG references get a warning line of their own before the
+# rest are summarised as "+N more". A malicious file can carry thousands.
+_MAX_REF_WARNINGS = 10
+# A reported URL is cut to this many characters — a data-exfiltration URL can
+# be kilobytes long, and the warning only has to identify it.
+_MAX_WARNING_URL = 200
 
 # PyMuPDF is not thread-safe; every call into it in this module holds this
 # (see the module docstring). Re-entrant so a helper can call another.
@@ -172,6 +196,110 @@ def _load_pdf(raw: bytes, max_pages: int, render_dpi: int) -> tuple[list[Page], 
     return pages, truncated
 
 
+def _svg_zoom(width_pt: float, height_pt: float, render_dpi: int, max_pixels: int) -> float:
+    """The zoom an SVG page renders at: ``render_dpi / 72``, scaled down when
+    that would exceed ``max_pixels``.
+
+    An SVG's page rectangle is in points (MuPDF reads ``width`` / ``height``,
+    falling back to the ``viewBox``, then to 612×792), so the render at the
+    requested DPI is ``w·h·zoom²`` pixels. Past the cap the zoom becomes
+    ``√(max_pixels / (w·h))`` — the largest render that fits — rather than
+    an error: a big-but-legitimate drawing still loads, just less sharply.
+    """
+    zoom = render_dpi / 72.0
+    area = width_pt * height_pt
+    if area > 0 and area * zoom * zoom > max_pixels:
+        zoom = math.sqrt(max_pixels / area)
+    return zoom
+
+
+def _ref_warnings(raw: bytes) -> list[str]:
+    """One "not rendered" line per external reference, capped."""
+    refs = find_external_refs(raw)
+    lines = []
+    for ref in refs[:_MAX_REF_WARNINGS]:
+        what = "image" if ref.tag in ("image", "feImage") else f"<{ref.tag}> reference"
+        url = ref.url if len(ref.url) <= _MAX_WARNING_URL else ref.url[:_MAX_WARNING_URL] + "…"
+        lines.append(f"external {what} not rendered: {url}")
+    if len(refs) > _MAX_REF_WARNINGS:
+        lines.append(f"+{len(refs) - _MAX_REF_WARNINGS} more external reference(s) not rendered")
+    return lines
+
+
+def _load_svg(raw: bytes, render_dpi: int, max_pixels: int) -> tuple[list[Page], list[str]]:
+    """Render an SVG as one page — image plus native text — like a 1-page PDF.
+
+    MuPDF opens the SVG as a one-page document: ``get_text`` reads its
+    ``<text>`` elements (so a text search hits words, not markup) and
+    ``get_pixmap`` draws it on white. The zoom is ``_svg_zoom``'s — the
+    requested DPI unless that breaks ``max_pixels``.
+
+    External references are never drawn (MuPDF fetches nothing); each one is
+    reported as a warning so a caller can tell a deliberately blank region
+    from a logo that lived on someone's CDN.
+
+    Args:
+        raw:        SVG bytes.
+        render_dpi: Raster density, as for a PDF page.
+        max_pixels: Ceiling on ``width × height`` of the render.
+
+    Returns:
+        ``(pages, warnings)`` — always exactly one page.
+
+    Raises:
+        UnsupportedDocumentError: MuPDF cannot parse it, it has no drawable
+            area (a zero width or height), or the render fails (including
+            MuPDF's own ``FzErrorLimit``).
+    """
+    import numpy as np
+    import pymupdf
+
+    try:
+        with _PYMUPDF_LOCK:
+            doc = pymupdf.open(stream=raw, filetype="svg")
+    except Exception as exc:
+        raise UnsupportedDocumentError(f"Could not open SVG: {exc}") from exc
+
+    try:
+        with _PYMUPDF_LOCK:
+            page = doc.load_page(0)
+            rect = page.rect
+            if rect.width <= 0 or rect.height <= 0:
+                raise UnsupportedDocumentError(
+                    f"SVG has no drawable area ({rect.width:g}×{rect.height:g} pt) — "
+                    "give the root <svg> a width/height or a viewBox."
+                )
+            zoom = _svg_zoom(rect.width, rect.height, render_dpi, max_pixels)
+            try:
+                native = page.get_text("text") or ""
+                pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom))
+                samples = bytes(pix.samples)
+                width, height, channels = pix.width, pix.height, pix.n
+                del pix
+            except Exception as exc:
+                raise UnsupportedDocumentError(f"Could not render SVG: {exc}") from exc
+            del page
+    finally:
+        with _PYMUPDF_LOCK:
+            doc.close()
+
+    if not width or not height:
+        raise UnsupportedDocumentError("SVG rendered to an empty image.")
+    arr = np.frombuffer(samples, dtype=np.uint8).reshape(height, width, channels)
+    if channels == 4:
+        arr = arr[:, :, :3]
+    bgr = arr[:, :, ::-1].copy()  # RGB → BGR
+    page_out = Page(
+        index=0,
+        image_bgr=bgr,
+        text=native,
+        text_source="native" if native.strip() else "none",
+        width=width,
+        height=height,
+    )
+    return [page_out], _ref_warnings(raw)
+
+
 def _load_txt(raw: bytes) -> list[Page]:
     """One page carrying the decoded text; .txt has no rendered surface."""
     # utf-8-sig drops a BOM; errors="replace" keeps a mostly-valid file usable
@@ -245,6 +373,7 @@ def load_document(
     render_dpi: int = DEFAULT_RENDER_DPI,
     image_decoder: Optional[ImageDecoder] = None,
     keep_source: bool = False,
+    max_render_pixels: int = DEFAULT_MAX_RENDER_PIXELS,
 ) -> Document:
     """Detect what ``raw`` is and load it into a ``Document``.
 
@@ -257,7 +386,8 @@ def load_document(
                        produced by ``detect_kind`` on the same bytes.
         max_pages:     Page cap for PDFs; extra pages are counted in
                        ``Document.truncated_pages``.
-        render_dpi:    Raster density for PDF page renders.
+        render_dpi:    Raster density for PDF page renders (and SVG renders,
+                       up to ``max_render_pixels``).
         image_decoder: ``bytes → BGR ndarray`` used for the image kind.
                        Defaults to ``default_image_decoder``.
         keep_source:   Retain ``raw`` on the Document as ``source_bytes``.
@@ -265,9 +395,13 @@ def load_document(
                        ``pdf_text_regions`` where a phrase sits — it has to
                        re-open the file. Costs the document's size in memory
                        for the life of the job, so leave it off otherwise.
+        max_render_pixels:
+                       Ceiling on one SVG render's ``width × height``; past it
+                       the zoom shrinks to fit (``_svg_zoom``). PDFs ignore it.
 
     Returns:
-        A ``Document`` with at least one page.
+        A ``Document`` with at least one page. An SVG's ``warnings`` list its
+        external references that were not drawn.
 
     Raises:
         UnsupportedDocumentError: Unrecognised bytes, a legacy .doc, or a
@@ -277,15 +411,18 @@ def load_document(
     decoder = image_decoder or default_image_decoder
 
     truncated = 0
+    warnings: list[str] = []
     if resolved_kind == "image":
         pages = _load_image(raw, decoder)
     elif resolved_kind == "pdf":
         pages, truncated = _load_pdf(raw, max_pages=max_pages, render_dpi=render_dpi)
+    elif resolved_kind == "svg":
+        pages, warnings = _load_svg(raw, render_dpi=render_dpi, max_pixels=max_render_pixels)
     elif resolved_kind == "txt":
         pages = _load_txt(raw)
     elif resolved_kind == "docx":
         pages = _load_docx(raw)
-    else:  # defensive: detect_kind only returns the four kinds above
+    else:  # defensive: detect_kind only returns the five kinds above
         raise UnsupportedDocumentError(f"Unhandled document kind: {resolved_kind!r}")
 
     if not pages:
@@ -301,6 +438,7 @@ def load_document(
         pages=pages,
         truncated_pages=truncated,
         source_bytes=raw if keep_source else None,
+        warnings=warnings,
     )
 
 
@@ -357,6 +495,44 @@ def pdf_page_size(
             zoom = render_dpi / 72.0
             rect = page.rect * pymupdf.Matrix(zoom, zoom)
             irect = rect.irect
+            return int(irect.width), int(irect.height)
+        finally:
+            doc.close()
+
+
+def svg_page_size(
+    raw: bytes,
+    *,
+    render_dpi: int = DEFAULT_RENDER_DPI,
+    max_pixels: int = DEFAULT_MAX_RENDER_PIXELS,
+) -> tuple[int, int]:
+    """The ``(width, height)`` in pixels an SVG renders to — without rendering.
+
+    ``pdf_page_size`` for the svg kind: the page rectangle MuPDF derives from
+    ``width`` / ``height`` / ``viewBox``, transformed by the SAME zoom
+    ``_load_svg`` uses (``_svg_zoom``, so the pixel cap applies identically)
+    and its integer rectangle read off. A reference request needs it to check
+    caller-supplied pixel regions against a page nobody has rasterised yet.
+
+    Raises:
+        UnsupportedDocumentError: MuPDF cannot open it, or it has no drawable
+            area.
+    """
+    import pymupdf
+
+    with _PYMUPDF_LOCK:
+        try:
+            doc = pymupdf.open(stream=raw, filetype="svg")
+        except Exception as exc:
+            raise UnsupportedDocumentError(f"Could not open SVG: {exc}") from exc
+        try:
+            rect = doc.load_page(0).rect
+            if rect.width <= 0 or rect.height <= 0:
+                raise UnsupportedDocumentError(
+                    f"SVG has no drawable area ({rect.width:g}×{rect.height:g} pt)."
+                )
+            zoom = _svg_zoom(rect.width, rect.height, render_dpi, max_pixels)
+            irect = (rect * pymupdf.Matrix(zoom, zoom)).irect
             return int(irect.width), int(irect.height)
         finally:
             doc.close()
@@ -430,6 +606,7 @@ def pdf_text_regions(
     mode: str = "contains",
     label: Optional[str] = None,
     max_regions: int = 200,
+    filetype: str = "pdf",
 ) -> list:
     """Where a text hit sits on a native PDF page, in page-image pixels.
 
@@ -457,8 +634,14 @@ def pdf_text_regions(
     sheet put every box on the wrong axis. ``pdf_rect`` stays unrotated,
     because that is the space PDF tooling (annotations, ``search_for``) uses.
 
+    **SVG.** Pass ``filetype="svg"`` and the same machinery answers for an
+    SVG's ``<text>``: MuPDF opens it as a one-page document in points. The
+    point → pixel scale is read off ``page.width / rect.width`` rather than
+    assumed from a DPI, so it stays right when ``_load_svg`` capped the zoom.
+
     Args:
-        pdf_bytes:   The original PDF (``Document.source_bytes``).
+        pdf_bytes:   The original PDF (``Document.source_bytes``) — or SVG,
+                     with ``filetype="svg"``.
         page:        The already-loaded page — supplies the index and the
                      rendered pixel size.
         hits:        ``TextHit`` objects for this page from
@@ -467,6 +650,8 @@ def pdf_text_regions(
         mode:        contains | exact | regex | fuzzy.
         label:       Region label; defaults to ``pattern``.
         max_regions: Cap on regions returned.
+        filetype:    "pdf" (default) | "svg" — the ``Document.kind`` the
+                     bytes are.
 
     Returns:
         ``box`` regions with ``source="pdf-text"`` and ``score=1.0``. Empty
@@ -488,7 +673,7 @@ def pdf_text_regions(
     regions: list = []
     with _PYMUPDF_LOCK:
         try:
-            doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+            doc = pymupdf.open(stream=pdf_bytes, filetype=filetype)
         except Exception:
             return []
         try:

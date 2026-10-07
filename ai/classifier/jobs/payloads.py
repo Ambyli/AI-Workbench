@@ -27,8 +27,16 @@ already known here, and the runner needs it to name the artifact directory.
                              unchanged.
 
 The bytes are the ones resolved AT SUBMIT: a URL was fetched, inline text
-encoded, a multipart upload read — so the worker never touches the network
-for its input, and the item cap already ran on exactly these bytes.
+encoded, a multipart upload read, an SVG's external images fetched and
+inlined (when CLASSIFIER_SVG_FETCH_IMAGES is on) — so the worker never
+touches the network for its input, and the item cap already ran on exactly
+these bytes.
+
+Each document entry may carry ``warnings``: what the submit noticed about it
+(an SVG image it could not fetch, and why). Optional with a default of none,
+so it needed no schema bump — an older payload without the key loads exactly
+as before — and the runner prepends them to the loader's own in
+``Document.warnings``.
 
 Process flow position: called by ``api.assess`` / ``api.references`` at
 submit time; read by ``jobs.runners.run_assess`` / ``run_reference`` after a
@@ -36,7 +44,7 @@ worker claims the row.
 """
 
 import base64
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from api.schemas import AssessRequest, CriterionInput
@@ -46,13 +54,15 @@ PAYLOAD_SCHEMA = 3
 
 @dataclass
 class SubmittedDocument:
-    """One document as submitted: bytes, name, declared type, kind, pages."""
+    """One document as submitted: bytes, name, declared type, kind, pages,
+    and the submit's warnings about it (see the module docstring)."""
 
     raw: bytes
     filename: str
     content_type: Optional[str]
     kind: str
     pages: int
+    warnings: list[str] = field(default_factory=list)
 
 
 def build_assess_payload(
@@ -71,16 +81,7 @@ def build_assess_payload(
     """
     payload = {
         "schema": PAYLOAD_SCHEMA,
-        "documents": [
-            {
-                "file_b64": base64.b64encode(d.raw).decode("ascii"),
-                "filename": d.filename,
-                "content_type": d.content_type or "application/octet-stream",
-                "kind": d.kind,
-                "pages": d.pages,
-            }
-            for d in documents
-        ],
+        "documents": [_document_entry(d) for d in documents],
         "criteria": [c.model_dump() for c in request.criteria],
         "job_id": job_id,
     }
@@ -90,13 +91,19 @@ def build_assess_payload(
 
 
 def _document_entry(d: SubmittedDocument) -> dict[str, Any]:
-    return {
+    """One document's JSON-safe entry — shared by both payload types.
+    ``warnings`` only when there are some, so a plain document's entry keeps
+    exactly its old keys."""
+    entry: dict[str, Any] = {
         "file_b64": base64.b64encode(d.raw).decode("ascii"),
         "filename": d.filename,
         "content_type": d.content_type or "application/octet-stream",
         "kind": d.kind,
         "pages": d.pages,
     }
+    if d.warnings:
+        entry["warnings"] = list(d.warnings)
+    return entry
 
 
 def build_reference_payload(

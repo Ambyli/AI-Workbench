@@ -24,6 +24,12 @@ import os
 
 from common.net import DEFAULT_BLOCKED_NETWORKS
 
+
+def _env_flag(name: str, default: str) -> bool:
+    """A boolean environment knob: 1 / true / yes / on (any case) is True."""
+    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
 # ---------------------------------------------------------------------------
 # Upstream vision LLM — vLLM OpenAI-compatible endpoint
 # ---------------------------------------------------------------------------
@@ -98,9 +104,14 @@ TEXT_MIN_COUNT_CAP: int = max(1, int(os.environ.get("CLASSIFIER_TEXT_MIN_COUNT_C
 # ---------------------------------------------------------------------------
 # Document loading + OCR
 # ---------------------------------------------------------------------------
-# The classifier accepts JPEG/PNG, PDF, plain text, and .docx. Everything is
-# normalised into a common.documents.Document — pages that may carry an image,
-# a text layer, or both — before any criterion runs.
+# The classifier accepts JPEG/PNG, PDF, SVG, plain text, and .docx. Everything
+# is normalised into a common.documents.Document — pages that may carry an
+# image, a text layer, or both — before any criterion runs. An SVG is one page
+# rendered by MuPDF like a one-page PDF (its <text> is native text), at
+# PDF_RENDER_DPI up to common.documents.DEFAULT_MAX_RENDER_PIXELS; MuPDF never
+# fetches what an SVG links to, and each external reference it did not draw is
+# reported in the result's documents[].warnings (see SVG_FETCH_* below for the
+# opt-in that fetches <image> links instead).
 #
 # OCR_ENGINE: "rapidocr" loads the bundled RapidOCR (PP-OCRv6 ONNX models,
 # baked into the image at build time); "none" disables OCR entirely, which
@@ -108,10 +119,10 @@ TEXT_MIN_COUNT_CAP: int = max(1, int(os.environ.get("CLASSIFIER_TEXT_MIN_COUNT_C
 # with no document text to read. There is no third option today.
 #
 # A request carries a LIST of documents, and every page of every document is
-# one ITEM: a photo, a .txt and a .docx count 1 each, a PDF counts its pages
-# (read from the bytes at submit, without rendering). MAX_ITEMS caps the
-# total, INCLUSIVELY — 20 items are accepted, 21 are a 400 at submit whose
-# message gives the per-document breakdown. Each item costs a render (PDF),
+# one ITEM: a photo, an SVG, a .txt and a .docx count 1 each, a PDF counts
+# its pages (read from the bytes at submit, without rendering). MAX_ITEMS caps
+# the total, INCLUSIVELY — 20 items are accepted, 21 are a 400 at submit whose
+# message gives the per-document breakdown. Each item costs a render (PDF/SVG),
 # possibly an OCR pass, and one unit of work per criterion, so this is the
 # knob that bounds one job's size.
 #
@@ -135,6 +146,39 @@ OCR_MIN_NATIVE_CHARS: int = max(
 )
 
 # ---------------------------------------------------------------------------
+# SVG external images (analysis/loading.py resolve_svg_images, api/assess.py,
+# api/references.py)
+# ---------------------------------------------------------------------------
+# MuPDF draws an SVG's data: images and NOTHING it would have to fetch, so an
+# <image href="https://cdn.example/logo.png"> is a blank region plus a
+# "not rendered" warning. SVG_FETCH_IMAGES opts in to fetching those links
+# AT SUBMIT — never in the worker (jobs/payloads.py's invariant: the worker
+# never touches the network for its input) — and inlining each one as a
+# data: URI before the bytes are queued:
+#
+#   * every URL goes through common.net.fetch_url: the SSRF blocklist below
+#     (BLOCKED_NETWORKS), no redirects, at most SVG_FETCH_MAX_BYTES per image,
+#     at most SVG_FETCH_TIMEOUT_S per image (every image of every SVG in the
+#     request is fetched concurrently, so that is also roughly the added
+#     submit latency);
+#   * at most SVG_FETCH_MAX_IMAGES distinct URLs per document; the rest are
+#     not fetched;
+#   * the body must be a PNG or JPEG by its bytes (no nested SVG, no HTML
+#     error page);
+#   * any failure blanks that href and becomes a documents[].warnings line
+#     naming the reason — it never fails the request.
+#
+# OFF by default because every fetch is a beacon: it tells whoever wrote the
+# SVG when, and from where, the document was processed. On customer
+# documents that is a privacy cost the deployment should choose to pay.
+SVG_FETCH_IMAGES: bool = _env_flag("CLASSIFIER_SVG_FETCH_IMAGES", "false")
+SVG_FETCH_MAX_IMAGES: int = max(0, int(os.environ.get("CLASSIFIER_SVG_FETCH_MAX_IMAGES", "10")))
+SVG_FETCH_MAX_BYTES: int = max(1, int(os.environ.get("CLASSIFIER_SVG_FETCH_MAX_BYTES", "5000000")))
+SVG_FETCH_TIMEOUT_S: float = max(
+    0.1, float(os.environ.get("CLASSIFIER_SVG_FETCH_TIMEOUT_S", "10"))
+)
+
+# ---------------------------------------------------------------------------
 # Document analysis constants (analysis/loading.py, analysis/text_eval.py)
 # ---------------------------------------------------------------------------
 # ACCEPTED_CONTENT_TYPES: declared upload types accepted on POST /assess. This
@@ -149,6 +193,7 @@ ACCEPTED_CONTENT_TYPES: frozenset[str] = frozenset({
     "image/jpeg",
     "image/jpg",
     "image/png",
+    "image/svg+xml",
     "application/pdf",
     "text/plain",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -584,10 +629,6 @@ LLM_BBOX_CROP_PAD: float = max(
 # 2.4. Costs one extra call per attempt whose coarse box validated; the
 # coarse box is kept when the second answer is unusable, and both are
 # recorded on the attempt (`coarse_bbox_grid`, `refined`).
-def _env_flag(name: str, default: str) -> bool:
-    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
-
-
 LLM_BBOX_GRIDLINES: bool = _env_flag("CLASSIFIER_LLM_BBOX_GRIDLINES", "true")
 LLM_BBOX_GRID_STEP: int = max(
     10, int(os.environ.get("CLASSIFIER_LLM_BBOX_GRID_STEP", "100"))

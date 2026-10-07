@@ -26,7 +26,7 @@ touches no job state.
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
-from common.documents import EXTENSIONS, MAX_PATTERN_CHARS
+from common.documents import DEFAULT_MAX_RENDER_PIXELS, EXTENSIONS, MAX_PATTERN_CHARS
 
 from analysis.ocr import ocr_engine_status
 from api.criterion_options import criterion_types
@@ -56,6 +56,10 @@ from config import (
     REFERENCE_MAX_PER_CRITERION,
     REFERENCE_MAX_PER_REQUEST,
     REGION_LAYER_FORMATS,
+    SVG_FETCH_IMAGES,
+    SVG_FETCH_MAX_BYTES,
+    SVG_FETCH_MAX_IMAGES,
+    SVG_FETCH_TIMEOUT_S,
     TEXT_CHAR_BUDGET,
     VISION_LLM_MAX_IMAGES_PER_PROMPT,
 )
@@ -176,6 +180,36 @@ def list_document_kinds():
                      "A scanned PDF has no native text layer, so OCR fills it in.",
         },
         {
+            "kind": "svg",
+            "extensions": EXTENSIONS["svg"],
+            "content_types": ["image/svg+xml"],
+            "detection": "UTF-8 XML whose first element is <svg> (or <prefix:svg>), "
+                         "after any XML declaration, comments and DOCTYPE — checked "
+                         "before plain text",
+            "pages": "1 — one item",
+            "has_page_images": True,
+            "native_text": True,
+            "notes": f"Rendered by MuPDF like a one-page PDF at {PDF_RENDER_DPI} dpi, "
+                     f"scaled down to at most {DEFAULT_MAX_RENDER_PIXELS:,} pixels; "
+                     "<text> elements are the native text layer (text criteria get "
+                     "pdf-text boxes). MuPDF fetches NOTHING an SVG links to — each "
+                     "external reference it did not draw is a line in the result's "
+                     "documents[].warnings. Only data: images are drawn, unless "
+                     "external_images.fetch is on.",
+            # The live answer for THIS container: whether <image> links are
+            # fetched at submit (CLASSIFIER_SVG_FETCH_IMAGES) and the bounds.
+            "external_images": {
+                "fetch": SVG_FETCH_IMAGES,
+                "max_images": SVG_FETCH_MAX_IMAGES,
+                "max_bytes": SVG_FETCH_MAX_BYTES,
+                "timeout_s": SVG_FETCH_TIMEOUT_S,
+                "accepted": ["image/png", "image/jpeg"],
+                "redirects": "not followed",
+                "when": "at submit; a link that fails is blanked and warned about, "
+                        "never a request failure",
+            },
+        },
+        {
             "kind": "txt",
             "extensions": EXTENSIONS["txt"],
             "content_types": ["text/plain"],
@@ -211,7 +245,14 @@ def list_document_kinds():
                     "reason": "Legacy OLE2 Word files are not readable by python-docx. "
                               "Convert to .docx and re-upload.",
                     "detection": "magic bytes: D0 CF 11 E0 A1 B1 1A E1",
-                }
+                },
+                {
+                    "kind": "svgz",
+                    "reason": "gzip-compressed SVG. Refused rather than inflated (a "
+                              "small gzip can expand to gigabytes); decompress to .svg "
+                              "and re-upload.",
+                    "detection": "magic bytes: 1F 8B (any gzip data)",
+                },
             ],
             "text_match_modes": {
                 "contains": "substring anywhere in the document text (default)",
@@ -239,6 +280,7 @@ def list_document_kinds():
                 "items": "every page of every document is one item; the cap is "
                          "inclusive and counted at submit",
                 "pdf_render_dpi": PDF_RENDER_DPI,
+                "svg_max_render_pixels": DEFAULT_MAX_RENDER_PIXELS,
                 "llm_text_char_budget": TEXT_CHAR_BUDGET,
                 # What one vision-model request may carry (the candidate plus
                 # reference examples); every call that is not reference-guided

@@ -254,13 +254,15 @@ def _text_regions(view: Document, name: str, opts: dict, res) -> list[Region]:
                        to line polygons, in page-image pixels.
       Native PDF text  needs the file itself — ``pdf_text_regions`` re-opens
                        ``doc.source_bytes`` (always kept for a PDF here).
+                       An SVG's ``<text>`` is the same case: MuPDF re-opens
+                       it with ``filetype="svg"``.
 
     .txt / .docx have no geometry and yield nothing — their hits are still
     reported in ``detail.snippets``.
     """
     regions: list[Region] = list(res.regions)
     page = view.pages[0]
-    if view.kind == "pdf" and page.text_source == "native" and view.source_bytes:
+    if view.kind in ("pdf", "svg") and page.text_source == "native" and view.source_bytes:
         hits = list(res.hits)
         if hits or opts["match"] in ("contains", "exact"):
             regions.extend(
@@ -272,6 +274,7 @@ def _text_regions(view: Document, name: str, opts: dict, res) -> list[Region]:
                     mode=opts["match"],
                     label=name,
                     max_regions=TEXT_REGION_MAX_HITS,
+                    filetype=view.kind,
                 )
             )
     return regions[:TEXT_REGION_MAX_HITS]
@@ -362,10 +365,11 @@ def _document_regions(
 ) -> list[Region]:
     """Each page's share of the hits → regions on THAT page (``page = item``).
 
-    OCR'd pages map through their line polygons; native PDF pages through
-    PyMuPDF word-span reconstruction — used for EVERY match mode here, since
-    a literal ``search_for(pattern)`` cannot find half a phrase whose other
-    half is on the next page. .txt / .docx pages have no geometry.
+    OCR'd pages map through their line polygons; native PDF (and SVG) pages
+    through PyMuPDF word-span reconstruction — used for EVERY match mode
+    here, since a literal ``search_for(pattern)`` cannot find half a phrase
+    whose other half is on the next page. .txt / .docx pages have no
+    geometry.
     """
     by_item = {ctx.item: ctx for ctx in group.items}
     regions: list[Region] = []
@@ -378,7 +382,11 @@ def _document_regions(
         found: list[Region] = []
         if layer is not None and layer.source == "ocr":
             found = ocr_line_regions(page, hits, name, max_regions=TEXT_REGION_MAX_HITS)
-        elif ctx.doc.kind == "pdf" and page.text_source == "native" and ctx.doc.source_bytes:
+        elif (
+            ctx.doc.kind in ("pdf", "svg")
+            and page.text_source == "native"
+            and ctx.doc.source_bytes
+        ):
             found = pdf_text_regions(
                 ctx.doc.source_bytes,
                 page,
@@ -387,6 +395,7 @@ def _document_regions(
                 mode="fuzzy",
                 label=name,
                 max_regions=TEXT_REGION_MAX_HITS,
+                filetype=ctx.doc.kind,
             )
         for region in found:
             region.page = item

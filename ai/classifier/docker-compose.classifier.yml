@@ -50,6 +50,15 @@ services:
       - CLASSIFIER_PDF_RENDER_DPI=${CLASSIFIER_PDF_RENDER_DPI:-150}
       - CLASSIFIER_TEXT_CHAR_BUDGET=${CLASSIFIER_TEXT_CHAR_BUDGET:-60000}
       - CLASSIFIER_OCR_MIN_NATIVE_CHARS=${CLASSIFIER_OCR_MIN_NATIVE_CHARS:-20}
+      # SVG external images: MuPDF never fetches what an SVG links to. With
+      # this on, the submit fetches each <image> link itself (SSRF-checked,
+      # no redirects, PNG/JPEG only, bounded by count / bytes / seconds) and
+      # inlines it before queueing. Off by default — every fetch is a beacon
+      # to the SVG's author. See ai/classifier/API.md § External references in SVG.
+      - CLASSIFIER_SVG_FETCH_IMAGES=${CLASSIFIER_SVG_FETCH_IMAGES:-false}
+      - CLASSIFIER_SVG_FETCH_MAX_IMAGES=${CLASSIFIER_SVG_FETCH_MAX_IMAGES:-10}
+      - CLASSIFIER_SVG_FETCH_MAX_BYTES=${CLASSIFIER_SVG_FETCH_MAX_BYTES:-5000000}
+      - CLASSIFIER_SVG_FETCH_TIMEOUT_S=${CLASSIFIER_SVG_FETCH_TIMEOUT_S:-10}
       # The thumbnail guard: a page image under this on either axis is a 400.
       - CLASSIFIER_MIN_IMAGE_WIDTH=${CLASSIFIER_MIN_IMAGE_WIDTH:-32}
       - CLASSIFIER_MIN_IMAGE_HEIGHT=${CLASSIFIER_MIN_IMAGE_HEIGHT:-32}

@@ -1,13 +1,14 @@
 """Page and Document — the in-memory shape every loader produces.
 
 A ``Document`` is the common currency of this subpackage: whatever the caller
-uploaded (a photo, a PDF, a .txt, a .docx), the loaders in ``loaders.py``
-normalise it into an ordered list of ``Page`` objects, each of which may carry
+uploaded (a photo, a PDF, an SVG, a .txt, a .docx), the loaders in
+``loaders.py`` normalise it into an ordered list of ``Page`` objects, each of
+which may carry
 
-  * a rasterised image (BGR numpy array) — always for image/PDF kinds, never
-    for txt/docx, which have no rendered surface, and
-  * a text layer — native (PDF text objects, .txt bytes, .docx runs), OCR'd
-    (filled in later by ``ocr.apply_ocr``), or absent.
+  * a rasterised image (BGR numpy array) — always for image/PDF/SVG kinds,
+    never for txt/docx, which have no rendered surface, and
+  * a text layer — native (PDF text objects, SVG ``<text>``, .txt bytes,
+    .docx runs), OCR'd (filled in later by ``ocr.apply_ocr``), or absent.
 
 Downstream code therefore never branches on the upload's file type: it asks
 ``document.page_images()`` for something to run OpenCV or a vision model on,
@@ -33,7 +34,7 @@ TextSource = Literal["native", "ocr", "none"]
 
 # The document kinds this package can load. Mirrors detect.DocumentKind —
 # kept as a plain Literal here so model.py imports nothing from detect.py.
-DocumentKind = Literal["image", "pdf", "txt", "docx"]
+DocumentKind = Literal["image", "pdf", "txt", "docx", "svg"]
 
 
 @dataclass
@@ -83,7 +84,8 @@ class Document:
     """A loaded document: metadata plus its pages in document order.
 
     Attributes:
-        kind:            "image" | "pdf" | "txt" | "docx" (see detect.py).
+        kind:            "image" | "pdf" | "txt" | "docx" | "svg" (see
+                         detect.py).
         filename:        Original filename as supplied by the caller ("" if
                          unknown) — informational only, never trusted for
                          format detection.
@@ -101,6 +103,12 @@ class Document:
                          the page. Off by default because holding a 40 MB PDF
                          for the life of a job is a real cost for a feature
                          most requests never use.
+        warnings:        Human-readable notes about how the document was read
+                         that are not errors — today, one line per external
+                         reference in an SVG that was not drawn (MuPDF never
+                         fetches; see ``svg.py``). A service may prepend its
+                         own (e.g. why it could not fetch an image) before
+                         reporting them. Empty for every other kind.
     """
 
     kind: DocumentKind
@@ -110,6 +118,7 @@ class Document:
     pages: list[Page] = field(default_factory=list)
     truncated_pages: int = 0
     source_bytes: Optional[bytes] = None
+    warnings: list[str] = field(default_factory=list)
 
     # ── Text helpers ──────────────────────────────────────────────────────
     def full_text(self, separator: str = "\n\n") -> str:

@@ -47,6 +47,7 @@ request. See [API.md § Documents, pages and items](../../../ai/classifier/API.m
 | [`photo_of_letter.png`](photo_of_letter.png) | image | **none** — OCR required | 1 | A badly photographed letter (3° skew, brightness gradient, mild blur, JPEG noise) that OCR still reads. Carries a logo, a stamp and a signature — see below |
 | [`photo_of_letter_blurry.png`](photo_of_letter_blurry.png) | image | **none** — OCR mostly fails | 1 | Sharpness FAIL, partial OCR, and `depends_on` skipping the LLM criterion |
 | [`unsupported_legacy.doc`](unsupported_legacy.doc) | — | — | — | The OLE2 rejection: HTTP 400 telling the caller to convert to .docx |
+| [`diagram.svg`](diagram.svg) | svg | native (the `<text>` labels) | 1 render @ `CLASSIFIER_PDF_RENDER_DPI` | An SVG drawing — a roof plan with labels, a 2×6 panel array, an embedded `data:` PNG badge (drawn) and an **external** `<image>` logo link (never drawn: MuPDF fetches nothing, so `documents[0].warnings` names it). Text search hits the words, never the markup |
 | [`utility_bill.jpeg`](utility_bill.jpeg) | image | **none** — OCR required | 1 (5712×4284, EXIF orientation 6 → upright 4284×5712) | A real phone photo of an Ohio Edison bill, **not** generated. Drives `regions_report.py --pipeline utility-bill`, which asks the vision model where the amount due is and draws its boxes. `Amount Due: $80.49` is printed on one line in the header and again on the payment stub. 5.8 MB, same order as `../Neighborhood.jpeg`. See [`../REGIONS_REPORT.md § Pipelines`](../REGIONS_REPORT.md#pipelines) |
 | [`utility_bill_2.jpeg`](utility_bill_2.jpeg) | image | **none** — OCR required | 1 (4032×3024, two pages side by side) | A real phone photo of an AEP Ohio bill, the pipeline's second fixture. Label and figure are **separate** OCR lines on the same row — `Amount due on or before` … `$193.33` — in the header and on the stub; `Total Amount Due At Last Billing $201.60` in the charges table is a different number. 2.6 MB |
 
@@ -266,6 +267,25 @@ default (`sum`), FAIL with `options.aggregate: {"documents": "all"}`.
 (PASS). A `has text` locate criterion (`score: false`) has regions on items 0
 and 1 only.
 
+### `diagram.svg`
+
+```json
+[
+  {"name": "System Size: 8.4 kW",        "type": "text", "weight": 3.0},
+  {"name": "markup is not text",         "type": "text", "options": {"pattern": "xlink:href"}},
+  {"name": "sharpness",                  "type": "cv"},
+  {"name": "shows a solar panel array",  "type": "llm", "options": {"hint": "presence", "boxes": true}}
+]
+```
+
+| Criterion | Expected | Why |
+|---|---|---|
+| `System Size: 8.4 kW` | **PASS** 10, a `pdf-text` box under the panels | The `<text>` elements are the native text layer; MuPDF re-opens the SVG to box the hit |
+| `markup is not text` | **FAIL** 1 | `xlink:href` is in the file but not in the drawing — the markup is never searched |
+| `sharpness` | **PASS** | A vector render is crisp |
+| `shows a solar panel array` | LLM-scored, with a box | The model sees the 2×6 array |
+| `documents[0]` | `kind: "svg"`, `pages: 1`, `warnings: ["external image not rendered: https://assets.acme-roofing.example/logo.png"]` | The green badge is a `data:` URI and IS drawn; the logo is an external link and is not. With `CLASSIFIER_SVG_FETCH_IMAGES=true` the submit tries it instead — the `.example` host never resolves, so the line becomes `external image not fetched (blocked: …could not be resolved…)` |
+
 ### `unsupported_legacy.doc`
 
 Any criteria. Expected: **HTTP 400** at submit time with
@@ -339,6 +359,17 @@ curl -s $LITELLM/v1/classifier/assess \
   -F "file=@$DOCS/unsupported_legacy.doc" \
   -F 'criteria=[{"name":"Notice to Owner","type":"text"}]'
 # → 400 "document #0 unsupported_legacy.doc: Legacy .doc (OLE2 compound) files are not supported…"
+
+# 5a — an SVG: one item, native <text>, and a warning for the external logo
+curl -s $LITELLM/v1/classifier/assess \
+  -H "Authorization: Bearer $KEY" \
+  -F "file=@$DOCS/diagram.svg;type=image/svg+xml" \
+  -F 'criteria=[
+    {"name":"System Size: 8.4 kW","type":"text","weight":3.0},
+    {"name":"markup is not text","type":"text","options":{"pattern":"xlink:href"}},
+    {"name":"sharpness","type":"cv"}
+  ]'
+# → documents[0].warnings: ["external image not rendered: https://assets.acme-roofing.example/logo.png"]
 
 # 5b — a two-page PDF and a photo: three items, one job; a phrase across the page break
 curl -s $LITELLM/v1/classifier/assess \

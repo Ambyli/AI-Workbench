@@ -884,11 +884,12 @@ def page_image(source: pathlib.Path, page: int, geometry: PageGeometry) -> Optio
     """The ORIGINAL fixture's page ``page`` (within that file), at the size
     the service reported for the item.
 
-    A PDF is re-rendered locally rather than read back from the job's
-    ``p{n}.base.jpg``: the base image is the service's own render, so drawing
-    on it would reintroduce exactly the shared-source problem this script
-    exists to avoid. The zoom is taken from ``page_geometry`` rather than from
-    ``CLASSIFIER_PDF_RENDER_DPI`` so a container with a different DPI still
+    A PDF (or an SVG — MuPDF opens both) is re-rendered locally rather than
+    read back from the job's ``p{n}.base.jpg``: the base image is the
+    service's own render, so drawing on it would reintroduce exactly the
+    shared-source problem this script exists to avoid. The zoom is taken from
+    ``page_geometry`` rather than from ``CLASSIFIER_PDF_RENDER_DPI`` so a
+    container with a different DPI (or an SVG whose render was capped) still
     lines up.
     """
     from PIL import Image, ImageOps
@@ -901,7 +902,7 @@ def page_image(source: pathlib.Path, page: int, geometry: PageGeometry) -> Optio
         image.load()
         return ImageOps.exif_transpose(image).convert("RGB")
 
-    if suffix == ".pdf":
+    if suffix in (".pdf", ".svg"):
         import pymupdf
 
         with pymupdf.open(source) as doc:

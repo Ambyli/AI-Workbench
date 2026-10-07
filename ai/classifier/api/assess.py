@@ -40,11 +40,16 @@ request rather than a job that fails in a worker a minute later:
   3. detect each document's kind from its bytes
      (``common.documents.detect_kind``) and count its pages — a PDF's page
      count is read from the cross-reference table without rendering, every
-     other kind is one page. The sum is the job's ITEM count, capped at
-     CLASSIFIER_MAX_ITEMS inclusively; over it is a 400 naming each
-     document's pages. A ``score: false`` criterion is refused when NO
-     document has a page image; a ``detector`` criterion is refused when
-     DETECTOR_URL is unset;
+     other kind (an SVG included) is one page. The sum is the job's ITEM
+     count, capped at CLASSIFIER_MAX_ITEMS inclusively; over it is a 400
+     naming each document's pages. A ``score: false`` criterion is refused
+     when NO document has a page image; a ``detector`` criterion is refused
+     when DETECTOR_URL is unset;
+  3b. with CLASSIFIER_SVG_FETCH_IMAGES on, fetch each SVG's external
+     ``<image>`` links and inline them (``analysis.resolve_svg_images``) —
+     here, because the worker never touches the network. A link that cannot
+     be fetched is blanked and becomes a ``documents[].warnings`` line; it
+     never fails the request;
   4. register a job row in phase "staging", write the payload, flip the row
      to "pending", wake a worker — ``_enqueue`` — and return 202.
 
@@ -57,6 +62,7 @@ to ``jobs.queue``.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 from dataclasses import dataclass
@@ -69,8 +75,11 @@ from starlette.datastructures import UploadFile
 
 from common.documents import UnsupportedDocumentError, detect_kind, pdf_page_count
 
-from analysis import load_input_bytes, validate_content_type
+from analysis import load_input_bytes, resolve_svg_images, validate_content_type
 from api.schemas import AssessRequest, ClassifierMetadata, DocumentInput, validation_message
+# A module, not names: SVG_FETCH_IMAGES is read at call time, so a test (or a
+# future live-reload) can flip it without re-importing this module.
+import config
 from config import MAX_ITEMS
 from cv import get_detector
 # A module, not names: is_configured() reads DETECTOR_URL at call time.
@@ -110,8 +119,8 @@ _OPENAPI = {
                     "properties": {
                         "file": {"type": "array",
                                  "items": {"type": "string", "format": "binary"},
-                                 "description": "JPEG, PNG, PDF (any page count), .txt or "
-                                                ".docx — repeat the part for more documents"},
+                                 "description": "JPEG, PNG, PDF (any page count), SVG, .txt "
+                                                "or .docx — repeat the part for more documents"},
                         "text": {"type": "array", "items": {"type": "string"},
                                  "description": "Inline text documents — repeat for more"},
                         "criteria": {"type": "string",
@@ -331,6 +340,25 @@ def _check_documents(model: AssessRequest, uploads: list[_Upload]) -> list[Submi
     return submitted
 
 
+async def _inline_svg_images(submitted: list[SubmittedDocument]) -> None:
+    """Step 3b: each SVG's external images fetched and inlined, in place.
+
+    A no-op unless CLASSIFIER_SVG_FETCH_IMAGES is on. Every SVG — and every
+    image inside each — is fetched concurrently, so the added submit latency
+    is about one CLASSIFIER_SVG_FETCH_TIMEOUT_S however many SVGs the request
+    carries (one after another, 20 SVGs could hold the submit for 20 of
+    them). In flight at once: at most CLASSIFIER_MAX_ITEMS ×
+    CLASSIFIER_SVG_FETCH_MAX_IMAGES, both caps the submit already enforced.
+    """
+    if not config.SVG_FETCH_IMAGES:
+        return
+    svgs = [d for d in submitted if d.kind == "svg"]
+    outcomes = await asyncio.gather(*(resolve_svg_images(d.raw) for d in svgs))
+    for d, (raw, warnings) in zip(svgs, outcomes):
+        d.raw = raw
+        d.warnings.extend(warnings)
+
+
 async def _enqueue(job_id: str, payload: dict) -> int:
     """Persist ``payload``, publish the job to the workers, return queue depth.
 
@@ -370,6 +398,7 @@ async def assess(request: Request):
     resolved = await _resolve(model)
     model = resolved.request
     submitted = _check_documents(model, uploads)
+    await _inline_svg_images(submitted)
     logger.info(
         "assess: %d document(s) %s, %d item(s), criteria=%s",
         len(submitted),

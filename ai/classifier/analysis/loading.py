@@ -13,8 +13,8 @@ per-kind load, and the fetch for a caller-supplied URL.
                                    page up to ``max_pages``, PDF render DPI).
     load_document_page()         — raw bytes → a ONE-page Document: page
                                    ``page`` of a PDF (only the pages up to it
-                                   are rendered), or the image. What a
-                                   reference — always one page — is built on.
+                                   are rendered), the image, or the SVG. What
+                                   a reference — always one page — is built on.
     validate_url()               — the SSRF check on a caller-supplied URL. The
                                    rule itself is ``common.net`` (the detector
                                    service needs the identical one); this is the
@@ -22,25 +22,43 @@ per-kind load, and the fetch for a caller-supplied URL.
                                    ``config.BLOCKED_NETWORKS`` and turns a
                                    refusal into the HTTP 400 the endpoints return.
     load_input_bytes()           — base64, URL, or inline text → raw bytes.
+                                   The URL fetch is ``common.net.fetch_url``
+                                   (SSRF check first, no redirects).
+    resolve_svg_images()         — an SVG's external ``<image>`` links fetched
+                                   (``common.net.fetch_url``, bounded by the
+                                   CLASSIFIER_SVG_FETCH_* knobs) and inlined as
+                                   ``data:`` URIs, each failure a warning. Runs
+                                   AT SUBMIT, only when
+                                   CLASSIFIER_SVG_FETCH_IMAGES is on.
 
 Process flow position: below the pipeline, above nothing — it imports no
-sibling. ``load_input_bytes`` / ``validate_content_type`` are called by
-``api.assess`` at submit (the bytes are needed there, for the item cap — a
-PDF counts its pages); ``load_document_bytes`` by ``jobs.runners`` in the
-worker, once per document (``load_document_page`` once per reference).
+sibling. ``load_input_bytes`` / ``validate_content_type`` /
+``resolve_svg_images`` are called by ``api.assess`` (and ``api.references``)
+at submit (the bytes are needed there, for the item cap — a PDF counts its
+pages); ``load_document_bytes`` by ``jobs.runners`` in the worker, once per
+document (``load_document_page`` once per reference).
 """
 
+import asyncio
 import base64
 import io
 from dataclasses import replace
+from typing import Optional
 
-import httpx
 import numpy as np
 from fastapi import HTTPException
 from PIL import Image, ImageOps
 
-from common.documents import Document, UnsupportedDocumentError, load_document
-from common.net import BlockedURLError, validate_url as _validate_url
+from common.documents import (
+    Document,
+    UnsupportedDocumentError,
+    detect_kind,
+    find_external_refs,
+    guess_content_type,
+    load_document,
+    replace_refs,
+)
+from common.net import BlockedURLError, FetchError, fetch_url, validate_url as _validate_url
 
 from config import (
     ACCEPTED_CONTENT_TYPES,
@@ -51,10 +69,17 @@ from config import (
     MIN_IMAGE_HEIGHT,
     MIN_IMAGE_WIDTH,
     PDF_RENDER_DPI,
+    SVG_FETCH_MAX_BYTES,
+    SVG_FETCH_MAX_IMAGES,
+    SVG_FETCH_TIMEOUT_S,
 )
 from logger import logger
 
-_http_timeout = httpx.Timeout(FETCH_TIMEOUT, connect=HTTP_CONNECT_TIMEOUT)
+# Sent with every fetch: some servers 403 httpx's default User-Agent.
+_USER_AGENT = {"User-Agent": "Classifier/1.0"}
+# A URL in a warning is cut to this many characters (the loader's own
+# "not rendered" lines use the same bound).
+_WARNING_URL_CHARS = 200
 
 # ACCEPTED_CONTENT_TYPES lives in config.py (§ Document analysis constants)
 # with the rest of the tunables; the SSRF blocklist itself (BLOCKED_NETWORKS)
@@ -82,7 +107,7 @@ def validate_content_type(content_type: str | None) -> None:
             status_code=400,
             detail=(
                 f"Unsupported content type '{content_type}'. Accepted: JPEG/PNG images, "
-                "PDF, plain text, and .docx (see GET /document-kinds)."
+                "PDF, SVG, plain text, and .docx (see GET /document-kinds)."
             ),
         )
 
@@ -175,6 +200,7 @@ def load_document_bytes(
     *,
     keep_source: bool = False,
     max_pages: int = MAX_ITEMS,
+    warnings: Optional[list[str]] = None,
 ) -> Document:
     """Turn uploaded bytes into a Document, or fail with a 400.
 
@@ -194,6 +220,11 @@ def load_document_bytes(
                       already held.
         max_pages:    Pages to load. The runner passes the count read at
                       submit, which already passed CLASSIFIER_MAX_ITEMS.
+        warnings:     Notes the SUBMIT already made about this document (an
+                      SVG image it could not fetch, and why). Placed ahead of
+                      the loader's own in ``Document.warnings``, so the
+                      result's ``documents[].warnings`` reads in the order
+                      things happened.
 
     Returns:
         A ``Document`` with every page — each becomes one item.
@@ -235,12 +266,15 @@ def load_document_bytes(
                 f"{max_pages} counted at submit"
             ),
         )
+    if warnings:
+        doc.warnings = list(warnings) + doc.warnings
     logger.info(
-        "load_document_bytes: kind=%s pages=%d has_text=%s has_image=%s",
+        "load_document_bytes: kind=%s pages=%d has_text=%s has_image=%s warnings=%d",
         doc.kind,
         len(doc.pages),
         doc.has_text(),
         doc.has_images(),
+        len(doc.warnings),
     )
     return doc
 
@@ -252,15 +286,18 @@ def load_document_page(
     *,
     page: int = 0,
     keep_source: bool = True,
+    warnings: Optional[list[str]] = None,
 ) -> Document:
     """One page of an upload, as a one-page ``Document`` — or a 400.
 
-    A reference example is ONE page: a JPEG/PNG, or page ``page`` of a PDF.
+    A reference example is ONE page: a JPEG/PNG, an SVG, or page ``page`` of
+    a PDF.
     Only the pages up to it are rendered (a PDF's pages render in order),
     and the result is a view holding just that page, so the pipeline sees a
     one-item document. ``Page.index`` stays the page's index IN ITS PDF,
     which is what ``common.documents.pdf_text_regions`` needs to re-open the
-    right page (hence ``keep_source``).
+    right page (hence ``keep_source``). ``warnings`` are the submit's notes
+    on the document, prepended to the loader's as in ``load_document_bytes``.
 
     Raises:
         HTTPException(400): Unsupported bytes, a text-only kind (.txt /
@@ -280,11 +317,11 @@ def load_document_page(
     except UnsupportedDocumentError as exc:
         logger.warning("load_document_page: rejected %s: %s", filename, exc)
         raise HTTPException(status_code=400, detail=str(exc))
-    if doc.kind not in ("image", "pdf"):
+    if doc.kind not in ("image", "pdf", "svg"):
         raise HTTPException(
             status_code=400,
             detail=f"a {doc.kind} document has no page image; a reference is one "
-                   "JPEG/PNG or one PDF page",
+                   "JPEG/PNG, one SVG, or one PDF page",
         )
     if page >= len(doc.pages):
         raise HTTPException(
@@ -292,7 +329,12 @@ def load_document_page(
             detail=f"page {page} is not in {filename or 'the document'} "
                    f"({len(doc.pages) + doc.truncated_pages} page(s))",
         )
-    return replace(doc, pages=[doc.pages[page]], truncated_pages=0)
+    return replace(
+        doc,
+        pages=[doc.pages[page]],
+        truncated_pages=0,
+        warnings=list(warnings or []) + doc.warnings,
+    )
 
 
 def validate_url(url: str) -> None:
@@ -317,9 +359,12 @@ def validate_url(url: str) -> None:
 async def load_input_bytes(data: str, type_: str) -> bytes:
     """The raw document bytes for a base64 string, a remote URL, or inline text.
 
-    For URL inputs: performs an SSRF check before fetching (ssrf.validate_url)
-    and sets a descriptive User-Agent to avoid 403 responses from servers that
-    block default request libraries.
+    For URL inputs: ``common.net.fetch_url`` performs the SSRF check before
+    fetching, refuses redirects (a 3xx could point past the check), and the
+    request carries a descriptive User-Agent to avoid 403 responses from
+    servers that block default request libraries. No size cap — the item cap
+    and the payload store bound what a document can cost — and the same
+    FETCH_TIMEOUT / HTTP_CONNECT_TIMEOUT per-operation timeouts as always.
 
     Args:
         data:  Base64 string, URL string, or the document text itself.
@@ -330,7 +375,8 @@ async def load_input_bytes(data: str, type_: str) -> bytes:
 
     Raises:
         HTTPException(400): Invalid base64 data or SSRF-blocked URL.
-        HTTPException(502): HTTP error while fetching the URL.
+        HTTPException(502): HTTP error, redirect, or transport failure while
+            fetching the URL.
     """
     data_repr = data[:80] if type_ == "url" else f"base64[{len(data)} chars]"
     logger.debug("load_input_bytes: type=%s data=%s", type_, data_repr)
@@ -345,15 +391,23 @@ async def load_input_bytes(data: str, type_: str) -> bytes:
             logger.error("load_input_bytes: invalid base64 data: %s", exc)
             raise HTTPException(status_code=400, detail=f"Invalid base64 data: {exc}")
     else:
-        # SSRF check must pass before we fetch anything
+        # fetch_url runs the SSRF check before it requests anything; the
+        # explicit call first keeps the refusal's log line and 400 identical
+        # to every other URL input in this service.
         validate_url(data)
         try:
-            async with httpx.AsyncClient(timeout=_http_timeout) as client:
-                r = await client.get(data, headers={"User-Agent": "Classifier/1.0"})
-                r.raise_for_status()
-                raw = r.content
+            raw = await fetch_url(
+                data,
+                timeout=FETCH_TIMEOUT,
+                connect_timeout=HTTP_CONNECT_TIMEOUT,
+                blocked_networks=BLOCKED_NETWORKS,
+                headers=_USER_AGENT,
+            )
             logger.debug("load_input_bytes: fetched %d bytes from URL", len(raw))
-        except httpx.HTTPError as exc:
+        except BlockedURLError as exc:
+            # Resolved differently the second time — refuse, like the first.
+            raise HTTPException(status_code=400, detail=str(exc))
+        except FetchError as exc:
             logger.error(
                 "load_input_bytes: failed to fetch URL '%s': %s", data[:80], exc
             )
@@ -364,3 +418,114 @@ async def load_input_bytes(data: str, type_: str) -> bytes:
     if not raw:
         raise HTTPException(status_code=400, detail="Document input was empty.")
     return raw
+
+
+# ---------------------------------------------------------------------------
+# SVG external images (CLASSIFIER_SVG_FETCH_IMAGES)
+# ---------------------------------------------------------------------------
+
+
+def _short(url: str) -> str:
+    return url if len(url) <= _WARNING_URL_CHARS else url[:_WARNING_URL_CHARS] + "…"
+
+
+async def _fetch_svg_image(url: str) -> tuple[Optional[str], Optional[str]]:
+    """One external image → ``(data_uri, None)``, or ``(None, reason)``.
+
+    Never raises: every way a fetch can go wrong is a reason string, because
+    one unreachable logo must not fail the request it is decoration on.
+    """
+    if not url.lower().startswith(("http://", "https://")):
+        # A relative path or file:// would be resolved against nothing we
+        # are willing to read; validate_url would refuse it anyway, but this
+        # says so in words a caller recognises.
+        return None, "not an http(s) URL"
+    try:
+        body = await fetch_url(
+            url,
+            timeout=SVG_FETCH_TIMEOUT_S,
+            deadline=SVG_FETCH_TIMEOUT_S,
+            max_bytes=SVG_FETCH_MAX_BYTES,
+            blocked_networks=BLOCKED_NETWORKS,
+            headers=_USER_AGENT,
+        )
+    except BlockedURLError as exc:
+        return None, f"blocked: {str(exc).rstrip('.')}"
+    except FetchError as exc:
+        return None, exc.reason
+    except Exception as exc:  # belt and braces — see the docstring
+        logger.warning("resolve_svg_images: unexpected error fetching %s: %r", url[:120], exc)
+        return None, "fetch failed"
+    # PNG / JPEG by the bytes, nothing else: not a nested SVG (which would
+    # need its own pass), not an HTML error page served with a 200.
+    try:
+        kind = detect_kind(body)
+    except UnsupportedDocumentError:
+        kind = None
+    if kind != "image":
+        return None, "not a PNG or JPEG image"
+    mime = guess_content_type("image", body)
+    return f"data:{mime};base64,{base64.b64encode(body).decode('ascii')}", None
+
+
+async def resolve_svg_images(raw: bytes) -> tuple[bytes, list[str]]:
+    """Fetch an SVG's external ``<image>`` links and inline them — at submit.
+
+    MuPDF never fetches, so without this an ``<image href="https://…">`` is a
+    blank region. With CLASSIFIER_SVG_FETCH_IMAGES on, the endpoints call
+    this BEFORE queueing (``jobs.payloads`` keeps the worker off the
+    network), and every external ``<image>`` reference ends up one of two
+    things:
+
+      * fetched — its href rewritten to a ``data:`` URI, which MuPDF draws;
+      * not — its href rewritten to ``""`` (drawn as nothing, exactly as
+        before) and a warning naming the reason:
+        ``external image not fetched (<reason>): <url>``.
+
+    Either way the loader no longer sees it as external, so its own
+    "not rendered" warning fires only for what this does not handle
+    (``<use>``, ``<feImage>``) — no reference is reported twice.
+
+    Limits (``config`` § SVG external images): at most
+    CLASSIFIER_SVG_FETCH_MAX_IMAGES DISTINCT URLs — the same logo referenced
+    five times is one fetch — the rest are blanked with an "over the limit"
+    warning; each fetch bounded by CLASSIFIER_SVG_FETCH_MAX_BYTES and
+    CLASSIFIER_SVG_FETCH_TIMEOUT_S, SSRF-checked, no redirects; all of them
+    concurrently, so the added submit latency is about one timeout.
+
+    Args:
+        raw: The SVG bytes as submitted.
+
+    Returns:
+        ``(rewritten_bytes, warnings)`` — ``raw`` itself and ``[]`` when the
+        file has no external ``<image>``.
+    """
+    refs = [r for r in find_external_refs(raw) if r.tag == "image"]
+    if not refs:
+        return raw, []
+
+    distinct: list[str] = []
+    for ref in refs:
+        if ref.url not in distinct:
+            distinct.append(ref.url)
+    to_fetch = distinct[:SVG_FETCH_MAX_IMAGES]
+    outcomes = await asyncio.gather(*(_fetch_svg_image(url) for url in to_fetch))
+    by_url: dict[str, tuple[Optional[str], Optional[str]]] = dict(zip(to_fetch, outcomes))
+    over_limit = f"over the {SVG_FETCH_MAX_IMAGES}-image limit"
+
+    replacements: dict = {}
+    warnings: list[str] = []
+    warned: set[str] = set()
+    for ref in refs:
+        data_uri, reason = by_url.get(ref.url, (None, over_limit))
+        replacements[ref] = data_uri or ""
+        if data_uri is None and ref.url not in warned:
+            warned.add(ref.url)
+            warnings.append(f"external image not fetched ({reason}): {_short(ref.url)}")
+    fetched = sum(1 for d, _ in by_url.values() if d is not None)
+    logger.info(
+        "resolve_svg_images: %d <image> reference(s), %d distinct URL(s), %d fetched, "
+        "%d not",
+        len(refs), len(distinct), fetched, len(distinct) - fetched,
+    )
+    return replace_refs(raw, replacements), warnings

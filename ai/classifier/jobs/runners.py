@@ -24,8 +24,11 @@ load concurrently (image decodes overlap; PDF renders take turns on
 common.documents' PyMuPDF lock, per page).
 
 Each uploaded file may be a JPEG/PNG, a PDF of any page count (the total is
-capped at submit), a .txt, or a .docx — the bytes are stored verbatim and the
-kind is detected when the worker loads them.
+capped at submit), an SVG, a .txt, or a .docx — the bytes are stored verbatim
+(an SVG's external images already inlined at submit, when that is on) and the
+kind is detected when the worker loads them. A document entry's ``warnings``
+(what the submit noticed) are handed to the loader, which puts them ahead of
+its own on ``Document.warnings``.
 
 How ``run_reference`` treats the pipeline:
 
@@ -119,6 +122,7 @@ def _load(d: dict[str, Any]):
         keep_source=True,  # a native PDF's text hits need the file re-opened
         # The count read at submit; MAX_ITEMS is the ceiling it passed.
         max_pages=int(d.get("pages") or MAX_ITEMS),
+        warnings=d.get("warnings"),
     )
 
 
@@ -167,6 +171,9 @@ async def _build(payload: dict[str, Any], ref: Any, job_id: Optional[str]) -> di
     criteria = [CriterionInput.model_validate(c) for c in payload["criteria"]]
     supplied: dict[str, dict[str, Any]] = payload.get("supplied") or {}
     warnings = list(payload.get("warnings") or [])
+    # How the page was read (an SVG's references not drawn / not fetched)
+    # belongs on the reference too: it explains a blank where a logo was.
+    warnings.extend(w for w in doc.warnings if w not in warnings)
 
     run = _criteria_to_run(criteria, supplied)
     pipeline: Optional[dict] = None
@@ -238,6 +245,7 @@ def _load_page(d: dict[str, Any], page: int):
         d.get("content_type"),
         page=page,
         keep_source=True,  # a native PDF's text hits need the file re-opened
+        warnings=d.get("warnings"),
     )
 
 

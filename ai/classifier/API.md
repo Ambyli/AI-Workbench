@@ -1,10 +1,10 @@
 # Classifier API
 
 FastAPI service that assesses **documents** — JPEG/PNG photos, PDFs of any
-page count (native or scanned), plain text, and .docx, several per request —
-against a list of criteria, each answered by an OpenCV detector, deterministic
-text matching, the open-vocabulary detector, or the vision LLM. Every page of
-every document is one **item**; each criterion runs once per item and its
+page count (native or scanned), SVG drawings, plain text, and .docx, several
+per request — against a list of criteria, each answered by an OpenCV detector,
+deterministic text matching, the open-vocabulary detector, or the vision LLM.
+Every page of every document is one **item**; each criterion runs once per item and its
 per-item results are aggregated into one answer (see
 [§ Documents, pages and items](#documents-pages-and-items)). The LLM is Meta's
 Muse-Glimmer-30B served by the `muse-glimmer` vLLM container (`VISION_LLM_API`
@@ -53,6 +53,7 @@ ai/classifier/
                        builds it), list, read, files, edit, delete
   analysis/            the engine
     loading.py         bytes → Document: content type, EXIF, kind, URL + SSRF, every page
+                       (+ the submit-time SVG image inliner)
     ocr.py             the OCR engine singleton
     geometry.py        the ≤1000-px working image and its PageGeometry
     context.py         DocumentContext: what every unit on ONE item shares, read-only; the
@@ -264,21 +265,22 @@ any more. `CLASSIFIER_MAX_ITEMS` (20) is new, and
 Every upload is normalised by
 [`common.documents`](../../shared/common/src/common/documents/__init__.py) into
 **pages** that may carry an image, a text layer, or both — one page for a
-photo, a `.txt` or a `.docx`, every page for a PDF — and every page becomes
-one [item](#documents-pages-and-items). Criteria then run against whichever of
+photo, an SVG, a `.txt` or a `.docx`, every page for a PDF — and every page
+becomes one [item](#documents-pages-and-items). Criteria then run against whichever of
 those they need, so the same criteria list works across kinds.
 
 | Kind | Extensions | Detected by | Page image | Native text |
 |---|---|---|---|---|
 | `image` | `.jpg` `.jpeg` `.png` | magic bytes `FF D8 FF` / `89 50 4E 47 0D 0A 1A 0A` | yes (EXIF-rotated) | no — needs OCR |
 | `pdf` | `.pdf` | `%PDF-` in the first 1 KB | yes, every page rendered at `CLASSIFIER_PDF_RENDER_DPI` (150) | yes when the PDF is digital; a scan has none |
+| `svg` | `.svg` | UTF-8 XML whose first element is `<svg>` / `<prefix:svg>` (after any XML declaration, comments, DOCTYPE) — checked **before** `txt` | yes, rendered by MuPDF at `CLASSIFIER_PDF_RENDER_DPI`, scaled down to at most 25 000 000 pixels | yes — its `<text>` elements (never its markup) |
 | `txt` | `.txt` | decodes as UTF-8 (BOM ok), no NUL bytes, mostly printable | **no** | yes |
 | `docx` | `.docx` | ZIP magic `PK\x03\x04` containing `word/document.xml` | **no** | yes (paragraphs + table cells in document order) |
 
 **Detection is by content, never by filename or `Content-Type`.** A PDF
 uploaded as `image/png` still loads as a PDF. The declared content type of a
 multipart part is only used for an early allowlist reject (`image/jpeg`,
-`image/png`, `application/pdf`, `text/plain`, the .docx type,
+`image/png`, `image/svg+xml`, `application/pdf`, `text/plain`, the .docx type,
 `application/octet-stream`, and `application/msword` — the last one only so a
 legacy `.doc` reaches the magic-byte check and gets its specific "convert to
 .docx" 400). The kind is detected on the `POST /assess` request itself, per
@@ -294,10 +296,19 @@ the OCR engine's actual availability.
   submit — see [§ Items and the cap](#items-and-the-cap). A PDF's page count
   is read with PyMuPDF from the cross-reference table
   (`common.documents.pdf_page_count`), without rendering anything. Photos,
-  `.txt` and `.docx` are one page by nature (python-docx reads XML, not a
-  laid-out page).
+  SVGs, `.txt` and `.docx` are one page by nature (python-docx reads XML, not
+  a laid-out page; an SVG is one drawing).
 * **Legacy `.doc` is not supported.** An OLE2 file (`D0 CF 11 E0 A1 B1 1A E1`)
   is rejected with HTTP 400 telling the caller to convert to `.docx`.
+* **`.svgz` is not supported.** Any gzip data (`1F 8B`) is rejected with a
+  400 telling the caller to decompress it to `.svg`. Inflating it would mean
+  carrying a decompression-bomb guard for a format nobody needs to send.
+* **An SVG's external references are not drawn.** MuPDF fetches nothing an
+  SVG points at; each reference becomes a line in the result's
+  `documents[].warnings` — see [§ External references in SVG](#external-references-in-svg).
+* **An SVG declares its own size**, so its render is capped at 25 000 000
+  pixels (`common.documents.DEFAULT_MAX_RENDER_PIXELS`): past that the zoom
+  is scaled down to fit rather than refused. PDF pages are not capped.
 * **`.txt` and `.docx` have no page image**, so `cv` and `detector` units
   on them come back `status: "skipped"` and are excluded from the aggregate
   and the weighted score — "not applicable", not "failed" — the `llm` prompt
@@ -307,6 +318,61 @@ the OCR engine's actual availability.
 * **One candidate image per LLM prompt** — one unit is one item, so that is its page.
   A reference-guided call adds the example image(s) before it
   ([§ What the vision model sees](#what-the-vision-model-sees)).
+
+### External references in SVG
+
+An SVG can point outside itself — `<image href="https://cdn…/logo.png">`, an
+external `<use>`, CSS `@import` / `url()` / `@font-face`, a `<foreignObject>`,
+an external DTD or an XXE entity. **MuPDF, which renders it, fetches none of
+them**: no network request, no local file read, no entity expansion — only
+`data:` images are drawn. That is verified, not assumed:
+`shared/common/tests/test_documents_svg.py` loads an SVG carrying every one of
+those vectors against a local HTTP listener and a `file://` PNG on disk, and
+asserts zero requests and zero drawn pixels.
+
+So by default an external image is a **blank region**, and the document entry
+says so — one line per reference (`<image>`, `<feImage>`, `<use>`), capped at
+10 plus a `+N more` line:
+
+```json
+"warnings": ["external image not rendered: https://assets.acme-roofing.example/logo.png"]
+```
+
+**Opt-in fetching — `CLASSIFIER_SVG_FETCH_IMAGES=true`.** The submit then
+fetches each external `<image>` link itself and inlines it as a `data:` URI
+**before the job is queued** — never in the worker, which never touches the
+network for its input:
+
+| Bound | Knob (default) |
+|---|---|
+| Distinct URLs fetched per SVG; the rest are blanked with an `over the 10-image limit` warning | `CLASSIFIER_SVG_FETCH_MAX_IMAGES` (10) |
+| Bytes per image; a bigger body is abandoned mid-download | `CLASSIFIER_SVG_FETCH_MAX_BYTES` (5 000 000) |
+| Seconds per image, start to finish (every SVG's images in a request are fetched concurrently) | `CLASSIFIER_SVG_FETCH_TIMEOUT_S` (10) |
+
+Every URL goes through `common.net.fetch_url`: the same SSRF blocklist as a
+`type: "url"` document, http(s) only, **no redirects** (a 3xx could point past
+the check), and the body must be a PNG or JPEG by its bytes — not a nested SVG,
+not an HTML error page. A link that fails any of that is **blanked** (drawn as
+nothing, as before) and becomes a warning naming why; it never fails the
+request:
+
+```json
+"warnings": [
+  "external image not fetched (blocked: URL resolves to a blocked network address): https://intranet.example/logo.png",
+  "external image not fetched (not a PNG or JPEG image): https://cdn.example/page.html",
+  "external <use> reference not rendered: https://cdn.example/sprites.svg#star"
+]
+```
+
+`<use>` and `<feImage>` are never fetched, so they still get the "not
+rendered" line; no reference is reported twice. `POST /references` does the
+same at its submit, and the lines land on the reference's `record.warnings`.
+
+**Why it is off by default.** Every fetch is a **beacon**: it tells whoever
+wrote the SVG that — and when, and from which address — the document was
+processed. On customer documents that is a privacy cost a deployment should
+choose to pay, not inherit. `GET /document-kinds` reports the live setting
+under the svg kind's `external_images`.
 
 ### OCR
 
@@ -392,8 +458,8 @@ from the text.
 
 A request carries a **list of documents**, and every page of every document is
 one **item**, numbered globally in request order: document 0's pages first,
-then document 1's, and so on. A photo, a `.txt` and a `.docx` are one item
-each; a PDF is one item per page.
+then document 1's, and so on. A photo, an SVG, a `.txt` and a `.docx` are one
+item each; a PDF is one item per page.
 
 ```
 documents: [two.pdf (2 pages), a.png, notes.txt]   →   items 0, 1 (two.pdf p0, p1), 2 (a.png), 3 (notes.txt)
@@ -407,7 +473,7 @@ the criterion's answer, and the overall score is weighed from those answers.
 ### Items and the cap
 
 Items are counted **at submit**, from the bytes, without rendering: 1 per
-non-PDF document, the page count for a PDF. `CLASSIFIER_MAX_ITEMS` (default
+non-PDF document (an SVG included), the page count for a PDF. `CLASSIFIER_MAX_ITEMS` (default
 20) is **inclusive** — 20 items is accepted, 21 is a 400 that names every
 document's pages and the total against the limit:
 
@@ -551,7 +617,7 @@ sending neither.
 | `type` | `data` is | Notes |
 |---|---|---|
 | `base64` | the file, base64-encoded | |
-| `url` | an `http(s)` URL | Fetched **at submit** (the item cap needs the bytes — a PDF counts its pages), after the SSRF check (`common.net`: private, loopback and link-local addresses refused). 400 when blocked, 502 when the fetch fails |
+| `url` | an `http(s)` URL | Fetched **at submit** (the item cap needs the bytes — a PDF counts its pages), after the SSRF check (`common.net`: private, loopback and link-local addresses refused). Redirects are not followed. 400 when blocked, 502 when the fetch fails (a redirect included) |
 | `text` | the document text itself | Treated as a `.txt`, UTF-8; its filename is `inline.txt` |
 
 `filename` is optional and only recorded in `documents[i].filename`.
@@ -843,7 +909,7 @@ llm.
 
 ## References
 
-A **reference** is a stored, reviewed example: ONE page — a JPEG/PNG, or one
+A **reference** is a stored, reviewed example: ONE page — a JPEG/PNG, an SVG, or one
 page of a PDF — with the criteria asked of it, the answer each one should get
 (`score`, `verdict`, `reason`) and where on the page the feature is. An
 `/assess` that lists references shows the vision model those examples **beside
@@ -884,7 +950,7 @@ JSON, or multipart parsed into the same model (`api.reference_schemas.ReferenceR
 
 | Field | Description |
 |---|---|
-| `document` + `page` | The example page: base64, URL (SSRF-checked, fetched at submit) or — refused — inline text. A JPEG/PNG (page `0`), or page `page` (0-based, default 0) of a PDF. `.txt` / `.docx` are a 400: a reference is shown to the model as an image |
+| `document` + `page` | The example page: base64, URL (SSRF-checked, fetched at submit) or — refused — inline text. A JPEG/PNG or an SVG (page `0`), or page `page` (0-based, default 0) of a PDF. `.txt` / `.docx` are a 400: a reference is shown to the model as an image |
 | `from_job` + `from_job_item` | **Instead of a document**: save item `from_job_item` (default 0) of a completed `/assess` job — see below |
 | `criteria` | The same `CriterionInput` list as `/assess` (the same cross-criterion rules). Required with `document`; with `from_job`, omitted means the job's own. `options.reference` is refused here — a reference's own criteria are never guided |
 | `breakdown` | `{name: {score, verdict?, reason?}}` — the answer key. `verdict` is optional and must be the score's (`score 3` with `verdict PASS` is a 400). Not allowed on a `score: false` criterion. A name left out is classified by the creation job |
@@ -1112,6 +1178,7 @@ Inside `job.result`, `schema_version: 3` — here for a two-page invoice plus a
   "schema_version": 3,
   "documents": [
     {"index": 0, "filename": "invoice.pdf", "kind": "pdf", "pages": 2, "items": [0, 1],
+     "warnings": [],
      "document_info": {
        "content_type": "application/pdf", "size_bytes": 5683, "has_image": true,
        "native_text_chars": 640,
@@ -1123,7 +1190,7 @@ Inside `job.result`, `schema_version: 3` — here for a two-page invoice plus a
                                     "file": "text.d0.auto.json"}]},
        "llm_text_char_budget": 60000}},
     {"index": 1, "filename": "contract.txt", "kind": "txt", "pages": 1, "items": [2],
-     "document_info": {"…": "…"}}
+     "warnings": [], "document_info": {"…": "…"}}
   ],
   "items": [
     {"item": 0, "document": 0, "page": 0, "filename": "invoice.pdf",
@@ -1201,11 +1268,11 @@ Inside `job.result`, `schema_version: 3` — here for a two-page invoice plus a
 
 | Key | Meaning |
 |---|---|
-| `documents` | One entry per document, in request order: `index`, `filename`, `kind`, `pages`, `items` (its global item indices) and `document_info` — `content_type`, `size_bytes`, `has_image` (any page), `native_text_chars` (all pages), `ocr` (`layers`: one entry per item and text layer, each with its `item`; `document_layers`: the joined text of `scope: "document"` searches), `llm_text_char_budget` |
+| `documents` | One entry per document, in request order: `index`, `filename`, `kind`, `pages`, `items` (its global item indices), `warnings` (how the document was read that is worth knowing but is not an error — today an SVG's external references, not rendered or not fetched and why, see [§ External references in SVG](#external-references-in-svg); `[]` otherwise) and `document_info` — `content_type`, `size_bytes`, `has_image` (any page), `native_text_chars` (all pages), `ocr` (`layers`: one entry per item and text layer, each with its `item`; `document_layers`: the joined text of `scope: "document"` searches), `llm_text_char_budget` |
 | `items` | One entry per item: `item`, `document`, `page` (within its document), `filename`, and that item's own `overall_score` / `overall_verdict` / `complete`, from its per-criterion unit results (see [§ Scores per item](#scores-per-item-and-overall)) |
 | `assessment` | The overall score, verdict, `complete` and breakdown — weighed over the AGGREGATED criterion results — and `per_criterion_scores` |
 | `verdict` | `assessment.overall_verdict` |
-| `page_geometry` | One entry per item, each with its `item`; `page` equals `item` (the global index the layers are drawn on). An item with no page image (.txt / .docx) has `width` / `height` / `working_scale` / `pdf_points` `null` |
+| `page_geometry` | One entry per item, each with its `item`; `page` equals `item` (the global index the layers are drawn on). An item with no page image (.txt / .docx) has `width` / `height` / `working_scale` / `pdf_points` `null`; `pdf_points` is also `null` for an image or an SVG page |
 | `detector` | What the open-vocabulary detector did for the whole job (was `document_info.detector`) |
 | `artifacts` | The job's files — each [labelled](#file-labels) with `kind`, `format`, `item`, `document`, `criteria`, exactly as the manifest endpoint labels them — and, under `items`, each item's combined layer URLs (items with a page image only) |
 | `references` | `null` when the request listed none. Otherwise `{mode: explicit \| auto, requested, pool (auto: the ids fixed at submit; else null), pool_truncated, resolved (the ids used — auto: those some item's selection kept), inherited, criteria: {name: {matched, use, combine, position, examples: [{reference_id, criterion, polarity, expected}]}}, selection: [{item, status: ok \| failed \| skipped, matches: [{id, confidence, reason}], dropped, error, reason}], calls (guided scoring calls), selection_calls}`. Under `auto`, `criteria[*].examples` is empty — each item's picks are in `selection` and each unit's `detail.reference` |
@@ -2012,16 +2079,22 @@ its declaration does not list — so this endpoint describes exactly what
 
 ### `GET /document-kinds`
 
-What this container can accept and do right now: the four kinds (with
-`pdf.pages` saying every page is an item), the `.doc` rejection, the accepted
-inputs, the four `text_match_modes`, the live OCR status, the limits, and the
-regions block.
+What this container can accept and do right now: the five kinds (with
+`pdf.pages` saying every page is an item, and `svg.external_images` the live
+[SVG fetch](#external-references-in-svg) setting), the `.doc` and `.svgz`
+rejections, the accepted inputs, the four `text_match_modes`, the live OCR
+status, the limits, and the regions block.
 
 ```json
 {
   "kinds": [{"kind": "image", "pages": "1 — one item", "…": "…"},
-            {"kind": "pdf", "pages": "any — every page is one item; the request's total items are capped at CLASSIFIER_MAX_ITEMS (counted at submit, without rendering)", "…": "…"}, "…"],
-  "unsupported": [{"kind": "doc", "…": "…"}],
+            {"kind": "pdf", "pages": "any — every page is one item; the request's total items are capped at CLASSIFIER_MAX_ITEMS (counted at submit, without rendering)", "…": "…"},
+            {"kind": "svg", "extensions": [".svg"], "content_types": ["image/svg+xml"],
+             "pages": "1 — one item", "has_page_images": true, "native_text": true, "…": "…",
+             "external_images": {"fetch": false, "max_images": 10, "max_bytes": 5000000,
+                                 "timeout_s": 10.0, "accepted": ["image/png", "image/jpeg"],
+                                 "redirects": "not followed", "when": "…"}}, "…"],
+  "unsupported": [{"kind": "doc", "…": "…"}, {"kind": "svgz", "…": "…"}],
   "inputs": {"json": ["base64", "url", "text"],
              "json_shape": "documents: [{type, data, filename?}, ...] — or document: {...} for one; not both",
              "multipart": ["file (or legacy 'image'), repeatable", "text, repeatable"]},
@@ -2031,7 +2104,8 @@ regions block.
           "set_on": "each llm / text criterion's options.ocr",
           "text_layer_artifact": "text.p<item>.<key>.json per item and distinct setting; text.d<document>.<key>.json for a scope-document text search"},
   "limits": {"max_items": 20, "items": "every page of every document is one item; the cap is inclusive and counted at submit",
-             "pdf_render_dpi": 150, "llm_text_char_budget": 60000,
+             "pdf_render_dpi": 150, "svg_max_render_pixels": 25000000,
+             "llm_text_char_budget": 60000,
              "images_per_llm_prompt": 3, "max_concurrent_jobs": 4,
              "max_units_per_job": 6, "max_llm_calls": 6, "ocr_workers": 4},
   "regions": {

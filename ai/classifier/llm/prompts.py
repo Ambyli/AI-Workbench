@@ -185,7 +185,7 @@ def build_llm_prompt(
         name:           The criterion.
         hint:           "quality" | "presence" | "auto" — selects the rubric.
         document_text:  The text layer for this criterion ("" if none).
-        document_kind:  "image" | "pdf" | "txt" | "docx", for context.
+        document_kind:  "image" | "pdf" | "svg" | "txt" | "docx", for context.
         text_truncated: True when document_text was cut at the char budget.
         references:     Worked examples to show before the candidate.
 
@@ -539,7 +539,7 @@ def build_describe_prompt(image_b64: str, *, document_kind: str = "image") -> di
 
     Args:
         image_b64:     Base64 JPEG of the working page image — the one image.
-        document_kind: "image" | "pdf", for the opening sentence.
+        document_kind: "image" | "pdf" | "svg", for the opening sentence.
 
     Returns:
         A dict ready to POST to the vLLM /v1/chat/completions endpoint.
@@ -602,7 +602,7 @@ def build_reference_selection_prompt(
         image_b64:     Base64 JPEG of the candidate's working page image.
         catalogue:     The pool as catalogue text.
         criteria:      The names of the criteria the examples are for.
-        document_kind: "image" | "pdf", for the opening sentence.
+        document_kind: "image" | "pdf" | "svg", for the opening sentence.
 
     Returns:
         A dict ready to POST to the vLLM /v1/chat/completions endpoint.

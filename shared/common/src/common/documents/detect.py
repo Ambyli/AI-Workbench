@@ -11,13 +11,19 @@ Supported kinds and how they are recognised:
     pdf    — ``%PDF-`` (allowing the leading junk some producers emit)
     docx   — ZIP magic ``PK\\x03\\x04`` whose central directory contains
              ``word/document.xml`` (an .xlsx/.pptx ZIP is therefore rejected)
+    svg    — UTF-8 XML whose first element is ``<svg>`` (``svg.looks_like_svg``).
+             Checked BEFORE txt: an SVG decodes as text too, and calling it
+             txt would hand its markup to a text search and a vision model.
     txt    — decodes as UTF-8 (BOM tolerated), contains no NUL bytes, and is
              overwhelmingly printable
 
-Anything else raises ``UnsupportedDocumentError``. Legacy ``.doc`` (OLE2
-compound files, magic ``D0 CF 11 E0 A1 B1 1A E1``) gets its own message
-telling the caller to convert to .docx, because "unsupported file" is not a
-useful answer when the user is holding a Word document.
+Anything else raises ``UnsupportedDocumentError``. Two near-misses get their
+own message, because "unsupported file" is not a useful answer when the user
+is holding the file: legacy ``.doc`` (OLE2 compound files, magic
+``D0 CF 11 E0 A1 B1 1A E1``) is told to convert to .docx, and gzip data
+(magic ``1F 8B`` — a ``.svgz`` in practice) is told to decompress to .svg.
+``.svgz`` is refused rather than inflated on purpose: a few kilobytes of gzip
+can expand to gigabytes, and supporting it would buy little.
 
 Process flow position: called by ``loaders.load_document`` before dispatch;
 services also call it directly to reject an upload before queueing work.
@@ -29,7 +35,9 @@ import io
 import zipfile
 from typing import Literal, Optional
 
-DocumentKind = Literal["image", "pdf", "txt", "docx"]
+from .svg import looks_like_svg
+
+DocumentKind = Literal["image", "pdf", "txt", "docx", "svg"]
 
 # Leading signatures that identify a kind outright.
 JPEG_MAGIC = b"\xff\xd8\xff"
@@ -39,6 +47,9 @@ ZIP_MAGIC = b"PK\x03\x04"
 # OLE2 compound document — legacy .doc/.xls/.ppt. Detected only to produce a
 # better error than "unrecognised file".
 OLE_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+# gzip member header — what a .svgz is. Detected only to produce a better
+# error than "unrecognised file".
+GZIP_MAGIC = b"\x1f\x8b"
 
 # The member every .docx has; its absence means the ZIP is some other OOXML
 # (or just a zip archive) and we do not claim to read it.
@@ -60,6 +71,7 @@ CONTENT_TYPES: dict[str, str] = {
     "pdf": "application/pdf",
     "txt": "text/plain",
     "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "svg": "image/svg+xml",
 }
 
 # File extensions per kind, for introspection endpoints and error messages.
@@ -68,6 +80,7 @@ EXTENSIONS: dict[str, list[str]] = {
     "pdf": [".pdf"],
     "txt": [".txt"],
     "docx": [".docx"],
+    "svg": [".svg"],
 }
 
 
@@ -127,11 +140,11 @@ def detect_kind(
         content_type: Declared MIME type, if any (used in error text only).
 
     Returns:
-        "image" | "pdf" | "txt" | "docx".
+        "image" | "pdf" | "txt" | "docx" | "svg".
 
     Raises:
-        UnsupportedDocumentError: Empty input, a legacy .doc file, or bytes
-            that match none of the supported signatures.
+        UnsupportedDocumentError: Empty input, a legacy .doc file, gzip data
+            (a .svgz), or bytes that match none of the supported signatures.
     """
     if not raw:
         raise UnsupportedDocumentError("Empty file — nothing to classify.")
@@ -160,13 +173,26 @@ def detect_kind(
             "— .xlsx / .pptx / plain .zip uploads are rejected."
         )
 
+    if raw.startswith(GZIP_MAGIC):
+        # Almost always a .svgz. Inflating it here would make every caller
+        # carry a decompression-bomb guard for a format nobody needs to send.
+        raise UnsupportedDocumentError(
+            "gzip-compressed data (.svgz?) is not supported — decompress it to "
+            ".svg (`gunzip -c file.svgz > file.svg`) and upload that instead."
+        )
+
+    # Before txt: an SVG is UTF-8 text too, and the first element is what
+    # tells the two apart.
+    if looks_like_svg(raw):
+        return "svg"
+
     if _looks_like_text(raw):
         return "txt"
 
     hint = f" (filename={filename!r}, content_type={content_type!r})" if filename or content_type else ""
     raise UnsupportedDocumentError(
         "Unsupported file type"
-        f"{hint}. Supported: JPEG/PNG images, PDF, plain text (UTF-8), and "
+        f"{hint}. Supported: JPEG/PNG images, PDF, SVG, plain text (UTF-8), and "
         f".docx. First bytes were {raw[:8].hex()}."
     )
 

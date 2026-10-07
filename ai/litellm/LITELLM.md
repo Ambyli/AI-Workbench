@@ -47,24 +47,95 @@ The proxy configuration file supports a wide range of options for models, routin
 
 - **Without it there is no check at all.** A pass-through declared in the config file with no `auth` key registers with no auth dependency (LiteLLM v1.95.0, `_register_pass_through_endpoint`): a keyless request is forwarded. Only endpoints created in the Admin UI default to `auth=True`; config-file entries do not.
 - **With it, the master key and proxy-admin keys pass as before.**
-- **A virtual key additionally needs the route allow-listed** in its own metadata or its team's metadata, or it gets `403 Key/team not allowed to access passthrough route … Configure allowed_passthrough_routes on the team or key.` Matching is exact or prefix, so `/v1/classifier` covers `/v1/classifier/jobs/…`:
-
-  ```json
-  {"allowed_passthrough_routes": ["/v1/classifier", "/v1/detector"]}
-  ```
-
-  **Put it inside `metadata`, not as the top-level field.** `/key/generate` and `/key/update` also accept a top-level `allowed_passthrough_routes`, but that path calls `_premium_user_check` and returns `403 … only available for LiteLLM Enterprise users` on an unlicensed proxy; the same list written into `metadata` is stored as-is and is what the route check reads (`route_checks.py::check_passthrough_route_access`). Either way only a **proxy admin** (the master key) may set it. So: Admin UI → Virtual Keys (or Teams) → edit → the Metadata JSON box, not a dedicated "pass-through routes" field; or
-
-  ```bash
-  curl -X POST http://localhost:4001/key/update \
-    -H "Authorization: Bearer $DEFAULT_LITELLM_MASTER_KEY" -H "Content-Type: application/json" \
-    -d '{"key": "sk-…", "metadata": {"allowed_passthrough_routes": ["/v1/classifier"]}}'
-  ```
-
-  `metadata` in an update **replaces** the key's metadata rather than merging, so include whatever the key already has (`GET /key/info?key=sk-…`). A key with `allowed_routes` set must also allow the route there.
+- **A virtual key additionally needs the route allow-listed** in its own `metadata` or its team's, or it gets `403 Key/team not allowed to access passthrough route …`. How to grant it is below.
 - **Side effect:** an auth-enforced pass-through is added to LiteLLM's `openai_routes`, so its calls show up per key in spend logs and count against key / team budgets.
 
-Applying a change to this block is `make up litellm`.
+Applying a change to the `pass_through_endpoints` block is `make up litellm`. Granting a key access is not a config change — it is a database write, effective on the key's next request, no restart.
+
+#### Granting a virtual key access
+
+What the key needs is one entry in its metadata (or its team's metadata):
+
+```json
+{"allowed_passthrough_routes": ["/v1/classifier", "/v1/detector"]}
+```
+
+Rules that apply whichever way you set it:
+
+- **Use the paths exactly as mounted** — `/v1/classifier`, `/v1/detector`, `/v1/madlad`, `/v1/interceptor`, `/v1/roofix`, `/v1/sandbox`. Matching is exact or prefix, so `/v1/classifier` also covers `/v1/classifier/jobs/{id}/artifacts`; list only the services the key's owner actually needs.
+- **It goes inside `metadata`, never as the top-level `allowed_passthrough_routes` field.** `/key/generate`, `/key/update` and the team endpoints all accept a top-level field of that name, but on an unlicensed proxy it fails with `403 … only available for LiteLLM Enterprise users` (`_premium_user_check`). Written into `metadata` it is stored as-is, and `metadata` is exactly what the route check reads (`route_checks.py::check_passthrough_route_access`).
+- **Only a proxy admin may set it** — call these endpoints with `$DEFAULT_LITELLM_MASTER_KEY`. A non-admin caller gets `403 Only proxy admins can set metadata.allowed_passthrough_routes`.
+- **Key and team lists are not combined.** If the key's own `metadata` has a non-empty list, that list is used and the team's is ignored; the team's list applies only to keys with none of their own.
+- **`allowed_routes` still applies first.** A key with a non-empty `allowed_routes` must allow the route there too (most keys leave it empty).
+
+##### A new key
+
+Put the list in `metadata` on `/key/generate`:
+
+```bash
+curl -X POST http://localhost:4001/key/generate \
+  -H "Authorization: Bearer $DEFAULT_LITELLM_MASTER_KEY" -H "Content-Type: application/json" \
+  -d '{
+        "key_alias": "classifier-batch",
+        "models": ["muse-glimmer"],
+        "metadata": {"allowed_passthrough_routes": ["/v1/classifier"]}
+      }'
+```
+
+##### An existing key
+
+`POST /key/update` **replaces** `metadata` wholesale — anything you leave out (other routes, budgets-related flags, notes) is deleted. So read it first, add the list, and send the whole object back:
+
+```bash
+KEY=sk-...   # the virtual key to grant
+H=(-H "Authorization: Bearer $DEFAULT_LITELLM_MASTER_KEY" -H "Content-Type: application/json")
+
+# 1. current metadata (the response is {"key": ..., "info": {..., "metadata": {...}}})
+curl -s "http://localhost:4001/key/info?key=$KEY" "${H[@]}" | jq '.info.metadata'
+
+# 2. merge in the routes and write the whole object back
+META=$(curl -s "http://localhost:4001/key/info?key=$KEY" "${H[@]}" \
+  | jq -c '.info.metadata // {} | .allowed_passthrough_routes = ((.allowed_passthrough_routes // []) + ["/v1/classifier", "/v1/detector"] | unique)')
+curl -X POST http://localhost:4001/key/update "${H[@]}" \
+  -d "{\"key\": \"$KEY\", \"metadata\": $META}"
+```
+
+Without `jq`, do step 1, edit the JSON by hand, and send it in step 2's `-d` body.
+
+##### Every key in a team
+
+Set it once on the team instead; it covers every key in the team that has no list of its own. `PATCH /team/{team_id}` **merges** `metadata` (RFC 7386 — omitted keys are kept), so no read-modify-write is needed:
+
+```bash
+curl -X PATCH http://localhost:4001/team/<team_id> \
+  -H "Authorization: Bearer $DEFAULT_LITELLM_MASTER_KEY" -H "Content-Type: application/json" \
+  -d '{"metadata": {"allowed_passthrough_routes": ["/v1/classifier", "/v1/detector"]}}'
+```
+
+The merge replaces the *list* as a whole, so send the full set of routes, not just the new one. Avoid `POST /team/update` for this — like `/key/update` it replaces `metadata`.
+
+##### From the Admin UI
+
+Virtual Keys (or Teams) → the key → edit → the **Metadata** JSON box: add `"allowed_passthrough_routes": [...]` alongside whatever is already there and save. Do not use a dedicated "allowed pass-through routes" control if your UI version shows one — it sends the top-level field and fails with the Enterprise error. You must be signed in as a proxy admin.
+
+##### Check it
+
+```bash
+# 200 — the key reaches the service
+curl -s -o /dev/null -w '%{http_code}\n' http://localhost:4001/v1/classifier/health -H "Authorization: Bearer $KEY"
+```
+
+| Result | Meaning |
+|---|---|
+| `200` | Allowed. |
+| `401` | Missing, wrong, expired or blocked key — LiteLLM never got as far as the route check. |
+| `403 Key/team not allowed to access passthrough route …` | Key is valid but no matching entry in key or team `metadata.allowed_passthrough_routes` — check the spelling and leading `/v1/`, and that a key-level list isn't shadowing the team's. |
+| `403 Virtual key is not allowed to call this route. Only allowed to call routes: …` | The key's `allowed_routes` is set and doesn't include the route. |
+| `403 … only available for LiteLLM Enterprise users` (on the update call) | You sent the top-level field; move it into `metadata`. |
+
+##### Revoking
+
+Write the list back without the route (same read-modify-write as above for a key; `PATCH /team/{team_id}` with the shortened list for a team). To remove the entry entirely from a team, `PATCH` it with `{"metadata": {"allowed_passthrough_routes": null}}`.
 
 ### Chain aliases and the overflow hook
 

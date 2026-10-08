@@ -28,27 +28,27 @@ Endpoints:
     POST   /profiles/{name}/refresh       upload a .tgz of a captured Chrome profile
     DELETE /profiles/{name}               wipe one profile
     POST   /capture                       run one capture (see CaptureRequest); optional
-                                          ``screenshot`` block returns an image of the page too,
-                                          optional ``page_script`` / ``actions`` drive the page
-    POST   /screenshot                    navigate + screenshot only, no XHR patterns needed
+                                          ``page_script`` / ``actions`` drive the page, and a
+                                          ``screenshot`` action returns an image of it
     GET    /jobs                          snapshot of the port pool + running captures
     GET    /jobs/{job_id}                 detail on one in-flight capture (404 if not found)
     POST   /jobs/{job_id}/cancel          abort an in-flight capture, reclaim its slot
     /mcp                                  FastMCP HTTP transport — exposes tools:
-                                          capture_url, screenshot_url, list_profiles,
-                                          list_jobs, get_job
+                                          capture_url, list_profiles, list_jobs, get_job
 
-Screenshots ride on a SECOND CDP connection to the same tab (see
-``common.cdp_interceptor.screenshot``) taken after the capture window elapses
-and before Chrome quits, so the page has had the whole window to render. MCP
-tools return the image as an ``ImageContent`` block next to the JSON payload;
-the HTTP endpoints return it base64-encoded inside the JSON.
-
-``page_script`` / ``actions`` ride a second CDP connection too (see
-``common.cdp_interceptor.actions``): a helper thread started right after
+``page_script`` / ``actions`` ride a SECOND CDP connection to the same tab
+(see ``common.cdp_interceptor.actions``): a helper thread started right after
 launch waits for the page to be ready, then fills / clicks / evaluates, so the
 requests the page fires in response are captured through the normal path.
 ``stop_when_matched`` ends the window as soon as every pattern has a match.
+
+Screenshots are an action step (``{"type": "screenshot", …}``), taken on that
+same side connection wherever the step sits in ``actions`` — so a caller can
+see the page between steps. A failed one is recorded and the run continues.
+The image comes back on the step's ``actions_report`` entry: base64 inside the
+JSON over HTTP, an ``ImageContent`` block per step over MCP. A capture with no
+``url_patterns`` (allowed only when an action is a screenshot) ends as soon as
+the actions finish.
 
 ``login_actions`` run only if the tab hits a login wall: the capture session
 calls them (``InterceptorClient``'s ``on_login_wall`` hook) to fill and submit
@@ -93,7 +93,6 @@ from common.cdp_interceptor import (
     BrowserNotFoundError,
     Capture,
     InterceptorClient,
-    ScreenshotError,
     parse_actions,
 )
 from common.jobs import InMemoryRegistry
@@ -109,11 +108,9 @@ DEBUG_PORT_BASE = int(os.environ.get("INTERCEPTOR_DEBUG_PORT", "9224"))
 DEFAULT_CAPTURE_WINDOW_SECONDS = int(
     os.environ.get("INTERCEPTOR_CAPTURE_WINDOW_SECONDS", "20")
 )
-# How long POST /screenshot / screenshot_url leave the page to render before
-# the shot is taken. Chrome needs ~4-5s of that just to boot and navigate.
-DEFAULT_SCREENSHOT_WAIT_SECONDS = int(
-    os.environ.get("INTERCEPTOR_SCREENSHOT_WAIT_SECONDS", "15")
-)
+# Screenshot steps one request may carry. Each image is base64 in the HTTP
+# JSON and an image block in a model's context, so the count is the payload.
+MAX_SCREENSHOT_ACTIONS = 10
 # Upper bound on one login_actions run (gate + every step) when a request
 # omits login_actions_timeout_seconds.
 DEFAULT_LOGIN_ACTIONS_TIMEOUT_SECONDS = 60
@@ -223,60 +220,6 @@ app = FastAPI(title="Interceptor API", lifespan=lifespan)
 app.include_router(build_router(_registry, include_cancel=True))
 
 
-# ── Request / response models ───────────────────────────────────────────────
-ScreenshotFormat = Literal["jpeg", "png", "webp"]
-
-
-class ScreenshotOptions(BaseModel):
-    """How to render the page image. Attached to ``CaptureRequest.screenshot``
-    (opt-in) and flattened onto ``ScreenshotRequest``."""
-
-    format: ScreenshotFormat = Field(
-        default="jpeg",
-        description="Image encoding. jpeg (default) is ~10x smaller than png "
-        "for a typical page; png is lossless; webp is smallest but less "
-        "universally decodable.",
-    )
-    quality: int = Field(
-        default=80, ge=1, le=100,
-        description="jpeg/webp compression quality. Ignored for png.",
-    )
-    full_page: bool = Field(
-        default=False,
-        description="Capture the whole scrollable document (clamped to "
-        "max_height) instead of just the 1920x1080 viewport.",
-    )
-    scale: float = Field(
-        default=1.0, gt=0, le=2.0,
-        description="Output scale factor. 0.5 halves both axes and roughly "
-        "quarters the payload — use it when the image is going into an LLM "
-        "context and pixel-level detail isn't needed.",
-    )
-    max_height: int = Field(
-        default=8000, ge=100, le=16384,
-        description="full_page only: cap on captured document height in CSS "
-        "px. Chrome refuses clips beyond 16384.",
-    )
-
-
-class ScreenshotResult(BaseModel):
-    """One captured image. ``data_base64`` is omitted from MCP payloads (the
-    image travels as an ImageContent block instead) but always present on the
-    HTTP responses."""
-
-    format: ScreenshotFormat
-    mime_type: str
-    width: int
-    height: int
-    full_page: bool
-    bytes: int
-    page_url: str = Field(
-        description="Tab URL at capture time — reflects any redirects that "
-        "happened after navigation (login bounce, canonical URL, etc.)."
-    )
-    data_base64: Optional[str] = None
-
-
 # ── Browser actions ─────────────────────────────────────────────────────────
 # One model per step type, discriminated on ``type``, so OpenAPI documents each
 # shape and a malformed step is a field-level 422. The models mirror
@@ -374,14 +317,59 @@ class EvaluateAction(_ActionModel):
     timeout_s: float = Field(default=15.0, gt=0, le=600)
 
 
+ScreenshotFormat = Literal["jpeg", "png", "webp"]
+
+
+class ScreenshotAction(_ActionModel):
+    """Capture an image of the page as it is at this point in the run — after
+    a best-effort settle (~5 s) for a step that navigated. The image lands on
+    this step's `actions_report` entry as `value` ({format, mime_type, width,
+    height, full_page, bytes, page_url, data_base64}). A failed screenshot is
+    recorded (ok=false) and the run continues."""
+    type: Literal["screenshot"]
+    format: ScreenshotFormat = Field(
+        default="jpeg",
+        description="Image encoding. jpeg (default) is ~10x smaller than png "
+        "for a typical page; png is lossless; webp is smallest but less "
+        "universally decodable.",
+    )
+    quality: int = Field(
+        default=80, ge=1, le=100,
+        description="jpeg/webp compression quality. Ignored for png.",
+    )
+    full_page: bool = Field(
+        default=False,
+        description="Capture the whole scrollable document (clamped to "
+        "max_height) instead of just the 1920x1080 viewport.",
+    )
+    scale: float = Field(
+        default=1.0, gt=0, le=2.0,
+        description="Output scale factor. 0.5 halves both axes and roughly "
+        "quarters the payload — use it when the image is going into an LLM "
+        "context and pixel-level detail isn't needed.",
+    )
+    max_height: int = Field(
+        default=8000, ge=100, le=16384,
+        description="full_page only: cap on captured document height in CSS "
+        "px. Chrome refuses clips beyond 16384.",
+    )
+    timeout_s: float = Field(
+        default=30.0, gt=0, le=600,
+        description="Budget for the whole step — settle, layout read and the "
+        "capture itself (a tall full-page clip can take several seconds).",
+    )
+
+
 ActionModel = Annotated[
     Union[WaitForAction, FillAction, ClickAction, PressAction, SelectAction,
-          WaitAction, EvaluateAction],
+          WaitAction, EvaluateAction, ScreenshotAction],
     Field(discriminator="type"),
 ]
 
 # login_actions: the same steps minus `evaluate` — a script on the login page
-# could read the password field back into the report.
+# could read the password field back into the report — and minus `screenshot`:
+# an image of the login form would put the username into the response, and
+# the login design keeps credentials out of every response.
 LoginActionModel = Annotated[
     Union[WaitForAction, FillAction, ClickAction, PressAction, SelectAction,
           WaitAction],
@@ -403,7 +391,9 @@ class ActionResultModel(BaseModel):
     value: Any = Field(
         default=None,
         description="evaluate / page_script: the script's return value. DOM "
-        "steps: details of the element acted on.",
+        "steps: details of the element acted on. screenshot: {format, "
+        "mime_type, width, height, full_page, bytes, page_url, data_base64} "
+        "(page_url is where the tab was at that step).",
     )
 
 
@@ -412,14 +402,16 @@ class ActionsReportModel(BaseModel):
     actions: list[ActionResultModel] = Field(default_factory=list)
     aborted_reason: Optional[str] = Field(
         default=None,
-        description="null when every step ran and succeeded. Otherwise e.g. "
+        description="null when every step ran (a failed screenshot step does "
+        "not stop the run, so check each step's `ok`). Otherwise e.g. "
         "'not ready: login page …', 'cancelled', 'actions[2] (click) failed: …', "
         "'capture window ended before actions finished'.",
     )
 
 
 _LOGIN_ACTIONS_DESC = (
-    "Steps (wait_for / fill / click / press / select / wait — no evaluate) run "
+    "Steps (wait_for / fill / click / press / select / wait — no evaluate or "
+    "screenshot) run "
     "ONLY if the tab lands on a login wall (`login_url_patterns`), once per "
     "capture, to sign in; the session then continues to `url` as it would "
     "after a human login. A fill `value` may reference the profile's stored "
@@ -445,14 +437,8 @@ class CaptureRequest(BaseModel):
         description="Regex patterns matched against every JSON XHR/fetch URL. "
         "Any capture whose URL matches at least one pattern is returned, "
         "bucketed by the first pattern that matched it. May be empty ONLY "
-        "when `screenshot` is set (screenshot-only navigation).",
-    )
-    screenshot: Optional[ScreenshotOptions] = Field(
-        default=None,
-        description="If set, take a screenshot of the page after the capture "
-        "window elapses (just before Chrome quits) and return it as "
-        "`screenshot` on the response. A failed screenshot never fails the "
-        "capture — it lands in `screenshot_error` instead.",
+        "when `actions` has a `screenshot` step (a screenshot-only capture, "
+        "whose window ends as soon as the actions finish).",
     )
     profile: str = Field(
         ...,
@@ -495,9 +481,12 @@ class CaptureRequest(BaseModel):
     actions: list[ActionModel] = Field(
         default_factory=list,
         description="Ordered browser steps (wait_for / fill / click / press / "
-        "select / wait / evaluate) run once the page is ready, so the page's "
-        "own code fires the requests `url_patterns` is waiting for. Stops at "
-        "the first failed step. See INTERCEPTOR.md § Page scripts and actions.",
+        "select / wait / evaluate / screenshot) run once the page is ready, so "
+        "the page's own code fires the requests `url_patterns` is waiting for. "
+        "Stops at the first failed step — except a failed `screenshot`, which "
+        f"is recorded and the run continues. At most {MAX_SCREENSHOT_ACTIONS} "
+        "screenshot steps. See INTERCEPTOR.md § Page scripts and actions and "
+        "§ Screenshots.",
     )
     actions_ready_timeout_seconds: Optional[int] = Field(
         default=None,
@@ -526,10 +515,16 @@ class CaptureRequest(BaseModel):
 
     @model_validator(mode="after")
     def _patterns_or_screenshot(self) -> "CaptureRequest":
-        if not self.url_patterns and self.screenshot is None:
+        shots = sum(1 for a in self.actions if a.type == "screenshot")
+        if not self.url_patterns and not shots:
             raise ValueError(
-                "url_patterns must contain at least one pattern unless "
-                "`screenshot` is requested"
+                "url_patterns must contain at least one pattern unless `actions` "
+                'has a screenshot step ({"type": "screenshot"}) — a screenshot-only capture'
+            )
+        if shots > MAX_SCREENSHOT_ACTIONS:
+            raise ValueError(
+                f"at most {MAX_SCREENSHOT_ACTIONS} screenshot steps per request "
+                f"(got {shots}) — each image is returned in the response"
             )
         if self.stop_when_matched and not self.url_patterns:
             raise ValueError("stop_when_matched needs at least one url_pattern to match")
@@ -554,11 +549,10 @@ class CaptureResponse(BaseModel):
     error: Optional[str]
     matches: dict[str, list[CaptureMatch]]
     captured_urls: list[str]
-    screenshot: Optional[ScreenshotResult] = None
-    screenshot_error: Optional[str] = None
     actions_report: Optional[ActionsReportModel] = Field(
         default=None,
-        description="What page_script / actions did — null unless requested.",
+        description="What page_script / actions did — null unless requested. "
+        "Screenshot images are on their steps' `value`.",
     )
     login_actions_report: Optional[ActionsReportModel] = Field(
         default=None,
@@ -567,70 +561,9 @@ class CaptureResponse(BaseModel):
     )
     ended_early: bool = Field(
         default=False,
-        description="True only when stop_when_matched ended the window before "
-        "capture_window_seconds elapsed.",
-    )
-
-
-class ScreenshotRequest(ScreenshotOptions):
-    """``POST /screenshot`` body — navigate under a profile and return an image.
-    No XHR patterns; inherits the render knobs from ``ScreenshotOptions``."""
-
-    url: str = Field(..., description="URL to navigate to")
-    profile: str = Field(
-        ...,
-        description="Named Chrome profile under INTERCEPTOR_PROFILES_ROOT.",
-    )
-    wait_seconds: int = Field(
-        default=DEFAULT_SCREENSHOT_WAIT_SECONDS,
-        ge=1,
-        le=600,
-        description="Seconds to let the page load before the shot is taken. "
-        "Chrome spends the first ~4-5s booting and navigating, so values "
-        "under 8 mostly capture blank or half-rendered pages.",
-    )
-    login_timeout: int = Field(default=300, ge=1)
-    login_url_patterns: list[str] = Field(
-        default_factory=lambda: ["login", "signin", "/auth"],
-        description="Same semantics as CaptureRequest.login_url_patterns.",
-    )
-    login_actions: list[LoginActionModel] = Field(
-        default_factory=list,
-        description="Same semantics as CaptureRequest.login_actions — "
-        "`wait_seconds` must cover the login, the redirect and the page load.",
-    )
-    login_actions_timeout_seconds: Optional[int] = Field(
-        default=None, ge=1, le=600,
-        description="Same semantics as CaptureRequest.login_actions_timeout_seconds.",
-    )
-
-    @model_validator(mode="after")
-    def _login_actions_need_detection(self) -> "ScreenshotRequest":
-        # Same rule as CaptureRequest — checked here too so it is a 422, not
-        # a 500 from building the CaptureRequest inside _run_screenshot.
-        if self.login_actions and not self.login_url_patterns:
-            raise ValueError(
-                "login_actions run only when a login wall is detected — they need "
-                "login_url_patterns (an empty list disables detection)"
-            )
-        return self
-
-
-class ScreenshotResponse(BaseModel):
-    job_id: str
-    url: str
-    status: str = Field(
-        description="Interceptor capture status. 'loading' is normal for a "
-        "page that fired no JSON XHRs (static pages) — it does not mean the "
-        "screenshot failed; check `screenshot` / `screenshot_error`."
-    )
-    login_wall: bool
-    error: Optional[str]
-    screenshot: Optional[ScreenshotResult]
-    screenshot_error: Optional[str]
-    login_actions_report: Optional[ActionsReportModel] = Field(
-        default=None,
-        description="Same as CaptureResponse.login_actions_report.",
+        description="True only when the window ended before "
+        "capture_window_seconds elapsed: stop_when_matched saw every pattern "
+        "matched, or — with no url_patterns — the actions finished.",
     )
 
 
@@ -907,7 +840,10 @@ def _run_capture(req: CaptureRequest) -> CaptureResponse:
         # ── Capture window ─────────────────────────────────────────────────
         # Short-poll instead of one long wait so the window can end on cancel,
         # on the deadline, or — with stop_when_matched — as soon as the
-        # actions are done and every pattern bucket has a match.
+        # actions are done and every pattern bucket has a match. With no
+        # patterns at all (a screenshot-only capture) there is nothing to
+        # wait for once the actions are done: all([]) is True, so the same
+        # check ends the window then.
         deadline = time.monotonic() + req.capture_window_seconds
         cancelled = False
         ended_early = False
@@ -918,14 +854,18 @@ def _run_capture(req: CaptureRequest) -> CaptureResponse:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            if req.stop_when_matched and (
+            if (req.stop_when_matched or not compiled) and (
                 actions_thread is None or not actions_thread.is_alive()
             ):
                 with results_lock:
                     all_matched = all(matches[p] for p, _ in compiled)
                 if all_matched:
                     ended_early = True
-                    job.log("stop_when_matched — every pattern matched, ending the window early")
+                    job.log(
+                        "stop_when_matched — every pattern matched, ending the window early"
+                        if compiled else
+                        "no url_patterns — actions finished, ending the window early"
+                    )
                     break
             job.wait_or_cancel(timeout=min(0.25, remaining))
         window_over.set()
@@ -945,51 +885,19 @@ def _run_capture(req: CaptureRequest) -> CaptureResponse:
                 report.aborted_reason = "capture window ended before actions finished"
             actions_report = ActionsReportModel.model_validate(report.to_dict())
             failed = next((r for r in report.actions if not r.ok), None)
+            # Counts only — a screenshot's base64 never goes near the log.
+            shots = [r for r in report.actions
+                     if r.type == "screenshot" and r.error != "skipped"]
+            shots_ok = sum(1 for r in shots if r.ok)
             job.log(
                 f"actions  ran={sum(1 for r in report.actions if r.error != 'skipped')}"
                 f"/{len(report.actions)}  aborted={report.aborted_reason or '-'}"
                 + (f"  first_failure=[{failed.index}] {failed.type}" if failed else "")
+                + (f"  screenshots={shots_ok} taken, {len(shots) - shots_ok} failed"
+                   if shots else "")
             )
 
         state = client.get_state()
-
-        # Screenshot BEFORE quitting Chrome. Runs on its own CDP socket so the
-        # worker's session is untouched. Failure is reported, never raised —
-        # the XHR captures are still valid even if the image isn't.
-        shot_result: Optional[ScreenshotResult] = None
-        shot_error: Optional[str] = None
-        if req.screenshot is not None and not cancelled:
-            job.set_phase("screenshot")
-            opts = req.screenshot
-            try:
-                shot = client.screenshot(
-                    format=opts.format,
-                    quality=opts.quality,
-                    full_page=opts.full_page,
-                    scale=opts.scale,
-                    max_height=opts.max_height,
-                )
-                shot_result = ScreenshotResult(
-                    format=shot.format,
-                    mime_type=shot.mime_type,
-                    width=shot.width,
-                    height=shot.height,
-                    full_page=shot.full_page,
-                    bytes=len(shot.data),
-                    page_url=shot.page_url,
-                    data_base64=shot.to_base64(),
-                )
-                job.log(
-                    f"screenshot  {shot.format}  {shot.width}x{shot.height}  "
-                    f"full_page={shot.full_page}  bytes={len(shot.data)}  "
-                    f"page_url={shot.page_url[:110]}"
-                )
-            except ScreenshotError as e:
-                shot_error = str(e)
-                job.log(f"screenshot failed: {e}")
-            except Exception as e:  # never let an image kill a capture
-                shot_error = f"{type(e).__name__}: {e}"
-                job.log(f"screenshot failed (unexpected): {shot_error}")
 
         if cancelled:
             job.log("cancelled — aborting capture and reclaiming slot")
@@ -1032,7 +940,6 @@ def _run_capture(req: CaptureRequest) -> CaptureResponse:
             f"done  status={status}  login_wall={login_wall}  "
             f"seen_urls={len(urls_snapshot)}  "
             f"matched={ {k: len(v) for k, v in matches_snapshot.items()} }  "
-            f"screenshot={'yes' if shot_result else ('failed' if shot_error else 'no')}  "
             f"ended_early={ended_early}"
         )
 
@@ -1044,8 +951,6 @@ def _run_capture(req: CaptureRequest) -> CaptureResponse:
             error=state.error,
             matches=matches_snapshot,
             captured_urls=urls_snapshot,
-            screenshot=shot_result,
-            screenshot_error=shot_error,
             actions_report=actions_report,
             login_actions_report=login_actions_report,
             ended_early=ended_early,
@@ -1076,47 +981,6 @@ def capture(req: CaptureRequest) -> CaptureResponse:
     return _run_capture(req)
 
 
-def _run_screenshot(req: ScreenshotRequest) -> ScreenshotResponse:
-    """Screenshot-only navigation: a capture with no URL patterns whose window
-    is ``wait_seconds``. Reuses ``_run_capture`` so the port pool, profile
-    fast/slow path, job registry, and cancel semantics are all identical."""
-    cap = CaptureRequest(
-        url=req.url,
-        url_patterns=[],
-        profile=req.profile,
-        capture_window_seconds=req.wait_seconds,
-        keep_open=False,
-        login_timeout=req.login_timeout,
-        debug_logging=False,
-        login_url_patterns=req.login_url_patterns,
-        login_actions=req.login_actions,
-        login_actions_timeout_seconds=req.login_actions_timeout_seconds,
-        screenshot=ScreenshotOptions(
-            format=req.format,
-            quality=req.quality,
-            full_page=req.full_page,
-            scale=req.scale,
-            max_height=req.max_height,
-        ),
-    )
-    res = _run_capture(cap)
-    return ScreenshotResponse(
-        job_id=res.job_id,
-        url=res.url,
-        status=res.status,
-        login_wall=res.login_wall,
-        error=res.error,
-        screenshot=res.screenshot,
-        screenshot_error=res.screenshot_error,
-        login_actions_report=res.login_actions_report,
-    )
-
-
-@app.post("/screenshot", response_model=ScreenshotResponse)
-def screenshot(req: ScreenshotRequest) -> ScreenshotResponse:
-    return _run_screenshot(req)
-
-
 # ── MCP tools ───────────────────────────────────────────────────────────────
 # Model-invokable tools return dicts and NEVER raise — errors surface inside
 # the payload so the LLM can act on them. Operator-only knobs like
@@ -1125,31 +989,42 @@ def screenshot(req: ScreenshotRequest) -> ScreenshotResponse:
 # to) are deliberately omitted from the MCP surface; they remain available on
 # the HTTP ``POST /capture`` request for operator use.
 #
-# Screenshots: the image is delivered as an MCP ``ImageContent`` block (so a
-# multimodal model can look at it) alongside the JSON payload, which carries
-# only the image metadata — the base64 is NOT duplicated into the text.
+# Screenshots: each screenshot step's image is delivered as an MCP
+# ``ImageContent`` block (so a multimodal model can look at it), preceded by a
+# short text label naming the step, in step order after the JSON payload. The
+# JSON keeps each step's image metadata — the base64 is NOT duplicated into
+# the text.
 
 
-def _screenshot_tool_result(payload: dict) -> ToolResult:
-    """Build the MCP result for a response that may carry a screenshot.
+def _tool_result(payload: dict) -> ToolResult:
+    """Build the MCP result for a ``CaptureResponse.model_dump()`` (or the
+    error payload shaped like one).
 
-    ``payload`` is a ``model_dump()`` of CaptureResponse / ScreenshotResponse.
-    If it holds a screenshot, the base64 is pulled out of the JSON and emitted
-    as a separate ImageContent block; the JSON keeps width/height/format/etc.
+    Every screenshot step in ``actions_report.actions`` that carries
+    ``data_base64`` has it pulled out of the JSON and emitted as a
+    ``TextContent`` label (``actions[3] screenshot — <page_url>, WxH``)
+    followed by an ``ImageContent`` block, in step order after the JSON.
     """
-    content: list = []
-    shot = payload.get("screenshot")
-    image_block = None
-    if isinstance(shot, dict) and shot.get("data_base64"):
+    images: list = []
+    report = payload.get("actions_report")
+    if isinstance(report, dict) and isinstance(report.get("actions"), list):
         import base64 as _b64
 
-        raw = _b64.b64decode(shot["data_base64"])
-        image_block = McpImage(data=raw, format=shot["format"]).to_image_content()
-        shot = {k: v for k, v in shot.items() if k != "data_base64"}
-        payload = {**payload, "screenshot": shot}
-    content.append(TextContent(type="text", text=json.dumps(payload, default=str)))
-    if image_block is not None:
-        content.append(image_block)
+        steps = []
+        for step in report["actions"]:
+            shot = step.get("value")
+            if step.get("type") == "screenshot" and isinstance(shot, dict) and shot.get("data_base64"):
+                raw = _b64.b64decode(shot["data_base64"])
+                images.append(TextContent(
+                    type="text",
+                    text=f"actions[{step.get('index')}] screenshot — {shot.get('page_url') or '?'}, "
+                    f"{shot.get('width')}x{shot.get('height')}",
+                ))
+                images.append(McpImage(data=raw, format=shot.get("format", "jpeg")).to_image_content())
+                step = {**step, "value": {k: v for k, v in shot.items() if k != "data_base64"}}
+            steps.append(step)
+        payload = {**payload, "actions_report": {**report, "actions": steps}}
+    content: list = [TextContent(type="text", text=json.dumps(payload, default=str)), *images]
     return ToolResult(content=content, structured_content=payload)
 
 
@@ -1177,15 +1052,11 @@ def _login_patterns_kw(patterns: Optional[list[str]]) -> dict:
 @mcp.tool()
 def capture_url(
     url: str,
-    url_patterns: list[str],
     profile: str,
+    url_patterns: Optional[list[str]] = None,
     capture_window_seconds: int = DEFAULT_CAPTURE_WINDOW_SECONDS,
     login_timeout: int = 300,
     max_matches_per_pattern: Optional[int] = None,
-    screenshot: bool = False,
-    screenshot_full_page: bool = False,
-    screenshot_format: ScreenshotFormat = "jpeg",
-    screenshot_scale: float = 1.0,
     page_script: Optional[str] = None,
     actions: Optional[list[dict]] = None,
     stop_when_matched: bool = False,
@@ -1194,35 +1065,29 @@ def capture_url(
     login_actions: Optional[list[dict]] = None,
 ) -> ToolResult:
     """Load a URL under a named Chrome profile and return JSON XHR/fetch bodies
-    whose URLs match any of the given regex patterns — optionally with a
-    screenshot of the rendered page, and optionally after driving the page
-    (fill a form, click a button) so it fires the request you want.
+    whose URLs match any of the given regex patterns — optionally after
+    driving the page (fill a form, click a button) so it fires the request you
+    want, and optionally with screenshots of the page taken between steps.
+
+    To just SEE a page, call it with no ``url_patterns`` and
+    ``actions=[{"type": "screenshot", "scale": 0.5}]`` — it returns as soon
+    as the image is taken.
 
     Args:
         url: Fully-qualified URL to navigate to (https://…).
-        url_patterns: List of regex patterns. Each intercepted XHR/fetch URL
-            is matched with ``re.search`` against every pattern; the response
-            body lands in the bucket of the first pattern it matches. May be
-            empty only when ``screenshot`` is true (use ``screenshot_url`` for
-            that case — it's the same thing with clearer defaults).
         profile: Named profile under ``INTERCEPTOR_PROFILES_ROOT``. Discover
             available names via the ``list_profiles`` tool. Profiles are
             uploaded out-of-band by an operator (see INTERCEPTOR.md).
+        url_patterns: List of regex patterns. Each intercepted XHR/fetch URL
+            is matched with ``re.search`` against every pattern; the response
+            body lands in the bucket of the first pattern it matches. May be
+            omitted only when ``actions`` has a ``screenshot`` step — then the
+            call ends as soon as the actions finish.
         capture_window_seconds: How long to run Chrome to collect captures
             (default 20). Increase if the page fires XHRs late.
         login_timeout: Max seconds to wait for a login redirect to resolve
             before returning ``login_wall: true``.
         max_matches_per_pattern: Cap on how many bodies to return per pattern.
-        screenshot: Also capture an image of the page at the end of the
-            window, returned as an image content block plus ``screenshot``
-            metadata ({format, mime_type, width, height, full_page, bytes,
-            page_url}) in the JSON. On failure ``screenshot_error`` is set and
-            the XHR results are still returned.
-        screenshot_full_page: Whole scrollable document (max 8000px tall)
-            instead of the 1920x1080 viewport.
-        screenshot_format: "jpeg" (default, small), "png" (lossless), "webp".
-        screenshot_scale: Output scale, 0 < scale <= 2. 0.5 quarters the
-            payload; use it when detail isn't needed.
         page_script: JavaScript run in the page once it has loaded, before
             any ``actions``. It is evaluated as an EXPRESSION; for several
             statements use an async IIFE, ``(async () => { ...; return x;
@@ -1241,7 +1106,8 @@ def capture_url(
             ``{"type": "press", "key": "Enter"|"Tab"|"Escape"|…|<one char>, "selector"?, "text"?}``,
             ``{"type": "select", "selector", "value", "text"?}`` (native <select> only),
             ``{"type": "wait", "seconds"}``,
-            ``{"type": "evaluate", "script", "timeout_s"?}``.
+            ``{"type": "evaluate", "script", "timeout_s"?}``,
+            ``{"type": "screenshot", "format"?: "jpeg"|"png"|"webp", "quality"?: 1-100, "full_page"?: false, "scale"?: 0-2, "max_height"?: 100-16384, "timeout_s"?: 30}``.
             ``selector`` is CSS matched in the document AND inside every open
             shadow root (Salesforce Lightning / web components), each tree
             separately — so a descendant combinator never crosses into a
@@ -1253,6 +1119,17 @@ def capture_url(
             trusted keyboard input; ``click`` sends a real mouse click at the
             element's centre. ``timeout_s`` defaults to 15. Steps stop at the
             first failure — read ``actions_report`` to see which and why.
+            ``screenshot`` captures the page as it is at that point (after a
+            short settle if the previous step navigated); put one after a
+            step to see what it did. Each comes back as an image block, in
+            step order, labelled ``actions[i] screenshot — <page_url>, WxH``,
+            and its metadata ({format, mime_type, width, height, full_page,
+            bytes, page_url}) is the step's ``value``. A failed screenshot is
+            recorded (``ok: false``) and the steps after it still run. At most
+            10 per call; prefer ``"scale": 0.5`` — it quarters the image and
+            is plenty to read a page. ``full_page`` captures the whole
+            document (up to ``max_height`` px) instead of the 1920x1080
+            viewport.
         stop_when_matched: End as soon as every pattern has at least one
             match and the actions have finished, instead of waiting out
             ``capture_window_seconds``. A click finishes when the mouse is
@@ -1276,7 +1153,8 @@ def capture_url(
         login_actions: Steps that run ONLY if the page redirects to a login
             wall (``login_url_patterns``), to sign in with the profile's
             stored service account; the capture then continues to ``url``.
-            Same step objects as ``actions`` except ``evaluate``. For the
+            Same step objects as ``actions`` except ``evaluate`` and
+            ``screenshot``. For the
             credentials write REFERENCES — ``"value": "${username}"`` and
             ``"value": "${password}"`` — which the server fills in from its
             own credentials file; ``list_profiles`` shows the reference names
@@ -1296,30 +1174,22 @@ def capture_url(
         JSON with keys ``job_id``, ``url``, ``status``, ``login_wall``,
         ``error``, ``matches`` (pattern → list of {url, body}),
         ``captured_urls`` (every JSON XHR/fetch URL seen, for diagnostics),
-        ``screenshot``, ``screenshot_error``, ``actions_report`` ({page_script,
-        actions: [{index, type, ok, elapsed_ms, error, value}],
-        aborted_reason}, or null), ``login_actions_report`` (same shape; null
-        unless ``login_actions`` were sent and a login wall was hit) and
-        ``ended_early`` — followed by the image block when a screenshot was
-        taken.
+        ``actions_report`` ({page_script, actions: [{index, type, ok,
+        elapsed_ms, error, value}], aborted_reason}, or null),
+        ``login_actions_report`` (same shape; null unless ``login_actions``
+        were sent and a login wall was hit) and ``ended_early`` — followed by
+        a text label + image block per screenshot step that succeeded.
     """
     try:
         req = CaptureRequest(
             url=url,
-            url_patterns=url_patterns,
+            url_patterns=url_patterns or [],
             profile=profile,
             capture_window_seconds=capture_window_seconds,
             keep_open=False,
             login_timeout=login_timeout,
             max_matches_per_pattern=max_matches_per_pattern,
             debug_logging=False,
-            screenshot=ScreenshotOptions(
-                format=screenshot_format,
-                full_page=screenshot_full_page,
-                scale=screenshot_scale,
-            )
-            if screenshot
-            else None,
             page_script=page_script,
             actions=actions or [],
             stop_when_matched=stop_when_matched,
@@ -1327,111 +1197,20 @@ def capture_url(
             login_actions=login_actions or [],
             **_login_patterns_kw(login_url_patterns),
         )
-        return _screenshot_tool_result(_run_capture(req).model_dump())
+        return _tool_result(_run_capture(req).model_dump())
     except (HTTPException, ValidationError) as e:
-        return _screenshot_tool_result(
+        return _tool_result(
             {
                 "job_id": "",
                 "url": url,
                 "status": "error",
                 "login_wall": False,
                 "error": _http_error_text(e),
-                "matches": {p: [] for p in url_patterns},
+                "matches": {p: [] for p in url_patterns or []},
                 "captured_urls": [],
-                "screenshot": None,
-                "screenshot_error": None,
                 "actions_report": None,
                 "login_actions_report": None,
                 "ended_early": False,
-            }
-        )
-
-
-@mcp.tool()
-def screenshot_url(
-    url: str,
-    profile: str,
-    wait_seconds: int = DEFAULT_SCREENSHOT_WAIT_SECONDS,
-    full_page: bool = False,
-    format: ScreenshotFormat = "jpeg",
-    quality: int = 80,
-    scale: float = 1.0,
-    login_timeout: int = 300,
-    login_url_patterns: Optional[list[str]] = None,
-    login_actions: Optional[list[dict]] = None,
-) -> ToolResult:
-    """Navigate to a URL under a named Chrome profile and return a screenshot
-    of the rendered page. Use this to *see* a page — layout, charts, error
-    banners, whatever isn't in an XHR body. Use ``capture_url`` when you want
-    the JSON the page fetched (optionally with ``screenshot=true`` for both).
-
-    Args:
-        url: Fully-qualified URL to navigate to (https://…).
-        profile: Named profile under ``INTERCEPTOR_PROFILES_ROOT`` — see
-            ``list_profiles``. The page renders with that profile's cookies,
-            so authenticated dashboards work if the profile is logged in.
-        wait_seconds: Seconds to let the page load before the shot (default
-            15). Chrome spends ~4-5s of this booting and navigating; raise it
-            for slow SPAs, lower it (not below ~8) for static pages.
-        full_page: Whole scrollable document (clamped to 8000px tall) instead
-            of the 1920x1080 viewport.
-        format: "jpeg" (default, ~100-300 KB for a viewport), "png"
-            (lossless, often 1-3 MB), or "webp".
-        quality: 1-100 for jpeg/webp. Ignored for png.
-        scale: Output scale, 0 < scale <= 2. 0.5 halves each axis.
-        login_timeout: Max seconds to wait for a login redirect to resolve
-            before returning ``login_wall: true``.
-        login_url_patterns: Regexes ``re.search``-matched against the tab URL
-            after navigation to spot a redirect to a login page. Omit for the
-            defaults (``login``, ``signin``, ``/auth``); a list REPLACES them,
-            so include them yourself if you still want them. Add the site's
-            SSO host when it doesn't match those (Enphase:
-            ``sso\\.enphaseenergy\\.com``) — otherwise an expired session
-            looks like an empty result instead of ``login_wall: true``. An
-            empty list disables login detection.
-        login_actions: Steps that sign in ONLY if the page redirects to a
-            login wall — same as ``capture_url``'s ``login_actions``. Write
-            the credentials as references (``"${username}"``,
-            ``"${password}"``; names in ``list_profiles``' ``login_keys``),
-            NEVER real values, and never ask a user for them. Raise
-            ``wait_seconds`` (~60) so the login, the redirect and the page
-            load fit.
-
-    Returns:
-        JSON with ``job_id``, ``url``, ``status``, ``login_wall``, ``error``,
-        ``screenshot`` ({format, mime_type, width, height, full_page, bytes,
-        page_url}), ``screenshot_error`` and ``login_actions_report`` (null
-        unless ``login_actions`` ran) — followed by the image itself as
-        an image content block. ``page_url`` is where the tab actually ended
-        up, so a redirect to a login page is visible even without
-        ``login_wall``. ``status: "loading"`` is normal for pages that fire
-        no JSON XHRs and does not indicate a failed screenshot.
-    """
-    try:
-        req = ScreenshotRequest(
-            url=url,
-            profile=profile,
-            wait_seconds=wait_seconds,
-            full_page=full_page,
-            format=format,
-            quality=quality,
-            scale=scale,
-            login_timeout=login_timeout,
-            login_actions=login_actions or [],
-            **_login_patterns_kw(login_url_patterns),
-        )
-        return _screenshot_tool_result(_run_screenshot(req).model_dump())
-    except (HTTPException, ValidationError) as e:
-        return _screenshot_tool_result(
-            {
-                "job_id": "",
-                "url": url,
-                "status": "error",
-                "login_wall": False,
-                "error": _http_error_text(e),
-                "screenshot": None,
-                "screenshot_error": None,
-                "login_actions_report": None,
             }
         )
 

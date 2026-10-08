@@ -8,6 +8,7 @@ JS, and the ``Input.*`` events — and records everything it was sent.
 
 from __future__ import annotations
 
+import base64
 import json
 import threading
 import time
@@ -100,6 +101,45 @@ def test_parse_actions_allowed_types_refuses_the_rest():
     assert a.value == "${username}"
 
 
+def test_parse_screenshot_defaults_and_overrides():
+    [d, o] = parse_actions([
+        {"type": "screenshot"},
+        {"type": "screenshot", "format": "png", "quality": 50, "full_page": True,
+         "scale": 0.5, "max_height": 4000, "timeout_s": 60},
+    ])
+    assert (d.format, d.quality, d.full_page, d.scale, d.max_height) == ("jpeg", 80, False, 1.0, 8000)
+    assert d.timeout_s == 30.0  # not the 15 s other steps get — a full-page capture is slow
+    assert (o.format, o.quality, o.full_page, o.scale, o.max_height, o.timeout_s) == (
+        "png", 50, True, 0.5, 4000, 60.0)
+    # A model_dump() of the service's model carries every field.
+    [n] = parse_actions([{"type": "screenshot", "format": None, "quality": None, "full_page": None,
+                          "scale": None, "max_height": None, "timeout_s": None}])
+    assert n.format == "jpeg" and n.timeout_s == 30.0
+
+
+@pytest.mark.parametrize("extra, msg", [
+    ({"format": "gif"}, "format must be one of jpeg, png, webp"),
+    ({"quality": 0}, "quality must be"),
+    ({"quality": 101}, "quality must be"),
+    ({"quality": 80.5}, "quality must be"),
+    ({"quality": True}, "quality must be"),
+    ({"full_page": "yes"}, "full_page must be"),
+    ({"scale": 0}, "scale must be"),
+    ({"scale": 2.5}, "scale must be"),
+    ({"scale": True}, "scale must be"),
+    ({"scale": "1"}, "scale must be"),
+    ({"max_height": 99}, "max_height must be"),
+    ({"max_height": 16385}, "max_height must be"),
+    ({"max_height": 800.0}, "max_height must be"),
+    ({"timeout_s": 0}, "timeout_s must be"),
+    ({"selector": "body"}, "unexpected field"),
+])
+def test_parse_screenshot_rejects_bad_options(extra, msg):
+    with pytest.raises(ActionError, match=msg) as ei:
+        parse_actions([{"type": "wait", "seconds": 0}, {"type": "screenshot", **extra}])
+    assert "actions[1] (screenshot)" in str(ei.value)
+
+
 def test_action_repr_hides_the_value():
     [a] = parse_actions([{"type": "fill", "selector": "#p", "value": "hunter2"}])
     assert "hunter2" not in repr(a) and "#p" in repr(a)
@@ -112,6 +152,12 @@ class WebSocketTimeoutException(Exception):
 
 
 READY = {"href": "https://support.example.com/feoc/", "rs": "complete", "hook": True}
+SHOT_BYTES = b"\xff\xd8\xff\xe0fake-jpeg"
+METRICS = {
+    "cssLayoutViewport": {"clientWidth": 1920, "clientHeight": 1080, "pageX": 0, "pageY": 0},
+    "cssVisualViewport": {"clientWidth": 1920, "clientHeight": 1080, "pageX": 0, "pageY": 0},
+    "cssContentSize": {"width": 1920, "height": 5000},
+}
 
 
 class FakePage:
@@ -126,6 +172,9 @@ class FakePage:
         self.click_box = {"x": 100.0, "y": 50.0, "element": "<button>"}
         self.eval_result = {"result": {"type": "number", "value": 2}}
         self.origins = ["https://support.example.com"]  # location.origin; last repeats
+        self.href = "https://support.example.com/feoc/results"  # location.href
+        self.metrics = METRICS                                   # Page.getLayoutMetrics
+        self.shot = {"data": base64.b64encode(SHOT_BYTES).decode()}  # Page.captureScreenshot
 
     @staticmethod
     def _next(seq):
@@ -136,6 +185,10 @@ class FakePage:
 
     def respond(self, method: str, params: dict):
         self.calls.append((method, params))
+        if method == "Page.getLayoutMetrics":
+            return self.metrics
+        if method == "Page.captureScreenshot":
+            return self.shot  # {"error": …} becomes a CDP error reply
         if method != "Runtime.evaluate":
             return {}
         expr = params["expression"]
@@ -143,6 +196,8 @@ class FakePage:
             return self.value(self._next(self.probes))
         if expr == actions_mod._ORIGIN_JS:
             return self.value(self._next(self.origins))
+        if expr == actions_mod._HREF_JS:
+            return self.value(self.href)
         if actions_mod._FIND_JS in expr:
             # The deep query reports bad selectors as a value ({error: …}),
             # not by throwing, so every scripted lookup is returned by value.
@@ -637,6 +692,129 @@ def test_dropped_side_socket_is_reopened(monkeypatch):
 
     assert report.ok, report.aborted_reason
     assert len(opened) == 2
+
+
+def _kinds(page: FakePage) -> list[str]:
+    """The page's calls with the readiness probes dropped, named by what they did."""
+    out = []
+    for m, p in page.calls:
+        expr = p.get("expression", "")
+        if m == "Runtime.evaluate" and expr == actions_mod._PROBE_JS:
+            continue
+        if actions_mod._FIND_JS in expr:
+            out.append("find")
+        elif expr == actions_mod._HREF_JS:
+            out.append("href")
+        elif m == "Runtime.evaluate":
+            out.append("eval")
+        else:
+            out.append(m)
+    return out
+
+
+def test_screenshot_between_steps_returns_the_image(monkeypatch):
+    page = FakePage()
+    _patch_chrome(monkeypatch, page)
+
+    report = _run([
+        {"type": "fill", "selector": "input", "value": "532614044013"},
+        {"type": "screenshot", "scale": 0.5},
+        {"type": "click", "selector": "button"},
+    ])
+
+    assert report.ok, report.aborted_reason
+    assert [(r.type, r.ok) for r in report.actions] == [("fill", True), ("screenshot", True), ("click", True)]
+    shot = report.actions[1].value
+    assert shot == {
+        "format": "jpeg", "mime_type": "image/jpeg", "width": 960, "height": 540,
+        "full_page": False, "bytes": len(SHOT_BYTES),
+        "page_url": "https://support.example.com/feoc/results",
+        "data_base64": base64.b64encode(SHOT_BYTES).decode(),
+    }
+    # Taken between the fill and the click, on the same side socket.
+    kinds = _kinds(page)
+    i = kinds.index("Page.captureScreenshot")
+    assert kinds.index("Input.insertText") < kinds.index("href") < kinds.index("Page.getLayoutMetrics") < i
+    assert i < kinds.index("Input.dispatchMouseEvent")
+    params = next(p for m, p in page.calls if m == "Page.captureScreenshot")
+    assert params == {"format": "jpeg", "captureBeyondViewport": False, "quality": 80,
+                      "clip": {"x": 0.0, "y": 0.0, "width": 1920, "height": 1080, "scale": 0.5}}
+
+
+def test_screenshot_full_page_png_uses_the_document_size(monkeypatch):
+    page = FakePage()
+    _patch_chrome(monkeypatch, page)
+
+    report = _run([{"type": "screenshot", "format": "png", "full_page": True, "max_height": 3000}])
+
+    assert report.ok
+    assert (report.actions[0].value["width"], report.actions[0].value["height"]) == (1920, 3000)
+    params = next(p for m, p in page.calls if m == "Page.captureScreenshot")
+    assert params["captureBeyondViewport"] is True and "quality" not in params
+
+
+def test_failed_screenshot_is_recorded_and_the_run_continues(monkeypatch):
+    page = FakePage()
+    page.shot = {"error": {"code": -32000, "message": "Unable to capture screenshot"}}
+    _patch_chrome(monkeypatch, page)
+
+    report = _run([
+        {"type": "screenshot"},
+        {"type": "click", "selector": "button"},
+        {"type": "screenshot"},
+    ])
+
+    assert report.aborted_reason is None and report.ok
+    first, click, last = report.actions
+    assert not first.ok and "Unable to capture screenshot" in first.error and first.value is None
+    assert click.ok and "Input.dispatchMouseEvent" in page.methods()
+    assert not last.ok and last.error != "skipped"
+
+
+def test_screenshot_of_an_empty_page_fails_without_capturing(monkeypatch):
+    page = FakePage()
+    page.metrics = {"cssLayoutViewport": {"clientWidth": 0, "clientHeight": 0}}
+    _patch_chrome(monkeypatch, page)
+
+    report = _run([{"type": "screenshot"}, {"type": "wait", "seconds": 0}])
+
+    assert "layout metrics reported an empty page" in report.actions[0].error
+    assert report.actions[1].ok and report.aborted_reason is None
+    assert "Page.captureScreenshot" not in page.methods()
+
+
+def test_screenshot_is_taken_even_when_the_page_never_settles(monkeypatch):
+    # The initial gate passes; by the time the screenshot step runs the page
+    # is loading again (a click navigated) and never finishes.
+    monkeypatch.setattr(actions_mod, "_SCREENSHOT_SETTLE_S", 0.2)
+    page = FakePage()
+    page.probes = [READY, {"href": READY["href"], "rs": "loading", "hook": False}]
+    _patch_chrome(monkeypatch, page)
+
+    report = _run([{"type": "screenshot"}])
+
+    assert report.ok and report.actions[0].ok
+    assert report.actions[0].value["bytes"] == len(SHOT_BYTES)
+
+
+def test_cancel_during_a_screenshot_aborts_the_run(monkeypatch):
+    page = FakePage()
+    _patch_chrome(monkeypatch, page)
+    flag = threading.Event()
+    real_respond = page.respond
+
+    def respond(method, params):
+        if method == "Page.getLayoutMetrics":
+            flag.set()  # cancelled while the step is underway
+        return real_respond(method, params)
+
+    page.respond = respond
+    report = _run([{"type": "screenshot"}, {"type": "wait", "seconds": 0}], cancel=flag.is_set)
+
+    assert report.actions[0].error == "cancelled"
+    assert report.actions[1].error == "skipped"
+    assert report.aborted_reason == "cancelled"
+    assert "Page.captureScreenshot" not in page.methods()
 
 
 def test_cancel_stops_a_long_wait_promptly(monkeypatch):

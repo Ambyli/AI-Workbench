@@ -253,11 +253,23 @@ def test_evaluate_in_login_actions_is_refused(client, app_mod, logins_dir):
     _pool_untouched(client, app_mod)
 
 
+def test_screenshot_in_login_actions_is_refused(client, app_mod, logins_dir):
+    # An image of the login form would carry the username into the response.
+    r = client.post("/capture", json={**BASE, "login_actions": [
+        *LOGIN_STEPS[:2], {"type": "screenshot"}, LOGIN_STEPS[2],
+    ]})
+    assert r.status_code == 422
+    assert "login_actions" in json.dumps(r.json()["detail"])
+    _pool_untouched(client, app_mod)
+
+
 def test_login_actions_need_login_detection(client, app_mod, logins_dir):
     r = client.post("/capture", json={**BASE, "login_url_patterns": []})
     assert r.status_code == 422 and "login_url_patterns" in r.text
-    r = client.post("/screenshot", json={
-        "url": "https://e.com", "profile": PROFILE, "login_url_patterns": [],
+    # Same rule for a screenshot-only capture.
+    r = client.post("/capture", json={
+        "url": "https://e.com", "profile": PROFILE, "url_patterns": [],
+        "actions": [{"type": "screenshot"}], "login_url_patterns": [],
         "login_actions": LOGIN_STEPS,
     })
     assert r.status_code == 422 and "login_url_patterns" in r.text
@@ -309,11 +321,6 @@ class _LoginFake:
 
     def get_login_report(self):
         return type(self).login_report
-
-    def screenshot(self, **_kw):
-        from common.cdp_interceptor import ScreenshotError
-
-        raise ScreenshotError("no browser in tests")
 
     def quit(self):
         pass
@@ -386,16 +393,17 @@ def test_window_end_relabels_a_cancelled_login(client, app_mod, logins_dir, fake
     assert "login_actions ok=False failed_at=0/fill" in capfd.readouterr().err
 
 
-def test_screenshot_endpoint_passes_login_actions_through(client, app_mod, logins_dir, fake):
+def test_screenshot_only_capture_passes_login_actions_through(client, app_mod, logins_dir, fake):
     fake.login_report = _login_report()
-    r = client.post("/screenshot", json={
-        "url": "https://app.example.com", "profile": PROFILE, "wait_seconds": 1,
+    r = client.post("/capture", json={
+        "url": "https://app.example.com", "profile": PROFILE, "url_patterns": [],
+        "capture_window_seconds": 1, "actions": [{"type": "screenshot"}],
         "login_url_patterns": [r"sso\.example\.com"], "login_actions": LOGIN_STEPS,
     })
     assert r.status_code == 200, r.text
     assert [a.value for a in fake.instances[0].kw["login_actions"]][:2] == [USER, SECRET]
     assert r.json()["login_actions_report"]["aborted_reason"] is None
-    assert SECRET not in r.text
+    assert SECRET not in r.text and USER not in r.text
 
 
 # ── MCP + profile listing ────────────────────────────────────────────────────
@@ -413,8 +421,8 @@ def test_mcp_tools_pass_login_actions_through(app_mod, monkeypatch):
     res = app_mod.capture_url(url="https://e.com", url_patterns=["x"], profile="p",
                               login_url_patterns=sso, login_actions=LOGIN_STEPS)
     assert res.structured_content["login_actions_report"] is None
-    app_mod.screenshot_url(url="https://e.com", profile="p", login_url_patterns=sso,
-                           login_actions=LOGIN_STEPS)
+    app_mod.capture_url(url="https://e.com", profile="p", actions=[{"type": "screenshot"}],
+                        login_url_patterns=sso, login_actions=LOGIN_STEPS)
     app_mod.capture_url(url="https://e.com", url_patterns=["x"], profile="p")
 
     # The references travel as-is; resolution happens inside _run_capture.
@@ -434,6 +442,12 @@ def test_mcp_capture_url_reports_an_evaluate_login_step_in_the_payload(app_mod):
     payload = res.structured_content
     assert payload["status"] == "error" and "login_actions.0" in payload["error"]
     assert app_mod._port_pool.qsize() == app_mod.MAX_CONCURRENT
+    res = app_mod.capture_url(
+        url="https://e.com", url_patterns=["x"], profile="p",
+        login_actions=[{"type": "screenshot"}],
+    )
+    assert res.structured_content["status"] == "error"
+    assert "login_actions.0" in res.structured_content["error"]
 
 
 def test_profiles_listing_shows_login_keys_not_values(client, app_mod, logins_dir):

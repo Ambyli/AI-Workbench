@@ -445,7 +445,7 @@ client.launch("https://phoenix.zeoenergy.com/projects")
 
 ### Driving the page (`run_actions`)
 
-For a page that only fires the request you want after someone fills a form and clicks a button, let the page's own code send it — the interceptor captures the response as usual. `run_actions` opens its own short-lived CDP socket to the tab (the worker's socket is untouched), waits for a readiness gate (tab off `about:blank`, not on a login URL, `document.readyState === "complete"`, `window._fetchInterceptorActive === true`), runs an optional `page_script`, then each step in order, stopping at the first failure.
+For a page that only fires the request you want after someone fills a form and clicks a button, let the page's own code send it — the interceptor captures the response as usual. `run_actions` opens its own short-lived CDP socket to the tab (the worker's socket is untouched), waits for a readiness gate (tab off `about:blank`, not on a login URL, `document.readyState === "complete"`, `window._fetchInterceptorActive === true`), runs an optional `page_script`, then each step in order, stopping at the first failure (a failed `screenshot` step excepted — see the table below).
 
 ```python
 from common.cdp_interceptor import InterceptorClient, parse_actions
@@ -468,7 +468,20 @@ client.quit()
 
 Two options exist for login steps (what `InterceptorClient`'s `login_actions` use): `gate="login"` swaps the readiness gate for one that only needs a real URL and `readyState === "complete"` — it acts *on* a login page instead of refusing it, and does not wait for the capture hook — and `fill_origins=[...]` makes every `fill` check `location.origin` against the list first, failing with `origin <o> not allowed for this fill` before anything is typed. `parse_actions(..., label="login_actions", allowed_types=[...])` names the list in errors and refuses step types outside the set.
 
-Step types: `wait_for`, `fill`, `click`, `press`, `select`, `wait`, `evaluate`. Element lookup searches the document **and every open shadow root** (each tree separately — a descendant combinator never crosses a shadow boundary), so Lightning Web Components are reachable; `fill` / `click` / `press` use trusted CDP `Input.*` events. Full reference: [`ai/interceptor/INTERCEPTOR.md` § Page scripts and actions](../../../../../ai/interceptor/INTERCEPTOR.md#page-scripts-and-actions).
+Step types:
+
+| Type | Fields | Does |
+|---|---|---|
+| `wait_for` | `selector`, `text?`, `state` (`visible`\|`attached`), `timeout_s` (15) | Poll until the element is there. |
+| `fill` | `selector`, `value`, `text?`, `clear` (true), `timeout_s` | Focus the real input, type with `Input.insertText`, fire `change`. |
+| `click` | `selector`, `text?`, `method` (`mouse`\|`js`), `timeout_s` | Trusted mouse click at the element's centre (or `el.click()`). |
+| `press` | `key`, `selector?`, `text?`, `timeout_s` | One key down + up, optionally after focusing an element. |
+| `select` | `selector`, `value`, `text?`, `timeout_s` | Pick a native `<select>` option by value or text. |
+| `wait` | `seconds` | Cancellable sleep. |
+| `evaluate` | `script`, `timeout_s` | Run JS, return its JSON value. |
+| `screenshot` | `format` (`jpeg`\|`png`\|`webp`), `quality` (80), `full_page` (false), `scale` (1.0, max 2), `max_height` (8000), `timeout_s` (**30**) | Settle (best-effort, ~5 s), then `Page.captureScreenshot` on the same side socket. `value` is `{format, mime_type, width, height, full_page, bytes, page_url, data_base64}`. **A failed screenshot is recorded and the run continues** — every other type stops the run on failure. |
+
+Element lookup searches the document **and every open shadow root** (each tree separately — a descendant combinator never crosses a shadow boundary), so Lightning Web Components are reachable; `fill` / `click` / `press` use trusted CDP `Input.*` events. Full reference: [`ai/interceptor/INTERCEPTOR.md` § Page scripts and actions](../../../../../ai/interceptor/INTERCEPTOR.md#page-scripts-and-actions).
 
 ### Long-running poller — refresh every 5 minutes
 
@@ -519,7 +532,7 @@ logging.basicConfig(level=logging.DEBUG)
 | `launcher.py` | OS-adaptive `find_browser`, `start_browser`, `clear_singleton_locks`, `kill_chrome_by_profile` (Windows-only). |
 | `cdp_session.py` | `run_session` — the WebSocket loop that talks to the browser. |
 | `screenshot.py` | `capture_screenshot` — page image over a second, short-lived CDP connection. |
-| `actions.py` | `run_actions` / `parse_actions` — readiness gate, `page_script`, and shadow-DOM-piercing fill / click / press / select / evaluate steps over a second CDP connection. |
+| `actions.py` | `run_actions` / `parse_actions` — readiness gate, `page_script`, and shadow-DOM-piercing fill / click / press / select / evaluate / screenshot steps over a second CDP connection. |
 | `sentinel.py` | Session-marker file helpers. |
 | `spy.py` | CLI entry point (`cdp-spy` script, or `python -m common.cdp_interceptor.spy`). |
 | `interceptor.js` | Injected JS that patches `fetch`/`XHR`. **DO NOT reformat — injected verbatim.** |

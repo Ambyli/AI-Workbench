@@ -27,16 +27,31 @@ Public API
 
 Step types
 ----------
-``wait_for``  selector, text?, state (visible|attached), timeout_s
-``fill``      selector, text?, value, clear=True, timeout_s
-``click``     selector, text?, method (mouse|js), timeout_s
-``press``     key, selector?, text?, timeout_s
-``select``    selector, text?, value, timeout_s
-``wait``      seconds
-``evaluate``  script, timeout_s
+``wait_for``    selector, text?, state (visible|attached), timeout_s
+``fill``        selector, text?, value, clear=True, timeout_s
+``click``       selector, text?, method (mouse|js), timeout_s
+``press``       key, selector?, text?, timeout_s
+``select``      selector, text?, value, timeout_s
+``wait``        seconds
+``evaluate``    script, timeout_s
+``screenshot``  format (jpeg|png|webp), quality, full_page, scale, max_height,
+                timeout_s (default 30)
 
 Non-obvious behaviour
 ---------------------
+- **A failed screenshot does not stop the run.** Every other step type
+  aborts the run on failure (the rest are reported ``skipped``); a
+  ``screenshot`` step records ``ok=False`` with its error and the next step
+  runs — it observes the page, so failing to observe it is no reason to stop
+  driving it. Cancellation still stops the run, screenshot or not.
+- **Screenshots ride the same side socket.** The step settles first (the
+  readiness gate, capped at ~5 s and best-effort — a page that is still not
+  ready is shot anyway, which is the point when a step lands on an
+  unexpected page), reads ``location.href``, then ``Page.getLayoutMetrics`` →
+  ``Page.captureScreenshot`` with the clip ``screenshot.build_capture_params``
+  builds. The capture call's budget is whatever is left of the step's
+  ``timeout_s``, not the 10 s per-RPC budget, because a tall full-page clip
+  can take several seconds. ``value`` carries the image as ``data_base64``.
 - **Element lookup pierces open shadow roots.** Salesforce Lightning Web
   Components (and most design systems built on custom elements) render inside
   native shadow DOM, where ``document.querySelector`` finds nothing. The
@@ -67,6 +82,7 @@ Non-obvious behaviour
 
 from __future__ import annotations
 
+import base64
 import json as _json
 import logging
 import re
@@ -77,16 +93,35 @@ from typing import Any, Callable, Iterable, Literal, Optional, Sequence
 # Reused from screenshot.py rather than refactored out of it: test_screenshot.py
 # monkeypatches these names on the screenshot module. Importing them into this
 # module's namespace gives this module's tests their own seam to patch.
-from .screenshot import ScreenshotError, _list_tabs, _open_ws, _Rpc, pick_page_tab
+from .screenshot import (
+    CHROME_MAX_CLIP_PX,
+    SCREENSHOT_FORMATS,
+    ScreenshotError,
+    _list_tabs,
+    _open_ws,
+    _Rpc,
+    build_capture_params,
+    pick_page_tab,
+)
 
 logger = logging.getLogger("cdp_interceptor")
 
 ACTION_TYPES: tuple[str, ...] = (
-    "wait_for", "fill", "click", "press", "select", "wait", "evaluate",
+    "wait_for", "fill", "click", "press", "select", "wait", "evaluate", "screenshot",
 )
 
 DEFAULT_STEP_TIMEOUT_S = 15.0
+# A full-page capture of a long document can legitimately take several seconds.
+DEFAULT_SCREENSHOT_TIMEOUT_S = 30.0
 MAX_STEP_SECONDS = 600.0
+
+# Screenshot bounds — the same ones the interceptor service's request model uses.
+MIN_SCREENSHOT_HEIGHT = 100
+MAX_SCREENSHOT_SCALE = 2.0
+
+# How long a screenshot step waits for the page to settle (readiness gate)
+# before shooting it as it is.
+_SCREENSHOT_SETTLE_S = 5.0
 
 # Budget for one CDP round trip inside a step (a lookup probe, an insertText,
 # one mouse event). Separate from the step's own ``timeout_s`` so a lookup that
@@ -104,6 +139,8 @@ _FIELDS: dict[str, tuple[frozenset[str], frozenset[str]]] = {
     "select": (frozenset({"selector", "value"}), frozenset({"text", "timeout_s"})),
     "wait": (frozenset({"seconds"}), frozenset()),
     "evaluate": (frozenset({"script"}), frozenset({"timeout_s"})),
+    "screenshot": (frozenset(), frozenset({"format", "quality", "full_page", "scale",
+                                           "max_height", "timeout_s"})),
 }
 
 # key name → (DOM ``key``, DOM ``code``, Windows virtual key code, text).
@@ -153,6 +190,11 @@ class Action:
     key: Optional[str] = None         # press
     seconds: Optional[float] = None   # wait
     script: Optional[str] = None      # evaluate
+    format: str = "jpeg"              # screenshot: "jpeg" | "png" | "webp"
+    quality: int = 80                 # screenshot (jpeg/webp only)
+    full_page: bool = False           # screenshot
+    scale: float = 1.0                # screenshot
+    max_height: int = 8000            # screenshot (full_page clamp, CSS px)
     timeout_s: float = DEFAULT_STEP_TIMEOUT_S
 
 
@@ -161,7 +203,9 @@ class ActionResult:
     """Outcome of one step. ``index`` is the position in the request's
     ``actions`` list, or ``-1`` for the ``page_script``. ``value`` is whatever
     the step reports back — the script's return value for ``evaluate`` /
-    ``page_script``, element details for the DOM steps."""
+    ``page_script``, element details for the DOM steps, and for
+    ``screenshot`` ``{format, mime_type, width, height, full_page, bytes,
+    page_url, data_base64}``."""
     index: int
     type: str
     ok: bool
@@ -173,7 +217,8 @@ class ActionResult:
 @dataclass
 class ActionsReport:
     """Everything ``run_actions`` did. ``aborted_reason`` is ``None`` when every
-    step ran and succeeded; otherwise it says why the run stopped ("not ready:
+    step ran (a failed ``screenshot`` step does not stop the run, so it can be
+    ``ok=False`` here too); otherwise it says why the run stopped ("not ready:
     login page …", "cancelled", "actions[2] (click) failed: …"). Steps that
     never ran are listed with ``ok=False, error="skipped"``."""
     page_script: Optional[ActionResult] = None
@@ -223,8 +268,9 @@ def parse_actions(
 
     Raises ``ActionError`` naming the offending step (``<label>[i]``) on an
     unknown ``type``, a type outside ``allowed_types`` (when given), a missing
-    required field, a field the type doesn't take, a wrong value type, or an
-    unknown ``press`` key. Keys whose value is ``None`` are ignored.
+    required field, a field the type doesn't take, a wrong value type, an
+    out-of-range screenshot option, or an unknown ``press`` key. Keys whose
+    value is ``None`` are ignored.
     """
     wanted = None if allowed_types is None else set(allowed_types)
     allowed = tuple(t for t in ACTION_TYPES if wanted is None or t in wanted)
@@ -257,6 +303,8 @@ def parse_actions(
             raise ActionError(f"{where}: missing required field(s) {', '.join(sorted(missing))}")
 
         a = Action(type=type_)
+        if type_ == "screenshot":
+            a.timeout_s = DEFAULT_SCREENSHOT_TIMEOUT_S
         for name in ("selector", "script"):
             if name in given:
                 v = given[name]
@@ -297,6 +345,33 @@ def parse_actions(
                     f"{where}: key must be one of {', '.join(PRESS_KEYS)} or a single character"
                 )
             a.key = k
+        if "format" in given:
+            if given["format"] not in SCREENSHOT_FORMATS:
+                raise ActionError(f"{where}: format must be one of {', '.join(SCREENSHOT_FORMATS)}")
+            a.format = given["format"]
+        if "quality" in given:
+            v = given["quality"]
+            if not isinstance(v, int) or isinstance(v, bool) or not (1 <= v <= 100):
+                raise ActionError(f"{where}: quality must be an integer in [1, 100]")
+            a.quality = v
+        if "full_page" in given:
+            if not isinstance(given["full_page"], bool):
+                raise ActionError(f"{where}: full_page must be true or false")
+            a.full_page = given["full_page"]
+        if "scale" in given:
+            v = given["scale"]
+            if not _is_number(v) or not (0 < v <= MAX_SCREENSHOT_SCALE):
+                raise ActionError(f"{where}: scale must be a number in (0, {MAX_SCREENSHOT_SCALE:g}]")
+            a.scale = float(v)
+        if "max_height" in given:
+            v = given["max_height"]
+            if (not isinstance(v, int) or isinstance(v, bool)
+                    or not (MIN_SCREENSHOT_HEIGHT <= v <= CHROME_MAX_CLIP_PX)):
+                raise ActionError(
+                    f"{where}: max_height must be an integer in "
+                    f"[{MIN_SCREENSHOT_HEIGHT}, {CHROME_MAX_CLIP_PX}]"
+                )
+            a.max_height = v
         out.append(a)
     return out
 
@@ -449,6 +524,9 @@ _PROBE_JS = (
 
 # fill_origins check, run before a fill touches the page.
 _ORIGIN_JS = "location.origin"
+
+# Where a screenshot step found the tab — after any redirect an earlier step caused.
+_HREF_JS = "location.href"
 
 _FIND_JS = "window.__ciActions.find"
 
@@ -869,6 +947,59 @@ def _do_evaluate(ctx: _Ctx, a: Action) -> Any:
     return _evaluate_script(ctx, a.script or "", a.timeout_s)
 
 
+def _do_screenshot(ctx: _Ctx, a: Action) -> Any:
+    """Image of the page as it is now. Settle first — the previous step may
+    have been a click that navigated — but only best-effort: a page that is
+    still not ready (or sits on a login page) is shot anyway, because seeing
+    it is the reason the step is there."""
+    deadline = time.monotonic() + a.timeout_s
+    not_ready = _wait_ready(ctx, min(deadline, time.monotonic() + _SCREENSHOT_SETTLE_S))
+    if not_ready == "cancelled":
+        raise _Cancelled()
+    if not_ready is not None:
+        logger.debug("actions: screenshot taken before the page was ready: %s", not_ready)
+    try:
+        page_url = ctx.side.evaluate(_HREF_JS, timeout=_rpc_budget(deadline))
+    except (_ContextLost, _Disconnected) as exc:
+        # The document went away between the settle and the read — it is
+        # mid-navigation. Settle once more and read the new one.
+        logger.debug("actions: screenshot lost its document (%s) — settling again", exc)
+        if _wait_ready(ctx, min(deadline, time.monotonic() + _SCREENSHOT_SETTLE_S)) == "cancelled":
+            raise _Cancelled()
+        page_url = ctx.side.evaluate(_HREF_JS, timeout=_rpc_budget(deadline))
+    metrics = ctx.side.call("Page.getLayoutMetrics", timeout=_rpc_budget(deadline))
+    try:
+        params, width, height = build_capture_params(
+            metrics, format=a.format, quality=a.quality, full_page=a.full_page,
+            scale=a.scale, max_height=a.max_height,
+        )
+    except ScreenshotError as exc:
+        raise _StepFailure(str(exc)) from exc
+    if ctx.cancel():
+        raise _Cancelled()
+    # The rest of the step's budget, not _RPC_TIMEOUT: a tall full-page clip
+    # can take several seconds to encode.
+    shot = ctx.side.call("Page.captureScreenshot", params,
+                         timeout=max(0.5, deadline - time.monotonic()))
+    b64 = shot.get("data")
+    if not b64:
+        raise _StepFailure("Page.captureScreenshot returned no image data")
+    try:
+        size = len(base64.b64decode(b64, validate=True))
+    except Exception as exc:
+        raise _StepFailure(f"could not decode screenshot payload: {exc}") from exc
+    return {
+        "format": a.format,
+        "mime_type": f"image/{a.format}",
+        "width": width,
+        "height": height,
+        "full_page": a.full_page,
+        "bytes": size,
+        "page_url": page_url if isinstance(page_url, str) else "",
+        "data_base64": b64,
+    }
+
+
 _EXECUTORS: dict[str, Callable[[_Ctx, Action], Any]] = {
     "wait_for": _do_wait_for,
     "fill": _do_fill,
@@ -877,6 +1008,7 @@ _EXECUTORS: dict[str, Callable[[_Ctx, Action], Any]] = {
     "select": _do_select,
     "wait": _do_wait,
     "evaluate": _do_evaluate,
+    "screenshot": _do_screenshot,
 }
 
 
@@ -923,9 +1055,11 @@ def run_actions(
     Order: readiness gate (up to ``ready_timeout_s``) → ``page_script`` (if
     given, awaited up to ``page_script_timeout_s``) → each action in order.
     Stops at the first failure; the remaining steps are reported as
-    ``skipped``. ``cancel`` is polled between and inside steps — return True to
-    stop within ~50 ms (a single in-flight CDP call can still take up to its
-    own timeout). ``on_progress(done, total)`` fires after each action.
+    ``skipped`` — except after a ``screenshot`` step, whose failure is
+    recorded and the next step runs. ``cancel`` is polled between and inside
+    steps — return True to stop within ~50 ms (a single in-flight CDP call can
+    still take up to its own timeout). ``on_progress(done, total)`` fires
+    after each action.
 
     ``login_url_patterns`` are the same regexes the capture uses to spot a
     login wall; with the default ``gate="page"`` nothing runs while the tab
@@ -983,7 +1117,9 @@ def run_actions(
                     on_progress(i + 1, len(actions))
                 except Exception as exc:
                     logger.debug("actions: on_progress raised: %s", exc)
-            if not res.ok:
+            # A failed screenshot is recorded and the run goes on — it only
+            # observes the page. Cancellation stops the run whatever the step.
+            if not res.ok and not (a.type == "screenshot" and res.error != "cancelled"):
                 return abort("cancelled" if res.error == "cancelled"
                              else f"{label}[{i}] ({a.type}) failed: {res.error}", i + 1)
         return report

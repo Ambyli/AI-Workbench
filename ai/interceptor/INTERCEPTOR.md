@@ -1,6 +1,6 @@
 # interceptor
 
-Generic HTTP + MCP front-end for `common.cdp_interceptor`. Give it a URL and a list of URL regex patterns; it opens the URL in a headless Chrome under a named `--user-data-dir`, waits for a bounded window, and returns the JSON XHR/fetch bodies whose URLs matched any pattern. It can also return a **screenshot** of the rendered page — either alongside the captures (`screenshot` block on `POST /capture`) or on its own (`POST /screenshot` / the `screenshot_url` MCP tool), so an agent can *look at* a page it navigated to. See [Screenshots](#screenshots). And it can **drive** the page — run a `page_script`, fill inputs, click buttons — for pages that only fire the request you want after someone interacts with them; the responses those actions provoke come back through the same `matches`. See [Page scripts and actions](#page-scripts-and-actions). When a profile's session has expired it can **sign back in** by itself — `login_actions` fill the login form from server-side credentials the request only names (`${password}`). See [Login actions](#login-actions).
+Generic HTTP + MCP front-end for `common.cdp_interceptor`. Give it a URL and a list of URL regex patterns; it opens the URL in a headless Chrome under a named `--user-data-dir`, waits for a bounded window, and returns the JSON XHR/fetch bodies whose URLs matched any pattern. It can **drive** the page — run a `page_script`, fill inputs, click buttons — for pages that only fire the request you want after someone interacts with them; the responses those actions provoke come back through the same `matches`. See [Page scripts and actions](#page-scripts-and-actions). One of those steps is a **screenshot**, which can sit anywhere in the list — so an agent can *look at* the page between steps, or (with no `url_patterns` at all) just look at a page it navigated to. See [Screenshots](#screenshots). When a profile's session has expired it can **sign back in** by itself — `login_actions` fill the login form from server-side credentials the request only names (`${password}`). See [Login actions](#login-actions).
 
 - **Container**: `interceptor` (internal only, port 8080 on `ai_shared`)
 - **Compose file**: `ai/interceptor/docker-compose.interceptor.yml`
@@ -44,12 +44,11 @@ docker exec interceptor curl -s http://localhost:8080/health
 | `GET` | `/profiles/{name}` | One profile's status (size, sentinel, `login_keys`, `login_origins`) |
 | `POST` | `/profiles/{name}/refresh` | Upload a `.tgz` of a captured Chrome profile |
 | `DELETE` | `/profiles/{name}` | Wipe one profile |
-| `POST` | `/capture` | Run one capture (see request/response below); optional `screenshot` block returns an image too; optional `page_script` / `actions` drive the page first (see [Page scripts and actions](#page-scripts-and-actions)) |
-| `POST` | `/screenshot` | Navigate and return a screenshot only — no XHR patterns (see [Screenshots](#screenshots)) |
+| `POST` | `/capture` | Run one capture (see request/response below); optional `page_script` / `actions` drive the page first (see [Page scripts and actions](#page-scripts-and-actions)), and a `screenshot` action returns an image of it (see [Screenshots](#screenshots)) |
 | `GET` | `/jobs` | Snapshot of the port pool + currently-running captures |
 | `GET` | `/jobs/{job_id}` | Detail on one in-flight capture (404 if not found) |
 | `POST` | `/jobs/{job_id}/cancel` | Abort an in-flight capture, reclaim its slot |
-| — | `/mcp` | FastMCP HTTP transport (`capture_url`, `screenshot_url`, `list_profiles`, `list_jobs`, `get_job` tools) |
+| — | `/mcp` | FastMCP HTTP transport (`capture_url`, `list_profiles`, `list_jobs`, `get_job` tools) |
 
 ### `POST /capture`
 
@@ -66,7 +65,6 @@ Request:
   "max_matches_per_pattern": null,
   "debug_logging": false,
   "login_url_patterns": ["login", "signin", "/auth"],
-  "screenshot": null,
   "page_script": null,
   "actions": [],
   "actions_ready_timeout_seconds": null,
@@ -78,7 +76,7 @@ Request:
 
 `page_script`, `actions`, `actions_ready_timeout_seconds` and `stop_when_matched` are covered in [Page scripts and actions](#page-scripts-and-actions), `login_actions` and `login_actions_timeout_seconds` in [Login actions](#login-actions); with all six at their defaults a capture behaves exactly as it always has.
 
-`screenshot` is opt-in. Set it to an options object — `{"format": "jpeg", "quality": 80, "full_page": false, "scale": 1.0, "max_height": 8000}` (all keys optional) — and the response gains a `screenshot` field holding the image taken just before Chrome quits. With `screenshot` set, `url_patterns` may be empty (screenshot-only navigation); without it, an empty `url_patterns` is a 422. Details in [Screenshots](#screenshots).
+A screenshot is an `actions` step — `{"type": "screenshot", "scale": 0.5}` — and its image comes back on that step's entry in `actions_report`. `url_patterns` may be empty only when `actions` has a screenshot step (a screenshot-only capture, which ends as soon as the actions finish); otherwise an empty `url_patterns` is a 422. Details in [Screenshots](#screenshots).
 
 `login_url_patterns` are regexes `re.search`-matched against the tab's `location.href` **after** navigation has settled, to detect a redirect to a login wall. Two things to know:
 
@@ -87,7 +85,7 @@ Request:
 
 An empty list disables login detection entirely.
 
-`capture_window_seconds` is a **hard wall**: `app.py` waits exactly that long and then quits Chrome, regardless of what stage the session is in — unless `stop_when_matched` ends it early, or it is cancelled. It must exceed `login_timeout` for a login to have any chance of resolving — otherwise the window closes first and the response comes back `login_wall: true` with `status="waiting_login"`.
+`capture_window_seconds` is a **hard wall**: `app.py` waits exactly that long and then quits Chrome, regardless of what stage the session is in — unless `stop_when_matched` (or, with no `url_patterns`, the actions finishing) ends it early, or it is cancelled. It must exceed `login_timeout` for a login to have any chance of resolving — otherwise the window closes first and the response comes back `login_wall: true` with `status="waiting_login"`.
 
 Chrome always runs headless in the container. The service writes a `session_ok` sentinel into each uploaded profile so `InterceptorClient` boots straight into headless — an operator only uploads a profile *after* logging in on their laptop, so treating uploaded profiles as session-ready by definition matches reality. If the persisted session expires, `InterceptorClient` detects the login redirect, sets `status="waiting_login"`, and the response comes back with `login_wall: true`; refresh the profile via `POST /profiles/{name}/refresh` and retry — or, for a site with a plain username/password form, send [`login_actions`](#login-actions) and let the capture sign in itself.
 
@@ -107,17 +105,15 @@ Response:
     "example\\.com/api/v1/user":  [ { "url": "https://…", "body": { … } } ]
   },
   "captured_urls": [ "https://…", "…" ],
-  "screenshot": null,
-  "screenshot_error": null,
   "actions_report": null,
   "login_actions_report": null,
   "ended_early": false
 }
 ```
 
-`actions_report` is `null` unless `page_script` or `actions` were sent (shape in [Page scripts and actions § The report](#the-report)); `login_actions_report` (same shape) is `null` unless `login_actions` were sent **and** the capture hit a login wall; `ended_early` is `true` only when `stop_when_matched` closed the window before `capture_window_seconds` elapsed.
+`actions_report` is `null` unless `page_script` or `actions` were sent (shape in [Page scripts and actions § The report](#the-report)); `login_actions_report` (same shape) is `null` unless `login_actions` were sent **and** the capture hit a login wall; `ended_early` is `true` only when the window closed before `capture_window_seconds` elapsed — `stop_when_matched` saw every pattern matched, or a capture with no `url_patterns` finished its actions.
 
-`screenshot` is `null` unless requested; `screenshot_error` is set (and `screenshot` stays `null`) when one was requested but could not be taken — the XHR captures are still returned, an image failure never fails the capture.
+Screenshots live on their steps in `actions_report.actions` (`value.data_base64`); a failed one is that step's `ok: false` + `error` — the XHR captures are still returned, an image failure never fails the capture.
 
 `job_id` is a 12-char hex identifier for the capture. During the request's lifetime it shows up in `GET /jobs` (see [Observability](#observability)) and is prefixed onto every log line emitted by that capture — useful for correlating interleaved logs when concurrent captures are running.
 
@@ -125,52 +121,33 @@ Patterns are `re.search`-matched against every JSON XHR/fetch URL the page emits
 
 ## Screenshots
 
-Two ways to get an image of the page:
+A screenshot is a step in [`actions`](#page-scripts-and-actions): `{"type": "screenshot"}`. Put one wherever you want to see the page — after a `click` to see what it did, between a `fill` and the submit, at the very end — up to **10** per request. Each image comes back on its own step's entry in `actions_report.actions`, so a run that fails or does something unexpected shows what the page looked like after each step.
 
-- **`POST /screenshot`** (MCP: `screenshot_url`) — navigate under a profile, wait `wait_seconds`, return the image. No `url_patterns`. Use it when the point is to *see* the page: layout, a chart, an error banner, whatever isn't in an XHR body.
-- **`screenshot` block on `POST /capture`** (MCP: `capture_url` with `screenshot=true`) — same image, taken at the end of the capture window, returned next to the XHR matches.
-
-### `POST /screenshot`
-
-Request:
+### The step
 
 ```json
-{
-  "url": "https://example.com/dashboard",
-  "profile": "example",
-  "wait_seconds": 15,
-  "format": "jpeg",
-  "quality": 80,
-  "full_page": false,
-  "scale": 1.0,
-  "max_height": 8000,
-  "login_timeout": 300,
-  "login_url_patterns": ["login", "signin", "/auth"],
-  "login_actions": [],
-  "login_actions_timeout_seconds": null
-}
+{"type": "screenshot", "format": "jpeg", "quality": 80, "full_page": false, "scale": 1.0, "max_height": 8000, "timeout_s": 30}
 ```
+
+Every field but `type` is optional:
 
 | Field | Default | Notes |
 |---|---|---|
-| `wait_seconds` | `INTERCEPTOR_SCREENSHOT_WAIT_SECONDS` (15) | How long the page gets to render. Chrome spends the first ~4–5 s booting and navigating, so values under ~8 mostly return blank or half-painted pages. Hard wall, same as `capture_window_seconds`. |
-| `login_actions` / `login_actions_timeout_seconds` | `[]` / `null` (60) | Same as on `POST /capture` — see [Login actions](#login-actions). `wait_seconds` must then cover the login, the redirect and the page load; the response gains `login_actions_report`. |
 | `format` | `jpeg` | `jpeg` (~100–300 KB for a viewport), `png` (lossless, often 1–3 MB), `webp`. |
-| `quality` | `80` | jpeg/webp only; ignored for png. |
+| `quality` | `80` | 1–100, jpeg/webp only; ignored for png. |
 | `full_page` | `false` | Whole scrollable document instead of the 1920×1080 headless viewport. |
 | `scale` | `1.0` | Output scale, `0 < scale ≤ 2`. `0.5` halves each axis and roughly quarters the payload — the right default when the image is going into a model context. |
-| `max_height` | `8000` | `full_page` height clamp in CSS px. Chrome refuses clips beyond 16384. |
+| `max_height` | `8000` | `full_page` height clamp in CSS px, 100–16384. Chrome refuses clips beyond 16384. |
+| `timeout_s` | **`30`** | Budget for the whole step — settle, layout read and the capture itself. Higher than the 15 s other steps get because a tall full-page capture can take several seconds. |
 
-Response:
+An out-of-range value or an unknown field is a **422**, before a port is taken; so is an 11th screenshot step.
+
+The step's `value` (HTTP):
 
 ```json
 {
-  "job_id": "a3f2b1c9d4e5",
-  "url": "https://example.com/dashboard",
-  "status": "loading",
-  "login_wall": false,
-  "error": null,
-  "screenshot": {
+  "index": 2, "type": "screenshot", "ok": true, "elapsed_ms": 380, "error": null,
+  "value": {
     "format": "jpeg",
     "mime_type": "image/jpeg",
     "width": 1904,
@@ -179,30 +156,79 @@ Response:
     "bytes": 21655,
     "page_url": "https://example.com/dashboard",
     "data_base64": "/9j/4AAQ…"
-  },
-  "screenshot_error": null,
-  "login_actions_report": null
+  }
 }
 ```
 
 Things to know:
 
-- **`status: "loading"` is normal here.** `status` is the interceptor's *capture* status; a page that fires no JSON XHRs (static pages, `example.com`) never reaches `"ok"`. Look at `screenshot` / `screenshot_error`, not `status`, to judge the screenshot.
-- **`page_url` is where the tab actually ended up.** A redirect to a login page shows here even when `login_url_patterns` didn't recognise it — and the image is of that login page, which is useful evidence in itself.
+- **A failed screenshot does not stop the run.** It is recorded — `ok: false`, `error` says why (`Page.captureScreenshot failed: …`, `layout metrics reported an empty page …`) — and the next step runs; `aborted_reason` stays `null` on its account. Every other step type stops the run on failure. Cancellation, and the capture window ending, still stop it.
+- **It settles first, best-effort.** The step waits up to ~5 s for the [readiness gate](#readiness-gate) to pass again — which covers a screenshot right after a click that navigated — and then shoots the page **whether or not it got there**: a half-loaded page, or the login page a click bounced to, is exactly what the image is for.
+- **`page_url` is where the tab was at that step** — after any redirect an earlier step caused.
 - **`width`/`height` are the requested clip × `scale`**, not decoded from the image; Chrome's rounding can differ by a pixel. The headless viewport is `--window-size=1920,1080` minus browser chrome, so expect ~1904×929 at `scale: 1.0`.
-- **Same slot accounting as `/capture`.** A screenshot job takes one port-pool slot for `wait_seconds`, shows up in `GET /jobs` (phase `capturing` → `screenshot` → `cleaning_up`), and can be cancelled the same way. Pool exhausted → 429.
+- **Not allowed in [`login_actions`](#login-actions)** (a 422): an image of the login form would carry the username into the response, and the login design keeps credentials out of every response.
+
+### Worked example: a screenshot after each interesting step
+
+```json
+{
+  "url": "https://support.enphase.com/feoc-compliance/",
+  "url_patterns": ["webruntime/api/apex/execute"],
+  "profile": "enphase",
+  "capture_window_seconds": 60,
+  "login_url_patterns": ["login", "signin", "/auth", "sso\\.enphaseenergy\\.com"],
+  "actions": [
+    {"type": "fill", "selector": "textarea[placeholder='Serial number']", "value": "532614044013"},
+    {"type": "screenshot", "scale": 0.5},
+    {"type": "click", "selector": "button[type=submit]", "text": "Submit"},
+    {"type": "wait", "seconds": 5},
+    {"type": "screenshot", "full_page": true, "scale": 0.5}
+  ]
+}
+```
+
+`actions[1]` shows the filled form before it is submitted; `actions[4]` shows what Submit produced — the result table, or the validation banner that explains an empty `matches`.
+
+### Screenshot-only
+
+`url_patterns` may be empty (or, on MCP, omitted) **only** when `actions` has a screenshot step. With nothing to match, the capture window ends as soon as the actions finish — `ended_early: true` — so the call returns in seconds instead of after `capture_window_seconds`, which remains the upper bound:
+
+```json
+{
+  "url": "https://example.com/dashboard",
+  "profile": "example",
+  "actions": [{"type": "screenshot", "scale": 0.5}]
+}
+```
+
+- **`status: "loading"` is normal here.** `status` is the interceptor's *capture* status; a page that fires no JSON XHRs (static pages, `example.com`) never reaches `"ok"`. Look at the step's `ok` / `error`, not `status`, to judge the screenshot.
+- **The readiness gate still applies before the first step**, so a tab sitting on a login wall gets no image: the gate waits out `actions_ready_timeout_seconds`, the step is `skipped`, and the response says `login_wall: true` as usual. To see the login page itself, send `"login_url_patterns": []` (detection off — the gate then only waits for the page to load). To get past it, send [`login_actions`](#login-actions).
+- **Same slot accounting as any capture.** It takes one port-pool slot until the actions finish, shows up in `GET /jobs` (phase `actions`), and can be cancelled the same way. Pool exhausted → 429.
+
+### Payload budgeting
+
+Every image is base64 inside the HTTP JSON (a third bigger than the bytes) and an image block in a model's context. A 1920×1080 viewport JPEG at quality 80 is ~100–300 KB; `scale: 0.5` brings it to ~30–80 KB with the layout still readable. Prefer `full_page: false` unless the content below the fold is the point — ten full-page PNGs can come to tens of MB, which is why the step count is capped at 10.
 
 ### How it works
 
-`run_session` owns the CDP WebSocket to the tab and runs it on a private worker thread, so nothing else can issue commands on it. Chrome allows many debugger clients per target and `Page.captureScreenshot` needs no `Page.enable`, so the screenshot opens its **own** short-lived WebSocket to the same tab (`shared/common/src/common/cdp_interceptor/screenshot.py`), waits up to 5 s for `document.readyState == "complete"`, reads `Page.getLayoutMetrics`, captures, and closes. The interceptor session never notices. `InterceptorClient.screenshot()` is the thread-safe entry point; `app.py` calls it after `capture_window_seconds` elapses and before `client.quit()`.
+`run_session` owns the CDP WebSocket to the tab and runs it on a private worker thread, so nothing else can issue commands on it. Chrome allows many debugger clients per target and `Page.captureScreenshot` needs no `Page.enable`, so the screenshot step runs on the **same short-lived side WebSocket the other steps use** (`shared/common/src/common/cdp_interceptor/actions.py`): settle, read `location.href`, `Page.getLayoutMetrics`, build the clip with `screenshot.build_capture_params`, then `Page.captureScreenshot` with whatever is left of the step's `timeout_s` as its budget. The interceptor session never notices.
 
-The helper connects by `127.0.0.1` rather than `localhost` (on Windows `localhost` resolves to `::1` first and Chrome only listens on IPv4 — a measured 2 s penalty per connection) while pinning `Origin: http://localhost:<port>` so `--remote-allow-origins` still accepts the handshake.
+The side socket connects by `127.0.0.1` rather than `localhost` (on Windows `localhost` resolves to `::1` first and Chrome only listens on IPv4 — a measured 2 s penalty per connection) while pinning `Origin: http://localhost:<port>` so `--remote-allow-origins` still accepts the handshake.
+
+The library's standalone `capture_screenshot()` / `InterceptorClient.screenshot()` (`screenshot.py`) are still there for other callers; the service no longer uses them.
 
 ### On MCP
 
-`capture_url` and `screenshot_url` return the image as an MCP **`ImageContent` block** next to the JSON text block, so a multimodal model can actually look at it. The JSON carries only the metadata (`format`, `mime_type`, `width`, `height`, `full_page`, `bytes`, `page_url`) — the base64 is *not* duplicated into the text. HTTP callers get `data_base64` inline instead.
+`capture_url` returns the JSON text block first, then — for every screenshot step that produced an image, in step order — a short text label naming the step and an MCP **`ImageContent` block**, so a multimodal model can tell which image is which and actually look at them:
 
-Payload budgeting for a model context: a 1920×1080 viewport JPEG at quality 80 is ~100–300 KB; `scale: 0.5` brings it to ~30–80 KB with the layout still readable. Prefer `full_page: false` unless the content below the fold is the point.
+```
+actions[1] screenshot — https://support.enphase.com/feoc-compliance/, 952x464
+<image>
+actions[4] screenshot — https://support.enphase.com/feoc-compliance/, 952x1630
+<image>
+```
+
+The JSON keeps each step's metadata (`format`, `mime_type`, `width`, `height`, `full_page`, `bytes`, `page_url`) — the base64 is *not* duplicated into the text. A failed screenshot step gets no block; its `error` is in the JSON. HTTP callers get `data_base64` inline instead.
 
 ## Page scripts and actions
 
@@ -211,7 +237,7 @@ A plain capture only *watches*: it returns the JSON the page fetches on its own.
 | Field | Default | What it does |
 |---|---|---|
 | `page_script` | `null` | JS evaluated in the page once it is ready, before any action. Its JSON-serialisable result comes back as `actions_report.page_script.value`. Use it to *inspect* the page — e.g. list the form fields before writing `actions` (see the [discovery example](#worked-example-discover-the-form-then-run-the-lookup)). |
-| `actions` | `[]` | Ordered steps — `wait_for`, `fill`, `click`, `press`, `select`, `wait`, `evaluate` — run once the page is ready. Stops at the first failed step. |
+| `actions` | `[]` | Ordered steps — `wait_for`, `fill`, `click`, `press`, `select`, `wait`, `evaluate`, `screenshot` — run once the page is ready. Stops at the first failed step, except a failed `screenshot`, which is recorded and the run continues. |
 | `actions_ready_timeout_seconds` | `capture_window_seconds` | How long the [readiness gate](#readiness-gate) may wait before the steps are abandoned. |
 | `stop_when_matched` | `false` | End the window as soon as every `url_patterns` bucket has at least one match and the actions (if any) have finished, instead of waiting out `capture_window_seconds`. Needs at least one pattern (422 otherwise). |
 
@@ -230,8 +256,9 @@ It is tempting to have `page_script` call the endpoint directly with `fetch()`. 
 | `select` | `selector`, `value`, `text?`, `timeout_s?` | Native `<select>` only: picks the option whose value — or, failing that, visible text — equals `value`, fires `input` + `change`. A `lightning-combobox` is not a `<select>`: `click` it open, then `click` the option by `text`. |
 | `wait` | `seconds` | Sleeps (0–600 s, cancellable). |
 | `evaluate` | `script`, `timeout_s?` | `Runtime.evaluate` with `awaitPromise`, `returnByValue`, `userGesture`. The value comes back in that step's `value`; a thrown error fails the step with its message. |
+| `screenshot` | `format?` (`jpeg` \| `png` \| `webp`), `quality?` (80), `full_page?` (false), `scale?` (1.0), `max_height?` (8000), `timeout_s?` (**30**) | Settles (best-effort, ~5 s), then `Page.captureScreenshot`. The image is the step's `value` (`{format, mime_type, width, height, full_page, bytes, page_url, data_base64}`). **A failed screenshot does not stop the run.** At most 10 per request. See [Screenshots](#screenshots). |
 
-`timeout_s` defaults to **15** per step (max 600). Unknown step types and missing fields are a **422**; an unknown `press` key is a **400** — both before a port is taken.
+`timeout_s` defaults to **15** per step (30 for `screenshot`; max 600). Unknown step types and missing fields are a **422**; an unknown `press` key is a **400** — both before a port is taken.
 
 **Scripts are expressions.** `page_script` and `evaluate.script` are evaluated as given, not wrapped. `document.title` works; several statements need an async IIFE — `(async () => { const x = …; return x; })()`. Promises are awaited. Return plain data (objects, arrays, strings): DOM nodes and functions don't survive `returnByValue`.
 
@@ -259,12 +286,13 @@ LWC components often render a beat after `readyState` reaches `complete`. Steps 
 
 ### Timing, navigation, and `stop_when_matched`
 
-The actions run on a helper thread started right after Chrome launches, on their **own** CDP connection to the tab (`shared/common/src/common/cdp_interceptor/actions.py`, the same second-socket pattern as [Screenshots](#how-it-works)) — so the capture session's socket is untouched. The job's phase is `actions` while they run (`GET /jobs` metadata shows `actions_done` / `actions_total`) and back to `capturing` after. The window keeps counting the whole time: **`capture_window_seconds` must cover the login (if any), the gate, and every step.**
+The actions run on a helper thread started right after Chrome launches, on their **own** CDP connection to the tab (`shared/common/src/common/cdp_interceptor/actions.py`; see [Screenshots § How it works](#how-it-works) for why a second socket is safe) — so the capture session's socket is untouched. The job's phase is `actions` while they run (`GET /jobs` metadata shows `actions_done` / `actions_total`) and back to `capturing` after. The window keeps counting the whole time: **`capture_window_seconds` must cover the login (if any), the gate, and every step.**
 
 - **A step that navigates** (a submit that reloads) is handled: the next lookup sees the old execution context vanish, re-waits the readiness gate once and retries; a dropped side socket is reopened on the next call. A `page_script` / `evaluate` whose document is destroyed while it runs is re-run once on the new document after the gate passes again — this matters after a visible login, where the gate can pass on the post-login landing page a moment before the capture session re-navigates to the target URL.
-- **The first failure stops the run.** Later steps are reported `ok: false, error: "skipped"`. The capture itself still completes normally — matches, screenshot, cleanup.
+- **The first failure stops the run** — unless the failed step is a `screenshot`, which is recorded and the run goes on. Later steps are reported `ok: false, error: "skipped"`. The capture itself still completes normally — matches, cleanup.
 - **When the window ends first**, the running step is stopped and `aborted_reason` reads `capture window ended before actions finished`. `POST /jobs/{id}/cancel` stops them too (`aborted_reason: "cancelled"`).
-- **`stop_when_matched`** checks four times a second: actions done (or none requested) **and** every pattern has ≥ 1 match → the window ends, `ended_early: true`, and the screenshot (if requested) and cleanup run as normal. **A click is "done" when the mouse button is released, not when its request returns.** If the page also makes matching calls on its own during load — a Salesforce site's every Apex call goes to the same `webruntime/api/apex/execute` URL — a load-time match can satisfy the condition the moment the click returns, before the response you wanted arrives. End such `actions` with a `wait_for` on the element that renders the result, so the actions only finish once the answer is on screen.
+- **`stop_when_matched`** checks four times a second: actions done (or none requested) **and** every pattern has ≥ 1 match → the window ends, `ended_early: true`, and cleanup runs as normal. **A click is "done" when the mouse button is released, not when its request returns.** If the page also makes matching calls on its own during load — a Salesforce site's every Apex call goes to the same `webruntime/api/apex/execute` URL — a load-time match can satisfy the condition the moment the click returns, before the response you wanted arrives. End such `actions` with a `wait_for` on the element that renders the result, so the actions only finish once the answer is on screen.
+- **No `url_patterns` at all** (allowed only with a `screenshot` step) is the same check with nothing to match: the window ends the moment the actions finish, `ended_early: true`. See [Screenshots § Screenshot-only](#screenshot-only).
 
 ### The report
 
@@ -274,14 +302,15 @@ The actions run on a helper thread started right after Chrome launches, on their
   "actions": [
     { "index": 0, "type": "fill",     "ok": true,  "elapsed_ms": 220, "error": null, "value": { "element": "<input id=\"input-12\" name=\"serial\">", "value_length": 12 } },
     { "index": 1, "type": "click",    "ok": true,  "elapsed_ms": 95,  "error": null, "value": { "element": "<button>", "x": 961.5, "y": 412.0 } },
-    { "index": 2, "type": "wait_for", "ok": false, "elapsed_ms": 15004, "error": "timed out after 15s waiting for '.result' (visible): nothing matches selector \".result\"", "value": null },
-    { "index": 3, "type": "evaluate", "ok": false, "elapsed_ms": 0, "error": "skipped", "value": null }
+    { "index": 2, "type": "screenshot", "ok": true, "elapsed_ms": 380, "error": null, "value": { "format": "jpeg", "mime_type": "image/jpeg", "width": 952, "height": 464, "full_page": false, "bytes": 41210, "page_url": "https://…", "data_base64": "/9j/4AAQ…" } },
+    { "index": 3, "type": "wait_for", "ok": false, "elapsed_ms": 15004, "error": "timed out after 15s waiting for '.result' (visible): nothing matches selector \".result\"", "value": null },
+    { "index": 4, "type": "evaluate", "ok": false, "elapsed_ms": 0, "error": "skipped", "value": null }
   ],
-  "aborted_reason": "actions[2] (wait_for) failed: timed out after 15s waiting for '.result' (visible): …"
+  "aborted_reason": "actions[3] (wait_for) failed: timed out after 15s waiting for '.result' (visible): …"
 }
 ```
 
-`index` is the step's position in `actions` (`-1` for `page_script`). `aborted_reason` is `null` when every step ran and succeeded. `value` for DOM steps describes the element acted on; for `evaluate` / `page_script` it is the script's return value.
+`index` is the step's position in `actions` (`-1` for `page_script`). `aborted_reason` is `null` when every step ran — a failed `screenshot` step does not stop the run, so check each step's `ok` too. `value` for DOM steps describes the element acted on; for `evaluate` / `page_script` it is the script's return value; for `screenshot` it is the image and its metadata (the screenshot at index 2 above shows what the page looked like when `.result` never appeared).
 
 ### Login actions
 
@@ -292,7 +321,7 @@ A profile's SSO session eventually expires. Without help, the capture then lands
 | `login_actions` | `[]` | Steps that run **only** if the tab hits a login wall (`login_url_patterns`), once per capture. A `fill` value may reference the profile's stored credentials as `${username}`, `${password}`, … Needs a non-empty `login_url_patterns` (422 otherwise). |
 | `login_actions_timeout_seconds` | `null` (60) | Upper bound on one login run: the login page becoming ready plus every step. 1–600. |
 
-Also on `POST /screenshot` and on both the `capture_url` and `screenshot_url` MCP tools (`login_actions` only there; the timeout keeps its default).
+Also on the `capture_url` MCP tool (`login_actions` only there; the timeout keeps its default).
 
 #### The credentials file
 
@@ -333,7 +362,7 @@ INTERCEPTOR_LOGIN_ENPHASE_PASSWORD=…
 
 #### Allowed steps
 
-`wait_for`, `fill`, `click`, `press`, `select`, `wait` — **no `evaluate`** (a 422): a script on the login page could read the password field back into the report.
+`wait_for`, `fill`, `click`, `press`, `select`, `wait` — **no `evaluate`** (a 422): a script on the login page could read the password field back into the report — and **no `screenshot`** (a 422): an image of the login form would put the username into the response.
 
 #### What happens
 
@@ -378,7 +407,7 @@ with `ai/interceptor/logins/enphase.json` holding `allowed_origins: ["https://ss
 
 ### Worked example: discover the form, then run the lookup
 
-**1 — Discovery.** Load the page with a `page_script` that waits (up to 15 s) for an input to render, walks every open shadow root, and returns each `input` / `textarea` / `select` / `button` / `[role=button]` with the details you need to write selectors — `hosts` is the chain of custom-element hosts it sits inside (e.g. `c-feoc-form > lightning-input`). Add a screenshot to see what you're looking at. For a profile that has never logged in, Chrome opens visibly: log in in that window and the gate waits for you (keep `login_timeout` below `capture_window_seconds`). The readable source:
+**1 — Discovery.** Load the page with a `page_script` that waits (up to 15 s) for an input to render, walks every open shadow root, and returns each `input` / `textarea` / `select` / `button` / `[role=button]` with the details you need to write selectors — `hosts` is the chain of custom-element hosts it sits inside (e.g. `c-feoc-form > lightning-input`). A `screenshot` action (which runs after the `page_script`) shows what you're looking at. For a profile that has never logged in, Chrome opens visibly: log in in that window and the gate waits for you (keep `login_timeout` below `capture_window_seconds`). The readable source:
 
 ```js
 (async () => {
@@ -443,12 +472,12 @@ The same script as a ready-to-send request body (the `page_script` value is that
   "capture_window_seconds": 300,
   "login_timeout": 240,
   "login_url_patterns": ["login", "signin", "/auth", "sso\\.enphaseenergy\\.com"],
-  "screenshot": {"full_page": true, "scale": 0.5},
+  "actions": [{"type": "screenshot", "full_page": true, "scale": 0.5}],
   "page_script": "(async () => {\n  const SEL = 'input, textarea, select, button, [role=button]';\n  const roots = () => {\n    const out = [document], stack = [document];\n    while (stack.length) {\n      for (const el of stack.pop().querySelectorAll('*')) {\n        if (el.shadowRoot) { out.push(el.shadowRoot); stack.push(el.shadowRoot); }\n      }\n    }\n    return out;\n  };\n  const find = () => roots().flatMap(r => Array.from(r.querySelectorAll(SEL)));\n  const until = Date.now() + 15000;\n  let els = find();\n  while (!els.some(e => e.matches('input, textarea')) && Date.now() < until) {\n    await new Promise(r => setTimeout(r, 500));\n    els = find();\n  }\n  const txt = n => (n && (n.innerText || n.textContent) || '').replace(/\\s+/g, ' ').trim();\n  const labelOf = el => {\n    if (el.labels && el.labels.length) return txt(el.labels[0]);\n    const by = el.getAttribute('aria-labelledby');\n    if (by) {\n      const root = el.getRootNode();\n      const t = by.split(' ').map(id => root.getElementById(id)).filter(Boolean).map(txt).join(' ');\n      if (t) return t;\n    }\n    return el.getAttribute('aria-label') || '';\n  };\n  const hosts = el => {\n    const out = [];\n    for (let r = el.getRootNode(); r && r.host; r = r.host.getRootNode()) out.unshift(r.host.tagName.toLowerCase());\n    return out.join(' > ');\n  };\n  return els.map(el => {\n    const r = el.getBoundingClientRect();\n    return {\n      tag: el.tagName.toLowerCase(),\n      type: el.getAttribute('type') || '',\n      name: el.getAttribute('name') || '',\n      id: el.id || '',\n      label: labelOf(el),\n      aria_label: el.getAttribute('aria-label') || '',\n      placeholder: el.getAttribute('placeholder') || '',\n      text: (txt(el) || el.value || '').slice(0, 80),\n      visible: r.width > 0 && r.height > 0,\n      hosts: hosts(el)\n    };\n  });\n})()"
 }
 ```
 
-Without `stop_when_matched` this run lasts the full 300 s (time to log in). Add `"stop_when_matched": true` once the profile is logged in, and it returns as soon as the page script is done and the page has made its first Apex call.
+Without `stop_when_matched` this run lasts the full 300 s (time to log in). Add `"stop_when_matched": true` once the profile is logged in, and it returns as soon as the page script and the screenshot are done and the page has made its first Apex call.
 
 **2 — The lookup.** Discovery on the live page (2026-10-02) found the serial field as a `<textarea placeholder="Serial number">` inside `c-feoc-parent-comp > c-feoc-serial-num`, and a `<button type="submit">Submit</button>` in `c-feoc-parent-comp`. This body is **verified** — it returns the `submitSerialNumbers` result in ~10 s:
 
@@ -706,7 +735,6 @@ Because the fast path writes cookies back to the base profile, the refreshed ses
 | `INTERCEPTOR_DEBUG_PORT` | `9224` | Base of the CDP debug port pool. Pool spans `[base, base + INTERCEPTOR_MAX_CONCURRENT)`. |
 | `INTERCEPTOR_MAX_CONCURRENT` | `8` | Max simultaneous `/capture` calls. Each slot = one Chrome (~200–400 MB RAM) + on same-profile collision one profile clone (~20–80 MB disk). See [Resource sizing](#resource-sizing). |
 | `INTERCEPTOR_CAPTURE_WINDOW_SECONDS` | `20` | Default capture window when a request omits `capture_window_seconds`. |
-| `INTERCEPTOR_SCREENSHOT_WAIT_SECONDS` | `15` | Default render wait for `POST /screenshot` / `screenshot_url` when a request omits `wait_seconds`. See [Screenshots](#screenshots). |
 | `INTERCEPTOR_LOGINS_DIR` | `/config/logins` | Directory holding the per-profile credential files `<profile>.json` that `login_actions` references resolve from. The compose file bind-mounts `ai/interceptor/logins` there read-only; the files are re-read on every request. Kept outside `INTERCEPTOR_PROFILES_ROOT` on purpose. Changing the mount is a recreate: `make build interceptor && make up interceptor`. See [Login actions](#login-actions). |
 | `INTERCEPTOR_LOGIN_<PROFILE>_USERNAME` / `_PASSWORD` | _(empty)_ | The credentials a logins file references as `${ENV:INTERCEPTOR_LOGIN_…}` — today `INTERCEPTOR_LOGIN_ENPHASE_USERNAME` / `_PASSWORD`. Set in `.env`; each must also be listed in the compose `environment:` block (as `${VAR:-}`). Only the `INTERCEPTOR_LOGIN_` prefix is resolvable. Unset or empty → that profile's `login_actions` are a 400 naming the variable. A literal `$` is written `$$`. Changing a value is `make up interceptor`. |
 
@@ -723,21 +751,20 @@ curl -X POST http://localhost:4001/v1/interceptor/capture `
 
 ### MCP tools
 
-The `interceptor` MCP server (registered in `ai/litellm/litellm_config.yaml` `mcp_servers.interceptor`) exposes five model-invokable tools:
+The `interceptor` MCP server (registered in `ai/litellm/litellm_config.yaml` `mcp_servers.interceptor`) exposes four model-invokable tools:
 
 | Tool | Purpose | Args |
 |---|---|---|
-| `capture_url` | Run one capture — same core behavior as `POST /capture`; `screenshot=true` adds an image of the page; `page_script` / `actions` drive the page first (see [Page scripts and actions](#page-scripts-and-actions)) | `url`, `url_patterns`, `profile`, `capture_window_seconds`, `login_timeout`, `max_matches_per_pattern`, `screenshot`, `screenshot_full_page`, `screenshot_format`, `screenshot_scale`, `page_script`, `actions` (list of step objects), `stop_when_matched`, `login_url_patterns`, `actions_ready_timeout_seconds`, `login_actions` (see [Login actions](#login-actions)) |
-| `screenshot_url` | Navigate and return a screenshot — same core behavior as `POST /screenshot`. Image arrives as an `ImageContent` block (see [Screenshots § On MCP](#on-mcp)) | `url`, `profile`, `wait_seconds`, `full_page`, `format`, `quality`, `scale`, `login_timeout`, `login_url_patterns`, `login_actions` |
+| `capture_url` | Run one capture — same core behavior as `POST /capture`; `page_script` / `actions` drive the page first (see [Page scripts and actions](#page-scripts-and-actions)), and each `screenshot` action comes back as a labelled `ImageContent` block, in step order (see [Screenshots § On MCP](#on-mcp)). `url_patterns` may be omitted when an action is a screenshot — `actions=[{"type": "screenshot", "scale": 0.5}]` alone is how a model just looks at a page | `url`, `profile`, `url_patterns`, `capture_window_seconds`, `login_timeout`, `max_matches_per_pattern`, `page_script`, `actions` (list of step objects), `stop_when_matched`, `login_url_patterns`, `actions_ready_timeout_seconds`, `login_actions` (see [Login actions](#login-actions)) |
 | `list_profiles` | Discover which named profiles exist — call before `capture_url` if the LLM doesn't know the profile name. Each entry carries `login_keys` / `login_origins`: the `${…}` names its `login_actions` may use | *(none)* |
 | `list_jobs` | Snapshot of the port pool + running captures — same shape as `GET /jobs` | *(none)* |
 | `get_job` | Detail on one in-flight capture by id — same shape as `GET /jobs/{job_id}` | `job_id` |
 
 The `keep_open` and `debug_logging` knobs from `POST /capture` are deliberately **not** exposed to MCP — both are operator-only debug flags (`keep_open` requires manual Chrome-kill cleanup; `debug_logging` writes to a DevTools console the LLM can't read).
 
-`login_url_patterns` on both tools has the same semantics as on `POST /capture`: omit it (or pass `null`) to keep the defaults, pass a list to **replace** them, `[]` to disable detection. Pass the site's SSO host when the defaults don't match it — for Enphase, `["login", "signin", "/auth", "sso\\.enphaseenergy\\.com"]` — or an expired session comes back as an empty result rather than `login_wall: true`.
+`login_url_patterns` on `capture_url` has the same semantics as on `POST /capture`: omit it (or pass `null`) to keep the defaults, pass a list to **replace** them, `[]` to disable detection. Pass the site's SSO host when the defaults don't match it — for Enphase, `["login", "signin", "/auth", "sso\\.enphaseenergy\\.com"]` — or an expired session comes back as an empty result rather than `login_wall: true`.
 
-`login_actions` on both tools take the same step objects as `POST /capture`. The tool docstrings tell the model to write the credentials as references (`${username}`, `${password}` — the names `list_profiles` reports) and never to ask a user for a real username or password; the values never reach the model in either direction.
+`login_actions` on `capture_url` take the same step objects as `POST /capture`. The tool docstrings tell the model to write the credentials as references (`${username}`, `${password}` — the names `list_profiles` reports) and never to ask a user for a real username or password; the values never reach the model in either direction.
 
 MCP tools return dicts and never raise — errors surface inside the payload (e.g. `{"error": "no active job …"}` or a `capture_url` response with `status="error"` and an `error` field describing the HTTP-layer failure).
 
@@ -772,7 +799,7 @@ Every `/capture` invocation gets a 12-char hex `job_id` and shows up in `GET /jo
 
 **`GET /jobs/{job_id}`** — same shape as one element of `jobs[]`, or **HTTP 404** if the id isn't currently in flight. Completed captures aren't retained — a 404 means either the id never existed or the capture finished.
 
-`phase` progresses: `"cloning"` (slow path only, during `shutil.copytree`) → `"capturing"` (Chrome running, XHRs being intercepted) → `"cleaning_up"` (temp rmtree + port release). Fast-path captures skip `"cloning"` and go straight to `"capturing"`. A capture with `page_script` / `actions` shows `"actions"` while they run (back to `"capturing"` when they finish), and its `metadata` carries `actions_done` / `actions_total`; one with a screenshot passes through `"screenshot"` just before `"cleaning_up"`.
+`phase` progresses: `"cloning"` (slow path only, during `shutil.copytree`) → `"capturing"` (Chrome running, XHRs being intercepted) → `"cleaning_up"` (temp rmtree + port release). Fast-path captures skip `"cloning"` and go straight to `"capturing"`. A capture with `page_script` / `actions` shows `"actions"` while they run (back to `"capturing"` when they finish), and its `metadata` carries `actions_done` / `actions_total` (screenshots are action steps, so they happen in `"actions"` too).
 
 Typical workflow — see what's running, then drill in:
 
@@ -879,4 +906,4 @@ uv run cdp-spy --url https://roofix.io/project/abc123 --profile-dir C:\data\prof
 - Actions reach open shadow roots only — not closed shadow roots, not iframes — and `select` handles native `<select>` only. One `page_script` and one action list per capture; there is no conditional branching between steps (use an `evaluate` step for logic).
 - `login_actions` handle a plain form login only — one attempt per capture, no verification codes / MFA / CAPTCHA, and (because the form has to be in the top document) not a login form inside an iframe.
 - No MCP-side cancellation — cancel is HTTP-only. An LLM cannot reclaim a stuck capture it started; that's an operator's job.
-- Screenshots are one-shot, taken at the end of the window (after any `actions`, so "fill, click, then screenshot" works) — but there is no mid-run screenshot and no element-level clipping. Viewport is fixed at the headless `1920×1080` window; full-page height is clamped to `max_height` (≤ 16384).
+- Screenshots are action steps only — at most 10 per request, none in `login_actions`, none after the actions finish (put the last one at the end of `actions`) — and there is no element-level clipping. Viewport is fixed at the headless `1920×1080` window; full-page height is clamped to `max_height` (≤ 16384).

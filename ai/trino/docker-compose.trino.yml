@@ -255,6 +255,14 @@ services:
       ENERFLO_LEADS_DB_USER: ${ENERFLO_LEADS_DB_USER}
       ENERFLO_LEADS_DB_PASSWORD: ${ENERFLO_LEADS_DB_PASSWORD}
       ENERFLO_LEADS_DB_SSLMODE: ${ENERFLO_LEADS_DB_SSLMODE:-require}
+      # Supabase Postgres for the Operations Assistant project (off-box, TLS
+      # required). Consumed by catalogs/supabase_operations_assistant.properties.
+      OPERATIONS_ASSISTANT_DB_HOST: ${OPERATIONS_ASSISTANT_DB_HOST}
+      OPERATIONS_ASSISTANT_DB_PORT: ${OPERATIONS_ASSISTANT_DB_PORT:-5432}
+      OPERATIONS_ASSISTANT_DB_NAME: ${OPERATIONS_ASSISTANT_DB_NAME:-postgres}
+      OPERATIONS_ASSISTANT_DB_USER: ${OPERATIONS_ASSISTANT_DB_USER}
+      OPERATIONS_ASSISTANT_DB_PASSWORD: ${OPERATIONS_ASSISTANT_DB_PASSWORD}
+      OPERATIONS_ASSISTANT_DB_SSLMODE: ${OPERATIONS_ASSISTANT_DB_SSLMODE:-require}
       # Self-hosted Supabase Postgres (ai/supabase), on ai_shared — reached by
       # service DNS at supabase-db:5432, no TLS needed on-box. Credentials are
       # the read-only trino_reader role created by

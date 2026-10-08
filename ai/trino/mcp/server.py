@@ -53,7 +53,7 @@ async def list_catalogs() -> list[str]:
     Typical result: ``["aws_glue", "iceberg", "postgres_litellm",
     "postgres_phoenix", "postgres_roofix", "postgres_sandbox",
     "postgres_supabase", "supabase_ai_agents", "supabase_enerflo_leads",
-    "system"]``.
+    "supabase_operations_assistant", "system"]``.
     Catalogs are named ``<source>_<dataset>``: ``iceberg`` is the
     lakehouse on MinIO; ``postgres_*`` federate the subsystem Postgres
     instances we run (including ``postgres_supabase``, the self-hosted

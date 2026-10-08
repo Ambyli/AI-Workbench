@@ -18,7 +18,7 @@ frozen into module constants at import, so a per-test directory would be
 ignored by everything that matters.
 
 **The database.** The classifier keeps its job queue, references and
-model-usage rows in Postgres and has no SQLite fallback. With
+model-usage rows in Postgres and nowhere else. With
 ``TEST_POSTGRES_DSN`` set (the same variable
 ``shared/common/tests/test_jobs_postgres.py`` uses), this file creates one
 uniquely named database for the session — ``classifier_test_<pid>_<hex>`` —

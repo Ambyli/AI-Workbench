@@ -1,7 +1,7 @@
 """A throwaway Postgres database for the classifier's tests and ``--local`` runs.
 
 The classifier keeps every row in Postgres (``classifier-db`` in the
-container) and has no SQLite fallback, so anything that runs the app or its
+container) and nowhere else, so anything that runs the app or its
 stores outside the container needs a database. This module makes one per run
 on an admin connection the developer supplies, points the classifier's
 ``CLASSIFIER_DB_*`` variables at it, and drops it afterwards:

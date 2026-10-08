@@ -63,11 +63,10 @@ COPY ai/classifier/references ./ai/classifier/references
 COPY ai/classifier/regions ./ai/classifier/regions
 
 # The operator tools. `bin/` is not imported by the service — it holds scripts
-# that have to run WHERE THE MODEL OR THE DATA IS (grounding_experiment.py
-# talks to VISION_LLM_API directly; migrate_sqlite_to_postgres.py reads the
-# old /data/classifier.db and writes classifier-db), so they ship in the image
-# and run inside the container, through the project venv:
-# `docker exec classifier uv run python bin/migrate_sqlite_to_postgres.py`.
+# that have to run WHERE THE MODEL IS (grounding_experiment.py talks to
+# VISION_LLM_API directly), so they ship in the image and run inside the
+# container, through the project venv:
+# `docker exec classifier uv run python bin/grounding_experiment.py`.
 COPY ai/classifier/bin ./ai/classifier/bin
 
 # Import the app the way the CMD below will (PYTHONPATH is already

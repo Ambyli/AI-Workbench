@@ -1,7 +1,7 @@
 """POST /references and the rest of the routes, end to end, with a scripted model.
 
 Same harness as test_classifier_endpoint.py: the app runs in-process through
-FastAPI's TestClient with its real worker pool, SQLite queue, artifact store
+FastAPI's TestClient with its real worker pool, Postgres queue, artifact store
 and reference store (all on the session temp directory conftest.py sets up),
 and the vision model is replaced at the transport (``llm.client._send``) so
 the process-wide call limit stays in play. The fake model answers by the kind

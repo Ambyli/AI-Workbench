@@ -88,15 +88,11 @@ class ClassifierQueue:
         )
 
     # ── Lifecycle (called from main.lifespan) ─────────────────────────────
-    async def start(self, *, sweep_orphans: bool = True) -> None:
+    async def start(self) -> None:
         """Recover interrupted jobs, sweep orphan payloads, start the workers.
-        The registry must already be ``init()``-ed.
-
-        ``sweep_orphans=False`` keeps every payload file: ``main`` passes it
-        while the pre-Postgres SQLite file is still unmigrated, when a payload
-        with no row is a queued job whose row has not been copied yet."""
+        The registry must already be ``init()``-ed."""
         requeued = await self.pool.recover(phases=["staging"])
-        swept = await self.payloads.sweep(self.registry) if sweep_orphans else 0
+        swept = await self.payloads.sweep(self.registry)
         pending = await self.refresh_queue_depth()
         logger.info("queue: recovery requeued=%d orphan_payloads_removed=%d pending=%d "
                     "max_concurrent=%d", requeued, swept, pending, MAX_CONCURRENT)
@@ -248,7 +244,7 @@ async def _fail_reference(job: JobBase, exc: BaseException) -> None:
 # ``result_type="json"``: the result column is JSON, not JSONB. JSONB sorts
 # object keys, and a job result's key order is part of what it says —
 # ``per_criterion_scores`` lists the criteria in the order the request asked
-# them, exactly as the SQLite text column used to keep it. ``metadata`` stays
+# them, and JSON keeps that order as written. ``metadata`` stays
 # JSONB (``references.store.jobs_using`` tests it with ``?``).
 
 jobs_registry = PostgresRegistry(pool=database, result_type="json")

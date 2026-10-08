@@ -8,10 +8,10 @@ restarts; they only leave the store on an explicit ``delete()`` call or the
 consumer's own retention policy.
 
 This is the right shape for services that hand off work to a background
-worker and expose ``POST kickoff → GET /jobs/{id}`` polling — like the
-classifier did before its state moved to Postgres (``PostgresRegistry``, so
-Trino could federate it): ``/assess`` returns immediately with a ``job_id``
-while the actual analysis happens in an asyncio task.
+worker and expose ``POST kickoff → GET /jobs/{id}`` polling: the kickoff
+endpoint returns immediately with a ``job_id`` while the actual work happens
+in an asyncio task. A service whose job rows must be queryable from outside
+the process (``psql``, Trino) wants ``PostgresRegistry`` instead.
 
 The table doubles as a durable FIFO work queue: producers register jobs in
 ``"pending"`` and any number of consumers call ``claim_next()`` to
@@ -79,97 +79,19 @@ class SqliteRegistry:
             result     TEXT,             -- JSON, set on completion
             error      TEXT
         );
-
-    Migration: if an older schema exists (with a ``status`` column instead of
-    ``phase`` and separate ``type`` + ``request_id`` columns — the shape
-    classifier used before adopting ``common.jobs``), ``init()`` renames
-    ``status`` → ``phase``, adds ``metadata``, and back-fills each row's
-    ``metadata`` from the legacy ``type`` and ``request_id`` columns.
     """
 
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
 
-    # ── Init + migration ──────────────────────────────────────────────────
+    # ── Init ──────────────────────────────────────────────────────────────
     async def init(self) -> None:
-        """Create the schema or migrate an older one. Idempotent."""
+        """Create the table and its index. Idempotent."""
         if self.db_path != ":memory:":
             os.makedirs(os.path.dirname(self.db_path) or ".", exist_ok=True)
         async with aiosqlite.connect(self.db_path) as db:
-            existing = await self._existing_columns(db)
-            if existing is None:
-                # Fresh install — create from scratch.
-                await db.executescript(_SCHEMA + _INDEX)
-                await db.commit()
-                return
-
-            # Table exists — figure out whether it's the new shape or the old
-            # classifier shape and migrate the old one in place.
-            has_phase = "phase" in existing
-            has_status = "status" in existing
-            has_metadata = "metadata" in existing
-            has_type = "type" in existing
-            has_request_id = "request_id" in existing
-
-            if has_phase and has_metadata:
-                # Already migrated — just make sure the index exists.
-                await db.executescript(_INDEX)
-                await db.commit()
-                return
-
-            # Legacy schema detected. Rename status → phase if needed, then
-            # add the metadata column, then back-fill from the legacy columns.
-            if has_status and not has_phase:
-                await db.execute("ALTER TABLE jobs RENAME COLUMN status TO phase")
-            if not has_metadata:
-                await db.execute("ALTER TABLE jobs ADD COLUMN metadata TEXT")
-                # Back-fill metadata from whichever legacy columns are present.
-                if has_type or has_request_id:
-                    select_cols = "id"
-                    if has_type:
-                        select_cols += ", type"
-                    if has_request_id:
-                        select_cols += ", request_id"
-                    async with db.execute(
-                        f"SELECT {select_cols} FROM jobs"
-                    ) as cur:
-                        rows = await cur.fetchall()
-                    for row in rows:
-                        i = 1
-                        meta: dict[str, Any] = {}
-                        if has_type:
-                            meta["type"] = row[i]
-                            i += 1
-                        if has_request_id:
-                            meta["request_id"] = row[i]
-                        await db.execute(
-                            "UPDATE jobs SET metadata = ? WHERE id = ?",
-                            (json.dumps(meta), row[0]),
-                        )
-                else:
-                    await db.execute(
-                        "UPDATE jobs SET metadata = ? WHERE metadata IS NULL",
-                        (json.dumps({}),),
-                    )
-                # Enforce NOT NULL after back-fill by copying the table.
-                # SQLite doesn't support ALTER COLUMN NOT NULL directly, but
-                # our reads tolerate NULL metadata (parsed as {}) so we skip
-                # the recreate — cheap and safe.
-            await db.executescript(_INDEX)
+            await db.executescript(_SCHEMA + _INDEX)
             await db.commit()
-
-    @staticmethod
-    async def _existing_columns(db: aiosqlite.Connection) -> Optional[set[str]]:
-        """Return the set of column names for the ``jobs`` table, or ``None``
-        if the table doesn't exist yet."""
-        async with db.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='jobs'"
-        ) as cur:
-            if await cur.fetchone() is None:
-                return None
-        async with db.execute("PRAGMA table_info(jobs)") as cur:
-            rows = await cur.fetchall()
-        return {r[1] for r in rows}  # (cid, name, type, notnull, dflt, pk)
 
     # ── CRUD ──────────────────────────────────────────────────────────────
     async def register(

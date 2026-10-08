@@ -6,9 +6,8 @@ networks:
 services:
   # ── classifier-db: every row the classifier keeps ─────────────────────────
   # The job queue (jobs), saved references (reference_examples) and one row
-  # per vision-model request (llm_calls). Was a SQLite file on the
-  # classifier_data volume; a file has no listener and Trino has no SQLite
-  # connector, so it moved here. Same shape as roofix-db: on ai_shared, so
+  # per vision-model request (llm_calls) — in a networked database so Trino
+  # can federate them. Same shape as roofix-db: on ai_shared, so
   # trino-coordinator reaches it by service DNS (the postgres_classifier
   # catalog) without joining anything else, and published on
   # PORT_CLASSIFIER_DB for psql / DBeaver. Its own container, not a schema in
@@ -174,7 +173,7 @@ services:
       # model-usage rows. HOST and PORT are fixed (service DNS on ai_shared,
       # the container port); the credentials come from the `## Classifier`
       # block in .env with the same dev defaults classifier-db is created
-      # with. There is no SQLite fallback — an unreachable database fails
+      # with. It is the only store — an unreachable database fails
       # startup. See ai/classifier/API.md § Concurrency and durability.
       - CLASSIFIER_DB_HOST=classifier-db
       - CLASSIFIER_DB_PORT=5432
@@ -186,8 +185,7 @@ services:
       # under the same /data), plus the idle workers' fallback poll. Fixed
       # values, not ${…}: the names are generic enough that interpolating
       # them from the shared root .env could pick up another service's
-      # setting. They equal config.py's defaults. /data/classifier.db is the
-      # pre-Postgres database, read only by bin/migrate_sqlite_to_postgres.py.
+      # setting. They equal config.py's defaults.
       - CLASSIFIER_DATA_DIR=/data
       - PAYLOAD_DIR=/data/payloads
       - WORKER_POLL_INTERVAL_S=1.0

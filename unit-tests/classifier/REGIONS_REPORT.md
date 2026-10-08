@@ -70,7 +70,7 @@ Check before a run:
 `CLASSIFIER_REFERENCE_DIR` under the output directory, with
 `CLASSIFIER_OCR_ENGINE=rapidocr`, and a throwaway **Postgres database**: the
 classifier keeps its job queue, references and model-usage rows in Postgres
-and has no SQLite fallback, so `--local` needs `TEST_POSTGRES_DSN` (any
+and nowhere else, so `--local` needs `TEST_POSTGRES_DSN` (any
 server you can `CREATE DATABASE` on — e.g.
 `postgresql://postgres@localhost:5432/postgres`). It creates
 `classifier_local_<pid>_<hex>` on it for the run and drops it afterwards

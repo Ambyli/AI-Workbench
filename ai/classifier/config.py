@@ -299,14 +299,12 @@ FETCH_TIMEOUT: float = 120.0
 # Every row the classifier keeps — the job queue (`jobs`), saved references
 # (`reference_examples`) and one row per vision-model request (`llm_calls`) —
 # lives in ONE Postgres database, the compose-managed `classifier-db`
-# container. It used to be a SQLite file (/data/classifier.db); a file has no
-# network listener and Trino has no SQLite connector, so none of it could be
-# queried from Trino or Superset. Now it is federated as the
-# `postgres_classifier` catalog. `db.py` owns the one connection pool all
-# three stores share.
+# container — a networked database, so Trino can federate all of it as the
+# `postgres_classifier` catalog and Superset can chart it. `db.py` owns the
+# one connection pool all three stores share.
 #
-# CLASSIFIER_DB_HOST is REQUIRED — there is no default and no SQLite
-# fallback: `db.database.init()` (main's lifespan) refuses to start with a
+# CLASSIFIER_DB_HOST is REQUIRED — there is no default and no other store:
+# `db.database.init()` (main's lifespan) refuses to start with a
 # message naming the variables when it is empty. The compose file sets it to
 # `classifier-db`; the unit tests point it at a throwaway database on
 # TEST_POSTGRES_DSN. User / password / name default to `classifier`, the
@@ -317,14 +315,7 @@ FETCH_TIMEOUT: float = 120.0
 #
 # DATA_DIR is the volume root for everything that stays on FILES: the
 # payloads of queued jobs, the per-job artifact directories, and the
-# reference files. LEGACY_SQLITE_PATH is where the old database lived — read
-# only by bin/migrate_sqlite_to_postgres.py and by the startup guard.
-# LEGACY_SQLITE_MARKER is the file that script writes when a real (not
-# --dry-run) migration finishes. While the old file exists WITHOUT the marker,
-# startup skips the orphan sweeps (queued payloads and artifact directories
-# whose job row is missing): every row is still in the old file, so "missing"
-# would mean "not migrated yet", and the sweeps would delete data the script
-# is about to give a row.
+# reference files.
 #
 # JOB_TTL_HOURS is the retention window the artifact sweeper enforces (see
 # § Region layers below): past it, a terminal job's artifact directory AND
@@ -351,8 +342,6 @@ def build_dsn(host: str, port: int, user: str, password: str, name: str) -> str:
 DB_DSN: Optional[str] = (
     build_dsn(DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME) if DB_HOST else None
 )
-LEGACY_SQLITE_PATH: str = os.path.join(DATA_DIR, "classifier.db")
-LEGACY_SQLITE_MARKER: str = LEGACY_SQLITE_PATH + ".migrated"
 JOB_TTL_HOURS: int = int(os.environ.get("JOB_TTL_HOURS", "24"))
 
 # ---------------------------------------------------------------------------

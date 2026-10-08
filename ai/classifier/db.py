@@ -21,7 +21,7 @@ connection budget separately.
                       can fail with a unique violation on ``pg_type``).
     DatabaseNotConfigured
                       raised when CLASSIFIER_DB_HOST is unset — there is no
-                      SQLite fallback, so the classifier refuses to start.
+                      other store, so the classifier refuses to start.
 
 **Why ``acquire()`` is not just ``pool.acquire()``.** An asyncpg pool belongs
 to the event loop it was created on; using it from another loop fails. In the
@@ -29,10 +29,9 @@ container there is exactly one loop (uvicorn's) and every call takes the pool.
 But a caller on ANOTHER loop — a test that does ``asyncio.run(store.get(…))``
 while the app runs inside a ``TestClient``, an operator script, the store's
 lazy table creation before the lifespan ran — gets a one-off connection that
-is opened and closed around its block instead. That is the same "one
-connection per call, from anywhere" behaviour the stores had on aiosqlite, so
-nothing that drove them from a second loop needs to know the backend changed.
-A one-off connection is the exception, never the hot path.
+is opened and closed around its block instead, so a store can be driven from
+any loop without the caller knowing which one owns the pool. A one-off
+connection is the exception, never the hot path.
 
 Process flow position: imported by the three stores; ``main`` calls
 ``database.init()`` first thing in its lifespan and ``database.close()`` last.
@@ -61,7 +60,7 @@ class DatabaseNotConfigured(RuntimeError):
 
 _NOT_CONFIGURED = (
     "the classifier keeps its job queue, references and model-usage rows in "
-    "Postgres (the classifier-db container) and has no SQLite fallback, but "
+    "Postgres (the classifier-db container) and has no other store, but "
     "CLASSIFIER_DB_HOST is not set. Set CLASSIFIER_DB_HOST / _PORT / _USER / "
     "_PASSWORD / _NAME — ai/classifier/docker-compose.classifier.yml sets them "
     "for the container; the unit tests derive them from TEST_POSTGRES_DSN."

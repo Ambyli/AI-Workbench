@@ -26,17 +26,16 @@ Trino, as ``postgres_classifier``) can filter on a tag or read a field of the
 record without parsing text. ``record`` is JSON rather than JSONB on purpose:
 JSONB sorts object keys, and the record's criteria are kept in the order the
 reference was built with — the order its examples are shown in. The
-``Reference`` this module hands back is unchanged from the SQLite days —
-timestamps are ISO-8601 strings, ``tags`` a list, ``record`` a dict — so no
-route's response shape moved with the backend.
+``Reference`` this module hands back is plain data — timestamps are ISO-8601
+strings, ``tags`` a list, ``record`` a dict — so no route's response shape
+depends on the column types.
 
 The in-use check (``jobs_using``) reads the ``jobs`` table of the same
 database directly — the registry of ``common.jobs`` has no "which queued
 job's metadata mentions X" query, and a scan through ``list_all`` would drag
 every result blob along. It only reads ``phase`` and ``metadata``, the two
 columns ``common.jobs.postgres`` documents as its schema, and with
-``metadata`` a JSONB column the test is the ``?`` key-exists operator rather
-than a ``json_each`` scan.
+``metadata`` a JSONB column the test is the ``?`` key-exists operator.
 
 Process flow position: below ``api.references`` (every route), the runner
 (``jobs.runners.run_reference``) and ``main``'s lifespan (init + reconcile).
@@ -115,7 +114,7 @@ def _json(value: Any) -> Any:
 
 def _affected(status: str) -> int:
     """Rows touched, from an asyncpg command tag (``"UPDATE 1"``,
-    ``"DELETE 0"``) — asyncpg's equivalent of sqlite3's ``rowcount``."""
+    ``"DELETE 0"``) — asyncpg's equivalent of a cursor's ``rowcount``."""
     try:
         return int(status.rsplit(" ", 1)[-1])
     except (AttributeError, ValueError):
@@ -297,7 +296,7 @@ class ReferenceRegistry:
         (tags are stored lowercased, so the match is case-insensitive).
 
         The tag test is JSONB's ``?`` — "is this string an element of the
-        array" — which is what the SQLite version's ``json_each`` scan did.
+        array".
         """
         where: list[str] = []
         args: list[Any] = []

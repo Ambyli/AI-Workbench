@@ -448,9 +448,9 @@ class UsageStore:
     ) -> list[tuple[Any, dict[str, Any]]]:
         """``[(group key, totals block)]`` for the rows matching ``where``.
 
-        A grouped list is ordered by its key with NULL FIRST — the order the
-        SQLite version produced, so ``by_criterion`` still lists the calls
-        that belong to no criterion (selection, describe) first.
+        A grouped list is ordered by its key with NULL FIRST, so
+        ``by_criterion`` lists the calls that belong to no criterion
+        (selection, describe) first.
         """
         await self._ensure()
         select = f"{group_by} AS grp, " if group_by else "NULL AS grp, "

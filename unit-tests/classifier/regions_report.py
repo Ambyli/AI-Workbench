@@ -400,7 +400,7 @@ class LocalTransport:
     def __init__(self, workdir: pathlib.Path):
         workdir.mkdir(parents=True, exist_ok=True)
         # The classifier keeps its queue, references and usage rows in
-        # Postgres, with no SQLite fallback — so a local run needs a server.
+        # Postgres and nowhere else — so a local run needs a server.
         # It gets a database of its own (classifier_local_<pid>_<hex>) on
         # TEST_POSTGRES_DSN (or an explicitly set CLASSIFIER_DB_HOST & co.),
         # dropped again in __exit__. Inside pytest the conftest has already

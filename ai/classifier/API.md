@@ -110,7 +110,6 @@ ai/classifier/
     queue.py           ClassifierQueue + the registry / queue / sweeper singletons
   bin/
     grounding_experiment.py   operator tool — runs where the model is
-    migrate_sqlite_to_postgres.py  one-shot: the old /data/classifier.db → classifier-db
 ```
 
 Import direction is strictly one way:
@@ -161,11 +160,16 @@ on `ai_shared`, host port `PORT_CLASSIFIER_DB` = 5439): the job queue
 (`jobs`, `common.jobs.postgres.PostgresRegistry`), saved references
 (`reference_examples`) and one row per model request (`llm_calls`). The three
 stores share one asyncpg pool (`db.py`, `CLASSIFIER_MAX_CONCURRENT +
-CLASSIFIER_MAX_LLM_CALLS + 8` connections). There is **no SQLite fallback**:
+CLASSIFIER_MAX_LLM_CALLS + 8` connections). The database is the only store:
 with `CLASSIFIER_DB_HOST` unset, or the database unreachable, the service
 refuses to start and says why. The same database is federated into Trino as
 the `postgres_classifier` catalog (read-only `trino_reader` role), so jobs,
-references and per-call cost can be queried from Trino and Superset. Files
+references and per-call cost can be queried from Trino and Superset. That
+role is created by `ai/classifier/db-init/10-trino-reader.sh` on the first
+start of an empty `classifier_db` volume, with
+`CLASSIFIER_TRINO_READER_PASSWORD` from `.env` (`openssl rand -hex 32`; empty
+skips it) — re-run the script by hand for an existing volume or to rotate the
+password. Files
 stay on the `classifier_data` volume: queued payloads, artifact directories
 and reference files. A job's `result` column is `JSON`, not `JSONB` — JSONB
 sorts object keys, and `per_criterion_scores` lists criteria in request order.
@@ -242,52 +246,6 @@ generation spent thinking, and `classifier_llm_call_seconds_count` against
 the server-wide hit rate across chat traffic too.
 
 ### Deploying this version
-
-**State moved from SQLite to Postgres (`classifier-db`).** The classifier no
-longer reads `/data/classifier.db`; it starts on an empty `classifier-db`, and
-its FIRST start prunes what that empty database does not know — queued
-payloads whose row is missing, and every job artifact directory whose row is
-missing. So the old data is copied across BEFORE the new container starts:
-
-1. **Drain the queue** (`classifier_job_queue_depth` at 0) — not required (a
-   queued job whose payload is still on disk is carried over and runs), but
-   it leaves nothing half-done.
-2. Set `CLASSIFIER_TRINO_READER_PASSWORD` in `.env` (`openssl rand -hex 32`):
-   the read-only Trino role is created on the first start of an empty
-   `classifier_db` volume (re-runnable by hand, see
-   `ai/classifier/db-init/10-trino-reader.sh`). `CLASSIFIER_DB_USER` /
-   `_PASSWORD` / `_NAME` default to `classifier`.
-3. `make build classifier`, then `make up classifier classifier-db` — the
-   database only; the old classifier keeps running on SQLite.
-4. `docker stop classifier`, then copy the data with a one-off container of
-   the new image (same volume, same env, never starts the app):
-
-   ```bash
-   docker compose -f ai/classifier/docker-compose.classifier.yml --env-file .env \
-       -p ai-classifier run --rm --no-deps classifier \
-       uv run python bin/migrate_sqlite_to_postgres.py        # --dry-run to count first
-   ```
-
-   It copies `reference_examples` (the one that matters — references never
-   expire and their files are named by these ids), `jobs` and `llm_calls`,
-   prints read / inserted / already present / unreadable per table, is
-   idempotent (`ON CONFLICT DO NOTHING`; a second run inserts 0) and never
-   touches the SQLite file. A job that was not finished keeps its phase when
-   its payload is on disk, and arrives `failed` ("resubmit") when it is not.
-   A real (not `--dry-run`) run also writes `/data/classifier.db.migrated`
-   beside the old file — the marker the startup guard below looks for.
-5. `make up classifier`. Remove `/data/classifier.db` (and the marker) by hand
-   once the counts look right. **Startup guard:** while the old file exists
-   WITHOUT the marker, startup logs an ERROR and skips the orphan payload
-   sweep and the artifact sweeper (TTL included), because a payload or an
-   artifact directory with no Postgres row is, in that state, data the
-   migration has not given a row yet. So starting the new container first
-   loses nothing: run `docker exec classifier uv run python
-   bin/migrate_sqlite_to_postgres.py`, then `make up classifier` again to turn
-   the sweeps back on.
-6. `make up trino` (a recreate: the coordinator's env gained
-   `CLASSIFIER_DB_NAME` / `CLASSIFIER_TRINO_READER_PASSWORD`), then check
-   `SELECT * FROM postgres_classifier.public.llm_calls LIMIT 5`.
 
 **Recreate `muse-glimmer` FIRST, with `--limit-mm-per-prompt '{"image": 3}'`.**
 A reference-guided scoring call sends up to three images, and a vLLM started

@@ -1,7 +1,7 @@
 """POST /assess end to end, through FastAPI's TestClient, with a scripted model.
 
 No network and no live model: the app runs in-process with its real worker
-pool, SQLite queue and artifact store (all on the session temp directory set
+pool, Postgres queue and artifact store (all on the session temp directory set
 up by conftest.py), and the vision model is replaced at the transport
 (``llm.client._send``) so the process-wide call limit stays in play.
 

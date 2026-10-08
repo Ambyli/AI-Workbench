@@ -10,8 +10,7 @@ Three backends, same conceptual shape:
 * ``SqliteRegistry`` (from ``common.jobs.sqlite``) — async, ``aiosqlite``-backed,
   persistent. Jobs survive process restarts and only leave the store on
   explicit ``delete``. Good for single-process services with light write
-  concurrency and no need to query the jobs from outside the process (the
-  classifier used it until its state moved to ``classifier-db``).
+  concurrency and no need to query the jobs from outside the process.
 
 * ``PostgresRegistry`` (from ``common.jobs.postgres``) — async, ``asyncpg``-backed,
   persistent, with a real connection pool and ``JSONB`` metadata/result. For

@@ -54,6 +54,13 @@ When the request lists references, a finished per-item unit then goes through
 score (never raise it) — before ``score: false`` clears the judgement, so a
 locate-only criterion still reports the check.
 
+Every unit is its own task under ``gather``, so the scheduler is also where a
+model call learns which unit it is for: ``run_item`` wraps the selection call
+in ``llm.usage.unit_scope(item, document)``, and ``_evaluate`` /
+``_evaluate_document`` wrap the evaluator in one that adds the criterion. The
+``llm_calls`` row each request writes carries those, and the per-task context
+keeps two concurrent units from ever seeing each other's.
+
 Process flow position: called by ``analysis.pipeline.analyze_document``
 between building the item contexts and aggregating the results.
 """
@@ -69,6 +76,7 @@ from analysis.outcome import Outcome, skipped
 from analysis.result_specs import clear_judgement
 from api.schemas import CriterionInput
 from config import MAX_UNITS_PER_JOB
+from llm.usage import unit_scope
 from logger import logger
 
 EVALUATORS = {
@@ -167,8 +175,11 @@ async def run_units(
             if outcome is None and ctx.references is not None and ctx.references.needs_selection(c):
                 # references "auto": this item's one selection call, shared by
                 # every unit on it — awaited BEFORE taking a unit slot, so a
-                # unit waiting on it holds nothing. It never raises.
-                await ctx.references.select(ctx)
+                # unit waiting on it holds nothing. It never raises. Its usage
+                # row carries the item and NO criterion: whichever unit gets
+                # here first makes the call, on behalf of all of them.
+                with unit_scope(item=ctx.item, document=ctx.document):
+                    await ctx.references.select(ctx)
             if outcome is None:
                 async with slots:
                     outcome = await _evaluate(c, ctx)
@@ -228,7 +239,9 @@ def _unjudged(c: CriterionInput, outcome: Outcome) -> Outcome:
 async def _evaluate(c: CriterionInput, ctx: DocumentContext) -> Outcome:
     """One evaluator call with the error isolation and ``score: false`` applied."""
     try:
-        outcome = await EVALUATORS[c.type](c, ctx)
+        # Every model call this unit makes is attributed to it (llm.usage).
+        with unit_scope(criterion=c.name, item=ctx.item, document=ctx.document):
+            outcome = await EVALUATORS[c.type](c, ctx)
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001 — every failure is this unit's alone
@@ -246,7 +259,8 @@ async def _evaluate(c: CriterionInput, ctx: DocumentContext) -> Outcome:
 async def _evaluate_document(c: CriterionInput, group: DocumentGroup) -> Outcome:
     """The same, for a document-scope unit (its evaluator stamps each region)."""
     try:
-        outcome = await DOCUMENT_EVALUATORS[c.type](c, group)
+        with unit_scope(criterion=c.name, document=group.index):
+            outcome = await DOCUMENT_EVALUATORS[c.type](c, group)
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001

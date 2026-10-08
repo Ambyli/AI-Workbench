@@ -11,7 +11,9 @@
                                no call path — scoring, box ask, refine,
                                verify — can get around the limit, and every
                                request is timed and its token usage counted
-                               by call kind there.
+                               by call kind there — and written as one
+                               ``llm_calls`` row linked to its job
+                               (``llm.usage``).
     call_kind()              — label -> score | ask | refine | verify |
                                select | describe | other (the metric label).
     usage_counts()           — a response's prompt / cached / completion /
@@ -41,7 +43,15 @@ verify, select, describe, other — derived from the ``label`` every caller
 already passes (:func:`call_kind`), so they say whether time goes to
 prefill, reasoning, or retries without a criterion name ever becoming a
 label value. ``_post`` also writes one INFO line per model request with the
-same numbers.
+same numbers (and the job id).
+
+The counters cannot say what one JOB cost, and a log line does not survive
+rotation, so ``_post`` also writes one row per request — ok or error — to the
+``llm_calls`` table of ``classifier.db`` through ``llm.usage``: the job, the
+criterion / item / document it was for (from context vars the queue and the
+scheduler set), the model, the seconds, every token count and the raw
+``usage`` object. Those rows outlive the job's TTL; ``GET /jobs/{id}/usage``
+and ``GET /usage`` read them (``api.usage``).
 
 Tests script the model by replacing ``call_vllm`` / ``call_vllm_json`` (the
 calls) or ``_send`` (the bare transport under ``_post``, which keeps the limit
@@ -72,6 +82,7 @@ from config import (
     VISION_LLM_API,
     VISION_LLM_MODEL,
 )
+from llm import usage as llm_usage
 from logger import logger
 
 # Shared HTTP timeout applied to every vLLM request
@@ -286,9 +297,17 @@ async def _post(prompt: dict, *, label: str = "", attempt: int = 1) -> dict:
 
     Every request — each retry included — is timed into
     ``classifier_llm_call_seconds{kind, outcome}``, its ``usage`` is added to
-    the per-kind token counters, and one INFO line records the kind, the
-    label, the seconds and the four token counts. The timer runs inside the
-    slot, so it measures the model, not the wait for a slot.
+    the per-kind token counters, and one INFO line records the job, the kind,
+    the label, the seconds and the four token counts. The timer runs inside
+    the slot, so it measures the model, not the wait for a slot.
+
+    Every request — ok or error — is also written as one ``llm_calls`` row
+    (``llm.usage.record_call``), attributed to its job and unit from the
+    context vars ``llm.usage`` holds. The write happens after the slot is
+    released, so the SQLite insert never holds a model slot, and it never
+    raises: a failed accounting write cannot fail the call. A failed request
+    is recorded (``http_status`` for a non-2xx, the exception as ``error``)
+    and then re-raised unchanged.
 
     Args:
         prompt:  The chat-completion request body.
@@ -297,27 +316,44 @@ async def _post(prompt: dict, *, label: str = "", attempt: int = 1) -> dict:
         attempt: 1-based attempt number, for the log line.
     """
     kind = call_kind(label)
+    failure: Exception | None = None
+    data = None
     async with LLM_CALLS:
+        started_at = llm_usage.now_iso()
         t0 = time.monotonic()
         try:
             data = await _send(prompt)
-        except Exception:
-            elapsed = time.monotonic() - t0
-            llm_call_seconds.labels(kind=kind, outcome="error").observe(elapsed)
-            logger.info(
-                "llm call kind=%s label=%s attempt=%d %.2fs outcome=error",
-                kind, label, attempt, elapsed,
-            )
-            raise
+        except Exception as exc:
+            # Kept, not raised here: the usage row is written below, AFTER
+            # the slot is released, and then the failure is re-raised. A
+            # cancellation (BaseException) is not caught and records nothing.
+            failure = exc
         elapsed = time.monotonic() - t0
+    job_id = llm_usage.job_id_var.get() or "-"
+    if failure is not None:
+        llm_call_seconds.labels(kind=kind, outcome="error").observe(elapsed)
+        logger.info(
+            "llm call job=%s kind=%s label=%s attempt=%d %.2fs outcome=error",
+            job_id, kind, label, attempt, elapsed,
+        )
+        await llm_usage.record_call(
+            label=label, kind=kind, attempt=attempt, prompt=prompt, data=None,
+            error=failure, seconds=elapsed, started_at=started_at,
+            counts=usage_counts(None),
+        )
+        raise failure
     llm_call_seconds.labels(kind=kind, outcome="ok").observe(elapsed)
     counts = usage_counts(data)
     _record_usage(kind, counts)
     logger.info(
-        "llm call kind=%s label=%s attempt=%d %.2fs prompt=%s cached=%s "
+        "llm call job=%s kind=%s label=%s attempt=%d %.2fs prompt=%s cached=%s "
         "completion=%s reasoning=%s",
-        kind, label, attempt, elapsed,
+        job_id, kind, label, attempt, elapsed,
         counts["prompt"], counts["cached"], counts["completion"], counts["reasoning"],
+    )
+    await llm_usage.record_call(
+        label=label, kind=kind, attempt=attempt, prompt=prompt, data=data,
+        error=None, seconds=elapsed, started_at=started_at, counts=counts,
     )
     return data
 

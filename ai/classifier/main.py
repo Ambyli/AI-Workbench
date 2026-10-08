@@ -20,6 +20,8 @@ Every endpoint handler lives in ``api/``:
     api.artifacts      the four /jobs/{job_id}/artifacts routes
     api.references     POST/GET/PATCH/DELETE /references — saved worked
                        examples, each built by a "reference" job
+    api.usage          GET /jobs/{job_id}/usage, GET /usage — the model
+                       calls each job made (llm_calls), which outlive the job
     common.jobs.router GET /jobs, GET /jobs/{id}, DELETE /jobs/{id}
 
 /locate and /assess/compare were removed and answer 404 like any unknown
@@ -61,6 +63,11 @@ text.p<item>.<key>.json per item and text layer its criteria used, one base
 image per item, manifest.json with the item map); the SVG / PNG / preview
 layers are rendered on first fetch by the artifact routes. A background sweeper prunes those directories, and the
 expired job rows themselves, past JOB_TTL_HOURS.
+
+Every vision-model request is also written as one ``llm_calls`` row linked
+to its job (``llm.usage``). Those rows are NOT swept — they outlive the job,
+so its cost stays readable at GET /jobs/{id}/usage — and only DELETE
+/jobs/{id} removes them.
 """
 
 import logging
@@ -73,9 +80,11 @@ from common.jobs.router import build_router
 
 from api import artifacts as artifacts_api
 from api import assess, introspection, references as references_api
+from api import usage as usage_api
 from config import LOG_LEVEL
 from jobs.queue import jobs_registry, queue, sweeper
 from llm import client as llm_client
+from llm import usage as llm_usage
 from logger import logger
 from middleware import CorrelationIDMiddleware, RequestIDFilter
 from references.store import reconcile as reconcile_references
@@ -114,7 +123,7 @@ async def lifespan(app: FastAPI):
 
     On startup:
       - Initialise (or migrate) the shared SQLite job registry, and create
-        the ``reference_examples`` table in the same DB.
+        the ``reference_examples`` and ``llm_calls`` tables in the same DB.
       - Reconcile references: a ``pending`` one whose creation job is gone or
         finished without readying it is marked ``failed`` (its job may have
         expired, or failed while no process was there to record it).
@@ -135,6 +144,7 @@ async def lifespan(app: FastAPI):
     """
     await jobs_registry.init()
     await reference_registry.init()
+    await llm_usage.usage_store.init()
     failed = await reconcile_references(jobs_registry)
     if failed:
         logger.warning("lifespan: %d pending reference(s) reconciled to failed", failed)
@@ -172,14 +182,35 @@ Instrumentator(
 # mid-analysis. If we later teach the worker to poll for phase="cancelled"
 # and bail out, flip include_cancel=True here.
 #
-# on_delete takes the job's artifact directory with the row, so DELETE
-# /jobs/{id} can never leave layer files that nothing points at.
+# on_delete takes the job's artifact directory AND its model-usage rows with
+# the row, so DELETE /jobs/{id} can never leave layer files that nothing
+# points at. The usage rows are the one thing the TTL sweeper leaves behind
+# (they outlive the job on purpose), so this delete is the only way they go.
+
+
+async def _delete_job_side_data(job_id: str) -> None:
+    """``on_delete`` hook: the artifact directory, then the usage rows.
+
+    Each step is guarded on its own — the router swallows a hook failure as a
+    whole, and a filesystem error on the directory must not leave the usage
+    rows behind. Runs before the router's own row check, so a DELETE on a job
+    the sweeper already expired still removes its usage, then answers 404.
+    """
+    try:
+        delete_artifacts_for_job(job_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("delete: could not remove artifacts for job %s: %s", job_id, exc)
+    removed = await llm_usage.usage_store.delete_job(job_id)
+    if removed:
+        logger.info("delete: removed %d model usage row(s) for job %s", removed, job_id)
+
+
 app.include_router(
     build_router(
         jobs_registry,
         include_delete=True,
         include_cancel=False,
-        on_delete=delete_artifacts_for_job,
+        on_delete=_delete_job_side_data,
     )
 )
 
@@ -187,6 +218,10 @@ app.include_router(
 # (/jobs/{id}/artifacts…) so they cannot collide with the jobs router's
 # /jobs/{job_id}, whatever the include order.
 app.include_router(artifacts_api.build_artifacts_router(jobs_registry))
+
+# GET /jobs/{id}/usage (three segments deep, like the artifact routes) and
+# GET /usage — what each job's model calls cost.
+app.include_router(usage_api.build_usage_router(jobs_registry))
 
 # The endpoints themselves: /assess, /references, then the introspection
 # routes and /health.

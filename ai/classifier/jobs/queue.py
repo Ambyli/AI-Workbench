@@ -25,6 +25,9 @@ Flow:
      message naming it. A "reference" job that fails for ANY reason —
      including a payload that never landed — marks its reference
      ``failed``; a cancelled one leaves it ``pending`` for the requeue.
+     ``handle_job`` also tags every model call the job makes with its id and
+     type (``llm.usage`` context vars) and, when the runner returns, adds
+     the job's ``usage`` totals to the result.
   3. The pool persists the result / error (→ "completed" | "failed") and
      calls ``_on_finish`` for metrics.
   4. Callers poll GET /jobs/{job_id}.
@@ -49,6 +52,7 @@ from common.jobs.worker import WorkerPool
 
 from config import DB_PATH, MAX_CONCURRENT, PAYLOAD_DIR, WORKER_POLL_INTERVAL_S
 from jobs.runners import run_assess, run_reference
+from llm import usage as llm_usage
 from logger import logger
 from metrics import job_duration, job_queue_depth, jobs_in_flight, jobs_total
 from middleware import request_id_var
@@ -131,6 +135,14 @@ class ClassifierQueue:
         jobs_in_flight.inc()
         keep_payload = False
         job_type = job.metadata.get("type", JOB_TYPE)
+        # Every model call this job makes — in every unit task the scheduler
+        # spawns, which copy this context — is recorded against it (llm.usage).
+        # Reset in `finally`: the pool awaits this handler in its own loop
+        # task, which must not carry one job's id into the next.
+        usage_tokens = (
+            llm_usage.job_id_var.set(job.job_id),
+            llm_usage.job_type_var.set(job_type),
+        )
         try:
             payload = await self.payloads.read(job.job_id)
             if payload is None:
@@ -145,8 +157,10 @@ class ClassifierQueue:
                 )
             # Looked up on the module at call time so a test can replace them.
             if job_type == "reference":
-                return await run_reference(payload)
-            return await run_assess(payload)
+                result = await run_reference(payload)
+            else:
+                result = await run_assess(payload)
+            return await _with_usage(job.job_id, result)
         except asyncio.CancelledError:
             # A shutdown mid-job: `docker compose stop` / `make up classifier`
             # sends SIGTERM, uvicorn runs the lifespan shutdown, and
@@ -162,6 +176,8 @@ class ClassifierQueue:
                 await _fail_reference(job, exc)
             raise
         finally:
+            llm_usage.job_type_var.reset(usage_tokens[1])
+            llm_usage.job_id_var.reset(usage_tokens[0])
             jobs_in_flight.dec()
             if not keep_payload:
                 # Completed or failed: the input is no longer needed. (A hard
@@ -175,6 +191,27 @@ class ClassifierQueue:
         jobs_total.labels(type=job_type, status=phase).inc()
         job_duration.labels(type=job_type).observe(elapsed)
         # Depth gauge is refreshed by the next enqueue/claim; keep the hook sync + cheap.
+
+
+async def _with_usage(job_id: str, result: Any) -> Any:
+    """Put the job's model-usage totals into its result as ``usage``.
+
+    The same numbers ``GET /jobs/{id}/usage`` reports as ``totals`` (calls,
+    errors, seconds, the five token totals, the models), plus ``usage_url``
+    for the per-call rows — read from the ``llm_calls`` rows this job's calls
+    have just written, so the result and the endpoint can never disagree. A
+    failed job has no result; its usage is still at the URL.
+
+    Never raises: a usage read that fails leaves the result without the block
+    rather than failing a job whose actual work succeeded.
+    """
+    if not isinstance(result, dict):
+        return result
+    try:
+        result["usage"] = await llm_usage.usage_store.job_usage(job_id)
+    except Exception as exc:  # noqa: BLE001 — accounting never fails a job
+        logger.warning("queue: could not read model usage for job %s: %s", job_id, exc)
+    return result
 
 
 async def _fail_reference(job: JobBase, exc: BaseException) -> None:

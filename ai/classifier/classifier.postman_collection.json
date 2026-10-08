@@ -585,7 +585,7 @@
             }
           ]
         },
-        "description": "Poll one job. `phase` progresses staging → pending → processing → completed | failed. When `completed`, `result` is the assessment:\n\nResult shape (GET /jobs/:jobId → `result`, `schema_version: 3`):\n  `{schema_version, documents, items, assessment: {overall_score, overall_verdict, complete, weighted_score_breakdown, per_criterion_scores}, verdict, page_geometry, detector, artifacts}`\nEvery page of every document is one ITEM, numbered globally in request order. `documents[]` is `{index, filename, kind, pages, items, document_info}` (document_info: content_type, size_bytes, has_image, native_text_chars, ocr.layers per item, ocr.document_layers, llm_text_char_budget). `items[]` is `{item, document, page, filename, overall_score, overall_verdict, complete}` — each item's own weighted score. `page_geometry` is a list, one entry per item (null sizes for a .txt/.docx item); `page` there, a region's `page` and the `p{n}` layer prefix all mean the item.\nEvery entry of `per_criterion_scores` has the SAME keys — the AGGREGATED answer: `status` (ok | error | skipped), `type`, `method`, `scored`, `score`, `verdict`, `confidence`, `reason`, `detail`, `regions` (the union over every item, capped at CLASSIFIER_INLINE_REGIONS_MAX with `regions_truncated`), `artifacts` (`items`: per item, that page's layer URLs filtered to the criterion and its loop `attempts`; `text`: one link per text layer its units read), `localization` (llm: the loop's record — merged across items), `options_used` (with `aggregate` resolved), `error`, `complete` (false when any of its units errored), `aggregate_used` ({pages, documents}), and `items` — one entry per unit: `{item, document, page, status, score, verdict, confidence, reason, detail, error, regions (a COUNT), text_layer, localization (llm)}`.\nThe overall score and verdict are weighed over the AGGREGATED criterion results; `complete` is false when any scored criterion is incomplete, and `overall_score` / `overall_verdict` are then null with the partial score in `weighted_score_breakdown` (`partial: true`). `score: false`, skipped and errored criteria never count toward the score.\n\nA model outage does NOT fail the job — it fails the unit (`status: \"error\"` on that item) and the job completes with `complete: false`. `failed` means the job itself could not run (a thumbnail-sized page image, an undecodable file, a payload from an older container — anything but `schema: 3`). **404** for an unknown job id. See API.md § `GET /jobs/{job_id}`."
+        "description": "Poll one job. `phase` progresses staging → pending → processing → completed | failed. When `completed`, `result` is the assessment:\n\nResult shape (GET /jobs/:jobId → `result`, `schema_version: 3`):\n  `{schema_version, documents, items, assessment: {overall_score, overall_verdict, complete, weighted_score_breakdown, per_criterion_scores}, verdict, page_geometry, detector, artifacts, references, request, usage}`\nEvery page of every document is one ITEM, numbered globally in request order. `documents[]` is `{index, filename, kind, pages, items, document_info}` (document_info: content_type, size_bytes, has_image, native_text_chars, ocr.layers per item, ocr.document_layers, llm_text_char_budget). `items[]` is `{item, document, page, filename, overall_score, overall_verdict, complete}` — each item's own weighted score. `page_geometry` is a list, one entry per item (null sizes for a .txt/.docx item); `page` there, a region's `page` and the `p{n}` layer prefix all mean the item.\nEvery entry of `per_criterion_scores` has the SAME keys — the AGGREGATED answer: `status` (ok | error | skipped), `type`, `method`, `scored`, `score`, `verdict`, `confidence`, `reason`, `detail`, `regions` (the union over every item, capped at CLASSIFIER_INLINE_REGIONS_MAX with `regions_truncated`), `artifacts` (`items`: per item, that page's layer URLs filtered to the criterion and its loop `attempts`; `text`: one link per text layer its units read), `localization` (llm: the loop's record — merged across items), `options_used` (with `aggregate` resolved), `error`, `complete` (false when any of its units errored), `aggregate_used` ({pages, documents}), and `items` — one entry per unit: `{item, document, page, status, score, verdict, confidence, reason, detail, error, regions (a COUNT), text_layer, localization (llm)}`.\nThe overall score and verdict are weighed over the AGGREGATED criterion results; `complete` is false when any scored criterion is incomplete, and `overall_score` / `overall_verdict` are then null with the partial score in `weighted_score_breakdown` (`partial: true`). `score: false`, skipped and errored criteria never count toward the score.\n`usage` is what the job's vision-model requests cost: `{calls, errors, seconds, prompt_tokens, cached_tokens, completion_tokens, reasoning_tokens, total_tokens, models, first_call_at, last_call_at, usage_url}` — the per-call rows are at GET /jobs/:jobId/usage.\n\nA model outage does NOT fail the job — it fails the unit (`status: \"error\"` on that item) and the job completes with `complete: false`. `failed` means the job itself could not run (a thumbnail-sized page image, an undecodable file, a payload from an older container — anything but `schema: 3`). **404** for an unknown job id. See API.md § `GET /jobs/{job_id}`."
       },
       "response": []
     },
@@ -613,7 +613,7 @@
             }
           ]
         },
-        "description": "Delete the job row AND its artifact directory (the router's `on_delete` hook removes the directory first, so no files are left that nothing points at — the `text.*.json` layers go with it). **404** for an unknown job id. A running job is not interrupted. See API.md § `DELETE /jobs/{job_id}`."
+        "description": "Delete the job row, its artifact directory AND its model-usage rows (the router's `on_delete` hook removes the directory and the `llm_calls` rows first, so nothing is left that nothing points at — the `text.*.json` layers go with it). **404** for an unknown job id — but the hook runs before that check, so a DELETE on a job the TTL sweeper already removed still deletes its usage rows (the one thing the sweeper leaves behind). A running job is not interrupted. See API.md § `DELETE /jobs/{job_id}`."
       },
       "response": []
     },
@@ -1568,6 +1568,81 @@
               ]
             },
             "description": "Free the disk and keep the job row: removes the whole artifact directory (regions.json, text layers, base image, cached layers). **204** on success; **404** for an unknown job or one with no directory. Afterwards the artifact routes answer **410**. The inline regions in the result survive."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Usage",
+      "description": "What each job's vision-model requests cost. Every HTTP request to VISION_LLM_API is one row of the `llm_calls` table in classifier.db, linked to its job, criterion and item; the rows outlive the job's TTL and go only with DELETE /jobs/:jobId. A completed job's result carries the totals as `usage`. Set `jobId` from a POST /assess or POST /references response. See API.md § Model usage.",
+      "item": [
+        {
+          "name": "GET /jobs/:jobId/usage",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/jobs/:jobId/usage",
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "classifier",
+                "jobs",
+                ":jobId",
+                "usage"
+              ],
+              "variable": [
+                {
+                  "key": "jobId",
+                  "value": "",
+                  "description": "job_id returned by POST /assess (202 body). Paste it here, or set the collection variable `jobId`. An expired job's id still works here — the usage rows outlive the job."
+                }
+              ]
+            },
+            "description": "Every vision-model HTTP request the job made — each scoring call, box-loop ask / refine / verify, `references: \"auto\"` selection, reference description, and each parse retry, failed requests included — with its totals. Returns `{job_id, job_present, job_type, totals, by_kind, by_outcome, by_criterion, calls}`.\n\n`totals` is `{calls, errors, seconds, prompt_tokens, cached_tokens, completion_tokens, reasoning_tokens, total_tokens, models, first_call_at, last_call_at}` — the same block the job result carries as `usage` (plus `usage_url` there). A token total is `null`, not 0, when no call reported it (`cached_tokens` needs `--enable-prompt-tokens-details` on muse-glimmer). `by_kind` (score | ask | refine | verify | select | describe | other) and `by_outcome` (ok | error) map to the same block; `by_criterion` is a LIST of blocks each with its `criterion` — `null` for the calls that belong to no criterion (the per-item selection, a reference's description).\n\n`calls[]`, in the order made: `{id, job_id, job_type, request_id, started_at, label, kind, criterion, item, document, attempt, model_requested, model_reported, api_url, max_tokens, outcome, http_status, error, finish_reason, seconds, prompt_tokens, cached_tokens, completion_tokens, reasoning_tokens, total_tokens, usage}` — `usage` is the response's raw `usage` object; `seconds` is time inside the CLASSIFIER_MAX_LLM_CALLS slot (the model, not the wait); `http_status` / `error` are set on a failed request.\n\n**200** with zero calls for a job that has not called the model (queued, or text / cv criteria only). **200 with `job_present: false`** once the TTL sweeper has removed the job — the usage rows outlive it. **404** only when there is neither a job row nor any usage row (an unknown id, or a job removed with DELETE /jobs/:jobId). See API.md § Model usage and § `GET /jobs/{job_id}/usage`."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /usage",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/usage?since=2026-10-01&until=2026-10-02&job_type=assess",
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "classifier",
+                "usage"
+              ],
+              "query": [
+                {
+                  "key": "since",
+                  "value": "2026-10-01",
+                  "disabled": true,
+                  "description": "Inclusive lower bound on a call's `started_at`: an ISO date (its midnight UTC) or datetime (`2026-10-01T08:00:00Z`; no offset means UTC)."
+                },
+                {
+                  "key": "until",
+                  "value": "2026-10-02",
+                  "disabled": true,
+                  "description": "Exclusive upper bound, same forms. `since=2026-10-01&until=2026-10-02` is one UTC day. Must be after `since`."
+                },
+                {
+                  "key": "job_type",
+                  "value": "assess",
+                  "disabled": true,
+                  "description": "Only calls made by jobs of this type: assess | reference."
+                }
+              ]
+            },
+            "description": "Model usage across jobs, expired ones included (the usage rows outlive their jobs). Returns `{filter: {since, until, job_type}, totals, by_kind, by_day}` — `totals` is the same block as GET /jobs/:jobId/usage's plus `jobs` (distinct jobs counted); `by_kind` maps each call kind to that block; `by_day` is a list of `{day: \"YYYY-MM-DD\" (UTC), …block}` in date order. `filter` echoes the bounds normalised to UTC. **400** for a `since` / `until` that is not an ISO date or datetime, or a `since` not before `until`. See API.md § `GET /usage`."
           },
           "response": []
         }

@@ -14,10 +14,10 @@ The reference gauges (``classifier_references{status}``, ``_reference_bytes``,
 create, finish, fail and delete; the creation outcomes and the generated
 descriptions are counted by jobs/runners.py.
 
-``llm_bbox_attempts`` (llm/boxes.py) lives here for the same reason: it is
-produced in one module and read in none, so a counter defined next to its
-producer would be invisible to anyone looking for "what does this service
-measure".
+``llm_bbox_attempts`` (llm/boxes.py) and ``llm_usage_write_errors``
+(llm/usage.py) live here for the same reason: each is produced in one module
+and read in none, so a counter defined next to its producer would be
+invisible to anyone looking for "what does this service measure".
 
 Scraped by Prometheus (see prometheus.yml) and visualised in Grafana alongside
 LiteLLM metrics from the same Prometheus instance.
@@ -86,6 +86,14 @@ reference_calls_total = Counter(
     # selection — one `references: "auto"` selection call per item (any outcome)
     # scoring   — one reference-guided scoring call (any outcome)
     ["kind", "outcome"],  # outcome: ok | failed
+)
+# Model usage records (llm/usage.py): a row that could not be written. The
+# model call it describes is unaffected — accounting never fails a call — so
+# this counter is the only sign that GET /jobs/{id}/usage is missing calls.
+llm_usage_write_errors = Counter(
+    "classifier_llm_usage_write_errors_total",
+    "Vision-model calls whose llm_calls usage row could not be written "
+    "(the call itself is unaffected)",
 )
 llm_bbox_attempts = Counter(
     "classifier_llm_bbox_attempts_total",

@@ -105,7 +105,10 @@ async def test_cancelled_job_keeps_its_payload(monkeypatch):
         return {"ok": True, "schema": payload["schema"]}
 
     monkeypatch.setattr(queue_module, "run_assess", finish)
-    assert await q.handle_job(job) == {"ok": True, "schema": 3}
+    result = await q.handle_job(job)
+    # handle_job adds the job's model-usage totals (none here: no model call).
+    assert result.pop("usage")["calls"] == 0
+    assert result == {"ok": True, "schema": 3}
     assert await q.payloads.read(job_id) is None  # consumed on completion
 
 

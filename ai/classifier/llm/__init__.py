@@ -8,6 +8,9 @@
                  request holds a slot of), ``call_vllm`` for the scoring call
                  and ``call_vllm_json`` for the small ones, the image encoder,
                  and the two Prometheus objects that count both.
+    usage.py     what each request cost, durably: the ``llm_calls`` table
+                 (one row per request, linked to its job, criterion and
+                 item through context vars), written by ``client._post``.
     validate.py  believing the answer only so far: find the criterion's answer,
                  clamp it, recompute the verdict from the clamped score.
     boxes.py     not believing it at all: ask -> validate -> verify by crop ->

@@ -47,7 +47,7 @@ same numbers (and the job id).
 
 The counters cannot say what one JOB cost, and a log line does not survive
 rotation, so ``_post`` also writes one row per request — ok or error — to the
-``llm_calls`` table of ``classifier.db`` through ``llm.usage``: the job, the
+``llm_calls`` table of ``classifier-db`` through ``llm.usage``: the job, the
 criterion / item / document it was for (from context vars the queue and the
 scheduler set), the model, the seconds, every token count and the raw
 ``usage`` object. Those rows outlive the job's TTL; ``GET /jobs/{id}/usage``
@@ -304,7 +304,7 @@ async def _post(prompt: dict, *, label: str = "", attempt: int = 1) -> dict:
     Every request — ok or error — is also written as one ``llm_calls`` row
     (``llm.usage.record_call``), attributed to its job and unit from the
     context vars ``llm.usage`` holds. The write happens after the slot is
-    released, so the SQLite insert never holds a model slot, and it never
+    released, so the database insert never holds a model slot, and it never
     raises: a failed accounting write cannot fail the call. A failed request
     is recorded (``http_status`` for a non-2xx, the exception as ``error``)
     and then re-raised unchanged.

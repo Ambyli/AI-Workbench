@@ -4,11 +4,12 @@ This module does four things and nothing else:
   - Configures logging with correlation ID injection (middleware.py).
   - Builds the app, attaches the correlation ID middleware, and instruments
     every endpoint with Prometheus metrics.
-  - Owns the lifespan: initialise the shared ``common.jobs`` SQLite registry
-    and the references table beside it, fail references whose creation job
-    is gone, requeue jobs a previous process left mid-flight, start
-    CLASSIFIER_MAX_CONCURRENT workers and the artifact sweeper — and stop them
-    again.
+  - Owns the lifespan: open the one Postgres pool (``db.database``, the
+    classifier-db container), create the ``common.jobs`` jobs table and the
+    references and model-usage tables beside it, fail references whose
+    creation job is gone, requeue jobs a previous process left mid-flight,
+    start CLASSIFIER_MAX_CONCURRENT workers and the artifact sweeper — and
+    stop them again.
   - Mounts the routers.
 
 Every endpoint handler lives in ``api/``:
@@ -34,7 +35,7 @@ Overall request flow for /assess:
      inline text, or an SSRF-checked URL fetch), detects each kind, counts
      the items (every page of every document) and refuses more than
      CLASSIFIER_MAX_ITEMS — all before anything is queued.
-  3. Job record created in SQLite via ``jobs_registry.register(..., "staging")``.
+  3. Job record created in Postgres via ``jobs_registry.register(..., "staging")``.
   4. Payload (every document's bytes + validated criteria) written to
      PAYLOAD_DIR/<job_id>.json, then the row is flipped to "pending" and idle
      workers are woken.
@@ -71,6 +72,7 @@ so its cost stays readable at GET /jobs/{id}/usage — and only DELETE
 """
 
 import logging
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -81,7 +83,8 @@ from common.jobs.router import build_router
 from api import artifacts as artifacts_api
 from api import assess, introspection, references as references_api
 from api import usage as usage_api
-from config import LOG_LEVEL
+from config import LEGACY_SQLITE_MARKER, LEGACY_SQLITE_PATH, LOG_LEVEL
+from db import database
 from jobs.queue import jobs_registry, queue, sweeper
 from llm import client as llm_client
 from llm import usage as llm_usage
@@ -122,8 +125,16 @@ async def lifespan(app: FastAPI):
     """Manage resources that must exist for the full lifetime of the server.
 
     On startup:
-      - Initialise (or migrate) the shared SQLite job registry, and create
-        the ``reference_examples`` and ``llm_calls`` tables in the same DB.
+      - Open the Postgres pool (``database.init()``). No CLASSIFIER_DB_HOST,
+        or a database that refuses the connection, fails startup here, with
+        the reason in the log — there is no SQLite fallback.
+      - Create the ``jobs``, ``reference_examples`` and ``llm_calls`` tables
+        (idempotent), all in the one classifier-db database.
+      - Guard the migration: while the old SQLite file (/data/classifier.db)
+        is on the volume without the script's ``.migrated`` marker, log an
+        ERROR and skip the orphan payload sweep and the artifact sweeper, so
+        nothing the migration needs is deleted. Nothing migrates
+        automatically (``bin/migrate_sqlite_to_postgres.py``).
       - Reconcile references: a ``pending`` one whose creation job is gone or
         finished without readying it is marked ``failed`` (its job may have
         expired, or failed while no process was there to record it).
@@ -141,16 +152,21 @@ async def lifespan(app: FastAPI):
       - ``sweeper.stop()``: cancel the sweep loop. A sweep is idempotent, so
         an interrupted one is simply redone next boot.
       - ``llm_client.aclose()``: close the pooled vision-model HTTP client.
+      - ``database.close()``: close the Postgres pool, last — the workers and
+        the sweeper that borrow from it are already stopped.
     """
+    await database.init()
     await jobs_registry.init()
     await reference_registry.init()
     await llm_usage.usage_store.init()
+    unmigrated = _legacy_unmigrated()
     failed = await reconcile_references(jobs_registry)
     if failed:
         logger.warning("lifespan: %d pending reference(s) reconciled to failed", failed)
     await refresh_reference_gauges()
-    await queue.start()
-    await sweeper.start()
+    await queue.start(sweep_orphans=not unmigrated)
+    if not unmigrated:
+        await sweeper.start()
     logger.info("lifespan: startup complete")
 
     yield  # server runs here
@@ -158,7 +174,34 @@ async def lifespan(app: FastAPI):
     await sweeper.stop()
     await queue.stop()
     await llm_client.aclose()
+    await database.close()
     logger.info("lifespan: shutdown complete")
+
+
+def _legacy_unmigrated() -> bool:
+    """True while the pre-Postgres SQLite file is on the volume and the
+    migration script has not left its marker (LEGACY_SQLITE_MARKER) beside it.
+
+    In that state every job row is still in the old file, so a queued payload
+    or an artifact directory with no Postgres row is not an orphan — it is
+    data the migration is about to give a row. The two orphan sweeps (the
+    queue's payload sweep and the artifact sweeper, which also enforces the
+    TTL) are therefore held back, loudly, until the script has run and the
+    classifier is restarted. Deliberately NOT an automatic migration —
+    copying is a one-shot operator step (``bin/migrate_sqlite_to_postgres.py``)
+    that should be run, and checked, once.
+    """
+    if not os.path.exists(LEGACY_SQLITE_PATH) or os.path.exists(LEGACY_SQLITE_MARKER):
+        return False
+    logger.error(
+        "lifespan: %s exists and has not been migrated to classifier-db — the "
+        "orphan payload sweep and the artifact sweeper are DISABLED so nothing "
+        "the migration needs is deleted. Run: docker exec classifier uv run python "
+        "bin/migrate_sqlite_to_postgres.py, then make up classifier "
+        "(ai/classifier/API.md § Deploying this version)",
+        LEGACY_SQLITE_PATH,
+    )
+    return True
 
 
 # ---------------------------------------------------------------------------

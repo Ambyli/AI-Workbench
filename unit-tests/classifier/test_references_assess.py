@@ -52,7 +52,7 @@ FAR_BOX = [700, 700, 900, 900]
 
 
 @pytest.fixture(scope="module")
-def client():
+def client(need_postgres):
     import main
 
     with TestClient(main.app) as c:

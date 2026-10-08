@@ -13,8 +13,14 @@ a message naming it, and a payload without ``schema: 3`` (a list of
 documents) is refused by the runner rather than half-run — schema 2's single
 document included.
 
+The four ``handle_job`` tests need the classifier's Postgres (the queue's
+registry is ``PostgresRegistry`` on ``db.database``, and ``handle_job`` reads
+the job's model-usage totals); they are marked ``postgres`` and skip without
+``TEST_POSTGRES_DSN`` — see conftest.py.
+
 Run with::
 
+    TEST_POSTGRES_DSN=postgresql://postgres@localhost:5432/postgres \\
     UV_LINK_MODE=copy uv run --no-sync --with pytest --package classifier \\
         python -m pytest unit-tests/classifier/test_queue_cancel.py -q -p no:cacheprovider
 """
@@ -27,9 +33,10 @@ import tempfile
 
 import pytest
 
-from common.jobs.sqlite import SqliteRegistry
+from common.jobs.postgres import PostgresRegistry
 
 from api.schemas import AssessRequest, ClassifierMetadata
+from db import database
 from jobs import queue as queue_module
 from jobs import runners
 from jobs.payloads import PAYLOAD_SCHEMA, SubmittedDocument, build_assess_payload
@@ -37,7 +44,11 @@ from jobs.payloads import PAYLOAD_SCHEMA, SubmittedDocument, build_assess_payloa
 
 async def _make_queue():
     tmp = pathlib.Path(tempfile.mkdtemp(prefix="classifier-queue-test-"))
-    registry = SqliteRegistry(str(tmp / "jobs.db"))
+    # The session database, as the container uses it: the registry borrows
+    # db.database (here, on pytest-asyncio's loop, one-off connections — see
+    # db.py). Every test enqueues its own fresh ids, so sharing the table
+    # with the rest of the session never makes a count here ambiguous.
+    registry = PostgresRegistry(pool=database)
     await registry.init()
     q = queue_module.ClassifierQueue(registry)
     # Keep this test's payloads away from the session-wide PAYLOAD_DIR.
@@ -78,6 +89,7 @@ def test_the_payload_shape():
     assert payload["criteria"][0]["options"]["match"] == "contains"
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
 async def test_cancelled_job_keeps_its_payload(monkeypatch):
     q, registry = await _make_queue()
@@ -112,6 +124,7 @@ async def test_cancelled_job_keeps_its_payload(monkeypatch):
     assert await q.payloads.read(job_id) is None  # consumed on completion
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
 async def test_completed_and_failed_jobs_delete_their_payload(monkeypatch):
     q, registry = await _make_queue()
@@ -134,6 +147,7 @@ async def test_completed_and_failed_jobs_delete_their_payload(monkeypatch):
     assert await q.payloads.read(failed_id) is None
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
 @pytest.mark.parametrize("job_type", ["compare", "locate"])
 async def test_removed_job_types_fail_by_name(monkeypatch, job_type):

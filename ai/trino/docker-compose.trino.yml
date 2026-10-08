@@ -273,6 +273,14 @@ services:
       SUPABASE_POSTGRES_DB: ${SUPABASE_POSTGRES_DB:-postgres}
       SUPABASE_TRINO_READER_USER: ${SUPABASE_TRINO_READER_USER:-trino_reader}
       SUPABASE_TRINO_READER_PASSWORD: ${SUPABASE_TRINO_READER_PASSWORD:-}
+      # The classifier's own Postgres (ai/classifier, classifier-db on
+      # ai_shared) — job queue, references, per-call model usage. Read-only
+      # trino_reader role from ai/classifier/db-init/10-trino-reader.sh.
+      # Consumed by catalogs/postgres_classifier.properties. Same `:-`
+      # reasoning as the Supabase pair: an empty password fails only this
+      # catalog, an unset ${ENV:…} would stop the whole coordinator.
+      CLASSIFIER_DB_NAME: ${CLASSIFIER_DB_NAME:-classifier}
+      CLASSIFIER_TRINO_READER_PASSWORD: ${CLASSIFIER_TRINO_READER_PASSWORD:-}
       # AWS Glue Data Catalog + S3 (what Athena queries). Consumed by
       # catalogs/aws_glue.properties via the Hive connector.
       AWS_GLUE_REGION: ${AWS_GLUE_REGION:-us-east-1}

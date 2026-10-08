@@ -63,7 +63,7 @@ TWO_PAGE = (DOCS / "invoice_two_page.pdf").read_bytes()
 
 
 @pytest.fixture(scope="module")
-def client():
+def client(need_postgres):
     import main
 
     with TestClient(main.app) as c:

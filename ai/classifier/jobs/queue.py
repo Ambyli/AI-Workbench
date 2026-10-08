@@ -47,10 +47,11 @@ from typing import Any, Optional
 
 from common.jobs.model import JobBase
 from common.jobs.payloads import FilePayloadStore
-from common.jobs.sqlite import SqliteRegistry
+from common.jobs.postgres import PostgresRegistry
 from common.jobs.worker import WorkerPool
 
-from config import DB_PATH, MAX_CONCURRENT, PAYLOAD_DIR, WORKER_POLL_INTERVAL_S
+from config import MAX_CONCURRENT, PAYLOAD_DIR, WORKER_POLL_INTERVAL_S
+from db import database
 from jobs.runners import run_assess, run_reference
 from llm import usage as llm_usage
 from logger import logger
@@ -73,7 +74,7 @@ class ClassifierQueue:
     (``enqueue``).
     """
 
-    def __init__(self, registry: SqliteRegistry) -> None:
+    def __init__(self, registry: PostgresRegistry) -> None:
         self.registry = registry
         self.payloads = FilePayloadStore(PAYLOAD_DIR)
         self.pool = WorkerPool(
@@ -87,11 +88,15 @@ class ClassifierQueue:
         )
 
     # ── Lifecycle (called from main.lifespan) ─────────────────────────────
-    async def start(self) -> None:
+    async def start(self, *, sweep_orphans: bool = True) -> None:
         """Recover interrupted jobs, sweep orphan payloads, start the workers.
-        The registry must already be ``init()``-ed."""
+        The registry must already be ``init()``-ed.
+
+        ``sweep_orphans=False`` keeps every payload file: ``main`` passes it
+        while the pre-Postgres SQLite file is still unmigrated, when a payload
+        with no row is a queued job whose row has not been copied yet."""
         requeued = await self.pool.recover(phases=["staging"])
-        swept = await self.payloads.sweep(self.registry)
+        swept = await self.payloads.sweep(self.registry) if sweep_orphans else 0
         pending = await self.refresh_queue_depth()
         logger.info("queue: recovery requeued=%d orphan_payloads_removed=%d pending=%d "
                     "max_concurrent=%d", requeued, swept, pending, MAX_CONCURRENT)
@@ -233,10 +238,19 @@ async def _fail_reference(job: JobBase, exc: BaseException) -> None:
 # ---------------------------------------------------------------------------
 # One registry for the process, shared by the endpoints (which register and
 # enqueue), the worker pool (which claims and completes), and the artifact
-# sweeper (which prunes expired rows AND their directories). Its schema
-# migration from the classifier's legacy layout (status → phase, add metadata
-# column) runs idempotently in ``init()``, which ``main``'s lifespan calls.
+# sweeper (which prunes expired rows AND their directories). It borrows the
+# one pool ``db.database`` owns (``pool=`` — the registry never creates or
+# closes it), so the jobs table, ``reference_examples`` and ``llm_calls``
+# share one connection budget in one database. Built at import time with no
+# pool yet: ``main``'s lifespan runs ``database.init()`` and then
+# ``jobs_registry.init()``, which creates the table idempotently.
+#
+# ``result_type="json"``: the result column is JSON, not JSONB. JSONB sorts
+# object keys, and a job result's key order is part of what it says —
+# ``per_criterion_scores`` lists the criteria in the order the request asked
+# them, exactly as the SQLite text column used to keep it. ``metadata`` stays
+# JSONB (``references.store.jobs_using`` tests it with ``?``).
 
-jobs_registry = SqliteRegistry(DB_PATH)
+jobs_registry = PostgresRegistry(pool=database, result_type="json")
 queue = ClassifierQueue(jobs_registry)
 sweeper = ArtifactSweeper(jobs_registry)

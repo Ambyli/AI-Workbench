@@ -37,6 +37,7 @@ One level of subpackages, imported by bare name — the container sets
 ai/classifier/
   main.py              FastAPI app, lifespan, router registration — nothing else
   config.py            every constant and env knob in the service, one file
+  db.py                the one asyncpg pool on classifier-db, shared by the three stores
   logger.py            the one "classifier" logger every module imports
   middleware.py        correlation IDs: the ContextVar, the filter, the middleware
   metrics.py           the Prometheus objects produced in one module, read in none
@@ -83,7 +84,7 @@ ai/classifier/
     sweeper.py         the TTL task, the DELETE hook, the disk gauges
   references/          stored worked examples — never imports analysis or llm
     model.py           the Reference row, the id and file-name grammar, guides_llm
-    store.py           ReferenceRegistry (`reference_examples` in classifier.db), the
+    store.py           ReferenceRegistry (`reference_examples` in classifier-db), the
                        sweeper-less file store at CLASSIFIER_REFERENCE_DIR, reconcile, gauges
     resolve.py         an /assess request's `references` against the store, at submit: the
                        plan the worker follows, inherited criteria, the `auto` pool
@@ -93,7 +94,7 @@ ai/classifier/
     prompts.py         the single-criterion scoring prompt (with reference examples), the
                        loop's two small ones, the reference describe and selection prompts
     client.py          LLM_CALLS (the process-wide limit), call_vllm, call_vllm_json, the encoder
-    usage.py           UsageStore (`llm_calls` in classifier.db): one row per model request,
+    usage.py           UsageStore (`llm_calls` in classifier-db): one row per model request,
                        attributed to its job / criterion / item through context vars
     validate.py        find the answer, clamp it, derive the verdict from the score
     boxes.py           the bounding-box enforcement loop
@@ -109,12 +110,13 @@ ai/classifier/
     queue.py           ClassifierQueue + the registry / queue / sweeper singletons
   bin/
     grounding_experiment.py   operator tool — runs where the model is
+    migrate_sqlite_to_postgres.py  one-shot: the old /data/classifier.db → classifier-db
 ```
 
 Import direction is strictly one way:
 
 ```
-config → logger / metrics / utils → api.criterion_options → api.schemas
+config → logger / metrics / utils / db → api.criterion_options → api.schemas
        → cv, llm, detector, regions, references → analysis → jobs → api (routers) → main
 ```
 
@@ -153,6 +155,21 @@ uses. The endpoint shapes and response fields are documented there.
 
 ### Concurrency and durability
 
+**Where the state lives.** Every row the classifier keeps is in one Postgres
+database, the compose-managed `classifier-db` container (`postgres:17-alpine`,
+on `ai_shared`, host port `PORT_CLASSIFIER_DB` = 5439): the job queue
+(`jobs`, `common.jobs.postgres.PostgresRegistry`), saved references
+(`reference_examples`) and one row per model request (`llm_calls`). The three
+stores share one asyncpg pool (`db.py`, `CLASSIFIER_MAX_CONCURRENT +
+CLASSIFIER_MAX_LLM_CALLS + 8` connections). There is **no SQLite fallback**:
+with `CLASSIFIER_DB_HOST` unset, or the database unreachable, the service
+refuses to start and says why. The same database is federated into Trino as
+the `postgres_classifier` catalog (read-only `trino_reader` role), so jobs,
+references and per-call cost can be queried from Trino and Superset. Files
+stay on the `classifier_data` volume: queued payloads, artifact directories
+and reference files. A job's `result` column is `JSON`, not `JSONB` — JSONB
+sorts object keys, and `per_criterion_scores` lists criteria in request order.
+
 The jobs table **is** the queue. Inside a job the unit of work is **(criterion,
 item)** — one criterion on one page of one document in, one result out (a
 `text` criterion with `options.scope: "document"` is one unit per document) —
@@ -172,8 +189,8 @@ Phases: `staging` → `pending` → `processing` → `completed` | `failed`.
 payload landing on disk; workers never claim it.
 
 Job inputs (the document bytes, resolved AT SUBMIT, plus the validated
-criteria) are written to `PAYLOAD_DIR` (default `/data/payloads`, same volume
-as the DB) and deleted when the job reaches a terminal phase. On startup the
+criteria) are written to `PAYLOAD_DIR` (default `/data/payloads`, on the
+`classifier_data` volume) and deleted when the job reaches a terminal phase. On startup the
 service requeues any `processing` rows a previous container left behind and
 sweeps orphaned payload files, so a restart mid-job re-runs the job rather
 than losing it.
@@ -225,6 +242,52 @@ generation spent thinking, and `classifier_llm_call_seconds_count` against
 the server-wide hit rate across chat traffic too.
 
 ### Deploying this version
+
+**State moved from SQLite to Postgres (`classifier-db`).** The classifier no
+longer reads `/data/classifier.db`; it starts on an empty `classifier-db`, and
+its FIRST start prunes what that empty database does not know — queued
+payloads whose row is missing, and every job artifact directory whose row is
+missing. So the old data is copied across BEFORE the new container starts:
+
+1. **Drain the queue** (`classifier_job_queue_depth` at 0) — not required (a
+   queued job whose payload is still on disk is carried over and runs), but
+   it leaves nothing half-done.
+2. Set `CLASSIFIER_TRINO_READER_PASSWORD` in `.env` (`openssl rand -hex 32`):
+   the read-only Trino role is created on the first start of an empty
+   `classifier_db` volume (re-runnable by hand, see
+   `ai/classifier/db-init/10-trino-reader.sh`). `CLASSIFIER_DB_USER` /
+   `_PASSWORD` / `_NAME` default to `classifier`.
+3. `make build classifier`, then `make up classifier classifier-db` — the
+   database only; the old classifier keeps running on SQLite.
+4. `docker stop classifier`, then copy the data with a one-off container of
+   the new image (same volume, same env, never starts the app):
+
+   ```bash
+   docker compose -f ai/classifier/docker-compose.classifier.yml --env-file .env \
+       -p ai-classifier run --rm --no-deps classifier \
+       uv run python bin/migrate_sqlite_to_postgres.py        # --dry-run to count first
+   ```
+
+   It copies `reference_examples` (the one that matters — references never
+   expire and their files are named by these ids), `jobs` and `llm_calls`,
+   prints read / inserted / already present / unreadable per table, is
+   idempotent (`ON CONFLICT DO NOTHING`; a second run inserts 0) and never
+   touches the SQLite file. A job that was not finished keeps its phase when
+   its payload is on disk, and arrives `failed` ("resubmit") when it is not.
+   A real (not `--dry-run`) run also writes `/data/classifier.db.migrated`
+   beside the old file — the marker the startup guard below looks for.
+5. `make up classifier`. Remove `/data/classifier.db` (and the marker) by hand
+   once the counts look right. **Startup guard:** while the old file exists
+   WITHOUT the marker, startup logs an ERROR and skips the orphan payload
+   sweep and the artifact sweeper (TTL included), because a payload or an
+   artifact directory with no Postgres row is, in that state, data the
+   migration has not given a row yet. So starting the new container first
+   loses nothing: run `docker exec classifier uv run python
+   bin/migrate_sqlite_to_postgres.py`, then `make up classifier` again to turn
+   the sweeps back on.
+6. `make up trino` (a recreate: the coordinator's env gained
+   `CLASSIFIER_DB_NAME` / `CLASSIFIER_TRINO_READER_PASSWORD`), then check
+   `SELECT * FROM postgres_classifier.public.llm_calls LIMIT 5`.
 
 **Recreate `muse-glimmer` FIRST, with `--limit-mm-per-prompt '{"image": 3}'`.**
 A reference-guided scoring call sends up to three images, and a vLLM started
@@ -1153,7 +1216,7 @@ against an example that is the whole page is a 400 at submit (explicit ids).
 They live in their own root, `CLASSIFIER_REFERENCE_DIR`, which nothing sweeps
 (the artifact sweeper deletes every directory whose job row is gone, which is
 exactly what a reference must survive), with their rows in the
-`reference_examples` table of the same `classifier.db`. The creation job
+`reference_examples` table of the same `classifier-db` database. The creation job
 expires on `JOB_TTL_HOURS` like any job; the reference has already copied what
 it needs. `CLASSIFIER_REFERENCE_MAX_COUNT` (500) is the only bound on their
 disk.
@@ -1178,8 +1241,9 @@ Every HTTP request the classifier makes to the vision model
 (`VISION_LLM_API` / `VISION_LLM_MODEL`) — each scoring call, each box-loop
 ask / refine / verify, each `references: "auto"` selection and reference
 description, **and each parse retry** — is written as one row of the
-`llm_calls` table in `classifier.db` (the same SQLite file as the jobs and
-`reference_examples` tables, on the `classifier_data` volume). Failed
+`llm_calls` table in `classifier-db` (the same Postgres database as the jobs
+and `reference_examples` tables — and so readable from Trino as
+`postgres_classifier.public.llm_calls`). Failed
 requests are recorded too. The Prometheus counters in
 [§ Concurrency and durability](#concurrency-and-durability) say where the
 model's time goes across the process; these rows say what **one job** cost.
@@ -1191,7 +1255,7 @@ model's time goes across the process; these rows say what **one job** cost.
 | `id` | Row id, in insert order |
 | `job_id` / `job_type` | The job that made the call (`assess` \| `reference`); `null` for a call made outside a job (none today) |
 | `request_id` | The correlation id of the HTTP request that queued the job (`X-Request-ID`) |
-| `started_at` | UTC ISO timestamp the request went out (after its `CLASSIFIER_MAX_LLM_CALLS` slot was granted) |
+| `started_at` | When the request went out (`TIMESTAMPTZ`; the API returns it as a UTC ISO string) (after its `CLASSIFIER_MAX_LLM_CALLS` slot was granted) |
 | `label` / `kind` | The call site's label (`score/<name>`, `bbox/<name>#2`, `reference/select#3`, …) and its kind — the same `score` / `ask` / `refine` / `verify` / `select` / `describe` / `other` the metrics use |
 | `criterion` / `item` / `document` | The unit it was for. A selection call has its `item` and `document` but **no** `criterion` — it is made once per item on behalf of every criterion there; a `scope: "document"` unit has `item` `null`; a reference's describe call has none of them |
 | `attempt` | 1-based parse-retry number (`MAX_LLM_RETRIES`) |
@@ -1202,7 +1266,7 @@ model's time goes across the process; these rows say what **one job** cost.
 | `finish_reason` | `stop`, or `length` when the budget ran out (often mid-reasoning, which then costs a retry) |
 | `seconds` | Time inside the slot — the model, not the wait for a slot |
 | `prompt_tokens` / `cached_tokens` / `completion_tokens` / `reasoning_tokens` / `total_tokens` | From the response's `usage`; `null` when not reported. `cached_tokens` is only reported when `muse-glimmer` runs `--enable-prompt-tokens-details`; `reasoning_tokens` is part of `completion_tokens` |
-| `usage` | The response's `usage` object verbatim (stored as `usage_json`), so nothing vLLM reports is lost — multimodal token counts, for one |
+| `usage` | The response's `usage` object verbatim (a `JSONB` column), so nothing vLLM reports is lost — multimodal token counts, for one |
 
 **How a call knows its job.** Context variables, not arguments: the queue's
 `handle_job` sets the job id and type, and the scheduler sets the unit — item
@@ -1221,7 +1285,8 @@ stays readable at `GET /jobs/{id}/usage` after the job itself is gone
 /jobs/{id}` — which does so even when the job row has already expired (it
 then answers 404 for the row). The table grows by one small row per model
 request; prune it by hand (`DELETE FROM llm_calls WHERE started_at < '…'` in
-`classifier.db`) if that ever matters.
+`classifier-db`, e.g. `docker exec -it classifier-db psql -U classifier`) if
+that ever matters.
 
 **Where to read it.**
 
@@ -2651,11 +2716,16 @@ uv run --package classifier python unit-tests/classifier/regions_report.py
 uv run --package classifier python unit-tests/classifier/regions_report.py --local
 ```
 
-`--local` mounts this app in-process with `TestClient` on a throwaway `/data`,
-so everything but the vision model is verifiable with no container and no GPU.
-Setup, how to read the report, and how to add a case:
+`--local` mounts this app in-process with `TestClient` on a throwaway `/data`
+and a throwaway Postgres database (created on `TEST_POSTGRES_DSN`, dropped
+after the run), so everything but the vision model is verifiable with no
+container and no GPU. Setup, how to read the report, and how to add a case:
 [`unit-tests/classifier/REGIONS_REPORT.md`](../../unit-tests/classifier/REGIONS_REPORT.md).
 
 The unit tests (`unit-tests/classifier/test_*.py`) script the model at
 `llm.client._send` / `call_vllm` / `call_vllm_json` and never touch the
-network.
+network. Everything that runs the app's lifespan or touches the jobs,
+references or usage tables needs Postgres: with `TEST_POSTGRES_DSN` set the
+session creates one `classifier_test_<pid>_<hex>` database and drops it at the
+end; without it those tests skip (marker `postgres` / fixture
+`need_postgres`, see `unit-tests/classifier/conftest.py`).

@@ -21,6 +21,8 @@ Process flow position: loaded first by every other module at import time.
 
 import ipaddress
 import os
+from typing import Optional
+from urllib.parse import quote
 
 from common.net import DEFAULT_BLOCKED_NETWORKS
 
@@ -292,20 +294,72 @@ HTTP_CONNECT_TIMEOUT: float = 10.0
 FETCH_TIMEOUT: float = 120.0
 
 # ---------------------------------------------------------------------------
-# Async job store (SQLite)
+# State: the classifier-db Postgres, and the files beside it on /data
 # ---------------------------------------------------------------------------
-# DB_PATH is mounted from a named Docker volume (/data) so jobs survive
-# container restarts.  JOB_TTL_HOURS is the retention window the artifact
-# sweeper enforces (see § Region layers below): past it, a terminal job's
-# artifact directory AND its row are both deleted. A job still pending or
-# processing is never swept, however old.
-DB_PATH: str = os.environ.get("DB_PATH", "/data/classifier.db")
+# Every row the classifier keeps — the job queue (`jobs`), saved references
+# (`reference_examples`) and one row per vision-model request (`llm_calls`) —
+# lives in ONE Postgres database, the compose-managed `classifier-db`
+# container. It used to be a SQLite file (/data/classifier.db); a file has no
+# network listener and Trino has no SQLite connector, so none of it could be
+# queried from Trino or Superset. Now it is federated as the
+# `postgres_classifier` catalog. `db.py` owns the one connection pool all
+# three stores share.
+#
+# CLASSIFIER_DB_HOST is REQUIRED — there is no default and no SQLite
+# fallback: `db.database.init()` (main's lifespan) refuses to start with a
+# message naming the variables when it is empty. The compose file sets it to
+# `classifier-db`; the unit tests point it at a throwaway database on
+# TEST_POSTGRES_DSN. User / password / name default to `classifier`, the
+# same dev-default convention as ROOFIX_DB_*.
+#
+# The DSN is built with urllib.parse.quote on the user and the password, so
+# a password containing `@`, `:` or `/` cannot break it.
+#
+# DATA_DIR is the volume root for everything that stays on FILES: the
+# payloads of queued jobs, the per-job artifact directories, and the
+# reference files. LEGACY_SQLITE_PATH is where the old database lived — read
+# only by bin/migrate_sqlite_to_postgres.py and by the startup guard.
+# LEGACY_SQLITE_MARKER is the file that script writes when a real (not
+# --dry-run) migration finishes. While the old file exists WITHOUT the marker,
+# startup skips the orphan sweeps (queued payloads and artifact directories
+# whose job row is missing): every row is still in the old file, so "missing"
+# would mean "not migrated yet", and the sweeps would delete data the script
+# is about to give a row.
+#
+# JOB_TTL_HOURS is the retention window the artifact sweeper enforces (see
+# § Region layers below): past it, a terminal job's artifact directory AND
+# its row are both deleted. A job still pending or processing is never
+# swept, however old.
+DATA_DIR: str = os.environ.get("CLASSIFIER_DATA_DIR", "/data")
+DB_HOST: str = os.environ.get("CLASSIFIER_DB_HOST", "").strip()
+DB_PORT: int = int(os.environ.get("CLASSIFIER_DB_PORT", "5432") or "5432")
+DB_USER: str = os.environ.get("CLASSIFIER_DB_USER", "classifier")
+DB_PASSWORD: str = os.environ.get("CLASSIFIER_DB_PASSWORD", "classifier")
+DB_NAME: str = os.environ.get("CLASSIFIER_DB_NAME", "classifier")
+
+
+def build_dsn(host: str, port: int, user: str, password: str, name: str) -> str:
+    """``postgresql://user:password@host:port/name`` with the user, password
+    and database name percent-quoted (``safe=""``), so no character in a
+    credential can be read as DSN punctuation."""
+    auth = quote(user, safe="")
+    if password:
+        auth += ":" + quote(password, safe="")
+    return f"postgresql://{auth}@{host}:{int(port)}/{quote(name, safe='')}"
+
+
+DB_DSN: Optional[str] = (
+    build_dsn(DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME) if DB_HOST else None
+)
+LEGACY_SQLITE_PATH: str = os.path.join(DATA_DIR, "classifier.db")
+LEGACY_SQLITE_MARKER: str = LEGACY_SQLITE_PATH + ".migrated"
 JOB_TTL_HOURS: int = int(os.environ.get("JOB_TTL_HOURS", "24"))
 
 # ---------------------------------------------------------------------------
 # Job queue + workers
 # ---------------------------------------------------------------------------
-# The jobs table in DB_PATH is the queue (see common.jobs.sqlite.claim_next).
+# The jobs table in classifier-db is the queue (see common.jobs.postgres.claim_next,
+# FOR UPDATE SKIP LOCKED).
 # CLASSIFIER_MAX_CONCURRENT worker tasks each claim one pending job at a
 # time, so at most that many jobs run simultaneously.
 #
@@ -339,7 +393,7 @@ JOB_TTL_HOURS: int = int(os.environ.get("JOB_TTL_HOURS", "24"))
 # PAYLOAD_DIR holds one JSON file per queued job (document bytes + the
 # validated request) so a job survives a container restart. Files are
 # deleted the moment the job reaches a terminal phase. Defaults to a
-# sibling of DB_PATH so it lands on the same /data volume.
+# directory under DATA_DIR, on the classifier_data volume.
 #
 # WORKER_POLL_INTERVAL_S is the fallback wake-up for idle workers. New jobs
 # posted to this process wake a worker instantly; the poll only matters for
@@ -351,9 +405,16 @@ MAX_UNITS_PER_JOB: int = max(
 MAX_LLM_CALLS: int = max(1, int(os.environ.get("CLASSIFIER_MAX_LLM_CALLS", "6")))
 OCR_WORKERS: int = max(1, int(os.environ.get("CLASSIFIER_OCR_WORKERS", "4")))
 PAYLOAD_DIR: str = os.environ.get(
-    "PAYLOAD_DIR", os.path.join(os.path.dirname(DB_PATH) or ".", "payloads")
+    "PAYLOAD_DIR", os.path.join(DATA_DIR, "payloads")
 )
 WORKER_POLL_INTERVAL_S: float = float(os.environ.get("WORKER_POLL_INTERVAL_S", "1.0"))
+
+# The one asyncpg pool's ceiling (db.py). Every worker can hold a connection
+# for a claim or a write, every model call writes one llm_calls row after its
+# slot is released, and the HTTP routes (polls, /references, /usage) need a
+# few more on top — so the workers, plus the model slots, plus headroom. A
+# pool that is too small never errors; a caller just waits for a connection.
+DB_POOL_MAX: int = MAX_CONCURRENT + MAX_LLM_CALLS + 8
 
 # ---------------------------------------------------------------------------
 # Region layers and the artifact directory (regions/, api/artifacts.py)
@@ -364,9 +425,9 @@ WORKER_POLL_INTERVAL_S: float = float(os.environ.get("WORKER_POLL_INTERVAL_S", "
 # un-annotated base image; the SVG / PNG / preview layers are rendered on
 # FIRST FETCH by the artifact endpoint and cached into the job directory.
 #
-# ARTIFACT_DIR is one directory per job on the same /data volume as the DB and
-# the payload store. ARTIFACT_SWEEP_INTERVAL_S is how often the background
-# sweeper runs; the TTL it enforces is JOB_TTL_HOURS above, which the sweeper
+# ARTIFACT_DIR is one directory per job on the classifier_data volume
+# (DATA_DIR), beside the payload store. ARTIFACT_SWEEP_INTERVAL_S is how often
+# the background sweeper runs; the TTL it enforces is JOB_TTL_HOURS above, which the sweeper
 # makes real for the first time — for both directories AND job rows.
 #
 # ARTIFACT_MAX_BYTES is the cap PER ITEM: a job's directory may hold
@@ -381,7 +442,7 @@ WORKER_POLL_INTERVAL_S: float = float(os.environ.get("WORKER_POLL_INTERVAL_S", "
 # result itself. Past the cap the inline list is cut and `regions_truncated`
 # is set — the complete list is always in regions.json.
 ARTIFACT_DIR: str = os.environ.get(
-    "CLASSIFIER_ARTIFACT_DIR", os.path.join(os.path.dirname(DB_PATH) or ".", "artifacts")
+    "CLASSIFIER_ARTIFACT_DIR", os.path.join(DATA_DIR, "artifacts")
 )
 ARTIFACT_SWEEP_INTERVAL_S: float = max(
     30.0, float(os.environ.get("CLASSIFIER_ARTIFACT_SWEEP_INTERVAL_S", "600"))
@@ -698,7 +759,7 @@ LLM_BBOX_GRID: float = 1000.0
 # to REFERENCE_DESCRIPTION_MAX_CHARS — which is also the longest description
 # a caller may send.
 REFERENCE_DIR: str = os.environ.get(
-    "CLASSIFIER_REFERENCE_DIR", os.path.join(os.path.dirname(DB_PATH) or ".", "references")
+    "CLASSIFIER_REFERENCE_DIR", os.path.join(DATA_DIR, "references")
 )
 REFERENCE_MAX_COUNT: int = max(
     1, int(os.environ.get("CLASSIFIER_REFERENCE_MAX_COUNT", "500"))

@@ -46,6 +46,9 @@ import pathlib
 import numpy as np
 import pytest
 
+# --local runs the app's lifespan, which opens the classifier's Postgres pool.
+pytestmark = pytest.mark.postgres
+
 HERE = pathlib.Path(__file__).resolve().parent
 BILL = HERE / "documents" / "utility_bill.jpeg"
 EXPECTATIONS = HERE / "regions_expected.json"
@@ -194,7 +197,7 @@ class ScriptedBillModel:
 
 @pytest.fixture
 def restore_environ():
-    """main() loads .env and LocalTransport points DB_PATH & co. at its work
+    """main() loads .env and LocalTransport points CLASSIFIER_DATA_DIR & co. at its work
     directory; neither may leak into the rest of the session."""
     saved = dict(os.environ)
     yield

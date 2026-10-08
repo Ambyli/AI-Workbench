@@ -17,12 +17,13 @@ job abc123 cost". This module answers the second question, durably:
     unit_scope()               the context manager the scheduler sets
                                ``unit_var`` with.
     UsageStore                 the ``llm_calls`` table, in the SAME
-                               ``classifier.db`` as the jobs table. aiosqlite,
-                               one connection per call, exactly like
+                               ``classifier-db`` Postgres as the jobs table.
+                               asyncpg, through the one pool ``db.database``
+                               owns, exactly like
                                ``references.store.ReferenceRegistry``.
-    usage_store                the process-wide instance (DB_PATH). Every
-                               reader looks it up on THIS module at call time,
-                               so a test can swap it for one on a temp file.
+    usage_store                the process-wide instance. Every reader looks
+                               it up on THIS module at call time, so a test
+                               can swap it for one of its own.
     record_call()              what ``llm.client._post`` calls once per request,
                                ok or error, after the request's ``LLM_CALLS``
                                slot is released. NEVER raises.
@@ -45,16 +46,19 @@ thing that removes a job's rows is ``DELETE /jobs/{id}`` (``main`` wires
 :meth:`UsageStore.delete_job` into the jobs router's ``on_delete`` hook).
 
 **Accounting can never fail a model call.** ``record_call`` catches
-everything — building the row, opening the DB, the insert — logs a warning
-and counts it in ``classifier_llm_usage_write_errors_total``. The write
-happens after the slot is released, so a slow SQLite lock never holds a
+everything — building the row, reaching the database, the insert — logs a
+warning and counts it in ``classifier_llm_usage_write_errors_total``. The
+write happens after the slot is released, so a slow database never holds a
 model slot either.
 
-``usage_json`` keeps the response's ``usage`` object verbatim, so whatever
-vLLM reports beyond the five token columns (multimodal token counts, a future
-field) is not lost. Cached tokens are only reported when vLLM runs with
-``--enable-prompt-tokens-details``; a token total is NULL (not 0) when no call
-in it reported that number.
+The ``usage`` column (``JSONB``) keeps the response's ``usage`` object
+verbatim, so whatever vLLM reports beyond the five token columns (multimodal
+token counts, a future field) is not lost — and Trino / ``psql`` can read a
+field of it without parsing text. ``started_at`` is a ``TIMESTAMPTZ``; the API
+still hands it out as the ISO-8601 UTC string (microseconds, ``+00:00``) it
+always did. Cached tokens are only reported when vLLM runs with
+``--enable-prompt-tokens-details``; a token total is NULL (not 0) when no
+call in it reported that number.
 
 Process flow position: ``llm.client._post`` writes; ``api.usage``
 (``GET /jobs/{id}/usage``, ``GET /usage``) and ``jobs.queue.handle_job`` (the
@@ -65,16 +69,16 @@ job's rows with the job.
 from __future__ import annotations
 
 import json
-import os
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any, Iterator, Optional
 
-import aiosqlite
+import asyncpg
 import httpx
 
-from config import DB_PATH, VISION_LLM_API
+from config import VISION_LLM_API
+from db import Database, create_schema, database
 from logger import logger
 from metrics import llm_usage_write_errors
 from middleware import request_id_var
@@ -111,22 +115,56 @@ def unit_scope(
 
 
 def now_iso() -> str:
-    """UTC, always with microseconds — so stored timestamps and the
-    ``since`` / ``until`` filters compare correctly as plain strings."""
+    """UTC, always with microseconds — the format every timestamp this module
+    hands out has, and the format ``api.usage`` normalises a ``since`` /
+    ``until`` bound to."""
     return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
+
+def _ts(value: Any) -> Optional[datetime]:
+    """An ISO-8601 string (or a datetime) → an aware UTC datetime for a
+    ``TIMESTAMPTZ`` parameter; a naive value is read as UTC. ``None`` passes
+    through.
+
+    Raises:
+        ValueError: Not an ISO-8601 date or datetime.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _iso(value: Any) -> Optional[str]:
+    """A ``TIMESTAMPTZ`` as asyncpg returns it → :func:`now_iso`'s format."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).isoformat(timespec="microseconds")
+    return str(value)
 
 
 # ---------------------------------------------------------------------------
 # The table
 # ---------------------------------------------------------------------------
 
+# Token columns are INTEGER (a per-call count never nears 2^31) so a SUM over
+# them is a BIGINT — a Python int — rather than NUMERIC, which asyncpg would
+# hand back as Decimal.
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS llm_calls (
-    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    id                BIGSERIAL PRIMARY KEY,
     job_id            TEXT,
     job_type          TEXT,
     request_id        TEXT,
-    started_at        TEXT NOT NULL,
+    started_at        TIMESTAMPTZ NOT NULL,
     label             TEXT,
     kind              TEXT NOT NULL,
     criterion         TEXT,
@@ -141,13 +179,13 @@ CREATE TABLE IF NOT EXISTS llm_calls (
     http_status       INTEGER,
     error             TEXT,
     finish_reason     TEXT,
-    seconds           REAL NOT NULL,
+    seconds           DOUBLE PRECISION NOT NULL,
     prompt_tokens     INTEGER,
     cached_tokens     INTEGER,
     completion_tokens INTEGER,
     reasoning_tokens  INTEGER,
     total_tokens      INTEGER,
-    usage_json        TEXT
+    usage             JSONB
 );
 CREATE INDEX IF NOT EXISTS llm_calls_job ON llm_calls (job_id);
 CREATE INDEX IF NOT EXISTS llm_calls_started ON llm_calls (started_at);
@@ -159,7 +197,7 @@ COLUMNS: tuple[str, ...] = (
     "criterion", "item", "document", "attempt", "model_requested",
     "model_reported", "api_url", "max_tokens", "outcome", "http_status",
     "error", "finish_reason", "seconds", "prompt_tokens", "cached_tokens",
-    "completion_tokens", "reasoning_tokens", "total_tokens", "usage_json",
+    "completion_tokens", "reasoning_tokens", "total_tokens", "usage",
 )
 
 # The token columns, in the order every totals block lists them.
@@ -173,10 +211,15 @@ TOKEN_COLUMNS: tuple[str, ...] = (
 # NULL when no call in the group reported it — deliberately not 0.
 _AGGREGATES = (
     "COUNT(*) AS calls, "
-    "COALESCE(SUM(outcome = 'error'), 0) AS errors, "
+    "COUNT(*) FILTER (WHERE outcome = 'error') AS errors, "
     "COALESCE(SUM(seconds), 0) AS seconds, "
     + ", ".join(f"SUM({c}) AS {c}" for c in TOKEN_COLUMNS)
 )
+
+# The UTC calendar day of a call — GET /usage's per-day grouping. Explicitly
+# UTC: date_trunc / ::date on a TIMESTAMPTZ use the SESSION time zone, which
+# is whatever the server or the role was configured with.
+_DAY = "to_char(started_at AT TIME ZONE 'UTC', 'YYYY-MM-DD')"
 
 # A short error string: the class and the message, never a traceback.
 _ERROR_MAX_CHARS = 500
@@ -189,29 +232,31 @@ def _count(value: Any) -> Optional[int]:
     return int(value) if value >= 0 else None
 
 
-def _block(row: aiosqlite.Row) -> dict[str, Any]:
+def _block(row: asyncpg.Record) -> dict[str, Any]:
     """One aggregate row → the totals dict every view returns."""
     out: dict[str, Any] = {
-        "calls": row["calls"],
-        "errors": row["errors"],
+        "calls": int(row["calls"]),
+        "errors": int(row["errors"]),
         "seconds": round(float(row["seconds"] or 0.0), 3),
     }
     for column in TOKEN_COLUMNS:
-        out[column] = row[column]
+        value = row[column]
+        out[column] = int(value) if value is not None else None
     return out
 
 
-def _call(row: aiosqlite.Row) -> dict[str, Any]:
-    """One ``llm_calls`` row → the API's call entry (``usage_json`` parsed
-    into ``usage``)."""
-    out = {key: row[key] for key in row.keys() if key != "usage_json"}
-    usage = None
-    if row["usage_json"]:
+def _call(row: asyncpg.Record) -> dict[str, Any]:
+    """One ``llm_calls`` row → the API's call entry (``started_at`` as an ISO
+    string, ``usage`` decoded)."""
+    out = {key: row[key] for key in row.keys() if key != "usage"}
+    out["started_at"] = _iso(row["started_at"])
+    usage = row["usage"]
+    if isinstance(usage, str):
         try:
-            usage = json.loads(row["usage_json"])
+            usage = json.loads(usage)
         except json.JSONDecodeError:
             usage = None
-    out["usage"] = usage
+    out["usage"] = usage if isinstance(usage, dict) else None
     return out
 
 
@@ -240,7 +285,8 @@ def build_row(
 
     ``request_id`` is the correlation id of the HTTP request that queued the
     job (``handle_job`` restores it into ``middleware.request_id_var``);
-    NULL outside one.
+    NULL outside one. ``usage`` is the response's ``usage`` object as a dict
+    (stored as JSONB), or None.
     """
     unit = unit_var.get() or {}
     body = prompt if isinstance(prompt, dict) else {}
@@ -288,8 +334,28 @@ def build_row(
         "completion_tokens": counts.get("completion"),
         "reasoning_tokens": counts.get("reasoning"),
         "total_tokens": _count(usage.get("total_tokens")) if isinstance(usage, dict) else None,
-        "usage_json": json.dumps(usage) if isinstance(usage, dict) else None,
+        "usage": usage if isinstance(usage, dict) else None,
     }
+
+
+class _Where:
+    """A WHERE clause built from ``$n`` placeholders, numbered as clauses are
+    added — asyncpg has no ``?``, and every reader here composes its filter
+    piece by piece."""
+
+    def __init__(self) -> None:
+        self.clauses: list[str] = []
+        self.args: list[Any] = []
+
+    def add(self, template: str, value: Any) -> "_Where":
+        """``template`` holds one ``{}`` for this value's placeholder."""
+        self.args.append(value)
+        self.clauses.append(template.format(f"${len(self.args)}"))
+        return self
+
+    @property
+    def sql(self) -> str:
+        return " AND ".join(self.clauses) if self.clauses else "TRUE"
 
 
 class UsageStore:
@@ -298,24 +364,21 @@ class UsageStore:
     The table is created by :meth:`init` (``main``'s lifespan) and, failing
     that, lazily by the first write or read — so a test or a script that
     calls the model without the app's lifespan still records, instead of
-    logging a "no such table" warning per call.
+    logging an "undefined table" warning per call.
 
     Args:
-        db_path: The classifier's SQLite file (DB_PATH) — shared with the jobs
-                 table and ``reference_examples``.
+        db: The classifier's :class:`db.Database` — the one pool shared with
+            the jobs table and ``reference_examples``.
     """
 
-    def __init__(self, db_path: str) -> None:
-        self.db_path = db_path
+    def __init__(self, db: Database) -> None:
+        self.db = db
         self._ready = False
 
     async def init(self) -> None:
         """Create the table and its indexes. Idempotent."""
-        if self.db_path != ":memory:":
-            os.makedirs(os.path.dirname(self.db_path) or ".", exist_ok=True)
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.executescript(_SCHEMA)
-            await db.commit()
+        async with self.db.acquire() as conn:
+            await create_schema(conn, "classifier.llm_calls", _SCHEMA)
         self._ready = True
 
     async def _ensure(self) -> None:
@@ -341,58 +404,73 @@ class UsageStore:
 
     async def _insert(self, row: dict[str, Any]) -> None:
         await self._ensure()
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                f"INSERT INTO llm_calls ({', '.join(COLUMNS)}) "
-                f"VALUES ({', '.join('?' for _ in COLUMNS)})",
-                [row.get(column) for column in COLUMNS],
+        values: list[Any] = []
+        marks: list[str] = []
+        for n, column in enumerate(COLUMNS, start=1):
+            value = row.get(column)
+            if column == "started_at":
+                value = _ts(value)
+            elif column == "usage":
+                value = json.dumps(value) if value is not None else None
+                marks.append(f"${n}::jsonb")
+                values.append(value)
+                continue
+            marks.append(f"${n}")
+            values.append(value)
+        async with self.db.acquire() as conn:
+            await conn.execute(
+                f"INSERT INTO llm_calls ({', '.join(COLUMNS)}) VALUES ({', '.join(marks)})",
+                *values,
             )
-            await db.commit()
 
     async def delete_job(self, job_id: str) -> int:
         """Remove every call of one job; the number removed."""
         await self._ensure()
-        async with aiosqlite.connect(self.db_path) as db:
-            cur = await db.execute("DELETE FROM llm_calls WHERE job_id = ?", (job_id,))
-            await db.commit()
-            return cur.rowcount
+        async with self.db.acquire() as conn:
+            status = await conn.execute("DELETE FROM llm_calls WHERE job_id = $1", job_id)
+        try:
+            return int(status.rsplit(" ", 1)[-1])
+        except ValueError:
+            return 0
 
     # ── Reads ─────────────────────────────────────────────────────────────
     async def calls(self, job_id: str) -> list[dict[str, Any]]:
         """Every call of one job, in the order they were made."""
         await self._ensure()
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                "SELECT * FROM llm_calls WHERE job_id = ? ORDER BY started_at, id",
-                (job_id,),
-            ) as cur:
-                return [_call(row) for row in await cur.fetchall()]
+        async with self.db.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM llm_calls WHERE job_id = $1 ORDER BY started_at, id", job_id,
+            )
+        return [_call(row) for row in rows]
 
     async def _aggregate(
-        self, where: str, args: list[Any], group_by: Optional[str] = None,
+        self, where: _Where, group_by: Optional[str] = None,
     ) -> list[tuple[Any, dict[str, Any]]]:
-        """``[(group key, totals block)]`` for the rows matching ``where``."""
+        """``[(group key, totals block)]`` for the rows matching ``where``.
+
+        A grouped list is ordered by its key with NULL FIRST — the order the
+        SQLite version produced, so ``by_criterion`` still lists the calls
+        that belong to no criterion (selection, describe) first.
+        """
         await self._ensure()
         select = f"{group_by} AS grp, " if group_by else "NULL AS grp, "
-        sql = f"SELECT {select}{_AGGREGATES} FROM llm_calls WHERE {where}"
+        sql = f"SELECT {select}{_AGGREGATES} FROM llm_calls WHERE {where.sql}"
         if group_by:
-            sql += f" GROUP BY {group_by} ORDER BY {group_by}"
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(sql, args) as cur:
-                return [(row["grp"], _block(row)) for row in await cur.fetchall()]
+            sql += f" GROUP BY {group_by} ORDER BY {group_by} NULLS FIRST"
+        async with self.db.acquire() as conn:
+            rows = await conn.fetch(sql, *where.args)
+        return [(row["grp"], _block(row)) for row in rows]
 
-    async def _models(self, where: str, args: list[Any]) -> list[str]:
+    async def _models(self, where: _Where) -> list[str]:
         """The distinct models that answered (reported name, else requested)."""
-        async with aiosqlite.connect(self.db_path) as db:
-            async with db.execute(
-                "SELECT DISTINCT COALESCE(model_reported, model_requested) FROM llm_calls "
-                f"WHERE {where} AND COALESCE(model_reported, model_requested) IS NOT NULL "
-                "ORDER BY 1",
-                args,
-            ) as cur:
-                return [row[0] for row in await cur.fetchall()]
+        async with self.db.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT DISTINCT COALESCE(model_reported, model_requested) AS model "
+                f"FROM llm_calls WHERE {where.sql} "
+                "AND COALESCE(model_reported, model_requested) IS NOT NULL ORDER BY 1",
+                *where.args,
+            )
+        return [row["model"] for row in rows]
 
     async def totals(self, job_id: str) -> dict[str, Any]:
         """One job's totals, plus the same block per kind, outcome and criterion.
@@ -403,65 +481,61 @@ class UsageStore:
         ``criterion`` — the per-item selection and the describe call belong
         to no criterion, and ``null`` cannot be a JSON object key.
         """
-        where, args = "job_id = ?", [job_id]
-        ((_, totals),) = await self._aggregate(where, args)
-        totals["models"] = await self._models(where, args)
-        async with aiosqlite.connect(self.db_path) as db:
-            async with db.execute(
-                "SELECT MIN(started_at), MAX(started_at) FROM llm_calls WHERE job_id = ?",
-                (job_id,),
-            ) as cur:
-                first, last = await cur.fetchone()
-        totals["first_call_at"], totals["last_call_at"] = first, last
+        where = _Where().add("job_id = {}", job_id)
+        ((_, totals),) = await self._aggregate(where)
+        totals["models"] = await self._models(where)
+        async with self.db.acquire() as conn:
+            span = await conn.fetchrow(
+                "SELECT MIN(started_at) AS first, MAX(started_at) AS last "
+                "FROM llm_calls WHERE job_id = $1",
+                job_id,
+            )
+        totals["first_call_at"], totals["last_call_at"] = _iso(span["first"]), _iso(span["last"])
         return {
             "totals": totals,
-            "by_kind": dict(await self._aggregate(where, args, "kind")),
-            "by_outcome": dict(await self._aggregate(where, args, "outcome")),
+            "by_kind": dict(await self._aggregate(where, "kind")),
+            "by_outcome": dict(await self._aggregate(where, "outcome")),
             "by_criterion": [
                 {"criterion": name, **block}
-                for name, block in await self._aggregate(where, args, "criterion")
+                for name, block in await self._aggregate(where, "criterion")
             ],
         }
 
     async def summary(
         self,
         *,
-        since: Optional[str] = None,
-        until: Optional[str] = None,
+        since: Optional[str | datetime] = None,
+        until: Optional[str | datetime] = None,
         job_type: Optional[str] = None,
     ) -> dict[str, Any]:
         """Totals across jobs, grouped by kind and by UTC day.
 
         Args:
-            since:    Inclusive lower bound on ``started_at`` (UTC ISO, as
-                      :func:`now_iso` writes it).
+            since:    Inclusive lower bound on ``started_at`` (an ISO string,
+                      as :func:`now_iso` writes it, or a datetime).
             until:    Exclusive upper bound.
             job_type: Only calls made by jobs of this type.
         """
-        clauses, args = ["1 = 1"], []
+        where = _Where()
         if since is not None:
-            clauses.append("started_at >= ?")
-            args.append(since)
+            where.add("started_at >= {}", _ts(since))
         if until is not None:
-            clauses.append("started_at < ?")
-            args.append(until)
+            where.add("started_at < {}", _ts(until))
         if job_type is not None:
-            clauses.append("job_type = ?")
-            args.append(job_type)
-        where = " AND ".join(clauses)
-        ((_, totals),) = await self._aggregate(where, args)
-        totals["models"] = await self._models(where, args)
-        async with aiosqlite.connect(self.db_path) as db:
-            async with db.execute(
-                f"SELECT COUNT(DISTINCT job_id) FROM llm_calls WHERE {where}", args,
-            ) as cur:
-                (totals["jobs"],) = await cur.fetchone()
+            where.add("job_type = {}", job_type)
+        ((_, totals),) = await self._aggregate(where)
+        totals["models"] = await self._models(where)
+        async with self.db.acquire() as conn:
+            jobs = await conn.fetchval(
+                f"SELECT COUNT(DISTINCT job_id) FROM llm_calls WHERE {where.sql}", *where.args,
+            )
+        totals["jobs"] = int(jobs or 0)
         return {
             "totals": totals,
-            "by_kind": dict(await self._aggregate(where, args, "kind")),
+            "by_kind": dict(await self._aggregate(where, "kind")),
             "by_day": [
                 {"day": day, **block}
-                for day, block in await self._aggregate(where, args, "substr(started_at, 1, 10)")
+                for day, block in await self._aggregate(where, _DAY)
             ],
         }
 
@@ -475,7 +549,7 @@ class UsageStore:
 # Process-wide instance and the one write path
 # ---------------------------------------------------------------------------
 
-usage_store = UsageStore(DB_PATH)
+usage_store = UsageStore(database)
 
 
 async def record_call(**fields: Any) -> None:

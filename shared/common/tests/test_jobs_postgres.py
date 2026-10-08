@@ -253,3 +253,182 @@ async def test_reset_phase_and_count_by_phase(registry: PostgresRegistry) -> Non
     assert await registry.count_by_phase() == {"pending": 2, "processing": 1}
     assert await registry.reset_phase("processing", "pending") == 1
     assert await registry.count_by_phase() == {"pending": 3}
+
+
+# ── Retention ─────────────────────────────────────────────────────────────
+async def _backdate(job_id: str, seconds: float) -> None:
+    """Move a job's created_at ``seconds`` into the past."""
+    conn = await asyncpg.connect(_DSN)
+    try:
+        await conn.execute(
+            "UPDATE jobs SET created_at = created_at - make_interval(secs => $1) "
+            "WHERE id = $2",
+            float(seconds),
+            job_id,
+        )
+    finally:
+        await conn.close()
+
+
+async def test_expired_job_ids_terminal_only_oldest_first(
+    registry: PostgresRegistry,
+) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    old_done = await registry.register({"n": 1})
+    await registry.set_result(old_done, {"ok": True})
+    older_failed = await registry.register({"n": 2})
+    await registry.set_error(older_failed, "boom")
+    old_pending = await registry.register({"n": 3})          # never expires
+    fresh_done = await registry.register({"n": 4})
+    await registry.set_result(fresh_done, {"ok": True})
+    await _backdate(old_done, 3600)
+    await _backdate(older_failed, 7200)
+    await _backdate(old_pending, 7200)
+
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=30)
+    assert await registry.expired_job_ids(cutoff) == [older_failed, old_done]
+    assert await registry.expired_job_ids(cutoff, limit=1) == [older_failed]
+    assert await registry.expired_job_ids(cutoff, ["completed"]) == [old_done]
+    assert await registry.expired_job_ids(cutoff, []) == []
+    # A naive cutoff is read as UTC.
+    naive = cutoff.replace(tzinfo=None)
+    assert await registry.expired_job_ids(naive) == [older_failed, old_done]
+
+
+async def test_expired_job_ids_drives_the_artifact_sweep(
+    registry: PostgresRegistry, tmp_path
+) -> None:
+    """``ArtifactStore.sweep`` takes the bounded expired_job_ids route and
+    removes both the expired row and its directory."""
+    from common.vision import ArtifactStore
+
+    expired = await registry.register({"n": 1})
+    await registry.set_result(expired, {"ok": True})
+    kept = await registry.register({"n": 2})
+    await registry.set_result(kept, {"ok": True})
+    await _backdate(expired, 7200)
+
+    store = ArtifactStore(str(tmp_path))
+    store.write_json(expired, "regions.json", {"regions": []})
+    store.write_json(kept, "regions.json", {"regions": []})
+    out = await store.sweep(registry, ttl_hours=1)
+    assert out["jobs_removed"] == 1 and out["dirs_removed"] == 1
+    assert await registry.get(expired) is None
+    assert await registry.get(kept) is not None
+    assert store.job_ids() == [kept]
+
+
+# ── External pool ─────────────────────────────────────────────────────────
+async def test_constructor_needs_exactly_one_of_dsn_and_pool() -> None:
+    with pytest.raises(ValueError):
+        PostgresRegistry()
+    with pytest.raises(ValueError):
+        PostgresRegistry(_DSN, pool=object())
+
+
+async def test_external_pool_is_used_and_never_closed() -> None:
+    conn = await asyncpg.connect(_DSN)
+    try:
+        await conn.execute("DROP TABLE IF EXISTS jobs")
+    finally:
+        await conn.close()
+
+    pool = await asyncpg.create_pool(_DSN, min_size=1, max_size=2)
+    try:
+        reg = PostgresRegistry(pool=pool)
+        assert reg.owns_pool is False
+        await reg.init()          # schema only — no pool of its own
+        job_id = await reg.register({"via": "external"})
+        assert (await reg.get(job_id)).metadata == {"via": "external"}
+
+        await reg.close()         # a no-op for a pool it does not own
+        assert not pool._closed
+        async with pool.acquire() as c:
+            assert await c.fetchval("SELECT count(*) FROM jobs") == 1
+
+        # A second registry on the same pool sees the same rows.
+        other = PostgresRegistry(pool=pool)
+        await other.init()
+        assert (await other.get(job_id)) is not None
+    finally:
+        await pool.close()
+
+
+async def test_external_pool_may_be_any_acquire_facade() -> None:
+    """Anything whose ``acquire()`` yields an asyncpg connection will do —
+    the classifier hands in a facade, not an ``asyncpg.Pool``."""
+    from contextlib import asynccontextmanager
+
+    class OneShot:
+        def __init__(self) -> None:
+            self.acquired = 0
+
+        @asynccontextmanager
+        async def acquire(self):
+            self.acquired += 1
+            conn = await asyncpg.connect(_DSN)
+            try:
+                yield conn
+            finally:
+                await conn.close()
+
+    conn = await asyncpg.connect(_DSN)
+    try:
+        await conn.execute("DROP TABLE IF EXISTS jobs")
+    finally:
+        await conn.close()
+
+    facade = OneShot()
+    reg = PostgresRegistry(pool=facade)
+    await reg.init()
+    job_id = await reg.register({"x": 1})
+    claimed = await reg.claim_next()
+    assert claimed is not None and claimed.job_id == job_id
+    assert await reg.count_by_phase() == {"processing": 1}
+    assert facade.acquired == 4   # init, register, claim, count
+
+
+# ── result_type ───────────────────────────────────────────────────────────
+async def test_result_type_json_keeps_key_order() -> None:
+    """JSONB sorts object keys; ``result_type="json"`` stores the text
+    verbatim, so a result whose key order means something survives."""
+    conn = await asyncpg.connect(_DSN)
+    try:
+        await conn.execute("DROP TABLE IF EXISTS jobs")
+    finally:
+        await conn.close()
+
+    ordered = {"zeta": 1, "alpha": 2, "document legibility": 3, "b": 4}
+    reg = PostgresRegistry(_DSN, result_type="json")
+    await reg.init()
+    try:
+        job_id = await reg.register({"k": 1})
+        await reg.set_result(job_id, {"scores": ordered})
+        got = await reg.get(job_id)
+        assert list(got.result["scores"]) == list(ordered)
+        conn = await asyncpg.connect(_DSN)
+        try:
+            kind = await conn.fetchval(
+                "SELECT data_type FROM information_schema.columns "
+                "WHERE table_name = 'jobs' AND column_name = 'result'"
+            )
+        finally:
+            await conn.close()
+        assert kind == "json"
+    finally:
+        await reg.close()
+
+
+async def test_result_type_jsonb_is_the_default_and_reorders(
+    registry: PostgresRegistry,
+) -> None:
+    """Pins WHY the option exists: the default JSONB column does reorder."""
+    job_id = await registry.register({"k": 1})
+    await registry.set_result(job_id, {"b": 1, "a": 2})
+    assert list((await registry.get(job_id)).result) == ["a", "b"]
+
+
+async def test_result_type_is_validated() -> None:
+    with pytest.raises(ValueError):
+        PostgresRegistry(_DSN, result_type="text")

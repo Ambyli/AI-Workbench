@@ -58,7 +58,7 @@ GOOD_BOX = [100, 200, 300, 400]
 
 
 @pytest.fixture(scope="module")
-def client():
+def client(need_postgres):
     import main
 
     with TestClient(main.app) as c:

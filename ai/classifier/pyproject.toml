@@ -21,7 +21,9 @@ dependencies = [
     "python-docx>=1.2.0",
     "rapidocr>=3.9.2,<4",
     "onnxruntime>=1.22.0",
-    "aiosqlite",
+    # The classifier-db Postgres: the job queue (common.jobs.postgres),
+    # reference_examples and llm_calls, all through db.py's one pool.
+    "asyncpg",
     "prometheus-client",
     "prometheus-fastapi-instrumentator",
 ]

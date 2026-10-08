@@ -4,9 +4,51 @@ networks:
     name: ai_shared
 
 services:
+  # ── classifier-db: every row the classifier keeps ─────────────────────────
+  # The job queue (jobs), saved references (reference_examples) and one row
+  # per vision-model request (llm_calls). Was a SQLite file on the
+  # classifier_data volume; a file has no listener and Trino has no SQLite
+  # connector, so it moved here. Same shape as roofix-db: on ai_shared, so
+  # trino-coordinator reaches it by service DNS (the postgres_classifier
+  # catalog) without joining anything else, and published on
+  # PORT_CLASSIFIER_DB for psql / DBeaver. Its own container, not a schema in
+  # supabase-db, so the job queue never depends on the Supabase stack.
+  #
+  # 10-trino-reader.sh runs once, on the first start of an EMPTY volume, and
+  # creates the read-only `trino_reader` role from
+  # CLASSIFIER_TRINO_READER_PASSWORD. Re-run it by hand for an existing volume
+  # (the command is in the script's header).
+  classifier-db:
+    image: postgres:17-alpine
+    container_name: classifier-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${CLASSIFIER_DB_USER:-classifier}
+      POSTGRES_PASSWORD: ${CLASSIFIER_DB_PASSWORD:-classifier}
+      POSTGRES_DB: ${CLASSIFIER_DB_NAME:-classifier}
+      # Consumed by db-init/10-trino-reader.sh. Empty = the role is skipped
+      # with a log line (only the Trino catalog breaks, never the classifier).
+      TRINO_READER_USER: trino_reader
+      TRINO_READER_PASSWORD: ${CLASSIFIER_TRINO_READER_PASSWORD:-}
+    volumes:
+      - classifier_db:/var/lib/postgresql/data
+      - ./db-init/10-trino-reader.sh:/docker-entrypoint-initdb.d/10-trino-reader.sh:ro
+    ports:
+      - "${PORT_CLASSIFIER_DB:-5439}:5432"
+    networks:
+      - shared
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${CLASSIFIER_DB_USER:-classifier} -d ${CLASSIFIER_DB_NAME:-classifier}"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
   classifier:
     networks:
       - shared
+    depends_on:
+      classifier-db:
+        condition: service_healthy
     build:
       context: ../..
       dockerfile: ai/classifier/Dockerfile
@@ -128,11 +170,25 @@ services:
       # Retention. Now enforced rather than informational: the sweeper
       # deletes a terminal job's artifact directory AND its row past this.
       - JOB_TTL_HOURS=${JOB_TTL_HOURS:-24}
-      # The job store and queue on the classifier_data volume, and the idle
-      # workers' fallback poll. Fixed values, not ${…}: the names are generic
-      # enough that interpolating them from the shared root .env could pick
-      # up another service's setting. They equal config.py's defaults.
-      - DB_PATH=/data/classifier.db
+      # The classifier-db Postgres above: the job queue, references and
+      # model-usage rows. HOST and PORT are fixed (service DNS on ai_shared,
+      # the container port); the credentials come from the `## Classifier`
+      # block in .env with the same dev defaults classifier-db is created
+      # with. There is no SQLite fallback — an unreachable database fails
+      # startup. See ai/classifier/API.md § Concurrency and durability.
+      - CLASSIFIER_DB_HOST=classifier-db
+      - CLASSIFIER_DB_PORT=5432
+      - CLASSIFIER_DB_USER=${CLASSIFIER_DB_USER:-classifier}
+      - CLASSIFIER_DB_PASSWORD=${CLASSIFIER_DB_PASSWORD:-classifier}
+      - CLASSIFIER_DB_NAME=${CLASSIFIER_DB_NAME:-classifier}
+      # What stays on FILES, on the classifier_data volume: queued jobs'
+      # payloads (and the artifact / reference roots above, which default
+      # under the same /data), plus the idle workers' fallback poll. Fixed
+      # values, not ${…}: the names are generic enough that interpolating
+      # them from the shared root .env could pick up another service's
+      # setting. They equal config.py's defaults. /data/classifier.db is the
+      # pre-Postgres database, read only by bin/migrate_sqlite_to_postgres.py.
+      - CLASSIFIER_DATA_DIR=/data
       - PAYLOAD_DIR=/data/payloads
       - WORKER_POLL_INTERVAL_S=1.0
     volumes:
@@ -146,3 +202,4 @@ services:
 
 volumes:
   classifier_data:
+  classifier_db:

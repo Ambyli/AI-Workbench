@@ -539,7 +539,7 @@ name = "classifier"
 version = "0.1.0"
 source = { virtual = "ai/classifier" }
 dependencies = [
-    { name = "aiosqlite" },
+    { name = "asyncpg" },
     { name = "common" },
     { name = "fastapi" },
     { name = "httpx" },
@@ -560,7 +560,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "aiosqlite" },
+    { name = "asyncpg" },
     { name = "common", editable = "shared/common" },
     { name = "fastapi" },
     { name = "httpx" },

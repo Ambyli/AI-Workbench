@@ -1575,7 +1575,7 @@
     },
     {
       "name": "Usage",
-      "description": "What each job's vision-model requests cost. Every HTTP request to VISION_LLM_API is one row of the `llm_calls` table in classifier.db, linked to its job, criterion and item; the rows outlive the job's TTL and go only with DELETE /jobs/:jobId. A completed job's result carries the totals as `usage`. Set `jobId` from a POST /assess or POST /references response. See API.md § Model usage.",
+      "description": "What each job's vision-model requests cost. Every HTTP request to VISION_LLM_API is one row of the `llm_calls` table in the classifier-db Postgres (also readable from Trino as postgres_classifier.public.llm_calls), linked to its job, criterion and item; the rows outlive the job's TTL and go only with DELETE /jobs/:jobId. A completed job's result carries the totals as `usage`. Set `jobId` from a POST /assess or POST /references response. See API.md § Model usage.",
       "item": [
         {
           "name": "GET /jobs/:jobId/usage",

@@ -10,13 +10,17 @@ Three backends, same conceptual shape:
 * ``SqliteRegistry`` (from ``common.jobs.sqlite``) — async, ``aiosqlite``-backed,
   persistent. Jobs survive process restarts and only leave the store on
   explicit ``delete``. Good for single-process services with light write
-  concurrency, like ``classifier``.
+  concurrency and no need to query the jobs from outside the process (the
+  classifier used it until its state moved to ``classifier-db``).
 
 * ``PostgresRegistry`` (from ``common.jobs.postgres``) — async, ``asyncpg``-backed,
   persistent, with a real connection pool and ``JSONB`` metadata/result. For
   services with multiple concurrent writers, a state store that needs to
   live in its own network segment, or operators who want to query the job
-  table from ``psql``. Used by the sandbox subsystem.
+  table from ``psql`` (or federate it into Trino). It either owns its pool
+  (``dsn=`` — the sandbox subsystem) or shares one the service owns
+  (``pool=`` — the classifier, whose references and model-usage tables live
+  in the same database).
 
 All three backends produce ``JobBase`` snapshots (see ``common.jobs.model``)
 and can be mounted onto a FastAPI app via ``common.jobs.router.build_router``.

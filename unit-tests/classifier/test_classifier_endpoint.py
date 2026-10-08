@@ -53,7 +53,7 @@ DOCS = HERE / "documents"
 
 
 @pytest.fixture(scope="module")
-def client():
+def client(need_postgres):
     import main
 
     with TestClient(main.app) as c:

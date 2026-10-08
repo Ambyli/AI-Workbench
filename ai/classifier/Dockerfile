@@ -63,18 +63,22 @@ COPY ai/classifier/references ./ai/classifier/references
 COPY ai/classifier/regions ./ai/classifier/regions
 
 # The operator tools. `bin/` is not imported by the service — it holds scripts
-# that have to run WHERE THE MODEL IS (grounding_experiment.py talks to
-# VISION_LLM_API directly), so they ship in the image and are run with
-# `docker compose exec classifier python bin/…`.
+# that have to run WHERE THE MODEL OR THE DATA IS (grounding_experiment.py
+# talks to VISION_LLM_API directly; migrate_sqlite_to_postgres.py reads the
+# old /data/classifier.db and writes classifier-db), so they ship in the image
+# and run inside the container, through the project venv:
+# `docker exec classifier uv run python bin/migrate_sqlite_to_postgres.py`.
 COPY ai/classifier/bin ./ai/classifier/bin
 
 # Import the app the way the CMD below will (PYTHONPATH is already
 # /app/ai/classifier), so a missing COPY line above, a circular import, or a
 # syntax error fails the BUILD instead of shipping a crash-looping container.
 # Same spirit as the OCR warm-up assertion. The paths are throwaway: config.py
-# freezes DB_PATH / PAYLOAD_DIR / CLASSIFIER_ARTIFACT_DIR at import time, and
-# /data is a volume mount at runtime.
-RUN DB_PATH=/tmp/build-check.db \
+# freezes CLASSIFIER_DATA_DIR (and the PAYLOAD_DIR / artifact / reference dirs
+# under it) at import time, and /data is a volume mount at runtime. Importing
+# needs no database: the Postgres pool (db.py) is only opened by the lifespan,
+# and CLASSIFIER_DB_HOST is deliberately unset here.
+RUN CLASSIFIER_DATA_DIR=/tmp/build-check \
     PAYLOAD_DIR=/tmp/build-check-payloads \
     CLASSIFIER_ARTIFACT_DIR=/tmp/build-check-artifacts \
     CLASSIFIER_OCR_ENGINE=none \

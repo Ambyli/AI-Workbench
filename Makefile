@@ -13,7 +13,7 @@ $(eval $(call service,vllm,qwen3.8 qwen3.8-solo qwen3.6 vllm-qwen-vl muse-glimme
 $(eval $(call service,llama,glm5.2 qwen3.8-flash glm5.3-flash))
 $(eval $(call service,kokoro,kokoro-app kokoro-api))
 $(eval $(call service,madlad,madlad-app madlad-api))
-$(eval $(call service,classifier,classifier))
+$(eval $(call service,classifier,classifier-db classifier))
 $(eval $(call service,detector,detector))
 $(eval $(call service,openwebui,openwebui))
 $(eval $(call service,oauth2-proxy,oauth2-proxy oauth2-assets))

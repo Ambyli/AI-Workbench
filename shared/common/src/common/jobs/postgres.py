@@ -13,8 +13,22 @@ right shape for services that:
 * need the state store to sit in its own network segment for isolation
   (the sandbox subsystem does this — see ``ai/sandbox/SANDBOX.md``).
 
-The public interface matches ``SqliteRegistry`` exactly, so
-``common.jobs.router.build_router`` mounts it with no changes.
+The public interface matches ``SqliteRegistry`` exactly — CRUD, the queue
+operations ``common.jobs.worker.WorkerPool`` drives (``claim_next`` /
+``reset_phase`` / ``count_by_phase``), and the retention query
+``common.vision.ArtifactStore.sweep`` prefers (``expired_job_ids``) — so
+``common.jobs.router.build_router`` mounts it with no changes and a service
+can swap one backend for the other without touching its consumers.
+
+Two ways to give it a connection pool:
+
+* ``PostgresRegistry(dsn)`` — the registry owns a pool: ``init()`` creates
+  it, ``close()`` closes it. The sandbox runner does this.
+* ``PostgresRegistry(pool=...)`` — the service owns ONE pool and hands it to
+  every store that shares the database (the classifier keeps jobs,
+  references and model-usage rows in one Postgres). ``init()`` then only
+  creates the schema and ``close()`` leaves the pool alone — whoever created
+  it closes it, after every store sharing it is done.
 
 Optional dep: ``asyncpg``. If a consumer imports this module without
 having asyncpg installed, they get a clean ``ImportError`` at import time.
@@ -24,7 +38,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 from uuid import uuid4
 
 import asyncpg
@@ -32,18 +46,27 @@ from pydantic import BaseModel
 
 from .model import JobBase, JobsListResponse
 
+# Phases a retention sweep may delete. A job still pending or processing is
+# never expired, however old — see ``expired_job_ids``. The same set as
+# ``common.jobs.sqlite._TERMINAL_PHASES`` and ``common.vision.store``.
+_TERMINAL_PHASES = ("completed", "failed", "cancelled")
 
+
+# ``{result_type}`` is ``JSONB`` (the default) or ``JSON`` — see the
+# ``result_type`` argument of ``PostgresRegistry``.
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
     id         TEXT PRIMARY KEY,
     phase      TEXT NOT NULL DEFAULT 'pending',
     created_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL,
-    metadata   JSONB NOT NULL DEFAULT '{}'::jsonb,
-    result     JSONB,
+    metadata   JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+    result     {result_type},
     error      TEXT
 );
 """
+
+_RESULT_TYPES = ("jsonb", "json")
 
 _INDEX = "CREATE INDEX IF NOT EXISTS jobs_updated_at ON jobs (updated_at DESC);"
 
@@ -54,12 +77,23 @@ class PostgresRegistry:
     Args:
         dsn: Postgres DSN (e.g. ``postgresql://user:pw@host:5432/dbname``).
             The pool is created on ``init()`` and reused for the lifetime of
-            the process.
+            the process. Give this OR ``pool``, not both.
+        pool: An externally owned pool — an ``asyncpg.Pool``, or any object
+            whose ``acquire()`` returns an async context manager yielding an
+            asyncpg connection (the classifier passes a facade that also
+            serves callers on a different event loop). The registry never
+            creates or closes it, and ``min_size`` / ``max_size`` are
+            ignored. Usable from construction on: the owner decides when it
+            is ready, so a process can build the registry at import time and
+            create the real pool later in its startup.
         min_size: Minimum pool size. Defaults to 1 — enough for a service
             that mostly serves reads with occasional writes.
         max_size: Maximum pool size. Defaults to 10 — comfortably above
             ``SANDBOX_MAX_CONCURRENT=8`` so no request queues waiting for a
             connection.
+        result_type: ``"jsonb"`` (default) or ``"json"`` for the ``result``
+            column — ``"json"`` when the result's key order must survive the
+            round trip (see below).
 
     Schema (created idempotently by ``init()``):
 
@@ -80,42 +114,68 @@ class PostgresRegistry:
     SQLite backend's ``TEXT``-of-JSON. Timestamps are ``TIMESTAMPTZ`` so
     Postgres handles the timezone offset instead of our helpers parsing
     ISO-8601 strings.
+
+    ``result_type="json"`` stores ``result`` as ``JSON`` instead. ``JSONB``
+    normalises a document — object keys come back SORTED (by length, then
+    bytes), not in the order they were written — and a result whose key
+    order is part of its meaning (the classifier's ``per_criterion_scores``
+    lists criteria in request order) must not be reordered by its store.
+    ``JSON`` keeps the text verbatim and still supports ``->`` / ``->>`` for
+    operators. ``metadata`` stays ``JSONB`` either way: ``update_metadata``
+    merges with the JSONB-only ``||`` operator. The type is only applied when
+    the table is created; an existing table keeps whatever it has.
     """
 
     def __init__(
         self,
-        dsn: str,
+        dsn: Optional[str] = None,
         *,
+        pool: Any = None,
         min_size: int = 1,
         max_size: int = 10,
+        result_type: str = "jsonb",
     ) -> None:
+        if (dsn is None) == (pool is None):
+            raise ValueError("PostgresRegistry needs exactly one of dsn= or pool=")
+        if result_type.lower() not in _RESULT_TYPES:
+            raise ValueError(f"result_type must be one of {_RESULT_TYPES}, not {result_type!r}")
+        self.result_type = result_type.lower()
         self.dsn = dsn
         self._min_size = min_size
         self._max_size = max_size
+        self._external_pool = pool
         self._pool: Optional[asyncpg.Pool] = None
+
+    @property
+    def owns_pool(self) -> bool:
+        """True when this registry creates (and closes) its own pool."""
+        return self._external_pool is None
 
     # ── Init + shutdown ───────────────────────────────────────────────────
     async def init(self) -> None:
-        """Create the pool and the schema. Idempotent — safe to call more
-        than once, though callers typically only call it during FastAPI's
-        startup event."""
-        if self._pool is None:
+        """Create the pool (when the registry owns one) and the schema.
+        Idempotent — safe to call more than once, though callers typically
+        only call it during FastAPI's startup event."""
+        if self.owns_pool and self._pool is None:
             self._pool = await asyncpg.create_pool(
                 self.dsn,
                 min_size=self._min_size,
                 max_size=self._max_size,
             )
-        async with self._pool.acquire() as conn:
-            await conn.execute(_SCHEMA)
+        async with self._require_pool().acquire() as conn:
+            await conn.execute(_SCHEMA.format(result_type=self.result_type.upper()))
             await conn.execute(_INDEX)
 
     async def close(self) -> None:
-        """Close the pool. Idempotent."""
+        """Close the pool this registry created. Idempotent, and a no-op for
+        an external pool — its owner closes it."""
         if self._pool is not None:
             await self._pool.close()
             self._pool = None
 
-    def _require_pool(self) -> asyncpg.Pool:
+    def _require_pool(self) -> Any:
+        if self._external_pool is not None:
+            return self._external_pool
         if self._pool is None:
             raise RuntimeError(
                 "PostgresRegistry.init() must be awaited before use"
@@ -163,7 +223,7 @@ class PostgresRegistry:
         pool = self._require_pool()
         async with pool.acquire() as conn:
             await conn.execute(
-                "UPDATE jobs SET phase = $1, result = $2::jsonb, updated_at = $3 "
+                f"UPDATE jobs SET phase = $1, result = $2::{self.result_type}, updated_at = $3 "
                 "WHERE id = $4",
                 phase,
                 json.dumps(result),
@@ -314,6 +374,58 @@ class PostgresRegistry:
             return int(status.rsplit(" ", 1)[1])
         except (IndexError, ValueError):
             return 0
+
+    # ── Retention ─────────────────────────────────────────────────────────
+    async def expired_job_ids(
+        self,
+        cutoff: datetime,
+        phases: Iterable[str] = _TERMINAL_PHASES,
+        *,
+        limit: Optional[int] = None,
+    ) -> list[str]:
+        """Ids of jobs in ``phases`` whose ``created_at`` predates ``cutoff``.
+
+        Same contract as ``SqliteRegistry.expired_job_ids`` and for the same
+        reason: it is the bounded alternative to ``list_all`` that
+        ``common.vision.ArtifactStore.sweep`` prefers — ids only, filtered in
+        SQL, no ceiling unless one is asked for — so a service that takes
+        more than a page of jobs inside one TTL window still reaches its
+        oldest expired rows, without dragging every ``result`` blob along.
+
+        No string-truncation trick is needed here, unlike the SQLite backend:
+        ``created_at`` is a ``TIMESTAMPTZ``, so this is a real instant-to-
+        instant comparison at microsecond resolution, whatever offset either
+        side was written with.
+
+        Args:
+            cutoff: Jobs created strictly before this instant are expired. A
+                naive datetime is read as UTC.
+            phases: Phases eligible for expiry. Defaults to the terminal set —
+                a job still pending or processing is never expired, however
+                old, because a queue that backed up should drain, not
+                evaporate.
+            limit:  Optional cap, oldest first. ``None`` returns every match.
+
+        Returns:
+            Job ids, oldest first.
+        """
+        phase_list = list(phases)
+        if not phase_list:
+            return []
+        if cutoff.tzinfo is None:
+            cutoff = cutoff.replace(tzinfo=timezone.utc)
+        sql = (
+            "SELECT id FROM jobs WHERE phase = ANY($1::text[]) AND created_at < $2 "
+            "ORDER BY created_at ASC, id ASC"
+        )
+        args: list[Any] = [phase_list, cutoff]
+        if limit is not None:
+            sql += " LIMIT $3"
+            args.append(int(limit))
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(sql, *args)
+        return [r["id"] for r in rows]
 
     async def count_by_phase(self) -> dict[str, int]:
         """Return ``{phase: row_count}`` for every phase present."""

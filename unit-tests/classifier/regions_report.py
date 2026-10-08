@@ -399,7 +399,27 @@ class LocalTransport:
 
     def __init__(self, workdir: pathlib.Path):
         workdir.mkdir(parents=True, exist_ok=True)
-        os.environ["DB_PATH"] = str(workdir / "classifier.db")
+        # The classifier keeps its queue, references and usage rows in
+        # Postgres, with no SQLite fallback — so a local run needs a server.
+        # It gets a database of its own (classifier_local_<pid>_<hex>) on
+        # TEST_POSTGRES_DSN (or an explicitly set CLASSIFIER_DB_HOST & co.),
+        # dropped again in __exit__. Inside pytest the conftest has already
+        # imported config against the SESSION database, so a second one here
+        # would be ignored — the run uses the session's instead.
+        self._db = None
+        if "config" not in sys.modules:
+            from pg_testdb import ThrowawayDatabase, admin_dsn  # noqa: PLC0415
+
+            admin = admin_dsn()
+            if not admin:
+                raise SystemExit(
+                    "--local needs a Postgres server for the classifier's job queue: set "
+                    "TEST_POSTGRES_DSN (e.g. postgresql://postgres@localhost:5432/postgres). "
+                    "A throwaway database is created on it for this run and dropped after."
+                )
+            self._db = ThrowawayDatabase(admin, prefix="classifier_local").create()
+            os.environ.update(self._db.env())
+        os.environ["CLASSIFIER_DATA_DIR"] = str(workdir)
         os.environ["PAYLOAD_DIR"] = str(workdir / "payloads")
         os.environ["CLASSIFIER_ARTIFACT_DIR"] = str(workdir / "artifacts")
         # References live in their own never-swept root; left at its default
@@ -429,7 +449,11 @@ class LocalTransport:
         return self
 
     def __exit__(self, *exc: Any) -> None:
-        self._client.__exit__(*exc)
+        try:
+            self._client.__exit__(*exc)   # the lifespan closes the pool first
+        finally:
+            if self._db is not None:
+                self._db.drop()
 
     def url(self, path: str) -> str:
         return self._strip(path)

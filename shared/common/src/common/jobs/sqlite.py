@@ -8,9 +8,10 @@ restarts; they only leave the store on an explicit ``delete()`` call or the
 consumer's own retention policy.
 
 This is the right shape for services that hand off work to a background
-worker and expose ``POST kickoff → GET /jobs/{id}`` polling — like
-``classifier``, whose ``/assess`` endpoint returns immediately with a
-``job_id`` while the actual analysis happens in an asyncio task.
+worker and expose ``POST kickoff → GET /jobs/{id}`` polling — like the
+classifier did before its state moved to Postgres (``PostgresRegistry``, so
+Trino could federate it): ``/assess`` returns immediately with a ``job_id``
+while the actual analysis happens in an asyncio task.
 
 The table doubles as a durable FIFO work queue: producers register jobs in
 ``"pending"`` and any number of consumers call ``claim_next()`` to

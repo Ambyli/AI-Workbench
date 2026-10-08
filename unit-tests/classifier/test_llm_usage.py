@@ -2,9 +2,10 @@
 
 No vLLM: the model is scripted at the bare transport ``llm.client._send`` —
 where every other suite scripts it — so ``_post`` (the slot, the timer, the
-usage row) runs for real. Every test that writes rows points
-``llm.usage.usage_store`` at a fresh SQLite file of its own, so the counts
-here are exact.
+usage row) runs for real. Every test that writes rows swaps
+``llm.usage.usage_store`` for a fresh store on the session's Postgres
+database with ``llm_calls`` emptied first, so the counts here are exact. The
+whole module needs that database (``TEST_POSTGRES_DSN``; see conftest.py).
 
 Pinned:
 
@@ -28,6 +29,7 @@ Pinned:
 
 Run with::
 
+    TEST_POSTGRES_DSN=postgresql://postgres@localhost:5432/postgres \\
     UV_LINK_MODE=copy uv run --no-sync --with pytest --package classifier \\
         python -m pytest unit-tests/classifier/test_llm_usage.py -q -p no:cacheprovider
 """
@@ -48,7 +50,10 @@ from fastapi.testclient import TestClient
 from prometheus_client import REGISTRY
 
 import llm.client as llm_client
+from db import database
 from llm import usage as llm_usage
+
+pytestmark = pytest.mark.postgres
 
 FULL_USAGE = {
     "prompt_tokens": 1200,
@@ -76,12 +81,19 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+async def _sql(statement: str) -> None:
+    async with database.acquire() as conn:
+        await conn.execute(statement)
+
+
 @pytest.fixture
 def store(monkeypatch):
-    """A fresh usage store on its own file, swapped in for the process one."""
-    tmp = pathlib.Path(tempfile.mkdtemp(prefix="classifier-usage-test-"))
-    fresh = llm_usage.UsageStore(str(tmp / "usage.db"))
+    """A fresh usage store on an EMPTY ``llm_calls``, swapped in for the
+    process one. The table is the session database's (the one every other
+    test's model calls also write to), emptied first so counts are exact."""
+    fresh = llm_usage.UsageStore(database)
     _run(fresh.init())
+    _run(_sql("TRUNCATE llm_calls"))
     monkeypatch.setattr(llm_usage, "usage_store", fresh)
     return fresh
 
@@ -412,7 +424,7 @@ def test_delete_job_removes_only_that_jobs_rows(store):
 
 def test_a_ttl_sweep_of_the_job_leaves_its_usage(store, monkeypatch):
     """The artifact sweeper prunes the expired job row — and never the usage."""
-    from common.jobs.sqlite import SqliteRegistry
+    from common.jobs.postgres import PostgresRegistry
     from common.vision import ArtifactStore
 
     from api.schemas import ClassifierMetadata
@@ -425,14 +437,15 @@ def test_a_ttl_sweep_of_the_job_leaves_its_usage(store, monkeypatch):
     monkeypatch.setattr(sweeper_module, "store", ArtifactStore(str(root)))
 
     async def scenario():
-        registry = SqliteRegistry(store.db_path)  # the same file, as in the container
+        registry = PostgresRegistry(pool=database)  # the same database, as in the container
         await registry.init()
         job_id = await registry.register(ClassifierMetadata(type="assess", request_id="t"))
         await registry.set_result(job_id, {"ok": True})
         await store.record(_row(job_id))
         monkeypatch.setattr(sweeper_module, "JOB_TTL_HOURS", 0)
-        # The registry compares created_at to the cutoff at SECOND resolution.
-        await asyncio.sleep(1.1)
+        # created_at is a TIMESTAMPTZ compared at microsecond resolution; a
+        # short pause just keeps "created strictly before the cutoff" honest.
+        await asyncio.sleep(0.05)
         out = await sweeper_module.ArtifactSweeper(registry).sweep_once()
         return job_id, out, await registry.get(job_id)
 
@@ -442,8 +455,8 @@ def test_a_ttl_sweep_of_the_job_leaves_its_usage(store, monkeypatch):
 
 
 def test_record_creates_the_table_on_first_use():
-    tmp = pathlib.Path(tempfile.mkdtemp(prefix="classifier-usage-lazy-"))
-    lazy = llm_usage.UsageStore(str(tmp / "sub" / "usage.db"))  # never init()-ed
+    _run(_sql("DROP TABLE IF EXISTS llm_calls"))
+    lazy = llm_usage.UsageStore(database)  # never init()-ed
     assert _run(lazy.record(_row("j")))
     assert len(_run(lazy.calls("j"))) == 1
 

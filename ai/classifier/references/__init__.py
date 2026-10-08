@@ -11,7 +11,7 @@ and tags may be edited.
     model.py     the Reference row, the id grammar, the file-name grammar, and
                  which criteria guide the vision model (``guides_llm``).
     store.py     ``ReferenceRegistry`` (the ``reference_examples`` table in
-                 the classifier's SQLite DB) and the reference file store — a
+                 the classifier-db Postgres) and the reference file store — a
                  ``common.vision.ArtifactStore`` rooted at
                  CLASSIFIER_REFERENCE_DIR that nothing sweeps — plus the
                  startup reconcile and the gauges.

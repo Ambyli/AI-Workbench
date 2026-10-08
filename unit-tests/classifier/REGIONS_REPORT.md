@@ -66,9 +66,17 @@ Check before a run:
 ### Locally, with no model at all
 
 `--local` mounts `ai/classifier/main.py` in-process with FastAPI's
-`TestClient` on a throwaway `DB_PATH` / `PAYLOAD_DIR` /
-`CLASSIFIER_ARTIFACT_DIR` under the output directory, with
-`CLASSIFIER_OCR_ENGINE=rapidocr`. No container, no GPU, no network. It
+`TestClient` on a throwaway `PAYLOAD_DIR` / `CLASSIFIER_ARTIFACT_DIR` /
+`CLASSIFIER_REFERENCE_DIR` under the output directory, with
+`CLASSIFIER_OCR_ENGINE=rapidocr`, and a throwaway **Postgres database**: the
+classifier keeps its job queue, references and model-usage rows in Postgres
+and has no SQLite fallback, so `--local` needs `TEST_POSTGRES_DSN` (any
+server you can `CREATE DATABASE` on — e.g.
+`postgresql://postgres@localhost:5432/postgres`). It creates
+`classifier_local_<pid>_<hex>` on it for the run and drops it afterwards
+(`pg_testdb.py`, the same helper the unit-test session uses); without the
+variable it stops before starting with a message saying so. No container, no
+GPU, no model. It
 verifies everything that is not the vision model: collection parsing,
 submission, the job queue, OCR, the OpenCV detectors, text matching, artifact
 writing, the annotation pass, and the report itself.
@@ -97,8 +105,9 @@ Two consequences, both stated in the report rather than hidden:
 # Everything, against the box
 uv run --package classifier python unit-tests/classifier/regions_report.py
 
-# Everything, in-process, no model needed
-uv run --package classifier python unit-tests/classifier/regions_report.py --local
+# Everything, in-process, no model needed (needs a Postgres to create a throwaway DB on)
+TEST_POSTGRES_DSN=postgresql://postgres@localhost:5432/postgres \
+    uv run --package classifier python unit-tests/classifier/regions_report.py --local
 
 # One fixture
 uv run --package classifier python unit-tests/classifier/regions_report.py --only photo_of_letter
@@ -154,7 +163,7 @@ reports/2026-09-23T09-48-12Z/
 │   ├── text.p0.auto.json  text.p1.auto.json  text.d0.auto.json   per page, and the joined document
 │   ├── p0.preview.jpg  p1.preview.jpg
 │   └── p0.annotated.jpg  p1.annotated.jpg                        ← one per item
-└── _service/                           --local only: the throwaway DB + artifacts
+└── _service/                           --local only: the throwaway payloads + artifacts (the DB is dropped)
 ```
 
 ### Reading `index.html`

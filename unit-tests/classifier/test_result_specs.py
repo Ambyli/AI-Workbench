@@ -234,6 +234,7 @@ def test_llm_any_across_documents(model):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.postgres  # the app's lifespan opens the classifier's Postgres pool
 def test_criterion_types_serves_each_result_shape():
     import main
 

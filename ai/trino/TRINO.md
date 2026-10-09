@@ -9,7 +9,9 @@ the off-box Phoenix production Postgres (`postgres_phoenix`, read-only
 role, TLS required), plus an Iceberg lakehouse on MinIO. Consumers:
 
 - **Models** — LiteLLM registers `trino-mcp:8080/mcp` alongside the
-  Phoenix MCP, so any tool-calling model can run federated SQL.
+  Phoenix MCP, so any tool-calling model can run federated SQL. Claude
+  Code connects through LiteLLM's `/mcp/trino` — see
+  [§ Using it from Claude Code](#using-it-from-claude-code).
 - **Humans** — Superset at `chat.zeoenergy.com/superset/` behind
   oauth2-proxy.
 - **External BI tools** — Trino JDBC on `PORT_TRINO` (default 8013),
@@ -43,7 +45,7 @@ the whole stack takes ~90 s.
 | MinIO API | `http://localhost:8014` | S3-compatible |
 | MinIO console | `https://chat.zeoenergy.com/minio/` | Behind oauth2-proxy |
 | Superset | `https://chat.zeoenergy.com/superset/` | Behind oauth2-proxy |
-| trino-mcp | `http://trino-mcp:8080/mcp` | Internal only, registered with LiteLLM |
+| trino-mcp | `http://trino-mcp:8080/mcp` | Internal only, registered with LiteLLM; external clients use `http://<host>:4001/mcp/trino` |
 | HMS Postgres | `psql -h localhost -p 5436 -U hive metastore` | Operator inspection only |
 | Superset Postgres | `psql -h localhost -p 5437 -U superset superset` | Operator inspection only |
 
@@ -154,6 +156,30 @@ The MCP loop is the same two-step pattern documented in
 `CLAUDE.md § LiteLLM with Phoenix MCP` — LiteLLM does not execute the
 tool call itself; the caller (OpenWebUI or a `curl` script) forwards the
 tool_call, hits `trino-mcp`'s HTTP endpoint, and sends the result back.
+
+### Using it from Claude Code
+
+`trino-mcp` publishes no host port, so Claude Code reaches it through
+LiteLLM's MCP gateway. The path segment is the `mcp_servers.trino` key in
+`ai/litellm/litellm_config.yaml`:
+
+```bash
+claude mcp add --transport http -s user trino http://192.168.5.233:4001/mcp/trino \
+  --header "Authorization: Bearer sk-your-master-key"
+```
+
+Then run `/mcp` in Claude Code — `trino` should show as connected with the
+five tools above. A virtual key works instead of the master key only if it
+is allowed the `trino` MCP server. Use `-s project` to write the entry to the
+repo's `.mcp.json` instead, and reference the key as `${VAR}` rather than
+committing it.
+
+Everything in [§ Adding a catalog](#adding-a-catalog) applies here too:
+there is no per-catalog access control, so a Claude Code session with this
+server can read every catalog, `postgres_phoenix` production and
+`postgres_supabase`'s `auth.users` included. The SELECT-only rule and the
+row / runtime clamps are the only limits. Full list of LiteLLM-hosted MCP
+servers: [`ai/litellm/LITELLM_MCP.md`](../litellm/LITELLM_MCP.md#add-mcp-servers-to-claude-code).
 
 ## Adding a catalog
 

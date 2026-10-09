@@ -84,3 +84,152 @@ def test_clamp_limit_ignores_inner_limits() -> None:
     # outer LIMIT.
     result = _clamp_limit("SELECT * FROM (SELECT * FROM t LIMIT 500) sub", 100)
     assert result.endswith("LIMIT 100")
+
+
+# --- execute(): what actually reaches the coordinator --------------------
+#
+# A fake driver records the SQL and how rows were fetched. Regression for
+# describe_table failing with "line 1:53: mismatched input 'LIMIT'": the
+# LIMIT clamp used to be spliced into every guarded statement, and Trino's
+# grammar has no LIMIT on SHOW / DESCRIBE / EXPLAIN.
+
+
+class _FakeCursor:
+    def __init__(self, rows: list[list[object]]) -> None:
+        self._rows = rows
+        self.sql: str | None = None
+        self.fetched_with: tuple[str, int | None] | None = None
+        self.closed = False
+        self.description = [("col",)]
+
+    def execute(self, sql: str) -> None:
+        self.sql = sql
+
+    def fetchall(self) -> list[list[object]]:
+        self.fetched_with = ("fetchall", None)
+        return list(self._rows)
+
+    def fetchmany(self, size: int) -> list[list[object]]:
+        self.fetched_with = ("fetchmany", size)
+        return list(self._rows[:size])
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeConn:
+    def __init__(self, cursor: _FakeCursor) -> None:
+        self._cursor = cursor
+
+    def cursor(self) -> _FakeCursor:
+        return self._cursor
+
+    def close(self) -> None:
+        pass
+
+
+@pytest.fixture
+def fake_cursor(monkeypatch: pytest.MonkeyPatch) -> _FakeCursor:
+    cursor = _FakeCursor([[i] for i in range(250)])
+    monkeypatch.setattr(
+        "common.trino.client.trino.dbapi.connect",
+        lambda **_: _FakeConn(cursor),
+    )
+    return cursor
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        'DESCRIBE "postgres_classifier"."public"."llm_calls"',
+        'SHOW COLUMNS FROM "postgres_classifier"."public"."llm_calls"',
+        "SHOW CATALOGS",
+        'SHOW SCHEMAS FROM "postgres_classifier"',
+        'SHOW TABLES FROM "postgres_classifier"."public"',
+        "-- leading comment\nDESCRIBE iceberg.demo.events",
+        "EXPLAIN SELECT * FROM t",
+    ],
+)
+def test_execute_never_appends_limit_to_non_select(
+    client: TrinoClient, fake_cursor: _FakeCursor, sql: str
+) -> None:
+    client.execute(sql)
+    assert fake_cursor.sql == sql
+    assert "LIMIT" not in fake_cursor.sql.upper()
+
+
+def test_execute_caps_non_select_rows_at_fetch(
+    client: TrinoClient, fake_cursor: _FakeCursor
+) -> None:
+    _, rows = client.execute("SHOW CATALOGS")
+    assert fake_cursor.fetched_with == ("fetchmany", 100)
+    assert len(rows) == 100
+    assert fake_cursor.closed
+
+
+def test_execute_appends_limit_to_select_without_one(
+    client: TrinoClient, fake_cursor: _FakeCursor
+) -> None:
+    client.execute("SELECT * FROM t")
+    assert fake_cursor.sql == "SELECT * FROM t LIMIT 100"
+    assert fake_cursor.fetched_with == ("fetchmany", 100)
+
+
+def test_execute_keeps_smaller_select_limit(
+    client: TrinoClient, fake_cursor: _FakeCursor
+) -> None:
+    client.execute("SELECT * FROM t LIMIT 5")
+    assert fake_cursor.sql == "SELECT * FROM t LIMIT 5"
+
+
+def test_execute_clamps_larger_select_limit(
+    client: TrinoClient, fake_cursor: _FakeCursor
+) -> None:
+    client.execute("SELECT * FROM t LIMIT 999999")
+    assert fake_cursor.sql == "SELECT * FROM t LIMIT 100"
+
+
+def test_execute_appends_limit_to_with_select(
+    client: TrinoClient, fake_cursor: _FakeCursor
+) -> None:
+    client.execute("WITH x AS (SELECT 1 AS a) SELECT * FROM x")
+    assert fake_cursor.sql == "WITH x AS (SELECT 1 AS a) SELECT * FROM x LIMIT 100"
+
+
+def test_execute_max_rows_lowers_cap_but_never_raises_it(
+    client: TrinoClient, fake_cursor: _FakeCursor
+) -> None:
+    client.execute("SELECT * FROM t", max_rows=10)
+    assert fake_cursor.sql == "SELECT * FROM t LIMIT 10"
+    assert fake_cursor.fetched_with == ("fetchmany", 10)
+
+    client.execute("DESCRIBE t", max_rows=10_000)
+    assert fake_cursor.sql == "DESCRIBE t"
+    assert fake_cursor.fetched_with == ("fetchmany", 100)
+
+
+def test_execute_rejects_writes_before_connecting(
+    client: TrinoClient, fake_cursor: _FakeCursor
+) -> None:
+    with pytest.raises(TrinoQueryError):
+        client.execute("DROP TABLE t")
+    assert fake_cursor.sql is None
+
+
+def test_execute_write_mode_sends_sql_untouched(fake_cursor: _FakeCursor) -> None:
+    write_client = TrinoClient(host="unused", default_max_rows=100, allow_writes=True)
+    _, rows = write_client.execute("CREATE SCHEMA iceberg.demo")
+    assert fake_cursor.sql == "CREATE SCHEMA iceberg.demo"
+    assert fake_cursor.fetched_with == ("fetchall", None)
+    assert len(rows) == 250
+
+
+def test_execute_failed_cancel_keeps_fetched_rows(
+    client: TrinoClient, fake_cursor: _FakeCursor, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _boom() -> None:
+        raise RuntimeError("cancel failed")
+
+    monkeypatch.setattr(fake_cursor, "close", _boom)
+    _, rows = client.execute("SHOW CATALOGS")
+    assert len(rows) == 100

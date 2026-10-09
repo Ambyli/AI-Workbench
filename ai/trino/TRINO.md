@@ -152,6 +152,14 @@ Clients that pinned the old fingerprint must re-trust.
 | `describe_table(catalog, schema, table)` | `[{"name":…, "type":…}, …]` |
 | `run_query(sql, max_rows?)` | SELECT only; clamped to `TRINO_MCP_MAX_ROWS` rows and `TRINO_MCP_MAX_RUNTIME_S` seconds |
 
+The row cap is enforced twice by `common.trino.TrinoClient`: a `LIMIT` is
+spliced into a `SELECT` / `WITH … SELECT` that has none (or a larger one),
+and every statement is fetched with `fetchmany(cap)`, the rest cancelled.
+`SHOW` / `DESCRIBE` / `EXPLAIN` — what the discovery tools send, and also
+accepted by `run_query` — are never rewritten: Trino's grammar has no
+`LIMIT` on them (`DESCRIBE t LIMIT 10` is a `SYNTAX_ERROR`), so the fetch
+cap alone bounds them.
+
 The MCP loop is the same two-step pattern documented in
 `CLAUDE.md § LiteLLM with Phoenix MCP` — LiteLLM does not execute the
 tool call itself; the caller (OpenWebUI or a `curl` script) forwards the

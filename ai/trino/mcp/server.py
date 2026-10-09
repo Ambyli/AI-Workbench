@@ -5,12 +5,15 @@ Registered in ai/litellm/litellm_config.yaml as ``mcp_servers.trino`` at
 sees the tools below and can run federated SQL over the Iceberg
 warehouse + the three Postgres catalogs.
 
-Guardrails (enforced on run_query only — the discovery tools are
-schema-only):
+Guardrails (``common.trino.TrinoClient``'s guarded path, so they apply
+to every tool — the discovery tools just never get near them):
 
-* SELECT-only. Any DDL/DML raises TrinoQueryError.
-* Row cap: TRINO_MCP_MAX_ROWS (default 10 000). If the SELECT lacks a
-  LIMIT clause we splice one in; if it has a larger one we clamp it.
+* Read-only: SELECT / WITH / SHOW / DESCRIBE / EXPLAIN. Any DDL/DML
+  raises TrinoQueryError.
+* Row cap: TRINO_MCP_MAX_ROWS (default 10 000). If a SELECT / WITH lacks
+  a LIMIT clause we splice one in; if it has a larger one we clamp it.
+  SHOW / DESCRIBE / EXPLAIN take no LIMIT in Trino's grammar, so they
+  are never rewritten — every statement is capped at fetch time instead.
 * Runtime cap: TRINO_MCP_MAX_RUNTIME_S (default 30). Forwarded as
   ``query.max-execution-time`` per request via the session properties.
 """
@@ -143,7 +146,10 @@ async def run_query(
     except TrinoQueryError as e:
         log.warning("run_query error: %s", e)
         return {"error": str(e), "hint": e.hint or ""}
-    truncated = len(rows) >= (max_rows or _client.default_max_rows)
+    # Same clamp the client applied, so a max_rows above the server cap
+    # still reports truncation at the cap.
+    cap = max_rows if max_rows is not None else _client.default_max_rows
+    truncated = len(rows) >= max(1, min(cap, _client.default_max_rows))
     return {
         "columns": columns,
         "rows": rows,

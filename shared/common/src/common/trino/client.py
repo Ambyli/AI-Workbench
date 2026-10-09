@@ -2,15 +2,19 @@
 
 Two things this wrapper adds over the raw ``trino.dbapi`` driver:
 
-1. A SELECT-only mode (``allow_writes=False``, the default) that
-   rejects any statement whose first significant token isn't ``SELECT``
-   or ``WITH``. Non-alphanumeric prefixes (comments, whitespace) are
-   stripped before the check.
+1. A read-only mode (``allow_writes=False``, the default) that rejects
+   any statement whose first significant token isn't ``SELECT``,
+   ``WITH``, ``SHOW``, ``DESCRIBE`` or ``EXPLAIN``. Leading comments and
+   whitespace are stripped before the check.
 
-2. Row + runtime clamps forwarded per-request via
-   ``session_properties={"query_max_execution_time": ...}`` and a
-   spliced ``LIMIT`` clause on SELECTs that don't already have a tighter
-   one. The clamps keep a rogue tool call from starving the coordinator.
+2. Row + runtime clamps. Runtime is forwarded per-request via
+   ``session_properties={"query_max_execution_time": ...}``. Rows are
+   capped twice: a ``LIMIT`` is spliced into ``SELECT`` / ``WITH …
+   SELECT`` queries that don't already have a tighter one (so the
+   coordinator stops early), and every guarded statement — ``SHOW`` /
+   ``DESCRIBE`` / ``EXPLAIN`` included, whose grammar has no ``LIMIT`` —
+   is fetched with ``fetchmany(max_rows)`` and the rest cancelled. The
+   clamps keep a rogue tool call from starving the coordinator.
 
 The write path exists for one caller only: the warehouse-seed script.
 Everything model-facing goes through the default (guarded) path.
@@ -85,20 +89,27 @@ class TrinoClient:
 
         Guardrail behavior (only when ``allow_writes=False``):
 
-        * Any statement whose first alphabetic token isn't ``SELECT`` or
-          ``WITH`` raises ``TrinoQueryError`` before dispatch. This
-          catches ``DROP``, ``INSERT``, ``DELETE``, ``ALTER``, ``CALL``,
-          ``EXECUTE``, ``USE``, ``GRANT``, ``REVOKE`` — everything with
-          side effects.
-        * A LIMIT clamp is applied. If ``max_rows`` is passed it wins;
-          otherwise ``default_max_rows`` is used. If the SQL already has
-          a smaller LIMIT we leave it alone.
+        * Any statement whose first alphabetic token isn't ``SELECT``,
+          ``WITH``, ``SHOW``, ``DESCRIBE`` or ``EXPLAIN`` raises
+          ``TrinoQueryError`` before dispatch. This catches ``DROP``,
+          ``INSERT``, ``DELETE``, ``ALTER``, ``CALL``, ``EXECUTE``,
+          ``USE``, ``GRANT``, ``REVOKE`` — everything with side effects.
+        * A row cap is applied. If ``max_rows`` is passed it wins
+          (clamped to ``default_max_rows``); otherwise
+          ``default_max_rows`` is used. ``SELECT`` / ``WITH`` get a
+          spliced LIMIT unless they already have a smaller one.
+          ``SHOW`` / ``DESCRIBE`` / ``EXPLAIN`` are NOT rewritten —
+          Trino rejects ``DESCRIBE t LIMIT n`` as a SYNTAX_ERROR. Every
+          guarded statement is fetched with ``fetchmany(cap)``, so the
+          cap holds either way.
         """
+        fetch_cap: Optional[int] = None
         if not self.allow_writes:
-            self._reject_non_select(sql)
-            effective_max = max_rows if max_rows is not None else self.default_max_rows
-            effective_max = max(1, min(effective_max, self.default_max_rows))
-            sql = _clamp_limit(sql, effective_max)
+            first = self._reject_non_select(sql)
+            fetch_cap = max_rows if max_rows is not None else self.default_max_rows
+            fetch_cap = max(1, min(fetch_cap, self.default_max_rows))
+            if first in _LIMITABLE:
+                sql = _clamp_limit(sql, fetch_cap)
 
         timeout_s = timeout_s or self.default_timeout_s
         session_properties = {"query_max_execution_time": f"{timeout_s}s"}
@@ -113,11 +124,18 @@ class TrinoClient:
             cur = conn.cursor()
             try:
                 cur.execute(sql)
-                rows = cur.fetchall()
+                rows = cur.fetchall() if fetch_cap is None else cur.fetchmany(fetch_cap)
                 columns = [c[0] for c in (cur.description or [])]
                 return columns, rows
             finally:
-                cur.close()
+                # close() cancels the query when fetchmany stopped short.
+                # Best-effort: a failed cancel must not throw away rows
+                # already fetched, and query_max_execution_time still
+                # bounds whatever is left running on the coordinator.
+                try:
+                    cur.close()
+                except Exception:  # noqa: BLE001
+                    pass
         except _DriverQueryError as e:
             raise TrinoQueryError(
                 str(e),
@@ -132,11 +150,12 @@ class TrinoClient:
             conn.close()
 
     @staticmethod
-    def _reject_non_select(sql: str) -> None:
-        stripped = _LEADING_COMMENT.sub("", sql).lstrip()
-        match = _FIRST_WORD.match(stripped)
-        first = match.group(0).upper() if match else ""
-        if first not in {"SELECT", "WITH", "SHOW", "DESCRIBE", "EXPLAIN"}:
+    def _reject_non_select(sql: str) -> str:
+        """Raise unless ``sql`` is a read; return its leading keyword,
+        upper-cased, so ``execute`` can tell whether a LIMIT fits.
+        """
+        first = _leading_keyword(sql)
+        if first not in _READ_ONLY:
             raise TrinoQueryError(
                 f"only SELECT/WITH/SHOW/DESCRIBE/EXPLAIN permitted; got {first or '?'}",
                 hint=(
@@ -144,6 +163,23 @@ class TrinoClient:
                     "if you genuinely need DDL/DML."
                 ),
             )
+        return first
+
+
+# Statements the guarded path lets through, and the subset whose grammar
+# takes a trailing LIMIT. SHOW / DESCRIBE / EXPLAIN do not, so they are
+# capped at fetch time only.
+_READ_ONLY = frozenset({"SELECT", "WITH", "SHOW", "DESCRIBE", "EXPLAIN"})
+_LIMITABLE = frozenset({"SELECT", "WITH"})
+
+
+def _leading_keyword(sql: str) -> str:
+    """First alphabetic token of ``sql``, upper-cased, after leading
+    whitespace and comments; ``""`` when there is none.
+    """
+    stripped = _LEADING_COMMENT.sub("", sql).lstrip()
+    match = _FIRST_WORD.match(stripped)
+    return match.group(0).upper() if match else ""
 
 
 _LIMIT_TAIL = re.compile(
@@ -161,8 +197,10 @@ def _clamp_limit(sql: str, max_rows: int) -> str:
     * No trailing LIMIT — append `` LIMIT max_rows``. Anything more
       structural (LIMIT inside a subquery, LIMIT ALL, etc.) is left
       alone; the coordinator's own ``query.max_execution_time`` and the
-      row-fetch cap in ``execute`` still apply, so no unbounded fetch
+      ``fetchmany`` cap in ``execute`` still apply, so no unbounded fetch
       escapes.
+
+    Only valid for ``SELECT`` / ``WITH`` — ``execute`` checks first.
     """
     stripped = sql.rstrip().rstrip(";").rstrip()
     match = _LIMIT_TAIL.search(stripped)

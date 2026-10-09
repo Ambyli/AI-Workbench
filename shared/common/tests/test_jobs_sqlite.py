@@ -187,6 +187,47 @@ def test_concurrent_claims_never_hand_out_the_same_job(db_path: str) -> None:
     assert sum(1 for j in claimed if j is None) == 4
 
 
+def test_cancel_after_commit_raises_cancelled_not_a_rollback_error(
+    db_path: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cancel does not stop SQL already in aiosqlite's thread, so it can
+    arrive after the COMMIT landed; the cleanup's ROLLBACK then fails with
+    "no transaction is active". That error used to replace the
+    CancelledError, which left WorkerPool.stop() waiting forever on a worker
+    that never unwound. Simulated deterministically: COMMIT runs, then the
+    await raises CancelledError."""
+    import aiosqlite
+
+    reg = SqliteRegistry(db_path)
+    _run(reg.init())
+    jid = _run(reg.register(_Meta(type="assess", request_id="c")))
+
+    real_execute = aiosqlite.Connection.execute
+
+    def execute(self, sql, *args, **kwargs):
+        result = real_execute(self, sql, *args, **kwargs)
+        if sql != "COMMIT":
+            return result
+
+        async def commit_then_cancelled():
+            await result
+            raise asyncio.CancelledError()
+
+        return commit_then_cancelled()
+
+    monkeypatch.setattr(aiosqlite.Connection, "execute", execute)
+
+    async def claim():
+        with pytest.raises(asyncio.CancelledError):
+            await reg.claim_next()
+
+    _run(claim())
+    monkeypatch.undo()
+    # The claim committed before the cancel: the row is "processing", which
+    # is what WorkerPool.recover() exists to requeue.
+    assert _run(reg.get(jid)).phase == "processing"
+
+
 def test_reset_phase_requeues_processing(db_path: str) -> None:
     reg = SqliteRegistry(db_path)
     _run(reg.init())

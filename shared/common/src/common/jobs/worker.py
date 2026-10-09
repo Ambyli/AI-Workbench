@@ -32,6 +32,9 @@ depends on the consumer having persisted the job's input — see
 Shutdown: ``stop()`` cancels the worker tasks. A job mid-handler is left in
 ``claim_to`` in the DB (the cancel interrupts the handler before it reaches
 set_result/set_error) and is picked up by the next start's ``recover()``.
+A registry whose cleanup raises over the cancel (so ``claim_next`` raises an
+ordinary exception instead) still stops: a worker whose claim fails while a
+cancel is pending re-raises it rather than backing off and retrying.
 """
 
 from __future__ import annotations
@@ -158,6 +161,12 @@ class WorkerPool:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                if _cancel_pending():
+                    # stop() cancelled us and the registry turned the cancel
+                    # into an ordinary error (a cleanup that raised over it).
+                    # Retrying would leave a half-cancelled task looping —
+                    # one whose next wait_for never wakes, so stop() hangs.
+                    raise asyncio.CancelledError() from exc
                 # A transient DB error must not kill the worker — back off and retry.
                 self.log.error("%s[%d]: claim failed: %s", self.name, idx, exc)
                 await asyncio.sleep(self.poll_interval)
@@ -205,3 +214,12 @@ class WorkerPool:
                 self.on_finish(job, phase, elapsed, error)
             except Exception as hook_exc:
                 self.log.warning("%s: on_finish hook raised: %s", self.name, hook_exc)
+
+
+def _cancel_pending() -> bool:
+    """Whether the current task has a cancel requested that it has not yet
+    raised — i.e. something swallowed it. ``Task.cancelling()`` is 3.11+;
+    on 3.10 this is always False and the pool keeps its old behaviour."""
+    task = asyncio.current_task()
+    cancelling = getattr(task, "cancelling", None)
+    return bool(cancelling and cancelling())

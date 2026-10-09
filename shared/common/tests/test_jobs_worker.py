@@ -153,3 +153,55 @@ def test_stop_leaves_inflight_job_in_processing_for_recovery(db_path: str) -> No
         assert (await reg.get(jid)).phase == "pending"
 
     asyncio.run(main())
+
+
+class _CancelSwallowingRegistry:
+    """A claim_next whose cleanup raises over a cancel — what SqliteRegistry
+    did when its ROLLBACK failed after the COMMIT had landed. Only ONE cancel
+    is swallowed (it was a race, not a habit), so on a regression the test's
+    own timeout can still unwind the pool and the test fails instead of
+    hanging the suite."""
+
+    def __init__(self) -> None:
+        self.claims = 0
+        self.swallow = 1
+
+    async def claim_next(self, from_phase="pending", to_phase="processing"):
+        self.claims += 1
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            if self.swallow:
+                self.swallow -= 1
+                raise RuntimeError("cleanup failed over the cancel")
+            raise
+        return None
+
+    async def reset_phase(self, from_phase, to_phase):
+        return 0
+
+    async def set_result(self, job_id, result, phase="completed"):
+        pass
+
+    async def set_error(self, job_id, error, phase="failed"):
+        pass
+
+
+def test_stop_returns_when_the_registry_swallows_the_cancel() -> None:
+    """stop() must unwind a worker even if claim_next turned the cancel into
+    an ordinary error; retrying would leave a half-cancelled task looping."""
+    async def main():
+        reg = _CancelSwallowingRegistry()
+
+        async def handler(job):
+            return {}
+
+        pool = WorkerPool(reg, handler, concurrency=2, poll_interval=0.01)
+        pool.start()
+        await asyncio.sleep(0.05)  # both workers are inside claim_next
+        await asyncio.wait_for(pool.stop(), timeout=2.0)
+        assert not pool.running
+        assert reg.swallow == 0  # the race really happened
+        assert reg.claims == 2  # stopped, not backed off and retried
+
+    asyncio.run(main())

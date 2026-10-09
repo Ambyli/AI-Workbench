@@ -264,7 +264,16 @@ class SqliteRegistry:
                     row = await cur.fetchone()
                 await db.execute("COMMIT")
             except BaseException:
-                await db.execute("ROLLBACK")
+                # A cancel does not stop SQL already handed to aiosqlite's
+                # thread, so the COMMIT may have landed and this ROLLBACK then
+                # fails ("no transaction is active"). Never let that error
+                # replace the original — above all a CancelledError, which
+                # WorkerPool.stop() relies on to unwind the worker. Closing the
+                # connection rolls back whatever is still open anyway.
+                try:
+                    await db.execute("ROLLBACK")
+                except Exception:
+                    pass
                 raise
         return _row_to_jobbase(row)
 

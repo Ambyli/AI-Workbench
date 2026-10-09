@@ -480,6 +480,7 @@ Step types:
 | `wait` | `seconds` | Cancellable sleep. |
 | `evaluate` | `script`, `timeout_s` | Run JS, return its JSON value. |
 | `screenshot` | `format` (`jpeg`\|`png`\|`webp`), `quality` (80), `full_page` (false), `scale` (1.0, max 2), `max_height` (8000), `timeout_s` (**30**) | Settle (best-effort, ~5 s), then `Page.captureScreenshot` on the same side socket. `value` is `{format, mime_type, width, height, full_page, bytes, page_url, data_base64}`. **A failed screenshot is recorded and the run continues** — every other type stops the run on failure. |
+| `scroll` | `selector?`, `text?`, `to?` (`top`\|`bottom`), `by?` (px, ±100000), `block` (`start`\|`center`\|`end`\|`nearest`; selector-only form), `timeout_s` (15, bounds the lookup) | At least one of `selector` / `to` / `by`; `to` and `by` exclusive. `selector` alone: `scrollIntoView` (`block: start` — the element at the top of the frame). `to` / `by` act on the element's scroll container, or with no selector the page's **main scroller** — `document.scrollingElement` when it scrolls, else the largest visible `overflow-y: auto\|scroll\|overlay` element in the document or any open shadow root (Salesforce Lightning scrolls an inner `<div>`). Always `behavior: "instant"`. Nothing to scroll is a no-op (`target: null`). `value` is `{target, element?, scroll_top, scroll_height, client_height, at_bottom}`. `click` / `fill` scroll their element to the centre, so put a `scroll` right before a `screenshot` to frame it. |
 
 Element lookup searches the document **and every open shadow root** (each tree separately — a descendant combinator never crosses a shadow boundary), so Lightning Web Components are reachable; `fill` / `click` / `press` use trusted CDP `Input.*` events. Full reference: [`ai/interceptor/INTERCEPTOR.md` § Page scripts and actions](../../../../../ai/interceptor/INTERCEPTOR.md#page-scripts-and-actions).
 
@@ -532,7 +533,7 @@ logging.basicConfig(level=logging.DEBUG)
 | `launcher.py` | OS-adaptive `find_browser`, `start_browser`, `clear_singleton_locks`, `kill_chrome_by_profile` (Windows-only). |
 | `cdp_session.py` | `run_session` — the WebSocket loop that talks to the browser. |
 | `screenshot.py` | `capture_screenshot` — page image over a second, short-lived CDP connection. |
-| `actions.py` | `run_actions` / `parse_actions` — readiness gate, `page_script`, and shadow-DOM-piercing fill / click / press / select / evaluate / screenshot steps over a second CDP connection. |
+| `actions.py` | `run_actions` / `parse_actions` — readiness gate, `page_script`, and shadow-DOM-piercing fill / click / press / select / evaluate / screenshot / scroll steps over a second CDP connection. |
 | `sentinel.py` | Session-marker file helpers. |
 | `spy.py` | CLI entry point (`cdp-spy` script, or `python -m common.cdp_interceptor.spy`). |
 | `interceptor.js` | Injected JS that patches `fetch`/`XHR`. **DO NOT reformat — injected verbatim.** |

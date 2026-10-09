@@ -263,6 +263,21 @@ def test_screenshot_in_login_actions_is_refused(client, app_mod, logins_dir):
     _pool_untouched(client, app_mod)
 
 
+def test_scroll_in_login_actions_is_accepted(client, app_mod, logins_dir, fake):
+    # It reads nothing from the page; a sign-in button below the fold is real.
+    steps = [*LOGIN_STEPS[:2], {"type": "scroll", "selector": "button[type=submit]"}, LOGIN_STEPS[2]]
+    r = client.post("/capture", json={**BASE, "login_actions": steps})
+    assert r.status_code == 200, r.text
+    got = fake.instances[0].kw["login_actions"]
+    assert [a.type for a in got] == ["fill", "fill", "scroll", "click"]
+    assert (got[2].selector, got[2].block) == ("button[type=submit]", "start")
+    assert "scroll" in app_mod.LOGIN_ACTION_TYPES
+    # Its form rules hold here too — a 422 before any port.
+    r = client.post("/capture", json={**BASE, "login_actions": [{"type": "scroll", "to": "top", "by": 1}]})
+    assert r.status_code == 422
+    _pool_untouched(client, app_mod)
+
+
 def test_login_actions_need_login_detection(client, app_mod, logins_dir):
     r = client.post("/capture", json={**BASE, "login_url_patterns": []})
     assert r.status_code == 422 and "login_url_patterns" in r.text

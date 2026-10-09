@@ -77,7 +77,8 @@ def test_parse_actions_accepts_single_character_keys_and_none():
     assert a.key == "a"
 
 
-LOGIN_TYPES = ("wait_for", "fill", "click", "press", "select", "wait")
+# Mirrors the interceptor service's LOGIN_ACTION_TYPES.
+LOGIN_TYPES = ("wait_for", "fill", "click", "press", "select", "wait", "scroll")
 
 
 def test_parse_actions_label_prefixes_errors():
@@ -93,12 +94,16 @@ def test_parse_actions_allowed_types_refuses_the_rest():
                       label="login_actions", allowed_types=LOGIN_TYPES)
     assert "evaluate" not in str(ei.value).split("use one of")[1]
     # An unknown type lists only the allowed ones.
-    with pytest.raises(ActionError, match="use one of wait_for, fill, click, press, select, wait$"):
+    with pytest.raises(ActionError, match="use one of wait_for, fill, click, press, select, wait, scroll$"):
         parse_actions([{"type": "hover"}], label="login_actions", allowed_types=LOGIN_TYPES)
-    # And an allowed one still parses.
-    [a] = parse_actions([{"type": "fill", "selector": "#u", "value": "${username}"}],
-                        label="login_actions", allowed_types=LOGIN_TYPES)
-    assert a.value == "${username}"
+    # And an allowed one still parses — scroll included (a sign-in button
+    # below the fold); screenshot is not.
+    a, s = parse_actions([{"type": "fill", "selector": "#u", "value": "${username}"},
+                          {"type": "scroll", "selector": "button[type=submit]"}],
+                         label="login_actions", allowed_types=LOGIN_TYPES)
+    assert a.value == "${username}" and s.type == "scroll"
+    with pytest.raises(ActionError, match=r"login_actions\[0\]: action type 'screenshot' is not allowed"):
+        parse_actions([{"type": "screenshot"}], label="login_actions", allowed_types=LOGIN_TYPES)
 
 
 def test_parse_screenshot_defaults_and_overrides():
@@ -140,6 +145,54 @@ def test_parse_screenshot_rejects_bad_options(extra, msg):
     assert "actions[1] (screenshot)" in str(ei.value)
 
 
+def test_parse_scroll_forms_and_defaults():
+    el, top, by, framed, nudge = parse_actions([
+        {"type": "scroll", "selector": "h2", "text": "Results"},
+        {"type": "scroll", "to": "top"},
+        {"type": "scroll", "by": -400},
+        {"type": "scroll", "selector": "h2", "block": "center", "timeout_s": 5},
+        {"type": "scroll", "selector": ".list", "by": 800},
+    ])
+    assert (el.selector, el.text, el.to, el.by, el.block, el.timeout_s) == (
+        "h2", "Results", None, None, "start", 15.0)
+    assert (top.selector, top.to, top.by, top.block) == (None, "top", None, "start")
+    assert (by.to, by.by) == (None, -400)
+    assert (framed.block, framed.timeout_s) == ("center", 5.0)
+    assert (nudge.selector, nudge.by) == (".list", 800)
+    # A model_dump() of the service's model carries every field.
+    [n] = parse_actions([{"type": "scroll", "selector": None, "text": None, "to": "bottom",
+                          "by": None, "block": None, "timeout_s": None}])
+    assert (n.to, n.block, n.timeout_s) == ("bottom", "start", 15.0)
+
+
+@pytest.mark.parametrize("extra, msg", [
+    ({}, "give selector, to or by"),
+    ({"to": "top", "by": 10}, "to and by are mutually exclusive"),
+    ({"to": "top", "block": "start"}, "block only applies to the selector-only form"),
+    ({"selector": "h2", "by": 10, "block": "center"}, "block only applies"),
+    ({"to": "top", "text": "Results"}, "text needs a selector"),
+    ({"text": "Results"}, "text needs a selector"),
+    ({"to": "middle"}, "to must be 'top' or 'bottom'"),
+    ({"selector": "h2", "block": "top"}, "block must be one of start, center, end, nearest"),
+    ({"by": 1.5}, "by must be an integer"),
+    ({"by": 100.0}, "by must be an integer"),
+    ({"by": True}, "by must be an integer"),
+    ({"by": 100001}, "by must be an integer in \\[-100000, 100000\\]"),
+    ({"by": -100001}, "by must be an integer"),
+    ({"selector": "  "}, "non-empty string"),
+    ({"to": "top", "format": "png"}, "unexpected field"),
+])
+def test_parse_scroll_rejects_bad_steps(extra, msg):
+    with pytest.raises(ActionError, match=msg) as ei:
+        parse_actions([{"type": "wait", "seconds": 0}, {"type": "scroll", **extra}])
+    assert "actions[1] (scroll)" in str(ei.value)
+
+
+def test_scroll_fields_are_refused_on_other_steps():
+    with pytest.raises(ActionError, match="unexpected field"):
+        parse_actions([{"type": "click", "selector": "b", "block": "start"}])
+
+
 def test_action_repr_hides_the_value():
     [a] = parse_actions([{"type": "fill", "selector": "#p", "value": "hunter2"}])
     assert "hunter2" not in repr(a) and "#p" in repr(a)
@@ -175,6 +228,8 @@ class FakePage:
         self.href = "https://support.example.com/feoc/results"  # location.href
         self.metrics = METRICS                                   # Page.getLayoutMetrics
         self.shot = {"data": base64.b64encode(SHOT_BYTES).decode()}  # Page.captureScreenshot
+        self.scroll = {"target": "window", "scroll_top": 0, "scroll_height": 5000,  # _SCROLL_JS
+                       "client_height": 1080, "at_bottom": False}
 
     @staticmethod
     def _next(seq):
@@ -215,6 +270,8 @@ class FakePage:
             return self.value({"focused": True, "element": "<input>"})
         if actions_mod._SELECT_JS in expr:
             return self.value({"element": "<select>", "value": "US"})
+        if actions_mod._SCROLL_JS in expr:
+            return self.value(self.scroll)
         return self.eval_result
 
     # helpers for assertions
@@ -815,6 +872,126 @@ def test_cancel_during_a_screenshot_aborts_the_run(monkeypatch):
     assert report.actions[1].error == "skipped"
     assert report.aborted_reason == "cancelled"
     assert "Page.captureScreenshot" not in page.methods()
+
+
+def _scroll_exprs(page: FakePage) -> list[str]:
+    return [p["expression"] for m, p in page.calls
+            if m == "Runtime.evaluate" and actions_mod._SCROLL_JS in p["expression"]]
+
+
+def test_scroll_to_an_element_looks_it_up_first_then_frames_it(monkeypatch):
+    page = FakePage()
+    page.scroll = {"target": '<div class="slds-scrollable_y">', "element": "<h2>",
+                   "scroll_top": 1200, "scroll_height": 4000, "client_height": 900,
+                   "at_bottom": False}
+    _patch_chrome(monkeypatch, page)
+
+    report = _run([{"type": "scroll", "selector": "h2", "text": "Results"}])
+
+    assert report.ok, report.aborted_reason
+    assert report.actions[0].value == page.scroll
+    assert _kinds(page) == ["find", "eval"]  # the deep lookup, then the scroll
+    find = next(p["expression"] for m, p in page.calls
+                if m == "Runtime.evaluate" and actions_mod._FIND_JS in p["expression"])
+    assert find.endswith('("h2", "Results", "visible")')
+    [expr] = _scroll_exprs(page)
+    assert expr.startswith(actions_mod._HELPER_JS)  # the helper is re-installed first
+    assert expr.endswith('(true, null, null, "start")')
+
+
+@pytest.mark.parametrize("step, args", [
+    ({"to": "bottom"}, '(false, "bottom", null, "start")'),
+    ({"to": "top"}, '(false, "top", null, "start")'),
+    ({"by": -300}, '(false, null, -300, "start")'),
+])
+def test_scroll_without_a_selector_makes_no_lookup(monkeypatch, step, args):
+    page = FakePage()
+    # Nothing on the page scrolls: a no-op, reported, not a failure.
+    page.scroll = {"target": None, "scroll_top": 0, "scroll_height": 900,
+                   "client_height": 900, "at_bottom": True}
+    _patch_chrome(monkeypatch, page)
+
+    report = _run([{"type": "scroll", **step}])
+
+    assert report.ok, report.aborted_reason
+    assert report.actions[0].value["target"] is None
+    assert page.lookups_sent() == 0
+    [expr] = _scroll_exprs(page)
+    assert expr.endswith(args)
+
+
+def test_scroll_with_a_selector_and_to_targets_its_container(monkeypatch):
+    page = FakePage()
+    _patch_chrome(monkeypatch, page)
+
+    report = _run([{"type": "scroll", "selector": ".results-list", "to": "bottom"}])
+
+    assert report.ok, report.aborted_reason
+    assert page.lookups_sent() == 1
+    [expr] = _scroll_exprs(page)
+    assert expr.endswith('(true, "bottom", null, "start")')
+
+
+def test_scroll_error_fails_the_step_and_aborts_the_run(monkeypatch):
+    page = FakePage()
+    gone = "the matched element is gone (page re-rendered or navigated)"
+    page.scroll = {"error": gone}
+    _patch_chrome(monkeypatch, page)
+
+    report = _run([{"type": "scroll", "selector": "h2"}, {"type": "screenshot"}])
+
+    assert report.actions[0].error == gone
+    assert report.actions[1].error == "skipped"
+    assert report.aborted_reason == f"actions[0] (scroll) failed: {gone}"
+    assert "Page.captureScreenshot" not in page.methods()
+
+
+def test_scroll_between_a_click_and_a_screenshot_runs_in_order(monkeypatch):
+    page = FakePage()
+    _patch_chrome(monkeypatch, page)
+
+    report = _run([
+        {"type": "click", "selector": "button"},
+        {"type": "scroll", "to": "top"},
+        {"type": "screenshot"},
+    ])
+
+    assert report.ok, report.aborted_reason
+    assert [r.type for r in report.actions] == ["click", "scroll", "screenshot"]
+    calls = page.calls
+    last_mouse = max(i for i, (m, _) in enumerate(calls) if m == "Input.dispatchMouseEvent")
+    scroll_at = next(i for i, (m, p) in enumerate(calls)
+                     if actions_mod._SCROLL_JS in p.get("expression", ""))
+    shot_at = next(i for i, (m, _) in enumerate(calls) if m == "Page.captureScreenshot")
+    assert last_mouse < scroll_at < shot_at
+
+
+def test_scroll_runs_under_the_login_gate(monkeypatch):
+    page = FakePage()
+    page.probes = [{"href": SSO, "rs": "complete", "hook": False}]
+    _patch_chrome(monkeypatch, page)
+
+    report = run_actions(
+        9224,
+        parse_actions([{"type": "scroll", "selector": "input[type=submit]", "block": "center"}],
+                      label="login_actions", allowed_types=LOGIN_TYPES),
+        gate="login", login_url_patterns=[r"sso\.example\.com"], label="login_actions",
+        ready_timeout_s=2.0, poll_interval_s=0.01,
+    )
+
+    assert report.ok, report.aborted_reason
+    [expr] = _scroll_exprs(page)
+    assert expr.endswith('(true, null, null, "center")')
+
+
+def test_scroll_js_is_standalone_and_leaves_the_helper_alone():
+    # The container logic lives in _SCROLL_JS; the helper's v: 1 contract is
+    # untouched, and the scroll script only uses what the helper exposes.
+    assert "window.__ciActions.v === 1" in actions_mod._HELPER_JS
+    assert "scrollingElement" not in actions_mod._HELPER_JS
+    assert actions_mod._TARGET_GONE in actions_mod._SCROLL_JS
+    assert actions_mod._SCROLL_JS.startswith("(function (useTarget, to, by, block) {")
+    assert "behavior: 'instant'" in actions_mod._SCROLL_JS
 
 
 def test_cancel_stops_a_long_wait_promptly(monkeypatch):

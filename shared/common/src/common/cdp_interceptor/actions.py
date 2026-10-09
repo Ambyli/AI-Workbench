@@ -36,9 +36,23 @@ Step types
 ``evaluate``    script, timeout_s
 ``screenshot``  format (jpeg|png|webp), quality, full_page, scale, max_height,
                 timeout_s (default 30)
+``scroll``      selector?, text?, to (top|bottom)?, by (px)?,
+                block (start|center|end|nearest, selector-only), timeout_s —
+                at least one of selector / to / by; to and by exclusive
 
 Non-obvious behaviour
 ---------------------
+- **``scroll`` finds the container that actually scrolls.** With only a
+  ``selector`` it is ``scrollIntoView({block})`` (``start`` by default — the
+  element at the top of the frame). ``to`` / ``by`` act on the element's
+  scroll container (itself, or the nearest ancestor that scrolls, crossing
+  shadow boundaries) or, with no selector, the page's main scroller:
+  ``document.scrollingElement`` when it scrolls, else the largest visible
+  ``overflow-y: auto|scroll|overlay`` element anywhere in the document or an
+  open shadow root — Salesforce Lightning scrolls an inner ``<div>`` and the
+  window never moves. Nothing scrolls → a no-op with ``target: null``, not a
+  failure. ``click`` and ``fill`` scroll their element to the CENTRE of the
+  viewport, so put a ``scroll`` right before a ``screenshot`` to frame it.
 - **A failed screenshot does not stop the run.** Every other step type
   aborts the run on failure (the rest are reported ``skipped``); a
   ``screenshot`` step records ``ok=False`` with its error and the next step
@@ -108,6 +122,7 @@ logger = logging.getLogger("cdp_interceptor")
 
 ACTION_TYPES: tuple[str, ...] = (
     "wait_for", "fill", "click", "press", "select", "wait", "evaluate", "screenshot",
+    "scroll",
 )
 
 DEFAULT_STEP_TIMEOUT_S = 15.0
@@ -118,6 +133,11 @@ MAX_STEP_SECONDS = 600.0
 # Screenshot bounds — the same ones the interceptor service's request model uses.
 MIN_SCREENSHOT_HEIGHT = 100
 MAX_SCREENSHOT_SCALE = 2.0
+
+# Scroll bounds — the same ones the interceptor service's request model uses.
+MAX_SCROLL_BY_PX = 100000
+SCROLL_TO = ("top", "bottom")
+SCROLL_BLOCKS = ("start", "center", "end", "nearest")
 
 # How long a screenshot step waits for the page to settle (readiness gate)
 # before shooting it as it is.
@@ -141,6 +161,7 @@ _FIELDS: dict[str, tuple[frozenset[str], frozenset[str]]] = {
     "evaluate": (frozenset({"script"}), frozenset({"timeout_s"})),
     "screenshot": (frozenset(), frozenset({"format", "quality", "full_page", "scale",
                                            "max_height", "timeout_s"})),
+    "scroll": (frozenset(), frozenset({"selector", "text", "to", "by", "block", "timeout_s"})),
 }
 
 # key name → (DOM ``key``, DOM ``code``, Windows virtual key code, text).
@@ -195,6 +216,9 @@ class Action:
     full_page: bool = False           # screenshot
     scale: float = 1.0                # screenshot
     max_height: int = 8000            # screenshot (full_page clamp, CSS px)
+    to: Optional[str] = None          # scroll: "top" | "bottom"
+    by: Optional[int] = None          # scroll (CSS px, negative is up)
+    block: str = "start"              # scroll, selector-only form
     timeout_s: float = DEFAULT_STEP_TIMEOUT_S
 
 
@@ -269,8 +293,8 @@ def parse_actions(
     Raises ``ActionError`` naming the offending step (``<label>[i]``) on an
     unknown ``type``, a type outside ``allowed_types`` (when given), a missing
     required field, a field the type doesn't take, a wrong value type, an
-    out-of-range screenshot option, or an unknown ``press`` key. Keys whose
-    value is ``None`` are ignored.
+    out-of-range screenshot option, an unknown ``press`` key, or a ``scroll``
+    that mixes its forms. Keys whose value is ``None`` are ignored.
     """
     wanted = None if allowed_types is None else set(allowed_types)
     allowed = tuple(t for t in ACTION_TYPES if wanted is None or t in wanted)
@@ -372,6 +396,34 @@ def parse_actions(
                     f"[{MIN_SCREENSHOT_HEIGHT}, {CHROME_MAX_CLIP_PX}]"
                 )
             a.max_height = v
+        if type_ == "scroll":
+            # Only scroll takes to / by / block (the unexpected-field check
+            # above refuses them elsewhere), so the form rules live here too.
+            if "to" in given:
+                if given["to"] not in SCROLL_TO:
+                    raise ActionError(f"{where}: to must be 'top' or 'bottom'")
+                a.to = given["to"]
+            if "by" in given:
+                v = given["by"]
+                if (not isinstance(v, int) or isinstance(v, bool)
+                        or not (-MAX_SCROLL_BY_PX <= v <= MAX_SCROLL_BY_PX)):
+                    raise ActionError(
+                        f"{where}: by must be an integer in "
+                        f"[-{MAX_SCROLL_BY_PX}, {MAX_SCROLL_BY_PX}]"
+                    )
+                a.by = v
+            if "block" in given:
+                if given["block"] not in SCROLL_BLOCKS:
+                    raise ActionError(f"{where}: block must be one of {', '.join(SCROLL_BLOCKS)}")
+                a.block = given["block"]
+            if a.text is not None and a.selector is None:
+                raise ActionError(f"{where}: text needs a selector — it narrows the selector's matches")
+            if a.selector is None and a.to is None and a.by is None:
+                raise ActionError(f"{where}: give selector, to or by")
+            if a.to is not None and a.by is not None:
+                raise ActionError(f"{where}: to and by are mutually exclusive — give one")
+            if "block" in given and (a.to is not None or a.by is not None):
+                raise ActionError(f"{where}: block only applies to the selector-only form (no to / by)")
         out.append(a)
     return out
 
@@ -604,6 +656,90 @@ _SELECT_JS = r"""(function (want) {
   s.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
   s.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
   return { element: A.describe(s), value: s.value };
+})"""
+
+# The scroll step's container choice lives entirely in here, not in
+# _HELPER_JS, so the helper's ``v: 1`` contract is unchanged. "Scrolls" means
+# overflowing content in a box that lets it scroll: the document's
+# scrollingElement, or an element with overflow-y auto / scroll / overlay.
+# Slotted elements climb through their assigned <slot> (the composed tree is
+# what scrolls them); a shadow root's top climbs to its host.
+_SCROLL_JS = r"""(function (useTarget, to, by, block) {
+  var A = window.__ciActions, el = null;
+  if (useTarget) {
+    el = window.__ciActionTarget;
+    """ + _TARGET_GONE + r"""
+  }
+  var se = document.scrollingElement || document.documentElement;
+  function scrolls(n) {
+    if (!n || n.nodeType !== 1 || !(n.scrollHeight > n.clientHeight + 1)) return false;
+    if (n === se) return true;
+    var oy = getComputedStyle(n).overflowY;
+    return oy === 'auto' || oy === 'scroll' || oy === 'overlay';
+  }
+  function up(n) {
+    if (n.assignedSlot) return n.assignedSlot;
+    if (n.parentElement) return n.parentElement;
+    var r = n.getRootNode && n.getRootNode();
+    return (r && r.host) || null;
+  }
+  function shownArea(n) {
+    var r = A.rectOf(n);
+    if (!r) return 0;
+    var w = Math.min(r.right, innerWidth) - Math.max(r.left, 0);
+    var h = Math.min(r.bottom, innerHeight) - Math.max(r.top, 0);
+    return w > 0 && h > 0 ? w * h : 0;
+  }
+  function mainScroller() {
+    if (scrolls(se)) return se;
+    var best = null, most = 0, stack = [document];
+    while (stack.length) {
+      var all = stack.pop().querySelectorAll('*');
+      for (var i = 0; i < all.length; i++) {
+        var n = all[i];
+        if (n.shadowRoot) stack.push(n.shadowRoot);
+        if (!scrolls(n)) continue;
+        var a = shownArea(n);
+        if (a > most) { best = n; most = a; }
+      }
+    }
+    return best;
+  }
+  function containerOf(n) {
+    for (var c = n; c; c = up(c)) if (scrolls(c)) return c;
+    return mainScroller();
+  }
+  function boxed(n) {
+    if (getComputedStyle(n).display !== 'contents') return n;
+    var k = Array.prototype.slice.call(n.children).concat(
+      n.shadowRoot ? Array.prototype.slice.call(n.shadowRoot.children) : []);
+    for (var i = 0; i < k.length; i++) { var b = boxed(k[i]); if (A.rectOf(b)) return b; }
+    return n;
+  }
+  function label(n) {
+    if (n === se) return 'window';
+    var d = A.describe(n), c = typeof n.className === 'string'
+      ? n.className.trim().split(/\s+/).slice(0, 3).join(' ') : '';
+    return c ? d.slice(0, -1) + ' class="' + c + '">' : d;
+  }
+  var t;
+  if (el && to === null && by === null) {
+    boxed(el).scrollIntoView({ block: block, inline: 'nearest', behavior: 'instant' });
+    t = containerOf(el);
+  } else {
+    t = el ? containerOf(el) : mainScroller();
+    if (t && to !== null) t.scrollTo({ top: to === 'top' ? 0 : t.scrollHeight, behavior: 'instant' });
+    if (t && by !== null) t.scrollBy({ top: by, behavior: 'instant' });
+  }
+  var m = t || se, out = {
+    target: t ? label(t) : null,
+    scroll_top: Math.round(m.scrollTop),
+    scroll_height: m.scrollHeight,
+    client_height: m.clientHeight,
+    at_bottom: m.scrollTop + m.clientHeight >= m.scrollHeight - 1
+  };
+  if (el) out.element = A.describe(el);
+  return out;
 })"""
 
 
@@ -1000,6 +1136,17 @@ def _do_screenshot(ctx: _Ctx, a: Action) -> Any:
     }
 
 
+def _do_scroll(ctx: _Ctx, a: Action) -> Any:
+    """Frame an element, jump to top/bottom, or nudge by pixels — on whichever
+    container actually scrolls (see the module docstring). Only the lookup
+    is bounded by ``timeout_s``; the scroll itself is one round trip."""
+    if a.selector:
+        _lookup(ctx, a, "visible")
+    return _checked(ctx.side.evaluate(
+        _call_js(_SCROLL_JS, bool(a.selector), a.to, a.by, a.block), timeout=_RPC_TIMEOUT,
+    ))
+
+
 _EXECUTORS: dict[str, Callable[[_Ctx, Action], Any]] = {
     "wait_for": _do_wait_for,
     "fill": _do_fill,
@@ -1009,6 +1156,7 @@ _EXECUTORS: dict[str, Callable[[_Ctx, Action], Any]] = {
     "wait": _do_wait,
     "evaluate": _do_evaluate,
     "screenshot": _do_screenshot,
+    "scroll": _do_scroll,
 }
 
 

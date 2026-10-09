@@ -116,6 +116,36 @@ def test_bad_screenshot_options_are_422(client, app_mod):
     _pool_untouched(client, app_mod)
 
 
+@pytest.mark.parametrize("bad", [
+    {},                                            # none of selector / to / by
+    {"to": "top", "by": 100},                      # to and by together
+    {"to": "top", "block": "start"},               # block outside the selector-only form
+    {"selector": "h2", "by": 10, "block": "end"},
+    {"to": "top", "text": "Results"},              # text without selector
+    {"to": "middle"},
+    {"selector": "h2", "block": "top"},
+    {"by": 1.5},
+    {"by": True},
+    {"by": 100001},
+    {"by": -100001},
+    {"selector": ""},
+    {"to": "top", "format": "png"},                # a screenshot field
+])
+def test_bad_scroll_steps_are_422_without_a_port(client, app_mod, bad):
+    r = client.post("/capture", json={**BASE, "actions": [{"type": "scroll", **bad}]})
+    assert r.status_code == 422, (bad, r.text)
+    _pool_untouched(client, app_mod)
+
+
+def test_bad_scroll_combination_names_the_rule(client, app_mod):
+    r = client.post("/capture", json={**BASE, "actions": [{"type": "scroll", "to": "top", "by": 5}]})
+    assert r.status_code == 422
+    assert "to and by are mutually exclusive" in r.text
+    r = client.post("/capture", json={**BASE, "actions": [{"type": "scroll"}]})
+    assert "give selector, to or by" in r.text
+    _pool_untouched(client, app_mod)
+
+
 def test_mcp_capture_url_returns_bad_actions_in_the_payload(app_mod):
     res = app_mod.capture_url(
         url="https://example.com", url_patterns=["x"], profile="p",
@@ -340,6 +370,47 @@ def test_screenshot_steps_reach_the_library_with_their_options(client, app_mod, 
     assert (first.format, first.full_page, first.scale, first.timeout_s) == ("png", True, 0.5, 30.0)
     assert (last.format, last.quality, last.timeout_s) == ("jpeg", 80, 30.0)
     assert "screenshots=2 taken, 0 failed" in capfd.readouterr().err
+
+
+def test_scroll_steps_reach_the_library_with_their_options(client, app_mod, fake_client):
+    r = client.post("/capture", json={
+        **BASE, "capture_window_seconds": 1,
+        "actions": [{"type": "click", "selector": "button"},
+                    {"type": "scroll", "selector": "h2", "text": "Results", "block": "center",
+                     "timeout_s": 5},
+                    {"type": "scroll", "to": "top"},
+                    {"type": "scroll", "selector": ".list", "by": -250},
+                    {"type": "screenshot"}],
+    })
+    assert r.status_code == 200, r.text
+    actions, _ = fake_client.instances[0].actions_called_with
+    _, framed, top, nudge, _ = actions
+    assert (framed.type, framed.selector, framed.text, framed.block, framed.timeout_s) == (
+        "scroll", "h2", "Results", "center", 5.0)
+    assert (top.selector, top.to, top.by, top.block, top.timeout_s) == (None, "top", None, "start", 15.0)
+    assert (nudge.selector, nudge.to, nudge.by) == (".list", None, -250)
+    steps = r.json()["actions_report"]["actions"]
+    assert [s["type"] for s in steps] == ["click", "scroll", "scroll", "scroll", "screenshot"]
+
+
+def test_mcp_capture_url_accepts_a_scroll_step(app_mod, monkeypatch):
+    seen: list = []
+
+    def _stop(req):
+        seen.append(req)
+        raise app_mod.HTTPException(status_code=429, detail="stop here")
+
+    monkeypatch.setattr(app_mod, "_run_capture", _stop)
+    app_mod.capture_url(url="https://e.com", profile="p",
+                        actions=[{"type": "scroll", "to": "bottom"}, {"type": "screenshot"}])
+    assert seen[0].actions[0].type == "scroll" and seen[0].actions[0].to == "bottom"
+    # A bad combination is an error payload, not an exception.
+    res = app_mod.capture_url(url="https://e.com", profile="p",
+                              actions=[{"type": "scroll", "to": "top", "by": 1},
+                                       {"type": "screenshot"}])
+    payload = res.structured_content
+    assert payload["status"] == "error" and "mutually exclusive" in payload["error"]
+    assert app_mod._port_pool.qsize() == app_mod.MAX_CONCURRENT
 
 
 def test_mcp_capture_url_returns_labelled_images_in_step_order(app_mod, fake_client, monkeypatch, capfd):

@@ -360,22 +360,69 @@ class ScreenshotAction(_ActionModel):
     )
 
 
+class ScrollAction(_ActionModel):
+    """Set the scroll position on whichever container actually scrolls — the
+    document, or (Salesforce Lightning) an inner `overflow-y: auto` element,
+    shadow DOM included. Three forms, at least one of selector / to / by:
+    `selector` alone frames that element (`block`, default `start` = at the
+    top); `to` jumps to the top or bottom; `by` nudges by CSS px. With a
+    `selector`, `to` / `by` act on that element's scroll container. `click`
+    and `fill` centre their element, so a `scroll` right before a
+    `screenshot` frames it. Nothing to scroll is a no-op, not a failure.
+    `value`: {target ('window' | '<div class=…>' | null), element?,
+    scroll_top, scroll_height, client_height, at_bottom}."""
+    type: Literal["scroll"]
+    selector: Optional[str] = Field(default=None, min_length=1, description=_SELECTOR_DESC)
+    text: Optional[str] = Field(default=None, description=_TEXT_DESC + " Needs `selector`.")
+    to: Optional[Literal["top", "bottom"]] = Field(
+        default=None,
+        description="Jump to the top or bottom of the scroll container. "
+        "Not with `by`.",
+    )
+    by: Optional[int] = Field(
+        default=None, ge=-100000, le=100000, strict=True,
+        description="Scroll by this many CSS px (negative is up). Not with `to`.",
+    )
+    block: Optional[Literal["start", "center", "end", "nearest"]] = Field(
+        default=None,
+        description="Selector-only form: where the element lands in the "
+        "viewport. Default `start` (top of the frame).",
+    )
+    timeout_s: float = Field(
+        default=15.0, gt=0, le=600,
+        description=_TIMEOUT_DESC + " Bounds only the element lookup.",
+    )
+
+    @model_validator(mode="after")
+    def _one_form(self) -> "ScrollAction":
+        if self.text is not None and self.selector is None:
+            raise ValueError("text needs a selector — it narrows the selector's matches")
+        if self.selector is None and self.to is None and self.by is None:
+            raise ValueError("give selector, to or by")
+        if self.to is not None and self.by is not None:
+            raise ValueError("to and by are mutually exclusive — give one")
+        if self.block is not None and (self.to is not None or self.by is not None):
+            raise ValueError("block only applies to the selector-only form (no to / by)")
+        return self
+
+
 ActionModel = Annotated[
     Union[WaitForAction, FillAction, ClickAction, PressAction, SelectAction,
-          WaitAction, EvaluateAction, ScreenshotAction],
+          WaitAction, EvaluateAction, ScreenshotAction, ScrollAction],
     Field(discriminator="type"),
 ]
 
 # login_actions: the same steps minus `evaluate` — a script on the login page
 # could read the password field back into the report — and minus `screenshot`:
 # an image of the login form would put the username into the response, and
-# the login design keeps credentials out of every response.
+# the login design keeps credentials out of every response. `scroll` stays:
+# it reads nothing, and a sign-in button below the fold is a real case.
 LoginActionModel = Annotated[
     Union[WaitForAction, FillAction, ClickAction, PressAction, SelectAction,
-          WaitAction],
+          WaitAction, ScrollAction],
     Field(discriminator="type"),
 ]
-LOGIN_ACTION_TYPES = ("wait_for", "fill", "click", "press", "select", "wait")
+LOGIN_ACTION_TYPES = ("wait_for", "fill", "click", "press", "select", "wait", "scroll")
 
 
 class ActionResultModel(BaseModel):
@@ -393,7 +440,8 @@ class ActionResultModel(BaseModel):
         description="evaluate / page_script: the script's return value. DOM "
         "steps: details of the element acted on. screenshot: {format, "
         "mime_type, width, height, full_page, bytes, page_url, data_base64} "
-        "(page_url is where the tab was at that step).",
+        "(page_url is where the tab was at that step). scroll: {target, "
+        "element?, scroll_top, scroll_height, client_height, at_bottom}.",
     )
 
 
@@ -410,8 +458,8 @@ class ActionsReportModel(BaseModel):
 
 
 _LOGIN_ACTIONS_DESC = (
-    "Steps (wait_for / fill / click / press / select / wait — no evaluate or "
-    "screenshot) run "
+    "Steps (wait_for / fill / click / press / select / wait / scroll — no "
+    "evaluate or screenshot) run "
     "ONLY if the tab lands on a login wall (`login_url_patterns`), once per "
     "capture, to sign in; the session then continues to `url` as it would "
     "after a human login. A fill `value` may reference the profile's stored "
@@ -481,12 +529,13 @@ class CaptureRequest(BaseModel):
     actions: list[ActionModel] = Field(
         default_factory=list,
         description="Ordered browser steps (wait_for / fill / click / press / "
-        "select / wait / evaluate / screenshot) run once the page is ready, so "
-        "the page's own code fires the requests `url_patterns` is waiting for. "
-        "Stops at the first failed step — except a failed `screenshot`, which "
-        f"is recorded and the run continues. At most {MAX_SCREENSHOT_ACTIONS} "
-        "screenshot steps. See INTERCEPTOR.md § Page scripts and actions and "
-        "§ Screenshots.",
+        "select / wait / evaluate / screenshot / scroll) run once the page is "
+        "ready, so the page's own code fires the requests `url_patterns` is "
+        "waiting for. Stops at the first failed step — except a failed "
+        "`screenshot`, which is recorded and the run continues. At most "
+        f"{MAX_SCREENSHOT_ACTIONS} screenshot steps. `click` / `fill` centre "
+        "their element, so a `scroll` right before a `screenshot` frames it. "
+        "See INTERCEPTOR.md § Page scripts and actions and § Screenshots.",
     )
     actions_ready_timeout_seconds: Optional[int] = Field(
         default=None,
@@ -1107,7 +1156,8 @@ def capture_url(
             ``{"type": "select", "selector", "value", "text"?}`` (native <select> only),
             ``{"type": "wait", "seconds"}``,
             ``{"type": "evaluate", "script", "timeout_s"?}``,
-            ``{"type": "screenshot", "format"?: "jpeg"|"png"|"webp", "quality"?: 1-100, "full_page"?: false, "scale"?: 0-2, "max_height"?: 100-16384, "timeout_s"?: 30}``.
+            ``{"type": "screenshot", "format"?: "jpeg"|"png"|"webp", "quality"?: 1-100, "full_page"?: false, "scale"?: 0-2, "max_height"?: 100-16384, "timeout_s"?: 30}``,
+            ``{"type": "scroll", "selector"?, "text"?, "to"?: "top"|"bottom", "by"?: <px>, "block"?: "start"|"center"|"end"|"nearest"}`` (at least one of selector / to / by; to and by exclusive; block only with selector alone).
             ``selector`` is CSS matched in the document AND inside every open
             shadow root (Salesforce Lightning / web components), each tree
             separately — so a descendant combinator never crosses into a
@@ -1130,6 +1180,16 @@ def capture_url(
             is plenty to read a page. ``full_page`` captures the whole
             document (up to ``max_height`` px) instead of the 1920x1080
             viewport.
+            ``scroll`` sets where the page is scrolled: ``selector`` alone
+            puts that element at the top of the frame (``block``); ``to`` /
+            ``by`` (CSS px, negative is up) move the page's main scroller —
+            the document, or the inner container a Salesforce Lightning page
+            actually scrolls — or, with a ``selector``, that element's scroll
+            container. ``click`` and ``fill`` centre their element, so a
+            ``scroll`` right before a ``screenshot`` frames it. Nothing to
+            scroll is a no-op (``target: null``), not a failure; the
+            ``value`` reports ``scroll_top`` / ``scroll_height`` /
+            ``at_bottom``.
         stop_when_matched: End as soon as every pattern has at least one
             match and the actions have finished, instead of waiting out
             ``capture_window_seconds``. A click finishes when the mouse is

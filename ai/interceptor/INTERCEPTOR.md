@@ -167,6 +167,29 @@ Things to know:
 - **`page_url` is where the tab was at that step** — after any redirect an earlier step caused.
 - **`width`/`height` are the requested clip × `scale`**, not decoded from the image; Chrome's rounding can differ by a pixel. The headless viewport is `--window-size=1920,1080` minus browser chrome, so expect ~1904×929 at `scale: 1.0`.
 - **Not allowed in [`login_actions`](#login-actions)** (a 422): an image of the login form would carry the username into the response, and the login design keeps credentials out of every response.
+- **It shoots the viewport where it is scrolled.** `click` and `fill` re-centre the page on their element — see [Framing](#framing-scroll-before-you-shoot).
+
+### Framing: `scroll` before you shoot
+
+A viewport screenshot captures wherever the page happens to be scrolled — and `click` and `fill` scroll their element to the **centre** of the viewport first, so a screenshot taken after a click lower down the page shows that area, not the top. A [`scroll`](#step-types) step right before the `screenshot` sets the frame:
+
+```json
+"actions": [
+  {"type": "click", "selector": "button", "text": "Show results"},
+  {"type": "wait_for", "selector": "h2", "text": "Results"},
+  {"type": "scroll", "selector": "h2", "text": "Results"},
+  {"type": "screenshot", "scale": 0.5},
+  {"type": "scroll", "to": "top"},
+  {"type": "screenshot", "scale": 0.5}
+]
+```
+
+- **`{"type": "scroll", "selector": …}`** finds the element with the same [deep lookup](#finding-elements) as `click` and puts it at the top of the frame (`block: "start"`; `center`, `end` and `nearest` also work).
+- **`{"type": "scroll", "to": "top" | "bottom"}`** and **`{"type": "scroll", "by": 800}`** (negative is up) act on the page's **main scroller**: the document when it scrolls; when it doesn't, the largest visible element whose `overflow-y` is `auto`, `scroll` or `overlay` and whose content overflows, found by walking the document **and every open shadow root**. That second case is Salesforce Lightning, which keeps `<html>` fixed and scrolls an inner `<div>` — and why `{"type": "evaluate", "script": "window.scrollTo(0, 0)"}` does nothing there. With a `selector` as well, `to` / `by` scroll **that element's** scroll container instead: the element itself if it scrolls, otherwise the nearest ancestor that does (crossing shadow boundaries), falling back to the main scroller.
+- **The step's `value` says what moved**: `{"target": "window" | "<div class=…>" | null,"element"?: "<…>", "scroll_top", "scroll_height", "client_height", "at_bottom"}`. A page with nothing to scroll is a **no-op with `target: null`**, not a failure — a short page needs no framing.
+- **Scrolling is `behavior: "instant"`**, so a page with CSS `scroll-behavior: smooth` is not mid-animation when the screenshot is taken.
+- **`full_page: true` always starts at the top of the document**, so it needs no `to: "top"` on a page the document scrolls. It does not help with an inner scroller: there the document is only one viewport tall, so frame the inner one with `scroll` instead.
+- **Not only for screenshots**: an infinite list or a "load more" section often fires its XHRs only once it is scrolled into view — `{"type": "scroll", "to": "bottom"}` then a `wait` makes the page fetch the next page of results for `url_patterns` to catch.
 
 ### Worked example: a screenshot after each interesting step
 
@@ -237,7 +260,7 @@ A plain capture only *watches*: it returns the JSON the page fetches on its own.
 | Field | Default | What it does |
 |---|---|---|
 | `page_script` | `null` | JS evaluated in the page once it is ready, before any action. Its JSON-serialisable result comes back as `actions_report.page_script.value`. Use it to *inspect* the page — e.g. list the form fields before writing `actions` (see the [discovery example](#worked-example-discover-the-form-then-run-the-lookup)). |
-| `actions` | `[]` | Ordered steps — `wait_for`, `fill`, `click`, `press`, `select`, `wait`, `evaluate`, `screenshot` — run once the page is ready. Stops at the first failed step, except a failed `screenshot`, which is recorded and the run continues. |
+| `actions` | `[]` | Ordered steps — `wait_for`, `fill`, `click`, `press`, `select`, `wait`, `evaluate`, `screenshot`, `scroll` — run once the page is ready. Stops at the first failed step, except a failed `screenshot`, which is recorded and the run continues. |
 | `actions_ready_timeout_seconds` | `capture_window_seconds` | How long the [readiness gate](#readiness-gate) may wait before the steps are abandoned. |
 | `stop_when_matched` | `false` | End the window as soon as every `url_patterns` bucket has at least one match and the actions (if any) have finished, instead of waiting out `capture_window_seconds`. Needs at least one pattern (422 otherwise). |
 
@@ -257,8 +280,9 @@ It is tempting to have `page_script` call the endpoint directly with `fetch()`. 
 | `wait` | `seconds` | Sleeps (0–600 s, cancellable). |
 | `evaluate` | `script`, `timeout_s?` | `Runtime.evaluate` with `awaitPromise`, `returnByValue`, `userGesture`. The value comes back in that step's `value`; a thrown error fails the step with its message. |
 | `screenshot` | `format?` (`jpeg` \| `png` \| `webp`), `quality?` (80), `full_page?` (false), `scale?` (1.0), `max_height?` (8000), `timeout_s?` (**30**) | Settles (best-effort, ~5 s), then `Page.captureScreenshot`. The image is the step's `value` (`{format, mime_type, width, height, full_page, bytes, page_url, data_base64}`). **A failed screenshot does not stop the run.** At most 10 per request. See [Screenshots](#screenshots). |
+| `scroll` | `selector?`, `text?`, `to?` (`top` \| `bottom`), `by?` (CSS px, negative is up, ±100000), `block?` (`start` \| `center` \| `end` \| `nearest`, default `start`), `timeout_s?` | Needs at least one of `selector` / `to` / `by`; `to` and `by` are exclusive, `block` belongs to the selector-only form, `text` needs a `selector`. `selector` alone: finds the element (as `click` does) and `scrollIntoView`s it to `block`. `to` / `by`: scrolls the page's main scroller — the document, or the largest visible inner `overflow-y: auto` element (shadow DOM included) when the document doesn't scroll — or, with a `selector`, that element's scroll container. Nothing to scroll is a no-op (`target: null`). `value`: `{target, element?, scroll_top, scroll_height, client_height, at_bottom}`. Put one right before a `screenshot` to frame it — see [Screenshots § Framing](#framing-scroll-before-you-shoot). |
 
-`timeout_s` defaults to **15** per step (30 for `screenshot`; max 600). Unknown step types and missing fields are a **422**; an unknown `press` key is a **400** — both before a port is taken.
+`timeout_s` defaults to **15** per step (30 for `screenshot`; max 600) — for `scroll` it bounds only the element lookup. Unknown step types, missing fields and a `scroll` that mixes its forms are a **422**; an unknown `press` key is a **400** — both before a port is taken.
 
 **Scripts are expressions.** `page_script` and `evaluate.script` are evaluated as given, not wrapped. `document.title` works; several statements need an async IIFE — `(async () => { const x = …; return x; })()`. Promises are awaited. Return plain data (objects, arrays, strings): DOM nodes and functions don't survive `returnByValue`.
 
@@ -362,7 +386,7 @@ INTERCEPTOR_LOGIN_ENPHASE_PASSWORD=…
 
 #### Allowed steps
 
-`wait_for`, `fill`, `click`, `press`, `select`, `wait` — **no `evaluate`** (a 422): a script on the login page could read the password field back into the report — and **no `screenshot`** (a 422): an image of the login form would put the username into the response.
+`wait_for`, `fill`, `click`, `press`, `select`, `wait`, `scroll` — **no `evaluate`** (a 422): a script on the login page could read the password field back into the report — and **no `screenshot`** (a 422): an image of the login form would put the username into the response. `scroll` is allowed: it reads nothing from the page, and a sign-in button below the fold is a real case.
 
 #### What happens
 

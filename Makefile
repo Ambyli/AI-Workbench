@@ -78,6 +78,10 @@ check_stack = $(if $(STACK),$(if $(filter $(STACK),$(STACKS)),,$(error Unknown s
 DC       = $(DC_$(STACK))
 SERVICES = $(if $(SVC),$(SVC),$(STACK_$(STACK)))
 
+# Lines of history `logs` prints per service before following. Override with
+# `make logs <stack> TAIL=2000`, or `TAIL=all` for the full history.
+TAIL ?= 500
+
 network:
 	docker network create ai_shared 2>/dev/null || true
 	# terminal_net is deliberately NOT ai_shared: it joins only open-terminal
@@ -140,7 +144,7 @@ endif
 logs:
 	$(check_stack)
 ifdef STACK
-	$(DC) logs -f $(SERVICES)
+	$(DC) logs -f --tail $(TAIL) $(SERVICES)
 else
 	@echo "Use: make logs <stack> [service...] to follow specific service logs."
 	@echo "Stacks: $(STACKS)"
@@ -167,7 +171,7 @@ help:
 	@echo "  clean       Stop and remove containers"
 	@echo "  very-clean  Stop, remove containers, volumes, and images (needs CONFIRM=yes)"
 	@echo "  build       Rebuild images"
-	@echo "  logs        Follow service logs"
+	@echo "  logs        Follow service logs (last 500 lines; TAIL=n or TAIL=all)"
 	@echo "  ps          List active containers for a stack"
 	@echo ""
 	@echo "Stacks: $(STACKS)"
@@ -179,7 +183,8 @@ help:
 	@echo "  make build sandbox                     # build every service + every profile in the sandbox stack"
 	@echo "  make build sandbox PROFILES=build      # build only services under the 'build' profile"
 	@echo "  make build sandbox PROFILES=build,x    # build multiple profiles (comma-separated)"
-	@echo "  make logs kokoro                       # tail kokoro logs"
+	@echo "  make logs kokoro                       # tail kokoro logs (last 500 lines, then follow)"
+	@echo "  make logs kokoro TAIL=all              # full history, then follow"
 	@echo "  make ps sandbox                        # list active sandbox containers"
 	@echo ""
 	@echo "Note: 'make build' auto-includes every profile declared in a stack's compose"

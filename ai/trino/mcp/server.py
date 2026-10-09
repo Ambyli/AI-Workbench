@@ -165,9 +165,14 @@ def _ident(name: str) -> str:
     return f'"{name}"'
 
 
-# FastMCP mounts the MCP transport on /mcp; FastAPI serves /health and
-# anything else we tack on for operator sanity.
-app = FastAPI(title="trino-mcp")
+# FastMCP serves the MCP transport at the root of its own app, which is
+# mounted at /mcp below — http_app()'s default path is also "/mcp", which
+# would put the endpoint at /mcp/mcp. Its lifespan starts the streamable-HTTP
+# session manager, so it must be FastAPI's lifespan too. FastAPI serves
+# /health and anything else we tack on for operator sanity.
+mcp_app = mcp.http_app(path="/")
+
+app = FastAPI(title="trino-mcp", lifespan=mcp_app.lifespan)
 
 
 @app.get("/health")
@@ -175,4 +180,4 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-app.mount("/mcp", mcp.http_app())
+app.mount("/mcp", mcp_app)

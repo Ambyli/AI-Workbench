@@ -1,0 +1,19 @@
+# Tooling config for the Zeo Energy chatbot prototype.
+# The linter is intentionally scoped to CORRECTNESS-class rules only (real bugs),
+# not stylistic ones — consistent with the project's no-build, low-ceremony ethos.
+# It exists as a non-breaking safety gate so future Build Tree passes stay honest.
+#
+#   Run:   venv/bin/ruff check backend/ *.py
+#   Fix:   venv/bin/ruff check backend/ *.py --fix
+
+[tool.ruff]
+target-version = "py39"
+line-length = 100
+extend-exclude = ["venv", "diagrams"]
+
+[tool.ruff.lint]
+# F  = pyflakes  (unused/undefined names, bad imports, f-string bugs)
+# E9 = syntax errors
+# (bugbear/style rules deliberately omitted: they trip FastAPI idioms like
+#  File(...)/Depends(...) and add churn without catching real bugs here.)
+select = ["F", "E9"]

@@ -1,0 +1,65 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+!.env.account.example
+*.key
+
+# Runtime uploads (user-submitted images)
+backend/data/uploads/*
+!backend/data/uploads/.gitkeep
+
+# Runtime Google Chat notification feed (regenerated as cases finalize)
+backend/data/chat_notifications.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.claude/
+
+# Internal design/diagram artifacts (not shipped)
+diagrams/
+PR_DESCRIPTION.md
+
+# Nested checkout of the website repo (its own git repo; never part of this repo or image)
+New-Zeo-Website/
+
+# Runtime data written by the service (S-M6): never commit customer data.
+# customers.json is the static mock CRM table and stays tracked.
+backend/data/*.json
+!backend/data/customers.json
+
+# Credential files must never be committed or baked into images (S-L7).
+*credentials*.json
+*service-account*.json
+*service_account*.json
+*-sa.json
+sa-key.json
+*.pem
+
+# Local screenshots of the mock page (regenerate any time)
+screenshots/
+
+# Local Service page mock (scripts/mock-*.ps1): build output, runtime data, logs
+mock/.site-build/
+mock/.data/
+mock/logs/
+mock/.pids.json
+mock/.no-account-env
+
+# Albatross (Phoenix read-only API) Postman exports: contain real customer example data
+*.postman_collection*.json
+*albatross*
+*Albatross*
+*pseudo*
+*Pseudo*

@@ -626,7 +626,8 @@ def test_without_references_the_result_says_null_and_nothing_changes(client, mod
     assert job["result"]["references"] is None
     assert "reference" not in _entry(job)["detail"]
     assert "reference" not in _entry(job)["options_used"]
-    assert set(job["metadata"]) == {"type", "request_id"}
+    # No `references` key — `progress` is the queue's gauge, on every job.
+    assert set(job["metadata"]) == {"type", "request_id", "progress"}
     assert [FakeModel.images(p) for p in model.scoring()] == [1]
 
 

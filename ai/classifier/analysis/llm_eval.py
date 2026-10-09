@@ -36,6 +36,11 @@ and it always sends one image: references do not reach the loop.
 Every call goes through ``llm.client``, so the process-wide
 CLASSIFIER_MAX_LLM_CALLS limit bounds them all.
 
+Progress: ``evaluate_with`` checkpoints ``"<name>: scored"`` on the job's
+gauge (``common.jobs.progress``) right after the scoring answer — the first
+of the two steps ``analysis.scheduler`` gives an llm unit with boxes; the
+unit's exit credits the second, located or not.
+
 Process flow position: one of the four evaluators ``analysis.scheduler``
 dispatches to; also called by ``analysis.cv_eval``.
 """
@@ -44,6 +49,8 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any, Optional
+
+from common.jobs import progress
 
 from analysis.context import DocumentContext
 from analysis.outcome import Outcome, empty_localization
@@ -159,6 +166,11 @@ async def evaluate_with(
         )
         if reference is not None:
             reference_detail = reference.unapplied_detail()
+    # The unit's first progress step (of two when it has boxes). Whether the
+    # loop then runs or is skipped, the scheduler's task exit credits the
+    # second; for a one-step unit (no boxes, or a `cv` criterion's llm
+    # fallback) the cap makes this a label update only.
+    progress.checkpoint(f"{name}: scored", logger=logger)
 
     outcome = Outcome(
         method="llm",

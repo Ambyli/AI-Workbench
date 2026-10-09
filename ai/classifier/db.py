@@ -1,11 +1,13 @@
 """The classifier's one Postgres connection pool (the ``classifier-db`` container).
 
 Every row the classifier keeps lives in one database: the job queue
-(``jobs``, ``common.jobs.postgres.PostgresRegistry``), saved references
+(``jobs``, ``common.jobs.postgres.PostgresRegistry``) with each job's
+progress history (``job_progress``,
+``common.jobs.progress_postgres.PostgresProgressStore``), saved references
 (``reference_examples``, ``references.store.ReferenceRegistry``) and one row
 per vision-model request (``llm_calls``, ``llm.usage.UsageStore``). They share
 ONE pool rather than one each, so the connection count is sized once
-(``DB_POOL_MAX``) and the three stores can never starve each other's
+(``DB_POOL_MAX``) and the stores can never starve each other's
 connection budget separately.
 
     Database          the pool owner. ``init()`` / ``close()`` are driven by

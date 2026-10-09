@@ -43,8 +43,29 @@ to exactly one caller (safe across tasks and processes),
   in-flight count and peak. What a job's inner work (model calls, OCR passes,
   per-job fan-out) is bounded with; the classifier holds two (model calls, OCR passes).
 
+How far along a running job is — the piece a submit-and-poll caller otherwise
+cannot see:
+
+* ``ProgressGauge`` (from ``common.jobs.progress``, stdlib only) — a job's
+  stages, each worth a share of 100 (``percent = Σ completed weights +
+  weight × index / length``), advanced at checkpoint moments by the module
+  helpers ``checkpoint()`` / ``plan()`` / ``task()``, which find the job's
+  gauge through a ContextVar and are no-ops outside one. ``checkpoint()``
+  also writes the log line, so logging a milestone and moving the gauge are
+  one call. ``async with gauge.running()`` flushes it to a store about once a
+  second and writes the terminal ``done`` / ``failed`` state before the
+  handler returns. Progress never fails a job.
+
+* ``PostgresProgressStore`` (from ``common.jobs.progress_postgres``) — the
+  snapshot in the job row's ``metadata.progress`` (so ``GET /jobs/{id}``
+  shows it as-is) and one ``job_progress`` row per event, foreign-keyed to
+  the jobs table ``ON DELETE CASCADE`` so the history goes with its job.
+  ``build_progress_router`` (in ``common.jobs.router``) serves it as
+  ``GET /jobs/{job_id}/progress``. The classifier is the first consumer.
+
 Optional deps: ``aiosqlite`` for ``SqliteRegistry``; ``asyncpg`` for
-``PostgresRegistry``; ``fastapi`` for ``build_router``. Consumers who don't
+``PostgresRegistry`` and ``PostgresProgressStore``; ``fastapi`` for
+``build_router`` / ``build_progress_router``. Consumers who don't
 use those don't pay the import cost — each submodule imports its optional
 dep at top-level and will raise a clear ImportError if the consumer forgot
 to depend on it.

@@ -80,6 +80,9 @@ services:
       - CLASSIFIER_MAX_UNITS_PER_JOB=${CLASSIFIER_MAX_UNITS_PER_JOB:-6}
       - CLASSIFIER_MAX_LLM_CALLS=${CLASSIFIER_MAX_LLM_CALLS:-6}
       - CLASSIFIER_OCR_WORKERS=${CLASSIFIER_OCR_WORKERS:-4}
+      # How often a running job's progress gauge is written to classifier-db
+      # (metadata.progress + job_progress rows). See API.md § Progress.
+      - CLASSIFIER_PROGRESS_FLUSH_INTERVAL_S=${CLASSIFIER_PROGRESS_FLUSH_INTERVAL_S:-1}
       # Document support: how many items (pages, across every document) one
       # request may carry, which OCR engine backs `text` criteria and scanned
       # PDFs, at what raster density a PDF page is rendered, how much

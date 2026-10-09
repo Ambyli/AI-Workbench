@@ -255,8 +255,9 @@ def test_the_assess_result_records_its_criteria(client, model):
     criteria = job["result"]["request"]["criteria"]
     assert [c["name"] for c in criteria] == [HOUSE, "after"]
     assert criteria[1]["depends_on"] == HOUSE and criteria[1]["weight"] == 2.5
-    # The assess job's metadata is exactly what it always was.
-    assert set(job["metadata"]) == {"type", "request_id"}
+    # The assess job's metadata is what it always was, plus the progress
+    # snapshot the queue's gauge keeps there.
+    assert set(job["metadata"]) == {"type", "request_id", "progress"}
 
 
 def test_caller_answers_beat_the_pipeline_and_observed_is_kept(client, model):

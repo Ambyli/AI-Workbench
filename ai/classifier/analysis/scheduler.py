@@ -61,6 +61,16 @@ in ``llm.usage.unit_scope(item, document)``, and ``_evaluate`` /
 ``llm_calls`` row each request writes carries those, and the per-task context
 keeps two concurrent units from ever seeing each other's.
 
+It is also where the job's progress gauge (``common.jobs.progress``) counts
+units: the "units" stage is planned at Σ steps over every unit — ONE step per
+unit, except an ``llm`` unit with ``options.boxes``, which is TWO (scored,
+then located: ``analysis.llm_eval`` checkpoints after the scoring call) — and
+each unit body runs inside ``progress.task("units", steps)``, whose exit
+credits whatever the unit did not checkpoint. So a unit skipped by its gate,
+one that errored, and one whose box loop never ran (a low score) all count in
+full, and the stage always reaches its length. With no gauge (a direct
+``analyze_document`` call) all of it is a no-op.
+
 Process flow position: called by ``analysis.pipeline.analyze_document``
 between building the item contexts and aggregating the results.
 """
@@ -69,6 +79,8 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+
+from common.jobs import progress
 
 from analysis import aggregate, cv_eval, detector_eval, llm_eval, text_eval
 from analysis.context import DocumentContext, DocumentGroup
@@ -171,45 +183,64 @@ async def run_units(
 
     async def run_item(c: CriterionInput, ctx: DocumentContext) -> None:
         try:
-            outcome = await gate(c, item=ctx.item, document=ctx.document)
-            if outcome is None and ctx.references is not None and ctx.references.needs_selection(c):
-                # references "auto": this item's one selection call, shared by
-                # every unit on it — awaited BEFORE taking a unit slot, so a
-                # unit waiting on it holds nothing. It never raises. Its usage
-                # row carries the item and NO criterion: whichever unit gets
-                # here first makes the call, on behalf of all of them.
-                with unit_scope(item=ctx.item, document=ctx.document):
-                    await ctx.references.select(ctx)
-            if outcome is None:
-                async with slots:
-                    outcome = await _evaluate(c, ctx)
-            runs[c.name].outcomes[ctx.item] = outcome
+            # The unit's progress steps — credited on exit however it ends.
+            with progress.task("units", steps[c.name], label=f"{c.name} · item {ctx.item}"):
+                outcome = await gate(c, item=ctx.item, document=ctx.document)
+                if (outcome is None and ctx.references is not None
+                        and ctx.references.needs_selection(c)):
+                    # references "auto": this item's one selection call, shared
+                    # by every unit on it — awaited BEFORE taking a unit slot,
+                    # so a unit waiting on it holds nothing. It never raises.
+                    # Its usage row carries the item and NO criterion:
+                    # whichever unit gets here first makes the call, on behalf
+                    # of all of them.
+                    with unit_scope(item=ctx.item, document=ctx.document):
+                        await ctx.references.select(ctx)
+                if outcome is None:
+                    async with slots:
+                        outcome = await _evaluate(c, ctx)
+                runs[c.name].outcomes[ctx.item] = outcome
         finally:
             finished[key(c.name, ctx.item)].set()
 
     async def run_document(c: CriterionInput, group: DocumentGroup) -> None:
         try:
-            outcome = await gate(c, item=None, document=group.index)
-            if outcome is None:
-                async with slots:
-                    outcome = await _evaluate_document(c, group)
-            runs[c.name].outcomes[group.index] = outcome
+            with progress.task("units", 1, label=f"{c.name} · document {group.index}"):
+                outcome = await gate(c, item=None, document=group.index)
+                if outcome is None:
+                    async with slots:
+                        outcome = await _evaluate_document(c, group)
+                runs[c.name].outcomes[group.index] = outcome
         finally:
             finished[key(c.name, group.index)].set()
 
+    steps = {c.name: unit_steps(c) for c in criteria}
     tasks = []
+    total_steps = 0
     for c in criteria:
         if runs[c.name].scope == "document":
             tasks.extend(run_document(c, g) for g in groups)
+            total_steps += len(groups)
         else:
             tasks.extend(run_item(c, ctx) for ctx in items)
+            total_steps += steps[c.name] * len(items)
 
     logger.info(
         "scheduler: %d criteria × %d item(s) in %d document(s) = %d unit(s), up to %d at once",
         len(criteria), len(items), len(groups), len(tasks), limit,
     )
+    progress.plan("units", total_steps)
     await asyncio.gather(*tasks)
     return runs
+
+
+def unit_steps(c: CriterionInput) -> int:
+    """Progress steps one per-item unit of ``c`` is worth: 2 for an ``llm``
+    criterion with ``options.boxes`` (scored, then located), else 1. A
+    document-scope unit is always 1."""
+    if c.type == "llm" and c.resolved_options().get("boxes"):
+        return 2
+    return 1
 
 
 def _failed(c: CriterionInput, exc: Exception) -> Outcome:

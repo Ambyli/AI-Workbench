@@ -30,7 +30,21 @@ Flow:
      the job's ``usage`` totals to the result.
   3. The pool persists the result / error (→ "completed" | "failed") and
      calls ``_on_finish`` for metrics.
-  4. Callers poll GET /jobs/{job_id}.
+  4. Callers poll GET /jobs/{job_id} — and GET /jobs/{job_id}/progress for
+     how far along it is.
+
+Progress (``common.jobs.progress``). ``enqueue`` writes the ``queued``
+snapshot (0%, attempt 0) while the row is still "staging", so no worker can
+have claimed it yet and a running gauge can never be overwritten by it.
+``handle_job`` runs the runner inside ``ProgressGauge(...).running()`` with
+the job type's ``STAGES`` and the next attempt number: the runners, the
+scheduler, the llm evaluator and the pipeline then ``plan`` / ``task`` /
+``checkpoint`` through the gauge the context carries, and the gauge's final
+flush (``done`` at 100, or ``failed``) lands BEFORE the pool's
+``set_result`` / ``set_error`` — the terminal snapshot is never newer than
+the phase. ``start()`` puts the snapshot of every job ``recover()`` sent back
+to the queue back to ``queued``. Progress writes never fail a job: every
+store error is logged and swallowed.
 
 Why the DB is the queue, not an asyncio.Queue: an in-memory queue loses every
 pending job on restart and can't be shared across processes. With the
@@ -48,9 +62,11 @@ from typing import Any, Optional
 from common.jobs.model import JobBase
 from common.jobs.payloads import FilePayloadStore
 from common.jobs.postgres import PostgresRegistry
+from common.jobs.progress import ProgressGauge, Stage, mark_queued, next_attempt
+from common.jobs.progress_postgres import PostgresProgressStore
 from common.jobs.worker import WorkerPool
 
-from config import MAX_CONCURRENT, PAYLOAD_DIR, WORKER_POLL_INTERVAL_S
+from config import MAX_CONCURRENT, PAYLOAD_DIR, PROGRESS_FLUSH_INTERVAL_S, WORKER_POLL_INTERVAL_S
 from db import database
 from jobs.runners import run_assess, run_reference
 from llm import usage as llm_usage
@@ -65,6 +81,29 @@ from regions.sweeper import ArtifactSweeper
 JOB_TYPE = "assess"
 JOB_TYPES = frozenset({"assess", "reference"})
 
+# Each job type's progress stages (common.jobs.progress.Stage: name, title,
+# weight — weights are shares of 100). The names are what the code checkpoints
+# against: jobs.runners plans and loads "load", analysis.scheduler plans and
+# runs "units" (one per (criterion, item) unit; an llm unit with boxes is two
+# steps, scored then located), analysis.pipeline enters "artifacts", and the
+# reference runner's describe + render are "finalize". "units" dominates
+# because that is where the model calls are. A reference job whose criteria
+# were all supplied skips units and artifacts — entering finalize completes
+# them.
+STAGES: dict[str, tuple[Stage, ...]] = {
+    "assess": (
+        Stage("load", "Loading documents", 10),
+        Stage("units", "Evaluating criteria", 85),
+        Stage("artifacts", "Writing artifacts", 5),
+    ),
+    "reference": (
+        Stage("load", "Loading documents", 5),
+        Stage("units", "Evaluating criteria", 70),
+        Stage("artifacts", "Writing artifacts", 5),
+        Stage("finalize", "Building reference", 20),
+    ),
+}
+
 
 class ClassifierQueue:
     """Owns the payload store and worker pool for one registry.
@@ -77,6 +116,10 @@ class ClassifierQueue:
     def __init__(self, registry: PostgresRegistry) -> None:
         self.registry = registry
         self.payloads = FilePayloadStore(PAYLOAD_DIR)
+        # The snapshot goes into the registry's own rows (metadata.progress)
+        # and the history into job_progress beside them, on the same pool.
+        # main's lifespan creates the table, after the jobs table it references.
+        self.progress = PostgresProgressStore(pool=database)
         self.pool = WorkerPool(
             registry,
             self.handle_job,
@@ -92,6 +135,12 @@ class ClassifierQueue:
         """Recover interrupted jobs, sweep orphan payloads, start the workers.
         The registry must already be ``init()``-ed."""
         requeued = await self.pool.recover(phases=["staging"])
+        try:
+            # A requeued row's snapshot still says "running" at whatever
+            # percent the dead process last flushed; put it back to queued.
+            await self.progress.requeued()
+        except Exception as exc:  # noqa: BLE001 — progress never stops a start
+            logger.warning("queue: could not reset the progress of requeued jobs: %s", exc)
         swept = await self.payloads.sweep(self.registry)
         pending = await self.refresh_queue_depth()
         logger.info("queue: recovery requeued=%d orphan_payloads_removed=%d pending=%d "
@@ -117,6 +166,10 @@ class ClassifierQueue:
             logger.error("enqueue: payload write failed for job_id=%s: %s", job_id, exc)
             await self.registry.set_error(job_id, f"could not persist job payload: {exc}")
             raise
+        # Before the flip to "pending": while the row is "staging" no worker
+        # can claim it, so this 0% can never land on top of a running gauge.
+        job_type = payload.get("type", JOB_TYPE) if isinstance(payload, dict) else JOB_TYPE
+        await mark_queued(self.progress, job_id, stages=_stages(job_type), logger=logger)
         await self.registry.set_phase(job_id, "pending")
         self.pool.notify()
         return await self.refresh_queue_depth()
@@ -145,22 +198,36 @@ class ClassifierQueue:
             llm_usage.job_type_var.set(job_type),
         )
         try:
-            payload = await self.payloads.read(job.job_id)
-            if payload is None:
-                raise RuntimeError(
-                    "payload missing — the job's input file was removed or never "
-                    "written (usually a restart between enqueue and payload write)"
-                )
-            if job_type not in JOB_TYPES:
-                raise RuntimeError(
-                    f"job type {job_type!r} no longer exists — /locate and "
-                    "/assess/compare were removed; resubmit to POST /assess"
-                )
-            # Looked up on the module at call time so a test can replace them.
-            if job_type == "reference":
-                result = await run_reference(payload)
-            else:
-                result = await run_assess(payload)
+            # This run's gauge: every plan / task / checkpoint below (in the
+            # runner, the scheduler's unit tasks, the to_thread loaders)
+            # finds it through the context. Its final flush — done, or failed
+            # with the exception — completes before this handler returns, so
+            # before the pool writes the result or the error.
+            gauge = ProgressGauge(
+                job.job_id,
+                _stages(job_type),
+                store=self.progress,
+                logger=logger,
+                flush_interval=PROGRESS_FLUSH_INTERVAL_S,
+                attempt=await next_attempt(self.progress, job.job_id, logger=logger),
+            )
+            async with gauge.running():
+                payload = await self.payloads.read(job.job_id)
+                if payload is None:
+                    raise RuntimeError(
+                        "payload missing — the job's input file was removed or never "
+                        "written (usually a restart between enqueue and payload write)"
+                    )
+                if job_type not in JOB_TYPES:
+                    raise RuntimeError(
+                        f"job type {job_type!r} no longer exists — /locate and "
+                        "/assess/compare were removed; resubmit to POST /assess"
+                    )
+                # Looked up on the module at call time so a test can replace them.
+                if job_type == "reference":
+                    result = await run_reference(payload)
+                else:
+                    result = await run_assess(payload)
             return await _with_usage(job.job_id, result)
         except asyncio.CancelledError:
             # A shutdown mid-job: `docker compose stop` / `make up classifier`
@@ -192,6 +259,12 @@ class ClassifierQueue:
         jobs_total.labels(type=job_type, status=phase).inc()
         job_duration.labels(type=job_type).observe(elapsed)
         # Depth gauge is refreshed by the next enqueue/claim; keep the hook sync + cheap.
+
+
+def _stages(job_type: str) -> tuple[Stage, ...]:
+    """A job type's progress stages; a removed type (which fails at once)
+    gets the assess stages, so its gauge still has somewhere to say so."""
+    return STAGES.get(job_type, STAGES[JOB_TYPE])
 
 
 async def _with_usage(job_id: str, result: Any) -> Any:

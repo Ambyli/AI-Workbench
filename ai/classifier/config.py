@@ -398,6 +398,18 @@ PAYLOAD_DIR: str = os.environ.get(
 )
 WORKER_POLL_INTERVAL_S: float = float(os.environ.get("WORKER_POLL_INTERVAL_S", "1.0"))
 
+# Job progress (common.jobs.progress, wired in jobs/queue.py). A running job's
+# gauge is written to the database — the snapshot into the job row's
+# metadata.progress, one job_progress row per checkpoint — at most once per
+# this many seconds, in one transaction, and only when something moved. The
+# terminal state is always written when the job ends, whatever the interval.
+# Lower makes GET /jobs/{id}/progress fresher at the cost of more writes per
+# job; the floor keeps a mis-set value from turning every checkpoint of every
+# running job into its own round trip.
+PROGRESS_FLUSH_INTERVAL_S: float = max(
+    0.2, float(os.environ.get("CLASSIFIER_PROGRESS_FLUSH_INTERVAL_S", "1"))
+)
+
 # The one asyncpg pool's ceiling (db.py). Every worker can hold a connection
 # for a claim or a write, every model call writes one llm_calls row after its
 # slot is released, and the HTTP routes (polls, /references, /usage) need a

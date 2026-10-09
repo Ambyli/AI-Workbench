@@ -107,7 +107,8 @@ ai/classifier/
   jobs/
     payloads.py        the one payload shape (schema 3: a list of documents)
     runners.py         run_assess, run_reference (the job POST /references queues)
-    queue.py           ClassifierQueue + the registry / queue / sweeper singletons
+    queue.py           ClassifierQueue + the registry / queue / sweeper singletons, and each
+                       job type's progress STAGES
   bin/
     grounding_experiment.py   operator tool — runs where the model is
 ```
@@ -140,11 +141,13 @@ imports back.
 
 `POST /assess` returns **202 Accepted** immediately with a job ID. Poll
 `GET /jobs/{job_id}` until `phase` is `"completed"` or `"failed"`, then read
-the `result` field.
+the `result` field. While it runs, `metadata.progress` says how far along it
+is (see [§ Progress](#progress)).
 
 ```
 POST /assess  →  {"job_id": "abc123", "phase": "pending"}
                          ↓  poll
+GET /jobs/abc123  →  {"phase": "processing", "metadata": {"progress": {"percent": 43.2, …}}}
 GET /jobs/abc123  →  {"phase": "completed", "result": {...}, "metadata": {...}}
 ```
 
@@ -157,8 +160,9 @@ uses. The endpoint shapes and response fields are documented there.
 **Where the state lives.** Every row the classifier keeps is in one Postgres
 database, the compose-managed `classifier-db` container (`postgres:17-alpine`,
 on `ai_shared`, host port `PORT_CLASSIFIER_DB` = 5439): the job queue
-(`jobs`, `common.jobs.postgres.PostgresRegistry`), saved references
-(`reference_examples`) and one row per model request (`llm_calls`). The three
+(`jobs`, `common.jobs.postgres.PostgresRegistry`), each job's progress
+history (`job_progress`, see [§ Progress](#progress)), saved references
+(`reference_examples`) and one row per model request (`llm_calls`). The
 stores share one asyncpg pool (`db.py`, `CLASSIFIER_MAX_CONCURRENT +
 CLASSIFIER_MAX_LLM_CALLS + 8` connections). The database is the only store:
 with `CLASSIFIER_DB_HOST` unset, or the database unreachable, the service
@@ -244,6 +248,85 @@ generation spent thinking, and `classifier_llm_call_seconds_count` against
 `classifier_llm_calls_total{status="success"}` the retry overhead. vLLM's own
 `vllm:prefix_cache_queries` / `vllm:prefix_cache_hits` counters (tokens) give
 the server-wide hit rate across chat traffic too.
+
+### Progress
+
+Every job runs under a progress **gauge** (`common.jobs.progress.ProgressGauge`,
+wired in `jobs/queue.py`). The job is cut into stages, each worth a share of
+100, and moves through them at checkpoints:
+
+```
+percent = Σ weight of the completed stages  +  weight × index / length   (the running stage)
+```
+
+| Job type | Stages (weight) |
+|---|---|
+| `assess` | `load` "Loading documents" (10) → `units` "Evaluating criteria" (85) → `artifacts` "Writing artifacts" (5) |
+| `reference` | `load` (5) → `units` (70) → `artifacts` (5) → `finalize` "Building reference" (20) |
+
+- **`load`** — one step per document, credited as each finishes loading (in its worker thread).
+- **`units`** — one step per (criterion, item) unit, except an `llm` criterion
+  with `options.boxes`, which is **two**: scored, then located. The scoring
+  call's checkpoint (`"<name>: scored"`) is the first; the unit finishing is
+  the second — whether the box loop ran, was short-circuited by a low score,
+  or the page had no image. A unit skipped by its `depends_on` gate, or one
+  that errored, still counts in full, so the stage always reaches its length.
+  A `text` criterion with `scope: "document"` is one step per document.
+- **`artifacts`** — entered when the job starts writing its artifact directory.
+- **`finalize`** (reference jobs) — two steps: the page description, then the
+  reference files. A reference whose criteria were all supplied runs no units;
+  entering `finalize` completes `units` and `artifacts` on the way.
+
+`percent` never decreases, and stays below 100 until the job has actually
+finished — `100` means done, not "the last counter filled up".
+
+**The snapshot** is stored on the job row as `metadata.progress`, so
+`GET /jobs/{job_id}` shows it with no extra call:
+
+```json
+{
+  "state": "running", "percent": 59.6,
+  "stage": "units", "stage_title": "Evaluating criteria",
+  "label": "has a roof: scored", "index": 7, "length": 12,
+  "attempt": 1, "seq": 19, "updated_at": "2026-10-09T15:00:04.511204+00:00",
+  "stages": [{"name": "load", "title": "Loading documents", "weight": 10.0, "index": 1, "length": 1},
+             {"name": "units", "title": "Evaluating criteria", "weight": 85.0, "index": 7, "length": 12},
+             {"name": "artifacts", "title": "Writing artifacts", "weight": 5.0, "index": 0, "length": 0}]
+}
+```
+
+| `state` | When |
+|---|---|
+| `queued` | Written at submit (attempt 0, 0%), and again for a job a restart sent back to the queue |
+| `running` | A worker is on it |
+| `done` | Finished — `percent` is 100. Written before the job's `phase` turns `completed` |
+| `failed` | The job itself failed; `label` is `failed: <error>` and `percent` stays where it stopped. Written before `phase` turns `failed` |
+
+`index` / `length` are the running stage's; `label` is the last checkpoint's
+(`"<criterion> · item <n>"` when a unit finishes). The snapshot is written at
+most once per `CLASSIFIER_PROGRESS_FLUSH_INTERVAL_S` (default 1 s, floor
+0.2), only when something moved, in one transaction with the history rows —
+so a poll can be up to a second behind. The terminal `done` / `failed` is
+always written, before the job's result.
+
+**Attempts.** A job interrupted by a restart is requeued and run again from
+the start; each run is a new **attempt** (1, 2, …) with its own history, and
+attempt 0 holds the one `queued` event written at submit. The snapshot always
+describes the latest.
+
+**History.** Every checkpoint is also one row of `job_progress` in
+classifier-db (`job_id, attempt, seq, at, stage, label, idx, length, percent,
+state`), served page by page at
+[`GET /jobs/{job_id}/progress`](#get-jobsjob_idprogress) and readable from
+Trino as `postgres_classifier.public.job_progress`. Its `job_id` is a foreign
+key to `jobs` **`ON DELETE CASCADE`**: `DELETE /jobs/{job_id}` and the TTL
+sweeper take a job's history with its row — unlike `llm_calls`, which outlives
+the job on purpose.
+
+Every checkpoint also writes one log line, `[progress 59%] units 7/12: has a
+roof: scored`, so `docker logs classifier` shows a job's progress too.
+Progress never fails a job: a database error while writing it is logged
+(once per streak) and the job carries on.
 
 ### Deploying this version
 
@@ -2585,11 +2668,22 @@ curl http://localhost:4001/v1/classifier/jobs/abc123 -H "Authorization: Bearer s
   "created_at": "2026-07-30T15:00:00+00:00",
   "updated_at": "2026-07-30T15:00:07+00:00",
   "elapsed_seconds": 7.0,
-  "metadata": {"type": "assess", "request_id": "req-xyz"},
+  "metadata": {
+    "type": "assess", "request_id": "req-xyz",
+    "progress": {"state": "done", "percent": 100.0, "stage": "artifacts",
+                 "stage_title": "Writing artifacts", "label": "done", "index": 0,
+                 "length": 0, "attempt": 1, "seq": 23,
+                 "updated_at": "2026-07-30T15:00:07+00:00", "stages": ["…"]}
+  },
   "result": {"schema_version": 3, "…": "…"},
   "error": null
 }
 ```
+
+`metadata.progress` is the job's progress snapshot — `state` `queued` →
+`running` → `done` | `failed`, and `percent` — see [§ Progress](#progress).
+While the job runs it is the field to watch; the history is at
+`GET /jobs/{job_id}/progress`.
 
 `phase` values: `staging` → `pending` → `processing` → `completed` | `failed`
 (see § Async job pattern). A model outage does **not** fail the job — it fails
@@ -2597,6 +2691,48 @@ the criterion and the job completes with `complete: false`. `failed` means the
 job itself could not run: a thumbnail-sized page image, an undecodable file,
 or a payload from an older container (`metadata.type` `compare` / `locate`,
 or an assess payload that is not `schema: 3`), each with a message saying so.
+
+---
+
+### `GET /jobs/{job_id}/progress`
+
+The progress snapshot plus a page of the job's checkpoint history
+([§ Progress](#progress)).
+
+| Param | Effect |
+|---|---|
+| `after` | Only events with `seq` greater than this (default 0 — from the start). Pass the previous page's `next_after` to page on |
+| `limit` | Events per page, default 200, clamped to 1–1000 |
+| `attempt` | Which run's history — default the latest; `0` is the `queued` event written at submit |
+
+```bash
+curl http://localhost:4001/v1/classifier/jobs/abc123/progress -H "Authorization: Bearer sk-1234" \
+  | jq '{phase, percent: .progress.percent, events: [.events[] | {seq, stage, index, length, percent, label}]}'
+```
+
+```json
+{
+  "job_id": "abc123",
+  "phase": "processing",
+  "progress": {"state": "running", "percent": 17.1, "stage": "units", "…": "…"},
+  "attempt": 1,
+  "events": [
+    {"seq": 1, "at": "2026-10-09T15:00:00.104511+00:00", "stage": null, "label": "started",
+     "index": 0, "length": 0, "percent": 0.0, "state": "running"},
+    {"seq": 2, "at": "2026-10-09T15:00:00.981200+00:00", "stage": "load", "label": "page.png",
+     "index": 1, "length": 1, "percent": 10.0, "state": "running"},
+    {"seq": 3, "at": "2026-10-09T15:00:04.511204+00:00", "stage": "units", "label": "has a roof: scored",
+     "index": 1, "length": 12, "percent": 17.1, "state": "running"}
+  ],
+  "next_after": 3
+}
+```
+
+`progress` is the same object as `GET /jobs/{job_id}`'s `metadata.progress`
+(`null` for a job that never ran under a gauge). `events` are oldest first;
+`next_after` is the last `seq` returned (`after` when the page is empty).
+**404** when the job is unknown — including after `DELETE /jobs/{job_id}` or
+the TTL sweeper, which take the history with the row.
 
 ---
 
@@ -2612,8 +2748,9 @@ curl "http://localhost:4001/v1/classifier/jobs?limit=10" -H "Authorization: Bear
 
 ### `DELETE /jobs/{job_id}`
 
-Delete a job record, **its artifact directory** (text layers included) **and
-its model-usage rows** (`llm_calls`). Returns `204 No Content`; **404** when
+Delete a job record, **its artifact directory** (text layers included), **its
+model-usage rows** (`llm_calls`) **and its progress history** (`job_progress`,
+by `ON DELETE CASCADE`). Returns `204 No Content`; **404** when
 the job is unknown. Both removals are wired in as
 `common.jobs.router.build_router`'s `on_delete` hook, so a deleted row can
 never leave files that nothing points at. The hook runs before the row check:

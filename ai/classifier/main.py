@@ -23,7 +23,9 @@ Every endpoint handler lives in ``api/``:
                        examples, each built by a "reference" job
     api.usage          GET /jobs/{job_id}/usage, GET /usage — the model
                        calls each job made (llm_calls), which outlive the job
-    common.jobs.router GET /jobs, GET /jobs/{id}, DELETE /jobs/{id}
+    common.jobs.router GET /jobs, GET /jobs/{id}, DELETE /jobs/{id}, and
+                       GET /jobs/{id}/progress (build_progress_router) — how
+                       far along a job is, and its checkpoint history
 
 /locate and /assess/compare were removed and answer 404 like any unknown
 route; /locate's job is ``score: false`` on a criterion of /assess.
@@ -48,7 +50,10 @@ Overall request flow for /assess:
      CLASSIFIER_OCR_WORKERS across the process), aggregate each criterion
      (pages → documents), weigh per item and overall, and store the
      artifacts.
-  7. Caller polls GET /jobs/{job_id} until phase="completed" or "failed".
+  7. Caller polls GET /jobs/{job_id} until phase="completed" or "failed" —
+     ``metadata.progress`` says how far along it is meanwhile (the job's
+     ``common.jobs.progress`` gauge, flushed about once a second), and
+     GET /jobs/{job_id}/progress pages through its checkpoint history.
 
 The jobs table IS the queue — see jobs/queue.py and common.jobs.worker — so up
 to CLASSIFIER_MAX_CONCURRENT jobs run at once and pending work survives
@@ -77,7 +82,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from prometheus_fastapi_instrumentator import Instrumentator
 
-from common.jobs.router import build_router
+from common.jobs.router import build_progress_router, build_router
 
 from api import artifacts as artifacts_api
 from api import assess, introspection, references as references_api
@@ -127,13 +132,17 @@ async def lifespan(app: FastAPI):
       - Open the Postgres pool (``database.init()``). No CLASSIFIER_DB_HOST,
         or a database that refuses the connection, fails startup here, with
         the reason in the log — the service has no other store.
-      - Create the ``jobs``, ``reference_examples`` and ``llm_calls`` tables
-        (idempotent), all in the one classifier-db database.
+      - Create the ``jobs``, ``job_progress``, ``reference_examples`` and
+        ``llm_calls`` tables (idempotent), all in the one classifier-db
+        database — ``job_progress`` right after ``jobs``, whose rows its
+        foreign key references (``ON DELETE CASCADE``: a job's progress
+        history goes with its row, through DELETE /jobs/{id} or the sweeper).
       - Reconcile references: a ``pending`` one whose creation job is gone or
         finished without readying it is marked ``failed`` (its job may have
         expired, or failed while no process was there to record it).
       - ``queue.start()``: requeue jobs the previous process left in
-        "processing" / "staging", sweep orphan payload files, and start
+        "processing" / "staging" (and put their progress snapshot back to
+        ``queued``), sweep orphan payload files, and start
         CLASSIFIER_MAX_CONCURRENT worker tasks.
       - ``sweeper.start()``: prune artifact directories and job rows past
         JOB_TTL_HOURS once immediately (a container that was down through a
@@ -151,6 +160,7 @@ async def lifespan(app: FastAPI):
     """
     await database.init()
     await jobs_registry.init()
+    await queue.progress.init()
     await reference_registry.init()
     await llm_usage.usage_store.init()
     failed = await reconcile_references(jobs_registry)
@@ -231,6 +241,12 @@ app.include_router(artifacts_api.build_artifacts_router(jobs_registry))
 # GET /jobs/{id}/usage (three segments deep, like the artifact routes) and
 # GET /usage — what each job's model calls cost.
 app.include_router(usage_api.build_usage_router(jobs_registry))
+
+# GET /jobs/{id}/progress — the progress snapshot (also on GET /jobs/{id} as
+# metadata.progress) plus a page of the job's checkpoint history. Three
+# segments deep as well. No on_delete wiring: job_progress rows cascade with
+# the job row.
+app.include_router(build_progress_router(jobs_registry, queue.progress))
 
 # The endpoints themselves: /assess, /references, then the introspection
 # routes and /health.

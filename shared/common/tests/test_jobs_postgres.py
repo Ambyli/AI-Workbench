@@ -41,10 +41,12 @@ class _Meta(BaseModel):
 
 @pytest_asyncio.fixture
 async def registry():
-    """Fresh registry per test. Drops any existing ``jobs`` table first."""
+    """Fresh registry per test. Drops any existing ``jobs`` table first —
+    ``CASCADE`` because test_jobs_progress_postgres.py's ``job_progress``
+    table references it in the same database."""
     conn = await asyncpg.connect(_DSN)
     try:
-        await conn.execute("DROP TABLE IF EXISTS jobs")
+        await conn.execute("DROP TABLE IF EXISTS jobs CASCADE")
     finally:
         await conn.close()
 
@@ -330,7 +332,7 @@ async def test_constructor_needs_exactly_one_of_dsn_and_pool() -> None:
 async def test_external_pool_is_used_and_never_closed() -> None:
     conn = await asyncpg.connect(_DSN)
     try:
-        await conn.execute("DROP TABLE IF EXISTS jobs")
+        await conn.execute("DROP TABLE IF EXISTS jobs CASCADE")
     finally:
         await conn.close()
 
@@ -375,7 +377,7 @@ async def test_external_pool_may_be_any_acquire_facade() -> None:
 
     conn = await asyncpg.connect(_DSN)
     try:
-        await conn.execute("DROP TABLE IF EXISTS jobs")
+        await conn.execute("DROP TABLE IF EXISTS jobs CASCADE")
     finally:
         await conn.close()
 
@@ -395,7 +397,7 @@ async def test_result_type_json_keeps_key_order() -> None:
     verbatim, so a result whose key order means something survives."""
     conn = await asyncpg.connect(_DSN)
     try:
-        await conn.execute("DROP TABLE IF EXISTS jobs")
+        await conn.execute("DROP TABLE IF EXISTS jobs CASCADE")
     finally:
         await conn.close()
 

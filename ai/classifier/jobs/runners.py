@@ -16,6 +16,14 @@ registry or the worker pool — that is ``jobs.queue``.
                       its files (``references.render``), mark it ``ready``.
     _load()         — one document's base64 → Document, run in a worker thread.
 
+Progress (``common.jobs.progress``, the gauge ``jobs.queue.handle_job`` runs
+the runner under): ``run_assess`` plans one "load" step per document and each
+``_load`` credits its own from the worker thread; ``_build`` has one "load"
+step, then plans "finalize" as two — the description, then the files — with
+the pipeline's "units" / "artifacts" in between (``analysis.scheduler`` /
+``analysis.pipeline``). With no gauge (a test calling a runner directly)
+every progress call is a no-op.
+
 Loading is off the event loop: a PDF renders every page at
 CLASSIFIER_PDF_RENDER_DPI and an image is decoded and EXIF-rotated, which is
 seconds of CPU for a large upload — and on the loop, every other job's model
@@ -59,6 +67,7 @@ import base64
 from dataclasses import replace
 from typing import Any, Optional
 
+from common.jobs import progress
 from common.vision import PageGeometry, Region
 
 from analysis import analyze_document, load_document_bytes, load_document_page
@@ -96,6 +105,9 @@ async def run_assess(payload: dict[str, Any]) -> dict:
             "a list of documents, every page an item); resubmit it"
         )
     criteria = [CriterionInput.model_validate(c) for c in payload["criteria"]]
+    # One "load" step per document, credited from the worker thread as each
+    # finishes (the thread inherits the job's gauge with its context).
+    progress.plan("load", len(payload["documents"]))
     loaded = await asyncio.gather(
         *(asyncio.to_thread(_load, d) for d in payload["documents"]),
         return_exceptions=True,
@@ -114,16 +126,18 @@ async def run_assess(payload: dict[str, Any]) -> dict:
 
 
 def _load(d: dict[str, Any]):
-    """One stored document → ``Document``. Blocking; called via to_thread."""
-    return load_document_bytes(
-        base64.b64decode(d["file_b64"]),
-        d.get("filename"),
-        d.get("content_type"),
-        keep_source=True,  # a native PDF's text hits need the file re-opened
-        # The count read at submit; MAX_ITEMS is the ceiling it passed.
-        max_pages=int(d.get("pages") or MAX_ITEMS),
-        warnings=d.get("warnings"),
-    )
+    """One stored document → ``Document``. Blocking; called via to_thread.
+    One "load" step, credited however the load ends."""
+    with progress.task("load", label=d.get("filename") or d.get("kind") or "document"):
+        return load_document_bytes(
+            base64.b64decode(d["file_b64"]),
+            d.get("filename"),
+            d.get("content_type"),
+            keep_source=True,  # a native PDF's text hits need the file re-opened
+            # The count read at submit; MAX_ITEMS is the ceiling it passed.
+            max_pages=int(d.get("pages") or MAX_ITEMS),
+            warnings=d.get("warnings"),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +180,7 @@ async def run_reference(payload: dict[str, Any]) -> dict:
 
 
 async def _build(payload: dict[str, Any], ref: Any, job_id: Optional[str]) -> dict:
+    progress.plan("load", 1)
     doc = await asyncio.to_thread(_load_page, payload["document"], int(payload.get("page") or 0))
     page = doc.pages[0]
     criteria = [CriterionInput.model_validate(c) for c in payload["criteria"]]
@@ -186,6 +201,10 @@ async def _build(payload: dict[str, Any], ref: Any, job_id: Optional[str]) -> di
         "run_reference: %s — %d criteria, %d run through the pipeline",
         ref.id, len(criteria), len(run),
     )
+    # Two steps: the description, then the files. Entering this stage also
+    # completes "units" / "artifacts" — which is all a fully supplied
+    # reference (an empty `run`) ever does with them.
+    progress.plan("finalize", 2)
 
     working = working_image_of(page)
     geometry = replace(page_geometry(doc, page, working), page=0)
@@ -196,6 +215,7 @@ async def _build(payload: dict[str, Any], ref: Any, job_id: Optional[str]) -> di
 
     description: Any = UNSET
     description_source: Any = UNSET
+    described = "description given" if ref.description is not None else "description off"
     if ref.description is None and REFERENCE_DESCRIBE:
         try:
             description = await describe_page(
@@ -203,9 +223,12 @@ async def _build(payload: dict[str, Any], ref: Any, job_id: Optional[str]) -> di
             )
             description_source = "model"
             reference_describe_total.labels(outcome="ok").inc()
+            described = "page described"
         except llm_client.LLMCallError as exc:
             warnings.append(f"the page could not be described ({exc}); it has no description")
             reference_describe_total.labels(outcome="failed").inc()
+            described = "page could not be described"
+    progress.checkpoint(described, stage="finalize", logger=logger)
 
     record = {
         "schema": RECORD_SCHEMA,
@@ -226,6 +249,7 @@ async def _build(payload: dict[str, Any], ref: Any, job_id: Optional[str]) -> di
         render_files, page.image_bgr, working, geometry, record_criteria
     )
     await asyncio.to_thread(_write_files, ref.id, files, record, geometry)
+    progress.checkpoint("reference files written", stage="finalize", logger=logger)
     if not await reference_registry.finish(
         ref.id, record, description=description, description_source=description_source
     ):
@@ -238,15 +262,17 @@ async def _build(payload: dict[str, Any], ref: Any, job_id: Optional[str]) -> di
 
 
 def _load_page(d: dict[str, Any], page: int):
-    """The reference's one page → a one-page Document. Blocking."""
-    return load_document_page(
-        base64.b64decode(d["file_b64"]),
-        d.get("filename"),
-        d.get("content_type"),
-        page=page,
-        keep_source=True,  # a native PDF's text hits need the file re-opened
-        warnings=d.get("warnings"),
-    )
+    """The reference's one page → a one-page Document. Blocking. Its one
+    "load" step."""
+    with progress.task("load", label=d.get("filename") or "page"):
+        return load_document_page(
+            base64.b64decode(d["file_b64"]),
+            d.get("filename"),
+            d.get("content_type"),
+            page=page,
+            keep_source=True,  # a native PDF's text hits need the file re-opened
+            warnings=d.get("warnings"),
+        )
 
 
 def _criteria_to_run(

@@ -51,6 +51,7 @@ async def _make_queue():
     registry = PostgresRegistry(pool=database)
     await registry.init()
     q = queue_module.ClassifierQueue(registry)
+    await q.progress.init()  # handle_job runs every job under a progress gauge
     # Keep this test's payloads away from the session-wide PAYLOAD_DIR.
     q.payloads = type(q.payloads)(str(tmp / "payloads"))
     return q, registry

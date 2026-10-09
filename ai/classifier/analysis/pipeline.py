@@ -30,6 +30,11 @@ siblings:
                          its only caller in the service (tests call it with a
                          single Document, which is a one-item list).
 
+Progress: when ``jobs.queue`` runs the job under a gauge
+(``common.jobs.progress``), step 3 is the "units" stage (planned and counted
+by ``analysis.scheduler``) and step 6 enters "artifacts"; outside a job every
+progress call is a no-op.
+
 Step 6 only reads outcomes and ADDS files and keys, so storing regions can
 never change a score or a verdict. It always runs when there is a job id —
 regions are no longer opt-in; the rendered layers are produced lazily by the
@@ -45,6 +50,7 @@ import asyncio
 from typing import Any, Optional, Union
 
 from common.documents import Document, TextLayer
+from common.jobs import progress
 
 from analysis.aggregate import Aggregated, aggregate_criterion
 from analysis.context import (
@@ -192,6 +198,11 @@ async def analyze_document(
     detector_used = bool(detector_stats.calls or detector_stats.errors)
     artifacts: Optional[dict] = None
     per_criterion_artifacts: dict[str, Optional[dict]] = {}
+    if job_id:
+        # Enter the job gauge's "artifacts" stage (completing "units"); it is
+        # finished by the gauge's final flush when the job returns. n=0: a
+        # stage marker, not a count.
+        progress.checkpoint("writing artifacts", stage="artifacts", n=0, logger=logger)
     if job_id and job_references is not None:
         # Before the manifest, so it lists the file; JSON, so the byte cap
         # never drops it.

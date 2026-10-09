@@ -10,6 +10,11 @@ and a sync route just calls the sync registry directly.
 We build two internal router variants (sync and async) and pick based on
 whether the registry's ``get`` method is a coroutine function.
 
+``build_progress_router`` is the separate, opt-in ``GET /jobs/{job_id}/progress``
+for a service whose jobs carry a ``common.jobs.progress.ProgressGauge``: the
+snapshot from the job row plus a page of the history a
+``PostgresProgressStore`` keeps.
+
 Optional dep: ``fastapi``. Consumers who don't want the pre-built router
 just skip importing this module.
 """
@@ -20,7 +25,7 @@ import inspect
 import logging
 from typing import Any, Callable, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 
 from .model import JobBase, JobsListResponse
 
@@ -197,3 +202,70 @@ def _register_async(
                 raise HTTPException(
                     status_code=404, detail=f"no job {job_id!r}"
                 )
+
+
+# ── Progress ──────────────────────────────────────────────────────────────
+# The largest page of history one request may ask for. A job's history is a
+# few rows per unit of work, so a long job can hold thousands; past this the
+# caller pages with ``after``.
+PROGRESS_MAX_LIMIT = 1000
+
+
+def build_progress_router(
+    registry: Any,
+    store: Any,
+    *,
+    prefix: str = "/jobs",
+    tags: list[str] | None = None,
+) -> APIRouter:
+    """Return an ``APIRouter`` with ``GET {prefix}/{job_id}/progress``.
+
+    ``store`` is a ``common.jobs.progress_postgres.PostgresProgressStore``
+    (anything with an async ``history(job_id, *, attempt, after, limit)``);
+    ``registry`` answers whether the job exists and supplies its phase and
+    ``metadata.progress`` snapshot — sync or async, like ``build_router``.
+
+    Query parameters:
+        ``after``   — only events with ``seq`` greater than this (paging; 0 = from the start).
+        ``limit``   — events per page, default 200, clamped to 1..1000.
+        ``attempt`` — which run's history (default: the latest; 0 is the queued event).
+
+    Returns ``{job_id, phase, progress, attempt, events, next_after}`` —
+    ``progress`` is the snapshot (``null`` for a job that never had a gauge),
+    ``events`` the history page oldest first, ``next_after`` the ``after`` to
+    pass for the next page. **404** when the job is unknown — its history
+    went with it (``ON DELETE CASCADE``).
+
+    Three path segments deep, so it can never collide with
+    ``build_router``'s ``{prefix}/{job_id}``, whatever the include order.
+    """
+    router = APIRouter(prefix=prefix, tags=tags or ["jobs"])
+
+    @router.get("/{job_id}/progress")
+    async def job_progress(
+        job_id: str,
+        after: int = Query(0, description="Only events with seq greater than this"),
+        limit: int = Query(200, description=f"Events per page, clamped to 1..{PROGRESS_MAX_LIMIT}"),
+        attempt: Optional[int] = Query(None, description="Which run (default: the latest)"),
+    ) -> dict:
+        job = registry.get(job_id)
+        if inspect.isawaitable(job):
+            job = await job
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"no job {job_id!r}")
+        history = await store.history(
+            job_id,
+            attempt=attempt,
+            after=max(0, after),
+            limit=max(1, min(limit, PROGRESS_MAX_LIMIT)),
+        )
+        return {
+            "job_id": job_id,
+            "phase": job.phase,
+            "progress": (job.metadata or {}).get("progress"),
+            "attempt": history["attempt"],
+            "events": history["events"],
+            "next_after": history["next_after"],
+        }
+
+    return router

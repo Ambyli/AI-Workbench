@@ -32,7 +32,7 @@
       "key": "jobId",
       "value": "",
       "type": "string",
-      "description": "job_id returned by POST /assess. Fill in after submitting to run GET /jobs/:jobId, DELETE /jobs/:jobId, and every request in the Artifacts folder. `phase` values progress staging → pending → processing → completed | failed."
+      "description": "job_id returned by POST /assess. Fill in after submitting to run GET /jobs/:jobId, GET /jobs/:jobId/progress, DELETE /jobs/:jobId, and every request in the Artifacts folder. `phase` values progress staging → pending → processing → completed | failed."
     },
     {
       "key": "artifactName",
@@ -585,7 +585,54 @@
             }
           ]
         },
-        "description": "Poll one job. `phase` progresses staging → pending → processing → completed | failed. When `completed`, `result` is the assessment:\n\nResult shape (GET /jobs/:jobId → `result`, `schema_version: 3`):\n  `{schema_version, documents, items, assessment: {overall_score, overall_verdict, complete, weighted_score_breakdown, per_criterion_scores}, verdict, page_geometry, detector, artifacts, references, request, usage}`\nEvery page of every document is one ITEM, numbered globally in request order. `documents[]` is `{index, filename, kind, pages, items, document_info}` (document_info: content_type, size_bytes, has_image, native_text_chars, ocr.layers per item, ocr.document_layers, llm_text_char_budget). `items[]` is `{item, document, page, filename, overall_score, overall_verdict, complete}` — each item's own weighted score. `page_geometry` is a list, one entry per item (null sizes for a .txt/.docx item); `page` there, a region's `page` and the `p{n}` layer prefix all mean the item.\nEvery entry of `per_criterion_scores` has the SAME keys — the AGGREGATED answer: `status` (ok | error | skipped), `type`, `method`, `scored`, `score`, `verdict`, `confidence`, `reason`, `detail`, `regions` (the union over every item, capped at CLASSIFIER_INLINE_REGIONS_MAX with `regions_truncated`), `artifacts` (`items`: per item, that page's layer URLs filtered to the criterion and its loop `attempts`; `text`: one link per text layer its units read), `localization` (llm: the loop's record — merged across items), `options_used` (with `aggregate` resolved), `error`, `complete` (false when any of its units errored), `aggregate_used` ({pages, documents}), and `items` — one entry per unit: `{item, document, page, status, score, verdict, confidence, reason, detail, error, regions (a COUNT), text_layer, localization (llm)}`.\nThe overall score and verdict are weighed over the AGGREGATED criterion results; `complete` is false when any scored criterion is incomplete, and `overall_score` / `overall_verdict` are then null with the partial score in `weighted_score_breakdown` (`partial: true`). `score: false`, skipped and errored criteria never count toward the score.\n`usage` is what the job's vision-model requests cost: `{calls, errors, seconds, prompt_tokens, cached_tokens, completion_tokens, reasoning_tokens, total_tokens, models, first_call_at, last_call_at, usage_url}` — the per-call rows are at GET /jobs/:jobId/usage.\n\nA model outage does NOT fail the job — it fails the unit (`status: \"error\"` on that item) and the job completes with `complete: false`. `failed` means the job itself could not run (a thumbnail-sized page image, an undecodable file, a payload from an older container — anything but `schema: 3`). **404** for an unknown job id. See API.md § `GET /jobs/{job_id}`."
+        "description": "Poll one job. `phase` progresses staging → pending → processing → completed | failed. While it runs, `metadata.progress` says how far along it is: `{state, percent, stage, stage_title, label, index, length, attempt, seq, updated_at, stages}` — `state` queued → running → done | failed, `percent` 0-100 (100 only once done; the terminal state is written before the phase turns completed / failed), flushed about once a second (CLASSIFIER_PROGRESS_FLUSH_INTERVAL_S). Stages: assess = load (10) → units (85) → artifacts (5); reference = load (5) → units (70) → artifacts (5) → finalize (20). The checkpoint history is GET /jobs/:jobId/progress. See API.md § Progress.\n\nWhen `completed`, `result` is the assessment:\n\nResult shape (GET /jobs/:jobId → `result`, `schema_version: 3`):\n  `{schema_version, documents, items, assessment: {overall_score, overall_verdict, complete, weighted_score_breakdown, per_criterion_scores}, verdict, page_geometry, detector, artifacts, references, request, usage}`\nEvery page of every document is one ITEM, numbered globally in request order. `documents[]` is `{index, filename, kind, pages, items, document_info}` (document_info: content_type, size_bytes, has_image, native_text_chars, ocr.layers per item, ocr.document_layers, llm_text_char_budget). `items[]` is `{item, document, page, filename, overall_score, overall_verdict, complete}` — each item's own weighted score. `page_geometry` is a list, one entry per item (null sizes for a .txt/.docx item); `page` there, a region's `page` and the `p{n}` layer prefix all mean the item.\nEvery entry of `per_criterion_scores` has the SAME keys — the AGGREGATED answer: `status` (ok | error | skipped), `type`, `method`, `scored`, `score`, `verdict`, `confidence`, `reason`, `detail`, `regions` (the union over every item, capped at CLASSIFIER_INLINE_REGIONS_MAX with `regions_truncated`), `artifacts` (`items`: per item, that page's layer URLs filtered to the criterion and its loop `attempts`; `text`: one link per text layer its units read), `localization` (llm: the loop's record — merged across items), `options_used` (with `aggregate` resolved), `error`, `complete` (false when any of its units errored), `aggregate_used` ({pages, documents}), and `items` — one entry per unit: `{item, document, page, status, score, verdict, confidence, reason, detail, error, regions (a COUNT), text_layer, localization (llm)}`.\nThe overall score and verdict are weighed over the AGGREGATED criterion results; `complete` is false when any scored criterion is incomplete, and `overall_score` / `overall_verdict` are then null with the partial score in `weighted_score_breakdown` (`partial: true`). `score: false`, skipped and errored criteria never count toward the score.\n`usage` is what the job's vision-model requests cost: `{calls, errors, seconds, prompt_tokens, cached_tokens, completion_tokens, reasoning_tokens, total_tokens, models, first_call_at, last_call_at, usage_url}` — the per-call rows are at GET /jobs/:jobId/usage.\n\nA model outage does NOT fail the job — it fails the unit (`status: \"error\"` on that item) and the job completes with `complete: false`. `failed` means the job itself could not run (a thumbnail-sized page image, an undecodable file, a payload from an older container — anything but `schema: 3`). **404** for an unknown job id. See API.md § `GET /jobs/{job_id}`."
+      },
+      "response": []
+    },
+    {
+      "name": "GET /jobs/:jobId/progress",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{litellm}}/v1/classifier/jobs/:jobId/progress?after=0&limit=200",
+          "host": [
+            "{{litellm}}"
+          ],
+          "path": [
+            "v1",
+            "classifier",
+            "jobs",
+            ":jobId",
+            "progress"
+          ],
+          "query": [
+            {
+              "key": "after",
+              "value": "0",
+              "description": "Only events with seq greater than this. 0 = from the start; pass the previous page's `next_after` to page on."
+            },
+            {
+              "key": "limit",
+              "value": "200",
+              "description": "Events per page, default 200, clamped to 1-1000."
+            },
+            {
+              "key": "attempt",
+              "value": "",
+              "disabled": true,
+              "description": "Which run's history. Default the latest; 0 is the `queued` event written at submit; a job requeued after a restart has attempts 1, 2, …"
+            }
+          ],
+          "variable": [
+            {
+              "key": "jobId",
+              "value": "",
+              "description": "job_id returned by POST /assess or POST /references (202 body). Paste it here, or set the collection variable `jobId`."
+            }
+          ]
+        },
+        "description": "How far along a job is, and how it got there. Returns `{job_id, phase, progress, attempt, events, next_after}`.\n\n`progress` is the job's progress snapshot — the same object GET /jobs/:jobId carries as `metadata.progress`: `{state (queued | running | done | failed), percent, stage, stage_title, label, index, length, attempt, seq, updated_at, stages: [{name, title, weight, index, length}]}` (`null` for a job that never ran under a gauge). percent = Σ weight of the completed stages + weight × index / length of the running one; it never decreases and is 100 only once the job is done.\n\n`events` is one page of the attempt's checkpoint history, oldest first: `{seq, at, stage, label, index, length, percent, state}` — `started`, one per document loaded, one per (criterion, item) unit finished (`<criterion> · item <n>`), `<criterion>: scored` for an llm criterion with options.boxes (its unit is two steps: scored, then located), `writing artifacts`, and `done` / `failed: <error>`. `next_after` is the last seq returned — pass it as `after` for the next page.\n\nThe history rows (`job_progress` in classifier-db, also postgres_classifier.public.job_progress in Trino) cascade with the job row: **404** for an unknown job, including one removed by DELETE /jobs/:jobId or the TTL sweeper. See API.md § `GET /jobs/{job_id}/progress` and § Progress."
       },
       "response": []
     },

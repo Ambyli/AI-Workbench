@@ -27,8 +27,8 @@
 #
 # ALL configuration is read from the root .env with a SUPABASE_ prefix and
 # mapped onto upstream's unprefixed container env names here. Upstream's raw
-# names collide with this repo's shared .env (MINIO_ROOT_USER/PASSWORD belong
-# to Trino; POSTGRES_* is generic). Edit .env, not this file.
+# names are generic (POSTGRES_*, JWT_SECRET, ANON_KEY, …) and would collide
+# with other subsystems in this repo's shared .env. Edit .env, not this file.
 #
 # Analytics (Logflare + Vector) is NOT enabled: upstream ships it as a layered
 # override and Vector needs /var/run/docker.sock, which only sandbox-runner is
@@ -399,8 +399,9 @@ services:
 
   # ── Storage: the object store API ───────────────────────────────────────
   # STORAGE_BACKEND=file — objects live on the supabase_storage named volume.
-  # The MinIO/S3 backend is an upstream override we do not use (and MINIO_ROOT_*
-  # in this repo's .env belongs to Trino, so it must never be borrowed here).
+  # The S3 backend (with its own bundled object store) is an upstream override
+  # we do not use. Trino's lake-s3 and its LAKE_S3_* credentials in this repo's
+  # .env belong to the warehouse and must never be borrowed here.
   #
   # Tighter than upstream: waits for rest + imgproxy to be HEALTHY rather than
   # merely started, so the first upload can't race an unready PostgREST.

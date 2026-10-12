@@ -1,14 +1,16 @@
 """One-shot: seed the Iceberg warehouse with a demo table so the
 end-to-end verification steps in TRINO.md have something to hit.
 
-Run once after `docker compose -f ai/trino/docker-compose.trino.yml up -d`:
+Run once after `make up trino`, from the repo root. This file is not baked
+into the trino-mcp image, so pipe it in and run it with that image's uv
+environment (which has ``common.trino``):
 
-    docker compose -f ai/trino/docker-compose.trino.yml exec trino-mcp \\
-        python /app/ai/trino/bin/init_warehouse.py
+    docker compose -f ai/trino/docker-compose.trino.yml --env-file .env -p ai-trino \\
+        exec -T trino-mcp uv run --no-sync python - < ai/trino/bin/init_warehouse.py
 
 Creates ``iceberg.demo`` schema (if missing) and ``iceberg.demo.events``
 table with three synthetic rows. Idempotent — re-runs replace the rows,
-not the table, so the Parquet layout on MinIO stays stable across
+not the table, so the Parquet layout on lake-s3 stays stable across
 sessions.
 """
 from __future__ import annotations

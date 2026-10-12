@@ -6,12 +6,15 @@
 #   1. Postgres JDBC driver — HMS reads/writes its own catalog tables in
 #      hive-metastore-db via JDBC. Not bundled in the base image.
 #   2. hadoop-aws + aws-java-sdk-bundle — HMS needs the s3a filesystem
-#      client so it can validate that Iceberg manifest paths on MinIO
-#      exist at CREATE TABLE time. Without these jars, `CREATE TABLE …
+#      client so it can validate that Iceberg manifest paths on lake-s3
+#      (RustFS) exist at CREATE TABLE time. Without these jars, `CREATE TABLE …
 #      WITH (location='s3://warehouse/…')` fails with
 #      java.io.IOException: No FileSystem for scheme "s3".
 #
-# Runtime config lives in metastore-site.xml (mounted alongside).
+# Runtime config lives in metastore-site.xml — COPYed in below, and also
+# bind-mounted read-only over that path by docker-compose.trino.yml so a
+# config edit needs a recreate, not a rebuild. Keep the COPY so a fresh
+# build matches what the mount provides.
 
 FROM apache/hive:4.0.0
 

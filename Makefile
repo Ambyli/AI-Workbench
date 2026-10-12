@@ -24,7 +24,7 @@ $(eval $(call service,searxng,searxng))
 $(eval $(call service,sandbox,sandbox-db sandbox-egress sandbox-proxy sandbox-runner))
 $(eval $(call service,n8n,n8n-db n8n))
 $(eval $(call service,open-terminal,open-terminal))
-$(eval $(call service,trino,hive-metastore-db hive-metastore minio minio-init trino-auth-init trino-coordinator trino-mcp superset-db superset))
+$(eval $(call service,trino,hive-metastore-db hive-metastore lake-s3 lake-s3-init trino-auth-init trino-coordinator trino-mcp superset-db superset))
 $(eval $(call service,semantic-router,vllm-sr-models-init vllm-sr-router vllm-sr-envoy))
 $(eval $(call service,supabase,supabase-db supavisor auth rest realtime imgproxy storage meta studio supabase-api functions))
 
@@ -86,7 +86,7 @@ network:
 	docker network create ai_shared 2>/dev/null || true
 	# terminal_net is deliberately NOT ai_shared: it joins only open-terminal
 	# and openwebui, keeping the model-driven shell away from litellm,
-	# roofix-db, sandbox-runner (docker.sock), minio and n8n. Plain bridge,
+	# roofix-db, sandbox-runner (docker.sock), lake-s3 and n8n. Plain bridge,
 	# not internal — open-terminal needs a gateway for pip/apt, narrowed by
 	# OPEN_TERMINAL_ALLOWED_DOMAINS. See ai/open-terminal/OPEN_TERMINAL.md.
 	docker network create terminal_net 2>/dev/null || true

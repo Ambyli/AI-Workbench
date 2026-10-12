@@ -75,7 +75,7 @@ docker exec open-terminal grep -n 'sudo -E capsh' /app/entrypoint.sh
 `open-terminal` is deliberately **not** on `ai_shared`. It runs code a model wrote, on behalf of whoever is chatting — the same trust posture as the sandbox subsystem. From `ai_shared` that shell could reach:
 
 - `roofix-db`, `sandbox-db`, `n8n-db`, `hive-metastore-db`, `superset-db` — several on dev-default credentials
-- `minio` on its dev-default root credentials, i.e. the whole Iceberg warehouse
+- `lake-s3` on its dev-default root credentials, i.e. the whole Iceberg warehouse
 - `litellm` — every model and every virtual key's surface
 - `n8n` — the encrypted credential store for every automation
 - `sandbox-runner` — which mounts `/var/run/docker.sock`, i.e. root on the host

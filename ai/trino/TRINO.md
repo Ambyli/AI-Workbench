@@ -1,12 +1,13 @@
 # Trino data lake
 
-Trino coordinator + Hive Metastore + MinIO + Superset + a FastMCP shim,
+Trino coordinator + Hive Metastore + an S3 object store (`lake-s3`,
+RustFS) + Superset + a FastMCP shim,
 brought up by a single compose file. Federates SQL over the
 Postgres instances this repo runs (`litellm_db`, `roofix-db`, `sandbox-db`,
 `supabase-db`, and the classifier's `classifier-db` — jobs, references and
 per-call model usage, `postgres_classifier`),
 the off-box Phoenix production Postgres (`postgres_phoenix`, read-only
-role, TLS required), plus an Iceberg lakehouse on MinIO. Consumers:
+role, TLS required), plus an Iceberg lakehouse on `lake-s3`. Consumers:
 
 - **Models** — LiteLLM registers `trino-mcp:8080/mcp` alongside the
   Phoenix MCP, so any tool-calling model can run federated SQL. Claude
@@ -24,12 +25,14 @@ docker network create ai_shared    # once, if you haven't already
 # .env must have TRINO_JDBC_USERS (user:password[,…]) and TRINO_SHARED_SECRET
 # (openssl rand -hex 32) set — compose refuses to start without them.
 docker compose -f ai/trino/docker-compose.trino.yml up -d --build
-# seed the Iceberg lakehouse with a demo table
-docker compose -f ai/trino/docker-compose.trino.yml exec trino-mcp \
-    python /app/ai/trino/bin/init_warehouse.py
+# seed the Iceberg lakehouse with a demo table — the script is not baked
+# into the trino-mcp image, so it is piped in and run with that image's uv
+# environment (which has `common.trino`)
+docker compose -f ai/trino/docker-compose.trino.yml --env-file .env -p ai-trino \
+    exec -T trino-mcp uv run --no-sync python - < ai/trino/bin/init_warehouse.py
 ```
 
-Rough startup order: `hive-metastore-db` → `minio` → `minio-init`
+Rough startup order: `hive-metastore-db` → `lake-s3` → `lake-s3-init`
 (one-shot) → `hive-metastore` → `trino-auth-init` (one-shot) →
 `trino-coordinator` → `trino-mcp` / `superset`. The compose file's `depends_on: service_healthy` /
 `service_completed_successfully` conditions handle it; on a cold boot
@@ -42,8 +45,8 @@ the whole stack takes ~90 s.
 | Trino web UI | `https://<host>:8013/ui/` | Self-signed cert; log in with a `TRINO_JDBC_USERS` account |
 | Trino JDBC | `jdbc:trino://<host>:8013?SSL=true&SSLVerification=NONE` | For DBeaver / DataGrip — see [§ JDBC authentication](#jdbc-authentication) |
 | Trino HTTP (internal) | `http://trino-coordinator:8080` | Container networks only, never published; username-only auth for `trino-mcp` / Superset |
-| MinIO API | `http://localhost:8014` | S3-compatible |
-| MinIO console | `https://chat.zeoenergy.com/minio/` | Behind oauth2-proxy |
+| lake-s3 S3 API | `http://<host>:8014` | S3-compatible, path-style only; keys are `LAKE_S3_ACCESS_KEY` / `LAKE_S3_SECRET_KEY` |
+| lake-s3 console | `https://chat.zeoenergy.com/rustfs/console/` | Behind oauth2-proxy; LAN fallback `http://<host>:8015/rustfs/console/` — see [§ Object store: RustFS](#object-store-rustfs) |
 | Superset | `https://chat.zeoenergy.com/superset/` | Behind oauth2-proxy |
 | trino-mcp | `http://trino-mcp:8080/mcp` | Internal only, registered with LiteLLM; external clients use `http://<host>:4001/mcp/trino` |
 | HMS Postgres | `psql -h localhost -p 5436 -U hive metastore` | Operator inspection only |
@@ -421,6 +424,120 @@ identity header. Open WebUI used the same pattern via
 [ai/openwebui/OPENWEBUI.md § Single sign-on](../openwebui/OPENWEBUI.md#single-sign-on)
 covers why, and the reasoning about reachability applies here unchanged.
 
+## Object store: RustFS
+
+The warehouse bucket lives on `lake-s3`, a single-node
+[RustFS](https://github.com/rustfs/rustfs) (Apache-2.0, S3-compatible).
+It replaced MinIO in October 2026: MinIO deleted `minio/minio` and
+`minio/mc` from Docker Hub and quay.io stopped serving them anonymously,
+so the stack only ran while the old images stayed cached on the box. The
+service is named for its role, not the product, so the next swap is an
+image change rather than a rename.
+
+- **Image:** `ghcr.io/rustfs/rustfs:1.0.1` — GHCR, not Docker Hub (the same
+  build is also on Quay and Docker Hub), pinned. Never `latest`. The
+  bucket is created by the one-shot `lake-s3-init`
+  (`public.ecr.aws/aws-cli/aws-cli:2.37.12`, `head-bucket || create-bucket`),
+  so nothing in this stack pulls from Docker Hub for object storage.
+- **Credentials:** `LAKE_S3_ACCESS_KEY` / `LAKE_S3_SECRET_KEY` in `.env`
+  (dev defaults `trino` / `trino-dev-only`) become `RUSTFS_ACCESS_KEY` /
+  `RUSTFS_SECRET_KEY` on lake-s3, `${ENV:…}` in `catalogs/iceberg.properties`
+  and `${env.…}` in `hive-metastore/metastore-site.xml`.
+- **Path-style only.** `RUSTFS_SERVER_DOMAINS` is deliberately unset —
+  setting it turns on virtual-host bucket routing, and Trino
+  (`s3.path-style-access=true`) and HMS (`fs.s3a.path.style.access=true`)
+  both address `http://lake-s3:9000/warehouse/…`.
+- **Console:** RustFS serves its UI at `/rustfs/console/` and its admin API
+  at `/rustfs/admin/v3`, both on port 9001, and does not support moving
+  them under another prefix (rustfs#1427). So oauth2-proxy routes the
+  `/rustfs/` prefix (`http://lake-s3:9001/rustfs/` in
+  `OAUTH2_PROXY_UPSTREAMS`) and the console is at
+  `https://chat.zeoenergy.com/rustfs/console/`; log in with the
+  `LAKE_S3_*` pair. If it misbehaves behind the proxy (rustfs#966: its
+  config can advertise the internal port), use the LAN console at
+  `http://<host>:8015/rustfs/console/`. There is no redirect-URL setting
+  like MinIO's `MINIO_BROWSER_REDIRECT_URL`.
+- **Scanner off.** `RUSTFS_SCANNER_ENABLED=false`: the background data
+  scanner does nothing useful on one disk with no lifecycle rules, and on
+  single-disk deployments it is behind open issues #8015 / #8121 / #8377
+  (latency spikes, a memory ratchet, constant background reads).
+- **Logs go to stdout.** The image sets `RUSTFS_OBS_LOG_DIRECTORY=/logs`
+  (rolling files inside the container); the compose file sets it to `""`,
+  which both the entrypoint and the binary treat as stdout-only, so
+  `docker logs lake-s3` works.
+- **Health:** `GET /health/ready` on 9000. First start can take up to ~2
+  minutes, which the healthcheck's retry budget allows for.
+- **No metrics scrape.** RustFS exports OTLP only (no Prometheus endpoint);
+  MinIO was not scraped either.
+
+### Cutover from MinIO (one-time, on the box)
+
+The new store starts **empty** — the only thing on MinIO was the
+`init_warehouse.py` demo table, which is re-seeded rather than copied.
+
+1. **While MinIO still runs**, drop the demo objects so HMS holds no rows
+   pointing at files that are about to vanish:
+
+   ```bash
+   docker exec trino-coordinator trino --execute \
+       "DROP TABLE IF EXISTS iceberg.demo.events; DROP SCHEMA IF EXISTS iceberg.demo"
+   ```
+
+   (The CLI's `--execute` runs each `;`-separated statement in turn.)
+2. Pull the change. In the box's `.env`: rename `MINIO_ROOT_USER` →
+   `LAKE_S3_ACCESS_KEY`, `MINIO_ROOT_PASSWORD` → `LAKE_S3_SECRET_KEY`,
+   `PORT_MINIO_API` → `PORT_LAKE_S3_API`, `PORT_MINIO_CONSOLE` →
+   `PORT_LAKE_S3_CONSOLE`; delete `MINIO_BROWSER_REDIRECT_URL`; in
+   `OAUTH2_PROXY_UPSTREAMS` replace `http://minio:9001/minio/` with
+   `http://lake-s3:9001/rustfs/`.
+3. Remove the old containers (`make up` does not remove orphans), then
+   bring the stack up — this pulls RustFS from GHCR and the AWS CLI from
+   ECR Public, creates the bucket, and recreates HMS + the coordinator
+   with the new env. No image builds are needed (`metastore-site.xml` is
+   bind-mounted over the copy baked into the HMS image):
+
+   ```bash
+   docker rm -f minio minio-init
+   make up trino
+   ```
+4. `make up oauth2-proxy` — its env changed, so it needs a recreate.
+5. Re-seed the demo table:
+
+   ```bash
+   docker compose -f ai/trino/docker-compose.trino.yml --env-file .env -p ai-trino \
+       exec -T trino-mcp uv run --no-sync python - < ai/trino/bin/init_warehouse.py
+   ```
+
+   (Run from the repo root. The script is piped in because the `trino-mcp`
+   image only contains `server.py`.)
+6. Once verified, drop what is left of MinIO:
+
+   ```bash
+   docker volume rm ai-trino_minio_data
+   docker image rm minio/minio:latest minio/mc:latest
+   ```
+
+**If MinIO is already gone** before step 1, the `DROP TABLE` cannot read
+the table's metadata. Do steps 2–4 first, then — before step 5 — remove
+the table from HMS without touching its files, and drop the schema
+(HMS's s3a client now reaches the empty lake-s3 instead of a dead host):
+
+```bash
+docker exec trino-coordinator trino --execute \
+    "CALL iceberg.system.unregister_table('demo', 'events'); DROP SCHEMA IF EXISTS iceberg.demo"
+```
+
+Skipping this leaves `iceberg.demo.events` registered against missing
+metadata, and `init_warehouse.py`'s `CREATE TABLE IF NOT EXISTS` then
+fails on the stale entry.
+
+**Verify:** `docker logs lake-s3-init` ends with `warehouse bucket ready`;
+`lake-s3` is healthy; `docker logs hive-metastore` is clean;
+`SELECT count(*) FROM iceberg.demo.events` returns 3; JDBC on 8013 is
+unaffected; the console lists the `warehouse` bucket (check
+`cf-cache-status` on its assets — Cloudflare caches static paths on the
+chat host).
+
 ## Connecting to the metastore DB
 
 ```bash
@@ -439,7 +556,7 @@ integrity, serde info shape); a manual UPDATE will silently break
 | Volume | Purpose | Kill when |
 |---|---|---|
 | `hive_metastore_db_data` | HMS's own tables (DBS, TBLS, …) | Never — this maps schema names to Parquet locations |
-| `minio_data` | The actual Parquet files under `warehouse/` | Only after export |
+| `lake_s3_data` | The actual Parquet files under `warehouse/` (lake-s3's `/data`) | Only after export |
 | `superset_db_data` | Superset dashboards, saved queries, user accounts | Only if you want to start over |
 | `trino_auth` | TLS keystore + `password.db` for the coordinator | Anytime — regenerates on next `up`; BI clients re-trust the new cert |
 

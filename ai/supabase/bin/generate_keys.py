@@ -4,11 +4,11 @@
 Standard library only — this runs on the box before anything is installed.
 
 Why not upstream's ``utils/generate-keys.sh``: it ``sed``s UNPREFIXED names
-(``POSTGRES_PASSWORD=``, ``MINIO_ROOT_PASSWORD=``, …) into ``./.env``. This repo
-has ONE shared ``.env`` where ``MINIO_ROOT_PASSWORD`` belongs to Trino's MinIO
-and ``POSTGRES_*`` is generic, so upstream's script would silently clobber
-another subsystem's credentials. Everything here is ``SUPABASE_``-prefixed and
-only ever touches lines whose key starts with that prefix.
+(``POSTGRES_PASSWORD=``, ``JWT_SECRET=``, …) into ``./.env``. This repo has ONE
+shared ``.env`` where generic names like ``POSTGRES_*`` are free for any
+subsystem to claim, so upstream's script would silently clobber another
+subsystem's credentials. Everything here is ``SUPABASE_``-prefixed and only
+ever touches lines whose key starts with that prefix.
 
 Usage
 -----

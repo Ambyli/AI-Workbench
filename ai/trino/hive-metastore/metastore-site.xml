@@ -1,10 +1,12 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
   HMS runtime config. Postgres backend for the metastore's own tables;
-  S3A filesystem for Iceberg manifest validation against MinIO.
+  S3A filesystem for Iceberg manifest validation against lake-s3 (RustFS).
 
-  Env-var references are expanded at container start by the base image's
-  entrypoint (see /opt/hive/bin/entrypoint.sh in apache/hive:4.0.0).
+  ${env.X} references are expanded by Hadoop's Configuration when HMS
+  reads this file — nothing rewrites it (apache/hive:4.0.0's
+  /entrypoint.sh never touches /opt/hive/conf). That is what lets
+  docker-compose.trino.yml bind-mount it read-only over the COPYed copy.
 -->
 <configuration>
   <!-- ── Backing store (hive-metastore-db) ──────────────────────────── -->
@@ -25,25 +27,32 @@
     <value>${env.HMS_DB_PASSWORD}</value>
   </property>
 
-  <!-- Default warehouse location on MinIO. Iceberg tables get their own
+  <!-- Default warehouse location on lake-s3. Iceberg tables get their own
        location under this prefix (s3a://warehouse/{db}/{table}/…). -->
   <property>
     <name>hive.metastore.warehouse.dir</name>
     <value>s3a://warehouse/</value>
   </property>
 
-  <!-- ── S3A filesystem pointing at MinIO ──────────────────────────── -->
+  <!-- ── S3A filesystem pointing at lake-s3 ────────────────────────── -->
   <property>
     <name>fs.s3a.endpoint</name>
-    <value>${env.MINIO_ENDPOINT}</value>
+    <value>${env.LAKE_S3_ENDPOINT}</value>
+  </property>
+  <!-- Pin the signing region rather than let the AWS SDK guess it from a
+       non-AWS endpoint; matches s3.region in catalogs/iceberg.properties
+       and the region the warehouse bucket was created in. -->
+  <property>
+    <name>fs.s3a.endpoint.region</name>
+    <value>us-east-1</value>
   </property>
   <property>
     <name>fs.s3a.access.key</name>
-    <value>${env.MINIO_ROOT_USER}</value>
+    <value>${env.LAKE_S3_ACCESS_KEY}</value>
   </property>
   <property>
     <name>fs.s3a.secret.key</name>
-    <value>${env.MINIO_ROOT_PASSWORD}</value>
+    <value>${env.LAKE_S3_SECRET_KEY}</value>
   </property>
   <property>
     <name>fs.s3a.path.style.access</name>

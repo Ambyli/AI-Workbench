@@ -2,7 +2,7 @@ networks:
   # Dedicated bridge for the terminal, mirroring the sandbox subsystem's
   # posture. open-terminal is a ROOT-capable shell that a model drives, so it
   # MUST NOT sit on ai_shared: from there it could reach roofix-db and
-  # sandbox-db (dev-default credentials), minio (dev-default root creds),
+  # sandbox-db (dev-default credentials), lake-s3 (dev-default root creds),
   # litellm (every virtual key's model surface), n8n (encrypted credential
   # store), phoenix-mcp, and sandbox-runner — which mounts docker.sock.
   #

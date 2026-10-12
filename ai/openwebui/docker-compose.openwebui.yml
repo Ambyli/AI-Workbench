@@ -6,7 +6,7 @@ networks:
   # Second, deliberately narrow network shared ONLY with open-terminal
   # (ai/open-terminal/docker-compose.open-terminal.yml). The terminal is a
   # root-capable shell driven by a model, so it is kept off ai_shared — from
-  # there it could reach roofix-db / sandbox-db / minio (all dev-default
+  # there it could reach roofix-db / sandbox-db / lake-s3 (all dev-default
   # credentials), litellm, n8n's credential store, and sandbox-runner, which
   # mounts docker.sock. openwebui straddles both networks because its backend
   # is the ONLY thing that proxies terminal traffic; the browser never talks

@@ -58,7 +58,7 @@ async def list_catalogs() -> list[str]:
     "postgres_supabase", "supabase_ai_agents", "supabase_enerflo_leads",
     "supabase_operations_assistant", "system"]``.
     Catalogs are named ``<source>_<dataset>``: ``iceberg`` is the
-    lakehouse on MinIO; ``postgres_*`` federate the subsystem Postgres
+    lakehouse (Parquet on the on-box S3 store); ``postgres_*`` federate the subsystem Postgres
     instances we run (including ``postgres_supabase``, the self-hosted
     Supabase instance) plus the Phoenix production DB; ``supabase_*`` are
     Supabase-HOSTED Postgres projects; ``aws_glue`` is the AWS Glue Data

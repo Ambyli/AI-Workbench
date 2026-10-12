@@ -69,9 +69,9 @@ model-driven shell, is on `terminal_net` and is **not** on `ai_shared`.)
    Or print a paste-ready block with no arguments. `--force` rotates values
    that are already set — read [Secrets that are one-shot](#secrets-that-are-one-shot)
    first. Do **not** use upstream's `utils/generate-keys.sh`: it `sed`s
-   *unprefixed* names (`POSTGRES_PASSWORD=`, `MINIO_ROOT_PASSWORD=`) into
-   `./.env`, and in this repo's shared `.env` that would clobber Trino's MinIO
-   credentials.
+   *unprefixed* names (`POSTGRES_PASSWORD=`, `JWT_SECRET=`, `ANON_KEY=`, …)
+   into `./.env`, and in this repo's shared `.env` those generic names are
+   free for any other subsystem to claim — it would silently clobber them.
 
 2. **Set the URLs.** In the same block:
    `SUPABASE_PUBLIC_URL`, `SUPABASE_API_EXTERNAL_URL`, `SUPABASE_SITE_URL`.

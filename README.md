@@ -64,7 +64,7 @@ Run `make help` to list all available targets, including any service stacks curr
 make network         # Create shared Docker network (ai_shared)
 ```
 
-All containers share a `ai_shared` Docker network so they can resolve each other by container name. `make setup` creates it automatically.
+All containers share a `ai_shared` Docker network so they can resolve each other by service name. `make setup` creates it automatically.
 
 ### Usage
 
@@ -76,7 +76,9 @@ make <verb> <stack>                  # apply verb to one stack (its default serv
 make <verb> <stack> <service> ...    # apply verb to specific services within a stack
 ```
 
-Verbs: `up`, `down`, `clean`, `very-clean`, `logs`, `build`.
+Verbs: `up`, `down`, `clean`, `very-clean`, `logs`, `build`, `ps`, `exec`.
+
+`make up` deploys with no downtime where it can: services labelled `com.zeo.deploy: swap` get a new `<service>-<hash>` copy beside the old one, which retires once the new one is healthy; everything else is recreated as before, and each status line says which and why. `RECREATE=1` restores plain `docker compose up -d`, `DRY_RUN=1` prints the plan. See [ai/edge/EDGE.md](ai/edge/EDGE.md).
 
 ```bash
 make up                     # Start every stack
@@ -86,6 +88,7 @@ make down                   # Stop every stack
 make clean roofix           # Stop and remove roofix containers + volumes
 make very-clean CONFIRM=yes # Stop everything and remove volumes and images
 make logs kokoro            # Follow logs for the kokoro stack
+make exec litellm litellm CMD='env'   # Run a command in a service's running container
 make build openwebui        # Rebuild the openwebui stack
 ```
 

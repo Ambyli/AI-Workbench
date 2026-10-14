@@ -18,6 +18,14 @@ logs as `Updated to new configuration config=… version=N`.
 **A tunnel may only have one connector on this host. Two is a bug, and it
 fails intermittently rather than cleanly.**
 
+The one exception is deliberate and lasts seconds: `make up cloudflared`
+swaps the container side by side (see [EDGE.md](../edge/EDGE.md)), so while
+the new `ai-cloudflared-<hash>` copy comes up next to the old one, two
+connectors are registered. Both are this exact container — same token, same
+config, same reachable origins — so neither returns 502, and the old one
+retires (draining for `--grace-period`) as soon as the new one reports ready.
+`ps aux` below may briefly count two during a deploy.
+
 Cloudflare load-balances requests across every registered connector for a
 tunnel. If two connectors are registered and only one can reach the origin,
 roughly half of all requests return **502 Bad Gateway** and half succeed —
@@ -150,13 +158,14 @@ paths, which Cloudflare never caches by default.
 
 ```bash
 # Origin failures, grouped by which rule is failing
-docker logs ai-cloudflared 2>&1 | grep -oE 'ingressRule=[0-9]+ originService=[^ ]+' | sort | uniq -c | sort -rn
+make -s logs cloudflared FOLLOW=0 TAIL=all 2>&1 | grep -oE 'ingressRule=[0-9]+ originService=[^ ]+' | sort | uniq -c | sort -rn
 
 # The routing table this connector actually pulled
-docker logs ai-cloudflared 2>&1 | grep 'Updated to new configuration'
+make -s logs cloudflared FOLLOW=0 TAIL=all 2>&1 | grep 'Updated to new configuration'
 
-# Connections registered — expect four (one per Cloudflare edge colo)
-docker logs ai-cloudflared 2>&1 | grep -c 'Registered tunnel connection'
+# Connections registered — expect four (one per Cloudflare edge colo) per
+# container; logs since the last `make up cloudflared` swap cover only the new copy
+make -s logs cloudflared FOLLOW=0 TAIL=all 2>&1 | grep -c 'Registered tunnel connection'
 ```
 
 | Symptom | Cause |

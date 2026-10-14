@@ -10,10 +10,17 @@ services:
     image: docker.io/searxng/searxng:latest
     networks:
       - shared
-    container_name: searxng
+    # Deployed side by side by `make up searxng` (scripts/deploy.py): a new
+    # `searxng-<hash>` starts next to the old one, and the old one retires
+    # once the new one is healthy. Hence no container_name and no `ports:` --
+    # PORT_SEARXNG is published by ai/edge; Open WebUI keeps calling
+    # searxng:8080 by service name. The hash covers the bind-mounted ./
+    # directory below, so a settings.yml edit deploys with `make up searxng`
+    # (and so does any other file in this folder). See ai/edge/EDGE.md.
+    labels:
+      com.zeo.deploy: swap
     restart: unless-stopped
-    ports:
-      - "${PORT_SEARXNG}:8080"
+    stop_grace_period: 30s
     environment:
       # Read at boot by the entrypoint wrapper below and sed-substituted into
       # the `${SEARXNG_SECRET}` placeholder in settings.yml.

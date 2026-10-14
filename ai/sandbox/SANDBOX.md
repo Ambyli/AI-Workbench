@@ -504,7 +504,7 @@ docker exec -it sandbox-db psql -U sandbox -d sandbox \
   -c "SELECT id, phase, jsonb_pretty(metadata), jsonb_pretty(result), error, created_at, updated_at FROM jobs WHERE id = '<sandbox_id>';"
 
 # egress requests this sandbox made (via tinyproxy access log)
-docker logs sandbox-egress | grep '<sandbox_id or IP>'
+make -s logs sandbox sandbox-egress FOLLOW=0 TAIL=all | grep '<sandbox_id or IP>'
 ```
 
 ### Rotating the sandbox-db password

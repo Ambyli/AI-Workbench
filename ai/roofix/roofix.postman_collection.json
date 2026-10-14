@@ -13,7 +13,7 @@
       "key": "roofix",
       "value": "http://localhost:8080",
       "type": "string",
-      "description": "Roofix bridge base URL. Default `http://localhost:8080` assumes you've added a host port mapping to the `roofix` service in `ai/roofix/docker-compose.roofix.yml` (it ships with NO port mapping — service is ai_shared-only). Inside the `ai_shared` Docker network it's `http://roofix:8080`. From another compose container: `docker exec -it litellm curl http://roofix:8080/health`."
+      "description": "Roofix bridge base URL. Default `http://localhost:8080` assumes you've added a host port mapping to the `roofix` service in `ai/roofix/docker-compose.roofix.yml` (it ships with NO port mapping — service is ai_shared-only). Inside the `ai_shared` Docker network it's `http://roofix:8080`. From another compose container: `make exec litellm litellm CMD='curl http://roofix:8080/health'`."
     },
     {
       "key": "roofixMessageId",

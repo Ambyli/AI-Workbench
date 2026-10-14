@@ -39,6 +39,10 @@ services:
   #     --dtype float16
   #     --max-model-len 8192
   #     --gpu-memory-utilization 0.2
+  #
+  # Recreated (with downtime) by `make up`: it holds the model in GPU memory
+  # and publishes a host port; a second copy would need a second copy's worth of
+  # VRAM.
   qwen3.8:
     networks:
       - shared
@@ -98,6 +102,10 @@ services:
   # matches qwen3.6 (same 27B hybrid architecture on one A6000) — see
   # VLLM.md § Single-GPU qwen3.8. Same v0.27.1 pin as `qwen3.8` so the two
   # behave identically.
+  #
+  # Recreated (with downtime) by `make up`: it holds the model in GPU memory
+  # and publishes a host port; a second copy would need a second copy's worth of
+  # VRAM.
   qwen3.8-solo:
     networks:
       - shared
@@ -143,6 +151,9 @@ services:
       --speculative-config '{"method":"mtp","num_speculative_tokens":2}'
       --chat-template /config/qwen_fixed_chat_template.jinja
 
+  # Recreated (with downtime) by `make up`: it holds the model in GPU memory
+  # and publishes a host port; a second copy would need a second copy's worth of
+  # VRAM.
   qwen3.6:
     networks:
       - shared
@@ -207,6 +218,10 @@ services:
   # .cached_tokens in every response, which the classifier records per call
   # kind (classifier_llm_cached_prompt_tokens_total) to show what the
   # prefix cache saves.
+  #
+  # Recreated (with downtime) by `make up`: it holds the model in GPU memory
+  # and publishes a host port; a second copy would need a second copy's worth of
+  # VRAM.
   muse-glimmer:
     networks:
       - shared
@@ -263,6 +278,9 @@ services:
       --speculative-config '{"method":"dflash","model":"meta-models/Muse-Glimmer-30B-assistant","num_speculative_tokens":15}'
       --limit-mm-per-prompt '{"image": 3}'
 
+  # Recreated (with downtime) by `make up`: it holds the model in GPU memory
+  # and publishes a host port; a second copy would need a second copy's worth of
+  # VRAM.
   vllm-qwen-vl:
     networks:
       - shared

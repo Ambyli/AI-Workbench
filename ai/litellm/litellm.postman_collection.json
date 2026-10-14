@@ -255,7 +255,7 @@
                 "completions"
               ]
             },
-            "description": "Chain alias `local-general` -- the semantic router's catch-all (`general` decision) and Envoy's default route. Orders: qwen3.8-solo (1) -> muse-glimmer (2) -> claude-sonnet-5 (3, overflow only). Each deployment calls its backend directly; a prompt over 114688 tokens skips qwen3.8-solo via the pre-call context check.\n\nReturns a normal chat completion. Check the spend log: model group local-general, model = the deployment that answered. A Claude row means the overflow hook dropped both local deployments (`docker logs litellm | grep overflow`) or both failed at call time. 401 = your key is not scoped to local-general. LITELLM.md > Chain aliases and the overflow hook."
+            "description": "Chain alias `local-general` -- the semantic router's catch-all (`general` decision) and Envoy's default route. Orders: qwen3.8-solo (1) -> muse-glimmer (2) -> claude-sonnet-5 (3, overflow only). Each deployment calls its backend directly; a prompt over 114688 tokens skips qwen3.8-solo via the pre-call context check.\n\nReturns a normal chat completion. Check the spend log: model group local-general, model = the deployment that answered. A Claude row means the overflow hook dropped both local deployments (`make -s logs litellm FOLLOW=0 TAIL=all | grep overflow`) or both failed at call time. 401 = your key is not scoped to local-general. LITELLM.md > Chain aliases and the overflow hook."
           },
           "response": []
         },

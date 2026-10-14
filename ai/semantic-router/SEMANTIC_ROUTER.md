@@ -316,7 +316,7 @@ make up semantic-router
 
 | Port | Where | Published? |
 |---|---|---|
-| `8899` (Envoy listener) | `vllm-sr-envoy` | **yes** — `PORT_SEMANTIC_ROUTER`, default `8025` |
+| `8899` (Envoy listener) | `vllm-sr-envoy` | **yes** — `PORT_SEMANTIC_ROUTER`, default `8025`, published by [`ai/edge`](../edge/EDGE.md) (`vllm-sr-envoy` and `vllm-sr-router` are swapped side by side on `make up`, so neither can hold a host port) |
 | `9901` (Envoy admin) | `vllm-sr-envoy` | never — serves `/quitquitquit` and a config dump **containing the listener bearer token** |
 | `50051` (ext_proc gRPC) | `vllm-sr-router` | never |
 | `8080` (management API) | `vllm-sr-router` | never — the healthcheck hits it inside the container |
@@ -343,7 +343,7 @@ docker compose -f ai/semantic-router/docker-compose.semantic-router.yml \
 Three places, and only the spend log is authoritative about cost:
 
 - **Which decision matched** — the router log (`make logs semantic-router vllm-sr-router`) and the response's `route_diagnostics` object. A code prompt that shows `general` means the keyword signal missed; add the term to `code_kw`. A PII prompt that shows anything but `privacy_local` is the soft spot from [§ The privacy guarantee](#the-privacy-guarantee--and-the-router-down-path) — widen `privacy_kw`.
-- **Which backend answered** — LiteLLM's **spend log** (Admin UI → Logs / spend by key). Filter on `SEMANTIC_ROUTER_LITELLM_KEY`: each row's *model group* is the chain alias and its *model* is the deployment that answered (`openai/qwen3.8-solo`, `openai/muse-glimmer`, `anthropic/claude-sonnet-5`, …). Overflow to Claude shows up only here. `docker logs litellm | grep '\[overflow\]'` shows the hook's spill decisions alongside.
+- **Which backend answered** — LiteLLM's **spend log** (Admin UI → Logs / spend by key). Filter on `SEMANTIC_ROUTER_LITELLM_KEY`: each row's *model group* is the chain alias and its *model* is the deployment that answered (`openai/qwen3.8-solo`, `openai/muse-glimmer`, `anthropic/claude-sonnet-5`, …). Overflow to Claude shows up only here. `make -s logs litellm FOLLOW=0 TAIL=all | grep '\[overflow\]'` shows the hook's spill decisions alongside.
 - **At a glance, in the chat** — every `auto` answer ends with a footer naming the deployment and chain that served it: `*qwen3.8-solo · local-general*`, with ` · overflow (local busy)` / `(local down)` when a Claude deployment answered and ` · router bypassed` when the router was down and `auto` fell back to `local-private`. LiteLLM derives it from the response headers (`llm_provider-x-litellm-model-*`, `llm_provider-x-vsr-*`), strips it again from the next turn's history before the router sees it, and skips tool calls, `response_format` and Open WebUI background tasks — it is cosmetic, not the cost record. Set Open WebUI's Task Model to a non-`auto` model too. Toggle: `AUTO_FOOTER_ENABLED`. [LITELLM.md § The `auto` footer](../litellm/LITELLM.md#the-auto-footer).
 
 > The exact field names inside `route_diagnostics` are **not** verified — see [§ What is still unverified](#what-is-still-unverified).
@@ -359,10 +359,10 @@ Manual — there is no end-to-end suite. The overflow hook's logic has unit test
 | Stack comes up clean | `make up semantic-router` on a box with no `vllm_sr_*` volumes | init exits 0; router reports ready; envoy healthy |
 | Init guards work | Break a field in `config.yaml`, then the recreate in [§ Applying a config change](#applying-a-config-change) | init exits non-zero with the CLI's validation error and the router never starts |
 | Envoy drift guard works | Change `providers.models` in `config.yaml` without re-rendering, then the recreate | init fails with a unified diff naming the stale file |
-| Hook loaded | `docker logs litellm` after `make up litellm` | no import error for `overflow.handler`; first chain request is followed by `[overflow]` lines only when something spills |
+| Hook loaded | `make logs litellm` after `make up litellm` | no import error for `overflow.handler`; first chain request is followed by `[overflow]` lines only when something spills |
 | Each decision answers | Postman `Envoy listener (direct)` folder, all four prompts | 200 with content; router log names `privacy_local` / `code` / `reasoning` / `general` |
 | Local first | One prompt per decision with both local models idle | spend log on the router's key shows only `openai/qwen3.8-solo` (or `openai/muse-glimmer` for `local-reasoning`) — **zero** Claude rows |
-| Busy spill to Claude is visible | Saturate both locals (e.g. 6+ parallel long `auto` chats plus a classifier batch — `qwen3.8-solo` has 3 sequences and `muse-glimmer` has 2 left over beside the classifier's 6), then send a `general` prompt | `[overflow] local-general: dropping …` lines for both local deployments in `docker logs litellm`, and a spend-log row on the router's key with model `anthropic/claude-sonnet-5` under model group `local-general` |
+| Busy spill to Claude is visible | Saturate both locals (e.g. 6+ parallel long `auto` chats plus a classifier batch — `qwen3.8-solo` has 3 sequences and `muse-glimmer` has 2 left over beside the classifier's 6), then send a `general` prompt | `[overflow] local-general: dropping …` lines for both local deployments in `make logs litellm`, and a spend-log row on the router's key with model `anthropic/claude-sonnet-5` under model group `local-general` |
 | Spill to the *other* local first | Saturate only `qwen3.8-solo`, send a `general` prompt | spend log shows `openai/muse-glimmer` under `local-general`, no Claude row |
 | `local-private` never shows Claude spend | Repeat the saturation test with a PII prompt (or call `local-private` directly) | the request waits (queues locally) and is answered by a local model; across **every** test, no spend-log row with model group `local-private` ever names a Claude model |
 | `local-private` fails closed | Stop both local vLLMs (`qwen3.8` up on the pair takes `muse-glimmer` down; stop `qwen3.8-solo`), send a PII prompt | an error, not an answer — and still no Claude row |

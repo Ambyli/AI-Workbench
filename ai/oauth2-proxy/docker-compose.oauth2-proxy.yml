@@ -5,13 +5,33 @@ networks:
 
 services:
   oauth2-proxy:
-    image: quay.io/oauth2-proxy/oauth2-proxy:latest
-    container_name: oauth2-proxy
+    # Pinned release, alpine flavour. The default image is distroless (no
+    # shell, no wget), which leaves nothing to run a healthcheck with; the
+    # `-alpine` tag is the same binary on alpine. Was `latest` (= v7.15.5 on
+    # 2026-10-14). Bump this line, `make build oauth2-proxy`, `make up oauth2-proxy`.
+    image: quay.io/oauth2-proxy/oauth2-proxy:v7.15.5-alpine
+    # Deployed side by side by `make up oauth2-proxy` (scripts/deploy.py): a
+    # new `oauth2-proxy-<hash>` starts next to the old one, and the old one
+    # retires once the new one is healthy. Hence no container_name and no
+    # `ports:` -- PORT_OAUTH2_PROXY is published by ai/edge. cloudflared
+    # reaches it by service name (oauth2-proxy:4180) and needs no change.
+    # See ai/edge/EDGE.md.
+    labels:
+      com.zeo.deploy: swap
     networks:
       - shared
     restart: unless-stopped
-    ports:
-      - "${PORT_OAUTH2_PROXY}:4180"
+    # Every Open WebUI chat passes through here, inside its 900 s budget;
+    # let the retiring copy finish them.
+    stop_grace_period: 900s
+    healthcheck:
+      # /ping answers 200 before any auth check (--ping-path, default /ping).
+      # The port must match OAUTH2_PROXY_HTTP_ADDRESS in .env.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:4180/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     volumes:
       - ./sa-key.json:/etc/oauth2-proxy/sa-key.json:ro
       - ./templates:/etc/oauth2-proxy/templates:ro
@@ -73,9 +93,21 @@ services:
   # the logo pre-login. Only files under assets/ are exposed.
   oauth2-assets:
     image: nginx:alpine
-    container_name: oauth2-assets
+    # Swapped side by side by `make up` like oauth2-proxy above; the hash
+    # covers the bind-mounted assets/ folder, so a new logo deploys too.
+    labels:
+      com.zeo.deploy: swap
     networks:
       - shared
     restart: unless-stopped
+    stop_grace_period: 30s
+    healthcheck:
+      # The stock nginx index page: always present, independent of which
+      # files assets/ holds.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
     volumes:
       - ../../assets:/usr/share/nginx/html/assets:ro

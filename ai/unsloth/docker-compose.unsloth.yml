@@ -4,6 +4,8 @@ networks:
     name: ai_shared
 
 services:
+  # Recreated (with downtime) by `make up`: it holds a GPU and publishes three
+  # host ports.
   unsloth:
     networks:
       - shared

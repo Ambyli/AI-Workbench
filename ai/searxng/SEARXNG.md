@@ -93,7 +93,7 @@ From the host (proves port publish + JSON output):
 curl -s "http://localhost:8009/search?q=hello&format=json" | python -c "import sys, json; print(len(json.load(sys.stdin).get('results', [])))"
 ```
 
-Expect a small integer (typically 5–10). If it prints `0`, upstream engines all failed — check `docker logs searxng`. If it returns HTML, the `search.formats` override isn't loading — inspect the bind mount.
+Expect a small integer (typically 5–10). If it prints `0`, upstream engines all failed — check `make logs searxng`. If it returns HTML, the `search.formats` override isn't loading — inspect the bind mount.
 
 From inside `ai_shared` (proves the exact URL Open WebUI uses):
 

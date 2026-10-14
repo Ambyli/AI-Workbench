@@ -50,6 +50,9 @@ services:
   # Host port is published for operator inspection (psql / DBeaver). The
   # port only exposes the DB on the host loopback — remove the ports: block
   # entirely if this ever runs on a machine with an untrusted network.
+  #
+  # Recreated (with downtime) by `make up`: a data directory can have only one
+  # Postgres.
   sandbox-db:
     image: postgres:16-alpine
     container_name: sandbox-db
@@ -87,10 +90,17 @@ services:
     build:
       context: ../..
       dockerfile: ai/sandbox/proxies/Dockerfile
-    container_name: sandbox-proxy
+    # Deployed side by side by `make up sandbox` (scripts/deploy.py): a new
+    # `sandbox-proxy-<hash>` starts next to the old one, and the old one
+    # retires once the new one is healthy. Its routing is static (no state
+    # beyond Caddy's own /data and /config), so two copies are safe. No
+    # container_name -- oauth2-proxy and the runner reach it by service name
+    # -- and no `ports:`: PORT_SANDBOX_PROXY is published by ai/edge. The hash
+    # covers the bind-mounted Caddyfile. See ai/edge/EDGE.md.
+    labels:
+      com.zeo.deploy: swap
     restart: unless-stopped
-    ports:
-      - "${PORT_SANDBOX_PROXY:-8011}:80"
+    stop_grace_period: 30s
     volumes:
       - ./proxies/Caddyfile:/etc/caddy/Caddyfile:ro
       - sandbox_proxy_data:/data
@@ -117,8 +127,15 @@ services:
     build:
       context: ../..
       dockerfile: ai/sandbox/proxies/egress.Dockerfile
-    container_name: sandbox-egress
+    # Deployed side by side by `make up sandbox` (scripts/deploy.py), like
+    # sandbox-proxy: sandboxes reach it as sandbox-egress:8888 by service
+    # name on sandbox_net, which resolves to both copies during the swap. The
+    # hash covers tinyproxy.conf and tinyproxy.filter, so an allowlist edit
+    # deploys with `make up sandbox sandbox-egress` -- no restart needed.
+    labels:
+      com.zeo.deploy: swap
     restart: unless-stopped
+    stop_grace_period: 30s
     volumes:
       - ./proxies/tinyproxy.conf:/etc/tinyproxy/tinyproxy.conf:ro
       - ./proxies/tinyproxy.filter:/etc/tinyproxy/filter:ro
@@ -148,6 +165,10 @@ services:
   # sandbox_net. Uses /var/run/docker.sock to spawn short-lived sandbox
   # containers — this is the audit boundary; nothing else in the sandbox
   # subsystem has any Docker API access.
+  #
+  # Recreated (with downtime) by `make up`: its concurrency slots are an
+  # in-process semaphore, and its reaper would tear down the sandboxes the
+  # other copy is serving.
   sandbox-runner:
     build:
       context: ../..

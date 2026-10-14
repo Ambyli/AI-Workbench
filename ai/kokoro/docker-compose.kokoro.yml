@@ -10,6 +10,8 @@ services:
     build:
       context: ../..
       dockerfile: ai/kokoro/Dockerfile.kokoro-app
+    # Recreated (with downtime) by `make up`: it holds the model on a GPU, and a
+    # second copy would need a second copy's worth of VRAM.
     container_name: kokoro-app
     restart: unless-stopped
     environment:
@@ -30,13 +32,18 @@ services:
     build:
       context: ../..
       dockerfile: ai/kokoro/Dockerfile.kokoro-api
-    container_name: kokoro-api
+    # Deployed side by side by `make up kokoro` (scripts/deploy.py): a new
+    # `kokoro-api-<hash>` starts next to the old one, and the old one retires
+    # once the new one is healthy. Stateless proxy, so two copies are safe.
+    # No container_name and no `ports:` -- PORT_KOKORO_API is published by
+    # ai/edge. See ai/edge/EDGE.md.
+    labels:
+      com.zeo.deploy: swap
     restart: unless-stopped
+    stop_grace_period: 60s
     environment:
       - KOKORO_APP_URL=${KOKORO_APP_URL}
       - AUDIO_BASE_URL=${AUDIO_BASE_URL}
-    ports:
-      - "${PORT_KOKORO_API}:8000"
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 30s

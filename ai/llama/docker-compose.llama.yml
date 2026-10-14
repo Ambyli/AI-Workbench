@@ -32,6 +32,9 @@ services:
   #     -ngl 999
   #     -c 32768
 
+  # Recreated (with downtime) by `make up`: it holds the model on GPUs (experts
+  # offloaded to RAM) and publishes a host port; a second copy would need a
+  # second copy's worth of VRAM and RAM.
   glm5.2:
     networks:
       - shared
@@ -79,6 +82,9 @@ services:
       --jinja
       --load-mode none
 
+  # Recreated (with downtime) by `make up`: it holds the model on a GPU and
+  # publishes a host port; a second copy would need a second copy's worth of
+  # VRAM.
   qwen3.8-flash:
     networks:
       - shared
@@ -222,6 +228,8 @@ services:
       --reasoning-budget 8192
       --reasoning-budget-message "Time to stop thinking. Give the final answer or make the tool call now."
 
+  # Recreated (with downtime) by `make up`: its 148 GB model is mlocked in RAM,
+  # which has room for one copy, and it publishes a host port.
   glm5.3-flash:
     networks:
       - shared

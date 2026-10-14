@@ -323,7 +323,7 @@
               "host": ["{{litellm}}"],
               "path": ["v1", "chat", "completions"]
             },
-            "description": "Streaming chat via LiteLLM. Same SSE `data: {...}` / `data: [DONE]` shape as the direct-port streaming request; LiteLLM passes chunks through as they arrive from llama-server. Look at LiteLLM logs (`docker logs litellm`) if the stream stalls — the `stream_timeout` in `litellm_config.yaml` caps how long the proxy waits between chunks."
+            "description": "Streaming chat via LiteLLM. Same SSE `data: {...}` / `data: [DONE]` shape as the direct-port streaming request; LiteLLM passes chunks through as they arrive from llama-server. Look at LiteLLM logs (`make logs litellm`) if the stream stalls — the `stream_timeout` in `litellm_config.yaml` caps how long the proxy waits between chunks."
           },
           "response": []
         }

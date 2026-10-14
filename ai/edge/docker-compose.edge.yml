@@ -1,0 +1,78 @@
+# Edge: one HAProxy that owns the LAN host ports of every service `make up`
+# swaps side by side.
+#
+# A host port can be bound by only one container, so a service that runs two
+# copies during a deploy cannot publish its own port. Instead this container
+# publishes it -- same PORT_* variable, same bind address (0.0.0.0) as the
+# service used to -- and forwards to `<service>:<port>` over ai_shared, where
+# Docker DNS returns every running copy. HAProxy health-checks each copy, so
+# during a swap traffic goes to whichever copies are up, and a connection
+# refused by a retiring copy is retried on the other (haproxy.cfg).
+#
+# Container-to-container traffic never comes through here: Open WebUI,
+# cloudflared, oauth2-proxy, etc. keep calling `litellm:4000` and friends by
+# service name. Only LAN / localhost clients on the published ports do.
+#
+# Inside the container each service gets a FIXED listener equal to its default
+# host port (4001 litellm, 4180 oauth2-proxy, ...); the left-hand side is the
+# operator's PORT_* value. HAProxy's own stats page is on 127.0.0.1:8404
+# inside the container only -- never published -- and is what
+# scripts/deploy.py reads to wait for a new copy to be UP.
+#
+# No docker.sock: sandbox-runner stays the only container that mounts it.
+# See ai/edge/EDGE.md for the cutover order and operations.
+
+networks:
+  shared:
+    external: true
+    name: ai_shared
+
+services:
+  edge:
+    # Pinned patch tag of the current HAProxy LTS branch (3.4, 2026-10-14),
+    # alpine flavour so busybox wget is there for the healthcheck and for
+    # scripts/deploy.py's stats read. Set EDGE_HAPROXY_VERSION in .env.
+    image: haproxy:${EDGE_HAPROXY_VERSION:-3.4.6}-alpine
+    # Recreated (with downtime) by `make up`: it owns the host ports, which is
+    # the whole point. A recreate drops in-flight LAN connections for a second
+    # or two; container-to-container traffic is unaffected.
+    container_name: edge
+    labels:
+      # `make up` waits for the healthcheck below after recreating it and
+      # fails loudly if it never passes. The edge stack is last in the
+      # Makefile, so a full `make up` ends by proving the LAN ports are served.
+      com.zeo.deploy.wait: healthy
+      # haproxy.cfg is bind-mounted, so compose never sees an edit to it. When
+      # compose would leave the edge running, `make up edge` instead validates
+      # the config inside it and, only if that passes, sends USR2: the
+      # official image runs HAProxy in master-worker mode (-W), so new workers
+      # load the new config while old ones finish their open connections. A
+      # bad config stops `make up` and the running edge keeps its old one.
+      com.zeo.deploy.reload: USR2
+      com.zeo.deploy.reload.check: haproxy -c -f /usr/local/etc/haproxy/haproxy.cfg
+    restart: unless-stopped
+    networks:
+      - shared
+    ports:
+      # <operator PORT_* value>:<fixed listener in haproxy.cfg>
+      - "${PORT_LITELLM}:4001"
+      - "${PORT_OAUTH2_PROXY}:4180"
+      - "${PORT_KOKORO_API}:8004"
+      - "${PORT_MADLAD_API}:8008"
+      - "${PORT_SEARXNG}:8009"
+      - "${PORT_SANDBOX_PROXY:-8011}:8011"
+      - "${PORT_SUPERSET:-8016}:8016"
+      - "${PORT_SUPABASE_API:-8022}:8022"
+      - "${PORT_SEMANTIC_ROUTER:-8025}:8025"
+    volumes:
+      # The whole directory, not the single file: an editor or `git pull`
+      # that replaces haproxy.cfg (new inode) would leave a single-file mount
+      # pointing at the old copy, and a reload would silently re-read it.
+      # After an edit, `make up edge` reloads it (see the labels above).
+      - ./:/usr/local/etc/haproxy:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8404/stats"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s

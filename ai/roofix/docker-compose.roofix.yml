@@ -9,6 +9,9 @@ services:
   # one past litellm_db's 5432 in the PORT REGISTRY in .env) so operators can
   # query it remotely — psql, DBeaver, dashboards. See ROOFIX.md
   # § "Connecting to the processed-store DB".
+  #
+  # Recreated (with downtime) by `make up`: a data directory can have only one
+  # Postgres.
   roofix-db:
     image: postgres:16-alpine
     container_name: roofix-db
@@ -29,6 +32,9 @@ services:
       timeout: 3s
       retries: 5
 
+  # Recreated (with downtime) by `make up`: a second APScheduler would
+  # double-tick, and the processed-email store upserts rather than claims, so
+  # both copies would act on the same email.
   roofix:
     networks:
       - shared

@@ -4,6 +4,8 @@ networks:
     name: ai_shared
 
 services:
+  # Recreated (with downtime) by `make up`: it holds the OWLv2 model on GPU 2
+  # and publishes a host port.
   detector:
     networks:
       - shared

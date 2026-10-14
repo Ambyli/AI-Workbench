@@ -13,10 +13,20 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.litellm
-    container_name: litellm
+    # Deployed side by side by `make up litellm` (scripts/deploy.py): a new
+    # `litellm-<hash>` starts next to the old one, and the old one retires
+    # once the new one is healthy. That is why there is no container_name
+    # (two copies run at once) and no `ports:` -- PORT_LITELLM is published by
+    # ai/edge, which routes to whichever copy is healthy. The hash covers
+    # litellm_config.yaml and overflow.py too, so editing either and running
+    # `make up litellm` deploys it. See ai/edge/EDGE.md.
+    labels:
+      com.zeo.deploy: swap
     restart: unless-stopped
-    ports:
-      - "${PORT_LITELLM}:4000"
+    # `docker stop` on the retiring copy waits this long for in-flight
+    # requests: an `auto` turn may take 870 s (stream_timeout + timeout),
+    # inside Open WebUI's 900 s budget.
+    stop_grace_period: 900s
     environment:
       STORE_MODEL_IN_DB: "True"
       # Overflow hook for the chain aliases (overflow.py, below). Defaults
@@ -58,6 +68,8 @@ services:
       db:
         condition: service_healthy
 
+  # Recreated (with downtime) by `make up`: a data directory can have only one
+  # Postgres. scripts/deploy.py says so when it runs.
   db:
     image: postgres:16
     restart: always
@@ -77,7 +89,9 @@ services:
       interval: 1s
       timeout: 5s
       retries: 10
-      
+
+  # Recreated (with downtime) by `make up`: the TSDB under /prometheus is
+  # locked by one process, so a second copy cannot start beside the first.
   prometheus:
     image: prom/prometheus:latest
     restart: always

@@ -407,16 +407,24 @@ Superset is configured with `AUTH_TYPE = AUTH_REMOTE_USER` in
 `superset/superset_config.py`. It trusts `X-Auth-Request-Email` from
 oauth2-proxy as the session user with no separate password check.
 
-**This is only safe when Superset is unreachable from anywhere except
-oauth2-proxy.** The compose file publishes `PORT_SUPERSET` (default
-8016) on the host — leaving that on `0.0.0.0` lets anyone on the LAN
-spoof the header and log in as any Superset account. Before exposing
-this host on an untrusted network:
+**This is only safe when nothing but oauth2-proxy can hand Superset that
+header.** `superset` is swapped side by side by `make up` (see
+[ai/edge/EDGE.md](../edge/EDGE.md)), so `PORT_SUPERSET` (default 8016) is
+published by the `ai/edge` HAProxy rather than by `docker-compose.trino.yml`.
+oauth2-proxy reaches `superset:8088` directly over `ai_shared`, never through
+the edge, so the edge deletes `X-Auth-Request-Email` / `-User` /
+`-Preferred-Username` and `X-Forwarded-Email` / `-User` on that port: a LAN
+client can no longer spoof the header and log in as any Superset account, as it
+could while the port was published straight from this stack. Keep it that way:
 
-1. Bind the port to loopback in `docker-compose.trino.yml`:
-   `"127.0.0.1:${PORT_SUPERSET:-8016}:8088"`, or
-2. Drop the `ports:` block entirely and reach Superset only via
-   `chat.zeoenergy.com/superset/`.
+- never route oauth2-proxy (or anything that sets the header legitimately)
+  through the edge;
+- if `SUPERSET_REMOTE_USER_HEADER` changes, add a `del-header` for the new name
+  in `ai/edge/haproxy.cfg`;
+- before exposing this host on an untrusted network, still bind the edge's
+  `PORT_SUPERSET` mapping to loopback in `ai/edge/docker-compose.edge.yml`
+  (`"127.0.0.1:${PORT_SUPERSET:-8016}:8016"`), or drop it and reach Superset
+  only via `chat.zeoenergy.com/superset/`.
 
 Superset is now the only service in the stack that trusts a proxy-set
 identity header. Open WebUI used the same pattern via

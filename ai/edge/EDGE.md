@@ -458,8 +458,9 @@ fronts has been deployed once. Do it in one sitting:
    `--no-recreate`) and `python3 --version` (3.10 or later).
 2. **Mirror `.env.example` into `.env`:** `EDGE_ALLOWED_CIDRS` and
    `EDGE_LITELLM_MAX_CONCURRENT_PER_KEY` in the Edge section, and
-   `,http://n8n:5678/n8n/,http://edge:8407/edge/` appended to
-   `OAUTH2_PROXY_UPSTREAMS` (skip the n8n entry if it is already there).
+   `,http://edge:8407/edge/` appended to `OAUTH2_PROXY_UPSTREAMS`. Do not add
+   an n8n entry there: n8n runs on its own subdomain because its subpath mode
+   is broken upstream.
 3. **Dry run.** Run `make up <stack> DRY_RUN=1` for each stack below and read
    the plan. The first real run of every swap service is always a swap: the new
    label and the removed `container_name`/`ports` change its config hash.
@@ -526,7 +527,7 @@ step frees what the next needs:
 
 ```bash
 # 1. .env: add EDGE_ALLOWED_CIDRS + EDGE_LITELLM_MAX_CONCURRENT_PER_KEY,
-#    append ,http://n8n:5678/n8n/,http://edge:8407/edge/ to OAUTH2_PROXY_UPSTREAMS
+#    append ,http://edge:8407/edge/ to OAUTH2_PROXY_UPSTREAMS
 make up classifier             # recreate without ports: frees 8005
 make up detector               # recreate without ports: frees 8021
 make up sandbox                # sandbox-runner recreated without ports: frees 8012

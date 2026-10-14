@@ -1313,7 +1313,9 @@ def test_status_page_is_read_only_and_behind_oauth2_proxy():
     assert "stats uri /edge/" in status["lines"]
     assert not [l for l in status["lines"] if l.startswith("stats admin")]
     upstreams = re.search(r"^OAUTH2_PROXY_UPSTREAMS=(.*)$", _env_example(), re.M).group(1).split(",")
-    assert "http://edge:8407/edge/" in upstreams and "http://n8n:5678/n8n/" in upstreams
+    assert "http://edge:8407/edge/" in upstreams
+    # n8n stays on its own subdomain: its N8N_PATH subpath mode is broken upstream.
+    assert "n8n:5678" not in upstreams
 
 
 def test_prometheus_is_on_ai_shared_and_every_target_is_reachable_there():

@@ -168,15 +168,16 @@ services:
   #
   # Recreated (with downtime) by `make up`: its concurrency slots are an
   # in-process semaphore, and its reaper would tear down the sandboxes the
-  # other copy is serving.
+  # other copy is serving. No `ports:` -- PORT_SANDBOX_RUNNER is published by
+  # ai/edge, which returns 503 + Retry-After while this container is being
+  # recreated, instead of a refused connection. Same host port, same URL.
+  # See ai/edge/EDGE.md.
   sandbox-runner:
     build:
       context: ../..
       dockerfile: ai/sandbox/runner/Dockerfile
     container_name: sandbox-runner
     restart: unless-stopped
-    ports:
-      - "${PORT_SANDBOX_RUNNER:-8012}:8000"
     environment:
       - DEBUG_LOGGING=${DEBUG_LOGGING:-false}
       # Concurrency and lifetime.

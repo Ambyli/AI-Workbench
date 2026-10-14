@@ -9,6 +9,12 @@ Each layer must sit strictly inside the one outside it:
 
 plus: a timeout inside a chain goes straight to the next `order`
 (router_settings.model_group_retry_policy, TimeoutErrorRetries: 0).
+
+plus: the ai/edge HAProxy's `listen litellm` (900 s client/server inactivity)
+sits OUTSIDE both callers that reach LiteLLM through it -- LAN clients on
+PORT_LITELLM (an `auto` turn is silent for up to 870 s) and the semantic
+router's Envoy on the internal 14000 bind (840 s) -- so the edge never cuts
+a turn they are still waiting on.
 See ai/semantic-router/SEMANTIC_ROUTER.md > Timeout budget.
 
 Two layers, like test_overflow.py:
@@ -115,6 +121,40 @@ def test_layers_are_strictly_nested():
     # Open WebUI's idle timer is a total too -- it must not undercut auto.
     assert idle > auto["stream_timeout"]
     assert envoy < ENVOY_HARD_CAP_S
+
+
+EDGE_CFG = _ROOT / "ai" / "edge" / "haproxy.cfg"
+
+
+def _edge_litellm_timeouts() -> dict[str, int]:
+    """`timeout client|server` of haproxy.cfg's `listen litellm`, in seconds."""
+    out, inside = {}, False
+    for raw in EDGE_CFG.read_text(encoding="utf-8").splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if not raw.startswith((" ", "\t")):
+            inside = line == "listen litellm"
+            continue
+        if inside and line.startswith("timeout "):
+            _, which, value = line.split()
+            out[which] = _seconds(value)
+    return out
+
+
+def test_edge_litellm_listener_outlasts_auto_and_envoy():
+    edge = _edge_litellm_timeouts()
+    auto = _auto_params()["stream_timeout"]
+    envoy = _envoy_listener_s()
+    assert edge["client"] == edge["server"], edge
+    # LAN path: client -> edge :4001 -> litellm `auto` (870). Router path:
+    # Envoy (840) -> edge :14000 -> litellm chain. Inactivity timers, and
+    # both responses can be silent for the whole turn.
+    assert edge["server"] > auto > envoy, (edge, auto, envoy)
+    # The router really goes through the edge's internal bind.
+    cfg = yaml.safe_load(ROUTER_CONFIG.read_text(encoding="utf-8"))
+    urls = {ref["base_url"] for m in cfg["providers"]["models"] for ref in m["backend_refs"]}
+    assert urls == {"http://edge:14000/v1"}
 
 
 def test_request_timeout_matches_open_webui_total():

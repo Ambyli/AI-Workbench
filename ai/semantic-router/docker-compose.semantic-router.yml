@@ -5,8 +5,11 @@
 # OpenAI surface for Open WebUI, Claude Code, n8n and the Roofix brain, and
 # every decision is `static` -- it picks ONE LiteLLM chain alias
 # (local-general / local-code / local-reasoning / local-private), reached at
-# http://litellm:4000/v1. Which backend answers -- local first, Claude only
-# as overflow, never for local-private -- is LiteLLM's job
+# http://edge:14000/v1 -- LiteLLM through the ai/edge HAProxy's internal
+# listener, so Envoy's single pinned upstream address never belongs to a
+# LiteLLM copy that a swap retires (config.yaml > WHY THE EDGE). Which
+# backend answers -- local first, Claude only as overflow, never for
+# local-private -- is LiteLLM's job
 # (ai/litellm/litellm_config.yaml + overflow.py).
 #
 # Request path (the loop is deliberate -- see the recursion guard in
@@ -16,6 +19,7 @@
 #             -> vllm-sr-envoy:8899      listener; Lua bearer check, ext_proc
 #             -> vllm-sr-router:50051    signals -> decision -> chain alias
 #             -> vllm-sr-envoy           routes on x-selected-model
+#             -> edge:14000              ai/edge internal listener (never published)
 #             -> litellm:4000            chain group: order 1 -> 2 -> 3
 #             -> vLLM (local) / Anthropic (overflow only)
 #

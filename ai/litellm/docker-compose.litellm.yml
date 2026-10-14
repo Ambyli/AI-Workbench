@@ -96,6 +96,13 @@ services:
     image: prom/prometheus:latest
     restart: always
     container_name: prometheus
+    # Every scrape target in prometheus.yml (litellm, classifier, detector,
+    # vllm-sr-router, edge) is reached by service name over ai_shared. Without
+    # this block prometheus sat only on this stack's default network, where
+    # none of them live -- not even litellm, which is on shared + internal.
+    # It needs nothing on `internal` (litellm_db is not scraped).
+    networks:
+      - shared
     ports:
       - "${PORT_PROMETHEUS}:9090"
     volumes:

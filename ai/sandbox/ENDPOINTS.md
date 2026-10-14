@@ -1,6 +1,6 @@
 # sandbox-runner — HTTP endpoints
 
-Base URL from the host: `http://localhost:8012`
+Base URL from the host: `http://localhost:8012` (`PORT_SANDBOX_RUNNER`, published by the [`ai/edge`](../edge/EDGE.md) HAProxy; while `sandbox-runner` is recreated it answers `503` + `Retry-After: 10`)
 Base URL on the `ai_shared` Docker network: `http://sandbox-runner:8000`
 
 Everything below is served by [`ai/sandbox/runner/app.py`](app.py). Jobs endpoints are contributed by the shared [`build_router`](../../shared/common/src/common/jobs/router.py) factory in `common.jobs`.

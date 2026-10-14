@@ -14,6 +14,7 @@ import importlib.util
 import io
 import json
 import pathlib
+import re
 import sys
 
 import pytest
@@ -828,6 +829,50 @@ listen superset
     assert deploy.parse_edge_listens(text) == {"litellm": "4001", "superset": "8016"}
 
 
+def test_parse_edge_listens_keeps_the_first_bind_and_ignores_internal_frontends():
+    text = """
+.if streq("${X-}","")
+    .alert "x"
+.endif
+frontend metrics
+    bind :8405 name internal
+listen litellm
+    bind :4001 name lan
+    bind :14000 name internal
+    acl lan_bind so_name -m str lan
+    .if !streq("${N-8}",0)
+    stick-table type string len 64 size 10k expire 10m
+    .endif
+    server-template app 3 litellm:4000 check
+listen classifier
+    bind :8005 name lan
+"""
+    assert deploy.parse_edge_listens(text) == {"litellm": "4001", "classifier": "8005"}
+
+
+def recreate_api_svc() -> dict:
+    """A recreate-class HTTP API the edge fronts (classifier, sandbox-runner, detector)."""
+    return {
+        "image": "example/api:1", "restart": "unless-stopped", "container_name": "api",
+        "healthcheck": {"test": ["CMD", "true"], "interval": "10s", "retries": 3},
+        "networks": {"shared": None},
+    }
+
+
+def test_fronted_recreate_class_service_never_asks_the_edge():
+    """check_edge_before_swap / wait_edge live in the swap path only: a
+    recreate-class backend of the edge deploys exactly as before, even with
+    the edge down."""
+    fake = FakeDocker({"api": recreate_api_svc()}, images={"example/api:1": "sha256:a"})
+    rc, out = run(fake, "api", edge_listens={"api": "8005"})
+    assert rc == 0, out
+    assert "api: recreate (downtime)" in out
+    assert "edge" not in out
+    assert fake.mutating() == ["compose up -d --no-deps api"]
+    asked_edge = [c for c in fake.calls if c[0] == "ps" and f"label={deploy.PROJECT_LABEL}={deploy.EDGE_PROJECT}" in c]
+    assert not asked_edge and not [c for c in fake.calls if c[0] == "exec"]
+
+
 def test_parse_edge_stats():
     rows = deploy.parse_edge_stats(stats([("a", "FRONTEND", "OPEN", ""), ("a", "app1", "UP", "1.2.3.4:80"),
                                           ("b", "app1", "UP", "5.6.7.8:80")]), "a")
@@ -1045,22 +1090,78 @@ def _swap_services():
     return found
 
 
-def _haproxy_listens():
-    """{listen name: (bind port, upstream host, upstream port)} from ai/edge/haproxy.cfg."""
-    out, current = {}, None
-    for raw in (_ROOT / "ai" / "edge" / "haproxy.cfg").read_text(encoding="utf-8").splitlines():
+def _all_services():
+    """{service key: [(stack, service dict, compose dict)]} across every compose file."""
+    found = {}
+    for path in _compose_files():
+        doc = _yaml().safe_load(path.read_text(encoding="utf-8"))
+        for key, svc in (doc.get("services") or {}).items():
+            found.setdefault(key, []).append((path.parent.name, svc, doc))
+    return found
+
+
+def _on_ai_shared(svc: dict, doc: dict) -> bool:
+    shared = {k for k, v in (doc.get("networks") or {}).items() if (v or {}).get("name") == "ai_shared"}
+    return bool(shared & set(svc.get("networks") or {}))
+
+
+EDGE_CFG_PATH = _ROOT / "ai" / "edge" / "haproxy.cfg"
+EDGE_COMPOSE_PATH = _ROOT / "ai" / "edge" / "docker-compose.edge.yml"
+# The recreate-class HTTP APIs the edge fronts only to turn their restart into
+# a 503 (EDGE.md § The edge).
+EDGE_RECREATE_BACKENDS = {"classifier", "sandbox-runner", "detector"}
+
+
+def _haproxy_sections():
+    """[{kind, name, binds: [(addr, port, bind name)], lines, server: (host, port)}].
+
+    Section headers start in column 0; everything indented (including an
+    indented `.if` block) belongs to the section above it. Comments are
+    stripped, which is safe because no directive in haproxy.cfg carries a `#`.
+    """
+    out, cur = [], None
+    for raw in EDGE_CFG_PATH.read_text(encoding="utf-8").splitlines():
         line = raw.split("#", 1)[0].strip()
-        if line.startswith("listen "):
-            current = line.split()[1]
-            out[current] = [None, None, None]
-        elif current and line.startswith("bind :"):
-            out[current][0] = int(line.split(":")[1])
-        elif current and line.startswith("server-template "):
-            host, port = line.split()[3].rsplit(":", 1)
-            out[current][1:] = [host, int(port)]
-        elif line and not raw.startswith((" ", "\t")):
-            current = None
-    return {k: tuple(v) for k, v in out.items()}
+        if not line:
+            continue
+        if not raw.startswith((" ", "\t")):
+            words = line.split()
+            cur = {"kind": words[0], "name": words[1] if len(words) > 1 else "", "binds": [],
+                   "lines": [], "server": None}
+            out.append(cur)
+            continue
+        cur["lines"].append(line)
+        words = line.split()
+        if words[0] == "bind":
+            addr, port = words[1].rsplit(":", 1)
+            name = words[words.index("name") + 1] if "name" in words else None
+            cur["binds"].append((addr, int(port), name))
+        elif words[0] == "server-template":
+            host, port = words[3].rsplit(":", 1)
+            cur["server"] = (host, int(port))
+    return out
+
+
+def _section(kind: str, name: str) -> dict:
+    (found,) = [s for s in _haproxy_sections() if s["kind"] == kind and s["name"] == name]
+    return found
+
+
+def _haproxy_listens():
+    """{listen name: (FIRST bind port, upstream host, upstream port)} -- what deploy.py sees."""
+    return {s["name"]: (s["binds"][0][1], *s["server"]) for s in _haproxy_sections() if s["kind"] == "listen"}
+
+
+def _edge_compose_service():
+    return _yaml().safe_load(EDGE_COMPOSE_PATH.read_text(encoding="utf-8"))["services"]["edge"]
+
+
+def _edge_published_container_ports():
+    return {int(p.rsplit(":", 1)[1]) for p in _edge_compose_service()["ports"]}
+
+
+def _env_example() -> str:
+    return (_ROOT / ".env.example").read_text(encoding="utf-8")
 
 
 def test_every_swap_labelled_service_really_swaps():
@@ -1070,37 +1171,174 @@ def test_every_swap_labelled_service_really_swaps():
         assert deploy.classify(key, svc) == (deploy.SWAP, ""), f"{stack}/{key}"
 
 
-def test_every_edge_backend_is_a_swap_service_on_ai_shared():
-    swaps = _swap_services()
+def test_every_edge_backend_is_on_ai_shared_and_swap_or_portless_recreate():
+    services = _all_services()
     listens = _haproxy_listens()
     assert listens, "no listen sections parsed"
+    recreate = set()
     for name, (bind, host, port) in listens.items():
-        assert name in swaps, f"listen {name} is not a swap-labelled service"
+        assert len(services.get(name, [])) == 1, f"listen {name} is not exactly one compose service"
         assert host == name, f"listen {name} forwards to {host}"
-        _stack, svc, doc = swaps[name]
-        shared = {k for k, v in (doc.get("networks") or {}).items() if (v or {}).get("name") == "ai_shared"}
-        nets = svc.get("networks") or {}
-        assert shared & set(nets), f"{name} is not on ai_shared, so the edge cannot reach it"
+        stack, svc, doc = services[name][0]
+        assert _on_ai_shared(svc, doc), f"{stack}/{name} is not on ai_shared, so the edge cannot reach it"
+        cls, _reason = deploy.classify(name, svc)
+        if cls == deploy.RECREATE:
+            # Fronted only for the friendly 503: the edge owns its host port.
+            assert not svc.get("ports"), f"{stack}/{name} is fronted by the edge but still publishes ports"
+            assert deploy.has_healthcheck(svc), f"{stack}/{name} has no healthcheck for the edge to copy"
+            recreate.add(name)
+        else:
+            assert cls == deploy.SWAP, f"{stack}/{name} is {cls}"
         assert bind and port
+    assert recreate == EDGE_RECREATE_BACKENDS
 
 
-def test_edge_publishes_exactly_its_listeners():
-    edge = _yaml().safe_load((_ROOT / "ai" / "edge" / "docker-compose.edge.yml").read_text(encoding="utf-8"))
-    ports = edge["services"]["edge"]["ports"]
-    container_ports = {int(p.rsplit(":", 1)[1]) for p in ports}
-    assert container_ports == {bind for bind, _h, _p in _haproxy_listens().values()}
-    env_example = (_ROOT / ".env.example").read_text(encoding="utf-8")
+def test_edge_publishes_exactly_its_lan_listeners():
+    ports = _edge_compose_service()["ports"]
+    assert _edge_published_container_ports() == {bind for bind, _h, _p in _haproxy_listens().values()}
+    env_example = _env_example()
     for p in ports:
         var = p.split("${", 1)[1].split("}", 1)[0].split(":-", 1)[0]
         assert f"\n{var}=" in env_example, f"{var} missing from .env.example"
+        row = next(line for line in env_example.splitlines() if line.startswith(f"{var}="))
+        assert "edge.yml" in row, f"PORT REGISTRY row for {var} must name edge.yml"
     assert "\nEDGE_HAPROXY_VERSION=" in env_example
+
+
+def test_lan_and_internal_binds_are_named_and_internal_ones_never_published():
+    published = _edge_published_container_ports()
+    internal = set()
+    for s in _haproxy_sections():
+        if s["kind"] == "listen":
+            first, *rest = s["binds"]
+            assert first[2] == "lan", f"listen {s['name']}: the first bind must be `name lan`"
+            for _addr, port, name in rest:
+                assert name == "internal", f"listen {s['name']}: extra bind :{port} must be `name internal`"
+                internal.add(port)
+        elif s["kind"] == "frontend":
+            for addr, port, name in s["binds"]:
+                assert addr == "127.0.0.1" or name == "internal", f"frontend {s['name']} :{port}"
+                internal.add(port)
+    assert {8404, 8405, 8407, 14000} <= internal
+    assert not internal & published, f"internal listeners published: {internal & published}"
+
+
+def test_lan_allow_list_applies_to_every_lan_bind_and_no_internal_one():
+    acl = 'acl lan_allowed src "${EDGE_ALLOWED_CIDRS[*]}"'
+    listens = 0
+    for s in _haproxy_sections():
+        body = s["lines"]
+        if s["kind"] == "frontend":
+            assert not [l for l in body if "lan_allowed" in l or "EDGE_ALLOWED_CIDRS" in l], s["name"]
+            continue
+        if s["kind"] != "listen":
+            continue
+        listens += 1
+        assert acl in body, f"listen {s['name']} has no LAN allow-list"
+        rejects = [l for l in body if l.startswith("http-request return status 403") and "lan_allowed" in l]
+        assert len(rejects) == 1, f"listen {s['name']}: expected exactly one 403 rule"
+        # First http-request rule, ahead of tracking and header rewrites.
+        assert next(l for l in body if l.startswith("http-request ")) == rejects[0], s["name"]
+        if len(s["binds"]) > 1:
+            # An internal bind shares the section: the reject must be limited to the LAN bind.
+            assert "acl lan_bind so_name -m str lan" in body, s["name"]
+            assert rejects[0].endswith("if lan_bind !lan_allowed"), s["name"]
+        else:
+            assert rejects[0].endswith("unless lan_allowed"), s["name"]
+    assert listens == len(_haproxy_listens())
+
+
+def test_per_key_limit_is_lan_only_and_never_stores_the_raw_key():
+    litellm = _section("listen", "litellm")
+    tracks = [l for l in litellm["lines"] if "track-sc" in l]
+    limits = [l for l in litellm["lines"] if l.startswith("http-request return status 429")]
+    assert len(tracks) == 3 and len(limits) == 1
+    for l in tracks + limits:
+        assert " if lan_bind " in l, l
+    assert [l.split()[2] for l in tracks] == [
+        "req.hdr(authorization),sha2(256),hex", "req.hdr(x-api-key),sha2(256),hex", "src"]
+    assert "sc0_trackers gt" in limits[0] and "hdr Retry-After" in limits[0]
+    assert '.if !streq("${EDGE_LITELLM_MAX_CONCURRENT_PER_KEY-8}",0)' in litellm["lines"]
+    for s in _haproxy_sections():
+        if s["name"] != "litellm":
+            assert not [l for l in s["lines"] if "track-sc" in l or "stick-table" in l], s["name"]
+
+
+def test_every_listen_answers_503_with_retry_after():
+    sections = _haproxy_sections()
+    (defaults,) = [s for s in sections if s["kind"] == "defaults"]
+    default_503 = [l for l in defaults["lines"] if l.startswith("http-error status 503")]
+    assert len(default_503) == 1 and "hdr Retry-After" in default_503[0] and "%[be_name]" in default_503[0]
+    for s in sections:
+        for l in s["lines"]:
+            if l.startswith("http-error status 503"):
+                assert "hdr Retry-After" in l, s["name"]
+                if s["kind"] == "listen":
+                    assert f"{s['name']} has no healthy copy" in l, f"listen {s['name']}: 503 must name the service"
+
+
+def test_edge_env_vars_are_passed_through_and_documented():
+    cfg = "\n".join(l.split("#", 1)[0] for l in EDGE_CFG_PATH.read_text(encoding="utf-8").splitlines())
+    used = set(re.findall(r"\$\{([A-Z][A-Z0-9_]*)", cfg))
+    assert used == {"EDGE_ALLOWED_CIDRS", "EDGE_LITELLM_MAX_CONCURRENT_PER_KEY"}
+    env = _edge_compose_service().get("environment") or {}
+    assert set(env) == used, "every variable haproxy.cfg reads must be in the edge compose environment"
+    env_example = _env_example()
+    claude_md = (_ROOT / "CLAUDE.md").read_text(encoding="utf-8")
+    for var in used:
+        assert f"\n{var}=" in env_example, f"{var} missing from .env.example"
+        assert f"`{var}`" in claude_md, f"{var} missing from the CLAUDE.md config table"
+    # Space-separated (HAProxy's "${VAR[*]}" expansion), never commas -- and
+    # docker-proxy's bridge-gateway source must stay allowed.
+    cidrs = re.search(r'^EDGE_ALLOWED_CIDRS="([^"]*)"$', env_example, re.M).group(1)
+    for value in (cidrs, env["EDGE_ALLOWED_CIDRS"]):
+        assert "," not in value and "172.16.0.0/12" in value.replace("}", " ").split()
+
+
+def test_semantic_router_reaches_litellm_through_the_edge_internal_bind():
+    cfg = _yaml().safe_load((_ROOT / "ai" / "semantic-router" / "config.yaml").read_text(encoding="utf-8"))
+    urls = {ref["base_url"] for m in cfg["providers"]["models"] for ref in m["backend_refs"]}
+    assert urls == {"http://edge:14000/v1"}
+    assert ("", 14000, "internal") in _section("listen", "litellm")["binds"]
+    assert 14000 not in _edge_published_container_ports()
+    render = (_ROOT / "ai" / "semantic-router" / "envoy.yaml").read_text(encoding="utf-8")
+    body = render[render.index("\nadmin:"):]
+    assert "address: litellm" not in body
+    assert body.count("address: edge") == len(cfg["providers"]["models"])
+
+
+def test_status_page_is_read_only_and_behind_oauth2_proxy():
+    status = _section("frontend", "status")
+    assert status["binds"] == [("", 8407, "internal")]
+    assert "stats uri /edge/" in status["lines"]
+    assert not [l for l in status["lines"] if l.startswith("stats admin")]
+    upstreams = re.search(r"^OAUTH2_PROXY_UPSTREAMS=(.*)$", _env_example(), re.M).group(1).split(",")
+    assert "http://edge:8407/edge/" in upstreams and "http://n8n:5678/n8n/" in upstreams
+
+
+def test_prometheus_is_on_ai_shared_and_every_target_is_reachable_there():
+    services = _all_services()
+    _stack, prom, doc = services["prometheus"][0]
+    assert _on_ai_shared(prom, doc), "prometheus must be on ai_shared to reach its targets"
+    assert deploy.classify("prometheus", prom)[0] == deploy.RECREATE  # TSDB lock
+    scrape = _yaml().safe_load((_ROOT / "ai" / "litellm" / "prometheus.yml").read_text(encoding="utf-8"))
+    targets = [t for job in scrape["scrape_configs"] for sc in job["static_configs"] for t in sc["targets"]]
+    assert "edge:8405" in targets
+    for target in targets:
+        host = target.rsplit(":", 1)[0]
+        rows = services.get(host, [])
+        assert rows, f"scrape target {target} is not a compose service key"
+        assert any(_on_ai_shared(svc, d) for _s, svc, d in rows), f"{target} is not on ai_shared"
+    metrics = _section("frontend", "metrics")
+    assert metrics["binds"] == [("", 8405, "internal")]
+    assert "http-request use-service prometheus-exporter if { path /metrics }" in metrics["lines"]
 
 
 def test_deploy_reads_the_same_edge_listeners_as_haproxy_cfg():
     listens = deploy.load_edge_listens(str(_ROOT))
     assert listens == {name: str(bind) for name, (bind, _h, _p) in _haproxy_listens().items()}
-    assert listens["litellm"] == "4001"
-    assert "stats" not in listens
+    assert listens["litellm"] == "4001"  # the LAN bind, not the internal 14000
+    assert not {"stats", "metrics", "status"} & set(listens)
 
 
 def test_edge_is_recreated_and_waited_for():

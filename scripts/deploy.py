@@ -418,7 +418,10 @@ def parse_edge_listens(text: str) -> dict:
     """{service key: listener port} for every `listen` section of haproxy.cfg.
 
     The section name is the compose service key it fronts (see the header of
-    ai/edge/haproxy.cfg); its `bind` port is the default LAN port.
+    ai/edge/haproxy.cfg); its FIRST `bind` port is the default LAN port. A
+    later bind is internal and never published (litellm's `:14000 name
+    internal`, the semantic router's path to LiteLLM), so it is ignored, as
+    are `frontend` sections (stats, metrics, status page).
     """
     out, current = {}, None
     for raw in text.splitlines():

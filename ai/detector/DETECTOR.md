@@ -22,7 +22,7 @@ come back with no geometry at all.
 |---|---|
 | Compose file | [`docker-compose.detector.yml`](docker-compose.detector.yml) |
 | Image | built locally from [`Dockerfile.detector`](Dockerfile.detector) (build context = repo root) |
-| Host port | `PORT_DETECTOR`, default **8021** |
+| Host port | `PORT_DETECTOR`, default **8021** — published by [`ai/edge`](../edge/EDGE.md), which answers `503` + `Retry-After` while the detector is recreated or still loading its model |
 | Network | `ai_shared` |
 | Model | `DETECTOR_MODEL`, default `google/owlv2-base-patch16-ensemble` |
 | GPU | `device_ids: ['2']` — **shared with `qwen3.8-solo`** |
@@ -316,7 +316,9 @@ slowly is more useful than one that is down, and `GET /health` reports
 
 - **No auth on the service.** Same as the classifier: the LiteLLM pass-through
   does the bearer check, and direct access on `PORT_DETECTOR` is
-  unauthenticated. Do not publish that port on an untrusted network.
+  unauthenticated. Do not publish that port on an untrusted network. The edge
+  that publishes it admits only `EDGE_ALLOWED_CIDRS`
+  ([EDGE.md § LAN allow-list](../edge/EDGE.md#lan-allow-list)).
 - **URL inputs are SSRF-checked** with `common.net.validate_url` before any
   fetch — every resolved address must clear the RFC1918 / loopback /
   link-local blocklist, not just the first one. This is a check, not a tunnel:

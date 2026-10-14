@@ -15,7 +15,10 @@ Muse Glimmer's reasoning depth is set per call from `VISION_LLM_REASONING_STRENG
 is stripped server-side by the `muse_glimmer` reasoning parser, so only the JSON
 answer reaches the classifier.
 
-Base URL (direct): `http://<host>:8005`
+Base URL (direct): `http://<host>:8005` — `PORT_CLASSIFIER`, published by the
+[`ai/edge`](../edge/EDGE.md) HAProxy (limited to `EDGE_ALLOWED_CIDRS`). The
+classifier is recreated, not swapped, on `make up`; while it restarts the edge
+answers `503` with `Retry-After: 10` and `{"detail": "classifier has no healthy copy right now…"}`, so retry.
 Base URL (via LiteLLM passthrough): `http://<host>:4001/v1/classifier`
 
 All passthrough requests require `Authorization: Bearer <master-key>`.

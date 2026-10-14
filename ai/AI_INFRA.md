@@ -52,7 +52,7 @@ Every service in the list below is on the `ai_shared` network unless noted. Port
 | [`trino/docker-compose.trino.yml`](trino/docker-compose.trino.yml) | `trino-coordinator`, `trino-auth-init`, `hive-metastore`, `hive-metastore-db`, `lake-s3`, `lake-s3-init`, `trino-mcp`, `superset`, `superset-db` | `8013` (trino — HTTPS + password auth), `8014`/`8015` (lake-s3 S3 api/console — RustFS), `8016` (superset, _via edge_), `5436`/`5437` (hms-db / superset-db) — the lake-s3 console and superset also reached via oauth2-proxy at `/rustfs/` and `/superset/` | [TRINO.md](trino/TRINO.md) |
 | [`open-terminal/docker-compose.open-terminal.yml`](open-terminal/docker-compose.open-terminal.yml) | `open-terminal` | _(none — **not on `ai_shared`**; on `terminal_net`, reached only by the openwebui backend)_ | [OPEN_TERMINAL.md](open-terminal/OPEN_TERMINAL.md) |
 | [`semantic-router/docker-compose.semantic-router.yml`](semantic-router/docker-compose.semantic-router.yml) | `vllm-sr-envoy`, `vllm-sr-router`, `vllm-sr-models-init` (one-shot), `vllm-sr-dashboard` (`dashboard` profile) | `8025` (envoy listener, _via edge_) — **only** published port; router `50051`/`8080`/`9190` and envoy admin `9901` never mapped. `8026` dashboard on `127.0.0.1` only | [SEMANTIC_ROUTER.md](semantic-router/SEMANTIC_ROUTER.md) |
-| [`edge/docker-compose.edge.yml`](edge/docker-compose.edge.yml) | `edge` (HAProxy) | `4001`, `4180`, `8004`, `8008`, `8009`, `8011`, `8016`, `8022`, `8025` — the host ports of every swap-class service — plus `8005`, `8012`, `8021` (recreate-class classifier / sandbox-runner / detector, for the 503), forwarded to `<service>:<port>` over `ai_shared`. Internal only: `14000` (LiteLLM for the semantic router), `8405` (Prometheus exporter), `8407` (status page, via oauth2-proxy at `/edge/`) | [EDGE.md](edge/EDGE.md) |
+| [`edge/docker-compose.edge.yml`](edge/docker-compose.edge.yml) | `edge` (HAProxy), `edge-certs` (certbot + Cloudflare DNS plugin) | `4443` (LiteLLM over TLS, Let's Encrypt certificate from `edge-certs`), `4001`, `4180`, `8004`, `8008`, `8009`, `8011`, `8016`, `8022`, `8025` — the host ports of every swap-class service — plus `8005`, `8012`, `8021` (recreate-class classifier / sandbox-runner / detector, for the 503), forwarded to `<service>:<port>` over `ai_shared`. Internal only: `14000` (LiteLLM for the semantic router), `8405` (Prometheus exporter), `8407` (status page, via oauth2-proxy at `/edge/`). `edge-certs` publishes nothing and is not on `ai_shared`: it reaches the Cloudflare API and Let's Encrypt outbound, and hands the edge its certificate through two volumes | [EDGE.md](edge/EDGE.md) |
 | [`supabase/docker-compose.supabase.yml`](supabase/docker-compose.supabase.yml) | `supabase-db`, `supavisor`, `supabase-api` (Envoy), `auth`, `rest`, `realtime`, `storage`, `imgproxy`, `meta`, `studio`, `functions` | `8022` (gateway + Studio, _via edge_), `8023`/`8024` (pooler session/transaction), `5438` (postgres) — only these three join `ai_shared`; the other eight are on `supabase_net` | [SUPABASE.md](supabase/SUPABASE.md) |
 
 ## Flow diagram
@@ -77,10 +77,13 @@ flowchart TB
     Roofix["roofix.io<br/>(Bubble app)"]:::ext
     ExtSite["target sites<br/>(any URL)"]:::ext
     SearchEngines["upstream search engines<br/>Google, Bing, DuckDuckGo, …"]:::ext
+    CFAPI["Cloudflare API + DNS<br/>zone zeoenergy.com<br/>(DNS-01 TXT records; not the tunnel)"]:::ext
+    LE["Let's Encrypt<br/>ACME (staging / production)"]:::ext
     PkgRepos["package registries<br/>PyPI, npm, GitHub, Debian"]:::ext
 
     subgraph EDG["edge/docker-compose.edge.yml"]
-        EDGE["edge (HAProxy)<br/>LAN ports 4001 · 4180 · 8004 · 8008<br/>8009 · 8011 · 8016 · 8022 · 8025<br/>+ 8005 · 8012 · 8021 (recreate-class, 503 while down)<br/>internal :14000 (LiteLLM for the router)<br/>:8405 metrics · :8407 status page<br/>EDGE_ALLOWED_CIDRS · per-key limit on 4001"]:::svc
+        EDGE["edge (HAProxy)<br/>LAN ports 4001 · 4443 (TLS) · 4180 · 8004 · 8008<br/>8009 · 8011 · 8016 · 8022 · 8025<br/>+ 8005 · 8012 · 8021 (recreate-class, 503 while down)<br/>internal :14000 (LiteLLM for the router)<br/>:8405 metrics · :8407 status page<br/>EDGE_ALLOWED_CIDRS · per-key limit on 4001 + 4443"]:::svc
+        EDGECERTS["edge-certs<br/>certbot/dns-cloudflare<br/>Let's Encrypt cert for EDGE_TLS_DOMAIN<br/>no ports, not on ai_shared"]:::svc
     end
     subgraph CFG["cloudflared/docker-compose.cloudflared.yml"]
         CF["cloudflared<br/>tunnel"]:::svc
@@ -173,7 +176,7 @@ flowchart TB
     O2P -->|"/assets/* (skip-auth)"| OA
     O2P -. OAuth + group check .-> Google
     OWU  ==>|OpenAI API<br/>via ai_shared| LL
-    CC   ==>|"OpenAI API<br/>localhost:4001"| EDGE
+    CC   ==>|"OpenAI API<br/>localhost:4001 · https://EDGE_TLS_DOMAIN:4443"| EDGE
     EDGE ==>|"litellm:4000<br/>(from LAN :4001 and internal :14000)"| LL
     LAN  ==>|"LAN host ports"| EDGE
     EDGE -.->|":4180"| O2P
@@ -188,6 +191,10 @@ flowchart TB
     EDGE -.->|":8021 (503 while recreated / loading)"| DET
     O2P  ==>|"/edge/* status page<br/>(same-origin cookie)"| EDGE
     PROM -. scrape :8405 .-> EDGE
+    EDGECERTS -.->|"DNS-01: create / delete TXT<br/>CLOUDFLARE_DNS_API_TOKEN"| CFAPI
+    EDGECERTS -.->|"ACME order, renewal"| LE
+    LE -.->|"reads _acme-challenge TXT"| CFAPI
+    EDGECERTS -->|"/certs/edge.pem (edge_certs volume)<br/>set ssl cert + commit (edge_api socket)"| EDGE
 
     LL ==>|"model pass-through<br/>qwen3.6-unsloth"| UN
     LL ==> VQ
@@ -291,6 +298,7 @@ flowchart TB
 
 - **Public entry point** — only `cloudflared` receives inbound traffic from outside the LAN. Every request to `chat.zeoenergy.com` transits `cloudflared → oauth2-proxy → openwebui`, except `/assets/*` which oauth2-proxy short-circuits to the internal `oauth2-assets` nginx sidecar without requiring a session (used to load the branded logo on the pre-auth sign-in and error pages — see [OAUTH2_PROXY.md § Branded sign-in and error pages](oauth2-proxy/OAUTH2_PROXY.md#branded-sign-in-and-error-pages)).
 - **LAN host ports go through the edge; container traffic does not** — `make up` deploys every service labelled `com.zeo.deploy: swap` side by side (new `<service>-<hash>` copy, wait until healthy, then `docker stop` the old one within its `stop_grace_period`), so those services can no longer publish their own host ports. The `edge` HAProxy publishes them instead — same `PORT_*` values, same bind address — and forwards to `<service>:<port>` over `ai_shared`, health-checking every copy Docker DNS returns and retrying a refused connection on another copy. Only LAN / `localhost` clients take that path (`CC ==> EDGE`, `LAN ==> EDGE`); Open WebUI → LiteLLM, cloudflared → oauth2-proxy, oauth2-proxy → superset and every other edge on this diagram stay direct service-DNS calls, which Python and Go clients fail over across the two copies by themselves. On the Superset port the edge strips the `X-Auth-Request-*` / `X-Forwarded-Email|User` identity headers, closing the LAN header-spoofing hole rather than widening it. GPU, Postgres, scheduler and other singleton services stay recreate-class (`make up` prints why); three of them — `classifier` (`8005`), `sandbox-runner` (`8012`), `detector` (`8021`) — are still fronted by the edge (`EDGE -.-> CLS / SBR / DET`), so a restart answers `503` + `Retry-After` naming the service instead of refusing connections. Every LAN port the edge publishes rejects sources outside `EDGE_ALLOWED_CIDRS` (`403`), and LiteLLM's caps concurrent requests per API key (`EDGE_LITELLM_MAX_CONCURRENT_PER_KEY`, `429`). Two internal callers use the edge on purpose: the semantic router's Envoy reaches LiteLLM through `edge:14000` (`SRE ==> EDGE ==> LL`), and oauth2-proxy serves the edge's read-only HAProxy status page at `chat.zeoenergy.com/edge/` (`O2P ==> EDGE`). Prometheus scrapes the edge's built-in exporter on `edge:8405` (`PROM -.-> EDGE`); `prometheus` sits on `ai_shared` for that and for every other target it scrapes. See [EDGE.md](edge/EDGE.md).
+- **The LAN edge's TLS certificate depends on Cloudflare's API, not the tunnel** — `edge` serves LiteLLM over HTTPS on `4443` with a Let's Encrypt certificate for `EDGE_TLS_DOMAIN` (e.g. `ai.zeoenergy.com`, a DNS-only A record pointing at the box's LAN IP). `edge-certs` obtains and renews it by **DNS-01**: it creates the `_acme-challenge` TXT record through the Cloudflare API with a token scoped to the one zone (`EDGECERTS -.-> CFAPI`), Let's Encrypt reads it from Cloudflare's DNS (`LE -.-> CFAPI`), and the certificate reaches the edge through the `edge_certs` volume and HAProxy's runtime-API socket in the `edge_api` volume — no restart, no `docker.sock`. So a Cloudflare API outage or a revoked token blocks only issuance and renewal (weeks of margin); LAN TLS traffic never touches Cloudflare. Without `EDGE_TLS_DOMAIN` or the token, `4443` serves a self-signed placeholder. See [EDGE.md § TLS](edge/EDGE.md#tls) and [CLOUDFLARED.md § DNS-01 certificate for the LAN edge](cloudflared/CLOUDFLARED.md#dns-01-certificate-for-the-lan-edge-aizeoenergycom).
 - **Cloudflare caches by extension, cookies or not** — without a dashboard Cache Rule bypassing `chat.zeoenergy.com`, `.png` / `.css` / `.js` responses that oauth2-proxy authenticated get cached at the edge for 4 h and re-served to anonymous clients, and Open WebUI re-branding looks broken for hours after a recreate. See [CLOUDFLARED.md § Cache rule](cloudflared/CLOUDFLARED.md#cache-rule--bypass-for-chatzeoenergycom).
 - **Exactly one tunnel connector** — `cloudflared` must be the only connector registered for the tunnel on this host. Cloudflare load-balances across every registered connector, so a leftover host-level `cloudflared.service` serving the same tunnel id makes roughly half of all requests return 502 while the rest succeed — an intermittent failure that looks like a Cloudflare outage. Resetting the tunnel token rotates the secret on the existing tunnel; it does **not** create a new one and does **not** evict a duplicate connector. The one sanctioned exception is the few seconds of a `make up cloudflared` swap, when two copies of this same container — same config, same reachable origins — are registered. See [CLOUDFLARED.md § Exactly one connector per tunnel](cloudflared/CLOUDFLARED.md#exactly-one-connector-per-tunnel).
 - **Tunnel ingress origins are container-relative** — ingress rules live in the Cloudflare dashboard, not this repo, and are dialed from inside the `cloudflared` container, where `localhost` is the container itself. A container-hosted target uses its **container** port on the service name (`http://litellm:4000`, not the published `localhost:4001`); a host-hosted target uses `host.docker.internal`, which resolves only because the compose file declares `extra_hosts: host.docker.internal:host-gateway`. See [CLOUDFLARED.md § Origin addresses are container-relative](cloudflared/CLOUDFLARED.md#origin-addresses-are-container-relative).
@@ -321,7 +329,7 @@ Ports are sourced from `.env` (`PORT_*` variables). Defaults shown; change them 
 | Service | Host port |
 |---|---|
 | oauth2-proxy | `4180` _(via edge)_ |
-| litellm | `4001` _(via edge)_ |
+| litellm | `4001` _(via edge)_, `4443` _(HTTPS via edge, Let's Encrypt)_ |
 | litellm_db (postgres) | `5432` |
 | prometheus | `9090` |
 | openwebui | `8007` |
@@ -359,4 +367,5 @@ Ports are sourced from `.env` (`PORT_*` variables). Defaults shown; change them 
 | supavisor (pooler — session / transaction) | `8023` / `8024` |
 | supabase-db (postgres) | `5438` |
 | supabase auth / rest / realtime / storage / imgproxy / meta / studio / functions | _(none — `supabase_net` only, reached through the gateway on `8022`)_ |
-| edge (HAProxy) | `4001` `4180` `8004` `8005` `8008` `8009` `8011` `8012` `8016` `8021` `8022` `8025` _(the rows marked via edge, limited to `EDGE_ALLOWED_CIDRS`; internal only: stats CSV on `127.0.0.1:8404`, LiteLLM for the semantic router on `edge:14000`, Prometheus exporter on `edge:8405`, status page on `edge:8407` — reached at `chat.zeoenergy.com/edge/` via oauth2-proxy)_ |
+| edge (HAProxy) | `4001` `4443` (TLS) `4180` `8004` `8005` `8008` `8009` `8011` `8012` `8016` `8021` `8022` `8025` _(the rows marked via edge, limited to `EDGE_ALLOWED_CIDRS`; internal only: stats CSV on `127.0.0.1:8404`, LiteLLM for the semantic router on `edge:14000`, Prometheus exporter on `edge:8405`, status page on `edge:8407` — reached at `chat.zeoenergy.com/edge/` via oauth2-proxy)_ |
+| edge-certs (certbot, Let's Encrypt via Cloudflare DNS-01) | _(none — outbound only; hands the edge its certificate through volumes)_ |

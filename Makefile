@@ -36,8 +36,9 @@ $(eval $(call service,semantic-router,vllm-sr-models-init vllm-sr-router vllm-sr
 $(eval $(call service,supabase,supabase-db supavisor auth rest realtime imgproxy storage meta studio supabase-api functions))
 # Last on purpose: it binds the host ports the swap-class services above used
 # to publish, so on a full `make up` they must have released them first.
-# See ai/edge/EDGE.md § One-time cutover.
-$(eval $(call service,edge,edge))
+# See ai/edge/EDGE.md § One-time cutover. edge-certs (its TLS certificate,
+# EDGE.md § TLS) comes first: the edge waits for it to be healthy.
+$(eval $(call service,edge,edge-certs edge))
 
 # Introspection targets consumed by the `_make_ai_complete` bash completion
 # function (installed once via `eval "$$(make completion-bash)"`). The

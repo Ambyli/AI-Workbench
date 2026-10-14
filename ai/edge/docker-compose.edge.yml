@@ -35,8 +35,15 @@
 #                   chat.zeoenergy.com/edge/
 # Every published port rejects clients outside EDGE_ALLOWED_CIDRS (below).
 #
-# No docker.sock: sandbox-runner stays the only container that mounts it.
-# See ai/edge/EDGE.md for the cutover order and operations.
+# TLS: LiteLLM is also served over HTTPS on PORT_LITELLM_TLS (4443), with a
+# Let's Encrypt certificate that the `edge-certs` service below obtains by
+# DNS-01 through the Cloudflare API and keeps renewed. It shares the
+# certificate with the edge through the `edge_certs` volume (read-only here)
+# and pushes a renewed one into the running HAProxy through its runtime-API
+# socket in the `edge_api` volume -- no restart. See ai/edge/EDGE.md § TLS.
+#
+# No docker.sock in either service: sandbox-runner stays the only container
+# that mounts it. See ai/edge/EDGE.md for the cutover order and operations.
 
 networks:
   shared:
@@ -74,6 +81,8 @@ services:
     ports:
       # <operator PORT_* value>:<fixed listener in haproxy.cfg>
       - "${PORT_LITELLM}:4001"
+      # LiteLLM over TLS (the `lan-tls` bind; EDGE.md § TLS).
+      - "${PORT_LITELLM_TLS:-4443}:4443"
       - "${PORT_OAUTH2_PROXY}:4180"
       - "${PORT_KOKORO_API}:8004"
       - "${PORT_MADLAD_API}:8008"
@@ -107,9 +116,82 @@ services:
       # pointing at the old copy, and a reload would silently re-read it.
       # After an edit, `make up edge` reloads it (see the labels above).
       - ./:/usr/local/etc/haproxy:ro
+      # /certs/edge.pem, the `ssl crt` of every `lan-tls` bind. Written only
+      # by edge-certs; a USR2 reload or a recreate re-reads it from here.
+      - edge_certs:/certs:ro
+      # HAProxy creates its runtime-API socket here (haproxy.cfg `stats
+      # socket`); edge-certs connects to it to push a renewed certificate.
+      - edge_api:/run/haproxy-api
+    # HAProxy will not start while an `ssl crt` file is missing; edge-certs is
+    # healthy once /certs/edge.pem exists (a self-signed placeholder at
+    # first). `make up` (scripts/deploy.py) waits for this itself, since it
+    # runs compose with --no-deps.
+    depends_on:
+      edge-certs:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8404/stats"]
       interval: 10s
       timeout: 5s
       retries: 3
       start_period: 5s
+
+  edge-certs:
+    # Let's Encrypt for the edge's TLS listeners (EDGE.md § TLS). Certbot's
+    # own image with the Cloudflare DNS plugin, pinned to a release tag
+    # (v5.8.0, 2026-09-01) -- never `latest`. Alpine + Python 3.14 + openssl,
+    # no socat: entrypoint.sh and edge_certs.py (bind-mounted below) do the
+    # rest in sh and stdlib Python.
+    image: certbot/dns-cloudflare:v5.8.0
+    # Recreate-class (no com.zeo.deploy label): one long-running renew loop.
+    # Two copies would run certbot against the same /etc/letsencrypt and both
+    # push to HAProxy, and it serves nothing a swap could keep up. Fixed name
+    # so `docker exec edge-certs certbot ...` works.
+    container_name: edge-certs
+    restart: unless-stopped
+    # tini as PID 1, so `docker stop` ends the sleep loop at once.
+    init: true
+    entrypoint: ["/bin/sh", "/edge-certs/entrypoint.sh"]
+    # No ports, no ai_shared: it talks only to the Cloudflare API and Let's
+    # Encrypt (outbound HTTPS), and to HAProxy through the edge_api socket.
+    # The project's default network gives it a route out and nothing else.
+    environment:
+      # Hostname of the certificate, e.g. ai.zeoenergy.com. Empty = TLS
+      # listeners keep a self-signed placeholder for localhost.
+      EDGE_TLS_DOMAIN: "${EDGE_TLS_DOMAIN:-}"
+      # Let's Encrypt account e-mail; empty registers without one.
+      EDGE_TLS_EMAIL: "${EDGE_TLS_EMAIL:-}"
+      # Anything but 0 uses Let's Encrypt's staging CA (untrusted certs,
+      # generous rate limits). Flip to 0 once the staging cert works.
+      EDGE_TLS_STAGING: "${EDGE_TLS_STAGING:-1}"
+      # Cloudflare API token, Zone:DNS:Edit on the one zone. Passed to THIS
+      # service only, never to the edge; entrypoint.sh writes it to a 0600
+      # file on the tmpfs below and unsets it. Empty = no certificate.
+      CLOUDFLARE_DNS_API_TOKEN: "${CLOUDFLARE_DNS_API_TOKEN:-}"
+    volumes:
+      - ./certs:/edge-certs:ro
+      - edge_certs:/certs
+      - edge_api:/run/haproxy-api
+      # Account key, certificates, renewal configs. Removing it means
+      # re-issuing, which counts against Let's Encrypt's weekly limits.
+      - edge_letsencrypt:/etc/letsencrypt
+    tmpfs:
+      # The Cloudflare credentials file lives here, never on a volume.
+      - /run/edge-certs:mode=0700
+      # certbot's work dir (locks, backups); a tmpfs instead of the image's
+      # anonymous volume.
+      - /var/lib/letsencrypt
+    healthcheck:
+      # Healthy once the edge has a certificate file to load. The placeholder
+      # is written within a second of start, so `make up edge` never waits
+      # on Let's Encrypt.
+      test: ["CMD-SHELL", "test -s /certs/edge.pem"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  edge_certs:
+  edge_api:
+  edge_letsencrypt:

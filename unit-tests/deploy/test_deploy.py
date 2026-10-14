@@ -1152,8 +1152,29 @@ def _haproxy_listens():
     return {s["name"]: (s["binds"][0][1], *s["server"]) for s in _haproxy_sections() if s["kind"] == "listen"}
 
 
+# Bind names of the published (LAN) listeners: the plain `lan` bind every
+# `listen` section starts with, and `lan-tls`, the same service over TLS
+# (EDGE.md § TLS). Everything else is `name internal` and never published.
+LAN_BIND_NAMES = {"lan", "lan-tls"}
+EDGE_CERT = "/certs/edge.pem"
+
+
+def _lan_bind_ports():
+    """Container ports of every LAN bind (lan and lan-tls) across the `listen` sections."""
+    return {port for s in _haproxy_sections() if s["kind"] == "listen"
+            for _addr, port, name in s["binds"] if name in LAN_BIND_NAMES}
+
+
+def _bind_lines(section: dict) -> list:
+    return [l for l in section["lines"] if l.startswith("bind ")]
+
+
+def _edge_compose():
+    return _yaml().safe_load(EDGE_COMPOSE_PATH.read_text(encoding="utf-8"))
+
+
 def _edge_compose_service():
-    return _yaml().safe_load(EDGE_COMPOSE_PATH.read_text(encoding="utf-8"))["services"]["edge"]
+    return _edge_compose()["services"]["edge"]
 
 
 def _edge_published_container_ports():
@@ -1195,7 +1216,9 @@ def test_every_edge_backend_is_on_ai_shared_and_swap_or_portless_recreate():
 
 def test_edge_publishes_exactly_its_lan_listeners():
     ports = _edge_compose_service()["ports"]
-    assert _edge_published_container_ports() == {bind for bind, _h, _p in _haproxy_listens().values()}
+    first_binds = {bind for bind, _h, _p in _haproxy_listens().values()}
+    assert first_binds <= _lan_bind_ports()
+    assert _edge_published_container_ports() == _lan_bind_ports()
     env_example = _env_example()
     for p in ports:
         var = p.split("${", 1)[1].split("}", 1)[0].split(":-", 1)[0]
@@ -1213,8 +1236,12 @@ def test_lan_and_internal_binds_are_named_and_internal_ones_never_published():
             first, *rest = s["binds"]
             assert first[2] == "lan", f"listen {s['name']}: the first bind must be `name lan`"
             for _addr, port, name in rest:
-                assert name == "internal", f"listen {s['name']}: extra bind :{port} must be `name internal`"
-                internal.add(port)
+                assert name in ("internal", "lan-tls"), \
+                    f"listen {s['name']}: extra bind :{port} must be `name internal` or `name lan-tls`"
+                if name == "internal":
+                    internal.add(port)
+                else:
+                    assert port in published, f"listen {s['name']}: TLS bind :{port} is not published"
         elif s["kind"] == "frontend":
             for addr, port, name in s["binds"]:
                 assert addr == "127.0.0.1" or name == "internal", f"frontend {s['name']} :{port}"
@@ -1239,9 +1266,14 @@ def test_lan_allow_list_applies_to_every_lan_bind_and_no_internal_one():
         assert len(rejects) == 1, f"listen {s['name']}: expected exactly one 403 rule"
         # First http-request rule, ahead of tracking and header rewrites.
         assert next(l for l in body if l.startswith("http-request ")) == rejects[0], s["name"]
-        if len(s["binds"]) > 1:
-            # An internal bind shares the section: the reject must be limited to the LAN bind.
-            assert "acl lan_bind so_name -m str lan" in body, s["name"]
+        names = {name for _a, _p, name in s["binds"]}
+        if "internal" in names:
+            # An internal bind shares the section: the reject must be limited to
+            # the LAN binds -- every one of them, the TLS one included.
+            lan_names = names & LAN_BIND_NAMES
+            (acl_line,) = [l for l in body if l.startswith("acl lan_bind ")]
+            assert acl_line.startswith("acl lan_bind so_name -m str "), s["name"]
+            assert set(acl_line.split()[5:]) == lan_names, f"listen {s['name']}: lan_bind must match {lan_names}"
             assert rejects[0].endswith("if lan_bind !lan_allowed"), s["name"]
         else:
             assert rejects[0].endswith("unless lan_allowed"), s["name"]
@@ -1360,4 +1392,128 @@ def test_edge_is_recreated_and_waited_for():
 def test_edge_is_the_last_stack_in_the_makefile():
     calls = [line for line in (_ROOT / "Makefile").read_text(encoding="utf-8").splitlines()
              if line.startswith("$(eval $(call service,")]
-    assert calls[-1] == "$(eval $(call service,edge,edge))"
+    # edge-certs first: the edge waits for it to be healthy (EDGE.md § TLS).
+    assert calls[-1] == "$(eval $(call service,edge,edge-certs edge))"
+
+
+# ── edge TLS: the lan-tls bind and the edge-certs service (EDGE.md § TLS) ───
+
+TLS_ENV = ("EDGE_TLS_DOMAIN", "EDGE_TLS_EMAIL", "EDGE_TLS_STAGING", "CLOUDFLARE_DNS_API_TOKEN")
+
+
+def _edge_certs_service():
+    return _edge_compose()["services"]["edge-certs"]
+
+
+def _volume_strings(svc: dict) -> list:
+    return [v if isinstance(v, str) else f"{v.get('source')}:{v.get('target')}" for v in svc.get("volumes") or []]
+
+
+def test_litellm_has_a_published_tls_lan_bind_with_the_edge_certificate():
+    litellm = _section("listen", "litellm")
+    assert ("", 4443, "lan-tls") in litellm["binds"]
+    assert litellm["binds"][0] == ("", 4001, "lan")  # deploy.py still reads the plain LAN port
+    assert deploy.parse_edge_listens(EDGE_CFG_PATH.read_text(encoding="utf-8"))["litellm"] == "4001"
+    ports = _edge_compose_service()["ports"]
+    assert "${PORT_LITELLM_TLS:-4443}:4443" in ports
+    # The TLS bind is a LAN bind: both the allow-list and the per-key limit
+    # are keyed on lan_bind, which must match it.
+    assert "acl lan_bind so_name -m str lan lan-tls" in litellm["lines"]
+    for l in litellm["lines"]:
+        if "track-sc0" in l or l.startswith(("http-request return status 429", "http-request return status 403")):
+            assert " if lan_bind" in l, l
+
+
+def test_every_tls_bind_is_a_lan_bind_serving_the_edge_certificate():
+    tls_binds = 0
+    for s in _haproxy_sections():
+        for line in _bind_lines(s):
+            words = line.split()
+            name = words[words.index("name") + 1] if "name" in words else None
+            if "ssl" in words or name == "lan-tls":
+                tls_binds += 1
+                assert s["kind"] == "listen" and name == "lan-tls", f"{s['name']}: {line}"
+                assert words[words.index("crt") + 1] == EDGE_CERT, f"{s['name']}: {line}"
+                assert words[words.index("alpn") + 1] == "h2,http/1.1", f"{s['name']}: {line}"
+    assert tls_binds >= 1
+
+
+def test_edge_runtime_api_socket_is_a_unix_socket_on_the_shared_volume():
+    (glob,) = [s for s in _haproxy_sections() if s["kind"] == "global"]
+    sockets = [l for l in glob["lines"] if l.startswith("stats socket ")]
+    assert sockets == ["stats socket /run/haproxy-api/admin.sock mode 660 level admin"]
+    vols = _volume_strings(_edge_compose_service())
+    assert "edge_certs:/certs:ro" in vols  # read-only: only edge-certs writes the certificate
+    assert "edge_api:/run/haproxy-api" in vols
+    assert EDGE_CERT.rsplit("/", 1)[0] == "/certs"
+    assert set(_edge_compose()["volumes"]) == {"edge_certs", "edge_api", "edge_letsencrypt"}
+
+
+def test_edge_certs_is_recreate_class_without_ports_docker_sock_or_gpu():
+    svc = _edge_certs_service()
+    cls, reason = deploy.classify("edge-certs", svc)
+    assert cls == deploy.RECREATE and "not labelled com.zeo.deploy=swap" in reason
+    assert deploy.SWAP_LABEL not in deploy.service_labels(svc)
+    assert not svc.get("ports") and not deploy.published_ports(svc)
+    assert not deploy.has_gpu(svc)
+    assert svc.get("restart") == "unless-stopped"  # a long-running loop, not a oneshot
+    assert deploy.has_healthcheck(svc)
+    assert "test -s /certs/edge.pem" in " ".join(svc["healthcheck"]["test"])
+    image = svc["image"]
+    assert image.startswith("certbot/dns-cloudflare:v") and not image.endswith(":latest")
+    vols = _volume_strings(svc)
+    assert "edge_certs:/certs" in vols and "edge_api:/run/haproxy-api" in vols
+    assert "edge_letsencrypt:/etc/letsencrypt" in vols
+    # The Cloudflare credentials file goes on a tmpfs, never a volume.
+    assert any(t.startswith("/run/edge-certs") for t in svc.get("tmpfs") or [])
+    assert "networks" not in svc  # the project's default network: a route out, no ai_shared
+    assert svc["entrypoint"] == ["/bin/sh", "/edge-certs/entrypoint.sh"]
+    assert "./certs:/edge-certs:ro" in vols
+    for name in ("entrypoint.sh", "edge_certs.py"):
+        data = (_ROOT / "ai" / "edge" / "certs" / name).read_bytes()
+        assert b"\r\n" not in data, f"ai/edge/certs/{name} must stay LF"
+
+
+def test_no_edge_service_mounts_docker_sock():
+    for key, svc in _edge_compose()["services"].items():
+        for v in _volume_strings(svc):
+            assert "docker.sock" not in v, f"{key} mounts docker.sock; sandbox-runner must stay the only one"
+
+
+def test_edge_waits_for_edge_certs_to_be_healthy():
+    edge = _edge_compose_service()
+    assert edge["depends_on"] == {"edge-certs": {"condition": "service_healthy"}}
+    # deploy.py runs compose with --no-deps and honours the condition itself:
+    # edge-certs is deployed first and the edge waits for its healthcheck.
+    services = {k: dict(v) for k, v in _edge_compose()["services"].items()}
+    images = {s["image"]: f"sha256:{k}" for k, s in services.items()}
+    fake = FakeDocker(services, images=images)
+    fake.add("edge-certs", "edge-certs", health=["starting", "starting", "healthy"])
+    rc, out = run(fake, "edge")
+    assert rc == 0, out
+    assert "order: edge-certs, edge" in out
+    ups = [c for c in fake.mutating() if c.startswith("compose up")]
+    assert ups == ["compose up -d --no-deps edge-certs", "compose up -d --no-deps edge"]
+    assert deploy.dependency_order(services, ["edge"]) == ["edge-certs", "edge"]
+
+
+def test_tls_env_vars_are_documented_and_reach_edge_certs_only():
+    env_example = _env_example()
+    claude_md = (_ROOT / "CLAUDE.md").read_text(encoding="utf-8")
+    certs_env = _edge_certs_service()["environment"]
+    edge_env = _edge_compose_service().get("environment") or {}
+    for var in TLS_ENV + ("PORT_LITELLM_TLS",):
+        assert f"\n{var}=" in env_example, f"{var} missing from .env.example"
+        assert f"`{var}`" in claude_md, f"{var} missing from the CLAUDE.md config table"
+    for var in TLS_ENV:
+        assert var in certs_env, f"{var} not passed to edge-certs"
+        assert certs_env[var].startswith("${" + var), certs_env[var]
+        assert var not in edge_env, f"{var} must not reach the edge"
+    # Safe defaults: staging until the operator flips it, no token in the example.
+    assert re.search(r"^EDGE_TLS_STAGING=1$", env_example, re.M)
+    assert re.search(r"^CLOUDFLARE_DNS_API_TOKEN=$", env_example, re.M)
+    assert re.search(r"^EDGE_TLS_DOMAIN=$", env_example, re.M)
+    assert certs_env["EDGE_TLS_STAGING"] == "${EDGE_TLS_STAGING:-1}"
+    # PORT REGISTRY: 4443 is taken by nothing else.
+    registry = re.findall(r"^PORT_[A-Z0-9_]+=(\d+)", env_example, re.M)
+    assert registry.count("4443") == 1

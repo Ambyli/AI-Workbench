@@ -6,6 +6,10 @@ Cloudflare Zero Trust tunnel. No inbound firewall rule, no public IP.
 Compose file: [`docker-compose.cloudflared.yml`](docker-compose.cloudflared.yml).
 Config: `CLOUDFLARE_TUNNEL_TOKEN` in `.env`.
 
+Separately, the LAN edge's TLS certificate uses Cloudflare's DNS and API (not
+the tunnel) with its own token, `CLOUDFLARE_DNS_API_TOKEN`: see
+[DNS-01 certificate for the LAN edge](#dns-01-certificate-for-the-lan-edge-aizeoenergycom).
+
 Ingress rules (which hostname maps to which origin) live in the **Cloudflare
 Zero Trust dashboard**, not in this repo. The token identifies the tunnel; the
 dashboard supplies the routing table, which the connector pulls on connect and
@@ -151,6 +155,133 @@ Verify with the `curl -sI` above: `cf-cache-status` should read `DYNAMIC` or
 `BYPASS`, and the anonymous request should get oauth2-proxy's `403`.
 `api.zeoenergy.com` needs no rule — LiteLLM answers JSON on extension-less
 paths, which Cloudflare never caches by default.
+
+---
+
+## DNS-01 certificate for the LAN edge (ai.zeoenergy.com)
+
+**This section is not about the tunnel.** It uses Cloudflare's **DNS** and its
+**API**, and nothing in `cloudflared`.
+
+The LAN edge ([`ai/edge`](../edge/EDGE.md)) serves LiteLLM over HTTPS on port
+`4443` with a Let's Encrypt certificate for the name in `EDGE_TLS_DOMAIN`,
+`ai.zeoenergy.com` here. Its `edge-certs` container gets that certificate with
+a **DNS-01** challenge: it creates the TXT record
+`_acme-challenge.ai.zeoenergy.com` through the Cloudflare API, Let's Encrypt
+reads it from Cloudflare's nameservers, and the record is deleted again. LAN
+clients connect straight to the box's LAN address: their traffic never passes
+through Cloudflare or the tunnel. The full checklist (`.env`, `make up edge`,
+staging → production, moving clients) is in
+[EDGE.md § TLS](../edge/EDGE.md#tls); the two Cloudflare steps are here.
+
+### The API token
+
+1. Cloudflare dashboard → **My Profile** (top right) → **API Tokens** →
+   **Create Token**.
+2. Next to **Edit zone DNS**, click **Use template**. Its permission is
+   already filled in: **Zone · DNS · Edit**. Leave it as the only one.
+3. **Zone Resources**: **Include** → **Specific zone** → `zeoenergy.com`.
+   Never "All zones".
+4. Optional: **Client IP Address Filtering** to the office's public address,
+   and a **TTL** end date (then put the rotation in a calendar).
+5. **Continue to summary** → **Create Token**. Cloudflare shows the token
+   **once**. Put it in the box's `.env` as `CLOUDFLARE_DNS_API_TOKEN`, and
+   nowhere else: not chat, not a ticket, not the repo, not `.env.example`.
+6. To check it on the box without leaving it in shell history:
+   ```bash
+   read -rs CF && curl -s https://api.cloudflare.com/client/v4/user/tokens/verify \
+     -H "Authorization: Bearer $CF"; unset CF
+   ```
+   Expect `"status":"active"`.
+
+This token has nothing to do with `CLOUDFLARE_TUNNEL_TOKEN` above: that one
+identifies the tunnel, this one edits DNS records.
+
+### The DNS record
+
+Cloudflare dashboard → `zeoenergy.com` → **DNS** → **Records** → **Add
+record**:
+
+| Type | Name | IPv4 address | Proxy status | TTL |
+|---|---|---|---|---|
+| `A` | `ai` | `192.168.5.240` | **DNS only** (grey cloud) | Auto |
+
+- **DNS only, never proxied.** An orange-cloud record would answer with
+  Cloudflare's addresses, and Cloudflare's proxy would then try to reach
+  `192.168.5.240` from the internet. It cannot, because that is a private
+  address, so every client would get a Cloudflare error page. And LAN traffic
+  would leave the building.
+- **No tunnel public hostname for this name.** One would create a proxied
+  CNAME for `ai.zeoenergy.com` that clashes with this record.
+- The record is what clients resolve. Issuance does not need it: DNS-01 only
+  uses the TXT record `edge-certs` creates and deletes. It does publish the
+  box's private address to anyone who looks the name up, which says little
+  but is not nothing.
+
+### Check DNS-rebind protection
+
+Many routers and LAN resolvers drop a public DNS answer that points at a
+private address (DNS-rebinding protection). From a **LAN laptop**, not the
+box:
+
+```bash
+nslookup ai.zeoenergy.com            # the LAN's resolver
+nslookup ai.zeoenergy.com 1.1.1.1    # a public resolver, for comparison
+```
+
+(On Windows PowerShell, `Resolve-DnsName ai.zeoenergy.com` works too.) Both
+must answer `192.168.5.240`. If the public resolver does and the LAN's does not
+(no answer, `NXDOMAIN`, or `Server failed`), the LAN resolver is filtering it.
+Fix it on the router or LAN DNS server, in order of preference:
+
+1. **A local DNS override** (a host override / static DNS entry):
+   `ai.zeoenergy.com` → `192.168.5.240`. LAN clients then do not depend on
+   public DNS at all.
+2. **Exempt the domain** from rebind protection: for example
+   `rebind-domain-ok=/zeoenergy.com/` in dnsmasq, or `private-domain:
+   "zeoenergy.com"` in Unbound (pfSense / OPNsense custom options).
+3. For one machine only: `192.168.5.240 ai.zeoenergy.com` in its hosts file.
+
+### What the token can and cannot do
+
+**It can** list, create, change and delete **any DNS record in
+`zeoenergy.com`**: `chat`, `api`, the MX, SPF, DKIM and DMARC records, all of
+them. Whoever holds it could therefore redirect the company's web and mail
+traffic, or prove control of any name in the zone and get a trusted
+certificate for it, the same way `edge-certs` does. That is the blast radius:
+the whole zone's DNS.
+
+**It cannot** touch other zones, the account, members, billing or other
+tokens, the tunnel or anything in Zero Trust (Access, `cloudflared`
+configuration), cache and WAF rules, or Workers, and it cannot read anyone's
+traffic.
+
+Cloudflare cannot scope a token to a single record, so keep the rest tight:
+
+- one zone only (never all zones, never the Global API Key);
+- IP filtering if the office's address is stable;
+- it lives only in the box's `.env`, and only the `edge-certs` container
+  receives it (not the edge). `edge-certs` keeps it in a `0600` file on a
+  tmpfs and never logs it ([EDGE.md § TLS](../edge/EDGE.md#how-it-works));
+- changes made with it show up in Cloudflare's **Audit Log** (Manage Account
+  → Audit Log).
+
+### Rotating or revoking the token
+
+- **Rotate:** My Profile → API Tokens → the token's **⋯** menu → **Roll**
+  (a new secret with the same permissions; the old one stops working at once),
+  or create a new token as above. Put the new value in `.env`, run
+  `make up edge` (it recreates only `edge-certs`), then delete the old token if
+  you created a new one. Check with `docker exec edge-certs certbot renew
+  --dry-run`. More in [EDGE.md § Rotating the Cloudflare
+  token](../edge/EDGE.md#rotating-the-cloudflare-token).
+- **Revoke** (a leak, or someone leaving): **Delete** the token in the same
+  menu. Nothing breaks right away: the token is only used when a certificate
+  is issued or renewed. The current certificate keeps serving until it
+  expires, and `edge-certs` logs `Invalid access token` (code 9109) at the next
+  renewal attempt, so set a new token within a few weeks. After a leak, also
+  look through the zone's DNS records and the Audit Log for changes you did not
+  make.
 
 ---
 

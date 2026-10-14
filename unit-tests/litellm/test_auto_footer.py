@@ -117,6 +117,15 @@ OWUI_FOLLOW_UP = "### Task:\nSuggest 3-5 relevant follow-up questions or prompts
 OWUI_QUERY = "### Task:\nAnalyze the chat history to determine the necessity of generating search queries, in the given language. ..."
 OWUI_AUTOCOMPLETE = "### Task:\nYou are an autocompletion system. Continue the text in `<text>` ..."
 OWUI_EMOJI = "Your task is to reflect the speaker's likely facial expression through a fitting emoji. ...\n\nMessage: ```hi```"
+# The default RAG template, PREPENDED to the user's own message when a model
+# with knowledge retrieves sources (RAG_SYSTEM_CONTEXT unset ->
+# add_or_update_user_message(..., append=False)). Starts "### Task:" too.
+OWUI_RAG = (
+    "### Task:\nRespond to the user query using the provided context, incorporating inline citations in the format [id] "
+    "**only when the <source> tag includes an explicit id attribute** (e.g., <source id=\"1\">).\n...\n"
+    "<context>\n<source id=\"1\">...</source>\n</context>\n"
+    "\nHow long did projects sit in the 'Audit and Submit M1' queue?"
+)
 
 
 @pytest.mark.parametrize("prompt", [OWUI_TITLE, OWUI_TAGS, OWUI_FOLLOW_UP, OWUI_QUERY, OWUI_AUTOCOMPLETE, OWUI_EMOJI])
@@ -129,6 +138,24 @@ def test_openwebui_task_prompts_are_detected(prompt):
     # List-of-parts content too.
     data["messages"][-1] = {"role": "user", "content": [{"type": "text", "text": prompt}]}
     assert is_openwebui_task(data)
+    # Open WebUI sends every task with stream=False; a streamed request is a chat answer.
+    data["stream"] = True
+    assert not is_openwebui_task(data)
+
+
+def test_streamed_answer_with_rag_template_is_not_a_task():
+    """Regression (chat ed3ef662, 2026-10-14): a knowledge-backed model's answer
+    lost its footer because the "### Task:" RAG template is prepended to the
+    user's message -- for every request of the turn, tool loop included."""
+    data = {"model": "auto", "stream": True, "messages": [
+        {"role": "system", "content": "You are the office assistant."},
+        {"role": "user", "content": OWUI_RAG},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "t"}]},
+        {"role": "tool", "tool_call_id": "t", "content": "[]"},
+    ]}
+    assert not is_openwebui_task(data)
+    data["messages"][1] = {"role": "user", "content": [{"type": "text", "text": OWUI_RAG}]}
+    assert not is_openwebui_task(data)
 
 
 def test_openwebui_legacy_function_calling_is_detected():
@@ -598,10 +625,13 @@ def test_stream_scope_tools_tasks_and_reasoning():
     chunks = stream_chunks(["thinking out loud"], finish="tool_calls")
     chunks.insert(1, tool)
     assert FOOTER_GENERAL not in joined(collect(h, chunks))
-    # response_format / Open WebUI task: skipped
+    # response_format / Open WebUI legacy function calling: skipped
     assert collect(h, stream_chunks(["{}"]), data=auto_data(stream=True, response_format={"type": "json_object"}))
-    assert FOOTER_GENERAL not in joined(collect(
-        h, stream_chunks(["Rain"]), data=auto_data(stream=True, messages=[{"role": "user", "content": OWUI_TITLE}])))
+    assert FOOTER_GENERAL not in joined(collect(h, stream_chunks(["Rain"]), data=auto_data(stream=True, messages=[
+        {"role": "system", "content": "Available Tools: [{...}]"}, {"role": "user", "content": "Query: rain?"}])))
+    # A streamed answer under the "### Task:" RAG template is a chat answer: footer.
+    assert joined(collect(h, stream_chunks(["Rain"]), data=auto_data(
+        stream=True, messages=[{"role": "user", "content": OWUI_RAG}]))) == "Rain" + FOOTER_GENERAL
     # reasoning-only stream: nothing to put a footer on
     assert FOOTER_GENERAL not in joined(collect(h, stream_chunks([], reasoning="hmm")))
     # reasoning + content: reasoning untouched, footer on content

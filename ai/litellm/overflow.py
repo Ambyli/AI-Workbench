@@ -122,7 +122,9 @@ when the name is in the leaf class's ``__dict__`` (proxy/utils.py:1718-1745),
 so a mixin or base class would silently never run. They skip tool calls,
 ``response_format`` requests and Open WebUI background tasks (title / tags /
 follow-ups / queries / autocomplete / emoji / legacy function calling, which
-are detected by their default prompt templates), strip a previous footer
+are detected by their default prompt templates on a non-streaming request --
+a streamed answer whose user message carries the "### Task:" RAG template
+still gets its footer), strip a previous footer
 from incoming assistant messages, and never throw. AUTO_FOOTER_ENABLED=false
 turns the whole feature off. See ai/litellm/LITELLM.md > The `auto` footer.
 """
@@ -519,6 +521,14 @@ FOOTER_RE = re.compile(
 # (utils/middleware.py:1351-1373) sends a system message starting
 # "Available Tools:". MOA (config.py:2443) is a user-visible answer and is
 # deliberately NOT treated as a task.
+#
+# The prefixes only count on a NON-streaming request: every task above is sent
+# with stream=False (routers/tasks.py), while the RAG template
+# (DEFAULT_RAG_TEMPLATE) also starts "### Task:" and, with RAG_SYSTEM_CONTEXT
+# unset, is PREPENDED to the user's own message (utils/middleware.py,
+# add_or_update_user_message(..., append=False)) -- so a streamed chat answer
+# that used knowledge retrieval would otherwise look like a task and lose its
+# footer for the whole turn.
 OWUI_TASK_PREFIXES = (
     "### Task:",
     "Your task is to reflect the speaker's likely facial expression",
@@ -607,14 +617,15 @@ def is_openwebui_task(data: Any) -> bool:
             return True
         if m.get("role") == "user":
             last_user = text
-    if last_user is None:
+    # Open WebUI sends every task except MOA with stream=False; a streamed
+    # request is a chat answer even when it starts "### Task:" (the RAG template).
+    if last_user is None or data.get("stream"):
         return False
     text = last_user.lstrip()
     if text.startswith(OWUI_TASK_PREFIXES):
         return True
-    # Admin-customised task templates usually keep the defaults' <chat_history>
-    # block; Open WebUI sends every task except MOA with stream=False.
-    return not data.get("stream") and "<chat_history>" in text and "</chat_history>" in text
+    # Admin-customised task templates usually keep the defaults' <chat_history> block.
+    return "<chat_history>" in text and "</chat_history>" in text
 
 
 def _get(obj: Any, key: str) -> Any:

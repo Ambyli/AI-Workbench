@@ -1,4 +1,4 @@
-Zeo patch 0003 — a model's default OAuth MCP tools never redirect a new chat.
+Zeo patch 0003 — a model's default OAuth MCP tools follow the user's real connection, and never redirect a new chat.
 
 Target: Open WebUI v0.11.4 (ghcr.io/open-webui/open-webui:v0.11.4).
 Applied by ai/openwebui/Dockerfile.openwebui with `patch -p1` from /app.
@@ -9,31 +9,50 @@ browser straight to /oauth/clients/mcp:<id>/authorize, and blocks sending
 until the integration is connected. Users the MCP server does not authorise
 land on its "not authorised" page on every new chat.
 
-This patch removes unconnected OAuth MCP tool ids from info.meta.toolIds in
-the GET /api/models response, per user, so the chat page never treats them
-as defaults: no redirect, no blocked send, the model runs without the tool.
-The tool is still listed in the chat's Integrations menu in its "connect"
-state; a user the server authorises connects once from there, after which
-the tool is a default again on every new chat. "Connected" uses the same
-oauth_client_manager.get_oauth_token check as GET /api/v1/tools, so the two
-responses cannot disagree. Response only — model rows are never changed.
+This patch filters OAuth MCP tool ids out of info.meta.toolIds in the
+GET /api/models response, per user, unless the user is really connected:
+a token (oauth_client_manager.get_oauth_token, the same call GET
+/api/v1/tools derives `authenticated` from) AND the MCP server accepts it
+(an `initialize` sent with the headers a real tool call sends). Connected:
+the tool is on in every new chat. Refused (401, or 403 invalid_token): the
+token is renewed once and retried; a second refusal deletes the session, so
+the Integrations menu shows "connect". No answer (timeout, 5xx, 429): off for
+now, session kept, back on by itself when the server answers. Verdicts are
+cached 60 s (accepted) / 15 s (otherwise) per user and access token, and
+concurrent page-load lookups share one check, bounded at 6 s. Response only
+— model rows are never changed.
+
+It also makes OAuthClientManager.get_oauth_token refresh single-flight. The
+chat layout fetches /api/models and /api/v1/tools together on every page
+load, and both look the token up; upstream refreshed an expiring token once
+per caller with the same refresh token, a server that rotates refresh tokens
+refused all but the first, and the losers deleted the session the winner had
+just renewed. That is why a user with valid credentials found the tool off
+after every access-token expiry. Now one refresh runs per (user, client), the
+rest reuse its result, and a session is deleted only when it can never be
+renewed (the token endpoint answers 400/401, or the token has expired with
+no refresh token). A transient refresh failure keeps the session. A
+non-refreshable token is served until it really expires instead of being
+deleted five minutes early.
 
 Backend only on purpose: the upstream image ships the Svelte frontend
 pre-compiled, so patching Chat.svelte would mean rebuilding the bundle.
 
 Files: backend/open_webui/main.py,
+       backend/open_webui/utils/oauth.py,
        backend/open_webui/utils/mcp_oauth_defaults.py (new).
 See ai/openwebui/OPENWEBUI.md § MCP tools (Phoenix) and § Custom image.
 
---- a/backend/open_webui/main.py	2026-10-07 13:40:20.611595400 -0600
-+++ b/backend/open_webui/main.py	2026-10-07 13:40:36.600697700 -0600
-@@ -912,6 +912,13 @@
+--- a/backend/open_webui/main.py
++++ b/backend/open_webui/main.py
+@@ -912,6 +912,14 @@
      # models the caller can actually see.
      models = await get_filtered_models(models, user)
  
 +    # ZEO PATCH (ai/openwebui/patches/0003-oauth-mcp-defaults-no-redirect.patch):
-+    # drop default OAuth MCP tools this user has not connected, so opening a
-+    # chat never redirects to the MCP server's authorize page.
++    # a model's default OAuth MCP tools stay defaults only while the MCP server
++    # accepts this user's token, so opening a chat never redirects to the MCP
++    # server's authorize page.
 +    from open_webui.utils.mcp_oauth_defaults import drop_unconnected_oauth_tool_defaults
 +
 +    models = await drop_unconnected_oauth_tool_defaults(request, user, models)
@@ -41,12 +60,155 @@ See ai/openwebui/OPENWEBUI.md § MCP tools (Phoenix) and § Custom image.
      for model in models:
          info = model.get('info') if isinstance(model.get('info'), dict) else {}
          meta = info.get('meta') if isinstance(info.get('meta'), dict) else {}
---- /dev/null	2026-10-07 13:40:36.000000000 -0600
-+++ b/backend/open_webui/utils/mcp_oauth_defaults.py	2026-10-07 13:40:20.613105600 -0600
-@@ -0,0 +1,81 @@
+--- a/backend/open_webui/utils/oauth.py
++++ b/backend/open_webui/utils/oauth.py
+@@ -247,6 +247,30 @@
+     return token
+ 
+ 
++# ZEO PATCH (ai/openwebui/patches/0003-oauth-mcp-defaults-no-redirect.patch):
++# OAuthClientManager.get_oauth_token refreshes single-flight and deletes a
++# session only when it can never be renewed. Upstream refreshes once per
++# caller, and the chat layout asks for GET /api/models and GET /api/v1/tools
++# together on every page load; both look the MCP token up, so an expiring
++# token was refreshed twice with the same refresh token. A server that
++# rotates refresh tokens (OAuth 2.1) refuses the second, and upstream then
++# deleted the session the first had just renewed: a user with valid
++# credentials was disconnected every time their access token expired.
++class _ZeoRefreshRejected(Exception):
++    """The token endpoint refused the refresh token (HTTP 400/401, RFC 6749 § 5.2)."""
++
++
++_ZEO_REFRESH_LOCKS: dict[tuple[str, str], asyncio.Lock] = {}
++
++
++def _zeo_needs_refresh(expires_at) -> bool:
++    return expires_at is None or datetime.now() + timedelta(minutes=5) >= datetime.fromtimestamp(expires_at)
++
++
++def _zeo_expired(expires_at) -> bool:
++    return expires_at is None or datetime.now() >= datetime.fromtimestamp(expires_at)
++
++
+ FERNET = None
+ 
+ if len(OAUTH_CLIENT_INFO_ENCRYPTION_KEY) != 44:
+@@ -1058,27 +1082,67 @@
+                 log.warning(f'No OAuth session found for user {user_id}, client_id {client_id}')
+                 return None
+ 
+-            if (
+-                force_refresh
+-                or session.expires_at is None
+-                or datetime.now() + timedelta(minutes=5) >= datetime.fromtimestamp(session.expires_at)
+-            ):
+-                log.debug('Token refresh needed for user %s, client_id %s', user_id, session.provider)
+-                refreshed_token = await self._refresh_token(session)
+-                if refreshed_token:
+-                    return refreshed_token
+-                else:
+-                    log.warning(
+-                        f'Token refresh failed for user {user_id}, client_id {session.provider}, deleting session {session.id}'
+-                    )
+-                    await OAuthSessions.delete_session_by_id(session.id)
+-                    return None
++            if force_refresh or _zeo_needs_refresh(session.expires_at):
++                return await self._zeo_refresh_single_flight(user_id, client_id, session, force_refresh)
+             return session.token
+ 
+         except Exception as e:
+             log.error(f'Error getting OAuth token for user {user_id}: {e}')
+             return None
+ 
++    async def _zeo_refresh_single_flight(self, user_id: str, client_id: str, seen, force_refresh: bool):
++        """ZEO PATCH (0003): one refresh at a time per (user, client); see _ZeoRefreshRejected.
++
++        The session is deleted only when it can never be renewed: the token
++        endpoint refused the refresh token, or the access token has expired
++        and there is no refresh token. A failure that may pass (network, 5xx,
++        429, discovery) keeps the session and its token while that token is
++        still valid, so the connection comes back by itself.
++        """
++        lock = _ZEO_REFRESH_LOCKS.setdefault((user_id, client_id), asyncio.Lock())
++        async with lock:
++            session = await OAuthSessions.get_session_by_provider_and_user_id(client_id, user_id)
++            if not session:
++                return None
++            # Refreshed (or reconnected) by whoever held the lock before us.
++            if session.token != seen.token and not _zeo_needs_refresh(session.expires_at):
++                return session.token
++            if not force_refresh and not _zeo_needs_refresh(session.expires_at):
++                return session.token
++
++            if not session.token.get('refresh_token'):
++                if _zeo_expired(session.expires_at):
++                    log.warning(
++                        f'OAuth token for user {user_id}, client_id {client_id} expired with no refresh token, '
++                        f'deleting session {session.id}'
++                    )
++                    await OAuthSessions.delete_session_by_id(session.id)
++                    return None
++                return session.token
++
++            log.debug('Token refresh needed for user %s, client_id %s', user_id, client_id)
++            try:
++                refreshed_token = await self._refresh_token(session)
++            except _ZeoRefreshRejected as e:
++                # Another worker may have rotated the refresh token under us.
++                current = await OAuthSessions.get_session_by_provider_and_user_id(client_id, user_id)
++                if current and current.token != session.token:
++                    return None if _zeo_expired(current.expires_at) else current.token
++                log.warning(
++                    f'Token refresh rejected ({e}) for user {user_id}, client_id {client_id}, '
++                    f'deleting session {session.id}'
++                )
++                await OAuthSessions.delete_session_by_id(session.id)
++                return None
++
++            if refreshed_token:
++                return refreshed_token
++            log.warning(
++                f'Token refresh for user {user_id}, client_id {client_id} did not complete; '
++                f'keeping session {session.id} to retry'
++            )
++            return None if _zeo_expired(session.expires_at) else session.token
++
+     async def _refresh_token(self, session) -> dict:
+         """
+         Refresh an OAuth token if needed, with concurrency protection.
+@@ -1102,6 +1166,8 @@
+                 log.error(f'Failed to refresh token for session {session.id}')
+                 return None
+ 
++        except _ZeoRefreshRejected:
++            raise
+         except Exception as e:
+             log.error(f'Error refreshing token for session {session.id}: {e}')
+             return None
+@@ -1185,8 +1251,15 @@
+                     else:
+                         error_text = await r.text()
+                         log.error(f'Token refresh failed for client_id {client_id}: {r.status} - {error_text}')
++                        # ZEO PATCH (0003): 400/401 is the token endpoint refusing
++                        # the refresh token, which no retry fixes. Anything else
++                        # (5xx, 429, a proxy's 403) may pass.
++                        if r.status in (400, 401):
++                            raise _ZeoRefreshRejected(f'HTTP {r.status}')
+                         return None
+ 
++        except _ZeoRefreshRejected:
++            raise
+         except Exception as e:
+             log.error(f'Exception during token refresh for client_id {client_id}: {e}')
+             return None
+--- /dev/null
++++ b/backend/open_webui/utils/mcp_oauth_defaults.py
+@@ -0,0 +1,244 @@
 +"""ZEO PATCH (ai/openwebui/patches/0003-oauth-mcp-defaults-no-redirect.patch).
 +
-+Stops a model's default OAuth MCP tools from hijacking the page.
++A model's default OAuth MCP tools (Phoenix) follow the user's real
++connection: on in every new chat while the MCP server accepts the user's
++token, off — with no redirect — while it does not.
 +
 +Upstream: when a new chat opens on a model whose default tools
 +(``info.meta.toolIds``) include an OAuth 2.1 MCP server the user has no
@@ -56,36 +218,204 @@ See ai/openwebui/OPENWEBUI.md § MCP tools (Phoenix) and § Custom image.
 +does not authorise, that is a dead end on the server's "not authorised"
 +page, every time they open a chat.
 +
-+This module removes such tool ids from the model list returned to THAT user
-+(``GET /api/models``), so the chat page never sees them as defaults: no
-+redirect, no blocked send, the model simply runs without the tool. The tool
-+stays listed in the chat's Integrations menu with its "connect" state, so a
-+user the server does authorise connects once from there; from then on the
-+token exists and the tool is a default again.
++This module filters such tool ids out of the model list returned to THAT
++user (``GET /api/models``). A tool stays a default only when both hold:
 +
-+"Connected" is decided exactly as ``GET /api/v1/tools`` decides its
-+``authenticated`` flag (``oauth_client_manager.get_oauth_token``), so the two
-+responses cannot disagree — a disagreement would put the redirect back.
++1. **A token.** ``oauth_client_manager.get_oauth_token`` — the call
++   ``GET /api/v1/tools`` derives its ``authenticated`` flag from, renewing an
++   expiring token. The renewal is single-flight; see the ``oauth.py`` hunk of
++   this patch for the race that used to disconnect users here.
++2. **The MCP server accepts it.** An ``initialize`` request is sent with the
++   headers a real tool call sends (``build_tool_server_headers``). A 401, or
++   a 403 whose ``WWW-Authenticate`` names ``invalid_token`` /
++   ``insufficient_scope``, is a refusal: the token is renewed once and asked
++   again, and a second refusal deletes the session, so the Integrations menu
++   shows the tool's "connect" state and ``GET /api/v1/tools`` agrees.
++   No answer (timeout, connection error, 5xx, 429, a bare 403 from a proxy)
++   proves nothing either way: the tool is left out for now but the session is
++   kept, so it comes back by itself once the server answers.
++
++Upstream redirects only when a tool is BOTH in the defaults AND
++``authenticated: false`` in ``GET /api/v1/tools``. A tool is kept here only
++with a live session the server accepted, and a session is deleted only on a
++path that has already dropped the tool, so that pair cannot be produced.
++
++Verdicts are cached per (user, server) against the access token they were
++reached with — accepted for ``_ACCEPTED_TTL_S``, anything else for
++``_UNSETTLED_TTL_S`` — and concurrent lookups share one check, because the
++app requests the model list several times on every page load. The whole
++check is bounded by ``_CHECK_TIMEOUT_S`` so a hung MCP server cannot stall
++the model list; a check that outlives it finishes in the background and
++fills the cache.
++
 +Only the response is changed: model rows in the DB and ``app.state.MODELS``
 +are never mutated.
 +"""
 +
 +from __future__ import annotations
 +
++import asyncio
++import hashlib
 +import logging
++import time
 +
++import aiohttp
 +from fastapi import Request
++from mcp.types import LATEST_PROTOCOL_VERSION
++from open_webui.env import AIOHTTP_CLIENT_SESSION_SSL
 +from open_webui.models.config import Config
++from open_webui.models.oauth_sessions import OAuthSessions
 +
 +log = logging.getLogger(__name__)
 +
 +_OAUTH_AUTH_TYPES = ('oauth_2.1', 'oauth_2.1_static')
 +
++_ACCEPTED_TTL_S = 60
++_UNSETTLED_TTL_S = 15
++_PROBE_TIMEOUT_S = 4
++_CHECK_TIMEOUT_S = 6
++
++ACCEPTED, REJECTED, UNREACHABLE = 'accepted', 'rejected', 'unreachable'
++
++# (user id, oauth client id) -> (monotonic expiry, access-token fingerprint, verdict)
++_verdicts: dict[tuple[str, str], tuple[float, str, str]] = {}
++_in_flight: dict[tuple[str, str], asyncio.Task] = {}
++
++
++def _fingerprint(token: dict | None) -> str:
++    access_token = (token or {}).get('access_token') or ''
++    return hashlib.sha256(access_token.encode()).hexdigest()[:16]
++
++
++async def _probe(url: str, headers: dict, cookies: dict) -> str:
++    """Ask the MCP server whether it accepts these credentials."""
++    request_headers = {
++        **headers,
++        'Accept': 'application/json, text/event-stream',
++        'Content-Type': 'application/json',
++    }
++    body = {
++        'jsonrpc': '2.0',
++        'id': 0,
++        'method': 'initialize',
++        'params': {
++            'protocolVersion': LATEST_PROTOCOL_VERSION,
++            'capabilities': {},
++            'clientInfo': {'name': 'open-webui-auth-probe', 'version': '1'},
++        },
++    }
++    try:
++        async with aiohttp.ClientSession(
++            trust_env=True,
++            timeout=aiohttp.ClientTimeout(total=_PROBE_TIMEOUT_S),
++            cookies=cookies or None,
++        ) as http:
++            async with http.post(url, json=body, headers=request_headers, ssl=AIOHTTP_CLIENT_SESSION_SSL) as r:
++                status = r.status
++                challenge = r.headers.get('WWW-Authenticate', '').lower()
++                mcp_session_id = r.headers.get('Mcp-Session-Id')
++            if mcp_session_id:
++                # End the session the probe opened rather than leave it to time out.
++                try:
++                    async with http.delete(
++                        url,
++                        headers={**request_headers, 'Mcp-Session-Id': mcp_session_id},
++                        ssl=AIOHTTP_CLIENT_SESSION_SSL,
++                    ):
++                        pass
++                except Exception:
++                    pass
++    except Exception as e:
++        log.info(f'MCP auth probe of {url} got no answer: {type(e).__name__}: {e}')
++        return UNREACHABLE
++
++    if status == 401 or (status == 403 and ('invalid_token' in challenge or 'insufficient_scope' in challenge)):
++        return REJECTED
++    if status in (403, 408, 429) or status >= 500:
++        log.info(f'MCP auth probe of {url} was inconclusive: HTTP {status}')
++        return UNREACHABLE
++    return ACCEPTED
++
++
++async def _check(request: Request, user, server: dict, client_id: str) -> str:
++    # Imported here, not at module level: utils.tools pulls in most of the app.
++    from open_webui.utils.tools import build_tool_server_headers
++
++    manager = request.app.state.oauth_client_manager
++    key = (user.id, client_id)
++    info_id = (server.get('info') or {}).get('id')
++    url = server.get('url', '')
++
++    token = await manager.get_oauth_token(user.id, client_id)
++    if not token:
++        return REJECTED  # no session, or one that could never be renewed
++
++    fingerprint = _fingerprint(token)
++    cached = _verdicts.get(key)
++    if cached and cached[0] > time.monotonic() and cached[1] == fingerprint:
++        return cached[2]
++
++    headers, cookies = await build_tool_server_headers(server, request, user, server_id=info_id)
++    verdict = await _probe(url, headers, cookies)
++
++    if verdict == REJECTED:
++        # The server refused a token Open WebUI thinks is valid (revoked,
++        # signing key rotated, ...): renew it once and ask again.
++        renewed = await manager.get_oauth_token(user.id, client_id, force_refresh=True)
++        if not renewed:
++            log.info(f'MCP server refused {client_id} for user {user.id} and the token could not be renewed')
++            return REJECTED  # get_oauth_token has already deleted the session
++        if _fingerprint(renewed) != fingerprint:
++            fingerprint = _fingerprint(renewed)
++            headers, cookies = await build_tool_server_headers(server, request, user, server_id=info_id)
++            verdict = await _probe(url, headers, cookies)
++        elif renewed.get('refresh_token'):
++            # The same token back means the renewal did not complete (network,
++            # 5xx); the refresh token may still be good, so keep the session.
++            verdict = UNREACHABLE
++
++        if verdict == REJECTED:
++            session = await OAuthSessions.get_session_by_provider_and_user_id(client_id, user.id)
++            # Only the session holding the refused token: a reconnect from
++            # another tab since then must survive.
++            if session and _fingerprint(session.token) == fingerprint:
++                log.warning(f'MCP server refused {client_id} for user {user.id}; deleting session {session.id}')
++                await OAuthSessions.delete_session_by_id(session.id)
++
++    ttl = _ACCEPTED_TTL_S if verdict == ACCEPTED else _UNSETTLED_TTL_S
++    _verdicts[key] = (time.monotonic() + ttl, fingerprint, verdict)
++    return verdict
++
++
++async def _is_connected(request: Request, user, server: dict, client_id: str) -> bool:
++    key = (user.id, client_id)
++    task = _in_flight.get(key)
++    if task is None:
++        task = asyncio.create_task(_check(request, user, server, client_id))
++        _in_flight[key] = task
++        task.add_done_callback(lambda _task, key=key: _in_flight.pop(key, None))
++    try:
++        # shield: a caller that gives up must not cancel a token refresh mid-rotation.
++        return await asyncio.wait_for(asyncio.shield(task), _CHECK_TIMEOUT_S) == ACCEPTED
++    except asyncio.TimeoutError:
++        log.info(f'OAuth MCP check of {client_id} for user {user.id} still running; tool left off for now')
++        return False
++    except Exception as e:  # never fail the model list over this
++        log.warning(f'OAuth MCP check of {client_id} for user {user.id} failed: {type(e).__name__}: {e}')
++        return False
++
++
++def _tool_ids_of(model: dict) -> tuple[dict | None, dict | None, list | None]:
++    info = model.get('info') if isinstance(model.get('info'), dict) else None
++    meta = info.get('meta') if info and isinstance(info.get('meta'), dict) else None
++    tool_ids = meta.get('toolIds') if meta else None
++    return info, meta, tool_ids if isinstance(tool_ids, list) else None
++
 +
 +async def drop_unconnected_oauth_tool_defaults(request: Request, user, models: list[dict]) -> list[dict]:
-+    # tool id ('server:mcp:<info.id>') -> oauth client id ('mcp:<last segment>'),
++    # tool id ('server:mcp:<info.id>') -> (connection, oauth client id 'mcp:<last segment>'),
 +    # built the same way routers/tools.py::get_tools builds them.
-+    oauth_tools: dict[str, str] = {}
++    oauth_tools: dict[str, tuple[dict, str]] = {}
 +    for server in await Config.get('tool_server.connections', []) or []:
 +        if server.get('type', 'openapi') != 'mcp' or not (server.get('config') or {}).get('enable'):
 +            continue
@@ -93,31 +423,24 @@ See ai/openwebui/OPENWEBUI.md § MCP tools (Phoenix) and § Custom image.
 +            continue
 +        info_id = (server.get('info') or {}).get('id')
 +        if info_id:
-+            oauth_tools[f'server:mcp:{info_id}'] = f'mcp:{info_id.split(":")[-1]}'
++            oauth_tools[f'server:mcp:{info_id}'] = (server, f'mcp:{info_id.split(":")[-1]}')
 +
 +    if not oauth_tools:
 +        return models
 +
-+    connected: dict[str, bool] = {}
++    wanted = sorted({t for model in models for t in (_tool_ids_of(model)[2] or []) if t in oauth_tools})
++    if not wanted:
++        return models
 +
-+    async def is_connected(tool_id: str) -> bool:
-+        if tool_id not in connected:
-+            try:
-+                token = await request.app.state.oauth_client_manager.get_oauth_token(user.id, oauth_tools[tool_id])
-+            except Exception as e:  # never fail the model list over this
-+                log.warning(f'OAuth token lookup failed for {tool_id}: {e}')
-+                token = None
-+            connected[tool_id] = token is not None
-+        return connected[tool_id]
++    # All servers at once: the slowest bounds the model list, not the sum.
++    results = await asyncio.gather(*(_is_connected(request, user, *oauth_tools[t]) for t in wanted))
++    connected = dict(zip(wanted, results))
 +
 +    result = []
 +    for model in models:
-+        info = model.get('info') if isinstance(model.get('info'), dict) else None
-+        meta = info.get('meta') if info and isinstance(info.get('meta'), dict) else None
-+        tool_ids = meta.get('toolIds') if meta else None
-+
-+        if isinstance(tool_ids, list) and any(t in oauth_tools for t in tool_ids):
-+            kept = [t for t in tool_ids if t not in oauth_tools or await is_connected(t)]
++        info, meta, tool_ids = _tool_ids_of(model)
++        if tool_ids and any(t in oauth_tools for t in tool_ids):
++            kept = [t for t in tool_ids if t not in oauth_tools or connected[t]]
 +            if len(kept) != len(tool_ids):
 +                # Copy on write: these dicts are shared with app.state.MODELS.
 +                model = {**model, 'info': {**info, 'meta': {**meta, 'toolIds': kept}}}

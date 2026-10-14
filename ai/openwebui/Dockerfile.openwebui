@@ -22,12 +22,16 @@
 #       on every sign-in. Touches backend/open_webui/env.py,
 #       routers/auths.py, and adds utils/trusted_proxy.py.
 #   0003-oauth-mcp-defaults-no-redirect.patch — a model's default OAuth MCP
-#       tools (Phoenix) that the user has not connected are dropped from that
-#       user's GET /api/models toolIds, so opening a chat no longer redirects
-#       to the MCP server's authorize page (users it does not authorise were
-#       stranded on its "not authorised" page). Connect once from the chat's
-#       Integrations menu and the tool is a default again. Touches
-#       backend/open_webui/main.py, adds utils/mcp_oauth_defaults.py.
+#       tools (Phoenix) stay in a user's GET /api/models toolIds only while
+#       that user holds a token the MCP server accepts (probed, cached 60 s),
+#       so opening a chat never redirects to the MCP server's authorize page
+#       (users it does not authorise were stranded on its "not authorised"
+#       page). Also makes OAuthClientManager.get_oauth_token refresh
+#       single-flight and delete a session only when it can never be renewed:
+#       the page-load race between /api/models and /api/v1/tools used to
+#       delete a valid session on every access-token expiry. Touches
+#       backend/open_webui/main.py and utils/oauth.py, adds
+#       utils/mcp_oauth_defaults.py.
 
 ARG OPENWEBUI_VERSION=v0.11.4
 FROM ghcr.io/open-webui/open-webui:${OPENWEBUI_VERSION}
@@ -57,9 +61,11 @@ RUN set -eu; \
         backend/open_webui/routers/auths.py \
         backend/open_webui/utils/trusted_proxy.py \
         backend/open_webui/main.py \
+        backend/open_webui/utils/oauth.py \
         backend/open_webui/utils/mcp_oauth_defaults.py; \
     grep -q "verify_google_identity" backend/open_webui/routers/auths.py; \
     grep -q "drop_unconnected_oauth_tool_defaults" backend/open_webui/main.py; \
+    grep -q "_zeo_refresh_single_flight" backend/open_webui/utils/oauth.py; \
     rm -rf /tmp/zeo-patches
 
 # Record the base and the patch set on the image so `docker image inspect`

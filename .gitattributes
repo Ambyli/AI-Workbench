@@ -15,6 +15,8 @@ Caddyfile text eol=lf
 *.yaml text eol=lf
 *.jinja text eol=lf
 *.py text eol=lf
+# ai/openwebui/patches/ are applied by patch(1) inside a Linux image build.
+*.patch text eol=lf
 *.toml text eol=lf
 entrypoint.sh text eol=lf
 # Vendored Supabase config (ai/supabase/volumes/). The Postgres init scripts

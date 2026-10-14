@@ -461,11 +461,16 @@ In a chat, click the **Tools** icon (paperclip-like) → toggle **phoenix** on. 
 
 **Phoenix as a model's default tool (OAuth).** Phoenix decides who it authorises, and Open WebUI cannot know that until someone has signed in to Phoenix. Upstream Open WebUI handles a default OAuth tool the user hasn't connected by navigating the whole page to `/oauth/clients/mcp:<id>/authorize` as soon as a new chat opens, then blocking sends until it is connected. Anyone Phoenix doesn't authorise lands on its "not authorised" page on every new chat. Patch `0003` ([Custom image](#custom-image-patches)) changes that:
 
-- **Not connected** (never signed in, refused by Phoenix, or the token expired and couldn't be refreshed): Phoenix is quietly left out of that user's defaults. There is no redirect and no blocked send; the model just answers without it.
-- **Connected**: Phoenix is switched on by default in every new chat, as before.
+- **Connected** — Open WebUI holds a token for the user **and Phoenix accepts it**: Phoenix is switched on by default in every new chat. "Accepts" is checked live: the model list sends Phoenix an MCP `initialize` with exactly the headers a real tool call would send, and the answer is cached per user for 60 s (re-checked at once when the token changes).
+- **Not connected** — never signed in, or Phoenix refuses the token (401, or 403 with `invalid_token`): Phoenix is quietly left out of that user's defaults. There is no redirect and no blocked send; the model just answers without it. On a refusal the token is renewed once and retried first; if Phoenix still refuses, the stored session is deleted so the Integrations menu shows "connect" again.
+- **Phoenix unreachable** (timeout, 5xx, 429): left out for now but the session is **kept**; it switches back on by itself within ~15 s of Phoenix answering again. A slow Phoenix never holds the model list for more than 6 s.
 - **First connect**: a user Phoenix authorises clicks **phoenix** once in the chat's Integrations menu (the tools icon), where it shows its "connect" state, and signs in. The chat restores the tool after the redirect, and from then on it is a default. Users Phoenix refuses only see the refusal if they click it themselves.
 
 Nothing about the Phoenix connection or the model's tool settings changes: keep Phoenix ticked in Workspace → Models → (model) → Tools. Applies to every OAuth 2.1 MCP server, not just Phoenix.
+
+**Why it used to switch itself off for users with valid credentials.** The chat layout requests `/api/models` and `/api/v1/tools` together on every page load, and both look up the Phoenix token. Upstream refreshes an expiring token once *per caller* with the same refresh token; an OAuth 2.1 server rotates refresh tokens, so it refused all but the first refresh, and Open WebUI then deleted the session the first had just renewed. Patch `0003` also fixes that in `utils/oauth.py`: one refresh at a time per user and server (the others reuse its result), and a session is deleted only when it can never be renewed — the token endpoint answers 400/401, or the token has expired with no refresh token. A network blip or a 5xx keeps it. In `docker logs openwebui`, `Token refresh rejected` and `MCP server refused … deleting session` mean a real disconnect; `did not complete; keeping session` and `MCP auth probe … got no answer` mean a transient one.
+
+The page keeps the model and tool lists it loaded until it is reloaded, so a change in connection state shows up on the next page load, not mid-session.
 
 **If the handshake times out** (you see "MCP server failed to initialize" in the logs), bump `OPENWEBUI_MCP_INITIALIZE_TIMEOUT` in `.env` (currently `30s`, upstream default is `10s`) and restart Open WebUI.
 
@@ -551,7 +556,7 @@ If Open WebUI shows "Server Connection Error" on play, `make logs openwebui` —
 | Patch | What | Files |
 |---|---|---|
 | `0002-trusted-header-google-identity.patch` | Adds `WEBUI_AUTH_TRUSTED_ACCESS_TOKEN_HEADER`. In trusted-header SSO mode, verify the asserted identity with Google using the access token oauth2-proxy forwards, and take display name + picture from Google's userinfo on every sign-in. Rationale and security in [Single sign-on](#single-sign-on) | `backend/open_webui/env.py`, `routers/auths.py`, `utils/trusted_proxy.py` (new) |
-| `0003-oauth-mcp-defaults-no-redirect.patch` | A model's default OAuth MCP tools that the user has not connected are dropped from **that user's** `GET /api/models` `toolIds`, so a new chat no longer redirects to the MCP server's authorize page. Always on, no env var. Backend-only because the image ships the Svelte frontend pre-compiled. Details in [MCP tools (Phoenix)](#mcp-tools-phoenix) | `backend/open_webui/main.py`, `utils/mcp_oauth_defaults.py` (new) |
+| `0003-oauth-mcp-defaults-no-redirect.patch` | A model's default OAuth MCP tools stay in **that user's** `GET /api/models` `toolIds` only while the user holds a token the MCP server accepts (live `initialize` probe, cached), so a new chat no longer redirects to the MCP server's authorize page. Also makes `OAuthClientManager.get_oauth_token` refresh single-flight and delete a session only when it can never be renewed. Always on, no env var. Backend-only because the image ships the Svelte frontend pre-compiled. Details in [MCP tools (Phoenix)](#mcp-tools-phoenix) | `backend/open_webui/main.py`, `utils/oauth.py`, `utils/mcp_oauth_defaults.py` (new) |
 
 (`0001` was a `login_hint` patch for the two-hop OAuth path; it was retired when one-gate SSO replaced that path.)
 
@@ -561,6 +566,7 @@ If Open WebUI shows "Server Connection Error" on play, `make logs openwebui` —
 docker image inspect openwebui-zeo:v0.11.4 --format '{{index .Config.Labels "com.zeoenergy.openwebui.patches"}}'
 docker exec openwebui test -f /app/backend/open_webui/utils/trusted_proxy.py && echo patched
 docker exec openwebui test -f /app/backend/open_webui/utils/mcp_oauth_defaults.py && echo 0003 patched
+docker exec openwebui grep -q _zeo_refresh_single_flight /app/backend/open_webui/utils/oauth.py && echo 0003 refresh fix
 ```
 
 #### Regenerating a patch for a new upstream version
@@ -580,7 +586,7 @@ patch -p1 -d patched < ai/openwebui/patches/0002-trusted-header-google-identity.
 
 Paste the header comment from the old patch file back on top, update its `Target:` line, replace the file, and re-run `make build openwebui`. Read what upstream changed around the rejected hunks before trusting the result — `routers/auths.py` moves between releases.
 
-For `0003`, regenerate the same way with `main.py` and `utils/mcp_oauth_defaults.py` (new). Before trusting it on a new tag, re-check the three upstream facts it depends on: `Chat.svelte`'s `setDefaults` still reads default tools from `model.info.meta.toolIds` and still redirects on `authenticated === false`; `routers/tools.py::get_tools` still derives `authenticated` from `oauth_client_manager.get_oauth_token(user.id, 'mcp:<id>')` with the tool id `server:mcp:<info.id>`; and the admin model editor still takes `meta` from the saved DB record rather than from `/api/models`. If upstream ships a native "don't auto-redirect" option, retire the patch.
+For `0003`, regenerate the same way with `main.py`, `utils/oauth.py` and `utils/mcp_oauth_defaults.py` (new). Before trusting it on a new tag, re-check the upstream facts it depends on: `Chat.svelte`'s `setDefaults` still reads default tools from `model.info.meta.toolIds` and still redirects on `authenticated === false`; `routers/tools.py::get_tools` still derives `authenticated` from `oauth_client_manager.get_oauth_token(user.id, 'mcp:<id>')` with the tool id `server:mcp:<info.id>`; `utils/tools.py::build_tool_server_headers(connection, request, user, server_id=…)` still builds an MCP call's headers; the admin model editor still takes `meta` from the saved DB record rather than from `/api/models`; and `OAuthClientManager.get_oauth_token` still has no refresh locking of its own. If upstream ships a native "don't auto-redirect" option, retire the `/api/models` half; if it ships single-flight refresh, retire the `oauth.py` half.
 
 #### Adding another patch
 

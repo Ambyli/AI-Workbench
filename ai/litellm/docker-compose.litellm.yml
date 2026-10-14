@@ -25,6 +25,13 @@ services:
       OVERFLOW_IDLE_AFTER_S: ${OVERFLOW_IDLE_AFTER_S:-5}
       OVERFLOW_POLL_INTERVAL_S: ${OVERFLOW_POLL_INTERVAL_S:-1}
       OVERFLOW_PROBE_TIMEOUT_S: ${OVERFLOW_PROBE_TIMEOUT_S:-0.75}
+      # Context fit: exact prompt counts from each local vLLM's /tokenize,
+      # asked only when a high chars-per-token estimate reaches
+      # MIN_FRACTION x the deployment's max_input_tokens. See
+      # ai/litellm/LITELLM.md > The overflow hook.
+      OVERFLOW_TOKENIZE_MIN_FRACTION: ${OVERFLOW_TOKENIZE_MIN_FRACTION:-0.6}
+      OVERFLOW_TOKENIZE_CHARS_PER_TOKEN: ${OVERFLOW_TOKENIZE_CHARS_PER_TOKEN:-2.5}
+      OVERFLOW_TOKENIZE_TIMEOUT_S: ${OVERFLOW_TOKENIZE_TIMEOUT_S:-5}
       # The `auto` footer (a "---" rule + "*<model> - <chain>*" line naming
       # the backend under each answer from the semantic router), also in
       # overflow.py. true|false|1|0.

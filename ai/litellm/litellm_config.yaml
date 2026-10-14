@@ -19,11 +19,17 @@ litellm_settings:
   drop_params: true
   turn_off_message_logging: true
   json_logs: false
-  # Also the context gate for the chain aliases below: _pre_call_checks
+  # The BACKSTOP context gate for the chain aliases below. _pre_call_checks
   # drops any deployment whose model_info.max_input_tokens is smaller than
-  # the prompt BEFORE the order filter picks the lowest order left
-  # (router.py:10694-10720 at v1.95.0), so a long prompt skips qwen3.8-solo
-  # (114688) for muse-glimmer (245760) with no error and no fallback hop.
+  # the prompt before the order filter picks the lowest order left
+  # (router.py:10694-10720 at v1.95.0) -- but it counts with
+  # litellm.token_counter(messages=messages) (router.py:10147): tiktoken,
+  # messages only, no tool definitions. That undercounts Qwen prompts (a
+  # 122,881-token prompt by vLLM's count got through to qwen3.8-solo on
+  # 2026-10-12 and was refused there). The real gate is the overflow hook's
+  # CONTEXT FIT step (callbacks, below), which drops a too-long deployment
+  # on vLLM's own /tokenize count first; this check still catches what the
+  # hook could not measure (tokenize failed, deployment not in a chain).
   enable_pre_call_checks: true
   # Overflow hook for the chain aliases (local-general / local-code /
   # local-reasoning / local-private). ai/litellm/overflow.py, mounted at
@@ -32,9 +38,13 @@ litellm_settings:
   # (proxy/types_utils/utils.py:30-56). It polls each local vLLM's /metrics
   # about once a second and, inside a chain, drops a local deployment that
   # has had a waiting queue for OVERFLOW_BUSY_AFTER_S or whose probe fails,
-  # so LiteLLM's order filter moves to the next order. It never drops a
-  # Claude deployment and never empties a group: local-private queues
-  # locally instead. See ai/litellm/LITELLM.md > Chain aliases.
+  # so LiteLLM's order filter moves to the next order. Before that it
+  # checks CONTEXT FIT: for a long prompt it asks each local vLLM's
+  # /tokenize for the exact count (messages + tools) and hard-drops a
+  # deployment the prompt does not fit (OVERFLOW_TOKENIZE_*). It never
+  # drops a Claude deployment for being busy and never empties a group:
+  # local-private queues locally instead. See ai/litellm/LITELLM.md >
+  # Chain aliases.
   callbacks: ["overflow.handler"]
   # Three independent fallback maps. `fallbacks` fires on generic failures
   # (connection refused while a vLLM container is still loading, 5xx, timeouts)
@@ -78,12 +88,14 @@ litellm_settings:
     - {"muse-glimmer":  ["claude-sonnet-5"]}
     # Same reasoning as `auto` under `fallbacks`: a prompt refused for
     # length has not been classified, so it goes local-only. local-private
-    # reaches muse-glimmer (245760) by itself -- the pre-call check skips
-    # qwen3.8-solo for anything over 114688 -- and a prompt over 245760 is
+    # reaches muse-glimmer (245760) by itself -- the overflow hook's context
+    # fit (vLLM's own /tokenize count; _pre_call_checks as the backstop)
+    # skips qwen3.8-solo for anything over 114688 -- and a prompt over 245760 is
     # refused there too, which is the point: it never reaches Claude.
     - {"auto":          ["local-private"]}
-    # No chain alias appears here either. Inside a chain the pre-call
-    # check already skips too-small deployments, and LiteLLM deliberately
+    # No chain alias appears here either. Inside a chain the overflow
+    # hook's context fit (backed by the pre-call check) already skips
+    # too-small deployments, and LiteLLM deliberately
     # skips order-based fallback for ContextWindowExceededError
     # (router.py:6132-6148 at v1.95.0). local-private, with no Claude
     # deployment, therefore FAILS on a prompt over 245760. (The other
@@ -428,8 +440,9 @@ model_list:
   # HOW A REQUEST PICKS A DEPLOYMENT (LiteLLM v1.95.0,
   # router.py::async_get_healthy_deployments, 10606-10740):
   #   cooldown filter -> overflow hook (async_callback_filter_deployments,
-  #   10686) -> pre-call context check (10694) -> order filter (10716-10720:
-  #   keep only the LOWEST `order` still present).
+  #   10686: context fit, then busy/down) -> pre-call context check (10694,
+  #   the tiktoken backstop) -> order filter (10716-10720: keep only the
+  #   LOWEST `order` still present).
   # So order 1 answers while it is up and not queueing. The overflow hook
   # (ai/litellm/overflow.py) drops a local deployment whose vLLM has had a
   # waiting queue for OVERFLOW_BUSY_AFTER_S, or whose /metrics probe fails;
@@ -463,9 +476,12 @@ model_list:
   # still callable directly.
   #
   # model_info.max_input_tokens is per DEPLOYMENT and load-bearing: it is
-  # what lets enable_pre_call_checks skip qwen3.8-solo (114688) for a long
-  # prompt and land on muse-glimmer (245760). The Claude deployments declare
-  # none, matching their standalone aliases.
+  # what lets the overflow hook's context fit (vLLM's exact /tokenize count,
+  # messages + tools) skip qwen3.8-solo (114688) for a long prompt and land
+  # on muse-glimmer (245760); enable_pre_call_checks reads it too, as the
+  # tiktoken backstop. The hook also checks count + max_tokens against the
+  # backend's max_model_len, which /tokenize reports. The Claude deployments
+  # declare none, matching their standalone aliases.
 
   # -- local-general: the catch-all; Envoy's default route --------------------
   - model_name: local-general
@@ -722,8 +738,8 @@ model_list:
     model_info:
       # The largest prompt every path out of `auto` can still serve LOCALLY:
       # 245760, muse-glimmer's window. All four chains contain muse-glimmer
-      # and the pre-call check skips qwen3.8-solo (114688) for anything
-      # longer, so each chain -- and local-private, which is where both
+      # and the overflow hook's context fit skips qwen3.8-solo (114688) for
+      # anything longer, so each chain -- and local-private, which is where both
       # `auto` fallbacks land -- reaches 245760 without Claude. A higher
       # number would let a prompt through that only a Claude deployment
       # could take (and local-private would refuse); a lower one (the old

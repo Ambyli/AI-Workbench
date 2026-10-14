@@ -22,12 +22,14 @@ this hook.
 WHERE IT RUNS (LiteLLM v1.95.0, router.py::async_get_healthy_deployments,
 10606-10740): cooldown filter -> ``async_callback_filter_deployments`` (10686,
 which calls every CustomLogger's ``async_filter_deployments``, 7340-7387) ->
-pre-call context check (10694) -> order filter (10716-10720, keeps only the
+pre-call context check (10694, a backstop now -- see CONTEXT FIT) -> order
+filter (10716-10720, keeps only the
 lowest ``order`` left). Dropping a deployment here therefore lets the order
 filter pick the next order level. NOTE that 7366-7384 RE-RAISES any exception
 a filter throws, which would fail the request -- so this hook never throws.
 
-THE RULE, per request, for a group with >= 2 distinct ``order`` values:
+THE RULE, per request, for a group with >= 2 distinct ``order`` values (on
+whatever the CONTEXT FIT step below has left):
   * drop every deployment with an ``api_base`` whose backend is BUSY or DOWN;
   * never drop a deployment without an ``api_base`` (the Claude deployments);
   * if that would leave nothing, stay local: keep the BUSY deployments (the
@@ -47,6 +49,46 @@ The poller is one asyncio task probing every known backend CONCURRENTLY
 about once a second. It is started lazily by the first filter call (on
 LiteLLM's own event loop) and restarted if it has died. Backends are learnt
 from the deployments the filter sees, so there is nothing to configure.
+
+CONTEXT FIT (runs BEFORE the busy/down rule, same chain groups only).
+LiteLLM's own pre-call context check (router.py::_pre_call_checks, 10163)
+counts the prompt with::
+
+    return litellm.token_counter(messages=messages)   # router.py:10147
+
+-- OpenAI's tiktoken, over ``messages`` alone. Tool definitions are not
+counted (Open WebUI's native tool calling sends them on every turn) and
+Qwen's tokenizer is not tiktoken, so on 2026-10-12 a prompt vLLM counted at
+122,881 tokens passed as under qwen3.8-solo's 114,688, vLLM refused it with
+ContextWindowExceededError, and LiteLLM does not try the next order for that
+error (router.py:6134-6137). So the hook counts for itself, with the
+backend's own tokenizer: vLLM's ``POST <api_base minus /v1>/tokenize``
+renders ``messages`` + ``tools`` through the same chat template and
+``preprocess_chat`` as /v1/chat/completions and returns ``count`` and
+``max_model_len`` -- exactly the numbers vLLM checks. A local deployment
+(an ``api_base`` and an int ``model_info.max_input_tokens``) FITS iff::
+
+    count <= max_input_tokens  and  count + max_out <= max_model_len
+
+with max_out the request's max_completion_tokens / max_tokens, else the
+deployment's own. One that does not fit is dropped as ``too-long``, and that
+is a HARD drop: the busy/down rule runs on what is left, so its "keep the
+busy ones" fallback can never bring it back. If NO local deployment fits, a
+group with a Claude deployment keeps only Claude (the prompt is past every
+local window -- the same outcome as before); local-private, with nothing
+unpolled, gets the list back unchanged, so vLLM refuses it with its own
+error and PII stays on the box.
+
+/tokenize is only called when it could matter: a deliberately HIGH estimate
+(JSON length of messages + tools / OVERFLOW_TOKENIZE_CHARS_PER_TOKEN) must
+reach OVERFLOW_TOKENIZE_MIN_FRACTION x that deployment's max_input_tokens.
+Each distinct backend is asked at most once per request, all of them
+concurrently, within OVERFLOW_TOKENIZE_TIMEOUT_S, and answers are kept in a
+small LRU (``auto``'s context_window_fallbacks and the mid-stream order
+fallback re-enter with the same messages). ANY tokenize failure -- timeout,
+non-200, an image part on a text-only model, a body without ``count`` --
+KEEPS the deployment: LiteLLM then behaves exactly as it did before, and
+_pre_call_checks stays in place as the backstop.
 
 Debugging: every spill decision logs one INFO line on the ``zeo.overflow``
 logger (throttled per alias/deployment/reason), and ``handler.state()``
@@ -88,11 +130,14 @@ turns the whole feature off. See ai/litellm/LITELLM.md > The `auto` footer.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import os
 import re
 import sys
 import time
+from collections import OrderedDict
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Tuple
 
 try:  # LiteLLM only treats CustomLogger instances as deployment filters.
@@ -128,10 +173,20 @@ STALE_POLLS = 5
 # At most one log line per (alias, deployment, reason) per this many seconds.
 LOG_EVERY_S = 30.0
 
+# Context fit (see CONTEXT FIT above). The estimate runs HIGH on purpose:
+# English is ~4 chars/token and JSON adds keys and escapes, so 2.5 chars/token
+# overestimates almost any prompt -- a short chat never makes the extra call.
+TOKENIZE_MIN_FRACTION = _env_float("OVERFLOW_TOKENIZE_MIN_FRACTION", 0.6)
+TOKENIZE_CHARS_PER_TOKEN = _env_float("OVERFLOW_TOKENIZE_CHARS_PER_TOKEN", 2.5, minimum=0.5)
+TOKENIZE_TIMEOUT_S = _env_float("OVERFLOW_TOKENIZE_TIMEOUT_S", 5.0, minimum=0.1)
+# (api_base, sha256 of the body) -> (count, max_model_len), least recent out.
+TOKENIZE_CACHE_SIZE = 64
+
 WAITING_METRIC = "vllm:num_requests_waiting"
 RUNNING_METRIC = "vllm:num_requests_running"
 
 OK, BUSY, DOWN, UNKNOWN = "ok", "busy", "down", "unknown"
+TOO_LONG = "too-long"
 
 logger = logging.getLogger("zeo.overflow")
 if not logger.handlers:
@@ -145,12 +200,25 @@ if not logger.handlers:
 
 
 # -- Pure helpers (unit-tested) ---------------------------------------------
-def metrics_url(api_base: str) -> str:
-    """http://qwen3.8-solo:8000/v1 -> http://qwen3.8-solo:8000/metrics"""
+def server_url(api_base: str, path: str) -> str:
+    """http://qwen3.8-solo:8000/v1 + /tokenize -> http://qwen3.8-solo:8000/tokenize
+
+    vLLM serves /metrics and /tokenize at the server root, outside /v1 (and
+    outside its /v1 API-key guard)."""
     base = api_base.strip().rstrip("/")
     if base.endswith("/v1"):
         base = base[: -len("/v1")]
-    return base + "/metrics"
+    return base + "/" + path.lstrip("/")
+
+
+def metrics_url(api_base: str) -> str:
+    """http://qwen3.8-solo:8000/v1 -> http://qwen3.8-solo:8000/metrics"""
+    return server_url(api_base, "/metrics")
+
+
+def tokenize_url(api_base: str) -> str:
+    """http://qwen3.8-solo:8000/v1 -> http://qwen3.8-solo:8000/tokenize"""
+    return server_url(api_base, "/tokenize")
 
 
 def parse_queue_metrics(text: str) -> Tuple[Optional[float], Optional[float]]:
@@ -304,6 +372,130 @@ def _order(deployment: Any) -> Optional[int]:
 def _label(deployment: Dict[str, Any]) -> str:
     params = deployment.get("litellm_params") or {}
     return f"{params.get('model', '?')}@order{_order(deployment)}"
+
+
+def _is_chain(deployments: Any) -> bool:
+    """>= 2 deployments with >= 2 distinct `order` values. Anything else is a
+    plain alias, and the hook never touches it."""
+    if not isinstance(deployments, list) or len(deployments) < 2:
+        return False
+    orders = {_order(d) for d in deployments}
+    orders.discard(None)
+    return len(orders) >= 2
+
+
+# -- Context fit: pure helpers (unit-tested) ---------------------------------
+def _positive_int(value: Any) -> Optional[int]:
+    # bool is an int subclass; True is not a token budget.
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
+def _jsonable(value: Any) -> Any:
+    """json.dumps default: pydantic messages / tool objects -> plain data."""
+    for attr in ("model_dump", "dict"):
+        fn = getattr(value, attr, None)
+        if callable(fn):
+            try:
+                return fn()
+            except Exception:
+                pass
+    return str(value)
+
+
+def _params(deployment: Any) -> Dict[str, Any]:
+    params = deployment.get("litellm_params") if isinstance(deployment, dict) else None
+    return params if isinstance(params, dict) else {}
+
+
+def max_input_tokens(deployment: Any) -> Optional[int]:
+    info = deployment.get("model_info") if isinstance(deployment, dict) else None
+    return _positive_int(info.get("max_input_tokens")) if isinstance(info, dict) else None
+
+
+def request_tools(request_kwargs: Any) -> Optional[List[Any]]:
+    tools = request_kwargs.get("tools") if isinstance(request_kwargs, dict) else None
+    return tools if isinstance(tools, list) and tools else None
+
+
+def estimate_tokens(messages: Any, tools: Optional[List[Any]], chars_per_token: float) -> int:
+    """A deliberately HIGH token estimate: JSON characters / chars_per_token.
+
+    json.dumps' default separators and ASCII escaping only add characters,
+    so non-English text and markup push the estimate up, never down."""
+    chars = len(json.dumps(messages, default=_jsonable))
+    if tools:
+        chars += len(json.dumps(tools, default=_jsonable))
+    return int(chars / max(chars_per_token, 0.1)) + 1
+
+
+def max_output_tokens(request_kwargs: Any, deployment: Any) -> int:
+    """The completion budget vLLM will reserve: the request's own
+    max_completion_tokens / max_tokens, else the deployment's (LiteLLM lays
+    the request's kwargs over the deployment's litellm_params, and vLLM
+    prefers max_completion_tokens). 0 when neither sets one -- vLLM then
+    gives the rest of the window to the answer and only the input must fit."""
+    for src in (request_kwargs if isinstance(request_kwargs, dict) else {}, _params(deployment)):
+        for key in ("max_completion_tokens", "max_tokens"):
+            value = _positive_int(src.get(key))
+            if value is not None:
+                return value
+    return 0
+
+
+def chat_template_kwargs(deployment: Any, request_kwargs: Any) -> Optional[Dict[str, Any]]:
+    """What vLLM's chat template will be rendered with, besides the server's
+    --default-chat-template-kwargs (which /tokenize applies by itself).
+
+    Merged in LiteLLM's precedence: the deployment's
+    extra_body.chat_template_kwargs, then the request's, then a top-level
+    request `chat_template_kwargs` (for an openai/ provider LiteLLM moves
+    unknown top-level params into extra_body, utils.py:4361-4392)."""
+    merged: Dict[str, Any] = {}
+    req = request_kwargs if isinstance(request_kwargs, dict) else {}
+    sources = (_params(deployment).get("extra_body"), req.get("extra_body"), req)
+    for src in sources:
+        value = src.get("chat_template_kwargs") if isinstance(src, dict) else None
+        if isinstance(value, dict):
+            merged.update(value)
+    return merged or None
+
+
+def tokenize_body(
+    deployment: Any, messages: Any, tools: Optional[List[Any]], request_kwargs: Any
+) -> Dict[str, Any]:
+    """The /tokenize request (vLLM TokenizeChatRequest): the same messages,
+    tools and template kwargs the chat completion will carry, plus the
+    generation prompt, so `count` is the prompt vLLM will actually see."""
+    body: Dict[str, Any] = {
+        "model": strip_provider(_params(deployment).get("model")) or "",
+        "messages": messages,
+        "add_generation_prompt": True,
+    }
+    if tools:
+        body["tools"] = tools
+    ctk = chat_template_kwargs(deployment, request_kwargs)
+    if ctk:
+        body["chat_template_kwargs"] = ctk
+    # Round-trip through JSON: plain data for httpx, and a stable cache key.
+    return json.loads(json.dumps(body, default=_jsonable))
+
+
+def tokenize_cache_key(url: str, body: Dict[str, Any]) -> Tuple[str, str]:
+    raw = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return url, hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def context_verdict(
+    count: int, max_input: int, max_model_len: Optional[int], max_out: int
+) -> Optional[str]:
+    """None when the prompt fits; otherwise why it does not (for the log)."""
+    if count > max_input:
+        return f"count={count} > max_input_tokens={max_input}"
+    if max_model_len is not None and count + max_out > max_model_len:
+        return f"count={count} + max_tokens={max_out} > max_model_len={max_model_len}"
+    return None
 
 
 # -- `auto` footer: pure helpers (unit-tested) --------------------------------
@@ -493,6 +685,40 @@ class _HttpxFetch:
         return resp.text
 
 
+# -- Tokenize ----------------------------------------------------------------
+Tokenize = Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]
+
+
+class _HttpxTokenize:
+    """POST a vLLM /tokenize request; return the JSON object or raise.
+
+    The caller bounds the whole call with asyncio.wait_for -- httpx's own
+    timeout is per read. No Authorization header: /tokenize sits outside
+    vLLM's /v1 API-key guard. The response carries every token id (for a
+    120k-token prompt, ~1 MB of JSON); there is no flag to omit them, which
+    is one more reason it is only asked when the estimate says it matters."""
+
+    def __init__(self, timeout: float) -> None:
+        self._timeout = timeout
+        self._client: Any = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+
+    async def __call__(self, url: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        import httpx  # LiteLLM depends on it; imported lazily for the tests
+
+        loop = asyncio.get_running_loop()
+        if self._client is None or self._loop is not loop:
+            self._client = httpx.AsyncClient(timeout=self._timeout)
+            self._loop = loop
+        resp = await self._client.post(url, json=body)
+        if resp.status_code != 200:
+            raise ProbeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
+        data = resp.json()
+        if not isinstance(data, dict):
+            raise ProbeError("response is not a JSON object")
+        return data
+
+
 def _proxy_router() -> Any:
     """The running proxy's Router, without importing the proxy (tests, scripts)."""
     mod = sys.modules.get("litellm.proxy.proxy_server")
@@ -635,6 +861,10 @@ class OverflowHandler(CustomLogger):  # type: ignore[misc,valid-type]
         start_poller: bool = True,
         auto_footer: Optional[bool] = None,
         router_getter: Optional[Callable[[], Any]] = None,
+        tokenize: Optional[Tokenize] = None,
+        tokenize_min_fraction: float = TOKENIZE_MIN_FRACTION,
+        tokenize_chars_per_token: float = TOKENIZE_CHARS_PER_TOKEN,
+        tokenize_timeout: float = TOKENIZE_TIMEOUT_S,
     ) -> None:
         try:
             super().__init__()
@@ -658,8 +888,14 @@ class OverflowHandler(CustomLogger):  # type: ignore[misc,valid-type]
         self._task_loop: Optional[asyncio.AbstractEventLoop] = None
         self._log_last: Dict[Tuple[str, str, str], float] = {}
         self._log_suppressed: Dict[Tuple[str, str, str], int] = {}
+        self.tokenize_min_fraction = tokenize_min_fraction
+        self.tokenize_chars_per_token = tokenize_chars_per_token
+        self.tokenize_timeout = tokenize_timeout
+        self._tokenize: Tokenize = tokenize or _HttpxTokenize(tokenize_timeout)
+        self._tokenize_cache: "OrderedDict[Tuple[str, str], Tuple[int, Optional[int]]]" = OrderedDict()
         self.stats: Dict[str, int] = {
             "spills": 0, "kept_all_overloaded": 0, "errors": 0, "poller_restarts": 0,
+            "context_drops": 0, "tokenize_calls": 0, "tokenize_cache_hits": 0, "tokenize_errors": 0,
             "footers": 0, "footers_stripped": 0, "footer_errors": 0,
         }
 
@@ -672,8 +908,12 @@ class OverflowHandler(CustomLogger):  # type: ignore[misc,valid-type]
         request_kwargs: Optional[dict] = None,
         parent_otel_span: Any = None,
     ) -> List[dict]:
+        # request_kwargs are the completion kwargs Router._acompletion was
+        # called with (router.py:2757-2762 -> 10793 -> 10686 at v1.95.0): the
+        # request's `tools`, `max_tokens`, `extra_body`, ... -- not yet merged
+        # with the chosen deployment's litellm_params.
         try:
-            return self.filter_deployments(model, healthy_deployments)
+            return await self.filter_with_context(model, healthy_deployments, messages, request_kwargs)
         except Exception as exc:  # never fail a request because of this hook
             self.stats["errors"] += 1
             try:
@@ -852,17 +1092,121 @@ class OverflowHandler(CustomLogger):  # type: ignore[misc,valid-type]
         except Exception:
             pass
 
-    # -- Core rule (sync, so it is trivially testable) --------------------------
-    def filter_deployments(self, model: str, healthy_deployments: List) -> List:
-        if not isinstance(healthy_deployments, list) or len(healthy_deployments) < 2:
-            return healthy_deployments
-        orders = {_order(d) for d in healthy_deployments}
-        orders.discard(None)
-        if len(orders) < 2:
-            return healthy_deployments  # not a chain: leave plain groups alone
+    # -- Context fit, then the busy/down rule ------------------------------------
+    async def filter_with_context(
+        self,
+        model: str,
+        healthy_deployments: List,
+        messages: Optional[List] = None,
+        request_kwargs: Optional[dict] = None,
+    ) -> List:
+        """The whole per-request rule: drop too-long local deployments (hard),
+        then apply the busy/down rule (filter_deployments) to what is left."""
+        if not _is_chain(healthy_deployments) or not isinstance(messages, list) or not messages:
+            return self.filter_deployments(model, healthy_deployments)
+        self._learn(model, healthy_deployments)
+        too_long = await self.context_check(model, healthy_deployments, messages, request_kwargs or {})
+        if not too_long:
+            return self.filter_deployments(model, healthy_deployments)
 
+        fitting = [d for i, d in enumerate(healthy_deployments) if i not in too_long]
+        why = ", ".join(f"{_label(healthy_deployments[i])}: {r}" for i, r in too_long.items())
+        if not any(_api_base(d) is not None for d in fitting):
+            if not fitting:
+                # local-private: nothing unpolled to spill to. Hand LiteLLM the
+                # list unchanged -- vLLM refuses the prompt with its own error
+                # and it never leaves the box.
+                self._log(model, "*", "none-fit",
+                          "%s: no deployment fits the prompt (%s); list unchanged -- the backend will refuse it",
+                          model, why)
+                return healthy_deployments
+            # Past every local window: only the Claude deployment(s) can take it.
+            self.stats["context_drops"] += 1
+            self._log(model, "*", "none-fit-local",
+                      "%s: no local deployment fits the prompt (%s); keeping only %s",
+                      model, why, ", ".join(_label(d) for d in fitting))
+            return fitting
+
+        self.stats["context_drops"] += 1
+        result = self.filter_deployments(model, fitting)
+        next_order = min((o for o in (_order(d) for d in result) if o is not None), default=None)
+        for i, reason in too_long.items():
+            d = healthy_deployments[i]
+            self._log(model, _label(d), TOO_LONG, "%s: dropping %s (%s, %s) -> next order %s",
+                      model, _label(d), TOO_LONG, reason, next_order)
+        return result
+
+    async def context_check(
+        self, model: str, deployments: List, messages: List, request_kwargs: dict
+    ) -> Dict[int, str]:
+        """{index in `deployments`: why} for every local deployment the prompt
+        does not fit. Deployments that cannot be measured are never listed."""
+        tools = request_tools(request_kwargs)
+        estimate: Optional[int] = None
+        pending: Dict[Tuple[str, str], Tuple[str, Dict[str, Any]]] = {}
+        candidates: List[Tuple[int, Tuple[str, str], int, int]] = []
+        for i, d in enumerate(deployments):
+            base = _api_base(d)
+            limit = max_input_tokens(d)
+            if base is None or limit is None:
+                continue  # Claude, or a local deployment with no declared window
+            if estimate is None:
+                estimate = estimate_tokens(messages, tools, self.tokenize_chars_per_token)
+            if estimate < self.tokenize_min_fraction * limit:
+                continue  # cannot be close: no /tokenize call
+            url = tokenize_url(base)
+            body = tokenize_body(d, messages, tools, request_kwargs)
+            key = tokenize_cache_key(url, body)
+            pending.setdefault(key, (url, body))
+            candidates.append((i, key, limit, max_output_tokens(request_kwargs, d)))
+        if not candidates:
+            return {}
+        keys = list(pending)
+        counted = await asyncio.gather(*(self._count(model, k, *pending[k]) for k in keys))
+        results = dict(zip(keys, counted))
+        out: Dict[int, str] = {}
+        for i, key, limit, max_out in candidates:
+            res = results.get(key)
+            if res is None:
+                continue  # tokenize failed: keep it, LiteLLM decides as before
+            reason = context_verdict(res[0], limit, res[1], max_out)
+            if reason is not None:
+                out[i] = reason
+        return out
+
+    async def _count(
+        self, model: str, key: Tuple[str, str], url: str, body: Dict[str, Any]
+    ) -> Optional[Tuple[int, Optional[int]]]:
+        """(count, max_model_len) from the cache or one bounded /tokenize call;
+        None on any failure."""
+        hit = self._tokenize_cache.get(key)
+        if hit is not None:
+            self._tokenize_cache.move_to_end(key)
+            self.stats["tokenize_cache_hits"] += 1
+            return hit
+        self.stats["tokenize_calls"] += 1
+        try:
+            data = await asyncio.wait_for(self._tokenize(url, body), timeout=self.tokenize_timeout)
+            count = data.get("count") if isinstance(data, dict) else None
+            if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                raise ProbeError("no integer `count` in the response")
+            result = (count, _positive_int(data.get("max_model_len")))
+        except Exception as exc:
+            self.stats["tokenize_errors"] += 1
+            self._log(model, url, "tokenize-failed",
+                      "%s: /tokenize at %s failed (%s); keeping that backend's deployment(s)",
+                      model, url, f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__)
+            return None
+        self._tokenize_cache[key] = result
+        while len(self._tokenize_cache) > TOKENIZE_CACHE_SIZE:
+            self._tokenize_cache.popitem(last=False)
+        return result
+
+    # -- Core busy/down rule (sync, so it is trivially testable) -----------------
+    def _learn(self, model: str, deployments: List) -> None:
+        """Register every local backend of a chain with the poller."""
         bases: List[str] = []
-        for d in healthy_deployments:
+        for d in deployments:
             base = _api_base(d)
             if base is not None:
                 bases.append(base)
@@ -872,6 +1216,11 @@ class OverflowHandler(CustomLogger):  # type: ignore[misc,valid-type]
             # Union: a cooled-down deployment missing from this call is still in the chain.
             self._chain_backends[model] = tuple(dict.fromkeys(self._chain_backends.get(model, ()) + tuple(bases)))
         self._ensure_poller()
+
+    def filter_deployments(self, model: str, healthy_deployments: List) -> List:
+        if not _is_chain(healthy_deployments):
+            return healthy_deployments  # not a chain: leave plain groups alone
+        self._learn(model, healthy_deployments)
 
         now = self._clock()
         kept: List = []
@@ -970,7 +1319,11 @@ class OverflowHandler(CustomLogger):  # type: ignore[misc,valid-type]
                 "poll_interval_s": self.poll_interval,
                 "probe_timeout_s": self.probe_timeout,
                 "stale_after_s": self.stale_after,
+                "tokenize_min_fraction": self.tokenize_min_fraction,
+                "tokenize_chars_per_token": self.tokenize_chars_per_token,
+                "tokenize_timeout_s": self.tokenize_timeout,
             },
+            "tokenize_cache_entries": len(self._tokenize_cache),
             "poller_running": bool(task is not None and not task.done()),
             "stats": dict(self.stats),
             "backends": {b: s.snapshot(now, self.stale_after) for b, s in self._backends.items()},

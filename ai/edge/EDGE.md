@@ -35,6 +35,7 @@ Config: [`haproxy.cfg`](haproxy.cfg). Image tag: `EDGE_HAPROXY_VERSION` in `.env
   - [One name, two paths (split-horizon)](#one-name-two-paths-split-horizon)
   - [How it works](#how-it-works)
   - [Operator checklist](#operator-checklist)
+  - [Updating certs](#updating-certs)
   - [Staging and production](#staging-and-production)
   - [Changing `EDGE_TLS_DOMAIN`](#changing-edge_tls_domain)
   - [Renewal](#renewal)
@@ -727,6 +728,81 @@ root, unless they say otherwise.
    - update the `PORT_LITELLM` rows of `.env.example`, `CLAUDE.md` and
      `ai/AI_INFRA.md`;
    - `make up edge` (a recreate, since the published ports changed).
+
+### Updating certs
+
+Runbook for every certificate change after the first setup. Run all commands
+on the box. The sections after this one explain what happens underneath.
+
+**See what is installed.** Do this before and after any change:
+```bash
+docker exec edge-certs certbot certificates                       # each name, its expiry, staging or not
+docker exec edge-certs python3 /edge-certs/edge_certs.py status   # disk vs what the running edge serves
+```
+
+#### Change the hostname
+
+Done on 2026-10-15 to move this box from `ai.zeoenergy.com` to
+`api.zeoenergy.com`. `<old>` and `<new>` below are the two names.
+
+1. **DNS for `<new>`.** If `<new>` already has a public record, as
+   `api.zeoenergy.com` does for the cloudflared tunnel, do **not** add an `A`
+   record for it in Cloudflare. Point office machines at the box with a router
+   DNS override instead ([One name, two paths](#one-name-two-paths-split-horizon),
+   optional). The certificate needs no `A` record at all: DNS-01 only writes
+   a TXT record at `_acme-challenge.<new>`.
+2. **`.env`:** set `EDGE_TLS_DOMAIN=<new>`. Once production has worked on this
+   box, leave `EDGE_TLS_STAGING=0` so the new name gets a trusted certificate
+   straight away.
+3. **Deploy:** `make up edge`. `edge-certs` is recreated and requests a
+   certificate for `<new>` (about a minute). Until it arrives, the edge still
+   serves `<old>`'s certificate, so clients see a name mismatch.
+4. **Watch it arrive:** `make logs edge edge-certs FOLLOW=0`. Expect
+   `requesting … certificate for <new>`, then `wrote the certificate …` and
+   `the running edge now serves …`.
+5. **Verify:**
+   ```bash
+   curl -sS --resolve <new>:443:127.0.0.1 https://<new>/health/liveliness   # "I'm alive!"
+   docker exec edge-certs certbot certificates                                # lists <new> and <old>
+   ```
+6. **Delete the old certificate.** Only after step 5 shows `<new>` is served.
+   While `EDGE_TLS_DOMAIN` still names `<old>`, deleting it just makes
+   `edge-certs` request it again:
+   ```bash
+   docker exec edge-certs certbot delete --cert-name <old> --non-interactive
+   docker exec edge-certs certbot certificates                                # only <new> left
+   ```
+   This removes the files on the box and nothing else; no revocation is
+   needed. `edge-certs` stops logging its "old lineage left alone" line.
+7. **Delete `<old>`'s DNS record** in Cloudflare, if one was created for it
+   (this box had an `ai` `A` record). Never delete a record that `<new>` or
+   the tunnel still uses.
+
+Mechanics: [Changing `EDGE_TLS_DOMAIN`](#changing-edge_tls_domain).
+
+#### Move from staging to production
+
+Set `EDGE_TLS_STAGING=0` in `.env`, then `make up edge`. `edge-certs` replaces
+the staging certificate in the same lineage, so nothing needs deleting. Check
+with `curl -sS --resolve <name>:443:127.0.0.1 https://<name>/health/liveliness`,
+without `-k`. Details: [Staging and production](#staging-and-production).
+
+#### Renew now
+
+Renewal is automatic ([Renewal](#renewal)). To force one, for example after
+a key compromise:
+```bash
+docker exec edge-certs certbot renew --cert-name <name> --force-renewal
+```
+The saved deploy hook pushes the new certificate into the running edge
+without a restart. Each forced production renewal counts against Let's
+Encrypt's limit of 5 certificates per name per week. To test without
+issuing anything, use `certbot renew --dry-run` instead.
+
+#### Replace the Cloudflare token
+
+See [Rotating the Cloudflare token](#rotating-the-cloudflare-token): put the
+new token in `.env`, run `make up edge`, then revoke the old one.
 
 ### Staging and production
 

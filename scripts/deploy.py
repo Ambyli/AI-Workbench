@@ -229,6 +229,20 @@ def published_ports(svc: dict) -> list:
     return out
 
 
+def host_ports(svc: dict) -> list:
+    """Published host port numbers (as strings), for `docker ps --filter publish=`."""
+    out = []
+    for p in svc.get("ports") or []:
+        if isinstance(p, dict):
+            pub = str(p.get("published") or "")
+        else:  # short syntax "[ip:]host:container"
+            parts = str(p).split(":")
+            pub = parts[-2] if len(parts) >= 2 else ""
+        if pub.isdigit() and pub not in out:
+            out.append(pub)
+    return out
+
+
 def has_gpu(svc: dict) -> bool:
     if svc.get("gpus") or svc.get("runtime") == "nvidia":
         return True
@@ -707,9 +721,51 @@ class Deployer:
                 self.say(name, f"recreate-class, unchanged -- compose leaves it running ({reason})")
             else:
                 self.say(name, f"recreate (downtime): {reason}")
+                self.check_ports_free(name, svc)
             self.compose_up(name)
         if labels.get(WAIT_LABEL) == "healthy":
             self.wait_recreated_healthy(name, svc)
+
+    def check_ports_free(self, name: str, svc: dict) -> None:
+        """Fail before `up` when another service's container holds one of our host ports.
+
+        Otherwise compose creates the container, fails to start it with
+        "port is already allocated", and leaves it half-made -- the usual case
+        being the edge before the one-time cutover, while an old pre-edge
+        container (litellm, ...) still publishes the port. Its own container
+        holding the port is fine: compose stops it before starting the new one.
+        """
+        holders = {}
+        for port in host_ports(svc):
+            r = self.docker("ps", "-q", "--no-trunc", "--filter", f"publish={port}")
+            ids = r.stdout.split() if r.ok else []
+            if not ids:
+                continue
+            r = self.docker("inspect", *ids)
+            if not r.ok:
+                continue
+            for c in (container_from_inspect(d) for d in json.loads(r.stdout or "[]")):
+                if (c.labels.get(PROJECT_LABEL), c.labels.get(SERVICE_LABEL)) == (self.project, name):
+                    continue
+                holders.setdefault(port, []).append(c)
+        if not holders:
+            return
+        lines, stacks = [], []
+        for port, cs in holders.items():
+            for c in cs:
+                project = c.labels.get(PROJECT_LABEL) or ""
+                lines.append(f"host port {port} is held by {c.name}" + (f" (project {project})" if project else ""))
+                if project.startswith("ai-") and project[3:] not in stacks:
+                    stacks.append(project[3:])
+        hint = ("; deploy those first so they release it: " + ", ".join(f"`make up {s}`" for s in stacks)
+                if stacks else "; stop that container first")
+        if name == EDGE_SERVICE and self.project == EDGE_PROJECT:
+            hint += " (ai/edge/EDGE.md § One-time cutover)"
+        message = "; ".join(lines) + hint
+        if self.dry_run:
+            self.detail(f"would fail: {message}")
+            return
+        raise DeployError(message)
 
     def reload_in_place(self, name: str, signal: str, check: Optional[str]) -> None:
         """Validate the bind-mounted config inside the running container, then signal it.

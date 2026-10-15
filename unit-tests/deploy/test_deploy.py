@@ -199,6 +199,10 @@ class FakeDocker:
             if a == "--filter":
                 key, value = args[i + 1].removeprefix("label=").split("=", 1)
                 filters[key] = value
+        if "publish" in filters:
+            ids = [cid for cid, c in self.containers.items()
+                   if c["state"] == "running" and int(filters["publish"]) in c["ports"]]
+            return deploy.Result(0, "\n".join(ids) + ("\n" if ids else ""))
         ids = [
             cid for cid, c in self.containers.items()
             if c["project"] == filters.get(deploy.PROJECT_LABEL)
@@ -222,7 +226,9 @@ class FakeDocker:
             out.append({
                 "Id": cid, "Name": "/" + c["name"], "Created": c["created"], "State": state,
                 "Image": c["image"],
-                "Config": {"Labels": c["labels"], "StopTimeout": c["stop_timeout"]},
+                "Config": {"Labels": {**c["labels"], deploy.PROJECT_LABEL: c["project"],
+                                      deploy.SERVICE_LABEL: c["service"]},
+                           "StopTimeout": c["stop_timeout"]},
                 "NetworkSettings": {
                     "Networks": {"ai_shared": {"IPAddress": c["ip"]}},
                     "Ports": {f"{p}/tcp": [{"HostIp": "0.0.0.0", "HostPort": str(p)}] for p in c["ports"]},
@@ -1031,6 +1037,38 @@ def test_dry_run_describes_the_reload():
     assert rc == 0
     assert fake.mutating() == [] and not [c for c in fake.calls if c[0] == "exec"]
     assert "would run `haproxy -c -f /usr/local/etc/haproxy/haproxy.cfg` in the running container, then send USR2" in out
+
+
+def test_host_ports_reads_both_port_syntaxes():
+    svc = {"ports": [{"target": 4001, "published": "4001"}, "127.0.0.1:8007:8080", "9090:9090", "5432"]}
+    assert deploy.host_ports(svc) == ["4001", "8007", "9090"]
+
+
+def test_recreate_refuses_when_another_stack_holds_a_host_port():
+    # The edge before the one-time cutover: the old pre-edge litellm still publishes 4001.
+    fake = FakeDocker({"edge": edge_like_svc()}, images={"haproxy:3.4.6-alpine": "sha256:h"})
+    fake.add("litellm", "litellm", project="ai-litellm", ports=[4001])
+    rc, out = run(fake, "edge")
+    assert rc == 1
+    assert "host port 4001 is held by litellm (project ai-litellm)" in out
+    assert "`make up litellm`" in out
+    assert fake.mutating() == []  # nothing half-created
+
+
+def test_recreate_ignores_its_own_container_holding_the_port():
+    fake = FakeDocker({"edge": edge_like_svc()}, images={"haproxy:3.4.6-alpine": "sha256:h"})
+    fake.add("edge", "edge", labels={deploy.CONFIG_HASH_LABEL: "an-older-config"}, ports=[4001])
+    rc, out = run(fake, "edge")
+    assert rc == 0, out
+    assert fake.mutating() == ["compose up -d --no-deps edge"]
+
+
+def test_dry_run_reports_a_held_port_without_failing():
+    fake = FakeDocker({"edge": edge_like_svc()}, images={"haproxy:3.4.6-alpine": "sha256:h"})
+    fake.add("litellm", "litellm", project="ai-litellm", ports=[4001])
+    rc, out = run(fake, "edge", dry_run=True)
+    assert rc == 0 and fake.mutating() == []
+    assert "would fail: host port 4001 is held by litellm" in out
 
 
 def test_recreate_without_wait_label_does_not_wait():

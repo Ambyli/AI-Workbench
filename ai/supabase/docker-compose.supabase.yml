@@ -68,7 +68,7 @@ services:
   # direct psql / DBeaver path (bypasses the pooler).
   #
   # Port grouping in the PORT REGISTRY block of .env:
-  #   5432 litellm_db, 5433 roofix-db, 5434 sandbox-db, 5435 n8n-db,
+  #   5432 litellm_db, 5433 roofix-db, 5440 sandbox-db, 5435 n8n-db,
   #   5436 hive-metastore-db, 5437 superset-db, 5438 supabase-db
   #
   # Recreated (with downtime) by `make up`: a data directory can have only one

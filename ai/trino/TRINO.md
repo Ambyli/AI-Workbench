@@ -258,7 +258,7 @@ bottom of the stack trace.
 |---|---|---|
 | On `ai_shared` (any compose service that joins it) | Docker service DNS | `roofix-db:5432`, `classifier-db:5432` (read-only `trino_reader` role from `ai/classifier/db-init/10-trino-reader.sh`) |
 | On `ai_shared` via a subsystem that dual-homes its DB on purpose | Docker service DNS | `supabase-db:5432` (see [ai/supabase/SUPABASE.md](../supabase/SUPABASE.md); only the `postgres` database is federated — `_supabase`, Supavisor's metadata DB, is not) |
-| On an isolated Docker network (`litellm`'s `internal`, sandbox's `sandbox_state`) | `host.docker.internal:<host-published-port>` | `host.docker.internal:5434` |
+| On an isolated Docker network (`litellm`'s `internal`, sandbox's `sandbox_state`) | `host.docker.internal:<host-published-port>` | `host.docker.internal:5440` |
 | Off-box (Supabase, RDS, a partner DB) | Public hostname | `aws-1-us-east-1.pooler.supabase.com:5432` |
 
 `host.docker.internal` works because the coordinator has

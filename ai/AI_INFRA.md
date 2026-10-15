@@ -47,7 +47,7 @@ Every service in the list below is on the `ai_shared` network unless noted. Port
 | [`roofix/docker-compose.roofix.yml`](roofix/docker-compose.roofix.yml) | `roofix` | _(internal only)_ | [ROOFIX.md](roofix/ROOFIX.md) |
 | [`interceptor/docker-compose.interceptor.yml`](interceptor/docker-compose.interceptor.yml) | `interceptor` | _(internal only)_ | [INTERCEPTOR.md](interceptor/INTERCEPTOR.md) |
 | [`searxng/docker-compose.searxng.yml`](searxng/docker-compose.searxng.yml) | `searxng` | `8009` _(via edge)_ | [SEARXNG.md](searxng/SEARXNG.md) |
-| [`sandbox/docker-compose.sandbox.yml`](sandbox/docker-compose.sandbox.yml) | `sandbox-runner`, `sandbox-proxy`, `sandbox-egress`, `sandbox-db` | `8012` (runner, _via edge_), `8011` (proxy, _via edge_), `5434` (db) | [SANDBOX.md](sandbox/SANDBOX.md) |
+| [`sandbox/docker-compose.sandbox.yml`](sandbox/docker-compose.sandbox.yml) | `sandbox-runner`, `sandbox-proxy`, `sandbox-egress`, `sandbox-db` | `8012` (runner, _via edge_), `8011` (proxy, _via edge_), `5440` (db) | [SANDBOX.md](sandbox/SANDBOX.md) |
 | [`n8n/docker-compose.n8n.yml`](n8n/docker-compose.n8n.yml) | `n8n`, `n8n-db` | `5435` (db) — n8n itself reached via oauth2-proxy at `/n8n/` | [N8N.md](n8n/N8N.md) |
 | [`trino/docker-compose.trino.yml`](trino/docker-compose.trino.yml) | `trino-coordinator`, `trino-auth-init`, `hive-metastore`, `hive-metastore-db`, `lake-s3`, `lake-s3-init`, `trino-mcp`, `superset`, `superset-db` | `8013` (trino — HTTPS + password auth), `8014`/`8015` (lake-s3 S3 api/console — RustFS), `8016` (superset, _via edge_), `5436`/`5437` (hms-db / superset-db) — the lake-s3 console and superset also reached via oauth2-proxy at `/rustfs/` and `/superset/` | [TRINO.md](trino/TRINO.md) |
 | [`open-terminal/docker-compose.open-terminal.yml`](open-terminal/docker-compose.open-terminal.yml) | `open-terminal` | _(none — **not on `ai_shared`**; on `terminal_net`, reached only by the openwebui backend)_ | [OPEN_TERMINAL.md](open-terminal/OPEN_TERMINAL.md) |
@@ -142,7 +142,7 @@ flowchart TB
         SBR["sandbox-runner<br/>:8000 (LAN :8012 via edge)<br/>FastAPI + MCP + docker.sock"]:::svc
         SBP["sandbox-proxy<br/>:80 (LAN :8011 via edge)<br/>Caddy /{id}/*"]:::svc
         SBE["sandbox-egress<br/>internal<br/>tinyproxy allowlist"]:::svc
-        SBD[("sandbox-db<br/>postgres :5434<br/>sandbox_state net")]:::store
+        SBD[("sandbox-db<br/>postgres :5440<br/>sandbox_state net")]:::store
         SBX["sandbox-{id}<br/>ephemeral<br/>sandbox_net only"]:::standalone
     end
     subgraph N8NG["n8n/docker-compose.n8n.yml"]
@@ -264,7 +264,7 @@ flowchart TB
     HMS  -.->|"s3a validation"| LAKES3
     TR   -.->|"federated<br/>host publish :5432"| DB
     TR   -.->|"federated<br/>ai_shared"| RB
-    TR   -.->|"federated<br/>host publish :5434"| SBD
+    TR   -.->|"federated<br/>host publish :5440"| SBD
     TR   -.->|"federated<br/>ai_shared, trino_reader"| SUPDB
     TR   -.->|"federated<br/>ai_shared, trino_reader"| CLSDB
 
@@ -350,7 +350,7 @@ Ports are sourced from `.env` (`PORT_*` variables). Defaults shown; change them 
 | searxng | `8009` _(via edge)_ |
 | sandbox-proxy | `8011` _(via edge)_ |
 | sandbox-runner | `8012` _(via edge; 503 while recreated)_ |
-| sandbox-db (postgres) | `5434` |
+| sandbox-db (postgres) | `5440` |
 | n8n-db (postgres) | `5435` |
 | n8n | _(none — via oauth2-proxy at `/n8n/`)_ |
 | trino-coordinator | `8013` _(HTTPS + password auth; the username-only HTTP listener on 8080 is container-internal and never published)_ |

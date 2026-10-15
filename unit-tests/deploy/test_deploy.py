@@ -92,6 +92,7 @@ class FakeDocker:
         self.compose_up_rc: dict = {}
         self.edge_stats = None  # str or callable -> str
         self.exec_result = None  # deploy.Result for non-stats `docker exec` (the reload check)
+        self.host_listeners: set = set()  # host ports held by processes outside Docker
 
     # model helpers ----------------------------------------------------------
 
@@ -298,6 +299,8 @@ def run(fake: FakeDocker, *services, dry_run=False, force=False, repo_root=None,
         # Tests opt in to an edge-fronted service; the real haproxy.cfg is
         # covered by the repo-invariant tests at the bottom.
         edge_listens=edge_listens or {},
+        # Never probe the test machine's real ports.
+        probe_port=lambda port: int(port) in fake.host_listeners,
     )
     rc = deployer.run(list(services))
     return rc, out.getvalue()
@@ -1054,6 +1057,42 @@ def test_recreate_refuses_when_another_stack_holds_a_host_port():
     assert "host port 4001 is held by litellm (project ai-litellm)" in out
     assert "`make up litellm`" in out
     assert fake.mutating() == []  # nothing half-created
+
+
+def test_recreate_refuses_when_a_process_outside_docker_holds_a_host_port():
+    # Seen on the box: sandbox-db's recreate failed with "address already in
+    # use" on 5434 -- no container held it, a host process did.
+    db = db_svc()
+    db["ports"] = [{"target": 5432, "published": "5434", "protocol": "tcp"}]
+    fake = FakeDocker({"db": db}, images={"postgres:16": "sha256:p"})
+    fake.host_listeners.add(5434)
+    rc, out = run(fake, "db")
+    assert rc == 1
+    assert "host port 5434 is in use by a process outside Docker" in out
+    assert "sudo ss -ltnp 'sport = :5434'" in out
+    assert "leftover docker-proxy" in out
+    assert fake.mutating() == []  # nothing created, the running copy untouched
+
+
+def test_port_probe_is_skipped_when_a_container_holds_the_port():
+    fake = FakeDocker({"edge": edge_like_svc()}, images={"haproxy:3.4.6-alpine": "sha256:h"})
+    fake.add("edge", "edge", labels={deploy.CONFIG_HASH_LABEL: "an-older-config"}, ports=[4001])
+    fake.host_listeners.add(4001)  # what a real probe would see: the edge's own binding
+    rc, out = run(fake, "edge")
+    assert rc == 0, out
+    assert fake.mutating() == ["compose up -d --no-deps edge"]
+
+
+def test_tcp_port_in_use_detects_a_real_listener():
+    import socket as _socket
+    # 0.0.0.0, not 127.0.0.1: Linux (where deploy.py runs) also refuses a
+    # 0.0.0.0 bind next to a loopback listener, Windows does not.
+    with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as s:
+        s.bind(("0.0.0.0", 0))
+        s.listen(1)
+        port = s.getsockname()[1]
+        assert deploy.tcp_port_in_use(str(port)) is True
+    assert deploy.tcp_port_in_use(str(port)) is False
 
 
 def test_recreate_ignores_its_own_container_holding_the_port():

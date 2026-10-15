@@ -6,7 +6,7 @@ networks:
 services:
   # Postgres backing n8n's workflow store, execution history, and encrypted
   # credentials. Exposed on the host at PORT_N8N_DB (default 5435 — sits one
-  # past sandbox-db's 5434 in the PORT REGISTRY in .env) so operators can
+  # past sandbox-db's 5440 in the PORT REGISTRY in .env) so operators can
   # query it remotely — psql, DBeaver, dashboards. See N8N.md
   # § "Connecting to the n8n DB".
   #

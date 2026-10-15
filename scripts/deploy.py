@@ -43,12 +43,14 @@ from __future__ import annotations
 
 import argparse
 import csv
+import errno
 import hashlib
 import io
 import json
 import os
 import re
 import shlex
+import socket
 import subprocess
 import sys
 import time
@@ -227,6 +229,23 @@ def published_ports(svc: dict) -> list:
         else:
             out.append(str(p))
     return out
+
+
+def tcp_port_in_use(port: str) -> bool:
+    """True when something on this host already listens on TCP `port`.
+
+    Binding 0.0.0.0 without SO_REUSEADDR fails while any address of the port
+    is taken, which is exactly what Docker's own bind would hit. Run on the
+    Docker host (deploy.py always is); any error other than EADDRINUSE --
+    e.g. EACCES for a port below 1024 as a non-root user -- is "don't know",
+    so it never blocks a deploy.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(("0.0.0.0", int(port)))
+        except OSError as exc:
+            return exc.errno == errno.EADDRINUSE
+    return False
 
 
 def host_ports(svc: dict) -> list:
@@ -491,8 +510,10 @@ class Deployer:
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
         edge_listens: Optional[dict] = None,
+        probe_port: Optional[Callable[[str], bool]] = None,
     ):
         self.docker = docker
+        self.probe_port = probe_port or tcp_port_in_use
         self.files = list(files)
         self.project = project
         self.env_file = env_file
@@ -762,30 +783,45 @@ class Deployer:
         container (litellm, ...) still publishes the port. Its own container
         holding the port is fine: compose stops it before starting the new one.
         """
-        holders = {}
+        holders, foreign = {}, []
         for port in host_ports(svc):
             r = self.docker("ps", "-q", "--no-trunc", "--filter", f"publish={port}")
             ids = r.stdout.split() if r.ok else []
-            if not ids:
+            containers = []
+            if ids:
+                r = self.docker("inspect", *ids)
+                if r.ok:
+                    containers = [container_from_inspect(d) for d in json.loads(r.stdout or "[]")]
+            if not containers:
+                # No container claims it, but a host process might: a leftover
+                # docker-proxy, a host Postgres, an SSH tunnel. Docker then fails
+                # the start with "address already in use" after creating the
+                # container -- and the old one is already gone.
+                if self.probe_port(port):
+                    foreign.append(port)
                 continue
-            r = self.docker("inspect", *ids)
-            if not r.ok:
-                continue
-            for c in (container_from_inspect(d) for d in json.loads(r.stdout or "[]")):
+            for c in containers:
                 if (c.labels.get(PROJECT_LABEL), c.labels.get(SERVICE_LABEL)) == (self.project, name):
                     continue
                 holders.setdefault(port, []).append(c)
-        if not holders:
+        if not holders and not foreign:
             return
         lines, stacks = [], []
+        for port in foreign:
+            lines.append(f"host port {port} is in use by a process outside Docker "
+                         f"(find it with: sudo ss -ltnp 'sport = :{port}')")
         for port, cs in holders.items():
             for c in cs:
                 project = c.labels.get(PROJECT_LABEL) or ""
                 lines.append(f"host port {port} is held by {c.name}" + (f" (project {project})" if project else ""))
                 if project.startswith("ai-") and project[3:] not in stacks:
                     stacks.append(project[3:])
-        hint = ("; deploy those first so they release it: " + ", ".join(f"`make up {s}`" for s in stacks)
-                if stacks else "; stop that container first")
+        if stacks:
+            hint = "; deploy those first so they release it: " + ", ".join(f"`make up {s}`" for s in stacks)
+        elif holders:
+            hint = "; stop that container first"
+        else:
+            hint = "; free it (a leftover docker-proxy can be killed by its pid), then retry"
         if name == EDGE_SERVICE and self.project == EDGE_PROJECT:
             hint += " (ai/edge/EDGE.md § One-time cutover)"
         message = "; ".join(lines) + hint

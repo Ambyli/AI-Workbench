@@ -28,7 +28,7 @@ Five Docker networks:
 
 `sandbox_egress_out` is the exception: it is *not* internal, so it does have a default gateway and can reach the public internet. It exists solely to give `sandbox-egress` its outbound leg after the allowlist filter runs. No sandbox, no state store, and nothing else in the stack attaches to it. Sandboxes reach the internet ONLY by first hitting `sandbox-egress` on `sandbox_net`, passing the filter, and then being forwarded out via `sandbox_egress_out`.
 
-`sandbox_db_publish` exists only so `PORT_SANDBOX_DB` (5434) gets published. Docker publishes **no** host ports for a container whose every network is `internal: true`. On the box (Docker 29.4.0) `sandbox-db` came up with `PortBindings` configured but `NetworkSettings.Ports` empty, and Trino's `postgres_sandbox` catalog, which reads `host.docker.internal:5434`, lost its connection. Nothing but `sandbox-db` attaches to `sandbox_db_publish`, so no sandbox, runner or `ai_shared` peer gains a route to the database. Its IP masquerade is off (`com.docker.network.bridge.enable_ip_masquerade: "false"`): the published port still works, because inbound connections are DNATed and replies return through the host, but `sandbox-db` gets no outbound internet through it.
+`sandbox_db_publish` exists only so `PORT_SANDBOX_DB` (5440) gets published. The port was 5434 until 2026-10-15; it moved because a Postgres installed directly on the box already listens on `127.0.0.1:5434`, and Docker's `0.0.0.0` bind collides with it ("address already in use"). Docker publishes **no** host ports for a container whose every network is `internal: true`. On the box (Docker 29.4.0) `sandbox-db` came up with `PortBindings` configured but `NetworkSettings.Ports` empty, and Trino's `postgres_sandbox` catalog, which reads `host.docker.internal:5440`, lost its connection. Nothing but `sandbox-db` attaches to `sandbox_db_publish`, so no sandbox, runner or `ai_shared` peer gains a route to the database. Its IP masquerade is off (`com.docker.network.bridge.enable_ip_masquerade: "false"`): the published port still works, because inbound connections are DNATed and replies return through the host, but `sandbox-db` gets no outbound internet through it.
 
 Consequences:
 
@@ -68,8 +68,8 @@ From the host, for `sandbox-db`'s host port and its publish-only network:
 
 ```
 docker inspect sandbox-db --format '{{json .NetworkSettings.Ports}}'
-                                                    → 5432/tcp bound to HostPort 5434 (not null)
-pg_isready -h localhost -p 5434                     → accepting connections
+                                                    → 5432/tcp bound to HostPort 5440 (not null)
+pg_isready -h localhost -p 5440                     → accepting connections
 docker network inspect sandbox_db_publish --format '{{range .Containers}}{{.Name}} {{end}}'
                                                     → sandbox-db ONLY
 docker exec sandbox-db wget -qO- --timeout 3 https://example.com

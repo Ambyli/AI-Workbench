@@ -38,7 +38,7 @@ services:
   # migrations run on startup and would collide with anything else.
   #
   # Port grouping in the PORT REGISTRY block of .env:
-  #   5432 litellm_db, 5433 roofix-db, 5434 sandbox-db, 5435 n8n-db,
+  #   5432 litellm_db, 5433 roofix-db, 5440 sandbox-db, 5435 n8n-db,
   #   5436 hive-metastore-db, 5437 superset-db
   #
   # Recreated (with downtime) by `make up`: a data directory can have only one
@@ -286,6 +286,8 @@ services:
       SANDBOX_DB_USER: ${SANDBOX_DB_USER:-sandbox}
       SANDBOX_DB_PASSWORD: ${SANDBOX_DB_PASSWORD:-sandbox}
       SANDBOX_DB_NAME: ${SANDBOX_DB_NAME:-sandbox}
+      # Host port of sandbox-db (catalogs/postgres_sandbox.properties).
+      PORT_SANDBOX_DB: ${PORT_SANDBOX_DB:-5440}
       # Phoenix production Postgres (off-box, read-only role). Same vars
       # the Roofix bridge uses — one definition in .env feeds both.
       # Consumed by catalogs/postgres_phoenix.properties.
@@ -345,7 +347,7 @@ services:
     # host.docker.internal is NOT defined by default on Linux Docker (only
     # Docker Desktop injects it). host-gateway maps it to the bridge
     # gateway IP so the postgres_litellm / postgres_sandbox catalogs can
-    # reach the host-published ports 5432 / 5434.
+    # reach the host-published ports 5432 / 5440.
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:

@@ -44,7 +44,7 @@ networks:
   # Host-port network for sandbox-db ONLY. Docker (29.4 on the box) does not
   # publish ports for a container whose every network is `internal: true`:
   # PORT_SANDBOX_DB was configured but bound nothing, which broke Trino's
-  # postgres_sandbox catalog (host.docker.internal:5434). This plain bridge
+  # postgres_sandbox catalog (host.docker.internal:5440). This plain bridge
   # exists solely so Docker can apply that publish. Nothing else attaches, so
   # no sandbox, runner or ai_shared peer gains a route to the DB. Masquerade
   # is off: the published port still works (inbound DNAT, replies go back
@@ -81,7 +81,7 @@ services:
     volumes:
       - sandbox_db_data:/var/lib/postgresql/data
     ports:
-      - "${PORT_SANDBOX_DB:-5434}:5432"
+      - "${PORT_SANDBOX_DB:-5440}:5432"
     networks:
       - sandbox_state
       # Only for the host-port publish above; see the network's comment.

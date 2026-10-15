@@ -1,0 +1,203 @@
+# Edge: one HAProxy that owns the LAN host ports of every service `make up`
+# swaps side by side.
+#
+# A host port can be bound by only one container, so a service that runs two
+# copies during a deploy cannot publish its own port. Instead this container
+# publishes it -- same PORT_* variable, same bind address (0.0.0.0) as the
+# service used to -- and forwards to `<service>:<port>` over ai_shared, where
+# Docker DNS returns every running copy. HAProxy health-checks each copy, so
+# during a swap traffic goes to whichever copies are up, and a connection
+# refused by a retiring copy is retried on the other (haproxy.cfg).
+#
+# Container-to-container traffic does not come through here: Open WebUI,
+# cloudflared, oauth2-proxy, etc. keep calling `litellm:4000` and friends by
+# service name. Only LAN / localhost clients on the published ports do -- plus
+# ONE internal caller: the semantic router's Envoy reaches LiteLLM through
+# edge:14000, so its pinned upstream address never belongs to a retiring
+# LiteLLM copy.
+#
+# It also publishes the ports of three recreate-class HTTP APIs (classifier,
+# sandbox-runner, detector). They are not swapped -- each compose file says
+# why -- but while one is recreated the edge answers 503 + Retry-After instead
+# of the client getting "connection refused".
+#
+# Inside the container each service gets a FIXED listener equal to its default
+# host port (4001 litellm, 4180 oauth2-proxy, ...); the left-hand side is the
+# operator's PORT_* value. Never published, reachable only inside the
+# container or as edge:<port> on ai_shared:
+#   127.0.0.1:8404  stats CSV; scripts/deploy.py reads it to wait for a new
+#                   copy to be UP, and the healthcheck below probes it
+#   14000           LiteLLM for the semantic router's Envoy (config.yaml
+#                   base_url http://edge:14000/v1); exempt from the LAN
+#                   allow-list and the per-key limit
+#   8405            Prometheus exporter, scraped by the litellm stack's prometheus
+#   8407            read-only status page, behind oauth2-proxy at
+#                   chat.zeoenergy.com/edge/
+# Every published port rejects clients outside EDGE_ALLOWED_CIDRS (below).
+#
+# TLS: LiteLLM is also served over HTTPS on PORT_LITELLM_TLS (host 443; the
+# listener inside the container is 4443), with a Let's Encrypt certificate for
+# EDGE_TLS_DOMAIN (api.zeoenergy.com: the tunnel's public name, which a LAN DNS
+# override points at this box -- split-horizon, EDGE.md § TLS) that the
+# `edge-certs` service below obtains by DNS-01 through the Cloudflare API and
+# keeps renewed. It shares the
+# certificate with the edge through the `edge_certs` volume (read-only here)
+# and pushes a renewed one into the running HAProxy through its runtime-API
+# socket in the `edge_api` volume -- no restart. See ai/edge/EDGE.md § TLS.
+#
+# No docker.sock in either service: sandbox-runner stays the only container
+# that mounts it. See ai/edge/EDGE.md for the cutover order and operations.
+
+networks:
+  shared:
+    external: true
+    name: ai_shared
+
+services:
+  edge:
+    # Pinned patch tag of the current HAProxy LTS branch (3.4, 2026-10-14),
+    # alpine flavour so busybox wget is there for the healthcheck and for
+    # scripts/deploy.py's stats read. Set EDGE_HAPROXY_VERSION in .env.
+    image: haproxy:${EDGE_HAPROXY_VERSION:-3.4.6}-alpine
+    # Recreated (with downtime) by `make up`: it owns the host ports, which is
+    # the whole point. A recreate drops in-flight LAN connections for a second
+    # or two; routed `auto` turns (they reach LiteLLM through edge:14000)
+    # fall back to local-private for as long. Other container-to-container
+    # traffic is unaffected. An edit to haproxy.cfg alone is a hitless reload instead.
+    container_name: edge
+    labels:
+      # `make up` waits for the healthcheck below after recreating it and
+      # fails loudly if it never passes. The edge stack is last in the
+      # Makefile, so a full `make up` ends by proving the LAN ports are served.
+      com.zeo.deploy.wait: healthy
+      # haproxy.cfg is bind-mounted, so compose never sees an edit to it. When
+      # compose would leave the edge running, `make up edge` instead validates
+      # the config inside it and, only if that passes, sends USR2: the
+      # official image runs HAProxy in master-worker mode (-W), so new workers
+      # load the new config while old ones finish their open connections. A
+      # bad config stops `make up` and the running edge keeps its old one.
+      com.zeo.deploy.reload: USR2
+      com.zeo.deploy.reload.check: haproxy -c -f /usr/local/etc/haproxy/haproxy.cfg
+    restart: unless-stopped
+    networks:
+      - shared
+    ports:
+      # <operator PORT_* value>:<fixed listener in haproxy.cfg>
+      - "${PORT_LITELLM}:4001"
+      # LiteLLM over TLS (the `lan-tls` bind; EDGE.md § TLS). Host 443 by
+      # default, so the LAN URL is the same as the public one; the fixed
+      # listener inside the container is 4443.
+      - "${PORT_LITELLM_TLS:-443}:4443"
+      - "${PORT_OAUTH2_PROXY}:4180"
+      - "${PORT_KOKORO_API}:8004"
+      - "${PORT_MADLAD_API}:8008"
+      - "${PORT_SEARXNG}:8009"
+      - "${PORT_SANDBOX_PROXY:-8011}:8011"
+      - "${PORT_SUPERSET:-8016}:8016"
+      - "${PORT_SUPABASE_API:-8022}:8022"
+      - "${PORT_SEMANTIC_ROUTER:-8025}:8025"
+      # Recreate-class APIs: the edge only turns their restart into a 503.
+      - "${PORT_CLASSIFIER:-8005}:8005"
+      - "${PORT_SANDBOX_RUNNER:-8012}:8012"
+      - "${PORT_DETECTOR:-8021}:8021"
+    # Read by haproxy.cfg as "${VAR}" -- HAProxy expands environment variables
+    # only inside double quotes. Changing either in .env changes this
+    # service's config, so `make up edge` recreates it (a second or two of
+    # LAN downtime; `auto` turns, which reach LiteLLM through 14000, fall back
+    # to local-private meanwhile)
+    # instead of reloading. See ai/edge/EDGE.md.
+    environment:
+      # LAN source allow-list for every published port: SPACE-separated CIDRs
+      # (haproxy.cfg expands it with "${EDGE_ALLOWED_CIDRS[*]}", one ACL
+      # pattern per word; a comma fails `haproxy -c`). 172.16.0.0/12 must stay:
+      # a connection from the host's own localhost arrives through
+      # docker-proxy with the Docker bridge gateway (172.x) as its source.
+      EDGE_ALLOWED_CIDRS: "${EDGE_ALLOWED_CIDRS:-127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16}"
+      # Concurrent requests per API key on litellm's LAN port; 0 = off.
+      EDGE_LITELLM_MAX_CONCURRENT_PER_KEY: "${EDGE_LITELLM_MAX_CONCURRENT_PER_KEY:-8}"
+    volumes:
+      # The whole directory, not the single file: an editor or `git pull`
+      # that replaces haproxy.cfg (new inode) would leave a single-file mount
+      # pointing at the old copy, and a reload would silently re-read it.
+      # After an edit, `make up edge` reloads it (see the labels above).
+      - ./:/usr/local/etc/haproxy:ro
+      # /certs/edge.pem, the `ssl crt` of every `lan-tls` bind. Written only
+      # by edge-certs; a USR2 reload or a recreate re-reads it from here.
+      - edge_certs:/certs:ro
+      # HAProxy creates its runtime-API socket here (haproxy.cfg `stats
+      # socket`); edge-certs connects to it to push a renewed certificate.
+      - edge_api:/run/haproxy-api
+    # HAProxy will not start while an `ssl crt` file is missing; edge-certs is
+    # healthy once /certs/edge.pem exists (a self-signed placeholder at
+    # first). `make up` (scripts/deploy.py) waits for this itself, since it
+    # runs compose with --no-deps.
+    depends_on:
+      edge-certs:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8404/stats"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  edge-certs:
+    # Let's Encrypt for the edge's TLS listeners (EDGE.md § TLS). Certbot's
+    # own image with the Cloudflare DNS plugin, pinned to a release tag
+    # (v5.8.0, 2026-09-01) -- never `latest`. Alpine + Python 3.14 + openssl,
+    # no socat: entrypoint.sh and edge_certs.py (bind-mounted below) do the
+    # rest in sh and stdlib Python.
+    image: certbot/dns-cloudflare:v5.8.0
+    # Recreate-class (no com.zeo.deploy label): one long-running renew loop.
+    # Two copies would run certbot against the same /etc/letsencrypt and both
+    # push to HAProxy, and it serves nothing a swap could keep up. Fixed name
+    # so `docker exec edge-certs certbot ...` works.
+    container_name: edge-certs
+    restart: unless-stopped
+    # tini as PID 1, so `docker stop` ends the sleep loop at once.
+    init: true
+    entrypoint: ["/bin/sh", "/edge-certs/entrypoint.sh"]
+    # No ports, no ai_shared: it talks only to the Cloudflare API and Let's
+    # Encrypt (outbound HTTPS), and to HAProxy through the edge_api socket.
+    # The project's default network gives it a route out and nothing else.
+    environment:
+      # Hostname of the certificate, e.g. api.zeoenergy.com. Empty = TLS
+      # listeners keep a self-signed placeholder for localhost. Changing it
+      # requests a new lineage; the old one stays unused (EDGE.md § TLS).
+      EDGE_TLS_DOMAIN: "${EDGE_TLS_DOMAIN:-}"
+      # Let's Encrypt account e-mail; empty registers without one.
+      EDGE_TLS_EMAIL: "${EDGE_TLS_EMAIL:-}"
+      # Anything but 0 uses Let's Encrypt's staging CA (untrusted certs,
+      # generous rate limits). Flip to 0 once the staging cert works.
+      EDGE_TLS_STAGING: "${EDGE_TLS_STAGING:-1}"
+      # Cloudflare API token, Zone:DNS:Edit on the one zone. Passed to THIS
+      # service only, never to the edge; entrypoint.sh writes it to a 0600
+      # file on the tmpfs below and unsets it. Empty = no certificate.
+      CLOUDFLARE_DNS_API_TOKEN: "${CLOUDFLARE_DNS_API_TOKEN:-}"
+    volumes:
+      - ./certs:/edge-certs:ro
+      - edge_certs:/certs
+      - edge_api:/run/haproxy-api
+      # Account key, certificates, renewal configs. Removing it means
+      # re-issuing, which counts against Let's Encrypt's weekly limits.
+      - edge_letsencrypt:/etc/letsencrypt
+    tmpfs:
+      # The Cloudflare credentials file lives here, never on a volume.
+      - /run/edge-certs:mode=0700
+      # certbot's work dir (locks, backups); a tmpfs instead of the image's
+      # anonymous volume.
+      - /var/lib/letsencrypt
+    healthcheck:
+      # Healthy once the edge has a certificate file to load. The placeholder
+      # is written within a second of start, so `make up edge` never waits
+      # on Let's Encrypt.
+      test: ["CMD-SHELL", "test -s /certs/edge.pem"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  edge_certs:
+  edge_api:
+  edge_letsencrypt:

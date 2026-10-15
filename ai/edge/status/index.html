@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Edge status</title>
+<!-- Served by the edge itself (haproxy.cfg, frontend status: http-request
+     return ... file) at chat.zeoenergy.com/edge/, behind oauth2-proxy. It
+     reads HAProxy's own stats CSV from raw/;csv. Must stay under 12 KB: the
+     whole response has to fit one HAProxy buffer (tune.bufsize 16 KB minus
+     tune.maxrewrite); unit-tests/deploy/test_deploy.py enforces it. After an
+     edit, `make up edge` reloads it. See ai/edge/EDGE.md > Status page. -->
+<style>
+:root{--bg:#f5f6f8;--card:#fff;--fg:#1d232a;--mut:#626d7a;--line:#e2e5e9;--ok:#1a7f37;--warn:#a85f00;--bad:#c62828;--acc:#2a64d6}
+@media (prefers-color-scheme:dark){:root{--bg:#0e1115;--card:#171b21;--fg:#e5e8ec;--mut:#8b95a2;--line:#262c34;--ok:#3fb950;--warn:#d29922;--bad:#f85149;--acc:#6ea8fe}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+main{max-width:980px;margin:0 auto;padding:24px 16px 40px}
+header{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;gap:6px 16px;margin-bottom:14px}
+h1{font-size:20px;margin:0}
+.mut{color:var(--mut);font-size:13px}
+.pills{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px}
+.pill{background:var(--card);border:1px solid var(--line);border-radius:999px;padding:3px 12px;font-size:13px}
+.pill b{font-variant-numeric:tabular-nums}
+section{background:var(--card);border:1px solid var(--line);border-radius:10px;margin-bottom:16px;overflow:hidden}
+h2{font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:var(--mut);margin:0;padding:10px 16px;border-bottom:1px solid var(--line)}
+h2 span{text-transform:none;letter-spacing:0;font-weight:400}
+.row{display:grid;grid-template-columns:14px minmax(150px,1.3fr) minmax(130px,1fr) minmax(220px,1.6fr);gap:4px 14px;align-items:center;padding:10px 16px;border-top:1px solid var(--line)}
+h2+.row{border-top:0}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--mut)}
+.ok .dot{background:var(--ok)}.warn .dot{background:var(--warn)}.bad .dot{background:var(--bad)}
+.nm{font-weight:600}.nm small,.cp small{display:block;font-weight:400;color:var(--mut);font-size:12px}
+.cp{font-variant-numeric:tabular-nums}
+.warn .cp small{color:var(--warn)}.bad .cp small{color:var(--bad)}
+.st{color:var(--mut);font-size:13px;font-variant-numeric:tabular-nums}
+.st b{color:var(--fg);font-weight:600}.st .e{color:var(--bad)}
+.ban{display:none;border:1px solid var(--bad);color:var(--bad);background:var(--card);border-radius:10px;padding:12px 16px;margin-bottom:16px}
+footer{display:flex;flex-wrap:wrap;justify-content:space-between;gap:8px}
+a{color:var(--acc)}
+@media (max-width:680px){.row{grid-template-columns:14px 1fr 1fr}.st{grid-column:2/4}}
+</style>
+</head>
+<body><main>
+<header><h1>Edge status</h1><span class="mut" id="upd">Loading…</span></header>
+<div class="ban" id="ban"></div>
+<div class="pills" id="pills"></div>
+<div id="groups"></div>
+<footer class="mut"><span>HAProxy edge on the AI box · refreshes every 5 s</span><a href="raw/">Raw HAProxy stats →</a></footer>
+</main>
+<script>
+// [compose service key, label, LAN port (the listen section's first bind), class, extra]
+// test_deploy.py checks this list against haproxy.cfg.
+const SERVICES = [
+  ["litellm", "LiteLLM", 4001, "swap", "HTTPS 443 · router 14000"],
+  ["oauth2-proxy", "oauth2-proxy", 4180, "swap", "Google sign-in for chat"],
+  ["kokoro-api", "Kokoro TTS", 8004, "swap", ""],
+  ["madlad-api", "MADLAD translate", 8008, "swap", ""],
+  ["searxng", "SearXNG", 8009, "swap", ""],
+  ["sandbox-proxy", "Sandbox proxy", 8011, "swap", ""],
+  ["superset", "Superset", 8016, "swap", ""],
+  ["supabase-api", "Supabase gateway", 8022, "swap", ""],
+  ["vllm-sr-envoy", "Semantic router", 8025, "swap", ""],
+  ["classifier", "Classifier", 8005, "recreate", ""],
+  ["sandbox-runner", "Sandbox runner", 8012, "recreate", ""],
+  ["detector", "Detector", 8021, "recreate", ""],
+];
+const GROUPS = {
+  swap: ["Swapped with no downtime", "make up starts a new copy beside the old one"],
+  recreate: ["Restarted on deploy", "while one restarts, LAN clients get 503 + Retry-After"],
+};
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+const ago = s => !isFinite(s) ? "" : s < 60 ? s + "s" : s < 3600 ? Math.floor(s / 60) + "m" : s < 86400 ? Math.floor(s / 3600) + "h" : Math.floor(s / 86400) + "d";
+const num = v => +v || 0;
+let prev = {}, last = 0;
+
+function parse(text) {
+  const lines = text.trim().split("\n");
+  const head = lines.shift().replace(/^# /, "").split(",");
+  return lines.map(l => { const v = l.split(","), r = {}; head.forEach((h, i) => r[h] = v[i] || ""); return r; });
+}
+
+function judge(name, rows) {
+  const mine = rows.filter(r => r.pxname === name);
+  const fe = mine.find(r => r.svname === "FRONTEND") || {};
+  const be = mine.find(r => r.svname === "BACKEND") || {};
+  const copies = mine.filter(r => r.svname !== "FRONTEND" && r.svname !== "BACKEND" && !r.status.startsWith("MAINT"));
+  const up = copies.filter(r => r.status.startsWith("UP")).length;
+  let cls = "ok", note = "";
+  if (!mine.length) { cls = "bad"; note = "not in the running edge config"; }
+  else if (!copies.length) { cls = "bad"; note = "not running — clients get 503"; }
+  else if (!up) { cls = "bad"; note = "no healthy copy — clients get 503"; }
+  else if (up < copies.length) { cls = "warn"; note = copies.length > 1 ? "swap in progress" : "unhealthy"; }
+  else if (copies.length > 1) { note = "swap in progress"; }
+  const err = num(fe.hrsp_5xx), delta = name in prev ? err - prev[name] : 0;
+  prev[name] = err;
+  return {cls, note, up, n: copies.length, open: num(fe.scur), rate: num(fe.req_rate || fe.rate),
+          err, delta, since: num(be.lastchg), addrs: copies.map(r => r.addr).filter(Boolean)};
+}
+
+function render(rows) {
+  const counts = {ok: 0, warn: 0, bad: 0};
+  let html = "";
+  for (const [kind, [title, sub]] of Object.entries(GROUPS)) {
+    html += `<section><h2>${title} <span>· ${sub}</span></h2>`;
+    for (const [name, label, port, k, extra] of SERVICES) {
+      if (k !== kind) continue;
+      const s = judge(name, rows);
+      counts[s.cls]++;
+      const copies = s.n ? `${s.up}/${s.n} cop${s.n === 1 ? "y" : "ies"} up` : "—";
+      html += `<div class="row ${s.cls}" title="${esc(s.addrs.join("  "))}">` +
+        `<span class="dot"></span>` +
+        `<div class="nm">${esc(label)}<small>${esc(name)} · LAN ${port}${extra ? " · " + esc(extra) : ""}</small></div>` +
+        `<div class="cp">${copies}<small>${esc(s.note || (s.since ? "stable for " + ago(s.since) : ""))}</small></div>` +
+        `<div class="st"><b>${s.open}</b> open · <b>${s.rate}</b> req/s · ` +
+        `<span class="${s.delta > 0 ? "e" : ""}"><b>${s.err}</b> 5xx${s.delta > 0 ? " (+" + s.delta + ")" : ""}</span></div></div>`;
+    }
+    html += "</section>";
+  }
+  $("groups").innerHTML = html;
+  $("pills").innerHTML =
+    `<span class="pill"><b>${SERVICES.length}</b> services</span>` +
+    `<span class="pill"><b>${counts.ok}</b> healthy</span>` +
+    (counts.warn ? `<span class="pill"><b>${counts.warn}</b> degraded</span>` : "") +
+    (counts.bad ? `<span class="pill"><b>${counts.bad}</b> down</span>` : "");
+}
+
+async function refresh() {
+  if (document.hidden) return;
+  try {
+    const res = await fetch("raw/;csv;norefresh", {cache: "no-store", credentials: "same-origin"});
+    const text = await res.text();
+    if (!res.ok || !text.startsWith("# pxname")) throw new Error(res.ok ? "unexpected response (signed out? reload the page)" : "HTTP " + res.status);
+    render(parse(text));
+    last = Date.now();
+    $("ban").style.display = "none";
+  } catch (e) {
+    $("ban").textContent = "Could not read the edge's stats: " + e.message;
+    $("ban").style.display = "block";
+  }
+}
+
+setInterval(() => { $("upd").textContent = last ? "updated " + ago(Math.round((Date.now() - last) / 1000)) + " ago" : "Loading…"; }, 1000);
+setInterval(refresh, 5000);
+document.addEventListener("visibilitychange", refresh);
+refresh();
+</script>
+</body>
+</html>

@@ -10,6 +10,8 @@ services:
     build:
       context: ../..
       dockerfile: ai/madlad/Dockerfile.madlad-app
+    # Recreated (with downtime) by `make up`: it holds the model on a GPU, and a
+    # second copy would need a second copy's worth of VRAM.
     container_name: madlad-app
     restart: unless-stopped
     environment:
@@ -31,12 +33,17 @@ services:
     build:
       context: ../..
       dockerfile: ai/madlad/Dockerfile.madlad-api
-    container_name: madlad-api
+    # Deployed side by side by `make up madlad` (scripts/deploy.py): a new
+    # `madlad-api-<hash>` starts next to the old one, and the old one retires
+    # once the new one is healthy. Stateless proxy, so two copies are safe.
+    # No container_name and no `ports:` -- PORT_MADLAD_API is published by
+    # ai/edge. See ai/edge/EDGE.md.
+    labels:
+      com.zeo.deploy: swap
     restart: unless-stopped
+    stop_grace_period: 60s
     environment:
       - MADLAD_APP_URL=${MADLAD_APP_URL}
-    ports:
-      - "${PORT_MADLAD_API}:8000"
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 30s

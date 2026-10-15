@@ -13,10 +13,20 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.litellm
-    container_name: litellm
+    # Deployed side by side by `make up litellm` (scripts/deploy.py): a new
+    # `litellm-<hash>` starts next to the old one, and the old one retires
+    # once the new one is healthy. That is why there is no container_name
+    # (two copies run at once) and no `ports:` -- PORT_LITELLM is published by
+    # ai/edge, which routes to whichever copy is healthy. The hash covers
+    # litellm_config.yaml and overflow.py too, so editing either and running
+    # `make up litellm` deploys it. See ai/edge/EDGE.md.
+    labels:
+      com.zeo.deploy: swap
     restart: unless-stopped
-    ports:
-      - "${PORT_LITELLM}:4000"
+    # `docker stop` on the retiring copy waits this long for in-flight
+    # requests: an `auto` turn may take 870 s (stream_timeout + timeout),
+    # inside Open WebUI's 900 s budget.
+    stop_grace_period: 900s
     environment:
       STORE_MODEL_IN_DB: "True"
       # Overflow hook for the chain aliases (overflow.py, below). Defaults
@@ -58,6 +68,8 @@ services:
       db:
         condition: service_healthy
 
+  # Recreated (with downtime) by `make up`: a data directory can have only one
+  # Postgres. scripts/deploy.py says so when it runs.
   db:
     image: postgres:16
     restart: always
@@ -77,16 +89,32 @@ services:
       interval: 1s
       timeout: 5s
       retries: 10
-      
+
+  # Recreated (with downtime) by `make up`: the TSDB under /prometheus is
+  # locked by one process, so a second copy cannot start beside the first.
   prometheus:
     image: prom/prometheus:latest
     restart: always
     container_name: prometheus
+    # Every scrape target in prometheus.yml (litellm, classifier, detector,
+    # vllm-sr-router, edge) is reached by service name over ai_shared. Without
+    # this block prometheus sat only on this stack's default network, where
+    # none of them live -- not even litellm, which is on shared + internal.
+    # It needs nothing on `internal` (litellm_db is not scraped).
+    networks:
+      - shared
     ports:
       - "${PORT_PROMETHEUS}:9090"
     volumes:
       - prometheus_data:/prometheus
       - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      # The LiteLLM key the `litellm` scrape job sends (prometheus.yml,
+      # credentials_file). The whole folder, so a missing key is a scrape error
+      # on that one job rather than Docker creating a directory in its place.
+      # git ignores everything in it but its own .gitignore -- see LITELLM.md >
+      # Prometheus scrape key. prometheus runs as nobody: the key file must be
+      # world-readable (it can only read /metrics).
+      - ./secrets:/etc/prometheus/secrets:ro
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.path=/prometheus"

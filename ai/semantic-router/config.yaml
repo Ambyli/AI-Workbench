@@ -23,8 +23,9 @@
 # |   litellm:4000  (alias `auto`)                                          |
 # |     -> vllm-sr-envoy:8899          (listener, ext_proc)                  |
 # |       -> vllm-sr-router:50051      (signals -> decision -> chain alias)  |
-# |     -> litellm:4000                (Envoy forwards the rewritten body to |
-# |                                     the chain alias's cluster)          |
+# |     -> edge:14000 -> litellm:4000  (Envoy forwards the rewritten body to |
+# |                                     the chain alias's cluster, via the  |
+# |                                     edge's internal LiteLLM listener)   |
 # |                                                                         |
 # | `providers.models` below must therefore contain ONLY concrete LiteLLM   |
 # | chain aliases. Never add `auto`, `vllm-sr/auto`, or any other router    |
@@ -108,10 +109,33 @@ listeners:
 
 # -- Providers -------------------------------------------------------------
 # Every candidate is a LiteLLM CHAIN alias reached at the SAME upstream,
-# http://litellm:4000/v1. The router never talks to a vLLM container or to
-# Anthropic directly -- the chain's order levels, the overflow hook, the
+# http://edge:14000/v1 -- LiteLLM, through the ai/edge HAProxy's INTERNAL
+# listener (never published). The router never talks to a vLLM container or
+# to Anthropic directly -- the chain's order levels, the overflow hook, the
 # no-Claude guarantee on local-private, spend logs and per-model sampling
 # defaults all live in LiteLLM, and going around it would skip every one.
+#
+# WHY THE EDGE AND NOT litellm:4000. The generated envoy.yaml turns each
+# base_url host into a LOGICAL_DNS cluster, which uses ONE resolved address
+# at a time and re-resolves about every 5 s. While `make up litellm` swaps
+# LiteLLM side by side, that one address can be the retiring copy, so a
+# routed `auto` request could fail for up to one DNS refresh. The edge never
+# swaps (it is recreate-class), and it health-checks every LiteLLM copy and
+# retries a refused connection on another, so Envoy pinning the edge's
+# address is harmless. The internal bind is exempt from the edge's LAN
+# allow-list and per-key concurrency limit: every routed turn carries
+# SEMANTIC_ROUTER_LITELLM_KEY from an ai_shared address. The edge's litellm
+# listener keeps 900 s client/server timeouts, above listeners[0].timeout
+# (840 s) below, so the edge never cuts a turn Envoy is still waiting on
+# (unit-tests/litellm/test_timeouts.py). Cost: the `auto` path now also
+# needs the edge -- during an edge RECREATE (a change to its compose file)
+# Envoy has no upstream for a few seconds and LiteLLM's `auto` answers from
+# its local-private fallback; a `make up edge` reload is hitless. See
+# ai/edge/EDGE.md > Limits.
+#
+# The ext_proc hop (vllm-sr-envoy -> vllm-sr-router:50051) is NOT moved: it
+# is gRPC on an internal port, still a LOGICAL_DNS cluster pinned to one
+# router copy, so a vllm-sr-router swap keeps that gap (EDGE.md > Limits).
 #
 # THE POOL IS WHAT SEMANTIC_ROUTER_LITELLM_KEY CAN CALL, and that is exactly
 # four aliases: local-general, local-code, local-reasoning, local-private.
@@ -145,7 +169,7 @@ providers:
       api_format: openai
       backend_refs:
         - name: litellm
-          base_url: http://litellm:4000/v1
+          base_url: http://edge:14000/v1
           protocol: http
           provider: openai
           auth_header: Authorization
@@ -157,7 +181,7 @@ providers:
       api_format: openai
       backend_refs:
         - name: litellm
-          base_url: http://litellm:4000/v1
+          base_url: http://edge:14000/v1
           protocol: http
           provider: openai
           auth_header: Authorization
@@ -169,7 +193,7 @@ providers:
       api_format: openai
       backend_refs:
         - name: litellm
-          base_url: http://litellm:4000/v1
+          base_url: http://edge:14000/v1
           protocol: http
           provider: openai
           auth_header: Authorization
@@ -184,7 +208,7 @@ providers:
       api_format: openai
       backend_refs:
         - name: litellm
-          base_url: http://litellm:4000/v1
+          base_url: http://edge:14000/v1
           protocol: http
           provider: openai
           auth_header: Authorization

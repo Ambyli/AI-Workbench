@@ -37,9 +37,12 @@
 #                        local-reasoning, local-private. Each yields ONE
 #                        route (matched on the x-selected-model header) and
 #                        ONE cluster. All four clusters resolve to the same
-#                        upstream, litellm:4000 -- the generator emits a
-#                        cluster per model, not one shared cluster, and
-#                        there is no knob to collapse them. Which backend
+#                        upstream, edge:14000 -- LiteLLM through the ai/edge
+#                        HAProxy's internal listener, so Envoy's LOGICAL_DNS
+#                        pin is on the edge (which never swaps), not on one
+#                        LiteLLM copy (config.yaml > WHY THE EDGE). The
+#                        generator emits a cluster per model, not one shared
+#                        cluster, and there is no knob to collapse them. Which backend
 #                        (local or Claude) answers is decided inside LiteLLM
 #                        by each chain's `order` levels, not here.
 #   anthropic_models     [] -- every entry is api_format: openai, so nothing
@@ -147,7 +150,7 @@ static_resources:
                   timeout: 840s
                   idleTimeout: 1200s
                   # Rewrite Host header to match upstream server
-                  host_rewrite_literal: "litellm:4000"
+                  host_rewrite_literal: "edge:14000"
                   
                   # Prepend path prefix to all requests (e.g., /compatible-mode + /v1/chat/completions = /compatible-mode/v1/chat/completions)
                   regex_rewrite:
@@ -169,7 +172,7 @@ static_resources:
                   timeout: 840s
                   idleTimeout: 1200s
                   # Rewrite Host header to match upstream server
-                  host_rewrite_literal: "litellm:4000"
+                  host_rewrite_literal: "edge:14000"
                   
                   # Prepend path prefix to all requests (e.g., /compatible-mode + /v1/chat/completions = /compatible-mode/v1/chat/completions)
                   regex_rewrite:
@@ -191,7 +194,7 @@ static_resources:
                   timeout: 840s
                   idleTimeout: 1200s
                   # Rewrite Host header to match upstream server
-                  host_rewrite_literal: "litellm:4000"
+                  host_rewrite_literal: "edge:14000"
                   
                   # Prepend path prefix to all requests (e.g., /compatible-mode + /v1/chat/completions = /compatible-mode/v1/chat/completions)
                   regex_rewrite:
@@ -213,7 +216,7 @@ static_resources:
                   timeout: 840s
                   idleTimeout: 1200s
                   # Rewrite Host header to match upstream server
-                  host_rewrite_literal: "litellm:4000"
+                  host_rewrite_literal: "edge:14000"
                   
                   # Prepend path prefix to all requests (e.g., /compatible-mode + /v1/chat/completions = /compatible-mode/v1/chat/completions)
                   regex_rewrite:
@@ -235,7 +238,7 @@ static_resources:
                   timeout: 840s
                   
                   # Rewrite Host header to match upstream server
-                  host_rewrite_literal: "litellm:4000"
+                  host_rewrite_literal: "edge:14000"
                   
                   
                   # Prepend path prefix to all requests (e.g., /compatible-mode + /v1/chat/completions = /compatible-mode/v1/chat/completions)
@@ -343,10 +346,10 @@ static_resources:
         - endpoint:
             address:
               socket_address:
-                address: litellm
-                port_value: 4000
+                address: edge
+                port_value: 14000
             
-            hostname: "litellm"
+            hostname: "edge"
             
           load_balancing_weight: 1
         
@@ -368,10 +371,10 @@ static_resources:
         - endpoint:
             address:
               socket_address:
-                address: litellm
-                port_value: 4000
+                address: edge
+                port_value: 14000
             
-            hostname: "litellm"
+            hostname: "edge"
             
           load_balancing_weight: 1
         
@@ -393,10 +396,10 @@ static_resources:
         - endpoint:
             address:
               socket_address:
-                address: litellm
-                port_value: 4000
+                address: edge
+                port_value: 14000
             
-            hostname: "litellm"
+            hostname: "edge"
             
           load_balancing_weight: 1
         
@@ -418,10 +421,10 @@ static_resources:
         - endpoint:
             address:
               socket_address:
-                address: litellm
-                port_value: 4000
+                address: edge
+                port_value: 14000
             
-            hostname: "litellm"
+            hostname: "edge"
             
           load_balancing_weight: 1
         

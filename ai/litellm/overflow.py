@@ -193,7 +193,7 @@ TOO_LONG = "too-long"
 logger = logging.getLogger("zeo.overflow")
 if not logger.handlers:
     # Own handler: LiteLLM's loggers may sit at WARNING, and a spill that is
-    # not in `docker logs litellm` is a spill nobody can audit.
+    # not in `make logs litellm` is a spill nobody can audit.
     _h = logging.StreamHandler(sys.stderr)
     _h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [overflow] %(message)s"))
     logger.addHandler(_h)

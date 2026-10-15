@@ -17,6 +17,8 @@ networks:
     name: terminal_net
 
 services:
+  # Recreated (with downtime) by `make up`: its SQLite webui.db and boot-time
+  # migrations are single-writer, and chat websockets live in process.
   openwebui:
     # Locally built: upstream's pinned release plus ai/openwebui/patches/*.patch
     # (Dockerfile.openwebui; OPENWEBUI.md § Custom image). The upstream tag is

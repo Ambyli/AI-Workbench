@@ -27,7 +27,47 @@ The proxy is reachable at `http://localhost:4001`. Configuration is loaded from 
 
 ### Health checks
 
-The LiteLLM service runs a liveliness probe against `/health/liveliness`. Prometheus scrapes metrics from the proxy on its default endpoint.
+The LiteLLM service runs a liveliness probe against `/health/liveliness`. Prometheus scrapes metrics from the proxy on its default endpoint, using the key described below.
+
+### Prometheus scrape key
+
+`/metrics` exists only because `litellm_config.yaml` sets `success_callback: ["prometheus"]` (and `failure_callback`). LiteLLM mounts the endpoint only in that branch. Without it, a valid key gets a `404`, because the auth middleware runs before routing.
+
+LiteLLM requires a key on `/metrics` (`require_auth_for_metrics_endpoint` is on by default). Without one, Prometheus's `litellm` job shows `401 Unauthorized`. Turning that setting off is not an option here: the cloudflared tunnel sends `api.zeoenergy.com` straight to LiteLLM, so `https://api.zeoenergy.com/metrics` would become public.
+
+Instead, Prometheus sends a **virtual key that can only call `/metrics`**. LiteLLM supports this with the key's `allowed_routes` (exact or wildcard match, `proxy/auth/route_checks.py`). The key lives at `ai/litellm/secrets/prometheus_metrics.key`. That folder's own `.gitignore` keeps everything but itself out of git, and it is mounted read-only into `prometheus` at `/etc/prometheus/secrets`. The `litellm` job in `prometheus.yml` reads it with `authorization.credentials_file`.
+
+**Create the key (on the box, from the repo root):**
+
+```bash
+MK=$(grep '^DEFAULT_LITELLM_MASTER_KEY=' .env | cut -d= -f2- | tr -d "\"'")
+curl -sS http://localhost:4001/key/generate \
+  -H "Authorization: Bearer $MK" -H 'Content-Type: application/json' \
+  -d '{"key_alias": "prometheus-metrics", "allowed_routes": ["/metrics", "/metrics/*"],
+       "metadata": {"purpose": "Prometheus scrape of litellm /metrics (ai/litellm/prometheus.yml)"}}' \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["key"], end="")' \
+  > ai/litellm/secrets/prometheus_metrics.key
+chmod 644 ai/litellm/secrets/prometheus_metrics.key   # prometheus runs as nobody
+unset MK
+```
+
+The key is written straight to the file and never printed. `/metrics/*` covers the trailing-slash redirect LiteLLM's mounted metrics app can answer with.
+
+**Check it, then deploy:**
+
+```bash
+K=$(cat ai/litellm/secrets/prometheus_metrics.key)
+curl -s -o /dev/null -w '%{http_code}\n' -L -H "Authorization: Bearer $K" http://localhost:4001/metrics     # 200
+curl -s -o /dev/null -w '%{http_code}\n'    -H "Authorization: Bearer $K" http://localhost:4001/v1/models   # 403: nothing but /metrics
+unset K
+make up litellm          # prometheus is a default service of this stack; the new mount recreates it once
+```
+
+In Prometheus (`http://<box>:9090/targets`), the `litellm` job should be **UP**.
+
+**Rotate it:** create a new key the same way (it overwrites the file), run `docker restart prometheus` (it re-reads the file on each scrape, so this is only to be safe), then delete the old key in the Admin UI under Virtual Keys → `prometheus-metrics`, or with `POST /key/delete`.
+
+A missing or empty key file only breaks the `litellm` job. Prometheus logs the read error and the other jobs keep scraping.
 
 ### Stopping
 
@@ -220,14 +260,14 @@ Every chain deployment sets **both** `stream_timeout` and `timeout` — 240 s on
 #### Applying a chain or hook change
 
 ```bash
-docker compose -f ai/litellm/docker-compose.litellm.yml --env-file .env -p ai-litellm up -d --force-recreate litellm
+make up litellm
 ```
 
-`litellm_config.yaml` and `overflow.py` are single-file bind mounts and LiteLLM reads both only at startup. `make up litellm` does not recreate a running container for a file *content* change, and `docker restart litellm` keeps the original mount — so an editor or `git pull` that replaced the file (new inode) leaves the container reading the old one. The recreate is the one path that always loads the current files. Then check `docker logs litellm` for an `overflow` import error.
+`litellm_config.yaml` and `overflow.py` are single-file bind mounts and LiteLLM reads both only at startup. `make up litellm` hashes their *content* into the container name (`litellm-<hash>`, see [EDGE.md § The swap](../edge/EDGE.md#the-swap)), so any edit produces a new name: a fresh copy starts beside the running one — reading the current files — and the old one retires once the new one is healthy, with no downtime (in-flight chats get the 900 s `stop_grace_period`). `docker restart` keeps the original mount, so an editor or `git pull` that replaced the file (new inode) leaves a restarted container reading the old one — use `make up litellm`. If the new copy fails its healthcheck (an `overflow` import error, a YAML typo), `make up` prints its last 100 log lines, removes it and leaves the old copy serving; otherwise check `make logs litellm` for warnings.
 
 #### Seeing spills
 
-- `docker logs litellm 2>&1 | grep '\[overflow\]'` — one INFO line per spill decision (alias, dropped deployment, reason, waiting count, next order), throttled to one per alias/deployment/reason per 30 s with a `(+N similar)` count. An `every deployment is busy/down … keeping …` line is `local-private` (or a chain whose Claude deployment was cooled down) choosing to queue.
+- `make -s logs litellm FOLLOW=0 TAIL=all 2>&1 | grep '\[overflow\]'` — one INFO line per spill decision (alias, dropped deployment, reason, waiting count, next order), throttled to one per alias/deployment/reason per 30 s with a `(+N similar)` count. An `every deployment is busy/down … keeping …` line is `local-private` (or a chain whose Claude deployment was cooled down) choosing to queue.
 - Context-fit lines use the same logger: `local-general: dropping openai/qwen3.8-solo@order1 (too-long, count=122881 > max_input_tokens=114688) -> next order 2` (or `count=… + max_tokens=… > max_model_len=…`); `no local deployment fits the prompt (…); keeping only anthropic/…` is a prompt past every local window going to Claude; `no deployment fits the prompt (…); list unchanged` is `local-private` refusing one; `/tokenize at … failed (…); keeping that backend's deployment(s)` means the hook could not measure and LiteLLM's own check decided.
 - **LiteLLM Admin UI → Logs / spend by key**: the row's *model group* is the chain alias, its *model* the deployment that answered. Claude overflow is any row with a `local-*` model group and an `anthropic/…` model. A `local-private` row with a Claude model must never exist.
 - In-process state: `handler.state()` returns the per-backend verdict, queue depths, timers and counters (`spills`, `kept_all_overloaded`, `errors`, `poller_restarts`, and for context fit `context_drops`, `tokenize_calls`, `tokenize_cache_hits`, `tokenize_errors`). It lives in the proxy process; it is there for debugging with a REPL or a temporary log line, not as an endpoint.

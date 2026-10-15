@@ -30,23 +30,35 @@ Postman collection: [`supabase.postman_collection.json`](supabase.postman_collec
 |---|---|---|---|---|
 | `supabase-db` | `supabase-db` | Postgres 17 (`supabase/postgres`) | `supabase_net`, `ai_shared` | `5438` (direct psql) |
 | `supabase-pooler` | `supavisor` | Supavisor connection pooler | `supabase_net`, `ai_shared` | `8023` session / `8024` transaction |
-| `supabase-api` | `supabase-api` | Envoy API gateway — the one LAN-facing surface | `supabase_net`, `ai_shared` | `8022` |
-| `supabase-auth` | `auth` | GoTrue — `/auth/v1/*` | `supabase_net` | — |
-| `supabase-rest` | `rest` | PostgREST — `/rest/v1/*` | `supabase_net` | — |
+| `supabase-api-<hash>` | `supabase-api` | Envoy API gateway — the one LAN-facing surface | `supabase_net`, `ai_shared` | `8022` (published by [`ai/edge`](../edge/EDGE.md)) |
+| `supabase-auth-<hash>` | `auth` | GoTrue — `/auth/v1/*` | `supabase_net` | — |
+| `supabase-rest-<hash>` | `rest` | PostgREST — `/rest/v1/*` | `supabase_net` | — |
 | `supabase-realtime` | `realtime` | Realtime — `/realtime/v1/*` | `supabase_net` | — |
-| `supabase-storage` | `storage` | Storage API — `/storage/v1/*` | `supabase_net` | — |
-| `supabase-imgproxy` | `imgproxy` | Image transforms for Storage | `supabase_net` | — |
-| `supabase-meta` | `meta` | postgres-meta — the schema API Studio drives | `supabase_net` | — |
-| `supabase-studio` | `studio` | The dashboard, behind Envoy basic auth at `/` | `supabase_net` | — |
-| `supabase-functions` | `functions` | Deno edge runtime — `/functions/v1/*` | `supabase_net` | — |
+| `supabase-storage-<hash>` | `storage` | Storage API — `/storage/v1/*` | `supabase_net` | — |
+| `supabase-imgproxy-<hash>` | `imgproxy` | Image transforms for Storage | `supabase_net` | — |
+| `supabase-meta-<hash>` | `meta` | postgres-meta — the schema API Studio drives | `supabase_net` | — |
+| `supabase-studio-<hash>` | `studio` | The dashboard, behind Envoy basic auth at `/` | `supabase_net` | — |
+| `supabase-functions-<hash>` | `functions` | Deno edge runtime — `/functions/v1/*` | `supabase_net` | — |
 
-**`container_name` deliberately does not equal the service key** for the eight
-data-plane services. The vendored Envoy cluster config
-(`volumes/api/envoy/cds.yaml`) addresses them by upstream's short service names
-(`auth`, `rest`, `realtime-dev.supabase-realtime`, `storage`, `functions`,
-`meta`, `studio`), so the keys must stay verbatim; the container names follow
-upstream's `supabase-<svc>` convention. Only the three that also join
-`ai_shared` get a distinctive name for both.
+**Container names do not equal the service key** for the eight data-plane
+services. The vendored Envoy cluster config (`volumes/api/envoy/cds.yaml`)
+addresses them by upstream's short service names (`auth`, `rest`,
+`realtime-dev.supabase-realtime`, `storage`, `functions`, `meta`, `studio`), so
+the keys must stay verbatim; the container names follow upstream's
+`supabase-<svc>` convention. Only the three that also join `ai_shared` get a
+distinctive name for both.
+
+**`make up supabase` swaps most of the stack with no downtime.** `supabase-api`
+and seven data-plane services (`auth`, `rest`, `storage`, `imgproxy`, `meta`,
+`studio`, `functions`) are labelled `com.zeo.deploy: swap`: a new
+`supabase-<svc>-<hash>` copy starts next to the old one, and the old one
+retires once the new one is healthy. That is why they have no `container_name`
+(the `com.zeo.deploy.name` label keeps the prefix) and why `supabase-api` has no
+`ports:` — `PORT_SUPABASE_API` is published by [`ai/edge`](../edge/EDGE.md),
+which also carries the Realtime websockets. `supabase-db`, `supavisor` and
+`realtime` keep their fixed names and are recreated, with downtime, as before.
+Use `make exec supabase <svc> CMD='…'` / `make logs supabase <svc>` rather than
+`docker exec|logs supabase-<svc>` for the swapped ones.
 
 `supabase-db` is dual-homed onto `ai_shared` on purpose, exactly like
 `roofix-db`: it is how `trino-coordinator` reaches it by Docker DNS without

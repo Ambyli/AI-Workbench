@@ -5,8 +5,11 @@
 # OpenAI surface for Open WebUI, Claude Code, n8n and the Roofix brain, and
 # every decision is `static` -- it picks ONE LiteLLM chain alias
 # (local-general / local-code / local-reasoning / local-private), reached at
-# http://litellm:4000/v1. Which backend answers -- local first, Claude only
-# as overflow, never for local-private -- is LiteLLM's job
+# http://edge:14000/v1 -- LiteLLM through the ai/edge HAProxy's internal
+# listener, so Envoy's single pinned upstream address never belongs to a
+# LiteLLM copy that a swap retires (config.yaml > WHY THE EDGE). Which
+# backend answers -- local first, Claude only as overflow, never for
+# local-private -- is LiteLLM's job
 # (ai/litellm/litellm_config.yaml + overflow.py).
 #
 # Request path (the loop is deliberate -- see the recursion guard in
@@ -16,6 +19,7 @@
 #             -> vllm-sr-envoy:8899      listener; Lua bearer check, ext_proc
 #             -> vllm-sr-router:50051    signals -> decision -> chain alias
 #             -> vllm-sr-envoy           routes on x-selected-model
+#             -> edge:14000              ai/edge internal listener (never published)
 #             -> litellm:4000            chain group: order 1 -> 2 -> 3
 #             -> vLLM (local) / Anthropic (overflow only)
 #
@@ -40,7 +44,8 @@
 #                                      of the prometheus scrape and the
 #                                      model download path.
 #
-# Only ONE port is published: Envoy's listener on PORT_SEMANTIC_ROUTER.
+# Only ONE port is published: Envoy's listener on PORT_SEMANTIC_ROUTER --
+# and since zero-downtime deploys, ai/edge publishes it, not this file.
 # 50051 (gRPC), 8080 (router management API), 9190 (router metrics) and 9901
 # (Envoy admin) are deliberately never mapped -- 9901 alone serves
 # /quitquitquit and a full config dump including the listener bearer token.
@@ -142,8 +147,19 @@ services:
     # vLLM images (see ai/vllm/docker-compose.vllm.yml). The CLI's own
     # default in cli/consts.py IS `latest`; do not copy it.
     image: ghcr.io/vllm-project/semantic-router/vllm-sr:${SEMANTIC_ROUTER_VERSION:-v0.3.0}
-    container_name: vllm-sr-router
+    # Deployed side by side by `make up semantic-router` (scripts/deploy.py):
+    # a new `vllm-sr-router-<hash>` starts next to the old one, and the old one
+    # retires once the new one is ready. Envoy and the dashboard reach it by
+    # service name, so no container_name. Its vllm_sr_state volume holds
+    # regenerable state (startup_status, looper state -- see `volumes:` below),
+    # not a database, so two copies sharing it is safe. The hash covers the
+    # bind-mounted config.yaml. See ai/edge/EDGE.md.
+    labels:
+      com.zeo.deploy: swap
     restart: unless-stopped
+    # One ext_proc gRPC stream lives for a whole `auto` request (up to the
+    # 840 s listener timeout), so give the retiring copy as long as LiteLLM.
+    stop_grace_period: 900s
     networks:
       - shared
       - router_net
@@ -213,14 +229,22 @@ services:
     # and a fresh box gets a different build than the one this config was
     # rendered and tested against. v1.34.14 is the newest v1.34 patch.
     image: envoyproxy/envoy:${SEMANTIC_ROUTER_ENVOY_VERSION:-v1.34.14}
-    container_name: vllm-sr-envoy
+    # Deployed side by side by `make up semantic-router` (scripts/deploy.py):
+    # a new `vllm-sr-envoy-<hash>` starts next to the old one, and the old one
+    # retires once the new one is healthy. LiteLLM's `auto` alias reaches it by
+    # service name (vllm-sr-envoy:8899), so no container_name; and no
+    # `ports:` -- PORT_SEMANTIC_ROUTER, the only published port of this stack,
+    # is now published by ai/edge. 9901 (admin) still stays inside. Envoy
+    # exits on SIGTERM without draining, so a request in flight on the
+    # retiring copy at that moment fails; new requests already go to the new
+    # copy. See ai/edge/EDGE.md.
+    labels:
+      com.zeo.deploy: swap
     restart: unless-stopped
+    stop_grace_period: 30s
     networks:
       - shared
       - router_net
-    ports:
-      # The ONLY published port in this stack. 9901 (admin) stays inside.
-      - "${PORT_SEMANTIC_ROUTER:-8025}:8899"
     # Bypasses the image's /docker-entrypoint.sh and execs the binary
     # directly, matching cli/docker_start.py::_build_envoy_runtime_command.
     # `--log-level debug` is in the CLI's args and is dropped here on
@@ -272,6 +296,8 @@ services:
   # and has no auth of its own -- reach it over an SSH tunnel, or front it
   # at chat.zeoenergy.com/vllm-sr/ through OAUTH2_PROXY_UPSTREAMS the way
   # /n8n/ and /sandboxes/ are done. Never bind it to 0.0.0.0.
+  #
+  # Recreated (with downtime) by `make up`: it publishes a host port.
   vllm-sr-dashboard:
     profiles: [dashboard]
     image: ghcr.io/vllm-project/semantic-router/dashboard:${SEMANTIC_ROUTER_VERSION:-v0.3.0}

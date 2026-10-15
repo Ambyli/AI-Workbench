@@ -14,7 +14,7 @@ If a fenced ` ```html ` block would do the job, prefer that — Open WebUI rende
 
 The single security control that matters is **network segmentation**. Everything else is defense in depth.
 
-Four Docker networks:
+Five Docker networks:
 
 | Network | Type | Members |
 |---|---|---|
@@ -22,10 +22,13 @@ Four Docker networks:
 | `sandbox_net` | bridge, `internal: true` | `sandbox-runner`, `sandbox-proxy`, `sandbox-egress`, every `sandbox-{id}` |
 | `sandbox_state` | bridge, `internal: true` | `sandbox-runner`, `sandbox-db` |
 | `sandbox_egress_out` | bridge (NOT `internal`) | `sandbox-egress` **only** |
+| `sandbox_db_publish` | bridge (NOT `internal`), IP masquerade off | `sandbox-db` **only** |
 
 `internal: true` means Docker **does not attach a default gateway**. A container on `sandbox_net` or `sandbox_state` that tries to hit the host, the internet, or any container on `ai_shared` has no route — the packets go nowhere.
 
 `sandbox_egress_out` is the exception: it is *not* internal, so it does have a default gateway and can reach the public internet. It exists solely to give `sandbox-egress` its outbound leg after the allowlist filter runs. No sandbox, no state store, and nothing else in the stack attaches to it. Sandboxes reach the internet ONLY by first hitting `sandbox-egress` on `sandbox_net`, passing the filter, and then being forwarded out via `sandbox_egress_out`.
+
+`sandbox_db_publish` exists only so `PORT_SANDBOX_DB` (5440) gets published. The port was 5434 until 2026-10-15; it moved because a Postgres installed directly on the box already listens on `127.0.0.1:5434`, and Docker's `0.0.0.0` bind collides with it ("address already in use"). Docker publishes **no** host ports for a container whose every network is `internal: true`. On the box (Docker 29.4.0) `sandbox-db` came up with `PortBindings` configured but `NetworkSettings.Ports` empty, and Trino's `postgres_sandbox` catalog, which reads `host.docker.internal:5440`, lost its connection. Nothing but `sandbox-db` attaches to `sandbox_db_publish`, so no sandbox, runner or `ai_shared` peer gains a route to the database. Its IP masquerade is off (`com.docker.network.bridge.enable_ip_masquerade: "false"`): the published port still works, because inbound connections are DNATed and replies return through the host, but `sandbox-db` gets no outbound internet through it.
 
 Consequences:
 
@@ -59,6 +62,18 @@ cat /proc/1/status | grep CapEff                    → CapEff: 0000000000000000
 mount | grep " / "                                  → shows "ro"
 docker inspect sandbox-<id> --format '{{.NetworkSettings.Networks}}'
                                                     → contains ONLY sandbox_net
+```
+
+From the host, for `sandbox-db`'s host port and its publish-only network:
+
+```
+docker inspect sandbox-db --format '{{json .NetworkSettings.Ports}}'
+                                                    → 5432/tcp bound to HostPort 5440 (not null)
+pg_isready -h localhost -p 5440                     → accepting connections
+docker network inspect sandbox_db_publish --format '{{range .Containers}}{{.Name}} {{end}}'
+                                                    → sandbox-db ONLY
+docker exec sandbox-db wget -qO- --timeout 3 https://example.com
+                                                    → must fail (no masquerade = no outbound)
 ```
 
 If any of the "must fail" checks succeeds, revert the change and investigate before shipping.
@@ -504,7 +519,7 @@ docker exec -it sandbox-db psql -U sandbox -d sandbox \
   -c "SELECT id, phase, jsonb_pretty(metadata), jsonb_pretty(result), error, created_at, updated_at FROM jobs WHERE id = '<sandbox_id>';"
 
 # egress requests this sandbox made (via tinyproxy access log)
-docker logs sandbox-egress | grep '<sandbox_id or IP>'
+make -s logs sandbox sandbox-egress FOLLOW=0 TAIL=all | grep '<sandbox_id or IP>'
 ```
 
 ### Rotating the sandbox-db password

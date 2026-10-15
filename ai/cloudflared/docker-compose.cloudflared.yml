@@ -5,11 +5,26 @@ networks:
 
 services:
   cloudflared:
-    image: cloudflare/cloudflared:latest
-    container_name: ai-cloudflared
+    # Pinned release tag (was `latest`, which `up -d` never re-pulls). Bump
+    # this line, `make build cloudflared`, `make up cloudflared`.
+    image: cloudflare/cloudflared:2026.10.0
+    # Deployed side by side by `make up cloudflared` (scripts/deploy.py): a
+    # second connector registers to the same tunnel, Cloudflare spreads
+    # requests across both, and the old one retires once the new one reports
+    # ready. Both copies run this exact config and reach the same origins, so
+    # this is not the "two connectors, one can't reach the origin" failure in
+    # CLOUDFLARED.md. No container_name, because two copies run at once; the
+    # label keeps the familiar `ai-cloudflared-<hash>` name. See
+    # ai/edge/EDGE.md.
+    labels:
+      com.zeo.deploy: swap
+      com.zeo.deploy.name: ai-cloudflared
     networks:
       - shared
     restart: unless-stopped
+    # cloudflared drains in-flight requests for --grace-period (default 30s)
+    # after SIGTERM; give it that plus margin before docker kills it.
+    stop_grace_period: 45s
     # Lets dashboard ingress rules reach services that listen on the HOST
     # rather than on ai_shared — e.g. rdp.zeoenergy.com must target
     # tcp://host.docker.internal:3389, because inside this container
@@ -21,4 +36,16 @@ services:
       # Token from a Cloudflare Zero Trust tunnel. Read from .env via the
       # standard --env-file flag in the Makefile macro.
       TUNNEL_TOKEN: "${CLOUDFLARE_TUNNEL_TOKEN}"
-    command: tunnel --no-autoupdate run
+    # --metrics binds the metrics/readiness server on the container loopback
+    # only (nothing on ai_shared can scrape it); the healthcheck below needs it.
+    command: tunnel --no-autoupdate --metrics 127.0.0.1:2000 run
+    healthcheck:
+      # The image is distroless (no shell, no curl), so exec form calling the
+      # binary itself. `cloudflared tunnel ready` GETs /ready on the --metrics
+      # address and exits 0 only once at least one connection to Cloudflare's
+      # edge is registered -- it refuses to run without --metrics.
+      test: ["CMD", "cloudflared", "tunnel", "--metrics", "127.0.0.1:2000", "ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s

@@ -17,6 +17,9 @@ services:
   # creates the read-only `trino_reader` role from
   # CLASSIFIER_TRINO_READER_PASSWORD. Re-run it by hand for an existing volume
   # (the command is in the script's header).
+  #
+  # Recreated (with downtime) by `make up`: a data directory can have only one
+  # Postgres.
   classifier-db:
     image: postgres:17-alpine
     container_name: classifier-db
@@ -42,6 +45,12 @@ services:
       timeout: 3s
       retries: 5
 
+  # Recreated (with downtime) by `make up`: on startup `recover()` requeues
+  # every job left processing (ai/classifier/jobs/queue.py), which would steal
+  # the running copy's jobs. No `ports:` -- PORT_CLASSIFIER is published by
+  # ai/edge, which returns 503 + Retry-After while this container is being
+  # recreated, instead of a refused connection. Same host port, same URL.
+  # See ai/edge/EDGE.md.
   classifier:
     networks:
       - shared
@@ -53,8 +62,6 @@ services:
       dockerfile: ai/classifier/Dockerfile
     container_name: classifier
     restart: unless-stopped
-    ports:
-      - "${PORT_CLASSIFIER}:8000"
     environment:
       # Vision model that scores LLM-bound criteria. All four come from the
       # `## Classifier` block in .env; the defaults here are the muse-glimmer

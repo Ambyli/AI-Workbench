@@ -1,13 +1,20 @@
+# Python for scripts/deploy.py (stdlib only, 3.10+). Override with
+# `make up PYTHON=python3.12 ...` if the box's default is older.
+PYTHON ?= python3
+
 # Compose stack registry — each call registers a stack and its default service list.
+# DC_<stack> is the raw compose command; DEPLOY_<stack> is scripts/deploy.py
+# pointed at the same compose file, env file and project — what `make up` runs.
 STACKS :=
 
 define service
 STACKS += $(1)
 STACK_$(1) := $(2)
 DC_$(1) := docker compose -f ai/$(1)/docker-compose.$(1).yml --env-file .env -p ai-$(1)
+DEPLOY_$(1) := $(PYTHON) scripts/deploy.py -f ai/$(1)/docker-compose.$(1).yml --env-file .env -p ai-$(1)
 endef
 
-$(eval $(call service,litellm,litellm))
+$(eval $(call service,litellm,litellm prometheus))
 $(eval $(call service,unsloth,unsloth))
 $(eval $(call service,vllm,qwen3.8 qwen3.8-solo qwen3.6 vllm-qwen-vl muse-glimmer))
 $(eval $(call service,llama,glm5.2 qwen3.8-flash glm5.3-flash))
@@ -27,6 +34,11 @@ $(eval $(call service,open-terminal,open-terminal))
 $(eval $(call service,trino,hive-metastore-db hive-metastore lake-s3 lake-s3-init trino-auth-init trino-coordinator trino-mcp superset-db superset))
 $(eval $(call service,semantic-router,vllm-sr-models-init vllm-sr-router vllm-sr-envoy))
 $(eval $(call service,supabase,supabase-db supavisor auth rest realtime imgproxy storage meta studio supabase-api functions))
+# Last on purpose: it binds the host ports the swap-class services above used
+# to publish, so on a full `make up` they must have released them first.
+# See ai/edge/EDGE.md § One-time cutover. edge-certs (its TLS certificate,
+# EDGE.md § TLS) comes first: the edge waits for it to be healthy.
+$(eval $(call service,edge,edge-certs edge))
 
 # Introspection targets consumed by the `_make_ai_complete` bash completion
 # function (installed once via `eval "$$(make completion-bash)"`). The
@@ -68,7 +80,8 @@ STACK := $(firstword $(ARGS))
 SVC   := $(wordlist 2,999,$(ARGS))
 
 # Swallow each positional arg as a no-op target so Make doesn't try to build it.
-$(foreach a,$(ARGS),$(eval $(a):;@:))
+# $(sort) dedupes, so `make up litellm litellm` doesn't define the rule twice.
+$(foreach a,$(sort $(ARGS)),$(eval $(a):;@:))
 
 # Guard: error when STACK is set but doesn't match a registered stack.
 # Empty STACK means "operate on all stacks" and skips the check.
@@ -81,6 +94,16 @@ SERVICES = $(if $(SVC),$(SVC),$(STACK_$(STACK)))
 # Lines of history `logs` prints per service before following. Override with
 # `make logs <stack> TAIL=2000`, or `TAIL=all` for the full history.
 TAIL ?= 500
+# FOLLOW=0 prints the history and exits instead of following, so `make logs`
+# can feed a pipe: `make -s logs litellm FOLLOW=0 TAIL=all | grep overflow`.
+FOLLOW ?= 1
+
+# `make up` switches. Only the literal value 1 turns one on, so a stray
+# DRY_RUN=true in the environment (roofix's .env setting, if exported) can't.
+#   RECREATE=1  plain `docker compose up -d` (the pre-deploy.py behaviour)
+#   DRY_RUN=1   print the deploy plan, change nothing
+#   FORCE=1     swap swap-class services even when they are up to date
+DEPLOY_FLAGS = $(if $(filter 1,$(DRY_RUN)),--dry-run) $(if $(filter 1,$(FORCE)),--force)
 
 network:
 	docker network create ai_shared 2>/dev/null || true
@@ -96,12 +119,23 @@ setup: network
 	cd widget && uv run claude_usage_widget.py &
 	$(foreach s,$(STACKS),$(DC_$(s)) up --build -d &&) true
 
-up: network
+# Zero-downtime deploy: scripts/deploy.py swaps services labelled
+# com.zeo.deploy=swap side by side and recreates the rest exactly as
+# `docker compose up -d` did, printing why. See ai/edge/EDGE.md.
+up: $(if $(filter 1,$(DRY_RUN)),,network)
 	$(check_stack)
+ifeq ($(RECREATE),1)
 ifdef STACK
 	$(DC) up -d $(SERVICES)
 else
 	$(foreach s,$(STACKS),$(DC_$(s)) up -d &&) true
+endif
+else
+ifdef STACK
+	$(DEPLOY_$(STACK)) $(DEPLOY_FLAGS) $(SERVICES)
+else
+	$(foreach s,$(STACKS),$(DEPLOY_$(s)) $(DEPLOY_FLAGS) &&) true
+endif
 endif
 
 down:
@@ -144,7 +178,7 @@ endif
 logs:
 	$(check_stack)
 ifdef STACK
-	$(DC) logs -f --tail $(TAIL) $(SERVICES)
+	$(DC) logs $(if $(filter 0,$(FOLLOW)),,-f) --tail $(TAIL) $(SERVICES)
 else
 	@echo "Use: make logs <stack> [service...] to follow specific service logs."
 	@echo "Stacks: $(STACKS)"
@@ -159,6 +193,24 @@ else
 	@echo "Stacks: $(STACKS)"
 endif
 
+# Run a command in a service's running container, found by its compose labels
+# — swap-class containers are named <service>-<hash>, so `docker exec <name>`
+# no longer has a fixed name to use. CMD defaults to an interactive shell; a
+# TTY is requested only when stdin is one, so it also works in pipes/scripts.
+#   make exec litellm litellm CMD='curl -s http://roofix:8080/status'
+exec:
+	$(check_stack)
+	@if [ -z "$(STACK)" ] || [ -z "$(SVC)" ]; then \
+		echo "Usage: make exec <stack> <service> [CMD='command ...']"; exit 2; \
+	fi
+	@cid=$$(docker ps -q --filter label=com.docker.compose.project=ai-$(STACK) \
+		--filter label=com.docker.compose.service=$(firstword $(SVC)) | head -1); \
+	if [ -z "$$cid" ]; then \
+		echo "No running container for service '$(firstword $(SVC))' in stack '$(STACK)'."; exit 1; \
+	fi; \
+	if [ -t 0 ]; then tty=-it; else tty=-i; fi; \
+	docker exec $$tty $$cid $(or $(CMD),sh)
+
 help:
 	@echo ""
 	@echo "Usage: make <verb> [stack] [service...]"
@@ -166,13 +218,21 @@ help:
 	@echo "Verbs:"
 	@echo "  setup       Install deps and start all services"
 	@echo "  network     Create shared Docker network"
-	@echo "  up          Start services (all stacks, one stack, or specific services)"
+	@echo "  up          Deploy services (all stacks, one stack, or specific services):"
+	@echo "              swap-class services are replaced side by side with no downtime,"
+	@echo "              the rest are recreated as before (each line says which and why)"
 	@echo "  down        Stop services"
 	@echo "  clean       Stop and remove containers"
 	@echo "  very-clean  Stop, remove containers, volumes, and images (needs CONFIRM=yes)"
 	@echo "  build       Rebuild images"
-	@echo "  logs        Follow service logs (last 500 lines; TAIL=n or TAIL=all)"
+	@echo "  logs        Follow service logs (last 500 lines; TAIL=n or TAIL=all; FOLLOW=0 to exit)"
 	@echo "  ps          List active containers for a stack"
+	@echo "  exec        Run CMD in a service's running container (default: sh)"
+	@echo ""
+	@echo "Switches for up:"
+	@echo "  RECREATE=1  plain 'docker compose up -d' (no side-by-side swap)"
+	@echo "  DRY_RUN=1   print the deploy plan without changing anything"
+	@echo "  FORCE=1     swap even when a swap-class service is up to date"
 	@echo ""
 	@echo "Stacks: $(STACKS)"
 	@echo ""
@@ -180,16 +240,22 @@ help:
 	@echo "  make up                                # start every stack"
 	@echo "  make up vllm                           # start vllm stack (default services)"
 	@echo "  make up vllm qwen3.6                   # start only qwen3.6 in vllm stack"
+	@echo "  make up litellm DRY_RUN=1              # show what a litellm deploy would do"
+	@echo "  make up litellm FORCE=1                # swap litellm even if unchanged"
+	@echo "  make up litellm RECREATE=1             # old behaviour: plain compose up -d"
 	@echo "  make build sandbox                     # build every service + every profile in the sandbox stack"
 	@echo "  make build sandbox PROFILES=build      # build only services under the 'build' profile"
 	@echo "  make build sandbox PROFILES=build,x    # build multiple profiles (comma-separated)"
 	@echo "  make logs kokoro                       # tail kokoro logs (last 500 lines, then follow)"
 	@echo "  make logs kokoro TAIL=all              # full history, then follow"
+	@echo "  make -s logs litellm FOLLOW=0 TAIL=all | grep overflow   # history into a pipe"
 	@echo "  make ps sandbox                        # list active sandbox containers"
+	@echo "  make exec litellm litellm CMD='env'    # run a command in the litellm container"
+	@echo "  make exec supabase auth                # shell in the running auth container"
 	@echo ""
 	@echo "Note: 'make build' auto-includes every profile declared in a stack's compose"
 	@echo "file (see 'docker compose config --profiles'). Override with PROFILES=<list>"
 	@echo "to narrow the set — the default of 'all profiles' works for most operators."
 	@echo ""
 
-.PHONY: setup network up down clean very-clean build logs ps help list-stacks list-services
+.PHONY: setup network up down clean very-clean build logs ps exec help list-stacks list-services

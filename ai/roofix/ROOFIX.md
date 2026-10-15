@@ -38,8 +38,8 @@ Before the bridge can hydrate proposals, upload a Roofix profile to interceptor 
 Reach the bridge from another container on `ai_shared`:
 
 ```bash
-docker exec -it litellm curl http://roofix:8080/status
-docker exec -it litellm curl -X POST http://roofix:8080/tick
+make exec litellm litellm CMD='curl http://roofix:8080/status'
+make exec litellm litellm CMD='curl -X POST http://roofix:8080/tick'
 ```
 
 For interceptor endpoints (proposal capture, profile refresh), see [INTERCEPTOR.md](../interceptor/INTERCEPTOR.md).

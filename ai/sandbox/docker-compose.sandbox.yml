@@ -5,11 +5,13 @@
 # for allowlisted internet, and NOTHING else on the stack. Security is
 # enforced by network segmentation, not by trusting the sandbox process.
 #
-# Three networks (see ai/sandbox/SANDBOX.md § Network topology for the diagram):
+# Networks (see ai/sandbox/SANDBOX.md § Network topology for the diagram):
 #
-#   shared        (external, ai_shared)     openwebui / litellm ↔ runner + proxy
-#   sandbox_net   (bridge, internal: true)  runner ↔ proxy ↔ sandboxes ↔ egress
-#   sandbox_state (bridge, internal: true)  runner ↔ sandbox-db (nothing else)
+#   shared             (external, ai_shared)     openwebui / litellm ↔ runner + proxy
+#   sandbox_net        (bridge, internal: true)  runner ↔ proxy ↔ sandboxes ↔ egress
+#   sandbox_state      (bridge, internal: true)  runner ↔ sandbox-db (nothing else)
+#   sandbox_egress_out (bridge)                  sandbox-egress → internet
+#   sandbox_db_publish (bridge, no masquerade)   sandbox-db only, for its host port
 #
 # `internal: true` on the two private networks means Docker does not attach
 # a default gateway. A sandbox that tries to hit the host or the internet
@@ -39,6 +41,19 @@ networks:
   sandbox_egress_out:
     driver: bridge
     name: sandbox_egress_out
+  # Host-port network for sandbox-db ONLY. Docker (29.4 on the box) does not
+  # publish ports for a container whose every network is `internal: true`:
+  # PORT_SANDBOX_DB was configured but bound nothing, which broke Trino's
+  # postgres_sandbox catalog (host.docker.internal:5440). This plain bridge
+  # exists solely so Docker can apply that publish. Nothing else attaches, so
+  # no sandbox, runner or ai_shared peer gains a route to the DB. Masquerade
+  # is off: the published port still works (inbound DNAT, replies go back
+  # through the host), but the DB gets no outbound internet via this network.
+  sandbox_db_publish:
+    driver: bridge
+    name: sandbox_db_publish
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"
 
 services:
   # ── State store ─────────────────────────────────────────────────────────
@@ -47,9 +62,14 @@ services:
   # (sandboxed code must not tamper with job state). Only sandbox-runner
   # bridges to this network.
   #
-  # Host port is published for operator inspection (psql / DBeaver). The
-  # port only exposes the DB on the host loopback — remove the ports: block
-  # entirely if this ever runs on a machine with an untrusted network.
+  # Host port is published for operator inspection (psql / DBeaver) and for
+  # Trino's postgres_sandbox catalog. It binds on all host interfaces --
+  # remove the ports: block entirely if this ever runs on a machine with an
+  # untrusted network. The publish needs the sandbox_db_publish network
+  # below: Docker publishes nothing for a container on internal networks only.
+  #
+  # Recreated (with downtime) by `make up`: a data directory can have only one
+  # Postgres.
   sandbox-db:
     image: postgres:16-alpine
     container_name: sandbox-db
@@ -61,9 +81,11 @@ services:
     volumes:
       - sandbox_db_data:/var/lib/postgresql/data
     ports:
-      - "${PORT_SANDBOX_DB:-5434}:5432"
+      - "${PORT_SANDBOX_DB:-5440}:5432"
     networks:
       - sandbox_state
+      # Only for the host-port publish above; see the network's comment.
+      - sandbox_db_publish
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${SANDBOX_DB_USER:-sandbox}"]
       interval: 10s
@@ -87,10 +109,17 @@ services:
     build:
       context: ../..
       dockerfile: ai/sandbox/proxies/Dockerfile
-    container_name: sandbox-proxy
+    # Deployed side by side by `make up sandbox` (scripts/deploy.py): a new
+    # `sandbox-proxy-<hash>` starts next to the old one, and the old one
+    # retires once the new one is healthy. Its routing is static (no state
+    # beyond Caddy's own /data and /config), so two copies are safe. No
+    # container_name -- oauth2-proxy and the runner reach it by service name
+    # -- and no `ports:`: PORT_SANDBOX_PROXY is published by ai/edge. The hash
+    # covers the bind-mounted Caddyfile. See ai/edge/EDGE.md.
+    labels:
+      com.zeo.deploy: swap
     restart: unless-stopped
-    ports:
-      - "${PORT_SANDBOX_PROXY:-8011}:80"
+    stop_grace_period: 30s
     volumes:
       - ./proxies/Caddyfile:/etc/caddy/Caddyfile:ro
       - sandbox_proxy_data:/data
@@ -117,8 +146,15 @@ services:
     build:
       context: ../..
       dockerfile: ai/sandbox/proxies/egress.Dockerfile
-    container_name: sandbox-egress
+    # Deployed side by side by `make up sandbox` (scripts/deploy.py), like
+    # sandbox-proxy: sandboxes reach it as sandbox-egress:8888 by service
+    # name on sandbox_net, which resolves to both copies during the swap. The
+    # hash covers tinyproxy.conf and tinyproxy.filter, so an allowlist edit
+    # deploys with `make up sandbox sandbox-egress` -- no restart needed.
+    labels:
+      com.zeo.deploy: swap
     restart: unless-stopped
+    stop_grace_period: 30s
     volumes:
       - ./proxies/tinyproxy.conf:/etc/tinyproxy/tinyproxy.conf:ro
       - ./proxies/tinyproxy.filter:/etc/tinyproxy/filter:ro
@@ -148,14 +184,19 @@ services:
   # sandbox_net. Uses /var/run/docker.sock to spawn short-lived sandbox
   # containers — this is the audit boundary; nothing else in the sandbox
   # subsystem has any Docker API access.
+  #
+  # Recreated (with downtime) by `make up`: its concurrency slots are an
+  # in-process semaphore, and its reaper would tear down the sandboxes the
+  # other copy is serving. No `ports:` -- PORT_SANDBOX_RUNNER is published by
+  # ai/edge, which returns 503 + Retry-After while this container is being
+  # recreated, instead of a refused connection. Same host port, same URL.
+  # See ai/edge/EDGE.md.
   sandbox-runner:
     build:
       context: ../..
       dockerfile: ai/sandbox/runner/Dockerfile
     container_name: sandbox-runner
     restart: unless-stopped
-    ports:
-      - "${PORT_SANDBOX_RUNNER:-8012}:8000"
     environment:
       - DEBUG_LOGGING=${DEBUG_LOGGING:-false}
       # Concurrency and lifetime.

@@ -4,6 +4,11 @@ networks:
     name: ai_shared
 
 services:
+  # Recreated (with downtime) by `make up`: it holds the OWLv2 model on GPU 2.
+  # No `ports:` -- PORT_DETECTOR is published by ai/edge, which returns 503 +
+  # Retry-After while this container is being recreated or still loading its
+  # model (/health is 503 until then), instead of a refused connection. Same
+  # host port, same URL. See ai/edge/EDGE.md.
   detector:
     networks:
       - shared
@@ -18,8 +23,6 @@ services:
         - DETECTOR_MODEL=${DETECTOR_MODEL:-google/owlv2-base-patch16-ensemble}
     container_name: detector
     restart: unless-stopped
-    ports:
-      - "${PORT_DETECTOR}:8000"
     environment:
       # Open-vocabulary detector knobs. All five come from the `## Detector`
       # block in .env; see .env.example for what each does and

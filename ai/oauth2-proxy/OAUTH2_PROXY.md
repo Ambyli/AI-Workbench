@@ -193,7 +193,7 @@ Both templates reference the logo as a plain URL:
 That works despite the pages being served pre-authentication because three things line up:
 
 1. **`oauth2-assets` sidecar** (defined in the same compose file) is `nginx:alpine` with the repo's top-level `assets/` folder bind-mounted at `/usr/share/nginx/html/assets`. It serves `/assets/<file>` at `http://oauth2-assets:80/assets/<file>` on the `ai_shared` network. It is NOT exposed on a host port — only oauth2-proxy talks to it.
-2. **Multi-upstream routing** — `OAUTH2_PROXY_UPSTREAMS=http://openwebui:8080,http://oauth2-assets:80/assets/`. oauth2-proxy uses longest-prefix path matching, so `/assets/*` goes to the sidecar and everything else goes to Open WebUI.
+2. **Multi-upstream routing** — `OAUTH2_PROXY_UPSTREAMS=http://openwebui:8080,http://oauth2-assets:80/assets/`. oauth2-proxy uses longest-prefix path matching, so `/assets/*` goes to the sidecar and everything else goes to Open WebUI. The deployed value (`.env.example`) adds more path upstreams the same way, each forwarded with its path unchanged: `/sandboxes/` (sandbox-proxy), `/superset/`, `/rustfs/` (lake-s3 console), `/n8n/` and `/edge/` — the edge HAProxy's read-only status page at `http://edge:8407/edge/` ([EDGE.md § Status page](../edge/EDGE.md#status-page)). After editing it, `make up oauth2-proxy`.
 3. **Skip-auth allowlist** — `OAUTH2_PROXY_SKIP_AUTH_ROUTES=^/assets/`. Without this, oauth2-proxy would redirect the `<img>` request to Google login and the browser would get a redirected image response (broken image icon on the sign-in page). With it, the `/assets/*` upstream is reachable without a session cookie.
 
 **Adding or replacing images.** Drop the file in the repo's top-level `assets/` folder and reference it by URL-encoded name (`/assets/My%20New%20Logo.png`). Nginx picks it up on the next request — no restart needed for asset changes, only for template changes. Filenames with spaces work, they just need URL encoding.
@@ -290,7 +290,7 @@ The access token is the one thing it *can* forward that lets the upstream ask Go
 | oauth2-proxy logs `Not Authorized to access this resource/api, forbidden` (403) *after* Admin SDK API is enabled | The account in `OAUTH2_PROXY_GOOGLE_ADMIN_EMAIL` isn't a **Super Admin**. Directory-wide group reads require the Super Admin role — Admin or Groups Admin alone will fail with this exact error. Grant Super Admin (Admin console → Directory → Users → user → Admin roles → Super Admin), OR change `OAUTH2_PROXY_GOOGLE_ADMIN_EMAIL` to an account that already is |
 | Users still hit Open WebUI directly, bypassing the proxy | Cloudflare tunnel is still routing `chat.zeoenergy.com` to `openwebui:8080` — update the tunnel's public hostname service URL |
 | Revocation not taking effect | `OAUTH2_PROXY_COOKIE_REFRESH` interval hasn't elapsed. Reduce it, or have the user clear cookies for `chat.zeoenergy.com` |
-| Sign-in page renders blank (200 with empty body) | Template parse error. Check `docker logs oauth2-proxy` at container startup — malformed Go template syntax fails silently at render time |
+| Sign-in page renders blank (200 with empty body) | Template parse error. Check `make logs oauth2-proxy` at container startup — malformed Go template syntax fails silently at render time |
 | Only one of sign-in / error pages picked up the custom branding | Both `sign_in.html` AND `error.html` must exist in `OAUTH2_PROXY_CUSTOM_TEMPLATES_DIR`. Missing one falls back to the built-in default for that page only |
 | Anonymous `curl -sI https://chat.zeoenergy.com/static/favicon.png` returns `200` + `cf-cache-status: HIT` instead of `403`; Open WebUI's branded assets stay stale after a recreate | Not oauth2-proxy — Cloudflare's edge cached the authenticated response by file extension. Purge, then add the bypass Cache Rule: [ai/cloudflared/CLOUDFLARED.md § Cache rule](../cloudflared/CLOUDFLARED.md#cache-rule--bypass-for-chatzeoenergycom) |
 
@@ -300,11 +300,11 @@ The access token is the one thing it *can* forward that lets the upstream ask Go
 # Follow oauth2-proxy logs
 make logs oauth2-proxy
 
-# Restart after config change
-make clean oauth2-proxy && make up oauth2-proxy
+# Apply a config change — swaps side by side, no downtime (ai/edge/EDGE.md)
+make up oauth2-proxy
 
 # Verify the container can reach Open WebUI over the shared network
-docker exec oauth2-proxy wget -qO- http://openwebui:8080/health
+make exec oauth2-proxy oauth2-proxy CMD='wget -qO- http://openwebui:8080/health'
 ```
 
 ---

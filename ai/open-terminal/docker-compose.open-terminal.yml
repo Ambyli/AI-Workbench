@@ -19,6 +19,8 @@ networks:
     name: terminal_net
 
 services:
+  # Recreated (with downtime) by `make up`: per-user Linux accounts and live PTY
+  # sessions exist in one container only.
   open-terminal:
     # Pinned release tag. Upstream publishes UNPREFIXED semver tags for the
     # default (fat) variant — `0.13.0`, plus a rolling `0.13` and `latest`.

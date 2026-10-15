@@ -3,7 +3,16 @@ global:
   evaluation_interval: 15s
 
 scrape_configs:
+  # LiteLLM authenticates /metrics (require_auth_for_metrics_endpoint defaults
+  # to on) and answered this job 401 without a key. The key is a virtual key
+  # restricted to the /metrics routes (`allowed_routes`), kept out of git in
+  # ai/litellm/secrets/. Turning the auth off instead would publish /metrics on
+  # https://api.zeoenergy.com/metrics, since the tunnel goes straight to
+  # litellm. See ai/litellm/LITELLM.md > Prometheus scrape key.
   - job_name: "litellm"
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/secrets/prometheus_metrics.key
     static_configs:
       - targets: ["litellm:4000"]
 
@@ -25,3 +34,11 @@ scrape_configs:
   - job_name: "detector"
     static_configs:
       - targets: ["detector:8000"]
+
+  # The ai/edge HAProxy's built-in Prometheus exporter (official image built
+  # with USE_PROMEX=1). edge:8405 is an internal-only frontend on ai_shared,
+  # never published. Per-backend health, sessions, 503s / 429s, queue time.
+  # See ai/edge/EDGE.md > Metrics.
+  - job_name: "edge"
+    static_configs:
+      - targets: ["edge:8405"]

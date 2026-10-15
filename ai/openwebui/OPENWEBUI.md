@@ -403,7 +403,7 @@ For LAN-wide or off-LAN access, Open WebUI is fronted by a Cloudflare Tunnel rat
 **Verifying:**
 
 ```bash
-docker logs ai-cloudflared --tail 50   # should show "Registered tunnel connection"
+make -s logs cloudflared FOLLOW=0 TAIL=50   # should show "Registered tunnel connection"
 curl -I https://chat.zeoenergy.com     # should return 200 from Open WebUI
 ```
 
@@ -427,7 +427,7 @@ systemctl status cloudflared 2>/dev/null | head -5
 
 - Systemd service running → **locally-managed**. Config file is authoritative. If oauth2-proxy is deployed in front of Open WebUI, the `service:` line for `chat.zeoenergy.com` must point at `http://localhost:${PORT_OAUTH2_PROXY}` (typically `4180`) instead of `http://localhost:${PORT_OPENWEBUI}` (typically `8007`). See [`OAUTH2_PROXY.md`](OAUTH2_PROXY.md).
 - Only a `cloudflared` container using `TUNNEL_TOKEN` → **remotely-managed**. Dashboard is authoritative.
-- **Both running** → you have two tunnels. Cloudflare DNS decides which serves `chat.zeoenergy.com` (whichever tunnel UUID is in the CNAME). The other tunnel's config changes have zero effect. Diagnose with `docker logs -f ai-cloudflared` while hitting the site — if no request activity appears, you're editing the wrong tunnel.
+- **Both running** → you have two tunnels. Cloudflare DNS decides which serves `chat.zeoenergy.com` (whichever tunnel UUID is in the CNAME). The other tunnel's config changes have zero effect. Diagnose with `make logs cloudflared` while hitting the site — if no request activity appears, you're editing the wrong tunnel.
 
 #### End-to-end smoke test
 

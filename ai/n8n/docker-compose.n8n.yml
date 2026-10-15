@@ -6,9 +6,12 @@ networks:
 services:
   # Postgres backing n8n's workflow store, execution history, and encrypted
   # credentials. Exposed on the host at PORT_N8N_DB (default 5435 — sits one
-  # past sandbox-db's 5434 in the PORT REGISTRY in .env) so operators can
+  # past sandbox-db's 5440 in the PORT REGISTRY in .env) so operators can
   # query it remotely — psql, DBeaver, dashboards. See N8N.md
   # § "Connecting to the n8n DB".
+  #
+  # Recreated (with downtime) by `make up`: a data directory can have only one
+  # Postgres.
   n8n-db:
     image: postgres:16-alpine
     container_name: n8n-db
@@ -30,6 +33,8 @@ services:
       timeout: 3s
       retries: 5
 
+  # Recreated (with downtime) by `make up`: a second copy's scheduler would fire
+  # every scheduled workflow twice.
   n8n:
     # Pinned release tag. Bump this line and `docker compose ... pull` to
     # update. Use `:latest` for the rolling upstream tag.

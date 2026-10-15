@@ -20,10 +20,14 @@
 # Upstream service KEYS are kept verbatim (auth, rest, realtime, storage,
 # imgproxy, meta, studio, functions) because the vendored Envoy cluster config
 # (volumes/api/envoy/cds.yaml) addresses them by those exact hostnames — see
-# SUPABASE.md § Vendored config. That means `container_name` deliberately does
-# NOT equal the service key for those eight (they are `supabase-<svc>`, as
-# upstream names them). The three that also join ai_shared get distinctive
-# names for both: supabase-db, supabase-api, supavisor.
+# SUPABASE.md § Vendored config. Upstream names their containers
+# `supabase-<svc>`. Seven of them (auth, rest, storage, imgproxy, meta, studio,
+# functions) are swapped side by side by `make up` and so carry no
+# container_name: the `com.zeo.deploy.name` label keeps the prefix, and the
+# containers are `supabase-<svc>-<hash>`. realtime keeps `container_name:
+# supabase-realtime` (it is recreated -- see its comment). The three that also
+# join ai_shared get distinctive names for both: supabase-db, supabase-api,
+# supavisor. See ai/edge/EDGE.md.
 #
 # ALL configuration is read from the root .env with a SUPABASE_ prefix and
 # mapped onto upstream's unprefixed container env names here. Upstream's raw
@@ -64,8 +68,11 @@ services:
   # direct psql / DBeaver path (bypasses the pooler).
   #
   # Port grouping in the PORT REGISTRY block of .env:
-  #   5432 litellm_db, 5433 roofix-db, 5434 sandbox-db, 5435 n8n-db,
+  #   5432 litellm_db, 5433 roofix-db, 5440 sandbox-db, 5435 n8n-db,
   #   5436 hive-metastore-db, 5437 superset-db, 5438 supabase-db
+  #
+  # Recreated (with downtime) by `make up`: a data directory can have only one
+  # Postgres.
   supabase-db:
     # Pinned release tag. Bump this line and `docker compose ... pull` to
     # update. Re-check it against supabase/supabase@master docker/docker-compose.yml.
@@ -135,6 +142,9 @@ services:
   #
   # Clients log in as `postgres.<POOLER_TENANT_ID>` — see SUPABASE.md § Access.
   # Dual-homed so anything on ai_shared can pool instead of connecting direct.
+  #
+  # Recreated (with downtime) by `make up`: it runs its metadata migrations on
+  # start, and its two pooler listeners are raw TCP host ports.
   supavisor:
     # Pinned release tag. Bump this line and `docker compose ... pull` to update.
     image: supabase/supavisor:2.9.12
@@ -191,8 +201,16 @@ services:
   auth:
     # Pinned release tag. Bump this line and `docker compose ... pull` to update.
     image: supabase/gotrue:v2.196.0
-    container_name: supabase-auth
+    # Deployed side by side by `make up supabase` (scripts/deploy.py): a new
+    # `supabase-auth-<hash>` starts next to the old one, and the old one
+    # retires once the new one is healthy. The gateway reaches it by service
+    # key (auth), so no container_name; the label keeps upstream's
+    # supabase-auth prefix. See ai/edge/EDGE.md.
+    labels:
+      com.zeo.deploy: swap
+      com.zeo.deploy.name: supabase-auth
     restart: unless-stopped
+    stop_grace_period: 30s
     environment:
       # All values sourced from .env — edit there, not here.
       GOTRUE_API_HOST: 0.0.0.0
@@ -285,8 +303,16 @@ services:
   rest:
     # Pinned release tag. Bump this line and `docker compose ... pull` to update.
     image: postgrest/postgrest:v14.17
-    container_name: supabase-rest
+    # Deployed side by side by `make up supabase` (scripts/deploy.py): a new
+    # `supabase-rest-<hash>` starts next to the old one, and the old one
+    # retires once the new one is healthy. The gateway reaches it by service
+    # key (rest), so no container_name; the label keeps upstream's
+    # supabase-rest prefix. See ai/edge/EDGE.md.
+    labels:
+      com.zeo.deploy: swap
+      com.zeo.deploy.name: supabase-rest
     restart: unless-stopped
+    stop_grace_period: 30s
     command: ["postgrest"]
     environment:
       # All values sourced from .env — edit there, not here.
@@ -324,6 +350,9 @@ services:
   # at, so the vendored cds.yaml addresses it as `realtime-dev.supabase-realtime`.
   # Upstream gets that DNS name from the dotted container_name; on a
   # compose-managed bridge we add it as an explicit network ALIAS instead.
+  #
+  # Recreated (with downtime) by `make up`: it holds a Postgres logical
+  # replication slot, which only one copy can consume.
   realtime:
     # Pinned release tag. Bump this line and `docker compose ... pull` to update.
     image: supabase/realtime:v2.134.10
@@ -377,8 +406,16 @@ services:
   imgproxy:
     # Pinned release tag. Bump this line and `docker compose ... pull` to update.
     image: darthsim/imgproxy:v3.31.4
-    container_name: supabase-imgproxy
+    # Deployed side by side by `make up supabase` (scripts/deploy.py): a new
+    # `supabase-imgproxy-<hash>` starts next to the old one, and the old one
+    # retires once the new one is healthy. Storage reaches it by service
+    # key (imgproxy), so no container_name; the label keeps upstream's
+    # supabase-imgproxy prefix. See ai/edge/EDGE.md.
+    labels:
+      com.zeo.deploy: swap
+      com.zeo.deploy.name: supabase-imgproxy
     restart: unless-stopped
+    stop_grace_period: 30s
     environment:
       # All values sourced from .env — edit there, not here.
       IMGPROXY_BIND: ":5001"
@@ -408,8 +445,18 @@ services:
   storage:
     # Pinned release tag. Bump this line and `docker compose ... pull` to update.
     image: supabase/storage-api:v1.74.0
-    container_name: supabase-storage
+    # Deployed side by side by `make up supabase` (scripts/deploy.py): a new
+    # `supabase-storage-<hash>` starts next to the old one, and the old one
+    # retires once the new one is healthy. The gateway reaches it by service
+    # key (storage), so no container_name; the label keeps upstream's
+    # supabase-storage prefix. See ai/edge/EDGE.md.
+    # Its migrations on start are idempotent, and both copies share the
+    # supabase_storage volume and database, so two copies are safe.
+    labels:
+      com.zeo.deploy: swap
+      com.zeo.deploy.name: supabase-storage
     restart: unless-stopped
+    stop_grace_period: 60s
     environment:
       # All values sourced from .env — edit there, not here.
       ANON_KEY: "${SUPABASE_ANON_KEY:?Set SUPABASE_ANON_KEY in .env — run python ai/supabase/bin/generate_keys.py, see ai/supabase/SUPABASE.md}"
@@ -459,8 +506,16 @@ services:
   meta:
     # Pinned release tag. Bump this line and `docker compose ... pull` to update.
     image: supabase/postgres-meta:v0.99.0
-    container_name: supabase-meta
+    # Deployed side by side by `make up supabase` (scripts/deploy.py): a new
+    # `supabase-meta-<hash>` starts next to the old one, and the old one
+    # retires once the new one is healthy. The gateway reaches it by service
+    # key (meta), so no container_name; the label keeps upstream's
+    # supabase-meta prefix. See ai/edge/EDGE.md.
+    labels:
+      com.zeo.deploy: swap
+      com.zeo.deploy.name: supabase-meta
     restart: unless-stopped
+    stop_grace_period: 30s
     environment:
       # All values sourced from .env — edit there, not here.
       PG_META_PORT: "8080"
@@ -491,8 +546,16 @@ services:
   studio:
     # Pinned release tag. Bump this line and `docker compose ... pull` to update.
     image: supabase/studio:2026.09.07-sha-7996410
-    container_name: supabase-studio
+    # Deployed side by side by `make up supabase` (scripts/deploy.py): a new
+    # `supabase-studio-<hash>` starts next to the old one, and the old one
+    # retires once the new one is healthy. The gateway reaches it by service
+    # key (studio), so no container_name; the label keeps upstream's
+    # supabase-studio prefix. See ai/edge/EDGE.md.
+    labels:
+      com.zeo.deploy: swap
+      com.zeo.deploy.name: supabase-studio
     restart: unless-stopped
+    stop_grace_period: 30s
     environment:
       # All values sourced from .env — edit there, not here.
       # Listen on all IPv4 interfaces.
@@ -561,11 +624,19 @@ services:
   supabase-api:
     # Pinned release tag. Bump this line and `docker compose ... pull` to update.
     image: envoyproxy/envoy:v1.39.1
-    container_name: supabase-api
+    # Deployed side by side by `make up supabase` (scripts/deploy.py): a new
+    # `supabase-api-<hash>` starts next to the old one, and the old one retires
+    # once the new one is healthy. No container_name (studio and functions
+    # reach it as supabase-api:8000 by service name) and no `ports:` --
+    # PORT_SUPABASE_API is published by ai/edge, which also carries the
+    # Realtime websockets. Envoy exits on SIGTERM without draining, so a
+    # request in flight on the retiring copy at that moment fails. The hash
+    # covers the four bind-mounted envoy files. See ai/edge/EDGE.md.
+    labels:
+      com.zeo.deploy: swap
     restart: unless-stopped
+    stop_grace_period: 30s
     entrypoint: ["/bin/sh", "/docker-entrypoint.sh"]
-    ports:
-      - "${PORT_SUPABASE_API:-8022}:8000"
     environment:
       # All values sourced from .env — edit there, not here.
       ANON_KEY: "${SUPABASE_ANON_KEY:?Set SUPABASE_ANON_KEY in .env — run python ai/supabase/bin/generate_keys.py, see ai/supabase/SUPABASE.md}"
@@ -609,8 +680,19 @@ services:
   functions:
     # Pinned release tag. Bump this line and `docker compose ... pull` to update.
     image: supabase/edge-runtime:v1.76.2
-    container_name: supabase-functions
+    # Deployed side by side by `make up supabase` (scripts/deploy.py): a new
+    # `supabase-functions-<hash>` starts next to the old one, and the old one
+    # retires once the new one is healthy. The gateway reaches it by service
+    # key (functions), so no container_name; the label keeps upstream's
+    # supabase-functions prefix. See ai/edge/EDGE.md.
+    # The hash covers ./volumes/functions. If `make up supabase` swaps this
+    # service every time with no edit, the runtime is writing into that
+    # directory -- check `git status ai/supabase/volumes/functions` on the box.
+    labels:
+      com.zeo.deploy: swap
+      com.zeo.deploy.name: supabase-functions
     restart: unless-stopped
+    stop_grace_period: 30s
     command: ["start", "--main-service", "/home/deno/functions/main"]
     environment:
       # All values sourced from .env — edit there, not here.

@@ -38,8 +38,11 @@ services:
   # migrations run on startup and would collide with anything else.
   #
   # Port grouping in the PORT REGISTRY block of .env:
-  #   5432 litellm_db, 5433 roofix-db, 5434 sandbox-db, 5435 n8n-db,
+  #   5432 litellm_db, 5433 roofix-db, 5440 sandbox-db, 5435 n8n-db,
   #   5436 hive-metastore-db, 5437 superset-db
+  #
+  # Recreated (with downtime) by `make up`: a data directory can have only one
+  # Postgres.
   hive-metastore-db:
     image: postgres:16-alpine
     container_name: hive-metastore-db
@@ -72,6 +75,9 @@ services:
   #
   # Internal only. Nothing outside analytics_net should ever talk to HMS
   # directly — Trino is the sole client.
+  #
+  # Recreated (with downtime) by `make up`: it migrates its schema on start,
+  # and Trino caches its thrift connection to the one metastore it found.
   hive-metastore:
     build:
       context: ./hive-metastore
@@ -125,6 +131,9 @@ services:
   # analytics_net (for trino / hms to reach it by DNS). Console lives
   # behind oauth2-proxy at /rustfs/console/ — see OAUTH2_PROXY_UPSTREAMS
   # in .env.
+  #
+  # Recreated (with downtime) by `make up`: one RustFS owns the data
+  # directory, and it publishes host ports.
   lake-s3:
     image: ghcr.io/rustfs/rustfs:1.0.1
     container_name: lake-s3
@@ -237,6 +246,9 @@ services:
   # /etc/trino/catalog/. Adding a new catalog is:
   #   1. drop a file in ai/trino/catalogs/
   #   2. docker compose restart trino-coordinator
+  #
+  # Recreated (with downtime) by `make up`: a cluster has exactly one
+  # coordinator, and it publishes PORT_TRINO.
   trino-coordinator:
     image: trinodb/trino:453
     container_name: trino-coordinator
@@ -274,6 +286,8 @@ services:
       SANDBOX_DB_USER: ${SANDBOX_DB_USER:-sandbox}
       SANDBOX_DB_PASSWORD: ${SANDBOX_DB_PASSWORD:-sandbox}
       SANDBOX_DB_NAME: ${SANDBOX_DB_NAME:-sandbox}
+      # Host port of sandbox-db (catalogs/postgres_sandbox.properties).
+      PORT_SANDBOX_DB: ${PORT_SANDBOX_DB:-5440}
       # Phoenix production Postgres (off-box, read-only role). Same vars
       # the Roofix bridge uses — one definition in .env feeds both.
       # Consumed by catalogs/postgres_phoenix.properties.
@@ -333,7 +347,7 @@ services:
     # host.docker.internal is NOT defined by default on Linux Docker (only
     # Docker Desktop injects it). host-gateway maps it to the bridge
     # gateway IP so the postgres_litellm / postgres_sandbox catalogs can
-    # reach the host-published ports 5432 / 5434.
+    # reach the host-published ports 5432 / 5440.
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:
@@ -366,8 +380,16 @@ services:
     build:
       context: ../..
       dockerfile: ai/trino/Dockerfile.mcp
-    container_name: trino-mcp
+    # Deployed side by side by `make up trino` (scripts/deploy.py): a new
+    # `trino-mcp-<hash>` starts next to the old one, and the old one retires
+    # once the new one is healthy. Stateless shim; LiteLLM reaches it by
+    # service name (trino-mcp:8080), so no container_name. See
+    # ai/edge/EDGE.md.
+    labels:
+      com.zeo.deploy: swap
     restart: unless-stopped
+    # run_query is clamped to TRINO_MCP_MAX_RUNTIME_S (30 s).
+    stop_grace_period: 60s
     environment:
       TRINO_HOST: trino-coordinator
       TRINO_PORT: 8080
@@ -388,6 +410,8 @@ services:
       retries: 3
 
   # ── Superset metadata Postgres ─────────────────────────────────────────
+  # Recreated (with downtime) by `make up`: a data directory can have only one
+  # Postgres.
   superset-db:
     image: postgres:16-alpine
     container_name: superset-db
@@ -419,10 +443,18 @@ services:
     build:
       context: ./superset
       dockerfile: Dockerfile
-    container_name: superset
+    # Deployed side by side by `make up trino` (scripts/deploy.py): a new
+    # `superset-<hash>` starts next to the old one, and the old one retires
+    # once the new one is healthy. bootstrap.sh is idempotent, so the new
+    # copy re-running it beside the old one is safe. No container_name
+    # (oauth2-proxy reaches superset:8088 by service name) and no `ports:`:
+    # PORT_SUPERSET is published by ai/edge, which strips the
+    # X-Auth-Request-* headers on that port -- see the header-auth note above
+    # and ai/edge/EDGE.md.
+    labels:
+      com.zeo.deploy: swap
     restart: unless-stopped
-    ports:
-      - "${PORT_SUPERSET:-8016}:8088"
+    stop_grace_period: 60s
     environment:
       SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY:-change-me}
       SUPERSET_DB_USER: ${SUPERSET_DB_USER:-superset}

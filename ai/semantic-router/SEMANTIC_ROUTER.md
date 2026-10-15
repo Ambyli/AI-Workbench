@@ -69,6 +69,9 @@ Each deployment calls its backend **directly** (`http://qwen3.8-solo:8000/v1`, `
         ▼
   vllm-sr-envoy:8899                 routes on x-selected-model to that chain's cluster
         ▼
+  edge:14000                         ai/edge HAProxy, INTERNAL listener (never published):
+        │                            picks a healthy LiteLLM copy per request
+        ▼
   litellm:4000                       model group local-general / -code / -reasoning / -private
         │  cooldown -> overflow hook -> context check -> lowest `order` left
         ▼
@@ -83,6 +86,7 @@ Three things fall out of that shape:
 1. **It is a loop.** LiteLLM calls the router, the router's request lands back in LiteLLM. See [§ Recursion guard](#recursion-guard).
 2. **Bodies are buffered.** Nothing reaches the caller until the chain's answer is complete — including any time `local-private` spends queued inside vLLM.
 3. **Envoy is the enforcement point, not the router.** The bearer check and the inbound header stripping are both Envoy filters; the router trusts what reaches it.
+4. **Envoy reaches LiteLLM through the edge.** Every `backend_refs[].base_url` is `http://edge:14000/v1`, not `http://litellm:4000/v1`. The generated clusters are `LOGICAL_DNS` — one resolved address at a time, re-resolved about every 5 s — so pointing them at `litellm` pinned one LiteLLM copy, and a `make up litellm` swap could fail a routed turn until the next refresh. The edge never swaps, health-checks every LiteLLM copy, and retries a refused connection on another. Its `:14000` bind is internal (never published), exempt from the edge's LAN allow-list and per-key limit, and keeps 900 s timeouts, above this stack's 840 s. Only an edge *recreate* interrupts it, for a second or two, and `auto` then answers from its `local-private` fallback ([§ The privacy guarantee](#the-privacy-guarantee--and-the-router-down-path)). The ext_proc hop to `vllm-sr-router:50051` is still direct, so a router swap keeps its one-refresh gap. See [EDGE.md § The semantic router's internal listener](../edge/EDGE.md#the-semantic-routers-internal-listener).
 
 ---
 
@@ -156,6 +160,7 @@ Every layer sits **strictly inside** the one outside it, so the innermost layer 
 | LiteLLM `auto` → Envoy | `stream_timeout` **and** `timeout` on `auto` | **870 s** | `httpx.Timeout`, per read |
 | Envoy → router → chain | `listeners[0].timeout` (`config.yaml`) | **840 s** | route `timeout` + ext_proc `message_timeout` (template `cli/templates/envoy.template.yaml:48,71,85,140`) — a total |
 | Envoy, hard-coded | route `idleTimeout`, ext_proc `grpc_service.timeout`, cluster `connect_timeout` | 1200 s | not parameterised; above 840, so never the binding one |
+| Envoy → edge `:14000` → LiteLLM | `timeout client` / `timeout server` of `listen litellm` in `ai/edge/haproxy.cfg` | 900 s | HAProxy inactivity timers; above 870 and 840, so never the binding one. The same section serves LAN clients on `PORT_LITELLM`, whose `auto` turns are silent for up to 870 s |
 | Chain orders 1 and 2 (local) | `stream_timeout` + `timeout` on each deployment | **240 s** | per read — a stall detector |
 | Chain order 3 (Claude) | same | **300 s** | per read |
 
@@ -172,9 +177,9 @@ Every layer sits **strictly inside** the one outside it, so the innermost layer 
 | Order 3 (Claude) times out, or both `local-private` orders do | Nothing behind it: the turn fails with LiteLLM's error. |
 | Envoy's 840 s fires | Envoy returns 504, which LiteLLM maps to `Timeout` (`exception_mapping_utils.py:465`). `auto` is in `model_group_retry_policy` with `TimeoutErrorRetries: 0` too, so the turn is **not** restarted with ~60 s left; it goes straight to `fallbacks: auto → [local-private]`, which gets whatever remains of Open WebUI's 900 s — usually too little for a full answer, but it stays local and the error, if any, is LiteLLM's rather than a silently doubled turn. |
 
-`unit-tests/litellm/test_timeouts.py` enforces the order (900 > 870 > 840 < 1200, every chain's order 1 < 870, the retry policy on all four chains and `auto`, the `.env.example` values) against the checked-in files — not `.env` — and drives both fail-over rows above against a real v1.95.0 `Router` and local stub upstreams.
+`unit-tests/litellm/test_timeouts.py` enforces the order (900 > 870 > 840 < 1200, the edge's `listen litellm` 900 > 870, every chain's order 1 < 870, the retry policy on all four chains and `auto`, the `.env.example` values) against the checked-in files — not `.env` — and drives both fail-over rows above against a real v1.95.0 `Router` and local stub upstreams.
 
-**Changing a number.** Keep the nesting, then apply outermost first so no window has an inner layer longer than an outer one: `make up openwebui` (an `.env` change — a recreate), then the LiteLLM recreate in [LITELLM.md § Applying a chain or hook change](../litellm/LITELLM.md#applying-a-chain-or-hook-change), then the router recreate in [§ Applying a config change](#applying-a-config-change) after re-rendering `envoy.yaml`. When *lowering*, reverse it: innermost first.
+**Changing a number.** Keep the nesting, then apply outermost first so no window has an inner layer longer than an outer one: `make up openwebui` (an `.env` change — a recreate), then the LiteLLM recreate in [LITELLM.md § Applying a chain or hook change](../litellm/LITELLM.md#applying-a-chain-or-hook-change), then `make up semantic-router FORCE=1` ([§ Applying a config change](#applying-a-config-change)) after re-rendering `envoy.yaml`. Raising any layer to 900 s or more also means raising the edge's `listen litellm` timeouts first (`ai/edge/haproxy.cfg`, then `make up edge` — a hitless reload). When *lowering*, reverse it: innermost first.
 
 ---
 
@@ -201,20 +206,21 @@ The old config had a **known gap**: `privacy_local` routed to `qwen3.8-solo`, an
 2. **Point it at a chain alias.** If none of the four fits, add a new chain in `litellm_config.yaml` first ([LITELLM.md § Adding a chain](../litellm/LITELLM.md#adding-a-chain)), add it to `providers.models` + `routing.modelCards`, and scope `SEMANTIC_ROUTER_LITELLM_KEY` to it in the LiteLLM Admin UI. Never point a decision at a concrete alias (`qwen3.8-solo`, `claude-*`): those carry Claude fallbacks.
 3. **Add the decision** under `routing.decisions`. `name`, `description` (**required** — a missing one fails validation), `priority`, `rules`, `modelRefs`, `algorithm: {type: static}`. Give it a priority that slots it correctly against the four above.
 4. **Validate locally** — see below — and re-render `envoy.yaml` if `providers.models` changed ([§ Re-rendering envoy.yaml](#re-rendering-envoyyaml)).
-5. **Apply it with a recreate**, not `make up` — see [§ Applying a config change](#applying-a-config-change).
+5. **Apply it with `make up semantic-router FORCE=1`** — see [§ Applying a config change](#applying-a-config-change).
 
 The same five steps apply to *changing* an existing decision — its keywords, its priority, or which chain it points at. Swapping which local model goes first, or which Claude model is the overflow, is a LiteLLM change, not a router one: edit the chain's `order` values in `litellm_config.yaml` ([LITELLM.md § Chain aliases](../litellm/LITELLM.md#chain-aliases-and-the-overflow-hook)) and `make up litellm` — nothing here needs touching.
 
 ### Applying a config change
 
 ```bash
-docker compose -f ai/semantic-router/docker-compose.semantic-router.yml --env-file .env -p ai-semantic-router \
-    up -d --force-recreate vllm-sr-models-init vllm-sr-router vllm-sr-envoy
+make up semantic-router FORCE=1
 ```
 
-`make up semantic-router` is a plain `docker compose up -d`. It recreates a container only when that container's *compose* definition changed (env, image, mounts) — so it is enough after a `.env` key rotation, but **not** after an edit to `config.yaml` or `envoy.yaml`, whose contents are bind-mounted and invisible to compose. A running router and Envoy would keep the old config, and the init service's validate + drift checks would never gate it.
+`make up` runs `scripts/deploy.py` ([EDGE.md § How `make up` deploys](../edge/EDGE.md#how-make-up-deploys)): `vllm-sr-models-init` runs first on every `make up` (a oneshot — validate, re-render and diff, substitute the keys, write the volume), then `vllm-sr-router` and `vllm-sr-envoy` are **swapped** side by side. **`FORCE=1` is required after a `config.yaml` / `envoy.yaml` edit.** The router's swap hash covers its bind-mounted `config.yaml`, so it would swap anyway — but Envoy loads its config from the `vllm_sr_envoy` **named volume**, which `deploy.py` does not hash. Without `FORCE=1` it prints `up to date` and keeps the old config in memory (Envoy has no file reload). A `.env` key rotation changes both containers' compose config, so a plain `make up semantic-router` is enough there.
 
-The router does have a live reload — it watches `/app/config.yaml`'s directory with fsnotify and reloads on change (vllm-sr v0.3.0 `pkg/extproc/server_config_watch.go`). Do not rely on it: `config.yaml` is a **single-file** bind mount, and a `git pull` or an editor that saves by replacing the file gives it a new inode the container never sees; a reload also skips the init service's validation; and Envoy has no reload at all, so a `providers.models` change needs Envoy recreated regardless. The recreate above is the one path that always validates, re-renders-and-diffs, and loads the new config into both containers.
+The old recreate still works, with downtime: `docker compose -f ai/semantic-router/docker-compose.semantic-router.yml --env-file .env -p ai-semantic-router up -d --force-recreate vllm-sr-models-init vllm-sr-router vllm-sr-envoy`.
+
+The router does have a live reload — it watches `/app/config.yaml`'s directory with fsnotify and reloads on change (vllm-sr v0.3.0 `pkg/extproc/server_config_watch.go`). Do not rely on it: `config.yaml` is a **single-file** bind mount, and a `git pull` or an editor that saves by replacing the file gives it a new inode the container never sees; a reload also skips the init service's validation; and Envoy has no reload at all, so a `providers.models` change needs Envoy recreated regardless. `make up semantic-router FORCE=1` is the path that always validates, re-renders-and-diffs, and loads the new config into both containers.
 
 ### Validating a config edit without Docker
 
@@ -245,13 +251,13 @@ Then splice: keep the hand-written comment header at the top of `ai/semantic-rou
 
 Both `ENVOY_*_ADDRESS` variables matter: they place the ext_proc cluster. If they are unset the render points at `127.0.0.1` and the init service's diff fails every time.
 
-**You do not have to remember.** `vllm-sr-models-init` re-renders every time it runs — which, after a config edit, means the recreate in [§ Applying a config change](#applying-a-config-change) — and fails the stack with a unified diff if the checked-in file no longer matches. Never work around that check — it is the only thing standing between a version bump and an Envoy config that routes to the wrong place.
+**You do not have to remember.** `vllm-sr-models-init` re-renders every time it runs — which, after a config edit, means `make up semantic-router FORCE=1` ([§ Applying a config change](#applying-a-config-change)) — and fails the stack with a unified diff if the checked-in file no longer matches. Never work around that check — it is the only thing standing between a version bump and an Envoy config that routes to the wrong place.
 
 ### What the render actually produces
 
 - One **route** per `providers.models` entry, matched on `x-selected-model` exact-equals the chain alias.
-- One **cluster** per chain. All four resolve to `litellm:4000` — the generator emits a cluster per model and there is no knob to collapse them into a shared `litellm_cluster`.
-- `LOGICAL_DNS` + `dns_lookup_family: V4_ONLY`, because `litellm` is a name and not an IP.
+- One **cluster** per chain. All four resolve to `edge:14000` (LiteLLM through the edge's internal listener — [§ Request path](#request-path)) — the generator emits a cluster per model and there is no knob to collapse them into a shared `litellm_cluster`.
+- `LOGICAL_DNS` + `dns_lookup_family: V4_ONLY`, because `edge` is a name and not an IP. `LOGICAL_DNS` uses one resolved address at a time, which is why the target is the edge (it never swaps) rather than `litellm` (it does).
 - A **default route** (no `x-selected-model`) to `models[0]` — `local-general`. Reordering `providers.models` changes the fallback target; keep `local-general` first.
 - `request_headers_to_remove` on the virtual host, dropping `x-vsr-looper-request` / `-secret` / `-decision` / `-iteration` and `x-authz-user-id` / `-groups` from every inbound request. This is upstream's own hardening and it is already correct — a caller on 8025 cannot forge a looper control header or spoof an identity.
 - Route `timeout` and ext_proc `message_timeout` from `listeners[0].timeout` (840s). `idleTimeout`, the ext_proc `grpc_service.timeout` and the cluster `connect_timeout`s stay at the template's hard-coded **1200s** — not parameterised, and above 840s, so the listener value is the real cap. See [§ Timeout budget](#timeout-budget).
@@ -316,14 +322,14 @@ make up semantic-router
 
 | Port | Where | Published? |
 |---|---|---|
-| `8899` (Envoy listener) | `vllm-sr-envoy` | **yes** — `PORT_SEMANTIC_ROUTER`, default `8025` |
+| `8899` (Envoy listener) | `vllm-sr-envoy` | **yes** — `PORT_SEMANTIC_ROUTER`, default `8025`, published by [`ai/edge`](../edge/EDGE.md) (`vllm-sr-envoy` and `vllm-sr-router` are swapped side by side on `make up`, so neither can hold a host port) |
 | `9901` (Envoy admin) | `vllm-sr-envoy` | never — serves `/quitquitquit` and a config dump **containing the listener bearer token** |
 | `50051` (ext_proc gRPC) | `vllm-sr-router` | never |
 | `8080` (management API) | `vllm-sr-router` | never — the healthcheck hits it inside the container |
 | `9190` (metrics) | `vllm-sr-router` | never — prometheus scrapes `vllm-sr-router:9190` over `ai_shared` |
 | `8700` (dashboard) | `vllm-sr-dashboard` | `127.0.0.1` only, behind the `dashboard` compose profile |
 
-`8025` is **not** behind oauth2-proxy. The listener bearer token is the only thing in front of it. Do not expose it on an untrusted network; if you want it browser-reachable, front it at `chat.zeoenergy.com/vllm-sr/` through `OAUTH2_PROXY_UPSTREAMS` the way `/n8n/` and `/sandboxes/*` are done.
+`8025` is **not** behind oauth2-proxy. The listener bearer token is the only thing in front of it, plus the edge's source allow-list (`EDGE_ALLOWED_CIDRS`, [EDGE.md § LAN allow-list](../edge/EDGE.md#lan-allow-list)). Do not expose it on an untrusted network; if you want it browser-reachable, front it at `chat.zeoenergy.com/vllm-sr/` through `OAUTH2_PROXY_UPSTREAMS` the way `/n8n/` and `/sandboxes/*` are done.
 
 The dashboard can edit the live router config and has no auth of its own. Start it deliberately:
 
@@ -343,7 +349,7 @@ docker compose -f ai/semantic-router/docker-compose.semantic-router.yml \
 Three places, and only the spend log is authoritative about cost:
 
 - **Which decision matched** — the router log (`make logs semantic-router vllm-sr-router`) and the response's `route_diagnostics` object. A code prompt that shows `general` means the keyword signal missed; add the term to `code_kw`. A PII prompt that shows anything but `privacy_local` is the soft spot from [§ The privacy guarantee](#the-privacy-guarantee--and-the-router-down-path) — widen `privacy_kw`.
-- **Which backend answered** — LiteLLM's **spend log** (Admin UI → Logs / spend by key). Filter on `SEMANTIC_ROUTER_LITELLM_KEY`: each row's *model group* is the chain alias and its *model* is the deployment that answered (`openai/qwen3.8-solo`, `openai/muse-glimmer`, `anthropic/claude-sonnet-5`, …). Overflow to Claude shows up only here. `docker logs litellm | grep '\[overflow\]'` shows the hook's spill decisions alongside.
+- **Which backend answered** — LiteLLM's **spend log** (Admin UI → Logs / spend by key). Filter on `SEMANTIC_ROUTER_LITELLM_KEY`: each row's *model group* is the chain alias and its *model* is the deployment that answered (`openai/qwen3.8-solo`, `openai/muse-glimmer`, `anthropic/claude-sonnet-5`, …). Overflow to Claude shows up only here. `make -s logs litellm FOLLOW=0 TAIL=all | grep '\[overflow\]'` shows the hook's spill decisions alongside.
 - **At a glance, in the chat** — every `auto` answer ends with a footer naming the deployment and chain that served it: `*qwen3.8-solo · local-general*`, with ` · overflow (local busy)` / `(local down)` when a Claude deployment answered and ` · router bypassed` when the router was down and `auto` fell back to `local-private`. LiteLLM derives it from the response headers (`llm_provider-x-litellm-model-*`, `llm_provider-x-vsr-*`), strips it again from the next turn's history before the router sees it, and skips tool calls, `response_format` and Open WebUI background tasks — it is cosmetic, not the cost record. Set Open WebUI's Task Model to a non-`auto` model too. Toggle: `AUTO_FOOTER_ENABLED`. [LITELLM.md § The `auto` footer](../litellm/LITELLM.md#the-auto-footer).
 
 > The exact field names inside `route_diagnostics` are **not** verified — see [§ What is still unverified](#what-is-still-unverified).
@@ -357,12 +363,12 @@ Manual — there is no end-to-end suite. The overflow hook's logic has unit test
 | Check | How | Pass when |
 |---|---|---|
 | Stack comes up clean | `make up semantic-router` on a box with no `vllm_sr_*` volumes | init exits 0; router reports ready; envoy healthy |
-| Init guards work | Break a field in `config.yaml`, then the recreate in [§ Applying a config change](#applying-a-config-change) | init exits non-zero with the CLI's validation error and the router never starts |
-| Envoy drift guard works | Change `providers.models` in `config.yaml` without re-rendering, then the recreate | init fails with a unified diff naming the stale file |
-| Hook loaded | `docker logs litellm` after `make up litellm` | no import error for `overflow.handler`; first chain request is followed by `[overflow]` lines only when something spills |
+| Init guards work | Break a field in `config.yaml`, then `make up semantic-router FORCE=1` ([§ Applying a config change](#applying-a-config-change)) | init exits non-zero with the CLI's validation error and the router never starts |
+| Envoy drift guard works | Change `providers.models` in `config.yaml` without re-rendering, then `make up semantic-router FORCE=1` | init fails with a unified diff naming the stale file |
+| Hook loaded | `make logs litellm` after `make up litellm` | no import error for `overflow.handler`; first chain request is followed by `[overflow]` lines only when something spills |
 | Each decision answers | Postman `Envoy listener (direct)` folder, all four prompts | 200 with content; router log names `privacy_local` / `code` / `reasoning` / `general` |
 | Local first | One prompt per decision with both local models idle | spend log on the router's key shows only `openai/qwen3.8-solo` (or `openai/muse-glimmer` for `local-reasoning`) — **zero** Claude rows |
-| Busy spill to Claude is visible | Saturate both locals (e.g. 6+ parallel long `auto` chats plus a classifier batch — `qwen3.8-solo` has 3 sequences and `muse-glimmer` has 2 left over beside the classifier's 6), then send a `general` prompt | `[overflow] local-general: dropping …` lines for both local deployments in `docker logs litellm`, and a spend-log row on the router's key with model `anthropic/claude-sonnet-5` under model group `local-general` |
+| Busy spill to Claude is visible | Saturate both locals (e.g. 6+ parallel long `auto` chats plus a classifier batch — `qwen3.8-solo` has 3 sequences and `muse-glimmer` has 2 left over beside the classifier's 6), then send a `general` prompt | `[overflow] local-general: dropping …` lines for both local deployments in `make logs litellm`, and a spend-log row on the router's key with model `anthropic/claude-sonnet-5` under model group `local-general` |
 | Spill to the *other* local first | Saturate only `qwen3.8-solo`, send a `general` prompt | spend log shows `openai/muse-glimmer` under `local-general`, no Claude row |
 | `local-private` never shows Claude spend | Repeat the saturation test with a PII prompt (or call `local-private` directly) | the request waits (queues locally) and is answered by a local model; across **every** test, no spend-log row with model group `local-private` ever names a Claude model |
 | `local-private` fails closed | Stop both local vLLMs (`qwen3.8` up on the pair takes `muse-glimmer` down; stop `qwen3.8-solo`), send a PII prompt | an error, not an answer — and still no Claude row |
@@ -374,6 +380,7 @@ Manual — there is no end-to-end suite. The overflow hook's logic has unit test
 | Metrics | `curl localhost:9090` → prometheus targets | the `semantic-router` job is UP against `vllm-sr-router:9190` |
 | Exposure | `ss -ltnp` on the box | only `8025` (and `8026` on loopback if enabled); `50051` / `8080` / `9190` / `9901` absent |
 | Key rotation | Change `SEMANTIC_ROUTER_LISTENER_KEY`, `make up semantic-router && make up litellm` | old key 401s at Envoy; `auto` through LiteLLM still works |
+| LiteLLM swap mid-turn | Start a long `auto` chat, then edit a comment in `litellm_config.yaml` and `make up litellm` | the turn completes; Envoy's chain clusters point at `edge:14000`, which follows the swap |
 
 ---
 
@@ -424,6 +431,6 @@ The plan was written against the upstream article, which describes five looper a
 | Tool-bearing requests → static `qwen3.8` | no verified request-shape signal for `tools` | not implemented; **`auto` is a chat model, not an agent model** — keep MCP flows on a concrete alias |
 | `models-init` downloads the Vela bundles | no download subcommand exists in the CLI | the init service validates the config, enforces the Envoy re-render, substitutes the listener key, and seeds the volume; the router image downloads |
 | `vllm-sr config validate` | does not exist | `vllm-sr validate --config …` |
-| Envoy routes to one shared `litellm_cluster` (`STRICT_DNS`) | the generator emits one cluster per model, `LOGICAL_DNS` | left as generated |
+| Envoy routes to one shared `litellm_cluster` (`STRICT_DNS`) | the generator emits one cluster per model, `LOGICAL_DNS` | left as generated, pointed at the edge's internal `:14000` listener so the single pinned address survives LiteLLM swaps |
 | `models-init` needs egress | it has nothing to download | `network_mode: none` |
 | `envoy.yaml` bind-mounted from the repo | the listener key would have to be committed | rendered + substituted into the `vllm_sr_envoy` volume by the init service |

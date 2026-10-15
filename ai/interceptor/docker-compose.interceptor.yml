@@ -4,6 +4,8 @@ networks:
     name: ai_shared
 
 services:
+  # Recreated (with downtime) by `make up`: Chrome profile directories and the
+  # CDP debug-port pool belong to one process.
   interceptor:
     networks:
       - shared

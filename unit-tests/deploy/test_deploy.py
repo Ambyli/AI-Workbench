@@ -1516,7 +1516,9 @@ def test_litellm_has_a_published_tls_lan_bind_with_the_edge_certificate():
     assert litellm["binds"][0] == ("", 4001, "lan")  # deploy.py still reads the plain LAN port
     assert deploy.parse_edge_listens(EDGE_CFG_PATH.read_text(encoding="utf-8"))["litellm"] == "4001"
     ports = _edge_compose_service()["ports"]
-    assert "${PORT_LITELLM_TLS:-4443}:4443" in ports
+    # Host side 443 by default (one URL in and out of the office, EDGE.md §
+    # TLS); the listener inside the container stays :4443.
+    assert "${PORT_LITELLM_TLS:-443}:4443" in ports
     # The TLS bind is a LAN bind: both the allow-list and the per-key limit
     # are keyed on lan_bind, which must match it.
     assert "acl lan_bind so_name -m str lan lan-tls" in litellm["lines"]
@@ -1615,6 +1617,11 @@ def test_tls_env_vars_are_documented_and_reach_edge_certs_only():
     assert re.search(r"^CLOUDFLARE_DNS_API_TOKEN=$", env_example, re.M)
     assert re.search(r"^EDGE_TLS_DOMAIN=$", env_example, re.M)
     assert certs_env["EDGE_TLS_STAGING"] == "${EDGE_TLS_STAGING:-1}"
-    # PORT REGISTRY: 4443 is taken by nothing else.
+    # PORT REGISTRY: LiteLLM's TLS port is 443 on the host, and 443 is taken
+    # by nothing else.
+    assert re.search(r"^PORT_LITELLM_TLS=443\s", env_example, re.M)
     registry = re.findall(r"^PORT_[A-Z0-9_]+=(\d+)", env_example, re.M)
-    assert registry.count("4443") == 1
+    assert registry.count("443") == 1
+    # The documented example name is the tunnel's own public hostname
+    # (split-horizon: one name on and off the LAN, CLOUDFLARED.md).
+    assert "e.g. api.zeoenergy.com" in env_example

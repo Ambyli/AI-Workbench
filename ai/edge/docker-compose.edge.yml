@@ -35,9 +35,12 @@
 #                   chat.zeoenergy.com/edge/
 # Every published port rejects clients outside EDGE_ALLOWED_CIDRS (below).
 #
-# TLS: LiteLLM is also served over HTTPS on PORT_LITELLM_TLS (4443), with a
-# Let's Encrypt certificate that the `edge-certs` service below obtains by
-# DNS-01 through the Cloudflare API and keeps renewed. It shares the
+# TLS: LiteLLM is also served over HTTPS on PORT_LITELLM_TLS (host 443; the
+# listener inside the container is 4443), with a Let's Encrypt certificate for
+# EDGE_TLS_DOMAIN (api.zeoenergy.com: the tunnel's public name, which a LAN DNS
+# override points at this box -- split-horizon, EDGE.md § TLS) that the
+# `edge-certs` service below obtains by DNS-01 through the Cloudflare API and
+# keeps renewed. It shares the
 # certificate with the edge through the `edge_certs` volume (read-only here)
 # and pushes a renewed one into the running HAProxy through its runtime-API
 # socket in the `edge_api` volume -- no restart. See ai/edge/EDGE.md § TLS.
@@ -81,8 +84,10 @@ services:
     ports:
       # <operator PORT_* value>:<fixed listener in haproxy.cfg>
       - "${PORT_LITELLM}:4001"
-      # LiteLLM over TLS (the `lan-tls` bind; EDGE.md § TLS).
-      - "${PORT_LITELLM_TLS:-4443}:4443"
+      # LiteLLM over TLS (the `lan-tls` bind; EDGE.md § TLS). Host 443 by
+      # default, so the LAN URL is the same as the public one; the fixed
+      # listener inside the container is 4443.
+      - "${PORT_LITELLM_TLS:-443}:4443"
       - "${PORT_OAUTH2_PROXY}:4180"
       - "${PORT_KOKORO_API}:8004"
       - "${PORT_MADLAD_API}:8008"
@@ -156,8 +161,9 @@ services:
     # Encrypt (outbound HTTPS), and to HAProxy through the edge_api socket.
     # The project's default network gives it a route out and nothing else.
     environment:
-      # Hostname of the certificate, e.g. ai.zeoenergy.com. Empty = TLS
-      # listeners keep a self-signed placeholder for localhost.
+      # Hostname of the certificate, e.g. api.zeoenergy.com. Empty = TLS
+      # listeners keep a self-signed placeholder for localhost. Changing it
+      # requests a new lineage; the old one stays unused (EDGE.md § TLS).
       EDGE_TLS_DOMAIN: "${EDGE_TLS_DOMAIN:-}"
       # Let's Encrypt account e-mail; empty registers without one.
       EDGE_TLS_EMAIL: "${EDGE_TLS_EMAIL:-}"

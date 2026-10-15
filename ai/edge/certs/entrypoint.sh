@@ -135,6 +135,17 @@ renew() {
 }
 
 log "managing a $ca certificate for $domain (DNS-01 through the Cloudflare API)"
+# Lineages for other names (an earlier EDGE_TLS_DOMAIN) stay in the volume:
+# every certbot run below is scoped to --cert-name "$domain", and
+# edge_certs.py sync reads only live/$EDGE_TLS_DOMAIN, so they are never
+# renewed or served. Said once, so the operator knows they can go.
+for other in "$LE_DIR"/renewal/*.conf; do
+    if [ -f "$other" ] && [ "$other" != "$conf" ]; then
+        other=${other##*/}
+        other=${other%.conf}
+        log "an old certificate lineage for $other (not EDGE_TLS_DOMAIN) is left alone: never renewed, never served. To remove it: docker exec edge-certs certbot delete --cert-name $other --non-interactive"
+    fi
+done
 tick=0
 while :; do
     if [ ! -f "$conf" ]; then

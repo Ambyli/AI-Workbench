@@ -217,3 +217,82 @@ def test_main_usage_and_placeholder_name_check(capsys):
     assert ec.main([]) == 2
     assert ec.main(["placeholder", "bad/name"]) == 1
     assert "is not a hostname" in capsys.readouterr().out
+
+
+# ── changing EDGE_TLS_DOMAIN (EDGE.md § TLS, "Changing EDGE_TLS_DOMAIN") ────
+
+NEW_LEAF = b"new-leaf-der" * 20
+NEW_FULLCHAIN = block("CERTIFICATE", NEW_LEAF) + block("CERTIFICATE", INTER)
+
+
+def test_a_domain_change_serves_the_new_lineage_and_never_the_old_one(env, monkeypatch, capsys):
+    """The volume still holds the old name's lineage (live/ai.example, from the
+    fixture) and /certs/edge.pem still holds its certificate. EDGE_TLS_DOMAIN
+    now names api.example."""
+    pem_path = env / "certs" / "edge.pem"
+    old_pem = ec.build_pem(FULLCHAIN, PRIVKEY)
+    pem_path.write_bytes(old_pem)
+    haproxy = FakeHAProxy(fp=WANT)
+    monkeypatch.setattr(ec, "cli", haproxy)
+    monkeypatch.setenv("EDGE_TLS_DOMAIN", "api.example")
+
+    # Before the new name is issued: the hourly sync keeps what the edge
+    # serves and does not fall back to the old lineage it finds next door.
+    assert ec.sync() == 0
+    assert pem_path.read_bytes() == old_pem and haproxy.fp == WANT
+    assert haproxy.calls == ["show ssl cert /certs/edge.pem"]
+
+    # certbot issues the new lineage and runs the deploy hook for it.
+    new = env / "live" / "api.example"
+    new.mkdir()
+    (new / "fullchain.pem").write_bytes(NEW_FULLCHAIN)
+    (new / "privkey.pem").write_bytes(PRIVKEY)
+    new_pem = ec.build_pem(NEW_FULLCHAIN, PRIVKEY)
+    monkeypatch.setenv("RENEWED_LINEAGE", str(new))
+    assert ec.sync() == 0
+    assert pem_path.read_bytes() == new_pem
+    assert haproxy.fp == ec.fingerprint(new_pem) == hashlib.sha1(NEW_LEAF).hexdigest().upper()
+
+    # A renewal of the OLD lineage (a bare `certbot renew` run by hand) runs
+    # the same saved deploy hook; it must not put the old name back.
+    monkeypatch.setenv("RENEWED_LINEAGE", str(env / "live" / "ai.example"))
+    calls_before = len(haproxy.calls)
+    assert ec.sync() == 0
+    assert pem_path.read_bytes() == new_pem and len(haproxy.calls) == calls_before
+    assert "ignoring renewed certificate" in capsys.readouterr().out
+
+    # And the hourly sync afterwards is a no-op.
+    monkeypatch.delenv("RENEWED_LINEAGE")
+    assert ec.sync() == 0
+    assert haproxy.calls[-1] == "show ssl cert /certs/edge.pem"
+    assert pem_path.read_bytes() == new_pem
+
+
+def _shell_commands(script: str, program: str) -> list:
+    """Every command line of `program` in a sh script, continuation lines joined; comments skipped."""
+    out, current = [], None
+    for raw in script.splitlines():
+        line = raw.strip()
+        if current is None:
+            if not line.startswith(program + " "):
+                continue
+            current = ""
+        current += line.rstrip("\\") + " "
+        if not line.endswith("\\"):
+            out.append(" ".join(current.split()))
+            current = None
+    return out
+
+
+def test_entrypoint_scopes_every_certbot_run_to_the_current_name():
+    """An old lineage left in edge_letsencrypt after EDGE_TLS_DOMAIN changes
+    must never be renewed or re-requested by the loop: every certbot call names
+    the current lineage, and the renewal config checked is the current name's."""
+    script = (_ROOT / "ai" / "edge" / "certs" / "entrypoint.sh").read_text(encoding="utf-8")
+    runs = _shell_commands(script, "certbot")
+    assert {r.split()[1] for r in runs} == {"certonly", "renew"}, runs
+    for run in runs:
+        assert '--cert-name "$domain"' in run, run
+    assert "conf=$LE_DIR/renewal/$domain.conf" in script
+    # ... and it tells the operator how to remove a leftover lineage.
+    assert "certbot delete --cert-name $other --non-interactive" in script

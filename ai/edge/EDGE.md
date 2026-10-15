@@ -32,8 +32,11 @@ Config: [`haproxy.cfg`](haproxy.cfg). Image tag: `EDGE_HAPROXY_VERSION` in `.env
   - [Status page](#status-page)
   - [What is deliberately not behind the edge](#what-is-deliberately-not-behind-the-edge)
 - [TLS](#tls)
+  - [One name, two paths (split-horizon)](#one-name-two-paths-split-horizon)
   - [How it works](#how-it-works)
   - [Operator checklist](#operator-checklist)
+  - [Staging and production](#staging-and-production)
+  - [Changing `EDGE_TLS_DOMAIN`](#changing-edge_tls_domain)
   - [Renewal](#renewal)
   - [Rotating the Cloudflare token](#rotating-the-cloudflare-token)
   - [Giving another listener TLS](#giving-another-listener-tls)
@@ -225,7 +228,7 @@ service over TLS, [TLS](#tls)):
 | Host port (var, default) | Edge listener | Forwards to | Health check | Class | Timeout |
 |---|---|---|---|---|---|
 | `PORT_LITELLM` 4001 | 4001 | `litellm:4000` | `GET /health/liveliness` | swap | 900 s |
-| `PORT_LITELLM_TLS` 4443 | 4443 (TLS, `name lan-tls`) | `litellm:4000` (same backend) | same | swap | 900 s |
+| `PORT_LITELLM_TLS` 443 | 4443 (TLS, `name lan-tls`) | `litellm:4000` (same backend) | same | swap | 900 s |
 | `PORT_OAUTH2_PROXY` 4180 | 4180 | `oauth2-proxy:4180` | `GET /ping` | swap | 900 s |
 | `PORT_KOKORO_API` 8004 | 8004 | `kokoro-api:8000` | `GET /health` | swap | 300 s |
 | `PORT_MADLAD_API` 8008 | 8008 | `madlad-api:8000` | `GET /health` | swap | 300 s |
@@ -340,7 +343,7 @@ nothing else.
 
 ### Per-key concurrency limit
 
-On LiteLLM's **LAN** ports only (plain 4001 and TLS 4443, one shared count per
+On LiteLLM's **LAN** ports only (plain 4001 and TLS 443, one shared count per
 key), each API key may have
 `EDGE_LITELLM_MAX_CONCURRENT_PER_KEY` requests in flight (default 8, `0` turns
 it off). The next one gets `429`, `Retry-After: 10` and an OpenAI-style JSON
@@ -466,19 +469,56 @@ read it too; it shows backend addresses and health, no secrets.
 
 `PORT_LITELLM` (4001) is plain HTTP, so every LAN client's bearer key crosses
 the network in clear text. The edge now also serves LiteLLM over HTTPS on
-**`PORT_LITELLM_TLS` (4443)** with a publicly trusted Let's Encrypt
-certificate for a name such as `ai.zeoenergy.com` that resolves to the box's
-LAN address. Plain 4001 stays until clients have moved, then it is closed
-([Operator checklist](#operator-checklist), step 7).
+**`PORT_LITELLM_TLS` (host port 443)** with a publicly trusted Let's Encrypt
+certificate for **`api.zeoenergy.com`**: the same name off-LAN clients
+already use through the Cloudflare tunnel. Split-horizon DNS decides which
+path a client takes, so the URL is `https://api.zeoenergy.com` in and out of
+the office. Plain 4001 stays until clients have moved, then it is closed
+([Operator checklist](#operator-checklist), step 8).
 
-`ai.zeoenergy.com` is the example used throughout. The name is whatever
+`api.zeoenergy.com` is the value used throughout. The name is whatever
 `EDGE_TLS_DOMAIN` says in `.env`; nothing in the config hard-codes it.
+
+### One name, two paths (split-horizon)
+
+In public DNS, `api.zeoenergy.com` is the cloudflared tunnel's public
+hostname: a proxied record routed to `litellm:4000`. That stays exactly as it
+is. On the office LAN, a local DNS override on the router makes the same name
+resolve to the box (`192.168.5.240`), and LAN clients reach this edge
+directly.
+
+| | Off the LAN | On the office LAN |
+|---|---|---|
+| Resolves to | Cloudflare (the tunnel's proxied record) | `192.168.5.240` (router override) |
+| Certificate | Cloudflare's edge certificate | Let's Encrypt, from `edge-certs` |
+| Path | Cloudflare → tunnel → `litellm:4000` | edge `:443` (listener `:4443`) → `litellm:4000`, no Cloudflare |
+| Timeout | Cloudflare's ~100 s origin response timeout (`524`) | 900 s |
+| Allow-list, per-key limit | no | yes |
+| Headers | `server: cloudflare`, `cf-ray` | neither |
+
+A client can tell which path it took from the headers: the tunnel path adds
+`server: cloudflare` and `cf-ray`, the edge path neither.
+
+- **Never add an `A` record for `api` in Cloudflare.** It would collide with
+  the tunnel's record and break public access. The DNS-01 challenge does not
+  need one: it writes the TXT record `_acme-challenge.api.zeoenergy.com`, a
+  different name, which coexists with the tunnel's record.
+- **The override belongs on the office router** (or Pi-hole), so it applies
+  only on the office network. A hosts-file line is the per-machine fallback,
+  and it breaks the name on that laptop outside the office.
+- **On the box itself**, `curl` and containers resolve the public tunnel name
+  unless the box uses the router's override. Services there call
+  `litellm:4000` anyway; test the edge with `curl --resolve` (step 6).
+
+DNS records, the override and the DNS troubleshooting table are in
+[CLOUDFLARED.md § DNS-01 certificate for api.zeoenergy.com on the LAN
+edge](../cloudflared/CLOUDFLARED.md#dns-01-certificate-for-apizeoenergycom-on-the-lan-edge-split-horizon).
 
 ### How it works
 
 ```
 edge-certs  (certbot/dns-cloudflare:v5.8.0 + ai/edge/certs/)
-  certbot certonly / renew --dns-cloudflare
+  certbot certonly / renew --dns-cloudflare --cert-name <EDGE_TLS_DOMAIN>
      -> Cloudflare API: create TXT _acme-challenge.<EDGE_TLS_DOMAIN>, delete it after
      -> Let's Encrypt: checks the TXT record, issues the certificate
   edge_certs.py sync   (certbot's --deploy-hook, and again after every run)
@@ -488,7 +528,9 @@ edge-certs  (certbot/dns-cloudflare:v5.8.0 + ai/edge/certs/)
 
 - **The listener.** `listen litellm` has a third bind,
   `bind :4443 name lan-tls ssl crt /certs/edge.pem alpn h2,http/1.1`,
-  published as `${PORT_LITELLM_TLS:-4443}:4443`. It is a **LAN bind**: the
+  published as `${PORT_LITELLM_TLS:-443}:4443`: host port 443, while the
+  listener inside the container stays `:4443`, like every other fixed edge
+  listener. It is a **LAN bind**: the
   `EDGE_ALLOWED_CIDRS` 403 and the per-key limit are keyed on
   `acl lan_bind so_name -m str lan lan-tls`, so they apply to it exactly as to
   4001, and a key's requests on both ports share one count. The internal
@@ -543,11 +585,15 @@ edge-certs  (certbot/dns-cloudflare:v5.8.0 + ai/edge/certs/)
 - **Turned off.** With `EDGE_TLS_DOMAIN` or the token empty, `edge-certs`
   writes a self-signed placeholder for `localhost` (if no certificate file
   exists yet), logs one line (`TLS certificates are off: …`), and idles,
-  healthy. 4443 then serves that self-signed certificate, and nothing fails.
+  healthy. The TLS port then serves that self-signed certificate, and nothing
+  fails.
 - **State.** The account key, certificates and renewal configs live in the
   `edge_letsencrypt` volume (`/etc/letsencrypt`). The certificate lineage is
-  named after the domain (`--cert-name <EDGE_TLS_DOMAIN>`). Removing that
-  volume means issuing again, which counts against the weekly limits below.
+  named after the domain (`--cert-name <EDGE_TLS_DOMAIN>`), and every certbot
+  run is scoped to it, so lineages for other names can sit in the volume
+  unused ([Changing `EDGE_TLS_DOMAIN`](#changing-edge_tls_domain)). Removing
+  that volume means issuing again, which counts against the weekly limits
+  below.
 - **Not HAProxy's own ACME client.** HAProxy 3.4 has one, but it is
   experimental (`expose-experimental-directives`), its DNS-01 support needs
   the Data Plane API or another tool to talk to the DNS provider, and it keeps
@@ -556,85 +602,108 @@ edge-certs  (certbot/dns-cloudflare:v5.8.0 + ai/edge/certs/)
 
 ### Operator checklist
 
-1. **Cloudflare: token and DNS record.** Create an API token from the
-   **Edit zone DNS** template, limited to the one zone, and an `A` record `ai`
-   → `192.168.5.240` with proxy status **DNS only** (grey cloud). The step by
-   step, with the DNS-rebind check, is in [CLOUDFLARED.md § DNS-01 certificate
-   for the LAN edge](../cloudflared/CLOUDFLARED.md#dns-01-certificate-for-the-lan-edge-aizeoenergycom).
-   This uses Cloudflare's DNS and API only: LAN traffic never goes through
-   Cloudflare or the tunnel.
-2. **`.env`**: the Edge TLS block of `.env.example`, and the `PORT REGISTRY`
+For `api.zeoenergy.com` on this box. Commands run on the box, from the repo
+root, unless they say otherwise.
+
+1. **Cloudflare API token.** Unchanged if you already have one: the **Edit
+   zone DNS** template, scoped to the `zeoenergy.com` zone only, in the box's
+   `.env` as `CLOUDFLARE_DNS_API_TOKEN`. Step by step in [CLOUDFLARED.md § The
+   API token](../cloudflared/CLOUDFLARED.md#the-api-token). **Do not touch the
+   existing `api` tunnel record**, and do not add an `A` record for `api`:
+   public DNS stays exactly as it is
+   ([why](../cloudflared/CLOUDFLARED.md#never-add-an-a-record-for-api)).
+2. **Check that host port 443 is free.**
+   ```bash
+   sudo ss -ltnp 'sport = :443'
+   ```
+   Only the header line means it is free. If something listens (a host nginx
+   or Caddy, another container), move it, or choose another port for
+   `PORT_LITELLM_TLS` in step 3, such as `8443`. Then the LAN URL needs the
+   port (`https://api.zeoenergy.com:8443`) while the off-LAN URL has none, so
+   a laptop that moves between the office and elsewhere no longer has one
+   URL. (Cloudflare's proxy also accepts HTTPS on 8443, so that URL may work
+   through the tunnel too; check it from outside the office before relying on
+   it.)
+3. **`.env`**: the Edge TLS block of `.env.example`, and the `PORT REGISTRY`
    row.
    ```bash
-   EDGE_TLS_DOMAIN=ai.zeoenergy.com
+   EDGE_TLS_DOMAIN=api.zeoenergy.com
+   PORT_LITELLM_TLS=443
    EDGE_TLS_EMAIL=you@zeoenergy.com
-   EDGE_TLS_STAGING=1
+   EDGE_TLS_STAGING=1          # or 0: see below
    CLOUDFLARE_DNS_API_TOKEN=<the token from step 1>
-   PORT_LITELLM_TLS=4443        # 443 works too, if nothing on the box binds it
    ```
-3. **Deploy and check on staging.**
+   `EDGE_TLS_STAGING=1` (Let's Encrypt's staging CA: untrusted certificate,
+   generous rate limits) is the safe first run on a new box. It proves the
+   token, the zone and the DNS-01 wait without spending production quota.
+   This box has already proven that pipeline on staging (for the earlier name
+   `ai.zeoenergy.com`, with the same token and zone), so going straight to
+   `EDGE_TLS_STAGING=0` is reasonable here. Production allows 5 certificates
+   per exact name per week and 5 failed validations per name per hour: if a
+   production run fails, fix the cause before retrying
+   ([Staging and production](#staging-and-production)).
+4. **Deploy.**
    ```bash
-   make up edge     # deploys edge-certs, waits for it, recreates the edge (new port, new volumes)
-   make logs edge edge-certs FOLLOW=0     # expect "the running edge now serves /certs/edge.pem ..."
-   curl -vk https://ai.zeoenergy.com:4443/health/liveliness
+   make up edge
+   make logs edge edge-certs FOLLOW=0
    ```
-   `-k` is needed because a staging certificate is untrusted. The `-v` output
-   should show an issuer with `(STAGING)` in it and a `subjectAltName` matching
-   `ai.zeoenergy.com`. `docker exec edge-certs python3
-   /edge-certs/edge_certs.py status` compares the file on disk with what the
-   edge serves.
-4. **Staging → production.** Set `EDGE_TLS_STAGING=0` in `.env`, then
-   `make up edge`. The changed variable recreates `edge-certs`. On start it
-   sees that the lineage's renewal config names a staging `server`, and runs
-   `certbot certonly --force-renewal` against production into the **same**
-   lineage. That also rewrites the saved `server`, so later renewals stay on
-   production. The deploy hook pushes the new certificate; the log says
-   `replacing it with a production one`, then `now serves`.
+   The changed variables recreate `edge-certs`, and the changed port
+   recreates the edge (a second or two of downtime on every LAN port of the
+   edge). `edge-certs` logs `requesting a … certificate for
+   api.zeoenergy.com`, then about a minute later `wrote the certificate for
+   api.zeoenergy.com …` and `the running edge now serves /certs/edge.pem …`.
+   Until then the edge serves whatever `/certs/edge.pem` held before (on this
+   box, the old `ai.zeoenergy.com` certificate), so a name mismatch in that
+   first minute is expected. Expect one more line saying the old
+   `ai.zeoenergy.com` lineage is left alone
+   ([Changing `EDGE_TLS_DOMAIN`](#changing-edge_tls_domain)).
+   `docker exec edge-certs python3 /edge-certs/edge_certs.py status` compares
+   the file on disk with what the edge serves.
+5. **Router DNS override:** `api.zeoenergy.com` → `192.168.5.240` in the
+   office router's local DNS, or Pi-hole. A hosts-file line only as a
+   per-machine fallback. Details and the hosts-file warning:
+   [CLOUDFLARED.md § The LAN override](../cloudflared/CLOUDFLARED.md#the-lan-override).
+6. **Verify, from a LAN laptop and from the box.**
+   ```bash
+   # LAN laptop (on Windows: curl.exe, and -o NUL)
+   nslookup api.zeoenergy.com        # 192.168.5.240
+   curl -sS -D - -o /dev/null https://api.zeoenergy.com/health/liveliness
 
-   Nothing has to be deleted. The staging certificates stay in `archive/` as
-   older versions of the lineage, and the staging account under
-   `/etc/letsencrypt/accounts/acme-staging-v02.api.letsencrypt.org/` is simply
-   never used again. For a clean slate instead (or after changing
-   `EDGE_TLS_DOMAIN`), delete the lineage **after** setting
-   `EDGE_TLS_STAGING=0`:
-   ```bash
-   docker exec edge-certs certbot delete --cert-name ai.zeoenergy.com --non-interactive
-   docker exec edge-certs rm -rf /etc/letsencrypt/accounts/acme-staging-v02.api.letsencrypt.org   # optional
-   docker restart edge-certs      # no lineage left: it requests a production certificate
-   ```
-   `certbot delete` removes the lineage's `live/`, `archive/` and renewal
-   config. It does not revoke anything, and it leaves `/certs/edge.pem` alone,
-   so the edge keeps serving the staging certificate until the new one arrives.
-   Each production issuance counts against Let's Encrypt's limit of 5
-   certificates per exact name per week, so do not flip back and forth.
-   Setting `EDGE_TLS_STAGING=1` again later keeps an existing production
-   certificate, and logs that it does.
-5. **Check without `-k`.**
-   ```bash
-   curl -sS https://ai.zeoenergy.com:4443/health/liveliness
-   echo | openssl s_client -connect ai.zeoenergy.com:4443 -servername ai.zeoenergy.com 2>/dev/null \
+   # the box
+   curl -sS --resolve api.zeoenergy.com:443:127.0.0.1 https://api.zeoenergy.com/health/liveliness
+   echo | openssl s_client -connect 127.0.0.1:443 -servername api.zeoenergy.com 2>/dev/null \
      | openssl x509 -noout -issuer -ext subjectAltName -enddate
    ```
-   The first must succeed with no certificate error. The issuer is a Let's
-   Encrypt intermediate without `(STAGING)`. Run both from a LAN laptop, not
-   only on the box.
-6. **Move clients** to `https://ai.zeoenergy.com:4443`. The paths and keys are
-   the same.
-   - **Claude Code:** `ANTHROPIC_BASE_URL=https://ai.zeoenergy.com:4443` in the
+   Both curls must succeed with no certificate error, and the laptop's must
+   show **no** `cf-ray` header: one means the request went through
+   Cloudflare, because the override is not in effect for that client. The
+   issuer is a Let's Encrypt intermediate. `(STAGING)` in it means
+   `EDGE_TLS_STAGING=1`: curl then needs `-k` until you switch to
+   [production](#staging-and-production). From off the LAN (a phone hotspot)
+   the same URL still answers, through the tunnel, with `cf-ray`.
+7. **Clients keep `https://api.zeoenergy.com`.** Anything that already uses
+   it changes nothing: in the office it now takes the edge, elsewhere the
+   tunnel. That includes `config.json`'s `LLM_URL`. Clients still on plain
+   `http://<box>:4001` or `http://localhost:4001` move to it; the paths and
+   keys are the same.
+   - **Claude Code:** `ANTHROPIC_BASE_URL=https://api.zeoenergy.com` in the
      `env` block of `~/.claude/settings.json`, or in the shell. Node trusts
      Let's Encrypt out of the box.
    - **n8n credentials:** n8n's built-in default (`N8N_AI_OPENAI_API_BASE`,
      `http://litellm:4000/v1`) never crosses the LAN and stays as it is. A
      credential someone pointed at the box's LAN address on 4001 moves to
-     `https://ai.zeoenergy.com:4443/v1`, or better to `http://litellm:4000/v1`,
-     which stays inside Docker and is not subject to the LAN per-key limit.
+     `http://litellm:4000/v1`, which stays inside Docker and is not subject to
+     the LAN per-key limit. (`https://api.zeoenergy.com/v1` works too, but n8n
+     runs on the box, which may resolve the public name and take the tunnel.)
    - **`CLASSIFIER_BASE_URL`** (the classifier test scripts' `.env` setting):
-     `https://ai.zeoenergy.com:4443`. Python `requests` and `httpx` trust
+     `https://api.zeoenergy.com`. Python `requests` and `httpx` trust
      Let's Encrypt through `certifi`.
    - **Postman:** set the `litellm` collection variable to
-     `https://ai.zeoenergy.com:4443`.
-   - Anything else still on `http://<box>:4001`.
-7. **Later: close plain 4001.** First check that nobody still uses it. In
+     `https://api.zeoenergy.com`.
+   - Off the LAN, the same clients take the tunnel, where Cloudflare cuts a
+     response that takes longer than ~100 s (`524`). Long non-streamed calls
+     belong on the LAN.
+8. **Later: close plain 4001.** First check that nobody still uses it. In
    HAProxy's request log the frontend field reads `litellm` for plain HTTP and
    `litellm~` for TLS, so
    `docker logs --since 24h edge 2>&1 | grep ' litellm litellm/'` lists the
@@ -646,11 +715,73 @@ edge-certs  (certbot/dns-cloudflare:v5.8.0 + ai/edge/certs/)
      repo-invariant tests read it), and set `acl lan_bind so_name -m str lan`
      (the tests require it to list exactly the section's LAN bind names);
    - in `docker-compose.edge.yml`, replace the `${PORT_LITELLM}:4001` and
-     `${PORT_LITELLM_TLS:-4443}:4443` lines with one
-     `${PORT_LITELLM_TLS:-4443}:4443`;
+     `${PORT_LITELLM_TLS:-443}:4443` lines with one
+     `${PORT_LITELLM_TLS:-443}:4443`;
    - update the `PORT_LITELLM` rows of `.env.example`, `CLAUDE.md` and
      `ai/AI_INFRA.md`;
    - `make up edge` (a recreate, since the published ports changed).
+
+### Staging and production
+
+To move from a staging certificate to production, set `EDGE_TLS_STAGING=0`
+in `.env`, then `make up edge`. The changed variable recreates `edge-certs`.
+On start it sees that the lineage's renewal config names a staging `server`,
+and runs `certbot certonly --force-renewal` against production into the
+**same** lineage. That also rewrites the saved `server`, so later renewals
+stay on production. The deploy hook pushes the new certificate; the log says
+`replacing it with a production one`, then `now serves`.
+
+Nothing has to be deleted. The staging certificates stay in `archive/` as
+older versions of the lineage, and the staging account under
+`/etc/letsencrypt/accounts/acme-staging-v02.api.letsencrypt.org/` is simply
+never used again. For a clean slate instead, delete the lineage **after**
+setting `EDGE_TLS_STAGING=0`:
+```bash
+docker exec edge-certs certbot delete --cert-name api.zeoenergy.com --non-interactive
+docker exec edge-certs rm -rf /etc/letsencrypt/accounts/acme-staging-v02.api.letsencrypt.org   # optional
+docker restart edge-certs      # no lineage left: it requests a production certificate
+```
+`certbot delete` removes the lineage's `live/`, `archive/` and renewal
+config. It does not revoke anything, and it leaves `/certs/edge.pem` alone,
+so the edge keeps serving the staging certificate until the new one arrives.
+Each production issuance counts against Let's Encrypt's limit of 5
+certificates per exact name per week, so do not flip back and forth.
+Setting `EDGE_TLS_STAGING=1` again later keeps an existing production
+certificate, and logs that it does.
+
+### Changing `EDGE_TLS_DOMAIN`
+
+This box went from `ai.zeoenergy.com` to `api.zeoenergy.com`. Changing the
+name is: set the new value in `.env`, then `make up edge`. Nothing has to be
+deleted first.
+
+- **A new lineage.** The changed variable recreates `edge-certs`. It looks
+  for `renewal/<new name>.conf`, finds none, and requests a certificate for
+  the new name into a new lineage (`--cert-name <new name>`), on staging or
+  production as `EDGE_TLS_STAGING` says.
+- **Written and pushed.** The deploy hook builds the PEM from
+  `live/<new name>/`, writes it to `/certs/edge.pem` and pushes it into the
+  running edge. If the edge is being recreated at that moment (a new
+  `PORT_LITELLM_TLS` in the same change), it loads the file when it starts,
+  and the hourly check pushes anything missed.
+- **The old lineage is left alone.** It stays in `edge_letsencrypt`, never
+  renewed and never served. Every certbot run in the loop is scoped to
+  `--cert-name <EDGE_TLS_DOMAIN>`, `edge_certs.py sync` reads only
+  `live/<EDGE_TLS_DOMAIN>/`, and a deploy hook for any other lineage (say a
+  bare `certbot renew` run by hand) logs `ignoring renewed certificate` and
+  changes nothing. `unit-tests/deploy/test_edge_certs.py` pins all three. On
+  start, `edge-certs` logs one line for each such lineage.
+- **Until the new certificate arrives** (about a minute, or longer if
+  issuance fails), the edge keeps serving what `/certs/edge.pem` already
+  held, the old name's certificate, and clients see a name mismatch.
+- **Optional cleanup**, once the new certificate is served:
+  ```bash
+  docker exec edge-certs certbot delete --cert-name ai.zeoenergy.com --non-interactive
+  ```
+  It removes the old lineage's `live/`, `archive/` and renewal config, and
+  revokes nothing. Until then, a bare `docker exec edge-certs certbot renew
+  --dry-run` also rehearses the old name: harmless, or add
+  `--cert-name api.zeoenergy.com` to skip it.
 
 ### Renewal
 
@@ -707,9 +838,11 @@ too, and `edge-certs` does not do that yet: it requests exactly one name.
 | `Error … 1009`, `Does your API token have "Zone:DNS:Edit" permissions?` | The token can read the zone but not edit its DNS. Recreate it from the **Edit zone DNS** template. |
 | Cloudflare API `429` / rate limited | Cloudflare's per-user API limit, reachable only if something else uses the same token heavily. Give `edge-certs` its own token. |
 | Let's Encrypt `too many certificates (5) already issued for this exact set of identifiers`, or `too many failed authorizations` | Production rate limits: 5 certificates per exact name per 7 days, 5 failed authorizations per name per hour. Wait for the window (the error says when), and test on staging (`EDGE_TLS_STAGING=1`, much higher limits). Never wipe `edge_letsencrypt` to retry. |
-| `curl: (6) Could not resolve host` on the LAN, while `nslookup ai.zeoenergy.com 1.1.1.1` works | The router's DNS-rebind protection drops a public answer that points at a private address. Whitelist the name in the router, give it a local DNS override (`ai.zeoenergy.com` → `192.168.5.240`), or add an `/etc/hosts` line per client. [CLOUDFLARED.md](../cloudflared/CLOUDFLARED.md#dns-01-certificate-for-the-lan-edge-aizeoenergycom) has the check. |
-| `curl: (60) SSL certificate problem: unable to get local issuer certificate` | Still the **staging** certificate, whose roots are in no trust store: do step 4. Or still the placeholder: TLS is off (`EDGE_TLS_DOMAIN` or the token empty), or the first issuance failed. Read `make logs edge edge-certs`. |
-| `curl: (60) … no alternative certificate subject name matches` | The client used an IP address or another name. Use `https://<EDGE_TLS_DOMAIN>:4443`. |
+| On the LAN, responses carry `cf-ray` and `server: cloudflare`; requests work but slowly, and long ones fail with a `524` after about 100 s | The client resolves `api.zeoenergy.com` publicly and goes through the tunnel: the LAN override is missing for it (no router entry, a hard-coded resolver, DNS-over-HTTPS, or a stale DNS cache). [CLOUDFLARED.md § Troubleshooting DNS](../cloudflared/CLOUDFLARED.md#troubleshooting-dns). |
+| Outside the office, `api.zeoenergy.com` times out | A stale hosts-file line still pins the name to `192.168.5.240`, which is unreachable there. Remove it; use the router override instead. |
+| `make up edge` fails with `Bind for 0.0.0.0:443 failed: port is already allocated` or `address already in use` | Something else holds host port 443: `sudo ss -ltnp 'sport = :443'`. Move it, or set another `PORT_LITELLM_TLS` ([checklist](#operator-checklist), step 2). |
+| `curl: (60) SSL certificate problem: unable to get local issuer certificate` | Still the **staging** certificate, whose roots are in no trust store: see [Staging and production](#staging-and-production). Or still the placeholder: TLS is off (`EDGE_TLS_DOMAIN` or the token empty), or the first issuance failed. Read `make logs edge edge-certs`. |
+| `curl: (60) … no alternative certificate subject name matches` | The client used an IP address or another name: use `https://<EDGE_TLS_DOMAIN>` (`https://api.zeoenergy.com`). Or the edge still serves the certificate of an earlier `EDGE_TLS_DOMAIN` because the new one has not been issued yet: read `make logs edge edge-certs` ([Changing `EDGE_TLS_DOMAIN`](#changing-edge_tls_domain)). |
 | The edge restarts in a loop with `unable to stat SSL certificate from file '/certs/edge.pem'`, or `cannot bind UNIX socket … /run/haproxy-api/admin.sock` | The edge was started without `edge-certs` (for example `docker compose up --no-deps edge`), so the certificate file or the socket directory's permissions are missing. Run `make up edge`. |
 | `edge_certs.py status` says `NO` | The last push failed; its error is in the log above. `docker exec edge-certs python3 /edge-certs/edge_certs.py sync` retries now, and a `make up edge` reload also makes the edge load the file. |
 | A client (Claude Code, Python) rejects the certificate | Still the staging certificate (above), or a TLS-inspecting proxy between the client and the box. LAN traffic should not cross one. |
@@ -1051,8 +1184,9 @@ check.
     its `success_callback` list, which `litellm_config.yaml` does not set.
     `https://chat.zeoenergy.com/edge/` shows the stats page after Google
     sign-in, with no admin buttons.
-11. **TLS:** steps 3 and 5 of [TLS § Operator checklist](#operator-checklist),
+11. **TLS:** steps 4 and 6 of [TLS § Operator checklist](#operator-checklist),
     then `docker exec edge-certs python3 /edge-certs/edge_certs.py status`
     (`match: yes`). The TLS port shares the allow-list and the per-key limit,
     so steps 8 and 9 give the same `403` and `429` on
-    `https://<EDGE_TLS_DOMAIN>:4443`.
+    `https://api.zeoenergy.com` (from a LAN client with the override, or on the
+    box with `curl --resolve api.zeoenergy.com:443:127.0.0.1`).

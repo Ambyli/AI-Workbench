@@ -6,9 +6,12 @@ Cloudflare Zero Trust tunnel. No inbound firewall rule, no public IP.
 Compose file: [`docker-compose.cloudflared.yml`](docker-compose.cloudflared.yml).
 Config: `CLOUDFLARE_TUNNEL_TOKEN` in `.env`.
 
-Separately, the LAN edge's TLS certificate uses Cloudflare's DNS and API (not
-the tunnel) with its own token, `CLOUDFLARE_DNS_API_TOKEN`: see
-[DNS-01 certificate for the LAN edge](#dns-01-certificate-for-the-lan-edge-aizeoenergycom).
+`api.zeoenergy.com` is split-horizon: off the LAN it is this tunnel's public
+hostname, and on the office LAN a local DNS override sends the same name to
+the LAN edge, whose Let's Encrypt certificate uses Cloudflare's DNS and API
+(not the tunnel) with its own token, `CLOUDFLARE_DNS_API_TOKEN`: see
+[DNS-01 certificate for api.zeoenergy.com on the LAN edge](#dns-01-certificate-for-apizeoenergycom-on-the-lan-edge-split-horizon).
+**Never add an `A` record for `api`** in the zone.
 
 Ingress rules (which hostname maps to which origin) live in the **Cloudflare
 Zero Trust dashboard**, not in this repo. The token identifies the tunnel; the
@@ -115,7 +118,7 @@ host-targeted ingress rule breaks.
 | Hostname | Origin | Notes |
 |---|---|---|
 | `chat.zeoenergy.com` | `http://oauth2-proxy:4180` | SSO front door for Open WebUI, `/sandboxes/*`, `/n8n/*` |
-| `api.zeoenergy.com` | `http://litellm:4000` | **Bypasses oauth2-proxy** — LiteLLM's own key auth is the only gate |
+| `api.zeoenergy.com` | `http://litellm:4000` | **Bypasses oauth2-proxy** — LiteLLM's own key auth is the only gate. Off-LAN path only: on the office LAN the same name resolves to the box and reaches the LAN edge instead ([split-horizon](#dns-01-certificate-for-apizeoenergycom-on-the-lan-edge-split-horizon)). Leave its DNS record alone; never add an `A` record for `api` |
 | `rdp.zeoenergy.com` | `tcp://host.docker.internal:3389` | RDP listens on the host, not in Docker |
 | _(catch-all)_ | `http_status:404` | |
 
@@ -158,21 +161,42 @@ paths, which Cloudflare never caches by default.
 
 ---
 
-## DNS-01 certificate for the LAN edge (ai.zeoenergy.com)
+## DNS-01 certificate for api.zeoenergy.com on the LAN edge (split-horizon)
 
-**This section is not about the tunnel.** It uses Cloudflare's **DNS** and its
-**API**, and nothing in `cloudflared`.
+**This section is about Cloudflare's DNS and its API, not about the tunnel's
+connector**, even though the name is the tunnel's own public hostname.
 
-The LAN edge ([`ai/edge`](../edge/EDGE.md)) serves LiteLLM over HTTPS on port
-`4443` with a Let's Encrypt certificate for the name in `EDGE_TLS_DOMAIN`,
-`ai.zeoenergy.com` here. Its `edge-certs` container gets that certificate with
-a **DNS-01** challenge: it creates the TXT record
-`_acme-challenge.ai.zeoenergy.com` through the Cloudflare API, Let's Encrypt
-reads it from Cloudflare's nameservers, and the record is deleted again. LAN
-clients connect straight to the box's LAN address: their traffic never passes
-through Cloudflare or the tunnel. The full checklist (`.env`, `make up edge`,
-staging → production, moving clients) is in
-[EDGE.md § TLS](../edge/EDGE.md#tls); the two Cloudflare steps are here.
+`api.zeoenergy.com` is **one name with two paths**. In public DNS it is the
+tunnel's public hostname ([Current ingress rules](#current-ingress-rules)):
+Cloudflare answers, terminates TLS, and the tunnel carries the request to
+`litellm:4000`. On the office LAN, a local DNS override makes the same name
+resolve to the box, `192.168.5.240`, so clients reach the LAN edge
+([`ai/edge`](../edge/EDGE.md)) directly on port 443. The edge serves LiteLLM
+there with a Let's Encrypt certificate for the same name. A client uses
+`https://api.zeoenergy.com` everywhere; where it is decides the path.
+
+| | Off the LAN | On the office LAN |
+|---|---|---|
+| `api.zeoenergy.com` resolves to | Cloudflare's addresses (the proxied tunnel record) | `192.168.5.240` (the router's local override) |
+| TLS certificate | Cloudflare's edge certificate | Let's Encrypt, kept by `edge-certs` |
+| Path | Cloudflare → tunnel → `litellm:4000` | edge `:443` → `litellm:4000`, no Cloudflare |
+| Response timeout | Cloudflare's ~100 s origin response timeout (a `524` past it) | the edge's 900 s |
+| Edge allow-list and per-key limit | no: the tunnel calls `litellm:4000` directly | yes ([EDGE.md](../edge/EDGE.md#lan-allow-list)) |
+| Response headers | `server: cloudflare` and `cf-ray` | neither |
+
+**Which path did a client take?** Look at the response headers: the tunnel
+path always adds `server: cloudflare` and a `cf-ray` header; the edge path has
+neither.
+
+The edge's `edge-certs` container gets the certificate with a **DNS-01**
+challenge. It creates the TXT record `_acme-challenge.api.zeoenergy.com`
+through the Cloudflare API, Let's Encrypt reads it from Cloudflare's
+nameservers, and the record is deleted again. `_acme-challenge.api` is a
+different name from `api`, so the TXT record sits next to the tunnel's record
+without touching it. Issuance needs no `A` record, and Let's Encrypt never
+reaches the box. The full checklist (`.env`, port 443, `make up edge`,
+moving clients) is in [EDGE.md § TLS](../edge/EDGE.md#tls); the Cloudflare
+and DNS steps are here.
 
 ### The API token
 
@@ -197,50 +221,88 @@ staging → production, moving clients) is in
 This token has nothing to do with `CLOUDFLARE_TUNNEL_TOKEN` above: that one
 identifies the tunnel, this one edits DNS records.
 
-### The DNS record
+### Never add an `A` record for `api`
 
-Cloudflare dashboard → `zeoenergy.com` → **DNS** → **Records** → **Add
-record**:
+The tunnel already owns `api.zeoenergy.com` in the zone: a proxied (orange
+cloud) record pointing at the tunnel, created by its public hostname in the
+Zero Trust dashboard. **Leave that record and the public hostname exactly as
+they are.**
 
-| Type | Name | IPv4 address | Proxy status | TTL |
-|---|---|---|---|---|
-| `A` | `ai` | `192.168.5.240` | **DNS only** (grey cloud) | Auto |
+- **Do not add an `A` or `AAAA` record named `api`**, grey cloud or orange. It
+  collides with the tunnel's record. Cloudflare refuses a second record next
+  to a `CNAME`, and replacing the tunnel's record to make room would send
+  every off-LAN client to a private address it cannot reach: public access to
+  LiteLLM breaks.
+- **Do not create `_acme-challenge.api` by hand.** `edge-certs` creates and
+  deletes it on every issuance and renewal.
+- Public DNS never contains the box's private address. The LAN override below
+  is the only place `192.168.5.240` appears.
 
-- **DNS only, never proxied.** An orange-cloud record would answer with
-  Cloudflare's addresses, and Cloudflare's proxy would then try to reach
-  `192.168.5.240` from the internet. It cannot, because that is a private
-  address, so every client would get a Cloudflare error page. And LAN traffic
-  would leave the building.
-- **No tunnel public hostname for this name.** One would create a proxied
-  CNAME for `ai.zeoenergy.com` that clashes with this record.
-- The record is what clients resolve. Issuance does not need it: DNS-01 only
-  uses the TXT record `edge-certs` creates and deletes. It does publish the
-  box's private address to anyone who looks the name up, which says little
-  but is not nothing.
+### The LAN override
 
-### Check DNS-rebind protection
+Make `api.zeoenergy.com` resolve to `192.168.5.240` **on the office network
+only**. Override this one name, never the whole zone: `chat.zeoenergy.com` and
+everything else must keep resolving publicly.
 
-Many routers and LAN resolvers drop a public DNS answer that points at a
-private address (DNS-rebinding protection). From a **LAN laptop**, not the
-box:
+1. **Preferred: the office router's local DNS.** Depending on the router it is
+   called a host override, static DNS entry, local DNS record or DNS rewrite;
+   on Pi-hole it is **Local DNS → DNS Records**. Examples: Unbound on pfSense
+   or OPNsense, a host override with host `api`, domain `zeoenergy.com`, IP
+   `192.168.5.240`; dnsmasq, `host-record=api.zeoenergy.com,192.168.5.240`.
+   It applies only to clients using the office resolver, so a laptop that
+   leaves the office falls back to public DNS and the tunnel path, with
+   nothing to change on the laptop.
+   - The client must actually use the router as its DNS server. A machine with
+     a hard-coded resolver (`8.8.8.8`, `1.1.1.1`) or DNS-over-HTTPS turned on
+     in the OS or the browser bypasses the override and takes the tunnel path.
+2. **Fallback: a hosts-file line on one machine**, in
+   `C:\Windows\System32\drivers\etc\hosts` (edit as Administrator) or
+   `/etc/hosts`:
+   ```
+   192.168.5.240  api.zeoenergy.com
+   ```
+   **The line travels with the machine.** Outside the office the laptop still
+   sends `api.zeoenergy.com` to `192.168.5.240`, a private address it cannot
+   reach there, so every call fails instead of going through the tunnel.
+   Remove the line before leaving, or use the router override instead.
+3. **On the box itself,** `curl` and the containers use the box's resolver,
+   so they resolve the public tunnel name unless the box is pointed at the
+   router's override. That is fine: services on the box call `litellm:4000`
+   by Docker DNS and never need the name. To test the edge from the box, pin
+   the name with `curl --resolve` (below); don't edit the box's `/etc/hosts`.
+
+### Verify
+
+From a **LAN laptop** (on Windows use `curl.exe` and `-o NUL`):
 
 ```bash
-nslookup ai.zeoenergy.com            # the LAN's resolver
-nslookup ai.zeoenergy.com 1.1.1.1    # a public resolver, for comparison
+nslookup api.zeoenergy.com           # expect 192.168.5.240
+curl -sS -D - -o /dev/null https://api.zeoenergy.com/health/liveliness
 ```
 
-(On Windows PowerShell, `Resolve-DnsName ai.zeoenergy.com` works too.) Both
-must answer `192.168.5.240`. If the public resolver does and the LAN's does not
-(no answer, `NXDOMAIN`, or `Server failed`), the LAN resolver is filtering it.
-Fix it on the router or LAN DNS server, in order of preference:
+Expect `200`, no certificate error, and **no** `cf-ray` or
+`server: cloudflare` header. (`curl -sSI` shows the same headers with a HEAD
+request, which a GET-only LiteLLM route may answer with `405`; the headers
+tell the path either way.)
 
-1. **A local DNS override** (a host override / static DNS entry):
-   `ai.zeoenergy.com` → `192.168.5.240`. LAN clients then do not depend on
-   public DNS at all.
-2. **Exempt the domain** from rebind protection: for example
-   `rebind-domain-ok=/zeoenergy.com/` in dnsmasq, or `private-domain:
-   "zeoenergy.com"` in Unbound (pfSense / OPNsense custom options).
-3. For one machine only: `192.168.5.240 ai.zeoenergy.com` in its hosts file.
+From the **box**, bypassing whatever the box resolves:
+
+```bash
+curl -sS --resolve api.zeoenergy.com:443:127.0.0.1 https://api.zeoenergy.com/health/liveliness
+```
+
+From **off the LAN** (a phone hotspot), the same URL must still work, now
+with `cf-ray` in the headers: the tunnel path is untouched.
+
+### Troubleshooting DNS
+
+| Symptom | Cause and fix |
+|---|---|
+| On the LAN, responses carry `cf-ray` and `server: cloudflare`. Requests work, but slowly; long ones fail with a `524` after about 100 s, and the LAN per-key limit never applies | The override is missing for this client: `nslookup api.zeoenergy.com` returns Cloudflare addresses. Check the router entry, check that the client uses the router as its DNS server (no hard-coded resolver, no DNS-over-HTTPS), then flush the client's cache (`ipconfig /flushdns`, `sudo resolvectl flush-caches`). |
+| Outside the office, `api.zeoenergy.com` times out (`Failed to connect to api.zeoenergy.com port 443`) | A stale hosts-file line still pins the name to `192.168.5.240`. Remove it and flush the DNS cache. |
+| On the LAN, `Failed to connect … port 443: Connection refused` | The edge does not publish 443: `PORT_LITELLM_TLS` is not `443` in the box's `.env`, or the edge was not recreated since. `make up edge`. |
+| On the LAN, a certificate error | The edge still serves the staging certificate, the placeholder, or a certificate for an old name. See [EDGE.md § Troubleshooting TLS](../edge/EDGE.md#troubleshooting-tls). |
+| Off the LAN, `api.zeoenergy.com` stopped working after a DNS change | Someone added or changed a record named `api`. Delete the `A` record and restore the tunnel's public hostname in the Zero Trust dashboard ([above](#never-add-an-a-record-for-api)). |
 
 ### What the token can and cannot do
 

@@ -1102,6 +1102,15 @@ class Deployer:
                     f"the running edge has no backend '{name}' although {EDGE_CFG} has one -- it is "
                     f"running an older config; run `make up edge` to reload it, then retry"
                 )
+            servers = [r for r in rows if r.get("svname") not in ("FRONTEND", "BACKEND")]
+            if servers and not any((r.get("addr") or "").strip() for r in servers):
+                # HAProxy fills `addr` only with `stats show-legends`; without
+                # it no row can ever match, so do not wait out the timeout.
+                raise DeployError(
+                    f"the edge's stats show no server addresses for '{name}', so the new copy cannot be "
+                    f"identified -- the edge's stats frontend (127.0.0.1:8404) needs `stats show-legends` "
+                    f"in {EDGE_CFG}; add it and run `make up edge`"
+                )
             if not announced:
                 self.detail(f"waiting up to {int(EDGE_TIMEOUT_S)}s for the edge to mark it UP")
                 announced = True

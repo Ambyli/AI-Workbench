@@ -766,6 +766,20 @@ def test_edge_timeout_stops_the_new_copy_gracefully_and_restores_the_parked_name
     assert rc == 0 and "up to date" in out
 
 
+def test_edge_stats_without_addresses_fail_fast_with_the_fix():
+    # Seen on the box: the 8404 stats frontend lacked `stats show-legends`, so
+    # every server's addr was empty and the wait could only time out.
+    fake = FakeDocker({"app": swap_svc()})
+    old = fake.add("app", "app")
+    fake.add("edge", "edge", project="ai-edge")
+    fake.edge_stats = stats([("app", "app1", "UP", ""), ("app", "app2", "UP", "")])
+    rc, out = run(fake, "app", edge_listens=FRONTED)
+    assert rc == 1
+    assert "needs `stats show-legends`" in out
+    assert len([c for c in fake.calls if c[0] == "exec"]) == 1  # no 60 s of polling
+    assert fake.containers[old]["state"] == "running"
+
+
 def test_unreadable_edge_stats_abort_instead_of_retiring_blind():
     fake = FakeDocker({"app": swap_svc()})
     old = fake.add("app", "app")
@@ -1463,6 +1477,17 @@ def test_semantic_router_reaches_litellm_through_the_edge_internal_bind():
     body = render[render.index("\nadmin:"):]
     assert "address: litellm" not in body
     assert body.count("address: edge") == len(cfg["providers"]["models"])
+
+
+def test_deploy_stats_frontend_shows_server_addresses():
+    # deploy.py's edge wait matches the new copy by the CSV `addr` column,
+    # which HAProxy fills only with `stats show-legends`.
+    text = (_ROOT / "ai" / "edge" / "haproxy.cfg").read_text(encoding="utf-8")
+    section = text.split("\nfrontend stats\n", 1)[1].split("\nfrontend ", 1)[0]
+    lines = [ln.split("#", 1)[0].strip() for ln in section.splitlines()]
+    assert "bind 127.0.0.1:8404" in lines
+    assert "stats show-legends" in lines
+    assert not any(ln.startswith("stats admin") for ln in lines)
 
 
 def test_status_page_is_read_only_and_behind_oauth2_proxy():

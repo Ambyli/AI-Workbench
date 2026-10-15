@@ -46,6 +46,14 @@ litellm_settings:
   # local-private queues locally instead. See ai/litellm/LITELLM.md >
   # Chain aliases.
   callbacks: ["overflow.handler"]
+  # Prometheus metrics. LiteLLM mounts /metrics ONLY when "prometheus" is in
+  # success_callback (proxy_server.py: PrometheusLogger._mount_metrics_endpoint
+  # in the success_callback branch, v1.93-1.95); without it /metrics is a 404
+  # behind the auth middleware (401 without a key). failure_callback records
+  # the failed requests too. Scraped by the litellm stack's prometheus with a
+  # /metrics-only virtual key: LITELLM.md > Prometheus scrape key.
+  success_callback: ["prometheus"]
+  failure_callback: ["prometheus"]
   # Three independent fallback maps. `fallbacks` fires on generic failures
   # (connection refused while a vLLM container is still loading, 5xx, timeouts)
   # after num_retries is exhausted; `context_window_fallbacks` fires ONLY on

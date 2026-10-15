@@ -31,6 +31,8 @@ The LiteLLM service runs a liveliness probe against `/health/liveliness`. Promet
 
 ### Prometheus scrape key
 
+`/metrics` exists only because `litellm_config.yaml` sets `success_callback: ["prometheus"]` (and `failure_callback`). LiteLLM mounts the endpoint only in that branch. Without it, a valid key gets a `404`, because the auth middleware runs before routing.
+
 LiteLLM requires a key on `/metrics` (`require_auth_for_metrics_endpoint` is on by default). Without one, Prometheus's `litellm` job shows `401 Unauthorized`. Turning that setting off is not an option here: the cloudflared tunnel sends `api.zeoenergy.com` straight to LiteLLM, so `https://api.zeoenergy.com/metrics` would become public.
 
 Instead, Prometheus sends a **virtual key that can only call `/metrics`**. LiteLLM supports this with the key's `allowed_routes` (exact or wildcard match, `proxy/auth/route_checks.py`). The key lives at `ai/litellm/secrets/prometheus_metrics.key`. That folder's own `.gitignore` keeps everything but itself out of git, and it is mounted read-only into `prometheus` at `/etc/prometheus/secrets`. The `litellm` job in `prometheus.yml` reads it with `authorization.credentials_file`.

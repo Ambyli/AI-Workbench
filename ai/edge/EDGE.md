@@ -250,7 +250,7 @@ as `edge:<port>` from `ai_shared`:
 | `127.0.0.1:8404` `/stats` | `frontend stats` | `deploy.py` (stats CSV through `docker exec`), the compose healthcheck | — |
 | `:14000` | second bind of `listen litellm` (`name internal`) | `vllm-sr-envoy`'s four chain clusters | no allow-list, no per-key limit |
 | `:8405` `/metrics` | `frontend metrics` | the litellm stack's `prometheus` | — |
-| `:8407` `/edge/` | `frontend status` | oauth2-proxy → `chat.zeoenergy.com/edge/` | — |
+| `:8407` `/edge/`, `/edge/raw/` | `frontend status` | oauth2-proxy → `chat.zeoenergy.com/edge/` (status page; raw HAProxy report under `raw/`) | — |
 | `/run/haproxy-api/admin.sock` (UNIX socket, `level admin`) | `global` `stats socket` | `edge-certs`, through the `edge_api` volume, to push a renewed certificate | not a network listener |
 
 - **Listener ports.** Inside the container, the listener ports are fixed at the
@@ -444,13 +444,45 @@ that one target DOWN with a 404 until someone turns it on.)
 
 ### Status page
 
-`frontend status` serves HAProxy's stats page at `edge:8407/edge/`, internal
-only, read-only: no `stats admin`, so there are no enable / disable / drain
-buttons. `OAUTH2_PROXY_UPSTREAMS` includes `http://edge:8407/edge/`, so it is
-at **`https://chat.zeoenergy.com/edge/`** after Google sign-in, the same
-pattern as `/n8n/` and `/superset/` (oauth2-proxy forwards the path
-unchanged). `/edge/;csv` is the same data as CSV. Anything on `ai_shared` can
-read it too; it shows backend addresses and health, no secrets.
+**`https://chat.zeoenergy.com/edge/`**, after Google sign-in. `OAUTH2_PROXY_UPSTREAMS`
+includes `http://edge:8407/edge/`, the same pattern as `/superset/` and
+`/rustfs/`; oauth2-proxy forwards the path unchanged. `frontend status` on
+`edge:8407` (internal only, never published) serves two things:
+
+- **`/edge/`: the status page,**
+  [`status/index.html`](status/index.html). One row per fronted service,
+  grouped into *swapped with no downtime* and *restarted on deploy*. Each row
+  shows:
+  - a status light;
+  - **copies up**, e.g. `2/2 copies up · swap in progress` during a deploy;
+  - how long the service has been stable;
+  - open connections, requests per second, and 5xx responses since the edge
+    started, flagged `(+N)` when new ones appeared since the last refresh.
+
+  It refreshes every 5 s by fetching the raw report's CSV, pauses while the
+  tab is hidden, and follows the system light/dark setting. Hover a row to
+  see its copies' addresses. A red banner means the CSV could not be read,
+  most often an expired sign-in; reload the page.
+- **`/edge/raw/`: HAProxy's built-in report,** with every column.
+  `/edge/raw/;csv` is the same data as CSV. It is read-only: no `stats admin`,
+  so there are no enable, disable or drain buttons.
+
+Anything on `ai_shared` can read both; they show backend addresses and
+health, no secrets.
+
+**Editing the page.**
+- **It's one self-contained file.** HAProxy serves it with `http-request
+  return … file`, which reads it when the config loads, so after an edit run
+  `make up edge` (a validated, hitless reload).
+- **Keep it under 12 KB.** The whole response must fit one HAProxy buffer
+  (`tune.bufsize`, 16 KB, minus `tune.maxrewrite`); past that HAProxy
+  answers 500.
+- **Keep its `SERVICES` list in step with `haproxy.cfg`.** Adding a
+  `listen` section means adding a row there with the service key, label,
+  LAN port and class (`swap` or `recreate`).
+
+`test_deploy.py` enforces the size limit, and that the list matches the
+`listen` sections and their swap labels.
 
 ### What is deliberately not behind the edge
 
@@ -1265,8 +1297,9 @@ check.
     those services run. A `litellm` target that is DOWN with **HTTP 404** is not
     a network problem: LiteLLM mounts `/metrics` only when `prometheus` is in
     its `success_callback` list, which `litellm_config.yaml` does not set.
-    `https://chat.zeoenergy.com/edge/` shows the stats page after Google
-    sign-in, with no admin buttons.
+    `https://chat.zeoenergy.com/edge/` shows the status page after Google
+    sign-in (one green row per running service), and `/edge/raw/` shows
+    HAProxy's report with no admin buttons.
 11. **TLS:** steps 4 and 6 of [TLS § Operator checklist](#operator-checklist),
     then `docker exec edge-certs python3 /edge-certs/edge_certs.py status`
     (`match: yes`). The TLS port shares the allow-list and the per-key limit,

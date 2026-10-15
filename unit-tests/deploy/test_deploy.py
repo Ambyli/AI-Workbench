@@ -1493,12 +1493,43 @@ def test_deploy_stats_frontend_shows_server_addresses():
 def test_status_page_is_read_only_and_behind_oauth2_proxy():
     status = _section("frontend", "status")
     assert status["binds"] == [("", 8407, "internal")]
-    assert "stats uri /edge/" in status["lines"]
+    # The readable page is /edge/; HAProxy's own report moved to /edge/raw/.
+    assert "stats uri /edge/raw/" in status["lines"]
     assert not [l for l in status["lines"] if l.startswith("stats admin")]
     upstreams = re.search(r"^OAUTH2_PROXY_UPSTREAMS=(.*)$", _env_example(), re.M).group(1).split(",")
     assert "http://edge:8407/edge/" in upstreams
     # n8n stays on its own subdomain: its N8N_PATH subpath mode is broken upstream.
     assert "n8n:5678" not in upstreams
+
+
+STATUS_HTML = _ROOT / "ai" / "edge" / "status" / "index.html"
+
+
+def test_status_html_is_served_from_the_edge_mount_and_fits_one_buffer():
+    status = _section("frontend", "status")
+    served = [l for l in status["lines"] if l.startswith("http-request return status 200")]
+    assert len(served) == 1 and " file /usr/local/etc/haproxy/status/index.html " in served[0]
+    assert "{ path /edge/" in served[0]
+    # The edge mounts ai/edge at /usr/local/etc/haproxy, so that path is this file.
+    edge = _yaml().safe_load((_ROOT / "ai" / "edge" / "docker-compose.edge.yml").read_text(encoding="utf-8"))
+    assert "./:/usr/local/etc/haproxy:ro" in edge["services"]["edge"]["volumes"]
+    # http-request return ... file: the whole response must fit tune.bufsize
+    # (16 KB) minus tune.maxrewrite, or HAProxy answers 500 instead.
+    assert STATUS_HTML.stat().st_size < 12000
+    # It polls the raw report's CSV, relative to /edge/.
+    assert 'fetch("raw/;csv' in STATUS_HTML.read_text(encoding="utf-8")
+
+
+def test_status_html_lists_exactly_the_edge_services_with_their_ports_and_classes():
+    text = STATUS_HTML.read_text(encoding="utf-8")
+    entries = re.findall(r'\["([a-z0-9.-]+)", "[^"]*", (\d+), "(swap|recreate)"', text)
+    listed = {name: (int(port), kind) for name, port, kind in entries}
+    listens = deploy.load_edge_listens(str(_ROOT))
+    assert set(listed) == set(listens), "status/index.html SERVICES must match haproxy.cfg's listen sections"
+    swaps = _swap_services()
+    for name, (port, kind) in listed.items():
+        assert port == int(listens[name]), f"{name}: page says LAN {port}, haproxy.cfg binds {listens[name]}"
+        assert (kind == "swap") == (name in swaps), f"{name}: page says {kind}"
 
 
 def test_prometheus_is_on_ai_shared_and_every_target_is_reachable_there():

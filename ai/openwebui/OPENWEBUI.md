@@ -54,6 +54,7 @@ Every value is sourced from `.env` so configuration lives in one file.
 | `WEBUI_AUTH_TRUSTED_ACCESS_TOKEN_HEADER` | `OPENWEBUI_WEBUI_AUTH_TRUSTED_ACCESS_TOKEN_HEADER` | `X-Forwarded-Access-Token` | **Zeo patch, not upstream.** Verify the trusted identity with Google and take name + picture from it — see [Single sign-on](#single-sign-on) |
 | `USER_AGENT` | `OPENWEBUI_USER_AGENT` | `OpenWebUI/1.0 (+github.com/open-webui/open-webui)` | User-Agent applied to outbound HTTP from RAG / web loaders (langchain_community); silences the "USER_AGENT not set" warning |
 | `MCP_INITIALIZE_TIMEOUT` | `OPENWEBUI_MCP_INITIALIZE_TIMEOUT` | `30` | Seconds to wait for an MCP server's initialize handshake; raise for slow cold-starts (upstream default: 10) |
+| `AUTO_CONTINUE_MAX_NUDGES` | `OPENWEBUI_AUTO_CONTINUE_MAX_NUDGES` | `2` | **Zeo patch, not upstream.** Nudges per turn when a model announces a tool call without making it; `0` = off. Read on every boot. See [Auto-continue announced tool calls](#auto-continue-announced-tool-calls) |
 | `AIOHTTP_CLIENT_TIMEOUT` | `OPENWEBUI_AIOHTTP_CLIENT_TIMEOUT` | `900` | Hard cap in seconds, **streaming included**, on every chat completion Open WebUI sends to LiteLLM (also `search_web`, `fetch_url`, and MCP tool servers by inheritance). v0.11.4 `utils/session_pool.py:43-51`. The outermost layer of the `auto` budget (900 > LiteLLM 870 > Envoy 840) — see [SEMANTIC_ROUTER.md § Timeout budget](../semantic-router/SEMANTIC_ROUTER.md#timeout-budget). Was `300`: the 5-minute "Error submitting message". Read on **every** boot, unlike the rest of this table — apply with `make up openwebui` |
 | `AIOHTTP_CLIENT_STREAM_IDLE_TIMEOUT` | `OPENWEBUI_AIOHTTP_CLIENT_STREAM_IDLE_TIMEOUT` | `900` | Max silence (`sock_read`) on a streaming response. On `auto` a turn is silent until it is complete (Envoy buffers it), so this must not be shorter than the cap above. Was `60`. Trade-off: shared with `fetch_url`, which now waits up to 900 s on a stalled site — [SEARXNG.md § Troubleshooting](../searxng/SEARXNG.md#troubleshooting-fetch_url--search-hangs) |
 | `CORS_ALLOW_ORIGIN` | `CORS_ALLOW_ORIGIN` | `*` | Tighten to a specific origin if another web app calls Open WebUI's API from the browser |
@@ -474,6 +475,60 @@ The page keeps the model and tool lists it loaded until it is reloaded, so a cha
 
 **If the handshake times out** (you see "MCP server failed to initialize" in the logs), bump `OPENWEBUI_MCP_INITIALIZE_TIMEOUT` in `.env` (currently `30s`, upstream default is `10s`) and restart Open WebUI.
 
+### Auto-continue announced tool calls
+
+With **native** function calling, Open WebUI's backend runs the tool loop: the model returns tool calls, Open WebUI runs them and asks the model again, and the first reply *without* tool calls ends the turn. Local models (muse-glimmer via `auto`, seen on 2026-10-15) sometimes end a turn right after a tool result by announcing the next step instead of taking it:
+
+> Permission denied on `/app/test.js` via exec. I'll use `write_files` to create the test harness correctly, then run it.
+
+Upstream stops there, and nothing happens until the user types "go on". Patch `0004` ([Custom image](#custom-image-patches)) checks that final reply before the loop ends. When **all** of these hold, it doesn't end the turn:
+
+- the chat uses native function calling and tools were offered (legacy function calling, task-model calls and tool-less chats are never touched);
+- at least one tool round already ran in this turn, and the reply came straight after a tool result (only reasoning in between);
+- the reply's last paragraph — LiteLLM `auto` footer stripped, code removed, reasoning not read — ends in first-person, forward-looking intent in its last two sentences ("let me", "I'll", "I'm going to", "now I", "give me a moment", "I'm fixing it now", …);
+- it asks the user nothing: no `?` in the last paragraph, no "want me to" / "should I" / "would you like" / "let me know" / "if you'd like";
+- fewer than `AUTO_CONTINUE_MAX_NUDGES` nudges were sent this turn, and the tool-call iteration limit isn't reached.
+
+Instead it sends the conversation so far plus a hidden user message — *"You said you would take an action but your reply contained no tool call, so nothing happened. Make the tool call now. If the task is actually finished, reply with a one-line summary instead; if you need a decision from the user, ask the question."* — through the same continuation path a tool round uses. The model's continuation, and any tool calls it makes (which then run through the normal loop), are appended to the **same** assistant message. The nudge exists only in that one request: it is never shown in the chat and never saved, and later rounds in the turn don't see it either. Bare imperatives ("re-run the tests", "then run it") don't count as intent, because in a finished answer they are instructions to the user. The Responses-API stateful mode (`ENABLE_RESPONSES_API_STATEFUL`) is skipped. A nudge that fails is logged and ends the turn as upstream would.
+
+| `.env` | Container env | Default | Notes |
+|---|---|---|---|
+| `OPENWEBUI_AUTO_CONTINUE_MAX_NUDGES` | `AUTO_CONTINUE_MAX_NUDGES` | `2` | Nudges per assistant turn; `0` turns the feature off. Each nudge costs one extra model call. Read on every boot — `make up openwebui` after a change |
+
+**Seeing it work.** One INFO line per nudge:
+
+```bash
+docker logs openwebui 2>&1 | grep auto-continue
+# auto-continue: chat 3f2a… nudge 1/2: reply announced an action without a tool call: "Permission denied on `/app/test.js` via exec. I'll use `write_files` to create the test harness correctly, then run it."
+# auto-continue: chat 3f2a…: continuation failed: …   <- the turn ended as upstream would
+```
+
+In the chat the user sees the announcement, then the model's continuation in the same message (with a second `auto` footer, because each request through `auto` gets one). If a model keeps announcing, the turn ends after `N` nudges. The heuristic lives in `backend/open_webui/utils/zeo_auto_continue.py`; `unit-tests/openwebui/` tests it on the real announcements and endings, loading the module straight out of the patch file (`uv run --no-sync pytest unit-tests/openwebui -q`).
+
+### Context compaction
+
+v0.11.4 ships **Context Compaction** (`backend/open_webui/utils/context_compaction.py`), **off by default**. Once a chat's context passes a token threshold, it summarises the oldest turns and sends the summary in their place. It is upstream code with no patch; this section only records how this install should set it.
+
+**How it works (v0.11.4):**
+
+- It runs **once at the start of each user turn** (`process_chat_payload`), never between tool rounds inside a turn. So a single agentic turn can still grow the context by its full tool-round output before the next check.
+- Token count = the reported usage of the **last stored message that has usage** (prompt + completion tokens), plus `len(text) / 4` for every message after it. A model that doesn't store usage falls back to `len / 4` for the whole chat. Open WebUI only asks a provider for usage on streams when the model has the **Usage** capability ticked (Workspace → Models → (model) → Capabilities), so tick it on the chat models.
+- When the count passes the threshold (and the chat has more than 3 messages), the oldest messages are summarised by the compaction model. Retention is a percentage of **messages**, not tokens, clamped to 10–50; the cut lands on a user-message boundary.
+- Only the **outgoing request** is rewritten: the summarised turns are dropped, and the summary is sent as a `[CONVERSATION SUMMARY]` system message. The stored chat stays intact — the user still sees every message. The summary is checkpointed on the first kept message as `contextSummary`, so later turns start from it and the next compaction folds the previous summary in.
+- It does nothing in **temporary chats** (only saved chats are compacted). A failed compaction is logged (`Context compaction failed; continuing with full chat history`) and the turn proceeds uncompacted. A successful one logs `Compacted chat context for chat=… dropped=… kept=…`.
+
+**Settings — PersistentConfig, set them in the UI.** Admin Settings → Interface → Context Compaction. These are `chat.context_compaction.*` config rows (`enable`, `token_threshold` default 80000, `token_cap`, `retention_percentage` default 40, `model`, `prompt_template`). The matching env vars (`ENABLE_CONTEXT_COMPACTION`, `CONTEXT_COMPACTION_*`) are only read on the first boot of a fresh `openwebui_data` volume, so on this install **env vars will not reach it** — use the UI. The per-model / per-chat override is **Context Compaction Threshold** in Advanced Params (a model's value wins over a chat's); `token_cap` is the ceiling on any override.
+
+Recommended values for this install:
+
+| UI field | Value | Why |
+|---|---|---|
+| Context Compaction | **On** | Long agentic chats otherwise run into the context window. |
+| Token Threshold | **64000** | The check happens only between turns, and one agentic turn can add ~30k tokens through tool rounds. Compacting at 64k keeps a chat inside `qwen3.8-solo`'s 114,688-token window and `muse-glimmer`'s 128k trained context even after a heavy turn. |
+| Token Cap | **64000** | Stops a model / chat override from setting a threshold the local models can't serve. |
+| Retained Messages | **20%** | In agentic chats the last few turns hold most of the tokens (tool results). Keeping 40% of the *messages* often keeps most of the tokens, so the compaction frees little. |
+| Context Compaction Model | **`local-private`** if Open WebUI's virtual key exposes it, else **Current Model** | The summary prompt carries the whole conversation. `local-private` is the local-only chain (no Claude deployment, no fallback to Claude), so that prompt can never overflow to Anthropic. "Current Model" on `auto` would route it like a chat turn and stamp the summary with an `auto` footer. |
+
 ### Restricting visible models
 
 Open WebUI populates its model picker by calling `GET /v1/models` against LiteLLM, using whatever API key it's been given. The LiteLLM **master key** sees every model defined in `litellm_config.yaml` — including non-chat entries like `kokoro` (TTS), which would clutter the picker. The fix is to give Open WebUI a **virtual key** scoped to just the chat models you want it to see.
@@ -557,6 +612,7 @@ If Open WebUI shows "Server Connection Error" on play, `make logs openwebui` —
 |---|---|---|
 | `0002-trusted-header-google-identity.patch` | Adds `WEBUI_AUTH_TRUSTED_ACCESS_TOKEN_HEADER`. In trusted-header SSO mode, verify the asserted identity with Google using the access token oauth2-proxy forwards, and take display name + picture from Google's userinfo on every sign-in. Rationale and security in [Single sign-on](#single-sign-on) | `backend/open_webui/env.py`, `routers/auths.py`, `utils/trusted_proxy.py` (new) |
 | `0003-oauth-mcp-defaults-no-redirect.patch` | A model's default OAuth MCP tools stay in **that user's** `GET /api/models` `toolIds` only while the user holds a token the MCP server accepts (live `initialize` probe, cached), so a new chat no longer redirects to the MCP server's authorize page. Also makes `OAuthClientManager.get_oauth_token` refresh single-flight and delete a session only when it can never be renewed. Always on, no env var. Backend-only because the image ships the Svelte frontend pre-compiled. Details in [MCP tools (Phoenix)](#mcp-tools-phoenix) | `backend/open_webui/main.py`, `utils/oauth.py`, `utils/mcp_oauth_defaults.py` (new) |
+| `0004-auto-continue-announced-tool-calls.patch` | With native function calling, when a model ends the tool loop right after a tool result by **announcing** its next step ("I'll rewrite the file and re-run.") instead of making the call, send a hidden nudge and continue the turn in the same assistant message, up to `AUTO_CONTINUE_MAX_NUDGES` times per turn (default 2, `0` = off). The nudge is never shown or saved. Details in [Auto-continue announced tool calls](#auto-continue-announced-tool-calls) | `backend/open_webui/utils/middleware.py`, `utils/zeo_auto_continue.py` (new) |
 
 (`0001` was a `login_hint` patch for the two-hop OAuth path; it was retired when one-gate SSO replaced that path.)
 
@@ -567,6 +623,8 @@ docker image inspect openwebui-zeo:v0.11.4 --format '{{index .Config.Labels "com
 docker exec openwebui test -f /app/backend/open_webui/utils/trusted_proxy.py && echo patched
 docker exec openwebui test -f /app/backend/open_webui/utils/mcp_oauth_defaults.py && echo 0003 patched
 docker exec openwebui grep -q _zeo_refresh_single_flight /app/backend/open_webui/utils/oauth.py && echo 0003 refresh fix
+docker exec openwebui grep -q zeo_auto_continue_round /app/backend/open_webui/utils/middleware.py && echo 0004 patched
+docker exec openwebui printenv AUTO_CONTINUE_MAX_NUDGES   # expect 2 (0 = feature off)
 ```
 
 #### Regenerating a patch for a new upstream version
@@ -588,9 +646,11 @@ Paste the header comment from the old patch file back on top, update its `Target
 
 For `0003`, regenerate the same way with `main.py`, `utils/oauth.py` and `utils/mcp_oauth_defaults.py` (new). Before trusting it on a new tag, re-check the upstream facts it depends on: `Chat.svelte`'s `setDefaults` still reads default tools from `model.info.meta.toolIds` and still redirects on `authenticated === false`; `routers/tools.py::get_tools` still derives `authenticated` from `oauth_client_manager.get_oauth_token(user.id, 'mcp:<id>')` with the tool id `server:mcp:<info.id>`; `utils/tools.py::build_tool_server_headers(connection, request, user, server_id=…)` still builds an MCP call's headers; the admin model editor still takes `meta` from the saved DB record rather than from `/api/models`; and `OAuthClientManager.get_oauth_token` still has no refresh locking of its own. If upstream ships a native "don't auto-redirect" option, retire the `/api/models` half; if it ships single-flight refresh, retire the `oauth.py` half.
 
+For `0004`, regenerate with `utils/middleware.py` and `utils/zeo_auto_continue.py` (new). The middleware hunk is two pieces inside `streaming_chat_response_handler`'s `response_handler`: the nested `zeo_auto_continue_round()` defined right after `emit_output()`, and the loop head `while (tool_calls or await zeo_auto_continue_round()) and (…)`. Before trusting it on a new tag, re-check that the native tool loop is still that `while tool_calls and (…)` loop; that a tool round still builds its follow-up as `[*form_data['messages'], *convert_output_to_messages(output, raw=True, reasoning_format=…, flatten_tool_images=True)]`, runs the `request` filters, `normalize_messages_for_model` and `generate_chat_completion(…, bypass_system_prompt=True)`; and that it still streams the reply with the `prior_output = list(full_output())` → `stream_body_handler` → `output = full_output()` bookkeeping. The hook copies those steps, so if upstream changes them, change the hook to match. If upstream ships its own "continue when the model only announced an action" option, retire the patch. Then run `uv run --no-sync pytest unit-tests/openwebui -q` — the tests read the module out of the patch file.
+
 #### Adding another patch
 
-Number it `0003-….patch`, keep the `a/` / `b/` path prefixes, list it in the Dockerfile header comment and the `com.zeoenergy.openwebui.patches` label, add its modules to the `ast.parse` list and a `grep -q` guard for something only the patched code contains. Patches apply in filename order.
+Number it `0005-….patch` (the next free number), keep the `a/` / `b/` path prefixes, list it in the Dockerfile header comment and the `com.zeoenergy.openwebui.patches` label, add its modules to the `ast.parse` list and a `grep -q` guard for something only the patched code contains. Patches apply in filename order.
 
 ### Updating the image
 

@@ -4,20 +4,30 @@ Tools exposed (all invoked as ``sandbox.<name>``):
 
     get_runtime_types()             — describe available runtime types (catalog)
     create(runtime, ...)            — warm an empty container
-    write_files(session_id, ...)   — overlay files, health-probe after
-    get_files(session_id, paths?)   — read files back from /app
+    write_files(session_id, ...)    — NEW files / full rewrites, health-probe after
+    read_file(session_id, path, ...)— numbered line window of one text file
+    edit_file(session_id, path, old_string, new_string, replace_all?)
+                                    — exact-string edit: THE way to change a file
+    get_files(session_id, paths?)   — dir listing, or raw/base64 contents
     get_logs(session_id, lines?)    — tail container stdout+stderr
     exec(session_id, command, ...)  — run a non-interactive shell command
-    patch_files(session_id, patches)— strict line-range edits, all-or-nothing
     preview(session_id)             — return the iframe artifact HTML
     close(session_id)               — teardown and release slot
     list_sessions()                 — enumerate live sandboxes
     run(runtime, files, ...)        — convenience: create + update + preview
 
+The flow every docstring teaches (Claude Code's file-tool contract):
+
+    get_runtime_types → create → write_files (new files)
+      → read_file / edit_file (changes) → exec → preview → close
+
 Every tool returns a ``ToolResult`` — a list of ``TextContent`` (what the
 model reads) plus a ``structured_content`` JSON payload (what any
-programmatic caller can parse without regex). The text form is unchanged
-from the pre-refactor shape where a caller was already using it.
+programmatic caller can parse without regex). Results are kept short on
+purpose: an edit returns a confirmation and a numbered snippet, never the
+whole file; exec echoes one line of the command; and content that is
+already in the text (exec output, get_files contents, the edit snippet)
+is not repeated in ``structured_content``.
 
 The tool implementations are bound to callables passed to ``build_mcp``
 from ``app.py`` — that indirection keeps ``sandbox_mcp`` free of the
@@ -39,6 +49,21 @@ from fastmcp.tools.tool import ToolResult
 from mcp.types import TextContent
 from pydantic import Field
 
+from constants import (
+    EDIT_SNIPPET_CONTEXT_LINES,
+    EXEC_COMMAND_ECHO_CHARS,
+    EXEC_DEFAULT_TIMEOUT_S,
+    EXEC_HARD_TIMEOUT_S,
+    EXEC_MAX_OUTPUT_BYTES,
+    GET_FILES_DEFAULT_BYTES,
+    GET_FILES_HARD_CAP_BYTES,
+    READ_FILE_DEFAULT_LINES,
+    READ_FILE_MAX_BYTES,
+    READ_FILE_MAX_LINE_CHARS,
+    READ_FILE_MAX_LINES,
+    WRITE_GUARD_MIN_LINES,
+    WRITE_GUARD_SIMILARITY,
+)
 from runtimes import describe_runtimes
 
 
@@ -49,15 +74,19 @@ log = logging.getLogger("sandbox-runner.mcp")
 
 def _format_diagnostic(detail: dict) -> str:
     """Turn a runner HTTPException detail dict into a diagnostic string
-    for the model. Same shape as pre-refactor — recognized errors:
+    for the model: ``failed: <error>``, the session id, an error-specific
+    body, then the ``hint``. Errors with their own body:
 
-      "static lint failed" (400)
-      "sandbox did not become ready" (504)
-      "sandbox container is gone" (409, new — surfaced by write_files
-                                   when recreate_if_gone=false and the
-                                   container was reaped)
-      "no running sandbox for this session" (404)
-      "session not found" (404)
+      "static lint failed" (400) — compiler-style lines with a caret
+      "sandbox did not become ready" (504) — the container's log tail
+      read_file / edit_file refusals (``tool`` + ``kind``) — the message,
+          plus the numbered closest text of a not-found old_string
+      "rewrite of existing file" (409) — which files, how similar
+      "payload too large" (413) / "invalid arguments" (422) — the
+          validator's message
+
+    Anything else (e.g. "sandbox container is gone", "session not found")
+    is dumped as JSON minus the hint, so no field is lost.
     """
     log.debug(
         "_format_diagnostic: error=%r session=%s keys=%s",
@@ -95,94 +124,32 @@ def _format_diagnostic(detail: dict) -> str:
             lines.append("---")
         else:
             lines.append("(container produced no output before timing out)")
-    elif detail.get("kind") in {
-        "content_mismatch", "out_of_range", "overlap",
-        "missing_file", "binary_file", "unsafe_path",
-        "bad_expected_type", "bad_replacement_type",
-    }:
-        # patch_files-specific structured failures. Rendered instead of
-        # the raw JSON dump the fallback branch uses.
-        kind = detail["kind"]
-        path = detail.get("path", "?")
-        sl = detail.get("start_line")
-        el = detail.get("end_line")
-        patch_idx = detail.get("patch_index")
+    elif detail.get("tool") in ("read_file", "edit_file") and detail.get("kind"):
+        # read_file / edit_file refusals: the message, plus the closest
+        # region of the file for a not-found old_string so the model can
+        # copy the real text without another read. The hint (appended
+        # below) names the exact next call.
         lines.append("")
-        if kind == "content_mismatch":
-            lines.append(
-                f"patch_files failed: expected content mismatch at "
-                f"{path}:{sl}-{el}."
-            )
-            lines.append("")
-            lines.append("Your `expected`:")
-            for src_line in (detail.get("expected") or "").split("\n"):
-                lines.append(f"    {src_line}")
-            lines.append("")
-            lines.append("Actual (currently in file):")
-            for src_line in (detail.get("actual") or "").split("\n"):
-                lines.append(f"    {src_line}")
+        lines.append(
+            f"{detail['tool']} {detail.get('path', '?')}: "
+            f"{detail.get('message', '')}"
+        )
+        closest = detail.get("closest_text")
+        if detail.get("kind") == "not_found" and closest:
+            pct = round(float(detail.get("similarity") or 0) * 100)
             lines.append("")
             lines.append(
-                "No files were modified. Call get_files(paths=["
-                f"\"{path}\"]) to refresh your view, then reissue "
-                "patch_files with the correct `expected` content. "
-                "The other patches in this call were NOT applied."
+                f"Closest text in the file (lines "
+                f"{detail.get('closest_start_line')}-"
+                f"{detail.get('closest_end_line')}, {pct}% similar):"
             )
-        elif kind == "out_of_range":
-            lines.append(
-                f"patch_files failed: patch #{patch_idx} on {path} "
-                f"targets lines {sl}-{el}, but the file has "
-                f"{detail.get('file_line_count', '?')} line(s)."
-            )
-            lines.append("")
-            lines.append(
-                "No files were modified. Call get_files(paths=["
-                f"\"{path}\"]) to see the current file, then reissue "
-                "patch_files with a valid line range."
-            )
-        elif kind == "overlap":
-            lines.append(f"patch_files failed: overlapping patches on {path}.")
-            lines.append("")
-            other_idx = detail.get("other_patch_index")
-            other_sl = detail.get("other_start_line")
-            other_el = detail.get("other_end_line")
-            lines.append(f"  Patch #{other_idx} covers lines {other_sl}-{other_el}")
-            lines.append(f"  Patch #{patch_idx} covers lines {sl}-{el}")
-            lines.append(
-                "These overlap. Combine them into ONE patch whose "
-                "`expected` and `replacement` cover the merged range. "
-                "No files were modified."
-            )
-        elif kind == "missing_file":
-            lines.append(
-                f"patch_files failed: {path} does not exist in the sandbox."
-            )
-            lines.append("")
-            lines.append(
-                "patch_files does not create files. Call write_files "
-                "with the file's full content to create it first."
-            )
-        elif kind == "binary_file":
-            lines.append(
-                f"patch_files failed: {path} is not UTF-8 (contains a "
-                "null byte or invalid encoding)."
-            )
-            lines.append("")
-            lines.append(
-                "Use write_files with a base64 payload to overwrite "
-                "the file entirely."
-            )
-        elif kind == "unsafe_path":
-            lines.append(
-                f"patch_files failed: patch #{patch_idx} has an unsafe "
-                f"path {path!r}. Absolute paths and '..' are rejected."
-            )
-        elif kind in ("bad_expected_type", "bad_replacement_type"):
-            field = "expected" if kind == "bad_expected_type" else "replacement"
-            lines.append(
-                f"patch_files failed: patch #{patch_idx} on {path} has "
-                f"a non-string `{field}` field."
-            )
+            lines.append(closest)
+    elif detail.get("kind") == "rewrite_of_existing_file":
+        lines.append("")
+        lines.append(detail.get("message", ""))
+    elif error in ("payload too large", "invalid arguments"):
+        lines.append("")
+        lines.append(detail.get("message", ""))
     else:
         # Any other structured error — pass through as JSON so the
         # model doesn't lose information.
@@ -250,14 +217,11 @@ def _format_startup_output(runtime: Optional[str], output: str) -> str:
             f"{' (and more)' if len(hits) > 3 else ''}. "
             "Fix the code with the SAME session_id BEFORE the user has "
             "to report it.\n\n"
-            "If the traceback points at a specific file:line, PREFER "
-            "patch_files — it edits in place at that line instead of "
-            "re-uploading the file. Call get_files(paths=[...]) first if "
-            "you don't already have the exact current bytes of the range, "
-            "then patch_files with your fix as `replacement`.\n\n"
-            "Use write_files (whole-file rewrite) for large refactors, "
-            "new files, or when the file's content has drifted from what "
-            "you have.\n"
+            "If the traceback points at file:line, call "
+            "read_file(path, offset=<line - 5>, limit=20) to see those "
+            "numbered lines, then edit_file with the broken text as "
+            "old_string and your fix as new_string. Do not re-send the "
+            "whole file with write_files.\n"
             "```\n"
             f"{stripped}\n"
             "```"
@@ -354,6 +318,98 @@ def _download_url_for(url: str, session_id: str) -> str:
     return f"{proxy_base}/download/{session_id}"
 
 
+def _format_read_file(result: dict) -> str:
+    """Text of a read_file result: a header, the numbered lines, and a
+    footer naming the next ``offset`` when the window stopped early."""
+    path = result.get("path", "?")
+    start = result.get("start_line", 1)
+    end = result.get("end_line", 0)
+    total = result.get("total_lines", 0)
+    content = result.get("content") or ""
+    file_truncated = result.get("file_truncated")
+    total_desc = f"{total}+" if file_truncated else str(total)
+    if total == 0:
+        return f"{path} is empty (0 lines)."
+    if not content:
+        return (
+            f"{path} has {total_desc} lines; offset {start} is past the end. "
+            f"Call read_file with an offset between 1 and {total}."
+        )
+    out = [f"{path} (lines {start}-{end} of {total_desc}):", content]
+    more = result.get("more_lines") or 0
+    if more:
+        out.append(
+            f"… {more} more line{'s' if more != 1 else ''}; call read_file "
+            f"with offset={end + 1}."
+        )
+    if file_truncated and end >= total:
+        out.append(
+            f"… the file is {result.get('size', 0):,} bytes and read_file "
+            f"reads only the first {_size(READ_FILE_MAX_BYTES)} (lines "
+            f"1-{total}). For later lines use exec, e.g. "
+            f"sed -n '{total + 1},{total + 100}p' {path}"
+        )
+    cut = result.get("lines_cut") or 0
+    if cut:
+        out.append(
+            f"({cut} line{'s' if cut != 1 else ''} longer than "
+            f"{READ_FILE_MAX_LINE_CHARS} characters were cut.)"
+        )
+    return "\n".join(out)
+
+
+def _command_echo(command: str, max_chars: int = EXEC_COMMAND_ECHO_CHARS) -> str:
+    """What the exec result echoes of the command: its first non-empty
+    line, cut to ``max_chars``, plus ``(+N more lines)``. The model
+    already has the command — echoing a 200-line heredoc back put it in
+    the context twice."""
+    lines = (command or "").strip("\n").split("\n")
+    first = lines[0].rstrip()
+    if len(first) > max_chars:
+        first = first[:max_chars] + "…"
+    more = len(lines) - 1
+    echo = f"`{first}`"
+    if more:
+        echo += f" (+{more} more line{'s' if more != 1 else ''})"
+    return echo
+
+
+def _format_exec(command: str, timeout_seconds: int, result: dict) -> str:
+    """Text of an exec result: one-line command echo, exit code / timeout,
+    then the output tail."""
+    echo = _command_echo(command)
+    if result.get("timed_out"):
+        head = (
+            f"Command {echo} TIMED OUT after {timeout_seconds}s "
+            "(it may still be running in the container)."
+        )
+    else:
+        head = (
+            f"Command {echo} exited {result.get('exit_code')} in "
+            f"{result.get('duration_ms')} ms."
+        )
+    trunc = (
+        f" (last {_size(EXEC_MAX_OUTPUT_BYTES)} — earlier output dropped)"
+        if result.get("truncated") else ""
+    )
+    return "\n".join([
+        head,
+        "",
+        f"--- output{trunc} ---",
+        result.get("output") or "(no output)",
+        "---",
+    ])
+
+
+def _exec_structured(result: dict) -> dict:
+    """exec's structured_content: status fields only — the command (the
+    caller has it) and the output (already in the text) are left out."""
+    return {
+        "ok": True,
+        **{k: v for k, v in result.items() if k not in ("command", "output")},
+    }
+
+
 def _tool_result(text: str, structured: dict) -> ToolResult:
     """Assemble the standard ToolResult shape — one TextContent block
     (what the model reads) plus a machine-readable structured payload
@@ -397,6 +453,149 @@ def _handle_http_exception(exc: HTTPException, *, tool: str) -> ToolResult:
     )
 
 
+# ── Tool descriptions built from the limits they quote ────────────────────
+# A description that states a limit is formatted from constants.py at
+# import time and passed as @mcp.tool(description=...), so what the model
+# reads can never drift from what the runner enforces. (FastMCP uses the
+# explicit description instead of the function docstring.)
+
+
+def _size(n: int) -> str:
+    """``262144`` → ``256 KiB``; a non-multiple of 1024 stays in bytes."""
+    return f"{n // 1024} KiB" if n % 1024 == 0 else f"{n:,} bytes"
+
+
+FLOW = (
+    "get_runtime_types → create → write_files (new files) → "
+    "read_file / edit_file (changes) → exec → preview → close"
+)
+
+_GUARD_PCT = round(WRITE_GUARD_SIMILARITY * 100)
+
+OVERWRITE_FIELD_DESCRIPTION = (
+    f"Set true ONLY to deliberately replace an existing text file of "
+    f"{WRITE_GUARD_MIN_LINES}+ lines with content that keeps {_GUARD_PCT}% "
+    "or more of its lines. Without it that write is refused "
+    "(rewrite_of_existing_file) — use edit_file for such changes."
+)
+
+WRITE_FILES_DESCRIPTION = f"""Write NEW files (or completely rewrite one). **Only for new files or
+complete rewrites. Changing part of an existing file? Use edit_file** —
+write_files refuses to rewrite a mostly-unchanged file unless
+overwrite=true.
+
+Semantics:
+  * ``files`` is a REPLACEMENT set — every listed path is overwritten
+    byte-for-byte with what you supply. Unlisted paths in /app are
+    preserved (this tool doesn't clear /app).
+  * Rewrite guard: if a listed path already exists as a text file of
+    {WRITE_GUARD_MIN_LINES}+ lines and your content keeps {_GUARD_PCT}%+ of its lines, the
+    WHOLE call is refused (nothing is written) with
+    ``rewrite_of_existing_file``. That is an edit — do it with read_file +
+    edit_file. Pass overwrite=true only when you really mean to replace
+    the file.
+  * ``deletes`` explicitly removes files under /app.
+  * Same URL, same session_id — dev server hot-reloads.
+  * Runs static Python lint on .py files before writing.
+  * After the reload settles, runs a health probe against the app's root
+    path and surfaces the result inline. If the reload broke the app,
+    you'll see the HTTP status here without a second tool call.
+  * Container gone? Default behavior is to error out with a clear "call
+    again with recreate_if_gone=true" message. This prevents silent state
+    loss — env is preserved on respawn, but files you installed via
+    ``exec`` are LOST.
+
+Flow: {FLOW}.
+"""
+
+READ_FILE_DESCRIPTION = f"""Read part of a text file with line numbers — the way to look at code
+before you change it with edit_file.
+
+Output is ``cat -n`` style: each line is ``<number><TAB><text>``. The
+number and TAB are NOT part of the file — when you copy a line into
+edit_file's ``old_string``, copy only the text after the TAB.
+
+Read only what you need: ``offset`` / ``limit`` select a window (default
+the first {READ_FILE_DEFAULT_LINES} lines, at most {READ_FILE_MAX_LINES}). A traceback names file:line —
+``read_file(path, offset=line-5, limit=20)`` shows that spot. When more
+lines follow, the result says which ``offset`` to ask for next. Lines
+longer than {READ_FILE_MAX_LINE_CHARS} characters are cut, and only the
+first {_size(READ_FILE_MAX_BYTES)} of a file can be read this way.
+
+Text only: a binary or non-UTF-8 file is refused — use ``get_files`` (it
+returns base64) for those. For a listing of /app call ``get_files`` with
+no paths.
+"""
+
+EDIT_FILE_DESCRIPTION = f"""**The preferred way to change a file.** Replaces ``old_string`` with
+``new_string`` in one existing file — you send only the part that
+changes, never the whole file.
+
+Copy ``old_string`` exactly from ``read_file`` output, without the
+line-number prefix (the number and TAB before each line). It must match
+the file exactly — every space, tab and line — and occur exactly once
+unless ``replace_all=true``. All or nothing: if it doesn't match,
+nothing is written and the result says why:
+
+  * not found → shows the closest text in the file, numbered, so you can
+    copy the real text and retry without re-reading the file;
+  * found N times → lists the lines; add surrounding lines to old_string
+    to make it unique, or set replace_all=true.
+
+The result is a short confirmation with the changed lines and
+{EDIT_SNIPPET_CONTEXT_LINES} lines of context on each side — not the whole file — plus the
+app's health probe and any new startup output. ``.py`` files are
+syntax-checked first; a syntax error is reported and NOT written.
+Creating a file is write_files' job.
+
+# WORKED EXAMPLE
+
+``read_file(session_id=sid, path="app.js", offset=10, limit=3)`` returned:
+    10\tfunction greet(name) {{
+    11\t  return "hi, " + name;
+    12\t}}
+
+To change the message:
+    edit_file(session_id=sid, path="app.js",
+              old_string='  return "hi, " + name;',
+              new_string='  return `Hello, ${{name}}!`;')
+
+Flow: {FLOW}.
+"""
+
+EXEC_DESCRIPTION = f"""Run a non-interactive shell command inside a running sandbox.
+
+Use this for:
+  * Installing a package the model forgot: `pip install requests`
+  * Running tests / scripts: `node test.js`, `python migrate.py`
+  * Ad-hoc introspection: `ls -la /app`, `cat /tmp/streamlit.log`
+
+Don't use it to write or edit source files (heredocs, sed): new files go
+through write_files, changes through edit_file — those are linted,
+health-probed and keep file ownership right.
+
+Important caveats:
+  1. State DRIFT on respawn — packages installed via exec do NOT survive a
+     self-heal respawn. If the dependency must persist, ALSO write it to
+     requirements.txt / package.json:
+         exec(sid, "pip install requests")      # immediate
+         edit_file(sid, "requirements.txt", ...) # persist
+  2. No interactive commands — anything that reads stdin hangs.
+  3. No long-running processes — a `&`-backgrounded process is killed
+     when exec finishes. Long-running services belong in the runtime
+     entrypoint set at create time.
+  4. Egress allowlist still applies — a `pip install` from a
+     non-allowlisted index gets a 403 from sandbox-egress. If the install
+     fails with a network error, tell the user which registry needs to be
+     added to tinyproxy.filter.
+
+Output: the LAST {_size(EXEC_MAX_OUTPUT_BYTES)} (errors are at the end), marked when earlier
+output was dropped; exit_code and duration are always populated. The
+result echoes only the first line of your command (at most
+{EXEC_COMMAND_ECHO_CHARS} characters).
+"""
+
+
 # ── Build the MCP server ──────────────────────────────────────────────────
 
 def build_mcp(
@@ -404,9 +603,10 @@ def build_mcp(
     logs_callable: Callable[..., Any],
     create_callable: Callable[..., Any],
     write_files_callable: Callable[..., Any],
+    read_file_callable: Callable[..., Any],
+    edit_file_callable: Callable[..., Any],
     get_files_callable: Callable[..., Any],
     exec_callable: Callable[..., Any],
-    patch_files_callable: Callable[..., Any],
     preview_callable: Callable[..., Any],
     close_callable: Callable[..., Any],
     list_sessions_callable: Callable[..., Any],
@@ -433,9 +633,10 @@ def build_mcp(
         requirements.txt.
 
         For the state of a running sandbox, use ``get_logs``,
-        ``get_files``, or ``list_sessions`` — NOT this tool.
+        ``get_files``, ``read_file`` or ``list_sessions`` — NOT this tool.
 
-        Flow: get_runtime_types → create → write_files → preview → close.
+        Flow: get_runtime_types → create → write_files (new files) →
+        read_file / edit_file (changes) → exec → preview → close.
         Or the one-shot: get_runtime_types → run.
         """
         log.info("MCP tool call: get_runtime_types")
@@ -504,7 +705,8 @@ def build_mcp(
         second create for the same chat returns the existing session
         (``duplicate_create_prevented``) rather than spawning again.
 
-        Flow: get_runtime_types → create → write_files (repeat) → preview → close.
+        Flow: get_runtime_types → create → write_files (new files) →
+        read_file / edit_file (changes) → exec → preview → close.
 
         Consumes one slot from SANDBOX_MAX_CONCURRENT (except when a
         duplicate create is short-circuited — that costs nothing).
@@ -522,8 +724,9 @@ def build_mcp(
                 f"This chat already has a sandbox — reusing it instead of "
                 f"creating a second one. Session id: {sid}. "
                 f"Runtime: {result['runtime']}. URL: {result['url']}.\n"
-                "Call write_files(session_id=\"" + sid + "\", files={...}) to "
-                "update it, or preview(session_id=\"" + sid + "\") to show it."
+                "Change existing files with read_file / edit_file(session_id=\""
+                + sid + "\", ...), add new ones with write_files, or call "
+                "preview(session_id=\"" + sid + "\") to show it."
             )
         else:
             text = (
@@ -532,157 +735,13 @@ def build_mcp(
                 f"URL: {result['url']} (expires {result['expires_at']}).\n"
                 "Status: warming — dev server is booting with placeholder files.\n"
                 "Next: call write_files(session_id=\"" + sid + "\", files={...}) "
-                "with your actual code."
+                "with your actual code. After that, change files with "
+                "read_file + edit_file — not by re-sending them."
             )
         return _tool_result(text, {"ok": True, **result})
 
-    # ── patch_files ──
-    @mcp.tool()
-    async def patch_files(
-        session_id: str = Field(
-            description=(
-                "The session_id from a previous create / run response."
-            )
-        ),
-        patches: list[dict] = Field(
-            description=(
-                "List of hunks. Each hunk is a dict with fields: "
-                "`path` (relative under /app), `start_line` (1-indexed "
-                "inclusive), `end_line` (1-indexed inclusive), `expected` "
-                "(the EXACT current text of those lines joined with \\n — "
-                "byte-for-byte, no whitespace or trailing-newline lenience), "
-                "`replacement` (what to write in place of `expected`), and "
-                "optional `note` (operator-log only). All-or-nothing: if "
-                "any patch fails validation, NO file is modified."
-            ),
-        ),
-        recreate_if_gone: bool = Field(
-            default=False,
-            description=(
-                "Accepted for interface consistency but has NO effect. "
-                "patch_files depends on files that would not exist in a "
-                "fresh container, so a dead container always returns an "
-                "error. Call write_files first if you need to respawn."
-            ),
-        ),
-    ) -> ToolResult:
-        """PRECISE line-range edits inside a running sandbox. **This is
-        the preferred edit tool.** Use it over ``write_files`` whenever
-        you know (or can `get_files` to read) the current bytes of the
-        target range — patching in place is cheaper than re-uploading
-        the whole file.
-
-        Fall back to write_files ONLY when:
-          * The file is new (patch_files does NOT create files).
-          * The rewrite covers most of the file.
-          * You have not called get_files on the target file in this turn
-            and cannot cheaply do so first.
-
-        # STRICT BYTE-FOR-BYTE MATCH
-
-        `expected` must match `\\n`-join(current_lines[start_line-1:end_line])
-        byte-for-byte. No whitespace or trailing-newline lenience. If it
-        does not match, the tool returns 409 with the ACTUAL current
-        content inline so you can retry in the same turn:
-
-            patch_files failed: expected content mismatch at app.py:15-18.
-            Your `expected`: ...
-            Actual (currently in file): ...
-            No files were modified. Call get_files(paths=["app.py"])...
-
-        The safe pattern is: `get_files(paths=[path])` immediately before
-        every `patch_files` on that file. Copy the range verbatim into
-        `expected`. Do not paraphrase.
-
-        # OVERLAP REJECTION
-
-        Two patches on the SAME `path` whose [start_line, end_line]
-        ranges intersect cause the entire call to be rejected — combine
-        them into ONE patch on the merged range. This includes
-        boundary-touching ranges: patches [10-15] and [15-20] overlap on
-        line 15.
-
-        # ATOMICITY
-
-        Every patch validates in a dry-run pass BEFORE any file is
-        touched. Only if every patch passes are the writes applied
-        (bottom-up per file so earlier-line indices stay valid). If
-        validation fails for any patch, no file is modified.
-
-        # AFTER THE WRITE
-
-        Post-write health probe runs (same as write_files). The
-        response's `app_status` and `startup_output` tell you whether the
-        edit broke the running app — act on ⚠ SUSPICIOUS immediately, in
-        the same turn.
-
-        # WORKED EXAMPLE
-
-        You called `get_files(paths=["app.py"])` and read:
-            10  def greet(name):
-            11      return f"hi, {name}"
-
-        You want to change the message. One patch:
-            {
-                "path": "app.py",
-                "start_line": 11,
-                "end_line": 11,
-                "expected": "    return f\\"hi, {name}\\"",
-                "replacement": "    return f\\"hello, {name}!\\"",
-            }
-
-        # NOT SELF-HEALING
-
-        Dead container? Returns 409, tells you to call write_files with
-        recreate_if_gone=true first. Fresh containers have no files to
-        anchor on, so respawning inside patch_files would be wrong.
-
-        See flow: get_runtime_types → create → write_files → (patch_files |
-        write_files loop) → preview → close.
-        """
-        log.info(
-            "MCP tool call: patch_files session=%s n_patches=%d",
-            session_id, len(patches or []),
-        )
-        try:
-            result = await patch_files_callable(
-                session_id, patches, recreate_if_gone,
-            )
-        except HTTPException as exc:
-            return _handle_http_exception(exc, tool="patch_files")
-
-        hunks = result.get("hunks_applied") or []
-        files_touched = result.get("files_touched") or []
-        text_lines = [
-            f"Patched {len(files_touched)} file(s), {len(hunks)} hunk(s) applied. "
-            f"Session `{result['session_id']}`.",
-            f"URL: {result['url']} (unchanged).",
-            _format_app_status(result.get("app_status")),
-            _format_startup_output(
-                result.get("runtime"), result.get("startup_output") or "",
-            ),
-            "",
-            "Applied:",
-        ]
-        # Group hunk ranges by path so the summary reads "app.py: 2 hunks (…)".
-        by_path: dict[str, list[str]] = {}
-        for h in hunks:
-            by_path.setdefault(h["path"], []).append(
-                f"lines {h['start_line']}-{h['end_line']}"
-            )
-        for path in files_touched:
-            ranges = by_path.get(path, [])
-            n = len(ranges)
-            text_lines.append(
-                f"- {path}: {n} hunk(s) ({', '.join(ranges)})"
-            )
-        return _tool_result(
-            "\n".join(text_lines),
-            {"ok": True, **result},
-        )
-
     # ── write_files ──
-    @mcp.tool()
+    @mcp.tool(description=WRITE_FILES_DESCRIPTION)
     async def write_files(
         session_id: str = Field(
             description=(
@@ -692,12 +751,13 @@ def build_mcp(
         files: dict = Field(
             default_factory=dict,
             description=(
-                "Path → FULL content. Every listed file is REPLACED "
-                "wholesale. Unlisted files are preserved. Values are "
-                "UTF-8 str, or {\"encoding\":\"base64\","
-                "\"content\":\"...\"} for binaries. Per-file cap: "
-                "SANDBOX_MAX_FILE_BYTES; total cap: SANDBOX_MAX_PAYLOAD_BYTES. "
-                "For a small edit, PREFER patch_files — no re-upload."
+                "Path → FULL content of NEW files (or of files you are "
+                "rewriting from scratch). Every listed file is replaced "
+                "wholesale; unlisted files are preserved. Values are UTF-8 "
+                "str, or {\"encoding\":\"base64\",\"content\":\"...\"} for "
+                "binaries. Per-file cap: SANDBOX_MAX_FILE_BYTES; total cap: "
+                "SANDBOX_MAX_PAYLOAD_BYTES. To change part of an existing "
+                "file use edit_file instead."
             ),
         ),
         deletes: list[str] = Field(
@@ -715,38 +775,20 @@ def build_mcp(
                 "via exec and in-container state are LOST; env is preserved."
             ),
         ),
+        overwrite: bool = Field(
+            default=False,
+            description=OVERWRITE_FIELD_DESCRIPTION,
+        ),
     ) -> ToolResult:
-        """REPLACES every file you list, wholesale. **Prefer
-        ``patch_files`` for edits** — it changes only the lines you
-        specify, at a fraction of the token cost. Use write_files only
-        for genuinely new files or when you're rewriting most of a file.
-
-        Semantics:
-          * ``files`` is a REPLACEMENT set — every listed path is
-            overwritten byte-for-byte with what you supply. Unlisted
-            paths in /app are preserved (this tool doesn't clear /app).
-          * ``deletes`` explicitly removes files under /app.
-          * Same URL, same session_id — dev server hot-reloads.
-          * Runs static Python lint on .py files before writing.
-          * After the reload settles, runs a health probe against the
-            app's root path and surfaces the result inline. If the reload
-            broke the app, you'll see the HTTP status here without a
-            second tool call.
-          * Container gone? Default behavior is to error out with a clear
-            "call again with recreate_if_gone=true" message. This prevents
-            silent state loss — env is preserved on respawn, but files
-            you installed via ``exec`` are LOST.
-
-        See flow: get_runtime_types → create → patch_files (edits) /
-        write_files (new files, full rewrites) → preview → close.
-        """
+        # Description: WRITE_FILES_DESCRIPTION (built from constants.py).
         log.info(
-            "MCP tool call: write_files session=%s n_files=%d recreate=%s",
-            session_id, len(files or {}), recreate_if_gone,
+            "MCP tool call: write_files session=%s n_files=%d recreate=%s "
+            "overwrite=%s",
+            session_id, len(files or {}), recreate_if_gone, overwrite,
         )
         try:
             result = await write_files_callable(
-                session_id, files, deletes, recreate_if_gone,
+                session_id, files, deletes, recreate_if_gone, overwrite,
             )
         except HTTPException as exc:
             return _handle_http_exception(exc, tool="write_files")
@@ -771,6 +813,111 @@ def build_mcp(
             {"ok": True, **result},
         )
 
+    # ── read_file ──
+    @mcp.tool(description=READ_FILE_DESCRIPTION)
+    async def read_file(
+        session_id: str = Field(
+            description="The session_id returned by create / run."
+        ),
+        path: str = Field(
+            description="Relative path of ONE text file under /app.",
+        ),
+        offset: int = Field(
+            default=1,
+            description="1-based line number to start reading at.",
+        ),
+        limit: int = Field(
+            default=READ_FILE_DEFAULT_LINES,
+            description=(
+                f"Number of lines to return (max {READ_FILE_MAX_LINES})."
+            ),
+        ),
+    ) -> ToolResult:
+        # Description: READ_FILE_DESCRIPTION (built from constants.py).
+        log.info(
+            "MCP tool call: read_file session=%s path=%s offset=%s limit=%s",
+            session_id, path, offset, limit,
+        )
+        try:
+            result = await read_file_callable(session_id, path, offset, limit)
+        except HTTPException as exc:
+            return _handle_http_exception(exc, tool="read_file")
+        text = _format_read_file(result)
+        structured = {
+            "ok": True,
+            "session_id": result.get("session_id"),
+            "sandbox_id": result.get("sandbox_id"),
+            "path": result.get("path"),
+            "start_line": result.get("start_line"),
+            "end_line": result.get("end_line"),
+            "total_lines": result.get("total_lines"),
+            "truncated": result.get("truncated"),
+        }
+        return _tool_result(text, structured)
+
+    # ── edit_file ──
+    @mcp.tool(description=EDIT_FILE_DESCRIPTION)
+    async def edit_file(
+        session_id: str = Field(
+            description="The session_id returned by create / run."
+        ),
+        path: str = Field(
+            description="Relative path under /app of an EXISTING text file.",
+        ),
+        old_string: str = Field(
+            description=(
+                "The exact text to replace, copied from read_file output "
+                "WITHOUT the line-number prefix. Include enough lines to "
+                "make it unique in the file."
+            ),
+        ),
+        new_string: str = Field(
+            description="The text to put in its place (must differ).",
+        ),
+        replace_all: bool = Field(
+            default=False,
+            description=(
+                "Replace every occurrence of old_string (e.g. renaming a "
+                "variable). Default: old_string must occur exactly once."
+            ),
+        ),
+    ) -> ToolResult:
+        # Description: EDIT_FILE_DESCRIPTION (built from constants.py).
+        log.info(
+            "MCP tool call: edit_file session=%s path=%s replace_all=%s",
+            session_id, path, replace_all,
+        )
+        try:
+            result = await edit_file_callable(
+                session_id, path, old_string, new_string, replace_all,
+            )
+        except HTTPException as exc:
+            return _handle_http_exception(exc, tool="edit_file")
+        n = result.get("replacements", 1)
+        if n == 1:
+            head = (
+                f"Edited {result['path']}: 1 replacement, lines "
+                f"{result['start_line']}-{result['end_line']}."
+            )
+        else:
+            where = ", ".join(str(x) for x in result.get("match_lines") or [])
+            head = (
+                f"Edited {result['path']}: {n} replacements (starting "
+                f"on lines {where}); the first is shown."
+            )
+        text_lines = [
+            head,
+            result.get("snippet") or "",
+            _format_app_status(result.get("app_status")),
+            _format_startup_output(
+                result.get("runtime"), result.get("startup_output") or "",
+            ),
+        ]
+        structured = {
+            k: v for k, v in result.items() if k != "snippet"
+        }
+        return _tool_result("\n".join(text_lines), {"ok": True, **structured})
+
     # ── get_files ──
     @mcp.tool()
     async def get_files(
@@ -785,21 +932,24 @@ def build_mcp(
             ),
         ),
         max_bytes_per_file: int = Field(
-            default=8192,
+            default=GET_FILES_DEFAULT_BYTES,
             description=(
-                "Truncate each file to this many bytes. Hard cap 65536."
+                "Truncate each file to this many bytes. Hard cap "
+                f"{GET_FILES_HARD_CAP_BYTES}."
             ),
         ),
     ) -> ToolResult:
-        """Read files back from the running sandbox's ``/app``.
+        """List ``/app``, or fetch files raw (binary as base64).
 
-        Call this when you need to verify what's actually on disk — for
-        instance before writing an overlay that references code you
-        didn't author in this session, or after a ``⚠ recreated``
-        notice from write_files, to rebuild your picture of /app.
+        With no ``paths``: a listing of every file under /app with its
+        size — the way to see what exists. With ``paths``: each file's
+        raw content (first ``max_bytes_per_file`` bytes), binary files as
+        base64 — the same shape ``write_files`` accepts.
 
-        Binary files are returned as base64 with the ``encoding`` field
-        set — the same shape you'd feed back to ``write_files``.
+        To read SOURCE code before changing it, use ``read_file``
+        instead: it returns numbered lines for a window of the file,
+        which is what ``edit_file`` needs, without pulling the whole file
+        into the conversation.
         """
         log.info(
             "MCP tool call: get_files session=%s paths=%s",
@@ -819,19 +969,34 @@ def build_mcp(
             if err:
                 text_lines.append(f"- {entry['path']}: ERROR ({err})")
                 continue
+            encoding = entry.get("encoding")
+            kind = f", {encoding}" if encoding else ""
             text_lines.append(
-                f"- {entry['path']} "
-                f"({entry['size']:,} bytes, {entry['encoding']}){marker}"
+                f"- {entry['path']} ({entry.get('size', 0):,} bytes{kind}){marker}"
             )
+        structured = {"ok": True, **result}
         if paths:
-            # Include contents inline for path-specific reads.
+            # Contents go inline in the text for path-specific reads — and
+            # only there: structured_content carries the metadata, not a
+            # second copy of every file.
             for entry in result["files"]:
                 if entry.get("error"):
                     continue
                 text_lines.append("")
                 text_lines.append(f"--- {entry['path']} ---")
-                text_lines.append(entry["content"])
-        return _tool_result("\n".join(text_lines), {"ok": True, **result})
+                text_lines.append(entry.get("content", ""))
+                if entry.get("truncated"):
+                    shown = len((entry.get("content") or "").encode("utf-8"))
+                    text_lines.append(
+                        f"--- truncated: first {shown:,} of "
+                        f"{entry.get('size', 0):,} bytes (use read_file for "
+                        "numbered windows of a long text file) ---"
+                    )
+            structured["files"] = [
+                {k: v for k, v in entry.items() if k != "content"}
+                for entry in result["files"]
+            ]
+        return _tool_result("\n".join(text_lines), structured)
 
     # ── get_logs ──
     @mcp.tool()
@@ -918,7 +1083,7 @@ def build_mcp(
         )
 
     # ── exec ──
-    @mcp.tool()
+    @mcp.tool(description=EXEC_DESCRIPTION)
     async def exec(
         session_id: str = Field(
             description="The target session."
@@ -931,8 +1096,10 @@ def build_mcp(
             )
         ),
         timeout_seconds: int = Field(
-            default=30,
-            description="Command timeout in seconds. Hard cap 120.",
+            default=EXEC_DEFAULT_TIMEOUT_S,
+            description=(
+                f"Command timeout in seconds. Hard cap {EXEC_HARD_TIMEOUT_S}."
+            ),
         ),
         working_dir: str = Field(
             default="/app",
@@ -942,32 +1109,7 @@ def build_mcp(
             ),
         ),
     ) -> ToolResult:
-        """Run a non-interactive shell command inside a running sandbox.
-
-        Use this for:
-          * Installing a package the model forgot: `pip install requests`
-          * Ad-hoc introspection: `ls -la /app`, `cat /tmp/streamlit.log`
-          * One-off scripts: `python migrate.py`, `npx prisma generate`
-
-        Important caveats:
-          1. State DRIFT on respawn — packages installed via exec do NOT
-             survive a self-heal respawn. If the model wants the dep to
-             persist, ALSO write it to requirements.txt / package.json via
-             write_files:
-                 exec(sid, "pip install requests")             # immediate
-                 write_files(sid, {"requirements.txt": "..."}) # persist
-          2. No interactive commands — anything that reads stdin hangs.
-          3. No long-running processes — a `&`-backgrounded process is
-             killed when exec finishes. Long-running services belong in
-             the runtime entrypoint set at create time.
-          4. Egress allowlist still applies — a `pip install` from a
-             non-allowlisted index gets a 403 from sandbox-egress. If the
-             install fails with a network error, tell the user which
-             registry needs to be added to tinyproxy.filter.
-
-        Output is truncated to the last 8 KB with a marker; exit_code and
-        duration are always populated.
-        """
+        # Description: EXEC_DESCRIPTION (built from constants.py).
         log.info(
             "MCP tool call: exec session=%s cmd=%r timeout=%d",
             session_id, command, timeout_seconds,
@@ -978,24 +1120,10 @@ def build_mcp(
             )
         except HTTPException as exc:
             return _handle_http_exception(exc, tool="exec")
-        head_lines = []
-        if result.get("timed_out"):
-            head_lines.append(
-                f"Command `{command}` in sandbox `{result['sandbox_id']}` "
-                f"KILLED after {timeout_seconds}s (timeout)."
-            )
-        else:
-            head_lines.append(
-                f"Command `{command}` in sandbox `{result['sandbox_id']}` "
-                f"exited {result['exit_code']} in "
-                f"{result['duration_ms']} ms."
-            )
-        head_lines.append("")
-        trunc = " (last 8 KB)" if result.get("truncated") else ""
-        head_lines.append(f"--- output{trunc} ---")
-        head_lines.append(result["output"] or "(no output)")
-        head_lines.append("---")
-        return _tool_result("\n".join(head_lines), {"ok": True, **result})
+        return _tool_result(
+            _format_exec(command, timeout_seconds, result),
+            _exec_structured(result),
+        )
 
     # ── preview ──
     @mcp.tool()
@@ -1013,13 +1141,13 @@ def build_mcp(
 
         Display-only: preview does NOT touch the container, does NOT
         self-heal, and does NOT count as activity (no last_used_at bump
-        happens here — that's write_files / exec / get_logs). If the
-        container is gone, this returns 404 with a hint to call
-        write_files first with recreate_if_gone=true.
+        happens here — that's write_files / read_file / edit_file /
+        exec). If the container is gone, this returns 404 with a hint to
+        call write_files first with recreate_if_gone=true.
 
         Call this once per turn when you want the user to see the
-        current state. Iterate with write_files silently between
-        previews.
+        current state. Iterate silently between previews — edit_file for
+        changes, exec to run tests.
         """
         log.info("MCP tool call: preview session=%s", session_id)
         try:
@@ -1122,6 +1250,7 @@ def build_mcp(
         deletes: list[str],
         env: Optional[dict[str, str]],
         chat_id: Optional[str] = None,
+        overwrite: bool = False,
     ) -> ToolResult:
         try:
             result = await run_callable(
@@ -1134,6 +1263,7 @@ def build_mcp(
                 env=env,
                 recreate_if_gone=True,
                 chat_id=chat_id,
+                overwrite=overwrite,
             )
         except HTTPException as exc:
             return _handle_http_exception(exc, tool="run")
@@ -1151,22 +1281,21 @@ def build_mcp(
         if reused:
             hint = (
                 f"You updated {n_files} file(s) in session `{session_id_out}` "
-                "— everything else in /app was preserved. To iterate silently: "
-                "prefer patch_files for a small edit at known lines "
-                "(cheapest — no re-upload); use write_files when replacing "
-                "a whole file or adding a new one. Call preview to hand the "
-                "user a fresh iframe when you're ready."
+                "— everything else in /app was preserved. To iterate "
+                "silently: read_file + edit_file for changes to existing "
+                "files, write_files only for new ones, exec to run tests. "
+                "Call preview to hand the user a fresh iframe when you're "
+                "ready."
             )
         else:
             hint = (
-                f"To EDIT this preview on the next turn: prefer "
-                f"patch_files(session_id=\"{session_id_out}\", patches=[...]) "
-                "for a small edit at known lines — it edits in place with a "
-                "byte-for-byte match on `expected`, no whole-file re-upload. "
-                f"Use write_files(session_id=\"{session_id_out}\", files={{...}}) "
-                "when replacing a whole file, adding a new file, or when your "
-                "picture of the file has drifted. Either way, DO NOT re-send "
-                "unchanged files. The container keeps running and hot-reloads."
+                f"To CHANGE this app: read_file(session_id=\"{session_id_out}\", "
+                "path=...) to see the numbered lines, then "
+                f"edit_file(session_id=\"{session_id_out}\", path=..., "
+                "old_string=..., new_string=...) — send only the text that "
+                f"changes. Add NEW files with write_files(session_id=\"{session_id_out}\", "
+                "files={...}). Never re-send unchanged files. The container "
+                "keeps running and hot-reloads."
             )
         startup_section = _format_startup_output(
             result.get("runtime"), result.get("startup_output") or "",
@@ -1206,8 +1335,9 @@ def build_mcp(
             description=(
                 "Path → content map. First call (no session_id): full "
                 "initial file set. Follow-up (with session_id): overlay — "
-                "only send changed files. Values are UTF-8 str or "
-                "{encoding:'base64', content:'...'} for binaries."
+                "only NEW files; change existing ones with edit_file. "
+                "Values are UTF-8 str or {encoding:'base64', content:'...'} "
+                "for binaries."
             ),
         ),
         entrypoint: Optional[str] = Field(
@@ -1253,6 +1383,10 @@ def build_mcp(
                 "Pass it on every run for the chat."
             ),
         ),
+        overwrite: bool = Field(
+            default=False,
+            description="Follow-up calls only. " + OVERWRITE_FIELD_DESCRIPTION,
+        ),
     ) -> ToolResult:
         """Convenience one-shot: create + write_files + preview.
 
@@ -1265,23 +1399,30 @@ def build_mcp(
           * The user pasted code and just wants it running.
           * You have a small, complete app and no separate compose step.
 
-        Prefer the get_runtime_types → create → write_files → preview flow
+        Prefer the flow get_runtime_types → create → write_files (new
+        files) → read_file / edit_file (changes) → exec → preview → close
         when:
           * The container should warm up while you finish writing code
             (pipelining wins on latency).
           * You want to update files silently across several turns and
             only surface the iframe once.
 
+        After the first call, change existing files with read_file +
+        edit_file, not by calling run again with the whole file: a
+        follow-up run that re-sends a mostly-unchanged existing file is
+        refused (rewrite_of_existing_file) unless overwrite=true.
+
         Both paths produce the same URL semantics — session_id is stable,
         the container hot-reloads, self-heal is implicit here.
         """
         log.info(
-            "MCP tool call: run runtime=%s session=%s chat=%s n_files=%d",
-            runtime, session_id, chat_id, len(files or {}),
+            "MCP tool call: run runtime=%s session=%s chat=%s n_files=%d "
+            "overwrite=%s",
+            runtime, session_id, chat_id, len(files or {}), overwrite,
         )
         return await _run_impl(
             runtime, files, entrypoint, ttl_seconds, session_id, deletes, env,
-            chat_id,
+            chat_id, overwrite,
         )
 
     return mcp

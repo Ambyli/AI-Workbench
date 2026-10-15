@@ -43,6 +43,7 @@ Per-container hardening (all applied by `spawner.py`):
 - `--memory 512m --cpus 1 --pids-limit 256` — resource caps.
 - `--user 1000:1000` — non-root.
 - No host bind-mounts. Caller files are injected via the Docker SDK's `put_archive` into `/app` (in-memory tarball → tmpfs).
+- Everything injected is owned by the sandbox user, not root. Docker's `put_archive` extraction runs as root on the daemon and applies each tar header's uid/gid, so `spawner.py::_build_app_tarball` stamps every entry `1000:1000` (`SANDBOX_UID` / `SANDBOX_GID` in `constants.py`) — files `0644`, plus an explicit `0755` entry for every parent directory, because a parent the tar does not list is created root-owned. `/app` itself is chowned to `1000:1000` in each base image: a tar cannot change it (Docker skips a `.` entry whose target exists). Without it files would land root-owned and `exec` could not create or edit files beside them (`cannot create test.js: Permission denied`). This gives the sandbox user write access to its own `/app` only; it grants no capability and no path outside the container.
 - No `docker.sock` access. Only `sandbox-runner` has this.
 
 ## Security-invariant checklist
@@ -125,14 +126,15 @@ The runner is split across:
 - [`constants.py`](runner/constants.py) — single source of truth for every configuration knob and compile-time limit (payload caps, TTLs, exec timeouts, container hardening, session-id regex, reserved env keys, etc.). Leaf module — imports only stdlib. Env-derived values are read at first import; `common.env.load_env()` runs before that in `app.py`.
 - [`state.py`](runner/state.py) — module-level singletons (`registry`, `spawner`, `reaper`, `slot_sem`) populated in `lifespan()`.
 - [`models.py`](runner/models.py) — pydantic request/response models and the shared validators (files-map, env). Constants come from `constants.py`.
-- [`operations.py`](runner/operations.py) — `_do_*` core operations shared between HTTP endpoints and MCP tools. `_reuse_or_spawn` (the legacy `POST /run` + `run` MCP path) lives here.
+- [`operations.py`](runner/operations.py) — `_do_*` core operations shared between HTTP endpoints and MCP tools. `_reuse_or_spawn` (behind `POST /run`, the `run` MCP tool and `/tool/run`) lives here.
 - [`tool_server.py`](runner/tool_server.py) — OpenWebUI Tool Server sub-app, mounted at `/tool`.
 - [`sandbox_mcp.py`](runner/sandbox_mcp.py) — FastMCP tool surface, mounted at `/mcp`.
-- [`spawner.py`](runner/spawner.py) — Docker interactions (spawn / spawn_empty / write_files / patch_files / exec_command / read_files / probe_health).
+- [`spawner.py`](runner/spawner.py) — Docker interactions (spawn / spawn_empty / write_files / put_files / exec_command / read_files / read_file_bytes / read_existing_files / probe_health).
+- [`textops.py`](runner/textops.py) — pure text rules behind `read_file` / `edit_file` / the `write_files` rewrite guard / exec and get_files truncation (numbering, exact-string edit with closest-region diagnostics, `difflib` similarity, UTF-8 boundaries). Stdlib only; leaf module. **Listed in the runner `Dockerfile`'s `COPY` like every other module.**
 - [`reaper.py`](runner/reaper.py) — TTL and idle-TTL sweeper.
 - [`runtimes.py`](runner/runtimes.py) — runtime registry (`static`, `python`, `node`).
 
-Import graph is strictly one direction: `app.py` → `operations.py` → `models.py` / `spawner.py` / `runtimes.py` / `state.py` → `constants.py`. `tool_server.py` also imports `operations.py` and `models.py`. `reaper.py` imports `constants.py` and `spawner.py`. Nothing imports back into `app.py`.
+Import graph is strictly one direction: `app.py` → `operations.py` → `models.py` / `spawner.py` / `runtimes.py` / `state.py` / `textops.py` → `constants.py` (`textops.py` imports nothing from the runner). `tool_server.py` also imports `operations.py` and `models.py`. `reaper.py` imports `constants.py` and `spawner.py`. Nothing imports back into `app.py`.
 
 ### Browser console capture
 
@@ -202,7 +204,7 @@ All base images normalize the app port to **80** so `sandbox-proxy` can statical
 
 ## MCP tool flow
 
-The sandbox subsystem exposes an MCP server named `sandbox` with 11 tools. Models compose them into a workflow that maps to the way a human dev works — warm the runtime, iterate silently, hand the user something to look at, tear down.
+The sandbox subsystem exposes an MCP server named `sandbox` with 12 tools. Models compose them into a workflow that maps to the way a human dev works — warm the runtime, write the files, change them with small edits, run them, hand the user something to look at, tear down. The file tools follow Claude Code's contract (see [Editing files](#editing-files)):
 
 ```
 get_runtime_types  ─── optional, first time on a deployment
@@ -211,11 +213,13 @@ get_runtime_types  ─── optional, first time on a deployment
 create          ─── returns session_id + warming URL; env fixed here
       │
       ▼
-write_files    ─── loop: overlay files; post-update health probe
-      │  ▲              recreate_if_gone=false (default) surfaces respawn choice
-      │  └─── get_files / get_logs / exec (read/modify on demand)
-      │  └─── patch_files (strict line-range edits after get_files)
-      │  └─── list_sessions (recover dropped handles)
+write_files    ─── NEW files (or full rewrites); post-update health probe
+      │              recreate_if_gone=false (default) surfaces respawn choice
+      ▼
+read_file / edit_file ─── loop: numbered window, then exact-string edit
+      │  ▲              (write_files refuses to re-send a mostly-unchanged file)
+      │  └─── exec (run tests, install a package) / get_logs
+      │  └─── get_files (dir listing, binary files) / list_sessions
       ▼
 preview         ─── show the user the iframe artifact
       │
@@ -236,11 +240,12 @@ Tool summary:
 |---|---|---|
 | `get_runtime_types` | read | Describe RUNTIME TYPES this deployment supports (catalog — not a session status check) |
 | `create` | write | Reserve an empty warming container, return session_id + URL |
-| `write_files` | write | Overlay files into a live sandbox; opt-in self-heal; post-update health probe |
-| `get_files` | read | Read files back from `/app` (dir listing when `paths` is omitted) |
+| `write_files` | write | NEW files / complete rewrites; rewrite guard (`overwrite`); opt-in self-heal; post-update health probe |
+| `read_file` | read | Numbered line window (`offset` / `limit`) of one text file |
+| `edit_file` | write | Exact-string edit (`old_string` → `new_string`, unique or `replace_all`) — how part of an existing file is changed |
+| `get_files` | read | Dir listing when `paths` is omitted; raw contents (binary as base64) otherwise |
 | `get_logs` | read | Tail container stdout+stderr for the session |
 | `exec` | write | Run a non-interactive shell command inside the container |
-| `patch_files` | write | Strict line-range file edits; all-or-nothing; byte-for-byte match required |
 | `preview` | display | Return the iframe artifact for the user's chat |
 | `close` | write | Tear down the session early, release the slot |
 | `list_sessions` | read | Enumerate live sandboxes (recover dropped session_ids) |
@@ -248,7 +253,9 @@ Tool summary:
 
 ### Data shapes shared by every write tool
 
-**`files` overlay.** Path → value map. Values are either UTF-8 strings (the common case) OR a discriminated dict `{"encoding": "base64", "content": "..."}` for binary content (images, PDFs, wheels). The pydantic validator enforces per-file (`SANDBOX_MAX_FILE_BYTES`) and total (`SANDBOX_MAX_PAYLOAD_BYTES`) caps at request-parse time — base64 values count their DECODED length. Absolute paths and `..` traversal are rejected downstream in the spawner.
+**`files` overlay.** Path → value map. Values are either UTF-8 strings (the common case) OR a discriminated dict `{"encoding": "base64", "content": "..."}` for binary content (images, PDFs, wheels). The pydantic validator enforces per-file (`SANDBOX_MAX_FILE_BYTES`) and total (`SANDBOX_MAX_PAYLOAD_BYTES`) caps at request-parse time — base64 values count their DECODED length — on BOTH paths: the MCP adapters in `app.py` build the same request models as the HTTP routes (`operations._validate_tool_args`). Absolute paths and `..` traversal are rejected downstream in the spawner.
+
+**`overwrite` on `write_files` / `run`.** Default `false`: a write that re-sends an existing text file of 30+ lines while keeping half or more of its lines is refused with `409 rewrite_of_existing_file` — see [Editing files](#editing-files).
 
 **`env` at create time.** Process env vars set inside the container. Immutable after spawn — a self-heal respawn replays the same env from the job's metadata JSONB, but there is no update path. Reserved keys (`HTTP_PROXY`, `HTTPS_PROXY`, `PYTHONUNBUFFERED`, `NPM_CONFIG_LOGLEVEL`, `FORCE_COLOR`, `TERM`) are rejected at validation — those are runner-controlled invariants that keep the egress allowlist and log buffering working; the spawner re-applies them on top of the merged env even if a validation bypass ever landed.
 
@@ -266,9 +273,9 @@ The guard has two layers. A cheap metadata **lookup** (`_find_active_session_by_
 Every MCP tool returns a `ToolResult` with two channels:
 
 - `content[0]` is a `TextContent` block (what the model sees, same shape as the pre-refactor tool responses).
-- `structured_content` is a JSON payload the caller can parse without regex. Fields depend on the tool: `create` / `run` include `session_id`, `sandbox_id`, `url`, `expires_at`, `runtime`, `app_status`; `write_files` adds `files_written` / `files_deleted` / `recreated`; `exec` returns `exit_code`, `duration_ms`, `output`, `truncated`, `timed_out`; and so on. See [`sandbox_mcp.py`](runner/sandbox_mcp.py) for the exact shapes.
+- `structured_content` is a JSON payload the caller can parse without regex. Fields depend on the tool: `create` / `run` include `session_id`, `sandbox_id`, `url`, `expires_at`, `runtime`, `app_status`; `write_files` adds `startup_output` / `recreated`; `read_file` returns `path`, `start_line`, `end_line`, `total_lines`, `truncated`; `edit_file` returns `path`, `replacements`, `start_line`, `end_line`, `match_lines`, `app_status`; `exec` returns `exit_code`, `duration_ms`, `truncated`, `timed_out`; and so on. See [`ENDPOINTS.md § MCP`](ENDPOINTS.md#mcp) for every shape.
 
-The text form preserves everything a model needs to reply — the fenced ```` ```html ```` block for `preview` / `run`, the `Session id:` line for follow-ups, the health-probe verdict, the startup-output tail. The structured payload is additive.
+The text form preserves everything a model needs to reply — the fenced ```` ```html ```` block for `preview` / `run`, the `Session id:` line for follow-ups, the health-probe verdict, the startup-output tail. Content that is already in the text — `exec` output, `get_files` file contents, `read_file` lines, the `edit_file` snippet — is NOT repeated in `structured_content`, and `exec` echoes only the first line of the command: every duplicate is context the model pays for on every later turn.
 
 ## HTTP endpoints
 
@@ -281,9 +288,10 @@ The text form preserves everything a model needs to reply — the fenced ```` ``
 | `POST /create` | reserve an empty warming container. Backing endpoint for `sandbox.create` |
 | `GET /sessions` | enumerate live sessions. Backing endpoint for `sandbox.list_sessions` |
 | `POST /session/{id}/files` | overlay files into a running sandbox. Backing endpoint for `sandbox.write_files` |
-| `GET /session/{id}/files` | read files back from `/app`. Backing endpoint for `sandbox.get_files` |
+| `GET /session/{id}/files` | dir listing, or raw file contents from `/app`. Backing endpoint for `sandbox.get_files` |
+| `GET /session/{id}/file` | numbered line window of one text file. Backing endpoint for `sandbox.read_file` |
+| `POST /session/{id}/edit` | exact-string edit of one file. Backing endpoint for `sandbox.edit_file` |
 | `POST /session/{id}/exec` | run a non-interactive shell command inside the container. Backing endpoint for `sandbox.exec` |
-| `POST /session/{id}/patch` | strict line-range file edits (all-or-nothing). Backing endpoint for `sandbox.patch_files` |
 | `GET /session/{id}/logs` | tail container stdout+stderr. Backing endpoint for `sandbox.get_logs` |
 | `GET /session/{id}/download` | stream `/app` as a tar archive (session-based; follows self-heal) |
 | `DELETE /session/{id}` | tear a session's sandbox down early. Backing endpoint for `sandbox.close` |
@@ -545,8 +553,10 @@ Design constraints:
 
 - **Non-interactive.** stdin is closed by the SDK's exec_start. A command that prompts for input hangs until the timeout kicks in — models MUST use non-interactive flags (`-y`, `--yes`, `PIP_YES=1`).
 - **Timeout hard-capped at 120 s.** Default 30 s. Enforced by wall-clock deadline on the exec_start stream — the exec is left dangling on timeout (Docker cleans it up when the container is torn down); the tool response is marked `timed_out`.
-- **Output truncated to 8 KB.** Prefixed with `(last 8 KB)` when truncation happened. Enough for pip/npm summaries and most tracebacks; anything longer belongs in `get_logs`.
-- **Runs as 1000:1000.** Matches the base image's non-root user. `sudo` is not available.
+- **Output: the last 8 KB.** The spawner keeps a ring buffer of the LAST `EXEC_MAX_OUTPUT_BYTES` (8 KiB), cut forward to a UTF-8 character boundary, and sets `truncated` when earlier output was dropped — the error at the end of a long build or test run survives. The MCP text labels it `(last 8 KiB — earlier output dropped)`; anything longer belongs in `get_logs`.
+- **Short echo.** The `exec` MCP result shows only the command's first line, cut to 120 characters (`EXEC_COMMAND_ECHO_CHARS`), plus `(+N more lines)`; `structured_content` carries no `command` and no `output`, so a heredoc does not enter the context twice. (The HTTP response includes `command`.) The tool description steers source writes away from heredocs: new files go through `write_files`, changes through `edit_file`.
+- **Runs as 1000:1000.** Matches the base image's non-root user. `sudo` is not available. `/app` and everything `write_files` / `edit_file` put there are owned by that user, so `exec` can create, edit and delete files and directories anywhere under `/app`.
+- **The command is a shell script, not one command.** It runs as `sh -c 'cd <working_dir> || exit 1<newline><command>'` — multi-line scripts, heredocs, `;` / `&&` chains, `VAR=x cmd` and shell keywords all work. The command is deliberately not prefixed with `exec`: that would replace the shell with the first simple command, so a heredoc write followed by `node test.js` would never run node.
 - **State drift on respawn.** Packages installed via `exec` do NOT survive a self-heal respawn — the container is rebuilt from the base image and only `env` is preserved. Models should ALSO write persistent deps to `requirements.txt` / `package.json` via `write_files` when appropriate:
   ```
   exec(sid, "pip install requests")                # immediate fix
@@ -557,61 +567,57 @@ Design constraints:
 
 Security analysis: `exec` opens no new escape path. The sandbox container is isolated by network segmentation, not by command-layer sandboxing — anything the container can do, the model could already do via a `python -c` embedded in the entrypoint. What `exec` opens is CPU/RAM inside the sandbox, already bounded by cgroups and the reaper's TTL.
 
-### Targeted edits (patch_files)
+### Editing files
 
-The `patch_files` MCP tool (backed by `POST /session/{id}/patch`) does strict line-range replacement inside a running sandbox's `/app`. It exists to close the "small change to a large file" gap in the tool set: when the model is fixing one function in a 40 KB `app.py`, sending the whole file through `write_files` burns tokens and forces a whole-file mtime bump that trips a full dev-server reload.
-
-**When to use `patch_files` vs `write_files`:**
-
-- **`patch_files`** — small targeted edits in files you've called `get_files` on this turn. The rule of thumb: <20–30% of the file changes. Never for new files (patch_files does NOT create files).
-- **`write_files`** — new file, whole-file rewrite, or refactor touching a majority of the file. Overlay semantics, no expected-content check.
-- **Rule the model bakes in:** if you have not called `get_files` on this file in the current turn, use `write_files` instead. The `expected` field must match the current file byte-for-byte.
-
-**Strict byte-for-byte match.** Every patch specifies `path`, `start_line`, `end_line` (both 1-indexed inclusive), `expected`, and `replacement`. The runner reads the current file, extracts `\n`-join(lines[start_line-1 : end_line]), and compares byte-for-byte to `expected`. No whitespace or trailing-newline lenience. Mismatch returns 409 with the ACTUAL current content inline so the model retries in the same turn without a separate `get_files` round trip:
+The model-facing file tools follow Claude Code's contract — **read a window, edit by exact text, write only new files**. Editing must be cheaper than rewriting: a model that re-sends whole files on every change, or gets every command echoed back, fills its context in a few turns (an Open WebUI chat on muse-glimmer reached ~100k prompt tokens that way).
 
 ```
-patch_files failed: expected content mismatch at app.py:15-18.
-
-Your `expected`:
-    def foo(x):
-        return x + 1
-
-Actual (currently in file):
-    def foo(x, y):
-        return x + y
-
-No files were modified. Call get_files(paths=["app.py"]) to refresh
-your view, then reissue patch_files with the correct `expected` content.
-The other patches in this call were NOT applied.
+read_file(session_id, path, offset?, limit?)          → numbered lines of a window
+edit_file(session_id, path, old_string, new_string,   → exact-string replacement,
+          replace_all?)                                  short confirmation + snippet
+write_files(session_id, files, overwrite?)            → NEW files / full rewrites only
 ```
 
-**Overlap rejection.** Two patches on the same `path` whose `[start_line, end_line]` ranges intersect cause the entire call to be rejected. Boundary-touching ranges count as overlapping (`[10-15]` and `[15-20]` both include line 15). The response names both patch indices and asks the caller to combine them into ONE patch on the merged range. Auto-merging is not attempted — the semantics of "two overlapping replacements" are ambiguous enough that failing loudly beats guessing.
+**`read_file`** (`GET /session/{id}/file`) returns `cat -n`-style text — line number, TAB, line — for `offset` (1-based, default 1) and `limit` (default 400, max 2000) lines, plus a header `path (lines a-b of N)` and, when cut, `… N more lines; call read_file with offset=b+1`. Lines over 2000 characters are cut with a marker; only the first 256 KiB of a file is read (past that, use `exec` + `sed -n`). A binary or non-UTF-8 file is refused with a pointer to `get_files`, which keeps its base64 path. The numbered text is in the tool's text only — `structured_content` carries `path`, `start_line`, `end_line`, `total_lines`, `truncated`. Constants: `READ_FILE_*` in [`constants.py`](runner/constants.py).
 
-**Atomicity.** Every patch validates in a dry-run pass BEFORE any file is touched. Only if every patch across every file passes the checks (path safety → file exists → UTF-8 → line range in bounds → expected byte-for-byte match → no per-file overlap) does the apply pass run. If a caller sends 10 patches and #7 fails validation, none of the other 9 are applied.
+**`edit_file`** (`POST /session/{id}/edit`) is **the preferred way to change a file**: `old_string` → `new_string` in one existing file, `old_string` copied from `read_file` output without the line-number prefix. The rules (all in [`textops.py`](runner/textops.py), pure and unit-tested):
 
-**Apply order.** Per-file, bottom-up by `start_line` descending — earlier-line indices stay valid under later-line replacements. Each file is written in a single `put_archive`, so a mid-batch failure never leaves a file half-written.
+- the file must exist and be UTF-8 (`missing_file` → create it with `write_files`; `binary_file`);
+- `old_string` non-empty (`empty_old_string`) and different from `new_string` (`no_change`);
+- it must occur exactly once, unless `replace_all=true` (`multiple_matches` lists the line of every match);
+- not found → `not_found` carries the **closest region** of the file: the best window with as many lines as `old_string`, compared with surrounding whitespace stripped (`difflib.SequenceMatcher`), numbered like `read_file`, with its similarity and a `whitespace_only` flag — so the model can copy the real text and retry without re-reading the file. If every line of `old_string` starts with a `read_file` prefix (`<number><TAB>`), the error says so (`line_number_prefix`) instead.
 
-**Post-write behavior.** Same 500 ms settle + HTTP health probe against the runtime's `readiness_probe_path` on port 80 that `write_files` runs. `app_status` in the response tells the caller whether the edit broke the running app. `last_used_at` is bumped only on successful apply — failed dry-runs do not extend TTL.
+All or nothing: the edit is computed in memory, a `.py` result is compiled (`static lint failed` → nothing written), and only then is the file written — the reload marker first (so `startup_output` is what the dev server printed after THIS edit), then one `put_archive` through `_build_app_tarball` (owned `1000:1000`), then the usual `last_used_at` bump, settle, log tail and health probe. A file whose every newline is CRLF is matched in LF form and written back as CRLF; a trailing newline is preserved. The result is `Edited path: N replacement(s), lines a-b`, a numbered snippet with 3 lines of context each side (capped at 40 rows), the app status and the startup output — never the whole file. The edited file must fit `SANDBOX_MAX_FILE_BYTES` (`too_large`).
 
-**No self-heal.** `recreate_if_gone` is accepted in the request shape for interface consistency but has NO effect — a fresh container has no file to anchor on, so patch_files always returns 409 for a dead container with a hint to call `write_files` first (with `recreate_if_gone=true` if a respawn is desired).
-
-**Payload limits.** Same envelope as `write_files`: each patch's UTF-8 `expected` + `replacement` bytes count toward `SANDBOX_MAX_FILE_BYTES` per patch, and the sum across all patches counts toward `SANDBOX_MAX_PAYLOAD_BYTES` — rejected at pydantic validation.
-
-**Worked flow.** Model reads the file, patches a hunk, tries again on mismatch:
+**`write_files` rewrite guard.** `write_files` is for new files and complete rewrites. Before writing, every listed path that already exists as a UTF-8 text file of at least `WRITE_GUARD_MIN_LINES` (30) lines is compared with the new content line by line; if it keeps `WRITE_GUARD_SIMILARITY` (0.5) or more of its lines and `overwrite` is not `true`, the WHOLE call is refused with `409 rewrite_of_existing_file` — nothing is written:
 
 ```
-1. get_files(session_id=sid, paths=["app.py"])   → returns full file bytes
-2. patch_files(session_id=sid, patches=[{
-       path: "app.py", start_line: 15, end_line: 18,
-       expected: "...exact bytes copied from step 1...",
-       replacement: "...new bytes..."
-   }])                                            → applied; app_status: HTTP 200
-3. If step 2 returned a `content_mismatch`, retry with the `actual`
-   content the 409 response included in the diagnostic. No extra
-   round trip to get_files required.
+failed: rewrite of existing file
+Session id: bfdYm3_H5SD4
+
+app.js already exists and your new content keeps 96% of its lines (12 of 310 changed).
+
+No files were written. Use edit_file for changes like this: read_file the part you are
+changing, then edit_file with old_string (the exact current text) and new_string. If you
+really mean to replace app.js wholesale, call write_files again with overwrite=true.
 ```
 
-Fidelity note: `get_files` returns UTF-8 content as raw text with no whitespace or trailing-newline mutation — the bytes you see are the bytes patch_files anchors against.
+New files, files under 30 lines, base64 values, binary existing files, genuine rewrites (ratio < 0.5) and `deletes` are unaffected. `run` follow-ups (which overlay into an existing session) are guarded the same way and take the same `overwrite`; the OpenWebUI Tool Server's `/tool/run` passes `overwrite=true`, because `run` is its only tool. Each existing path costs one `get_archive` read.
+
+**Worked flow:**
+
+```
+1. read_file(session_id=sid, path="app.js", offset=35, limit=15)
+     → "app.js (lines 35-49 of 310):\n35\t...\n40\t  return 'hi, ' + name;\n..."
+2. edit_file(session_id=sid, path="app.js",
+             old_string="  return 'hi, ' + name;",
+             new_string="  return `Hello, ${name}!`;")
+     → "Edited app.js: 1 replacement, lines 40-40." + 7 numbered lines + App status
+3. If step 2 says not_found, copy old_string from the "Closest text" block it printed
+   and call edit_file again — no extra read_file needed.
+```
+
+**Result size.** The same contract trims every echo: `exec` shows only the command's first line (≤ 120 characters, `+N more lines`) and leaves `command` and `output` out of `structured_content`; `get_files` with `paths` puts contents in the text only; `edit_file` returns a snippet, not the file.
 
 ### Env vars
 
@@ -628,7 +634,7 @@ Two knobs, both env-tunable:
 - `SANDBOX_MAX_FILE_BYTES` (default `1000000`) — per-file cap on every value in the `files` map (post-base64-decode).
 - `SANDBOX_MAX_PAYLOAD_BYTES` (default `10000000`) — total cap across all files in one request.
 
-Enforcement lives in `_validate_files_map` at pydantic validation, so a rejected payload never touches the tarball builder or the container. The 413 response names the largest offending path and the total submitted size so the caller can shrink or split across multiple `write_files` calls. Base64 values count their DECODED length so a client can't smuggle a large blob past the cap by encoding it.
+Enforcement lives in `_validate_files_map` at pydantic validation, so a rejected payload never touches the tarball builder or the container — on the HTTP routes (a `422`) and on the MCP tools (`run`, `write_files`, `edit_file`, through `operations._validate_tool_args`, rendered as `failed: payload too large`). The message names the largest offending path and the total submitted size so the caller can shrink or split across multiple `write_files` calls. Base64 values count their DECODED length so a client can't smuggle a large blob past the cap by encoding it. `edit_file` applies the per-file cap to `old_string`, `new_string` and the edited file.
 
 ## Configuration
 

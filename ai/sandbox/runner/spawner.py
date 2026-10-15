@@ -21,8 +21,10 @@ from __future__ import annotations
 import base64
 import io
 import logging
+import shlex
 import tarfile
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Optional, Union
 
@@ -36,11 +38,20 @@ from constants import (
     NANO_CPUS_PER_CPU,
     NET_NAME,
     PIDS_LIMIT,
+    SANDBOX_GID,
+    SANDBOX_UID,
+    SANDBOX_USER_NAME,
 )
+from common.textops import FileOpError, decode_utf8_prefix, utf8_tail
 from runtimes import Runtime
 
 
 log = logging.getLogger("sandbox-runner.spawner")
+
+# Go's os.ModeDir bit, as Docker reports it in the get_archive stat header
+# (X-Docker-Container-Path-Stat ``mode``). Lets a read refuse a directory
+# before streaming its whole tree.
+_GO_MODE_DIR = 1 << 31
 
 
 # Type alias for a single file entry in the runtime files map. Either a raw
@@ -123,36 +134,6 @@ class ExecResult:
     duration_ms: int
     truncated: bool
     timed_out: bool = False
-
-
-@dataclass
-class HunkResult:
-    """One applied hunk in a ``patch_files`` call."""
-
-    path: str
-    start_line: int
-    end_line: int
-    replaced_bytes: int
-    new_bytes: int
-
-
-@dataclass
-class PatchMismatch:
-    """Structured dry-run failure — no file was modified."""
-
-    kind: str  # "missing_file" | "out_of_range" | "content_mismatch" | "overlap"
-    path: str
-    start_line: Optional[int] = None
-    end_line: Optional[int] = None
-    expected: Optional[str] = None
-    actual: Optional[str] = None
-    file_line_count: Optional[int] = None
-    # For overlap errors — the range of the OTHER patch that intersects.
-    other_start_line: Optional[int] = None
-    other_end_line: Optional[int] = None
-    other_index: Optional[int] = None
-    patch_index: Optional[int] = None
-    message: str = ""
 
 
 class Spawner:
@@ -554,20 +535,83 @@ class Spawner:
                 })
                 continue
             try:
-                stream, stat = container.get_archive(f"/app/{safe}")
-            except NotFound:
+                data, size, truncated = _read_archive_file(
+                    container, safe, max_bytes_per_file,
+                )
+            except FileOpError as exc:
                 out.append({
                     "path": safe, "size": 0, "encoding": "utf-8",
                     "content": "", "truncated": False,
-                    "error": "not found",
+                    "error": (
+                        "not found" if exc.kind == "missing_file"
+                        else exc.message
+                    ),
                 })
                 continue
-            data, size, truncated = _extract_file_from_tar_stream(
-                stream, max_bytes_per_file,
-            )
             entry = _encode_bytes_for_response(safe, data, size, truncated)
             out.append(entry)
         return out
+
+    def read_file_bytes(
+        self, container_name: str, path: str, max_bytes: int,
+    ) -> tuple[str, bytes, int, bool]:
+        """Read ONE regular file under ``/app``: ``(safe_path, data,
+        real_size, truncated)`` with ``data`` capped at ``max_bytes``.
+
+        Backs ``read_file`` and ``edit_file``. Raises ``FileOpError`` —
+        ``unsafe_path`` / ``missing_file`` / ``is_directory`` /
+        ``not_a_file`` — rather than returning a partial answer. Decoding
+        and line handling are the caller's (``common.textops``)."""
+        safe = _safe_path_or_error(path)
+        container = self._client.containers.get(container_name)
+        data, size, truncated = _read_archive_file(container, safe, max_bytes)
+        log.debug(
+            "read_file_bytes: %s /app/%s size=%d read=%d truncated=%s",
+            container_name, safe, size, len(data), truncated,
+        )
+        return safe, data, size, truncated
+
+    def read_existing_files(
+        self, container_name: str, paths: list[str], max_bytes: int,
+    ) -> dict[str, bytes]:
+        """Current bytes of each of ``paths`` that exists as a regular
+        file of at most ``max_bytes`` — one ``get_archive`` per path.
+
+        Backs the write_files rewrite guard, which only cares about files
+        it could compare: missing paths, directories, unsafe paths (the
+        write itself rejects those) and files over the cap are left out
+        of the result instead of raising. Keys are the caller's paths."""
+        container = self._client.containers.get(container_name)
+        out: dict[str, bytes] = {}
+        for p in paths:
+            try:
+                safe = _safe_relpath(p)
+                data, _size, truncated = _read_archive_file(
+                    container, safe, max_bytes,
+                )
+            except (ValueError, FileOpError):
+                continue
+            if not truncated:
+                out[p] = data
+        log.debug(
+            "read_existing_files: %s %d of %d path(s) exist",
+            container_name, len(out), len(paths),
+        )
+        return out
+
+    def put_files(self, container_name: str, files: dict[str, bytes]) -> None:
+        """Write already-encoded ``{relpath: bytes}`` into ``/app`` in one
+        ``put_archive``. Used by ``edit_file``; goes through
+        ``_build_app_tarball`` like every other write, so the file and its
+        parents stay owned by the sandbox user."""
+        safe_files = {_safe_relpath(p): data for p, data in files.items()}
+        container = self._client.containers.get(container_name)
+        tarball = _build_app_tarball(safe_files)
+        container.put_archive("/app", tarball)
+        log.info(
+            "put_files: %s ← %d file(s) via put_archive (%d bytes tar)",
+            container_name, len(safe_files), len(tarball),
+        )
 
     def exec_command(
         self,
@@ -591,9 +635,10 @@ class Spawner:
         1000:1000 whose command line looks like ours — cheaper than
         tracking PIDs across the two-phase spawn.
 
-        Output is truncated to ``max_output_bytes`` (default 8 KB set at
-        the app layer). Truncation prepends a marker line so the model
-        knows content was elided.
+        Output keeps the LAST ``max_output_bytes`` (default 8 KB set at
+        the app layer), cut forward to a UTF-8 character boundary, with
+        ``truncated=True`` when earlier output was dropped. The tail is
+        what matters: a failing build or test prints its error last.
         """
         log.info(
             "exec_command: %s cmd=%r timeout=%ds workdir=%s",
@@ -607,10 +652,7 @@ class Spawner:
             raise ValueError(str(exc))
 
         container = self._client.containers.get(container_name)
-        # Wrap with `cd` so we honor working_dir but keep the interpreter
-        # explicit. `sh -c` runs as a non-login shell so no rc files are
-        # sourced — same behaviour as the base image entrypoint.
-        wrapped = f"cd {safe_workdir} && exec {command}"
+        wrapped = _wrap_exec_command(safe_workdir, command)
 
         # exec_create + exec_start stream lets us enforce a wall-clock
         # timeout without depending on the container's own signal handling.
@@ -626,9 +668,14 @@ class Spawner:
 
         start = time.monotonic()
         deadline = start + timeout_seconds
-        chunks: list[bytes] = []
+        # Ring buffer of the LAST max_output_bytes: errors and summaries
+        # are at the end of a command's output, so the head is what gets
+        # dropped. Chunks are popped from the left once the bytes after
+        # them already cover the budget; the final join is trimmed to the
+        # exact budget on a UTF-8 boundary (``utf8_tail``).
+        chunks: deque[bytes] = deque()
+        kept = 0
         total = 0
-        truncated = False
         timed_out = False
 
         try:
@@ -642,23 +689,12 @@ class Spawner:
                 if time.monotonic() > deadline:
                     timed_out = True
                     break
-                remaining = max_output_bytes - total
-                if remaining <= 0:
-                    truncated = True
-                    # Drain the rest of the stream so exec_start's
-                    # underlying socket doesn't leak.
-                    for _ in stream:
-                        pass
-                    break
-                if len(chunk) > remaining:
-                    chunks.append(bytes(chunk[:remaining]))
-                    total += remaining
-                    truncated = True
-                    for _ in stream:
-                        pass
-                    break
-                chunks.append(bytes(chunk))
+                chunk = bytes(chunk)
+                chunks.append(chunk)
+                kept += len(chunk)
                 total += len(chunk)
+                while chunks and kept - len(chunks[0]) >= max_output_bytes:
+                    kept -= len(chunks.popleft())
         except APIError as exc:
             log.warning(
                 "exec_command: %s exec_start APIError: %s",
@@ -674,7 +710,8 @@ class Spawner:
             )
 
         duration_ms = int((time.monotonic() - start) * 1000)
-        output_bytes = b"".join(chunks)
+        truncated = total > max_output_bytes
+        output_bytes = utf8_tail(b"".join(chunks), max_output_bytes)
         output_text = output_bytes.decode("utf-8", errors="replace")
 
         if timed_out:
@@ -940,257 +977,6 @@ class Spawner:
                 container_name, len(deletes),
             )
 
-    def patch_files(
-        self,
-        container_name: str,
-        patches: list[dict],
-    ) -> tuple[list[HunkResult], Optional[PatchMismatch]]:
-        """Line-range strict-validation edits, all-or-nothing.
-
-        Each patch is a dict:
-            {path, start_line, end_line, expected, replacement, note?}
-
-        Line numbers are 1-indexed inclusive. ``expected`` MUST byte-for-byte
-        match ``\n``-join(current_lines[start_line-1 : end_line]) or the
-        entire call is rejected — the runner returns a ``PatchMismatch``
-        describing what it saw so the caller can retry inline.
-
-        Overlap check: two patches on the same ``path`` whose
-        ``[start_line, end_line]`` ranges intersect cause the entire call
-        to be rejected.
-
-        Returns ``(hunks_applied, mismatch)``. If ``mismatch`` is
-        non-None, ``hunks_applied`` is empty — no files were touched.
-
-        Path validation reuses ``_safe_relpath`` — same as ``write_files``
-        and ``deletes``. Line ending on the final line: we split with
-        ``splitlines(keepends=False)`` so the join is trailing-newline-
-        preserving as long as the caller's ``expected`` also omits its
-        trailing newline. If the caller passes a trailing newline, the
-        strict comparison catches it — the model retries with the right
-        shape.
-        """
-        container = self._client.containers.get(container_name)
-
-        # ── Dry-run pass: validate every patch before touching Docker ──
-        # We read every file once and keep the split-line snapshot around
-        # so the apply pass doesn't re-read.
-        file_lines: dict[str, list[str]] = {}
-        file_had_trailing_newline: dict[str, bool] = {}
-
-        # Group patches by path for the overlap check.
-        by_path: dict[str, list[tuple[int, dict]]] = {}
-        for idx, patch in enumerate(patches):
-            path_raw = patch.get("path", "")
-            try:
-                safe = _safe_relpath(path_raw)
-            except ValueError as exc:
-                log.warning(
-                    "patch_files: rejected unsafe path %r at patch #%d: %s",
-                    path_raw, idx + 1, exc,
-                )
-                return [], PatchMismatch(
-                    kind="unsafe_path",
-                    path=path_raw,
-                    patch_index=idx + 1,
-                    message=str(exc),
-                )
-            by_path.setdefault(safe, []).append((idx, patch))
-
-        # Overlap check per file.
-        for safe_path, entries in by_path.items():
-            entries.sort(key=lambda e: (e[1]["start_line"], e[1]["end_line"]))
-            for i in range(1, len(entries)):
-                prev_idx, prev = entries[i - 1]
-                cur_idx, cur = entries[i]
-                if cur["start_line"] <= prev["end_line"]:
-                    log.warning(
-                        "patch_files: overlap on %s — patch #%d [%d-%d] and "
-                        "patch #%d [%d-%d]",
-                        safe_path,
-                        prev_idx + 1, prev["start_line"], prev["end_line"],
-                        cur_idx + 1, cur["start_line"], cur["end_line"],
-                    )
-                    return [], PatchMismatch(
-                        kind="overlap",
-                        path=safe_path,
-                        start_line=cur["start_line"],
-                        end_line=cur["end_line"],
-                        other_start_line=prev["start_line"],
-                        other_end_line=prev["end_line"],
-                        patch_index=cur_idx + 1,
-                        other_index=prev_idx + 1,
-                        message=(
-                            f"Patch #{cur_idx + 1} covers lines "
-                            f"{cur['start_line']}-{cur['end_line']}; "
-                            f"patch #{prev_idx + 1} covers lines "
-                            f"{prev['start_line']}-{prev['end_line']}. "
-                            "Combine them into ONE patch whose expected + "
-                            "replacement cover the merged range."
-                        ),
-                    )
-
-        # File read + line-range + expected-content check for every patch.
-        # Reads are done once per file — the split-line snapshot is cached.
-        for safe_path, entries in by_path.items():
-            if safe_path not in file_lines:
-                try:
-                    stream, _stat = container.get_archive(f"/app/{safe_path}")
-                except NotFound:
-                    idx = entries[0][0]
-                    log.warning(
-                        "patch_files: missing file %r (patch #%d)",
-                        safe_path, idx + 1,
-                    )
-                    return [], PatchMismatch(
-                        kind="missing_file",
-                        path=safe_path,
-                        patch_index=idx + 1,
-                        message=(
-                            "patch_files does not create files; use "
-                            "write_files for new files."
-                        ),
-                    )
-                data, _size, _truncated = _extract_file_from_tar_stream(
-                    stream, 1 << 30,  # effectively unbounded for patching
-                )
-                try:
-                    text = data.decode("utf-8")
-                except UnicodeDecodeError as exc:
-                    idx = entries[0][0]
-                    log.warning(
-                        "patch_files: non-utf8 file %r (patch #%d): %s",
-                        safe_path, idx + 1, exc,
-                    )
-                    return [], PatchMismatch(
-                        kind="binary_file",
-                        path=safe_path,
-                        patch_index=idx + 1,
-                        message=(
-                            "cannot patch a non-UTF-8 file. Use "
-                            "write_files to overwrite it entirely."
-                        ),
-                    )
-                # Preserve trailing newline info so the writeback is
-                # byte-faithful. splitlines() drops the trailing empty
-                # entry after a final '\n', so we track it separately.
-                trailing_nl = text.endswith("\n")
-                file_had_trailing_newline[safe_path] = trailing_nl
-                file_lines[safe_path] = text.splitlines()
-
-            lines = file_lines[safe_path]
-            for patch_idx, patch in entries:
-                sl = patch["start_line"]
-                el = patch["end_line"]
-                if not (1 <= sl <= el <= len(lines)):
-                    log.warning(
-                        "patch_files: out of range on %r patch #%d "
-                        "[%d-%d], file has %d lines",
-                        safe_path, patch_idx + 1, sl, el, len(lines),
-                    )
-                    return [], PatchMismatch(
-                        kind="out_of_range",
-                        path=safe_path,
-                        start_line=sl,
-                        end_line=el,
-                        file_line_count=len(lines),
-                        patch_index=patch_idx + 1,
-                        message=(
-                            f"Patch #{patch_idx + 1} targets lines "
-                            f"{sl}-{el}, but {safe_path!r} has only "
-                            f"{len(lines)} line(s)."
-                        ),
-                    )
-                actual = "\n".join(lines[sl - 1 : el])
-                expected = patch.get("expected", "")
-                if not isinstance(expected, str):
-                    return [], PatchMismatch(
-                        kind="bad_expected_type",
-                        path=safe_path,
-                        start_line=sl,
-                        end_line=el,
-                        patch_index=patch_idx + 1,
-                        message="`expected` must be a string",
-                    )
-                if actual != expected:
-                    log.info(
-                        "patch_files: content mismatch on %r patch #%d "
-                        "[%d-%d]", safe_path, patch_idx + 1, sl, el,
-                    )
-                    return [], PatchMismatch(
-                        kind="content_mismatch",
-                        path=safe_path,
-                        start_line=sl,
-                        end_line=el,
-                        expected=expected,
-                        actual=actual,
-                        patch_index=patch_idx + 1,
-                        message=(
-                            f"Expected content at {safe_path}:"
-                            f"{sl}-{el} did not match the current file."
-                        ),
-                    )
-                replacement = patch.get("replacement", "")
-                if not isinstance(replacement, str):
-                    return [], PatchMismatch(
-                        kind="bad_replacement_type",
-                        path=safe_path,
-                        start_line=sl,
-                        end_line=el,
-                        patch_index=patch_idx + 1,
-                        message="`replacement` must be a string",
-                    )
-
-        # ── Apply pass: bottom-up per file so earlier-line numbers stay valid ──
-        # Files are rewritten as a single put_archive so an interrupted
-        # apply never leaves a file half-written.
-        applied: list[HunkResult] = []
-        new_files: dict[str, bytes] = {}
-        for safe_path, entries in by_path.items():
-            lines = list(file_lines[safe_path])  # copy so per-file work is isolated
-            # Sort descending by start_line so early-line indices don't
-            # shift under later replacements.
-            for patch_idx, patch in sorted(
-                entries, key=lambda e: e[1]["start_line"], reverse=True,
-            ):
-                sl = patch["start_line"]
-                el = patch["end_line"]
-                replacement = patch["replacement"]
-                expected = patch["expected"]
-                replacement_lines = replacement.split("\n") if replacement != "" else [""]
-                # Replace lines[sl-1 : el] with replacement_lines.
-                lines[sl - 1 : el] = replacement_lines
-                applied.append(HunkResult(
-                    path=safe_path,
-                    start_line=sl,
-                    end_line=el,
-                    replaced_bytes=len(expected.encode("utf-8")),
-                    new_bytes=len(replacement.encode("utf-8")),
-                ))
-            body = "\n".join(lines)
-            if file_had_trailing_newline.get(safe_path):
-                body += "\n"
-            new_files[safe_path] = body.encode("utf-8")
-
-        # One tarball, one put_archive — atomic w.r.t. Docker's snapshot.
-        buf = io.BytesIO()
-        with tarfile.open(fileobj=buf, mode="w") as tar:
-            for rel_path, payload in new_files.items():
-                info = tarfile.TarInfo(name=rel_path)
-                info.size = len(payload)
-                info.mode = 0o644
-                info.mtime = int(time.time())
-                tar.addfile(info, io.BytesIO(payload))
-        container.put_archive("/app", buf.getvalue())
-        log.info(
-            "patch_files: %s ← %d file(s), %d hunk(s) via put_archive "
-            "(%d bytes tar)",
-            container_name, len(new_files), len(applied), buf.tell(),
-        )
-        # Preserve caller-facing order by hunk position (path, start_line).
-        applied.sort(key=lambda h: (h.path, h.start_line))
-        return applied, None
-
     def list_managed(self) -> list[Container]:
         """Return every running container this subsystem owns.
 
@@ -1291,15 +1077,78 @@ def _make_tarball(files: dict[str, FileEntry]) -> bytes:
     Values are either str (UTF-8) or a discriminated dict for binary
     content — see ``_decode_file_entry``.
     """
+    decoded = {
+        _safe_relpath(rel_path): _decode_file_entry(content)
+        for rel_path, content in files.items()
+    }
+    return _build_app_tarball(decoded)
+
+
+def _owned_tarinfo(name: str) -> tarfile.TarInfo:
+    """A ``TarInfo`` owned by the sandbox user (``SANDBOX_UID``:``SANDBOX_GID``).
+
+    Docker's ``put_archive`` extraction (moby/go-archive ``Unpack``) runs
+    as root on the daemon side and ``lchown``s every entry to the uid/gid
+    in its tar header. ``tarfile.TarInfo`` defaults to 0:0, so without
+    this every injected file landed root-owned 0644 — readable by the
+    app, but not editable, replaceable or deletable by ``exec`` (which
+    runs as 1000:1000).
+    """
+    info = tarfile.TarInfo(name=name)
+    info.uid = SANDBOX_UID
+    info.gid = SANDBOX_GID
+    info.uname = SANDBOX_USER_NAME
+    info.gname = SANDBOX_USER_NAME
+    info.mtime = int(time.time())
+    return info
+
+
+def _parent_dirs(paths) -> list[str]:
+    """Every ancestor directory of ``paths`` (relative to ``/app``),
+    parents before children, ``/app`` itself excluded.
+
+    ``"a/b/c.txt"`` → ``["a", "a/b"]``. Empty and ``.`` segments are
+    dropped so ``"./x"`` or ``"a//b"`` yield the same directories Docker
+    would create.
+    """
+    dirs: set[str] = set()
+    for path in paths:
+        parts = [p for p in path.split("/") if p not in ("", ".")]
+        for depth in range(1, len(parts)):
+            dirs.add("/".join(parts[:depth]))
+    return sorted(dirs, key=lambda d: (d.count("/"), d))
+
+
+def _build_app_tarball(files: dict[str, bytes]) -> bytes:
+    """Pack already-validated ``{relpath: bytes}`` into a tar for
+    ``put_archive("/app", ...)``, with EVERY entry owned by the sandbox
+    user — explicit directory entries included.
+
+    The directory entries matter as much as the file ownership: for a
+    parent the tar does not list, Docker's extraction creates an
+    *implied* directory owned by root, mode 0755, so ``exec`` could not
+    create a file inside ``src/`` after ``write_files({"src/a.js": …})``.
+    Listing each parent (before its children) makes Docker create — or,
+    for one that already exists, re-own and re-mode — it as 1000:1000
+    0755, which also heals directories a pre-fix runner left root-owned.
+
+    ``/app`` itself is NOT listed: ``Unpack`` skips a ``.`` entry whose
+    target already exists, so a tar cannot change it. ``/app`` is owned
+    by 1000:1000 in the base images (``ai/sandbox/images/*.Dockerfile``).
+
+    Files keep mode 0644; directories get 0755.
+    """
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w") as tar:
-        for rel_path, content in files.items():
-            safe = _safe_relpath(rel_path)
-            data = _decode_file_entry(content)
-            info = tarfile.TarInfo(name=safe)
+        for dir_path in _parent_dirs(files.keys()):
+            info = _owned_tarinfo(dir_path)
+            info.type = tarfile.DIRTYPE
+            info.mode = 0o755
+            tar.addfile(info)
+        for rel_path, data in files.items():
+            info = _owned_tarinfo(rel_path)
             info.size = len(data)
             info.mode = 0o644
-            info.mtime = int(time.time())
             tar.addfile(info, io.BytesIO(data))
     return buf.getvalue()
 
@@ -1311,6 +1160,39 @@ def _safe_relpath(path: str) -> str:
         log.warning("_safe_relpath: rejected %r", path)
         raise ValueError(f"unsafe path in files/deletes: {path!r}")
     return path.lstrip("/")
+
+
+def _safe_path_or_error(path: str) -> str:
+    """``_safe_relpath`` for the single-file tools: a rejection is a
+    ``FileOpError("unsafe_path")`` the caller renders, not a ValueError."""
+    try:
+        return _safe_relpath(path)
+    except ValueError as exc:
+        raise FileOpError(
+            "unsafe_path",
+            f"{path!r} is not a relative path under /app — absolute "
+            "paths and '..' are rejected.",
+            path=path,
+        ) from exc
+
+
+def _wrap_exec_command(safe_workdir: str, command: str) -> str:
+    """The ``sh -c`` script ``exec_command`` runs: ``cd`` into the
+    (already validated) working dir, then the caller's command verbatim.
+
+    ``sh -c`` runs a non-login shell, so no rc files are sourced — same
+    behaviour as the base image entrypoint.
+
+    The command is NOT prefixed with ``exec`` (it used to be:
+    ``cd X && exec {command}``). ``exec`` replaces the shell with the
+    FIRST simple command, so everything after it silently never ran —
+    ``cat > a.js <<'EOF' … EOF`` + newline + ``node a.js`` wrote the file
+    and exited 0 without running node — and a first word that is a
+    keyword, builtin or ``VAR=value`` assignment failed outright. The cd
+    is on its own line with ``|| exit 1`` so a failed cd stops the script
+    instead of running the command in the wrong directory.
+    """
+    return f"cd {shlex.quote(safe_workdir)} || exit 1\n{command}"
 
 
 def _safe_workdir(working_dir: str) -> str:
@@ -1373,31 +1255,97 @@ def _list_app_dir(container: Container) -> list[dict]:
     return entries
 
 
-def _extract_file_from_tar_stream(
-    stream, max_bytes: int,
+class _ChunkReader(io.RawIOBase):
+    """File-like view over Docker's ``get_archive`` chunk iterator, so
+    ``tarfile``'s stream mode reads lazily instead of the whole archive
+    being buffered first. ``drain`` consumes what is left (releasing the
+    HTTP connection); ``close_stream`` abandons it."""
+
+    def __init__(self, chunks) -> None:
+        super().__init__()
+        self._chunks = chunks
+        self._it = iter(chunks)
+        self._buf = b""
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, b) -> int:
+        while not self._buf:
+            try:
+                self._buf = bytes(next(self._it))
+            except StopIteration:
+                return 0
+        n = min(len(b), len(self._buf))
+        b[:n] = self._buf[:n]
+        self._buf = self._buf[n:]
+        return n
+
+    def drain(self) -> None:
+        for _ in self._it:
+            pass
+
+    def close_stream(self) -> None:
+        closer = getattr(self._chunks, "close", None)
+        if callable(closer):
+            try:
+                closer()
+            except Exception:  # noqa: BLE001 — best effort
+                pass
+
+
+def _read_archive_file(
+    container, safe: str, max_bytes: int,
 ) -> tuple[bytes, int, bool]:
-    """Consume Docker's get_archive stream and pull out the first regular
-    file. Returns ``(data, real_size, truncated)`` — ``data`` is capped
-    at ``max_bytes``, ``real_size`` is the file's true size before any
-    truncation.
-    """
-    buf = io.BytesIO()
-    for chunk in stream:
-        buf.write(chunk)
-    buf.seek(0)
-    with tarfile.open(fileobj=buf, mode="r|") as tar:
+    """Read ``/app/{safe}`` as ONE regular file: ``(data, real_size,
+    truncated)`` with ``data`` capped at ``max_bytes``.
+
+    ``get_archive`` on a directory returns its whole tree, so a directory
+    is refused from the stat header before anything is streamed (and from
+    the first tar member, if the header lacked the mode). The member is
+    read only up to the cap; the rest of a file's stream is drained so the
+    connection is released.
+
+    Raises ``FileOpError``: ``missing_file``, ``is_directory``,
+    ``not_a_file`` (a symlink or other special entry)."""
+    try:
+        stream, stat = container.get_archive(f"/app/{safe}")
+    except NotFound as exc:
+        raise FileOpError(
+            "missing_file", f"{safe} does not exist under /app.", path=safe,
+        ) from exc
+    reader = _ChunkReader(stream)
+    mode = int((stat or {}).get("mode") or 0) if isinstance(stat, dict) else 0
+    if mode & _GO_MODE_DIR:
+        reader.close_stream()
+        raise FileOpError("is_directory", f"{safe} is a directory.", path=safe)
+    result: Optional[tuple[bytes, int, bool]] = None
+    problem: Optional[FileOpError] = None
+    with tarfile.open(fileobj=reader, mode="r|") as tar:
         for member in tar:
-            if not member.isfile():
-                continue
-            extracted = tar.extractfile(member)
-            if extracted is None:
-                continue
-            payload = extracted.read()
-            real_size = int(member.size)
-            if real_size > max_bytes:
-                return payload[:max_bytes], real_size, True
-            return payload, real_size, False
-    return b"", 0, False
+            if member.isdir():
+                problem = FileOpError(
+                    "is_directory", f"{safe} is a directory.", path=safe,
+                )
+            elif not member.isfile():
+                problem = FileOpError(
+                    "not_a_file",
+                    f"{safe} is not a regular file (symlink or special file).",
+                    path=safe,
+                )
+            else:
+                extracted = tar.extractfile(member)
+                data = extracted.read(max_bytes) if extracted is not None else b""
+                size = int(member.size)
+                result = (data, size, size > max_bytes)
+            break
+    if problem is not None:
+        reader.close_stream()
+        raise problem
+    reader.drain()
+    if result is None:
+        raise FileOpError("missing_file", f"{safe} does not exist under /app.", path=safe)
+    return result
 
 
 def _encode_bytes_for_response(
@@ -1408,6 +1356,10 @@ def _encode_bytes_for_response(
     UTF-8 files get emitted as text; anything with a null byte or
     invalid UTF-8 is base64-encoded so the caller can round-trip binary
     content through the same overlay format ``write_files`` accepts.
+
+    A truncated read can stop in the middle of a multi-byte character;
+    the incomplete tail is dropped (``decode_utf8_prefix``) instead of
+    the whole file falling back to base64.
     """
     if b"\x00" in data:
         return {
@@ -1418,7 +1370,7 @@ def _encode_bytes_for_response(
             "truncated": truncated,
         }
     try:
-        text = data.decode("utf-8")
+        text = decode_utf8_prefix(data) if truncated else data.decode("utf-8")
         return {
             "path": path,
             "size": real_size,

@@ -28,12 +28,15 @@ MCP tool surface (all under the ``sandbox`` server):
 
     get_runtime_types()             — describe available runtime types (catalog)
     create(runtime, env?, ...)      — warm an empty container, returns session
-    write_files(session_id, files, deletes?, recreate_if_gone?)
-                                    — overlay files, health-probe after
-    get_files(session_id, paths?)   — read files back from /app
+    write_files(session_id, files, deletes?, recreate_if_gone?, overwrite?)
+                                    — NEW files / full rewrites, health-probe after
+    read_file(session_id, path, offset?, limit?)
+                                    — numbered lines of one text file
+    edit_file(session_id, path, old_string, new_string, replace_all?)
+                                    — exact-string edit (the preferred edit)
+    get_files(session_id, paths?)   — dir listing, or raw/base64 file contents
     get_logs(session_id, lines?)    — tail container stdout+stderr
     exec(session_id, command, ...)  — run non-interactive shell command
-    patch_files(session_id, patches)— strict line-range edits, all-or-nothing
     preview(session_id)             — return the iframe artifact HTML
     close(session_id)               — teardown and release slot
     list_sessions()                 — enumerate live sandboxes globally
@@ -49,8 +52,9 @@ HTTP endpoints:
     GET  /sessions                  list live sessions (list_sessions backing)
     POST /session/{id}/files        write_files overlay (JSON)
     GET  /session/{id}/files        list files under /app or read specified paths
+    GET  /session/{id}/file         numbered line window of one file (read_file)
+    POST /session/{id}/edit         exact-string edit of one file (edit_file)
     POST /session/{id}/exec         run a shell command in the container
-    POST /session/{id}/patch        strict line-range file edits (patch_files)
     /mcp                            FastMCP HTTP transport
     /tool/*                         OpenWebUI Tool Server sub-app:
         GET  /tool/openapi.json         OpenAPI spec for OpenWebUI discovery
@@ -88,6 +92,7 @@ from constants import (
     EXEC_DEFAULT_TIMEOUT_S,
     GET_FILES_DEFAULT_BYTES,
     HARD_TTL_S,
+    READ_FILE_DEFAULT_LINES,
     LOG_DIR,
     MAX_CONCURRENT,
     MAX_FILE_BYTES,
@@ -97,8 +102,8 @@ from constants import (
 )
 from models import (
     CreateRequest,
+    EditFileRequest,
     ExecRequest,
-    PatchFilesRequest,
     RunRequest,
     RunResponse,
     WriteFilesRequest,
@@ -107,14 +112,16 @@ from operations import (
     _do_browser_log_ingest,
     _do_close,
     _do_create,
+    _do_edit_file,
     _do_exec,
     _do_get_files,
     _do_list_sessions,
-    _do_patch_files,
     _do_preview,
+    _do_read_file,
     _do_write_files,
     _find_running_session,
     _reuse_or_spawn,
+    _validate_tool_args,
 )
 from reaper import Reaper
 # Import name is `sandbox_mcp`, not `mcp`, because `ai/sandbox/` is on
@@ -184,19 +191,31 @@ async def _mcp_run(
     env: Optional[dict[str, str]] = None,
     recreate_if_gone: bool = True,
     chat_id: Optional[str] = None,
+    overwrite: bool = False,
 ) -> dict:
-    """MCP-facing bridge to ``_reuse_or_spawn``. All fields already
-    validated by the tool wrapper, so this is a thin passthrough."""
+    """MCP-facing bridge to ``_reuse_or_spawn``. The arguments go through
+    ``RunRequest`` — the model ``POST /run`` validates with — so the file
+    size caps, reserved env keys and id regexes apply on the MCP path too
+    (they used to be skipped)."""
     log.debug(
         "MCP run: runtime=%s session=%s chat=%s n_files=%d n_deletes=%d "
-        "entrypoint=%r ttl=%s recreate_if_gone=%s env_keys=%s",
+        "entrypoint=%r ttl=%s recreate_if_gone=%s overwrite=%s env_keys=%s",
         runtime, session_id, chat_id, len(files or {}), len(deletes or []),
-        entrypoint, ttl_seconds, recreate_if_gone,
+        entrypoint, ttl_seconds, recreate_if_gone, overwrite,
         sorted((env or {}).keys()),
     )
-    return await _reuse_or_spawn(
-        runtime, files, entrypoint, ttl_seconds, session_id, deletes,
+    req = _validate_tool_args(
+        RunRequest, "run", session_id,
+        runtime=runtime, files=files or {}, entrypoint=entrypoint,
+        ttl_seconds=ttl_seconds, session_id=session_id, deletes=deletes or [],
         env=env, recreate_if_gone=recreate_if_gone, chat_id=chat_id,
+        overwrite=overwrite,
+    )
+    return await _reuse_or_spawn(
+        req.runtime, req.files, req.entrypoint, req.ttl_seconds,
+        req.session_id, req.deletes,
+        env=req.env, recreate_if_gone=req.recreate_if_gone,
+        chat_id=req.chat_id, overwrite=req.overwrite,
     )
 
 
@@ -211,7 +230,14 @@ async def _mcp_create(
         "MCP create: runtime=%s ttl=%s entrypoint=%r chat=%s env_keys=%s",
         runtime, ttl_seconds, entrypoint, chat_id, sorted((env or {}).keys()),
     )
-    return await _do_create(runtime, ttl_seconds, entrypoint, env, chat_id=chat_id)
+    req = _validate_tool_args(
+        CreateRequest, "create",
+        runtime=runtime, ttl_seconds=ttl_seconds, entrypoint=entrypoint,
+        env=env, chat_id=chat_id,
+    )
+    return await _do_create(
+        req.runtime, req.ttl_seconds, req.entrypoint, req.env, chat_id=req.chat_id,
+    )
 
 
 async def _mcp_write_files(
@@ -219,12 +245,58 @@ async def _mcp_write_files(
     files: dict,
     deletes: list[str],
     recreate_if_gone: bool,
+    overwrite: bool = False,
 ) -> dict:
     log.debug(
-        "MCP write_files: session=%s n_files=%d n_deletes=%d recreate=%s",
+        "MCP write_files: session=%s n_files=%d n_deletes=%d recreate=%s "
+        "overwrite=%s",
         session_id, len(files or {}), len(deletes or []), recreate_if_gone,
+        overwrite,
     )
-    return await _do_write_files(session_id, files, deletes, recreate_if_gone)
+    req = _validate_tool_args(
+        WriteFilesRequest, "write_files", session_id,
+        files=files or {}, deletes=deletes or [],
+        recreate_if_gone=recreate_if_gone, overwrite=overwrite,
+    )
+    return await _do_write_files(
+        session_id, req.files, req.deletes, req.recreate_if_gone,
+        overwrite=req.overwrite,
+    )
+
+
+async def _mcp_read_file(
+    session_id: str,
+    path: str,
+    offset: int,
+    limit: Optional[int],
+) -> dict:
+    log.debug(
+        "MCP read_file: session=%s path=%s offset=%s limit=%s",
+        session_id, path, offset, limit,
+    )
+    return await _do_read_file(session_id, path, offset, limit)
+
+
+async def _mcp_edit_file(
+    session_id: str,
+    path: str,
+    old_string: str,
+    new_string: str,
+    replace_all: bool,
+) -> dict:
+    log.debug(
+        "MCP edit_file: session=%s path=%s old=%d chars new=%d chars all=%s",
+        session_id, path, len(old_string or ""), len(new_string or ""),
+        replace_all,
+    )
+    req = _validate_tool_args(
+        EditFileRequest, "edit_file", session_id,
+        path=path, old_string=old_string, new_string=new_string,
+        replace_all=replace_all,
+    )
+    return await _do_edit_file(
+        session_id, req.path, req.old_string, req.new_string, req.replace_all,
+    )
 
 
 async def _mcp_get_files(
@@ -257,18 +329,6 @@ async def _mcp_exec(
     return await _do_exec(session_id, command, timeout_seconds, working_dir)
 
 
-async def _mcp_patch_files(
-    session_id: str,
-    patches: list[dict],
-    recreate_if_gone: bool,
-) -> dict:
-    log.debug(
-        "MCP patch_files: session=%s n_patches=%d recreate=%s",
-        session_id, len(patches or []), recreate_if_gone,
-    )
-    return await _do_patch_files(session_id, patches, recreate_if_gone)
-
-
 async def _mcp_preview(session_id: str) -> dict:
     log.debug("MCP preview: session=%s", session_id)
     return await _do_preview(session_id)
@@ -291,10 +351,11 @@ _mcp = build_mcp(
     write_files_callable=_mcp_write_files,
     get_files_callable=_mcp_get_files,
     exec_callable=_mcp_exec,
-    patch_files_callable=_mcp_patch_files,
     preview_callable=_mcp_preview,
     close_callable=_mcp_close,
     list_sessions_callable=_mcp_list_sessions,
+    read_file_callable=_mcp_read_file,
+    edit_file_callable=_mcp_edit_file,
 )
 # path="/" so FastMCP puts its transport at the mount root — mounting
 # the returned ASGI app at /mcp then gives clients a single POST /mcp/
@@ -425,6 +486,7 @@ async def run(req: RunRequest) -> RunResponse:
         env=req.env,
         recreate_if_gone=req.recreate_if_gone,
         chat_id=req.chat_id,
+        overwrite=req.overwrite,
     )
     return RunResponse(**result)
 
@@ -449,6 +511,7 @@ async def session_write_files(
 ) -> RunResponse:
     result = await _do_write_files(
         session_id, req.files, req.deletes, req.recreate_if_gone,
+        overwrite=req.overwrite,
     )
     return RunResponse(**result)
 
@@ -469,6 +532,29 @@ async def session_read_files(
     return await _do_get_files(session_id, path_list, max_bytes_per_file)
 
 
+@app.get("/session/{session_id}/file")
+async def session_read_file(
+    session_id: str,
+    path: str,
+    offset: int = 1,
+    limit: int = READ_FILE_DEFAULT_LINES,
+) -> dict:
+    """Numbered line window of ONE text file (``read_file``). ``offset``
+    is the 1-based first line, ``limit`` the line count (capped at
+    READ_FILE_MAX_LINES). ``content`` is ``cat -n`` style text."""
+    return await _do_read_file(session_id, path, offset, limit)
+
+
+@app.post("/session/{session_id}/edit")
+async def session_edit_file(session_id: str, req: EditFileRequest) -> dict:
+    """Exact-string replacement in one existing file (``edit_file``).
+    All-or-nothing; refusals are structured 4xx details — see
+    ENDPOINTS.md § POST /session/{session_id}/edit."""
+    return await _do_edit_file(
+        session_id, req.path, req.old_string, req.new_string, req.replace_all,
+    )
+
+
 @app.post("/session/{session_id}/exec")
 async def session_exec(session_id: str, req: ExecRequest) -> dict:
     return await _do_exec(
@@ -476,20 +562,6 @@ async def session_exec(session_id: str, req: ExecRequest) -> dict:
         req.command,
         req.timeout_seconds or EXEC_DEFAULT_TIMEOUT_S,
         req.working_dir or "/app",
-    )
-
-
-@app.post("/session/{session_id}/patch")
-async def session_patch(session_id: str, req: PatchFilesRequest) -> dict:
-    """Strict line-range file edits. All-or-nothing across the batch.
-
-    Every patch must pass byte-for-byte validation against the current
-    file content — see ENDPOINTS.md § POST /session/{id}/patch for the
-    full behavior including the mismatch response shape.
-    """
-    patches_dicts = [p.model_dump() for p in req.patches]
-    return await _do_patch_files(
-        session_id, patches_dicts, req.recreate_if_gone,
     )
 
 

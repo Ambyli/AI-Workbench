@@ -30,10 +30,12 @@ regression.
 - Env-derived — SANDBOX_*, LOG_DIR, DEBUG_LOGGING. Overridable in ``.env``.
 - Payload limits — file/payload caps used by the pydantic validators.
 - Validation regexes / reserved sets — SESSION_ID_RE, RESERVED_ENV_KEYS.
-- Read-file limits — GET_FILES_*.
+- Read-file limits — GET_FILES_*, READ_FILE_*.
+- Edit / write-guard — EDIT_*, WRITE_GUARD_*.
 - Exec limits — EXEC_*.
 - Timing — HEALTH_PROBE_TIMEOUT_S, UPDATE_SETTLE_S.
-- Container hardening — MEMORY_LIMIT, NANO_CPUS_PER_CPU, PIDS_LIMIT.
+- Container hardening — MEMORY_LIMIT, NANO_CPUS_PER_CPU, PIDS_LIMIT,
+  SANDBOX_UID / SANDBOX_GID.
   These are the security invariants documented in SANDBOX.md § Security
   model; do NOT change without updating that checklist.
 """
@@ -132,11 +134,49 @@ GET_FILES_DEFAULT_BYTES = 8 * 1024
 GET_FILES_HARD_CAP_BYTES = 64 * 1024
 
 
+# ── read_file limits ──────────────────────────────────────────────────────
+# ``read_file`` returns a line-numbered window of ONE text file, the way
+# Claude Code's Read does, so a model can look at the part it is about to
+# edit instead of pulling the whole file into its context.
+
+READ_FILE_DEFAULT_LINES = 400        # lines returned when `limit` is omitted
+READ_FILE_MAX_LINES = 2000           # ceiling on `limit`
+READ_FILE_MAX_LINE_CHARS = 2000      # longer lines are cut with a marker
+READ_FILE_MAX_BYTES = 256 * 1024     # bytes read from the container before slicing
+
+
+# ── edit_file ─────────────────────────────────────────────────────────────
+
+# Context lines shown on each side of an edit in the edit_file result
+# (and around the closest region of a not-found `old_string`).
+EDIT_SNIPPET_CONTEXT_LINES = 3
+# Ceiling on the numbered snippet so a huge `new_string` is not echoed back.
+EDIT_SNIPPET_MAX_LINES = 40
+# Match line numbers listed for a `multiple_matches` / `replace_all` result.
+EDIT_MAX_LISTED_MATCHES = 20
+
+
+# ── write_files rewrite guard ─────────────────────────────────────────────
+# write_files refuses (409 `rewrite_of_existing_file`) to replace an
+# existing UTF-8 file of at least WRITE_GUARD_MIN_LINES lines with content
+# whose line-level difflib ratio against it is >= WRITE_GUARD_SIMILARITY,
+# unless the caller passes overwrite=true. That shape — a mostly-unchanged
+# whole-file re-send — is what edit_file exists for.
+
+WRITE_GUARD_MIN_LINES = 30
+WRITE_GUARD_SIMILARITY = 0.5
+
+
 # ── exec limits ───────────────────────────────────────────────────────────
 
 EXEC_DEFAULT_TIMEOUT_S = 30
 EXEC_HARD_TIMEOUT_S = 120
+# exec keeps the LAST this-many bytes of output (errors are at the end),
+# cut forward to a UTF-8 character boundary.
 EXEC_MAX_OUTPUT_BYTES = 8 * 1024
+# The exec MCP result echoes only the command's first line, cut to this
+# many characters, so a heredoc does not enter the model's context twice.
+EXEC_COMMAND_ECHO_CHARS = 120
 
 
 # ── Timing ────────────────────────────────────────────────────────────────
@@ -160,6 +200,17 @@ UPDATE_SETTLE_S = 0.5
 MEMORY_LIMIT = "512m"
 NANO_CPUS_PER_CPU = 1_000_000_000
 PIDS_LIMIT = 256
+
+# The non-root identity every sandbox process runs as (``user="1000:1000"``
+# in spawner.py, ``USER 1000:1000`` in ai/sandbox/images/*.Dockerfile).
+# Every tar entry the runner ``put_archive``s into ``/app`` is stamped
+# with it: Docker's extraction preserves the tar header's uid/gid, and a
+# TarInfo defaults to 0:0, which left injected files and their parent
+# directories root-owned — `exec` (also 1000:1000) could not edit or
+# create files beside them.
+SANDBOX_UID = 1000
+SANDBOX_GID = 1000
+SANDBOX_USER_NAME = "sandbox"
 
 
 # ── Browser log ingest ───────────────────────────────────────────────────

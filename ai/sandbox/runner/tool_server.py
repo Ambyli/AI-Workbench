@@ -72,6 +72,9 @@ async def tool_run(req: ToolRunRequest) -> HTMLResponse:
         env=req.env,
         recreate_if_gone=True,
         chat_id=req.chat_id,
+        # The Tool Server's only tool is `run` — there is no edit_file to
+        # fall back on, so the write_files rewrite guard is off here.
+        overwrite=True,
     )
     return HTMLResponse(
         content=render_preview_html(

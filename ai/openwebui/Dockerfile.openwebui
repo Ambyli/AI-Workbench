@@ -32,6 +32,14 @@
 #       delete a valid session on every access-token expiry. Touches
 #       backend/open_webui/main.py and utils/oauth.py, adds
 #       utils/mcp_oauth_defaults.py.
+#   0004-auto-continue-announced-tool-calls.patch — with native function
+#       calling, a model that ends a turn right after a tool result by
+#       ANNOUNCING its next step ("I'll rewrite the file and re-run.") instead
+#       of making the tool call gets a hidden nudge and a continuation, up to
+#       AUTO_CONTINUE_MAX_NUDGES times per turn (0 = off). The continuation is
+#       appended to the same assistant message; the nudge is never shown or
+#       saved. Touches backend/open_webui/utils/middleware.py, adds
+#       utils/zeo_auto_continue.py.
 
 ARG OPENWEBUI_VERSION=v0.11.4
 FROM ghcr.io/open-webui/open-webui:${OPENWEBUI_VERSION}
@@ -62,14 +70,17 @@ RUN set -eu; \
         backend/open_webui/utils/trusted_proxy.py \
         backend/open_webui/main.py \
         backend/open_webui/utils/oauth.py \
-        backend/open_webui/utils/mcp_oauth_defaults.py; \
+        backend/open_webui/utils/mcp_oauth_defaults.py \
+        backend/open_webui/utils/middleware.py \
+        backend/open_webui/utils/zeo_auto_continue.py; \
     grep -q "verify_google_identity" backend/open_webui/routers/auths.py; \
     grep -q "drop_unconnected_oauth_tool_defaults" backend/open_webui/main.py; \
     grep -q "_zeo_refresh_single_flight" backend/open_webui/utils/oauth.py; \
+    grep -q "zeo_auto_continue_round" backend/open_webui/utils/middleware.py; \
     rm -rf /tmp/zeo-patches
 
 # Record the base and the patch set on the image so `docker image inspect`
 # can tell a patched build from a stock one.
 ARG OPENWEBUI_VERSION
 LABEL org.opencontainers.image.base.name="ghcr.io/open-webui/open-webui:${OPENWEBUI_VERSION}" \
-      com.zeoenergy.openwebui.patches="0002-trusted-header-google-identity,0003-oauth-mcp-defaults-no-redirect"
+      com.zeoenergy.openwebui.patches="0002-trusted-header-google-identity,0003-oauth-mcp-defaults-no-redirect,0004-auto-continue-announced-tool-calls"

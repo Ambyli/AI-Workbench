@@ -59,7 +59,16 @@ RUN chmod +x /usr/local/bin/sandbox-entrypoint.sh
 # Non-root user matching what the runner passes as --user 1000:1000.
 # HOME must be writable for `pip install --user` above to land somewhere
 # valid on a read-only rootfs; /tmp is the tmpfs the runner mounts.
-RUN useradd --uid 1000 --user-group --create-home --home-dir /home/sandbox sandbox
+#
+# /app is created and chowned here, as root, rather than left to
+# `WORKDIR /app` below: BuildKit's WORKDIR creates the directory as the
+# current USER, but the legacy builder creates it root-owned, and a
+# root-owned /app means `exec` (uid 1000) cannot create a single file in
+# it. The runner's put_archive cannot fix /app afterwards either — Docker
+# skips a tar's `.` entry when the target already exists.
+RUN useradd --uid 1000 --user-group --create-home --home-dir /home/sandbox sandbox && \
+    mkdir -p /app && \
+    chown 1000:1000 /app
 
 USER 1000:1000
 ENV HOME=/home/sandbox \

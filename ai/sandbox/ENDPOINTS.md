@@ -14,9 +14,10 @@ Everything below is served by [`ai/sandbox/runner/app.py`](app.py). Jobs endpoin
 | `POST` | `/create` | Reserve an empty warming container of the chosen runtime. Backing endpoint for `sandbox.create` |
 | `GET` | `/sessions` | Enumerate live sessions. Backing endpoint for `sandbox.list_sessions` |
 | `POST` | `/session/{session_id}/files` | Overlay files into a live sandbox. Backing endpoint for `sandbox.write_files` |
-| `GET` | `/session/{session_id}/files` | Read files back from `/app` — dir listing when `paths` is omitted, contents inline otherwise. Backing endpoint for `sandbox.get_files` |
+| `GET` | `/session/{session_id}/files` | Read files back from `/app` — dir listing when `paths` is omitted, raw contents (binary as base64) otherwise. Backing endpoint for `sandbox.get_files` |
+| `GET` | `/session/{session_id}/file` | Line-numbered window (`offset` / `limit`) of ONE text file. Backing endpoint for `sandbox.read_file` |
+| `POST` | `/session/{session_id}/edit` | Exact-string edit of one file (`old_string` → `new_string`, unique match or `replace_all`). Backing endpoint for `sandbox.edit_file` |
 | `POST` | `/session/{session_id}/exec` | Run a non-interactive shell command inside the container. Backing endpoint for `sandbox.exec` |
-| `POST` | `/session/{session_id}/patch` | Strict line-range file edits (all-or-nothing). Backing endpoint for `sandbox.patch_files` |
 | `DELETE` | `/session/{session_id}` | Tear down a session's running sandbox. Backing endpoint for `sandbox.close`. Idempotent |
 | `GET` | `/session/{session_id}/download` | Stream the running sandbox's `/app` as a tar archive. Follows self-heal. Also exposed publicly via Caddy at `/sandboxes/download/{session_id}` |
 | `GET` | `/session/{session_id}/logs` | Return the last N lines (default 100, max 1000) of the running sandbox's stdout+stderr. Follows self-heal. Backing endpoint for `sandbox.get_logs` |
@@ -83,7 +84,8 @@ Two modes, driven by whether `session_id` is present:
   "session_id":         null,
   "deletes":            [],
   "env":                null,
-  "recreate_if_gone":   true
+  "recreate_if_gone":   true,
+  "overwrite":          false
 }
 ```
 
@@ -100,6 +102,7 @@ Field semantics:
 | `env` | `{str: str}` | no | Process env vars set inside the container. Immutable after spawn (self-heal replays the recorded env). Reserved keys (`HTTP_PROXY`, `PYTHONUNBUFFERED`, `TERM`, etc.) are rejected. |
 | `recreate_if_gone` | bool | no | Default `true` for backward compat with `POST /run`. If the session's container is gone, silently respawn. Set `false` to force the caller to reason about self-heal explicitly (recommended for direct `write_files` calls, but `/run` keeps the historical default). |
 | `chat_id` | string | no | Chat/conversation id, `^[A-Za-z0-9_.:-]{1,128}$`. When set and **no** `session_id` is given, the runner reuses this chat's existing running container (overlay path) instead of spawning a second one — so repeated `/run` calls in one chat update the same preview even if the caller lost the `session_id`. A fresh spawn records the `chat_id` so the next call converges. |
+| `overwrite` | bool | no | Default `false`. Follow-up (overlay) calls only: the same rewrite guard as `POST /session/{id}/files` — a listed path that already exists as a text file of 30+ lines and keeps ≥ 50 % of its lines is refused with `409 rewrite_of_existing_file` unless this is `true`. A fresh spawn has nothing to guard. `/tool/run` always passes `true`. |
 
 **Response (200):**
 ```json
@@ -125,6 +128,8 @@ The returned `url` is reachable at `http://sandbox-proxy` on the `ai_shared` Doc
 | Status | Meaning |
 |---|---|
 | `400` | Unknown `runtime` value, OR **static lint failed on a Python file** (see below). |
+| `409` | Follow-up call only: `rewrite_of_existing_file` (see `POST /session/{id}/files`), or the container is gone and `recreate_if_gone` is false. |
+| `422` | Request validation — includes a file over `SANDBOX_MAX_FILE_BYTES` / a payload over `SANDBOX_MAX_PAYLOAD_BYTES` (the message names the largest oversized path), a reserved `env` key, a malformed `session_id` / `chat_id`. |
 | `429` | Concurrency cap reached (`SANDBOX_MAX_CONCURRENT`, default 8). |
 | `500` | Docker spawn error — image missing, cgroup rejection, etc. |
 | `504` | Sandbox spawned but readiness probe (`GET /` inside container) didn't reply within 30s. Container is torn down before the response returns; **logs are captured first** (see below). |
@@ -279,14 +284,15 @@ Returns EVERY live session globally — no per-user filtering. Documented explic
 
 ## `POST /session/{session_id}/files`
 
-Overlay files into a live sandbox. Backs `sandbox.write_files`.
+Write NEW files (or complete rewrites) into a live sandbox. Backs `sandbox.write_files`. To change part of an existing file use [`POST /session/{id}/edit`](#post-sessionsession_idedit).
 
 **Body:**
 ```json
 {
   "files":            { "app.py": "import streamlit as st\nst.title('v2')" },
   "deletes":          ["stale-page.html"],
-  "recreate_if_gone": false
+  "recreate_if_gone": false,
+  "overwrite":        false
 }
 ```
 
@@ -297,6 +303,28 @@ Field semantics:
 | `files` | `{ path: str \| {encoding, content} }` | no | Same shape as `POST /run.files`. Absent paths preserved. |
 | `deletes` | `[path, …]` | no | Relative paths under `/app` to remove. |
 | `recreate_if_gone` | bool | no | Default **false** (opt-in self-heal). If true and the container is gone, respawn under the same session_id and reapply the recorded env — files installed via `exec` and non-listed in-container files are LOST. |
+| `overwrite` | bool | no | Default **false**. Turns off the rewrite guard (below) for this call. |
+
+**Rewrite guard.** Before anything is written, each listed path that already exists as a UTF-8 text file of at least 30 lines (`WRITE_GUARD_MIN_LINES`) is compared with the new content line by line (`difflib.SequenceMatcher` ratio). If any keeps ≥ 0.5 of its lines (`WRITE_GUARD_SIMILARITY`) and `overwrite` is false, the WHOLE call is refused — no file of it is written:
+
+```json
+{
+  "detail": {
+    "error": "rewrite of existing file",
+    "kind": "rewrite_of_existing_file",
+    "tool": "write_files",
+    "session_id": "bfdYm3_H5SD4",
+    "files": [
+      {"path": "app.js", "similarity": 0.961, "changed_lines": 12,
+       "old_lines": 310, "new_lines": 312, "identical": false}
+    ],
+    "message": "app.js already exists and your new content keeps 96% of its lines (12 of 310 changed).",
+    "hint": "No files were written. Use edit_file for changes like this: read_file the part you are changing, then edit_file with old_string (the exact current text) and new_string. If you really mean to replace app.js wholesale, call write_files again with overwrite=true."
+  }
+}
+```
+
+New files, existing files under 30 lines, binary (base64) values, binary or non-UTF-8 existing files, genuine rewrites (ratio < 0.5) and `deletes` are never refused. Each existing path costs one `get_archive` read; files over `SANDBOX_MAX_FILE_BYTES` are not compared.
 
 **Response (200):** same shape as `POST /run` — `sandbox_id`, `session_id`, `url` (unchanged if the container was alive), `reused: true`, `app_status` from the health probe, `recreated` set true if self-heal ran.
 
@@ -306,8 +334,8 @@ Field semantics:
 |---|---|
 | `400` | Static lint failed, invalid session_id, or unsafe path in `files`/`deletes`. |
 | `404` | `session_id` never existed. |
-| `409` | Container is gone AND `recreate_if_gone` was false. Body carries an `error`, `session_id`, and remediation hint. |
-| `413` | Payload exceeded `SANDBOX_MAX_FILE_BYTES` / `SANDBOX_MAX_PAYLOAD_BYTES`. |
+| `409` | `rewrite_of_existing_file` (above), OR the container is gone AND `recreate_if_gone` was false. Body carries an `error`, `session_id`, and remediation hint. |
+| `422` | Request validation — a file over `SANDBOX_MAX_FILE_BYTES` or a payload over `SANDBOX_MAX_PAYLOAD_BYTES` (the message names the largest oversized path). The `write_files` MCP tool applies the same caps and reports them as `failed: payload too large` (413). |
 
 ---
 
@@ -336,7 +364,7 @@ Read files back from the running sandbox's `/app`. Backs `sandbox.get_files`.
 }
 ```
 
-Binary content is base64-encoded — same shape you can round-trip into `POST /session/{id}/files`. Missing paths get an `error: "not found"` entry rather than raising.
+Binary content is base64-encoded — same shape you can round-trip into `POST /session/{id}/files`. A truncated text file is cut on a UTF-8 character boundary, so it stays text. Missing paths get an `error: "not found"` entry rather than raising; a directory path gets `error: "<path> is a directory."`. For source code a model is about to change, [`GET /session/{id}/file`](#get-sessionsession_idfile) (numbered line windows) is the better read.
 
 **Errors:** 400 on invalid session_id, 404 on no running sandbox.
 
@@ -377,101 +405,148 @@ Field semantics:
 }
 ```
 
-Output is capped at 8 KB; when truncated, the last 8 KB are returned and `truncated: true` is set. See [`SANDBOX.md § Runtime introspection (exec)`](SANDBOX.md#runtime-introspection-exec) for the state-drift, allowlist, and interactivity caveats.
+Output keeps the LAST 8 KB (`EXEC_MAX_OUTPUT_BYTES`), cut forward to a UTF-8 character boundary; `truncated: true` means earlier output was dropped — the error at the end of a long build or test run is what survives. The HTTP response echoes `command`; the `exec` MCP tool does not — its text shows only the command's first line (≤ 120 chars, `+N more lines`) and its `structured_content` drops `command` and `output`. See [`SANDBOX.md § Runtime introspection (exec)`](SANDBOX.md#runtime-introspection-exec) for the state-drift, allowlist, and interactivity caveats.
 
 **Errors:** 400 on invalid session_id, empty command, or unsafe `working_dir`; 404 on no running sandbox.
 
 ---
 
-## `POST /session/{session_id}/patch`
+## `GET /session/{session_id}/file`
 
-Strict line-range file edits inside a running sandbox. All-or-nothing across the batch — every patch validates in a dry-run pass first, only then are any files modified. Backs `sandbox.patch_files`.
+A line-numbered window of ONE text file — Claude Code's Read. Backs `sandbox.read_file`. This is how a model looks at the part of a file it is about to change, without pulling the whole file into its context.
+
+**Query params:**
+
+| Param | Type | Default | Notes |
+|---|---|---|---|
+| `path` | string | — (required) | Relative path under `/app`. Absolute paths and `..` are rejected. |
+| `offset` | int | `1` | 1-based first line to return. |
+| `limit` | int | `400` (`READ_FILE_DEFAULT_LINES`) | Lines to return, capped at `2000` (`READ_FILE_MAX_LINES`). |
+
+**Request:**
+```bash
+curl "http://localhost:8012/session/bfdYm3_H5SD4/file?path=app.js&offset=10&limit=3"
+```
+
+**Response (200):**
+```json
+{
+  "session_id":     "bfdYm3_H5SD4",
+  "sandbox_id":     "a1b2c3d4e5f6",
+  "path":           "app.js",
+  "start_line":     10,
+  "end_line":       12,
+  "total_lines":    120,
+  "more_lines":     108,
+  "truncated":      true,
+  "lines_cut":      0,
+  "size":           3410,
+  "file_truncated": false,
+  "content":        "10\tfunction greet(name) {\n11\t  return 'hi, ' + name;\n12\t}"
+}
+```
+
+`content` is `cat -n` style: the line number (right-aligned to the widest number in the window), a TAB, then the line. The prefix is not part of the file — `edit_file`'s `old_string` is the text after the TAB. `truncated` means more lines follow `end_line` (ask again with `offset = end_line + 1`); `more_lines` says how many. Lines longer than 2000 characters (`READ_FILE_MAX_LINE_CHARS`) are cut with a `… [line cut at 2000 of N chars]` marker and counted in `lines_cut`. Only the first 256 KiB (`READ_FILE_MAX_BYTES`) of a file is read: past that, `file_truncated` is `true`, `total_lines` counts the whole lines inside the first 256 KiB, and later lines need `exec` (`sed -n 'A,Bp' path`). An `offset` past the end returns `200` with an empty `content`. A CRLF file is shown without the `\r`. Counts as activity (bumps `last_used_at`).
+
+**Errors** — structured `detail` with `error`, `kind`, `tool: "read_file"`, `session_id`, `path`, `message`, `hint`:
+
+| Status | `kind` | Meaning |
+|---|---|---|
+| `400` | `unsafe_path` | Absolute path or `..`. (A malformed `session_id` is a plain `400 invalid session_id`.) |
+| `404` | `missing_file` | No such file. (No running session is a `404` with `error: "session not found"`.) |
+| `409` | `binary_file` | Contains a NUL byte or is not valid UTF-8 — use `GET /session/{id}/files`, which returns base64. |
+| `409` | `is_directory` / `not_a_file` | A directory, symlink or special file. |
+| `409` | — | `error: "sandbox container is gone"` — read_file never respawns. |
+
+---
+
+## `POST /session/{session_id}/edit`
+
+Exact-string replacement in one existing file — Claude Code's Edit. Backs `sandbox.edit_file`, **the preferred way to change a file**: the caller sends only the text that changes.
 
 **Body:**
 ```json
 {
-  "patches": [
-    {
-      "path":        "app.py",
-      "start_line":  15,
-      "end_line":    18,
-      "expected":    "def foo(x):\n    return x + 1",
-      "replacement": "def foo(x, y):\n    return x + y",
-      "note":        "add y argument"
-    }
-  ],
-  "recreate_if_gone": false
+  "path":        "app.js",
+  "old_string":  "  return 'hi, ' + name;",
+  "new_string":  "  return `Hello, ${name}!`;",
+  "replace_all": false
 }
 ```
 
-Field semantics:
-
 | Field | Type | Required | Notes |
 |---|---|---|---|
-| `patches` | list of PatchSpec | yes | At least one patch required. |
-| `patches[].path` | string | yes | Relative to `/app`. Absolute paths and `..` traversal rejected. |
-| `patches[].start_line` | int | yes | 1-indexed inclusive. |
-| `patches[].end_line` | int | yes | 1-indexed inclusive. Must satisfy `start_line <= end_line`. |
-| `patches[].expected` | string | yes | EXACT current content of lines `[start_line, end_line]` joined with `\n`. Byte-for-byte match required. |
-| `patches[].replacement` | string | yes | What to write in place of `expected`. |
-| `patches[].note` | string | no | Free-text; logged for operator debugging, not applied. |
-| `recreate_if_gone` | bool | no | Accepted for interface consistency but has NO effect. A dead container always returns 409 regardless — see behavior notes. |
+| `path` | string | yes | Relative path of an EXISTING file under `/app`. |
+| `old_string` | string | yes | Exact current text, copied from `read_file` output WITHOUT the line-number prefix. Must be non-empty and occur exactly once unless `replace_all`. |
+| `new_string` | string | yes | Replacement; must differ from `old_string`. |
+| `replace_all` | bool | no | Default `false`. `true` replaces every (non-overlapping) occurrence. |
 
-**Payload limits:** each patch's `expected` + `replacement` UTF-8 bytes count toward `SANDBOX_MAX_FILE_BYTES` (default 1,000,000) individually, and the sum across all patches counts toward `SANDBOX_MAX_PAYLOAD_BYTES` (default 10,000,000). Rejected at pydantic validation before the runner touches the container.
+`old_string` and `new_string` are each capped at `SANDBOX_MAX_FILE_BYTES` (422 at validation), and so is the edited file (`413 too_large`).
 
 **Response (200):**
 ```json
 {
   "sandbox_id":     "a1b2c3d4e5f6",
-  "session_id":    "bfdYm3_H5SD4",
-  "url":           "https://chat.zeoenergy.com/sandboxes/a1b2c3d4e5f6/",
-  "expires_at":    "2026-09-03T20:15:00+00:00",
-  "runtime":       "python",
-  "hunks_applied": [
-    {"path": "app.py", "start_line": 15, "end_line": 18,
-     "replaced_bytes": 27, "new_bytes": 41}
-  ],
-  "files_touched": ["app.py"],
+  "session_id":     "bfdYm3_H5SD4",
+  "url":            "https://chat.zeoenergy.com/sandboxes/a1b2c3d4e5f6/",
+  "expires_at":     "2026-10-15T20:15:00+00:00",
+  "runtime":        "node",
+  "path":           "app.js",
+  "replacements":   1,
+  "start_line":     11,
+  "end_line":       11,
+  "match_lines":    [11],
+  "total_lines":    120,
+  "snippet":        " 8\t...\n11\t  return `Hello, ${name}!`;\n...\n14\t...",
   "startup_output": "",
-  "app_status":    {"code": 200, "latency_ms": 47},
-  "recreated":     false
+  "app_status":     {"code": 200, "latency_ms": 41},
+  "recreated":      false
 }
 ```
 
+`start_line` / `end_line` are the (first) replaced region in the NEW file; `match_lines` the first line of every replacement (up to 20). `snippet` is that region with 3 lines of context each side, numbered, at most 40 rows — never the whole file.
+
 Behavior:
 
-- **Dry-run validation.** For each patch: path safety → file exists (else `missing_file` 409) → target must be UTF-8 (else `binary_file` 409) → line range in bounds (else `out_of_range` 409) → `expected` byte-for-byte matches `\n`-join(current_lines[start_line-1:end_line]) (else `content_mismatch` 409).
-- **Overlap check.** Two patches on the SAME `path` whose `[start_line, end_line]` ranges intersect cause the entire call to be rejected with `overlap` 409. Boundary-touching ranges count as overlapping (e.g. `[10-15]` and `[15-20]`).
-- **Apply pass** only runs if every patch passes. Per-file bottom-up so earlier-line indices stay valid; each file is written in a single `put_archive` so a mid-batch failure doesn't half-write.
-- **Trailing newline preserved.** If the file ended with `\n` before, it does after.
-- **`last_used_at` bumped** only on successful apply.
-- **Post-write health probe** (same as `POST /session/{id}/files`): 500 ms settle → single HTTP probe against the runtime's `readiness_probe_path` on port 80 → result inline in `app_status`.
-- **No self-heal.** `recreate_if_gone` is accepted but ignored — a fresh container has no files to anchor on, so a dead container always returns 409 with a hint to call `write_files` first.
+- **All-or-nothing.** The file is read, the rules are checked, a `.py` result is compiled (`400 static lint failed`, nothing written), and only then is the file written — one `put_archive` through `_build_app_tarball`, so it stays owned by `1000:1000`.
+- **Line endings.** A file whose every newline is CRLF is matched in LF form and written back as CRLF, so an `old_string` copied from `read_file` matches. A trailing newline (or its absence) is preserved.
+- **Reload marker first**, then the write, then the same post-write steps as `POST /session/{id}/files`: `last_used_at` bump, 500 ms settle, `startup_output` (what the dev server printed after this edit), single health probe → `app_status`.
+- **No self-heal.** A dead container is a `409` (`error: "sandbox container is gone"`).
 
-**Structured 409 shape (`content_mismatch`):**
+**Errors** — structured `detail` with `error`, `kind`, `tool: "edit_file"`, `session_id`, `path`, `message`, `hint` (the exact next action) plus kind-specific fields. No file is modified on any of them:
+
+| Status | `kind` | Extra fields | Meaning |
+|---|---|---|---|
+| `409` | `not_found` | `closest_start_line`, `closest_end_line`, `similarity`, `closest_text`, `whitespace_only` | `old_string` does not occur. `closest_text` is the best-matching window of the file (same line count as `old_string`, compared with whitespace stripped), numbered like `read_file`, when one scores ≥ 0.3; `whitespace_only: true` means it differs only in whitespace/indentation. |
+| `409` | `line_number_prefix` | `matches_without_prefixes` | Every line of `old_string` starts with a `read_file` prefix (`<number><TAB>`). |
+| `409` | `multiple_matches` | `count`, `match_lines` | Occurs more than once and `replace_all` is false. |
+| `409` | `no_change` / `empty_old_string` | — | `old_string == new_string` (also when they differ only in CRLF vs LF on a CRLF file) / empty `old_string`. |
+| `409` | `binary_file` / `is_directory` / `not_a_file` | — | Not an editable text file. |
+| `404` | `missing_file` | — | No such file — create it with `POST /session/{id}/files`. |
+| `400` | `unsafe_path` | — | Absolute path or `..`. |
+| `413` | `too_large` | — | The file, or the edited file, is over `SANDBOX_MAX_FILE_BYTES`. |
+
+Example `not_found` detail:
 ```json
 {
   "detail": {
-    "error":         "expected content mismatch",
-    "session_id":    "bfdYm3_H5SD4",
-    "kind":          "content_mismatch",
-    "path":          "app.py",
-    "patch_index":   1,
-    "start_line":    15,
-    "end_line":      18,
-    "expected":      "...caller-supplied text...",
-    "actual":        "...current file content of those lines...",
-    "message":       "Expected content at app.py:15-18 did not match the current file.",
-    "hint":          "The file has changed since you last read it. Call get_files with the affected path, copy the current bytes into `expected`, and reissue patch_files. No files were modified."
+    "error": "old_string not found",
+    "kind": "not_found",
+    "tool": "edit_file",
+    "session_id": "bfdYm3_H5SD4",
+    "path": "app.js",
+    "message": "old_string was not found in the file. It must match the current text exactly — every space, tab and line.",
+    "closest_start_line": 11,
+    "closest_end_line": 11,
+    "similarity": 0.92,
+    "closest_text": "11\t  return 'hi, ' + name;",
+    "whitespace_only": false,
+    "hint": "The closest text is lines 11-11 (shown above). Copy old_string exactly from it — or read_file(path=\"app.js\", offset=1, limit=40) for more context — and call edit_file again. No file was modified."
   }
 }
 ```
 
-Other `kind` values: `out_of_range` (adds `file_line_count`), `overlap` (adds `other_start_line`/`other_end_line`/`other_patch_index`), `missing_file`, `binary_file`, `unsafe_path`, `bad_expected_type`, `bad_replacement_type`. Each carries a `hint` telling the caller the exact next action.
-
-**Errors:** 400 on invalid session_id or empty `patches`; 404 on session not found; 409 on any dry-run failure or dead container; 413 on payload cap exceeded.
-
-See [`SANDBOX.md § Targeted edits (patch_files)`](SANDBOX.md#targeted-edits-patch_files) for the "when to use vs write_files" flow and worked examples.
+See [`SANDBOX.md § Editing files`](SANDBOX.md#editing-files) for the read → edit flow.
 
 ---
 
@@ -761,34 +836,38 @@ All requests are JSON-RPC 2.0 over HTTP POST. Response bodies come back as eithe
 
 ### Available tools
 
-Eleven tools registered on the `sandbox` MCP server. Every tool returns a `ToolResult` with a `TextContent` block (what the model reads) plus a `structured_content` payload (machine-readable JSON — see the field breakdowns per tool).
+Twelve tools registered on the `sandbox` MCP server. Every tool returns a `ToolResult` with a `TextContent` block (what the model reads) plus a `structured_content` payload (machine-readable JSON — see the field breakdowns per tool). The flow the docstrings teach is Claude Code's file-tool contract: `get_runtime_types → create → write_files (new files) → read_file / edit_file (changes) → exec → preview → close`.
 
 | Tool | Backing HTTP endpoint | Purpose |
 |---|---|---|
 | `get_runtime_types` | (in-process; no HTTP backing) | Describe runtime types (catalog — not a session status check) |
 | `create` | `POST /create` | Reserve an empty warming container (pass `chat_id` for one-per-chat) |
-| `write_files` | `POST /session/{id}/files` | Overlay files, run health probe |
-| `get_files` | `GET /session/{id}/files` | Read files back from `/app` |
+| `write_files` | `POST /session/{id}/files` | NEW files or complete rewrites (`overwrite` opts out of the rewrite guard); health probe |
+| `read_file` | `GET /session/{id}/file` | Numbered line window (`offset` / `limit`) of one text file |
+| `edit_file` | `POST /session/{id}/edit` | Exact-string edit — the way to change part of an existing file |
+| `get_files` | `GET /session/{id}/files` | Dir listing, or raw contents (binary as base64) |
 | `get_logs` | `GET /session/{id}/logs` | Tail combined stdout+stderr |
 | `exec` | `POST /session/{id}/exec` | Run a non-interactive shell command |
-| `patch_files` | `POST /session/{id}/patch` | Strict line-range file edits (all-or-nothing) |
 | `preview` | (in-process; reads from registry only) | Return the iframe artifact HTML |
 | `close` | `DELETE /session/{id}` | Teardown and slot release |
 | `list_sessions` | `GET /sessions` | Enumerate live sandboxes |
 | `run` | `POST /run` (with `recreate_if_gone=true`) | One-shot: create + update + preview |
 
-**Failure returns.** When the runner raises a 400 (static lint failed), 404 (session not found), 409 (container gone without `recreate_if_gone`), 504 (readiness failure with logs), or similar, the MCP wrapper catches the HTTPException and formats the detail dict into a diagnostic string. The tool returns a normal text response, not an MCP-level error, so the model reads it as tool output and can call the tool again with the same `session_id` to retry.
+**Failure returns.** When the runner raises a 400 (static lint failed), 404 (session not found), 409 (container gone without `recreate_if_gone`, `rewrite_of_existing_file`, an `edit_file` refusal), 504 (readiness failure with logs), or similar, the MCP wrapper catches the HTTPException and formats the detail dict into a diagnostic string — for `edit_file` that includes the numbered closest text of a not-found `old_string`. The tool returns a normal text response, not an MCP-level error, so the model reads it as tool output and can call the tool again with the same `session_id` to retry.
+
+**Argument validation.** The MCP adapters in `app.py` build the same pydantic models the HTTP routes use (`RunRequest`, `CreateRequest`, `WriteFilesRequest`, `EditFileRequest`), so the per-file / payload caps, reserved env keys and id regexes apply on the MCP path exactly as on HTTP. A size cap comes back as `failed: payload too large` (413), anything else as `failed: invalid arguments` (422), with the validator's message.
 
 **Text-shape stability.** `run` and `preview` include a `Session id: <sid>` line and a fenced ```` ```html ```` block — both are load-bearing. Models are instructed to relay the response verbatim so OpenWebUI's `ContentRenderer` promotes the block into the artifacts panel. The `Session id:` line is what the model greps back on the next turn.
 
 **Structured payload highlights:**
 
 - `create` / `run` → `{ok, session_id, sandbox_id, url, expires_at, runtime, app_status, reused, recreated, chat_id, duplicate_create_prevented}` — `duplicate_create_prevented: true` means a chat_id was supplied and matched a live sandbox, so this response is the existing session, not a new spawn
-- `write_files` → adds `startup_output`, `app_status`, `recreated` (self-heal flag)
-- `get_files` → `{ok, session_id, sandbox_id, files: [{path, size, encoding, content, truncated, error?}, …]}`
+- `write_files` → adds `startup_output`, `app_status`, `recreated` (self-heal flag); a refused rewrite is `{ok: false, status: 409, error: "rewrite of existing file", detail: {kind: "rewrite_of_existing_file", files: [{path, similarity, changed_lines, old_lines, new_lines, identical}], message, hint}}`
+- `read_file` → `{ok, session_id, sandbox_id, path, start_line, end_line, total_lines, truncated}` — the numbered lines are in the text only
+- `edit_file` → `{ok, session_id, sandbox_id, url, expires_at, runtime, path, replacements, start_line, end_line, match_lines, total_lines, startup_output, app_status, recreated: false}` — the snippet is in the text only; a refusal is `{ok: false, status, error, session_id, detail: {kind, tool: "edit_file", path, message, hint, …kind-specific fields}}`
+- `get_files` → `{ok, session_id, sandbox_id, files: [{path, size, encoding?, truncated?, error?}, …]}` — with `paths`, file contents are in the text only (no `content` in the structured payload)
 - `get_logs` → `{ok, session_id, sandbox_id, lines_requested, logs, empty?}`
-- `exec` → `{ok, session_id, sandbox_id, command, exit_code, duration_ms, output, truncated, timed_out}`
-- `patch_files` → `{ok, session_id, sandbox_id, url, expires_at, runtime, hunks_applied: [{path, start_line, end_line, replaced_bytes, new_bytes}], files_touched, startup_output, app_status, recreated: false}` — on failure the payload carries `{ok: false, status: 409, error, session_id, detail: {kind, path, patch_index, start_line?, end_line?, expected?, actual?, file_line_count?, other_start_line?, other_end_line?, other_patch_index?, message, hint}}`
+- `exec` → `{ok, session_id, sandbox_id, exit_code, duration_ms, truncated, timed_out}` — the output is in the text only, and the text echoes just the command's first line
 - `preview` → `{ok, session_id, sandbox_id, url, iframe_html, download_url}`
 - `close` → `{ok, session_id, sandbox_id?, was_running}`
 - `list_sessions` → `{ok, count, sessions: [...]}`
@@ -874,7 +953,20 @@ curl -X POST http://localhost:8012/mcp/ ... \
                    "arguments": {"session_id": "X",
                                  "files": {"app.py": "import streamlit as st..."}}}}'
 
-# 3. Show the user
+# 3. Change part of a file: read the numbered lines, then edit by text
+curl -X POST http://localhost:8012/mcp/ ... \
+  -d '{... "method": "tools/call",
+        "params": {"name": "read_file",
+                   "arguments": {"session_id": "X", "path": "app.py",
+                                 "offset": 1, "limit": 40}}}'
+curl -X POST http://localhost:8012/mcp/ ... \
+  -d '{... "method": "tools/call",
+        "params": {"name": "edit_file",
+                   "arguments": {"session_id": "X", "path": "app.py",
+                                 "old_string": "st.title(\"v1\")",
+                                 "new_string": "st.title(\"v2\")"}}}'
+
+# 4. Show the user
 curl -X POST http://localhost:8012/mcp/ ... \
   -d '{... "method": "tools/call",
         "params": {"name": "preview",

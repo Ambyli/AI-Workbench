@@ -1,7 +1,7 @@
 {
 	"info": {
 		"name": "sandbox-runner",
-		"description": "sandbox-runner endpoints, called through the LiteLLM pass-through registered in ai/litellm/litellm_config.yaml (`pass_through_endpoints` → `/v1/sandbox` → `http://sandbox-runner:8000`, `include_subpath: true`). Every request is authenticated with a Bearer token from a LiteLLM virtual key. Set the collection variables `litellm` (e.g. http://localhost:4001) and `virtual master key` (an sk-… key issued from the LiteLLM Admin UI → Virtual Keys) — every request inherits them via collection-level auth. See ai/sandbox/ENDPOINTS.md for the full endpoint reference and ai/litellm/LITELLM.md for issuing virtual keys.\n\nSessions: the workflow is get_runtime_types → create → write_files (loop with get_files / get_logs / exec) → preview → close. Or the one-shot: run. First call: omit `session_id`; server generates one and returns it. Follow-up call: pass the same `session_id` back — server writes new files into the running container's /app, returns the same URL, dev server hot-reloads. Set the `sandboxSessionId` collection variable from the first response, then run the follow-up request. See ai/sandbox/SANDBOX.md § MCP tool flow.",
+		"description": "sandbox-runner endpoints, called through the LiteLLM pass-through registered in ai/litellm/litellm_config.yaml (`pass_through_endpoints` → `/v1/sandbox` → `http://sandbox-runner:8000`, `include_subpath: true`). Every request is authenticated with a Bearer token from a LiteLLM virtual key. Set the collection variables `litellm` (e.g. http://localhost:4001) and `virtual master key` (an sk-… key issued from the LiteLLM Admin UI → Virtual Keys) — every request inherits them via collection-level auth. See ai/sandbox/ENDPOINTS.md for the full endpoint reference and ai/litellm/LITELLM.md for issuing virtual keys.\n\nSessions: the workflow is get_runtime_types → create → write_files (loop with get_files / get_logs / exec) → preview → close. Or the one-shot: run. First call: omit `session_id`; server generates one and returns it. Follow-up call: pass the same `session_id` back — server writes new files into the running container's /app, returns the same URL, dev server hot-reloads. Set the `sandboxSessionId` collection variable from the first response, then run the follow-up request. See ai/sandbox/SANDBOX.md § MCP tool flow.\n\nFile tools follow Claude Code's contract: write_files for NEW files, read_file (GET /session/{id}/file) for a numbered window, edit_file (POST /session/{id}/edit) for exact-string changes.",
 		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
 		"_postman_id": "sandbox-runner-collection"
 	},
@@ -256,7 +256,7 @@
 				],
 				"body": {
 					"mode": "raw",
-					"raw": "{\n  \"runtime\": \"static\",\n  \"session_id\": \"{{sandboxSessionId}}\",\n  \"files\": {\n    \"index.html\": \"<!doctype html><html><body style=\\\"font-family: system-ui; padding: 2rem\\\"><h1>updated content</h1><p>this replaced the initial file — same URL, no respawn.</p></body></html>\"\n  }\n}",
+					"raw": "{\n  \"runtime\": \"static\",\n  \"session_id\": \"{{sandboxSessionId}}\",\n  \"files\": {\n    \"index.html\": \"<!doctype html><html><body style=\\\"font-family: system-ui; padding: 2rem\\\"><h1>updated content</h1><p>this replaced the initial file — same URL, no respawn.</p></body></html>\"\n  },\n  \"overwrite\": false\n}",
 					"options": {
 						"raw": {
 							"language": "json"
@@ -274,7 +274,7 @@
 						"run"
 					]
 				},
-				"description": "Update a preview in place. Pass the `session_id` from a previous /run response (via the sandboxSessionId collection variable) and the file(s) that changed. The runner writes them into the running container's /app via docker cp — no respawn. Response has `reused: true` and the SAME sandbox_id + url as the initial spawn. The dev server inside the sandbox reloads on file change: nginx serves the new file on next request, Streamlit auto-reruns, Vite HMR fires without a browser refresh. If the container was already reaped when this call arrives (idle-TTL or manual rm), the runner self-heals — same session_id, new sandbox_id, new url — so callers don't have to distinguish the two cases.\n\n`files` is treated as an overlay: paths listed here overwrite the running container's copies; unlisted files stay put. Save tokens by not resending unchanged files."
+				"description": "Update a preview in place. Pass the `session_id` from a previous /run response (via the sandboxSessionId collection variable) and the file(s) that changed. The runner writes them into the running container's /app via docker cp — no respawn. Response has `reused: true` and the SAME sandbox_id + url as the initial spawn. The dev server inside the sandbox reloads on file change: nginx serves the new file on next request, Streamlit auto-reruns, Vite HMR fires without a browser refresh. If the container was already reaped when this call arrives (idle-TTL or manual rm), the runner self-heals — same session_id, new sandbox_id, new url — so callers don't have to distinguish the two cases.\n\n`files` is treated as an overlay: paths listed here overwrite the running container's copies; unlisted files stay put. Save tokens by not resending unchanged files.\n\nRewrite guard: on this follow-up path a listed file that already exists as a text file of 30+ lines and keeps >= 50% of its lines is refused with 409 rewrite_of_existing_file unless `overwrite` is true (same rule as POST /session/{id}/files). Change part of a file with POST /session/{id}/edit instead."
 			},
 			"response": []
 		},
@@ -367,7 +367,7 @@
 			"response": []
 		},
 		{
-			"name": "POST /session/{sandboxSessionId}/files — update files (opt-in self-heal)",
+			"name": "POST /session/{sandboxSessionId}/files — write new files (opt-in self-heal, rewrite guard)",
 			"request": {
 				"method": "POST",
 				"header": [
@@ -378,7 +378,7 @@
 				],
 				"body": {
 					"mode": "raw",
-					"raw": "{\n  \"files\": {\n    \"app.py\": \"import streamlit as st\\nst.title('updated in place')\\n\"\n  },\n  \"deletes\": [],\n  \"recreate_if_gone\": false\n}",
+					"raw": "{\n  \"files\": {\n    \"app.py\": \"import streamlit as st\\nst.title('updated in place')\\n\"\n  },\n  \"deletes\": [],\n  \"recreate_if_gone\": false,\n  \"overwrite\": false\n}",
 					"options": {
 						"raw": {
 							"language": "json"
@@ -405,7 +405,7 @@
 						}
 					]
 				},
-				"description": "Overlay files into a live sandbox. Backs sandbox.write_files. Unlike POST /run, `recreate_if_gone` defaults to FALSE — if the container is gone, the endpoint returns a structured 409 telling you to opt in explicitly. Set to true to accept state loss (env preserved, in-container files and exec-installed packages LOST).\n\n`files` values are UTF-8 str or {encoding:'base64', content:'...'} for binary. Per-file cap SANDBOX_MAX_FILE_BYTES; total SANDBOX_MAX_PAYLOAD_BYTES.\n\nResponse: same shape as POST /run — includes `app_status` from the post-update health probe. See ENDPOINTS.md § POST /session/{session_id}/files."
+				"description": "Write NEW files (or complete rewrites) into a live sandbox. Backs sandbox.write_files. To change part of an existing file use POST /session/{id}/edit instead.\n\nUnlike POST /run, `recreate_if_gone` defaults to FALSE — if the container is gone, the endpoint returns a structured 409 telling you to opt in explicitly. Set to true to accept state loss (env preserved, in-container files and exec-installed packages LOST).\n\nRewrite guard: a listed path that already exists as a UTF-8 text file of 30+ lines (WRITE_GUARD_MIN_LINES) and keeps >= 50% of its lines (WRITE_GUARD_SIMILARITY, difflib line ratio) makes the WHOLE call fail with 409 `rewrite_of_existing_file` (detail.files: [{path, similarity, changed_lines, old_lines, new_lines, identical}], message, hint) — nothing is written. `overwrite: true` turns the guard off. New files, small files, base64 values, binary existing files, genuine rewrites and `deletes` are never refused.\n\n`files` values are UTF-8 str or {encoding:'base64', content:'...'} for binary. Per-file cap SANDBOX_MAX_FILE_BYTES; total SANDBOX_MAX_PAYLOAD_BYTES (422 at validation).\n\nResponse: same shape as POST /run — includes `app_status` from the post-update health probe. See ENDPOINTS.md § POST /session/{session_id}/files."
 			},
 			"response": []
 		},
@@ -475,7 +475,96 @@
 						}
 					]
 				},
-				"description": "Read files back from /app. Binary payloads come back base64-encoded — same shape you can round-trip via POST /session/{id}/files. Missing paths get an `error: 'not found'` entry rather than raising. See ENDPOINTS.md § GET /session/{session_id}/files."
+				"description": "Read files back from /app, raw. Binary payloads come back base64-encoded — same shape you can round-trip via POST /session/{id}/files. A truncated text file is cut on a UTF-8 character boundary. Missing paths get an `error: 'not found'` entry and a directory path an `error: '<path> is a directory.'` entry rather than raising. For source a model is about to change, GET /session/{id}/file (numbered line windows) is the better read. See ENDPOINTS.md § GET /session/{session_id}/files."
+			},
+			"response": []
+		},
+		{
+			"name": "GET /session/{sandboxSessionId}/file — numbered line window (read_file)",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "{{litellm}}/v1/sandbox/session/:sandboxSessionId/file?path=app.py&offset=1&limit=40",
+					"host": [
+						"{{litellm}}"
+					],
+					"path": [
+						"v1",
+						"sandbox",
+						"session",
+						":sandboxSessionId",
+						"file"
+					],
+					"query": [
+						{
+							"key": "path",
+							"value": "app.py",
+							"description": "Relative path of ONE text file under /app (required)."
+						},
+						{
+							"key": "offset",
+							"value": "1",
+							"description": "1-based first line. Default 1."
+						},
+						{
+							"key": "limit",
+							"value": "40",
+							"description": "Lines to return. Default 400 (READ_FILE_DEFAULT_LINES), max 2000 (READ_FILE_MAX_LINES)."
+						}
+					],
+					"variable": [
+						{
+							"key": "sandboxSessionId",
+							"value": "",
+							"description": "Persistent session handle returned by POST /run or POST /create."
+						}
+					]
+				},
+				"description": "A cat -n style window of one text file — Claude Code's Read. Backs sandbox.read_file.\n\nReturns {session_id, sandbox_id, path, start_line, end_line, total_lines, more_lines, truncated, lines_cut, size, file_truncated, content}. `content` is '<number>\\t<line>' rows; the prefix is not part of the file. `truncated` = more lines follow (ask again with offset = end_line + 1). Lines over 2000 chars are cut with a marker; only the first 256 KiB of the file is read (`file_truncated`). An offset past the end returns 200 with empty content. Counts as activity.\n\nErrors (structured detail with kind / tool / path / message / hint): 400 unsafe_path, 404 missing_file (or session not found), 409 binary_file / is_directory / not_a_file, 409 container gone. See ENDPOINTS.md § GET /session/{session_id}/file."
+			},
+			"response": []
+		},
+		{
+			"name": "POST /session/{sandboxSessionId}/edit — exact-string edit (edit_file)",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n  \"path\": \"app.py\",\n  \"old_string\": \"st.title('updated in place')\",\n  \"new_string\": \"st.title('edited with edit_file')\",\n  \"replace_all\": false\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "{{litellm}}/v1/sandbox/session/:sandboxSessionId/edit",
+					"host": [
+						"{{litellm}}"
+					],
+					"path": [
+						"v1",
+						"sandbox",
+						"session",
+						":sandboxSessionId",
+						"edit"
+					],
+					"variable": [
+						{
+							"key": "sandboxSessionId",
+							"value": "",
+							"description": "Persistent session handle returned by POST /run or POST /create."
+						}
+					]
+				},
+				"description": "Replace `old_string` with `new_string` in one existing file — Claude Code's Edit. Backs sandbox.edit_file, the preferred way to change a file.\n\n`old_string` must be non-empty, differ from `new_string`, and occur exactly once unless `replace_all` is true. All-or-nothing: a .py result is compiled first (400 static lint failed), then the reload marker, one put_archive (owned 1000:1000), last_used_at bump, settle, log tail, health probe. A CRLF file stays CRLF.\n\nReturns {sandbox_id, session_id, url, expires_at, runtime, path, replacements, start_line, end_line, match_lines, total_lines, snippet, startup_output, app_status, recreated}. `snippet` is the changed region ±3 lines, numbered — never the whole file.\n\nErrors — structured detail {error, kind, tool: 'edit_file', session_id, path, message, hint, …}: 409 not_found (+ closest_start_line / closest_end_line / similarity / closest_text / whitespace_only), 409 line_number_prefix (+ matches_without_prefixes), 409 multiple_matches (+ count / match_lines), 409 no_change / empty_old_string / binary_file / is_directory, 404 missing_file, 400 unsafe_path, 413 too_large, 409 container gone. Nothing is written on any of them. See ENDPOINTS.md § POST /session/{session_id}/edit."
 			},
 			"response": []
 		},
@@ -518,50 +607,7 @@
 						}
 					]
 				},
-				"description": "Run a non-interactive shell command inside the running container. Backs sandbox.exec.\n\nNON-INTERACTIVE: stdin closed. Timeout default 30 s, hard cap 120 s. Output capped at 8 KB (last 8 KB returned when truncated). Runs as 1000:1000.\n\nSTATE DRIFT: packages installed via exec do NOT survive a self-heal respawn — env is preserved, files/packages are not. Prefer writing dependencies into requirements.txt / package.json via POST /session/{id}/files for persistence.\n\nEGRESS: `pip install` still routes through sandbox-egress (allowlist). Non-allowlisted registries return 403 from the proxy.\n\nSee ENDPOINTS.md § POST /session/{session_id}/exec."
-			},
-			"response": []
-		},
-		{
-			"name": "POST /session/{sandboxSessionId}/patch — strict line-range edits",
-			"request": {
-				"method": "POST",
-				"header": [
-					{
-						"key": "Content-Type",
-						"value": "application/json"
-					}
-				],
-				"body": {
-					"mode": "raw",
-					"raw": "{\n  \"patches\": [\n    {\n      \"path\": \"app.py\",\n      \"start_line\": 15,\n      \"end_line\": 18,\n      \"expected\": \"def foo(x):\\n    return x + 1\",\n      \"replacement\": \"def foo(x, y):\\n    return x + y\",\n      \"note\": \"add y arg\"\n    }\n  ],\n  \"recreate_if_gone\": false\n}",
-					"options": {
-						"raw": {
-							"language": "json"
-						}
-					}
-				},
-				"url": {
-					"raw": "{{litellm}}/v1/sandbox/session/:sandboxSessionId/patch",
-					"host": [
-						"{{litellm}}"
-					],
-					"path": [
-						"v1",
-						"sandbox",
-						"session",
-						":sandboxSessionId",
-						"patch"
-					],
-					"variable": [
-						{
-							"key": "sandboxSessionId",
-							"value": "",
-							"description": "Persistent session handle from create / run / write_files."
-						}
-					]
-				},
-				"description": "Strict line-range edits inside a running sandbox. All-or-nothing.\n\nEach patch specifies `path` (relative under /app), `start_line` / `end_line` (1-indexed inclusive), `expected` (byte-for-byte current content of that range, joined with \\n), and `replacement`. The runner validates every patch in a dry-run pass first (path safety → file exists → UTF-8 → in-bounds range → byte-for-byte `expected` match → no per-file overlap); only if every patch passes does the apply pass run.\n\nByte-for-byte match is strict: no whitespace or trailing-newline lenience. On mismatch the response is 409 with the ACTUAL current content in `detail.actual` so the caller can retry inline. `recreate_if_gone` is accepted but has NO effect — a dead container returns 409 regardless, because a fresh container has no file to anchor on. Call POST /session/{id}/files first (with recreate_if_gone=true) if you need to establish state.\n\nPost-write behavior mirrors POST /session/{id}/files: 500 ms settle + HTTP health probe against the runtime's readiness_probe_path on port 80.\n\nPayload limits: each patch's `expected` + `replacement` UTF-8 bytes count toward SANDBOX_MAX_FILE_BYTES per patch, sum across all patches counts toward SANDBOX_MAX_PAYLOAD_BYTES. Rejected at pydantic validation.\n\nBacks sandbox.patch_files.\n\nSee ENDPOINTS.md § POST /session/{session_id}/patch and SANDBOX.md § Targeted edits (patch_files)."
+				"description": "Run a non-interactive shell command inside the running container. Backs sandbox.exec.\n\nNON-INTERACTIVE: stdin closed. Timeout default 30 s, hard cap 120 s. Output: the LAST 8 KB (EXEC_MAX_OUTPUT_BYTES), cut on a UTF-8 boundary; `truncated: true` when earlier output was dropped. Runs as 1000:1000. The HTTP response echoes `command`; the MCP tool's text shows only its first line.\n\nSTATE DRIFT: packages installed via exec do NOT survive a self-heal respawn — env is preserved, files/packages are not. Prefer writing dependencies into requirements.txt / package.json via POST /session/{id}/files for persistence.\n\nEGRESS: `pip install` still routes through sandbox-egress (allowlist). Non-allowlisted registries return 403 from the proxy.\n\nSee ENDPOINTS.md § POST /session/{session_id}/exec."
 			},
 			"response": []
 		},
@@ -921,7 +967,7 @@
 		},
 		{
 			"name": "MCP",
-			"description": "FastMCP JSON-RPC over HTTP forwarded through the LiteLLM pass-through. Note that LiteLLM ALSO advertises the sandbox as an MCP server via `mcp_servers.sandbox` in litellm_config.yaml — models see the tool through that path, not this one. The Postman requests below are useful for debugging the transport directly. Every MCP request MUST use trailing-slash (POST /mcp/), MUST send `Accept: application/json, text/event-stream`, and MUST start with an `initialize` call — copy the `mcp-session-id` response header into the `mcpSessionId` collection variable for subsequent calls.\n\nTools registered on the sandbox MCP server: get_runtime_types, create, write_files, get_files, get_logs, exec, patch_files, preview, close, list_sessions, run. The examples below cover the primary tools.",
+			"description": "FastMCP JSON-RPC over HTTP forwarded through the LiteLLM pass-through. Note that LiteLLM ALSO advertises the sandbox as an MCP server via `mcp_servers.sandbox` in litellm_config.yaml — models see the tool through that path, not this one. The Postman requests below are useful for debugging the transport directly. Every MCP request MUST use trailing-slash (POST /mcp/), MUST send `Accept: application/json, text/event-stream`, and MUST start with an `initialize` call — copy the `mcp-session-id` response header into the `mcpSessionId` collection variable for subsequent calls.\n\nTools registered on the sandbox MCP server: get_runtime_types, create, write_files, read_file, edit_file, get_files, get_logs, exec, preview, close, list_sessions, run. The examples below cover the primary tools.",
 			"item": [
 				{
 					"name": "MCP — initialize",
@@ -939,7 +985,7 @@
 						],
 						"body": {
 							"mode": "raw",
-							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 1,\n  \"method\": \"initialize\",\n  \"params\": {\n    \"protocolVersion\": \"2024-11-05\",\n    \"capabilities\": {},\n    \"clientInfo\": { \"name\": \"postman\", \"version\": \"0.0\" }\n  }\n}",
+							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 1,\n  \"method\": \"initialize\",\n  \"params\": {\n    \"protocolVersion\": \"2024-11-05\",\n    \"capabilities\": {},\n    \"clientInfo\": {\n      \"name\": \"postman\",\n      \"version\": \"0.0\"\n    }\n  }\n}",
 							"options": {
 								"raw": {
 									"language": "json"
@@ -1001,7 +1047,7 @@
 								""
 							]
 						},
-						"description": "Enumerate the tools exposed by the sandbox MCP server: get_runtime_types, create, write_files, get_files, get_logs, exec, patch_files, preview, close, list_sessions, run."
+						"description": "Enumerate the tools exposed by the sandbox MCP server: get_runtime_types, create, write_files, read_file, edit_file, get_files, get_logs, exec, preview, close, list_sessions, run."
 					},
 					"response": []
 				},
@@ -1025,7 +1071,7 @@
 						],
 						"body": {
 							"mode": "raw",
-							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 8,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"get_logs\",\n    \"arguments\": {\n      \"session_id\": \"{{sandboxSessionId}}\",\n      \"lines\": 80\n    }\n  }\n}",
+							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 3,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"get_logs\",\n    \"arguments\": {\n      \"session_id\": \"{{sandboxSessionId}}\",\n      \"lines\": 80\n    }\n  }\n}",
 							"options": {
 								"raw": {
 									"language": "json"
@@ -1068,7 +1114,7 @@
 						],
 						"body": {
 							"mode": "raw",
-							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 10,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"get_runtime_types\",\n    \"arguments\": {}\n  }\n}",
+							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 4,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"get_runtime_types\",\n    \"arguments\": {}\n  }\n}",
 							"options": {
 								"raw": {
 									"language": "json"
@@ -1111,7 +1157,7 @@
 						],
 						"body": {
 							"mode": "raw",
-							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 11,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"create\",\n    \"arguments\": {\n      \"runtime\": \"python\",\n      \"ttl_seconds\": 900,\n      \"env\": {\n        \"DEMO_MODE\": \"1\"\n      },\n      \"chat_id\": \"{{chatId}}\"\n    }\n  }\n}",
+							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 5,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"create\",\n    \"arguments\": {\n      \"runtime\": \"python\",\n      \"ttl_seconds\": 900,\n      \"env\": {\n        \"DEMO_MODE\": \"1\"\n      },\n      \"chat_id\": \"{{chatId}}\"\n    }\n  }\n}",
 							"options": {
 								"raw": {
 									"language": "json"
@@ -1135,7 +1181,7 @@
 					"response": []
 				},
 				{
-					"name": "MCP — tools/call write_files (overlay)",
+					"name": "MCP — tools/call write_files (new files)",
 					"request": {
 						"method": "POST",
 						"header": [
@@ -1154,7 +1200,7 @@
 						],
 						"body": {
 							"mode": "raw",
-							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 12,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"write_files\",\n    \"arguments\": {\n      \"session_id\": \"{{sandboxSessionId}}\",\n      \"files\": {\n        \"app.py\": \"import streamlit as st\\nst.title('overlay applied')\\n\"\n      },\n      \"recreate_if_gone\": false\n    }\n  }\n}",
+							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 6,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"write_files\",\n    \"arguments\": {\n      \"session_id\": \"{{sandboxSessionId}}\",\n      \"files\": {\n        \"app.py\": \"import streamlit as st\\nst.title('overlay applied')\\n\"\n      },\n      \"recreate_if_gone\": false,\n      \"overwrite\": false\n    }\n  }\n}",
 							"options": {
 								"raw": {
 									"language": "json"
@@ -1173,7 +1219,93 @@
 								""
 							]
 						},
-						"description": "Overlay files onto a running sandbox. `recreate_if_gone` defaults to false — if the container is gone, a structured 409 diagnostic is returned instead of a silent respawn. Retry with `recreate_if_gone: true` to accept the state loss (env preserved, in-container files and exec-installed packages LOST).\n\nResponse includes `app_status` from the post-update HTTP health probe so you can spot a broken reload immediately."
+						"description": "Write NEW files (or complete rewrites) into the session's /app. Same session_id, same URL; the dev server hot-reloads. Changing part of an existing file? Use edit_file — write_files refuses (rewrite_of_existing_file) to re-send an existing text file of 30+ lines that keeps most of its lines, unless `overwrite: true`. Arguments are validated by WriteFilesRequest, so the SANDBOX_MAX_FILE_BYTES / SANDBOX_MAX_PAYLOAD_BYTES caps apply (`failed: payload too large`). recreate_if_gone defaults to false. See SANDBOX.md § Editing files."
+					},
+					"response": []
+				},
+				{
+					"name": "MCP — tools/call read_file (numbered line window)",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "Accept",
+								"value": "application/json, text/event-stream"
+							},
+							{
+								"key": "Mcp-Session-Id",
+								"value": "{{mcpSessionId}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 7,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"read_file\",\n    \"arguments\": {\n      \"session_id\": \"{{sandboxSessionId}}\",\n      \"path\": \"app.py\",\n      \"offset\": 1,\n      \"limit\": 40\n    }\n  }\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{litellm}}/v1/sandbox/mcp/",
+							"host": [
+								"{{litellm}}"
+							],
+							"path": [
+								"v1",
+								"sandbox",
+								"mcp",
+								""
+							]
+						},
+						"description": "Numbered line window of one text file (cat -n style: '<number>\\t<line>'). The text result has a header 'path (lines a-b of N):' and, when more lines follow, '… N more lines; call read_file with offset=b+1'. structured_content is {ok, session_id, sandbox_id, path, start_line, end_line, total_lines, truncated} — the lines are in the text only. Binary / non-UTF-8 files are refused (use get_files). Backed by GET /session/{id}/file. See SANDBOX.md § Editing files."
+					},
+					"response": []
+				},
+				{
+					"name": "MCP — tools/call edit_file (exact-string edit)",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "Accept",
+								"value": "application/json, text/event-stream"
+							},
+							{
+								"key": "Mcp-Session-Id",
+								"value": "{{mcpSessionId}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 8,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"edit_file\",\n    \"arguments\": {\n      \"session_id\": \"{{sandboxSessionId}}\",\n      \"path\": \"app.py\",\n      \"old_string\": \"st.title('updated in place')\",\n      \"new_string\": \"st.title('edited with edit_file')\",\n      \"replace_all\": false\n    }\n  }\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{litellm}}/v1/sandbox/mcp/",
+							"host": [
+								"{{litellm}}"
+							],
+							"path": [
+								"v1",
+								"sandbox",
+								"mcp",
+								""
+							]
+						},
+						"description": "The preferred way to change a file: exact-string replacement, old_string copied from read_file output WITHOUT the line-number prefix, unique unless replace_all. Text result: 'Edited path: N replacement(s), lines a-b.' + a numbered snippet (±3 lines) + app status + startup output — never the whole file; structured_content has no snippet. On a miss the text shows the closest region of the file ('Closest text in the file (lines a-b, N% similar):') and the exact next call; nothing is written. Backed by POST /session/{id}/edit. See SANDBOX.md § Editing files."
 					},
 					"response": []
 				},
@@ -1197,7 +1329,7 @@
 						],
 						"body": {
 							"mode": "raw",
-							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 13,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"get_files\",\n    \"arguments\": {\n      \"session_id\": \"{{sandboxSessionId}}\"\n    }\n  }\n}",
+							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 9,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"get_files\",\n    \"arguments\": {\n      \"session_id\": \"{{sandboxSessionId}}\"\n    }\n  }\n}",
 							"options": {
 								"raw": {
 									"language": "json"
@@ -1216,7 +1348,7 @@
 								""
 							]
 						},
-						"description": "Directory listing (paths + sizes only) of the running sandbox's /app. Omit `paths` to get the listing; pass `paths: [...]` to get the contents inline. Binary files come back base64-encoded."
+						"description": "With no `paths`: a listing of every file under /app with its size. With `paths`: raw contents (binary as base64), in the text only — structured_content.files carries metadata without `content`. For source you are about to change, read_file is the better read."
 					},
 					"response": []
 				},
@@ -1240,7 +1372,7 @@
 						],
 						"body": {
 							"mode": "raw",
-							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 14,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"exec\",\n    \"arguments\": {\n      \"session_id\": \"{{sandboxSessionId}}\",\n      \"command\": \"pip install requests\",\n      \"timeout_seconds\": 60,\n      \"working_dir\": \"/app\"\n    }\n  }\n}",
+							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 10,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"exec\",\n    \"arguments\": {\n      \"session_id\": \"{{sandboxSessionId}}\",\n      \"command\": \"pip install requests\",\n      \"timeout_seconds\": 60,\n      \"working_dir\": \"/app\"\n    }\n  }\n}",
 							"options": {
 								"raw": {
 									"language": "json"
@@ -1259,50 +1391,7 @@
 								""
 							]
 						},
-						"description": "Run a non-interactive shell command inside the running container. NON-INTERACTIVE — stdin is closed; anything prompting for input hangs until timeout. Output capped at 8 KB. STATE DRIFT: packages installed here do NOT survive self-heal respawn — also write to requirements.txt / package.json via write_files for persistence.\n\nSee SANDBOX.md § Runtime introspection (exec)."
-					},
-					"response": []
-				},
-				{
-					"name": "MCP — tools/call patch_files (strict line-range edit)",
-					"request": {
-						"method": "POST",
-						"header": [
-							{
-								"key": "Content-Type",
-								"value": "application/json"
-							},
-							{
-								"key": "Accept",
-								"value": "application/json, text/event-stream"
-							},
-							{
-								"key": "Mcp-Session-Id",
-								"value": "{{mcpSessionId}}"
-							}
-						],
-						"body": {
-							"mode": "raw",
-							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 15,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"patch_files\",\n    \"arguments\": {\n      \"session_id\": \"{{sandboxSessionId}}\",\n      \"patches\": [\n        {\n          \"path\": \"app.py\",\n          \"start_line\": 15,\n          \"end_line\": 18,\n          \"expected\": \"def foo(x):\\n    return x + 1\",\n          \"replacement\": \"def foo(x, y):\\n    return x + y\",\n          \"note\": \"add y arg\"\n        }\n      ],\n      \"recreate_if_gone\": false\n    }\n  }\n}",
-							"options": {
-								"raw": {
-									"language": "json"
-								}
-							}
-						},
-						"url": {
-							"raw": "{{litellm}}/v1/sandbox/mcp/",
-							"host": [
-								"{{litellm}}"
-							],
-							"path": [
-								"v1",
-								"sandbox",
-								"mcp",
-								""
-							]
-						},
-						"description": "Strict line-range replacement inside a running sandbox. Use AFTER get_files on the target file: copy the current bytes into `expected` byte-for-byte, then send with the new content in `replacement`. Every patch validates in a dry-run pass first (byte-for-byte match, in-bounds range, no per-file overlap); if any fails, no file is modified. Mismatch responses include the actual current content so the model can retry inline without another get_files call.\n\nNot for new files (use write_files instead). Not for large rewrites. Not self-healing — dead container returns 409.\n\nSee SANDBOX.md § Targeted edits (patch_files)."
+						"description": "Run a non-interactive shell command inside the running container. NON-INTERACTIVE — stdin is closed. Output: the LAST 8 KB, cut on a UTF-8 boundary. The text result echoes only the command's first line (≤ 120 chars, '(+N more lines)'); structured_content is {ok, session_id, sandbox_id, exit_code, duration_ms, truncated, timed_out} — no command, no output. STATE DRIFT: packages installed here do NOT survive self-heal respawn — also write them to requirements.txt / package.json via write_files for persistence.\n\nSee SANDBOX.md § Runtime introspection (exec)."
 					},
 					"response": []
 				},
@@ -1326,7 +1415,7 @@
 						],
 						"body": {
 							"mode": "raw",
-							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 15,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"preview\",\n    \"arguments\": {\n      \"session_id\": \"{{sandboxSessionId}}\"\n    }\n  }\n}",
+							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 11,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"preview\",\n    \"arguments\": {\n      \"session_id\": \"{{sandboxSessionId}}\"\n    }\n  }\n}",
 							"options": {
 								"raw": {
 									"language": "json"
@@ -1369,7 +1458,7 @@
 						],
 						"body": {
 							"mode": "raw",
-							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 16,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"close\",\n    \"arguments\": {\n      \"session_id\": \"{{sandboxSessionId}}\"\n    }\n  }\n}",
+							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 12,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"close\",\n    \"arguments\": {\n      \"session_id\": \"{{sandboxSessionId}}\"\n    }\n  }\n}",
 							"options": {
 								"raw": {
 									"language": "json"
@@ -1412,7 +1501,7 @@
 						],
 						"body": {
 							"mode": "raw",
-							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 17,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"list_sessions\",\n    \"arguments\": {}\n  }\n}",
+							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 13,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"list_sessions\",\n    \"arguments\": {}\n  }\n}",
 							"options": {
 								"raw": {
 									"language": "json"
@@ -1455,7 +1544,7 @@
 						],
 						"body": {
 							"mode": "raw",
-							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 18,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"run\",\n    \"arguments\": {\n      \"runtime\": \"static\",\n      \"files\": {\n        \"index.html\": \"<h1>one-shot from run</h1>\"\n      },\n      \"chat_id\": \"{{chatId}}\"\n    }\n  }\n}",
+							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 14,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"run\",\n    \"arguments\": {\n      \"runtime\": \"static\",\n      \"files\": {\n        \"index.html\": \"<h1>one-shot from run</h1>\"\n      },\n      \"chat_id\": \"{{chatId}}\"\n    }\n  }\n}",
 							"options": {
 								"raw": {
 									"language": "json"

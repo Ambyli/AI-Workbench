@@ -181,9 +181,20 @@ class RunRequest(BaseModel):
     recreate_if_gone: bool = Field(
         default=True,
         description=(
-            "Backward-compat default for POST /run: silently respawn if "
-            "the session's container is gone. Set false to require the "
-            "caller to reason about self-heal explicitly."
+            "If the session's container is gone, respawn a fresh one "
+            "under the same session_id (env preserved; in-container "
+            "files and exec-installed packages LOST). Default true — "
+            "run is the one-shot path. Set false to get a 409 instead."
+        ),
+    )
+    overwrite: bool = Field(
+        default=False,
+        description=(
+            "Follow-up calls only: allow replacing an existing text file of 30+ lines with "
+            "content that keeps most of its lines. Without it such a "
+            "write is refused with 409 rewrite_of_existing_file — use "
+            "edit_file for changes to part of a file. New files, small "
+            "files, binary files and genuine rewrites are never refused."
         ),
     )
     chat_id: Optional[str] = Field(
@@ -270,6 +281,16 @@ class WriteFilesRequest(BaseModel):
             "false — caller must opt-in explicitly."
         ),
     )
+    overwrite: bool = Field(
+        default=False,
+        description=(
+            "Allow replacing an existing text file of 30+ lines with "
+            "content that keeps most of its lines. Without it such a "
+            "write is refused with 409 rewrite_of_existing_file — use "
+            "edit_file for changes to part of a file. New files, small "
+            "files, binary files and genuine rewrites are never refused."
+        ),
+    )
 
     @field_validator("files")
     @classmethod
@@ -312,104 +333,46 @@ class ExecRequest(BaseModel):
     working_dir: Optional[str] = Field(default=None)
 
 
-class PatchSpec(BaseModel):
-    """One hunk in a ``patch_files`` call — line-range strict replacement."""
+class EditFileRequest(BaseModel):
+    """One exact-string replacement in one file — ``edit_file``."""
 
     path: str = Field(
         description=(
-            "Relative path under /app. Same validation as `deletes` — "
-            "absolute paths and '..' rejected."
+            "Relative path under /app of an EXISTING UTF-8 file. Absolute "
+            "paths and '..' are rejected."
         ),
     )
-    start_line: int = Field(
-        description="1-indexed, inclusive start of the range to replace.",
-        ge=1,
-    )
-    end_line: int = Field(
-        description="1-indexed, inclusive end of the range to replace.",
-        ge=1,
-    )
-    expected: str = Field(
+    old_string: str = Field(
         description=(
-            "The EXACT current content of lines [start_line, end_line] "
-            "joined with '\\n'. Byte-for-byte match required — no "
-            "whitespace or trailing-newline lenience. If your view is "
-            "stale, call get_files first."
+            "The exact text to replace, copied from read_file output "
+            "WITHOUT the line-number prefix. Must occur exactly once in "
+            "the file unless replace_all is true."
         ),
     )
-    replacement: str = Field(
-        description=(
-            "What to write in place of `expected`. May be shorter, "
-            "longer, or the same length."
-        ),
+    new_string: str = Field(
+        description="The replacement text. Must differ from old_string.",
     )
-    note: str = Field(
-        default="",
-        description=(
-            "Optional free-text note logged for operator debugging. "
-            "Not applied to the file."
-        ),
-    )
-
-
-class PatchFilesRequest(BaseModel):
-    patches: list[PatchSpec] = Field(
-        description=(
-            "List of patches. All-or-nothing: every patch validates first "
-            "(byte-for-byte + no overlap on the same file); only then are "
-            "any files modified."
-        ),
-    )
-    recreate_if_gone: bool = Field(
+    replace_all: bool = Field(
         default=False,
-        description=(
-            "Accepted for interface consistency but has NO effect on this "
-            "tool. patch_files depends on file content that would not "
-            "exist in a fresh container, so a dead container always "
-            "returns 409 regardless. Call write_files first to establish "
-            "file state before reissuing patches."
-        ),
+        description="Replace every occurrence of old_string instead of exactly one.",
     )
 
-    @field_validator("patches")
+    @field_validator("path")
     @classmethod
-    def _validate_patches(cls, v: list[PatchSpec]) -> list[PatchSpec]:
-        if not v:
-            raise ValueError("patches must contain at least one patch")
-        total = 0
-        per_patch_over: list[tuple[int, str, int]] = []
-        for i, p in enumerate(v):
-            if p.end_line < p.start_line:
-                raise ValueError(
-                    f"patches[{i}]: end_line ({p.end_line}) must be >= "
-                    f"start_line ({p.start_line})"
-                )
-            # Each patch contributes both expected and replacement to the
-            # payload budget. Kept symmetric with `files`: bytes are UTF-8.
-            expected_bytes = len(p.expected.encode("utf-8"))
-            replacement_bytes = len(p.replacement.encode("utf-8"))
-            patch_size = expected_bytes + replacement_bytes
-            if patch_size > MAX_FILE_BYTES:
-                per_patch_over.append((i, p.path, patch_size))
-            total += patch_size
-        if per_patch_over or total > MAX_PAYLOAD_BYTES:
-            parts = ["Rejected: patch_files payload exceeded limits."]
-            parts.append(f"  Individual patch cap: {MAX_FILE_BYTES:,} bytes")
-            if per_patch_over:
-                biggest = max(per_patch_over, key=lambda t: t[2])
-                parts.append(
-                    f"  (largest oversized: patch #{biggest[0] + 1} on "
-                    f"{biggest[1]!r} at {biggest[2]:,} bytes; "
-                    f"{len(per_patch_over)} patch(es) over the cap)"
-                )
-            parts.append(
-                f"  Total payload cap: {MAX_PAYLOAD_BYTES:,} bytes "
-                f"(submitted: {total:,} bytes)"
+    def _validate_path(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("path must be a non-empty relative path under /app")
+        return v
+
+    @field_validator("old_string", "new_string")
+    @classmethod
+    def _validate_size(cls, v: str) -> str:
+        size = len(v.encode("utf-8"))
+        if size > MAX_FILE_BYTES:
+            raise ValueError(
+                f"Rejected: {size:,} bytes exceeds the per-file cap of "
+                f"{MAX_FILE_BYTES:,} bytes (SANDBOX_MAX_FILE_BYTES)."
             )
-            parts.append(
-                "Shrink or split patches into multiple patch_files calls."
-            )
-            raise ValueError("\n".join(parts))
         return v
 
 

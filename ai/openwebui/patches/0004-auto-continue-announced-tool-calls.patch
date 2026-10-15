@@ -1,0 +1,375 @@
+Zeo patch 0004 — nudge a model that announces a tool call instead of making it.
+
+Target: Open WebUI v0.11.4 (ghcr.io/open-webui/open-webui:v0.11.4).
+Applied by ai/openwebui/Dockerfile.openwebui with `patch -p1` from /app.
+
+Upstream: with native function calling the backend runs the tool loop
+(utils/middleware.py, streaming_chat_response_handler): tool calls are run
+and the model asked again, and the first reply WITHOUT tool calls ends the
+turn. Local models (muse-glimmer via LiteLLM) regularly end a turn right
+after a tool result by announcing the next step instead of taking it —
+"Permission denied on `/app/test.js` via exec. I'll use `write_files` to
+create the test harness correctly, then run it." — and nothing happens until
+the user types "go on".
+
+This patch checks that final reply before the loop ends. When ALL hold:
+native function calling with tools offered, at least one tool round ran this
+turn and the reply came straight after a tool result, the reply (LiteLLM
+`auto` footer stripped, code removed, reasoning excluded) ends in first-person
+forward-looking intent ("let me", "I'll", "I'm going to", "give me a
+moment", ...) and asks the user nothing, and fewer than
+AUTO_CONTINUE_MAX_NUDGES nudges were sent this turn — it sends the
+conversation plus a hidden user message ("You said you would take an action
+but your reply contained no tool call ...") through the same continuation
+path a tool round uses. The continuation, and any tool calls it makes (which
+then run through the normal loop), are appended to the same assistant
+message. The nudge exists only in that one request: it is never shown in the
+chat and never saved. One INFO line per nudge: `auto-continue: chat <id>
+nudge k/N: ...`.
+
+AUTO_CONTINUE_MAX_NUDGES (compose: ${OPENWEBUI_AUTO_CONTINUE_MAX_NUDGES:-2})
+caps nudges per assistant turn; 0 turns the feature off. Legacy function
+calling, task-model calls and the non-streaming handler (which has no tool
+loop) are untouched; the Responses-API stateful mode (previous_response_id)
+is skipped.
+
+Files: backend/open_webui/utils/middleware.py,
+       backend/open_webui/utils/zeo_auto_continue.py (new).
+See ai/openwebui/OPENWEBUI.md § Auto-continue announced tool calls and
+§ Custom image. Tests: unit-tests/openwebui/ (load the new module straight
+out of this file).
+
+--- a/backend/open_webui/utils/middleware.py
++++ b/backend/open_webui/utils/middleware.py
+@@ -5888,7 +5888,112 @@
+                             }
+                         )
+ 
+-                while tool_calls and (
++                # ZEO PATCH (ai/openwebui/patches/0004-auto-continue-announced-tool-calls.patch):
++                # when the tool loop is about to end on a reply that only ANNOUNCES
++                # an action ("I'll rewrite the file and re-run."), send the
++                # conversation plus a hidden nudge through the same continuation
++                # path a tool round uses, so the model's next reply (and any tool
++                # calls) lands in this same assistant message. The nudge is only
++                # in that one request: never shown, never saved. Returns True when
++                # the continuation produced tool calls for the loop below.
++                # Heuristic + config: utils/zeo_auto_continue.py.
++                zeo_auto_continue_nudges = 0
++
++                async def zeo_auto_continue_round():
++                    nonlocal output, prior_output, output_start, zeo_auto_continue_nudges
++                    from open_webui.utils import zeo_auto_continue
++
++                    while True:
++                        if max_tool_call_iterations is not None and tool_call_iterations >= max_tool_call_iterations:
++                            return False
++                        if ENABLE_RESPONSES_API_STATEFUL and last_response_id:
++                            return False
++                        announced = zeo_auto_continue.should_nudge(
++                            output,
++                            nudges_used=zeo_auto_continue_nudges,
++                            tool_rounds=tool_call_iterations,
++                            native=metadata.get('params', {}).get('function_calling') != 'legacy',
++                            tools_offered=bool(form_data.get('tools')),
++                        )
++                        if announced is None:
++                            return False
++                        zeo_auto_continue_nudges += 1
++                        log.info(
++                            zeo_auto_continue.describe_nudge(
++                                metadata.get('chat_id'),
++                                zeo_auto_continue_nudges,
++                                zeo_auto_continue.MAX_NUDGES,
++                                announced,
++                            )
++                        )
++                        try:
++                            new_form_data = {
++                                **form_data,
++                                'model': model_id,
++                                'stream': True,
++                                'metadata': metadata,
++                                'messages': [
++                                    *form_data['messages'],
++                                    *convert_output_to_messages(
++                                        output,
++                                        raw=True,
++                                        reasoning_format=get_reasoning_format(model),
++                                        flatten_tool_images=True,
++                                    ),
++                                    {'role': 'user', 'content': zeo_auto_continue.NUDGE_TEXT},
++                                ],
++                            }
++                            new_form_data = await convert_url_images_to_base64(new_form_data, user=user)
++                            if filter_functions:
++                                new_form_data, _ = await process_filter_functions(
++                                    request=request,
++                                    filter_context=filter_context,
++                                    filter_functions=filter_functions,
++                                    filter_type='request',
++                                    form_data=new_form_data,
++                                    extra_params=extra_params,
++                                )
++                            new_form_data = normalize_messages_for_model(new_form_data)
++
++                            res = await generate_chat_completion(
++                                request,
++                                new_form_data,
++                                user,
++                                bypass_system_prompt=True,
++                            )
++                            if not isinstance(res, StreamingResponse):
++                                log.warning(
++                                    'auto-continue: chat %s: continuation returned %s, not a stream; ending the turn',
++                                    metadata.get('chat_id') or '-',
++                                    getattr(res, 'status_code', type(res).__name__),
++                                )
++                                return False
++
++                            # Same bookkeeping as a tool round's continuation.
++                            prior_output = list(full_output())
++                            if (
++                                prior_output
++                                and prior_output[-1].get('type') == 'message'
++                                and prior_output[-1].get('status') == 'in_progress'
++                            ):
++                                msg_parts = prior_output[-1].get('content', [])
++                                if not msg_parts or (len(msg_parts) == 1 and not msg_parts[0].get('text', '').strip()):
++                                    prior_output.pop()
++                            output = []
++                            output_start = len(prior_output)
++                            await stream_body_handler(res, new_form_data)
++                            output = full_output()
++                            prior_output = []
++                        except Exception as e:
++                            # The reply being nudged is already complete and shown:
++                            # a failed nudge ends the turn as upstream would have.
++                            log.exception('auto-continue: chat %s: continuation failed: %s', metadata.get('chat_id') or '-', e)
++                            return False
++
++                        if tool_calls:
++                            return True
++
++                while (tool_calls or await zeo_auto_continue_round()) and (
+                     max_tool_call_iterations is None or tool_call_iterations < max_tool_call_iterations
+                 ):
+                     tool_call_iterations += 1
+--- /dev/null
++++ b/backend/open_webui/utils/zeo_auto_continue.py
+@@ -0,0 +1,215 @@
++"""ZEO PATCH (ai/openwebui/patches/0004-auto-continue-announced-tool-calls.patch):
++nudge a model that announces a tool call instead of making it.
++
++With native function calling, Open WebUI's backend runs the tool loop
++(``utils/middleware.py``, ``streaming_chat_response_handler``): the model
++answers with tool calls, Open WebUI runs them and asks the model again, and
++the first answer WITHOUT tool calls ends the turn. Some local models end turns
++right after a tool result by announcing the next step instead of taking it::
++
++    Permission denied on `/app/test.js` via exec. I'll use `write_files` to
++    create the test harness correctly, then run it.
++
++Nothing happens after that until the user types "go on". The middleware hunk
++of this patch asks :func:`should_nudge` whenever the loop is about to end; on
++a yes it sends the conversation so far plus :data:`NUDGE_TEXT` as a hidden
++user message through the same continuation path a tool round uses, so what
++the model says or calls next lands in the same assistant message. The nudge
++itself is only ever in that one request: never in the chat, never persisted.
++
++A turn is nudged only when ALL hold:
++
++* native function calling, with tools offered (``form_data['tools']``);
++* at least one tool round already ran in this turn, and the final text came
++  straight after a tool result (nothing but reasoning in between);
++* that text — LiteLLM ``auto`` footer stripped, inline / fenced code removed —
++  ends in first-person, forward-looking intent ("let me", "I'll", "I'm going
++  to", "give me a moment", "I'm fixing it now", ...) in its last two sentences;
++* the last paragraph asks the user nothing (no ``?``, no "want me to",
++  "should I", "let me know", "if you'd like", ...);
++* fewer than :data:`MAX_NUDGES` nudges were sent this turn.
++
++Bare imperatives such as "re-run the tests" or "then run it" are NOT intent on
++their own: in a finished answer they are instructions to the user.
++
++Stdlib only and free of Open WebUI imports, so the unit tests can load it
++straight out of the patch file (unit-tests/openwebui/).
++
++Config: ``AUTO_CONTINUE_MAX_NUDGES`` (from ``OPENWEBUI_AUTO_CONTINUE_MAX_NUDGES``
++in .env), default 2; ``0`` turns the feature off.
++"""
++
++from __future__ import annotations
++
++import os
++import re
++from typing import Any, Mapping, Optional
++
++ENV_VAR = 'AUTO_CONTINUE_MAX_NUDGES'
++DEFAULT_MAX_NUDGES = 2
++
++NUDGE_TEXT = (
++    'You said you would take an action but your reply contained no tool call, so nothing happened. '
++    'Make the tool call now. If the task is actually finished, reply with a one-line summary instead; '
++    'if you need a decision from the user, ask the question.'
++)
++
++
++def read_max_nudges(environ: Optional[Mapping[str, str]] = None) -> int:
++    """``AUTO_CONTINUE_MAX_NUDGES`` as an int >= 0; unset or invalid -> the default."""
++    environ = os.environ if environ is None else environ
++    raw = (environ.get(ENV_VAR) or '').strip()
++    if not raw:
++        return DEFAULT_MAX_NUDGES
++    try:
++        value = int(raw)
++    except ValueError:
++        return DEFAULT_MAX_NUDGES
++    return max(value, 0)
++
++
++MAX_NUDGES = read_max_nudges()
++
++# The footer ai/litellm/overflow.py appends to `auto` answers
++# ("\n\n---\n*muse-glimmer · local-general*"): a blank line, a `---` rule,
++# then one *italic* line of at least two " · "-separated parts, at the very
++# end. Same expression as overflow.FOOTER_RE (a test pins the two together).
++FOOTER_RE = re.compile(r'(?:\r?\n){2,}---[ \t]*\r?\n\*[^*\r\n·]+(?: · [^*\r\n·]+)+\*[ \t]*(?:\r?\n[ \t]*)*\Z')
++
++_FENCED_CODE_RE = re.compile(r'```.*?(?:```|\Z)', re.S)
++_INLINE_CODE_RE = re.compile(r'`[^`\n]*`')
++_PARAGRAPH_SPLIT_RE = re.compile(r'\n\s*\n')
++_SENTENCE_SPLIT_RE = re.compile(r'(?<=[.!?…])\s+')
++
++_APOS = "['’]"  # ' or a typographic apostrophe
++
++# First-person, forward-looking intent: the model says what it is about to do.
++_INTENT_RE = re.compile(
++    '|'.join(
++        [
++            r'\blet me\b',
++            rf'\blet{_APOS}s\b',
++            rf'\bI{_APOS}ll\b',
++            r'\bI (?:will|shall)\b',
++            rf'\bI(?:{_APOS}m| am) (?:going|about) to\b',
++            rf'\bI{_APOS}m gonna\b',
++            r'\b(?:now|next),? I\b',
++            rf'\bI(?:{_APOS}m| am) (?:now |currently |just )?'
++            r'(?:fixing|rewriting|writing|running|re-?running|updating|creating|adding|checking|retrying|'
++            r'trying|applying|patching|editing|installing|testing|starting|restarting|building|switching|'
++            r'working|looking)\b',
++            r'\bgive me (?:a|one) (?:moment|sec(?:ond)?|minute)\b',
++            r'\b(?:one|just a) (?:moment|sec(?:ond)?)\b',
++            r'\bhold on\b',
++        ]
++    ),
++    re.I,
++)
++
++# The answer hands the turn back to the user: never nudge those.
++_ASKS_USER_RE = re.compile(
++    '|'.join(
++        [
++            r'\bwould you like\b',
++            r'\bdo you want\b',
++            r'\bwant me to\b',
++            r'\bshould I\b',
++            r'\bshall I\b',
++            r'\blet me know\b',
++            rf'\bif you(?:{_APOS}d| would)? (?:like|want|prefer)\b',
++            r'\bup to you\b',
++            r'\byour call\b',
++        ]
++    ),
++    re.I,
++)
++
++
++def strip_footer(text: str) -> str:
++    """Remove trailing LiteLLM ``auto`` footers (repeatedly, like overflow.strip_footer)."""
++    while True:
++        stripped = FOOTER_RE.sub('', text)
++        if stripped == text:
++            return text
++        text = stripped
++
++
++def _prose(text: str) -> str:
++    """The answer without its footer and code: what the heuristic reads."""
++    text = strip_footer(text or '')
++    text = _FENCED_CODE_RE.sub(' ', text)
++    text = _INLINE_CODE_RE.sub('CODE', text)
++    return text.strip()
++
++
++def _last_paragraph(text: str) -> str:
++    paragraphs = [p.strip() for p in _PARAGRAPH_SPLIT_RE.split(text) if p.strip()]
++    return paragraphs[-1] if paragraphs else ''
++
++
++def looks_like_announced_action(text: str) -> bool:
++    """True when ``text`` ends by announcing an action instead of finishing or asking."""
++    tail = _last_paragraph(_prose(text))
++    if not tail:
++        return False
++    if '?' in tail or _ASKS_USER_RE.search(tail):
++        return False
++    sentences = [s for s in _SENTENCE_SPLIT_RE.split(tail) if s.strip()]
++    return bool(_INTENT_RE.search(' '.join(sentences[-2:])))
++
++
++def last_round_text(output: Any) -> tuple[str, bool]:
++    """Text of the trailing assistant message items in an Open WebUI ``output`` list.
++
++    Walks back from the end over ``message`` items (``output_text`` parts) and
++    ``reasoning`` items (skipped). Returns ``(text, after_tool_result)``, the
++    second being True when the item just before that text is a
++    ``function_call_output`` — i.e. the text answered a tool result.
++    """
++    texts: list[str] = []
++    after_tool_result = False
++    for item in reversed(output if isinstance(output, list) else []):
++        if not isinstance(item, dict):
++            break
++        item_type = item.get('type')
++        if item_type == 'reasoning':
++            continue
++        if item_type == 'message' and item.get('role', 'assistant') == 'assistant':
++            texts.append(
++                ''.join(
++                    part.get('text', '')
++                    for part in item.get('content') or []
++                    if isinstance(part, dict) and part.get('type') == 'output_text' and isinstance(part.get('text'), str)
++                )
++            )
++            continue
++        after_tool_result = item_type == 'function_call_output'
++        break
++    return '\n\n'.join(t for t in reversed(texts) if t.strip()).strip(), after_tool_result
++
++
++def should_nudge(
++    output: Any,
++    *,
++    nudges_used: int,
++    tool_rounds: int,
++    native: bool,
++    tools_offered: bool,
++    max_nudges: Optional[int] = None,
++) -> Optional[str]:
++    """The announcement to nudge on, or None to let the turn end as upstream does."""
++    limit = MAX_NUDGES if max_nudges is None else max_nudges
++    if limit <= 0 or nudges_used >= limit or tool_rounds <= 0 or not native or not tools_offered:
++        return None
++    text, after_tool_result = last_round_text(output)
++    if not after_tool_result or not looks_like_announced_action(text):
++        return None
++    return text
++
++
++def describe_nudge(chat_id: Any, nudge: int, limit: int, text: str) -> str:
++    """The INFO line logged per nudge (``docker logs openwebui | grep auto-continue``)."""
++    tail = ' '.join(strip_footer(text or '').split())
++    if len(tail) > 160:
++        tail = '…' + tail[-159:]
++    return f'auto-continue: chat {chat_id or "-"} nudge {nudge}/{limit}: reply announced an action without a tool call: {tail!r}'

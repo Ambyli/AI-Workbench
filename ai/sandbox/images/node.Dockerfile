@@ -54,8 +54,15 @@ RUN chmod +x /usr/local/bin/sandbox-entrypoint.sh
 # exist and /home/sandbox to be writable by it — the name is irrelevant
 # since the runner's `USER 1000:1000` references the uid, not the login
 # name. Skip creation, just prepare the home dir.
-RUN mkdir -p /home/sandbox && \
-    chown 1000:1000 /home/sandbox
+#
+# /app is created and chowned here, as root, rather than left to
+# `WORKDIR /app` below: BuildKit's WORKDIR creates the directory as the
+# current USER, but the legacy builder creates it root-owned, and a
+# root-owned /app means `exec` (uid 1000) cannot create a single file in
+# it. The runner's put_archive cannot fix /app afterwards either — Docker
+# skips a tar's `.` entry when the target already exists.
+RUN mkdir -p /home/sandbox /app && \
+    chown 1000:1000 /home/sandbox /app
 
 USER 1000:1000
 ENV HOME=/home/sandbox \

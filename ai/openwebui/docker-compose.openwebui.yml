@@ -158,6 +158,13 @@ services:
       # cold-starts slowly.
       MCP_INITIALIZE_TIMEOUT: "${OPENWEBUI_MCP_INITIALIZE_TIMEOUT}"
 
+      # ZEO PATCH 0004 (Dockerfile.openwebui; OPENWEBUI.md § Auto-continue
+      # announced tool calls). Nudges per assistant turn when a model ends a
+      # native tool loop by announcing an action ("I'll rewrite the file and
+      # re-run.") without making the tool call. 0 turns the feature off. Read
+      # on every boot — a change is `make up openwebui` (env change -> recreate).
+      AUTO_CONTINUE_MAX_NUDGES: "${OPENWEBUI_AUTO_CONTINUE_MAX_NUDGES:-2}"
+
       # Web search — backed by the searxng container on ai_shared. Only read
       # on the first boot of a fresh openwebui_data volume; on an existing
       # install, toggle via Admin Panel → Settings → Web Search. See

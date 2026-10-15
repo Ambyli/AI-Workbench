@@ -21,22 +21,43 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import HTTPException
+from pydantic import BaseModel, ValidationError
 
 from constants import (
     BROWSER_LOG_RATE_LIMIT_PER_MIN,
     CHAT_ID_RE,
     DEFAULT_TTL_S,
+    EDIT_MAX_LISTED_MATCHES,
+    EDIT_SNIPPET_CONTEXT_LINES,
+    EDIT_SNIPPET_MAX_LINES,
     EXEC_DEFAULT_TIMEOUT_S,
     EXEC_HARD_TIMEOUT_S,
     EXEC_MAX_OUTPUT_BYTES,
     GET_FILES_HARD_CAP_BYTES,
     HARD_TTL_S,
     HEALTH_PROBE_TIMEOUT_S,
+    MAX_FILE_BYTES,
     PROXY_URL,
+    READ_FILE_DEFAULT_LINES,
+    READ_FILE_MAX_BYTES,
+    READ_FILE_MAX_LINE_CHARS,
+    READ_FILE_MAX_LINES,
     SESSION_ID_RE,
     UPDATE_SETTLE_S,
+    WRITE_GUARD_MIN_LINES,
+    WRITE_GUARD_SIMILARITY,
 )
 from models import FileContent
+from common.textops import (
+    FileOpError,
+    RewriteVerdict,
+    apply_edit,
+    decode_utf8_prefix,
+    looks_binary,
+    number_lines,
+    rewrite_guard,
+    split_lines,
+)
 from runtimes import RUNTIMES, get_runtime
 
 import state
@@ -89,6 +110,57 @@ def _new_session_id() -> str:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _validate_tool_args(
+    model_cls: type[BaseModel],
+    tool: str,
+    sid: Optional[str] = None,
+    /,
+    **fields,
+):
+    """Build ``model_cls(**fields)`` — the same pydantic model the HTTP
+    route validates with — for an MCP adapter. ``sid`` (positional-only,
+    so a model field may also be called ``session_id``) is only echoed
+    into the error detail.
+
+    Without it an MCP tool would hand raw dicts straight to ``_do_*``
+    and skip every model validator: the per-file / payload size caps
+    (``_validate_files_map``), reserved env keys, the session/chat id
+    regexes. A failure becomes a structured ``HTTPException`` the MCP layer renders:
+    413 ``payload too large`` for a size cap, 422 ``invalid arguments``
+    for anything else.
+    """
+    try:
+        return model_cls(**fields)
+    except ValidationError as exc:
+        parts: list[str] = []
+        for err in exc.errors():
+            loc = ".".join(str(p) for p in err.get("loc", ()))
+            msg = str(err.get("msg", "")).removeprefix("Value error, ")
+            parts.append(f"{loc}: {msg}" if loc else msg)
+        message = "\n".join(parts) or str(exc)
+        too_large = (
+            "exceeded limits" in message or "exceeds the per-file cap" in message
+        )
+        log.info(
+            "%s: argument validation failed (too_large=%s): %s",
+            tool, too_large, message.replace("\n", " | "),
+        )
+        detail = {
+            "error": "payload too large" if too_large else "invalid arguments",
+            "tool": tool,
+            "message": message,
+            "hint": (
+                "Nothing was written. Send smaller files, or split them "
+                "across several calls."
+                if too_large else
+                f"Fix the arguments above and call {tool} again."
+            ),
+        }
+        if sid:
+            detail["session_id"] = sid
+        raise HTTPException(413 if too_large else 422, detail) from exc
 
 
 def _lint_python_files(files: dict[str, FileContent]) -> list[dict]:
@@ -334,8 +406,8 @@ async def _list_running_sessions_rows() -> list[dict]:
 
 def _resolve_runtime(runtime: str, entrypoint: Optional[str]):
     """Validate the runtime name and the custom-entrypoint rule, returning the
-    runtime spec. Raises ``HTTPException(400)`` with the same messages both
-    spawn paths used to raise inline."""
+    runtime spec. Raises ``HTTPException(400)`` with the same messages for
+    both spawn paths."""
     try:
         rt = get_runtime(runtime)
     except KeyError:
@@ -577,13 +649,16 @@ async def _do_write_files(
     files: dict[str, FileContent],
     deletes: list[str],
     recreate_if_gone: bool,
+    overwrite: bool = False,
 ) -> dict:
     """Overlay files into a live session's ``/app``. On a dead container,
     respawn only if the caller asked for it — otherwise return a 409 with
     the exact remediation the caller should take.
 
     Runs static Python lint on the overlay before touching Docker so a
-    syntax error is caught in ~1 ms.
+    syntax error is caught in ~1 ms. Unless ``overwrite``, a write that
+    would re-send a mostly-unchanged existing file is refused with a 409
+    ``rewrite_of_existing_file`` (see ``_check_rewrite_guard``).
     """
     if state.registry is None or state.spawner is None or state.slot_sem is None:
         raise HTTPException(500, "runner not initialized")
@@ -602,18 +677,12 @@ async def _do_write_files(
                     "Fix the syntax errors above. The lint runs before "
                     "any container write, so this failure did not touch "
                     "/app.\n\n"
-                    "PREFERRED for a small edit at a known line — "
-                    "call patch_files with the same session_id. Pass the "
-                    "path, start_line, end_line, the current bytes as "
-                    "`expected`, and your fix as `replacement`. It edits "
-                    "in place instead of re-uploading the file.\n\n"
-                    "If you don't already have the exact current bytes of "
-                    "that range in this turn, call get_files(paths=[...]) "
-                    "first — patch_files requires a byte-for-byte match on "
-                    "`expected`.\n\n"
-                    "Use write_files (whole-file rewrite) only when the "
-                    "fix is a large refactor, a new file, or the target "
-                    "file's content has drifted from what you have."
+                    "If the file already exists in the sandbox, fix just "
+                    "the broken lines with edit_file (same session_id): "
+                    "read_file(path, offset=<line - 5>, limit=20) shows the "
+                    "numbered lines, then copy the bad text into "
+                    "old_string and your fix into new_string. Re-send the "
+                    "whole file with write_files only when it is new."
                 ),
             },
         )
@@ -636,7 +705,9 @@ async def _do_write_files(
         state.spawner.container_exists, existing["container_name"]
     )
     if alive:
-        return await _apply_files_to_running(existing, files, deletes)
+        return await _apply_files_to_running(
+            existing, files, deletes, overwrite=overwrite,
+        )
 
     # Container is gone.
     if not recreate_if_gone:
@@ -659,40 +730,12 @@ async def _do_write_files(
     return await _respawn_session(existing, session_id, files, deletes)
 
 
-async def _apply_files_to_running(
-    existing: dict,
-    files: dict[str, FileContent],
-    deletes: list[str],
-) -> dict:
-    """Existing container overlay path (extracted from _reuse_or_spawn's
-    reuse branch). Bumps last_used_at, tails logs, runs a health probe."""
-    session_id = None
-    if isinstance(existing.get("expires_at"), str) and state.registry is not None:
-        # Session id is stored on the registry row; fetch to get the pure
-        # id for logging and last_used bumping.
-        got = await state.registry.get(existing["sandbox_id"])
-        if got is not None:
-            session_id = got.metadata.get("session_id")
-    session_id = session_id or existing.get("session_id") or "?"
-
-    log.info(
-        "update path: session=%s sandbox=%s alive, overlaying %d file(s), "
-        "removing %d",
-        session_id, existing["sandbox_id"], len(files or {}), len(deletes or []),
-    )
-    await asyncio.to_thread(
-        state.spawner.write_reload_marker, existing["container_name"]
-    )
-    try:
-        await asyncio.to_thread(
-            state.spawner.write_files,
-            existing["container_name"],
-            files,
-            deletes,
-        )
-    except ValueError as exc:
-        log.warning("update path: rejected unsafe path: %s", exc)
-        raise HTTPException(400, str(exc))
+async def _post_write_status(existing: dict) -> tuple[str, dict]:
+    """After a write into a live container: bump ``last_used_at``, let the
+    dev server notice (``UPDATE_SETTLE_S``), tail what it printed since
+    the last reload marker, and take one health probe. Shared by
+    write_files and edit_file so they report the same way.
+    Returns ``(startup_output, app_status)``."""
     await state.registry.update_metadata(
         existing["sandbox_id"],
         {"last_used_at": _now_iso()},
@@ -716,6 +759,169 @@ async def _apply_files_to_running(
         probe_path,
         HEALTH_PROBE_TIMEOUT_S,
     )
+    return startup_output, app_status
+
+
+# ── write_files rewrite guard (sandbox policy over common.textops) ────────
+
+
+def _text_of_file_value(value) -> Optional[str]:
+    """The text a ``files``-map value would write, or ``None`` for a
+    base64 (binary) value — the guard only compares text."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict) and value.get("encoding") in (None, "utf-8", "utf8", "text"):
+        return str(value.get("content", ""))
+    return None
+
+
+def _guard_writes(
+    files: dict,
+    current: dict[str, bytes],
+    *,
+    min_lines: int = WRITE_GUARD_MIN_LINES,
+    threshold: float = WRITE_GUARD_SIMILARITY,
+) -> list[RewriteVerdict]:
+    """The write_files decision as a pure function: every path in
+    ``files`` whose existing bytes (``current``, path → bytes, only for
+    paths that exist) would be needlessly rewritten. Empty list = allow."""
+    verdicts: list[RewriteVerdict] = []
+    for path, value in (files or {}).items():
+        if path not in current:
+            continue
+        new_text = _text_of_file_value(value)
+        if new_text is None:
+            continue
+        verdict = rewrite_guard(
+            path, current[path], new_text, min_lines=min_lines, threshold=threshold,
+        )
+        if verdict is not None:
+            verdicts.append(verdict)
+    return verdicts
+
+
+def _describe_rewrite(v: RewriteVerdict) -> str:
+    """One sentence per guarded file, used in the 409 message."""
+    if v.identical:
+        return (
+            f"{v.path} already exists with exactly this content "
+            f"({v.old_lines} lines) — nothing to write."
+        )
+    return (
+        f"{v.path} already exists and your new content keeps "
+        f"{round(v.similarity * 100)}% of its lines ({v.changed_lines} of "
+        f"{v.old_lines} changed)."
+    )
+
+
+async def _check_rewrite_guard(
+    existing: dict,
+    files: dict[str, FileContent],
+    session_id: str,
+    tool: str,
+) -> None:
+    """Refuse (409 ``rewrite_of_existing_file``) a write that re-sends an
+    existing text file of ``WRITE_GUARD_MIN_LINES``+ lines while keeping
+    ``WRITE_GUARD_SIMILARITY`` or more of its lines. Called before
+    anything is written, so the whole call is rejected — no file of it
+    lands. New, small, binary and genuinely rewritten files pass; the
+    decision itself is ``_guard_writes`` (pure, unit-tested)."""
+    text_paths = [
+        p for p, v in (files or {}).items() if _text_of_file_value(v) is not None
+    ]
+    if not text_paths:
+        return
+    current = await asyncio.to_thread(
+        state.spawner.read_existing_files,
+        existing["container_name"],
+        text_paths,
+        MAX_FILE_BYTES,
+    )
+    verdicts = _guard_writes(files, current)
+    if not verdicts:
+        return
+    log.info(
+        "%s: session=%s refused needless rewrite of %s",
+        tool, session_id, [(v.path, v.similarity) for v in verdicts],
+    )
+    raise HTTPException(409, _rewrite_detail(verdicts, session_id, tool))
+
+
+def _rewrite_detail(
+    verdicts: list[RewriteVerdict], session_id: str, tool: str,
+) -> dict:
+    paths = ", ".join(v.path for v in verdicts)
+    return {
+        "error": "rewrite of existing file",
+        "kind": "rewrite_of_existing_file",
+        "tool": tool,
+        "session_id": session_id,
+        "files": [
+            {
+                "path": v.path,
+                "similarity": v.similarity,
+                "changed_lines": v.changed_lines,
+                "old_lines": v.old_lines,
+                "new_lines": v.new_lines,
+                "identical": v.identical,
+            }
+            for v in verdicts
+        ],
+        "message": " ".join(_describe_rewrite(v) for v in verdicts),
+        "hint": (
+            "No files were written. Use edit_file for changes like this: "
+            f"read_file the part you are changing, then edit_file with "
+            "old_string (the exact current text) and new_string. If you "
+            f"really mean to replace {paths} wholesale, call {tool} again "
+            "with overwrite=true."
+        ),
+    }
+
+
+async def _apply_files_to_running(
+    existing: dict,
+    files: dict[str, FileContent],
+    deletes: list[str],
+    *,
+    overwrite: bool = False,
+    tool: str = "write_files",
+) -> dict:
+    """Existing container overlay path (extracted from _reuse_or_spawn's
+    reuse branch). Rewrite guard (unless ``overwrite``), reload marker,
+    write, then ``_post_write_status`` (last_used_at, settle, log tail,
+    health probe)."""
+    session_id = None
+    if isinstance(existing.get("expires_at"), str) and state.registry is not None:
+        # Session id is stored on the registry row; fetch to get the pure
+        # id for logging and last_used bumping.
+        got = await state.registry.get(existing["sandbox_id"])
+        if got is not None:
+            session_id = got.metadata.get("session_id")
+    session_id = session_id or existing.get("session_id") or "?"
+
+    if not overwrite:
+        await _check_rewrite_guard(existing, files, session_id, tool)
+
+    log.info(
+        "update path: session=%s sandbox=%s alive, overlaying %d file(s), "
+        "removing %d",
+        session_id, existing["sandbox_id"], len(files or {}), len(deletes or []),
+    )
+    await asyncio.to_thread(
+        state.spawner.write_reload_marker, existing["container_name"]
+    )
+    try:
+        await asyncio.to_thread(
+            state.spawner.write_files,
+            existing["container_name"],
+            files,
+            deletes,
+        )
+    except ValueError as exc:
+        log.warning("update path: rejected unsafe path: %s", exc)
+        raise HTTPException(400, str(exc))
+    startup_output, app_status = await _post_write_status(existing)
+    rt_name = existing.get("runtime")
     log.info(
         "update path complete: session=%s sandbox=%s reused=True app_status=%s",
         session_id, existing["sandbox_id"], app_status,
@@ -855,36 +1061,18 @@ async def _do_exec(
     }
 
 
-async def _do_patch_files(
-    session_id: str,
-    patches: list[dict],
-    recreate_if_gone: bool,
-) -> dict:
-    """Strict line-range replacement across one or more files.
+# ── read_file / edit_file ─────────────────────────────────────────────────
 
-    Two-pass model:
-      1. Dry-run — every patch is validated (path safety, file exists,
-         line range in bounds, expected byte-for-byte match, no overlap).
-         If anything fails, no file is touched and the caller gets a
-         structured 409 with the actual current content when applicable.
-      2. Apply — bottom-up per file so earlier hunks' line indices stay
-         valid. Then a single put_archive per file, followed by the same
-         500 ms settle + HTTP health probe write_files uses.
-
-    ``recreate_if_gone`` is accepted for interface consistency but does
-    NOT trigger a respawn — a fresh container would not have the file
-    the patch anchors on, so callers are told to establish state via
-    write_files first.
-    """
-    if state.registry is None or state.spawner is None or state.slot_sem is None:
+async def _require_live_container(session_id: str, tool: str) -> dict:
+    """Session lookup shared by read_file / edit_file: 400 bad id, 404 no
+    running session, 409 container gone (neither tool respawns — a fresh
+    container would not have the file)."""
+    if state.registry is None or state.spawner is None:
         raise HTTPException(500, "runner not initialized")
-    if not SESSION_ID_RE.match(session_id):
+    if not SESSION_ID_RE.match(session_id or ""):
         raise HTTPException(400, "invalid session_id")
-    if not patches:
-        raise HTTPException(400, "patches must contain at least one patch")
-
     existing = await _find_running_session(session_id)
-    if existing is None:
+    if existing is None or not existing.get("container_name"):
         raise HTTPException(
             404,
             {
@@ -892,8 +1080,7 @@ async def _do_patch_files(
                 "session_id": session_id,
                 "hint": (
                     "No running sandbox for this session_id. Call `create` "
-                    "or `run` first, then `write_files` to establish files, "
-                    "then `patch_files` for targeted edits."
+                    "or `run` first (list_sessions recovers a lost id)."
                 ),
             },
         )
@@ -901,174 +1088,314 @@ async def _do_patch_files(
         state.spawner.container_exists, existing["container_name"]
     )
     if not alive:
-        # patch_files never respawns — a fresh container has no file to
-        # anchor on. Signal 409 no matter what recreate_if_gone says.
         raise HTTPException(
             409,
             {
                 "error": "sandbox container is gone",
                 "session_id": session_id,
                 "hint": (
-                    "patch_files cannot respawn — it depends on files that "
-                    "would not exist in a fresh container. Call "
-                    "write_files first (with recreate_if_gone=true if you "
-                    "want to force a respawn) to establish file state, then "
-                    "reissue your patches."
+                    f"{tool} cannot respawn a container — a fresh one would "
+                    "not have your files. Call write_files with "
+                    "recreate_if_gone=true and the files' full content to "
+                    "bring the session back, then continue."
                 ),
             },
         )
+    return existing
 
+
+_FILE_OP_STATUS = {
+    "unsafe_path": 400,
+    "missing_file": 404,
+    "too_large": 413,
+}
+
+_FILE_OP_ERROR = {
+    "unsafe_path": "unsafe path",
+    "missing_file": "file does not exist",
+    "is_directory": "path is a directory",
+    "not_a_file": "not a regular file",
+    "binary_file": "not a UTF-8 text file",
+    "too_large": "file too large",
+    "empty_old_string": "old_string is empty",
+    "no_change": "old_string equals new_string",
+    "not_found": "old_string not found",
+    "line_number_prefix": "old_string contains read_file line numbers",
+    "multiple_matches": "old_string matches more than once",
+}
+
+
+def _file_op_hint(kind: str, tool: str, path: str, extra: dict) -> str:
+    """The exact next action for a refused read_file / edit_file."""
+    edit = tool == "edit_file"
+    tail = " No file was modified." if edit else ""
+    if kind == "unsafe_path":
+        return (
+            "Paths are relative to /app (e.g. `src/app.js`); absolute paths "
+            "and '..' are rejected." + tail
+        )
+    if kind == "missing_file":
+        if edit:
+            return (
+                "edit_file only changes existing files. Create it with "
+                "write_files (its full content), or call get_files() with "
+                "no paths to list what exists under /app."
+            )
+        return "Call get_files() with no paths to list what exists under /app."
+    if kind in ("is_directory", "not_a_file"):
+        return "Call get_files() with no paths to list the files under /app." + tail
+    if kind == "binary_file":
+        if edit:
+            return (
+                "edit_file only edits UTF-8 text. Replace a binary file with "
+                "write_files and a base64 value."
+            )
+        return (
+            "read_file shows UTF-8 text only. get_files(paths=[...]) returns "
+            "a binary file as base64."
+        )
+    if kind == "too_large":
+        return (
+            f"edit_file handles files up to {MAX_FILE_BYTES:,} bytes "
+            "(SANDBOX_MAX_FILE_BYTES). Edit a large file with exec (e.g. "
+            "sed) or split it into smaller files." + tail
+        )
+    if kind == "empty_old_string":
+        return (
+            "To create a file or replace all of it, use write_files "
+            "(overwrite=true for an existing file)." + tail
+        )
+    if kind == "no_change":
+        return "Put the text you want in new_string." + tail
+    if kind == "line_number_prefix":
+        n = extra.get("matches_without_prefixes")
+        found = (
+            " Without the prefixes, old_string matches exactly one place."
+            if n == 1 else ""
+        )
+        return (
+            "Remove the `<number><TAB>` prefix from every line of old_string "
+            "(and new_string) and call edit_file again." + found + tail
+        )
+    if kind == "not_found":
+        a = extra.get("closest_start_line")
+        if a is not None:
+            ws = (
+                " It differs only in whitespace or indentation."
+                if extra.get("whitespace_only") else ""
+            )
+            return (
+                f"The closest text is lines {a}-{extra.get('closest_end_line')} "
+                f"(shown above).{ws} Copy old_string exactly from it — or "
+                f"read_file(path=\"{path}\", offset={max(1, a - 10)}, limit=40) "
+                "for more context — and call edit_file again." + tail
+            )
+        return (
+            f"Call read_file(path=\"{path}\") to see the current text, then "
+            "copy old_string from it exactly." + tail
+        )
+    if kind == "multiple_matches":
+        lines = ", ".join(str(n) for n in extra.get("match_lines") or [])
+        return (
+            f"Matches start on lines {lines}. Include enough surrounding "
+            "lines in old_string to pick one, or set replace_all=true to "
+            f"change all {extra.get('count')}." + tail
+        )
+    return f"Fix the issue above and call {tool} again." + tail
+
+
+def _file_op_http(
+    exc: FileOpError, *, session_id: str, tool: str, path: str,
+) -> HTTPException:
+    """``FileOpError`` → the structured HTTPException every MCP tool
+    renders: ``{error, kind, tool, session_id, path, message, hint, ...}``."""
+    target = exc.extra.get("path") or path
+    detail = {
+        "error": _FILE_OP_ERROR.get(exc.kind, f"{tool} failed"),
+        "kind": exc.kind,
+        "tool": tool,
+        "session_id": session_id,
+        "path": target,
+        "message": exc.message,
+    }
+    for key, value in exc.extra.items():
+        if key != "path":
+            detail[key] = value
+    detail["hint"] = _file_op_hint(exc.kind, tool, target, exc.extra)
     log.info(
-        "patch_files: session=%s sandbox=%s n_patches=%d",
-        session_id, existing["sandbox_id"], len(patches),
+        "%s: refused session=%s path=%s kind=%s", tool, session_id, target, exc.kind,
     )
-    try:
-        hunks, mismatch = await asyncio.to_thread(
-            state.spawner.patch_files,
-            existing["container_name"],
-            patches,
-        )
-    except ValueError as exc:
-        # Path traversal etc. surfaced by _safe_relpath.
-        log.warning("patch_files: rejected: %s", exc)
-        raise HTTPException(400, str(exc))
-    if mismatch is not None:
-        log.info(
-            "patch_files: rejected pre-apply — kind=%s path=%s patch=%s",
-            mismatch.kind, mismatch.path, mismatch.patch_index,
-        )
-        detail = {
-            "error": _PATCH_KIND_TO_ERROR.get(
-                mismatch.kind, "patch_files validation failed",
-            ),
-            "session_id": session_id,
-            "kind": mismatch.kind,
-            "path": mismatch.path,
-            "patch_index": mismatch.patch_index,
-            "message": mismatch.message,
-        }
-        if mismatch.start_line is not None:
-            detail["start_line"] = mismatch.start_line
-            detail["end_line"] = mismatch.end_line
-        if mismatch.file_line_count is not None:
-            detail["file_line_count"] = mismatch.file_line_count
-        if mismatch.expected is not None:
-            detail["expected"] = mismatch.expected
-            detail["actual"] = mismatch.actual
-        if mismatch.other_start_line is not None:
-            detail["other_start_line"] = mismatch.other_start_line
-            detail["other_end_line"] = mismatch.other_end_line
-            detail["other_patch_index"] = mismatch.other_index
-        # Content mismatch and out-of-range are 409 (client-fixable state
-        # divergence). Missing file, binary file, unsafe path are 4xx too
-        # but carry different semantics; group them all under 409 to keep
-        # the tool response shape consistent (the model reads the `kind`).
-        detail["hint"] = _PATCH_HINT_FOR(mismatch.kind)
-        raise HTTPException(409, detail)
+    return HTTPException(_FILE_OP_STATUS.get(exc.kind, 409), detail)
 
-    # Apply succeeded — bump last_used_at, settle, probe.
+
+def _decode_text(data: bytes, safe: str, *, partial: bool) -> str:
+    """UTF-8 text of a file, or ``FileOpError("binary_file")``."""
+    if looks_binary(data):
+        raise FileOpError(
+            "binary_file", f"{safe} is not UTF-8 text (it contains a NUL byte).",
+            path=safe,
+        )
+    try:
+        return decode_utf8_prefix(data) if partial else data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise FileOpError(
+            "binary_file", f"{safe} is not valid UTF-8 text.", path=safe,
+        ) from exc
+
+
+async def _do_read_file(
+    session_id: str,
+    path: str,
+    offset: Optional[int] = 1,
+    limit: Optional[int] = None,
+) -> dict:
+    """A ``cat -n``-style window of one text file — Claude Code's Read.
+
+    ``offset`` is the 1-based first line, ``limit`` the line count
+    (default ``READ_FILE_DEFAULT_LINES``, capped at ``READ_FILE_MAX_LINES``).
+    At most ``READ_FILE_MAX_BYTES`` are read from the container; a longer
+    file reports ``file_truncated`` and its readable line count. Lines
+    over ``READ_FILE_MAX_LINE_CHARS`` are cut with a marker. Binary and
+    non-UTF-8 files are refused (``binary_file``) — get_files keeps the
+    base64 path for those.
+    """
+    existing = await _require_live_container(session_id, "read_file")
+    start = max(1, int(offset or 1))
+    count = max(1, min(int(limit or READ_FILE_DEFAULT_LINES), READ_FILE_MAX_LINES))
+    try:
+        safe, data, size, byte_capped = await asyncio.to_thread(
+            state.spawner.read_file_bytes,
+            existing["container_name"],
+            path,
+            READ_FILE_MAX_BYTES,
+        )
+        text = _decode_text(data, safe, partial=byte_capped)
+    except FileOpError as exc:
+        raise _file_op_http(exc, session_id=session_id, tool="read_file", path=path)
+    if byte_capped and not text.endswith("\n"):
+        # The cap cut a line in half; show only whole lines.
+        text = text[: text.rfind("\n") + 1]
+    lines = split_lines(text)
+    total = len(lines)
+    window = lines[start - 1:start - 1 + count]
+    end = start + len(window) - 1 if window else min(start - 1, total)
+    content, cut = number_lines(
+        window, start, max_line_chars=READ_FILE_MAX_LINE_CHARS,
+    )
     await state.registry.update_metadata(
         existing["sandbox_id"], {"last_used_at": _now_iso()},
     )
-    await asyncio.sleep(UPDATE_SETTLE_S)
-    rt_name = existing.get("runtime")
-    probe_path = "/"
-    if rt_name and rt_name in RUNTIMES:
-        probe_path = RUNTIMES[rt_name].readiness_probe_path
-    app_status = await asyncio.to_thread(
-        state.spawner.probe_health,
-        existing["container_name"],
-        80,
-        probe_path,
-        HEALTH_PROBE_TIMEOUT_S,
-    )
-    startup_output = await asyncio.to_thread(
-        state.spawner.tail_logs_since_last_marker,
-        existing["container_name"],
-        40,
-    )
-    hunks_out = [
-        {
-            "path": h.path,
-            "start_line": h.start_line,
-            "end_line": h.end_line,
-            "replaced_bytes": h.replaced_bytes,
-            "new_bytes": h.new_bytes,
-        }
-        for h in hunks
-    ]
-    files_touched = sorted({h["path"] for h in hunks_out})
+    more = max(0, total - end) if window else 0
     log.info(
-        "patch_files complete: session=%s sandbox=%s files=%d hunks=%d "
-        "app_status=%s",
-        session_id, existing["sandbox_id"], len(files_touched),
-        len(hunks_out), app_status,
+        "read_file: session=%s path=%s lines %d-%d of %d (size=%d capped=%s)",
+        session_id, safe, start, end, total, size, byte_capped,
     )
+    return {
+        "session_id": session_id,
+        "sandbox_id": existing["sandbox_id"],
+        "path": safe,
+        "start_line": start,
+        "end_line": end,
+        "total_lines": total,
+        "more_lines": more,
+        "truncated": more > 0 or (byte_capped and bool(window) and end == total),
+        "lines_cut": cut,
+        "size": size,
+        "file_truncated": byte_capped,
+        "content": content,
+    }
+
+
+async def _do_edit_file(
+    session_id: str,
+    path: str,
+    old_string: str,
+    new_string: str,
+    replace_all: bool = False,
+) -> dict:
+    """Exact-string replacement in one existing file — Claude Code's Edit.
+
+    All-or-nothing: the file is read, ``common.textops.apply_edit`` checks
+    the rules (non-empty, changed, exactly one match unless
+    ``replace_all``) and builds the new content, a ``.py`` result is linted, and only then
+    is the file written (reload marker first, so ``startup_output`` is
+    fresh; ``_build_app_tarball`` ownership via ``Spawner.put_files``).
+    Refusals are ``FileOpError``s rendered as structured 4xx details; a
+    not-found ``old_string`` carries the closest region of the file.
+    """
+    existing = await _require_live_container(session_id, "edit_file")
+    container_name = existing["container_name"]
+    try:
+        safe, data, _size, truncated = await asyncio.to_thread(
+            state.spawner.read_file_bytes, container_name, path, MAX_FILE_BYTES,
+        )
+        if truncated:
+            raise FileOpError(
+                "too_large",
+                f"{safe} is larger than {MAX_FILE_BYTES:,} bytes.",
+                path=safe,
+            )
+        text = _decode_text(data, safe, partial=False)
+        result = await asyncio.to_thread(
+            lambda: apply_edit(
+                text, old_string, new_string, replace_all,
+                context=EDIT_SNIPPET_CONTEXT_LINES,
+                max_snippet_lines=EDIT_SNIPPET_MAX_LINES,
+                max_listed=EDIT_MAX_LISTED_MATCHES,
+                max_line_chars=READ_FILE_MAX_LINE_CHARS,
+            )
+        )
+        new_bytes = result.new_text.encode("utf-8")
+        if len(new_bytes) > MAX_FILE_BYTES:
+            raise FileOpError(
+                "too_large",
+                f"The edited {safe} would be {len(new_bytes):,} bytes.",
+                path=safe,
+            )
+    except FileOpError as exc:
+        raise _file_op_http(exc, session_id=session_id, tool="edit_file", path=path)
+
+    if safe.endswith(".py"):
+        lint_errors = _lint_python_files({safe: result.new_text})
+        if lint_errors:
+            raise HTTPException(
+                400,
+                {
+                    "error": "static lint failed",
+                    "session_id": session_id,
+                    "errors": lint_errors,
+                    "hint": (
+                        "The edit was NOT applied — the file would not "
+                        "compile with it. Fix new_string and call edit_file "
+                        "again."
+                    ),
+                },
+            )
+
+    log.info(
+        "edit_file: session=%s path=%s replacements=%d lines %d-%d",
+        session_id, safe, result.replacements, result.start_line, result.end_line,
+    )
+    await asyncio.to_thread(state.spawner.write_reload_marker, container_name)
+    await asyncio.to_thread(state.spawner.put_files, container_name, {safe: new_bytes})
+    startup_output, app_status = await _post_write_status(existing)
     return {
         "sandbox_id": existing["sandbox_id"],
         "session_id": session_id,
         "url": existing["url"],
         "expires_at": existing["expires_at"],
-        "runtime": rt_name,
-        "hunks_applied": hunks_out,
-        "files_touched": files_touched,
+        "runtime": existing.get("runtime"),
+        "path": safe,
+        "replacements": result.replacements,
+        "start_line": result.start_line,
+        "end_line": result.end_line,
+        "match_lines": result.match_lines,
+        "total_lines": result.total_lines,
+        "snippet": result.snippet,
         "startup_output": startup_output,
         "app_status": app_status,
         "recreated": False,
     }
-
-
-# Mapping from PatchMismatch.kind to the `error` string surfaced in the
-# structured tool response. Kept separate so sandbox_mcp can pattern-match
-# without importing the dataclass.
-_PATCH_KIND_TO_ERROR = {
-    "unsafe_path": "unsafe path in patch",
-    "missing_file": "target file does not exist",
-    "binary_file": "cannot patch non-UTF-8 file",
-    "out_of_range": "line range out of bounds",
-    "content_mismatch": "expected content mismatch",
-    "overlap": "overlapping patches on same file",
-    "bad_expected_type": "expected must be a string",
-    "bad_replacement_type": "replacement must be a string",
-}
-
-
-def _PATCH_HINT_FOR(kind: str) -> str:
-    if kind == "missing_file":
-        return (
-            "patch_files does not create files. Call write_files with "
-            "the file's full content to create it first."
-        )
-    if kind == "binary_file":
-        return (
-            "The target file is not UTF-8 (contains a null byte or "
-            "invalid encoding). Use write_files with a base64 payload "
-            "to overwrite it entirely."
-        )
-    if kind == "out_of_range":
-        return (
-            "Call get_files(paths=[<path>]) to refresh your view of the "
-            "file, then reissue patch_files with the correct line range. "
-            "No files were modified."
-        )
-    if kind == "content_mismatch":
-        return (
-            "The file has changed since you last read it. Call get_files "
-            "with the affected path, copy the current bytes into "
-            "`expected`, and reissue patch_files. No files were modified."
-        )
-    if kind == "overlap":
-        return (
-            "Combine the overlapping patches into ONE patch whose "
-            "`expected` and `replacement` cover the merged range. No "
-            "files were modified."
-        )
-    if kind == "unsafe_path":
-        return (
-            "Paths must be relative under /app. '..' and absolute paths "
-            "are rejected. No files were modified."
-        )
-    return "Fix the issue above and reissue patch_files."
 
 
 async def _do_preview(session_id: str) -> dict:
@@ -1295,8 +1622,10 @@ async def _reuse_or_spawn(
     env: Optional[dict[str, str]] = None,
     recreate_if_gone: bool = True,
     chat_id: Optional[str] = None,
+    overwrite: bool = False,
 ) -> dict:
-    """Session-aware entry point retained for HTTP compatibility.
+    """Session-aware entry point behind ``POST /run``, the ``run`` MCP
+    tool and ``/tool/run``.
 
     Two branches:
       * ``session_id`` names a live container → overlay + probe. Same shape
@@ -1304,13 +1633,15 @@ async def _reuse_or_spawn(
       * No session_id, OR the session's container is gone AND
         ``recreate_if_gone`` is true → full spawn.
 
-    Kept as a single function so ``POST /run`` and the ``run`` MCP tool
-    still work exactly as they did before the redesign.
-
     ``chat_id`` makes ``run`` one-create-per-chat: when the caller gives a
     chat_id but no explicit session_id, and the chat already has a live
     container, we resolve that chat's session_id and take the overlay path
     instead of spawning a second container.
+
+    ``overwrite`` is the overlay path's rewrite-guard opt-out (see
+    ``_check_rewrite_guard``); a fresh spawn has no existing files to
+    guard. The OpenWebUI Tool Server passes ``True`` — its only tool is
+    ``run``, so it has no edit_file to fall back on.
     """
     log.info(
         "_reuse_or_spawn: runtime=%s session_id=%s chat_id=%s n_files=%d "
@@ -1346,7 +1677,9 @@ async def _reuse_or_spawn(
             )
             if alive:
                 # Session reuse: overlay + probe path.
-                return await _apply_files_to_running(existing, files, deletes)
+                return await _apply_files_to_running(
+                    existing, files, deletes, overwrite=overwrite, tool="run",
+                )
             # Container gone. Respect the caller's recreate_if_gone flag.
             if not recreate_if_gone:
                 raise HTTPException(
@@ -1427,7 +1760,9 @@ async def _reuse_or_spawn(
                 "winner sandbox=%s",
                 chat_id, winner["sandbox_id"],
             )
-            return await _apply_files_to_running(winner, files, deletes)
+            return await _apply_files_to_running(
+                winner, files, deletes, overwrite=overwrite, tool="run",
+            )
         log.info(
             "run: chat=%s lost the spawn race to still-warming sandbox=%s — "
             "returning it",

@@ -524,6 +524,8 @@ class Deployer:
         self.sleep = sleep
         self.clock = clock
         self.config: dict = {}
+        # (container, target name) of a copy renamed aside during a swap; see abort().
+        self.parked: Optional[tuple] = None
         self.services: dict = {}
         # {service key: LAN port} the edge fronts, from ai/edge/haproxy.cfg.
         self.edge_listens = load_edge_listens(repo_root) if edge_listens is None else dict(edge_listens)
@@ -945,6 +947,7 @@ class Deployer:
 
         old = [c for c in running if c is not current]
         created = False
+        self.parked = None
         if current_ok:
             self.detail(f"{target} is already running and healthy; retiring the other copies")
             new = current
@@ -955,6 +958,8 @@ class Deployer:
                 self.must(self.docker("rename", current.id, parked), f"docker rename {current.name}")
                 current.name = parked
                 old.append(current)
+                # abort() gives it its name back if the new copy is thrown away.
+                self.parked = (current, target)
             new = self.start_copy(name, target, scale=len(old) + 1)
             created = True
             new = self.wait_healthy(name, new, timeout, old)
@@ -1011,8 +1016,27 @@ class Deployer:
         return f"{', '.join(c.name for c in old)} keeps serving" if old else "no copy was running before"
 
     def abort(self, new: Container, reason: str, old: list) -> None:
+        """Throw the new copy away, gracefully, and leave the old one exactly as it was.
+
+        `docker stop`, not `rm -f`: by now the edge (or Docker DNS) may already be
+        sending it requests -- the edge-wait abort happens after it was healthy --
+        and a kill drops those mid-flight. Then a copy parked under
+        `<target>-old-<id>` gets its name back, or the next run would see no
+        container at the target name and swap again instead of "up to date".
+        """
         self.print_logs(new)
+        self.detail(f"stopping the new copy {new.name} (docker stop, grace {new.stop_timeout or 10}s)")
+        self.docker("stop", new.id)
         self.remove(new)
+        parked, self.parked = self.parked, None
+        if parked is not None:
+            c, target = parked
+            r = self.docker("rename", c.id, target)
+            if r.ok:
+                c.name = target
+                self.detail(f"renamed {c.id[:12]} back to {target}")
+            else:
+                self.detail(f"could not rename {c.name} back to {target} ({r.why()}); the next run swaps it")
         raise DeployError(f"{reason}; removed the new copy, {self.serving(old)}")
 
     def edge_container(self) -> Optional[Container]:
@@ -1087,7 +1111,14 @@ class Deployer:
                     self.detail(f"edge backend {name}/{row.get('svname')} is UP")
                     return
             if self.clock() >= deadline:
-                raise DeployError(f"the edge did not mark {new.name} UP within {int(EDGE_TIMEOUT_S)}s")
+                seen = "; ".join(
+                    f"{row.get('svname')}={(row.get('status') or '').strip() or '?'}@{row.get('addr') or '-'}"
+                    for row in rows
+                )
+                raise DeployError(
+                    f"the edge did not mark {new.name} UP within {int(EDGE_TIMEOUT_S)}s "
+                    f"(looked for {', '.join(sorted(ips))}; backend '{name}' shows: {seen})"
+                )
             self.sleep(POLL_S)
 
     def retire(self, c: Container) -> None:

@@ -741,6 +741,31 @@ def test_edge_that_never_marks_the_copy_up_aborts():
     assert fake.containers[old]["state"] == "running"
 
 
+def test_edge_timeout_stops_the_new_copy_gracefully_and_restores_the_parked_name():
+    # Seen on the box: `make up litellm FORCE=1` parked the healthy copy as
+    # <target>-old-<id>, the edge wait failed, the new copy was `rm -f`'d
+    # mid-request, and the old copy kept its parked name -- so the next plain
+    # `make up` swapped again instead of saying "up to date".
+    fake = FakeDocker({"app": swap_svc()})
+    target = target_name(fake, "app")
+    current = fake.add("app", target)
+    fake.add("edge", "edge", project="ai-edge")
+    fake.edge_stats = stats([("app", "app1", "UP", "172.18.0.11:4000"), ("app", "app2", "DOWN", "-")])
+    rc, out = run(fake, "app", force=True, edge_listens=FRONTED)
+    assert rc == 1
+    seq = fake.mutating()
+    new = next(cmd.split()[1] for cmd in seq if cmd.startswith("rename ") and cmd.endswith(target)
+               and not cmd.startswith(f"rename {current}"))
+    assert f"stop {new}" in seq and seq.index(f"stop {new}") < seq.index(f"rm -f {new}")
+    assert seq[-1] == f"rename {current} {target}"  # its name back, last
+    assert fake.names("app") == [target] and fake.containers[current]["state"] == "running"
+    # The timeout names what the edge showed and which addresses were wanted.
+    assert "looked for 172.18.0." in out and "app1=UP@172.18.0.11:4000" in out and "app2=DOWN@-" in out
+    # And now a plain run is a no-op.
+    rc, out = run(fake, "app", edge_listens=FRONTED)
+    assert rc == 0 and "up to date" in out
+
+
 def test_unreadable_edge_stats_abort_instead_of_retiring_blind():
     fake = FakeDocker({"app": swap_svc()})
     old = fake.add("app", "app")

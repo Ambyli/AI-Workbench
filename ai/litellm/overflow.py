@@ -127,6 +127,29 @@ a streamed answer whose user message carries the "### Task:" RAG template
 still gets its footer), strip a previous footer
 from incoming assistant messages, and never throw. AUTO_FOOTER_ENABLED=false
 turns the whole feature off. See ai/litellm/LITELLM.md > The `auto` footer.
+
+THE CODE-TOOL REMAP (third job, in the same async_pre_call_hook). The
+semantic router reads only the latest user message and cannot see tool
+NAMES, so a coding chat whose latest turn is "Looks the same" lands on
+local-general. When the conversation in a request for ``local-general``
+contains a CALL to a tool whose function name matches CODE_ROUTE_TOOL_REGEX
+in full (default: the sandbox MCP tools, ``sandbox-mcp_*``, and Open
+Terminal's distinctive operationIds such as ``run_command``), the hook
+rewrites ``data["model"]`` to ``local-code``. Tools that are merely offered
+(``data["tools"]``) do not count: a chat with the sandbox attached but never
+used stays on local-general. A call anywhere in the history counts, so once a
+chat has used the sandbox every later turn is local-code, and inside a turn
+the remap starts with the first tool round after the first sandbox call.
+The proxy routes on the rewritten model (pre_call_hook ->
+route_request in common_request_processing.py) and the Router sets
+metadata.model_group from it, so the overflow filter, the spend log and the
+`auto` footer all see local-code. Only ``local-general`` is ever remapped --
+never local-private (PII routing stays the router's decision),
+local-reasoning, local-code itself, ``auto`` or a concrete alias. One
+``[route] local-general -> local-code (tool: <name>)`` line per remap
+(throttled like the spill lines). An empty CODE_ROUTE_TOOL_REGEX disables
+it; an invalid one is logged and disables it. See ai/litellm/LITELLM.md >
+local-code: what it adds.
 """
 
 from __future__ import annotations
@@ -450,29 +473,62 @@ def chat_template_kwargs(deployment: Any, request_kwargs: Any) -> Optional[Dict[
     """What vLLM's chat template will be rendered with, besides the server's
     --default-chat-template-kwargs (which /tokenize applies by itself).
 
-    Merged in LiteLLM's precedence: the deployment's
-    extra_body.chat_template_kwargs, then the request's, then a top-level
-    request `chat_template_kwargs` (for an openai/ provider LiteLLM moves
-    unknown top-level params into extra_body, utils.py:4361-4392)."""
-    merged: Dict[str, Any] = {}
+    LiteLLM REPLACES rather than merges (measured on the outgoing request
+    body with both 1.93.0 and 1.95.0): the Router builds the call as {**deployment litellm_params,
+    **request kwargs} (router.py::_acompletion), so a request `extra_body`
+    replaces the deployment's whole extra_body; then, for an openai/ provider,
+    a top-level request `chat_template_kwargs` is written over
+    extra_body["chat_template_kwargs"] as one value
+    (utils.py::add_provider_specific_params_to_optional_params). So the
+    template is rendered with exactly ONE of: the request's top-level
+    chat_template_kwargs, else the request's extra_body's, else -- only when
+    the request sent no extra_body at all -- the deployment's. Mirroring
+    that is what keeps /tokenize counting the prompt vLLM will see (the
+    local-code deployments set reasoning_effort / reasoning_strength here,
+    and a client that sends its own chat_template_kwargs drops them)."""
     req = request_kwargs if isinstance(request_kwargs, dict) else {}
-    sources = (_params(deployment).get("extra_body"), req.get("extra_body"), req)
-    for src in sources:
-        value = src.get("chat_template_kwargs") if isinstance(src, dict) else None
-        if isinstance(value, dict):
-            merged.update(value)
-    return merged or None
+    top = req.get("chat_template_kwargs")
+    if top is not None:
+        return dict(top) if isinstance(top, dict) and top else None
+    extra = req["extra_body"] if "extra_body" in req else _params(deployment).get("extra_body")
+    value = extra.get("chat_template_kwargs") if isinstance(extra, dict) else None
+    return dict(value) if isinstance(value, dict) and value else None
+
+
+def system_prompt_messages(deployment: Any, messages: Any) -> Any:
+    """`messages` as LiteLLM will send them to this deployment: a
+    `litellm_system_prompt` litellm_param is merged IN FRONT of the first
+    system message (or becomes a new first system message) by
+    main.py::completion -> add_system_prompt_to_messages(...,
+    merge_with_first_system=True), AFTER the router has picked the
+    deployment -- so this hook must add it itself to count it."""
+    prompt = _params(deployment).get("litellm_system_prompt")
+    if not isinstance(prompt, str) or not prompt or not isinstance(messages, list):
+        return messages
+    first = messages[0] if messages else None
+    if isinstance(first, dict) and first.get("role") == "system":
+        merged = dict(first)
+        content = first.get("content", "")
+        if isinstance(content, str):
+            merged["content"] = f"{prompt.strip()}\n\n{content}"
+        elif isinstance(content, list):
+            merged["content"] = [{"type": "text", "text": prompt.strip()}] + list(content)
+        else:
+            merged["content"] = [{"type": "text", "text": prompt.strip()}]
+        return [merged] + list(messages[1:])
+    return [{"role": "system", "content": prompt}] + list(messages)
 
 
 def tokenize_body(
     deployment: Any, messages: Any, tools: Optional[List[Any]], request_kwargs: Any
 ) -> Dict[str, Any]:
-    """The /tokenize request (vLLM TokenizeChatRequest): the same messages,
-    tools and template kwargs the chat completion will carry, plus the
-    generation prompt, so `count` is the prompt vLLM will actually see."""
+    """The /tokenize request (vLLM TokenizeChatRequest): the same messages
+    (with the deployment's litellm_system_prompt merged in), tools and
+    template kwargs the chat completion will carry, plus the generation
+    prompt, so `count` is the prompt vLLM will actually see."""
     body: Dict[str, Any] = {
         "model": strip_provider(_params(deployment).get("model")) or "",
-        "messages": messages,
+        "messages": system_prompt_messages(deployment, messages),
         "add_generation_prompt": True,
     }
     if tools:
@@ -665,6 +721,105 @@ def _headers_of(obj: Any) -> Dict[str, Any]:
 
 def _choice_has_tool_calls(obj: Any) -> bool:
     return bool(_get(obj, "tool_calls")) or bool(_get(obj, "function_call"))
+
+
+# -- Code-tool remap: pure helpers (unit-tested) -------------------------------
+CODE_ROUTE_FROM = "local-general"
+CODE_ROUTE_TO = "local-code"
+# Tool names as Open WebUI v0.11.4 presents them to the model:
+#   * the sandbox MCP server's tools carry the server-id prefix `sandbox-mcp_`
+#     (sandbox-mcp_run, sandbox-mcp_write_files, sandbox-mcp_exec, ...);
+#   * Open Terminal's tools are its OpenAPI operationIds, UNPREFIXED --
+#     utils/tools.py::get_terminal_tools uses `function_name = spec['name']`,
+#     and convert_openapi_to_tool_payload sets name = operationId. The
+#     open-terminal 0.13.0 operationIds in the schema are run_command,
+#     get_process_status, send_process_input, kill_process, list_processes,
+#     replace_file_content, write_file, read_file, display_file, list_files,
+#     grep_search, glob_search, match_files, search_files, get_info,
+#     read_user_terminal, send_user_terminal_input. Only the ones no other
+#     tool server is likely to share are listed; run_command is always
+#     present when a terminal is attached.
+#
+# The pattern must match the WHOLE tool name (re.fullmatch), so it needs no
+# `^...$` anchors -- and a `$` in .env would have to be written `$$`. The
+# same string is the default in docker-compose.litellm.yml and .env.example;
+# unit-tests/litellm/test_code_route.py fails if the three drift.
+DEFAULT_CODE_ROUTE_TOOL_REGEX = (
+    "sandbox-mcp_.+|run_command|get_process_status|send_process_input"
+    "|kill_process|replace_file_content|read_user_terminal|send_user_terminal_input"
+)
+
+
+def compile_code_route_regex(raw: Optional[str]) -> Tuple[Optional["re.Pattern[str]"], str]:
+    """(compiled pattern or None, error). Unset / empty / whitespace disables
+    the remap; an invalid pattern disables it too and returns the error to log."""
+    if raw is None or not raw.strip():
+        return None, ""
+    try:
+        return re.compile(raw.strip()), ""
+    except re.error as exc:
+        return None, f"invalid CODE_ROUTE_TOOL_REGEX {raw!r}: {exc}"
+
+
+def _name_of(obj: Any) -> Optional[str]:
+    name = obj.get("name") if isinstance(obj, dict) else None
+    return name if isinstance(name, str) and name else None
+
+
+def called_tool_names(messages: Any) -> List[str]:
+    """Names of the tools the conversation has actually CALLED, most recent
+    first. Reads every shape a chat-completions history carries a call in:
+    an assistant's OpenAI ``tool_calls[].function.name`` (what Open WebUI
+    replays) and legacy ``function_call.name``, Anthropic ``tool_use``
+    content blocks, and a ``tool`` / ``function`` result message's ``name``.
+    Offered tool definitions (``tools``) are deliberately not read."""
+    names: List[str] = []
+    if not isinstance(messages, list):
+        return names
+    for msg in reversed(messages):
+        if not isinstance(msg, dict):
+            continue
+        found: List[str] = []
+        calls = msg.get("tool_calls")
+        if isinstance(calls, list):
+            found += [n for n in (_name_of(c.get("function")) for c in calls if isinstance(c, dict)) if n]
+        legacy = _name_of(msg.get("function_call"))
+        if legacy:
+            found.append(legacy)
+        content = msg.get("content")
+        if isinstance(content, list):
+            found += [n for n in (_name_of(b) for b in content
+                                  if isinstance(b, dict) and b.get("type") == "tool_use") if n]
+        if msg.get("role") in ("tool", "function"):
+            result = _name_of(msg)
+            if result:
+                found.append(result)
+        names += reversed(found)
+    return names
+
+
+def code_tool_match(names: Any, pattern: Any) -> Optional[str]:
+    """The first of `names` that `pattern` matches in FULL (re.fullmatch),
+    else None. `pattern` may be a compiled regex, a string, or None (=
+    disabled)."""
+    if pattern is None or not isinstance(names, list):
+        return None
+    if isinstance(pattern, str):
+        pattern, _ = compile_code_route_regex(pattern)
+        if pattern is None:
+            return None
+    for name in names:
+        if isinstance(name, str) and pattern.fullmatch(name):
+            return name
+    return None
+
+
+# Unset -> the default above; set but empty -> remap off (the compose file
+# passes ${CODE_ROUTE_TOOL_REGEX-<default>}, so only an explicit empty value
+# in .env turns it off).
+CODE_ROUTE_TOOL_REGEX, CODE_ROUTE_TOOL_REGEX_ERROR = compile_code_route_regex(
+    os.environ.get("CODE_ROUTE_TOOL_REGEX", DEFAULT_CODE_ROUTE_TOOL_REGEX)
+)
 
 
 # -- Fetch -------------------------------------------------------------------
@@ -876,12 +1031,26 @@ class OverflowHandler(CustomLogger):  # type: ignore[misc,valid-type]
         tokenize_min_fraction: float = TOKENIZE_MIN_FRACTION,
         tokenize_chars_per_token: float = TOKENIZE_CHARS_PER_TOKEN,
         tokenize_timeout: float = TOKENIZE_TIMEOUT_S,
+        code_route_regex: Any = "env",
     ) -> None:
         try:
             super().__init__()
         except Exception:  # pragma: no cover -- CustomLogger signature drift
             pass
         self.auto_footer = AUTO_FOOTER_ENABLED if auto_footer is None else bool(auto_footer)
+        # "env" -> CODE_ROUTE_TOOL_REGEX as read at import; a str is compiled
+        # here; a compiled pattern is used as is; None disables the remap.
+        if isinstance(code_route_regex, str) and code_route_regex == "env":
+            self.code_route_regex, route_error = CODE_ROUTE_TOOL_REGEX, CODE_ROUTE_TOOL_REGEX_ERROR
+        elif isinstance(code_route_regex, str):
+            self.code_route_regex, route_error = compile_code_route_regex(code_route_regex)
+        else:
+            self.code_route_regex, route_error = code_route_regex, ""
+        if route_error:
+            try:
+                logger.warning("%s -- local-general -> local-code tool remap disabled", route_error)
+            except Exception:
+                pass
         self._router_getter = router_getter or _proxy_router
         # chain alias -> the api_bases of its local deployments, learnt in
         # filter_deployments; the footer reads their verdicts.
@@ -908,6 +1077,7 @@ class OverflowHandler(CustomLogger):  # type: ignore[misc,valid-type]
             "spills": 0, "kept_all_overloaded": 0, "errors": 0, "poller_restarts": 0,
             "context_drops": 0, "tokenize_calls": 0, "tokenize_cache_hits": 0, "tokenize_errors": 0,
             "footers": 0, "footers_stripped": 0, "footer_errors": 0,
+            "code_routes": 0, "code_route_errors": 0,
         }
 
     # -- LiteLLM hook ----------------------------------------------------------
@@ -933,29 +1103,68 @@ class OverflowHandler(CustomLogger):  # type: ignore[misc,valid-type]
                 pass
             return healthy_deployments
 
-    # -- `auto` footer hooks -----------------------------------------------------
+    # -- `auto` footer hooks (+ the code-tool remap) -----------------------------
     # These three MUST stay defined in this class body. The proxy decides once
     # per callback list whether to call async_post_call_streaming_iterator_hook
     # and async_pre_call_hook by looking the name up in type(callback).__dict__
     # (proxy/utils.py:1718-1745 at v1.95.0); one inherited from a mixin or base
     # class would never run. async_post_call_success_hook is called on every
     # CustomLogger in litellm.callbacks (proxy/utils.py:2404-2410) and a
-    # non-None return replaces the response. All three are no-ops unless the
-    # client asked for model `auto`, and none of them ever raises.
+    # non-None return replaces the response. The footer parts are no-ops unless
+    # the client asked for model `auto`, the remap is a no-op unless it asked
+    # for local-general, and none of them ever raises.
     async def async_pre_call_hook(self, user_api_key_dict: Any, cache: Any, data: dict, call_type: Any) -> Any:
-        """Strip footers we emitted from incoming assistant messages, so the model
-        never sees (and imitates) them and the router's signals never read them."""
+        """Two independent edits, each in its own try:
+
+        * local-general with a code tool attached -> local-code (remap_code_tools);
+        * `auto`: strip footers we emitted from incoming assistant messages, so
+          the model never sees (and imitates) them and the router's signals
+          never read them.
+
+        Returns `data` (modified in place; proxy/utils.py:913-917 keeps a
+        returned dict) when either changed it, else None."""
+        changed = self.remap_code_tools(data)
         try:
             if not self.auto_footer or not isinstance(data, dict) or data.get("model") != AUTO_MODEL:
-                return None
+                return data if changed else None
             n = strip_footers_from_messages(data.get("messages"))
             if not n:
-                return None
+                return data if changed else None
             self.stats["footers_stripped"] += n
-            return data  # modified in place; proxy/utils.py:913-917 keeps a returned dict
+            return data
         except Exception as exc:
             self._footer_error("pre_call", exc)
-            return None
+            return data if changed else None
+
+    def remap_code_tools(self, data: Any) -> bool:
+        """local-general whose history CALLED a tool CODE_ROUTE_TOOL_REGEX
+        matches -> local-code. True when data["model"] was rewritten. Never
+        raises: on any error `data` is left unchanged and the error is logged."""
+        try:
+            if self.code_route_regex is None or not isinstance(data, dict):
+                return False
+            if data.get("model") != CODE_ROUTE_FROM:
+                return False
+            tool = code_tool_match(called_tool_names(data.get("messages")), self.code_route_regex)
+            if tool is None:
+                return False
+        except Exception as exc:
+            try:
+                self.stats["code_route_errors"] += 1
+                logger.warning("[route] remap skipped after an error, request unchanged: %r", exc)
+            except Exception:
+                pass
+            return False
+        # The rewrite is the last thing that can fail, so an error above
+        # always leaves the request exactly as it came in.
+        data["model"] = CODE_ROUTE_TO
+        self.stats["code_routes"] += 1
+        try:
+            self._log(CODE_ROUTE_FROM, tool, "route", "[route] %s -> %s (tool: %s)",
+                      CODE_ROUTE_FROM, CODE_ROUTE_TO, tool)
+        except Exception:
+            pass
+        return True
 
     async def async_post_call_success_hook(self, data: dict, user_api_key_dict: Any, response: Any) -> Any:
         """Non-streaming: append the footer to each qualifying choice's message."""

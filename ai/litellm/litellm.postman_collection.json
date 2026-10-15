@@ -289,7 +289,7 @@
                 "completions"
               ]
             },
-            "description": "Chain alias `local-code` -- the semantic router's `code` decision. Same ladder as local-general: qwen3.8-solo (1) -> muse-glimmer (2) -> claude-sonnet-5 (3, overflow only); a separate group so code traffic can be tuned and attributed on its own.\n\nSpend log: model group local-code. 401 = key not scoped to local-code. LITELLM.md > Chain aliases and the overflow hook."
+            "description": "Chain alias `local-code` -- the semantic router's `code` decision, and where the overflow hook sends a `local-general` request whose history has called a sandbox / Open Terminal tool (CODE_ROUTE_TOOL_REGEX; tools only offered don't count; a `[route] local-general -> local-code` line in `make logs litellm`). Same ladder as local-general: qwen3.8-solo (1) -> muse-glimmer (2) -> claude-sonnet-5 (3, overflow only). What it adds, per deployment: a coding system prompt (litellm_system_prompt, merged in front of your first system message), deeper reasoning (qwen chat_template_kwargs reasoning_effort high, muse reasoning_strength xhigh) and max_tokens 32768 on the local orders.\n\nThe request's own `max_tokens` (512 here) overrides the deployment's 32768 -- drop it to get the coding default. A request `extra_body` or `chat_template_kwargs` REPLACES the deployment's (dropping the reasoning kwarg), it does not merge.\n\nSpend log: model group local-code. 401 = key not scoped to local-code. LITELLM.md > local-code: what it adds."
           },
           "response": []
         },

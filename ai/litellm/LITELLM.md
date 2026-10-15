@@ -188,7 +188,63 @@ Four model groups exist for the semantic router ([`ai/semantic-router/SEMANTIC_R
 | `local-reasoning` | `muse-glimmer` | `qwen3.8-solo` | `claude-opus-5-5` |
 | `local-private` | `qwen3.8-solo` | `muse-glimmer` | **— none —** |
 
-Every deployment calls its backend **directly** (`api_base: http://qwen3.8-solo:8000/v1`, `anthropic/claude-sonnet-5`, …); its `litellm_params` and `model_info` are copies of the standalone alias of the same name. Never point a chain deployment at a LiteLLM alias: it would recurse through the proxy and inherit that alias's `fallbacks: → claude-sonnet-5`. The standalone aliases (`qwen3.8-solo`, `muse-glimmer`, `claude-*`) are unchanged and still callable directly — **when you change one of them, change its chain copies too.**
+Every deployment calls its backend **directly** (`api_base: http://qwen3.8-solo:8000/v1`, `anthropic/claude-sonnet-5`, …); its `litellm_params` and `model_info` are copies of the standalone alias of the same name — except `local-code`'s, which add coding settings on top ([§ local-code: what it adds](#local-code-what-it-adds)). Never point a chain deployment at a LiteLLM alias: it would recurse through the proxy and inherit that alias's `fallbacks: → claude-sonnet-5`. The standalone aliases (`qwen3.8-solo`, `muse-glimmer`, `claude-*`) are unchanged and still callable directly — **when you change one of them, change its chain copies too.**
+
+#### local-code: what it adds
+
+`local-code` has the same ladder as `local-general`; what differs is how a request gets there and what each deployment sends.
+
+**How a request gets there.** Two ways:
+
+1. The semantic router's `code` decision — `code_kw`, a set of RE2 regexes over the latest user message ([SEMANTIC_ROUTER.md § Decisions](../semantic-router/SEMANTIC_ROUTER.md#decisions)).
+2. **The code-tool remap** in `overflow.py`'s `async_pre_call_hook`. The router reads only the latest user message and cannot see tool *names* — only that tools exist — so a coding turn like "Looks the same" lands on `local-general`. When the conversation in a request for **`local-general`** contains a **call** to a tool whose function name matches `CODE_ROUTE_TOOL_REGEX` **in full** (`re.fullmatch`), the hook rewrites `data["model"]` to `local-code`. A call is an assistant's `tool_calls[].function.name` in the history — what Open WebUI replays from earlier rounds and turns — and also a legacy `function_call`, an Anthropic `tool_use` block, or a named `tool` / `function` result (`overflow.called_tool_names`). Tools that are only **offered** in `tools` do not count, so a chat with the sandbox attached but never used stays on `local-general`. The proxy routes on the rewritten model (`common_request_processing.py`: `pre_call_hook` → `route_request`), and the Router sets `metadata.model_group` from it, so the overflow filter, the spend log and the `auto` footer (`· local-code`) all see `local-code`.
+
+| `CODE_ROUTE_TOOL_REGEX` | Effect |
+|---|---|
+| unset (default) | `sandbox-mcp_.+\|run_command\|get_process_status\|send_process_input\|kill_process\|replace_file_content\|read_user_terminal\|send_user_terminal_input` |
+| empty | remap off |
+| invalid | one `invalid CODE_ROUTE_TOOL_REGEX … remap disabled` warning at startup; remap off |
+
+The default matches the tool names Open WebUI v0.11.4 actually sends. The sandbox MCP server's tools carry its server-id prefix (`sandbox-mcp_run`, `sandbox-mcp_write_files`, `sandbox-mcp_exec`, … — seen in a real chat). Open Terminal's tools are its OpenAPI **operationIds, unprefixed**: `utils/tools.py::get_terminal_tools` uses `function_name = spec['name']`, `convert_openapi_to_tool_payload` sets `name` to the `operationId`, and `utils/middleware.py` merges them with `{**tools_dict, **terminal_tools}`. Open Terminal 0.13.0's schema-visible operationIds are `run_command`, `get_process_status`, `send_process_input`, `kill_process`, `list_processes`, `replace_file_content`, `write_file`, `read_file`, `display_file`, `list_files`, `grep_search`, `glob_search`, `match_files`, `search_files`, `get_info`, `read_user_terminal`, `send_user_terminal_input` (`open_terminal/main.py`). The default lists only the ones another tool server is unlikely to share; `run_command` is always there when a terminal is attached. It needs no `^…$` — and a `$` in `.env` would have to be `$$`. Unset uses the default because the compose file passes `${CODE_ROUTE_TOOL_REGEX-<default>}` (`-`, not `:-`): an **empty** value in `.env` reaches the hook and turns the remap off. `.env.example` sets the default explicitly; `unit-tests/litellm/test_code_route.py` fails if the three copies drift.
+
+- **Scope.** Only `local-general` is ever remapped — router-originated or a direct call. `local-private` (PII routing stays the router's decision), `local-reasoning`, `local-code`, `auto` and the concrete aliases are never touched. The remap runs after key auth: a key allowed `local-general` but not `local-code` is still served by `local-code` (same models). `SEMANTIC_ROUTER_LITELLM_KEY` already has all four chains.
+- **Log.** One `[overflow] [route] local-general -> local-code (tool: <most recent matching call>)` line per remap, throttled to one per tool name per 30 s with a `(+N similar)` count; `handler.state()["stats"]` counts `code_routes` and `code_route_errors`. **Never throws:** on any error the request is left exactly as it came in and a warning is logged.
+- **When it starts and how long it lasts.** Inside a turn, the rounds before the model's first sandbox / terminal call run wherever the router sent them; every round after that call is `local-code` (the footer names the chain of the turn's last round). A call anywhere in the history counts, so once a chat has used the sandbox **every later turn is `local-code`**, even if the topic changes — same models, but the coding prompt and the deeper, slower reasoning below. Start a new chat for an unrelated question. Attaching the sandbox to a model card (as `office-model` does) changes nothing until the model actually calls it.
+
+**The prompt.** All three deployments carry the same `litellm_system_prompt`, written once with the YAML anchor `&code_system_prompt` and reused with `*code_system_prompt` (the proxy loads the config with `yaml.safe_load`, which resolves both):
+
+```
+You are working on code with tools.
+- Your turn ends as soon as you reply without a tool call. Never announce a step ("let me...", "I'll now...") - make the tool call instead.
+- Change existing files with edit_file (exact old_string -> new_string). Use write_files only for new files or complete rewrites. Read only the lines you need with read_file (offset/limit).
+- When a tool returns an error, diagnose it and retry in the same turn.
+- Run the code or its tests to verify before saying it works.
+- Reply without a tool call only when the task is done (say what changed) or you need a decision from the user (ask it).
+```
+
+LiteLLM merges it **in front of** the first system message (Open WebUI's), or adds it as one, for that deployment only (`main.py`: `add_system_prompt_to_messages(..., merge_with_first_system=True)`), re-applies it on every retry and order fallback with that deployment's own value, and never sends the key to the provider. The overflow hook's `/tokenize` count includes it. It must **never** contain a `Reasoning strength:` line: Muse Glimmer's template would take that over the kwarg below.
+
+**Per deployment.**
+
+| Order | Deployment | Adds |
+|---|---|---|
+| 1 | `qwen3.8-solo` | the prompt; `extra_body.chat_template_kwargs: {reasoning_effort: high}` (the fixed template maps `high` → `xhigh`, `ai/jinja/qwen_fixed_chat_template.jinja`; its default is `medium`); `max_tokens: 32768` (Qwen's own SWE-bench setting); `max_input_tokens: 98304` |
+| 2 | `muse-glimmer` | the prompt; `extra_body.chat_template_kwargs: {reasoning_strength: xhigh}` (the stock template defaults to `high`); `max_tokens: 32768`; `max_input_tokens: 229376` |
+| 3 | `claude-sonnet-5` | the prompt only |
+
+Sampling is unchanged — `qwen3.8-solo`'s already is Qwen's official Thinking preset, `muse-glimmer`'s is Meta's published defaults (`top_k` stays next to the new key in `extra_body`).
+
+- **Context.** The overflow hook's context fit drops a deployment when `count + max_tokens > max_model_len`, so with a 32768-token answer `qwen3.8-solo` (131072) takes prompts up to 98304 and `muse-glimmer` (262144) up to 229376; `max_input_tokens` says the same so LiteLLM's backstop check agrees. A `local-code` prompt over 98304 goes to `muse-glimmer`; one between 229376 and `auto`'s 245760 goes to `local-code`'s Claude order (it is not the PII chain).
+- **Client caps win.** A client-sent `max_tokens` overrides the deployment's 32768. That includes the `auto` alias's own default — a deployment default is sent in the request body, so it reached the inner LiteLLM as a client value — which is why `auto` now sets no `max_tokens` and each chain's deployment decides. **Operator step:** if an Open WebUI model card sets *Max Tokens* (the `office-model` card had 8192), clear it or raise it to 32768 (Workspace → Models → Advanced Params), or every coding answer is cut at that.
+- **Client template kwargs replace, they do not merge.** A request `extra_body` replaces the deployment's whole `extra_body` (`top_k` included), and a top-level request `chat_template_kwargs` replaces `extra_body.chat_template_kwargs` — measured on the outgoing body at v1.93.0 and v1.95.0. An Open WebUI *custom parameter* `chat_template_kwargs` (e.g. `enable_thinking`) therefore drops `reasoning_effort` / `reasoning_strength`; add them to it if you set one. The hook's `/tokenize` call follows the same precedence.
+- **Timeouts are unchanged, and that is a trade-off.** `xhigh` reasoning makes turns slower. The chain's per-read 240 s still applies: a `qwen3.8-solo` turn that goes silent for 240 s (before its first token, or mid-stream) fails over to `muse-glimmer`, and the whole turn still has to finish inside `auto`'s budget ([§ Chain timeouts](#chain-timeouts)). Streaming keeps a reasoning turn alive token by token, so long thinking is fine; a long *silent* prefill is what trips it. `unit-tests/litellm/test_timeouts.py` keeps the nesting.
+
+**Verifying.** In a fresh Open WebUI chat on `auto` with the sandbox attached, send `Looks the same` first: no sandbox call yet, so the footer reads `· local-general`. Then ask for something that makes the model use the sandbox (`Make me a scientific calculator!`), and send `Looks the same` again: the footer reads `· local-code` and `make -s logs litellm FOLLOW=0 TAIL=200 2>&1 | grep '\[route\]'` shows the remap. Spend-log rows for `local-code` show `qwen3.8-solo` or `muse-glimmer`. To see that `muse-glimmer` renders `xhigh`, render a request with vLLM's tokenize endpoint from a container on `ai_shared` and look for `Reasoning strength: xhigh.` in the system text:
+
+```bash
+curl -s muse-glimmer:8000/tokenize -H 'content-type: application/json' \
+  -d '{"model":"muse-glimmer","messages":[{"role":"user","content":"hi"}],"chat_template_kwargs":{"reasoning_strength":"xhigh"},"return_token_strs":true}'
+```
 
 #### How a deployment is picked (LiteLLM v1.95.0)
 
@@ -221,7 +277,7 @@ The poller starts lazily on the first chain request and is restarted if it ever 
 
 - **Which deployments.** Every deployment with an `api_base` and an integer `model_info.max_input_tokens`, in a chain group. Claude deployments and plain aliases are never measured.
 - **When it asks.** Only if a deliberately high estimate — `len(json(messages)) + len(json(tools))` characters ÷ `OVERFLOW_TOKENIZE_CHARS_PER_TOKEN` (2.5) — reaches `OVERFLOW_TOKENIZE_MIN_FRACTION` (0.6) × that deployment's `max_input_tokens`. A short chat never makes the call. Each distinct backend is asked at most once per request, all of them concurrently, and the answers sit in a 64-entry LRU keyed by backend + body hash, so `auto`'s `context_window_fallbacks → local-private` and the mid-stream order fallback, which re-enter with the same messages, do not ask again.
-- **The body.** `model` (the deployment's `litellm_params.model` minus `openai/`), `messages`, `tools` when the request has them, `add_generation_prompt: true`, and `chat_template_kwargs` merged from the deployment's `extra_body`, the request's `extra_body` and a top-level request `chat_template_kwargs` (LiteLLM moves that into `extra_body` for an `openai/` provider). The server's own `--chat-template` / `--default-chat-template-kwargs` apply on `/tokenize` exactly as on a chat completion. vLLM checks `model` against its `--served-model-name`; a mismatch is a tokenize failure (below).
+- **The body.** `model` (the deployment's `litellm_params.model` minus `openai/`), `messages` (with the deployment's `litellm_system_prompt` merged in front of the first system message, as LiteLLM will send them), `tools` when the request has them, `add_generation_prompt: true`, and the ONE `chat_template_kwargs` LiteLLM will send — the request's top-level `chat_template_kwargs`, else the request's `extra_body`'s, else (only when the request sent no `extra_body`) the deployment's. LiteLLM replaces rather than merges: `{**deployment, **request}` at the Router, then a top-level value written over `extra_body.chat_template_kwargs` whole ([§ local-code: what it adds](#local-code-what-it-adds)). The server's own `--chat-template` / `--default-chat-template-kwargs` apply on `/tokenize` exactly as on a chat completion. vLLM checks `model` against its `--served-model-name`; a mismatch is a tokenize failure (below).
 - **The rule.** A deployment **fits** iff `count <= max_input_tokens` **and** `count + max_out <= max_model_len`, where `max_out` is the request's `max_completion_tokens` / `max_tokens`, else the deployment's `litellm_params.max_tokens` (vLLM refuses a chat completion whose input plus `max_tokens` exceeds `max-model-len`). One that does not fit is dropped as **`too-long`** — a **hard** drop: the busy/down rule then runs on what is left, so its "keep the busy ones" fallback can never bring it back.
 - **Nothing local fits.** A group with a Claude deployment (`local-general` / `-code` / `-reasoning`) keeps only Claude — the prompt is past every local window, the same outcome as before. `local-private` gets the list back **unchanged**, so vLLM refuses it with its own error and the prompt never leaves the box.
 - **Any tokenize failure keeps the deployment** — a timeout (`OVERFLOW_TOKENIZE_TIMEOUT_S`, wall clock), a non-200, an image part sent to a text-only model, a body without `count`. LiteLLM then behaves as it did before this step, with step 3 as the backstop. Failures are not cached.
@@ -270,7 +326,7 @@ make up litellm
 - `make -s logs litellm FOLLOW=0 TAIL=all 2>&1 | grep '\[overflow\]'` — one INFO line per spill decision (alias, dropped deployment, reason, waiting count, next order), throttled to one per alias/deployment/reason per 30 s with a `(+N similar)` count. An `every deployment is busy/down … keeping …` line is `local-private` (or a chain whose Claude deployment was cooled down) choosing to queue.
 - Context-fit lines use the same logger: `local-general: dropping openai/qwen3.8-solo@order1 (too-long, count=122881 > max_input_tokens=114688) -> next order 2` (or `count=… + max_tokens=… > max_model_len=…`); `no local deployment fits the prompt (…); keeping only anthropic/…` is a prompt past every local window going to Claude; `no deployment fits the prompt (…); list unchanged` is `local-private` refusing one; `/tokenize at … failed (…); keeping that backend's deployment(s)` means the hook could not measure and LiteLLM's own check decided.
 - **LiteLLM Admin UI → Logs / spend by key**: the row's *model group* is the chain alias, its *model* the deployment that answered. Claude overflow is any row with a `local-*` model group and an `anthropic/…` model. A `local-private` row with a Claude model must never exist.
-- In-process state: `handler.state()` returns the per-backend verdict, queue depths, timers and counters (`spills`, `kept_all_overloaded`, `errors`, `poller_restarts`, and for context fit `context_drops`, `tokenize_calls`, `tokenize_cache_hits`, `tokenize_errors`). It lives in the proxy process; it is there for debugging with a REPL or a temporary log line, not as an endpoint.
+- In-process state: `handler.state()` returns the per-backend verdict, queue depths, timers and counters (`spills`, `kept_all_overloaded`, `errors`, `poller_restarts`, for context fit `context_drops`, `tokenize_calls`, `tokenize_cache_hits`, `tokenize_errors`, and for the code-tool remap `code_routes`, `code_route_errors`). It lives in the proxy process; it is there for debugging with a REPL or a temporary log line, not as an endpoint.
 
 #### Adding a chain
 
@@ -315,7 +371,7 @@ When — and only when — a client calls model **`auto`** (the semantic router)
 
 - `async_post_call_success_hook` (non-streaming; `proxy/utils.py:2404-2410` keeps a non-`None` return) appends the footer to each qualifying `message.content`;
 - `async_post_call_streaming_iterator_hook` (the proxy wraps the stream once, `proxy_server.py:7413-7419`, and writes `data: [DONE]` after it ends) yields the footer as an extra `delta.content` chunk right before each qualifying choice's finish chunk — or appends it to the finish chunk's own content when that chunk carries text, so it never lands in front of the last words. A stream that ends without a finish chunk gets it last;
-- `async_pre_call_hook` strips footers from the incoming conversation (below).
+- `async_pre_call_hook` strips footers from the incoming conversation (below). The same hook also does the code-tool remap (`local-general` → `local-code`, [§ local-code: what it adds](#local-code-what-it-adds)), which does not depend on `AUTO_FOOTER_ENABLED`.
 
 **Edge cases.**
 
@@ -327,7 +383,7 @@ When — and only when — a client calls model **`auto`** (the semantic router)
 - **Never throws:** any internal error returns the response or stream unmodified. `handler.state()["stats"]` counts `footers`, `footers_stripped` and `footer_errors`.
 - The footer is presentation only: spend logs, token counts and cost are those of the answer without it.
 
-**Toggle.** `AUTO_FOOTER_ENABLED` (default `true`; accepts `true`/`false`/`1`/`0`, also `yes`/`no`/`on`/`off`), passed through the compose `environment:` like the `OVERFLOW_*` variables. Off disables all three hooks, stripping included. A change to `overflow.py` itself needs the recreate in [§ Applying a chain or hook change](#applying-a-chain-or-hook-change).
+**Toggle.** `AUTO_FOOTER_ENABLED` (default `true`; accepts `true`/`false`/`1`/`0`, also `yes`/`no`/`on`/`off`), passed through the compose `environment:` like the `OVERFLOW_*` variables. Off disables all three footer hooks, stripping included (the code-tool remap keeps working; `CODE_ROUTE_TOOL_REGEX=` empty is its own off switch). A change to `overflow.py` itself needs the recreate in [§ Applying a chain or hook change](#applying-a-chain-or-hook-change).
 
 **Verifying.**
 

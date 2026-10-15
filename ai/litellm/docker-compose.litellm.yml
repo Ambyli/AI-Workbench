@@ -47,6 +47,14 @@ services:
       # overflow.py. true|false|1|0.
       # See ai/litellm/LITELLM.md > The `auto` footer.
       AUTO_FOOTER_ENABLED: ${AUTO_FOOTER_ENABLED:-true}
+      # Code-tool remap (overflow.py): local-general whose history CALLED a
+      # tool whose name matches this regex in full -> local-code (offered but
+      # uncalled tools don't count). `-` not `:-` ON PURPOSE:
+      # unset uses the default below (== overflow.DEFAULT_CODE_ROUTE_TOOL_REGEX,
+      # unit-tests/litellm/test_code_route.py checks), but an EMPTY value in
+      # .env must reach the hook, because empty turns the remap off.
+      # See ai/litellm/LITELLM.md > local-code: what it adds.
+      CODE_ROUTE_TOOL_REGEX: ${CODE_ROUTE_TOOL_REGEX-sandbox-mcp_.+|run_command|get_process_status|send_process_input|kill_process|replace_file_content|read_user_terminal|send_user_terminal_input}
     env_file:
       - ../../.env
     volumes:

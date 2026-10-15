@@ -540,14 +540,40 @@ model_list:
       stream_timeout: 300
       timeout: 300
 
-  # -- local-code: same ladder, separate group for tuning and attribution -----
+  # -- local-code: same ladder as local-general, tuned for coding -------------
+  # Reached two ways: the router's `code` decision (code_kw regexes), and the
+  # overflow hook's tool remap -- a local-general request that carries a
+  # sandbox / Open Terminal tool is rewritten to local-code before routing
+  # (overflow.py, CODE_ROUTE_TOOL_REGEX). Differences from local-general,
+  # all per deployment (see ai/litellm/LITELLM.md > local-code: what it adds):
+  #   * litellm_system_prompt -- the same coding rules on all three orders,
+  #     defined once with the YAML anchor &code_system_prompt and reused with
+  #     *code_system_prompt (PyYAML safe_load, which the proxy uses, resolves
+  #     both). LiteLLM merges it IN FRONT of the first system message for
+  #     that deployment only (main.py, add_system_prompt_to_messages(...,
+  #     merge_with_first_system=True)) and never sends the key itself. It
+  #     must never contain a "Reasoning strength:" line: muse-glimmer's
+  #     template would take that over the reasoning_strength kwarg below.
+  #   * deeper reasoning through each local model's OWN chat-template kwarg:
+  #     qwen reasoning_effort high (the fixed template maps high -> xhigh,
+  #     ai/jinja/qwen_fixed_chat_template.jinja), muse reasoning_strength
+  #     xhigh (its stock template defaults to high). A client that sends its
+  #     own chat_template_kwargs (or extra_body) REPLACES these, it does not
+  #     merge with them.
+  #   * max_tokens 32768 on both locals (Qwen's own SWE-bench setting). A
+  #     client-sent max_tokens still wins -- including the `auto` alias's,
+  #     which is why `auto` below sets none.
+  # Sampling is unchanged: qwen's is already Qwen's official Thinking preset,
+  # muse's is Meta's published defaults. Timeouts are unchanged too: xhigh
+  # turns are slower, and a qwen turn that goes silent for 240 s fails over
+  # to muse (unit-tests/litellm/test_timeouts.py keeps the nesting).
   - model_name: local-code
     litellm_params:
       model: openai/qwen3.8-solo
       api_base: http://qwen3.8-solo:8000/v1
       api_key: none
       order: 1
-      max_tokens: 16384
+      max_tokens: 32768
       temperature: 1.0
       top_p: 0.95
       frequency_penalty: 0
@@ -555,11 +581,27 @@ model_list:
       extra_body:
         top_k: 20
         min_p: 0
+        chat_template_kwargs:
+          reasoning_effort: high
+      litellm_system_prompt: &code_system_prompt |-
+        You are working on code with tools.
+        - Your turn ends as soon as you reply without a tool call. Never announce a step ("let me...", "I'll now...") - make the tool call instead.
+        - Change existing files with edit_file (exact old_string -> new_string). Use write_files only for new files or complete rewrites. Read only the lines you need with read_file (offset/limit).
+        - When a tool returns an error, diagnose it and retry in the same turn.
+        - Run the code or its tests to verify before saying it works.
+        - Reply without a tool call only when the task is done (say what changed) or you need a decision from the user (ask it).
       stream_timeout: 240
       timeout: 240
     model_info:
-      max_input_tokens: 114688
-      max_output_tokens: 16384
+      # 98304, not qwen's 114688, ON PURPOSE: qwen3.8-solo runs
+      # --max-model-len 131072, and with this deployment's 32768-token
+      # answer budget the overflow hook's context fit (count + max_tokens <=
+      # max_model_len) already skips qwen above 131072 - 32768 = 98304. Saying
+      # so here keeps LiteLLM's own pre-call check (the tiktoken backstop) on
+      # the same line instead of letting it pass prompts qwen cannot answer
+      # in full. Longer local-code prompts go to muse-glimmer.
+      max_input_tokens: 98304
+      max_output_tokens: 32768
 
   - model_name: local-code
     litellm_params:
@@ -567,18 +609,24 @@ model_list:
       api_base: http://muse-glimmer:8000/v1
       api_key: none
       order: 2
-      max_tokens: 16384
+      max_tokens: 32768
       temperature: 1.0
       top_p: 0.95
       frequency_penalty: 0
       presence_penalty: 0
       extra_body:
         top_k: 64
+        chat_template_kwargs:
+          reasoning_strength: xhigh
+      litellm_system_prompt: *code_system_prompt
       stream_timeout: 240
       timeout: 240
     model_info:
-      max_input_tokens: 245760
-      max_output_tokens: 16384
+      # --max-model-len 262144: 229376 input + 32768 output. 245760 (the
+      # other chains' value) would let the context fit drop muse for prompts
+      # between 229376 and 245760 anyway; this keeps the backstop honest.
+      max_input_tokens: 229376
+      max_output_tokens: 32768
       supports_vision: true
 
   - model_name: local-code
@@ -586,6 +634,7 @@ model_list:
       model: anthropic/claude-sonnet-5
       api_key: os.environ/ANTHROPIC_API_KEY
       order: 3
+      litellm_system_prompt: *code_system_prompt
       stream_timeout: 300
       timeout: 300
 
@@ -740,7 +789,11 @@ model_list:
       model: openai/vllm-sr/auto
       api_base: http://vllm-sr-envoy:8899/v1
       api_key: os.environ/SEMANTIC_ROUTER_LISTENER_KEY
-      max_tokens: 16384
+      # NO max_tokens here, on purpose. A deployment default is sent in the
+      # request body, so whatever `auto` set would arrive at the inner
+      # LiteLLM as a CLIENT max_tokens and override the chain deployment's
+      # own (16384 on most, 32768 on local-code). With none, each chain's
+      # deployment decides; a client that sends max_tokens still wins.
       stream_timeout: 870
       timeout: 870
     model_info:
@@ -753,5 +806,9 @@ model_list:
       # could take (and local-private would refuse); a lower one (the old
       # 114688) refuses prompts muse-glimmer could answer. Keep in step with
       # routing.modelCards[].context_window_size in the router config.
+      # One exception: local-code's muse-glimmer deployment reserves 32768
+      # tokens for the answer, so it takes prompts up to 229376 only; a
+      # routed coding prompt between that and 245760 goes to local-code's
+      # Claude order (local-code is not the PII chain).
       max_input_tokens: 245760
-      max_output_tokens: 16384
+      max_output_tokens: 32768

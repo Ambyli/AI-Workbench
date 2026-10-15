@@ -235,7 +235,9 @@ routing:
   # skips straight to it. Claude windows are deliberately not counted --
   # LiteLLM declares no model_info for the Claude deployments, and
   # local-private has none at all. Keep in step with `auto`'s
-  # max_input_tokens in litellm_config.yaml.
+  # max_input_tokens in litellm_config.yaml. (local-code's muse-glimmer
+  # deployment reserves 32768 output tokens, so locally it takes 229376;
+  # the card keeps 245760 because a static decision never reads it.)
   modelCards:
     - name: local-general
       context_window_size: 245760
@@ -249,8 +251,9 @@ routing:
       description: >-
         LiteLLM chain: qwen3.8-solo (order 1) -> muse-glimmer (order 2) ->
         claude-sonnet-5 (order 3, overflow only). Same ladder as
-        local-general, kept separate so code traffic can be re-tuned and
-        attributed on its own.
+        local-general, tuned for code in LiteLLM: a coding system prompt,
+        deeper reasoning and a 32768-token answer budget on the local
+        orders.
       tags: [chain, local-first, overflow-sonnet]
     - name: local-reasoning
       context_window_size: 245760
@@ -270,10 +273,34 @@ routing:
   # Keyword signals need nothing on disk, so the stack routes correctly
   # before any classifier weights land in the vllm_sr_models volume.
   #
-  # The schema for a keyword signal in 0.3.0 is exactly four fields --
-  # name / operator / keywords / case_sensitive (cli/models.py::KeywordSignal).
-  # There is no `method: bm25` and no `bm25_threshold`; both were assumed by
-  # the plan and do not exist. Matching semantics are owned by the Go router.
+  # TWO SCHEMAS READ THIS BLOCK. The Python CLI's KeywordSignal
+  # (cli/models.py) declares only name / operator / keywords /
+  # case_sensitive and IGNORES any other key (pydantic's default
+  # extra="ignore"), so `vllm-sr validate` and the Envoy render never see
+  # the rest. The Go router reads THIS FILE directly (start-router.sh:
+  # `router -config=/app/config.yaml`, no translation step) into
+  # config.KeywordRule (pkg/config/signal_config.go), which also has
+  # `method` (regex | bm25 | ngram; empty = regex), fuzzy_match /
+  # fuzzy_threshold, bm25_threshold, ngram_threshold / ngram_arity.
+  #
+  # Matching (pkg/classification/keyword_classifier_regex.go::regexPatterns):
+  #   * no `method` -- each keyword is regexp.QuoteMeta'd and wrapped in
+  #     \b...\b, i.e. a whole-word literal: "function" never matches
+  #     "functions";
+  #   * `method: regex` -- each keyword is used AS a Go RE2 pattern, with
+  #     "(?i)" prepended when case_sensitive is false. RE2: no lookaround,
+  #     no backreferences; \b and \w are ASCII. A pattern that does not
+  #     compile fails the router at startup, and `vllm-sr validate` does
+  #     NOT check it -- unit-tests/semantic-router/test_router_config.py does.
+  # Write patterns in YAML SINGLE quotes: a backslash is literal there, so
+  # '\b' reaches the router as \b (in double quotes it would be a YAML
+  # escape).
+  #
+  # The signal only sees the LATEST user message. Follow-ups such as "Looks
+  # the same" match nothing and land on `general`; a chat that has CALLED the
+  # sandbox or Open Terminal is moved to local-code by LiteLLM instead, on
+  # the called tool NAMES in the history (the router can only see THAT tools
+  # are offered): ai/litellm/overflow.py, CODE_ROUTE_TOOL_REGEX.
   signals:
     keywords:
       - name: privacy_kw
@@ -291,27 +318,22 @@ routing:
           - medical record
           - customer address
 
+      # RE2 patterns, not words (see the schema note above). One per family:
+      # languages, tooling, code vocabulary (plurals included), file names
+      # with a code extension, a markdown code fence, and "build/make/
+      # create/write/code ... <a kind of program>" within 40 characters --
+      # which is what catches "Make me a scientific calculator!".
       - name: code_kw
         operator: OR
         case_sensitive: false
+        method: regex
         keywords:
-          - python
-          - typescript
-          - javascript
-          - golang
-          - rust
-          - sql
-          - docker
-          - compose
-          - kubernetes
-          - stack trace
-          - traceback
-          - regex
-          - refactor
-          - unit test
-          - function
-          - class
-          - api endpoint
+          - '\b(python|typescript|javascript|js|golang|rust|sql|bash|powershell|html|css|jsx|tsx|node\.?js|react|vue|svelte)\b'
+          - '\b(docker|compose|kubernetes|k8s|helm|terraform|nginx|git)\b'
+          - '\b(functions?|class(es)?|methods?|variables?|modules?|librar(y|ies)|packages?|scripts?|regex(es)?|(api )?endpoints?|compil(e|er|ing)|refactor(ing|ed)?|debug(ging)?|stack ?traces?|tracebacks?|exceptions?|unit ?tests?|test (suite|harness|cases?)|bugs?)\b'
+          - '\b[\w.-]+\.(py|js|mjs|ts|tsx|jsx|html|css|json|ya?ml|toml|sh|sql|go|rs|java|cs|cpp|rb|php)\b'
+          - '```'
+          - '\b(build|make|create|write|code)\b.{0,40}\b(app|application|website|web ?page|script|program|cli|game|calculator|dashboard|bot|api|component)s?\b'
 
       - name: reasoning_kw
         operator: OR

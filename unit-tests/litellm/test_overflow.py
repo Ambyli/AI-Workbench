@@ -608,19 +608,59 @@ def test_tools_count_toward_the_estimate_and_go_in_the_body():
     assert "chat_template_kwargs" not in body
 
 
-def test_chat_template_kwargs_are_merged_into_the_body():
+def test_chat_template_kwargs_follow_litellms_replace_precedence():
+    """LiteLLM replaces, it does not merge: {**deployment, **request} at the
+    Router, then a top-level request chat_template_kwargs written over
+    extra_body["chat_template_kwargs"] whole. The hook must tokenize with the
+    same single dict."""
     d = ldep("openai/qwen3.8-solo", 1, QWEN, QWEN_LIMIT,
-             extra_body={"top_k": 20, "chat_template_kwargs": {"enable_thinking": True, "a": 1}})
+             extra_body={"top_k": 20, "chat_template_kwargs": {"reasoning_effort": "high", "a": 1}})
+    # No request override: the deployment's.
+    assert chat_template_kwargs(d, {}) == {"reasoning_effort": "high", "a": 1}
+    # A request extra_body replaces the deployment's whole extra_body.
+    assert chat_template_kwargs(d, {"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}}) == {
+        "enable_thinking": False}
+    assert chat_template_kwargs(d, {"extra_body": {"top_k": 5}}) is None
+    # A top-level request chat_template_kwargs wins over both.
     req = {"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}, "chat_template_kwargs": {"b": 2}}
-    assert chat_template_kwargs(d, req) == {"enable_thinking": False, "a": 1, "b": 2}
-    assert chat_template_kwargs(d, {}) == {"enable_thinking": True, "a": 1}
+    assert chat_template_kwargs(d, req) == {"b": 2}
+    assert chat_template_kwargs(d, {"chat_template_kwargs": {"b": 2}}) == {"b": 2}
     assert chat_template_kwargs(ldep("m", 1, QWEN, 1), {}) is None
 
     tok = StubTokenize({QWEN_TOK: 1})
     h = make_handler(Clock(), tokenize=tok)
     chain = [d, ldep("openai/muse-glimmer", 2, MUSE, MUSE_LIMIT)]
     fit(h, "local-private", chain, LONG, req)
-    assert tok.calls[0][1]["chat_template_kwargs"] == {"enable_thinking": False, "a": 1, "b": 2}
+    assert tok.calls[0][1]["chat_template_kwargs"] == {"b": 2}
+    fit(h, "local-private", chain, msgs(300_001), {})
+    assert tok.calls[1][1]["chat_template_kwargs"] == {"reasoning_effort": "high", "a": 1}
+
+
+def test_litellm_system_prompt_is_counted_where_litellm_puts_it():
+    """main.py merges a deployment's litellm_system_prompt in front of the
+    first system message AFTER the router picked it, so /tokenize must see
+    it too -- and only for the deployment that carries it."""
+    from overflow import system_prompt_messages
+
+    d = ldep("openai/qwen3.8-solo", 1, QWEN, QWEN_LIMIT)
+    d["litellm_params"]["litellm_system_prompt"] = "CODE RULES\n"
+    with_sys = [{"role": "system", "content": "owui"}, {"role": "user", "content": "hi"}]
+    assert system_prompt_messages(d, with_sys)[0] == {"role": "system", "content": "CODE RULES\n\nowui"}
+    assert with_sys[0]["content"] == "owui"  # the request's messages are not mutated
+    parts = [{"role": "system", "content": [{"type": "text", "text": "owui"}]}]
+    assert system_prompt_messages(d, parts)[0]["content"] == [
+        {"type": "text", "text": "CODE RULES"}, {"type": "text", "text": "owui"}]
+    no_sys = [{"role": "user", "content": "hi"}]
+    assert system_prompt_messages(d, no_sys) == [{"role": "system", "content": "CODE RULES\n"}] + no_sys
+    plain = ldep("openai/muse-glimmer", 2, MUSE, MUSE_LIMIT)
+    assert system_prompt_messages(plain, with_sys) is with_sys
+
+    tok = StubTokenize({QWEN_TOK: 1, MUSE_TOK: 1})
+    h = make_handler(Clock(), tokenize=tok)
+    fit(h, "local-private", [d, plain], msgs(800_000), {})  # estimate 320k: both asked
+    bodies = {url: body for url, body in tok.calls}
+    assert bodies[QWEN_TOK]["messages"][0]["content"] == "CODE RULES\n\nYou are helpful."
+    assert bodies[MUSE_TOK]["messages"][0]["content"] == "You are helpful."
 
 
 @pytest.mark.parametrize(

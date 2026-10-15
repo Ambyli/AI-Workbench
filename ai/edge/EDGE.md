@@ -503,6 +503,13 @@ A client can tell which path it took from the headers: the tunnel path adds
   the tunnel's record and break public access. The DNS-01 challenge does not
   need one: it writes the TXT record `_acme-challenge.api.zeoenergy.com`, a
   different name, which coexists with the tunnel's record.
+- **The override is optional.** Without it, office clients resolve the
+  public record and take the off-LAN path (Cloudflare → tunnel →
+  `litellm:4000`). Everything keeps working, with the left column's limits:
+  the ~100 s `524` on slow non-streamed responses, a round trip through
+  Cloudflare, and no allow-list or per-key limit. The edge's TLS listener just
+  goes unused until the override exists. Adding the override later needs no
+  change on the box.
 - **The override belongs on the office router** (or Pi-hole), so it applies
   only on the office network. A hosts-file line is the per-machine fallback,
   and it breaks the name on that laptop outside the office.

@@ -3,7 +3,16 @@ global:
   evaluation_interval: 15s
 
 scrape_configs:
+  # LiteLLM authenticates /metrics (require_auth_for_metrics_endpoint defaults
+  # to on) and answered this job 401 without a key. The key is a virtual key
+  # restricted to the /metrics routes (`allowed_routes`), kept out of git in
+  # ai/litellm/secrets/. Turning the auth off instead would publish /metrics on
+  # https://api.zeoenergy.com/metrics, since the tunnel goes straight to
+  # litellm. See ai/litellm/LITELLM.md > Prometheus scrape key.
   - job_name: "litellm"
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/secrets/prometheus_metrics.key
     static_configs:
       - targets: ["litellm:4000"]
 

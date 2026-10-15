@@ -14,7 +14,7 @@ DC_$(1) := docker compose -f ai/$(1)/docker-compose.$(1).yml --env-file .env -p 
 DEPLOY_$(1) := $(PYTHON) scripts/deploy.py -f ai/$(1)/docker-compose.$(1).yml --env-file .env -p ai-$(1)
 endef
 
-$(eval $(call service,litellm,litellm))
+$(eval $(call service,litellm,litellm prometheus))
 $(eval $(call service,unsloth,unsloth))
 $(eval $(call service,vllm,qwen3.8 qwen3.8-solo qwen3.6 vllm-qwen-vl muse-glimmer))
 $(eval $(call service,llama,glm5.2 qwen3.8-flash glm5.3-flash))

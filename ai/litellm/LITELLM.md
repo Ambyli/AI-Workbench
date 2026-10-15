@@ -27,7 +27,45 @@ The proxy is reachable at `http://localhost:4001`. Configuration is loaded from 
 
 ### Health checks
 
-The LiteLLM service runs a liveliness probe against `/health/liveliness`. Prometheus scrapes metrics from the proxy on its default endpoint.
+The LiteLLM service runs a liveliness probe against `/health/liveliness`. Prometheus scrapes metrics from the proxy on its default endpoint, using the key described below.
+
+### Prometheus scrape key
+
+LiteLLM requires a key on `/metrics` (`require_auth_for_metrics_endpoint` is on by default). Without one, Prometheus's `litellm` job shows `401 Unauthorized`. Turning that setting off is not an option here: the cloudflared tunnel sends `api.zeoenergy.com` straight to LiteLLM, so `https://api.zeoenergy.com/metrics` would become public.
+
+Instead, Prometheus sends a **virtual key that can only call `/metrics`**. LiteLLM supports this with the key's `allowed_routes` (exact or wildcard match, `proxy/auth/route_checks.py`). The key lives at `ai/litellm/secrets/prometheus_metrics.key`. That folder's own `.gitignore` keeps everything but itself out of git, and it is mounted read-only into `prometheus` at `/etc/prometheus/secrets`. The `litellm` job in `prometheus.yml` reads it with `authorization.credentials_file`.
+
+**Create the key (on the box, from the repo root):**
+
+```bash
+MK=$(grep '^DEFAULT_LITELLM_MASTER_KEY=' .env | cut -d= -f2- | tr -d "\"'")
+curl -sS http://localhost:4001/key/generate \
+  -H "Authorization: Bearer $MK" -H 'Content-Type: application/json' \
+  -d '{"key_alias": "prometheus-metrics", "allowed_routes": ["/metrics", "/metrics/*"],
+       "metadata": {"purpose": "Prometheus scrape of litellm /metrics (ai/litellm/prometheus.yml)"}}' \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["key"], end="")' \
+  > ai/litellm/secrets/prometheus_metrics.key
+chmod 644 ai/litellm/secrets/prometheus_metrics.key   # prometheus runs as nobody
+unset MK
+```
+
+The key is written straight to the file and never printed. `/metrics/*` covers the trailing-slash redirect LiteLLM's mounted metrics app can answer with.
+
+**Check it, then deploy:**
+
+```bash
+K=$(cat ai/litellm/secrets/prometheus_metrics.key)
+curl -s -o /dev/null -w '%{http_code}\n' -L -H "Authorization: Bearer $K" http://localhost:4001/metrics     # 200
+curl -s -o /dev/null -w '%{http_code}\n'    -H "Authorization: Bearer $K" http://localhost:4001/v1/models   # 403: nothing but /metrics
+unset K
+make up litellm          # prometheus is a default service of this stack; the new mount recreates it once
+```
+
+In Prometheus (`http://<box>:9090/targets`), the `litellm` job should be **UP**.
+
+**Rotate it:** create a new key the same way (it overwrites the file), run `docker restart prometheus` (it re-reads the file on each scrape, so this is only to be safe), then delete the old key in the Admin UI under Virtual Keys → `prometheus-metrics`, or with `POST /key/delete`.
+
+A missing or empty key file only breaks the `litellm` job. Prometheus logs the read error and the other jobs keep scraping.
 
 ### Stopping
 

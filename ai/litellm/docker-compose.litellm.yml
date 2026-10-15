@@ -108,6 +108,13 @@ services:
     volumes:
       - prometheus_data:/prometheus
       - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      # The LiteLLM key the `litellm` scrape job sends (prometheus.yml,
+      # credentials_file). The whole folder, so a missing key is a scrape error
+      # on that one job rather than Docker creating a directory in its place.
+      # git ignores everything in it but its own .gitignore -- see LITELLM.md >
+      # Prometheus scrape key. prometheus runs as nobody: the key file must be
+      # world-readable (it can only read /metrics).
+      - ./secrets:/etc/prometheus/secrets:ro
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.path=/prometheus"

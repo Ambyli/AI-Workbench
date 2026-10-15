@@ -924,6 +924,10 @@ class Deployer:
             return
 
         others = [c.name for c in running if c is not current]
+        if current is not None and not current_ok:
+            # FORCE=1, or an unhealthy copy already at the target name: it is
+            # replaced too (parked aside below), so it is not "no copy".
+            others = [f"{current.name} ({'forced' if self.force else current.health})"] + others
         replacing = f" (replacing {', '.join(others)})" if others else " (no copy running yet)"
         self.say(name, f"swap -> {target}{replacing}")
         for n in notes:

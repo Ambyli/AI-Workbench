@@ -659,11 +659,12 @@ class Deployer:
         else:
             self.recreate(name, svc, reason)
 
-    def compose_up(self, name: str) -> None:
+    def compose_up(self, name: str, force: bool = False) -> None:
+        args = ["up", "-d", "--no-deps"] + (["--force-recreate"] if force else []) + [name]
         if self.dry_run:
-            self.detail(f"would run: docker compose up -d --no-deps {name}")
+            self.detail(f"would run: docker compose {' '.join(args)}")
             return
-        self.must(self.compose("up", "-d", "--no-deps", name, capture=False), f"docker compose up {name}")
+        self.must(self.compose(*args, capture=False), f"docker compose up {name}")
 
     def wait_until(self, check: Callable[[], bool], timeout: float, what: str) -> None:
         deadline = self.clock() + timeout
@@ -709,9 +710,35 @@ class Deployer:
             for c in running
         )
 
+    def unbound_ports(self, name: str, svc: dict) -> list:
+        """Host ports the config publishes that a running container of this service lacks.
+
+        Docker can leave a container running with NO port bindings: create
+        it, fail its first start with "port is already allocated", free the
+        port, start it again. Its config hash still matches, so compose (and a
+        reload) would leave it alone forever -- serving nothing on those ports.
+        """
+        wanted = host_ports(svc)
+        if not wanted:
+            return []
+        missing = []
+        for c in self.containers(name):
+            if c.running:
+                missing += [p for p in wanted if p not in c.published and p not in missing]
+        return missing
+
     def recreate(self, name: str, svc: dict, reason: str) -> None:
         labels = service_labels(svc)
         unchanged = self.recreate_unchanged(name, svc)
+        unbound = self.unbound_ports(name, svc) if unchanged else []
+        if unbound:
+            self.say(name, f"recreate (downtime): its running container is missing host port binding(s) "
+                           f"{', '.join(unbound)} (started after a failed port allocation?); forcing a recreate")
+            self.check_ports_free(name, svc)
+            self.compose_up(name, force=True)
+            if labels.get(WAIT_LABEL) == "healthy":
+                self.wait_recreated_healthy(name, svc)
+            return
         signal = labels.get(RELOAD_LABEL)
         if unchanged and signal:
             self.say(name, f"recreate-class, unchanged -- reloading in place with {signal} ({reason})")

@@ -992,7 +992,8 @@ def reloadable_edge_svc() -> dict:
 
 
 def unchanged_edge(fake):
-    return fake.add("edge", "edge", labels={deploy.CONFIG_HASH_LABEL: "cfg-edge"}, image="sha256:h")
+    return fake.add("edge", "edge", labels={deploy.CONFIG_HASH_LABEL: "cfg-edge"}, image="sha256:h",
+                    ports=[4001])
 
 
 def test_unchanged_reloadable_service_is_checked_then_signalled():
@@ -1061,6 +1062,29 @@ def test_recreate_ignores_its_own_container_holding_the_port():
     rc, out = run(fake, "edge")
     assert rc == 0, out
     assert fake.mutating() == ["compose up -d --no-deps edge"]
+
+
+def test_running_container_without_its_port_bindings_is_force_recreated():
+    # Seen on the box: the edge's first start failed ("port is already
+    # allocated"), a later start brought it up with no bindings at all, and
+    # its config hash still matched -- so a plain `make up edge` only reloaded it.
+    fake = FakeDocker({"edge": reloadable_edge_svc()}, images={"haproxy:3.4.6-alpine": "sha256:h"})
+    cid = fake.add("edge", "edge", labels={deploy.CONFIG_HASH_LABEL: "cfg-edge"}, image="sha256:h")
+    rc, out = run(fake, "edge")
+    assert rc == 0, out
+    assert "missing host port binding(s) 4001" in out
+    assert fake.mutating() == ["compose up -d --no-deps --force-recreate edge"]
+    assert not [c for c in fake.calls if c[0] == "exec"]  # no reload attempt
+    assert fake.containers[cid]["ports"] == []  # the fake does not model the recreate itself
+
+
+def test_unchanged_container_with_its_ports_bound_is_not_recreated():
+    fake = FakeDocker({"edge": reloadable_edge_svc()}, images={"haproxy:3.4.6-alpine": "sha256:h"})
+    fake.add("edge", "edge", labels={deploy.CONFIG_HASH_LABEL: "cfg-edge"}, image="sha256:h", ports=[4001])
+    rc, out = run(fake, "edge")
+    assert rc == 0, out
+    assert "reloading in place with USR2" in out
+    assert "--force-recreate" not in " ".join(fake.mutating())
 
 
 def test_dry_run_reports_a_held_port_without_failing():

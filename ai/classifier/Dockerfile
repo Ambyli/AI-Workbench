@@ -53,6 +53,12 @@ RUN uv run --no-dev --package classifier python -c "from rapidocr import RapidOC
 # ADDING A SUBPACKAGE MEANS ADDING A LINE HERE. The import smoke below is what
 # makes forgetting it a build failure rather than a crash-looping container.
 COPY ai/classifier/*.py ./ai/classifier/
+# The model registry (llm/models.py reads it from next to the package, i.e.
+# /app/ai/classifier/models.yaml). The compose file bind-mounts the box's copy
+# over this exact path, read-only, so editing it on the box needs only
+# `docker restart classifier`; this baked-in copy is what a container without
+# the mount (or the import check below) reads.
+COPY ai/classifier/models.yaml ./ai/classifier/
 COPY ai/classifier/analysis ./ai/classifier/analysis
 COPY ai/classifier/api ./ai/classifier/api
 COPY ai/classifier/cv ./ai/classifier/cv
@@ -63,17 +69,21 @@ COPY ai/classifier/references ./ai/classifier/references
 COPY ai/classifier/regions ./ai/classifier/regions
 
 # The operator tools. `bin/` is not imported by the service — it holds scripts
-# that have to run WHERE THE MODEL IS (grounding_experiment.py talks to
-# VISION_LLM_API directly), so they ship in the image and run inside the
-# container, through the project venv:
+# that have to run WHERE THE MODEL IS (grounding_experiment.py talks to a
+# models.yaml entry's URL directly), so they ship in the image and run inside
+# the container, through the project venv:
 # `docker exec classifier uv run python bin/grounding_experiment.py`.
 COPY ai/classifier/bin ./ai/classifier/bin
 
 # Import the app the way the CMD below will (PYTHONPATH is already
 # /app/ai/classifier), so a missing COPY line above, a circular import, or a
 # syntax error fails the BUILD instead of shipping a crash-looping container.
-# Same spirit as the OCR warm-up assertion. The paths are throwaway: config.py
-# freezes CLASSIFIER_DATA_DIR (and the PAYLOAD_DIR / artifact / reference dirs
+# Same spirit as the OCR warm-up assertion. It also loads and validates the
+# baked-in models.yaml (llm/models.py), so a registry that cannot load fails
+# the build too — a non-default entry whose API key variable is unset here
+# just loads as unavailable, as it would at runtime (a DEFAULT that needs a
+# key would fail here; keep the default local). The paths are throwaway:
+# config.py freezes CLASSIFIER_DATA_DIR (and the PAYLOAD_DIR / artifact / reference dirs
 # under it) at import time, and /data is a volume mount at runtime. Importing
 # needs no database: the Postgres pool (db.py) is only opened by the lifespan,
 # and CLASSIFIER_DB_HOST is deliberately unset here.
@@ -81,7 +91,7 @@ RUN CLASSIFIER_DATA_DIR=/tmp/build-check \
     PAYLOAD_DIR=/tmp/build-check-payloads \
     CLASSIFIER_ARTIFACT_DIR=/tmp/build-check-artifacts \
     CLASSIFIER_OCR_ENGINE=none \
-    uv run --no-dev --package classifier python -c "import main; print('import main: ok')"
+    uv run --no-dev --package classifier python -c "import main; from llm.models import get_registry; r = get_registry(); print('import main: ok; models:', r.ids(), 'default:', r.default_id)"
 
 WORKDIR /app/ai/classifier
 EXPOSE 8000

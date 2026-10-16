@@ -29,6 +29,9 @@ once per item, and never written to by an evaluator:
         references     the job's ``analysis.references.JobReferences`` (one
                        object shared by every item), or None when the request
                        listed no references
+        default_model  the job's model id (the request's ``model``), None for
+                       the registry default — what a criterion without its
+                       own ``options.model`` runs on
     DocumentGroup    one document and its items, in page order — what a
                      ``text`` criterion with ``options.scope: "document"``
                      searches, and what the ``pages`` level of an aggregate
@@ -179,6 +182,10 @@ class DocumentContext:
     # analysis.references.JobReferences — typed Any so this module does not
     # import the llm layer through it.
     references: Any = None
+    # The job's model (the request's `model`, a registry id), or None for the
+    # registry default. A criterion's own options.model wins over it
+    # (analysis.llm_eval); the references "auto" selection always uses it.
+    default_model: Optional[str] = None
     _image_b64: Optional[str] = None
     _ask_image: Optional["asyncio.Future[str]"] = None
     _layers: dict[str, "asyncio.Future[TextLayer]"] = field(default_factory=dict)

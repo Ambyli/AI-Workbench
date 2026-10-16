@@ -78,6 +78,7 @@ from config import MAX_ITEMS, REFERENCE_DESCRIBE
 from jobs.payloads import PAYLOAD_SCHEMA
 # A module, not names: tests script the model at `llm.client._send`.
 from llm import client as llm_client
+from llm.models import get_registry
 from logger import logger
 from metrics import reference_describe_total, references_created_total
 from references.finalize import merge
@@ -117,9 +118,14 @@ async def run_assess(payload: dict[str, Any]) -> dict:
     for outcome in loaded:
         if isinstance(outcome, BaseException):
             raise outcome
-    # The plan only when the request listed references: an unguided job calls
-    # the pipeline exactly as before.
-    extra = {"references_plan": payload["references"]} if payload.get("references") else {}
+    # The plan only when the request listed references, the model only when it
+    # named one: an unguided default-model job calls the pipeline exactly as
+    # before.
+    extra: dict[str, Any] = (
+        {"references_plan": payload["references"]} if payload.get("references") else {}
+    )
+    if payload.get("model"):
+        extra["default_model"] = payload["model"]
     return await analyze_document(
         list(loaded), criteria, job_id=payload.get("job_id"), **extra
     )
@@ -194,8 +200,11 @@ async def _build(payload: dict[str, Any], ref: Any, job_id: Optional[str]) -> di
     pipeline: Optional[dict] = None
     observed: dict[str, dict[str, Any]] = {}
     observed_regions: dict[str, list[Region]] = {}
+    # The creation job's model (POST /references `model`), else the default.
+    job_model: Optional[str] = payload.get("model")
     if run:
-        pipeline = await analyze_document([doc], run, job_id=job_id)
+        extra = {"default_model": job_model} if job_model else {}
+        pipeline = await analyze_document([doc], run, job_id=job_id, **extra)
         observed, observed_regions = _observations(pipeline, job_id)
     logger.info(
         "run_reference: %s — %d criteria, %d run through the pipeline",
@@ -219,7 +228,8 @@ async def _build(payload: dict[str, Any], ref: Any, job_id: Optional[str]) -> di
     if ref.description is None and REFERENCE_DESCRIBE:
         try:
             description = await describe_page(
-                llm_client.encode_image_to_base64(working), document_kind=doc.kind
+                llm_client.encode_image_to_base64(working), document_kind=doc.kind,
+                model=get_registry().resolve(job_model),
             )
             description_source = "model"
             reference_describe_total.labels(outcome="ok").inc()

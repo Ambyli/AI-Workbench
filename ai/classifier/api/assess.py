@@ -14,7 +14,8 @@ JSON caller and a multipart caller take exactly the same path:
                           plus a `criteria` field holding the same JSON array
                           and an optional `references` field (a JSON array of
                           reference ids, the word ``auto``, or the JSON
-                          ``{"auto": true, ...}`` object).
+                          ``{"auto": true, ...}`` object), and an optional
+                          `model` field (a registry id, GET /models).
 
 Either way, an omitted ``criteria`` is genuinely omitted — the multipart path
 no longer fills in the defaults itself — so the model can tell "the caller
@@ -27,7 +28,9 @@ request rather than a job that fails in a worker a minute later:
 
   1. validate the request (per-type options, caps, text patterns, unique
      names, dependencies, cycles, ``score: false`` only where there is
-     geometry, the static reference rules) — ``AssessRequest``;
+     geometry, the static reference rules, the ``model`` / ``options.model``
+     ids and what each criterion's effective model can do — boxes and
+     references need vision) — ``AssessRequest``;
   1b. resolve ``references`` against the store (``references.resolve``):
      unknown ids 400, not-ready 409, inherited criteria merged and
      re-validated, the per-criterion example cap, position against a
@@ -44,7 +47,8 @@ request rather than a job that fails in a worker a minute later:
      count, capped at CLASSIFIER_MAX_ITEMS inclusively; over it is a 400
      naming each document's pages. A ``score: false`` criterion is refused
      when NO document has a page image; a ``detector`` criterion is refused
-     when DETECTOR_URL is unset;
+     when DETECTOR_URL is unset; a criterion on a text-only model is refused
+     when a photo would give it no text (OCR off, or ``options.ocr: never``);
   3b. with CLASSIFIER_SVG_FETCH_IMAGES on, fetch each SVG's external
      ``<image>`` links and inline them (``analysis.resolve_svg_images``) —
      here, because the worker never touches the network. A link that cannot
@@ -86,6 +90,8 @@ from cv import get_detector
 from detector import client as detector_client
 from jobs.payloads import SubmittedDocument, build_assess_payload
 from jobs.queue import jobs_registry, queue
+# A module, not names: the registry is looked up at call time (tests swap it).
+from llm import models as llm_models
 from logger import logger
 from metrics import jobs_total
 from middleware import request_id_var
@@ -98,7 +104,7 @@ router = APIRouter(tags=["assess"])
 # each occurrence is one document, in form order. Anything else is refused by
 # name, which is how a caller still sending the removed `ocr` / `regions`
 # fields finds out they now live on each criterion.
-_FORM_FIELDS = {"file", "image", "text", "criteria", "references"}
+_FORM_FIELDS = {"file", "image", "text", "criteria", "references", "model"}
 _REMOVED_FORM_FIELDS = {
     "ocr": "each llm / text criterion's options.ocr",
     "regions": "nothing — regions are always stored now, and layers render on first fetch",
@@ -128,6 +134,9 @@ _OPENAPI = {
                         "references": {"type": "string",
                                        "description": "JSON array of reference ids, "
                                                       "'auto', or a JSON {\"auto\": true, ...}"},
+                        "model": {"type": "string",
+                                  "description": "The job's model: a registry id from "
+                                                 "GET /models (default: the registry's)"},
                     },
                 }
             },
@@ -204,6 +213,8 @@ async def _from_form(request: Request) -> tuple[AssessRequest, list[_Upload]]:
         raise _bad("Send 'criteria' once — one JSON array covers every document")
     if len(form.getlist("references")) > 1:
         raise _bad("Send 'references' once — one JSON array of reference ids")
+    if len(form.getlist("model")) > 1:
+        raise _bad("Send 'model' once — one registry id for the job (GET /models)")
 
     uploads: list[_Upload] = []
     documents: list[dict] = []
@@ -263,6 +274,11 @@ async def _from_form(request: Request) -> tuple[AssessRequest, list[_Upload]]:
                     f"'references' is not valid JSON: {exc}. Expected a JSON array of "
                     'reference ids, e.g. ["r0123456789ab"], or the word auto'
                 )
+    raw_model = form.get("model")
+    if raw_model is not None:
+        if not isinstance(raw_model, str):
+            raise _bad("'model' must be a plain form value (a registry id), not a file")
+        body["model"] = raw_model.strip()
     model = _validate(body)
     return model, uploads
 
@@ -336,6 +352,30 @@ def _check_documents(model: AssessRequest, uploads: list[_Upload]) -> list[Submi
                 f"criteria {needs} need the open-vocabulary detector, and this container "
                 "has none configured (DETECTOR_URL is empty). Use type 'llm', or omit "
                 "options.fallback so a cv criterion falls back to the llm."
+            )
+
+    # A text-only model reads a page's text layer and nothing else. A photo
+    # (kind "image") has no native text, so with no OCR — the engine is off,
+    # or the criterion's options.ocr is "never" — it would have nothing to
+    # read. (A PDF or SVG page may carry native text, which is only known
+    # once it is loaded; that case fails the unit at run time instead.)
+    photos = [_label(i, d.filename) for i, d in enumerate(submitted) if d.kind == "image"]
+    if photos:
+        registry = llm_models.get_registry()
+        blind_text = [
+            f"{c.name!r} (model {spec.id!r})"
+            for c in model.criteria
+            if c.guided_by_llm()
+            and not (spec := registry.resolve(c.model_id(model.model))).vision
+            and (not config.OCR_ENGINE or config.OCR_ENGINE == "none"
+                 or c.resolved_options().get("ocr") == "never")
+        ]
+        if blind_text:
+            raise _bad(
+                f"criteria {blind_text} run on a text-only model, and the photo(s) "
+                f"{photos} have no text for it to read without OCR (CLASSIFIER_OCR_ENGINE="
+                f"{config.OCR_ENGINE or 'none'}, or options.ocr 'never'). Use a vision "
+                "model, or OCR."
             )
     return submitted
 
@@ -419,7 +459,9 @@ async def assess(request: Request):
     )
     depth = await _enqueue(
         job_id,
-        build_assess_payload(model, submitted, job_id=job_id, references=resolved.plan),
+        build_assess_payload(
+            model, submitted, job_id=job_id, references=resolved.plan, model=model.model,
+        ),
     )
     jobs_total.labels(type="assess", status="pending").inc()
     logger.info("assess: queued job_id=%s queue_depth=%d", job_id, depth)

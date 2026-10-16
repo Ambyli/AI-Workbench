@@ -5,11 +5,20 @@ A criterion's top level holds only what every type shares — ``name``,
 something to one evaluation path lives in ``options``, validated by the model
 for that path:
 
-    llm       LLMOptions       hint, boxes, max_attempts, ocr, reference, aggregate
+    llm       LLMOptions       hint, boxes, max_attempts, ocr, reference, model,
+                               aggregate
     text      TextOptions      pattern, match, case_sensitive, fuzzy_threshold,
                                min_count, ocr, scope, aggregate
-    cv        CVOptions        fallback, reference, aggregate
+    cv        CVOptions        fallback, reference, model, aggregate
     detector  DetectorOptions  threshold, aggregate
+
+``model`` picks the registry model (``models.yaml``, GET /models) that
+answers the criterion — on ``llm``, and on a ``cv`` name answered by its llm
+fallback. Precedence: ``options.model``, then the request's ``model``, then
+the registry default. An unknown or unavailable id is a 400 naming the valid
+ones. Like ``reference`` it appears in ``resolve()`` only when sent, and it
+is NOT part of a criterion's identity (``without_model``): the same question
+asked of another model is the same criterion.
 
 ``reference`` (``ReferenceOptions``) says how the request's ``references`` —
 stored worked examples, see ``references/`` — guide THIS criterion: whether
@@ -73,10 +82,11 @@ from config import (
     REFERENCE_POSITION_CAP,
     REFERENCE_POSITION_MAX_OFFSET,
     REFERENCE_POSITION_MIN_IOU,
-    VISION_LLM_MAX_IMAGES_PER_PROMPT,
     TEXT_MIN_COUNT_CAP as MIN_COUNT_CAP,
 )
 from cv import get_detector
+# A module, not names: the registry is looked up at call time (tests swap it).
+from llm import models as llm_models
 from cv.quality import check_blur, check_exposure
 # A module, not names: `detector_client.is_configured()` reads DETECTOR_URL at
 # call time, which is what lets a test point it at a stub.
@@ -268,6 +278,27 @@ def _reference_field() -> Any:
     )
 
 
+def _model_field(what: str) -> Any:
+    return Field(
+        default=None,
+        min_length=1,
+        max_length=64,
+        description=(
+            f"Which registry model {what} — an id from GET /models. Omitted: the "
+            "request's `model`, else the registry default. Unknown or unavailable "
+            "is a 400."
+        ),
+    )
+
+
+def check_model_id(value: Optional[str]) -> Optional[str]:
+    """A model id a request may select (known AND available), or ValueError —
+    the one check every `model` field runs, so the messages agree."""
+    if value is not None:
+        llm_models.get_registry().check_selectable(value)
+    return value
+
+
 class LLMOptions(_Options):
     """Options for ``type: "llm"`` — the vision model scores the criterion."""
 
@@ -311,6 +342,13 @@ class LLMOptions(_Options):
 
     reference: Optional[ReferenceOptions] = _reference_field()
 
+    model: Optional[str] = _model_field("scores this criterion (and runs its box loop)")
+
+    @field_validator("model")
+    @classmethod
+    def _known_model(cls, value: Optional[str]) -> Optional[str]:
+        return check_model_id(value)
+
     @model_validator(mode="after")
     def _position_needs_boxes(self) -> "LLMOptions":
         if self.reference is not None and self.reference.position == "check":
@@ -341,7 +379,7 @@ class LLMOptions(_Options):
             "ocr": self.ocr,
             "aggregate": self.resolved_aggregate(default_aggregate("llm", self.hint)),
         }
-        return _with_reference(resolved, self.reference, name)
+        return _with_model(_with_reference(resolved, self.reference, name), self.model)
 
     @classmethod
     def caps(cls) -> dict[str, Any]:
@@ -439,6 +477,15 @@ class CVOptions(_Options):
 
     reference: Optional[ReferenceOptions] = _reference_field()
 
+    model: Optional[str] = _model_field(
+        "answers this criterion when the llm fallback does (only then — a 400 otherwise)"
+    )
+
+    @field_validator("model")
+    @classmethod
+    def _known_model(cls, value: Optional[str]) -> Optional[str]:
+        return check_model_id(value)
+
     @model_validator(mode="after")
     def _no_position_on_cv(self) -> "CVOptions":
         if self.reference is not None and self.reference.position == "check":
@@ -455,7 +502,7 @@ class CVOptions(_Options):
             "fallback": self.fallback or default,
             "aggregate": self.resolved_aggregate(default_aggregate("cv")),
         }
-        return _with_reference(resolved, self.reference, name)
+        return _with_model(_with_reference(resolved, self.reference, name), self.model)
 
 
 class DetectorOptions(_Options):
@@ -487,6 +534,25 @@ def _with_reference(
     if reference is None:
         return resolved
     return {**resolved, "reference": reference.resolve(name)}
+
+
+def _with_model(resolved: dict[str, Any], model: Optional[str]) -> dict[str, Any]:
+    """``resolved`` plus ``model`` — only when the caller sent one, so a
+    criterion without it resolves (and echoes) exactly as it always did. The
+    model the criterion actually ran on is ``detail.model`` on its result."""
+    if model is None:
+        return resolved
+    return {**resolved, "model": model}
+
+
+def without_model(resolved: dict[str, Any]) -> dict[str, Any]:
+    """Resolved options with ``model`` dropped — a criterion's IDENTITY.
+
+    Which model answers a question does not change the question, so two
+    criteria that differ only in ``options.model`` are the same criterion:
+    a reference saved under one model guides the criterion under any other
+    (``references.resolve``, ``api.references``)."""
+    return {k: v for k, v in resolved.items() if k != "model"}
 
 
 # The message a reference on a criterion the model does not answer gets.
@@ -609,14 +675,28 @@ def criterion_types() -> dict[str, Any]:
             "caps": {
                 "max_per_request": REFERENCE_MAX_PER_REQUEST,
                 "max_per_criterion": REFERENCE_MAX_PER_CRITERION,
-                "images_per_llm_prompt": VISION_LLM_MAX_IMAGES_PER_PROMPT,
             },
+            # Images per prompt is a property of the MODEL now: GET /models
+            # max_images_per_prompt / supports.references.
+            "requires_model": "a vision model with max_images_per_prompt >= 2 "
+                              "(3 pairs a PASS and a FAIL example in one call) — GET /models",
             "position": {
                 "min_iou": REFERENCE_POSITION_MIN_IOU,
                 "max_offset": REFERENCE_POSITION_MAX_OFFSET,
                 "cap": REFERENCE_POSITION_CAP,
                 "requires": "options.boxes: true and hint presence / auto",
             },
+        },
+        # options.model on llm criteria (and a cv criterion's llm fallback);
+        # the request-level `model` sets the default for the job.
+        "model": {
+            "applies_to": "llm criteria, and cv criteria answered by the llm fallback",
+            "precedence": "options.model, then the request's `model`, then the registry default",
+            "default": llm_models.get_registry().default_id,
+            "models": llm_models.get_registry().ids(),
+            "catalog": "GET /models",
+            "identity": "options.model is not part of a criterion's identity: references "
+                        "match across models",
         },
         "detector_configured": detector_client.is_configured(),
     }

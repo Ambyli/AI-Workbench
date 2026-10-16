@@ -50,8 +50,10 @@ box validated — so at most ``3 × max_attempts`` small calls per located
 criterion, on top of that criterion's own scoring call. That is why the loop
 is opt-in per criterion (``options.boxes``), capped per criterion
 (``options.max_attempts``, never above LLM_BBOX_MAX_ATTEMPTS) and gated on the
-presence score. Every call goes through ``llm.client``, so the process-wide
-CLASSIFIER_MAX_LLM_CALLS limit applies to each one.
+presence score. Every call goes to the criterion's model (``model``, the
+same registry entry its scoring call used — a vision model: the submit
+refuses boxes on a text-only one) through ``llm.client``, so that model's
+``max_concurrent`` limit applies to each one.
 
 Process flow position: called by the ``llm`` evaluator
 (``analysis.llm_eval``) right after that criterion's scoring call.
@@ -81,9 +83,10 @@ from config import (
     MAX_WORKING_DIMENSION,
 )
 # Imported as modules, not by name, so a test can script the model by
-# replacing `llm.client.call_vllm_json` — the same reason the pipeline imports
+# replacing `llm.client.call_model_json` — the same reason the pipeline imports
 # `detector.client` as a module.
 from llm import client, prompts
+from llm.models import ModelSpec
 from logger import logger
 from metrics import llm_bbox_attempts
 
@@ -401,6 +404,7 @@ async def locate_criterion(
     gridlines: Optional[bool] = None,
     refine: Optional[bool] = None,
     ask_b64: Optional[str] = None,
+    model: Optional[ModelSpec] = None,
 ) -> tuple[list[Region], Localization]:
     """Run the full ask → validate → refine → verify → retry loop for one criterion.
 
@@ -428,6 +432,9 @@ async def locate_criterion(
                           (``DocumentContext.ask_image_b64`` memoises it per
                           item, so N located criteria on a page draw the grid
                           once). None → built here from ``gridlines``.
+        model:            The registry entry every ask / refine / verify call
+                          goes to (its ``max_tokens.box`` budget); None → the
+                          registry default.
 
     Returns:
         ``(regions, localization)``. ``regions`` holds one Region per attempt
@@ -458,12 +465,13 @@ async def locate_criterion(
 
         # Step 1 — ask.
         loc.calls += 1
-        answer = await client.call_vllm_json(
+        answer = await client.call_model_json(
             prompts.build_bbox_prompt(
                 ask_b64, name, feedback=feedback,
-                gridlines=grid_on_ask, grid_step=LLM_BBOX_GRID_STEP,
+                gridlines=grid_on_ask, grid_step=LLM_BBOX_GRID_STEP, model=model,
             ),
             label=f"bbox/{name}#{number}",
+            model=model,
         )
         if answer is None:
             attempt.reject = (
@@ -518,15 +526,16 @@ async def locate_criterion(
                 )
             else:
                 loc.calls += 1
-                fine = await client.call_vllm_json(
+                fine = await client.call_model_json(
                     prompts.build_bbox_prompt(
                         client.encode_image_to_base64(
                             _with_grid(crop) if gridlines else crop
                         ),
                         name, gridlines=gridlines, grid_step=LLM_BBOX_GRID_STEP,
-                        zoomed=True,
+                        zoomed=True, model=model,
                     ),
                     label=f"refine/{name}#{number}",
+                    model=model,
                 )
                 fine_bbox, fine_reject = (
                     validate_bbox(fine.get("bbox"), present="bbox" in fine)
@@ -563,9 +572,12 @@ async def locate_criterion(
             llm_bbox_attempts.labels(outcome="rejected_verify").inc()
             break
         loc.calls += 1
-        verdict = await client.call_vllm_json(
-            prompts.build_verify_prompt(client.encode_image_to_base64(crop), name),
+        verdict = await client.call_model_json(
+            prompts.build_verify_prompt(
+                client.encode_image_to_base64(crop), name, model=model,
+            ),
             label=f"verify/{name}#{number}",
+            model=model,
         )
         attempt.verify_score = _score_of(verdict)
         attempt.verify_reason = (

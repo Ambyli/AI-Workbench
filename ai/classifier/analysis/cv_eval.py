@@ -14,10 +14,14 @@ DETECTOR_URL is configured and "llm" otherwise, unless the caller chose:
                          boxes (``analysis.detector_eval``), at
                          DETECTOR_MIN_SCORE
     fallback "llm"       the vision model scores it with the default llm
-                         options (hint auto, no boxes, ocr auto) — guided by
-                         the request's references exactly as an llm criterion
-                         is (``options.reference`` on a cv criterion is only
-                         accepted when this is the path that answers)
+                         options (hint auto, no boxes, ocr auto) — on the cv
+                         criterion's ``options.model``, else the job's model,
+                         else the registry default (a text-only model is
+                         refused at submit) — guided by the request's
+                         references exactly as an llm criterion is
+                         (``options.reference`` and ``options.model`` on a cv
+                         criterion are only accepted when this is the path
+                         that answers)
 
 The result's ``method`` says which path actually answered.
 
@@ -91,15 +95,17 @@ async def evaluate(c: CriterionInput, ctx: DocumentContext) -> Outcome:
     """Run the named OpenCV detector on the page, or the resolved fallback."""
     detector = get_detector(c.name)
     if detector is None:
-        fallback = c.resolved_options()["fallback"]
+        resolved = c.resolved_options()
+        fallback = resolved["fallback"]
         logger.info("cv_eval: no OpenCV detector for '%s' — fallback=%s", c.name, fallback)
         if fallback == "detector":
             outcome = await detector_eval.evaluate_label(c.name, ctx, DETECTOR_MIN_SCORE)
         else:
             guide = ctx.references.guide(c, ctx.item) if ctx.references is not None else None
-            outcome = await llm_eval.evaluate_with(
-                c.name, LLMOptions().resolve(c.name), ctx, reference=guide
-            )
+            # The default llm options, on the cv criterion's own options.model
+            # when it set one (else the job's model, resolved in llm_eval).
+            llm_opts = LLMOptions(model=resolved.get("model")).resolve(c.name)
+            outcome = await llm_eval.evaluate_with(c.name, llm_opts, ctx, reference=guide)
         note = f"No OpenCV detector matches '{c.name}'; answered by the {fallback} fallback."
         outcome.reason = f"{note} {outcome.reason or ''}".strip()
         return outcome

@@ -7,7 +7,7 @@ progress history (``job_progress``,
 (``reference_examples``, ``references.store.ReferenceRegistry``) and one row
 per vision-model request (``llm_calls``, ``llm.usage.UsageStore``). They share
 ONE pool rather than one each, so the connection count is sized once
-(``DB_POOL_MAX``) and the stores can never starve each other's
+(``pool_max()``) and the stores can never starve each other's
 connection budget separately.
 
     Database          the pool owner. ``init()`` / ``close()`` are driven by
@@ -47,8 +47,23 @@ from typing import Any, AsyncIterator, Optional
 
 import asyncpg
 
-from config import DB_DSN, DB_POOL_MAX
+from config import DB_DSN, DB_POOL_HEADROOM, MAX_CONCURRENT
 from logger import logger
+
+
+def pool_max() -> int:
+    """The pool's ceiling: every worker (a claim or a write each), every model
+    slot in the registry (each model call writes one ``llm_calls`` row after
+    its slot is released), and ``DB_POOL_HEADROOM`` for the rest (the HTTP
+    routes, progress flushes, the sweeper — see config.py). A pool that is too small never errors; a caller just
+    waits for a connection.
+
+    Read when the pool is created, not at import: it needs the model registry
+    (``llm.models``), which is loaded and validated at startup.
+    """
+    from llm.models import get_registry
+
+    return MAX_CONCURRENT + get_registry().total_concurrency() + DB_POOL_HEADROOM
 
 # Seconds ``close()`` waits for borrowed connections to come back before it
 # terminates the pool. Shutdown cancels the workers first, so this only bites
@@ -78,13 +93,16 @@ class Database:
                   unset, in which case every use raises
                   :class:`DatabaseNotConfigured`.
         min_size: Connections the pool keeps open while idle.
-        max_size: The pool's ceiling (``config.DB_POOL_MAX``).
+        max_size: The pool's ceiling — None to compute it with
+                  :func:`pool_max` when the pool is created.
     """
 
-    def __init__(self, dsn: Optional[str], *, min_size: int = 1, max_size: int = 10) -> None:
+    def __init__(
+        self, dsn: Optional[str], *, min_size: int = 1, max_size: Optional[int] = 10
+    ) -> None:
         self.dsn = dsn
         self.min_size = max(0, int(min_size))
-        self.max_size = max(1, int(max_size))
+        self.max_size: Optional[int] = None if max_size is None else max(1, int(max_size))
         self._pool: Optional[asyncpg.Pool] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
@@ -124,11 +142,12 @@ class Database:
         # A pool left over from a loop that has since ended (a TestClient
         # that exited without the lifespan closing it) cannot be closed from
         # here — its transports belong to that loop. Drop the reference.
+        max_size = self.max_size if self.max_size is not None else pool_max()
         self._pool = await asyncpg.create_pool(
-            dsn, min_size=self.min_size, max_size=self.max_size,
+            dsn, min_size=min(self.min_size, max_size), max_size=max_size,
         )
         self._loop = loop
-        logger.info("db: pool ready (max_size=%d)", self.max_size)
+        logger.info("db: pool ready (max_size=%d)", max_size)
 
     async def close(self) -> None:
         """Close the pool. Idempotent. Waits up to ``_CLOSE_TIMEOUT_S`` for
@@ -186,4 +205,4 @@ async def create_schema(conn: Any, lock_name: str, ddl: str) -> None:
         await conn.execute(ddl)
 
 
-database = Database(DB_DSN, min_size=1, max_size=DB_POOL_MAX)
+database = Database(DB_DSN, min_size=1, max_size=None)

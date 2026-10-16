@@ -1,11 +1,14 @@
 """The two model-usage routes: one job's calls, and totals across jobs.
 
-    GET /jobs/{job_id}/usage   every vision-model request the job made, with
-                               its totals and the same totals per call kind,
-                               outcome and criterion
-    GET /usage                 totals across jobs, by call kind and by UTC day,
-                               optionally limited to a time window and a job
-                               type
+    GET /jobs/{job_id}/usage   every model request the job made, with its
+                               totals and the same totals per call kind,
+                               outcome, criterion and model
+    GET /usage                 totals across jobs, by call kind, by model and
+                               by UTC day, optionally limited to a time
+                               window, a job type and a model
+
+A model filter is not checked against the registry: a model removed from
+``models.yaml`` still has its rows, and asking for them is legitimate.
 
 Both read the ``llm_calls`` rows ``llm.client._post`` writes through
 ``llm.usage`` (see that module for what a row holds and how it is attributed
@@ -97,16 +100,21 @@ def build_usage_router(registry: Any) -> APIRouter:
             None, description="Exclusive upper bound on a call's started_at (ISO, UTC if no offset)"),
         job_type: Optional[str] = Query(
             None, description="Only calls made by jobs of this type: assess | reference"),
+        model: Optional[str] = Query(
+            None, description="Only calls addressed to this registry model id (GET /models)"),
     ) -> dict:
-        """Totals across jobs, grouped by call kind and by UTC day."""
+        """Totals across jobs, grouped by call kind, by model and by UTC day."""
         lower, upper = _bound(since, "since"), _bound(until, "until")
         if lower is not None and upper is not None and lower >= upper:
             raise HTTPException(status_code=400, detail="since must be before until")
         summary = await llm_usage.usage_store.summary(
-            since=lower, until=upper, job_type=job_type or None,
+            since=lower, until=upper, job_type=job_type or None, model=model or None,
         )
         return {
-            "filter": {"since": lower, "until": upper, "job_type": job_type or None},
+            "filter": {
+                "since": lower, "until": upper, "job_type": job_type or None,
+                "model": model or None,
+            },
             **summary,
         }
 

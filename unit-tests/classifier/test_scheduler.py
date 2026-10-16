@@ -1,8 +1,9 @@
 """The scheduler: units, per-item gating, parallelism, isolation, the limits.
 
 Driven through ``analysis.analyze_document`` on synthetic documents, with the
-vision model scripted at the TRANSPORT (``llm.client._send``) — which is where
-the process-wide model-call limit lives, so the limit is genuinely in play
+vision model scripted at the TRANSPORT (``llm.client._send``) — under the
+model's own call limit (the default model's ``ModelSpec.limit``, models.yaml
+``max_concurrent``, held in ``llm.client._post``), so the limit is genuinely in play
 and can be measured: the fake counts how many calls are in flight at once.
 
 Run with::
@@ -25,6 +26,7 @@ from analysis import scheduler
 from api.schemas import CriterionInput
 from llm import boxes as llm_boxes
 from llm import client as llm_client
+from llm.models import get_registry
 
 
 class SlowModel:
@@ -94,14 +96,14 @@ def model(monkeypatch):
 
 def test_independent_criteria_run_in_parallel(monkeypatch, model):
     monkeypatch.setattr(scheduler, "MAX_UNITS_PER_JOB", 4)
-    monkeypatch.setattr(llm_client.LLM_CALLS, "limit", 8)
+    monkeypatch.setattr(get_registry().default.limit, "limit", 8)
     _run([_llm(f"c{i}") for i in range(4)])
     assert model.peak == 4
 
 
 def test_the_per_job_cap_bounds_one_job(monkeypatch, model):
     monkeypatch.setattr(scheduler, "MAX_UNITS_PER_JOB", 2)
-    monkeypatch.setattr(llm_client.LLM_CALLS, "limit", 8)
+    monkeypatch.setattr(get_registry().default.limit, "limit", 8)
     _run([_llm(f"c{i}") for i in range(6)])
     assert model.peak == 2
 
@@ -109,8 +111,8 @@ def test_the_per_job_cap_bounds_one_job(monkeypatch, model):
 def test_the_global_llm_limit_bounds_every_job_together(monkeypatch, model):
     """Two jobs × three criteria, one limit: in flight never exceeds it."""
     monkeypatch.setattr(scheduler, "MAX_UNITS_PER_JOB", 3)
-    monkeypatch.setattr(llm_client.LLM_CALLS, "limit", 2)
-    llm_client.LLM_CALLS.reset_peak()
+    monkeypatch.setattr(get_registry().default.limit, "limit", 2)
+    get_registry().default.limit.reset_peak()
 
     async def two_jobs():
         doc_a = analysis.load_document_bytes(_png(), "a.png", None)
@@ -122,14 +124,14 @@ def test_the_global_llm_limit_bounds_every_job_together(monkeypatch, model):
 
     asyncio.run(two_jobs())
     assert model.peak == 2
-    assert llm_client.LLM_CALLS.peak <= 2
+    assert get_registry().default.limit.peak <= 2
     assert len(model.prompts) == 6
 
 
 def test_the_llm_limit_also_bounds_the_box_loop(monkeypatch, model):
     """Scoring and the loop's ask/verify calls share one limit."""
     monkeypatch.setattr(scheduler, "MAX_UNITS_PER_JOB", 4)
-    monkeypatch.setattr(llm_client.LLM_CALLS, "limit", 1)
+    monkeypatch.setattr(get_registry().default.limit, "limit", 1)
     monkeypatch.setattr(llm_boxes, "LLM_BBOX_REFINE", False)
     monkeypatch.setattr(llm_boxes, "LLM_BBOX_GRIDLINES", False)
     # Every answer carries both a score and a bbox, so it serves as a scoring

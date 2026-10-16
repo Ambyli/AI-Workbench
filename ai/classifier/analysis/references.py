@@ -34,7 +34,7 @@ reference up by id.
         summary()      the result's top-level ``references`` block.
         artifact()     the ``references.json`` body.
     plan_calls()     which examples share a scoring call: with room for three
-                     images (VISION_LLM_MAX_IMAGES_PER_PROMPT ≥ 3) call i pairs
+                     images (the model's max_images_per_prompt ≥ 3) call i pairs
                      the i-th PASS-side example with the i-th FAIL example —
                      one contrastive call, three images; with room for two,
                      each example is its own call. At most
@@ -58,8 +58,10 @@ CLASSIFIER_REFERENCE_POSITION_CAP (never raises it) and recomputes the
 verdict; nothing located is ``unlocated`` and is not capped. On a ``score:
 false`` criterion the check is reported and changes nothing. No model call.
 
-Every model call goes through ``llm.client``, so the process-wide
-CLASSIFIER_MAX_LLM_CALLS limit bounds it like any scoring call.
+Every model call goes through ``llm.client``, so its model's
+``max_concurrent`` limit bounds it like any scoring call. The selection call
+runs on the JOB's model (``DocumentContext.default_model``), the describe
+call on the creation job's.
 
 Process flow position: ``JobReferences`` is built by ``analysis.pipeline``,
 read by ``analysis.llm_eval`` / ``cv_eval`` (guide, images) and
@@ -90,6 +92,7 @@ from config import (
 # A module, not names: tests script the model at `llm.client._send`, under
 # the limit, and every call must reach the one object they replaced.
 from llm import client as llm_client
+from llm.models import ModelSpec, get_registry
 from llm.prompts import build_describe_prompt, build_reference_selection_prompt
 from llm.validate import description_validator, selection_validator
 from logger import logger
@@ -286,14 +289,17 @@ class JobReferences:
             name for name, entry in (self.plan.get("criteria") or {}).items()
             if (entry.get("options") or {}).get("use", True)
         ]
+        # The JOB's model makes the selection: it serves every criterion on
+        # the item, so no one criterion's options.model can speak for it.
+        spec = get_registry().resolve(getattr(ctx, "default_model", None))
         prompt = build_reference_selection_prompt(
             image, catalogue_text(self.plan.get("catalogue") or []), names,
-            document_kind=getattr(ctx.doc, "kind", "image"),
+            document_kind=getattr(ctx.doc, "kind", "image"), model=spec,
         )
         try:
-            answer = await llm_client.call_vllm(
+            answer = await llm_client.call_model(
                 prompt, label=f"reference/select#{ctx.item}",
-                validator=selection_validator(pool),
+                validator=selection_validator(pool), model=spec,
             )
         except Exception as exc:  # noqa: BLE001 — a failed selection only degrades
             reference_calls_total.labels(kind="selection", outcome="failed").inc()
@@ -503,15 +509,21 @@ class JobReferences:
 # ---------------------------------------------------------------------------
 
 
-async def describe_page(image_b64: str, *, document_kind: str = "image") -> str:
+async def describe_page(
+    image_b64: str, *, document_kind: str = "image", model: Optional[ModelSpec] = None,
+) -> str:
     """The model's description of one page image, cut to the length cap.
+
+    ``model`` is the creation job's (POST /references ``model``; None = the
+    registry default) — always a vision model, the submit saw to that.
 
     Raises:
         llm.client.LLMCallError: The call failed or never produced a
             description (after MAX_LLM_RETRIES).
     """
-    return await llm_client.call_vllm(
-        build_describe_prompt(image_b64, document_kind=document_kind),
+    return await llm_client.call_model(
+        build_describe_prompt(image_b64, document_kind=document_kind, model=model),
         label="reference/describe",
         validator=description_validator(REFERENCE_DESCRIPTION_MAX_CHARS),
+        model=model,
     )

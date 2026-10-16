@@ -14,8 +14,12 @@ POST takes the same two encodings /assess does, parsed into ONE model
 
     application/json     {"document": {"type", "data", "filename"}, "page": 0,
                           "criteria": [...], "breakdown": {...}, "regions": {...},
-                          "region_units": "px", "title", "description", "tags"}
+                          "region_units": "px", "title", "description", "tags",
+                          "model"}
                          — or "from_job" + "from_job_item" instead of a document.
+                         ``model`` (optional) is the creation job's registry
+                         model and must be a VISION model (400 otherwise), as
+                         must every criterion's own ``options.model``.
     multipart/form-data  ONE `file` part (the legacy `image` alias too), and the
                           other keys as fields — `criteria`, `breakdown`,
                           `regions` and `tags` holding JSON (`tags` may instead
@@ -85,8 +89,15 @@ from common.vision import content_type_for
 from analysis import load_input_bytes, resolve_svg_images, validate_content_type
 from analysis.loading import _validate_image_dimensions
 from api.assess import _json_filename
+from api.criterion_options import without_model
 from api.reference_schemas import ReferencePatch, ReferenceRequest
-from api.schemas import ClassifierMetadata, CriterionInput, check_criteria_rules, validation_message
+from api.schemas import (
+    ClassifierMetadata,
+    CriterionInput,
+    check_criteria_rules,
+    check_model_rules,
+    validation_message,
+)
 # A module, not names: SVG_FETCH_IMAGES is read at call time (see api.assess).
 import config
 from config import (
@@ -110,7 +121,7 @@ router = APIRouter(tags=["references"])
 # Multipart fields this endpoint reads. `file` / `image` is the ONE page.
 _FORM_FIELDS = {
     "file", "image", "page", "from_job", "from_job_item", "criteria", "breakdown",
-    "regions", "region_units", "title", "description", "tags",
+    "regions", "region_units", "title", "description", "tags", "model",
 }
 _JSON_FORM_FIELDS = ("criteria", "breakdown", "regions")
 _INT_FORM_FIELDS = ("page", "from_job_item")
@@ -141,6 +152,9 @@ _OPENAPI = {
                         "description": {"type": "string"},
                         "tags": {"type": "string",
                                  "description": "JSON array, or repeat the field"},
+                        "model": {"type": "string",
+                                  "description": "The creation job's model (a vision "
+                                                 "registry id, GET /models)"},
                     },
                 }
             },
@@ -256,10 +270,10 @@ async def _from_form(request: Request) -> tuple[ReferenceRequest, Optional[_Uplo
             body[key] = int(str(value))
         except ValueError:
             raise _bad(f"'{key}' must be an integer, got {str(value)[:40]!r}")
-    for key in ("from_job", "region_units", "title", "description"):
+    for key in ("from_job", "region_units", "title", "description", "model"):
         value = form.get(key)
         if value is not None:
-            body[key] = str(value)
+            body[key] = str(value).strip() if key == "model" else str(value)
     tags = [str(v) for v in form.getlist("tags")]
     if len(tags) == 1 and tags[0].lstrip().startswith("["):
         try:
@@ -336,8 +350,12 @@ def _resolve_document(model: ReferenceRequest, upload: _Upload) -> _Source:
 def _same_question(a: CriterionInput, b: CriterionInput) -> bool:
     """Whether a job's answer to ``b`` answers ``a`` — same type, same
     ``score``, same resolved options. Weight and depends_on change how an
-    answer counts, not what it is."""
-    return a.type == b.type and a.score == b.score and a.resolved_options() == b.resolved_options()
+    answer counts, not what it is; ``options.model`` changes who answered,
+    not the question (``without_model``)."""
+    return (
+        a.type == b.type and a.score == b.score
+        and without_model(a.resolved_options()) == without_model(b.resolved_options())
+    )
 
 
 def _legacy_criteria(job_id: str, result: dict) -> tuple[list[CriterionInput], str]:
@@ -561,6 +579,12 @@ async def create_reference(request: Request):
             src.raw, src.document_warnings = await resolve_svg_images(src.raw)
     else:
         src = await _resolve_from_job(model)
+        if model.criteria is None:
+            # The job's own criteria: their options.model must see images too.
+            try:
+                check_model_rules(src.criteria, model.model, require_vision=True)
+            except ValueError as exc:
+                raise _bad(f"Invalid reference: the job's criteria: {exc}")
     _caller_answers(model, src)
 
     reference_id = new_reference_id()
@@ -592,6 +616,7 @@ async def create_reference(request: Request):
         supplied=src.supplied,
         source=src.source,
         warnings=src.warnings,
+        model=model.model,
     )
     try:
         depth = await queue.enqueue(job_id, payload)

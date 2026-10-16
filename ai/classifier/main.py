@@ -16,7 +16,7 @@ Every endpoint handler lives in ``api/``:
 
     api.assess         POST /assess — the one analysis endpoint (JSON or
                        multipart, parsed into one AssessRequest)
-    api.introspection  GET /criterion-types, /hints, /cv-detectors,
+    api.introspection  GET /models, /criterion-types, /hints, /cv-detectors,
                        /document-kinds, /health
     api.artifacts      the four /jobs/{job_id}/artifacts routes
     api.references     POST/GET/PATCH/DELETE /references — saved worked
@@ -46,7 +46,8 @@ Overall request flow for /assess:
      runs ``jobs.runners.run_assess``: load every page of every document,
      build one context per item, evaluate every (criterion, item) unit
      independently (per-item dependency gating, CLASSIFIER_MAX_UNITS_PER_JOB
-     at once, model calls bounded by CLASSIFIER_MAX_LLM_CALLS and OCR by
+     at once, model calls bounded per model by models.yaml's max_concurrent
+     and OCR by
      CLASSIFIER_OCR_WORKERS across the process), aggregate each criterion
      (pages → documents), weigh per item and overall, and store the
      artifacts.
@@ -91,6 +92,7 @@ from config import LOG_LEVEL
 from db import database
 from jobs.queue import jobs_registry, queue, sweeper
 from llm import client as llm_client
+from llm import models as llm_models
 from llm import usage as llm_usage
 from logger import logger
 from middleware import CorrelationIDMiddleware, RequestIDFilter
@@ -129,7 +131,13 @@ async def lifespan(app: FastAPI):
     """Manage resources that must exist for the full lifetime of the server.
 
     On startup:
-      - Open the Postgres pool (``database.init()``). No CLASSIFIER_DB_HOST,
+      - Load and validate the model registry (``llm.models.startup_check``,
+        ``models.yaml``) FIRST: a file that does not validate, or a default
+        model that is unavailable, stops the container here with the reason
+        in the log — and one WARNING names any replaced env var
+        (VISION_LLM_*, CLASSIFIER_MAX_LLM_CALLS, …) still set.
+      - Open the Postgres pool (``database.init()``), sized from the
+        registry. No CLASSIFIER_DB_HOST,
         or a database that refuses the connection, fails startup here, with
         the reason in the log — the service has no other store.
       - Create the ``jobs``, ``job_progress``, ``reference_examples`` and
@@ -158,6 +166,7 @@ async def lifespan(app: FastAPI):
       - ``database.close()``: close the Postgres pool, last — the workers and
         the sweeper that borrow from it are already stopped.
     """
+    llm_models.startup_check()
     await database.init()
     await jobs_registry.init()
     await queue.progress.init()

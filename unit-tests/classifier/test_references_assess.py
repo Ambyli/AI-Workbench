@@ -2,8 +2,8 @@
 
 Same harness as test_references_api.py — the app in-process through
 TestClient, its real queue and stores on the session temp directory, the
-model scripted at ``llm.client._send`` (so every call takes a real
-CLASSIFIER_MAX_LLM_CALLS slot). References are created fully supplied (a
+model scripted at ``llm.client._send`` (so every call takes a real slot of
+its model's ``max_concurrent`` limit). References are created fully supplied (a
 breakdown and regions for every criterion, and a description), so building
 one costs no model call and the fake model only ever sees /assess traffic.
 
@@ -265,12 +265,11 @@ def test_static_refusals(client, model, body, needle):
 
 
 def test_a_one_image_model_refuses_references(client, model, monkeypatch):
-    from api import schemas
+    from llm.models import get_registry
 
-    monkeypatch.setattr(schemas, "VISION_LLM_MAX_IMAGES_PER_PROMPT", 1)
-    assert "one image per request" in _refuse(
-        client, {"criteria": [_house()], "references": ["r000000000000"]}
-    )
+    monkeypatch.setattr(get_registry().default, "max_images_per_prompt", 1)
+    detail = _refuse(client, {"criteria": [_house()], "references": ["r000000000000"]})
+    assert "takes 1 image per prompt" in detail and "example cannot be shown" in detail
 
 
 def test_store_checked_refusals(client, model, refs, monkeypatch):
@@ -413,9 +412,9 @@ def test_pass_and_fail_share_one_contrastive_call(client, model, refs):
 
 
 def test_a_two_image_model_sends_one_example_per_call(client, model, refs, monkeypatch):
-    from analysis import llm_eval
+    from llm.models import get_registry
 
-    monkeypatch.setattr(llm_eval, "VISION_LLM_MAX_IMAGES_PER_PROMPT", 2)
+    monkeypatch.setattr(get_registry().default, "max_images_per_prompt", 2)
     job = _assess(client, {"criteria": [_house()], "references": [refs["pass"], refs["fail"]]})
     assert sorted(FakeModel.images(p) for p in model.scoring()) == [2, 2]
     ref = _entry(job)["detail"]["reference"]

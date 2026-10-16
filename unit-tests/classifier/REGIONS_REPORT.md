@@ -56,7 +56,7 @@ What has to be **running** depends on which folders you run:
 | You need | For |
 |---|---|
 | `classifier` | everything |
-| `muse-glimmer` (`VISION_LLM_API`) | any item with an `llm` criterion (including every `options.boxes` item). Without it those **criteria** come back `status: "error"` and the job completes with `complete: false` — the other criteria still score |
+| `muse-glimmer` (the default entry of `ai/classifier/models.yaml`) | any item with an `llm` criterion (including every `options.boxes` item). Without it those **criteria** come back `status: "error"` and the job completes with `complete: false` — the other criteria still score |
 | `detector` (`DETECTOR_URL`) | the items with a `detector` criterion. Without DETECTOR_URL those are **refused at submit** (400); with it set but the service down, the detector criteria come back `status: "error"` |
 
 Check before a run:
@@ -433,7 +433,7 @@ The collection **is** the suite, so that is all. Two things to know:
   kept one. `--local` creates the reference for real (the llm criterion
   errors with no model); `test_utility_bill_reference_report.py` drives the
   guided path with a scripted model. Needs a classifier with the references
-  API and `VISION_LLM_MAX_IMAGES_PER_PROMPT` ≥ 2.
+  API and a model whose `max_images_per_prompt` (`ai/classifier/models.yaml`) is ≥ 2.
 
   That default spec shows the plumbing, not an effect: the model already
   knows a utility bill, so it is PASS 10 with or without the example.

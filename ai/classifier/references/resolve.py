@@ -56,7 +56,7 @@ from typing import Any, Optional
 
 from pydantic import ValidationError
 
-from api.criterion_options import ReferenceOptions
+from api.criterion_options import ReferenceOptions, without_model
 from api.schemas import AssessRequest, CriterionInput, validation_message
 from config import REFERENCE_AUTO_POOL_MAX, REFERENCE_MAX_PER_CRITERION
 from references.model import Reference
@@ -87,9 +87,13 @@ def _fold(name: str) -> str:
 
 
 def _same(a: CriterionInput, b: CriterionInput) -> bool:
+    """Whether two references hold the SAME criterion. ``options.model`` is
+    not part of a criterion's identity (``without_model``): the same question
+    answered on two models is one criterion — the first reference's options
+    (model included) are the ones inherited."""
     return (
         a.type == b.type
-        and a.resolved_options() == b.resolved_options()
+        and without_model(a.resolved_options()) == without_model(b.resolved_options())
         and a.weight == b.weight
         and a.score == b.score
         and a.depends_on == b.depends_on
@@ -118,6 +122,10 @@ def _inherit(request: AssessRequest, refs: list[Reference]) -> AssessRequest:
         "criteria": [c.model_dump() for c, _ in merged.values()],
         "references": request.reference_ids(),
     }
+    # The job's model rides through the rebuild (only when sent, so an
+    # inherited request without one stays "default").
+    if request.model is not None:
+        body["model"] = request.model
     try:
         return AssessRequest.model_validate(body)
     except ValidationError as exc:

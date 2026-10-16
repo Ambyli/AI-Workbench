@@ -8,10 +8,11 @@ numbers decide how to configure it — and whether the open-vocabulary detector
 should be the primary source with the LLM as the fallback rather than the
 other way round.
 
-**This has to run where the model is.** It talks to `VISION_LLM_API` directly
-(the `muse-glimmer` container on `ai_shared`), so it runs ON the box — in the
-classifier container, or on the host with the port published. It cannot be run
-from a laptop with no GPU behind it.
+**This has to run where the model is.** It talks to a registry model's URL
+directly (`models.yaml`; the default is the `muse-glimmer` container on
+`ai_shared`, `--model <id>` picks another vision entry), so it runs ON the
+box — in the classifier container, or on the host with the port published. It
+cannot be run from a laptop with no GPU behind it.
 
 Usage::
 
@@ -23,6 +24,9 @@ Usage::
         --images /data/roof-photos \\
         --criteria /data/roof-criteria.json \\
         --attempts 3 --out /data/grounding.json
+
+    # The same against another registry model (GET /models)
+    python bin/grounding_experiment.py --model qwen2.5-vl
 
 ``--criteria`` is a JSON object mapping file name to the criteria to ask
 about, e.g.::
@@ -87,10 +91,21 @@ from config import (  # noqa: E402
     LLM_BBOX_MIN_AREA,
     LLM_BBOX_VERIFY_PASS,
     MAX_WORKING_DIMENSION,
-    VISION_LLM_API,
-    VISION_LLM_MODEL,
 )
 from llm.client import encode_image_to_base64  # noqa: E402
+from llm.models import ModelSpec, get_registry  # noqa: E402
+
+
+def _model(model_id: str | None) -> ModelSpec:
+    """The registry entry ``--model`` names (default: the registry's), or exit."""
+    registry = get_registry()
+    try:
+        spec = registry.check_selectable(model_id) if model_id else registry.default
+    except ValueError as exc:
+        raise SystemExit(f"--model: {exc}")
+    if not spec.vision:
+        raise SystemExit(f"--model: {spec.id!r} is text-only; grounding needs a vision model")
+    return spec
 
 # The image suffixes scanned for and the per-fixture default criteria live in
 # config.py § Grounding experiment, next to every other classifier constant.
@@ -176,7 +191,8 @@ async def run(args) -> dict:
         [p.name for p in paths],
     )
 
-    print(f"model   : {VISION_LLM_MODEL} at {VISION_LLM_API}")
+    spec = _model(args.model)
+    print(f"model   : {spec.id} ({spec.served_name}) at {spec.url}")
     print(f"detector: {'on — ' + str(detector_client.status()['url_host']) if detector_client.is_configured() else 'off'}")
     print(f"loop    : {args.attempts} attempt(s), verify >= {LLM_BBOX_VERIFY_PASS}, "
           f"area {LLM_BBOX_MIN_AREA:.3%}-{LLM_BBOX_MAX_AREA:.0%}")
@@ -209,6 +225,7 @@ async def run(args) -> dict:
                 detector_regions=detector.get(label),
                 max_attempts=args.attempts,
                 working_image=working,
+                model=spec,
             )
             elapsed = time.monotonic() - t0
             first = loc.attempts[0] if loc.attempts else None
@@ -244,7 +261,7 @@ async def run(args) -> dict:
             print(f"  {mark} {label:<26} {detail}{iou}  ({elapsed:.1f}s)")
         print()
 
-    summary = _summarise(records, time.monotonic() - started)
+    summary = _summarise(records, time.monotonic() - started, spec.id)
     _print_summary(summary)
     if args.out:
         out = pathlib.Path(args.out)
@@ -260,7 +277,7 @@ def _rate(values: list[bool]) -> float:
     return (sum(1 for v in values if v) / len(values)) if values else 0.0
 
 
-def _summarise(records: list[dict], elapsed: float) -> dict:
+def _summarise(records: list[dict], elapsed: float, model_id: str) -> dict:
     """Per-criterion and overall rates — the four numbers the plan asks for."""
 
     def block(rows: list[dict]) -> dict:
@@ -293,7 +310,7 @@ def _summarise(records: list[dict], elapsed: float) -> dict:
         },
         "elapsed_seconds": round(elapsed, 1),
         "config": {
-            "model": VISION_LLM_MODEL,
+            "model": model_id,
             "verify_pass": LLM_BBOX_VERIFY_PASS,
             "min_area": LLM_BBOX_MIN_AREA,
             "max_area": LLM_BBOX_MAX_AREA,
@@ -366,6 +383,11 @@ def main() -> None:
     parser.add_argument(
         "--attempts", type=int, default=LLM_BBOX_MAX_ATTEMPTS,
         help=f"loop attempts per criterion (default: {LLM_BBOX_MAX_ATTEMPTS})",
+    )
+    parser.add_argument(
+        "--model", default=None,
+        help="registry model id to measure (models.yaml / GET /models; default: the "
+             "registry default). Must be a vision model.",
     )
     parser.add_argument("--out", default=None, help="write the full JSON report here")
     asyncio.run(run(parser.parse_args()))

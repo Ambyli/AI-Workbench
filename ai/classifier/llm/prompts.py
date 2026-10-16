@@ -26,8 +26,27 @@ other:
                             candidate page) and the text catalogue of the
                             candidate references; "which of these are useful
                             examples for this page?", ranked with confidences.
-    _system_prompt()      — the shared system prompt for the two small calls,
-                            carrying the ``Reasoning strength`` line.
+    _system_prompt()      — the shared system prompt for the small calls (plus
+                            the model's reasoning line, for the rare
+                            ``system_line`` model).
+
+EVERY BUILDER TAKES ``model`` — the registry entry (``llm.models.ModelSpec``)
+the request is for; None means the registry default. The entry supplies the
+body's ``model`` (``served_name``), the token budget for the call kind under
+its ``token_param``, ``response_format`` when ``json_mode``, its
+``extra_body``, and its reasoning setting (``ModelSpec.body``). Reasoning
+depth is normally a chat-template variable in the body — Muse Glimmer's
+``chat_template_kwargs: {"reasoning_strength": "low"}`` — which its template
+renders as "Reasoning strength: low." in the system text itself. The prompts
+here therefore carry NO reasoning line for it: one in the system prompt would
+override the variable. Only a model whose registry entry says
+``reasoning.style: system_line`` (one with no template variable) gets a line,
+appended verbatim.
+
+A TEXT-ONLY model (``vision: false``) gets the scoring prompt without the
+page image, worded for text ("You are assessing the text of a single
+document page…"); the other builders always attach an image, and the submit
+refuses to route a text-only model to them.
 
 One criterion per scoring call, not all of them in one prompt: each criterion
 is an independent unit of work (see ``analysis.scheduler``), so one that the
@@ -45,9 +64,10 @@ that page (gridded) or a refine crop, ``build_verify_prompt`` the ONE crop,
 ``build_reference_selection_prompt`` the candidate page (the references
 themselves are a text catalogue, not images). Only a scoring call WITH
 reference examples carries more — the example composite(s) first, then the
-candidate — and never more than VISION_LLM_MAX_IMAGES_PER_PROMPT, which must
-match muse-glimmer's ``--limit-mm-per-prompt`` (3: a PASS example, a FAIL
-example and the candidate; ``analysis.llm_eval`` plans the calls to fit).
+candidate — and never more than the model's ``max_images_per_prompt``, which
+must match its server's ``--limit-mm-per-prompt`` (muse-glimmer: 3, a PASS
+example, a FAIL example and the candidate; ``analysis.llm_eval`` plans the
+calls to fit).
 ``build_llm_prompt(..., references=None)`` is byte-for-byte the plain prompt
 — no examples, no extra system sentence — which a test pins by hash.
 
@@ -77,14 +97,9 @@ from config import (
     DOCUMENT_TEXT_HEADING,
     HINT_RUBRICS,
     LLM_BBOX_GRID,
-    LLM_BBOX_MAX_TOKENS,
-    REFERENCE_DESCRIBE_MAX_TOKENS,
     REFERENCE_DESCRIPTION_MAX_CHARS,
-    REFERENCE_SELECT_MAX_TOKENS,
-    VISION_LLM_MAX_TOKENS,
-    VISION_LLM_MODEL,
-    VISION_LLM_REASONING_STRENGTH,
 )
+from llm.models import ModelSpec, get_registry
 from logger import logger
 
 # The answer the scoring call is asked for, verbatim in the prompt.
@@ -99,6 +114,11 @@ REFERENCE_GUARD = (
     "what this criterion means here. Do not reward resemblance the criterion does not "
     "ask about, and do not score the examples."
 )
+
+
+def _model(model: Optional[ModelSpec]) -> ModelSpec:
+    """``model``, or the registry default when None."""
+    return model if model is not None else get_registry().default
 
 
 @dataclass(frozen=True)
@@ -156,8 +176,9 @@ def build_llm_prompt(
     document_kind: str = "image",
     text_truncated: bool = False,
     references: Optional[list[ReferenceExample]] = None,
+    model: Optional[ModelSpec] = None,
 ) -> dict:
-    """Assemble the vLLM chat completion request for ONE criterion.
+    """Assemble the chat completion request for ONE criterion.
 
     The user text is laid out context line → DOCUMENT TEXT block → rubric →
     ``CRITERION:`` → instructions + answer scaffold, so system prompt, image,
@@ -166,8 +187,8 @@ def build_llm_prompt(
     comment at ``user_text``).
 
     Document handling:
-      * ``document_text`` (already truncated to CLASSIFIER_TEXT_CHAR_BUDGET by
-        the caller) is placed as a clearly-labelled block right after the
+      * ``document_text`` (already truncated to the model's
+        ``text_char_budget`` by the caller) is placed as a clearly-labelled block right after the
         context line, ahead of the rubric and the criterion, and the system
         prompt tells the model it may use image and text together.
       * The candidate is at most ONE image. Pass None for a text-only
@@ -178,6 +199,9 @@ def build_llm_prompt(
         then the usual text — and one sentence in the system prompt. Only the
         candidate's text layer is ever sent. None or [] is byte-for-byte the
         prompt without references (see the module docstring).
+      * A text-only ``model`` (``vision: false``) never gets the image: the
+        page's text layer is all it is shown, and the wording says so. The
+        caller refuses references for such a model at submit.
 
     Args:
         image_b64:      Base64-encoded JPEG of the (resized) page image, or
@@ -188,14 +212,22 @@ def build_llm_prompt(
         document_kind:  "image" | "pdf" | "svg" | "txt" | "docx", for context.
         text_truncated: True when document_text was cut at the char budget.
         references:     Worked examples to show before the candidate.
+        model:          The registry entry the request is for (None: default).
 
     Returns:
-        A dict ready to POST to the vLLM /v1/chat/completions endpoint.
+        A dict ready to POST to the model's chat-completions endpoint.
     """
+    spec = _model(model)
+    # A text-only model reads the text of an image page; the page itself is
+    # not sent.
+    text_only_page = bool(image_b64) and not spec.vision
+    if text_only_page:
+        image_b64 = None
     logger.debug(
-        "build_llm_prompt: '%s' hint=%s image_b64[%s] kind=%s text=%d chars "
+        "build_llm_prompt: '%s' model=%s hint=%s image_b64[%s] kind=%s text=%d chars "
         f"examples={len(references or [])}",
         name,
+        spec.id,
         hint,
         f"{len(image_b64)} chars" if image_b64 else "none",
         document_kind,
@@ -208,7 +240,14 @@ def build_llm_prompt(
         rubric += f"\n  {rubric_def['extra']}"
 
     # --- Document context: what the model is actually looking at ---
-    if document_kind == "image":
+    if text_only_page:
+        what = "photo" if document_kind == "image" else f"{document_kind} page"
+        context_line = (
+            f"You are assessing the text of a single document page (a {what}); the "
+            "page image is not shown to you. Judge the criterion from the extracted "
+            "text below."
+        )
+    elif document_kind == "image":
         context_line = "You are assessing a single image."
     elif image_b64:
         context_line = f"You are assessing a 1-page {document_kind} document."
@@ -255,7 +294,15 @@ def build_llm_prompt(
         f"{scaffold}"
     )
 
-    if document_text.strip():
+    if text_only_page:
+        source_sentence = (
+            "You are given one page of a document as extracted text only — you cannot "
+            "see the page. Judge the criterion from that text; a criterion about how the "
+            "page LOOKS cannot be judged from it, so say so and score it 5 (uncertain). "
+            "The text may be OCR output and can contain recognition errors — judge "
+            "meaning, not exact spelling. "
+        )
+    elif document_text.strip():
         # Both modalities are available: say so explicitly, and warn that the
         # text may be OCR output so the model treats near-misses sensibly.
         source_sentence = (
@@ -284,10 +331,9 @@ def build_llm_prompt(
             " Reference examples with known answers come first; score ONLY the image "
             "marked CANDIDATE."
         )
-    if VISION_LLM_REASONING_STRENGTH:
-        # Muse Glimmer reads its reasoning depth from this system-prompt line
-        # (see ai/vllm/VLLM.md "Parsers and sampling"). Other models ignore it.
-        system_prompt += f"\nReasoning strength: {VISION_LLM_REASONING_STRENGTH}"
+    # Reasoning depth normally rides in the body (chat_template_kwargs, see
+    # the module docstring); only a `system_line` model gets a line here.
+    system_prompt = _system_prompt(system_prompt, spec)
 
     user_content: list[dict] = []
     for example in references or []:
@@ -311,35 +357,35 @@ def build_llm_prompt(
         )
     user_content.append({"type": "text", "text": user_text})
 
-    return {
-        "model": VISION_LLM_MODEL,
-        "messages": [
+    # The budget (models.yaml max_tokens.score) covers reasoning + the JSON
+    # answer; reasoning is stripped server-side by --reasoning-parser so
+    # `content` is JSON only. No temperature override: the server's
+    # --generation-config auto applies the model's published sampling (Muse
+    # Glimmer: temperature 1.0, top_p 0.95, top_k 64 — its card warns against
+    # greedy decoding). Consistency comes from json_object mode plus
+    # llm.validate.clamp_answer().
+    return spec.body(
+        [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
         ],
-        # Budget covers reasoning + the JSON answer; reasoning is stripped
-        # server-side by --reasoning-parser so `content` is JSON only.
-        "max_tokens": VISION_LLM_MAX_TOKENS,
-        # No temperature override: the server's --generation-config auto applies
-        # Meta's published sampling for Muse Glimmer (temperature 1.0, top_p
-        # 0.95, top_k 64). The model card warns against greedy / near-greedy
-        # decoding. Consistency comes from json_object mode plus
-        # llm.validate.clamp_answer().
-        "response_format": {"type": "json_object"},
-    }
+        "score",
+    )
 
 
-def _system_prompt(instruction: str) -> str:
-    """A system prompt for a single-question call, with the reasoning line.
+def _system_prompt(instruction: str, model: Optional[ModelSpec] = None) -> str:
+    """A system prompt, plus the model's reasoning line when it has one.
 
-    Muse Glimmer reads its reasoning depth from a system-prompt line rather
-    than a chat-template kwarg (see ai/vllm/VLLM.md "Parsers and sampling"),
-    and these calls are small enough that its budget matters — so the same
-    directive the scoring prompt sets is repeated here. Other models ignore
-    the line.
+    Only a registry entry with ``reasoning.style: system_line`` (a model whose
+    chat template has no reasoning variable) has a line. Muse Glimmer's depth
+    is ``chat_template_kwargs.reasoning_strength`` in the body, which its
+    template renders into the system text itself — a line here would OVERRIDE
+    that variable, so it never gets one (``llm.models`` refuses the
+    combination at load).
     """
-    if VISION_LLM_REASONING_STRENGTH:
-        return f"{instruction}\nReasoning strength: {VISION_LLM_REASONING_STRENGTH}"
+    line = _model(model).reasoning_line
+    if line:
+        return f"{instruction}\n{line}"
     return instruction
 
 
@@ -352,6 +398,7 @@ def build_bbox_prompt(
     gridlines: bool = False,
     grid_step: int = 100,
     zoomed: bool = False,
+    model: Optional[ModelSpec] = None,
 ) -> dict:
     """Ask for ONE criterion's bounding box on the attached page image.
 
@@ -431,14 +478,18 @@ def build_bbox_prompt(
         f"{scaffold}"
     )
 
-    prompt = {
-        "model": VISION_LLM_MODEL,
-        "messages": [
+    # Small budget (models.yaml max_tokens.box): the answer is ~60 tokens of
+    # JSON. It is still four figures for a reasoning model because reasoning
+    # tokens are spent before it — a budget exhausted mid-reasoning returns
+    # empty content, which call_model_json treats as a parse failure.
+    prompt = _model(model).body(
+        [
             {
                 "role": "system",
                 "content": _system_prompt(
                     "You locate features in images. You answer with coordinates "
-                    "and nothing else. Return ONLY a valid JSON object."
+                    "and nothing else. Return ONLY a valid JSON object.",
+                    model,
                 ),
             },
             {
@@ -452,13 +503,8 @@ def build_bbox_prompt(
                 ],
             },
         ],
-        # Small budget: the answer is ~60 tokens of JSON. It is still four
-        # figures because reasoning tokens are spent before it — a budget
-        # exhausted mid-reasoning returns empty content, which call_vllm_json
-        # treats as a parse failure.
-        "max_tokens": LLM_BBOX_MAX_TOKENS,
-        "response_format": {"type": "json_object"},
-    }
+        "box",
+    )
     logger.debug(
         "build_bbox_prompt: '%s' grid=%d feedback=%d line(s) gridlines=%s zoomed=%s",
         name, span, len(feedback or []), gridlines, zoomed,
@@ -466,7 +512,7 @@ def build_bbox_prompt(
     return prompt
 
 
-def build_verify_prompt(crop_b64: str, name: str) -> dict:
+def build_verify_prompt(crop_b64: str, name: str, *, model: Optional[ModelSpec] = None) -> dict:
     """Ask whether ``name`` is visible in a CROP, with no other context.
 
     This is the half of the loop that makes a box mean something. A model
@@ -501,14 +547,14 @@ def build_verify_prompt(crop_b64: str, name: str) -> dict:
         "Return ONLY this JSON object:\n\n"
         f"{scaffold}"
     )
-    return {
-        "model": VISION_LLM_MODEL,
-        "messages": [
+    return _model(model).body(
+        [
             {
                 "role": "system",
                 "content": _system_prompt(
                     "You say what is in an image crop. You judge only the crop "
-                    "you are shown. Return ONLY a valid JSON object."
+                    "you are shown. Return ONLY a valid JSON object.",
+                    model,
                 ),
             },
             {
@@ -522,12 +568,13 @@ def build_verify_prompt(crop_b64: str, name: str) -> dict:
                 ],
             },
         ],
-        "max_tokens": LLM_BBOX_MAX_TOKENS,
-        "response_format": {"type": "json_object"},
-    }
+        "box",
+    )
 
 
-def build_describe_prompt(image_b64: str, *, document_kind: str = "image") -> dict:
+def build_describe_prompt(
+    image_b64: str, *, document_kind: str = "image", model: Optional[ModelSpec] = None,
+) -> dict:
     """Ask for a short, neutral description of ONE reference page.
 
     The description is a catalogue line: it is what ``references: "auto"``
@@ -555,14 +602,14 @@ def build_describe_prompt(image_b64: str, *, document_kind: str = "image") -> di
         "Return ONLY this JSON object:\n\n"
         f"{scaffold}"
     )
-    return {
-        "model": VISION_LLM_MODEL,
-        "messages": [
+    return _model(model).body(
+        [
             {
                 "role": "system",
                 "content": _system_prompt(
                     "You write short, factual catalogue descriptions of images. "
-                    "Return ONLY a valid JSON object."
+                    "Return ONLY a valid JSON object.",
+                    model,
                 ),
             },
             {
@@ -576,9 +623,8 @@ def build_describe_prompt(image_b64: str, *, document_kind: str = "image") -> di
                 ],
             },
         ],
-        "max_tokens": REFERENCE_DESCRIBE_MAX_TOKENS,
-        "response_format": {"type": "json_object"},
-    }
+        "describe",
+    )
 
 
 def build_reference_selection_prompt(
@@ -587,6 +633,7 @@ def build_reference_selection_prompt(
     criteria: list[str],
     *,
     document_kind: str = "image",
+    model: Optional[ModelSpec] = None,
 ) -> dict:
     """Ask which stored references are useful examples for ONE candidate page.
 
@@ -632,14 +679,14 @@ def build_reference_selection_prompt(
         "build_reference_selection_prompt: %d criteria, catalogue %d chars",
         len(criteria), len(catalogue),
     )
-    return {
-        "model": VISION_LLM_MODEL,
-        "messages": [
+    return _model(model).body(
+        [
             {
                 "role": "system",
                 "content": _system_prompt(
                     "You match an image to stored reference examples. You rank catalogue "
-                    "entries; you do not score the image. Return ONLY a valid JSON object."
+                    "entries; you do not score the image. Return ONLY a valid JSON object.",
+                    model,
                 ),
             },
             {
@@ -653,6 +700,5 @@ def build_reference_selection_prompt(
                 ],
             },
         ],
-        "max_tokens": REFERENCE_SELECT_MAX_TOKENS,
-        "response_format": {"type": "json_object"},
-    }
+        "select",
+    )

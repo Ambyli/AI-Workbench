@@ -27,8 +27,11 @@ Three rules, all enforced here and nowhere else:
     ends.
   * **The per-job cap counts UNITS.** At most ``MAX_UNITS_PER_JOB`` units of
     one job are EVALUATING at once (a unit waiting on its dependency holds no
-    slot). Model calls and OCR passes are further bounded process-wide by
-    ``llm.client.LLM_CALLS`` and ``analysis.context.OCR_PASSES``.
+    slot). Model calls and OCR passes are further bounded process-wide — by
+    each model's own limit (``ModelSpec.limit``, models.yaml
+    ``max_concurrent``, held in ``llm.client._post``) and
+    ``analysis.context.OCR_PASSES``. A slot is held for a whole unit, so a
+    slow model's units can occupy a job's slots while its other units wait.
   * **A failed unit fails alone.** Any exception out of an evaluator — a
     model HTTP error, an unparseable answer after the retries, a detector
     outage, a bug — becomes ``status: "error"`` for that (criterion, item).

@@ -1,8 +1,12 @@
 """The cheap introspection endpoints: what can I send, and what will run?
 
-Five routes that answer questions about the SERVICE rather than about a
+Six routes that answer questions about the SERVICE rather than about a
 document, so a caller can check before submitting a job:
 
+    GET /models          the model registry (models.yaml): every model a
+                         request's ``model`` / a criterion's ``options.model``
+                         may name, with its description, endpoint host,
+                         capabilities and limits — never a key value.
     GET /criterion-types each criterion type's options: JSON schema (from the
                          pydantic models themselves), resolved defaults, and
                          the server caps — the live answer for THIS container.
@@ -45,7 +49,6 @@ from config import (
     LLM_BBOX_VERIFY_PASS,
     MAX_CONCURRENT,
     MAX_ITEMS,
-    MAX_LLM_CALLS,
     MAX_UNITS_PER_JOB,
     OCR_WORKERS,
     PDF_RENDER_DPI,
@@ -60,15 +63,34 @@ from config import (
     SVG_FETCH_MAX_BYTES,
     SVG_FETCH_MAX_IMAGES,
     SVG_FETCH_TIMEOUT_S,
-    TEXT_CHAR_BUDGET,
-    VISION_LLM_MAX_IMAGES_PER_PROMPT,
 )
 from cv import REGISTRY
 from cv.result import spec_of
 from detector import client as detector_client
+# A module, not names: the registry is looked up at call time (tests swap it).
+from llm import models as llm_models
 from logger import logger
 
 router = APIRouter(tags=["introspection"])
+
+
+@router.get("/models")
+def list_models():
+    """The model registry: ``{default, models: [...]}``.
+
+    One entry per ``models.yaml`` model, in file order: ``id`` (what a
+    request's ``model`` and a criterion's ``options.model`` name), its
+    ``description``, the ``served_name`` sent as the body's ``model``, the
+    ``endpoint`` scheme / host / port (where a request's pages and text GO —
+    an external host means the data leaves this box), whether it is
+    ``authenticated`` (never the key itself), whether it is ``available``
+    (an entry whose API key variable is unset is not, and says why),
+    ``vision`` and ``max_images_per_prompt``, what it ``supports`` (boxes,
+    references, contrastive references, text-only scoring), its reasoning
+    setting, token budgets per call kind, ``text_char_budget``,
+    ``timeout_s``, ``max_concurrent`` and the requests ``in_flight`` now.
+    """
+    return JSONResponse(content=llm_models.get_registry().public())
 
 
 @router.get("/criterion-types")
@@ -155,6 +177,7 @@ def list_document_kinds():
     per-request setting — the limits come from the container's environment.
     """
     logger.debug("list_document_kinds: building capability map")
+    default_model = llm_models.get_registry().default
 
     kinds = [
         {
@@ -281,15 +304,20 @@ def list_document_kinds():
                          "inclusive and counted at submit",
                 "pdf_render_dpi": PDF_RENDER_DPI,
                 "svg_max_render_pixels": DEFAULT_MAX_RENDER_PIXELS,
-                "llm_text_char_budget": TEXT_CHAR_BUDGET,
-                # What one vision-model request may carry (the candidate plus
-                # reference examples); every call that is not reference-guided
-                # still sends one image.
-                "images_per_llm_prompt": VISION_LLM_MAX_IMAGES_PER_PROMPT,
                 "max_concurrent_jobs": MAX_CONCURRENT,
                 "max_units_per_job": MAX_UNITS_PER_JOB,
-                "max_llm_calls": MAX_LLM_CALLS,
                 "ocr_workers": OCR_WORKERS,
+                # Text budget, images per prompt, model calls in flight and
+                # the timeout are per MODEL — GET /models. The default model's
+                # are here, labelled as such, for a caller that names none.
+                "models": "per model — GET /models (text_char_budget, "
+                          "max_images_per_prompt, max_concurrent, timeout_s)",
+                "default_model": {
+                    "id": default_model.id,
+                    "llm_text_char_budget": default_model.text_char_budget,
+                    "images_per_llm_prompt": default_model.max_images_per_prompt,
+                    "max_concurrent": default_model.max_concurrent,
+                },
             },
             # What this container can tell you about WHERE, and what it costs.
             # Same spirit as the ocr block: the honest, live answer, so a
@@ -323,9 +351,13 @@ def list_document_kinds():
             # Saved worked examples (POST /references) and what an /assess may
             # ask of them on THIS container.
             "references": {
-                "enabled": VISION_LLM_MAX_IMAGES_PER_PROMPT >= 2,
-                "images_per_llm_prompt": VISION_LLM_MAX_IMAGES_PER_PROMPT,
-                "contrastive": VISION_LLM_MAX_IMAGES_PER_PROMPT >= 3,
+                # Whether references work, and contrastively, depends on the
+                # model each criterion runs on (GET /models `supports`); these
+                # three are the DEFAULT model's.
+                "enabled": default_model.supports_references,
+                "images_per_llm_prompt": default_model.max_images_per_prompt,
+                "contrastive": default_model.supports_contrastive,
+                "per_model": "GET /models supports.references / contrastive_references",
                 "max_count": REFERENCE_MAX_COUNT,
                 "max_per_request": REFERENCE_MAX_PER_REQUEST,
                 "max_per_criterion": REFERENCE_MAX_PER_CRITERION,

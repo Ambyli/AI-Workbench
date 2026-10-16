@@ -24,7 +24,7 @@ siblings:
      references), regions.json, the base images, the
      manifest
   7. Assemble the ``schema_version: 3`` result (with ``request.criteria``,
-     the validated criteria as run)
+     the validated criteria as run, and ``request.model``, the job's model)
 
     analyze_document() — the pipeline itself; ``jobs.runners.run_assess`` is
                          its only caller in the service (tests call it with a
@@ -65,9 +65,10 @@ from analysis.references import JobReferences
 from analysis.scheduler import CriterionUnits, run_units
 from analysis.weighting import compute_weighted_score
 from api.schemas import CriterionInput
-from config import OCR_ENGINE, OCR_MIN_NATIVE_CHARS, TEXT_CHAR_BUDGET
+from config import OCR_ENGINE, OCR_MIN_NATIVE_CHARS
 # A module, not names: detector_client.status() reads DETECTOR_URL at call time.
 from detector import client as detector_client
+from llm.models import get_registry
 from logger import logger
 from regions.artifacts import (
     ItemInfo,
@@ -89,6 +90,7 @@ async def analyze_document(
     *,
     job_id: Optional[str] = None,
     references_plan: Optional[dict] = None,
+    default_model: Optional[str] = None,
 ) -> dict:
     """Run every criterion on every item of ``docs`` and return the job result.
 
@@ -103,17 +105,22 @@ async def analyze_document(
         references_plan: The plan ``references.resolve`` built at submit (the
                   payload's ``references`` key), or None. One
                   ``JobReferences`` is built from it and shared by every item.
+        default_model: The job's model (the request's ``model``, a registry
+                  id), or None for the registry default. Every criterion
+                  without its own ``options.model`` runs on it.
 
     Returns:
         The ``schema_version: 3`` result — see API.md § Result shape.
     """
     documents = [docs] if isinstance(docs, Document) else list(docs)
+    job_spec = get_registry().resolve(default_model)
     logger.info(
-        "analyze_document: %d document(s) %s criteria=%s job=%s",
+        "analyze_document: %d document(s) %s criteria=%s job=%s model=%s",
         len(documents),
         [f"{d.kind}:{len(d.pages)}p" for d in documents],
         [f"{c.name}({c.type}{'' if c.score else ', score:false'})" for c in criteria],
         job_id,
+        job_spec.id,
     )
 
     # Step 1 — a thumbnail is not a document.
@@ -154,6 +161,7 @@ async def analyze_document(
                 detector_stats=detector_stats,
             )
             ctx.references = job_references
+            ctx.default_model = default_model
             items.append(ctx)
             members.append(ctx)
         groups.append(DocumentGroup(
@@ -237,7 +245,7 @@ async def analyze_document(
     }
     result = {
         "schema_version": SCHEMA_VERSION,
-        "documents": [_document_entry(g) for g in groups],
+        "documents": [_document_entry(g, job_spec.text_char_budget) for g in groups],
         "items": item_rows,
         "assessment": {**scoring, "per_criterion_scores": per_criterion},
         "verdict": scoring["overall_verdict"],
@@ -253,7 +261,13 @@ async def analyze_document(
         # The criteria exactly as validated (depends_on, weight, every
         # option as sent) — what POST /references' `from_job` rebuilds a
         # reviewed job's criteria from. Additive: nothing else reads it.
-        "request": {"criteria": [c.model_dump(mode="json") for c in criteria]},
+        "request": {
+            "criteria": [c.model_dump(mode="json") for c in criteria],
+            # The job-level model, resolved: the request's `model`, else the
+            # registry default — what every criterion without its own
+            # options.model ran on (each llm result's detail.model says so).
+            "model": job_spec.id,
+        },
     }
     logger.info(
         "analyze_document: verdict=%s overall_score=%s complete=%s items=%d regions=%d",
@@ -377,8 +391,10 @@ def _geometry_entry(ctx: DocumentContext) -> dict[str, Any]:
     return {"item": ctx.item, **ctx.geometry.as_dict()}
 
 
-def _document_entry(group: DocumentGroup) -> dict[str, Any]:
-    """One document: what it is, its items, and what was done to read it."""
+def _document_entry(group: DocumentGroup, text_char_budget: int) -> dict[str, Any]:
+    """One document: what it is, its items, and what was done to read it.
+    ``text_char_budget`` is the JOB model's (a criterion on another model
+    reports its own in ``detail.text_sent.budget``)."""
     doc = group.doc
     passes = [p for ctx in group.items for p in ctx.ocr_passes]
     joined = []
@@ -418,6 +434,6 @@ def _document_entry(group: DocumentGroup) -> dict[str, Any]:
                 # text.d{index}.<key>.json.
                 "document_layers": joined,
             },
-            "llm_text_char_budget": TEXT_CHAR_BUDGET,
+            "llm_text_char_budget": text_char_budget,
         },
     }

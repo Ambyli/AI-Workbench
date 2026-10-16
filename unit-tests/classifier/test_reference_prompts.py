@@ -31,21 +31,40 @@ from llm.prompts import CANDIDATE_HEADING, ReferenceExample, build_llm_prompt
 from llm.validate import description_validator
 
 # sha256 of json.dumps(build_llm_prompt(*args, **kwargs), sort_keys=True,
-# ensure_ascii=False) (default env). The two calls WITHOUT document text are
-# still the hashes from before references were added; the two WITH text were
+# ensure_ascii=False), on the registry DEFAULT model (models.yaml
+# muse-glimmer). History: the two calls WITHOUT document text kept their
+# hashes from before references were added; the two WITH text were
 # regenerated when the DOCUMENT TEXT block moved ahead of the rubric and the
 # criterion for vLLM prefix caching (and the presence rubric's "provided
 # below" became "provided above").
+#
+# REGENERATED DELIBERATELY with the model registry (models.yaml): Muse
+# Glimmer's reasoning depth moved from a "\nReasoning strength: low" line at
+# the end of the system prompt to `chat_template_kwargs: {"reasoning_strength":
+# "low"}` in the body. Its stock chat template reads that variable and writes
+# "Reasoning strength: low." into the system text itself — and a reasoning
+# line already IN the system prompt overrides the variable, so the line had
+# to go. Nothing else changed: LEGACY below holds the previous hashes, and
+# test_the_only_change_is_the_reasoning_mechanism rebuilds each old prompt
+# from the new one (line put back, kwargs removed) and matches it exactly.
 GOLDEN = [
     ((("ZmFrZQ==", "has a house"), {}),
-     "e577ab6fc567d7a15314ea972227b3d4c4066d1fb19964f14f74ac2b524c2249"),
+     "727dd5d757b738fc128706a7cdaea3cbec2a057c2a36a945973a1c68822e037f"),
     ((("ZmFrZQ==", "has a house", "presence", "Total due $5"), {"document_kind": "pdf"}),
-     "ff79fee2611e44ddcd6c16030c944c64c3bc3d67763b7a3cae1613d83a682f6e"),
+     "1f1e265d7a60ff94d6b12fee96bce8c2f226c6fab40ab0665e276f830d5baf0c"),
     (((None, "mentions a warranty", "auto", "Limited Warranty text"),
       {"document_kind": "txt", "text_truncated": True}),
-     "096e85e3692b0d506ccb57ae9fa89d190dda1edbb9b4f8cbfde00cafc038af1f"),
+     "6d27054ae72627a9d310b81e7542cadef95d55762bee850cd23df5a3503dda10"),
     ((("ZmFrZQ==", "image sharpness", "quality"), {}),
-     "08766fcc8c87747f99262f29aa162eae3c5b03755e370df3a291622c3810c20c"),
+     "13cf4c1d61fb86423140e47d2e20139c40e8c58b21ff2da3ab5308cc3c4d8433"),
+]
+
+# The hashes before the registry (system-prompt reasoning line, no kwargs).
+LEGACY = [
+    "e577ab6fc567d7a15314ea972227b3d4c4066d1fb19964f14f74ac2b524c2249",
+    "ff79fee2611e44ddcd6c16030c944c64c3bc3d67763b7a3cae1613d83a682f6e",
+    "096e85e3692b0d506ccb57ae9fa89d190dda1edbb9b4f8cbfde00cafc038af1f",
+    "08766fcc8c87747f99262f29aa162eae3c5b03755e370df3a291622c3810c20c",
 ]
 
 
@@ -61,6 +80,19 @@ def test_no_references_is_byte_identical_to_before(call, digest, references):
     if references != "omitted":
         kwargs = {**kwargs, "references": references}
     assert _hash(build_llm_prompt(*args, **kwargs)) == digest
+
+
+@pytest.mark.parametrize("call, legacy", list(zip([c for c, _ in GOLDEN], LEGACY)))
+def test_the_only_change_is_the_reasoning_mechanism(call, legacy):
+    """The default model's prompt is the pre-registry prompt with exactly one
+    change: no reasoning line in the system prompt, chat_template_kwargs in
+    the body instead."""
+    args, kwargs = call
+    prompt = build_llm_prompt(*args, **kwargs)
+    assert "Reasoning strength" not in json.dumps(prompt)
+    assert prompt.pop("chat_template_kwargs") == {"reasoning_strength": "low"}
+    prompt["messages"][0]["content"] += "\nReasoning strength: low"
+    assert _hash(prompt) == legacy
 
 
 @pytest.mark.parametrize("document_kind, image", [("pdf", "ZmFrZQ=="), ("txt", None)])
@@ -121,10 +153,12 @@ def test_examples_come_first_then_the_candidate_then_the_text():
     assert content[5]["image_url"]["url"].endswith("Q0FORA==")
     # The text part is exactly the unguided one — only the candidate's text layer.
     assert content[6] == plain["messages"][1]["content"][1]
-    assert guided["messages"][0]["content"].startswith(plain["messages"][0]["content"].split(
-        "\nReasoning strength")[0])
+    # The guided system prompt is the plain one plus one sentence — and, like
+    # it, carries no reasoning line (that is chat_template_kwargs now).
+    assert guided["messages"][0]["content"].startswith(plain["messages"][0]["content"])
     assert "score ONLY the image marked CANDIDATE" in guided["messages"][0]["content"]
-    for key in ("model", "max_tokens", "response_format"):
+    assert "Reasoning strength" not in guided["messages"][0]["content"]
+    for key in ("model", "max_tokens", "response_format", "chat_template_kwargs"):
         assert guided[key] == plain[key]
 
 
@@ -240,7 +274,7 @@ def test_the_catalogue_lists_usable_criteria_only():
 
 
 def test_the_selection_prompt_carries_one_image_and_the_catalogue():
-    from config import REFERENCE_SELECT_MAX_TOKENS
+    from llm.models import get_registry
     from llm.prompts import build_reference_selection_prompt
 
     prompt = build_reference_selection_prompt(
@@ -253,7 +287,7 @@ def test_the_selection_prompt_carries_one_image_and_the_catalogue():
     assert "'has a house', 'a roof'" in text
     assert "CATALOGUE:\n- id: r0123456789ab" in text
     assert '"matches"' in text and "an empty list is a valid answer" in text
-    assert prompt["max_tokens"] == REFERENCE_SELECT_MAX_TOKENS
+    assert prompt["max_tokens"] == get_registry().default.max_tokens["select"]
     assert prompt["response_format"] == {"type": "json_object"}
 
 

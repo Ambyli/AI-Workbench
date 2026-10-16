@@ -57,15 +57,17 @@ from api.criterion_options import (
     TextOptions,
     answered_by_llm,
     can_locate,
+    check_model_id,
 )
 from config import (
     DEFAULT_CRITERIA,
     REFERENCE_MAX_PER_REQUEST,
     REFERENCE_MAX_TAGS,
     REFERENCE_TAG_MAX_CHARS,
-    VISION_LLM_MAX_IMAGES_PER_PROMPT,
 )
 from cv import get_detector
+# A module, not names: the registry is looked up at call time (tests swap it).
+from llm import models as llm_models
 
 CriterionType = Literal["llm", "text", "cv", "detector"]
 
@@ -198,12 +200,20 @@ class CriterionInput(BaseModel):
             raise ValueError(_format_errors(exc, "options.")) from None
         if self.type == "text":
             _check_pattern(self.name, self.options)
-        if self.type == "cv" and self.options.reference is not None and not self.guided_by_llm():
-            raise ValueError(
-                f"options.reference: {NOT_GUIDED} — '{self.name}' is answered by "
-                + ("an OpenCV detector" if get_detector(self.name) is not None
-                   else "the detector service (options.fallback)")
+        if self.type == "cv" and not self.guided_by_llm():
+            answered = (
+                "an OpenCV detector" if get_detector(self.name) is not None
+                else "the detector service (options.fallback)"
             )
+            if self.options.reference is not None:
+                raise ValueError(
+                    f"options.reference: {NOT_GUIDED} — '{self.name}' is answered by {answered}"
+                )
+            if self.options.model is not None:
+                raise ValueError(
+                    f"options.model: '{self.name}' is answered by {answered}, not a model; "
+                    "options.model on a cv criterion only picks the model of its llm fallback"
+                )
         return self
 
     # ── Resolved values ───────────────────────────────────────────────────
@@ -223,6 +233,12 @@ class CriterionInput(BaseModel):
     def reference_options(self) -> Optional[dict[str, Any]]:
         """The resolved ``options.reference``, or None when it was not sent."""
         return self.resolved_options().get("reference")
+
+    def model_id(self, job_model: Optional[str] = None) -> Optional[str]:
+        """The registry id this criterion's model calls go to: its own
+        ``options.model``, else ``job_model``; None means the registry
+        default. Only meaningful when :meth:`guided_by_llm`."""
+        return self.resolved_options().get("model") or job_model
 
     def scope(self) -> str:
         """"document" for a text criterion with options.scope "document" — one
@@ -331,6 +347,21 @@ class AssessRequest(BaseModel):
             "{\"auto\": true, \"tags\": [...], \"tags_match\": \"all\" | \"any\"}."
         ),
     )
+    model: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=64,
+        description=(
+            "The job's model — a registry id from GET /models. Used by every llm "
+            "criterion (and cv llm fallback) without its own options.model, and by "
+            "the references \"auto\" selection call. Omitted: the registry default."
+        ),
+    )
+
+    @field_validator("model")
+    @classmethod
+    def _known_model(cls, value: Optional[str]) -> Optional[str]:
+        return check_model_id(value)
 
     def criteria_given(self) -> bool:
         """Whether the caller sent ``criteria`` (False = the default, or —
@@ -398,12 +429,16 @@ class AssessRequest(BaseModel):
                     f"options.reference on {guided} but the request lists no `references`"
                 )
             return self
-        if VISION_LLM_MAX_IMAGES_PER_PROMPT < 2:
-            raise ValueError(
-                "this container's vision model takes one image per request "
-                f"(VISION_LLM_MAX_IMAGES_PER_PROMPT={VISION_LLM_MAX_IMAGES_PER_PROMPT}), so an "
-                "example cannot be shown beside the candidate; drop `references`"
-            )
+        return self
+
+    @model_validator(mode="after")
+    def _model_rules(self) -> "AssessRequest":
+        check_model_rules(
+            self.criteria,
+            self.model,
+            references=self.references is not None,
+            auto=self.auto_references() is not None,
+        )
         return self
 
 
@@ -458,6 +493,86 @@ def check_criteria_rules(criteria: list[CriterionInput]) -> None:
                 )
             seen.append(nxt)
             current = by_name[nxt]
+
+
+def check_model_rules(
+    criteria: list[CriterionInput],
+    job_model: Optional[str],
+    *,
+    references: bool = False,
+    auto: bool = False,
+    require_vision: bool = False,
+) -> None:
+    """The rules that depend on WHICH model answers each criterion — every
+    one a ``ValueError`` (a 400) at submit.
+
+    For each criterion the model answers (``llm``, or a ``cv`` name answered
+    by its llm fallback), its EFFECTIVE model is ``options.model``, else
+    ``job_model``, else the registry default:
+
+      * a text-only model (``vision: false``) with ``options.boxes`` — the
+        box loop sends page crops;
+      * a ``cv`` criterion whose llm fallback lands on a text-only model — a
+        cv name is a visual question;
+      * with ``references`` on the request, a model that cannot carry an
+        example beside the candidate (not vision, or ``max_images_per_prompt``
+        < 2) on a criterion that uses them (``options.reference.use`` not
+        false);
+      * ``references: "auto"`` with a text-only JOB model — its per-item
+        selection call sends the page image;
+      * ``require_vision`` (POST /references): any text-only model at all —
+        a reference is an image example, and its creation job locates on it.
+
+    The one rule that needs the uploaded documents (a text-only model on an
+    image-only document with no OCR) is ``api.assess._check_documents``'s.
+    """
+    registry = llm_models.get_registry()
+    job_spec = registry.resolve(job_model)
+    if require_vision and not job_spec.vision:
+        raise ValueError(
+            f"model {job_spec.id!r} is text-only; a reference is an image example and "
+            "needs a vision model (GET /models)"
+        )
+    if auto and not job_spec.vision:
+        raise ValueError(
+            f"references \"auto\" selects examples with one call per page that sends the "
+            f"page image, and the job's model {job_spec.id!r} is text-only; set `model` "
+            "to a vision model"
+        )
+    for c in criteria:
+        if not c.guided_by_llm():
+            continue
+        spec = registry.resolve(c.model_id(job_model))
+        opts = c.resolved_options()
+        where = f"criterion {c.name!r} runs on model {spec.id!r}"
+        if not spec.vision:
+            if require_vision:
+                raise ValueError(
+                    f"{where}, which is text-only; a reference is an image example and "
+                    "every model scoring it needs vision"
+                )
+            if c.type == "cv":
+                raise ValueError(
+                    f"{where} (its llm fallback), which is text-only, and a cv criterion "
+                    "is a question about the image; give it options.model with a vision "
+                    "model, or make it an llm criterion"
+                )
+            if opts.get("boxes"):
+                raise ValueError(
+                    f"{where}, which is text-only, so it cannot locate (options.boxes "
+                    "sends page crops); drop boxes or pick a vision model"
+                )
+        if references and (opts.get("reference") or {}).get("use", True):
+            if not spec.supports_references:
+                why = (
+                    "is text-only" if not spec.vision
+                    else f"takes {spec.max_images_per_prompt} image per prompt"
+                )
+                raise ValueError(
+                    f"{where}, which {why}, so a reference example cannot be shown beside "
+                    "the candidate; pick a model with max_images_per_prompt >= 2, set "
+                    "options.reference.use false, or drop `references`"
+                )
 
 
 def _check_pattern(name: str, options: TextOptions) -> None:

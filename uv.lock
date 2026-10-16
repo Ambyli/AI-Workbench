@@ -554,6 +554,7 @@ dependencies = [
     { name = "pymupdf" },
     { name = "python-docx" },
     { name = "python-multipart" },
+    { name = "pyyaml" },
     { name = "rapidocr" },
     { name = "uvicorn" },
 ]
@@ -574,6 +575,7 @@ requires-dist = [
     { name = "pymupdf", specifier = ">=1.28.2" },
     { name = "python-docx", specifier = ">=1.2.0" },
     { name = "python-multipart" },
+    { name = "pyyaml" },
     { name = "rapidocr", specifier = ">=3.9.2,<4" },
     { name = "uvicorn" },
 ]

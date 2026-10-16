@@ -1,6 +1,6 @@
 """The LLM bounding-box enforcement loop, driven by a scripted fake model.
 
-No vLLM, no network: ``llm.client.call_vllm_json`` is replaced with a list of
+No vLLM, no network: ``llm.client.call_model_json`` is replaced with a list of
 answers, which is exactly what the loop is for — the interesting cases are
 all "the model said something wrong", and a real model cannot be asked to say
 something wrong on cue.
@@ -51,7 +51,7 @@ FULL_FRAME = [0, 0, 1000, 1000]
 
 
 class ScriptedModel:
-    """A ``call_vllm_json`` stand-in that answers from a list, in order.
+    """A ``call_model_json`` stand-in that answers from a list, in order.
 
     Records every prompt it was given so a test can assert on the FEEDBACK —
     the retry carrying the previous rejection is half of what the loop does,
@@ -62,7 +62,7 @@ class ScriptedModel:
         self.answers = list(answers)
         self.calls: list[tuple[str, dict]] = []
 
-    async def __call__(self, prompt, *, label=""):
+    async def __call__(self, prompt, *, label="", model=None):
         self.calls.append((label, prompt))
         return self.answers.pop(0) if self.answers else None
 
@@ -89,7 +89,7 @@ def _run(model, monkeypatch, page, **kwargs):
     each change the call sequence — which the tests under "The grid and the
     refine pass" cover on their own.
     """
-    monkeypatch.setattr(llm_client, "call_vllm_json", model)
+    monkeypatch.setattr(llm_client, "call_model_json", model)
     kwargs.setdefault("gridlines", False)
     kwargs.setdefault("refine", False)
     return asyncio.run(
@@ -215,7 +215,7 @@ def test_bbox_null_stops_the_loop(monkeypatch, page):
 
 
 def test_model_failure_is_a_rejected_attempt_not_an_exception(monkeypatch, page):
-    """A None from call_vllm_json (HTTP error, unparseable) is survivable."""
+    """A None from call_model_json (HTTP error, unparseable) is survivable."""
     model = ScriptedModel([None, None, None])
     regions, loc = _run(model, monkeypatch, page)
     assert len(loc.attempts) == 3
@@ -568,10 +568,10 @@ def _png_bytes(width=400, height=600):
 
 
 def _scoring_call(score: int, calls: list | None = None):
-    """A stand-in for ``llm.client.call_vllm``: one flat answer, run through
+    """A stand-in for ``llm.client.call_model``: one flat answer, run through
     the validator the evaluator passes, exactly as the real call does."""
 
-    async def _call(prompt, *, label="", validator=None):
+    async def _call(prompt, *, label="", validator=None, model=None):
         if calls is not None:
             calls.append(label)
         raw = {
@@ -594,9 +594,9 @@ def _analyze(monkeypatch, criterion, *, answers, score=10, job_id=None, scoring_
     """Run the whole pipeline on a synthetic PNG with a scripted model."""
     import analysis
 
-    monkeypatch.setattr(llm_client, "call_vllm", _scoring_call(score, scoring_calls))
+    monkeypatch.setattr(llm_client, "call_model", _scoring_call(score, scoring_calls))
     model = ScriptedModel(answers)
-    monkeypatch.setattr(llm_client, "call_vllm_json", model)
+    monkeypatch.setattr(llm_client, "call_model_json", model)
     # These tests script ask/verify pairs; the refine pass would consume the
     # verify answers. The grid changes no call sequence but is off for parity.
     monkeypatch.setattr(llm_boxes, "LLM_BBOX_REFINE", False)

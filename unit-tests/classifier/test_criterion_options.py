@@ -329,6 +329,13 @@ def test_criterion_types_payload():
     assert payload["aggregate"]["defaults"]["llm (hint presence)"] == {
         "pages": "any", "documents": "all"
     }
+    # options.model: on llm and cv, never in a type's defaults (only when sent).
+    for type_ in ("llm", "cv"):
+        assert "model" in payload["types"][type_]["options_schema"]["properties"]
+        assert "model" not in payload["types"][type_]["defaults"]
+    for type_ in ("text", "detector"):
+        assert "model" not in payload["types"][type_]["options_schema"]["properties"]
+    assert payload["model"]["default"] in payload["model"]["models"]
 
 
 # ── The two input caps are config knobs ────────────────────────────────────
@@ -396,12 +403,14 @@ def test_position_check_with_boxes_is_accepted():
 
 
 def test_criterion_types_has_a_reference_block():
-    from config import REFERENCE_MAX_PER_CRITERION, VISION_LLM_MAX_IMAGES_PER_PROMPT
+    from config import REFERENCE_MAX_PER_CRITERION
 
     block = criterion_types()["reference"]
     assert block["options_schema"]["additionalProperties"] is False
     assert set(block["defaults"]) == {"use", "criterion", "position", "min_iou", "combine"}
     assert block["caps"]["max_per_criterion"] == REFERENCE_MAX_PER_CRITERION
-    assert block["caps"]["images_per_llm_prompt"] == VISION_LLM_MAX_IMAGES_PER_PROMPT
+    # Images per prompt is per MODEL now (GET /models), not a global cap.
+    assert "images_per_llm_prompt" not in block["caps"]
+    assert "GET /models" in block["requires_model"]
     assert "reference" in criterion_types()["types"]["llm"]["options_schema"]["properties"]
     assert "reference" not in criterion_types()["types"]["text"]["options_schema"]["properties"]

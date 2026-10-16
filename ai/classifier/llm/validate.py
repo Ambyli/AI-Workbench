@@ -11,7 +11,7 @@ that agrees with the score.
                      for, or — tolerated — ``{"assessment":
                      {"per_criterion_scores": {name: {…}}}}``, matched by
                      name (exact, case-insensitive, fuzzy, or the only entry).
-                     ``ValueError`` when there is none, which ``call_vllm``
+                     ``ValueError`` when there is none, which ``call_model``
                      treats as a parse failure and retries.
     clamp_answer() — clamp score and confidence, recompute the verdict FROM
                      the clamped score, keep the reason as a string.
@@ -25,7 +25,7 @@ that agrees with the score.
 The weighted overall score is not computed here — that is
 ``analysis.weighting.compute_weighted_score``, over every criterion.
 
-Process flow position: passed to ``llm.client.call_vllm`` as its
+Process flow position: passed to ``llm.client.call_model`` as its
 ``validator`` by ``analysis.llm_eval``.
 """
 
@@ -93,7 +93,7 @@ def clamp_answer(entry: dict) -> dict:
 
 
 def answer_validator(name: str):
-    """A ``call_vllm`` validator that extracts and clamps ``name``'s answer."""
+    """A ``call_model`` validator that extracts and clamps ``name``'s answer."""
 
     def _validate(raw: Any) -> dict:
         return clamp_answer(find_answer(raw, name))
@@ -102,9 +102,9 @@ def answer_validator(name: str):
 
 
 def description_validator(max_chars: int):
-    """A ``call_vllm`` validator for ``build_describe_prompt``'s answer.
+    """A ``call_model`` validator for ``build_describe_prompt``'s answer.
 
-    ``ValueError`` (so ``call_vllm`` retries) when there is no non-empty
+    ``ValueError`` (so ``call_model`` retries) when there is no non-empty
     ``description`` string; otherwise the text with its whitespace collapsed,
     cut at ``max_chars`` on a word boundary where one is near.
     """
@@ -126,9 +126,9 @@ def description_validator(max_chars: int):
 
 
 def selection_validator(pool_ids: list[str]):
-    """A ``call_vllm`` validator for ``build_reference_selection_prompt``.
+    """A ``call_model`` validator for ``build_reference_selection_prompt``.
 
-    ``ValueError`` (so ``call_vllm`` retries) when there is no ``matches``
+    ``ValueError`` (so ``call_model`` retries) when there is no ``matches``
     list. Otherwise ``{"matches": [{"id", "confidence", "reason"}],
     "dropped": [ids not in the pool], "raw": the model's object}`` — entries
     whose id is not in ``pool_ids`` are dropped (and named), a confidence is

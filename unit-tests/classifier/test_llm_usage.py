@@ -15,7 +15,7 @@ Pinned:
     exception, and the call still raises;
   * a failed write (or a row that cannot even be built) never fails the
     call — ``classifier_llm_usage_write_errors_total`` counts it — and the
-    write happens after the ``LLM_CALLS`` slot is released;
+    write happens after the model's slot is released;
   * the context vars attribute job, criterion and item; two concurrent units
     never cross-attribute; the ``references: "auto"`` selection call carries
     the item and no criterion;
@@ -52,6 +52,7 @@ from prometheus_client import REGISTRY
 import llm.client as llm_client
 from db import database
 from llm import usage as llm_usage
+from llm.models import get_registry
 
 pytestmark = pytest.mark.postgres
 
@@ -123,7 +124,7 @@ def test_an_ok_call_writes_one_row_with_every_field(store, monkeypatch):
 
     async def call():
         with llm_usage.unit_scope(criterion="has a house", item=2, document=1):
-            return await llm_client.call_vllm(prompt, label="score/has a house")
+            return await llm_client.call_model(prompt, label="score/has a house")
 
     assert _run(_in_job("job-ok", call)) == {"score": 9}
     (row,) = _run(store.calls("job-ok"))
@@ -132,7 +133,11 @@ def test_an_ok_call_writes_one_row_with_every_field(store, monkeypatch):
     assert row["label"] == "score/has a house" and row["kind"] == "score"
     assert row["attempt"] == 1 and row["outcome"] == "ok"
     assert row["model_requested"] == "muse-glimmer" and row["model_reported"] == "muse-glimmer"
-    assert row["api_url"] == llm_client.VISION_LLM_API
+    # The registry id and the URL actually posted to (no model passed: the
+    # registry default).
+    default = get_registry().default
+    assert row["model_id"] == default.id
+    assert row["api_url"] == default.url
     assert row["max_tokens"] == 8192 and row["finish_reason"] == "stop"
     assert row["http_status"] is None and row["error"] is None
     assert row["seconds"] >= 0 and row["started_at"].endswith("+00:00")
@@ -150,7 +155,7 @@ def test_every_parse_retry_is_its_own_row(store, monkeypatch):
         return next(answers)
 
     monkeypatch.setattr(llm_client, "_send", send)
-    _run(_in_job("job-retry", lambda: llm_client.call_vllm_json({}, label="verify/x#1")))
+    _run(_in_job("job-retry", lambda: llm_client.call_model_json({}, label="verify/x#1")))
     rows = _run(store.calls("job-retry"))
     assert [(r["attempt"], r["completion_tokens"]) for r in rows] == [(1, 7), (2, 2)]
     assert {r["kind"] for r in rows} == {"verify"}
@@ -167,7 +172,7 @@ def test_an_http_error_is_recorded_and_still_raises(store, monkeypatch):
 
     monkeypatch.setattr(llm_client, "_send", overloaded)
     with pytest.raises(llm_client.LLMCallError):
-        _run(_in_job("job-503", lambda: llm_client.call_vllm(
+        _run(_in_job("job-503", lambda: llm_client.call_model(
             {"model": "muse-glimmer"}, label="score/x")))
     (row,) = _run(store.calls("job-503"))
     assert row["outcome"] == "error" and row["http_status"] == 503
@@ -181,7 +186,7 @@ def test_a_transport_error_has_no_status_but_is_recorded(store, monkeypatch):
         raise httpx.ConnectError("connection refused")
 
     monkeypatch.setattr(llm_client, "_send", down)
-    assert _run(_in_job("job-down", lambda: llm_client.call_vllm_json(
+    assert _run(_in_job("job-down", lambda: llm_client.call_model_json(
         {}, label="bbox/x#1"))) is None
     (row,) = _run(store.calls("job-down"))
     assert row["outcome"] == "error" and row["http_status"] is None
@@ -198,7 +203,7 @@ def test_a_failed_write_never_fails_the_call(store, monkeypatch):
     monkeypatch.setattr(llm_client, "_send", send)
     monkeypatch.setattr(store, "_insert", broken_insert)
     before = _errors()
-    assert _run(llm_client.call_vllm({}, label="score/x")) == {"score": 9}
+    assert _run(llm_client.call_model({}, label="score/x")) == {"score": 9}
     assert _errors() - before == 1
 
 
@@ -212,7 +217,7 @@ def test_a_row_that_cannot_be_built_never_fails_the_call(store, monkeypatch):
     monkeypatch.setattr(llm_client, "_send", send)
     monkeypatch.setattr(llm_usage, "build_row", broken_build)
     before = _errors()
-    assert _run(llm_client.call_vllm({}, label="score/x")) == {"score": 9}
+    assert _run(llm_client.call_model({}, label="score/x")) == {"score": 9}
     assert _errors() - before == 1
 
 
@@ -225,12 +230,12 @@ def test_the_write_happens_after_the_slot_is_released(store, monkeypatch):
     original = store.record
 
     async def record(row):
-        seen.append(llm_client.LLM_CALLS.in_flight)
+        seen.append(get_registry().default.limit.in_flight)
         return await original(row)
 
     monkeypatch.setattr(llm_client, "_send", send)
     monkeypatch.setattr(store, "record", record)
-    _run(llm_client.call_vllm({}, label="score/x"))
+    _run(llm_client.call_model({}, label="score/x"))
     assert seen == [0]
 
 
@@ -239,7 +244,7 @@ def test_a_call_outside_a_job_is_recorded_with_no_job(store, monkeypatch):
         return _response(usage={"prompt_tokens": 1, "completion_tokens": 1})
 
     monkeypatch.setattr(llm_client, "_send", send)
-    _run(llm_client.call_vllm({}, label="reference/describe"))
+    _run(llm_client.call_model({}, label="reference/describe"))
     summary = _run(store.summary())
     assert summary["totals"]["calls"] == 1 and summary["totals"]["jobs"] == 0
 
@@ -266,7 +271,7 @@ def test_concurrent_units_never_cross_attribute(store, monkeypatch):
     async def unit(name: str, item: int):
         with llm_usage.unit_scope(criterion=name, item=item, document=0):
             await asyncio.sleep(0)  # let the other unit set its own scope
-            return await llm_client.call_vllm({"who": name}, label=f"score/{name}")
+            return await llm_client.call_model({"who": name}, label=f"score/{name}")
 
     async def job():
         await asyncio.gather(unit("a", 0), unit("b", 1))
@@ -294,7 +299,7 @@ def test_the_scheduler_attributes_criterion_item_and_the_selection_call(store, m
     monkeypatch.setattr(llm_client, "_send", send)
 
     async def fake_llm(c, ctx):
-        await llm_client.call_vllm({}, label=f"score/{c.name}")
+        await llm_client.call_model({}, label=f"score/{c.name}")
         return Outcome(status="ok", method="llm", score=9, verdict="PASS",
                        confidence=80, reason="ok")
 
@@ -310,7 +315,7 @@ def test_the_scheduler_attributes_criterion_item_and_the_selection_call(store, m
         async def select(self, ctx):
             if ctx.item not in self.selected:
                 self.selected[ctx.item] = asyncio.get_running_loop().create_future()
-                await llm_client.call_vllm({}, label=f"reference/select#{ctx.item}")
+                await llm_client.call_model({}, label=f"reference/select#{ctx.item}")
                 self.selected[ctx.item].set_result(None)
             return await self.selected[ctx.item]
 

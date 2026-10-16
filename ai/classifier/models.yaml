@@ -1,0 +1,143 @@
+# The classifier's model registry — every model a job or a criterion may
+# select by id, validated at startup by llm/models.py and served (without
+# secrets) as GET /models.
+#
+#   POST /assess {"model": "<id>"}            the job's model
+#   criterion options.model: "<id>"            one llm criterion's model (or a
+#                                              cv criterion's llm fallback)
+#   POST /references {"model": "<id>"}         the creation job's model
+#
+# Precedence: a criterion's options.model, then the request's model, then
+# `default` below. Nothing ever picks an external model on its own: the
+# default is local, and an external entry is only used when a request names
+# it. An external entry sends document pages and text to that provider —
+# GET /models reports each entry's host so a caller can see where data goes.
+#
+# Editing this file on the box takes effect with `docker restart classifier`
+# (it is bind-mounted read-only; the classifier is recreate-class, so compose
+# cannot see the edit). A file that does not validate stops the container at
+# startup with the reason in `docker logs classifier`.
+#
+# Fields (every one is checked; an unknown key is a startup error):
+#
+#   description            what it is and what it is good for (GET /models)
+#   url                    the FULL chat-completions URL, http:// or https://
+#   served_name            the request body's "model" (vLLM --served-model-name,
+#                          or the provider's model name)
+#   api_key_env            NAME of the env var holding the key; null = no auth.
+#                          Keys are never in this file. The variable must also
+#                          be listed in docker-compose.classifier.yml's
+#                          `environment:` as `- NAME=${NAME:-}`. Unset or empty
+#                          → the entry loads but is unavailable (selecting it
+#                          is a 400; an unavailable default stops startup). A
+#                          key on a plain http:// URL to a dotted host (an IP
+#                          or a public name) is a startup error — keys only go
+#                          over https, or to a service name on ai_shared.
+#   api_key_header         "Authorization" (default) → "Bearer <key>"; any
+#                          other header name carries the raw key
+#   vision                 true = the model takes images. false = text only:
+#                          it scores from the page's text layer alone, and
+#                          boxes, references and visual cv fallbacks are
+#                          refused at submit
+#   max_images_per_prompt  images one request may carry; must match the
+#                          server's --limit-mm-per-prompt. 3 = contrastive
+#                          references (PASS + FAIL example + candidate), 2 =
+#                          one example per call, 1 = no references. 0 (and
+#                          only 0) for a text-only model
+#   reasoning              how the reasoning depth is sent:
+#                            {style: chat_template_kwargs, key: <var>, value: <v>}
+#                              → "chat_template_kwargs": {<var>: <v>} in the
+#                              body (Muse Glimmer: reasoning_strength; the
+#                              qwen family: reasoning_effort)
+#                            {style: system_line, value: "<line>"}
+#                              → <line> appended to every system prompt, for a
+#                              model whose template has no variable. Never for
+#                              Muse Glimmer: a "reasoning strength" line in the
+#                              system prompt OVERRIDES its template variable
+#                            {style: none} (or null) → nothing sent
+#   extra_body             merged into every request body (sampling, other
+#                          chat_template_kwargs). May not set model, messages,
+#                          the token field or response_format, nor the
+#                          reasoning key itself (a load-time error, not a
+#                          silent override)
+#   json_mode              send response_format {"type": "json_object"}
+#   token_param            max_tokens | max_completion_tokens (newer OpenAI)
+#   max_tokens             the completion budget per call kind — score (the
+#                          scoring call), box (one box-loop ask / refine /
+#                          verify), select (references "auto"), describe (a
+#                          reference's description). Reasoning tokens count
+#                          against it before the JSON answer
+#   timeout_s              seconds ONE request may take. Responses are not
+#                          streamed, so it bounds the whole generation (queue
+#                          + prefill + reasoning + answer). A timeout is not
+#                          retried
+#   max_concurrent         requests to THIS model in flight across every job
+#                          (a slot per HTTP request; a retry takes a fresh one)
+#   text_char_budget       characters of a page's text layer pasted into a
+#                          scoring prompt; the rest is dropped and the prompt
+#                          says so
+
+default: muse-glimmer
+
+models:
+  muse-glimmer:
+    description: >-
+      Muse Glimmer 30B on vLLM (ai/vllm, GPU pair 0-1, shared with qwen3.8 —
+      only one of the two runs at a time). Vision, 3 images per prompt:
+      boxes, references and contrastive references. The default.
+    url: http://muse-glimmer:8000/v1/chat/completions
+    served_name: muse-glimmer
+    api_key_env: null
+    vision: true
+    # Must match muse-glimmer's --limit-mm-per-prompt '{"image": 3}'.
+    max_images_per_prompt: 3
+    # The stock chat template reads `reasoning_strength` (low | medium |
+    # high | xhigh; it defaults to high) and writes "Reasoning strength:
+    # <value>." into the system text itself. `low` keeps every classifier call
+    # cheap. Check what a request renders on the box with:
+    #   curl -s muse-glimmer:8000/tokenize -H 'content-type: application/json' \
+    #     -d '{"model":"muse-glimmer","messages":[{"role":"user","content":"hi"}],
+    #          "chat_template_kwargs":{"reasoning_strength":"low"},"return_token_strs":true}'
+    reasoning: {style: chat_template_kwargs, key: reasoning_strength, value: low}
+    # No sampling overrides: --generation-config auto applies Meta's
+    # published defaults, and the model card warns against greedy decoding.
+    extra_body: {}
+    json_mode: true
+    token_param: max_tokens
+    max_tokens: {score: 8192, box: 1024, select: 2048, describe: 1024}
+    # Not streamed: a scoring call that spends most of its 8192 tokens
+    # reasoning in a full batch can pass two minutes.
+    timeout_s: 240
+    # muse-glimmer schedules 8 (--max-num-seqs 8). The classifier takes 6 and
+    # leaves 2 for the LiteLLM chat chains muse-glimmer also serves: their
+    # overflow hook spills chat to the next order (in the end, Claude) once
+    # vLLM's waiting queue stays non-empty, so filling all 8 here would push
+    # chat off the local model.
+    max_concurrent: 6
+    # ~15k tokens: a long contract cannot crowd out the image or the answer.
+    text_char_budget: 60000
+
+  qwen2.5-vl:
+    description: >-
+      Qwen2.5-VL-7B-Instruct on vLLM (the vllm-qwen-vl service in ai/vllm) —
+      the old manual fallback for when muse-glimmer is not running. Vision,
+      one image per prompt, so no references; an 8192-token context, so small
+      budgets. Only answers while vllm-qwen-vl is up.
+    url: http://vllm-qwen-vl:8000/v1/chat/completions
+    served_name: Qwen/Qwen2.5-VL-7B-Instruct
+    api_key_env: null
+    vision: true
+    # vLLM's default of one image per prompt (the service sets no
+    # --limit-mm-per-prompt).
+    max_images_per_prompt: 1
+    reasoning: {style: none}
+    extra_body: {}
+    json_mode: true
+    token_param: max_tokens
+    # --max-model-len 8192 covers prompt AND answer: one ~1000-px page is
+    # ~1300 tokens, so the answer budgets and the text budget below leave the
+    # prompt room. It does not reason, so the JSON answer is all a budget buys.
+    max_tokens: {score: 1024, box: 256, select: 512, describe: 512}
+    timeout_s: 120
+    max_concurrent: 2
+    text_char_budget: 8000

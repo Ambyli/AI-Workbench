@@ -32,6 +32,10 @@ inlined (when CLASSIFIER_SVG_FETCH_IMAGES is on) — so the worker never
 touches the network for its input, and the item cap already ran on exactly
 these bytes.
 
+Either payload may carry ``model`` — the request's job-level registry id —
+only when the request named one; like ``references`` it needed no schema
+bump, and a payload without it runs on the registry default.
+
 Each document entry may carry ``warnings``: what the submit noticed about it
 (an SVG image it could not fetch, and why). Optional with a default of none,
 so it needed no schema bump — an older payload without the key loads exactly
@@ -71,13 +75,16 @@ def build_assess_payload(
     *,
     job_id: Optional[str] = None,
     references: Optional[dict[str, Any]] = None,
+    model: Optional[str] = None,
 ) -> dict[str, Any]:
     """Serialise one validated submission for the payload store.
 
     ``references`` is the plan ``references.resolve`` built at submit; the
     key is present only when the request listed references, so a plain
     assess payload keeps exactly its old keys (same schema number — the
-    runner reads the key with ``get``).
+    runner reads the key with ``get``). ``model`` (the request's job-level
+    registry id) follows the same rule: present only when the request named
+    one, so a payload without it runs on the registry default.
     """
     payload = {
         "schema": PAYLOAD_SCHEMA,
@@ -87,6 +94,8 @@ def build_assess_payload(
     }
     if references is not None:
         payload["references"] = references
+    if model is not None:
+        payload["model"] = model
     return payload
 
 
@@ -116,14 +125,17 @@ def build_reference_payload(
     supplied: dict[str, dict[str, Any]],
     source: dict[str, Any],
     warnings: Optional[list[str]] = None,
+    model: Optional[str] = None,
 ) -> dict[str, Any]:
     """Serialise one validated POST /references for the payload store.
 
     ``supplied`` is ``{name: {"breakdown"?, "regions"?, "regions_source"?,
     "observed"?}}`` exactly as ``references.finalize.merge`` reads it; the
     regions are already in ORIGINAL page pixels (grid converted at submit).
+    ``model`` (the creation job's registry id) is present only when the
+    request named one.
     """
-    return {
+    payload = {
         "schema": PAYLOAD_SCHEMA,
         "type": "reference",
         "reference_id": reference_id,
@@ -135,3 +147,6 @@ def build_reference_payload(
         "source": source,
         "warnings": list(warnings or []),
     }
+    if model is not None:
+        payload["model"] = model
+    return payload

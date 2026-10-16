@@ -1,4 +1,9 @@
-"""Model usage records: one row per vision-model request, linked to its job.
+"""Model usage records: one row per model request, linked to its job.
+
+Each row names the registry model it was addressed to (``model_id``, from
+``models.yaml``) and the URL it was actually posted to (``api_url``); the
+job and summary views group by it (``by_model``) and ``GET /usage`` filters
+on it (``?model=``).
 
 The Prometheus counters ``llm.client`` keeps are process-wide and labelled by
 call KIND only — they answer "where does the model's time go", never "what did
@@ -25,7 +30,7 @@ job abc123 cost". This module answers the second question, durably:
                                it up on THIS module at call time, so a test
                                can swap it for one of its own.
     record_call()              what ``llm.client._post`` calls once per request,
-                               ok or error, after the request's ``LLM_CALLS``
+                               ok or error, after the request's model-limit
                                slot is released. NEVER raises.
 
 Why ContextVars rather than arguments: the call sites that reach ``_post`` —
@@ -77,7 +82,6 @@ from typing import Any, Iterator, Optional
 import asyncpg
 import httpx
 
-from config import VISION_LLM_API
 from db import Database, create_schema, database
 from logger import logger
 from metrics import llm_usage_write_errors
@@ -185,8 +189,13 @@ CREATE TABLE IF NOT EXISTS llm_calls (
     completion_tokens INTEGER,
     reasoning_tokens  INTEGER,
     total_tokens      INTEGER,
-    usage             JSONB
+    usage             JSONB,
+    model_id          TEXT
 );
+-- model_id (the models.yaml registry id) arrived with the model registry; a
+-- table created before it gains the column here. Rows written before it have
+-- NULL — model_requested / api_url still say what they called.
+ALTER TABLE llm_calls ADD COLUMN IF NOT EXISTS model_id TEXT;
 CREATE INDEX IF NOT EXISTS llm_calls_job ON llm_calls (job_id);
 CREATE INDEX IF NOT EXISTS llm_calls_started ON llm_calls (started_at);
 """
@@ -197,7 +206,7 @@ COLUMNS: tuple[str, ...] = (
     "criterion", "item", "document", "attempt", "model_requested",
     "model_reported", "api_url", "max_tokens", "outcome", "http_status",
     "error", "finish_reason", "seconds", "prompt_tokens", "cached_tokens",
-    "completion_tokens", "reasoning_tokens", "total_tokens", "usage",
+    "completion_tokens", "reasoning_tokens", "total_tokens", "usage", "model_id",
 )
 
 # The token columns, in the order every totals block lists them.
@@ -271,6 +280,8 @@ def build_row(
     seconds: float,
     started_at: str,
     counts: dict[str, Optional[int]],
+    model_id: Optional[str] = None,
+    api_url: Optional[str] = None,
 ) -> dict[str, Any]:
     """The ``llm_calls`` row for one request, attributed from the context vars.
 
@@ -282,6 +293,8 @@ def build_row(
         seconds:    Time inside the slot — the model, not the wait for one.
         started_at: When the request went out (:func:`now_iso`).
         counts:     ``llm.client.usage_counts(data)``.
+        model_id:   The registry id the request was addressed to.
+        api_url:    The URL it was actually posted to.
 
     ``request_id`` is the correlation id of the HTTP request that queued the
     job (``handle_job`` restores it into ``middleware.request_id_var``);
@@ -322,7 +335,7 @@ def build_row(
         "attempt": attempt,
         "model_requested": body.get("model") if isinstance(body.get("model"), str) else None,
         "model_reported": model_reported if isinstance(model_reported, str) else None,
-        "api_url": VISION_LLM_API,
+        "api_url": api_url,
         "max_tokens": _count(max_tokens),
         "outcome": "error" if error is not None else "ok",
         "http_status": http_status,
@@ -335,6 +348,7 @@ def build_row(
         "reasoning_tokens": counts.get("reasoning"),
         "total_tokens": _count(usage.get("total_tokens")) if isinstance(usage, dict) else None,
         "usage": usage if isinstance(usage, dict) else None,
+        "model_id": model_id,
     }
 
 
@@ -472,14 +486,26 @@ class UsageStore:
             )
         return [row["model"] for row in rows]
 
-    async def totals(self, job_id: str) -> dict[str, Any]:
-        """One job's totals, plus the same block per kind, outcome and criterion.
+    async def _by_model(self, where: _Where) -> list[dict[str, Any]]:
+        """The totals block per registry id (``model_id``), as a LIST like
+        ``by_criterion``: rows written before the registry have no id, and
+        ``null`` cannot be a JSON object key."""
+        return [
+            {"model": model_id, **block}
+            for model_id, block in await self._aggregate(where, "model_id")
+        ]
 
-        Returns ``{"totals", "by_kind", "by_outcome", "by_criterion"}``.
-        ``totals`` also carries ``models`` and ``first_call_at`` /
-        ``last_call_at``. ``by_criterion`` is a LIST of blocks each with its
-        ``criterion`` — the per-item selection and the describe call belong
-        to no criterion, and ``null`` cannot be a JSON object key.
+    async def totals(self, job_id: str) -> dict[str, Any]:
+        """One job's totals, plus the same block per kind, outcome, criterion
+        and model.
+
+        Returns ``{"totals", "by_kind", "by_outcome", "by_criterion",
+        "by_model"}``. ``totals`` also carries ``models`` and
+        ``first_call_at`` / ``last_call_at``. ``by_criterion`` is a LIST of
+        blocks each with its ``criterion`` — the per-item selection and the
+        describe call belong to no criterion, and ``null`` cannot be a JSON
+        object key; ``by_model`` is a list of blocks each with its ``model``
+        (the registry id) for the same reason.
         """
         where = _Where().add("job_id = {}", job_id)
         ((_, totals),) = await self._aggregate(where)
@@ -499,6 +525,7 @@ class UsageStore:
                 {"criterion": name, **block}
                 for name, block in await self._aggregate(where, "criterion")
             ],
+            "by_model": await self._by_model(where),
         }
 
     async def summary(
@@ -507,14 +534,16 @@ class UsageStore:
         since: Optional[str | datetime] = None,
         until: Optional[str | datetime] = None,
         job_type: Optional[str] = None,
+        model: Optional[str] = None,
     ) -> dict[str, Any]:
-        """Totals across jobs, grouped by kind and by UTC day.
+        """Totals across jobs, grouped by kind, by model and by UTC day.
 
         Args:
             since:    Inclusive lower bound on ``started_at`` (an ISO string,
                       as :func:`now_iso` writes it, or a datetime).
             until:    Exclusive upper bound.
             job_type: Only calls made by jobs of this type.
+            model:    Only calls addressed to this registry id.
         """
         where = _Where()
         if since is not None:
@@ -523,6 +552,8 @@ class UsageStore:
             where.add("started_at < {}", _ts(until))
         if job_type is not None:
             where.add("job_type = {}", job_type)
+        if model is not None:
+            where.add("model_id = {}", model)
         ((_, totals),) = await self._aggregate(where)
         totals["models"] = await self._models(where)
         async with self.db.acquire() as conn:
@@ -533,6 +564,7 @@ class UsageStore:
         return {
             "totals": totals,
             "by_kind": dict(await self._aggregate(where, "kind")),
+            "by_model": await self._by_model(where),
             "by_day": [
                 {"day": day, **block}
                 for day, block in await self._aggregate(where, _DAY)

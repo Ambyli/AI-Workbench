@@ -26,4 +26,6 @@ dependencies = [
     "asyncpg",
     "prometheus-client",
     "prometheus-fastapi-instrumentator",
+    # models.yaml — the model registry (llm/models.py, yaml.safe_load).
+    "pyyaml",
 ]

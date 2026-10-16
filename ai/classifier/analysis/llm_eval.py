@@ -1,10 +1,18 @@
 """The `llm` evaluator: ONE scoring call for one criterion, then maybe boxes.
 
 Each (``llm`` criterion, item) is its own unit of work and its own model
-call: the item's page image (one page, so there is no page to choose) plus
-the text layer ITS ``options.ocr`` produces, truncated to
-CLASSIFIER_TEXT_CHAR_BUDGET, scored on the rubric ITS ``options.hint``
-selects. A model that cannot answer fails this criterion alone.
+call, sent to ITS model — ``options.model``, else the job's ``model``
+(``DocumentContext.default_model``), else the registry default
+(``models.yaml``): the item's page image (one page, so there is no page to
+choose) plus the text layer ITS ``options.ocr`` produces, truncated to that
+model's ``text_char_budget``, scored on the rubric ITS ``options.hint``
+selects. A model that cannot answer fails this criterion alone. The model's
+registry id is ``detail.model``.
+
+A TEXT-ONLY model (``vision: false``) is sent the text layer and no image;
+an item with no text at all fails the unit ("no text available for a
+text-only model"), and the box loop never runs for it (the submit refuses
+boxes on such a model; the gate below is the second line).
 
 When the request lists ``references`` and they hold examples for this
 criterion (``analysis.references.JobReferences.guide``), the one scoring
@@ -12,7 +20,7 @@ call becomes one call PER example group: ``plan_calls`` pairs a PASS-side
 example with a FAIL example in one contrastive call (three images: positive,
 counter-example, candidate) when the model admits three images, else one
 example per call (two images). The calls run concurrently, each taking its
-own CLASSIFIER_MAX_LLM_CALLS slot, and their answers combine by
+own slot of the model's ``max_concurrent``, and their answers combine by
 ``options.reference.combine`` (``any`` by default: the best, with its
 reason). A call that fails is left out and noted; when EVERY call fails the
 unit fails, exactly as a plain scoring call's failure does. What was shown
@@ -33,8 +41,8 @@ and it always sends one image: references do not reach the loop.
     _guided()        — the reference-guided scoring calls, combined.
     _budgeted()      — the text layer truncated to the prompt budget.
 
-Every call goes through ``llm.client``, so the process-wide
-CLASSIFIER_MAX_LLM_CALLS limit bounds them all.
+Every call goes through ``llm.client``, so the model's ``max_concurrent``
+limit bounds them all.
 
 Progress: ``evaluate_with`` checkpoints ``"<name>: scored"`` on the job's
 gauge (``common.jobs.progress``) right after the scoring answer — the first
@@ -64,27 +72,35 @@ from analysis.result_specs import (
     result_spec,
     with_metric,
 )
+from analysis.outcome import EvaluationError
 from api.schemas import CriterionInput
-from config import TEXT_CHAR_BUDGET, VISION_LLM_MAX_IMAGES_PER_PROMPT
 # Modules, not names: a test scripts the model by replacing
-# `llm.client.call_vllm` / `call_vllm_json`, and must reach the one object
-# every caller uses.
+# `llm.client.call_model` / `call_model_json`, and must reach the one object
+# every caller uses; the registry is looked up at call time (tests swap it).
 from llm import boxes as llm_boxes
 from llm import client as llm_client
+from llm import models as llm_models
+from llm.models import ModelSpec
 from llm.prompts import ReferenceExample, build_llm_prompt
 from llm.validate import answer_validator
 from logger import logger
 from metrics import reference_calls_total
 
 
-def _budgeted(text: str) -> tuple[str, bool]:
-    """The text truncated to CLASSIFIER_TEXT_CHAR_BUDGET, and whether it was."""
-    if TEXT_CHAR_BUDGET and len(text) > TEXT_CHAR_BUDGET:
-        logger.info(
-            "llm_eval: truncating %d chars to the %d-char budget", len(text), TEXT_CHAR_BUDGET
-        )
-        return text[:TEXT_CHAR_BUDGET], True
+def _budgeted(text: str, budget: int) -> tuple[str, bool]:
+    """The text truncated to the model's ``text_char_budget``, and whether it was."""
+    if budget and len(text) > budget:
+        logger.info("llm_eval: truncating %d chars to the %d-char budget", len(text), budget)
+        return text[:budget], True
     return text, False
+
+
+def model_for(opts: dict, ctx: DocumentContext) -> ModelSpec:
+    """The registry entry a unit runs on: ``options.model``, else the job's
+    model, else the registry default."""
+    return llm_models.get_registry().resolve(
+        opts.get("model") or getattr(ctx, "default_model", None)
+    )
 
 
 # The detail an `llm` result carries — declared here, beside the code that
@@ -101,7 +117,14 @@ LLM_RESULT = ResultSpec(
             "judgement is not reported", "number",
         ),
         "hint": FieldSpec("The rubric the model was asked to use", "string", stable=True),
-        "image_sent": FieldSpec("Whether the page image was attached", "boolean", stable=True),
+        "model": FieldSpec(
+            "The registry id of the model that answered (GET /models): options.model, "
+            "else the request's model, else the registry default", "string", stable=True,
+        ),
+        "image_sent": FieldSpec(
+            "Whether the page image was attached (never, for a text-only model)", "boolean",
+            stable=True,
+        ),
         "text_sent": FieldSpec(
             "The text attached: `{chars, truncated, budget, source}`", "object",
         ),
@@ -140,29 +163,41 @@ async def evaluate_with(
         llm.client.LLMCallError: The scoring call failed (HTTP error, or no
             parseable answer after MAX_LLM_RETRIES) — for guided calls, every
             one of them did. The scheduler turns it into ``status: "error"``.
-        EvaluationError: A guiding reference was deleted after submit.
+        EvaluationError: A guiding reference was deleted after submit, or the
+            model is text-only and the item has no text at all.
     """
+    spec = model_for(opts, ctx)
     _, layer = await ctx.text_document(opts["ocr"])
-    text, truncated = _budgeted(layer.text)
-    image_b64 = ctx.image_b64()
+    text, truncated = _budgeted(layer.text, spec.text_char_budget)
+    # A text-only model is never shown the page: build_llm_prompt drops the
+    # image for it (and words the prompt for text); `image_b64` here is what
+    # was SENT.
+    page_b64 = ctx.image_b64()
+    image_b64 = page_b64 if spec.vision else None
+    if not spec.vision and not text.strip():
+        raise EvaluationError(
+            f"no text available for a text-only model ({spec.id!r}): this page has no "
+            f"text layer (source {layer.source!r}) — use a vision model, or OCR"
+        )
 
     def prompt(examples: Optional[list[ReferenceExample]] = None) -> dict:
         return build_llm_prompt(
-            image_b64,
+            page_b64,
             name,
             opts["hint"],
             text,
             document_kind=ctx.doc.kind,
             text_truncated=truncated,
             references=examples,
+            model=spec,
         )
 
     reference_detail: Optional[dict] = None
     if reference is not None and reference.applied:
-        answer, reference_detail = await _guided(name, reference, ctx, prompt, image_b64)
+        answer, reference_detail = await _guided(name, reference, ctx, prompt, image_b64, spec)
     else:
-        answer = await llm_client.call_vllm(
-            prompt(), label=f"score/{name}", validator=answer_validator(name),
+        answer = await llm_client.call_model(
+            prompt(), label=f"score/{name}", validator=answer_validator(name), model=spec,
         )
         if reference is not None:
             reference_detail = reference.unapplied_detail()
@@ -183,11 +218,12 @@ async def evaluate_with(
         detail=with_metric(
             {
                 "hint": opts["hint"],
+                "model": spec.id,
                 "image_sent": image_b64 is not None,
                 "text_sent": {
                     "chars": len(text),
                     "truncated": truncated,
-                    "budget": TEXT_CHAR_BUDGET,
+                    "budget": spec.text_char_budget,
                     "source": layer.source,
                 },
                 **({"reference": reference_detail} if reference_detail is not None else {}),
@@ -199,6 +235,11 @@ async def evaluate_with(
     )
 
     if not opts["boxes"]:
+        return outcome
+    if not spec.supports_boxes:
+        # Refused at submit; the second line, should the registry have
+        # changed between the submit and this run.
+        logger.info("llm_eval: '%s' asked for boxes but model %s is text-only", name, spec.id)
         return outcome
     if image_b64 is None or ctx.geometry is None:
         logger.info("llm_eval: '%s' asked for boxes but there is no page image", name)
@@ -219,6 +260,7 @@ async def evaluate_with(
         max_attempts=opts["max_attempts"],
         working_image=ctx.working_image,
         ask_b64=await ctx.ask_image_b64(),
+        model=spec,
     )
     outcome.regions = regions
     outcome.localization = loc.as_dict()
@@ -231,14 +273,16 @@ async def _guided(
     ctx: DocumentContext,
     prompt: Any,
     image_b64: Optional[str],
+    spec: ModelSpec,
 ) -> tuple[dict, dict]:
-    """The reference-guided scoring calls for one unit, combined.
+    """The reference-guided scoring calls for one unit, combined, planned to
+    fit ``spec.max_images_per_prompt``.
 
     Returns ``(answer, detail.reference)``. Raises the first call's error when
     every call failed, and ``EvaluationError`` when a reference is gone.
     """
     examples = guide.examples
-    calls = plan_calls(examples, VISION_LLM_MAX_IMAGES_PER_PROMPT)
+    calls = plan_calls(examples, spec.max_images_per_prompt)
     images = {i: await ctx.references.image_b64(examples[i]) for call in calls for i in call}
 
     def shown(i: int) -> ReferenceExample:
@@ -254,10 +298,11 @@ async def _guided(
 
     results = await asyncio.gather(
         *(
-            llm_client.call_vllm(
+            llm_client.call_model(
                 prompt([shown(i) for i in call]),
                 label=f"score/{name}/ref{k}",
                 validator=answer_validator(name),
+                model=spec,
             )
             for k, call in enumerate(calls)
         ),

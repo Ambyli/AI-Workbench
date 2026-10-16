@@ -33,30 +33,19 @@ def _env_flag(name: str, default: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Upstream vision LLM — vLLM OpenAI-compatible endpoint
+# The models — see models.yaml and llm/models.py, not this file
 # ---------------------------------------------------------------------------
-# Points at the muse-glimmer container (meta-models/Muse-Glimmer-30B, served
-# under alias `muse-glimmer`) on the shared Docker network. VISION_LLM_MODEL is
-# the `model` field sent with every chat completion and must match the
-# server's --served-model-name (or the HF repo id when that flag is unset,
-# e.g. `Qwen/Qwen2.5-VL-7B-Instruct` for vllm-qwen-vl). Change both to swap
-# the vision model or run vLLM on a different host.
-#
-# VISION_LLM_REASONING_STRENGTH is a Muse Glimmer-specific knob: the model's
-# reasoning depth is set by a `Reasoning strength: low|medium|high|xhigh`
-# line in the system prompt (not a chat-template kwarg). Reasoning tokens
-# count against max_tokens, so higher settings need a bigger budget. Set it
-# to an empty string for models that don't understand the directive.
-VISION_LLM_API: str = os.environ.get(
-    "VISION_LLM_API", "http://muse-glimmer:8000/v1/chat/completions"
-)
-VISION_LLM_MODEL: str = os.environ.get("VISION_LLM_MODEL", "muse-glimmer")
-VISION_LLM_REASONING_STRENGTH: str = os.environ.get(
-    "VISION_LLM_REASONING_STRENGTH", "low"
-).strip().lower()
-# Completion budget per scoring call. Includes any reasoning the model emits
-# before the JSON answer, so it is deliberately larger than the JSON alone.
-VISION_LLM_MAX_TOKENS: int = int(os.environ.get("VISION_LLM_MAX_TOKENS", "8192"))
+# Every model a request may select (endpoint, served name, API key variable,
+# vision or text-only, images per prompt, reasoning setting, token budgets
+# per call kind, timeout, concurrency, text budget) is an entry in the
+# checked-in registry ai/classifier/models.yaml, validated at startup by
+# llm/models.py and served as GET /models. The env vars that used to set one
+# global model here (VISION_LLM_API, VISION_LLM_MODEL,
+# CLASSIFIER_REASONING_STRENGTH, VISION_LLM_MAX_TOKENS,
+# VISION_LLM_MAX_IMAGES_PER_PROMPT, CLASSIFIER_MAX_LLM_CALLS,
+# CLASSIFIER_HTTP_TIMEOUT_S, CLASSIFIER_LLM_BBOX_MAX_TOKENS,
+# CLASSIFIER_REFERENCE_SELECT_MAX_TOKENS, CLASSIFIER_TEXT_CHAR_BUDGET) were
+# removed with no fallback; startup warns about any still set.
 
 # ---------------------------------------------------------------------------
 # OpenCV pre-check thresholds
@@ -132,17 +121,15 @@ TEXT_MIN_COUNT_CAP: int = max(1, int(os.environ.get("CLASSIFIER_TEXT_MIN_COUNT_C
 # density at which 8-10pt body text survives OCR; 300 roughly quadruples the
 # pixel count (and the OCR time) for little accuracy gain on clean scans.
 #
-# TEXT_CHAR_BUDGET caps how much extracted text is pasted into the vision
-# prompt. Text past the budget is dropped and the prompt says so. ~60k chars
-# is roughly 15k tokens — sized so a long contract cannot crowd out the image
-# or the response budget (VISION_LLM_MAX_TOKENS).
+# How much extracted text is pasted into a scoring prompt is per MODEL
+# (models.yaml `text_char_budget`): a CPU model's prefill makes 60k characters
+# minutes, where muse-glimmer takes it in seconds.
 #
 # OCR_MIN_NATIVE_CHARS is the "does this page already have a text layer?"
 # threshold used by ocr mode "auto". Below it the page is treated as a scan.
 OCR_ENGINE: str = os.environ.get("CLASSIFIER_OCR_ENGINE", "rapidocr").strip().lower()
 MAX_ITEMS: int = max(1, int(os.environ.get("CLASSIFIER_MAX_ITEMS", "20")))
 PDF_RENDER_DPI: int = max(72, int(os.environ.get("CLASSIFIER_PDF_RENDER_DPI", "150")))
-TEXT_CHAR_BUDGET: int = max(0, int(os.environ.get("CLASSIFIER_TEXT_CHAR_BUDGET", "60000")))
 OCR_MIN_NATIVE_CHARS: int = max(
     0, int(os.environ.get("CLASSIFIER_OCR_MIN_NATIVE_CHARS", "20"))
 )
@@ -272,24 +259,18 @@ DOCUMENT_TEXT_HEADING: str = "DOCUMENT TEXT (extracted, may contain OCR errors)"
 # LLM call behaviour
 # ---------------------------------------------------------------------------
 # MAX_LLM_RETRIES: how many times to retry if the LLM returns unparseable JSON.
-# HTTP_TIMEOUT (CLASSIFIER_HTTP_TIMEOUT_S): seconds one vLLM request may take.
-#   It is httpx's per-read timeout, but responses are NOT streamed — vLLM
-#   sends nothing until the answer is complete — so in practice it bounds the
-#   WHOLE generation: any wait in vLLM's own queue, prefill, every reasoning
-#   token, and the JSON answer. A scoring call that spends most of
-#   VISION_LLM_MAX_TOKENS (8192) reasoning while the model is batching
-#   MAX_LLM_CALLS-many others (plus chat) can run past two minutes, and a
-#   timeout is an HTTP error: NOT retried, it fails that criterion
-#   (call_vllm) or that localisation attempt (call_vllm_json). The wait for
-#   an LLM_CALLS slot is outside it (the slot is taken first). Was a
-#   hard-coded 120; 240 leaves room for the 6-wide batch.
+# The seconds ONE model request may take are per model (models.yaml
+#   `timeout_s`). Responses are NOT streamed, so that bounds the WHOLE
+#   generation — queue, prefill, every reasoning token, the JSON answer — and
+#   a timeout is an HTTP error: NOT retried, it fails that criterion
+#   (call_model) or that localisation attempt (call_model_json). The wait for
+#   the model's concurrency slot is outside it.
 # HTTP_CONNECT_TIMEOUT: seconds to wait while establishing the TCP connection.
 # FETCH_TIMEOUT: seconds to fetch a `type: "url"` document
-#   (analysis/loading.py). Separate from HTTP_TIMEOUT on purpose — a slow
-#   remote file server is not a reason to hold a submit request for four
+#   (analysis/loading.py). Separate from the model timeouts on purpose — a
+#   slow remote file server is not a reason to hold a submit request for four
 #   minutes.
 MAX_LLM_RETRIES: int = 3
-HTTP_TIMEOUT: float = max(1.0, float(os.environ.get("CLASSIFIER_HTTP_TIMEOUT_S", "240")))
 HTTP_CONNECT_TIMEOUT: float = 10.0
 FETCH_TIMEOUT: float = 120.0
 
@@ -361,22 +342,17 @@ JOB_TTL_HOURS: int = int(os.environ.get("JOB_TTL_HOURS", "24"))
 #   MAX_UNITS_PER_JOB     units ONE job evaluates at once. A job with ten
 #                         criteria on twenty pages still holds only this many
 #                         in flight. A unit waiting on its depends_on holds no
-#                         slot. Defaults to MAX_LLM_CALLS' 6, so a lone job
-#                         can fill every model slot the classifier has (it
-#                         was 2, then 4). Lower it to keep one big job from
-#                         crowding out the others.
-#   MAX_LLM_CALLS         model calls in flight across ALL jobs, every call
-#                         type — scoring, box ask, refine, verify. Acquired in
-#                         llm/client.py around the HTTP request itself, so no
-#                         call path can go around it. Size it to the vision
-#                         model: muse-glimmer schedules 8 (--max-num-seqs 8)
-#                         and the classifier takes 6, leaving 2 for the
-#                         LiteLLM chat chains muse-glimmer also serves — their
-#                         overflow hook spills chat to the next order (and in
-#                         the end to Claude) once vLLM's waiting queue stays
-#                         non-empty, so filling all 8 here would push chat
-#                         off the local model.
-#   OCR_WORKERS           OCR passes at once. Each is one ONNX inference in a
+#                         slot. Defaults to the default model's 6
+#                         max_concurrent, so a lone job can fill every slot
+#                         that model has (it was 2, then 4). Lower it to keep
+#                         one big job from crowding out the others.
+#   model calls           requests in flight to ONE model, across ALL jobs and
+#                         every call type — scoring, box ask, refine, verify,
+#                         select, describe. Per model: models.yaml
+#                         `max_concurrent`, one ConcurrencyLimit each,
+#                         acquired in llm/client.py around the HTTP request
+#                         itself, so no call path can go around it.
+#   OCR_WORKERS          OCR passes at once. Each is one ONNX inference in a
 #                         worker thread; the engine is shared.
 #
 # PAYLOAD_DIR holds one JSON file per queued job (document bytes + the
@@ -391,7 +367,6 @@ MAX_CONCURRENT: int = max(1, int(os.environ.get("CLASSIFIER_MAX_CONCURRENT", "4"
 MAX_UNITS_PER_JOB: int = max(
     1, int(os.environ.get("CLASSIFIER_MAX_UNITS_PER_JOB", "6"))
 )
-MAX_LLM_CALLS: int = max(1, int(os.environ.get("CLASSIFIER_MAX_LLM_CALLS", "6")))
 OCR_WORKERS: int = max(1, int(os.environ.get("CLASSIFIER_OCR_WORKERS", "4")))
 PAYLOAD_DIR: str = os.environ.get(
     "PAYLOAD_DIR", os.path.join(DATA_DIR, "payloads")
@@ -410,12 +385,18 @@ PROGRESS_FLUSH_INTERVAL_S: float = max(
     0.2, float(os.environ.get("CLASSIFIER_PROGRESS_FLUSH_INTERVAL_S", "1"))
 )
 
-# The one asyncpg pool's ceiling (db.py). Every worker can hold a connection
-# for a claim or a write, every model call writes one llm_calls row after its
-# slot is released, and the HTTP routes (polls, /references, /usage) need a
-# few more on top — so the workers, plus the model slots, plus headroom. A
-# pool that is too small never errors; a caller just waits for a connection.
-DB_POOL_MAX: int = MAX_CONCURRENT + MAX_LLM_CALLS + 8
+# The one asyncpg pool's ceiling is computed in db.py (``pool_max()``):
+# MAX_CONCURRENT + the model registry's Σ max_concurrent + DB_POOL_HEADROOM —
+# every worker, every model slot (each call writes one llm_calls row), plus
+# headroom. It needs the registry, which config.py does not load.
+#
+# The headroom is the connections that are neither a worker nor a model slot:
+# the HTTP routes (GET /jobs polls, /references, /usage), each running job's
+# progress flush, and the artifact sweeper. A round number, not a measured
+# one: a pool that is too small never errors (a caller waits for a
+# connection), and the whole ceiling sits far under Postgres's default
+# max_connections of 100 — classifier-db's only client is this service.
+DB_POOL_HEADROOM: int = 8
 
 # ---------------------------------------------------------------------------
 # Region layers and the artifact directory (regions/, api/artifacts.py)
@@ -643,10 +624,9 @@ DETECTOR_STRONG_SCORE: float = 0.5
 # Under the floor it is a speck the crop cannot confirm; over the ceiling it
 # is the whole frame, which is a refusal dressed up as an answer.
 #
-# LLM_BBOX_MAX_TOKENS is the completion budget for ONE ask or verify call.
-# Muse Glimmer's reasoning tokens count against it before the JSON answer
-# (the `Reasoning strength` system line still applies), so it is deliberately
-# larger than the ~60 tokens of JSON it has to produce.
+# The completion budget for ONE ask / refine / verify call is per model
+# (models.yaml `max_tokens.box`): a reasoning model spends it before the ~60
+# tokens of JSON it has to produce, so it is deliberately larger than that.
 #
 # LLM_BBOX_CROP_PAD widens the crop by this fraction of the box on each side
 # before the verify call, clamped to the page. A box that clips the feature is
@@ -666,9 +646,6 @@ LLM_BBOX_MIN_AREA: float = float(
 )
 LLM_BBOX_MAX_AREA: float = float(
     os.environ.get("CLASSIFIER_LLM_BBOX_MAX_AREA", "0.95")
-)
-LLM_BBOX_MAX_TOKENS: int = max(
-    64, int(os.environ.get("CLASSIFIER_LLM_BBOX_MAX_TOKENS", "1024"))
 )
 LLM_BBOX_CROP_PAD: float = max(
     0.0, float(os.environ.get("CLASSIFIER_LLM_BBOX_CROP_PAD", "0.25"))
@@ -732,11 +709,12 @@ LLM_BBOX_GRID: float = 1000.0
 # ready and failed alike); POST /references past it is a 409. With no TTL the
 # count cap is the only thing bounding the disk this root can take.
 #
-# VISION_LLM_MAX_IMAGES_PER_PROMPT is what the vision model admits per
-# request (muse-glimmer's --limit-mm-per-prompt). 3 lets one call carry a
-# PASS example, a FAIL example and the candidate; 2 sends each example in its
-# own call; 1 means the model takes one image, and an /assess that asks for
-# references is refused at submit.
+# How many images one request may carry is per model (models.yaml
+# `max_images_per_prompt`, which must match the server's
+# --limit-mm-per-prompt). 3 lets one call carry a PASS example, a FAIL
+# example and the candidate; 2 sends each example in its own call; 1 (or a
+# text-only model) means an /assess whose criteria would use references on it
+# is refused at submit.
 #
 # REFERENCE_MAX_PER_REQUEST bounds the explicit ids one /assess may list;
 # REFERENCE_MAX_PER_CRITERION bounds how many examples (and so how many
@@ -746,7 +724,8 @@ LLM_BBOX_GRID: float = 1000.0
 # (newest first; `pool_truncated` says when it cut). The selection call puts
 # a text catalogue of the pool beside the candidate page and asks which
 # apply; REFERENCE_AUTO_MIN_CONFIDENCE (0-100) is the line a match must clear
-# to be used, and REFERENCE_SELECT_MAX_TOKENS its completion budget.
+# to be used; the call's completion budget is the job model's
+# `max_tokens.select`.
 #
 # REFERENCE_POSITION_* drive the opt-in position check (`options.reference.
 # position: "check"` on an llm criterion with boxes): the candidate's located
@@ -765,9 +744,6 @@ REFERENCE_DIR: str = os.environ.get(
 REFERENCE_MAX_COUNT: int = max(
     1, int(os.environ.get("CLASSIFIER_REFERENCE_MAX_COUNT", "500"))
 )
-VISION_LLM_MAX_IMAGES_PER_PROMPT: int = max(
-    1, int(os.environ.get("VISION_LLM_MAX_IMAGES_PER_PROMPT", "3"))
-)
 REFERENCE_MAX_PER_REQUEST: int = max(
     1, int(os.environ.get("CLASSIFIER_REFERENCE_MAX_PER_REQUEST", "10"))
 )
@@ -779,9 +755,6 @@ REFERENCE_AUTO_POOL_MAX: int = max(
 )
 REFERENCE_AUTO_MIN_CONFIDENCE: int = max(
     0, min(100, int(os.environ.get("CLASSIFIER_REFERENCE_AUTO_MIN_CONFIDENCE", "60")))
-)
-REFERENCE_SELECT_MAX_TOKENS: int = max(
-    64, int(os.environ.get("CLASSIFIER_REFERENCE_SELECT_MAX_TOKENS", "2048"))
 )
 REFERENCE_POSITION_MIN_IOU: float = max(
     0.0, min(1.0, float(os.environ.get("CLASSIFIER_REFERENCE_POSITION_MIN_IOU", "0.3")))
@@ -798,12 +771,10 @@ REFERENCE_DESCRIPTION_MAX_CHARS: int = max(
 )
 
 # Code constants for references (not env knobs). The describe call's
-# completion budget: the answer is ~one paragraph of JSON, the rest is the
-# model's reasoning. Title / tag bounds keep a catalogue line short.
-# REFERENCE_JPEG_QUALITY is for page.jpg / working.jpg / the composites: a
-# composite is what the model will SEE as the example, so it is kept higher
-# than a preview.
-REFERENCE_DESCRIBE_MAX_TOKENS: int = 1024
+# completion budget is per model (models.yaml `max_tokens.describe`). Title /
+# tag bounds keep a catalogue line short. REFERENCE_JPEG_QUALITY is for
+# page.jpg / working.jpg / the composites: a composite is what the model will
+# SEE as the example, so it is kept higher than a preview.
 REFERENCE_TITLE_MAX_CHARS: int = 120
 REFERENCE_MAX_TAGS: int = 20
 REFERENCE_TAG_MAX_CHARS: int = 40

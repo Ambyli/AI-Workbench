@@ -48,6 +48,7 @@ from analysis.outcome import Outcome, skipped
 from api.schemas import CriterionInput
 from common.vision import Region
 from llm import client as llm_client
+from llm.models import get_registry
 
 HERE = pathlib.Path(__file__).resolve().parent
 DOCS = HERE / "documents"
@@ -573,7 +574,7 @@ def test_one_failed_unit_fails_alone_and_the_job_is_incomplete(monkeypatch):
 def test_the_unit_cap_bounds_a_job(monkeypatch):
     fake = Model(delay=0.05)
     monkeypatch.setattr(llm_client, "_send", fake)
-    monkeypatch.setattr(llm_client.LLM_CALLS, "limit", 16)
+    monkeypatch.setattr(get_registry().default.limit, "limit", 16)
     criteria = [CriterionInput(name=f"c{i}", type="llm") for i in range(2)]
     monkeypatch.setattr(scheduler, "MAX_UNITS_PER_JOB", 2)
     _analyze(_txt_docs("a", "b", "c"), criteria)

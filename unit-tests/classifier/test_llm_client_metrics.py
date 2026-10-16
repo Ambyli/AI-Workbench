@@ -8,9 +8,9 @@ timer, the usage counters, the log line) runs for real.
     kind set, and anything else to ``other`` — never a criterion name;
   * ``usage_counts`` reads vLLM's ``usage`` and never raises on a missing
     or odd one;
-  * a successful request adds its tokens to the four per-kind counters and
-    observes ``classifier_llm_call_seconds{kind, outcome="ok"}``; a failed
-    one observes ``outcome="error"`` and still raises;
+  * a successful request adds its tokens to the four per-kind, per-model
+    counters and observes ``classifier_llm_call_seconds{kind, outcome="ok",
+    model}``; a failed one observes ``outcome="error"`` and still raises;
   * one INFO line per request, retries included.
 """
 
@@ -24,9 +24,13 @@ import pytest
 from prometheus_client import REGISTRY
 
 import llm.client as llm_client
+from llm.models import get_registry
 
 
 def _sample(name: str, **labels) -> float:
+    """A metric sample; ``model`` defaults to the registry default — the
+    model every call below goes to (none passes one)."""
+    labels.setdefault("model", get_registry().default_id)
     return REGISTRY.get_sample_value(name, labels) or 0.0
 
 
@@ -111,7 +115,7 @@ def test_a_scoring_call_records_tokens_latency_and_one_log_line(monkeypatch, cap
         "count": _sample("classifier_llm_call_seconds_count", kind="score", outcome="ok"),
     }
     with caplog.at_level(logging.INFO, logger=llm_client.logger.name):
-        answer = asyncio.run(llm_client.call_vllm({}, label="score/has a house"))
+        answer = asyncio.run(llm_client.call_model({}, label="score/has a house"))
     assert answer == {"score": 9}
 
     assert _sample("classifier_llm_prompt_tokens_total", kind="score") - before["prompt"] == 1200
@@ -126,6 +130,7 @@ def test_a_scoring_call_records_tokens_latency_and_one_log_line(monkeypatch, cap
     lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("llm call ")]
     assert len(lines) == 1
     assert "kind=score" in lines[0] and "label=score/has a house" in lines[0]
+    assert f"model={get_registry().default_id}" in lines[0]
     assert "prompt=1200 cached=1024 completion=300 reasoning=250" in lines[0]
 
 
@@ -136,7 +141,7 @@ def test_no_usage_records_no_tokens_and_does_not_raise(monkeypatch):
     monkeypatch.setattr(llm_client, "_send", send)
     before = _sample("classifier_llm_prompt_tokens_total", kind="ask")
     count = _sample("classifier_llm_call_seconds_count", kind="ask", outcome="ok")
-    assert asyncio.run(llm_client.call_vllm_json({}, label="bbox/x#1")) == {"bbox": None}
+    assert asyncio.run(llm_client.call_model_json({}, label="bbox/x#1")) == {"bbox": None}
     assert _sample("classifier_llm_prompt_tokens_total", kind="ask") == before
     assert _sample("classifier_llm_call_seconds_count", kind="ask", outcome="ok") - count == 1
 
@@ -152,7 +157,7 @@ def test_every_retry_is_its_own_request(monkeypatch, caplog):
     before = _sample("classifier_llm_completion_tokens_total", kind="verify")
     count = _sample("classifier_llm_call_seconds_count", kind="verify", outcome="ok")
     with caplog.at_level(logging.INFO, logger=llm_client.logger.name):
-        assert asyncio.run(llm_client.call_vllm_json({}, label="verify/x#1")) == {"score": 3}
+        assert asyncio.run(llm_client.call_model_json({}, label="verify/x#1")) == {"score": 3}
     # The failed parse still spent tokens; both requests are counted.
     assert _sample("classifier_llm_completion_tokens_total", kind="verify") - before == 9
     assert _sample("classifier_llm_call_seconds_count", kind="verify", outcome="ok") - count == 2
@@ -167,6 +172,6 @@ def test_an_http_error_is_observed_as_error_and_still_fails_the_call(monkeypatch
     monkeypatch.setattr(llm_client, "_send", down)
     count = _sample("classifier_llm_call_seconds_count", kind="describe", outcome="error")
     with pytest.raises(llm_client.LLMCallError):
-        asyncio.run(llm_client.call_vllm({}, label="reference/describe"))
+        asyncio.run(llm_client.call_model({}, label="reference/describe"))
     assert (_sample("classifier_llm_call_seconds_count", kind="describe", outcome="error")
             - count) == 1

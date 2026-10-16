@@ -23,7 +23,8 @@ The proxy is reachable at `http://localhost:4001`. Configuration is loaded from 
 - `HF_TOKEN` from `.env` — HuggingFace token for gated model downloads
 - `LITELLM_DATABASE_URL` from `.env` — PostgreSQL connection string
 - `litellm_config.yaml` — proxy config with model definitions and routing rules
-- `overflow.py` — the chain-alias overflow hook and the `auto` footer, mounted at `/app/overflow.py` beside the config (see [§ Chain aliases and the overflow hook](#chain-aliases-and-the-overflow-hook) and [§ The `auto` footer](#the-auto-footer))
+- `hooks/` — this deployment's proxy hooks (the chain-alias overflow hook, the `auto` footer, the code-tool remap), mounted read-only at `/app/hooks`, with the two stdlib-only parts of `shared/common` they import mounted at `/app/common` (see [§ The hooks package](#the-hooks-package))
+- `overflow.py` — the shim LiteLLM loads (`callbacks: ["overflow.handler"]`), mounted at `/app/overflow.py` beside the config; it imports `hooks` and builds `handler`
 
 ### Health checks
 
@@ -197,7 +198,7 @@ Every deployment calls its backend **directly** (`api_base: http://qwen3.8-solo:
 **How a request gets there.** Two ways:
 
 1. The semantic router's `code` decision — `code_kw`, a set of RE2 regexes over the latest user message ([SEMANTIC_ROUTER.md § Decisions](../semantic-router/SEMANTIC_ROUTER.md#decisions)).
-2. **The code-tool remap** in `overflow.py`'s `async_pre_call_hook`. The router reads only the latest user message and cannot see tool *names* — only that tools exist — so a coding turn like "Looks the same" lands on `local-general`. When the conversation in a request for **`local-general`** contains a **call** to a tool whose function name matches `CODE_ROUTE_TOOL_REGEX` **in full** (`re.fullmatch`), the hook rewrites `data["model"]` to `local-code`. A call is an assistant's `tool_calls[].function.name` in the history — what Open WebUI replays from earlier rounds and turns — and also a legacy `function_call`, an Anthropic `tool_use` block, or a named `tool` / `function` result (`overflow.called_tool_names`). Tools that are only **offered** in `tools` do not count, so a chat with the sandbox attached but never used stays on `local-general`. The proxy routes on the rewritten model (`common_request_processing.py`: `pre_call_hook` → `route_request`), and the Router sets `metadata.model_group` from it, so the overflow filter, the spend log and the `auto` footer (`· local-code`) all see `local-code`.
+2. **The code-tool remap** in the hooks' `async_pre_call_hook` (`hooks/routing/code_route.py`). The router reads only the latest user message and cannot see tool *names* — only that tools exist — so a coding turn like "Looks the same" lands on `local-general`. When the conversation in a request for **`local-general`** contains a **call** to a tool whose function name matches `CODE_ROUTE_TOOL_REGEX` **in full** (`re.fullmatch`), the hook rewrites `data["model"]` to `local-code`. A call is an assistant's `tool_calls[].function.name` in the history — what Open WebUI replays from earlier rounds and turns — and also a legacy `function_call`, an Anthropic `tool_use` block, or a named `tool` / `function` result (`common.conversation.called_tool_names`). Tools that are only **offered** in `tools` do not count, so a chat with the sandbox attached but never used stays on `local-general`. The proxy routes on the rewritten model (`common_request_processing.py`: `pre_call_hook` → `route_request`), and the Router sets `metadata.model_group` from it, so the overflow filter, the spend log and the `auto` footer (`· local-code`) all see `local-code`.
 
 | `CODE_ROUTE_TOOL_REGEX` | Effect |
 |---|---|
@@ -209,7 +210,7 @@ The default matches the tool names Open WebUI v0.11.4 actually sends. The sandbo
 
 - **Scope.** Only `local-general` is ever remapped — router-originated or a direct call. `local-private` (PII routing stays the router's decision), `local-reasoning`, `local-code`, `auto` and the concrete aliases are never touched. The remap runs after key auth: a key allowed `local-general` but not `local-code` is still served by `local-code` (same models). `SEMANTIC_ROUTER_LITELLM_KEY` already has all four chains.
 - **Log.** One `[overflow] [route] local-general -> local-code (<reason>)` line per remap — `called sandbox-mcp_exec in this exchange`, or `called sandbox-mcp_write_files 2 exchange(s) ago; 1/3 irrelevant since`, or `message matches code_kw …` — and one `[route] local-general stays (cooldown: 3/3 irrelevant exchanges since the last one that …)` when a chat that was code has cooled down. They are throttled to one per kind (this exchange / an earlier one / cooldown) per 30 s with a `(+N similar)` count; `handler.state()["stats"]` counts `code_routes`, `code_route_cooldowns` and `code_route_errors`. **Never throws:** on any error the request is left exactly as it came in and a warning is logged.
-- **The cooldown: when it starts and when it lets go.** The hook splits the history into **exchanges**, one per user message (the message plus every model round it started). An exchange is **relevant** when the model called a `CODE_ROUTE_TOOL_REGEX` tool during it, or when its user message matches the semantic router's own `code_kw` signal. LiteLLM reads that signal from the router's `config.yaml`, mounted read-only at `/app/semantic-router-config.yaml` (`CODE_ROUTE_ROUTER_CONFIG`), and compiles it with the Go router's rules (`method: regex` = raw pattern, otherwise a whole literal word; ASCII `\b`), so the two never disagree. A `local-general` request moves to `local-code` while the **current** exchange is relevant, or while fewer than `CODE_ROUTE_COOLDOWN` (default **3**) irrelevant exchanges in a row followed the last relevant one. Build a calculator, then ask about the weather: weather questions 1–3 are still `local-code`, the 4th is `local-general`. The moment an exchange is relevant again (a `code_kw` message, or the model calls the sandbox mid-exchange — every round after that call is `local-code`) the count restarts. Irrelevant tool calls (`search_web`, a generic `read_file`) don't count. Attaching the sandbox to a model card (as `office-model` does) changes nothing until the model actually calls it. Everything is recomputed from the request's history: there is no per-chat state, so both copies during a swap, and a restart, agree; Open WebUI's context compaction summarising old exchanges away also lets a chat cool down.
+- **The cooldown: when it starts and when it lets go.** The hook splits the history into **exchanges**, one per user message (the message plus every model round it started). An exchange is **relevant** when the model called a `CODE_ROUTE_TOOL_REGEX` tool during it, or when its user message matches the semantic router's own `code_kw` signal. LiteLLM reads that signal from the router's `config.yaml`, mounted read-only at `/app/semantic-router-config.yaml` (`CODE_ROUTE_ROUTER_CONFIG`), and compiles it with the Go router's rules (`common.keywordmatch`: `method: regex` = raw pattern, otherwise a whole literal word; ASCII `\b`), so the two never disagree. A `local-general` request moves to `local-code` while the **current** exchange is relevant, or while fewer than `CODE_ROUTE_COOLDOWN` (default **3**) irrelevant exchanges in a row followed the last relevant one. Build a calculator, then ask about the weather: weather questions 1–3 are still `local-code`, the 4th is `local-general`. The moment an exchange is relevant again (a `code_kw` message, or the model calls the sandbox mid-exchange — every round after that call is `local-code`) the count restarts. Irrelevant tool calls (`search_web`, a generic `read_file`) don't count. Attaching the sandbox to a model card (as `office-model` does) changes nothing until the model actually calls it. Everything is recomputed from the request's history: there is no per-chat state, so both copies during a swap, and a restart, agree; Open WebUI's context compaction summarising old exchanges away also lets a chat cool down.
 
   | `CODE_ROUTE_COOLDOWN` | Effect |
   |---|---|
@@ -260,7 +261,7 @@ curl -s muse-glimmer:8000/tokenize -H 'content-type: application/json' \
 `router.py::async_get_healthy_deployments` (10606-10740) filters in this order:
 
 1. **cooldown** — deployments LiteLLM has cooled down after failures are removed;
-2. **overflow hook** — `async_callback_filter_deployments` (10686) calls `ai/litellm/overflow.py`, which first drops a local deployment the prompt does not fit (**context fit**, on vLLM's exact `/tokenize` count), then one that is busy or down. This is the real context gate, and why `max_input_tokens` is set per deployment: a prompt over 114688 tokens skips `qwen3.8-solo` for `muse-glimmer` (245760) with no error and no fallback hop;
+2. **overflow hook** — `async_callback_filter_deployments` (10686) calls `Handler.async_filter_deployments` (`hooks/overflow/filter.py`), which first drops a local deployment the prompt does not fit (**context fit**, on vLLM's exact `/tokenize` count), then one that is busy or down. This is the real context gate, and why `max_input_tokens` is set per deployment: a prompt over 114688 tokens skips `qwen3.8-solo` for `muse-glimmer` (245760) with no error and no fallback hop;
 3. **pre-call context check** (10694, `enable_pre_call_checks: true`) — drops any deployment whose `model_info.max_input_tokens` is smaller than the prompt **as LiteLLM counts it**: `litellm.token_counter(messages=messages)` (`router.py:10147`) — OpenAI's tiktoken, over `messages` only, with no tool definitions. That undercounts Qwen prompts, and Open WebUI's native tool calling sends the tool definitions on every turn: on 2026-10-12 a prompt vLLM counted at 122,881 tokens passed this check for `qwen3.8-solo` (114688) and was refused by vLLM. It stays on as the backstop for whatever the hook could not measure;
 4. **order filter** (10716-10720) — keeps only the **lowest** `order` left.
 
@@ -268,9 +269,9 @@ A deployment that fails *at call time* (connection refused, 5xx) is retried `num
 
 `local-private` has no Claude deployment and no entry in `fallbacks` or `context_window_fallbacks`. Do not add one. `auto`'s two fallback entries point at `local-private`, because when the router is down nothing has checked the prompt for PII.
 
-#### The overflow hook (`overflow.py`)
+#### The overflow hook
 
-Mounted at `/app/overflow.py` next to `/app/config.yaml` and registered with `litellm_settings.callbacks: ["overflow.handler"]` (LiteLLM resolves the module relative to the config file's directory, `proxy/types_utils/utils.py:30-56`). It:
+`hooks/overflow/` — `filter.py` (the rule below), `context_fit.py`, `poller.py`, `state.py` (`BackendState`), `vllm.py` (URLs, metric parsing, the httpx clients) — run from `Handler.async_filter_deployments`; how LiteLLM loads it is in [§ The hooks package](#the-hooks-package). It:
 
 - **polls** `<api_base minus /v1>/metrics` on every local backend it has seen in a chain, **concurrently**, about once a second, and sums `vllm:num_requests_waiting` / `vllm:num_requests_running` across label sets;
 - marks a backend **busy** once `waiting > 0` has held for `OVERFLOW_BUSY_AFTER_S`, and clears it once `waiting == 0` has held for `OVERFLOW_IDLE_AFTER_S`;
@@ -328,7 +329,7 @@ Every chain deployment sets **both** `stream_timeout` and `timeout` — 240 s on
 make up litellm
 ```
 
-`litellm_config.yaml` and `overflow.py` are single-file bind mounts and LiteLLM reads both only at startup. `make up litellm` hashes their *content* into the container name (`litellm-<hash>`, see [EDGE.md § The swap](../edge/EDGE.md#the-swap)), so any edit produces a new name: a fresh copy starts beside the running one — reading the current files — and the old one retires once the new one is healthy, with no downtime (in-flight chats get the 900 s `stop_grace_period`). `docker restart` keeps the original mount, so an editor or `git pull` that replaced the file (new inode) leaves a restarted container reading the old one — use `make up litellm`. If the new copy fails its healthcheck (an `overflow` import error, a YAML typo), `make up` prints its last 100 log lines, removes it and leaves the old copy serving; otherwise check `make logs litellm` for warnings.
+`litellm_config.yaml` and `overflow.py` are single-file bind mounts, `hooks/` and the two `shared/common` parts are directory mounts, and LiteLLM reads all of them only at startup. `make up litellm` hashes their *content* into the container name (`litellm-<hash>`, see [EDGE.md § The swap](../edge/EDGE.md#the-swap)), so any edit produces a new name: a fresh copy starts beside the running one — reading the current files — and the old one retires once the new one is healthy, with no downtime (in-flight chats get the 900 s `stop_grace_period`). `docker restart` keeps the original single-file mounts, so an editor or `git pull` that replaced such a file (new inode) leaves a restarted container reading the old one — use `make up litellm`. If the new copy fails its healthcheck (a `hooks` import error, a YAML typo), `make up` prints its last 100 log lines, removes it and leaves the old copy serving; otherwise check `make logs litellm` for warnings.
 
 #### Seeing spills
 
@@ -345,16 +346,11 @@ make up litellm
 4. Nothing to configure in the hook — it learns backends from the deployments it sees. A non-vLLM local backend (llama.cpp) has no `vllm:num_requests_waiting`; the hook then treats it as **unknown** and never spills on its account, only failing over on real errors.
 5. Apply it with the recreate in [§ Applying a chain or hook change](#applying-a-chain-or-hook-change) (not `make up litellm`), then add a Postman item under **Chain aliases** in `litellm.postman_collection.json`.
 
-The overflow hook's unit tests live in [`unit-tests/litellm/test_overflow.py`](../../unit-tests/litellm/test_overflow.py) and drive the real v1.95.0 `Router` when `litellm` is installed:
-
-```bash
-uv venv /tmp/llvenv && UV_LINK_MODE=copy uv pip install --python /tmp/llvenv litellm==1.95.0 pytest
-/tmp/llvenv/bin/python -m pytest unit-tests/litellm -q -p no:cacheprovider
-```
+The overflow hook's unit tests live in [`unit-tests/litellm/test_overflow.py`](../../unit-tests/litellm/test_overflow.py) and drive the real v1.95.0 `Router` when `litellm` is installed; [§ The hooks package](#the-hooks-package) has the venv recipe.
 
 ### The `auto` footer
 
-When — and only when — a client calls model **`auto`** (the semantic router), the same handler in `overflow.py` appends a footer to the assistant message naming the backend that actually answered:
+When — and only when — a client calls model **`auto`** (the semantic router), the same handler (`hooks/footer/`) appends a footer to the assistant message naming the backend that actually answered:
 
 ```
 <answer>
@@ -376,7 +372,7 @@ When — and only when — a client calls model **`auto`** (the semantic router)
 
 **How it is derived (LiteLLM v1.95.0).** The inner LiteLLM — the one serving the chain — puts `x-litellm-model-id`, `x-litellm-model-name` (`common_request_processing.py:938-948`) and `x-litellm-model-group` (`router.py:9388`) on its response; Envoy passes them through and the router adds `x-vsr-selected-decision` / `x-vsr-selected-model` (`processor_res_header_mutation.go:249-261`). The outer openai provider keeps every upstream header as `llm_provider-<name>` in `_hidden_params["additional_headers"]` — on the response for JSON (`core_helpers.py:318-319`) and on the stream wrapper for SSE (`openai.py:1072-1079` → `streaming_handler.py:164-171`; both regression-tested against a stand-in upstream). The model id is mapped back to its deployment through the proxy's own router (`llm_router.get_deployment`, `router.py:8577`), because inner and outer are the same proxy; it is the id of the deployment that actually answered, also after an in-group order fallback. The name / group headers are the fallback. **Router bypassed** is read from the outer deployment the proxy stores in `data["deployment"]` (`common_request_processing.py:1707`, resolved from the response's model id): its model group is `local-private`, not `auto` (the outer router also reports `x-litellm-model-group: local-private` and `x-litellm-attempted-fallbacks: 1`). `data["model"]` itself stays `auto` — `route_request` unpacks `**data` into the router (`route_llm_request.py:404`). Busy / down come from this handler's own backend state for the chain, so they are an approximation of *why* Claude answered, not a record.
 
-**Hooks.** Three methods defined directly in the `OverflowHandler` class body — not on a mixin, because the proxy activates `async_post_call_streaming_iterator_hook` and `async_pre_call_hook` only when the name is in the leaf class's `__dict__` (`proxy/utils.py:1718-1745`):
+**Hooks.** Three methods defined directly in the `Handler` class body (`hooks/handler.py`) — not on a mixin, because the proxy activates `async_post_call_streaming_iterator_hook` and `async_pre_call_hook` only when the name is in the leaf class's `__dict__` (`proxy/utils.py:1718-1745`). Each delegates: to `AutoFooter` (`hooks/footer/auto.py`) and, for streams, `FooterStream` (`hooks/footer/stream.py`):
 
 - `async_post_call_success_hook` (non-streaming; `proxy/utils.py:2404-2410` keeps a non-`None` return) appends the footer to each qualifying `message.content`;
 - `async_post_call_streaming_iterator_hook` (the proxy wraps the stream once, `proxy_server.py:7413-7419`, and writes `data: [DONE]` after it ends) yields the footer as an extra `delta.content` chunk right before each qualifying choice's finish chunk — or appends it to the finish chunk's own content when that chunk carries text, so it never lands in front of the last words. A stream that ends without a finish chunk gets it last;
@@ -392,7 +388,7 @@ When — and only when — a client calls model **`auto`** (the semantic router)
 - **Never throws:** any internal error returns the response or stream unmodified. `handler.state()["stats"]` counts `footers`, `footers_stripped` and `footer_errors`.
 - The footer is presentation only: spend logs, token counts and cost are those of the answer without it.
 
-**Toggle.** `AUTO_FOOTER_ENABLED` (default `true`; accepts `true`/`false`/`1`/`0`, also `yes`/`no`/`on`/`off`), passed through the compose `environment:` like the `OVERFLOW_*` variables. Off disables all three footer hooks, stripping included (the code-tool remap keeps working; `CODE_ROUTE_TOOL_REGEX=` empty is its own off switch). A change to `overflow.py` itself needs the recreate in [§ Applying a chain or hook change](#applying-a-chain-or-hook-change).
+**Toggle.** `AUTO_FOOTER_ENABLED` (default `true`; accepts `true`/`false`/`1`/`0`, also `yes`/`no`/`on`/`off`), passed through the compose `environment:` like the `OVERFLOW_*` variables. Off disables all three footer hooks, stripping included (the code-tool remap keeps working; `CODE_ROUTE_TOOL_REGEX=` empty is its own off switch). A change to the hooks' code is applied as in [§ Applying a chain or hook change](#applying-a-chain-or-hook-change).
 
 **Verifying.**
 
@@ -410,3 +406,60 @@ curl -siN http://localhost:4001/v1/chat/completions \
 ```
 
 Then confirm the negatives: the same call with `"model":"local-general"` has no footer, and a new Open WebUI chat's title, tags and follow-ups carry none. Unit tests: [`unit-tests/litellm/test_auto_footer.py`](../../unit-tests/litellm/test_auto_footer.py), run the same way as the overflow tests (the proxy-plumbing tests additionally need `litellm[proxy]==1.95.0`).
+
+### The hooks package
+
+`litellm_settings.callbacks: ["overflow.handler"]` loads one object, `handler`: a `Handler` doing three jobs.
+
+| Path | What |
+|---|---|
+| `overflow.py` | the shim LiteLLM loads: imports `hooks`, builds `handler`, exports nothing else |
+| `hooks/handler.py` | `Handler(CustomLogger)` — the four hooks LiteLLM dispatches on, each only delegating; `state()` |
+| `hooks/settings.py` | every environment variable the hooks read (`OVERFLOW_*`, `AUTO_FOOTER_ENABLED`, `CODE_ROUTE_*`), read once at import |
+| `hooks/log.py` | the `zeo.overflow` logger (the `[overflow]` lines) and the 30 s per-key throttle |
+| `hooks/deployments.py` | reading LiteLLM deployment dicts (`api_base`, `order`, chain detection) |
+| `hooks/overflow/` | job 1, [§ The overflow hook](#the-overflow-hook) |
+| `hooks/footer/` | job 2, [§ The `auto` footer](#the-auto-footer) |
+| `hooks/routing/code_route.py` | job 3, the code-tool remap ([§ local-code: what it adds](#local-code-what-it-adds)) |
+| `shared/common/src/common/conversation`, `…/keywordmatch` | shared, stdlib-only: chat-history helpers and the Go-compatible keyword-rule compiler |
+
+**How it loads.** LiteLLM's `get_instance_fn` (`proxy/types_utils/utils.py:8-61`, identical in 1.93 and 1.95) maps `overflow.handler` to `<config dir>/overflow.py` and loads it with `spec_from_file_location` + `exec_module`: it never registers the file in `sys.modules`, never adds `/app` to `sys.path` for it, and cannot load a package. Code loaded that way cannot use relative imports, and `@dataclass` crashes on it at proxy start (`'NoneType' object has no attribute '__dict__'`). So `overflow.py` is only a shim. It puts its own directory first on `sys.path`, imports `hooks.handler` the normal way, takes the entry back out, and builds `handler`. Because the import is normal, `hooks` and every submodule are in `sys.modules`, relative imports work, and `@dataclass` is safe (`BackendState` is one).
+
+Taking the entry back out matters. The proxy CLI already *appends* its working directory (`/app`) to `sys.path`, and that low-precedence entry is how `import enterprise` finds the image's `/app/enterprise`. Leaving `/app` first would let anything under `/app` shadow an installed package for the rest of the process. The shim also refuses to load, with an `ImportError` naming the file, if a different top-level `hooks` was imported first. Neither `litellm[proxy]==1.95.0` nor the upstream Dockerfile's `/app` (`.venv`, `docker/`, `enterprise/`, …) has a top-level `hooks` or `common` (the second box check below confirms it for the running image); LiteLLM's own `litellm.proxy.hooks` is a subpackage, always imported by its full name.
+
+**`common` in the container.** The image is upstream plus bind mounts, so `shared/common` is not installed there. The compose file mounts only what the hooks import, read-only under `/app/common`: `common/__init__.py` (a docstring), `common/conversation` and `common/keywordmatch`. The rest of `common` (documents, vision, jobs, …) is not in the container, and editing it does not change LiteLLM's deploy hash. [`unit-tests/litellm/test_hook_package.py`](../../unit-tests/litellm/test_hook_package.py) fails in three cases:
+
+- the hooks import a `common.<x>` that has no mount line;
+- a mounted part imports anything outside the stdlib;
+- the hooks import a third-party package the image lacks (only `litellm`, `yaml` and `httpx` are allowed).
+
+It also builds a fresh `/app` from the compose file's own mounts and loads the shim there in an isolated interpreter.
+
+**The leaf-class rule.** The proxy activates `async_post_call_streaming_iterator_hook` and `async_pre_call_hook` only when the name is in the registered class's own `__dict__` (`proxy/utils.py:1718-1745`). So all four hooks stay in `Handler`'s class body and delegate from there. A hook moved onto a component or a base class would silently never run.
+
+**Tests.** From the repo root:
+
+```bash
+UV_LINK_MODE=copy uv run --no-sync pytest unit-tests/litellm shared/common/tests/test_conversation.py shared/common/tests/test_keywordmatch.py -q
+```
+
+The workspace venv has `litellm` without its proxy extras, so the three proxy-plumbing tests skip there. To run them, use a throwaway venv. Nothing else needs installing in it: `unit-tests/litellm/conftest.py` puts `ai/litellm` and `shared/common/src` on `sys.path`.
+
+```bash
+uv venv /tmp/llvenv && UV_LINK_MODE=copy uv pip install --python /tmp/llvenv "litellm[proxy]==1.95.0" "fastapi<0.119" pytest
+/tmp/llvenv/bin/python -m pytest unit-tests/litellm -q -p no:cacheprovider
+```
+
+**On the box**, after `make up litellm`:
+
+```bash
+# from /app (cwd on sys.path): the mounted package and common
+make exec litellm litellm CMD="python -c 'import importlib.util as u; print(u.find_spec(\"hooks\").origin, u.find_spec(\"common\").submodule_search_locations)'"
+#   /app/hooks/__init__.py ['/app/common']
+# isolated (-I: no cwd): nothing installed under either name
+make exec litellm litellm CMD="python -I -c 'import importlib.util as u; print(u.find_spec(\"hooks\"), u.find_spec(\"common\"))'"
+#   None None
+make -s logs litellm FOLLOW=0 TAIL=300 2>&1 | grep -E 'Traceback|ImportError|\[overflow\]'
+```
+
+The last command should show no traceback. Then send one `auto` request ([§ The `auto` footer](#the-auto-footer) › Verifying) and check the answer ends with its footer.

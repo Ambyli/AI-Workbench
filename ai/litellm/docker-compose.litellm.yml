@@ -18,8 +18,9 @@ services:
     # once the new one is healthy. That is why there is no container_name
     # (two copies run at once) and no `ports:` -- PORT_LITELLM is published by
     # ai/edge, which routes to whichever copy is healthy. The hash covers
-    # litellm_config.yaml and overflow.py too, so editing either and running
-    # `make up litellm` deploys it. See ai/edge/EDGE.md.
+    # every bind mount below too (litellm_config.yaml, overflow.py, hooks/,
+    # the mounted parts of shared/common, the router config), so editing any
+    # of them and running `make up litellm` deploys it. See ai/edge/EDGE.md.
     labels:
       com.zeo.deploy: swap
     restart: unless-stopped
@@ -29,8 +30,9 @@ services:
     stop_grace_period: 900s
     environment:
       STORE_MODEL_IN_DB: "True"
-      # Overflow hook for the chain aliases (overflow.py, below). Defaults
-      # match the code; see ai/litellm/LITELLM.md > Chain aliases.
+      # Overflow hook for the chain aliases (hooks/overflow/, mounted below).
+      # Defaults match hooks/settings.py, the one place the hooks read the
+      # environment; see ai/litellm/LITELLM.md > Chain aliases.
       OVERFLOW_BUSY_AFTER_S: ${OVERFLOW_BUSY_AFTER_S:-2}
       OVERFLOW_IDLE_AFTER_S: ${OVERFLOW_IDLE_AFTER_S:-5}
       OVERFLOW_POLL_INTERVAL_S: ${OVERFLOW_POLL_INTERVAL_S:-1}
@@ -43,14 +45,15 @@ services:
       OVERFLOW_TOKENIZE_CHARS_PER_TOKEN: ${OVERFLOW_TOKENIZE_CHARS_PER_TOKEN:-2.5}
       OVERFLOW_TOKENIZE_TIMEOUT_S: ${OVERFLOW_TOKENIZE_TIMEOUT_S:-5}
       # The `auto` footer (a "---" rule + "*<model> - <chain>*" line naming
-      # the backend under each answer from the semantic router), also in
-      # overflow.py. true|false|1|0.
+      # the backend under each answer from the semantic router), in
+      # hooks/footer/. true|false|1|0.
       # See ai/litellm/LITELLM.md > The `auto` footer.
       AUTO_FOOTER_ENABLED: ${AUTO_FOOTER_ENABLED:-true}
-      # Code-tool remap (overflow.py): local-general whose history CALLED a
-      # tool whose name matches this regex in full -> local-code (offered but
-      # uncalled tools don't count). `-` not `:-` ON PURPOSE:
-      # unset uses the default below (== overflow.DEFAULT_CODE_ROUTE_TOOL_REGEX,
+      # Code-tool remap (hooks/routing/code_route.py): local-general whose
+      # history CALLED a tool whose name matches this regex in full ->
+      # local-code (offered but uncalled tools don't count). `-` not `:-` ON
+      # PURPOSE: unset uses the default below (== code_route's
+      # DEFAULT_CODE_ROUTE_TOOL_REGEX,
       # unit-tests/litellm/test_code_route.py checks), but an EMPTY value in
       # .env must reach the hook, because empty turns the remap off.
       # See ai/litellm/LITELLM.md > local-code: what it adds.
@@ -69,8 +72,24 @@ services:
       # litellm_settings.callbacks: ["overflow.handler"] is resolved relative
       # to the config file's directory, so this must sit next to
       # /app/config.yaml. The v1.95.0 runtime image has no /app/overflow.py
-      # of its own to shadow.
+      # of its own to shadow. overflow.py is only a shim: it imports the
+      # `hooks` package mounted beside it the normal way (registered in
+      # sys.modules), with /app first on sys.path for that one import. The
+      # package's layout is in hooks/__init__.py.
       - ./overflow.py:/app/overflow.py:ro
+      - ./hooks:/app/hooks:ro
+      # The two stdlib-only parts of shared/common the hooks import, plus the
+      # package's docstring-only __init__.py -- NOT the whole package: the
+      # container sees only what it uses, and an edit elsewhere in common
+      # (documents, vision, jobs, ...) does not change this service's deploy
+      # hash. Neither litellm[proxy] nor the upstream Dockerfile's /app
+      # (.venv, docker/, enterprise/, ...) has a `common` or a `hooks` of its
+      # own; LITELLM.md > The hooks package has the check to run on the box.
+      # unit-tests/litellm/test_hook_package.py fails if a `common.<x>` the
+      # hooks import has no line here.
+      - ../../shared/common/src/common/__init__.py:/app/common/__init__.py:ro
+      - ../../shared/common/src/common/conversation:/app/common/conversation:ro
+      - ../../shared/common/src/common/keywordmatch:/app/common/keywordmatch:ro
       # The semantic router's config, read-only, for its `code_kw` signal
       # (the code cooldown above). Holds no secrets: its api_keys are the
       # __SEMANTIC_ROUTER_*_KEY__ placeholders. A code_kw edit

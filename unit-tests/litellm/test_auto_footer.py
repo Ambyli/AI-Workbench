@@ -1,4 +1,5 @@
-"""Unit tests for the `auto` footer in ai/litellm/overflow.py.
+"""Unit tests for the `auto` footer -- ai/litellm/hooks/footer, driven through
+hooks.handler.Handler's three hooks.
 
 When a client calls model `auto` (the semantic router), the assistant text
 ends with a markdown footer naming the backend that answered:
@@ -17,7 +18,7 @@ Three layers:
   router bypassed, tool calls / response_format / Open WebUI tasks skipped,
   n > 1, idempotence, reasoning untouched, exception safety.
 * The proxy plumbing (skipped unless litellm[proxy]==1.95.0 is importable):
-  the proxy really activates these hooks on OverflowHandler, really dispatches
+  the proxy really activates these hooks on Handler, really dispatches
   them, and the outer openai provider really surfaces the inner LiteLLM's /
   router's headers as `llm_provider-*` for BOTH a JSON and an SSE response
   (a stdlib HTTP server stands in for Envoy). Plus the cross-group fallback
@@ -35,27 +36,18 @@ import json
 import os
 import pathlib
 import socket
-import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
+from hooks.footer.render import footer_text, is_openwebui_task, strip_footer, strip_footers_from_messages
+from hooks.handler import Handler
+from hooks.overflow.vllm import metrics_url
+from hooks.settings import _env_bool
+
 _ROOT = pathlib.Path(__file__).resolve().parents[2]
 _LITELLM_DIR = _ROOT / "ai" / "litellm"
-if str(_LITELLM_DIR) not in sys.path:
-    sys.path.insert(0, str(_LITELLM_DIR))
-
-import overflow  # noqa: E402
-from overflow import (  # noqa: E402
-    OverflowHandler,
-    _env_bool,
-    footer_text,
-    is_openwebui_task,
-    metrics_url,
-    strip_footer,
-    strip_footers_from_messages,
-)
 
 QWEN = "http://qwen3.8-solo:8000/v1"
 MUSE = "http://muse-glimmer:8000/v1"
@@ -241,7 +233,7 @@ class Clock:
         self.t += dt
 
 
-def make_handler(pages=None, clock=None, router=FakeRouter(), **kw) -> OverflowHandler:
+def make_handler(pages=None, clock=None, router=FakeRouter(), **kw) -> Handler:
     pages = pages if pages is not None else {}
 
     async def fetch(url):
@@ -252,7 +244,7 @@ def make_handler(pages=None, clock=None, router=FakeRouter(), **kw) -> OverflowH
             raise ConnectionError("no route")
         return page
 
-    return OverflowHandler(fetch=fetch, clock=clock or Clock(), busy_after=2.0, idle_after=5.0,
+    return Handler(fetch=fetch, clock=clock or Clock(), busy_after=2.0, idle_after=5.0,
                            poll_interval=1.0, probe_timeout=0.5, start_poller=False,
                            auto_footer=kw.pop("auto_footer", True), router_getter=lambda: router, **kw)
 
@@ -351,12 +343,12 @@ def general_chain():
 
 
 def _learn_and_poll(h, pages, clock, qwen, muse):
-    h.filter_deployments("local-general", general_chain())  # what the INNER request does
+    h.overflow.filter_deployments("local-general", general_chain())  # what the INNER request does
     pages[metrics_url(QWEN)] = qwen
     pages[metrics_url(MUSE)] = muse
-    run(h.poll_once())
+    run(h.overflow.poller.poll_once())
     clock.advance(2.5)
-    run(h.poll_once())
+    run(h.overflow.poller.poll_once())
 
 
 def _metrics(waiting):
@@ -502,7 +494,7 @@ def test_exceptions_never_escape():
     def boom(*_a, **_k):
         raise RuntimeError("bug")
 
-    h.footer_label = boom  # type: ignore[assignment]
+    h.footer.label = boom  # type: ignore[assignment]
     resp = response()
     assert run(h.async_post_call_success_hook(data=auto_data(), user_api_key_dict=None, response=resp)) is None
     assert contents(resp) == ["hello"]
@@ -875,14 +867,18 @@ def test_in_group_order_fallback_reports_the_final_deployment_id():
 
 
 @needs_litellm
-def test_env_toggle_reaches_the_instance_litellm_loads(monkeypatch):
+def test_env_toggle_reaches_the_instance_litellm_loads(monkeypatch, fresh_hooks):
+    """hooks.settings reads the environment once per process, at import -- so
+    each load is against a fresh import of the package, as each proxy start is."""
     from litellm.proxy.types_utils.utils import get_instance_fn
 
     monkeypatch.setenv("AUTO_FOOTER_ENABLED", "false")
-    h = get_instance_fn("overflow.handler", config_file_path=str(_LITELLM_DIR / "litellm_config.yaml"))
-    assert h.auto_footer is False
+    with fresh_hooks():
+        h = get_instance_fn("overflow.handler", config_file_path=str(_LITELLM_DIR / "litellm_config.yaml"))
+    assert h.footer.enabled is False
     monkeypatch.setenv("AUTO_FOOTER_ENABLED", "1")
-    h = get_instance_fn("overflow.handler", config_file_path=str(_LITELLM_DIR / "litellm_config.yaml"))
-    assert h.auto_footer is True
+    with fresh_hooks():
+        h = get_instance_fn("overflow.handler", config_file_path=str(_LITELLM_DIR / "litellm_config.yaml"))
+    assert h.footer.enabled is True
     monkeypatch.delenv("AUTO_FOOTER_ENABLED")
-    assert overflow._env_bool("AUTO_FOOTER_ENABLED", True) is True  # default on
+    assert _env_bool("AUTO_FOOTER_ENABLED", True) is True  # default on

@@ -1,5 +1,6 @@
-"""local-code: the code-tool remap in ai/litellm/overflow.py and the
-local-code chain's coding settings in ai/litellm/litellm_config.yaml.
+"""local-code: the code-tool remap (ai/litellm/hooks/routing/code_route.py,
+run from hooks.handler.Handler's async_pre_call_hook) and the local-code
+chain's coding settings in ai/litellm/litellm_config.yaml.
 
 Three layers, like the other files here:
 
@@ -14,7 +15,7 @@ Three layers, like the other files here:
   prompt never says "reasoning strength" (muse's template would let it win
   over the kwarg), 32768-token answers fit each backend's max-model-len,
   local-general & co. are untouched, `auto` sets no max_tokens, and the
-  regex default agrees across overflow.py, the compose file and .env.example.
+  regex default agrees across code_route.py, the compose file and .env.example.
 * Against real LiteLLM (skipped unless importable): the proxy's own
   pre_call_hook dispatch applies the remap, and a Router built from the
   config really sends local-code's prompt, kwargs and max_tokens.
@@ -26,34 +27,29 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import importlib.util
 import logging
 import pathlib
 import re
-import sys
 
 import pytest
 
-_ROOT = pathlib.Path(__file__).resolve().parents[2]
-_LITELLM_DIR = _ROOT / "ai" / "litellm"
-if str(_LITELLM_DIR) not in sys.path:
-    sys.path.insert(0, str(_LITELLM_DIR))
-
-import overflow  # noqa: E402
-from overflow import (  # noqa: E402
+from common.conversation import called_tool_names, split_exchanges
+from common.keywordmatch import KeywordRule, compile_keyword_rule
+from hooks.handler import Handler
+from hooks.log import logger
+from hooks.routing.code_route import (
     DEFAULT_CODE_ROUTE_COOLDOWN,
+    DEFAULT_CODE_ROUTE_ROUTER_CONFIG,
     DEFAULT_CODE_ROUTE_TOOL_REGEX,
-    CodeTextSignal,
-    OverflowHandler,
-    called_tool_names,
     code_route_decision,
     code_tool_match,
     compile_code_route_regex,
-    compile_code_text_signal,
     load_code_text_signal,
     parse_code_route_cooldown,
-    split_exchanges,
 )
+
+_ROOT = pathlib.Path(__file__).resolve().parents[2]
+_LITELLM_DIR = _ROOT / "ai" / "litellm"
 
 ROUTER_CONFIG = _ROOT / "ai" / "semantic-router" / "config.yaml"
 
@@ -79,7 +75,7 @@ TERMINAL_TOOLS = [fn(n) for n in (
 WEB_TOOLS = [fn("search_web"), fn("fetch_url"), fn("get_current_date")]
 
 
-def make_handler(**kw) -> OverflowHandler:
+def make_handler(**kw) -> Handler:
     """Tool-call checks only and the default cooldown unless a test says
     otherwise, so no test depends on /app/semantic-router-config.yaml."""
     async def fetch(url):
@@ -87,10 +83,10 @@ def make_handler(**kw) -> OverflowHandler:
 
     kw.setdefault("code_text_signal", None)
     kw.setdefault("code_route_cooldown", DEFAULT_CODE_ROUTE_COOLDOWN)
-    return OverflowHandler(fetch=fetch, start_poller=False, auto_footer=kw.pop("auto_footer", True), **kw)
+    return Handler(fetch=fetch, start_poller=False, auto_footer=kw.pop("auto_footer", True), **kw)
 
 
-def pre_call(h: OverflowHandler, data):
+def pre_call(h: Handler, data):
     return asyncio.run(h.async_pre_call_hook(user_api_key_dict=None, cache=None, data=data, call_type="acompletion"))
 
 
@@ -189,31 +185,33 @@ def test_invalid_regex_disables_with_an_error():
     assert "invalid CODE_ROUTE_TOOL_REGEX" in error and "sandbox-mcp_(" in error
 
 
-def _load_fresh(monkeypatch, value):
+def _load_fresh(monkeypatch, fresh_hooks, load_shim, value):
     """Load overflow.py the way the proxy does (spec_from_file_location, not
-    registered in sys.modules), with CODE_ROUTE_TOOL_REGEX set to `value`
-    (None = unset), so the env read at import is what is tested."""
+    registered in sys.modules) against a FRESH import of the hooks package,
+    with CODE_ROUTE_TOOL_REGEX set to `value` (None = unset), so the env read
+    at import (hooks.settings) is what is tested."""
     if value is None:
         monkeypatch.delenv("CODE_ROUTE_TOOL_REGEX", raising=False)
     else:
         monkeypatch.setenv("CODE_ROUTE_TOOL_REGEX", value)
-    spec = importlib.util.spec_from_file_location("overflow_fresh_for_test", _LITELLM_DIR / "overflow.py")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+    with fresh_hooks():
+        return load_shim()
 
 
-def test_env_unset_uses_the_default_empty_disables_invalid_disables(monkeypatch):
-    mod = _load_fresh(monkeypatch, None)
-    assert mod.handler.code_route_regex is not None
-    assert mod.handler.code_route_regex.pattern == DEFAULT_CODE_ROUTE_TOOL_REGEX
+def test_env_unset_uses_the_default_empty_disables_invalid_disables(monkeypatch, fresh_hooks, load_shim):
+    def _load(value):
+        return _load_fresh(monkeypatch, fresh_hooks, load_shim, value)
 
-    mod = _load_fresh(monkeypatch, "")
-    assert mod.handler.code_route_regex is None
+    mod = _load(None)
+    assert mod.handler.code_route.regex is not None
+    assert mod.handler.code_route.regex.pattern == DEFAULT_CODE_ROUTE_TOOL_REGEX
 
-    mod = _load_fresh(monkeypatch, "only_this_tool")
-    assert code_tool_match(["only_this_tool"], mod.handler.code_route_regex) == "only_this_tool"
-    assert code_tool_match(["sandbox-mcp_run"], mod.handler.code_route_regex) is None
+    mod = _load("")
+    assert mod.handler.code_route.regex is None
+
+    mod = _load("only_this_tool")
+    assert code_tool_match(["only_this_tool"], mod.handler.code_route.regex) == "only_this_tool"
+    assert code_tool_match(["sandbox-mcp_run"], mod.handler.code_route.regex) is None
 
     records = []
 
@@ -224,10 +222,10 @@ def test_env_unset_uses_the_default_empty_disables_invalid_disables(monkeypatch)
     grab = Grab()
     logging.getLogger("zeo.overflow").addHandler(grab)
     try:
-        mod = _load_fresh(monkeypatch, "(unclosed")
+        mod = _load("(unclosed")
     finally:
         logging.getLogger("zeo.overflow").removeHandler(grab)
-    assert mod.handler.code_route_regex is None
+    assert mod.handler.code_route.regex is None
     assert any("invalid CODE_ROUTE_TOOL_REGEX" in r and "remap disabled" in r for r in records)
 
 
@@ -302,7 +300,7 @@ def test_remap_works_with_the_footer_turned_off():
 @pytest.mark.parametrize("setting", ["", None])
 def test_disabled_remap_changes_nothing(setting):
     h = make_handler(code_route_regex=setting)
-    assert h.code_route_regex is None
+    assert h.code_route.regex is None
     data = request(called=("sandbox-mcp_exec",))
     assert pre_call(h, data) is None and data["model"] == "local-general"
 
@@ -321,12 +319,12 @@ def test_remap_logs_one_route_line():
             records.append(record.getMessage())
 
     grab = Grab()
-    overflow.logger.addHandler(grab)
+    logger.addHandler(grab)
     try:
         h = make_handler()
         pre_call(h, request(called=("sandbox-mcp_exec",)))
     finally:
-        overflow.logger.removeHandler(grab)
+        logger.removeHandler(grab)
     assert records == ["[route] local-general -> local-code "
                        "(called sandbox-mcp_exec 1 exchange(s) ago; 0/3 irrelevant since)"]
 
@@ -454,7 +452,7 @@ def test_irrelevant_tool_calls_do_not_count():
 
 # The router's own signal, as LiteLLM loads it from the mounted config.yaml.
 @pytest.fixture(scope="module")
-def router_signal() -> CodeTextSignal:
+def router_signal() -> KeywordRule:
     signal, error = load_code_text_signal(str(ROUTER_CONFIG))
     assert signal is not None, error
     return signal
@@ -480,16 +478,16 @@ def test_a_code_kw_message_is_relevant_without_any_tool_call(router_signal):
 
 
 def test_compile_code_text_signal_mirrors_go_semantics():
-    words = compile_code_text_signal({"operator": "OR", "case_sensitive": False, "keywords": ["function", "```"]})
+    words = compile_keyword_rule({"operator": "OR", "case_sensitive": False, "keywords": ["function", "```"]})
     assert words.matches("a FUNCTION here") and not words.matches("functions")   # whole literal word
     assert words.matches("see```x")                       # no letters or digits -> no \b, a plain substring
-    regex = compile_code_text_signal({"method": "regex", "case_sensitive": False, "keywords": [r"\bfunctions?\b"]})
+    regex = compile_keyword_rule({"method": "regex", "case_sensitive": False, "keywords": [r"\bfunctions?\b"]})
     assert regex.matches("Functions") and not regex.matches("dysfunctional")
-    cased = compile_code_text_signal({"method": "regex", "case_sensitive": True, "keywords": ["Go"]})
+    cased = compile_keyword_rule({"method": "regex", "case_sensitive": True, "keywords": ["Go"]})
     assert cased.matches("Go") and not cased.matches("go")
-    both = compile_code_text_signal({"operator": "AND", "keywords": ["docker", "compose"]})
+    both = compile_keyword_rule({"operator": "AND", "keywords": ["docker", "compose"]})
     assert both.matches("docker compose up") and not both.matches("docker run")
-    none = compile_code_text_signal({"operator": "NOR", "keywords": ["weather"]})
+    none = compile_keyword_rule({"operator": "NOR", "keywords": ["weather"]})
     assert none.matches("code") and not none.matches("weather")
     assert not words.matches("") and not words.matches(None)
 
@@ -499,7 +497,7 @@ def test_compile_code_text_signal_mirrors_go_semantics():
                                   {"method": "regex", "keywords": ["(unclosed"]}])
 def test_compile_code_text_signal_rejects_bad_rules(rule):
     with pytest.raises(ValueError):
-        compile_code_text_signal(rule)
+        compile_keyword_rule(rule)
 
 
 def test_load_code_text_signal_failures_return_an_error(tmp_path):
@@ -531,7 +529,7 @@ def test_the_hook_applies_the_cooldown_and_logs_the_drop():
             records.append(record.getMessage())
 
     grab = Grab()
-    overflow.logger.addHandler(grab)
+    logger.addHandler(grab)
     try:
         h = make_handler()
         history = coding()
@@ -542,7 +540,7 @@ def test_the_hook_applies_the_cooldown_and_logs_the_drop():
             models.append(data["model"])
             history += chatting(question)
     finally:
-        overflow.logger.removeHandler(grab)
+        logger.removeHandler(grab)
     assert models == ["local-code", "local-code", "local-code", "local-general"]
     assert h.stats["code_routes"] == 3 and h.stats["code_route_cooldowns"] == 1
     assert records[-1] == ("[route] local-general stays (cooldown: 3/3 irrelevant exchanges since the last "
@@ -551,7 +549,7 @@ def test_the_hook_applies_the_cooldown_and_logs_the_drop():
 
 def test_handler_loads_the_router_config_from_a_path():
     h = make_handler(code_text_signal=str(ROUTER_CONFIG))
-    assert isinstance(h.code_text_signal, CodeTextSignal)
+    assert isinstance(h.code_route.text_signal, KeywordRule)
     data = {"model": "local-general", "messages": now("Make me a scientific calculator!")}
     assert pre_call(h, data) is data and data["model"] == "local-code"
 
@@ -709,8 +707,8 @@ def test_cooldown_default_and_router_config_mount_agree():
     service = yaml.safe_load(COMPOSE.read_text(encoding="utf-8"))["services"]["litellm"]
     env = service["environment"]
     assert env["CODE_ROUTE_COOLDOWN"] == f"${{CODE_ROUTE_COOLDOWN:-{DEFAULT_CODE_ROUTE_COOLDOWN}}}"
-    assert env["CODE_ROUTE_ROUTER_CONFIG"] == overflow.DEFAULT_CODE_ROUTE_ROUTER_CONFIG
-    mount = f"../semantic-router/config.yaml:{overflow.DEFAULT_CODE_ROUTE_ROUTER_CONFIG}:ro"
+    assert env["CODE_ROUTE_ROUTER_CONFIG"] == DEFAULT_CODE_ROUTE_ROUTER_CONFIG
+    mount = f"../semantic-router/config.yaml:{DEFAULT_CODE_ROUTE_ROUTER_CONFIG}:ro"
     assert mount in service["volumes"]
     assert (COMPOSE.parent / "../semantic-router/config.yaml").resolve() == ROUTER_CONFIG.resolve()
     lines = [ln for ln in ENV_EXAMPLE.read_text(encoding="utf-8").splitlines() if ln.startswith("CODE_ROUTE_COOLDOWN=")]

@@ -218,11 +218,11 @@ def test_strip_footer_removes_overflow_footer_variants():
 def test_footer_regex_matches_litellm_overflow():
     sys.path.insert(0, str(_LITELLM_DIR))
     try:
-        overflow = pytest.importorskip("overflow")
+        render = pytest.importorskip("hooks.footer.render")  # needs `common` (the workspace venv has it)
     finally:
         sys.path.remove(str(_LITELLM_DIR))
-    assert zac.FOOTER_RE.pattern == overflow.FOOTER_RE.pattern
-    text = ANNOUNCEMENTS[2] + overflow.footer_text("muse-glimmer · local-general")
+    assert zac.FOOTER_RE.pattern == render.FOOTER_RE.pattern
+    text = ANNOUNCEMENTS[2] + render.footer_text("muse-glimmer · local-general")
     assert zac.strip_footer(text) == ANNOUNCEMENTS[2]
 
 

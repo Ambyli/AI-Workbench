@@ -323,6 +323,13 @@ routing:
       # with a code extension, a markdown code fence, and "build/make/
       # create/write/code ... <a kind of program>" within 40 characters --
       # which is what catches "Make me a scientific calculator!".
+      #
+      # LiteLLM ALSO reads this rule (this file is mounted read-only into the
+      # litellm container) for the code cooldown: an earlier exchange whose
+      # message matches keeps a chat on local-code for CODE_ROUTE_COOLDOWN
+      # more exchanges. Keep the patterns valid in Python `re` too
+      # (unit-tests/semantic-router/test_router_config.py), and after an edit
+      # run `make up semantic-router FORCE=1` AND `make up litellm`.
       - name: code_kw
         operator: OR
         case_sensitive: false

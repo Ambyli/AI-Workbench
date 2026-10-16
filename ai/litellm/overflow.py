@@ -137,9 +137,14 @@ in full (default: the sandbox MCP tools, ``sandbox-mcp_*``, and Open
 Terminal's distinctive operationIds such as ``run_command``), the hook
 rewrites ``data["model"]`` to ``local-code``. Tools that are merely offered
 (``data["tools"]``) do not count: a chat with the sandbox attached but never
-used stays on local-general. A call anywhere in the history counts, so once a
-chat has used the sandbox every later turn is local-code, and inside a turn
-the remap starts with the first tool round after the first sandbox call.
+used stays on local-general. The history is split into EXCHANGES, one per
+user message; an exchange is relevant when the model called such a tool
+during it or its user message matches the semantic router's own ``code_kw``
+signal (read from the router's config.yaml, CODE_ROUTE_ROUTER_CONFIG). The
+remap holds while the current exchange is relevant or fewer than
+CODE_ROUTE_COOLDOWN (default 3) irrelevant exchanges in a row followed the
+last relevant one; after that the chat drops back to local-general until it
+looks like code again.
 The proxy routes on the rewritten model (pre_call_hook ->
 route_request in common_request_processing.py) and the Router sets
 metadata.model_group from it, so the overflow filter, the spend log and the
@@ -822,6 +827,190 @@ CODE_ROUTE_TOOL_REGEX, CODE_ROUTE_TOOL_REGEX_ERROR = compile_code_route_regex(
 )
 
 
+# -- Code cooldown: pure helpers (unit-tested) ----------------------------------
+# A chat stays on local-code while its recent EXCHANGES (one per user message:
+# the message plus every model round it started) keep looking like code, and
+# drops back to local-general after CODE_ROUTE_COOLDOWN irrelevant exchanges in
+# a row. An exchange is relevant when its user message matches the semantic
+# router's own `code_kw` signal (read from the router's config.yaml, mounted
+# read-only, so the two can never disagree) or when the model called a tool
+# CODE_ROUTE_TOOL_REGEX matches during it. Everything is recomputed from the
+# request's history: no per-chat state, so both swap copies and a restart agree.
+DEFAULT_CODE_ROUTE_COOLDOWN = 3
+DEFAULT_CODE_ROUTE_ROUTER_CONFIG = "/app/semantic-router-config.yaml"
+CODE_ROUTE_SIGNAL = "code_kw"
+
+
+def parse_code_route_cooldown(raw: Any) -> Tuple[int, str]:
+    """(cooldown, error). Unset / empty -> the default; a non-negative int is
+    used as is (0: only the current exchange counts); anything else -> the
+    default plus an error to log."""
+    if raw is None or not str(raw).strip():
+        return DEFAULT_CODE_ROUTE_COOLDOWN, ""
+    try:
+        value = int(str(raw).strip())
+    except ValueError:
+        value = -1
+    if value < 0:
+        return DEFAULT_CODE_ROUTE_COOLDOWN, (
+            f"invalid CODE_ROUTE_COOLDOWN {raw!r}: expected an integer >= 0, using {DEFAULT_CODE_ROUTE_COOLDOWN}"
+        )
+    return value, ""
+
+
+class CodeTextSignal:
+    """The router's `code_kw` keyword rule, compiled for Python. Mirrors the
+    Go router (pkg/classification/keyword_classifier_regex.go at v0.3.0):
+    `method: regex` uses each keyword as a raw pattern, any other method
+    matches it as a whole literal word; `case_sensitive: false` ignores case;
+    `\\b` / `\\w` are ASCII as in RE2. Not a @dataclass -- see BackendState."""
+
+    def __init__(self, operator: str, patterns: List["re.Pattern[str]"]) -> None:
+        self.operator = operator
+        self.patterns = patterns
+
+    def matches(self, text: str) -> bool:
+        if not text or not self.patterns:
+            return False
+        hits = [bool(p.search(text)) for p in self.patterns]
+        if self.operator == "AND":
+            return all(hits)
+        if self.operator == "NOR":
+            return not any(hits)
+        return any(hits)
+
+
+def compile_code_text_signal(rule: Any) -> "CodeTextSignal":
+    """Compile one keyword rule ({name, operator, keywords, case_sensitive,
+    method}) the way the Go router does. Raises ValueError on a bad rule."""
+    if not isinstance(rule, dict) or not isinstance(rule.get("keywords"), list) or not rule["keywords"]:
+        raise ValueError("keyword rule has no keywords")
+    operator = str(rule.get("operator") or "OR").upper()
+    if operator not in ("OR", "AND", "NOR"):
+        raise ValueError(f"unsupported operator {operator!r}")
+    flags = re.ASCII | (0 if rule.get("case_sensitive") else re.IGNORECASE)
+    raw_regex = str(rule.get("method") or "").lower() == "regex"
+    patterns = []
+    for keyword in rule["keywords"]:
+        if not isinstance(keyword, str) or not keyword:
+            raise ValueError(f"bad keyword {keyword!r}")
+        if raw_regex:
+            source = keyword
+        else:
+            source = re.escape(keyword)
+            if re.search(r"\w", keyword, re.ASCII):
+                source = rf"\b{source}\b"
+        try:
+            patterns.append(re.compile(source, flags))
+        except re.error as exc:
+            raise ValueError(f"keyword {keyword!r} does not compile: {exc}") from exc
+    return CodeTextSignal(operator, patterns)
+
+
+def _find_keyword_rule(node: Any, name: str) -> Optional[dict]:
+    if isinstance(node, dict):
+        if node.get("name") == name and isinstance(node.get("keywords"), list):
+            return node
+        children = node.values()
+    elif isinstance(node, list):
+        children = node
+    else:
+        return None
+    for child in children:
+        found = _find_keyword_rule(child, name)
+        if found is not None:
+            return found
+    return None
+
+
+def load_code_text_signal(path: Optional[str], name: str = CODE_ROUTE_SIGNAL) -> Tuple[Optional[CodeTextSignal], str]:
+    """(signal, error) from the router's config.yaml. Missing file, missing
+    rule or a bad pattern -> (None, error): the cooldown then judges
+    exchanges by tool calls only."""
+    if not path:
+        return None, "CODE_ROUTE_ROUTER_CONFIG is empty"
+    try:
+        import yaml  # LiteLLM's own dependency (the proxy loads config.yaml with it)
+
+        with open(path, "r", encoding="utf-8") as fh:
+            config = yaml.safe_load(fh)
+        rule = _find_keyword_rule(config, name)
+        if rule is None:
+            return None, f"no keyword signal {name!r} in {path}"
+        return compile_code_text_signal(rule), ""
+    except Exception as exc:
+        return None, f"cannot load the router's {name!r} signal from {path}: {exc}"
+
+
+def message_text(content: Any) -> str:
+    """The text of a chat message's content: a string, or the `text` parts of
+    a multimodal list."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(p["text"] for p in content
+                         if isinstance(p, dict) and p.get("type") == "text" and isinstance(p.get("text"), str))
+    return ""
+
+
+def split_exchanges(messages: Any) -> List[Tuple[str, List[dict]]]:
+    """[(user text, the messages after it up to the next user message)], one
+    per user message, oldest first. Anything before the first user message
+    (system prompts, a compaction summary) belongs to no exchange."""
+    out: List[Tuple[str, List[dict]]] = []
+    if not isinstance(messages, list):
+        return out
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") == "user":
+            out.append((message_text(msg.get("content")), []))
+        elif out:
+            out[-1][1].append(msg)
+    return out
+
+
+def exchange_relevance(text: str, rounds: List[dict], tool_pattern: Any,
+                       text_signal: Optional[CodeTextSignal]) -> Optional[str]:
+    """Why one exchange counts as code, or None: a matching tool call during
+    it (the most recent one is named) or its user message matching code_kw."""
+    tool = code_tool_match(called_tool_names(rounds), tool_pattern)
+    if tool is not None:
+        return f"called {tool}"
+    if text_signal is not None and text_signal.matches(text):
+        return f"message matches {CODE_ROUTE_SIGNAL}"
+    return None
+
+
+def code_route_decision(messages: Any, tool_pattern: Any, text_signal: Optional[CodeTextSignal],
+                        cooldown: int) -> Tuple[bool, str]:
+    """(stay on / move to local-code?, reason). The current exchange (the last
+    user message and the rounds so far) is relevant -> True. Otherwise count
+    the irrelevant exchanges in a row before it: True while there was a
+    relevant one and fewer than `cooldown` irrelevant ones since; False once
+    the cooldown has run out (the reason says so) or when the chat has never
+    looked like code (empty reason)."""
+    exchanges = split_exchanges(messages)
+    if not exchanges:
+        return False, ""
+    current = exchange_relevance(*exchanges[-1], tool_pattern, text_signal)
+    if current is not None:
+        return True, f"{current} in this exchange"
+    irrelevant = 0
+    for text, rounds in reversed(exchanges[:-1]):
+        why = exchange_relevance(text, rounds, tool_pattern, text_signal)
+        if why is not None:
+            if irrelevant < cooldown:
+                return True, f"{why} {irrelevant + 1} exchange(s) ago; {irrelevant}/{cooldown} irrelevant since"
+            return False, f"cooldown: {irrelevant}/{cooldown} irrelevant exchanges since the last one that {why}"
+        irrelevant += 1
+    return False, ""
+
+
+CODE_ROUTE_COOLDOWN, CODE_ROUTE_COOLDOWN_ERROR = parse_code_route_cooldown(os.environ.get("CODE_ROUTE_COOLDOWN"))
+CODE_ROUTE_ROUTER_CONFIG = os.environ.get("CODE_ROUTE_ROUTER_CONFIG", DEFAULT_CODE_ROUTE_ROUTER_CONFIG)
+
+
 # -- Fetch -------------------------------------------------------------------
 Fetch = Callable[[str], Awaitable[str]]
 
@@ -1032,6 +1221,8 @@ class OverflowHandler(CustomLogger):  # type: ignore[misc,valid-type]
         tokenize_chars_per_token: float = TOKENIZE_CHARS_PER_TOKEN,
         tokenize_timeout: float = TOKENIZE_TIMEOUT_S,
         code_route_regex: Any = "env",
+        code_route_cooldown: Any = "env",
+        code_text_signal: Any = "env",
     ) -> None:
         try:
             super().__init__()
@@ -1051,6 +1242,26 @@ class OverflowHandler(CustomLogger):  # type: ignore[misc,valid-type]
                 logger.warning("%s -- local-general -> local-code tool remap disabled", route_error)
             except Exception:
                 pass
+        # "env" -> CODE_ROUTE_COOLDOWN as read at import; an int is used as is.
+        if isinstance(code_route_cooldown, str) and code_route_cooldown == "env":
+            self.code_route_cooldown, cooldown_error = CODE_ROUTE_COOLDOWN, CODE_ROUTE_COOLDOWN_ERROR
+        else:
+            self.code_route_cooldown, cooldown_error = parse_code_route_cooldown(code_route_cooldown)
+        # "env" -> the router's code_kw from CODE_ROUTE_ROUTER_CONFIG; a str is
+        # a path to load; a CodeTextSignal is used as is; None = tool calls only.
+        signal_error = ""
+        if isinstance(code_text_signal, str):
+            path = CODE_ROUTE_ROUTER_CONFIG if code_text_signal == "env" else code_text_signal
+            self.code_text_signal, signal_error = load_code_text_signal(path)
+        else:
+            self.code_text_signal = code_text_signal
+        for problem, consequence in ((cooldown_error, ""),
+                                     (signal_error, " -- code cooldown judges exchanges by tool calls only")):
+            if problem and self.code_route_regex is not None:
+                try:
+                    logger.warning("%s%s", problem, consequence)
+                except Exception:
+                    pass
         self._router_getter = router_getter or _proxy_router
         # chain alias -> the api_bases of its local deployments, learnt in
         # filter_deployments; the footer reads their verdicts.
@@ -1077,7 +1288,7 @@ class OverflowHandler(CustomLogger):  # type: ignore[misc,valid-type]
             "spills": 0, "kept_all_overloaded": 0, "errors": 0, "poller_restarts": 0,
             "context_drops": 0, "tokenize_calls": 0, "tokenize_cache_hits": 0, "tokenize_errors": 0,
             "footers": 0, "footers_stripped": 0, "footer_errors": 0,
-            "code_routes": 0, "code_route_errors": 0,
+            "code_routes": 0, "code_route_cooldowns": 0, "code_route_errors": 0,
         }
 
     # -- LiteLLM hook ----------------------------------------------------------
@@ -1137,16 +1348,23 @@ class OverflowHandler(CustomLogger):  # type: ignore[misc,valid-type]
             return data if changed else None
 
     def remap_code_tools(self, data: Any) -> bool:
-        """local-general whose history CALLED a tool CODE_ROUTE_TOOL_REGEX
-        matches -> local-code. True when data["model"] was rewritten. Never
-        raises: on any error `data` is left unchanged and the error is logged."""
+        """local-general -> local-code while the chat's recent exchanges look
+        like code (code_route_decision: a CODE_ROUTE_TOOL_REGEX tool call or a
+        code_kw message, with a cooldown of CODE_ROUTE_COOLDOWN irrelevant
+        exchanges). True when data["model"] was rewritten. Never raises: on
+        any error `data` is left unchanged and the error is logged."""
         try:
             if self.code_route_regex is None or not isinstance(data, dict):
                 return False
             if data.get("model") != CODE_ROUTE_FROM:
                 return False
-            tool = code_tool_match(called_tool_names(data.get("messages")), self.code_route_regex)
-            if tool is None:
+            remap, reason = code_route_decision(
+                data.get("messages"), self.code_route_regex, self.code_text_signal, self.code_route_cooldown)
+            if not remap:
+                if reason:  # the chat WAS code; the cooldown has run out
+                    self.stats["code_route_cooldowns"] += 1
+                    self._log(CODE_ROUTE_FROM, "cooldown", "route", "[route] %s stays (%s)",
+                              CODE_ROUTE_FROM, reason)
                 return False
         except Exception as exc:
             try:
@@ -1160,8 +1378,9 @@ class OverflowHandler(CustomLogger):  # type: ignore[misc,valid-type]
         data["model"] = CODE_ROUTE_TO
         self.stats["code_routes"] += 1
         try:
-            self._log(CODE_ROUTE_FROM, tool, "route", "[route] %s -> %s (tool: %s)",
-                      CODE_ROUTE_FROM, CODE_ROUTE_TO, tool)
+            kind = "current" if reason.endswith("in this exchange") else "earlier"
+            self._log(CODE_ROUTE_FROM, kind, "route", "[route] %s -> %s (%s)",
+                      CODE_ROUTE_FROM, CODE_ROUTE_TO, reason)
         except Exception:
             pass
         return True

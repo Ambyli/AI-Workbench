@@ -41,12 +41,21 @@ if str(_LITELLM_DIR) not in sys.path:
 
 import overflow  # noqa: E402
 from overflow import (  # noqa: E402
+    DEFAULT_CODE_ROUTE_COOLDOWN,
     DEFAULT_CODE_ROUTE_TOOL_REGEX,
+    CodeTextSignal,
     OverflowHandler,
     called_tool_names,
+    code_route_decision,
     code_tool_match,
     compile_code_route_regex,
+    compile_code_text_signal,
+    load_code_text_signal,
+    parse_code_route_cooldown,
+    split_exchanges,
 )
+
+ROUTER_CONFIG = _ROOT / "ai" / "semantic-router" / "config.yaml"
 
 CONFIG = _LITELLM_DIR / "litellm_config.yaml"
 COMPOSE = _LITELLM_DIR / "docker-compose.litellm.yml"
@@ -71,9 +80,13 @@ WEB_TOOLS = [fn("search_web"), fn("fetch_url"), fn("get_current_date")]
 
 
 def make_handler(**kw) -> OverflowHandler:
+    """Tool-call checks only and the default cooldown unless a test says
+    otherwise, so no test depends on /app/semantic-router-config.yaml."""
     async def fetch(url):
         raise ConnectionError("no network in unit tests")
 
+    kw.setdefault("code_text_signal", None)
+    kw.setdefault("code_route_cooldown", DEFAULT_CODE_ROUTE_COOLDOWN)
     return OverflowHandler(fetch=fetch, start_poller=False, auto_footer=kw.pop("auto_footer", True), **kw)
 
 
@@ -314,7 +327,8 @@ def test_remap_logs_one_route_line():
         pre_call(h, request(called=("sandbox-mcp_exec",)))
     finally:
         overflow.logger.removeHandler(grab)
-    assert records == ["[route] local-general -> local-code (tool: sandbox-mcp_exec)"]
+    assert records == ["[route] local-general -> local-code "
+                       "(called sandbox-mcp_exec 1 exchange(s) ago; 0/3 irrelevant since)"]
 
 
 def test_hook_never_raises():
@@ -329,7 +343,7 @@ def test_hook_never_raises():
     assert h.stats["code_route_errors"] == 1
 
     class ExplodingMessages(list):
-        def __reversed__(self):
+        def __iter__(self):
             raise RuntimeError("boom")
 
     data = request(messages=ExplodingMessages(history("sandbox-mcp_exec")))
@@ -344,6 +358,202 @@ def test_hook_never_raises():
     data = request(called=("sandbox-mcp_exec",))
     assert pre_call(h, data) is None and data["model"] == "local-general"
     assert pre_call(h, None) is None and pre_call(h, "x") is None
+
+
+# ── the code cooldown ─────────────────────────────────────────────────────────
+def coding(text="Make me a scientific calculator!", tool="sandbox-mcp_write_files"):
+    """One exchange: the user message and the rounds it started (a code-tool
+    call when `tool` is set, then the final answer)."""
+    msgs = [{"role": "user", "content": text}]
+    if tool:
+        msgs += [{"role": "assistant", "content": "", "tool_calls": [
+                     {"id": "c1", "type": "function", "function": {"name": tool, "arguments": "{}"}}]},
+                 {"role": "tool", "tool_call_id": "c1", "content": "ok"}]
+    msgs.append({"role": "assistant", "content": "Done."})
+    return msgs
+
+
+def chatting(text):
+    return [{"role": "user", "content": text}, {"role": "assistant", "content": "It's sunny."}]
+
+
+def now(text):
+    """The current exchange: just the user's new message, no rounds yet."""
+    return [{"role": "user", "content": text}]
+
+
+WEATHER = ["What's the weather in Denver?", "And tomorrow?", "Will it snow this week?", "What about Boulder?"]
+
+
+def test_split_exchanges_one_per_user_message():
+    msgs = [{"role": "system", "content": "sys"}, {"role": "assistant", "content": "orphan"},
+            *coding(), *chatting("hi"),
+            {"role": "user", "content": [{"type": "text", "text": "look"}, {"type": "image_url", "image_url": {}},
+                                         {"type": "text", "text": "at this"}]}]
+    ex = split_exchanges(msgs)
+    assert [t for t, _ in ex] == ["Make me a scientific calculator!", "hi", "look\nat this"]
+    assert len(ex[0][1]) == 3 and len(ex[1][1]) == 1 and ex[2][1] == []
+    assert split_exchanges(None) == [] and split_exchanges("x") == []
+
+
+def test_users_example_three_irrelevant_exchanges_then_it_drops():
+    """Build a calculator (sandbox call), then four weather questions: the
+    first three are still served by local-code, the fourth drops."""
+    history = coding()
+    served = []
+    for question in WEATHER:
+        remap, _ = code_route_decision(history + now(question), DEFAULT_CODE_ROUTE_TOOL_REGEX, None, 3)
+        served.append(remap)
+        history += chatting(question)
+    assert served == [True, True, True, False]
+
+
+def test_the_reasons_name_the_activity_and_the_count():
+    tool = DEFAULT_CODE_ROUTE_TOOL_REGEX
+    h = coding()
+    assert code_route_decision(h + now(WEATHER[0]), tool, None, 3) == (
+        True, "called sandbox-mcp_write_files 1 exchange(s) ago; 0/3 irrelevant since")
+    h += chatting(WEATHER[0]) + chatting(WEATHER[1])
+    assert code_route_decision(h + now(WEATHER[2]), tool, None, 3) == (
+        True, "called sandbox-mcp_write_files 3 exchange(s) ago; 2/3 irrelevant since")
+    h += chatting(WEATHER[2])
+    assert code_route_decision(h + now(WEATHER[3]), tool, None, 3) == (
+        False, "cooldown: 3/3 irrelevant exchanges since the last one that called sandbox-mcp_write_files")
+
+
+def test_a_chat_that_never_looked_like_code_has_no_reason():
+    h = chatting(WEATHER[0]) + chatting(WEATHER[1])
+    assert code_route_decision(h + now(WEATHER[2]), DEFAULT_CODE_ROUTE_TOOL_REGEX, None, 3) == (False, "")
+    assert code_route_decision([], DEFAULT_CODE_ROUTE_TOOL_REGEX, None, 3) == (False, "")
+
+
+def test_code_activity_in_the_current_exchange_wins_and_resets_the_streak():
+    tool = DEFAULT_CODE_ROUTE_TOOL_REGEX
+    h = coding() + sum((chatting(q) for q in WEATHER), [])          # cooled down
+    assert code_route_decision(h + now("Looks the same"), tool, None, 3)[0] is False
+    # The model calls the sandbox mid-exchange: the next round is local-code.
+    mid = h + coding("Looks the same", tool="sandbox-mcp_exec")[:-1]
+    assert code_route_decision(mid, tool, None, 3) == (True, "called sandbox-mcp_exec in this exchange")
+    # And the streak counts from there again.
+    h = mid + [{"role": "assistant", "content": "Fixed."}]
+    assert code_route_decision(h + now(WEATHER[0]), tool, None, 3)[0] is True
+
+
+def test_cooldown_zero_keeps_local_code_only_for_the_current_exchange():
+    tool = DEFAULT_CODE_ROUTE_TOOL_REGEX
+    assert code_route_decision(coding() + now(WEATHER[0]), tool, None, 0)[0] is False
+    assert code_route_decision(coding()[:-1], tool, None, 0)[0] is True
+
+
+def test_irrelevant_tool_calls_do_not_count():
+    tool = DEFAULT_CODE_ROUTE_TOOL_REGEX
+    h = coding() + coding(WEATHER[0], tool="search_web") + coding(WEATHER[1], tool="search_web") \
+        + coding(WEATHER[2], tool="read_file")
+    assert code_route_decision(h + now(WEATHER[3]), tool, None, 3)[0] is False
+
+
+# The router's own signal, as LiteLLM loads it from the mounted config.yaml.
+@pytest.fixture(scope="module")
+def router_signal() -> CodeTextSignal:
+    signal, error = load_code_text_signal(str(ROUTER_CONFIG))
+    assert signal is not None, error
+    return signal
+
+
+def test_the_real_code_kw_loads_and_keeps_the_router_semantics(router_signal):
+    assert router_signal.operator == "OR" and len(router_signal.patterns) >= 5
+    assert router_signal.matches("Make me a scientific calculator!")
+    assert router_signal.matches("there should be a test for each function")
+    assert router_signal.matches("The tests have to use exactly the same functions the calculator uses.")
+    for question in WEATHER + ["How far is the nearest star?", "Looks the same"]:
+        assert not router_signal.matches(question), question
+
+
+def test_a_code_kw_message_is_relevant_without_any_tool_call(router_signal):
+    tool = DEFAULT_CODE_ROUTE_TOOL_REGEX
+    h = coding("Refactor this function please", tool=None)
+    assert code_route_decision(h + now(WEATHER[0]), tool, router_signal, 3) == (
+        True, "message matches code_kw 1 exchange(s) ago; 0/3 irrelevant since")
+    assert code_route_decision(h + now(WEATHER[0]), tool, None, 3) == (False, "")   # tool checks only
+    assert code_route_decision(now("fix the python script"), tool, router_signal, 3) == (
+        True, "message matches code_kw in this exchange")
+
+
+def test_compile_code_text_signal_mirrors_go_semantics():
+    words = compile_code_text_signal({"operator": "OR", "case_sensitive": False, "keywords": ["function", "```"]})
+    assert words.matches("a FUNCTION here") and not words.matches("functions")   # whole literal word
+    assert words.matches("see```x")                       # no letters or digits -> no \b, a plain substring
+    regex = compile_code_text_signal({"method": "regex", "case_sensitive": False, "keywords": [r"\bfunctions?\b"]})
+    assert regex.matches("Functions") and not regex.matches("dysfunctional")
+    cased = compile_code_text_signal({"method": "regex", "case_sensitive": True, "keywords": ["Go"]})
+    assert cased.matches("Go") and not cased.matches("go")
+    both = compile_code_text_signal({"operator": "AND", "keywords": ["docker", "compose"]})
+    assert both.matches("docker compose up") and not both.matches("docker run")
+    none = compile_code_text_signal({"operator": "NOR", "keywords": ["weather"]})
+    assert none.matches("code") and not none.matches("weather")
+    assert not words.matches("") and not words.matches(None)
+
+
+@pytest.mark.parametrize("rule", [None, {}, {"keywords": []}, {"keywords": [""]}, {"keywords": [3]},
+                                  {"operator": "XOR", "keywords": ["a"]},
+                                  {"method": "regex", "keywords": ["(unclosed"]}])
+def test_compile_code_text_signal_rejects_bad_rules(rule):
+    with pytest.raises(ValueError):
+        compile_code_text_signal(rule)
+
+
+def test_load_code_text_signal_failures_return_an_error(tmp_path):
+    assert load_code_text_signal(str(tmp_path / "missing.yaml"))[0] is None
+    assert load_code_text_signal("")[1] == "CODE_ROUTE_ROUTER_CONFIG is empty"
+    other = tmp_path / "other.yaml"
+    other.write_text("routing:\n  signals:\n    keywords:\n      - name: privacy_kw\n        keywords: [ssn]\n",
+                     encoding="utf-8")
+    signal, error = load_code_text_signal(str(other))
+    assert signal is None and "no keyword signal 'code_kw'" in error
+
+
+@pytest.mark.parametrize("raw,expected", [(None, (3, "")), ("", (3, "")), (" 5 ", (5, "")), ("0", (0, "")), (2, (2, ""))])
+def test_parse_code_route_cooldown(raw, expected):
+    assert parse_code_route_cooldown(raw) == expected
+
+
+@pytest.mark.parametrize("raw", ["-1", "three", "1.5"])
+def test_parse_code_route_cooldown_rejects_junk(raw):
+    value, error = parse_code_route_cooldown(raw)
+    assert value == DEFAULT_CODE_ROUTE_COOLDOWN and "invalid CODE_ROUTE_COOLDOWN" in error
+
+
+def test_the_hook_applies_the_cooldown_and_logs_the_drop():
+    records = []
+
+    class Grab(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    grab = Grab()
+    overflow.logger.addHandler(grab)
+    try:
+        h = make_handler()
+        history = coding()
+        models = []
+        for question in WEATHER:
+            data = {"model": "local-general", "messages": copy.deepcopy(history + now(question))}
+            pre_call(h, data)
+            models.append(data["model"])
+            history += chatting(question)
+    finally:
+        overflow.logger.removeHandler(grab)
+    assert models == ["local-code", "local-code", "local-code", "local-general"]
+    assert h.stats["code_routes"] == 3 and h.stats["code_route_cooldowns"] == 1
+    assert records[-1] == ("[route] local-general stays (cooldown: 3/3 irrelevant exchanges since the last "
+                           "one that called sandbox-mcp_write_files)")
+
+
+def test_handler_loads_the_router_config_from_a_path():
+    h = make_handler(code_text_signal=str(ROUTER_CONFIG))
+    assert isinstance(h.code_text_signal, CodeTextSignal)
+    data = {"model": "local-general", "messages": now("Make me a scientific calculator!")}
+    assert pre_call(h, data) is data and data["model"] == "local-code"
 
 
 # ── config invariants ─────────────────────────────────────────────────────────
@@ -492,6 +702,19 @@ def test_regex_default_is_the_same_in_code_compose_and_env_example():
              if ln.startswith("CODE_ROUTE_TOOL_REGEX=")]
     assert lines == [f"CODE_ROUTE_TOOL_REGEX={DEFAULT_CODE_ROUTE_TOOL_REGEX}"]
     assert "$" not in DEFAULT_CODE_ROUTE_TOOL_REGEX  # .env would need $$
+
+
+@needs_yaml
+def test_cooldown_default_and_router_config_mount_agree():
+    service = yaml.safe_load(COMPOSE.read_text(encoding="utf-8"))["services"]["litellm"]
+    env = service["environment"]
+    assert env["CODE_ROUTE_COOLDOWN"] == f"${{CODE_ROUTE_COOLDOWN:-{DEFAULT_CODE_ROUTE_COOLDOWN}}}"
+    assert env["CODE_ROUTE_ROUTER_CONFIG"] == overflow.DEFAULT_CODE_ROUTE_ROUTER_CONFIG
+    mount = f"../semantic-router/config.yaml:{overflow.DEFAULT_CODE_ROUTE_ROUTER_CONFIG}:ro"
+    assert mount in service["volumes"]
+    assert (COMPOSE.parent / "../semantic-router/config.yaml").resolve() == ROUTER_CONFIG.resolve()
+    lines = [ln for ln in ENV_EXAMPLE.read_text(encoding="utf-8").splitlines() if ln.startswith("CODE_ROUTE_COOLDOWN=")]
+    assert lines == [f"CODE_ROUTE_COOLDOWN={DEFAULT_CODE_ROUTE_COOLDOWN}"]
 
 
 # ── against real LiteLLM ──────────────────────────────────────────────────────

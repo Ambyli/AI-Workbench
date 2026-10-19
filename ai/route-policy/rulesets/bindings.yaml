@@ -1,0 +1,17 @@
+# Seed bindings: which ruleset decides for which requested model.
+#
+# Applied at every startup (route_policy/rulesets/store.py::seed_and_load):
+# each entry is upserted into the `bindings` table. `version` omitted = the
+# highest version of that ruleset baked into this image, so bumping
+# default.yaml's version re-points `auto` on the next deploy.
+#
+#   model       the requested model (LiteLLM's `auto` alias)
+#   key_alias   optional: only requests from this LiteLLM key alias (a test
+#               key can run a draft ruleset); omitted = every key
+#   ruleset     a ruleset id from this directory
+#   version     optional: pin a version
+#
+# Phase 2: startup owns these rows. Editing bindings at runtime is the
+# phase-5 write API.
+- model: auto
+  ruleset: default

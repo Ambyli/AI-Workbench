@@ -1,0 +1,21 @@
+[project]
+name = "route-policy"
+version = "0.1.0"
+description = "Route-policy engine: rulesets of evaluators pick a LiteLLM chain alias for each `auto` turn, and every decision is logged to route-policy-db"
+requires-python = ">=3.11"
+dependencies = [
+    # common.conversation (split_exchanges, called_tool_names, message_text)
+    # and common.keywordmatch (the Go-RE2 keyword-rule compiler) -- both
+    # stdlib-only, so no extra is needed.
+    "common",
+    "fastapi",
+    "uvicorn",
+    "pydantic>=2",
+    # route-policy-db: rulesets, bindings, decisions, evaluations, outcomes,
+    # all through route_policy/db/pool.py's one pool.
+    "asyncpg",
+    "prometheus-client",
+    "prometheus-fastapi-instrumentator",
+    # rulesets/*.yaml and their patterns_ref files (yaml.safe_load).
+    "pyyaml",
+]

@@ -1,4 +1,4 @@
-"""This deployment's LiteLLM proxy hooks -- one CustomLogger, three jobs.
+"""This deployment's LiteLLM proxy hooks -- one CustomLogger, four jobs.
 
 LiteLLM loads them through the shim ai/litellm/overflow.py
 (``litellm_settings.callbacks: ["overflow.handler"]``), which imports this
@@ -17,7 +17,10 @@ at /app/common the same way.
     overflow/       job 1: spill a chain alias to its next `order` when a
                     local vLLM is busy, down, or too small for the prompt
     footer/         job 2: the `auto` footer naming the backend that answered
-    routing/        job 3: the local-general -> local-code code-tool remap
+    routing/        job 3: the local-general -> local-code code-tool remap;
+                    job 4: the route-policy client (shadow mode: /decide and
+                    /observe for every `auto` request, logged by the service,
+                    never changing routing)
 
 Importing this package, or a helper module in it, builds no handler and
 starts nothing; only hooks.settings reads the environment (once, when first

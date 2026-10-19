@@ -1,0 +1,63 @@
+Zeo patch 0005 — send the assistant message id to LiteLLM beside the chat id.
+
+Target: Open WebUI v0.11.4 (ghcr.io/open-webui/open-webui:v0.11.4).
+Applied by ai/openwebui/Dockerfile.openwebui with `patch -p1` from /app.
+
+Upstream: with ENABLE_FORWARD_USER_INFO_HEADERS=true, every request to an
+OpenAI-compatible connection carries X-OpenWebUI-User-Name/-Id/-Email/-Role,
+and a chat-completions request also carries X-OpenWebUI-Chat-Id
+(routers/openai.py, get_headers_and_cookies). X-OpenWebUI-Message-Id
+(FORWARD_SESSION_INFO_HEADER_MESSAGE_ID, already defined in env.py) is only
+sent to tool servers (utils/tools.py, build_tool_server_headers), so LiteLLM
+can tell which chat a request belongs to but not which turn.
+
+This patch adds the message id in the same place and under the same guards
+as the chat id: the flag is on, there is a user, and the request's metadata
+has a `message_id`. Only generate_chat_completion passes metadata, so the
+header goes on chat-completions requests only. On a chat sent from the UI
+the value is the id of the ASSISTANT message being generated
+(main.py::chat_completion, per_model_metadata['message_id']): one per model
+in a multi-model chat, a new one on regenerate, and the same one on every
+tool-round follow-up and auto-continue nudge of that turn. Task-model calls
+(title, tags, follow-ups, queries) carry the chat id but no message id. A
+direct API caller gets the `id` it sent, if any.
+
+Used by the LiteLLM route-policy hook (ai/litellm/hooks/routing/) to key
+shadow decisions to a chat turn. No new env var: ENABLE_FORWARD_USER_INFO_HEADERS
+(compose: ${OPENWEBUI_ENABLE_FORWARD_USER_INFO_HEADERS:-false}) turns both
+ids on or off; FORWARD_SESSION_INFO_HEADER_MESSAGE_ID renames the header.
+
+Files: backend/open_webui/routers/openai.py.
+See ai/openwebui/OPENWEBUI.md § Forwarded user and session headers and
+§ Custom image. Tests: unit-tests/openwebui/ (run the patched block straight
+out of this file).
+
+--- a/backend/open_webui/routers/openai.py
++++ b/backend/open_webui/routers/openai.py
+@@ -28,8 +28,9 @@
+     BYPASS_MODEL_ACCESS_CONTROL,
+     ENABLE_FORWARD_USER_INFO_HEADERS,
+     ENABLE_OPENAI_API_PASSTHROUGH,
+     FORWARD_SESSION_INFO_HEADER_CHAT_ID,
++    FORWARD_SESSION_INFO_HEADER_MESSAGE_ID,
+     MODELS_CACHE_TTL,
+     REDIS_KEY_PREFIX,
+ )
+ from open_webui.events import EVENTS, publish_event, publish_model_provider_request_failed
+@@ -179,8 +180,16 @@
+     if ENABLE_FORWARD_USER_INFO_HEADERS and user:
+         headers = include_user_info_headers(headers, user, request=request)
+         if metadata and metadata.get('chat_id'):
+             headers[FORWARD_SESSION_INFO_HEADER_CHAT_ID] = metadata.get('chat_id')
++        # ZEO PATCH 0005 (ai/openwebui/patches/0005-forward-message-id-header.patch):
++        # also send the assistant message id beside the chat id, so LiteLLM can
++        # tie each chat-completions request to the turn it answers. Upstream
++        # sends this header to tool servers only (utils/tools.py). str(): a
++        # direct API caller may send a non-string `id`, and aiohttp only takes
++        # str header values.
++        if metadata and metadata.get('message_id'):
++            headers[FORWARD_SESSION_INFO_HEADER_MESSAGE_ID] = str(metadata['message_id'])
+ 
+     token = None
+     auth_type = config.get('auth_type')
+ 

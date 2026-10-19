@@ -4,8 +4,10 @@ container, and the class-body rule the proxy dispatches by.
 
 * The proxy activates async_post_call_streaming_iterator_hook and
   async_pre_call_hook only when the NAME is in the registered class's own
-  __dict__ (proxy/utils.py:1718-1745 at v1.95.0) -- so all four hooks must be
-  defined on Handler itself, not inherited.
+  __dict__ (proxy/utils.py:1718-1745 at v1.95.0) -- so all five hooks must be
+  defined on Handler itself, not inherited (async_post_call_failure_hook is
+  dispatched on any CustomLogger, but stays in the class body by the same
+  rule, so no hook can drift onto a component).
 * overflow.py exports nothing but `handler`, refuses a foreign top-level
   `hooks`, and leaves sys.path as it found it.
 * A fresh interpreter laid out like the container's /app -- built from the
@@ -60,9 +62,13 @@ needs_yaml = pytest.mark.skipif(yaml is None, reason="needs PyYAML")
 
 
 # ── the leaf-class rule ──────────────────────────────────────────────────────
+DISPATCHED = ("async_filter_deployments", "async_pre_call_hook", "async_post_call_success_hook",
+              "async_post_call_failure_hook")
+
+
 def test_dispatched_hooks_are_defined_on_the_leaf_class():
     """Not inherited from a mixin or base: the proxy reads type(cb).__dict__."""
-    for name in ("async_filter_deployments", "async_pre_call_hook", "async_post_call_success_hook"):
+    for name in DISPATCHED:
         assert name in Handler.__dict__, name
         assert inspect.iscoroutinefunction(Handler.__dict__[name]), name
     assert "async_post_call_streaming_iterator_hook" in Handler.__dict__
@@ -128,6 +134,7 @@ print(json.dumps({
     "signal": type(h.code_route.text_signal).__name__,
     "regex": getattr(h.code_route.regex, "pattern", None),
     "footer": h.footer.enabled,
+    "policy": [h.policy.enabled, h.policy.base_url, h.policy.timeout],
 }))
 '''
 
@@ -160,7 +167,7 @@ def test_container_layout_loads_the_hook_in_a_fresh_interpreter(tmp_path):
     script = tmp_path / "child.py"
     script.write_text(CHILD, encoding="utf-8")
     env = dict(os.environ)
-    for name in [k for k in env if k.startswith(("OVERFLOW_", "CODE_ROUTE_", "AUTO_FOOTER_"))]:
+    for name in [k for k in env if k.startswith(("OVERFLOW_", "CODE_ROUTE_", "AUTO_FOOTER_", "ROUTE_POLICY_"))]:
         del env[name]
     # As the compose file sets it, relocated under the temporary /app.
     env["CODE_ROUTE_ROUTER_CONFIG"] = str(app / "semantic-router-config.yaml")
@@ -175,20 +182,22 @@ def test_container_layout_loads_the_hook_in_a_fresh_interpreter(tmp_path):
     assert got["mro"][0] == "hooks.handler.Handler"
     if litellm is not None:
         assert "litellm.integrations.custom_logger.CustomLogger" in got["mro"]
-    assert got["class_hooks"] == ["async_filter_deployments", "async_post_call_streaming_iterator_hook",
-                                  "async_post_call_success_hook", "async_pre_call_hook"]
+    assert got["class_hooks"] == ["async_filter_deployments", "async_post_call_failure_hook",
+                                  "async_post_call_streaming_iterator_hook", "async_post_call_success_hook",
+                                  "async_pre_call_hook"]
     assert _same(got["hooks_file"], app / "hooks" / "__init__.py")
     assert len(got["common_path"]) == 1 and _same(got["common_path"][0], app / "common")
     common = {m for m in got["modules"] if m.split(".")[0] == "common"}
     assert common == {"common", "common.conversation", "common.conversation.history",
                       "common.keywordmatch", "common.keywordmatch.rules"}
     assert {"hooks.handler", "hooks.settings", "hooks.overflow.filter", "hooks.footer.stream",
-            "hooks.routing.code_route"} <= set(got["modules"])
+            "hooks.routing.code_route", "hooks.routing.policy_client"} <= set(got["modules"])
     assert got["documents_visible"] is False  # only the mounted parts of common exist
     assert got["path_restored"] is True and got["shim_registered"] is False
     assert got["backend_is_dataclass"] is True
     assert got["signal"] == "KeywordRule"  # the mounted router config was read
     assert got["regex"] == DEFAULT_CODE_ROUTE_TOOL_REGEX and got["footer"] is True
+    assert got["policy"] == [True, "http://route-policy:8000", 2.0]  # the defaults: on, by service DNS
 
 
 # ── repo invariants ──────────────────────────────────────────────────────────

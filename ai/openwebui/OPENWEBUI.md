@@ -55,6 +55,7 @@ Every value is sourced from `.env` so configuration lives in one file.
 | `USER_AGENT` | `OPENWEBUI_USER_AGENT` | `OpenWebUI/1.0 (+github.com/open-webui/open-webui)` | User-Agent applied to outbound HTTP from RAG / web loaders (langchain_community); silences the "USER_AGENT not set" warning |
 | `MCP_INITIALIZE_TIMEOUT` | `OPENWEBUI_MCP_INITIALIZE_TIMEOUT` | `30` | Seconds to wait for an MCP server's initialize handshake; raise for slow cold-starts (upstream default: 10) |
 | `AUTO_CONTINUE_MAX_NUDGES` | `OPENWEBUI_AUTO_CONTINUE_MAX_NUDGES` | `2` | **Zeo patch, not upstream.** Nudges per turn when a model announces a tool call without making it; `0` = off. Read on every boot. See [Auto-continue announced tool calls](#auto-continue-announced-tool-calls) |
+| `ENABLE_FORWARD_USER_INFO_HEADERS` | `OPENWEBUI_ENABLE_FORWARD_USER_INFO_HEADERS` | `true` (compose fallback `false`) | Upstream flag. Sends the user (`X-OpenWebUI-User-*`) and, on chat completions, the chat id and — **Zeo patch `0005`** — the message id to LiteLLM. Also sends the user headers to kokoro-api, every tool server and the terminal. Read on every boot. See [Forwarded user and session headers](#forwarded-user-and-session-headers) |
 | `AIOHTTP_CLIENT_TIMEOUT` | `OPENWEBUI_AIOHTTP_CLIENT_TIMEOUT` | `900` | Hard cap in seconds, **streaming included**, on every chat completion Open WebUI sends to LiteLLM (also `search_web`, `fetch_url`, and MCP tool servers by inheritance). v0.11.4 `utils/session_pool.py:43-51`. The outermost layer of the `auto` budget (900 > LiteLLM 870 > Envoy 840) — see [SEMANTIC_ROUTER.md § Timeout budget](../semantic-router/SEMANTIC_ROUTER.md#timeout-budget). Was `300`: the 5-minute "Error submitting message". Read on **every** boot, unlike the rest of this table — apply with `make up openwebui` |
 | `AIOHTTP_CLIENT_STREAM_IDLE_TIMEOUT` | `OPENWEBUI_AIOHTTP_CLIENT_STREAM_IDLE_TIMEOUT` | `900` | Max silence (`sock_read`) on a streaming response. On `auto` a turn is silent until it is complete (Envoy buffers it), so this must not be shorter than the cap above. Was `60`. Trade-off: shared with `fetch_url`, which now waits up to 900 s on a stalled site — [SEARXNG.md § Troubleshooting](../searxng/SEARXNG.md#troubleshooting-fetch_url--search-hangs) |
 | `CORS_ALLOW_ORIGIN` | `CORS_ALLOW_ORIGIN` | `*` | Tighten to a specific origin if another web app calls Open WebUI's API from the browser |
@@ -505,6 +506,51 @@ docker logs openwebui 2>&1 | grep auto-continue
 
 In the chat the user sees the announcement, then the model's continuation in the same message (with a second `auto` footer, because each request through `auto` gets one). If a model keeps announcing, the turn ends after `N` nudges. The heuristic lives in `backend/open_webui/utils/zeo_auto_continue.py`; `unit-tests/openwebui/` tests it on the real announcements and endings, loading the module straight out of the patch file (`uv run --no-sync pytest unit-tests/openwebui -q`).
 
+### Forwarded user and session headers
+
+LiteLLM's route-policy hook (`ai/litellm/hooks/routing/`) keys each routing decision to the chat turn it served. It learns the chat and the turn from request headers that Open WebUI adds when `OPENWEBUI_ENABLE_FORWARD_USER_INFO_HEADERS=true` (upstream's `ENABLE_FORWARD_USER_INFO_HEADERS`; compose fallback `false`, `.env.example` `true`; only the literal `true` turns it on). Plain env, read on every boot: a change is `make up openwebui`.
+
+What a request to LiteLLM then carries:
+
+| Header | Value | Sent on |
+|---|---|---|
+| `X-OpenWebUI-User-Name` / `-Id` / `-Email` / `-Role` | the signed-in user (name URL-encoded); plus `X-OpenWebUI-Auth-Type` when the caller used an API key or JWT | every request to an OpenAI-compatible connection: chat, the model list on each page load, embeddings |
+| `X-OpenWebUI-Chat-Id` | the chat id | chat completions that belong to a chat: the turn itself, its tool rounds, and task-model calls for that chat (title, tags, follow-ups, search queries) |
+| `X-OpenWebUI-Message-Id` | the id of the **assistant** message being generated | **patch `0005`**: the turn, every tool-round follow-up and every auto-continue nudge of it (all the same id); one per model in a multi-model chat; a new one on regenerate. Task-model calls carry none. A direct `/api/chat/completions` call gets the `id` it sent, if any |
+
+Upstream builds these in `routers/openai.py::get_headers_and_cookies`, and only the chat-completions path passes it the request metadata, so the two ids never appear on the model list or embeddings. LiteLLM keeps them in `metadata.headers` (lower-cased keys) for its hooks and does not pass them on to vLLM or Anthropic (`forward_client_headers_to_llm_api` is not set). Any client with a LiteLLM key can send the same headers, so treat them as labels, not proof of identity.
+
+**Who else receives them.** The flag is not scoped to LiteLLM. On v0.11.4 it also adds the user headers to:
+
+| Recipient | On this install | Also gets the ids? |
+|---|---|---|
+| TTS, `openai` engine | `kokoro-api` (`http://kokoro-api:8000/v1`) | no |
+| every MCP and OpenAPI tool server (Admin Settings → External Tools) | Phoenix (`https://phoenix-mcp.com/mcp`, over the internet), the sandbox MCP server, sandbox-runner's `/tool` server if registered | yes, on tool calls (upstream). Patch `0003`'s Phoenix probe sends the user headers only |
+| terminal servers | `open-terminal` (it already gets `X-User-Id` / `X-Session-Id` without the flag) | yes |
+| RAG embeddings (`openai` / `ollama` / `azure`), external reranker, Mistral OCR, image generation / editing (`openai`), STT (`openai`), Ollama, Anthropic connections | not configured in `.env`; the `openai` RAG / image / STT engines default to `OPENWEBUI_OPENAI_API_BASE_URL`, i.e. LiteLLM | no |
+
+SearXNG gets nothing. Connections are PersistentConfig rows, so check what the box really has (prints URLs only, no keys):
+
+```bash
+docker exec -i openwebui python3 - <<'EOF'
+import json, sqlite3
+cfg = {k: json.loads(v) for k, v in sqlite3.connect('/app/backend/data/webui.db').execute('select key, value from config')}
+print('openai', cfg.get('openai.api_base_urls'), '| ollama', cfg.get('ollama.enable'), cfg.get('ollama.base_urls'))
+for key in ('tool_server.connections', 'terminal_server.connections'):
+    for c in cfg.get(key) or []:
+        print(key, c.get('type'), c.get('url'))
+for key in ('audio.tts.engine', 'audio.tts.openai.api_base_url', 'audio.stt.engine', 'rag.embedding_engine',
+            'rag.reranking_engine', 'rag.content_extraction_engine', 'image_generation.enable', 'image_generation.engine'):
+    print(key, cfg.get(key))
+EOF
+```
+
+A key the script prints as `None` has no row and runs on its env / upstream default.
+
+**LiteLLM-only alternative, no flag and no patch.** Upstream's per-connection headers fill `{{CHAT_ID}}`, `{{MESSAGE_ID}}` and `{{USER_ID}}` from the same metadata (`utils/headers.py::parse_custom_headers`). Set them in Admin Settings → Connections → the LiteLLM connection → Headers: `{"X-OpenWebUI-Chat-Id": "{{CHAT_ID}}", "X-OpenWebUI-Message-Id": "{{MESSAGE_ID}}", "X-OpenWebUI-User-Id": "{{USER_ID}}"}`. Nothing then reaches kokoro-api, the tool servers or the terminal. The costs: the setting lives in the `openai.api_configs` DB row, not in this repo (`OPENAI_API_CONFIGS` is first-boot-only), and a missing value is sent as an empty header rather than left out.
+
+**Checking it on the box** after `make up openwebui`: `docker exec openwebui printenv ENABLE_FORWARD_USER_INFO_HEADERS` says `true`; then send a chat on `auto` and the route-policy decisions for that chat (`GET /chats/{chat_id}/decisions` on `route-policy`) have both `chat_id` and `message_id` set, with `message_id` equal to the assistant message's id in the chat. A tool round or nudge in the same turn repeats the same `message_id` under a new `decision_id`.
+
 ### Context compaction
 
 v0.11.4 ships **Context Compaction** (`backend/open_webui/utils/context_compaction.py`), **off by default**. Once a chat's context passes a token threshold, it summarises the oldest turns and sends the summary in their place. It is upstream code with no patch; this section only records how this install should set it.
@@ -613,6 +659,7 @@ If Open WebUI shows "Server Connection Error" on play, `make logs openwebui` —
 | `0002-trusted-header-google-identity.patch` | Adds `WEBUI_AUTH_TRUSTED_ACCESS_TOKEN_HEADER`. In trusted-header SSO mode, verify the asserted identity with Google using the access token oauth2-proxy forwards, and take display name + picture from Google's userinfo on every sign-in. Rationale and security in [Single sign-on](#single-sign-on) | `backend/open_webui/env.py`, `routers/auths.py`, `utils/trusted_proxy.py` (new) |
 | `0003-oauth-mcp-defaults-no-redirect.patch` | A model's default OAuth MCP tools stay in **that user's** `GET /api/models` `toolIds` only while the user holds a token the MCP server accepts (live `initialize` probe, cached), so a new chat no longer redirects to the MCP server's authorize page. Also makes `OAuthClientManager.get_oauth_token` refresh single-flight and delete a session only when it can never be renewed. Always on, no env var. Backend-only because the image ships the Svelte frontend pre-compiled. Details in [MCP tools (Phoenix)](#mcp-tools-phoenix) | `backend/open_webui/main.py`, `utils/oauth.py`, `utils/mcp_oauth_defaults.py` (new) |
 | `0004-auto-continue-announced-tool-calls.patch` | With native function calling, when a model ends the tool loop right after a tool result by **announcing** its next step ("I'll rewrite the file and re-run.") instead of making the call, send a hidden nudge and continue the turn in the same assistant message, up to `AUTO_CONTINUE_MAX_NUDGES` times per turn (default 2, `0` = off). The nudge is never shown or saved. Details in [Auto-continue announced tool calls](#auto-continue-announced-tool-calls) | `backend/open_webui/utils/middleware.py`, `utils/zeo_auto_continue.py` (new) |
+| `0005-forward-message-id-header.patch` | With `ENABLE_FORWARD_USER_INFO_HEADERS` on, a chat-completions request to an OpenAI-compatible connection (LiteLLM) also carries `X-OpenWebUI-Message-Id`, the assistant message being generated, beside upstream's `X-OpenWebUI-Chat-Id`. Upstream sent the message id to tool servers only. Same guards as the chat id: flag on, a user, metadata with a `message_id`. No new env var. Details in [Forwarded user and session headers](#forwarded-user-and-session-headers) | `backend/open_webui/routers/openai.py` |
 
 (`0001` was a `login_hint` patch for the two-hop OAuth path; it was retired when one-gate SSO replaced that path.)
 
@@ -625,6 +672,8 @@ docker exec openwebui test -f /app/backend/open_webui/utils/mcp_oauth_defaults.p
 docker exec openwebui grep -q _zeo_refresh_single_flight /app/backend/open_webui/utils/oauth.py && echo 0003 refresh fix
 docker exec openwebui grep -q zeo_auto_continue_round /app/backend/open_webui/utils/middleware.py && echo 0004 patched
 docker exec openwebui printenv AUTO_CONTINUE_MAX_NUDGES   # expect 2 (0 = feature off)
+docker exec openwebui grep -qF 'headers[FORWARD_SESSION_INFO_HEADER_MESSAGE_ID]' /app/backend/open_webui/routers/openai.py && echo 0005 patched
+docker exec openwebui printenv ENABLE_FORWARD_USER_INFO_HEADERS   # expect true, or no ids are sent at all
 ```
 
 #### Regenerating a patch for a new upstream version
@@ -648,9 +697,11 @@ For `0003`, regenerate the same way with `main.py`, `utils/oauth.py` and `utils/
 
 For `0004`, regenerate with `utils/middleware.py` and `utils/zeo_auto_continue.py` (new). The middleware hunk is two pieces inside `streaming_chat_response_handler`'s `response_handler`: the nested `zeo_auto_continue_round()` defined right after `emit_output()`, and the loop head `while (tool_calls or await zeo_auto_continue_round()) and (…)`. Before trusting it on a new tag, re-check that the native tool loop is still that `while tool_calls and (…)` loop; that a tool round still builds its follow-up as `[*form_data['messages'], *convert_output_to_messages(output, raw=True, reasoning_format=…, flatten_tool_images=True)]`, runs the `request` filters, `normalize_messages_for_model` and `generate_chat_completion(…, bypass_system_prompt=True)`; and that it still streams the reply with the `prior_output = list(full_output())` → `stream_body_handler` → `output = full_output()` bookkeeping. The hook copies those steps, so if upstream changes them, change the hook to match. If upstream ships its own "continue when the model only announced an action" option, retire the patch. Then run `uv run --no-sync pytest unit-tests/openwebui -q` — the tests read the module out of the patch file.
 
+For `0005`, regenerate with `routers/openai.py` only, and with `diff -U4` instead of `diff -u`: four lines of context put the `if ENABLE_FORWARD_USER_INFO_HEADERS and user:` line into the hunk, so the patch refuses to apply if upstream moves or changes that guard, and `unit-tests/openwebui/test_forward_message_id.py` runs the whole block out of the hunk. Before trusting it on a new tag, re-check that `get_headers_and_cookies` still adds the chat-id header inside that guard; that `generate_chat_completion` is still the only caller that passes `metadata`; that `main.py::chat_completion` still puts the assistant message id into `metadata['message_id']` (`per_model_metadata` on the websocket path, `metadata['message_id'] = message_ids[0]['message_id']` on the direct path); and that `env.py` still defines `FORWARD_SESSION_INFO_HEADER_MESSAGE_ID`. If upstream starts sending the message id to OpenAI connections itself, retire the patch.
+
 #### Adding another patch
 
-Number it `0005-….patch` (the next free number), keep the `a/` / `b/` path prefixes, list it in the Dockerfile header comment and the `com.zeoenergy.openwebui.patches` label, add its modules to the `ast.parse` list and a `grep -q` guard for something only the patched code contains. Patches apply in filename order.
+Number it `0006-….patch` (the next free number), keep the `a/` / `b/` path prefixes, list it in the Dockerfile header comment and the `com.zeoenergy.openwebui.patches` label, add its modules to the `ast.parse` list and a `grep -q` guard for something only the patched code contains. Patches apply in filename order.
 
 ### Updating the image
 

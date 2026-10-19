@@ -196,6 +196,7 @@ environment, such as roofix's `.env` setting if it was exported, does nothing.
 | trino | `trino-mcp`, `superset` | `*-db`: Postgres. `lake-s3`: data directory. `hive-metastore`: migrates on start, and Trino caches its thrift connection. `trino-coordinator`: a cluster has one coordinator. The two `*-init` services are oneshot. |
 | semantic-router | `vllm-sr-router`, `vllm-sr-envoy` | `vllm-sr-dashboard`: host port. `vllm-sr-models-init` is oneshot. |
 | supabase | `supabase-api`, plus `auth`, `rest`, `storage`, `imgproxy`, `meta`, `studio`, `functions` (all as `supabase-<svc>-<hash>`) | `supabase-db`: Postgres. `realtime`: a logical replication slot. `supavisor`: migrates on start, and its TCP pooler ports. |
+| route-policy | `route-policy` | `route-policy-db`: Postgres. |
 | vllm, llama, unsloth | — | GPU or RAM, and host ports |
 | detector | — | `detector`: GPU. Its port is published by the edge, which answers `503` while it restarts or loads its model. |
 | classifier | — | `classifier-db`: Postgres. `classifier`: on startup, `recover()` requeues the running copy's jobs (`ai/classifier/jobs/queue.py`). Its port is published by the edge, which answers `503` while it restarts. |
@@ -238,6 +239,7 @@ service over TLS, [TLS](#tls)):
 | `PORT_SUPERSET` 8016 | 8016 | `superset:8088` | `GET /health` | swap | 300 s |
 | `PORT_SUPABASE_API` 8022 | 8022 | `supabase-api:8000` | TCP connect | swap | 300 s |
 | `PORT_SEMANTIC_ROUTER` 8025 | 8025 | `vllm-sr-envoy:8899` | TCP connect | swap | 900 s |
+| `PORT_ROUTE_POLICY` 8027 | 8027 | `route-policy:8000` | `GET /health` | swap | 300 s |
 | `PORT_CLASSIFIER` 8005 | 8005 | `classifier:8000` | `GET /health` | **recreate** | 600 s |
 | `PORT_SANDBOX_RUNNER` 8012 | 8012 | `sandbox-runner:8000` | `GET /health` | **recreate** | 300 s |
 | `PORT_DETECTOR` 8021 | 8021 | `detector:8000` | `GET /health` (503 until the model is loaded) | **recreate** | 120 s |

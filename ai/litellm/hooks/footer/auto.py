@@ -33,6 +33,7 @@ the whole feature off. See ai/litellm/LITELLM.md > The `auto` footer.
 from __future__ import annotations
 
 import sys
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ..deployments import strip_provider
@@ -59,6 +60,29 @@ def proxy_router() -> Any:
     """The running proxy's Router, without importing the proxy (tests, scripts)."""
     mod = sys.modules.get("litellm.proxy.proxy_server")
     return getattr(mod, "llm_router", None) if mod is not None else None
+
+
+@dataclass(frozen=True)
+class Served:
+    """Who answered an `auto` request (AutoFooter.served).
+
+    chain     the chain alias (model group) that served it: local-general, ...
+    model     that deployment's litellm_params.model: openai/qwen3.8-solo, ...
+    bypassed  `auto` fell back past the router (its fallbacks: local-private)
+    """
+
+    chain: Optional[str]
+    model: Optional[str]
+    bypassed: bool
+
+
+def is_claude(model: Optional[str]) -> bool:
+    """True for a Claude deployment (anthropic/..., or a bare claude-* name) --
+    the only deployments that answer a chain as overflow."""
+    if not isinstance(model, str) or not model:
+        return False
+    name = clean(strip_provider(model)) or ""
+    return model.startswith("anthropic/") or name.startswith("claude")
 
 
 class AutoFooter:
@@ -144,13 +168,30 @@ class AutoFooter:
             return None
 
     def label(self, headers: Dict[str, Any], data: Any) -> Optional[str]:
-        """'qwen3.8-solo · local-general', or None when the backend is unknown.
+        """'qwen3.8-solo · local-general', or None when the backend is unknown
+        (see served() for where each part comes from)."""
+        served = self.served(headers, data)
+        name = clean(strip_provider(served.model))
+        chain = clean(served.chain)
+        if not name or not chain:
+            return None
+        parts = [name, chain]
+        if is_claude(served.model):
+            parts.append(self.overflow_tag(chain))
+        if served.bypassed:
+            parts.append("router bypassed")
+        return FOOTER_SEP.join(parts)
+
+    def served(self, headers: Dict[str, Any], data: Any) -> Served:
+        """Which chain and deployment answered an `auto` request -- what the
+        footer names, and what the route-policy client reports in /observe.
 
         Inner LiteLLM (behind the router) -> llm_provider-x-litellm-model-id /
         -model-name / -model-group; the id is mapped through the proxy's own
         router because inner and outer are the same proxy. The OUTER deployment
         is data["deployment"] (common_request_processing.py:1707): when its
         group is not `auto`, `auto` fell back past the router to local-private.
+        May raise on malformed input; callers guard.
         """
         headers = headers or {}
         outer_group, outer_model = deployment_fields(data.get("deployment") if isinstance(data, dict) else None)
@@ -180,35 +221,44 @@ class AutoFooter:
             bypassed = True
         if bypassed:
             served, chain = outer_model, (outer_group if outer_group != AUTO_MODEL else None)
-
-        name = clean(strip_provider(served if isinstance(served, str) else None))
-        chain = clean(chain if isinstance(chain, str) else None)
-        if not name or not chain:
-            return None
-        parts = [name, chain]
-        if isinstance(served, str) and (served.startswith("anthropic/") or name.startswith("claude")):
-            parts.append(self.overflow_tag(chain))
-        if bypassed:
-            parts.append("router bypassed")
-        return FOOTER_SEP.join(parts)
+        return Served(
+            chain=chain if isinstance(chain, str) and chain else None,
+            model=served if isinstance(served, str) and served else None,
+            bypassed=bypassed,
+        )
 
     def overflow_tag(self, chain: str) -> str:
         """'overflow (local busy)' / '(local down)' from the overflow filter's
         CURRENT view of the chain's local backends -- an approximation of why
         Claude answered."""
+        reason = self.overflow_reason(chain)
+        if reason == DOWN:
+            return "overflow (local down)"
+        if reason == BUSY:
+            return "overflow (local busy)"
+        return "overflow"
+
+    def overflow_reason(self, chain: Any) -> Optional[str]:
+        """DOWN when every local backend of `chain` the filter knows is down,
+        BUSY when any is busy, else None (no verdict, or a call-time failure).
+        The CURRENT view, so only an approximation of why Claude answered.
+        Never raises."""
         try:
+            if not isinstance(chain, str) or not chain:
+                return None
+
             def find(name: str) -> Any:
                 router = self.router_getter()
                 return router.get_model_list(model_name=name) if router is not None else None
 
             verdicts = self.overflow.local_verdicts(chain, find)
             if verdicts and all(v == DOWN for v in verdicts):
-                return "overflow (local down)"
+                return DOWN
             if any(v == BUSY for v in verdicts):
-                return "overflow (local busy)"
+                return BUSY
         except Exception:
             pass
-        return "overflow"
+        return None
 
     def error(self, where: str, exc: BaseException) -> None:
         try:

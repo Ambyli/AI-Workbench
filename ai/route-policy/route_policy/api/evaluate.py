@@ -1,0 +1,46 @@
+"""POST /evaluate -- dry-run a ruleset on a conversation. Writes nothing.
+
+Either a stored version (``{"ruleset": {"id": "default", "version": 1}}``;
+version omitted = the highest) or an unsaved document (``{"document":
+{...}}``; ``patterns_ref`` refs resolve inside the baked rulesets directory),
+plus ``messages`` / ``tools`` / ``backends`` and optionally
+``requested_model`` (default ``auto``). Returns the /decide response shape
+with ``decision_id: null`` and, per vote, the evaluator's ``detail`` and
+``error``.
+
+    200  the decision
+    404  no such ruleset version
+    422  the body, or the document, is invalid -- ``detail.errors`` lists every problem
+"""
+
+from __future__ import annotations
+
+from fastapi import APIRouter, HTTPException, Request
+
+from ..engine import pipeline
+from ..rulesets.loader import RulesetFileError, resolve_refs
+from ..rulesets.validate import RulesetInvalid, compile_ruleset
+from .schemas import EvaluateRequest
+
+router = APIRouter()
+
+
+@router.post("/evaluate")
+async def evaluate(body: EvaluateRequest, request: Request) -> dict:
+    service = request.app.state.service
+    if body.document is not None:
+        try:
+            ruleset = compile_ruleset(resolve_refs(body.document, service.rulesets_dir))
+        except RulesetFileError as exc:
+            raise HTTPException(422, {"message": "the document's refs cannot be resolved",
+                                      "errors": [str(exc)]}) from None
+        except RulesetInvalid as exc:
+            raise HTTPException(422, {"message": "the document is not a valid ruleset",
+                                      "errors": exc.errors}) from None
+    else:
+        ruleset = await service.store.get(body.ruleset.id, body.ruleset.version)
+        if ruleset is None:
+            version = f"@{body.ruleset.version}" if body.ruleset.version else ""
+            raise HTTPException(404, f"no ruleset {body.ruleset.id}{version}")
+    decision = await pipeline.run(ruleset, body.context())
+    return decision.response(None, with_detail=True)

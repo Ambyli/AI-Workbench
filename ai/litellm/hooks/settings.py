@@ -63,3 +63,11 @@ CODE_ROUTE_TOOL_REGEX, CODE_ROUTE_TOOL_REGEX_ERROR = compile_code_route_regex(
 )
 CODE_ROUTE_COOLDOWN, CODE_ROUTE_COOLDOWN_ERROR = parse_code_route_cooldown(os.environ.get("CODE_ROUTE_COOLDOWN"))
 CODE_ROUTE_ROUTER_CONFIG = os.environ.get("CODE_ROUTE_ROUTER_CONFIG", DEFAULT_CODE_ROUTE_ROUTER_CONFIG)
+
+# -- The route-policy client, shadow mode (hooks/routing/policy_client.py) ------
+# Infrastructure only -- where the service is, whether to call it, how long a
+# background call may take. The routing rules live in the service's rulesets,
+# never here. Disabled, or an empty URL: no /decide, no /observe, nothing stashed.
+ROUTE_POLICY_ENABLED = _env_bool("ROUTE_POLICY_ENABLED", True)
+ROUTE_POLICY_URL = os.environ.get("ROUTE_POLICY_URL", "http://route-policy:8000").strip()
+ROUTE_POLICY_TIMEOUT_S = _env_float("ROUTE_POLICY_TIMEOUT_S", 2.0, minimum=0.1)

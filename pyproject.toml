@@ -6,6 +6,7 @@ members = [
     "ai/interceptor",
     "ai/classifier",
     "ai/detector",
+    "ai/route-policy",
     "ai/sandbox/runner",
     "ai/trino/mcp",
 ]

@@ -339,6 +339,13 @@ services:
       # catalog, an unset ${ENV:…} would stop the whole coordinator.
       CLASSIFIER_DB_NAME: ${CLASSIFIER_DB_NAME:-classifier}
       CLASSIFIER_TRINO_READER_PASSWORD: ${CLASSIFIER_TRINO_READER_PASSWORD:-}
+      # The route-policy service's Postgres (ai/route-policy, route-policy-db
+      # on ai_shared) -- rulesets, decisions, evaluations, outcomes. Read-only
+      # trino_reader role from ai/route-policy/db-init/10-trino-reader.sh.
+      # Consumed by catalogs/postgres_route_policy.properties. Same `:-`
+      # reasoning: an empty password fails only this catalog.
+      ROUTE_POLICY_DB_NAME: ${ROUTE_POLICY_DB_NAME:-route_policy}
+      ROUTE_POLICY_TRINO_READER_PASSWORD: ${ROUTE_POLICY_TRINO_READER_PASSWORD:-}
       # AWS Glue Data Catalog + S3 (what Athena queries). Consumed by
       # catalogs/aws_glue.properties via the Hive connector.
       AWS_GLUE_REGION: ${AWS_GLUE_REGION:-us-east-1}

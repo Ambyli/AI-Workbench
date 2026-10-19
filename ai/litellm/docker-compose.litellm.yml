@@ -65,6 +65,16 @@ services:
       # mounted below, so the two always agree.
       CODE_ROUTE_COOLDOWN: ${CODE_ROUTE_COOLDOWN:-3}
       CODE_ROUTE_ROUTER_CONFIG: /app/semantic-router-config.yaml
+      # Route-policy client, shadow mode (hooks/routing/policy_client.py): on
+      # every `auto` request, POST /decide to the route-policy service, and
+      # POST /observe once the answer is out -- fired in the background, never
+      # awaited, never changing routing. Infrastructure only (where the
+      # service is, whether to call it, how long a background call may take);
+      # the routing rules live in the service's rulesets. Defaults match
+      # hooks/settings.py. See ai/litellm/LITELLM.md > Route-policy shadow mode.
+      ROUTE_POLICY_ENABLED: ${ROUTE_POLICY_ENABLED:-true}
+      ROUTE_POLICY_URL: ${ROUTE_POLICY_URL:-http://route-policy:8000}
+      ROUTE_POLICY_TIMEOUT_S: ${ROUTE_POLICY_TIMEOUT_S:-2}
     env_file:
       - ../../.env
     volumes:

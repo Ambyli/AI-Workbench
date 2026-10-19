@@ -157,7 +157,7 @@ out of this file).
                      tool_call_iterations += 1
 --- /dev/null
 +++ b/backend/open_webui/utils/zeo_auto_continue.py
-@@ -0,0 +1,215 @@
+@@ -0,0 +1,216 @@
 +"""ZEO PATCH (ai/openwebui/patches/0004-auto-continue-announced-tool-calls.patch):
 +nudge a model that announces a tool call instead of making it.
 +
@@ -230,10 +230,11 @@ out of this file).
 +
 +MAX_NUDGES = read_max_nudges()
 +
-+# The footer ai/litellm/overflow.py appends to `auto` answers
++# The footer LiteLLM's ai/litellm/hooks/footer/ appends to `auto` answers
 +# ("\n\n---\n*muse-glimmer · local-general*"): a blank line, a `---` rule,
 +# then one *italic* line of at least two " · "-separated parts, at the very
-+# end. Same expression as overflow.FOOTER_RE (a test pins the two together).
++# end. Same expression as FOOTER_RE in ai/litellm/hooks/footer/render.py (a
++# test pins the two together).
 +FOOTER_RE = re.compile(r'(?:\r?\n){2,}---[ \t]*\r?\n\*[^*\r\n·]+(?: · [^*\r\n·]+)+\*[ \t]*(?:\r?\n[ \t]*)*\Z')
 +
 +_FENCED_CODE_RE = re.compile(r'```.*?(?:```|\Z)', re.S)
@@ -286,7 +287,7 @@ out of this file).
 +
 +
 +def strip_footer(text: str) -> str:
-+    """Remove trailing LiteLLM ``auto`` footers (repeatedly, like overflow.strip_footer)."""
++    """Remove trailing LiteLLM ``auto`` footers (repeatedly, like hooks/footer/render.py strip_footer)."""
 +    while True:
 +        stripped = FOOTER_RE.sub('', text)
 +        if stripped == text:

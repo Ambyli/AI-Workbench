@@ -15,6 +15,9 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 OK, BUSY, DOWN, UNKNOWN = "ok", "busy", "down", "unknown"
+# Reported only (BackendState.report): UNKNOWN because the last probe is older
+# than the stale window. The filter treats it exactly like UNKNOWN.
+STALE = "stale"
 # The context-fit drop reason (a hard drop, see context_fit.py).
 TOO_LONG = "too-long"
 
@@ -96,6 +99,16 @@ class BackendState:
         if not self.has_metrics:
             return UNKNOWN
         return BUSY if self.busy else OK
+
+    def report(self, now: float, stale_after: float) -> Dict[str, Any]:
+        """{verdict, waiting, running} for the route-policy client's
+        `backends` (the /decide contract): verdict() with STALE split out of
+        UNKNOWN, so a dead poller is distinguishable from a backend without
+        queue metrics. waiting / running are None when not known."""
+        verdict = self.verdict(now, stale_after)
+        if verdict == UNKNOWN and self.probed_at is not None and now - self.probed_at > stale_after:
+            verdict = STALE
+        return {"verdict": verdict, "waiting": self.waiting, "running": self.running}
 
     def snapshot(self, now: float, stale_after: float) -> Dict[str, Any]:
         return {

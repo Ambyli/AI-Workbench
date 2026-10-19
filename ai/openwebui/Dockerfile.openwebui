@@ -40,6 +40,12 @@
 #       appended to the same assistant message; the nudge is never shown or
 #       saved. Touches backend/open_webui/utils/middleware.py, adds
 #       utils/zeo_auto_continue.py.
+#   0005-forward-message-id-header.patch — with ENABLE_FORWARD_USER_INFO_HEADERS
+#       on, a chat-completions request to an OpenAI-compatible connection
+#       (LiteLLM) carries X-OpenWebUI-Message-Id (the assistant message id)
+#       beside upstream's X-OpenWebUI-Chat-Id, so LiteLLM can tie a request to
+#       the chat turn it answers. Upstream sends the message id to tool
+#       servers only. Touches backend/open_webui/routers/openai.py.
 
 ARG OPENWEBUI_VERSION=v0.11.4
 FROM ghcr.io/open-webui/open-webui:${OPENWEBUI_VERSION}
@@ -72,15 +78,17 @@ RUN set -eu; \
         backend/open_webui/utils/oauth.py \
         backend/open_webui/utils/mcp_oauth_defaults.py \
         backend/open_webui/utils/middleware.py \
-        backend/open_webui/utils/zeo_auto_continue.py; \
+        backend/open_webui/utils/zeo_auto_continue.py \
+        backend/open_webui/routers/openai.py; \
     grep -q "verify_google_identity" backend/open_webui/routers/auths.py; \
     grep -q "drop_unconnected_oauth_tool_defaults" backend/open_webui/main.py; \
     grep -q "_zeo_refresh_single_flight" backend/open_webui/utils/oauth.py; \
     grep -q "zeo_auto_continue_round" backend/open_webui/utils/middleware.py; \
+    grep -qF "headers[FORWARD_SESSION_INFO_HEADER_MESSAGE_ID]" backend/open_webui/routers/openai.py; \
     rm -rf /tmp/zeo-patches
 
 # Record the base and the patch set on the image so `docker image inspect`
 # can tell a patched build from a stock one.
 ARG OPENWEBUI_VERSION
 LABEL org.opencontainers.image.base.name="ghcr.io/open-webui/open-webui:${OPENWEBUI_VERSION}" \
-      com.zeoenergy.openwebui.patches="0002-trusted-header-google-identity,0003-oauth-mcp-defaults-no-redirect,0004-auto-continue-announced-tool-calls"
+      com.zeoenergy.openwebui.patches="0002-trusted-header-google-identity,0003-oauth-mcp-defaults-no-redirect,0004-auto-continue-announced-tool-calls,0005-forward-message-id-header"

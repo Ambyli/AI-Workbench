@@ -4,8 +4,10 @@ Trino coordinator + Hive Metastore + an S3 object store (`lake-s3`,
 RustFS) + Superset + a FastMCP shim,
 brought up by a single compose file. Federates SQL over the
 Postgres instances this repo runs (`litellm_db`, `roofix-db`, `sandbox-db`,
-`supabase-db`, and the classifier's `classifier-db` — jobs, references and
-per-call model usage, `postgres_classifier`),
+`supabase-db`, the classifier's `classifier-db` — jobs, references and
+per-call model usage, `postgres_classifier` — and the route-policy service's
+`route-policy-db` — every routing decision and what answered it,
+`postgres_route_policy`),
 the off-box Phoenix production Postgres (`postgres_phoenix`, read-only
 role, TLS required), plus an Iceberg lakehouse on `lake-s3`. Consumers:
 
@@ -149,7 +151,7 @@ Clients that pinned the old fingerprint must re-trust.
 
 | Tool | Purpose |
 |---|---|
-| `list_catalogs()` | Every catalog Trino sees — `aws_glue`, `iceberg`, `postgres_classifier`, `postgres_litellm`, `postgres_phoenix`, `postgres_roofix`, `postgres_sandbox`, `postgres_supabase`, `supabase_ai_agents`, `supabase_enerflo_leads`, `supabase_operations_assistant`, `system` |
+| `list_catalogs()` | Every catalog Trino sees — `aws_glue`, `iceberg`, `postgres_classifier`, `postgres_litellm`, `postgres_phoenix`, `postgres_roofix`, `postgres_route_policy`, `postgres_sandbox`, `postgres_supabase`, `supabase_ai_agents`, `supabase_enerflo_leads`, `supabase_operations_assistant`, `system` |
 | `list_schemas(catalog)` | Schemas under a catalog |
 | `list_tables(catalog, schema)` | Tables under a schema |
 | `describe_table(catalog, schema, table)` | `[{"name":…, "type":…}, …]` |
@@ -236,7 +238,7 @@ models get an accurate hint.
   what it is. `postgres_<subsystem>` for Postgres instances we run or
   are handed directly (`postgres_litellm`, `postgres_roofix`,
   `postgres_sandbox`, `postgres_phoenix`, `postgres_supabase`,
-  `postgres_classifier`);
+  `postgres_classifier`, `postgres_route_policy`);
   `supabase_<project>` for Supabase-hosted projects (`supabase_ai_agents`,
   `supabase_enerflo_leads`, `supabase_operations_assistant`); `aws_glue` for the Glue Data Catalog. Note the
   split that `postgres_supabase` sits on: it is the Supabase instance **we**
@@ -256,7 +258,7 @@ bottom of the stack trace.
 
 | Target lives… | `connection-url` host | Example |
 |---|---|---|
-| On `ai_shared` (any compose service that joins it) | Docker service DNS | `roofix-db:5432`, `classifier-db:5432` (read-only `trino_reader` role from `ai/classifier/db-init/10-trino-reader.sh`) |
+| On `ai_shared` (any compose service that joins it) | Docker service DNS | `roofix-db:5432`, `classifier-db:5432`, `route-policy-db:5432` (read-only `trino_reader` roles from `ai/classifier/db-init/10-trino-reader.sh` / `ai/route-policy/db-init/10-trino-reader.sh`) |
 | On `ai_shared` via a subsystem that dual-homes its DB on purpose | Docker service DNS | `supabase-db:5432` (see [ai/supabase/SUPABASE.md](../supabase/SUPABASE.md); only the `postgres` database is federated — `_supabase`, Supavisor's metadata DB, is not) |
 | On an isolated Docker network (`litellm`'s `internal`, sandbox's `sandbox_state`) | `host.docker.internal:<host-published-port>` | `host.docker.internal:5440` |
 | Off-box (Supabase, RDS, a partner DB) | Public hostname | `aws-1-us-east-1.pooler.supabase.com:5432` |

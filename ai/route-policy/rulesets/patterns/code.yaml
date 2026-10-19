@@ -1,0 +1,24 @@
+# code_kw -- the semantic router's code keyword signal, for the `default`
+# ruleset's `code-text` evaluator and as a `sticky-code` cooldown judge.
+#
+# A COPY of routing.signals.keywords[name=code_kw] in
+# ai/semantic-router/config.yaml, kept identical (keywords, operator,
+# case_sensitive, method) by unit-tests/route-policy/test_drift.py until
+# phase 3 retires the router. Edit both together, and bump the ruleset's
+# `version` (this file is part of its content hash).
+#
+# `method: regex`: each keyword is an RE2 pattern (no lookaround, no
+# backreferences; \b and \w are ASCII), "(?i)" applied because
+# case_sensitive is false -- compiled here by common.keywordmatch with the
+# same semantics. Single quotes keep each backslash literal.
+name: code_kw
+operator: OR
+case_sensitive: false
+method: regex
+keywords:
+  - '\b(python|typescript|javascript|js|golang|rust|sql|bash|powershell|html|css|jsx|tsx|node\.?js|react|vue|svelte)\b'
+  - '\b(docker|compose|kubernetes|k8s|helm|terraform|nginx|git)\b'
+  - '\b(functions?|class(es)?|methods?|variables?|modules?|librar(y|ies)|packages?|scripts?|regex(es)?|(api )?endpoints?|compil(e|er|ing)|refactor(ing|ed)?|debug(ging)?|stack ?traces?|tracebacks?|exceptions?|unit ?tests?|test (suite|harness|cases?)|bugs?)\b'
+  - '\b[\w.-]+\.(py|js|mjs|ts|tsx|jsx|html|css|json|ya?ml|toml|sh|sql|go|rs|java|cs|cpp|rb|php)\b'
+  - '```'
+  - '\b(build|make|create|write|code)\b.{0,40}\b(app|application|website|web ?page|script|program|cli|game|calculator|dashboard|bot|api|component)s?\b'

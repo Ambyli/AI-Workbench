@@ -208,6 +208,16 @@ general_settings:
       methods: ["GET", "POST", "DELETE"]
       forward_headers: true
       auth: true
+    # The route-policy service (ai/route-policy/ROUTE_POLICY.md): /decide,
+    # /observe, /evaluate, /rulesets, /bindings, /chats/{id}/decisions,
+    # /evaluator-types. Operators only -- the hook itself calls
+    # http://route-policy:8000 directly, never through this path.
+    - path: "/v1/route-policy"
+      target: "http://route-policy:8000"
+      include_subpath: true
+      methods: ["GET", "POST"]
+      forward_headers: true
+      auth: true
 
 mcp_servers:
   kokoro_tts:

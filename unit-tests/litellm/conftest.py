@@ -12,12 +12,20 @@ run in a bare `litellm[proxy]` venv too.
 loads the shim against a FRESH import of the package with :func:`fresh_hooks`,
 which puts the original modules back afterwards, so the classes every other
 test imported at module level stay the ones in sys.modules.
+
+The route-policy client is ON by default in the proxy and would fire real
+background POSTs at http://route-policy:8000 from every `auto` pre-call hook a
+test runs. So these tests default it OFF (ROUTE_POLICY_ENABLED=false, set
+before `hooks` is first imported); test_route_policy.py turns it on per
+Handler with a fake transport, and the tests of the default itself unset the
+variable for a fresh import.
 """
 
 from __future__ import annotations
 
 import contextlib
 import importlib.util
+import os
 import pathlib
 import sys
 from types import ModuleType
@@ -34,6 +42,9 @@ if str(LITELLM_DIR) not in sys.path:
     sys.path.insert(0, str(LITELLM_DIR))
 if str(COMMON_SRC) not in sys.path:
     sys.path.append(str(COMMON_SRC))
+
+# Never reach a real route-policy service from a unit test (see the docstring).
+os.environ["ROUTE_POLICY_ENABLED"] = "false"
 
 
 def _is_hooks_module(name: str) -> bool:

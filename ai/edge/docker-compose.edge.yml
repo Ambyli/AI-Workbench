@@ -96,6 +96,7 @@ services:
       - "${PORT_SUPERSET:-8016}:8016"
       - "${PORT_SUPABASE_API:-8022}:8022"
       - "${PORT_SEMANTIC_ROUTER:-8025}:8025"
+      - "${PORT_ROUTE_POLICY:-8027}:8027"
       # Recreate-class APIs: the edge only turns their restart into a 503.
       - "${PORT_CLASSIFIER:-8005}:8005"
       - "${PORT_SANDBOX_RUNNER:-8012}:8012"

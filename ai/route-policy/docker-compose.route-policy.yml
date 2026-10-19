@@ -1,0 +1,111 @@
+# Route policy -- rulesets of evaluators pick the LiteLLM chain alias for each
+# `auto` turn, and every decision is logged. Phase 2 of ROUTE_POLICY_PLAN:
+# SHADOW mode -- LiteLLM's hook (ai/litellm/hooks/routing/) calls /decide and
+# /observe without waiting and applies nothing; the semantic router still
+# routes. Operator guide: ai/route-policy/ROUTE_POLICY.md.
+#
+#   route-policy      FastAPI on :8000 (ai_shared). LiteLLM reaches it as
+#                     http://route-policy:8000; LAN clients through ai/edge on
+#                     PORT_ROUTE_POLICY, or LiteLLM's /v1/route-policy
+#                     pass-through. No auth of its own, like the classifier.
+#   route-policy-db   Postgres 17: rulesets, bindings, decisions,
+#                     evaluations, outcomes. Trino reads it as the
+#                     postgres_route_policy catalog (read-only trino_reader).
+
+networks:
+  shared:
+    external: true
+    name: ai_shared
+
+services:
+  # ── route-policy-db ──────────────────────────────────────────────────────
+  # On ai_shared so trino-coordinator reaches it by service DNS
+  # (route-policy-db:5432, catalogs/postgres_route_policy.properties) without
+  # joining anything else -- the classifier-db / roofix-db shape. Published
+  # on PORT_ROUTE_POLICY_DB for psql / DBeaver.
+  #
+  # 10-trino-reader.sh runs once, on the first start of an EMPTY volume, and
+  # creates the read-only `trino_reader` role from
+  # ROUTE_POLICY_TRINO_READER_PASSWORD. Re-run it by hand for an existing
+  # volume (the command is in the script's header).
+  #
+  # Recreated (with downtime) by `make up`: a data directory can have only
+  # one Postgres. route-policy keeps deciding from its cached rulesets
+  # meanwhile; only the decisions made during the gap go unlogged.
+  route-policy-db:
+    image: postgres:17-alpine
+    container_name: route-policy-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${ROUTE_POLICY_DB_USER:-route_policy}
+      POSTGRES_PASSWORD: ${ROUTE_POLICY_DB_PASSWORD:-route_policy}
+      POSTGRES_DB: ${ROUTE_POLICY_DB_NAME:-route_policy}
+      # Consumed by db-init/10-trino-reader.sh. Empty = the role is skipped
+      # with a log line (only the Trino catalog breaks, never the service).
+      TRINO_READER_USER: trino_reader
+      TRINO_READER_PASSWORD: ${ROUTE_POLICY_TRINO_READER_PASSWORD:-}
+    volumes:
+      - route_policy_db:/var/lib/postgresql/data
+      - ./db-init/10-trino-reader.sh:/docker-entrypoint-initdb.d/10-trino-reader.sh:ro
+    ports:
+      - "${PORT_ROUTE_POLICY_DB:-5441}:5432"
+    networks:
+      - shared
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${ROUTE_POLICY_DB_USER:-route_policy} -d ${ROUTE_POLICY_DB_NAME:-route_policy}"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ── route-policy ─────────────────────────────────────────────────────────
+  # Deployed side by side by `make up route-policy` (scripts/deploy.py): a
+  # new `route-policy-<hash>` starts next to the old one and the old one
+  # retires once the new one is healthy and the edge marks it UP. Two copies
+  # are safe: every decision is computed from the request alone, startup's
+  # migrations and ruleset seeding take advisory locks, and every write is
+  # idempotent on decision_id. No container_name and no `ports:` --
+  # PORT_ROUTE_POLICY is published by ai/edge. See ai/edge/EDGE.md.
+  #
+  # Startup needs route-policy-db (migrations + seeding); a copy that cannot
+  # reach it, or whose baked-in ruleset changed without a version bump,
+  # exits with the reason in its log and the old copy keeps serving.
+  route-policy:
+    build:
+      context: ../..
+      dockerfile: ai/route-policy/Dockerfile
+    labels:
+      com.zeo.deploy: swap
+    restart: unless-stopped
+    # Every request is a few milliseconds; 30 s drains anything in flight.
+    stop_grace_period: 30s
+    networks:
+      - shared
+    depends_on:
+      route-policy-db:
+        condition: service_healthy
+    environment:
+      # One `[decide]` line per decision at INFO (ids, route, reason -- never
+      # message text).
+      - LOG_LEVEL=INFO
+      # route-policy-db above. HOST and PORT are fixed (service DNS on
+      # ai_shared, the container port); the credentials come from the
+      # `## Route policy` block of .env with the same dev defaults the
+      # database is created with.
+      - ROUTE_POLICY_DB_HOST=route-policy-db
+      - ROUTE_POLICY_DB_PORT=5432
+      - ROUTE_POLICY_DB_USER=${ROUTE_POLICY_DB_USER:-route_policy}
+      - ROUTE_POLICY_DB_PASSWORD=${ROUTE_POLICY_DB_PASSWORD:-route_policy}
+      - ROUTE_POLICY_DB_NAME=${ROUTE_POLICY_DB_NAME:-route_policy}
+      # Infrastructure only -- the routing rules live in the rulesets
+      # (rulesets/*.yaml, seeded into route-policy-db), never here.
+      - ROUTE_POLICY_DB_POOL_MAX=${ROUTE_POLICY_DB_POOL_MAX:-10}
+      - ROUTE_POLICY_BINDING_REFRESH_S=${ROUTE_POLICY_BINDING_REFRESH_S:-10}
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+volumes:
+  route_policy_db:

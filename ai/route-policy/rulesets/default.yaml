@@ -1,0 +1,87 @@
+# The `default` ruleset: today's `auto` routing, reproduced, in SHADOW mode.
+#
+# Today an `auto` turn is routed in two steps:
+#   1. the semantic router (ai/semantic-router/config.yaml) matches keyword
+#      signals on the LATEST user message: privacy_kw -> local-private
+#      (priority 300), code_kw -> local-code (200), reasoning_kw ->
+#      local-reasoning (150), else local-general (10);
+#   2. the LiteLLM hook (ai/litellm/hooks/routing/code_route.py) turns a
+#      local-general turn into local-code when the conversation CALLED a
+#      sandbox / Open Terminal tool in this exchange, or did -- or matched
+#      code_kw -- within the last 3 exchanges (the cooldown).
+# The `priority` combiner over the evaluators below, in this order, gives the
+# same route: first non-abstaining vote wins, privacy forces. Bound to the
+# requested model `auto` by bindings.yaml.
+#
+# Kept in step with its sources by unit-tests/route-policy/test_drift.py (the
+# pattern files vs the router's rules, the tool regex and cooldown vs
+# ai/litellm/hooks/settings.py's CODE_ROUTE_* defaults) and test_parity.py
+# (this ruleset vs the router's decisions + the hook's remap, on real
+# conversation shapes). Phase 3 deletes those sources; this file stays.
+#
+# CHANGING IT: versions are immutable. Anything but these comments -- a
+# description, a pattern in a referenced file -- is new content, and a stored
+# `default@1` with different content stops route-policy at startup. Bump
+# `version` (the binding follows the highest one). ROUTE_POLICY.md §
+# Changing a ruleset.
+id: default
+version: 1
+description: >-
+  Reproduces today's `auto` routing -- the semantic router's privacy / code /
+  reasoning keyword signals on the latest user message, then the LiteLLM
+  hook's code-tool remap and 3-exchange cooldown -- in shadow mode.
+mode: shadow
+routes: [local-general, local-code, local-reasoning, local-private]
+default_route: local-general
+evaluators:
+  # Router decision privacy_local (priority 300). `force`: wins over every
+  # other vote, so a PII prompt never reaches a Claude-capable chain.
+  - id: privacy
+    type: regex_text
+    role: force
+    description: PII keywords in the latest user message (the router's privacy_kw).
+    config:
+      patterns_ref: patterns/privacy.yaml
+    vote: {route: local-private}
+
+  # Router decision code (priority 200).
+  - id: code-text
+    type: regex_text
+    description: Code keywords in the latest user message (the router's code_kw).
+    config:
+      patterns_ref: patterns/code.yaml
+    vote: {route: local-code}
+
+  # Router decision reasoning (priority 150). Before the two below because
+  # the hook only ever remaps local-general: a reasoning turn stays reasoning.
+  - id: reasoning-text
+    type: regex_text
+    description: Math / science / multi-step keywords in the latest user message (the router's reasoning_kw).
+    config:
+      patterns_ref: patterns/reasoning.yaml
+    vote: {route: local-reasoning}
+
+  # The hook's remap, current exchange: a sandbox MCP tool or one of Open
+  # Terminal's distinctive operationIds was CALLED since the latest user
+  # message. Same pattern as DEFAULT_CODE_ROUTE_TOOL_REGEX (full-name match).
+  - id: code-tools
+    type: tool_calls
+    description: A sandbox / Open Terminal tool was called in this exchange (the hook's code-tool remap).
+    config:
+      pattern: 'sandbox-mcp_.+|run_command|get_process_status|send_process_input|kill_process|replace_file_content|read_user_terminal|send_user_terminal_input'
+      scope: current_exchange
+    vote: {route: local-code}
+
+  # The hook's cooldown: local-code holds while fewer than 3 irrelevant
+  # exchanges followed the last one that called such a tool or matched
+  # code_kw (DEFAULT_CODE_ROUTE_COOLDOWN). Judges in the hook's order: tools
+  # first, then the message.
+  - id: sticky-code
+    type: cooldown
+    description: Stays on local-code for 3 exchanges after the last coding one (the hook's cooldown).
+    config:
+      exchanges: 3
+      relevant_if: [code-tools, code-text]
+    vote: {route: local-code}
+
+combiner: {type: priority}

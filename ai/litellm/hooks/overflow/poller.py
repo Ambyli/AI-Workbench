@@ -64,6 +64,11 @@ class Poller:
     def snapshot(self, now: float) -> Dict[str, Any]:
         return {b: s.snapshot(now, self.stale_after) for b, s in self.backends.items()}
 
+    def report(self, now: float) -> Dict[str, Dict[str, Any]]:
+        """api_base -> {verdict, waiting, running} of every watched backend
+        (BackendState.report) -- the /decide request's `backends`."""
+        return {b: s.report(now, self.stale_after) for b, s in self.backends.items()}
+
     def ensure_running(self) -> None:
         if not self._start:
             return

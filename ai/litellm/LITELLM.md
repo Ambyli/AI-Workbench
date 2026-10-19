@@ -409,18 +409,19 @@ Then confirm the negatives: the same call with `"model":"local-general"` has no 
 
 ### The hooks package
 
-`litellm_settings.callbacks: ["overflow.handler"]` loads one object, `handler`: a `Handler` doing three jobs.
+`litellm_settings.callbacks: ["overflow.handler"]` loads one object, `handler`: a `Handler` doing four jobs.
 
 | Path | What |
 |---|---|
 | `overflow.py` | the shim LiteLLM loads: imports `hooks`, builds `handler`, exports nothing else |
-| `hooks/handler.py` | `Handler(CustomLogger)` — the four hooks LiteLLM dispatches on, each only delegating; `state()` |
-| `hooks/settings.py` | every environment variable the hooks read (`OVERFLOW_*`, `AUTO_FOOTER_ENABLED`, `CODE_ROUTE_*`), read once at import |
+| `hooks/handler.py` | `Handler(CustomLogger)` — the five hooks LiteLLM dispatches on, each only delegating; `state()` |
+| `hooks/settings.py` | every environment variable the hooks read (`OVERFLOW_*`, `AUTO_FOOTER_ENABLED`, `CODE_ROUTE_*`, `ROUTE_POLICY_*`), read once at import |
 | `hooks/log.py` | the `zeo.overflow` logger (the `[overflow]` lines) and the 30 s per-key throttle |
 | `hooks/deployments.py` | reading LiteLLM deployment dicts (`api_base`, `order`, chain detection) |
 | `hooks/overflow/` | job 1, [§ The overflow hook](#the-overflow-hook) |
 | `hooks/footer/` | job 2, [§ The `auto` footer](#the-auto-footer) |
 | `hooks/routing/code_route.py` | job 3, the code-tool remap ([§ local-code: what it adds](#local-code-what-it-adds)) |
+| `hooks/routing/policy_client.py` | job 4, the route-policy client in shadow mode ([§ Route-policy shadow mode](#route-policy-shadow-mode)) |
 | `shared/common/src/common/conversation`, `…/keywordmatch` | shared, stdlib-only: chat-history helpers and the Go-compatible keyword-rule compiler |
 
 **How it loads.** LiteLLM's `get_instance_fn` (`proxy/types_utils/utils.py:8-61`, identical in 1.93 and 1.95) maps `overflow.handler` to `<config dir>/overflow.py` and loads it with `spec_from_file_location` + `exec_module`: it never registers the file in `sys.modules`, never adds `/app` to `sys.path` for it, and cannot load a package. Code loaded that way cannot use relative imports, and `@dataclass` crashes on it at proxy start (`'NoneType' object has no attribute '__dict__'`). So `overflow.py` is only a shim. It puts its own directory first on `sys.path`, imports `hooks.handler` the normal way, takes the entry back out, and builds `handler`. Because the import is normal, `hooks` and every submodule are in `sys.modules`, relative imports work, and `@dataclass` is safe (`BackendState` is one).
@@ -435,7 +436,7 @@ Taking the entry back out matters. The proxy CLI already *appends* its working d
 
 It also builds a fresh `/app` from the compose file's own mounts and loads the shim there in an isolated interpreter.
 
-**The leaf-class rule.** The proxy activates `async_post_call_streaming_iterator_hook` and `async_pre_call_hook` only when the name is in the registered class's own `__dict__` (`proxy/utils.py:1718-1745`). So all four hooks stay in `Handler`'s class body and delegate from there. A hook moved onto a component or a base class would silently never run.
+**The leaf-class rule.** The proxy activates `async_post_call_streaming_iterator_hook` and `async_pre_call_hook` only when the name is in the registered class's own `__dict__` (`proxy/utils.py:1718-1745`). So all five hooks stay in `Handler`'s class body and delegate from there (`async_post_call_failure_hook` is dispatched on any `CustomLogger`, `proxy/utils.py:2136-2166`, but follows the same rule). A hook moved onto a component or a base class would silently never run.
 
 **Tests.** From the repo root:
 
@@ -463,3 +464,78 @@ make -s logs litellm FOLLOW=0 TAIL=300 2>&1 | grep -E 'Traceback|ImportError|\[o
 ```
 
 The last command should show no traceback. Then send one `auto` request ([§ The `auto` footer](#the-auto-footer) › Verifying) and check the answer ends with its footer.
+
+#### Route-policy shadow mode
+
+Phase 2 of the route-policy engine (ZT-471). On every request for model **`auto`**, the handler (`hooks/routing/policy_client.py`) tells the route-policy service (`ai/route-policy/`, `http://route-policy:8000` on `ai_shared`) what came in and, afterwards, what answered. The service evaluates its ruleset and logs its own choice next to what really served the turn, so the two can be compared in Trino.
+
+It **logs only**. The semantic router still decides every `auto` turn, nothing in the request is changed apart from one key in `data["metadata"]`, and nothing is awaited, so it adds no latency. Phase 3 is when the hook starts awaiting `/decide`.
+
+| When | Call | What it sends |
+|---|---|---|
+| `async_pre_call_hook` | `POST /decide` | `decision_id` (a uuid4 the hook makes), `requested_model`, `litellm_call_id`, `chat_id` / `message_id` / `user_id` (Open WebUI's `X-OpenWebUI-Chat-Id` / `-Message-Id` / `-User-Id` request headers, any case, `null` when absent), `key_alias`, `messages` and `tools` (as LiteLLM will forward them, so after the footer strip), and `backends` (the overflow poller's `{verdict, waiting, running}` per `api_base`; `verdict` is `ok`, `busy`, `down`, `stale` or `unknown`) |
+| `async_post_call_success_hook` (non-streaming) | `POST /observe` | `decision_id`, `litellm_call_id`, `response_id` (the response `id`, which is the spend log's `request_id`), `served_model_group` and `served_deployment` (derived like the footer, e.g. `local-code` and `openai/muse-glimmer`), `overflow_reason` (`busy` / `down` when a Claude deployment answered, else `null`; the hook's *current* view, like the footer's tag), `finish_reason`, `tool_calls` (the function names in the answer), `status: "success"`, `error: null` |
+| `async_post_call_streaming_iterator_hook`, at stream end | `POST /observe` | the same, read from the chunks: `response_id` is the first chunk's id, `tool_calls` the names streamed in `delta.tool_calls`. An upstream error mid-stream, or a client that disconnects, sends `status: "failure"` instead |
+| `async_post_call_failure_hook` | `POST /observe` | `status: "failure"` and `error: "<ExceptionType>: <message>"` (at most 500 characters); the served fields are `null` |
+
+The streaming wrapper is the footer's: one generator does both jobs, so the stream is never wrapped twice.
+
+**How the decision id travels.** The pre-call hook stashes it, with the `litellm_call_id`, in `data["metadata"]["zeo_route_policy"]`, replacing any stash a client sent. LiteLLM v1.95.0 hands the success, streaming and failure hooks the same `data` dict:
+
+- `common_request_processing.py` assigns the pre-call result to `self.data` (1274), then passes `self.data` to `post_call_success_hook` (1919), to the stream generator as `request_data` (1854-1859), and to `post_call_failure_hook` (2538-2542);
+- `proxy_server.py`'s `async_data_generator` hands that same dict to the iterator hook (7413-7419) and, on an upstream error, to `post_call_failure_hook` (7540).
+
+`litellm_call_id` is `data["litellm_call_id"]`, which the proxy sets before the pre-call hook (`x-litellm-call-id` header, else a uuid4; `common_request_processing.py:1227`). `metadata` never reaches the upstream: the openai provider forwards it only with `litellm.enable_preview_features`, and then only string values (`main.py:2407`, `utils.py:9243`), while the stash is a dict. The stash also records that the request was observed, so a stream that fails, and is therefore seen by both the iterator hook and the failure hook, is still observed once. Both paths are verified against a real `litellm[proxy]==1.95.0` process in [`unit-tests/litellm/test_route_policy.py`](../../unit-tests/litellm/test_route_policy.py) and its proxy-plumbing tests.
+
+**Fire and forget.**
+
+- Each call is an asyncio task on the proxy's own loop, using one `httpx.AsyncClient` per event loop.
+- At most 64 calls are in flight; past that a call is dropped and counted. A dropped `/decide` stashes nothing, so that request sends no `/observe` either.
+- Each call is bounded by `ROUTE_POLICY_TIMEOUT_S`. The service's answer is ignored.
+- Nothing raises into LiteLLM, and the failure hook always returns `None`, so it never changes the error the client gets.
+- Measured: the pre-call hook gains about 15 µs, plus a shallow copy of the message list (≈ 0.5 ms on a 1,000-message chat), whether the service answers, hangs or is gone.
+
+**Scope.** Chat requests (`messages`) for `auto`, nothing else. Direct chain and alias calls are never sent, and neither is the router's own inner `local-*` request. Open WebUI background tasks (title, tags, follow-ups) sent to `auto` are decided like any other turn. `backends` stays `{}` until the proxy process has served a chain request, because the poller learns backends from those.
+
+**Settings.** These are infrastructure settings only; routing rules live in the service's rulesets, never in env vars. They are passed through the compose `environment:`.
+
+| Variable | Default | |
+|---|---|---|
+| `ROUTE_POLICY_ENABLED` | `true` | `false` makes every path a no-op: no task, no stash |
+| `ROUTE_POLICY_URL` | `http://route-policy:8000` | the service, by Docker DNS on `ai_shared`; an empty value also disables the client |
+| `ROUTE_POLICY_TIMEOUT_S` | `2` | one background call, start to finish (floor 0.1) |
+
+**Counters** in `handler.state()`:
+
+- `stats.route_policy_decides` and `route_policy_observes`: calls the service answered with a 2xx;
+- `route_policy_errors`: timeouts, refused connections, non-2xx answers and internal errors;
+- `route_policy_dropped`: calls over the in-flight cap;
+- `route_policy_in_flight` and `config.route_policy_*`.
+
+Like the rest of `state()`, they live in the proxy process. The logs carry the same signals:
+
+- one `[overflow] [route-policy] first POST http://route-policy:8000/decide answered HTTP 200 -- shadow mode is live` line per path per process;
+- `[route-policy] POST … failed: …` (timeouts, refusals, non-2xx) and `… dropped: N calls already in flight`, throttled to one per path per 30 s.
+
+**On the box**, after `make up litellm`:
+
+```bash
+# the settings reached the container
+make exec litellm litellm CMD="sh -c 'env | grep ^ROUTE_POLICY_'"
+# the client's log lines: "shadow mode is live" once per path, and no failures
+make -s logs litellm FOLLOW=0 TAIL=all 2>&1 | grep -E '\[route-policy\]|Traceback'
+```
+
+Until the route-policy service is deployed, every `auto` turn logs a throttled `[route-policy] POST http://route-policy:8000/decide failed: ConnectError: …` line. That is expected and harmless: the chat is served as before. Set `ROUTE_POLICY_ENABLED=false` in `.env` to silence it.
+
+Once the service is up, send one `auto` turn with a recognisable chat id and look it up in the service:
+
+```bash
+curl -s http://localhost:4001/v1/chat/completions \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -H "X-OpenWebUI-Chat-Id: smoke-1" -H "x-litellm-call-id: smoke-call-1" \
+  -d '{"model":"auto","messages":[{"role":"user","content":"Say hi in five words."}]}' > /dev/null
+make exec litellm litellm CMD="python -c 'import urllib.request as u; print(u.urlopen(\"http://route-policy:8000/chats/smoke-1/decisions\", timeout=5).read().decode())'"
+```
+
+The decision should carry `litellm_call_id: smoke-call-1`. Its outcome should name the chain and deployment the footer showed.

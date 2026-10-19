@@ -60,10 +60,10 @@ The jobs table IS the queue — see jobs/queue.py and common.jobs.worker — so 
 to CLASSIFIER_MAX_CONCURRENT jobs run at once and pending work survives
 restarts.
 
-A request carries a list of documents: JPEG/PNG photos, PDFs of any page
-count (native or scanned), plain text, and .docx, all loaded through
-``common.documents`` into pages that may carry an image, a text layer, or
-both. Every page of every document is one item.
+A request carries a list of documents: JPEG/PNG/HEIC/HEIF/AVIF photos, PDFs of
+any page count (native or scanned), SVGs, plain text, and .docx, all loaded
+through ``common.documents`` into pages that may carry an image, a text
+layer, or both. Every page of every document is one item.
 
 Every job writes a per-job artifact directory (regions.json, one
 text.p<item>.<key>.json per item and text layer its criteria used, one base

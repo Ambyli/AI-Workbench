@@ -31,8 +31,9 @@ calls and OCR passes would sit waiting behind it. The documents of one job
 load concurrently (image decodes overlap; PDF renders take turns on
 common.documents' PyMuPDF lock, per page).
 
-Each uploaded file may be a JPEG/PNG, a PDF of any page count (the total is
-capped at submit), an SVG, a .txt, or a .docx — the bytes are stored verbatim
+Each uploaded file may be a JPEG/PNG/HEIC/HEIF/AVIF photo, a PDF of any page
+count (the total is capped at submit), an SVG, a .txt, or a .docx — the bytes
+are stored verbatim
 (an SVG's external images already inlined at submit, when that is on) and the
 kind is detected when the worker loads them. A document entry's ``warnings``
 (what the submit noticed) are handed to the loader, which puts them ahead of

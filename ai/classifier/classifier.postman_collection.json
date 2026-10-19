@@ -2,7 +2,7 @@
   "info": {
     "_postman_id": "classifier-collection",
     "name": "classifier",
-    "description": "Document Classifier — JPEG/PNG photos, PDFs of any page count, SVG drawings, .txt and .docx, several documents per request, scored by OpenCV detectors, deterministic text matching, the open-vocabulary detector, and vision-LLM criteria — called through the LiteLLM pass-through registered in ai/litellm/litellm_config.yaml (`pass_through_endpoints` → `/v1/classifier` → `http://classifier:8000`, `include_subpath: true`, methods GET/POST/PATCH/DELETE, `forward_headers: true`). Every request is authenticated with a Bearer token from a LiteLLM virtual key: set the collection variables `litellm` (e.g. http://localhost:4001) and `virtual master key` (an sk-… key from the LiteLLM Admin UI → Virtual Keys) — every request inherits them via collection-level auth. See ai/classifier/API.md for the full reference and ai/litellm/LITELLM.md for issuing keys.\n\nDirect base URL (bypassing LiteLLM): http://classifier:8000 inside ai_shared, or http://<host>:${PORT_CLASSIFIER} (default 8005), which the ai/edge HAProxy publishes for clients in EDGE_ALLOWED_CIDRS — no auth there. While the classifier is recreated, the edge answers 503 + Retry-After: 10 with a JSON `detail`; retry.\n\nONE analysis endpoint: POST /assess, as JSON (`{documents: [{type: base64|url|text, data}, …], criteria}` — or `{document: {…}}` for one; not both) or multipart (repeated `file` parts and/or `text` fields, plus `criteria` once). `/locate` and `/assess/compare` were removed (404); `/locate`'s job is `score: false` on a criterion. A criterion is `{name, type, weight, depends_on, score, options}` with the type-specific settings in `options` — GET /criterion-types has each type's schema, defaults and caps. Every page of every document is one ITEM (at most CLASSIFIER_MAX_ITEMS = 20 per request, counted at submit; 21 is a 400 with a per-document breakdown); each criterion runs once per item and `options.aggregate` collapses the per-item results — pages → per document → per request (API.md § Documents, pages and items). An SVG is one item rendered by MuPDF, which never fetches what it links to: each external reference is a line in the result's `documents[].warnings` — or, with CLASSIFIER_SVG_FETCH_IMAGES on, `<image>` links are fetched AT SUBMIT through the SSRF guard and inlined (API.md § External references in SVG).\n\nAsync-job pattern: POST /assess returns 202 with `{job_id, phase: \"pending\"}`; poll GET /jobs/:jobId until `phase` is `completed` or `failed`. The jobs table in the classifier-db Postgres is the queue: CLASSIFIER_MAX_CONCURRENT (default 4) jobs at once; inside a job CLASSIFIER_MAX_UNITS_PER_JOB (2) (criterion, item) units at once; each model's max_concurrent (models.yaml; muse-glimmer 6) model calls and CLASSIFIER_OCR_WORKERS (4) OCR passes across the whole process. Copy a `job_id` into the `jobId` collection variable to run the GET/DELETE items.\n\nArtifacts: every job stores regions.json, one text.p<n>.<key>.json per item and text layer its criteria used (text.d<i>.<key>.json for a scope-document text search), one p<n>.base.jpg per item with an image, and a manifest with the item map; SVG / PNG / preview layers (p<n>.*) render on first fetch. See the Artifacts folder.\n\nFolders: `Documents` (one request per fixture in unit-tests/classifier/documents/, plus a two-page PDF and a three-document request), `Regions` (fixtures chosen for their geometry), `Documents + regions` (the document fixtures again, geometry-focused), `Artifacts` (the four artifact routes), `References` (saved worked examples — POST, list, read, files, PATCH, DELETE). `unit-tests/classifier/regions_report.py` runs the first three as a suite (REGIONS_REPORT.md).\n\nModels: which model answers is chosen per request (`model`) and per criterion (`options.model`) from the checked-in registry ai/classifier/models.yaml — see GET /models and API.md § Models.",
+    "description": "Document Classifier — JPEG/PNG/HEIC/HEIF/AVIF photos (an iPhone's HEIC as it comes), PDFs of any page count, SVG drawings, .txt and .docx, several documents per request, scored by OpenCV detectors, deterministic text matching, the open-vocabulary detector, and vision-LLM criteria — called through the LiteLLM pass-through registered in ai/litellm/litellm_config.yaml (`pass_through_endpoints` → `/v1/classifier` → `http://classifier:8000`, `include_subpath: true`, methods GET/POST/PATCH/DELETE, `forward_headers: true`). Every request is authenticated with a Bearer token from a LiteLLM virtual key: set the collection variables `litellm` (e.g. http://localhost:4001) and `virtual master key` (an sk-… key from the LiteLLM Admin UI → Virtual Keys) — every request inherits them via collection-level auth. See ai/classifier/API.md for the full reference and ai/litellm/LITELLM.md for issuing keys.\n\nDirect base URL (bypassing LiteLLM): http://classifier:8000 inside ai_shared, or http://<host>:${PORT_CLASSIFIER} (default 8005), which the ai/edge HAProxy publishes for clients in EDGE_ALLOWED_CIDRS — no auth there. While the classifier is recreated, the edge answers 503 + Retry-After: 10 with a JSON `detail`; retry.\n\nONE analysis endpoint: POST /assess, as JSON (`{documents: [{type: base64|url|text, data}, …], criteria}` — or `{document: {…}}` for one; not both) or multipart (repeated `file` parts and/or `text` fields, plus `criteria` once). `/locate` and `/assess/compare` were removed (404); `/locate`'s job is `score: false` on a criterion. A criterion is `{name, type, weight, depends_on, score, options}` with the type-specific settings in `options` — GET /criterion-types has each type's schema, defaults and caps. Every page of every document is one ITEM (at most CLASSIFIER_MAX_ITEMS = 20 per request, counted at submit; 21 is a 400 with a per-document breakdown); each criterion runs once per item and `options.aggregate` collapses the per-item results — pages → per document → per request (API.md § Documents, pages and items). An SVG is one item rendered by MuPDF, which never fetches what it links to: each external reference is a line in the result's `documents[].warnings` — or, with CLASSIFIER_SVG_FETCH_IMAGES on, `<image>` links are fetched AT SUBMIT through the SSRF guard and inlined (API.md § External references in SVG).\n\nAsync-job pattern: POST /assess returns 202 with `{job_id, phase: \"pending\"}`; poll GET /jobs/:jobId until `phase` is `completed` or `failed`. The jobs table in the classifier-db Postgres is the queue: CLASSIFIER_MAX_CONCURRENT (default 4) jobs at once; inside a job CLASSIFIER_MAX_UNITS_PER_JOB (2) (criterion, item) units at once; each model's max_concurrent (models.yaml; muse-glimmer 6) model calls and CLASSIFIER_OCR_WORKERS (4) OCR passes across the whole process. Copy a `job_id` into the `jobId` collection variable to run the GET/DELETE items.\n\nArtifacts: every job stores regions.json, one text.p<n>.<key>.json per item and text layer its criteria used (text.d<i>.<key>.json for a scope-document text search), one p<n>.base.jpg per item with an image, and a manifest with the item map; SVG / PNG / preview layers (p<n>.*) render on first fetch. See the Artifacts folder.\n\nFolders: `Documents` (one request per fixture in unit-tests/classifier/documents/, plus a two-page PDF and a three-document request), `Regions` (fixtures chosen for their geometry), `Documents + regions` (the document fixtures again, geometry-focused), `Artifacts` (the four artifact routes), `References` (saved worked examples — POST, list, read, files, PATCH, DELETE). `unit-tests/classifier/regions_report.py` runs the first three as a suite (REGIONS_REPORT.md).\n\nModels: which model answers is chosen per request (`model`) and per criterion (`options.model`) from the checked-in registry ai/classifier/models.yaml — see GET /models and API.md § Models.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "auth": {
@@ -176,7 +176,7 @@
             "document-kinds"
           ]
         },
-        "description": "What this container accepts and how it is handled right now: the five kinds (image, svg and .txt/.docx one item each, pdf one item PER PAGE — the svg entry's `external_images` is the live CLASSIFIER_SVG_FETCH_* setting), the refused legacy .doc and .svgz, the accepted inputs (JSON `documents: [base64 | url | text, …]` or the one-`document` shorthand; multipart repeatable `file` | `text`), the text-match modes, the live OCR status (`ocr.available` loads the engine to answer honestly), the limits (`max_items` = CLASSIFIER_MAX_ITEMS, render DPI, `svg_max_render_pixels`, the LLM text budget, and the four concurrency limits: jobs, units per job, model calls, OCR passes), and the regions block (always stored; layers render on first fetch; the llm box-loop bounds; the live detector status; `artifact_max_bytes_per_item`). No errors."
+        "description": "What this container accepts and how it is handled right now: the five kinds (image, svg and .txt/.docx one item each, pdf one item PER PAGE — the image entry's `formats` is the live list of image formats this container decodes, `[\"jpeg\", \"png\", \"heic\", \"heif\", \"avif\"]` when pillow-heif and Pillow's AVIF plugin are present, its `content_types` / `extensions` include HEIC/HEIF/AVIF; the svg entry's `external_images` is the live CLASSIFIER_SVG_FETCH_* setting), the refused legacy .doc, .svgz and video (an MP4 / MOV such as a Live Photo's video), the accepted inputs (JSON `documents: [base64 | url | text, …]` or the one-`document` shorthand; multipart repeatable `file` | `text`), the text-match modes, the live OCR status (`ocr.available` loads the engine to answer honestly), the limits (`max_items` = CLASSIFIER_MAX_ITEMS, render DPI, `svg_max_render_pixels`, the LLM text budget, and the four concurrency limits: jobs, units per job, model calls, OCR passes), and the regions block (always stored; layers render on first fetch; the llm box-loop bounds; the live detector status; `artifact_max_bytes_per_item`). No errors."
       },
       "response": []
     },
@@ -192,7 +192,7 @@
               "key": "file",
               "type": "file",
               "src": "unit-tests/classifier/documents/invoice_native.pdf",
-              "description": "A document: JPEG, PNG, PDF (every page is an item), SVG, .txt or .docx. REPEAT the part for more documents — this item sends two. The kind is detected from the bytes (common.documents.detect_kind), never from the filename or Content-Type. The `src` points at a repo fixture — re-select the file if your Postman working directory differs. The legacy part name `image` is also accepted, and repeats too."
+              "description": "A document: JPEG, PNG, HEIC/HEIF, AVIF, PDF (every page is an item), SVG, .txt or .docx. REPEAT the part for more documents — this item sends two. The kind is detected from the bytes (common.documents.detect_kind), never from the filename or Content-Type. The `src` points at a repo fixture — re-select the file if your Postman working directory differs. The legacy part name `image` is also accepted, and repeats too."
             },
             {
               "key": "file",
@@ -726,7 +726,7 @@
     },
     {
       "name": "References",
-      "description": "Saved worked examples (API.md § References). A reference is ONE page — a JPEG/PNG, or one page of a PDF — with the criteria asked of it, the answer each should get and where the feature is; an /assess that lists it shows the vision model the example beside the candidate. LLM-only: llm criteria and cv names answered by the llm fallback. Creating one runs a `reference` job (visible in GET /jobs); poll GET /references/:referenceId until `status` is ready or failed. Kept until DELETE — never swept. PATCH needs `PATCH` in the LiteLLM /v1/classifier pass-through's methods.",
+      "description": "Saved worked examples (API.md § References). A reference is ONE page — a JPEG/PNG/HEIC/HEIF/AVIF photo, an SVG, or one page of a PDF — with the criteria asked of it, the answer each should get and where the feature is; an /assess that lists it shows the vision model the example beside the candidate. LLM-only: llm criteria and cv names answered by the llm fallback. Creating one runs a `reference` job (visible in GET /jobs); poll GET /references/:referenceId until `status` is ready or failed. Kept until DELETE — never swept. PATCH needs `PATCH` in the LiteLLM /v1/classifier pass-through's methods.",
       "item": [
         {
           "name": "POST /references — JSON, a document page",
@@ -774,7 +774,7 @@
                   "key": "file",
                   "type": "file",
                   "src": "unit-tests/classifier/Neighborhood.jpeg",
-                  "description": "The example page."
+                  "description": "The example page: a JPEG/PNG/HEIC/HEIF/AVIF photo (sized from its header, upright — the same frame /assess decodes it into), an SVG, or a PDF with `page`."
                 },
                 {
                   "key": "criteria",
@@ -1273,6 +1273,44 @@
               ]
             },
             "description": "Expected: overall PASS (~10). OCR reads the skewed, unevenly lit page (one pass, `text.p0.auto.json`, confidence ≈ 0.99): `Notice to Owner` PASS 10 (ratio ≈ 0.88), `case number` PASS 10 (`CASE-77813`), `sharpness` PASS (~10), `proper exposure` PASS (~9)."
+          },
+          "response": []
+        },
+        {
+          "name": "photo_of_letter.heic — an iPhone portrait HEIC, rotated upright once",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": "unit-tests/classifier/documents/photo_of_letter.heic",
+                  "contentType": "image/heic",
+                  "description": "photo_of_letter.png's pixels as an iPhone portrait HEIC: stored sideways (1300×1000) with \"rotate 90° clockwise\" written twice — the container's irot AND EXIF orientation 6. Detected as kind `image` from its ftyp brands, never the filename or the part's Content-Type (`image/heic` / `image/heif` / `image/avif` pass the allowlist)."
+                },
+                {
+                  "key": "criteria",
+                  "type": "text",
+                  "value": "[{\"name\":\"Notice to Owner\",\"type\":\"text\",\"weight\":3.0,\"options\":{\"match\":\"fuzzy\",\"fuzzy_threshold\":0.8}},{\"name\":\"case number\",\"type\":\"text\",\"weight\":2.0,\"options\":{\"match\":\"regex\",\"pattern\":\"CASE-\\\\d{5}\"}},{\"name\":\"sharpness\",\"type\":\"cv\",\"weight\":2.0},{\"name\":\"proper exposure\",\"type\":\"cv\"},{\"name\":\"document legibility\",\"type\":\"llm\",\"options\":{\"hint\":\"quality\"}}]",
+                  "description": "The same criteria as the photo_of_letter.png item, so the two results can be compared."
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/classifier/assess",
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "classifier",
+                "assess"
+              ]
+            },
+            "description": "Expected: the photo_of_letter.png results (give or take HEVC noise), plus `documents[0].kind: \"image\"`, `document_info.content_type: \"image/heic\"` and `page_geometry[0]` 1000×1300 — the decoder applied the container's rotation exactly once (1300×1000 = not applied, upside down = applied twice). `GET /jobs/:jobId/artifacts/p0.base.jpg` shows the upright letter. Possible 400s: a container without pillow-heif names the missing package (GET /document-kinds → image `formats` says what it decodes); a Live Photo `.MOV` sent instead is refused as video. See API.md § HEIC / HEIF / AVIF."
           },
           "response": []
         },

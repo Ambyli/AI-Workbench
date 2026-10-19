@@ -1,6 +1,7 @@
 # Classifier API
 
-FastAPI service that assesses **documents** — JPEG/PNG photos, PDFs of any
+FastAPI service that assesses **documents** — JPEG/PNG/HEIC/HEIF/AVIF photos
+(an iPhone's HEIC as it comes), PDFs of any
 page count (native or scanned), SVG drawings, plain text, and .docx, several
 per request — against a list of criteria, each answered by an OpenCV detector,
 deterministic text matching, the open-vocabulary detector, or the vision LLM.
@@ -496,7 +497,7 @@ those they need, so the same criteria list works across kinds.
 
 | Kind | Extensions | Detected by | Page image | Native text |
 |---|---|---|---|---|
-| `image` | `.jpg` `.jpeg` `.png` | magic bytes `FF D8 FF` / `89 50 4E 47 0D 0A 1A 0A` | yes (EXIF-rotated) | no — needs OCR |
+| `image` | `.jpg` `.jpeg` `.png` `.heic` `.heif` `.avif` | magic bytes `FF D8 FF` / `89 50 4E 47 0D 0A 1A 0A`; HEIC / HEIF / AVIF by the brands of the leading ISO-BMFF `ftyp` box ([below](#heic--heif--avif)) | yes (rotated upright once) | no — needs OCR |
 | `pdf` | `.pdf` | `%PDF-` in the first 1 KB | yes, every page rendered at `CLASSIFIER_PDF_RENDER_DPI` (150) | yes when the PDF is digital; a scan has none |
 | `svg` | `.svg` | UTF-8 XML whose first element is `<svg>` / `<prefix:svg>` (after any XML declaration, comments, DOCTYPE) — checked **before** `txt` | yes, rendered by MuPDF at `CLASSIFIER_PDF_RENDER_DPI`, scaled down to at most 25 000 000 pixels | yes — its `<text>` elements (never its markup) |
 | `txt` | `.txt` | decodes as UTF-8 (BOM ok), no NUL bytes, mostly printable | **no** | yes |
@@ -505,15 +506,49 @@ those they need, so the same criteria list works across kinds.
 **Detection is by content, never by filename or `Content-Type`.** A PDF
 uploaded as `image/png` still loads as a PDF. The declared content type of a
 multipart part is only used for an early allowlist reject (`image/jpeg`,
-`image/png`, `image/svg+xml`, `application/pdf`, `text/plain`, the .docx type,
+`image/png`, `image/heic`, `image/heif`, `image/avif`, `image/svg+xml`,
+`application/pdf`, `text/plain`, the .docx type,
 `application/octet-stream`, and `application/msword` — the last one only so a
 legacy `.doc` reaches the magic-byte check and gets its specific "convert to
 .docx" 400). The kind is detected on the `POST /assess` request itself, per
 document, so an unsupported file is a 400 at submit time (naming the document,
-`document #1 old.doc: …`) and never becomes a job.
+`document #1 old.doc: …`) and never becomes a job. Three near-misses get a
+message of their own: a legacy `.doc` (convert to .docx), gzip / `.svgz`
+(decompress to .svg), and a video — an MP4 or MOV, such as the `.MOV` half of
+an iPhone Live Photo — which is told to send the still photo instead.
 
 `GET /document-kinds` returns this table live from a running container, plus
-the OCR engine's actual availability.
+the OCR engine's actual availability and, under the image kind's `formats`,
+which image formats this container can decode.
+
+### HEIC / HEIF / AVIF
+
+An iPhone saves photos as HEIC; they are accepted wherever a JPEG is
+(`/assess`, `/references`), as the same one-item `image` kind:
+
+* **Detection** reads the brands of the file's leading ISO-BMFF `ftyp` box
+  (`common.documents.image_format`): a HEIC brand (`heic`, `heix`, `hevc`, …)
+  anywhere wins — a Samsung photo is major `mif1` with compatible `heic` —
+  then an AVIF brand (`avif`, `avis`), then a generic HEIF one (`mif1`,
+  `msf1`). An `ftyp` with none of them is a video, refused as above.
+  `documents[].document_info.content_type` is `image/heic`, `image/heif` or
+  `image/avif` accordingly.
+* **Decoding**: HEIC/HEIF through
+  [pillow-heif](https://pillow-heif.readthedocs.io/), AVIF through Pillow's
+  own plugin (≥ 11.3). Both are checked when the image is built
+  (`available_image_formats()`), so a container that cannot decode them
+  fails its build, not its first photo.
+* **Primary image only.** Burst frames, depth maps, thumbnails and HDR gain
+  maps are ignored, and a 10/12-bit image is reduced to 8-bit.
+* **Orientation is applied once.** A HEIF says how to turn its pixels in the
+  container (`irot` / `imir`) and an iPhone writes the EXIF orientation tag
+  too; the decoder applies the container's rotation and mirroring exactly
+  once, so the page — and `p{n}.base.jpg`, and every region — is upright.
+* Everything downstream sees a decoded array, re-encoded as JPEG / PNG (the
+  vision prompt, `p{n}.base.jpg`, reference images, detector requests), so
+  nothing after the decode knows the upload was a HEIC. The one exception
+  is the [SVG image inliner](#external-references-in-svg), which forwards
+  original bytes and so still takes PNG or JPEG only.
 
 ### Limitations
 
@@ -577,7 +612,9 @@ network for its input:
 Every URL goes through `common.net.fetch_url`: the same SSRF blocklist as a
 `type: "url"` document, http(s) only, **no redirects** (a 3xx could point past
 the check), and the body must be a PNG or JPEG by its bytes — not a nested SVG,
-not an HTML error page. A link that fails any of that is **blanked** (drawn as
+not an HTML error page, and not a HEIC / AVIF either (MuPDF draws only JPEG
+and PNG `data:` images, though the same file uploaded as a document of its
+own is fine). A link that fails any of that is **blanked** (drawn as
 nothing, as before) and becomes a warning naming why; it never fails the
 request:
 
@@ -1155,7 +1192,8 @@ llm.
 
 ## References
 
-A **reference** is a stored, reviewed example: ONE page — a JPEG/PNG, an SVG, or one
+A **reference** is a stored, reviewed example: ONE page — a JPEG/PNG/HEIC/HEIF/AVIF
+photo, an SVG, or one
 page of a PDF — with the criteria asked of it, the answer each one should get
 (`score`, `verdict`, `reason`) and where on the page the feature is. An
 `/assess` that lists references shows the vision model those examples **beside
@@ -1197,7 +1235,7 @@ JSON, or multipart parsed into the same model (`api.reference_schemas.ReferenceR
 
 | Field | Description |
 |---|---|
-| `document` + `page` | The example page: base64, URL (SSRF-checked, fetched at submit) or — refused — inline text. A JPEG/PNG or an SVG (page `0`), or page `page` (0-based, default 0) of a PDF. `.txt` / `.docx` are a 400: a reference is shown to the model as an image |
+| `document` + `page` | The example page: base64, URL (SSRF-checked, fetched at submit) or — refused — inline text. A JPEG/PNG/HEIC/HEIF/AVIF photo or an SVG (page `0`), or page `page` (0-based, default 0) of a PDF. `.txt` / `.docx` are a 400: a reference is shown to the model as an image |
 | `from_job` + `from_job_item` | **Instead of a document**: save item `from_job_item` (default 0) of a completed `/assess` job — see below |
 | `criteria` | The same `CriterionInput` list as `/assess` (the same cross-criterion rules). Required with `document`; with `from_job`, omitted means the job's own. `options.reference` is refused here — a reference's own criteria are never guided |
 | `breakdown` | `{name: {score, verdict?, reason?}}` — the answer key. `verdict` is optional and must be the score's (`score 3` with `verdict PASS` is a 400). Not allowed on a `score: false` criterion. A name left out is classified by the creation job |
@@ -2461,21 +2499,25 @@ its declaration does not list — so this endpoint describes exactly what
 ### `GET /document-kinds`
 
 What this container can accept and do right now: the five kinds (with
-`pdf.pages` saying every page is an item, and `svg.external_images` the live
-[SVG fetch](#external-references-in-svg) setting), the `.doc` and `.svgz`
-rejections, the accepted inputs, the four `text_match_modes`, the live OCR
-status, the limits, and the regions block.
+`image.formats` the image formats this container can decode, `pdf.pages`
+saying every page is an item, and `svg.external_images` the live
+[SVG fetch](#external-references-in-svg) setting), the `.doc`, `.svgz` and
+video rejections, the accepted inputs, the four `text_match_modes`, the live
+OCR status, the limits, and the regions block.
 
 ```json
 {
-  "kinds": [{"kind": "image", "pages": "1 — one item", "…": "…"},
+  "kinds": [{"kind": "image", "extensions": [".jpg", ".jpeg", ".png", ".heic", ".heif", ".avif"],
+             "content_types": ["image/jpeg", "image/png", "image/heic", "image/heif", "image/avif"],
+             "pages": "1 — one item", "…": "…",
+             "formats": ["jpeg", "png", "heic", "heif", "avif"]},
             {"kind": "pdf", "pages": "any — every page is one item; the request's total items are capped at CLASSIFIER_MAX_ITEMS (counted at submit, without rendering)", "…": "…"},
             {"kind": "svg", "extensions": [".svg"], "content_types": ["image/svg+xml"],
              "pages": "1 — one item", "has_page_images": true, "native_text": true, "…": "…",
              "external_images": {"fetch": false, "max_images": 10, "max_bytes": 5000000,
                                  "timeout_s": 10.0, "accepted": ["image/png", "image/jpeg"],
                                  "redirects": "not followed", "when": "…"}}, "…"],
-  "unsupported": [{"kind": "doc", "…": "…"}, {"kind": "svgz", "…": "…"}],
+  "unsupported": [{"kind": "doc", "…": "…"}, {"kind": "svgz", "…": "…"}, {"kind": "video", "…": "…"}],
   "inputs": {"json": ["base64", "url", "text"],
              "json_shape": "documents: [{type, data, filename?}, ...] — or document: {...} for one; not both",
              "multipart": ["file (or legacy 'image'), repeatable", "text, repeatable"]},
@@ -2985,7 +3027,10 @@ assessment incomplete).
 
 [`unit-tests/classifier/documents/`](../../unit-tests/classifier/documents/)
 holds one generated fixture per document kind and failure mode — a native PDF,
-a scanned PDF, a `.txt`, a `.docx`, a well and a badly photographed letter, a
+a scanned PDF, a `.txt`, a `.docx`, a well and a badly photographed letter,
+the well-photographed one again as an iPhone portrait HEIC
+(`photo_of_letter.heic`: stored sideways, rotated by its container and its
+EXIF tag, so it comes out upright only if the rotation is applied once), a
 legacy `.doc`, and a two-page PDF whose sentence over the page break shows
 `options.scope: "document"` — each with the criteria to send and the result
 to expect, plus curl examples. The

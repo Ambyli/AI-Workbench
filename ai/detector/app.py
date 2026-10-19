@@ -58,6 +58,7 @@ from fastmcp import FastMCP
 from PIL import Image, ImageOps
 from prometheus_fastapi_instrumentator import Instrumentator
 
+from common.documents import UnsupportedDocumentError, ensure_image_support
 from common.net import BlockedURLError, validate_url
 
 from config import (
@@ -233,10 +234,23 @@ def _decode_image(raw: bytes) -> Image.Image:
     page image, which IS transposed (analysis._decode_image_bgr does the
     same thing). The two have to agree about what "original pixels" means.
 
+    HEIC/HEIF and AVIF go through the same lines: ``ensure_image_support``
+    registers pillow-heif's opener first (and names the missing package if
+    this container lacks it), and each format's rotation is applied exactly once
+    — pillow-heif applies the container's irot/imir and resets the EXIF tag,
+    Pillow's AVIF plugin reports irot/imir AS the EXIF tag for
+    ``exif_transpose`` (see ``common.documents.loaders``). Anything else
+    Pillow can open is accepted as before.
+
     Raises:
-        HTTPException(400): Undecodable bytes, or an image too small to be
-            worth running.
+        HTTPException(400): Undecodable bytes, a format this container has
+            no decoder for, or an image too small to be worth running.
     """
+    try:
+        ensure_image_support(raw)
+    except UnsupportedDocumentError as exc:
+        logger.error("_decode_image: %s", exc)
+        raise HTTPException(status_code=400, detail=str(exc))
     try:
         image = Image.open(io.BytesIO(raw))
         image = ImageOps.exif_transpose(image)

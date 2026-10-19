@@ -255,8 +255,9 @@ class CriterionInput(BaseModel):
 class DocumentInput(BaseModel):
     """One document: base64 bytes, a URL to fetch, or inline text.
 
-    The kind (JPEG/PNG, PDF, .txt, .docx) is determined from the BYTES, never
-    from a filename or content type. ``text`` is plain text treated as a .txt
+    The kind (a JPEG/PNG/HEIC/HEIF/AVIF photo, PDF, SVG, .txt, .docx) is
+    determined from the BYTES, never from a filename or content type.
+    ``text`` is plain text treated as a .txt
     document. A URL is SSRF-checked (``common.net``) before it is fetched, at
     submit time — the item cap needs the bytes (a PDF counts its pages).
     """

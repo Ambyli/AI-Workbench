@@ -719,6 +719,19 @@ def test_document_kinds_reports_items_and_units(client):
     pdf = next(k for k in body["kinds"] if k["kind"] == "pdf")
     assert pdf["pages"].startswith("any — every page is one item")
     assert body["regions"]["artifact_max_bytes_per_item"] > 0
+    # A photo is one item whatever its format — HEIC / HEIF / AVIF included —
+    # and `formats` is the live answer for this process's decoders.
+    from common.documents import available_image_formats
+
+    image = next(k for k in body["kinds"] if k["kind"] == "image")
+    assert image["pages"] == "1 — one item"
+    assert image["extensions"] == [".jpg", ".jpeg", ".png", ".heic", ".heif", ".avif"]
+    assert image["content_types"] == [
+        "image/jpeg", "image/png", "image/heic", "image/heif", "image/avif"
+    ]
+    assert image["formats"] == available_image_formats()
+    assert image["formats"][:2] == ["jpeg", "png"]
+    assert "video" in {u["kind"] for u in body["unsupported"]}
 
 
 # ---------------------------------------------------------------------------

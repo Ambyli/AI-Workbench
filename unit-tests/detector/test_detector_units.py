@@ -1,12 +1,15 @@
 """Unit tests for the detector service's model-free parts.
 
 Everything here runs without torch, without transformers, and without a GPU:
-request parsing, the coordinate contract, and response shaping. Those are the
-parts where a bug is silent — a mis-scaled box looks plausible until someone
-crops by it — and the parts that do not need 600 MB of weights to exercise.
+request parsing, the coordinate contract, response shaping, and the image
+decode (HEIC / AVIF included). Those are the parts where a bug is silent — a
+mis-scaled box, or a photo rotated twice, looks plausible until someone crops
+by it — and the parts that do not need 600 MB of weights to exercise.
 
 Run from the repo root, in any environment that has pytest, pydantic and
-Pillow (the classifier's workspace venv does):
+Pillow (the classifier's workspace venv does); the ``_decode_image`` tests
+import ``app`` and so also need fastapi, fastmcp and pillow-heif — the
+detector's own dependencies:
 
     UV_LINK_MODE=copy uv run --package classifier pytest unit-tests/detector -q
 
@@ -269,3 +272,97 @@ def test_factory_refuses_an_unknown_family():
 
     with pytest.raises(ValueError, match="matches no detector family"):
         build_detector("meta-llama/Llama-3", "cpu", max_image_side=1024)
+
+
+# ── _decode_image: HEIC / HEIF / AVIF ──────────────────────────────────────
+# Importing app builds the FastAPI and FastMCP objects but loads no model
+# (that is the lifespan's job) and imports neither torch nor transformers, so
+# the decode path can be tested directly. Module-scoped: the import costs a
+# few seconds of fastmcp, and only these tests need it.
+@pytest.fixture(scope="module")
+def decode_image():
+    import app
+
+    return app._decode_image
+
+
+def _pillow_has_avif() -> bool:
+    from PIL import features
+
+    try:
+        return bool(features.check_module("avif"))
+    except ValueError:
+        return False
+
+
+def _marker_picture():
+    """Blue 240x160 with a red block in the top-left quarter."""
+    from PIL import Image
+
+    img = Image.new("RGB", (240, 160), (0, 0, 255))
+    img.paste((255, 0, 0), (0, 0, 60, 40))
+    return img
+
+
+def _encode(fmt: str, orientation: int) -> bytes:
+    """The marker picture as ``fmt``, carrying EXIF orientation
+    ``orientation`` — for HEIC (pillow-heif) as irot/imir AND the EXIF tag,
+    like an iPhone photo; for AVIF (Pillow) as irot/imir alone."""
+    import io
+
+    from PIL import Image
+
+    exif = Image.Exif()
+    exif[0x0112] = orientation
+    buf = io.BytesIO()
+    if fmt == "heic":
+        pillow_heif = pytest.importorskip("pillow_heif")
+        pillow_heif.from_pillow(_marker_picture()).save(buf, quality=90, exif=exif.tobytes())
+    else:
+        _marker_picture().save(buf, format=fmt.upper(), quality=90, exif=exif.tobytes())
+    return buf.getvalue()
+
+
+def _marker_box(image):
+    import numpy as np
+
+    rgb = np.asarray(image)
+    red = (rgb[:, :, 0] > 180) & (rgb[:, :, 1] < 90) & (rgb[:, :, 2] < 90)
+    ys, xs = np.nonzero(red)
+    return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+
+
+@pytest.mark.parametrize(
+    "fmt",
+    [
+        "heic",
+        pytest.param("avif", marks=pytest.mark.skipif(
+            not _pillow_has_avif(), reason="Pillow built without AVIF")),
+    ],
+)
+def test_decode_image_returns_heic_and_avif_upright(decode_image, fmt):
+    """EXIF orientation 6 (an iPhone portrait): stored 240x160, decoded
+    160x240 with the top-left block at the top RIGHT — the same frame the
+    JPEG path gives, so the rotation was applied exactly once."""
+    want = decode_image(_encode("jpeg", 6))
+    got = decode_image(_encode(fmt, 6))
+    assert got.mode == "RGB"
+    assert got.size == want.size == (160, 240)
+    for a, b in zip(_marker_box(got), _marker_box(want)):
+        assert abs(a - b) <= 3, (_marker_box(got), _marker_box(want))
+    assert _marker_box(want)[0] >= 115  # the block is on the right
+
+
+def test_decode_image_names_a_missing_pillow_heif(decode_image, monkeypatch):
+    import sys
+
+    from fastapi import HTTPException
+
+    from common.documents import loaders
+
+    raw = _encode("heic", 1)
+    monkeypatch.setitem(sys.modules, "pillow_heif", None)
+    monkeypatch.setattr(loaders, "_heif_registered", None)
+    with pytest.raises(HTTPException) as exc:
+        decode_image(raw)
+    assert exc.value.status_code == 400 and "pillow-heif" in exc.value.detail

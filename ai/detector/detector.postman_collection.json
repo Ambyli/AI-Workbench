@@ -60,7 +60,7 @@
             {
               "key": "file",
               "type": "file",
-              "description": "Repo fixture: unit-tests/classifier/Neighborhood.jpeg — a 7770×1999 street panorama. Re-select the file in Postman if your working directory differs. Any JPEG/PNG works; images below 32 px on a side are refused with a 400.",
+              "description": "Repo fixture: unit-tests/classifier/Neighborhood.jpeg — a 7770×1999 street panorama. Re-select the file in Postman if your working directory differs. Any JPEG / PNG / HEIC / HEIF / AVIF works (or anything else Pillow opens) — a phone photo is turned upright once, from its EXIF tag or its HEIF container's rotation, and the boxes are in that upright frame; images below 32 px on a side are refused with a 400.",
               "src": "unit-tests/classifier/Neighborhood.jpeg"
             },
             {
@@ -88,7 +88,7 @@
           "host": ["{{litellm}}"],
           "path": ["v1", "detector", "detect"]
         },
-        "description": "Find every requested label in one uploaded image.\n\n**Expect** on this fixture at threshold 0.2: several `house` boxes (best ~0.65) and several `tree` boxes (best ~0.32), and EMPTY lists for `car` and `swimming pool` — which is the assertion worth making. Every requested label gets a key in `by_label` even with no hits, because \"looked and found none\" and \"did not look\" are different answers and a missing key makes them indistinguishable.\n\n**Returns** `model`, `family`, `device`, `elapsed_ms` (inference only, not the round trip), the `threshold` actually applied, `image` (the ORIGINAL size every box is expressed in), `counts`, `by_label`, and `detections` — the same boxes flat in score order, for a caller drawing one overlay.\n\n**Errors:** 400 (bad labels/threshold, undecodable or too-small image, unsupported Content-Type), 503 (model not loaded — check GET /health).\n\nSee ai/detector/DETECTOR.md § POST /detect."
+        "description": "Find every requested label in one uploaded image.\n\n**Expect** on this fixture at threshold 0.2: several `house` boxes (best ~0.65) and several `tree` boxes (best ~0.32), and EMPTY lists for `car` and `swimming pool` — which is the assertion worth making. Every requested label gets a key in `by_label` even with no hits, because \"looked and found none\" and \"did not look\" are different answers and a missing key makes them indistinguishable.\n\n**Returns** `model`, `family`, `device`, `elapsed_ms` (inference only, not the round trip), the `threshold` actually applied, `image` (the ORIGINAL size every box is expressed in), `counts`, `by_label`, and `detections` — the same boxes flat in score order, for a caller drawing one overlay.\n\n**Errors:** 400 (bad labels/threshold, undecodable or too-small image, a HEIC/AVIF this container has no decoder for — the message names the missing package, unsupported Content-Type), 503 (model not loaded — check GET /health).\n\nSee ai/detector/DETECTOR.md § POST /detect."
       },
       "response": []
     },

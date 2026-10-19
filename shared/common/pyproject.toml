@@ -21,7 +21,8 @@ dependencies = [
 documents = [
     "pymupdf>=1.28.2",       # PDF text extraction + page rendering
     "python-docx>=1.2.0",    # .docx paragraphs and tables
-    "pillow>=11.0.0",        # image decode / EXIF / resize
+    "pillow>=11.3.0",        # image decode / EXIF / resize; 11.3 is the first with AVIF
+    "pillow-heif>=1.8.1,<2", # HEIC/HEIF decode; also the test-fixture encoder
     "numpy>=1.26",           # page images are BGR ndarrays
     "rapidocr>=3.9.2,<4",    # OCR front-end (PP-OCRv6 models)
     "onnxruntime>=1.22.0",   # rapidocr's inference engine
@@ -45,7 +46,8 @@ dev = [
     "trino>=0.328",      # for tests/trino/test_client.py
     "pymupdf>=1.28.2",   # for tests/test_documents_*.py (also builds the fixtures)
     "python-docx>=1.2.0",# for tests/test_documents_*.py
-    "pillow>=11.0.0",    # for tests/test_documents_*.py
+    "pillow>=11.3.0",    # for tests/test_documents_*.py (AVIF needs 11.3)
+    "pillow-heif>=1.8.1,<2",  # for tests/test_documents_*.py (HEIC decode + fixture encoder)
     "numpy>=1.26",       # for tests/test_documents_*.py
 ]
 

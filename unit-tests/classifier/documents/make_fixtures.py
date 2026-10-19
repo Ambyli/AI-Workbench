@@ -28,6 +28,12 @@ Fixtures produced (see README.md for the criteria/expectations table):
                               brightness, mild blur, sensor noise → OCR-able
     photo_of_letter_blurry.png  same letter, heavily blurred → sharpness FAILs
                               and OCR confidence drops
+    photo_of_letter.heic      photo_of_letter.png's exact pixels as an iPhone
+                              portrait HEIC: stored sideways (1300×1000) with
+                              "rotate 90° clockwise" written twice — the
+                              container's irot AND the EXIF orientation tag
+                              (6) — so it decodes upright to the PNG's page
+                              only if the rotation is applied exactly once
     unsupported_legacy.doc    the OLE2 magic plus padding, to demonstrate the
                               clear "convert to .docx" rejection
     diagram.svg               a roof-plan drawing as SVG: <text> labels (a
@@ -44,8 +50,8 @@ RNG, so adding them did not move the noise stream of any other fixture; see
 ``LOGO_BOX`` / ``STAMP_CENTER`` / ``SIGNATURE_BOX`` below and the README's
 "Marks on the letter" table.
 
-Dependencies: pymupdf, python-docx, pillow, numpy — all already in
-ai/classifier/pyproject.toml.
+Dependencies: pymupdf, python-docx, pillow, pillow-heif, numpy — all already
+in ai/classifier/pyproject.toml.
 """
 
 from __future__ import annotations
@@ -648,6 +654,35 @@ def make_photo_of_letter_blurry() -> pathlib.Path:
     return _as_photo_png(photo, HERE / "photo_of_letter_blurry.png")
 
 
+def make_photo_of_letter_heic() -> pathlib.Path:
+    """``photo_of_letter.png``'s pixels as the HEIC an iPhone shoots in portrait.
+
+    Read back from the PNG rather than photographed again: ``_photograph``
+    draws from the one module-level RNG, so a second call would both differ
+    from the PNG and shift the noise of every fixture built after it. Must
+    therefore run after ``make_photo_of_letter`` (``main`` orders it so).
+
+    The page is stored turned 90° counter-clockwise (1300×1000) and the file
+    says "rotate 90° clockwise" twice: pillow-heif's encoder writes the
+    container's ``irot`` for EXIF orientation 6 AND keeps the tag in the
+    stored EXIF, exactly as an iPhone does. A decoder that applies it once
+    gets the PNG's upright 1000×1300 page back; one that honours both gets it
+    upside down. x265's output is deterministic for a fixed input and
+    quality, so a re-run is byte-identical.
+    """
+    import pillow_heif
+
+    upright = Image.open(HERE / "photo_of_letter.png").convert("RGB")
+    stored = upright.transpose(Image.Transpose.ROTATE_90)
+    exif = Image.Exif()
+    exif[0x0112] = 6
+    out = HERE / "photo_of_letter.heic"
+    buf = io.BytesIO()
+    pillow_heif.from_pillow(stored).save(buf, quality=80, exif=exif.tobytes())
+    out.write_bytes(buf.getvalue())
+    return out
+
+
 # ── The SVG diagram ───────────────────────────────────────────────────────
 # The external link uses the reserved .example TLD, so it never resolves:
 # with CLASSIFIER_SVG_FETCH_IMAGES on, the fetch fails the SSRF guard's
@@ -741,6 +776,7 @@ def main() -> None:
         make_contract_txt,
         make_proposal_docx,
         make_photo_of_letter,
+        make_photo_of_letter_heic,  # reads photo_of_letter.png; draws no RNG
         make_photo_of_letter_blurry,
         make_unsupported_legacy_doc,
         make_diagram_svg,

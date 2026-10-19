@@ -2,7 +2,8 @@
 
     POST /references
       ReferenceRequest
-        ├── document + page        one page: a JPEG/PNG, or page `page` of a PDF
+        ├── document + page        one page: a photo (JPEG/PNG/HEIC/HEIF/AVIF), an
+        │                          SVG, or page `page` of a PDF
         │   (or from_job + from_job_item — a completed /assess job's item)
         ├── criteria   : list[CriterionInput]   — the same model /assess uses
         ├── breakdown  : {name: BreakdownInput} — the answer key, per criterion
@@ -173,7 +174,9 @@ class ReferenceRequest(_Meta):
     """The whole POST /references body — JSON and multipart both land here."""
 
     document: Optional[DocumentInput] = Field(
-        default=None, description="The example: a JPEG/PNG, or a PDF (one page of it)."
+        default=None,
+        description="The example: a JPEG/PNG/HEIC/HEIF/AVIF photo, an SVG, or a PDF "
+                    "(one page of it).",
     )
     page: Optional[int] = Field(
         default=None, ge=0, description="Which PDF page (0-based). Default 0; 0 for an image."

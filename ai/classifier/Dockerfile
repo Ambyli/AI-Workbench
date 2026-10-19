@@ -31,6 +31,12 @@ COPY ai/classifier/pyproject.toml ./ai/classifier/
 
 RUN uv sync --package classifier --no-dev
 
+# HEIC/HEIF (pillow-heif, whose wheel bundles libheif) and AVIF (Pillow's own
+# plugin, in its wheels since 11.3) must both decode here. A wheel without
+# libheif or a Pillow built without AVIF fails the BUILD, not the first
+# iPhone photo — same spirit as the OCR warm-up assertion below.
+RUN uv run --no-dev --package classifier python -c "from common.documents import available_image_formats as f; a=f(); assert {'heic','heif','avif'} <= set(a), a; print('image formats:', a)"
+
 # Pre-warm the OCR models. RapidOCR downloads PP-OCRv6 det/rec + the angle
 # classifier into its own package directory on first construction; baking them
 # in means the container never reaches the network at request time (and a job

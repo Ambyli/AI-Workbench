@@ -1,7 +1,8 @@
 """References: stored, reviewed examples the vision model is shown as guidance.
 
-A reference is ONE page — a JPEG/PNG, or one page of a PDF — with the
-criteria asked of it, the answer each one should get, and where on the page
+A reference is ONE page — a photo (JPEG/PNG/HEIC/HEIF/AVIF), an SVG, or one
+page of a PDF — with the criteria asked of it, the answer each one should
+get, and where on the page
 the feature is. Creating one runs it as a job (``jobs.runners.run_reference``):
 whatever the caller supplied (a breakdown, regions) is kept, whatever is
 missing is classified and located by the pipeline, and the merged record is

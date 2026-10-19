@@ -49,6 +49,12 @@ COPY ai/detector/pyproject.toml ./ai/detector/
 
 RUN uv sync --package detector --no-dev
 
+# HEIC/HEIF (pillow-heif) and AVIF (Pillow ≥ 11.3) must both decode here, so
+# a wheel without libheif or a Pillow built without AVIF fails the BUILD
+# rather than the first iPhone photo — the classifier's Dockerfile runs the
+# same check.
+RUN uv run --no-dev --package detector python -c "from common.documents import available_image_formats as f; a=f(); assert {'heic','heif','avif'} <= set(a), a; print('image formats:', a)"
+
 # Pre-warm the weights so a cold container never reaches HuggingFace on its
 # first request — the same reasoning as the classifier's RapidOCR warm-up, and
 # the same shape of guard: the second command fails the build if the download

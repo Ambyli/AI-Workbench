@@ -12,7 +12,10 @@ dependencies = [
     "numpy",
     "pydantic",
     "python-multipart",
-    "Pillow",
+    # 11.3 is the first Pillow whose wheels decode AVIF; pillow-heif adds
+    # HEIC/HEIF (common.documents registers its opener on first use).
+    "Pillow>=11.3.0",
+    "pillow-heif>=1.8.1,<2",
     # common.documents — document loading, OCR, and text matching. Listed
     # here rather than pulled via common[documents] so this service's lock
     # entry is explicit. rapidocr 3.x does NOT depend on an inference engine,

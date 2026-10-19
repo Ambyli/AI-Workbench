@@ -24,7 +24,7 @@ Both folders are also runnable as a suite:
 layers, re-draws the regions on the original fixtures, and writes an HTML
 accuracy report.
 
-Total size: ~1.2 MB (the two PNGs dominate; they are JPEG round-tripped so PNG
+Total size: ~1.3 MB (the two PNGs dominate; they are JPEG round-tripped so PNG
 can compress the sensor noise).
 
 Every fixture but one is a single page — one **item**. A request may carry
@@ -45,6 +45,7 @@ request. See [API.md § Documents, pages and items](../../../ai/classifier/API.m
 | [`contract.txt`](contract.txt) | txt | native | none | Plain text: `cv` criteria SKIP, the LLM call is text-only |
 | [`proposal.docx`](proposal.docx) | docx | native (paragraphs **and** table cells) | none | Document-order extraction; a table row is searchable as `System Size \| 8.4 kW` |
 | [`photo_of_letter.png`](photo_of_letter.png) | image | **none** — OCR required | 1 | A badly photographed letter (3° skew, brightness gradient, mild blur, JPEG noise) that OCR still reads. Carries a logo, a stamp and a signature — see below |
+| [`photo_of_letter.heic`](photo_of_letter.heic) | image (`image/heic`) | **none** — OCR required | 1 (stored 1300×1000 sideways → upright 1000×1300) | `photo_of_letter.png`'s exact pixels as an iPhone portrait HEIC: stored turned 90° counter-clockwise, with "rotate 90° clockwise" written twice — the container's `irot` **and** EXIF orientation 6. Upright and identical to the PNG only if the rotation is applied exactly once. Same criteria, same expected results |
 | [`photo_of_letter_blurry.png`](photo_of_letter_blurry.png) | image | **none** — OCR mostly fails | 1 | Sharpness FAIL, partial OCR, and `depends_on` skipping the LLM criterion |
 | [`unsupported_legacy.doc`](unsupported_legacy.doc) | — | — | — | The OLE2 rejection: HTTP 400 telling the caller to convert to .docx |
 | [`diagram.svg`](diagram.svg) | svg | native (the `<text>` labels) | 1 render @ `CLASSIFIER_PDF_RENDER_DPI` | An SVG drawing — a roof plan with labels, a 2×6 panel array, an embedded `data:` PNG badge (drawn) and an **external** `<image>` logo link (never drawn: MuPDF fetches nothing, so `documents[0].warnings` names it). Text search hits the words, never the markup |
@@ -223,6 +224,19 @@ each should also come back with a box near the corresponding row of the marks
 table. The score is the model's and varies; what is worth asserting is that an
 accepted box overlaps the documented box rather than covering the page.
 
+### `photo_of_letter.heic`
+
+Send the `photo_of_letter.png` criteria above (and the marks criteria): the
+results should match the PNG's, give or take HEVC compression noise. What is
+specific to this file:
+
+| Check | Expected | Why |
+|---|---|---|
+| `documents[0]` | `kind: "image"`, `pages: 1`, `document_info.content_type: "image/heic"` | Detected by its `ftyp` brands, not its filename or declared type |
+| `page_geometry[0]` | `width: 1000`, `height: 1300` | The decoder turned the sideways storage upright — once. 1300×1000 means the rotation was skipped; 1000×1300 upside down means it was applied twice |
+| `GET /jobs/{id}/artifacts/p0.base.jpg` | the upright letter, logo top-left | Everything after the decode is re-encoded from the upright array |
+| marks boxes | the "In `photo_of_letter.png`" column of § Marks on the letter | Same upright page |
+
 ### `photo_of_letter_blurry.png`
 
 ```json
@@ -342,6 +356,16 @@ curl -s $LITELLM/v1/classifier/assess \
   -H "Authorization: Bearer $KEY" \
   -F "file=@$DOCS/invoice_scanned.pdf" \
   -F 'criteria=[{"name":"Notice to Owner","type":"text","options":{"match":"fuzzy","ocr":"never"}}]'
+
+# 3b — an iPhone portrait HEIC: one upright 1000×1300 image item
+curl -s $LITELLM/v1/classifier/assess \
+  -H "Authorization: Bearer $KEY" \
+  -F "file=@$DOCS/photo_of_letter.heic;type=image/heic" \
+  -F 'criteria=[
+    {"name":"Notice to Owner","type":"text","options":{"match":"fuzzy","fuzzy_threshold":0.8}},
+    {"name":"sharpness","type":"cv"}
+  ]'
+# → documents[0].document_info.content_type: "image/heic"; page_geometry[0]: 1000×1300
 
 # 4 — .docx: cv criteria SKIP, the LLM prompt is text-only
 curl -s $LITELLM/v1/classifier/assess \

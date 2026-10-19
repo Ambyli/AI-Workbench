@@ -41,7 +41,7 @@ Two spellings of the same request, chosen by `Content-Type`.
 
 | Field | Required | Meaning |
 |---|---|---|
-| `file` | yes | The image (JPEG / PNG / anything Pillow opens) |
+| `file` | yes | The image (JPEG / PNG / HEIC / HEIF / AVIF / anything Pillow opens). HEIC/HEIF is decoded by pillow-heif, AVIF by Pillow's own plugin (≥ 11.3); the image build fails if either is missing. A HEIF's container rotation (`irot` / `imir`) is applied once, like a JPEG's EXIF orientation |
 | `labels` | yes | A JSON array (`["tree","house"]`) **or** a comma list (`tree, house`) **or** one name |
 | `threshold` | no | Confidence floor 0–1. Default `DETECTOR_DEFAULT_THRESHOLD` (0.25) |
 | `max_per_label` | no | Keep at most this many boxes per label, best first |
@@ -137,7 +137,9 @@ Postman collection uses.
 ## Coordinates
 
 Boxes come back in the pixel space of the image **you sent**, after EXIF
-transpose. Two resizes happen in between and neither leaks out:
+transpose (for a HEIC / HEIF / AVIF, after its container's rotation — applied
+exactly once, the same frame the classifier decodes the photo into). Two
+resizes happen in between and neither leaks out:
 
 1. This service resizes the long side down to `DETECTOR_MAX_IMAGE_SIDE`
    (1024) before inference. OWLv2 pads to a square and works on its own 960-px
@@ -338,15 +340,19 @@ slowly is more useful than one that is down, and `GET /health` reports
 ## Verifying a change
 
 The model-free parts — request parsing, the coordinate contract, response
-shaping, the family factory — are unit-tested without torch, transformers, or
+shaping, the family factory, and the image decode (HEIC / AVIF upright, a
+missing pillow-heif named) — are unit-tested without torch, transformers, or
 a GPU:
 
 ```bash
 UV_LINK_MODE=copy uv run --package classifier pytest unit-tests/detector -q
 ```
 
-(any environment with pytest, pydantic and Pillow works; the classifier's
-workspace venv has all three.)
+(any environment with pytest, pydantic and Pillow works for most of it; the
+`_decode_image` tests import `app` and also need fastapi, fastmcp and
+pillow-heif. The shared workspace venv has all of them, and
+`uv run --no-sync --with pytest --package detector python -m pytest unit-tests/detector -q`
+runs them against the detector's own dependency set.)
 
 The model path itself is deliberately **not** unit-tested — mocking a
 transformer's output shape tests the mock. Verify it by running the real

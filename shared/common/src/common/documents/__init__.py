@@ -1,5 +1,6 @@
 """
-common.documents — load JPEG/PNG/PDF/SVG/TXT/DOCX into one page-oriented shape.
+common.documents — load JPEG/PNG/HEIC/HEIF/AVIF/PDF/SVG/TXT/DOCX into one
+page-oriented shape.
 
 Services that used to accept "an image" and push a BGR array through OpenCV
 and a vision model need very little to accept "a document" instead: something
@@ -10,7 +11,23 @@ both. That is this package.
                                 magic bytes and structure, never by filename
                                 or the caller's Content-Type. Legacy .doc
                                 raises a specific "convert to .docx" error,
-                                gzip (.svgz) a "decompress to .svg" one.
+                                gzip (.svgz) a "decompress to .svg" one, and
+                                an MP4 / MOV (an ``ftyp`` box with no image
+                                brand) a "video is not supported" one.
+
+    image_format(raw)         → "jpeg" | "png" | "heic" | "heif" | "avif" |
+                                None — the format inside the image kind (the
+                                HEIF family by its ``ftyp`` brands), which
+                                ``guess_content_type`` maps through
+                                ``IMAGE_CONTENT_TYPES``.
+
+    ensure_image_support(raw) → registers pillow-heif's Pillow opener (once
+                                per process) and raises a named "needs
+                                pillow-heif" / "needs Pillow with AVIF" error
+                                when this process cannot decode the format;
+                                ``available_image_formats()`` is the live
+                                list. Every decoder calls it before
+                                ``Image.open``.
 
     load_document(raw, ...)   → ``Document`` with ``pages: list[Page]``. PDFs
                                 carry native text plus a render per page (up
@@ -74,26 +91,32 @@ Typical flow::
         ...
 
 Optional deps (the ``documents`` extra): ``pymupdf`` for PDF, ``python-docx``
-for DOCX, ``pillow`` + ``numpy`` for images, ``rapidocr`` + ``onnxruntime``
-for the bundled OCR engine. Each is imported lazily at the point of use, so a
-consumer that only handles text pays for none of them. ``detect.py`` and
-``textmatch.py`` (and ``svg.py``) are pure-stdlib and always importable.
+for DOCX, ``pillow`` (≥ 11.3, for AVIF) + ``numpy`` for images,
+``pillow-heif`` for HEIC/HEIF, ``rapidocr`` + ``onnxruntime`` for the bundled
+OCR engine. Each is imported lazily at the point of use, so a consumer that
+only handles text pays for none of them. ``detect.py`` and ``textmatch.py``
+(and ``svg.py``) are pure-stdlib and always importable.
 """
 
 from .detect import (
     CONTENT_TYPES,
     EXTENSIONS,
+    IMAGE_CONTENT_TYPES,
     DocumentKind,
+    ImageFormat,
     UnsupportedDocumentError,
     detect_kind,
     guess_content_type,
+    image_format,
 )
 from .loaders import (
     DEFAULT_MAX_PAGES,
     DEFAULT_MAX_RENDER_PIXELS,
     DEFAULT_RENDER_DPI,
     ImageDecoder,
+    available_image_formats,
     default_image_decoder,
+    ensure_image_support,
     load_document,
     pdf_page_count,
     pdf_page_size,
@@ -135,16 +158,21 @@ __all__ = [
     # detect
     "CONTENT_TYPES",
     "EXTENSIONS",
+    "IMAGE_CONTENT_TYPES",
     "DocumentKind",
+    "ImageFormat",
     "UnsupportedDocumentError",
     "detect_kind",
     "guess_content_type",
+    "image_format",
     # loaders
     "DEFAULT_MAX_PAGES",
     "DEFAULT_MAX_RENDER_PIXELS",
     "DEFAULT_RENDER_DPI",
     "ImageDecoder",
+    "available_image_formats",
     "default_image_decoder",
+    "ensure_image_support",
     "load_document",
     "pdf_page_count",
     "pdf_page_size",

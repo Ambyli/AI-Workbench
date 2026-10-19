@@ -2,11 +2,41 @@
 
 from __future__ import annotations
 
+import sys
+
 import pytest
 
-from common.documents import UnsupportedDocumentError, load_document
+from common.documents import (
+    UnsupportedDocumentError,
+    available_image_formats,
+    ensure_image_support,
+    load_document,
+)
 
-from .documents_fixtures import make_docx, make_png, make_pdf, make_scanned_pdf
+from .documents_fixtures import (
+    make_avif,
+    make_docx,
+    make_ftyp,
+    make_heic,
+    make_jpeg,
+    make_pdf,
+    make_png,
+    make_scanned_pdf,
+    marker_box,
+    marker_picture,
+)
+
+
+def _pillow_has_avif() -> bool:
+    try:
+        from PIL import features
+
+        return bool(features.check_module("avif"))
+    except (ImportError, ValueError):
+        return False
+
+
+needs_avif = pytest.mark.skipif(not _pillow_has_avif(), reason="Pillow built without AVIF")
 
 
 # ---------------------------------------------------------------------------
@@ -38,6 +68,128 @@ def test_custom_image_decoder_is_used() -> None:
     doc = load_document(make_png(), filename="p.png", image_decoder=decoder)
     assert calls, "injected decoder was not called"
     assert (doc.pages[0].width, doc.pages[0].height) == (60, 40)
+
+
+# ---------------------------------------------------------------------------
+# HEIC / HEIF / AVIF
+# ---------------------------------------------------------------------------
+
+
+def _assert_red_photo(doc, content_type: str) -> None:
+    import numpy as np
+
+    assert doc.kind == "image"
+    assert doc.content_type == content_type
+    assert len(doc.pages) == 1
+    page = doc.pages[0]
+    assert (page.width, page.height) == (300, 200)
+    assert page.image_bgr.shape == (200, 300, 3)
+    assert page.text_source == "none"
+    # Lossy codecs: the colour survives within a few levels, in BGR order.
+    b, g, r = page.image_bgr.reshape(-1, 3).mean(axis=0)
+    assert r > 230 and g < 25 and b < 25, (b, g, r)
+    assert np.issubdtype(page.image_bgr.dtype, np.uint8)
+
+
+def test_heic_loads_as_one_page() -> None:
+    pytest.importorskip("pillow_heif")
+    doc = load_document(make_heic((300, 200), "red"), filename="IMG_0001.HEIC")
+    _assert_red_photo(doc, "image/heic")
+
+
+@needs_avif
+def test_avif_loads_as_one_page() -> None:
+    doc = load_document(make_avif((300, 200), "red"), filename="photo.avif")
+    _assert_red_photo(doc, "image/avif")
+
+
+def _upright(raw: bytes):
+    """The decoded page of ``raw``: its (width, height) and marker box."""
+    page = load_document(raw).pages[0]
+    return (page.width, page.height), marker_box(page.image_bgr)
+
+
+def _close(a, b, slack: int = 3) -> bool:
+    return a is not None and b is not None and all(abs(x - y) <= slack for x, y in zip(a, b))
+
+
+@pytest.mark.parametrize("orientation", range(1, 9))
+def test_an_oriented_heic_is_rotated_exactly_once(orientation) -> None:
+    """pillow-heif applies the container's irot/imir and resets the EXIF tag
+    to 1, so the decoder's exif_transpose does nothing more — the HEIC comes
+    out as the same frame as an EXIF-oriented JPEG of the same picture. The
+    fixture carries the orientation BOTH ways (irot/imir and EXIF), like an
+    iPhone photo: honouring both would rotate twice."""
+    pytest.importorskip("pillow_heif")
+    jpeg_size, jpeg_box = _upright(make_jpeg(image=marker_picture(), exif_orientation=orientation))
+    heic_size, heic_box = _upright(make_heic(image=marker_picture(), exif_orientation=orientation))
+    assert heic_size == jpeg_size
+    assert _close(heic_box, jpeg_box), (heic_box, jpeg_box)
+
+
+@needs_avif
+@pytest.mark.parametrize("orientation", range(1, 9))
+def test_an_oriented_avif_is_rotated_exactly_once(orientation) -> None:
+    """Pillow's AVIF plugin leaves the pixels as stored and reports
+    irot/imir AS the EXIF orientation, which exif_transpose applies once."""
+    jpeg_size, jpeg_box = _upright(make_jpeg(image=marker_picture(), exif_orientation=orientation))
+    avif_size, avif_box = _upright(make_avif(image=marker_picture(), exif_orientation=orientation))
+    assert avif_size == jpeg_size
+    assert _close(avif_box, jpeg_box), (avif_box, jpeg_box)
+
+
+def test_orientation_6_turns_landscape_storage_into_portrait() -> None:
+    """The case an iPhone portrait shot is: stored 120×80, shown 80×120 with
+    the top-left block at the top RIGHT. Pins the reference the parametrized
+    tests compare against."""
+    size, box = _upright(make_jpeg(image=marker_picture(), exif_orientation=6))
+    assert size == (80, 120)
+    assert _close(box, (60, 0, 79, 29))
+
+
+def test_jpeg_png_and_unknown_bytes_need_nothing() -> None:
+    ensure_image_support(make_png())
+    ensure_image_support(make_jpeg())
+    ensure_image_support(b"anything else Pillow may or may not open")
+
+
+def test_heic_without_pillow_heif_names_the_package(monkeypatch) -> None:
+    pytest.importorskip("pillow_heif")
+    from common.documents import loaders
+
+    raw = make_heic()
+    monkeypatch.setitem(sys.modules, "pillow_heif", None)  # import now fails
+    monkeypatch.setattr(loaders, "_heif_registered", None)
+    with pytest.raises(UnsupportedDocumentError, match="pillow-heif"):
+        ensure_image_support(raw)
+    with pytest.raises(UnsupportedDocumentError, match="pillow-heif"):
+        load_document(raw, filename="IMG_0001.HEIC")
+    # A generic HEIF needs the same package.
+    with pytest.raises(UnsupportedDocumentError, match="pillow-heif"):
+        ensure_image_support(make_ftyp("mif1", ["miaf"]))
+    assert available_image_formats()[:2] == ["jpeg", "png"]
+    assert "heic" not in available_image_formats()
+
+
+def test_avif_without_pillow_avif_names_the_requirement(monkeypatch) -> None:
+    from common.documents import loaders
+
+    monkeypatch.setattr(loaders, "_avif_supported", lambda: False)
+    with pytest.raises(UnsupportedDocumentError, match="AVIF needs Pillow"):
+        ensure_image_support(make_ftyp("avif", ["mif1", "miaf"]))
+    assert "avif" not in available_image_formats()
+
+
+def test_available_image_formats() -> None:
+    formats = available_image_formats()
+    assert formats[:2] == ["jpeg", "png"]
+    try:
+        import pillow_heif  # noqa: F401
+    except ImportError:
+        assert "heic" not in formats and "heif" not in formats
+    else:
+        assert "heic" in formats and "heif" in formats
+    assert ("avif" in formats) == _pillow_has_avif()
 
 
 # ---------------------------------------------------------------------------

@@ -95,9 +95,12 @@ TEXT_MIN_COUNT_CAP: int = max(1, int(os.environ.get("CLASSIFIER_TEXT_MIN_COUNT_C
 # ---------------------------------------------------------------------------
 # Document loading + OCR
 # ---------------------------------------------------------------------------
-# The classifier accepts JPEG/PNG, PDF, SVG, plain text, and .docx. Everything
-# is normalised into a common.documents.Document — pages that may carry an
-# image, a text layer, or both — before any criterion runs. An SVG is one page
+# The classifier accepts JPEG/PNG/HEIC/HEIF/AVIF photos, PDF, SVG, plain text,
+# and .docx. Everything is normalised into a common.documents.Document — pages
+# that may carry an image, a text layer, or both — before any criterion runs.
+# A HEIC (an iPhone's default) or AVIF is the same one-item `image` kind as a
+# JPEG: decoded once (pillow-heif / Pillow's AVIF plugin), rotated upright
+# once, and re-encoded as JPEG/PNG for everything downstream. An SVG is one page
 # rendered by MuPDF like a one-page PDF (its <text> is native text), at
 # PDF_RENDER_DPI up to common.documents.DEFAULT_MAX_RENDER_PIXELS; MuPDF never
 # fetches what an SVG links to, and each external reference it did not draw is
@@ -153,7 +156,7 @@ OCR_MIN_NATIVE_CHARS: int = max(
 #   * at most SVG_FETCH_MAX_IMAGES distinct URLs per document; the rest are
 #     not fetched;
 #   * the body must be a PNG or JPEG by its bytes (no nested SVG, no HTML
-#     error page);
+#     error page, no HEIC/AVIF — MuPDF draws only JPEG and PNG data: images);
 #   * any failure blanks that href and becomes a documents[].warnings line
 #     naming the reason — it never fails the request.
 #
@@ -177,11 +180,15 @@ SVG_FETCH_TIMEOUT_S: float = max(
 # clients send it for everything. Legacy Word (application/msword) is NOT
 # supported but is allowed through on purpose: detect_kind then sees the OLE2
 # magic and returns the specific "convert to .docx" message instead of a
-# generic content-type rejection.
+# generic content-type rejection. image/heic / image/heif are what an iPhone
+# (or a browser picking its photo) declares; image/avif is AVIF's.
 ACCEPTED_CONTENT_TYPES: frozenset[str] = frozenset({
     "image/jpeg",
     "image/jpg",
     "image/png",
+    "image/heic",
+    "image/heif",
+    "image/avif",
     "image/svg+xml",
     "application/pdf",
     "text/plain",

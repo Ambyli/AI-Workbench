@@ -10,8 +10,8 @@ named database for the session -- ``route_policy_test_<pid>_<hex>`` -- points
 ``ROUTE_POLICY_DB_*`` at it BEFORE ``route_policy.config`` is imported, and
 drops it at the end. Without it, ``ROUTE_POLICY_DB_HOST`` is forced empty (no
 test can reach a database a developer's shell points at) and every test
-marked ``postgres`` is skipped. The engine, evaluator, combiner, ruleset,
-drift and parity tests never need it.
+marked ``postgres`` is skipped. The engine, evaluator, combiner, ruleset
+and default-ruleset tests never need it.
 
     UV_LINK_MODE=copy uv run --no-sync python -m pytest unit-tests/route-policy -q -p no:cacheprovider
     TEST_POSTGRES_DSN=postgresql://postgres@localhost:55441/postgres  (same command)
@@ -99,6 +99,14 @@ else:
     os.environ["ROUTE_POLICY_DB_HOST"] = ""
 # Re-read on every refresh in tests that change bindings under a running app.
 os.environ["ROUTE_POLICY_BINDING_REFRESH_S"] = "0"
+# The shared tests read what they just wrote, so their database waits must
+# not be cut short: a scratch Postgres on a laptop can take more than 50 ms.
+# The budgets themselves are tested with fake databases and explicit values
+# (test_writes.py).
+os.environ["ROUTE_POLICY_DECISION_WRITE_BUDGET_S"] = "30"
+import route_policy.config as _config  # noqa: E402 -- after the environment above
+
+_config.DB_READ_BUDGET_S = 30.0
 
 HAVE_POSTGRES = _SESSION_DB is not None
 

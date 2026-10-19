@@ -51,7 +51,7 @@ a{color:var(--acc)}
 // [compose service key, label, LAN port (the listen section's first bind), class, extra]
 // test_deploy.py checks this list against haproxy.cfg.
 const SERVICES = [
-  ["litellm", "LiteLLM", 4001, "swap", "HTTPS 443 · router 14000"],
+  ["litellm", "LiteLLM", 4001, "swap", "HTTPS 443"],
   ["oauth2-proxy", "oauth2-proxy", 4180, "swap", "Google sign-in for chat"],
   ["kokoro-api", "Kokoro TTS", 8004, "swap", ""],
   ["madlad-api", "MADLAD translate", 8008, "swap", ""],
@@ -59,7 +59,6 @@ const SERVICES = [
   ["sandbox-proxy", "Sandbox proxy", 8011, "swap", ""],
   ["superset", "Superset", 8016, "swap", ""],
   ["supabase-api", "Supabase gateway", 8022, "swap", ""],
-  ["vllm-sr-envoy", "Semantic router", 8025, "swap", ""],
   ["route-policy", "Route policy", 8027, "swap", ""],
   ["classifier", "Classifier", 8005, "recreate", ""],
   ["sandbox-runner", "Sandbox runner", 8012, "recreate", ""],

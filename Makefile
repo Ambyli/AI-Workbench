@@ -32,7 +32,6 @@ $(eval $(call service,sandbox,sandbox-db sandbox-egress sandbox-proxy sandbox-ru
 $(eval $(call service,n8n,n8n-db n8n))
 $(eval $(call service,open-terminal,open-terminal))
 $(eval $(call service,trino,hive-metastore-db hive-metastore lake-s3 lake-s3-init trino-auth-init trino-coordinator trino-mcp superset-db superset))
-$(eval $(call service,semantic-router,vllm-sr-models-init vllm-sr-router vllm-sr-envoy))
 $(eval $(call service,supabase,supabase-db supavisor auth rest realtime imgproxy storage meta studio supabase-api functions))
 $(eval $(call service,route-policy,route-policy-db route-policy))
 # Last on purpose: it binds the host ports the swap-class services above used

@@ -38,9 +38,11 @@ def _errors(doc) -> list:
 
 def test_the_baked_in_seed():
     s = seed()
-    assert [(r.id, r.version, r.mode) for r in s.compiled] == [("default", 1, "shadow")]
+    # Only the current version is baked in: version 1 (phase 2, shadow) lives
+    # on in the database alone (test_db.py::test_the_phase_3_upgrade_...).
+    assert [(r.id, r.version, r.mode) for r in s.compiled] == [("default", 2, "enforce")]
     assert [(b.scope_model, b.scope_key_alias, b.ruleset_id, b.version) for b in s.bindings] == [
-        ("auto", None, "default", 1)]
+        ("auto", None, "default", 2)]
     ruleset = s.compiled[0]
     assert ruleset.routes == ["local-general", "local-code", "local-reasoning", "local-private"]
     assert ruleset.default_route == "local-general"
@@ -175,11 +177,12 @@ def _bindings(tmp_path: pathlib.Path, text: str):
 
 def test_seed_bindings(tmp_path):
     (b,) = _bindings(tmp_path, "- {model: auto, ruleset: default}\n")
-    assert (b.scope_model, b.scope_key_alias, b.version) == ("auto", None, 1)
-    (b,) = _bindings(tmp_path, "- {model: auto, key_alias: tester, ruleset: default, version: 1}\n")
+    assert (b.scope_model, b.scope_key_alias, b.version) == ("auto", None, 2)
+    (b,) = _bindings(tmp_path, "- {model: auto, key_alias: tester, ruleset: default, version: 2}\n")
     assert b.scope_key_alias == "tester"
     for bad, match in [
         ("- {model: auto, ruleset: ghost}\n", "no ruleset 'ghost'"),
+        ("- {model: auto, ruleset: default, version: 1}\n", "not baked in"),
         ("- {model: auto, ruleset: default, version: 9}\n", "not baked in"),
         ("- {model: auto, ruleset: default}\n- {model: auto, ruleset: default}\n", "bound twice"),
         ("- {model: auto, ruleset: default, extra: 1}\n", "expected"),
@@ -206,12 +209,12 @@ def test_store_resolves_bindings_by_model_and_key_alias():
         store.add(r)
     from route_policy.rulesets.loader import Binding
 
-    store.set_bindings([Binding("auto", None, "default", 1), Binding("auto", "tester", "default", 1)])
+    store.set_bindings([Binding("auto", None, "default", 2), Binding("auto", "tester", "default", 2)])
     assert store.binding_for("auto", None).scope_key_alias is None
     assert store.binding_for("auto", "tester").scope_key_alias == "tester"
     assert store.binding_for("auto", "someone").scope_key_alias is None
     assert store.binding_for("local-code", None) is None
     assert asyncio.run(store.resolve("auto", None)).id == "default"
     assert asyncio.run(store.resolve("gpt-4", None)) is None
-    assert asyncio.run(store.get("default")).version == 1
-    assert asyncio.run(store.get("default", 2)) is None
+    assert asyncio.run(store.get("default")).version == 2
+    assert asyncio.run(store.get("default", 1)) is None   # not baked in, and no database to ask

@@ -4,9 +4,10 @@ against. Responses are plain dicts built by the engine
 (``engine.pipeline.Decision.response``) so their keys are exactly the
 contract's.
 
-Lenient where a strict check would only lose data: the hook calls /decide and
-/observe fire-and-forget, so a 422 is invisible to everyone. Unknown fields
-are ignored; enum-like strings (verdict, status, finish_reason,
+Lenient where a strict check would only lose data: a 422 on /decide sends the
+turn to the hook's fallback (local-private) and one on /observe is never
+seen (it is fire-and-forget), so nobody can act on it. Unknown fields are
+ignored; enum-like strings (verdict, status, finish_reason,
 overflow_reason) are bounded in length, not in value -- the documented values
 are in ROUTE_POLICY.md. Strict where the database needs it: ``decision_id``
 must be a UUID (it is the primary key the two calls meet on).

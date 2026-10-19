@@ -1,17 +1,15 @@
-# privacy_kw -- the semantic router's PII keyword signal, for the `default`
-# ruleset's `privacy` evaluator (role: force -> local-private).
+# privacy_kw -- PII keywords, for the `default` ruleset's `privacy` evaluator
+# (role: force -> local-private).
 #
-# A COPY of routing.signals.keywords[name=privacy_kw] in
-# ai/semantic-router/config.yaml, kept identical (keywords, operator,
-# case_sensitive, method) by unit-tests/route-policy/test_drift.py until
-# phase 3 retires the router and this file becomes the only one. Edit both
-# together -- and since this file is part of the ruleset's content hash, give
-# the ruleset a new `version` (ROUTE_POLICY.md § Changing a ruleset).
+# The only copy: this file is the source of truth. It is part of every
+# ruleset version that references it (its content, not these comments, is
+# inlined and hashed), so an edit here needs a ruleset `version` bump
+# (ROUTE_POLICY.md § Changing a ruleset).
 #
 # No `method`: each keyword is a whole-word literal, case-insensitive
-# (common.keywordmatch, the Go router's semantics). Literal words are lexical:
-# a PII prompt that names none of them is NOT caught -- widen the list rather
-# than trusting the match.
+# (common.keywordmatch). Literal words are lexical: a PII prompt that names
+# none of them is NOT caught -- widen the list rather than trusting the
+# match.
 name: privacy_kw
 operator: OR
 case_sensitive: false

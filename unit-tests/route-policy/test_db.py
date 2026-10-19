@@ -55,10 +55,18 @@ def _decide(client, chat="chat-db", decision_id=None, messages=None, **kw):
     return body, r.json()
 
 
-def _copy_rulesets(tmp_path: pathlib.Path) -> pathlib.Path:
-    target = tmp_path / "rulesets"
+def _copy_rulesets(tmp_path: pathlib.Path, name: str = "rulesets") -> pathlib.Path:
+    target = tmp_path / name
     shutil.copytree(RULESETS_DIR, target)
     return target
+
+
+def _rewrite(path: pathlib.Path, *pairs) -> None:
+    text = path.read_text(encoding="utf-8")
+    for old, new in pairs:
+        assert old in text, old
+        text = text.replace(old, new)
+    path.write_text(text, encoding="utf-8")
 
 
 # -- startup ----------------------------------------------------------------------
@@ -73,10 +81,10 @@ def test_startup_migrates_seeds_and_binds(fresh_database):
             "schema_migrations"} <= tables
     assert "analyses" not in tables  # phase 4
     (rs,) = _fetch(fresh_database, "SELECT id, version, created_by, source, active_from, active_to FROM rulesets")
-    assert (rs["id"], rs["version"], rs["created_by"], rs["source"]) == ("default", 1, "seed", "rulesets/default.yaml")
+    assert (rs["id"], rs["version"], rs["created_by"], rs["source"]) == ("default", 2, "seed", "rulesets/default.yaml")
     assert rs["active_from"] is not None and rs["active_to"] is None
     (b,) = _fetch(fresh_database, "SELECT scope_model, scope_key_alias, ruleset_id, version FROM bindings")
-    assert b == {"scope_model": "auto", "scope_key_alias": None, "ruleset_id": "default", "version": 1}
+    assert b == {"scope_model": "auto", "scope_key_alias": None, "ruleset_id": "default", "version": 2}
     # A second start changes nothing.
     with _client(fresh_database) as c:
         assert c.get("/health").status_code == 200
@@ -88,9 +96,8 @@ def test_a_changed_ruleset_without_a_version_bump_stops_startup(fresh_database, 
     with _client(fresh_database):
         pass
     edited = _copy_rulesets(tmp_path)
-    path = edited / "default.yaml"
-    path.write_text(path.read_text(encoding="utf-8").replace("exchanges: 3", "exchanges: 4"), encoding="utf-8")
-    with pytest.raises(SeedConflict, match="default@1"):
+    _rewrite(edited / "default.yaml", ("exchanges: 3", "exchanges: 4"))
+    with pytest.raises(SeedConflict, match="default@2"):
         with _client(fresh_database, edited):
             pass
 
@@ -99,16 +106,39 @@ def test_a_version_bump_moves_the_binding(fresh_database, tmp_path):
     with _client(fresh_database):
         pass
     edited = _copy_rulesets(tmp_path)
-    path = edited / "default.yaml"
-    path.write_text(path.read_text(encoding="utf-8").replace("version: 1", "version: 2")
-                    .replace("exchanges: 3", "exchanges: 4"), encoding="utf-8")
+    _rewrite(edited / "default.yaml", ("version: 2", "version: 3"), ("exchanges: 3", "exchanges: 4"))
     with _client(fresh_database, edited) as c:
         _, out = _decide(c)
-        assert out["ruleset"] == {"id": "default", "version": 2}
+        assert out["ruleset"] == {"id": "default", "version": 3}
         versions = [v["version"] for v in c.get("/rulesets/default").json()["versions"]]
-        assert versions == [1, 2]
+        assert versions == [2, 3]
     marks = {r["version"]: r for r in _fetch(fresh_database, "SELECT version, active_from, active_to FROM rulesets")}
-    assert marks[1]["active_to"] is not None and marks[2]["active_to"] is None
+    assert marks[2]["active_to"] is not None and marks[3]["active_to"] is None
+
+
+def test_the_phase_3_upgrade_keeps_the_old_version_readable(fresh_database, tmp_path):
+    """The box's path: a database seeded with a shadow `default@1` (phase 2),
+    then this image, whose only baked-in `default` is version 2 (enforce).
+    The binding moves to 2; version 1 stays stored with its decisions, and
+    is still readable and evaluable although no file holds it any more."""
+    phase2 = _copy_rulesets(tmp_path, "phase2")
+    _rewrite(phase2 / "default.yaml", ("version: 2", "version: 1"), ("mode: enforce", "mode: shadow"))
+    with _client(fresh_database, phase2) as c:
+        _, out = _decide(c, chat="chat-upgrade")
+        assert (out["ruleset"], out["mode"], out["apply"]) == ({"id": "default", "version": 1}, "shadow", False)
+    with _client(fresh_database) as c:
+        _, out = _decide(c, chat="chat-upgrade")
+        assert (out["ruleset"], out["mode"], out["apply"]) == ({"id": "default", "version": 2}, "enforce", True)
+        assert c.get("/health").json()["rulesets"] == [{"id": "default", "version": 2}]
+        assert [v["version"] for v in c.get("/rulesets/default").json()["versions"]] == [1, 2]
+        assert c.get("/rulesets/default/1").json()["document"]["mode"] == "shadow"
+        old = c.post("/evaluate", json={"ruleset": {"id": "default", "version": 1},
+                                        "messages": [user("fix app.py")]})
+        assert old.status_code == 200 and (old.json()["mode"], old.json()["route"]) == ("shadow", "local-code")
+        (b,) = c.get("/bindings").json()["bindings"]
+        assert b["version"] == 2
+        decisions = c.get("/chats/chat-upgrade/decisions").json()["decisions"]
+        assert [(d["ruleset"]["version"], d["applied"]) for d in decisions] == [(1, False), (2, True)]
 
 
 def test_migrations_are_recorded_and_immutable(fresh_database, tmp_path):
@@ -138,8 +168,8 @@ def test_decide_stores_the_decision_and_its_evaluations():
     did = uuid.UUID(body["decision_id"])
     (d,) = _fetch(config.DB_DSN, "SELECT * FROM decisions WHERE decision_id = $1", did)
     assert (d["chat_id"], d["requested_model"], d["chosen_route"], d["applied"], d["mode"]) == \
-        ("chat-store", "auto", "local-code", False, "shadow")
-    assert (d["ruleset_id"], d["ruleset_version"], d["message_count"], d["tool_count"]) == ("default", 1, 3, 0)
+        ("chat-store", "auto", "local-code", True, "enforce")
+    assert (d["ruleset_id"], d["ruleset_version"], d["message_count"], d["tool_count"]) == ("default", 2, 3, 0)
     assert d["scores"] == {"local-code": 2.0} and d["response"] == out and d["error"] is None
     assert d["backend_snapshot"] == {"http://qwen3.8-solo:8000/v1": {"verdict": "busy", "waiting": 2.0,
                                                                      "running": 3.0}}
@@ -184,7 +214,7 @@ def test_observe_before_decide_and_the_view():
 
 
 def test_success_query_shape():
-    """The phase-2 success query (ROUTE_POLICY_PLAN § 7) runs as written."""
+    """The agreement query (ROUTE_POLICY_PLAN § 7) runs as written."""
     with _client() as c:
         body, _ = _decide(c, chat="chat-q")
         c.post("/observe", json={"decision_id": body["decision_id"], "served_model_group": "local-general",
@@ -219,19 +249,20 @@ def test_chat_decisions_oldest_first_with_outcomes():
 def test_ruleset_and_binding_reads():
     with _client() as c:
         listed = c.get("/rulesets").json()["rulesets"]
-        assert [(r["id"], r["version"], r["mode"]) for r in listed] == [("default", 1, "shadow")]
+        assert [(r["id"], r["version"], r["mode"]) for r in listed] == [("default", 2, "enforce")]
         assert "document" not in listed[0] and len(listed[0]["sha256"]) == 64
         latest = c.get("/rulesets/default").json()
-        assert latest["version"] == 1 and latest["document"]["id"] == "default"
-        assert [v["version"] for v in latest["versions"]] == [1]
-        assert c.get("/rulesets/default/1").json()["document"]["evaluators"][0]["id"] == "privacy"
-        assert c.get("/rulesets/default/2").status_code == 404
+        assert latest["version"] == 2 and latest["document"]["id"] == "default"
+        assert [v["version"] for v in latest["versions"]] == [2]
+        assert c.get("/rulesets/default/2").json()["document"]["evaluators"][0]["id"] == "privacy"
+        assert c.get("/rulesets/default/1").status_code == 404
+        assert c.get("/rulesets/default/3").status_code == 404
         assert c.get("/rulesets/nope").status_code == 404
         assert c.get("/rulesets/default/0").status_code == 422
         (b,) = c.get("/bindings").json()["bindings"]
-        assert (b["scope_model"], b["scope_key_alias"], b["ruleset_id"], b["version"]) == ("auto", None, "default", 1)
+        assert (b["scope_model"], b["scope_key_alias"], b["ruleset_id"], b["version"]) == ("auto", None, "default", 2)
         # A stored document posts straight back to /evaluate.
-        doc = c.get("/rulesets/default/1").json()["document"]
+        doc = c.get("/rulesets/default/2").json()["document"]
         assert c.post("/evaluate", json={"document": doc, "messages": [user("prove it")]}).json()["route"] == \
             "local-reasoning"
 
@@ -241,7 +272,7 @@ def test_a_binding_changed_in_the_database_is_picked_up(fresh_database):
         assert c.post("/decide", json={"decision_id": str(uuid.uuid4()), "requested_model": "tester",
                                        "messages": [user("x")]}).status_code == 404
         _fetch(fresh_database, "INSERT INTO bindings (scope_model, ruleset_id, version, updated_by) "
-                               "VALUES ('tester', 'default', 1, 'test') RETURNING id")
+                               "VALUES ('tester', 'default', 2, 'test') RETURNING id")
         r = c.post("/decide", json={"decision_id": str(uuid.uuid4()), "requested_model": "tester",
                                     "messages": [user("x")]})
-        assert r.status_code == 200 and r.json()["ruleset"] == {"id": "default", "version": 1}
+        assert r.status_code == 200 and r.json()["ruleset"] == {"id": "default", "version": 2}

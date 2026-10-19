@@ -1,84 +1,92 @@
-# The `default` ruleset: today's `auto` routing, reproduced, in SHADOW mode.
+# The `default` ruleset: how every `auto` turn is routed (ENFORCE mode).
 #
-# Today an `auto` turn is routed in two steps:
-#   1. the semantic router (ai/semantic-router/config.yaml) matches keyword
-#      signals on the LATEST user message: privacy_kw -> local-private
-#      (priority 300), code_kw -> local-code (200), reasoning_kw ->
-#      local-reasoning (150), else local-general (10);
-#   2. the LiteLLM hook (ai/litellm/hooks/routing/code_route.py) turns a
-#      local-general turn into local-code when the conversation CALLED a
-#      sandbox / Open Terminal tool in this exchange, or did -- or matched
-#      code_kw -- within the last 3 exchanges (the cooldown).
-# The `priority` combiner over the evaluators below, in this order, gives the
-# same route: first non-abstaining vote wins, privacy forces. Bound to the
-# requested model `auto` by bindings.yaml.
+# LiteLLM (ai/litellm/hooks/routing/policy_client.py) awaits POST /decide
+# for each `auto` request and rewrites it to the returned chain alias when
+# `apply` is true; anything else (a timeout, an error, `apply: false`) goes
+# to local-private. Bound to the requested model `auto` by bindings.yaml.
 #
-# Kept in step with its sources by unit-tests/route-policy/test_drift.py (the
-# pattern files vs the router's rules, the tool regex and cooldown vs
-# ai/litellm/hooks/settings.py's CODE_ROUTE_* defaults) and test_parity.py
-# (this ruleset vs the router's decisions + the hook's remap, on real
-# conversation shapes). Phase 3 deletes those sources; this file stays.
+# The rules, first non-abstaining vote wins (`priority` combiner):
+#   1. privacy        PII words in the latest user message -> local-private,
+#                     role `force`: wins over every other vote;
+#   2. code-text      code words / file names / fences in the latest user
+#                     message -> local-code;
+#   3. reasoning-text math / science / multi-step words -> local-reasoning;
+#   4. code-tools     a sandbox / Open Terminal tool was CALLED in this
+#                     exchange -> local-code;
+#   5. sticky-code    a coding exchange (4. or 2.) within the last 3 ->
+#                     local-code;
+#   else local-general.
+# The keyword rules live in patterns/*.yaml -- the only copy; their RE2
+# subset and the real-chat prompts they must (not) match are checked by
+# unit-tests/route-policy/test_default_ruleset.py, which also pins this
+# ruleset's routes on conversation shapes.
+#
+# Version history: 1 (phase 2) ran the same evaluators and patterns in
+# shadow mode; it stays in route-policy-db with the decisions made under it,
+# but is no longer baked in (a stored version needs no file: the store
+# compiles it from the database on first use, e.g. for POST /evaluate). 2 is
+# `mode: enforce`, with descriptions that say what each rule does.
 #
 # CHANGING IT: versions are immutable. Anything but these comments -- a
 # description, a pattern in a referenced file -- is new content, and a stored
-# `default@1` with different content stops route-policy at startup. Bump
+# `default@2` with different content stops route-policy at startup. Bump
 # `version` (the binding follows the highest one). ROUTE_POLICY.md §
 # Changing a ruleset.
 id: default
-version: 1
+version: 2
 description: >-
-  Reproduces today's `auto` routing -- the semantic router's privacy / code /
-  reasoning keyword signals on the latest user message, then the LiteLLM
-  hook's code-tool remap and 3-exchange cooldown -- in shadow mode.
-mode: shadow
+  Routes `auto` by the latest user message's privacy / code / reasoning
+  keywords, then by the sandbox / Open Terminal tools the conversation called
+  (this exchange, or a coding exchange within the last 3) -- in enforce mode.
+mode: enforce
 routes: [local-general, local-code, local-reasoning, local-private]
 default_route: local-general
 evaluators:
-  # Router decision privacy_local (priority 300). `force`: wins over every
-  # other vote, so a PII prompt never reaches a Claude-capable chain.
+  # `force`: wins over every other vote, so a PII prompt never reaches a
+  # Claude-capable chain (local-private has no Claude deployment).
   - id: privacy
     type: regex_text
     role: force
-    description: PII keywords in the latest user message (the router's privacy_kw).
+    description: PII keywords in the latest user message.
     config:
       patterns_ref: patterns/privacy.yaml
     vote: {route: local-private}
 
-  # Router decision code (priority 200).
   - id: code-text
     type: regex_text
-    description: Code keywords in the latest user message (the router's code_kw).
+    description: Code keywords, file names or a code fence in the latest user message.
     config:
       patterns_ref: patterns/code.yaml
     vote: {route: local-code}
 
-  # Router decision reasoning (priority 150). Before the two below because
-  # the hook only ever remaps local-general: a reasoning turn stays reasoning.
+  # Before the two tool-based rules below: a turn that asks for a proof
+  # stays on local-reasoning even in a chat that has been coding.
   - id: reasoning-text
     type: regex_text
-    description: Math / science / multi-step keywords in the latest user message (the router's reasoning_kw).
+    description: Math / science / multi-step keywords in the latest user message.
     config:
       patterns_ref: patterns/reasoning.yaml
     vote: {route: local-reasoning}
 
-  # The hook's remap, current exchange: a sandbox MCP tool or one of Open
-  # Terminal's distinctive operationIds was CALLED since the latest user
-  # message. Same pattern as DEFAULT_CODE_ROUTE_TOOL_REGEX (full-name match).
+  # A sandbox MCP tool (Open WebUI prefixes them `sandbox-mcp_`) or one of
+  # Open Terminal's distinctive operationIds was CALLED since the latest user
+  # message. Offered-but-uncalled tools never count; the pattern must match
+  # the whole tool name.
   - id: code-tools
     type: tool_calls
-    description: A sandbox / Open Terminal tool was called in this exchange (the hook's code-tool remap).
+    description: A sandbox / Open Terminal tool was called in this exchange.
     config:
       pattern: 'sandbox-mcp_.+|run_command|get_process_status|send_process_input|kill_process|replace_file_content|read_user_terminal|send_user_terminal_input'
       scope: current_exchange
     vote: {route: local-code}
 
-  # The hook's cooldown: local-code holds while fewer than 3 irrelevant
-  # exchanges followed the last one that called such a tool or matched
-  # code_kw (DEFAULT_CODE_ROUTE_COOLDOWN). Judges in the hook's order: tools
-  # first, then the message.
+  # local-code holds while fewer than 3 irrelevant exchanges followed the
+  # last one that called such a tool or matched the code keywords -- build a
+  # calculator, then three weather questions stay on local-code and the
+  # fourth drops to local-general. The judges are asked in this order.
   - id: sticky-code
     type: cooldown
-    description: Stays on local-code for 3 exchanges after the last coding one (the hook's cooldown).
+    description: Stays on local-code for 3 exchanges after the last coding one.
     config:
       exchanges: 3
       relevant_if: [code-tools, code-text]

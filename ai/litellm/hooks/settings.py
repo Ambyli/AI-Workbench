@@ -11,13 +11,6 @@ from __future__ import annotations
 
 import os
 
-from .routing.code_route import (
-    DEFAULT_CODE_ROUTE_ROUTER_CONFIG,
-    DEFAULT_CODE_ROUTE_TOOL_REGEX,
-    compile_code_route_regex,
-    parse_code_route_cooldown,
-)
-
 
 def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
     raw = os.environ.get(name, "")
@@ -54,20 +47,15 @@ TOKENIZE_TIMEOUT_S = _env_float("OVERFLOW_TOKENIZE_TIMEOUT_S", 5.0, minimum=0.1)
 # -- The `auto` footer (hooks/footer) --------------------------------------------
 AUTO_FOOTER_ENABLED = _env_bool("AUTO_FOOTER_ENABLED", True)
 
-# -- The code-tool remap (hooks/routing/code_route.py) --------------------------
-# Unset -> the default; set but empty -> remap off (the compose file passes
-# ${CODE_ROUTE_TOOL_REGEX-<default>}, so only an explicit empty value in .env
-# turns it off). Invalid -> off, with the error logged when the handler is built.
-CODE_ROUTE_TOOL_REGEX, CODE_ROUTE_TOOL_REGEX_ERROR = compile_code_route_regex(
-    os.environ.get("CODE_ROUTE_TOOL_REGEX", DEFAULT_CODE_ROUTE_TOOL_REGEX)
-)
-CODE_ROUTE_COOLDOWN, CODE_ROUTE_COOLDOWN_ERROR = parse_code_route_cooldown(os.environ.get("CODE_ROUTE_COOLDOWN"))
-CODE_ROUTE_ROUTER_CONFIG = os.environ.get("CODE_ROUTE_ROUTER_CONFIG", DEFAULT_CODE_ROUTE_ROUTER_CONFIG)
-
-# -- The route-policy client, shadow mode (hooks/routing/policy_client.py) ------
+# -- The route-policy client (hooks/routing/policy_client.py) --------------------
 # Infrastructure only -- where the service is, whether to call it, how long a
-# background call may take. The routing rules live in the service's rulesets,
-# never here. Disabled, or an empty URL: no /decide, no /observe, nothing stashed.
+# call may take. The routing rules live in the service's rulesets, never here.
+# Disabled, or an empty URL: no /decide, no /observe, and every `auto` request
+# goes to local-private (logged as a fallback).
 ROUTE_POLICY_ENABLED = _env_bool("ROUTE_POLICY_ENABLED", True)
 ROUTE_POLICY_URL = os.environ.get("ROUTE_POLICY_URL", "http://route-policy:8000").strip()
+# One background /observe call, start to finish.
 ROUTE_POLICY_TIMEOUT_S = _env_float("ROUTE_POLICY_TIMEOUT_S", 2.0, minimum=0.1)
+# The AWAITED /decide on every `auto` request, start to finish; past it the
+# request goes to local-private. It is added to the request's latency.
+ROUTE_POLICY_DECIDE_TIMEOUT_S = _env_float("ROUTE_POLICY_DECIDE_TIMEOUT_S", 0.25, minimum=0.05)

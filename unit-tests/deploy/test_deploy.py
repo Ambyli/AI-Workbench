@@ -886,8 +886,8 @@ frontend metrics
     bind :8405 name internal
 listen litellm
     bind :4001 name lan
-    bind :14000 name internal
-    acl lan_bind so_name -m str lan
+    bind :4443 name lan-tls ssl crt /certs/edge.pem alpn h2,http/1.1
+    acl lan_allowed src "${EDGE_ALLOWED_CIDRS[*]}"
     .if !streq("${N-8}",0)
     stick-table type string len 64 size 10k expire 10m
     .endif
@@ -1386,7 +1386,7 @@ def test_lan_and_internal_binds_are_named_and_internal_ones_never_published():
             for addr, port, name in s["binds"]:
                 assert addr == "127.0.0.1" or name == "internal", f"frontend {s['name']} :{port}"
                 internal.add(port)
-    assert {8404, 8405, 8407, 14000} <= internal
+    assert {8404, 8405, 8407} <= internal
     assert not internal & published, f"internal listeners published: {internal & published}"
 
 
@@ -1425,8 +1425,15 @@ def test_per_key_limit_is_lan_only_and_never_stores_the_raw_key():
     tracks = [l for l in litellm["lines"] if "track-sc" in l]
     limits = [l for l in litellm["lines"] if l.startswith("http-request return status 429")]
     assert len(tracks) == 3 and len(limits) == 1
+    # LAN only: with nothing but LAN binds the rules apply to every bind; an
+    # internal bind added to the section would have to be exempted by
+    # `lan_bind` scoping (test_lan_allow_list_... checks the acl itself).
+    names = {name for _a, _p, name in litellm["binds"]}
     for l in tracks + limits:
-        assert " if lan_bind " in l, l
+        if "internal" in names:
+            assert " if lan_bind " in l, l
+        else:
+            assert names <= LAN_BIND_NAMES and "lan_bind" not in l, l
     assert [l.split()[2] for l in tracks] == [
         "req.hdr(authorization),sha2(256),hex", "req.hdr(x-api-key),sha2(256),hex", "src"]
     assert "sc0_trackers gt" in limits[0] and "hdr Retry-After" in limits[0]
@@ -1465,18 +1472,6 @@ def test_edge_env_vars_are_passed_through_and_documented():
     cidrs = re.search(r'^EDGE_ALLOWED_CIDRS="([^"]*)"$', env_example, re.M).group(1)
     for value in (cidrs, env["EDGE_ALLOWED_CIDRS"]):
         assert "," not in value and "172.16.0.0/12" in value.replace("}", " ").split()
-
-
-def test_semantic_router_reaches_litellm_through_the_edge_internal_bind():
-    cfg = _yaml().safe_load((_ROOT / "ai" / "semantic-router" / "config.yaml").read_text(encoding="utf-8"))
-    urls = {ref["base_url"] for m in cfg["providers"]["models"] for ref in m["backend_refs"]}
-    assert urls == {"http://edge:14000/v1"}
-    assert ("", 14000, "internal") in _section("listen", "litellm")["binds"]
-    assert 14000 not in _edge_published_container_ports()
-    render = (_ROOT / "ai" / "semantic-router" / "envoy.yaml").read_text(encoding="utf-8")
-    body = render[render.index("\nadmin:"):]
-    assert "address: litellm" not in body
-    assert body.count("address: edge") == len(cfg["providers"]["models"])
 
 
 def test_deploy_stats_frontend_shows_server_addresses():
@@ -1553,7 +1548,7 @@ def test_prometheus_is_on_ai_shared_and_every_target_is_reachable_there():
 def test_deploy_reads_the_same_edge_listeners_as_haproxy_cfg():
     listens = deploy.load_edge_listens(str(_ROOT))
     assert listens == {name: str(bind) for name, (bind, _h, _p) in _haproxy_listens().items()}
-    assert listens["litellm"] == "4001"  # the LAN bind, not the internal 14000
+    assert listens["litellm"] == "4001"  # the plain LAN bind, not the TLS 4443
     assert not {"stats", "metrics", "status"} & set(listens)
 
 
@@ -1600,12 +1595,12 @@ def test_litellm_has_a_published_tls_lan_bind_with_the_edge_certificate():
     # Host side 443 by default (one URL in and out of the office, EDGE.md §
     # TLS); the listener inside the container stays :4443.
     assert "${PORT_LITELLM_TLS:-443}:4443" in ports
-    # The TLS bind is a LAN bind: both the allow-list and the per-key limit
-    # are keyed on lan_bind, which must match it.
-    assert "acl lan_bind so_name -m str lan lan-tls" in litellm["lines"]
-    for l in litellm["lines"]:
-        if "track-sc0" in l or l.startswith(("http-request return status 429", "http-request return status 403")):
-            assert " if lan_bind" in l, l
+    # The TLS bind is a LAN bind: every bind of the section is, so the
+    # allow-list and the per-key limit apply to it unscoped, like to 4001.
+    assert {name for _a, _p, name in litellm["binds"]} == LAN_BIND_NAMES
+    assert not [l for l in litellm["lines"] if "lan_bind" in l]
+    (reject,) = [l for l in litellm["lines"] if l.startswith("http-request return status 403")]
+    assert reject.endswith("unless lan_allowed"), reject
 
 
 def test_every_tls_bind_is_a_lan_bind_serving_the_edge_certificate():

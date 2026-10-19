@@ -27,8 +27,10 @@ changed ruleset must get a new version.
       ruleset: default
       version: null             # null / omitted = the highest version baked in
 
-Phase 2: startup owns the bindings it seeds (it re-points them on every
-start); the write API that edits them is phase 5.
+Startup owns the bindings it seeds (it re-points them on every start); the
+write API that edits them is phase 5. A stored version that is no longer
+baked in (``default@1`` after phase 3) stays in the database and is
+compiled from there on first use.
 """
 
 from __future__ import annotations

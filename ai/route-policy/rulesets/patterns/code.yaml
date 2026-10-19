@@ -1,16 +1,18 @@
-# code_kw -- the semantic router's code keyword signal, for the `default`
-# ruleset's `code-text` evaluator and as a `sticky-code` cooldown judge.
+# code_kw -- code keywords, for the `default` ruleset's `code-text` evaluator
+# and as a `sticky-code` cooldown judge.
 #
-# A COPY of routing.signals.keywords[name=code_kw] in
-# ai/semantic-router/config.yaml, kept identical (keywords, operator,
-# case_sensitive, method) by unit-tests/route-policy/test_drift.py until
-# phase 3 retires the router. Edit both together, and bump the ruleset's
-# `version` (this file is part of its content hash).
+# The only copy: this file is the source of truth. It is part of every
+# ruleset version that references it (its content, not these comments, is
+# inlined and hashed), so an edit here needs a ruleset `version` bump.
+# unit-tests/route-policy/test_default_ruleset.py checks that every pattern
+# stays in the RE2 subset, and the real-chat prompts it must (and must not)
+# match.
 #
-# `method: regex`: each keyword is an RE2 pattern (no lookaround, no
-# backreferences; \b and \w are ASCII), "(?i)" applied because
-# case_sensitive is false -- compiled here by common.keywordmatch with the
-# same semantics. Single quotes keep each backslash literal.
+# `method: regex`: each keyword is a pattern, "(?i)" applied because
+# case_sensitive is false, compiled by common.keywordmatch with Go RE2's
+# semantics: keep to the RE2 subset (no lookaround, no backreferences, no
+# atomic / possessive groups, no \Z), and \b / \w are ASCII. Single quotes
+# keep each backslash literal.
 name: code_kw
 operator: OR
 case_sensitive: false

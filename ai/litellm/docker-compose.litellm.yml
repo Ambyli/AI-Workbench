@@ -19,14 +19,13 @@ services:
     # (two copies run at once) and no `ports:` -- PORT_LITELLM is published by
     # ai/edge, which routes to whichever copy is healthy. The hash covers
     # every bind mount below too (litellm_config.yaml, overflow.py, hooks/,
-    # the mounted parts of shared/common, the router config), so editing any
-    # of them and running `make up litellm` deploys it. See ai/edge/EDGE.md.
+    # the mounted part of shared/common), so editing any of them and running
+    # `make up litellm` deploys it. See ai/edge/EDGE.md.
     labels:
       com.zeo.deploy: swap
     restart: unless-stopped
     # `docker stop` on the retiring copy waits this long for in-flight
-    # requests: an `auto` turn may take 870 s (stream_timeout + timeout),
-    # inside Open WebUI's 900 s budget.
+    # requests: a streamed turn may run up to Open WebUI's 900 s total.
     stop_grace_period: 900s
     environment:
       STORE_MODEL_IN_DB: "True"
@@ -45,36 +44,23 @@ services:
       OVERFLOW_TOKENIZE_CHARS_PER_TOKEN: ${OVERFLOW_TOKENIZE_CHARS_PER_TOKEN:-2.5}
       OVERFLOW_TOKENIZE_TIMEOUT_S: ${OVERFLOW_TOKENIZE_TIMEOUT_S:-5}
       # The `auto` footer (a "---" rule + "*<model> - <chain>*" line naming
-      # the backend under each answer from the semantic router), in
-      # hooks/footer/. true|false|1|0.
-      # See ai/litellm/LITELLM.md > The `auto` footer.
+      # the backend under each answer to model `auto`), in hooks/footer/.
+      # true|false|1|0. See ai/litellm/LITELLM.md > The `auto` footer.
       AUTO_FOOTER_ENABLED: ${AUTO_FOOTER_ENABLED:-true}
-      # Code-tool remap (hooks/routing/code_route.py): local-general whose
-      # history CALLED a tool whose name matches this regex in full ->
-      # local-code (offered but uncalled tools don't count). `-` not `:-` ON
-      # PURPOSE: unset uses the default below (== code_route's
-      # DEFAULT_CODE_ROUTE_TOOL_REGEX,
-      # unit-tests/litellm/test_code_route.py checks), but an EMPTY value in
-      # .env must reach the hook, because empty turns the remap off.
-      # See ai/litellm/LITELLM.md > local-code: what it adds.
-      CODE_ROUTE_TOOL_REGEX: ${CODE_ROUTE_TOOL_REGEX-sandbox-mcp_.+|run_command|get_process_status|send_process_input|kill_process|replace_file_content|read_user_terminal|send_user_terminal_input}
-      # Code cooldown: a chat stays on local-code until this many exchanges
-      # (user messages) in a row neither called a code tool nor matched the
-      # router's code_kw, then drops to local-general. 0 = only the current
-      # exchange counts. code_kw is read from the router's own config.yaml,
-      # mounted below, so the two always agree.
-      CODE_ROUTE_COOLDOWN: ${CODE_ROUTE_COOLDOWN:-3}
-      CODE_ROUTE_ROUTER_CONFIG: /app/semantic-router-config.yaml
-      # Route-policy client, shadow mode (hooks/routing/policy_client.py): on
-      # every `auto` request, POST /decide to the route-policy service, and
-      # POST /observe once the answer is out -- fired in the background, never
-      # awaited, never changing routing. Infrastructure only (where the
-      # service is, whether to call it, how long a background call may take);
+      # Route-policy client (hooks/routing/policy_client.py): every `auto`
+      # request AWAITS the route-policy service's POST /decide (at most
+      # ROUTE_POLICY_DECIDE_TIMEOUT_S) and is rewritten to the chain alias it
+      # chose -- or to local-private on a timeout, an error, apply=false, or
+      # with the client off -- then POST /observe reports what answered,
+      # fired in the background (ROUTE_POLICY_TIMEOUT_S). Infrastructure only
+      # (where the service is, whether to call it, how long a call may take);
       # the routing rules live in the service's rulesets. Defaults match
-      # hooks/settings.py. See ai/litellm/LITELLM.md > Route-policy shadow mode.
+      # hooks/settings.py. See ai/litellm/LITELLM.md > Route policy:
+      # single-pass `auto`.
       ROUTE_POLICY_ENABLED: ${ROUTE_POLICY_ENABLED:-true}
       ROUTE_POLICY_URL: ${ROUTE_POLICY_URL:-http://route-policy:8000}
       ROUTE_POLICY_TIMEOUT_S: ${ROUTE_POLICY_TIMEOUT_S:-2}
+      ROUTE_POLICY_DECIDE_TIMEOUT_S: ${ROUTE_POLICY_DECIDE_TIMEOUT_S:-0.25}
     env_file:
       - ../../.env
     volumes:
@@ -88,8 +74,9 @@ services:
       # package's layout is in hooks/__init__.py.
       - ./overflow.py:/app/overflow.py:ro
       - ./hooks:/app/hooks:ro
-      # The two stdlib-only parts of shared/common the hooks import, plus the
-      # package's docstring-only __init__.py -- NOT the whole package: the
+      # The one stdlib-only part of shared/common the hooks import (the
+      # footer's Open WebUI task detection reads chat history with it), plus
+      # the package's docstring-only __init__.py -- NOT the whole package: the
       # container sees only what it uses, and an edit elsewhere in common
       # (documents, vision, jobs, ...) does not change this service's deploy
       # hash. Neither litellm[proxy] nor the upstream Dockerfile's /app
@@ -99,13 +86,6 @@ services:
       # hooks import has no line here.
       - ../../shared/common/src/common/__init__.py:/app/common/__init__.py:ro
       - ../../shared/common/src/common/conversation:/app/common/conversation:ro
-      - ../../shared/common/src/common/keywordmatch:/app/common/keywordmatch:ro
-      # The semantic router's config, read-only, for its `code_kw` signal
-      # (the code cooldown above). Holds no secrets: its api_keys are the
-      # __SEMANTIC_ROUTER_*_KEY__ placeholders. A code_kw edit
-      # therefore changes this service's deploy hash too: `make up litellm`
-      # after `make up semantic-router FORCE=1`.
-      - ../semantic-router/config.yaml:/app/semantic-router-config.yaml:ro
     command:
       - "--config=/app/config.yaml"
     healthcheck:
@@ -147,7 +127,7 @@ services:
     restart: always
     container_name: prometheus
     # Every scrape target in prometheus.yml (litellm, classifier, detector,
-    # vllm-sr-router, edge) is reached by service name over ai_shared. Without
+    # route-policy, edge) is reached by service name over ai_shared. Without
     # this block prometheus sat only on this stack's default network, where
     # none of them live -- not even litellm, which is on shared + internal.
     # It needs nothing on `internal` (litellm_db is not scraped).

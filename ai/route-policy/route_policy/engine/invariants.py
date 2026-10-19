@@ -10,8 +10,12 @@
    not be applied.
 
 The LiteLLM hook enforces its own copy of both before it rewrites a request
-(phase 3, ``ai/litellm/hooks/routing/invariants.py``); this module is pure
-and stdlib-only so the two copies can be tested against the same cases.
+(``ai/litellm/hooks/routing/invariants.py``, whose allowed routes are the four
+chain aliases), so a wrong answer from this service can never move a turn
+off ``local-private`` or onto a non-chain model. This module is pure and
+stdlib-only, and ``PRIVATE_ROUTE`` / ``fail_safe_route`` / ``enforce`` keep
+their names: unit-tests/litellm loads both files by path and runs them over
+the same cases.
 """
 
 from __future__ import annotations

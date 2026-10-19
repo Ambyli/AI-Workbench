@@ -29,6 +29,16 @@ whatever the context-fit step has left):
     unchanged. For local-private, which has no Claude deployment, that is
     what keeps PII on the box.
 
+TOO LONG FOR EVERY LOCAL WINDOW (the context-fit step, context_fit.py): a
+group with a Claude deployment keeps only Claude -- EXCEPT for a request the
+client sent as ``auto`` (the route-policy stash in ``request_kwargs``'
+metadata, hooks/routing/stash.py). Claude is load overflow for ``auto``,
+never a bigger window: such a request gets the group's local deployments
+back unchanged, so vLLM refuses it with its own context-length error, the
+same as local-private. (The old ``auto`` deployment refused these with its
+``max_input_tokens``; ``auto`` is an alias now and has no window of its own.)
+Busy / down overflow to Claude is unchanged for ``auto`` requests.
+
 Debugging: every spill decision logs one INFO line on the ``zeo.overflow``
 logger (throttled per alias/deployment/reason), and ``handler.state()``
 returns a JSON-able snapshot of what the hook believes about each backend.
@@ -37,10 +47,11 @@ See ai/litellm/LITELLM.md > Chain aliases and the overflow hook.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from .. import deployments
 from ..log import ThrottledLog
+from ..routing.stash import stash_of
 from .context_fit import ContextFit
 from .poller import Poller
 from .state import BUSY, DOWN, TOO_LONG
@@ -94,6 +105,17 @@ class OverflowFilter:
                           "%s: no deployment fits the prompt (%s); list unchanged -- the backend will refuse it",
                           model, why)
                 return healthy_deployments
+            if stash_of(request_kwargs) is not None:
+                # The client asked for `auto`: Claude is load overflow there,
+                # never a bigger window. Keep the local deployments; vLLM
+                # refuses the prompt with its own error.
+                local = [d for d in healthy_deployments if deployments.api_base(d) is not None]
+                self.stats["context_auto_kept_local"] += 1
+                self._log(model, "*", "none-fit-auto",
+                          "%s: no local deployment fits the prompt (%s); an auto request never goes to "
+                          "Claude for length -- keeping %s, the backend will refuse it",
+                          model, why, ", ".join(deployments.label(d) for d in local))
+                return local
             # Past every local window: only the Claude deployment(s) can take it.
             self.stats["context_drops"] += 1
             self._log(model, "*", "none-fit-local",
@@ -168,13 +190,11 @@ class OverflowFilter:
         return kept
 
     # -- For the `auto` footer ---------------------------------------------------
-    def local_verdicts(self, chain: str, find_deployments: Callable[[str], Any]) -> List[str]:
-        """The CURRENT verdicts of a chain's local backends -- the ones learnt
-        from its requests, else the api_bases `find_deployments(chain)` lists.
-        Backends never watched are left out. May raise; the caller guards."""
-        bases = self._chain_backends.get(chain)
-        if not bases:
-            found = find_deployments(chain)
-            bases = tuple(b for b in (deployments.api_base(d) for d in (found or [])) if b)
+    def local_verdicts(self, chain: str) -> List[str]:
+        """The CURRENT verdicts of a chain's local backends, as learnt from
+        its requests -- in a single pass the filter has always seen the
+        request being answered, so a chain that served it is known. Backends
+        never watched are left out. May raise; the caller guards."""
+        bases = self._chain_backends.get(chain) or ()
         now = self._clock()
         return [self.poller.verdict(b, now) for b in bases if b in self.poller.backends]

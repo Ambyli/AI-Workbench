@@ -34,12 +34,19 @@ def test_pipeline_applies_the_private_invariant():
     d = run(default_ruleset(), [user("write a python script")], requested_model="local-private")
     assert d.route == "local-private" and d.overrides == ("private",)
     assert "requested local-private stays local-private" in d.reason
-    assert d.apply is False  # shadow
+    assert d.apply is True   # `default` is enforce, and the invariant held
+
+
+def test_shadow_mode_never_applies():
+    doc = {**default_ruleset().document, "id": "draft", "mode": "shadow"}
+    shadow = compile_doc(doc)
+    assert run(shadow, [user("hello")]).apply is False
+    assert run(shadow, [user("write python")], requested_model="local-private").apply is False
 
 
 def test_enforce_mode_applies_only_when_allowed():
-    doc = {**default_ruleset().document, "id": "enforced", "mode": "enforce"}
-    enforced = compile_doc(doc)
+    enforced = default_ruleset()
+    assert enforced.mode == "enforce"
     assert run(enforced, [user("hello")]).apply is True
     assert run(enforced, [user("write python")], requested_model="local-private").apply is True
 

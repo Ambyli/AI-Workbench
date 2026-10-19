@@ -1,21 +1,19 @@
 """tool_calls -- a tool the conversation actually CALLED.
 
-The semantic router can see THAT tools are offered, never which ones were
-used; this reads the calls themselves (``common.conversation.called_tool_names``:
+What the conversation DID, not what it was offered: this reads the calls
+themselves (``common.conversation.called_tool_names``:
 OpenAI ``tool_calls``, legacy ``function_call``, Anthropic ``tool_use``,
 named tool results). Offered definitions (the request's ``tools``) never
 count: a chat with the sandbox attached but unused is not a coding chat.
 
 ``pattern`` is a Python regex matched against the WHOLE tool name
-(``re.fullmatch``, no anchors needed) -- the same test as the LiteLLM hook's
-code-tool remap (``ai/litellm/hooks/routing/code_route.py::code_tool_match``),
-whose default pattern the `default` ruleset's ``code-tools`` carries
-(unit-tests/route-policy/test_drift.py keeps them equal until phase 3 deletes
-the hook's copy).
+(``re.fullmatch``, no anchors needed). The `default` ruleset's
+``code-tools`` matches the sandbox MCP tools (``sandbox-mcp_.+``) and Open
+Terminal's distinctive operationIds.
 
 ``scope``:
     current_exchange  the rounds after the latest user message (default) --
-                      what the remap reads for "in this exchange"
+                      "in this exchange"
     conversation      every call in the history
 """
 
@@ -51,7 +49,7 @@ class ToolCallsConfig(EvaluatorConfig):
 
 def first_full_match(names: Any, pattern: "re.Pattern[str]") -> Optional[str]:
     """The first of ``names`` that ``pattern`` matches in FULL, else None.
-    Non-strings are skipped (a port of code_route.code_tool_match)."""
+    Non-strings are skipped."""
     if not isinstance(names, list):
         return None
     for name in names:

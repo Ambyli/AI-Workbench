@@ -25,9 +25,10 @@ deployment's own. One that does not fit is dropped as ``too-long``, and that
 is a HARD drop: the busy/down rule runs on what is left, so its "keep the
 busy ones" fallback can never bring it back. If NO local deployment fits, a
 group with a Claude deployment keeps only Claude (the prompt is past every
-local window -- the same outcome as before); local-private, with nothing
-unpolled, gets the list back unchanged, so vLLM refuses it with its own
-error and PII stays on the box. (Those two outcomes are decided in
+local window) -- unless the client sent the request as ``auto``, which gets
+its local deployments back unchanged, like local-private: local-private, with
+nothing unpolled, gets the list back unchanged, so vLLM refuses it with its
+own error and PII stays on the box. (Those outcomes are decided in
 filter.py; this module only says which deployments do not fit.)
 
 /tokenize is only called when it could matter: a deliberately HIGH estimate

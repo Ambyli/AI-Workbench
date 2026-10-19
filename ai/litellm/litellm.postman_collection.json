@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "litellm",
-    "description": "LiteLLM proxy endpoints for this deployment. Config is in `ai/litellm/litellm_config.yaml`; operator guide in `ai/litellm/LITELLM.md`; MCP tool-call orchestration in `ai/litellm/LITELLM_MCP.md`.\n\nAuth model: the collection's default Bearer is `virtual master key` — an sk-… issued from the LiteLLM Admin UI → Virtual Keys (or `/key/generate`). Admin endpoints (under the `Admin` folder) override at the item level to `litellm master key` — the value of `DEFAULT_LITELLM_MASTER_KEY` in `.env`, which `general_settings.master_key` reads via `os.environ`. Never distribute the master key; use it only for key/user/model management.\n\nSet the collection variables `litellm` (base URL — localhost publish is 4001 = `PORT_LITELLM`; the same API over TLS is https://api.zeoenergy.com, one URL in and out of the office (split-horizon DNS: on the office LAN the router's DNS override sends it to the edge on host port 443 = `PORT_LITELLM_TLS` with a Let's Encrypt certificate; anywhere else public DNS sends it through the Cloudflare tunnel to litellm:4000, whose responses carry `cf-ray` and are cut at Cloudflare's ~100 s origin timeout), see ai/edge/EDGE.md § TLS; on `ai_shared` it's http://litellm:4000), `virtual master key`, and `litellm master key` before running requests.\n\nModels enabled in this deployment (from `model_list`): `kokoro` (TTS, audio), `qwen3.6`, `qwen3.8`, `glm5.2`, `qwen2.5-vl` (image), `claude-sonnet-5` (Anthropic fallback), plus the env-driven default (`DEFAULT_LITELLM_MODEL_NAME`). Context-window fallbacks route qwen3.6/qwen3.8/glm5.2 → claude-sonnet-5 when the request exceeds the local model's window (see `litellm_settings.context_window_fallbacks`).\n\nCHAIN ALIASES (folder 'Chain aliases'): local-general, local-code, local-reasoning, local-private are model groups whose deployments carry `order: 1 / 2 / 3` -- local vLLM first, Claude only when both local models are busy or down (overflow hook ai/litellm/overflow.py), and local-private never reaches Claude. The semantic router's `auto` forwards to them; you can also call them directly with a key scoped to them. See LITELLM.md > Chain aliases and the overflow hook.",
+    "description": "LiteLLM proxy endpoints for this deployment. Config is in `ai/litellm/litellm_config.yaml`; operator guide in `ai/litellm/LITELLM.md`; MCP tool-call orchestration in `ai/litellm/LITELLM_MCP.md`.\n\nAuth model: the collection's default Bearer is `virtual master key` — an sk-… issued from the LiteLLM Admin UI → Virtual Keys (or `/key/generate`). Admin endpoints (under the `Admin` folder) override at the item level to `litellm master key` — the value of `DEFAULT_LITELLM_MASTER_KEY` in `.env`, which `general_settings.master_key` reads via `os.environ`. Never distribute the master key; use it only for key/user/model management.\n\nSet the collection variables `litellm` (base URL — localhost publish is 4001 = `PORT_LITELLM`; the same API over TLS is https://api.zeoenergy.com, one URL in and out of the office (split-horizon DNS: on the office LAN the router's DNS override sends it to the edge on host port 443 = `PORT_LITELLM_TLS` with a Let's Encrypt certificate; anywhere else public DNS sends it through the Cloudflare tunnel to litellm:4000, whose responses carry `cf-ray` and are cut at Cloudflare's ~100 s origin timeout), see ai/edge/EDGE.md § TLS; on `ai_shared` it's http://litellm:4000), `virtual master key`, and `litellm master key` before running requests.\n\nModels enabled in this deployment (from `model_list`): `kokoro` (TTS, audio), `qwen3.6`, `qwen3.8`, `glm5.2`, `qwen2.5-vl` (image), `claude-sonnet-5` (Anthropic fallback), plus the env-driven default (`DEFAULT_LITELLM_MODEL_NAME`). Context-window fallbacks route qwen3.6/qwen3.8/glm5.2 → claude-sonnet-5 when the request exceeds the local model's window (see `litellm_settings.context_window_fallbacks`).\n\nCHAIN ALIASES (folder 'Chain aliases'): local-general, local-code, local-reasoning, local-private are model groups whose deployments carry `order: 1 / 2 / 3` -- local vLLM first, Claude only when both local models are busy or down (overflow hook ai/litellm/overflow.py), and local-private never reaches Claude. The route-policy engine routes `auto` to one of them (the LiteLLM hook awaits its /decide and rewrites the model, in the same pass); you can also call them directly by name. See LITELLM.md > Chain aliases and the overflow hook.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
     "_postman_id": "litellm-collection"
   },
@@ -117,7 +117,7 @@
               "host": ["{{litellm}}"],
               "path": ["v1", "chat", "completions"]
             },
-            "description": "Standard chat-completion call. `model` must match a `model_name` in `model_list` — this deployment defines qwen3.6, qwen3.8, glm5.2, qwen2.5-vl (image), claude-sonnet-5, claude-opus-5-5, kokoro (audio), `auto` (the vLLM Semantic Router - one name whose keyword decisions each forward the request to one chain alias; see ai/semantic-router/SEMANTIC_ROUTER.md and its own Postman collection), the four chain aliases local-general / local-code / local-reasoning / local-private (folder 'Chain aliases'), plus the env-driven `DEFAULT_LITELLM_MODEL_NAME`. If the request exceeds the model's context window, `litellm_settings.context_window_fallbacks` transparently reroutes qwen3.6/qwen3.8/glm5.2 → claude-sonnet-5. Tool calls are supported but not auto-executed — see LITELLM_MCP.md § Step 1/Step 2 for the tool-call loop."
+            "description": "Standard chat-completion call. `model` must match a `model_name` in `model_list` or a `router_settings.model_group_alias` — this deployment defines qwen3.6, qwen3.8, glm5.2, qwen2.5-vl (image), claude-sonnet-5, claude-opus-5-5, kokoro (audio), the four chain aliases local-general / local-code / local-reasoning / local-private (folder 'Chain aliases'), `auto` (routed to one of those chains by the route-policy engine; see the `auto` item in that folder), plus the env-driven `DEFAULT_LITELLM_MODEL_NAME`. If the request exceeds the model's context window, `litellm_settings.context_window_fallbacks` transparently reroutes qwen3.6/qwen3.8/glm5.2 → claude-sonnet-5. Tool calls are supported but not auto-executed — see LITELLM_MCP.md § Step 1/Step 2 for the tool-call loop."
           },
           "response": []
         },
@@ -223,8 +223,47 @@
     },
     {
       "name": "Chain aliases",
-      "description": "The four LiteLLM chain aliases the semantic router forwards to (ai/litellm/litellm_config.yaml > CHAIN ALIASES). Each is a model group with `order: 1 / 2 / 3` deployments; the overflow hook (ai/litellm/overflow.py) drops a busy or down local deployment so the next order answers. Call them with a key scoped to them (the collection's {{virtual master key}}, or SEMANTIC_ROUTER_LITELLM_KEY). LITELLM.md > Chain aliases and the overflow hook. Called directly, a chain alias gets NO backend footer: the `---` / `*<model> · <chain>*` footer is added only to responses for model `auto` (the semantic router). Here, read the deployment that answered from the `x-litellm-model-name` response header or the spend log. LITELLM.md > The `auto` footer.",
+      "description": "The four LiteLLM chain aliases (ai/litellm/litellm_config.yaml > CHAIN ALIASES), and `auto`, which the route-policy engine routes to one of them. Each chain is a model group with `order: 1 / 2 / 3` deployments; the overflow hook (ai/litellm/hooks/overflow) drops a busy or down local deployment so the next order answers. Call a chain directly with a key allowed it (the collection's {{virtual master key}}). LITELLM.md > Chain aliases and the overflow hook. Called directly, a chain alias gets NO backend footer: the `---` / `*<model> · <chain>*` footer is added only to responses for model `auto`. Here, read the deployment that answered from the `x-litellm-model-group` / `x-litellm-model-id` response headers or the spend log. LITELLM.md > The `auto` footer.",
       "item": [
+        {
+          "name": "POST /v1/chat/completions -- auto",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-OpenWebUI-Chat-Id",
+                "value": "postman-smoke-1",
+                "description": "Optional: the chat id the route-policy service logs the decision under (GET /v1/route-policy/chats/postman-smoke-1/decisions). Open WebUI sends it with ENABLE_FORWARD_USER_INFO_HEADERS."
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"auto\",\n  \"stream\": true,\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"Write a Python function that reverses a linked list.\"\n    }\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{litellm}}/v1/chat/completions",
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "chat",
+                "completions"
+              ]
+            },
+            "description": "Model `auto` -- routed by the route-policy engine (ai/route-policy) in ONE pass: the LiteLLM pre-call hook awaits the service's POST /decide (at most ROUTE_POLICY_DECIDE_TIMEOUT_S, 0.25 s) and rewrites the request to the chain alias it chose (local-general / local-code / local-reasoning / local-private); LiteLLM then serves that chain, streamed. `auto` is router_settings.model_group_alias -> local-private, so a request the engine did not route -- /decide slow, failing or apply=false, or the client off -- is served by local-private, the chain with no Claude.\n\nReturns a normal chat completion (`model` stays `auto`). The answer ends with a footer naming what served it, e.g. `---` / `*qwen3.8-solo · local-code*`; `· route-policy fallback` means local-private served it because the engine did not route it, `· overflow (local busy)` that a Claude deployment answered. The `x-litellm-model-group` response header names the chain. The decision (every evaluator's vote) and its outcome are in the route-policy service: GET /v1/route-policy/chats/{chat id}/decisions with the X-OpenWebUI-Chat-Id sent here. POST /v1/messages with model `auto` is routed the same way. LITELLM.md > Route policy: single-pass `auto`; LITELLM.md > The `auto` footer."
+          },
+          "response": []
+        },
         {
           "name": "POST /v1/chat/completions -- local-general",
           "request": {
@@ -255,7 +294,7 @@
                 "completions"
               ]
             },
-            "description": "Chain alias `local-general` -- the semantic router's catch-all (`general` decision) and Envoy's default route. Orders: qwen3.8-solo (1) -> muse-glimmer (2) -> claude-sonnet-5 (3, overflow only). Each deployment calls its backend directly; a prompt over 114688 tokens skips qwen3.8-solo via the pre-call context check.\n\nReturns a normal chat completion. Check the spend log: model group local-general, model = the deployment that answered. A Claude row means the overflow hook dropped both local deployments (`make -s logs litellm FOLLOW=0 TAIL=all | grep overflow`) or both failed at call time. 401 = your key is not scoped to local-general. LITELLM.md > Chain aliases and the overflow hook."
+            "description": "Chain alias `local-general` -- the route-policy engine's default route for `auto`. Orders: qwen3.8-solo (1) -> muse-glimmer (2) -> claude-sonnet-5 (3, overflow only). Each deployment calls its backend directly; a prompt over 114688 tokens skips qwen3.8-solo via the overflow hook's context fit.\n\nReturns a normal chat completion. Check the spend log: model group local-general, model = the deployment that answered. A Claude row means the overflow hook dropped both local deployments (`make -s logs litellm FOLLOW=0 TAIL=all | grep overflow`) or both failed at call time. 401 = your key is not allowed local-general. LITELLM.md > Chain aliases and the overflow hook."
           },
           "response": []
         },
@@ -289,7 +328,7 @@
                 "completions"
               ]
             },
-            "description": "Chain alias `local-code` -- the semantic router's `code` decision, and where the overflow hook sends a `local-general` request whose history has called a sandbox / Open Terminal tool (CODE_ROUTE_TOOL_REGEX; tools only offered don't count; a `[route] local-general -> local-code` line in `make logs litellm`). Same ladder as local-general: qwen3.8-solo (1) -> muse-glimmer (2) -> claude-sonnet-5 (3, overflow only). What it adds, per deployment: a coding system prompt (litellm_system_prompt, merged in front of your first system message), deeper reasoning (qwen chat_template_kwargs reasoning_effort high, muse reasoning_strength xhigh) and max_tokens 32768 on the local orders.\n\nThe request's own `max_tokens` (512 here) overrides the deployment's 32768 -- drop it to get the coding default. A request `extra_body` or `chat_template_kwargs` REPLACES the deployment's (dropping the reasoning kwarg), it does not merge.\n\nSpend log: model group local-code. 401 = key not scoped to local-code. LITELLM.md > local-code: what it adds."
+            "description": "Chain alias `local-code` -- where the route-policy engine sends `auto` when the chat is code (a code-like message, or a sandbox / Open Terminal tool called recently). A direct call to `local-general` is never moved here. Same ladder as local-general: qwen3.8-solo (1) -> muse-glimmer (2) -> claude-sonnet-5 (3, overflow only). What it adds, per deployment: a coding system prompt (litellm_system_prompt, merged in front of your first system message), deeper reasoning (qwen chat_template_kwargs reasoning_effort high, muse reasoning_strength xhigh) and max_tokens 32768 on the local orders.\n\nThe request's own `max_tokens` (512 here) overrides the deployment's 32768 -- drop it to get the coding default. A request `extra_body` or `chat_template_kwargs` REPLACES the deployment's (dropping the reasoning kwarg), it does not merge.\n\nSpend log: model group local-code. 401 = key not allowed local-code. LITELLM.md > local-code: what it adds."
           },
           "response": []
         },
@@ -323,7 +362,7 @@
                 "completions"
               ]
             },
-            "description": "Chain alias `local-reasoning` -- the semantic router's `reasoning` decision. Orders: muse-glimmer (1) -> qwen3.8-solo (2) -> claude-opus-5-5 (3, overflow only). muse-glimmer's 8 sequences are shared with the classifier, which takes at most 6 (max_concurrent of the muse-glimmer entry in ai/classifier/models.yaml) and leaves 2 for chat; when chat needs more than those 2 the overflow hook may mark it busy and this lands on qwen3.8-solo.\n\nSpend log: model group local-reasoning; an anthropic/claude-opus-5-5 row is Opus overflow. LITELLM.md > Chain aliases and the overflow hook."
+            "description": "Chain alias `local-reasoning` -- where the route-policy engine sends a reasoning request for `auto`. Orders: muse-glimmer (1) -> qwen3.8-solo (2) -> claude-opus-5-5 (3, overflow only). muse-glimmer's 8 sequences are shared with the classifier, which takes at most 6 (max_concurrent of the muse-glimmer entry in ai/classifier/models.yaml) and leaves 2 for chat; when chat needs more than those 2 the overflow hook may mark it busy and this lands on qwen3.8-solo.\n\nSpend log: model group local-reasoning; an anthropic/claude-opus-5-5 row is Opus overflow. LITELLM.md > Chain aliases and the overflow hook."
           },
           "response": []
         },
@@ -357,7 +396,7 @@
                 "completions"
               ]
             },
-            "description": "Chain alias `local-private` -- LOCAL ONLY. Orders: qwen3.8-solo (1) -> muse-glimmer (2), and NO Claude deployment, NO entry in `fallbacks` / `context_window_fallbacks`. The semantic router's `privacy_local` decision and `auto`'s own fallbacks (router down) both land here. With both local models busy the overflow hook keeps them and the request queues in vLLM (slow, never cloud); with both down it fails (5xx) -- that is the guarantee working.\n\nSpend log: model group local-private must ONLY ever show openai/qwen3.8-solo or openai/muse-glimmer. LITELLM.md > Chain aliases and the overflow hook."
+            "description": "Chain alias `local-private` -- LOCAL ONLY. Orders: qwen3.8-solo (1) -> muse-glimmer (2), and NO Claude deployment, NO entry in `fallbacks` / `context_window_fallbacks`. The route-policy engine's privacy route lands here, and so does every `auto` request the engine did not route (/decide slow, failing or apply=false, or the client off) -- the `auto` alias itself points here. With both local models busy the overflow hook keeps them and the request queues in vLLM (slow, never cloud); with both down it fails (5xx) -- that is the guarantee working.\n\nSpend log: model group local-private must ONLY ever show openai/qwen3.8-solo or openai/muse-glimmer. LITELLM.md > Chain aliases and the overflow hook."
           },
           "response": []
         }

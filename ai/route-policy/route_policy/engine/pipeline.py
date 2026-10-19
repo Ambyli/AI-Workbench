@@ -3,7 +3,8 @@
 ``await run(ruleset, ctx)`` -> :class:`Decision`:
 
 1. every evaluator runs, in ruleset order (all of them, even after a force
-   vote -- the log is the point of shadow mode); each one's time is measured,
+   vote -- every vote is logged, so a rule's hit rate can be read in Trino
+   whatever decided the turn); each one's time is measured,
    and an evaluator that raises is recorded as an abstain with its error;
 2. a vote for a route the ruleset does not list is turned into an abstain
    with an error -- an evaluator can never smuggle a non-chain route past the

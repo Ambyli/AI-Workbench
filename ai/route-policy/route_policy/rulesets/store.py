@@ -18,14 +18,26 @@ immutable, so cached for the life of the process -- and a snapshot of the
 bindings, re-read when older than ROUTE_POLICY_BINDING_REFRESH_S. A copy
 that cannot reach the database keeps deciding from its last snapshot; a
 version this copy has not compiled is fetched and compiled on first use.
+
+**Bounded on the /decide path.** With ``read_budget_s`` set (the app passes
+config.DB_READ_BUDGET_S), ``resolve`` never waits on the database for longer:
+the binding refresh runs as one shielded task at a time -- a request that
+starts it waits up to the budget, then decides from the last snapshot while
+the refresh finishes in the background; requests arriving meanwhile do not
+wait at all -- and a version fetch is shared per (id, version), waited for up
+to the budget, then answered as "not available" (/decide's 503, LiteLLM's
+local-private) while it lands in the cache for the next request. Both count
+in route_policy_db_reads_cut_total. ``get`` without a budget (POST /evaluate,
+the read endpoints) waits as long as it takes.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import pathlib
 import time
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .. import metrics
 from ..db.repositories import rulesets as rulesets_repo
@@ -36,15 +48,26 @@ from .validate import RulesetInvalid, compile_ruleset
 logger = logging.getLogger("route_policy.rulesets")
 
 
+def _retrieve(task: "asyncio.Task[Any]") -> None:
+    """Done-callback: consume a background task's outcome (both callers catch
+    and log their own errors; this only keeps asyncio from complaining)."""
+    if not task.cancelled():
+        task.exception()
+
+
 class RulesetStore:
-    def __init__(self, database=None, *, refresh_s: float = 10.0,
+    def __init__(self, database=None, *, refresh_s: float = 10.0, read_budget_s: Optional[float] = None,
                  clock: Callable[[], float] = time.monotonic) -> None:
         self.database = database
         self.refresh_s = refresh_s
+        # None: resolve() waits for the database as long as it takes.
+        self.read_budget_s = read_budget_s
         self._clock = clock
         self._compiled: Dict[Tuple[str, int], CompiledRuleset] = {}
         self._bindings: List[Binding] = []
         self._bindings_at: Optional[float] = None
+        self._refresh_task: "Optional[asyncio.Task[bool]]" = None
+        self._fetches: "Dict[Tuple[str, Optional[int]], asyncio.Task[Optional[CompiledRuleset]]]" = {}
 
     # -- filling the cache ---------------------------------------------------
 
@@ -95,18 +118,41 @@ class RulesetStore:
         return exact or any_key
 
     async def resolve(self, model: str, key_alias: Optional[str]) -> Optional[CompiledRuleset]:
-        """The ruleset bound to (model, key alias), or None when nothing is bound."""
+        """The ruleset bound to (model, key alias), or None when nothing is
+        bound -- or, with a read budget, when the bound version is not cached
+        and the database did not hand it over in time."""
         stale = self._bindings_at is None or self._clock() - self._bindings_at >= self.refresh_s
         if stale and self.database is not None:
-            await self.refresh_bindings()
+            await self._refresh_within_budget()
         binding = self.binding_for(model, key_alias)
         if binding is None:
             return None
-        return await self.get(binding.ruleset_id, binding.version)
+        return await self.get(binding.ruleset_id, binding.version, budget_s=self.read_budget_s)
 
-    async def get(self, ruleset_id: str, version: Optional[int] = None) -> Optional[CompiledRuleset]:
+    async def _refresh_within_budget(self) -> None:
+        if self.read_budget_s is None:
+            await self.refresh_bindings()
+            return
+        if self._refresh_task is not None and not self._refresh_task.done():
+            return  # one refresh at a time; meanwhile decide from the snapshot
+        task = asyncio.get_running_loop().create_task(self.refresh_bindings())
+        task.add_done_callback(_retrieve)
+        self._refresh_task = task
+        try:
+            await asyncio.wait_for(asyncio.shield(task), self.read_budget_s)
+        except asyncio.TimeoutError:
+            metrics.db_reads_cut_total.labels("binding_refresh").inc()
+            logger.debug("rulesets: binding refresh outlasted %.3fs; deciding from the last snapshot",
+                         self.read_budget_s)
+            # Not again before the next interval, whatever the task does.
+            self._bindings_at = self._clock()
+
+    async def get(self, ruleset_id: str, version: Optional[int] = None, *,
+                  budget_s: Optional[float] = None) -> Optional[CompiledRuleset]:
         """A compiled version (``None`` = the highest), from the cache or the
-        database. None when it does not exist or this copy cannot compile it."""
+        database. None when it does not exist or this copy cannot compile it
+        -- or, with ``budget_s``, when the database did not answer in time
+        (the fetch goes on, shared, and fills the cache)."""
         if version is not None and (ruleset_id, version) in self._compiled:
             return self._compiled[(ruleset_id, version)]
         if self.database is None:
@@ -114,6 +160,35 @@ class RulesetStore:
                 return None
             cached = [v for (rid, v) in self._compiled if rid == ruleset_id]
             return self._compiled[(ruleset_id, max(cached))] if cached else None
+        if budget_s is None:
+            return await self._fetch(ruleset_id, version)
+        key = (ruleset_id, version)
+        task = self._fetches.get(key)
+        if task is None or task.done():
+            task = asyncio.get_running_loop().create_task(self._fetch(ruleset_id, version))
+            task.add_done_callback(_retrieve)
+            task.add_done_callback(lambda t, key=key: self._fetches.pop(key, None) if self._fetches.get(key) is t
+                                   else None)
+            self._fetches[key] = task
+        try:
+            return await asyncio.wait_for(asyncio.shield(task), budget_s)
+        except asyncio.TimeoutError:
+            metrics.db_reads_cut_total.labels("ruleset_fetch").inc()
+            logger.debug("rulesets: fetching %s@%s outlasted %.3fs; not available for this request",
+                         ruleset_id, version, budget_s)
+            return None
+
+    async def cancel_background(self) -> None:
+        """Shutdown: cancel a refresh / fetch still running in the background
+        (reads are disposable) and wait for the cancellations."""
+        tasks = [t for t in [self._refresh_task, *self._fetches.values()] if t is not None and not t.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _fetch(self, ruleset_id: str, version: Optional[int]) -> Optional[CompiledRuleset]:
+        """Read one version from the database and compile it into the cache."""
         try:
             async with self.database.acquire() as conn:
                 row = await rulesets_repo.get(conn, ruleset_id, version)

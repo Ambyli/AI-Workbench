@@ -3,9 +3,9 @@
 The document (``ai/route-policy/rulesets/default.yaml`` is the reference)::
 
     id: default                      # [a-z0-9][a-z0-9_-]*
-    version: 1                       # immutable: new content = a new version
+    version: 2                       # immutable: new content = a new version
     description: ...
-    mode: shadow                     # shadow | enforce
+    mode: enforce                    # shadow (log only) | enforce (LiteLLM applies it)
     routes: [local-general, local-code, local-reasoning, local-private]
     default_route: local-general     # one of routes
     evaluators:                      # in order; each votes or abstains

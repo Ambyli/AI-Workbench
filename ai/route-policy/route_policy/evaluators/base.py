@@ -214,8 +214,8 @@ _REGISTRY: Dict[str, Type[Evaluator]] = {}
 
 # The modules that declare a type, imported on first lookup -- so asking for
 # the registry before anything imported the evaluators still finds them all.
-# phase 4 adds llm_classifier; context_size and semantic_router are listed in
-# ROUTE_POLICY_PLAN § 4 but not built.
+# phase 4 adds llm_classifier; context_size is listed in ROUTE_POLICY_PLAN
+# § 4 but not built.
 _DECLARING_MODULES = (
     "route_policy.evaluators.regex_text",
     "route_policy.evaluators.tool_calls",

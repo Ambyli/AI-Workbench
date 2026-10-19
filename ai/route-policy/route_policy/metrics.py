@@ -13,7 +13,7 @@ evaluator ids and types from the rulesets this copy has compiled, `kind` and
 
 from __future__ import annotations
 
-from prometheus_client import Counter, Histogram
+from prometheus_client import Counter, Gauge, Histogram
 
 # Engine latency is sub-millisecond to a few ms; the buckets resolve that and
 # still show a pathological history (a huge conversation) as a tail.
@@ -63,10 +63,27 @@ duplicates_total = Counter(
 errors_total = Counter(
     "route_policy_errors_total",
     "Errors by kind",
-    # decision_write  -- a decision was computed and returned but could not be stored
-    # outcome_write   -- POST /observe answered 503
+    # decision_write          -- a decision was computed and returned but could not be stored
+    # decision_write_dropped  -- ... and was not even tried: WRITES_MAX_IN_FLIGHT background writes pending
+    # outcome_write           -- an outcome could not be stored (503 when it failed within the budget)
+    # outcome_write_dropped   -- POST /observe answered 503 without trying: too many writes pending
     # binding_refresh -- the binding snapshot could not be refreshed (the old one is kept)
     # ruleset_compile -- a stored ruleset this copy cannot compile
     # unbound_model   -- POST /decide for a model no binding covers (404)
     ["kind"],
+)
+writes_deferred_total = Counter(
+    "route_policy_writes_deferred_total",
+    "Writes that outlasted ROUTE_POLICY_DECISION_WRITE_BUDGET_S: the request was answered and the "
+    "write went on in the background",
+    ["write"],  # decision | outcome
+)
+writes_in_flight = Gauge(
+    "route_policy_writes_in_flight",
+    "Decision / outcome writes started and not finished yet (capped at WRITES_MAX_IN_FLIGHT)",
+)
+db_reads_cut_total = Counter(
+    "route_policy_db_reads_cut_total",
+    "Database reads on the /decide path that outlasted DB_READ_BUDGET_S (the request went on without them)",
+    ["read"],  # binding_refresh | ruleset_fetch
 )

@@ -1,11 +1,11 @@
 """priority -- the first non-abstaining vote wins, in ruleset order.
 
-The `default` ruleset uses it to reproduce today's routing: the router's
-decision priorities (privacy 300 > code 200 > reasoning 150 > general 10)
-become the evaluator order, and the code-tool remap and cooldown, which only
-ever turn a ``local-general`` turn into ``local-code``, sit after the three
-keyword evaluators. Weights and confidences are reported in ``scores`` but
-never change the outcome.
+The `default` ruleset uses it: privacy (a force), then the code and
+reasoning keywords, then the tool-call and cooldown rules -- so a turn that
+asks for a proof stays on ``local-reasoning`` in a chat that has been coding,
+and only an otherwise ``local-general`` turn is held on ``local-code``.
+Weights and confidences are reported in ``scores`` but never change the
+outcome.
 """
 
 from __future__ import annotations

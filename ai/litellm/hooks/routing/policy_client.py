@@ -1,67 +1,85 @@
-"""THE ROUTE-POLICY CLIENT, SHADOW MODE (phase 2 of the route-policy plan).
+"""THE ROUTE-POLICY CLIENT (phase 3 of the route-policy plan: single pass).
 
-On every request for model ``auto`` it tells the route-policy service
-(ai/route-policy/, ``http://route-policy:8000`` on ai_shared) what came in,
-and afterwards what answered -- and it changes NOTHING about routing:
+On every request for model ``auto`` the pre-call hook ASKS the route-policy
+service (ai/route-policy/, ``http://route-policy:8000`` on ai_shared) which
+chain alias should serve it, rewrites ``data["model"]`` to that chain, and
+LiteLLM serves it in the same pass -- streamed. Afterwards it tells the
+service what really answered:
 
     pre-call   POST /decide  {decision_id, requested_model, litellm_call_id,
-                              chat_id, message_id, user_id, key_alias,
+               (AWAITED)      chat_id, message_id, user_id, key_alias,
                               messages, tools, backends}
+               <- {decision_id, route, mode, apply, ruleset, votes, scores, latency_ms}
     success    POST /observe {decision_id, litellm_call_id, response_id,
                (or stream     served_model_group, served_deployment,
                 end)          overflow_reason, finish_reason, tool_calls,
                               status: "success", error: null}
     failure    POST /observe {..., status: "failure", error: "<exception>"}
 
-Both calls are FIRED, never awaited: each is an asyncio task on the proxy's
-own event loop, so the hook returns as fast as it did without them, and the
-service's answer is ignored (it logs the decision itself). The two may reach
-the service in either order -- the contract says it must not need /decide
-first. Phase 3 is when the hook starts awaiting /decide (with a timeout and
-a fail-safe route); nothing here does.
+THE ROUTE. /decide is awaited under ROUTE_POLICY_DECIDE_TIMEOUT_S
+(asyncio.wait_for -- LiteLLM puts no timeout around a pre-call hook,
+proxy/utils.py:1444-1457 at v1.95.0). The answer's route is applied only when
+``apply`` is ``true`` (an ``enforce`` ruleset whose own invariants held) AND
+the hook's copy of the invariants allows it (routing/invariants.py: one of the
+four chain aliases). EVERYTHING ELSE goes to ``local-private`` -- the chain
+with no Claude deployment, because nothing has checked such a prompt for
+PII: a timeout, a transport error, a non-2xx, a body that is not a JSON
+object, ``apply: false`` (a shadow ruleset), a route that is not a chain, the
+client being off (ROUTE_POLICY_ENABLED=false or an empty ROUTE_POLICY_URL), a
+request with no ``messages`` to decide on, or a bug here. Each fallback is
+counted (``route_policy_fallbacks``, and by reason in ``state()``) and logged,
+throttled per reason: ``[route-policy] auto -> local-private (<why>)``.
+Requests for any other model are never decided and never rewritten.
 
-THE DECISION ID. The hook makes it (uuid4) and stashes it, with the request's
-litellm_call_id, in ``data["metadata"]["zeo_route_policy"]`` (replacing any
-the client sent: the proxy keeps unknown client metadata). LiteLLM v1.95.0
-hands the success, streaming-iterator and failure hooks the very ``data``
-dict the pre-call hook got, so the stash survives to them:
-common_request_processing.py assigns the pre-call result to self.data
-(1274) and passes self.data to post_call_success_hook (1919), to the stream
-generator as request_data (1854-1859 -> proxy_server.py async_data_generator,
-which hands it to the iterator hook, 7413-7419, and to post_call_failure_hook
-on an upstream error, 7540) and to post_call_failure_hook on a failed call
-(2538-2542). Where the proxy copies it (_merge_guardrails_with_existing, only
-with model-level guardrails) the copy is shallow, so ``metadata`` -- and the
-stash in it -- is the same object. ``metadata`` never reaches the upstream:
-the openai provider forwards it only with litellm.enable_preview_features,
-and even then only string values (main.py:2407, utils.py:9243
-add_openai_metadata) -- the stash is a dict.
-The stash also records that an /observe went out, so a request is observed
-exactly once even when two paths see its end (a stream that fails is seen by
-the iterator hook and by post_call_failure_hook).
+The rewrite works because the proxy routes on the pre-call hook's ``data``
+(common_request_processing.py:1274 -> route_request). ``auto`` itself is a
+``router_settings.model_group_alias`` for local-private, resolved only at
+deployment selection (router.py:10465) -- AFTER this hook -- so the hook
+still sees ``"auto"``, and a request this hook never rewrote (the callback
+list failed to load, say) is served by local-private too. The client keeps
+seeing ``"model": "auto"`` in the response (requested_model_from_client).
+
+THE STASH (routing/stash.py) records requested_model / route / source /
+decision_id as ``zeo_route_policy`` in the proxy's own metadata dict
+(``data["metadata"]``, or ``data["litellm_metadata"]`` on /v1/messages and
+the other routes where ``metadata`` is a request parameter); the footer and
+the /observe paths read it, never ``data["model"]``. LiteLLM v1.95.0 hands the
+success, streaming-iterator and failure hooks the very ``data`` dict the
+pre-call hook got: common_request_processing.py assigns the pre-call result to
+self.data (1274) and passes self.data to post_call_success_hook (1919), to the
+stream generator as request_data (1854-1859 -> proxy_server.py
+async_data_generator, which hands it to the iterator hook, 7413-7419, and to
+post_call_failure_hook on an upstream error, 7540) and to
+post_call_failure_hook on a failed call (2538-2542). Neither dict reaches
+the upstream: the openai provider forwards ``metadata`` only with
+litellm.enable_preview_features, and even then only string values
+(main.py:2407, utils.py:9243 add_openai_metadata) -- the stash is a dict --
+and ``litellm_metadata`` is LiteLLM's own.
 
 WHAT IS SENT. ``messages`` / ``tools`` are the request's as this proxy will
-forward them (after the footer hook stripped old footers), snapshotted in the
-hook (a shallow copy of each message dict -- O(messages), no serialisation)
-and JSON-encoded in the background task. ``backends`` is the overflow
-poller's per-backend view (Poller.report). ``chat_id`` / ``message_id`` /
-``user_id`` are Open WebUI's X-OpenWebUI-Chat-Id / -Message-Id / -User-Id
-request headers (ENABLE_FORWARD_USER_INFO_HEADERS and patch 0005), read from
-``data["metadata"]["headers"]`` (litellm_pre_call_utils.py:1450), any case,
-None when absent. The served chain / deployment come from the inner LiteLLM's
-response headers through the footer's own derivation (AutoFooter.served);
-``overflow_reason`` is set only when a Claude deployment answered, from the
-overflow filter's CURRENT view (AutoFooter.overflow_reason) -- the same
-approximation the footer prints.
+forward them (after the footer hook stripped old footers), JSON-encoded in
+the hook before the await -- with every inline binary payload in a content
+part (a base64 image, document or audio; any ``data:`` URI) replaced by a
+short placeholder that keeps the part's type, so a chat full of images costs
+the critical path kilobytes, not megabytes (slim_messages; text parts and
+tool calls are never touched, the request itself is never changed).
+``backends`` is the overflow poller's per-backend view
+(Poller.report). ``chat_id`` / ``message_id`` / ``user_id`` are Open WebUI's
+X-OpenWebUI-Chat-Id / -Message-Id / -User-Id request headers
+(ENABLE_FORWARD_USER_INFO_HEADERS and patch 0005), read from the proxy
+metadata dict's ``headers`` (litellm_pre_call_utils.py:1450), any case,
+None when absent. The served chain / deployment come from
+``data["deployment"]`` (common_request_processing.py:1707) through the
+footer's own derivation (AutoFooter.served); ``overflow_reason`` is set only
+when a Claude deployment answered, from the overflow filter's CURRENT view.
 
-BOUNDED. At most MAX_IN_FLIGHT calls are in flight; past that a call is
-dropped and counted (``route_policy_dropped``), so a hung service costs at
-most that many tasks, each ending after ROUTE_POLICY_TIMEOUT_S. A /decide
-that is dropped stashes nothing, so its /observe is never sent either.
-Nothing here raises into LiteLLM: every error is counted
-(``route_policy_errors``) and logged, throttled. ROUTE_POLICY_ENABLED=false
-(or an empty ROUTE_POLICY_URL) makes every entry point a no-op: no task, no
-stash. See ai/litellm/LITELLM.md > Route-policy shadow mode.
+/observe IS FIRED, NEVER AWAITED: an asyncio task on the proxy's loop, at most
+MAX_IN_FLIGHT at once (past that it is dropped and counted,
+``route_policy_dropped``), each bounded by ROUTE_POLICY_TIMEOUT_S. It is sent
+for every request whose /decide was attempted -- applied or fallen back --
+exactly once (the stash's ``observed`` flag), never for a request that sent
+no /decide. Nothing here raises into LiteLLM. See ai/litellm/LITELLM.md >
+Route policy: single-pass `auto`.
 """
 
 from __future__ import annotations
@@ -69,18 +87,18 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
 from ..footer.auto import AUTO_MODEL, Served, is_claude
 from ..footer.render import get_field, headers_of, to_int
 from ..log import ThrottledLog, logger
 from ..overflow.poller import Poller
+from .invariants import PRIVATE_ROUTE, enforce
+from .stash import ENGINE, FALLBACK_PREFIX, STASH_KEY, drop_foreign_stash, metadata_of, stash_of
 
 DECIDE_PATH = "/decide"
 OBSERVE_PATH = "/observe"
-# data["metadata"][STASH_KEY] = {"decision_id", "litellm_call_id", "observed"}
-STASH_KEY = "zeo_route_policy"
-# Background calls in flight at once, /decide and /observe together.
+# Background /observe calls in flight at once.
 MAX_IN_FLIGHT = 64
 # Longest `error` string sent in a failure /observe.
 ERROR_MAX_CHARS = 500
@@ -93,8 +111,20 @@ OPENWEBUI_ID_HEADERS = {
 SUCCESS, FAILURE = "success", "failure"
 DISCONNECTED = "client disconnected before the end of the stream"
 
-# POST <url> <JSON body bytes> -> the HTTP status (raise on a transport error).
-Post = Callable[[str, bytes], Awaitable[int]]
+# The fallback reasons (stash `source` is "fallback:<reason>"; the counters in
+# state()["route_policy_fallbacks_by_reason"] are keyed by them). An HTTP
+# status is "http-<code>".
+DISABLED = "disabled"          # ROUTE_POLICY_ENABLED=false or no ROUTE_POLICY_URL
+NO_MESSAGES = "no-messages"    # not a chat request (no `messages` list): nothing to decide on
+TIMEOUT = "timeout"            # no /decide answer within ROUTE_POLICY_DECIDE_TIMEOUT_S
+ERROR = "error"                # transport error (refused, reset, DNS, ...)
+BAD_RESPONSE = "bad-response"  # 2xx, but not a JSON object (or another decision's id)
+NOT_APPLIED = "not-applied"    # apply is not true (a shadow ruleset, or the service's invariants)
+NOT_A_CHAIN = "not-a-chain"    # the route failed the hook's own invariants
+HOOK_ERROR = "hook-error"      # a bug in this module
+
+# POST <url> <JSON body bytes> -> (HTTP status, response body); raise on a transport error.
+Post = Callable[[str, bytes], Awaitable[Tuple[int, bytes]]]
 # (lower-cased response headers, request data) -> who answered.
 ServedFn = Callable[[Dict[str, Any], Any], Served]
 # chain alias -> "busy" | "down" | None.
@@ -102,7 +132,7 @@ OverflowFn = Callable[[Any], Optional[str]]
 
 
 class HttpxPost:
-    """POST a JSON body; return the HTTP status. One httpx.AsyncClient per
+    """POST a JSON body; return (status, body). One httpx.AsyncClient per
     event loop, like hooks/overflow/vllm.py's clients (an AsyncClient is bound
     to the loop it first ran on). The caller bounds the whole call with
     asyncio.wait_for -- httpx's own timeout is per operation. No auth: the
@@ -114,7 +144,7 @@ class HttpxPost:
         self._client: Any = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
-    async def __call__(self, url: str, body: bytes) -> int:
+    async def __call__(self, url: str, body: bytes) -> Tuple[int, bytes]:
         import httpx  # LiteLLM depends on it; imported lazily for the tests
 
         loop = asyncio.get_running_loop()
@@ -125,7 +155,7 @@ class HttpxPost:
             self._client = httpx.AsyncClient(**kwargs)
             self._loop = loop
         resp = await self._client.post(url, content=body, headers={"content-type": "application/json"})
-        return resp.status_code
+        return resp.status_code, resp.content
 
 
 # -- Pure helpers (unit-tested) -------------------------------------------------
@@ -145,22 +175,26 @@ def encode(body: Dict[str, Any]) -> bytes:
     return json.dumps(body, default=_jsonable, ensure_ascii=False).encode("utf-8")
 
 
-def metadata_of(data: Any) -> Optional[Dict[str, Any]]:
-    """data["metadata"] when it is a dict, else None."""
-    meta = data.get("metadata") if isinstance(data, dict) else None
-    return meta if isinstance(meta, dict) else None
+def split_reply(reply: Any) -> Tuple[Any, bytes]:
+    """(status, body) from what a Post returned; a bare status has an empty body."""
+    if isinstance(reply, tuple) and len(reply) == 2:
+        status, body = reply
+        return status, body if isinstance(body, (bytes, bytearray, str)) else b""
+    return reply, b""
 
 
-def stash_of(data: Any) -> Optional[Dict[str, Any]]:
-    """The pre-call hook's stash, or None (no decision was sent for this request)."""
-    meta = metadata_of(data)
-    stash = meta.get(STASH_KEY) if meta is not None else None
-    return stash if isinstance(stash, dict) and isinstance(stash.get("decision_id"), str) else None
+def parse_decision(raw: Any) -> Optional[Dict[str, Any]]:
+    """The /decide answer as a dict, or None when it is not a JSON object."""
+    try:
+        answer = json.loads(raw)
+    except Exception:
+        return None
+    return answer if isinstance(answer, dict) else None
 
 
 def request_ids(data: Any) -> Dict[str, Optional[str]]:
     """chat_id / message_id / user_id from the request's Open WebUI headers
-    (data["metadata"]["headers"], any case); None when absent or empty."""
+    (the proxy metadata dict's ``headers``, any case); None when absent or empty."""
     out: Dict[str, Optional[str]] = {k: None for k in OPENWEBUI_ID_HEADERS}
     meta = metadata_of(data)
     headers = meta.get("headers") if meta is not None else None
@@ -179,11 +213,76 @@ def key_alias_of(user_api_key_dict: Any) -> Optional[str]:
     return value if isinstance(value, str) and value else None
 
 
-def snapshot_messages(messages: List[Any]) -> List[Any]:
-    """A shallow copy of each message dict: the request goes on being
-    processed while the /decide task waits for its turn, and a key replaced
-    in a message meanwhile must not change what was sent. O(messages)."""
-    return [dict(m) if isinstance(m, dict) else m for m in messages]
+# -- Keeping /decide small ---------------------------------------------------------
+# A data: URI shorter than this is left alone (it cannot be a real payload).
+DATA_URI_MIN_CHARS = 128
+# Content parts whose every string the evaluators may need verbatim.
+VERBATIM_PART_TYPES = ("text", "input_text", "tool_use")
+
+
+def omitted(value: str) -> str:
+    """The placeholder for an inline payload: a data: URI keeps its header
+    (``data:image/png;base64,``), so the media type is still visible."""
+    head = value[: value.index(",") + 1] if value.startswith("data:") and "," in value[:256] else ""
+    return f"{head}[omitted: {len(value)} chars]"
+
+
+def _is_data_uri(value: Any) -> bool:
+    return isinstance(value, str) and value.startswith("data:") and len(value) >= DATA_URI_MIN_CHARS
+
+
+def _slim(obj: Any) -> Tuple[Any, bool]:
+    """(obj with inline payloads replaced, whether anything was). Copies only
+    what it changes; never mutates `obj`."""
+    if isinstance(obj, list):
+        out, changed = [], False
+        for item in obj:
+            new, c = _slim(item)
+            out.append(new)
+            changed = changed or c
+        return (out, True) if changed else (obj, False)
+    if not isinstance(obj, dict) or obj.get("type") in VERBATIM_PART_TYPES:
+        return obj, False
+    kind = obj.get("type")
+    new_obj: Optional[Dict[str, Any]] = None
+    for key, value in obj.items():
+        replacement: Any = value
+        if isinstance(value, str):
+            # Anthropic {"type": "base64", "data": ...} image / document sources,
+            # and the raw base64 of an OpenAI input_audio part.
+            raw_base64 = key == "data" and (kind == "base64" or "format" in obj) and len(value) >= DATA_URI_MIN_CHARS
+            if raw_base64 or _is_data_uri(value):
+                replacement = omitted(value)
+        elif isinstance(value, (dict, list)):
+            replacement, c = _slim(value)
+            if not c:
+                replacement = value
+        if replacement is not value:
+            if new_obj is None:
+                new_obj = dict(obj)
+            new_obj[key] = replacement
+    return (new_obj, True) if new_obj is not None else (obj, False)
+
+
+def slim_messages(messages: Any) -> Any:
+    """The messages for /decide: every list-of-parts content with its inline
+    binary payloads -- image_url / input_image data URIs, Anthropic image and
+    document ``source.data``, input_audio data, a ``file_data`` URI, any other
+    data: URI in a part -- replaced by omitted(...). The part keeps its type
+    (the evaluators may still see that an image was there); text parts, string
+    contents and tool calls are untouched. A changed message is a shallow copy
+    with a new content list; the request's own messages are never modified."""
+    if not isinstance(messages, list):
+        return messages
+    out: List[Any] = []
+    for m in messages:
+        content = m.get("content") if isinstance(m, dict) else None
+        if isinstance(content, list):
+            new, changed = _slim(content)
+            if changed:
+                m = {**m, "content": new}
+        out.append(m)
+    return out
 
 
 def build_decide_body(
@@ -201,7 +300,7 @@ def build_decide_body(
         "litellm_call_id": call_id if isinstance(call_id, str) and call_id else None,
         **request_ids(data),
         "key_alias": key_alias_of(user_api_key_dict),
-        "messages": snapshot_messages(data["messages"]),
+        "messages": slim_messages(data["messages"]),
         "tools": list(tools) if isinstance(tools, list) and tools else None,
         "backends": backends,
     }
@@ -224,6 +323,29 @@ def tool_call_names(obj: Any) -> List[str]:
     return names
 
 
+def response_outcome(response: Any) -> Tuple[Optional[str], List[str]]:
+    """(finish_reason, called tool names) of a non-streamed answer: an OpenAI
+    chat completion (choice 0's finish_reason, every choice's tool calls) or an
+    Anthropic /v1/messages response (stop_reason, its tool_use blocks)."""
+    choices = get_field(response, "choices")
+    if isinstance(choices, list):
+        finish: Optional[str] = None
+        names: List[str] = []
+        for choice in sorted(choices, key=lambda c: to_int(get_field(c, "index"))):
+            if finish is None:
+                finish = _str_or_none(get_field(choice, "finish_reason"))
+            names.extend(tool_call_names(get_field(choice, "message")))
+        return finish, names
+    content = get_field(response, "content")
+    names = []
+    if isinstance(content, list):
+        for block in content:
+            name = get_field(block, "name")
+            if get_field(block, "type") == "tool_use" and isinstance(name, str) and name:
+                names.append(name)
+    return _str_or_none(get_field(response, "stop_reason")), names
+
+
 def error_text(exc: Any) -> str:
     text = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
     return text[:ERROR_MAX_CHARS]
@@ -233,10 +355,17 @@ def _str_or_none(value: Any) -> Optional[str]:
     return value if isinstance(value, str) and value else None
 
 
+def _ruleset_label(answer: Dict[str, Any]) -> str:
+    ruleset = answer.get("ruleset")
+    if isinstance(ruleset, dict) and ruleset.get("id") is not None:
+        return f"{ruleset.get('id')}@{ruleset.get('version')}"
+    return "?"
+
+
 # -- The client -----------------------------------------------------------------
 class PolicyClient:
-    """Fires /decide on `auto` requests and /observe after them; never awaits,
-    never raises. `served` / `overflow_reason` are the footer's derivations
+    """Routes `auto` requests (awaited /decide) and fires /observe after them.
+    Never raises. `served` / `overflow_reason` are the footer's derivations
     (AutoFooter.served / .overflow_reason); `poller` supplies `backends`."""
 
     def __init__(
@@ -244,6 +373,7 @@ class PolicyClient:
         enabled: bool,
         base_url: str,
         timeout: float,
+        decide_timeout: float,
         post: Post,
         poller: Poller,
         served: ServedFn,
@@ -256,8 +386,10 @@ class PolicyClient:
         self.base_url = (base_url or "").strip().rstrip("/")
         self.enabled = bool(enabled) and bool(self.base_url)
         self.timeout = timeout
+        self.decide_timeout = decide_timeout
         self.max_in_flight = max(1, int(max_in_flight))
         self.stats = stats
+        self.fallbacks: Dict[str, int] = {}
         self._post = post
         self._poller = poller
         self._served = served
@@ -271,55 +403,130 @@ class PolicyClient:
     def in_flight(self) -> int:
         return len(self._tasks)
 
-    # -- pre-call ----------------------------------------------------------------
-    def decide(self, data: Any, user_api_key_dict: Any) -> bool:
-        """On an `auto` chat request: make a decision id, fire /decide, and
-        stash the id in data["metadata"] for the post-call hooks. Changes
-        nothing else in `data`. True when a /decide was fired."""
-        if not self.enabled:
-            return False
+    # -- pre-call: the route ---------------------------------------------------------
+    async def route(self, data: Any, user_api_key_dict: Any) -> bool:
+        """Every request: drop a stash the client sent. An `auto` request:
+        await /decide and rewrite data["model"] to the chosen chain, or to
+        local-private (see the module docstring), and stash what happened.
+        True when data["model"] was rewritten -- every `auto` request; other
+        requests are never rewritten. Never raises (a cancelled request's
+        CancelledError still propagates)."""
         try:
+            drop_foreign_stash(data)
             if not isinstance(data, dict) or data.get("model") != AUTO_MODEL:
                 return False
-            if not isinstance(data.get("messages"), list):
-                return False  # not a chat completion (responses API, ...)
-            meta = data.get("metadata")
-            if meta is None:
-                meta = data["metadata"] = {}
-            if not isinstance(meta, dict):
-                return False
-            # Never trust a stash that arrived in the request body: the
-            # proxy keeps client metadata keys it does not know.
-            meta.pop(STASH_KEY, None)
-            decision_id = str(uuid.uuid4())
-            body = build_decide_body(decision_id, data, user_api_key_dict, self._poller.report(self._clock()))
-            if not self._fire(DECIDE_PATH, body):
-                return False
-            meta[STASH_KEY] = {
-                "decision_id": decision_id,
-                "litellm_call_id": body["litellm_call_id"],
-                "observed": False,
-            }
-            return True
-        except Exception as exc:
-            self._error("decide", exc)
+        except Exception:
             return False
+        try:
+            return await self._route(data, user_api_key_dict)
+        except Exception as exc:
+            self._error("route", exc)
+            return self._fallback(data, HOOK_ERROR, f"internal error: {exc!r}", None)
+
+    async def _route(self, data: Dict[str, Any], user_api_key_dict: Any) -> bool:
+        if not self.enabled:
+            return self._fallback(data, DISABLED, "client off: ROUTE_POLICY_ENABLED=false or no ROUTE_POLICY_URL",
+                                  None)
+        if not isinstance(data.get("messages"), list):
+            return self._fallback(data, NO_MESSAGES, "not a chat request: no `messages` to decide on", None)
+        decision_id = str(uuid.uuid4())
+        body = encode(build_decide_body(decision_id, data, user_api_key_dict, self._poller.report(self._clock())))
+        try:
+            reply = await asyncio.wait_for(self._post(self.base_url + DECIDE_PATH, body), timeout=self.decide_timeout)
+        except asyncio.TimeoutError:
+            return self._failed_decide(data, TIMEOUT, f"no /decide answer in {self.decide_timeout:g}s", decision_id)
+        except Exception as exc:
+            return self._failed_decide(data, ERROR, f"/decide failed: {error_text(exc)}", decision_id)
+        status, raw = split_reply(reply)
+        if not (isinstance(status, int) and 200 <= status < 300):
+            return self._failed_decide(data, f"http-{status}", f"/decide answered HTTP {status}", decision_id)
+        self.stats["route_policy_decides"] += 1
+        answer = parse_decision(raw)
+        if answer is None:
+            return self._failed_decide(data, BAD_RESPONSE, "/decide answered something that is not a JSON object",
+                                       decision_id)
+        if answer.get("decision_id") not in (None, decision_id):
+            return self._failed_decide(data, BAD_RESPONSE,
+                                       f"/decide answered for decision {answer.get('decision_id')!r}", decision_id)
+        route = answer.get("route")
+        if answer.get("apply") is not True:
+            return self._fallback(data, NOT_APPLIED,
+                                  f"/decide chose {route!r} but apply={answer.get('apply')!r} "
+                                  f"(ruleset {_ruleset_label(answer)}, mode {answer.get('mode')!r})", decision_id)
+        checked = enforce(AUTO_MODEL, route)
+        if not checked.allowed:
+            return self._failed_decide(data, NOT_A_CHAIN, "; ".join(checked.notes) or f"{route!r} refused",
+                                       decision_id)
+        # The rewrite is the last step: every failure above left the request
+        # for the fallback instead.
+        data["model"] = checked.route
+        self.stats["route_policy_applied"] += 1
+        self._stash(data, checked.route, ENGINE, decision_id)
+        if "decide" not in self._announced:  # one positive line per process
+            self._announced.add("decide")
+            try:
+                logger.info("[route-policy] first decision applied: auto -> %s (ruleset %s) -- single pass is live",
+                            checked.route, _ruleset_label(answer))
+            except Exception:
+                pass
+        return True
+
+    def _failed_decide(self, data: Dict[str, Any], why: str, detail: str, decision_id: Optional[str]) -> bool:
+        """A /decide that did not produce a usable answer: an error, then the fallback."""
+        try:
+            self.stats["route_policy_errors"] += 1
+        except Exception:
+            pass
+        return self._fallback(data, why, detail, decision_id)
+
+    def _fallback(self, data: Any, why: str, detail: str, decision_id: Optional[str]) -> bool:
+        """data["model"] = local-private, stash it as a fallback, count and log it."""
+        try:
+            data["model"] = PRIVATE_ROUTE  # first: whatever fails below, the request is safe
+        except Exception:
+            return False  # not a dict we can write: the alias still serves `auto` from local-private
+        try:
+            self.stats["route_policy_fallbacks"] += 1
+            self.fallbacks[why] = self.fallbacks.get(why, 0) + 1
+            self._stash(data, PRIVATE_ROUTE, FALLBACK_PREFIX + why, decision_id)
+            self._log("route-policy", "fallback", why, "[route-policy] auto -> %s (%s)", PRIVATE_ROUTE, detail)
+        except Exception:
+            pass
+        return True
+
+    @staticmethod
+    def _stash(data: Dict[str, Any], route: str, source: str, decision_id: Optional[str]) -> None:
+        meta = metadata_of(data)  # the proxy's own dict: metadata, or litellm_metadata on /v1/messages
+        if meta is None and data.get("metadata") is None:
+            meta = data["metadata"] = {}
+        if meta is None:
+            return  # nowhere to put it: no footer, no /observe for this request
+        call_id = data.get("litellm_call_id")
+        meta[STASH_KEY] = {
+            "requested_model": AUTO_MODEL,
+            "route": route,
+            "source": source,
+            "decision_id": decision_id,
+            "litellm_call_id": call_id if isinstance(call_id, str) and call_id else None,
+            "observed": False,
+        }
 
     # -- post-call ---------------------------------------------------------------
+    def _observable(self, data: Any) -> Optional[Dict[str, Any]]:
+        """The stash of a request whose /decide was attempted and that has not
+        been observed yet, else None."""
+        stash = stash_of(data) if self.enabled else None
+        if stash is None or stash.get("observed") or not isinstance(stash.get("decision_id"), str):
+            return None
+        return stash
+
     def observe_response(self, data: Any, response: Any) -> None:
         """Non-streaming success: /observe from the response object."""
-        stash = stash_of(data) if self.enabled else None
-        if stash is None or stash.get("observed"):
+        stash = self._observable(data)
+        if stash is None:
             return
         try:
-            choices = get_field(response, "choices")
-            choices = choices if isinstance(choices, list) else []
-            finish: Optional[str] = None
-            names: List[str] = []
-            for choice in sorted(choices, key=lambda c: to_int(get_field(c, "index"))):
-                if finish is None:
-                    finish = _str_or_none(get_field(choice, "finish_reason"))
-                names.extend(tool_call_names(get_field(choice, "message")))
+            finish, names = response_outcome(response)
             self._observe(data, stash, SUCCESS, headers_of(response), _str_or_none(get_field(response, "id")),
                           finish, names, None)
         except Exception as exc:
@@ -328,15 +535,13 @@ class PolicyClient:
     def watch_stream(self, data: Any, wrapper: Any) -> Optional["StreamWatch"]:
         """A StreamWatch for a streamed response that has a decision to
         observe, else None (the stream is then not watched at all)."""
-        stash = stash_of(data) if self.enabled else None
-        if stash is None or stash.get("observed"):
-            return None
-        return StreamWatch(self, data, stash, wrapper)
+        stash = self._observable(data)
+        return StreamWatch(self, data, stash, wrapper) if stash is not None else None
 
     def observe_failure(self, data: Any, exc: Any) -> None:
         """post_call_failure_hook: /observe with status failure."""
-        stash = stash_of(data) if self.enabled else None
-        if stash is None or stash.get("observed"):
+        stash = self._observable(data)
+        if stash is None:
             return
         try:
             self._observe(data, stash, FAILURE, {}, None, None, [], error_text(exc))
@@ -356,12 +561,11 @@ class PolicyClient:
     ) -> None:
         # Mark first: whatever happens below, this request is never observed twice.
         stash["observed"] = True
-        served = Served(chain=None, model=None, bypassed=False)
-        if status == SUCCESS or headers:
-            try:
-                served = self._served(headers, data)
-            except Exception:
-                pass
+        served = Served(chain=None, model=None)
+        try:
+            served = self._served(headers, data)
+        except Exception:
+            pass
         reason = self._overflow_reason(served.chain) if is_claude(served.model) else None
         call_id = data.get("litellm_call_id") if isinstance(data, dict) else None
         body = {
@@ -378,7 +582,7 @@ class PolicyClient:
         }
         self._fire(OBSERVE_PATH, body)
 
-    # -- background calls ---------------------------------------------------------
+    # -- background /observe ------------------------------------------------------
     def _fire(self, path: str, body: Dict[str, Any]) -> bool:
         """Start one bounded background POST. False when it was dropped."""
         if len(self._tasks) >= self.max_in_flight:
@@ -399,7 +603,7 @@ class PolicyClient:
 
     async def _send(self, path: str, body: Dict[str, Any]) -> None:
         try:
-            status = await asyncio.wait_for(self._post(self.base_url + path, encode(body)), timeout=self.timeout)
+            reply = await asyncio.wait_for(self._post(self.base_url + path, encode(body)), timeout=self.timeout)
         except asyncio.CancelledError:
             raise
         except asyncio.TimeoutError:
@@ -408,13 +612,13 @@ class PolicyClient:
         except Exception as exc:
             self._failed(path, error_text(exc))
             return
+        status, _ = split_reply(reply)
         if isinstance(status, int) and 200 <= status < 300:
-            self.stats["route_policy_decides" if path == DECIDE_PATH else "route_policy_observes"] += 1
+            self.stats["route_policy_observes"] += 1
             if path not in self._announced:  # one positive line per path per process
                 self._announced.add(path)
                 try:
-                    logger.info("[route-policy] first POST %s%s answered HTTP %d -- shadow mode is live",
-                                self.base_url, path, status)
+                    logger.info("[route-policy] first POST %s%s answered HTTP %d", self.base_url, path, status)
                 except Exception:
                     pass
         else:
@@ -445,7 +649,8 @@ class StreamWatch:
     response_id is the first chunk's `id` (what the spend log keys on,
     streaming_handler.py:735-742); finish_reason is choice 0's (else the
     first choice's); tool_calls are the function names streamed in
-    delta.tool_calls, in order."""
+    delta.tool_calls, in order. A /v1/messages stream (Anthropic events) has
+    no `choices`: it is observed with whatever the chunks carry."""
 
     def __init__(self, client: PolicyClient, data: Any, stash: Dict[str, Any], wrapper: Any) -> None:
         self.client = client
@@ -489,13 +694,7 @@ class StreamWatch:
 
     def succeeded(self) -> None:
         """The upstream stream ended normally."""
-        if self.stash.get("observed"):
-            return
-        try:
-            self.client._observe(self.data, self.stash, SUCCESS, self._headers(), self.response_id,
-                                 self._finish_reason(), list(self.tool_calls), None)
-        except Exception as exc:
-            self.client._error("observe", exc)
+        self._end(SUCCESS, None)
 
     def failed(self, exc: BaseException) -> None:
         """The upstream stream raised (the proxy then also calls
@@ -508,7 +707,7 @@ class StreamWatch:
         this one sees GeneratorExit when it is collected). No-op once observed."""
         self._end(FAILURE, DISCONNECTED)
 
-    def _end(self, status: str, error: str) -> None:
+    def _end(self, status: str, error: Optional[str]) -> None:
         if self.stash.get("observed"):
             return
         try:

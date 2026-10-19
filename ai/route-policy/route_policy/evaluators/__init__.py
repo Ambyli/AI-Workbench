@@ -8,8 +8,8 @@
     backend_load.py  a vote from the overflow layer's backend snapshot
     static.py        a fixed vote, for tests and overrides
 
-Not built yet: llm_classifier (phase 4); context_size and semantic_router
-(ROUTE_POLICY_PLAN § 4, unscheduled).
+Not built yet: llm_classifier (phase 4); context_size (ROUTE_POLICY_PLAN
+§ 4, unscheduled).
 """
 
 from .base import (

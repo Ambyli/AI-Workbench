@@ -14,8 +14,10 @@ serving):
    that kept its version number fails here;
 4. hang the ``Service`` (ruleset cache + database) on ``app.state``.
 
-Shutdown closes the pool. There are no background workers in phase 2 (the
-llm_classifier's analysis queue is phase 4).
+Shutdown first drains the background writes (``Service.drain``: decision /
+outcome writes that outlasted ROUTE_POLICY_DECISION_WRITE_BUDGET_S get up to
+WRITES_DRAIN_S, then are cancelled), then closes the pool. There are no other
+background workers (the llm_classifier's analysis queue is phase 4).
 
 A test can pass its own ``service`` -- e.g. a ruleset cache filled from the
 files with no database -- and the lifespan then touches nothing.
@@ -55,7 +57,7 @@ async def start_service(database: Database, rulesets_dir: pathlib.Path) -> Servi
     await database.init()
     async with database.acquire() as conn:
         await migrate(conn)
-    store = RulesetStore(database, refresh_s=config.BINDING_REFRESH_S)
+    store = RulesetStore(database, refresh_s=config.BINDING_REFRESH_S, read_budget_s=config.DB_READ_BUDGET_S)
     seed = await seed_and_load(store, database, rulesets_dir)
     logger.info("startup: %d ruleset version(s) loaded (%s); bindings: %s",
                 len(seed.compiled), ", ".join(f"{r.id}@{r.version} {r.mode}" for r in seed.compiled),
@@ -80,7 +82,10 @@ def create_app(*, service: Optional[Service] = None, database: Optional[Database
     async def lifespan(app: FastAPI):
         if service is not None:
             app.state.service = service
-            yield
+            try:
+                yield
+            finally:
+                await service.drain()
             return
         db = database or Database(config.DB_DSN, max_size=config.DB_POOL_MAX)
         try:
@@ -92,7 +97,10 @@ def create_app(*, service: Optional[Service] = None, database: Optional[Database
         try:
             yield
         finally:
-            await db.close()
+            try:
+                await app.state.service.drain()
+            finally:
+                await db.close()
             logger.info("lifespan: shutdown complete")
 
     app = FastAPI(

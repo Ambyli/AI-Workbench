@@ -1,16 +1,14 @@
 """cooldown -- a vote that holds for a few exchanges after the last relevant one.
 
-A port of the LiteLLM hook's code cooldown
-(``ai/litellm/hooks/routing/code_route.py::code_route_decision`` and
-``exchange_relevance``), configured by the ruleset instead of
-CODE_ROUTE_COOLDOWN / CODE_ROUTE_TOOL_REGEX / the router-config mount:
+How the `default` ruleset keeps a coding chat on ``local-code`` for a few
+turns after the last coding exchange (``sticky-code``):
 
 * the history is split into EXCHANGES, one per user message (the message plus
   every round after it);
 * an exchange is RELEVANT when one of the evaluators named in ``relevant_if``
   says so (``Evaluator.exchange_relevance``; asked in the order listed, the
   first reason wins -- the default ruleset lists ``code-tools`` before
-  ``code-text``, the hook's order);
+  ``code-text``);
 * the current exchange relevant -> vote;
 * otherwise walk back: a relevant exchange with fewer than ``exchanges``
   irrelevant ones between it and the current one -> vote; ``exchanges`` or
@@ -20,8 +18,9 @@ Everything is recomputed from the request's history -- no per-chat state, so
 two copies of the service and a restart agree. (Whether it should count from
 stored decisions instead is ROUTE_POLICY_PLAN § 9's open question.)
 
-The reasons are the hook's, word for word, so a shadow decision and a
-``[route]`` log line can be compared directly.
+The reasons ("called X 2 exchange(s) ago; 1/3 irrelevant since", "cooldown:
+3/3 irrelevant exchanges since the last one that ...") are pinned by
+unit-tests/route-policy/test_evaluators.py: Trino queries group on them.
 """
 
 from __future__ import annotations

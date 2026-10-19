@@ -2,8 +2,8 @@
 
 A request's ``messages`` list is the whole conversation so far: system
 prompts, every user message, every assistant round (text, tool calls) and
-every tool result. These helpers answer the questions a router or a proxy
-hook asks about it without caring which client produced it:
+every tool result. These helpers answer the questions a routing engine or a
+proxy hook asks about it without caring which client produced it:
 
 * :func:`message_text` — the text of one message's ``content`` (a string, or
   the ``text`` parts of a multimodal list, joined with newlines);
@@ -17,8 +17,11 @@ hook asks about it without caring which client produced it:
   (``tools``) sit beside ``messages``, never inside, so they are never read.
 
 Stdlib only, pure, never raises on malformed input (junk entries are
-skipped). The LiteLLM hooks (``ai/litellm/hooks``) are the first consumer:
-the code-tool remap reads exchanges and called tools.
+skipped). Consumers: route-policy (``ai/route-policy``: the ``tool_calls``
+and ``cooldown`` evaluators read exchanges and called tools), and the
+LiteLLM hooks (``ai/litellm/hooks``: the ``auto`` footer's background-task
+detection reads ``message_text``). The hooks get it as a read-only bind
+mount, not an install, which is why it must stay stdlib-only.
 
 Public API:
     message_text(content)       -> str

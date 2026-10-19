@@ -1,6 +1,8 @@
-"""Request routing edits made before LiteLLM picks a model group.
+"""Routing `auto` to a chain alias before LiteLLM picks a deployment.
 
-    code_route.py     CodeRoute -- local-general -> local-code for coding chats
-    policy_client.py  PolicyClient -- route-policy shadow mode: /decide on every
-                      `auto` request, /observe after it; fired, never awaited
+    policy_client.py  PolicyClient -- awaits the route-policy service's /decide
+                      on every `auto` request and rewrites it to the chosen
+                      chain (else local-private); fires /observe after it
+    invariants.py     the hook's own copy of the two route invariants
+    stash.py          the per-request record the post-call hooks read
 """

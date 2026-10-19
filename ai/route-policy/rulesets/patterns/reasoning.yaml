@@ -1,11 +1,9 @@
-# reasoning_kw -- the semantic router's math / science / multi-step keyword
-# signal, for the `default` ruleset's `reasoning-text` evaluator.
+# reasoning_kw -- math / science / multi-step keywords, for the `default`
+# ruleset's `reasoning-text` evaluator.
 #
-# A COPY of routing.signals.keywords[name=reasoning_kw] in
-# ai/semantic-router/config.yaml, kept identical (keywords, operator,
-# case_sensitive, method) by unit-tests/route-policy/test_drift.py until
-# phase 3 retires the router. Edit both together, and bump the ruleset's
-# `version` (this file is part of its content hash).
+# The only copy: this file is the source of truth. It is part of every
+# ruleset version that references it (its content, not these comments, is
+# inlined and hashed), so an edit here needs a ruleset `version` bump.
 #
 # No `method`: whole-word literals, case-insensitive.
 name: reasoning_kw

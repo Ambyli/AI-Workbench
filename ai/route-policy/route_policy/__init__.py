@@ -20,7 +20,10 @@ as the ``postgres_route_policy`` catalog.
     rulesets/       document model, loader (files + refs), validation, cache
     db/             pool, migrations, repositories
 
-Phase 2 of ROUTE_POLICY_PLAN: every ruleset is ``mode: shadow`` -- decisions
-are computed and logged, never applied. The llm_classifier evaluator and the
-analyses queue are phase 4 and do not exist here yet.
+Phase 3 of ROUTE_POLICY_PLAN: the `default` ruleset is ``mode: enforce`` --
+LiteLLM awaits ``/decide`` for every ``auto`` request and serves the chain it
+returns when ``apply`` is true (anything else goes to ``local-private``). A
+``shadow`` ruleset is still decided and logged, never applied. The
+llm_classifier evaluator and the analyses queue are phase 4 and do not exist
+here yet.
 """

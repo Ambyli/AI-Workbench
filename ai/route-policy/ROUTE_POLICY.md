@@ -11,15 +11,28 @@ route. Two **invariants** have the last word:
 - a request for `local-private` stays `local-private`;
 - the route is always one of the ruleset's chain aliases.
 
-**Phase 2 runs in shadow mode.** Every ruleset is `mode: shadow`:
-- LiteLLM's hook (`ai/litellm/hooks/routing/policy_client.py`) calls
-  `/decide` and `/observe` without waiting for them;
-- nothing is applied;
-- the semantic router plus the hook's code remap still route every turn.
+**Phase 3: the engine routes `auto`.** The `default` ruleset (version 2) is
+`mode: enforce`:
+- LiteLLM's pre-call hook (`ai/litellm/hooks/routing/policy_client.py`)
+  **awaits** `/decide` for every request to `auto`, within
+  `ROUTE_POLICY_DECIDE_TIMEOUT_S` (0.25 s);
+- when the answer has `apply: true` and the hook's own copy of the invariants
+  agrees, it rewrites the request to that chain alias, and LiteLLM serves it
+  **in the same pass, streamed**;
+- anything else (a timeout, a non-200, bad JSON, `apply: false`, the client
+  disabled) sends the turn to **`local-private`**, the chain with no Claude
+  deployment, and logs `[route-policy] … -> local-private (<why>)`;
+- `/observe` is still fired after the call, never awaited.
 
-The point of phase 2 is the comparison in Trino: does the engine choose what
-today's routing chose ([§ Decision log](#decision-log-and-trino))? Phase 3
-flips the ruleset to `enforce`, and the engine replaces the router.
+Only `auto` is decided. A request that names a chain alias directly is served
+as asked. `auto` itself is a LiteLLM `model_group_alias` for `local-private`,
+so a request the hook never rewrote is still served privately.
+
+Phase 2 ran the same rules in `shadow` mode beside the semantic router, and
+the decisions agreed with what the router plus LiteLLM's code remap chose.
+Phase 3 retired both; the pattern files here are now the only copy of the
+rules. A `shadow` ruleset still works: it is decided and logged, never
+applied.
 
 Plan: `ROUTE_POLICY_PLAN.md` (outside the repo), phases 2–5.
 
@@ -53,13 +66,14 @@ Plan: `ROUTE_POLICY_PLAN.md` (outside the repo), phases 2–5.
 ## How it fits
 
 ```
-Open WebUI ─► LiteLLM (model `auto`)
+Open WebUI ─► LiteLLM (model `auto`, one pass)
                 ├─ pre-call hook ── POST /decide {decision_id, messages, tools, ids, backends} ──► route-policy
-                │                   (fired, not awaited)                                          ├─ ruleset (bound to `auto`)
-                ├─ (still) Envoy ─► semantic router ─► chain alias ─► LiteLLM ─► vLLM / Claude     ├─ evaluators → votes
-                └─ success / failure hook ── POST /observe {decision_id, served chain, ...} ──────► ├─ combiner → route
-                                                                                                   └─ invariants
-                                                                         route-policy-db ◄────────────┘
+                │   (awaited, ≤ 0.25 s)  ◄── {route: local-code, apply: true, ...} ────────────── ├─ ruleset (bound to `auto`)
+                │   data["model"] = "local-code"   (fallback on any failure: local-private)       ├─ evaluators → votes
+                ├─ deployment pick: overflow filter (context fit, busy / down) inside the chain   ├─ combiner → route
+                ├─ vLLM / Claude ── STREAMED straight back to the client                          └─ invariants
+                └─ success / failure hook ── POST /observe {decision_id, served chain, ...} ──► (fired)  │
+                                                                         route-policy-db ◄───────────────┘
                                                                               │ trino_reader
                                                                          Trino: postgres_route_policy
 ```
@@ -73,13 +87,26 @@ The hook sends the overflow layer's backend snapshot in every `/decide`
 (`backends`), so a ruleset can be load-aware (`backend_load`). The engine
 still never picks a deployment.
 
-**The hook makes the `decision_id`** (uuid4) and sends both calls with it. The
-two calls may arrive in either order, so `outcomes` has no foreign key to
-`decisions`. The `decision_outcomes` view joins them.
+**Two copies of the invariants.** The service enforces them
+(`route_policy/engine/invariants.py`), and the hook re-checks the answer with
+its own copy (`ai/litellm/hooks/routing/invariants.py`, whose allowed routes
+are exactly the four chain aliases) before it rewrites anything. So a wrong
+answer from this service can never move a turn off `local-private` or onto a
+model that is not a chain. `unit-tests/litellm` runs both files over the same
+cases, which is why `enforce`, `fail_safe_route` and `PRIVATE_ROUTE` keep
+their names.
+
+**The hook makes the `decision_id`** (uuid4) and sends both calls with it.
+`/observe` normally follows `/decide`, but a `/decide` the hook gave up on
+can still land after the fallback answer's `/observe`, so `outcomes` has no
+foreign key to `decisions`. The `decision_outcomes` view joins them.
 
 ## Deploying
 
-Steps, in order (on the box, from the repo root):
+On a box that already runs phase 2 (shadow), follow
+[§ Upgrading from phase 2](#upgrading-from-phase-2-shadow) instead.
+
+A fresh box, in order (from the repo root):
 
 1. **`.env`:**
    - Copy the `## Route policy` block and the two `PORT_ROUTE_POLICY*` rows
@@ -95,19 +122,20 @@ Steps, in order (on the box, from the repo root):
    sudo ss -ltnp 'sport = :5441'
    ```
 3. **`make up edge` first.**
-   - The edge compose file gained the `8027` port, so this is a recreate: a
-     second or two of LAN downtime, and `auto` turns fall back to
-     `local-private` meanwhile.
+   - It publishes `8027`. On a box whose edge predates route-policy this is a
+     recreate: a second or two of LAN downtime.
    - It must come first. A swap of a fronted service refuses to go ahead when
      the running edge has no backend for it.
 4. **`make build route-policy && make up route-policy`.**
    - `route-policy-db` is recreated (it is new); `route-policy` swaps.
    - The image build itself validates the baked-in rulesets.
+   - It must be up before LiteLLM routes through it. Until it answers, every
+     `auto` turn goes to `local-private` (safe, never to Claude).
 5. **`make up trino trino-coordinator`.** A recreate, because its environment
    gained `ROUTE_POLICY_DB_NAME` / `ROUTE_POLICY_TRINO_READER_PASSWORD` and
    the new catalog file.
 6. **`make up litellm`.** Picks up the `/v1/route-policy` pass-through in
-   `litellm_config.yaml` (and workstream C's hook).
+   `litellm_config.yaml` and the hook that awaits `/decide`.
 7. **`docker restart prometheus`.** Its config is bind-mounted, and it gained
    the `route-policy` scrape job.
 
@@ -115,25 +143,71 @@ Steps, in order (on the box, from the repo root):
 
 ```bash
 make logs route-policy route-policy FOLLOW=0 TAIL=50   # "applied migration 0001_initial.sql",
-                                                      # "seeded default@1", "binding auto -> default@1"
-curl -s localhost:8027/health                         # {"status":"ok","rulesets":[{"id":"default","version":1}],"bindings":1}
+                                                      # "seeded default@2", "binding auto -> default@2"
+curl -s localhost:8027/health                         # {"status":"ok","rulesets":[{"id":"default","version":2}],"bindings":1}
 curl -s localhost:8027/ready                          # {"status":"ready","db":"up"}
 curl -s localhost:8027/bindings
 curl -s -X POST localhost:8027/evaluate -H 'content-type: application/json' \
-  -d '{"ruleset":{"id":"default"},"messages":[{"role":"user","content":"write a python script"}]}' | jq .route
-                                                      # "local-code"
+  -d '{"ruleset":{"id":"default"},"messages":[{"role":"user","content":"write a python script"}]}' | jq '.route, .apply'
+                                                      # "local-code", true
 docker exec route-policy-db psql -U route_policy -c '\dt'
 docker exec route-policy-db psql -U route_policy -c '\du trino_reader'
 ```
 
-- **Once LiteLLM's hook is live:** chat once through `auto` in Open WebUI, then
-  `docker exec route-policy-db psql -U route_policy -c 'select * from
-  decision_outcomes order by decided_at desc limit 5'`. Every turn should
-  have one row with both sides.
+- **Once LiteLLM is up:** chat once through `auto` in Open WebUI. The answer
+  streams, and its footer names the chain and deployment that served it.
+  Then `docker exec route-policy-db psql -U route_policy -c 'select
+  chosen_route, applied, served_model_group, agree from decision_outcomes
+  order by decided_at desc limit 5'`: every turn has one row with both sides,
+  `applied = true` and `agree = true`.
+- **No fallbacks:** `make logs litellm` has no `[route-policy] … ->
+  local-private (…)` lines.
 - **In Trino:** `SHOW TABLES FROM postgres_route_policy.public`.
 - **In Prometheus:** the `route-policy` target is UP.
 - **On the edge status page** (`chat.zeoenergy.com/edge/`): `route-policy` is
   listed.
+
+### Upgrading from phase 2 (shadow)
+
+Staged, so `auto` never breaks. On the box, from the repo root:
+
+1. **`git pull`** on the branch.
+2. **`make build route-policy && make up route-policy`.** Seeds `default@2`
+   (enforce) and moves the `auto` binding to it. The running phase-2 LiteLLM
+   ignores `/decide`'s answer, so nothing changes for users yet. Check
+   `curl -s localhost:8027/health` shows version 2. Version 1 stays in the
+   database with its decisions (`GET /rulesets/default/1`), although it is no
+   longer baked in.
+3. **`make up litellm`.** Swaps in the single-pass hook. Check:
+   - an `auto` chat streams;
+   - its footer names the chain;
+   - `decision_outcomes` shows `applied = true` for the new turns;
+   - no `[route-policy] … -> local-private (…)` lines in `make logs litellm`.
+4. **Tear down the semantic router.**
+   ```bash
+   docker compose -p ai-semantic-router down --volumes
+   ```
+   If compose wants the deleted compose file, recover it from git and pass it
+   with `-f`. `57c3812` is the last commit before phase 3, so this works
+   whatever has landed since:
+   ```bash
+   git show 57c3812:ai/semantic-router/docker-compose.semantic-router.yml > /tmp/sr.yml
+   docker compose -p ai-semantic-router -f /tmp/sr.yml --env-file .env down --volumes
+   ```
+   Run it from the repo root and before step 6. The old file fails fast on its
+   `${SEMANTIC_ROUTER_*:?…}` variables, so it needs the `.env` that still
+   holds them.
+   Then `docker network rm router_net` if it is left over.
+5. **`make up edge`.** The edge compose file loses the router's port, so this
+   is a recreate (a second or two of LAN downtime). Then `docker restart
+   prometheus`: its scrape config lost the router job.
+6. **Manual cleanup:** remove the `SEMANTIC_ROUTER_*` and
+   `PORT_SEMANTIC_ROUTER*` lines from the box `.env`, and delete the
+   `SEMANTIC_ROUTER_LITELLM_KEY` virtual key in the LiteLLM Admin UI.
+
+**Rollback:** `git revert` the phase-3 commit, then `make up semantic-router`,
+`make up litellm`, `make up edge`. The reverted image bakes `default@1` again
+and re-points the binding at it; version 2 stays stored.
 
 ## API
 
@@ -162,8 +236,9 @@ phase 5.
 
 ### POST /decide
 
-This is the contract workstream C's client is built against
-(ROUTE_POLICY_PLAN § 7, "Phase 2 build spec").
+This is the contract LiteLLM's client (`ai/litellm/hooks/routing/`) is built
+against (ROUTE_POLICY_PLAN § 7, "Phase 2 build spec"; unchanged in phase 3,
+which only started awaiting the answer).
 
 ```json
 {"decision_id": "uuid4, made by the hook", "requested_model": "auto",
@@ -175,8 +250,8 @@ This is the contract workstream C's client is built against
 → `200`, and the same body is what gets logged:
 
 ```json
-{"decision_id": "…", "route": "local-code", "mode": "shadow", "apply": false,
- "ruleset": {"id": "default", "version": 1},
+{"decision_id": "…", "route": "local-code", "mode": "enforce", "apply": true,
+ "ruleset": {"id": "default", "version": 2},
  "votes": [{"evaluator": "code-tools", "type": "tool_calls", "route": "local-code", "weight": 1.0,
             "confidence": 1.0, "role": "vote", "abstained": false,
             "reason": "called sandbox-mcp_exec in this exchange", "latency_ms": 0.1}],
@@ -187,8 +262,10 @@ This is the contract workstream C's client is built against
   abstain has `route` and `confidence` null and a reason.
 - **`scores`:** Σ weight × confidence per route, over the non-abstaining
   `vote` and `force` votes.
-- **`apply`:** true only for an `enforce` ruleset whose invariants held. It is
-  never true in phase 2.
+- **`apply`:** true only for an `enforce` ruleset whose invariants held, so
+  true for `default@2` unless a combined route fell outside the ruleset's
+  `routes`. LiteLLM applies `route` only when it is true; `false` (a `shadow`
+  ruleset, or an invariant override) sends the turn to `local-private`.
 - **Idempotent on `decision_id`.** A repeat returns the **first** stored
   response, whatever the new body says. Nothing is written twice.
 - **Errors:**
@@ -196,14 +273,44 @@ This is the contract workstream C's client is built against
   - `422`: the body breaks the contract (e.g. `decision_id` is not a UUID).
   - `503`: the bound ruleset cannot be compiled by this copy (only possible
     mid-swap after a ruleset gained an evaluator type the old code lacks).
-- **Lenient where strictness would only lose data.** Calls are fire-and-forget,
-  so a `422` is invisible to everyone:
+- **Lenient where strictness would only lose data.** A `422` on `/decide`
+  only sends the turn to LiteLLM's fallback (`local-private`), and one on the
+  fire-and-forget `/observe` is never seen, so:
   - unknown fields are ignored;
   - a null `messages` is an empty list;
   - an unknown `verdict` is kept as sent.
 - **A decision is returned even when route-policy-db is down.** It is then
   not logged; that is counted in `route_policy_errors_total{kind="decision_write"}`.
   Routing never depends on the log.
+- **And it is returned in time, whatever the database does.** LiteLLM waits
+  0.25 s for `/decide` and sends the turn to `local-private` past it, so no
+  database wait may hold the answer for long (`route_policy/service.py`,
+  `rulesets/store.py`):
+  - **The decision write** runs as its own task. `/decide` waits for it up
+    to `ROUTE_POLICY_DECISION_WRITE_BUDGET_S` (0.05 s). In time, it behaves
+    as if the write were synchronous: a duplicate `decision_id` replays the
+    first stored response. Late (a hung database, an exhausted pool), the
+    computed response goes out at once and the write finishes in the
+    background (`route_policy_writes_deferred_total{write="decision"}`); if
+    it then fails, it is counted and logged like any `decision_write` error.
+    A duplicate whose write is late gets the newly computed answer; the
+    stored row still holds the first.
+  - **At most 256 writes** are in flight (`WRITES_MAX_IN_FLIGHT`,
+    `route_policy_writes_in_flight`). Past that a write is dropped, never
+    queued (`route_policy_errors_total{kind="decision_write_dropped"}`): the
+    decision is still returned, just not logged.
+  - **The reads on the path** — the binding refresh every
+    `ROUTE_POLICY_BINDING_REFRESH_S`, and compiling a stored version this
+    copy has not cached — get `DB_READ_BUDGET_S` (0.1 s, a constant in
+    `config.py`). A slow refresh finishes in the background while requests
+    decide from the last snapshot; a slow version fetch answers `503` (so
+    LiteLLM falls back to `local-private`) and lands in the cache for the
+    next request. Both count in `route_policy_db_reads_cut_total`.
+  - **Shutdown** waits up to 5 s (`WRITES_DRAIN_S`) for background writes,
+    then cancels the rest.
+- **Latency.** The engine takes well under a millisecond (p50 0.28 ms in
+  shadow); the HTTP hop and, normally, a few milliseconds of decision write
+  are the rest. Every `auto` turn waits for it.
 
 ### POST /observe
 
@@ -215,15 +322,21 @@ This is the contract workstream C's client is built against
 ```
 
 - **`202`:** `{"decision_id": "…", "stored": true}`, or `stored: false` when
-  this decision already had an outcome (the first write wins).
-- **`503`:** the database is unavailable.
+  this decision already had an outcome (the first write wins), or
+  `{"decision_id": "…", "stored": null, "deferred": true}` when the write
+  outlasted `ROUTE_POLICY_DECISION_WRITE_BUDGET_S` and goes on in the
+  background (the hook ignores the body).
+- **`503`:** the outcome could not be stored: no database, the write failed
+  within the budget, or 256 writes were already in flight
+  (`outcome_write_dropped`).
 - **`error`** is cut to 2000 characters.
 
 ### POST /evaluate
 
 Give exactly one of:
-- `{"ruleset": {"id": "default", "version": 1}}` (version omitted = the
-  highest);
+- `{"ruleset": {"id": "default", "version": 2}}` (version omitted = the
+  highest). A stored version that is no longer baked in (`default@1`) works
+  too: it is compiled from the database;
 - `{"document": {…}}`.
 
 Plus `messages` / `tools` / `backends` and an optional `requested_model`
@@ -243,9 +356,9 @@ its evaluator's `detail` and `error`.
 
 ```yaml
 id: default                      # [a-z0-9][a-z0-9_-]*
-version: 1                       # immutable: new content = a new version
+version: 2                       # immutable: new content = a new version
 description: …
-mode: shadow                     # shadow | enforce
+mode: enforce                    # shadow (decide + log) | enforce (LiteLLM applies it)
 routes: [local-general, local-code, local-reasoning, local-private]
 default_route: local-general     # one of routes
 evaluators:                      # in order; each votes or abstains
@@ -289,13 +402,27 @@ swap cannot race.
    - `active_from` is the first time a binding pointed at a version;
    - `active_to` is when none does any more.
 
-In phase 2, startup owns the seeded bindings and resets them on every start.
+Startup owns the seeded bindings and resets them on every start.
+
+**A stored version needs no file.** Only the current `default` (version 2) is
+baked in; version 1 (phase 2, shadow) stays in the database with the
+decisions made under it, and the store compiles it from there on first use
+(`GET /rulesets/default/1`, `POST /evaluate`). Keeping old files would also
+freeze the pattern files: a version that references `patterns/code.yaml`
+hashes its content, so an edited pattern would stop startup on the old
+version.
 
 **Changing a ruleset:**
-1. Edit the YAML.
+1. Edit the YAML in place (`default.yaml` holds only the current version).
 2. Bump `version`.
-3. Try it with `POST /evaluate {"document": …}` on real conversation shapes.
-4. `make build route-policy && make up route-policy`.
+3. Update the expected values in `unit-tests/route-policy/test_default_ruleset.py`
+   (and the RE2 check passes for a new pattern).
+4. Try it with `POST /evaluate {"document": …}` on real conversation shapes,
+   or ship it first as a `shadow` ruleset bound to a test key alias.
+5. `make build route-policy && make up route-policy`. The new copy seeds the
+   version and moves the binding; the old copy keeps deciding with the old
+   version until its next binding refresh (`ROUTE_POLICY_BINDING_REFRESH_S`,
+   10 s), then with the new one, until it retires.
 
 The old version stays in the database, so its decisions remain readable.
 
@@ -322,9 +449,9 @@ into Trino; `regex_text` reports pattern *indices*, `tool_calls` tool *names*.
 
 | Type | Config | Votes when |
 |---|---|---|
-| `regex_text` | `rule` (or `patterns_ref`): a semantic-router keyword rule `{name, operator: OR\|AND\|NOR, case_sensitive, method: regex?, keywords}`. `scope: current_message` | The rule matches the **latest user message**. Uses `common.keywordmatch` (Go-RE2 semantics: ASCII `\b` / `\w`, `(?i)` unless case-sensitive; no `method` = whole-word literals). |
+| `regex_text` | `rule` (or `patterns_ref`): a keyword rule `{name, operator: OR\|AND\|NOR, case_sensitive, method: regex?, keywords}`. `scope: current_message` | The rule matches the **latest user message**. Uses `common.keywordmatch` (Go-RE2 semantics: ASCII `\b` / `\w`, `(?i)` unless case-sensitive; no `method` = whole-word literals). |
 | `tool_calls` | `pattern` (Python regex, **full-name** match), `scope: current_exchange \| conversation` | The conversation **called** a matching tool: OpenAI `tool_calls`, legacy `function_call`, Anthropic `tool_use`, named tool results (`common.conversation.called_tool_names`). Offered `tools` never count. |
-| `cooldown` | `exchanges` (≥ 0), `relevant_if: [evaluator ids]` | The current exchange is relevant, or an earlier one is and fewer than `exchanges` irrelevant exchanges followed it. A faithful port of `ai/litellm/hooks/routing/code_route.py::code_route_decision`, reasons word for word. The judges are asked in order. |
+| `cooldown` | `exchanges` (≥ 0), `relevant_if: [evaluator ids]` | The current exchange is relevant, or an earlier one is and fewer than `exchanges` irrelevant exchanges followed it. The judges are asked in order; the first reason wins. Recomputed from the history on every request, no per-chat state. |
 | `backend_load` | `backends` (regexes over api_base), `verdicts` (default busy, down), `min_waiting`, `require: any \| all` | Watched backends in the snapshot qualify. Abstains when none matches. |
 | `static` | `abstain`, `confidence`, `reason` | Always (or never). For tests, overrides, and as a `veto`. |
 
@@ -333,8 +460,7 @@ into Trino; `regex_text` reports pattern *indices*, `tool_calls` tool *names*.
 - **`regex_text` and `tool_calls` can judge a single exchange**, which is what
   `cooldown.relevant_if` uses.
 - **Phase 4 adds `llm_classifier`** (`async_next_turn`, with the `analyses`
-  table). `context_size` and `semantic_router` are in the plan but not
-  scheduled.
+  table). `context_size` is in the plan but not scheduled.
 
 ## Combiners and roles
 
@@ -351,8 +477,8 @@ Every combiner runs the same frame (`route_policy/combiners/base.py`):
      `routes`.
 4. **default:** `default_route`; if that is vetoed, the first route in play.
 
-**Every evaluator always runs**, even after a force vote. The log is the point
-of shadow mode.
+**Every evaluator always runs**, even after a force vote, and every vote is
+logged: a rule's hit rate is readable in Trino whatever decided the turn.
 
 An evaluator that **raises** is recorded as an abstain with its error, and the
 decision goes on. A vote for a route the ruleset does not list is turned into
@@ -365,34 +491,43 @@ an abstain with an error.
 
 ## The `default` ruleset
 
-`rulesets/default.yaml`, version 1, `mode: shadow`, `priority` combiner. It
-reproduces today's `auto` routing:
+`rulesets/default.yaml`, version 2, `mode: enforce`, `priority` combiner:
 
-| # | Evaluator | Type | Today's source | Route |
+| # | Evaluator | Type | Votes when | Route |
 |---|---|---|---|---|
-| 1 | `privacy` (`force`) | `regex_text` → `patterns/privacy.yaml` | router `privacy_kw` (priority 300) | `local-private` |
-| 2 | `code-text` | `regex_text` → `patterns/code.yaml` | router `code_kw` (200) | `local-code` |
-| 3 | `reasoning-text` | `regex_text` → `patterns/reasoning.yaml` | router `reasoning_kw` (150) | `local-reasoning` |
-| 4 | `code-tools` | `tool_calls`, current exchange | hook remap, `CODE_ROUTE_TOOL_REGEX` | `local-code` |
-| 5 | `sticky-code` | `cooldown`, 3 exchanges, judges `code-tools`, `code-text` | hook cooldown, `CODE_ROUTE_COOLDOWN` | `local-code` |
-| — | default | | router `general` (10) | `local-general` |
+| 1 | `privacy` (`force`) | `regex_text` → `patterns/privacy.yaml` (`privacy_kw`) | PII words in the latest user message | `local-private` |
+| 2 | `code-text` | `regex_text` → `patterns/code.yaml` (`code_kw`, regexes) | code words, a file name or a code fence | `local-code` |
+| 3 | `reasoning-text` | `regex_text` → `patterns/reasoning.yaml` (`reasoning_kw`) | math / science / multi-step words | `local-reasoning` |
+| 4 | `code-tools` | `tool_calls`, current exchange | a sandbox MCP tool (`sandbox-mcp_.+`) or one of Open Terminal's distinctive operationIds was CALLED | `local-code` |
+| 5 | `sticky-code` | `cooldown`, 3 exchanges, judges `code-tools`, `code-text` | a coding exchange within the last 3 | `local-code` |
+| — | default | | | `local-general` |
 
-Rows 4–5 sit after `reasoning-text` because the hook only ever remaps
-`local-general`: a reasoning turn stays reasoning.
+- **Privacy forces.** A PII word wins over every other vote, and
+  `local-private` has no Claude deployment. The match is lexical: a PII
+  prompt that names none of the words lands on another chain and can
+  overflow to Claude. Widen `patterns/privacy.yaml` rather than trusting it.
+- **Rows 4–5 come after `reasoning-text`**, so a turn that asks for a proof
+  stays on `local-reasoning` in a chat that has been coding; only an
+  otherwise `local-general` turn is held on `local-code`.
+- **Offered tools never count**, only called ones: a chat with the sandbox
+  attached but unused is not a coding chat.
+- **The cooldown is stateless.** Build a calculator, then ask three weather
+  questions: they stay on `local-code`, and the fourth drops to
+  `local-general`. Any coding exchange resets it.
 
-Until phase 3 deletes the sources, two tests keep this ruleset a copy of them:
-- **`test_drift.py`:**
-  - the pattern files equal the router's rules (keywords, operator,
-    case_sensitive, method);
-  - the tool regex and cooldown equal `ai/litellm/hooks/settings.py`'s
-    `CODE_ROUTE_*` defaults, read in a subprocess with those variables unset;
-  - the wiring mirrors the router's priorities.
-- **`test_parity.py`:** runs the ruleset and a reference built from the real
-  sources on ~20 conversation shapes. The reference is the router's
-  `decisions` compiled with `common.keywordmatch`, plus the hook's
-  `code_route_decision`.
+**The pattern files are the only copy of the rules.** Phase 2 kept them equal
+to the semantic router's keyword signals; phase 3 retired the router and its
+config, so nothing else holds them. `test_default_ruleset.py` checks that:
+- every `patterns/*.yaml` is a valid rule, and every `method: regex` keyword
+  stays in the RE2 subset (no lookaround, backreferences, atomic or
+  possessive groups, `\Z`). `common.keywordmatch` gives Go RE2's semantics
+  (ASCII `\b` / `\w`), but Python's `re` accepts more, so this check is what
+  keeps the patterns portable;
+- the real "Scientific Calculator" chat prompts match `code_kw` (or don't);
+- the wiring and the routes on ~20 conversation shapes are as listed above.
 
-**When one fails, change both sides and bump `version`.**
+Changing any of it is a ruleset change: update the expected values and bump
+`version` ([§ Rulesets](#rulesets)).
 
 ## Decision log and Trino
 
@@ -428,17 +563,29 @@ lock:
 (`ai/trino/catalogs/postgres_route_policy.properties`): `route-policy-db:5432`
 by service DNS, through the read-only `trino_reader` role.
 
-The phase-2 success query:
+**Agreement:** did the chain the engine chose actually serve the turn? In
+phase 2 this compared the shadow decision with the semantic router; under
+`enforce` it measures LiteLLM's fallbacks:
 
 ```sql
-SELECT d.chosen_route = o.served_model_group AS agree, count(*)
+SELECT d.applied, d.chosen_route = o.served_model_group AS agree, count(*)
 FROM postgres_route_policy.public.decisions d
 JOIN postgres_route_policy.public.outcomes o USING (decision_id)
-GROUP BY 1;
+WHERE d.mode = 'enforce'
+GROUP BY 1, 2;
 ```
 
-Disagreements are expected only where the engine and today's path differ by
-design. Overflow to Claude does not count: `served_model_group` is the chain.
+`applied = true, agree = false` means the hook did not use the answer: the
+`/decide` came back too late (past `ROUTE_POLICY_DECIDE_TIMEOUT_S`) and the
+turn went to `local-private`. Those rows should be rare; LiteLLM logs each
+one as `[route-policy] … -> local-private (<why>)`. Overflow to Claude does
+not count: `served_model_group` is the chain, the deployment is
+`served_deployment`. An outcome with no decision row is a `/decide` that
+never arrived or was not logged.
+
+The comments inside `0001_initial.sql` still describe phase 2 (fire-and-
+forget calls, the shadow comparison). The file is immutable once applied,
+so they stay; this section is the current description.
 
 **Every message's votes, route, the deployment that answered, and its cost.**
 `LiteLLM_SpendLogs.request_id` is the provider's response id; `litellm_call_id`
@@ -485,11 +632,14 @@ Treat `ROUTE_POLICY_TRINO_READER_PASSWORD` as a real secret anyway.
 | `route_policy_invariant_overrides_total` | `invariant` (private / not_a_chain) | Decisions an invariant changed |
 | `route_policy_observations_total` | `status` (success / failure / other) | Outcomes stored |
 | `route_policy_duplicates_total` | `endpoint` | Repeated `decision_id`s |
-| `route_policy_errors_total` | `kind` (decision_write, outcome_write, binding_refresh, ruleset_compile, unbound_model) | Errors |
+| `route_policy_writes_deferred_total` | `write` (decision / outcome) | Writes that outlasted `ROUTE_POLICY_DECISION_WRITE_BUDGET_S`: answered at once, finished in the background |
+| `route_policy_writes_in_flight` | — | Decision / outcome writes started and not finished (cap 256) |
+| `route_policy_db_reads_cut_total` | `read` (binding_refresh / ruleset_fetch) | Reads on the `/decide` path that outlasted `DB_READ_BUDGET_S` |
+| `route_policy_errors_total` | `kind` (decision_write, decision_write_dropped, outcome_write, outcome_write_dropped, binding_refresh, ruleset_compile, unbound_model) | Errors |
 
 Plus the HTTP request metrics of prometheus-fastapi-instrumentator. Each
 `/decide` also logs one INFO line:
-`[decide] <id> auto -> local-code (code-tools: called … ; default@1 shadow) chat=<id>`.
+`[decide] <id> auto -> local-code (code-tools: called … ; default@2 enforce) chat=<id>`.
 
 ## Configuration
 
@@ -504,11 +654,19 @@ environment variables.
 | `ROUTE_POLICY_TRINO_READER_PASSWORD` | _(empty)_ | `trino_reader` password; empty skips the role (only the Trino catalog breaks) |
 | `ROUTE_POLICY_DB_POOL_MAX` | `10` | Pool ceiling |
 | `ROUTE_POLICY_BINDING_REFRESH_S` | `10` | Age at which `/decide` re-reads `bindings` |
+| `ROUTE_POLICY_DECISION_WRITE_BUDGET_S` | `0.05` | How long `/decide` / `/observe` wait for their row before answering anyway (floor 0; the write then finishes in the background). Keep it well below LiteLLM's 0.25 s `ROUTE_POLICY_DECIDE_TIMEOUT_S` |
+
+Constants in `route_policy/config.py`, not environment variables:
+`WRITES_MAX_IN_FLIGHT` (256 background writes), `WRITES_DRAIN_S` (5 s at
+shutdown), `DB_READ_BUDGET_S` (0.1 s for the binding refresh and a version
+fetch on the `/decide` path).
 
 `ROUTE_POLICY_DB_HOST` / `_PORT` are fixed in the compose file
-(`route-policy-db:5432`). The hook's own settings (`ROUTE_POLICY_URL`,
-`ROUTE_POLICY_ENABLED`, `ROUTE_POLICY_TIMEOUT_S`) belong to LiteLLM; see
-`ai/litellm/LITELLM.md`.
+(`route-policy-db:5432`). The hook's own settings belong to LiteLLM (see
+`ai/litellm/LITELLM.md`): `ROUTE_POLICY_URL`, `ROUTE_POLICY_ENABLED` (`false`
+or an empty URL sends every `auto` turn to `local-private`),
+`ROUTE_POLICY_DECIDE_TIMEOUT_S` (0.25, the awaited `/decide`) and
+`ROUTE_POLICY_TIMEOUT_S` (the background `/observe`).
 
 ## Operations
 
@@ -522,8 +680,13 @@ environment variables.
 - **Startup failed with `MigrationChanged`:** an applied migration file was
   edited. Restore it and add a new migration.
 - **`/ready` is 503 but `/health` is 200:** the database is unreachable. The
-  service keeps deciding from its cache; decisions in the gap are not logged
-  (`route_policy_errors_total{kind="decision_write"}`).
+  service keeps deciding from its cache, in time; decisions in the gap are
+  not logged (`route_policy_errors_total{kind="decision_write"}`, or
+  `decision_write_dropped` once 256 writes are stuck behind a hung
+  database).
+- **`route_policy_writes_deferred_total` climbing:** route-policy-db is slow
+  or the pool (`ROUTE_POLICY_DB_POOL_MAX`) is exhausted. Routing is
+  unaffected; the log falls behind, and past 256 pending writes it drops.
 - **Retrofit or rotate the Trino role:**
   1. Edit `ROUTE_POLICY_TRINO_READER_PASSWORD`.
   2. `make up route-policy route-policy-db`.
@@ -543,8 +706,19 @@ environment variables.
   - read decisions by chat id;
   - write decisions and outcomes.
 
-  That is the classifier's posture, accepted for a shadow log. Revisit it
-  before phase 3 makes `/decide` authoritative.
+  That is the classifier's posture, and `/decide` being authoritative does
+  not change what a caller can do with it: the hook makes a fresh uuid4 per
+  request, so nobody can pre-store a decision LiteLLM will read back, and the
+  hook's own invariants cap any answer at the four chain aliases, never off
+  `local-private`. **What is now routing control is the database:** a row in
+  `bindings` (re-read every `ROUTE_POLICY_BINDING_REFRESH_S`) or a new
+  `rulesets` version decides every `auto` turn, including whether PII
+  reaches a Claude-capable chain. Override the dev-default
+  `ROUTE_POLICY_DB_PASSWORD` and keep `PORT_ROUTE_POLICY_DB` off untrusted
+  networks.
+- **Route-policy down:** every `auto` turn goes to `local-private` (counted
+  and logged by LiteLLM's hook) until a copy answers again. A swap never
+  causes that: the old copy serves until the new one is healthy.
 
 ## Code layout
 
@@ -585,13 +759,13 @@ TEST_POSTGRES_DSN=postgresql://postgres@localhost:55441/postgres \
 
 | Module | Covers |
 |---|---|
-| `test_evaluators.py` | Each evaluator. The cooldown runs against the hook's `code_route_decision` on the same histories. |
+| `test_evaluators.py` | Each evaluator. The cooldown's verdicts and reasons are pinned on a table of histories. |
 | `test_declarations.py` | Every real evaluator's `detail` against its declaration |
 | `test_combiners.py`, `test_invariants.py`, `test_pipeline.py` | The frame, both combiners, the invariants, the contract shapes, error handling |
 | `test_rulesets.py` | Files, refs (no path escape), validation, content hash, seed bindings, the cache |
-| `test_drift.py`, `test_parity.py` | The `default` ruleset against the router config and the hook |
+| `test_default_ruleset.py` | The pattern files (valid rules, every regex in the RE2 subset, the real-chat prompts `code_kw` must and must not match), the ruleset's wiring, and its routes on ~20 conversation shapes |
 | `test_api.py` | Every endpoint with no database: contract, validation, decisions still answered with the DB down |
-| `test_db.py` (`postgres`) | Startup, seeding, immutability, migrations, idempotent `/decide` / `/observe` in either order, the view, the reads |
+| `test_db.py` (`postgres`) | Startup, seeding, immutability, migrations, the phase-2 → phase-3 upgrade (`default@1` stays readable once no longer baked in), idempotent `/decide` / `/observe` in either order, the view, the reads |
 | `test_wiring.py` | Postman coverage, compose classes, Trino env, pass-through, Makefile, Dockerfile, line endings |
 
 - **The `postgres` tests** need `TEST_POSTGRES_DSN`: an admin connection on

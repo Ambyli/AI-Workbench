@@ -19,8 +19,8 @@ Config:
                  all: every watched backend must qualify
 
 Abstains when no snapshot key matches -- an empty snapshot (the hook could
-not see) is never evidence of load. The default ruleset does not use it:
-today's routing is not load-aware.
+not see) is never evidence of load. The `default` ruleset does not use it:
+capacity is the overflow layer's job inside each chain.
 """
 
 from __future__ import annotations

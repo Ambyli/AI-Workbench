@@ -1,8 +1,11 @@
 # Route policy -- rulesets of evaluators pick the LiteLLM chain alias for each
-# `auto` turn, and every decision is logged. Phase 2 of ROUTE_POLICY_PLAN:
-# SHADOW mode -- LiteLLM's hook (ai/litellm/hooks/routing/) calls /decide and
-# /observe without waiting and applies nothing; the semantic router still
-# routes. Operator guide: ai/route-policy/ROUTE_POLICY.md.
+# `auto` turn, and every decision is logged. Phase 3 of ROUTE_POLICY_PLAN:
+# the `default` ruleset ENFORCES -- LiteLLM's pre-call hook
+# (ai/litellm/hooks/routing/) awaits /decide on every `auto` request (within
+# ROUTE_POLICY_DECIDE_TIMEOUT_S, 0.25 s) and serves the returned chain in the
+# same pass; a timeout, an error or `apply: false` sends the turn to
+# local-private. /observe is still fired after the call, not awaited.
+# Operator guide: ai/route-policy/ROUTE_POLICY.md.
 #
 #   route-policy      FastAPI on :8000 (ai_shared). LiteLLM reaches it as
 #                     http://route-policy:8000; LAN clients through ai/edge on
@@ -31,7 +34,9 @@ services:
   #
   # Recreated (with downtime) by `make up`: a data directory can have only
   # one Postgres. route-policy keeps deciding from its cached rulesets
-  # meanwhile; only the decisions made during the gap go unlogged.
+  # meanwhile; only the decisions made during the gap go unlogged. A /decide
+  # never waits on it for long, refused or hung: the write gets
+  # ROUTE_POLICY_DECISION_WRITE_BUDGET_S, then finishes in the background.
   route-policy-db:
     image: postgres:17-alpine
     container_name: route-policy-db
@@ -69,6 +74,8 @@ services:
   # Startup needs route-policy-db (migrations + seeding); a copy that cannot
   # reach it, or whose baked-in ruleset changed without a version bump,
   # exits with the reason in its log and the old copy keeps serving.
+  # Every `auto` turn waits on this service: while no copy answers (no
+  # healthy copy at all, not a swap), `auto` is served by local-private.
   route-policy:
     build:
       context: ../..
@@ -100,6 +107,10 @@ services:
       # (rulesets/*.yaml, seeded into route-policy-db), never here.
       - ROUTE_POLICY_DB_POOL_MAX=${ROUTE_POLICY_DB_POOL_MAX:-10}
       - ROUTE_POLICY_BINDING_REFRESH_S=${ROUTE_POLICY_BINDING_REFRESH_S:-10}
+      # How long /decide (and /observe) waits for its row before answering
+      # anyway; the write then finishes in the background. LiteLLM waits
+      # 0.25 s for the whole /decide, so keep this well below that.
+      - ROUTE_POLICY_DECISION_WRITE_BUDGET_S=${ROUTE_POLICY_DECISION_WRITE_BUDGET_S:-0.05}
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 10s

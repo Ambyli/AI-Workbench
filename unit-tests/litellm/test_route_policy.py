@@ -1,22 +1,30 @@
-"""Unit tests for the route-policy client in shadow mode --
+"""Unit tests for the route-policy client, single pass --
 ai/litellm/hooks/routing/policy_client.py, driven through hooks.handler.Handler.
 
-On every `auto` request the pre-call hook FIRES ``POST /decide`` (never
-awaited) and stashes the decision id in ``data["metadata"]``; the success,
-streaming-iterator and failure hooks read it back and fire ``POST /observe``.
-Nothing changes routing, nothing raises, nothing waits.
+On every `auto` request the pre-call hook AWAITS ``POST /decide`` (bounded by
+ROUTE_POLICY_DECIDE_TIMEOUT_S), rewrites ``data["model"]`` to the chain the
+engine chose when the answer says ``apply: true`` and the hook's own
+invariants allow it -- and to ``local-private`` in every other case -- and
+stashes what happened in ``data["metadata"]``. The success,
+streaming-iterator and failure hooks read the stash and fire ``POST
+/observe`` in the background. Requests for any other model are never touched.
 
-* Pure helpers (always run): header ids, tool-call names, the backend report.
-* The hooks with a fake transport (always run): the exact /decide and
-  /observe bodies for non-streaming, streaming and failed `auto` calls, the
-  decision-id round trip, exactly-once, nothing for other models or when
-  disabled, hook latency with a hung or failing service, the in-flight cap,
-  never-raises. Most of these need litellm's response types.
+* Pure helpers (always run): header ids, tool-call names, response outcomes
+  (OpenAI and Anthropic), reply parsing, the backend report.
+* The hooks with a fake transport (always run): the exact /decide body and
+  the rewrite, every fallback reason (timeout, transport error, non-2xx, bad
+  JSON, another decision's id, apply false, a route that is not a chain, the
+  client off, no messages), the exact /observe bodies for non-streaming,
+  streaming and failed calls, exactly-once, hook latency against a hung
+  service, the /observe in-flight cap, never-raises. Most of these need
+  litellm's response types.
 * The real HTTP client: httpx.MockTransport (timeouts, 5xx, the wire format)
   and a stdlib HTTP server.
-* The proxy plumbing (skipped unless litellm[proxy]==1.95.0): ProxyLogging
-  really dispatches all four paths to Handler and the stash survives them;
-  the openai provider never forwards the stash upstream.
+* Against real LiteLLM: a Router with this repo's `auto` alias serves the
+  chain the hook chose, and the openai provider never forwards the stash
+  upstream. The proxy plumbing (skipped unless litellm[proxy]==1.95.0):
+  ProxyLogging really dispatches every path to Handler -- /v1/messages
+  (anthropic_messages) included -- and the stash survives them.
 * Repo invariants: the defaults agree across settings.py, the compose file
   and .env.example.
 
@@ -28,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import logging
 import pathlib
 import re
 import statistics
@@ -41,13 +50,17 @@ import pytest
 
 from hooks.footer.render import footer_text
 from hooks.handler import Handler
+from hooks.log import logger
 from hooks.overflow.state import STALE
 from hooks.overflow.vllm import metrics_url
 from hooks.routing.policy_client import (
     DISCONNECTED,
     STASH_KEY,
     HttpxPost,
+    parse_decision,
     request_ids,
+    response_outcome,
+    split_reply,
     stash_of,
     tool_call_names,
 )
@@ -60,7 +73,7 @@ ENV_EXAMPLE = _ROOT / ".env.example"
 QWEN = "http://qwen3.8-solo:8000/v1"
 MUSE = "http://muse-glimmer:8000/v1"
 SERVICE = "http://route-policy:8000"
-FOOTER_GENERAL = footer_text("qwen3.8-solo · local-general")
+CHAINS = ("local-general", "local-code", "local-reasoning", "local-private")
 
 try:
     import litellm
@@ -97,24 +110,36 @@ needs_yaml = pytest.mark.skipif(yaml is None, reason="needs PyYAML")
 
 # ── fakes ──────────────────────────────────────────────────────────────────
 class Recorder:
-    """A fake Post: records (url, decoded JSON body) and answers `status`."""
+    """A fake Post standing in for the route-policy service: records (url,
+    decoded JSON body); /decide answers a decision for `route` / `apply`
+    (or `raw` bytes, or `status`), /observe answers `observe_status`. Paths
+    in `hang` never answer; `exc` is raised for the paths in `exc_paths`."""
 
-    def __init__(self, status=200, hang=False, exc=None):
-        self.status = status
-        self.hang = hang
-        self.exc = exc
+    def __init__(self, route="local-code", apply=True, mode="enforce", status=200, raw=None, hang=(), exc=None,
+                 exc_paths=("decide", "observe"), observe_status=202):
+        self.route, self.apply, self.mode, self.status, self.raw = route, apply, mode, status, raw
+        self.hang, self.exc, self.exc_paths, self.observe_status = set(hang), exc, set(exc_paths), observe_status
         self.calls = []
 
     async def __call__(self, url, body):
-        self.calls.append((url, json.loads(body.decode("utf-8"))))
-        if self.hang:
+        doc = json.loads(body.decode("utf-8"))
+        self.calls.append((url, doc))
+        path = url.rsplit("/", 1)[-1]
+        if path in self.hang:
             await asyncio.sleep(3600)
-        if self.exc is not None:
+        if self.exc is not None and path in self.exc_paths:
             raise self.exc
-        return self.status
+        if path == "observe":
+            return self.observe_status, b""
+        if self.raw is not None:
+            return self.status, self.raw
+        answer = {"decision_id": doc["decision_id"], "route": self.route, "mode": self.mode, "apply": self.apply,
+                  "ruleset": {"id": "default", "version": 2}, "votes": [], "scores": {self.route: 1.0},
+                  "latency_ms": 0.3}
+        return self.status, json.dumps(answer).encode()
 
     def bodies(self, path):
-        return [b for u, b in self.calls if u == SERVICE + path]
+        return [b for u, b in self.calls if u.endswith(path)]
 
 
 class Clock:
@@ -128,22 +153,7 @@ class Clock:
         self.t += dt
 
 
-INNER = {
-    "id-gen-qwen": {"model_name": "local-general", "litellm_params": {"model": "openai/qwen3.8-solo", "api_base": QWEN}},
-    "id-gen-claude": {"model_name": "local-general", "litellm_params": {"model": "anthropic/claude-sonnet-5"}},
-    "id-code-muse": {"model_name": "local-code", "litellm_params": {"model": "openai/muse-glimmer", "api_base": MUSE}},
-}
-
-
-class FakeRouter:
-    def get_deployment(self, model_id):
-        return copy.deepcopy(INNER.get(model_id))
-
-    def get_model_list(self, model_name=None, team_id=None):
-        return [copy.deepcopy(d) for d in INNER.values() if d["model_name"] == model_name]
-
-
-def make_handler(post=None, enabled=True, clock=None, pages=None, router=FakeRouter(), **kw) -> Handler:
+def make_handler(post=None, enabled=True, clock=None, pages=None, **kw) -> Handler:
     pages = pages if pages is not None else {}
 
     async def fetch(url):
@@ -156,8 +166,9 @@ def make_handler(post=None, enabled=True, clock=None, pages=None, router=FakeRou
 
     return Handler(fetch=fetch, clock=clock or Clock(), busy_after=2.0, idle_after=5.0, poll_interval=1.0,
                    probe_timeout=0.5, start_poller=False, auto_footer=kw.pop("auto_footer", True),
-                   router_getter=lambda: router, route_policy=enabled, route_policy_url=kw.pop("url", SERVICE),
+                   route_policy=enabled, route_policy_url=kw.pop("url", SERVICE),
                    route_policy_timeout=kw.pop("timeout", 1.0),
+                   route_policy_decide_timeout=kw.pop("decide_timeout", 0.5),
                    policy_post=post if post is not None else Recorder(), **kw)
 
 
@@ -170,7 +181,6 @@ OWUI_HEADERS = {
     "x-openwebui-user-id": "user-7",
     "x-openwebui-user-name": "Amber",
 }
-AUTO_DEPLOYMENT = {"model_name": "auto", "litellm_params": {"model": "openai/vllm-sr/auto"}, "model_info": {"id": "id-auto"}}
 KEY = types.SimpleNamespace(key_alias="open-webui")
 TOOLS = [{"type": "function", "function": {"name": "sandbox-mcp_exec", "parameters": {"type": "object"}}}]
 
@@ -190,14 +200,9 @@ def proxy_data(model="auto", stream=False, messages=None, headers=None, tools=No
     return data
 
 
-def routed_headers(model_id="id-gen-qwen", group="local-general", name="openai/qwen3.8-solo"):
-    return {
-        "x-litellm-model-group": "auto",
-        "llm_provider-x-vsr-selected-model": group,
-        "llm_provider-x-litellm-model-id": model_id,
-        "llm_provider-x-litellm-model-name": name,
-        "llm_provider-x-litellm-model-group": group,
-    }
+def deployment(chain="local-code", model="openai/muse-glimmer"):
+    """data["deployment"] as the proxy stores it after the call (1707)."""
+    return {"model_name": chain, "litellm_params": {"model": model}, "model_info": {"id": f"id-{chain}"}}
 
 
 def general_chain():
@@ -213,7 +218,7 @@ def metrics(waiting, running=1):
 
 
 async def prime_backends(h, pages, clock, qwen, muse):
-    """Teach the poller the chain's backends (what an inner request does) and poll twice."""
+    """Teach the poller the chain's backends (what serving a request does) and poll twice."""
     h.overflow.filter_deployments("local-general", general_chain())
     pages[metrics_url(QWEN)] = qwen
     pages[metrics_url(MUSE)] = muse
@@ -223,7 +228,7 @@ async def prime_backends(h, pages, clock, qwen, muse):
 
 
 async def drain(h):
-    """Let every background call the client started finish."""
+    """Let every background /observe the client started finish."""
     for _ in range(5):
         tasks = list(h.policy._tasks)
         if not tasks:
@@ -265,6 +270,106 @@ def test_tool_call_names_message_delta_and_legacy():
     assert tool_call_names({"tool_calls": "garbage"}) == []
 
 
+def test_response_outcome_openai_and_anthropic():
+    openai = {"choices": [{"index": 1, "finish_reason": "length", "message": {"content": "x"}},
+                          {"index": 0, "finish_reason": "tool_calls",
+                           "message": {"tool_calls": [{"function": {"name": "run_command"}}]}}]}
+    assert response_outcome(openai) == ("tool_calls", ["run_command"])
+    anthropic = {"id": "msg_1", "type": "message", "stop_reason": "tool_use", "content": [
+        {"type": "text", "text": "let me"}, {"type": "tool_use", "id": "t", "name": "sandbox-mcp_exec", "input": {}}]}
+    assert response_outcome(anthropic) == ("tool_use", ["sandbox-mcp_exec"])
+    assert response_outcome(None) == (None, []) and response_outcome(object()) == (None, [])
+
+
+def test_split_reply_and_parse_decision():
+    assert split_reply((200, b"{}")) == (200, b"{}")
+    assert split_reply(204) == (204, b"")
+    assert split_reply((500, None)) == (500, b"")
+    assert parse_decision(b'{"route": "local-code"}') == {"route": "local-code"}
+    for raw in (b"not json", b"[1, 2]", b"", b"null", None, b'"local-code"'):
+        assert parse_decision(raw) is None, raw
+
+
+B64 = "iVBORw0KGgo" + "A" * 3_000_000  # ~3 MB of base64
+
+
+def image_conversation():
+    """Every shape of inline payload a /decide may meet, next to text and tool calls."""
+    return [
+        {"role": "system", "content": "be brief"},
+        {"role": "user", "content": [
+            {"type": "text", "text": "what is in this picture? data:image/png;base64," + "x" * 300},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + B64, "detail": "high"}},
+            {"type": "image_url", "image_url": "data:image/jpeg;base64," + B64},
+            {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}},
+            {"type": "input_image", "image_url": "data:image/webp;base64," + B64},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": B64}},
+            {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": B64}},
+            {"type": "input_audio", "input_audio": {"data": B64, "format": "wav"}},
+            {"type": "file", "file": {"filename": "a.pdf", "file_data": "data:application/pdf;base64," + B64}},
+        ]},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "t1", "type": "function", "function": {"name": "sandbox-mcp_exec", "arguments": '{"cmd": "ls"}'}}]},
+        {"role": "tool", "tool_call_id": "t1", "content": "a.txt"},
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "tu", "name": "run_command",
+                                           "input": {"blob": "data:image/png;base64," + "y" * 500}}]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "tu", "content": [
+                {"type": "text", "text": "the screenshot:"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": B64}}]},
+            {"type": "text", "text": "Looks the same"}]},
+    ]
+
+
+def test_decide_body_drops_inline_payloads_and_keeps_the_rest():
+    async def go():
+        post = Recorder()
+        h = make_handler(post)
+        data = proxy_data(messages=image_conversation(), tools=TOOLS)
+        original = copy.deepcopy(data["messages"])
+        assert len(json.dumps(original)) > 20_000_000
+        await h.async_pre_call_hook(KEY, None, data, "acompletion")
+        return data, original, post
+
+    data, original, post = run(go())
+    assert data["model"] == "local-code"
+    assert data["messages"] == original  # the request itself is untouched
+    raw_size = len(json.dumps(post.calls[0][1]))
+    assert raw_size < 5_000, raw_size  # was > 20 MB
+    sent = post.bodies("/decide")[0]["messages"]
+    parts = sent[1]["content"]
+    # Every part keeps its type (and its other keys); only the payload is gone.
+    assert [p["type"] for p in parts] == [p["type"] for p in original[1]["content"]]
+    assert parts[0] == original[1]["content"][0]  # text is verbatim, data: URI and all
+    assert parts[1]["image_url"] == {"url": "data:image/png;base64,[omitted: 3000033 chars]", "detail": "high"}
+    assert parts[2]["image_url"] == "data:image/jpeg;base64,[omitted: 3000034 chars]"
+    assert parts[3] == original[1]["content"][3]  # a plain URL is no payload
+    assert parts[4]["image_url"].startswith("data:image/webp;base64,[omitted: ")
+    assert parts[5]["source"] == {"type": "base64", "media_type": "image/png", "data": "[omitted: 3000011 chars]"}
+    assert parts[6]["source"]["media_type"] == "application/pdf" and parts[6]["source"]["data"].startswith("[omitted")
+    assert parts[7]["input_audio"] == {"data": "[omitted: 3000011 chars]", "format": "wav"}
+    assert parts[8]["file"]["filename"] == "a.pdf"
+    assert parts[8]["file"]["file_data"].startswith("data:application/pdf;base64,[omitted: ")
+    # Tool calls, tool results' text, the latest user text: verbatim.
+    assert sent[0] == original[0] and sent[2] == original[2] and sent[3] == original[3]
+    assert sent[4] == original[4]  # a tool_use block is a tool call: never touched
+    nested = sent[5]["content"][0]["content"]
+    assert nested[0] == {"type": "text", "text": "the screenshot:"}
+    assert nested[1]["type"] == "image" and nested[1]["source"]["data"].startswith("[omitted")
+    assert sent[5]["content"][1] == {"type": "text", "text": "Looks the same"}
+
+
+def test_a_conversation_without_payloads_is_sent_as_is():
+    messages = [{"role": "user", "content": [{"type": "text", "text": "hi"}]},
+                {"role": "user", "content": "data:image/png;base64," + "z" * 500}]  # a string content is text
+    from hooks.routing.policy_client import slim_messages
+
+    out = slim_messages(messages)
+    assert out == messages and all(a is b for a, b in zip(out, messages))
+    small = [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:,x"}}]}]
+    assert slim_messages(small)[0] is small[0]  # too short to be a payload
+
+
 def test_backend_report_splits_stale_from_unknown():
     async def go():
         clock, pages = Clock(), {}
@@ -284,10 +389,13 @@ def test_backend_report_splits_stale_from_unknown():
     run(go())
 
 
-# ── /decide ────────────────────────────────────────────────────────────────
-def test_decide_body_exact_and_fired_in_the_background():
+# ── /decide and the rewrite ────────────────────────────────────────────────
+FOOTER_GENERAL = footer_text("qwen3.8-solo · local-general")
+
+
+def test_decide_is_awaited_and_its_route_applied():
     async def go():
-        clock, pages, post = Clock(), {}, Recorder()
+        clock, pages, post = Clock(), {}, Recorder(route="local-code")
         h = make_handler(post, clock=clock, pages=pages)
         await prime_backends(h, pages, clock, metrics(0, 2), metrics(3))
         messages = [
@@ -298,13 +406,12 @@ def test_decide_body_exact_and_fired_in_the_background():
         ]
         data = proxy_data(messages=messages, tools=TOOLS)
         out = await h.async_pre_call_hook(KEY, None, data, "acompletion")
-        assert out is data  # the footer strip changed it; the stash alone would not return it
-        stash = data["metadata"][STASH_KEY]
-        assert post.calls == []  # fired, not awaited: nothing has run yet
-        assert h.policy.in_flight == 1
-        await drain(h)
+        assert out is data
+        # Awaited: the answer is in before the hook returned, and applied.
         [body] = post.bodies("/decide")
-        assert is_uuid4(body["decision_id"]) and body["decision_id"] == stash["decision_id"]
+        assert data["model"] == "local-code"
+        stash = data["metadata"][STASH_KEY]
+        assert is_uuid4(body["decision_id"])
         assert body == {
             "decision_id": stash["decision_id"],
             "requested_model": "auto",
@@ -323,24 +430,23 @@ def test_decide_body_exact_and_fired_in_the_background():
             "backends": {QWEN: {"verdict": "ok", "waiting": 0.0, "running": 2.0},
                          MUSE: {"verdict": "busy", "waiting": 3.0, "running": 1.0}},
         }
-        assert stash == {"decision_id": body["decision_id"], "litellm_call_id": "call-1", "observed": False}
-        assert data["model"] == "auto"  # routing untouched
-        assert h.stats["route_policy_decides"] == 1 and h.stats["route_policy_errors"] == 0
+        assert stash == {"requested_model": "auto", "route": "local-code", "source": "engine",
+                         "decision_id": body["decision_id"], "litellm_call_id": "call-1", "observed": False}
+        assert h.policy.in_flight == 0  # nothing left running in the background
+        stats = h.stats
+        assert (stats["route_policy_decides"], stats["route_policy_applied"], stats["route_policy_fallbacks"],
+                stats["route_policy_errors"]) == (1, 1, 0, 0)
 
     run(go())
 
 
-def test_decide_snapshot_is_taken_in_the_hook():
-    """A key replaced in a message after the hook returned does not change what was sent."""
+@pytest.mark.parametrize("route", CHAINS)
+def test_every_chain_route_is_applied(route):
     async def go():
-        post = Recorder()
-        h = make_handler(post)
-        data = proxy_data(messages=[{"role": "user", "content": "original"}])
-        assert await h.async_pre_call_hook(KEY, None, data, "acompletion") is None  # stash only
-        data["messages"][0]["content"] = "rewritten later"
-        data["messages"].append({"role": "assistant", "content": "x"})
-        await drain(h)
-        assert post.bodies("/decide")[0]["messages"] == [{"role": "user", "content": "original"}]
+        h = make_handler(Recorder(route=route))
+        data = proxy_data()
+        await h.async_pre_call_hook(KEY, None, data, "acompletion")
+        assert data["model"] == route and stash_of(data)["source"] == "engine"
 
     run(go())
 
@@ -351,13 +457,13 @@ def test_decide_minimal_request_sends_nulls():
         h = make_handler(post)
         data = {"model": "auto", "messages": [{"role": "user", "content": "hi"}]}  # no metadata, ids or key
         await h.async_pre_call_hook(None, None, data, "acompletion")
-        await drain(h)
         body = post.bodies("/decide")[0]
         assert {k: body[k] for k in ("litellm_call_id", "chat_id", "message_id", "user_id", "key_alias", "tools")} == {
             "litellm_call_id": None, "chat_id": None, "message_id": None, "user_id": None,
             "key_alias": None, "tools": None}
         assert body["backends"] == {}  # nothing learnt yet (a fresh proxy)
         assert data["metadata"][STASH_KEY]["decision_id"] == body["decision_id"]
+        assert data["model"] == "local-code"
 
     run(go())
 
@@ -367,9 +473,9 @@ def test_a_client_sent_stash_is_replaced():
         post = Recorder()
         h = make_handler(post)
         data = proxy_data()
-        data["metadata"][STASH_KEY] = {"decision_id": "client-chosen", "observed": True}
+        data["metadata"][STASH_KEY] = {"requested_model": "auto", "route": "claude-sonnet-5", "source": "engine",
+                                       "decision_id": "client-chosen", "observed": True}
         await h.async_pre_call_hook(KEY, None, data, "acompletion")
-        await drain(h)
         decided = post.bodies("/decide")[0]["decision_id"]
         assert decided != "client-chosen" and data["metadata"][STASH_KEY]["decision_id"] == decided
         assert data["metadata"][STASH_KEY]["observed"] is False
@@ -383,11 +489,13 @@ def test_nothing_for_other_models(model):
         post = Recorder()
         h = make_handler(post)
         data = proxy_data(model=model)
+        data["metadata"][STASH_KEY] = {"requested_model": "auto", "route": model, "source": "engine",
+                                       "decision_id": "forged", "observed": False}
         before = copy.deepcopy(data)
-        await h.async_pre_call_hook(KEY, None, data, "acompletion")
-        if model == "local-general":
-            before["model"] = data["model"]  # the code remap may act; it is not ours
+        assert await h.async_pre_call_hook(KEY, None, data, "acompletion") is None
+        del before["metadata"][STASH_KEY]  # a stash the body carried is dropped -- the only edit
         assert data == before and stash_of(data) is None
+        await h.async_post_call_success_hook(data, KEY, None)
         await h.async_post_call_failure_hook(data, RuntimeError("x"), KEY)
         await drain(h)
         assert post.calls == [] and h.policy.in_flight == 0
@@ -396,54 +504,253 @@ def test_nothing_for_other_models(model):
 
 
 @pytest.mark.parametrize("handler_kw", [{"enabled": False}, {"url": ""}, {"url": "   "}])
-def test_disabled_does_nothing_at_all(handler_kw):
+def test_client_off_routes_auto_to_local_private_without_calling(handler_kw):
     async def go():
         post = Recorder()
         h = make_handler(post, **handler_kw)
         assert h.policy.enabled is False
         data = proxy_data()
-        before = copy.deepcopy(data)
-        assert await h.async_pre_call_hook(KEY, None, data, "acompletion") is None
-        assert data == before  # not even a stash
-        # A stash that arrived from elsewhere is ignored too.
-        data["metadata"][STASH_KEY] = {"decision_id": "d", "observed": False}
+        assert await h.async_pre_call_hook(KEY, None, data, "acompletion") is data
+        assert data["model"] == "local-private"
+        assert data["metadata"][STASH_KEY] == {"requested_model": "auto", "route": "local-private",
+                                               "source": "fallback:disabled", "decision_id": None,
+                                               "litellm_call_id": "call-1", "observed": False}
+        # No decision was asked for, so none is observed.
         await h.async_post_call_failure_hook(data, RuntimeError("x"), KEY)
         assert h.policy.watch_stream(data, None) is None
         await drain(h)
         assert post.calls == [] and h.policy.in_flight == 0
-        assert h.state()["config"]["route_policy_enabled"] is False
+        state = h.state()
+        assert state["config"]["route_policy_enabled"] is False
+        assert state["route_policy_fallbacks_by_reason"] == {"disabled": 1}
+        assert state["stats"]["route_policy_fallbacks"] == 1 and state["stats"]["route_policy_errors"] == 0
 
     run(go())
 
 
-def test_non_chat_auto_request_is_not_decided():
+def test_the_stash_goes_in_the_proxys_own_metadata_dict():
+    """On /v1/messages (and /v1/responses, batches, files) the proxy keeps its
+    metadata -- the request headers -- in data["litellm_metadata"], because
+    `metadata` is a parameter of the request itself there. The ids are read
+    from, and the stash written to, that dict; the client's `metadata` is
+    left exactly as sent."""
+    async def go():
+        post = Recorder(route="local-code")
+        h = make_handler(post)
+        data = {"model": "auto", "max_tokens": 64, "messages": [{"role": "user", "content": "hi"}],
+                "metadata": {"user_id": "claude-code-user"},
+                "litellm_metadata": {"headers": dict(OWUI_HEADERS), "user_api_key_alias": "cc"},
+                "litellm_call_id": "call-m"}
+        await h.async_pre_call_hook(KEY, None, data, "anthropic_messages")
+        assert data["model"] == "local-code"
+        assert data["metadata"] == {"user_id": "claude-code-user"}
+        assert data["litellm_metadata"][STASH_KEY]["route"] == "local-code"
+        assert stash_of(data) is data["litellm_metadata"][STASH_KEY]
+        assert post.bodies("/decide")[0]["chat_id"] == "chat-9"
+        # A stash smuggled into either dict of a direct call is dropped.
+        direct = {"model": "local-general", "messages": [], "metadata": {STASH_KEY: {"requested_model": "auto",
+                                                                                     "route": "x"}},
+                  "litellm_metadata": {"headers": {}, STASH_KEY: {"requested_model": "auto", "route": "x"}}}
+        await h.async_pre_call_hook(KEY, None, direct, "anthropic_messages")
+        assert STASH_KEY not in direct["metadata"] and STASH_KEY not in direct["litellm_metadata"]
+
+    run(go())
+
+
+def test_non_chat_auto_request_goes_to_local_private_without_calling():
     async def go():
         post = Recorder()
         h = make_handler(post)
         data = {"model": "auto", "input": "hi", "metadata": {}}  # e.g. the responses API
-        await h.async_pre_call_hook(KEY, None, data, "aresponses")
+        assert await h.async_pre_call_hook(KEY, None, data, "aresponses") is data
+        assert data["model"] == "local-private"
+        assert data["metadata"][STASH_KEY]["source"] == "fallback:no-messages"
+        assert post.calls == []
+
+    run(go())
+
+
+ANOTHER_ID = str(uuid.uuid4())
+
+
+@pytest.mark.parametrize("post_kw,why,is_error", [
+    ({"hang": {"decide"}}, "timeout", True),
+    ({"exc": ConnectionError("refused")}, "error", True),
+    ({"status": 500}, "http-500", True),
+    ({"status": 404}, "http-404", True),
+    ({"status": 422}, "http-422", True),
+    ({"raw": b"not json"}, "bad-response", True),
+    ({"raw": b"[1, 2]"}, "bad-response", True),
+    ({"raw": json.dumps({"decision_id": ANOTHER_ID, "route": "local-code", "apply": True}).encode()},
+     "bad-response", True),
+    ({"apply": False, "mode": "shadow"}, "not-applied", False),
+    ({"apply": "true"}, "not-applied", False),
+    ({"apply": None}, "not-applied", False),
+    ({"route": "claude-sonnet-5"}, "not-a-chain", True),
+    ({"route": "auto"}, "not-a-chain", True),
+    ({"route": None}, "not-a-chain", True),
+    ({"route": 7}, "not-a-chain", True),
+], ids=lambda v: v if isinstance(v, str) else None)
+def test_every_fallback_goes_to_local_private_and_is_still_observed(post_kw, why, is_error):
+    async def go():
+        post = Recorder(exc_paths=("decide",), **post_kw)
+        h = make_handler(post, decide_timeout=0.1)
+        data = proxy_data()
+        assert await h.async_pre_call_hook(KEY, None, data, "acompletion") is data
+        assert data["model"] == "local-private"
+        stash = data["metadata"][STASH_KEY]
+        [decide] = post.bodies("/decide")
+        assert stash == {"requested_model": "auto", "route": "local-private", "source": f"fallback:{why}",
+                         "decision_id": decide["decision_id"], "litellm_call_id": "call-1", "observed": False}
+        assert h.state()["route_policy_fallbacks_by_reason"] == {why: 1}
+        assert h.stats["route_policy_fallbacks"] == 1 and h.stats["route_policy_applied"] == 0
+        assert h.stats["route_policy_errors"] == (1 if is_error else 0)
+        # The decision id still meets its outcome: local-private answered.
+        data["deployment"] = deployment("local-private", "openai/qwen3.8-solo")
+        await h.async_post_call_failure_hook(data, RuntimeError("x"), KEY) if why == "error" else None
+        if why != "error":
+            await h.async_post_call_success_hook(data, KEY, {"choices": []})
         await drain(h)
-        assert post.calls == [] and data == {"model": "auto", "input": "hi", "metadata": {}}
+        [observe] = post.bodies("/observe")
+        assert observe["decision_id"] == decide["decision_id"]
+        if why != "error":
+            assert (observe["served_model_group"], observe["served_deployment"]) == (
+                "local-private", "openai/qwen3.8-solo")
+
+    run(go())
+
+
+def test_a_hung_service_costs_at_most_the_decide_timeout():
+    async def go():
+        h = make_handler(Recorder(hang={"decide"}), decide_timeout=0.2)
+        data = proxy_data(messages=[{"role": "user", "content": f"m{i}"} for i in range(200)])
+        t0 = time.perf_counter()
+        await h.async_pre_call_hook(KEY, None, data, "acompletion")
+        elapsed = time.perf_counter() - t0
+        assert 0.15 <= elapsed < 0.6, elapsed
+        assert data["model"] == "local-private" and stash_of(data)["source"] == "fallback:timeout"
+
+    run(go())
+
+
+def test_hook_overhead_against_an_instant_service_is_small():
+    """Median pre-call time with the client on (an instant fake service) vs
+    off, on a 400-message chat: encoding the body and one await."""
+    async def timed(h):
+        samples = []
+        for _ in range(40):
+            data = proxy_data(messages=[{"role": "user" if i % 2 else "assistant", "content": "x" * 400}
+                                        for i in range(400)])
+            t0 = time.perf_counter()
+            await h.async_pre_call_hook(KEY, None, data, "acompletion")
+            samples.append(time.perf_counter() - t0)
+        return statistics.median(samples)
+
+    async def go():
+        return await timed(make_handler(Recorder(), enabled=False)), await timed(make_handler(Recorder()))
+
+    off, on = run(go())
+    # The fake also decodes the body (as the service would); still well inside the 0.25 s budget.
+    assert on - off < 0.05, (off, on)
+
+
+def test_log_lines_live_once_and_fallbacks_throttled():
+    lines = []
+
+    class ListHandler(logging.Handler):
+        def emit(self, record):
+            lines.append(record.getMessage())
+
+    lh = ListHandler()
+    logger.addHandler(lh)
+    try:
+        async def go():
+            ok = make_handler(Recorder(route="local-reasoning"))
+            for _ in range(3):
+                await ok.async_pre_call_hook(KEY, None, proxy_data(), "acompletion")
+            bad = make_handler(Recorder(status=500))
+            for _ in range(3):
+                await bad.async_pre_call_hook(KEY, None, proxy_data(), "acompletion")
+            assert bad.stats["route_policy_errors"] == 3 and bad.stats["route_policy_fallbacks"] == 3
+            shadow = make_handler(Recorder(apply=False, mode="shadow"))
+            await shadow.async_pre_call_hook(KEY, None, proxy_data(), "acompletion")
+
+        run(go())
+    finally:
+        logger.removeHandler(lh)
+    live = [ln for ln in lines if "single pass is live" in ln]
+    assert live == ["[route-policy] first decision applied: auto -> local-reasoning (ruleset default@2) "
+                    "-- single pass is live"]
+    fallbacks = [ln for ln in lines if "-> local-private" in ln]
+    assert fallbacks == [
+        "[route-policy] auto -> local-private (/decide answered HTTP 500)",
+        "[route-policy] auto -> local-private (/decide chose 'local-code' but apply=False "
+        "(ruleset default@2, mode 'shadow'))",
+    ]
+
+
+def test_never_raises():
+    class BadKey:
+        @property
+        def key_alias(self):
+            raise RuntimeError("bad key object")
+
+    async def go():
+        post = Recorder()
+        h = make_handler(post)
+        for data in (None, "string", {"model": "auto"}, {"model": "auto", "messages": "nope"}):
+            await h.async_pre_call_hook(KEY, None, data, "acompletion")  # no exception
+        weird_meta = {"model": "auto", "messages": [], "metadata": "not a dict"}
+        await h.async_pre_call_hook(KEY, None, weird_meta, "acompletion")
+        assert weird_meta["model"] == "local-code"  # routed; nowhere to stash it
+        # A bad key object: a bug in our code path -> the safe fallback, counted.
+        data = proxy_data()
+        assert await h.async_pre_call_hook(BadKey(), None, data, "acompletion") is data
+        assert data["model"] == "local-private" and stash_of(data)["source"] == "fallback:hook-error"
+        assert h.stats["route_policy_errors"] == 1
+        # Unserialisable message content: encoded with str(), still decided.
+        weird = proxy_data(messages=[{"role": "user", "content": object()}])
+        await h.async_pre_call_hook(KEY, None, weird, "acompletion")
+        assert weird["model"] == "local-code"
+        # The footer's derivation blowing up: the observe goes out with nulls.
+        good = proxy_data()
+        await h.async_pre_call_hook(KEY, None, good, "acompletion")
+
+        def boom(*_a, **_k):
+            raise RuntimeError("served bug")
+
+        h.policy._served = boom
+        assert await h.async_post_call_success_hook(good, KEY, None) is None
+        assert await h.async_post_call_success_hook(good, KEY, object()) is None
+        assert await h.async_post_call_failure_hook(None, RuntimeError("x"), KEY) is None
+        await drain(h)
+        [observe] = [o for o in post.bodies("/observe") if o["decision_id"] == good["metadata"][STASH_KEY]["decision_id"]]
+        assert observe["status"] == "success" and observe["served_model_group"] is None
+        # A transport that returns garbage: a fallback, not an exception.
+        h2 = make_handler(Recorder(status="weird"))
+        d2 = proxy_data()
+        await h2.async_pre_call_hook(KEY, None, d2, "acompletion")
+        assert d2["model"] == "local-private" and h2.stats["route_policy_errors"] == 1
 
     run(go())
 
 
 # ── /observe: non-streaming ────────────────────────────────────────────────
-def response(content="hello", headers=None, tool_calls=None, finish="stop", rid="chatcmpl-abc"):
+def response(content="hello", tool_calls=None, finish="stop", rid="chatcmpl-abc", group="local-code"):
     msg = {"role": "assistant", "content": content}
     if tool_calls:
         msg["tool_calls"] = [ChatCompletionMessageToolCall(id=f"t{i}", type="function",
                                                            function=Function(name=n, arguments="{}"))
                              for i, n in enumerate(tool_calls)]
     r = ModelResponse(id=rid, model="auto", choices=[Choices(index=0, message=Message(**msg), finish_reason=finish)])
-    r._hidden_params = {"additional_headers": dict(headers if headers is not None else routed_headers())}
+    r._hidden_params = {"additional_headers": {"x-litellm-model-group": group}}
     return r
 
 
-async def decided(h, **kw):
+async def decided(h, chain="local-code", model="openai/muse-glimmer", **kw):
     data = proxy_data(**kw)
     await h.async_pre_call_hook(KEY, None, data, "acompletion")
-    data["deployment"] = copy.deepcopy(AUTO_DEPLOYMENT)  # what the proxy sets after the call (1707)
+    data["deployment"] = deployment(chain, model)  # what the proxy sets after the call (1707)
     return data
 
 
@@ -454,15 +761,15 @@ def test_observe_non_streaming_exact_body():
         h = make_handler(post)
         data = await decided(h)
         out = await h.async_post_call_success_hook(data, KEY, response())
-        assert out.choices[0].message.content == "hello" + FOOTER_GENERAL  # the footer still works
+        assert out.choices[0].message.content == "hello" + footer_text("muse-glimmer · local-code")
         await drain(h)
         [decide], [observe] = post.bodies("/decide"), post.bodies("/observe")
         assert observe == {
             "decision_id": decide["decision_id"],
             "litellm_call_id": "call-1",
             "response_id": "chatcmpl-abc",
-            "served_model_group": "local-general",
-            "served_deployment": "openai/qwen3.8-solo",
+            "served_model_group": "local-code",
+            "served_deployment": "openai/muse-glimmer",
             "overflow_reason": None,
             "finish_reason": "stop",
             "tool_calls": [],
@@ -481,8 +788,7 @@ def test_observe_tool_calls_and_exactly_once():
         post = Recorder()
         h = make_handler(post)
         data = await decided(h)
-        resp = response(content=None, tool_calls=["sandbox-mcp_exec", "run_command"], finish="tool_calls",
-                        headers=routed_headers(model_id="id-code-muse", group="local-code", name="openai/muse-glimmer"))
+        resp = response(content=None, tool_calls=["sandbox-mcp_exec", "run_command"], finish="tool_calls")
         assert await h.async_post_call_success_hook(data, KEY, resp) is None  # no footer on a tool call
         await h.async_post_call_success_hook(data, KEY, resp)  # a second dispatch
         await h.async_post_call_failure_hook(data, RuntimeError("late"), KEY)  # and a failure after it
@@ -496,25 +802,36 @@ def test_observe_tool_calls_and_exactly_once():
 
 
 @needs_litellm
-def test_observe_claude_overflow_reason_and_router_bypass():
+def test_observe_claude_overflow_reason():
     async def go():
-        clock, pages, post = Clock(), {}, Recorder()
+        clock, pages, post = Clock(), {}, Recorder(route="local-general")
         h = make_handler(post, clock=clock, pages=pages)
         await prime_backends(h, pages, clock, metrics(3), metrics(3))
-        data = await decided(h)
-        await h.async_post_call_success_hook(data, KEY, response(
-            headers=routed_headers(model_id="id-gen-claude", name="anthropic/claude-sonnet-5")))
-        # Router down: `auto` fell back to local-private (outer deployment, no inner headers).
-        bypass = await decided(h)
-        bypass["deployment"] = {"model_name": "local-private", "litellm_params": {"model": "openai/qwen3.8-solo"}}
-        await h.async_post_call_success_hook(bypass, KEY, response(
-            headers={"x-litellm-model-group": "local-private", "llm_provider-content-type": "application/json"}))
+        data = await decided(h, "local-general", "anthropic/claude-sonnet-5")
+        out = await h.async_post_call_success_hook(data, KEY, response(group="local-general"))
+        assert out.choices[0].message.content.endswith("*claude-sonnet-5 · local-general · overflow (local busy)*")
         await drain(h)
-        claude, local = post.bodies("/observe")
-        assert (claude["served_model_group"], claude["served_deployment"], claude["overflow_reason"]) == (
+        [observe] = post.bodies("/observe")
+        assert (observe["served_model_group"], observe["served_deployment"], observe["overflow_reason"]) == (
             "local-general", "anthropic/claude-sonnet-5", "busy")
-        assert (local["served_model_group"], local["served_deployment"], local["overflow_reason"]) == (
-            "local-private", "openai/qwen3.8-solo", None)
+
+    run(go())
+
+
+def test_observe_anthropic_messages_response():
+    """/v1/messages: the response is an Anthropic message dict."""
+    async def go():
+        post = Recorder()
+        h = make_handler(post)
+        data = await decided(h, messages=[{"role": "user", "content": [{"type": "text", "text": "fix it"}]}])
+        resp = {"id": "msg_01", "type": "message", "role": "assistant", "model": "auto", "stop_reason": "tool_use",
+                "content": [{"type": "tool_use", "id": "toolu_1", "name": "sandbox-mcp_exec", "input": {}}]}
+        assert await h.async_post_call_success_hook(data, KEY, resp) is None  # no footer on this shape
+        await drain(h)
+        [observe] = post.bodies("/observe")
+        assert (observe["response_id"], observe["finish_reason"], observe["tool_calls"]) == (
+            "msg_01", "tool_use", ["sandbox-mcp_exec"])
+        assert observe["served_model_group"] == "local-code"
 
     run(go())
 
@@ -523,7 +840,8 @@ def test_observe_failure_exact_body_and_none_returned():
     async def go():
         post = Recorder()
         h = make_handler(post)
-        data = await decided(h)
+        data = proxy_data()
+        await h.async_pre_call_hook(KEY, None, data, "acompletion")  # no deployment: the call failed
         out = await h.async_post_call_failure_hook(request_data=data, original_exception=RuntimeError("boom"),
                                                    user_api_key_dict=KEY, traceback_str="tb")
         assert out is None  # never transforms the client's error
@@ -534,14 +852,13 @@ def test_observe_failure_exact_body_and_none_returned():
             "served_model_group": None, "served_deployment": None, "overflow_reason": None,
             "finish_reason": None, "tool_calls": [], "status": "failure", "error": "RuntimeError: boom",
         }
-        assert len(observe["error"]) <= 500
 
     run(go())
 
 
 # ── /observe: streaming ────────────────────────────────────────────────────
-def stream_chunks(texts=("hel", "lo"), tool=None, finish="stop", rid="chatcmpl-s1", headers=None):
-    hidden = {"additional_headers": dict(headers if headers is not None else routed_headers())}
+def stream_chunks(texts=("hel", "lo"), tool=None, finish="stop", rid="chatcmpl-s1", group="local-code"):
+    hidden = {"additional_headers": {"x-litellm-model-group": group}}
     out = [ModelResponseStream(id=rid, created=1, model="auto",
                                choices=[StreamingChoices(index=0, delta=Delta(content=t))]) for t in texts]
     if tool:
@@ -562,10 +879,10 @@ def stream_chunks(texts=("hel", "lo"), tool=None, finish="stop", rid="chatcmpl-s
 class Wrapper:
     """Stands in for CustomStreamWrapper: async-iterable with _hidden_params."""
 
-    def __init__(self, chunks, headers=None, fail_after=None):
+    def __init__(self, chunks, fail_after=None, group="local-code"):
         self._chunks = chunks
         self._fail_after = fail_after
-        self._hidden_params = {"additional_headers": dict(headers if headers is not None else routed_headers())}
+        self._hidden_params = {"additional_headers": {"x-litellm-model-group": group}}
 
     def __aiter__(self):
         return self._gen()
@@ -595,12 +912,12 @@ def test_observe_streaming_exact_body_and_the_stream_is_wrapped_once():
         chunks = stream_chunks()
         out = await collect(h, data, Wrapper(chunks))
         # Exactly what the footer alone produces: one extra footer chunk, nothing else.
-        assert len(out) == len(chunks) + 1 and joined(out) == "hello" + FOOTER_GENERAL
+        assert len(out) == len(chunks) + 1 and joined(out) == "hello" + footer_text("muse-glimmer · local-code")
         await drain(h)
         [decide], [observe] = post.bodies("/decide"), post.bodies("/observe")
         assert observe == {
             "decision_id": decide["decision_id"], "litellm_call_id": "call-1", "response_id": "chatcmpl-s1",
-            "served_model_group": "local-general", "served_deployment": "openai/qwen3.8-solo",
+            "served_model_group": "local-code", "served_deployment": "openai/muse-glimmer",
             "overflow_reason": None, "finish_reason": "stop", "tool_calls": [], "status": "success", "error": None,
         }
 
@@ -655,7 +972,7 @@ def test_stream_upstream_error_observes_failure_once():
         [observe] = post.bodies("/observe")
         assert observe["status"] == "failure" and observe["error"] == "ValueError: upstream died"
         assert observe["response_id"] == "chatcmpl-s1"  # the first chunk did arrive
-        assert observe["served_model_group"] == "local-general"
+        assert observe["served_model_group"] == "local-code"
 
     run(go())
 
@@ -683,7 +1000,8 @@ def test_stream_without_a_decision_is_not_watched():
     async def go():
         post = Recorder()
         h = make_handler(post)
-        data = proxy_data(model="local-general", stream=True)  # no stash
+        data = proxy_data(model="local-general", stream=True)  # a direct chain call: no stash
+        await h.async_pre_call_hook(KEY, None, data, "acompletion")
         chunks = stream_chunks()
         out = await collect(h, data, Wrapper(chunks))
         assert out == chunks and post.calls == []
@@ -691,63 +1009,15 @@ def test_stream_without_a_decision_is_not_watched():
     run(go())
 
 
-# ── latency, errors, the in-flight cap ─────────────────────────────────────
-@pytest.mark.parametrize("post", [Recorder(hang=True), Recorder(status=500), Recorder(exc=ConnectionError("refused"))],
-                         ids=["hangs", "500", "refused"])
-def test_hook_latency_is_unaffected_by_a_bad_service(post):
+def test_observe_in_flight_cap_drops_and_counts():
     async def go():
-        h = make_handler(post, timeout=0.2)
-        data = proxy_data(messages=[{"role": "user", "content": f"m{i}"} for i in range(200)])
-        t0 = time.perf_counter()
-        await h.async_pre_call_hook(KEY, None, data, "acompletion")
-        elapsed = time.perf_counter() - t0
-        task = next(iter(h.policy._tasks))
-        assert not task.done()  # returned before the call even started
-        assert elapsed < 0.05, elapsed
-        t0 = time.perf_counter()
-        await h.async_post_call_failure_hook(data, RuntimeError("x"), KEY)
-        assert time.perf_counter() - t0 < 0.05
-        await drain(h)
-        assert h.policy.in_flight == 0
-        assert h.stats["route_policy_errors"] == 2 and h.stats["route_policy_decides"] == 0
-
-    run(go())
-
-
-def test_hook_overhead_is_small_against_a_disabled_client():
-    """Median pre-call time with the client on vs off, on a 400-message chat:
-    the client adds a uuid, a shallow copy of the message list and a task."""
-    async def timed(h):
-        samples = []
-        for _ in range(60):
-            data = proxy_data(messages=[{"role": "user" if i % 2 else "assistant", "content": "x" * 400}
-                                        for i in range(400)])
-            t0 = time.perf_counter()
-            await h.async_pre_call_hook(KEY, None, data, "acompletion")
-            samples.append(time.perf_counter() - t0)
-            await drain(h)
-        return statistics.median(samples)
-
-    async def go():
-        off = await timed(make_handler(Recorder(), enabled=False))
-        on = await timed(make_handler(Recorder(hang=False)))
-        return off, on
-
-    off, on = run(go())
-    assert on - off < 0.005, (off, on)
-
-
-def test_in_flight_cap_drops_and_counts():
-    async def go():
-        post = Recorder(hang=True)
+        post = Recorder(hang={"observe"})
         h = make_handler(post, timeout=5.0, policy_max_in_flight=3)
         datas = [proxy_data() for _ in range(5)]
         for d in datas:
             await h.async_pre_call_hook(KEY, None, d, "acompletion")
-        assert h.policy.in_flight == 3 and h.stats["route_policy_dropped"] == 2
-        assert [stash_of(d) is not None for d in datas] == [True, True, True, False, False]
-        # A dropped decision is never observed.
-        for d in datas[3:]:
+        assert all(d["model"] == "local-code" for d in datas)  # /decide is awaited, never capped
+        for d in datas:
             await h.async_post_call_failure_hook(d, RuntimeError("x"), KEY)
         assert h.policy.in_flight == 3 and h.stats["route_policy_dropped"] == 2
         assert h.state()["route_policy_in_flight"] == 3
@@ -759,90 +1029,6 @@ def test_in_flight_cap_drops_and_counts():
     run(go())
 
 
-def test_log_lines_live_once_and_failures_throttled():
-    import logging
-
-    from hooks.log import logger
-
-    lines = []
-
-    class ListHandler(logging.Handler):
-        def emit(self, record):
-            lines.append(record.getMessage())
-
-    lh = ListHandler()
-    logger.addHandler(lh)
-    try:
-        async def go():
-            ok = make_handler(Recorder())
-            for _ in range(3):
-                await ok.async_pre_call_hook(KEY, None, proxy_data(), "acompletion")
-                await drain(ok)
-            bad = make_handler(Recorder(exc=ConnectionError("refused")))
-            for _ in range(3):
-                await bad.async_pre_call_hook(KEY, None, proxy_data(), "acompletion")
-                await drain(bad)
-            assert bad.stats["route_policy_errors"] == 3
-
-        run(go())
-    finally:
-        logger.removeHandler(lh)
-    live = [ln for ln in lines if "shadow mode is live" in ln]
-    assert live == ["[route-policy] first POST http://route-policy:8000/decide answered HTTP 200 -- shadow mode is live"]
-    failed = [ln for ln in lines if "failed" in ln]
-    assert failed == ["[route-policy] POST http://route-policy:8000/decide failed: ConnectionError: refused"]
-
-
-def test_decide_outside_an_event_loop_is_dropped_not_raised():
-    h = make_handler(Recorder())
-    data = proxy_data()
-    assert h.policy.decide(data, KEY) is False
-    assert stash_of(data) is None and h.stats["route_policy_dropped"] == 1
-
-
-def test_never_raises():
-    class BadKey:
-        @property
-        def key_alias(self):
-            raise RuntimeError("bad key object")
-
-    async def go():
-        post = Recorder()
-        h = make_handler(post)
-        for data in (None, "string", {"model": "auto"}, {"model": "auto", "messages": "nope"},
-                     {"model": "auto", "messages": [], "metadata": "not a dict"}):
-            assert await h.async_pre_call_hook(KEY, None, data, "acompletion") is None
-        # A bad key object: counted, request untouched apart from nothing.
-        data = proxy_data()
-        await h.async_pre_call_hook(BadKey(), None, data, "acompletion")
-        assert stash_of(data) is None and h.stats["route_policy_errors"] == 1
-        # Unserialisable message content: encoded with str(), still sent.
-        weird = proxy_data(messages=[{"role": "user", "content": object()}])
-        await h.async_pre_call_hook(KEY, None, weird, "acompletion")
-        # The footer's derivation blowing up: the observe goes out with nulls.
-        good = proxy_data()
-        await h.async_pre_call_hook(KEY, None, good, "acompletion")
-
-        def boom(*_a, **_k):
-            raise RuntimeError("served bug")
-
-        h.policy._served = boom
-        assert await h.async_post_call_success_hook(good, KEY, None) is None
-        assert await h.async_post_call_success_hook(good, KEY, object()) is None
-        assert await h.async_post_call_failure_hook(None, RuntimeError("x"), KEY) is None
-        await drain(h)
-        assert len(post.bodies("/decide")) == 2
-        [observe] = post.bodies("/observe")
-        assert observe["status"] == "success" and observe["served_model_group"] is None
-        # A transport that returns garbage: an error, not an exception.
-        h2 = make_handler(Recorder(status="weird"))
-        await h2.async_pre_call_hook(KEY, None, proxy_data(), "acompletion")
-        await drain(h2)
-        assert h2.stats["route_policy_errors"] == 1
-
-    run(go())
-
-
 # ── the real HTTP client ───────────────────────────────────────────────────
 @needs_httpx
 def test_httpx_post_wire_format_timeout_and_5xx():
@@ -850,25 +1036,28 @@ def test_httpx_post_wire_format_timeout_and_5xx():
 
     async def go():
         async def handler(request):
-            seen.append((request.method, str(request.url), request.headers.get("content-type"),
-                         json.loads(request.content)))
+            body = json.loads(request.content)
+            seen.append((request.method, str(request.url), request.headers.get("content-type"), body))
             if request.url.path == "/observe":
                 return httpx.Response(500)
             if request.url.path.startswith("/slow/"):
                 await asyncio.sleep(5)
-            return httpx.Response(200, json={"route": "local-general"})
+            return httpx.Response(200, json={"decision_id": body["decision_id"], "route": "local-reasoning",
+                                             "mode": "enforce", "apply": True})
 
         transport = httpx.MockTransport(handler)
-        h = make_handler(HttpxPost(0.2, transport=transport), timeout=0.2)
+        h = make_handler(HttpxPost(0.2, transport=transport), timeout=0.2, decide_timeout=0.2)
         data = await decided(h)
+        assert data["model"] == "local-reasoning"
         await h.async_post_call_failure_hook(data, RuntimeError("x"), KEY)
         await drain(h)
         assert h.stats["route_policy_decides"] == 1 and h.stats["route_policy_errors"] == 1  # the 500
-        h.policy.base_url = SERVICE + "/slow"  # a hung service: timed out, counted
+        h.policy.base_url = SERVICE + "/slow"  # a hung service: timed out, local-private
+        slow = proxy_data()
         t0 = time.perf_counter()
-        await h.async_pre_call_hook(KEY, None, proxy_data(), "acompletion")
-        assert time.perf_counter() - t0 < 0.05
-        await drain(h)
+        await h.async_pre_call_hook(KEY, None, slow, "acompletion")
+        assert time.perf_counter() - t0 < 0.6
+        assert slow["model"] == "local-private" and stash_of(slow)["source"] == "fallback:timeout"
         assert h.stats["route_policy_errors"] == 2
 
     run(go())
@@ -889,13 +1078,17 @@ class _Service(BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers.get("content-length") or 0)))
         type(self).received.append((self.path, body))
-        status = 200 if self.path == "/decide" else 202
-        payload = json.dumps({"decision_id": body.get("decision_id")}).encode()
+        if self.path == "/decide":
+            status, payload = 200, {"decision_id": body["decision_id"], "route": "local-code", "mode": "enforce",
+                                    "apply": True, "ruleset": {"id": "default", "version": 2}}
+        else:
+            status, payload = 202, {"decision_id": body.get("decision_id")}
+        raw = json.dumps(payload).encode()
         self.send_response(status)
         self.send_header("content-type", "application/json")
-        self.send_header("content-length", str(len(payload)))
+        self.send_header("content-length", str(len(raw)))
         self.end_headers()
-        self.wfile.write(payload)
+        self.wfile.write(raw)
 
 
 @needs_httpx
@@ -909,8 +1102,9 @@ def test_against_a_real_http_server(monkeypatch):
     url = f"http://127.0.0.1:{server.server_address[1]}"
     try:
         async def go():
-            h = make_handler(HttpxPost(2.0), url=url, timeout=2.0)
+            h = make_handler(HttpxPost(2.0), url=url, timeout=2.0, decide_timeout=2.0)
             data = await decided(h, stream=True)
+            assert data["model"] == "local-code"
             await collect(h, data, Wrapper(stream_chunks()))
             await drain(h)
             return h
@@ -927,28 +1121,36 @@ def test_against_a_real_http_server(monkeypatch):
 
 
 # ── settings and repo invariants ───────────────────────────────────────────
+ROUTE_POLICY_VARS = ("ROUTE_POLICY_ENABLED", "ROUTE_POLICY_URL", "ROUTE_POLICY_TIMEOUT_S",
+                     "ROUTE_POLICY_DECIDE_TIMEOUT_S")
+
+
 def test_settings_defaults_and_overrides(monkeypatch, fresh_hooks):
-    for name in ("ROUTE_POLICY_ENABLED", "ROUTE_POLICY_URL", "ROUTE_POLICY_TIMEOUT_S"):
+    for name in ROUTE_POLICY_VARS:
         monkeypatch.delenv(name, raising=False)
     with fresh_hooks():
         from hooks import settings
-        assert (settings.ROUTE_POLICY_ENABLED, settings.ROUTE_POLICY_URL, settings.ROUTE_POLICY_TIMEOUT_S) == (
-            True, "http://route-policy:8000", 2.0)
+        assert (settings.ROUTE_POLICY_ENABLED, settings.ROUTE_POLICY_URL, settings.ROUTE_POLICY_TIMEOUT_S,
+                settings.ROUTE_POLICY_DECIDE_TIMEOUT_S) == (True, "http://route-policy:8000", 2.0, 0.25)
     monkeypatch.setenv("ROUTE_POLICY_ENABLED", "false")
     monkeypatch.setenv("ROUTE_POLICY_URL", " http://elsewhere:9000/ ")
     monkeypatch.setenv("ROUTE_POLICY_TIMEOUT_S", "0.01")
+    monkeypatch.setenv("ROUTE_POLICY_DECIDE_TIMEOUT_S", "0.001")
     with fresh_hooks():
         from hooks import settings
         from hooks.handler import Handler as FreshHandler
-        assert (settings.ROUTE_POLICY_ENABLED, settings.ROUTE_POLICY_URL, settings.ROUTE_POLICY_TIMEOUT_S) == (
-            False, "http://elsewhere:9000/", 0.1)
+        assert (settings.ROUTE_POLICY_ENABLED, settings.ROUTE_POLICY_URL, settings.ROUTE_POLICY_TIMEOUT_S,
+                settings.ROUTE_POLICY_DECIDE_TIMEOUT_S) == (False, "http://elsewhere:9000/", 0.1, 0.05)  # floors
         h = FreshHandler(start_poller=False)
         assert h.policy.enabled is False and h.policy.base_url == "http://elsewhere:9000"
+        assert h.state()["config"]["route_policy_decide_timeout_s"] == 0.05
     monkeypatch.setenv("ROUTE_POLICY_ENABLED", "true")
     monkeypatch.setenv("ROUTE_POLICY_URL", "")
+    monkeypatch.setenv("ROUTE_POLICY_DECIDE_TIMEOUT_S", "1.5")
     with fresh_hooks():
         from hooks.handler import Handler as FreshHandler
-        assert FreshHandler(start_poller=False).policy.enabled is False  # no URL, no client
+        h = FreshHandler(start_poller=False)
+        assert h.policy.enabled is False and h.policy.decide_timeout == 1.5  # no URL, no client
 
 
 def _compose_env():
@@ -966,6 +1168,7 @@ def _env_example(name):
     ("ROUTE_POLICY_ENABLED", "true"),
     ("ROUTE_POLICY_URL", "http://route-policy:8000"),
     ("ROUTE_POLICY_TIMEOUT_S", "2"),
+    ("ROUTE_POLICY_DECIDE_TIMEOUT_S", "0.25"),
 ])
 def test_defaults_agree_across_settings_compose_and_env_example(name, default):
     value = _compose_env()[name]
@@ -973,6 +1176,95 @@ def test_defaults_agree_across_settings_compose_and_env_example(name, default):
     assert m, f"compose must pass ${{{name}:-<default>}}: {value!r}"
     assert m.group(1) == default
     assert _env_example(name) == default
+
+
+# ── against real LiteLLM ───────────────────────────────────────────────────
+class _Upstream(BaseHTTPRequestHandler):
+    """A stand-in OpenAI-compatible backend that records the bodies LiteLLM sends it."""
+
+    bodies = []
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers.get("content-length") or 0)) or b"{}")
+        type(self).bodies.append(body)
+        payload = json.dumps({"id": "chatcmpl-u", "object": "chat.completion", "created": 1, "model": body["model"],
+                              "choices": [{"index": 0, "message": {"role": "assistant", "content": "hello"},
+                                           "finish_reason": "stop"}],
+                              "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+
+@pytest.fixture
+def upstream(monkeypatch):
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
+    monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
+    _Upstream.bodies = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Upstream)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}/v1"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def _alias_router(base):
+    """local-private and local-code on the stand-in, and this repo's `auto` alias."""
+    def dep(chain, served, order):
+        return {"model_name": chain, "litellm_params": {"model": f"openai/{served}", "api_base": base,
+                                                        "api_key": "none", "order": order},
+                "model_info": {"id": f"id-{chain}-{order}"}}
+
+    return litellm.Router(model_list=[dep("local-private", "qwen3.8-solo", 1), dep("local-code", "muse-glimmer", 1)],
+                          model_group_alias={"auto": "local-private"}, num_retries=0)
+
+
+@needs_litellm
+def test_the_routed_chain_answers_and_the_outcome_names_it(upstream):
+    """Pre-call (the engine picks local-code) -> the Router serves the
+    rewritten model -> the proxy's data["deployment"] -> footer + /observe."""
+    async def go():
+        router = _alias_router(upstream)
+        post = Recorder(route="local-code")
+        h = make_handler(post)
+        data = proxy_data()
+        await h.async_pre_call_hook(KEY, None, data, "acompletion")
+        resp = await router.acompletion(model=data["model"], messages=data["messages"], metadata=data["metadata"])
+        data["deployment"] = router.get_deployment(model_id=resp._hidden_params["model_id"])
+        out = await h.async_post_call_success_hook(data, KEY, resp)
+        await drain(h)
+        return out, post
+
+    out, post = run(go())
+    assert [b["model"] for b in _Upstream.bodies] == ["muse-glimmer"]  # local-code's deployment, one call
+    assert out.choices[0].message.content == "hello" + footer_text("muse-glimmer · local-code")
+    [observe] = post.bodies("/observe")
+    assert (observe["served_model_group"], observe["served_deployment"]) == ("local-code", "openai/muse-glimmer")
+
+
+@needs_litellm
+def test_the_stash_is_never_sent_upstream(upstream, monkeypatch):
+    """data["metadata"] goes into Router.acompletion(**data); the openai
+    provider must not put the stash (or metadata at all) in the upstream body
+    -- also not with enable_preview_features, which forwards string values only."""
+    router = _alias_router(upstream)
+    stash = {"requested_model": "auto", "route": "local-code", "source": "engine",
+             "decision_id": str(uuid.uuid4()), "litellm_call_id": "call-1", "observed": False}
+    for preview in (False, True):
+        monkeypatch.setattr(litellm, "enable_preview_features", preview)
+        meta = {"headers": dict(OWUI_HEADERS), STASH_KEY: dict(stash)}
+        run(router.acompletion(model="local-code", messages=[{"role": "user", "content": "hi"}], metadata=meta))
+    assert len(_Upstream.bodies) == 2
+    for body in _Upstream.bodies:
+        assert STASH_KEY not in json.dumps(body)
+        assert stash["decision_id"] not in json.dumps(body)
 
 
 # ── proxy plumbing (litellm[proxy]==1.95.0) ────────────────────────────────
@@ -989,7 +1281,7 @@ needs_proxy = pytest.mark.skipif(ProxyLogging is None, reason="needs litellm[pro
 @needs_proxy
 def test_proxy_dispatches_every_path_and_the_stash_survives():
     async def go():
-        post = Recorder()
+        post = Recorder(route="local-code")
         h = make_handler(post)
         old = litellm.callbacks
         litellm.callbacks = [h]
@@ -999,17 +1291,18 @@ def test_proxy_dispatches_every_path_and_the_stash_survives():
 
             # Non-streaming.
             data = await pl.pre_call_hook(user_api_key_dict=key, data=proxy_data(), call_type="acompletion")
+            assert data["model"] == "local-code"
             stash = data["metadata"][STASH_KEY]
-            data["deployment"] = copy.deepcopy(AUTO_DEPLOYMENT)
+            data["deployment"] = deployment()
             out = await pl.post_call_success_hook(data=data, response=response(), user_api_key_dict=key)
-            assert out.choices[0].message.content == "hello" + FOOTER_GENERAL
+            assert out.choices[0].message.content == "hello" + footer_text("muse-glimmer · local-code")
 
             # Streaming, through the proxy's own iterator chain.
             sdata = await pl.pre_call_hook(user_api_key_dict=key, data=proxy_data(stream=True), call_type="acompletion")
-            sdata["deployment"] = copy.deepcopy(AUTO_DEPLOYMENT)
+            sdata["deployment"] = deployment()
             chunks = [c async for c in pl.async_post_call_streaming_iterator_hook(
                 response=Wrapper(stream_chunks()), user_api_key_dict=key, request_data=sdata)]
-            assert joined(chunks) == "hello" + FOOTER_GENERAL
+            assert joined(chunks) == "hello" + footer_text("muse-glimmer · local-code")
 
             # Failure: post_call_failure_hook returns no transformed exception.
             fdata = await pl.pre_call_hook(user_api_key_dict=key, data=proxy_data(), call_type="acompletion")
@@ -1032,6 +1325,36 @@ def test_proxy_dispatches_every_path_and_the_stash_survives():
 
 
 @needs_proxy
+def test_proxy_routes_anthropic_messages_too():
+    """/v1/messages (Claude Code) runs the same pre-call pipeline with
+    call_type anthropic_messages (anthropic_endpoints/endpoints.py:95): its
+    `auto` is decided and rewritten like a chat completion's."""
+    async def go():
+        post = Recorder(route="local-reasoning")
+        h = make_handler(post)
+        old = litellm.callbacks
+        litellm.callbacks = [h]
+        try:
+            pl = ProxyLogging(user_api_key_cache=DualCache())
+            body = {"model": "auto", "max_tokens": 1024, "system": "be brief",
+                    "messages": [{"role": "user", "content": [{"type": "text", "text": "prove it"}]}],
+                    "tools": [{"name": "sandbox-mcp_exec", "input_schema": {"type": "object"}}],
+                    "litellm_call_id": "call-m", "litellm_metadata": {"headers": {}}}
+            data = await pl.pre_call_hook(user_api_key_dict=UserAPIKeyAuth(), data=body,
+                                          call_type="anthropic_messages")
+        finally:
+            litellm.callbacks = old
+        return data, post
+
+    data, post = run(go())
+    assert data["model"] == "local-reasoning" and stash_of(data)["source"] == "engine"
+    assert STASH_KEY in data["litellm_metadata"] and "metadata" not in data
+    [decide] = post.bodies("/decide")
+    assert decide["messages"] == [{"role": "user", "content": [{"type": "text", "text": "prove it"}]}]
+    assert decide["tools"] == [{"name": "sandbox-mcp_exec", "input_schema": {"type": "object"}}]
+
+
+@needs_proxy
 def test_proxy_still_activates_the_class_body_hooks():
     h = make_handler(Recorder())
     old = litellm.callbacks
@@ -1042,53 +1365,3 @@ def test_proxy_still_activates_the_class_body_hooks():
         assert (h, "override") in caps.iterator_overrides
     finally:
         litellm.callbacks = old
-
-
-# A stand-in for Envoy + the inner LiteLLM that records the request bodies the
-# outer openai provider sends it.
-class _Upstream(BaseHTTPRequestHandler):
-    bodies = []
-
-    def log_message(self, *a):
-        pass
-
-    def do_POST(self):
-        body = json.loads(self.rfile.read(int(self.headers.get("content-length") or 0)) or b"{}")
-        type(self).bodies.append(body)
-        payload = json.dumps({"id": "chatcmpl-u", "object": "chat.completion", "created": 1, "model": "local-general",
-                              "choices": [{"index": 0, "message": {"role": "assistant", "content": "hello"},
-                                           "finish_reason": "stop"}],
-                              "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}).encode()
-        self.send_response(200)
-        self.send_header("content-type", "application/json")
-        self.send_header("content-length", str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
-
-
-@needs_litellm
-def test_the_stash_is_never_sent_upstream(monkeypatch):
-    """data["metadata"] goes into Router.acompletion(**data); the openai
-    provider must not put the stash (or metadata at all) in the upstream body
-    -- also not with enable_preview_features, which forwards string values only."""
-    monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
-    monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
-    _Upstream.bodies = []
-    server = ThreadingHTTPServer(("127.0.0.1", 0), _Upstream)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    base = f"http://127.0.0.1:{server.server_address[1]}/v1"
-    try:
-        router = litellm.Router(model_list=[{"model_name": "auto", "litellm_params": {
-            "model": "openai/vllm-sr/auto", "api_base": base, "api_key": "sk-test"}}])
-        stash = {"decision_id": str(uuid.uuid4()), "litellm_call_id": "call-1", "observed": False}
-        for preview in (False, True):
-            monkeypatch.setattr(litellm, "enable_preview_features", preview)
-            meta = {"headers": dict(OWUI_HEADERS), STASH_KEY: dict(stash)}
-            run(router.acompletion(model="auto", messages=[{"role": "user", "content": "hi"}], metadata=meta))
-    finally:
-        server.shutdown()
-        server.server_close()
-    assert len(_Upstream.bodies) == 2
-    for body in _Upstream.bodies:
-        assert STASH_KEY not in json.dumps(body)
-        assert stash["decision_id"] not in json.dumps(body)

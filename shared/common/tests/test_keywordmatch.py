@@ -1,5 +1,5 @@
-"""common.keywordmatch — the semantic router's keyword rules, compiled with
-the Go router's semantics. Pure; no I/O.
+"""common.keywordmatch — keyword rules compiled with the semantics of the Go
+keyword classifier they were written for (RE2). Pure; no I/O.
 
     UV_LINK_MODE=copy uv run --no-sync pytest shared/common/tests/test_keywordmatch.py -q
 """
@@ -10,7 +10,7 @@ import dataclasses
 
 import pytest
 
-from common.keywordmatch import KeywordRule, compile_keyword_rule, find_keyword_rule
+from common.keywordmatch import KeywordRule, compile_keyword_rule
 
 
 def test_literal_keywords_are_whole_words_ignoring_case_by_default():
@@ -61,17 +61,3 @@ def test_bad_rules_raise_value_error(rule):
     with pytest.raises(ValueError):
         compile_keyword_rule(rule)
 
-
-def test_find_keyword_rule_searches_the_whole_tree_in_order():
-    tree = {
-        "routing": {
-            "signals": {"keywords": [
-                {"name": "privacy_kw", "keywords": ["ssn"]},
-                {"name": "code_kw", "keywords": ["python"], "method": "regex"},
-            ]},
-            "decisions": [{"name": "code_kw", "rules": {"conditions": []}}],  # same name, no keywords
-        },
-    }
-    assert find_keyword_rule(tree, "code_kw") == {"name": "code_kw", "keywords": ["python"], "method": "regex"}
-    assert find_keyword_rule(tree, "missing") is None
-    assert find_keyword_rule(None, "code_kw") is None and find_keyword_rule("x", "code_kw") is None

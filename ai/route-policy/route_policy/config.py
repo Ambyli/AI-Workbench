@@ -65,10 +65,41 @@ def build_dsn(host: str, port: int, user: str, password: str, name: str) -> Opti
 
 DB_DSN: Optional[str] = build_dsn(DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME)
 
-# The pool's ceiling. Every /decide and /observe borrows one connection for a
-# few milliseconds; the default covers bursts from both LiteLLM copies during
-# a swap with room to spare. Too small never errors, a request just waits.
+# The pool's ceiling. Every /decide and /observe write borrows one connection
+# for a few milliseconds; the default covers bursts from both LiteLLM copies
+# during a swap with room to spare. Too small never errors: a write waits for
+# a connection -- in the background once it outlasts the budget below.
 DB_POOL_MAX: int = _env_int("ROUTE_POLICY_DB_POOL_MAX", 10, 1)
+
+# -- Database waits on the request path ------------------------------------------
+# LiteLLM awaits /decide for every `auto` turn within its own 0.25 s
+# (ROUTE_POLICY_DECIDE_TIMEOUT_S) and falls back to local-private past it, so
+# no request here may wait on the database for long (service.py).
+#
+# How long /decide (and /observe) waits for its row to be written before it
+# answers anyway. A write that finishes in time behaves as if it were
+# synchronous (a duplicate decision_id replays the FIRST stored decision); a
+# slower one -- a hung database, an exhausted pool -- keeps running in the
+# background, counted in route_policy_writes_deferred_total. 0 = never wait.
+DECISION_WRITE_BUDGET_S: float = _env_float("ROUTE_POLICY_DECISION_WRITE_BUDGET_S", 0.05, 0.0)
+
+# Background writes allowed in flight at once (decisions and outcomes
+# together). Past it a write is DROPPED (the decision is still returned;
+# route_policy_errors_total{kind="decision_write_dropped"}): a database that
+# is down for minutes must not pile up tasks and connections without bound.
+WRITES_MAX_IN_FLIGHT: int = 256
+
+# How long shutdown waits for background writes before cancelling them.
+WRITES_DRAIN_S: float = 5.0
+
+# The database READS on the /decide path -- the binding refresh every
+# ROUTE_POLICY_BINDING_REFRESH_S, and compiling a stored version this copy has
+# not cached -- get this long. Past it the refresh finishes in the background
+# and the request decides from the last snapshot; a version fetch answers 503
+# (LiteLLM falls back to local-private) and lands in the cache for the next
+# request. Not an environment variable: it only trades a few milliseconds of
+# freshness for latency. The tests raise it (unit-tests/route-policy/conftest.py).
+DB_READ_BUDGET_S: float = 0.1
 
 # -- Ruleset cache --------------------------------------------------------------
 # How old the in-memory binding snapshot may get before a /decide re-reads

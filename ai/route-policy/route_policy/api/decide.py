@@ -1,13 +1,22 @@
 """POST /decide -- decide (and log) the chain for one request.
 
-Called by the LiteLLM hook on every ``auto`` request (phase 2: fired and
-forgotten; phase 3: awaited under a ~150 ms budget, fail-safe to
-``local-private``). Contract: ROUTE_POLICY_PLAN § 7, ROUTE_POLICY.md § API.
+Called by LiteLLM's pre-call hook on every ``auto`` request and AWAITED,
+under ROUTE_POLICY_DECIDE_TIMEOUT_S (0.25 s by default): the hook rewrites
+the request to ``route`` when ``apply`` is true and its own copy of the
+invariants agrees, and sends it to ``local-private`` on anything else (a
+timeout, a non-200, ``apply: false``). So this is on the critical path of
+every ``auto`` turn: the engine takes well under a millisecond, and no
+database wait may hold the answer for long -- the decision write is awaited
+for at most ROUTE_POLICY_DECISION_WRITE_BUDGET_S (then finishes in the
+background, service.py), the binding refresh and an uncached version fetch
+for at most config.DB_READ_BUDGET_S (rulesets/store.py). Contract:
+ROUTE_POLICY_PLAN § 7, ROUTE_POLICY.md § API.
 
     200  the decision (a duplicate decision_id gets the FIRST stored decision)
     404  no ruleset is bound to requested_model (+ key_alias)
     422  the body does not match the contract (decision_id not a UUID, ...)
-    503  the bound ruleset cannot be compiled by this copy
+    503  the bound ruleset cannot be loaded by this copy (it cannot compile it,
+         or the database did not hand it over within the read budget)
 """
 
 from __future__ import annotations
@@ -32,12 +41,13 @@ async def decide(body: DecideRequest, request: Request) -> dict:
         binding = service.store.binding_for(body.requested_model, body.key_alias)
         if binding is not None:
             raise HTTPException(503, f"the ruleset bound to {body.requested_model!r} "
-                                     f"({binding.ruleset_id}@{binding.version}) cannot be loaded by this copy")
+                                     f"({binding.ruleset_id}@{binding.version}) cannot be loaded by this "
+                                     "copy right now")
         metrics.errors_total.labels("unbound_model").inc()
         raise HTTPException(404, f"no ruleset is bound to model {body.requested_model!r}")
     decision = await pipeline.run(ruleset, body.context())
     status, response = await service.record_decision(body, decision, decision.response(str(body.decision_id)))
     logger.info("[decide] %s %s -> %s (%s%s; %s@%d %s) chat=%s", body.decision_id, body.requested_model,
-                response.get("route"), decision.reason, "" if status != "duplicate" else ", duplicate",
-                ruleset.id, ruleset.version, ruleset.mode, body.chat_id or "-")
+                response.get("route"), decision.reason,
+                f", {status}" if status in ("duplicate", "deferred", "dropped") else "", ruleset.id, ruleset.version, ruleset.mode, body.chat_id or "-")
     return response

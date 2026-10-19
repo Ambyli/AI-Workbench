@@ -1,4 +1,4 @@
-"""Keyword rules compiled with the Go router's semantics. See the package docstring."""
+"""Keyword rules compiled with Go RE2's semantics. See the package docstring."""
 
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ class KeywordRule:
 
 def compile_keyword_rule(rule: Any) -> KeywordRule:
     """Compile one keyword rule ({name, operator, keywords, case_sensitive,
-    method}) the way the Go router does. Raises ValueError on a bad rule: no
+    method}) with Go RE2's semantics. Raises ValueError on a bad rule: no
     keywords, an unknown operator, an empty / non-string keyword, or a
     pattern that does not compile."""
     if not isinstance(rule, dict) or not isinstance(rule.get("keywords"), list) or not rule["keywords"]:
@@ -58,22 +58,3 @@ def compile_keyword_rule(rule: Any) -> KeywordRule:
             raise ValueError(f"keyword {keyword!r} does not compile: {exc}") from exc
     return KeywordRule(operator, patterns)
 
-
-def find_keyword_rule(node: Any, name: str) -> Optional[dict]:
-    """The first dict anywhere in a parsed config tree whose ``name`` is
-    `name` and that carries a ``keywords`` list (depth-first, in order), or
-    None. Searching the whole tree keeps callers independent of where the
-    router's schema nests its signals."""
-    if isinstance(node, dict):
-        if node.get("name") == name and isinstance(node.get("keywords"), list):
-            return node
-        children = node.values()
-    elif isinstance(node, list):
-        children = node
-    else:
-        return None
-    for child in children:
-        found = find_keyword_rule(child, name)
-        if found is not None:
-            return found
-    return None

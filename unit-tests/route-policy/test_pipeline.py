@@ -15,8 +15,8 @@ def test_response_is_exactly_the_contract():
     d = run(default_ruleset(), [user("go"), *tool_round("sandbox-mcp_exec")])
     body = d.response("6f0e8c1e-8f7e-4c55-9a39-0f3f7ab5d001")
     assert set(body) == DECIDE_KEYS
-    assert body["route"] == "local-code" and body["mode"] == "shadow" and body["apply"] is False
-    assert body["ruleset"] == {"id": "default", "version": 1}
+    assert body["route"] == "local-code" and body["mode"] == "enforce" and body["apply"] is True
+    assert body["ruleset"] == {"id": "default", "version": 2}
     assert [v["evaluator"] for v in body["votes"]] == ["privacy", "code-text", "reasoning-text", "code-tools",
                                                        "sticky-code"]
     for vote in body["votes"]:

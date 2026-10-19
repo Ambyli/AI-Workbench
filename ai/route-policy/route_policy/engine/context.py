@@ -7,8 +7,8 @@ views evaluators ask for, each computed on first use and cached:
 
     exchanges       the history as (user text, [messages after it]), one per
                     user message, oldest first (common.conversation.split_exchanges)
-    current_text    the LATEST user message's text -- what the semantic
-                    router's keyword signals read
+    current_text    the LATEST user message's text -- what regex_text
+                    searches
     current_rounds  the messages after it: the model rounds and tool results
                     of the exchange in progress
     called_tools    every tool the conversation CALLED, most recent first

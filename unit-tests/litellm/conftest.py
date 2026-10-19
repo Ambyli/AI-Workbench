@@ -13,12 +13,14 @@ loads the shim against a FRESH import of the package with :func:`fresh_hooks`,
 which puts the original modules back afterwards, so the classes every other
 test imported at module level stay the ones in sys.modules.
 
-The route-policy client is ON by default in the proxy and would fire real
-background POSTs at http://route-policy:8000 from every `auto` pre-call hook a
-test runs. So these tests default it OFF (ROUTE_POLICY_ENABLED=false, set
-before `hooks` is first imported); test_route_policy.py turns it on per
-Handler with a fake transport, and the tests of the default itself unset the
-variable for a fresh import.
+The route-policy client is ON by default in the proxy and would await a real
+POST /decide at http://route-policy:8000 in every `auto` pre-call hook a test
+runs (and, failing that, route the request to local-private). So these tests
+default it OFF (ROUTE_POLICY_ENABLED=false, set before `hooks` is first
+imported) -- an `auto` request then goes straight to local-private as a
+`fallback:disabled`; test_route_policy.py turns it on per Handler with a fake
+transport, and the tests of the default itself unset the variable for a
+fresh import.
 """
 
 from __future__ import annotations

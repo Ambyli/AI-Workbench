@@ -729,6 +729,63 @@ def test_local_general_with_every_local_too_long_keeps_only_claude():
     assert h.stats["context_drops"] == 1
 
 
+def auto_kwargs(meta_key: str = "metadata", route: str = "local-code", **kw) -> dict:
+    """request_kwargs of a request the client sent as `auto`: the route-policy
+    stash rides in the proxy's metadata dict (litellm_metadata on /v1/messages)."""
+    stash = {"requested_model": "auto", "route": route, "source": "engine", "decision_id": "d-1",
+             "litellm_call_id": "call-1", "observed": False}
+    return {meta_key: {"headers": {}, "zeo_route_policy": stash}, **kw}
+
+
+@pytest.mark.parametrize("meta_key", ["metadata", "litellm_metadata"])
+def test_auto_request_too_long_for_every_local_never_goes_to_claude(meta_key):
+    """Claude is LOAD overflow for `auto`, never a bigger window: the old `auto`
+    deployment refused such a prompt with its max_input_tokens. Now the group's
+    local deployments come back and vLLM refuses it, like local-private."""
+    tok = StubTokenize({QWEN_TOK: 300_000, MUSE_TOK: 300_000})
+    h = make_handler(Clock(), tokenize=tok)
+    out = fit(h, "local-code", lgeneral(), msgs(800_000), auto_kwargs(meta_key))
+    assert models(out) == ["openai/qwen3.8-solo", "openai/muse-glimmer"]
+    assert not [m for m in models(out) if m.startswith("anthropic/")]
+    assert h.stats["context_auto_kept_local"] == 1 and h.stats["context_drops"] == 0
+
+
+def test_the_same_prompt_on_a_direct_chain_call_still_goes_to_claude():
+    tok = StubTokenize({QWEN_TOK: 300_000, MUSE_TOK: 300_000})
+    h = make_handler(Clock(), tokenize=tok)
+    for kwargs in ({}, {"metadata": {"headers": {}}},
+                   # Not auto's: a stash for another model is ignored (and the pre-call
+                   # hook drops any stash a request body carried in the first place).
+                   {"metadata": {"zeo_route_policy": {"requested_model": "local-code", "route": "local-code"}}}):
+        assert models(fit(h, "local-code", lgeneral(), msgs(800_000), kwargs)) == ["anthropic/claude-sonnet-5"]
+    assert h.stats["context_auto_kept_local"] == 0 and h.stats["context_drops"] == 3
+
+
+def test_auto_request_that_fits_one_local_still_drops_the_other():
+    tok = StubTokenize({QWEN_TOK: 122_881, MUSE_TOK: 122_881})
+    h = make_handler(Clock(), tokenize=tok)
+    assert models(fit(h, "local-code", lgeneral(), msgs(800_000), auto_kwargs())) == [
+        "openai/muse-glimmer", "anthropic/claude-sonnet-5"]  # the order filter then picks muse
+
+
+def test_auto_request_with_both_locals_busy_still_overflows_to_claude():
+    clock = Clock()
+    pages = {metrics_url(QWEN): metrics(0), metrics_url(MUSE): metrics(0)}
+    h = make_handler(clock, pages)
+    h.overflow.filter_deployments("local-code", lgeneral())  # learn the backends
+    pages[metrics_url(MUSE)] = metrics(4, 3)
+    busy(h, clock, metrics_url(QWEN), pages)  # both BUSY
+    out = fit(h, "local-code", lgeneral(), [{"role": "user", "content": "hi"}], auto_kwargs())
+    assert models(out) == ["anthropic/claude-sonnet-5"]
+    # Down, too.
+    pages[metrics_url(QWEN)] = ConnectionError("refused")
+    pages[metrics_url(MUSE)] = ConnectionError("refused")
+    poll(h)
+    out = fit(h, "local-code", lgeneral(), [{"role": "user", "content": "hi"}], auto_kwargs("litellm_metadata"))
+    assert models(out) == ["anthropic/claude-sonnet-5"]
+    assert h.stats["context_auto_kept_local"] == 0
+
+
 def test_too_long_is_a_hard_drop_the_busy_fallback_never_re_adds():
     clock = Clock()
     pages = {metrics_url(QWEN): metrics(0), metrics_url(MUSE): metrics(0)}
@@ -856,7 +913,11 @@ def test_config_chain_table_is_what_the_policy_says():
     cfg = yaml.safe_load(CONFIG.read_text(encoding="utf-8"))
     for fb in cfg["litellm_settings"]["fallbacks"] + cfg["litellm_settings"]["context_window_fallbacks"]:
         assert not any(k in CHAINS for k in fb), fb
-        assert not any("claude" in t for k, v in fb.items() if k == "auto" for t in v)
+        # `auto` is rewritten to a chain before routing: an entry would never fire.
+        assert "auto" not in fb, fb
+    # What serves `auto` when nothing rewrote it: the chain with no Claude.
+    assert cfg["router_settings"]["model_group_alias"] == {"auto": "local-private"}
+    assert not [m for m in cfg["model_list"] if m["model_name"] == "auto"]
     assert cfg["litellm_settings"]["callbacks"] == ["overflow.handler"]
 
 
@@ -865,8 +926,8 @@ HOOK_MODULES = {
     "hooks.overflow", "hooks.overflow.filter", "hooks.overflow.context_fit", "hooks.overflow.poller",
     "hooks.overflow.state", "hooks.overflow.vllm",
     "hooks.footer", "hooks.footer.auto", "hooks.footer.stream", "hooks.footer.render",
-    "hooks.routing", "hooks.routing.code_route",
-    "common.conversation", "common.keywordmatch",
+    "hooks.routing", "hooks.routing.policy_client", "hooks.routing.invariants", "hooks.routing.stash",
+    "common.conversation",
 }
 
 
@@ -992,6 +1053,28 @@ def test_router_exact_count_skips_qwen_that_litellm_undercounts():
         assert models(healthy(router, "local-private", UNDERCOUNTED, {"tools": TOOLS})) == ["openai/muse-glimmer"]
         assert tok.calls[0][1]["tools"] == TOOLS
         assert tok.calls[0][1]["model"] == "qwen3.8-solo"
+    finally:
+        litellm.callbacks = []
+
+
+# 400k characters of words: the hook's estimate (160k) reaches 0.6 x both
+# local-code windows (98304, 229376), so both are measured; tiktoken counts it
+# at ~80k, under both, so LiteLLM's own backstop keeps them.
+UNDERCOUNTED_FOR_BOTH = "word " * 80_000
+
+
+@pytestmark_litellm
+def test_router_auto_request_too_long_for_every_local_never_reaches_claude():
+    """Through the real v1.95.0 Router and the real local-code chain: the stash
+    in request_kwargs' metadata keeps an over-long `auto` prompt off Claude;
+    the same prompt on a direct local-code call still goes to Claude."""
+    h = make_handler(Clock(), {}, tokenize=StubTokenize({QWEN_TOK: 300_000, MUSE_TOK: 300_000}))
+    router = make_router(h)
+    try:
+        assert models(healthy(router, "local-code", UNDERCOUNTED_FOR_BOTH)) == ["anthropic/claude-sonnet-5"]
+        for meta_key in ("metadata", "litellm_metadata"):
+            out = healthy(router, "local-code", UNDERCOUNTED_FOR_BOTH, auto_kwargs(meta_key))
+            assert models(out) == ["openai/qwen3.8-solo"], meta_key  # the order filter: lowest local order
     finally:
         litellm.callbacks = []
 

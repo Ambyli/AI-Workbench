@@ -43,8 +43,8 @@ def test_decide_returns_the_contract(client):
     out = r.json()
     assert set(out) == DECIDE_KEYS and all(set(v) == VOTE_KEYS for v in out["votes"])
     assert out["decision_id"] == body["decision_id"]
-    assert (out["route"], out["mode"], out["apply"]) == ("local-code", "shadow", False)
-    assert out["ruleset"] == {"id": "default", "version": 1}
+    assert (out["route"], out["mode"], out["apply"]) == ("local-code", "enforce", True)
+    assert out["ruleset"] == {"id": "default", "version": 2}
 
 
 def test_decide_is_lenient_where_strictness_would_only_lose_data(client):
@@ -73,8 +73,9 @@ def test_decide_unbound_model_is_404(client):
 
 def test_decide_requested_private_stays_private(client):
     r = client.post("/decide", json=decide_body(requested_model="local-private"))
-    # No binding for local-private in phase 2 -- the invariant is exercised
-    # through /evaluate below and in test_invariants.py.
+    # Only `auto` is bound: a request naming a chain is honoured as is by
+    # LiteLLM and never decided. The invariant is exercised through /evaluate
+    # below and in test_invariants.py.
     assert r.status_code == 404
 
 
@@ -85,7 +86,11 @@ def test_decide_still_answers_when_the_database_is_down():
         store.add(compiled)
     store.set_bindings(s.bindings)
     dead = Database("postgresql://nobody@127.0.0.1:1/none")
-    app = create_app(service=Service(store=store, database=dead, rulesets_dir=RULESETS_DIR), instrument=False)
+    # A budget long enough for the refused connection to come back within it
+    # (Windows retries a refused SYN for ~2 s): the failure is then seen in
+    # time, so /observe answers 503. The deferred paths are test_writes.py's.
+    service = Service(store=store, database=dead, rulesets_dir=RULESETS_DIR, write_budget_s=30)
+    app = create_app(service=service, instrument=False)
     with TestClient(app) as c:
         r = c.post("/decide", json=decide_body())
         assert r.status_code == 200 and r.json()["route"] == "local-code"
@@ -117,7 +122,7 @@ def test_evaluate_a_stored_ruleset(client):
     out = r.json()
     assert out["decision_id"] is None and out["route"] == "local-reasoning"
     assert all(set(v) == VOTE_KEYS | {"detail", "error"} for v in out["votes"])
-    r = client.post("/evaluate", json={"ruleset": {"id": "default", "version": 1},
+    r = client.post("/evaluate", json={"ruleset": {"id": "default", "version": 2},
                                        "requested_model": "local-private", "messages": [user("prove it")]})
     assert r.json()["route"] == "local-private"
 
@@ -157,7 +162,7 @@ def test_evaluate_errors(client):
 
 
 def test_health_ready_and_types(client):
-    assert client.get("/health").json() == {"status": "ok", "rulesets": [{"id": "default", "version": 1}],
+    assert client.get("/health").json() == {"status": "ok", "rulesets": [{"id": "default", "version": 2}],
                                             "bindings": 1}
     assert client.get("/ready").status_code == 503
     types = client.get("/evaluator-types").json()
@@ -170,7 +175,7 @@ def test_health_ready_and_types(client):
 
 
 def test_database_reads_without_a_database_are_503(client):
-    for path in ("/rulesets", "/rulesets/default", "/rulesets/default/1", "/bindings", "/chats/c/decisions"):
+    for path in ("/rulesets", "/rulesets/default", "/rulesets/default/2", "/bindings", "/chats/c/decisions"):
         assert client.get(path).status_code == 503, path
 
 
@@ -189,4 +194,4 @@ def test_metrics_are_exposed():
     for name in ("route_policy_decisions_total", "route_policy_decide_seconds", "route_policy_evaluator_seconds",
                  "route_policy_votes_total", "route_policy_errors_total"):
         assert name in text, name
-    assert 'route_policy_decisions_total{applied="false",mode="shadow",route="local-code"}' in text
+    assert 'route_policy_decisions_total{applied="true",mode="enforce",route="local-code"}' in text

@@ -1,13 +1,10 @@
 """Each evaluator's behaviour: votes, abstains, edge cases, config validation.
 
-The cooldown is checked against the code it ports -- the LiteLLM hook's
-``code_route_decision`` -- on the same histories (skipped if the hooks
-package cannot be imported).
+The cooldown's verdicts and reasons are pinned on a table of histories (what
+the `default` ruleset's `sticky-code` reports in every decision log).
 """
 
 from __future__ import annotations
-
-import sys
 
 import pytest
 from pydantic import ValidationError
@@ -48,7 +45,7 @@ def cooldown(exchanges: int = 3, judges=None) -> Cooldown:
 def test_regex_text_literal_words_are_whole_words():
     ev = regex({"name": "w", "keywords": ["function"]})
     assert evaluate(ev, [user("write a function")]).voted
-    assert not evaluate(ev, [user("these functions")]).voted   # whole word, like the Go router
+    assert not evaluate(ev, [user("these functions")]).voted   # a literal is a whole word
 
 
 def test_regex_text_regex_method_and_case():
@@ -92,7 +89,7 @@ def test_regex_text_detail_never_carries_the_text():
     assert "secret" not in repr(out.detail) and out.detail["searched_chars"] == len("secret project: app.py")
 
 
-def test_regex_text_relevance_reason_is_the_hooks():
+def test_regex_text_relevance_reason():
     assert regex(CODE_RULE).exchange_relevance("fix the bug", []) == "message matches code_kw"
     assert regex(CODE_RULE).exchange_relevance("hello", []) is None
 
@@ -149,21 +146,7 @@ def test_tool_calls_bad_pattern_refused():
         ToolCallsConfig(pattern="(")
 
 
-# -- cooldown: a faithful port of the hook's code_route_decision ---------------------
-
-
-def _hook_code_route():
-    litellm_dir = str(ROOT / "ai" / "litellm")
-    if litellm_dir not in sys.path:
-        sys.path.append(litellm_dir)
-    try:
-        from hooks.routing.code_route import code_route_decision  # noqa: PLC0415
-    except Exception as exc:  # noqa: BLE001
-        pytest.skip(f"ai/litellm/hooks is not importable here: {exc!r}")
-    from common.keywordmatch import compile_keyword_rule
-
-    rule = compile_keyword_rule(CODE_RULE)
-    return lambda messages, n: code_route_decision(messages, TOOL_REGEX, rule, n)
+# -- cooldown --------------------------------------------------------------------------
 
 
 def _histories():
@@ -185,16 +168,54 @@ def _histories():
     }
 
 
+TOOL = "called sandbox-mcp_exec"
+TEXT = "message matches code_kw"
+
+
+def _held(why: str, ago: int, since: int, n: int):
+    return True, f"{why} {ago} exchange(s) ago; {since}/{n} irrelevant since"
+
+
+def _expired(why: str, since: int, n: int):
+    return False, f"cooldown: {since}/{n} irrelevant exchanges since the last one that {why}"
+
+
+def _expected(name: str, n: int):
+    """(voted, reason) of a `cooldown(n)` judged by code-tools then code-text."""
+    if name in ("empty", "system only"):
+        return False, "no user message"
+    if name in ("never code", "other tool"):
+        return False, "no exchange has been relevant"
+    if name == "tool now":
+        return True, f"{TOOL} in this exchange"
+    if name == "code text now":
+        return True, f"{TEXT} in this exchange"
+    why, ago, since = {
+        "tool 1 ago": (TOOL, 1, 0),
+        "tool 2 ago": (TOOL, 2, 1),
+        "tool 3 ago": (TOOL, 3, 2),
+        "tool 4 ago (expired)": (TOOL, 4, 3),
+        "text 2 ago": (TEXT, 2, 1),
+        "text then expired": (TEXT, 4, 3),
+    }[name]
+    # Held while fewer than n irrelevant exchanges followed the relevant one.
+    return _held(why, ago, since, n) if since < n else _expired(why, since, n)
+
+
 @pytest.mark.parametrize("name", list(_histories()))
 @pytest.mark.parametrize("n", [0, 1, 3])
-def test_cooldown_matches_the_hook(name, n):
-    hook = _hook_code_route()
-    messages = _histories()[name]
-    expected_vote, expected_reason = hook(messages, n)
-    out = evaluate(cooldown(n), messages)
-    assert out.voted == expected_vote, (name, n, out.reason, expected_reason)
-    if expected_reason:
-        assert out.reason == expected_reason
+def test_cooldown_outcomes(name, n):
+    out = evaluate(cooldown(n), _histories()[name])
+    assert (out.voted, out.reason) == _expected(name, n), (name, n)
+
+
+def test_cooldown_expected_table_spot_checks():
+    # The table above, spelled out for the cases the ruleset relies on.
+    assert _expected("tool 1 ago", 3) == (True, "called sandbox-mcp_exec 1 exchange(s) ago; 0/3 irrelevant since")
+    assert _expected("tool 1 ago", 0) == (
+        False, "cooldown: 0/0 irrelevant exchanges since the last one that called sandbox-mcp_exec")
+    assert _expected("tool 3 ago", 3)[0] is True and _expected("tool 4 ago (expired)", 3)[0] is False
+    assert _expected("text 2 ago", 3) == (True, "message matches code_kw 2 exchange(s) ago; 1/3 irrelevant since")
 
 
 def test_cooldown_detail():

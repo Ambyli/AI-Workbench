@@ -1,6 +1,6 @@
 """THE `auto` FOOTER. When -- and only when -- a client calls model ``auto``
-(the semantic router), the assistant text gets a markdown footer naming the
-backend that actually answered::
+(routed by the route-policy engine), the assistant text gets a markdown footer
+naming the backend that actually answered::
 
     <answer>
 
@@ -9,15 +9,24 @@ backend that actually answered::
 
 with `` · overflow (local busy|local down)`` when a Claude deployment
 answered (busy/down read from the overflow filter's backend state --
-approximate), and `` · router bypassed`` when ``auto`` itself fell back to
-local-private. The served deployment comes from the inner LiteLLM's response
-headers, which the outer openai provider keeps as
-``llm_provider-x-litellm-model-id`` / ``-model-name`` / ``-model-group`` in
-``_hidden_params["additional_headers"]`` (core_helpers.py:318-319; streams:
-streaming_handler.py:164-171); the model id is mapped back to its deployment
-through the proxy's own router, because inner and outer are the same proxy. A
-router bypass shows up as an outer ``data["deployment"]``
-(common_request_processing.py:1707) whose model group is not ``auto``.
+approximate), and `` · route-policy fallback`` when the engine did not route
+the request and it went to local-private instead (the stash's source is
+``fallback:<why>``; see hooks/routing/policy_client.py).
+
+ONE PASS. The pre-call hook rewrites ``data["model"]`` from ``auto`` to the
+chain, and the proxy serves that chain itself, so everything the footer
+names comes from this one request: the deployment the proxy stores in
+``data["deployment"]`` (common_request_processing.py:1707 at v1.95.0, resolved
+from the response's model id BEFORE the success and streaming hooks run) --
+its ``model_name`` is the chain, its ``litellm_params.model`` the deployment
+(``openai/qwen3.8-solo``, ``anthropic/claude-sonnet-5``). The response's
+``x-litellm-model-group`` (router.py:9388, in
+``_hidden_params["additional_headers"]``) names the chain when the deployment
+is missing; without a deployment there is no model name, and no footer.
+"Was this request ``auto``?" is the route-policy stash (``zeo_route_policy``
+in the proxy's metadata, routing/stash.py), because ``data["model"]`` is the
+chain by then; a request still for ``auto`` (the hook never rewrote it -- the
+``auto`` alias served it from local-private) counts too.
 
 The three LiteLLM hooks that drive it live on hooks.handler.Handler (the
 proxy's leaf-class ``__dict__`` rule); they call into AutoFooter. They skip
@@ -26,20 +35,22 @@ tool calls, ``response_format`` requests and Open WebUI background tasks
 calling, which are detected by their default prompt templates on a
 non-streaming request -- a streamed answer whose user message carries the
 "### Task:" RAG template still gets its footer), strip a previous footer from
-incoming assistant messages, and never throw. AUTO_FOOTER_ENABLED=false turns
-the whole feature off. See ai/litellm/LITELLM.md > The `auto` footer.
+incoming assistant messages, and never throw. A response that is not an
+OpenAI chat completion (``/v1/messages``, the responses API) is left alone.
+AUTO_FOOTER_ENABLED=false turns the whole feature off. See
+ai/litellm/LITELLM.md > The `auto` footer.
 """
 
 from __future__ import annotations
 
-import sys
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from ..deployments import strip_provider
 from ..log import ThrottledLog
 from ..overflow.filter import OverflowFilter
 from ..overflow.state import BUSY, DOWN
+from ..routing.stash import fell_back, requested_auto
 from .render import (
     AUTO_MODEL,
     FOOTER_SEP,
@@ -55,25 +66,20 @@ from .render import (
     strip_footers_from_messages,
 )
 
-
-def proxy_router() -> Any:
-    """The running proxy's Router, without importing the proxy (tests, scripts)."""
-    mod = sys.modules.get("litellm.proxy.proxy_server")
-    return getattr(mod, "llm_router", None) if mod is not None else None
+# The last footer part when the engine did not route an `auto` request.
+FALLBACK_TAG = "route-policy fallback"
 
 
 @dataclass(frozen=True)
 class Served:
-    """Who answered an `auto` request (AutoFooter.served).
+    """Who answered a request (AutoFooter.served).
 
     chain     the chain alias (model group) that served it: local-general, ...
     model     that deployment's litellm_params.model: openai/qwen3.8-solo, ...
-    bypassed  `auto` fell back past the router (its fallbacks: local-private)
     """
 
     chain: Optional[str]
     model: Optional[str]
-    bypassed: bool
 
 
 def is_claude(model: Optional[str]) -> bool:
@@ -92,19 +98,20 @@ class AutoFooter:
     def __init__(
         self,
         enabled: bool,
-        router_getter: Callable[[], Any],
         overflow: OverflowFilter,
         stats: Dict[str, int],
         log: ThrottledLog,
     ) -> None:
         self.enabled = enabled
-        self.router_getter = router_getter
         self.overflow = overflow
         self.stats = stats
         self._log = log
 
     def wanted(self, data: Any) -> bool:
-        if not self.enabled or not isinstance(data, dict) or data.get("model") != AUTO_MODEL:
+        """A footer for this request's answer? Only when the client asked
+        for `auto` (the stash, see routing/stash.py) -- not for a direct
+        chain or alias call."""
+        if not self.enabled or not isinstance(data, dict) or not requested_auto(data):
             return False
         if data.get("response_format"):
             return False  # structured output: a footer would break the JSON
@@ -113,8 +120,9 @@ class AutoFooter:
     def strip_incoming(self, data: Any) -> bool:
         """On an `auto` request, strip footers we emitted from incoming
         assistant messages, in place, so the model never sees (and imitates)
-        them and the router's signals never read them. True when something
-        was stripped. Never raises."""
+        them and the route-policy engine never reads them. Runs before the
+        route-policy rewrite, so data["model"] is still `auto`. True when
+        something was stripped. Never raises."""
         try:
             if not self.enabled or not isinstance(data, dict) or data.get("model") != AUTO_MODEL:
                 return False
@@ -135,7 +143,7 @@ class AutoFooter:
                 return None
             choices = getattr(response, "choices", None)
             if not isinstance(choices, list) or not choices:
-                return None  # not a chat completion (embeddings, responses API, ...)
+                return None  # not a chat completion (embeddings, /v1/messages, responses API, ...)
             hidden = getattr(response, "_hidden_params", None)
             if isinstance(hidden, dict) and hidden.get("zeo_auto_footer"):
                 return None  # already done -- never twice
@@ -178,54 +186,23 @@ class AutoFooter:
         parts = [name, chain]
         if is_claude(served.model):
             parts.append(self.overflow_tag(chain))
-        if served.bypassed:
-            parts.append("router bypassed")
+        if fell_back(data):
+            parts.append(FALLBACK_TAG)
         return FOOTER_SEP.join(parts)
 
     def served(self, headers: Dict[str, Any], data: Any) -> Served:
-        """Which chain and deployment answered an `auto` request -- what the
-        footer names, and what the route-policy client reports in /observe.
+        """Which chain and deployment answered -- what the footer names, and
+        what the route-policy client reports in /observe.
 
-        Inner LiteLLM (behind the router) -> llm_provider-x-litellm-model-id /
-        -model-name / -model-group; the id is mapped through the proxy's own
-        router because inner and outer are the same proxy. The OUTER deployment
-        is data["deployment"] (common_request_processing.py:1707): when its
-        group is not `auto`, `auto` fell back past the router to local-private.
-        May raise on malformed input; callers guard.
-        """
-        headers = headers or {}
-        outer_group, outer_model = deployment_fields(data.get("deployment") if isinstance(data, dict) else None)
-        bare_group = headers.get("x-litellm-model-group")
-        if not outer_group and isinstance(bare_group, str) and bare_group:
-            outer_group = bare_group
-        has_vsr = any(k.startswith("llm_provider-x-vsr-") for k in headers)
-
-        chain: Optional[str] = None
-        served: Optional[str] = None
-        inner_id = headers.get("llm_provider-x-litellm-model-id")
-        if inner_id:
-            try:
-                router = self.router_getter()
-                dep = router.get_deployment(model_id=str(inner_id)) if router is not None else None
-                chain, served = deployment_fields(dep)
-            except Exception:
-                chain = served = None
-        if not served:
-            served = headers.get("llm_provider-x-litellm-model-name") or None
-        if not chain:
-            chain = headers.get("llm_provider-x-litellm-model-group") or headers.get("llm_provider-x-vsr-selected-model") or None
-        inner_known = bool(served or chain)
-
-        bypassed = bool(outer_group) and outer_group != AUTO_MODEL
-        if not bypassed and not has_vsr and not inner_known and outer_model and "vllm-sr/" not in outer_model:
-            bypassed = True
-        if bypassed:
-            served, chain = outer_model, (outer_group if outer_group != AUTO_MODEL else None)
-        return Served(
-            chain=chain if isinstance(chain, str) and chain else None,
-            model=served if isinstance(served, str) and served else None,
-            bypassed=bypassed,
-        )
+        data["deployment"] (common_request_processing.py:1707): model_name is
+        the chain, litellm_params.model the deployment. The response's
+        x-litellm-model-group names the chain when there is no deployment.
+        May raise on malformed input; callers guard."""
+        chain, model = deployment_fields(data.get("deployment") if isinstance(data, dict) else None)
+        group = (headers or {}).get("x-litellm-model-group")
+        if not chain and isinstance(group, str) and group and group != AUTO_MODEL:
+            chain = group
+        return Served(chain=chain or None, model=model or None)
 
     def overflow_tag(self, chain: str) -> str:
         """'overflow (local busy)' / '(local down)' from the overflow filter's
@@ -242,16 +219,12 @@ class AutoFooter:
         """DOWN when every local backend of `chain` the filter knows is down,
         BUSY when any is busy, else None (no verdict, or a call-time failure).
         The CURRENT view, so only an approximation of why Claude answered.
-        Never raises."""
+        The filter learnt the chain's backends when it filtered this very
+        request. Never raises."""
         try:
             if not isinstance(chain, str) or not chain:
                 return None
-
-            def find(name: str) -> Any:
-                router = self.router_getter()
-                return router.get_model_list(model_name=name) if router is not None else None
-
-            verdicts = self.overflow.local_verdicts(chain, find)
+            verdicts = self.overflow.local_verdicts(chain)
             if verdicts and all(v == DOWN for v in verdicts):
                 return DOWN
             if any(v == BUSY for v in verdicts):

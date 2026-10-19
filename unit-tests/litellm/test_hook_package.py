@@ -12,10 +12,11 @@ container, and the class-body rule the proxy dispatches by.
   `hooks`, and leaves sys.path as it found it.
 * A fresh interpreter laid out like the container's /app -- built from the
   compose file's own bind mounts -- loads the shim the way get_instance_fn
-  does and gets a working handler, with `common` limited to the mounted parts.
-* Repo invariants: every `common.<x>` the hooks import is mounted; the mounted
-  parts of common are stdlib-only; the hooks import nothing the LiteLLM image
-  lacks.
+  does and gets a working handler, with `common` limited to the mounted part.
+* Repo invariants: every `common.<x>` the hooks import is mounted, and nothing
+  else is; the mounted parts of common are stdlib-only; the hooks import
+  nothing the LiteLLM image lacks; nothing of the retired semantic router is
+  mounted any more.
 
     python -m pytest unit-tests/litellm -q -p no:cacheprovider
 """
@@ -35,7 +36,6 @@ import types
 import pytest
 
 from hooks.handler import Handler
-from hooks.routing.code_route import DEFAULT_CODE_ROUTE_TOOL_REGEX
 
 _ROOT = pathlib.Path(__file__).resolve().parents[2]
 _LITELLM_DIR = _ROOT / "ai" / "litellm"
@@ -131,10 +131,8 @@ print(json.dumps({
     "path_restored": sys.path == path_before and app not in sys.path,
     "shim_registered": "overflow" in sys.modules,
     "backend_is_dataclass": dataclasses.is_dataclass(backend),
-    "signal": type(h.code_route.text_signal).__name__,
-    "regex": getattr(h.code_route.regex, "pattern", None),
     "footer": h.footer.enabled,
-    "policy": [h.policy.enabled, h.policy.base_url, h.policy.timeout],
+    "policy": [h.policy.enabled, h.policy.base_url, h.policy.timeout, h.policy.decide_timeout],
 }))
 '''
 
@@ -167,10 +165,8 @@ def test_container_layout_loads_the_hook_in_a_fresh_interpreter(tmp_path):
     script = tmp_path / "child.py"
     script.write_text(CHILD, encoding="utf-8")
     env = dict(os.environ)
-    for name in [k for k in env if k.startswith(("OVERFLOW_", "CODE_ROUTE_", "AUTO_FOOTER_", "ROUTE_POLICY_"))]:
+    for name in [k for k in env if k.startswith(("OVERFLOW_", "AUTO_FOOTER_", "ROUTE_POLICY_"))]:
         del env[name]
-    # As the compose file sets it, relocated under the temporary /app.
-    env["CODE_ROUTE_ROUTER_CONFIG"] = str(app / "semantic-router-config.yaml")
     # -I: no PYTHONPATH, no user site, no script dir on sys.path -- only the
     # interpreter's own site-packages, like the image.
     proc = subprocess.run([sys.executable, "-I", str(script), str(app)], capture_output=True, text=True,
@@ -188,16 +184,15 @@ def test_container_layout_loads_the_hook_in_a_fresh_interpreter(tmp_path):
     assert _same(got["hooks_file"], app / "hooks" / "__init__.py")
     assert len(got["common_path"]) == 1 and _same(got["common_path"][0], app / "common")
     common = {m for m in got["modules"] if m.split(".")[0] == "common"}
-    assert common == {"common", "common.conversation", "common.conversation.history",
-                      "common.keywordmatch", "common.keywordmatch.rules"}
+    assert common == {"common", "common.conversation", "common.conversation.history"}
     assert {"hooks.handler", "hooks.settings", "hooks.overflow.filter", "hooks.footer.stream",
-            "hooks.routing.code_route", "hooks.routing.policy_client"} <= set(got["modules"])
-    assert got["documents_visible"] is False  # only the mounted parts of common exist
+            "hooks.routing.policy_client", "hooks.routing.invariants", "hooks.routing.stash"} <= set(got["modules"])
+    assert got["documents_visible"] is False  # only the mounted part of common exists
     assert got["path_restored"] is True and got["shim_registered"] is False
     assert got["backend_is_dataclass"] is True
-    assert got["signal"] == "KeywordRule"  # the mounted router config was read
-    assert got["regex"] == DEFAULT_CODE_ROUTE_TOOL_REGEX and got["footer"] is True
-    assert got["policy"] == [True, "http://route-policy:8000", 2.0]  # the defaults: on, by service DNS
+    assert got["footer"] is True
+    # The defaults: on, by service DNS; /observe 2 s, the awaited /decide 0.25 s.
+    assert got["policy"] == [True, "http://route-policy:8000", 2.0, 0.25]
 
 
 # ── repo invariants ──────────────────────────────────────────────────────────
@@ -240,12 +235,25 @@ def test_hooks_import_only_the_stdlib_the_image_and_common():
 @needs_yaml
 def test_every_common_part_the_hooks_import_is_mounted():
     used = _common_parts_used()
-    assert used == {"conversation", "keywordmatch"}  # update the compose file when this grows
+    assert used == {"conversation"}  # update the compose file when this changes
     volumes = yaml.safe_load(COMPOSE.read_text(encoding="utf-8"))["services"]["litellm"]["volumes"]
     assert "../../shared/common/src/common/__init__.py:/app/common/__init__.py:ro" in volumes
     for part in used:
         assert f"../../shared/common/src/common/{part}:/app/common/{part}:ro" in volumes, part
     assert "./hooks:/app/hooks:ro" in volumes and "./overflow.py:/app/overflow.py:ro" in volumes
+    # ...and no part the hooks do not import (it would only widen the deploy hash).
+    mounted = {spec.split(":")[1] for spec in volumes if spec.split(":")[1].startswith("/app/common/")}
+    assert mounted == {"/app/common/__init__.py"} | {f"/app/common/{part}" for part in used}
+
+
+@needs_yaml
+def test_nothing_of_the_semantic_router_is_left_in_the_service():
+    """Phase 3 retired the router: no config mount, no CODE_ROUTE_* or
+    SEMANTIC_ROUTER_* variable, no hook module of the code remap."""
+    service = yaml.safe_load(COMPOSE.read_text(encoding="utf-8"))["services"]["litellm"]
+    assert not [v for v in service["volumes"] if "semantic-router" in v]
+    assert not [k for k in service["environment"] if k.startswith(("CODE_ROUTE_", "SEMANTIC_ROUTER_"))]
+    assert not (HOOKS_DIR / "routing" / "code_route.py").exists()
 
 
 def test_the_mounted_common_parts_are_stdlib_only():

@@ -1,8 +1,8 @@
 """outcomes: one row per POST /observe -- what really answered.
 
-No foreign key to decisions (the hook fires /decide and /observe without
-waiting, so either may arrive first); the ``decision_outcomes`` view joins
-them. Idempotent on ``decision_id``: the first write wins.
+No foreign key to decisions (a /decide the hook gave up on can land after
+the /observe of the fallback answer, or never); the ``decision_outcomes``
+view joins them. Idempotent on ``decision_id``: the first write wins.
 """
 
 from __future__ import annotations

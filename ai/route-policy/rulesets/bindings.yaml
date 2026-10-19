@@ -11,7 +11,8 @@
 #   ruleset     a ruleset id from this directory
 #   version     optional: pin a version
 #
-# Phase 2: startup owns these rows. Editing bindings at runtime is the
-# phase-5 write API.
+# Startup owns these rows. Editing bindings at runtime is the phase-5 write
+# API. A binding is routing control: whatever it points `auto` at decides
+# every `auto` turn (ROUTE_POLICY.md § Operations, Exposure).
 - model: auto
   ruleset: default

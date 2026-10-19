@@ -1,7 +1,6 @@
 """regex_text -- one keyword rule on the latest user message.
 
-The rule is the semantic router's own shape (ai/semantic-router/config.yaml
-``routing.signals.keywords``)::
+A rule, one of ``rulesets/patterns/*.yaml``::
 
     name: code_kw
     operator: OR            # OR | AND | NOR
@@ -9,16 +8,16 @@ The rule is the semantic router's own shape (ai/semantic-router/config.yaml
     method: regex           # absent = each keyword is a whole-word literal
     keywords: ['\\bpython\\b', ...]
 
-compiled by ``common.keywordmatch`` with the Go router's semantics (RE2-style
-ASCII ``\\b`` / ``\\w``, ``(?i)`` unless case-sensitive), so the same rule
-reaches the same verdict here and in the router. A ruleset usually points at a
-file instead of inlining it -- ``config: {patterns_ref: patterns/code.yaml}``
--- and the loader inlines that file as ``rule`` before the content hash, so a
-changed pattern file is a changed ruleset version.
+compiled by ``common.keywordmatch`` with Go RE2's semantics (ASCII ``\\b`` /
+``\\w``, ``(?i)`` unless case-sensitive). A ruleset usually points at a file
+instead of inlining it -- ``config: {patterns_ref: patterns/code.yaml}`` --
+and the loader inlines that file as ``rule`` before the content hash, so a
+changed pattern file is a changed ruleset version. The pattern files are the
+only copy of the rules; unit-tests/route-policy/test_default_ruleset.py keeps
+their regexes in the RE2 subset.
 
-It reads the LATEST user message only (``scope: current_message``), exactly
-what the router's keyword signals see. As a ``cooldown`` judge it reads each
-past exchange's user message the same way.
+It reads the LATEST user message only (``scope: current_message``). As a
+``cooldown`` judge it reads each past exchange's user message the same way.
 
 ``detail`` names WHICH patterns matched (by index), never the matched text:
 decisions are federated into Trino, and the text is the user's.
@@ -36,9 +35,10 @@ from .base import Evaluator, EvaluatorConfig, FieldSpec, Outcome, OutputSpec, de
 
 
 class KeywordRuleSpec(BaseModel):
-    """A router keyword rule. Only the keys common.keywordmatch implements:
-    a ``fuzzy_match`` / ``bm25`` / ``ngram`` option the Go router knows would
-    be ignored here and give a different verdict, so it is refused instead."""
+    """A keyword rule. Only the keys common.keywordmatch implements: an
+    option it does not (``fuzzy_match``, ``bm25``, ``ngram``) would be
+    silently ignored and give a different verdict than its author expected,
+    so it is refused instead."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -55,7 +55,7 @@ class KeywordRuleSpec(BaseModel):
             raise ValueError("operator must be OR, AND or NOR")
         return value
 
-    def as_router_rule(self) -> dict:
+    def as_keyword_rule(self) -> dict:
         rule = {"name": self.name, "operator": self.operator,
                 "case_sensitive": self.case_sensitive, "keywords": list(self.keywords)}
         if self.method is not None:
@@ -72,14 +72,14 @@ class RegexTextConfig(EvaluatorConfig):
 
     @model_validator(mode="after")
     def _compiles(self) -> "RegexTextConfig":
-        compile_keyword_rule(self.rule.as_router_rule())  # ValueError -> a ruleset error
+        compile_keyword_rule(self.rule.as_keyword_rule())  # ValueError -> a ruleset error
         return self
 
 
 @declares(OutputSpec(
     type="regex_text",
-    summary="A keyword rule (the semantic router's shape, Go-RE2 semantics via common.keywordmatch) "
-            "on the latest user message.",
+    summary="A keyword rule ({name, operator, case_sensitive, method, keywords}; Go-RE2 semantics via "
+            "common.keywordmatch) on the latest user message.",
     votes="vote.route when the rule matches the latest user message; abstains otherwise, and when "
           "the conversation has no user message.",
     relevance="the exchange's user message matches the rule ('message matches <rule name>')",
@@ -99,7 +99,7 @@ class RegexText(Evaluator):
     def __init__(self, evaluator_id: str, config: RegexTextConfig) -> None:
         super().__init__(evaluator_id, config)
         self.rule_spec = config.rule
-        self.rule: KeywordRule = compile_keyword_rule(config.rule.as_router_rule())
+        self.rule: KeywordRule = compile_keyword_rule(config.rule.as_keyword_rule())
 
     def _detail(self, text: str, matched: bool) -> dict:
         return {

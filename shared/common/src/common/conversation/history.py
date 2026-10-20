@@ -16,10 +16,52 @@ def message_text(content: Any) -> str:
     return ""
 
 
+# Open WebUI (v0.11.4, utils/middleware.py) answers from retrieved sources --
+# a turn's attached files / knowledge on its first call, the pages a web
+# search or fetch tool returned on every later tool round -- by REWRITING the
+# latest user message for that one request (never saved): its RAG template
+# with {{CONTEXT}} filled in, then "\n", then the user's own text
+# (utils/misc.py update_message_content, append=False, per text part; with
+# RAG_SYSTEM_CONTEXT set it goes into the system message instead). The
+# default template (config.py DEFAULT_RAG_TEMPLATE) starts "### Task:" and
+# ends "<context>\n{{CONTEXT}}\n</context>\n", so the user's text is what
+# follows the LAST "</context>\n\n" -- the last, so a fetched page that
+# carries the boundary itself cannot pass its own text off as the user's.
+_OWUI_RAG_PREFIX = "### Task:"
+_OWUI_RAG_OPEN = "<context>"
+_OWUI_RAG_BOUNDARY = "</context>\n\n"
+
+
+def strip_openwebui_rag(text: str) -> str:
+    """The user's own words in a message Open WebUI wrapped in its RAG block
+    (above); any other text is returned unchanged -- a customised template
+    without that shape is left alone rather than guessed at."""
+    if not isinstance(text, str) or not text.lstrip().startswith(_OWUI_RAG_PREFIX):
+        return text
+    head, boundary, tail = text.rpartition(_OWUI_RAG_BOUNDARY)
+    if not boundary or _OWUI_RAG_OPEN not in head:
+        return text
+    return tail
+
+
+def user_text(content: Any) -> str:
+    """What the USER wrote in a user message's ``content``: :func:`message_text`
+    with Open WebUI's RAG block removed from each text part
+    (:func:`strip_openwebui_rag`)."""
+    if isinstance(content, str):
+        return strip_openwebui_rag(content)
+    if isinstance(content, list):
+        return "\n".join(strip_openwebui_rag(p["text"]) for p in content
+                         if isinstance(p, dict) and p.get("type") == "text" and isinstance(p.get("text"), str))
+    return ""
+
+
 def split_exchanges(messages: Any) -> List[Tuple[str, List[dict]]]:
     """[(user text, the messages after it up to the next user message)], one
-    per user message, oldest first. Anything before the first user message
-    (system prompts, a compaction summary) belongs to no exchange."""
+    per user message, oldest first. The user text is :func:`user_text`: what
+    the user typed, without the RAG block Open WebUI puts in front of it on a
+    request that carries retrieved sources. Anything before the first user
+    message (system prompts, a compaction summary) belongs to no exchange."""
     out: List[Tuple[str, List[dict]]] = []
     if not isinstance(messages, list):
         return out
@@ -27,7 +69,7 @@ def split_exchanges(messages: Any) -> List[Tuple[str, List[dict]]]:
         if not isinstance(msg, dict):
             continue
         if msg.get("role") == "user":
-            out.append((message_text(msg.get("content")), []))
+            out.append((user_text(msg.get("content")), []))
         elif out:
             out[-1][1].append(msg)
     return out

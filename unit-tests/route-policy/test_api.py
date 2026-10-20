@@ -172,7 +172,7 @@ def test_evaluate_errors(client):
 
 def test_health_ready_and_types(client):
     assert client.get("/health").json() == {"status": "ok", "rulesets": [{"id": "default", "version": 3},
-                                                                         {"id": "default-llm", "version": 2}],
+                                                                         {"id": "default-llm", "version": 3}],
                                             "bindings": 1}
     assert client.get("/ready").status_code == 503
     types = client.get("/evaluator-types").json()

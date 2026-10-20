@@ -285,3 +285,71 @@ def test_later_calls_of_a_turn_keep_its_route(name):
         assert decision.reason == f"{fresh.reason}; local-private beats this turn's first decision ({first_route}, {FIRST})"
     else:
         assert decision.reason == fresh.reason and decision.decided_by == fresh.decided_by
+
+
+# -- Open WebUI's RAG block ---------------------------------------------------------------
+
+# Open WebUI v0.11.4's DEFAULT_RAG_TEMPLATE (backend/open_webui/config.py),
+# verbatim. On a request carrying retrieved sources Open WebUI sends it,
+# filled in, in FRONT of the user's message. 2026-10-20: its example sentence
+# ("the proposed method increases efficiency") matched code_kw ("method"),
+# so a weather turn's fetch rounds voted local-code.
+OWUI_RAG_TEMPLATE = (
+    '### Task:\n'
+    'Respond to the user query using the provided context, incorporating inline citations in the format [id] **only when the <source> tag includes an explicit id attribute** (e.g., <source id="1">).\n'
+    '\n'
+    '### Guidelines:\n'
+    "- If you don't know the answer, clearly state that.\n"
+    '- If uncertain, ask the user for clarification.\n'
+    "- Respond in the same language as the user's query.\n"
+    '- If the context is unreadable or of poor quality, inform the user and provide the best possible answer.\n'
+    "- If the answer isn't present in the context but you possess the knowledge, explain this to the user and provide the answer using your own understanding.\n"
+    '- **Only include inline citations using [id] (e.g., [1], [2]) when the <source> tag includes an id attribute.**\n'
+    '- Do not cite if the <source> tag does not contain an id attribute.\n'
+    '- Do not use XML tags in your response.\n'
+    '- Ensure citations are concise and directly related to the information provided.\n'
+    '\n'
+    '### Example of Citation:\n'
+    'If the user asks about a specific topic and the information is found in a source with a provided id attribute, the response should include the citation like in the following example:\n'
+    '* "According to the study, the proposed method increases efficiency by 20% [1]."\n'
+    '\n'
+    '### Output:\n'
+    "Provide a clear and direct response to the user's query, including inline citations in the format [id] only when the <source> tag with id attribute is present in the context.\n"
+    '\n'
+    '<context>\n'
+    '{{CONTEXT}}\n'
+    '</context>\n'
+)
+
+
+def owui_wrap(own: str, context: str) -> str:
+    return OWUI_RAG_TEMPLATE.replace("{{CONTEXT}}", context) + "\n" + own
+
+
+def test_the_rag_template_alone_would_trip_code_kw():
+    """Why the block must go: without the strip, the template's own words are
+    a code_kw hit."""
+    assert compile_keyword_rule(_rule("code")).matches(OWUI_RAG_TEMPLATE)
+
+
+@pytest.mark.parametrize("context,expected", [
+    # The template alone (a fetch round's citation markers).
+    ('<source id="1" name="weather.gov"></source>', "local-general"),
+    # A fetched page full of code and PII words.
+    ('<source id="1">Our API endpoint docs: refactor the function, debug the traceback. '
+     'Call me, my SSN is 123-45-6789.</source>', "local-general"),
+])
+def test_rules_read_the_users_words_not_open_webuis_block(context, expected):
+    messages = [user("check the weather in Utah"), *tool_round("search_web"), *tool_round("fetch_url", "c2")]
+    messages[0] = user(owui_wrap("check the weather in Utah", context))
+    decision = run(default_ruleset(), messages)
+    assert decision.route == expected, decision.reason
+    code_text = next(v for v in decision.votes if v.evaluator == "code-text")
+    assert code_text.detail["searched_chars"] == len("check the weather in Utah")
+
+
+def test_a_wrapped_coding_request_still_routes_to_code():
+    """The user's own words still count: "fix this function" stays a code turn
+    with sources attached."""
+    decision = run(default_ruleset(), [user(owui_wrap("fix this function", '<source id="1">x</source>'))])
+    assert decision.route == "local-code", decision.reason

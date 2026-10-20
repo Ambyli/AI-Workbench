@@ -56,7 +56,7 @@ import sys
 from collections import defaultdict
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
-from common.conversation import called_tool_names, message_text
+from common.conversation import called_tool_names, user_text
 
 from . import convert
 from .baseline import DEFAULT_RULESET, PRIVATE_ROUTE, RuleBaseline, weak_label
@@ -143,7 +143,8 @@ async def chat_points(chat: Dict[str, Any], *, baseline: RuleBaseline, decisions
         answer_id = answer_msg.get("id") if answer_msg else None
         answer_tools = called_tool_names(convert.replay_answer(stored_answer))
 
-        text = message_text(messages[-1].get("content")) if messages and messages[-1].get("role") == "user" else ""
+        # What the privacy evaluator reads (user_text: Open WebUI's RAG block removed).
+        text = user_text(messages[-1].get("content")) if messages and messages[-1].get("role") == "user" else ""
         privacy = baseline.privacy_matches(text)
         code_tool = baseline.code_tool(answer_tools)
         decision_route = decisions.route(chat_id, answer_id)

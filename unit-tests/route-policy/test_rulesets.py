@@ -43,9 +43,9 @@ def test_the_baked_in_seed():
     # tests). `default-llm` is the phase-4 draft, bound as `auto`'s shadow;
     # its version 1 likewise.
     assert sorted((r.id, r.version, r.mode) for r in s.compiled) == [
-        ("default", 3, "enforce"), ("default-llm", 2, "shadow")]
+        ("default", 3, "enforce"), ("default-llm", 3, "shadow")]
     assert [(b.scope_model, b.scope_key_alias, b.ruleset_id, b.version, b.shadows) for b in s.bindings] == [
-        ("auto", None, "default", 3, (("default-llm", 2),))]
+        ("auto", None, "default", 3, (("default-llm", 3),))]
     ruleset = default_ruleset()
     assert ruleset.routes == ["local-general", "local-code", "local-reasoning", "local-private"]
     assert ruleset.default_route == "local-general"
@@ -72,7 +72,7 @@ def test_content_hash_ignores_comments_and_tracks_content(tmp_path):
         return {r.key: r.sha256 for r in load_directory(directory)}
 
     base = hashes(tmp_path)
-    assert base == hashes(RULESETS_DIR) and set(base) == {("default", 3), ("default-llm", 2)}
+    assert base == hashes(RULESETS_DIR) and set(base) == {("default", 3), ("default-llm", 3)}
     ruleset = tmp_path / "default.yaml"
     ruleset.write_text("# a new comment\n" + ruleset.read_text(encoding="utf-8"), encoding="utf-8")
     assert hashes(tmp_path) == base
@@ -203,9 +203,9 @@ def test_seed_bindings(tmp_path):
     (b,) = _bindings(tmp_path, "- {model: auto, key_alias: tester, ruleset: default, version: 3}\n")
     assert b.scope_key_alias == "tester"
     (b,) = _bindings(tmp_path, "- {model: auto, ruleset: default, shadow: [default-llm]}\n")
-    assert b.shadows == (("default-llm", 2),)
-    (b,) = _bindings(tmp_path, "- {model: auto, ruleset: default, shadow: [{ruleset: default-llm, version: 2}]}\n")
-    assert b.shadows == (("default-llm", 2),)
+    assert b.shadows == (("default-llm", 3),)
+    (b,) = _bindings(tmp_path, "- {model: auto, ruleset: default, shadow: [{ruleset: default-llm, version: 3}]}\n")
+    assert b.shadows == (("default-llm", 3),)
     (b,) = _bindings(tmp_path, "- {model: auto, ruleset: default, shadow: []}\n")
     assert b.shadows == ()
     for bad, match in [
@@ -245,14 +245,14 @@ def test_store_resolves_bindings_by_model_and_key_alias():
         store.add(r)
     from route_policy.rulesets.loader import Binding
 
-    store.set_bindings([Binding("auto", None, "default", 3, (("default-llm", 2),)),
+    store.set_bindings([Binding("auto", None, "default", 3, (("default-llm", 3),)),
                         Binding("auto", "tester", "default", 3)])
     assert store.binding_for("auto", None).scope_key_alias is None
     assert store.binding_for("auto", "tester").scope_key_alias == "tester"
     assert store.binding_for("auto", "someone").scope_key_alias is None
     assert store.binding_for("local-code", None) is None
     resolved = asyncio.run(store.resolve("auto", None))
-    assert resolved.primary.id == "default" and resolved.shadows == (("default-llm", 2),)
+    assert resolved.primary.id == "default" and resolved.shadows == (("default-llm", 3),)
     assert [r.id for r in asyncio.run(store.shadow_rulesets(resolved))] == ["default-llm"]
     assert asyncio.run(store.resolve("auto", "tester")).shadows == ()
     assert asyncio.run(store.resolve("gpt-4", None)) is None

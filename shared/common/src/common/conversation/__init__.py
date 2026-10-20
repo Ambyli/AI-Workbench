@@ -10,6 +10,15 @@ proxy hook asks about it without caring which client produced it:
 * :func:`split_exchanges` — the history as EXCHANGES, one per user message:
   the user's text plus every message after it up to the next user message
   (the model rounds and tool results it started);
+* :func:`user_text` / :func:`strip_openwebui_rag` — what the USER wrote in a
+  user message. On a request that carries retrieved sources (attached
+  files, the pages a web search or fetch tool returned) Open WebUI puts
+  its RAG instruction block ("### Task: Respond to the user query using
+  the provided context ... <context>...</context>") in front of the
+  user's words for that one request; these return the words alone, so a
+  keyword rule never reads Open WebUI's instructions or a fetched page as
+  the user's request. :func:`split_exchanges` (and so
+  :func:`render_transcript`) use it; :func:`message_text` does not;
 * :func:`called_tool_names` — the tools the conversation actually CALLED,
   most recent first, from every shape a history carries a call in (OpenAI
   ``tool_calls`` / legacy ``function_call``, Anthropic ``tool_use`` blocks,
@@ -36,6 +45,8 @@ install, which is why it must stay stdlib-only.
 
 Public API:
     message_text(content)        -> str
+    user_text(content)           -> str   (message_text without Open WebUI's RAG block)
+    strip_openwebui_rag(text)    -> str
     split_exchanges(messages)    -> [(user text, [messages after it]), ...]
     called_tool_names(messages)  -> [tool name, ...] most recent first
     user_message_count(messages) -> int
@@ -47,8 +58,10 @@ from .history import (
     message_text,
     render_transcript,
     split_exchanges,
+    strip_openwebui_rag,
     user_message_count,
+    user_text,
 )
 
 __all__ = ["called_tool_names", "message_text", "render_transcript", "split_exchanges",
-           "user_message_count"]
+           "strip_openwebui_rag", "user_message_count", "user_text"]

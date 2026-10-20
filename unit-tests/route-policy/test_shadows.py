@@ -50,7 +50,7 @@ from route_policy.rulesets.store import Resolved, RulesetStore
 from route_policy.service import Service, shadow_decision_id
 
 PRIMARY = ("default", 3)
-SHADOW = ("default-llm", 2)
+SHADOW = ("default-llm", 3)
 
 
 @pytest.fixture
@@ -101,7 +101,7 @@ def test_resolve_returns_the_primary_and_the_shadow_refs():
     resolved = asyncio.run(store.resolve("auto", None))
     assert (resolved.primary.id, resolved.primary.version) == PRIMARY and resolved.shadows == (SHADOW,)
     assert [(r.id, r.version, r.mode) for r in asyncio.run(store.shadow_rulesets(resolved))] == [
-        ("default-llm", 2, "shadow")]
+        ("default-llm", 3, "shadow")]
 
 
 def test_a_shadow_that_cannot_load_is_skipped_and_counted():
@@ -115,7 +115,7 @@ def test_a_shadow_that_cannot_load_is_skipped_and_counted():
 def test_shadow_ids_are_derived():
     primary = uuid.UUID("6f0e8c1e-8f7e-4c55-9a39-0f3f7ab5d001")
     (llm,) = [r for r in seed().compiled if r.id == "default-llm"]
-    assert shadow_decision_id(primary, llm) == uuid.uuid5(primary, "default-llm@2")
+    assert shadow_decision_id(primary, llm) == uuid.uuid5(primary, "default-llm@3")
     assert shadow_decision_id(primary, llm) == shadow_decision_id(primary, llm)
     assert shadow_decision_id(uuid.uuid4(), llm) != shadow_decision_id(primary, llm)
 
@@ -148,17 +148,17 @@ def test_the_shadow_decision_is_stored_beside_the_primary(tables):
     with TestClient(create_app(service=service, instrument=False)) as client:
         out = client.post("/decide", json=body).json()
         primary_id = uuid.UUID(body["decision_id"])
-        shadow_id = uuid.uuid5(primary_id, "default-llm@2")
+        shadow_id = uuid.uuid5(primary_id, "default-llm@3")
         wait_for(lambda: shadow_id in tables.decisions)
     primary, shadow = tables.decisions[primary_id], tables.decisions[shadow_id]
     assert primary.shadow_of is None and primary.response == out
     assert shadow.shadow_of == primary_id
-    assert (shadow.ruleset_id, shadow.ruleset_version, shadow.mode, shadow.applied) == ("default-llm", 2, "shadow",
+    assert (shadow.ruleset_id, shadow.ruleset_version, shadow.mode, shadow.applied) == ("default-llm", 3, "shadow",
                                                                                        False)
     assert (shadow.chat_id, shadow.message_id, shadow.user_id, shadow.litellm_call_id) == (
         "chat-s", "msg-2", "u1", "call-1")
     assert shadow.response["decision_id"] == str(shadow_id) and shadow.response["ruleset"] == {
-        "id": "default-llm", "version": 2}
+        "id": "default-llm", "version": 3}
     assert [e.evaluator_id for e in tables.evaluations[shadow_id]] == [
         "privacy", "code-text", "reasoning-text", "code-tools", "topic-llm"]
     topic = tables.evaluations[shadow_id][-1]
@@ -169,8 +169,8 @@ def test_the_shadow_decision_is_stored_beside_the_primary(tables):
 def test_a_repeated_decide_writes_no_shadow_twice(tables):
     service = _service(FakeDatabase())
     body = _body()
-    shadow_id = uuid.uuid5(uuid.UUID(body["decision_id"]), "default-llm@2")
-    before = _sample("route_policy_shadow_decisions_total", ruleset="default-llm@2", agree="true")
+    shadow_id = uuid.uuid5(uuid.UUID(body["decision_id"]), "default-llm@3")
+    before = _sample("route_policy_shadow_decisions_total", ruleset="default-llm@3", agree="true")
     with TestClient(create_app(service=service, instrument=False)) as client:
         first = client.post("/decide", json=body).json()
         wait_for(lambda: shadow_id in tables.decisions)
@@ -178,7 +178,7 @@ def test_a_repeated_decide_writes_no_shadow_twice(tables):
         wait_for(lambda: service.pending_writes == 0)
     assert first == second
     assert len(tables.decisions) == 2
-    assert _sample("route_policy_shadow_decisions_total", ruleset="default-llm@2", agree="true") == before + 1
+    assert _sample("route_policy_shadow_decisions_total", ruleset="default-llm@3", agree="true") == before + 1
 
 
 # -- the analysis requests ------------------------------------------------------------------------
@@ -193,11 +193,11 @@ def test_requests_reach_the_queue_with_their_provenance(tables):
         wait_for(lambda: queue.submitted)
         wait_for(lambda: service.pending_writes == 0)
     (req,) = queue.submitted   # `default` has no llm_classifier; default-llm's topic-llm asks once
-    shadow_id = uuid.uuid5(uuid.UUID(body["decision_id"]), "default-llm@2")
+    shadow_id = uuid.uuid5(uuid.UUID(body["decision_id"]), "default-llm@3")
     assert (req.ruleset_id, req.ruleset_version, req.decision_id, req.evaluator_id) == (
-        "default-llm", 2, shadow_id, "topic-llm")
+        "default-llm", 3, shadow_id, "topic-llm")
     assert (req.chat_id, req.message_id, req.exchange_index, req.model) == ("chat-s", "msg-2", 2, "qwen3.5-4b")
-    assert req.text == render_transcript(body["messages"], exchanges=4, max_chars=6000, upto_user=2)
+    assert req.text == render_transcript(body["messages"], exchanges=1, max_chars=6000, upto_user=2)
 
 
 def test_a_primary_with_an_llm_classifier_reads_its_verdicts_and_enqueues(tables):
@@ -213,7 +213,7 @@ def test_a_primary_with_an_llm_classifier_reads_its_verdicts_and_enqueues(tables
     service = Service(store=store, database=FakeDatabase(), rulesets_dir=RULESETS_DIR, analysis_queue=queue)
     messages = [user("hello"), assistant("hi"), user("tell me about the moon")]
     topic = enforced.entries[-1].evaluator
-    k1 = input_key(topic.fingerprint, render_transcript(messages, exchanges=4, max_chars=6000, upto_user=1))
+    k1 = input_key(topic.fingerprint, render_transcript(messages, exchanges=1, max_chars=6000, upto_user=1))
     tables.analyses[k1] = Verdict(k1, "ok", "local-reasoning", 0.8, {"local-reasoning": 8}, 1, "qwen3.5-4b")
     with TestClient(create_app(service=service, instrument=False)) as client:
         out = client.post("/decide", json=_body(messages=messages)).json()
@@ -290,7 +290,7 @@ def test_evaluate_reads_verdicts_and_never_enqueues(tables):
     messages = [user("hello"), assistant("hi"), user("tell me about the moon")]
     (llm,) = [r for r in seed().compiled if r.id == "default-llm"]
     topic = llm.entries[-1].evaluator
-    k1 = input_key(topic.fingerprint, render_transcript(messages, exchanges=4, max_chars=6000, upto_user=1))
+    k1 = input_key(topic.fingerprint, render_transcript(messages, exchanges=1, max_chars=6000, upto_user=1))
     tables.analyses[k1] = Verdict(k1, "ok", "local-code", 0.9, {"local-code": 9}, 1, "qwen3.5-4b")
     with TestClient(create_app(service=service, instrument=False)) as client:
         out = client.post("/evaluate", json={"ruleset": {"id": "default-llm"}, "messages": messages}).json()

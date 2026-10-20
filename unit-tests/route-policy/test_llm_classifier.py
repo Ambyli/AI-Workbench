@@ -317,7 +317,7 @@ def test_the_draft_ruleset_wiring():
     (llm,) = [r for r in seed().compiled if r.id == "default-llm"]
     (live,) = [r for r in seed().compiled if r.id == "default"]
     assert (llm.version, llm.mode, llm.pin, llm.routes, llm.default_route) == (
-        2, "shadow", "turn", live.routes, live.default_route)
+        3, "shadow", "turn", live.routes, live.default_route)
     assert [(e.id, e.type, e.role) for e in llm.entries] == [
         ("privacy", "regex_text", "force"), ("code-text", "regex_text", "vote"),
         ("reasoning-text", "regex_text", "vote"), ("code-tools", "tool_calls", "vote"),
@@ -328,14 +328,16 @@ def test_the_draft_ruleset_wiring():
     topic = llm.entries[-1].evaluator.config
     assert topic.model == "qwen3.5-4b" and list(topic.criteria) == ["local-code", "local-reasoning", "local-private"]
     assert (topic.otherwise, topic.min_score, topic.history.exchanges, topic.history.max_chars,
-            topic.max_age_exchanges) == ("local-general", 7, 4, 6000, 2)
+            topic.max_age_exchanges) == ("local-general", 7, 1, 6000, 1)
     assert all(len(text) <= 200 for text in topic.criteria.values())
     # Version 1's "writing, running, debugging or changing code or software"
-    # scored a web search for the weather 10/10 as running software: the
-    # code criterion asks about source code, and says a tool call is not it.
+    # scored a web search for the weather 10/10 as running software; version
+    # 2's "source code, a script or a software project" scored "make me a
+    # calculator app" 1/10. Version 3 covers building an app and still says a
+    # tool call is not code.
     code = topic.criteria["local-code"]
-    assert code == ("The latest user request asks to write, fix, change or explain source code, a script or a "
-                    "software project. Using a tool such as web search does not count.")
+    assert code == ("The latest user request asks to build, write, fix, change or explain software: an app, "
+                    "a website, a script or source code. Using a tool such as web search does not count.")
     assert "running" not in code
     assert llm.combiner.type_name == "priority"
     assert (RULESETS_DIR / "default-llm.yaml").exists()

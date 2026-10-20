@@ -17,10 +17,12 @@
 # shadow rows: the turn's first shadow decision is the only one that asks
 # for a classification.
 #
-# `topic-llm` votes from the verdict the analysis queue stored for an
-# earlier prefix of this conversation (usually the previous user message's:
-# this message is classified only after this answer), at most 2 user
-# messages old. Its model, `qwen3.5-4b`, is the CPU llama.cpp service
+# `topic-llm` votes from the verdict the analysis queue stored for the
+# previous user message (this message is classified only after this
+# answer starts), and reads only that ONE message -- the latest request is
+# what says where the conversation is heading; older exchanges made it
+# score a weather question as code because a calculator was still in the
+# window. Its model, `qwen3.5-4b`, is the CPU llama.cpp service
 # (ai/llama), reached only through the document classifier's registry
 # (ai/classifier/models.yaml); the analysis queue refuses any model that is
 # not local (ROUTE_POLICY.md § The llm_classifier). An Open WebUI background
@@ -30,13 +32,17 @@
 # debugging or changing code or software", and the model counted a web
 # search for the weather as running software (10/10 for local-code). 2 asks
 # about source code and says that using a tool does not count, and pins the
-# route per turn. The criteria are in the verdict keys' fingerprint, so
-# version 2 classifies from scratch rather than reading version 1's
-# verdicts.
+# route per turn. 3 reads only the latest user message (history.exchanges
+# 1, was 4), uses a verdict for the next message only (max_age_exchanges
+# 1, was 2), and lets the code criterion cover building an app again (2
+# scored "Can you make me a calculator app?" 1/10 as "an application
+# rather than source code"). The criteria and history are in the verdict
+# keys' fingerprint, so each version classifies from scratch rather than
+# reading an earlier one's verdicts.
 #
 # CHANGING IT: versions are immutable -- edit, then bump `version`.
 id: default-llm
-version: 2
+version: 3
 description: >-
   Draft: `default` with the 2-exchange code cooldown replaced by a local
   model's verdict on the conversation (qwen3.5-4b through the document
@@ -88,13 +94,13 @@ evaluators:
     config:
       model: qwen3.5-4b
       criteria:
-        local-code: "The latest user request asks to write, fix, change or explain source code, a script or a software project. Using a tool such as web search does not count."
+        local-code: "The latest user request asks to build, write, fix, change or explain software: an app, a website, a script or source code. Using a tool such as web search does not count."
         local-reasoning: "The latest user request needs careful multi-step reasoning such as maths, logic, planning or analysis."
         local-private: "The conversation contains personal data about a real person, such as a name with an address, phone number, email or account number."
       otherwise: local-general
       min_score: 7
-      history: {exchanges: 4, max_chars: 6000}
-      max_age_exchanges: 2
+      history: {exchanges: 1, max_chars: 6000}
+      max_age_exchanges: 1
     vote: {weight: 1.0}
 
 combiner: {type: priority}

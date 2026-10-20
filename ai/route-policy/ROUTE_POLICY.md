@@ -214,11 +214,11 @@ A fresh box, in order (from the repo root):
 
 ```bash
 make logs route-policy route-policy FOLLOW=0 TAIL=50   # "applied migration 0001_initial.sql" / "0002_llm_classifier.sql" /
-                                                      # "0003_turn_pins.sql", "seeded default@3", "seeded default-llm@2",
-                                                      # "binding auto -> default@3", "binding auto shadowed by default-llm@2",
+                                                      # "0003_turn_pins.sql", "seeded default@3", "seeded default-llm@3",
+                                                      # "binding auto -> default@3", "binding auto shadowed by default-llm@3",
                                                       # "analysis: queue ready (2 worker(s), ...)"
 curl -s localhost:8027/health                         # {"status":"ok","rulesets":[{"id":"default","version":3},
-                                                      #   {"id":"default-llm","version":2}],"bindings":1}
+                                                      #   {"id":"default-llm","version":3}],"bindings":1}
 curl -s localhost:8027/ready                          # {"status":"ready","db":"up"}
 curl -s localhost:8027/bindings
 curl -s -X POST localhost:8027/evaluate -H 'content-type: application/json' \
@@ -360,6 +360,24 @@ phase 3: route-policy first, then the hook. On the box, from the repo root:
 again, already stored with the same content, and moves both slots back;
 the old code ignores the two columns (new rows get their defaults) and the
 appended view columns. Versions 3 and 2 stay stored with their decisions.
+
+### Upgrading to default-llm@3
+
+Only the shadow draft changes: `topic-llm` reads just the latest user
+message, a verdict counts for the next message only, and the code
+criterion covers building an app again ([§ The `default-llm`
+draft](#the-default-llm-draft)). Routing does not change -- `default@3` is
+untouched.
+
+1. **`git pull`.** No new `.env` lines, no migration.
+2. **`make build route-policy && make up route-policy`.** `default-llm@3` is
+   seeded and the shadow slot moves to it (`/health` lists
+   `{"id":"default-llm","version":3}`). Its fingerprint is new, so it
+   classifies from scratch; compare versions in Trino by
+   `shadow_ruleset_version` / `analyses.ruleset_version`.
+
+**Rollback:** `git revert` and `make up route-policy`; `default-llm@2` is
+already stored with the same content and the slot moves back.
 
 ## API
 
@@ -641,8 +659,8 @@ swap cannot race.
 Startup owns the seeded bindings and resets them on every start.
 
 **A stored version needs no file.** Only the current `default` (version 3)
-and `default-llm` (version 2) are baked in; `default@1` (phase 2, shadow),
-`default@2` (phase 3) and `default-llm@1` stay in the database with the
+and `default-llm` (version 3) are baked in; `default@1` (phase 2, shadow),
+`default@2` (phase 3), `default-llm@1` and `default-llm@2` stay in the database with the
 decisions made under them, and the store compiles each from there on first
 use (`GET /rulesets/default/1`, `POST /evaluate`). Keeping old files would
 also freeze the pattern files: a version that references `patterns/code.yaml`
@@ -695,6 +713,24 @@ into Trino; `regex_text` reports pattern *indices*, `tool_calls` tool *names*.
 
 - **Exchanges** come from `common.conversation.split_exchanges`: one per user
   message, holding the message and every round after it.
+- **A user message is what the user typed.** On a request that carries
+  retrieved sources -- a turn's attached files or knowledge on its first
+  call, the pages a web search or fetch tool returned on every later tool
+  round -- Open WebUI rewrites the latest user message for that one request:
+  its RAG template (`### Task: Respond to the user query using the
+  provided context …`, ~1,450 characters) with the sources filled into
+  `<context>…</context>`, then the user's words. `split_exchanges` reads
+  user text through `common.conversation.user_text`, which removes that
+  block (everything up to the last `</context>`, so a fetched page cannot
+  pass text off as the user's), so `regex_text`, the cooldown's judges and
+  the classifier's transcript never read Open WebUI's instructions or a
+  fetched page as the user's request. Before it, the template's own example
+  sentence ("the proposed **method** increases efficiency") matched
+  `code_kw` on every fetch round (2026-10-20); a privacy word in a fetched
+  page would have forced `local-private` mid-answer. `regex_text`'s
+  `searched_chars` is the typed length. A customised `RAG_TEMPLATE` that
+  does not start `### Task:` and end `<context>…</context>` is left as
+  is.
 - **`regex_text` and `tool_calls` can judge a single exchange**, which is what
   `cooldown.relevant_if` uses.
 - **`llm_classifier`** reads only what the service put on the request
@@ -794,7 +830,7 @@ nudge is a new user message, so it is a new "exchange" for `sticky-code`
 (that is how a weather answer fell off `local-code` halfway), and its text
 is the nudge's, not the user's.
 
-**`pin: turn`** (a ruleset field, `default@3` and `default-llm@2` set it):
+**`pin: turn`** (a ruleset field; `default@3` and `default-llm@2` onward set it):
 1. **The first call of a turn is decided exactly as without a pin.**
 2. **A later call** (a stored decision of the same ruleset id exists for the
    same chat + message) runs every evaluator as usual -- votes and scores
@@ -916,13 +952,13 @@ how a draft is measured on real traffic before anyone promotes it.
   config:
     model: qwen3.5-4b           # a document-classifier registry id; must be LOCAL (below)
     criteria:                   # route -> the question /assess scores 1-10 (hint: presence), <= 200 chars each
-      local-code: "The latest user request asks to write, fix, change or explain source code, a script or a software project. Using a tool such as web search does not count."
+      local-code: "The latest user request asks to build, write, fix, change or explain software: an app, a website, a script or source code. Using a tool such as web search does not count."
       local-reasoning: "The latest user request needs careful multi-step reasoning such as maths, logic, planning or analysis."
       local-private: "The conversation contains personal data about a real person, such as a name with an address, phone number, email or account number."
     otherwise: local-general    # no criterion reaches min_score -> this route; null = abstain
     min_score: 7                # the classifier's PASS line
-    history: {exchanges: 4, max_chars: 6000}   # max_chars <= the model's text_char_budget (12000 for qwen3.5-4b)
-    max_age_exchanges: 2        # a verdict may be this many user messages old
+    history: {exchanges: 1, max_chars: 6000}   # ONLY the latest user message; max_chars <= the model's text_char_budget (12000 for qwen3.5-4b)
+    max_age_exchanges: 1        # a verdict counts for the next user message only
   vote: {weight: 1.0}           # no route: the verdict picks it
 ```
 
@@ -1089,7 +1125,7 @@ lifespan:
 
 ## The `default-llm` draft
 
-`rulesets/default-llm.yaml`, version 2, `mode: shadow`, `pin: turn`, bound
+`rulesets/default-llm.yaml`, version 3, `mode: shadow`, `pin: turn`, bound
 as `auto`'s shadow, `priority` combiner:
 
 | # | Evaluator | Type | Route |
@@ -1116,7 +1152,14 @@ code, a script or a software project and says that using a tool does not
 count, and pins the route per turn (from its own shadow rows). The
 criteria are in the verdict keys' fingerprint, so version 2 classifies from
 scratch instead of reading version 1's verdicts; in Trino, compare the two
-by `shadow_ruleset_version`.
+by `shadow_ruleset_version`. 3 reads **only the latest user message**
+(`history.exchanges: 1`, was 4) -- the latest request is what says where
+the conversation is heading, and with 4 exchanges in the window two
+weather follow-ups scored 10/10 for code because the calculator work was
+still in it; a verdict counts for the next message only
+(`max_age_exchanges: 1`, was 2); and the code criterion covers building
+an app again (2 scored "Can you make me a calculator app?" 1/10 as "an
+application rather than source code").
 
 ## Decision log and Trino
 
@@ -1395,7 +1438,7 @@ prometheus-fastapi-instrumentator. Each `/decide` logs one INFO line:
 `[decide] <id> auto -> local-code (code-tools: called … ; default@3 enforce) chat=<id>`
 (` task` appended for a background task; a pinned call's reason starts
 `pinned to this turn's first decision …`),
-each shadow one `[shadow] <id> default-llm@2 -> … beside <primary id> -> …`,
+each shadow one `[shadow] <id> default-llm@3 -> … beside <primary id> -> …`,
 each classification one `[analysis] <key prefix> qwen3.5-4b k=3 -> local-code (ok; scores {…}; 6.2s, queue 0.4s) chat=<id>`
 -- ids, routes, scores and timings, never text.
 

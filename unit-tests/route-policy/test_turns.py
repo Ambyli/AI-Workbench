@@ -108,7 +108,7 @@ def test_the_calls_of_one_turn_keep_its_first_route(tables):
     service = _service(GatedDatabase(), queue=queue)
     kept = _sample("route_policy_pinned_total", ruleset="default@3", outcome="kept")
     changed = _sample("route_policy_pinned_total", ruleset="default@3", outcome="changed")
-    shadow_kept = _sample("route_policy_pinned_total", ruleset="default-llm@2", outcome="kept")
+    shadow_kept = _sample("route_policy_pinned_total", ruleset="default-llm@3", outcome="kept")
     with TestClient(create_app(service=service, instrument=False)) as client:
         calls = [_decide(client, tables, messages) for messages in (FIRST_CALL, TOOL_ROUND, NUDGED)]
         wait_for(lambda: service.pending_writes == 0)
@@ -130,7 +130,7 @@ def test_the_calls_of_one_turn_keep_its_first_route(tables):
     assert [s.chosen_route for s in shadows] == ["local-general"] * 3
     assert shadows[0].pinned_from is None
     assert shadows[1].pinned_from == shadows[2].pinned_from == shadows[0].decision_id
-    assert _sample("route_policy_pinned_total", ruleset="default-llm@2", outcome="kept") == shadow_kept + 2
+    assert _sample("route_policy_pinned_total", ruleset="default-llm@3", outcome="kept") == shadow_kept + 2
     # One classification for the turn: the first shadow decision's. The tool
     # round's prefix was the same; the nudge's (a new "user message") is
     # never asked for.

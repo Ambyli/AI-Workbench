@@ -44,7 +44,7 @@ def test_decide_returns_the_contract(client):
     assert set(out) == DECIDE_KEYS and all(set(v) == VOTE_KEYS for v in out["votes"])
     assert out["decision_id"] == body["decision_id"]
     assert (out["route"], out["mode"], out["apply"]) == ("local-code", "enforce", True)
-    assert out["ruleset"] == {"id": "default", "version": 2}
+    assert out["ruleset"] == {"id": "default", "version": 3}
 
 
 def test_decide_is_lenient_where_strictness_would_only_lose_data(client):
@@ -122,9 +122,18 @@ def test_evaluate_a_stored_ruleset(client):
     out = r.json()
     assert out["decision_id"] is None and out["route"] == "local-reasoning"
     assert all(set(v) == VOTE_KEYS | {"detail", "error"} for v in out["votes"])
-    r = client.post("/evaluate", json={"ruleset": {"id": "default", "version": 2},
+    r = client.post("/evaluate", json={"ruleset": {"id": "default", "version": 3},
                                        "requested_model": "local-private", "messages": [user("prove it")]})
     assert r.json()["route"] == "local-private"
+
+
+def test_evaluate_takes_the_background_task_flag(client):
+    body = {"ruleset": {"id": "default-llm"}, "messages": [user("### Task:\nGenerate a title")]}
+    chat = client.post("/evaluate", json=body).json()["votes"][-1]
+    task = client.post("/evaluate", json={**body, "background_task": True}).json()["votes"][-1]
+    assert chat["evaluator"] == task["evaluator"] == "topic-llm"
+    assert chat["reason"] == "lookup unavailable (no database)"   # a chat turn looks its verdicts up
+    assert task["reason"] == "background task" and task["detail"]["looked_up"] == 0
 
 
 def test_evaluate_a_document(client):
@@ -162,8 +171,8 @@ def test_evaluate_errors(client):
 
 
 def test_health_ready_and_types(client):
-    assert client.get("/health").json() == {"status": "ok", "rulesets": [{"id": "default", "version": 2},
-                                                                         {"id": "default-llm", "version": 1}],
+    assert client.get("/health").json() == {"status": "ok", "rulesets": [{"id": "default", "version": 3},
+                                                                         {"id": "default-llm", "version": 2}],
                                             "bindings": 1}
     assert client.get("/ready").status_code == 503
     types = client.get("/evaluator-types").json()
@@ -180,7 +189,7 @@ def test_health_ready_and_types(client):
 
 
 def test_database_reads_without_a_database_are_503(client):
-    for path in ("/rulesets", "/rulesets/default", "/rulesets/default/2", "/bindings", "/chats/c/decisions"):
+    for path in ("/rulesets", "/rulesets/default", "/rulesets/default/3", "/bindings", "/chats/c/decisions"):
         assert client.get(path).status_code == 503, path
 
 

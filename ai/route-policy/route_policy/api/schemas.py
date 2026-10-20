@@ -46,11 +46,22 @@ class _Conversation(BaseModel):
     messages: List[Any] = Field(default_factory=list)
     tools: Optional[List[Any]] = None
     backends: Optional[Dict[str, BackendIn]] = None
+    # The hook's verdict (ai/litellm/hooks/footer/render.py is_openwebui_task)
+    # that this is an Open WebUI background task -- a title, tags,
+    # follow-ups -- rather than a chat answer. Optional, default false: a
+    # hook older than this field still decides as before (route-policy
+    # deploys first).
+    background_task: bool = False
 
     @field_validator("messages", mode="before")
     @classmethod
     def _messages(cls, value: Any) -> Any:
         return [] if value is None else value
+
+    @field_validator("background_task", mode="before")
+    @classmethod
+    def _background_task(cls, value: Any) -> Any:
+        return False if value is None else value
 
     def backend_views(self) -> Dict[str, BackendView]:
         return {base: BackendView(base, b.verdict, b.waiting, b.running)
@@ -77,6 +88,7 @@ class DecideRequest(_Conversation):
             user_id=self.user_id,
             key_alias=self.key_alias,
             litellm_call_id=self.litellm_call_id,
+            background_task=self.background_task,
         )
 
 
@@ -104,7 +116,8 @@ class EvaluateRequest(_Conversation):
 
     def context(self) -> RequestContext:
         return RequestContext(requested_model=self.requested_model, messages=self.messages,
-                              tools=self.tools, backends=self.backend_views())
+                              tools=self.tools, backends=self.backend_views(),
+                              background_task=self.background_task)
 
 
 class ObserveRequest(BaseModel):

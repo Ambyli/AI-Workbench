@@ -487,7 +487,7 @@ Upstream stops there, and nothing happens until the user types "go on". Patch `0
 - the chat uses native function calling and tools were offered (legacy function calling, task-model calls and tool-less chats are never touched);
 - at least one tool round already ran in this turn, and the reply came straight after a tool result (only reasoning in between);
 - the reply's last paragraph — LiteLLM `auto` footer stripped, code removed, reasoning not read — ends in first-person, forward-looking intent in its last two sentences ("let me", "I'll", "I'm going to", "now I", "give me a moment", "I'm fixing it now", …);
-- it asks the user nothing: no `?` in the last paragraph, no "want me to" / "should I" / "would you like" / "let me know" / "if you'd like";
+- it hands nothing back to the user: no `?` in the last paragraph, no "want me to" / "should I" / "would you like" / "let me know", and no conditional or offer addressed to them ("if you …", "tell me …", "feel free …", "just say …", "happy to …", "once / when you …"). "If you're in Provo, tell me and I'll check that spot" is an offer, not an announced action — on 2026-10-20 such an ending was nudged into a second, redundant answer before offers counted;
 - fewer than `AUTO_CONTINUE_MAX_NUDGES` nudges were sent this turn, and the tool-call iteration limit isn't reached.
 
 Instead it sends the conversation so far plus a hidden user message — *"You said you would take an action but your reply contained no tool call, so nothing happened. Make the tool call now. If the task is actually finished, reply with a one-line summary instead; if you need a decision from the user, ask the question."* — through the same continuation path a tool round uses. The model's continuation, and any tool calls it makes (which then run through the normal loop), are appended to the **same** assistant message. The nudge exists only in that one request: it is never shown in the chat and never saved, and later rounds in the turn don't see it either. Bare imperatives ("re-run the tests", "then run it") don't count as intent, because in a finished answer they are instructions to the user. The Responses-API stateful mode (`ENABLE_RESPONSES_API_STATEFUL`) is skipped. A nudge that fails is logged and ends the turn as upstream would.
@@ -671,7 +671,8 @@ docker exec openwebui test -f /app/backend/open_webui/utils/trusted_proxy.py && 
 docker exec openwebui test -f /app/backend/open_webui/utils/mcp_oauth_defaults.py && echo 0003 patched
 docker exec openwebui grep -q _zeo_refresh_single_flight /app/backend/open_webui/utils/oauth.py && echo 0003 refresh fix
 docker exec openwebui grep -q zeo_auto_continue_round /app/backend/open_webui/utils/middleware.py && echo 0004 patched
-docker exec openwebui printenv AUTO_CONTINUE_MAX_NUDGES   # expect 2 (0 = feature off)
+docker exec openwebui printenv AUTO_CONTINUE_MAX_NUDGES   # .env.example ships 0 (off) for now; 2 once re-enabled
+docker exec openwebui grep -qF "r'\btell me\b'" /app/backend/open_webui/utils/zeo_auto_continue.py && echo 0004 offer fix
 docker exec openwebui grep -qF 'headers[FORWARD_SESSION_INFO_HEADER_MESSAGE_ID]' /app/backend/open_webui/routers/openai.py && echo 0005 patched
 docker exec openwebui printenv ENABLE_FORWARD_USER_INFO_HEADERS   # expect true, or no ids are sent at all
 ```

@@ -18,9 +18,14 @@ Everything is recomputed from the request's history -- no per-chat state, so
 two copies of the service and a restart agree. (Whether it should count from
 stored decisions instead is ROUTE_POLICY_PLAN § 9's open question.)
 
-The reasons ("called X 2 exchange(s) ago; 1/3 irrelevant since", "cooldown:
-3/3 irrelevant exchanges since the last one that ...") are pinned by
+The reasons ("called X 2 exchange(s) ago; 1/2 irrelevant since", "cooldown:
+2/2 irrelevant exchanges since the last one that ...") are pinned by
 unit-tests/route-policy/test_evaluators.py: Trino queries group on them.
+
+An exchange is one user message, so a hidden user message inside one answer
+(Open WebUI's auto-continue nudge) would count as one; a ``pin: turn``
+ruleset holds such a call to its turn's first decision instead
+(``engine.pipeline``).
 """
 
 from __future__ import annotations

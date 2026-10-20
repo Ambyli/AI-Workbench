@@ -285,20 +285,20 @@ def test_a_hung_binding_refresh_decides_from_the_snapshot(monkeypatch):
         store = RulesetStore(FakeDatabase(gate=gate), refresh_s=0, read_budget_s=0.05)
         for compiled in seed().compiled:
             store.add(compiled)
-        store.set_bindings([Binding("auto", None, "default", 2)])
+        store.set_bindings([Binding("auto", None, "default", 3)])
 
         async def list_bindings(conn):
-            return [{"scope_model": "auto", "scope_key_alias": None, "ruleset_id": "default", "version": 2}]
+            return [{"scope_model": "auto", "scope_key_alias": None, "ruleset_id": "default", "version": 3}]
 
         monkeypatch.setattr(rulesets_repo, "list_bindings", list_bindings)
         cut = _sample("route_policy_db_reads_cut_total", read="binding_refresh")
         started = time.monotonic()
-        assert (await store.resolve("auto", None)).primary.version == 2
+        assert (await store.resolve("auto", None)).primary.version == 3
         assert time.monotonic() - started < 0.3
         assert _sample("route_policy_db_reads_cut_total", read="binding_refresh") == cut + 1
         # Next request: the refresh is still running -- no wait at all, no second refresh.
         started = time.monotonic()
-        assert (await store.resolve("auto", None)).primary.version == 2
+        assert (await store.resolve("auto", None)).primary.version == 3
         assert time.monotonic() - started < 0.04
         assert store.database.acquired == 1
         gate.set()

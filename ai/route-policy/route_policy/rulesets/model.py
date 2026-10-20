@@ -3,9 +3,10 @@
 The document (``ai/route-policy/rulesets/default.yaml`` is the reference)::
 
     id: default                      # [a-z0-9][a-z0-9_-]*
-    version: 2                       # immutable: new content = a new version
+    version: 3                       # immutable: new content = a new version
     description: ...
     mode: enforce                    # shadow (log only) | enforce (LiteLLM applies it)
+    pin: turn                        # optional: one route per turn (below); omitted = every call decides afresh
     routes: [local-general, local-code, local-reasoning, local-private]
     default_route: local-general     # one of routes
     evaluators:                      # in order; each votes or abstains
@@ -15,6 +16,14 @@ The document (``ai/route-policy/rulesets/default.yaml`` is the reference)::
         config: {patterns_ref: patterns/privacy.yaml}
         vote: {route: local-private, weight: 1.0}
     combiner: {type: priority}       # priority | weighted (+ its options)
+
+**``pin: turn``** holds every call of one TURN -- the same Open WebUI chat id
+and message id: the tool rounds of one answer, and Open WebUI's hidden
+auto-continue nudge -- to the route this ruleset chose for the turn's FIRST
+call, unless the fresh decision is local-private (privacy always wins). The
+service reads that first decision (``Service.load_turn_pin``) and the
+pipeline applies it (``engine.pipeline``); a call without both ids is never
+pinned.
 
 Validation beyond the shapes below (routes, references, each type's config)
 is ``rulesets.validate``; refs (``patterns_ref``) are inlined by
@@ -87,6 +96,9 @@ class RulesetDocument(BaseModel):
     version: int = Field(ge=1)
     description: str = Field("", max_length=4000)
     mode: Literal["shadow", "enforce"]
+    # None: every call is decided afresh. "turn": the calls of one turn
+    # (chat id + message id) keep the route of its first decision.
+    pin: Optional[Literal["turn"]] = None
     routes: List[str] = Field(min_length=1)
     default_route: str
     evaluators: List[EvaluatorEntry] = Field(default_factory=list)
@@ -118,6 +130,7 @@ class CompiledRuleset:
     combiner: Combiner
     document: Dict[str, Any] = field(repr=False)   # the resolved document as stored
     sha256: str = ""
+    pin: Optional[str] = None                      # None | "turn"
 
     def ref(self) -> Dict[str, Any]:
         return {"id": self.id, "version": self.version}

@@ -13,7 +13,7 @@
 #   3. reasoning-text math / science / multi-step words -> local-reasoning;
 #   4. code-tools     a sandbox / Open Terminal tool was CALLED in this
 #                     exchange -> local-code;
-#   5. sticky-code    a coding exchange (4. or 2.) within the last 3 ->
+#   5. sticky-code    a coding exchange (4. or 2.) within the last 2 ->
 #                     local-code;
 #   else local-general.
 # The keyword rules live in patterns/*.yaml -- the only copy; their RE2
@@ -21,24 +21,36 @@
 # unit-tests/route-policy/test_default_ruleset.py, which also pins this
 # ruleset's routes on conversation shapes.
 #
+# One route per TURN (`pin: turn`): every call of one answer -- its tool
+# rounds, and Open WebUI's hidden auto-continue nudge, which arrives as an
+# extra user message under the same message id -- keeps the route the
+# turn's first call got, unless the fresh decision is local-private (privacy
+# always wins). Every evaluator still runs and is logged on each call; only
+# the route is held. A call without both an Open WebUI chat id and message
+# id (Claude Code, a background task) is decided afresh every time.
+#
 # Version history: 1 (phase 2) ran the same evaluators and patterns in
-# shadow mode; it stays in route-policy-db with the decisions made under it,
-# but is no longer baked in (a stored version needs no file: the store
-# compiles it from the database on first use, e.g. for POST /evaluate). 2 is
-# `mode: enforce`, with descriptions that say what each rule does.
+# shadow mode; 2 was `mode: enforce`, with descriptions that say what each
+# rule does; 3 shortens the code cooldown from 3 exchanges to 2 and pins the
+# route per turn. Older versions stay in route-policy-db with the decisions
+# made under them, but are no longer baked in (a stored version needs no
+# file: the store compiles it from the database on first use, e.g. for POST
+# /evaluate).
 #
 # CHANGING IT: versions are immutable. Anything but these comments -- a
-# description, a pattern in a referenced file -- is new content, and a stored
-# `default@2` with different content stops route-policy at startup. Bump
-# `version` (the binding follows the highest one). ROUTE_POLICY.md §
+# description, a pattern in a referenced file -- is new content, and a
+# stored version with different content stops route-policy at startup.
+# Bump `version` (the binding follows the highest one). ROUTE_POLICY.md §
 # Changing a ruleset.
 id: default
-version: 2
+version: 3
 description: >-
   Routes `auto` by the latest user message's privacy / code / reasoning
   keywords, then by the sandbox / Open Terminal tools the conversation called
-  (this exchange, or a coding exchange within the last 3) -- in enforce mode.
+  (this exchange, or a coding exchange within the last 2), one route per
+  turn -- in enforce mode.
 mode: enforce
+pin: turn
 routes: [local-general, local-code, local-reasoning, local-private]
 default_route: local-general
 evaluators:
@@ -80,15 +92,15 @@ evaluators:
       scope: current_exchange
     vote: {route: local-code}
 
-  # local-code holds while fewer than 3 irrelevant exchanges followed the
+  # local-code holds while fewer than 2 irrelevant exchanges followed the
   # last one that called such a tool or matched the code keywords -- build a
-  # calculator, then three weather questions stay on local-code and the
-  # fourth drops to local-general. The judges are asked in this order.
+  # calculator, then two weather questions stay on local-code and the third
+  # drops to local-general. The judges are asked in this order.
   - id: sticky-code
     type: cooldown
-    description: Stays on local-code for 3 exchanges after the last coding one.
+    description: Stays on local-code for 2 exchanges after the last coding one.
     config:
-      exchanges: 3
+      exchanges: 2
       relevant_if: [code-tools, code-text]
     vote: {route: local-code}
 

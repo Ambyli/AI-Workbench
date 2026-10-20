@@ -2,8 +2,10 @@
 
 ``RequestContext`` wraps a /decide (or /evaluate) body -- the OpenAI
 ``messages`` exactly as LiteLLM received them, the offered ``tools``, the
-caller's ids, and the overflow layer's backend snapshot -- and derives the
-views evaluators ask for, each computed on first use and cached:
+caller's ids, the overflow layer's backend snapshot, and
+``background_task`` (the hook's verdict that this is an Open WebUI
+background task -- a title, tags, follow-ups -- not a chat answer) -- and
+derives the views evaluators ask for, each computed on first use and cached:
 
     exchanges       the history as (user text, [messages after it]), one per
                     user message, oldest first (common.conversation.split_exchanges)
@@ -23,17 +25,24 @@ Plus what the SERVICE puts on it before the pipeline runs:
                     why that read did not happen (``timed out`` | ``failed``
                     | ``unavailable (no database)``); None when it did, or was
                     not needed
+    turn_pin        the FIRST stored decision of this turn (same chat id,
+                    message id and ruleset id) for a ruleset with
+                    ``pin: turn`` -- its id and route; None when this call is
+                    the turn's first, the ruleset does not pin, an id is
+                    missing, or the read did not happen in time
     memo            scratch space for values an evaluator derives from the
                     request once and reuses across its hooks (the
                     llm_classifier's rendered prefixes)
 
 Nothing here reads a ruleset or keeps state between requests: two copies of
 the service, or a restart, decide the same history the same way -- the
-verdicts are content-addressed rows any copy reads alike.
+verdicts are content-addressed rows any copy reads alike, and so is a turn's
+first decision.
 """
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass, field
 from functools import cached_property
 from typing import Any, Dict, List, Mapping, Optional, Tuple
@@ -58,6 +67,15 @@ class BackendView:
     running: Optional[float] = None
 
 
+@dataclass(frozen=True)
+class TurnPin:
+    """The first decision of a turn, as a ``pin: turn`` ruleset holds the
+    turn's later calls to it (``engine.pipeline.run``)."""
+
+    decision_id: uuid.UUID
+    route: str
+
+
 @dataclass
 class RequestContext:
     requested_model: str
@@ -69,8 +87,10 @@ class RequestContext:
     user_id: Optional[str] = None
     key_alias: Optional[str] = None
     litellm_call_id: Optional[str] = None
+    background_task: bool = False
     analyses: Mapping[str, Verdict] = field(default_factory=dict)
     analysis_lookup_error: Optional[str] = None
+    turn_pin: Optional[TurnPin] = None
     memo: Dict[Any, Any] = field(default_factory=dict, repr=False, compare=False)
 
     @cached_property

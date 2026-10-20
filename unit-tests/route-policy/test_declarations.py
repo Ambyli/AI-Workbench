@@ -51,6 +51,10 @@ def _lookup_failed(evaluator, ctx):
     ctx.analysis_lookup_error = "timed out"
 
 
+def _background_task(evaluator, ctx):
+    ctx.background_task = True
+
+
 # type -> (config, extra siblings for bind, [(messages, backends[, prepare]), ...])
 # prepare(evaluator, ctx) sets what the service would put on the context.
 CASES = {
@@ -84,6 +88,7 @@ CASES = {
         (THREE, None, _verdicts((3, "ok", None))),                            # no route reached
         (THREE, None, None),                                                  # no verdict yet
         (THREE, None, _lookup_failed),                                        # lookup timed out
+        (THREE, None, _background_task),                                      # an Open WebUI background task
         ([], None, None),                                                     # no user message
     ]),
 }
@@ -153,6 +158,16 @@ def test_problems_catches_each_kind_of_mismatch():
     assert any("not declared nullable" in p for p in cooldown.problems({
         "exchanges": 1, "relevant_if": [], "relevant_now": None, "last_relevant_ago": None,
         "irrelevant_since": None, "why": None, "expired": False}))
+
+
+def test_the_background_task_abstain_is_declared():
+    llm = registry()["llm_classifier"]
+    assert "background task" in llm.output.votes and "background_task" in llm.output.votes
+    evaluator = _build("llm_classifier", LLM_CONFIG, {})
+    ctx = context(THREE)
+    _background_task(evaluator, ctx)
+    out = asyncio.run(evaluator.evaluate(ctx))
+    assert not out.voted and out.reason == "background task" and llm.output.problems(out.detail) == []
 
 
 def test_evaluator_types_describe_config_schema_and_output():

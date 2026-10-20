@@ -6,7 +6,7 @@ Config::
     model: qwen3.5-4b            # a document-classifier registry id (GET /models on the classifier)
     criteria:                    # route -> the question /assess scores 1-10 (hint: presence);
                                  # a tie goes to the route listed first in the ruleset's `routes`
-      local-code: "The latest user request ... is about writing, running, debugging or changing code ..."
+      local-code: "The latest user request asks to write, fix, change or explain source code, ..."
       local-reasoning: "..."
     otherwise: local-general     # no criterion reaches min_score -> this route; null = abstain
     min_score: 7                 # the classifier's PASS line
@@ -42,6 +42,13 @@ transcript)``, the fingerprint covering everything that changes a verdict
   works the same way;
 * editing the criteria or the model (a new ruleset version) starts from
   scratch rather than reading verdicts made under the old questions.
+
+**Background tasks are never classified.** Open WebUI's title / tags /
+follow-up requests reach ``auto`` too (``background_task`` on /decide, the
+LiteLLM hook's verdict); each would cost a whole classification of a prompt
+that is not a chat turn. For one, :meth:`analysis_lookups` and
+:meth:`analysis_requests` return nothing and :meth:`evaluate` abstains
+(``background task``).
 
 **Nothing depends on the order of the ``criteria`` mapping**: a ruleset
 stored in route-policy-db is jsonb, which keeps object keys in its own order,
@@ -144,8 +151,9 @@ def input_key(fingerprint: str, transcript: str) -> str:
     votes="The route of the newest usable verdict among the prefixes ending at the latest user message "
           "and the `max_age_exchanges` before it (confidence: the verdict's). Abstains when no such "
           "verdict exists yet, when the newest found failed and no older one is usable, when the newest "
-          "usable one has no route (nothing reached min_score and no `otherwise`), or when the lookup "
-          "timed out.",
+          "usable one has no route (nothing reached min_score and no `otherwise`), when the lookup "
+          "timed out, or for an Open WebUI background task (`background_task` on /decide: reason "
+          "`background task`, nothing looked up or classified).",
     fields={
         "model": FieldSpec("The classifier registry id the verdicts come from", "string"),
         "user_messages": FieldSpec("User messages in the conversation (n)", "integer"),
@@ -216,11 +224,16 @@ class LlmClassifier(Evaluator):
         return out
 
     def analysis_lookups(self, ctx) -> List[str]:
+        if ctx.background_task:
+            return []
         return [key for _, key, _ in self._prefixes(ctx)]
 
     def analysis_requests(self, ctx) -> List[AnalysisRequest]:
         """One request: the prefix ending at the latest user message --
-        unless its verdict is already on the context."""
+        unless its verdict is already on the context, or this is a
+        background task."""
+        if ctx.background_task:
+            return []
         prefixes = self._prefixes(ctx)
         n = user_message_count(ctx.messages)
         if not prefixes or prefixes[0][0] != n or prefixes[0][1] in ctx.analyses:
@@ -265,6 +278,8 @@ class LlmClassifier(Evaluator):
 
     async def evaluate(self, ctx) -> Outcome:
         n = user_message_count(ctx.messages)
+        if ctx.background_task:
+            return Outcome.abstain("background task", self._detail(n, 0, None, None))
         prefixes = self._prefixes(ctx)
         if n == 0 or not prefixes:
             return Outcome.abstain("no user message", self._detail(n, 0, None, None))

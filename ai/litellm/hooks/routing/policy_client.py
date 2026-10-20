@@ -8,7 +8,7 @@ service what really answered:
 
     pre-call   POST /decide  {decision_id, requested_model, litellm_call_id,
                (AWAITED)      chat_id, message_id, user_id, key_alias,
-                              messages, tools, backends}
+                              messages, tools, backends, background_task}
                <- {decision_id, route, mode, apply, ruleset, votes, scores, latency_ms}
     success    POST /observe {decision_id, litellm_call_id, response_id,
                (or stream     served_model_group, served_deployment,
@@ -68,7 +68,13 @@ tool calls are never touched, the request itself is never changed).
 X-OpenWebUI-Chat-Id / -Message-Id / -User-Id request headers
 (ENABLE_FORWARD_USER_INFO_HEADERS and patch 0005), read from the proxy
 metadata dict's ``headers`` (litellm_pre_call_utils.py:1450), any case,
-None when absent. The served chain / deployment come from
+None when absent. ``background_task`` is the footer's own Open WebUI
+background-task detection (footer/render.py ``is_openwebui_task``: a
+``### Task:`` title / tags / follow-up prompt sent with ``stream`` false, or
+legacy function calling's ``Available Tools:`` system message) -- computed
+here because it needs ``data["stream"]``, which is not in the body; the
+service then classifies no such request and never pins a turn to one. The
+served chain / deployment come from
 ``data["deployment"]`` (common_request_processing.py:1707) through the
 footer's own derivation (AutoFooter.served); ``overflow_reason`` is set only
 when a Claude deployment answered, from the overflow filter's CURRENT view.
@@ -90,7 +96,7 @@ import uuid
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
 from ..footer.auto import AUTO_MODEL, Served, is_claude
-from ..footer.render import get_field, headers_of, to_int
+from ..footer.render import get_field, headers_of, is_openwebui_task, to_int
 from ..log import ThrottledLog, logger
 from ..overflow.poller import Poller
 from .invariants import PRIVATE_ROUTE, enforce
@@ -303,6 +309,7 @@ def build_decide_body(
         "messages": slim_messages(data["messages"]),
         "tools": list(tools) if isinstance(tools, list) and tools else None,
         "backends": backends,
+        "background_task": is_openwebui_task(data),
     }
 
 

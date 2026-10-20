@@ -1,8 +1,10 @@
 """Shared helpers for the route-policy tests: conversation builders, the
 baked-in rulesets, a synchronous engine runner, the app with no database,
-and a fake document classifier (``FakeClassifier``: an ``httpx.MockTransport``
-answering GET /models, POST /assess, GET /jobs/{id}, POST /jobs/{id}/cancel
-and DELETE /jobs/{id} the way ai/classifier does, recording every request).
+the service's tables in memory (``memory_tables``, with ``GatedDatabase``
+and ``RecordingQueue``), and a fake document classifier
+(``FakeClassifier``: an ``httpx.MockTransport`` answering GET /models, POST
+/assess, GET /jobs/{id}, POST /jobs/{id}/cancel and DELETE /jobs/{id} the way
+ai/classifier does, recording every request).
 
 Imported by the test modules (conftest.py puts this directory on sys.path).
 """
@@ -14,6 +16,8 @@ import json
 import pathlib
 import socket
 import threading
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -23,6 +27,17 @@ RULESETS_DIR = SERVICE_DIR / "rulesets"
 # The API contract (ROUTE_POLICY_PLAN § 7): exact key sets.
 DECIDE_KEYS = {"decision_id", "route", "mode", "apply", "ruleset", "votes", "scores", "latency_ms"}
 VOTE_KEYS = {"evaluator", "type", "route", "weight", "confidence", "role", "abstained", "reason", "latency_ms"}
+
+# What Open WebUI's patch 0004 sends as a hidden USER message inside one
+# answer, under that answer's message id (ai/openwebui/patches/0004,
+# zeo_auto_continue.NUDGE_TEXT).
+NUDGE = ("You said you would take an action but your reply contained no tool call, so nothing happened. "
+         "Make the tool call now. If the task is actually finished, reply with a one-line summary instead; "
+         "if you need a decision from the user, ask the question.")
+# An Open WebUI title task's prompt (its default template, abridged): what
+# the LiteLLM hook flags as background_task when it is sent without streaming.
+TITLE_TASK = ("### Task:\nGenerate a concise, 3-5 word title with an emoji summarizing the chat history.\n"
+              "<chat_history>\nUSER: Make me a scientific calculator!\n</chat_history>")
 
 
 def user(text: Any) -> dict:
@@ -97,6 +112,78 @@ def dbless_app():
     store.set_bindings(s.bindings)
     return create_app(service=Service(store=store, database=None, rulesets_dir=RULESETS_DIR),
                       instrument=False)
+
+
+# -- the service's tables, in memory ---------------------------------------------------
+
+
+class RecordingQueue:
+    """Stands in for the AnalysisQueue: records what is submitted."""
+
+    def __init__(self) -> None:
+        self.submitted = []
+
+    def submit(self, request) -> bool:
+        self.submitted.append(request)
+        return True
+
+    async def stop(self, timeout_s=None) -> int:
+        return 0
+
+
+class GatedDatabase:
+    """``acquire`` waits on ``gate`` (when given), then fails (``fail``) or
+    hands out a dummy connection -- for repositories replaced by
+    :func:`memory_tables`."""
+
+    def __init__(self, gate=None, fail=False) -> None:
+        self.gate, self.fail = gate, fail
+
+    @asynccontextmanager
+    async def acquire(self):
+        if self.gate is not None:
+            await self.gate.wait()
+        if self.fail:
+            raise ConnectionError("route-policy-db is down")
+        yield SimpleNamespace()
+
+
+def memory_tables(monkeypatch):
+    """decisions (+ evaluations) and analyses, in memory: the repositories'
+    insert / get_response / first_of_turn / get_many replaced. Returns the
+    rows (``decisions``: id -> DecisionRecord in insertion order, which
+    stands in for created_at; ``evaluations``; ``analyses``: key -> Verdict)."""
+    from route_policy.db.repositories import analyses as analyses_repo
+    from route_policy.db.repositories import decisions as decisions_repo
+
+    rows = SimpleNamespace(decisions={}, evaluations={}, analyses={})
+
+    async def insert_decision(conn, record, evaluations):
+        if record.decision_id in rows.decisions:
+            return False
+        rows.decisions[record.decision_id] = record
+        rows.evaluations[record.decision_id] = list(evaluations)
+        return True
+
+    async def get_response(conn, decision_id):
+        record = rows.decisions.get(decision_id)
+        return record.response if record else None
+
+    async def get_many(conn, keys):
+        return {k: rows.analyses[k] for k in keys if k in rows.analyses}
+
+    async def first_of_turn(conn, *, chat_id, message_id, ruleset_id, shadow, exclude):
+        for r in rows.decisions.values():
+            if (r.chat_id, r.message_id, r.ruleset_id) == (chat_id, message_id, ruleset_id) \
+                    and (r.shadow_of is not None) == shadow and r.decision_id != exclude and not r.background_task:
+                return r.decision_id, r.chosen_route
+        return None
+
+    monkeypatch.setattr(decisions_repo, "insert", insert_decision)
+    monkeypatch.setattr(decisions_repo, "get_response", get_response)
+    monkeypatch.setattr(decisions_repo, "first_of_turn", first_of_turn)
+    monkeypatch.setattr(analyses_repo, "get_many", get_many)
+    return rows
 
 
 # -- a fake document classifier ------------------------------------------------------

@@ -13,14 +13,17 @@ for at most config.DB_READ_BUDGET_S (rulesets/store.py). Contract:
 ROUTE_POLICY_PLAN § 7, ROUTE_POLICY.md § API.
 
 The steps: resolve the binding (the primary ruleset; its shadow slots are
-only refs here) -> read the stored verdicts the primary's evaluators name, in
-one query within DB_READ_BUDGET_S (none for a ruleset without an
-``llm_classifier``, so no query for ``default``) -> run the pipeline ->
-record (within the write budget) -> answer. THEN, in one background task
-(``Service.after_decide``): the primary's analysis requests go to the
-analysis queue, and each shadow ruleset is decided on the same request and
-stored with ``shadow_of`` -- none of which can change, delay or fail the
-response.
+only refs here) -> read, concurrently and each in one query within
+DB_READ_BUDGET_S, the stored verdicts the primary's evaluators name (none
+for a ruleset without an ``llm_classifier``, so no query for ``default``)
+and, for a ``pin: turn`` ruleset, the turn's first decision (same chat id +
+message id; none without both ids, or for a background task) -> run the
+pipeline (which keeps the turn's route, unless the fresh one is
+local-private) -> record (within the write budget) -> answer. THEN, in one
+background task (``Service.after_decide``): the primary's analysis requests
+go to the analysis queue (none from a call that is not its turn's first),
+and each shadow ruleset is decided on the same request and stored with
+``shadow_of`` -- none of which can change, delay or fail the response.
 
     200  the decision (a duplicate decision_id gets the FIRST stored decision)
     404  no ruleset is bound to requested_model (+ key_alias)
@@ -57,11 +60,12 @@ async def decide(body: DecideRequest, request: Request) -> dict:
         raise HTTPException(404, f"no ruleset is bound to model {body.requested_model!r}")
     ruleset = resolved.primary
     ctx = body.context()
-    await service.load_analyses(ruleset, ctx, budget_s=service.read_budget_s)
+    await service.load_context(ruleset, ctx, body.decision_id, shadow=False, budget_s=service.read_budget_s)
     decision = await pipeline.run(ruleset, ctx)
     status, response = await service.record_decision(body, decision, decision.response(str(body.decision_id)))
-    logger.info("[decide] %s %s -> %s (%s%s; %s@%d %s) chat=%s", body.decision_id, body.requested_model,
+    logger.info("[decide] %s %s -> %s (%s%s; %s@%d %s) chat=%s%s", body.decision_id, body.requested_model,
                 response.get("route"), decision.reason,
-                f", {status}" if status in ("duplicate", "deferred", "dropped") else "", ruleset.id, ruleset.version, ruleset.mode, body.chat_id or "-")
+                f", {status}" if status in ("duplicate", "deferred", "dropped") else "", ruleset.id, ruleset.version,
+                ruleset.mode, body.chat_id or "-", " task" if body.background_task else "")
     service.after_decide(body, decision, resolved, ctx)
     return response

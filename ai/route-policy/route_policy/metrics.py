@@ -75,6 +75,7 @@ errors_total = Counter(
     #                    started: WRITES_MAX_IN_FLIGHT background tasks pending
     # shadow_error    -- that task raised (a bug; logged with its traceback)
     # analysis_lookup -- the verdicts an llm_classifier needs could not be read (it abstains)
+    # turn_pin        -- the turn's first decision could not be read (the call is decided afresh)
     # analysis_write  -- a classification ended but its analyses row could not be stored
     # classifier_delete -- DELETE /jobs/{id} on the classifier failed (the job expires with its TTL)
     ["kind"],
@@ -92,7 +93,17 @@ writes_in_flight = Gauge(
 db_reads_cut_total = Counter(
     "route_policy_db_reads_cut_total",
     "Database reads on the /decide path that outlasted DB_READ_BUDGET_S (the request went on without them)",
-    ["read"],  # binding_refresh | ruleset_fetch | analysis_lookup
+    ["read"],  # binding_refresh | ruleset_fetch | analysis_lookup | turn_pin
+)
+pinned_total = Counter(
+    "route_policy_pinned_total",
+    "Decisions of a `pin: turn` ruleset that were not their turn's first (same chat id + message id), by "
+    "ruleset and what the turn's pin did",
+    # ruleset: <id>@<version>
+    # outcome: changed -- the fresh route differed; the turn's first route was kept instead
+    #          kept    -- the fresh route already was the turn's
+    #          private -- the fresh route was local-private and beat the pin (privacy always wins)
+    ["ruleset", "outcome"],
 )
 
 # -- Shadow rulesets and the analysis queue (phase 4) ------------------------------

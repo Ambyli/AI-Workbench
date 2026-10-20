@@ -16,7 +16,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 SEED_LOCK = "route_policy.seed"
 _SUMMARY_COLUMNS = ("id, version, content_sha256, source, created_at, created_by, active_from, active_to, "
-                    "document->>'mode' AS mode, document->>'description' AS description")
+                    "document->>'mode' AS mode, document->>'pin' AS pin, document->>'description' AS description")
 
 
 class SeedConflict(RuntimeError):

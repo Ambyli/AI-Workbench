@@ -5,8 +5,10 @@ Open WebUI chat id (``X-OpenWebUI-Chat-Id``, forwarded by LiteLLM as
 ``chat_id``), returned OLDEST FIRST, each with its votes, its outcome (null
 until /observe arrives) and ``shadows``: the decisions the binding's shadow
 rulesets made beside it (same keys but ``shadows``; ``shadow_of`` names the
-primary, ``outcome`` is always null). An unknown chat id is an empty list,
-not a 404.
+primary, ``outcome`` is always null). ``pinned_from`` names the turn's first
+decision on every later call of a ``pin: turn`` turn (null on the first, and
+without a pin); ``background_task`` is true for an Open WebUI background
+task. An unknown chat id is an empty list, not a 404.
 """
 
 from __future__ import annotations

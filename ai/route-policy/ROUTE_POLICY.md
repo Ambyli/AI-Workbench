@@ -11,7 +11,7 @@ route. Two **invariants** have the last word:
 - a request for `local-private` stays `local-private`;
 - the route is always one of the ruleset's chain aliases.
 
-**Phase 3: the engine routes `auto`.** The `default` ruleset (version 2) is
+**Phase 3: the engine routes `auto`.** The `default` ruleset (version 3) is
 `mode: enforce`:
 - LiteLLM's pre-call hook (`ai/litellm/hooks/routing/policy_client.py`)
   **awaits** `/decide` for every request to `auto`, within
@@ -45,11 +45,28 @@ conversation so far:
   conversation prefix, and counts **from the next turn on**;
 - it runs in the draft ruleset `default-llm`, bound as a **shadow** beside
   `default`: decided on every `auto` turn after the answer, logged with
-  `shadow_of`, never applied. `default@2` still routes every turn, unchanged.
+  `shadow_of`, never applied. `default` still routes every turn by its
+  keyword and tool rules.
 
 Trino's `shadow_comparisons` and the benchmark ([§ Benchmark](#benchmark))
 say whether it is better; promoting it is a separate, later change
 ([§ Promoting the classifier](#promoting-the-classifier)).
+
+**One route per turn, and no classification for background tasks**
+(`default@3`, `default-llm@2`, migration 0003):
+- **A turn keeps one route.** A ruleset with `pin: turn` holds every call
+  of one answer (the same Open WebUI chat id and message id) to the route
+  its first call got. That covers the answer's tool rounds and Open WebUI's
+  hidden auto-continue nudge, which arrives as an extra user message under
+  the same message id. A fresh `local-private` always wins over the pin.
+  [§ Turn pinning](#turn-pinning).
+- **Background tasks are flagged.** The hook marks Open WebUI's title / tags
+  / follow-up requests with `background_task`. They are decided and logged
+  as before, but an `llm_classifier` never classifies one, and a background
+  task never pins a turn. [§ Background tasks](#background-tasks).
+- **The code cooldown is 2 exchanges** (was 3), and `default-llm`'s code
+  criterion no longer counts a tool call (a web search) as "running
+  software".
 
 Plan: `ROUTE_POLICY_PLAN.md` (outside the repo), phases 2–6.
 
@@ -74,6 +91,8 @@ Plan: `ROUTE_POLICY_PLAN.md` (outside the repo), phases 2–6.
 - [Evaluators](#evaluators)
 - [Combiners and roles](#combiners-and-roles)
 - [The `default` ruleset](#the-default-ruleset)
+- [Turn pinning](#turn-pinning)
+- [Background tasks](#background-tasks)
 - [Shadow rulesets](#shadow-rulesets)
 - [The llm_classifier](#the-llm_classifier)
 - [The `default-llm` draft](#the-default-llm-draft)
@@ -90,11 +109,12 @@ Plan: `ROUTE_POLICY_PLAN.md` (outside the repo), phases 2–6.
 
 ```
 Open WebUI ─► LiteLLM (model `auto`, one pass)
-                ├─ pre-call hook ── POST /decide {decision_id, messages, tools, ids, backends} ──► route-policy
+                ├─ pre-call hook ── POST /decide {decision_id, messages, tools, ids, backends, background_task} ──► route-policy
                 │   (awaited, ≤ 0.25 s)  ◄── {route: local-code, apply: true, ...} ────────────── ├─ ruleset (bound to `auto`)
                 │   data["model"] = "local-code"   (fallback on any failure: local-private)       ├─ evaluators → votes
                 ├─ deployment pick: overflow filter (context fit, busy / down) inside the chain   ├─ combiner → route
-                ├─ vLLM / Claude ── STREAMED straight back to the client                          └─ invariants
+                ├─ vLLM / Claude ── STREAMED straight back to the client                          ├─ invariants
+                │                                                                                 └─ the turn's pin (`pin: turn`)
                 └─ success / failure hook ── POST /observe {decision_id, served chain, ...} ──► (fired)  │
                                                                          route-policy-db ◄───────────────┤
                                                                               │ trino_reader             │
@@ -120,8 +140,10 @@ still never picks a deployment.
 **Nothing slow is on the request path.** `/decide` runs the bound
 (primary) ruleset and answers. A model's reading of the conversation is
 always the verdict of an EARLIER background classification, read in one
-bounded query; shadow rulesets and new classifications start only after the
-answer, and cannot change, delay or fail it.
+bounded query, and so is the turn's first decision for a `pin: turn`
+ruleset (the two reads run concurrently); shadow rulesets and new
+classifications start only after the answer, and cannot change, delay or
+fail it.
 
 **Two copies of the invariants.** The service enforces them
 (`route_policy/engine/invariants.py`), and the hook re-checks the answer with
@@ -139,10 +161,12 @@ foreign key to `decisions`. The `decision_outcomes` view joins them.
 
 ## Deploying
 
-On a box that already runs phase 3, follow
-[§ Upgrading to phase 4](#upgrading-to-phase-4) instead; on one that runs
+On a box that already runs phase 4, follow
+[§ Upgrading to the turn pins](#upgrading-to-the-turn-pins-default3)
+instead; on one that runs phase 3,
+[§ Upgrading to phase 4](#upgrading-to-phase-4) first; on one that runs
 phase 2 (shadow), [§ Upgrading from phase 2](#upgrading-from-phase-2-shadow)
-first.
+before that.
 
 Routing needs only route-policy and its database. The `llm_classifier` in
 the shadow ruleset also needs the document classifier (`ai/classifier`) with
@@ -189,12 +213,12 @@ A fresh box, in order (from the repo root):
 **Checks after the deploy:**
 
 ```bash
-make logs route-policy route-policy FOLLOW=0 TAIL=50   # "applied migration 0001_initial.sql" / "0002_llm_classifier.sql",
-                                                      # "seeded default@2", "seeded default-llm@1",
-                                                      # "binding auto -> default@2", "binding auto shadowed by default-llm@1",
+make logs route-policy route-policy FOLLOW=0 TAIL=50   # "applied migration 0001_initial.sql" / "0002_llm_classifier.sql" /
+                                                      # "0003_turn_pins.sql", "seeded default@3", "seeded default-llm@2",
+                                                      # "binding auto -> default@3", "binding auto shadowed by default-llm@2",
                                                       # "analysis: queue ready (2 worker(s), ...)"
-curl -s localhost:8027/health                         # {"status":"ok","rulesets":[{"id":"default","version":2},
-                                                      #   {"id":"default-llm","version":1}],"bindings":1}
+curl -s localhost:8027/health                         # {"status":"ok","rulesets":[{"id":"default","version":3},
+                                                      #   {"id":"default-llm","version":2}],"bindings":1}
 curl -s localhost:8027/ready                          # {"status":"ready","db":"up"}
 curl -s localhost:8027/bindings
 curl -s -X POST localhost:8027/evaluate -H 'content-type: application/json' \
@@ -219,7 +243,9 @@ docker exec route-policy-db psql -U route_policy -c '\du trino_reader'
 
 ### Upgrading from phase 2 (shadow)
 
-Staged, so `auto` never breaks. On the box, from the repo root:
+Staged, so `auto` never breaks. (Written for the phase-3 image, which
+baked `default@2`; a later image seeds its own current version in step 2,
+and the rest is the same.) On the box, from the repo root:
 
 1. **`git pull`** on the branch.
 2. **`make build route-policy && make up route-policy`.** Seeds `default@2`
@@ -261,8 +287,10 @@ and re-points the binding at it; version 2 stays stored.
 
 ### Upgrading to phase 4
 
-Routing does not change: `default@2` keeps deciding every `auto` turn. On
-the box, from the repo root:
+Routing does not change: `default@2` keeps deciding every `auto` turn (an
+image that also has the turn pins moves it to `default@3` in step 4; the
+checks of [§ Upgrading to the turn pins](#upgrading-to-the-turn-pins-default3)
+apply then too). On the box, from the repo root:
 
 1. **`git pull`**, and add the new `.env` lines from `.env.example`: the
    five `ROUTE_POLICY_CLASSIF*` / `ROUTE_POLICY_ANALYSIS_*` lines (the
@@ -303,6 +331,36 @@ re-seeds its bindings without a shadow slot. Then remove the two
 `models.yaml` entries and `docker restart classifier`, and stop
 `qwen3.5-4b`.
 
+### Upgrading to the turn pins (default@3)
+
+`default@3` (the 2-exchange code cooldown, `pin: turn`), `default-llm@2`
+(the reworded code criterion, `pin: turn`) and migration 0003. Staged, like
+phase 3: route-policy first, then the hook. On the box, from the repo root:
+
+1. **`git pull`.** No new `.env` lines.
+2. **`make build route-policy && make up route-policy`.** Migration 0003
+   adds `decisions.pinned_from`, `decisions.background_task` (old rows read
+   `false`), the turn index and the new view columns; `default@3` and
+   `default-llm@2` are seeded and the binding and its shadow slot move to
+   them. The running LiteLLM does not send `background_task` yet; it
+   defaults to `false`, so everything else works at once. Check:
+   - the deploy log lines and `/health` above show the new versions;
+   - two calls of one answer (an `auto` chat that uses a tool) give one
+     route:
+     `docker exec route-policy-db psql -U route_policy -c "select message_id, chosen_route, pinned_from is not null as pinned, left(reason, 60) from decisions where shadow_of is null order by created_at desc limit 6"`.
+3. **`make up litellm`.** The hook now sends `background_task`. Check that
+   an Open WebUI chat title lands as a decision with `background_task =
+   true` and no `analyses` row of its own.
+4. **Open WebUI (recommended): Admin Settings → Interface → Task Model =
+   `local-private`.** Background tasks then never reach `auto` (or Claude)
+   at all; see [§ Background tasks](#background-tasks).
+
+**Rollback:** `git revert` the change and `make up route-policy` (then
+`make up litellm`). The reverted image bakes `default@2` / `default-llm@1`
+again, already stored with the same content, and moves both slots back;
+the old code ignores the two columns (new rows get their defaults) and the
+appended view columns. Versions 3 and 2 stay stored with their decisions.
+
 ## API
 
 No auth on the service itself, the same as the classifier:
@@ -332,20 +390,28 @@ phase 6.
 
 This is the contract LiteLLM's client (`ai/litellm/hooks/routing/`) is built
 against (ROUTE_POLICY_PLAN § 7, "Phase 2 build spec"; unchanged in phase 3,
-which only started awaiting the answer).
+which only started awaiting the answer; the request gained
+`background_task` with the turn pins, the response is unchanged).
 
 ```json
 {"decision_id": "uuid4, made by the hook", "requested_model": "auto",
  "litellm_call_id": "…", "chat_id": "… | null", "message_id": "… | null", "user_id": "… | null", "key_alias": "… | null",
  "messages": [/* the OpenAI messages as LiteLLM received them */], "tools": [/* or null */],
- "backends": {"<api_base>": {"verdict": "ok|busy|down|stale|unknown", "waiting": 0.0, "running": 0.0}}}
+ "backends": {"<api_base>": {"verdict": "ok|busy|down|stale|unknown", "waiting": 0.0, "running": 0.0}},
+ "background_task": false}
 ```
+
+- **`background_task`:** the hook's verdict that this is an Open WebUI
+  background task (a title, tags, follow-ups; [§ Background
+  tasks](#background-tasks)). Optional, default `false`, `null` reads as
+  `false`: a hook that predates it still works, which is why route-policy
+  deploys first.
 
 → `200`, and the same body is what gets logged:
 
 ```json
 {"decision_id": "…", "route": "local-code", "mode": "enforce", "apply": true,
- "ruleset": {"id": "default", "version": 2},
+ "ruleset": {"id": "default", "version": 3},
  "votes": [{"evaluator": "code-tools", "type": "tool_calls", "route": "local-code", "weight": 1.0,
             "confidence": 1.0, "role": "vote", "abstained": false,
             "reason": "called sandbox-mcp_exec in this exchange", "latency_ms": 0.1}],
@@ -357,9 +423,14 @@ which only started awaiting the answer).
 - **`scores`:** Σ weight × confidence per route, over the non-abstaining
   `vote` and `force` votes.
 - **`apply`:** true only for an `enforce` ruleset whose invariants held, so
-  true for `default@2` unless a combined route fell outside the ruleset's
-  `routes`. LiteLLM applies `route` only when it is true; `false` (a `shadow`
-  ruleset, or an invariant override) sends the turn to `local-private`.
+  true for `default@3` unless a combined (or pinned) route fell outside the
+  ruleset's `routes`. LiteLLM applies `route` only when it is true; `false`
+  (a `shadow` ruleset, or an invariant override) sends the turn to
+  `local-private`.
+- **`route` of a later call of a turn** is the turn's first route for a
+  `pin: turn` ruleset (`default@3` is one), unless the fresh decision is
+  `local-private`; `votes` and `scores` are still the fresh ones.
+  [§ Turn pinning](#turn-pinning).
 - **Idempotent on `decision_id`.** A repeat returns the **first** stored
   response, whatever the new body says. Nothing is written twice.
 - **Errors:**
@@ -403,20 +474,28 @@ which only started awaiting the answer).
   - **Shutdown** waits up to 5 s (`WRITES_DRAIN_S`) for background writes,
     then cancels the rest.
 - **Latency.** The engine takes well under a millisecond (p50 0.28 ms in
-  shadow); the HTTP hop and, normally, a few milliseconds of decision write
-  are the rest. Every `auto` turn waits for it.
+  shadow); the HTTP hop, the turn-pin read below (one indexed query) and,
+  normally, a few milliseconds of decision write are the rest. Every `auto`
+  turn waits for it.
 - **Verdict lookups.** When the primary ruleset has an `llm_classifier`
-  (`default@2` has none), `/decide` reads the verdicts it names in ONE query
+  (`default@3` has none), `/decide` reads the verdicts it names in ONE query
   before the pipeline runs, within `DB_READ_BUDGET_S` (0.1 s); past it the
   evaluator abstains (`lookup timed out`) and the decision goes on.
   `route_policy_db_reads_cut_total{read="analysis_lookup"}` counts it.
+- **The turn's first decision.** For a `pin: turn` ruleset and a request
+  with both `chat_id` and `message_id` (and not a background task),
+  `/decide` reads the turn's first decision in ONE query, concurrently with
+  the verdicts and within the same budget. Past it, or on a failure, the
+  call is decided afresh as if it were the turn's first
+  (`route_policy_db_reads_cut_total{read="turn_pin"}`,
+  `route_policy_errors_total{kind="turn_pin"}`).
 - **After the answer, in one background task** (counted with the writes
   against `WRITES_MAX_IN_FLIGHT`; dropped past it, `shadow_dropped`):
   1. the primary's `llm_classifier` analysis requests go to the analysis
-     queue;
+     queue (none from a call that is not its turn's first);
   2. each **shadow** ruleset of the binding runs on the same request (its
-     own verdict lookup, with the same budget, so it measures what
-     enforcing it would do) and is stored as a `decisions` row with
+     own verdict lookup and turn pin, with the same budget, so it measures
+     what enforcing it would do) and is stored as a `decisions` row with
      `decision_id` = `uuid5(<this decision_id>, "<ruleset>@<version>")` and
      `shadow_of` = this decision_id, with its own `evaluations`; then its
      analysis requests go to the queue.
@@ -454,18 +533,22 @@ which only started awaiting the answer).
   and `shadows`: the decisions the binding's shadow rulesets made beside it
   -- the same keys except `shadows`, with `shadow_of` = the primary's id and
   `outcome` always null (the turn's outcome is the primary's). A primary's
-  `shadow_of` is null.
+  `shadow_of` is null. Every decision also carries `pinned_from` (the turn's
+  first decision, on a later call of a `pin: turn` turn; null otherwise)
+  and `background_task`.
 
 ### POST /evaluate
 
 Give exactly one of:
-- `{"ruleset": {"id": "default", "version": 2}}` (version omitted = the
-  highest). A stored version that is no longer baked in (`default@1`) works
-  too: it is compiled from the database;
+- `{"ruleset": {"id": "default", "version": 3}}` (version omitted = the
+  highest). A stored version that is no longer baked in (`default@1`,
+  `default@2`) works too: it is compiled from the database;
 - `{"document": {…}}`.
 
 Plus `messages` / `tools` / `backends` and an optional `requested_model`
-(default `auto`).
+(default `auto`) and `background_task` (default `false`). There is no chat
+or message id, so a `pin: turn` ruleset is never pinned here: every call is
+its turn's first.
 
 It returns the `/decide` shape with `decision_id: null`. Each vote also carries
 its evaluator's `detail` and `error`.
@@ -485,9 +568,10 @@ its evaluator's `detail` and `error`.
 
 ```yaml
 id: default                      # [a-z0-9][a-z0-9_-]*
-version: 2                       # immutable: new content = a new version
+version: 3                       # immutable: new content = a new version
 description: …
 mode: enforce                    # shadow (decide + log) | enforce (LiteLLM applies it)
+pin: turn                        # optional: one route per turn (§ Turn pinning); omitted = every call afresh
 routes: [local-general, local-code, local-reasoning, local-private]
 default_route: local-general     # one of routes
 evaluators:                      # in order; each votes or abstains
@@ -506,6 +590,8 @@ Validation (`route_policy/rulesets/validate.py`):
 - **Every `vote.route` must be one of `routes`**, so a ruleset can only ever
   vote for its own chain aliases.
 - **Cross-references must resolve** (`cooldown.relevant_if`).
+- **`pin`** is `turn` or absent (`null`); anything else is an error. It is
+  content like the rest: adding or dropping it is a new version.
 
 **Files** (`ai/route-policy/rulesets/`, baked into the image):
 - `*.yaml` at the top level: one ruleset each (`default.yaml`,
@@ -554,11 +640,12 @@ swap cannot race.
 
 Startup owns the seeded bindings and resets them on every start.
 
-**A stored version needs no file.** Only the current `default` (version 2)
-and `default-llm` (version 1) are baked in; version 1 (phase 2, shadow) stays in the database with the
-decisions made under it, and the store compiles it from there on first use
-(`GET /rulesets/default/1`, `POST /evaluate`). Keeping old files would also
-freeze the pattern files: a version that references `patterns/code.yaml`
+**A stored version needs no file.** Only the current `default` (version 3)
+and `default-llm` (version 2) are baked in; `default@1` (phase 2, shadow),
+`default@2` (phase 3) and `default-llm@1` stay in the database with the
+decisions made under them, and the store compiles each from there on first
+use (`GET /rulesets/default/1`, `POST /evaluate`). Keeping old files would
+also freeze the pattern files: a version that references `patterns/code.yaml`
 hashes its content, so an edited pattern would stop startup on the old
 version.
 
@@ -604,7 +691,7 @@ into Trino; `regex_text` reports pattern *indices*, `tool_calls` tool *names*.
 | `cooldown` | `exchanges` (≥ 0), `relevant_if: [evaluator ids]` | The current exchange is relevant, or an earlier one is and fewer than `exchanges` irrelevant exchanges followed it. The judges are asked in order; the first reason wins. Recomputed from the history on every request, no per-chat state. |
 | `backend_load` | `backends` (regexes over api_base), `verdicts` (default busy, down), `min_waiting`, `require: any \| all` | Watched backends in the snapshot qualify. Abstains when none matches. |
 | `static` | `abstain`, `confidence`, `reason` | Always (or never). For tests, overrides, and as a `veto`. |
-| `llm_classifier` | `model`, `criteria` (route → question), `otherwise`, `min_score`, `history`, `max_age_exchanges` | A stored verdict (a local model's classification of an earlier prefix of this conversation, at most `max_age_exchanges` user messages old) names a route. **Chooses its own route**: `vote.route` is refused. [§ The llm_classifier](#the-llm_classifier). |
+| `llm_classifier` | `model`, `criteria` (route → question), `otherwise`, `min_score`, `history`, `max_age_exchanges` | A stored verdict (a local model's classification of an earlier prefix of this conversation, at most `max_age_exchanges` user messages old) names a route. **Chooses its own route**: `vote.route` is refused. Abstains for a background task (`background task`), which it never classifies. [§ The llm_classifier](#the-llm_classifier). |
 
 - **Exchanges** come from `common.conversation.split_exchanges`: one per user
   message, holding the message and every round after it.
@@ -644,7 +731,8 @@ an abstain with an error.
 
 ## The `default` ruleset
 
-`rulesets/default.yaml`, version 2, `mode: enforce`, `priority` combiner:
+`rulesets/default.yaml`, version 3, `mode: enforce`, `pin: turn`,
+`priority` combiner:
 
 | # | Evaluator | Type | Votes when | Route |
 |---|---|---|---|---|
@@ -652,7 +740,7 @@ an abstain with an error.
 | 2 | `code-text` | `regex_text` → `patterns/code.yaml` (`code_kw`, regexes) | code words, a file name or a code fence | `local-code` |
 | 3 | `reasoning-text` | `regex_text` → `patterns/reasoning.yaml` (`reasoning_kw`) | math / science / multi-step words | `local-reasoning` |
 | 4 | `code-tools` | `tool_calls`, current exchange | a sandbox MCP tool (`sandbox-mcp_.+`) or one of Open Terminal's distinctive operationIds was CALLED | `local-code` |
-| 5 | `sticky-code` | `cooldown`, 3 exchanges, judges `code-tools`, `code-text` | a coding exchange within the last 3 | `local-code` |
+| 5 | `sticky-code` | `cooldown`, 2 exchanges, judges `code-tools`, `code-text` | a coding exchange within the last 2 | `local-code` |
 | — | default | | | `local-general` |
 
 - **Privacy forces.** A PII word wins over every other vote, and
@@ -664,9 +752,18 @@ an abstain with an error.
   otherwise `local-general` turn is held on `local-code`.
 - **Offered tools never count**, only called ones: a chat with the sandbox
   attached but unused is not a coding chat.
-- **The cooldown is stateless.** Build a calculator, then ask three weather
-  questions: they stay on `local-code`, and the fourth drops to
-  `local-general`. Any coding exchange resets it.
+- **The cooldown is stateless.** Build a calculator, then ask two weather
+  questions: they stay on `local-code`, and the third drops to
+  `local-general`. Any coding exchange resets it. Version 2 held three; the
+  2026-10 calculator-then-weather chat was the reason to shorten it.
+- **One route per turn** (`pin: turn`): the tool rounds of one answer, and
+  Open WebUI's hidden auto-continue nudge, keep the route the answer's
+  first call got -- so a nudge, which is a new "exchange", cannot expire the
+  cooldown halfway through an answer. [§ Turn pinning](#turn-pinning).
+
+**Version history:** 1 (phase 2) ran these rules in `shadow` mode; 2
+(phase 3) enforced them with a 3-exchange cooldown; 3 has the 2-exchange
+cooldown and `pin: turn`. Routing is otherwise identical.
 
 **The pattern files are the only copy of the rules.** Phase 2 kept them equal
 to the semantic router's keyword signals; phase 3 retired the router and its
@@ -677,10 +774,102 @@ config, so nothing else holds them. `test_default_ruleset.py` checks that:
   (ASCII `\b` / `\w`), but Python's `re` accepts more, so this check is what
   keeps the patterns portable;
 - the real "Scientific Calculator" chat prompts match `code_kw` (or don't);
-- the wiring and the routes on ~20 conversation shapes are as listed above.
+- the wiring and the routes on ~25 conversation shapes are as listed above,
+  and so are the routes of a turn's later calls (a tool round, the nudge,
+  PII mid-turn) with the turn's first decision on the context.
 
 Changing any of it is a ruleset change: update the expected values and bump
 `version` ([§ Rulesets](#rulesets)).
+
+## Turn pinning
+
+A **turn** is one assistant answer: every `/decide` with the same Open
+WebUI `chat_id` and `message_id` (the hook reads them from
+`X-OpenWebUI-Chat-Id` / `-Message-Id`, patch 0005). One answer makes
+several calls: one per tool round, and Open WebUI's patch 0004 adds a
+hidden auto-continue **nudge** -- an extra USER message under the same
+message id -- when the model announces a tool call it did not make. A
+ruleset re-deciding each call fresh could switch chains mid-answer: the
+nudge is a new user message, so it is a new "exchange" for `sticky-code`
+(that is how a weather answer fell off `local-code` halfway), and its text
+is the nudge's, not the user's.
+
+**`pin: turn`** (a ruleset field, `default@3` and `default-llm@2` set it):
+1. **The first call of a turn is decided exactly as without a pin.**
+2. **A later call** (a stored decision of the same ruleset id exists for the
+   same chat + message) runs every evaluator as usual -- votes and scores
+   are logged fresh -- and then keeps the first decision's route:
+   - fresh route = the turn's route: unchanged (reason: the combiner's);
+   - fresh route differs: the turn's route, `decided_by` `pin`, reason
+     `pinned to this turn's first decision (<route>, <first id>); fresh:
+     <fresh route> — <fresh reason>`;
+   - **fresh route `local-private`: the fresh route wins.** A privacy force
+     (or a request for `local-private`) is never pinned away; reason
+     `<fresh reason>; local-private beats this turn's first decision (…)`.
+     A turn whose first call was private stays private through a nudge
+     that names no PII.
+3. **The invariants run again on the pinned route**, so they still have the
+   last word (a first decision of another version, whose routes this one
+   lacks, becomes the fail-safe with `apply: false`).
+4. **Every later call stores `pinned_from`** = the turn's first decision id,
+   whichever of the three it was. The first call's `pinned_from` is null.
+5. **A later call asks for no classification**: the first call already
+   asked for its conversation prefix, and the nudge's prefix (one user
+   message more) would be a wasted one.
+
+**The lookup** (`db/repositories/decisions.py::first_of_turn`): the EARLIEST
+stored decision of the same **ruleset id** (any version: a turn that spans a
+deploy keeps its route) for the same `(chat_id, message_id)`, leaving out
+the decision being made and background tasks -- among the primaries for the
+primary, among that ruleset's own shadow rows for a shadow. One query on
+`decisions_turn_idx`, within `DB_READ_BUDGET_S`, concurrently with the
+verdict lookup. No pin (decided afresh, as a first call) when:
+- the ruleset has no `pin`;
+- `chat_id` or `message_id` is missing -- Claude Code on `/v1/messages`,
+  any non-Open-WebUI client;
+- it is a background task ([§ Background tasks](#background-tasks));
+- the read timed out, failed, or there is no database (counted:
+  `route_policy_db_reads_cut_total{read="turn_pin"}`,
+  `route_policy_errors_total{kind="turn_pin"}`), or the first decision's
+  row was not written yet.
+
+**Still per call, not per turn:** a code tool called in the middle of a
+general answer does not move that answer to `local-code` -- the next user
+message does (`sticky-code` sees the call). A regenerated answer is a new
+message id, so a new turn.
+
+`route_policy_pinned_total{ruleset, outcome}` counts the later calls:
+`kept` (the fresh route already was the turn's), `changed` (the pin held a
+different fresh route), `private` (a fresh `local-private` beat the pin).
+
+## Background tasks
+
+Open WebUI's **background tasks** -- the chat title, tags, follow-up
+suggestions, query generation, emoji -- are ordinary chat completions. With
+the Task Model left on `auto` they reach route-policy like a chat turn
+(their decisions have no `message_id`), and before this an `llm_classifier`
+classified each one: ~100 s of CPU on `qwen3.5-4b` for a prompt that is not
+a turn of the conversation.
+
+- **The hook flags them.** `/decide` carries `background_task`, computed by
+  the LiteLLM hook with the `auto` footer's own detection
+  (`ai/litellm/hooks/footer/render.py::is_openwebui_task`: a `### Task:`
+  prompt sent without streaming, a `<chat_history>` block, or legacy
+  function calling's `Available Tools:` system message). The hook computes
+  it because it needs the request's `stream` flag, which `/decide` does not
+  carry.
+- **Decided and logged as before**, with `decisions.background_task = true`
+  -- so Trino can leave them out of anything about chat turns.
+- **Never classified:** an `llm_classifier` names no verdicts to look up,
+  enqueues nothing and abstains with `background task`.
+- **Never pinned, never pinning:** a background task is not a turn's first
+  decision, and is never held to one.
+
+**Recommended:** Open WebUI Admin Settings → Interface → **Task Model =
+`local-private`**. Background tasks then never reach `auto` at all, and a
+chat's title and follow-ups -- generated from the whole conversation --
+never reach a Claude-capable chain either (`auto` sends a task to whatever
+chain its words match, and those can overflow to Claude).
 
 ## Shadow rulesets
 
@@ -696,10 +885,14 @@ how a draft is measured on real traffic before anyone promotes it.
   (`shadow_error`), and neither affects the primary or the other shadows.
 - **Stored as:** a `decisions` row with `decision_id = uuid5(<primary id>,
   "<ruleset>@<version>")`, `shadow_of` = the primary's id, `mode = shadow`,
-  `applied = false`, the same chat / message / user ids, and its own
-  `evaluations`. A repeated `/decide` derives the same ids, and the first
-  write wins. No foreign key to the primary: its own write may still be in
-  flight, like `outcomes`.
+  `applied = false`, the same chat / message / user ids and
+  `background_task`, and its own `evaluations`. A repeated `/decide` derives
+  the same ids, and the first write wins. No foreign key to the primary: its
+  own write may still be in flight, like `outcomes`.
+- **Pinned on its own:** a `pin: turn` shadow is held to ITS turn's first
+  shadow decision (read from its own shadow rows, `pinned_from` = that
+  shadow row), never to the primary's route -- so it still measures what
+  enforcing it would do.
 - **Read as:** `GET /chats/{id}/decisions` nests them under their primary;
   Trino's `shadow_comparisons` view puts each beside its primary and the
   turn's outcome ([§ Decision log and Trino](#decision-log-and-trino));
@@ -723,7 +916,7 @@ how a draft is measured on real traffic before anyone promotes it.
   config:
     model: qwen3.5-4b           # a document-classifier registry id; must be LOCAL (below)
     criteria:                   # route -> the question /assess scores 1-10 (hint: presence), <= 200 chars each
-      local-code: "The latest user request in this conversation is about writing, running, debugging or changing code or software."
+      local-code: "The latest user request asks to write, fix, change or explain source code, a script or a software project. Using a tool such as web search does not count."
       local-reasoning: "The latest user request needs careful multi-step reasoning such as maths, logic, planning or analysis."
       local-private: "The conversation contains personal data about a real person, such as a name with an address, phone number, email or account number."
     otherwise: local-general    # no criterion reaches min_score -> this route; null = abstain
@@ -787,10 +980,17 @@ the next turn on**. The reasons, which Trino can group on:
 | `verdict failed: timeout` | the verdicts found all failed (any status but ok / incomplete) |
 | `no verdict in the last 3 message(s)` | nothing classified yet (a new chat's first turns), or older than `max_age_exchanges` |
 | `lookup timed out` / `lookup failed` / `lookup unavailable (no database)` | the read did not happen |
+| `background task` | an Open WebUI background task: nothing is looked up or classified ([§ Background tasks](#background-tasks)) |
 
 `detail`: `model`, `user_messages` (n), `looked_up`, `lookup_error`, and for
 the verdict reported -- `input_key`, `exchange_index` (its k), `age_exchanges`
 (n − k), `status`, `scores` (route → 1–10).
+
+**Which calls ask for a classification:** after the answer, a call asks for
+the prefix ending at its latest user message, unless that verdict is
+already stored -- and never a background task, nor (in a `pin: turn`
+ruleset) a call that is not its turn's first. So one Open WebUI answer, its
+tool rounds and its nudge included, costs at most one classification.
 
 ### The /assess cycle
 
@@ -889,8 +1089,8 @@ lifespan:
 
 ## The `default-llm` draft
 
-`rulesets/default-llm.yaml`, version 1, `mode: shadow`, bound as `auto`'s
-shadow, `priority` combiner:
+`rulesets/default-llm.yaml`, version 2, `mode: shadow`, `pin: turn`, bound
+as `auto`'s shadow, `priority` combiner:
 
 | # | Evaluator | Type | Route |
 |---|---|---|---|
@@ -902,28 +1102,38 @@ shadow, `priority` combiner:
 | — | default | | `local-general` |
 
 Rows 1–4 are `default`'s, config for config and in the same order, so the
-two rulesets differ only in the last rule: `default`'s 3-exchange
+two rulesets differ only in the last rule: `default`'s 2-exchange
 `sticky-code` cooldown is replaced by `topic-llm`. What it tests: does the
 classifier replace the cooldown, and catch what the keyword rules miss?
 `topic-llm` decides only a turn no keyword or tool rule claimed.
 `unit-tests/route-policy/test_llm_classifier.py` pins this wiring.
 
+**Version history:** 1's code criterion asked whether the request was
+"about writing, running, debugging or changing code or software", and
+`qwen3.5-4b` scored "check the weather in Utah" 10/10 for `local-code` --
+it read the web-search tool call as running software. 2 asks about source
+code, a script or a software project and says that using a tool does not
+count, and pins the route per turn (from its own shadow rows). The
+criteria are in the verdict keys' fingerprint, so version 2 classifies from
+scratch instead of reading version 1's verdicts; in Trino, compare the two
+by `shadow_ruleset_version`.
+
 ## Decision log and Trino
 
-`route-policy-db`, schema from `route_policy/db/migrations/0001_initial.sql`
-and `0002_llm_classifier.sql`:
+`route-policy-db`, schema from `route_policy/db/migrations/0001_initial.sql`,
+`0002_llm_classifier.sql` and `0003_turn_pins.sql`:
 
 | Table | One row per | Key columns |
 |---|---|---|
 | `rulesets` | ruleset version | `id`, `version` (PK), `document` (jsonb, resolved), `content_sha256`, `source`, `created_at`, `created_by`, `active_from`, `active_to` |
 | `bindings` | scope → version | `id`, `scope_model`, `scope_key_alias` (null = every key; unique with NULLS NOT DISTINCT), `ruleset_id`, `version` (FK), `updated_at`, `updated_by` |
 | `binding_shadows` | shadow slot | `binding_id` (FK, cascade), `position`, `ruleset_id`, `version` (FK) |
-| `decisions` | `/decide`, and each shadow ruleset beside it | `decision_id` (uuid PK), `created_at`, `chat_id`, `message_id`, `litellm_call_id`, `user_id`, `key_alias`, `requested_model`, `chosen_route`, `applied`, `mode`, `ruleset_id`, `ruleset_version` (FK), `reason`, `scores`, `backend_snapshot`, `message_count`, `tool_count`, `latency_ms`, `error`, `response`, `shadow_of` (the primary's id; null for a primary; **no FK**) |
+| `decisions` | `/decide`, and each shadow ruleset beside it | `decision_id` (uuid PK), `created_at`, `chat_id`, `message_id`, `litellm_call_id`, `user_id`, `key_alias`, `requested_model`, `chosen_route`, `applied`, `mode`, `ruleset_id`, `ruleset_version` (FK), `reason`, `scores`, `backend_snapshot`, `message_count`, `tool_count`, `latency_ms`, `error`, `response`, `shadow_of` (the primary's id; null for a primary; **no FK**), `pinned_from` (0003: the turn's first decision, on a later call of a `pin: turn` turn; null otherwise; **no FK**), `background_task` (0003: the hook's flag; `false` for older rows) |
 | `evaluations` | evaluator × decision | `decision_id` (FK, cascade), `position`, `evaluator_id`, `type`, `role`, `vote_route`, `weight`, `confidence`, `reason`, `abstained`, `latency_ms`, `error`, `detail` |
 | `outcomes` | `/observe` | `decision_id` (uuid PK, **no FK**), `created_at`, `litellm_call_id`, `response_id`, `served_model_group`, `served_deployment`, `overflow_reason`, `finish_reason`, `tool_calls` (jsonb), `status`, `error` |
 | `analyses` | classified conversation prefix | `input_key` (PK: sha256 of fingerprint + transcript), `created_at`, `fingerprint`, `model_id`; who asked first: `ruleset_id`, `ruleset_version`, `evaluator_id`, `chat_id`, `message_id`, `decision_id`; `exchange_index` (k), `input_chars`; the verdict: `route`, `confidence`, `scores` (jsonb route → 1–10), `reason` (the best-scoring criterion's, ≤ 200, CHECKed), `status`, `error`; the cost: `classifier_job_id`, `calls`, `prompt_tokens`, `completion_tokens`, `model_seconds`, `queue_ms`, `latency_ms`. **No transcript** |
-| `decision_outcomes` | view | every PRIMARY decision FULL JOIN its outcome, plus `agree` = `chosen_route = served_model_group` (0001's columns; 0002 recreated it over `shadow_of IS NULL`) |
-| `shadow_comparisons` | view | every shadow decision beside its primary and the turn's outcome: `shadow_decision_id`, `primary_decision_id`, both `*_decided_at`, `observed_at`, `chat_id`, `message_id`, `user_id`, `requested_model`, `shadow_ruleset_id` / `_version`, `primary_ruleset_id` / `_version`, `shadow_route`, `primary_route`, `primary_applied`, `served_model_group`, `served_deployment`, `shadow_reason`, `primary_reason`, `shadow_error`, `agree_with_primary`, `agree_with_served` |
+| `decision_outcomes` | view | every PRIMARY decision FULL JOIN its outcome, plus `agree` = `chosen_route = served_model_group` (0001's columns; 0002 recreated it over `shadow_of IS NULL`; 0003 appended `pinned_from`, `background_task`) |
+| `shadow_comparisons` | view | every shadow decision beside its primary and the turn's outcome: `shadow_decision_id`, `primary_decision_id`, both `*_decided_at`, `observed_at`, `chat_id`, `message_id`, `user_id`, `requested_model`, `shadow_ruleset_id` / `_version`, `primary_ruleset_id` / `_version`, `shadow_route`, `primary_route`, `primary_applied`, `served_model_group`, `served_deployment`, `shadow_reason`, `primary_reason`, `shadow_error`, `agree_with_primary`, `agree_with_served`; 0003 appended `shadow_pinned_from`, `primary_pinned_from`, `background_task` |
 | `schema_migrations` | applied migration | `version`, `name`, `sha256`, `applied_at` |
 
 - **Indexes:**
@@ -933,7 +1143,9 @@ and `0002_llm_classifier.sql`:
     `outcomes(litellm_call_id)`;
   - `evaluations(evaluator_id)`;
   - `decisions(shadow_of)`; `analyses(created_at)`, `analyses(chat_id, created_at)`,
-    `analyses(decision_id)`.
+    `analyses(decision_id)`;
+  - `decisions(chat_id, message_id, ruleset_id, created_at)`
+    (`decisions_turn_idx`, 0003: the turn-pin lookup).
 - **JSON is jsonb** (Trino: `json`) rather than arrays: the PostgreSQL
   connector hides array columns by default.
 
@@ -996,8 +1208,52 @@ GROUP BY 1, 2
 ORDER BY 3 DESC;
 ```
 
+**One row per chat turn** -- each answer's FIRST decision, background tasks
+left out (rows from before 0003 have no pins, so there every call of an
+answer shows):
+
+```sql
+SELECT created_at, chat_id, message_id, ruleset_version, chosen_route, reason
+FROM postgres_route_policy.public.decisions
+WHERE shadow_of IS NULL AND pinned_from IS NULL AND NOT background_task
+  AND message_id IS NOT NULL
+ORDER BY created_at DESC
+LIMIT 100;
+```
+
+**What the turn pin did** -- the later calls of each turn, by what the pin
+did to their fresh route (the same split as `route_policy_pinned_total`):
+
+```sql
+SELECT ruleset_id, ruleset_version,
+       CASE WHEN reason LIKE 'pinned to this turn''s first decision%' THEN 'changed'
+            WHEN reason LIKE '%local-private beats this turn''s first decision%' THEN 'private'
+            ELSE 'kept' END AS pin,
+       count(*) AS calls
+FROM postgres_route_policy.public.decisions
+WHERE pinned_from IS NOT NULL
+GROUP BY 1, 2, 3
+ORDER BY calls DESC;
+```
+
+Each `changed` row's reason names the fresh route the pin overrode (`fresh:
+local-general — …`); join `pinned_from` back to `decisions` for the turn's
+first call.
+
+**Background tasks reaching `auto`** -- they should drop to ~0 once Open
+WebUI's Task Model is `local-private` ([§ Background tasks](#background-tasks)):
+
+```sql
+SELECT date_trunc('day', created_at) AS day, background_task, count(*)
+FROM postgres_route_policy.public.decisions
+WHERE shadow_of IS NULL AND requested_model = 'auto'
+GROUP BY 1, 2
+ORDER BY 1 DESC, 2;
+```
+
 **Shadow agreement** -- the promotion measure, by shadow ruleset: how often
-the draft chose what the live ruleset chose, and the chain that served:
+the draft chose what the live ruleset chose, and the chain that served,
+over chat turns only:
 
 ```sql
 SELECT shadow_ruleset_id, shadow_ruleset_version, primary_route, shadow_route,
@@ -1005,12 +1261,14 @@ SELECT shadow_ruleset_id, shadow_ruleset_version, primary_route, shadow_route,
        count_if(agree_with_served) AS agree_served
 FROM postgres_route_policy.public.shadow_comparisons
 WHERE shadow_decided_at > current_timestamp - INTERVAL '7' DAY
+  AND NOT background_task
 GROUP BY 1, 2, 3, 4
 ORDER BY turns DESC;
 ```
 
 **The classifier's vote against the rules', per turn** -- where `topic-llm`
-decided the shadow, what `default`'s `sticky-code` said for the same turn:
+decided the shadow, what `default`'s `sticky-code` said for the same turn
+(each answer's first call):
 
 ```sql
 SELECT e.vote_route AS classifier, p.vote_route AS sticky_code, s.primary_route, count(*)
@@ -1019,6 +1277,7 @@ JOIN postgres_route_policy.public.evaluations e
   ON e.decision_id = s.shadow_decision_id AND e.evaluator_id = 'topic-llm'
 JOIN postgres_route_policy.public.evaluations p
   ON p.decision_id = s.primary_decision_id AND p.evaluator_id = 'sticky-code'
+WHERE NOT s.background_task AND s.primary_pinned_from IS NULL
 GROUP BY 1, 2, 3
 ORDER BY 4 DESC;
 ```
@@ -1120,20 +1379,23 @@ verdicts `default-llm` already stored for the same `topic-llm` config.
 | `route_policy_duplicates_total` | `endpoint` | Repeated `decision_id`s |
 | `route_policy_writes_deferred_total` | `write` (decision / outcome) | Writes that outlasted `ROUTE_POLICY_DECISION_WRITE_BUDGET_S`: answered at once, finished in the background |
 | `route_policy_writes_in_flight` | — | Decision / outcome writes started and not finished (cap 256) |
-| `route_policy_db_reads_cut_total` | `read` (binding_refresh / ruleset_fetch / analysis_lookup) | Reads on the `/decide` path that outlasted `DB_READ_BUDGET_S` |
+| `route_policy_db_reads_cut_total` | `read` (binding_refresh / ruleset_fetch / analysis_lookup / turn_pin) | Reads on the `/decide` path that outlasted `DB_READ_BUDGET_S` |
+| `route_policy_pinned_total` | `ruleset` (`<id>@<version>`), `outcome` (kept / changed / private) | Later calls of a `pin: turn` turn: the fresh route already was the turn's, the pin held a different one, or a fresh `local-private` beat the pin ([§ Turn pinning](#turn-pinning)); shadows included |
 | `route_policy_shadow_decisions_total` | `ruleset` (`<id>@<version>`), `agree` (true / false: chose the primary's route) | Shadow decisions stored |
 | `route_policy_analyses_total` | `model`, `status` (ok / incomplete / unavailable / refused / failed / timeout / not_local) | Classifications finished |
 | `route_policy_analysis_seconds` | `model` | One classification's cycle, locality check to result |
 | `route_policy_analysis_queue_depth` | — | Requests waiting for a worker |
 | `route_policy_analysis_dropped_total` | `reason` (queue_full / shutdown) | Requests not classified |
-| `route_policy_errors_total` | `kind` (decision_write, decision_write_dropped, outcome_write, outcome_write_dropped, binding_refresh, ruleset_compile, unbound_model, shadow_load, shadow_dropped, shadow_error, analysis_lookup, analysis_write, classifier_delete) | Errors |
+| `route_policy_errors_total` | `kind` (decision_write, decision_write_dropped, outcome_write, outcome_write_dropped, binding_refresh, ruleset_compile, unbound_model, shadow_load, shadow_dropped, shadow_error, analysis_lookup, turn_pin, analysis_write, classifier_delete) | Errors |
 
 Shadow decisions also count in `route_policy_decisions_total` (with
 `mode="shadow"`), `route_policy_votes_total` and
 `route_policy_evaluator_seconds`. Plus the HTTP request metrics of
 prometheus-fastapi-instrumentator. Each `/decide` logs one INFO line:
-`[decide] <id> auto -> local-code (code-tools: called … ; default@2 enforce) chat=<id>`,
-each shadow one `[shadow] <id> default-llm@1 -> … beside <primary id> -> …`,
+`[decide] <id> auto -> local-code (code-tools: called … ; default@3 enforce) chat=<id>`
+(` task` appended for a background task; a pinned call's reason starts
+`pinned to this turn's first decision …`),
+each shadow one `[shadow] <id> default-llm@2 -> … beside <primary id> -> …`,
 each classification one `[analysis] <key prefix> qwen3.5-4b k=3 -> local-code (ok; scores {…}; 6.2s, queue 0.4s) chat=<id>`
 -- ids, routes, scores and timings, never text.
 
@@ -1161,7 +1423,8 @@ Constants in `route_policy/config.py`, not environment variables:
 `WRITES_MAX_IN_FLIGHT` (256 background writes and after-the-answer tasks),
 `WRITES_DRAIN_S` (5 s at shutdown, for the writes and again for running
 classifications), `DB_READ_BUDGET_S` (0.1 s for the binding refresh, a
-version fetch and a verdict lookup on the `/decide` path),
+version fetch, a verdict lookup and the turn-pin read on the `/decide`
+path),
 `CLASSIFIER_MODELS_TTL_S` (60 s cache of `GET /models` and of each model
 host's locality verdict).
 
@@ -1201,8 +1464,9 @@ or an empty URL sends every `auto` turn to `local-private`),
   4. `make up trino trino-coordinator`.
 - **Deploy classes:**
   - `route-policy` swaps side by side. Two copies are safe: every decision
-    comes from the request alone, startup takes advisory locks, and writes
-    are idempotent.
+    comes from the request and from rows any copy reads alike (stored
+    verdicts, a turn's first decision), startup takes advisory locks, and
+    writes are idempotent.
   - `route-policy-db` is recreated (one data directory, one Postgres). The
     service keeps deciding during the gap.
 - **Exposure:** no auth on the service. Anything on `ai_shared`, and any LAN
@@ -1266,7 +1530,8 @@ ai/route-policy/
     rulesets/           model (document, compiled form, hash), loader (files, refs, bindings), validate, store
     analysis/           model (AnalysisRequest, Verdict), verdict (choose), classifier_client (the /assess
                         cycle), queue (AnalysisQueue)
-    db/                 pool, migrations/ (0001_initial.sql, 0002_llm_classifier.sql + runner), repositories/
+    db/                 pool, migrations/ (0001_initial.sql, 0002_llm_classifier.sql, 0003_turn_pins.sql
+                        + runner), repositories/
 ```
 
 Reused from `shared/common`:
@@ -1287,19 +1552,20 @@ TEST_POSTGRES_DSN=postgresql://postgres@localhost:55441/postgres \
 
 | Module | Covers |
 |---|---|
-| `test_evaluators.py` | Each evaluator. The cooldown's verdicts and reasons are pinned on a table of histories. |
-| `test_declarations.py` | Every real evaluator's `detail` against its declaration |
-| `test_combiners.py`, `test_invariants.py`, `test_pipeline.py` | The frame, both combiners, the invariants, the contract shapes, error handling |
-| `test_rulesets.py` | Files, refs (no path escape), validation, content hash, seed bindings, the cache |
-| `test_default_ruleset.py` | The pattern files (valid rules, every regex in the RE2 subset, the real-chat prompts `code_kw` must and must not match), the ruleset's wiring, and its routes on ~20 conversation shapes |
+| `test_evaluators.py` | Each evaluator. The cooldown's verdicts and reasons are pinned on a table of histories (0 to 3 exchanges; the ruleset's 2 spelled out). |
+| `test_declarations.py` | Every real evaluator's `detail` against its declaration (the `llm_classifier`'s background-task abstain included) |
+| `test_combiners.py`, `test_invariants.py`, `test_pipeline.py` | The frame, both combiners, the invariants, the contract shapes, error handling; the turn pin as a pure function (the contract unchanged, every vote kept, privacy and a requested `local-private` winning, the invariants on the pinned route, no pin without `pin: turn`, no analysis requests from a later call) |
+| `test_rulesets.py` | Files, refs (no path escape), validation (`pin` included), content hash, seed bindings, the cache |
+| `test_default_ruleset.py` | The pattern files (valid rules, every regex in the RE2 subset, the real-chat prompts `code_kw` must and must not match), the ruleset's wiring, its routes on ~25 conversation shapes, and the routes of a turn's later calls (tool rounds, the nudge, PII mid-turn) |
+| `test_turns.py` | Turn pinning and background tasks through `/decide` with the tables in memory: one route for a turn's calls, `pinned_from`, a shadow pinned from its own rows, one classification per turn, privacy beating the pin, no lookup without a message id, a cut / failed lookup decided afresh in time, a background task logged / never classified / never pinning, the metrics |
 | `test_api.py` | Every endpoint with no database: contract, validation, decisions still answered with the DB down |
 | `test_writes.py` | No database wait holds `/decide`: deferred and dropped writes, shutdown, bounded reads |
-| `test_llm_classifier.py` | The evaluator: config validation, route checks, fingerprint, verdict keys (stable across tool rounds, changed by an edit), ageing, every vote and abstain reason, analysis requests, the tie order surviving a jsonb round trip, the `default-llm` wiring |
+| `test_llm_classifier.py` | The evaluator: config validation, route checks, fingerprint, verdict keys (stable across tool rounds, changed by an edit), ageing, every vote and abstain reason, analysis requests, background tasks, the tie order surviving a jsonb round trip, the `default-llm` wiring (version, pin, the reworded code criterion) |
 | `test_verdict.py` | `choose`: winners, ties, `otherwise` confidence, errored criteria |
 | `test_analysis_client.py` | The `/assess` cycle on a fake classifier: every status, the locality guard (authenticated, public, mixed and unresolvable hosts refused before submitting; private / loopback / ULA local), caches, DELETE always (after a cancel on timeout, and when cancelled), no submitted text in any error |
 | `test_analysis_queue.py` | Dedupe, overflow, skip-if-stored, the written row (scores by route, winner's reason, usage, provenance; failures with no scores), write failures, shutdown (waiting dropped, running cancelled and still deleted) |
 | `test_shadows.py` | Resolving shadows, skipped unloadable ones, derived ids, the primary response unchanged by a shadow, the shadow row and its evaluations, idempotency, provenance of analysis requests, a primary with an `llm_classifier`, isolation (a raising shadow, a hung database, the task cap), `/evaluate` reading without enqueueing |
-| `test_db.py` (`postgres`) | Startup, seeding (with shadow slots), immutability, migrations, the phase-2 → phase-3 upgrade, idempotent `/decide` / `/observe` in either order, shadow rows and both views, the `analyses` table (first write wins, caps, the CHECK), the whole classifier loop on a fake classifier (job deleted, verdict voted next turn, no text stored), an edit making a verdict unreachable, a stored draft compiling like its file, the reads |
+| `test_db.py` (`postgres`) | Startup, seeding (with shadow slots), immutability, migrations (0003 on a phase-4 database with rows), the phase-2 → phase-3 and phase-4 → `default@3` upgrades (a turn pinned across the deploy), idempotent `/decide` / `/observe` in either order, shadow rows and both views (the 0003 columns), the `analyses` table (first write wins, caps, the CHECK), the whole classifier loop on a fake classifier (job deleted, verdict voted next turn, no text stored), one classification per turn, the turn lookup on real rows, an edit making a verdict unreachable, a stored draft compiling like its file, the reads |
 | `test_wiring.py` | Postman coverage, compose classes and env, Trino env, pass-through, Makefile, Dockerfile (bench shipped and imported), line endings |
 | `bench/` | The benchmark's pure parts ([`bench/BENCH.md`](bench/BENCH.md)) |
 

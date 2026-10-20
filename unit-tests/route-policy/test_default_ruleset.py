@@ -10,9 +10,11 @@ that route `auto`.
 * real prompts from the "Scientific Calculator" chat match ``code_kw`` (or
   don't) -- both through the RE2 stand-in and through the rule the engine
   really runs;
-* the ruleset's wiring (version, mode, evaluator order, roles, refs, the
-  tool pattern, the cooldown);
-* fixed routes on conversation shapes: what an ``auto`` turn is sent to.
+* the ruleset's wiring (version, mode, the turn pin, evaluator order, roles,
+  refs, the tool pattern, the cooldown);
+* fixed routes on conversation shapes: what an ``auto`` turn is sent to --
+  and, with the turn's first decision on the context, what its later calls
+  (tool rounds, Open WebUI's hidden auto-continue nudge) are sent to.
 
 Changing a pattern or the wiring is a ruleset change: update the expected
 values here and bump ``default.yaml``'s ``version`` (ROUTE_POLICY.md §
@@ -21,14 +23,17 @@ Changing a ruleset).
 
 from __future__ import annotations
 
+import asyncio
 import re
+import uuid
 
 import pytest
 import yaml
 
-from rp_helpers import RULESETS_DIR, assistant, default_ruleset, run, system, tool_round, user
+from rp_helpers import NUDGE, RULESETS_DIR, assistant, context, default_ruleset, run, system, tool_round, user
 
 from common.keywordmatch import compile_keyword_rule
+from route_policy.engine.pipeline import run as run_pipeline
 from route_policy.evaluators.regex_text import RegexTextConfig
 
 PATTERN_FILES = sorted((RULESETS_DIR / "patterns").glob("*.yaml"))
@@ -150,7 +155,7 @@ def test_non_code_prompts_do_not_match(text):
 
 def test_default_ruleset_wiring():
     ruleset = default_ruleset()
-    assert (ruleset.id, ruleset.version, ruleset.mode) == ("default", 2, "enforce")
+    assert (ruleset.id, ruleset.version, ruleset.mode, ruleset.pin) == ("default", 3, "enforce", "turn")
     assert ruleset.routes == ["local-general", "local-code", "local-reasoning", "local-private"]
     assert ruleset.default_route == "local-general"
     assert ruleset.document["combiner"] == {"type": "priority"}
@@ -171,7 +176,7 @@ def test_default_ruleset_wiring():
     assert tools.scope == "current_exchange"
     cooldown = entries[4].evaluator.config
     # Judges asked in this order: tool calls first, then the code keywords.
-    assert (cooldown.exchanges, cooldown.relevant_if) == (3, ["code-tools", "code-text"])
+    assert (cooldown.exchanges, cooldown.relevant_if) == (2, ["code-tools", "code-text"])
 
 
 PLAIN = [user("what's the weather like"), assistant("sunny")]
@@ -189,9 +194,22 @@ CONVERSATIONS = {
     "reasoning beats tool history": (CODING + [user("derive the formula step by step")], "local-reasoning"),
     "tool call this exchange": ([user("go ahead"), *tool_round("run_command")], "local-code"),
     "tool call 1 ago": (CODING + [user("Looks the same")], "local-code"),
-    "tool call 3 ago": (CODING + PLAIN + PLAIN + [user("ok")], "local-code"),
+    "tool call 2 ago": (CODING + PLAIN + [user("ok")], "local-code"),
+    "tool call 3 ago": (CODING + PLAIN + PLAIN + [user("ok")], "local-general"),   # the 2-exchange cooldown ran out
     "tool call 4 ago": (CODING + PLAIN * 3 + [user("ok")], "local-general"),
     "code text 2 ago": ([user("debug this traceback"), assistant()] + PLAIN + [user("thanks")], "local-code"),
+    "code text 3 ago": ([user("debug this traceback"), assistant()] + PLAIN * 2 + [user("thanks")], "local-general"),
+    # The 2026-10 chat: a calculator, then the weather. The first weather
+    # question is still held (1 irrelevant since < 2), the next one is not.
+    "calculator then weather": ([user("Make me a scientific calculator!"), assistant(),
+                                 user("check the weather in Utah")], "local-code"),
+    "calculator then weather twice": ([user("Make me a scientific calculator!"), assistant(),
+                                       user("check the weather in Utah"), assistant("sunny"),
+                                       user("and in Denver?")], "local-code"),
+    "calculator then weather three times": ([user("Make me a scientific calculator!"), assistant(),
+                                             user("check the weather in Utah"), assistant("sunny"),
+                                             user("and in Denver?"), assistant("snow"),
+                                             user("and Boise?")], "local-general"),
     "unrelated tool": ([user("look it up"), *tool_round("search_web"), user("and?")], "local-general"),
     "offered tools only": ([user("hi")], "local-general"),
     "no user message": ([system("you are a bot")], "local-general"),
@@ -214,3 +232,56 @@ def test_default_ruleset_routes(name):
 def test_requested_private_is_never_applied_elsewhere():
     decision = run(default_ruleset(), [user("write a python script")], requested_model="local-private")
     assert decision.route == "local-private" and decision.apply is True and decision.overrides == ("private",)
+
+
+# -- one route per turn ------------------------------------------------------------------
+
+FIRST = uuid.UUID("0b1c2d3e-0000-4000-8000-000000000001")
+CALCULATOR = [user("Make me a scientific calculator!"), assistant()]
+WEATHER = [user("check the weather in Utah")]
+# name -> (a LATER call of the turn, the route the turn's first call got,
+#          the route this call gets, the pin's outcome)
+LATER_CALLS = {
+    # The 2026-10 chat: the weather turn's first call was still on the
+    # cooldown; the nudge, a new "exchange", would have expired it mid-answer.
+    "nudge after a search": (CALCULATOR + [user("tell me a joke"), assistant()] + WEATHER
+                             + tool_round("search_web") + [assistant("I'll look it up again."), user(NUDGE)],
+                             "local-code", "local-code", "changed"),
+    "tool round of a coding turn": (CALCULATOR + [user("now add tests"), *tool_round("sandbox-mcp_exec")],
+                                    "local-code", "local-code", "kept"),
+    "tool round of a weather turn": (WEATHER + tool_round("search_web"), "local-general", "local-general", "kept"),
+    # A code tool called mid-turn does not move a general turn either.
+    "code tool in a general turn": (WEATHER + tool_round("run_command"), "local-general", "local-general",
+                                    "changed"),
+    # Privacy always wins over a pin...
+    "pii in the latest user message": (WEATHER + tool_round("search_web") + [user("my SSN is 123-45-6789")],
+                                       "local-general", "local-private", "private"),
+    # ...and a private turn stays private through a nudge that names no PII.
+    "nudge in a private turn": ([user("my SSN is 123-45-6789, file my taxes"), *tool_round("search_web"),
+                                 assistant("I'll file it."), user(NUDGE)],
+                                "local-private", "local-private", "changed"),
+}
+
+
+@pytest.mark.parametrize("name", sorted(LATER_CALLS))
+def test_later_calls_of_a_turn_keep_its_route(name):
+    from route_policy.engine.context import TurnPin
+
+    messages, first_route, expected, outcome = LATER_CALLS[name]
+    ctx = context(messages)
+    ctx.turn_pin = TurnPin(FIRST, first_route)
+    decision = asyncio.run(run_pipeline(default_ruleset(), ctx))
+    assert (decision.route, decision.pin_outcome, decision.pinned_from) == (expected, outcome, FIRST), \
+        (name, decision.reason)
+    assert decision.apply is True
+    assert len(decision.votes) == 5   # every evaluator still ran and is logged
+    fresh = run(default_ruleset(), messages)   # the same call as the turn's first
+    assert fresh.pinned_from is None and fresh.pin_outcome is None
+    if outcome == "changed":
+        assert fresh.route != expected and decision.decided_by == "pin"
+        assert decision.reason == (f"pinned to this turn's first decision ({first_route}, {FIRST}); "
+                                   f"fresh: {fresh.route} — {fresh.reason}")
+    elif outcome == "private":
+        assert decision.reason == f"{fresh.reason}; local-private beats this turn's first decision ({first_route}, {FIRST})"
+    else:
+        assert decision.reason == fresh.reason and decision.decided_by == fresh.decided_by

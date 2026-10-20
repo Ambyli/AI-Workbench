@@ -20,6 +20,8 @@ behind.
     0002_llm_classifier.sql  binding_shadows, decisions.shadow_of, analyses (the
                              llm_classifier's verdicts), decision_outcomes over
                              primaries only, the shadow_comparisons view (phase 4)
+    0003_turn_pins.sql       decisions.pinned_from (`pin: turn`), decisions.background_task,
+                             the turn index, both views with the new columns appended
 """
 
 from __future__ import annotations

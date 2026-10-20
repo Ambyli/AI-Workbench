@@ -10,25 +10,44 @@
    with an error -- an evaluator can never smuggle a non-chain route past the
    combiner;
 3. the ruleset's combiner picks one route (``combiners.base``);
-4. the invariants (``engine.invariants``) have the last word;
-5. ``apply`` is true only for an ``enforce`` ruleset whose invariants held.
+4. the invariants (``engine.invariants``) check it -- the FRESH decision;
+5. a ``pin: turn`` ruleset whose turn already has a first decision
+   (``ctx.turn_pin``, put there by the service) keeps that decision's route,
+   unless the fresh route is local-private: a privacy force, or a request
+   for local-private, always wins over a pin. The invariants run again on
+   the pinned route, so they still have the last word;
+6. ``apply`` is true only for an ``enforce`` ruleset whose invariants held.
+
+**The pin** changes nothing but the route (and ``apply`` / the reason): every
+evaluator still runs and every vote is logged, so the turn's later calls show
+what the rules would have said. :attr:`Decision.pinned_from` names the turn's
+first decision whenever there was one -- whether the pin changed the route
+(``decided_by == "pin"``, reason ``pinned to this turn's first decision
+(<route>, <id>); fresh: <route> — <reason>``), the fresh route already was the
+turn's (the reason is the combiner's), or a fresh local-private beat it (the
+reason says so). :attr:`Decision.pin_outcome` says which (``changed`` |
+``kept`` | ``private``), for the metrics.
 
 Pure: no database, no metrics. The API layer stores and counts the result.
 :meth:`Decision.response` is the POST /decide body (ROUTE_POLICY_PLAN § 7,
-the API contract), and with ``with_detail`` the POST /evaluate body.
+the API contract), and with ``with_detail`` the POST /evaluate body -- the
+pin adds no key to either.
 
 Around a run, the service asks the same ruleset two more questions
 (``Evaluator.analysis_lookups`` / ``analysis_requests``, gathered by
 :func:`analysis_lookups` and :func:`analysis_requests` here): which stored
 verdicts to read onto the context BEFORE the run, and what to classify in
 the background AFTER the answer. An evaluator that raises in either is
-skipped and logged -- the decision never depends on them.
+skipped and logged -- the decision never depends on them. A call that is not
+its turn's first asks for nothing: the turn's first call already asked for
+its conversation prefix.
 """
 
 from __future__ import annotations
 
 import logging
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -37,11 +56,16 @@ from ..combiners.base import Ballot
 from ..evaluators.base import Outcome
 from ..rulesets.model import CompiledRuleset
 from . import invariants
-from .context import RequestContext
+from .context import RequestContext, TurnPin
 
 logger = logging.getLogger("route_policy.engine")
 
 ERROR_MAX_CHARS = 500
+
+# Decision.decided_by when the turn's pin replaced the fresh route.
+PIN = "pin"
+# Decision.pin_outcome (the route_policy_pinned_total{outcome} label).
+PIN_CHANGED, PIN_KEPT, PIN_PRIVATE = "changed", "kept", "private"
 
 
 def _ms(seconds: float) -> float:
@@ -90,10 +114,14 @@ class Decision:
     apply: bool
     votes: List[Vote]
     scores: Dict[str, float]
-    reason: str                       # the combiner's explanation (+ invariant notes)
-    decided_by: Optional[str]
+    reason: str                       # the combiner's explanation (+ invariant notes, + the pin)
+    decided_by: Optional[str]         # the deciding evaluator id; "pin"; None for the default
     overrides: Tuple[str, ...]        # invariants that changed the route
     latency_ms: float
+    # The turn's first decision, when this one is not it (a `pin: turn`
+    # ruleset); and what the pin did: changed | kept | private.
+    pinned_from: Optional[uuid.UUID] = None
+    pin_outcome: Optional[str] = None
 
     @property
     def mode(self) -> str:
@@ -139,10 +167,17 @@ def analysis_lookups(ruleset: CompiledRuleset, ctx: RequestContext) -> List[str]
     return keys
 
 
+def _turn_pin(ruleset: CompiledRuleset, ctx: RequestContext) -> Optional[TurnPin]:
+    """The turn's first decision when ``ruleset`` pins turns, else None."""
+    return ctx.turn_pin if ruleset.pin == "turn" else None
+
+
 def analysis_requests(ruleset: CompiledRuleset, ctx: RequestContext) -> List[AnalysisRequest]:
     """What the ruleset's evaluators want classified in the background, in
     ruleset order (provenance not filled in yet: the service adds the ruleset
-    and the decision)."""
+    and the decision). Nothing for a call that is not its turn's first."""
+    if _turn_pin(ruleset, ctx) is not None:
+        return []
     out: List[AnalysisRequest] = []
     for entry in ruleset.entries:
         try:
@@ -187,15 +222,38 @@ async def run(ruleset: CompiledRuleset, ctx: RequestContext) -> Decision:
     combination = ruleset.combiner.combine(ballots, ruleset.routes, ruleset.default_route)
     checked = invariants.enforce(ctx.requested_model, combination.route, ruleset.routes, ruleset.default_route)
     reason = combination.reason if not checked.notes else f"{combination.reason}; " + "; ".join(checked.notes)
+    route, allowed, overrides, decided_by = checked.route, checked.allowed, checked.overrides, combination.decided_by
+    pinned_from: Optional[uuid.UUID] = None
+    pin_outcome: Optional[str] = None
+    pin = _turn_pin(ruleset, ctx)
+    if pin is not None:
+        pinned_from = pin.decision_id
+        first = f"this turn's first decision ({pin.route}, {pin.decision_id})"
+        if route == pin.route:
+            pin_outcome = PIN_KEPT
+        elif route == invariants.PRIVATE_ROUTE:
+            # Privacy always wins: a pin never moves a turn off local-private.
+            pin_outcome = PIN_PRIVATE
+            reason = f"{reason}; {invariants.PRIVATE_ROUTE} beats {first}"
+        else:
+            held = invariants.enforce(ctx.requested_model, pin.route, ruleset.routes, ruleset.default_route)
+            pin_outcome, decided_by = PIN_CHANGED, PIN
+            reason = f"pinned to {first}; fresh: {route} — {reason}"
+            if held.notes:
+                reason = f"{reason}; " + "; ".join(held.notes)
+            route, allowed = held.route, held.allowed
+            overrides = tuple(dict.fromkeys(overrides + held.overrides))
     return Decision(
         ruleset=ruleset,
         requested_model=ctx.requested_model,
-        route=checked.route,
-        apply=ruleset.mode == "enforce" and checked.allowed,
+        route=route,
+        apply=ruleset.mode == "enforce" and allowed,
         votes=votes,
         scores=combination.scores,
         reason=reason,
-        decided_by=combination.decided_by,
-        overrides=checked.overrides,
+        decided_by=decided_by,
+        overrides=overrides,
         latency_ms=_ms(time.perf_counter() - started),
+        pinned_from=pinned_from,
+        pin_outcome=pin_outcome,
     )

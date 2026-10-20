@@ -429,6 +429,7 @@ def test_decide_is_awaited_and_its_route_applied():
             "tools": TOOLS,
             "backends": {QWEN: {"verdict": "ok", "waiting": 0.0, "running": 2.0},
                          MUSE: {"verdict": "busy", "waiting": 3.0, "running": 1.0}},
+            "background_task": False,
         }
         assert stash == {"requested_model": "auto", "route": "local-code", "source": "engine",
                          "decision_id": body["decision_id"], "litellm_call_id": "call-1", "observed": False}
@@ -462,8 +463,41 @@ def test_decide_minimal_request_sends_nulls():
             "litellm_call_id": None, "chat_id": None, "message_id": None, "user_id": None,
             "key_alias": None, "tools": None}
         assert body["backends"] == {}  # nothing learnt yet (a fresh proxy)
+        assert body["background_task"] is False
         assert data["metadata"][STASH_KEY]["decision_id"] == body["decision_id"]
         assert data["model"] == "local-code"
+
+    run(go())
+
+
+TITLE_TASK = ("### Task:\nGenerate a concise, 3-5 word title with an emoji summarizing the chat history.\n"
+              "<chat_history>\nUSER: build a calculator\n</chat_history>")
+
+
+@pytest.mark.parametrize("messages, stream, expected", [
+    # Open WebUI's title / tags / follow-ups: a `### Task:` prompt, never streamed.
+    ([{"role": "user", "content": TITLE_TASK}], False, True),
+    # The RAG template also starts `### Task:`, but a chat answer is streamed.
+    ([{"role": "user", "content": TITLE_TASK}], True, False),
+    # Legacy function calling's tool-picking request.
+    ([{"role": "system", "content": "Available Tools: [...]"}, {"role": "user", "content": "hi"}], True, True),
+    ([{"role": "user", "content": "what's the weather in Utah?"}], False, False),
+])
+def test_decide_carries_the_footers_background_task_verdict(messages, stream, expected):
+    """background_task is the footer's own is_openwebui_task(data) -- the same
+    detection that keeps the footer off a task -- computed in the hook
+    because it needs data["stream"], which the body does not carry."""
+    from hooks.footer.render import is_openwebui_task
+
+    async def go():
+        post = Recorder()
+        h = make_handler(post)
+        data = proxy_data(messages=messages, stream=stream)
+        assert is_openwebui_task(data) is expected
+        await h.async_pre_call_hook(KEY, None, data, "acompletion")
+        body = post.bodies("/decide")[0]
+        assert body["background_task"] is expected
+        assert data["model"] == "local-code"   # decided and routed as before
 
     run(go())
 

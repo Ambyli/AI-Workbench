@@ -9,7 +9,10 @@
 * the vote: the newest usable verdict, its age in the reason, the
   route chosen by the verdict, every abstain reason;
 * analysis_requests: one request for the latest prefix, carrying the
-  rendered transcript, unless that verdict is already known.
+  rendered transcript, unless that verdict is already known;
+* an Open WebUI background task: nothing looked up, nothing requested, an
+  abstain;
+* the `default-llm` draft's wiring (version, pin, criteria).
 """
 
 from __future__ import annotations
@@ -20,7 +23,7 @@ import copy
 import pytest
 from pydantic import ValidationError
 
-from rp_helpers import RULESETS_DIR, assistant, compile_doc, context, seed, tool_round, user
+from rp_helpers import RULESETS_DIR, TITLE_TASK, assistant, compile_doc, context, seed, tool_round, user
 
 from common.conversation import render_transcript
 from route_policy.analysis.model import Verdict
@@ -289,11 +292,32 @@ def test_no_request_when_the_verdict_is_known_or_there_is_nothing_to_classify():
     assert ev.analysis_requests(context([])) == []
 
 
+# -- background tasks --------------------------------------------------------------------------
+
+def test_a_background_task_is_never_looked_up_classified_or_voted():
+    ev = evaluator()
+    msgs = [*conversation(2), assistant("done"), user(TITLE_TASK)]
+    task = context(msgs)
+    task.background_task = True
+    # Even a verdict that is stored for this very prefix is not read.
+    k3 = key_for(ev, msgs, 3)
+    task.analyses = {k3: verdict(k3, 3)}
+    assert ev.analysis_lookups(task) == [] and ev.analysis_requests(task) == []
+    out = asyncio.run(ev.evaluate(task))
+    assert not out.voted and out.reason == "background task"
+    assert out.detail == {"model": "qwen3.5-4b", "user_messages": 3, "looked_up": 0, "lookup_error": None,
+                          "input_key": None, "exchange_index": None, "age_exchanges": None, "status": None,
+                          "scores": None}
+    # The same conversation as a chat turn is looked up and classified.
+    chat = context(msgs)
+    assert len(ev.analysis_lookups(chat)) == 3 and len(ev.analysis_requests(chat)) == 1
+
+
 def test_the_draft_ruleset_wiring():
     (llm,) = [r for r in seed().compiled if r.id == "default-llm"]
     (live,) = [r for r in seed().compiled if r.id == "default"]
-    assert (llm.version, llm.mode, llm.routes, llm.default_route) == (
-        1, "shadow", live.routes, live.default_route)
+    assert (llm.version, llm.mode, llm.pin, llm.routes, llm.default_route) == (
+        2, "shadow", "turn", live.routes, live.default_route)
     assert [(e.id, e.type, e.role) for e in llm.entries] == [
         ("privacy", "regex_text", "force"), ("code-text", "regex_text", "vote"),
         ("reasoning-text", "regex_text", "vote"), ("code-tools", "tool_calls", "vote"),
@@ -306,5 +330,12 @@ def test_the_draft_ruleset_wiring():
     assert (topic.otherwise, topic.min_score, topic.history.exchanges, topic.history.max_chars,
             topic.max_age_exchanges) == ("local-general", 7, 4, 6000, 2)
     assert all(len(text) <= 200 for text in topic.criteria.values())
+    # Version 1's "writing, running, debugging or changing code or software"
+    # scored a web search for the weather 10/10 as running software: the
+    # code criterion asks about source code, and says a tool call is not it.
+    code = topic.criteria["local-code"]
+    assert code == ("The latest user request asks to write, fix, change or explain source code, a script or a "
+                    "software project. Using a tool such as web search does not count.")
+    assert "running" not in code
     assert llm.combiner.type_name == "priority"
     assert (RULESETS_DIR / "default-llm.yaml").exists()

@@ -82,6 +82,13 @@ LEGIT = [
     " or keep the tests strictly mirroring the current behavior?",
     "You should now see the full 5×7 scientific pad, DEG/RAD toggle, expression line, result, history and"
     " memory indicator.",
+    # 2026-10-20, after a search_web round: nudged ("I'll check") into a second,
+    # redundant answer before conditional offers counted as handing back.
+    "Here's what I found for **Salt Lake City, Utah** (I used SLC as the reference point — let me know if you"
+    " meant another part of Utah):\n\n- **Now:** Partly to mostly sunny, high around 71°F, winds SSE at 5–10 mph"
+    "\n- **This afternoon:** Mostly sunny, climbing from 68° to 71°, with only a slight chance (~1–8%) of a brief"
+    " shower\n- **No active alerts** for the area\n\nIf you're in St. George, Provo, Ogden or elsewhere in the"
+    " state, tell me and I'll check that specific spot.",
 ]
 
 
@@ -149,6 +156,15 @@ def test_empty_text_does_not_trigger(text):
         "If you'd like, I'll add a dark-mode toggle next.",
         "Done. Should I also update the README, or leave it?",
         "I can fix it now. Want me to?",
+        # Conditional offers addressed to the user hand the turn back too.
+        "If you're in St. George, Provo, Ogden or elsewhere in the state, tell me and I'll check that specific spot.",
+        "Tell me which city and I'll look it up.",
+        "If you need a different unit, I'll convert it.",
+        "Feel free to paste the error and I'll take a look.",
+        "Just say the word and I'll add the chart.",
+        "Happy to dig deeper. I'll need the full stack trace for that.",
+        "Once you confirm the port, I'll update the config.",
+        "When you're ready, I'll walk through the deploy.",
     ],
 )
 def test_question_or_offer_in_tail_does_not_trigger(text):

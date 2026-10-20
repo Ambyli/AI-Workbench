@@ -32,7 +32,7 @@ def tools(pattern: str = TOOL_REGEX, scope: str = "current_exchange") -> ToolCal
     return ToolCalls("code-tools", ToolCallsConfig(pattern=pattern, scope=scope))
 
 
-def cooldown(exchanges: int = 3, judges=None) -> Cooldown:
+def cooldown(exchanges: int = 2, judges=None) -> Cooldown:
     judges = judges if judges is not None else [tools(), RegexText("code-text", RegexTextConfig(rule=CODE_RULE))]
     cd = Cooldown("sticky", CooldownConfig(exchanges=exchanges, relevant_if=[j.id for j in judges]))
     cd.bind({**{j.id: j for j in judges}, "sticky": cd})
@@ -203,27 +203,31 @@ def _expected(name: str, n: int):
 
 
 @pytest.mark.parametrize("name", list(_histories()))
-@pytest.mark.parametrize("n", [0, 1, 3])
+@pytest.mark.parametrize("n", [0, 1, 2, 3])
 def test_cooldown_outcomes(name, n):
     out = evaluate(cooldown(n), _histories()[name])
     assert (out.voted, out.reason) == _expected(name, n), (name, n)
 
 
 def test_cooldown_expected_table_spot_checks():
-    # The table above, spelled out for the cases the ruleset relies on.
-    assert _expected("tool 1 ago", 3) == (True, "called sandbox-mcp_exec 1 exchange(s) ago; 0/3 irrelevant since")
+    # The table above, spelled out for the cases the ruleset relies on
+    # (`default`'s sticky-code is a 2-exchange cooldown).
+    assert _expected("tool 1 ago", 2) == (True, "called sandbox-mcp_exec 1 exchange(s) ago; 0/2 irrelevant since")
     assert _expected("tool 1 ago", 0) == (
         False, "cooldown: 0/0 irrelevant exchanges since the last one that called sandbox-mcp_exec")
+    assert _expected("tool 2 ago", 2)[0] is True and _expected("tool 3 ago", 2) == (
+        False, "cooldown: 2/2 irrelevant exchanges since the last one that called sandbox-mcp_exec")
+    assert _expected("text 2 ago", 2) == (True, "message matches code_kw 2 exchange(s) ago; 1/2 irrelevant since")
+    # The old 3-exchange cooldown held one exchange longer.
     assert _expected("tool 3 ago", 3)[0] is True and _expected("tool 4 ago (expired)", 3)[0] is False
-    assert _expected("text 2 ago", 3) == (True, "message matches code_kw 2 exchange(s) ago; 1/3 irrelevant since")
 
 
 def test_cooldown_detail():
-    out = evaluate(cooldown(3), _histories()["tool 2 ago"])
+    out = evaluate(cooldown(2), _histories()["tool 2 ago"])
     assert out.voted and out.detail["last_relevant_ago"] == 2 and out.detail["irrelevant_since"] == 1
     assert out.detail["why"] == "called sandbox-mcp_exec" and out.detail["expired"] is False
-    out = evaluate(cooldown(3), _histories()["tool 4 ago (expired)"])
-    assert not out.voted and out.detail["expired"] is True and out.reason.startswith("cooldown: 3/3")
+    out = evaluate(cooldown(2), _histories()["tool 3 ago"])
+    assert not out.voted and out.detail["expired"] is True and out.reason.startswith("cooldown: 2/2")
 
 
 def test_cooldown_bind_errors():

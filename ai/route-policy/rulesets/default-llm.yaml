@@ -12,7 +12,10 @@
 #
 # The first four evaluators are `default`'s, in `default`'s order, with the
 # same pattern files -- so the two rulesets differ only in the last rule. A
-# pattern edit is new content for BOTH rulesets: bump both versions.
+# pattern edit is new content for BOTH rulesets: bump both versions. Like
+# `default`, it keeps one route per turn (`pin: turn`), read from its own
+# shadow rows: the turn's first shadow decision is the only one that asks
+# for a classification.
 #
 # `topic-llm` votes from the verdict the analysis queue stored for an
 # earlier prefix of this conversation (usually the previous user message's:
@@ -20,17 +23,27 @@
 # messages old. Its model, `qwen3.5-4b`, is the CPU llama.cpp service
 # (ai/llama), reached only through the document classifier's registry
 # (ai/classifier/models.yaml); the analysis queue refuses any model that is
-# not local (ROUTE_POLICY.md § The llm_classifier).
+# not local (ROUTE_POLICY.md § The llm_classifier). An Open WebUI background
+# task (a title, tags, follow-ups) is never classified: it abstains.
+#
+# Version history: 1 asked whether the request was "about writing, running,
+# debugging or changing code or software", and the model counted a web
+# search for the weather as running software (10/10 for local-code). 2 asks
+# about source code and says that using a tool does not count, and pins the
+# route per turn. The criteria are in the verdict keys' fingerprint, so
+# version 2 classifies from scratch rather than reading version 1's
+# verdicts.
 #
 # CHANGING IT: versions are immutable -- edit, then bump `version`.
 id: default-llm
-version: 1
+version: 2
 description: >-
-  Draft: `default` with the 3-exchange code cooldown replaced by a local
+  Draft: `default` with the 2-exchange code cooldown replaced by a local
   model's verdict on the conversation (qwen3.5-4b through the document
-  classifier, applied from the next turn on) -- shadow mode, compared against
-  `default` before promotion.
+  classifier, applied from the next turn on), one route per turn -- shadow
+  mode, compared against `default` before promotion.
 mode: shadow
+pin: turn
 routes: [local-general, local-code, local-reasoning, local-private]
 default_route: local-general
 evaluators:
@@ -75,7 +88,7 @@ evaluators:
     config:
       model: qwen3.5-4b
       criteria:
-        local-code: "The latest user request in this conversation is about writing, running, debugging or changing code or software."
+        local-code: "The latest user request asks to write, fix, change or explain source code, a script or a software project. Using a tool such as web search does not count."
         local-reasoning: "The latest user request needs careful multi-step reasoning such as maths, logic, planning or analysis."
         local-private: "The conversation contains personal data about a real person, such as a name with an address, phone number, email or account number."
       otherwise: local-general

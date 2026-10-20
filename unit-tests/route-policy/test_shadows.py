@@ -21,8 +21,6 @@ import asyncio
 import copy
 import time
 import uuid
-from contextlib import asynccontextmanager
-from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -31,8 +29,11 @@ from prometheus_client import REGISTRY
 from rp_helpers import (
     DECIDE_KEYS,
     RULESETS_DIR,
+    GatedDatabase as FakeDatabase,
+    RecordingQueue,
     assistant,
     compile_doc,
+    memory_tables,
     seed,
     strip_shadows,
     tool_round,
@@ -43,67 +44,19 @@ from rp_helpers import (
 from common.conversation import render_transcript
 from route_policy.analysis.model import Verdict
 from route_policy.app import create_app
-from route_policy.db.repositories import analyses as analyses_repo
-from route_policy.db.repositories import decisions as decisions_repo
 from route_policy.evaluators.llm_classifier import input_key
 from route_policy.rulesets.loader import Binding
 from route_policy.rulesets.store import Resolved, RulesetStore
 from route_policy.service import Service, shadow_decision_id
 
-PRIMARY = ("default", 2)
-SHADOW = ("default-llm", 1)
-
-
-class RecordingQueue:
-    """Stands in for the AnalysisQueue: records what is submitted."""
-
-    def __init__(self) -> None:
-        self.submitted = []
-
-    def submit(self, request) -> bool:
-        self.submitted.append(request)
-        return True
-
-    async def stop(self, timeout_s=None) -> int:
-        return 0
-
-
-class FakeDatabase:
-    def __init__(self, gate=None, fail=False) -> None:
-        self.gate, self.fail = gate, fail
-
-    @asynccontextmanager
-    async def acquire(self):
-        if self.gate is not None:
-            await self.gate.wait()
-        if self.fail:
-            raise ConnectionError("route-policy-db is down")
-        yield SimpleNamespace()
+PRIMARY = ("default", 3)
+SHADOW = ("default-llm", 2)
 
 
 @pytest.fixture
 def tables(monkeypatch):
     """decisions (+ evaluations) and analyses, in memory."""
-    rows = SimpleNamespace(decisions={}, evaluations={}, analyses={})
-
-    async def insert_decision(conn, record, evaluations):
-        if record.decision_id in rows.decisions:
-            return False
-        rows.decisions[record.decision_id] = record
-        rows.evaluations[record.decision_id] = list(evaluations)
-        return True
-
-    async def get_response(conn, decision_id):
-        record = rows.decisions.get(decision_id)
-        return record.response if record else None
-
-    async def get_many(conn, keys):
-        return {k: rows.analyses[k] for k in keys if k in rows.analyses}
-
-    monkeypatch.setattr(decisions_repo, "insert", insert_decision)
-    monkeypatch.setattr(decisions_repo, "get_response", get_response)
-    monkeypatch.setattr(analyses_repo, "get_many", get_many)
-    return rows
+    return memory_tables(monkeypatch)
 
 
 def _store(shadows: bool = True) -> RulesetStore:
@@ -148,7 +101,7 @@ def test_resolve_returns_the_primary_and_the_shadow_refs():
     resolved = asyncio.run(store.resolve("auto", None))
     assert (resolved.primary.id, resolved.primary.version) == PRIMARY and resolved.shadows == (SHADOW,)
     assert [(r.id, r.version, r.mode) for r in asyncio.run(store.shadow_rulesets(resolved))] == [
-        ("default-llm", 1, "shadow")]
+        ("default-llm", 2, "shadow")]
 
 
 def test_a_shadow_that_cannot_load_is_skipped_and_counted():
@@ -162,7 +115,7 @@ def test_a_shadow_that_cannot_load_is_skipped_and_counted():
 def test_shadow_ids_are_derived():
     primary = uuid.UUID("6f0e8c1e-8f7e-4c55-9a39-0f3f7ab5d001")
     (llm,) = [r for r in seed().compiled if r.id == "default-llm"]
-    assert shadow_decision_id(primary, llm) == uuid.uuid5(primary, "default-llm@1")
+    assert shadow_decision_id(primary, llm) == uuid.uuid5(primary, "default-llm@2")
     assert shadow_decision_id(primary, llm) == shadow_decision_id(primary, llm)
     assert shadow_decision_id(uuid.uuid4(), llm) != shadow_decision_id(primary, llm)
 
@@ -186,7 +139,7 @@ def test_the_primary_response_is_the_same_with_and_without_a_shadow(tables, mess
     a, b = a.json(), b.json()
     assert set(a) == set(b) == DECIDE_KEYS
     assert _without_latency({**a, "decision_id": None}) == _without_latency({**b, "decision_id": None})
-    assert a["ruleset"] == {"id": "default", "version": 2} and a["mode"] == "enforce"
+    assert a["ruleset"] == {"id": "default", "version": 3} and a["mode"] == "enforce"
 
 
 def test_the_shadow_decision_is_stored_beside_the_primary(tables):
@@ -195,17 +148,17 @@ def test_the_shadow_decision_is_stored_beside_the_primary(tables):
     with TestClient(create_app(service=service, instrument=False)) as client:
         out = client.post("/decide", json=body).json()
         primary_id = uuid.UUID(body["decision_id"])
-        shadow_id = uuid.uuid5(primary_id, "default-llm@1")
+        shadow_id = uuid.uuid5(primary_id, "default-llm@2")
         wait_for(lambda: shadow_id in tables.decisions)
     primary, shadow = tables.decisions[primary_id], tables.decisions[shadow_id]
     assert primary.shadow_of is None and primary.response == out
     assert shadow.shadow_of == primary_id
-    assert (shadow.ruleset_id, shadow.ruleset_version, shadow.mode, shadow.applied) == ("default-llm", 1, "shadow",
+    assert (shadow.ruleset_id, shadow.ruleset_version, shadow.mode, shadow.applied) == ("default-llm", 2, "shadow",
                                                                                        False)
     assert (shadow.chat_id, shadow.message_id, shadow.user_id, shadow.litellm_call_id) == (
         "chat-s", "msg-2", "u1", "call-1")
     assert shadow.response["decision_id"] == str(shadow_id) and shadow.response["ruleset"] == {
-        "id": "default-llm", "version": 1}
+        "id": "default-llm", "version": 2}
     assert [e.evaluator_id for e in tables.evaluations[shadow_id]] == [
         "privacy", "code-text", "reasoning-text", "code-tools", "topic-llm"]
     topic = tables.evaluations[shadow_id][-1]
@@ -216,8 +169,8 @@ def test_the_shadow_decision_is_stored_beside_the_primary(tables):
 def test_a_repeated_decide_writes_no_shadow_twice(tables):
     service = _service(FakeDatabase())
     body = _body()
-    shadow_id = uuid.uuid5(uuid.UUID(body["decision_id"]), "default-llm@1")
-    before = _sample("route_policy_shadow_decisions_total", ruleset="default-llm@1", agree="true")
+    shadow_id = uuid.uuid5(uuid.UUID(body["decision_id"]), "default-llm@2")
+    before = _sample("route_policy_shadow_decisions_total", ruleset="default-llm@2", agree="true")
     with TestClient(create_app(service=service, instrument=False)) as client:
         first = client.post("/decide", json=body).json()
         wait_for(lambda: shadow_id in tables.decisions)
@@ -225,7 +178,7 @@ def test_a_repeated_decide_writes_no_shadow_twice(tables):
         wait_for(lambda: service.pending_writes == 0)
     assert first == second
     assert len(tables.decisions) == 2
-    assert _sample("route_policy_shadow_decisions_total", ruleset="default-llm@1", agree="true") == before + 1
+    assert _sample("route_policy_shadow_decisions_total", ruleset="default-llm@2", agree="true") == before + 1
 
 
 # -- the analysis requests ------------------------------------------------------------------------
@@ -240,9 +193,9 @@ def test_requests_reach_the_queue_with_their_provenance(tables):
         wait_for(lambda: queue.submitted)
         wait_for(lambda: service.pending_writes == 0)
     (req,) = queue.submitted   # `default` has no llm_classifier; default-llm's topic-llm asks once
-    shadow_id = uuid.uuid5(uuid.UUID(body["decision_id"]), "default-llm@1")
+    shadow_id = uuid.uuid5(uuid.UUID(body["decision_id"]), "default-llm@2")
     assert (req.ruleset_id, req.ruleset_version, req.decision_id, req.evaluator_id) == (
-        "default-llm", 1, shadow_id, "topic-llm")
+        "default-llm", 2, shadow_id, "topic-llm")
     assert (req.chat_id, req.message_id, req.exchange_index, req.model) == ("chat-s", "msg-2", 2, "qwen3.5-4b")
     assert req.text == render_transcript(body["messages"], exchanges=4, max_chars=6000, upto_user=2)
 
@@ -255,7 +208,7 @@ def test_a_primary_with_an_llm_classifier_reads_its_verdicts_and_enqueues(tables
     enforced = compile_doc(doc)
     store = RulesetStore(None)
     store.add(enforced)
-    store.set_bindings([Binding("auto", None, "enforced", 1)])
+    store.set_bindings([Binding("auto", None, "enforced", enforced.version)])
     queue = RecordingQueue()
     service = Service(store=store, database=FakeDatabase(), rulesets_dir=RULESETS_DIR, analysis_queue=queue)
     messages = [user("hello"), assistant("hi"), user("tell me about the moon")]

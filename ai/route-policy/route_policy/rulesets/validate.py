@@ -142,4 +142,5 @@ def compile_ruleset(document: Dict[str, Any], *, sha256: str = "") -> CompiledRu
         combiner=combiner,
         document=document,
         sha256=sha256 or content_sha256(document),
+        pin=doc.pin,
     )

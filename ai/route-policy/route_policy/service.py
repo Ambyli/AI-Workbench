@@ -11,9 +11,11 @@
 
 ``record_decision`` and ``record_outcome`` turn an engine result / an
 /observe body into rows, idempotently, and keep the metrics.
-``load_analyses`` reads the verdicts a ruleset's evaluators named onto the
-request view before the pipeline runs; ``after_decide`` does what /decide
-leaves until after its answer (below).
+``load_context`` puts what the pipeline reads besides the request onto the
+request view before it runs -- the verdicts a ruleset's evaluators named
+(``load_analyses``) and, for a ``pin: turn`` ruleset, the turn's first
+decision (``load_turn_pin``), the two reads run concurrently;
+``after_decide`` does what /decide leaves until after its answer (below).
 
 **A decision is returned even when it cannot be stored.** Routing must never
 depend on the log: a failed write is counted
@@ -49,15 +51,26 @@ it, or with the database failing or absent, the context records why
 out"). A ruleset without such evaluators names no keys and makes no query --
 the live ``default`` ruleset is one.
 
+**So is the turn's first decision.** For a ``pin: turn`` ruleset and a call
+carrying both a chat id and a message id (and not a background task),
+``load_turn_pin`` reads the EARLIEST stored decision of the same ruleset id
+for that (chat, message) -- among the primaries for the primary, among that
+ruleset's own shadow rows for a shadow -- in ONE query within the same
+budget. Past it, on a failure or with no database, there is no pin and the
+call is decided afresh as if it were the turn's first
+(``route_policy_db_reads_cut_total{read="turn_pin"}`` /
+``route_policy_errors_total{kind="turn_pin"}``). The pipeline applies the pin
+(``engine.pipeline``); a call that found one enqueues no analysis requests.
+
 **After the answer** (``after_decide``), ONE background task per /decide,
 counted with the writes against ``max_in_flight`` (past it the work is
 dropped: ``shadow_dropped``):
 
 1. the primary decision's analysis requests go to the queue;
 2. each SHADOW ruleset bound beside the primary (``bindings.yaml``
-   ``shadow:``) runs on the same request -- its own verdict lookup (with the
-   same budget, so it measures what enforcing it would do), the pipeline --
-   and is stored as a decisions row with id ``uuid5(primary id,
+   ``shadow:``) runs on the same request -- its own verdict lookup and turn
+   pin (with the same budget, so it measures what enforcing it would do), the
+   pipeline -- and is stored as a decisions row with id ``uuid5(primary id,
    "<ruleset>@<version>")`` and ``shadow_of`` = the primary id, with its own
    evaluations; then its analysis requests go to the queue.
 
@@ -87,7 +100,7 @@ from .db.repositories import decisions as decisions_repo
 from .db.repositories import outcomes as outcomes_repo
 from .db.repositories.evaluations import EvaluationRecord
 from .engine import pipeline
-from .engine.context import RequestContext
+from .engine.context import RequestContext, TurnPin
 from .engine.pipeline import Decision
 from .rulesets.model import CompiledRuleset
 from .rulesets.store import Resolved, RulesetStore
@@ -126,7 +139,51 @@ class Service:
     _pending: Set["asyncio.Task[Any]"] = field(default_factory=set, init=False, repr=False)
     _last_drop_log: float = field(default=float("-inf"), init=False, repr=False)
 
-    # -- verdicts -------------------------------------------------------------------
+    # -- what the pipeline reads besides the request -----------------------------------
+
+    async def load_context(self, ruleset: CompiledRuleset, ctx: RequestContext, decision_id: uuid.UUID, *,
+                           shadow: bool, budget_s: Optional[float]) -> None:
+        """Put the stored verdicts and the turn's first decision on ``ctx``
+        for ``ruleset``, the two reads concurrently, each within
+        ``budget_s``. ``decision_id`` is the decision being made (a shadow's
+        derived id for a shadow); ``shadow`` picks the rows its pin is read
+        from. Never raises: a read that does not happen is recorded or
+        counted, and the decision goes on without it."""
+        await asyncio.gather(
+            self.load_analyses(ruleset, ctx, budget_s=budget_s),
+            self.load_turn_pin(ruleset, ctx, decision_id, shadow=shadow, budget_s=budget_s),
+        )
+
+    async def load_turn_pin(self, ruleset: CompiledRuleset, ctx: RequestContext, decision_id: uuid.UUID, *,
+                            shadow: bool, budget_s: Optional[float]) -> None:
+        """For a ``pin: turn`` ruleset: put the turn's first decision on
+        ``ctx`` (``ctx.turn_pin``), in one query within ``budget_s``. Nothing
+        to read (no pin, an id missing, a background task) or no database:
+        no query. A timeout or a failure is counted and leaves no pin."""
+        if ruleset.pin != "turn" or not ctx.chat_id or not ctx.message_id or ctx.background_task:
+            return
+        if self.database is None:
+            return
+        try:
+            found = await asyncio.wait_for(
+                self._read_turn_pin(ctx.chat_id, ctx.message_id, ruleset.id, shadow, decision_id), budget_s)
+        except asyncio.TimeoutError:
+            metrics.db_reads_cut_total.labels("turn_pin").inc()
+            logger.debug("decide: the turn pin of %s for %s outlasted %s s; decided afresh",
+                         ruleset.id, decision_id, budget_s)
+            return
+        except Exception as exc:  # noqa: BLE001 -- no pin; the decision goes on
+            metrics.errors_total.labels("turn_pin").inc()
+            logger.warning("decide: turn pin lookup for %s@%d failed: %r", ruleset.id, ruleset.version, exc)
+            return
+        if found is not None:
+            ctx.turn_pin = TurnPin(*found)
+
+    async def _read_turn_pin(self, chat_id: str, message_id: str, ruleset_id: str, shadow: bool,
+                             decision_id: uuid.UUID):
+        async with self.database.acquire() as conn:
+            return await decisions_repo.first_of_turn(conn, chat_id=chat_id, message_id=message_id,
+                                                      ruleset_id=ruleset_id, shadow=shadow, exclude=decision_id)
 
     async def load_analyses(self, ruleset: CompiledRuleset, ctx: RequestContext, *,
                             budget_s: Optional[float]) -> None:
@@ -187,9 +244,9 @@ class Service:
     async def _run_shadow(self, body: DecideRequest, primary: Decision, ruleset: CompiledRuleset) -> None:
         """Decide, store and count one shadow ruleset on the request."""
         ctx = body.context()
-        await self.load_analyses(ruleset, ctx, budget_s=self.read_budget_s)
-        decision = await pipeline.run(ruleset, ctx)
         shadow_id = shadow_decision_id(body.decision_id, ruleset)
+        await self.load_context(ruleset, ctx, shadow_id, shadow=True, budget_s=self.read_budget_s)
+        decision = await pipeline.run(ruleset, ctx)
         stored = await self._store_shadow(body, decision, shadow_id)
         if stored:
             self._count(decision)
@@ -278,6 +335,8 @@ class Service:
             error="; ".join(decision.errors) or None,
             response=response,
             shadow_of=shadow_of,
+            pinned_from=decision.pinned_from,
+            background_task=body.background_task,
         )
         evaluations = [
             EvaluationRecord(i, v.evaluator, v.type, v.role, v.route, v.weight, v.confidence, v.reason,
@@ -431,3 +490,6 @@ class Service:
             metrics.votes_total.labels(v.evaluator, v.type, outcome).inc()
         for invariant in decision.overrides:
             metrics.invariant_overrides_total.labels(invariant).inc()
+        if decision.pin_outcome is not None:
+            metrics.pinned_total.labels(f"{decision.ruleset.id}@{decision.ruleset.version}",
+                                        decision.pin_outcome).inc()

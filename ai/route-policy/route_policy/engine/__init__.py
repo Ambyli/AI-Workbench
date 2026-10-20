@@ -1,7 +1,7 @@
 """The decision engine.
 
     context.py     RequestContext: the request as evaluators see it (parsed once)
-    pipeline.py    run(ruleset, ctx): every evaluator -> combiner -> invariants -> Decision
+    pipeline.py    run(ruleset, ctx): every evaluator -> combiner -> invariants -> the turn's pin -> Decision
     invariants.py  the two rules no ruleset can override
 
 Deliberately imports nothing here: evaluators import ``engine.context``, and

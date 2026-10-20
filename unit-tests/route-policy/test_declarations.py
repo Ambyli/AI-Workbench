@@ -23,14 +23,36 @@ import pytest
 
 from rp_helpers import ROOT, assistant, context, tool_round, user
 
+from route_policy.analysis.model import Verdict
 from route_policy.evaluators.base import Outcome, registry
 
 import yaml
 
 CODE_RULE = yaml.safe_load((ROOT / "ai/route-policy/rulesets/patterns/code.yaml").read_text(encoding="utf-8"))
 SOLO = "http://qwen3.8-solo:8000/v1"
+LLM_CONFIG = {"model": "qwen3.5-4b", "otherwise": "local-general",
+              "criteria": {"local-code": "About code.", "local-reasoning": "Needs reasoning."}}
+THREE = [user("a"), assistant(), user("b"), assistant(), user("c")]
 
-# type -> (config, extra siblings for bind, [(messages, backends), ...])
+
+def _verdicts(*specs):
+    """A case's `prepare`: put verdicts on the context, one per (k, status,
+    route) -- keyed the way the evaluator looks them up."""
+    def prepare(evaluator, ctx):
+        keys = {k: key for k, key, _ in evaluator._prefixes(ctx)}
+        ctx.analyses = {keys[k]: Verdict(keys[k], status, route, 0.9 if route else None,
+                                         {"local-code": 9, "local-reasoning": None} if route else {}, k,
+                                         "qwen3.5-4b")
+                        for k, status, route in specs}
+    return prepare
+
+
+def _lookup_failed(evaluator, ctx):
+    ctx.analysis_lookup_error = "timed out"
+
+
+# type -> (config, extra siblings for bind, [(messages, backends[, prepare]), ...])
+# prepare(evaluator, ctx) sets what the service would put on the context.
 CASES = {
     "regex_text": ({"rule": CODE_RULE, "patterns_ref": "patterns/code.yaml"}, {}, [
         ([user("write a python script")], None),
@@ -55,6 +77,15 @@ CASES = {
         ([user("x")], None),
     ]),
     "static": ({}, {}, [([user("x")], None)]),
+    "llm_classifier": (LLM_CONFIG, {}, [
+        (THREE, None, _verdicts((2, "ok", "local-code"))),                    # votes, 1 message old
+        (THREE, None, _verdicts((3, "incomplete", "local-general"))),         # votes otherwise
+        (THREE, None, _verdicts((2, "timeout", None))),                       # verdict failed
+        (THREE, None, _verdicts((3, "ok", None))),                            # no route reached
+        (THREE, None, None),                                                  # no verdict yet
+        (THREE, None, _lookup_failed),                                        # lookup timed out
+        ([], None, None),                                                     # no user message
+    ]),
 }
 
 
@@ -73,8 +104,11 @@ def _build(type_name: str, config: dict, siblings: dict):
 def _outcomes(type_name: str):
     config, siblings, cases = CASES[type_name]
     evaluator = _build(type_name, config, siblings)
-    for messages, backends in cases:
-        out = asyncio.run(evaluator.evaluate(context(messages, backends=backends)))
+    for messages, backends, *prepare in cases:
+        ctx = context(messages, backends=backends)
+        if prepare and prepare[0] is not None:
+            prepare[0](evaluator, ctx)
+        out = asyncio.run(evaluator.evaluate(ctx))
         assert isinstance(out, Outcome)
         yield out
 

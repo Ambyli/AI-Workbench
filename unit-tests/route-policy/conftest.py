@@ -104,6 +104,10 @@ os.environ["ROUTE_POLICY_BINDING_REFRESH_S"] = "0"
 # The budgets themselves are tested with fake databases and explicit values
 # (test_writes.py).
 os.environ["ROUTE_POLICY_DECISION_WRITE_BUDGET_S"] = "30"
+# No analysis queue unless a test builds one on a fake classifier
+# (test_analysis_queue.py, test_shadows.py): an app started here must never
+# reach for a real http://classifier:8000.
+os.environ["ROUTE_POLICY_CLASSIFIER_URL"] = ""
 import route_policy.config as _config  # noqa: E402 -- after the environment above
 
 _config.DB_READ_BUDGET_S = 30.0

@@ -371,5 +371,116 @@ services:
       --top-p 0.95
       ${LLAMA_GLM53_FLASH_EXTRA_ARGS:-}
 
+  # Recreated (with downtime) by `make up`: it loads its model into RAM before
+  # it answers and publishes a host port, which a second copy could not bind.
+  qwen3.5-4b:
+    networks:
+      - shared
+    # CPU-ONLY, like glm5.3-flash: no `runtime: nvidia`, no GPU reservation.
+    # A small text model for route-policy's `llm_classifier` evaluator, which
+    # reaches it ONLY through the document classifier's model registry
+    # (ai/classifier/models.yaml, entry `qwen3.5-4b`): route-policy submits a
+    # rendered transcript to POST /assess and the classifier calls this
+    # server. It is NOT in LiteLLM, so it is in no chain and no fallback.
+    #
+    # Same build and image as glm5.3-flash: Qwen3.5's hybrid Gated DeltaNet
+    # architecture is in mainline llama.cpp, and the Unsloth cpu build is
+    # mainline plus extras, already running on the box. One image for both
+    # CPU services, so bumping LLAMA_UNSLOTH_CPU_TAG rebuilds and recreates
+    # both:
+    #   docker compose -f ai/llama/docker-compose.llama.yml up -d --build --force-recreate glm5.3-flash qwen3.5-4b
+    build:
+      context: ../..
+      dockerfile: ai/llama/Dockerfile.llama-unsloth
+      args:
+        LLAMA_UNSLOTH_TAG: ${LLAMA_UNSLOTH_CPU_TAG:-b10840-mix-d5c17a0}
+        LLAMA_UNSLOTH_VARIANT: cpu
+        BASE_IMAGE: ubuntu:22.04
+    image: llama-unsloth:${LLAMA_UNSLOTH_CPU_TAG:-b10840-mix-d5c17a0}-cpu
+    # Local-only image name: never try to pull it from a registry.
+    pull_policy: build
+    container_name: qwen3.5-4b
+    restart: unless-stopped
+    environment:
+      - HF_TOKEN=${HF_TOKEN}
+      - LLAMA_ARG_HF_TOKEN=${HF_TOKEN}
+    ports:
+      - "${PORT_LLAMA_QWEN35_4B}:8000"
+    volumes:
+      # llama-server stores -hf downloads in a HF-hub layout under
+      # $HOME/.cache/huggingface/hub. Shared with the other llama services.
+      - llama_data:/root/.cache/huggingface
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      # First start downloads ~2.7 GB (Q4_K_M): minutes at worst, not the
+      # half hour glm5.3-flash's 148 GB needs.
+      start_period: 600s
+    # QUANT (LLAMA_QWEN35_4B_QUANT): Q4_K_M, 2.74 GB. K-quants only on CPU
+    # (see glm5.3-flash). Q6_K (3.53 GB) / Q8_0 (4.48 GB) are the steps up if
+    # the benchmark says quality, not speed, is what limits it.
+    #
+    # TEXT ONLY: the repo also ships a vision projector (mmproj-*.gguf,
+    # ~670 MB), which -hf downloads and loads by default. --no-mmproj skips
+    # both; the classifier entry is `vision: false` and never sends an image.
+    #
+    # NO MLOCK, unlike glm5.3-flash: a 2.7 GB file read on every token stays
+    # hot in the page cache, and if the kernel does evict it while the model
+    # is idle, re-reading it costs a second or two on the next call — not the
+    # per-token stalls of a 150 GB working set. So no --load-mode
+    # mmap+mlock and no memlock ulimit.
+    #
+    # THREADS: -t 8 (LLAMA_QWEN35_4B_THREADS). A small model's decode stops
+    # scaling well before the core count, and it shares the CPU with
+    # glm5.3-flash, which takes every physical core by default. To keep the
+    # two apart, pin this one with `--cpu-range 0-7` (`-Cr`) in
+    # LLAMA_QWEN35_4B_EXTRA_ARGS and give glm5.3-flash `-t` / its own range
+    # through LLAMA_GLM53_FLASH_EXTRA_ARGS — a range on one side only still
+    # lets the other's threads run on those cores.
+    #
+    # CONTEXT / OUTPUT: -c 32768 with --parallel 2 = two 16k slots, one per
+    # classifier request in flight (the registry entry's max_concurrent: 2).
+    # A scoring prompt is the transcript (text_char_budget 12000 characters,
+    # ~3-4k tokens) plus ~600 tokens of rubric, and --n-predict 512 caps the
+    # answer — the entry's max_tokens.score. Change the three together.
+    #
+    # THINKING: Qwen3.5 thinks by default; its template reads enable_thinking.
+    # A classifier call wants the JSON answer, not minutes of CPU reasoning,
+    # so the server default is off (the registry entry also sends it per
+    # request). A request that sends enable_thinking: true still turns it on.
+    #
+    # SAMPLING: the model card's instruct (non-thinking) preset — temperature
+    # 0.7, top_p 0.8, top_k 20, min_p 0 — WITHOUT its presence_penalty 1.5.
+    # The classifier sends no sampling of its own (llm/prompts.py: the server
+    # applies the model's published sampling, like every registry model), so
+    # these are what every scoring call gets. A presence penalty lowers every
+    # token already in the answer, and a ~100-token JSON answer is mostly
+    # repetition by design: the quotes, colons and keys of the scaffold, and
+    # the digits of `score` again in `confidence`. It is a guard against long
+    # free-text loops, which --n-predict 512 caps here anyway; the card's own
+    # precise-coding preset sets it to 0 too.
+    #
+    # Do NOT paste a `#` comment inside the `command: >` block — YAML's folded
+    # scalar has no comment syntax and it would become a literal argument.
+    command: >
+      -hf unsloth/Qwen3.5-4B-GGUF:${LLAMA_QWEN35_4B_QUANT:-Q4_K_M}
+      --no-mmproj
+      -a qwen3.5-4b
+      --host 0.0.0.0 --port 8000
+      -t ${LLAMA_QWEN35_4B_THREADS:-8}
+      -c 32768
+      --parallel 2
+      --n-predict 512
+      --jinja
+      --chat-template-kwargs '{"enable_thinking":false}'
+      --temp 0.7
+      --top-p 0.8
+      --top-k 20
+      --min-p 0.0
+      --presence-penalty 0.0
+      ${LLAMA_QWEN35_4B_EXTRA_ARGS:-}
+
 volumes:
   llama_data:

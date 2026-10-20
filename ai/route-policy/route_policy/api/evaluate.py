@@ -8,6 +8,11 @@ plus ``messages`` / ``tools`` / ``backends`` and optionally
 with ``decision_id: null`` and, per vote, the evaluator's ``detail`` and
 ``error``.
 
+An ``llm_classifier`` reads the STORED verdicts for the conversation, as on
+/decide (one read-only query, waited for as long as it takes); /evaluate never
+enqueues a classification, so a conversation nobody routed has none and the
+evaluator abstains ("no verdict ...").
+
     200  the decision
     404  no such ruleset version
     422  the body, or the document, is invalid -- ``detail.errors`` lists every problem
@@ -42,5 +47,7 @@ async def evaluate(body: EvaluateRequest, request: Request) -> dict:
         if ruleset is None:
             version = f"@{body.ruleset.version}" if body.ruleset.version else ""
             raise HTTPException(404, f"no ruleset {body.ruleset.id}{version}")
-    decision = await pipeline.run(ruleset, body.context())
+    ctx = body.context()
+    await service.load_analyses(ruleset, ctx, budget_s=None)
+    decision = await pipeline.run(ruleset, ctx)
     return decision.response(None, with_detail=True)

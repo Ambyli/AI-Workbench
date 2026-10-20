@@ -13,17 +13,34 @@ views evaluators ask for, each computed on first use and cached:
                     of the exchange in progress
     called_tools    every tool the conversation CALLED, most recent first
 
+Plus what the SERVICE puts on it before the pipeline runs:
+
+    analyses        stored verdicts (``analyses`` rows) by key, read in one
+                    query for the keys the ruleset's evaluators named
+                    (``Evaluator.analysis_lookups``) -- what an
+                    ``llm_classifier`` votes from
+    analysis_lookup_error
+                    why that read did not happen (``timed out`` | ``failed``
+                    | ``unavailable (no database)``); None when it did, or was
+                    not needed
+    memo            scratch space for values an evaluator derives from the
+                    request once and reuses across its hooks (the
+                    llm_classifier's rendered prefixes)
+
 Nothing here reads a ruleset or keeps state between requests: two copies of
-the service, or a restart, decide the same history the same way.
+the service, or a restart, decide the same history the same way -- the
+verdicts are content-addressed rows any copy reads alike.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from functools import cached_property
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from common.conversation import called_tool_names, split_exchanges
+
+from ..analysis.model import Verdict
 
 # The verdicts the LiteLLM overflow layer reports per backend
 # (ai/litellm/hooks/overflow/state.py). Anything else a caller sends is kept
@@ -52,6 +69,9 @@ class RequestContext:
     user_id: Optional[str] = None
     key_alias: Optional[str] = None
     litellm_call_id: Optional[str] = None
+    analyses: Mapping[str, Verdict] = field(default_factory=dict)
+    analysis_lookup_error: Optional[str] = None
+    memo: Dict[Any, Any] = field(default_factory=dict, repr=False, compare=False)
 
     @cached_property
     def exchanges(self) -> List[Tuple[str, List[dict]]]:

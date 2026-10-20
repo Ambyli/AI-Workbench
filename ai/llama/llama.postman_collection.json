@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "llama",
-    "description": "llama.cpp `llama-server` endpoints — GGUF-quantized models exposed via an OpenAI-compatible HTTP surface plus llama.cpp-native extras. Every service in `ai/llama/docker-compose.llama.yml` is a standalone llama-server; the default deploy publishes the `glm5.2` container on `localhost:8010` (see `PORT_LLAMA_GLM52` in `.env`) with model alias `glm5.2`. The other two services are `qwen3.8-flash` on `localhost:8017` (`PORT_LLAMA_QWEN38_FLASH`, variable `llamaQwen38Flash`) and `glm5.3-flash` on `localhost:8020` (`PORT_LLAMA_GLM53_FLASH`, variable `llamaGlm53Flash`) \u2014 the latter is the CPU + RAM-only GLM-5.3-Flash service with no GPU, so budget minutes for time-to-first-token on large prompts. Set the collection variable `llama` to the direct-port base URL (default http://localhost:8010) — no auth is required on the direct port per LLAMA.md.\n\nThe 'Via LiteLLM' folder routes chat through the unified LiteLLM proxy at `{{litellm}}/v1/chat/completions` using the same `glm5.2` alias (registered in `ai/litellm/litellm_config.yaml` → `model_list`). LiteLLM requires bearer auth via a virtual master key.\n\nNotes:\n- `/v1/embeddings` is only mounted when `llama-server` is launched with `--embedding` (or `--pooling`). The current `glm5.2` command in `docker-compose.llama.yml` does NOT enable it, so no embeddings request is included by default. Add `--embedding` to the service `command:` block and uncomment the equivalent request if you need it.\n- First request after container start is slow — llama.cpp runs a warmup pass on the first inference call (see LLAMA.md § Non-obvious constraints).\n- The healthcheck has a 900 s `start_period` to cover the initial GGUF download; `/health` will 503 while the model is still loading.",
+    "description": "llama.cpp `llama-server` endpoints — GGUF-quantized models exposed via an OpenAI-compatible HTTP surface plus llama.cpp-native extras. Every service in `ai/llama/docker-compose.llama.yml` is a standalone llama-server; the default deploy publishes the `glm5.2` container on `localhost:8010` (see `PORT_LLAMA_GLM52` in `.env`) with model alias `glm5.2`. The other two services are `qwen3.8-flash` on `localhost:8017` (`PORT_LLAMA_QWEN38_FLASH`, variable `llamaQwen38Flash`) and `glm5.3-flash` on `localhost:8020` (`PORT_LLAMA_GLM53_FLASH`, variable `llamaGlm53Flash`) \u2014 the latter is the CPU + RAM-only GLM-5.3-Flash service with no GPU, so budget minutes for time-to-first-token on large prompts. The fourth, `qwen3.5-4b` on `localhost:8028` (`PORT_LLAMA_QWEN35_4B`, variable `llamaQwen35_4b`, folder 'qwen3.5-4b'), is a small CPU-only model that only the document classifier's model registry calls (route-policy's `llm_classifier` evaluator) — it is not in LiteLLM. Set the collection variable `llama` to the direct-port base URL (default http://localhost:8010) — no auth is required on the direct port per LLAMA.md.\n\nThe 'Via LiteLLM' folder routes chat through the unified LiteLLM proxy at `{{litellm}}/v1/chat/completions` using the same `glm5.2` alias (registered in `ai/litellm/litellm_config.yaml` → `model_list`). LiteLLM requires bearer auth via a virtual master key.\n\nNotes:\n- `/v1/embeddings` is only mounted when `llama-server` is launched with `--embedding` (or `--pooling`). The current `glm5.2` command in `docker-compose.llama.yml` does NOT enable it, so no embeddings request is included by default. Add `--embedding` to the service `command:` block and uncomment the equivalent request if you need it.\n- First request after container start is slow — llama.cpp runs a warmup pass on the first inference call (see LLAMA.md § Non-obvious constraints).\n- The healthcheck has a 900 s `start_period` to cover the initial GGUF download; `/health` will 503 while the model is still loading.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
     "_postman_id": "llama-collection"
   },
@@ -29,6 +29,12 @@
       "value": "http://localhost:8020",
       "type": "string",
       "description": "Direct-port base URL for the `glm5.3-flash` llama-server container. Published on `${PORT_LLAMA_GLM53_FLASH}` (default 8020) \u2192 container port 8000. On `ai_shared` it's http://glm5.3-flash:8000. Model alias is `glm5.3-flash`. This service runs GLM-5.3-Flash entirely on CPU + system RAM (no GPU) with MTP speculative decoding, so expect a long time-to-first-token on big prompts (LLAMA.md \u00a7 `glm5.3-flash` \u2014 GLM-5.3-Flash on CPU and RAM only)."
+    },
+    {
+      "key": "llamaQwen35_4b",
+      "value": "http://localhost:8028",
+      "type": "string",
+      "description": "Direct-port base URL for the `qwen3.5-4b` llama-server container (folder 'qwen3.5-4b'). Published on `${PORT_LLAMA_QWEN35_4B}` (default 8028) \u2192 container port 8000. On `ai_shared` it's http://qwen3.5-4b:8000 \u2014 the URL of the `qwen3.5-4b` entry in `ai/classifier/models.yaml`. Model alias is `qwen3.5-4b`. CPU only, thinking off by default, not registered in LiteLLM (LLAMA.md \u00a7 `qwen3.5-4b` \u2014 a small CPU model for route-policy)."
     },
     {
       "key": "litellm",
@@ -267,6 +273,47 @@
         "description": "llama.cpp-native detokenizer. Returns `{\"content\": \"...\"}` — the string reconstructed from the token id array. Inverse of `/tokenize`. Handy when consuming logprobs or streaming diagnostics that surface raw token ids."
       },
       "response": []
+    },
+    {
+      "name": "qwen3.5-4b",
+      "description": "The `qwen3.5-4b` llama-server container at `{{llamaQwen35_4b}}` (default http://localhost:8028, no auth): Qwen3.5-4B Q4_K_M on CPU only, the model route-policy's `llm_classifier` evaluator scores conversation transcripts with through the document classifier's `POST /assess` (`model: qwen3.5-4b`). Not registered in LiteLLM, so there is no 'Via LiteLLM' request for it. The requests here are the box checks of LLAMA.md § `qwen3.5-4b` — a small CPU model for route-policy.",
+      "item": [
+        {
+          "name": "GET /health (qwen3.5-4b)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{llamaQwen35_4b}}/health",
+              "host": ["{{llamaQwen35_4b}}"],
+              "path": ["health"]
+            },
+            "description": "Liveness probe for `qwen3.5-4b`. Returns `{\"status\":\"ok\"}` once the 2.74 GB Q4_K_M GGUF has downloaded and loaded; 503 while it is still loading (the healthcheck's `start_period` is 600 s for the first download). LLAMA.md § `qwen3.5-4b` — a small CPU model for route-policy."
+          },
+          "response": []
+        },
+        {
+          "name": "POST /v1/chat/completions — JSON mode (qwen3.5-4b)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"qwen3.5-4b\",\n  \"messages\": [\n    { \"role\": \"user\", \"content\": \"Is this request about code? \\\"my python script crashes with KeyError\\\". Answer as JSON: {\\\"score\\\": 1-10, \\\"reason\\\": \\\"...\\\"}\" }\n  ],\n  \"response_format\": { \"type\": \"json_object\" },\n  \"chat_template_kwargs\": { \"enable_thinking\": false },\n  \"max_tokens\": 128\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{llamaQwen35_4b}}/v1/chat/completions",
+              "host": ["{{llamaQwen35_4b}}"],
+              "path": ["v1", "chat", "completions"]
+            },
+            "description": "OpenAI-compatible chat completion shaped like a classifier scoring call: `response_format: {\"type\": \"json_object\"}` (llama-server turns it into a JSON grammar) and `chat_template_kwargs: {\"enable_thinking\": false}` — the same kwarg the classifier's `qwen3.5-4b` registry entry sends in its `extra_body`, and the server's own default (`--chat-template-kwargs`). Expect `choices[0].message.content` to be the JSON alone, with no `<think>` block and no `reasoning_content`, in a few dozen completion tokens; `timings` (llama.cpp's addition to the response) shows prompt and generation speed on CPU. Server defaults: `--temp 0.7 --top-p 0.8 --top-k 20 --min-p 0.0 --presence-penalty 0.0` (the model card's instruct preset without its presence penalty), `--n-predict 512` caps `max_tokens`. 503 while the model is loading. LLAMA.md § `qwen3.5-4b` — a small CPU model for route-policy."
+          },
+          "response": []
+        }
+      ]
     },
     {
       "name": "Via LiteLLM",

@@ -2,7 +2,7 @@
   "info": {
     "_postman_id": "route-policy-collection",
     "name": "route-policy",
-    "description": "Route-policy service (ai/route-policy): rulesets of evaluators pick the LiteLLM chain alias for each `auto` turn, and every decision is logged to route-policy-db (Trino: postgres_route_policy). Phase 3: the `default` ruleset ENFORCES -- LiteLLM's pre-call hook awaits POST /decide for every `auto` request (within ROUTE_POLICY_DECIDE_TIMEOUT_S, 0.25 s) and serves the chain it returns in the same pass; a timeout, an error or `apply: false` sends the turn to local-private. Called through the LiteLLM pass-through registered in ai/litellm/litellm_config.yaml (`pass_through_endpoints` → `/v1/route-policy` → `http://route-policy:8000`, `include_subpath: true`, methods GET/POST, `forward_headers: true`, `auth: true`). Every request is authenticated with a Bearer token from a LiteLLM virtual key: set the collection variables `litellm` (e.g. http://localhost:4001) and `virtual master key` — every request inherits them via collection-level auth.\n\nDirect base URL (bypassing LiteLLM): http://route-policy:8000 inside ai_shared (what LiteLLM's hook uses), or http://<host>:${PORT_ROUTE_POLICY} (default 8027), which the ai/edge HAProxy publishes for clients in EDGE_ALLOWED_CIDRS — no auth there. Drop `/v1/route-policy` from the paths when you use it.\n\nWorkflow: GET /evaluator-types (what a ruleset may contain) → GET /rulesets/:rulesetId (the live `default`) → POST /evaluate (dry-run on a conversation) → POST /decide + POST /observe with the same `decisionId` (what the hook sends) → GET /chats/:chatId/decisions. See ai/route-policy/ROUTE_POLICY.md for the full reference.",
+    "description": "Route-policy service (ai/route-policy): rulesets of evaluators pick the LiteLLM chain alias for each `auto` turn, and every decision is logged to route-policy-db (Trino: postgres_route_policy). Phase 3: the `default` ruleset ENFORCES -- LiteLLM's pre-call hook awaits POST /decide for every `auto` request (within ROUTE_POLICY_DECIDE_TIMEOUT_S, 0.25 s) and serves the chain it returns in the same pass; a timeout, an error or `apply: false` sends the turn to local-private. Phase 4: after each answer the binding's SHADOW ruleset (`default-llm`: `default` with its code cooldown replaced by an `llm_classifier`) is decided on the same request and logged with `shadow_of`, never applied; its classifier verdicts come from background POST /assess jobs on the document classifier (a local model, qwen3.5-4b), stored in the `analyses` table and read back from the next turn on. Called through the LiteLLM pass-through registered in ai/litellm/litellm_config.yaml (`pass_through_endpoints` → `/v1/route-policy` → `http://route-policy:8000`, `include_subpath: true`, methods GET/POST, `forward_headers: true`, `auth: true`). Every request is authenticated with a Bearer token from a LiteLLM virtual key: set the collection variables `litellm` (e.g. http://localhost:4001) and `virtual master key` — every request inherits them via collection-level auth.\n\nDirect base URL (bypassing LiteLLM): http://route-policy:8000 inside ai_shared (what LiteLLM's hook uses), or http://<host>:${PORT_ROUTE_POLICY} (default 8027), which the ai/edge HAProxy publishes for clients in EDGE_ALLOWED_CIDRS — no auth there. Drop `/v1/route-policy` from the paths when you use it.\n\nWorkflow: GET /evaluator-types (what a ruleset may contain) → GET /rulesets/:rulesetId (the live `default`) → POST /evaluate (dry-run on a conversation) → POST /decide + POST /observe with the same `decisionId` (what the hook sends) → GET /chats/:chatId/decisions. See ai/route-policy/ROUTE_POLICY.md for the full reference.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "auth": {
@@ -70,7 +70,7 @@
             "health"
           ]
         },
-        "description": "Liveness, and what the compose healthcheck and the edge probe. Returns {status: \"ok\", rulesets: [{id, version}, ...] (the compiled versions this copy has cached), bindings: <count>}. A running process has finished startup, which required route-policy-db (migrations + ruleset seeding); /health itself does not touch the database. See ROUTE_POLICY.md § API."
+        "description": "Liveness, and what the compose healthcheck and the edge probe. Returns {status: \"ok\", rulesets: [{id, version}, ...] (the compiled versions this copy has cached -- default@2 and the shadow default-llm@1 on this image), bindings: <count>}. A running process has finished startup, which required route-policy-db (migrations + ruleset seeding); /health itself does not touch the database, nor the document classifier. See ROUTE_POLICY.md § API."
       },
       "response": []
     },
@@ -110,7 +110,7 @@
             "metrics"
           ]
         },
-        "description": "Prometheus text: route_policy_decisions_total{route,mode,applied}, route_policy_decide_seconds, route_policy_evaluator_seconds{evaluator,type}, route_policy_votes_total{evaluator,type,outcome}, route_policy_invariant_overrides_total{invariant}, route_policy_observations_total{status}, route_policy_duplicates_total{endpoint}, route_policy_errors_total{kind}, plus the HTTP metrics of prometheus-fastapi-instrumentator. Scraped by the litellm stack's prometheus (job route-policy). See ROUTE_POLICY.md § Metrics."
+        "description": "Prometheus text: route_policy_decisions_total{route,mode,applied} (shadow decisions count with mode=\"shadow\"), route_policy_decide_seconds, route_policy_evaluator_seconds{evaluator,type}, route_policy_votes_total{evaluator,type,outcome}, route_policy_invariant_overrides_total{invariant}, route_policy_observations_total{status}, route_policy_duplicates_total{endpoint}, route_policy_shadow_decisions_total{ruleset,agree}, route_policy_analyses_total{model,status}, route_policy_analysis_seconds{model}, route_policy_analysis_queue_depth, route_policy_analysis_dropped_total{reason}, route_policy_writes_deferred_total{write}, route_policy_writes_in_flight, route_policy_db_reads_cut_total{read}, route_policy_errors_total{kind}, plus the HTTP metrics of prometheus-fastapi-instrumentator. Scraped by the litellm stack's prometheus (job route-policy). See ROUTE_POLICY.md § Metrics."
       },
       "response": []
     },
@@ -130,7 +130,7 @@
             "evaluator-types"
           ]
         },
-        "description": "What a ruleset can contain. evaluator_types: every registered type (regex_text, tool_calls, cooldown, backend_load, static) with its config JSON schema and DECLARED output (summary, when it votes, what one exchange's relevance means -- null when it cannot judge single exchanges -- and every detail key with its kind). combiner_types: priority, weighted with their option schemas. roles: vote | force | veto. The declarations live next to each evaluator and are tested against the real code. See ROUTE_POLICY.md § Evaluators."
+        "description": "What a ruleset can contain. evaluator_types: every registered type (regex_text, tool_calls, cooldown, backend_load, static, llm_classifier) with its config JSON schema, whether vote.route is required or the evaluator chooses the route itself (llm_classifier), and its DECLARED output (summary, when it votes, what one exchange's relevance means -- null when it cannot judge single exchanges -- every detail key with its kind, and notes). combiner_types: priority, weighted with their option schemas. roles: vote | force | veto. The declarations live next to each evaluator and are tested against the real code. See ROUTE_POLICY.md § Evaluators."
       },
       "response": []
     },
@@ -164,7 +164,7 @@
             "decide"
           ]
         },
-        "description": "Decide (and log) the chain alias for one request -- what LiteLLM's pre-call hook sends on every `auto` request, and AWAITS (ROUTE_POLICY_DECIDE_TIMEOUT_S, 0.25 s): it rewrites `auto` to `route` when `apply` is true and its own copy of the invariants agrees, else to local-private. The bound ruleset (bindings: auto -> default) runs every evaluator, its combiner picks one route, and the invariants have the last word (requested local-private stays local-private; the route is always one of the ruleset's chain aliases).\n\nBody (the contract, ROUTE_POLICY_PLAN § 7): decision_id (a UUID the caller makes), requested_model, litellm_call_id, chat_id, message_id, user_id, key_alias (all nullable), messages (OpenAI messages as LiteLLM received them), tools (or null), backends ({api_base: {verdict: ok|busy|down|stale|unknown, waiting, running}}). Unknown fields are ignored.\n\n200: {decision_id, route, mode, apply, ruleset: {id, version}, votes: [{evaluator, type, route, weight, confidence, role, abstained, reason, latency_ms}], scores, latency_ms}. apply is true only for an enforce ruleset whose invariants held -- the `default` ruleset (version 2) is enforce, so this example answers apply: true. This example routes to local-code through `sticky-code` (a sandbox tool was called one exchange ago).\n\nIdempotent: a repeated decision_id returns the FIRST stored decision, whatever the new body says. 404: no ruleset bound to requested_model. 422: decision_id not a UUID, wrong types. 503: the bound ruleset cannot be compiled by this copy. A decision is returned even when route-policy-db is down (it is then not logged), and in time: the decision write is waited for at most ROUTE_POLICY_DECISION_WRITE_BUDGET_S (0.05 s), then finishes in the background. See ROUTE_POLICY.md § API."
+        "description": "Decide (and log) the chain alias for one request -- what LiteLLM's pre-call hook sends on every `auto` request, and AWAITS (ROUTE_POLICY_DECIDE_TIMEOUT_S, 0.25 s): it rewrites `auto` to `route` when `apply` is true and its own copy of the invariants agrees, else to local-private. The bound ruleset (bindings: auto -> default) runs every evaluator, its combiner picks one route, and the invariants have the last word (requested local-private stays local-private; the route is always one of the ruleset's chain aliases).\n\nBody (the contract, ROUTE_POLICY_PLAN § 7): decision_id (a UUID the caller makes), requested_model, litellm_call_id, chat_id, message_id, user_id, key_alias (all nullable), messages (OpenAI messages as LiteLLM received them), tools (or null), backends ({api_base: {verdict: ok|busy|down|stale|unknown, waiting, running}}). Unknown fields are ignored.\n\n200: {decision_id, route, mode, apply, ruleset: {id, version}, votes: [{evaluator, type, route, weight, confidence, role, abstained, reason, latency_ms}], scores, latency_ms}. apply is true only for an enforce ruleset whose invariants held -- the `default` ruleset (version 2) is enforce, so this example answers apply: true. This example routes to local-code through `sticky-code` (a sandbox tool was called one exchange ago).\n\nThe response is the PRIMARY ruleset's alone. After answering, one background task decides the binding's shadow rulesets (default-llm) on the same request -- stored as decisions rows with id uuid5(decision_id, \"<ruleset>@<version>\") and shadow_of = this decision_id, read back by GET /chats/:chatId/decisions and the shadow_comparisons view -- and hands their llm_classifier analysis requests (the conversation up to the latest user message, in memory only) to the analysis queue, which classifies it through the document classifier's POST /assess and stores the verdict in `analyses`; nothing of that can delay, change or fail this answer.\n\nIdempotent: a repeated decision_id returns the FIRST stored decision, whatever the new body says (and re-derives the same shadow ids, so nothing is written twice). 404: no ruleset bound to requested_model. 422: decision_id not a UUID, wrong types. 503: the bound ruleset cannot be compiled by this copy. A decision is returned even when route-policy-db is down (it is then not logged), and in time: the decision write is waited for at most ROUTE_POLICY_DECISION_WRITE_BUDGET_S (0.05 s), then finishes in the background. See ROUTE_POLICY.md § API."
       },
       "response": []
     },
@@ -232,7 +232,41 @@
             "evaluate"
           ]
         },
-        "description": "Dry-run a stored ruleset version (version omitted = the highest; on the box `default` 1, the phase-2 shadow version, is still stored and evaluable) on a conversation. Writes nothing. Returns the /decide shape with decision_id: null and, per vote, the evaluator's `detail` (its declared output, GET /evaluator-types) and `error`. requested_model defaults to auto; send local-private to see the privacy invariant. 404: no such version. 422: give exactly one of `ruleset` / `document`. See ROUTE_POLICY.md § API."
+        "description": "Dry-run a stored ruleset version (version omitted = the highest; on the box `default` 1, the phase-2 shadow version, is still stored and evaluable) on a conversation. Writes nothing. Returns the /decide shape with decision_id: null and, per vote, the evaluator's `detail` (its declared output, GET /evaluator-types) and `error`. requested_model defaults to auto; send local-private to see the privacy invariant. An llm_classifier (ruleset default-llm) reads the verdicts STORED for the conversation's prefixes (read-only; /evaluate never enqueues a classification), so a conversation nobody routed abstains with \"no verdict in the last N message(s)\". 404: no such version. 422: give exactly one of `ruleset` / `document`. See ROUTE_POLICY.md § API."
+      },
+      "response": []
+    },
+    {
+      "name": "POST /evaluate — the shadow default-llm",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"ruleset\": {\n    \"id\": \"default-llm\",\n    \"version\": 1\n  },\n  \"requested_model\": \"auto\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"Make me a scientific calculator!\"\n    },\n    {\n      \"role\": \"assistant\",\n      \"content\": \"Here it is: a calculator with sin, cos and a history pane.\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": \"Looks great. Now what is the weather like on Mars?\"\n    }\n  ]\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{litellm}}/v1/route-policy/evaluate",
+          "host": [
+            "{{litellm}}"
+          ],
+          "path": [
+            "v1",
+            "route-policy",
+            "evaluate"
+          ]
+        },
+        "description": "Dry-run the phase-4 shadow ruleset default-llm (default's privacy / code / reasoning / tool rules, then `topic-llm`, an llm_classifier, instead of the 3-exchange code cooldown) on a conversation. Writes nothing and enqueues nothing. topic-llm votes the newest STORED verdict for the prefixes ending at the latest user message and the 2 before it (its `detail` says which: input_key, exchange_index, age_exchanges, status, scores); a conversation /decide never saw has none, so it abstains (\"no verdict in the last 2 message(s)\") and the turn goes to local-general -- where default@2's sticky-code would still say local-code. See ROUTE_POLICY.md § The llm_classifier."
       },
       "response": []
     },
@@ -286,7 +320,7 @@
             "rulesets"
           ]
         },
-        "description": "Every stored ruleset version, without documents: {rulesets: [{id, version, mode, description, sha256, source, created_at, created_by, active_from, active_to}]}. active_from = first time a binding pointed at it; active_to = when none does any more (null while bound). 503 when route-policy-db is unavailable."
+        "description": "Every stored ruleset version, without documents: {rulesets: [{id, version, mode, description, sha256, source, created_at, created_by, active_from, active_to}]} -- on this image default@2 (enforce) and default-llm@1 (shadow), plus any older version still stored. active_from = first time a binding or a shadow slot pointed at it; active_to = when none does any more (null while bound). 503 when route-policy-db is unavailable."
       },
       "response": []
     },
@@ -368,7 +402,7 @@
             "bindings"
           ]
         },
-        "description": "Which ruleset decides for which requested model: {bindings: [{scope_model, scope_key_alias (null = every key), ruleset_id, version, updated_at, updated_by}]}. Startup seeds auto -> default @ the highest baked-in version (rulesets/bindings.yaml); editing bindings is the phase-5 write API. The binding decides every `auto` turn."
+        "description": "Which ruleset decides for which requested model: {bindings: [{scope_model, scope_key_alias (null = every key), ruleset_id, version, shadows: [{ruleset_id, version}, ...], updated_at, updated_by}]}. Startup seeds auto -> default @ the highest baked-in version with shadow slot default-llm (rulesets/bindings.yaml; the primary must be an enforce ruleset, every shadow a shadow one); editing bindings is the phase-6 write API. The binding decides every `auto` turn; a shadow slot only adds logged decisions and background classifications."
       },
       "response": []
     },
@@ -404,7 +438,7 @@
             }
           ]
         },
-        "description": "One conversation's latest `limit` decisions, OLDEST FIRST, each with its votes and its outcome (null until /observe arrives; `agree` = the decided route equals the chain that served). An unknown chat id is an empty list. 503 when route-policy-db is unavailable."
+        "description": "One conversation's latest `limit` PRIMARY decisions, OLDEST FIRST, each with its votes, its outcome (null until /observe arrives; `agree` = the decided route equals the chain that served) and `shadows`: the decisions the binding's shadow rulesets made beside it (same keys but `shadows`; `shadow_of` = the primary's decision_id; `outcome` always null -- the turn's outcome is the primary's). `shadow_of` is null on a primary. An unknown chat id is an empty list. 503 when route-policy-db is unavailable."
       },
       "response": []
     }

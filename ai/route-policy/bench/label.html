@@ -1,0 +1,508 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Nothing leaves this page: no network of any kind, no external scripts,
+     styles, fonts or images. The points file holds customer conversations. -->
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'none'; connect-src 'none'; form-action 'none'; base-uri 'none'">
+<title>Route labelling</title>
+<!--
+  Gold labels for the route-classifier benchmark (ai/route-policy/bench/BENCH.md).
+
+  Open this file from disk in a browser, load a points file (sample.jsonl from
+  `python -m bench.points --sample`), and label each point's LATEST user
+  message, read in its context, with the chain it should go to. Export writes
+  labels.jsonl: {"point_id", "label", "note", "labelled_at"} per labelled point.
+  Load an earlier labels.jsonl beside the points to resume.
+
+  Privacy: everything stays in this tab's memory. Nothing is uploaded, nothing
+  is stored in the browser (no localStorage / IndexedDB / cookies); closing the
+  tab discards it -- the page warns while labels are unexported. Conversation
+  text is only ever inserted as text (textContent), never as HTML.
+  The weak label and the rules' route are hidden behind "Reveal" so they do not
+  bias the label.
+-->
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --text: #1d2330; --muted: #5d6677; --line: #dde1e8;
+    --user: #eef3ff; --user-line: #b8c8f2; --assistant: #ffffff; --tool: #f3f4f6;
+    --target: #fff6dc; --target-line: #e2b33c; --accent: #2f5bd3; --accent-text: #ffffff;
+    --chosen: #1f7a4a; --warn: #a3401f;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14171c; --panel: #1c2027; --text: #e5e8ee; --muted: #9aa3b2; --line: #2e343e;
+      --user: #1d2a44; --user-line: #34508a; --assistant: #1c2027; --tool: #22262e;
+      --target: #3a3016; --target-line: #b58a22; --accent: #6d8ff0; --accent-text: #0e1220;
+      --chosen: #3fb87a; --warn: #e07a55;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  header { position: sticky; top: 0; z-index: 2; background: var(--panel); border-bottom: 1px solid var(--line);
+    padding: 10px 16px; display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: center; }
+  header h1 { font-size: 16px; margin: 0; }
+  header label.file { display: inline-flex; gap: 6px; align-items: center; color: var(--muted); }
+  .bar { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; width: 160px; }
+  .bar > div { height: 100%; width: 0; background: var(--chosen); }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 330px; gap: 16px; padding: 16px; }
+  @media (max-width: 860px) { main { grid-template-columns: minmax(0, 1fr); } }
+  #transcript { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px;
+    min-height: 60vh; overflow-wrap: anywhere; }
+  #side { display: flex; flex-direction: column; gap: 12px; }
+  @media (min-width: 861px) { #side { position: sticky; top: 70px; align-self: start; } }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; }
+  .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 0 0 8px; }
+  .msg { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; margin: 8px 0; }
+  .msg.user { background: var(--user); border-color: var(--user-line); }
+  .msg.assistant { background: var(--assistant); }
+  .msg.tool, .msg.system { background: var(--tool); color: var(--muted); }
+  .msg.target { background: var(--target); border: 2px solid var(--target-line); }
+  .role { font-size: 12px; font-weight: 600; color: var(--muted); margin-bottom: 4px; display: flex; gap: 8px; }
+  .badge { background: var(--target-line); color: #1d1600; border-radius: 4px; padding: 0 6px; font-weight: 600; }
+  .text { white-space: pre-wrap; }
+  details { margin-top: 4px; }
+  details pre { white-space: pre-wrap; margin: 4px 0 0; font-size: 12px; max-height: 320px; overflow: auto; }
+  summary { cursor: pointer; color: var(--muted); }
+  .chip { display: inline-block; border: 1px solid var(--line); border-radius: 4px; padding: 0 6px; margin: 2px 4px 0 0;
+    font-size: 12px; color: var(--muted); }
+  .divider { text-align: center; color: var(--muted); font-size: 12px; margin: 14px 0 4px; }
+  .routes { display: grid; grid-template-columns: 1fr; gap: 6px; }
+  button { font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--text);
+    border-radius: 6px; padding: 7px 10px; cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .5; cursor: default; }
+  button.route { text-align: left; display: flex; justify-content: space-between; }
+  button.route kbd { color: var(--muted); }
+  button.route.chosen { background: var(--chosen); border-color: var(--chosen); color: #ffffff; }
+  button.route.chosen kbd { color: #ffffff; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+  .row { display: flex; gap: 6px; flex-wrap: wrap; }
+  textarea { width: 100%; min-height: 64px; font: inherit; color: var(--text); background: var(--bg);
+    border: 1px solid var(--line); border-radius: 6px; padding: 6px; resize: vertical; }
+  dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; font-size: 13px; }
+  dt { color: var(--muted); } dd { margin: 0; overflow-wrap: anywhere; }
+  .muted { color: var(--muted); }
+  .warn { color: var(--warn); }
+  .empty { color: var(--muted); padding: 40px 10px; text-align: center; }
+  kbd { font: 12px ui-monospace, Consolas, monospace; }
+  select { font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 6px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Route labelling</h1>
+  <label class="file">Points <input type="file" id="points-file" accept=".jsonl,.json,.ndjson,.txt"></label>
+  <label class="file">Labels to resume <input type="file" id="labels-file" accept=".jsonl,.json,.ndjson,.txt"></label>
+  <span id="progress-text" class="muted">No points loaded</span>
+  <div class="bar" aria-hidden="true"><div id="progress-bar"></div></div>
+  <button id="export" class="primary" disabled>Export labels.jsonl</button>
+  <span id="status" class="muted" role="status"></span>
+</header>
+<main>
+  <section id="transcript" aria-label="Conversation"><div class="empty">Load a points file to start. Nothing leaves this page.</div></section>
+  <aside id="side">
+    <div class="card">
+      <h2>Route for the latest user message</h2>
+      <div class="routes" id="routes"></div>
+      <p class="muted" style="margin:8px 0 0;font-size:12px">Keys: <kbd>1</kbd>-<kbd>4</kbd> label,
+        <kbd>&larr;</kbd>/<kbd>&rarr;</kbd> back / next, <kbd>N</kbd> next unlabelled, <kbd>X</kbd> clear,
+        <kbd>R</kbd> reveal.</p>
+    </div>
+    <div class="card">
+      <h2>Note</h2>
+      <textarea id="note" placeholder="Optional: why, or what is ambiguous" disabled></textarea>
+    </div>
+    <div class="card">
+      <div class="row">
+        <button id="back" disabled>&larr; Back</button>
+        <button id="skip" disabled>Skip &rarr;</button>
+        <button id="next-unlabelled" disabled>Next unlabelled</button>
+        <button id="clear" disabled>Clear label</button>
+      </div>
+      <div class="row" style="margin-top:8px;align-items:center">
+        <label><input type="checkbox" id="advance" checked> Advance after labelling</label>
+        <label>Show <select id="window">
+          <option value="2">2</option><option value="4" selected>4</option><option value="8">8</option>
+          <option value="0">all</option></select> exchanges</label>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Point</h2>
+      <dl id="meta"></dl>
+    </div>
+    <div class="card">
+      <div class="row" style="justify-content:space-between;align-items:center">
+        <h2 style="margin:0">What the rules said</h2>
+        <button id="reveal" disabled>Reveal</button>
+      </div>
+      <dl id="hints" hidden></dl>
+      <p class="muted" style="margin:6px 0 0;font-size:12px">Hidden by default so it does not bias the label.</p>
+    </div>
+  </aside>
+</main>
+<script>
+"use strict";
+(function () {
+  const ROUTES = ["local-general", "local-code", "local-reasoning", "local-private"];
+  const ROUTE_HELP = {
+    "local-general": "everyday questions, writing, chat",
+    "local-code": "writing, running or debugging code / software",
+    "local-reasoning": "maths, logic, careful multi-step analysis",
+    "local-private": "personal data about a real person"
+  };
+
+  const state = {
+    points: [],          // decision points, in file order
+    index: 0,
+    entries: new Map(),  // point_id -> {label, note, labelled_at}; label may be null (a note only)
+    dirty: false,
+    reveal: false,
+    windowSize: 4,
+    showAll: false
+  };
+
+  const $ = (id) => document.getElementById(id);
+  const el = (tag, cls, text) => {
+    const node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (text !== undefined && text !== null) node.textContent = String(text);
+    return node;
+  };
+
+  // -- files ------------------------------------------------------------------------
+  function readFile(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result));
+      reader.onerror = () => reject(reader.error);
+      reader.readAsText(file, "utf-8");
+    });
+  }
+
+  function parseJsonl(text) {
+    const records = [];
+    let bad = 0;
+    for (const line of text.split(/\r?\n/)) {
+      if (!line.trim()) continue;
+      try {
+        const value = JSON.parse(line);
+        if (value && typeof value === "object" && !Array.isArray(value)) records.push(value); else bad++;
+      } catch (e) { bad++; }
+    }
+    return { records, bad };
+  }
+
+  $("points-file").addEventListener("change", async (event) => {
+    const file = event.target.files && event.target.files[0];
+    if (!file) return;
+    const { records, bad } = parseJsonl(await readFile(file));
+    state.points = records.filter((p) => typeof p.point_id === "string" && Array.isArray(p.messages));
+    state.index = firstUnlabelled(0);
+    status(`${state.points.length} points loaded` + (bad ? `, ${bad} unreadable line(s) skipped` : ""));
+    event.target.value = "";
+    render();
+  });
+
+  $("labels-file").addEventListener("change", async (event) => {
+    const file = event.target.files && event.target.files[0];
+    if (!file) return;
+    const { records, bad } = parseJsonl(await readFile(file));
+    let n = 0;
+    for (const r of records) {
+      if (typeof r.point_id !== "string" || typeof r.label !== "string" || !r.label) continue;
+      state.entries.set(r.point_id, { label: r.label, note: typeof r.note === "string" ? r.note : "",
+                                      labelled_at: typeof r.labelled_at === "string" ? r.labelled_at : null });
+      n++;
+    }
+    status(`${n} labels loaded` + (bad ? `, ${bad} unreadable line(s) skipped` : ""));
+    event.target.value = "";
+    if (state.points.length) state.index = firstUnlabelled(0);
+    render();
+  });
+
+  $("export").addEventListener("click", () => {
+    const lines = [];
+    for (const [pointId, e] of state.entries) {
+      if (!e.label) continue;
+      lines.push(JSON.stringify({ point_id: pointId, label: e.label, note: e.note || "",
+                                  labelled_at: e.labelled_at }));
+    }
+    const blob = new Blob([lines.join("\n") + (lines.length ? "\n" : "")], { type: "application/x-ndjson" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "labels.jsonl";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    state.dirty = false;
+    status(`exported ${lines.length} labels`);
+    render();
+  });
+
+  window.addEventListener("beforeunload", (event) => {
+    if (state.dirty) { event.preventDefault(); event.returnValue = ""; }
+  });
+
+  // -- labelling ----------------------------------------------------------------------
+  function current() { return state.points[state.index]; }
+  function entryOf(point) { return point ? state.entries.get(point.point_id) : undefined; }
+
+  function firstUnlabelled(from) {
+    const n = state.points.length;
+    for (let i = 0; i < n; i++) {
+      const j = (from + i) % n;
+      const e = entryOf(state.points[j]);
+      if (!e || !e.label) return j;
+    }
+    return Math.min(from, Math.max(0, n - 1));
+  }
+
+  function setLabel(route) {
+    const point = current();
+    if (!point) return;
+    state.entries.set(point.point_id, { label: route, note: $("note").value,
+                                        labelled_at: new Date().toISOString() });
+    state.dirty = true;
+    if (route && $("advance").checked) {
+      go(firstUnlabelled((state.index + 1) % state.points.length));
+    } else {
+      render();
+    }
+  }
+
+  function saveNote() {
+    const point = current();
+    if (!point) return;
+    const old = entryOf(point);
+    const note = $("note").value;
+    if (!old && !note) return;
+    if (old && (old.note || "") === note) return;
+    state.entries.set(point.point_id, { label: old ? old.label : null, note,
+                                        labelled_at: old ? old.labelled_at : null });
+    if (old && old.label) state.dirty = true;
+  }
+
+  function go(index) {
+    if (!state.points.length) return;
+    saveNote();
+    state.index = Math.max(0, Math.min(index, state.points.length - 1));
+    state.reveal = false;
+    state.showAll = false;
+    render();
+  }
+
+  // -- the transcript ------------------------------------------------------------------
+  function contentText(content) {
+    if (typeof content === "string") return { text: content, images: 0 };
+    if (Array.isArray(content)) {
+      const texts = [];
+      let images = 0;
+      for (const part of content) {
+        if (!part || typeof part !== "object") continue;
+        if ((part.type === "text" || part.type === "input_text") && typeof part.text === "string") texts.push(part.text);
+        else if (/image/.test(String(part.type))) images++;
+      }
+      return { text: texts.join("\n"), images };
+    }
+    return { text: "", images: 0 };
+  }
+
+  // The same split as common.conversation.split_exchanges: one exchange per
+  // user message, holding the messages after it; anything earlier is "before".
+  function splitExchanges(messages) {
+    const before = [];
+    const exchanges = [];
+    for (const m of messages) {
+      if (!m || typeof m !== "object") continue;
+      if (m.role === "user") exchanges.push({ user: m, rounds: [] });
+      else if (exchanges.length) exchanges[exchanges.length - 1].rounds.push(m);
+      else before.push(m);
+    }
+    return { before, exchanges };
+  }
+
+  function messageNode(m, isTarget) {
+    const role = String(m.role || "?");
+    const box = el("div", "msg " + (["user", "assistant", "tool", "system"].includes(role) ? role : "tool"));
+    if (isTarget) box.classList.add("target");
+    const head = el("div", "role", role === "tool" ? "tool result" : role);
+    if (isTarget) head.appendChild(el("span", "badge", "label this message"));
+    box.appendChild(head);
+    const { text, images } = contentText(m.content);
+    if (role === "tool" || role === "system") {
+      const details = el("details");
+      details.appendChild(el("summary", null, `${text.length} characters`));
+      details.appendChild(el("pre", null, text));
+      box.appendChild(details);
+    } else if (text) {
+      box.appendChild(el("div", "text", text));
+    }
+    for (let i = 0; i < images; i++) box.appendChild(el("span", "chip", "image"));
+    if (Array.isArray(m.tool_calls)) {
+      for (const call of m.tool_calls) {
+        const fn = call && call.function ? call.function : {};
+        const details = el("details");
+        details.appendChild(el("summary", null, `tool call: ${fn.name || "?"}`));
+        details.appendChild(el("pre", null, typeof fn.arguments === "string" ? fn.arguments : JSON.stringify(fn.arguments)));
+        box.appendChild(details);
+      }
+    }
+    return box;
+  }
+
+  function renderTranscript(point) {
+    const root = $("transcript");
+    root.replaceChildren();
+    if (!point) {
+      root.appendChild(el("div", "empty", "Load a points file to start. Nothing leaves this page."));
+      return;
+    }
+    const { before, exchanges } = splitExchanges(point.messages);
+    const k = Number.isInteger(point.k) && point.k >= 1 ? Math.min(point.k, exchanges.length) : exchanges.length;
+    const upto = exchanges.slice(0, k);
+    const size = state.windowSize;
+    const start = state.showAll || size === 0 ? 0 : Math.max(0, upto.length - size);
+    if (start > 0 || (point.trimmed_exchanges || 0) > 0) {
+      const hidden = start + (point.trimmed_exchanges || 0);
+      const line = el("div", "divider", `${hidden} earlier exchange(s) not shown` +
+        ((point.trimmed_exchanges || 0) > 0 ? ` (${point.trimmed_exchanges} not in the points file)` : ""));
+      if (start > 0) {
+        const more = el("button", null, "show them");
+        more.style.marginLeft = "8px";
+        more.addEventListener("click", () => { state.showAll = true; render(); });
+        line.appendChild(more);
+      }
+      root.appendChild(line);
+    }
+    if (start === 0) for (const m of before) root.appendChild(messageNode(m, false));
+    let target = null;
+    upto.slice(start).forEach((ex, i) => {
+      const isLast = start + i === upto.length - 1;
+      if (i > 0) root.appendChild(el("div", "divider", "· · ·"));
+      const node = messageNode(ex.user, isLast);
+      root.appendChild(node);
+      if (isLast) target = node;
+      else for (const m of ex.rounds) root.appendChild(messageNode(m, false));
+    });
+    if (target) target.scrollIntoView({ block: "nearest" });
+  }
+
+  // -- the side panel --------------------------------------------------------------------
+  function addMeta(dl, name, value) {
+    dl.appendChild(el("dt", null, name));
+    dl.appendChild(el("dd", null, value === null || value === undefined || value === "" ? "-" : value));
+  }
+
+  function fmtGap(seconds) {
+    if (typeof seconds !== "number") return "-";
+    return seconds < 120 ? `${seconds.toFixed(0)} s` : `${(seconds / 60).toFixed(1)} min`;
+  }
+
+  function renderSide(point) {
+    const entry = entryOf(point);
+    const routes = $("routes");
+    routes.replaceChildren();
+    ROUTES.forEach((route, i) => {
+      const b = el("button", "route");
+      const name = el("span");
+      name.appendChild(el("strong", null, route));
+      name.appendChild(el("span", "muted", " " + ROUTE_HELP[route]));
+      b.appendChild(name);
+      b.appendChild(el("kbd", null, String(i + 1)));
+      b.disabled = !point;
+      if (entry && entry.label === route) b.classList.add("chosen");
+      b.addEventListener("click", () => setLabel(route));
+      routes.appendChild(b);
+    });
+    if (entry && entry.label && !ROUTES.includes(entry.label)) {
+      routes.appendChild(el("div", "warn", `Loaded label "${entry.label}" is not one of the four routes.`));
+    }
+    $("note").disabled = !point;
+    $("note").value = entry ? entry.note || "" : "";
+    for (const id of ["back", "skip", "next-unlabelled", "clear", "reveal"]) $(id).disabled = !point;
+    $("clear").disabled = !(entry && entry.label);
+
+    const meta = $("meta");
+    meta.replaceChildren();
+    if (point) {
+      addMeta(meta, "point", `${state.index + 1} of ${state.points.length}`);
+      addMeta(meta, "chat", String(point.chat_id || "").slice(0, 12));
+      addMeta(meta, "user message", `${point.user_index || "?"} (k = ${point.k})`);
+      addMeta(meta, "when", typeof point.timestamp === "number" ? new Date(point.timestamp * 1000).toLocaleString() : "-");
+      addMeta(meta, "since previous", fmtGap(point.gap_s));
+      addMeta(meta, "label", entry && entry.label ? entry.label : "unlabelled");
+    }
+
+    const hints = $("hints");
+    hints.replaceChildren();
+    hints.hidden = !state.reveal || !point;
+    $("reveal").textContent = state.reveal ? "Hide" : "Reveal";
+    if (point && state.reveal) {
+      addMeta(hints, "weak label", point.weak_label ? `${point.weak_label} (${point.weak_source})` : "none");
+      addMeta(hints, "rules route", `${point.rules_route} (${point.rules_decided_by || "default route"})`);
+      addMeta(hints, "privacy keywords", point.privacy_kw_route || "no match");
+      addMeta(hints, "logged decision", point.decision_route || "none");
+      addMeta(hints, "answer called", (point.answer_tools || []).join(", ") || "no tools");
+    }
+  }
+
+  function render() {
+    const point = current();
+    renderTranscript(point);
+    renderSide(point);
+    const labelled = state.points.filter((p) => { const e = entryOf(p); return e && e.label; }).length;
+    const total = state.points.length;
+    $("progress-text").textContent = total ? `${labelled} of ${total} labelled` + (state.dirty ? " · unexported" : "")
+                                           : "No points loaded";
+    $("progress-bar").style.width = total ? `${(100 * labelled / total).toFixed(1)}%` : "0";
+    let any = false;
+    for (const e of state.entries.values()) if (e.label) { any = true; break; }
+    $("export").disabled = !any;
+  }
+
+  function status(text) { $("status").textContent = text; }
+
+  // -- controls ---------------------------------------------------------------------------
+  $("back").addEventListener("click", () => go(state.index - 1));
+  $("skip").addEventListener("click", () => go(state.index + 1));
+  $("next-unlabelled").addEventListener("click", () => go(firstUnlabelled((state.index + 1) % state.points.length)));
+  $("clear").addEventListener("click", () => {
+    const point = current();
+    const e = entryOf(point);
+    if (!e) return;
+    state.entries.set(point.point_id, { label: null, note: $("note").value, labelled_at: null });
+    state.dirty = true;
+    render();
+  });
+  $("reveal").addEventListener("click", () => { state.reveal = !state.reveal; renderSide(current()); });
+  $("window").addEventListener("change", (event) => { state.windowSize = Number(event.target.value); render(); });
+  $("note").addEventListener("change", saveNote);
+
+  document.addEventListener("keydown", (event) => {
+    const tag = event.target && event.target.tagName;
+    if (tag === "TEXTAREA" || tag === "INPUT" || tag === "SELECT") return;
+    if (event.ctrlKey || event.metaKey || event.altKey || !state.points.length) return;
+    const n = Number(event.key);
+    if (n >= 1 && n <= ROUTES.length) { setLabel(ROUTES[n - 1]); event.preventDefault(); return; }
+    switch (event.key) {
+      case "ArrowLeft": go(state.index - 1); break;
+      case "ArrowRight": go(state.index + 1); break;
+      case "n": case "N": go(firstUnlabelled((state.index + 1) % state.points.length)); break;
+      case "x": case "X": $("clear").click(); break;
+      case "r": case "R": $("reveal").click(); break;
+      default: return;
+    }
+    event.preventDefault();
+  });
+
+  render();
+})();
+</script>
+</body>
+</html>

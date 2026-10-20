@@ -1,4 +1,4 @@
-"""Read-only ruleset and binding endpoints (the write API is phase 5).
+"""Read-only ruleset and binding endpoints (the write API is phase 6).
 
     GET /rulesets                  every stored version, without documents
     GET /rulesets/{id}             the highest version with its document, plus every version's summary

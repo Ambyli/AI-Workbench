@@ -16,6 +16,13 @@
 Pure: no database, no metrics. The API layer stores and counts the result.
 :meth:`Decision.response` is the POST /decide body (ROUTE_POLICY_PLAN § 7,
 the API contract), and with ``with_detail`` the POST /evaluate body.
+
+Around a run, the service asks the same ruleset two more questions
+(``Evaluator.analysis_lookups`` / ``analysis_requests``, gathered by
+:func:`analysis_lookups` and :func:`analysis_requests` here): which stored
+verdicts to read onto the context BEFORE the run, and what to classify in
+the background AFTER the answer. An evaluator that raises in either is
+skipped and logged -- the decision never depends on them.
 """
 
 from __future__ import annotations
@@ -25,6 +32,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
+from ..analysis.model import AnalysisRequest
 from ..combiners.base import Ballot
 from ..evaluators.base import Outcome
 from ..rulesets.model import CompiledRuleset
@@ -114,6 +122,35 @@ class Decision:
 def _error_text(exc: BaseException) -> str:
     text = f"{type(exc).__name__}: {exc}"
     return text if len(text) <= ERROR_MAX_CHARS else text[: ERROR_MAX_CHARS - 1] + "…"
+
+
+def analysis_lookups(ruleset: CompiledRuleset, ctx: RequestContext) -> List[str]:
+    """Every stored verdict the ruleset's evaluators will read, deduplicated,
+    in ruleset order. Empty for a ruleset without analysis evaluators."""
+    keys: List[str] = []
+    for entry in ruleset.entries:
+        try:
+            wanted = entry.evaluator.analysis_lookups(ctx)
+        except Exception as exc:  # noqa: BLE001 -- its evaluate() then abstains on an empty map
+            logger.warning("engine: %s@%d evaluator %s analysis_lookups raised: %s",
+                           ruleset.id, ruleset.version, entry.id, _error_text(exc))
+            continue
+        keys.extend(k for k in wanted if k not in keys)
+    return keys
+
+
+def analysis_requests(ruleset: CompiledRuleset, ctx: RequestContext) -> List[AnalysisRequest]:
+    """What the ruleset's evaluators want classified in the background, in
+    ruleset order (provenance not filled in yet: the service adds the ruleset
+    and the decision)."""
+    out: List[AnalysisRequest] = []
+    for entry in ruleset.entries:
+        try:
+            out.extend(entry.evaluator.analysis_requests(ctx))
+        except Exception as exc:  # noqa: BLE001 -- nothing is classified for it this turn
+            logger.warning("engine: %s@%d evaluator %s analysis_requests raised: %s",
+                           ruleset.id, ruleset.version, entry.id, _error_text(exc))
+    return out
 
 
 async def run(ruleset: CompiledRuleset, ctx: RequestContext) -> Decision:

@@ -8,7 +8,7 @@ import pathlib
 
 import pytest
 
-from rp_helpers import RULESETS_DIR, default_ruleset, seed
+from rp_helpers import RULESETS_DIR, default_ruleset, seed, strip_shadows
 
 from route_policy.rulesets.loader import (
     BINDINGS_FILE,
@@ -38,12 +38,14 @@ def _errors(doc) -> list:
 
 def test_the_baked_in_seed():
     s = seed()
-    # Only the current version is baked in: version 1 (phase 2, shadow) lives
-    # on in the database alone (test_db.py::test_the_phase_3_upgrade_...).
-    assert [(r.id, r.version, r.mode) for r in s.compiled] == [("default", 2, "enforce")]
-    assert [(b.scope_model, b.scope_key_alias, b.ruleset_id, b.version) for b in s.bindings] == [
-        ("auto", None, "default", 2)]
-    ruleset = s.compiled[0]
+    # Only the current `default` is baked in: version 1 (phase 2, shadow)
+    # lives on in the database alone (test_db.py::test_the_phase_3_upgrade_...).
+    # `default-llm` is the phase-4 draft, bound as `auto`'s shadow.
+    assert sorted((r.id, r.version, r.mode) for r in s.compiled) == [
+        ("default", 2, "enforce"), ("default-llm", 1, "shadow")]
+    assert [(b.scope_model, b.scope_key_alias, b.ruleset_id, b.version, b.shadows) for b in s.bindings] == [
+        ("auto", None, "default", 2, (("default-llm", 1),))]
+    ruleset = default_ruleset()
     assert ruleset.routes == ["local-general", "local-code", "local-reasoning", "local-private"]
     assert ruleset.default_route == "local-general"
     assert [(e.id, e.type, e.role, e.route) for e in ruleset.entries] == [
@@ -64,14 +66,19 @@ def test_content_hash_ignores_comments_and_tracks_content(tmp_path):
         target = tmp_path / path.relative_to(RULESETS_DIR)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
-    base = load_directory(tmp_path)[0].sha256
-    assert base == load_directory(RULESETS_DIR)[0].sha256
+    def hashes(directory):
+        return {r.key: r.sha256 for r in load_directory(directory)}
+
+    base = hashes(tmp_path)
+    assert base == hashes(RULESETS_DIR) and set(base) == {("default", 2), ("default-llm", 1)}
     ruleset = tmp_path / "default.yaml"
     ruleset.write_text("# a new comment\n" + ruleset.read_text(encoding="utf-8"), encoding="utf-8")
-    assert load_directory(tmp_path)[0].sha256 == base
+    assert hashes(tmp_path) == base
+    # A pattern file is content of EVERY ruleset that references it.
     pattern = tmp_path / "patterns" / "code.yaml"
     pattern.write_text(pattern.read_text(encoding="utf-8").replace("  - '```'\n", ""), encoding="utf-8")
-    assert load_directory(tmp_path)[0].sha256 != base
+    changed = hashes(tmp_path)
+    assert all(changed[k] != base[k] for k in base)
 
 
 def test_hash_is_over_the_document_not_a_pydantic_dump():
@@ -177,9 +184,15 @@ def _bindings(tmp_path: pathlib.Path, text: str):
 
 def test_seed_bindings(tmp_path):
     (b,) = _bindings(tmp_path, "- {model: auto, ruleset: default}\n")
-    assert (b.scope_model, b.scope_key_alias, b.version) == ("auto", None, 2)
+    assert (b.scope_model, b.scope_key_alias, b.version, b.shadows) == ("auto", None, 2, ())
     (b,) = _bindings(tmp_path, "- {model: auto, key_alias: tester, ruleset: default, version: 2}\n")
     assert b.scope_key_alias == "tester"
+    (b,) = _bindings(tmp_path, "- {model: auto, ruleset: default, shadow: [default-llm]}\n")
+    assert b.shadows == (("default-llm", 1),)
+    (b,) = _bindings(tmp_path, "- {model: auto, ruleset: default, shadow: [{ruleset: default-llm, version: 1}]}\n")
+    assert b.shadows == (("default-llm", 1),)
+    (b,) = _bindings(tmp_path, "- {model: auto, ruleset: default, shadow: []}\n")
+    assert b.shadows == ()
     for bad, match in [
         ("- {model: auto, ruleset: ghost}\n", "no ruleset 'ghost'"),
         ("- {model: auto, ruleset: default, version: 1}\n", "not baked in"),
@@ -187,6 +200,14 @@ def test_seed_bindings(tmp_path):
         ("- {model: auto, ruleset: default}\n- {model: auto, ruleset: default}\n", "bound twice"),
         ("- {model: auto, ruleset: default, extra: 1}\n", "expected"),
         ("{model: auto}\n", "a list"),
+        # The seed rules: an enforce primary, shadow-mode shadows.
+        ("- {model: auto, ruleset: default-llm}\n", "primary ruleset must be `enforce`"),
+        ("- {model: auto, ruleset: default, shadow: [default]}\n", "a shadow slot takes a `shadow` ruleset"),
+        ("- {model: auto, ruleset: default, shadow: [default-llm, default-llm]}\n", "listed twice"),
+        ("- {model: auto, ruleset: default, shadow: [ghost]}\n", "no ruleset 'ghost'"),
+        ("- {model: auto, ruleset: default, shadow: [{ruleset: default-llm, version: 7}]}\n", "not baked in"),
+        ("- {model: auto, ruleset: default, shadow: [{ruleset: default-llm, pin: 1}]}\n", "expected a ruleset id"),
+        ("- {model: auto, ruleset: default, shadow: default-llm}\n", "a list of ruleset ids"),
     ]:
         with pytest.raises(RulesetFileError, match=match):
             _bindings(tmp_path, bad)
@@ -209,12 +230,16 @@ def test_store_resolves_bindings_by_model_and_key_alias():
         store.add(r)
     from route_policy.rulesets.loader import Binding
 
-    store.set_bindings([Binding("auto", None, "default", 2), Binding("auto", "tester", "default", 2)])
+    store.set_bindings([Binding("auto", None, "default", 2, (("default-llm", 1),)),
+                        Binding("auto", "tester", "default", 2)])
     assert store.binding_for("auto", None).scope_key_alias is None
     assert store.binding_for("auto", "tester").scope_key_alias == "tester"
     assert store.binding_for("auto", "someone").scope_key_alias is None
     assert store.binding_for("local-code", None) is None
-    assert asyncio.run(store.resolve("auto", None)).id == "default"
+    resolved = asyncio.run(store.resolve("auto", None))
+    assert resolved.primary.id == "default" and resolved.shadows == (("default-llm", 1),)
+    assert [r.id for r in asyncio.run(store.shadow_rulesets(resolved))] == ["default-llm"]
+    assert asyncio.run(store.resolve("auto", "tester")).shadows == ()
     assert asyncio.run(store.resolve("gpt-4", None)) is None
     assert asyncio.run(store.get("default")).version == 2
     assert asyncio.run(store.get("default", 1)) is None   # not baked in, and no database to ask

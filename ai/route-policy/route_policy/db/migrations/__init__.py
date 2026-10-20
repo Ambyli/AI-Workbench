@@ -15,8 +15,11 @@ VIEW``), so a database created by hand, or a half-recorded history, still
 converges. Postgres DDL is transactional: a failing migration leaves nothing
 behind.
 
-Phase 4 adds the ``analyses`` table (the llm_classifier's async_next_turn
-runs) as its own migration; it is deliberately not in 0001.
+    0001_initial.sql         rulesets, bindings, decisions, evaluations, outcomes,
+                             the decision_outcomes view (phase 2)
+    0002_llm_classifier.sql  binding_shadows, decisions.shadow_of, analyses (the
+                             llm_classifier's verdicts), decision_outcomes over
+                             primaries only, the shadow_comparisons view (phase 4)
 """
 
 from __future__ import annotations

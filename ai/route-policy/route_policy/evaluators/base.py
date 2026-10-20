@@ -29,15 +29,29 @@ user text and the rounds after it) overrides :meth:`Evaluator.exchange_relevance
 the ``cooldown`` evaluator asks the evaluators its ``relevant_if`` names. That
 is how ``sticky-code`` reuses ``code-tools`` and ``code-text`` instead of
 repeating their patterns.
+
+**Analyses** (the ``llm_classifier``). An evaluator whose vote depends on a
+slow, background judgement keeps ``evaluate`` pure by splitting the work:
+
+* :meth:`Evaluator.analysis_lookups` names the stored verdicts it wants
+  (content-addressed keys); the service reads them all in ONE query and puts
+  them on ``ctx.analyses`` before the pipeline runs;
+* :meth:`Evaluator.evaluate` reads ``ctx.analyses`` and nothing else;
+* :meth:`Evaluator.analysis_requests` names what should be classified next;
+  the service enqueues it AFTER answering ``/decide`` (``analysis.queue``).
+
+Both default to nothing, so every other type is untouched.
 """
 
 from __future__ import annotations
 
 import importlib
 from dataclasses import dataclass, field
-from typing import Any, Callable, ClassVar, Dict, List, Mapping, Optional, Tuple, Type, TypeVar
+from typing import Any, Callable, ClassVar, Dict, List, Mapping, Optional, Sequence, Tuple, Type, TypeVar
 
 from pydantic import BaseModel, ConfigDict
+
+from ..analysis.model import AnalysisRequest
 
 # -- Declared output ------------------------------------------------------------
 
@@ -138,8 +152,8 @@ class Outcome:
     detail: Dict[str, Any] = field(default_factory=dict)
     confidence: float = 1.0
     # None = the ruleset entry's vote.route. An evaluator that picks its own
-    # route (phase 4's llm_classifier: `route: from_output`) sets it; the
-    # pipeline still refuses a route the ruleset does not list.
+    # route (the llm_classifier: the verdict's route) sets it; the pipeline
+    # still refuses a route the ruleset does not list.
     route: Optional[str] = None
 
     @classmethod
@@ -172,8 +186,9 @@ class Evaluator:
     type_name: ClassVar[str] = ""
     output: ClassVar[OutputSpec]
     Config: ClassVar[Type[EvaluatorConfig]] = EvaluatorConfig
-    # True: the entry must carry vote.route, and a vote goes there. Every
-    # phase-2 type works this way.
+    # True: the entry must carry vote.route, and a vote goes there. False:
+    # the evaluator names the route itself (Outcome.route) and the entry may
+    # not set vote.route (llm_classifier).
     needs_vote_route: ClassVar[bool] = True
 
     def __init__(self, evaluator_id: str, config: EvaluatorConfig) -> None:
@@ -186,8 +201,25 @@ class Evaluator:
         Raise ValueError on a bad reference; validation reports it as a
         ruleset error."""
 
+    def check_routes(self, routes: Sequence[str]) -> None:
+        """Check the routes this evaluator's ``config`` names against the
+        ruleset's ``routes``; raise ValueError (validation reports it as a
+        ruleset error). Only types that name routes in their config override
+        it -- ``vote.route`` itself is checked by the validator."""
+
     async def evaluate(self, ctx: Any) -> Outcome:  # ctx: engine.context.RequestContext
         raise NotImplementedError
+
+    def analysis_lookups(self, ctx: Any) -> Sequence[str]:
+        """The stored verdicts (``analyses`` keys) :meth:`evaluate` will read
+        from ``ctx.analyses``. Called before the pipeline; must be cheap and
+        pure."""
+        return ()
+
+    def analysis_requests(self, ctx: Any) -> Sequence[AnalysisRequest]:
+        """What to classify in the background for this request. Called after
+        ``/decide`` has answered (never by ``/evaluate``)."""
+        return ()
 
     def exchange_relevance(self, text: str, rounds: List[dict]) -> Optional[str]:
         """Why one exchange (its user text, the messages after it) counts,
@@ -214,14 +246,14 @@ _REGISTRY: Dict[str, Type[Evaluator]] = {}
 
 # The modules that declare a type, imported on first lookup -- so asking for
 # the registry before anything imported the evaluators still finds them all.
-# phase 4 adds llm_classifier; context_size is listed in ROUTE_POLICY_PLAN
-# § 4 but not built.
+# context_size is listed in ROUTE_POLICY_PLAN § 4 but not built.
 _DECLARING_MODULES = (
     "route_policy.evaluators.regex_text",
     "route_policy.evaluators.tool_calls",
     "route_policy.evaluators.cooldown",
     "route_policy.evaluators.backend_load",
     "route_policy.evaluators.static",
+    "route_policy.evaluators.llm_classifier",
 )
 _loaded = False
 

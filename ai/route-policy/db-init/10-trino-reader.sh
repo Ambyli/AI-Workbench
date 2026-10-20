@@ -28,7 +28,8 @@
 #
 # What it can read: rulesets, bindings, decisions (chat / message / user ids,
 # routes, votes and their reasons -- never message text), evaluations,
-# outcomes. Treat the password as a real secret all the same.
+# outcomes, analyses (the classifier's scores and its <= 200-character reason
+# -- never the transcript). Treat the password as a real secret all the same.
 #
 # An EMPTY password skips the role with a message instead of failing: the
 # service itself must not depend on Trino's credentials, and the only thing

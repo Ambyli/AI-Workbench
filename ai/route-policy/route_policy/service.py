@@ -2,12 +2,18 @@
 
 ``Service`` is built by the app's lifespan and hung on ``app.state.service``:
 
-    store         the ruleset cache (rulesets.store.RulesetStore)
-    database      route-policy-db (db.pool.Database), or None in DB-less tests
-    rulesets_dir  where refs in a POST /evaluate document resolve
+    store           the ruleset cache (rulesets.store.RulesetStore)
+    database        route-policy-db (db.pool.Database), or None in DB-less tests
+    rulesets_dir    where refs in a POST /evaluate document resolve
+    analysis_queue  the llm_classifier's background classifications
+                    (analysis.queue.AnalysisQueue), or None when
+                    ROUTE_POLICY_CLASSIFIER_URL is empty
 
 ``record_decision`` and ``record_outcome`` turn an engine result / an
 /observe body into rows, idempotently, and keep the metrics.
+``load_analyses`` reads the verdicts a ruleset's evaluators named onto the
+request view before the pipeline runs; ``after_decide`` does what /decide
+leaves until after its answer (below).
 
 **A decision is returned even when it cannot be stored.** Routing must never
 depend on the log: a failed write is counted
@@ -35,25 +41,56 @@ to the config values; tests set their own.
 ``{"stored": true|false}`` as before, a failure in time is a 503, and a late
 one answers ``{"stored": null, "deferred": true}`` (the hook ignores the
 body: it fires /observe and forgets it).
+
+**Verdict lookups are bounded too.** ``load_analyses`` reads every key in ONE
+query, within ``read_budget_s`` (config.DB_READ_BUDGET_S) on /decide; past
+it, or with the database failing or absent, the context records why
+(``analysis_lookup_error``) and an ``llm_classifier`` abstains ("lookup timed
+out"). A ruleset without such evaluators names no keys and makes no query --
+the live ``default`` ruleset is one.
+
+**After the answer** (``after_decide``), ONE background task per /decide,
+counted with the writes against ``max_in_flight`` (past it the work is
+dropped: ``shadow_dropped``):
+
+1. the primary decision's analysis requests go to the queue;
+2. each SHADOW ruleset bound beside the primary (``bindings.yaml``
+   ``shadow:``) runs on the same request -- its own verdict lookup (with the
+   same budget, so it measures what enforcing it would do), the pipeline --
+   and is stored as a decisions row with id ``uuid5(primary id,
+   "<ruleset>@<version>")`` and ``shadow_of`` = the primary id, with its own
+   evaluations; then its analysis requests go to the queue.
+
+The primary's response is never touched by any of it, and a shadow that
+fails to load or to run is skipped and counted. A repeated /decide derives
+the same shadow ids, so nothing is written twice; the queue deduplicates
+requests by key, and a worker skips a key that already has a verdict.
 """
 
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import pathlib
 import time
+import uuid
 from dataclasses import dataclass, field
-from typing import Any, Coroutine, Dict, Optional, Set, Tuple
+from typing import Any, Coroutine, Dict, List, Optional, Set, Tuple
 
 from . import config, metrics
+from .analysis.queue import AnalysisQueue
 from .api.schemas import DecideRequest, ObserveRequest
 from .db.pool import Database
+from .db.repositories import analyses as analyses_repo
 from .db.repositories import decisions as decisions_repo
 from .db.repositories import outcomes as outcomes_repo
 from .db.repositories.evaluations import EvaluationRecord
+from .engine import pipeline
+from .engine.context import RequestContext
 from .engine.pipeline import Decision
-from .rulesets.store import RulesetStore
+from .rulesets.model import CompiledRuleset
+from .rulesets.store import Resolved, RulesetStore
 
 logger = logging.getLogger("route_policy")
 
@@ -62,6 +99,12 @@ STORED, DUPLICATE, NOT_STORED, DEFERRED, DROPPED = "stored", "duplicate", "not_s
 # At most one "too many writes in flight" warning per this many seconds: a
 # database that is down for minutes would otherwise log one per request.
 _DROP_LOG_INTERVAL_S = 60.0
+
+
+def shadow_decision_id(primary_id: uuid.UUID, ruleset: CompiledRuleset) -> uuid.UUID:
+    """The id of ``ruleset``'s shadow decision beside ``primary_id``: derived,
+    so a repeated /decide writes the same rows (the first write wins)."""
+    return uuid.uuid5(primary_id, f"{ruleset.id}@{ruleset.version}")
 
 
 class OutcomeNotStored(RuntimeError):
@@ -75,11 +118,109 @@ class Service:
     store: RulesetStore
     database: Optional[Database]
     rulesets_dir: pathlib.Path
+    analysis_queue: Optional[AnalysisQueue] = None
     write_budget_s: float = field(default_factory=lambda: config.DECISION_WRITE_BUDGET_S)
     max_in_flight: int = field(default_factory=lambda: config.WRITES_MAX_IN_FLIGHT)
     drain_s: float = field(default_factory=lambda: config.WRITES_DRAIN_S)
+    read_budget_s: Optional[float] = field(default_factory=lambda: config.DB_READ_BUDGET_S)
     _pending: Set["asyncio.Task[Any]"] = field(default_factory=set, init=False, repr=False)
     _last_drop_log: float = field(default=float("-inf"), init=False, repr=False)
+
+    # -- verdicts -------------------------------------------------------------------
+
+    async def load_analyses(self, ruleset: CompiledRuleset, ctx: RequestContext, *,
+                            budget_s: Optional[float]) -> None:
+        """Put the verdicts ``ruleset``'s evaluators asked for on ``ctx``
+        (``ctx.analyses``), in one query within ``budget_s`` (None = wait as
+        long as it takes). On a timeout, a failure or no database, record why
+        in ``ctx.analysis_lookup_error`` instead. No keys, no query."""
+        keys = pipeline.analysis_lookups(ruleset, ctx)
+        if not keys:
+            return
+        if self.database is None:
+            ctx.analysis_lookup_error = "unavailable (no database)"
+            return
+        try:
+            ctx.analyses = await asyncio.wait_for(self._read_analyses(keys), budget_s)
+        except asyncio.TimeoutError:
+            metrics.db_reads_cut_total.labels("analysis_lookup").inc()
+            ctx.analysis_lookup_error = "timed out"
+        except Exception as exc:  # noqa: BLE001 -- the llm_classifier abstains; the decision goes on
+            metrics.errors_total.labels("analysis_lookup").inc()
+            logger.warning("decide: verdict lookup for %s@%d failed: %r", ruleset.id, ruleset.version, exc)
+            ctx.analysis_lookup_error = "failed"
+
+    async def _read_analyses(self, keys: List[str]):
+        async with self.database.acquire() as conn:
+            return await analyses_repo.get_many(conn, keys)
+
+    # -- after the answer --------------------------------------------------------------
+
+    def after_decide(self, body: DecideRequest, decision: Decision, resolved: Resolved,
+                     ctx: RequestContext) -> bool:
+        """Start /decide's after-the-answer work as one background task: the
+        primary's analysis requests, then every shadow ruleset. Returns False
+        when there was nothing to do or the task was dropped."""
+        if not resolved.shadows and self.analysis_queue is None:
+            return False
+        task = self._spawn(self._after_decide(body, decision, resolved, ctx))
+        if task is None:
+            metrics.errors_total.labels("shadow_dropped").inc()
+            self._log_drop("shadow decisions for", body.decision_id, "shadow_dropped")
+            return False
+        return True
+
+    async def _after_decide(self, body: DecideRequest, decision: Decision, resolved: Resolved,
+                            ctx: RequestContext) -> None:
+        # Let the request finish sending its answer before any of this work
+        # (rendering transcripts, evaluating shadows) takes the event loop.
+        await asyncio.sleep(0)
+        try:
+            self._enqueue(pipeline.analysis_requests(resolved.primary, ctx), decision.ruleset,
+                          body.decision_id)
+            for shadow in await self.store.shadow_rulesets(resolved):
+                await self._run_shadow(body, decision, shadow)
+        except Exception:  # noqa: BLE001 -- never reaches the request; counted and logged
+            metrics.errors_total.labels("shadow_error").inc()
+            logger.exception("decide: after-the-answer work for %s failed", body.decision_id)
+
+    async def _run_shadow(self, body: DecideRequest, primary: Decision, ruleset: CompiledRuleset) -> None:
+        """Decide, store and count one shadow ruleset on the request."""
+        ctx = body.context()
+        await self.load_analyses(ruleset, ctx, budget_s=self.read_budget_s)
+        decision = await pipeline.run(ruleset, ctx)
+        shadow_id = shadow_decision_id(body.decision_id, ruleset)
+        stored = await self._store_shadow(body, decision, shadow_id)
+        if stored:
+            self._count(decision)
+            metrics.shadow_decisions_total.labels(f"{ruleset.id}@{ruleset.version}",
+                                                  str(decision.route == primary.route).lower()).inc()
+        logger.info("[shadow] %s %s@%d -> %s (%s) beside %s -> %s%s", shadow_id, ruleset.id, ruleset.version,
+                    decision.route, decision.reason, body.decision_id, primary.route,
+                    "" if stored else ", not stored")
+        self._enqueue(pipeline.analysis_requests(ruleset, ctx), ruleset, shadow_id)
+
+    async def _store_shadow(self, body: DecideRequest, decision: Decision, shadow_id: uuid.UUID) -> bool:
+        """True when the shadow decision was stored now; False when it already
+        was (a repeated /decide) or could not be (counted)."""
+        if self.database is None:
+            return True
+        record, evaluations = self._records(body, decision, shadow_id, decision.response(str(shadow_id)),
+                                            shadow_of=body.decision_id)
+        try:
+            async with self.database.acquire() as conn:
+                return await decisions_repo.insert(conn, record, evaluations)
+        except Exception as exc:  # noqa: BLE001
+            metrics.errors_total.labels("decision_write").inc()
+            logger.error("decide: shadow decision %s computed but not stored: %r", shadow_id, exc)
+            return False
+
+    def _enqueue(self, requests: List[Any], ruleset: CompiledRuleset, decision_id: uuid.UUID) -> None:
+        if self.analysis_queue is None:
+            return
+        for request in requests:
+            self.analysis_queue.submit(dataclasses.replace(
+                request, ruleset_id=ruleset.id, ruleset_version=ruleset.version, decision_id=decision_id))
 
     # -- decisions --------------------------------------------------------------
 
@@ -92,8 +233,30 @@ class Service:
         if self.database is None:
             self._count(decision)
             return NOT_STORED, response
+        record, evaluations = self._records(body, decision, body.decision_id, response)
+        task = self._spawn(self._write_decision(record, evaluations, decision))
+        if task is None:
+            metrics.errors_total.labels("decision_write_dropped").inc()
+            self._log_drop("decision", body.decision_id, "decision_write_dropped")
+            self._count(decision)
+            return DROPPED, response
+        try:
+            status, stored = await asyncio.wait_for(asyncio.shield(task), self.write_budget_s)
+        except asyncio.TimeoutError:
+            metrics.writes_deferred_total.labels("decision").inc()
+            logger.debug("decide: decision %s answered before its write finished (> %.3fs); "
+                         "the write goes on in the background", body.decision_id, self.write_budget_s)
+            return DEFERRED, response
+        if status == DUPLICATE and isinstance(stored, dict):
+            return DUPLICATE, stored
+        return status, response
+
+    @staticmethod
+    def _records(body: DecideRequest, decision: Decision, decision_id: uuid.UUID, response: Dict[str, Any],
+                 shadow_of: Optional[uuid.UUID] = None) -> Tuple[decisions_repo.DecisionRecord, list]:
+        """The decisions row and its evaluations for one decided ruleset."""
         record = decisions_repo.DecisionRecord(
-            decision_id=body.decision_id,
+            decision_id=decision_id,
             chat_id=body.chat_id,
             message_id=body.message_id,
             litellm_call_id=body.litellm_call_id,
@@ -114,28 +277,14 @@ class Service:
             latency_ms=decision.latency_ms,
             error="; ".join(decision.errors) or None,
             response=response,
+            shadow_of=shadow_of,
         )
         evaluations = [
             EvaluationRecord(i, v.evaluator, v.type, v.role, v.route, v.weight, v.confidence, v.reason,
                              v.abstained, v.latency_ms, v.error, v.detail)
             for i, v in enumerate(decision.votes)
         ]
-        task = self._spawn(self._write_decision(record, evaluations, decision))
-        if task is None:
-            metrics.errors_total.labels("decision_write_dropped").inc()
-            self._log_drop("decision", body.decision_id)
-            self._count(decision)
-            return DROPPED, response
-        try:
-            status, stored = await asyncio.wait_for(asyncio.shield(task), self.write_budget_s)
-        except asyncio.TimeoutError:
-            metrics.writes_deferred_total.labels("decision").inc()
-            logger.debug("decide: decision %s answered before its write finished (> %.3fs); "
-                         "the write goes on in the background", body.decision_id, self.write_budget_s)
-            return DEFERRED, response
-        if status == DUPLICATE and isinstance(stored, dict):
-            return DUPLICATE, stored
-        return status, response
+        return record, evaluations
 
     async def _write_decision(self, record: decisions_repo.DecisionRecord, evaluations: list,
                               decision: Decision) -> Tuple[str, Optional[Dict[str, Any]]]:
@@ -182,7 +331,7 @@ class Service:
         task = self._spawn(self._write_outcome(record))
         if task is None:
             metrics.errors_total.labels("outcome_write_dropped").inc()
-            self._log_drop("outcome", body.decision_id)
+            self._log_drop("outcome", body.decision_id, "outcome_write_dropped")
             raise OutcomeNotStored("too many writes in flight")
         try:
             return await asyncio.wait_for(asyncio.shield(task), self.write_budget_s)
@@ -238,32 +387,36 @@ class Service:
         if not task.cancelled():
             task.exception()
 
-    def _log_drop(self, what: str, decision_id: Any) -> None:
+    def _log_drop(self, what: str, decision_id: Any, kind: str) -> None:
         now = time.monotonic()
         if now - self._last_drop_log >= _DROP_LOG_INTERVAL_S:
             self._last_drop_log = now
-            logger.warning("%s %s not stored: %d writes already in flight (WRITES_MAX_IN_FLIGHT) -- "
+            logger.warning("%s %s not stored: %d background tasks already in flight (WRITES_MAX_IN_FLIGHT) -- "
                            "route-policy-db is not keeping up; further drops are only counted for %.0fs "
-                           "(route_policy_errors_total{kind=\"%s_write_dropped\"})",
-                           what, decision_id, self.max_in_flight, _DROP_LOG_INTERVAL_S, what)
+                           "(route_policy_errors_total{kind=\"%s\"})",
+                           what, decision_id, self.max_in_flight, _DROP_LOG_INTERVAL_S, kind)
 
     async def drain(self, timeout_s: Optional[float] = None) -> int:
         """Shutdown: wait up to ``timeout_s`` (default ``drain_s``,
-        WRITES_DRAIN_S) for the background writes, then cancel what is left and
-        wait for the cancellations; cancel the store's background reads too.
-        Returns how many writes were cancelled."""
+        WRITES_DRAIN_S) for the background writes and after-the-answer tasks,
+        then cancel what is left and wait for the cancellations; cancel the
+        store's background reads too; then stop the analysis queue (its
+        running classifications get their own ``drain_s``). Returns how many
+        background tasks were cancelled."""
         timeout_s = self.drain_s if timeout_s is None else timeout_s
         await self.store.cancel_background()
         pending = set(self._pending)
-        if not pending:
-            return 0
-        _done, left = await asyncio.wait(pending, timeout=max(0.0, timeout_s))
-        for task in left:
-            task.cancel()
-        if left:
-            await asyncio.gather(*left, return_exceptions=True)
-            logger.warning("shutdown: %d background write(s) did not finish within %.1fs and were cancelled",
-                           len(left), timeout_s)
+        left: Set["asyncio.Task[Any]"] = set()
+        if pending:
+            _done, left = await asyncio.wait(pending, timeout=max(0.0, timeout_s))
+            for task in left:
+                task.cancel()
+            if left:
+                await asyncio.gather(*left, return_exceptions=True)
+                logger.warning("shutdown: %d background task(s) did not finish within %.1fs and were cancelled",
+                               len(left), timeout_s)
+        if self.analysis_queue is not None:
+            await self.analysis_queue.stop()
         return len(left)
 
     # -- metrics ---------------------------------------------------------------------

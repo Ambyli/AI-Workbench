@@ -31,7 +31,7 @@ import pytest
 from fastapi.testclient import TestClient
 from prometheus_client import REGISTRY
 
-from rp_helpers import RULESETS_DIR, default_ruleset, seed, tool_round, user
+from rp_helpers import RULESETS_DIR, default_ruleset, seed, strip_shadows, tool_round, user
 
 from route_policy.api.schemas import DecideRequest, ObserveRequest
 from route_policy.app import create_app
@@ -96,11 +96,14 @@ def _sample(name: str, **labels) -> float:
 
 
 def _store() -> RulesetStore:
+    """The baked-in rulesets, bound WITHOUT their shadow slots: these tests
+    are about the primary's write. Shadows under a slow database are
+    test_shadows.py's."""
     s = seed()
     store = RulesetStore(None)
     for compiled in s.compiled:
         store.add(compiled)
-    store.set_bindings(s.bindings)
+    store.set_bindings(strip_shadows(s.bindings))
     return store
 
 
@@ -290,12 +293,12 @@ def test_a_hung_binding_refresh_decides_from_the_snapshot(monkeypatch):
         monkeypatch.setattr(rulesets_repo, "list_bindings", list_bindings)
         cut = _sample("route_policy_db_reads_cut_total", read="binding_refresh")
         started = time.monotonic()
-        assert (await store.resolve("auto", None)).version == 2
+        assert (await store.resolve("auto", None)).primary.version == 2
         assert time.monotonic() - started < 0.3
         assert _sample("route_policy_db_reads_cut_total", read="binding_refresh") == cut + 1
         # Next request: the refresh is still running -- no wait at all, no second refresh.
         started = time.monotonic()
-        assert (await store.resolve("auto", None)).version == 2
+        assert (await store.resolve("auto", None)).primary.version == 2
         assert time.monotonic() - started < 0.04
         assert store.database.acquired == 1
         gate.set()
@@ -324,7 +327,7 @@ def test_a_hung_version_fetch_is_cut_and_lands_in_the_cache(monkeypatch):
         assert await store.resolve("auto", None) is None and store.database.acquired == 1  # shared fetch
         gate.set()
         await asyncio.wait_for(asyncio.gather(*store._fetches.values()), 5)
-        assert (await store.resolve("auto", None)).version == 7  # from the cache now
+        assert (await store.resolve("auto", None)).primary.version == 7  # from the cache now
         # Without a budget (POST /evaluate, the read endpoints) get() waits as before.
         assert (await store.get("default", 7)).version == 7
 

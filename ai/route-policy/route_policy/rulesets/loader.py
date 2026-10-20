@@ -26,11 +26,18 @@ changed ruleset must get a new version.
       key_alias: null           # optional: only requests from this LiteLLM key alias
       ruleset: default
       version: null             # null / omitted = the highest version baked in
+      shadow: [default-llm]     # optional: rulesets decided beside it, logged, never applied;
+                                # each an id (highest version) or {ruleset: id, version: n}
 
-Startup owns the bindings it seeds (it re-points them on every start); the
-write API that edits them is phase 5. A stored version that is no longer
-baked in (``default@1`` after phase 3) stays in the database and is
-compiled from there on first use.
+Two seed rules, checked here so they stop the image build as well as
+startup: the PRIMARY ruleset of a binding must be ``mode: enforce`` (a shadow
+primary would answer ``apply: false`` and send every turn to local-private),
+and every SHADOW slot must be ``mode: shadow``.
+
+Startup owns the bindings it seeds (it re-points them, and replaces their
+shadow slots, on every start); the write API that edits them is phase 6. A
+stored version that is no longer baked in (``default@1`` after phase 3)
+stays in the database and is compiled from there on first use.
 """
 
 from __future__ import annotations
@@ -38,7 +45,7 @@ from __future__ import annotations
 import copy
 import pathlib
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
@@ -71,6 +78,9 @@ class Binding:
     scope_key_alias: Optional[str]
     ruleset_id: str
     version: int
+    # (ruleset id, version) of each shadow slot, in order: decided after the
+    # primary has answered, logged with shadow_of, never applied.
+    shadows: Tuple[Tuple[str, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -161,9 +171,24 @@ def load_directory(base_dir: pathlib.Path) -> List[LoadedRuleset]:
     return out
 
 
+def _baked_version(where: str, versions: Dict[str, List[int]], ruleset_id: Any, version: Any) -> int:
+    """``version`` of ``ruleset_id`` (None = the highest baked in), refusing
+    one that is not baked in."""
+    if not isinstance(ruleset_id, str) or not ruleset_id:
+        raise RulesetFileError(f"{where}: ruleset is a required string")
+    if ruleset_id not in versions:
+        raise RulesetFileError(f"{where}: no ruleset {ruleset_id!r} is baked in")
+    if version is None:
+        return max(versions[ruleset_id])
+    if isinstance(version, bool) or version not in versions[ruleset_id]:
+        raise RulesetFileError(f"{where}: {ruleset_id}@{version} is not baked in")
+    return int(version)
+
+
 def load_bindings(base_dir: pathlib.Path, rulesets: List[LoadedRuleset]) -> List[Binding]:
     """``bindings.yaml``, each version resolved against the loaded rulesets
-    (omitted = the highest version of that id)."""
+    (omitted = the highest version of that id), the primary checked to be
+    ``enforce`` and every shadow slot ``shadow``."""
     path = base_dir / BINDINGS_FILE
     if not path.exists():
         return []
@@ -171,30 +196,52 @@ def load_bindings(base_dir: pathlib.Path, rulesets: List[LoadedRuleset]) -> List
     if not isinstance(raw, list):
         raise RulesetFileError(f"{BINDINGS_FILE}: a list of bindings")
     versions: Dict[str, List[int]] = {}
+    modes: Dict[Tuple[str, int], Any] = {}
     for loaded in rulesets:
         versions.setdefault(str(loaded.key[0]), []).append(loaded.key[1])
+        modes[(str(loaded.key[0]), loaded.key[1])] = loaded.document.get("mode")
     out: List[Binding] = []
     seen = set()
     for i, item in enumerate(raw):
-        if not isinstance(item, dict) or set(item) - {"model", "key_alias", "ruleset", "version"}:
-            raise RulesetFileError(f"{BINDINGS_FILE}[{i}]: expected {{model, key_alias?, ruleset, version?}}")
+        where = f"{BINDINGS_FILE}[{i}]"
+        if not isinstance(item, dict) or set(item) - {"model", "key_alias", "ruleset", "version", "shadow"}:
+            raise RulesetFileError(f"{where}: expected {{model, key_alias?, ruleset, version?, shadow?}}")
         model, ruleset_id = item.get("model"), item.get("ruleset")
         key_alias = item.get("key_alias")
         if not isinstance(model, str) or not model or not isinstance(ruleset_id, str) or not ruleset_id:
-            raise RulesetFileError(f"{BINDINGS_FILE}[{i}]: model and ruleset are required strings")
+            raise RulesetFileError(f"{where}: model and ruleset are required strings")
         if key_alias is not None and (not isinstance(key_alias, str) or not key_alias):
-            raise RulesetFileError(f"{BINDINGS_FILE}[{i}]: key_alias is a non-empty string or null")
-        if ruleset_id not in versions:
-            raise RulesetFileError(f"{BINDINGS_FILE}[{i}]: no ruleset {ruleset_id!r} is baked in")
-        version = item.get("version")
-        if version is None:
-            version = max(versions[ruleset_id])
-        elif version not in versions[ruleset_id]:
-            raise RulesetFileError(f"{BINDINGS_FILE}[{i}]: {ruleset_id}@{version} is not baked in")
+            raise RulesetFileError(f"{where}: key_alias is a non-empty string or null")
+        version = _baked_version(where, versions, ruleset_id, item.get("version"))
+        if modes[(ruleset_id, version)] != "enforce":
+            raise RulesetFileError(
+                f"{where}: {ruleset_id}@{version} is mode {modes[(ruleset_id, version)]!r}; a binding's "
+                "primary ruleset must be `enforce` (a shadow primary sends every turn to local-private) "
+                "-- bind a shadow ruleset under `shadow:` instead")
+        raw_shadows = item.get("shadow")
+        if raw_shadows is None:
+            raw_shadows = []
+        if not isinstance(raw_shadows, list):
+            raise RulesetFileError(f"{where}.shadow: a list of ruleset ids or {{ruleset, version?}}")
+        shadows: List[Tuple[str, int]] = []
+        for j, slot in enumerate(raw_shadows):
+            slot_where = f"{where}.shadow[{j}]"
+            if isinstance(slot, str):
+                slot = {"ruleset": slot}
+            if not isinstance(slot, dict) or set(slot) - {"ruleset", "version"}:
+                raise RulesetFileError(f"{slot_where}: expected a ruleset id or {{ruleset, version?}}")
+            ref = (slot.get("ruleset"),
+                   _baked_version(slot_where, versions, slot.get("ruleset"), slot.get("version")))
+            if modes[ref] != "shadow":
+                raise RulesetFileError(f"{slot_where}: {ref[0]}@{ref[1]} is mode {modes[ref]!r}; "
+                                       "a shadow slot takes a `shadow` ruleset")
+            if ref in shadows:
+                raise RulesetFileError(f"{slot_where}: {ref[0]}@{ref[1]} is listed twice")
+            shadows.append(ref)
         if (model, key_alias) in seen:
-            raise RulesetFileError(f"{BINDINGS_FILE}[{i}]: {model} / {key_alias} is bound twice")
+            raise RulesetFileError(f"{where}: {model} / {key_alias} is bound twice")
         seen.add((model, key_alias))
-        out.append(Binding(model, key_alias, ruleset_id, int(version)))
+        out.append(Binding(model, key_alias, ruleset_id, version, tuple(shadows)))
     return out
 
 

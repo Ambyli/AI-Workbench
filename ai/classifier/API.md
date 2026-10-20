@@ -73,9 +73,21 @@ its log):
 The checked-in entries: **`muse-glimmer`** (the default — 3 images,
 `reasoning_strength: low`, budgets 8192 / 1024 / 2048 / 1024, 240 s, 6 in
 flight of its 8 sequences so 2 stay free for the LiteLLM chat chains, 60 000
-characters) and **`qwen2.5-vl`** (the `vllm-qwen-vl` service, the old manual
+characters), **`qwen2.5-vl`** (the `vllm-qwen-vl` service, the old manual
 fallback: 1 image so no references, no reasoning, budgets sized for its
-8192-token context). Check what a Muse request renders on the box:
+8192-token context), **`qwen3.5-4b`** (the CPU-only `qwen3.5-4b` llama.cpp
+service in [`ai/llama`](../llama/LLAMA.md#qwen35-4b--a-small-cpu-model-for-route-policy):
+text only, thinking off through `extra_body.chat_template_kwargs:
+{enable_thinking: false}`, a 512-token score budget = the server's
+`--n-predict`, 90 s, 2 in flight = its `--parallel 2`, 12 000 characters — the
+model route-policy's `llm_classifier` evaluator sends conversation transcripts
+to, one `text` document and one presence criterion per route; seconds per
+call, so not a document model) and **`qwen3.8-solo`** (the `qwen3.8-solo` vLLM
+service, order 1 of three LiteLLM chat chains: text only,
+`reasoning_effort: low`, budgets 8192 / 1024 / 2048 / 1024, 240 s, 60 000
+characters, and **1** in flight of its 3 sequences, because a queued
+classifier call makes the overflow hook spill chat off it — a benchmark
+candidate for the same evaluator). Check what a Muse request renders on the box:
 
 ```bash
 curl -s muse-glimmer:8000/tokenize -H 'content-type: application/json' \
@@ -2300,7 +2312,9 @@ curl http://localhost:4001/v1/classifier/models -H "Authorization: Bearer sk-123
      "text_char_budget": 60000,
      "max_tokens": {"score": 8192, "box": 1024, "select": 2048, "describe": 1024},
      "timeout_s": 240.0, "max_concurrent": 6, "in_flight": 0},
-    {"id": "qwen2.5-vl", "…": "…"}
+    {"id": "qwen2.5-vl", "…": "…"},
+    {"id": "qwen3.5-4b", "…": "…"},
+    {"id": "qwen3.8-solo", "…": "…"}
   ]
 }
 ```
@@ -2355,7 +2369,8 @@ curl http://localhost:4001/v1/classifier/criterion-types -H "Authorization: Bear
   "aggregate_detail": {"rule": "…", "level": "…", "from": "…", "values": "…"},
   "model": {"applies_to": "llm criteria, and cv criteria answered by the llm fallback",
             "precedence": "options.model, then the request's `model`, then the registry default",
-            "default": "muse-glimmer", "models": ["muse-glimmer", "qwen2.5-vl"],
+            "default": "muse-glimmer",
+            "models": ["muse-glimmer", "qwen2.5-vl", "qwen3.5-4b", "qwen3.8-solo"],
             "catalog": "GET /models", "identity": "…"},
   "detector_configured": true
 }

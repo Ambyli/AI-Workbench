@@ -1,0 +1,87 @@
+# The `default-llm` draft ruleset: `default` with its exchange cooldown
+# (`sticky-code`) replaced by a local model's reading of the conversation
+# (`topic-llm`). SHADOW mode: decided after every `auto` turn has been
+# answered (bindings.yaml binds it beside `default` under `shadow:`), logged
+# as a decisions row with shadow_of = the live decision, never applied.
+#
+# What it tests: does the classifier replace the cooldown, and catch what the
+# keyword rules miss? Compare it in Trino (`shadow_comparisons`) and with the
+# benchmark (ai/route-policy/bench) before anyone promotes it -- promotion is
+# a new `default` version that adds `topic-llm`, never a mode flip here
+# (ROUTE_POLICY.md § Promoting the classifier).
+#
+# The first four evaluators are `default`'s, in `default`'s order, with the
+# same pattern files -- so the two rulesets differ only in the last rule. A
+# pattern edit is new content for BOTH rulesets: bump both versions.
+#
+# `topic-llm` votes from the verdict the analysis queue stored for an
+# earlier prefix of this conversation (usually the previous user message's:
+# this message is classified only after this answer), at most 2 user
+# messages old. Its model, `qwen3.5-4b`, is the CPU llama.cpp service
+# (ai/llama), reached only through the document classifier's registry
+# (ai/classifier/models.yaml); the analysis queue refuses any model that is
+# not local (ROUTE_POLICY.md § The llm_classifier).
+#
+# CHANGING IT: versions are immutable -- edit, then bump `version`.
+id: default-llm
+version: 1
+description: >-
+  Draft: `default` with the 3-exchange code cooldown replaced by a local
+  model's verdict on the conversation (qwen3.5-4b through the document
+  classifier, applied from the next turn on) -- shadow mode, compared against
+  `default` before promotion.
+mode: shadow
+routes: [local-general, local-code, local-reasoning, local-private]
+default_route: local-general
+evaluators:
+  - id: privacy
+    type: regex_text
+    role: force
+    description: PII keywords in the latest user message.
+    config:
+      patterns_ref: patterns/privacy.yaml
+    vote: {route: local-private}
+
+  - id: code-text
+    type: regex_text
+    description: Code keywords, file names or a code fence in the latest user message.
+    config:
+      patterns_ref: patterns/code.yaml
+    vote: {route: local-code}
+
+  - id: reasoning-text
+    type: regex_text
+    description: Math / science / multi-step keywords in the latest user message.
+    config:
+      patterns_ref: patterns/reasoning.yaml
+    vote: {route: local-reasoning}
+
+  - id: code-tools
+    type: tool_calls
+    description: A sandbox / Open Terminal tool was called in this exchange.
+    config:
+      pattern: 'sandbox-mcp_.+|run_command|get_process_status|send_process_input|kill_process|replace_file_content|read_user_terminal|send_user_terminal_input'
+      scope: current_exchange
+    vote: {route: local-code}
+
+  # Last, after every keyword and tool rule: it decides only a turn none of
+  # them claimed (the turns `default` sends to sticky-code or local-general).
+  # Its criteria are /assess `llm` criteria with hint: presence -- each is
+  # scored 1-10, the best at or above min_score wins (ties: listed order),
+  # none -> `otherwise`.
+  - id: topic-llm
+    type: llm_classifier
+    description: A local model's verdict on the conversation (the previous message's, usually).
+    config:
+      model: qwen3.5-4b
+      criteria:
+        local-code: "The latest user request in this conversation is about writing, running, debugging or changing code or software."
+        local-reasoning: "The latest user request needs careful multi-step reasoning such as maths, logic, planning or analysis."
+        local-private: "The conversation contains personal data about a real person, such as a name with an address, phone number, email or account number."
+      otherwise: local-general
+      min_score: 7
+      history: {exchanges: 4, max_chars: 6000}
+      max_age_exchanges: 2
+    vote: {weight: 1.0}
+
+combiner: {type: priority}

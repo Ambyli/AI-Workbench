@@ -12,15 +12,16 @@ docker compose -f ai/llama/docker-compose.llama.yml up -d
 make up llama
 ```
 
-This launches three containers by default:
+This launches four containers by default:
 
 | Container | Port | Model | Quant | Weights |
 |---|---|---|---|---|
 | `glm5.2` | `localhost:8010` | Z.ai GLM-5.2 (~753B-A40B MoE) | UD-IQ1_S (~176 GB) | `unsloth/GLM-5.2-GGUF` |
 | `qwen3.8-flash` | `localhost:8017` | Qwen3.8-Flash-Next | UD-Q4_K_XL + MTP `shared-Q8_0` draft head | `unsloth/Qwen3.8-Flash-Next-GGUF` |
 | `glm5.3-flash` | `localhost:8020` | Z.ai GLM-5.3-Flash (321B-A18B MoE) — **CPU + RAM only, no GPU** | UD-Q3_K_XL (~148 GB) + embedded MTP head | `unsloth/GLM-5.3-Flash-GGUF` |
+| `qwen3.5-4b` | `localhost:8028` | Qwen3.5-4B — **CPU only**, route-policy's classifier model, not in LiteLLM | Q4_K_M (2.74 GB) | `unsloth/Qwen3.5-4B-GGUF` |
 
-`glm5.2` runs the stock `ghcr.io/ggml-org/llama.cpp:server-cuda` image. `qwen3.8-flash` and `glm5.3-flash` build local images from Unsloth's llama.cpp prebuilds ([`Dockerfile.llama-unsloth`](Dockerfile.llama-unsloth)): the first because MTP speculative decoding for Qwen3.8-Flash-Next is not in mainline llama.cpp yet — see [MTP speculative decoding](#qwen38-flash-mtp-speculative-decoding) below — the second because the GLM-5.3-Flash architecture itself is not merged upstream, and it uses the GPU-free `cpu` tarball flavour — see [`glm5.3-flash` — GLM-5.3-Flash on CPU and RAM only](#glm53-flash--glm-53-flash-on-cpu-and-ram-only). `make up llama` / `docker compose up -d` build both on first run.
+`glm5.2` runs the stock `ghcr.io/ggml-org/llama.cpp:server-cuda` image. `qwen3.8-flash` and `glm5.3-flash` build local images from Unsloth's llama.cpp prebuilds ([`Dockerfile.llama-unsloth`](Dockerfile.llama-unsloth)): the first because MTP speculative decoding for Qwen3.8-Flash-Next is not in mainline llama.cpp yet — see [MTP speculative decoding](#qwen38-flash-mtp-speculative-decoding) below — the second because the GLM-5.3-Flash architecture itself is not merged upstream, and it uses the GPU-free `cpu` tarball flavour — see [`glm5.3-flash` — GLM-5.3-Flash on CPU and RAM only](#glm53-flash--glm-53-flash-on-cpu-and-ram-only). `qwen3.5-4b` reuses `glm5.3-flash`'s `cpu` image — see [`qwen3.5-4b` — a small CPU model for route-policy](#qwen35-4b--a-small-cpu-model-for-route-policy). `make up llama` / `docker compose up -d` build both images on first run.
 
 Test with:
 
@@ -198,6 +199,84 @@ Deliberately **not** set: `-ngl` (the build has no GPU backend), `--cache-type-k
 
 **What to expect.** Decode speed is set almost entirely by memory bandwidth: a dual-socket server with 8–12 DDR4/DDR5 channels lands in the high single digits to low teens tok/s before MTP; a desktop with two or four channels is 2–4 tok/s. The `--reasoning-budget` cap and `low` effort are what keep that usable for agentic loops.
 
+### `qwen3.5-4b` — a small CPU model for route-policy
+
+`qwen3.5-4b` serves Qwen3.5-4B on the CPU for one job: route-policy's `llm_classifier` evaluator ([ROUTE_POLICY.md](../route-policy/ROUTE_POLICY.md)), which asks, per `auto` conversation, whether the latest request is about code, needs reasoning, or carries personal data. Route-policy never calls this server itself. It renders the conversation (`common.conversation.render_transcript`) and submits it to the document classifier's `POST /assess` as one `text` document with one `llm` presence criterion per route and `model: qwen3.5-4b`; the classifier's registry entry ([`ai/classifier/models.yaml`](../classifier/models.yaml), [API.md § Models](../classifier/API.md#models)) is what calls `http://qwen3.5-4b:8000`. The service is **not in LiteLLM** — no alias, no chain, no fallback — so no chat ever lands on it.
+
+**Why a small CPU model.** The verdict is computed in the background and only counts from the next turn, so latency matters less than not taking a GPU sequence from chat: the GPU models' sequences are spoken for — `qwen3.8-solo`'s 3 serve chat, and of `muse-glimmer`'s 8 the classifier's document jobs take 6 and chat the other 2. Qwen3.5-4B is a hybrid model (24 Gated DeltaNet layers with a fixed-size recurrent state, 8 gated-attention layers), so its KV cache is small and a CPU handles it at seconds per call. Whether it is good enough is what the benchmark in `ai/route-policy/bench/` measures, against `muse-glimmer` and `qwen3.8-solo` (both also registry entries).
+
+**Image and RAM.** Same `build:` block and image as `glm5.3-flash` (`llama-unsloth:${LLAMA_UNSLOTH_CPU_TAG}-cpu`): the Qwen3.5 architecture is in mainline llama.cpp, and the Unsloth `cpu` build is mainline plus extras, already running on the box. One image for both CPU services, so a `LLAMA_UNSLOTH_CPU_TAG` bump rebuilds and recreates both. The Q4_K_M weights are 2.74 GB; with two 16k slots of KV the process stays at a few GB (`docker stats qwen3.5-4b` is the real number). There is **no mlock**: a 2.7 GB file read on every token stays hot in the page cache, and an eviction while idle costs a second or two of re-reading on the next call, not the per-token stalls `glm5.3-flash`'s 148 GB would see — so neither `--load-mode mmap+mlock` nor the memlock ulimit. The repo also ships a vision projector (`mmproj-*.gguf`, ~670 MB) that `-hf` would download and load; `--no-mmproj` skips it, since the classifier entry is text-only.
+
+**Threads.** `-t 8` (`LLAMA_QWEN35_4B_THREADS`): a 4B model's decode stops scaling well before the core count, and the box's CPU is shared with `glm5.3-flash`, which takes every physical core by default. To keep the two apart, give each its own cores — on BOTH sides, since a range on one only still lets the other's threads run there. Pick the ranges from `lscpu -e` (physical cores, one socket where possible):
+
+```bash
+# .env
+LLAMA_QWEN35_4B_EXTRA_ARGS=--cpu-range 0-7
+LLAMA_GLM53_FLASH_EXTRA_ARGS=--cpu-range 8-47 -t 40
+```
+
+**Thinking off.** Qwen3.5 thinks by default; its chat template reads `enable_thinking`. A classifier call wants the JSON answer, not minutes of CPU reasoning, so the server default is `--chat-template-kwargs '{"enable_thinking":false}'`, and the registry entry also sends `chat_template_kwargs: {enable_thinking: false}` in its `extra_body` (the classifier's `reasoning.value` is a string, so a boolean switch rides there). A request that sends `enable_thinking: true` still turns it on.
+
+**Sampling.** The classifier sends no sampling of its own — the server applies the model's published sampling, as for every registry model — so these server defaults are what every scoring call gets: the model card's **instruct (non-thinking)** preset, without its presence penalty.
+
+| Flag | Value | Why |
+|---|---|---|
+| `--temp` | `0.7` | Model card, instruct mode |
+| `--top-p` | `0.8` | Model card, instruct mode |
+| `--top-k` | `20` | Model card |
+| `--min-p` | `0.0` | Model card |
+| `--presence-penalty` | `0.0` | The card says `1.5`. A presence penalty lowers every token already in the answer, and a ~100-token JSON answer is mostly repetition by design: the scaffold's quotes, colons and keys, and the digits of `score` again in `confidence`. It guards long free text against loops, which `--n-predict 512` caps here anyway; the card's own precise-coding preset sets it to 0 too. |
+
+If the benchmark shows the same transcript scoring differently run to run, lower `--temp` here rather than adding sampling to the registry entry.
+
+**Context and output.** `-c 32768 --parallel 2` = two 16k slots, one per classifier request in flight. A scoring prompt is the transcript plus ~600 tokens of rubric, and `--n-predict 512` caps the answer. The classifier entry mirrors it — change them together, then `make up llama qwen3.5-4b` and `docker restart classifier`:
+
+| Setting | Where | Value |
+|---|---|---|
+| Context per slot | llama-server (`-c` / `--parallel`) | 16,384 |
+| `--n-predict` | llama-server | 512 |
+| `max_tokens.score` | `ai/classifier/models.yaml` → `qwen3.5-4b` | 512 |
+| `max_concurrent` | same entry | 2 (= `--parallel`) |
+| `text_char_budget` | same entry | 12,000 characters (~3–4k tokens); route-policy's `history.max_chars` must not exceed it |
+| `timeout_s` | same entry | 90 |
+
+The classifier sends every criterion of a job with the same transcript first in the prompt (`ai/classifier/llm/prompts.py` orders it for prefix caching), so with `llama-server`'s slot prompt cache the second and third criterion should only process the rubric. Qwen3.5's recurrent layers make that reuse depend on llama.cpp's context checkpoints; check on the box whether follow-up criteria show a short prompt time (`prompt eval time` in the log, or `timings.prompt_n` in a response).
+
+**Verify on the box.**
+
+```bash
+make up llama qwen3.5-4b
+make logs llama qwen3.5-4b                 # the 2.7 GB download, then "server is listening"
+curl -s http://localhost:8028/health       # {"status":"ok"}
+curl -s http://localhost:8028/v1/chat/completions -H 'content-type: application/json' -d '{
+  "model": "qwen3.5-4b",
+  "messages": [{"role": "user", "content": "Is this request about code? \"my python script crashes with KeyError\". Answer as JSON: {\"score\": 1-10, \"reason\": \"...\"}"}],
+  "response_format": {"type": "json_object"},
+  "chat_template_kwargs": {"enable_thinking": false},
+  "max_tokens": 128}' | jq '.choices[0].message, .usage, .timings'
+```
+
+`message.content` must be the JSON alone, with no `<think>` block and no `reasoning_content`, in a few dozen completion tokens. Watch `docker stats qwen3.5-4b` during a request for its CPU use. Then the classifier side — `docker restart classifier`, `GET /models` must list `qwen3.5-4b` with `available: true`, and a hand-made job must complete with a score:
+
+```bash
+curl -s http://localhost:8005/models | jq '.models[] | select(.id == "qwen3.5-4b") | {available, endpoint}'
+curl -s http://localhost:8005/assess -H 'content-type: application/json' -d '{
+  "documents": [{"type": "text", "data": "User: my python script crashes with KeyError, can you fix it?", "filename": "transcript.txt"}],
+  "model": "qwen3.5-4b",
+  "criteria": [{"name": "The latest user request is about writing, running, debugging or changing code.",
+                "type": "llm", "options": {"hint": "presence", "ocr": "never"}}]}'
+# -> {"job_id": "..."}: poll GET /jobs/<id> until it is done, read the score, then DELETE /jobs/<id>
+```
+
+**Quant swap.** `LLAMA_QWEN35_4B_QUANT` is the tag after the colon on `unsloth/Qwen3.5-4B-GGUF`. K-quants only on CPU (the `IQ*` files are slower there, as for `glm5.3-flash`): `Q4_K_M` 2.74 GB _(default)_, `Q5_K_M` 3.14 GB, `Q6_K` 3.53 GB, `Q8_0` 4.48 GB. Edit `.env`, then `make up llama qwen3.5-4b`; the new file downloads into `llama_data` beside the old one. A bigger quant is slower per token, so re-check the entry's `timeout_s` against `classifier_llm_call_seconds{model="qwen3.5-4b"}`.
+
+| Key | Default | Notes |
+|---|---|---|
+| `PORT_LLAMA_QWEN35_4B` | `8028` | Host port (container 8000), in the PORT REGISTRY. In-network callers use `http://qwen3.5-4b:8000`. |
+| `LLAMA_QWEN35_4B_QUANT` | `Q4_K_M` | Quant tag — see above. |
+| `LLAMA_QWEN35_4B_THREADS` | `8` | `-t`. |
+| `LLAMA_QWEN35_4B_EXTRA_ARGS` | _(empty)_ | Extra llama-server args appended verbatim (`--cpu-range 0-7`, …). |
+
 ### First-run download
 
 All services use llama-server's `-hf` flag (and, for `qwen3.8-flash`, `-hfd` + `-md` for the MTP head) to download GGUFs from HuggingFace on first start. The weights land in the `llama_data` named volume, mounted at `/root/.cache/huggingface` — llama-server keeps a HuggingFace-hub-style cache at `~/.cache/huggingface/hub` (override with `LLAMA_CACHE` or `HF_HUB_CACHE`) — so subsequent starts are instant. Expect the first launch to take a while — UD-IQ1_S is ~176 GB across split GGUF files. Follow progress with:
@@ -293,6 +372,8 @@ All services share the `llama_data` volume, so downloads for one don't affect th
 
 `glm5.2`, `qwen3.8-flash` and `glm5.3-flash` are pre-registered in [`ai/litellm/litellm_config.yaml`](../litellm/litellm_config.yaml) under `model_list`, and all three have `fallbacks` and `context_window_fallbacks` entries to `claude-sonnet-5`. Container-name DNS works because LiteLLM and every llama-server sit on `ai_shared`, so the `api_base` values (`http://glm5.2:8000/v1`, `http://qwen3.8-flash:8000/v1`, `http://glm5.3-flash:8000/v1`) resolve inside the network.
 
+`qwen3.5-4b` is deliberately **not** registered: its only caller is the document classifier's model registry ([`qwen3.5-4b` — a small CPU model for route-policy](#qwen35-4b--a-small-cpu-model-for-route-policy)), and a LiteLLM alias would put it one `fallbacks` line away from a chat path it was never sized for.
+
 Clients hit LiteLLM the same way they hit any other model:
 
 ```bash
@@ -313,7 +394,7 @@ curl http://localhost:4001/v1/chat/completions \
 ### Non-obvious constraints
 
 - **`ghcr.io/ggml-org/llama.cpp:server-cuda` is a moving tag.** Upstream ships fast and occasionally changes CLI flag names (`--n-cpu-moe` is relatively new — added mid-2026). If you upgrade and see `unrecognized argument`, pin to a specific dated tag from https://github.com/ggml-org/llama.cpp/pkgs/container/llama.cpp.
-- **`qwen3.8-flash` and `glm5.3-flash` are pinned, `glm5.2` is not.** The Unsloth prebuilds are pinned by `LLAMA_UNSLOTH_TAG` (`b10796`, CUDA) and `LLAMA_UNSLOTH_CPU_TAG` (`b10840`, CPU) respectively; each is a full llama.cpp (upstream + patches), so every flag the stock image accepts works there too. The three images can drift apart in flag names independently — check the pinned release when a flag rename appears upstream. The two pins are deliberately separate so bumping one never rebuilds the other.
+- **`qwen3.8-flash`, `glm5.3-flash` and `qwen3.5-4b` are pinned, `glm5.2` is not.** The Unsloth prebuilds are pinned by `LLAMA_UNSLOTH_TAG` (`b10796`, CUDA) and `LLAMA_UNSLOTH_CPU_TAG` (`b10840`, CPU — shared by the two CPU services, which run one image) respectively; each is a full llama.cpp (upstream + patches), so every flag the stock image accepts works there too. The three images can drift apart in flag names independently — check the pinned release when a flag rename appears upstream. The two pins are deliberately separate so bumping one never rebuilds the other; a CPU bump rebuilds and recreates both CPU services.
 - **`glm5.3-flash` needs an unlimited `memlock` ulimit.** `--load-mode mmap+mlock` pins ~150 GB; Docker's default memlock limit is 64 KB, so the compose service sets `ulimits.memlock` to `-1`. If you copy the block for another CPU model, keep it — without it the log shows `failed to mlock` and the weights silently become evictable.
 - **`IQ*` quants are a CPU trap.** They are the smallest files, but the codebook dequant has no fast CPU matmul path — on the CPU-only service a `UD-IQ3_XXS` (120 GB) decodes slower than `UD-Q3_K_XL` (148 GB). Stick to `Q*_K_*` there.
 - **`llama_data` must stay mounted at `/root/.cache/huggingface`.** llama-server writes `-hf` / `-hfd` downloads to `~/.cache/huggingface/hub/models--<owner>--<repo>/` (same layout as the `huggingface_hub` Python library). Mounting the volume anywhere else means a full re-download on every `--force-recreate`.
@@ -339,4 +420,4 @@ curl http://localhost:4001/v1/chat/completions \
 
 ### No tests
 
-There is no automated test suite. Verify by hitting `/v1/chat/completions` after `make up llama glm5.2` and confirming a coherent response. `curl http://localhost:8010/health` should return `{"status":"ok"}` once the model has finished loading. For `glm5.3-flash` use port 8020 and expect the first `/health` OK to take a good while after the download — the mlock pass touches every page of the file before the server starts answering.
+There is no automated test suite. Verify by hitting `/v1/chat/completions` after `make up llama glm5.2` and confirming a coherent response. `curl http://localhost:8010/health` should return `{"status":"ok"}` once the model has finished loading. For `glm5.3-flash` use port 8020 and expect the first `/health` OK to take a good while after the download — the mlock pass touches every page of the file before the server starts answering. For `qwen3.5-4b` use port 8028 and follow [its own checklist](#qwen35-4b--a-small-cpu-model-for-route-policy): thinking must be off, and the classifier must list it as available.

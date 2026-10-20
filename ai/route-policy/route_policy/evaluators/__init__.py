@@ -7,9 +7,10 @@
     cooldown.py      a vote that holds for N exchanges after the last relevant one
     backend_load.py  a vote from the overflow layer's backend snapshot
     static.py        a fixed vote, for tests and overrides
+    llm_classifier.py  the verdict a local model gave the conversation, classified in the
+                     background through the document classifier (route_policy.analysis)
 
-Not built yet: llm_classifier (phase 4); context_size (ROUTE_POLICY_PLAN
-§ 4, unscheduled).
+Not built: context_size (ROUTE_POLICY_PLAN § 4, unscheduled).
 """
 
 from .base import (

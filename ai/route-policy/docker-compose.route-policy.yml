@@ -1,19 +1,25 @@
 # Route policy -- rulesets of evaluators pick the LiteLLM chain alias for each
-# `auto` turn, and every decision is logged. Phase 3 of ROUTE_POLICY_PLAN:
-# the `default` ruleset ENFORCES -- LiteLLM's pre-call hook
+# `auto` turn, and every decision is logged. The `default` ruleset ENFORCES
+# (phase 3 of ROUTE_POLICY_PLAN) -- LiteLLM's pre-call hook
 # (ai/litellm/hooks/routing/) awaits /decide on every `auto` request (within
 # ROUTE_POLICY_DECIDE_TIMEOUT_S, 0.25 s) and serves the returned chain in the
 # same pass; a timeout, an error or `apply: false` sends the turn to
 # local-private. /observe is still fired after the call, not awaited.
+# Phase 4: after each answer, the `default-llm` draft is decided beside it in
+# SHADOW mode, and its llm_classifier has the conversation classified in the
+# background through the document classifier's POST /assess
+# (http://classifier:8000 on ai_shared -> the `qwen3.5-4b` CPU model).
 # Operator guide: ai/route-policy/ROUTE_POLICY.md.
 #
 #   route-policy      FastAPI on :8000 (ai_shared). LiteLLM reaches it as
 #                     http://route-policy:8000; LAN clients through ai/edge on
 #                     PORT_ROUTE_POLICY, or LiteLLM's /v1/route-policy
 #                     pass-through. No auth of its own, like the classifier.
-#   route-policy-db   Postgres 17: rulesets, bindings, decisions,
-#                     evaluations, outcomes. Trino reads it as the
-#                     postgres_route_policy catalog (read-only trino_reader).
+#   route-policy-db   Postgres 17: rulesets, bindings (+ shadow slots),
+#                     decisions (primary and shadow), evaluations, outcomes,
+#                     analyses (the classifier's verdicts -- never the text).
+#                     Trino reads it as the postgres_route_policy catalog
+#                     (read-only trino_reader).
 
 networks:
   shared:
@@ -76,6 +82,12 @@ services:
   # exits with the reason in its log and the old copy keeps serving.
   # Every `auto` turn waits on this service: while no copy answers (no
   # healthy copy at all, not a swap), `auto` is served by local-private.
+  #
+  # It does NOT need the classifier (a different compose project, so no
+  # depends_on): a classifier that is down only makes background
+  # classifications fail (analyses.status = unavailable), never a /decide.
+  # During a swap both copies may classify; the analyses table's primary key
+  # (one verdict per conversation prefix) keeps that harmless.
   route-policy:
     build:
       context: ../..
@@ -83,7 +95,10 @@ services:
     labels:
       com.zeo.deploy: swap
     restart: unless-stopped
-    # Every request is a few milliseconds; 30 s drains anything in flight.
+    # Every request is a few milliseconds. Shutdown waits up to 5 s
+    # (WRITES_DRAIN_S) for background writes and up to 5 s more for running
+    # classifications, each of which then deletes its classifier job (5 s
+    # cap per request): 30 s covers it.
     stop_grace_period: 30s
     networks:
       - shared
@@ -111,6 +126,19 @@ services:
       # anyway; the write then finishes in the background. LiteLLM waits
       # 0.25 s for the whole /decide, so keep this well below that.
       - ROUTE_POLICY_DECISION_WRITE_BUDGET_S=${ROUTE_POLICY_DECISION_WRITE_BUDGET_S:-0.05}
+      # The llm_classifier's background classifications (phase 4), never on
+      # the /decide path: the document classifier by Docker DNS (no auth,
+      # like this service), one /assess job per conversation prefix, polled
+      # every CLASSIFY_POLL_S, given up (cancelled + deleted) after
+      # CLASSIFY_TIMEOUT_S; at most ANALYSIS_CONCURRENCY jobs open at once,
+      # at most ANALYSIS_QUEUE_MAX requests waiting (the rest dropped and
+      # counted). Only a LOCAL model is ever sent a conversation: the queue
+      # checks the model's GET /models entry and resolves its host first.
+      - ROUTE_POLICY_CLASSIFIER_URL=${ROUTE_POLICY_CLASSIFIER_URL:-http://classifier:8000}
+      - ROUTE_POLICY_CLASSIFY_TIMEOUT_S=${ROUTE_POLICY_CLASSIFY_TIMEOUT_S:-180}
+      - ROUTE_POLICY_CLASSIFY_POLL_S=${ROUTE_POLICY_CLASSIFY_POLL_S:-1}
+      - ROUTE_POLICY_ANALYSIS_QUEUE_MAX=${ROUTE_POLICY_ANALYSIS_QUEUE_MAX:-64}
+      - ROUTE_POLICY_ANALYSIS_CONCURRENCY=${ROUTE_POLICY_ANALYSIS_CONCURRENCY:-2}
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 10s

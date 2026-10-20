@@ -10,17 +10,25 @@ serving):
 1. open the Postgres pool on route-policy-db (``db.pool.Database``);
 2. apply pending migrations (``db.migrations.migrate``);
 3. read and validate the baked-in rulesets and seed them, idempotently, with
-   their bindings (``rulesets.store.seed_and_load``) -- a changed ruleset
-   that kept its version number fails here;
-4. hang the ``Service`` (ruleset cache + database) on ``app.state``.
+   their bindings and shadow slots (``rulesets.store.seed_and_load``) -- a
+   changed ruleset that kept its version number, a shadow ruleset bound as a
+   primary or an enforce one in a shadow slot, fails here;
+4. start the analysis queue (``analysis.queue.AnalysisQueue``: the
+   llm_classifier's background classifications through the document
+   classifier, ROUTE_POLICY_CLASSIFIER_URL) -- unless that URL is empty;
+5. hang the ``Service`` (ruleset cache + database + queue) on ``app.state``.
 
-Shutdown first drains the background writes (``Service.drain``: decision /
-outcome writes that outlasted ROUTE_POLICY_DECISION_WRITE_BUDGET_S get up to
-WRITES_DRAIN_S, then are cancelled), then closes the pool. There are no other
-background workers (the llm_classifier's analysis queue is phase 4).
+Shutdown drains the background tasks (``Service.drain``: decision / outcome
+writes that outlasted ROUTE_POLICY_DECISION_WRITE_BUDGET_S and /decide's
+after-the-answer work get up to WRITES_DRAIN_S, then are cancelled), stops
+the analysis queue (waiting classifications are dropped, running ones get
+WRITES_DRAIN_S and then are cancelled -- each still deletes its classifier
+job), then closes the pool.
 
 A test can pass its own ``service`` -- e.g. a ruleset cache filled from the
-files with no database -- and the lifespan then touches nothing.
+files with no database -- and the lifespan then touches nothing; or its own
+``analysis_client`` (a ``ClassifierClient`` on a fake transport) for the
+queue the lifespan starts.
 """
 
 from __future__ import annotations
@@ -34,6 +42,8 @@ from fastapi import FastAPI
 from prometheus_fastapi_instrumentator import Instrumentator
 
 from . import config
+from .analysis.classifier_client import ClassifierClient
+from .analysis.queue import AnalysisQueue
 from .api import chats, decide, evaluate, evaluator_types, health, observe, rulesets
 from .db.migrations import migrate
 from .db.pool import Database
@@ -52,8 +62,24 @@ def configure_logging() -> None:
     logging.getLogger("route_policy").setLevel(getattr(logging, config.LOG_LEVEL, logging.INFO))
 
 
-async def start_service(database: Database, rulesets_dir: pathlib.Path) -> Service:
-    """Steps 1-3 of startup; returns the ready Service."""
+def build_analysis_queue(database: Database, client: Optional[ClassifierClient]) -> Optional[AnalysisQueue]:
+    """The analysis queue on ``client`` (default: one for
+    ROUTE_POLICY_CLASSIFIER_URL), or None when there is no client and the URL
+    is empty. Not started."""
+    if client is None:
+        if not config.CLASSIFIER_URL:
+            logger.warning("startup: ROUTE_POLICY_CLASSIFIER_URL is empty -- no analysis queue; every "
+                           "llm_classifier evaluator will abstain")
+            return None
+        client = ClassifierClient(config.CLASSIFIER_URL, timeout_s=config.CLASSIFY_TIMEOUT_S,
+                                  poll_s=config.CLASSIFY_POLL_S, models_ttl_s=config.CLASSIFIER_MODELS_TTL_S)
+    return AnalysisQueue(database, client, maxsize=config.ANALYSIS_QUEUE_MAX,
+                         concurrency=config.ANALYSIS_CONCURRENCY, drain_s=config.WRITES_DRAIN_S)
+
+
+async def start_service(database: Database, rulesets_dir: pathlib.Path,
+                        analysis_client: Optional[ClassifierClient] = None) -> Service:
+    """Steps 1-4 of startup; returns the ready Service."""
     await database.init()
     async with database.acquire() as conn:
         await migrate(conn)
@@ -62,19 +88,28 @@ async def start_service(database: Database, rulesets_dir: pathlib.Path) -> Servi
     logger.info("startup: %d ruleset version(s) loaded (%s); bindings: %s",
                 len(seed.compiled), ", ".join(f"{r.id}@{r.version} {r.mode}" for r in seed.compiled),
                 ", ".join(f"{b.scope_model}{'/' + b.scope_key_alias if b.scope_key_alias else ''}"
-                          f" -> {b.ruleset_id}@{b.version}" for b in store.bindings) or "none")
-    return Service(store=store, database=database, rulesets_dir=rulesets_dir)
+                          f" -> {b.ruleset_id}@{b.version}"
+                          + (f" (shadow: {', '.join(f'{rid}@{v}' for rid, v in b.shadows)})" if b.shadows else "")
+                          for b in store.bindings) or "none")
+    queue = build_analysis_queue(database, analysis_client)
+    if queue is not None:
+        queue.start()
+    return Service(store=store, database=database, rulesets_dir=rulesets_dir, analysis_queue=queue)
 
 
 def create_app(*, service: Optional[Service] = None, database: Optional[Database] = None,
-               rulesets_dir: Optional[pathlib.Path] = None, instrument: bool = True) -> FastAPI:
+               rulesets_dir: Optional[pathlib.Path] = None, instrument: bool = True,
+               analysis_client: Optional[ClassifierClient] = None) -> FastAPI:
     """Build the app.
 
     Args:
-        service:      a ready Service -- the lifespan then does nothing.
-        database:     the database to start against (default: config.DB_DSN).
-        rulesets_dir: the rulesets to seed (default: the baked-in directory).
-        instrument:   mount prometheus-fastapi-instrumentator's HTTP metrics + /metrics.
+        service:         a ready Service -- the lifespan then does nothing
+                         but drain it at shutdown.
+        database:        the database to start against (default: config.DB_DSN).
+        rulesets_dir:    the rulesets to seed (default: the baked-in directory).
+        instrument:      mount prometheus-fastapi-instrumentator's HTTP metrics + /metrics.
+        analysis_client: the ClassifierClient the analysis queue uses
+                         (default: one for ROUTE_POLICY_CLASSIFIER_URL).
     """
     directory = rulesets_dir or config.RULESETS_DIR
 
@@ -89,7 +124,7 @@ def create_app(*, service: Optional[Service] = None, database: Optional[Database
             return
         db = database or Database(config.DB_DSN, max_size=config.DB_POOL_MAX)
         try:
-            app.state.service = await start_service(db, directory)
+            app.state.service = await start_service(db, directory, analysis_client)
         except BaseException:
             await db.close()
             raise

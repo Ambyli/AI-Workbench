@@ -10,14 +10,23 @@ together during a swap cannot race:
    have the same content hash, or startup fails (``SeedConflict``) --
    versions are immutable;
 2. each seed binding is pointed at its version (``auto`` -> ``default`` @ the
-   highest version baked in);
+   highest version baked in), and its shadow slots are replaced by the
+   file's (``auto`` shadowed by ``default-llm``);
 3. the ``active_from`` / ``active_to`` marks are refreshed.
 
 **The cache** (``RulesetStore``): compiled rulesets by (id, version) --
 immutable, so cached for the life of the process -- and a snapshot of the
-bindings, re-read when older than ROUTE_POLICY_BINDING_REFRESH_S. A copy
-that cannot reach the database keeps deciding from its last snapshot; a
-version this copy has not compiled is fetched and compiled on first use.
+bindings (with their shadow slots), re-read when older than
+ROUTE_POLICY_BINDING_REFRESH_S. A copy that cannot reach the database keeps
+deciding from its last snapshot; a version this copy has not compiled is
+fetched and compiled on first use.
+
+``resolve`` returns a :class:`Resolved`: the PRIMARY ruleset, compiled, and
+the binding's shadow slots as (id, version) refs only. The shadows are
+loaded by :meth:`RulesetStore.shadow_rulesets` in /decide's background task,
+never on the request path; one that cannot be loaded is skipped and counted
+(``route_policy_errors_total{kind="shadow_load"}``) and never affects the
+primary.
 
 **Bounded on the /decide path.** With ``read_budget_s`` set (the app passes
 config.DB_READ_BUDGET_S), ``resolve`` never waits on the database for longer:
@@ -37,6 +46,7 @@ import asyncio
 import logging
 import pathlib
 import time
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .. import metrics
@@ -46,6 +56,20 @@ from .model import CompiledRuleset
 from .validate import RulesetInvalid, compile_ruleset
 
 logger = logging.getLogger("route_policy.rulesets")
+
+
+@dataclass(frozen=True)
+class Resolved:
+    """What a binding resolves to: the ruleset that decides, and the shadow
+    slots decided beside it after the answer."""
+
+    primary: CompiledRuleset
+    shadows: Tuple[Tuple[str, int], ...] = ()
+
+
+def _binding(row: Dict[str, Any]) -> Binding:
+    shadows = tuple((s["ruleset_id"], int(s["version"])) for s in (row.get("shadows") or []))
+    return Binding(row["scope_model"], row["scope_key_alias"], row["ruleset_id"], row["version"], shadows)
 
 
 def _retrieve(task: "asyncio.Task[Any]") -> None:
@@ -99,8 +123,7 @@ class RulesetStore:
             logger.warning("rulesets: binding refresh failed, keeping the last snapshot: %r", exc)
             self._bindings_at = self._clock()  # do not retry on every request
             return False
-        self.set_bindings([Binding(r["scope_model"], r["scope_key_alias"], r["ruleset_id"], r["version"])
-                           for r in rows])
+        self.set_bindings([_binding(r) for r in rows])
         return True
 
     # -- lookups ----------------------------------------------------------------
@@ -117,17 +140,37 @@ class RulesetStore:
                 any_key = b
         return exact or any_key
 
-    async def resolve(self, model: str, key_alias: Optional[str]) -> Optional[CompiledRuleset]:
-        """The ruleset bound to (model, key alias), or None when nothing is
-        bound -- or, with a read budget, when the bound version is not cached
-        and the database did not hand it over in time."""
+    async def resolve(self, model: str, key_alias: Optional[str]) -> Optional[Resolved]:
+        """The ruleset bound to (model, key alias) with its shadow slots, or
+        None when nothing is bound -- or, with a read budget, when the bound
+        version is not cached and the database did not hand it over in
+        time. Shadows are NOT loaded here (``shadow_rulesets``)."""
         stale = self._bindings_at is None or self._clock() - self._bindings_at >= self.refresh_s
         if stale and self.database is not None:
             await self._refresh_within_budget()
         binding = self.binding_for(model, key_alias)
         if binding is None:
             return None
-        return await self.get(binding.ruleset_id, binding.version, budget_s=self.read_budget_s)
+        primary = await self.get(binding.ruleset_id, binding.version, budget_s=self.read_budget_s)
+        if primary is None:
+            return None
+        return Resolved(primary, binding.shadows)
+
+    async def shadow_rulesets(self, resolved: Resolved) -> List[CompiledRuleset]:
+        """The shadow slots, compiled, in order -- each from the cache or,
+        within the read budget, the database. One that cannot be loaded (not
+        stored, not compilable by this copy, not handed over in time) is
+        skipped and counted; the rest still run."""
+        out: List[CompiledRuleset] = []
+        for ruleset_id, version in resolved.shadows:
+            compiled = await self.get(ruleset_id, version, budget_s=self.read_budget_s)
+            if compiled is None:
+                metrics.errors_total.labels("shadow_load").inc()
+                logger.warning("rulesets: shadow %s@%d of %s@%d cannot be loaded by this copy right now; "
+                               "skipped", ruleset_id, version, resolved.primary.id, resolved.primary.version)
+                continue
+            out.append(compiled)
+        return out
 
     async def _refresh_within_budget(self) -> None:
         if self.read_budget_s is None:
@@ -225,10 +268,13 @@ async def seed_and_load(store: RulesetStore, database, rulesets_dir: pathlib.Pat
             await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", rulesets_repo.SEED_LOCK)
             results = await rulesets_repo.seed(conn, seed.rulesets)
             for b in seed.bindings:
+                scope = f"{b.scope_model}{f' (key {b.scope_key_alias})' if b.scope_key_alias else ''}"
                 if await rulesets_repo.upsert_binding(conn, b.scope_model, b.scope_key_alias,
                                                       b.ruleset_id, b.version):
-                    logger.info("rulesets: binding %s%s -> %s@%d", b.scope_model,
-                                f" (key {b.scope_key_alias})" if b.scope_key_alias else "", b.ruleset_id, b.version)
+                    logger.info("rulesets: binding %s -> %s@%d", scope, b.ruleset_id, b.version)
+                if await rulesets_repo.set_binding_shadows(conn, b.scope_model, b.scope_key_alias, b.shadows):
+                    logger.info("rulesets: binding %s shadowed by %s", scope,
+                                ", ".join(f"{rid}@{v}" for rid, v in b.shadows) or "nothing")
             await rulesets_repo.refresh_active_marks(conn)
         rows = await rulesets_repo.list_bindings(conn)
     for r in results:
@@ -236,6 +282,5 @@ async def seed_and_load(store: RulesetStore, database, rulesets_dir: pathlib.Pat
             logger.info("rulesets: seeded %s@%d", r["id"], r["version"])
     for compiled in seed.compiled:
         store.add(compiled)
-    store.set_bindings([Binding(r["scope_model"], r["scope_key_alias"], r["ruleset_id"], r["version"])
-                        for r in rows])
+    store.set_bindings([_binding(r) for r in rows])
     return seed

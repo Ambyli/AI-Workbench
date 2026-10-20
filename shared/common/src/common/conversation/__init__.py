@@ -14,21 +14,41 @@ proxy hook asks about it without caring which client produced it:
   most recent first, from every shape a history carries a call in (OpenAI
   ``tool_calls`` / legacy ``function_call``, Anthropic ``tool_use`` blocks,
   named ``tool`` / ``function`` results). Offered tool definitions
-  (``tools``) sit beside ``messages``, never inside, so they are never read.
+  (``tools``) sit beside ``messages``, never inside, so they are never read;
+* :func:`user_message_count` — how many user messages (exchanges) there are;
+* :func:`render_transcript` — the conversation up to its k-th user message
+  as ``User:`` / ``Assistant:`` / ``[tool: <name>]`` text, the last N
+  exchanges within a character budget. Deterministic, and a prefix renders
+  the same however the conversation continues — the property a verdict
+  cache keyed by its hash relies on.
 
 Stdlib only, pure, never raises on malformed input (junk entries are
-skipped). Consumers: route-policy (``ai/route-policy``: the ``tool_calls``
-and ``cooldown`` evaluators read exchanges and called tools), and the
-LiteLLM hooks (``ai/litellm/hooks``: the ``auto`` footer's background-task
-detection reads ``message_text``). The hooks get it as a read-only bind
-mount, not an install, which is why it must stay stdlib-only.
+skipped; ``render_transcript`` raises ``ValueError`` only for a bad
+argument). Consumers: route-policy (``ai/route-policy``: the ``tool_calls``
+and ``cooldown`` evaluators read exchanges and called tools; the
+``llm_classifier`` evaluator sends ``render_transcript`` to the document
+classifier and keys its verdicts by the transcript's hash, and the
+benchmark under ``bench/`` renders its decision points with the same
+function, so it scores exactly what the evaluator would), and the LiteLLM
+hooks (``ai/litellm/hooks``: the ``auto`` footer's background-task detection
+reads ``message_text``). The hooks get it as a read-only bind mount, not an
+install, which is why it must stay stdlib-only.
 
 Public API:
-    message_text(content)       -> str
-    split_exchanges(messages)   -> [(user text, [messages after it]), ...]
-    called_tool_names(messages) -> [tool name, ...] most recent first
+    message_text(content)        -> str
+    split_exchanges(messages)    -> [(user text, [messages after it]), ...]
+    called_tool_names(messages)  -> [tool name, ...] most recent first
+    user_message_count(messages) -> int
+    render_transcript(messages, *, exchanges, max_chars, upto_user=None) -> str
 """
 
-from .history import called_tool_names, message_text, split_exchanges
+from .history import (
+    called_tool_names,
+    message_text,
+    render_transcript,
+    split_exchanges,
+    user_message_count,
+)
 
-__all__ = ["called_tool_names", "message_text", "split_exchanges"]
+__all__ = ["called_tool_names", "message_text", "render_transcript", "split_exchanges",
+           "user_message_count"]

@@ -6,6 +6,5 @@ the transaction boundaries.
     decisions.py     decisions (+ evaluations, same transaction), idempotent insert, per-chat reads
     evaluations.py   the per-evaluator rows
     outcomes.py      outcomes, idempotent insert
-
-Phase 4 adds analyses.py beside them.
+    analyses.py      the llm_classifier's verdicts, one per conversation prefix
 """

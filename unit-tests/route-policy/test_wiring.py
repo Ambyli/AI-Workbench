@@ -103,6 +103,12 @@ def test_compose_classes_ports_and_env():
     assert svc["healthcheck"] and svc["stop_grace_period"]
     assert svc["networks"] == ["shared"] and compose["networks"]["shared"]["name"] == "ai_shared"
     assert svc["depends_on"] == {"route-policy-db": {"condition": "service_healthy"}}
+    # The analysis queue's infrastructure settings, each with the default config.py uses.
+    env = dict(e.split("=", 1) for e in svc["environment"])
+    assert env["ROUTE_POLICY_CLASSIFIER_URL"] == "${ROUTE_POLICY_CLASSIFIER_URL:-http://classifier:8000}"
+    for var, default in (("ROUTE_POLICY_CLASSIFY_TIMEOUT_S", "180"), ("ROUTE_POLICY_CLASSIFY_POLL_S", "1"),
+                         ("ROUTE_POLICY_ANALYSIS_QUEUE_MAX", "64"), ("ROUTE_POLICY_ANALYSIS_CONCURRENCY", "2")):
+        assert env[var] == f"${{{var}:-{default}}}", var
     db = compose["services"]["route-policy-db"]
     assert db["container_name"] == "route-policy-db" and db["image"] == "postgres:17-alpine"
     assert "com.zeo.deploy" not in (db.get("labels") or {})
@@ -149,6 +155,8 @@ def test_makefile_workspace_and_dockerfile():
     dockerfile = (SERVICE_DIR / "Dockerfile").read_text(encoding="utf-8")
     assert "COPY ai/route-policy/route_policy ./ai/route-policy/route_policy" in dockerfile
     assert "COPY ai/route-policy/rulesets ./ai/route-policy/rulesets" in dockerfile
+    assert "COPY ai/route-policy/bench ./ai/route-policy/bench" in dockerfile   # the benchmark runs from the image
+    assert "import bench.run, bench.points, bench.report, bench.convert, bench.metrics" in dockerfile
     assert "PYTHONPATH=/app/ai/route-policy" in dockerfile
     assert '"route_policy.app:app"' in dockerfile
 

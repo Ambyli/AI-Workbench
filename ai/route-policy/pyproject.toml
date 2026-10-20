@@ -18,4 +18,9 @@ dependencies = [
     "prometheus-fastapi-instrumentator",
     # rulesets/*.yaml and their patterns_ref files (yaml.safe_load).
     "pyyaml",
+    # route_policy/analysis/classifier_client.py: the llm_classifier's
+    # POST /assess cycle against the document classifier (also used by
+    # bench/). common.net's DEFAULT_BLOCKED_NETWORKS (the locality guard) is
+    # stdlib-only and needs no extra.
+    "httpx",
 ]

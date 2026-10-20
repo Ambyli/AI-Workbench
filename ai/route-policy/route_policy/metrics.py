@@ -70,6 +70,13 @@ errors_total = Counter(
     # binding_refresh -- the binding snapshot could not be refreshed (the old one is kept)
     # ruleset_compile -- a stored ruleset this copy cannot compile
     # unbound_model   -- POST /decide for a model no binding covers (404)
+    # shadow_load     -- a bound shadow ruleset could not be loaded by this copy (skipped)
+    # shadow_dropped  -- /decide's after-the-answer task (shadows, analysis requests) was not
+    #                    started: WRITES_MAX_IN_FLIGHT background tasks pending
+    # shadow_error    -- that task raised (a bug; logged with its traceback)
+    # analysis_lookup -- the verdicts an llm_classifier needs could not be read (it abstains)
+    # analysis_write  -- a classification ended but its analyses row could not be stored
+    # classifier_delete -- DELETE /jobs/{id} on the classifier failed (the job expires with its TTL)
     ["kind"],
 )
 writes_deferred_total = Counter(
@@ -85,5 +92,38 @@ writes_in_flight = Gauge(
 db_reads_cut_total = Counter(
     "route_policy_db_reads_cut_total",
     "Database reads on the /decide path that outlasted DB_READ_BUDGET_S (the request went on without them)",
-    ["read"],  # binding_refresh | ruleset_fetch
+    ["read"],  # binding_refresh | ruleset_fetch | analysis_lookup
+)
+
+# -- Shadow rulesets and the analysis queue (phase 4) ------------------------------
+
+shadow_decisions_total = Counter(
+    "route_policy_shadow_decisions_total",
+    "Shadow decisions made after /decide answered, by shadow ruleset and whether they chose the "
+    "primary's route",
+    ["ruleset", "agree"],  # ruleset: <id>@<version> of a bound shadow; agree: true | false
+)
+analyses_total = Counter(
+    "route_policy_analyses_total",
+    "Background classifications finished, by classifier model and status",
+    # status: ok | incomplete | unavailable | refused | failed | timeout | not_local
+    ["model", "status"],
+)
+analysis_seconds = Histogram(
+    "route_policy_analysis_seconds",
+    "One classification's cycle (locality check, submit, the classifier's queue, the model calls, "
+    "the result), by classifier model",
+    ["model"],
+    buckets=(0.5, 1, 2, 5, 10, 20, 30, 60, 90, 120, 180, 300),
+)
+analysis_queue_depth = Gauge(
+    "route_policy_analysis_queue_depth",
+    "Analysis requests waiting for a worker (running ones not included)",
+)
+analysis_dropped_total = Counter(
+    "route_policy_analysis_dropped_total",
+    "Analysis requests not classified",
+    # queue_full -- ROUTE_POLICY_ANALYSIS_QUEUE_MAX requests were already waiting
+    # shutdown   -- still waiting (or arriving) when the service stopped
+    ["reason"],
 )

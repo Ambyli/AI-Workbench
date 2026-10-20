@@ -9,7 +9,10 @@ where it is (``evaluators[2] (code-tools).config.pattern: ...``):
 * evaluator ids unique; each ``type`` registered; each ``config`` valid for
   its type (``extra="forbid"`` -- a typo is an error, never ignored);
 * ``vote.route`` present where the type needs it, and one of ``routes`` --
-  so a ruleset can only ever vote for its own chain aliases;
+  so a ruleset can only ever vote for its own chain aliases; absent where
+  the evaluator chooses the route itself (``llm_classifier``);
+* routes a ``config`` names (``llm_classifier.criteria`` / ``otherwise``)
+  are routes of the ruleset (``Evaluator.check_routes``);
 * cross-references (``cooldown.relevant_if``) resolve;
 * the combiner type registered and its options valid.
 
@@ -88,10 +91,19 @@ def compile_ruleset(document: Dict[str, Any], *, sha256: str = "") -> CompiledRu
         if cls.needs_vote_route and route is None:
             errors.append(f"{where}.vote.route: required for a {entry.type} evaluator")
             continue
+        if not cls.needs_vote_route and route is not None:
+            errors.append(f"{where}.vote.route: a {entry.type} evaluator chooses its own route; "
+                          "remove vote.route")
+            continue
         if route is not None and route not in routes:
             errors.append(f"{where}.vote.route: {route!r} is not one of routes")
             continue
         evaluator = cls(entry.id, config)
+        try:
+            evaluator.check_routes(routes)
+        except ValueError as exc:
+            errors.append(f"{where}.config: {exc}")
+            continue
         built[entry.id] = evaluator
         entries.append(CompiledEntry(entry.id, entry.type, entry.role, route, entry.vote.weight, evaluator))
 

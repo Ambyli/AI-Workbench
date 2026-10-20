@@ -162,11 +162,16 @@ def test_evaluate_errors(client):
 
 
 def test_health_ready_and_types(client):
-    assert client.get("/health").json() == {"status": "ok", "rulesets": [{"id": "default", "version": 2}],
+    assert client.get("/health").json() == {"status": "ok", "rulesets": [{"id": "default", "version": 2},
+                                                                         {"id": "default-llm", "version": 1}],
                                             "bindings": 1}
     assert client.get("/ready").status_code == 503
     types = client.get("/evaluator-types").json()
-    assert set(types["evaluator_types"]) == {"regex_text", "tool_calls", "cooldown", "backend_load", "static"}
+    assert set(types["evaluator_types"]) == {"regex_text", "tool_calls", "cooldown", "backend_load", "static",
+                                             "llm_classifier"}
+    llm = types["evaluator_types"]["llm_classifier"]
+    assert llm["vote_route"] == "chosen by the evaluator" and llm["output"]["relevance"] is None
+    assert llm["config_schema"]["required"] == ["model", "criteria"]
     assert set(types["combiner_types"]) == {"priority", "weighted"}
     assert types["roles"] == ["vote", "force", "veto"]
     tool_calls = types["evaluator_types"]["tool_calls"]

@@ -1,7 +1,8 @@
 """Service settings -- INFRASTRUCTURE ONLY.
 
 Where the database is, how big the pool is, how often the binding snapshot is
-refreshed, where the baked-in rulesets live, the log level. Never a routing
+refreshed, where the baked-in rulesets live, where the document classifier
+is and how long a classification may take, the log level. Never a routing
 rule: what an evaluator matches, which route it votes for, the cooldown, the
 combiner -- all of that is in a ruleset (``ai/route-policy/rulesets/``),
 versioned in route-policy-db, never in an environment variable
@@ -83,13 +84,16 @@ DB_POOL_MAX: int = _env_int("ROUTE_POLICY_DB_POOL_MAX", 10, 1)
 # background, counted in route_policy_writes_deferred_total. 0 = never wait.
 DECISION_WRITE_BUDGET_S: float = _env_float("ROUTE_POLICY_DECISION_WRITE_BUDGET_S", 0.05, 0.0)
 
-# Background writes allowed in flight at once (decisions and outcomes
-# together). Past it a write is DROPPED (the decision is still returned;
-# route_policy_errors_total{kind="decision_write_dropped"}): a database that
-# is down for minutes must not pile up tasks and connections without bound.
+# Background tasks allowed in flight at once: decision and outcome writes,
+# and /decide's after-the-answer work (shadow rulesets, analysis requests).
+# Past it a write is DROPPED (the decision is still returned;
+# route_policy_errors_total{kind="decision_write_dropped"}, or
+# "shadow_dropped"): a database that is down for minutes must not pile up
+# tasks and connections without bound.
 WRITES_MAX_IN_FLIGHT: int = 256
 
-# How long shutdown waits for background writes before cancelling them.
+# How long shutdown waits for background writes -- and, separately, for the
+# running classifications of the analysis queue -- before cancelling them.
 WRITES_DRAIN_S: float = 5.0
 
 # The database READS on the /decide path -- the binding refresh every
@@ -105,7 +109,7 @@ DB_READ_BUDGET_S: float = 0.1
 # How old the in-memory binding snapshot may get before a /decide re-reads
 # the `bindings` table (one small query). Ruleset versions are immutable, so
 # a compiled ruleset is cached forever; only "which version does `auto` use"
-# can change -- at startup today, through the write API in phase 5. A copy
+# can change -- at startup today, through the write API in phase 6. A copy
 # that cannot reach the database keeps deciding from its last snapshot.
 BINDING_REFRESH_S: float = _env_float("ROUTE_POLICY_BINDING_REFRESH_S", 10.0, 0.0)
 
@@ -113,6 +117,39 @@ BINDING_REFRESH_S: float = _env_float("ROUTE_POLICY_BINDING_REFRESH_S", 10.0, 0.
 # ai/route-policy/rulesets/, next to this package -- /app/ai/route-policy/
 # rulesets in the image (Dockerfile). Seeded into route-policy-db at startup.
 RULESETS_DIR: pathlib.Path = pathlib.Path(__file__).resolve().parent.parent / "rulesets"
+
+# -- The analysis queue (llm_classifier) -------------------------------------------
+# Background classifications go through the document classifier's POST
+# /assess (route_policy/analysis/classifier_client.py), by Docker DNS on
+# ai_shared, no auth -- the same way LiteLLM reaches route-policy. Empty
+# (only possible outside the compose file, whose ${...:-} falls back to the
+# default) runs no analysis queue: requests are not classified and every
+# llm_classifier abstains ("no verdict"). The unit tests use that.
+CLASSIFIER_URL: str = os.environ.get("ROUTE_POLICY_CLASSIFIER_URL", "http://classifier:8000").strip().rstrip("/")
+
+# One classification, from the locality check to the result: the job may wait
+# behind document jobs in the classifier's queue, then makes one model call
+# per criterion (concurrently, up to the model's max_concurrent). Past it the
+# job is cancelled and deleted, and the analysis is stored as `timeout`.
+CLASSIFY_TIMEOUT_S: float = _env_float("ROUTE_POLICY_CLASSIFY_TIMEOUT_S", 180.0, 1.0)
+
+# How often GET /jobs/{id} is polled while a classification runs. Also the
+# resolution of analyses.queue_ms.
+CLASSIFY_POLL_S: float = _env_float("ROUTE_POLICY_CLASSIFY_POLL_S", 1.0, 0.1)
+
+# Requests that may WAIT for a worker (a running one does not count). Past
+# it a request is dropped and counted (route_policy_analysis_dropped_total):
+# that turn gets no verdict. Each holds one rendered transcript in memory.
+ANALYSIS_QUEUE_MAX: int = _env_int("ROUTE_POLICY_ANALYSIS_QUEUE_MAX", 64, 1)
+
+# Workers, i.e. classifier jobs route-policy has open at once. The
+# classifier's own per-model max_concurrent bounds the model calls inside
+# them; this keeps route-policy from flooding the classifier's FIFO, which
+# document jobs share.
+ANALYSIS_CONCURRENCY: int = _env_int("ROUTE_POLICY_ANALYSIS_CONCURRENCY", 2, 1)
+
+# How long GET /models (and a model host's locality verdict) is cached.
+CLASSIFIER_MODELS_TTL_S: float = 60.0
 
 # -- API caps -------------------------------------------------------------------
 # GET /chats/{chat_id}/decisions: default and largest `limit`.

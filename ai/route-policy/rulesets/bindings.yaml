@@ -19,6 +19,10 @@
 # is the phase-6 write API. A binding is routing control: whatever it points
 # `auto` at decides every `auto` turn (ROUTE_POLICY.md § Operations,
 # Exposure); a shadow slot only adds rows and background classifications.
+#
+# `auto` is shadowed by two drafts: `default-llm` (phase 4, a local model's
+# verdict) and `default-signals` (phase 5, the signals sidecar). Both run
+# after every answer, each with its own decisions row.
 - model: auto
   ruleset: default
-  shadow: [default-llm]
+  shadow: [default-llm, default-signals]

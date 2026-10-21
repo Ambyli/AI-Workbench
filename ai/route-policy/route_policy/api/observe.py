@@ -38,7 +38,7 @@ async def observe(body: ObserveRequest, request: Request) -> dict:
         raise HTTPException(503, "the outcome could not be stored; route-policy-db is unavailable") from None
     except Exception as exc:  # noqa: BLE001 -- anything unexpected: same answer, counted here
         metrics.errors_total.labels("outcome_write").inc()
-        logger.error("observe: outcome for %s not stored: %r", body.decision_id, exc)
+        logger.error("observe: outcome for %s not stored: %s", body.decision_id, type(exc).__name__)
         raise HTTPException(503, "the outcome could not be stored; route-policy-db is unavailable") from None
     if stored is None:
         return {"decision_id": str(body.decision_id), "stored": None, "deferred": True}

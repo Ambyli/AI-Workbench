@@ -73,7 +73,10 @@ errors_total = Counter(
     # shadow_load     -- a bound shadow ruleset could not be loaded by this copy (skipped)
     # shadow_dropped  -- /decide's after-the-answer task (shadows, analysis requests) was not
     #                    started: WRITES_MAX_IN_FLIGHT background tasks pending
-    # shadow_error    -- that task raised (a bug; logged with its traceback)
+    # shadow_error    -- that task, or one shadow ruleset in it, raised (a bug; logged by exception
+    #                    type; the other shadows still run)
+    # signals         -- load_signals raised past the client (a bug): the signal evaluators abstain
+    #                    ("signals failed") and pii votes from its patterns
     # analysis_lookup -- the verdicts an llm_classifier needs could not be read (it abstains)
     # turn_pin        -- the turn's first decision could not be read (the call is decided afresh)
     # analysis_write  -- a classification ended but its analyses row could not be stored
@@ -137,4 +140,32 @@ analysis_dropped_total = Counter(
     # queue_full -- ROUTE_POLICY_ANALYSIS_QUEUE_MAX requests were already waiting
     # shutdown   -- still waiting (or arriving) when the service stopped
     ["reason"],
+)
+
+# -- The signals sidecar (phase 5) ------------------------------------------------------
+
+signals_seconds = Histogram(
+    "route_policy_signals_seconds",
+    "One POST /signals to the signals sidecar, as route-policy waited for it (within "
+    "ROUTE_POLICY_SIGNALS_BUDGET_S on /decide and for shadows), by kind",
+    ["kind"],  # primary | shadow | evaluate (POST /evaluate, 10 s, no deadline cut)
+    buckets=(0.005, 0.01, 0.02, 0.03, 0.05, 0.075, 0.1, 0.15, 0.25, 0.5, 1.0, 2.5, 10.0),
+)
+signals_total = Counter(
+    "route_policy_signals_total",
+    "Signals calls by outcome",
+    # ok          -- the sidecar answered (each task's own status: route_policy_signal_tasks_total)
+    # timeout     -- no answer within the budget: the signal evaluators abstain, pii votes from patterns
+    # error       -- a non-200, a malformed answer, a connection error
+    # unavailable -- ROUTE_POLICY_SIGNALS_URL is empty (no client)
+    # not_local   -- the sidecar's host resolves outside the box's networks: nothing was sent
+    ["outcome"],
+)
+signal_tasks_total = Counter(
+    "route_policy_signal_tasks_total",
+    "Tasks of the signals calls that were answered, by task and status",
+    # task:   pii | nearest | injection | language | other
+    # status: ok | partial | deadline | skipped | warming | error | unavailable (the sidecar's),
+    #         missing (no result for a task that was sent), not_sent (no text fit the caps), other
+    ["task", "status"],
 )

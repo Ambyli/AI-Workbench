@@ -50,8 +50,12 @@ def _client(dsn: str = None, rulesets_dir: pathlib.Path = RULESETS_DIR, classifi
                                  analysis_client=client))
 
 
-def _shadow_id(primary_id) -> uuid.UUID:
-    return uuid.uuid5(uuid.UUID(str(primary_id)), "default-llm@3")
+def _shadow_id(primary_id, ruleset: str = "default-llm@3") -> uuid.UUID:
+    return uuid.uuid5(uuid.UUID(str(primary_id)), ruleset)
+
+
+# `auto`'s shadow slots, in order: the phase-4 and phase-5 drafts.
+SHADOWS = [{"ruleset_id": "default-llm", "version": 3}, {"ruleset_id": "default-signals", "version": 1}]
 
 
 def _wait_rows(dsn: str, sql: str, *args, n: int = 1):
@@ -109,19 +113,26 @@ def test_startup_migrates_seeds_and_binds(fresh_database):
     rows = _fetch(fresh_database, "SELECT id, version, created_by, source, active_from, active_to FROM rulesets "
                                   "ORDER BY id")
     assert [(r["id"], r["version"], r["created_by"], r["source"]) for r in rows] == [
-        ("default", 3, "seed", "rulesets/default.yaml"), ("default-llm", 3, "seed", "rulesets/default-llm.yaml")]
-    # Both are active: one as the primary, one in a shadow slot.
+        ("default", 3, "seed", "rulesets/default.yaml"), ("default-llm", 3, "seed", "rulesets/default-llm.yaml"),
+        ("default-signals", 1, "seed", "rulesets/default-signals.yaml")]
+    # All three are active: one as the primary, two in shadow slots.
     assert all(r["active_from"] is not None and r["active_to"] is None for r in rows)
     (b,) = _fetch(fresh_database, "SELECT id, scope_model, scope_key_alias, ruleset_id, version FROM bindings")
     assert {k: v for k, v in b.items() if k != "id"} == {"scope_model": "auto", "scope_key_alias": None,
                                                          "ruleset_id": "default", "version": 3}
-    (s,) = _fetch(fresh_database, "SELECT binding_id, position, ruleset_id, version FROM binding_shadows")
-    assert s == {"binding_id": b["id"], "position": 0, "ruleset_id": "default-llm", "version": 3}
+    slots = _fetch(fresh_database, "SELECT binding_id, position, ruleset_id, version FROM binding_shadows "
+                                   "ORDER BY position")
+    assert slots == [{"binding_id": b["id"], "position": 0, "ruleset_id": "default-llm", "version": 3},
+                     {"binding_id": b["id"], "position": 1, "ruleset_id": "default-signals", "version": 1}]
+    # The example set is inlined into the stored document, never read from the file again.
+    (signals,) = _fetch(fresh_database, "SELECT document FROM rulesets WHERE id = 'default-signals'")
+    (topic,) = [e for e in signals["document"]["evaluators"] if e["id"] == "topic"]
+    assert topic["config"]["examples"]["name"] == "routes_v1"
     # A second start changes nothing.
     with _client(fresh_database) as c:
         assert c.get("/health").status_code == 200
-    assert len(_fetch(fresh_database, "SELECT * FROM rulesets")) == 2
-    assert len(_fetch(fresh_database, "SELECT * FROM binding_shadows")) == 1
+    assert len(_fetch(fresh_database, "SELECT * FROM rulesets")) == 3
+    assert len(_fetch(fresh_database, "SELECT * FROM binding_shadows")) == 2
     assert len(_fetch(fresh_database, "SELECT * FROM schema_migrations")) == len(migrations_mod.migrations())
 
 
@@ -129,7 +140,7 @@ def test_shadow_slots_follow_the_bindings_file(fresh_database, tmp_path):
     with _client(fresh_database):
         pass
     unshadowed = _copy_rulesets(tmp_path)
-    _rewrite(unshadowed / "bindings.yaml", ("  shadow: [default-llm]\n", ""))
+    _rewrite(unshadowed / "bindings.yaml", ("  shadow: [default-llm, default-signals]\n", ""))
     with _client(fresh_database, unshadowed) as c:
         (b,) = c.get("/bindings").json()["bindings"]
         assert b["shadows"] == []
@@ -140,7 +151,7 @@ def test_shadow_slots_follow_the_bindings_file(fresh_database, tmp_path):
     assert llm["active_to"] is not None   # no slot points at it any more
     with _client(fresh_database) as c:
         (b,) = c.get("/bindings").json()["bindings"]
-        assert b["shadows"] == [{"ruleset_id": "default-llm", "version": 3}]
+        assert b["shadows"] == SHADOWS
     (llm,) = _fetch(fresh_database, "SELECT active_to FROM rulesets WHERE id = 'default-llm'")
     assert llm["active_to"] is None
 
@@ -181,6 +192,7 @@ def test_the_phase_3_upgrade_keeps_the_old_version_readable(fresh_database, tmp_
     _rewrite(phase2 / "default.yaml", ("version: 3", "version: 1"), ("mode: enforce", "mode: shadow"))
     (phase2 / "bindings.yaml").unlink()
     (phase2 / "default-llm.yaml").unlink()
+    (phase2 / "default-signals.yaml").unlink()
     with _client(fresh_database, phase2) as c:
         _fetch(fresh_database, "INSERT INTO bindings (scope_model, ruleset_id, version) "
                                "VALUES ('auto', 'default', 1) RETURNING id")
@@ -190,14 +202,15 @@ def test_the_phase_3_upgrade_keeps_the_old_version_readable(fresh_database, tmp_
         _, out = _decide(c, chat="chat-upgrade")
         assert (out["ruleset"], out["mode"], out["apply"]) == ({"id": "default", "version": 3}, "enforce", True)
         assert c.get("/health").json()["rulesets"] == [{"id": "default", "version": 3},
-                                                       {"id": "default-llm", "version": 3}]
+                                                       {"id": "default-llm", "version": 3},
+                                                       {"id": "default-signals", "version": 1}]
         assert [v["version"] for v in c.get("/rulesets/default").json()["versions"]] == [1, 3]
         assert c.get("/rulesets/default/1").json()["document"]["mode"] == "shadow"
         old = c.post("/evaluate", json={"ruleset": {"id": "default", "version": 1},
                                         "messages": [user("fix app.py")]})
         assert old.status_code == 200 and (old.json()["mode"], old.json()["route"]) == ("shadow", "local-code")
         (b,) = c.get("/bindings").json()["bindings"]
-        assert b["version"] == 3 and b["shadows"] == [{"ruleset_id": "default-llm", "version": 3}]
+        assert b["version"] == 3 and b["shadows"] == SHADOWS
         decisions = c.get("/chats/chat-upgrade/decisions").json()["decisions"]
         assert [(d["ruleset"]["version"], d["applied"]) for d in decisions] == [(1, False), (3, True)]
 
@@ -303,14 +316,20 @@ def test_chat_decisions_oldest_first_with_outcomes():
         assert out["decisions"][0]["outcome"] is None
         assert out["decisions"][1]["outcome"]["agree"] is True and out["decisions"][1]["route"] == "local-code"
         assert len(out["decisions"][1]["votes"]) == 5 and out["decisions"][1]["shadow_of"] is None
-        # Each primary carries its shadow, written after the answer.
+        # Each primary carries its shadows, written after the answer.
         _wait_rows(config.DB_DSN, "SELECT 1 FROM decisions WHERE shadow_of = $1",
-                   uuid.UUID(second["decision_id"]))
-        (shadow,) = c.get(f"/chats/{chat}/decisions").json()["decisions"][1]["shadows"]
+                   uuid.UUID(second["decision_id"]), n=2)
+        shadows = {d["ruleset"]["id"]: d for d in
+                   c.get(f"/chats/{chat}/decisions").json()["decisions"][1]["shadows"]}
+        assert set(shadows) == {"default-llm", "default-signals"}
+        shadow = shadows["default-llm"]
         assert shadow["shadow_of"] == second["decision_id"] and shadow["outcome"] is None
         assert shadow["decision_id"] == str(_shadow_id(second["decision_id"])) and "shadows" not in shadow
         assert shadow["ruleset"] == {"id": "default-llm", "version": 3} and shadow["mode"] == "shadow"
         assert len(shadow["votes"]) == 5
+        signals = shadows["default-signals"]
+        assert signals["decision_id"] == str(_shadow_id(second["decision_id"], "default-signals@1"))
+        assert len(signals["votes"]) == 11 and signals["route"] == "local-code"
         limited = c.get(f"/chats/{chat}/decisions", params={"limit": 1}).json()["decisions"]
         assert [d["decision_id"] for d in limited] == [second["decision_id"]]
         assert c.get("/chats/nobody/decisions").json() == {"chat_id": "nobody", "decisions": []}
@@ -321,7 +340,8 @@ def test_ruleset_and_binding_reads():
     with _client() as c:
         listed = c.get("/rulesets").json()["rulesets"]
         assert [(r["id"], r["version"], r["mode"], r["pin"]) for r in listed] == [
-            ("default", 3, "enforce", "turn"), ("default-llm", 3, "shadow", "turn")]
+            ("default", 3, "enforce", "turn"), ("default-llm", 3, "shadow", "turn"),
+            ("default-signals", 1, "shadow", "turn")]
         assert "document" not in listed[0] and len(listed[0]["sha256"]) == 64
         latest = c.get("/rulesets/default").json()
         assert latest["version"] == 3 and latest["document"]["id"] == "default" and latest["pin"] == "turn"
@@ -333,11 +353,37 @@ def test_ruleset_and_binding_reads():
         assert c.get("/rulesets/default/0").status_code == 422
         (b,) = c.get("/bindings").json()["bindings"]
         assert (b["scope_model"], b["scope_key_alias"], b["ruleset_id"], b["version"]) == ("auto", None, "default", 3)
-        assert b["shadows"] == [{"ruleset_id": "default-llm", "version": 3}]
+        assert b["shadows"] == SHADOWS
         # A stored document posts straight back to /evaluate.
         doc = c.get("/rulesets/default/3").json()["document"]
         assert c.post("/evaluate", json={"document": doc, "messages": [user("prove it")]}).json()["route"] == \
             "local-reasoning"
+
+
+def test_startup_warms_the_bound_example_sets_and_shadows_reach_the_sidecar(fresh_database):
+    """The real startup path (seed, bind, warm) with a signals client on a
+    fake sidecar: one warm-up for `default-signals`' example set before the
+    first request, then each /decide's shadow makes its own call."""
+    from rp_helpers import FakeSidecar
+
+    sidecar = FakeSidecar(status={"nearest": "warming"})
+    database = Database(fresh_database, max_size=4)
+    app = create_app(database=database, rulesets_dir=RULESETS_DIR, instrument=False,
+                     signals_client=sidecar.client())
+    with TestClient(app) as c:
+        (warm,) = sidecar.requests
+        assert warm["request_id"] == "warmup" and [t["task"] for t in warm["tasks"]] == ["nearest"]
+        assert warm["tasks"][0]["texts"] == []
+        body, _ = _decide(c, chat="chat-warm", messages=[user("my SSN is 523-45-6789")])
+        shadow_id = _shadow_id(body["decision_id"], "default-signals@1")
+        wait_for(lambda: len(sidecar.requests) == 2)
+        wait_for(lambda: c.app.state.service.pending_writes == 0)
+    assert sidecar.requests[1]["request_id"] == str(shadow_id)
+    (row,) = _fetch(fresh_database, "SELECT chosen_route FROM decisions WHERE decision_id = $1", shadow_id)
+    assert row["chosen_route"] == "local-private"
+    topic = _fetch(fresh_database, "SELECT reason, detail FROM evaluations WHERE decision_id = $1 "
+                                   "AND evaluator_id = 'topic'", shadow_id)
+    assert topic[0]["reason"] == "nearest warming" and topic[0]["detail"]["status"] == "warming"
 
 
 def test_a_binding_changed_in_the_database_is_picked_up(fresh_database):
@@ -359,7 +405,9 @@ def test_shadow_decisions_and_the_views():
     with _client() as c:
         body, out = _decide(c, chat=chat, messages=[user("hello"), assistant(), user("tell me a story")])
         primary_id = uuid.UUID(body["decision_id"])
-        (shadow,) = _wait_rows(config.DB_DSN, "SELECT * FROM decisions WHERE shadow_of = $1", primary_id)
+        rows = _wait_rows(config.DB_DSN, "SELECT * FROM decisions WHERE shadow_of = $1", primary_id, n=2)
+        (shadow,) = [r for r in rows if r["ruleset_id"] == "default-llm"]
+        (signals,) = [r for r in rows if r["ruleset_id"] == "default-signals"]
         c.post("/observe", json={"decision_id": body["decision_id"], "served_model_group": "local-general",
                                  "status": "success"})
         # A repeated /decide derives the same shadow id: nothing is written twice.
@@ -368,7 +416,14 @@ def test_shadow_decisions_and_the_views():
     assert shadow["decision_id"] == _shadow_id(primary_id)
     assert (shadow["ruleset_id"], shadow["mode"], shadow["applied"], shadow["chat_id"]) == (
         "default-llm", "shadow", False, chat)
-    assert len(_fetch(config.DB_DSN, "SELECT * FROM decisions WHERE shadow_of = $1", primary_id)) == 1
+    assert len(_fetch(config.DB_DSN, "SELECT * FROM decisions WHERE shadow_of = $1", primary_id)) == 2
+    assert signals["decision_id"] == _shadow_id(primary_id, "default-signals@1")
+    # The draft's signal rows abstain without a sidecar (none in the tests); pii still ran its patterns.
+    evaluations = {e["evaluator_id"]: e for e in _fetch(
+        config.DB_DSN, "SELECT * FROM evaluations WHERE decision_id = $1", signals["decision_id"])}
+    assert evaluations["topic"]["reason"] == "signals unavailable" and evaluations["topic"]["vote_route"] is None
+    assert evaluations["pii"]["detail"]["texts_scanned"] == 2 and evaluations["pii"]["abstained"]
+    assert (evaluations["injection"]["role"], evaluations["injection"]["abstained"]) == ("observe", True)
     topic = _fetch(config.DB_DSN, "SELECT * FROM evaluations WHERE decision_id = $1 AND evaluator_id = 'topic-llm'",
                    shadow["decision_id"])
     assert topic[0]["abstained"] and topic[0]["detail"]["looked_up"] == 2
@@ -376,7 +431,11 @@ def test_shadow_decisions_and_the_views():
     rows = _fetch(config.DB_DSN, "SELECT * FROM decision_outcomes WHERE chat_id = $1", chat)
     assert [r["decision_id"] for r in rows] == [primary_id] and rows[0]["agree"] is True
     # shadow_comparisons: the shadow beside its primary and what served the turn.
-    (cmp,) = _fetch(config.DB_DSN, "SELECT * FROM shadow_comparisons WHERE chat_id = $1", chat)
+    comparisons = {r["shadow_ruleset_id"]: r for r in _fetch(
+        config.DB_DSN, "SELECT * FROM shadow_comparisons WHERE chat_id = $1", chat)}
+    assert set(comparisons) == {"default-llm", "default-signals"}
+    assert comparisons["default-signals"]["agree_with_primary"] is True
+    cmp = comparisons["default-llm"]
     assert (cmp["shadow_decision_id"], cmp["primary_decision_id"]) == (shadow["decision_id"], primary_id)
     assert (cmp["shadow_ruleset_id"], cmp["shadow_ruleset_version"], cmp["primary_ruleset_id"],
             cmp["primary_ruleset_version"]) == ("default-llm", 3, "default", 3)
@@ -477,8 +536,8 @@ def test_the_classifier_loop_end_to_end():
         first, out1 = _decide(c, chat=chat, messages=two)
         (analysis,) = _wait_rows(config.DB_DSN, "SELECT * FROM analyses WHERE chat_id = $1", chat)
         second, out2 = _decide(c, chat=chat, messages=three)
-        (shadow,) = _wait_rows(config.DB_DSN, "SELECT * FROM decisions WHERE shadow_of = $1",
-                               uuid.UUID(second["decision_id"]))
+        (shadow,) = _wait_rows(config.DB_DSN, "SELECT * FROM decisions WHERE shadow_of = $1 "
+                                              "AND ruleset_id = 'default-llm'", uuid.UUID(second["decision_id"]))
         wait_for(lambda: c.app.state.service.pending_writes == 0)
     # The job: one text document, the three criteria, deleted after reading.
     (body,) = fake.submitted[:1]
@@ -514,8 +573,8 @@ def test_an_edited_message_makes_the_old_verdict_unreachable():
         _wait_rows(config.DB_DSN, "SELECT * FROM analyses WHERE chat_id = $1", chat)
         edited = [user("hello"), assistant(), user("write a limerick"), assistant(), user("and another")]
         second, _ = _decide(c, chat=chat, messages=edited)
-        (shadow,) = _wait_rows(config.DB_DSN, "SELECT * FROM decisions WHERE shadow_of = $1",
-                               uuid.UUID(second["decision_id"]))
+        (shadow,) = _wait_rows(config.DB_DSN, "SELECT * FROM decisions WHERE shadow_of = $1 "
+                                              "AND ruleset_id = 'default-llm'", uuid.UUID(second["decision_id"]))
         wait_for(lambda: c.app.state.service.pending_writes == 0)
     topic = shadow["response"]["votes"][-1]
     # default-llm reads only the latest user message: k=2's verdict was for
@@ -539,7 +598,8 @@ def _turn(c, chat, message_id="m1"):
     out = []
     for messages in (FIRST_CALL, TOOL_ROUND, NUDGED):
         body, answer = _decide(c, chat=chat, message_id=message_id, messages=messages)
-        _wait_rows(config.DB_DSN, "SELECT 1 FROM decisions WHERE shadow_of = $1", uuid.UUID(body["decision_id"]))
+        _wait_rows(config.DB_DSN, "SELECT 1 FROM decisions WHERE shadow_of = $1", uuid.UUID(body["decision_id"]),
+                   n=2)
         out.append((uuid.UUID(body["decision_id"]), answer))
     return out
 
@@ -555,7 +615,7 @@ def test_the_calls_of_one_turn_on_real_rows():
         task_body, _ = _decide(c, chat=chat, message_id="m1", messages=CALCULATOR + [user(TITLE_TASK)],
                                background_task=True)
         task = uuid.UUID(task_body["decision_id"])
-        _wait_rows(config.DB_DSN, "SELECT 1 FROM decisions WHERE shadow_of = $1", task)
+        _wait_rows(config.DB_DSN, "SELECT 1 FROM decisions WHERE shadow_of = $1", task, n=2)
         calls = _turn(c, chat)
         other_body, other_out = _decide(c, chat=chat, message_id="m2", messages=NUDGED)
         other = uuid.UUID(other_body["decision_id"])
@@ -564,19 +624,24 @@ def test_the_calls_of_one_turn_on_real_rows():
     ids = [did for did, _ in calls]
     assert [out["route"] for _, out in calls] == ["local-code"] * 3 and other_out["route"] == "local-general"
     rows = {r["decision_id"]: r for r in _fetch(
-        config.DB_DSN, "SELECT decision_id, shadow_of, pinned_from, background_task, chosen_route, reason "
-                       "FROM decisions WHERE chat_id = $1", chat)}
+        config.DB_DSN, "SELECT decision_id, shadow_of, ruleset_id, pinned_from, background_task, chosen_route, "
+                       "reason FROM decisions WHERE chat_id = $1", chat)}
     assert rows[task]["background_task"] is True and rows[task]["pinned_from"] is None
     assert rows[ids[0]]["pinned_from"] is None             # never pinned to the task before it
     assert rows[ids[1]]["pinned_from"] == rows[ids[2]]["pinned_from"] == ids[0]
     assert rows[ids[2]]["reason"].startswith(f"pinned to this turn's first decision (local-code, {ids[0]}); "
                                              "fresh: local-general")
     assert rows[other]["pinned_from"] is None and not rows[other]["background_task"]
-    shadow_of = {r["shadow_of"]: r for r in rows.values() if r["shadow_of"] is not None}
+    shadow_of = {r["shadow_of"]: r for r in rows.values() if r["ruleset_id"] == "default-llm"}
     assert shadow_of[task]["background_task"] is True
     first_shadow = _shadow_id(ids[0])
     assert shadow_of[ids[0]]["pinned_from"] is None
     assert shadow_of[ids[1]]["pinned_from"] == shadow_of[ids[2]]["pinned_from"] == first_shadow
+    # Each shadow pins to ITS OWN first row: default-signals to its own, not default-llm's.
+    signals_of = {r["shadow_of"]: r for r in rows.values() if r["ruleset_id"] == "default-signals"}
+    first_signals = _shadow_id(ids[0], "default-signals@1")
+    assert signals_of[ids[0]]["pinned_from"] is None
+    assert signals_of[ids[1]]["pinned_from"] == signals_of[ids[2]]["pinned_from"] == first_signals
     # The views carry the new columns.
     outcomes = {r["decision_id"]: r for r in _fetch(
         config.DB_DSN, "SELECT decision_id, pinned_from, background_task FROM decision_outcomes WHERE chat_id = $1",
@@ -584,13 +649,14 @@ def test_the_calls_of_one_turn_on_real_rows():
     assert outcomes[ids[2]]["pinned_from"] == ids[0] and outcomes[task]["background_task"] is True
     cmp = {r["primary_decision_id"]: r for r in _fetch(
         config.DB_DSN, "SELECT primary_decision_id, shadow_pinned_from, primary_pinned_from, background_task "
-                       "FROM shadow_comparisons WHERE chat_id = $1", chat)}
+                       "FROM shadow_comparisons WHERE chat_id = $1 AND shadow_ruleset_id = 'default-llm'", chat)}
     assert (cmp[ids[2]]["shadow_pinned_from"], cmp[ids[2]]["primary_pinned_from"]) == (first_shadow, ids[0])
     assert cmp[task]["background_task"] is True and cmp[ids[0]]["background_task"] is False
     # GET /chats/{id}/decisions shows them too, the shadows' as well.
     assert [d["pinned_from"] for d in listed] == [None, None, str(ids[0]), str(ids[0]), None]
     assert [d["background_task"] for d in listed] == [True, False, False, False, False]
-    assert listed[3]["shadows"][0]["pinned_from"] == str(first_shadow)
+    assert {s["ruleset"]["id"]: s["pinned_from"] for s in listed[3]["shadows"]} == {
+        "default-llm": str(first_shadow), "default-signals": str(first_signals)}
 
 
 def test_one_classification_per_turn_end_to_end():
@@ -669,6 +735,8 @@ def test_the_phase_4_upgrade_moves_both_bindings_and_pins_across_it(fresh_databa
     _rewrite(phase4 / "default.yaml", ("version: 3", "version: 2"), ("pin: turn\n", ""),
              ("exchanges: 2", "exchanges: 3"))
     _rewrite(phase4 / "default-llm.yaml", ("version: 3", "version: 1"), ("pin: turn\n", ""))
+    _rewrite(phase4 / "bindings.yaml", ("shadow: [default-llm, default-signals]", "shadow: [default-llm]"))
+    (phase4 / "default-signals.yaml").unlink()
     chat = "chat-phase4"
     with _client(fresh_database, phase4) as c:
         old_body, old = _decide(c, chat=chat, message_id="m1", messages=FIRST_CALL)
@@ -677,7 +745,7 @@ def test_the_phase_4_upgrade_moves_both_bindings_and_pins_across_it(fresh_databa
         new_body, new = _decide(c, chat=chat, message_id="m1", messages=NUDGED)
         assert (new["ruleset"], new["route"], new["apply"]) == ({"id": "default", "version": 3}, "local-code", True)
         (b,) = c.get("/bindings").json()["bindings"]
-        assert b["version"] == 3 and b["shadows"] == [{"ruleset_id": "default-llm", "version": 3}]
+        assert b["version"] == 3 and b["shadows"] == SHADOWS
         assert [v["version"] for v in c.get("/rulesets/default").json()["versions"]] == [2, 3]
         assert [v["version"] for v in c.get("/rulesets/default-llm").json()["versions"]] == [1, 3]
         assert c.get("/rulesets/default/2").json()["pin"] is None

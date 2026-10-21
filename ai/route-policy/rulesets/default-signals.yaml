@@ -1,0 +1,160 @@
+# The `default-signals` draft ruleset (phase 5): `default`'s rules plus the
+# fast signals the `signals` sidecar (ai/signals) computes on CPU -- PII
+# NER, nearest-example topic, a prompt-injection score, the language -- and
+# two pure structural ones. SHADOW mode: bound beside `default` as a second
+# shadow (bindings.yaml), decided after every `auto` turn has been
+# answered, logged with shadow_of = the live decision, never applied.
+#
+# What it tests, in `shadow_comparisons` (ROUTE_POLICY.md § The
+# default-signals draft):
+#   * PII forces first: how often would `pii` have sent to local-private a
+#     turn `default` sent to a Claude-capable chain (the gap a name +
+#     address with no privacy keyword leaves open);
+#   * `topic` decides only the turns no keyword, tool or cooldown rule
+#     claimed -- how often does it disagree with local-general;
+#   * the `observe` rows (injection, code shape, language, size) route
+#     nothing: they put their would-be route and their numbers on every
+#     decision, for choosing what a later version should do with them.
+#
+# The signals: ONE POST /signals per decision, concurrently with the
+# database reads, within ROUTE_POLICY_SIGNALS_BUDGET_S (0.1 s, the same
+# budget enforcing it would have). A cut or missing answer makes a signal
+# evaluator abstain; `pii` still votes from its in-process patterns.
+#
+# The user's PII rule (ROUTE_POLICY_PHASE5_PLAN § 10): sensitive data in ANY
+# user message keeps the chat private (user_messages: all); results of DATA
+# tools are scanned too (Phoenix / Trino queries carry customers' names and
+# addresses -- web search and fetch results do not count: a business's
+# public phone is not sensitive). The tool pattern takes Open WebUI's names
+# (phoenix_run_query) and MCP clients' prefixed ones (Claude Code on
+# /v1/messages: mcp__claude_ai_Phoenix-MCP__run_query,
+# mcp__litellm__trino-run_query), any case. A name forces only with a date of birth in
+# the same text; a bare name never does. `privacy` (the keyword rule) stays
+# a force for now.
+#
+# Rows 2 and 4-7 are `default@3`'s, in its order, with the same pattern
+# files -- a pattern edit is new content for `default`, `default-llm` AND
+# this ruleset: bump all three versions. So is an edit to
+# examples/routes.yaml (this ruleset only).
+#
+# CHANGING IT: versions are immutable -- edit, then bump `version`.
+# Promoting it is a new `default` version, never a mode flip here
+# (ROUTE_POLICY.md § Promoting the signals).
+id: default-signals
+version: 1
+description: >-
+  Draft: `default` plus fast CPU signals -- sensitive data anywhere in the
+  user messages or data-tool results forces local-private, a nearest-example
+  topic vote decides the turns no rule claimed, and the injection score, code
+  shape, language and size are observed -- one route per turn, shadow mode,
+  compared against `default` before promotion.
+mode: shadow
+pin: turn
+routes: [local-general, local-code, local-reasoning, local-private]
+default_route: local-general
+evaluators:
+  # First, a force: sensitive data in any user message or data-tool result.
+  # The patterns run in-process on every call; the sidecar's NER adds
+  # free-form addresses, ids and the names `with_person` needs.
+  - id: pii
+    type: pii
+    role: force
+    description: Sensitive data in any user message or Phoenix / Trino tool result.
+    config:
+      scope:
+        user_messages: all
+        tool_results: '(?i)(?:.*[-_])?(?:phoenix|trino)[-_].+'
+      force: [email, phone, street_address, gov_id, card_number, bank_account, account_number]
+      with_person: [date_of_birth]
+      ner: true
+      min_score: 0.5
+      model: gravitee-io/bert-small-pii-detection
+    vote: {route: local-private}
+
+  - id: privacy
+    type: regex_text
+    role: force
+    description: PII keywords in the latest user message.
+    config:
+      patterns_ref: patterns/privacy.yaml
+    vote: {route: local-private}
+
+  # Log only: the score lands in evaluations.detail.score; what a hit should
+  # do is a later version's choice, from that data.
+  - id: injection
+    type: prompt_injection
+    role: observe
+    description: Jailbreak / prompt-injection score of the latest user message (logged, routes nothing).
+    config:
+      model: NeuralTrust/prompt-guard-oss-small
+      threshold: 0.9
+      scope: current_message
+    vote: {route: local-private}
+
+  - id: code-text
+    type: regex_text
+    description: Code keywords, file names or a code fence in the latest user message.
+    config:
+      patterns_ref: patterns/code.yaml
+    vote: {route: local-code}
+
+  - id: reasoning-text
+    type: regex_text
+    description: Math / science / multi-step keywords in the latest user message.
+    config:
+      patterns_ref: patterns/reasoning.yaml
+    vote: {route: local-reasoning}
+
+  - id: code-tools
+    type: tool_calls
+    description: A sandbox / Open Terminal tool was called in this exchange.
+    config:
+      pattern: 'sandbox-mcp_.+|run_command|get_process_status|send_process_input|kill_process|replace_file_content|read_user_terminal|send_user_terminal_input'
+      scope: current_exchange
+    vote: {route: local-code}
+
+  - id: sticky-code
+    type: cooldown
+    description: Stays on local-code for 2 exchanges after the last coding one.
+    config:
+      exchanges: 2
+      relevant_if: [code-tools, code-text]
+    vote: {route: local-code}
+
+  # After every keyword, tool and cooldown rule: it decides only a turn none
+  # of them claimed. Chooses its own route (no vote.route).
+  - id: topic
+    type: nearest_examples
+    description: The route of the curated example prompts nearest to the latest user message.
+    config:
+      model: intfloat/multilingual-e5-small
+      examples_ref: examples/routes.yaml
+      k: 5
+      min_share: 0.8
+
+  - id: code-shape
+    type: text_shape
+    role: observe
+    description: The latest user message looks like pasted code (logged, routes nothing).
+    config:
+      min_code_ratio: 0.5
+      min_lines: 5
+    vote: {route: local-code}
+
+  - id: language
+    type: language
+    role: observe
+    description: The latest user message is not in English (logged, routes nothing).
+    config:
+      not_languages: [en]
+    vote: {route: local-general}
+
+  - id: context-size
+    type: context_size
+    role: observe
+    description: The request is estimated above 100k tokens (logged, routes nothing).
+    config:
+      max_tokens: 100000
+    vote: {route: local-reasoning}
+
+combiner: {type: priority}

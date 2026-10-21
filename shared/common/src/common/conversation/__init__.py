@@ -19,6 +19,17 @@ proxy hook asks about it without caring which client produced it:
   keyword rule never reads Open WebUI's instructions or a fetched page as
   the user's request. :func:`split_exchanges` (and so
   :func:`render_transcript`) use it; :func:`message_text` does not;
+* :func:`user_texts` — :func:`user_text` of EVERY user message, oldest
+  first, one entry per user message (``""`` for one without text), so
+  entry k-1 is user message k — what a scan of the whole conversation
+  (route-policy's ``pii`` evaluator) reads;
+* :func:`tool_results` — every tool RESULT, oldest first, as ``(message
+  index, tool name, text)``: OpenAI ``tool`` / legacy ``function`` messages
+  and Anthropic ``tool_result`` blocks, each named by its own ``name`` or by
+  the call it answers (``tool_call_id`` → an assistant's ``tool_calls[].id``,
+  ``tool_use_id`` → a ``tool_use`` block's ``id``). The text is the result
+  as the model saw it — a database row, a fetched page — which is why a
+  caller scanning it for personal data picks the tools by name;
 * :func:`called_tool_names` — the tools the conversation actually CALLED,
   most recent first, from every shape a history carries a call in (OpenAI
   ``tool_calls`` / legacy ``function_call``, Anthropic ``tool_use`` blocks,
@@ -38,7 +49,9 @@ and ``cooldown`` evaluators read exchanges and called tools; the
 ``llm_classifier`` evaluator sends ``render_transcript`` to the document
 classifier and keys its verdicts by the transcript's hash, and the
 benchmark under ``bench/`` renders its decision points with the same
-function, so it scores exactly what the evaluator would), and the LiteLLM
+function, so it scores exactly what the evaluator would; the signal
+evaluators send ``user_texts`` and the selected ``tool_results`` to the
+``signals`` sidecar as ``u<k>`` / ``t<k>``), and the LiteLLM
 hooks (``ai/litellm/hooks``: the ``auto`` footer's background-task detection
 reads ``message_text``). The hooks get it as a read-only bind mount, not an
 install, which is why it must stay stdlib-only.
@@ -47,6 +60,8 @@ Public API:
     message_text(content)        -> str
     user_text(content)           -> str   (message_text without Open WebUI's RAG block)
     strip_openwebui_rag(text)    -> str
+    user_texts(messages)         -> [user text, ...] one per user message, oldest first
+    tool_results(messages)       -> [(message index, tool name, text), ...] oldest first
     split_exchanges(messages)    -> [(user text, [messages after it]), ...]
     called_tool_names(messages)  -> [tool name, ...] most recent first
     user_message_count(messages) -> int
@@ -59,9 +74,11 @@ from .history import (
     render_transcript,
     split_exchanges,
     strip_openwebui_rag,
+    tool_results,
     user_message_count,
     user_text,
+    user_texts,
 )
 
 __all__ = ["called_tool_names", "message_text", "render_transcript", "split_exchanges",
-           "strip_openwebui_rag", "user_message_count", "user_text"]
+           "strip_openwebui_rag", "tool_results", "user_message_count", "user_text", "user_texts"]

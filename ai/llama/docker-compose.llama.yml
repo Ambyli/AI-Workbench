@@ -432,11 +432,16 @@ services:
     # per-token stalls of a 150 GB working set. So no --load-mode
     # mmap+mlock and no memlock ulimit.
     #
-    # THREADS: -t 8 (LLAMA_QWEN35_4B_THREADS). A small model's decode stops
-    # scaling well before the core count, and it shares the CPU with
-    # glm5.3-flash, which takes every physical core by default. To keep the
-    # two apart, pin this one with `--cpu-range 0-7` (`-Cr`) in
-    # LLAMA_QWEN35_4B_EXTRA_ARGS and give glm5.3-flash `-t` / its own range
+    # THREADS: .env.example sets -t 16 (LLAMA_QWEN35_4B_THREADS) together
+    # with `--cpu-range 0-15` (`-Cr`, in LLAMA_QWEN35_4B_EXTRA_ARGS): the
+    # box's 32 vCPUs are split 0-15 for this model, 24-31 for the signals
+    # sidecar (its own cpuset, SIGNALS_CPUSET; ai/signals/SIGNALS.md) and
+    # 16-23 for everything else. glm5.3-flash, which takes every physical
+    # core by default, has been off for months; at -t 8 unpinned a verdict
+    # took ~60-100 s (prompt 25-50 tok/s), so this model gets 16 idle cores.
+    # The fallback below stays 8 on purpose: 16 threads only make sense with
+    # the range, and a .env without the two lines keeps the old behaviour.
+    # Before turning glm5.3-flash on, give it a range outside 0-15 and 24-31
     # through LLAMA_GLM53_FLASH_EXTRA_ARGS — a range on one side only still
     # lets the other's threads run on those cores.
     #

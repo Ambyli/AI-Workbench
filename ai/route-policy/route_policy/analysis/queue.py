@@ -165,8 +165,9 @@ class AnalysisQueue:
                 await self.process(request)
             except asyncio.CancelledError:
                 raise
-            except Exception:  # noqa: BLE001 -- a bug in one analysis never stops the worker
-                logger.exception("analysis: %s failed unexpectedly", request.input_key[:12])
+            except Exception as exc:  # noqa: BLE001 -- a bug in one analysis never stops the worker
+                # By type only: the request holds a transcript, and a message can quote it.
+                logger.error("analysis: %s failed unexpectedly: %s", request.input_key[:12], type(exc).__name__)
             finally:
                 self._busy.discard(task)
                 self._keys.discard(request.input_key)
@@ -183,7 +184,8 @@ class AnalysisQueue:
                         logger.debug("analysis: %s already classified; skipped", request.input_key[:12])
                         return None
             except Exception as exc:  # noqa: BLE001 -- classify anyway; the insert is idempotent
-                logger.warning("analysis: could not check %s before classifying: %r", request.input_key[:12], exc)
+                logger.warning("analysis: could not check %s before classifying: %s", request.input_key[:12],
+                               type(exc).__name__)
         criteria = list(request.criteria.values())
         outcome = await self.client.assess(model=request.model, text=request.text, criteria=criteria)
         record = self.record(request, outcome)
@@ -201,7 +203,8 @@ class AnalysisQueue:
                 return await analyses_repo.insert(conn, record)
         except Exception as exc:  # noqa: BLE001 -- the verdict is lost; the next message asks again
             metrics.errors_total.labels("analysis_write").inc()
-            logger.error("analysis: verdict for %s computed but not stored: %r", request.input_key[:12], exc)
+            logger.error("analysis: verdict for %s computed but not stored: %s", request.input_key[:12],
+                         type(exc).__name__)
             return None
 
     @staticmethod

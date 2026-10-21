@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 
 def message_text(content: Any) -> str:
@@ -54,6 +54,99 @@ def user_text(content: Any) -> str:
         return "\n".join(strip_openwebui_rag(p["text"]) for p in content
                          if isinstance(p, dict) and p.get("type") == "text" and isinstance(p.get("text"), str))
     return ""
+
+
+def user_texts(messages: Any) -> List[str]:
+    """:func:`user_text` of every user message, oldest first -- exactly one
+    entry per user message, so ``user_texts(m)[k - 1]`` is user message k's
+    text and ``len(user_texts(m)) == user_message_count(m)``. A user message
+    with no text (an image alone, an Anthropic message carrying only
+    ``tool_result`` blocks) is ``""``, not skipped."""
+    if not isinstance(messages, list):
+        return []
+    return [user_text(msg.get("content")) for msg in messages
+            if isinstance(msg, dict) and msg.get("role") == "user"]
+
+
+def _call_ids(msg: dict) -> List[Tuple[str, str]]:
+    """(call id, tool name) for every call one message makes: OpenAI
+    ``tool_calls[].id`` with its ``function.name``, Anthropic ``tool_use``
+    blocks' ``id`` with their ``name``."""
+    found: List[Tuple[str, str]] = []
+    calls = msg.get("tool_calls")
+    if isinstance(calls, list):
+        for call in calls:
+            if isinstance(call, dict) and isinstance(call.get("id"), str) and call["id"]:
+                name = _name_of(call.get("function"))
+                if name:
+                    found.append((call["id"], name))
+    content = msg.get("content")
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "tool_use" and isinstance(block.get("id"), str):
+                name = _name_of(block)
+                if name and block["id"]:
+                    found.append((block["id"], name))
+    return found
+
+
+def tool_results(messages: Any) -> List[Tuple[int, str, str]]:
+    """Every tool RESULT in the conversation, oldest first, as ``(index,
+    tool name, text)``:
+
+    * ``index`` -- the position in ``messages`` of the message that carries
+      it (an Anthropic user message carrying several ``tool_result`` blocks
+      gives each the same index), so a caller can tell which results came
+      after the latest user message;
+    * ``tool name`` -- the result's own ``name`` when it has one (a legacy
+      ``function`` message, a named ``tool`` message), else the name of the
+      CALL it answers: an OpenAI ``tool`` message's ``tool_call_id`` matched
+      to an assistant's ``tool_calls[].id``, an Anthropic ``tool_result``
+      block's ``tool_use_id`` matched to a ``tool_use`` block's ``id``.
+      ``""`` when neither resolves;
+    * ``text`` -- :func:`message_text` of the result's content (a string, or
+      the ``text`` parts / blocks of a list; images give ``""``). Tool output
+      is not user text, so no RAG block is stripped.
+
+    A result is matched to the most recent call with its id before it (to
+    any call with that id when none comes before -- a history replayed out
+    of order). Offered tool definitions are never read."""
+    out: List[Tuple[int, str, str]] = []
+    if not isinstance(messages, list):
+        return out
+    every: Optional[Dict[str, str]] = None
+    seen: Dict[str, str] = {}
+
+    def name_for(call_id: Any) -> str:
+        nonlocal every
+        if not isinstance(call_id, str) or not call_id:
+            return ""
+        if call_id in seen:
+            return seen[call_id]
+        if every is None:
+            every = {}
+            for msg in messages:
+                if isinstance(msg, dict):
+                    for cid, name in _call_ids(msg):
+                        every.setdefault(cid, name)
+        return every.get(call_id, "")
+
+    for index, msg in enumerate(messages):
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        if role in ("tool", "function"):
+            name = _name_of(msg) or name_for(msg.get("tool_call_id"))
+            out.append((index, name, message_text(msg.get("content"))))
+        content = msg.get("content")
+        if role == "user" and isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    name = _name_of(block) or name_for(block.get("tool_use_id"))
+                    out.append((index, name, message_text(block.get("content"))))
+        for cid, name in _call_ids(msg):
+            seen[cid] = name
+    return out
 
 
 def split_exchanges(messages: Any) -> List[Tuple[str, List[dict]]]:

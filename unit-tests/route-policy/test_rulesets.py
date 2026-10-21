@@ -40,16 +40,17 @@ def test_the_baked_in_seed():
     s = seed()
     # Only the current `default` is baked in: versions 1 (phase 2, shadow)
     # and 2 (phase 3) live on in the database alone (test_db.py's upgrade
-    # tests). `default-llm` is the phase-4 draft, bound as `auto`'s shadow;
-    # its version 1 likewise.
+    # tests). `default-llm` (phase 4) and `default-signals` (phase 5) are the
+    # drafts, both bound as `auto`'s shadows; default-llm's version 1 lives on
+    # in the database likewise.
     assert sorted((r.id, r.version, r.mode) for r in s.compiled) == [
-        ("default", 3, "enforce"), ("default-llm", 3, "shadow")]
+        ("default", 3, "enforce"), ("default-llm", 3, "shadow"), ("default-signals", 1, "shadow")]
     assert [(b.scope_model, b.scope_key_alias, b.ruleset_id, b.version, b.shadows) for b in s.bindings] == [
-        ("auto", None, "default", 3, (("default-llm", 3),))]
+        ("auto", None, "default", 3, (("default-llm", 3), ("default-signals", 1)))]
     ruleset = default_ruleset()
     assert ruleset.routes == ["local-general", "local-code", "local-reasoning", "local-private"]
     assert ruleset.default_route == "local-general"
-    assert [r.pin for r in s.compiled] == ["turn", "turn"]
+    assert [r.pin for r in s.compiled] == ["turn", "turn", "turn"]
     assert [(e.id, e.type, e.role, e.route) for e in ruleset.entries] == [
         ("privacy", "regex_text", "force", "local-private"),
         ("code-text", "regex_text", "vote", "local-code"),
@@ -72,7 +73,8 @@ def test_content_hash_ignores_comments_and_tracks_content(tmp_path):
         return {r.key: r.sha256 for r in load_directory(directory)}
 
     base = hashes(tmp_path)
-    assert base == hashes(RULESETS_DIR) and set(base) == {("default", 3), ("default-llm", 3)}
+    assert base == hashes(RULESETS_DIR) and set(base) == {("default", 3), ("default-llm", 3),
+                                                          ("default-signals", 1)}
     ruleset = tmp_path / "default.yaml"
     ruleset.write_text("# a new comment\n" + ruleset.read_text(encoding="utf-8"), encoding="utf-8")
     assert hashes(tmp_path) == base
@@ -81,6 +83,14 @@ def test_content_hash_ignores_comments_and_tracks_content(tmp_path):
     pattern.write_text(pattern.read_text(encoding="utf-8").replace("  - '```'\n", ""), encoding="utf-8")
     changed = hashes(tmp_path)
     assert all(changed[k] != base[k] for k in base)
+    # An example set is content of the ruleset that references it -- only that one.
+    examples = tmp_path / "examples" / "routes.yaml"
+    examples.write_text(examples.read_text(encoding="utf-8").replace("my script throws", "my script raises"),
+                        encoding="utf-8")
+    again = hashes(tmp_path)
+    assert again[("default-signals", 1)] != changed[("default-signals", 1)]
+    assert {k: again[k] for k in again if k[0] != "default-signals"} == {
+        k: changed[k] for k in changed if k[0] != "default-signals"}
 
 
 def test_hash_is_over_the_document_not_a_pydantic_dump():
@@ -110,6 +120,41 @@ def test_ref_errors():
     assert compile_ruleset(resolve_refs(stored, RULESETS_DIR)).sha256 == default_ruleset().sha256
     # Anything it does not recognise is left for validation.
     assert resolve_refs({"evaluators": "nope"}, RULESETS_DIR) == {"evaluators": "nope"}
+
+
+def test_examples_ref_is_inlined_as_examples():
+    (signals,) = [r for r in seed().compiled if r.id == "default-signals"]
+    (topic,) = [e for e in signals.document["evaluators"] if e["id"] == "topic"]
+    assert topic["config"]["examples_ref"] == "examples/routes.yaml"
+    assert topic["config"]["examples"]["name"] == "routes_v1" and len(topic["config"]["examples"]["examples"]) >= 75
+    # A stored document posted back keeps its examples: the ref is not re-read.
+    stored = copy.deepcopy(signals.document)
+    stored["evaluators"][7]["config"]["examples"]["examples"] = stored["evaluators"][7]["config"]["examples"][
+        "examples"][:3]
+    assert resolve_refs(stored, RULESETS_DIR) == stored
+
+
+def _topic_doc(config: dict) -> dict:
+    return {"id": "x", "version": 1, "mode": "shadow", "routes": ["local-general", "local-code"],
+            "default_route": "local-general",
+            "evaluators": [{"id": "topic", "type": "nearest_examples",
+                            "config": {"model": "intfloat/multilingual-e5-small", **config}}]}
+
+
+def test_examples_ref_errors(tmp_path):
+    with pytest.raises(RulesetFileError, match="does not exist"):
+        resolve_refs(_topic_doc({"examples_ref": "examples/none.yaml"}), RULESETS_DIR)
+    with pytest.raises(RulesetFileError, match="inside the rulesets directory"):
+        resolve_refs(_topic_doc({"examples_ref": "../docker-compose.route-policy.yml"}), RULESETS_DIR)
+    # A broken example file is a ruleset error, reported where it is.
+    (tmp_path / "examples").mkdir()
+    (tmp_path / "examples" / "bad.yaml").write_text(
+        "name: bad\nexamples:\n  - {id: a, route: local-code, text: one}\n"
+        "  - {id: a, route: local-code, text: two}\n", encoding="utf-8")
+    with pytest.raises(RulesetInvalid) as info:
+        compile_ruleset(resolve_refs(_topic_doc({"examples_ref": "examples/bad.yaml"}), tmp_path))
+    joined = "\n".join(info.value.errors)
+    assert "evaluators[0] (topic).config.examples.examples" in joined and "used twice" in joined
 
 
 def test_duplicate_versions_and_bad_files(tmp_path):
@@ -208,6 +253,8 @@ def test_seed_bindings(tmp_path):
     assert b.shadows == (("default-llm", 3),)
     (b,) = _bindings(tmp_path, "- {model: auto, ruleset: default, shadow: []}\n")
     assert b.shadows == ()
+    (b,) = _bindings(tmp_path, "- {model: auto, ruleset: default, shadow: [default-llm, default-signals]}\n")
+    assert b.shadows == (("default-llm", 3), ("default-signals", 1))
     for bad, match in [
         ("- {model: auto, ruleset: ghost}\n", "no ruleset 'ghost'"),
         ("- {model: auto, ruleset: default, version: 2}\n", "not baked in"),

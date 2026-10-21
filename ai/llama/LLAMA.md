@@ -207,12 +207,21 @@ Deliberately **not** set: `-ngl` (the build has no GPU backend), `--cache-type-k
 
 **Image and RAM.** Same `build:` block and image as `glm5.3-flash` (`llama-unsloth:${LLAMA_UNSLOTH_CPU_TAG}-cpu`): the Qwen3.5 architecture is in mainline llama.cpp, and the Unsloth `cpu` build is mainline plus extras, already running on the box. One image for both CPU services, so a `LLAMA_UNSLOTH_CPU_TAG` bump rebuilds and recreates both. The Q4_K_M weights are 2.74 GB; with two 16k slots of KV the process stays at a few GB (`docker stats qwen3.5-4b` is the real number). There is **no mlock**: a 2.7 GB file read on every token stays hot in the page cache, and an eviction while idle costs a second or two of re-reading on the next call, not the per-token stalls `glm5.3-flash`'s 148 GB would see — so neither `--load-mode mmap+mlock` nor the memlock ulimit. The repo also ships a vision projector (`mmproj-*.gguf`, ~670 MB) that `-hf` would download and load; `--no-mmproj` skips it, since the classifier entry is text-only.
 
-**Threads.** `-t 8` (`LLAMA_QWEN35_4B_THREADS`): a 4B model's decode stops scaling well before the core count, and the box's CPU is shared with `glm5.3-flash`, which takes every physical core by default. To keep the two apart, give each its own cores — on BOTH sides, since a range on one only still lets the other's threads run there. Pick the ranges from `lscpu -e` (physical cores, one socket where possible):
+**Threads and cores.** `-t 16` on cores 0–15 (`LLAMA_QWEN35_4B_THREADS=16`, `LLAMA_QWEN35_4B_EXTRA_ARGS="--cpu-range 0-15"` in `.env.example`). The box is a Xen VM with 32 vCPUs (one thread per core, one NUMA node, AVX2 only — the hypervisor hides AVX-512 / VNNI), split three ways:
+
+| Cores | Who | How |
+|---|---|---|
+| 0–15 | `qwen3.5-4b` | `--cpu-range 0-15` (`-Cr`) + `-t 16` |
+| 16–23 | everything else (classifier, route-policy, Postgres, …) | unpinned |
+| 24–31 | the `signals` sidecar (route-policy's PII / topic / injection models, ~100 ms per call) | its compose `cpuset` (`SIGNALS_CPUSET`, [SIGNALS.md § CPU pinning](../signals/SIGNALS.md#cpu-pinning)) |
+
+At `-t 8` unpinned a verdict took ~60–100 s (prompt 25–50 tok/s, decode 5–12 tok/s, measured 2026-10-20), and `glm5.3-flash` — which takes every physical core by default — has been off for months, so doubling the threads on otherwise idle cores is the cheapest speed-up. The two values go together: the compose file still falls back to `-t 8` with no range when `.env` lacks them, because 16 unpinned threads would also land on the sidecar's cores. On a host with fewer than 32 CPUs, lower both (and leave `SIGNALS_CPUSET` empty). Before turning `glm5.3-flash` on, give it a range of its own — on BOTH sides, since a range on one only still lets the other's threads run there. Pick the ranges from `lscpu -e`:
 
 ```bash
 # .env
-LLAMA_QWEN35_4B_EXTRA_ARGS=--cpu-range 0-7
-LLAMA_GLM53_FLASH_EXTRA_ARGS=--cpu-range 8-47 -t 40
+LLAMA_QWEN35_4B_THREADS=16
+LLAMA_QWEN35_4B_EXTRA_ARGS="--cpu-range 0-15"
+LLAMA_GLM53_FLASH_EXTRA_ARGS="--cpu-range 16-23 -t 8"   # only while it runs; it needs cores taken from the others to be fast
 ```
 
 **Thinking off.** Qwen3.5 thinks by default; its chat template reads `enable_thinking`. A classifier call wants the JSON answer, not minutes of CPU reasoning, so the server default is `--chat-template-kwargs '{"enable_thinking":false}'`, and the registry entry also sends `chat_template_kwargs: {enable_thinking: false}` in its `extra_body` (the classifier's `reasoning.value` is a string, so a boolean switch rides there). A request that sends `enable_thinking: true` still turns it on.
@@ -274,8 +283,8 @@ curl -s http://localhost:8005/assess -H 'content-type: application/json' -d '{
 |---|---|---|
 | `PORT_LLAMA_QWEN35_4B` | `8028` | Host port (container 8000), in the PORT REGISTRY. In-network callers use `http://qwen3.5-4b:8000`. |
 | `LLAMA_QWEN35_4B_QUANT` | `Q4_K_M` | Quant tag — see above. |
-| `LLAMA_QWEN35_4B_THREADS` | `8` | `-t`. |
-| `LLAMA_QWEN35_4B_EXTRA_ARGS` | _(empty)_ | Extra llama-server args appended verbatim (`--cpu-range 0-7`, …). |
+| `LLAMA_QWEN35_4B_THREADS` | `16` (compose fallback `8`) | `-t`; set together with the range below (Threads and cores, above). |
+| `LLAMA_QWEN35_4B_EXTRA_ARGS` | `"--cpu-range 0-15"` (compose fallback empty) | Extra llama-server args appended verbatim. Cores 0–15; 24–31 are the `signals` sidecar's. |
 
 ### First-run download
 

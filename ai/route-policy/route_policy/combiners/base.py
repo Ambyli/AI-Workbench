@@ -15,6 +15,11 @@ implements :meth:`Combiner.choose`, the choice among ordinary votes:
    vetoed, the first route in ``routes`` that is not; if every route is
    vetoed, ``default_route`` anyway (a veto never leaves a request unrouted).
 
+``role: observe`` is in none of the steps: an observe evaluator runs and is
+logged with its would-be route (``evaluations.route``), and no combiner reads
+it -- no score, no force, no veto. It is how a signal (the jailbreak score)
+is measured without routing anything, in a shadow or an enforced ruleset.
+
 ``scores`` is the same for every type: Σ weight × confidence per route over
 the non-abstaining vote and force votes (vetoes are not scores). It is what
 /decide returns and what route-policy-db stores.
@@ -30,8 +35,8 @@ from typing import Any, Callable, ClassVar, Dict, List, Optional, Sequence, Type
 
 from pydantic import BaseModel, ConfigDict
 
-ROLE_VOTE, ROLE_FORCE, ROLE_VETO = "vote", "force", "veto"
-ROLES = (ROLE_VOTE, ROLE_FORCE, ROLE_VETO)
+ROLE_VOTE, ROLE_FORCE, ROLE_VETO, ROLE_OBSERVE = "vote", "force", "veto", "observe"
+ROLES = (ROLE_VOTE, ROLE_FORCE, ROLE_VETO, ROLE_OBSERVE)
 
 
 @dataclass(frozen=True)

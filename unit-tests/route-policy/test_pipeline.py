@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import logging
 import uuid
 
 import pytest
@@ -66,16 +67,75 @@ class _Boom(Evaluator):
         raise RuntimeError("kaput")
 
 
-def test_a_raising_evaluator_is_an_abstain_with_its_error():
+class _Quoting(Evaluator):
+    """Raises everywhere with a message that quotes the conversation, the
+    way common.pii's KeyError('ſ') did."""
+
+    type_name = "quoting"
+
+    def _boom(self, ctx):
+        raise KeyError(f"no axis for {ctx.messages[-1]['content']!r}")
+
+    def analysis_lookups(self, ctx):
+        self._boom(ctx)
+
+    def analysis_requests(self, ctx):
+        self._boom(ctx)
+
+    def signal_requests(self, ctx):
+        self._boom(ctx)
+
+    async def evaluate(self, ctx):
+        self._boom(ctx)
+
+
+class _NotAnOutcome(Evaluator):
+    type_name = "not_an_outcome"
+
+    async def evaluate(self, ctx):
+        return {"route": "local-code"}
+
+
+def _with_first(evaluator, evaluator_id="boom"):
     ruleset = default_ruleset()
     first = ruleset.entries[0]
-    boom = type(first)("boom", "boom", "force", "local-private", 1.0, _Boom("boom", None))
-    hacked = type(ruleset)(**{**ruleset.__dict__, "entries": [boom, *ruleset.entries[1:]]})
+    entry = type(first)(evaluator_id, evaluator.type_name, "force", "local-private", 1.0, evaluator)
+    return type(ruleset)(**{**ruleset.__dict__, "entries": [entry, *ruleset.entries[1:]]})
+
+
+def test_a_raising_evaluator_is_an_abstain_with_its_error():
+    hacked = _with_first(_Boom("boom", None))
     d = asyncio.run(run_pipeline(hacked, context([user("write python")])))
     assert d.route == "local-code"           # the rest still decided
-    assert d.votes[0].abstained and d.votes[0].error == "RuntimeError: kaput"
-    assert d.votes[0].reason == "error: RuntimeError: kaput"
-    assert d.errors == ["boom: RuntimeError: kaput"]
+    # Only the exception's TYPE is kept: its message can quote the conversation.
+    assert d.votes[0].abstained and d.votes[0].error == "RuntimeError"
+    assert d.votes[0].reason == "error: RuntimeError"
+    assert d.errors == ["boom: RuntimeError"]
+
+
+def test_no_exception_message_is_stored_or_logged(caplog):
+    from route_policy.engine import pipeline
+
+    secret = "77 N 400 ſ -- zebra-quartz-7731"
+    hacked = _with_first(_Quoting("quoting", None), "quoting")
+    ctx = context([user(secret)])
+    with caplog.at_level(logging.DEBUG):
+        assert pipeline.analysis_lookups(hacked, ctx) == []
+        assert pipeline.analysis_requests(hacked, ctx) == []
+        pipeline.signal_requests(hacked, ctx)
+        d = asyncio.run(run_pipeline(hacked, ctx))
+    vote = d.votes[0]
+    assert (vote.error, vote.reason, d.errors) == ("KeyError", "error: KeyError", ["quoting: KeyError"])
+    body = d.response(None, with_detail=True)
+    assert "zebra" not in repr(body) and "zebra" not in repr(d.errors)
+    assert caplog.records and not any("zebra" in r.getMessage() for r in caplog.records)
+    assert sum("KeyError" in r.getMessage() for r in caplog.records) >= 4
+
+
+def test_an_evaluator_that_returns_no_outcome_says_so():
+    d = asyncio.run(run_pipeline(_with_first(_NotAnOutcome("x", None), "x"), context([user("write python")])))
+    assert d.votes[0].abstained and d.votes[0].error == "evaluate() returned dict, not an Outcome"
+    assert d.route == "local-code"
 
 
 def test_every_evaluator_runs_even_after_a_force():
@@ -83,6 +143,19 @@ def test_every_evaluator_runs_even_after_a_force():
     assert d.route == "local-private"
     assert [v.abstained for v in d.votes] == [False, False, True, True, False]
     assert d.decided_by == "privacy"
+
+
+def test_an_observe_vote_is_logged_with_its_route_and_changes_nothing():
+    doc = copy.deepcopy(default_ruleset().document)
+    doc["evaluators"].insert(0, {"id": "watch", "type": "static", "role": "observe",
+                                 "config": {"reason": "always"}, "vote": {"route": "local-private", "weight": 5}})
+    observed = compile_doc(doc)
+    for messages in ([user("hello")], [user("write python")], [user("my ssn")]):
+        d, plain = run(observed, messages), run(default_ruleset(), messages)
+        assert (d.route, d.scores, d.decided_by) == (plain.route, plain.scores, plain.decided_by), messages
+        watch = d.response(None, with_detail=True)["votes"][0]
+        assert watch == {**watch, "evaluator": "watch", "role": "observe", "route": "local-private",
+                         "abstained": False, "confidence": 1.0, "weight": 5.0, "reason": "always"}
 
 
 # -- the turn pin ------------------------------------------------------------------------

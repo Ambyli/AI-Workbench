@@ -16,8 +16,10 @@ from common.conversation import (
     render_transcript,
     split_exchanges,
     strip_openwebui_rag,
+    tool_results,
     user_message_count,
     user_text,
+    user_texts,
 )
 
 
@@ -353,3 +355,95 @@ def test_exchanges_and_transcripts_read_the_users_words_only():
         assert render_transcript(wrapped, exchanges=exchanges, max_chars=6000) == \
             render_transcript(plain, exchanges=exchanges, max_chars=6000)
     assert user_message_count(wrapped) == user_message_count(plain)
+
+
+# -- user_texts / tool_results ----------------------------------------------------------
+
+def test_user_texts_is_one_entry_per_user_message_rag_stripped():
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:,"}}]},   # no text
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "RESULT"}]},
+        {"role": "user", "content": owui_wrap("check the weather in Utah")},
+    ]
+    assert user_texts(msgs) == ["first", "", "", "check the weather in Utah"]
+    assert len(user_texts(msgs)) == user_message_count(msgs)
+    assert user_texts(CHAT) == [text for text, _ in split_exchanges(CHAT)]
+
+
+def test_user_texts_on_junk():
+    assert user_texts(None) == [] and user_texts({}) == [] and user_texts("x") == []
+    assert user_texts([None, 3, {"role": "user"}, {"role": "USER", "content": "x"}]) == [""]
+
+
+def test_tool_results_resolve_openai_names_through_call_ids():
+    msgs = [
+        {"role": "user", "content": "look up Laura"},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "call_a", "type": "function", "function": {"name": "run_query", "arguments": "{}"}},
+            {"id": "call_b", "type": "function", "function": {"name": "web_search", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "call_a", "content": "1 row: Laura Kim"},
+        {"role": "tool", "tool_call_id": "call_b",
+         "content": [{"type": "text", "text": "page one"}, {"type": "text", "text": "page two"}]},
+        {"role": "tool", "tool_call_id": "call_zzz", "content": "an orphan"},            # no such call
+        {"role": "tool", "name": "named_tool", "tool_call_id": "call_a", "content": "own name wins"},
+        {"role": "assistant", "function_call": {"name": "legacy", "arguments": "{}"}},
+        {"role": "function", "name": "legacy", "content": "legacy result"},
+        {"role": "user", "content": "thanks"},
+    ]
+    assert tool_results(msgs) == [
+        (2, "run_query", "1 row: Laura Kim"),
+        (3, "web_search", "page one\npage two"),
+        (4, "", "an orphan"),
+        (5, "named_tool", "own name wins"),
+        (7, "legacy", "legacy result"),
+    ]
+
+
+def test_tool_results_resolve_anthropic_tool_use_blocks():
+    msgs = [
+        {"role": "user", "content": "fix the bug"},
+        {"role": "assistant", "content": [{"type": "text", "text": "Reading."},
+                                          {"type": "tool_use", "id": "toolu_1", "name": "read_file", "input": {}},
+                                          {"type": "tool_use", "id": "toolu_2", "name": "grep", "input": {}}]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_1", "content": "def main(): ..."},
+            {"type": "tool_result", "tool_use_id": "toolu_2",
+             "content": [{"type": "text", "text": "a.py:3"}, {"type": "image", "source": {}}]},
+            {"type": "text", "text": "and also this"}]},
+    ]
+    assert tool_results(msgs) == [(2, "read_file", "def main(): ..."), (2, "grep", "a.py:3")]
+    # The user's own text part is user text, not a tool result.
+    assert user_texts(msgs) == ["fix the bug", "and also this"]
+
+
+def test_tool_results_match_the_most_recent_call_with_the_id():
+    msgs = [
+        {"role": "tool", "tool_call_id": "c1", "content": "before any call"},   # out of order: any call
+        {"role": "assistant", "tool_calls": [{"id": "c1", "function": {"name": "first"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "one"},
+        {"role": "assistant", "tool_calls": [{"id": "c1", "function": {"name": "second"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "two"},
+    ]
+    assert tool_results(msgs) == [(0, "first", "before any call"), (2, "first", "one"), (4, "second", "two")]
+
+
+def test_tool_results_keep_text_less_results_and_ignore_junk():
+    msgs = [None, 3, "x",
+            {"role": "system", "tools": [{"type": "function", "function": {"name": "offered"}}]},
+            {"role": "assistant", "tool_calls": [None, {"id": 5, "function": {"name": "bad_id"}},
+                                                 {"id": "c", "function": "nope"}]},
+            {"role": "tool", "tool_call_id": "c", "content": [{"type": "image_url", "image_url": {}}]},
+            {"role": "tool", "tool_call_id": 5, "content": None},
+            {"role": "user", "content": [None, {"type": "tool_result"}, {"type": "tool_result", "content": 7}]}]
+    assert tool_results(msgs) == [(5, "", ""), (6, "", ""), (7, "", ""), (7, "", "")]
+    assert tool_results(None) == [] and tool_results({}) == [] and tool_results("x") == []
+
+
+def test_tool_results_never_strip_the_rag_block():
+    page = owui_wrap("not the user's words")
+    msgs = [{"role": "assistant", "tool_calls": [{"id": "f", "function": {"name": "fetch_url"}}]},
+            {"role": "tool", "tool_call_id": "f", "content": page}]
+    assert tool_results(msgs) == [(1, "fetch_url", page)]

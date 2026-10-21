@@ -100,3 +100,19 @@ def test_weighted_uses_confidence():
 def test_scores_skip_abstains_and_vetoes():
     assert scores_of([b("a", "local-code", abstained=True), b("v", "local-code", role="veto"),
                       b("f", "local-private", role="force", weight=2.0)]) == {"local-private": 2.0}
+
+
+def test_observe_is_ignored_by_every_combiner():
+    """role: observe is logged with its would-be route but never combined:
+    no score, no force, no veto -- in either combiner."""
+    for combiner in (priority(), weighted(0.0)):
+        c = combiner.combine([b("watch", "local-private", role="observe", weight=9.0), b("code", "local-code")],
+                             ROUTES, "local-general")
+        assert (c.route, c.decided_by, c.scores, c.vetoed) == ("local-code", "code", {"local-code": 1.0}, ())
+        alone = combiner.combine([b("watch", "local-reasoning", role="observe", weight=9.0)], ROUTES,
+                                 "local-general")
+        assert (alone.route, alone.decided_by, alone.scores) == ("local-general", None, {})
+        # An observe on the default route does not veto it either.
+        assert combiner.combine([b("watch", "local-general", role="observe")], ROUTES,
+                                "local-general").route == "local-general"
+    assert scores_of([b("watch", "local-private", role="observe")]) == {}

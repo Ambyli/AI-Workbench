@@ -41,6 +41,13 @@ the background AFTER the answer. An evaluator that raises in either is
 skipped and logged -- the decision never depends on them. A call that is not
 its turn's first asks for nothing: the turn's first call already asked for
 its conversation prefix.
+
+And a third (phase 5): what to fetch from the ``signals`` sidecar BEFORE the
+run (``Evaluator.signal_requests``, merged by :func:`signal_requests` into
+ONE request, ``signals.model.merge``). An evaluator that raises there is
+skipped and logged too; its ``evaluate`` then abstains on the missing
+answer. Every call asks, a turn's later calls included: the sidecar caches
+by text, so a repeated text costs a lookup.
 """
 
 from __future__ import annotations
@@ -55,6 +62,7 @@ from ..analysis.model import AnalysisRequest
 from ..combiners.base import Ballot
 from ..evaluators.base import Outcome
 from ..rulesets.model import CompiledRuleset
+from ..signals.model import SignalBatch, SignalRequest, merge
 from . import invariants
 from .context import RequestContext, TurnPin
 
@@ -148,7 +156,11 @@ class Decision:
 
 
 def _error_text(exc: BaseException) -> str:
-    text = f"{type(exc).__name__}: {exc}"
+    """An exception as it is logged and stored (``evaluations.error``, the
+    vote's reason, ``decisions.error``): its TYPE name only. Evaluators read
+    the conversation, and a message can quote it -- ``common.pii``'s grid
+    lookup once raised ``KeyError('ſ')``, a character of the user's text."""
+    text = type(exc).__name__
     return text if len(text) <= ERROR_MAX_CHARS else text[: ERROR_MAX_CHARS - 1] + "…"
 
 
@@ -188,6 +200,47 @@ def analysis_requests(ruleset: CompiledRuleset, ctx: RequestContext) -> List[Ana
     return out
 
 
+def signal_requests(ruleset: CompiledRuleset, ctx: RequestContext) -> Optional[SignalBatch]:
+    """The ruleset's sidecar requests as ONE batch (``signals.model.merge``),
+    or None when no evaluator asked for anything -- then there is no call.
+    A request for a task already asked for with other parameters is left
+    out and logged; its evaluator abstains (``conflict``)."""
+    requests: List[SignalRequest] = []
+    for entry in ruleset.entries:
+        try:
+            requests.extend(entry.evaluator.signal_requests(ctx))
+        except Exception as exc:  # noqa: BLE001 -- its evaluate() then abstains on the missing answer
+            logger.warning("engine: %s@%d evaluator %s signal_requests raised: %s",
+                           ruleset.id, ruleset.version, entry.id, _error_text(exc))
+    if not requests:
+        return None
+    batch = merge(requests)
+    if batch.conflicts and (ruleset.id, ruleset.version) not in _CONFLICTS_LOGGED:
+        _CONFLICTS_LOGGED.add((ruleset.id, ruleset.version))   # a ruleset property: once per process
+        logger.warning("engine: %s@%d asks the signals sidecar for %s twice with different parameters; "
+                       "the first request is sent", ruleset.id, ruleset.version, ", ".join(batch.conflicts))
+    return batch
+
+
+_CONFLICTS_LOGGED: set = set()
+
+
+def signal_warmups(rulesets: List[CompiledRuleset]) -> List[SignalBatch]:
+    """What to send the sidecar at startup for these rulesets: one batch per
+    distinct warm-up (a task name can appear once per request), texts
+    empty."""
+    seen: Dict[str, SignalRequest] = {}
+    for ruleset in rulesets:
+        for entry in ruleset.entries:
+            try:
+                for request in entry.evaluator.signal_warmups():
+                    seen.setdefault(request.key, request)
+            except Exception as exc:  # noqa: BLE001 -- it just starts cold
+                logger.warning("engine: %s@%d evaluator %s signal_warmups raised: %s",
+                               ruleset.id, ruleset.version, entry.id, _error_text(exc))
+    return [merge([request], keep_empty=True) for request in seen.values()]
+
+
 async def run(ruleset: CompiledRuleset, ctx: RequestContext) -> Decision:
     started = time.perf_counter()
     votes: List[Vote] = []
@@ -197,12 +250,15 @@ async def run(ruleset: CompiledRuleset, ctx: RequestContext) -> Decision:
         error: Optional[str] = None
         try:
             outcome = await entry.evaluator.evaluate(ctx)
-            if not isinstance(outcome, Outcome):
-                raise TypeError(f"evaluate() returned {type(outcome).__name__}, not an Outcome")
         except Exception as exc:  # noqa: BLE001 -- one broken evaluator never breaks the decision
             error = _error_text(exc)
             logger.warning("engine: %s@%d evaluator %s raised: %s", ruleset.id, ruleset.version, entry.id, error)
             outcome = Outcome.abstain(f"error: {error}", {})
+        else:
+            if not isinstance(outcome, Outcome):
+                error = f"evaluate() returned {type(outcome).__name__}, not an Outcome"
+                logger.warning("engine: %s@%d evaluator %s: %s", ruleset.id, ruleset.version, entry.id, error)
+                outcome = Outcome.abstain(f"error: {error}", {})
         elapsed = _ms(time.perf_counter() - t0)
 
         route: Optional[str] = None

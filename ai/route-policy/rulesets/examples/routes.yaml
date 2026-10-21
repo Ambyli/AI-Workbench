@@ -1,0 +1,118 @@
+# routes_v1 -- labelled example prompts for the `default-signals` draft's
+# `topic` evaluator (type nearest_examples): the sidecar embeds the latest
+# user message and votes the route of its nearest examples.
+#
+# CURATED AND PII-FREE. Written by hand for this business (solar installs,
+# permits, Phoenix / Trino data questions) -- never a real prompt, never
+# text pasted from a chat or from the phase-4 gold set (those are customer
+# chats; this file is stored in route-policy-db and federated into Trino).
+# unit-tests/route-policy/test_default_signals.py runs common.pii over every
+# text and fails on any finding.
+#
+# The only copy: inlined into every ruleset version that references it
+# (`examples_ref`), and hashed with it -- an edit here needs a ruleset
+# `version` bump (ROUTE_POLICY.md § Changing a ruleset). Ids are stable:
+# Trino reads them back from `evaluations.detail.neighbours`, so never reuse
+# a removed id for a different text.
+#
+# Rules (checked by the nearest_examples config): ids unique, routes among
+# the ruleset's, each text 1-300 characters, at most 1,000 examples. About
+# 30 per route; local-private has none on purpose -- privacy is the `pii`
+# and `privacy` evaluators' job, never a topic's.
+name: routes_v1
+examples:
+  # -- local-code: writing, fixing, running or changing software -------------
+  - {id: code-001, route: local-code, text: "my script throws an error when I run it"}
+  - {id: code-002, route: local-code, text: "help me debug this function, it returns the wrong value"}
+  - {id: code-003, route: local-code, text: "write a python program that renames every file in a folder"}
+  - {id: code-004, route: local-code, text: "the app freezes when I click save"}
+  - {id: code-005, route: local-code, text: "build a simple web page with a contact form"}
+  - {id: code-006, route: local-code, text: "how do I fix a merge conflict in git"}
+  - {id: code-007, route: local-code, text: "add a feature to the program we wrote earlier"}
+  - {id: code-008, route: local-code, text: "why is my SQL query so slow on a big table"}
+  - {id: code-009, route: local-code, text: "convert this JavaScript file to TypeScript"}
+  - {id: code-010, route: local-code, text: "make a todo list app I can run in the browser"}
+  - {id: code-011, route: local-code, text: "my code works on my laptop but fails on the server"}
+  - {id: code-012, route: local-code, text: "write a regular expression that matches ISO dates"}
+  - {id: code-013, route: local-code, text: "the page shows a blank screen after I deploy it"}
+  - {id: code-014, route: local-code, text: "write a SQL query that counts Phoenix projects by permit status"}
+  - {id: code-015, route: local-code, text: "build a small dashboard that charts installs per month from a CSV export"}
+  - {id: code-016, route: local-code, text: "write a script that reads the permit spreadsheet and flags rows with missing documents"}
+  - {id: code-017, route: local-code, text: "the API call returns a server error and I do not know why"}
+  - {id: code-018, route: local-code, text: "install and configure nginx as a reverse proxy for the app"}
+  - {id: code-019, route: local-code, text: "write a function that works out system size from panel count and wattage"}
+  - {id: code-020, route: local-code, text: "create a calculator app with a history panel"}
+  - {id: code-021, route: local-code, text: "parse this JSON response and pull out the inverter fields"}
+  - {id: code-022, route: local-code, text: "my pip install fails with a dependency conflict"}
+  - {id: code-023, route: local-code, text: "split this long Python file into smaller modules"}
+  - {id: code-024, route: local-code, text: "add input validation to the signup form"}
+  - {id: code-025, route: local-code, text: "the scheduled job runs twice every night, help me fix it"}
+  - {id: code-026, route: local-code, text: "write a Node script that uploads files to an S3 bucket"}
+  - {id: code-027, route: local-code, text: "how do I read environment variables in a FastAPI app"}
+  - {id: code-028, route: local-code, text: "the chart on the page does not update when new data arrives"}
+  - {id: code-029, route: local-code, text: "add logging to this script so I can see where it fails"}
+  - {id: code-030, route: local-code, text: "write a Trino query that joins installs to permits by project"}
+
+  # -- local-reasoning: maths, logic, planning, analysis with numbers --------
+  - {id: reasoning-001, route: local-reasoning, text: "solve this equation step by step"}
+  - {id: reasoning-002, route: local-reasoning, text: "what is the probability that two dice add up to seven"}
+  - {id: reasoning-003, route: local-reasoning, text: "prove this statement by induction"}
+  - {id: reasoning-004, route: local-reasoning, text: "work out which option is cheaper over ten years"}
+  - {id: reasoning-005, route: local-reasoning, text: "a logic puzzle: three boxes are all mislabeled, which one should I open first"}
+  - {id: reasoning-006, route: local-reasoning, text: "calculate the compound interest on a loan over five years"}
+  - {id: reasoning-007, route: local-reasoning, text: "plan the most efficient route between these job sites"}
+  - {id: reasoning-008, route: local-reasoning, text: "analyze the pros and cons of each pricing strategy with numbers"}
+  - {id: reasoning-009, route: local-reasoning, text: "estimate how many homes in a county could fit rooftop solar, and show your reasoning"}
+  - {id: reasoning-010, route: local-reasoning, text: "find the derivative of x squared times sine x"}
+  - {id: reasoning-011, route: local-reasoning, text: "how many ways can five books be arranged on a shelf"}
+  - {id: reasoning-012, route: local-reasoning, text: "if prices rise three percent a year, what will this cost in ten years"}
+  - {id: reasoning-013, route: local-reasoning, text: "how long until a home battery pays for itself if it shifts peak usage every day"}
+  - {id: reasoning-014, route: local-reasoning, text: "each crew can do three installs a week, how many crews do we need to clear next month's backlog"}
+  - {id: reasoning-015, route: local-reasoning, text: "is this argument logically valid, and why"}
+  - {id: reasoning-016, route: local-reasoning, text: "work out the break-even point for opening a new sales office"}
+  - {id: reasoning-017, route: local-reasoning, text: "if a panel loses half a percent of its output each year, how much is left after twenty-five years"}
+  - {id: reasoning-018, route: local-reasoning, text: "which of these three financing offers gives the homeowner the lowest total cost"}
+  - {id: reasoning-019, route: local-reasoning, text: "explain step by step how the overall conversion rate can drop when every region improved"}
+  - {id: reasoning-020, route: local-reasoning, text: "estimate the yearly production of a system facing west instead of south"}
+  - {id: reasoning-021, route: local-reasoning, text: "design a fair rotation for weekend on-call shifts across six people"}
+  - {id: reasoning-022, route: local-reasoning, text: "how much would we save per year if cancellations dropped by a third"}
+  - {id: reasoning-023, route: local-reasoning, text: "work through this word problem about two pipes filling a tank"}
+  - {id: reasoning-024, route: local-reasoning, text: "rank these projects by expected margin and explain the trade-offs"}
+  - {id: reasoning-025, route: local-reasoning, text: "calculate how many panels fit on a roof section of a given width and height"}
+  - {id: reasoning-026, route: local-reasoning, text: "what sample size do I need to tell whether the new sales pitch improved close rates"}
+  - {id: reasoning-027, route: local-reasoning, text: "figure out the best order to visit these permit offices so we finish in one day"}
+  - {id: reasoning-028, route: local-reasoning, text: "a home uses far more power in summer than in winter, how big should the system be to cover the whole year"}
+  - {id: reasoning-029, route: local-reasoning, text: "find the flaw in this proof"}
+  - {id: reasoning-030, route: local-reasoning, text: "model how a yearly utility rate increase changes the savings over the life of the system"}
+
+  # -- local-general: everything else -----------------------------------------
+  - {id: general-001, route: local-general, text: "what's the weather like this weekend"}
+  - {id: general-002, route: local-general, text: "write a birthday message for my coworker"}
+  - {id: general-003, route: local-general, text: "recommend a good movie for tonight"}
+  - {id: general-004, route: local-general, text: "summarize this news article"}
+  - {id: general-005, route: local-general, text: "what is the capital of Canada"}
+  - {id: general-006, route: local-general, text: "give me ideas for a family dinner"}
+  - {id: general-007, route: local-general, text: "translate this sentence into German"}
+  - {id: general-008, route: local-general, text: "how does a heat pump work"}
+  - {id: general-009, route: local-general, text: "make this email sound more professional"}
+  - {id: general-010, route: local-general, text: "what are some fun things to do near the office this weekend"}
+  - {id: general-011, route: local-general, text: "tell me about the history of the Eiffel Tower"}
+  - {id: general-012, route: local-general, text: "write a short product description for solar panels"}
+  - {id: general-013, route: local-general, text: "what time is it in Tokyo"}
+  - {id: general-014, route: local-general, text: "suggest a name for my podcast"}
+  - {id: general-015, route: local-general, text: "what does a building inspector check on a solar install"}
+  - {id: general-016, route: local-general, text: "explain net metering to a homeowner in plain language"}
+  - {id: general-017, route: local-general, text: "draft a friendly reminder that the site survey is tomorrow"}
+  - {id: general-018, route: local-general, text: "what documents does a homeowner usually need for an interconnection application"}
+  - {id: general-019, route: local-general, text: "how many projects in Phoenix are waiting on a permit right now"}
+  - {id: general-020, route: local-general, text: "list the installs scheduled for next week"}
+  - {id: general-021, route: local-general, text: "write a thank-you note to a homeowner after their install"}
+  - {id: general-022, route: local-general, text: "what is the federal tax credit for residential solar"}
+  - {id: general-023, route: local-general, text: "rewrite this announcement so it is shorter"}
+  - {id: general-024, route: local-general, text: "give me talking points for a homeowner who is worried about roof leaks"}
+  - {id: general-025, route: local-general, text: "what is the difference between a string inverter and microinverters"}
+  - {id: general-026, route: local-general, text: "show me the open tickets for the service team"}
+  - {id: general-027, route: local-general, text: "how do solar batteries work during a power outage"}
+  - {id: general-028, route: local-general, text: "suggest a spot for a team lunch"}
+  - {id: general-029, route: local-general, text: "write a social media post about our new service area"}
+  - {id: general-030, route: local-general, text: "what should I know before visiting a homeowner for the first time"}

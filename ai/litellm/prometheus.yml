@@ -32,6 +32,14 @@ scrape_configs:
     static_configs:
       - targets: ["route-policy:8000"]
 
+  # The signals sidecar (ai/signals): requests and task statuses, per-model
+  # inference time and queue depth, cache hits, example-set warmings. Label
+  # values come from fixed lists, never from a request. Swap-class like
+  # route-policy, so the same one-copy-per-scrape caveat applies.
+  - job_name: "signals"
+    static_configs:
+      - targets: ["signals:8000"]
+
   # The ai/edge HAProxy's built-in Prometheus exporter (official image built
   # with USE_PROMEX=1). edge:8405 is an internal-only frontend on ai_shared,
   # never published. Per-backend health, sessions, 503s / 429s, queue time.

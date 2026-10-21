@@ -4,9 +4,12 @@ version = "0.1.0"
 description = "Route-policy engine: rulesets of evaluators pick a LiteLLM chain alias for each `auto` turn, and every decision is logged to route-policy-db"
 requires-python = ">=3.11"
 dependencies = [
-    # common.conversation (split_exchanges, called_tool_names, message_text)
-    # and common.keywordmatch (the Go-RE2 keyword-rule compiler) -- both
-    # stdlib-only, so no extra is needed.
+    # common.conversation (split_exchanges, called_tool_names, message_text,
+    # user_texts, tool_results), common.keywordmatch (the Go-RE2 keyword-rule
+    # compiler), common.pii (the in-process PII patterns) and common.signals
+    # (the signals sidecar's wire format + client) -- stdlib-only apart from
+    # the client's lazily imported httpx, which is a dependency below anyway,
+    # so no extra is needed.
     "common",
     "fastapi",
     "uvicorn",
@@ -20,7 +23,8 @@ dependencies = [
     "pyyaml",
     # route_policy/analysis/classifier_client.py: the llm_classifier's
     # POST /assess cycle against the document classifier (also used by
-    # bench/). common.net's DEFAULT_BLOCKED_NETWORKS (the locality guard) is
-    # stdlib-only and needs no extra.
+    # bench/), and common.signals.SignalsClient (the signals sidecar).
+    # common.net's DEFAULT_BLOCKED_NETWORKS / locality_problem (the locality
+    # guards) are stdlib-only and need no extra.
     "httpx",
 ]

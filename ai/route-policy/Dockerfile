@@ -14,9 +14,10 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 WORKDIR /app
 
 # Workspace bootstrap. Only common's stdlib-only subpackages are imported
-# (common.conversation, common.keywordmatch, common.net's validate-side
-# DEFAULT_BLOCKED_NETWORKS), but the package is installed whole, as every
-# service here does.
+# (common.conversation, common.keywordmatch, common.pii, common.signals --
+# whose client imports httpx, already a dependency -- and common.net's
+# DEFAULT_BLOCKED_NETWORKS / locality_problem), but the package is installed
+# whole, as every service here does.
 COPY pyproject.toml .
 COPY shared/common ./shared/common
 COPY ai/route-policy/pyproject.toml ./ai/route-policy/

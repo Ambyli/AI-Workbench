@@ -172,17 +172,21 @@ def test_evaluate_errors(client):
 
 def test_health_ready_and_types(client):
     assert client.get("/health").json() == {"status": "ok", "rulesets": [{"id": "default", "version": 3},
-                                                                         {"id": "default-llm", "version": 3}],
+                                                                         {"id": "default-llm", "version": 3},
+                                                                         {"id": "default-signals", "version": 1}],
                                             "bindings": 1}
     assert client.get("/ready").status_code == 503
     types = client.get("/evaluator-types").json()
     assert set(types["evaluator_types"]) == {"regex_text", "tool_calls", "cooldown", "backend_load", "static",
-                                             "llm_classifier"}
+                                             "llm_classifier", "pii", "nearest_examples", "prompt_injection",
+                                             "language", "text_shape", "context_size"}
+    assert types["evaluator_types"]["nearest_examples"]["vote_route"] == "chosen by the evaluator"
+    assert types["evaluator_types"]["pii"]["config_schema"]["required"] == ["force"]
     llm = types["evaluator_types"]["llm_classifier"]
     assert llm["vote_route"] == "chosen by the evaluator" and llm["output"]["relevance"] is None
     assert llm["config_schema"]["required"] == ["model", "criteria"]
     assert set(types["combiner_types"]) == {"priority", "weighted"}
-    assert types["roles"] == ["vote", "force", "veto"]
+    assert types["roles"] == ["vote", "force", "veto", "observe"]
     tool_calls = types["evaluator_types"]["tool_calls"]
     assert tool_calls["config_schema"]["required"] == ["pattern"]
     assert tool_calls["output"]["relevance"]

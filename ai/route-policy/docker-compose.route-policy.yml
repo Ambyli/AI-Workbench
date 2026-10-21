@@ -9,6 +9,9 @@
 # SHADOW mode, and its llm_classifier has the conversation classified in the
 # background through the document classifier's POST /assess
 # (http://classifier:8000 on ai_shared -> the `qwen3.5-4b` CPU model).
+# Phase 5: the `default-signals` draft, a second shadow, reads fast signals
+# (PII, topic, injection, language) from the `signals` sidecar
+# (http://signals:8000 on ai_shared, ai/signals).
 # Operator guide: ai/route-policy/ROUTE_POLICY.md.
 #
 #   route-policy      FastAPI on :8000 (ai_shared). LiteLLM reaches it as
@@ -86,6 +89,8 @@ services:
   # It does NOT need the classifier (a different compose project, so no
   # depends_on): a classifier that is down only makes background
   # classifications fail (analyses.status = unavailable), never a /decide.
+  # Nor the signals sidecar: one that is down or slow makes the signal
+  # evaluators abstain; deploy it first so the startup warm-up reaches it.
   # During a swap both copies may classify; the analyses table's primary key
   # (one verdict per conversation prefix) keeps that harmless.
   route-policy:
@@ -139,6 +144,18 @@ services:
       - ROUTE_POLICY_CLASSIFY_POLL_S=${ROUTE_POLICY_CLASSIFY_POLL_S:-1}
       - ROUTE_POLICY_ANALYSIS_QUEUE_MAX=${ROUTE_POLICY_ANALYSIS_QUEUE_MAX:-64}
       - ROUTE_POLICY_ANALYSIS_CONCURRENCY=${ROUTE_POLICY_ANALYSIS_CONCURRENCY:-2}
+      # The signals sidecar (phase 5, ai/signals): PII NER, nearest-example
+      # topic, injection score and language for the signal evaluators, by
+      # Docker DNS on ai_shared, no auth. ONE POST /signals per decision that
+      # needs it -- the `default` ruleset needs none, so the live path makes
+      # no call; the `default-signals` shadow makes one after each answer --
+      # concurrently with the database reads, within SIGNALS_BUDGET_S (keep it
+      # at or below the 0.1 s database read budget so it adds nothing to the
+      # worst case). Past it the signal evaluators abstain and `pii` votes
+      # from its in-process patterns. Only a sidecar on this box's networks
+      # is ever sent text: the client resolves its host first.
+      - ROUTE_POLICY_SIGNALS_URL=${ROUTE_POLICY_SIGNALS_URL:-http://signals:8000}
+      - ROUTE_POLICY_SIGNALS_BUDGET_S=${ROUTE_POLICY_SIGNALS_BUDGET_S:-0.1}
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 10s

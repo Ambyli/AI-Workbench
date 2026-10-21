@@ -15,7 +15,9 @@ remote failure; every one becomes a ``status``:
    resolve at all is ``not_local`` and nothing is submitted. (Docker DNS
    answers only for RUNNING containers, so a stopped model service shows up
    as ``not_local`` too.) The host's verdict is cached per host for
-   ``models_ttl_s``. An unknown or unavailable model is ``refused``.
+   ``models_ttl_s`` -- an unresolved one for ``unresolved_ttl_s`` only, so a
+   restarted model is classified again within seconds. An unknown or
+   unavailable model is ``refused``.
 2. ``POST /assess`` -- JSON: the transcript as ONE ``text`` document, one
    ``llm`` criterion per question with ``options: {hint: presence, ocr:
    never}``, and ``model``. ``202 {job_id}``.
@@ -160,6 +162,7 @@ class ClassifierClient:
 
     def __init__(self, base_url: str, *, timeout_s: float, poll_s: float,
                  models_ttl_s: float = 60.0,
+                 unresolved_ttl_s: float = 2.0,
                  transport: Optional[httpx.AsyncBaseTransport] = None,
                  resolver: Optional[Resolver] = None,
                  clock: Callable[[], float] = time.monotonic) -> None:
@@ -167,12 +170,13 @@ class ClassifierClient:
         self.timeout_s = float(timeout_s)
         self.poll_s = float(poll_s)
         self.models_ttl_s = float(models_ttl_s)
+        self.unresolved_ttl_s = float(unresolved_ttl_s)
         self._resolver = resolver or resolve_host
         self._clock = clock
         self._http = httpx.AsyncClient(transport=transport, timeout=CALL_TIMEOUT_S)
         self._models: Optional[Dict[str, Dict[str, Any]]] = None
         self._models_at = float("-inf")
-        self._hosts: Dict[str, Tuple[float, Optional[str]]] = {}
+        self._hosts: Dict[str, Tuple[float, Optional[str], float]] = {}
 
     async def aclose(self) -> None:
         await self._http.aclose()
@@ -231,7 +235,7 @@ class ClassifierClient:
         try:
             r = await self._http.get(f"{self.base_url}/models", timeout=self._call_timeout(deadline))
         except httpx.HTTPError as exc:
-            raise _Stop("unavailable", f"GET /models: {type(exc).__name__}: {exc}") from None
+            raise _Stop("unavailable", f"GET /models: {type(exc).__name__}") from None
         if r.status_code != 200:
             raise _Stop("unavailable", f"GET /models answered {r.status_code}")
         try:
@@ -262,19 +266,25 @@ class ClassifierClient:
 
     async def _host_problem(self, host: str) -> Optional[str]:
         """None when every address ``host`` resolves to is private /
-        loopback / link-local; else why not. Cached per host."""
+        loopback / link-local; else why not. Cached per host: a resolved
+        verdict for ``models_ttl_s``, a host that did not resolve for
+        ``unresolved_ttl_s`` only (Docker DNS answers only for running
+        containers, so a restarting model is back in seconds)."""
         now = self._clock()
         cached = self._hosts.get(host)
-        if cached is not None and now - cached[0] < self.models_ttl_s:
+        if cached is not None and now - cached[0] < cached[2]:
             return cached[1]
         problem: Optional[str] = None
+        ttl = self.models_ttl_s
         try:
             addresses = list(await asyncio.to_thread(self._resolver, host))
         except Exception as exc:  # noqa: BLE001 -- gaierror, or anything a resolver raises
             addresses = []
             problem = f"endpoint host {host!r} could not be resolved ({type(exc).__name__})"
+            ttl = self.unresolved_ttl_s
         if problem is None and not addresses:
             problem = f"endpoint host {host!r} resolved to no address"
+            ttl = self.unresolved_ttl_s
         for raw in addresses:
             try:
                 ip = ipaddress.ip_address(str(raw).split("%", 1)[0])
@@ -284,7 +294,7 @@ class ClassifierClient:
             if not any(ip.version == net.version and ip in net for net in DEFAULT_BLOCKED_NETWORKS):
                 problem = f"endpoint host {host!r} resolves to a public address"
                 break
-        self._hosts[host] = (now, problem)
+        self._hosts[host] = (now, problem, ttl)
         return problem
 
     # -- 2. submit ---------------------------------------------------------------------
@@ -299,7 +309,8 @@ class ClassifierClient:
         try:
             r = await self._http.post(f"{self.base_url}/assess", json=body, timeout=self._call_timeout(deadline))
         except httpx.HTTPError as exc:
-            raise _Stop("unavailable", f"POST /assess: {type(exc).__name__}: {exc}") from None
+            # The type only: this request carries the transcript (analyses.error stores the reason).
+            raise _Stop("unavailable", f"POST /assess: {type(exc).__name__}") from None
         if 400 <= r.status_code < 500:
             raise _Stop("refused", f"POST /assess answered {r.status_code}: {self._detail(r)}")
         if r.status_code not in (200, 202):

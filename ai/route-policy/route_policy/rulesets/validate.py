@@ -11,12 +11,19 @@ where it is (``evaluators[2] (code-tools).config.pattern: ...``):
 * ``vote.route`` present where the type needs it, and one of ``routes`` --
   so a ruleset can only ever vote for its own chain aliases; absent where
   the evaluator chooses the route itself (``llm_classifier``);
-* routes a ``config`` names (``llm_classifier.criteria`` / ``otherwise``)
-  are routes of the ruleset (``Evaluator.check_routes``);
+* routes a ``config`` names (``llm_classifier.criteria`` / ``otherwise``,
+  ``nearest_examples``' example routes) are routes of the ruleset
+  (``Evaluator.check_routes``);
 * cross-references (``cooldown.relevant_if``) resolve;
+* no two evaluators ask the signals sidecar for the same task with
+  different parameters (``Evaluator.signal_tasks``): one request carries
+  each task once, its results keyed by task -- two ``nearest_examples``
+  with different example sets (or ``k``), two ``prompt_injection`` with
+  different ``max_tokens``, cannot share one;
 * the combiner type registered and its options valid.
 
-Refs (``patterns_ref``) must already be inlined (``rulesets.loader``).
+Refs (``patterns_ref``, ``examples_ref``) must already be inlined
+(``rulesets.loader``).
 """
 
 from __future__ import annotations
@@ -116,6 +123,20 @@ def compile_ruleset(document: Dict[str, Any], *, sha256: str = "") -> CompiledRu
             entry.evaluator.bind(siblings)
         except ValueError as exc:
             errors.append(f"evaluators[{seen[entry.id]}] ({entry.id}).config: {exc}")
+
+    claimed: Dict[str, tuple] = {}   # task -> (evaluator id, key)
+    for entry in entries:
+        try:
+            keys = dict(entry.evaluator.signal_tasks())
+        except Exception as exc:  # noqa: BLE001 -- reported like any config error
+            errors.append(f"evaluators[{seen[entry.id]}] ({entry.id}): signal_tasks raised {type(exc).__name__}")
+            continue
+        for task, key in keys.items():
+            first = claimed.setdefault(task, (entry.id, key))
+            if first[1] != key:
+                errors.append(f"evaluators[{seen[entry.id]}] ({entry.id}): asks the signals sidecar for {task} "
+                              f"with other parameters than {first[0]} -- one request carries each task once; "
+                              "give them the same parameters (or drop one)")
 
     combiners = combiner_registry()
     combiner = None

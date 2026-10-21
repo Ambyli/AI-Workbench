@@ -8,14 +8,17 @@
     analysis_queue  the llm_classifier's background classifications
                     (analysis.queue.AnalysisQueue), or None when
                     ROUTE_POLICY_CLASSIFIER_URL is empty
+    signals_client  the signals sidecar's client (common.signals.SignalsClient),
+                    or None when ROUTE_POLICY_SIGNALS_URL is empty
 
 ``record_decision`` and ``record_outcome`` turn an engine result / an
 /observe body into rows, idempotently, and keep the metrics.
 ``load_context`` puts what the pipeline reads besides the request onto the
 request view before it runs -- the verdicts a ruleset's evaluators named
-(``load_analyses``) and, for a ``pin: turn`` ruleset, the turn's first
-decision (``load_turn_pin``), the two reads run concurrently;
-``after_decide`` does what /decide leaves until after its answer (below).
+(``load_analyses``), for a ``pin: turn`` ruleset the turn's first decision
+(``load_turn_pin``), and the signals its evaluators asked the sidecar for
+(``load_signals``), all three concurrently; ``after_decide`` does what
+/decide leaves until after its answer (below).
 
 **A decision is returned even when it cannot be stored.** Routing must never
 depend on the log: a failed write is counted
@@ -62,22 +65,44 @@ call is decided afresh as if it were the turn's first
 ``route_policy_errors_total{kind="turn_pin"}``). The pipeline applies the pin
 (``engine.pipeline``); a call that found one enqueues no analysis requests.
 
+**And so are the signals.** ``load_signals`` sends the ONE ``POST /signals``
+the ruleset's evaluators asked for (``engine.pipeline.signal_requests``; no
+request, no call -- the live ``default`` asks for none) within
+``signals_budget_s`` (ROUTE_POLICY_SIGNALS_BUDGET_S, 0.1 s), telling the
+sidecar ``deadline_ms`` = the budget minus SIGNALS_DEADLINE_MARGIN_S so it
+answers with whatever finished first. Past the budget, on a failure, with no
+client (an empty ROUTE_POLICY_SIGNALS_URL) or a sidecar that is not local,
+``ctx.signals_error`` says why and the signal evaluators abstain (``pii``
+votes from its patterns). Counted in ``route_policy_signals_total{outcome}``,
+timed in ``route_policy_signals_seconds{kind}``, each answered task in
+``route_policy_signal_tasks_total{task,status}``. POST /evaluate waits up to
+SIGNALS_EVALUATE_TIMEOUT_S with no deadline cut. At startup,
+``warm_signals`` sends each bound ruleset's warm-up (its example sets), so
+the sidecar embeds them before the first turn needs them.
+
 **After the answer** (``after_decide``), ONE background task per /decide,
 counted with the writes against ``max_in_flight`` (past it the work is
 dropped: ``shadow_dropped``):
 
 1. the primary decision's analysis requests go to the queue;
 2. each SHADOW ruleset bound beside the primary (``bindings.yaml``
-   ``shadow:``) runs on the same request -- its own verdict lookup and turn
-   pin (with the same budget, so it measures what enforcing it would do), the
+   ``shadow:``) runs on the same request -- its own verdict lookup, turn pin
+   and signals call (with the same budgets, so it measures what enforcing it
+   would do; texts the sidecar saw for the primary are cache hits), the
    pipeline -- and is stored as a decisions row with id ``uuid5(primary id,
    "<ruleset>@<version>")`` and ``shadow_of`` = the primary id, with its own
    evaluations; then its analysis requests go to the queue.
 
 The primary's response is never touched by any of it, and a shadow that
-fails to load or to run is skipped and counted. A repeated /decide derives
-the same shadow ids, so nothing is written twice; the queue deduplicates
-requests by key, and a worker skips a key that already has a verdict.
+fails to load or to run is skipped and counted -- each shadow on its own,
+so one that raises never costs the next (``shadow_error``). A repeated
+/decide derives the same shadow ids, so nothing is written twice; the queue
+deduplicates requests by key, and a worker skips a key that already has a
+verdict.
+
+**Exceptions are logged by type only**, here and in the engine: an
+evaluator, a write or a shadow run all handle conversation-derived data,
+and an exception's message can quote it.
 """
 
 from __future__ import annotations
@@ -93,6 +118,7 @@ from typing import Any, Coroutine, Dict, List, Optional, Set, Tuple
 
 from . import config, metrics
 from .analysis.queue import AnalysisQueue
+from .signals import wire
 from .api.schemas import DecideRequest, ObserveRequest
 from .db.pool import Database
 from .db.repositories import analyses as analyses_repo
@@ -136,6 +162,8 @@ class Service:
     max_in_flight: int = field(default_factory=lambda: config.WRITES_MAX_IN_FLIGHT)
     drain_s: float = field(default_factory=lambda: config.WRITES_DRAIN_S)
     read_budget_s: Optional[float] = field(default_factory=lambda: config.DB_READ_BUDGET_S)
+    signals_client: Optional[Any] = None
+    signals_budget_s: float = field(default_factory=lambda: config.SIGNALS_BUDGET_S)
     _pending: Set["asyncio.Task[Any]"] = field(default_factory=set, init=False, repr=False)
     _last_drop_log: float = field(default=float("-inf"), init=False, repr=False)
 
@@ -143,16 +171,103 @@ class Service:
 
     async def load_context(self, ruleset: CompiledRuleset, ctx: RequestContext, decision_id: uuid.UUID, *,
                            shadow: bool, budget_s: Optional[float]) -> None:
-        """Put the stored verdicts and the turn's first decision on ``ctx``
-        for ``ruleset``, the two reads concurrently, each within
-        ``budget_s``. ``decision_id`` is the decision being made (a shadow's
-        derived id for a shadow); ``shadow`` picks the rows its pin is read
-        from. Never raises: a read that does not happen is recorded or
-        counted, and the decision goes on without it."""
+        """Put the stored verdicts, the turn's first decision and the
+        signals on ``ctx`` for ``ruleset``, the three concurrently: the reads
+        each within ``budget_s``, the signals call within
+        ``signals_budget_s``. ``decision_id`` is the decision being made (a
+        shadow's derived id for a shadow); ``shadow`` picks the rows its pin
+        is read from. Never raises: a read or call that does not happen is
+        recorded or counted, and the decision goes on without it."""
         await asyncio.gather(
             self.load_analyses(ruleset, ctx, budget_s=budget_s),
             self.load_turn_pin(ruleset, ctx, decision_id, shadow=shadow, budget_s=budget_s),
+            self.load_signals(ruleset, ctx, decision_id, kind="shadow" if shadow else "primary",
+                              budget_s=self.signals_budget_s),
         )
+
+    async def load_signals(self, ruleset: CompiledRuleset, ctx: RequestContext, decision_id: Optional[uuid.UUID],
+                           *, kind: str, budget_s: float, deadline: bool = True) -> None:
+        """Send the ONE signals request ``ruleset``'s evaluators asked for and
+        put the answer on ``ctx`` (``ctx.signals`` / ``signals_error`` /
+        ``signals_ms``), within ``budget_s``; with ``deadline`` the sidecar is
+        told to answer ``SIGNALS_DEADLINE_MARGIN_S`` before it. No request,
+        no call. Never raises: anything unexpected (a bug -- the client itself
+        never raises) leaves ``signals_error = "failed"``, so the signal
+        evaluators abstain and ``pii`` votes from its patterns, and is counted
+        (``route_policy_errors_total{kind="signals"}``) and logged by type."""
+        try:
+            await self._load_signals(ruleset, ctx, decision_id, kind=kind, budget_s=budget_s, deadline=deadline)
+        except Exception as exc:  # noqa: BLE001 -- the decision goes on without signals
+            ctx.signals_error = "failed"   # what a failed call says (signals.wire); evaluators read it first
+            metrics.errors_total.labels("signals").inc()
+            logger.warning("decide: signals for %s@%d (%s) failed: %s", ruleset.id, ruleset.version, kind,
+                           type(exc).__name__)
+
+    async def _load_signals(self, ruleset: CompiledRuleset, ctx: RequestContext, decision_id: Optional[uuid.UUID],
+                            *, kind: str, budget_s: float, deadline: bool) -> None:
+        batch = pipeline.signal_requests(ruleset, ctx)
+        if batch is None:
+            return
+        if self.signals_client is None or not batch.tasks:
+            wire.apply(ctx, batch, None if batch.tasks else wire.NOTHING_SENT)
+            if batch.tasks:
+                metrics.signals_total.labels("unavailable").inc()
+            return
+        deadline_ms = (max(1, int(round((budget_s - config.SIGNALS_DEADLINE_MARGIN_S) * 1000)))
+                       if deadline else None)
+        started = time.perf_counter()
+        try:
+            request = wire.build_request(batch, request_id=str(decision_id) if decision_id else None,
+                                         deadline_ms=deadline_ms)
+            # The client keeps its own budget and never raises; this is the
+            # belt to its braces, so /decide's time never depends on it.
+            outcome = await asyncio.wait_for(self.signals_client.fetch(request, budget_s=budget_s),
+                                             budget_s + config.SIGNALS_DEADLINE_MARGIN_S)
+        except asyncio.TimeoutError:
+            outcome = wire.TIMED_OUT
+        except Exception as exc:  # noqa: BLE001 -- the client should never raise; the evaluators abstain
+            logger.warning("decide: signals call for %s@%d raised %s", ruleset.id, ruleset.version,
+                           type(exc).__name__)
+            outcome = wire.FAILED
+        metrics.signals_seconds.labels(kind).observe(time.perf_counter() - started)
+        label = wire.apply(ctx, batch, outcome)
+        metrics.signals_total.labels(label).inc()
+        for task in ctx.signals.values():
+            metrics.signal_tasks_total.labels(*wire.task_labels(task)).inc()
+        logger.debug("decide: signals for %s@%d (%s): %s in %s ms, tasks %s", ruleset.id, ruleset.version, kind,
+                     label, ctx.signals_ms, ", ".join(f"{t.task} {t.status}" for t in ctx.signals.values()))
+
+    async def warm_signals(self, timeout_s: Optional[float] = None) -> int:
+        """Startup: send every bound ruleset's (primary and shadow) signal
+        warm-ups -- the example sets the sidecar should embed before the
+        first turn needs them. Returns how many were answered; never raises
+        and never stops startup."""
+        if self.signals_client is None:
+            return 0
+        timeout_s = config.SIGNALS_WARM_TIMEOUT_S if timeout_s is None else timeout_s
+        rulesets: Dict[Tuple[str, int], CompiledRuleset] = {}
+        for binding in self.store.bindings:
+            for ruleset_id, version in ((binding.ruleset_id, binding.version), *binding.shadows):
+                compiled = await self.store.get(ruleset_id, version)
+                if compiled is not None:
+                    rulesets.setdefault((compiled.id, compiled.version), compiled)
+        answered = 0
+        for batch in pipeline.signal_warmups(list(rulesets.values())):
+            try:
+                request = wire.build_request(batch, request_id="warmup", deadline_ms=int(timeout_s * 1000))
+                outcome = await asyncio.wait_for(self.signals_client.fetch(request, budget_s=timeout_s),
+                                                 timeout_s + 1.0)
+            except Exception as exc:  # noqa: BLE001 -- the set is embedded on its first real use instead
+                logger.warning("startup: signals warm-up (%s) failed: %s", ", ".join(t.task for t in batch.tasks),
+                               type(exc).__name__)
+                continue
+            ctx = RequestContext(requested_model="warmup")
+            label = wire.apply(ctx, batch, outcome)
+            if label == "ok":
+                answered += 1
+            logger.info("startup: signals warm-up %s: %s (%s)", ", ".join(t.task for t in batch.tasks), label,
+                        ", ".join(f"{t.task} {t.status}" for t in ctx.signals.values()) or ctx.signals_error)
+        return answered
 
     async def load_turn_pin(self, ruleset: CompiledRuleset, ctx: RequestContext, decision_id: uuid.UUID, *,
                             shadow: bool, budget_s: Optional[float]) -> None:
@@ -174,7 +289,8 @@ class Service:
             return
         except Exception as exc:  # noqa: BLE001 -- no pin; the decision goes on
             metrics.errors_total.labels("turn_pin").inc()
-            logger.warning("decide: turn pin lookup for %s@%d failed: %r", ruleset.id, ruleset.version, exc)
+            logger.warning("decide: turn pin lookup for %s@%d failed: %s", ruleset.id, ruleset.version,
+                           type(exc).__name__)
             return
         if found is not None:
             ctx.turn_pin = TurnPin(*found)
@@ -204,7 +320,8 @@ class Service:
             ctx.analysis_lookup_error = "timed out"
         except Exception as exc:  # noqa: BLE001 -- the llm_classifier abstains; the decision goes on
             metrics.errors_total.labels("analysis_lookup").inc()
-            logger.warning("decide: verdict lookup for %s@%d failed: %r", ruleset.id, ruleset.version, exc)
+            logger.warning("decide: verdict lookup for %s@%d failed: %s", ruleset.id, ruleset.version,
+                           type(exc).__name__)
             ctx.analysis_lookup_error = "failed"
 
     async def _read_analyses(self, keys: List[str]):
@@ -235,11 +352,20 @@ class Service:
         try:
             self._enqueue(pipeline.analysis_requests(resolved.primary, ctx), decision.ruleset,
                           body.decision_id)
-            for shadow in await self.store.shadow_rulesets(resolved):
-                await self._run_shadow(body, decision, shadow)
-        except Exception:  # noqa: BLE001 -- never reaches the request; counted and logged
+            shadows = await self.store.shadow_rulesets(resolved)
+        except Exception as exc:  # noqa: BLE001 -- never reaches the request; counted and logged
             metrics.errors_total.labels("shadow_error").inc()
-            logger.exception("decide: after-the-answer work for %s failed", body.decision_id)
+            logger.error("decide: after-the-answer work for %s failed: %s", body.decision_id, type(exc).__name__)
+            return
+        # Each shadow on its own: one that raises is counted and skipped, and
+        # the next still runs (default-signals must not depend on default-llm).
+        for shadow in shadows:
+            try:
+                await self._run_shadow(body, decision, shadow)
+            except Exception as exc:  # noqa: BLE001 -- never reaches the request; counted and logged
+                metrics.errors_total.labels("shadow_error").inc()
+                logger.error("decide: shadow %s@%d beside %s failed: %s", shadow.id, shadow.version,
+                             body.decision_id, type(exc).__name__)
 
     async def _run_shadow(self, body: DecideRequest, primary: Decision, ruleset: CompiledRuleset) -> None:
         """Decide, store and count one shadow ruleset on the request."""
@@ -269,7 +395,7 @@ class Service:
                 return await decisions_repo.insert(conn, record, evaluations)
         except Exception as exc:  # noqa: BLE001
             metrics.errors_total.labels("decision_write").inc()
-            logger.error("decide: shadow decision %s computed but not stored: %r", shadow_id, exc)
+            logger.error("decide: shadow decision %s computed but not stored: %s", shadow_id, type(exc).__name__)
             return False
 
     def _enqueue(self, requests: List[Any], ruleset: CompiledRuleset, decision_id: uuid.UUID) -> None:
@@ -357,7 +483,7 @@ class Service:
                 stored = await decisions_repo.get_response(conn, record.decision_id)
         except Exception as exc:  # noqa: BLE001 -- the decision was (or is being) returned anyway
             metrics.errors_total.labels("decision_write").inc()
-            logger.error("decide: decision %s computed but not stored: %r", record.decision_id, exc)
+            logger.error("decide: decision %s computed but not stored: %s", record.decision_id, type(exc).__name__)
             self._count(decision)
             return NOT_STORED, None
         metrics.duplicates_total.labels("decide").inc()
@@ -409,8 +535,8 @@ class Service:
                 stored = await outcomes_repo.insert(conn, record)
         except Exception as exc:  # noqa: BLE001
             metrics.errors_total.labels("outcome_write").inc()
-            logger.error("observe: outcome for %s not stored: %r", record.decision_id, exc)
-            raise OutcomeNotStored(str(exc)) from exc
+            logger.error("observe: outcome for %s not stored: %s", record.decision_id, type(exc).__name__)
+            raise OutcomeNotStored(type(exc).__name__) from exc
         if stored:
             # Bounded label: a caller's own status string is stored, not labelled.
             label = record.status if record.status in ("success", "failure") else "other"
@@ -460,8 +586,8 @@ class Service:
         WRITES_DRAIN_S) for the background writes and after-the-answer tasks,
         then cancel what is left and wait for the cancellations; cancel the
         store's background reads too; then stop the analysis queue (its
-        running classifications get their own ``drain_s``). Returns how many
-        background tasks were cancelled."""
+        running classifications get their own ``drain_s``) and close the
+        signals client. Returns how many background tasks were cancelled."""
         timeout_s = self.drain_s if timeout_s is None else timeout_s
         await self.store.cancel_background()
         pending = set(self._pending)
@@ -476,6 +602,11 @@ class Service:
                                len(left), timeout_s)
         if self.analysis_queue is not None:
             await self.analysis_queue.stop()
+        if self.signals_client is not None and hasattr(self.signals_client, "aclose"):
+            try:
+                await self.signals_client.aclose()
+            except Exception as exc:  # noqa: BLE001 -- shutting down anyway
+                logger.warning("shutdown: closing the signals client failed: %s", type(exc).__name__)
         return len(left)
 
     # -- metrics ---------------------------------------------------------------------

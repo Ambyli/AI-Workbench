@@ -1,0 +1,90 @@
+# Signals sidecar -- fast CPU signals for route-policy's evaluators (phase 5
+# of ROUTE_POLICY_PLAN): PII NER (gravitee-io/bert-small-pii-detection),
+# topic by nearest labelled examples (intfloat/multilingual-e5-small), a
+# jailbreak / prompt-injection score (NeuralTrust/prompt-guard-oss-small) and
+# language id (fastText lid.176), all ONNX / fastText on the CPU, pinned in
+# ai/signals/models.yaml and baked into the image.
+# Operator guide: ai/signals/SIGNALS.md.
+#
+#   signals   FastAPI on :8000 (ai_shared). route-policy reaches it as
+#             http://signals:8000 (ROUTE_POLICY_SIGNALS_URL) with ONE
+#             POST /signals per decision, inside its 0.1 s budget; LAN
+#             debugging goes through ai/edge on PORT_SIGNALS (8025). No auth
+#             of its own, like the classifier and the detector. It reaches
+#             nothing: no outbound call, no database, no volume.
+
+networks:
+  shared:
+    external: true
+    name: ai_shared
+
+services:
+  # Deployed side by side by `make up signals` (scripts/deploy.py): a new
+  # `signals-<hash>` starts next to the old one and the old one retires once
+  # the new one is healthy (all four models loaded and warmed; /health is 503
+  # until then, ~10 s) and the edge marks it UP. Two copies are safe: the
+  # only state is an in-memory cache, and during the swap Docker DNS gives
+  # both copies traffic -- with equal model ids that is harmless; a model
+  # change between copies makes the pinned evaluators abstain for those
+  # seconds ("model mismatch"), never route. No container_name and no
+  # `ports:` -- PORT_SIGNALS is published by ai/edge. See ai/edge/EDGE.md.
+  signals:
+    build:
+      context: ../..
+      dockerfile: ai/signals/Dockerfile
+    labels:
+      com.zeo.deploy: swap
+    restart: unless-stopped
+    # A /signals request is at most its deadline (route-policy sends 80 ms;
+    # /evaluate up to 10 s); shutdown then stops the model lanes.
+    stop_grace_period: 15s
+    networks:
+      - shared
+    # Nothing is written at run time: the image is the models + the code,
+    # the cache is in memory. /tmp is the only writable path (and HOME).
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # CPU. Each ONNX model is one onnxruntime session with SIGNALS_THREADS_*
+    # intra-op threads (2 each, measured on the box: 4 each contend), so at
+    # most 6 busy threads. The box (32 vCPUs, a Xen VM, AVX2 only) gives the
+    # sidecar cores 24-31 of its own; qwen3.5-4b runs on 0-15
+    # (--cpu-range 0-15) and the rest of the box on 16-23
+    # (SIGNALS.md § CPU pinning). `${VAR-default}` on purpose, without the
+    # colon: unset -> 24-31, but an EMPTY SIGNALS_CPUSET= in .env means "no
+    # pinning" (an empty cpuset is Docker's default, every CPU) -- needed on
+    # a host with fewer than 32 CPUs, where 24-31 does not exist and the
+    # container would refuse to start. cpu_shares makes the CFS favour the
+    # sidecar over default-weight containers when it is not pinned.
+    cpuset: "${SIGNALS_CPUSET-24-31}"
+    cpu_shares: 2048
+    # ~1.8 GB resident per copy (e5's 250k-token vocabulary is most of it).
+    mem_limit: ${SIGNALS_MEM_LIMIT:-4g}
+    environment:
+      # One `[signals]` line per request at INFO: request id, text and
+      # character counts, each task's status and ms -- never text.
+      - LOG_LEVEL=INFO
+      - SIGNALS_THREADS_PII=${SIGNALS_THREADS_PII:-2}
+      - SIGNALS_THREADS_EMBED=${SIGNALS_THREADS_EMBED:-2}
+      - SIGNALS_THREADS_INJECTION=${SIGNALS_THREADS_INJECTION:-2}
+      # Entries of the in-memory feature cache (sha256 of a text -> its
+      # features, never the text). 0 disables it.
+      - SIGNALS_CACHE_ENTRIES=${SIGNALS_CACHE_ENTRIES:-20000}
+      # Belt and braces: the models are baked in and nothing imports
+      # huggingface_hub, so nothing could download anyway.
+      - HF_HUB_OFFLINE=1
+      # onnxruntime uses its own thread pool (SIGNALS_THREADS_*); keep any
+      # OpenMP / BLAS pool (numpy's kNN product) from adding threads.
+      - OMP_NUM_THREADS=1
+      - OPENBLAS_NUM_THREADS=1
+      - MKL_NUM_THREADS=1
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      start_period: 60s
+      retries: 3

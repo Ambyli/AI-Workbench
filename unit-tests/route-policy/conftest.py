@@ -108,6 +108,10 @@ os.environ["ROUTE_POLICY_DECISION_WRITE_BUDGET_S"] = "30"
 # (test_analysis_queue.py, test_shadows.py): an app started here must never
 # reach for a real http://classifier:8000.
 os.environ["ROUTE_POLICY_CLASSIFIER_URL"] = ""
+# No signals client unless a test builds one on a fake sidecar
+# (rp_helpers.FakeSidecar, test_signals.py): an app started here must never
+# reach for a real http://signals:8000.
+os.environ["ROUTE_POLICY_SIGNALS_URL"] = ""
 import route_policy.config as _config  # noqa: E402 -- after the environment above
 
 _config.DB_READ_BUDGET_S = 30.0

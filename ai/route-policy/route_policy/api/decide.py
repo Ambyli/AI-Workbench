@@ -17,7 +17,9 @@ only refs here) -> read, concurrently and each in one query within
 DB_READ_BUDGET_S, the stored verdicts the primary's evaluators name (none
 for a ruleset without an ``llm_classifier``, so no query for ``default``)
 and, for a ``pin: turn`` ruleset, the turn's first decision (same chat id +
-message id; none without both ids, or for a background task) -> run the
+message id; none without both ids, or for a background task) -- and,
+beside them within ROUTE_POLICY_SIGNALS_BUDGET_S, the ONE signals call its
+signal evaluators ask for (none for ``default``) -> run the
 pipeline (which keeps the turn's route, unless the fresh one is
 local-private) -> record (within the write budget) -> answer. THEN, in one
 background task (``Service.after_decide``): the primary's analysis requests

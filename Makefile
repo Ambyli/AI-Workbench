@@ -33,6 +33,10 @@ $(eval $(call service,n8n,n8n-db n8n))
 $(eval $(call service,open-terminal,open-terminal))
 $(eval $(call service,trino,hive-metastore-db hive-metastore lake-s3 lake-s3-init trino-auth-init trino-coordinator trino-mcp superset-db superset))
 $(eval $(call service,supabase,supabase-db supavisor auth rest realtime imgproxy storage meta studio supabase-api functions))
+# Before route-policy: its startup warms the bound rulesets' example sets on
+# the sidecar (ai/signals/SIGNALS.md). Not a depends_on -- a down sidecar only
+# makes the signal evaluators abstain.
+$(eval $(call service,signals,signals))
 $(eval $(call service,route-policy,route-policy-db route-policy))
 # Last on purpose: it binds the host ports the swap-class services above used
 # to publish, so on a full `make up` they must have released them first.

@@ -51,6 +51,7 @@ from route_policy.service import Service, shadow_decision_id
 
 PRIMARY = ("default", 3)
 SHADOW = ("default-llm", 3)
+SIGNALS = ("default-signals", 1)
 
 
 @pytest.fixture
@@ -99,9 +100,9 @@ def _without_latency(response: dict) -> dict:
 def test_resolve_returns_the_primary_and_the_shadow_refs():
     store = _store()
     resolved = asyncio.run(store.resolve("auto", None))
-    assert (resolved.primary.id, resolved.primary.version) == PRIMARY and resolved.shadows == (SHADOW,)
+    assert (resolved.primary.id, resolved.primary.version) == PRIMARY and resolved.shadows == (SHADOW, SIGNALS)
     assert [(r.id, r.version, r.mode) for r in asyncio.run(store.shadow_rulesets(resolved))] == [
-        ("default-llm", 3, "shadow")]
+        ("default-llm", 3, "shadow"), ("default-signals", 1, "shadow")]
 
 
 def test_a_shadow_that_cannot_load_is_skipped_and_counted():
@@ -170,14 +171,15 @@ def test_a_repeated_decide_writes_no_shadow_twice(tables):
     service = _service(FakeDatabase())
     body = _body()
     shadow_id = uuid.uuid5(uuid.UUID(body["decision_id"]), "default-llm@3")
+    signals_id = uuid.uuid5(uuid.UUID(body["decision_id"]), "default-signals@1")
     before = _sample("route_policy_shadow_decisions_total", ruleset="default-llm@3", agree="true")
     with TestClient(create_app(service=service, instrument=False)) as client:
         first = client.post("/decide", json=body).json()
-        wait_for(lambda: shadow_id in tables.decisions)
+        wait_for(lambda: shadow_id in tables.decisions and signals_id in tables.decisions)
         second = client.post("/decide", json=body).json()
         wait_for(lambda: service.pending_writes == 0)
     assert first == second
-    assert len(tables.decisions) == 2
+    assert len(tables.decisions) == 3   # the primary and its two shadows, once each
     assert _sample("route_policy_shadow_decisions_total", ruleset="default-llm@3", agree="true") == before + 1
 
 
@@ -241,6 +243,33 @@ def test_a_failing_shadow_never_reaches_the_answer(tables, monkeypatch):
         wait_for(lambda: service.pending_writes == 0)
     assert _sample("route_policy_errors_total", kind="shadow_error") == before + 1
     assert len(tables.decisions) == 1
+
+
+def test_one_raising_shadow_never_costs_the_next(tables, monkeypatch, caplog):
+    # `auto` has two shadows, default-llm then default-signals: a bug in the
+    # first must not skip the second. Counted once, logged by type only.
+    service = _service(FakeDatabase())
+    run_shadow = service._run_shadow
+
+    async def flaky(body, primary, ruleset):
+        if ruleset.id == "default-llm":
+            raise KeyError("a message that quotes zebra-quartz-7731")
+        await run_shadow(body, primary, ruleset)
+
+    monkeypatch.setattr(service, "_run_shadow", flaky)
+    body = _body()
+    signals_id = uuid.uuid5(uuid.UUID(body["decision_id"]), "default-signals@1")
+    before = _sample("route_policy_errors_total", kind="shadow_error")
+    caplog.set_level("DEBUG")
+    with TestClient(create_app(service=service, instrument=False)) as client:
+        r = client.post("/decide", json=body)
+        assert r.status_code == 200 and r.json()["route"] == "local-general"
+        wait_for(lambda: signals_id in tables.decisions)
+        wait_for(lambda: service.pending_writes == 0)
+    assert _sample("route_policy_errors_total", kind="shadow_error") == before + 1
+    assert {d.ruleset_id for d in tables.decisions.values()} == {"default", "default-signals"}
+    assert any("default-llm@3" in r.getMessage() and "KeyError" in r.getMessage() for r in caplog.records)
+    assert not any("zebra" in r.getMessage() for r in caplog.records)
 
 
 def test_a_hung_database_delays_neither_the_answer_nor_shutdown_for_long(tables):

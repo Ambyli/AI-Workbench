@@ -41,6 +41,29 @@ slow, background judgement keeps ``evaluate`` pure by splitting the work:
   the service enqueues it AFTER answering ``/decide`` (``analysis.queue``).
 
 Both default to nothing, so every other type is untouched.
+
+**Signals** (phase 5: ``pii``, ``nearest_examples``, ``prompt_injection``,
+``language``). An evaluator that reads the ``signals`` sidecar keeps
+``evaluate`` pure the same way:
+
+* :meth:`Evaluator.signal_requests` names the sidecar tasks it will read
+  and over which texts (``signals.model.SignalRequest``, cheap and pure);
+  the pipeline merges every evaluator's into ONE request, and the service
+  sends it before the pipeline runs, within ROUTE_POLICY_SIGNALS_BUDGET_S,
+  and puts the answer on ``ctx.signals`` (or why not on
+  ``ctx.signals_error``);
+* :meth:`Evaluator.evaluate` reads ``ctx.signals`` and nothing else -- a
+  missing or cut answer is an abstain (``pii`` still votes from its
+  in-process patterns);
+* :meth:`Evaluator.signal_warmups` names work the sidecar should start at
+  startup (``nearest_examples``: embedding its example set), sent once
+  before the service takes traffic;
+* :meth:`Evaluator.signal_tasks` names, statically, each task it may ask
+  for and the key its requests always carry -- validation refuses a
+  ruleset in which two evaluators would ask for one task with different
+  parameters (a request carries each task once: results are keyed by task).
+
+All default to nothing.
 """
 
 from __future__ import annotations
@@ -52,6 +75,7 @@ from typing import Any, Callable, ClassVar, Dict, List, Mapping, Optional, Seque
 from pydantic import BaseModel, ConfigDict
 
 from ..analysis.model import AnalysisRequest
+from ..signals.model import SignalRequest
 
 # -- Declared output ------------------------------------------------------------
 
@@ -221,6 +245,24 @@ class Evaluator:
         ``/decide`` has answered (never by ``/evaluate``)."""
         return ()
 
+    def signal_requests(self, ctx: Any) -> Sequence[SignalRequest]:
+        """The sidecar tasks :meth:`evaluate` will read from ``ctx.signals``,
+        with their texts. Called before the pipeline; must be cheap and
+        pure."""
+        return ()
+
+    def signal_warmups(self) -> Sequence[SignalRequest]:
+        """Sidecar work to start before this copy serves (texts empty): the
+        ``nearest_examples`` example set. Sent once, at startup, for every
+        bound ruleset."""
+        return ()
+
+    def signal_tasks(self) -> Mapping[str, str]:
+        """task -> the ``SignalRequest.key`` every request of this evaluator
+        for that task carries (texts aside). ``rulesets.validate`` refuses
+        two evaluators of a ruleset with different keys for one task."""
+        return {}
+
     def exchange_relevance(self, text: str, rounds: List[dict]) -> Optional[str]:
         """Why one exchange (its user text, the messages after it) counts,
         or None. Only types whose ``output.relevance`` is set implement it."""
@@ -246,7 +288,6 @@ _REGISTRY: Dict[str, Type[Evaluator]] = {}
 
 # The modules that declare a type, imported on first lookup -- so asking for
 # the registry before anything imported the evaluators still finds them all.
-# context_size is listed in ROUTE_POLICY_PLAN § 4 but not built.
 _DECLARING_MODULES = (
     "route_policy.evaluators.regex_text",
     "route_policy.evaluators.tool_calls",
@@ -254,6 +295,12 @@ _DECLARING_MODULES = (
     "route_policy.evaluators.backend_load",
     "route_policy.evaluators.static",
     "route_policy.evaluators.llm_classifier",
+    "route_policy.evaluators.pii",
+    "route_policy.evaluators.nearest_examples",
+    "route_policy.evaluators.prompt_injection",
+    "route_policy.evaluators.language",
+    "route_policy.evaluators.text_shape",
+    "route_policy.evaluators.context_size",
 )
 _loaded = False
 

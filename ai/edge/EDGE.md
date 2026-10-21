@@ -190,6 +190,7 @@ environment, such as roofix's `.env` setting if it was exported, does nothing.
 | sandbox | `sandbox-proxy`, `sandbox-egress` | `sandbox-db`: Postgres. `sandbox-runner`: an in-process slot semaphore, and its reaper would reap the other copy's sandboxes. Its port is published by the edge, which answers `503` while it restarts. |
 | trino | `trino-mcp`, `superset` | `*-db`: Postgres. `lake-s3`: data directory. `hive-metastore`: migrates on start, and Trino caches its thrift connection. `trino-coordinator`: a cluster has one coordinator. The two `*-init` services are oneshot. |
 | supabase | `supabase-api`, plus `auth`, `rest`, `storage`, `imgproxy`, `meta`, `studio`, `functions` (all as `supabase-<svc>-<hash>`) | `supabase-db`: Postgres. `realtime`: a logical replication slot. `supavisor`: migrates on start, and its TCP pooler ports. |
+| signals | `signals` | — |
 | route-policy | `route-policy` | `route-policy-db`: Postgres. |
 | vllm, llama, unsloth | — | GPU or RAM, and host ports |
 | detector | — | `detector`: GPU. Its port is published by the edge, which answers `503` while it restarts or loads its model. |
@@ -232,6 +233,7 @@ service over TLS, [TLS](#tls)):
 | `PORT_SANDBOX_PROXY` 8011 | 8011 | `sandbox-proxy:80` | `GET /health` | swap | 300 s |
 | `PORT_SUPERSET` 8016 | 8016 | `superset:8088` | `GET /health` | swap | 300 s |
 | `PORT_SUPABASE_API` 8022 | 8022 | `supabase-api:8000` | TCP connect | swap | 300 s |
+| `PORT_SIGNALS` 8025 | 8025 | `signals:8000` | `GET /health` (503 until every model is loaded and warmed) | swap | 75 s |
 | `PORT_ROUTE_POLICY` 8027 | 8027 | `route-policy:8000` | `GET /health` | swap | 300 s |
 | `PORT_CLASSIFIER` 8005 | 8005 | `classifier:8000` | `GET /health` | **recreate** | 600 s |
 | `PORT_SANDBOX_RUNNER` 8012 | 8012 | `sandbox-runner:8000` | `GET /health` | **recreate** | 300 s |
@@ -263,7 +265,10 @@ as `edge:<port>` from `ai_shared`:
   `litellm` and `oauth2-proxy` get 900 s, Open WebUI's own outermost limit: a
   long reasoning answer, or a non-streamed request, can be silent for minutes
   (the chain deployments' per-read timeouts are 240 s local and 300 s
-  Claude). The recreate-class APIs are sized from their
+  Claude). `signals` gets 75 s: route-policy's calls end at their 80 ms
+  deadline, and a debugging request with no deadline is capped by the
+  sidecar itself at 60 s (`common.signals` `MAX_DEADLINE_MS`), so the edge
+  is never what cuts one. The recreate-class APIs are sized from their
   longest request: a classifier submit fetches every `type: "url"` document one
   after another, each bounded by its 120 s fetch timeout (600 s); a
   sandbox-runner spawn waits up to 30 s for readiness and `exec` is capped at
@@ -276,7 +281,8 @@ as `edge:<port>` from `ai_shared`:
 ports, such as Claude Code at `localhost:4001`, curl, and DBeaver for Superset.
 Container-to-container traffic does not: Open WebUI → `litellm:4000`,
 cloudflared → `oauth2-proxy:4180`, oauth2-proxy → `superset:8088`, the
-LiteLLM pass-throughs → `classifier:8000` / `detector:8000`, and so on all go
+LiteLLM pass-throughs → `classifier:8000` / `detector:8000`, route-policy →
+`signals:8000`, and so on all go
 straight to the service by DNS. Public chat traffic (cloudflared →
 oauth2-proxy) never touches the edge. One internal caller does, on purpose:
 oauth2-proxy reaches the status page at `edge:8407`.
@@ -372,7 +378,8 @@ error.
 ### When no copy is healthy: 503
 
 When every server of a section is down — a recreate-class service
-restarting, a detector still loading its model, a swap that failed, a service
+restarting, a detector or the signals sidecar still loading its models, a
+swap that failed, a service
 not running at all — the edge answers `503` with `Retry-After: 10` and a short
 message naming the service, instead of HAProxy's generic page. The default
 (in `defaults`, for browser-facing sections) is plain text built from
@@ -380,7 +387,8 @@ message naming the service, instead of HAProxy's generic page. The default
 being deployed. Retry in a few seconds.` API sections override it with JSON in
 the shape their callers expect: OpenAI-style `{"error": {…}}` for
 `litellm`, FastAPI-style `{"detail": "…"}` for `classifier`,
-`sandbox-runner`, `detector`, `kokoro-api` and `madlad-api`, `{"message": "…"}`
+`sandbox-runner`, `detector`, `kokoro-api`, `madlad-api`, `route-policy` and
+`signals`, `{"message": "…"}`
 for `supabase-api`.
 
 That is why `classifier` (`8005`), `sandbox-runner` (`8012`) and `detector`
@@ -403,7 +411,7 @@ above), queue and response times.
 
 `prometheus` itself now sits on `ai_shared`. It used to have no `networks:`
 block, which left it on its stack's default network only, where none of its
-targets (`litellm`, `classifier`, `detector`, `route-policy`) live. It stays
+targets (`litellm`, `classifier`, `detector`, `route-policy`, `signals`) live. It stays
 recreate-class: its TSDB is locked by one process. (Its `litellm` job can
 reach `litellm:4000` now, but LiteLLM serves `/metrics` only with the
 `prometheus` success callback enabled, which this repo does not do — expect
@@ -1228,7 +1236,7 @@ check.
    requests on `localhost:4001`; the 9th gets `429` with `Retry-After`. The same
    test on `auto` through Open WebUI is never limited.
 10. **Metrics and status:** `curl -s localhost:9090/api/v1/targets` shows the
-    `edge` job UP, and `classifier`, `detector` and `route-policy` UP when
+    `edge` job UP, and `classifier`, `detector`, `route-policy` and `signals` UP when
     those services run. A `litellm` target that is DOWN with **HTTP 404** is not
     a network problem: LiteLLM mounts `/metrics` only when `prometheus` is in
     its `success_callback` list, which `litellm_config.yaml` does not set.

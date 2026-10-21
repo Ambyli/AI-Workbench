@@ -12,7 +12,7 @@ The document (``ai/route-policy/rulesets/default.yaml`` is the reference)::
     evaluators:                      # in order; each votes or abstains
       - id: privacy
         type: regex_text             # GET /evaluator-types
-        role: force                  # vote (default) | force | veto
+        role: force                  # vote (default) | force | veto | observe (logged, never combined)
         config: {patterns_ref: patterns/privacy.yaml}
         vote: {route: local-private, weight: 1.0}
     combiner: {type: priority}       # priority | weighted (+ its options)
@@ -26,8 +26,8 @@ pipeline applies it (``engine.pipeline``); a call without both ids is never
 pinned.
 
 Validation beyond the shapes below (routes, references, each type's config)
-is ``rulesets.validate``; refs (``patterns_ref``) are inlined by
-``rulesets.loader`` before either.
+is ``rulesets.validate``; refs (``patterns_ref``, ``examples_ref``) are
+inlined by ``rulesets.loader`` before either.
 """
 
 from __future__ import annotations
@@ -71,7 +71,7 @@ class EvaluatorEntry(BaseModel):
 
     id: str = Field(pattern=ID_PATTERN)
     type: str = Field(min_length=1, max_length=64)
-    role: Literal["vote", "force", "veto"] = "vote"
+    role: Literal["vote", "force", "veto", "observe"] = "vote"
     description: Optional[str] = Field(None, max_length=2000)
     config: Dict[str, Any] = Field(default_factory=dict)
     vote: VoteSpec = Field(default_factory=VoteSpec)

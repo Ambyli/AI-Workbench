@@ -95,6 +95,12 @@ def test_collection_bodies_match_the_request_models(path, model):
         model.model_validate(json.loads(text))
 
 
+def test_collection_dry_runs_the_signals_draft():
+    bodies = [json.loads(i["request"]["body"]["raw"]) for i in _collection()["item"]
+              if i["request"]["url"]["path"][-1] == "evaluate"]
+    assert any((b.get("ruleset") or {}).get("id") == "default-signals" for b in bodies)
+
+
 def test_compose_classes_ports_and_env():
     compose = yaml.safe_load(COMPOSE.read_text(encoding="utf-8"))
     svc = compose["services"]["route-policy"]
@@ -109,6 +115,13 @@ def test_compose_classes_ports_and_env():
     for var, default in (("ROUTE_POLICY_CLASSIFY_TIMEOUT_S", "180"), ("ROUTE_POLICY_CLASSIFY_POLL_S", "1"),
                          ("ROUTE_POLICY_ANALYSIS_QUEUE_MAX", "64"), ("ROUTE_POLICY_ANALYSIS_CONCURRENCY", "2")):
         assert env[var] == f"${{{var}:-{default}}}", var
+    # The signals sidecar (phase 5), each with the default config.py uses.
+    assert env["ROUTE_POLICY_SIGNALS_URL"] == "${ROUTE_POLICY_SIGNALS_URL:-http://signals:8000}"
+    assert env["ROUTE_POLICY_SIGNALS_BUDGET_S"] == "${ROUTE_POLICY_SIGNALS_BUDGET_S:-0.1}"
+    from route_policy import config
+
+    assert (config.SIGNALS_BUDGET_S, config.SIGNALS_EVALUATE_TIMEOUT_S) == (0.1, 10.0)
+    assert "signals" not in (svc.get("depends_on") or {})     # a down sidecar never blocks a deploy
     db = compose["services"]["route-policy-db"]
     assert db["container_name"] == "route-policy-db" and db["image"] == "postgres:17-alpine"
     assert "com.zeo.deploy" not in (db.get("labels") or {})

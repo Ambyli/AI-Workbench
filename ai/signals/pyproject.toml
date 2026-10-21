@@ -1,0 +1,25 @@
+[project]
+name = "signals"
+version = "0.1.0"
+description = "Signals sidecar: CPU ONNX models (PII NER, topic embeddings, prompt injection, language id) answering route-policy's evaluators within a deadline"
+requires-python = ">=3.11"
+dependencies = [
+    # common.signals (the wire contract shared with route-policy) and
+    # common.pii (the entity vocabulary) -- both stdlib-only, no extra.
+    "common",
+    "fastapi",
+    "uvicorn",
+    # The three ONNX models (signals/tasks/). No torch, no transformers:
+    # raw tokenizers + onnxruntime's CPU provider. tokenizers >= 0.19 for
+    # left truncation (the injection tail window).
+    "onnxruntime>=1.22",
+    "tokenizers>=0.19",
+    "numpy>=1.26",
+    # fastText lid.176 for the language task: the predict-only wheel, no
+    # training code and no build toolchain needed.
+    "fasttext-predict>=0.9.2.4",
+    # models.yaml.
+    "pyyaml",
+    "prometheus-client",
+    "prometheus-fastapi-instrumentator",
+]

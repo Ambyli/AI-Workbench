@@ -14,6 +14,19 @@ derives the views evaluators ask for, each computed on first use and cached:
     current_rounds  the messages after it: the model rounds and tool results
                     of the exchange in progress
     called_tools    every tool the conversation CALLED, most recent first
+    user_items      every user message's text as a ``SignalText`` with id
+                    ``u<k>`` (1-based, oldest first; common.conversation.
+                    user_texts, Open WebUI's RAG block stripped) -- what a
+                    signal evaluator sends the sidecar
+    tool_items      every tool result as (``SignalText`` with id ``t<k>``,
+                    tool name), oldest first (common.conversation.tool_results)
+    latest_user_position
+                    the message index of the latest user message (None
+                    without one): a tool result after it belongs to the
+                    exchange in progress
+    latest_user_message
+                    that message itself (its content parts: text_shape
+                    counts attachments)
 
 Plus what the SERVICE puts on it before the pipeline runs:
 
@@ -30,6 +43,14 @@ Plus what the SERVICE puts on it before the pipeline runs:
                     ``pin: turn`` -- its id and route; None when this call is
                     the turn's first, the ruleset does not pin, an id is
                     missing, or the read did not happen in time
+    signals         the sidecar's answer to the ONE ``POST /signals`` the
+                    ruleset's evaluators asked for (``Evaluator.
+                    signal_requests``, merged by ``engine.pipeline.
+                    signal_requests``): task -> ``signals.model.SignalTask``
+    signals_error   why that call did not answer (``timed out`` | ``failed``
+                    | ``unavailable`` | ``not local``); None when it did, or
+                    was not needed
+    signals_ms      how long it took (None when there was no call)
     memo            scratch space for values an evaluator derives from the
                     request once and reuses across its hooks (the
                     llm_classifier's rendered prefixes)
@@ -47,9 +68,10 @@ from dataclasses import dataclass, field
 from functools import cached_property
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
-from common.conversation import called_tool_names, split_exchanges
+from common.conversation import called_tool_names, split_exchanges, tool_results, user_texts
 
 from ..analysis.model import Verdict
+from ..signals.model import SignalTask, SignalText
 
 # The verdicts the LiteLLM overflow layer reports per backend
 # (ai/litellm/hooks/overflow/state.py). Anything else a caller sends is kept
@@ -91,6 +113,9 @@ class RequestContext:
     analyses: Mapping[str, Verdict] = field(default_factory=dict)
     analysis_lookup_error: Optional[str] = None
     turn_pin: Optional[TurnPin] = None
+    signals: Mapping[str, SignalTask] = field(default_factory=dict)
+    signals_error: Optional[str] = None
+    signals_ms: Optional[float] = None
     memo: Dict[Any, Any] = field(default_factory=dict, repr=False, compare=False)
 
     @cached_property
@@ -108,6 +133,40 @@ class RequestContext:
     @cached_property
     def called_tools(self) -> List[str]:
         return called_tool_names(self.messages)
+
+    @cached_property
+    def _user_positions(self) -> List[int]:
+        if not isinstance(self.messages, list):
+            return []
+        return [i for i, m in enumerate(self.messages) if isinstance(m, dict) and m.get("role") == "user"]
+
+    @cached_property
+    def user_items(self) -> List[SignalText]:
+        texts = user_texts(self.messages)
+        positions = self._user_positions
+        if len(positions) != len(texts):  # never, by user_texts' contract: one per user message
+            positions = [-1] * len(texts)
+        return [SignalText(f"u{k}", text if isinstance(text, str) else "", (positions[k - 1], k))
+                for k, text in enumerate(texts, 1)]
+
+    @cached_property
+    def tool_items(self) -> List[Tuple[SignalText, str]]:
+        out: List[Tuple[SignalText, str]] = []
+        for k, (index, name, text) in enumerate(tool_results(self.messages), 1):
+            out.append((SignalText(f"t{k}", text if isinstance(text, str) else "",
+                                   (index if isinstance(index, int) else -1, k)),
+                        name if isinstance(name, str) else ""))
+        return out
+
+    @cached_property
+    def latest_user_position(self) -> Optional[int]:
+        positions = self._user_positions
+        return positions[-1] if positions else None
+
+    @cached_property
+    def latest_user_message(self) -> Optional[dict]:
+        position = self.latest_user_position
+        return self.messages[position] if position is not None else None
 
     @property
     def message_count(self) -> int:

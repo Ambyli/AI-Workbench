@@ -2,7 +2,8 @@
 
 Where the database is, how big the pool is, how often the binding snapshot is
 refreshed, where the baked-in rulesets live, where the document classifier
-is and how long a classification may take, the log level. Never a routing
+is and how long a classification may take, where the signals sidecar is and
+how long a decision waits for it, the log level. Never a routing
 rule: what an evaluator matches, which route it votes for, the cooldown, the
 combiner -- all of that is in a ruleset (``ai/route-policy/rulesets/``),
 versioned in route-policy-db, never in an environment variable
@@ -150,6 +151,48 @@ ANALYSIS_CONCURRENCY: int = _env_int("ROUTE_POLICY_ANALYSIS_CONCURRENCY", 2, 1)
 
 # How long GET /models (and a model host's locality verdict) is cached.
 CLASSIFIER_MODELS_TTL_S: float = 60.0
+
+# -- The signals sidecar (phase 5) -------------------------------------------------
+# PII NER, nearest-example topic, injection score and language, from the
+# `signals` sidecar (ai/signals) by Docker DNS on ai_shared, no auth. ONE
+# POST /signals per decision, for the tasks the ruleset's evaluators name
+# (none for `default`, so the live path makes no call), concurrently with the
+# verdict lookup and the turn pin. The client (common.signals) refuses a URL
+# whose host resolves outside the private / loopback / link-local networks,
+# so conversation text never leaves the box. Empty (only possible outside the
+# compose file) disables it: every signal evaluator abstains ("signals
+# unavailable") and `pii` still votes from its in-process patterns. The unit
+# tests use that.
+SIGNALS_URL: str = os.environ.get("ROUTE_POLICY_SIGNALS_URL", "http://signals:8000").strip().rstrip("/")
+
+# 20 ms, not 10: under load the sidecar answers a few ms past its deadline
+# (its event loop waits for the GIL behind three busy lanes), and the
+# response still has to cross the network and be parsed. At 10 ms a
+# 2,000-character turn lost its partial PII result to route-policy's cut
+# (2026-10-20 end-to-end).
+SIGNALS_DEADLINE_MARGIN_S: float = 0.02
+
+# How long /decide (and each shadow ruleset, after the answer) waits for the
+# signals call. It runs concurrently with the database reads, so at or below
+# DB_READ_BUDGET_S it adds nothing to the worst case. The sidecar is sent
+# `deadline_ms` = this minus SIGNALS_DEADLINE_MARGIN_S, so it answers with
+# whatever finished before route-policy's own wait gives up. Floor: the
+# margin + 20 ms (0.04), so the sidecar always has at least 20 ms -- a floor
+# equal to the margin sent `deadline_ms: 1`, and every task was skipped.
+SIGNALS_BUDGET_FLOOR_S: float = SIGNALS_DEADLINE_MARGIN_S + 0.02
+SIGNALS_BUDGET_S: float = _env_float("ROUTE_POLICY_SIGNALS_BUDGET_S", 0.1, SIGNALS_BUDGET_FLOOR_S)
+
+# POST /evaluate waits this long for the signals call, with no deadline cut,
+# so a draft is judged on complete signals.
+SIGNALS_EVALUATE_TIMEOUT_S: float = 10.0
+
+# The startup warm-up of the bound rulesets' example sets (one POST /signals
+# per set, texts empty; the sidecar embeds it in the background). A sidecar
+# that does not answer in time is logged and never stops startup.
+SIGNALS_WARM_TIMEOUT_S: float = 5.0
+
+# How long the sidecar's GET /models and its host's locality verdict are cached.
+SIGNALS_MODELS_TTL_S: float = 60.0
 
 # -- API caps -------------------------------------------------------------------
 # GET /chats/{chat_id}/decisions: default and largest `limit`.

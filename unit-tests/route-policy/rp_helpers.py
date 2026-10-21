@@ -4,7 +4,9 @@ the service's tables in memory (``memory_tables``, with ``GatedDatabase``
 and ``RecordingQueue``), and a fake document classifier
 (``FakeClassifier``: an ``httpx.MockTransport`` answering GET /models, POST
 /assess, GET /jobs/{id}, POST /jobs/{id}/cancel and DELETE /jobs/{id} the way
-ai/classifier does, recording every request).
+ai/classifier does, recording every request), and a fake signals sidecar
+(``FakeSidecar``: POST /signals per ROUTE_POLICY_PHASE5_PLAN § 3.1, in
+process through ``prefetch`` or over an ``httpx.MockTransport``).
 
 Imported by the test modules (conftest.py puts this directory on sys.path).
 """
@@ -379,3 +381,212 @@ def wait_for(predicate: Callable[[], Any], timeout_s: float = 10.0, interval_s: 
         if time.monotonic() > deadline:
             raise AssertionError(f"not true within {timeout_s}s")
         time.sleep(interval_s)
+
+
+# -- a fake signals sidecar -------------------------------------------------------------
+
+# What the fake answers in `models` (the sidecar's GET /models ids, pinned revisions).
+SIGNAL_MODELS = {
+    "pii": "gravitee-io/bert-small-pii-detection@6f1c2e0",
+    "embed": "intfloat/multilingual-e5-small@c007d7e",
+    "injection": "NeuralTrust/prompt-guard-oss-small@9b8a7c6",
+    "language": "fasttext/lid.176@7e69ec5451bc",
+}
+ADDRESSES["signals"] = ["172.18.0.11"]
+ADDRESSES["signals.example.com"] = ["93.184.216.40"]
+
+
+class FakeSidecar:
+    """The signals sidecar's POST /signals, in memory (ROUTE_POLICY_PHASE5_PLAN § 3.1).
+
+    Per-task behaviour, each a function of ONE text (the fake never looks at
+    another text, like the real cache):
+
+    * ``ner(text) -> {type: (count, max_score)}`` (default: nothing found);
+    * ``nearest(text) -> (route, share) | None`` (default: None -- the text
+      gets no neighbours);
+    * ``injection(text) -> score | None`` (default 0.01);
+    * ``language(text) -> (code, confidence)`` (default ("en", 0.99));
+    * ``status``: task -> a status to answer instead of computing (``warming``,
+      ``deadline``, ...); ``drop``: tasks left out of the answer;
+    * ``models``: the `models` map (default :data:`SIGNAL_MODELS`);
+    * ``delay_s``: every answer waits this long; ``down``: every request is a
+      connection error; ``http_status``: answer this instead of 200.
+
+    Records every POST /signals body in ``requests`` (thread-safe: an app
+    under TestClient runs it on its own loop thread).
+    """
+
+    def __init__(self, **kw: Any) -> None:
+        self.ner: Callable[[str], Dict[str, tuple]] = kw.pop("ner", lambda text: {})
+        self.nearest: Callable[[str], Optional[tuple]] = kw.pop("nearest", lambda text: None)
+        self.injection: Callable[[str], Optional[float]] = kw.pop("injection", lambda text: 0.01)
+        self.language: Callable[[str], tuple] = kw.pop("language", lambda text: ("en", 0.99))
+        self.status: Dict[str, str] = kw.pop("status", {})
+        self.drop: List[str] = kw.pop("drop", [])
+        self.models: Dict[str, str] = kw.pop("models", dict(SIGNAL_MODELS))
+        self.delay_s: float = kw.pop("delay_s", 0.0)
+        self.down: bool = kw.pop("down", False)
+        self.http_status: int = kw.pop("http_status", 200)
+        if kw:
+            raise TypeError(f"unknown options {sorted(kw)}")
+        self.requests: List[Dict[str, Any]] = []
+        self._lock = threading.Lock()
+
+    # -- the answer ---------------------------------------------------------------------
+
+    def _features(self, task: Dict[str, Any], text: str) -> Optional[Dict[str, Any]]:
+        name = task["task"]
+        if name == "pii":
+            found = self.ner(text)
+            return {"entities": {k: {"count": c, "max_score": s} for k, (c, s) in found.items()},
+                    "complete": True, "cached": False}
+        if name == "nearest":
+            picked = self.nearest(text)
+            if picked is None:
+                return None
+            route, share = picked
+            items = task.get("examples", {}).get("items", [])
+            k = int(task.get("k", 5))
+            mine = [e for e in items if e["route"] == route][:max(0, round(k * share))]
+            other = [e for e in items if e["route"] != route][:k - len(mine)]
+            neighbours = [{"id": e["id"], "route": e["route"], "similarity": round(0.95 - 0.01 * i, 3)}
+                          for i, e in enumerate(mine + other)]
+            routes: Dict[str, Dict[str, Any]] = {}
+            total = sum(n["similarity"] for n in neighbours) or 1.0
+            for n in neighbours:
+                entry = routes.setdefault(n["route"], {"share": 0.0, "best": n["similarity"], "count": 0})
+                entry["share"] += n["similarity"] / total
+                entry["count"] += 1
+            return {"neighbours": neighbours, "routes": {r: {**v, "share": round(v["share"], 4)}
+                                                         for r, v in routes.items()}, "cached": False}
+        if name == "injection":
+            score = self.injection(text)
+            return None if score is None else {"score": score, "windows": 1 if len(text) < 200 else 2,
+                                               "cached": False}
+        if name == "language":
+            code, confidence = self.language(text)
+            return {"language": code, "confidence": confidence}
+        return None
+
+    def answer(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        with self._lock:
+            self.requests.append(body)
+        texts = {t["id"]: t["text"] for t in body.get("texts", [])}
+        results: Dict[str, Any] = {}
+        for task in body.get("tasks", []):
+            name = task["task"]
+            if name in self.drop:
+                continue
+            status = self.status.get(name, "ok")
+            if status not in ("ok", "partial"):
+                results[name] = {"status": status, "ms": None, "texts": {}}
+                continue
+            out = {}
+            for text_id in task.get("texts", []):
+                features = self._features(task, texts[text_id])
+                if features is not None:
+                    out[text_id] = features
+            results[name] = {"status": status, "ms": 1.5, "texts": out}
+        return {"request_id": body.get("request_id"), "latency_ms": 4.2, "models": dict(self.models),
+                "results": results}
+
+    # -- over HTTP ---------------------------------------------------------------------------
+
+    def transport(self):
+        import httpx
+
+        return httpx.MockTransport(self._handle)
+
+    def client(self, base_url: str = "http://signals:8000", **kw: Any):
+        """A common.signals.SignalsClient on this fake, with the fake resolver."""
+        from common.signals import SignalsClient
+
+        kw.setdefault("resolver", fake_resolver)
+        return SignalsClient(base_url, transport=self.transport(), **kw)
+
+    async def _handle(self, request):
+        import httpx
+
+        if self.delay_s:
+            await asyncio.sleep(self.delay_s)
+        if self.down:
+            raise httpx.ConnectError("connection refused", request=request)
+        path = request.url.path
+        if request.method == "GET" and path == "/models":
+            return httpx.Response(200, json={"models": {k: {"id": v} for k, v in self.models.items()}})
+        if request.method == "GET" and path == "/health":
+            return httpx.Response(200, json={"status": "ok"})
+        if request.method == "POST" and path == "/signals":
+            body = json.loads(request.content)
+            if self.http_status != 200:
+                with self._lock:
+                    self.requests.append(body)
+                return httpx.Response(self.http_status, json={"detail": "refused"})
+            return httpx.Response(200, json=self.answer(body))
+        return httpx.Response(404, json={"detail": "Not Found"})
+
+
+def wire_body(batch, request_id: Optional[str] = "test", deadline_ms: Optional[int] = 80) -> Dict[str, Any]:
+    """A SignalBatch as the POST /signals JSON body (what the client sends)."""
+    from route_policy.signals import wire
+
+    return wire.build_request(batch, request_id=request_id, deadline_ms=deadline_ms).to_json()
+
+
+def answer_batch(ctx, batch, sidecar: Optional[FakeSidecar] = None, *, error: Optional[str] = None,
+                 ms: float = 12.5, edit: Optional[Callable[[Dict[str, Any]], None]] = None) -> str:
+    """Put the fake sidecar's answer to ``batch`` on ``ctx`` the way
+    Service.load_signals does -- parsed by common.signals and cut to the
+    request, as the client does -- with no HTTP; ``edit`` changes the JSON
+    answer first. ``error`` instead makes the call fail that way
+    (``timeout`` | ``error`` | ``unavailable`` | ``not_local``). Returns the
+    outcome label."""
+    from common.signals import SignalsOutcome, SignalsResponse
+    from route_policy.signals import wire
+
+    if error is not None:
+        return wire.apply(ctx, batch, SignalsOutcome(error, None, 100.0, "fake failure"))
+    request = wire.build_request(batch, request_id="test", deadline_ms=90)
+    answer = (sidecar or FakeSidecar()).answer(request.to_json())
+    if edit is not None:
+        edit(answer)
+    response = SignalsResponse.from_json(answer).for_request(request)
+    return wire.apply(ctx, batch, SignalsOutcome("ok", response, ms))
+
+
+def prefetch(ruleset, ctx, sidecar: Optional[FakeSidecar] = None, *, error: Optional[str] = None):
+    """What Service.load_signals would put on ``ctx`` for ``ruleset``, with
+    ``sidecar`` answering in-process (no client, no HTTP); ``error`` instead
+    makes the call fail that way. Returns the batch (None: nothing was
+    asked)."""
+    from route_policy.engine import pipeline
+
+    batch = pipeline.signal_requests(ruleset, ctx)
+    if batch is not None:
+        answer_batch(ctx, batch, sidecar, error=error)
+    return batch
+
+
+def signals_ruleset():
+    (ruleset,) = [r for r in seed().compiled if r.id == "default-signals"]
+    return ruleset
+
+
+def decide_with_signals(ruleset, messages: List[Any], sidecar: Optional[FakeSidecar] = None, *,
+                        error: Optional[str] = None, **kw):
+    """The pipeline's decision with the signals prefetched first."""
+    from route_policy.engine.pipeline import run as run_pipeline
+
+    ctx = context(messages, **kw)
+    prefetch(ruleset, ctx, sidecar, error=error)
+    return asyncio.run(run_pipeline(ruleset, ctx))
+
+
+def tool_result_round(name: str, result: str, call_id: str = "c1") -> List[dict]:
+    """An assistant tool call to ``name`` and its result ``result``."""
+    return [
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": call_id, "type": "function", "function": {"name": name, "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": call_id, "content": result},
+    ]

@@ -1,0 +1,102 @@
+# The signals sidecar's pinned models -- one entry per model lane.
+#
+# Read twice:
+#   * at BUILD time by `python -m signals.fetch_models /models` (Dockerfile):
+#     every file below is downloaded at the pinned revision into a plain
+#     directory /models/<lane>/<path> (NOT the Hugging Face cache: onnxruntime
+#     refuses external data such as injection's model.onnx.data when it
+#     resolves outside the model's own directory, which the cache's symlinks
+#     into blobs/ make it do), its sha256 is checked against the value here,
+#     and a NOTICE.txt with the licence is written beside it. Then
+#     `python -m signals.runtime --check` loads every model and runs one
+#     inference, so a broken pin fails the build, not the first request.
+#   * at RUN time by signals/runtime.py: the model ids in every answer
+#     (`<id>@<first 12 of revision>`), GET /models, and the token caps.
+#
+# A model change is: a new revision + new sha256 values here, a rebuild, and a
+# new route-policy ruleset version for every evaluator that pins the model id
+# (its calibration -- thresholds, min_share -- belongs to the old model).
+#
+# Fields:
+#   repo       Hugging Face repo id, or (with `url`) the display id.
+#   revision   the commit sha files are fetched at (HF only).
+#   url        a direct download URL instead of HF (one file).
+#   licence    SPDX id; the model card (README.md, one of the files) carries
+#              the authors' declaration, NOTICE.txt repeats it.
+#   attribution  extra text NOTICE.txt must carry (fastText's CC-BY-SA).
+#   files      relative path -> sha256 of every file the lane needs.
+#   model      which of `files` is the ONNX graph / fastText model.
+#   tokens     token caps (GET /models reports them; request params are
+#              clamped to `max`). No routing thresholds live here -- they
+#              belong to the rulesets that read these signals.
+
+models:
+  # Token classification, BERT-small (4 layers, 28.5 M). 25 Presidio-style
+  # labels, mapped onto common.pii's vocabulary in signals/tasks/pii.py.
+  pii:
+    repo: gravitee-io/bert-small-pii-detection
+    revision: f8c27a85c51c0168f07b9dcf00265bf0a4097939
+    licence: Apache-2.0
+    model: model.onnx
+    files:
+      model.onnx: 5fc1642b7400e18ee6014571dc6ae88a7bd155389334b9fa76fbc368d2c7c493
+      tokenizer.json: d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66
+      config.json: 6757df1ae2ec9ca16cef63009af337a66573d06c721d03c7820590f69eefa6c8
+      README.md: 2b047773ebf24c021432eea343ffc15e35603aa2895d3ccdf95b8d448fef43e6
+    tokens:
+      window: 256     # every text is scanned whole, in windows of this many tokens
+      stride: 16      # tokens shared by consecutive windows
+      max: 512        # the model's position limit
+
+  # Sentence embeddings, 384-d, mean pooling, "query: " prefix (e5's
+  # convention for symmetric tasks such as kNN). 100 languages.
+  embed:
+    repo: intfloat/multilingual-e5-small
+    revision: 614241f622f53c4eeff9890bdc4f31cfecc418b3
+    licence: MIT
+    model: onnx/model.onnx
+    files:
+      onnx/model.onnx: ca456c06b3a9505ddfd9131408916dd79290368331e7d76bb621f1cba6bc8665
+      tokenizer.json: 0b44a9d7b51c3c62626640cda0e2c2f70fdacdc25bbbd68038369d14ebdf4c39
+      config.json: 69137736cab8b8903a07fe8afaafdda25aac55415a12a55d1bffa9f581abf959
+      README.md: 0038de97aee16258cecbad7ffda4b4febd6953e747a00e0ddbc8e6ed241e9c1c
+    tokens:
+      default: 256    # a nearest task's max_tokens when it sends none
+      max: 512
+
+  # Jailbreak / prompt-injection classifier, mmBERT-small (ModernBERT, 22
+  # layers). Two labels, benign / jailbreak; the score is P(jailbreak).
+  # The graph keeps its weights in model.onnx.data, next to it.
+  injection:
+    repo: NeuralTrust/prompt-guard-oss-small
+    revision: 40e5c56b68a1b081484c3e56c9bee726e2749138
+    licence: MIT
+    model: model.onnx
+    files:
+      model.onnx: 4c070374acf8d1f6976de34afea0528cd629840fdb828632b1b573e52974d44f
+      model.onnx.data: cb0fd2964fa9da23ee14f18738ad7ecc416a4fdecdd70361c0bf4c414a69d287
+      tokenizer.json: 17f7d8b9518c403d7429ad9eeeabb6eed49c8d3311de8ef4ed5ad811381a2ced
+      config.json: 6ee7a8558718a95b5a5c238a304040ac60ebde3f8f2925af9cbda0fd328c5f11
+      README.md: 2a52acece7f074670a8d96199296a9544d93cbc44c91549f398d2227158137a4
+    tokens:
+      default: 256    # an injection task's max_tokens per window when it sends none
+      max: 512        # prompt-guard-config.json's max_length
+
+  # fastText language identification, 176 languages, the compressed 917 KB
+  # variant. Not on Hugging Face: fetched from Meta's download host and
+  # pinned by its sha256 (the id carries the first 12 hex digits).
+  language:
+    repo: fasttext/lid.176
+    url: https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.ftz
+    licence: CC-BY-SA-3.0
+    attribution: >-
+      lid.176.ftz, the fastText language identification model by Facebook AI
+      Research (A. Joulin, E. Grave, P. Bojanowski, T. Mikolov, "Bag of Tricks
+      for Efficient Text Classification", 2016; "FastText.zip: Compressing
+      text classification models", 2016), from
+      https://fasttext.cc/docs/en/language-identification.html, licensed
+      under the Creative Commons Attribution-Share-Alike License 3.0
+      (https://creativecommons.org/licenses/by-sa/3.0/). Used unmodified.
+    model: lid.176.ftz
+    files:
+      lid.176.ftz: 8f3472cfe8738a7b6099e8e999c3cbfae0dcd15696aac7d7738a8039db603e83

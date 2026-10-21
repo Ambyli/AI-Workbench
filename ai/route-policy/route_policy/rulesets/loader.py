@@ -6,10 +6,12 @@ it into route-policy-db (``rulesets.store.seed_and_load``):
     rulesets/<anything>.yaml     one ruleset document each (top level only)
     rulesets/bindings.yaml       the seed bindings -- not a ruleset
     rulesets/patterns/*.yaml     keyword rules, referenced by `patterns_ref`
+    rulesets/examples/*.yaml     example sets, referenced by `examples_ref`
 
 **Refs.** An evaluator's ``config.patterns_ref: patterns/code.yaml`` is
-inlined as ``config.rule`` (the ref is kept, as provenance). A config that
-already has ``rule`` is left alone -- a stored document, as GET /rulesets
+inlined as ``config.rule``, and ``config.examples_ref: examples/routes.yaml``
+as ``config.examples`` (the ref is kept, as provenance). A config that
+already has the target key is left alone -- a stored document, as GET /rulesets
 returns it, can be posted back to POST /evaluate as is. A ref is a relative
 path inside the rulesets directory -- an absolute path or one that climbs
 out with ``..`` is refused, also for documents sent to POST /evaluate.
@@ -26,7 +28,7 @@ changed ruleset must get a new version.
       key_alias: null           # optional: only requests from this LiteLLM key alias
       ruleset: default
       version: null             # null / omitted = the highest version baked in
-      shadow: [default-llm]     # optional: rulesets decided beside it, logged, never applied;
+      shadow: [default-llm, default-signals]   # optional: rulesets decided beside it, logged, never applied;
                                 # each an id (highest version) or {ruleset: id, version: n}
 
 Two seed rules, checked here so they stop the image build as well as
@@ -54,7 +56,7 @@ from .validate import compile_ruleset
 
 BINDINGS_FILE = "bindings.yaml"
 # ref key -> the config key it is inlined as.
-REF_KEYS = {"patterns_ref": "rule"}
+REF_KEYS = {"patterns_ref": "rule", "examples_ref": "examples"}
 
 
 class RulesetFileError(ValueError):

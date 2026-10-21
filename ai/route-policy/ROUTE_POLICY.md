@@ -68,14 +68,38 @@ say whether it is better; promoting it is a separate, later change
   criterion no longer counts a tool call (a web search) as "running
   software".
 
-Plan: `ROUTE_POLICY_PLAN.md` (outside the repo), phases 2–6.
+**Phase 5: fast signals, in shadow.** A second draft, `default-signals`,
+is bound beside `default-llm` as another shadow. Its evaluators read fast
+CPU signals from the **`signals` sidecar** (`ai/signals`, ONNX models on
+CPU) -- PII NER, a nearest-example topic, a prompt-injection score, the
+language -- fetched in ONE `POST /signals` per decision within
+`ROUTE_POLICY_SIGNALS_BUDGET_S` (0.1 s), concurrently with the database
+reads ([§ Signals](#signals)):
+- **`pii` forces `local-private`** on sensitive data (email, phone, street
+  address, government id, card / bank / account number) in ANY user
+  message -- once it appears, the chat stays private -- or in a Phoenix /
+  Trino tool result; a name forces only with a date of birth, a bare name
+  never. Its patterns (`common.pii`) run in-process, so it still forces
+  with the sidecar down;
+- **`topic`** (`nearest_examples`) votes the route of the curated example
+  prompts nearest to the latest user message, for the turns no keyword,
+  tool or cooldown rule claimed;
+- the **injection score**, the code shape, the language and the size are
+  logged with the new role **`observe`** and route nothing.
+
+`default@3` keeps routing every turn and makes no signals call; promotion is
+a separate, later change ([§ Promoting the signals](#promoting-the-signals)).
+[§ The `default-signals` draft](#the-default-signals-draft).
+
+Plan: `ROUTE_POLICY_PLAN.md` and `ROUTE_POLICY_PHASE5_PLAN.md` (outside the
+repo), phases 2–6.
 
 | | |
 |---|---|
 | Compose file | [`docker-compose.route-policy.yml`](docker-compose.route-policy.yml) |
 | Services | `route-policy` (FastAPI, swap-class), `route-policy-db` (Postgres 17, recreate-class) |
 | Inside ai_shared | `http://route-policy:8000` (what LiteLLM uses), `route-policy-db:5432` |
-| Calls | `http://classifier:8000` (`ROUTE_POLICY_CLASSIFIER_URL`): background `/assess` jobs only, never on the `/decide` path |
+| Calls | `http://classifier:8000` (`ROUTE_POLICY_CLASSIFIER_URL`): background `/assess` jobs only, never on the `/decide` path; `http://signals:8000` (`ROUTE_POLICY_SIGNALS_URL`): one `POST /signals` per decision whose ruleset asks (today only the `default-signals` shadow, after the answer), within `ROUTE_POLICY_SIGNALS_BUDGET_S` |
 | LAN | `PORT_ROUTE_POLICY` 8027, published by `ai/edge` (`EDGE_ALLOWED_CIDRS`); `PORT_ROUTE_POLICY_DB` 5441 |
 | Through LiteLLM | `{{litellm}}/v1/route-policy/*` (pass-through, `auth: true`) |
 | Trino catalog | `postgres_route_policy` (read-only `trino_reader`) |
@@ -96,9 +120,12 @@ Plan: `ROUTE_POLICY_PLAN.md` (outside the repo), phases 2–6.
 - [Shadow rulesets](#shadow-rulesets)
 - [The llm_classifier](#the-llm_classifier)
 - [The `default-llm` draft](#the-default-llm-draft)
+- [Signals](#signals)
+- [The `default-signals` draft](#the-default-signals-draft)
 - [Decision log and Trino](#decision-log-and-trino)
 - [Benchmark](#benchmark)
 - [Promoting the classifier](#promoting-the-classifier)
+- [Promoting the signals](#promoting-the-signals)
 - [Metrics](#metrics)
 - [Configuration](#configuration)
 - [Operations](#operations)
@@ -121,7 +148,9 @@ Open WebUI ─► LiteLLM (model `auto`, one pass)
                                                                          Trino: postgres_route_policy    │
                                                                                                          │
    after the answer (one background task per /decide) ───────────────────────────────────────────────────┘
-     ├─ shadow rulesets (default-llm) decided on the same request ──► decisions row, shadow_of = primary
+     ├─ shadow rulesets (default-llm, default-signals) decided on the same request ──► decisions row, shadow_of = primary
+     │    └─ default-signals: ONE POST /signals (≤ ROUTE_POLICY_SIGNALS_BUDGET_S) ──► signals:8000 (ai/signals, CPU)
+     │                          pii NER · nearest-example topic · injection · language ◄── statuses + features, never text
      └─ llm_classifier analysis requests ──► analysis queue (in memory, deduplicated)
             └─ worker: GET /models (locality) ─ POST /assess ─ poll GET /jobs/{id} ─ read ─ DELETE /jobs/{id}
                    classifier:8000 ──► qwen3.5-4b (llama.cpp, CPU)
@@ -143,7 +172,11 @@ always the verdict of an EARLIER background classification, read in one
 bounded query, and so is the turn's first decision for a `pin: turn`
 ruleset (the two reads run concurrently); shadow rulesets and new
 classifications start only after the answer, and cannot change, delay or
-fail it.
+fail it. A ruleset whose evaluators read the signals sidecar gets ONE call,
+concurrently with those reads and within `ROUTE_POLICY_SIGNALS_BUDGET_S`
+(0.1 s, no more than the read budget), so the worst case does not grow;
+today only the `default-signals` shadow makes it, after the answer
+([§ Signals](#signals)).
 
 **Two copies of the invariants.** The service enforces them
 (`route_policy/engine/invariants.py`), and the hook re-checks the answer with
@@ -161,7 +194,9 @@ foreign key to `decisions`. The `decision_outcomes` view joins them.
 
 ## Deploying
 
-On a box that already runs phase 4, follow
+On a box that already runs `default@3` and `default-llm@3`, follow
+[§ Upgrading to phase 5](#upgrading-to-phase-5-default-signals1); on one
+that runs phase 4,
 [§ Upgrading to the turn pins](#upgrading-to-the-turn-pins-default3)
 instead; on one that runs phase 3,
 [§ Upgrading to phase 4](#upgrading-to-phase-4) first; on one that runs
@@ -173,7 +208,11 @@ the shadow ruleset also needs the document classifier (`ai/classifier`) with
 the `qwen3.5-4b` entry in its `models.yaml`, and the `qwen3.5-4b` llama.cpp
 service (`ai/llama`); without them every background classification is
 stored as failed (`unavailable`, `refused`, `not_local`) and `topic-llm`
-abstains -- routing is unaffected.
+abstains -- routing is unaffected. Likewise the `default-signals` shadow
+reads the `signals` sidecar (`ai/signals`, `ai/signals/SIGNALS.md`): without
+it every signal evaluator abstains and `pii` votes from its patterns alone
+-- routing is unaffected. Deploy it before route-policy so the startup
+warm-up of the example set reaches it.
 
 A fresh box, in order (from the repo root):
 
@@ -218,7 +257,8 @@ make logs route-policy route-policy FOLLOW=0 TAIL=50   # "applied migration 0001
                                                       # "binding auto -> default@3", "binding auto shadowed by default-llm@3",
                                                       # "analysis: queue ready (2 worker(s), ...)"
 curl -s localhost:8027/health                         # {"status":"ok","rulesets":[{"id":"default","version":3},
-                                                      #   {"id":"default-llm","version":3}],"bindings":1}
+                                                      #   {"id":"default-llm","version":3},
+                                                      #   {"id":"default-signals","version":1}],"bindings":1}
 curl -s localhost:8027/ready                          # {"status":"ready","db":"up"}
 curl -s localhost:8027/bindings
 curl -s -X POST localhost:8027/evaluate -H 'content-type: application/json' \
@@ -379,6 +419,51 @@ untouched.
 **Rollback:** `git revert` and `make up route-policy`; `default-llm@2` is
 already stored with the same content and the slot moves back.
 
+### Upgrading to phase 5 (default-signals@1)
+
+Only a second shadow is added: `default-signals@1` beside `default-llm@3`.
+Routing does not change -- `default@3` is untouched and makes no signals
+call. No migration. On the box, from the repo root (the sidecar's own guide
+is `ai/signals/SIGNALS.md`):
+
+1. **`git pull`**, and add the new `.env` lines from `.env.example`: the
+   `## Signals` block, the `PORT_SIGNALS` row, and
+   `ROUTE_POLICY_SIGNALS_URL` / `ROUTE_POLICY_SIGNALS_BUDGET_S` in the
+   `## Route policy` block (the compose file falls back to the same
+   defaults if they are missing).
+2. **`make up edge`** (it gains the sidecar's LAN port; a recreate, a second
+   or two of LAN downtime).
+3. **`make build signals && make up signals`.** Wait for `curl -s
+   localhost:8025/health` to answer 200 (models loaded and warm).
+4. **`make build route-policy && make up route-policy`.** `default-signals@1`
+   is seeded and added as the binding's second shadow slot, and startup
+   sends its example set to the sidecar (`startup: signals warm-up nearest:
+   ok (nearest warming)` in the log). Check:
+   - `/health` lists `{"id":"default-signals","version":1}` and `/bindings`
+     shows two shadow slots;
+   - a dry run: `curl -s -X POST localhost:8027/evaluate -H
+     'content-type: application/json' -d
+     '{"ruleset":{"id":"default-signals"},"messages":[{"role":"user","content":"my SSN is 523-45-6789"}]}'
+     | jq '.route, (.votes[] | select(.evaluator=="pii") | .reason)'` →
+     `"local-private"`, `"sensitive data: gov_id"`;
+   - after a few `auto` turns, `shadow_comparisons` has a
+     `default-signals` row per turn, and `curl -s localhost:8027/metrics |
+     grep route_policy_signals_total` shows `outcome="ok"` growing (not
+     `timeout` / `unavailable` / `not_local`).
+5. **`docker restart prometheus`** (the sidecar's scrape job).
+6. **Optional: `qwen3.5-4b` on cores of its own** (the box's CPU split,
+   `ai/llama/LLAMA.md § qwen3.5-4b`). Copy `LLAMA_QWEN35_4B_THREADS=16` and
+   `LLAMA_QWEN35_4B_EXTRA_ARGS="--cpu-range 0-15"` from `.env.example`,
+   check the image knows the flag (`docker run --rm --entrypoint
+   llama-server llama-unsloth:<LLAMA_UNSLOTH_CPU_TAG>-cpu --help | grep
+   cpu-range`), then `make up llama qwen3.5-4b` -- a recreate: while it
+   reloads, background classifications fail (`not_local` /
+   `unavailable`) and `topic-llm` abstains; routing is unaffected.
+
+**Rollback:** `git revert` and `make up route-policy`: the binding loses the
+slot; `default-signals@1` stays stored with its decisions. Then
+`docker compose -p ai-signals down` and `make up edge`.
+
 ## API
 
 No auth on the service itself, the same as the classifier:
@@ -507,13 +592,21 @@ which only started awaiting the answer; the request gained
   call is decided afresh as if it were the turn's first
   (`route_policy_db_reads_cut_total{read="turn_pin"}`,
   `route_policy_errors_total{kind="turn_pin"}`).
+- **Signals.** When the primary ruleset has signal evaluators (`default@3`
+  has none, so no call), `/decide` sends ONE `POST /signals` for all of
+  them, concurrently with the two reads, within
+  `ROUTE_POLICY_SIGNALS_BUDGET_S` (0.1 s; the sidecar is told to answer 20
+  ms before it). Past it, or on any failure -- a bug around the call
+  included: `load_signals` never raises, it leaves `signals failed` and
+  counts `route_policy_errors_total{kind="signals"}` -- the signal
+  evaluators abstain and `pii` votes from its patterns ([§ Signals](#signals)).
 - **After the answer, in one background task** (counted with the writes
   against `WRITES_MAX_IN_FLIGHT`; dropped past it, `shadow_dropped`):
   1. the primary's `llm_classifier` analysis requests go to the analysis
      queue (none from a call that is not its turn's first);
   2. each **shadow** ruleset of the binding runs on the same request (its
-     own verdict lookup and turn pin, with the same budget, so it measures
-     what enforcing it would do) and is stored as a `decisions` row with
+     own verdict lookup, turn pin and signals call, with the same budgets,
+     so it measures what enforcing it would do) and is stored as a `decisions` row with
      `decision_id` = `uuid5(<this decision_id>, "<ruleset>@<version>")` and
      `shadow_of` = this decision_id, with its own `evaluations`; then its
      analysis requests go to the queue.
@@ -575,8 +668,14 @@ its evaluator's `detail` and `error`.
   (one read-only query, waited for as long as it takes); `/evaluate` never
   enqueues a classification, so a conversation `/decide` never saw has none
   and the evaluator abstains (`no verdict in the last N message(s)`).
-- **A draft document** may use `patterns_ref` refs. They resolve inside the
-  baked `rulesets/` directory; a path that leaves it is a `422`.
+- **The signal evaluators** get ONE signals call, as on `/decide`, but
+  waited for up to `SIGNALS_EVALUATE_TIMEOUT_S` (10 s) with no deadline cut,
+  so a draft is judged on complete signals; each signal vote's `detail`
+  carries its task's `status` and `signals_ms`. It runs concurrently with
+  the verdict read.
+- **A draft document** may use `patterns_ref` / `examples_ref` refs. They
+  resolve inside the baked `rulesets/` directory; a path that leaves it is a
+  `422`.
 - **A stored document** from `GET /rulesets/{id}/{version}` posts back as it
   is.
 - **An invalid document** is a `422` whose `detail.errors` lists **every**
@@ -595,7 +694,7 @@ default_route: local-general     # one of routes
 evaluators:                      # in order; each votes or abstains
   - id: privacy
     type: regex_text             # GET /evaluator-types
-    role: force                  # vote (default) | force | veto
+    role: force                  # vote (default) | force | veto | observe (logged, never combined)
     config: {patterns_ref: patterns/privacy.yaml}
     vote: {route: local-private, weight: 1.0}
 combiner: {type: priority}       # priority | {type: weighted, threshold: 0.7}
@@ -608,16 +707,25 @@ Validation (`route_policy/rulesets/validate.py`):
 - **Every `vote.route` must be one of `routes`**, so a ruleset can only ever
   vote for its own chain aliases.
 - **Cross-references must resolve** (`cooldown.relevant_if`).
+- **One parameter set per signals task:** two evaluators that would ask the
+  signals sidecar for the same task with different parameters are refused
+  ([§ Signals](#signals)).
+- **Example sets** (`nearest_examples`): ids unique, routes among `routes`,
+  texts 1–300 characters, at most 1,000 examples.
 - **`pin`** is `turn` or absent (`null`); anything else is an error. It is
   content like the rest: adding or dropping it is a new version.
 
 **Files** (`ai/route-policy/rulesets/`, baked into the image):
 - `*.yaml` at the top level: one ruleset each (`default.yaml`,
-  `default-llm.yaml`).
+  `default-llm.yaml`, `default-signals.yaml`).
 - `bindings.yaml`: the seed bindings.
 - `patterns/*.yaml`: keyword rules, referenced by `patterns_ref` -- by
-  `default` AND `default-llm`, so a pattern edit is new content for both:
-  bump both versions.
+  `default`, `default-llm` AND `default-signals`, so a pattern edit is new
+  content for all three: bump all three versions.
+- `examples/*.yaml`: labelled example sets for `nearest_examples`,
+  referenced by `examples_ref` and inlined as `config.examples` -- the same
+  mechanism, so an edited example is new content too
+  ([§ The `default-signals` draft](#the-default-signals-draft)).
 
 **Bindings** (`bindings.yaml`):
 
@@ -626,8 +734,8 @@ Validation (`route_policy/rulesets/validate.py`):
   key_alias: null            # optional: only requests from this LiteLLM key alias
   ruleset: default           # must be mode: enforce
   version: null              # omitted = the highest version baked in
-  shadow: [default-llm]      # optional: each an id (highest version) or {ruleset: <id>, version: <n>};
-                             # each must be mode: shadow
+  shadow: [default-llm, default-signals]   # optional: each an id (highest version) or
+                                           # {ruleset: <id>, version: <n>}; each must be mode: shadow
 ```
 
 Two seed rules, checked when the files are loaded (so at image build time
@@ -658,8 +766,8 @@ swap cannot race.
 
 Startup owns the seeded bindings and resets them on every start.
 
-**A stored version needs no file.** Only the current `default` (version 3)
-and `default-llm` (version 3) are baked in; `default@1` (phase 2, shadow),
+**A stored version needs no file.** Only the current `default` (version 3),
+`default-llm` (version 3) and `default-signals` (version 1) are baked in; `default@1` (phase 2, shadow),
 `default@2` (phase 3), `default-llm@1` and `default-llm@2` stay in the database with the
 decisions made under them, and the store compiles each from there on first
 use (`GET /rulesets/default/1`, `POST /evaluate`). Keeping old files would
@@ -710,6 +818,12 @@ into Trino; `regex_text` reports pattern *indices*, `tool_calls` tool *names*.
 | `backend_load` | `backends` (regexes over api_base), `verdicts` (default busy, down), `min_waiting`, `require: any \| all` | Watched backends in the snapshot qualify. Abstains when none matches. |
 | `static` | `abstain`, `confidence`, `reason` | Always (or never). For tests, overrides, and as a `veto`. |
 | `llm_classifier` | `model`, `criteria` (route → question), `otherwise`, `min_score`, `history`, `max_age_exchanges` | A stored verdict (a local model's classification of an earlier prefix of this conversation, at most `max_age_exchanges` user messages old) names a route. **Chooses its own route**: `vote.route` is refused. Abstains for a background task (`background task`), which it never classifies. [§ The llm_classifier](#the-llm_classifier). |
+| `pii` | `scope: {user_messages: all \| latest, tool_results: null \| <full-match regex over tool names>}`, `force: [types]` (required), `with_person: [types]`, `ner` (true), `min_score` (0.5), `model` (optional NER pin) | A `force` type is found in a text in scope -- by `common.pii`'s patterns (in-process, always) or by the sidecar's NER at `max_score >= min_score` -- or a `with_person` type in the SAME text as a person. `person` / `location` are refused in both lists: alone they never force. With the sidecar down, cut or on another model it votes from the patterns (reason `… (patterns only: signals timed out)`). `detail`: `types`, `by_source`, `forced_by`, `forced_in` (`latest_user` / `earlier_user` / `tool:<name>`), `texts_in_scope`, `texts_scanned`, `chars_scanned`, `ner_status`, `ner_unscanned_texts`, `ner_model`, `signals_ms`. |
+| `nearest_examples` | `model` (pin), `examples` (usually `examples_ref`), `k` (5), `min_share` (0.8), `min_similarity` (0), `max_tokens` (256), `scope: current_message` | The top-k route's share of the similarity mass is ≥ `min_share`. **Chooses its own route** (confidence = the share). Abstains while the sidecar embeds the set (`nearest warming`), on any missing answer, and on another embedding model (`nearest model mismatch`). `detail`: `model`, `status`, `fingerprint`, `neighbours` (example ids), `route_shares`, `best_similarity`, `signals_ms`. |
+| `prompt_injection` | `model` (pin), `threshold` (0.9), `scope: current_message \| current_exchange` (+ this exchange's tool results: indirect injection), `max_tokens` (256) | The highest score (head + tail windows per text) is ≥ `threshold`. `detail`: `model`, `status`, `score`, `scored_texts`, `windows`, `signals_ms`. Observed only in `default-signals`. |
+| `language` | `languages` or `not_languages` (exactly one), `min_confidence` (0.6) | The latest user message's language (fastText) matches. `detail`: `language`, `confidence`, `status`, `signals_ms`. |
+| `text_shape` | `min_lines`, `min_code_ratio` (at least one) | Pure. The latest user message looks like pasted code. `detail`: `chars`, `lines`, `fenced_blocks`, `code_lines`, `code_ratio`, `urls`, `attachments` `{image, file, audio}` (content parts by type -- the hook's slimmed placeholders keep it). |
+| `context_size` | `max_tokens`, `chars_per_token` (2.5) | Pure. The overflow hook's estimate -- JSON characters of `messages` + `tools` / `chars_per_token` -- is above `max_tokens`. `detail`: `estimated_tokens`, `chars`, `max_tokens`. |
 
 - **Exchanges** come from `common.conversation.split_exchanges`: one per user
   message, holding the message and every round after it.
@@ -735,8 +849,12 @@ into Trino; `regex_text` reports pattern *indices*, `tool_calls` tool *names*.
   `cooldown.relevant_if` uses.
 - **`llm_classifier`** reads only what the service put on the request
   (`ctx.analyses`); the slow part happens in the background
-  ([§ The llm_classifier](#the-llm_classifier)). `context_size` is in the
-  plan but not scheduled.
+  ([§ The llm_classifier](#the-llm_classifier)).
+- **`pii`, `nearest_examples`, `prompt_injection`, `language`** read only
+  what the service put on the request (`ctx.signals`: the ONE signals call
+  their `signal_requests` asked for, [§ Signals](#signals)); `pii` also runs
+  `common.pii` in-process. `text_shape` and `context_size` read the request
+  alone. None of them stores a span or a character of the text.
 
 ## Combiners and roles
 
@@ -753,12 +871,28 @@ Every combiner runs the same frame (`route_policy/combiners/base.py`):
      `routes`.
 4. **default:** `default_route`; if that is vetoed, the first route in play.
 
+**`observe`** is in none of the steps: an observe evaluator runs, and is
+logged with its would-be route (`evaluations.vote_route`, `abstained =
+false` when it "voted"), and no combiner reads it -- no score, no force, no
+veto, in either combiner. It is how a signal is measured without routing
+anything: `default-signals` observes the injection score, the code shape,
+the language and the size. A later version changes what a hit does by
+changing the `role` (`force`, `veto`) -- in a shadow first, or inside an
+enforced ruleset as an observer. The invariants are unchanged (in both
+copies).
+
 **Every evaluator always runs**, even after a force vote, and every vote is
 logged: a rule's hit rate is readable in Trino whatever decided the turn.
 
 An evaluator that **raises** is recorded as an abstain with its error, and the
-decision goes on. A vote for a route the ruleset does not list is turned into
-an abstain with an error.
+decision goes on. The error is the exception's **type name** only
+(`KeyError`; reason `error: KeyError`), in the vote, `evaluations.error`,
+`decisions.error` and the log: an evaluator reads the conversation, and a
+message can quote it (`common.pii`'s grid lookup once raised `KeyError('ſ')`,
+a character of the user's text). The same holds for every exception
+route-policy logs or stores around a decision, a shadow, a write or an
+analysis. A vote for a route the ruleset does not list is turned into an
+abstain with an error.
 
 **The invariants** (`route_policy/engine/invariants.py`) run last:
 - `requested_model == local-private` → `local-private`.
@@ -918,7 +1052,9 @@ how a draft is measured on real traffic before anyone promotes it.
   response is never touched; a shadow that cannot be loaded (not stored, not
   compilable by this copy, not handed over within `DB_READ_BUDGET_S`) is
   skipped and counted (`shadow_load`), one that raises is counted
-  (`shadow_error`), and neither affects the primary or the other shadows.
+  (`shadow_error`, logged by exception type), and neither affects the
+  primary or the other shadows: each shadow runs on its own, so a bug in
+  `default-llm` never skips `default-signals`.
 - **Stored as:** a `decisions` row with `decision_id = uuid5(<primary id>,
   "<ruleset>@<version>")`, `shadow_of` = the primary's id, `mode = shadow`,
   `applied = false`, the same chat / message / user ids and
@@ -939,7 +1075,11 @@ how a draft is measured on real traffic before anyone promotes it.
   `route_policy_evaluator_seconds` include them, so a shadow evaluator's hit
   rate is on the dashboard too.
 - **Cost:** CPU for one more pipeline run per request, one more decision
-  write, and whatever its evaluators enqueue -- off the request path.
+  write, and whatever its evaluators enqueue or fetch -- off the request
+  path. `auto` has two: `default-llm` (an analysis request per turn) and
+  `default-signals` (one signals call per call, within the same budget an
+  enforced ruleset would get; texts the sidecar already scanned are cache
+  hits).
 
 ## The llm_classifier
 
@@ -1043,8 +1183,9 @@ a remote failure is a status, never an exception:
    public address, or one that does not resolve at all is **`not_local`**
    and nothing is submitted. Docker DNS answers only for RUNNING
    containers, so a stopped `qwen3.5-4b` shows up as `not_local` too. The
-   host's verdict is cached per host for 60 s. An unknown or unavailable
-   model is `refused`.
+   host's verdict is cached per host for 60 s -- an unresolved one for 2 s
+   only, so a restarted model is classified again within seconds. An
+   unknown or unavailable model is `refused`.
 2. **`POST /assess`** (JSON): `documents: [{type: text, data: <transcript>}]`,
    one `{name: <question>, type: llm, options: {hint: presence, ocr: never}}`
    per criterion in tie order, `model`. N criteria cost N model calls, run
@@ -1160,6 +1301,194 @@ still in it; a verdict counts for the next message only
 (`max_age_exchanges: 1`, was 2); and the code criterion covers building
 an app again (2 scored "Can you make me a calculator app?" 1/10 as "an
 application rather than source code").
+
+## Signals
+
+Four evaluator types read the **`signals` sidecar** (`ai/signals`, operator
+guide `ai/signals/SIGNALS.md`): `pii` (its NER), `nearest_examples`,
+`prompt_injection` and `language`. Small ONNX models on CPU, fast enough to
+vote on the CURRENT turn, unlike the `llm_classifier`.
+
+**One call per decision** (`route_policy/signals/`, `engine/pipeline.py`,
+`service.py`), the phase-4 prefetch pattern:
+1. **Before the pipeline,** each evaluator's `signal_requests(ctx)` says which
+   task it will read, over which texts, with which parameters (cheap, pure).
+   `pipeline.signal_requests` merges them into ONE request
+   (`signals.model.merge`): each text once, by id; equal requests for a task
+   become one task over the union of their texts. A request carries each
+   task once (its results are keyed by task), so **validation refuses** a
+   ruleset in which two evaluators would ask for one task with different
+   parameters -- two `nearest_examples` with different example sets or `k`,
+   two `prompt_injection` with different `max_tokens`
+   (`Evaluator.signal_tasks`); `pii`'s scope is which texts, not a
+   parameter, so two `pii` share the task. Should a conflict reach the
+   pipeline anyway, the first request is sent and the other evaluator
+   abstains (`conflict`, logged once per ruleset version). No request, no
+   call: `default@3` makes none.
+2. **`Service.load_signals`** sends it through `common.signals.SignalsClient`
+   -- inside `load_context`'s `asyncio.gather`, beside the verdict lookup
+   and the turn pin -- within `ROUTE_POLICY_SIGNALS_BUDGET_S` (0.1 s), with
+   `deadline_ms` = the budget minus 20 ms, so the sidecar answers with what
+   finished before route-policy's own wait gives up. The decision id is the
+   `request_id` (the sidecar's logs only).
+3. **The answer lands on the request view:** `ctx.signals` (task → status,
+   model id, per-text features, the text ids sent), or `ctx.signals_error`
+   (`timed out` | `failed` | `unavailable` | `not local`), and
+   `ctx.signals_ms`. Evaluators read only the context, so the pipeline stays
+   a pure function.
+
+**Texts and their ids**, newest first in every task (the order the sidecar
+scans in):
+- `u<k>`: the user text of the k-th user message
+  (`common.conversation.user_texts`; Open WebUI's RAG block stripped, the
+  same text `regex_text` reads). An empty one is never sent;
+- `t<k>`: the k-th tool result of the conversation
+  (`common.conversation.tool_results`, named through its `tool_call_id`),
+  sent only when an evaluator's scope selects it: `pii`'s
+  `scope.tool_results` regex over the tool name, `prompt_injection`'s
+  `current_exchange` (the results after the latest user message).
+
+**The request caps** the sidecar enforces with a 413 (`common.signals`: 20,000
+characters per text, 200,000 per request, 64 texts) are applied before
+sending: a longer text is cut to its first 20,000 characters (`pii` counts
+it as not completely scanned by NER), and, newest first, a text that no
+longer fits is left out -- an older, shorter one may still fit. The `pii`
+patterns scan everything in-process regardless (up to 200,000 characters
+per decision, user texts first).
+
+**Task statuses** (each signal vote's `detail.status`; `pii`'s
+`ner_status`): the sidecar's `ok` | `partial` (some texts: the deadline
+cut the rest, or a text failed -- the others still count and the failed
+one is "not scanned") | `deadline` | `skipped` (queued past the deadline) |
+`warming` (the example set is being embedded) | `error` (no text has
+features) | `unavailable` (its model is not loaded); or
+route-policy's `not_sent` (no text fit the caps), `timed out` / `failed` /
+`unavailable` / `not local` (the call itself), `not fetched`, `conflict`,
+`model mismatch` (the sidecar answered with another model than the
+evaluator's `model` pin; a pin without `@<revision>` accepts any revision).
+Only `ok` / `partial` carry features. Every other status is an abstain --
+**the sidecar down, slow or wrong never moves a turn**, and never off
+`local-private` (the invariants are unchanged).
+
+**Shadows** prefetch their own signals after the answer, with the SAME budget
+(so a shadow measures what enforcing it would cost); the texts the sidecar
+saw for an earlier call are cache hits. **`POST /evaluate`** waits up to
+`SIGNALS_EVALUATE_TIMEOUT_S` (10 s) and sends no deadline, so a draft is
+judged on complete signals.
+
+**The startup warm-up.** After seeding, the service sends each bound
+ruleset's warm-up (`Evaluator.signal_warmups`: a `nearest` task with the
+example set and no text), so the sidecar embeds the set before the first
+turn needs it; the answer is `warming` (started) or `ok` (cached). A sidecar
+that is down at startup is logged and never stops it; the set is then
+embedded on first use, and `topic` abstains (`nearest warming`) until it is.
+
+**Locality and privacy.** The client resolves the sidecar's host first and
+sends nothing unless it resolves only to private / loopback / link-local
+addresses (`common.net.check_locality`, cached 60 s -- 2 s when the host
+did not resolve, so a sidecar that restarts, or starts after route-policy,
+is reached again within seconds; the classifier client's rule): a
+misconfigured URL can never carry conversation text off
+the box. Answers carry statuses, model ids, counts, scores, example ids and
+language codes -- never text, never spans -- and that is all `detail`
+keeps. An empty `ROUTE_POLICY_SIGNALS_URL` runs no client: the signal
+evaluators abstain (`signals unavailable`) and `pii` votes from its
+patterns.
+
+**No migration:** a signal evaluator's `detail` carries its `status` and
+`signals_ms`, which Trino reads from `evaluations.detail`.
+
+## The `default-signals` draft
+
+`rulesets/default-signals.yaml`, version 1, `mode: shadow`, `pin: turn`,
+bound as `auto`'s SECOND shadow (`bindings.yaml`: `shadow: [default-llm,
+default-signals]`), `priority` combiner:
+
+| # | Evaluator | Type | Role | Route |
+|---|---|---|---|---|
+| 1 | `pii` | `pii`: `scope: {user_messages: all, tool_results: '(?i)(?:.*[-_])?(?:phoenix\|trino)[-_].+'}` (Open WebUI's `phoenix_run_query` and Claude Code's prefixed `mcp__claude_ai_Phoenix-MCP__run_query` / `mcp__litellm__trino-run_query`), `force: [email, phone, street_address, gov_id, card_number, bank_account, account_number]`, `with_person: [date_of_birth]`, `min_score: 0.5`, `model: gravitee-io/bert-small-pii-detection` | **force** | `local-private` |
+| 2 | `privacy` | `regex_text` → `patterns/privacy.yaml` (as `default`) | force | `local-private` |
+| 3 | `injection` | `prompt_injection`: `model: NeuralTrust/prompt-guard-oss-small`, `threshold: 0.9`, `scope: current_message` | **observe** | `local-private` (would-be) |
+| 4–7 | `code-text`, `reasoning-text`, `code-tools`, `sticky-code` | as `default@3`, config for config, same order | vote | as `default` |
+| 8 | `topic` | `nearest_examples`: `examples_ref: examples/routes.yaml`, `k: 5`, `min_share: 0.8`, `model: intfloat/multilingual-e5-small` | vote | chosen |
+| 9 | `code-shape` | `text_shape`: `min_code_ratio: 0.5`, `min_lines: 5` | observe | `local-code` (would-be) |
+| 10 | `language` | `language`: `not_languages: [en]` | observe | `local-general` (would-be) |
+| 11 | `context-size` | `context_size`: `max_tokens: 100000` | observe | `local-reasoning` (would-be) |
+| — | default | | | `local-general` |
+
+- **PII forces first.** The user's rule: sensitive data in ANY user message
+  keeps the chat private (`user_messages: all` -- "my SSN is …", then "now
+  write a poem" stays on `local-private`), and so does a result of a DATA
+  tool: the tools seen in `outcomes.tool_calls` so far are
+  `phoenix_run_query` and `phoenix_describe_table`; `trino[-_]…` covers the
+  Trino MCP. Web search, fetch, the sandbox, Open Terminal and knowledge
+  search results are NOT scanned -- a business's public phone or address is
+  not sensitive data. A name forces only with a date of birth in the same
+  text; a bare name ("my name is Sam"), a place or a date of birth alone
+  never does.
+- **`privacy` (the keyword rule) stays a force** for now: it forces on words
+  alone ("how do I renew my passport"), which the "sensitive data only" rule
+  would not; whether to demote it is decided at promotion, from Trino.
+- **`topic` decides only a turn no keyword, tool or cooldown rule claimed**
+  (as `topic-llm` does in `default-llm`).
+- **The observe rows route nothing**; they put their numbers and would-be
+  route on every decision.
+- **What it answers** (`shadow_comparisons`): how often `pii` would have
+  forced a turn `default` sent to a Claude-capable chain (the gap a name +
+  address with no privacy keyword leaves open), and how often `topic`
+  disagrees with `local-general`. Queries in
+  [§ Decision log and Trino](#decision-log-and-trino).
+
+`unit-tests/route-policy/test_default_signals.py` pins the wiring (rows 2 and
+4–7 identical to `default@3`'s), the PII rule on fabricated shapes (every
+pattern type forcing with the sidecar timed out; what has no shape forcing
+through the NER; the never-force shapes), observe rows never routing, and
+that with nothing from the sidecar the draft routes every `default`
+conversation shape like `default@3`.
+
+### The example set
+
+`rulesets/examples/routes.yaml` (`routes_v1`): about 30 curated example
+prompts each for `local-code`, `local-reasoning` and `local-general` (none
+for `local-private`: privacy is `pii`'s and `privacy`'s job, never a
+topic's), written for this business -- solar installs, permits, Phoenix /
+Trino data questions:
+
+```yaml
+name: routes_v1
+examples:
+  - {id: code-001, route: local-code, text: "my script throws an error when I run it"}
+```
+
+- **Versioned with the ruleset:** `examples_ref` is inlined as
+  `config.examples` and hashed with the document, so an edited example is a
+  new ruleset version.
+- **Validated:** ids unique and stable (Trino reads them back from
+  `detail.neighbours`; never reuse a removed id), routes among the ruleset's,
+  each text 1–300 characters, at most 1,000 examples.
+- **PII-free, never real prompts.** The file is stored in route-policy-db and
+  federated into Trino. A test runs `common.pii` over every example and fails
+  on any finding. The phase-4 gold set (real customer chats) is used only to
+  EVALUATE, on the box; a person writes the examples, guided by what it shows
+  is misrouted -- never its prompts, never their embeddings.
+- **The fingerprint** (SHA-256 over the sorted (id, route, text) and the
+  pinned model id, `common.signals.fingerprint_examples`) is the sidecar's
+  cache key; a new example set, or another embedding model, embeds afresh.
+- **The thresholds** come from the phase-5 measurements (e5-small, kNN-5):
+  `min_share` 0.6 voted on 40/43 test prompts at 0.975 accuracy, 0.8 on 29/43
+  at 1.00; noise ("ok", "?") has a share around 0.4 and abstains.
+
+### The jailbreak action is config
+
+`injection` is `role: observe` with a would-be `vote.route: local-private`:
+its score is in `evaluations.detail.score` on every decision, and it routes
+nothing. Changing what a hit does is a new ruleset version with another
+`role` (`force` → `local-private`, or `veto` on a chain) or `threshold`,
+chosen from the score histogram ([§ Decision log and Trino](#decision-log-and-trino)).
+Refusing a request is not an engine action: route-policy can only pick a
+chain. On a long message the injection model is the slowest
+(~340 ms at 2,000 characters on the box), so within the 0.1 s budget it is
+often `deadline` / `skipped` -- harmless while it only observes.
 
 ## Decision log and Trino
 
@@ -1336,6 +1665,65 @@ GROUP BY 1, 2
 ORDER BY 3 DESC;
 ```
 
+**The gap `pii` closes** -- turns `default` sent to a Claude-capable chain
+that `default-signals`' `pii` would have forced to `local-private`, by what
+it found and where:
+
+```sql
+SELECT s.primary_route, json_format(json_extract(e.detail, '$.forced_by')) AS forced_by,
+       json_format(json_extract(e.detail, '$.forced_in')) AS forced_in, count(*) AS turns
+FROM postgres_route_policy.public.shadow_comparisons s
+JOIN postgres_route_policy.public.evaluations e
+  ON e.decision_id = s.shadow_decision_id AND e.evaluator_id = 'pii'
+WHERE s.shadow_ruleset_id = 'default-signals' AND NOT e.abstained
+  AND s.primary_route <> 'local-private' AND NOT s.background_task
+GROUP BY 1, 2, 3
+ORDER BY turns DESC;
+```
+
+`forced_in` says whether it was the latest user message, an earlier one (the
+"stays private" rule) or a Phoenix / Trino result.
+
+**The injection score histogram** -- what a `threshold` would catch, before a
+later version changes the role:
+
+```sql
+SELECT round(CAST(json_extract_scalar(detail, '$.score') AS double), 1) AS score, count(*)
+FROM postgres_route_policy.public.evaluations
+WHERE evaluator_id = 'injection' AND json_extract_scalar(detail, '$.status') = 'ok'
+GROUP BY 1
+ORDER BY 1;
+```
+
+**The topic against `local-general`** -- what `topic` chose on the turns no
+rule claimed (`decided_by` is the topic when the shadow's reason starts
+`topic:`):
+
+```sql
+SELECT s.primary_route, s.shadow_route, count(*) AS turns
+FROM postgres_route_policy.public.shadow_comparisons s
+WHERE s.shadow_ruleset_id = 'default-signals' AND s.shadow_reason LIKE 'topic:%'
+  AND NOT s.background_task AND s.shadow_pinned_from IS NULL
+GROUP BY 1, 2
+ORDER BY turns DESC;
+```
+
+**Signal cost and coverage** -- each signal evaluator's task status and
+`signals_ms` (the promotion bar: `ok` on ≥ 95 % of a turn's first calls):
+
+```sql
+SELECT e.evaluator_id,
+       coalesce(json_extract_scalar(e.detail, '$.status'), json_extract_scalar(e.detail, '$.ner_status')) AS status,
+       count(*) AS n,
+       approx_percentile(CAST(json_extract_scalar(e.detail, '$.signals_ms') AS double), 0.95) AS signals_p95_ms
+FROM postgres_route_policy.public.evaluations e
+JOIN postgres_route_policy.public.decisions d USING (decision_id)
+WHERE d.ruleset_id = 'default-signals' AND d.pinned_from IS NULL
+  AND e.evaluator_id IN ('pii', 'topic', 'injection', 'language')
+GROUP BY 1, 2
+ORDER BY 1, 3 DESC;
+```
+
 **Classifications: status, latency, queue wait, cost**:
 
 ```sql
@@ -1356,7 +1744,9 @@ host did not resolve to a private address (a stopped container counts).
 **Privacy.** No message text is stored anywhere. Decisions keep:
 - ids (chat, message, user, key alias, call, response);
 - routes and votes;
-- reasons, which name patterns and tools, never content.
+- reasons, which name patterns, tools, entity types and scores, never
+  content; the signal evaluators' `detail` holds types, counts, scores,
+  example ids, statuses -- never a span.
 
 `analyses` keeps a hash of the transcript that was classified, never the
 transcript, plus the model's own reason for its best-scoring criterion, cut
@@ -1407,6 +1797,27 @@ The verdict keys do not change with the ruleset version (they hash the
 evaluator's configuration, not the ruleset), so the new `default` reads the
 verdicts `default-llm` already stored for the same `topic-llm` config.
 
+## Promoting the signals
+
+A later, separate change (ROUTE_POLICY_PHASE5_PLAN § 4.4). Promote when, over
+at least two weeks of shadow and on the gold set:
+- **PII:** the `pii` force fires on at least the gold `local-private` points
+  `privacy_kw` catches, and on at most 2 % of gold non-private points;
+- **Topic:** `topic` does not lower gold accuracy against `default@3`;
+- **Cost:** the `pii` and `topic` tasks are `ok` on at least 95 % of a turn's
+  first calls, and `/decide` p95 stays below 150 ms.
+
+Then:
+1. A **new `default` version** that adds `pii` (force), `topic` (vote) and the
+   observe rows -- so the injection score lands on every primary decision --
+   in the places `default-signals` tested.
+2. Update `test_default_ruleset.py`'s wiring and routes.
+3. Decide `privacy_kw`'s role from the data (demote it to `observe` if `pii`
+   covers its real hits).
+4. Drop `default-signals` from `bindings.yaml`'s `shadow:`.
+5. `make build route-policy && make up route-policy`. The primary then makes
+   the signals call on the request path, within the same 0.1 s budget.
+
 ## Metrics
 
 `GET /metrics`, scraped by the litellm stack's prometheus (job `route-policy`):
@@ -1429,7 +1840,10 @@ verdicts `default-llm` already stored for the same `topic-llm` config.
 | `route_policy_analysis_seconds` | `model` | One classification's cycle, locality check to result |
 | `route_policy_analysis_queue_depth` | — | Requests waiting for a worker |
 | `route_policy_analysis_dropped_total` | `reason` (queue_full / shutdown) | Requests not classified |
-| `route_policy_errors_total` | `kind` (decision_write, decision_write_dropped, outcome_write, outcome_write_dropped, binding_refresh, ruleset_compile, unbound_model, shadow_load, shadow_dropped, shadow_error, analysis_lookup, turn_pin, analysis_write, classifier_delete) | Errors |
+| `route_policy_signals_seconds` | `kind` (primary / shadow / evaluate) | One signals call, as route-policy waited for it |
+| `route_policy_signals_total` | `outcome` (ok / timeout / error / unavailable / not_local) | Signals calls; `unavailable` also counts a call that would have been made with no client (an empty `ROUTE_POLICY_SIGNALS_URL`) |
+| `route_policy_signal_tasks_total` | `task` (pii / nearest / injection / language), `status` (the sidecar's, or missing / not_sent) | Each task of an answered call |
+| `route_policy_errors_total` | `kind` (decision_write, decision_write_dropped, outcome_write, outcome_write_dropped, binding_refresh, ruleset_compile, unbound_model, shadow_load, shadow_dropped, shadow_error, analysis_lookup, turn_pin, analysis_write, classifier_delete, signals) | Errors |
 
 Shadow decisions also count in `route_policy_decisions_total` (with
 `mode="shadow"`), `route_policy_votes_total` and
@@ -1461,6 +1875,8 @@ environment variables.
 | `ROUTE_POLICY_CLASSIFY_POLL_S` | `1` | `GET /jobs/{id}` interval (floor 0.1); also the resolution of `analyses.queue_ms` |
 | `ROUTE_POLICY_ANALYSIS_QUEUE_MAX` | `64` | Requests that may wait for a worker (floor 1); past it dropped and counted |
 | `ROUTE_POLICY_ANALYSIS_CONCURRENCY` | `2` | Workers = route jobs open on the classifier at once (floor 1) |
+| `ROUTE_POLICY_SIGNALS_URL` | `http://signals:8000` | The signals sidecar, by Docker DNS on `ai_shared`, no auth. Only a host that resolves to this box's networks is ever sent text. Empty (only possible outside the compose file) runs no client: every signal evaluator abstains (`signals unavailable`), `pii` votes from its patterns |
+| `ROUTE_POLICY_SIGNALS_BUDGET_S` | `0.1` | How long a decision (primary or shadow) waits for its signals call (floor 0.04: the margin + 20 ms, so the sidecar always gets at least 20 ms -- at a floor of 0.02 it was told `deadline_ms: 1` and skipped every task); the sidecar is told 20 ms less. It runs concurrently with the database reads, so at or below `DB_READ_BUDGET_S` it adds nothing to the worst case |
 
 Constants in `route_policy/config.py`, not environment variables:
 `WRITES_MAX_IN_FLIGHT` (256 background writes and after-the-answer tasks),
@@ -1469,7 +1885,10 @@ classifications), `DB_READ_BUDGET_S` (0.1 s for the binding refresh, a
 version fetch, a verdict lookup and the turn-pin read on the `/decide`
 path),
 `CLASSIFIER_MODELS_TTL_S` (60 s cache of `GET /models` and of each model
-host's locality verdict).
+host's locality verdict), `SIGNALS_EVALUATE_TIMEOUT_S` (10 s: `/evaluate`'s
+signals call, no deadline cut), `SIGNALS_DEADLINE_MARGIN_S` (20 ms: under load the sidecar answers a few ms past its deadline, and a 10 ms margin lost a 2,000-character turn's partial PII result),
+`SIGNALS_WARM_TIMEOUT_S` (5 s per startup warm-up), `SIGNALS_MODELS_TTL_S`
+(60 s cache of the sidecar host's locality verdict).
 
 `ROUTE_POLICY_DB_HOST` / `_PORT` are fixed in the compose file
 (`route-policy-db:5432`). The hook's own settings belong to LiteLLM (see
@@ -1546,6 +1965,23 @@ or an empty URL sends every `auto` turn to `local-private`),
   failed DELETE is counted (`classifier_delete`) and that job expires with
   the classifier's `JOB_TTL_HOURS`. A hard kill of route-policy mid-cycle
   can orphan one the same way.
+- **`route_policy_signals_total` not `ok`:** routing is unaffected (only the
+  `default-signals` shadow calls the sidecar); its signal votes abstain.
+  - `not_local`: `ROUTE_POLICY_SIGNALS_URL`'s host did not resolve to a
+    private address from route-policy -- is the sidecar running (`make ps
+    signals`)? Docker DNS answers only for running containers (an
+    unresolved host is retried after 2 s, a public one after 60 s);
+  - `unavailable`: the sidecar is down, still loading (its `/health` is 503
+    until its models are warm) or answering 5xx; or the URL is empty;
+  - `timeout`: the sidecar did not answer within the budget -- check its
+    CPU (`SIGNALS_CPUSET`, `ai/signals/SIGNALS.md`) before raising
+    `ROUTE_POLICY_SIGNALS_BUDGET_S`;
+  - `error`: a 4xx (413 / 422) or a malformed answer -- the two images'
+    `common.signals` disagree; rebuild both.
+- **`topic` abstaining with `nearest warming`** for more than a few seconds
+  after a deploy: the startup warm-up did not reach the sidecar (look for
+  `startup: signals warm-up` in the log); the first real request starts the
+  embedding instead.
 - **`route_policy_analysis_dropped_total{reason="queue_full"}` climbing:**
   classifications are slower than turns arrive. Those turns get no verdict;
   routing is unaffected (the shadow's `topic-llm` abstains more).
@@ -1556,23 +1992,28 @@ or an empty URL sends every `auto` turn to `local-private`),
 ai/route-policy/
   docker-compose.route-policy.yml  Dockerfile  pyproject.toml  ROUTE_POLICY.md  route-policy.postman_collection.json
   db-init/10-trino-reader.sh       the read-only Trino role (first start of an empty volume)
-  rulesets/default.yaml  rulesets/default-llm.yaml  rulesets/bindings.yaml
+  rulesets/default.yaml  rulesets/default-llm.yaml  rulesets/default-signals.yaml  rulesets/bindings.yaml
   rulesets/patterns/{privacy,code,reasoning}.yaml
+  rulesets/examples/routes.yaml    the curated example prompts (nearest_examples)
   bench/                the classifier benchmark (bench/BENCH.md), shipped in the image
   route_policy/
-    app.py              FastAPI factory + lifespan (pool, migrations, seeding, analysis queue)
+    app.py              FastAPI factory + lifespan (pool, migrations, seeding, analysis queue, signals
+                        client + warm-up)
     config.py           infrastructure settings only
     metrics.py          Prometheus metrics
-    service.py          the shared objects; storing decisions and outcomes; verdict lookups;
-                        the after-the-answer task (shadows, analysis requests)
+    service.py          the shared objects; storing decisions and outcomes; verdict lookups; the
+                        signals call; the after-the-answer task (shadows, analysis requests)
     api/                decide, observe, evaluate, rulesets, chats, evaluator_types, health, schemas
     engine/             context (the request view), pipeline (evaluators → combiner → invariants), invariants
     evaluators/         base (contract, @declares, registry), regex_text, tool_calls, cooldown, backend_load,
-                        static, llm_classifier
+                        static, llm_classifier, pii, nearest_examples, prompt_injection, language,
+                        text_shape, context_size; _signals (reading a task off ctx.signals)
     combiners/          base (force / veto / default frame), priority, weighted
     rulesets/           model (document, compiled form, hash), loader (files, refs, bindings), validate, store
     analysis/           model (AnalysisRequest, Verdict), verdict (choose), classifier_client (the /assess
                         cycle), queue (AnalysisQueue)
+    signals/            model (SignalText, SignalRequest, merge -> SignalBatch, SignalTask; the caps),
+                        wire (the adapter to common.signals: build_request, apply)
     db/                 pool, migrations/ (0001_initial.sql, 0002_llm_classifier.sql, 0003_turn_pins.sql
                         + runner), repositories/
 ```
@@ -1580,8 +2021,11 @@ ai/route-policy/
 Reused from `shared/common`:
 - `common.keywordmatch`: Go-RE2 keyword rules.
 - `common.conversation`: exchanges, called tools, `user_message_count`,
-  `render_transcript`.
+  `render_transcript`; `user_texts` / `tool_results` (the signal texts).
 - `common.net`: `DEFAULT_BLOCKED_NETWORKS`, the locality guard's networks.
+- `common.pii`: the in-process PII patterns (`counts`, `ENTITY_TYPES`).
+- `common.signals`: the sidecar's wire format, caps, example fingerprint and
+  `SignalsClient` (locality guard, budget, never raises).
 
 ## Tests
 
@@ -1596,9 +2040,12 @@ TEST_POSTGRES_DSN=postgresql://postgres@localhost:55441/postgres \
 | Module | Covers |
 |---|---|
 | `test_evaluators.py` | Each evaluator. The cooldown's verdicts and reasons are pinned on a table of histories (0 to 3 exchanges; the ruleset's 2 spelled out). |
-| `test_declarations.py` | Every real evaluator's `detail` against its declaration (the `llm_classifier`'s background-task abstain included) |
-| `test_combiners.py`, `test_invariants.py`, `test_pipeline.py` | The frame, both combiners, the invariants, the contract shapes, error handling; the turn pin as a pure function (the contract unchanged, every vote kept, privacy and a requested `local-private` winning, the invariants on the pinned route, no pin without `pin: turn`, no analysis requests from a later call) |
-| `test_rulesets.py` | Files, refs (no path escape), validation (`pin` included), content hash, seed bindings, the cache |
+| `test_declarations.py` | Every real evaluator's `detail` against its declaration (the `llm_classifier`'s background-task abstain included; the six phase-5 types on a fake sidecar's answers) |
+| `test_signal_evaluators.py` | The phase-5 types: `pii` (patterns and NER, sticky over every user message, data-tool results yes and web search no, name + DOB only together, a bare name never, still forcing from patterns with the sidecar timed out / failed / unavailable / not local / cut / on another model, NER coverage, the pattern cap, config validation), `nearest_examples` (shares, `min_share`, `min_similarity`, warming / skipped / error / model mismatch, the fingerprint, example-set validation), `prompt_injection` (threshold, the current exchange's tool results), `language`, `text_shape`, `context_size` |
+| `test_signals.py` | The prefetch: `merge` (dedupe, newest first, conflicts, the caps), the text ids, ONE call per `/decide` through the real `SignalsClient` on a fake sidecar (none for `default`), the budget cut leaving `/decide` in time with `pii` forcing from patterns, the primary unchanged by a shadow's signals, shadows prefetching on their own with the same budget, `/evaluate` waiting, every failure an abstain (no client, not local -- nothing sent --, down, 5xx, 413), the warm-up, the metrics, no request text in any log line or stored row |
+| `test_default_signals.py` | The `default-signals` draft: wiring (rows shared with `default@3` verbatim), the binding's second shadow slot, the example set valid and PII-free (`common.pii` over every example), the user's PII rule on fabricated shapes, observe rows never routing, the topic deciding only unclaimed turns, one batched request, and routing like `default@3` on every shape when the sidecar adds nothing |
+| `test_combiners.py`, `test_invariants.py`, `test_pipeline.py` | The frame, both combiners (`observe` ignored by both, still logged with its route), the invariants, the contract shapes, error handling; the turn pin as a pure function (the contract unchanged, every vote kept, privacy and a requested `local-private` winning, the invariants on the pinned route, no pin without `pin: turn`, no analysis requests from a later call) |
+| `test_rulesets.py` | Files, refs (`patterns_ref` and `examples_ref`; no path escape), validation (`pin` and example sets included), content hash (an example edit is content of the ruleset that references it), seed bindings (two shadow slots), the cache |
 | `test_default_ruleset.py` | The pattern files (valid rules, every regex in the RE2 subset, the real-chat prompts `code_kw` must and must not match), the ruleset's wiring, its routes on ~25 conversation shapes, and the routes of a turn's later calls (tool rounds, the nudge, PII mid-turn) |
 | `test_turns.py` | Turn pinning and background tasks through `/decide` with the tables in memory: one route for a turn's calls, `pinned_from`, a shadow pinned from its own rows, one classification per turn, privacy beating the pin, no lookup without a message id, a cut / failed lookup decided afresh in time, a background task logged / never classified / never pinning, the metrics |
 | `test_api.py` | Every endpoint with no database: contract, validation, decisions still answered with the DB down |
@@ -1608,8 +2055,8 @@ TEST_POSTGRES_DSN=postgresql://postgres@localhost:55441/postgres \
 | `test_analysis_client.py` | The `/assess` cycle on a fake classifier: every status, the locality guard (authenticated, public, mixed and unresolvable hosts refused before submitting; private / loopback / ULA local), caches, DELETE always (after a cancel on timeout, and when cancelled), no submitted text in any error |
 | `test_analysis_queue.py` | Dedupe, overflow, skip-if-stored, the written row (scores by route, winner's reason, usage, provenance; failures with no scores), write failures, shutdown (waiting dropped, running cancelled and still deleted) |
 | `test_shadows.py` | Resolving shadows, skipped unloadable ones, derived ids, the primary response unchanged by a shadow, the shadow row and its evaluations, idempotency, provenance of analysis requests, a primary with an `llm_classifier`, isolation (a raising shadow, a hung database, the task cap), `/evaluate` reading without enqueueing |
-| `test_db.py` (`postgres`) | Startup, seeding (with shadow slots), immutability, migrations (0003 on a phase-4 database with rows), the phase-2 → phase-3 and phase-4 → `default@3` upgrades (a turn pinned across the deploy), idempotent `/decide` / `/observe` in either order, shadow rows and both views (the 0003 columns), the `analyses` table (first write wins, caps, the CHECK), the whole classifier loop on a fake classifier (job deleted, verdict voted next turn, no text stored), one classification per turn, the turn lookup on real rows, an edit making a verdict unreachable, a stored draft compiling like its file, the reads |
-| `test_wiring.py` | Postman coverage, compose classes and env, Trino env, pass-through, Makefile, Dockerfile (bench shipped and imported), line endings |
+| `test_db.py` (`postgres`) | Startup, seeding (with shadow slots), immutability, migrations (0003 on a phase-4 database with rows), the phase-2 → phase-3 and phase-4 → `default@3` upgrades (a turn pinned across the deploy), idempotent `/decide` / `/observe` in either order, shadow rows and both views (the 0003 columns), the `analyses` table (first write wins, caps, the CHECK), the whole classifier loop on a fake classifier (job deleted, verdict voted next turn, no text stored), one classification per turn, the turn lookup on real rows (each shadow pinned from its own rows), the startup warm-up and a shadow's signals call on a fake sidecar, an edit making a verdict unreachable, a stored draft compiling like its file, the reads |
+| `test_wiring.py` | Postman coverage (a `default-signals` dry run included), compose classes and env (the signals settings), Trino env, pass-through, Makefile, Dockerfile (bench shipped and imported), line endings |
 | `bench/` | The benchmark's pure parts ([`bench/BENCH.md`](bench/BENCH.md)) |
 
 - **The `postgres` tests** need `TEST_POSTGRES_DSN`: an admin connection on

@@ -16,7 +16,12 @@ serving):
 4. start the analysis queue (``analysis.queue.AnalysisQueue``: the
    llm_classifier's background classifications through the document
    classifier, ROUTE_POLICY_CLASSIFIER_URL) -- unless that URL is empty;
-5. hang the ``Service`` (ruleset cache + database + queue) on ``app.state``.
+5. build the signals client (``common.signals.SignalsClient`` on
+   ROUTE_POLICY_SIGNALS_URL, unless that is empty) and send the bound
+   rulesets' warm-ups (``Service.warm_signals``: the example sets the
+   sidecar should embed before the first turn) -- logged, never fatal;
+6. hang the ``Service`` (ruleset cache + database + queue + signals client)
+   on ``app.state``.
 
 Shutdown drains the background tasks (``Service.drain``: decision / outcome
 writes that outlasted ROUTE_POLICY_DECISION_WRITE_BUDGET_S and /decide's
@@ -28,7 +33,7 @@ job), then closes the pool.
 A test can pass its own ``service`` -- e.g. a ruleset cache filled from the
 files with no database -- and the lifespan then touches nothing; or its own
 ``analysis_client`` (a ``ClassifierClient`` on a fake transport) for the
-queue the lifespan starts.
+queue the lifespan starts, and its own ``signals_client`` (a fake sidecar).
 """
 
 from __future__ import annotations
@@ -36,10 +41,12 @@ from __future__ import annotations
 import logging
 import pathlib
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import FastAPI
 from prometheus_fastapi_instrumentator import Instrumentator
+
+from common.signals import SignalsClient
 
 from . import config
 from .analysis.classifier_client import ClassifierClient
@@ -77,9 +84,22 @@ def build_analysis_queue(database: Database, client: Optional[ClassifierClient])
                          concurrency=config.ANALYSIS_CONCURRENCY, drain_s=config.WRITES_DRAIN_S)
 
 
+def build_signals_client(client: Optional[SignalsClient] = None) -> Optional[SignalsClient]:
+    """``client``, else a ``common.signals.SignalsClient`` for
+    ROUTE_POLICY_SIGNALS_URL, else None when that URL is empty."""
+    if client is not None:
+        return client
+    if not config.SIGNALS_URL:
+        logger.warning("startup: ROUTE_POLICY_SIGNALS_URL is empty -- no signals sidecar; every signal evaluator "
+                       "will abstain (pii still votes from its patterns)")
+        return None
+    return SignalsClient(config.SIGNALS_URL, models_ttl_s=config.SIGNALS_MODELS_TTL_S)
+
+
 async def start_service(database: Database, rulesets_dir: pathlib.Path,
-                        analysis_client: Optional[ClassifierClient] = None) -> Service:
-    """Steps 1-4 of startup; returns the ready Service."""
+                        analysis_client: Optional[ClassifierClient] = None,
+                        signals_client: Optional[Any] = None) -> Service:
+    """Steps 1-5 of startup; returns the ready Service."""
     await database.init()
     async with database.acquire() as conn:
         await migrate(conn)
@@ -94,12 +114,16 @@ async def start_service(database: Database, rulesets_dir: pathlib.Path,
     queue = build_analysis_queue(database, analysis_client)
     if queue is not None:
         queue.start()
-    return Service(store=store, database=database, rulesets_dir=rulesets_dir, analysis_queue=queue)
+    service = Service(store=store, database=database, rulesets_dir=rulesets_dir, analysis_queue=queue,
+                      signals_client=build_signals_client(signals_client))
+    await service.warm_signals()
+    return service
 
 
 def create_app(*, service: Optional[Service] = None, database: Optional[Database] = None,
                rulesets_dir: Optional[pathlib.Path] = None, instrument: bool = True,
-               analysis_client: Optional[ClassifierClient] = None) -> FastAPI:
+               analysis_client: Optional[ClassifierClient] = None,
+               signals_client: Optional[Any] = None) -> FastAPI:
     """Build the app.
 
     Args:
@@ -110,6 +134,8 @@ def create_app(*, service: Optional[Service] = None, database: Optional[Database
         instrument:      mount prometheus-fastapi-instrumentator's HTTP metrics + /metrics.
         analysis_client: the ClassifierClient the analysis queue uses
                          (default: one for ROUTE_POLICY_CLASSIFIER_URL).
+        signals_client:  the signals client (default: a common.signals.SignalsClient
+                         for ROUTE_POLICY_SIGNALS_URL; none when it is empty).
     """
     directory = rulesets_dir or config.RULESETS_DIR
 
@@ -124,7 +150,7 @@ def create_app(*, service: Optional[Service] = None, database: Optional[Database
             return
         db = database or Database(config.DB_DSN, max_size=config.DB_POOL_MAX)
         try:
-            app.state.service = await start_service(db, directory, analysis_client)
+            app.state.service = await start_service(db, directory, analysis_client, signals_client)
         except BaseException:
             await db.close()
             raise

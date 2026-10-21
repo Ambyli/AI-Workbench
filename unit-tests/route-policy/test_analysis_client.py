@@ -183,6 +183,34 @@ def test_a_failed_resolution_is_not_local_and_resolution_errors_are_named():
     assert out.status == "not_local" and "could not be resolved" in out.error
 
 
+def test_an_unresolved_host_is_cached_briefly_and_a_resolved_one_for_the_ttl():
+    # Docker DNS answers only for running containers: a restarted model must
+    # be classified again within seconds, not after models_ttl_s.
+    fake = FakeClassifier(score={CODE: 8})
+    now, up, calls = [100.0], [False], []
+
+    def resolver(host):
+        calls.append(host)
+        if not up[0]:
+            raise socket.gaierror(socket.EAI_NONAME, "Name or service not known")
+        return fake_resolver(host)
+
+    async def go():
+        client = fake.client(resolver=resolver, clock=lambda: now[0])
+        statuses = []
+        for step, back in ((0.0, False), (1.0, True), (1.5, True), (30.0, True)):
+            now[0] += step
+            up[0] = back
+            statuses.append((await client.assess(model="qwen3.5-4b", text=TEXT, criteria=[CODE])).status)
+        await client.aclose()
+        return statuses
+
+    # +1 s: still the cached failure (unresolved_ttl_s = 2); +2.5 s: resolved
+    # again; +32.5 s: that verdict is still cached (models_ttl_s = 60).
+    assert asyncio.run(go()) == ["not_local", "not_local", "ok", "ok"]
+    assert calls == ["qwen3.5-4b"] * 2
+
+
 def test_no_error_carries_the_submitted_text():
     # A 4xx whose detail echoes the document is withheld, not returned.
     fake = FakeClassifier(assess_status=422, assess_detail=f"bad document: {TEXT[10:80]}")

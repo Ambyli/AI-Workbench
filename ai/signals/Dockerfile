@@ -56,9 +56,13 @@ COPY ai/signals/signals ./ai/signals/signals
 #     of synthetic sentences with known answers (signals.runtime.smoke) --
 #     exit 1 on any failure;
 #   * the app module imports the way the CMD will (a missing module fails
-#     here, not as a crash-looping container).
+#     here, not as a crash-looping container), and its OpenAPI schema builds
+#     -- every route, through the included router. (Not `app.routes`: since
+#     FastAPI 0.139 an included router is one `_IncludedRouter` entry there,
+#     with no `.path`.) unit-tests/signals/test_signals_wiring.py runs this
+#     same line.
 RUN python -m signals.runtime --check \
-    && python -c "from signals.app import app; print('app ok:', [r.path for r in app.routes][:8])"
+    && python -c "from signals.app import app; print('app ok:', sorted(app.openapi()['paths']))"
 
 # Runs as an unprivileged user; /app and /models stay root-owned and
 # read-only (the compose file also mounts the root filesystem read_only).

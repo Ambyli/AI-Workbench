@@ -116,6 +116,22 @@ def test_the_image_is_cpu_only_locked_baked_and_unprivileged():
         assert f'"{banned}' not in deps, banned
 
 
+def test_the_dockerfile_app_check_runs():
+    # The build's `python -c` app check, run here with the same PYTHONPATH,
+    # so a check that breaks on a dependency bump (FastAPI 0.139 made an
+    # included router an `_IncludedRouter` in app.routes, with no `.path`)
+    # fails in the unit tests, not halfway through a build on the box.
+    import subprocess
+
+    dockerfile = (SERVICE_DIR / "Dockerfile").read_text(encoding="utf-8")
+    (code,) = re.findall(r'python -c "(from signals\.app import app;[^"]*)"', dockerfile)
+    env = {**__import__("os").environ, "PYTHONPATH": str(SERVICE_DIR)}
+    done = subprocess.run([sys.executable, "-c", code], cwd=SERVICE_DIR, env=env,
+                          capture_output=True, text=True, timeout=120)
+    assert done.returncode == 0, done.stderr[-2000:]
+    assert "app ok:" in done.stdout and "/signals" in done.stdout
+
+
 def test_it_is_a_workspace_member_with_a_lock_entry():
     root = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
     assert '"ai/signals"' in root

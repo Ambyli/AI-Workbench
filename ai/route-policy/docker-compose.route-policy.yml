@@ -1,0 +1,167 @@
+# Route policy -- rulesets of evaluators pick the LiteLLM chain alias for each
+# `auto` turn, and every decision is logged. The `default` ruleset ENFORCES
+# (phase 3 of ROUTE_POLICY_PLAN) -- LiteLLM's pre-call hook
+# (ai/litellm/hooks/routing/) awaits /decide on every `auto` request (within
+# ROUTE_POLICY_DECIDE_TIMEOUT_S, 0.25 s) and serves the returned chain in the
+# same pass; a timeout, an error or `apply: false` sends the turn to
+# local-private. /observe is still fired after the call, not awaited.
+# Phase 4: after each answer, the `default-llm` draft is decided beside it in
+# SHADOW mode, and its llm_classifier has the conversation classified in the
+# background through the document classifier's POST /assess
+# (http://classifier:8000 on ai_shared -> the `qwen3.5-4b` CPU model).
+# Phase 5: the `default-signals` draft, a second shadow, reads fast signals
+# (PII, topic, injection, language) from the `signals` sidecar
+# (http://signals:8000 on ai_shared, ai/signals).
+# Operator guide: ai/route-policy/ROUTE_POLICY.md.
+#
+#   route-policy      FastAPI on :8000 (ai_shared). LiteLLM reaches it as
+#                     http://route-policy:8000; LAN clients through ai/edge on
+#                     PORT_ROUTE_POLICY, or LiteLLM's /v1/route-policy
+#                     pass-through. No auth of its own, like the classifier.
+#   route-policy-db   Postgres 17: rulesets, bindings (+ shadow slots),
+#                     decisions (primary and shadow), evaluations, outcomes,
+#                     analyses (the classifier's verdicts -- never the text).
+#                     Trino reads it as the postgres_route_policy catalog
+#                     (read-only trino_reader).
+
+networks:
+  shared:
+    external: true
+    name: ai_shared
+
+services:
+  # ── route-policy-db ──────────────────────────────────────────────────────
+  # On ai_shared so trino-coordinator reaches it by service DNS
+  # (route-policy-db:5432, catalogs/postgres_route_policy.properties) without
+  # joining anything else -- the classifier-db / roofix-db shape. Published
+  # on PORT_ROUTE_POLICY_DB for psql / DBeaver.
+  #
+  # 10-trino-reader.sh runs once, on the first start of an EMPTY volume, and
+  # creates the read-only `trino_reader` role from
+  # ROUTE_POLICY_TRINO_READER_PASSWORD. Re-run it by hand for an existing
+  # volume (the command is in the script's header).
+  #
+  # Recreated (with downtime) by `make up`: a data directory can have only
+  # one Postgres. route-policy keeps deciding from its cached rulesets
+  # meanwhile; only the decisions made during the gap go unlogged. A /decide
+  # never waits on it for long, refused or hung: the write gets
+  # ROUTE_POLICY_DECISION_WRITE_BUDGET_S, then finishes in the background.
+  route-policy-db:
+    image: postgres:17-alpine
+    container_name: route-policy-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${ROUTE_POLICY_DB_USER:-route_policy}
+      POSTGRES_PASSWORD: ${ROUTE_POLICY_DB_PASSWORD:-route_policy}
+      POSTGRES_DB: ${ROUTE_POLICY_DB_NAME:-route_policy}
+      # Consumed by db-init/10-trino-reader.sh. Empty = the role is skipped
+      # with a log line (only the Trino catalog breaks, never the service).
+      TRINO_READER_USER: trino_reader
+      TRINO_READER_PASSWORD: ${ROUTE_POLICY_TRINO_READER_PASSWORD:-}
+    volumes:
+      - route_policy_db:/var/lib/postgresql/data
+      - ./db-init/10-trino-reader.sh:/docker-entrypoint-initdb.d/10-trino-reader.sh:ro
+    ports:
+      - "${PORT_ROUTE_POLICY_DB:-5441}:5432"
+    networks:
+      - shared
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${ROUTE_POLICY_DB_USER:-route_policy} -d ${ROUTE_POLICY_DB_NAME:-route_policy}"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ── route-policy ─────────────────────────────────────────────────────────
+  # Deployed side by side by `make up route-policy` (scripts/deploy.py): a
+  # new `route-policy-<hash>` starts next to the old one and the old one
+  # retires once the new one is healthy and the edge marks it UP. Two copies
+  # are safe: every decision is computed from the request alone, startup's
+  # migrations and ruleset seeding take advisory locks, and every write is
+  # idempotent on decision_id. No container_name and no `ports:` --
+  # PORT_ROUTE_POLICY is published by ai/edge. See ai/edge/EDGE.md.
+  #
+  # Startup needs route-policy-db (migrations + seeding); a copy that cannot
+  # reach it, or whose baked-in ruleset changed without a version bump,
+  # exits with the reason in its log and the old copy keeps serving.
+  # Every `auto` turn waits on this service: while no copy answers (no
+  # healthy copy at all, not a swap), `auto` is served by local-private.
+  #
+  # It does NOT need the classifier (a different compose project, so no
+  # depends_on): a classifier that is down only makes background
+  # classifications fail (analyses.status = unavailable), never a /decide.
+  # Nor the signals sidecar: one that is down or slow makes the signal
+  # evaluators abstain; deploy it first so the startup warm-up reaches it.
+  # During a swap both copies may classify; the analyses table's primary key
+  # (one verdict per conversation prefix) keeps that harmless.
+  route-policy:
+    build:
+      context: ../..
+      dockerfile: ai/route-policy/Dockerfile
+    labels:
+      com.zeo.deploy: swap
+    restart: unless-stopped
+    # Every request is a few milliseconds. Shutdown waits up to 5 s
+    # (WRITES_DRAIN_S) for background writes and up to 5 s more for running
+    # classifications, each of which then deletes its classifier job (5 s
+    # cap per request): 30 s covers it.
+    stop_grace_period: 30s
+    networks:
+      - shared
+    depends_on:
+      route-policy-db:
+        condition: service_healthy
+    environment:
+      # One `[decide]` line per decision at INFO (ids, route, reason -- never
+      # message text).
+      - LOG_LEVEL=INFO
+      # route-policy-db above. HOST and PORT are fixed (service DNS on
+      # ai_shared, the container port); the credentials come from the
+      # `## Route policy` block of .env with the same dev defaults the
+      # database is created with.
+      - ROUTE_POLICY_DB_HOST=route-policy-db
+      - ROUTE_POLICY_DB_PORT=5432
+      - ROUTE_POLICY_DB_USER=${ROUTE_POLICY_DB_USER:-route_policy}
+      - ROUTE_POLICY_DB_PASSWORD=${ROUTE_POLICY_DB_PASSWORD:-route_policy}
+      - ROUTE_POLICY_DB_NAME=${ROUTE_POLICY_DB_NAME:-route_policy}
+      # Infrastructure only -- the routing rules live in the rulesets
+      # (rulesets/*.yaml, seeded into route-policy-db), never here.
+      - ROUTE_POLICY_DB_POOL_MAX=${ROUTE_POLICY_DB_POOL_MAX:-10}
+      - ROUTE_POLICY_BINDING_REFRESH_S=${ROUTE_POLICY_BINDING_REFRESH_S:-10}
+      # How long /decide (and /observe) waits for its row before answering
+      # anyway; the write then finishes in the background. LiteLLM waits
+      # 0.25 s for the whole /decide, so keep this well below that.
+      - ROUTE_POLICY_DECISION_WRITE_BUDGET_S=${ROUTE_POLICY_DECISION_WRITE_BUDGET_S:-0.05}
+      # The llm_classifier's background classifications (phase 4), never on
+      # the /decide path: the document classifier by Docker DNS (no auth,
+      # like this service), one /assess job per conversation prefix, polled
+      # every CLASSIFY_POLL_S, given up (cancelled + deleted) after
+      # CLASSIFY_TIMEOUT_S; at most ANALYSIS_CONCURRENCY jobs open at once,
+      # at most ANALYSIS_QUEUE_MAX requests waiting (the rest dropped and
+      # counted). Only a LOCAL model is ever sent a conversation: the queue
+      # checks the model's GET /models entry and resolves its host first.
+      - ROUTE_POLICY_CLASSIFIER_URL=${ROUTE_POLICY_CLASSIFIER_URL:-http://classifier:8000}
+      - ROUTE_POLICY_CLASSIFY_TIMEOUT_S=${ROUTE_POLICY_CLASSIFY_TIMEOUT_S:-180}
+      - ROUTE_POLICY_CLASSIFY_POLL_S=${ROUTE_POLICY_CLASSIFY_POLL_S:-1}
+      - ROUTE_POLICY_ANALYSIS_QUEUE_MAX=${ROUTE_POLICY_ANALYSIS_QUEUE_MAX:-64}
+      - ROUTE_POLICY_ANALYSIS_CONCURRENCY=${ROUTE_POLICY_ANALYSIS_CONCURRENCY:-2}
+      # The signals sidecar (phase 5, ai/signals): PII NER, nearest-example
+      # topic, injection score and language for the signal evaluators, by
+      # Docker DNS on ai_shared, no auth. ONE POST /signals per decision that
+      # needs it -- the `default` ruleset needs none, so the live path makes
+      # no call; the `default-signals` shadow makes one after each answer --
+      # concurrently with the database reads, within SIGNALS_BUDGET_S (keep it
+      # at or below the 0.1 s database read budget so it adds nothing to the
+      # worst case). Past it the signal evaluators abstain and `pii` votes
+      # from its in-process patterns. Only a sidecar on this box's networks
+      # is ever sent text: the client resolves its host first.
+      - ROUTE_POLICY_SIGNALS_URL=${ROUTE_POLICY_SIGNALS_URL:-http://signals:8000}
+      - ROUTE_POLICY_SIGNALS_BUDGET_S=${ROUTE_POLICY_SIGNALS_BUDGET_S:-0.1}
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+volumes:
+  route_policy_db:

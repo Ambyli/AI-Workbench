@@ -1,4 +1,5 @@
-"""Unit tests for ai/litellm/overflow.py -- the chain-alias overflow hook.
+"""Unit tests for the chain-alias overflow hook -- ai/litellm/hooks/overflow,
+driven through hooks.handler.Handler as LiteLLM drives it.
 
 Two layers:
 
@@ -14,11 +15,12 @@ Two layers:
   driven with the hook registered -- proving the hook runs before the order
   filter, that a long prompt skips qwen3.8-solo (by LiteLLM's own count, and
   by the exact /tokenize count when LiteLLM's undercounts), that the
-  request's `tools` reach the hook in `request_kwargs`, and that a failed
-  order-1 call is retried at order 2.
+  request's `tools` reach the hook in `request_kwargs`, that a failed
+  order-1 call is retried at order 2, and that the overflow.py shim LiteLLM
+  loads imports the `hooks` package for real.
 
 Run from the repo root in any venv with pytest (+ litellm==1.95.0 and PyYAML
-for the second layer):
+for the second layer); conftest.py puts `hooks` and `common` on sys.path:
 
     python -m pytest unit-tests/litellm -q -p no:cacheprovider
 """
@@ -27,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import dataclasses
 import os
 import pathlib
 import sys
@@ -34,27 +37,21 @@ import time
 
 import pytest
 
-_ROOT = pathlib.Path(__file__).resolve().parents[2]
-_LITELLM_DIR = _ROOT / "ai" / "litellm"
-if str(_LITELLM_DIR) not in sys.path:
-    sys.path.insert(0, str(_LITELLM_DIR))
-
-import overflow  # noqa: E402
-from overflow import (  # noqa: E402
-    BUSY,
-    DOWN,
-    OK,
-    UNKNOWN,
-    BackendState,
-    OverflowHandler,
+from hooks.handler import Handler
+from hooks.log import logger
+from hooks.overflow import context_fit
+from hooks.overflow.context_fit import (
     chat_template_kwargs,
     context_verdict,
     estimate_tokens,
     max_output_tokens,
-    metrics_url,
-    parse_queue_metrics,
-    tokenize_url,
+    system_prompt_messages,
 )
+from hooks.overflow.state import BUSY, DOWN, OK, UNKNOWN, BackendState
+from hooks.overflow.vllm import metrics_url, parse_queue_metrics, tokenize_url
+
+_ROOT = pathlib.Path(__file__).resolve().parents[2]
+_LITELLM_DIR = _ROOT / "ai" / "litellm"
 
 QWEN = "http://qwen3.8-solo:8000/v1"
 MUSE = "http://muse-glimmer:8000/v1"
@@ -105,7 +102,7 @@ async def _no_tokenize(url: str, body: dict) -> dict:
     raise ConnectionError("no /tokenize in unit tests")
 
 
-def make_handler(clock: Clock, pages: dict | None = None, tokenize=None, **kw) -> OverflowHandler:
+def make_handler(clock: Clock, pages: dict | None = None, tokenize=None, **kw) -> Handler:
     """A handler whose fetch serves `pages[url]` (str) or raises it (Exception).
     /tokenize fails unless a stub is given, so no test ever reaches the network."""
     pages = pages if pages is not None else {}
@@ -118,15 +115,15 @@ def make_handler(clock: Clock, pages: dict | None = None, tokenize=None, **kw) -
             raise ConnectionError("no route")
         return page
 
-    return OverflowHandler(
+    return Handler(
         fetch=fetch, clock=clock, busy_after=2.0, idle_after=5.0,
         poll_interval=1.0, probe_timeout=0.5, start_poller=False,
         tokenize=tokenize or _no_tokenize, **kw,
     )
 
 
-def poll(h: OverflowHandler) -> None:
-    asyncio.run(h.poll_once())
+def poll(h: Handler) -> None:
+    asyncio.run(h.overflow.poller.poll_once())
 
 
 def models(deployments: list) -> list:
@@ -222,7 +219,7 @@ def test_verdicts_unknown_when_never_probed_stale_or_metric_missing():
 
 
 # ── the filter rule ────────────────────────────────────────────────────────
-def busy(h: OverflowHandler, clock: Clock, url: str, pages: dict) -> None:
+def busy(h: Handler, clock: Clock, url: str, pages: dict) -> None:
     pages[url] = metrics(4, 3)
     poll(h)
     clock.advance(2.5)
@@ -233,26 +230,26 @@ def test_unknown_backends_keep_everything():
     clock = Clock()
     h = make_handler(clock)
     chain = general_chain()
-    assert h.filter_deployments("local-general", chain) is chain
+    assert h.overflow.filter_deployments("local-general", chain) is chain
 
 
 def test_idle_chain_is_untouched():
     clock = Clock()
     pages = {metrics_url(QWEN): metrics(0), metrics_url(MUSE): metrics(0)}
     h = make_handler(clock, pages)
-    h.filter_deployments("local-general", general_chain())  # learn backends
+    h.overflow.filter_deployments("local-general", general_chain())  # learn backends
     poll(h)
     chain = general_chain()
-    assert h.filter_deployments("local-general", chain) is chain
+    assert h.overflow.filter_deployments("local-general", chain) is chain
 
 
 def test_busy_order1_spills_to_order2_not_claude():
     clock = Clock()
     pages = {metrics_url(QWEN): metrics(0), metrics_url(MUSE): metrics(0)}
     h = make_handler(clock, pages)
-    h.filter_deployments("local-general", general_chain())
+    h.overflow.filter_deployments("local-general", general_chain())
     busy(h, clock, metrics_url(QWEN), pages)
-    out = h.filter_deployments("local-general", general_chain())
+    out = h.overflow.filter_deployments("local-general", general_chain())
     assert models(out) == ["openai/muse-glimmer", "anthropic/claude-sonnet-5"]
     assert h.stats["spills"] == 1
 
@@ -261,20 +258,20 @@ def test_waiting_shorter_than_busy_after_does_not_spill():
     clock = Clock()
     pages = {metrics_url(QWEN): metrics(4), metrics_url(MUSE): metrics(0)}
     h = make_handler(clock, pages)
-    h.filter_deployments("local-general", general_chain())
+    h.overflow.filter_deployments("local-general", general_chain())
     poll(h)
     clock.advance(1.0)
     poll(h)
-    assert len(h.filter_deployments("local-general", general_chain())) == 3
+    assert len(h.overflow.filter_deployments("local-general", general_chain())) == 3
 
 
 def test_both_local_busy_or_down_leaves_only_claude():
     clock = Clock()
     pages = {metrics_url(QWEN): metrics(0), metrics_url(MUSE): ConnectionError("refused")}
     h = make_handler(clock, pages)
-    h.filter_deployments("local-general", general_chain())
+    h.overflow.filter_deployments("local-general", general_chain())
     busy(h, clock, metrics_url(QWEN), pages)
-    out = h.filter_deployments("local-general", general_chain())
+    out = h.overflow.filter_deployments("local-general", general_chain())
     assert models(out) == ["anthropic/claude-sonnet-5"]
 
 
@@ -282,9 +279,9 @@ def test_down_order1_spills_to_order2():
     clock = Clock()
     pages = {metrics_url(QWEN): ConnectionError("refused"), metrics_url(MUSE): metrics(0)}
     h = make_handler(clock, pages)
-    h.filter_deployments("local-reasoning", general_chain())
+    h.overflow.filter_deployments("local-reasoning", general_chain())
     poll(h)
-    out = h.filter_deployments("local-general", general_chain())
+    out = h.overflow.filter_deployments("local-general", general_chain())
     assert models(out) == ["openai/muse-glimmer", "anthropic/claude-sonnet-5"]
 
 
@@ -292,9 +289,9 @@ def test_claude_is_never_dropped():
     clock = Clock()
     pages = {metrics_url(QWEN): ConnectionError("x"), metrics_url(MUSE): ConnectionError("x")}
     h = make_handler(clock, pages)
-    h.filter_deployments("local-general", general_chain())
+    h.overflow.filter_deployments("local-general", general_chain())
     poll(h)
-    out = h.filter_deployments("local-general", general_chain())
+    out = h.overflow.filter_deployments("local-general", general_chain())
     assert "anthropic/claude-sonnet-5" in models(out)
 
 
@@ -302,14 +299,14 @@ def test_local_private_both_busy_stays_local():
     clock = Clock()
     pages = {metrics_url(QWEN): metrics(0), metrics_url(MUSE): metrics(0)}
     h = make_handler(clock, pages)
-    h.filter_deployments("local-private", private_chain())
+    h.overflow.filter_deployments("local-private", private_chain())
     pages[metrics_url(QWEN)] = metrics(3)
     pages[metrics_url(MUSE)] = metrics(3)
     poll(h)
     clock.advance(2.5)
     poll(h)
     chain = private_chain()
-    out = h.filter_deployments("local-private", chain)
+    out = h.overflow.filter_deployments("local-private", chain)
     assert out == chain  # both busy -> both kept -> order 1 queues locally
     assert all(d["litellm_params"].get("api_base") for d in out)
     assert h.stats["kept_all_overloaded"] == 1
@@ -319,19 +316,19 @@ def test_local_private_prefers_busy_over_down():
     clock = Clock()
     pages = {metrics_url(QWEN): ConnectionError("refused"), metrics_url(MUSE): metrics(0)}
     h = make_handler(clock, pages)
-    h.filter_deployments("local-private", private_chain())
+    h.overflow.filter_deployments("local-private", private_chain())
     busy(h, clock, metrics_url(MUSE), pages)
-    out = h.filter_deployments("local-private", private_chain())
+    out = h.overflow.filter_deployments("local-private", private_chain())
     assert models(out) == ["openai/muse-glimmer"]
 
 
 def test_local_private_all_down_returns_original():
     clock = Clock()
     h = make_handler(clock, {})
-    h.filter_deployments("local-private", private_chain())
+    h.overflow.filter_deployments("local-private", private_chain())
     poll(h)
     chain = private_chain()
-    assert h.filter_deployments("local-private", chain) is chain
+    assert h.overflow.filter_deployments("local-private", chain) is chain
 
 
 def test_groups_without_two_orders_are_never_touched():
@@ -339,9 +336,9 @@ def test_groups_without_two_orders_are_never_touched():
     h = make_handler(clock, {})
     single = [dep("openai/qwen3.8-solo", None, QWEN), dep("openai/qwen3.8-solo", None, QWEN)]
     poll(h)
-    assert h.filter_deployments("qwen3.8-solo", single) is single
+    assert h.overflow.filter_deployments("qwen3.8-solo", single) is single
     same_order = [dep("openai/qwen3.8-solo", 1, QWEN), dep("openai/muse-glimmer", 1, MUSE)]
-    assert h.filter_deployments("x", same_order) is same_order
+    assert h.overflow.filter_deployments("x", same_order) is same_order
     assert h.state()["backends"] == {}  # not a chain -> not even learnt
 
 
@@ -349,11 +346,11 @@ def test_stale_data_keeps_everything():
     clock = Clock()
     pages = {metrics_url(QWEN): ConnectionError("x"), metrics_url(MUSE): metrics(0)}
     h = make_handler(clock, pages)
-    h.filter_deployments("local-general", general_chain())
+    h.overflow.filter_deployments("local-general", general_chain())
     poll(h)
-    assert len(h.filter_deployments("local-general", general_chain())) == 2
+    assert len(h.overflow.filter_deployments("local-general", general_chain())) == 2
     clock.advance(5.1)  # > 5 x poll interval with no new probe
-    assert len(h.filter_deployments("local-general", general_chain())) == 3
+    assert len(h.overflow.filter_deployments("local-general", general_chain())) == 3
 
 
 def test_hook_never_throws():
@@ -362,7 +359,7 @@ def test_hook_never_throws():
     def boom(*_a, **_k):
         raise RuntimeError("bug")
 
-    h.filter_deployments = boom  # type: ignore[assignment]
+    h.overflow.filter_deployments = boom  # type: ignore[assignment]
     chain = general_chain()
     out = asyncio.run(h.async_filter_deployments("local-general", chain, None))
     assert out is chain and h.stats["errors"] == 1
@@ -381,20 +378,20 @@ def test_spill_logging_is_throttled():
     clock = Clock()
     pages = {metrics_url(QWEN): ConnectionError("x"), metrics_url(MUSE): metrics(0)}
     h = make_handler(clock, pages)
-    h.filter_deployments("local-general", general_chain())
+    h.overflow.filter_deployments("local-general", general_chain())
     poll(h)
     lh = ListHandler()
-    overflow.logger.addHandler(lh)
+    logger.addHandler(lh)
     try:
         for _ in range(5):
-            h.filter_deployments("local-general", general_chain())
+            h.overflow.filter_deployments("local-general", general_chain())
         clock.advance(1.0)
         poll(h)
         clock.advance(30.0)
         poll(h)
-        h.filter_deployments("local-general", general_chain())
+        h.overflow.filter_deployments("local-general", general_chain())
     finally:
-        overflow.logger.removeHandler(lh)
+        logger.removeHandler(lh)
     assert len(records) == 2
     assert "dropping openai/qwen3.8-solo@order1 (down" in records[0]
     assert "+4 similar" in records[1]
@@ -406,10 +403,10 @@ def test_poll_once_probes_concurrently():
         await asyncio.sleep(0.3)
         return metrics(0)
 
-    h = OverflowHandler(fetch=slow_fetch, poll_interval=1.0, probe_timeout=1.0, start_poller=False)
-    h.filter_deployments("local-general", general_chain())
+    h = Handler(fetch=slow_fetch, poll_interval=1.0, probe_timeout=1.0, start_poller=False)
+    h.overflow.filter_deployments("local-general", general_chain())
     start = time.perf_counter()
-    asyncio.run(h.poll_once())
+    asyncio.run(h.overflow.poller.poll_once())
     assert time.perf_counter() - start < 0.55  # 2 x 0.3 s would be serial
     assert all(b["verdict"] == OK for b in h.state()["backends"].values())
 
@@ -419,9 +416,9 @@ def test_probe_timeout_counts_as_down():
         await asyncio.sleep(5)
         return metrics(0)
 
-    h = OverflowHandler(fetch=hang, poll_interval=1.0, probe_timeout=0.1, start_poller=False)
-    h.filter_deployments("local-general", general_chain())
-    asyncio.run(h.poll_once())
+    h = Handler(fetch=hang, poll_interval=1.0, probe_timeout=0.1, start_poller=False)
+    h.overflow.filter_deployments("local-general", general_chain())
+    asyncio.run(h.overflow.poller.poll_once())
     assert {b["verdict"] for b in h.state()["backends"].values()} == {DOWN}
 
 
@@ -433,10 +430,10 @@ def test_poller_starts_lazily_and_restarts_when_dead():
         return metrics(0)
 
     async def scenario():
-        h = OverflowHandler(fetch=fetch, poll_interval=0.2, probe_timeout=0.1)
-        assert h._task is None
+        h = Handler(fetch=fetch, poll_interval=0.2, probe_timeout=0.1)
+        assert h.overflow.poller._task is None
         await h.async_filter_deployments("local-general", general_chain(), None)
-        first = h._task
+        first = h.overflow.poller._task
         assert first is not None and not first.done()
         await asyncio.sleep(0.05)
         first.cancel()
@@ -450,12 +447,12 @@ def test_poller_starts_lazily_and_restarts_when_dead():
 
         dead = asyncio.get_running_loop().create_task(died())
         await asyncio.sleep(0)
-        h._task = dead
+        h.overflow.poller._task = dead
         await h.async_filter_deployments("local-general", general_chain(), None)
-        assert h._task is not dead and not h._task.done()
+        assert h.overflow.poller._task is not dead and not h.overflow.poller._task.done()
         assert h.stats["poller_restarts"] == 1
         await asyncio.sleep(0.05)
-        h._task.cancel()
+        h.overflow.poller._task.cancel()
         return h
 
     h = asyncio.run(scenario())
@@ -533,7 +530,7 @@ def msgs(chars: int) -> list:
 LONG = msgs(300_000)
 
 
-def fit(h: OverflowHandler, model: str, deployments: list, messages, kwargs=None) -> list:
+def fit(h: Handler, model: str, deployments: list, messages, kwargs=None) -> list:
     return asyncio.run(h.async_filter_deployments(model, deployments, messages, kwargs if kwargs is not None else {}))
 
 
@@ -640,8 +637,6 @@ def test_litellm_system_prompt_is_counted_where_litellm_puts_it():
     """main.py merges a deployment's litellm_system_prompt in front of the
     first system message AFTER the router picked it, so /tokenize must see
     it too -- and only for the deployment that carries it."""
-    from overflow import system_prompt_messages
-
     d = ldep("openai/qwen3.8-solo", 1, QWEN, QWEN_LIMIT)
     d["litellm_params"]["litellm_system_prompt"] = "CODE RULES\n"
     with_sys = [{"role": "system", "content": "owui"}, {"role": "user", "content": "hi"}]
@@ -674,7 +669,7 @@ def test_tokenize_failure_keeps_the_deployment(answer):
     chain = lgeneral()
     assert fit(h, "local-general", chain, LONG) is chain
     assert h.stats["tokenize_errors"] == 1 and h.stats["context_drops"] == 0
-    assert h._tokenize_cache == {}  # failures are not cached
+    assert h.overflow.context_fit.cache == {}  # failures are not cached
 
 
 def test_tokenize_timeout_keeps_the_deployment():
@@ -698,12 +693,12 @@ def test_cache_hits_when_a_fallback_re_enters_with_the_same_messages():
 
 
 def test_cache_is_bounded(monkeypatch):
-    monkeypatch.setattr(overflow, "TOKENIZE_CACHE_SIZE", 2)
+    monkeypatch.setattr(context_fit, "TOKENIZE_CACHE_SIZE", 2)
     tok = StubTokenize({QWEN_TOK: 1})
     h = make_handler(Clock(), tokenize=tok)
     for n in range(4):
         fit(h, "local-general", lgeneral(), msgs(300_000 + n))
-    assert len(h._tokenize_cache) == 2
+    assert len(h.overflow.context_fit.cache) == 2
     fit(h, "local-general", lgeneral(), msgs(300_000))  # evicted -> asked again
     assert len(tok.calls) == 5
 
@@ -734,17 +729,74 @@ def test_local_general_with_every_local_too_long_keeps_only_claude():
     assert h.stats["context_drops"] == 1
 
 
+def auto_kwargs(meta_key: str = "metadata", route: str = "local-code", **kw) -> dict:
+    """request_kwargs of a request the client sent as `auto`: the route-policy
+    stash rides in the proxy's metadata dict (litellm_metadata on /v1/messages)."""
+    stash = {"requested_model": "auto", "route": route, "source": "engine", "decision_id": "d-1",
+             "litellm_call_id": "call-1", "observed": False}
+    return {meta_key: {"headers": {}, "zeo_route_policy": stash}, **kw}
+
+
+@pytest.mark.parametrize("meta_key", ["metadata", "litellm_metadata"])
+def test_auto_request_too_long_for_every_local_never_goes_to_claude(meta_key):
+    """Claude is LOAD overflow for `auto`, never a bigger window: the old `auto`
+    deployment refused such a prompt with its max_input_tokens. Now the group's
+    local deployments come back and vLLM refuses it, like local-private."""
+    tok = StubTokenize({QWEN_TOK: 300_000, MUSE_TOK: 300_000})
+    h = make_handler(Clock(), tokenize=tok)
+    out = fit(h, "local-code", lgeneral(), msgs(800_000), auto_kwargs(meta_key))
+    assert models(out) == ["openai/qwen3.8-solo", "openai/muse-glimmer"]
+    assert not [m for m in models(out) if m.startswith("anthropic/")]
+    assert h.stats["context_auto_kept_local"] == 1 and h.stats["context_drops"] == 0
+
+
+def test_the_same_prompt_on_a_direct_chain_call_still_goes_to_claude():
+    tok = StubTokenize({QWEN_TOK: 300_000, MUSE_TOK: 300_000})
+    h = make_handler(Clock(), tokenize=tok)
+    for kwargs in ({}, {"metadata": {"headers": {}}},
+                   # Not auto's: a stash for another model is ignored (and the pre-call
+                   # hook drops any stash a request body carried in the first place).
+                   {"metadata": {"zeo_route_policy": {"requested_model": "local-code", "route": "local-code"}}}):
+        assert models(fit(h, "local-code", lgeneral(), msgs(800_000), kwargs)) == ["anthropic/claude-sonnet-5"]
+    assert h.stats["context_auto_kept_local"] == 0 and h.stats["context_drops"] == 3
+
+
+def test_auto_request_that_fits_one_local_still_drops_the_other():
+    tok = StubTokenize({QWEN_TOK: 122_881, MUSE_TOK: 122_881})
+    h = make_handler(Clock(), tokenize=tok)
+    assert models(fit(h, "local-code", lgeneral(), msgs(800_000), auto_kwargs())) == [
+        "openai/muse-glimmer", "anthropic/claude-sonnet-5"]  # the order filter then picks muse
+
+
+def test_auto_request_with_both_locals_busy_still_overflows_to_claude():
+    clock = Clock()
+    pages = {metrics_url(QWEN): metrics(0), metrics_url(MUSE): metrics(0)}
+    h = make_handler(clock, pages)
+    h.overflow.filter_deployments("local-code", lgeneral())  # learn the backends
+    pages[metrics_url(MUSE)] = metrics(4, 3)
+    busy(h, clock, metrics_url(QWEN), pages)  # both BUSY
+    out = fit(h, "local-code", lgeneral(), [{"role": "user", "content": "hi"}], auto_kwargs())
+    assert models(out) == ["anthropic/claude-sonnet-5"]
+    # Down, too.
+    pages[metrics_url(QWEN)] = ConnectionError("refused")
+    pages[metrics_url(MUSE)] = ConnectionError("refused")
+    poll(h)
+    out = fit(h, "local-code", lgeneral(), [{"role": "user", "content": "hi"}], auto_kwargs("litellm_metadata"))
+    assert models(out) == ["anthropic/claude-sonnet-5"]
+    assert h.stats["context_auto_kept_local"] == 0
+
+
 def test_too_long_is_a_hard_drop_the_busy_fallback_never_re_adds():
     clock = Clock()
     pages = {metrics_url(QWEN): metrics(0), metrics_url(MUSE): metrics(0)}
     tok = StubTokenize({QWEN_TOK: 122_881})
     h = make_handler(clock, pages, tokenize=tok)
-    h.filter_deployments("local-private", lprivate())
+    h.overflow.filter_deployments("local-private", lprivate())
     busy(h, clock, metrics_url(QWEN), pages)  # qwen BUSY (and too long)
     pages[metrics_url(MUSE)] = ConnectionError("refused")
     poll(h)  # muse DOWN
     # Without the context step the busy/down rule would keep the busy qwen...
-    assert models(h.filter_deployments("local-private", lprivate())) == ["openai/qwen3.8-solo"]
+    assert models(h.overflow.filter_deployments("local-private", lprivate())) == ["openai/qwen3.8-solo"]
     # ...but qwen cannot take this prompt, so muse (down, the only fit) is it.
     assert models(fit(h, "local-private", lprivate(), LONG)) == ["openai/muse-glimmer"]
     # local-general: qwen too long, muse busy -> Claude, never qwen.
@@ -777,11 +829,11 @@ def test_too_long_drop_is_logged_with_the_count():
 
     h = make_handler(Clock(), tokenize=StubTokenize({QWEN_TOK: 122_881}))
     lh = ListHandler()
-    overflow.logger.addHandler(lh)
+    logger.addHandler(lh)
     try:
         fit(h, "local-general", lgeneral(), LONG)
     finally:
-        overflow.logger.removeHandler(lh)
+        logger.removeHandler(lh)
     assert records == [
         "local-general: dropping openai/qwen3.8-solo@order1 "
         "(too-long, count=122881 > max_input_tokens=114688) -> next order 2"
@@ -805,7 +857,7 @@ def test_context_step_never_throws():
     async def boom(*_a, **_k):
         raise RuntimeError("bug")
 
-    h.context_check = boom  # type: ignore[assignment]
+    h.overflow.context_fit.check = boom  # type: ignore[assignment]
     chain = lgeneral()
     assert fit(h, "local-general", chain, LONG) is chain
     assert h.stats["errors"] == 1
@@ -861,26 +913,55 @@ def test_config_chain_table_is_what_the_policy_says():
     cfg = yaml.safe_load(CONFIG.read_text(encoding="utf-8"))
     for fb in cfg["litellm_settings"]["fallbacks"] + cfg["litellm_settings"]["context_window_fallbacks"]:
         assert not any(k in CHAINS for k in fb), fb
-        assert not any("claude" in t for k, v in fb.items() if k == "auto" for t in v)
+        # `auto` is rewritten to a chain before routing: an entry would never fire.
+        assert "auto" not in fb, fb
+    # What serves `auto` when nothing rewrote it: the chain with no Claude.
+    assert cfg["router_settings"]["model_group_alias"] == {"auto": "local-private"}
+    assert not [m for m in cfg["model_list"] if m["model_name"] == "auto"]
     assert cfg["litellm_settings"]["callbacks"] == ["overflow.handler"]
 
 
+HOOK_MODULES = {
+    "hooks", "hooks.handler", "hooks.settings", "hooks.log", "hooks.deployments",
+    "hooks.overflow", "hooks.overflow.filter", "hooks.overflow.context_fit", "hooks.overflow.poller",
+    "hooks.overflow.state", "hooks.overflow.vllm",
+    "hooks.footer", "hooks.footer.auto", "hooks.footer.stream", "hooks.footer.render",
+    "hooks.routing", "hooks.routing.policy_client", "hooks.routing.invariants", "hooks.routing.stash",
+    "common.conversation",
+}
+
+
 @pytestmark_litellm
-def test_litellm_can_load_the_hook_the_way_the_proxy_does():
+def test_litellm_loads_the_hook_through_the_shim_into_a_real_package(fresh_hooks):
     """The proxy loads `overflow.handler` with spec_from_file_location +
-    exec_module and never registers it in sys.modules
-    (proxy/types_utils/utils.py:42-49). A @dataclass in the module crashed
-    exactly there -- this is the regression test."""
+    exec_module and never registers overflow.py in sys.modules
+    (proxy/types_utils/utils.py:8-61). A @dataclass in THAT file crashes
+    there, which is why overflow.py is only a shim: it imports the `hooks`
+    package normally, so the package and every submodule ARE in sys.modules
+    and a @dataclass inside it (BackendState) works. Loaded against a fresh
+    import of the package, through LiteLLM's own loader."""
     from litellm.integrations.custom_logger import CustomLogger
     from litellm.proxy.types_utils.utils import get_instance_fn
 
-    h = get_instance_fn("overflow.handler", config_file_path=str(CONFIG))
-    assert isinstance(h, CustomLogger)
-    assert type(h).__name__ == "OverflowHandler"
-    assert h.state()["config"]["busy_after_s"] == float(os.environ.get("OVERFLOW_BUSY_AFTER_S") or 2.0)
+    path_before = list(sys.path)
+    with fresh_hooks():
+        h = get_instance_fn("overflow.handler", config_file_path=str(CONFIG))
+        assert isinstance(h, CustomLogger)
+        assert type(h).__name__ == "Handler" and type(h).__module__ == "hooks.handler"
+        assert sys.modules["hooks.handler"].Handler is type(h)
+        assert HOOK_MODULES <= set(sys.modules)
+        assert "overflow" not in sys.modules  # LiteLLM's loader never registers the shim
+        state_mod = sys.modules["hooks.overflow.state"]
+        assert dataclasses.is_dataclass(state_mod.BackendState)
+        h.overflow.filter_deployments("local-general", general_chain())
+        backend = h.overflow.poller.backends[QWEN]
+        assert isinstance(backend, state_mod.BackendState) and dataclasses.is_dataclass(backend)
+        assert {f.name for f in dataclasses.fields(backend)} >= {"api_base", "url", "busy", "waiting"}
+        assert h.state()["config"]["busy_after_s"] == float(os.environ.get("OVERFLOW_BUSY_AFTER_S") or 2.0)
+    assert sys.path == path_before  # the shim took its sys.path entry back out
 
 
-def make_router(handler: OverflowHandler, **kw):
+def make_router(handler: Handler, **kw):
     router = litellm.Router(model_list=chain_model_list(), enable_pre_call_checks=True, **kw)
     litellm.callbacks = [handler]
     return router
@@ -972,6 +1053,28 @@ def test_router_exact_count_skips_qwen_that_litellm_undercounts():
         assert models(healthy(router, "local-private", UNDERCOUNTED, {"tools": TOOLS})) == ["openai/muse-glimmer"]
         assert tok.calls[0][1]["tools"] == TOOLS
         assert tok.calls[0][1]["model"] == "qwen3.8-solo"
+    finally:
+        litellm.callbacks = []
+
+
+# 400k characters of words: the hook's estimate (160k) reaches 0.6 x both
+# local-code windows (98304, 229376), so both are measured; tiktoken counts it
+# at ~80k, under both, so LiteLLM's own backstop keeps them.
+UNDERCOUNTED_FOR_BOTH = "word " * 80_000
+
+
+@pytestmark_litellm
+def test_router_auto_request_too_long_for_every_local_never_reaches_claude():
+    """Through the real v1.95.0 Router and the real local-code chain: the stash
+    in request_kwargs' metadata keeps an over-long `auto` prompt off Claude;
+    the same prompt on a direct local-code call still goes to Claude."""
+    h = make_handler(Clock(), {}, tokenize=StubTokenize({QWEN_TOK: 300_000, MUSE_TOK: 300_000}))
+    router = make_router(h)
+    try:
+        assert models(healthy(router, "local-code", UNDERCOUNTED_FOR_BOTH)) == ["anthropic/claude-sonnet-5"]
+        for meta_key in ("metadata", "litellm_metadata"):
+            out = healthy(router, "local-code", UNDERCOUNTED_FOR_BOTH, auto_kwargs(meta_key))
+            assert models(out) == ["openai/qwen3.8-solo"], meta_key  # the order filter: lowest local order
     finally:
         litellm.callbacks = []
 

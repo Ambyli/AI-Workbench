@@ -4,7 +4,16 @@ Every test document is generated in-process rather than committed as a binary
 blob: the suite stays diffable, the fixtures can be tuned per test, and there
 is no risk of a stale .pdf drifting from what the loader expects.
 
-  make_png / make_jpeg  — tiny raster images (PIL)
+  make_png / make_jpeg  — tiny raster images (PIL); make_jpeg can carry an
+                          EXIF orientation
+  make_heic             — a HEIC via pillow-heif's encoder; with an
+                          orientation it carries it twice, as an iPhone photo
+                          does (container irot/imir AND the EXIF tag)
+  make_avif             — an AVIF via Pillow's own plugin (≥ 11.3), whose
+                          encoder turns an EXIF orientation into irot/imir
+  make_ftyp             — just an ISO-BMFF ftyp box, for brand detection
+  marker_picture        — a picture whose orientation can be read back: a
+                          red block in the top-left corner (``marker_box``)
   make_text_image       — a white page with rendered text, for OCR tests
   make_pdf              — a text-layer PDF, one page per string (PyMuPDF)
   make_scanned_pdf      — the same text rasterised, so the PDF has NO text
@@ -19,6 +28,7 @@ is no risk of a stale .pdf drifting from what the loader expects.
 from __future__ import annotations
 
 import io
+import struct
 from typing import Iterable, Optional, Sequence
 
 from common.documents.model import Document, Page
@@ -33,13 +43,122 @@ def make_png(size: tuple[int, int] = (120, 80), color: str = "white") -> bytes:
     return buf.getvalue()
 
 
-def make_jpeg(size: tuple[int, int] = (120, 80), color: str = "white") -> bytes:
-    """A minimal JPEG."""
+def _exif(orientation: Optional[int]) -> dict:
+    """``save`` keyword arguments carrying an EXIF orientation tag (or none)."""
+    if not orientation:
+        return {}
     from PIL import Image
 
+    exif = Image.Exif()
+    exif[0x0112] = orientation
+    return {"exif": exif.tobytes()}
+
+
+def marker_picture(size: tuple[int, int] = (120, 80)):
+    """A blue picture with a red block in its top-left quarter.
+
+    Where the block ends up after decoding (``marker_box``) says which way up
+    the picture came out, so an orientation applied twice — or not at all —
+    is visible, not just the dimensions.
+    """
+    from PIL import Image
+
+    width, height = size
+    img = Image.new("RGB", size, (0, 0, 255))
+    img.paste((255, 0, 0), (0, 0, width // 4, height // 4))
+    return img
+
+
+def marker_box(bgr) -> Optional[tuple[int, int, int, int]]:
+    """``(x0, y0, x1, y1)`` of the red block in a decoded BGR array, or None."""
+    import numpy as np
+
+    red = (bgr[:, :, 2] > 180) & (bgr[:, :, 1] < 90) & (bgr[:, :, 0] < 90)
+    ys, xs = np.nonzero(red)
+    if not len(xs):
+        return None
+    return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+
+
+def make_jpeg(
+    size: tuple[int, int] = (120, 80),
+    color: str = "white",
+    *,
+    exif_orientation: Optional[int] = None,
+    image=None,
+) -> bytes:
+    """A minimal JPEG — of ``image`` when given — optionally carrying an EXIF
+    orientation tag (the stored pixels stay as they are)."""
+    from PIL import Image
+
+    img = image if image is not None else Image.new("RGB", size, color)
     buf = io.BytesIO()
-    Image.new("RGB", size, color).save(buf, format="JPEG", quality=90)
+    img.save(buf, format="JPEG", quality=90, **_exif(exif_orientation))
     return buf.getvalue()
+
+
+def make_heic(
+    size: tuple[int, int] = (120, 80),
+    color: str = "white",
+    *,
+    exif_orientation: Optional[int] = None,
+    image=None,
+) -> bytes:
+    """A HEIC (HEVC-coded HEIF) written by pillow-heif's encoder.
+
+    With ``exif_orientation`` the stored pixels are left as they are and the
+    file says how to turn them twice over, the way an iPhone photo does: the
+    encoder writes the container's ``irot`` / ``imir`` for that orientation
+    AND keeps the tag in the stored EXIF. A decoder that honoured both would
+    rotate twice — which is what the loader tests check does not happen.
+    """
+    import pillow_heif
+    from PIL import Image
+
+    img = image if image is not None else Image.new("RGB", size, color)
+    buf = io.BytesIO()
+    pillow_heif.from_pillow(img).save(buf, quality=90, **_exif(exif_orientation))
+    return buf.getvalue()
+
+
+def make_avif(
+    size: tuple[int, int] = (120, 80),
+    color: str = "white",
+    *,
+    exif_orientation: Optional[int] = None,
+    image=None,
+) -> bytes:
+    """An AVIF written by Pillow's own plugin (Pillow ≥ 11.3 built with AVIF).
+
+    Pillow's encoder moves an EXIF orientation into the container — it writes
+    ``irot`` / ``imir`` and drops the tag from the stored EXIF — so the file
+    looks like a camera's AVIF, with the stored pixels unrotated.
+    """
+    from PIL import Image
+
+    img = image if image is not None else Image.new("RGB", size, color)
+    buf = io.BytesIO()
+    img.save(buf, format="AVIF", quality=90, **_exif(exif_orientation))
+    return buf.getvalue()
+
+
+def make_ftyp(
+    major: str,
+    compatible: Sequence[str] = (),
+    *,
+    size: Optional[int] = None,
+    tail: bytes = b"",
+) -> bytes:
+    """Just an ISO-BMFF ``ftyp`` box (size, ``ftyp``, major brand, minor
+    version 0, compatible brands) followed by ``tail`` — enough for brand
+    detection, nothing a decoder could open. ``size`` overrides the box's
+    size field, to fake a truncated file or a lying header."""
+    brands = b"".join(b.encode("latin-1") for b in compatible)
+    declared = 16 + len(brands) if size is None else size
+    return (
+        struct.pack(">I", declared) + b"ftyp" + major.encode("latin-1")
+        + b"\x00\x00\x00\x00" + brands + tail
+    )
 
 
 def make_text_image(lines: Sequence[str], width: int = 1000, line_height: int = 70) -> bytes:

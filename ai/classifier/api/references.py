@@ -33,8 +33,9 @@ request, never a creation job that fails a minute later:
   2. CLASSIFIER_REFERENCE_MAX_COUNT references already exist — 409;
   3. the source:
        ``document``  its bytes resolved like /assess (base64, inline text, an
-                     SSRF-checked URL), its kind from the bytes: a JPEG/PNG,
-                     an SVG, or a PDF with ``page`` in range; .txt / .docx are
+                     SSRF-checked URL), its kind from the bytes: a photo
+                     (JPEG/PNG/HEIC/HEIF/AVIF), an SVG, or a PDF with
+                     ``page`` in range; .txt / .docx are
                      a 400 (a reference shows the model a page image). The
                      page's pixel size is read without rendering it. An SVG's
                      external images are fetched and inlined here, as for
@@ -80,6 +81,7 @@ from pydantic import ValidationError
 from common.documents import (
     UnsupportedDocumentError,
     detect_kind,
+    ensure_image_support,
     pdf_page_count,
     pdf_page_size,
     svg_page_size,
@@ -292,9 +294,19 @@ async def _from_form(request: Request) -> tuple[ReferenceRequest, Optional[_Uplo
 
 def _image_size(raw: bytes) -> tuple[int, int]:
     """An image's (width, height) AFTER EXIF rotation, from its header only —
-    the same frame ``analysis.loading`` decodes it into."""
+    the same frame ``analysis.loading`` decodes it into.
+
+    The one swap serves every format: a HEIC/HEIF opens with the
+    container's rotation already in its size and the EXIF tag reset to 1
+    (pillow-heif), while an AVIF opens at its stored size with that rotation
+    reported AS the EXIF tag (Pillow). ``unit-tests/classifier/
+    test_image_formats.py`` pins both against the decoder."""
     from PIL import Image
 
+    try:
+        ensure_image_support(raw)
+    except UnsupportedDocumentError as exc:
+        raise _bad(f"Could not read the image: {exc}")
     try:
         with Image.open(io.BytesIO(raw)) as img:
             width, height = img.size
@@ -314,8 +326,8 @@ def _resolve_document(model: ReferenceRequest, upload: _Upload) -> _Source:
     if kind not in ("image", "pdf", "svg"):
         raise _bad(
             f"document {upload.filename!r} is {kind}, which has no page image; a reference "
-            "is one JPEG/PNG, one SVG, or one PDF page — the example is shown to the "
-            "vision model"
+            "is one JPEG/PNG/HEIC/HEIF/AVIF photo, one SVG, or one PDF page — the example "
+            "is shown to the vision model"
         )
     page = model.page or 0
     pages = 1

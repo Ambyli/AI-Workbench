@@ -1,0 +1,26 @@
+# code_kw -- code keywords, for the `default` ruleset's `code-text` evaluator
+# and as a `sticky-code` cooldown judge.
+#
+# The only copy: this file is the source of truth. It is part of every
+# ruleset version that references it (its content, not these comments, is
+# inlined and hashed), so an edit here needs a ruleset `version` bump.
+# unit-tests/route-policy/test_default_ruleset.py checks that every pattern
+# stays in the RE2 subset, and the real-chat prompts it must (and must not)
+# match.
+#
+# `method: regex`: each keyword is a pattern, "(?i)" applied because
+# case_sensitive is false, compiled by common.keywordmatch with Go RE2's
+# semantics: keep to the RE2 subset (no lookaround, no backreferences, no
+# atomic / possessive groups, no \Z), and \b / \w are ASCII. Single quotes
+# keep each backslash literal.
+name: code_kw
+operator: OR
+case_sensitive: false
+method: regex
+keywords:
+  - '\b(python|typescript|javascript|js|golang|rust|sql|bash|powershell|html|css|jsx|tsx|node\.?js|react|vue|svelte)\b'
+  - '\b(docker|compose|kubernetes|k8s|helm|terraform|nginx|git)\b'
+  - '\b(functions?|class(es)?|methods?|variables?|modules?|librar(y|ies)|packages?|scripts?|regex(es)?|(api )?endpoints?|compil(e|er|ing)|refactor(ing|ed)?|debug(ging)?|stack ?traces?|tracebacks?|exceptions?|unit ?tests?|test (suite|harness|cases?)|bugs?)\b'
+  - '\b[\w.-]+\.(py|js|mjs|ts|tsx|jsx|html|css|json|ya?ml|toml|sh|sql|go|rs|java|cs|cpp|rb|php)\b'
+  - '```'
+  - '\b(build|make|create|write|code)\b.{0,40}\b(app|application|website|web ?page|script|program|cli|game|calculator|dashboard|bot|api|component)s?\b'

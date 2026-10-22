@@ -141,3 +141,72 @@ models:
     timeout_s: 120
     max_concurrent: 2
     text_char_budget: 8000
+
+  qwen3.5-4b:
+    description: >-
+      Qwen3.5-4B (Q4_K_M) on llama.cpp, CPU only (the qwen3.5-4b service in
+      ai/llama). Text only, no thinking. The model route-policy's
+      llm_classifier evaluator scores conversation transcripts with — one
+      text document per job, one presence criterion per route. Slow: seconds
+      per call, tens of seconds for a long transcript, so not a document
+      model.
+    url: http://qwen3.5-4b:8000/v1/chat/completions
+    served_name: qwen3.5-4b
+    api_key_env: null
+    vision: false
+    max_images_per_prompt: 0
+    reasoning: {style: none}
+    # Qwen3.5 thinks by default and its template switches it with
+    # enable_thinking — a boolean, which `reasoning.value` (a string) cannot
+    # carry, so it rides here. The server's --chat-template-kwargs defaults
+    # it off as well. Sampling is the server's (see the service's command).
+    extra_body: {chat_template_kwargs: {enable_thinking: false}}
+    json_mode: true
+    token_param: max_tokens
+    # score = the server's --n-predict 512 (it clamps anything larger); with
+    # no thinking the JSON answer is all it buys. box / select / describe are
+    # image work a text-only model is refused at submit — required, unused.
+    max_tokens: {score: 512, box: 64, select: 64, describe: 64}
+    # CPU prefill of a ~4k-token transcript plus the answer, with the other
+    # slot busy.
+    timeout_s: 90
+    # = the server's --parallel 2: one slot per request in flight.
+    max_concurrent: 2
+    # ~3-4k tokens, well inside a 16k slot. route-policy's history.max_chars
+    # must not exceed it.
+    text_char_budget: 12000
+
+  qwen3.8-solo:
+    description: >-
+      Qwen3.8-27B (AWQ INT4) on vLLM, one GPU (the qwen3.8-solo service in
+      ai/vllm) — order 1 of LiteLLM's local-general / -code / -private
+      chains and order 2 of local-reasoning. Text only, low reasoning. A
+      benchmark candidate for route-policy's llm_classifier, not a document
+      model: every call takes one of the 3 sequences chat runs on.
+    url: http://qwen3.8-solo:8000/v1/chat/completions
+    served_name: qwen3.8-solo
+    api_key_env: null
+    # LiteLLM declares no vision for it; the classifier sends it text only.
+    vision: false
+    max_images_per_prompt: 0
+    # The shared fixed template (ai/jinja/qwen_fixed_chat_template.jinja)
+    # reads reasoning_effort: none | minimal | low | medium | high | xhigh …
+    # (unset = medium, what the chains send; local-code sends high). `low`
+    # keeps thinking on, briefly; --reasoning-parser qwen3 strips it, so
+    # `content` is the JSON alone.
+    reasoning: {style: chat_template_kwargs, key: reasoning_effort, value: low}
+    # No sampling overrides: vLLM's --generation-config auto applies the
+    # checkpoint's generation_config.json, as for muse-glimmer.
+    extra_body: {}
+    json_mode: true
+    token_param: max_tokens
+    # Reasoning counts against score first, as on muse-glimmer at `low`.
+    max_tokens: {score: 8192, box: 1024, select: 2048, describe: 1024}
+    timeout_s: 240
+    # --max-num-seqs 3, and all three are chat's (order 1 of three chains).
+    # One here: a classifier call that queues makes vllm:num_requests_waiting
+    # positive, and the LiteLLM overflow hook then spills chat off this
+    # model — to muse-glimmer, and on to Claude.
+    max_concurrent: 1
+    # ~15k tokens + the 8192 answer, far inside --max-model-len 131072.
+    text_char_budget: 60000

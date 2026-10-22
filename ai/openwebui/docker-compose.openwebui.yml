@@ -29,8 +29,8 @@ services:
       context: ../..
       dockerfile: ai/openwebui/Dockerfile.openwebui
       args:
-        OPENWEBUI_VERSION: ${OPENWEBUI_VERSION:-v0.11.4}
-    image: openwebui-zeo:${OPENWEBUI_VERSION:-v0.11.4}
+        OPENWEBUI_VERSION: ${OPENWEBUI_VERSION:-v0.12.3}
+    image: openwebui-zeo:${OPENWEBUI_VERSION:-v0.12.3}
     # Local-only image name: never try to pull it from a registry.
     pull_policy: build
     networks:
@@ -165,6 +165,19 @@ services:
       # on every boot — a change is `make up openwebui` (env change -> recreate).
       AUTO_CONTINUE_MAX_NUDGES: "${OPENWEBUI_AUTO_CONTINUE_MAX_NUDGES:-2}"
 
+      # Forwarded user + session headers (OPENWEBUI.md § Forwarded user and
+      # session headers). "true" makes every request to an OpenAI-compatible
+      # connection (LiteLLM) carry X-OpenWebUI-User-Name/-Id/-Email/-Role, and
+      # each chat completion also X-OpenWebUI-Chat-Id plus — ZEO PATCH 0005 —
+      # X-OpenWebUI-Message-Id, which LiteLLM's route-policy hook reads.
+      # Upstream applies the SAME flag to the TTS engine (kokoro-api), every
+      # MCP / OpenAPI tool server (Phoenix, the sandbox) and the terminal
+      # (open-terminal): they get the user headers too. Only the literal
+      # "true" turns it on (env.py compares lower-cased). `:-false` is
+      # upstream's default, so a .env without the line changes nothing.
+      # Plain env, read on every boot — a change is `make up openwebui`.
+      ENABLE_FORWARD_USER_INFO_HEADERS: "${OPENWEBUI_ENABLE_FORWARD_USER_INFO_HEADERS:-false}"
+
       # Web search — backed by the searxng container on ai_shared. Only read
       # on the first boot of a fresh openwebui_data volume; on an existing
       # install, toggle via Admin Panel → Settings → Web Search. See
@@ -181,9 +194,9 @@ services:
       # search_web call to searxng and the fetch_url tool's direct page
       # fetch. Read on every boot (not a first-boot-only PersistentConfig
       # value like the web-search block above). 900 / 900 is the outermost
-      # layer of the `auto` timeout budget (Open WebUI 900 > LiteLLM auto
-      # 870 > Envoy 840) — see .env.example and
-      # ai/semantic-router/SEMANTIC_ROUTER.md § Timeout budget, and
+      # layer of the chat timeout budget (Open WebUI 900 > the chain
+      # deployments' per-read 240 local / 300 Claude) — see .env.example and
+      # ai/litellm/LITELLM.md § Chain timeouts, and
       # ai/searxng/SEARXNG.md § Troubleshooting: fetch_url / search hangs
       # for what the shared setting costs fetch_url.
       AIOHTTP_CLIENT_TIMEOUT: "${OPENWEBUI_AIOHTTP_CLIENT_TIMEOUT}"

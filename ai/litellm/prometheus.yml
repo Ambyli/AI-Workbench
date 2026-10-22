@@ -20,20 +20,25 @@ scrape_configs:
     static_configs:
       - targets: ["classifier:8000"]
 
-  # vLLM Semantic Router. Metrics port is 9190 on the default /metrics path
-  # (cli/consts.py DEFAULT_METRICS_PORT; cli/runtime_stack.py builds
-  # http://<router>:9190/metrics, and the CLI's own bundled scrape config
-  # cli/templates/prometheus.serve.yaml targets the same port with no
-  # metrics_path override). 9190 is never published on the host — this
-  # reaches it by service DNS over ai_shared, which is the only reason
-  # vllm-sr-router joins that network at all.
-  - job_name: "semantic-router"
-    static_configs:
-      - targets: ["vllm-sr-router:9190"]
-
   - job_name: "detector"
     static_configs:
       - targets: ["detector:8000"]
+
+  # The route-policy service (ai/route-policy): decisions by route / mode,
+  # evaluator latency and outcomes, errors. Every swap copy answers on
+  # route-policy:8000; Docker DNS hands Prometheus one of them per scrape, so
+  # counters can step back during a deploy (rate() absorbs it).
+  - job_name: "route-policy"
+    static_configs:
+      - targets: ["route-policy:8000"]
+
+  # The signals sidecar (ai/signals): requests and task statuses, per-model
+  # inference time and queue depth, cache hits, example-set warmings. Label
+  # values come from fixed lists, never from a request. Swap-class like
+  # route-policy, so the same one-copy-per-scrape caveat applies.
+  - job_name: "signals"
+    static_configs:
+      - targets: ["signals:8000"]
 
   # The ai/edge HAProxy's built-in Prometheus exporter (official image built
   # with USE_PROMEX=1). edge:8405 is an internal-only frontend on ai_shared,

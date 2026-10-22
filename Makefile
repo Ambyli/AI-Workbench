@@ -17,7 +17,7 @@ endef
 $(eval $(call service,litellm,litellm prometheus))
 $(eval $(call service,unsloth,unsloth))
 $(eval $(call service,vllm,qwen3.8 qwen3.8-solo qwen3.6 vllm-qwen-vl muse-glimmer))
-$(eval $(call service,llama,glm5.2 qwen3.8-flash glm5.3-flash))
+$(eval $(call service,llama,glm5.2 qwen3.8-flash glm5.3-flash qwen3.5-4b))
 $(eval $(call service,kokoro,kokoro-app kokoro-api))
 $(eval $(call service,madlad,madlad-app madlad-api))
 $(eval $(call service,classifier,classifier-db classifier))
@@ -32,8 +32,12 @@ $(eval $(call service,sandbox,sandbox-db sandbox-egress sandbox-proxy sandbox-ru
 $(eval $(call service,n8n,n8n-db n8n))
 $(eval $(call service,open-terminal,open-terminal))
 $(eval $(call service,trino,hive-metastore-db hive-metastore lake-s3 lake-s3-init trino-auth-init trino-coordinator trino-mcp superset-db superset))
-$(eval $(call service,semantic-router,vllm-sr-models-init vllm-sr-router vllm-sr-envoy))
 $(eval $(call service,supabase,supabase-db supavisor auth rest realtime imgproxy storage meta studio supabase-api functions))
+# Before route-policy: its startup warms the bound rulesets' example sets on
+# the sidecar (ai/signals/SIGNALS.md). Not a depends_on -- a down sidecar only
+# makes the signal evaluators abstain.
+$(eval $(call service,signals,signals))
+$(eval $(call service,route-policy,route-policy-db route-policy))
 # Last on purpose: it binds the host ports the swap-class services above used
 # to publish, so on a full `make up` they must have released them first.
 # See ai/edge/EDGE.md § One-time cutover. edge-certs (its TLS certificate,

@@ -1,21 +1,27 @@
-"""Regression tests for the `auto` timeout budget.
+"""Regression tests for the chat timeout budget.
 
-Each layer must sit strictly inside the one outside it:
+`auto` is served in ONE pass: the route-policy hook rewrites it to a chain
+alias and LiteLLM streams that chain's answer straight back. So there is one
+layer inside Open WebUI's total:
 
     Open WebUI 900  (AIOHTTP_CLIENT_TIMEOUT -- a hard total incl. streaming)
-      > LiteLLM `auto` 870  (stream_timeout + timeout, ai/litellm/litellm_config.yaml)
-        > Envoy listener 840  (listeners[0].timeout, ai/semantic-router/config.yaml)
-          > chain orders 1/2: 240, Claude order 3: 300  (per-read)
+      > chain deployments, per read: local orders 1/2: 240, Claude order 3: 300
+
+and the three pre-header timeouts a chain can burn in a row
+(240 + 240 + 300 = 780 s) still fit inside it, so a stalled local backend
+fails over while the turn has budget left.
 
 plus: a timeout inside a chain goes straight to the next `order`
 (router_settings.model_group_retry_policy, TimeoutErrorRetries: 0).
 
 plus: the ai/edge HAProxy's `listen litellm` (900 s client/server inactivity)
-sits OUTSIDE both callers that reach LiteLLM through it -- LAN clients on
-PORT_LITELLM (an `auto` turn is silent for up to 870 s) and the semantic
-router's Envoy on the internal 14000 bind (840 s) -- so the edge never cuts
-a turn they are still waiting on.
-See ai/semantic-router/SEMANTIC_ROUTER.md > Timeout budget.
+sits OUTSIDE the chains for LAN clients on PORT_LITELLM / PORT_LITELLM_TLS --
+a non-streamed answer is silent until it is complete, so the edge must outlast
+the longest silence a chain can produce.
+
+plus: `auto` has no timeout of its own -- it is a model_group_alias, not a
+deployment -- so nothing sits between Open WebUI and the chain any more.
+See ai/litellm/LITELLM.md > Chain timeouts.
 
 Two layers, like test_overflow.py:
 
@@ -23,11 +29,11 @@ Two layers, like test_overflow.py:
   WebUI's values come from .env.example, NEVER from .env -- the test must not
   depend on, or read, the secrets file.
 * Against real LiteLLM (skipped unless `litellm` is importable): build a
-  v1.95.0 Router from the parsed config, prove it picks up the retry policy
-  and resolves the intended timeouts, and drive real timeouts against local
-  stubs: a pre-header timeout must fail over to order 2 without retrying
-  order 1, and a stall after headers must take the mid-stream fallback to
-  order 2.
+  v1.95.0 Router from the parsed config, prove it picks up the retry policy,
+  the `auto` alias and the intended timeouts, and drive real timeouts against
+  local stubs: a pre-header timeout must fail over to order 2 without
+  retrying order 1, and a stall after headers must take the mid-stream
+  fallback to order 2.
 
     python -m pytest unit-tests/litellm -q -p no:cacheprovider
 """
@@ -49,15 +55,10 @@ yaml = pytest.importorskip("yaml")
 
 _ROOT = pathlib.Path(__file__).resolve().parents[2]
 LITELLM_CONFIG = _ROOT / "ai" / "litellm" / "litellm_config.yaml"
-ROUTER_CONFIG = _ROOT / "ai" / "semantic-router" / "config.yaml"
-ENVOY_RENDER = _ROOT / "ai" / "semantic-router" / "envoy.yaml"
+EDGE_CFG = _ROOT / "ai" / "edge" / "haproxy.cfg"
 ENV_EXAMPLE = _ROOT / ".env.example"
 
 CHAINS = ("local-general", "local-code", "local-reasoning", "local-private")
-# Template-hard-coded in vllm-sr 0.3.0 (cli/templates/envoy.template.yaml:
-# route idleTimeout, ext_proc grpc_service.timeout, connect_timeout) -- the
-# listener timeout must stay below it to mean anything.
-ENVOY_HARD_CAP_S = 1200
 
 
 def _litellm_cfg() -> dict:
@@ -88,16 +89,6 @@ def _owui() -> tuple[int, int]:
     )
 
 
-def _auto_params() -> dict:
-    (auto,) = [m for m in _litellm_cfg()["model_list"] if m["model_name"] == "auto"]
-    return auto["litellm_params"]
-
-
-def _envoy_listener_s() -> int:
-    cfg = yaml.safe_load(ROUTER_CONFIG.read_text(encoding="utf-8"))
-    return _seconds(cfg["listeners"][0]["timeout"])
-
-
 def _chain_deployments() -> dict[str, list[dict]]:
     out: dict[str, list[dict]] = {}
     for m in _litellm_cfg()["model_list"]:
@@ -106,24 +97,10 @@ def _chain_deployments() -> dict[str, list[dict]]:
     return out
 
 
-# ── config invariants ──────────────────────────────────────────────────────
-def test_env_example_open_webui_values_are_900():
-    assert _owui() == (900, 900)
-
-
-def test_layers_are_strictly_nested():
-    total, idle = _owui()
-    auto = _auto_params()
-    envoy = _envoy_listener_s()
-    assert auto["stream_timeout"] == auto["timeout"], "auto: stream and non-stream must agree"
-    assert total > auto["stream_timeout"] > envoy, (total, auto["stream_timeout"], envoy)
-    # On `auto` the response is silent until complete (Envoy buffers it), so
-    # Open WebUI's idle timer is a total too -- it must not undercut auto.
-    assert idle > auto["stream_timeout"]
-    assert envoy < ENVOY_HARD_CAP_S
-
-
-EDGE_CFG = _ROOT / "ai" / "edge" / "haproxy.cfg"
+def _worst_chain_silence(deployments: list[dict]) -> int:
+    """The longest a chain can keep a caller waiting without a byte: every
+    order's per-read timeout firing before headers, one after the other."""
+    return sum(d["stream_timeout"] for d in deployments)
 
 
 def _edge_litellm_timeouts() -> dict[str, int]:
@@ -142,63 +119,58 @@ def _edge_litellm_timeouts() -> dict[str, int]:
     return out
 
 
-def test_edge_litellm_listener_outlasts_auto_and_envoy():
-    edge = _edge_litellm_timeouts()
-    auto = _auto_params()["stream_timeout"]
-    envoy = _envoy_listener_s()
-    assert edge["client"] == edge["server"], edge
-    # LAN path: client -> edge :4001 -> litellm `auto` (870). Router path:
-    # Envoy (840) -> edge :14000 -> litellm chain. Inactivity timers, and
-    # both responses can be silent for the whole turn.
-    assert edge["server"] > auto > envoy, (edge, auto, envoy)
-    # The router really goes through the edge's internal bind.
-    cfg = yaml.safe_load(ROUTER_CONFIG.read_text(encoding="utf-8"))
-    urls = {ref["base_url"] for m in cfg["providers"]["models"] for ref in m["backend_refs"]}
-    assert urls == {"http://edge:14000/v1"}
+# ── config invariants ──────────────────────────────────────────────────────
+def test_env_example_open_webui_values_are_900():
+    assert _owui() == (900, 900)
 
 
 def test_request_timeout_matches_open_webui_total():
     assert _litellm_cfg()["litellm_settings"]["request_timeout"] == _owui()[0]
 
 
-def test_chain_deployments_carry_both_timeouts_inside_auto():
-    auto = _auto_params()["stream_timeout"]
-    envoy = _envoy_listener_s()
+def test_chain_deployments_carry_both_timeouts_inside_open_webui():
+    total, idle = _owui()
     chains = _chain_deployments()
     assert set(chains) == set(CHAINS)
     for alias, deployments in chains.items():
-        by_order = {d["order"]: d for d in deployments}
-        assert by_order[1]["stream_timeout"] < auto, alias
         for d in deployments:
             assert d["stream_timeout"] == d["timeout"], (alias, d["order"])
-            assert d["stream_timeout"] < envoy, (alias, d["order"])
             expected = 300 if d["model"].startswith("anthropic/") else 240
             assert d["stream_timeout"] == expected, (alias, d["order"], d["model"])
+            # A per-read limit: Open WebUI's stream-idle timer must not undercut it.
+            assert d["stream_timeout"] < idle, (alias, d["order"])
+        # Every order timing out before headers still leaves Open WebUI's total
+        # time to show the error instead of cutting the turn itself.
+        assert _worst_chain_silence(deployments) < total, alias
+
+
+def test_auto_is_an_alias_with_no_timeout_layer_of_its_own():
+    cfg = _litellm_cfg()
+    assert not [m for m in cfg["model_list"] if m["model_name"] == "auto"]
+    assert cfg["router_settings"]["model_group_alias"] == {"auto": "local-private"}
+
+
+def test_edge_litellm_listener_outlasts_every_chain_silence():
+    """LAN clients reach LiteLLM through the edge. A non-streamed answer is
+    silent until complete -- up to a chain's worst-case pre-header failover --
+    so the edge's inactivity timers must outlast that, and match Open WebUI's
+    total (the edge is outside the budget, never the layer that cuts a turn)."""
+    edge = _edge_litellm_timeouts()
+    total, _ = _owui()
+    assert edge["client"] == edge["server"], edge
+    assert edge["server"] >= total, (edge, total)
+    worst = max(_worst_chain_silence(d) for d in _chain_deployments().values())
+    assert edge["server"] > worst, (edge, worst)
 
 
 def test_retry_policy_sends_chain_timeouts_to_the_next_order():
     rs = _litellm_cfg().get("router_settings") or {}
     policy = rs.get("model_group_retry_policy") or {}
-    for alias in CHAINS + ("auto",):
-        assert policy.get(alias) == {"TimeoutErrorRetries": 0}, alias
+    assert set(policy) == set(CHAINS), "the chains, and nothing else (`auto` is rewritten before routing)"
+    for alias in CHAINS:
+        assert policy[alias] == {"TimeoutErrorRetries": 0}, alias
     # allowed_fails_policy switches every deployment to legacy cooldown.
     assert "allowed_fails_policy" not in rs
-
-
-def test_checked_in_envoy_render_carries_the_listener_timeout():
-    """prepare.py's compare() is the real gate; this catches a config.yaml
-    edit committed without its re-render before the box does."""
-    text = ENVOY_RENDER.read_text(encoding="utf-8")
-    body = text[text.index("\nadmin:") + 1:]
-    want = f"{_envoy_listener_s()}s"
-    route_timeouts = re.findall(r"^\s+timeout: (\S+)$", body, re.M)
-    message_timeouts = re.findall(r"^\s+message_timeout: (\S+)$", body, re.M)
-    assert message_timeouts == [want]
-    # Every route timeout is the listener value; the only other `timeout:`
-    # is the template-hard-coded ext_proc grpc_service timeout.
-    assert route_timeouts.count(f"{ENVOY_HARD_CAP_S}s") == 1
-    assert [t for t in route_timeouts if t != f"{ENVOY_HARD_CAP_S}s"] == [want] * (len(route_timeouts) - 1)
-    assert len(route_timeouts) > 1
 
 
 # ── against real LiteLLM 1.95.0 ────────────────────────────────────────────
@@ -240,7 +212,7 @@ def test_router_settings_are_router_args_the_proxy_will_pass():
 
 
 @needs_litellm
-def test_v1_95_router_picks_up_policy_and_timeouts():
+def test_v1_95_router_picks_up_policy_alias_and_timeouts():
     from litellm.router_utils.get_retry_from_policy import get_num_retries_from_retry_policy
 
     settings = _litellm_cfg()["litellm_settings"]
@@ -250,12 +222,10 @@ def test_v1_95_router_picks_up_policy_and_timeouts():
         enable_pre_call_checks=True,
         **_router_settings(),
     )
-    # The four chains, plus `auto`: a turn that used its whole budget must not
-    # be started again with seconds left before Open WebUI's cap.
-    assert set(router.model_group_retry_policy) == set(CHAINS) | {"auto"}
+    assert set(router.model_group_retry_policy) == set(CHAINS)
     timeout_exc = litellm.Timeout(message="t", model="m", llm_provider="openai")
     other_exc = litellm.InternalServerError(message="x", model="m", llm_provider="openai")
-    for alias in CHAINS + ("auto",):
+    for alias in CHAINS:
         assert get_num_retries_from_retry_policy(
             exception=timeout_exc, model_group=alias,
             model_group_retry_policy=router.model_group_retry_policy) == 0
@@ -263,6 +233,12 @@ def test_v1_95_router_picks_up_policy_and_timeouts():
         assert get_num_retries_from_retry_policy(
             exception=other_exc, model_group=alias,
             model_group_retry_policy=router.model_group_retry_policy) is None
+    # `auto` resolves to local-private's deployments when nothing rewrote it,
+    # and is listed like a model (what /v1/models shows Open WebUI).
+    assert router._get_model_from_alias("auto") == "local-private"
+    listed = router.get_model_list_from_model_alias(model_name="auto")
+    assert {d["litellm_params"]["model"] for d in listed} == {"openai/qwen3.8-solo", "openai/muse-glimmer"}
+    assert {d["model_name"] for d in listed} == {"auto"}
 
     def effective(name, order=None, stream=True):
         (d,) = [m for m in router.model_list if m["model_name"] == name
@@ -270,7 +246,6 @@ def test_v1_95_router_picks_up_policy_and_timeouts():
         return router._get_timeout(kwargs={"stream": stream}, data=d["litellm_params"])
 
     for stream in (True, False):
-        assert effective("auto", stream=stream) == 870
         assert effective("local-general", 1, stream) == 240
         assert effective("local-general", 3, stream) == 300
         assert effective("local-private", 2, stream) == 240
@@ -354,10 +329,12 @@ def _stub_chain(order1: _Stub, order2: _Stub):
             "model": "openai/stub", "api_base": base, "api_key": "none",
             "order": order, "timeout": 1, "stream_timeout": 1}}
 
+    settings = _router_settings()
+    settings.pop("model_group_alias", None)  # its target (local-private) is not in this stub list
     return litellm.Router(
         model_list=[dep(1, order1.base), dep(2, order2.base)],
         num_retries=_litellm_cfg()["litellm_settings"]["num_retries"],
-        **_router_settings(),
+        **settings,
     )
 
 
@@ -386,8 +363,8 @@ def test_stall_after_headers_falls_over_mid_stream_at_v1_95():
     (streaming_handler.py:2153-2217) and the Router's mid-stream fallback
     (router.py:2066-2150) moves to order 2. Only a mid-stream error that maps
     to a 4xx (streaming_handler.py:2202-2206) is raised without fallback. If
-    this test starts failing after a LiteLLM bump, SEMANTIC_ROUTER.md >
-    Timeout budget is out of date."""
+    this test starts failing after a LiteLLM bump, LITELLM.md > Chain
+    timeouts is out of date."""
     stall, fast = _Stub("stall"), _Stub("ok", "order-2")
 
     async def run():

@@ -1,0 +1,26 @@
+# reasoning_kw -- math / science / multi-step keywords, for the `default`
+# ruleset's `reasoning-text` evaluator.
+#
+# The only copy: this file is the source of truth. It is part of every
+# ruleset version that references it (its content, not these comments, is
+# inlined and hashed), so an edit here needs a ruleset `version` bump.
+#
+# No `method`: whole-word literals, case-insensitive.
+name: reasoning_kw
+operator: OR
+case_sensitive: false
+keywords:
+  - prove
+  - proof
+  - derive
+  - theorem
+  - integral
+  - derivative
+  - probability
+  - equation
+  - algebra
+  - geometry
+  - physics
+  - chemistry
+  - step by step
+  - show your work

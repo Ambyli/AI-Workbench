@@ -12,8 +12,7 @@ cannot publish its own port. **`ai/edge`** is a small HAProxy that publishes
 those ports instead and forwards to whichever copies are healthy. It also
 fronts three recreate-class APIs so their restarts answer `503` instead of
 refusing connections, filters LAN clients by source address, limits
-concurrent requests per API key on LiteLLM's LAN port, gives the semantic
-router a LiteLLM address that never disappears during a swap, exports
+concurrent requests per API key on LiteLLM's LAN port, exports
 Prometheus metrics and a read-only status page, and serves LiteLLM over TLS
 with a Let's Encrypt certificate that its companion `edge-certs` container
 keeps renewed ([TLS](#tls)).
@@ -27,7 +26,6 @@ Config: [`haproxy.cfg`](haproxy.cfg). Image tag: `EDGE_HAPROXY_VERSION` in `.env
   - [LAN allow-list](#lan-allow-list)
   - [Per-key concurrency limit](#per-key-concurrency-limit)
   - [When no copy is healthy: 503](#when-no-copy-is-healthy-503)
-  - [The semantic router's internal listener](#the-semantic-routers-internal-listener)
   - [Metrics](#metrics)
   - [Status page](#status-page)
   - [What is deliberately not behind the edge](#what-is-deliberately-not-behind-the-edge)
@@ -67,7 +65,7 @@ line per service and exits non-zero at the first failure.
 | Class | Applies to | What happens | Status line |
 |---|---|---|---|
 | **swap** | labelled `com.zeo.deploy: swap` | Side-by-side swap, below | `swap -> <name>-<hash> (replacing …)` or `up to date (<name>-<hash>)` |
-| **oneshot** | `restart` is `no` or unset (`vllm-sr-models-init`, `lake-s3-init`, `trino-auth-init`) | `up -d --no-deps`, then `docker wait`. A non-zero exit stops the deploy and prints the logs. | `oneshot` |
+| **oneshot** | `restart` is `no` or unset (`lake-s3-init`, `trino-auth-init`) | `up -d --no-deps`, then `docker wait`. A non-zero exit stops the deploy and prints the logs. | `oneshot` |
 | **recreate** | everything else, by default | `up -d --no-deps <svc>`, exactly as before: compose recreates it only if its config or image changed | `recreate (downtime): <reason>`, or `recreate-class, unchanged …` when compose will leave it alone |
 
 A swap-labelled service still falls back to recreate, with the reason printed,
@@ -149,8 +147,8 @@ For service `S`:
    services the edge fronts (`classifier`, `sandbox-runner`, `detector`) are
    recreated exactly as before; `make up` never asks the edge about them.
 6. **Retire the old copy.** `docker stop` honours the service's
-   `stop_grace_period`, so in-flight requests finish (900 s for `litellm`,
-   `oauth2-proxy` and `vllm-sr-router`). Then `docker rm`.
+   `stop_grace_period`, so in-flight requests finish (900 s for `litellm`
+   and `oauth2-proxy`). Then `docker rm`.
 
 **Why callers see no errors during the swap:**
 
@@ -162,9 +160,6 @@ For service `S`:
 - **From the LAN,** traffic goes through the edge. The old copy fails its
   HAProxy health check, and `retry-on conn-failure` plus `option redispatch 1`
   resend a refused connection to the new copy.
-- **From the semantic router's Envoy,** traffic to LiteLLM goes through the
-  edge's internal listener too, see
-  [The semantic router's internal listener](#the-semantic-routers-internal-listener).
 
 Only a failed *connection* is retried, never a request that reached a server.
 Nothing runs twice.
@@ -194,8 +189,9 @@ environment, such as roofix's `.env` setting if it was exported, does nothing.
 | madlad | `madlad-api` | `madlad-app`: GPU |
 | sandbox | `sandbox-proxy`, `sandbox-egress` | `sandbox-db`: Postgres. `sandbox-runner`: an in-process slot semaphore, and its reaper would reap the other copy's sandboxes. Its port is published by the edge, which answers `503` while it restarts. |
 | trino | `trino-mcp`, `superset` | `*-db`: Postgres. `lake-s3`: data directory. `hive-metastore`: migrates on start, and Trino caches its thrift connection. `trino-coordinator`: a cluster has one coordinator. The two `*-init` services are oneshot. |
-| semantic-router | `vllm-sr-router`, `vllm-sr-envoy` | `vllm-sr-dashboard`: host port. `vllm-sr-models-init` is oneshot. |
 | supabase | `supabase-api`, plus `auth`, `rest`, `storage`, `imgproxy`, `meta`, `studio`, `functions` (all as `supabase-<svc>-<hash>`) | `supabase-db`: Postgres. `realtime`: a logical replication slot. `supavisor`: migrates on start, and its TCP pooler ports. |
+| signals | `signals` | — |
+| route-policy | `route-policy` | `route-policy-db`: Postgres. |
 | vllm, llama, unsloth | — | GPU or RAM, and host ports |
 | detector | — | `detector`: GPU. Its port is published by the edge, which answers `503` while it restarts or loads its model. |
 | classifier | — | `classifier-db`: Postgres. `classifier`: on startup, `recover()` requeues the running copy's jobs (`ai/classifier/jobs/queue.py`). Its port is published by the edge, which answers `503` while it restarts. |
@@ -217,7 +213,12 @@ Both find the container by its compose labels.
 ## The edge
 
 One `edge` container on `ai_shared`, running `haproxy:<EDGE_HAPROXY_VERSION>-alpine`
-(3.4 LTS, pinned to a patch tag). It publishes the ports below with the same
+(3.4 LTS, pinned to a patch tag). `EDGE_HAPROXY_VERSION` is the tag without
+the suffix: a patch tag of the current LTS branch, never `lts` or `latest`,
+which move and are never re-pulled once cached. The compose file appends
+`-alpine` on purpose: the alpine flavour brings the busybox `wget` that the
+compose healthcheck and `deploy.py`'s stats read (`docker exec edge wget …`)
+use. A bump is `make up edge` (a recreate). It publishes the ports below with the same
 `PORT_*` variable and the same bind address (all interfaces) the services used
 before. It does not mount `docker.sock`, so `sandbox-runner` stays the only
 container that does.
@@ -237,7 +238,8 @@ service over TLS, [TLS](#tls)):
 | `PORT_SANDBOX_PROXY` 8011 | 8011 | `sandbox-proxy:80` | `GET /health` | swap | 300 s |
 | `PORT_SUPERSET` 8016 | 8016 | `superset:8088` | `GET /health` | swap | 300 s |
 | `PORT_SUPABASE_API` 8022 | 8022 | `supabase-api:8000` | TCP connect | swap | 300 s |
-| `PORT_SEMANTIC_ROUTER` 8025 | 8025 | `vllm-sr-envoy:8899` | TCP connect | swap | 900 s |
+| `PORT_SIGNALS` 8025 | 8025 | `signals:8000` | `GET /health` (503 until every model is loaded and warmed) | swap | 75 s |
+| `PORT_ROUTE_POLICY` 8027 | 8027 | `route-policy:8000` | `GET /health` | swap | 300 s |
 | `PORT_CLASSIFIER` 8005 | 8005 | `classifier:8000` | `GET /health` | **recreate** | 600 s |
 | `PORT_SANDBOX_RUNNER` 8012 | 8012 | `sandbox-runner:8000` | `GET /health` | **recreate** | 300 s |
 | `PORT_DETECTOR` 8021 | 8021 | `detector:8000` | `GET /health` (503 until the model is loaded) | **recreate** | 120 s |
@@ -248,7 +250,6 @@ as `edge:<port>` from `ai_shared`:
 | Listener | Section | Used by | Filtered? |
 |---|---|---|---|
 | `127.0.0.1:8404` `/stats` | `frontend stats` | `deploy.py` (stats CSV through `docker exec`), the compose healthcheck | — |
-| `:14000` | second bind of `listen litellm` (`name internal`) | `vllm-sr-envoy`'s four chain clusters | no allow-list, no per-key limit |
 | `:8405` `/metrics` | `frontend metrics` | the litellm stack's `prometheus` | — |
 | `:8407` `/edge/`, `/edge/raw/` | `frontend status` | oauth2-proxy → `chat.zeoenergy.com/edge/` (status page; raw HAProxy report under `raw/`) | — |
 | `/run/haproxy-api/admin.sock` (UNIX socket, `level admin`) | `global` `stats socket` | `edge-certs`, through the `edge_api` volume, to push a renewed certificate | not a network listener |
@@ -258,16 +259,21 @@ as `edge:<port>` from `ai_shared`:
   side of the mapping moves; `haproxy.cfg` does not change.
 - **The first bind is the LAN bind.** `deploy.py`'s `parse_edge_listens` reads
   only the first `bind` of each `listen` section; litellm's `:4443` (`lan-tls`)
-  and `:14000` (`internal`) are later binds, so it still reports `4001`. Internal-only listeners are `frontend`
-  sections, so `deploy.py` never takes them for services.
-- **Health checks.** They copy each service's own compose healthcheck. The two
-  Envoy gateways get a TCP check because every route needs a key.
+  is a later bind, so it still reports `4001`. Internal-only listeners are
+  `frontend` sections, so `deploy.py` never takes them for services.
+- **Health checks.** They copy each service's own compose healthcheck. The
+  Supabase Envoy gateway gets a TCP check because every route needs a key.
 - **Address resolution.** Each section resolves `<service>` through Docker DNS
   (`127.0.0.11`) every second. `server-template app 3` holds up to three
   copies; `init-addr none` lets the edge start before the services exist.
 - **Timeouts.** The default `timeout server` and `timeout client` are 300 s.
-  `litellm`, `oauth2-proxy` and `vllm-sr-envoy` get 900 s, because an `auto`
-  turn can be silent for 870 s. The recreate-class APIs are sized from their
+  `litellm` and `oauth2-proxy` get 900 s, Open WebUI's own outermost limit: a
+  long reasoning answer, or a non-streamed request, can be silent for minutes
+  (the chain deployments' per-read timeouts are 240 s local and 300 s
+  Claude). `signals` gets 75 s: route-policy's calls end at their 80 ms
+  deadline, and a debugging request with no deadline is capped by the
+  sidecar itself at 60 s (`common.signals` `MAX_DEADLINE_MS`), so the edge
+  is never what cuts one. The recreate-class APIs are sized from their
   longest request: a classifier submit fetches every `type: "url"` document one
   after another, each bounded by its 120 s fetch timeout (600 s); a
   sandbox-runner spawn waits up to 30 s for readiness and `exec` is capped at
@@ -280,10 +286,10 @@ as `edge:<port>` from `ai_shared`:
 ports, such as Claude Code at `localhost:4001`, curl, and DBeaver for Superset.
 Container-to-container traffic does not: Open WebUI → `litellm:4000`,
 cloudflared → `oauth2-proxy:4180`, oauth2-proxy → `superset:8088`, the
-LiteLLM pass-throughs → `classifier:8000` / `detector:8000`, and so on all go
+LiteLLM pass-throughs → `classifier:8000` / `detector:8000`, route-policy →
+`signals:8000`, and so on all go
 straight to the service by DNS. Public chat traffic (cloudflared →
-oauth2-proxy) never touches the edge. Two internal callers do, on purpose:
-the semantic router's Envoy reaches LiteLLM through `edge:14000`, and
+oauth2-proxy) never touches the edge. One internal caller does, on purpose:
 oauth2-proxy reaches the status page at `edge:8407`.
 
 **What backends see.** For edge traffic, the TCP peer is now the edge's
@@ -331,14 +337,14 @@ nothing else.
   the box's LAN address is DNAT-ed by iptables instead and keeps its real
   source address, which is what the `10/8` and `192.168/16` entries are for.
   The 403 body prints the address HAProxy saw, which makes this easy to check.
-- **Internal listeners are never filtered.** litellm's `:14000` (the semantic
-  router comes from an `ai_shared` address), `:8404`, `:8405` and `:8407` have no
-  allow-list. On litellm's section, where all three binds share rules, the
-  reject is limited to the LAN binds by `so_name` (the `name lan` and
-  `name lan-tls` labels: `acl lan_bind so_name -m str lan lan-tls`), not by
-  `dst_port`: HAProxy reports the pre-DNAT destination port for a connection
-  that came through iptables, which would be the operator's `PORT_LITELLM`,
-  not 4001.
+- **Internal listeners are never filtered.** `:8404`, `:8405` and `:8407`
+  are `frontend` sections with no allow-list. Every bind of a `listen`
+  section is a LAN bind, so its rules need no scoping. Should a section ever
+  get an internal bind again (a `name internal` bind sharing the section),
+  its LAN-only rules must be scoped by `so_name` (`acl lan_bind so_name -m str
+  lan lan-tls`), not by `dst_port`: HAProxy reports the pre-DNAT destination
+  port for a connection that came through iptables, which would be the
+  operator's `PORT_LITELLM`, not 4001. `test_deploy.py` checks both shapes.
 - **Changing it** changes the edge's compose environment, so `make up edge`
   recreates the edge (a second or two of downtime), not a hitless reload.
 
@@ -369,24 +375,25 @@ error.
   stopping one runaway script from flooding the chains, and the Claude
   overflow behind them, on its own. Raise it if a fan-out client (Claude Code
   subagents) hits 429s.
-- **LAN clients only.** Open WebUI, n8n, roofix and the semantic router call
-  LiteLLM without the LAN port (`litellm:4000`, or the edge's internal
-  `:14000`), so they are never limited here. Per-user and per-key budgets for
-  them belong in LiteLLM's virtual keys.
+- **LAN clients only.** Open WebUI, n8n and roofix call LiteLLM at
+  `litellm:4000`, without the LAN port, so they are never limited here.
+  Per-user and per-key budgets for them belong in LiteLLM's virtual keys.
 - **Changing it** recreates the edge, like the allow-list.
 
 ### When no copy is healthy: 503
 
 When every server of a section is down — a recreate-class service
-restarting, a detector still loading its model, a swap that failed, a service
+restarting, a detector or the signals sidecar still loading its models, a
+swap that failed, a service
 not running at all — the edge answers `503` with `Retry-After: 10` and a short
 message naming the service, instead of HAProxy's generic page. The default
 (in `defaults`, for browser-facing sections) is plain text built from
 `%[be_name]`, e.g. `searxng has no healthy copy right now: it is restarting or
 being deployed. Retry in a few seconds.` API sections override it with JSON in
-the shape their callers expect: OpenAI-style `{"error": {…}}` for `litellm`
-and `vllm-sr-envoy`, FastAPI-style `{"detail": "…"}` for `classifier`,
-`sandbox-runner`, `detector`, `kokoro-api` and `madlad-api`, `{"message": "…"}`
+the shape their callers expect: OpenAI-style `{"error": {…}}` for
+`litellm`, FastAPI-style `{"detail": "…"}` for `classifier`,
+`sandbox-runner`, `detector`, `kokoro-api`, `madlad-api`, `route-policy` and
+`signals`, `{"message": "…"}`
 for `supabase-api`.
 
 That is why `classifier` (`8005`), `sandbox-runner` (`8012`) and `detector`
@@ -394,33 +401,6 @@ That is why `classifier` (`8005`), `sandbox-runner` (`8012`) and `detector`
 `make up` that recreates one, a client gets a `503` it can retry rather than
 "connection refused". Same host port, same URL; their compose files no longer
 have `ports:` and keep `container_name`.
-
-### The semantic router's internal listener
-
-`vllm-sr-envoy` forwards each routed `auto` request to LiteLLM. Its
-`envoy.yaml` is generated by vllm-sr from `ai/semantic-router/config.yaml`, and
-the generator turns each `base_url` host into a `LOGICAL_DNS` cluster, which
-uses **one** resolved address at a time and re-resolves about every 5 s. With
-`base_url: http://litellm:4000/v1`, that one address could be the LiteLLM copy
-a swap was retiring, so a routed request could fail for up to one DNS refresh.
-
-The four `backend_refs` now say `base_url: http://edge:14000/v1`. Envoy pins
-the **edge's** address, which never changes during a LiteLLM swap, and the edge
-health-checks every LiteLLM copy and retries a refused connection on another.
-`:14000` is a second `bind` of `listen litellm`, so it shares the backend, the
-health checks and the 900 s timeouts (above Envoy's 840 s listener timeout;
-`unit-tests/litellm/test_timeouts.py` enforces the nesting). It is never
-published, and it is exempt from the allow-list and the per-key limit: every
-routed turn carries the same `SEMANTIC_ROUTER_LITELLM_KEY` from an `ai_shared`
-address. The re-rendered `envoy.yaml` and the reason are in
-[SEMANTIC_ROUTER.md § Request path](../semantic-router/SEMANTIC_ROUTER.md#request-path).
-
-The price is that routed `auto` turns now need the edge. A `make up edge`
-**reload** is hitless; an edge **recreate** (a change to its compose file or
-an `EDGE_*` variable) makes Envoy's upstream disappear for a second or two.
-LiteLLM's `auto` alias treats that like a router outage and answers from its
-`fallbacks: [local-private]`
-([SEMANTIC_ROUTER.md § The privacy guarantee](../semantic-router/SEMANTIC_ROUTER.md#the-privacy-guarantee--and-the-router-down-path)).
 
 ### Metrics
 
@@ -436,7 +416,7 @@ above), queue and response times.
 
 `prometheus` itself now sits on `ai_shared`. It used to have no `networks:`
 block, which left it on its stack's default network only, where none of its
-targets (`litellm`, `classifier`, `detector`, `vllm-sr-router`) live. It stays
+targets (`litellm`, `classifier`, `detector`, `route-policy`, `signals`) live. It stays
 recreate-class: its TSDB is locked by one process. (Its `litellm` job can
 reach `litellm:4000` now, but LiteLLM serves `/metrics` only with the
 `prometheus` success callback enabled, which this repo does not do — expect
@@ -494,7 +474,6 @@ health, no secrets.
 | `8014` `8015` | lake-s3 | S3 API with SigV4 signatures over the Host header, and large streamed uploads; recreate-class (data directory). The console is behind oauth2-proxy at `/rustfs/` already. |
 | `8007` | openwebui | Bound to `127.0.0.1` on purpose: its trusted-header SSO trusts whoever reaches it, and the loopback bind is part of that trust model (`openwebui/docker-compose.openwebui.yml`). Routing it through a container on `ai_shared` would widen who can reach it. |
 | `9090` | prometheus | Recreate-class (TSDB lock), operator-only, and the scraper of the edge itself. |
-| `8026` | vllm-sr-dashboard | `127.0.0.1` only, behind a compose profile. |
 
 ---
 
@@ -570,11 +549,10 @@ edge-certs  (certbot/dns-cloudflare:v5.8.0 + ai/edge/certs/)
   `bind :4443 name lan-tls ssl crt /certs/edge.pem alpn h2,http/1.1`,
   published as `${PORT_LITELLM_TLS:-443}:4443`: host port 443, while the
   listener inside the container stays `:4443`, like every other fixed edge
-  listener. It is a **LAN bind**: the
-  `EDGE_ALLOWED_CIDRS` 403 and the per-key limit are keyed on
-  `acl lan_bind so_name -m str lan lan-tls`, so they apply to it exactly as to
-  4001, and a key's requests on both ports share one count. The internal
-  `:14000` bind stays exempt. ALPN offers HTTP/2 and HTTP/1.1. HAProxy talks
+  listener. It is a **LAN bind**: the section's `EDGE_ALLOWED_CIDRS` 403 and
+  per-key limit apply to every bind, so they apply to it exactly as to 4001,
+  and a key's requests on both ports share one count. ALPN offers HTTP/2 and
+  HTTP/1.1. HAProxy talks
   HTTP/1.1 to LiteLLM either way, and a streamed (SSE) answer is forwarded
   chunk by chunk over both. `deploy.py` still reads the first bind (`lan`,
   4001).
@@ -622,6 +600,10 @@ edge-certs  (certbot/dns-cloudflare:v5.8.0 + ai/edge/certs/)
 - **Staging first.** `EDGE_TLS_STAGING` defaults to `1`, Let's Encrypt's
   staging CA: the same DNS-01 flow, far higher rate limits, but an untrusted
   certificate. Only the literal `0` asks for production.
+- **Account e-mail.** `EDGE_TLS_EMAIL` registers the Let's Encrypt account
+  with `-m <address> --no-eff-email`; empty registers it with
+  `--register-unsafely-without-email` (Let's Encrypt no longer sends expiry
+  mail, so nothing is lost).
 - **Turned off.** With `EDGE_TLS_DOMAIN` or the token empty, `edge-certs`
   writes a self-signed placeholder for `localhost` (if no certificate file
   exists yet), logs one line (`TLS certificates are off: …`), and idles,
@@ -747,18 +729,16 @@ root, unless they say otherwise.
    HAProxy's request log the frontend field reads `litellm` for plain HTTP and
    `litellm~` for TLS, so
    `docker logs --since 24h edge 2>&1 | grep ' litellm litellm/'` lists the
-   plain-HTTP requests (ignore the semantic router's, which come from an
-   `ai_shared` address through `:14000`). Then, in one change:
-   - in `haproxy.cfg`, delete `bind :4001 name lan`, rename the TLS bind to
+   plain-HTTP requests. Then, in one change:
+   - in `haproxy.cfg`, delete `bind :4001 name lan` and rename the TLS bind to
      `bind :4443 name lan ssl crt /certs/edge.pem alpn h2,http/1.1` (a
      section's first bind must be `name lan`: `deploy.py` and the
-     repo-invariant tests read it), and set `acl lan_bind so_name -m str lan`
-     (the tests require it to list exactly the section's LAN bind names);
+     repo-invariant tests read it);
    - in `docker-compose.edge.yml`, replace the `${PORT_LITELLM}:4001` and
      `${PORT_LITELLM_TLS:-443}:4443` lines with one
      `${PORT_LITELLM_TLS:-443}:4443`;
-   - update the `PORT_LITELLM` rows of `.env.example`, `CLAUDE.md` and
-     `ai/AI_INFRA.md`;
+   - update the `PORT_LITELLM` rows of `.env.example`, `ai/edge/CLAUDE.md`
+     and `ai/AI_INFRA.md`;
    - `make up edge` (a recreate, since the published ports changed).
 
 ### Updating certs
@@ -938,9 +918,9 @@ bind :<port> name lan-tls ssl crt /certs/edge.pem alpn h2,http/1.1
 
 Then add one `ports:` entry in `docker-compose.edge.yml`, with a new
 `PORT_*_TLS` variable in the `PORT REGISTRY`, and run `make up edge` (a
-recreate, since the published ports change). In a section whose rules are
-limited to the LAN with `lan_bind` (only `litellm` today), the acl already
-lists `lan-tls`. Every other section's allow-list applies to all of its binds.
+recreate, since the published ports change). A section's allow-list (and,
+on `litellm`, the per-key limit) applies to all of its binds, the new one
+included.
 If the service has its own hostname, that name has to be on the certificate
 too, and `edge-certs` does not do that yet: it requests exactly one name.
 
@@ -973,7 +953,7 @@ Against the real binaries, in WSL, on 2026-10-14:
   like the image:
   - TLS on 4443 with ALPN `h2` and `http/1.1`, and SSE chunks arriving one
     second apart over HTTP/2;
-  - the 403 on 4443 with only `10/8` allowed, while `:14000` still answered;
+  - the 403 on 4443 with only `10/8` allowed;
   - the per-key limit counting one key across 4001 and 4443, and across
     HTTP/2 streams on one connection;
   - the socket created `99:99 0660`;
@@ -1020,8 +1000,8 @@ fronts has been deployed once. Do it in one sitting:
 2. **Mirror `.env.example` into `.env`:** `EDGE_ALLOWED_CIDRS` and
    `EDGE_LITELLM_MAX_CONCURRENT_PER_KEY` in the Edge section, and
    `,http://edge:8407/edge/` appended to `OAUTH2_PROXY_UPSTREAMS`. Do not add
-   an n8n entry there: n8n runs on its own subdomain because its subpath mode
-   is broken upstream.
+   an n8n entry there: n8n is not exposed, and its subpath mode is broken
+   upstream.
 3. **Dry run.** Run `make up <stack> DRY_RUN=1` for each stack below and read
    the plan. The first real run of every swap service is always a swap: the new
    label and the removed `container_name`/`ports` change its config hash.
@@ -1040,7 +1020,6 @@ fronts has been deployed once. Do it in one sitting:
    make up detector
    make up sandbox
    make up trino
-   make up semantic-router
    make up supabase
    ```
    Each swap service comes up without a host port, and its old container frees
@@ -1058,10 +1037,6 @@ fronts has been deployed once. Do it in one sitting:
 - **LAN clients.** From the moment each old copy retires in step 4 until
   `make up edge` binds its port, LAN clients get "connection refused" on that
   port: seconds, if you run the steps back to back.
-- **Routed `auto` turns.** From `make up semantic-router` until `make up edge`,
-  Envoy's upstream (`edge:14000`) does not exist yet; LiteLLM's `auto` falls
-  back to `local-private` for that window, as it does whenever the router is
-  down.
 - **Public chat.** No gap. cloudflared → oauth2-proxy → openwebui goes over
   Docker DNS.
 - **The edge itself.** `make up edge` fails with "port is already allocated"
@@ -1077,8 +1052,6 @@ fronts has been deployed once. Do it in one sitting:
 
 **Rolling back.** Run `make clean edge`, revert the compose changes, and
 `make up <stack> RECREATE=1` for each stack. The old `ports:` come back.
-Revert `ai/semantic-router/config.yaml` + `envoy.yaml` too, or routed `auto`
-turns fall back to `local-private` with no edge to reach.
 
 ### Upgrading an edge that is already running
 
@@ -1093,17 +1066,12 @@ make up classifier             # recreate without ports: frees 8005
 make up detector               # recreate without ports: frees 8021
 make up sandbox                # sandbox-runner recreated without ports: frees 8012
 make up edge                   # recreate: new ports, new environment, new haproxy.cfg
-make up semantic-router FORCE=1  # Envoy loads the re-rendered envoy.yaml (edge:14000)
 make up litellm                # prometheus recreated onto ai_shared, edge scrape job
 make up oauth2-proxy           # picks up the new OAUTH2_PROXY_UPSTREAMS
 ```
 
 Between the first three steps and `make up edge`, those three ports refuse
-connections for a few seconds. `FORCE=1` on the semantic router is needed
-because Envoy's config reaches it through a named volume, which `deploy.py`
-does not hash: without it `vllm-sr-envoy` would report `up to date` and keep
-the old `litellm:4000` clusters in memory
-([SEMANTIC_ROUTER.md § Applying a config change](../semantic-router/SEMANTIC_ROUTER.md#applying-a-config-change)).
+connections for a few seconds.
 
 **Adding TLS to a running edge** needs nothing freed first: mirror
 `PORT_LITELLM_TLS` and the Edge TLS block of `.env.example` into `.env` (they
@@ -1182,43 +1150,27 @@ check.
 
 ## Limits
 
-- **Envoy does not drain.**
-  - `vllm-sr-envoy` and `supabase-api` are Envoy, and Envoy exits on SIGTERM
-    without draining. A request in flight on the *retiring* copy at that moment
-    fails; new requests already go to the new copy.
-  - `vllm-sr-router` is in the same position if it does not handle SIGTERM
-    gracefully. Every `auto` request holds an ext_proc stream to it.
-- **Envoy pins one upstream address — closed for LiteLLM, open for the router.**
-  `envoy.yaml` is generated, and its clusters are `LOGICAL_DNS`: one resolved
-  address at a time, re-resolved about every 5 s.
-  - **LiteLLM: closed.** The chain clusters point at `edge:14000`, not
-    `litellm:4000`, so a LiteLLM swap no longer fails routed `auto` requests
-    ([The semantic router's internal listener](#the-semantic-routers-internal-listener)).
-  - **`vllm-sr-router`: still open.** The ext_proc cluster is gRPC to
-    `vllm-sr-router:50051` and is left direct. When the router swaps, an `auto`
-    request can fail for up to one DNS refresh if Envoy's address was the
-    retiring copy; LiteLLM's `auto` fallback then answers it from
-    `local-private`.
-- **The `auto` path depends on the edge.** An edge recreate is a second or two
-  of routed turns falling back to `local-private`. Reloads are hitless.
-- **The per-key limit only sees LAN clients.** Open WebUI, n8n, roofix and the
-  semantic router never cross the LAN port. Budgets for them are LiteLLM
-  virtual-key settings.
+- **Envoy does not drain.** `supabase-api` is Envoy, and Envoy exits on
+  SIGTERM without draining. A request in flight on the *retiring* copy at that
+  moment fails; new requests already go to the new copy.
+- **The per-key limit only sees LAN clients.** Open WebUI, n8n and roofix
+  never cross the LAN port. Budgets for them are LiteLLM virtual-key
+  settings.
 - **Two cloudflared connectors during a swap.** The tunnel briefly has two
   connectors. Both are this exact container, with the same config and the same
   reachable origins, so this is not the "two connectors, one can't reach the
   origin" failure in [CLOUDFLARED.md](../cloudflared/CLOUDFLARED.md). It lasts
   only until the old copy retires.
-- **Long stops.** Retiring `litellm`, `oauth2-proxy` or `vllm-sr-router` can
-  take up to 900 s while long chats finish. `make up` waits for it.
+- **Long stops.** Retiring `litellm` or `oauth2-proxy` can take up to 900 s
+  while long chats finish. `make up` waits for it.
   - Verify that SIGTERM reaches the server: time a `docker stop` on an idle
     copy. A full grace-period wait on an idle container means the entrypoint
     does not forward signals; fix that with `exec` or `init: true`.
 - **Recreate-class services ignore bind-mount content, as before.** Only swap
   services hash it. After editing, for example, `ai/vllm/qwen_fixed_chat_template.jinja`,
   use `docker compose … up -d --force-recreate <svc>`. Volume content is not
-  hashed either: that is why a router config change needs
-  `make up semantic-router FORCE=1`.
+  hashed either: a swap service whose config reaches it through a named
+  volume needs `FORCE=1`.
 - **Directories that hash a lot.**
   - `searxng` mounts its whole folder, so any file there (even `SEARXNG.md`)
     triggers a swap.
@@ -1232,6 +1184,18 @@ check.
 - **New services are recreate by default.** Leave them unlabelled unless two
   copies can safely run at once: no singleton scheduler, no exclusive data
   directory or lock, no GPU, and no startup step that disturbs a running copy.
+  An unlabelled service also keeps its compose config hash unchanged, so
+  adding it does not make compose recreate anything.
+- **Optional labels for a recreate-class service** (read by `deploy.py`, not
+  only on the edge):
+  - `com.zeo.deploy.wait: healthy` makes `make up` wait for its healthcheck
+    after recreating it and fail loudly if it never passes.
+  - `com.zeo.deploy.reload: <signal>` + `com.zeo.deploy.reload.check: <command>`
+    are for config compose cannot see change (a bind mount): when compose
+    would leave the container running, `make up` runs the check inside it and
+    sends the signal only if the check passes; a failed check stops the deploy
+    and the old config keeps serving. The edge uses `USR2` + `haproxy -c -f …`
+    ([Changing haproxy.cfg](#changing-haproxycfg)).
 - **To make one swap-class:**
   - Add `labels: {com.zeo.deploy: swap}` and a healthcheck.
   - Remove `container_name`. Add `com.zeo.deploy.name: <prefix>` if the old
@@ -1273,8 +1237,7 @@ check.
      `make up litellm`. The mount content is part of the hash, so this now
      produces a new name and swaps.
    - Expect no `FAIL`, the stream completes, and `docker ps` shows
-     `litellm-<hash>` with the old copy gone. The `auto` chat now also survives
-     the swap: its Envoy hop goes through `edge:14000`.
+     `litellm-<hash>` with the old copy gone.
    - A second `make up litellm` prints `up to date`.
 5. **Failure path:** break the litellm config so its healthcheck fails, then
    `make up litellm`. Expect exit 1, the old copy still serving, and the new
@@ -1287,13 +1250,14 @@ check.
 8. **Allow-list:** from the box, `curl -s localhost:4001/health/liveliness`
    works (source `172.x`, inside `172.16.0.0/12`). Temporarily set
    `EDGE_ALLOWED_CIDRS="10.0.0.0/8"`, `make up edge`, and the same curl gets
-   `403 edge: 172.x.x.x is not in EDGE_ALLOWED_CIDRS`; an `auto` chat still
-   works (internal bind). Put it back and `make up edge`.
+   `403 edge: 172.x.x.x is not in EDGE_ALLOWED_CIDRS`; an `auto` chat in
+   Open WebUI still works (it never crosses the edge). Put it back and
+   `make up edge`.
 9. **Per-key limit:** with a throwaway key, start 9 concurrent streamed
    requests on `localhost:4001`; the 9th gets `429` with `Retry-After`. The same
    test on `auto` through Open WebUI is never limited.
 10. **Metrics and status:** `curl -s localhost:9090/api/v1/targets` shows the
-    `edge` job UP, and `classifier`, `detector` and `semantic-router` UP when
+    `edge` job UP, and `classifier`, `detector`, `route-policy` and `signals` UP when
     those services run. A `litellm` target that is DOWN with **HTTP 404** is not
     a network problem: LiteLLM mounts `/metrics` only when `prometheus` is in
     its `success_callback` list, which `litellm_config.yaml` does not set.

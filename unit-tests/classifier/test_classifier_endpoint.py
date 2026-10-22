@@ -13,6 +13,9 @@ What is pinned here:
   * the result shape — ``schema_version: 3``, one key set for every
     criterion whatever its type or status, ``page_geometry`` a list with one
     entry per item;
+  * a HEIC photo (an iPhone portrait, stored sideways) is one image item
+    with an upright page and base image — the decode details are in
+    test_image_formats.py;
   * the refusals at submit — the removed routes (404), and the validation
     400s that need the HTTP layer (the model-level rules are in
     test_criterion_options.py; the item cap and the multi-document shapes
@@ -303,6 +306,36 @@ def test_a_model_outage_fails_one_criterion_and_marks_the_job_incomplete(client,
     assert breakdown["partial"] is True
     assert list(breakdown["per_criterion"]) == ["sharpness"]
     assert breakdown["excluded"] == {"has a roof": "error"}
+
+
+def test_a_heic_photo_is_assessed_like_a_png(client, model):
+    """An iPhone portrait HEIC — stored sideways, rotated by its container
+    AND its EXIF tag — is one image item whose page (and stored base image)
+    is upright: the PNG fixture's 1000×1300, not 1300×1000 or upside down."""
+    import io
+
+    from PIL import Image
+
+    pytest.importorskip("pillow_heif")
+    raw = (DOCS / "photo_of_letter.heic").read_bytes()
+    job = _run_form(
+        client,
+        [{"name": "sharpness", "type": "cv"},
+         {"name": "has a company logo", "type": "llm", "options": {"hint": "presence"}}],
+        files={"file": ("IMG_0001.HEIC", raw, "image/heic")},
+    )
+    result = job["result"]
+    (document,) = result["documents"]
+    assert (document["kind"], document["pages"], document["items"]) == ("image", 1, [0])
+    assert document["document_info"]["content_type"] == "image/heic"
+    (geometry,) = result["page_geometry"]
+    assert (geometry["width"], geometry["height"]) == (1000, 1300)
+    entries = _entries(job)
+    assert entries["sharpness"]["status"] == "ok"
+    assert entries["has a company logo"]["status"] == "ok"
+    base = client.get(f"/jobs/{job['job_id']}/artifacts/p0.base.jpg")
+    assert base.status_code == 200, base.text
+    assert Image.open(io.BytesIO(base.content)).size == (1000, 1300)
 
 
 # ---------------------------------------------------------------------------

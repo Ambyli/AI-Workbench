@@ -452,9 +452,9 @@ def parse_edge_listens(text: str) -> dict:
 
     The section name is the compose service key it fronts (see the header of
     ai/edge/haproxy.cfg); its FIRST `bind` port is the default LAN port. A
-    later bind is internal and never published (litellm's `:14000 name
-    internal`, the semantic router's path to LiteLLM), so it is ignored, as
-    are `frontend` sections (stats, metrics, status page).
+    later bind is the same service over TLS (litellm's `:4443 name lan-tls`)
+    or an internal one, never the port deploy.py waits on, so it is ignored,
+    as are `frontend` sections (stats, metrics, status page).
     """
     out, current = {}, None
     for raw in text.splitlines():

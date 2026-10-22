@@ -1,6 +1,7 @@
 # Classifier API
 
-FastAPI service that assesses **documents** — JPEG/PNG photos, PDFs of any
+FastAPI service that assesses **documents** — JPEG/PNG/HEIC/HEIF/AVIF photos
+(an iPhone's HEIC as it comes), PDFs of any
 page count (native or scanned), SVG drawings, plain text, and .docx, several
 per request — against a list of criteria, each answered by an OpenCV detector,
 deterministic text matching, the open-vocabulary detector, or the vision LLM.
@@ -72,9 +73,21 @@ its log):
 The checked-in entries: **`muse-glimmer`** (the default — 3 images,
 `reasoning_strength: low`, budgets 8192 / 1024 / 2048 / 1024, 240 s, 6 in
 flight of its 8 sequences so 2 stay free for the LiteLLM chat chains, 60 000
-characters) and **`qwen2.5-vl`** (the `vllm-qwen-vl` service, the old manual
+characters), **`qwen2.5-vl`** (the `vllm-qwen-vl` service, the old manual
 fallback: 1 image so no references, no reasoning, budgets sized for its
-8192-token context). Check what a Muse request renders on the box:
+8192-token context), **`qwen3.5-4b`** (the CPU-only `qwen3.5-4b` llama.cpp
+service in [`ai/llama`](../llama/LLAMA.md#qwen35-4b--a-small-cpu-model-for-route-policy):
+text only, thinking off through `extra_body.chat_template_kwargs:
+{enable_thinking: false}`, a 512-token score budget = the server's
+`--n-predict`, 90 s, 2 in flight = its `--parallel 2`, 12 000 characters — the
+model route-policy's `llm_classifier` evaluator sends conversation transcripts
+to, one `text` document and one presence criterion per route; seconds per
+call, so not a document model) and **`qwen3.8-solo`** (the `qwen3.8-solo` vLLM
+service, order 1 of three LiteLLM chat chains: text only,
+`reasoning_effort: low`, budgets 8192 / 1024 / 2048 / 1024, 240 s, 60 000
+characters, and **1** in flight of its 3 sequences, because a queued
+classifier call makes the overflow hook spill chat off it — a benchmark
+candidate for the same evaluator). Check what a Muse request renders on the box:
 
 ```bash
 curl -s muse-glimmer:8000/tokenize -H 'content-type: application/json' \
@@ -83,7 +96,29 @@ curl -s muse-glimmer:8000/tokenize -H 'content-type: application/json' \
 ```
 
 Editing `models.yaml` on the box takes effect with `docker restart
-classifier` (it is bind-mounted read-only; compose cannot see the edit).
+classifier` (it is bind-mounted read-only over `/app/ai/classifier/models.yaml`;
+compose cannot see the edit, so it is a recreate-class change, not a swap). It
+is also baked into the image — the build's import check loads it, so an
+invalid registry fails `make build classifier`.
+
+More on the checked-in entries:
+
+- **`muse-glimmer`'s `max_concurrent: 6`** is 6 of its `--max-num-seqs 8`
+  because `muse-glimmer` is also in LiteLLM's chain aliases and the overflow
+  hook spills chat (eventually to Claude) once vLLM's waiting queue stays
+  non-empty. Watch `classifier_llm_call_seconds{kind, model}` before raising it.
+- **`qwen3.5-4b`** uses `reasoning: {style: none}` plus
+  `extra_body.chat_template_kwargs.enable_thinking: false`, because
+  `reasoning.value` is a string (it cannot carry the boolean); it sets
+  `json_mode`, and `timeout_s: 90`. It is route-policy's classifier — one
+  `text` document per job, never a document model — and route-policy's
+  `history.max_chars` (ruleset config) must stay at or under its
+  `text_char_budget` (12 000). Its `max_concurrent: 2` and score budget 512
+  change together with the llama.cpp service's `--parallel 2` /
+  `--n-predict 512` / `-c 32768`.
+- **`qwen3.8-solo`** is a benchmark candidate for that classifier at
+  `max_concurrent: 1`, so it never takes more than one of the 3 sequences chat
+  runs on (a queued request there makes the overflow hook spill chat).
 
 **Text-only models** (`vision: false`) score from the page's text layer
 alone: the scoring prompt carries no image and says so ("You are assessing
@@ -267,16 +302,33 @@ on `ai_shared`, host port `PORT_CLASSIFIER_DB` = 5439): the job queue
 history (`job_progress`, see [§ Progress](#progress)), saved references
 (`reference_examples`) and one row per model request (`llm_calls`). The
 stores share one asyncpg pool (`db.py`, `CLASSIFIER_MAX_CONCURRENT` + every
-model's `max_concurrent` + 8 connections). The database is the only store:
+model's `max_concurrent` + `DB_POOL_HEADROOM` (8, a `config.py` constant)
+connections — `db.pool_max()`; adding registry entries grows it, e.g. the
+`qwen3.5-4b` and `qwen3.8-solo` entries took Σ `max_concurrent` from 8 to 11
+and the pool by 3). The database is the only store:
 with `CLASSIFIER_DB_HOST` unset, or the database unreachable, the service
-refuses to start and says why. The same database is federated into Trino as
+refuses to start and says why. `CLASSIFIER_DB_HOST` (`classifier-db`) and the
+port are fixed in the compose file, never in `.env`; the credentials are
+`CLASSIFIER_DB_USER` / `_PASSWORD` / `_NAME` (all `classifier` — dev defaults,
+override the password before exposing `PORT_CLASSIFIER_DB` past the host), and
+the DSN is built with `urllib.parse.quote` on user and password, so any
+character is safe in them. Files live under `CLASSIFIER_DATA_DIR` (`/data`,
+fixed in the compose file) on the `classifier_data` volume. The same database is federated into Trino as
 the `postgres_classifier` catalog (read-only `trino_reader` role), so jobs,
 references and per-call cost can be queried from Trino and Superset. That
 role is created by `ai/classifier/db-init/10-trino-reader.sh` on the first
 start of an empty `classifier_db` volume, with
 `CLASSIFIER_TRINO_READER_PASSWORD` from `.env` (`openssl rand -hex 32`; empty
-skips it) — re-run the script by hand for an existing volume or to rotate the
-password. Files
+skips it with a log line, and only the Trino catalog breaks) — re-run the
+script by hand for an existing volume or to rotate the password: edit `.env`,
+`make up classifier` (so `classifier-db`'s env has it), `docker exec
+classifier-db sh /docker-entrypoint-initdb.d/10-trino-reader.sh`, then `make
+up trino` (the coordinator's env). The role is `pg_read_all_data` +
+`default_transaction_read_only`, with no `BYPASSRLS` (nothing here uses RLS);
+it reads every job result and reference, so treat its password as a real
+secret. The script is a `.sh` that must stay safe to SOURCE — the postgres
+entrypoint sources an init script that has no exec bit — so no `exit` and no
+`set`. Files
 stay on the `classifier_data` volume: queued payloads, artifact directories
 and reference files. A job's `result` column is `JSON`, not `JSONB` — JSONB
 sorts object keys, and `per_criterion_scores` lists criteria in request order.
@@ -496,7 +548,7 @@ those they need, so the same criteria list works across kinds.
 
 | Kind | Extensions | Detected by | Page image | Native text |
 |---|---|---|---|---|
-| `image` | `.jpg` `.jpeg` `.png` | magic bytes `FF D8 FF` / `89 50 4E 47 0D 0A 1A 0A` | yes (EXIF-rotated) | no — needs OCR |
+| `image` | `.jpg` `.jpeg` `.png` `.heic` `.heif` `.avif` | magic bytes `FF D8 FF` / `89 50 4E 47 0D 0A 1A 0A`; HEIC / HEIF / AVIF by the brands of the leading ISO-BMFF `ftyp` box ([below](#heic--heif--avif)) | yes (rotated upright once) | no — needs OCR |
 | `pdf` | `.pdf` | `%PDF-` in the first 1 KB | yes, every page rendered at `CLASSIFIER_PDF_RENDER_DPI` (150) | yes when the PDF is digital; a scan has none |
 | `svg` | `.svg` | UTF-8 XML whose first element is `<svg>` / `<prefix:svg>` (after any XML declaration, comments, DOCTYPE) — checked **before** `txt` | yes, rendered by MuPDF at `CLASSIFIER_PDF_RENDER_DPI`, scaled down to at most 25 000 000 pixels | yes — its `<text>` elements (never its markup) |
 | `txt` | `.txt` | decodes as UTF-8 (BOM ok), no NUL bytes, mostly printable | **no** | yes |
@@ -505,15 +557,49 @@ those they need, so the same criteria list works across kinds.
 **Detection is by content, never by filename or `Content-Type`.** A PDF
 uploaded as `image/png` still loads as a PDF. The declared content type of a
 multipart part is only used for an early allowlist reject (`image/jpeg`,
-`image/png`, `image/svg+xml`, `application/pdf`, `text/plain`, the .docx type,
+`image/png`, `image/heic`, `image/heif`, `image/avif`, `image/svg+xml`,
+`application/pdf`, `text/plain`, the .docx type,
 `application/octet-stream`, and `application/msword` — the last one only so a
 legacy `.doc` reaches the magic-byte check and gets its specific "convert to
 .docx" 400). The kind is detected on the `POST /assess` request itself, per
 document, so an unsupported file is a 400 at submit time (naming the document,
-`document #1 old.doc: …`) and never becomes a job.
+`document #1 old.doc: …`) and never becomes a job. Three near-misses get a
+message of their own: a legacy `.doc` (convert to .docx), gzip / `.svgz`
+(decompress to .svg), and a video — an MP4 or MOV, such as the `.MOV` half of
+an iPhone Live Photo — which is told to send the still photo instead.
 
 `GET /document-kinds` returns this table live from a running container, plus
-the OCR engine's actual availability.
+the OCR engine's actual availability and, under the image kind's `formats`,
+which image formats this container can decode.
+
+### HEIC / HEIF / AVIF
+
+An iPhone saves photos as HEIC; they are accepted wherever a JPEG is
+(`/assess`, `/references`), as the same one-item `image` kind:
+
+* **Detection** reads the brands of the file's leading ISO-BMFF `ftyp` box
+  (`common.documents.image_format`): a HEIC brand (`heic`, `heix`, `hevc`, …)
+  anywhere wins — a Samsung photo is major `mif1` with compatible `heic` —
+  then an AVIF brand (`avif`, `avis`), then a generic HEIF one (`mif1`,
+  `msf1`). An `ftyp` with none of them is a video, refused as above.
+  `documents[].document_info.content_type` is `image/heic`, `image/heif` or
+  `image/avif` accordingly.
+* **Decoding**: HEIC/HEIF through
+  [pillow-heif](https://pillow-heif.readthedocs.io/), AVIF through Pillow's
+  own plugin (≥ 11.3). Both are checked when the image is built
+  (`available_image_formats()`), so a container that cannot decode them
+  fails its build, not its first photo.
+* **Primary image only.** Burst frames, depth maps, thumbnails and HDR gain
+  maps are ignored, and a 10/12-bit image is reduced to 8-bit.
+* **Orientation is applied once.** A HEIF says how to turn its pixels in the
+  container (`irot` / `imir`) and an iPhone writes the EXIF orientation tag
+  too; the decoder applies the container's rotation and mirroring exactly
+  once, so the page — and `p{n}.base.jpg`, and every region — is upright.
+* Everything downstream sees a decoded array, re-encoded as JPEG / PNG (the
+  vision prompt, `p{n}.base.jpg`, reference images, detector requests), so
+  nothing after the decode knows the upload was a HEIC. The one exception
+  is the [SVG image inliner](#external-references-in-svg), which forwards
+  original bytes and so still takes PNG or JPEG only.
 
 ### Limitations
 
@@ -571,13 +657,15 @@ network for its input:
 | Bound | Knob (default) |
 |---|---|
 | Distinct URLs fetched per SVG; the rest are blanked with an `over the 10-image limit` warning | `CLASSIFIER_SVG_FETCH_MAX_IMAGES` (10) |
-| Bytes per image; a bigger body is abandoned mid-download | `CLASSIFIER_SVG_FETCH_MAX_BYTES` (5 000 000) |
-| Seconds per image, start to finish (every SVG's images in a request are fetched concurrently) | `CLASSIFIER_SVG_FETCH_TIMEOUT_S` (10) |
+| Bytes per image; streamed, a bigger body is abandoned mid-download (or refused up front when `Content-Length` says so) | `CLASSIFIER_SVG_FETCH_MAX_BYTES` (5 000 000) |
+| Seconds per image, start to finish — a wall-clock deadline, so a server dripping a byte a second still trips it (every SVG's images in a request are fetched concurrently, so this is also roughly the latency they add to a submit) | `CLASSIFIER_SVG_FETCH_TIMEOUT_S` (10) |
 
 Every URL goes through `common.net.fetch_url`: the same SSRF blocklist as a
 `type: "url"` document, http(s) only, **no redirects** (a 3xx could point past
 the check), and the body must be a PNG or JPEG by its bytes — not a nested SVG,
-not an HTML error page. A link that fails any of that is **blanked** (drawn as
+not an HTML error page, and not a HEIC / AVIF either (MuPDF draws only JPEG
+and PNG `data:` images, though the same file uploaded as a document of its
+own is fine). A link that fails any of that is **blanked** (drawn as
 nothing, as before) and becomes a warning naming why; it never fails the
 request:
 
@@ -1115,6 +1203,25 @@ every type through the pipeline and fails if a `detail` carries a key its
 declaration does not list or misses one it requires; it also checks that each
 type's spec is the one its own evaluator declares.
 
+**Declaring a shape.** The standard is: declare it next to the code that
+produces it, and register it under the key its consumers look it up by.
+
+- An OpenCV detector's `detail` is declared with `@describes(DetectorSpec(...))`
+  on the detector function (`ai/classifier/cv/result.py`); the detector
+  `REGISTRY` is the lookup and `GET /cv-detectors` serves it.
+  `unit-tests/classifier/test_cv_measurements.py` runs every detector.
+- A criterion type's `detail` is declared with `@result_spec(ResultSpec(...))`
+  on that type's evaluator (`analysis/{llm,text,detector,cv}_eval.py`); it
+  registers by type name in `analysis/result_specs.py`, which the aggregator,
+  the scheduler and `GET /criterion-types` look up by. A new type's module is
+  also listed once in `result_specs._DECLARING_MODULES`.
+- `detail.reference` is ONE shared declaration, `REFERENCE_FIELD` in
+  `analysis/result_specs.py`, listed on `LLM_RESULT` only.
+
+Both tests fail on an undeclared key, a missing required key, or a wrong
+`metric` / `value`. Adding a detector, a criterion type, or a key to an
+existing `detail` updates its declaration in the same change.
+
 ### Dependencies
 
 `depends_on` names another **scored** criterion, and is gated **per item**:
@@ -1155,7 +1262,8 @@ llm.
 
 ## References
 
-A **reference** is a stored, reviewed example: ONE page — a JPEG/PNG, an SVG, or one
+A **reference** is a stored, reviewed example: ONE page — a JPEG/PNG/HEIC/HEIF/AVIF
+photo, an SVG, or one
 page of a PDF — with the criteria asked of it, the answer each one should get
 (`score`, `verdict`, `reason`) and where on the page the feature is. An
 `/assess` that lists references shows the vision model those examples **beside
@@ -1197,7 +1305,7 @@ JSON, or multipart parsed into the same model (`api.reference_schemas.ReferenceR
 
 | Field | Description |
 |---|---|
-| `document` + `page` | The example page: base64, URL (SSRF-checked, fetched at submit) or — refused — inline text. A JPEG/PNG or an SVG (page `0`), or page `page` (0-based, default 0) of a PDF. `.txt` / `.docx` are a 400: a reference is shown to the model as an image |
+| `document` + `page` | The example page: base64, URL (SSRF-checked, fetched at submit) or — refused — inline text. A JPEG/PNG/HEIC/HEIF/AVIF photo or an SVG (page `0`), or page `page` (0-based, default 0) of a PDF. `.txt` / `.docx` are a 400: a reference is shown to the model as an image |
 | `from_job` + `from_job_item` | **Instead of a document**: save item `from_job_item` (default 0) of a completed `/assess` job — see below |
 | `criteria` | The same `CriterionInput` list as `/assess` (the same cross-criterion rules). Required with `document`; with `from_job`, omitted means the job's own. `options.reference` is refused here — a reference's own criteria are never guided |
 | `breakdown` | `{name: {score, verdict?, reason?}}` — the answer key. `verdict` is optional and must be the score's (`score 3` with `verdict PASS` is a 400). Not allowed on a `score: false` criterion. A name left out is classified by the creation job |
@@ -1927,6 +2035,13 @@ vision-LLM call. The classifier reaches it at `DETECTOR_URL`; **empty means
 off**, and then a `detector` criterion is refused at submit and a `cv`
 criterion's fallback resolves to the llm.
 
+| Classifier knob (default) | What |
+|---|---|
+| `DETECTOR_URL` (empty) | `http://detector:8000` once `ai/detector` is up — both containers are on `ai_shared`. Empty: a `detector` criterion, or a `cv` one with an explicit `options.fallback: "detector"`, is a 400 at submit |
+| `DETECTOR_MIN_SCORE` (0.25) | Used **twice on purpose**: sent as the detector's `threshold`, and the line a detector-scored criterion must clear to PASS from boxes alone (table below). A `detector` criterion's `options.threshold` overrides it. Two separate floors would mean boxes that count as regions but not as evidence |
+| `DETECTOR_TIMEOUT_S` (30) | Seconds one `POST /detect` may take. A page on the shared GPU answers in a few hundred ms; the CPU fallback takes a few seconds. Generous for either without letting a wedged service hold a classifier worker |
+| `DETECTOR_MAX_LABELS_PER_CALL` (16) | Labels per detector request. The detector embeds each label as its own query, so its cost is linear; a page needing more is split across calls rather than rejected. Keep it at or below the detector's own `DETECTOR_MAX_LABELS` (32) |
+
 | Spelling | What happens |
 |---|---|
 | `{"name": "has roof vent", "type": "detector"}` | Answered by the detector at `options.threshold`: boxes **and** a score |
@@ -2008,6 +2123,18 @@ lines from 0/8 to 7/8 and the mean y error from 48 units to 2.4. Both are on
 by default and both are recorded on the attempt. What the second pass cannot
 fix is *identification*: asked for a logo, a model that boxes the heading
 naming the same company 90 units lower is precisely placed on the wrong thing.
+
+**The grid step.** `CLASSIFIER_LLM_BBOX_GRID_STEP` (100 grid units) spaces the
+lines on the ask image and on the refine crop (which gets its own grid in its
+own frame); both the drawn overlay (`common.vision.draw_grid_overlay`) and the
+prompt sentence that describes it read it, so they cannot drift. Use a divisor
+of 1000 (`50`, `100`, `200`, `250`) so the last line lands on the edge; the
+floor is `10`. Denser is not automatically better: at `50` on a ≤1000-px page
+the edge labels start to overlap each other and the content. Change it, then
+re-run `bin/grounding_experiment.py` (below) before trusting the new value.
+`CLASSIFIER_LLM_BBOX_GRIDLINES=false` sends the bare image; a caller of
+`locate_criterion` without the working page image gets the bare-image ask and
+a prompt that does not mention a grid.
 
 **When it runs.** All four have to hold, or the loop costs nothing:
 
@@ -2262,7 +2389,9 @@ curl http://localhost:4001/v1/classifier/models -H "Authorization: Bearer sk-123
      "text_char_budget": 60000,
      "max_tokens": {"score": 8192, "box": 1024, "select": 2048, "describe": 1024},
      "timeout_s": 240.0, "max_concurrent": 6, "in_flight": 0},
-    {"id": "qwen2.5-vl", "…": "…"}
+    {"id": "qwen2.5-vl", "…": "…"},
+    {"id": "qwen3.5-4b", "…": "…"},
+    {"id": "qwen3.8-solo", "…": "…"}
   ]
 }
 ```
@@ -2317,7 +2446,8 @@ curl http://localhost:4001/v1/classifier/criterion-types -H "Authorization: Bear
   "aggregate_detail": {"rule": "…", "level": "…", "from": "…", "values": "…"},
   "model": {"applies_to": "llm criteria, and cv criteria answered by the llm fallback",
             "precedence": "options.model, then the request's `model`, then the registry default",
-            "default": "muse-glimmer", "models": ["muse-glimmer", "qwen2.5-vl"],
+            "default": "muse-glimmer",
+            "models": ["muse-glimmer", "qwen2.5-vl", "qwen3.5-4b", "qwen3.8-solo"],
             "catalog": "GET /models", "identity": "…"},
   "detector_configured": true
 }
@@ -2355,7 +2485,12 @@ is always present; `stable` marks what survives a `mean` aggregate.
 [§ Result details](#result-details--the-same-shape-on-every-type).
 
 `text.defaults.pattern` shows `<name>` because it defaults to the criterion's
-name. `cv.defaults.fallback` is `detector` only while DETECTOR_URL is set.
+name. `caps.pattern_max_chars` (500) is not a knob: it lives in
+`common.documents.textmatch`, which enforces it for every caller;
+`caps.min_count` is `CLASSIFIER_TEXT_MIN_COUNT_CAP` and the `name` cap
+`CLASSIFIER_CRITERION_NAME_MAX_CHARS` (for `llm` criteria the name is the
+prompt text, and every name is slugified into artifact file names, so it
+bounds both). `cv.defaults.fallback` is `detector` only while DETECTOR_URL is set.
 Each type's `defaults.aggregate` is for its default options (an `llm`
 criterion's defaults change with its hint — the top-level `aggregate.defaults`
 has the whole table).
@@ -2461,21 +2596,25 @@ its declaration does not list — so this endpoint describes exactly what
 ### `GET /document-kinds`
 
 What this container can accept and do right now: the five kinds (with
-`pdf.pages` saying every page is an item, and `svg.external_images` the live
-[SVG fetch](#external-references-in-svg) setting), the `.doc` and `.svgz`
-rejections, the accepted inputs, the four `text_match_modes`, the live OCR
-status, the limits, and the regions block.
+`image.formats` the image formats this container can decode, `pdf.pages`
+saying every page is an item, and `svg.external_images` the live
+[SVG fetch](#external-references-in-svg) setting), the `.doc`, `.svgz` and
+video rejections, the accepted inputs, the four `text_match_modes`, the live
+OCR status, the limits, and the regions block.
 
 ```json
 {
-  "kinds": [{"kind": "image", "pages": "1 — one item", "…": "…"},
+  "kinds": [{"kind": "image", "extensions": [".jpg", ".jpeg", ".png", ".heic", ".heif", ".avif"],
+             "content_types": ["image/jpeg", "image/png", "image/heic", "image/heif", "image/avif"],
+             "pages": "1 — one item", "…": "…",
+             "formats": ["jpeg", "png", "heic", "heif", "avif"]},
             {"kind": "pdf", "pages": "any — every page is one item; the request's total items are capped at CLASSIFIER_MAX_ITEMS (counted at submit, without rendering)", "…": "…"},
             {"kind": "svg", "extensions": [".svg"], "content_types": ["image/svg+xml"],
              "pages": "1 — one item", "has_page_images": true, "native_text": true, "…": "…",
              "external_images": {"fetch": false, "max_images": 10, "max_bytes": 5000000,
                                  "timeout_s": 10.0, "accepted": ["image/png", "image/jpeg"],
                                  "redirects": "not followed", "when": "…"}}, "…"],
-  "unsupported": [{"kind": "doc", "…": "…"}, {"kind": "svgz", "…": "…"}],
+  "unsupported": [{"kind": "doc", "…": "…"}, {"kind": "svgz", "…": "…"}, {"kind": "video", "…": "…"}],
   "inputs": {"json": ["base64", "url", "text"],
              "json_shape": "documents: [{type, data, filename?}, ...] — or document: {...} for one; not both",
              "multipart": ["file (or legacy 'image'), repeatable", "text, repeatable"]},
@@ -2581,7 +2720,11 @@ and every reference rule ([§ References — Refusals](#refusals-at-submit));
 a Content-Type that is neither JSON nor multipart; **502** when a document URL
 cannot be fetched; **500** if the payload could not be persisted. A page image
 under `CLASSIFIER_MIN_IMAGE_WIDTH` × `CLASSIFIER_MIN_IMAGE_HEIGHT` (32 × 32 px)
-fails the JOB with "Image too small".
+fails the JOB with "Image too small". It is a thumbnail-catcher only — OCR
+upscales small pages itself, the vision model takes any size, and the
+working-image step only shrinks. It was a hard-coded 100 × 100, which refused a
+crop of one text line submitted as its own document (what `regions_report.py
+--pipeline utility-bill` does in stage 3).
 
 ---
 
@@ -2985,7 +3128,10 @@ assessment incomplete).
 
 [`unit-tests/classifier/documents/`](../../unit-tests/classifier/documents/)
 holds one generated fixture per document kind and failure mode — a native PDF,
-a scanned PDF, a `.txt`, a `.docx`, a well and a badly photographed letter, a
+a scanned PDF, a `.txt`, a `.docx`, a well and a badly photographed letter,
+the well-photographed one again as an iPhone portrait HEIC
+(`photo_of_letter.heic`: stored sideways, rotated by its container and its
+EXIF tag, so it comes out upright only if the rotation is applied once), a
 legacy `.doc`, and a two-page PDF whose sentence over the page break shows
 `options.scope: "document"` — each with the criteria to send and the result
 to expect, plus curl examples. The
@@ -3031,3 +3177,24 @@ references or usage tables needs Postgres: with `TEST_POSTGRES_DSN` set the
 session creates one `classifier_test_<pid>_<hex>` database and drops it at the
 end; without it those tests skip (marker `postgres` / fixture
 `need_postgres`, see `unit-tests/classifier/conftest.py`).
+
+### Running the unit tests
+
+```bash
+UV_LINK_MODE=copy uv run --no-sync --with pytest --package classifier \
+  python -m pytest unit-tests/classifier -q -p no:cacheprovider
+TEST_POSTGRES_DSN=postgresql://postgres@localhost:55439/postgres \
+  UV_LINK_MODE=copy uv run --no-sync --with pytest --package classifier \
+  python -m pytest unit-tests/classifier -q -p no:cacheprovider
+```
+
+- **Without `TEST_POSTGRES_DSN` about a third of the suite skips** — a run
+  like that has not passed. The DSN is an admin connection on a scratch
+  server; each session creates and drops its own `classifier_test_*`
+  database. On Windows, a scratch server from the EDB binaries zip:
+  `initdb -U postgres --auth=trust`, then `pg_ctl -o "-p 55439" start`.
+- **`unit-tests/classifier` and `unit-tests/detector` run in separate pytest
+  processes**: both ship a top-level `config.py`, and the classifier's
+  conftest puts `ai/classifier` on `sys.path`.
+- Use `--no-sync`: `uv sync --package classifier` prunes the shared workspace
+  venv to the classifier's dependencies.

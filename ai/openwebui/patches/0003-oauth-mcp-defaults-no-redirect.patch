@@ -1,6 +1,6 @@
 Zeo patch 0003 — a model's default OAuth MCP tools follow the user's real connection, and never redirect a new chat.
 
-Target: Open WebUI v0.11.4 (ghcr.io/open-webui/open-webui:v0.11.4).
+Target: Open WebUI v0.12.3 (ghcr.io/open-webui/open-webui:v0.12.3).
 Applied by ai/openwebui/Dockerfile.openwebui with `patch -p1` from /app.
 
 Upstream: opening a new chat on a model whose default tools include an
@@ -45,7 +45,7 @@ See ai/openwebui/OPENWEBUI.md § MCP tools (Phoenix) and § Custom image.
 
 --- a/backend/open_webui/main.py
 +++ b/backend/open_webui/main.py
-@@ -912,6 +912,14 @@
+@@ -948,6 +948,14 @@
      # models the caller can actually see.
      models = await get_filtered_models(models, user)
  
@@ -62,7 +62,7 @@ See ai/openwebui/OPENWEBUI.md § MCP tools (Phoenix) and § Custom image.
          meta = info.get('meta') if isinstance(info.get('meta'), dict) else {}
 --- a/backend/open_webui/utils/oauth.py
 +++ b/backend/open_webui/utils/oauth.py
-@@ -247,6 +247,30 @@
+@@ -283,6 +283,30 @@
      return token
  
  
@@ -93,7 +93,7 @@ See ai/openwebui/OPENWEBUI.md § MCP tools (Phoenix) and § Custom image.
  FERNET = None
  
  if len(OAUTH_CLIENT_INFO_ENCRYPTION_KEY) != 44:
-@@ -1058,27 +1082,67 @@
+@@ -1098,27 +1122,67 @@
                  log.warning(f'No OAuth session found for user {user_id}, client_id {client_id}')
                  return None
  
@@ -176,7 +176,7 @@ See ai/openwebui/OPENWEBUI.md § MCP tools (Phoenix) and § Custom image.
      async def _refresh_token(self, session) -> dict:
          """
          Refresh an OAuth token if needed, with concurrency protection.
-@@ -1102,6 +1166,8 @@
+@@ -1142,6 +1206,8 @@
                  log.error(f'Failed to refresh token for session {session.id}')
                  return None
  
@@ -185,7 +185,7 @@ See ai/openwebui/OPENWEBUI.md § MCP tools (Phoenix) and § Custom image.
          except Exception as e:
              log.error(f'Error refreshing token for session {session.id}: {e}')
              return None
-@@ -1185,8 +1251,15 @@
+@@ -1226,8 +1292,15 @@
                      else:
                          error_text = await r.text()
                          log.error(f'Token refresh failed for client_id {client_id}: {r.status} - {error_text}')

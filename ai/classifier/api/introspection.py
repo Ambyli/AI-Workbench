@@ -30,7 +30,13 @@ touches no job state.
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
-from common.documents import DEFAULT_MAX_RENDER_PIXELS, EXTENSIONS, MAX_PATTERN_CHARS
+from common.documents import (
+    DEFAULT_MAX_RENDER_PIXELS,
+    EXTENSIONS,
+    IMAGE_CONTENT_TYPES,
+    MAX_PATTERN_CHARS,
+    available_image_formats,
+)
 
 from analysis.ocr import ocr_engine_status
 from api.criterion_options import criterion_types
@@ -183,12 +189,24 @@ def list_document_kinds():
         {
             "kind": "image",
             "extensions": EXTENSIONS["image"],
-            "content_types": ["image/jpeg", "image/png"],
-            "detection": "magic bytes: FF D8 FF (JPEG) / 89 50 4E 47 0D 0A 1A 0A (PNG)",
+            "content_types": list(IMAGE_CONTENT_TYPES.values()),
+            "detection": "magic bytes: FF D8 FF (JPEG) / 89 50 4E 47 0D 0A 1A 0A (PNG); "
+                         "HEIC / HEIF / AVIF by the brands of the leading ISO-BMFF "
+                         "ftyp box — a HEIC brand (heic, heix, hevc, …) anywhere wins, "
+                         "then an AVIF brand (avif, avis), then a generic HEIF one "
+                         "(mif1, msf1)",
             "pages": "1 — one item",
             "has_page_images": True,
             "native_text": False,
-            "notes": "EXIF orientation is applied on load. Text criteria need OCR.",
+            "notes": "EXIF orientation is applied on load; for HEIC/HEIF/AVIF the "
+                     "container's rotation and mirroring (irot/imir) are applied "
+                     "once, by the decoder. A HEIC is read as its primary image only "
+                     "— burst frames, depth maps, thumbnails and HDR gain maps are "
+                     "ignored, and a 10/12-bit image is reduced to 8-bit. Text "
+                     "criteria need OCR.",
+            # The live answer for THIS container: which formats it can decode
+            # (pillow-heif present, Pillow built with AVIF).
+            "formats": available_image_formats(),
         },
         {
             "kind": "pdf",
@@ -275,6 +293,14 @@ def list_document_kinds():
                               "small gzip can expand to gigabytes); decompress to .svg "
                               "and re-upload.",
                     "detection": "magic bytes: 1F 8B (any gzip data)",
+                },
+                {
+                    "kind": "video",
+                    "reason": "MP4 / MOV (including the video half of an iPhone Live "
+                              "Photo) is not a document. Upload the still photo "
+                              "(JPEG, PNG, HEIC or AVIF) instead.",
+                    "detection": "an ISO-BMFF ftyp box with no HEIC/HEIF/AVIF brand "
+                                 "(isom, mp42, qt  , …)",
                 },
             ],
             "text_match_modes": {

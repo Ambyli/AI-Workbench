@@ -1,0 +1,30 @@
+[project]
+name = "route-policy"
+version = "0.1.0"
+description = "Route-policy engine: rulesets of evaluators pick a LiteLLM chain alias for each `auto` turn, and every decision is logged to route-policy-db"
+requires-python = ">=3.11"
+dependencies = [
+    # common.conversation (split_exchanges, called_tool_names, message_text,
+    # user_texts, tool_results), common.keywordmatch (the Go-RE2 keyword-rule
+    # compiler), common.pii (the in-process PII patterns) and common.signals
+    # (the signals sidecar's wire format + client) -- stdlib-only apart from
+    # the client's lazily imported httpx, which is a dependency below anyway,
+    # so no extra is needed.
+    "common",
+    "fastapi",
+    "uvicorn",
+    "pydantic>=2",
+    # route-policy-db: rulesets, bindings, decisions, evaluations, outcomes,
+    # all through route_policy/db/pool.py's one pool.
+    "asyncpg",
+    "prometheus-client",
+    "prometheus-fastapi-instrumentator",
+    # rulesets/*.yaml and their patterns_ref files (yaml.safe_load).
+    "pyyaml",
+    # route_policy/analysis/classifier_client.py: the llm_classifier's
+    # POST /assess cycle against the document classifier (also used by
+    # bench/), and common.signals.SignalsClient (the signals sidecar).
+    # common.net's DEFAULT_BLOCKED_NETWORKS / locality_problem (the locality
+    # guards) are stdlib-only and need no extra.
+    "httpx",
+]

@@ -1,39 +1,34 @@
 # vLLM — Multi-Model Serving
 
-> **Windows / WSL2 compatibility note:** vLLM v0.22.0+ (the current `latest` image) uses a V1 engine that requires CUDA Unified Virtual Addressing (UVA), which is unavailable in WSL2's paravirtualized GPU driver. Running the latest image on Windows Docker with WSL2 will fail at startup with `RuntimeError: UVA is not available`. Pin the image to `vllm/vllm-openai:v0.6.6` until upstream adds a WSL2-compatible code path.
-
-Run multiple models simultaneously, each in its own container on a different port. Hit any model at the standard OpenAI-compatible endpoint (`/v1/chat/completions`) — pick which model by specifying `"model": "qwen"` or `"model": "llama"` in your request body.
+Run several models at once, each in its own container on its own host port, each serving the OpenAI-compatible API (`/v1/chat/completions`). Pick the model with `"model": "<served name>"` in the request body. Chat traffic normally reaches them through LiteLLM's chain aliases, not directly ([LITELLM.md](../litellm/LITELLM.md)).
 
 ### Quick start
 
+From the repo root on the box, start a model by service name (`make up vllm` alone starts every service in the Makefile's list, which needs all the GPUs):
+
 ```bash
-docker compose -f ai/vllm/docker-compose.vllm.yml up -d
+make up vllm qwen3.8-solo
 ```
 
-This launches two containers by default:
+| Service | Host port (`.env`) | Model | Served name |
+|---|---|---|---|
+| `qwen3.6` | `PORT_VLLM_QWEN36` (`8002`) | `cyankiwi/Qwen3.6-27B-AWQ-INT4` | `qwen3.6` |
+| `qwen3.8` | `PORT_VLLM_QWEN38` (`8003`) | `cyankiwi/Qwen3.8-27B-AWQ-INT4` | `qwen3.8` |
+| `vllm-qwen-vl` | `PORT_VLLM_QWEN_VL` (`8006`) | `Qwen/Qwen2.5-VL-7B-Instruct` | see the compose file |
+| `muse-glimmer` | `PORT_VLLM_MUSE_GLIMMER` (`8018`) | `meta-models/Muse-Glimmer-30B` | `muse-glimmer` |
+| `qwen3.8-solo` | `PORT_VLLM_QWEN38_SOLO` (`8019`) | `cyankiwi/Qwen3.8-27B-AWQ-INT4` | `qwen3.8-solo` |
 
-| Container | Port | Model |
-|---|---|---|
-| `vllm-qwen` | `localhost:8002` | `Qwen/Qwen2.5-3B-Instruct` |
-| `vllm-llama` | `localhost:8003` | `meta-llama/Llama-3.2-3B-Instruct` |
-
-Test with:
+`muse-glimmer` and `qwen3.8` share a GPU pair — run one of them (§ Muse Glimmer 30B). Test with:
 
 ```bash
-# Qwen on port 8002
-curl http://localhost:8002/v1/chat/completions \
+curl http://localhost:8019/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model": "qwen", "messages": [{"role": "user", "content": "Hello!"}]}'
-
-# Llama on port 8003
-curl http://localhost:8003/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model": "llama", "messages": [{"role": "user", "content": "Hello!"}]}'
+  -d '{"model": "qwen3.8-solo", "messages": [{"role": "user", "content": "Hello!"}]}'
 ```
 
 ### How it works
 
-Each service in `ai/vllm/docker-compose.vllm.yml` is a standalone vLLM instance. The `--model` flag on the command line tells vLLM which HuggingFace model to load. Each container gets its own GPU memory allocation and listens on a different host port, so they run in parallel without conflict.
+Each service in `ai/vllm/docker-compose.vllm.yml` is a standalone vLLM instance. The model argument on its command line (`vllm serve <model>` or `--model`) tells vLLM which HuggingFace model to load. Each container gets its own GPU memory allocation and listens on a different host port, so they run in parallel without conflict.
 
 For strategies on dividing GPU resources between containers (time-slicing, MIG, `--gpu-memory-utilization` tuning), see [GPU_SHARING_GUIDE.md](../GPU_SHARING_GUIDE.md).
 
@@ -165,7 +160,7 @@ Applied via a bind mount and the `--chat-template` flag:
 
 **`device_ids` vs `count`.** `count: all` exposes every GPU and lets vLLM take the first N it needs — fine when a service owns the box, wrong when two services must share it. `device_ids: ['2']` sets `NVIDIA_VISIBLE_DEVICES=2`, so the container sees exactly one card and vLLM's `cuda:0` *is* host GPU 2. Indices follow `nvidia-smi` order and are 0-based, so "slot 3" is `'2'`. If a driver update or reseat changes enumeration, pin by UUID instead: `nvidia-smi -L` prints `GPU-xxxxxxxx-…` ids that Docker accepts verbatim in `device_ids`. Compose rejects `count` and `device_ids` on the same entry — use one.
 
-**Why 3 sequences.** Qwen3.8-27B is a hybrid: 16 of its 64 layers are full attention (4 KV heads × 256 head_dim), the rest are linear attention with a small fixed state. In BF16 that is 64 KiB of KV per token, so a full 131072-token sequence costs ~8 GiB. One A6000 at 0.90 utilisation leaves ~21 GiB for KV after ~19 GiB of INT4 weights + MTP head and ~3 GiB of activations — roughly 2½ max-length sequences, which is why the cap is 3 (the same figure `qwen3.6`, the same architecture on one card, has run with). As always the cap is a ceiling: a dozen 8k-token chats fit fine; three 128k ones will queue briefly. `--kv-cache-dtype fp8` would double that if you ever need it.
+**Why 3 sequences.** Qwen3.8-27B is a hybrid: 16 of its 64 layers are full attention (4 KV heads × 256 head_dim), the rest are linear attention with a small fixed state. In BF16 that is 64 KiB of KV per token, so a full 131072-token sequence costs ~8 GiB. One A6000 at 0.90 utilisation leaves ~21 GiB for KV after ~19 GiB of INT4 weights + MTP head and ~3 GiB of activations — roughly 2½ max-length sequences, which is why the cap is 3 (the same figure `qwen3.6`, the same architecture on one card, has run with). As always the cap is a ceiling: a dozen 8k-token chats fit fine; three 128k ones will queue briefly. `--kv-cache-dtype fp8` would double that if you ever need it. The classifier also has a `qwen3.8-solo` registry entry (`ai/classifier/models.yaml`, `max_concurrent: 1`), a route-policy benchmark candidate: when a job selects it, it holds at most one of these three sequences, and while it does the overflow hook can see `vllm:num_requests_waiting` rise sooner for chat.
 
 **What can co-run.** With three A6000s and these services at 0.90 utilisation:
 
@@ -174,6 +169,8 @@ Applied via a bind mount and the `--chat-template` flag:
 | `muse-glimmer` (TP=2, first two cards) | 0, 1 | `qwen3.8-solo` **or** `qwen3.6` (both TP=1) — but not both, and `qwen3.6` uses `count: all`, so it grabs GPU 0 and collides with muse; give it a `device_ids` too if you want that pairing |
 | `qwen3.8` (TP=2, first two cards) | 0, 1 | `qwen3.8-solo` on GPU 2 — pointless duplication, but it works |
 | `glm5.2` / `qwen3.8-flash` (llama.cpp, `--tensor-split 1,1,1`) | 0, 1, 2 | nothing — they use all three cards |
+
+**GPU 2 is shared with the detector.** `ai/detector` pins `device_ids: ['2']` too and runs OWLv2 (fp16, one inference at a time) in the headroom `qwen3.8-solo`'s `--gpu-memory-utilization 0.90` leaves. Raising that utilisation, growing `--max-num-seqs` / `--max-model-len`, or pointing `DETECTOR_MODEL` at a larger checkpoint can OOM one of the two; `DETECTOR_DEVICE=cpu` is the detector's fallback ([DETECTOR.md](../detector/DETECTOR.md)).
 
 `qwen3.8` and `qwen3.8-solo` are separate LiteLLM aliases on purpose. Listing both under one `model_name` would make LiteLLM round-robin onto whichever is down and burn a retry + cooldown per request; keep them distinct and point clients at the one that is up.
 
@@ -203,13 +200,13 @@ The `muse-glimmer` service serves [`meta-models/Muse-Glimmer-30B`](https://huggi
       --limit-mm-per-prompt '{"image": 3}'   # classifier references — see Multimodal
 ```
 
-**vLLM version — pinned, not `latest`.** Model support, the `muse_glimmer` reasoning + tool-call parsers, and DFlash2 all landed in **vLLM v0.28.0** (2026-08-26; [#51655](https://github.com/vllm-project/vllm/pull/51655), [#52816](https://github.com/vllm-project/vllm/pull/52816)); **v0.29.0** (2026-09-09) adds a DFlash draft RoPE-layout fix and a Muse Glimmer LoRA fix, and is what every service in this compose file now pins except `qwen3.8`, which is held at `v0.27.1` (the build it was already running) until it has been tried on v0.29.0. Meta's recipe names `v0.28.0` as the minimum. The whole file moved off `latest` because `docker compose up -d` never re-pulls a `latest` tag that is already cached on the host — a stale pre-0.28 `latest` boots the container and then dies with:
+**vLLM version — pinned, not `latest`.** Model support, the `muse_glimmer` reasoning + tool-call parsers, and DFlash2 all landed in **vLLM v0.28.0** (2026-08-26; [#51655](https://github.com/vllm-project/vllm/pull/51655), [#52816](https://github.com/vllm-project/vllm/pull/52816)); **v0.29.0** (2026-09-09) adds a DFlash draft RoPE-layout fix and a Muse Glimmer LoRA fix, and is what every service in this compose file now pins except `qwen3.8` and its one-card copy `qwen3.8-solo`, which are held at `v0.27.1` (the build `qwen3.8` was already running) until they have been tried on v0.29.0. Meta's recipe names `v0.28.0` as the minimum. The whole file moved off `latest` because `docker compose up -d` never re-pulls a `latest` tag that is already cached on the host — a stale pre-0.28 `latest` boots the container and then dies with:
 
 ```
 KeyError: 'invalid tool call parser: muse_glimmer (chose from { apertus, ..., qwen3_coder, qwen3_xml, ... })'
 ```
 
-If you see that, the running image is too old — it is not a typo in the parser name. Bumping a pin is a deliberate edit + `make up vllm <service>` (compose pulls a tag it doesn't have locally); bump one service at a time so a regression is attributable. Meta's own recipe is at [recipes.vllm.ai](https://recipes.vllm.ai/meta-models/Muse-Glimmer-30B).
+If you see that, the running image is too old — it is not a typo in the parser name. Bumping a pin is a deliberate edit + `make up vllm <service>` (compose pulls a tag it doesn't have locally); bump one service at a time so a regression is attributable. LiteLLM's overflow hook counts prompts with each chain backend's `POST /tokenize` (server root, outside `/v1`), verified at v0.27.1 and v0.29.0 ([LITELLM.md § The overflow hook](../litellm/LITELLM.md#the-overflow-hook)) — after bumping `qwen3.8-solo` or `muse-glimmer`, check `/tokenize` still answers with `count` and `max_model_len`. Meta's own recipe is at [recipes.vllm.ai](https://recipes.vllm.ai/meta-models/Muse-Glimmer-30B).
 
 **Why TP=2 works.** The text stack has 32 attention heads and **2 KV heads**, so the only legal TP sizes are 1 and 2 (see *Picking TP size* above). Two A6000s (2 × 48 GB) comfortably clear Meta's 72 GB minimum:
 
@@ -248,6 +245,8 @@ At startup vLLM logs `Maximum concurrency for 262144 tokens per request: N`; tha
 ```bash
 make stop vllm qwen3.8 && make up vllm muse-glimmer
 ```
+
+While `qwen3.8` runs instead, `muse-glimmer`'s `/metrics` probe fails, LiteLLM's overflow hook marks it down, and the chain aliases degrade to `qwen3.8-solo` alone (then Claude, except `local-private`).
 
 To pin the NVLinked pair explicitly instead of relying on enumeration order, replace `count: all` with `device_ids: ['0', '1']` under `deploy.resources.reservations.devices`.
 

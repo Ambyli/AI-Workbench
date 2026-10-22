@@ -1,6 +1,6 @@
 Zeo patch 0004 — nudge a model that announces a tool call instead of making it.
 
-Target: Open WebUI v0.11.4 (ghcr.io/open-webui/open-webui:v0.11.4).
+Target: Open WebUI v0.12.3 (ghcr.io/open-webui/open-webui:v0.12.3).
 Applied by ai/openwebui/Dockerfile.openwebui with `patch -p1` from /app.
 
 Upstream: with native function calling the backend runs the tool loop
@@ -17,7 +17,8 @@ native function calling with tools offered, at least one tool round ran this
 turn and the reply came straight after a tool result, the reply (LiteLLM
 `auto` footer stripped, code removed, reasoning excluded) ends in first-person
 forward-looking intent ("let me", "I'll", "I'm going to", "give me a
-moment", ...) and asks the user nothing, and fewer than
+moment", ...) and hands nothing back to the user (no question, no offer
+such as "tell me and I'll check" or "if you're in X, ..."), and fewer than
 AUTO_CONTINUE_MAX_NUDGES nudges were sent this turn — it sends the
 conversation plus a hidden user message ("You said you would take an action
 but your reply contained no tool call ...") through the same continuation
@@ -41,7 +42,7 @@ out of this file).
 
 --- a/backend/open_webui/utils/middleware.py
 +++ b/backend/open_webui/utils/middleware.py
-@@ -5888,7 +5888,112 @@
+@@ -5611,7 +5611,137 @@
                              }
                          )
  
@@ -58,7 +59,7 @@ out of this file).
 +                zeo_auto_continue_nudges = 0
 +
 +                async def zeo_auto_continue_round():
-+                    nonlocal output, prior_output, output_start, zeo_auto_continue_nudges
++                    nonlocal output, prior_output, output_start, response_usage, messages, zeo_auto_continue_nudges
 +                    from open_webui.utils import zeo_auto_continue
 +
 +                    while True:
@@ -66,8 +67,11 @@ out of this file).
 +                            return False
 +                        if ENABLE_RESPONSES_API_STATEFUL and last_response_id:
 +                            return False
++                        # full_output(), not output: after a tool round `output` holds
++                        # only the latest reply, and the check needs the tool result
++                        # that came before it.
 +                        announced = zeo_auto_continue.should_nudge(
-+                            output,
++                            full_output(),
 +                            nudges_used=zeo_auto_continue_nudges,
 +                            tool_rounds=tool_call_iterations,
 +                            native=metadata.get('params', {}).get('function_calling') != 'legacy',
@@ -85,19 +89,40 @@ out of this file).
 +                            )
 +                        )
 +                        try:
++                            # The history a tool round builds: the system messages,
++                            # `messages` (the conversation through the last tool
++                            # results, compacted if upstream compacted it), then the
++                            # reply being nudged. The nudge goes on the request only.
++                            reply_messages = convert_output_to_messages(
++                                output,
++                                raw=True,
++                                reasoning_format=get_reasoning_format(model),
++                                flatten_tool_images=True,
++                            )
++                            if response_usage and reply_messages:
++                                reply_messages[0]['usage'] = response_usage
++                            history = [
++                                *[message for message in form_data['messages'] if message.get('role') == 'system'],
++                                *[message for message in messages if message.get('role') != 'system'],
++                                *reply_messages,
++                            ]
++                            request_messages = process_messages_with_output(history)
++                            context_summary = next(
++                                (message['contextSummary'] for message in history if message.get('contextSummary')),
++                                None,
++                            )
++                            if context_summary:
++                                request_messages.insert(
++                                    1 if request_messages and request_messages[0].get('role') == 'system' else 0,
++                                    {'role': 'system', 'content': f'[CONVERSATION SUMMARY]\n{context_summary}'},
++                                )
 +                            new_form_data = {
 +                                **form_data,
 +                                'model': model_id,
 +                                'stream': True,
 +                                'metadata': metadata,
 +                                'messages': [
-+                                    *form_data['messages'],
-+                                    *convert_output_to_messages(
-+                                        output,
-+                                        raw=True,
-+                                        reasoning_format=get_reasoning_format(model),
-+                                        flatten_tool_images=True,
-+                                    ),
++                                    *request_messages,
 +                                    {'role': 'user', 'content': zeo_auto_continue.NUDGE_TEXT},
 +                                ],
 +                            }
@@ -139,9 +164,10 @@ out of this file).
 +                                    prior_output.pop()
 +                            output = []
 +                            output_start = len(prior_output)
-+                            await stream_body_handler(res, new_form_data)
-+                            output = full_output()
-+                            prior_output = []
++                            response_usage = await stream_body_handler(res, new_form_data)
++                            # The nudged reply is now part of the conversation the
++                            # next tool round builds on; the nudge is not.
++                            messages = history
 +                        except Exception as e:
 +                            # The reply being nudged is already complete and shown:
 +                            # a failed nudge ends the turn as upstream would have.
@@ -157,7 +183,7 @@ out of this file).
                      tool_call_iterations += 1
 --- /dev/null
 +++ b/backend/open_webui/utils/zeo_auto_continue.py
-@@ -0,0 +1,215 @@
+@@ -0,0 +1,228 @@
 +"""ZEO PATCH (ai/openwebui/patches/0004-auto-continue-announced-tool-calls.patch):
 +nudge a model that announces a tool call instead of making it.
 +
@@ -185,8 +211,11 @@ out of this file).
 +* that text — LiteLLM ``auto`` footer stripped, inline / fenced code removed —
 +  ends in first-person, forward-looking intent ("let me", "I'll", "I'm going
 +  to", "give me a moment", "I'm fixing it now", ...) in its last two sentences;
-+* the last paragraph asks the user nothing (no ``?``, no "want me to",
-+  "should I", "let me know", "if you'd like", ...);
++* the last paragraph hands nothing back to the user: no ``?``, no "want me
++  to", "should I", "let me know", and no conditional offer addressed to
++  them ("if you ...", "tell me ...", "feel free ...", "once you ...",
++  "happy to ..."): "If you're in Provo, tell me and I'll check" is an
++  offer, not an announced action;
 +* fewer than :data:`MAX_NUDGES` nudges were sent this turn.
 +
 +Bare imperatives such as "re-run the tests" or "then run it" are NOT intent on
@@ -230,10 +259,11 @@ out of this file).
 +
 +MAX_NUDGES = read_max_nudges()
 +
-+# The footer ai/litellm/overflow.py appends to `auto` answers
++# The footer LiteLLM's ai/litellm/hooks/footer/ appends to `auto` answers
 +# ("\n\n---\n*muse-glimmer · local-general*"): a blank line, a `---` rule,
 +# then one *italic* line of at least two " · "-separated parts, at the very
-+# end. Same expression as overflow.FOOTER_RE (a test pins the two together).
++# end. Same expression as FOOTER_RE in ai/litellm/hooks/footer/render.py (a
++# test pins the two together).
 +FOOTER_RE = re.compile(r'(?:\r?\n){2,}---[ \t]*\r?\n\*[^*\r\n·]+(?: · [^*\r\n·]+)+\*[ \t]*(?:\r?\n[ \t]*)*\Z')
 +
 +_FENCED_CODE_RE = re.compile(r'```.*?(?:```|\Z)', re.S)
@@ -266,7 +296,11 @@ out of this file).
 +    re.I,
 +)
 +
-+# The answer hands the turn back to the user: never nudge those.
++# The answer hands the turn back to the user: never nudge those. That
++# includes any conditional or offer addressed to them -- 2026-10-20 a
++# weather answer ending "If you're in St. George, Provo, Ogden or elsewhere
++# in the state, tell me and I'll check that specific spot." was nudged
++# ("I'll check") into a second, redundant answer.
 +_ASKS_USER_RE = re.compile(
 +    '|'.join(
 +        [
@@ -276,7 +310,12 @@ out of this file).
 +            r'\bshould I\b',
 +            r'\bshall I\b',
 +            r'\blet me know\b',
-+            rf'\bif you(?:{_APOS}d| would)? (?:like|want|prefer)\b',
++            r'\bif you\b',
++            r'\btell me\b',
++            r'\bfeel free\b',
++            r'\bjust (?:say|ask)\b',
++            r'\b(?:happy|glad) to\b',
++            r'\b(?:once|when|whenever) you\b',
 +            r'\bup to you\b',
 +            r'\byour call\b',
 +        ]
@@ -286,7 +325,7 @@ out of this file).
 +
 +
 +def strip_footer(text: str) -> str:
-+    """Remove trailing LiteLLM ``auto`` footers (repeatedly, like overflow.strip_footer)."""
++    """Remove trailing LiteLLM ``auto`` footers (repeatedly, like hooks/footer/render.py strip_footer)."""
 +    while True:
 +        stripped = FOOTER_RE.sub('', text)
 +        if stripped == text:

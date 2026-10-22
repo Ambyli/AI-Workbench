@@ -17,6 +17,8 @@ This launches two containers:
 
 All client traffic goes through `kokoro-api` on port 8004. `kokoro-app` is not exposed to the host.
 
+On the box, deploy with `make up kokoro`: `kokoro-api` is **swap-class** (no `container_name` / `ports:` of its own — host port `PORT_KOKORO_API` is published by `ai/edge`, see [EDGE.md](../edge/EDGE.md)), while `kokoro-app` holds the GPU and is recreated.
+
 ### Usage
 
 **List available voices:**
@@ -40,7 +42,7 @@ The response is a WAV file. The default voice is `af_heart` if `voice` is omitte
 |---|---|---|
 | `HF_TOKEN` | — | HuggingFace token for downloading model weights on first run |
 | `KOKORO_APP_URL` | `http://kokoro-app:8085` | URL the API proxy uses to reach the inference container. Resolves via Docker service name in Compose. For local dev, override inline: `KOKORO_APP_URL=http://localhost:8085 uv run kokoro_server.py` |
-| `AUDIO_BASE_URL` | `http://localhost:8000` | Base URL returned by the `text_to_speech` MCP tool. Used to build the audio playback link. Override if the server runs on a different host or port. |
+| `AUDIO_BASE_URL` | `http://localhost:8004` | Base URL returned by the `text_to_speech` MCP tool. Used to build the audio playback link. Its port must match `PORT_KOKORO_API`; override if the server runs on a different host or port. |
 
 ### Model loading
 

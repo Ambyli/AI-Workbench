@@ -1,0 +1,480 @@
+{
+  "info": {
+    "_postman_id": "route-policy-collection",
+    "name": "route-policy",
+    "description": "Route-policy service (ai/route-policy): rulesets of evaluators pick the LiteLLM chain alias for each `auto` turn, and every decision is logged to route-policy-db (Trino: postgres_route_policy). Phase 3: the `default` ruleset ENFORCES -- LiteLLM's pre-call hook awaits POST /decide for every `auto` request (within ROUTE_POLICY_DECIDE_TIMEOUT_S, 0.25 s) and serves the chain it returns in the same pass; a timeout, an error or `apply: false` sends the turn to local-private. Phase 4: after each answer the binding's SHADOW ruleset (`default-llm`: `default` with its code cooldown replaced by an `llm_classifier`) is decided on the same request and logged with `shadow_of`, never applied; its classifier verdicts come from background POST /assess jobs on the document classifier (a local model, qwen3.5-4b), stored in the `analyses` table and read back from the next turn on. Both rulesets set `pin: turn` (default@3, default-llm@3): every call of one answer -- the same chat_id + message_id: its tool rounds, Open WebUI's hidden auto-continue nudge -- keeps the route of the answer's first call unless the fresh decision is local-private, and only that first call asks for a classification. The hook also sends `background_task` (an Open WebUI title / tags / follow-up request), which is logged but never classified and never pins a turn. Phase 5: a second shadow, `default-signals`, reads fast CPU signals from the `signals` sidecar (ai/signals, http://signals:8000) -- sensitive data (`pii`: common.pii's patterns in-process plus the sidecar's NER) in ANY user message or a Phoenix / Trino tool result forces local-private, a nearest-example topic vote (`nearest_examples`) decides the turns no keyword / tool / cooldown rule claimed, and the injection score, code shape, language and size are logged with role `observe` (never combined). ONE POST /signals per decision, within ROUTE_POLICY_SIGNALS_BUDGET_S (0.1 s); POST /evaluate waits up to 10 s with no deadline cut. Called through the LiteLLM pass-through registered in ai/litellm/litellm_config.yaml (`pass_through_endpoints` → `/v1/route-policy` → `http://route-policy:8000`, `include_subpath: true`, methods GET/POST, `forward_headers: true`, `auth: true`). Every request is authenticated with a Bearer token from a LiteLLM virtual key: set the collection variables `litellm` (e.g. http://localhost:4001) and `virtual master key` — every request inherits them via collection-level auth.\n\nDirect base URL (bypassing LiteLLM): http://route-policy:8000 inside ai_shared (what LiteLLM's hook uses), or http://<host>:${PORT_ROUTE_POLICY} (default 8027), which the ai/edge HAProxy publishes for clients in EDGE_ALLOWED_CIDRS — no auth there. Drop `/v1/route-policy` from the paths when you use it.\n\nWorkflow: GET /evaluator-types (what a ruleset may contain) → GET /rulesets/:rulesetId (the live `default`) → POST /evaluate (dry-run on a conversation) → POST /decide + POST /observe with the same `decisionId` (what the hook sends) → GET /chats/:chatId/decisions. See ai/route-policy/ROUTE_POLICY.md for the full reference.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{virtual master key}}",
+        "type": "string"
+      }
+    ]
+  },
+  "variable": [
+    {
+      "key": "litellm",
+      "value": "http://localhost:4001",
+      "type": "string",
+      "description": "LiteLLM base URL. Localhost publish is 4001 (PORT_LITELLM); on ai_shared it's http://litellm:4000; behind cloudflared it's https://api.zeoenergy.com."
+    },
+    {
+      "key": "virtual master key",
+      "value": "sk-your-litellm-virtual-key",
+      "type": "string",
+      "description": "LiteLLM virtual key (Admin UI → Virtual Keys, or /key/generate API). The pass-through runs with `auth: true`, so a non-admin virtual key needs `/v1/route-policy` in its (or its team's) `metadata.allowed_passthrough_routes` — set under `metadata`, by a proxy admin, because the top-level field is Enterprise-only; the master key works without it. Otherwise 403. See ai/litellm/LITELLM.md § Pass-through auth. Sent as `Authorization: Bearer {{virtual master key}}` by the collection-level auth."
+    },
+    {
+      "key": "decisionId",
+      "value": "6f0e8c1e-8f7e-4c55-9a39-0f3f7ab5d001",
+      "type": "string",
+      "description": "A UUID shared by POST /decide and POST /observe (the hook makes a fresh uuid4 per request). Re-sending /decide with the same value replays the FIRST stored decision; set a new one (e.g. Postman's {{$guid}}) for a new decision."
+    },
+    {
+      "key": "chatId",
+      "value": "postman-chat",
+      "type": "string",
+      "description": "Chat id sent as `chat_id` on POST /decide, and read back by GET /chats/:chatId/decisions (fill that request's path variable with it)."
+    },
+    {
+      "key": "rulesetId",
+      "value": "default",
+      "type": "string",
+      "description": "Ruleset id for GET /rulesets/:rulesetId and /rulesets/:rulesetId/:rulesetVersion."
+    },
+    {
+      "key": "rulesetVersion",
+      "value": "3",
+      "type": "string",
+      "description": "Ruleset version for GET /rulesets/:rulesetId/:rulesetVersion."
+    }
+  ],
+  "item": [
+    {
+      "name": "GET /health",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{litellm}}/v1/route-policy/health",
+          "host": [
+            "{{litellm}}"
+          ],
+          "path": [
+            "v1",
+            "route-policy",
+            "health"
+          ]
+        },
+        "description": "Liveness, and what the compose healthcheck and the edge probe. Returns {status: \"ok\", rulesets: [{id, version}, ...] (the compiled versions this copy has cached -- default@2 and the shadow default-llm@1 on this image), bindings: <count>}. A running process has finished startup, which required route-policy-db (migrations + ruleset seeding); /health itself does not touch the database, nor the document classifier. See ROUTE_POLICY.md § API."
+      },
+      "response": []
+    },
+    {
+      "name": "GET /ready",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{litellm}}/v1/route-policy/ready",
+          "host": [
+            "{{litellm}}"
+          ],
+          "path": [
+            "v1",
+            "route-policy",
+            "ready"
+          ]
+        },
+        "description": "Readiness: a live SELECT 1 on route-policy-db. 200 {status: \"ready\", db: \"up\"} when decisions can be logged right now; 503 {status: \"not ready\", db: \"down\"} otherwise (the service still DECIDES from its cached rulesets then; only logging stops)."
+      },
+      "response": []
+    },
+    {
+      "name": "GET /metrics",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{litellm}}/v1/route-policy/metrics",
+          "host": [
+            "{{litellm}}"
+          ],
+          "path": [
+            "v1",
+            "route-policy",
+            "metrics"
+          ]
+        },
+        "description": "Prometheus text: route_policy_decisions_total{route,mode,applied} (shadow decisions count with mode=\"shadow\"), route_policy_decide_seconds, route_policy_evaluator_seconds{evaluator,type}, route_policy_votes_total{evaluator,type,outcome}, route_policy_invariant_overrides_total{invariant}, route_policy_observations_total{status}, route_policy_duplicates_total{endpoint}, route_policy_shadow_decisions_total{ruleset,agree}, route_policy_analyses_total{model,status}, route_policy_analysis_seconds{model}, route_policy_analysis_queue_depth, route_policy_analysis_dropped_total{reason}, route_policy_writes_deferred_total{write}, route_policy_writes_in_flight, route_policy_db_reads_cut_total{read}, route_policy_errors_total{kind}, plus the HTTP metrics of prometheus-fastapi-instrumentator. Scraped by the litellm stack's prometheus (job route-policy). See ROUTE_POLICY.md § Metrics."
+      },
+      "response": []
+    },
+    {
+      "name": "GET /evaluator-types",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{litellm}}/v1/route-policy/evaluator-types",
+          "host": [
+            "{{litellm}}"
+          ],
+          "path": [
+            "v1",
+            "route-policy",
+            "evaluator-types"
+          ]
+        },
+        "description": "What a ruleset can contain. evaluator_types: every registered type (regex_text, tool_calls, cooldown, backend_load, static, llm_classifier) with its config JSON schema, whether vote.route is required or the evaluator chooses the route itself (llm_classifier), and its DECLARED output (summary, when it votes, what one exchange's relevance means -- null when it cannot judge single exchanges -- every detail key with its kind, and notes). combiner_types: priority, weighted with their option schemas. roles: vote | force | veto. The declarations live next to each evaluator and are tested against the real code. See ROUTE_POLICY.md § Evaluators."
+      },
+      "response": []
+    },
+    {
+      "name": "POST /decide",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"decision_id\": \"{{decisionId}}\",\n  \"requested_model\": \"auto\",\n  \"litellm_call_id\": \"postman-call-1\",\n  \"chat_id\": \"{{chatId}}\",\n  \"message_id\": \"postman-message-1\",\n  \"user_id\": \"postman\",\n  \"key_alias\": null,\n  \"messages\": [\n    {\n      \"role\": \"system\",\n      \"content\": \"You are a helpful assistant.\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": \"Make me a scientific calculator!\"\n    },\n    {\n      \"role\": \"assistant\",\n      \"content\": null,\n      \"tool_calls\": [\n        {\n          \"id\": \"call_1\",\n          \"type\": \"function\",\n          \"function\": {\n            \"name\": \"sandbox-mcp_write_files\",\n            \"arguments\": \"{\\\"files\\\": {}}\"\n          }\n        }\n      ]\n    },\n    {\n      \"role\": \"tool\",\n      \"tool_call_id\": \"call_1\",\n      \"content\": \"wrote 2 files\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": \"Looks the same\"\n    }\n  ],\n  \"tools\": null,\n  \"backends\": {\n    \"http://qwen3.8-solo:8000/v1\": {\n      \"verdict\": \"ok\",\n      \"waiting\": 0.0,\n      \"running\": 2.0\n    },\n    \"http://muse-glimmer:8000/v1\": {\n      \"verdict\": \"busy\",\n      \"waiting\": 3.0,\n      \"running\": 8.0\n    }\n  },\n  \"background_task\": false\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{litellm}}/v1/route-policy/decide",
+          "host": [
+            "{{litellm}}"
+          ],
+          "path": [
+            "v1",
+            "route-policy",
+            "decide"
+          ]
+        },
+        "description": "Decide (and log) the chain alias for one request -- what LiteLLM's pre-call hook sends on every `auto` request, and AWAITS (ROUTE_POLICY_DECIDE_TIMEOUT_S, 0.25 s): it rewrites `auto` to `route` when `apply` is true and its own copy of the invariants agrees, else to local-private. The bound ruleset (bindings: auto -> default) runs every evaluator, its combiner picks one route, and the invariants have the last word (requested local-private stays local-private; the route is always one of the ruleset's chain aliases). `default` sets `pin: turn`: a LATER call of the same turn (same chat_id + message_id: a tool round, Open WebUI's hidden auto-continue nudge) still runs every evaluator but keeps the route of the turn's first call, unless the fresh decision is local-private; its row records `pinned_from` = that first decision. Send this request twice with a NEW decisionId each time to see it (the same decisionId replays the first answer).\n\nBody (the contract, ROUTE_POLICY_PLAN § 7): decision_id (a UUID the caller makes), requested_model, litellm_call_id, chat_id, message_id, user_id, key_alias (all nullable), messages (OpenAI messages as LiteLLM received them), tools (or null), backends ({api_base: {verdict: ok|busy|down|stale|unknown, waiting, running}}), background_task (the hook's verdict that this is an Open WebUI background task -- a title, tags, follow-ups; optional, default false, null = false: it is logged, never classified by an llm_classifier, and never pins or is pinned). Unknown fields are ignored.\n\n200: {decision_id, route, mode, apply, ruleset: {id, version}, votes: [{evaluator, type, route, weight, confidence, role, abstained, reason, latency_ms}], scores, latency_ms}. apply is true only for an enforce ruleset whose invariants held -- the `default` ruleset (version 3) is enforce, so this example answers apply: true. This example routes to local-code through `sticky-code` (a sandbox tool was called one exchange ago; the cooldown holds for 2 exchanges). The response keys are the same for a pinned call.\n\nThe response is the PRIMARY ruleset's alone. After answering, one background task decides the binding's shadow rulesets (default-llm) on the same request -- stored as decisions rows with id uuid5(decision_id, \"<ruleset>@<version>\") and shadow_of = this decision_id, read back by GET /chats/:chatId/decisions and the shadow_comparisons view -- and hands their llm_classifier analysis requests (the conversation up to the latest user message, in memory only; none from a background task, nor from a call that is not its turn's first) to the analysis queue, which classifies it through the document classifier's POST /assess and stores the verdict in `analyses`; nothing of that can delay, change or fail this answer.\n\nIdempotent: a repeated decision_id returns the FIRST stored decision, whatever the new body says (and re-derives the same shadow ids, so nothing is written twice). 404: no ruleset bound to requested_model. 422: decision_id not a UUID, wrong types. 503: the bound ruleset cannot be compiled by this copy. A decision is returned even when route-policy-db is down (it is then not logged), and in time: the decision write is waited for at most ROUTE_POLICY_DECISION_WRITE_BUDGET_S (0.05 s), then finishes in the background. See ROUTE_POLICY.md § API."
+      },
+      "response": []
+    },
+    {
+      "name": "POST /observe",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"decision_id\": \"{{decisionId}}\",\n  \"litellm_call_id\": \"postman-call-1\",\n  \"response_id\": \"chatcmpl-postman-1\",\n  \"served_model_group\": \"local-code\",\n  \"served_deployment\": \"openai/qwen3.8-solo\",\n  \"overflow_reason\": null,\n  \"finish_reason\": \"stop\",\n  \"tool_calls\": [],\n  \"status\": \"success\",\n  \"error\": null\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{litellm}}/v1/route-policy/observe",
+          "host": [
+            "{{litellm}}"
+          ],
+          "path": [
+            "v1",
+            "route-policy",
+            "observe"
+          ]
+        },
+        "description": "Record what really answered a decided request -- what the hook sends after the call, with the same decision_id. May arrive before or after /decide (no foreign key; the decision_outcomes view joins them). Body: decision_id, litellm_call_id, response_id (the provider's chatcmpl-..., what LiteLLM_SpendLogs.request_id holds), served_model_group (the chain), served_deployment, overflow_reason (busy | down | null), finish_reason, tool_calls (names), status (success | failure), error.\n\n202: {decision_id, stored: true}; stored: false when this decision_id already had an outcome (the first write wins); {decision_id, stored: null, deferred: true} when the write outlasted ROUTE_POLICY_DECISION_WRITE_BUDGET_S and goes on in the background. 422: decision_id not a UUID. 503: the outcome could not be stored (no database, the write failed in time, or too many writes in flight). See ROUTE_POLICY.md § API."
+      },
+      "response": []
+    },
+    {
+      "name": "POST /evaluate — a stored ruleset",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"ruleset\": {\n    \"id\": \"default\",\n    \"version\": 3\n  },\n  \"requested_model\": \"auto\",\n  \"messages\": [\n    {\n      \"role\": \"system\",\n      \"content\": \"You are a helpful assistant.\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": \"Make me a scientific calculator!\"\n    },\n    {\n      \"role\": \"assistant\",\n      \"content\": null,\n      \"tool_calls\": [\n        {\n          \"id\": \"call_1\",\n          \"type\": \"function\",\n          \"function\": {\n            \"name\": \"sandbox-mcp_write_files\",\n            \"arguments\": \"{\\\"files\\\": {}}\"\n          }\n        }\n      ]\n    },\n    {\n      \"role\": \"tool\",\n      \"tool_call_id\": \"call_1\",\n      \"content\": \"wrote 2 files\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": \"Looks the same\"\n    }\n  ],\n  \"tools\": null,\n  \"backends\": {\n    \"http://qwen3.8-solo:8000/v1\": {\n      \"verdict\": \"ok\",\n      \"waiting\": 0.0,\n      \"running\": 2.0\n    },\n    \"http://muse-glimmer:8000/v1\": {\n      \"verdict\": \"busy\",\n      \"waiting\": 3.0,\n      \"running\": 8.0\n    }\n  }\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{litellm}}/v1/route-policy/evaluate",
+          "host": [
+            "{{litellm}}"
+          ],
+          "path": [
+            "v1",
+            "route-policy",
+            "evaluate"
+          ]
+        },
+        "description": "Dry-run a stored ruleset version (version omitted = the highest; on the box `default` 1 (the phase-2 shadow version) and 2 (phase 3, the 3-exchange cooldown) are still stored and evaluable) on a conversation. Writes nothing. Returns the /decide shape with decision_id: null and, per vote, the evaluator's `detail` (its declared output, GET /evaluator-types) and `error`. requested_model defaults to auto; send local-private to see the privacy invariant. background_task (default false) is taken as on /decide. There is no chat or message id here, so a `pin: turn` ruleset is never pinned: every call is its turn's first. An llm_classifier (ruleset default-llm) reads the verdicts STORED for the conversation's prefixes (read-only; /evaluate never enqueues a classification), so a conversation nobody routed abstains with \"no verdict in the last N message(s)\". 404: no such version. 422: give exactly one of `ruleset` / `document`. See ROUTE_POLICY.md § API."
+      },
+      "response": []
+    },
+    {
+      "name": "POST /evaluate — the shadow default-llm",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"ruleset\": {\n    \"id\": \"default-llm\",\n    \"version\": 2\n  },\n  \"requested_model\": \"auto\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"Make me a scientific calculator!\"\n    },\n    {\n      \"role\": \"assistant\",\n      \"content\": \"Here it is: a calculator with sin, cos and a history pane.\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": \"Looks great. Now what is the weather like on Mars?\"\n    }\n  ]\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{litellm}}/v1/route-policy/evaluate",
+          "host": [
+            "{{litellm}}"
+          ],
+          "path": [
+            "v1",
+            "route-policy",
+            "evaluate"
+          ]
+        },
+        "description": "Dry-run the phase-4 shadow ruleset default-llm (default's privacy / code / reasoning / tool rules, then `topic-llm`, an llm_classifier, instead of the 2-exchange code cooldown) on a conversation. Writes nothing and enqueues nothing. topic-llm votes the newest STORED verdict for the prefixes ending at the latest user message and the 2 before it (its `detail` says which: input_key, exchange_index, age_exchanges, status, scores); a conversation /decide never saw has none, so it abstains (\"no verdict in the last 2 message(s)\") and the turn goes to local-general -- where default@3's sticky-code would still say local-code. Version 2 rewords the code criterion (\"asks to write, fix, change or explain source code, a script or a software project. Using a tool such as web search does not count.\") -- version 1 scored a web search for the weather as running software -- so it starts with no verdicts of its own. Add \"background_task\": true to see topic-llm abstain with \"background task\". See ROUTE_POLICY.md § The llm_classifier."
+      },
+      "response": []
+    },
+    {
+      "name": "POST /evaluate — the shadow default-signals",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"ruleset\": {\n    \"id\": \"default-signals\",\n    \"version\": 1\n  },\n  \"requested_model\": \"auto\",\n  \"messages\": [\n    {\n      \"role\": \"system\",\n      \"content\": \"You are a helpful assistant.\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": \"Which homeowner is on project 4412, and can you draft them a permit update?\"\n    },\n    {\n      \"role\": \"assistant\",\n      \"content\": null,\n      \"tool_calls\": [\n        {\n          \"id\": \"call_1\",\n          \"type\": \"function\",\n          \"function\": {\n            \"name\": \"phoenix_run_query\",\n            \"arguments\": \"{\\\"sql\\\": \\\"SELECT homeowner, email, address FROM projects WHERE id = 4412\\\"}\"\n          }\n        }\n      ]\n    },\n    {\n      \"role\": \"tool\",\n      \"tool_call_id\": \"call_1\",\n      \"content\": \"[{\\\"homeowner\\\": \\\"Jordan Example\\\", \\\"email\\\": \\\"jordan.example@example.com\\\", \\\"address\\\": \\\"1482 W Cedar Hollow Dr, Lehi, UT 84043\\\"}]\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": \"Great, now make the email sound friendlier.\"\n    }\n  ],\n  \"tools\": null\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{litellm}}/v1/route-policy/evaluate",
+          "host": [
+            "{{litellm}}"
+          ],
+          "path": [
+            "v1",
+            "route-policy",
+            "evaluate"
+          ]
+        },
+        "description": "Dry-run the phase-5 draft `default-signals` (version 1, shadow) on a conversation whose Phoenix tool result carries a (fabricated) homeowner's email and street address. Writes nothing. The service makes ONE POST /signals to the signals sidecar for the draft's signal evaluators (pii's NER over every user text and the Phoenix result, the latest user text for the injection score, the topic and the language), waited for up to SIGNALS_EVALUATE_TIMEOUT_S (10 s) with no deadline cut -- so a draft is judged on complete signals; each signal vote's `detail` carries its task `status` and `signals_ms`. Expect route local-private, forced by `pii` (`forced_by: [email, street_address]`, `forced_in: [tool:phoenix_run_query]`) even though the latest message names no privacy keyword -- the gap `default` leaves. `injection`, `code-shape`, `language` and `context-size` are role `observe`: logged with their would-be route, never combined. With the sidecar down or ROUTE_POLICY_SIGNALS_URL empty, the signal votes abstain (`signals unavailable` / `signals failed`) and `pii` still forces from its in-process patterns. 404: no such version. See ROUTE_POLICY.md § The default-signals draft and § API."
+      },
+      "response": []
+    },
+    {
+      "name": "POST /evaluate — a draft document",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"document\": {\n    \"id\": \"draft-load-aware\",\n    \"version\": 1,\n    \"mode\": \"shadow\",\n    \"routes\": [\n      \"local-general\",\n      \"local-code\",\n      \"local-reasoning\",\n      \"local-private\"\n    ],\n    \"default_route\": \"local-general\",\n    \"evaluators\": [\n      {\n        \"id\": \"privacy\",\n        \"type\": \"regex_text\",\n        \"role\": \"force\",\n        \"config\": {\n          \"patterns_ref\": \"patterns/privacy.yaml\"\n        },\n        \"vote\": {\n          \"route\": \"local-private\"\n        }\n      },\n      {\n        \"id\": \"code-text\",\n        \"type\": \"regex_text\",\n        \"config\": {\n          \"patterns_ref\": \"patterns/code.yaml\"\n        },\n        \"vote\": {\n          \"route\": \"local-code\",\n          \"weight\": 1.0\n        }\n      },\n      {\n        \"id\": \"solo-busy\",\n        \"type\": \"backend_load\",\n        \"config\": {\n          \"backends\": [\n            \"qwen3\\\\.8-solo\"\n          ],\n          \"verdicts\": [\n            \"busy\",\n            \"down\"\n          ]\n        },\n        \"vote\": {\n          \"route\": \"local-reasoning\",\n          \"weight\": 0.8\n        }\n      }\n    ],\n    \"combiner\": {\n      \"type\": \"weighted\",\n      \"threshold\": 0.7\n    }\n  },\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"What's a good name for a cat?\"\n    }\n  ],\n  \"backends\": {\n    \"http://qwen3.8-solo:8000/v1\": {\n      \"verdict\": \"busy\",\n      \"waiting\": 2.0,\n      \"running\": 3.0\n    }\n  }\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{litellm}}/v1/route-policy/evaluate",
+          "host": [
+            "{{litellm}}"
+          ],
+          "path": [
+            "v1",
+            "route-policy",
+            "evaluate"
+          ]
+        },
+        "description": "Dry-run an UNSAVED ruleset document -- how a new version is tried before it is seeded. patterns_ref refs resolve inside the baked rulesets directory (a path that leaves it is a 422); a document copied from GET /rulesets/:rulesetId/:rulesetVersion posts back as is. Here a weighted, load-aware draft sends a general question to local-reasoning while qwen3.8-solo is busy. 422 with detail.errors listing EVERY problem when the document is invalid. Writes nothing. See ROUTE_POLICY.md § Rulesets."
+      },
+      "response": []
+    },
+    {
+      "name": "GET /rulesets",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{litellm}}/v1/route-policy/rulesets",
+          "host": [
+            "{{litellm}}"
+          ],
+          "path": [
+            "v1",
+            "route-policy",
+            "rulesets"
+          ]
+        },
+        "description": "Every stored ruleset version, without documents: {rulesets: [{id, version, mode, pin, description, sha256, source, created_at, created_by, active_from, active_to}]} -- on this image default@3 (enforce) and default-llm@3 (shadow), both `pin: turn` (pin is null for a ruleset without it), plus any older version still stored (default@1, default@2, default-llm@1 on the box). active_from = first time a binding or a shadow slot pointed at it; active_to = when none does any more (null while bound). 503 when route-policy-db is unavailable."
+      },
+      "response": []
+    },
+    {
+      "name": "GET /rulesets/:rulesetId",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{litellm}}/v1/route-policy/rulesets/:rulesetId",
+          "host": [
+            "{{litellm}}"
+          ],
+          "path": [
+            "v1",
+            "route-policy",
+            "rulesets",
+            ":rulesetId"
+          ],
+          "variable": [
+            {
+              "key": "rulesetId",
+              "value": "",
+              "description": "Ruleset id, e.g. `default`."
+            }
+          ]
+        },
+        "description": "The highest version of one ruleset with its resolved document (refs inlined, exactly as hashed), plus `versions`: every version's summary. 404: no such ruleset."
+      },
+      "response": []
+    },
+    {
+      "name": "GET /rulesets/:rulesetId/:rulesetVersion",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{litellm}}/v1/route-policy/rulesets/:rulesetId/:rulesetVersion",
+          "host": [
+            "{{litellm}}"
+          ],
+          "path": [
+            "v1",
+            "route-policy",
+            "rulesets",
+            ":rulesetId",
+            ":rulesetVersion"
+          ],
+          "variable": [
+            {
+              "key": "rulesetId",
+              "value": "",
+              "description": "Ruleset id, e.g. `default`."
+            },
+            {
+              "key": "rulesetVersion",
+              "value": "",
+              "description": "Ruleset version (an integer >= 1)."
+            }
+          ]
+        },
+        "description": "One version with its document. Versions are immutable: changed content is a new version (a seed whose content differs from the stored version stops the service at startup). 404: no such version; 422: version < 1."
+      },
+      "response": []
+    },
+    {
+      "name": "GET /bindings",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{litellm}}/v1/route-policy/bindings",
+          "host": [
+            "{{litellm}}"
+          ],
+          "path": [
+            "v1",
+            "route-policy",
+            "bindings"
+          ]
+        },
+        "description": "Which ruleset decides for which requested model: {bindings: [{scope_model, scope_key_alias (null = every key), ruleset_id, version, shadows: [{ruleset_id, version}, ...], updated_at, updated_by}]}. Startup seeds auto -> default @ the highest baked-in version with shadow slot default-llm (rulesets/bindings.yaml; the primary must be an enforce ruleset, every shadow a shadow one); editing bindings is the phase-6 write API. The binding decides every `auto` turn; a shadow slot only adds logged decisions and background classifications."
+      },
+      "response": []
+    },
+    {
+      "name": "GET /chats/:chatId/decisions",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{litellm}}/v1/route-policy/chats/:chatId/decisions?limit=100",
+          "host": [
+            "{{litellm}}"
+          ],
+          "path": [
+            "v1",
+            "route-policy",
+            "chats",
+            ":chatId",
+            "decisions"
+          ],
+          "query": [
+            {
+              "key": "limit",
+              "value": "100",
+              "description": "Latest N decisions (1-1000, default 100)."
+            }
+          ],
+          "variable": [
+            {
+              "key": "chatId",
+              "value": "",
+              "description": "Open WebUI chat id (the X-OpenWebUI-Chat-Id header LiteLLM forwards as chat_id)."
+            }
+          ]
+        },
+        "description": "One conversation's latest `limit` PRIMARY decisions, OLDEST FIRST, each with its votes, its outcome (null until /observe arrives; `agree` = the decided route equals the chain that served) and `shadows`: the decisions the binding's shadow rulesets made beside it (same keys but `shadows`; `shadow_of` = the primary's decision_id; `outcome` always null -- the turn's outcome is the primary's). `shadow_of` is null on a primary. Every decision also carries `pinned_from` (the turn's first decision id on a later call of the same chat_id + message_id under a `pin: turn` ruleset -- a shadow's points at its own first shadow decision; null otherwise) and `background_task`. An unknown chat id is an empty list. 503 when route-policy-db is unavailable."
+      },
+      "response": []
+    }
+  ]
+}

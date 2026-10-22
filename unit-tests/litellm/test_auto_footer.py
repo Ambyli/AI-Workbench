@@ -1,28 +1,32 @@
-"""Unit tests for the `auto` footer in ai/litellm/overflow.py.
+"""Unit tests for the `auto` footer -- ai/litellm/hooks/footer, driven through
+hooks.handler.Handler's three hooks.
 
-When a client calls model `auto` (the semantic router), the assistant text
-ends with a markdown footer naming the backend that answered:
+When a client calls model `auto`, the route-policy hook rewrites it to a chain
+alias and LiteLLM serves that chain in the same pass; the assistant text ends
+with a markdown footer naming what answered:
 
     <answer>
 
     ---
     *qwen3.8-solo · local-general*
 
+Everything the footer names comes from that one request: data["deployment"]
+(the proxy sets it from the response's model id before the success and
+streaming hooks run) and the route-policy stash in data["metadata"].
+
 Three layers:
 
 * Pure helpers (always run): footer regex / stripping, Open WebUI task
   detection, the env toggle parser.
 * The hooks against real litellm types (skipped unless `litellm` is
-  importable): non-stream and stream, scope, overflow busy/down/plain,
-  router bypassed, tool calls / response_format / Open WebUI tasks skipped,
+  importable): non-stream and stream, scope (only requests the client sent
+  as `auto`), overflow busy/down/plain, the route-policy fallback tag, tool
+  calls / response_format / Open WebUI tasks / non-chat responses skipped,
   n > 1, idempotence, reasoning untouched, exception safety.
-* The proxy plumbing (skipped unless litellm[proxy]==1.95.0 is importable):
-  the proxy really activates these hooks on OverflowHandler, really dispatches
-  them, and the outer openai provider really surfaces the inner LiteLLM's /
-  router's headers as `llm_provider-*` for BOTH a JSON and an SSE response
-  (a stdlib HTTP server stands in for Envoy). Plus the cross-group fallback
-  (`auto` -> local-private) and the in-group order fallback, driven through
-  a real `litellm.Router`.
+* Against real LiteLLM: a Router with this repo's `auto` alias serves the
+  rewritten chain (or local-private when nothing rewrote it) and the footer
+  names what data["deployment"] resolves to; the proxy (litellm[proxy]==
+  1.95.0) really activates and dispatches these hooks on Handler.
 
     python -m pytest unit-tests/litellm -q -p no:cacheprovider
 """
@@ -31,31 +35,19 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import json
-import os
 import pathlib
 import socket
-import sys
-import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
+from hooks.footer.render import footer_text, is_openwebui_task, strip_footer, strip_footers_from_messages
+from hooks.handler import Handler
+from hooks.overflow.vllm import metrics_url
+from hooks.routing.stash import STASH_KEY
+from hooks.settings import _env_bool
+
 _ROOT = pathlib.Path(__file__).resolve().parents[2]
 _LITELLM_DIR = _ROOT / "ai" / "litellm"
-if str(_LITELLM_DIR) not in sys.path:
-    sys.path.insert(0, str(_LITELLM_DIR))
-
-import overflow  # noqa: E402
-from overflow import (  # noqa: E402
-    OverflowHandler,
-    _env_bool,
-    footer_text,
-    is_openwebui_task,
-    metrics_url,
-    strip_footer,
-    strip_footers_from_messages,
-)
 
 QWEN = "http://qwen3.8-solo:8000/v1"
 MUSE = "http://muse-glimmer:8000/v1"
@@ -74,7 +66,7 @@ def test_footer_text_is_the_approved_format():
         ("hi" + FOOTER_GENERAL + "\n", "hi"),
         ("hi\r\n\r\n---\r\n*qwen3.8-solo · local-general*", "hi"),
         ("hi" + footer_text("claude-sonnet-5 · local-general · overflow (local busy)"), "hi"),
-        ("hi" + footer_text("qwen3.8-solo · local-private · router bypassed"), "hi"),
+        ("hi" + footer_text("qwen3.8-solo · local-private · route-policy fallback"), "hi"),
         ("hi" + FOOTER_GENERAL + FOOTER_GENERAL, "hi"),  # a doubled footer goes too
         # Not ours: a rule + italic line without the " · " separator, or not at the end.
         ("hi\n\n---\n*Note: this is an aside*", "hi\n\n---\n*Note: this is an aside*"),
@@ -212,23 +204,6 @@ except ImportError:
 
 needs_litellm = pytest.mark.skipif(litellm is None, reason="needs litellm==1.95.0")
 
-AUTO_DEPLOYMENT = {"model_name": "auto", "litellm_params": {"model": "openai/vllm-sr/auto"}, "model_info": {"id": "id-auto"}}
-
-INNER = {
-    "id-gen-qwen": {"model_name": "local-general", "litellm_params": {"model": "openai/qwen3.8-solo", "api_base": QWEN}},
-    "id-gen-muse": {"model_name": "local-general", "litellm_params": {"model": "openai/muse-glimmer", "api_base": MUSE}},
-    "id-gen-claude": {"model_name": "local-general", "litellm_params": {"model": "anthropic/claude-sonnet-5"}},
-    "id-rea-opus": {"model_name": "local-reasoning", "litellm_params": {"model": "anthropic/claude-opus-5-5"}},
-}
-
-
-class FakeRouter:
-    def get_deployment(self, model_id):
-        return copy.deepcopy(INNER.get(model_id))
-
-    def get_model_list(self, model_name=None, team_id=None):
-        return [copy.deepcopy(d) for d in INNER.values() if d["model_name"] == model_name]
-
 
 class Clock:
     def __init__(self, t: float = 1000.0) -> None:
@@ -241,7 +216,9 @@ class Clock:
         self.t += dt
 
 
-def make_handler(pages=None, clock=None, router=FakeRouter(), **kw) -> OverflowHandler:
+def make_handler(pages=None, clock=None, **kw) -> Handler:
+    """The route-policy client is off (conftest), so these tests drive the
+    post-call hooks with data shaped like a request the client DID route."""
     pages = pages if pages is not None else {}
 
     async def fetch(url):
@@ -252,28 +229,42 @@ def make_handler(pages=None, clock=None, router=FakeRouter(), **kw) -> OverflowH
             raise ConnectionError("no route")
         return page
 
-    return OverflowHandler(fetch=fetch, clock=clock or Clock(), busy_after=2.0, idle_after=5.0,
-                           poll_interval=1.0, probe_timeout=0.5, start_poller=False,
-                           auto_footer=kw.pop("auto_footer", True), router_getter=lambda: router, **kw)
+    return Handler(fetch=fetch, clock=clock or Clock(), busy_after=2.0, idle_after=5.0,
+                   poll_interval=1.0, probe_timeout=0.5, start_poller=False,
+                   auto_footer=kw.pop("auto_footer", True), **kw)
 
 
-def routed_headers(model_id="id-gen-qwen", group="local-general", name="openai/qwen3.8-solo"):
-    """What the outer openai provider keeps from Envoy + the inner LiteLLM."""
-    return {
-        "x-litellm-model-group": "auto",  # set by the OUTER router (router.py:9388)
-        "llm_provider-x-vsr-selected-decision": "general",
-        "llm_provider-x-vsr-selected-model": group,
-        "llm_provider-x-litellm-model-id": model_id,
-        "llm_provider-x-litellm-model-name": name,
-        "llm_provider-x-litellm-model-group": group,
-    }
+def deployment(chain="local-general", model="openai/qwen3.8-solo", **params):
+    """data["deployment"] as the proxy stores it (a Deployment's dict form)."""
+    return {"model_name": chain, "litellm_params": {"model": model, **params}, "model_info": {"id": f"id-{chain}"}}
 
 
-def auto_data(**kw):
-    data = {"model": "auto", "stream": False, "messages": [{"role": "user", "content": "hi"}],
-            "deployment": copy.deepcopy(AUTO_DEPLOYMENT)}
+def stash(route="local-general", source="engine", decision_id="d-1"):
+    return {"requested_model": "auto", "route": route, "source": source, "decision_id": decision_id,
+            "litellm_call_id": "call-1", "observed": False}
+
+
+def auto_data(chain="local-general", model="openai/qwen3.8-solo", source="engine", **kw):
+    """An `auto` request as the post-call hooks see it: the pre-call hook
+    rewrote `model` to the chain and stashed the route; the proxy stored the
+    deployment that answered."""
+    data = {"model": chain, "stream": False, "messages": [{"role": "user", "content": "hi"}],
+            "metadata": {STASH_KEY: stash(chain, source)}, "deployment": deployment(chain, model)}
     data.update(kw)
     return data
+
+
+def direct_data(model="local-general", **kw):
+    """A direct chain / alias call: no stash."""
+    data = {"model": model, "stream": False, "messages": [{"role": "user", "content": "hi"}],
+            "metadata": {}, "deployment": deployment(model if model.startswith("local-") else "x")}
+    data.update(kw)
+    return data
+
+
+def group_headers(chain="local-general"):
+    """What the Router puts in _hidden_params["additional_headers"] (router.py:9388)."""
+    return {"x-litellm-model-group": chain}
 
 
 def response(contents=("hello",), headers=None, tool_calls=False, reasoning=None):
@@ -286,7 +277,7 @@ def response(contents=("hello",), headers=None, tool_calls=False, reasoning=None
             msg["tool_calls"] = [{"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}}]
         choices.append(Choices(index=i, message=Message(**msg), finish_reason="tool_calls" if tool_calls else "stop"))
     r = ModelResponse(model="auto", choices=choices)
-    r._hidden_params = {"additional_headers": dict(headers if headers is not None else routed_headers())}
+    r._hidden_params = {"additional_headers": dict(headers if headers is not None else group_headers())}
     return r
 
 
@@ -312,11 +303,36 @@ def test_non_stream_footer():
 
 
 @needs_litellm
+def test_the_footer_names_the_served_deployment_and_chain():
+    """Both parts come from data["deployment"]: model_name is the chain,
+    litellm_params.model the deployment (an order-2 answer names order 2)."""
+    h = make_handler()
+    out = success(h, auto_data("local-code", "openai/muse-glimmer"), response(headers=group_headers("local-code")))
+    assert contents(out) == ["hello\n\n---\n*muse-glimmer · local-code*"]
+    # The deployment wins over a disagreeing group header.
+    out = success(h, auto_data(), response(headers=group_headers("local-reasoning")))
+    assert contents(out) == ["hello" + FOOTER_GENERAL]
+
+
+@needs_litellm
+def test_without_a_deployment_there_is_no_model_name_and_no_footer():
+    """x-litellm-model-group can name the chain, never the deployment."""
+    h = make_handler()
+    resp = response()
+    assert run(h.async_post_call_success_hook(data=auto_data(deployment=None), user_api_key_dict=None,
+                                              response=resp)) is None
+    assert contents(resp) == ["hello"]
+
+
+@needs_litellm
 def test_non_auto_is_untouched():
+    """A direct chain or alias call -- no stash -- gets no footer, and its
+    history is not stripped."""
     h = make_handler()
     for model in ("local-general", "local-private", "qwen3.8-solo", "claude-sonnet-5"):
         resp = response()
-        assert run(h.async_post_call_success_hook(data=auto_data(model=model), user_api_key_dict=None, response=resp)) is None
+        assert run(h.async_post_call_success_hook(data=direct_data(model), user_api_key_dict=None,
+                                                  response=resp)) is None
         assert contents(resp) == ["hello"]
         msgs = [{"role": "assistant", "content": "a" + FOOTER_GENERAL}]
         assert run(h.async_pre_call_hook(None, None, {"model": model, "messages": msgs}, "acompletion")) is None
@@ -324,22 +340,16 @@ def test_non_auto_is_untouched():
 
 
 @needs_litellm
-def test_model_id_beats_model_name_header():
-    """The deployment is mapped from x-litellm-model-id through the proxy's router,
-    so a name header that disagrees (e.g. stale after an order fallback) loses."""
+def test_a_client_sent_stash_on_a_direct_call_gets_no_footer():
+    """The pre-call hook drops a stash the request body carried, so a client
+    cannot make a direct chain call look like `auto`."""
     h = make_handler()
-    out = success(h, auto_data(), response(headers=routed_headers(model_id="id-gen-muse", name="openai/qwen3.8-solo")))
-    assert contents(out) == ["hello\n\n---\n*muse-glimmer · local-general*"]
-
-
-@needs_litellm
-def test_without_router_falls_back_to_name_and_group_headers():
-    h = make_handler(router=None)
-    out = success(h, auto_data(), response(headers=routed_headers(model_id="unknown-id")))
-    assert contents(out) == ["hello" + FOOTER_GENERAL]
-    # Only the router's own header: chain known, model unknown -> no footer at all.
-    resp = response(headers={"llm_provider-x-vsr-selected-model": "local-general"})
-    assert run(h.async_post_call_success_hook(data=auto_data(), user_api_key_dict=None, response=resp)) is None
+    data = direct_data("local-general")
+    data["metadata"][STASH_KEY] = stash()
+    assert run(h.async_pre_call_hook(None, None, data, "acompletion")) is None
+    assert STASH_KEY not in data["metadata"]
+    resp = response()
+    assert run(h.async_post_call_success_hook(data=data, user_api_key_dict=None, response=resp)) is None
 
 
 def general_chain():
@@ -351,19 +361,20 @@ def general_chain():
 
 
 def _learn_and_poll(h, pages, clock, qwen, muse):
-    h.filter_deployments("local-general", general_chain())  # what the INNER request does
+    h.overflow.filter_deployments("local-general", general_chain())  # what serving the request does
     pages[metrics_url(QWEN)] = qwen
     pages[metrics_url(MUSE)] = muse
-    run(h.poll_once())
+    run(h.overflow.poller.poll_once())
     clock.advance(2.5)
-    run(h.poll_once())
+    run(h.overflow.poller.poll_once())
 
 
 def _metrics(waiting):
     return f'vllm:num_requests_waiting{{engine="0"}} {waiting}\nvllm:num_requests_running{{engine="0"}} 1\n'
 
 
-CLAUDE = routed_headers(model_id="id-gen-claude", name="anthropic/claude-sonnet-5")
+def claude_data(**kw):
+    return auto_data("local-general", "anthropic/claude-sonnet-5", **kw)
 
 
 @needs_litellm
@@ -371,7 +382,7 @@ def test_overflow_local_busy():
     clock, pages = Clock(), {}
     h = make_handler(pages, clock)
     _learn_and_poll(h, pages, clock, _metrics(3), _metrics(3))
-    out = success(h, auto_data(), response(headers=CLAUDE))
+    out = success(h, claude_data(), response())
     assert contents(out) == ["hello\n\n---\n*claude-sonnet-5 · local-general · overflow (local busy)*"]
 
 
@@ -380,7 +391,7 @@ def test_overflow_local_down():
     clock, pages = Clock(), {}
     h = make_handler(pages, clock)
     _learn_and_poll(h, pages, clock, ConnectionError("refused"), ConnectionError("refused"))
-    out = success(h, auto_data(), response(headers=CLAUDE))
+    out = success(h, claude_data(), response())
     assert contents(out) == ["hello\n\n---\n*claude-sonnet-5 · local-general · overflow (local down)*"]
 
 
@@ -389,36 +400,44 @@ def test_overflow_busy_wins_over_down_and_unknown_is_plain():
     clock, pages = Clock(), {}
     h = make_handler(pages, clock)
     _learn_and_poll(h, pages, clock, _metrics(3), ConnectionError("refused"))
-    assert "overflow (local busy)" in contents(success(h, auto_data(), response(headers=CLAUDE)))[0]
-    # A fresh handler that never saw the chain (another worker) and has no data: plain.
+    assert "overflow (local busy)" in contents(success(h, claude_data(), response()))[0]
+    # A fresh handler that never filtered the chain (another worker) has no verdicts: plain.
     h2 = make_handler()
-    assert contents(success(h2, auto_data(), response(headers=CLAUDE)))[0].endswith(
+    assert contents(success(h2, claude_data(), response()))[0].endswith(
         "*claude-sonnet-5 · local-general · overflow*")
-    # Opus via local-reasoning, chain backends found through the router's model list.
-    out = success(h2, auto_data(), response(headers=routed_headers(
-        model_id="id-rea-opus", group="local-reasoning", name="anthropic/claude-opus-5-5")))
+    out = success(h2, auto_data("local-reasoning", "anthropic/claude-opus-5-5"),
+                  response(headers=group_headers("local-reasoning")))
     assert contents(out)[0].endswith("*claude-opus-5-5 · local-reasoning · overflow*")
 
 
-BYPASS_HEADERS = {
-    # The outer router answered from local-private after `auto` failed:
-    "x-litellm-model-group": "local-private",
-    "x-litellm-attempted-fallbacks": 1,
-    # ...and the backend is vLLM itself, so no x-vsr-* / x-litellm-* upstream headers.
-    "llm_provider-content-type": "application/json",
-}
+@needs_litellm
+@pytest.mark.parametrize("source", ["fallback:timeout", "fallback:disabled", "fallback:not-applied",
+                                    "fallback:http-500"])
+def test_route_policy_fallback(source):
+    """The engine did not route the request: local-private answered, and the
+    footer says so."""
+    h = make_handler()
+    data = auto_data("local-private", "openai/qwen3.8-solo", source=source)
+    out = success(h, data, response(headers=group_headers("local-private")))
+    assert contents(out) == ["hello\n\n---\n*qwen3.8-solo · local-private · route-policy fallback*"]
 
 
 @needs_litellm
-def test_router_bypassed():
+def test_an_engine_routed_local_private_is_not_a_fallback():
     h = make_handler()
-    data = auto_data(deployment={"model_name": "local-private", "litellm_params": {"model": "openai/qwen3.8-solo"}})
-    out = success(h, data, response(headers=BYPASS_HEADERS))
-    assert contents(out) == ["hello\n\n---\n*qwen3.8-solo · local-private · router bypassed*"]
-    # Without data["deployment"] (it is resolved from the model id and could be
-    # missing) the outer group header alone is not enough to name the model.
-    resp = response(headers=BYPASS_HEADERS)
-    assert run(h.async_post_call_success_hook(data=auto_data(deployment=None), user_api_key_dict=None, response=resp)) is None
+    out = success(h, auto_data("local-private", "openai/muse-glimmer"), response())
+    assert contents(out) == ["hello\n\n---\n*muse-glimmer · local-private*"]
+
+
+@needs_litellm
+def test_an_auto_request_the_hook_never_rewrote_is_a_fallback():
+    """No stash and model still `auto`: the `auto` alias served it from
+    local-private (router_settings.model_group_alias)."""
+    h = make_handler()
+    data = {"model": "auto", "messages": [{"role": "user", "content": "hi"}],
+            "deployment": deployment("local-private", "openai/qwen3.8-solo")}
+    out = success(h, data, response())
+    assert contents(out) == ["hello\n\n---\n*qwen3.8-solo · local-private · route-policy fallback*"]
 
 
 @needs_litellm
@@ -437,6 +456,18 @@ def test_tool_calls_response_format_and_tasks_are_skipped():
         data = auto_data(messages=[{"role": "user", "content": prompt}])
         assert run(h.async_post_call_success_hook(data=data, user_api_key_dict=None, response=resp)) is None
         assert contents(resp) == ['{"title": "Rain"}']
+
+
+@needs_litellm
+def test_an_anthropic_messages_response_is_left_alone():
+    """/v1/messages (Claude Code) routes `auto` the same way, but its response
+    is an Anthropic message dict, not a chat completion: no footer, no error."""
+    h = make_handler()
+    resp = {"id": "msg_1", "type": "message", "role": "assistant", "model": "auto", "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": "hello"}]}
+    before = copy.deepcopy(resp)
+    assert run(h.async_post_call_success_hook(data=auto_data(), user_api_key_dict=None, response=resp)) is None
+    assert resp == before and h.stats["footer_errors"] == 0
 
 
 @needs_litellm
@@ -471,14 +502,16 @@ def test_toggle_off():
     assert run(h.async_post_call_success_hook(data=auto_data(), user_api_key_dict=None, response=resp)) is None
     assert contents(resp) == ["hello"]
     msgs = [{"role": "assistant", "content": "a" + FOOTER_GENERAL}]
-    assert run(h.async_pre_call_hook(None, None, {"model": "auto", "messages": msgs}, "acompletion")) is None
-    assert msgs[0]["content"] == "a" + FOOTER_GENERAL
+    data = {"model": "auto", "messages": msgs}
+    run(h.async_pre_call_hook(None, None, data, "acompletion"))
+    assert msgs[0]["content"] == "a" + FOOTER_GENERAL  # not stripped...
+    assert data["model"] == "local-private"  # ...but still routed (the client is off here)
     chunks = stream_chunks(["a", "b"])
     assert collect(h, chunks) == chunks
 
 
 @needs_litellm
-def test_pre_call_strips_on_auto():
+def test_pre_call_strips_on_auto_before_the_route():
     h = make_handler()
     data = {"model": "auto", "messages": [
         {"role": "user", "content": "q1"},
@@ -492,7 +525,10 @@ def test_pre_call_strips_on_auto():
     assert data["messages"][2]["content"][0]["text"] == "a2"
     assert data["messages"][3]["content"] == "q2" + FOOTER_GENERAL
     assert h.stats["footers_stripped"] == 2
-    assert run(h.async_pre_call_hook(None, None, data, "acompletion")) is None  # idempotent
+    # Routed after the strip (the client is off in these tests: local-private).
+    assert data["model"] == "local-private" and data["metadata"][STASH_KEY]["route"] == "local-private"
+    # A second pass is a direct local-private call now: nothing to strip, nothing to route.
+    assert run(h.async_pre_call_hook(None, None, data, "acompletion")) is None
 
 
 @needs_litellm
@@ -502,7 +538,7 @@ def test_exceptions_never_escape():
     def boom(*_a, **_k):
         raise RuntimeError("bug")
 
-    h.footer_label = boom  # type: ignore[assignment]
+    h.footer.label = boom  # type: ignore[assignment]
     resp = response()
     assert run(h.async_post_call_success_hook(data=auto_data(), user_api_key_dict=None, response=resp)) is None
     assert contents(resp) == ["hello"]
@@ -510,23 +546,25 @@ def test_exceptions_never_escape():
     assert [_text(c) for c in collect(h, chunks)] == [_text(c) for c in stream_chunks(["a", "b"])]
     assert h.stats["footer_errors"] >= 2
 
-    # A router that raises: the name header is used instead.
-    class BadRouter:
-        def get_deployment(self, model_id):
-            raise RuntimeError("router bug")
+    # A deployment object that raises on every read: no footer, no exception.
+    class Hostile:
+        def __getattr__(self, name):
+            raise RuntimeError("deployment bug")
 
-    h2 = make_handler(router=BadRouter())
-    assert contents(success(h2, auto_data(), response())) == ["hello" + FOOTER_GENERAL]
+    h2 = make_handler()
+    resp = response()
+    assert run(h2.async_post_call_success_hook(data=auto_data(deployment=Hostile()), user_api_key_dict=None,
+                                               response=resp)) is None
+    assert contents(resp) == ["hello"]
     # Garbage in, nothing out -- and no exception.
     assert run(h2.async_post_call_success_hook(data=None, user_api_key_dict=None, response=None)) is None
     assert run(h2.async_post_call_success_hook(data=auto_data(), user_api_key_dict=None, response=object())) is None
-    assert run(h2.async_pre_call_hook(None, None, {"model": "auto", "messages": "nope"}, "acompletion")) is None
     assert run(h2.async_pre_call_hook(None, None, None, "acompletion")) is None
 
 
 # ── streaming ──────────────────────────────────────────────────────────────
 def stream_chunks(texts, finish="stop", finish_text=None, headers=None, n=1, reasoning=None, usage_chunk=True):
-    hidden = {"additional_headers": dict(headers if headers is not None else routed_headers())}
+    hidden = {"additional_headers": dict(headers if headers is not None else group_headers())}
     out = []
     if reasoning:
         for i in range(n):
@@ -552,7 +590,7 @@ class Wrapper:
 
     def __init__(self, chunks, headers=None):
         self._chunks = chunks
-        self._hidden_params = {"additional_headers": dict(headers if headers is not None else routed_headers())}
+        self._hidden_params = {"additional_headers": dict(headers if headers is not None else group_headers())}
 
     def __aiter__(self):
         return self._gen()
@@ -616,9 +654,9 @@ def test_stream_without_finish_chunk_gets_footer_at_the_end():
 @needs_litellm
 def test_stream_scope_tools_tasks_and_reasoning():
     h = make_handler()
-    # non-auto: identical objects, nothing added
+    # a direct chain call: identical objects, nothing added
     chunks = stream_chunks(["a"])
-    assert collect(h, chunks, data=auto_data(model="local-general", stream=True)) == chunks
+    assert collect(h, chunks, data=direct_data("local-general", stream=True)) == chunks
     # tool call streamed: skipped
     tool = ModelResponseStream(id="c", created=1, model="auto", choices=[StreamingChoices(index=0, delta=Delta(
         tool_calls=[ChatCompletionDeltaToolCall(id="t", index=0, type="function", function=Function(name="f", arguments="{}"))]))])
@@ -649,15 +687,41 @@ def test_stream_n_greater_than_one():
 
 
 @needs_litellm
-def test_stream_claude_and_bypass_labels():
+def test_stream_claude_and_fallback_labels():
     clock, pages = Clock(), {}
     h = make_handler(pages, clock)
     _learn_and_poll(h, pages, clock, ConnectionError("x"), ConnectionError("x"))
-    out = collect(h, stream_chunks(["hi"], headers=CLAUDE), headers=CLAUDE)
+    out = collect(h, stream_chunks(["hi"]), data=claude_data(stream=True))
     assert joined(out).endswith("*claude-sonnet-5 · local-general · overflow (local down)*")
-    data = auto_data(stream=True, deployment={"model_name": "local-private", "litellm_params": {"model": "openai/muse-glimmer"}})
-    out = collect(h, stream_chunks(["hi"], headers=BYPASS_HEADERS), data=data, headers=BYPASS_HEADERS)
-    assert joined(out) == "hi\n\n---\n*muse-glimmer · local-private · router bypassed*"
+    data = auto_data("local-private", "openai/muse-glimmer", source="fallback:timeout", stream=True)
+    out = collect(h, stream_chunks(["hi"], headers=group_headers("local-private")), data=data,
+                  headers=group_headers("local-private"))
+    assert joined(out) == "hi\n\n---\n*muse-glimmer · local-private · route-policy fallback*"
+
+
+@needs_litellm
+def test_stream_of_anthropic_events_passes_through():
+    """A /v1/messages stream carries Anthropic events, not chat chunks: the
+    footer adds nothing and every event passes through unchanged."""
+    events = [b'event: message_start\ndata: {"type":"message_start"}\n\n',
+              {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "hi"}},
+              b'event: message_stop\ndata: {"type":"message_stop"}\n\n']
+
+    class Raw:
+        _hidden_params = {}
+
+        def __aiter__(self):
+            return self._gen()
+
+        async def _gen(self):
+            for e in events:
+                yield e
+
+    async def go():
+        return [c async for c in make_handler().async_post_call_streaming_iterator_hook(
+            user_api_key_dict=None, response=Raw(), request_data=auto_data(stream=True))]
+
+    assert run(go()) == events
 
 
 @needs_litellm
@@ -680,6 +744,95 @@ def test_stream_upstream_errors_still_propagate():
 
     with pytest.raises(ValueError):
         run(go())
+
+
+# ── against a real Router with this repo's `auto` alias ────────────────────
+def _closed_port() -> int:
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def _alias_router(**kw):
+    def dep(chain, model, order, reply):
+        return {"model_name": chain, "litellm_params": {"model": model, "order": order, "api_key": "none",
+                                                        "api_base": QWEN if "qwen" in model else MUSE,
+                                                        "mock_response": reply},
+                "model_info": {"id": f"id-{chain}-{order}"}}
+
+    return litellm.Router(
+        model_list=[dep("local-private", "openai/qwen3.8-solo", 1, "private answer"),
+                    dep("local-private", "openai/muse-glimmer", 2, "private answer 2"),
+                    dep("local-code", "openai/qwen3.8-solo", 1, "code answer")],
+        model_group_alias={"auto": "local-private"}, num_retries=0, **kw)
+
+
+@needs_litellm
+def test_routed_auto_is_served_by_its_chain_and_the_footer_names_it():
+    """What the proxy does after the pre-call hook rewrote `auto`: route on
+    the chain, then store the deployment resolved from the response's model
+    id in data["deployment"] (common_request_processing.py:1707)."""
+    router = _alias_router()
+    data = auto_data("local-code", "unused")
+    resp = run(router.acompletion(model=data["model"], messages=data["messages"]))
+    data["deployment"] = router.get_deployment(model_id=resp._hidden_params["model_id"])
+    assert resp._hidden_params["additional_headers"]["x-litellm-model-group"] == "local-code"
+    assert contents(success(make_handler(), data, resp)) == ["code answer\n\n---\n*qwen3.8-solo · local-code*"]
+
+
+@needs_litellm
+def test_unrewritten_auto_is_served_by_local_private_through_the_alias():
+    """If nothing rewrote it, `auto` resolves to local-private at deployment
+    selection; the request keeps model `auto`, and the footer flags it."""
+    router = _alias_router()
+    data = {"model": "auto", "messages": [{"role": "user", "content": "hi"}]}
+    resp = run(router.acompletion(**data))
+    assert data["model"] == "auto"
+    data["deployment"] = router.get_deployment(model_id=resp._hidden_params["model_id"])
+    assert data["deployment"].model_name == "local-private"
+    assert contents(success(make_handler(), data, resp)) == [
+        "private answer\n\n---\n*qwen3.8-solo · local-private · route-policy fallback*"]
+
+
+@needs_litellm
+def test_in_group_order_fallback_reports_the_final_deployment_id():
+    """data["deployment"] is resolved from the response's
+    _hidden_params["model_id"]; after an order-1 failure it is order 2's, so
+    the footer names the deployment that really answered."""
+    port = _closed_port()
+    router = litellm.Router(model_list=[
+        {"model_name": "local-private", "litellm_params": {"model": "openai/qwen3.8-solo", "order": 1,
+                                                           "api_base": f"http://127.0.0.1:{port}/v1", "api_key": "x"},
+         "model_info": {"id": "id-qwen"}},
+        {"model_name": "local-private", "litellm_params": {"model": "openai/muse-glimmer", "order": 2,
+                                                           "api_base": MUSE, "api_key": "x", "mock_response": "two"},
+         "model_info": {"id": "id-muse"}},
+    ], num_retries=0)
+    resp = run(router.acompletion(model="local-private", messages=[{"role": "user", "content": "hi"}], timeout=5))
+    assert resp._hidden_params["model_id"] == "id-muse"
+    assert resp._hidden_params["additional_headers"]["x-litellm-model-group"] == "local-private"
+    data = auto_data("local-private", "unused", deployment=router.get_deployment(model_id="id-muse"))
+    assert contents(success(make_handler(), data, resp)) == ["two\n\n---\n*muse-glimmer · local-private*"]
+
+
+@needs_litellm
+def test_env_toggle_reaches_the_instance_litellm_loads(monkeypatch, fresh_hooks):
+    """hooks.settings reads the environment once per process, at import -- so
+    each load is against a fresh import of the package, as each proxy start is."""
+    from litellm.proxy.types_utils.utils import get_instance_fn
+
+    monkeypatch.setenv("AUTO_FOOTER_ENABLED", "false")
+    with fresh_hooks():
+        h = get_instance_fn("overflow.handler", config_file_path=str(_LITELLM_DIR / "litellm_config.yaml"))
+    assert h.footer.enabled is False
+    monkeypatch.setenv("AUTO_FOOTER_ENABLED", "1")
+    with fresh_hooks():
+        h = get_instance_fn("overflow.handler", config_file_path=str(_LITELLM_DIR / "litellm_config.yaml"))
+    assert h.footer.enabled is True
+    monkeypatch.delenv("AUTO_FOOTER_ENABLED")
+    assert _env_bool("AUTO_FOOTER_ENABLED", True) is True  # default on
 
 
 # ── proxy plumbing (litellm[proxy]==1.95.0) ────────────────────────────────
@@ -720,6 +873,7 @@ def test_proxy_dispatches_all_three_hooks(registered):
     data = {"model": "auto", "messages": [{"role": "assistant", "content": "a" + FOOTER_GENERAL}]}
     data = run(pl.pre_call_hook(user_api_key_dict=key, data=data, call_type="acompletion"))
     assert data["messages"][0]["content"] == "a"
+    assert data["model"] == "local-private"  # the client is off in these tests: the fallback
 
     out = run(pl.post_call_success_hook(data=auto_data(), response=response(), user_api_key_dict=key))
     assert contents(out) == ["hello" + FOOTER_GENERAL]
@@ -732,157 +886,3 @@ def test_proxy_dispatches_all_three_hooks(registered):
         return res
 
     assert joined(run(stream())) == "hi" + FOOTER_GENERAL
-
-
-# A stand-in for Envoy + the inner LiteLLM: answers /v1/chat/completions with
-# the response headers the real ones add (x-vsr-* from the router,
-# x-litellm-model-* from the inner proxy).
-UPSTREAM_HEADERS = {
-    "x-vsr-selected-decision": "general",
-    "x-vsr-selected-model": "local-general",
-    "x-litellm-model-id": "id-gen-qwen",
-    "x-litellm-model-name": "openai/qwen3.8-solo",
-    "x-litellm-model-group": "local-general",
-}
-
-
-class _Upstream(BaseHTTPRequestHandler):
-    def log_message(self, *a):
-        pass
-
-    def do_POST(self):
-        body = json.loads(self.rfile.read(int(self.headers.get("content-length") or 0)) or b"{}")
-        self.send_response(200)
-        for k, v in UPSTREAM_HEADERS.items():
-            self.send_header(k, v)
-        if body.get("stream"):
-            self.send_header("content-type", "text/event-stream")
-            self.end_headers()
-            for delta, fin in (({"role": "assistant", "content": "hel"}, None), ({"content": "lo"}, None), ({}, "stop")):
-                chunk = {"id": "u", "object": "chat.completion.chunk", "created": 1, "model": "local-general",
-                         "choices": [{"index": 0, "delta": delta, "finish_reason": fin}]}
-                self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
-            self.wfile.write(b"data: [DONE]\n\n")
-        else:
-            payload = json.dumps({"id": "u", "object": "chat.completion", "created": 1, "model": "local-general",
-                                  "choices": [{"index": 0, "message": {"role": "assistant", "content": "hello"},
-                                               "finish_reason": "stop"}],
-                                  "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}).encode()
-            self.send_header("content-type", "application/json")
-            self.send_header("content-length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
-
-
-@pytest.fixture
-def upstream(monkeypatch):
-    monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
-    monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
-    server = ThreadingHTTPServer(("127.0.0.1", 0), _Upstream)
-    t = threading.Thread(target=server.serve_forever, daemon=True)
-    t.start()
-    try:
-        yield f"http://127.0.0.1:{server.server_address[1]}/v1"
-    finally:
-        server.shutdown()
-        server.server_close()
-
-
-def _closed_port() -> int:
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
-
-
-@needs_litellm
-def test_outer_provider_surfaces_upstream_headers_json_and_sse(upstream):
-    """The UNVERIFIED-in-the-plan bit: the outer openai provider keeps the
-    router's and the inner LiteLLM's headers as llm_provider-* -- on the
-    response for JSON, and on the CustomStreamWrapper for SSE."""
-    router = litellm.Router(model_list=[{"model_name": "auto", "litellm_params": {
-        "model": "openai/vllm-sr/auto", "api_base": upstream, "api_key": "sk-test"}}])
-    h = make_handler()
-
-    resp = run(router.acompletion(model="auto", messages=[{"role": "user", "content": "hi"}]))
-    hdrs = resp._hidden_params["additional_headers"]
-    assert hdrs["llm_provider-x-litellm-model-id"] == "id-gen-qwen"
-    assert hdrs["llm_provider-x-vsr-selected-model"] == "local-general"
-    assert hdrs["x-litellm-model-group"] == "auto"  # the outer group, bare
-    data = auto_data(deployment=router.get_deployment(model_id=resp._hidden_params["model_id"]))
-    assert contents(success(h, data, resp)) == ["hello" + FOOTER_GENERAL]
-
-    async def stream():
-        wrapper = await router.acompletion(model="auto", messages=[{"role": "user", "content": "hi"}], stream=True)
-        assert wrapper._hidden_params["additional_headers"]["llm_provider-x-litellm-model-id"] == "id-gen-qwen"
-        out = []
-        async for c in h.async_post_call_streaming_iterator_hook(
-                user_api_key_dict=None, response=wrapper, request_data=auto_data(stream=True, deployment=data["deployment"])):
-            out.append(c)
-        return out
-
-    out = run(stream())
-    assert joined(out) == "hello" + FOOTER_GENERAL
-
-
-@needs_litellm
-def test_cross_group_fallback_to_local_private_is_router_bypassed():
-    """`auto` down -> fallbacks: auto -> [local-private]. The proxy's own data
-    dict keeps model="auto" (route_request unpacks it, route_llm_request.py:404),
-    and data["deployment"] -- what the proxy resolves from the response's
-    model_id -- is the local-private deployment."""
-    port = _closed_port()
-    router = litellm.Router(
-        model_list=[
-            {"model_name": "auto", "litellm_params": {"model": "openai/vllm-sr/auto",
-                                                      "api_base": f"http://127.0.0.1:{port}/v1", "api_key": "x"}},
-            {"model_name": "local-private", "litellm_params": {"model": "openai/qwen3.8-solo",
-                                                               "api_base": QWEN, "api_key": "none",
-                                                               "mock_response": "answered locally"}},
-        ],
-        fallbacks=[{"auto": ["local-private"]}],
-        num_retries=0,
-    )
-    data = {"model": "auto", "messages": [{"role": "user", "content": "hi"}], "timeout": 5}
-    resp = run(router.acompletion(**data))
-    assert data["model"] == "auto"
-    hidden = resp._hidden_params
-    assert hidden["additional_headers"]["x-litellm-model-group"] == "local-private"
-    assert int(hidden["additional_headers"]["x-litellm-attempted-fallbacks"]) == 1
-    data["deployment"] = router.get_deployment(model_id=hidden["model_id"])
-    assert data["deployment"].model_name == "local-private"
-    out = success(make_handler(), data, resp)
-    assert contents(out) == ["answered locally\n\n---\n*qwen3.8-solo · local-private · router bypassed*"]
-
-
-@needs_litellm
-def test_in_group_order_fallback_reports_the_final_deployment_id():
-    """What the inner proxy sends as x-litellm-model-id is the response's
-    _hidden_params["model_id"]; after an order-1 failure it is order 2's."""
-    port = _closed_port()
-    router = litellm.Router(model_list=[
-        {"model_name": "local-private", "litellm_params": {"model": "openai/qwen3.8-solo", "order": 1,
-                                                           "api_base": f"http://127.0.0.1:{port}/v1", "api_key": "x"},
-         "model_info": {"id": "id-qwen"}},
-        {"model_name": "local-private", "litellm_params": {"model": "openai/muse-glimmer", "order": 2,
-                                                           "api_base": MUSE, "api_key": "x", "mock_response": "two"},
-         "model_info": {"id": "id-muse"}},
-    ], num_retries=0)
-    resp = run(router.acompletion(model="local-private", messages=[{"role": "user", "content": "hi"}], timeout=5))
-    assert resp._hidden_params["model_id"] == "id-muse"
-    assert resp._hidden_params["additional_headers"]["x-litellm-model-group"] == "local-private"
-
-
-@needs_litellm
-def test_env_toggle_reaches_the_instance_litellm_loads(monkeypatch):
-    from litellm.proxy.types_utils.utils import get_instance_fn
-
-    monkeypatch.setenv("AUTO_FOOTER_ENABLED", "false")
-    h = get_instance_fn("overflow.handler", config_file_path=str(_LITELLM_DIR / "litellm_config.yaml"))
-    assert h.auto_footer is False
-    monkeypatch.setenv("AUTO_FOOTER_ENABLED", "1")
-    h = get_instance_fn("overflow.handler", config_file_path=str(_LITELLM_DIR / "litellm_config.yaml"))
-    assert h.auto_footer is True
-    monkeypatch.delenv("AUTO_FOOTER_ENABLED")
-    assert overflow._env_bool("AUTO_FOOTER_ENABLED", True) is True  # default on

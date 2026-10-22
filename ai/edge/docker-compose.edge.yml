@@ -11,10 +11,7 @@
 #
 # Container-to-container traffic does not come through here: Open WebUI,
 # cloudflared, oauth2-proxy, etc. keep calling `litellm:4000` and friends by
-# service name. Only LAN / localhost clients on the published ports do -- plus
-# ONE internal caller: the semantic router's Envoy reaches LiteLLM through
-# edge:14000, so its pinned upstream address never belongs to a retiring
-# LiteLLM copy.
+# service name. Only LAN / localhost clients on the published ports do.
 #
 # It also publishes the ports of three recreate-class HTTP APIs (classifier,
 # sandbox-runner, detector). They are not swapped -- each compose file says
@@ -27,9 +24,6 @@
 # container or as edge:<port> on ai_shared:
 #   127.0.0.1:8404  stats CSV; scripts/deploy.py reads it to wait for a new
 #                   copy to be UP, and the healthcheck below probes it
-#   14000           LiteLLM for the semantic router's Envoy (config.yaml
-#                   base_url http://edge:14000/v1); exempt from the LAN
-#                   allow-list and the per-key limit
 #   8405            Prometheus exporter, scraped by the litellm stack's prometheus
 #   8407            read-only status page, behind oauth2-proxy at
 #                   chat.zeoenergy.com/edge/
@@ -61,9 +55,9 @@ services:
     image: haproxy:${EDGE_HAPROXY_VERSION:-3.4.6}-alpine
     # Recreated (with downtime) by `make up`: it owns the host ports, which is
     # the whole point. A recreate drops in-flight LAN connections for a second
-    # or two; routed `auto` turns (they reach LiteLLM through edge:14000)
-    # fall back to local-private for as long. Other container-to-container
-    # traffic is unaffected. An edit to haproxy.cfg alone is a hitless reload instead.
+    # or two; container-to-container traffic (every Open WebUI chat, `auto`
+    # included) is unaffected. An edit to haproxy.cfg alone is a hitless
+    # reload instead.
     container_name: edge
     labels:
       # `make up` waits for the healthcheck below after recreating it and
@@ -95,7 +89,8 @@ services:
       - "${PORT_SANDBOX_PROXY:-8011}:8011"
       - "${PORT_SUPERSET:-8016}:8016"
       - "${PORT_SUPABASE_API:-8022}:8022"
-      - "${PORT_SEMANTIC_ROUTER:-8025}:8025"
+      - "${PORT_SIGNALS:-8025}:8025"
+      - "${PORT_ROUTE_POLICY:-8027}:8027"
       # Recreate-class APIs: the edge only turns their restart into a 503.
       - "${PORT_CLASSIFIER:-8005}:8005"
       - "${PORT_SANDBOX_RUNNER:-8012}:8012"
@@ -103,9 +98,7 @@ services:
     # Read by haproxy.cfg as "${VAR}" -- HAProxy expands environment variables
     # only inside double quotes. Changing either in .env changes this
     # service's config, so `make up edge` recreates it (a second or two of
-    # LAN downtime; `auto` turns, which reach LiteLLM through 14000, fall back
-    # to local-private meanwhile)
-    # instead of reloading. See ai/edge/EDGE.md.
+    # LAN downtime) instead of reloading. See ai/edge/EDGE.md.
     environment:
       # LAN source allow-list for every published port: SPACE-separated CIDRs
       # (haproxy.cfg expands it with "${EDGE_ALLOWED_CIDRS[*]}", one ACL

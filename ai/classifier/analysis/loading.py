@@ -50,11 +50,12 @@ from fastapi import HTTPException
 from PIL import Image, ImageOps
 
 from common.documents import (
+    IMAGE_CONTENT_TYPES,
     Document,
     UnsupportedDocumentError,
-    detect_kind,
+    ensure_image_support,
     find_external_refs,
-    guess_content_type,
+    image_format,
     load_document,
     replace_refs,
 )
@@ -106,8 +107,8 @@ def validate_content_type(content_type: str | None) -> None:
         raise HTTPException(
             status_code=400,
             detail=(
-                f"Unsupported content type '{content_type}'. Accepted: JPEG/PNG images, "
-                "PDF, SVG, plain text, and .docx (see GET /document-kinds)."
+                f"Unsupported content type '{content_type}'. Accepted: JPEG/PNG/HEIC/HEIF/"
+                "AVIF images, PDF, SVG, plain text, and .docx (see GET /document-kinds)."
             ),
         )
 
@@ -140,33 +141,52 @@ def _validate_image_dimensions(w: int, h: int) -> None:
     logger.debug("_validate_image_dimensions: dimensions valid")
 
 
+# Formats headless OpenCV cannot read: a PIL failure on one of these is the
+# answer, not a reason to try cv2.imdecode (which would only return None and
+# hide PIL's message behind "Failed to decode image.").
+_NO_CV2_FALLBACK = frozenset({"heic", "heif", "avif"})
+
+
 def _decode_image_bgr(raw: bytes):
     """Decode raw image bytes to a BGR numpy array suitable for OpenCV.
 
     Passed to ``load_document`` as its image decoder, so every image page in
     the system goes through the same path:
 
-      1. Open with PIL and apply EXIF orientation correction.
+      1. ``common.documents.ensure_image_support`` — registers pillow-heif's
+         opener on first use, and refuses a HEIC/HEIF/AVIF this process has
+         no decoder for with a message naming the missing package.
+      2. Open with PIL and apply EXIF orientation correction.
          Phone cameras embed orientation metadata; without this step a portrait
-         photo may load sideways, producing wrong CV scores.
-      2. Convert the PIL RGB array to OpenCV BGR format.
-      3. Fall back to direct cv2.imdecode() if PIL fails for any reason.
+         photo may load sideways, producing wrong CV scores. For HEIC/HEIF and
+         AVIF the container's rotation is applied exactly once (pillow-heif
+         applies it and resets the EXIF tag; Pillow's AVIF plugin reports it
+         AS the EXIF tag) — see ``common.documents.loaders``.
+      3. Convert the PIL RGB array to OpenCV BGR format.
+      4. Fall back to direct cv2.imdecode() if PIL fails on a JPEG or PNG —
+         never for HEIC/HEIF/AVIF (OpenCV cannot read them), and never for an
+         image over Pillow's decompression-bomb limit (cv2 has no such guard).
 
     Magic-byte validation happens in common.documents.detect before this is
     reached, so there is no format check here.
 
     Args:
-        raw: Raw JPEG or PNG file bytes.
+        raw: Raw JPEG, PNG, HEIC/HEIF or AVIF file bytes.
 
     Returns:
         BGR numpy array (H×W×3).
 
     Raises:
-        HTTPException(400): If decoding fails entirely.
+        UnsupportedDocumentError: No decoder for the format, a HEIC/HEIF/AVIF
+            PIL cannot decode, or a decompression bomb (both callers turn it
+            into a 400).
+        HTTPException(400): If a JPEG/PNG fails PIL and cv2 alike.
     """
     import cv2
 
-    logger.debug("_decode_image_bgr: decoding %d bytes", len(raw))
+    ensure_image_support(raw)
+    fmt = image_format(raw)
+    logger.debug("_decode_image_bgr: decoding %d bytes (format=%s)", len(raw), fmt)
 
     try:
         # PIL handles EXIF orientation (cv2 does not)
@@ -177,7 +197,15 @@ def _decode_image_bgr(raw: bytes):
         logger.debug(
             "_decode_image_bgr: PIL decode + EXIF correction succeeded shape=%s", bgr.shape
         )
+    except Image.DecompressionBombError as exc:
+        # Over 2 × Image.MAX_IMAGE_PIXELS. Handing it to cv2 would decode the
+        # bomb anyway — refuse it here instead.
+        logger.warning("_decode_image_bgr: refused a decompression bomb: %s", exc)
+        raise UnsupportedDocumentError(f"Image is too large to decode: {exc}") from exc
     except Exception as exc:
+        if fmt in _NO_CV2_FALLBACK:
+            logger.warning("_decode_image_bgr: PIL could not decode %s: %s", fmt, exc)
+            raise UnsupportedDocumentError(f"Could not decode {fmt} image: {exc}") from exc
         # PIL failed; fall back to cv2 (no EXIF correction)
         logger.warning(
             "_decode_image_bgr: PIL EXIF correction failed (%s), falling back to cv2", exc
@@ -290,8 +318,8 @@ def load_document_page(
 ) -> Document:
     """One page of an upload, as a one-page ``Document`` — or a 400.
 
-    A reference example is ONE page: a JPEG/PNG, an SVG, or page ``page`` of
-    a PDF.
+    A reference example is ONE page: a photo (JPEG/PNG/HEIC/HEIF/AVIF), an
+    SVG, or page ``page`` of a PDF.
     Only the pages up to it are rendered (a PDF's pages render in order),
     and the result is a view holding just that page, so the pipeline sees a
     one-item document. ``Page.index`` stays the page's index IN ITS PDF,
@@ -321,7 +349,7 @@ def load_document_page(
         raise HTTPException(
             status_code=400,
             detail=f"a {doc.kind} document has no page image; a reference is one "
-                   "JPEG/PNG, one SVG, or one PDF page",
+                   "JPEG/PNG/HEIC/HEIF/AVIF photo, one SVG, or one PDF page",
         )
     if page >= len(doc.pages):
         raise HTTPException(
@@ -457,14 +485,12 @@ async def _fetch_svg_image(url: str) -> tuple[Optional[str], Optional[str]]:
         logger.warning("resolve_svg_images: unexpected error fetching %s: %r", url[:120], exc)
         return None, "fetch failed"
     # PNG / JPEG by the bytes, nothing else: not a nested SVG (which would
-    # need its own pass), not an HTML error page served with a 200.
-    try:
-        kind = detect_kind(body)
-    except UnsupportedDocumentError:
-        kind = None
-    if kind != "image":
+    # need its own pass), not an HTML error page served with a 200, and not a
+    # HEIC/HEIF/AVIF photo either — MuPDF draws only JPEG and PNG data: images.
+    fmt = image_format(body)
+    if fmt not in ("jpeg", "png"):
         return None, "not a PNG or JPEG image"
-    mime = guess_content_type("image", body)
+    mime = IMAGE_CONTENT_TYPES[fmt]
     return f"data:{mime};base64,{base64.b64encode(body).decode('ascii')}", None
 
 

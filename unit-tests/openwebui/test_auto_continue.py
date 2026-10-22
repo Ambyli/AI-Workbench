@@ -82,6 +82,13 @@ LEGIT = [
     " or keep the tests strictly mirroring the current behavior?",
     "You should now see the full 5×7 scientific pad, DEG/RAD toggle, expression line, result, history and"
     " memory indicator.",
+    # 2026-10-20, after a search_web round: nudged ("I'll check") into a second,
+    # redundant answer before conditional offers counted as handing back.
+    "Here's what I found for **Salt Lake City, Utah** (I used SLC as the reference point — let me know if you"
+    " meant another part of Utah):\n\n- **Now:** Partly to mostly sunny, high around 71°F, winds SSE at 5–10 mph"
+    "\n- **This afternoon:** Mostly sunny, climbing from 68° to 71°, with only a slight chance (~1–8%) of a brief"
+    " shower\n- **No active alerts** for the area\n\nIf you're in St. George, Provo, Ogden or elsewhere in the"
+    " state, tell me and I'll check that specific spot.",
 ]
 
 
@@ -149,6 +156,15 @@ def test_empty_text_does_not_trigger(text):
         "If you'd like, I'll add a dark-mode toggle next.",
         "Done. Should I also update the README, or leave it?",
         "I can fix it now. Want me to?",
+        # Conditional offers addressed to the user hand the turn back too.
+        "If you're in St. George, Provo, Ogden or elsewhere in the state, tell me and I'll check that specific spot.",
+        "Tell me which city and I'll look it up.",
+        "If you need a different unit, I'll convert it.",
+        "Feel free to paste the error and I'll take a look.",
+        "Just say the word and I'll add the chart.",
+        "Happy to dig deeper. I'll need the full stack trace for that.",
+        "Once you confirm the port, I'll update the config.",
+        "When you're ready, I'll walk through the deploy.",
     ],
 )
 def test_question_or_offer_in_tail_does_not_trigger(text):
@@ -218,11 +234,11 @@ def test_strip_footer_removes_overflow_footer_variants():
 def test_footer_regex_matches_litellm_overflow():
     sys.path.insert(0, str(_LITELLM_DIR))
     try:
-        overflow = pytest.importorskip("overflow")
+        render = pytest.importorskip("hooks.footer.render")  # needs `common` (the workspace venv has it)
     finally:
         sys.path.remove(str(_LITELLM_DIR))
-    assert zac.FOOTER_RE.pattern == overflow.FOOTER_RE.pattern
-    text = ANNOUNCEMENTS[2] + overflow.footer_text("muse-glimmer · local-general")
+    assert zac.FOOTER_RE.pattern == render.FOOTER_RE.pattern
+    text = ANNOUNCEMENTS[2] + render.footer_text("muse-glimmer · local-general")
     assert zac.strip_footer(text) == ANNOUNCEMENTS[2]
 
 
@@ -327,3 +343,21 @@ def test_middleware_hunk_references_existing_module_api():
     assert "while (tool_calls or await zeo_auto_continue_round())" in added
     # The nudge must stay out of `output` (what is shown and saved).
     assert "output.append" not in added
+
+
+def test_middleware_hunk_follows_the_v012_tool_loop_bookkeeping():
+    # Since v0.12 a tool round keeps only the latest reply in `output` and the
+    # conversation in `messages`: the check must read full_output() (it needs
+    # the tool result before the reply), the request must be built from
+    # `messages`, and the nudged reply must join `messages` for the next round.
+    added = "\n".join(line[1:] for line in _SECTIONS[_MIDDLEWARE_PATH] if line.startswith("+"))
+    code = "\n".join(line for line in added.split("\n") if not line.lstrip().startswith("#"))
+    assert re.search(r"zeo_auto_continue\.should_nudge\(\s*full_output\(\),", code)
+    assert re.search(r"nonlocal [^\n]*\bmessages\b", code)
+    assert re.search(r"nonlocal [^\n]*\bresponse_usage\b", code)
+    assert "for message in messages if message.get('role') != 'system'" in code
+    assert "process_messages_with_output(history)" in code
+    assert "response_usage = await stream_body_handler(res, new_form_data)" in code
+    assert "messages = history" in code
+    # v0.11's flattening would duplicate the turn into the next tool round.
+    assert "output = full_output()" not in code

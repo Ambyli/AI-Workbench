@@ -5,7 +5,10 @@ and dispatches to the per-kind loader:
 
     image → ``_load_image``  one page, decoded through a caller-supplied
                              decoder (so a service can keep its own
-                             EXIF-aware decode path), no text layer.
+                             EXIF-aware decode path), no text layer. JPEG,
+                             PNG, HEIC/HEIF (pillow-heif's Pillow plugin,
+                             registered by ``ensure_image_support``) or AVIF
+                             (Pillow's own plugin, ≥ 11.3).
     pdf   → ``_load_pdf``    per-page native text via PyMuPDF plus a raster
                              render at ``render_dpi``, capped at ``max_pages``.
     svg   → ``_load_svg``    one page, rendered by MuPDF like a one-page PDF
@@ -32,7 +35,18 @@ Design notes worth knowing before editing:
     the two OpenCV wheels (or neither).
   * The image decoder is injected rather than fixed. ``classifier`` passes its
     EXIF-correcting decoder so a phone photo loads the right way up; anything
-    else gets ``default_image_decoder``.
+    else gets ``default_image_decoder``. Either way, a decoder calls
+    ``ensure_image_support`` first: it registers pillow-heif's opener with
+    Pillow (once per process) and turns "this process cannot decode HEIC /
+    AVIF" into an ``UnsupportedDocumentError`` naming the missing package,
+    instead of PIL's "cannot identify image file".
+  * Orientation of a HEIF-family photo is applied exactly ONCE, by whichever
+    plugin decodes it, so the decoders' ``ImageOps.exif_transpose`` stays
+    correct for every format: pillow-heif applies the container's
+    ``irot`` / ``imir`` while decoding and resets the EXIF orientation tag to
+    1; Pillow's AVIF plugin leaves the pixels as stored and reports
+    ``irot`` / ``imir`` AS the EXIF orientation, which ``exif_transpose``
+    then applies. The tests pin both against an EXIF-oriented JPEG.
   * Every PyMuPDF call holds ``_PYMUPDF_LOCK``. PyMuPDF documents itself as
     not thread-safe (one global MuPDF context), and callers run these
     functions from worker threads (``asyncio.to_thread``) — several jobs at
@@ -40,8 +54,9 @@ Design notes worth knowing before editing:
     render does not stall a short ``pdf_text_regions`` lookup for seconds.
 
 Requires the ``documents`` extra: ``pymupdf`` (PDF, SVG), ``python-docx`` (DOCX),
-``pillow`` + ``numpy`` (images). Each is imported lazily inside its loader so
-a consumer that only handles .txt pays for none of them.
+``pillow`` + ``numpy`` (images), ``pillow-heif`` (HEIC/HEIF). Each is imported
+lazily inside its loader so a consumer that only handles .txt pays for none
+of them.
 
 Process flow position: called by services on upload; the ``Document`` it
 returns is then optionally OCR'd (ocr.py) and searched (textmatch.py).
@@ -53,7 +68,13 @@ import math
 import threading
 from typing import TYPE_CHECKING, Callable, Optional
 
-from .detect import DocumentKind, UnsupportedDocumentError, detect_kind, guess_content_type
+from .detect import (
+    DocumentKind,
+    UnsupportedDocumentError,
+    detect_kind,
+    guess_content_type,
+    image_format,
+)
 from .model import Document, Page
 from .svg import find_external_refs
 
@@ -87,28 +108,109 @@ _MAX_WARNING_URL = 200
 # (see the module docstring). Re-entrant so a helper can call another.
 _PYMUPDF_LOCK = threading.RLock()
 
+# pillow-heif's Pillow opener: registered once per process, on first need.
+# None = not tried yet, True = registered, False = pillow-heif not installed.
+_heif_registered: Optional[bool] = None
+_HEIF_LOCK = threading.Lock()
+
+
+def _heif_opener_registered() -> bool:
+    """Register pillow-heif's opener with Pillow (once); False when the
+    package is not installed in this process."""
+    global _heif_registered
+    if _heif_registered is not None:
+        return _heif_registered
+    with _HEIF_LOCK:
+        if _heif_registered is None:
+            try:
+                import pillow_heif
+            except ImportError:
+                _heif_registered = False
+            else:
+                pillow_heif.register_heif_opener()
+                _heif_registered = True
+    return _heif_registered
+
+
+def _avif_supported() -> bool:
+    """Whether this process's Pillow decodes AVIF (its own plugin, ≥ 11.3)."""
+    try:
+        from PIL import features
+
+        return bool(features.check_module("avif"))
+    except (ImportError, ValueError):  # no PIL, or a Pillow too old to know "avif"
+        return False
+
+
+def available_image_formats() -> list[str]:
+    """The image formats this process can decode, in ``image_format``'s names.
+
+    ``jpeg`` and ``png`` always; ``heic`` and ``heif`` when pillow-heif's
+    opener is registered (registering it if need be); ``avif`` when Pillow
+    was built with AVIF. A live answer for introspection endpoints and build
+    checks — not a compiled-in list.
+    """
+    formats = ["jpeg", "png"]
+    if _heif_opener_registered():
+        formats += ["heic", "heif"]
+    if _avif_supported():
+        formats.append("avif")
+    return formats
+
+
+def ensure_image_support(raw: bytes) -> None:
+    """Make sure Pillow can open ``raw``'s image format, or say what is missing.
+
+    Call before ``Image.open`` on caller-supplied bytes. Registers
+    pillow-heif's opener the first time it is needed; when ``image_format``
+    names a format this process cannot decode, raises a message naming the
+    missing piece rather than letting PIL answer "cannot identify image
+    file". Bytes that are no known image format just return — a caller that
+    opens anything Pillow can (the detector) relies on that.
+
+    Raises:
+        UnsupportedDocumentError: A HEIC/HEIF without pillow-heif, or an AVIF
+            with a Pillow that has no AVIF support.
+    """
+    fmt = image_format(raw)
+    if fmt in ("heic", "heif"):
+        if not _heif_opener_registered():
+            raise UnsupportedDocumentError(
+                f"This is a {fmt.upper()} image, and HEIC/HEIF needs the pillow-heif "
+                "package (common[documents]), which this service does not have."
+            )
+    elif fmt == "avif" and not _avif_supported():
+        raise UnsupportedDocumentError(
+            "This is an AVIF image, and AVIF needs Pillow ≥ 11.3 built with AVIF, "
+            "which this service does not have."
+        )
+
 
 def default_image_decoder(raw: bytes) -> "np.ndarray":
     """Decode image bytes to a BGR numpy array using PIL.
 
     Applies EXIF orientation so a portrait phone photo does not arrive
-    sideways, converts to RGB (dropping alpha / palette), then reverses the
-    channel order to the BGR convention every OpenCV consumer expects.
+    sideways (for HEIC/HEIF and AVIF the container's rotation is applied once
+    — see the module docstring), converts to RGB (dropping alpha / palette),
+    then reverses the channel order to the BGR convention every OpenCV
+    consumer expects.
 
     Args:
-        raw: JPEG or PNG bytes.
+        raw: JPEG, PNG, HEIC/HEIF or AVIF bytes.
 
     Returns:
         BGR numpy array (H×W×3, uint8).
 
     Raises:
-        UnsupportedDocumentError: If PIL cannot decode the bytes.
+        UnsupportedDocumentError: If this process lacks the format's decoder
+            (``ensure_image_support``) or PIL cannot decode the bytes.
     """
     import io
 
     import numpy as np
     from PIL import Image, ImageOps
 
+    ensure_image_support(raw)
     try:
         pil = Image.open(io.BytesIO(raw))
         pil = ImageOps.exif_transpose(pil)

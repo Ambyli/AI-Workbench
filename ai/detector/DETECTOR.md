@@ -22,7 +22,7 @@ come back with no geometry at all.
 |---|---|
 | Compose file | [`docker-compose.detector.yml`](docker-compose.detector.yml) |
 | Image | built locally from [`Dockerfile.detector`](Dockerfile.detector) (build context = repo root) |
-| Host port | `PORT_DETECTOR`, default **8021** — published by [`ai/edge`](../edge/EDGE.md), which answers `503` + `Retry-After` while the detector is recreated or still loading its model |
+| Host port | `PORT_DETECTOR`, default **8021** — published by [`ai/edge`](../edge/EDGE.md), which answers `503` + `Retry-After` while the detector is recreated or still loading its model. `8017` (the first guess) is `qwen3.8-flash`'s and 8018–8020 are `muse-glimmer` / `qwen3.8-solo` / `glm5.3-flash`'s; 8021 was the next free entry in the `PORT REGISTRY` block of `.env` |
 | Network | `ai_shared` |
 | Model | `DETECTOR_MODEL`, default `google/owlv2-base-patch16-ensemble` |
 | GPU | `device_ids: ['2']` — **shared with `qwen3.8-solo`** |
@@ -41,7 +41,7 @@ Two spellings of the same request, chosen by `Content-Type`.
 
 | Field | Required | Meaning |
 |---|---|---|
-| `file` | yes | The image (JPEG / PNG / anything Pillow opens) |
+| `file` | yes | The image (JPEG / PNG / HEIC / HEIF / AVIF / anything Pillow opens). HEIC/HEIF is decoded by pillow-heif, AVIF by Pillow's own plugin (≥ 11.3); the image build fails if either is missing. A HEIF's container rotation (`irot` / `imir`) is applied once, like a JPEG's EXIF orientation |
 | `labels` | yes | A JSON array (`["tree","house"]`) **or** a comma list (`tree, house`) **or** one name |
 | `threshold` | no | Confidence floor 0–1. Default `DETECTOR_DEFAULT_THRESHOLD` (0.25) |
 | `max_per_label` | no | Keep at most this many boxes per label, best first |
@@ -137,7 +137,9 @@ Postman collection uses.
 ## Coordinates
 
 Boxes come back in the pixel space of the image **you sent**, after EXIF
-transpose. Two resizes happen in between and neither leaks out:
+transpose (for a HEIC / HEIF / AVIF, after its container's rotation — applied
+exactly once, the same frame the classifier decodes the photo into). Two
+resizes happen in between and neither leaks out:
 
 1. This service resizes the long side down to `DETECTOR_MAX_IMAGE_SIDE`
    (1024) before inference. OWLv2 pads to a square and works on its own 960-px
@@ -338,15 +340,22 @@ slowly is more useful than one that is down, and `GET /health` reports
 ## Verifying a change
 
 The model-free parts — request parsing, the coordinate contract, response
-shaping, the family factory — are unit-tested without torch, transformers, or
+shaping, the family factory, and the image decode (HEIC / AVIF upright, a
+missing pillow-heif named) — are unit-tested without torch, transformers, or
 a GPU:
 
 ```bash
 UV_LINK_MODE=copy uv run --package classifier pytest unit-tests/detector -q
 ```
 
-(any environment with pytest, pydantic and Pillow works; the classifier's
-workspace venv has all three.)
+(any environment with pytest, pydantic and Pillow works for most of it; the
+`_decode_image` tests import `app` and also need fastapi, fastmcp and
+pillow-heif. The shared workspace venv has all of them, and
+`uv run --no-sync --with pytest --package detector python -m pytest unit-tests/detector -q`
+runs them against the detector's own dependency set. Run this suite in its
+own pytest process, never in one run with `unit-tests/classifier`: both ship a
+top-level `config.py`, and the classifier's conftest puts `ai/classifier` on
+`sys.path`.)
 
 The model path itself is deliberately **not** unit-tested — mocking a
 transformer's output shape tests the mock. Verify it by running the real
@@ -380,4 +389,4 @@ Sanity checks worth making on any change to `detectors/`:
 | Every label returns zero boxes | Either the image genuinely has none of them (try `["person","car","tree"]` on a street photo to confirm the model works), or the threshold is too high. OWLv2 scores are low in absolute terms; 0.2–0.3 is a normal working range. |
 | Spurious boxes covering the whole image | Threshold too low. Also true of OWLv2 generally — a full-frame box is usually the model saying "I have nothing". |
 | OOM on GPU 2 | `qwen3.8-solo` grew, or `DETECTOR_MODEL` was pointed at the `large` checkpoint. Drop back to `base`, or set `DETECTOR_DEVICE=cpu`. |
-| Classifier jobs show `artifacts.notes` about the detector | Expected degradation, not a failure — the classifier never fails a job because an enrichment did. The note says whether it was unconfigured or unreachable. |
+| Classifier criteria come back `status: "error"` naming the detector | The classifier's `DETECTOR_URL` is set but the detector did not answer (refused, timed out after `DETECTOR_TIMEOUT_S`, a `503` while the model loads). Only the criteria that asked the detector fail, and the job is `complete: false` — there is no silent fall-through to the LLM ([API.md § The detector](../classifier/API.md#the-detector)). With `DETECTOR_URL` empty a `detector` criterion is refused at submit instead. |

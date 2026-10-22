@@ -11,7 +11,8 @@ dependencies = [
     "fastmcp>=2.0",
     "pydantic",
     "python-multipart",          # POST /detect accepts a multipart upload
-    "Pillow>=11.0.0",            # decode + EXIF transpose + the pre-inference resize
+    "Pillow>=11.3.0",            # decode + EXIF transpose + the pre-inference resize; AVIF from 11.3
+    "pillow-heif>=1.8.1,<2",     # HEIC/HEIF decode (common.documents.ensure_image_support)
     "numpy>=1.26",
     # ── The model stack ────────────────────────────────────────────────────
     # torch's Linux wheels on PyPI are the CUDA build (2.14 bundles the

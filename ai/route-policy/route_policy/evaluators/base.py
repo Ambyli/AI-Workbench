@@ -1,0 +1,340 @@
+"""The evaluator plugin contract: base class, declared output, registry.
+
+**The standard** (the classifier's ``@result_spec``, ai/classifier/analysis/
+result_specs.py): an evaluator's ``detail`` shape is declared NEXT TO THE
+CODE THAT PRODUCES IT and registers itself under the key consumers look it up
+by -- here the ruleset's ``type``::
+
+    @declares(OutputSpec(type="regex_text", fields={...}, ...))
+    class RegexText(Evaluator):
+        Config = RegexTextConfig          # pydantic, extra="forbid"
+        async def evaluate(self, ctx): ...
+
+``GET /evaluator-types`` serves every registered type's config schema and
+declared output. ``unit-tests/route-policy/test_declarations.py`` runs every
+real evaluator -- votes, abstains, edge cases -- and fails on an undeclared
+``detail`` key, a missing always-present key, or a value of the wrong kind.
+Adding a type means: a module here with ``@declares``, one line in
+``_DECLARING_MODULES``, and cases in that test, in the same change.
+
+**What an evaluator returns** is an :class:`Outcome`: it voted (for the
+ruleset entry's ``vote.route``, unless the evaluator names its own) or it
+abstained, with a human reason and a ``detail`` dict. It never sees roles,
+weights or other evaluators' votes -- those belong to the pipeline and the
+combiner. An evaluator never raises on odd input; if it does anyway, the
+pipeline records an abstain with the error.
+
+**Exchange relevance.** An evaluator that can judge ONE past exchange (its
+user text and the rounds after it) overrides :meth:`Evaluator.exchange_relevance`;
+the ``cooldown`` evaluator asks the evaluators its ``relevant_if`` names. That
+is how ``sticky-code`` reuses ``code-tools`` and ``code-text`` instead of
+repeating their patterns.
+
+**Analyses** (the ``llm_classifier``). An evaluator whose vote depends on a
+slow, background judgement keeps ``evaluate`` pure by splitting the work:
+
+* :meth:`Evaluator.analysis_lookups` names the stored verdicts it wants
+  (content-addressed keys); the service reads them all in ONE query and puts
+  them on ``ctx.analyses`` before the pipeline runs;
+* :meth:`Evaluator.evaluate` reads ``ctx.analyses`` and nothing else;
+* :meth:`Evaluator.analysis_requests` names what should be classified next;
+  the service enqueues it AFTER answering ``/decide`` (``analysis.queue``).
+
+Both default to nothing, so every other type is untouched.
+
+**Signals** (phase 5: ``pii``, ``nearest_examples``, ``prompt_injection``,
+``language``). An evaluator that reads the ``signals`` sidecar keeps
+``evaluate`` pure the same way:
+
+* :meth:`Evaluator.signal_requests` names the sidecar tasks it will read
+  and over which texts (``signals.model.SignalRequest``, cheap and pure);
+  the pipeline merges every evaluator's into ONE request, and the service
+  sends it before the pipeline runs, within ROUTE_POLICY_SIGNALS_BUDGET_S,
+  and puts the answer on ``ctx.signals`` (or why not on
+  ``ctx.signals_error``);
+* :meth:`Evaluator.evaluate` reads ``ctx.signals`` and nothing else -- a
+  missing or cut answer is an abstain (``pii`` still votes from its
+  in-process patterns);
+* :meth:`Evaluator.signal_warmups` names work the sidecar should start at
+  startup (``nearest_examples``: embedding its example set), sent once
+  before the service takes traffic;
+* :meth:`Evaluator.signal_tasks` names, statically, each task it may ask
+  for and the key its requests always carry -- validation refuses a
+  ruleset in which two evaluators would ask for one task with different
+  parameters (a request carries each task once: results are keyed by task).
+
+All default to nothing.
+"""
+
+from __future__ import annotations
+
+import importlib
+from dataclasses import dataclass, field
+from typing import Any, Callable, ClassVar, Dict, List, Mapping, Optional, Sequence, Tuple, Type, TypeVar
+
+from pydantic import BaseModel, ConfigDict
+
+from ..analysis.model import AnalysisRequest
+from ..signals.model import SignalRequest
+
+# -- Declared output ------------------------------------------------------------
+
+# JSON kinds a detail value may have. bool is excluded from the numeric kinds
+# on purpose (in Python it is an int).
+KINDS = ("string", "number", "integer", "boolean", "array", "object")
+
+
+def _is_kind(value: Any, kind: str) -> bool:
+    if kind == "string":
+        return isinstance(value, str)
+    if kind == "boolean":
+        return isinstance(value, bool)
+    if kind == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if kind == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if kind == "array":
+        return isinstance(value, list)
+    if kind == "object":
+        return isinstance(value, dict)
+    return False
+
+
+@dataclass(frozen=True)
+class FieldSpec:
+    """One ``detail`` key."""
+
+    description: str
+    kind: str
+    nullable: bool = False          # the value may be null
+    when: Optional[str] = None      # present only in this case; None = always present
+
+    def __post_init__(self) -> None:
+        if self.kind not in KINDS:
+            raise ValueError(f"unknown kind {self.kind!r}; expected one of {KINDS}")
+
+
+@dataclass(frozen=True)
+class OutputSpec:
+    """What one evaluator type returns: when it votes, and its ``detail``."""
+
+    type: str
+    summary: str
+    votes: str                                  # when it votes, and for which route
+    fields: Dict[str, FieldSpec] = field(default_factory=dict)
+    relevance: Optional[str] = None             # what one exchange's relevance means; None = not offered
+    notes: Tuple[str, ...] = ()
+
+    def required(self) -> set:
+        return {k for k, f in self.fields.items() if f.when is None}
+
+    def problems(self, detail: Any) -> List[str]:
+        """Everything about ``detail`` that contradicts this declaration."""
+        if not isinstance(detail, dict):
+            return [f"{self.type}: detail is {type(detail).__name__}, not an object"]
+        out = []
+        for key in sorted(set(detail) - set(self.fields)):
+            out.append(f"{self.type}: undeclared detail key {key!r}")
+        for key in sorted(self.required() - set(detail)):
+            out.append(f"{self.type}: always-present detail key {key!r} is missing")
+        for key, spec in self.fields.items():
+            if key not in detail:
+                continue
+            value = detail[key]
+            if value is None:
+                if not spec.nullable:
+                    out.append(f"{self.type}: detail key {key!r} is null but not declared nullable")
+            elif not _is_kind(value, spec.kind):
+                out.append(f"{self.type}: detail key {key!r} is {type(value).__name__}, declared {spec.kind}")
+        return out
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "summary": self.summary,
+            "votes": self.votes,
+            "relevance": self.relevance,
+            "detail": {
+                key: {
+                    "kind": f.kind,
+                    "description": f.description,
+                    **({"nullable": True} if f.nullable else {}),
+                    **({"when": f.when} if f.when else {}),
+                }
+                for key, f in self.fields.items()
+            },
+            "notes": list(self.notes),
+        }
+
+
+# -- What an evaluator returns --------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Outcome:
+    voted: bool
+    reason: str
+    detail: Dict[str, Any] = field(default_factory=dict)
+    confidence: float = 1.0
+    # None = the ruleset entry's vote.route. An evaluator that picks its own
+    # route (the llm_classifier: the verdict's route) sets it; the pipeline
+    # still refuses a route the ruleset does not list.
+    route: Optional[str] = None
+
+    @classmethod
+    def vote(cls, reason: str, detail: Dict[str, Any], *, confidence: float = 1.0,
+             route: Optional[str] = None) -> "Outcome":
+        return cls(True, reason, detail, confidence, route)
+
+    @classmethod
+    def abstain(cls, reason: str, detail: Dict[str, Any]) -> "Outcome":
+        return cls(False, reason, detail)
+
+
+# -- The base class ---------------------------------------------------------------
+
+
+class EvaluatorConfig(BaseModel):
+    """Base of every evaluator's ``config`` model: unknown keys are an error,
+    so a typo in a ruleset fails validation instead of being ignored."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class Evaluator:
+    """One configured evaluator in one compiled ruleset.
+
+    Subclasses set ``Config`` and implement :meth:`evaluate`; ``@declares``
+    sets ``type_name`` and ``output``.
+    """
+
+    type_name: ClassVar[str] = ""
+    output: ClassVar[OutputSpec]
+    Config: ClassVar[Type[EvaluatorConfig]] = EvaluatorConfig
+    # True: the entry must carry vote.route, and a vote goes there. False:
+    # the evaluator names the route itself (Outcome.route) and the entry may
+    # not set vote.route (llm_classifier).
+    needs_vote_route: ClassVar[bool] = True
+
+    def __init__(self, evaluator_id: str, config: EvaluatorConfig) -> None:
+        self.id = evaluator_id
+        self.config = config
+
+    def bind(self, siblings: Mapping[str, Optional["Evaluator"]]) -> None:
+        """Resolve references to other evaluators of the same ruleset (every
+        declared id, self included; None for one that failed validation).
+        Raise ValueError on a bad reference; validation reports it as a
+        ruleset error."""
+
+    def check_routes(self, routes: Sequence[str]) -> None:
+        """Check the routes this evaluator's ``config`` names against the
+        ruleset's ``routes``; raise ValueError (validation reports it as a
+        ruleset error). Only types that name routes in their config override
+        it -- ``vote.route`` itself is checked by the validator."""
+
+    async def evaluate(self, ctx: Any) -> Outcome:  # ctx: engine.context.RequestContext
+        raise NotImplementedError
+
+    def analysis_lookups(self, ctx: Any) -> Sequence[str]:
+        """The stored verdicts (``analyses`` keys) :meth:`evaluate` will read
+        from ``ctx.analyses``. Called before the pipeline; must be cheap and
+        pure."""
+        return ()
+
+    def analysis_requests(self, ctx: Any) -> Sequence[AnalysisRequest]:
+        """What to classify in the background for this request. Called after
+        ``/decide`` has answered (never by ``/evaluate``)."""
+        return ()
+
+    def signal_requests(self, ctx: Any) -> Sequence[SignalRequest]:
+        """The sidecar tasks :meth:`evaluate` will read from ``ctx.signals``,
+        with their texts. Called before the pipeline; must be cheap and
+        pure."""
+        return ()
+
+    def signal_warmups(self) -> Sequence[SignalRequest]:
+        """Sidecar work to start before this copy serves (texts empty): the
+        ``nearest_examples`` example set. Sent once, at startup, for every
+        bound ruleset."""
+        return ()
+
+    def signal_tasks(self) -> Mapping[str, str]:
+        """task -> the ``SignalRequest.key`` every request of this evaluator
+        for that task carries (texts aside). ``rulesets.validate`` refuses
+        two evaluators of a ruleset with different keys for one task."""
+        return {}
+
+    def exchange_relevance(self, text: str, rounds: List[dict]) -> Optional[str]:
+        """Why one exchange (its user text, the messages after it) counts,
+        or None. Only types whose ``output.relevance`` is set implement it."""
+        raise NotImplementedError(f"{self.type_name} does not judge single exchanges")
+
+    @classmethod
+    def supports_relevance(cls) -> bool:
+        return cls.exchange_relevance is not Evaluator.exchange_relevance
+
+    @classmethod
+    def describe(cls) -> Dict[str, Any]:
+        """This type as GET /evaluator-types serves it."""
+        return {
+            "vote_route": "required" if cls.needs_vote_route else "chosen by the evaluator",
+            "config_schema": cls.Config.model_json_schema(),
+            "output": cls.output.as_dict(),
+        }
+
+
+# -- The registry ------------------------------------------------------------------
+
+_REGISTRY: Dict[str, Type[Evaluator]] = {}
+
+# The modules that declare a type, imported on first lookup -- so asking for
+# the registry before anything imported the evaluators still finds them all.
+_DECLARING_MODULES = (
+    "route_policy.evaluators.regex_text",
+    "route_policy.evaluators.tool_calls",
+    "route_policy.evaluators.cooldown",
+    "route_policy.evaluators.backend_load",
+    "route_policy.evaluators.static",
+    "route_policy.evaluators.llm_classifier",
+    "route_policy.evaluators.pii",
+    "route_policy.evaluators.nearest_examples",
+    "route_policy.evaluators.prompt_injection",
+    "route_policy.evaluators.language",
+    "route_policy.evaluators.text_shape",
+    "route_policy.evaluators.context_size",
+)
+_loaded = False
+
+E = TypeVar("E", bound=Type[Evaluator])
+
+
+def declares(spec: OutputSpec) -> Callable[[E], E]:
+    """Class decorator: declare what an evaluator type returns, and register
+    the class under ``spec.type``. The same class twice is fine; a different
+    class for a registered type is a bug."""
+
+    def attach(cls: E) -> E:
+        if not (isinstance(cls, type) and issubclass(cls, Evaluator)):
+            raise TypeError("@declares decorates an Evaluator subclass")
+        existing = _REGISTRY.get(spec.type)
+        if existing is not None and existing is not cls:
+            raise ValueError(f"an evaluator type {spec.type!r} is already registered")
+        cls.type_name = spec.type
+        cls.output = spec
+        _REGISTRY[spec.type] = cls
+        return cls
+
+    return attach
+
+
+def registry() -> Dict[str, Type[Evaluator]]:
+    """Every registered evaluator type, loading the declaring modules once."""
+    global _loaded
+    if not _loaded:
+        for module in _DECLARING_MODULES:
+            importlib.import_module(module)
+        _loaded = True
+    return dict(_REGISTRY)
+
+
+def evaluator_type(name: str) -> Optional[Type[Evaluator]]:
+    return registry().get(name)

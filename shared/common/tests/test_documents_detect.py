@@ -11,14 +11,43 @@ import zipfile
 
 import pytest
 
-from common.documents import UnsupportedDocumentError, detect_kind, guess_content_type
+from common.documents import (
+    EXTENSIONS,
+    UnsupportedDocumentError,
+    detect_kind,
+    guess_content_type,
+    image_format,
+)
 
-from .documents_fixtures import make_docx, make_jpeg, make_pdf, make_png, make_svg
+from .documents_fixtures import (
+    make_avif,
+    make_docx,
+    make_ftyp,
+    make_heic,
+    make_jpeg,
+    make_pdf,
+    make_png,
+    make_svg,
+)
+
+
+def _pillow_has_avif() -> bool:
+    try:
+        from PIL import features
+
+        return bool(features.check_module("avif"))
+    except (ImportError, ValueError):
+        return False
+
+
+needs_avif = pytest.mark.skipif(not _pillow_has_avif(), reason="Pillow built without AVIF")
 
 
 def test_detects_png_and_jpeg() -> None:
     assert detect_kind(make_png()) == "image"
     assert detect_kind(make_jpeg()) == "image"
+    assert image_format(make_png()) == "png"
+    assert image_format(make_jpeg()) == "jpeg"
 
 
 def test_guess_content_type_distinguishes_png_from_jpeg() -> None:
@@ -83,6 +112,126 @@ def test_unknown_binary_is_rejected_with_hex_hint() -> None:
         detect_kind(b"\x7fELF\x02\x01\x01\x00binary", filename="thing.bin")
     assert "7f454c4602010100" in str(exc.value)
     assert "SVG" in str(exc.value)  # the "Supported:" list names every kind
+    assert "HEIC" in str(exc.value) and "AVIF" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# HEIC / HEIF / AVIF — the image kind, told apart by ftyp brand
+# ---------------------------------------------------------------------------
+
+
+def test_real_heic_is_an_image() -> None:
+    pytest.importorskip("pillow_heif")
+    raw = make_heic()
+    assert detect_kind(raw) == "image"
+    assert image_format(raw) == "heic"
+    assert guess_content_type("image", raw) == "image/heic"
+
+
+@needs_avif
+def test_real_avif_is_an_image() -> None:
+    raw = make_avif()
+    assert detect_kind(raw) == "image"
+    assert image_format(raw) == "avif"
+    assert guess_content_type("image", raw) == "image/avif"
+
+
+@pytest.mark.parametrize(
+    "major,compatible,expected",
+    [
+        ("heic", ["mif1", "heic"], "heic"),     # an iPhone photo
+        ("mif1", ["heic"], "heic"),             # a Samsung photo: generic major, HEIC compatible
+        ("heix", [], "heic"),                   # 10-bit HEVC
+        ("msf1", ["hevc"], "heic"),             # an HEVC image sequence
+        ("avif", ["mif1", "miaf"], "avif"),
+        ("mif1", ["miaf", "avif"], "avif"),     # generic major, AVIF compatible
+        ("avis", [], "avif"),
+        ("mif1", [], "heif"),                   # structural brand only, no codec named
+        ("mif1", ["miaf"], "heif"),
+        ("isom", ["mif1"], "heif"),             # an unknown major brand does not hide mif1
+    ],
+)
+def test_ftyp_brands_decide_the_format(major, compatible, expected) -> None:
+    raw = make_ftyp(major, compatible)
+    assert image_format(raw) == expected
+    assert detect_kind(raw) == "image"
+    assert guess_content_type("image", raw) == f"image/{expected}"
+
+
+@pytest.mark.parametrize(
+    "major,compatible,brand",
+    [
+        ("isom", ["isom", "iso2", "avc1", "mp41"], "'isom'"),  # an MP4
+        ("mp42", ["mp42", "mp41"], "'mp42'"),
+        ("qt  ", ["qt  "], "'qt  '"),                           # a Live Photo .MOV
+    ],
+)
+def test_video_gets_a_specific_message(major, compatible, brand) -> None:
+    raw = make_ftyp(major, compatible, tail=b"\x00\x00\x00\x08free" + b"\x00" * 64)
+    assert image_format(raw) is None
+    with pytest.raises(UnsupportedDocumentError) as exc:
+        detect_kind(raw, filename="IMG_0001.MOV")
+    message = str(exc.value)
+    assert "video" in message and "still photo" in message
+    assert brand in message
+
+
+def test_brands_are_read_only_inside_the_ftyp_box() -> None:
+    # "heic" right after a 24-byte MP4 ftyp box is the next box's bytes, not
+    # a compatible brand of this one.
+    raw = make_ftyp("isom", ["mp42", "avc1"]) + b"heic" + b"\x00" * 64
+    assert image_format(raw) is None
+    with pytest.raises(UnsupportedDocumentError, match="video"):
+        detect_kind(raw)
+
+
+def test_a_size_past_the_buffer_is_bounded_by_the_buffer() -> None:
+    # A truncated upload: the box claims 4 KB, the bytes stop after one
+    # compatible brand. The brands that are present still count.
+    assert image_format(make_ftyp("mif1", ["heic"], size=4096)) == "heic"
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b"\x00\x00\x00\x18ftyp",                     # cut off before the major brand
+        b"\x00\x00\x00\x18ftyphe",                   # cut off inside it
+        b"\x00\x00\x00\x18ftypheic",                 # no minor version
+        make_ftyp("heic", ["mif1"], size=8),         # a size smaller than the header
+        make_ftyp("heic", ["mif1"], size=12),
+    ],
+    ids=["no-major", "half-major", "no-minor", "size-8", "size-12"],
+)
+def test_a_truncated_or_lying_ftyp_is_not_an_image(raw) -> None:
+    assert image_format(raw) is None
+    with pytest.raises(UnsupportedDocumentError) as exc:
+        detect_kind(raw)
+    assert "Unsupported file type" in str(exc.value)  # not mistaken for video either
+
+
+def test_text_with_ftyp_at_offset_four_is_still_text() -> None:
+    # "The " read as a box size is ~1.4 GB — past _MAX_FTYP_BOX, so this is
+    # not an ftyp and the file is not refused as a video.
+    raw = b"The ftyp box opens every MP4; heic and avif are its image brands.\n"
+    assert image_format(raw) is None
+    assert detect_kind(raw) == "txt"
+
+
+def test_a_size_past_the_ftyp_cap_is_not_an_ftyp() -> None:
+    assert image_format(make_ftyp("heic", ["mif1"], size=4097)) is None
+
+
+def test_a_size_zero_ftyp_runs_to_the_end_of_the_buffer() -> None:
+    assert image_format(make_ftyp("mif1", ["heic"], size=0, tail=b"\x00" * 8192)) == "heic"
+
+
+def test_image_extensions_include_the_heif_family() -> None:
+    assert EXTENSIONS["image"] == [".jpg", ".jpeg", ".png", ".heic", ".heif", ".avif"]
+
+
+def test_image_content_type_never_guesses_jpeg() -> None:
+    # Bytes that are no image format at all are not labelled image/jpeg.
+    assert guess_content_type("image", b"not an image") == "application/octet-stream"
 
 
 # ---------------------------------------------------------------------------

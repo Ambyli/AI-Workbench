@@ -1,0 +1,26 @@
+# privacy_kw -- PII keywords, for the `default` ruleset's `privacy` evaluator
+# (role: force -> local-private).
+#
+# The only copy: this file is the source of truth. It is part of every
+# ruleset version that references it (its content, not these comments, is
+# inlined and hashed), so an edit here needs a ruleset `version` bump
+# (ROUTE_POLICY.md § Changing a ruleset).
+#
+# No `method`: each keyword is a whole-word literal, case-insensitive
+# (common.keywordmatch). Literal words are lexical: a PII prompt that names
+# none of them is NOT caught -- widen the list rather than trusting the
+# match.
+name: privacy_kw
+operator: OR
+case_sensitive: false
+keywords:
+  - ssn
+  - social security
+  - credit card
+  - passport
+  - date of birth
+  - driver license
+  - bank account
+  - routing number
+  - medical record
+  - customer address

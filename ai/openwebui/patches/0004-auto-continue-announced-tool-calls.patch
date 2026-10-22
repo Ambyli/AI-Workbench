@@ -1,6 +1,6 @@
 Zeo patch 0004 — nudge a model that announces a tool call instead of making it.
 
-Target: Open WebUI v0.11.4 (ghcr.io/open-webui/open-webui:v0.11.4).
+Target: Open WebUI v0.12.3 (ghcr.io/open-webui/open-webui:v0.12.3).
 Applied by ai/openwebui/Dockerfile.openwebui with `patch -p1` from /app.
 
 Upstream: with native function calling the backend runs the tool loop
@@ -42,7 +42,7 @@ out of this file).
 
 --- a/backend/open_webui/utils/middleware.py
 +++ b/backend/open_webui/utils/middleware.py
-@@ -5888,7 +5888,112 @@
+@@ -5611,7 +5611,137 @@
                              }
                          )
  
@@ -59,7 +59,7 @@ out of this file).
 +                zeo_auto_continue_nudges = 0
 +
 +                async def zeo_auto_continue_round():
-+                    nonlocal output, prior_output, output_start, zeo_auto_continue_nudges
++                    nonlocal output, prior_output, output_start, response_usage, messages, zeo_auto_continue_nudges
 +                    from open_webui.utils import zeo_auto_continue
 +
 +                    while True:
@@ -67,8 +67,11 @@ out of this file).
 +                            return False
 +                        if ENABLE_RESPONSES_API_STATEFUL and last_response_id:
 +                            return False
++                        # full_output(), not output: after a tool round `output` holds
++                        # only the latest reply, and the check needs the tool result
++                        # that came before it.
 +                        announced = zeo_auto_continue.should_nudge(
-+                            output,
++                            full_output(),
 +                            nudges_used=zeo_auto_continue_nudges,
 +                            tool_rounds=tool_call_iterations,
 +                            native=metadata.get('params', {}).get('function_calling') != 'legacy',
@@ -86,19 +89,40 @@ out of this file).
 +                            )
 +                        )
 +                        try:
++                            # The history a tool round builds: the system messages,
++                            # `messages` (the conversation through the last tool
++                            # results, compacted if upstream compacted it), then the
++                            # reply being nudged. The nudge goes on the request only.
++                            reply_messages = convert_output_to_messages(
++                                output,
++                                raw=True,
++                                reasoning_format=get_reasoning_format(model),
++                                flatten_tool_images=True,
++                            )
++                            if response_usage and reply_messages:
++                                reply_messages[0]['usage'] = response_usage
++                            history = [
++                                *[message for message in form_data['messages'] if message.get('role') == 'system'],
++                                *[message for message in messages if message.get('role') != 'system'],
++                                *reply_messages,
++                            ]
++                            request_messages = process_messages_with_output(history)
++                            context_summary = next(
++                                (message['contextSummary'] for message in history if message.get('contextSummary')),
++                                None,
++                            )
++                            if context_summary:
++                                request_messages.insert(
++                                    1 if request_messages and request_messages[0].get('role') == 'system' else 0,
++                                    {'role': 'system', 'content': f'[CONVERSATION SUMMARY]\n{context_summary}'},
++                                )
 +                            new_form_data = {
 +                                **form_data,
 +                                'model': model_id,
 +                                'stream': True,
 +                                'metadata': metadata,
 +                                'messages': [
-+                                    *form_data['messages'],
-+                                    *convert_output_to_messages(
-+                                        output,
-+                                        raw=True,
-+                                        reasoning_format=get_reasoning_format(model),
-+                                        flatten_tool_images=True,
-+                                    ),
++                                    *request_messages,
 +                                    {'role': 'user', 'content': zeo_auto_continue.NUDGE_TEXT},
 +                                ],
 +                            }
@@ -140,9 +164,10 @@ out of this file).
 +                                    prior_output.pop()
 +                            output = []
 +                            output_start = len(prior_output)
-+                            await stream_body_handler(res, new_form_data)
-+                            output = full_output()
-+                            prior_output = []
++                            response_usage = await stream_body_handler(res, new_form_data)
++                            # The nudged reply is now part of the conversation the
++                            # next tool round builds on; the nudge is not.
++                            messages = history
 +                        except Exception as e:
 +                            # The reply being nudged is already complete and shown:
 +                            # a failed nudge ends the turn as upstream would have.

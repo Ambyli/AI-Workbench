@@ -343,3 +343,21 @@ def test_middleware_hunk_references_existing_module_api():
     assert "while (tool_calls or await zeo_auto_continue_round())" in added
     # The nudge must stay out of `output` (what is shown and saved).
     assert "output.append" not in added
+
+
+def test_middleware_hunk_follows_the_v012_tool_loop_bookkeeping():
+    # Since v0.12 a tool round keeps only the latest reply in `output` and the
+    # conversation in `messages`: the check must read full_output() (it needs
+    # the tool result before the reply), the request must be built from
+    # `messages`, and the nudged reply must join `messages` for the next round.
+    added = "\n".join(line[1:] for line in _SECTIONS[_MIDDLEWARE_PATH] if line.startswith("+"))
+    code = "\n".join(line for line in added.split("\n") if not line.lstrip().startswith("#"))
+    assert re.search(r"zeo_auto_continue\.should_nudge\(\s*full_output\(\),", code)
+    assert re.search(r"nonlocal [^\n]*\bmessages\b", code)
+    assert re.search(r"nonlocal [^\n]*\bresponse_usage\b", code)
+    assert "for message in messages if message.get('role') != 'system'" in code
+    assert "process_messages_with_output(history)" in code
+    assert "response_usage = await stream_body_handler(res, new_form_data)" in code
+    assert "messages = history" in code
+    # v0.11's flattening would duplicate the turn into the next tool round.
+    assert "output = full_output()" not in code

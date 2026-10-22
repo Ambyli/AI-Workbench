@@ -2,7 +2,7 @@
 
 The patched code only exists inside
 ``ai/openwebui/patches/0005-forward-message-id-header.patch`` (it is applied to
-upstream's ``routers/openai.py`` at image build time). The patch is generated
+upstream's ``utils/headers.py`` at image build time). The patch is generated
 with four lines of context, so its second hunk carries the WHOLE
 ``if ENABLE_FORWARD_USER_INFO_HEADERS and user:`` block of
 ``get_headers_and_cookies``. These tests cut that block out of the hunk, check
@@ -24,7 +24,7 @@ _ROOT = pathlib.Path(__file__).resolve().parents[2]
 _OWUI = _ROOT / "ai" / "openwebui"
 _PATCH_DIR = _OWUI / "patches"
 _PATCH = _PATCH_DIR / "0005-forward-message-id-header.patch"
-_OPENAI_PATH = "backend/open_webui/routers/openai.py"
+_HEADERS_PATH = "backend/open_webui/utils/headers.py"
 _GUARD = "    if ENABLE_FORWARD_USER_INFO_HEADERS and user:"
 
 CHAT_HEADER = "X-OpenWebUI-Chat-Id"  # env.py FORWARD_SESSION_INFO_HEADER_CHAT_ID default
@@ -57,7 +57,7 @@ _HUNKS = _file_hunks(_PATCH_TEXT)
 
 
 def _block_hunk() -> list[str]:
-    matches = [h for h in _HUNKS.get(_OPENAI_PATH, []) if any(line == " " + _GUARD for line in h)]
+    matches = [h for h in _HUNKS.get(_HEADERS_PATH, []) if any(line == " " + _GUARD for line in h)]
     assert len(matches) == 1, "expected exactly one hunk carrying the user-info guard as context"
     return matches[0]
 
@@ -99,22 +99,29 @@ def _run(*, enabled=True, user="u-1", metadata=None) -> dict:
 # --- the patch's shape --------------------------------------------------------
 
 
-def test_patch_only_touches_routers_openai():
-    assert set(_HUNKS) == {_OPENAI_PATH}
-    assert "--- a/" + _OPENAI_PATH in _PATCH_TEXT.splitlines()
+def test_patch_only_touches_utils_headers():
+    assert set(_HUNKS) == {_HEADERS_PATH}
+    assert "--- a/" + _HEADERS_PATH in _PATCH_TEXT.splitlines()
 
 
 def test_import_hunk_adds_the_message_id_constant_to_the_env_import():
-    added = [line for hunk in _HUNKS[_OPENAI_PATH] for line in hunk if line.startswith("+")]
+    added = [line for hunk in _HUNKS[_HEADERS_PATH] for line in hunk if line.startswith("+")]
     assert "+    FORWARD_SESSION_INFO_HEADER_MESSAGE_ID," in added
-    import_hunk = next(h for h in _HUNKS[_OPENAI_PATH] if "+    FORWARD_SESSION_INFO_HEADER_MESSAGE_ID," in h)
+    import_hunk = next(h for h in _HUNKS[_HEADERS_PATH] if "+    FORWARD_SESSION_INFO_HEADER_MESSAGE_ID," in h)
     new = _new_side(import_hunk)
     i = new.index("    FORWARD_SESSION_INFO_HEADER_MESSAGE_ID,")
     # Same parenthesised `from open_webui.env import (...)` list as the chat-id
     # constant and the flag it is guarded by.
     assert new[i - 1] == "    FORWARD_SESSION_INFO_HEADER_CHAT_ID,"
     assert "    ENABLE_FORWARD_USER_INFO_HEADERS," in new[:i]
-    assert ")" in new[i + 1 :]
+    opener = new.index("from open_webui.env import (")
+    assert opener < i
+    # Everything from the opener to the end of the hunk (or the closing paren)
+    # is one name per line: the new line is inside that import list.
+    inside = new[opener + 1 :]
+    if ")" in inside:
+        inside = inside[: inside.index(")")]
+    assert all(re.fullmatch(r"    [A-Z_]+,", line) for line in inside), inside
 
 
 def test_message_id_line_is_inside_the_user_info_guard():
@@ -131,8 +138,8 @@ def test_message_id_line_is_inside_the_user_info_guard():
 
 def test_patched_line_is_the_one_the_dockerfile_greps_for():
     dockerfile = (_OWUI / "Dockerfile.openwebui").read_text(encoding="utf-8")
-    m = re.search(r'grep -qF "([^"]+)" ' + re.escape(_OPENAI_PATH), dockerfile)
-    assert m, "Dockerfile.openwebui must grep routers/openai.py for the 0005 line"
+    m = re.search(r'grep -qF "([^"]+)" ' + re.escape(_HEADERS_PATH), dockerfile)
+    assert m, "Dockerfile.openwebui must grep utils/headers.py for the 0005 line"
     hunk = _block_hunk()
     assert any(line.startswith("+") and m.group(1) in line for line in hunk)
     assert not any(line.startswith(" ") and m.group(1) in line for line in hunk), "the guard must not match upstream"
@@ -189,7 +196,7 @@ def test_dockerfile_lists_every_patch():
     assert label and label.group(1).split(",") == stems
     for stem in stems:
         assert f"#   {stem}.patch" in dockerfile, f"{stem} missing from the Dockerfile header comment"
-    assert f"        {_OPENAI_PATH}" in dockerfile, "routers/openai.py missing from the ast.parse list"
+    assert f"        {_HEADERS_PATH}" in dockerfile, "utils/headers.py missing from the compile list"
 
 
 def test_compose_and_env_example_wire_the_flag():

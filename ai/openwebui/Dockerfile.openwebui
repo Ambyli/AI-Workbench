@@ -45,9 +45,10 @@
 #       (LiteLLM) carries X-OpenWebUI-Message-Id (the assistant message id)
 #       beside upstream's X-OpenWebUI-Chat-Id, so LiteLLM can tie a request to
 #       the chat turn it answers. Upstream sends the message id to tool
-#       servers only. Touches backend/open_webui/routers/openai.py.
+#       servers only. Touches backend/open_webui/utils/headers.py (where
+#       get_headers_and_cookies has lived since v0.12; routers/openai.py before).
 
-ARG OPENWEBUI_VERSION=v0.11.4
+ARG OPENWEBUI_VERSION=v0.12.3
 FROM ghcr.io/open-webui/open-webui:${OPENWEBUI_VERSION}
 
 # Upstream ends its Dockerfile with `USER $UID:$GID`, 0:0 by default, so we
@@ -58,8 +59,9 @@ COPY ai/openwebui/patches/*.patch /tmp/zeo-patches/
 
 # Three checks per build, each of which fails the build on its own:
 #   1. --dry-run: every hunk of every patch still matches upstream's code.
-#   2. ast.parse: every patched module still parses (catches a half-applied
-#      hunk that would otherwise only surface at container start).
+#   2. compile: every patched module still compiles (catches a half-applied
+#      hunk, or a nested hook whose `nonlocal` names a variable upstream
+#      renamed, that would otherwise only surface at container start).
 #   3. grep: the feature is really present (catches a patch that applied to
 #      the wrong context and changed nothing that matters).
 RUN set -eu; \
@@ -70,7 +72,7 @@ RUN set -eu; \
         patch -p1 --forward --dry-run < "$p"; \
         patch -p1 --forward < "$p"; \
     done; \
-    python3 -c 'import ast,sys; [ast.parse(open(f).read(), f) for f in sys.argv[1:]]' \
+    python3 -c 'import sys; [compile(open(f).read(), f, "exec") for f in sys.argv[1:]]' \
         backend/open_webui/env.py \
         backend/open_webui/routers/auths.py \
         backend/open_webui/utils/trusted_proxy.py \
@@ -79,12 +81,12 @@ RUN set -eu; \
         backend/open_webui/utils/mcp_oauth_defaults.py \
         backend/open_webui/utils/middleware.py \
         backend/open_webui/utils/zeo_auto_continue.py \
-        backend/open_webui/routers/openai.py; \
+        backend/open_webui/utils/headers.py; \
     grep -q "verify_google_identity" backend/open_webui/routers/auths.py; \
     grep -q "drop_unconnected_oauth_tool_defaults" backend/open_webui/main.py; \
     grep -q "_zeo_refresh_single_flight" backend/open_webui/utils/oauth.py; \
     grep -q "zeo_auto_continue_round" backend/open_webui/utils/middleware.py; \
-    grep -qF "headers[FORWARD_SESSION_INFO_HEADER_MESSAGE_ID]" backend/open_webui/routers/openai.py; \
+    grep -qF "headers[FORWARD_SESSION_INFO_HEADER_MESSAGE_ID]" backend/open_webui/utils/headers.py; \
     rm -rf /tmp/zeo-patches
 
 # Record the base and the patch set on the image so `docker image inspect`

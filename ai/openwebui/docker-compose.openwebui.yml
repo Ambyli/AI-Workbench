@@ -29,8 +29,8 @@ services:
       context: ../..
       dockerfile: ai/openwebui/Dockerfile.openwebui
       args:
-        OPENWEBUI_VERSION: ${OPENWEBUI_VERSION:-v0.11.4}
-    image: openwebui-zeo:${OPENWEBUI_VERSION:-v0.11.4}
+        OPENWEBUI_VERSION: ${OPENWEBUI_VERSION:-v0.12.3}
+    image: openwebui-zeo:${OPENWEBUI_VERSION:-v0.12.3}
     # Local-only image name: never try to pull it from a registry.
     pull_policy: build
     networks:

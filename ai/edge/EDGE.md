@@ -213,7 +213,12 @@ Both find the container by its compose labels.
 ## The edge
 
 One `edge` container on `ai_shared`, running `haproxy:<EDGE_HAPROXY_VERSION>-alpine`
-(3.4 LTS, pinned to a patch tag). It publishes the ports below with the same
+(3.4 LTS, pinned to a patch tag). `EDGE_HAPROXY_VERSION` is the tag without
+the suffix: a patch tag of the current LTS branch, never `lts` or `latest`,
+which move and are never re-pulled once cached. The compose file appends
+`-alpine` on purpose: the alpine flavour brings the busybox `wget` that the
+compose healthcheck and `deploy.py`'s stats read (`docker exec edge wget …`)
+use. A bump is `make up edge` (a recreate). It publishes the ports below with the same
 `PORT_*` variable and the same bind address (all interfaces) the services used
 before. It does not mount `docker.sock`, so `sandbox-runner` stays the only
 container that does.
@@ -595,6 +600,10 @@ edge-certs  (certbot/dns-cloudflare:v5.8.0 + ai/edge/certs/)
 - **Staging first.** `EDGE_TLS_STAGING` defaults to `1`, Let's Encrypt's
   staging CA: the same DNS-01 flow, far higher rate limits, but an untrusted
   certificate. Only the literal `0` asks for production.
+- **Account e-mail.** `EDGE_TLS_EMAIL` registers the Let's Encrypt account
+  with `-m <address> --no-eff-email`; empty registers it with
+  `--register-unsafely-without-email` (Let's Encrypt no longer sends expiry
+  mail, so nothing is lost).
 - **Turned off.** With `EDGE_TLS_DOMAIN` or the token empty, `edge-certs`
   writes a self-signed placeholder for `localhost` (if no certificate file
   exists yet), logs one line (`TLS certificates are off: …`), and idles,
@@ -728,8 +737,8 @@ root, unless they say otherwise.
    - in `docker-compose.edge.yml`, replace the `${PORT_LITELLM}:4001` and
      `${PORT_LITELLM_TLS:-443}:4443` lines with one
      `${PORT_LITELLM_TLS:-443}:4443`;
-   - update the `PORT_LITELLM` rows of `.env.example`, `CLAUDE.md` and
-     `ai/AI_INFRA.md`;
+   - update the `PORT_LITELLM` rows of `.env.example`, `ai/edge/CLAUDE.md`
+     and `ai/AI_INFRA.md`;
    - `make up edge` (a recreate, since the published ports changed).
 
 ### Updating certs
@@ -991,8 +1000,8 @@ fronts has been deployed once. Do it in one sitting:
 2. **Mirror `.env.example` into `.env`:** `EDGE_ALLOWED_CIDRS` and
    `EDGE_LITELLM_MAX_CONCURRENT_PER_KEY` in the Edge section, and
    `,http://edge:8407/edge/` appended to `OAUTH2_PROXY_UPSTREAMS`. Do not add
-   an n8n entry there: n8n runs on its own subdomain because its subpath mode
-   is broken upstream.
+   an n8n entry there: n8n is not exposed, and its subpath mode is broken
+   upstream.
 3. **Dry run.** Run `make up <stack> DRY_RUN=1` for each stack below and read
    the plan. The first real run of every swap service is always a swap: the new
    label and the removed `container_name`/`ports` change its config hash.
@@ -1175,6 +1184,18 @@ check.
 - **New services are recreate by default.** Leave them unlabelled unless two
   copies can safely run at once: no singleton scheduler, no exclusive data
   directory or lock, no GPU, and no startup step that disturbs a running copy.
+  An unlabelled service also keeps its compose config hash unchanged, so
+  adding it does not make compose recreate anything.
+- **Optional labels for a recreate-class service** (read by `deploy.py`, not
+  only on the edge):
+  - `com.zeo.deploy.wait: healthy` makes `make up` wait for its healthcheck
+    after recreating it and fail loudly if it never passes.
+  - `com.zeo.deploy.reload: <signal>` + `com.zeo.deploy.reload.check: <command>`
+    are for config compose cannot see change (a bind mount): when compose
+    would leave the container running, `make up` runs the check inside it and
+    sends the signal only if the check passes; a failed check stops the deploy
+    and the old config keeps serving. The edge uses `USR2` + `haproxy -c -f …`
+    ([Changing haproxy.cfg](#changing-haproxycfg)).
 - **To make one swap-class:**
   - Add `labels: {com.zeo.deploy: swap}` and a healthcheck.
   - Remove `container_name`. Add `com.zeo.deploy.name: <prefix>` if the old

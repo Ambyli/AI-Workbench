@@ -34,7 +34,7 @@ curl http://localhost:4001/v1/chat/completions \
   }'
 ```
 
-Replace the `content` with the actual result from calling the tool on your MCP server.
+Replace the `content` with the actual result from calling the tool on your MCP server — for the Phoenix MCP server, which exposes Phoenix's database tools (`list_tables`, `run_query`, …) through LiteLLM, that is `https://phoenix-mcp.com/mcp` (`DEFAULT_LITELLM_MCP_PHOENIX_URL` in `.env`).
 
 ## Add MCP Servers to Claude Code
 
@@ -66,3 +66,20 @@ Run `/mcp` inside Claude Code afterwards to confirm each server shows as connect
 ## MCP API Token
 
 Some MCP servers issue long-lived API tokens via a browser-based OAuth flow. Check your MCP server's documentation for token acquisition.
+
+### Phoenix MCP API token
+
+The Phoenix MCP server issues long-lived API tokens through a Google sign-in:
+
+```bash
+# Get a Google login URL
+curl -s https://phoenix-mcp.com/api-token \
+  -H "X-API-Key: your-shared-secret"
+# Open the returned login_url in a browser, sign in, get your API token
+
+# Or exchange a Google access token directly
+curl -X POST https://phoenix-mcp.com/api-token \
+  -H "X-API-Key: your-shared-secret" \
+  -H "Content-Type: application/json" \
+  -d '{"google_token": "<google-access-token>", "expires_in": 0}'
+```

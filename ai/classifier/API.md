@@ -96,7 +96,29 @@ curl -s muse-glimmer:8000/tokenize -H 'content-type: application/json' \
 ```
 
 Editing `models.yaml` on the box takes effect with `docker restart
-classifier` (it is bind-mounted read-only; compose cannot see the edit).
+classifier` (it is bind-mounted read-only over `/app/ai/classifier/models.yaml`;
+compose cannot see the edit, so it is a recreate-class change, not a swap). It
+is also baked into the image — the build's import check loads it, so an
+invalid registry fails `make build classifier`.
+
+More on the checked-in entries:
+
+- **`muse-glimmer`'s `max_concurrent: 6`** is 6 of its `--max-num-seqs 8`
+  because `muse-glimmer` is also in LiteLLM's chain aliases and the overflow
+  hook spills chat (eventually to Claude) once vLLM's waiting queue stays
+  non-empty. Watch `classifier_llm_call_seconds{kind, model}` before raising it.
+- **`qwen3.5-4b`** uses `reasoning: {style: none}` plus
+  `extra_body.chat_template_kwargs.enable_thinking: false`, because
+  `reasoning.value` is a string (it cannot carry the boolean); it sets
+  `json_mode`, and `timeout_s: 90`. It is route-policy's classifier — one
+  `text` document per job, never a document model — and route-policy's
+  `history.max_chars` (ruleset config) must stay at or under its
+  `text_char_budget` (12 000). Its `max_concurrent: 2` and score budget 512
+  change together with the llama.cpp service's `--parallel 2` /
+  `--n-predict 512` / `-c 32768`.
+- **`qwen3.8-solo`** is a benchmark candidate for that classifier at
+  `max_concurrent: 1`, so it never takes more than one of the 3 sequences chat
+  runs on (a queued request there makes the overflow hook spill chat).
 
 **Text-only models** (`vision: false`) score from the page's text layer
 alone: the scoring prompt carries no image and says so ("You are assessing
@@ -280,16 +302,33 @@ on `ai_shared`, host port `PORT_CLASSIFIER_DB` = 5439): the job queue
 history (`job_progress`, see [§ Progress](#progress)), saved references
 (`reference_examples`) and one row per model request (`llm_calls`). The
 stores share one asyncpg pool (`db.py`, `CLASSIFIER_MAX_CONCURRENT` + every
-model's `max_concurrent` + 8 connections). The database is the only store:
+model's `max_concurrent` + `DB_POOL_HEADROOM` (8, a `config.py` constant)
+connections — `db.pool_max()`; adding registry entries grows it, e.g. the
+`qwen3.5-4b` and `qwen3.8-solo` entries took Σ `max_concurrent` from 8 to 11
+and the pool by 3). The database is the only store:
 with `CLASSIFIER_DB_HOST` unset, or the database unreachable, the service
-refuses to start and says why. The same database is federated into Trino as
+refuses to start and says why. `CLASSIFIER_DB_HOST` (`classifier-db`) and the
+port are fixed in the compose file, never in `.env`; the credentials are
+`CLASSIFIER_DB_USER` / `_PASSWORD` / `_NAME` (all `classifier` — dev defaults,
+override the password before exposing `PORT_CLASSIFIER_DB` past the host), and
+the DSN is built with `urllib.parse.quote` on user and password, so any
+character is safe in them. Files live under `CLASSIFIER_DATA_DIR` (`/data`,
+fixed in the compose file) on the `classifier_data` volume. The same database is federated into Trino as
 the `postgres_classifier` catalog (read-only `trino_reader` role), so jobs,
 references and per-call cost can be queried from Trino and Superset. That
 role is created by `ai/classifier/db-init/10-trino-reader.sh` on the first
 start of an empty `classifier_db` volume, with
 `CLASSIFIER_TRINO_READER_PASSWORD` from `.env` (`openssl rand -hex 32`; empty
-skips it) — re-run the script by hand for an existing volume or to rotate the
-password. Files
+skips it with a log line, and only the Trino catalog breaks) — re-run the
+script by hand for an existing volume or to rotate the password: edit `.env`,
+`make up classifier` (so `classifier-db`'s env has it), `docker exec
+classifier-db sh /docker-entrypoint-initdb.d/10-trino-reader.sh`, then `make
+up trino` (the coordinator's env). The role is `pg_read_all_data` +
+`default_transaction_read_only`, with no `BYPASSRLS` (nothing here uses RLS);
+it reads every job result and reference, so treat its password as a real
+secret. The script is a `.sh` that must stay safe to SOURCE — the postgres
+entrypoint sources an init script that has no exec bit — so no `exit` and no
+`set`. Files
 stay on the `classifier_data` volume: queued payloads, artifact directories
 and reference files. A job's `result` column is `JSON`, not `JSONB` — JSONB
 sorts object keys, and `per_criterion_scores` lists criteria in request order.
@@ -618,8 +657,8 @@ network for its input:
 | Bound | Knob (default) |
 |---|---|
 | Distinct URLs fetched per SVG; the rest are blanked with an `over the 10-image limit` warning | `CLASSIFIER_SVG_FETCH_MAX_IMAGES` (10) |
-| Bytes per image; a bigger body is abandoned mid-download | `CLASSIFIER_SVG_FETCH_MAX_BYTES` (5 000 000) |
-| Seconds per image, start to finish (every SVG's images in a request are fetched concurrently) | `CLASSIFIER_SVG_FETCH_TIMEOUT_S` (10) |
+| Bytes per image; streamed, a bigger body is abandoned mid-download (or refused up front when `Content-Length` says so) | `CLASSIFIER_SVG_FETCH_MAX_BYTES` (5 000 000) |
+| Seconds per image, start to finish — a wall-clock deadline, so a server dripping a byte a second still trips it (every SVG's images in a request are fetched concurrently, so this is also roughly the latency they add to a submit) | `CLASSIFIER_SVG_FETCH_TIMEOUT_S` (10) |
 
 Every URL goes through `common.net.fetch_url`: the same SSRF blocklist as a
 `type: "url"` document, http(s) only, **no redirects** (a 3xx could point past
@@ -1163,6 +1202,25 @@ in the unaggregated shape. `unit-tests/classifier/test_result_specs.py` runs
 every type through the pipeline and fails if a `detail` carries a key its
 declaration does not list or misses one it requires; it also checks that each
 type's spec is the one its own evaluator declares.
+
+**Declaring a shape.** The standard is: declare it next to the code that
+produces it, and register it under the key its consumers look it up by.
+
+- An OpenCV detector's `detail` is declared with `@describes(DetectorSpec(...))`
+  on the detector function (`ai/classifier/cv/result.py`); the detector
+  `REGISTRY` is the lookup and `GET /cv-detectors` serves it.
+  `unit-tests/classifier/test_cv_measurements.py` runs every detector.
+- A criterion type's `detail` is declared with `@result_spec(ResultSpec(...))`
+  on that type's evaluator (`analysis/{llm,text,detector,cv}_eval.py`); it
+  registers by type name in `analysis/result_specs.py`, which the aggregator,
+  the scheduler and `GET /criterion-types` look up by. A new type's module is
+  also listed once in `result_specs._DECLARING_MODULES`.
+- `detail.reference` is ONE shared declaration, `REFERENCE_FIELD` in
+  `analysis/result_specs.py`, listed on `LLM_RESULT` only.
+
+Both tests fail on an undeclared key, a missing required key, or a wrong
+`metric` / `value`. Adding a detector, a criterion type, or a key to an
+existing `detail` updates its declaration in the same change.
 
 ### Dependencies
 
@@ -1977,6 +2035,13 @@ vision-LLM call. The classifier reaches it at `DETECTOR_URL`; **empty means
 off**, and then a `detector` criterion is refused at submit and a `cv`
 criterion's fallback resolves to the llm.
 
+| Classifier knob (default) | What |
+|---|---|
+| `DETECTOR_URL` (empty) | `http://detector:8000` once `ai/detector` is up — both containers are on `ai_shared`. Empty: a `detector` criterion, or a `cv` one with an explicit `options.fallback: "detector"`, is a 400 at submit |
+| `DETECTOR_MIN_SCORE` (0.25) | Used **twice on purpose**: sent as the detector's `threshold`, and the line a detector-scored criterion must clear to PASS from boxes alone (table below). A `detector` criterion's `options.threshold` overrides it. Two separate floors would mean boxes that count as regions but not as evidence |
+| `DETECTOR_TIMEOUT_S` (30) | Seconds one `POST /detect` may take. A page on the shared GPU answers in a few hundred ms; the CPU fallback takes a few seconds. Generous for either without letting a wedged service hold a classifier worker |
+| `DETECTOR_MAX_LABELS_PER_CALL` (16) | Labels per detector request. The detector embeds each label as its own query, so its cost is linear; a page needing more is split across calls rather than rejected. Keep it at or below the detector's own `DETECTOR_MAX_LABELS` (32) |
+
 | Spelling | What happens |
 |---|---|
 | `{"name": "has roof vent", "type": "detector"}` | Answered by the detector at `options.threshold`: boxes **and** a score |
@@ -2058,6 +2123,18 @@ lines from 0/8 to 7/8 and the mean y error from 48 units to 2.4. Both are on
 by default and both are recorded on the attempt. What the second pass cannot
 fix is *identification*: asked for a logo, a model that boxes the heading
 naming the same company 90 units lower is precisely placed on the wrong thing.
+
+**The grid step.** `CLASSIFIER_LLM_BBOX_GRID_STEP` (100 grid units) spaces the
+lines on the ask image and on the refine crop (which gets its own grid in its
+own frame); both the drawn overlay (`common.vision.draw_grid_overlay`) and the
+prompt sentence that describes it read it, so they cannot drift. Use a divisor
+of 1000 (`50`, `100`, `200`, `250`) so the last line lands on the edge; the
+floor is `10`. Denser is not automatically better: at `50` on a ≤1000-px page
+the edge labels start to overlap each other and the content. Change it, then
+re-run `bin/grounding_experiment.py` (below) before trusting the new value.
+`CLASSIFIER_LLM_BBOX_GRIDLINES=false` sends the bare image; a caller of
+`locate_criterion` without the working page image gets the bare-image ask and
+a prompt that does not mention a grid.
 
 **When it runs.** All four have to hold, or the loop costs nothing:
 
@@ -2408,7 +2485,12 @@ is always present; `stable` marks what survives a `mean` aggregate.
 [§ Result details](#result-details--the-same-shape-on-every-type).
 
 `text.defaults.pattern` shows `<name>` because it defaults to the criterion's
-name. `cv.defaults.fallback` is `detector` only while DETECTOR_URL is set.
+name. `caps.pattern_max_chars` (500) is not a knob: it lives in
+`common.documents.textmatch`, which enforces it for every caller;
+`caps.min_count` is `CLASSIFIER_TEXT_MIN_COUNT_CAP` and the `name` cap
+`CLASSIFIER_CRITERION_NAME_MAX_CHARS` (for `llm` criteria the name is the
+prompt text, and every name is slugified into artifact file names, so it
+bounds both). `cv.defaults.fallback` is `detector` only while DETECTOR_URL is set.
 Each type's `defaults.aggregate` is for its default options (an `llm`
 criterion's defaults change with its hint — the top-level `aggregate.defaults`
 has the whole table).
@@ -2638,7 +2720,11 @@ and every reference rule ([§ References — Refusals](#refusals-at-submit));
 a Content-Type that is neither JSON nor multipart; **502** when a document URL
 cannot be fetched; **500** if the payload could not be persisted. A page image
 under `CLASSIFIER_MIN_IMAGE_WIDTH` × `CLASSIFIER_MIN_IMAGE_HEIGHT` (32 × 32 px)
-fails the JOB with "Image too small".
+fails the JOB with "Image too small". It is a thumbnail-catcher only — OCR
+upscales small pages itself, the vision model takes any size, and the
+working-image step only shrinks. It was a hard-coded 100 × 100, which refused a
+crop of one text line submitted as its own document (what `regions_report.py
+--pipeline utility-bill` does in stage 3).
 
 ---
 
@@ -3091,3 +3177,24 @@ references or usage tables needs Postgres: with `TEST_POSTGRES_DSN` set the
 session creates one `classifier_test_<pid>_<hex>` database and drops it at the
 end; without it those tests skip (marker `postgres` / fixture
 `need_postgres`, see `unit-tests/classifier/conftest.py`).
+
+### Running the unit tests
+
+```bash
+UV_LINK_MODE=copy uv run --no-sync --with pytest --package classifier \
+  python -m pytest unit-tests/classifier -q -p no:cacheprovider
+TEST_POSTGRES_DSN=postgresql://postgres@localhost:55439/postgres \
+  UV_LINK_MODE=copy uv run --no-sync --with pytest --package classifier \
+  python -m pytest unit-tests/classifier -q -p no:cacheprovider
+```
+
+- **Without `TEST_POSTGRES_DSN` about a third of the suite skips** — a run
+  like that has not passed. The DSN is an admin connection on a scratch
+  server; each session creates and drops its own `classifier_test_*`
+  database. On Windows, a scratch server from the EDB binaries zip:
+  `initdb -U postgres --auth=trust`, then `pg_ctl -o "-p 55439" start`.
+- **`unit-tests/classifier` and `unit-tests/detector` run in separate pytest
+  processes**: both ship a top-level `config.py`, and the classifier's
+  conftest puts `ai/classifier` on `sys.path`.
+- Use `--no-sync`: `uv sync --package classifier` prunes the shared workspace
+  venv to the classifier's dependencies.

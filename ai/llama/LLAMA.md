@@ -62,7 +62,7 @@ Qwen3.8-Flash-Next ships **MTP (multi-token prediction) draft heads** in the `MT
 | Key | Default | Notes |
 |---|---|---|
 | `LLAMA_UNSLOTH_TAG` | `b10796-mix-659e406` | Release tag. Also part of the local image tag (`llama-unsloth:<tag>-<variant>`), so a bump forces a rebuild. |
-| `LLAMA_UNSLOTH_VARIANT` | `cuda13-portable` | Tarball flavour. `cuda13-*` needs an R580+ host driver; `cuda12-*` works on R525+. `-newer` / `-older` are narrower arch lists with no functional difference. |
+| `LLAMA_UNSLOTH_VARIANT` | `cuda13-portable` | Tarball flavour. `cuda13-portable` (toolkit 13.3, sm 75–120; the A6000 is sm 86) needs an R580+ host driver; `cuda12-portable` (toolkit 12.8, sm 70–120) works on R525+. The detector's torch wheel is a CUDA 13 build too, so the R580 floor is shared ([DETECTOR.md](../detector/DETECTOR.md)). `-newer` / `-older` are narrower arch lists with no functional difference. |
 | `LLAMA_CUDA_RUNTIME_IMAGE` | `nvidia/cuda:13.3.1-runtime-ubuntu22.04` | Base image. Must match the variant's CUDA major — `libggml-cuda.so` links `libcudart.so.13` / `libcublas.so.13`. For `cuda12-portable` use `nvidia/cuda:12.8.1-runtime-ubuntu22.04`. The Dockerfile runs `ldd` on the tarball and fails the build on a mismatch. |
 
 Upgrade with:
@@ -277,14 +277,14 @@ curl -s http://localhost:8005/assess -H 'content-type: application/json' -d '{
 # -> {"job_id": "..."}: poll GET /jobs/<id> until it is done, read the score, then DELETE /jobs/<id>
 ```
 
-**Quant swap.** `LLAMA_QWEN35_4B_QUANT` is the tag after the colon on `unsloth/Qwen3.5-4B-GGUF`. K-quants only on CPU (the `IQ*` files are slower there, as for `glm5.3-flash`): `Q4_K_M` 2.74 GB _(default)_, `Q5_K_M` 3.14 GB, `Q6_K` 3.53 GB, `Q8_0` 4.48 GB. Edit `.env`, then `make up llama qwen3.5-4b`; the new file downloads into `llama_data` beside the old one. A bigger quant is slower per token, so re-check the entry's `timeout_s` against `classifier_llm_call_seconds{model="qwen3.5-4b"}`.
+**Quant swap.** `LLAMA_QWEN35_4B_QUANT` is the tag after the colon on `unsloth/Qwen3.5-4B-GGUF`. K-quants only on CPU (the `IQ*` files are slower there, as for `glm5.3-flash`): `Q4_K_M` 2.74 GB _(default)_, `Q5_K_M` 3.14 GB, `Q6_K` 3.53 GB, `Q8_0` 4.48 GB — `Q6_K` / `Q8_0` are the steps up if the route-policy benchmark says quality, not speed, is what limits it. Edit `.env`, then `make up llama qwen3.5-4b`; the new file downloads into `llama_data` beside the old one. A bigger quant is slower per token, so re-check the entry's `timeout_s` against `classifier_llm_call_seconds{model="qwen3.5-4b"}`.
 
 | Key | Default | Notes |
 |---|---|---|
 | `PORT_LLAMA_QWEN35_4B` | `8028` | Host port (container 8000), in the PORT REGISTRY. In-network callers use `http://qwen3.5-4b:8000`. |
 | `LLAMA_QWEN35_4B_QUANT` | `Q4_K_M` | Quant tag — see above. |
 | `LLAMA_QWEN35_4B_THREADS` | `16` (compose fallback `8`) | `-t`; set together with the range below (Threads and cores, above). |
-| `LLAMA_QWEN35_4B_EXTRA_ARGS` | `"--cpu-range 0-15"` (compose fallback empty) | Extra llama-server args appended verbatim. Cores 0–15; 24–31 are the `signals` sidecar's. |
+| `LLAMA_QWEN35_4B_EXTRA_ARGS` | `"--cpu-range 0-15"` (compose fallback empty) | Extra llama-server args appended verbatim. Cores 0–15; 24–31 are the `signals` sidecar's (which has its own `cpuset`). Quoted in `.env` because the value has a space. |
 
 ### First-run download
 
@@ -300,7 +300,7 @@ The healthcheck has a **900-second `start_period`** to accommodate the download;
 
 GLM-5.2 is a 753B / 40B-active MoE. Even at 1-bit dynamic quant it does **not** fit in 3× A6000 VRAM (144 GB) alone. The service is configured to offload MoE expert layers to system RAM via llama.cpp's `--n-cpu-moe` flag.
 
-Reference numbers for the default box (3× RTX A6000 = 144 GB VRAM, ~400 GB RAM):
+Reference numbers for the default box (3× RTX A6000 = 144 GB VRAM, ~200 GB RAM):
 
 | Quant | Weights | VRAM used | RAM used (via `--n-cpu-moe`) | Notes |
 |---|---|---|---|---|

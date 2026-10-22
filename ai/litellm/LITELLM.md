@@ -23,7 +23,7 @@ The proxy is reachable at `http://localhost:4001`. Configuration is loaded from 
 - `HF_TOKEN` from `.env` — HuggingFace token for gated model downloads
 - `LITELLM_DATABASE_URL` from `.env` — PostgreSQL connection string
 - `litellm_config.yaml` — proxy config with model definitions and routing rules
-- `hooks/` — this deployment's proxy hooks (the chain-alias overflow hook, the `auto` footer, the code-tool remap), mounted read-only at `/app/hooks`, with the two stdlib-only parts of `shared/common` they import mounted at `/app/common` (see [§ The hooks package](#the-hooks-package))
+- `hooks/` — this deployment's proxy hooks (the chain-alias overflow hook, the `auto` footer, the route-policy client), mounted read-only at `/app/hooks`, with the stdlib-only part of `shared/common` they import (`common.conversation`, plus `common/__init__.py`) mounted at `/app/common` (see [§ The hooks package](#the-hooks-package))
 - `overflow.py` — the shim LiteLLM loads (`callbacks: ["overflow.handler"]`), mounted at `/app/overflow.py` beside the config; it imports `hooks` and builds `handler`
 
 ### Health checks
@@ -70,6 +70,10 @@ In Prometheus (`http://<box>:9090/targets`), the `litellm` job should be **UP**.
 
 A missing or empty key file only breaks the `litellm` job. Prometheus logs the read error and the other jobs keep scraping.
 
+### Prometheus scrape jobs
+
+`prometheus` lives in this stack (`make up litellm` deploys `litellm prometheus`) but scrapes every stack's metrics by service name over `ai_shared`: the jobs in `prometheus.yml` are `litellm`, `classifier`, `detector`, `route-policy`, `signals` and `edge`. It is recreate-class (one process owns the TSDB) and `prometheus.yml` is a single-file bind mount that compose cannot see change, so `make up litellm` leaves it alone after an edit. A new or changed scrape job — e.g. when a stack gains a `/metrics` endpoint — is applied with `docker restart prometheus`, and that step belongs to the deploy order of the stack that gained the job (see [ROUTE_POLICY.md](../route-policy/ROUTE_POLICY.md) and [SIGNALS.md](../signals/SIGNALS.md) for examples).
+
 ### Stopping
 
 ```bash
@@ -84,7 +88,7 @@ The proxy configuration file supports a wide range of options for models, routin
 
 ### Pass-through auth
 
-`general_settings.pass_through_endpoints` mounts six internal services — `/v1/classifier`, `/v1/detector`, `/v1/madlad`, `/v1/interceptor`, `/v1/roofix`, `/v1/sandbox` — and **every entry carries `auth: true`**. None of those services checks a bearer token itself, so this flag is the only thing between a caller and them.
+`general_settings.pass_through_endpoints` mounts seven internal services — `/v1/classifier`, `/v1/detector`, `/v1/madlad`, `/v1/interceptor`, `/v1/roofix`, `/v1/sandbox`, `/v1/route-policy` — and **every entry carries `auth: true`**. None of those services checks a bearer token itself, so this flag is the only thing between a caller and them.
 
 - **Without it there is no check at all.** A pass-through declared in the config file with no `auth` key registers with no auth dependency (LiteLLM v1.95.0, `_register_pass_through_endpoint`): a keyless request is forwarded. Only endpoints created in the Admin UI default to `auth=True`; config-file entries do not.
 - **With it, the master key and proxy-admin keys pass as before.**
@@ -103,7 +107,7 @@ What the key needs is one entry in its metadata (or its team's metadata):
 
 Rules that apply whichever way you set it:
 
-- **Use the paths exactly as mounted** — `/v1/classifier`, `/v1/detector`, `/v1/madlad`, `/v1/interceptor`, `/v1/roofix`, `/v1/sandbox`. Matching is exact or prefix, so `/v1/classifier` also covers `/v1/classifier/jobs/{id}/artifacts`; list only the services the key's owner actually needs.
+- **Use the paths exactly as mounted** — `/v1/classifier`, `/v1/detector`, `/v1/madlad`, `/v1/interceptor`, `/v1/roofix`, `/v1/sandbox`, `/v1/route-policy`. Matching is exact or prefix, so `/v1/classifier` also covers `/v1/classifier/jobs/{id}/artifacts`; list only the services the key's owner actually needs.
 - **It goes inside `metadata`, never as the top-level `allowed_passthrough_routes` field.** `/key/generate`, `/key/update` and the team endpoints all accept a top-level field of that name, but on an unlicensed proxy it fails with `403 … only available for LiteLLM Enterprise users` (`_premium_user_check`). Written into `metadata` it is stored as-is, and `metadata` is exactly what the route check reads (`route_checks.py::check_passthrough_route_access`).
 - **Only a proxy admin may set it** — call these endpoints with `$DEFAULT_LITELLM_MASTER_KEY`. A non-admin caller gets `403 Only proxy admins can set metadata.allowed_passthrough_routes`.
 - **Key and team lists are not combined.** If the key's own `metadata` has a non-empty list, that list is used and the team's is ignored; the team's list applies only to keys with none of their own.
@@ -191,6 +195,10 @@ Four model groups exist for the route-policy engine ([`ai/route-policy/ROUTE_POL
 
 Every deployment calls its backend **directly** (`api_base: http://qwen3.8-solo:8000/v1`, `anthropic/claude-sonnet-5`, …); its `litellm_params` and `model_info` are copies of the standalone alias of the same name — except `local-code`'s, which add coding settings on top ([§ local-code: what it adds](#local-code-what-it-adds)). Never point a chain deployment at a LiteLLM alias: it would recurse through the proxy and inherit that alias's `fallbacks: → claude-sonnet-5`. The standalone aliases (`qwen3.8-solo`, `muse-glimmer`, `claude-*`) are unchanged and still callable directly — **when you change one of them, change its chain copies too.**
 
+**Capacity is the binding constraint: local vLLM slots.** `qwen3.8-solo` runs with `--max-num-seqs 3`; `muse-glimmer` with `--max-num-seqs 8`, of which the classifier takes at most 6 (`max_concurrent: 6` on its entry in `ai/classifier/models.yaml`; the classifier calls vLLM directly, not via LiteLLM) so that 2 stay free for chat — a classifier that filled every sequence would keep `vllm:num_requests_waiting` above 0 and make the overflow hook spill every chat turn off `muse-glimmer`. The classifier's `qwen3.8-solo` benchmark entry is held to `max_concurrent: 1` for the same reason. `muse-glimmer` shares its GPU pair with `qwen3.8`: when an operator runs `qwen3.8` instead, `muse-glimmer`'s `/metrics` probe fails, the hook marks it **down**, and the chains degrade to `qwen3.8-solo` alone. `qwen3.6`, `qwen3.8`, `qwen3.8-flash` and `glm5.2` are in no chain; `glm5.3-flash` stays out on purpose (CPU-only, one slot, minutes to first token). The edge's per-key limit (`EDGE_LITELLM_MAX_CONCURRENT_PER_KEY`, 8) is sized against this capacity (3 + 2 plus headroom) — [EDGE.md § Per-key concurrency limit](../edge/EDGE.md#per-key-concurrency-limit).
+
+**One `auto` turn is one chain request** — no fan-out to several models, and no quality escalation to Claude: Claude answers only as load overflow (both locals busy or down) on the three chains that have it.
+
 #### local-code: what it adds
 
 `local-code` has the same ladder as `local-general`; what differs is what each deployment sends.
@@ -245,6 +253,8 @@ A deployment that fails *at call time* (connection refused, 5xx) is retried `num
 
 `local-private` has no Claude deployment and no entry in `fallbacks` or `context_window_fallbacks`. Do not add one. `auto` itself is `router_settings.model_group_alias: {auto: local-private}`: an `auto` request nothing rewrote is served there, because nothing has checked such a prompt for PII.
 
+The concrete aliases (`qwen3.8-solo`, `muse-glimmer`) keep their own `fallbacks: → claude-sonnet-5`, which is why nothing routes PII to them directly: LiteLLM re-reads the fallback map on every hop (`router_utils/fallback_event_handlers.py:120-137` at v1.95.0, up to `ROUTER_MAX_FALLBACKS=5`), so a `local-private` chain deployment that pointed at an alias would inherit that alias's Claude fallback. Remaining soft spot: the engine's privacy rule is lexical — a PII prompt that names no `privacy_kw` word lands on another chain and can overflow to Claude.
+
 #### The overflow hook
 
 `hooks/overflow/` — `filter.py` (the rule below), `context_fit.py`, `poller.py`, `state.py` (`BackendState`), `vllm.py` (URLs, metric parsing, the httpx clients) — run from `Handler.async_filter_deployments`; how LiteLLM loads it is in [§ The hooks package](#the-hooks-package). It:
@@ -262,7 +272,7 @@ The poller starts lazily on the first chain request and is restarted if it ever 
 **Context fit.** LiteLLM's own context check (step 3 above) undercounts, so the hook counts for itself with each backend's own tokenizer: vLLM's `POST <api_base minus /v1>/tokenize` (server root, outside `/v1` and its API-key guard; verified at v0.27.1 and v0.29.0, the tags `qwen3.8-solo` and `muse-glimmer` run) renders `messages` + `tools` through the same chat template and `preprocess_chat` as `/v1/chat/completions` and returns `count` and `max_model_len` — the numbers vLLM itself checks.
 
 - **Which deployments.** Every deployment with an `api_base` and an integer `model_info.max_input_tokens`, in a chain group. Claude deployments and plain aliases are never measured.
-- **When it asks.** Only if a deliberately high estimate — `len(json(messages)) + len(json(tools))` characters ÷ `OVERFLOW_TOKENIZE_CHARS_PER_TOKEN` (2.5) — reaches `OVERFLOW_TOKENIZE_MIN_FRACTION` (0.6) × that deployment's `max_input_tokens`. A short chat never makes the call. Each distinct backend is asked at most once per request, all of them concurrently, and the answers sit in a 64-entry LRU keyed by backend + body hash, so `auto`'s `context_window_fallbacks → local-private` and the mid-stream order fallback, which re-enter with the same messages, do not ask again.
+- **When it asks.** Only if a deliberately high estimate — `len(json(messages)) + len(json(tools))` characters ÷ `OVERFLOW_TOKENIZE_CHARS_PER_TOKEN` (2.5) — reaches `OVERFLOW_TOKENIZE_MIN_FRACTION` (0.6) × that deployment's `max_input_tokens`. A short chat never makes the call. Each distinct backend is asked at most once per request, all of them concurrently, and the answers sit in a 64-entry LRU keyed by backend + body hash, so the order fallbacks (including the mid-stream one), which re-enter with the same messages, do not ask again.
 - **The body.** `model` (the deployment's `litellm_params.model` minus `openai/`), `messages` (with the deployment's `litellm_system_prompt` merged in front of the first system message, as LiteLLM will send them), `tools` when the request has them, `add_generation_prompt: true`, and the ONE `chat_template_kwargs` LiteLLM will send — the request's top-level `chat_template_kwargs`, else the request's `extra_body`'s, else (only when the request sent no `extra_body`) the deployment's. LiteLLM replaces rather than merges: `{**deployment, **request}` at the Router, then a top-level value written over `extra_body.chat_template_kwargs` whole ([§ local-code: what it adds](#local-code-what-it-adds)). The server's own `--chat-template` / `--default-chat-template-kwargs` apply on `/tokenize` exactly as on a chat completion. vLLM checks `model` against its `--served-model-name`; a mismatch is a tokenize failure (below).
 - **The rule.** A deployment **fits** iff `count <= max_input_tokens` **and** `count + max_out <= max_model_len`, where `max_out` is the request's `max_completion_tokens` / `max_tokens`, else the deployment's `litellm_params.max_tokens` (vLLM refuses a chat completion whose input plus `max_tokens` exceeds `max-model-len`). One that does not fit is dropped as **`too-long`** — a **hard** drop: the busy/down rule then runs on what is left, so its "keep the busy ones" fallback can never bring it back.
 - **Nothing local fits.** A group with a Claude deployment (`local-general` / `-code` / `-reasoning`) called **by name** keeps only Claude — the prompt is past every local window. `local-private` gets the list back **unchanged**, so vLLM refuses it with its own error and the prompt never leaves the box. **A request the client sent as `auto`** gets its chain's local deployments back unchanged too, on any chain, so vLLM refuses it: Claude is *load* overflow for `auto` (both locals busy or down), never a bigger window. The hook knows the request was `auto` from the route-policy stash, which rides in the request's metadata into `request_kwargs` (`metadata`, or `litellm_metadata` on `/v1/messages`). This is what the old `auto` deployment's `max_input_tokens: 245760` enforced; `auto` is an alias now and has no window of its own. Busy / down overflow to Claude is unchanged for `auto`. `handler.state()["stats"]["context_auto_kept_local"]` counts these. Residual gap: when `/tokenize` cannot measure a local deployment, that deployment is kept and LiteLLM's tiktoken backstop decides — if the backstop then drops every local, Claude answers.
@@ -287,6 +297,7 @@ Set them in `.env` and `make up litellm` (they are passed through the compose `e
 
 - **Reorder** (e.g. make `muse-glimmer` go first in `local-general`): swap the two deployments' `order` values. Nothing else changes — the hook and the order filter read `order` per request.
 - **Change the overflow model** (e.g. `local-code` → `claude-opus-5-5`): replace the order-3 deployment's `litellm_params` with a copy of the other Claude alias's. Never add a Claude deployment to `local-private`.
+- **Change a context window.** Every local deployment's `model_info.max_input_tokens` is its backend's vLLM `--max-model-len` minus that deployment's `max_tokens` (`qwen3.8-solo` 131072 − 16384 = 114688, 98304 on `local-code`; `muse-glimmer` 262144 − 16384 = 245760, 229376 on `local-code`). A `--max-model-len` change in `ai/vllm/docker-compose.vllm.yml`, or a `max_tokens` change here, updates the other side in the same change.
 - **Change a model's settings** (sampling, `max_input_tokens`): edit the standalone alias **and** every chain copy of it — the chains do not reference the standalone alias, on purpose. **Timeouts are the exception**: chain deployments carry their own `stream_timeout` / `timeout` (the chain's budget, [§ Chain timeouts](#chain-timeouts)), not copies of the standalone alias's.
 - The route-policy engine needs no change for any of these; it only knows the chain's name.
 
@@ -304,13 +315,15 @@ Set them in `.env` and `make up litellm` (they are passed through the compose `e
 
 `unit-tests/litellm/test_timeouts.py` keeps this nesting: it fails if a chain's worst-case failover no longer fits inside Open WebUI's total, if the edge's timers drop below it, or if `auto` grows a timeout of its own.
 
+History: before single-pass `auto` (phase 3), the budget had nested layers — the `auto` deployment's 870 s and the semantic router's Envoy at 840 s inside Open WebUI's 900 s. Both are gone with the router; only the chain's per-read timeouts and Open WebUI's total remain.
+
 #### Applying a chain or hook change
 
 ```bash
 make up litellm
 ```
 
-`litellm_config.yaml` and `overflow.py` are single-file bind mounts, `hooks/` and `shared/common`'s `conversation` part are directory mounts, and LiteLLM reads all of them only at startup. `make up litellm` hashes their *content* into the container name (`litellm-<hash>`, see [EDGE.md § The swap](../edge/EDGE.md#the-swap)), so any edit produces a new name: a fresh copy starts beside the running one — reading the current files — and the old one retires once the new one is healthy, with no downtime (in-flight chats get the 900 s `stop_grace_period`). `docker restart` keeps the original single-file mounts, so an editor or `git pull` that replaced such a file (new inode) leaves a restarted container reading the old one — use `make up litellm`. If the new copy fails its healthcheck (a `hooks` import error, a YAML typo), `make up` prints its last 100 log lines, removes it and leaves the old copy serving; otherwise check `make logs litellm` for warnings.
+`litellm_config.yaml` and `overflow.py` are single-file bind mounts, `hooks/` and `shared/common`'s `conversation` part are directory mounts, and LiteLLM reads all of them only at startup. `make up litellm` hashes their *content* into the container name (`litellm-<hash>`, see [EDGE.md § The swap](../edge/EDGE.md#the-swap)), so any edit produces a new name: a fresh copy starts beside the running one — reading the current files — and the old one retires once the new one is healthy, with no downtime (in-flight chats get the 900 s `stop_grace_period`). Don't `docker restart` it: `litellm` is swap-class (the container is `litellm-<hash>`), and a restart takes down the only copy — `make up litellm` applies the same edit with no downtime. If the new copy fails its healthcheck (a `hooks` import error, a YAML typo), `make up` prints its last 100 log lines, removes it and leaves the old copy serving; otherwise check `make logs litellm` for warnings.
 
 #### Seeing spills
 
@@ -415,9 +428,11 @@ Taking the entry back out matters. The proxy CLI already *appends* its working d
 - a mounted part imports anything outside the stdlib;
 - the hooks import a third-party package the image lacks (only `litellm`, `yaml` and `httpx` are allowed).
 
-It also builds a fresh `/app` from the compose file's own mounts and loads the shim there in an isolated interpreter.
+It also builds a fresh `/app` from the compose file's own mounts and loads the shim there in an isolated interpreter. [`unit-tests/litellm/test_overflow.py`](../../unit-tests/litellm/test_overflow.py) loads the shim through LiteLLM's own `get_instance_fn`, exactly as the proxy does.
 
-**The leaf-class rule.** The proxy activates `async_post_call_streaming_iterator_hook` and `async_pre_call_hook` only when the name is in the registered class's own `__dict__` (`proxy/utils.py:1718-1745`). So all five hooks stay in `Handler`'s class body and delegate from there (`async_post_call_failure_hook` is dispatched on any `CustomLogger`, `proxy/utils.py:2136-2166`, but follows the same rule). A hook moved onto a component or a base class would silently never run.
+**The leaf-class rule.** The proxy activates `async_post_call_streaming_iterator_hook` and `async_pre_call_hook` only when the name is in the registered class's own `__dict__` (`proxy/utils.py:1718-1745`). So all five hooks stay in `Handler`'s class body and delegate from there (`async_post_call_failure_hook` is dispatched on any `CustomLogger`, `proxy/utils.py:2136-2166`, but follows the same rule). A hook moved onto a component or a base class would silently never run. The components they delegate to: `OverflowFilter` (`hooks/overflow/`), `AutoFooter` / `FooterStream` (`hooks/footer/`) and `PolicyClient` (`hooks/routing/policy_client.py`). The pre-call hook runs `AutoFooter.strip_incoming` first (old footers out of the history, so the engine never reads them), then `PolicyClient.route`.
+
+**The invariants copy.** `hooks/routing/invariants.py` is the hook's own copy of the route-policy service's `route_policy/engine/invariants.py` (pure, stdlib-only). [`unit-tests/litellm/test_hook_invariants.py`](../../unit-tests/litellm/test_hook_invariants.py) loads **both** files by path and runs them over the same cases, so `enforce` / `fail_safe_route` / `PRIVATE_ROUTE` must stay stable and a change to one is a change to both.
 
 **Tests.** From the repo root:
 
@@ -471,7 +486,7 @@ Phase 3 of the route-policy engine (ZT-471). `auto` is not a deployment any more
 | `fallback:no-messages` | the request has no `messages` list to decide on (the responses API) |
 | `fallback:hook-error` | a bug in the client (logged) |
 
-A request the hook never rewrote at all is served by `local-private` too: `auto` is `router_settings.model_group_alias: {auto: local-private}`, which LiteLLM resolves only at deployment selection (`router.py:10465`), after the pre-call hook (`common_request_processing.py:1274`) — so the hook still sees `"auto"`, `auto` is listed in `/v1/models` and passes key checks (`auth_checks.py:2978`). Requests that name a chain or any other alias are never decided and never rewritten. A routed `auto` request whose prompt fits no local deployment of its chain is **not** handed to that chain's Claude deployment: the overflow hook keeps it local and vLLM refuses it ([§ The overflow hook](#the-overflow-hook) › Nothing local fits) — Claude is load overflow only. **`/v1/messages`** (Claude Code) runs the same pre-call pipeline (`anthropic_endpoints/endpoints.py:95`), so its `auto` is routed the same way.
+A request the hook never rewrote at all is served by `local-private` too: `auto` is `router_settings.model_group_alias: {auto: local-private}`, which LiteLLM resolves only at deployment selection (`router.py:10465`), after the pre-call hook (`common_request_processing.py:1274`) — so the hook still sees `"auto"`, `auto` is listed in `/v1/models` and passes key checks (`auth_checks.py:2978`). Leave the alias's `hidden` unset: Open WebUI lists `auto` from `/v1/models`. The response still says `"model": "auto"` to the client (`requested_model_from_client`). Requests that name a chain or any other alias are never decided and never rewritten. A routed `auto` request whose prompt fits no local deployment of its chain is **not** handed to that chain's Claude deployment: the overflow hook keeps it local and vLLM refuses it ([§ The overflow hook](#the-overflow-hook) › Nothing local fits) — Claude is load overflow only. **`/v1/messages`** (Claude Code) runs the same pre-call pipeline (`anthropic_endpoints/endpoints.py:95`), so its `auto` is routed the same way.
 
 **One chain per answer, decided by the service.** Every tool round of an Open WebUI answer is its own `auto` request, and so is the hidden auto-continue nudge Open WebUI's patch 0004 sends under the same message id. The hook asks `/decide` for each of them; the service's `default` ruleset (`pin: turn`) answers every call after the first with the chain the answer's first call got (same `chat_id` + `message_id`), unless the fresh decision is `local-private` — so one answer never switches chains mid-way. Nothing in the hook keeps state for it; a request without both ids (Claude Code) is decided afresh each time. `background_task` changes nothing here (the task is routed as before); the service uses it to skip classifying the task and to keep it out of turn pins. See [ROUTE_POLICY.md § Turn pinning](../route-policy/ROUTE_POLICY.md#turn-pinning) and [§ Background tasks](../route-policy/ROUTE_POLICY.md#background-tasks).
 
@@ -493,10 +508,10 @@ A request the hook never rewrote at all is served by `local-private` too: `auto`
 
 | Variable | Default | |
 |---|---|---|
-| `ROUTE_POLICY_ENABLED` | `true` | `false`: no `/decide`, no `/observe`, every `auto` request goes to `local-private` (`fallback:disabled`) |
-| `ROUTE_POLICY_URL` | `http://route-policy:8000` | the service, by Docker DNS on `ai_shared`; an empty value also disables the client |
-| `ROUTE_POLICY_DECIDE_TIMEOUT_S` | `0.25` | the awaited `/decide`, start to finish (floor 0.05); past it, `local-private` |
-| `ROUTE_POLICY_TIMEOUT_S` | `2` | one background `/observe`, start to finish (floor 0.1) |
+| `ROUTE_POLICY_ENABLED` | `true` | `false`: no `/decide`, no `/observe`, every `auto` request goes to `local-private` (`fallback:disabled`). It is not "route some other way": every `auto` turn is a logged fallback |
+| `ROUTE_POLICY_URL` | `http://route-policy:8000` | the service, by Docker DNS on `ai_shared`; no auth on it (the classifier's posture); an empty value also disables the client |
+| `ROUTE_POLICY_DECIDE_TIMEOUT_S` | `0.25` | the awaited `/decide`, start to finish (floor 0.05; compose `${ROUTE_POLICY_DECIDE_TIMEOUT_S:-0.25}`); past it, `local-private`. Added to every `auto` turn's latency: the engine itself takes well under a millisecond, the rest is the HTTP hop plus at most the service's `ROUTE_POLICY_DECISION_WRITE_BUDGET_S` of decision write. Raising it trades latency on a slow route-policy for fewer private fallbacks |
+| `ROUTE_POLICY_TIMEOUT_S` | `2` | one background `/observe`, start to finish (floor 0.1); a timeout counts as an error. It bounds how long a hung service holds one of the 64 in-flight slots, never the request |
 
 **Counters** in `handler.state()`:
 

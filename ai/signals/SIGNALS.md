@@ -42,7 +42,7 @@ LiteLLM hook ── POST /decide (awaited, 0.25 s) ──► route-policy
                                                       ├─ verdict lookup (DB, 0.1 s)
                                                       ├─ turn pin       (DB, 0.1 s)
                                                       └─ ONE POST /signals (ROUTE_POLICY_SIGNALS_BUDGET_S = 0.1 s,
-                                                            deadline_ms = budget − 10 ms) ──► signals
+                                                            deadline_ms = budget − 20 ms) ──► signals
 ```
 
 Every evaluator of a ruleset says which signals it will read
@@ -235,6 +235,14 @@ per model), `metrics.py`, `config.py`, `fetch_models.py` (build time),
   `/decide` arriving meanwhile answered `skipped` for every task.
 * **Background work** (a parked PII job, a patient job, an example set being
   embedded) runs only while no request waits, oldest first.
+* **The GIL switch interval is 1 ms — keep it.** The process runs
+  `sys.setswitchinterval(config.GIL_SWITCH_INTERVAL_S)` (0.001, `app.py`). The
+  deadline is the event loop's `asyncio.wait` timer, and while three lane
+  threads run Python (tokenising, post-processing) the loop waits for the GIL
+  up to one interval per handoff: at CPython's 5 ms default a 2,000-character
+  request answered at 101.5 ms against a 90 ms deadline (2026-10-20,
+  end-to-end), past route-policy's cut, which then dropped every partial
+  result.
 
 ### Token windows
 
@@ -465,7 +473,12 @@ models warm) and for the edge to mark it UP, then stops the old one
 traffic; equal model ids make that harmless, and a model change between
 copies makes the pinned evaluators abstain for those seconds.
 
-Order on the box (first time):
+The edge's `listen signals` has 75 s client / server timeouts: route-policy's
+calls end at their 80 ms deadline, and a request with no deadline is capped
+by the sidecar at 60 s. Port 8025 was the retired vLLM Semantic Router's.
+
+Order on the box (first time). The Makefile registers `signals` before
+`route-policy` in `STACKS` for this, so a full `make up` keeps it:
 
 1. `make up edge` — the edge gains the `listen signals` on 8025.
 2. `make build signals && make up signals` (the build downloads ~1.2 GB and
@@ -482,7 +495,8 @@ make logs signals signals                             # one [signals] line per r
 
 RAM: ~1.8 GB per copy, two during a swap (`mem_limit`, `SIGNALS_MEM_LIMIT`,
 default `4g`). Rollback: `git revert`, `make up route-policy` (its binding
-loses the shadow slot), then `docker compose -p ai-signals down`.
+loses the shadow slot), then `docker compose -p ai-signals down` and
+`make up edge` (drops the `listen signals` backend).
 
 ### Configuration
 

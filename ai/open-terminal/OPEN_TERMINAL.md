@@ -4,7 +4,7 @@
 
 Open WebUI v0.11.3 integrates it natively: the terminal's OpenAPI operations become **native function-calling tools** on the model, and the chat UI grows a file-browser sidebar, file previews, drag-and-drop uploads into the terminal's filesystem, and an interactive xterm pane.
 
-Compose file: [`docker-compose.open-terminal.yml`](docker-compose.open-terminal.yml). Operator config lives in the root `.env` (`OPEN_TERMINAL_*`, plus `OPENWEBUI_ENABLE_CODE_INTERPRETER`); see the config-var table in the root [`CLAUDE.md`](../../CLAUDE.md). HTTP surface: [`open-terminal.postman_collection.json`](open-terminal.postman_collection.json).
+Compose file: [`docker-compose.open-terminal.yml`](docker-compose.open-terminal.yml). Operator config lives in the root `.env` (`OPEN_TERMINAL_*`, plus `OPENWEBUI_ENABLE_CODE_INTERPRETER`): each variable is commented in `.env.example`, listed in [`CLAUDE.md`](CLAUDE.md) beside this guide, and the less obvious ones are in [Configuration](#configuration). HTTP surface: [`open-terminal.postman_collection.json`](open-terminal.postman_collection.json).
 
 ## Why it replaces Pyodide
 
@@ -138,6 +138,18 @@ Plain `docker compose` silently ignores `deploy.resources.limits` (a Swarm key),
 
 This box also runs vLLM and llama.cpp; a runaway model-issued command with no ceiling starves them. `pids_limit` is the fork-bomb guard.
 
+## Configuration
+
+The settings not covered by a section above. Every one is also commented in `.env.example`.
+
+| `.env` | Default | Notes |
+|---|---|---|
+| `OPEN_TERMINAL_API_KEY` | _(unset — required)_ | Bearer token the terminal verifies. The SAME variable is interpolated into `TERMINAL_SERVER_CONNECTIONS`, whose connection JSON is built **inline** in `ai/openwebui/docker-compose.openwebui.yml`, so the key lives in exactly one place and the two containers can't drift. Compose fails fast via `${OPEN_TERMINAL_API_KEY:?...}`: left unset, open-terminal would self-generate a key and the connection would silently 401. Anyone holding it has a root-capable shell — `openssl rand -hex 32`, treat it as a production password. Rotating also means editing the key in Admin Settings → Integrations → Open Terminal (first-boot-only PersistentConfig). |
+| `OPEN_TERMINAL_MAX_SESSIONS` | `16` | Cap on concurrent interactive PTY sessions across all users; `POST /api/terminals` returns 429 past it. |
+| `OPEN_TERMINAL_EXECUTE_TIMEOUT` | _(empty)_ | Seconds `POST /execute` and `GET /execute/{id}/status` block inline before returning a process id the model must poll. Empty = return immediately. Set 5–15 if models keep forgetting to poll; the API caps per-request `wait` at 300. The compose file reads it as `${OPEN_TERMINAL_EXECUTE_TIMEOUT:-0}` **on purpose**: `open_terminal/env.py` calls `float()` whenever the variable is present, so a present-but-empty value crashes the server at import, while `0` is falsy at its only use site and behaves exactly like unset. |
+| `OPEN_TERMINAL_PIP_PACKAGES` | _(empty)_ | Space-separated pip packages installed on **every** container start (fat image only) — before the server binds, so a long list delays readiness on each recreate. Bake heavy deps into a derived image instead. The base image already ships numpy/pandas/scipy/scikit-learn/matplotlib/plotly/requests/bs4/sqlalchemy/openpyxl/python-docx/python-pptx/pypdf. |
+| `OPEN_TERMINAL_INFO` | _(operator context string)_ | Appended to the system prompt served at `GET /system`, which Open WebUI fetches once at startup and injects for any model with the terminal attached. Also creates the `GET /info` route — the route does not exist at all when this is empty. Keep it short; it costs tokens every turn. |
+
 ## First-time bring-up
 
 Run these on the box, from the repo root.
@@ -221,7 +233,7 @@ Admins always keep access when `BYPASS_ADMIN_ACCESS_CONTROL` is on (upstream def
 
 ## Verifying the connection
 
-`open-terminal` has no host port, so test from inside `openwebui` — the only container that can reach it:
+`open-terminal` has no host port, so test from inside `openwebui` — the only container that can reach it (for Postman, the collection's description documents a temporary loopback publish and a `socat` tunnel; never bind `0.0.0.0`, where the bearer token would be the only thing between the LAN and a shell):
 
 ```bash
 # is it reachable and does the key work?
@@ -309,7 +321,7 @@ make build open-terminal
 make up open-terminal
 ```
 
-The `open_terminal_home` volume is untouched by an image bump — user files survive. Check the [release notes](https://github.com/open-webui/open-terminal/releases) for new `OPEN_TERMINAL_*` variables; add anything you adopt to `.env`, `.env.example`, the compose file, and the `CLAUDE.md` table together.
+The `open_terminal_home` volume is untouched by an image bump — user files survive. Check the [release notes](https://github.com/open-webui/open-terminal/releases) for new `OPEN_TERMINAL_*` variables; add anything you adopt to `.env`, `.env.example`, the compose file, and the env-var list in this folder's `CLAUDE.md` together.
 
 Open WebUI itself is pinned separately by `OPENWEBUI_VERSION` and builds a patched local image — see [OPENWEBUI.md § Custom image](../openwebui/OPENWEBUI.md). Terminal support landed upstream before v0.11.3, so a terminal bump never requires an Open WebUI bump.
 

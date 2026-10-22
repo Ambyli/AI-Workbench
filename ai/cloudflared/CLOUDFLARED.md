@@ -117,7 +117,7 @@ host-targeted ingress rule breaks.
 
 | Hostname | Origin | Notes |
 |---|---|---|
-| `chat.zeoenergy.com` | `http://oauth2-proxy:4180` | SSO front door for Open WebUI, `/sandboxes/*`, `/n8n/*` |
+| `chat.zeoenergy.com` | `http://oauth2-proxy:4180` | SSO front door for Open WebUI and every path upstream in `OAUTH2_PROXY_UPSTREAMS`: `/sandboxes/*`, `/superset/*`, `/rustfs/*`, `/edge/*`. Not `/n8n/*`: n8n is not exposed ([N8N.md § Access](../n8n/N8N.md#access-not-exposed)) |
 | `api.zeoenergy.com` | `http://litellm:4000` | **Bypasses oauth2-proxy** — LiteLLM's own key auth is the only gate. Off-LAN path only: on the office LAN the same name resolves to the box and reaches the LAN edge instead ([split-horizon](#dns-01-certificate-for-apizeoenergycom-on-the-lan-edge-split-horizon)). Leave its DNS record alone; never add an `A` record for `api` |
 | `rdp.zeoenergy.com` | `tcp://host.docker.internal:3389` | RDP listens on the host, not in Docker |
 | _(catch-all)_ | `http_status:404` | |

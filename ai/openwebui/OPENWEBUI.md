@@ -494,7 +494,7 @@ Instead it sends the conversation so far plus a hidden user message — *"You sa
 
 | `.env` | Container env | Default | Notes |
 |---|---|---|---|
-| `OPENWEBUI_AUTO_CONTINUE_MAX_NUDGES` | `AUTO_CONTINUE_MAX_NUDGES` | `2` | Nudges per assistant turn; `0` turns the feature off. Each nudge costs one extra model call. Read on every boot — `make up openwebui` after a change |
+| `OPENWEBUI_AUTO_CONTINUE_MAX_NUDGES` | `AUTO_CONTINUE_MAX_NUDGES` | `2` (compose `${OPENWEBUI_AUTO_CONTINUE_MAX_NUDGES:-2}`; `.env.example` ships `0`) | Nudges per assistant turn; `0` turns the feature off. Each nudge costs one extra model call and one `auto-continue:` INFO line. Read on every boot — `make up openwebui` after a change. **Off (`0`) in `.env.example` since 2026-10-20:** the heuristic nudged a finished answer that ended with an offer into a second, redundant answer, and route-policy read the hidden nudge as a new user message (route-policy's turn pin now holds a nudge to its turn's route). The heuristic is fixed (conditional offers hand the turn back); set `2` again once that is verified |
 
 **Seeing it work.** One INFO line per nudge:
 
@@ -551,6 +551,10 @@ A key the script prints as `None` has no row and runs on its env / upstream defa
 **LiteLLM-only alternative, no flag and no patch.** Upstream's per-connection headers fill `{{CHAT_ID}}`, `{{MESSAGE_ID}}` and `{{USER_ID}}` from the same metadata (`utils/headers.py::parse_custom_headers`). Set them in Admin Settings → Connections → the LiteLLM connection → Headers: `{"X-OpenWebUI-Chat-Id": "{{CHAT_ID}}", "X-OpenWebUI-Message-Id": "{{MESSAGE_ID}}", "X-OpenWebUI-User-Id": "{{USER_ID}}"}`. Nothing then reaches kokoro-api, the tool servers or the terminal. The costs: the setting lives in the `openai.api_configs` DB row, not in this repo (`OPENAI_API_CONFIGS` is first-boot-only), and a missing value is sent as an empty header rather than left out.
 
 **Checking it on the box** after `make up openwebui`: `docker exec openwebui printenv ENABLE_FORWARD_USER_INFO_HEADERS` says `true`; then send a chat on `auto` and the route-policy decisions for that chat (`GET /chats/{chat_id}/decisions` on `route-policy`) have both `chat_id` and `message_id` set, with `message_id` equal to the assistant message's id in the chat. A tool round or nudge in the same turn repeats the same `message_id` under a new `decision_id`.
+
+### Task model
+
+Set **Admin Settings → Interface → Task Model** (local *and* external) to a non-`auto` model — `local-private` if chats may carry customer data. Open WebUI otherwise sends every background task (title, tags, follow-ups, search queries, autocomplete, emoji) to the chat model; on `auto` each one reaches route-policy like a chat turn and can pick up a LiteLLM `auto` footer. Both LiteLLM's footer and route-policy's `background_task` flag detect tasks by Open WebUI's **default** task prompts (`### Task:`, the emoji prompt, `Available Tools:`), so re-check that detection after an upgrade that changes them. Details: [LITELLM.md § The `auto` footer](../litellm/LITELLM.md#the-auto-footer), [ROUTE_POLICY.md § Background tasks](../route-policy/ROUTE_POLICY.md#background-tasks). A PersistentConfig row — set it in the UI.
 
 ### Context compaction
 

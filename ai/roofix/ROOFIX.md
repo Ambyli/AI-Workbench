@@ -20,7 +20,7 @@ docker compose -f ai/roofix/docker-compose.roofix.yml up -d
 
 Default `DRY_RUN=true` — the bridge fetches, parses, decides, and logs, but does **not** write to Phoenix. Flip to `false` in `.env` only after watching a full run.
 
-Before the bridge can hydrate proposals, upload a Roofix profile to interceptor once — see [INTERCEPTOR.md § Refreshing a profile](INTERCEPTOR.md#refreshing-a-profile-operator-flow). The uploaded profile lives at `/data/profiles/roofix/` inside the interceptor container.
+Before the bridge can hydrate proposals, upload a Roofix profile to interceptor once — see [INTERCEPTOR.md § Refreshing a profile](../interceptor/INTERCEPTOR.md#refreshing-a-profile-operator-flow). The uploaded profile lives at `/data/profiles/roofix/` inside the interceptor container.
 
 ### Endpoints
 
@@ -119,7 +119,7 @@ Sub-cases that short-circuit before the action branches:
 | `PHOENIX_AGENT_USER_ID` | _(unset — required for writes)_ | Dedicated Phoenix user id the bridge writes as. Provision manually. |
 | `PHOENIX_ROOFIX_ID_COLUMN` | `migration_external_id` | Where the Roofix project id is stamped on the project row. |
 | `ROOFIX_DB_USER` | `roofix` | User for the compose-managed `roofix-db` Postgres backing `ProcessedStore`. |
-| `ROOFIX_DB_PASSWORD` | `roofix` | Password for `roofix-db`. Defaults to `roofix` in both `docker-compose.roofix.yml` and `ai/roofix/app.py`'s DSN, so the container comes up on a fresh clone. Override for anything past dev. |
+| `ROOFIX_DB_PASSWORD` | `roofix` | Password for `roofix-db`. Defaults to `roofix` in both `docker-compose.roofix.yml` and `ai/roofix/app.py`'s DSN, so the container comes up on a fresh clone. Override for anything past dev: `roofix-db` sits on `ai_shared` (reachable by every service there, and by Trino) and publishes `PORT_ROOFIX_DB` — don't ship the default password if you expose it. |
 | `ROOFIX_DB_NAME` | `roofix` | Database name inside `roofix-db`. |
 | `PORT_ROOFIX_DB` | `5433` | Host port `roofix-db` binds to (container 5432 → host `5433`) so remote clients can connect. Lives in the `PORT REGISTRY` block at the top of `.env` alongside `PORT_POSTGRES` (litellm_db, 5432). |
 | `INTERCEPTOR_URL` | `http://interceptor:8080` | Sibling generic CDP service the bridge POSTs `/capture` to. |
@@ -177,7 +177,7 @@ machine-bound about them (unlike Chrome's saved passwords).
 
 `interceptor` owns Roofix's login state as a named profile called `roofix` (configurable via `ROOFIX_PROFILE_NAME`). Every `/capture` call the bridge makes reuses that profile — no login prompt until the session expires.
 
-**Canonical operator guide for capturing + uploading a profile: [INTERCEPTOR.md § Refreshing a profile](INTERCEPTOR.md#refreshing-a-profile-operator-flow).** In short:
+**Canonical operator guide for capturing + uploading a profile: [INTERCEPTOR.md § Refreshing a profile](../interceptor/INTERCEPTOR.md#refreshing-a-profile-operator-flow).** In short:
 
 ```powershell
 uv run cdp-spy --url https://roofix.io --profile-dir "C:\Users\<you>\.zeo\roofix_profile"   # log in visibly
@@ -399,31 +399,33 @@ docker compose -f ai/roofix/docker-compose.roofix.yml up -d --build
 ### Project structure
 
 ```
-ai/
-  docker-compose.roofix.yml
+ai/roofix/
+  docker-compose.roofix.yml         roofix-db + roofix (both recreate-class)
   Dockerfile.roofix
   ROOFIX.md
-  roofix/
-    bridge/
-      pyproject.toml
-      app.py                          FastAPI + APScheduler entry point
-      components/
-        parser.py                     email → normalized event (Contract B)
-        brain.py                      rules-first decision + LiteLLM fallback
-        orchestrator.py               parse → resolve → decide → execute
-        gmail_client.py               Gmail API listener (OAuth 2.0)
-        phoenix_client.py             Phoenix Postgres client (psycopg2, reads + writes)
-        roofix_scraper_client.py      HTTP client → interceptor /capture, reshapes to init_data+mget_docs
-        notifier.py                   Phase 1 stub — CloudTalk / rep SMS
-      config/
-        field_mapping.json            Roofix event → Phoenix milestone map (Michael's file)
-      tests/
-        roofix_email_samples.py       real observed email shapes
-        test_parser.py                offline parser suite
-        test_brain.py                 offline brain/rules suite
+  roofix.postman_collection.json
+  pyproject.toml                    uv workspace member `roofix`
+  app.py                            FastAPI + APScheduler entry point
+  components/
+    parser.py                       email → normalized event (Contract B)
+    brain.py                        rules-first decision + LiteLLM fallback (generate_ai_decision, AsyncOpenAI)
+    orchestrator.py                 parse → resolve → decide → execute
+    gmail_client.py                 Gmail API listener (OAuth 2.0)
+    phoenix_client.py               Phoenix Postgres client (psycopg2, reads + writes)
+    roofix_scraper_client.py        HTTP client → interceptor /capture, reshapes to init_data+mget_docs
+    proposal_extractor.py           init_data + mget_docs → proposal dict
+    notifier.py                     Phase 1 stub — CloudTalk / rep SMS
+    constants.py
+  config/
+    field_mapping.json              Roofix event → Phoenix milestone map (Michael's file)
+  tests/
+    roofix_email_samples.py         real observed email shapes
+    fixtures/                       captured proposal payloads
+    test_parser.py, test_brain.py, test_phoenix_client.py, test_proposal_extractor.py,
+    test_t9_orchestrator.py, test_e2e_offline.py
 ```
 
-Chrome-under-CDP lives in the sibling `ai/interceptor/` service (see `INTERCEPTOR.md`).
+There is no separate scraper service any more: the Playwright proposal scraper (and its `save_roofix_session.py` + `/session/refresh` flow) was replaced by the generic `ai/interceptor/` service (Chrome under CDP), which owns the Roofix session as a named profile — see [Session profile](#session-profile-roofix-on-interceptor).
 
 ### Known limitations / TODOs
 
@@ -431,4 +433,4 @@ Chrome-under-CDP lives in the sibling `ai/interceptor/` service (see `INTERCEPTO
 - **`field_mapping.json` is a stub.** Michael owns the Roofix-event → Phoenix (block_name, status_id) mapping. `update_milestone` will log a "no milestone mapping" warning and skip until the file is filled in.
 - **`PHOENIX_AGENT_USER_ID` must be provisioned manually.** Create a dedicated Phoenix agent user and set the env var so writes are attributable.
 - **Phase 1** — `create_project` and `notify_rep` paths exist but are stubbed. Wire a CloudTalk MCP when needed.
-- **Session refresh is manual.** interceptor cannot present a login UI — operators capture a profile on a laptop and upload the `.tgz` to `/profiles/roofix/refresh` (see [INTERCEPTOR.md § Refreshing a profile](INTERCEPTOR.md#refreshing-a-profile-operator-flow)).
+- **Session refresh is manual.** interceptor cannot present a login UI — operators capture a profile on a laptop and upload the `.tgz` to `/profiles/roofix/refresh` (see [INTERCEPTOR.md § Refreshing a profile](../interceptor/INTERCEPTOR.md#refreshing-a-profile-operator-flow)).

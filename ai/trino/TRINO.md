@@ -54,6 +54,26 @@ the whole stack takes ~90 s.
 | HMS Postgres | `psql -h localhost -p 5436 -U hive metastore` | Operator inspection only |
 | Superset Postgres | `psql -h localhost -p 5437 -U superset superset` | Operator inspection only |
 
+Host ports are `PORT_TRINO` (8013 → `:8443`), `PORT_LAKE_S3_API` /
+`PORT_LAKE_S3_CONSOLE` (8014 / 8015 → `9000` / `9001`), `PORT_SUPERSET`
+(8016, published by `ai/edge`, not this compose file), and `PORT_HMS_DB` /
+`PORT_SUPERSET_DB` (5436 / 5437), all in the `PORT REGISTRY` block of `.env`.
+
+## Networks
+
+The stack uses two networks:
+
+- **`analytics_net`** — the data plane: Trino ↔ HMS ↔ HMS Postgres, plus
+  `lake-s3`'s second leg so Trino reaches it by service DNS. It is a plain
+  bridge, **not** `internal: true`: `lake-s3` already publishes host ports on
+  `ai_shared`, so hardening the data plane would gain nothing and would
+  complicate future ingestion jobs.
+- **`ai_shared`** — only the surfaces external callers reach:
+  `trino-coordinator` (JDBC / web UI), `lake-s3` (S3 API + console),
+  `superset` (UI), and `trino-mcp` (LiteLLM's MCP endpoint).
+
+Nothing outside `analytics_net` talks to HMS directly; Trino is its sole client.
+
 ## JDBC authentication
 
 The coordinator runs two listeners with different trust models:
@@ -69,6 +89,11 @@ Trino disables HTTP entirely once HTTPS + an authenticator are on;
 authenticator. That is the same trust posture every other service on
 `ai_shared` already has, and it is only safe because 8080 is never
 published on the host. **Do not add an 8080 port mapping.**
+
+Enabling client authentication also makes Trino demand a node-to-node
+secret, even on a single node: `TRINO_SHARED_SECRET`, referenced from
+`config/config.properties` as `${ENV:TRINO_SHARED_SECRET}` (generate with
+`openssl rand -hex 32`; compose refuses to start without it).
 
 ### Accounts
 
@@ -165,8 +190,17 @@ accepted by `run_query` — are never rewritten: Trino's grammar has no
 `LIMIT` on them (`DESCRIBE t LIMIT 10` is a `SYNTAX_ERROR`), so the fetch
 cap alone bounds them.
 
+**SELECT-only and clamped.** `common.trino.TrinoClient` rejects every
+statement except `SELECT` / `WITH` / `SHOW` / `DESCRIBE` / `EXPLAIN` unless
+it is built with `allow_writes=True`, which only `ai/trino/bin/init_warehouse.py`
+does. Rows are clamped to `TRINO_MCP_MAX_ROWS` (above); runtime is clamped to
+`TRINO_MCP_MAX_RUNTIME_S` by forwarding it as
+`session_properties.query_max_execution_time` on each `run_query`. The
+coordinator's own `query.max-execution-time` in `ai/trino/config/config.properties`
+is the belt-and-suspenders backup.
+
 The MCP loop is the same two-step pattern documented in
-`CLAUDE.md § LiteLLM with Phoenix MCP` — LiteLLM does not execute the
+[`ai/litellm/LITELLM_MCP.md`](../litellm/LITELLM_MCP.md) — LiteLLM does not execute the
 tool call itself; the caller (OpenWebUI or a `curl` script) forwards the
 tool_call, hits `trino-mcp`'s HTTP endpoint, and sends the result back.
 
@@ -452,7 +486,10 @@ image change rather than a rename.
 - **Credentials:** `LAKE_S3_ACCESS_KEY` / `LAKE_S3_SECRET_KEY` in `.env`
   (dev defaults `trino` / `trino-dev-only`) become `RUSTFS_ACCESS_KEY` /
   `RUSTFS_SECRET_KEY` on lake-s3, `${ENV:…}` in `catalogs/iceberg.properties`
-  and `${env.…}` in `hive-metastore/metastore-site.xml`.
+  and `${env.…}` in `hive-metastore/metastore-site.xml` (bind-mounted
+  read-only, so no rebuild is needed). The endpoint `http://lake-s3:9000` is
+  fixed in the compose file, not `.env`. Rotating the pair is edit `.env` +
+  `make up trino` — every consumer reads them from env at container start.
 - **Path-style only.** `RUSTFS_SERVER_DOMAINS` is deliberately unset —
   setting it turns on virtual-host bucket routing, and Trino
   (`s3.path-style-access=true`) and HMS (`fs.s3a.path.style.access=true`)
@@ -479,6 +516,15 @@ image change rather than a rename.
   minutes, which the healthcheck's retry budget allows for.
 - **No metrics scrape.** RustFS exports OTLP only (no Prometheus endpoint);
   MinIO was not scraped either.
+
+### Iceberg warehouse paths: `s3a://`, not `s3://`
+
+The Hive Metastore's `hive.metastore.warehouse.dir` points at
+`s3a://warehouse/`, and every `CREATE SCHEMA` should carry an explicit
+`WITH (location = 's3a://warehouse/<schema>')`. That matches HMS's default
+filesystem and avoids the scheme mismatch that would follow if Trino wrote
+through its native S3 connector while HMS validated with s3a.
+`ai/trino/bin/init_warehouse.py` follows this convention.
 
 ### Cutover from MinIO (one-time, on the box)
 

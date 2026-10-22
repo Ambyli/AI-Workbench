@@ -807,7 +807,9 @@ Each type is a plugin (`route_policy/evaluators/`) with:
 
 `unit-tests/route-policy/test_declarations.py` runs every real evaluator and
 fails on an undeclared or missing key: the classifier's `@result_spec`
-standard. **No `detail` ever holds message text.** Decisions are federated
+standard. A new type is its module, one line in
+`evaluators/base.py::_DECLARING_MODULES`, and cases in that test, in the
+same change. **No `detail` ever holds message text.** Decisions are federated
 into Trino; `regex_text` reports pattern *indices*, `tool_calls` tool *names*.
 
 | Type | Config | Votes when |
@@ -942,7 +944,8 @@ config, so nothing else holds them. `test_default_ruleset.py` checks that:
   stays in the RE2 subset (no lookaround, backreferences, atomic or
   possessive groups, `\Z`). `common.keywordmatch` gives Go RE2's semantics
   (ASCII `\b` / `\w`), but Python's `re` accepts more, so this check is what
-  keeps the patterns portable;
+  keeps the patterns portable. Write regex keywords in YAML **single**
+  quotes so their backslashes survive;
 - the real "Scientific Calculator" chat prompts match `code_kw` (or don't);
 - the wiring and the routes on ~25 conversation shapes are as listed above,
   and so are the routes of a turn's later calls (a tool round, the nudge,
@@ -1863,20 +1866,20 @@ environment variables.
 
 | Variable | Default | What |
 |---|---|---|
-| `PORT_ROUTE_POLICY` | `8027` | LAN port, published by `ai/edge` |
-| `PORT_ROUTE_POLICY_DB` | `5441` | Host port of `route-policy-db` (psql / DBeaver) |
-| `ROUTE_POLICY_DB_USER` / `_PASSWORD` / `_NAME` | `route_policy` × 3 | Database credentials (dev defaults; override before exposing 5441) |
-| `ROUTE_POLICY_TRINO_READER_PASSWORD` | _(empty)_ | `trino_reader` password; empty skips the role (only the Trino catalog breaks) |
+| `PORT_ROUTE_POLICY` | `8027` | LAN port, published by `ai/edge` (`route-policy` is swap-class, so it has no `ports:` of its own; `make up edge` before the first `make up route-policy`) and limited to `EDGE_ALLOWED_CIDRS`; no auth on the service. LiteLLM's hook and Trino never use it: they reach `route-policy:8000` / `route-policy-db:5432` by service DNS on `ai_shared` |
+| `PORT_ROUTE_POLICY_DB` | `5441` | Host port of `route-policy-db` (psql / DBeaver), in the Postgres group of the `PORT REGISTRY` -- not `5434`, which a host Postgres holds on the box |
+| `ROUTE_POLICY_DB_USER` / `_PASSWORD` / `_NAME` | `route_policy` × 3 | Database credentials (dev defaults; override before exposing 5441 -- whoever can write `bindings` / `rulesets` decides every `auto` turn). Every row the service keeps goes through ONE asyncpg pool (`route_policy/db/pool.py`). Startup needs the database (migrations + seeding); once up, `/decide` keeps deciding from the cached rulesets if it goes away. Tests need `TEST_POSTGRES_DSN` ([§ Tests](#tests)) |
+| `ROUTE_POLICY_TRINO_READER_PASSWORD` | _(empty)_ | `trino_reader` password (`pg_read_all_data` + `default_transaction_read_only`, no `BYPASSRLS` -- nothing here uses RLS), created by `db-init/10-trino-reader.sh` on the FIRST start of an empty volume; empty skips the role (only the Trino catalog breaks). It reads every decision with its chat / user ids (never message text): `openssl rand -hex 32`. Retrofit / rotate: [§ Operations](#operations) |
 | `ROUTE_POLICY_DB_POOL_MAX` | `10` | Pool ceiling |
 | `ROUTE_POLICY_BINDING_REFRESH_S` | `10` | Age at which `/decide` re-reads `bindings` |
 | `ROUTE_POLICY_DECISION_WRITE_BUDGET_S` | `0.05` | How long `/decide` / `/observe` wait for their row before answering anyway (floor 0; the write then finishes in the background). Keep it well below LiteLLM's 0.25 s `ROUTE_POLICY_DECIDE_TIMEOUT_S` |
-| `ROUTE_POLICY_CLASSIFIER_URL` | `http://classifier:8000` | The document classifier, by Docker DNS on `ai_shared`, no auth. Empty (only possible outside the compose file) runs no analysis queue: every `llm_classifier` abstains |
-| `ROUTE_POLICY_CLASSIFY_TIMEOUT_S` | `180` | One classification, from the locality check to the result (floor 1); past it the job is cancelled + deleted and stored as `timeout` |
+| `ROUTE_POLICY_CLASSIFIER_URL` | `http://classifier:8000` | The document classifier, by Docker DNS on `ai_shared`, no auth, never on the `/decide` path. Empty (only possible outside the compose file, whose `${…:-}` falls back to the default) runs no analysis queue: every `llm_classifier` abstains (the unit tests use that). Not a `depends_on` (another compose project): a down classifier only makes classifications fail (`analyses.status = unavailable`) |
+| `ROUTE_POLICY_CLASSIFY_TIMEOUT_S` | `180` | One classification, from the locality check to the result (floor 1) -- it may wait behind document jobs in the classifier's FIFO, then makes one model call per criterion; past it the job is cancelled + deleted and stored as `timeout` |
 | `ROUTE_POLICY_CLASSIFY_POLL_S` | `1` | `GET /jobs/{id}` interval (floor 0.1); also the resolution of `analyses.queue_ms` |
 | `ROUTE_POLICY_ANALYSIS_QUEUE_MAX` | `64` | Requests that may wait for a worker (floor 1); past it dropped and counted |
-| `ROUTE_POLICY_ANALYSIS_CONCURRENCY` | `2` | Workers = route jobs open on the classifier at once (floor 1) |
-| `ROUTE_POLICY_SIGNALS_URL` | `http://signals:8000` | The signals sidecar, by Docker DNS on `ai_shared`, no auth. Only a host that resolves to this box's networks is ever sent text. Empty (only possible outside the compose file) runs no client: every signal evaluator abstains (`signals unavailable`), `pii` votes from its patterns |
-| `ROUTE_POLICY_SIGNALS_BUDGET_S` | `0.1` | How long a decision (primary or shadow) waits for its signals call (floor 0.04: the margin + 20 ms, so the sidecar always gets at least 20 ms -- at a floor of 0.02 it was told `deadline_ms: 1` and skipped every task); the sidecar is told 20 ms less. It runs concurrently with the database reads, so at or below `DB_READ_BUDGET_S` it adds nothing to the worst case |
+| `ROUTE_POLICY_ANALYSIS_CONCURRENCY` | `2` | Workers = route jobs open on the classifier at once (floor 1). The classifier's per-model `max_concurrent` (`qwen3.5-4b`: 2) bounds the model calls inside them; this keeps route-policy from flooding the classifier's FIFO, which document jobs share |
+| `ROUTE_POLICY_SIGNALS_URL` | `http://signals:8000` | The signals sidecar, by Docker DNS on `ai_shared`, no auth. Only a host that resolves to this box's networks is ever sent text (`common.signals`' client, [§ Signals](#signals)). Empty (only possible outside the compose file, whose `${…:-}` falls back to the default) runs no client: every signal evaluator abstains (`signals unavailable`), `pii` votes from its patterns. Not a `depends_on` (another compose project) |
+| `ROUTE_POLICY_SIGNALS_BUDGET_S` | `0.1` | How long a decision (primary or shadow) waits for its signals call (floor 0.04: the margin + 20 ms, so the sidecar always gets at least 20 ms -- at a floor of 0.02 it was told `deadline_ms: 1` and skipped every task); the sidecar is told 20 ms less. It runs concurrently with the verdict lookup and the turn-pin read (`DB_READ_BUDGET_S`, 0.1 s), so at or below that it adds nothing to the worst case (~170 ms for `/decide` against the hook's 250). Measured on the box (2026-10-20, 2 threads per model, all three models in one call): 13 / 38 ms p50 for a 20 / 200-character message, so a turn up to ~1,000 characters gets every signal. At 2,000 characters PII and topic take ~82 / 85 ms alone: PII answers with the windows it scanned (`complete: false`) and finishes late into the sidecar's cache for the next turn, topic may abstain, and the injection score (~340 ms) misses it -- harmless while it only observes. Metrics: `route_policy_signals_total{outcome}`, `route_policy_signals_seconds{kind}` |
 
 Constants in `route_policy/config.py`, not environment variables:
 `WRITES_MAX_IN_FLIGHT` (256 background writes and after-the-answer tasks),
@@ -2017,6 +2020,15 @@ ai/route-policy/
     db/                 pool, migrations/ (0001_initial.sql, 0002_llm_classifier.sql, 0003_turn_pins.sql
                         + runner), repositories/
 ```
+
+**The pipeline stays pure.** Everything slow is fetched by the service
+before the pipeline runs and handed in on the request view: each evaluator
+names what it needs through hooks that `Evaluator` defaults to empty --
+`analysis_lookups(ctx)` (verdict keys to read), `signal_requests(ctx)` (the
+signals call) -- and hands back `analysis_requests(ctx)`, which the service
+enqueues after the answer. `rulesets/store.py::resolve` returns
+`Resolved(primary, shadow refs)` for a request; the primary answers, the
+shadows run in the after-the-answer task.
 
 Reused from `shared/common`:
 - `common.keywordmatch`: Go-RE2 keyword rules.

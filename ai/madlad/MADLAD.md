@@ -17,6 +17,8 @@ This launches two containers:
 
 All client traffic goes through `madlad-api` on port 8008. `madlad-app` is not exposed to the host.
 
+On the box, deploy with `make up madlad`: `madlad-api` is **swap-class** (no `container_name` / `ports:` of its own — host port `PORT_MADLAD_API` is published by `ai/edge`, see [EDGE.md](../edge/EDGE.md)), while `madlad-app` holds the GPU and is recreated.
+
 ### Usage
 
 **List available target languages:**
@@ -166,7 +168,7 @@ translate(text: str, target_lang: str) -> str
 
 Unlike a chat completions model, MADLAD is **tool-only** — it does not appear in `model_list` and cannot be called via `/v1/chat/completions` directly. Use it by asking a chat model to invoke the `translate` tool.
 
-**Example flow via LiteLLM proxy** (see CLAUDE.md's LiteLLM section for the two-step tool call loop):
+**Example flow via LiteLLM proxy** (see [LITELLM_MCP.md](../litellm/LITELLM_MCP.md) for the two-step tool call loop):
 
 ```bash
 curl http://localhost:4001/v1/chat/completions \

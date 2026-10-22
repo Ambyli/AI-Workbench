@@ -4,7 +4,7 @@ a change needs `make up litellm`). The values are the defaults of
 Handler(...); a test passes its own instead of touching the environment.
 
 Passed through ai/litellm/docker-compose.litellm.yml's `environment:` block;
-documented in CLAUDE.md's config table and ai/litellm/LITELLM.md.
+documented in ai/litellm/CLAUDE.md and ai/litellm/LITELLM.md.
 """
 
 from __future__ import annotations

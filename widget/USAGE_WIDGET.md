@@ -287,6 +287,7 @@ All settings live in `config.json` in the project root. Edit the file directly o
 | `LLM_MODEL` | _(empty)_ | Model alias passed to Claude Code; must match `--alias` on llama-server |
 | `LLM_LOG_MAX_LINES` | `200` | Max lines kept in the server-output log box |
 | `LLAMA_SERVER_CMD` | _(empty)_ | Full shell command to launch llama-server |
+| `KEEP_LLM_ACTIVE` | `false` | On **Quit**, leave Claude Code pointed at the local LLM. Quit always stops the llama-server it started; with `false` it also restores the Claude API settings. Any exit other than Quit leaves llama-server running (orphaned). |
 
 > **`CHROME_PATHS_VAR`** — set as a system environment variable (not in `config.json`) to supply an alternative Chrome executable path. Leave unset to use the built-in defaults.
 
@@ -337,6 +338,6 @@ If both accounts have been used in the same working directory, their sessions wi
 | `claude_observer/ui/popup.py` | `UsagePopup` — the tkinter popup window |
 | `claude_observer/ui/tray_icon.py` | `make_tray_icon()` — generates the tray icon image |
 | `claude_observer/system/startup.py` | Windows registry helpers for run-at-login |
-| `cdp_interceptor/` | Standalone, site-agnostic Chrome DevTools Protocol interceptor library — see [`USAGE_INTERCEPTOR.md`](USAGE_INTERCEPTOR.md) |
+| `common.cdp_interceptor` (`shared/common/src/common/cdp_interceptor/`) | Standalone, site-agnostic Chrome DevTools Protocol interceptor library, now in the shared `common` package — see [`USAGE_INTERCEPTOR.md`](USAGE_INTERCEPTOR.md) |
 | `config.json` | Local configuration |
 | `~/.claude_widget/chrome_profile/` | Persistent Chrome session data (created on first Link Browser click) |

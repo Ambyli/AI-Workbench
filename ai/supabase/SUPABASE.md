@@ -48,6 +48,11 @@ the keys must stay verbatim; the container names follow upstream's
 `supabase-<svc>` convention. Only the three that also join `ai_shared` get a
 distinctive name for both.
 
+**Realtime needs an explicit network alias.** Upstream gets the DNS name
+`realtime-dev.supabase-realtime` from a dotted `container_name` we do not
+reproduce, so the compose file adds it as a network alias on `supabase_net`.
+Remove the alias and the gateway's `/realtime/v1` route 503s.
+
 **`make up supabase` swaps most of the stack with no downtime.** `supabase-api`
 and seven data-plane services (`auth`, `rest`, `storage`, `imgproxy`, `meta`,
 `studio`, `functions`) are labelled `com.zeo.deploy: swap`: a new
@@ -80,7 +85,12 @@ model-driven shell, is on `terminal_net` and is **not** on `ai_shared`.)
 
    Or print a paste-ready block with no arguments. `--force` rotates values
    that are already set — read [Secrets that are one-shot](#secrets-that-are-one-shot)
-   first. Do **not** use upstream's `utils/generate-keys.sh`: it `sed`s
+   first. `--verify` runs the script's self-check. The script is stdlib only
+   and only ever touches `SUPABASE_*` lines. Every required secret is
+   `${VAR:?…}` in the compose file, and the services enforce the lengths:
+   `SUPABASE_SECRET_KEY_BASE` ≥ 64, `SUPABASE_REALTIME_DB_ENC_KEY` **exactly**
+   16, `SUPABASE_VAULT_ENC_KEY` **exactly** 32, `SUPABASE_PG_META_CRYPTO_KEY`
+   ≥ 32, `SUPABASE_JWT_SECRET` ≥ 32. Do **not** use upstream's `utils/generate-keys.sh`: it `sed`s
    *unprefixed* names (`POSTGRES_PASSWORD=`, `JWT_SECRET=`, `ANON_KEY=`, …)
    into `./.env`, and in this repo's shared `.env` those generic names are
    free for any other subsystem to claim — it would silently clobber them.
@@ -88,7 +98,8 @@ model-driven shell, is on `terminal_net` and is **not** on `ai_shared`.)
 2. **Set the URLs.** In the same block:
    `SUPABASE_PUBLIC_URL`, `SUPABASE_API_EXTERNAL_URL`, `SUPABASE_SITE_URL`.
    `SUPABASE_PUBLIC_URL` must be the **exact browser origin, no trailing
-   slash** — Envoy's entrypoint `sed`s it into a CORS *exact match*.
+   slash** — Envoy's entrypoint `sed`s it into a CORS *exact match*. Its
+   port must therefore agree with `PORT_SUPABASE_API` (default `8022`).
 
 3. **Bring it up.**
 

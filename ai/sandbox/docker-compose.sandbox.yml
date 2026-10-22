@@ -203,6 +203,8 @@ services:
       - SANDBOX_MAX_CONCURRENT=${SANDBOX_MAX_CONCURRENT:-8}
       - SANDBOX_DEFAULT_TTL_SECONDS=${SANDBOX_DEFAULT_TTL_SECONDS:-900}
       - SANDBOX_HARD_TTL_SECONDS=${SANDBOX_HARD_TTL_SECONDS:-3600}
+      # Reaper idle threshold; empty or unset inherits the default TTL.
+      - SANDBOX_IDLE_TTL_SECONDS=${SANDBOX_IDLE_TTL_SECONDS:-${SANDBOX_DEFAULT_TTL_SECONDS:-900}}
       # Networks the runner will attach spawned sandboxes to. Must exist.
       - SANDBOX_NET_NAME=sandbox_net
       # Where the runner tells sandboxes to send outbound HTTP.

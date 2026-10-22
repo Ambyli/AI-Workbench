@@ -1463,10 +1463,10 @@ def test_edge_env_vars_are_passed_through_and_documented():
     env = _edge_compose_service().get("environment") or {}
     assert set(env) == used, "every variable haproxy.cfg reads must be in the edge compose environment"
     env_example = _env_example()
-    claude_md = (_ROOT / "CLAUDE.md").read_text(encoding="utf-8")
+    claude_md = (_ROOT / "ai" / "edge" / "CLAUDE.md").read_text(encoding="utf-8")
     for var in used:
         assert f"\n{var}=" in env_example, f"{var} missing from .env.example"
-        assert f"`{var}`" in claude_md, f"{var} missing from the CLAUDE.md config table"
+        assert f"`{var}`" in claude_md, f"{var} missing from ai/edge/CLAUDE.md's env var list"
     # Space-separated (HAProxy's "${VAR[*]}" expansion), never commas -- and
     # docker-proxy's bridge-gateway source must stay allowed.
     cidrs = re.search(r'^EDGE_ALLOWED_CIDRS="([^"]*)"$', env_example, re.M).group(1)
@@ -1678,12 +1678,12 @@ def test_edge_waits_for_edge_certs_to_be_healthy():
 
 def test_tls_env_vars_are_documented_and_reach_edge_certs_only():
     env_example = _env_example()
-    claude_md = (_ROOT / "CLAUDE.md").read_text(encoding="utf-8")
+    claude_md = (_ROOT / "ai" / "edge" / "CLAUDE.md").read_text(encoding="utf-8")
     certs_env = _edge_certs_service()["environment"]
     edge_env = _edge_compose_service().get("environment") or {}
     for var in TLS_ENV + ("PORT_LITELLM_TLS",):
         assert f"\n{var}=" in env_example, f"{var} missing from .env.example"
-        assert f"`{var}`" in claude_md, f"{var} missing from the CLAUDE.md config table"
+        assert f"`{var}`" in claude_md, f"{var} missing from ai/edge/CLAUDE.md's env var list"
     for var in TLS_ENV:
         assert var in certs_env, f"{var} not passed to edge-certs"
         assert certs_env[var].startswith("${" + var), certs_env[var]

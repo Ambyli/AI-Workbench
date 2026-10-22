@@ -184,8 +184,9 @@ def test_linux_side_files_are_lf():
 def test_docs_list_the_subsystem():
     claude = (ROOT / "CLAUDE.md").read_text(encoding="utf-8")
     assert "ai/route-policy/route-policy.postman_collection.json" in claude
+    stack = (SERVICE_DIR / "CLAUDE.md").read_text(encoding="utf-8")
     for var in ("PORT_ROUTE_POLICY", "PORT_ROUTE_POLICY_DB", "ROUTE_POLICY_TRINO_READER_PASSWORD"):
-        assert f"`{var}`" in claude, var
+        assert f"`{var}`" in stack, f"{var} missing from ai/route-policy/CLAUDE.md"
     infra = (ROOT / "ai/AI_INFRA.md").read_text(encoding="utf-8")
     assert "route-policy/docker-compose.route-policy.yml" in infra
     assert "route-policy/ROUTE_POLICY.md" in infra

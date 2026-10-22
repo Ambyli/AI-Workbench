@@ -2,38 +2,33 @@
 
 Self-hosted [n8n](https://n8n.io) workflow engine — used here to prototype automations that stitch together LiteLLM (chat / tool models), the Roofix bridge, MCP servers, and any external HTTP / webhook surface without writing a bespoke service for each one.
 
-Compose file: [`docker-compose.n8n.yml`](docker-compose.n8n.yml). Operator config lives in the root `.env` (`N8N_*`, `PORT_N8N_DB`); see the config-var table in the root `CLAUDE.md`.
+Compose file: [`docker-compose.n8n.yml`](docker-compose.n8n.yml). Operator config lives in the root `.env` (`N8N_*`, `PORT_N8N_DB`), commented in `.env.example` and listed in [`CLAUDE.md`](CLAUDE.md) beside this guide. The compose file is a pure `${…}` template (same discipline as `ai/openwebui`): edit `.env`, never the YAML.
 
 ## What runs
 
 | Container | Purpose | Network | Host port |
 |---|---|---|---|
-| `n8n` | Editor + workflow runtime (`n8nio/n8n`, port 5678 in-container) | `ai_shared` | _(none — reached via oauth2-proxy)_ |
+| `n8n` | Editor + workflow runtime (`n8nio/n8n`, port 5678 in-container) | `ai_shared` | _(none — not exposed, § Access)_ |
 | `n8n-db` | Postgres 16 backing workflows, credentials, execution history | `ai_shared` | `PORT_N8N_DB` (default `5435`) |
 
 Single-process runtime — no queue mode / Redis broker. If a workflow queue backlog becomes real, switch `EXECUTIONS_MODE=queue` and add a Redis service; not needed for prototyping.
 
-## Public routing (same-origin under oauth2-proxy)
+## Access (not exposed)
 
-n8n rides on the existing `chat.zeoenergy.com` hostname at the `/n8n/` subpath. No new Cloudflare tunnel hostname, no new oauth2-proxy instance, no new Google OAuth client.
+n8n is **not reachable from outside the box's Docker network.** `n8n` publishes no host port, `OAUTH2_PROXY_UPSTREAMS` has no n8n entry, there is no oauth2-proxy instance of its own, and no Cloudflare tunnel hostname points at it — so no browser can open the editor and no outside service can call a webhook. Containers on `ai_shared` reach it at `http://n8n:5678`; `n8n-db` is reachable on `PORT_N8N_DB` (§ Connecting to the n8n DB).
 
-The traffic path mirrors what `sandbox-proxy` already does under `/sandboxes/`:
+Don't publish `5678` to get at the editor: that hands it to the whole LAN with no SSO in front.
 
-```
-Browser ─▶ cloudflared ─▶ oauth2-proxy ──▶ n8n:5678   (path prefix /n8n/*)
-                                     └──▶ openwebui:8080  (everything else)
-                                     └──▶ sandbox-proxy:80/sandboxes/  (path prefix /sandboxes/*)
-                                     └──▶ oauth2-assets:80/assets/    (skip-auth)
-```
+### Exposing it later
 
-Wiring lives in `.env`:
+Not done. Notes for whoever does it:
 
-- `OAUTH2_PROXY_UPSTREAMS` includes `http://n8n:5678/n8n/` — oauth2-proxy's longest-prefix match sends `/n8n/*` requests to n8n with the path preserved.
-- On the n8n side, `N8N_PATH=/n8n/`, `N8N_EDITOR_BASE_URL=https://chat.zeoenergy.com/n8n/`, and `WEBHOOK_URL=https://chat.zeoenergy.com/n8n/` tell it it's mounted at that prefix so the editor's HTML and webhook payloads use the correct URLs.
+- **Its own hostname, at root — not a path on `chat.zeoenergy.com`.** n8n's subpath mode (`N8N_PATH=/n8n/`) is broken upstream (n8n-io/n8n#19635, #18596: assets fall through to the SPA, login redirects to `/n8n/n8n`); the maintainers recommend a subdomain. Run it with `N8N_PATH=/`.
+- **SSO in front of that hostname.** oauth2-proxy routes by path on one hostname, so a second hostname needs its own oauth2-proxy instance (its own cookie name, secret and domain; its `https://<host>/oauth2/callback` added to the Google OAuth client's redirect URIs) and a new Cloudflare tunnel public hostname pointing at it — add a rule, never edit the `chat` one. Neither exists in the repo today.
+- **Then set the URL n8n bakes into its pages**: `N8N_HOST`, `N8N_PROTOCOL`, `N8N_PATH` (keep the trailing slash), `N8N_EDITOR_BASE_URL` and `N8N_WEBHOOK_URL` (independent settings — set both) to the public URL, and `N8N_PROXY_HOPS` to the proxies in front (cloudflared + oauth2-proxy = 2); `make up n8n`.
+- In the same change: `ai/AI_INFRA.md` (diagram edge, Ports at a glance, the n8n bullet), `ai/cloudflared/CLOUDFLARED.md`'s ingress table, and the n8n entries of the root and `ai/oauth2-proxy` / `ai/cloudflared` CLAUDE.md files.
 
-Access gate reuses the existing `zeoai.access@zeoenergy.com` Google-group check on oauth2-proxy — anyone who can reach Open WebUI can reach n8n; the shared session cookie means one Google sign-in covers both.
-
-**No Cloudflare dashboard change is needed.** The tunnel already terminates at `oauth2-proxy:4180`, and `chat.zeoenergy.com/n8n/*` is just another path on the same hostname.
+`.env.example`'s URL values (`https://n8n.zeoenergy.com/`) are placeholders for that hostname; nothing serves them today.
 
 ## First-run checklist
 
@@ -50,19 +45,13 @@ Access gate reuses the existing `zeoai.access@zeoenergy.com` Google-group check 
 3. **Bring up the stack** (from the repo root):
 
    ```bash
-   docker compose -f ai/n8n/docker-compose.n8n.yml up -d
+   make up n8n          # recreate-class: two copies would fire every schedule twice
    docker logs -f n8n
    ```
 
-   Wait for `Editor is now accessible via: https://chat.zeoenergy.com/n8n/`.
+   The `Editor is now accessible via: …` log line prints `N8N_EDITOR_BASE_URL` — nothing routes to it yet (§ Access).
 
-4. **Reload oauth2-proxy** so it picks up the new `OAUTH2_PROXY_UPSTREAMS` entry:
-
-   ```bash
-   docker compose -f ai/oauth2-proxy/docker-compose.oauth2-proxy.yml up -d --force-recreate
-   ```
-
-5. **Sign in.** Open <https://chat.zeoenergy.com/n8n/> in a browser. oauth2-proxy takes you through Google SSO if you don't already have a session cookie; then n8n's own owner-setup page asks you to create a local owner account. That account is the first admin inside n8n.
+4. **Owner account.** n8n's owner-setup page asks for a local owner account on the first browser visit to the editor, which needs n8n exposed first (§ Exposing it later). That account is the first admin inside n8n.
 
 ## AI-node wiring
 
@@ -94,16 +83,11 @@ Tables of interest: `workflow_entity` (workflow definitions), `credentials_entit
 | Symptom | Cause / fix |
 |---|---|
 | `Editor is now accessible via: http://localhost:5678` in the logs | `N8N_HOST` / `N8N_PROTOCOL` / `N8N_PATH` didn't propagate. Check `.env` and recreate the container. |
-| Login loop at `/n8n/` | oauth2-proxy wasn't restarted after adding `http://n8n:5678/n8n/` to `OAUTH2_PROXY_UPSTREAMS`. |
-| Editor loads but assets 404 | `N8N_PATH` missing its trailing slash. It must be `/n8n/`, not `/n8n`. |
-| Webhook URLs come out as `chat.zeoenergy.com/webhook/...` (no `/n8n/`) | `WEBHOOK_URL` wasn't set to the subpath variant. Editor URL and webhook URL are independent env vars in n8n. |
+| Editor loads but assets 404 | `N8N_PATH` missing its trailing slash (`/`, never a bare `/x`) — or a subpath at all, which is broken upstream (§ Exposing it later). |
+| Webhook URLs point at the wrong host | `N8N_WEBHOOK_URL` isn't the public URL. Editor URL and webhook URL are independent env vars in n8n. |
 | Credentials all show as `unset` after a restart | `N8N_ENCRYPTION_KEY` changed between runs. Restore the original key from your secret store, or accept the loss and re-enter credentials. |
 | Container refuses to start with `variable N8N_ENCRYPTION_KEY must be set` | The compose file uses `${N8N_ENCRYPTION_KEY:?...}` so it fails fast when unset — generate one with `openssl rand -hex 32` and paste it into `.env`. |
 
 ## Rollback
 
-The wiring is fully additive. To back out:
-
-1. Remove `,http://n8n:5678/n8n/` from `OAUTH2_PROXY_UPSTREAMS` in `.env`.
-2. Recreate oauth2-proxy: `docker compose -f ai/oauth2-proxy/docker-compose.oauth2-proxy.yml up -d --force-recreate`.
-3. Tear down n8n: `docker compose -f ai/n8n/docker-compose.n8n.yml down -v` (the `-v` drops the `n8n_data` + `n8n_db` volumes; omit if you want to keep workflow state around for a possible re-enable).
+Nothing else depends on n8n, so removing it is one command: `docker compose -f ai/n8n/docker-compose.n8n.yml down -v` (the `-v` drops the `n8n_data` + `n8n_db` volumes; omit it to keep workflow state for a possible re-enable).

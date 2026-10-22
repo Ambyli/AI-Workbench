@@ -116,7 +116,7 @@ If any of the "must fail" checks succeeds, revert the change and investigate bef
 - **`sandbox-runner`** — FastAPI + MCP + `docker.from_env()`. On `ai_shared`, `sandbox_net`, and `sandbox_state`. Spawns and reaps `sandbox-{id}` containers. Writes job state to `sandbox-db`. See [`ai/sandbox/runner/app.py`](runner/app.py).
 - **`sandbox-proxy`** — Caddy. Routes `/{sandbox_id}/*` → `sandbox-{id}:80`. Strips `X-Frame-Options` and rewrites CSP so Open WebUI can iframe the result. See [`ai/sandbox/proxies/Caddyfile`](proxies/Caddyfile).
 - **`sandbox-egress`** — tinyproxy, dual-homed on `sandbox_net` (inbound from sandboxes) and `sandbox_egress_out` (outbound to the internet). Allowlist enforced by [`tinyproxy.filter`](proxies/tinyproxy.filter) with `FilterDefaultDeny Yes`. Built from [`Dockerfile.sandbox-egress`](proxies/egress.Dockerfile) (alpine + `apk add tinyproxy`) rather than a pulled image, so we own the entrypoint + permission model.
-- **`sandbox-db`** — Postgres 16-alpine. Backing store for `common.jobs.PostgresRegistry`. See [`shared/common/src/common/jobs/postgres.py`](../shared/common/src/common/jobs/postgres.py).
+- **`sandbox-db`** — Postgres 16-alpine. Backing store for `common.jobs.PostgresRegistry`. See [`shared/common/src/common/jobs/postgres.py`](../../shared/common/src/common/jobs/postgres.py). Postgres rather than SQLite on purpose: concurrent writers (runner requests and the reaper), JSONB `metadata` operators can query with `psql`, and a database on its own `sandbox_state` network, so a container escape in a sandbox cannot tamper with job records. `PostgresRegistry` is the reusable backend any future service wanting Postgres-backed jobs can adopt.
 
 ### Runner file layout
 
@@ -130,11 +130,14 @@ The runner is split across:
 - [`tool_server.py`](runner/tool_server.py) — OpenWebUI Tool Server sub-app, mounted at `/tool`.
 - [`sandbox_mcp.py`](runner/sandbox_mcp.py) — FastMCP tool surface, mounted at `/mcp`.
 - [`spawner.py`](runner/spawner.py) — Docker interactions (spawn / spawn_empty / write_files / put_files / exec_command / read_files / read_file_bytes / read_existing_files / probe_health).
-- [`textops.py`](runner/textops.py) — pure text rules behind `read_file` / `edit_file` / the `write_files` rewrite guard / exec and get_files truncation (numbering, exact-string edit with closest-region diagnostics, `difflib` similarity, UTF-8 boundaries). Stdlib only; leaf module. **Listed in the runner `Dockerfile`'s `COPY` like every other module.**
 - [`reaper.py`](runner/reaper.py) — TTL and idle-TTL sweeper.
 - [`runtimes.py`](runner/runtimes.py) — runtime registry (`static`, `python`, `node`).
 
-Import graph is strictly one direction: `app.py` → `operations.py` → `models.py` / `spawner.py` / `runtimes.py` / `state.py` / `textops.py` → `constants.py` (`textops.py` imports nothing from the runner). `tool_server.py` also imports `operations.py` and `models.py`. `reaper.py` imports `constants.py` and `spawner.py`. Nothing imports back into `app.py`.
+The pure text rules behind `read_file` / `edit_file` / exec and get_files truncation (numbering, exact-string edit with closest-region diagnostics, UTF-8 boundaries, the `rewrite_guard` similarity check) are not a runner module: they live in the shared [`common.textops`](../../shared/common/src/common/textops/) (stdlib only, tested in `shared/common/tests/test_textops.py`), imported by `operations.py` and `spawner.py`. The rewrite-guard **policy** (thresholds, messages) and the tool wiring stay in the runner (`operations.py`, tested in `unit-tests/sandbox/`).
+
+**Every runner module is listed in the `COPY` of [`runner/Dockerfile`](runner/Dockerfile).** A new `ai/sandbox/runner/*.py` that is not added there is missing from the image and the runner dies at boot with `ModuleNotFoundError`.
+
+Import graph is strictly one direction: `app.py` → `operations.py` → `models.py` / `spawner.py` / `runtimes.py` / `state.py` → `constants.py`, with `common.textops` used by `operations.py` and `spawner.py`. `tool_server.py` also imports `operations.py` and `models.py`. `reaper.py` imports `constants.py` and `spawner.py`. Nothing imports back into `app.py`.
 
 ### Browser console capture
 
@@ -191,6 +194,8 @@ Set by appending `?_debug=1` to the preview URL. Kept off by default because cha
 ## Runtimes
 
 Add a new one by adding a Dockerfile + one entry in [`ai/sandbox/runner/runtimes.py`](runner/runtimes.py).
+
+**Every runtime's app binds port 80.** That is what lets `sandbox-proxy` (Caddy) route `/{sandbox_id}/*` → `sandbox-{id}:80` statically, with no per-sandbox config. A runtime that listens on anything else would need dynamic route management through Caddy's admin API — don't add one unless you have to.
 
 | Runtime | Base image | Pre-baked packages | Default entrypoint |
 |---|---|---|---|
@@ -447,11 +452,13 @@ Then open the returned URL in a browser (from the host — reach `sandbox-proxy`
 
 ### Adding an egress destination
 
-Edit [`ai/sandbox/proxies/tinyproxy.filter`](proxies/tinyproxy.filter) — one anchored regex per line. Anchor with `^…$` so a typosquat like `pypi.org.attacker.com` is not accepted. Restart `sandbox-egress`:
+Edit [`ai/sandbox/proxies/tinyproxy.filter`](proxies/tinyproxy.filter) — one anchored regex per line. Anchor with `^…$` so a typosquat like `pypi.org.attacker.com` is not accepted. Then deploy `sandbox-egress`. It is swap-class and its deploy hash covers `tinyproxy.conf` and `tinyproxy.filter`, so this swaps it with no downtime:
 
 ```bash
-docker compose -f ai/sandbox/docker-compose.sandbox.yml restart sandbox-egress
+make up sandbox sandbox-egress
 ```
+
+(`docker compose -f ai/sandbox/docker-compose.sandbox.yml restart sandbox-egress` also picks up the bind-mounted filter, with a moment of downtime.) The filter file is the source of truth; `SANDBOX_EGRESS_ALLOWLIST` is only an additive per-deployment tweak.
 
 Never add `.*` — that defeats the entire egress model. Add the specific domain the sandbox needs.
 
@@ -580,7 +587,7 @@ write_files(session_id, files, overwrite?)            → NEW files / full rewri
 
 **`read_file`** (`GET /session/{id}/file`) returns `cat -n`-style text — line number, TAB, line — for `offset` (1-based, default 1) and `limit` (default 400, max 2000) lines, plus a header `path (lines a-b of N)` and, when cut, `… N more lines; call read_file with offset=b+1`. Lines over 2000 characters are cut with a marker; only the first 256 KiB of a file is read (past that, use `exec` + `sed -n`). A binary or non-UTF-8 file is refused with a pointer to `get_files`, which keeps its base64 path. The numbered text is in the tool's text only — `structured_content` carries `path`, `start_line`, `end_line`, `total_lines`, `truncated`. Constants: `READ_FILE_*` in [`constants.py`](runner/constants.py).
 
-**`edit_file`** (`POST /session/{id}/edit`) is **the preferred way to change a file**: `old_string` → `new_string` in one existing file, `old_string` copied from `read_file` output without the line-number prefix. The rules (all in [`textops.py`](runner/textops.py), pure and unit-tested):
+**`edit_file`** (`POST /session/{id}/edit`) is **the preferred way to change a file**: `old_string` → `new_string` in one existing file, `old_string` copied from `read_file` output without the line-number prefix. The rules (all in the shared [`common.textops`](../../shared/common/src/common/textops/), pure and unit-tested in `shared/common/tests/test_textops.py`; any guidance string that tells a model which tool to use must teach this read → edit → write-new-files flow):
 
 - the file must exist and be UTF-8 (`missing_file` → create it with `write_files`; `binary_file`);
 - `old_string` non-empty (`empty_old_string`) and different from `new_string` (`no_change`);
@@ -638,4 +645,19 @@ Enforcement lives in `_validate_files_map` at pydantic validation, so a rejected
 
 ## Configuration
 
-See the `SANDBOX_*` block in [`.env.example`](../.env.example) and the config table in [`CLAUDE.md`](../CLAUDE.md#configuration).
+Set in `.env`; documented in the `SANDBOX_*` block of [`.env.example`](../../.env.example). Every runner knob is read once in [`runner/constants.py`](runner/constants.py).
+
+| Variable | Default | Notes |
+|---|---|---|
+| `SANDBOX_MAX_CONCURRENT` | `8` | Max simultaneous running sandboxes; `sandbox-runner` returns `429` past it (`slot_sem`). Each slot ≈ 512 MB RAM + 1 CPU + the base image's disk footprint. |
+| `SANDBOX_DEFAULT_TTL_SECONDS` | `900` | Default idle TTL, stored on each job. A model can request a shorter one per `create` / `run`, never one longer than `SANDBOX_HARD_TTL_SECONDS`. |
+| `SANDBOX_IDLE_TTL_SECONDS` | _(empty — inherits `SANDBOX_DEFAULT_TTL_SECONDS`)_ | The reaper tears down a running sandbox whose `metadata->>'last_used_at'` is older than this; `last_used_at` is bumped on every session-reuse call (`write_files`, `read_file`, `edit_file`, `exec`, `preview`). A distinct knob only when idle behaviour should differ from the per-session default. |
+| `SANDBOX_HARD_TTL_SECONDS` | `3600` | Absolute cap on a sandbox's lifetime. The reaper ([`runner/reaper.py`](runner/reaper.py)) sweeps expired containers every 60 s. |
+| `SANDBOX_EGRESS_ALLOWLIST` | _(empty)_ | Comma-separated hostnames, additive to [`proxies/tinyproxy.filter`](proxies/tinyproxy.filter). Prefer editing the filter file (the source of truth, see [Adding an egress destination](#adding-an-egress-destination)); use this only for per-deployment tweaks. |
+| `SANDBOX_MAX_FILE_BYTES` | `1000000` | Per-file byte cap on the `files` map (`POST /run`, `/session/{id}/files`, the `run` / `write_files` MCP tools) and on `edit_file`'s `old_string` / `new_string` / edited file. Base64 values count their DECODED length. The MCP adapters validate through the same pydantic models as HTTP (`operations._validate_tool_args`). Rejected as a `422` on HTTP, `failed: payload too large` (413) on MCP, naming the largest oversized path. See [Payload limits](#payload-limits). |
+| `SANDBOX_MAX_PAYLOAD_BYTES` | `10000000` | Total byte cap on the `files` map of one request, enforced at pydantic validation before the tarball is built, so a hostile payload never reaches the spawner. Shrink files, drop non-essential assets, or split across several `write_files` calls. |
+| `SANDBOX_DB_USER` / `_PASSWORD` / `_NAME` | `sandbox` / `sandbox` / `sandbox` | Credentials of the compose-managed `sandbox-db` behind `common.jobs.PostgresRegistry`. Dev defaults baked into compose (same convention as `ROOFIX_DB_*`): override before exposing anything past `sandbox_state`. Rotation: [Rotating the sandbox-db password](#rotating-the-sandbox-db-password). |
+| `PORT_SANDBOX_RUNNER` | `8012` | Host port of `sandbox-runner` (FastAPI + MCP). **Published by `ai/edge`** (`listen sandbox-runner`): the runner is recreate-class, and the edge answers `503` + `Retry-After` while it restarts. |
+| `PORT_SANDBOX_PROXY` | `8011` | Host port of `sandbox-proxy` (Caddy serving `/{sandbox_id}/*`). **Published by `ai/edge`** (`listen sandbox-proxy`), because `sandbox-proxy` is swap-class and has no `ports:` of its own. |
+| `PORT_SANDBOX_DB` | `5440` | Host port of `sandbox-db`, for operator inspection and Trino's `postgres_sandbox` catalog (`host.docker.internal:5440`). Published by `sandbox-db` itself, through the publish-only `sandbox_db_publish` network (see [Security model](#security-model-read-this-first)). In the Postgres group of the `PORT REGISTRY` block of `.env`. |
+| `SANDBOX_PROXY_URL` | `https://chat.zeoenergy.com/sandboxes` (`.env.example`, this deployment); compose fallback `http://sandbox-proxy` | Public URL prefix the runner returns as the iframe `src` (`POST /run`, `POST /tool/run`, the `run` / `preview` MCP tools). Here sandbox traffic shares Open WebUI's origin: `OAUTH2_PROXY_UPSTREAMS` carries `http://sandbox-proxy:80/sandboxes/`, so the session cookie authenticates `chat.zeoenergy.com/sandboxes/{id}/*`. Change it together with that upstream — see [Public iframe routing](#public-iframe-routing). |

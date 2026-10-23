@@ -14,7 +14,10 @@ that agrees with the score.
                      ``ValueError`` when there is none, which ``call_model``
                      treats as a parse failure and retries.
     clamp_answer() — clamp score and confidence, recompute the verdict FROM
-                     the clamped score, keep the reason as a string.
+                     the clamped score, keep the reason as a string, say
+                     whether the confidence was defaulted
+                     (``stated_defaulted``), and carry the client's measured
+                     confidence keys through (``llm.confidence``).
     description_validator() — a reference description call's answer: one
                      non-empty ``description`` string, whitespace collapsed,
                      cut to the length cap.
@@ -65,31 +68,47 @@ def find_answer(raw: Any, name: str) -> dict:
     raise ValueError(f"no 'score' for {name!r} in the answer: {str(raw)[:200]}")
 
 
+# The private keys llm.client attaches to a scoring answer (the measured
+# confidence — llm.confidence.PRIVATE_KEYS); carried through clamping so a
+# validator that rebuilds the answer does not drop them.
+_PASS_THROUGH = ("_score_dist", "_samples", "_confidence_note")
+
+
 def clamp_answer(entry: dict) -> dict:
     """Clamp one answer to valid ranges and derive the verdict from the score.
 
     A missing or non-numeric score becomes 5 and a missing confidence 50 —
-    logged, because either means the model half-answered.
+    logged, because either means the model half-answered. ``stated_defaulted``
+    says the confidence was made up here (missing or unreadable), so a
+    consumer of ``detail.confidence`` can tell a model's 50 from ours.
     """
     try:
         score = max(1, min(10, int(round(float(entry.get("score", 5))))))
     except (TypeError, ValueError):
         logger.warning("clamp_answer: invalid score %r, defaulting to 5", entry.get("score"))
         score = 5
+    stated_defaulted = False
+    raw_confidence = entry.get("confidence")
     try:
-        confidence = max(0, min(100, int(round(float(entry.get("confidence", 50))))))
-    except (TypeError, ValueError):
-        logger.warning(
-            "clamp_answer: invalid confidence %r, defaulting to 50", entry.get("confidence")
-        )
+        if raw_confidence is None or isinstance(raw_confidence, bool):
+            raise TypeError("missing")
+        confidence = max(0, min(100, int(round(float(raw_confidence)))))
+    except (TypeError, ValueError, OverflowError):
+        logger.warning("clamp_answer: invalid confidence %r, defaulting to 50", raw_confidence)
         confidence = 50
+        stated_defaulted = True
     reason = entry.get("reason")
-    return {
+    out = {
         "score": score,
         "verdict": _verdict_from_score(score),
         "confidence": confidence,
         "reason": str(reason) if reason is not None else "",
+        "stated_defaulted": stated_defaulted,
     }
+    for key in _PASS_THROUGH:
+        if key in entry:
+            out[key] = entry[key]
+    return out
 
 
 def answer_validator(name: str):

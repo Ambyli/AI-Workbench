@@ -79,6 +79,7 @@ from api.schemas import CriterionInput
 # every caller uses; the registry is looked up at call time (tests swap it).
 from llm import boxes as llm_boxes
 from llm import client as llm_client
+from llm import confidence as llm_confidence
 from llm import models as llm_models
 from llm.models import ModelSpec
 from llm.prompts import ReferenceExample, build_llm_prompt
@@ -128,12 +129,26 @@ LLM_RESULT = ResultSpec(
         "text_sent": FieldSpec(
             "The text attached: `{chars, truncated, budget, source}`", "object",
         ),
+        "confidence": FieldSpec(
+            "How sure the model was, measured per models.yaml `confidence.method` "
+            "(llm.confidence): `{method, source: logprobs | sampling | stated, headline: "
+            "stated | calibrated, stated, stated_defaulted, calibrated, "
+            "verdict_probability, band: {PASS, MARGINAL, FAIL}, distribution: "
+            "{\"1\"..\"10\"}, expected_score, entropy_bits, certainty, coverage, "
+            "unresolved: [{values, mass}], samples: null | {asked, answered, agreement, "
+            "stated_mean}, note}` — the distribution keys are null when source is "
+            "`stated`; the whole block is null for a `score: false` criterion",
+            "object",
+        ),
         "reference": REFERENCE_FIELD,
         "aggregate": AGGREGATE_FIELD,
     },
     notes=(
         "The model's answer is the top-level score / verdict / confidence / reason; "
         "detail records what it was shown.",
+        "The top-level confidence is detail.confidence.stated unless the model's "
+        "models.yaml entry says `headline: calibrated` and this answer has the "
+        "calibration's signal (then detail.confidence.calibrated).",
         "Box-loop results are in `localization`, not `detail`.",
         "A cv criterion answered by the llm fallback has this shape, `reference` included.",
     ),
@@ -207,11 +222,16 @@ async def evaluate_with(
     # fallback) the cap makes this a label update only.
     progress.checkpoint(f"{name}: scored", logger=logger)
 
+    # What the model's own sampling says about this answer (models.yaml
+    # `confidence`), and which number is the headline: the stated one, until
+    # the entry is flipped to `headline: calibrated` with a fitted curve.
+    confidence_block, headline = llm_confidence.assess(answer, spec.confidence)
+
     outcome = Outcome(
         method="llm",
         score=answer["score"],
         verdict=answer["verdict"],
-        confidence=answer["confidence"],
+        confidence=headline,
         reason=answer["reason"],
         # The model's headline number is its score; the scheduler clears
         # `value` for a `score: false` criterion (result_specs.clear_judgement).
@@ -226,6 +246,7 @@ async def evaluate_with(
                     "budget": spec.text_char_budget,
                     "source": layer.source,
                 },
+                "confidence": confidence_block,
                 **({"reference": reference_detail} if reference_detail is not None else {}),
             },
             "llm", answer["score"],
@@ -322,6 +343,12 @@ async def _guided(
 
     rule = guide.options.get("combine", "any")
     answer, chosen = combine(survivors, rule)
+    if rule == "mean":
+        # `combine` averages the scores (analysis.references); the measured
+        # confidence of that averaged answer is the MIXTURE of the calls'
+        # distributions (any / all keep the chosen call's answer whole, its
+        # measurement with it).
+        answer = llm_confidence.combined_answer(answer, [r for _, r in survivors])
     candidate = 1 if image_b64 else 0
     call_of = {i: k for k, call in enumerate(calls) for i in call}
     call_rows = []
@@ -333,6 +360,10 @@ async def _guided(
             "score": None if failed else result["score"],
             "verdict": None if failed else result["verdict"],
             "confidence": None if failed else result["confidence"],
+            "verdict_probability": (
+                None if failed
+                else llm_confidence.assess(result, spec.confidence)[0]["verdict_probability"]
+            ),
             "reason": None if failed else result["reason"],
             "chosen": (k == chosen) if rule != "mean" else not failed,
             "error": str(result) if failed else None,

@@ -33,6 +33,19 @@ container: the entry loads with ``available: false`` and a reason, and a
 request that selects it is refused at submit. Only an unavailable DEFAULT is
 fatal, because every request without a ``model`` would fail.
 
+**Confidence is configuration too.** Each entry's ``confidence:`` block
+(``ConfidenceConfig``) says how a scoring call's confidence is MEASURED —
+``logprobs`` (the score token's distribution), ``sampling`` (n answers) or
+``stated`` (the model's own number; the default, safe on any provider) — and
+whether the headline ``confidence`` is that stated number or a fitted
+calibration. No code branches on a model's name: every provider difference
+(the request keys, where the response keeps the entries, how its tokenizer
+writes numbers, how many samples) is a knob with a default. Load refuses a
+``headline: calibrated`` without points, a calibration ``signal`` the method
+cannot produce, a reserved body key in ``logprobs.request`` /
+``sampling.extra_body``, and ``sampling`` via ``n_param`` with ``n`` above
+``max_concurrent`` (one such call holds n slots). See ``llm.confidence``.
+
 **Replaced settings.** The registry replaced ``VISION_LLM_API``,
 ``VISION_LLM_MODEL``, ``VISION_LLM_REASONING_STRENGTH`` /
 ``CLASSIFIER_REASONING_STRENGTH``, ``VISION_LLM_MAX_TOKENS``,
@@ -155,6 +168,156 @@ class MaxTokens(_Strict):
     describe: int = Field(ge=16)
 
 
+# ── confidence: how an entry's confidence signal is measured ─────────────
+#
+# Per-model CONFIGURATION, never per-model code: token probabilities are not
+# universal (Claude and OpenAI reasoning models have none; some providers
+# ignore the parameter, cap it, or 400 on it), so each entry declares how its
+# signal is acquired and every knob has a default. An entry without the block
+# is `method: stated` — nothing extra is requested, which is safe on any
+# provider. What each method produces is `llm.confidence`'s job; the request
+# body changes (score calls only) are `ModelSpec.body`'s.
+
+CONFIDENCE_METHODS: tuple[str, ...] = ("logprobs", "sampling", "stated")
+
+# The calibration signals each method produces — a calibration's `signal`
+# must be one its entry's method can feed (llm.confidence computes them):
+#   stated               the model's own 0-100 number / 100
+#   verdict_probability  the probability mass on the reported verdict's band
+#   certainty            1 - entropy / log2(10) of the score distribution
+#   agreement            the share of samples with the majority verdict
+SIGNALS_BY_METHOD: dict[str, tuple[str, ...]] = {
+    "stated": ("stated",),
+    "logprobs": ("stated", "verdict_probability", "certainty"),
+    "sampling": ("stated", "verdict_probability", "certainty", "agreement"),
+}
+
+# Body keys a confidence block may not set on top of the reserved ones: the
+# merged chat_template_kwargs (reasoning lives there), streaming (the client
+# reads one JSON body), and `n` (only sampling sets it, from `sampling.n`).
+_CONFIDENCE_RESERVED = _RESERVED_BODY_KEYS | {"chat_template_kwargs", "stream", "n"}
+
+
+def _refuse_reserved(where: str, body: dict[str, Any]) -> None:
+    reserved = sorted(_CONFIDENCE_RESERVED & set(body))
+    if reserved:
+        raise ValueError(
+            f"{where} may not set {reserved} — the prompt builders own model / messages / "
+            "the token field / response_format / chat_template_kwargs, the client reads "
+            "one non-streamed body, and `n` comes from confidence.sampling.n"
+        )
+
+
+class LogprobsConfig(_Strict):
+    """``confidence.logprobs`` — reading the score's token distribution."""
+
+    request: dict[str, Any] = Field(
+        default_factory=lambda: {"logprobs": True, "top_logprobs": 20},
+        description="Merged into the SCORE request body only — whatever this provider's API wants.",
+    )
+    entries_path: str = Field(
+        default="choices.0.logprobs.content", min_length=1,
+        description="Dotted path to the [{token, logprob, <top_key>}] list in the response.",
+    )
+    top_key: str = Field(default="top_logprobs", min_length=1)
+    number_tokens: Literal["auto", "single", "digits"] = "auto"
+    min_coverage: float = Field(default=0.5, ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def _body(self) -> "LogprobsConfig":
+        _refuse_reserved("confidence.logprobs.request", self.request)
+        return self
+
+
+class SamplingConfig(_Strict):
+    """``confidence.sampling`` — the empirical distribution of n answers."""
+
+    n: int = Field(default=5, ge=2, le=32)
+    via: Literal["n_param", "repeat"] = "n_param"
+    extra_body: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _body(self) -> "SamplingConfig":
+        _refuse_reserved("confidence.sampling.extra_body", self.extra_body)
+        return self
+
+
+class CalibrationConfig(_Strict):
+    """``confidence.calibration`` — a fitted curve from one signal to a 0-100
+    "right this often" number (``bin/confidence_calibration.py`` prints it)."""
+
+    signal: Literal["stated", "verdict_probability", "certainty", "agreement"]
+    points: list[tuple[float, float]] = Field(min_length=1)
+    n: Optional[int] = Field(default=None, ge=0)
+    fitted_on: Optional[str] = None
+    ground_truth: Optional[str] = None
+
+    @field_validator("points")
+    @classmethod
+    def _monotone(cls, points: list[tuple[float, float]]) -> list[tuple[float, float]]:
+        for x, y in points:
+            if not (0.0 <= x <= 1.0) or not (0.0 <= y <= 100.0):
+                raise ValueError(
+                    f"calibration points are [x, y] with x in [0, 1] and y in [0, 100]; "
+                    f"got [{x}, {y}]"
+                )
+        for (x0, y0), (x1, y1) in zip(points, points[1:]):
+            if x1 < x0 or y1 < y0:
+                raise ValueError(
+                    "calibration points must be non-decreasing in both x and y "
+                    f"(isotonic); [{x0}, {y0}] is followed by [{x1}, {y1}]"
+                )
+        return points
+
+
+class ConfidenceConfig(_Strict):
+    """An entry's ``confidence:`` block. Every knob has a default; no block at
+    all is ``method: stated``."""
+
+    method: Literal["logprobs", "sampling", "stated"] = "stated"
+    logprobs: LogprobsConfig = Field(default_factory=LogprobsConfig)
+    sampling: SamplingConfig = Field(default_factory=SamplingConfig)
+    fallback: Literal["stated"] = "stated"
+    headline: Literal["stated", "calibrated"] = "stated"
+    calibration: Optional[CalibrationConfig] = None
+
+    @model_validator(mode="after")
+    def _consistent(self) -> "ConfidenceConfig":
+        if self.headline == "calibrated" and self.calibration is None:
+            raise ValueError(
+                "confidence.headline: calibrated needs confidence.calibration (signal + "
+                "points) — fit one with bin/confidence_calibration.py; until then keep "
+                "headline: stated"
+            )
+        if self.calibration is not None:
+            produced = SIGNALS_BY_METHOD[self.method]
+            if self.calibration.signal not in produced:
+                raise ValueError(
+                    f"confidence.calibration.signal {self.calibration.signal!r} is not one "
+                    f"method {self.method!r} produces ({list(produced)})"
+                )
+        return self
+
+    def score_body(self) -> dict[str, Any]:
+        """What a SCORE request adds for this method (the other kinds add nothing)."""
+        if self.method == "logprobs":
+            return dict(self.logprobs.request)
+        if self.method == "sampling":
+            out = dict(self.sampling.extra_body)
+            if self.sampling.via == "n_param":
+                out["n"] = int(self.sampling.n)
+            return out
+        return {}
+
+    @property
+    def slots(self) -> int:
+        """Slots of the model's limit ONE score request holds: n for
+        ``sampling`` via ``n_param`` (n sequences on the server), else 1."""
+        if self.method == "sampling" and self.sampling.via == "n_param":
+            return int(self.sampling.n)
+        return 1
+
+
 class ModelEntry(_Strict):
     """One ``models:`` entry, as written in the file."""
 
@@ -173,6 +336,7 @@ class ModelEntry(_Strict):
     timeout_s: float = Field(gt=0)
     max_concurrent: int = Field(ge=1)
     text_char_budget: int = Field(ge=0)
+    confidence: ConfidenceConfig = Field(default_factory=ConfidenceConfig)
 
     @field_validator("url")
     @classmethod
@@ -223,6 +387,13 @@ class ModelEntry(_Strict):
                     f"reasoning style system_line together with chat_template_kwargs {clash}: "
                     "a model gets its reasoning depth one way, not both"
                 )
+        if self.confidence.slots > self.max_concurrent:
+            raise ValueError(
+                f"confidence.sampling.n {self.confidence.slots} via n_param holds "
+                f"{self.confidence.slots} slots of max_concurrent {self.max_concurrent} per "
+                "score call (n sequences on the server) — raise max_concurrent, lower n, "
+                "or use via: repeat"
+            )
         return self
 
 
@@ -283,6 +454,10 @@ class ModelSpec:
     api_key_header: str = "Authorization"
     available: bool = True
     unavailable_reason: Optional[str] = None
+    # The parsed `confidence:` block (defaults = method stated). Read by
+    # body() for score calls, by llm.client (what to extract) and by
+    # llm.confidence (the signals, the headline).
+    confidence: ConfidenceConfig = field(default_factory=ConfidenceConfig)
     _headers: dict[str, str] = field(default_factory=dict, repr=False)
     limit: ConcurrencyLimit = field(init=False, repr=False)
 
@@ -312,6 +487,12 @@ class ModelSpec:
         the extras — the order the builders always produced, so a request is
         recognisable in a log. ``chat_template_kwargs`` is the extras' own
         merged with the reasoning variable (a clash was refused at load).
+
+        A ``score`` call also carries what the entry's ``confidence.method``
+        asks for (``ConfidenceConfig.score_body``: the logprobs request, or
+        ``n`` plus the sampling extras), after ``extra_body`` so a sampling
+        override wins for the score call alone. Box, select and describe
+        bodies never change.
         """
         out: dict[str, Any] = {
             "model": self.served_name,
@@ -322,6 +503,8 @@ class ModelSpec:
             out["response_format"] = {"type": "json_object"}
         extra = {k: v for k, v in self.extra_body.items() if k != "chat_template_kwargs"}
         out.update(extra)
+        if kind == "score":
+            out.update(self.confidence.score_body())
         kwargs = dict(self.extra_body.get("chat_template_kwargs") or {})
         if self.reasoning.get("style") == "chat_template_kwargs":
             kwargs[self.reasoning["key"]] = self.reasoning["value"]
@@ -367,6 +550,13 @@ class ModelSpec:
             "timeout_s": self.timeout_s,
             "max_concurrent": self.max_concurrent,
             "in_flight": self.limit.in_flight,
+            # How detail.confidence is measured and whether the headline is
+            # calibrated — not the points, not the request body.
+            "confidence": {
+                "method": self.confidence.method,
+                "headline": self.confidence.headline,
+                "calibrated": self.confidence.calibration is not None,
+            },
         }
 
 
@@ -507,6 +697,7 @@ def _build(model_id: str, entry: ModelEntry, env: Mapping[str, str]) -> ModelSpe
         api_key_header=entry.api_key_header,
         available=available,
         unavailable_reason=reason,
+        confidence=entry.confidence,
         _headers=headers,
     )
 
@@ -586,10 +777,12 @@ def startup_check() -> Registry:
         )
     for spec in registry.models.values():
         logger.info(
-            "models: %s%s → %s (%s) vision=%s images=%d concurrent=%d timeout=%gs%s",
+            "models: %s%s → %s (%s) vision=%s images=%d concurrent=%d timeout=%gs "
+            "confidence=%s/%s%s",
             spec.id, " [default]" if spec.id == registry.default_id else "",
             urlsplit(spec.url).hostname, spec.served_name, spec.vision,
             spec.max_images_per_prompt, spec.max_concurrent, spec.timeout_s,
+            spec.confidence.method, spec.confidence.headline,
             "" if spec.available else f" UNAVAILABLE: {spec.unavailable_reason}",
         )
     return registry

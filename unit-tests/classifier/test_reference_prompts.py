@@ -73,13 +73,26 @@ def _hash(prompt: dict) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+def _without_confidence(prompt: dict) -> dict:
+    """The prompt minus the keys the default model's ``confidence`` block adds
+    to every SCORE body (models.yaml muse-glimmer: ``logprobs: true,
+    top_logprobs: 20``), after checking they are exactly those. The hashes
+    above predate the measured confidence and still pin everything else:
+    the messages did not change, only the request asks for logprobs."""
+    from llm.models import get_registry
+
+    added = get_registry().default.confidence.score_body()
+    assert {k: prompt[k] for k in added} == added
+    return {k: v for k, v in prompt.items() if k not in added}
+
+
 @pytest.mark.parametrize("call, digest", GOLDEN)
 @pytest.mark.parametrize("references", ["omitted", None, []])
 def test_no_references_is_byte_identical_to_before(call, digest, references):
     args, kwargs = call
     if references != "omitted":
         kwargs = {**kwargs, "references": references}
-    assert _hash(build_llm_prompt(*args, **kwargs)) == digest
+    assert _hash(_without_confidence(build_llm_prompt(*args, **kwargs))) == digest
 
 
 @pytest.mark.parametrize("call, legacy", list(zip([c for c, _ in GOLDEN], LEGACY)))
@@ -88,7 +101,7 @@ def test_the_only_change_is_the_reasoning_mechanism(call, legacy):
     change: no reasoning line in the system prompt, chat_template_kwargs in
     the body instead."""
     args, kwargs = call
-    prompt = build_llm_prompt(*args, **kwargs)
+    prompt = _without_confidence(build_llm_prompt(*args, **kwargs))
     assert "Reasoning strength" not in json.dumps(prompt)
     assert prompt.pop("chat_template_kwargs") == {"reasoning_strength": "low"}
     prompt["messages"][0]["content"] += "\nReasoning strength: low"

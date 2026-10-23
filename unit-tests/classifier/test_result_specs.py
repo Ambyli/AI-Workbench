@@ -14,7 +14,11 @@ criterion AND for each of its per-unit ``items`` entries:
     detector, a measurement for cv, the score for llm — null under
     ``score: false``);
   * an aggregate carries exactly the ``aggregate_detail`` block, and a
-    ``mean`` keeps only the type's stable keys.
+    ``mean`` keeps only the type's stable keys;
+  * the llm ``detail.confidence`` block (``llm.confidence.BLOCK_KEYS``) from
+    a logprob-carrying response and from the fallback, every key named in
+    its declaration, kept per member under ``mean``, and the guided calls'
+    ``verdict_probability``.
 
 The model and the detector are scripted; OCR is off (text comes from .txt
 documents), so the file runs in a few seconds.
@@ -352,6 +356,96 @@ def test_cv_llm_fallback_guided_has_the_llm_shape(model):
     assert entry["method"] == "llm"
     _check_criterion(entry)
     assert entry["detail"]["reference"]["applied"] is True
+
+
+# ---------------------------------------------------------------------------
+# detail.confidence — declared on LLM_RESULT, built by llm.confidence.assess
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def logprob_model(monkeypatch):
+    """The model answering with token logprobs, shaped like muse-glimmer's
+    (``10`` one token; the score's top list has numbers and junk)."""
+    import math
+
+    def e(token, top=None):
+        top = top or [(token, 1.0)]
+        return {"token": token, "logprob": math.log(dict(top).get(token, 1.0)),
+                "top_logprobs": [{"token": t, "logprob": math.log(p)} for t, p in top]}
+
+    async def send(prompt):
+        assert prompt.get("logprobs") is True  # the default entry measures logprobs
+        tokens = [e('{"'), e("score"), e('":'), e(" "),
+                  e("8", [("8", 0.7), ("7", 0.2), (" eight", 0.1)]), e(","),
+                  e(' "verdict":'), e(' "PASS",'), e(' "confidence":'), e(" 90,"),
+                  e(' "reason":'), e(' "ok"}')]
+        content = "".join(t["token"] for t in tokens)
+        return {"choices": [{"message": {"content": content},
+                             "logprobs": {"content": tokens}}]}
+
+    monkeypatch.setattr(llm_client, "_send", send)
+
+
+def _check_confidence(block, *, source):
+    from llm.confidence import BLOCK_KEYS, SAMPLES_KEYS
+
+    assert tuple(block) == BLOCK_KEYS
+    assert block["source"] == source and block["headline"] == "stated"
+    # The declaration names every key the producer writes.
+    declared = specs()["llm"].fields["confidence"].description
+    for key in BLOCK_KEYS + SAMPLES_KEYS:
+        assert key in declared, key
+    if source == "stated":
+        assert block["distribution"] is None and block["verdict_probability"] is None
+    else:
+        assert list(block["distribution"]) == [str(v) for v in range(1, 11)]
+        assert set(block["band"]) == {"PASS", "MARGINAL", "FAIL"}
+        assert 0.0 <= block["verdict_probability"] <= 1.0
+
+
+def test_llm_confidence_is_declared_and_not_stable():
+    field = specs()["llm"].fields["confidence"]
+    assert field.kind == "object" and not field.stable and field.when is None
+
+
+def test_llm_confidence_from_logprobs_matches_its_declaration(logprob_model):
+    entry = _entries(_run([_doc(_png(), "p.png")], [CriterionInput(name="has a meter")]))
+    entry = entry["has a meter"]
+    _check_criterion(entry)
+    block = entry["detail"]["confidence"]
+    _check_confidence(block, source="logprobs")
+    assert block["verdict_probability"] == pytest.approx(1.0)  # 8 and 7 are both PASS
+    assert block["coverage"] == pytest.approx(0.9)
+    assert entry["confidence"] == block["stated"] == 90
+
+
+def test_llm_confidence_fallback_matches_its_declaration(model):
+    # The plain scripted answer has no logprobs: the fallback, with a note.
+    entry = _entries(_run([_doc(_png(), "p.png")], [CriterionInput(name="has a meter")]))
+    block = entry["has a meter"]["detail"]["confidence"]
+    _check_confidence(block, source="stated")
+    assert block["method"] == "logprobs" and "no entries" in block["note"]
+
+
+def test_llm_confidence_is_dropped_by_mean_and_kept_in_items(logprob_model):
+    c = CriterionInput(name="has a meter", type="llm", options={"aggregate": "mean"})
+    entry = _entries(_run([_doc(_png(), "a.png"), _doc(_png(), "b.png")], [c]))["has a meter"]
+    _check_criterion(entry, aggregated=True)
+    assert "confidence" not in entry["detail"]
+    for unit in entry["items"]:
+        _check_confidence(unit["detail"]["confidence"], source="logprobs")
+
+
+def test_guided_calls_carry_verdict_probability(logprob_model):
+    c = CriterionInput(name="has a meter", type="llm", options={"hint": "presence"})
+    result = asyncio.run(analysis.analyze_document(
+        [_doc(_png(), "p.png")], [c], references_plan=_guided_plan("has a meter")))
+    entry = _entries(result)["has a meter"]
+    _check_criterion(entry)
+    (call,) = entry["detail"]["reference"]["calls"]
+    assert call["verdict_probability"] == pytest.approx(1.0)
+    _check_confidence(entry["detail"]["confidence"], source="logprobs")
 
 
 def test_reference_is_dropped_by_mean_and_kept_in_items(model):

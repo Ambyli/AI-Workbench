@@ -72,3 +72,57 @@ def test_release_on_exception():
 def test_limit_must_be_positive():
     with pytest.raises(ValueError):
         ConcurrencyLimit(0)
+
+
+def test_hold_takes_n_slots_and_counts_them():
+    limit = ConcurrencyLimit(4)
+
+    async def main():
+        async with limit.hold(3):
+            assert limit.in_flight == 3
+        async with limit.hold(1):
+            assert limit.in_flight == 1
+
+    asyncio.run(main())
+    assert limit.in_flight == 0 and limit.peak == 3
+    with pytest.raises(ValueError):
+        limit.hold(5)
+    with pytest.raises(ValueError):
+        limit.hold(0)
+
+
+def test_two_multi_slot_holders_never_deadlock():
+    """Taking slots one at a time, two hold(3)s on a limit of 4 could each sit
+    on two and wait forever; the gate makes them take turns."""
+    limit = ConcurrencyLimit(4)
+
+    async def heavy():
+        async with limit.hold(3):
+            await asyncio.sleep(0.01)
+
+    async def light():
+        async with limit:
+            await asyncio.sleep(0.005)
+
+    async def main():
+        await asyncio.gather(*(heavy() for _ in range(4)), *(light() for _ in range(6)))
+
+    asyncio.run(asyncio.wait_for(main(), timeout=5))
+    assert limit.in_flight == 0 and limit.peak <= 4
+
+
+def test_hold_releases_on_cancel():
+    limit = ConcurrencyLimit(2)
+
+    async def main():
+        async with limit:
+            waiter = asyncio.create_task(limit.hold(2).__aenter__())
+            await asyncio.sleep(0.01)  # it holds the gate and one slot, waiting for two
+            waiter.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiter
+        async with limit.hold(2):     # would hang if the cancelled one leaked a slot
+            pass
+
+    asyncio.run(asyncio.wait_for(main(), timeout=2))
+    assert limit.in_flight == 0

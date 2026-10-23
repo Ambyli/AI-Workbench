@@ -12,6 +12,12 @@ Pinned:
     key on plain http to a dotted host, a reasoning key set twice, a system
     reasoning line on Muse Glimmer, an unavailable DEFAULT; a non-default
     entry with its key variable unset loads as unavailable;
+  * the `confidence` block: absent = stated (no body change); only the
+    SCORE body gets the logprobs request / `n` + sampling extras; every
+    load-time refusal (reserved keys, ranges, calibrated without points, a
+    signal the method cannot produce, non-monotone points, n_param n above
+    max_concurrent); GET /models reports {method, headline, calibrated} and
+    never the points;
   * keys reach the request headers and NEVER GET /models;
   * the startup WARNING names a replaced env var still set;
   * precedence: criterion options.model > job model > registry default,
@@ -168,10 +174,119 @@ def test_the_checked_in_registry_loads():
 
 
 def test_the_default_body_carries_reasoning_as_a_template_variable():
-    body = get_registry().default.body([{"role": "user", "content": "x"}], "score")
+    default = get_registry().default
+    body = default.body([{"role": "user", "content": "x"}], "box")
     assert list(body) == ["model", "messages", "max_tokens", "response_format",
                           "chat_template_kwargs"]
     assert body["chat_template_kwargs"] == {"reasoning_strength": "low"}
+    # The SCORE body alone also asks for the logprobs its confidence is
+    # measured from (models.yaml confidence: {method: logprobs}).
+    score = default.body([{"role": "user", "content": "x"}], "score")
+    assert list(score) == ["model", "messages", "max_tokens", "response_format",
+                           "logprobs", "top_logprobs", "chat_template_kwargs"]
+    assert (score["logprobs"], score["top_logprobs"]) == (True, 20)
+
+
+def test_the_checked_in_confidence_methods():
+    reg = load_registry()
+    methods = {mid: spec.confidence.method for mid, spec in reg.models.items()}
+    assert methods == {"muse-glimmer": "logprobs", "qwen2.5-vl": "stated",
+                       "qwen3.5-4b": "logprobs", "qwen3.8-solo": "logprobs"}
+    # Shadow: no entry is calibrated yet, so every headline is the stated number.
+    assert all(s.confidence.headline == "stated" and s.confidence.calibration is None
+               for s in reg.models.values())
+
+
+# ---------------------------------------------------------------------------
+# The confidence block
+# ---------------------------------------------------------------------------
+
+
+def test_no_confidence_block_is_stated_and_changes_no_body():
+    reg = parse_registry(_data(a=_entry("http://a:1/x", "a")), env={})
+    spec = reg.default
+    assert spec.confidence.method == "stated" and spec.confidence.headline == "stated"
+    assert spec.confidence.slots == 1
+    for kind in ("score", "box", "select", "describe"):
+        body = spec.body([], kind)
+        assert set(body) == {"model", "messages", "max_tokens", "response_format"}
+    assert spec.public()["confidence"] == {"method": "stated", "headline": "stated",
+                                           "calibrated": False}
+
+
+def test_only_the_score_body_gets_the_confidence_request():
+    reg = parse_registry(_data(
+        lp=_entry("http://lp:1/x", "lp", extra_body={"temperature": 0.7},
+                  confidence={"method": "logprobs",
+                              "logprobs": {"request": {"logprobs": True, "top_logprobs": 5}}}),
+        nn=_entry("http://nn:1/x", "nn", extra_body={"temperature": 0.7}, max_concurrent=4,
+                  confidence={"method": "sampling",
+                              "sampling": {"n": 4, "extra_body": {"temperature": 1.0}}}),
+        rp=_entry("http://rp:1/x", "rp", confidence={"method": "sampling",
+                                                     "sampling": {"n": 3, "via": "repeat"}}),
+    ), env={})
+    lp, nn, rp = reg.get("lp"), reg.get("nn"), reg.get("rp")
+    assert lp.body([], "score")["top_logprobs"] == 5
+    assert "logprobs" not in lp.body([], "box") and "logprobs" not in lp.body([], "describe")
+    score = nn.body([], "score")
+    # Sampling's extra_body wins over the entry's for the score call alone.
+    assert (score["n"], score["temperature"]) == (4, 1.0)
+    assert "n" not in nn.body([], "select") and nn.body([], "select")["temperature"] == 0.7
+    assert nn.confidence.slots == 4
+    # via repeat: n requests of the plain body, one slot each.
+    assert "n" not in rp.body([], "score") and rp.confidence.slots == 1
+    assert rp.max_concurrent == 2  # below n is fine for repeat
+
+
+_CAL = {"signal": "verdict_probability", "points": [[0.2, 30], [0.9, 85]]}
+
+
+@pytest.mark.parametrize("confidence, needle", [
+    ({"method": "bayes"}, "method"),
+    ({"method": "logprobs", "colour": "red"}, "Extra inputs"),
+    ({"logprobs": {"request": {"logprobs": True, "max_tokens": 9}}}, "may not set ['max_tokens']"),
+    ({"logprobs": {"request": {"n": 2}}}, "may not set ['n']"),
+    ({"logprobs": {"request": {"chat_template_kwargs": {}}}}, "chat_template_kwargs"),
+    ({"logprobs": {"min_coverage": 1.5}}, "min_coverage"),
+    ({"logprobs": {"number_tokens": "bytes"}}, "number_tokens"),
+    ({"sampling": {"n": 1}}, "sampling.n"),
+    ({"sampling": {"extra_body": {"model": "x"}}}, "may not set ['model']"),
+    ({"method": "sampling", "sampling": {"n": 5}}, "max_concurrent 2"),
+    ({"headline": "calibrated"}, "needs confidence.calibration"),
+    ({"method": "stated", "calibration": _CAL}, "not one method 'stated' produces"),
+    ({"method": "logprobs", "calibration": {**_CAL, "signal": "agreement"}},
+     "not one method 'logprobs' produces"),
+    ({"method": "logprobs", "calibration": {**_CAL, "points": [[0.5, 60], [0.4, 70]]}},
+     "non-decreasing"),
+    ({"method": "logprobs", "calibration": {**_CAL, "points": [[0.5, 60], [0.6, 50]]}},
+     "non-decreasing"),
+    ({"method": "logprobs", "calibration": {**_CAL, "points": [[1.5, 60]]}}, "x in [0, 1]"),
+    ({"method": "logprobs", "calibration": {**_CAL, "points": [[0.5, 160]]}}, "y in [0, 100]"),
+    ({"method": "logprobs", "calibration": {**_CAL, "points": []}}, "points"),
+])
+def test_invalid_confidence_blocks_refuse_to_load(confidence, needle):
+    with pytest.raises(RegistryError) as info:
+        parse_registry(_data(a=_entry("http://a:1/x", "a", confidence=confidence)), env={})
+    assert needle in str(info.value)
+
+
+def test_a_calibrated_entry_loads_and_get_models_says_so():
+    from api.introspection import list_models
+
+    reg = parse_registry(_data(a=_entry("http://a:1/x", "a", confidence={
+        "method": "logprobs", "headline": "calibrated",
+        "calibration": {**_CAL, "n": 150, "fitted_on": "2026-10-23", "ground_truth": "deliberate"},
+    })), env={})
+    spec = reg.default
+    assert spec.confidence.calibration.points == [(0.2, 30.0), (0.9, 85.0)]
+    previous = llm_models.use_registry(reg)
+    try:
+        payload = json.loads(list_models().body.decode("utf-8"))
+    finally:
+        llm_models.use_registry(previous)
+    block = payload["models"][0]["confidence"]
+    assert block == {"method": "logprobs", "headline": "calibrated", "calibrated": True}
+    assert "points" not in json.dumps(payload) and "top_logprobs" not in json.dumps(payload)
 
 
 # ---------------------------------------------------------------------------

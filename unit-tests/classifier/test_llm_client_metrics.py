@@ -116,7 +116,11 @@ def test_a_scoring_call_records_tokens_latency_and_one_log_line(monkeypatch, cap
     }
     with caplog.at_level(logging.INFO, logger=llm_client.logger.name):
         answer = asyncio.run(llm_client.call_model({}, label="score/has a house"))
-    assert answer == {"score": 9}
+    # The default model measures confidence from logprobs (models.yaml): a
+    # response without them is answered as before, plus the private keys
+    # llm.confidence reads (no distribution, and a note saying why).
+    assert {k: v for k, v in answer.items() if not k.startswith("_")} == {"score": 9}
+    assert answer["_score_dist"] is None and "no entries" in answer["_confidence_note"]
 
     assert _sample("classifier_llm_prompt_tokens_total", kind="score") - before["prompt"] == 1200
     assert _sample("classifier_llm_cached_prompt_tokens_total", kind="score") - before["cached"] == 1024

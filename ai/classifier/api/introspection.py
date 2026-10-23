@@ -94,7 +94,11 @@ def list_models():
     ``vision`` and ``max_images_per_prompt``, what it ``supports`` (boxes,
     references, contrastive references, text-only scoring), its reasoning
     setting, token budgets per call kind, ``text_char_budget``,
-    ``timeout_s``, ``max_concurrent`` and the requests ``in_flight`` now.
+    ``timeout_s``, ``max_concurrent``, the requests ``in_flight`` now, and
+    ``confidence: {method, headline, calibrated}`` — how its llm results'
+    ``detail.confidence`` is measured (logprobs | sampling | stated), which
+    number is the headline, and whether a calibration is fitted (never the
+    points or the request keys).
     """
     return JSONResponse(content=llm_models.get_registry().public())
 

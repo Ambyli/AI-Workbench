@@ -76,6 +76,71 @@
 #   text_char_budget       characters of a page's text layer pasted into a
 #                          scoring prompt; the rest is dropped and the prompt
 #                          says so
+#   confidence             OPTIONAL — how an llm result's confidence is
+#                          MEASURED (detail.confidence) and which number is the
+#                          headline `confidence`. No block = {method: stated}:
+#                          nothing extra is requested, safe for any provider.
+#                          Every model difference is a knob here, never code:
+#     method               stated (default) | logprobs | sampling
+#                            stated   the model's own 0-100 number only
+#                            logprobs the score token's probability
+#                                     distribution, from the response's token
+#                                     log-probabilities. Known to work: vLLM,
+#                                     llama.cpp, OpenAI non-reasoning chat
+#                                     models. NOT available: Claude, OpenAI
+#                                     reasoning models (o-series / gpt-5
+#                                     reasoning) — use stated or sampling there.
+#                                     Costs request/response size only
+#                            sampling n answers to the same prompt; their
+#                                     scores make the distribution, their
+#                                     verdicts the `agreement`. Multiplies the
+#                                     model's work by n — on an external entry,
+#                                     its cost too
+#     logprobs:            used by method logprobs
+#       request            merged into the SCORE request body only (box /
+#                          select / describe calls never change). Default
+#                          {logprobs: true, top_logprobs: 20}; whatever this
+#                          provider's API wants. May not set model, messages,
+#                          the token field, response_format,
+#                          chat_template_kwargs, stream or n
+#       entries_path       where [{token, logprob, top_logprobs}] lives in the
+#                          response. Default choices.0.logprobs.content
+#       top_key            the alternatives list's key in each entry. Default
+#                          top_logprobs
+#       number_tokens      auto (default) | single | digits — how the tokenizer
+#                          writes 10: one token (muse-glimmer) or `1`,`0`
+#                          (the qwen family). auto reads it from the stream;
+#                          a pinned value the stream contradicts is logged and
+#                          the stream wins
+#       min_coverage       the share of the score position's probability that
+#                          must be on SOME number (default 0.5); below it the
+#                          fallback is reported
+#     sampling:            used by method sampling
+#       n                  samples per score call (default 5, 2-32)
+#       via                n_param (default: `n` in ONE request — vLLM, OpenAI;
+#                          it holds n slots of max_concurrent, so max_concurrent
+#                          must be >= n or the load fails) | repeat (n requests,
+#                          one slot each — for a provider without `n`)
+#       extra_body         merged into the sampling score body after
+#                          extra_body (e.g. a temperature); default {} = the
+#                          server's sampling. Same refused keys as above
+#     fallback             stated — reported when the method yields nothing
+#                          (no logprobs in the response, low coverage, no
+#                          sample parsed). The scoring call never fails
+#                          because of its measurement
+#     headline             stated (default) | calibrated. SHADOW until a
+#                          calibration is fitted: the top-level confidence
+#                          stays the model's own number and the measured
+#                          signals sit in detail.confidence. calibrated needs
+#                          `calibration`
+#     calibration          null (default) | {signal, points: [[x, y], ...],
+#                          n, fitted_on, ground_truth} — the block
+#                          bin/confidence_calibration.py prints. signal is one
+#                          the method produces (stated: stated; logprobs: +
+#                          verdict_probability, certainty; sampling: +
+#                          agreement); points are non-decreasing, x in [0, 1],
+#                          y in [0, 100]. Re-fit after a model, prompt or
+#                          reasoning change
 
 default: muse-glimmer
 
@@ -116,6 +181,14 @@ models:
     max_concurrent: 6
     # ~15k tokens: a long contract cannot crowd out the image or the answer.
     text_char_budget: 60000
+    # Probed 2026-10-22 (vLLM 0.29, spec decode, reasoning parser): logprobs
+    # come back, `10` is ONE token, the stream includes the reasoning. Shadow:
+    # the headline stays the stated number until a calibration is fitted.
+    # number_tokens is pinned to what /tokenize showed: under `auto`, when `10`
+    # is not among a position's top tokens a `1` alternative cannot be told
+    # from the start of `10` and is reported unresolved (a lower bound); pinned,
+    # it is score 1 exactly.
+    confidence: {method: logprobs, logprobs: {number_tokens: single}}
 
   qwen2.5-vl:
     description: >-
@@ -141,6 +214,8 @@ models:
     timeout_s: 120
     max_concurrent: 2
     text_char_budget: 8000
+    # Not running, so never probed: the model's own number only.
+    confidence: {method: stated}
 
   qwen3.5-4b:
     description: >-
@@ -175,6 +250,11 @@ models:
     # ~3-4k tokens, well inside a 16k slot. route-policy's history.max_chars
     # must not exceed it.
     text_char_budget: 12000
+    # Probed 2026-10-22 (llama.cpp): logprobs come back, digits split, real
+    # spread. This is route-policy's latency path: if
+    # classifier_llm_call_seconds{kind="score",model="qwen3.5-4b"} p50 grows
+    # by more than ~10% with it on, set it back to {method: stated}.
+    confidence: {method: logprobs}
 
   qwen3.8-solo:
     description: >-
@@ -210,3 +290,7 @@ models:
     max_concurrent: 1
     # ~15k tokens + the 8192 answer, far inside --max-model-len 131072.
     text_char_budget: 60000
+    # Probed 2026-10-22: logprobs come back, digits split (`1`,`0`), and the
+    # stream includes the reasoning tokens — the score is read from the
+    # answer part only.
+    confidence: {method: logprobs}

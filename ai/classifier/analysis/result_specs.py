@@ -124,7 +124,8 @@ AGGREGATE_FIELD = FieldSpec(
 REFERENCE_FIELD = FieldSpec(
     "What the request's references did for this unit: `{applied, mode, combine, "
     "examples: [{reference_id, criterion, expected, polarity, region, call}], "
-    "calls: [{call, images, score, verdict, confidence, reason, chosen, error}], "
+    "calls: [{call, images, score, verdict, confidence, verdict_probability, reason, "
+    "chosen, error}], "
     "position: null | {status, iou, center_offset, min_iou, max_offset, "
     "reference_id, capped_from}, note}`",
     "object",
@@ -219,10 +220,16 @@ def with_metric(detail: dict, method: str, value: Any) -> dict:
 
 
 def clear_judgement(detail: Any, method: Optional[str]) -> Any:
-    """For ``score: false``: drop ``value`` when the metric IS the judgement (llm)."""
+    """For ``score: false``: drop ``value`` when the metric IS the judgement
+    (llm) — and the llm's measured ``confidence`` block with it (its stated
+    number, verdict probability and score distribution are the judgement
+    too)."""
     spec = spec_for(method)
     if isinstance(detail, dict) and spec is not None and spec.metric_from == "score":
-        return {**detail, "value": None}
+        cleared = {**detail, "value": None}
+        if "confidence" in cleared:
+            cleared["confidence"] = None
+        return cleared
     return detail
 
 

@@ -51,8 +51,11 @@ entry's host so a caller can see where the data goes.
 **What an entry sets** (every field is validated; an unknown key, invalid
 YAML, an unknown `default`, an `api_key_env` on plain `http://` to a dotted
 host, a reasoning key set twice, a `system_line` reasoning on Muse Glimmer,
-or an unavailable default stops the container at startup with the reason in
-its log):
+an unavailable default, or an invalid `confidence` block — a reserved body
+key in it, `headline: calibrated` without a calibration, a calibration signal
+the method cannot produce, non-monotone points, `sampling` via `n_param` with
+`n` above `max_concurrent` — stops the container at startup with the reason
+in its log):
 
 | Field | Meaning |
 |---|---|
@@ -69,6 +72,7 @@ its log):
 | `timeout_s` | Seconds ONE request may take. Not streamed, so it bounds queue + prefill + reasoning + answer; a timeout is not retried |
 | `max_concurrent` | Requests to THIS model in flight across every job — its own limit, held around the HTTP request in `llm/client.py` |
 | `text_char_budget` | Characters of the text layer pasted into a scoring prompt |
+| `confidence` | Optional — how an llm result's confidence is MEASURED and which number is the headline: `{method: stated (default) \| logprobs \| sampling, logprobs: {request, entries_path, top_key, number_tokens, min_coverage}, sampling: {n, via: n_param \| repeat, extra_body}, fallback: stated, headline: stated (default) \| calibrated, calibration: null \| {signal, points, n, fitted_on, ground_truth}}`. No block = `stated`: nothing extra is requested. Only the SCORE call's body changes. See [§ Confidence](#confidence--measured-then-calibrated) |
 
 The checked-in entries: **`muse-glimmer`** (the default — 3 images,
 `reasoning_strength: low`, budgets 8192 / 1024 / 2048 / 1024, 240 s, 6 in
@@ -87,7 +91,11 @@ service, order 1 of three LiteLLM chat chains: text only,
 `reasoning_effort: low`, budgets 8192 / 1024 / 2048 / 1024, 240 s, 60 000
 characters, and **1** in flight of its 3 sequences, because a queued
 classifier call makes the overflow hook spill chat off it — a benchmark
-candidate for the same evaluator). Check what a Muse request renders on the box:
+candidate for the same evaluator). `muse-glimmer`, `qwen3.5-4b` and
+`qwen3.8-solo` measure confidence with `confidence: {method: logprobs}` (probed
+on the box 2026-10-22); `qwen2.5-vl` is `stated`. Every headline is still the
+stated number (shadow, [§ Confidence](#confidence--measured-then-calibrated)).
+Check what a Muse request renders on the box:
 
 ```bash
 curl -s muse-glimmer:8000/tokenize -H 'content-type: application/json' \
@@ -231,10 +239,14 @@ ai/classifier/
                        budgets, reasoning, timeout, a concurrency limit each), get_registry
     prompts.py         the single-criterion scoring prompt (with reference examples), the
                        loop's two small ones, the reference describe and selection prompts
-    client.py          per-model routing + limit (_post), call_model, call_model_json, the encoder
+    client.py          per-model routing + limit (_post), call_model, call_model_json, the encoder;
+                       reads a score call's logprobs / samples (models.yaml `confidence`)
+    confidence.py      detail.confidence: band mass, signals, mixture, the headline;
+                       fit_isotonic / apply (the calibration curve)
     usage.py           UsageStore (`llm_calls` in classifier-db): one row per model request,
                        attributed to its job / criterion / item through context vars
-    validate.py        find the answer, clamp it, derive the verdict from the score
+    validate.py        find the answer, clamp it, derive the verdict from the score,
+                       flag a defaulted confidence (stated_defaulted)
     boxes.py           the bounding-box enforcement loop
   cv/                  REGISTRY + get_detector in __init__.py
     quality.py         check_blur, check_exposure — whole-page, no regions
@@ -249,6 +261,8 @@ ai/classifier/
                        job type's progress STAGES
   bin/
     grounding_experiment.py   operator tool — runs where the model is
+    confidence_calibration.py operator tool — measures the confidence signals, fits a
+                              calibration (§ Confidence)
 ```
 
 Import direction is strictly one way:
@@ -735,8 +749,10 @@ truncated — and the rubric its `options.hint` selects. A text-only model
 `{"score", "verdict", "confidence", "reason"}`; the verdict is always
 recomputed from the clamped score. What was sent is in the result's
 `detail`: `{metric: "score", value, hint, model, image_sent, text_sent: {chars,
-truncated, budget, source}}` — `model` is the registry id that answered — `value` is the score, and null for a `score: false`
-criterion (see [§ Result details](#result-details--the-same-shape-on-every-type)).
+truncated, budget, source}, confidence}` — `model` is the registry id that answered — `value` is the score, and null for a `score: false`
+criterion; `confidence` is the MEASURED confidence (the score's token
+distribution for a `logprobs` model; [§ Confidence](#confidence--measured-then-calibrated))
+(see [§ Result details](#result-details--the-same-shape-on-every-type)).
 
 > **Images per call.** A unit is one item, so its page image is the one
 > CANDIDATE image — a ten-page PDF is ten calls per `llm` criterion, never one
@@ -1144,7 +1160,7 @@ every type, so the headline number reads the same whatever ran:
 
 | Type | `metric` | `value` is | Other `detail` keys |
 |---|---|---|---|
-| `llm` | `score` | the model's score (**null** for `score: false` — the judgement is not reported) | `hint`, `image_sent`, `text_sent`; `reference` when the request listed references (below) |
+| `llm` | `score` | the model's score (**null** for `score: false` — the judgement is not reported) | `hint`, `image_sent`, `text_sent`, `confidence` (below; **null** for `score: false`); `reference` when the request listed references (below) |
 | `text` | `count` | `detail.count`, the hits | the match record above; `scope`, `separator`, `items_with_hits` with `scope: "document"` |
 | `detector` | `best_score` | `detail.best_score` | `detector_matches`, `min_score` |
 | `cv` | per detector | `detail.measurements[metric]` | `detector`, `measurements`, `thresholds`, `parameters`, `state`, `image` — keys per detector in `GET /cv-detectors` |
@@ -1167,7 +1183,7 @@ has it too, through the llm shape:
                 "expected": {"score": 2, "verdict": "FAIL"}, "polarity": "fail",
                 "region": "whole_page", "call": 0}],
   "calls": [{"call": 0, "images": 3, "score": 9, "verdict": "PASS", "confidence": 80,
-             "reason": "…", "chosen": true, "error": null}],
+             "verdict_probability": 0.97, "reason": "…", "chosen": true, "error": null}],
   "position": {"status": "miss", "iou": 0.04, "center_offset": 0.41, "min_iou": 0.3,
                "max_offset": 0.15, "reference_id": "r1a2b3c4d5e6f", "capped_from": 9},
   "note": null
@@ -1180,6 +1196,48 @@ criterion scored without an example. `examples[].call` is the call it was
 shown in (`null` past the call cap); `calls[].images` counts the candidate;
 `position` is `null` unless `options.reference.position` is `check`. It is
 **not** a stable key: under `mean` it is only in `items[]`.
+`calls[].verdict_probability` is that call's measured probability of its own
+verdict (`null` when its model measures nothing — see `detail.confidence`).
+
+**`detail.confidence`** — on every llm-answered unit: how sure the model was,
+MEASURED the way its `models.yaml` entry's `confidence.method` says
+(`llm/confidence.py`; [§ Confidence](#confidence--measured-then-calibrated)):
+
+```json
+"confidence": {
+  "method": "logprobs", "source": "logprobs", "headline": "stated",
+  "stated": 95, "stated_defaulted": false, "calibrated": null,
+  "verdict_probability": 0.9812,
+  "band": {"PASS": 0.9812, "MARGINAL": 0.0101, "FAIL": 0.0},
+  "distribution": {"1": 0.0, "2": 0.0, "3": 0.0, "4": 0.0, "5": 0.0, "6": 0.0101,
+                   "7": 0.0303, "8": 0.0505, "9": 0.1212, "10": 0.7792},
+  "expected_score": 9.5, "entropy_bits": 1.1386, "certainty": 0.6572,
+  "coverage": 0.99, "unresolved": [{"values": [1, 10], "mass": 0.0087}],
+  "samples": null, "note": null
+}
+```
+
+| Key | Meaning |
+|---|---|
+| `method` | What the entry is configured to measure: `logprobs` \| `sampling` \| `stated` |
+| `source` | What actually produced the signals — the method, or `stated` (the fallback) when it yielded nothing: no logprobs in the response, numeric `coverage` under `min_coverage`, no sample parsed. `note` says why. A scoring call never fails because of its measurement |
+| `headline` | Which number the top-level `confidence` is: `stated` (shadow — the default) or `calibrated` |
+| `stated` / `stated_defaulted` | The model's own 0-100 number (clamped); `stated_defaulted: true` when it omitted or garbled it and the 50 is ours |
+| `calibrated` | The entry's calibration curve at its signal (0-100), or `null` (no calibration, or the signal is unavailable on this answer) |
+| `verdict_probability` | The probability mass on the reported verdict's band (PASS 7-10, MARGINAL 4-6, FAIL 1-3) — a **lower bound**: `unresolved` mass that could land in two bands counts in neither |
+| `band` | That mass for each band |
+| `distribution` | `"1"`..`"10"` → probability, renormalised over the mass that went to a number |
+| `expected_score` / `entropy_bits` / `certainty` | Its mean, its entropy (0 = certain, 3.32 = uniform) and `1 - entropy / log2(10)` (unresolved mass split evenly) |
+| `coverage` | The share of the score position's probability that went to SOME number, before renormalising (`1.0` for samples) |
+| `unresolved` | `[{values, mass}]` — under a split-digit tokenizer a non-sampled `1` is 1 or 10; its split is unknown, so it is not guessed |
+| `samples` | `sampling` only: `{asked, answered, agreement, stated_mean}` — `agreement` is the share with the majority verdict; else `null` |
+| `note` | Why `source` or `headline` fell back, else `null` |
+
+With `source: "stated"` every distribution key is `null`. It is **not** a
+stable key: under `mean` it is only in `items[]`; under `any` / `worst` /
+`all` it is the chosen member's. A guided `combine: mean` scores the averaged
+answer against the mixture of the calls' distributions. The logprob payload
+itself is never stored — `llm_calls` keeps `usage` and `finish_reason` only.
 
 **Aggregates keep the shape.** When a criterion ran on more than one item or
 document, its `detail` is still its type's shape, plus one block:
@@ -1593,6 +1651,73 @@ Token totals are sums over the calls that reported the number, and `null`
 as `cached_tokens: null`, not as a 0% cache hit rate.
 
 ---
+
+## Confidence — measured, then calibrated
+
+The top-level `confidence` of an `llm` result has always been a number the
+model types into its JSON after it has written the score. On the box's
+stored jobs (2026-10) 68% of 14 546 llm results say 95-100 and 79% say ≥ 90:
+it is not tied to how often the answer is right. So each result now also
+carries what the model's sampling actually did (`detail.confidence`, [§ Result
+details](#result-details--the-same-shape-on-every-type)), and the headline
+can be switched, per model, to a calibrated number that means "right about
+this often".
+
+**How it is measured is per-model configuration** (`models.yaml`
+`confidence`, [§ Models](#models)), never per-model code — token
+probabilities are not universal:
+
+| `method` | What it reads | Cost | Providers |
+|---|---|---|---|
+| `stated` (default) | the model's own number only | nothing | any |
+| `logprobs` | the score token's alternatives (`logprobs: true, top_logprobs: 20` on the SCORE call only); a whole-number tokenizer (muse-glimmer writes `10` as one token) and a split-digit one (the qwen family: `1`, `0`) are both read exactly, and a reasoning prefix in the stream is skipped (`common.logprobs`) | request / response size | vLLM, llama.cpp, OpenAI non-reasoning chat — **not** Claude, **not** OpenAI reasoning models |
+| `sampling` | the empirical distribution of `n` answers; the REPORTED answer is the first sample's, so the score never moves | n × the model's work (and, on an external entry, its bill); `via: n_param` holds n slots of `max_concurrent` per call | any (`via: repeat` where `n` is not supported) |
+
+**Shadow first.** Every entry's `headline` is `stated` today: the top-level
+number is unchanged, the stated number is also `detail.confidence.stated`,
+and the measured signals sit beside it. The stated number is kept because it
+is what every consumer (route-policy's `llm_classifier`, the reference
+`auto` floor, reports) reads, and because a signal is only worth a headline
+once it has been shown to rank right answers above wrong ones.
+
+**Measure, then fit** — `bin/confidence_calibration.py`, in the container,
+off-hours (its calls come on top of production's slots):
+
+```bash
+docker exec classifier uv run python bin/confidence_calibration.py \
+  --docs /data/calibration/docs --criteria /data/calibration/criteria.json \
+  --model muse-glimmer --concurrency 1 --out /data/calibration.json
+```
+
+It runs every (criterion, page) through `analyze_document` as configured,
+then again on a DELIBERATE copy of the entry (`<id>@deliberate`: reasoning
+`xhigh`, `max_tokens.score` 32768, `timeout_s` 900) whose verdict is the label
+— or a person's, from `--labels` (`--export-labels` writes the CSV to fill
+in). For each signal (`stated / 100`, `verdict_probability`, `certainty`,
+`agreement`) it prints the agreement rate, AUROC for "fast verdict == label",
+ECE, Brier and a histogram, the seconds and bytes per call, and the isotonic
+fit of the best signal as a ready-to-paste block:
+
+```yaml
+    confidence:
+      method: logprobs
+      calibration:
+        signal: verdict_probability
+        points: [[0.41, 38.0], [0.88, 71.5], [0.99, 93.2]]
+        n: 180
+        fitted_on: "2026-10-30"
+        ground_truth: deliberate
+```
+
+Paste it only when that signal beats `stated` on AUROC; `calibrated` then
+appears in every result's `detail.confidence` while the headline stays
+stated. **Flipping** a model is a separate edit: `headline: calibrated`, then
+`docker restart classifier` — the top-level `confidence` becomes
+`round(apply(points, x))` for that signal (monotone piecewise-linear between
+the points, flat beyond them). An answer without the signal (no logprobs in
+that response) keeps the stated headline and says so in `note`. Re-fit after
+a model, prompt or reasoning change: a curve describes one model answering
+one prompt at one reasoning depth.
 
 ## Result shape
 
@@ -2388,7 +2513,8 @@ curl http://localhost:4001/v1/classifier/models -H "Authorization: Bearer sk-123
      "reasoning": {"style": "chat_template_kwargs", "key": "reasoning_strength", "value": "low"},
      "text_char_budget": 60000,
      "max_tokens": {"score": 8192, "box": 1024, "select": 2048, "describe": 1024},
-     "timeout_s": 240.0, "max_concurrent": 6, "in_flight": 0},
+     "timeout_s": 240.0, "max_concurrent": 6, "in_flight": 0,
+     "confidence": {"method": "logprobs", "headline": "stated", "calibrated": false}},
     {"id": "qwen2.5-vl", "…": "…"},
     {"id": "qwen3.5-4b", "…": "…"},
     {"id": "qwen3.8-solo", "…": "…"}
@@ -2399,7 +2525,11 @@ curl http://localhost:4001/v1/classifier/models -H "Authorization: Bearer sk-123
 `endpoint.host` is where a request's pages and text go — an external host
 means the data leaves the box. `available: false` (with `unavailable_reason`)
 is an entry whose API key variable is unset; selecting it is a 400.
-`in_flight` is that model's requests in flight right now.
+`in_flight` is that model's requests in flight right now. `confidence` is how
+its llm results' `detail.confidence` is measured (`logprobs` | `sampling` |
+`stated`), which number is the top-level `confidence` (`stated` until the
+entry is flipped to `calibrated`), and whether a calibration is fitted — never
+the points or the request keys ([§ Confidence](#confidence--measured-then-calibrated)).
 
 ---
 

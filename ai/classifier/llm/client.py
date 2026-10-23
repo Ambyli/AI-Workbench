@@ -38,6 +38,19 @@ the prompt with; ``None`` means the registry's default.
 The difference in failure mode between the two is the whole reason they are
 separate functions.
 
+**Measured confidence** (``models.yaml`` ``confidence.method``, score calls
+only). ``logprobs``: the score call's body asked for token probabilities
+(``ModelSpec.body``); after parsing, ``common.logprobs`` reads the score's
+distribution from them and the payload is dropped — it is never stored
+(``llm_calls`` keeps ``usage`` and ``finish_reason`` only). ``sampling``: via
+``n_param`` ONE request asks for n completions and holds n slots of the
+model's limit (``ConcurrencyLimit.hold``; the registry refuses n above
+``max_concurrent``); via ``repeat`` n requests each hold one. The reported
+answer is the first parseable sample. Either way the answer dict gains the
+private keys ``llm.confidence.assess`` reads; a missing or unreadable
+measurement is a note and the fallback, never a failed call. A test that
+replaces ``call_model`` returns plain answers and gets the fallback.
+
 ``llm_calls_total`` and ``llm_latency`` live here rather than in ``metrics``
 because both calls produce them and nothing else reads them — and so do the
 per-request ``classifier_llm_call_seconds`` histogram and the four
@@ -83,7 +96,10 @@ from typing import Optional
 import httpx
 from prometheus_client import Counter, Histogram
 
+from common.logprobs import from_samples, int_field_distribution, resolve_path
+
 from config import HTTP_CONNECT_TIMEOUT, MAX_LLM_RETRIES
+from llm import confidence as llm_confidence
 from llm import usage as llm_usage
 from llm.models import ModelSpec, get_registry
 from logger import logger
@@ -306,9 +322,12 @@ async def _send(prompt: dict) -> dict:
 
 async def _post(
     prompt: dict, *, label: str = "", attempt: int = 1, model: Optional[ModelSpec] = None,
+    slots: int = 1,
 ) -> dict:
     """One model request holding a slot of ITS model's limit for exactly its
-    duration.
+    duration (``slots`` of them for a request the server runs as several
+    sequences — a sampling score call with ``n``; ``ConcurrencyLimit.hold``
+    takes them all at once, so two such calls never deadlock on half each).
 
     Parsing and retry decisions happen outside the slot, so a slow parse
     never holds a place another job's call could use. The slot is the
@@ -342,7 +361,7 @@ async def _post(
     kind = call_kind(label)
     failure: Exception | None = None
     data = None
-    async with spec.limit:
+    async with spec.limit.hold(slots):
         started_at = llm_usage.now_iso()
         t0 = time.monotonic()
         token = _target.set(spec)
@@ -386,8 +405,9 @@ async def _post(
     return data
 
 
-def _parse_content(data: dict) -> dict:
-    """The JSON object in a completion's ``content``.
+def _parse_content(data: dict, index: int = 0) -> dict:
+    """The JSON object in a completion's ``content`` (choice ``index``; a
+    sampling call with ``n`` has several).
 
     With a reasoning parser the model's thinking lands in
     ``reasoning_content``; ``content`` is the answer and can be None if the
@@ -399,7 +419,7 @@ def _parse_content(data: dict) -> dict:
         KeyError / IndexError: The response is not a chat completion.
         ValueError: No JSON object in the content.
     """
-    content = data["choices"][0]["message"].get("content") or ""
+    content = data["choices"][index]["message"].get("content") or ""
     try:
         parsed = json.loads(content)
     except json.JSONDecodeError:
@@ -436,23 +456,39 @@ async def call_model(
                    default) — where it is sent, and under whose limit.
 
     Returns:
-        The model's JSON object, or ``validator``'s result for it.
+        The model's JSON object, or ``validator``'s result for it. For a
+        ``score/`` call to an entry whose ``confidence.method`` measures
+        something, a dict result also carries the private keys
+        ``llm.confidence`` reads (``_score_dist``, ``_samples``,
+        ``_confidence_note``) — see :func:`_measure`.
 
     Raises:
         LLMCallError: The call failed; the message says why.
     """
     spec = _spec(model)
+    conf = spec.confidence
+    # Only the SCORE call kind is measured — the same rule ModelSpec.body
+    # uses to add the confidence request keys; box / select / describe calls
+    # are sent and read exactly as before.
+    measure = conf.method if conf.method != "stated" and call_kind(label) == "score" else None
+    repeat = measure == "sampling" and conf.sampling.via == "repeat"
+    slots = conf.slots if measure == "sampling" else 1
     logger.debug(
-        "call_model(%s): posting to %s model=%s (max_retries=%d)",
-        label, spec.id, spec.served_name, MAX_LLM_RETRIES,
+        "call_model(%s): posting to %s model=%s (max_retries=%d, confidence=%s)",
+        label, spec.id, spec.served_name, MAX_LLM_RETRIES, measure or "stated",
     )
     last_exc: Exception | None = None
     for attempt in range(MAX_LLM_RETRIES):
         try:
-            data = await _post(prompt, label=label, attempt=attempt + 1, model=spec)
-            result = _parse_content(data)
-            if validator is not None:
-                result = validator(result)
+            if repeat:
+                responses = await _post_repeat(
+                    prompt, label=label, attempt=attempt + 1, model=spec, n=conf.sampling.n,
+                )
+            else:
+                responses = [
+                    await _post(prompt, label=label, attempt=attempt + 1, model=spec, slots=slots)
+                ]
+            result = _measure(responses, validator, measure, spec)
             llm_calls_total.labels(status="success", model=spec.id).inc()
             return result
         except httpx.HTTPError as exc:
@@ -477,6 +513,128 @@ async def call_model(
         f"model {spec.id!r}'s answer could not be parsed after {MAX_LLM_RETRIES} "
         f"attempts: {last_exc}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Measured confidence (llm.confidence reads what these attach)
+# ---------------------------------------------------------------------------
+
+
+async def _post_repeat(
+    prompt: dict, *, label: str, attempt: int, model: ModelSpec, n: int,
+) -> list[dict]:
+    """``sampling`` via ``repeat``: n concurrent requests of the same prompt,
+    each its own ``_post`` (its own slot, timer, usage row). The bodies that
+    answered, in request order; when none did, the first failure is raised
+    (an HTTP error stays an HTTP error, so ``call_model`` does not retry it)."""
+    results = await asyncio.gather(
+        *(_post(prompt, label=label, attempt=attempt, model=model) for _ in range(n)),
+        return_exceptions=True,
+    )
+    for result in results:
+        if isinstance(result, BaseException) and not isinstance(result, Exception):
+            raise result  # a cancellation: the job is being torn down
+    answered = [r for r in results if not isinstance(r, BaseException)]
+    if not answered:
+        raise next(r for r in results if isinstance(r, BaseException))
+    return answered
+
+
+def _logprob_distribution(data: dict, spec: ModelSpec):
+    """``(Distribution | None, note | None)`` for the score in one response.
+
+    Never raises: a response without logprobs, or with entries that cannot be
+    read, is a note and the fallback — the scoring call itself never fails
+    because of its confidence measurement.
+    """
+    cfg = spec.confidence.logprobs
+    try:
+        entries = resolve_path(data, cfg.entries_path)
+        if not isinstance(entries, list) or not entries:
+            return None, (
+                f"logprobs: the response has no entries at {cfg.entries_path} — the "
+                "server ignored the request, or keeps them elsewhere (models.yaml "
+                "confidence.logprobs.entries_path)"
+            )
+        content = None
+        message = data["choices"][0].get("message") if isinstance(data.get("choices"), list) else None
+        if isinstance(message, dict) and isinstance(message.get("content"), str):
+            content = message["content"]
+        dist = int_field_distribution(
+            entries, llm_confidence.SCORE_KEY, llm_confidence.SCORE_LO, llm_confidence.SCORE_HI,
+            content=content, top_key=cfg.top_key, number_tokens=cfg.number_tokens,
+        )
+    except Exception as exc:  # noqa: BLE001 — a measurement never fails the call
+        logger.warning("logprobs: could not read model %s's entries: %s", spec.id, exc)
+        return None, f"logprobs: the entries could not be read ({type(exc).__name__})"
+    if dist is None:
+        return None, "logprobs: no score value was found in the answer's token stream"
+    return dist, None
+
+
+def _drop_logprobs(data: dict) -> None:
+    """Forget a response's logprob payload (tens of KB with reasoning) once it
+    has been read. ``llm.usage.record_call`` already stored only ``usage`` and
+    ``finish_reason``; nothing else keeps the body."""
+    choices = data.get("choices") if isinstance(data, dict) else None
+    for choice in choices if isinstance(choices, list) else []:
+        if isinstance(choice, dict):
+            choice.pop("logprobs", None)
+
+
+def _measure(responses: list[dict], validator, measure: Optional[str], spec: ModelSpec):
+    """The answer of a scoring call, with its measured confidence attached.
+
+    ``measure`` None (stated, or not a score call): choice 0 parsed and
+    validated — exactly the call's old behaviour. ``logprobs``: the same
+    answer, plus the score distribution read from the response's token
+    probabilities. ``sampling``: every choice of every response is parsed
+    and validated, unparseable ones are dropped (when ALL are, the first
+    failure is raised — a parse failure is then the normal retry); the
+    REPORTED answer is the first that parsed, so sampling never changes the
+    score, and the samples' scores make the distribution.
+    """
+    if measure != "sampling":
+        data = responses[0]
+        result = _parse_content(data)
+        if validator is not None:
+            result = validator(result)
+        if measure == "logprobs":
+            dist, note = _logprob_distribution(data, spec)
+            _drop_logprobs(data)
+            if isinstance(result, dict):
+                result = {**result, llm_confidence.DIST_KEY: dist,
+                          llm_confidence.NOTE_KEY: note}
+        return result
+
+    answers: list = []
+    first_exc: Exception | None = None
+    for data in responses:
+        choices = data.get("choices") if isinstance(data, dict) else None
+        count = len(choices) if isinstance(choices, list) and choices else 1
+        for index in range(count):
+            try:
+                parsed = _parse_content(data, index)
+                answers.append(validator(parsed) if validator is not None else parsed)
+            except (json.JSONDecodeError, ValueError, KeyError, IndexError) as exc:
+                first_exc = first_exc or exc
+    if not answers:
+        raise first_exc or ValueError("no choice in the sampling response")
+    reported = answers[0]
+    if not isinstance(reported, dict):
+        return reported
+    scored = [a for a in answers if isinstance(a, dict) and "score" in a]
+    samples = {
+        "asked": spec.confidence.sampling.n,
+        "verdicts": [a.get("verdict") for a in scored],
+        "stated": [a.get("confidence") for a in scored],
+    }
+    dist = from_samples(
+        [a["score"] for a in scored], llm_confidence.SCORE_LO, llm_confidence.SCORE_HI,
+    ) if scored else None
+    note = None if dist is not None else "sampling: no sample carried a score"
+    return {**reported, llm_confidence.DIST_KEY: dist, llm_confidence.SAMPLES_KEY: samples,
+            llm_confidence.NOTE_KEY: note}
 
 
 async def call_model_json(

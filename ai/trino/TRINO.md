@@ -176,7 +176,7 @@ Clients that pinned the old fingerprint must re-trust.
 
 | Tool | Purpose |
 |---|---|
-| `list_catalogs()` | Every catalog Trino sees — `aws_glue`, `iceberg`, `postgres_classifier`, `postgres_litellm`, `postgres_phoenix`, `postgres_roofix`, `postgres_route_policy`, `postgres_sandbox`, `postgres_supabase`, `supabase_ai_agents`, `supabase_enerflo_leads`, `supabase_operations_assistant`, `system` |
+| `list_catalogs()` | Every catalog Trino sees — `aws_glue`, `bigquery_supernova_dev`, `iceberg`, `postgres_classifier`, `postgres_litellm`, `postgres_phoenix`, `postgres_roofix`, `postgres_route_policy`, `postgres_sandbox`, `postgres_supabase`, `supabase_ai_agents`, `supabase_enerflo_leads`, `supabase_operations_assistant`, `system` |
 | `list_schemas(catalog)` | Schemas under a catalog |
 | `list_tables(catalog, schema)` | Tables under a schema |
 | `describe_table(catalog, schema, table)` | `[{"name":…, "type":…}, …]` |
@@ -274,7 +274,9 @@ models get an accurate hint.
   `postgres_sandbox`, `postgres_phoenix`, `postgres_supabase`,
   `postgres_classifier`, `postgres_route_policy`);
   `supabase_<project>` for Supabase-hosted projects (`supabase_ai_agents`,
-  `supabase_enerflo_leads`, `supabase_operations_assistant`); `aws_glue` for the Glue Data Catalog. Note the
+  `supabase_enerflo_leads`, `supabase_operations_assistant`); `aws_glue` for the Glue Data Catalog;
+  `bigquery_<project>` for a BigQuery project (`bigquery_supernova_dev` is
+  GCP project `supernova-dev-zeo`). Note the
   split that `postgres_supabase` sits on: it is the Supabase instance **we**
   run (`ai/supabase`), so it is named for the Postgres we operate, not for
   the vendor — `supabase_*` is reserved for projects hosted on
@@ -414,12 +416,40 @@ second catalog with `connector.name=iceberg` +
 `iceberg.catalog.type=glue` on the same credentials and set
 `hive.iceberg-catalog-name=<that catalog>` here so Trino redirects.
 
-Other first-party connectors (BigQuery, Snowflake, Redshift, ClickHouse,
-MongoDB, Kafka, Delta Lake, …) follow the same shape — `connector.name`
-from the [Trino connector index](https://trino.io/docs/current/connector.html),
-then per-connector keys. Anything that needs a credentials *file* (e.g.
-BigQuery's service-account JSON) also needs a read-only volume mount on
-the coordinator.
+<a id="bigquery"></a>
+**BigQuery** (see `bigquery_supernova_dev.properties`):
+
+```properties
+connector.name=bigquery
+bigquery.project-id=${ENV:X_BQ_PROJECT_ID}
+bigquery.credentials-key=${ENV:X_BQ_CREDENTIALS_KEY}
+bigquery.case-insensitive-name-matching=true
+```
+
+- **The key goes in `.env`, not a mount.** `bigquery.credentials-key` takes
+  the service account's JSON key file base64-encoded onto one line
+  (`base64 -w0 key.json`), so no volume is needed. Delete the downloaded
+  JSON once it is in the box's `.env`.
+- **Roles.** BigQuery Data Viewer on the datasets (metadata + data) and
+  BigQuery Read Session User on the billing project: table scans go through
+  the Storage Read API, billed to `bigquery.parent-project-id` (default: the
+  key's own project). A `PERMISSION_DENIED … readsessions.create` means the
+  second role is missing.
+- **Views are off** (connector default). Reading a view makes Trino
+  materialize it into a temporary table, which needs `bigquery.tables.create`
+  — more than a reader key has. Turn on `bigquery.views-enabled=true` only
+  with a key that may write to a scratch dataset.
+- **Arrow.** The connector reads Storage API pages as Arrow, which needs
+  `--add-opens=java.base/java.nio=ALL-UNNAMED` in `config/jvm.config`
+  (present); without it scans fail with an `InaccessibleObjectException`.
+- **Datasets are schemas**, so a dataset in another project is not visible
+  here — it needs a second catalog with that `bigquery.project-id`.
+
+Other first-party connectors (Snowflake, Redshift, ClickHouse, MongoDB,
+Kafka, Delta Lake, …) follow the same shape — `connector.name` from the
+[Trino connector index](https://trino.io/docs/current/connector.html), then
+per-connector keys. Anything that needs a credentials *file* also needs a
+read-only volume mount on the coordinator.
 
 ### Verifying
 

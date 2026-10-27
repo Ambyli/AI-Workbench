@@ -1,0 +1,7 @@
+{
+  "allowed_origins": ["https://app.roofix.io"],
+  "values": {
+    "username": "${ENV:INTERCEPTOR_LOGIN_ROOFIX_V3_USERNAME}",
+    "password": "${ENV:INTERCEPTOR_LOGIN_ROOFIX_V3_PASSWORD}"
+  }
+}

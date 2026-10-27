@@ -31,6 +31,8 @@ services:
       # missing pair fails only that profile's login_actions, with a 400.
       - INTERCEPTOR_LOGIN_ENPHASE_USERNAME=${INTERCEPTOR_LOGIN_ENPHASE_USERNAME:-}
       - INTERCEPTOR_LOGIN_ENPHASE_PASSWORD=${INTERCEPTOR_LOGIN_ENPHASE_PASSWORD:-}
+      - INTERCEPTOR_LOGIN_ROOFIX_V3_USERNAME=${INTERCEPTOR_LOGIN_ROOFIX_V3_USERNAME:-}
+      - INTERCEPTOR_LOGIN_ROOFIX_V3_PASSWORD=${INTERCEPTOR_LOGIN_ROOFIX_V3_PASSWORD:-}
     volumes:
       - interceptor_data:/data
       # Read-only: the service only ever reads these. The files hold only

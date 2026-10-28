@@ -160,7 +160,7 @@ def _strip_ids(value, job_id: str):
 
 
 ENTRY_KEYS = {
-    "status", "type", "method", "scored", "score", "verdict", "confidence",
+    "status", "type", "key", "method", "scored", "score", "verdict", "confidence",
     "reason", "detail", "regions", "regions_truncated", "artifacts",
     "localization", "options_used", "error", "complete", "aggregate_used", "items",
 }
@@ -247,13 +247,21 @@ def test_every_criterion_has_the_same_keys(client, model, monkeypatch):
             {"name": "sharpness", "type": "cv"},
             {"name": "has sky", "type": "cv"},
             {"name": "SOMETHING", "type": "text"},
-            {"name": "has a roof", "type": "llm", "options": {"hint": "presence"}},
+            {"name": "has a roof", "type": "llm", "key": " roof ", "options": {"hint": "presence"}},
             {"name": "will fail", "type": "llm"},
             {"name": "after", "type": "text", "depends_on": "SOMETHING"},
         ],
         files={"file": ("page.png", _png(), "image/png")},
     )
     result = job["result"]
+    # The key is echoed per entry (stripped), null when unset, and recorded
+    # with the criteria the job ran.
+    assert {name: e["key"] for name, e in _entries(job).items()} == {
+        "sharpness": None, "has sky": None, "SOMETHING": None, "has a roof": "roof",
+        "will fail": None, "after": None,
+    }
+    assert [c["key"] for c in result["request"]["criteria"]] == [
+        None, None, None, "roof", None, None]
     assert result["schema_version"] == 3
     (geometry,) = result["page_geometry"]
     assert geometry["item"] == 0 and geometry["page"] == 0 and geometry["width"] == 400

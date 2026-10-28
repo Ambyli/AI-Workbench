@@ -231,7 +231,8 @@ ai/classifier/
     store.py           ReferenceRegistry (`reference_examples` in classifier-db), the
                        sweeper-less file store at CLASSIFIER_REFERENCE_DIR, reconcile, gauges
     resolve.py         an /assess request's `references` against the store, at submit: the
-                       plan the worker follows, inherited criteria, the `auto` pool
+                       plan the worker follows, the matching order (criterion → key →
+                       name), inherited criteria, the `auto` pool
     finalize.py        caller answers + pipeline answers → the frozen record
     render.py          page.jpg / working.jpg / c.<slug>.jpg, and the `auto` catalogue
   llm/
@@ -548,6 +549,13 @@ come back empty) before `up -d --force-recreate`.
 `CLASSIFIER_MAX_UNITS_PER_JOB` (default since raised from 2 to 4, then 6) — the old name is not read
 any more. `CLASSIFIER_MAX_ITEMS` (20) is new, and
 `CLASSIFIER_ARTIFACT_MAX_BYTES` is now a per-item allowance.
+
+**Criterion `key`** ([§ matching order](#how-a-criterion-finds-its-examples--the-matching-order))
+is code only: no env var, no `models.yaml` edit, no queue drain — `key` is
+optional, so a payload, a stored reference or an `auto` plan from the
+previous container runs unchanged (matched by name). `make build classifier &&
+make up classifier`; `GET /criterion-types` → `shared_fields.key` confirms the
+new build is live.
 
 ---
 
@@ -967,7 +975,7 @@ sending neither.
 |---|---|---|
 | `file` | at least one `file` or `text` | A document. **Repeat the part** for more documents. The legacy name `image` is still accepted, and repeats too |
 | `text` | at least one `file` or `text` | Inline text, same as the JSON `type: "text"`. Repeatable; an empty one is a 400 |
-| `criteria` | no | The same JSON array as the JSON body's `criteria`, as a string, **once** — it covers every document. Omitted: with explicit `references`, the references' criteria ([inherited](#using-them--references-on-assess)); otherwise the four default quality criteria. The form parser no longer fills the defaults in itself, so the model can tell "omitted" from "sent" |
+| `criteria` | no | The same JSON array as the JSON body's `criteria`, as a string, **once** — it covers every document. Omitted: with explicit `references`, the references' criteria ([inherited](#inheritance-auto-and-optionsreference)); otherwise the four default quality criteria. The form parser no longer fills the defaults in itself, so the model can tell "omitted" from "sent" |
 | `references` | no | **Once**: a JSON array of reference ids, the word `auto`, or the JSON `{"auto": true, …}` object |
 | `model` | no | **Once**: the job's model, a plain registry id (`muse-glimmer`) — same as the JSON `model` |
 
@@ -989,6 +997,7 @@ in `options`:
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `name` | string (1–200, `CLASSIFIER_CRITERION_NAME_MAX_CHARS`) | — | The criterion. Unique in the request. For `text` it is also the default `pattern`; for `cv` it is matched against the OpenCV registry; for `detector` it is the text prompt |
+| `key` | string (1–200, stripped) \| null | `null` | Used **only** to find reference examples: a keyed criterion is guided by the reference criteria with the same key (case-insensitive), whatever either is named, and never falls back to its name — see [§ How a criterion finds its examples](#how-a-criterion-finds-its-examples--the-matching-order). Never shown to the model; results, `depends_on` and prompts stay on `name`. May repeat in a request; unique within one reference. Echoed on each result entry |
 | `type` | `llm` \| `text` \| `cv` \| `detector` | `llm` | The evaluation path — see below |
 | `weight` | number > 0 | `1` | Relative weight in the overall score |
 | `depends_on` | string \| null | `null` | Another SCORED criterion that must **PASS** first — see [§ Dependencies](#dependencies) |
@@ -1022,7 +1031,8 @@ nothing is queued:
   compiled through the matcher's own path;
 * duplicate names; a `depends_on` naming an unknown criterion, itself, or a
   `score: false` criterion; a dependency cycle (`dependency cycle: a -> c -> b
-  -> a`);
+  -> a`); a blank `key` or one over 200 characters (a repeated key is fine
+  here — it is unique only within a reference);
 * `score: false` on a criterion that cannot produce geometry, or when no
   document in the request has a page image (every one a .txt / .docx);
 * a `detector` criterion (or a `cv` one with an explicit `fallback:
@@ -1328,7 +1338,10 @@ page of a PDF — with the criteria asked of it, the answer each one should get
 the candidate**, so the model knows what a criterion means HERE: a reference
 whose `has a house` was PASS (10) with the house boxed teaches "a house" by
 example, and a FAIL reference is a counter-example. The score still answers
-the criterion — an example is guidance, never the answer.
+the criterion — an example is guidance, never the answer. Which stored
+criterion is an example for which requested one is ONE rule —
+`options.reference.criterion`, else the criterion's `key`, else its `name`
+([§ How a criterion finds its examples](#how-a-criterion-finds-its-examples--the-matching-order)).
 
 **References guide the vision model only.** They apply to `llm` criteria and
 to `cv` names that fall back to the llm (no OpenCV detector, `fallback`
@@ -1365,7 +1378,7 @@ JSON, or multipart parsed into the same model (`api.reference_schemas.ReferenceR
 |---|---|
 | `document` + `page` | The example page: base64, URL (SSRF-checked, fetched at submit) or — refused — inline text. A JPEG/PNG/HEIC/HEIF/AVIF photo or an SVG (page `0`), or page `page` (0-based, default 0) of a PDF. `.txt` / `.docx` are a 400: a reference is shown to the model as an image |
 | `from_job` + `from_job_item` | **Instead of a document**: save item `from_job_item` (default 0) of a completed `/assess` job — see below |
-| `criteria` | The same `CriterionInput` list as `/assess` (the same cross-criterion rules). Required with `document`; with `from_job`, omitted means the job's own. `options.reference` is refused here — a reference's own criteria are never guided |
+| `criteria` | The same `CriterionInput` list as `/assess` (the same cross-criterion rules). Required with `document`; with `from_job`, omitted means the job's own. `options.reference` is refused here — a reference's own criteria are never guided. A criterion's `key` is stored with it and is how keyed `/assess` criteria find it ([§ matching order](#how-a-criterion-finds-its-examples--the-matching-order)); keys are **unique within a reference** (case-insensitive — a 400 naming both criteria), though they may repeat on `/assess` |
 | `breakdown` | `{name: {score, verdict?, reason?}}` — the answer key. `verdict` is optional and must be the score's (`score 3` with `verdict PASS` is a 400). Not allowed on a `score: false` criterion. A name left out is classified by the creation job |
 | `regions` | `{name: [{"box": [x1, y1, x2, y2]} \| {"polygon": [[x, y], …]}]}` — where. A name left out is **located** by the creation job; `[]` means **the whole page** is the example |
 | `region_units` | `px` (default — ORIGINAL page pixels, after EXIF rotation; one pixel of overshoot is tolerated and clamped) \| `grid` (0–1000 on both axes; recommended for a PDF page, whose pixel size depends on `CLASSIFIER_PDF_RENDER_DPI`) |
@@ -1389,17 +1402,19 @@ a `text` criterion on the reference relies on OCR). The criteria are the job's
 `result.request.criteria`; a job that predates that block has them rebuilt from
 each criterion's `options_used`, with a warning on the reference (`depends_on`
 is not recorded there and is dropped; `weight` is recovered only where the
-breakdown kept it). Every criterion whose type, `score` and resolved options
-match the job's takes the job's answer on that item and its ACCEPTED regions
-there as supplied (`source: "pipeline"`, `observed.job_id`), so a reviewed job
-usually costs no model call at all; the caller's own `breakdown` / `regions`
-still win.
+breakdown kept it). Inherited criteria keep their `key`s; two of them sharing
+one is a 400 — send `criteria` explicitly to choose. Every criterion whose type,
+`score` and resolved options match the job's (a `key` is not compared — it
+changes how a reference is found, not the question) takes the job's answer on
+that item and its ACCEPTED regions there as supplied (`source: "pipeline"`,
+`observed.job_id`), so a reviewed job usually costs no model call at all; the
+caller's own `breakdown` / `regions` still win.
 
 **Refused at submit**, nothing queued:
 
 | Status | When |
 |---|---|
-| 400 | Any malformed input — both or neither of `document` / `from_job`; `page` with `from_job` or `from_job_item` with `document`; `criteria` missing with `document`; a criterion rule; a verdict that disagrees with its score; a breakdown for a `score: false` criterion; a `breakdown` / `regions` key naming no criterion; a malformed box (`x1 < x2`, `y1 < y2`) or polygon (≥ 3 vertices); negative coordinates; grid coordinates past 1000; a pixel region outside the page; a `.txt` / `.docx`; a page the PDF does not have; a page image under the 32 × 32 floor; an item of `from_job` that does not exist or has no page image |
+| 400 | Any malformed input — both or neither of `document` / `from_job`; `page` with `from_job` or `from_job_item` with `document`; `criteria` missing with `document`; a criterion rule; two criteria with the same `key` (case-insensitive — a `from_job`'s inherited criteria too); a verdict that disagrees with its score; a breakdown for a `score: false` criterion; a `breakdown` / `regions` key naming no criterion; a malformed box (`x1 < x2`, `y1 < y2`) or polygon (≥ 3 vertices); negative coordinates; grid coordinates past 1000; a pixel region outside the page; a `.txt` / `.docx`; a page the PDF does not have; a page image under the 32 × 32 floor; an item of `from_job` that does not exist or has no page image |
 | 404 | `from_job`: no such job |
 | 409 | `from_job`: the job is not a completed `/assess` job (still running, failed, or a reference job); its criteria no longer validate on this container. **And** `CLASSIFIER_REFERENCE_MAX_COUNT` (500) references already exist |
 | 410 | `from_job`: the job's artifacts are gone — the TTL sweeper or a `DELETE` took the directory, or the byte cap dropped `p{item}.base.jpg` |
@@ -1441,7 +1456,11 @@ failure of the merge: **no scored criterion ended with an expected answer**
 it `pending` for the requeued job to finish; a `pending` reference whose job
 is gone, or finished without readying it, is failed at the next startup.
 After `ready` its content never changes — PATCH edits only `title`,
-`description` and `tags`; a new answer key is a new reference.
+`description` and `tags`, and the one exception inside the record: each
+criterion's `key` (`criteria_keys`), because a key changes how the reference
+is FOUND, not what it teaches — so a reference saved before keys existed can
+be keyed without being re-created. The answers, regions and page stay
+immutable; a new answer key is a new reference.
 
 ### Using them — `references` on `/assess`
 
@@ -1451,16 +1470,101 @@ After `ready` its content never changes — PATCH edits only `title`,
 | `"references": "auto"` | Let the service pick, per page, from every ready reference |
 | `"references": {"auto": true, "tags": ["houses"], "tags_match": "all" \| "any"}` | The same, from references carrying all / any of these tags (default `any`) |
 
-**Matching.** Each llm-answered criterion is matched by NAME, case-folded, to
-the references' usable criteria — its own name, or
-`options.reference.criterion` when set. A criterion with no match scores
-without an example (`detail.reference.applied: false`, with a note); more
-than `CLASSIFIER_REFERENCE_MAX_PER_CRITERION` (3) matching examples is a 400.
+**Matching.** Each llm-answered criterion finds its examples among the
+references' usable criteria by one order — `options.reference.criterion`,
+else its `key`, else its `name` — set out in full in the next section. More
+than `CLASSIFIER_REFERENCE_MAX_PER_CRITERION` (3) matching examples for one
+criterion is a 400.
+
+### How a criterion finds its examples — the matching order
+
+This is the one rule that decides which stored reference criteria are the
+examples for a criterion of an `/assess` request. It is the same for
+explicit reference ids, for the `auto` pool (which references are candidates,
+fixed at submit) and for each item's `auto` pick (which criterion of a
+selected reference is the example). For each llm-answered criterion, the
+**first** of these that is set decides:
+
+1. **`options.reference.criterion`** → the reference criterion with that
+   **name** (`matched_by: "criterion"`).
+2. Otherwise the criterion's **`key`** → the reference criteria with that
+   **key**, whatever either is named (`matched_by: "key"`).
+3. Otherwise its own **`name`** → the reference criteria with that **name**
+   (`matched_by: "name"`).
+
+* **Case-insensitive, stripped.** `Shape` matches `shape`, `HAS A HOUSE`
+  matches `has a house`.
+* **A keyed criterion never falls back to its name.** When no listed
+  reference criterion has its key it scores without an example —
+  `detail.reference.applied: false`, with a note naming the key (*"no listed
+  reference has a usable criterion with key 'shape'"*) — even when a
+  reference criterion has its exact name. A silent fallback would mix two
+  rules and make "why did this example apply?" unanswerable.
+* **A key-less criterion matches by name** — a reference criterion that HAS
+  a key included: a key adds a way to be found and takes none away.
+* **Only `usable` reference criteria are examples** — answered by the vision
+  model, with an expected answer (`usable: true` on the reference).
+* **Finding nothing is a 400 under rule 1 only.** An
+  `options.reference.criterion` that no listed reference has is a 400 — the
+  caller named it. An unmatched key or name is not an error: that criterion
+  scores unguided, with the note.
+* **Keys may repeat on `/assess`** — several criteria guided by one example,
+  below — but are **unique within one reference** (case-insensitive): a 400
+  on `POST /references` (a `from_job`'s inherited criteria too) and on
+  `PATCH … criteria_keys`, because two reference criteria sharing a key would
+  give one candidate two conflicting captions. With `criteria` omitted, the
+  inherited criteria keep their keys, and one name keyed differently in two
+  references is an [inheritance](#inheritance-auto-and-optionsreference)
+  conflict.
+* **The key is never shown to the model** — not in a prompt, not in a file
+  name. The example's caption quotes the REFERENCE criterion's name and its
+  answer (*"in this reference 'is this square' was PASS (10)…"*), so the
+  model is told what the example actually answered, and the candidate is
+  asked its own `name`. Results, `depends_on`, artifact names and the
+  `per_criterion_scores` keys stay on `name`; each entry echoes its `key`
+  (null when unset), so an application that generates names can map them
+  back.
+* **The result says which rule applied**: the top-level
+  `references.criteria[name]` carries `matched_by` (`criterion` | `key` |
+  `name`) and `matched`, the value it matched.
+
+Worked example — one reference, saved once:
+
+```json
+{"criteria": [{"name": "is this square", "key": "shape", "type": "llm",
+               "options": {"hint": "presence"}}],
+ "breakdown": {"is this square": {"score": 10}},
+ "document": {"type": "base64", "data": "<base64>"}}
+```
+
+— then an `/assess` whose two criteria are both guided by that one example:
+
+```json
+{"references": ["r1a2b3c4d5e6f"],
+ "criteria": [{"name": "is this rectangle", "key": "shape"},
+              {"name": "is this square",    "key": "shape"}],
+ "documents": [{"type": "base64", "data": "<base64>"}]}
+```
+
+Both entries come back with `"key": "shape"` and
+`references.criteria[*].matched_by: "key"`. Without the keys, `is this
+square` would match by name and `is this rectangle` would find nothing.
+Whether a square's example suits "is this rectangle" is the caller's design
+choice; the caption still says what the example answered.
+
+**Keying existing references.** A reference saved before keys (or saved
+without one) is keyed in place with
+[`PATCH /references/{id}`](#patch-referencesreference_id) `criteria_keys` —
+nothing else in it changes, and a job already queued keeps the examples its
+submit resolved.
+
+### Inheritance, `auto` and `options.reference`
 
 **Inheritance.** With explicit ids and `criteria` **omitted**, the references'
 criteria are the request's — merged by name in list order. The same name with
-a different type, options, weight, `score` or `depends_on` in two references
-is a 400 naming both; the merged list goes back through every request rule.
+a different type, options, weight, `score`, `depends_on` or `key` in two
+references is a 400 naming both; the merged list goes back through every
+request rule.
 This is why an omitted multipart `criteria` field is no longer filled with the
 four default quality criteria by the form parser: with explicit references it
 means "inherit", without references the defaults still apply exactly as
@@ -1468,17 +1572,20 @@ before.
 
 **`auto`.** Needs `criteria` (an omitted list is a 400 — there is nothing to
 match on). The **pool** is fixed at submit: ready references with a usable
-criterion matching one of the request's llm-answered criteria (by the same
-name rule), filtered by tags, newest first, capped at
-`CLASSIFIER_REFERENCE_AUTO_POOL_MAX` (20; `pool_truncated` says when it cut).
+criterion that one of the request's llm-answered criteria matches (by the
+same [matching order](#how-a-criterion-finds-its-examples--the-matching-order)
+— a keyed criterion admits references by key only), filtered by tags, newest
+first, capped at `CLASSIFIER_REFERENCE_AUTO_POOL_MAX` (20; `pool_truncated`
+says when it cut).
 In the worker, each **item** makes ONE selection call — the candidate page as
 the one image, plus a text catalogue of the pool (id, title, description,
 tags, each usable criterion with its expected verdict and score) — answered
 with a ranked `{"matches": [{"id", "confidence", "reason"}]}`; ids outside
 the pool are dropped and confidences clamped 0–100. It is memoised per item
 and shared by every criterion on it, and it runs before a unit takes its slot.
-Each criterion then keeps the matches that HAVE that criterion with confidence
-≥ `CLASSIFIER_REFERENCE_AUTO_MIN_CONFIDENCE` (60), best first, at most
+Each criterion then keeps the matches that HAVE a criterion it matches (the
+same order) with confidence ≥ `CLASSIFIER_REFERENCE_AUTO_MIN_CONFIDENCE`
+(60), best first, at most
 `CLASSIFIER_REFERENCE_MAX_PER_CRITERION`. No call is made when the pool is
 empty or the item has no page image. **A failed selection is not fatal**: the
 units score without examples (`applied: false`) and the error is in the
@@ -1491,7 +1598,7 @@ llm fallback; only with `references` on the request (a 400 otherwise):
 | Field | Default | Meaning |
 |---|---|---|
 | `use` | `true` | `false` = score this criterion without examples |
-| `criterion` | its own name | Which reference criterion is the example (case-insensitive). Named but in no listed reference: a 400 |
+| `criterion` | unset — then the `key`, else the name, decides (`options_used` shows the name) | Which reference criterion is the example, by NAME (case-insensitive); it **wins over `key`** — rule 1 of the [matching order](#how-a-criterion-finds-its-examples--the-matching-order). Named but in no listed reference: a 400 |
 | `position` | `off` | `check` = the position check below. Needs `options.boxes: true` and hint `presence` / `auto`; refused on `cv` (its llm fallback runs without boxes) |
 | `min_iou` | `CLASSIFIER_REFERENCE_POSITION_MIN_IOU` (0.3) | Overlap that counts as a position hit |
 | `combine` | `any` | How several examples' answers become one: `any` the best (with its reason), `all` the lowest, `mean` the rounded mean (verdict from it; Python rounding, so 6.5 → 6) |
@@ -1555,7 +1662,7 @@ against an example that is the whole page is a 400 at submit (explicit ids).
 
 | Status | Rule |
 |---|---|
-| 400 | `options.reference` with no `references`; `options.reference` on a `text` / `detector` / OpenCV-answered `cv` criterion; `position: "check"` without `boxes` or with hint `quality`, or on `cv`; an empty list, duplicate ids, a malformed id, more than `CLASSIFIER_REFERENCE_MAX_PER_REQUEST`; `references` on a criterion (that uses them) whose model has `max_images_per_prompt` < 2 or is text-only; `auto` with a text-only job model; unknown ids (all named); an inheritance conflict (both references named); `auto` without `criteria`; an `options.reference.criterion` no listed reference has; more than `CLASSIFIER_REFERENCE_MAX_PER_CRITERION` examples for one criterion; `position: "check"` against a whole-page example |
+| 400 | `options.reference` with no `references`; `options.reference` on a `text` / `detector` / OpenCV-answered `cv` criterion; `position: "check"` without `boxes` or with hint `quality`, or on `cv`; an empty list, duplicate ids, a malformed id, more than `CLASSIFIER_REFERENCE_MAX_PER_REQUEST`; `references` on a criterion (that uses them) whose model has `max_images_per_prompt` < 2 or is text-only; `auto` with a text-only job model; unknown ids (all named); an inheritance conflict (both references named — a differing `key` included); `auto` without `criteria`; an `options.reference.criterion` no listed reference has (an unmatched `key` or name is not refused — [matching order](#how-a-criterion-finds-its-examples--the-matching-order)); more than `CLASSIFIER_REFERENCE_MAX_PER_CRITERION` examples for one criterion; `position: "check"` against a whole-page example |
 | 409 | A listed reference is not `ready` (`pending` or `failed`) |
 
 ### Retention
@@ -1764,7 +1871,7 @@ Inside `job.result`, `schema_version: 3` — here for a two-page invoice plus a
     },
     "per_criterion_scores": {
       "Net 30": {
-        "status": "ok", "type": "text", "method": "text", "scored": true,
+        "status": "ok", "type": "text", "key": null, "method": "text", "scored": true,
         "score": 10, "verdict": "PASS", "confidence": 100,
         "reason": "sum over 2 document(s): Found 2x via contains match.",
         "detail": {"metric": "count", "value": 2, "found": true, "count": 2, "…": "…",
@@ -1832,8 +1939,8 @@ Inside `job.result`, `schema_version: 3` — here for a two-page invoice plus a
 | `page_geometry` | One entry per item, each with its `item`; `page` equals `item` (the global index the layers are drawn on). An item with no page image (.txt / .docx) has `width` / `height` / `working_scale` / `pdf_points` `null`; `pdf_points` is also `null` for an image or an SVG page |
 | `detector` | What the open-vocabulary detector did for the whole job (was `document_info.detector`) |
 | `artifacts` | The job's files — each [labelled](#file-labels) with `kind`, `format`, `item`, `document`, `criteria`, exactly as the manifest endpoint labels them — and, under `items`, each item's combined layer URLs (items with a page image only) |
-| `references` | `null` when the request listed none. Otherwise `{mode: explicit \| auto, requested, pool (auto: the ids fixed at submit; else null), pool_truncated, resolved (the ids used — auto: those some item's selection kept), inherited, criteria: {name: {matched, use, combine, position, examples: [{reference_id, criterion, polarity, expected}]}}, selection: [{item, status: ok \| failed \| skipped, matches: [{id, confidence, reason}], dropped, error, reason}], calls (guided scoring calls), selection_calls}`. Under `auto`, `criteria[*].examples` is empty — each item's picks are in `selection` and each unit's `detail.reference` |
-| `request` | `{"criteria": [...], "model": "<id>"}` — `model` is the job's model, resolved (the request's `model`, else the registry default); the criteria exactly as validated (`depends_on`, `weight`, every option as sent; inherited ones when `criteria` was omitted). What `POST /references` `from_job` rebuilds a job's criteria from |
+| `references` | `null` when the request listed none. Otherwise `{mode: explicit \| auto, requested, pool (auto: the ids fixed at submit; else null), pool_truncated, resolved (the ids used — auto: those some item's selection kept), inherited, criteria: {name: {matched, matched_by: criterion \| key \| name, use, combine, position, examples: [{reference_id, criterion, polarity, expected}]}}, selection: [{item, status: ok \| failed \| skipped, matches: [{id, confidence, reason}], dropped, error, reason}], calls (guided scoring calls), selection_calls}`. Under `auto`, `criteria[*].examples` is empty — each item's picks are in `selection` and each unit's `detail.reference`. `matched_by` is the [matching order](#how-a-criterion-finds-its-examples--the-matching-order) rule that applied and `matched` its value (a reference criterion's name, or the key) |
+| `request` | `{"criteria": [...], "model": "<id>"}` — `model` is the job's model, resolved (the request's `model`, else the registry default); the criteria exactly as validated (`key`, null when unset; `depends_on`, `weight`, every option as sent; inherited ones when `criteria` was omitted). What `POST /references` `from_job` rebuilds a job's criteria from |
 | `usage` | What the job's vision-model requests cost — the `totals` block of [`GET /jobs/{job_id}/usage`](#get-jobsjob_idusage): `calls` (every HTTP request, parse retries included), `errors`, `seconds`, `prompt_tokens` / `cached_tokens` / `completion_tokens` / `reasoning_tokens` / `total_tokens` (`null` when no call reported one), `models`, `first_call_at` / `last_call_at`, and `usage_url` for the per-call rows. `calls: 0` when nothing asked the model (`text` / `cv` criteria only). Added by the queue after the runner returns, so a `reference` job's result carries it too. See [§ Model usage](#model-usage) |
 
 **Every criterion has the same keys**, whatever its type or status. The keys
@@ -1843,6 +1950,7 @@ that existed before describe the AGGREGATED answer:
 |---|---|
 | `status` | `ok` \| `error` \| `skipped` — `ok` when at least one unit answered, `error` when none did and one errored, `skipped` when every unit was skipped |
 | `type` | The criterion's `type` |
+| `key` | The criterion's `key` as sent (stripped), `null` when unset — the reference-matching label ([§ matching order](#how-a-criterion-finds-its-examples--the-matching-order)), echoed so dynamic names can be mapped back. The entry itself stays keyed by `name` |
 | `method` | The path that actually answered — for a `cv` criterion with no OpenCV detector, its fallback's (`detector` / `llm`); `null` when skipped by a dependency |
 | `scored` | The criterion's `score` flag |
 | `score` / `verdict` / `confidence` | The judgement; `null` when not scored (`score: false`, skipped, error) |
@@ -2544,7 +2652,8 @@ curl http://localhost:4001/v1/classifier/criterion-types -H "Authorization: Bear
 
 ```json
 {
-  "shared_fields": {"name": "…", "type": "…", "weight": "…", "depends_on": "…", "score": "…"},
+  "shared_fields": {"name": "…", "key": "…", "type": "…", "weight": "…", "depends_on": "…",
+                    "score": "…"},
   "types": {
     "llm": {
       "options_schema": {"type": "object", "additionalProperties": false,
@@ -2627,9 +2736,14 @@ has the whole table).
 
 The top-level `reference` block is `options.reference`
 ([§ References](#references)): its `options_schema`, `defaults`, `applies_to`,
+`match` (the [matching order](#how-a-criterion-finds-its-examples--the-matching-order)
+in one sentence: `options.reference.criterion`, else `key`, else `name`, and
+a keyed criterion never falls back to its name),
 `caps` (`max_per_request`, `max_per_criterion`, `images_per_llm_prompt`) and
 the `position` knobs (`min_iou`, `max_offset`, `cap`). `llm` and `cv`
 `options_schema` list `reference`; `text` and `detector` do not.
+`shared_fields.key` describes the criterion's `key`; it is new in this build,
+so its presence is how a caller tells the build matches by key.
 
 ---
 
@@ -2885,8 +2999,9 @@ Summaries, newest first: `{"references": [...], "total", "limit", "offset"}`.
 Each summary is `reference_id`, `status`, `title`, `description`,
 `description_source` (`caller` | `model` | null), `tags`, `job_id`, `source`
 (`{kind: document | from_job, job_id, item}`), `error`, `created_at`,
-`updated_at`, and `criteria` — `[{name, type, guides_llm, usable, verdict,
-score, region_source}]` — never the full record.
+`updated_at`, and `criteria` — `[{name, key, type, guides_llm, usable,
+verdict, score, region_source}]` (`key` null when unset) — never the full
+record.
 
 | Param | Effect |
 |---|---|
@@ -2898,7 +3013,8 @@ score, region_source}]` — never the full record.
 
 ### `GET /references/{reference_id}`
 
-The summary plus `record` — the frozen per-criterion record (`input`, `slug`,
+The summary plus `record` — the frozen per-criterion record (`input` — the
+criterion as validated, its `key` included; `slug`,
 `guides_llm`, `expected` `{score, verdict, reason, source}`, `observed`,
 `regions` in page pixels, `region_source`, `composite`, `usable`), the page
 (`kind`, `filename`, `page`, `geometry`, `working`), `source`, the creation
@@ -2920,13 +3036,34 @@ is not there (every file is written when the reference becomes ready).
 
 ### `PATCH /references/{reference_id}`
 
-`{"title"?, "description"?, "tags"?}` — the only editable fields; an explicit
-`null` clears a title or description (a set description becomes
-`description_source: "caller"`). Returns the full reference. **400** for an
-empty body or any other key ("only title, description and tags are editable;
-a new answer key is a new reference"); **404** for an unknown id. Through
-LiteLLM this needs `PATCH` in the `/v1/classifier` pass-through's `methods`
-(`ai/litellm/litellm_config.yaml`).
+`{"title"?, "description"?, "tags"?, "criteria_keys"?}` — the only editable
+fields; an explicit `null` clears a title or description (a set description
+becomes `description_source: "caller"`). Returns the full reference.
+
+`criteria_keys` is `{criterion name: key | null}`: it sets (stripped, 1–200
+characters) or clears (`null`) each named criterion's `key` — the label keyed
+`/assess` criteria find it by
+([§ matching order](#how-a-criterion-finds-its-examples--the-matching-order)).
+It is the one change a ready reference's record takes, because a key changes
+how the reference is found, not what it teaches: only `record.criteria[name].input.key`
+moves (and `record.json` with it); the answers, regions, composites and page
+stay byte-identical. Jobs already queued keep the examples their submit
+resolved.
+
+```json
+{"criteria_keys": {"is this square": "shape", "has a house": null}}
+```
+
+**400** for an empty body, any other key ("only title, description, tags and
+criteria_keys are editable; a new answer key is a new reference"), an empty
+or `null` `criteria_keys`, a blank or over-long key, a name that is not one of
+the reference's criteria (the known ones listed), or keys that would no longer
+be unique within the reference (case-insensitive — the two criteria named;
+swapping two keys in one patch is fine). **409** for `criteria_keys` on a
+reference that is not `ready` (a pending one has no criteria yet), or one
+whose stored criterion no longer validates on this container. **404** for an
+unknown id. Through LiteLLM this needs `PATCH` in the `/v1/classifier`
+pass-through's `methods` (`ai/litellm/litellm_config.yaml`).
 
 ---
 

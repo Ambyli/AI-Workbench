@@ -13,18 +13,22 @@
         └── title, description, tags
 
     PATCH /references/{id}
-      ReferencePatch — title / description / tags; nothing else is editable.
+      ReferencePatch — title / description / tags, and criteria_keys (each
+      criterion's matching key); the content is not editable.
 
 Everything checkable without the store or the bytes is checked HERE, so it is
 a 400 naming the field: one source, not two; ``page`` only with a document;
 ``criteria`` required unless ``from_job`` supplies them; the cross-criterion
 rules (``api.schemas.check_criteria_rules`` — the same function /assess
-runs); a breakdown verdict that disagrees with its score
+runs) and criterion keys unique within the reference
+(``check_unique_keys``, which /assess does not run: there keys may repeat);
+a breakdown verdict that disagrees with its score
 (``utils.verdict_from_score``); a breakdown for a ``score: false`` criterion;
 breakdown / regions keys that name no criterion; a malformed box or polygon;
-grid coordinates outside 0–1000. What needs the bytes (the page exists, a
-pixel region lies inside it) or the store (``from_job``'s job) is checked by
-``api.references`` before anything is queued.
+grid coordinates outside 0–1000; a blank ``criteria_keys`` value. What needs
+the bytes (the page exists, a pixel region lies inside it) or the store
+(``from_job``'s job, PATCH's record) is checked by ``api.references`` before
+anything is queued or written.
 
 Process flow position: imported by ``api.references`` only.
 """
@@ -32,12 +36,19 @@ Process flow position: imported by ``api.references`` only.
 from __future__ import annotations
 
 import re
-from typing import Any, Literal, Optional
+from typing import Annotated, Any, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from api.criterion_options import check_model_id
-from api.schemas import CriterionInput, DocumentInput, check_criteria_rules, check_model_rules
+from api.criterion_options import NAME_MAX_CHARS, check_model_id
+from api.schemas import (
+    CriterionInput,
+    DocumentInput,
+    check_criteria_rules,
+    check_model_rules,
+    check_unique_keys,
+    clean_key,
+)
 from config import (
     LLM_BBOX_GRID,
     REFERENCE_DESCRIPTION_MAX_CHARS,
@@ -237,6 +248,7 @@ class ReferenceRequest(_Meta):
                 raise ValueError(f"from_job {self.from_job!r} is not a job id (12 hex)")
         if self.criteria is not None:
             check_criteria_rules(self.criteria)
+            check_unique_keys(self.criteria)
             guided = [c.name for c in self.criteria if c.reference_options() is not None]
             if guided:
                 raise ValueError(
@@ -278,12 +290,49 @@ class ReferenceRequest(_Meta):
 
 
 class ReferencePatch(_Meta):
-    """PATCH /references/{id}: the metadata only. An explicit null clears a
-    title or description; the content (criteria, answers, regions, page) is
-    immutable — a new answer key is a new reference."""
+    """PATCH /references/{id}: the metadata, and the criteria's keys.
+
+    An explicit null clears a title or description. ``criteria_keys`` maps a
+    criterion name to its new key (null clears it): a key changes how the
+    reference is FOUND, not what it teaches, so it sits with the lookup
+    metadata — and a reference saved before keys can be keyed without being
+    re-created. Everything else (the criteria themselves, answers, regions,
+    page) is immutable — a new answer key is a new reference. Here only the
+    key grammar is checked (``api.schemas.clean_key`` and the length cap);
+    that each name is a criterion, that the reference is ready and that its
+    keys stay unique need the record — ``api.references.patch_reference``.
+    """
+
+    criteria_keys: Optional[
+        dict[str, Optional[Annotated[str, Field(max_length=NAME_MAX_CHARS)]]]
+    ] = Field(
+        default=None,
+        description="{criterion name: key | null} — set (or, with null, clear) each "
+                    "named criterion's reference-matching key. Ready references only; "
+                    "keys stay unique within the reference.",
+    )
+
+    @field_validator("criteria_keys", mode="before")
+    @classmethod
+    def _criteria_keys(cls, value: Any) -> Any:
+        if value is None:
+            raise ValueError(
+                "criteria_keys is an object {criterion name: key | null}; null clears "
+                "one criterion's key, not the map"
+            )
+        if isinstance(value, dict):
+            if not value:
+                raise ValueError("criteria_keys is empty; name at least one criterion")
+            return {
+                name: clean_key(key, f"the key for {name!r}", "null to clear it")
+                for name, key in value.items()
+            }
+        return value
 
     @model_validator(mode="after")
     def _something(self) -> "ReferencePatch":
         if not self.model_fields_set:
-            raise ValueError("send at least one of 'title', 'description', 'tags'")
+            raise ValueError(
+                "send at least one of 'title', 'description', 'tags', 'criteria_keys'"
+            )
         return self

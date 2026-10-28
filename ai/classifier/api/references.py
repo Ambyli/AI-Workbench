@@ -5,7 +5,8 @@
     GET    /references/{id}              the summary, the full record, the file URLs
     GET    /references/{id}/files/{name} page.jpg | working.jpg | c.<slug>.jpg |
                                          regions.json | record.json
-    PATCH  /references/{id}              title / description / tags — nothing else
+    PATCH  /references/{id}              title / description / tags, and criteria_keys
+                                         (a ready reference's matching keys) — nothing else
     DELETE /references/{id}              204; 409 while a queued or running job uses it
                                          (``?force=true`` deletes anyway)
 
@@ -28,8 +29,9 @@ POST takes the same two encodings /assess does, parsed into ONE model
 Then, before anything is queued — every one of these is an error on THIS
 request, never a creation job that fails a minute later:
 
-  1. the model (``ReferenceRequest``): shape, criteria rules, breakdown
-     verdicts, region shapes and grid ranges — 400;
+  1. the model (``ReferenceRequest``): shape, criteria rules, keys unique
+     within the reference, breakdown verdicts, region shapes and grid
+     ranges — 400;
   2. CLASSIFIER_REFERENCE_MAX_COUNT references already exist — 409;
   3. the source:
        ``document``  its bytes resolved like /assess (base64, inline text, an
@@ -50,9 +52,13 @@ request, never a creation job that fails a minute later:
                      that block — are rebuilt from each criterion's
                      ``options_used``, with a warning on the reference (no
                      ``depends_on``; ``weight`` only where the breakdown kept
-                     it). Each criterion whose type, ``score`` and resolved
+                     it). Inherited criteria keep their ``key``s, and two
+                     sharing one is a 400 (send ``criteria`` explicitly).
+                     Each criterion whose type, ``score`` and resolved
                      options match the job's takes the job's answer on that
-                     item and its ACCEPTED regions there as supplied;
+                     item and its ACCEPTED regions there as supplied (the key
+                     is not compared: it changes how a reference is found,
+                     not the question);
   4. every breakdown / regions key names a criterion; every pixel region lies
      inside the page (``grid`` regions are converted to pixels here) — 400;
   5. register the creation job ("staging", metadata type "reference"), insert
@@ -69,6 +75,7 @@ by ``main``; hands work to ``jobs.queue``.
 from __future__ import annotations
 
 import base64
+import copy
 import io
 import json
 from dataclasses import dataclass, field
@@ -98,6 +105,7 @@ from api.schemas import (
     CriterionInput,
     check_criteria_rules,
     check_model_rules,
+    check_unique_keys,
     validation_message,
 )
 # A module, not names: SVG_FETCH_IMAGES is read at call time (see api.assess).
@@ -113,7 +121,14 @@ from jobs.queue import jobs_registry, queue
 from logger import logger
 from metrics import jobs_total
 from middleware import request_id_var
-from references.model import FILE_NAME_RE, STATUSES, file_url, is_reference_id, new_reference_id
+from references.model import (
+    FILE_NAME_RE,
+    RECORD_FILE,
+    STATUSES,
+    file_url,
+    is_reference_id,
+    new_reference_id,
+)
 from references.store import UNSET, reference_files, reference_registry, refresh_gauges
 from regions.artifacts import base_image_name
 from regions.store import store as artifact_store
@@ -363,7 +378,8 @@ def _same_question(a: CriterionInput, b: CriterionInput) -> bool:
     """Whether a job's answer to ``b`` answers ``a`` — same type, same
     ``score``, same resolved options. Weight and depends_on change how an
     answer counts, not what it is; ``options.model`` changes who answered,
-    not the question (``without_model``)."""
+    not the question (``without_model``); a ``key`` changes how a reference
+    is found, not the question, so it is not compared either."""
     return (
         a.type == b.type and a.score == b.score
         and without_model(a.resolved_options()) == without_model(b.resolved_options())
@@ -473,6 +489,16 @@ async def _resolve_from_job(model: ReferenceRequest) -> _Source:
             check_criteria_rules(criteria)
         except ValueError as exc:
             raise _bad(f"Invalid reference: the job's criteria: {exc}")
+        # An /assess may repeat a key; a reference may not. The job's keys
+        # ride in its result.request.criteria, so a keyed job's reference
+        # inherits them — unless two collide.
+        try:
+            check_unique_keys(criteria)
+        except ValueError as exc:
+            raise _bad(
+                f"Invalid reference: the job's criteria: {exc} — send `criteria` "
+                "explicitly to choose the keys"
+            )
 
     per = (result.get("assessment") or {}).get("per_criterion_scores") or {}
     region_entries = regions_doc.get("criteria") or {}
@@ -708,10 +734,56 @@ async def get_reference_file(reference_id: str, name: str):
     return Response(content=raw, media_type=content_type_for(name))
 
 
+def _rekeyed(ref, criteria_keys: dict[str, Optional[str]]) -> dict[str, Any]:
+    """A copy of ``ref.record`` with each named criterion's ``input.key`` set
+    (None clears it) — and nothing else touched: answers, regions, slugs,
+    composites and the page are the record's own, byte for byte.
+
+    Raises:
+        HTTPException: 409 the reference is not ready (a pending one has no
+            criteria yet, a failed one never will) or a criterion no longer
+            validates on this container; 400 a name that is not one of its
+            criteria, or keys that would no longer be unique.
+    """
+    if ref.status != "ready" or not isinstance(ref.record, dict):
+        raise HTTPException(
+            status_code=409,
+            detail=f"reference {ref.id!r} is {ref.status}; criteria_keys needs a ready "
+                   "reference (its criteria are fixed when it is ready)",
+        )
+    record = copy.deepcopy(ref.record)
+    entries = record.get("criteria") or {}
+    unknown = sorted(name for name in criteria_keys if name not in entries)
+    if unknown:
+        raise _bad(
+            f"Invalid patch: criteria_keys names {unknown}, which are not criteria of "
+            f"reference {ref.id!r} (known: {sorted(entries)})"
+        )
+    for name, key in criteria_keys.items():
+        entries[name]["input"] = {**(entries[name].get("input") or {}), "key": key}
+    criteria: list[CriterionInput] = []
+    for name, entry in entries.items():
+        try:
+            criteria.append(CriterionInput.model_validate(entry.get("input") or {}))
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=f"reference {ref.id!r}'s criterion {name!r} does not validate on "
+                       f"this container ({validation_message(exc)}); its keys cannot be "
+                       "changed — save a new reference",
+            )
+    try:
+        check_unique_keys(criteria)
+    except ValueError as exc:
+        raise _bad(f"Invalid patch: criteria_keys: {exc}")
+    return record
+
+
 @router.patch("/references/{reference_id}")
 async def patch_reference(reference_id: str, request: Request):
-    """Edit the title, description or tags. The content is immutable."""
-    await _get_or_404(reference_id)
+    """Edit the title, description or tags, or set / clear a criterion's
+    ``key`` (``criteria_keys``). The rest of the content is immutable."""
+    ref = await _get_or_404(reference_id)
     try:
         body = await request.json()
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
@@ -724,19 +796,28 @@ async def patch_reference(reference_id: str, request: Request):
         message = validation_message(exc)
         if "Extra inputs" in message:
             message += (
-                " — only title, description and tags are editable; a new answer key "
-                "is a new reference"
+                " — only title, description, tags and criteria_keys are editable; a new "
+                "answer key is a new reference"
             )
         raise _bad(f"Invalid patch: {message}")
     fields = patch.model_fields_set
+    record = (
+        _rekeyed(ref, patch.criteria_keys or {}) if "criteria_keys" in fields else UNSET
+    )
     ref = await reference_registry.update_meta(
         reference_id,
         title=patch.title if "title" in fields else UNSET,
         description=patch.description if "description" in fields else UNSET,
         tags=patch.tags if "tags" in fields else UNSET,
+        record=record,
     )
     if ref is None:  # deleted between the two calls
         raise HTTPException(status_code=404, detail=f"no reference {reference_id!r}")
+    if record is not UNSET:
+        # record.json is the record's copy on disk (the files route serves
+        # it), so it follows the row.
+        reference_files.write_json(ref.id, RECORD_FILE, ref.record)
+        logger.info("references: %s criteria_keys %s", ref.id, patch.criteria_keys)
     return _full(ref)
 
 

@@ -240,11 +240,15 @@ class ReferenceRegistry:
         title: Any = UNSET,
         description: Any = UNSET,
         tags: Any = UNSET,
+        record: Any = UNSET,
     ) -> Optional[Reference]:
-        """PATCH: title / description / tags only — the content is immutable.
-        Returns the updated row, or None when the id is unknown. Setting a
-        description marks it ``description_source: "caller"`` (clearing it,
-        None)."""
+        """PATCH: title / description / tags, and ``record`` — the whole
+        record, which PATCH ``criteria_keys`` rewrites with only its
+        criteria's keys changed (``api.references`` builds it; the content
+        stays immutable). Returns the updated row, or None when the id is
+        unknown. Setting a description marks it ``description_source:
+        "caller"`` (clearing it, None). ``record`` is written as ``finish``
+        writes it — ``json.dumps`` into the JSON column, criteria order kept."""
         sets: list[str] = []
         args: list[Any] = []
 
@@ -259,6 +263,8 @@ class ReferenceRegistry:
             bind("description_source", "caller" if description is not None else None)
         if tags is not UNSET:
             bind("tags", json.dumps(list(tags or [])), "::jsonb")
+        if record is not UNSET:
+            bind("record", json.dumps(record), "::json")
         if sets:
             bind("updated_at", _now())
             args.append(reference_id)

@@ -19,10 +19,14 @@ caller and a multipart caller can never be treated differently:
 
 A criterion's top level is only what every type shares — ``name``, ``type``,
 ``weight``, ``depends_on``, ``score``; everything type-specific is in
-``options``, validated per type by ``api.criterion_options``. The
+``options``, validated per type by ``api.criterion_options``. The optional
+``key`` is a caller's label used ONLY to match reference examples
+(``references.resolve``): never shown to the model, never a file name, and
+results, ``depends_on`` and prompts stay on ``name``. The
 cross-criterion rules (unique names, dependencies that exist and are scored,
 no cycles, ``score: false`` only where there is geometry to return) are
-checked here, on the request, so every one of them is a 400 at submit.
+checked here, on the request, so every one of them is a 400 at submit. Keys
+may repeat on /assess; ``check_unique_keys`` is the reference-only rule.
 
 ``ClassifierMetadata`` is the other half of the shape: not a request body, but
 the per-job blob stored in ``jobs.metadata`` and echoed by GET /jobs.
@@ -114,6 +118,21 @@ def _format_errors(exc: ValidationError, prefix: str = "") -> str:
     return "; ".join(parts)
 
 
+def clean_key(value: Any, where: str = "a key", unset: str = "omit it") -> Any:
+    """A criterion ``key`` stripped, and a blank one refused — the one rule
+    ``CriterionInput.key`` and PATCH /references ``criteria_keys`` share
+    (``where`` / ``unset`` word the message for each). Anything but a string
+    is returned as it came, for pydantic to refuse by type; the length cap is
+    the field's own."""
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            raise ValueError(
+                f"{where} cannot be blank; send 1-{NAME_MAX_CHARS} characters, or {unset}"
+            )
+    return value
+
+
 class CriterionInput(BaseModel):
     """One criterion: shared fields at the top, type-specific ones in options.
 
@@ -128,6 +147,19 @@ class CriterionInput(BaseModel):
         min_length=1,
         max_length=NAME_MAX_CHARS,
         description="The criterion to evaluate; unique within the request.",
+    )
+    key: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=NAME_MAX_CHARS,
+        description=(
+            "Optional label used ONLY to find reference examples: the criterion is "
+            "guided by the reference criteria with the same key (case-insensitive), "
+            "whatever either is named, and never falls back to its name. "
+            "options.reference.criterion wins over it. Never shown to the model; "
+            "results, depends_on and prompts stay on `name`. May repeat in a request; "
+            "unique within one reference."
+        ),
     )
     type: CriterionType = Field(
         default="llm",
@@ -181,6 +213,11 @@ class CriterionInput(BaseModel):
                     )
                 )
         return data
+
+    @field_validator("key", mode="before")
+    @classmethod
+    def _clean_key(cls, value: Any) -> Any:
+        return clean_key(value)
 
     @model_validator(mode="after")
     def _typed_options(self) -> "CriterionInput":
@@ -450,7 +487,8 @@ def check_criteria_rules(criteria: list[CriterionInput]) -> None:
     dependencies that exist, are scored and are acyclic. Raises
     ``ValueError`` (a 400 through the request model that calls it) — shared
     by ``AssessRequest`` and POST /references' request model so the two can
-    never accept different lists.
+    never accept different lists. Keys are not checked here: they may repeat
+    on /assess (``check_unique_keys`` is the reference's own rule).
     """
     by_name: dict[str, CriterionInput] = {}
     for c in criteria:
@@ -494,6 +532,30 @@ def check_criteria_rules(criteria: list[CriterionInput]) -> None:
                 )
             seen.append(nxt)
             current = by_name[nxt]
+
+
+def check_unique_keys(criteria: list[CriterionInput]) -> None:
+    """Keys unique within ONE reference, compared case-folded.
+
+    The reference-only rule beside ``check_criteria_rules``: POST /references
+    (``api.reference_schemas``, and a ``from_job``'s inherited criteria in
+    ``api.references``) and PATCH ``criteria_keys`` run it. Two reference
+    criteria sharing a key would give one candidate two conflicting captions
+    on the same image. On /assess keys may repeat — several criteria guided
+    by one example — so ``AssessRequest`` never calls it. Raises
+    ``ValueError`` naming the key and both criteria.
+    """
+    seen: dict[str, str] = {}
+    for c in criteria:
+        if c.key is None:
+            continue
+        folded = c.key.casefold()
+        if folded in seen:
+            raise ValueError(
+                f"key {c.key!r} is on both {seen[folded]!r} and {c.name!r}; a reference's "
+                "criterion keys must be unique (case-insensitive)"
+            )
+        seen[folded] = c.name
 
 
 def check_model_rules(

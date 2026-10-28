@@ -11,7 +11,11 @@ reference up by id.
         guide(c, item) which examples guide criterion ``c`` on an item (a
                        ``CriterionGuide``), or None for a criterion the model
                        does not answer. Explicit ids: the plan's examples.
-                       ``auto``: that item's SELECTION, filtered per criterion.
+                       ``auto``: that item's SELECTION, filtered per criterion
+                       by the plan's ``matched_by`` / ``matched`` — the
+                       reference criterion with that name, or (``key``) with
+                       that key. A plan without ``matched_by`` (written
+                       before keys) matches by name, as it always did.
         needs_selection(c) / select(ctx)
                        ``references: "auto"``: ONE selection call per item —
                        the candidate page (the one image) and the pool's text
@@ -238,9 +242,12 @@ class JobReferences:
             return CriterionGuide(c.name, self.mode, options, [],
                                   note="options.reference.use is false")
         examples = list(entry.get("examples") or [])
-        note = None if examples else (
-            f"no listed reference has a usable criterion named {entry.get('matched')!r}"
+        matched = entry.get("matched")
+        rule = (
+            f"with key {matched!r}" if entry.get("matched_by", "name") == "key"
+            else f"named {matched!r}"
         )
+        note = None if examples else f"no listed reference has a usable criterion {rule}"
         return CriterionGuide(c.name, self.mode, options, examples, note=note)
 
     # ── auto: the per-item selection ──────────────────────────────────────
@@ -320,7 +327,13 @@ class JobReferences:
     ) -> CriterionGuide:
         """The examples ``item``'s selection gives ``c``: matches that HAVE the
         criterion, at or above CLASSIFIER_REFERENCE_AUTO_MIN_CONFIDENCE, in
-        rank order, at most CLASSIFIER_REFERENCE_MAX_PER_CRITERION."""
+        rank order, at most CLASSIFIER_REFERENCE_MAX_PER_CRITERION.
+
+        "Have the criterion" follows the plan entry's ``matched_by``: ``key``
+        looks the folded ``matched`` up in ``examples_by_key``, anything else
+        in ``examples`` (by folded name). A plan written before keys has
+        neither field: ``name``, and ``options.criterion`` or the name — what
+        it always did."""
         if not options.get("use", True):
             return CriterionGuide(c.name, "auto", options, [],
                                   note="options.reference.use is false")
@@ -333,8 +346,11 @@ class JobReferences:
         if record["status"] == "failed":
             return CriterionGuide(c.name, "auto", options, [],
                                   note=f"the selection call failed: {record['error']}")
-        target = (options.get("criterion") or c.name).casefold().strip()
-        by_ref = self.plan.get("examples") or {}
+        entry = (self.plan.get("criteria") or {}).get(c.name) or {}
+        by = entry.get("matched_by", "name")
+        value = entry.get("matched") or options.get("criterion") or c.name
+        target = value.casefold().strip()
+        by_ref = self.plan.get("examples_by_key" if by == "key" else "examples") or {}
         examples = []
         for match in record["matches"]:
             if match["confidence"] < REFERENCE_AUTO_MIN_CONFIDENCE:
@@ -346,10 +362,10 @@ class JobReferences:
                 "confidence": match["confidence"], "reason": match["reason"]}})
             if len(examples) >= REFERENCE_MAX_PER_CRITERION:
                 break
+        rule = f"with key {value!r}" if by == "key" else repr(value)
         note = None if examples else (
-            f"the selection matched no reference with a usable criterion "
-            f"{options.get('criterion') or c.name!r} at confidence >= "
-            f"{REFERENCE_AUTO_MIN_CONFIDENCE}"
+            f"the selection matched no reference with a usable criterion {rule} at "
+            f"confidence >= {REFERENCE_AUTO_MIN_CONFIDENCE}"
         )
         return CriterionGuide(c.name, "auto", options, examples, note=note)
 
@@ -462,6 +478,8 @@ class JobReferences:
         criteria = {
             name: {
                 "matched": entry.get("matched"),
+                # name | key | criterion — which rule found the examples.
+                "matched_by": entry.get("matched_by", "name"),
                 "use": (entry.get("options") or {}).get("use", True),
                 "combine": (entry.get("options") or {}).get("combine", "any"),
                 "position": (entry.get("options") or {}).get("position", "off"),

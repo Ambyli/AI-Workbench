@@ -30,6 +30,13 @@ The record, once ready::
      "source": {"kind": "document" | "from_job", "job_id", "item"},
      "warnings": [...]}
 
+``input`` is the criterion as validated (``CriterionInput.model_dump``) —
+including its ``key``, the label ``references.resolve`` matches keyed
+criteria by; a record written before keys has none (key-less, matched by
+name). ``input.key`` is the ONE part of a ready record that changes: PATCH
+``criteria_keys`` sets or clears it, since a key changes how the reference is
+found, not what it teaches.
+
 ``expected`` is ``{score, verdict, reason, source: caller | pipeline}`` (None
 for a ``score: false`` criterion, or when nothing answered it); ``observed``
 is what the pipeline itself answered (None when the caller supplied
@@ -123,15 +130,17 @@ class Reference:
     record: Optional[dict[str, Any]] = None
 
     def criteria_summary(self) -> list[dict[str, Any]]:
-        """``[{name, type, expected verdict / score, region_source, guides_llm}]``
-        — what the list endpoint (and, later, the ``auto`` catalogue) shows
-        without the full record."""
+        """``[{name, key, type, expected verdict / score, region_source,
+        guides_llm}]`` — what the list endpoint (and, later, the ``auto``
+        catalogue) shows without the full record. ``key`` is None when unset
+        (and on a record written before keys)."""
         entries = ((self.record or {}).get("criteria") or {})
         out = []
         for name, entry in entries.items():
             expected = entry.get("expected") or {}
             out.append({
                 "name": name,
+                "key": (entry.get("input") or {}).get("key"),
                 "type": (entry.get("input") or {}).get("type"),
                 "guides_llm": bool(entry.get("guides_llm")),
                 "usable": bool(entry.get("usable")),

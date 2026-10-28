@@ -364,6 +364,9 @@ def _entry(
     return {
         "status": o.status,
         "type": c.type,
+        # The caller's reference-matching label, echoed so an application
+        # with generated names can map them back (null when unset).
+        "key": c.key,
         "method": o.method,
         "scored": c.score,
         "score": o.score,

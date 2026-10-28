@@ -18,6 +18,12 @@ What is pinned here:
   * inheritance — criteria omitted means the references' criteria, merged by
     name; name matching is case-insensitive and `options.reference.criterion`
     redirects it;
+  * matching by `key` — the order criterion → key → name: one key guides
+    differently named criteria, a keyed criterion never falls back to its
+    name (unguided, noted — not a 400), a key-less one still matches by
+    name, `options.reference.criterion` beats the key, an inheritance
+    conflict on keys, inherited keys, a reference keyed by PATCH, the `auto`
+    pool and pick by key, and an old `auto` plan without `matched_by`;
   * the images per call — 2 for one example, 3 for a contrastive PASS + FAIL
     call, one example per call when the model takes only two; the box loop
     and an unguided criterion still send one;
@@ -357,6 +363,11 @@ def test_names_match_case_insensitively_and_criterion_redirects(client, model, r
     assert unguided["applied"] is False and "no listed reference" in unguided["note"]
     images = sorted(FakeModel.images(p) for p in model.scoring())
     assert images == [1, 2, 2]
+    block = job["result"]["references"]["criteria"]
+    assert (block["HAS A HOUSE"]["matched_by"], block["HAS A HOUSE"]["matched"]) == (
+        "name", "HAS A HOUSE")
+    assert (block["is a dwelling"]["matched_by"], block["is a dwelling"]["matched"]) == (
+        "criterion", HOUSE)
 
 
 def test_use_false_scores_without_examples(client, model, refs):
@@ -365,6 +376,139 @@ def test_use_false_scores_without_examples(client, model, refs):
     ref = _entry(job)["detail"]["reference"]
     assert ref["applied"] is False and "use is false" in ref["note"]
     assert [FakeModel.images(p) for p in model.scoring()] == [1]
+
+
+# ---------------------------------------------------------------------------
+# Matching by key — the order criterion → key → name
+# ---------------------------------------------------------------------------
+
+SQUARE = "is this square"
+RECTANGLE = "is this rectangle"
+SHAPE_KEY = "shape-key-7f"   # distinctive, so a prompt can be searched for it
+
+
+def _shape(name=SQUARE, key=None, **options) -> dict:
+    out = {"name": name, "type": "llm", "options": {"hint": "presence", **options}}
+    if key is not None:
+        out["key"] = key
+    return out
+
+
+@pytest.fixture(scope="module")
+def keyed(client):
+    """Keyed references (no tags, so no `auto` pool here ever sees them)."""
+    return {
+        "square": _reference(client, criteria=[_shape(key=SHAPE_KEY)], reason="a square tile"),
+        "square_upper": _reference(client, criteria=[_shape(key=SHAPE_KEY.upper())],
+                                   reason="another square tile"),
+        "square_other": _reference(client, criteria=[_shape(key="colour-key-3c")],
+                                   reason="a red square"),
+        "square_unkeyed": _reference(client, criteria=[_shape()], reason="an unkeyed square"),
+    }
+
+
+def test_one_key_guides_differently_named_criteria(client, model, keyed):
+    job = _assess(client, {
+        "criteria": [_shape(RECTANGLE, SHAPE_KEY.upper()), _shape(SQUARE, SHAPE_KEY)],
+        "references": [keyed["square"]],
+    })
+    for name in (RECTANGLE, SQUARE):
+        ref = _entry(job, name)["detail"]["reference"]
+        assert ref["applied"] is True, name
+        assert [(e["reference_id"], e["criterion"]) for e in ref["examples"]] == [
+            (keyed["square"], SQUARE)]
+    # Each entry echoes its own key, as sent.
+    assert _entry(job, RECTANGLE)["key"] == SHAPE_KEY.upper()
+    assert _entry(job, SQUARE)["key"] == SHAPE_KEY
+    block = job["result"]["references"]["criteria"]
+    assert (block[RECTANGLE]["matched_by"], block[RECTANGLE]["matched"]) == (
+        "key", SHAPE_KEY.upper())
+    assert block[SQUARE]["matched_by"] == "key"
+    # The model is told what the example ANSWERED (the reference criterion's
+    # name) and asked its own question; the key is never in a prompt.
+    prompts = model.scoring()
+    assert len(prompts) == 2 and all(FakeModel.images(p) == 2 for p in prompts)
+    asked = set()
+    for prompt in prompts:
+        text = json.dumps(prompt)
+        assert SHAPE_KEY not in text.lower()
+        assert "in this reference 'is this square' was PASS (10)" in FakeModel.texts(prompt)[0]
+        asked.add(FakeModel.texts(prompt)[-1].split("CRITERION: ", 1)[1].split("\n", 1)[0])
+    assert asked == {RECTANGLE, SQUARE}
+
+
+def test_a_keyed_criterion_never_falls_back_to_its_name(client, model, keyed):
+    # The name matches the reference's criterion; the key does not. No 400:
+    # it scores unguided, and the note names the key.
+    job = _assess(client, {
+        "criteria": [_shape(SQUARE, "no-such-key")],
+        "references": [keyed["square"], keyed["square_unkeyed"]],
+    })
+    ref = _entry(job, SQUARE)["detail"]["reference"]
+    assert ref["applied"] is False
+    assert ref["note"] == "no listed reference has a usable criterion with key 'no-such-key'"
+    assert job["result"]["references"]["criteria"][SQUARE]["matched_by"] == "key"
+    assert [FakeModel.images(p) for p in model.scoring()] == [1]
+
+
+def test_a_keyless_criterion_still_matches_by_name(client, model, keyed):
+    # The reference criterion HAS a key; a key-less /assess criterion still
+    # finds it by name, case-insensitively.
+    job = _assess(client, {"criteria": [_shape(SQUARE.upper())],
+                           "references": [keyed["square"]]})
+    ref = _entry(job, SQUARE.upper())["detail"]["reference"]
+    assert ref["applied"] is True and ref["examples"][0]["reference_id"] == keyed["square"]
+    assert _entry(job, SQUARE.upper())["key"] is None
+    block = job["result"]["references"]["criteria"][SQUARE.upper()]
+    assert (block["matched_by"], block["matched"]) == ("name", SQUARE.upper())
+
+
+def test_options_reference_criterion_beats_the_key(client, model, refs, keyed):
+    # The key would match `square`; the explicit criterion name wins.
+    job = _assess(client, {
+        "criteria": [_shape(RECTANGLE, SHAPE_KEY, reference={"criterion": HOUSE})],
+        "references": [keyed["square"], refs["pass"]],
+    })
+    ref = _entry(job, RECTANGLE)["detail"]["reference"]
+    assert [(e["reference_id"], e["criterion"]) for e in ref["examples"]] == [
+        (refs["pass"], HOUSE)]
+    block = job["result"]["references"]["criteria"][RECTANGLE]
+    assert (block["matched_by"], block["matched"]) == ("criterion", HOUSE)
+    # An unmatched explicit criterion is still the one 400.
+    assert "is not a usable criterion" in _refuse(client, {
+        "criteria": [_shape(RECTANGLE, SHAPE_KEY, reference={"criterion": "a chimney"})],
+        "references": [keyed["square"]],
+    })
+
+
+def test_inherited_criteria_keep_their_keys_and_a_key_conflict_is_a_400(
+    client, model, keyed
+):
+    job = _assess(client, {"references": [keyed["square"], keyed["square_upper"]]})
+    # One criterion: the keys differ only in case, so the two agree.
+    (criterion,) = job["result"]["request"]["criteria"]
+    assert (criterion["name"], criterion["key"]) == (SQUARE, SHAPE_KEY)
+    assert _entry(job, SQUARE)["key"] == SHAPE_KEY
+    ref = _entry(job, SQUARE)["detail"]["reference"]
+    assert {e["reference_id"] for e in ref["examples"]} == {
+        keyed["square"], keyed["square_upper"]}
+    assert job["result"]["references"]["criteria"][SQUARE]["matched_by"] == "key"
+
+    for other in ("square_other", "square_unkeyed"):
+        detail = _refuse(client, {"references": [keyed["square"], keyed[other]]})
+        assert keyed["square"] in detail and keyed[other] in detail
+        assert SQUARE in detail and "key" in detail
+
+
+def test_a_reference_keyed_by_patch_guides_by_key(client, model):
+    rid = _reference(client, criteria=[_shape("is it round")], reason="a round table")
+    body = {"criteria": [_shape("is the table circular", "roundness")], "references": [rid]}
+    assert _entry(_assess(client, body), "is the table circular")["detail"]["reference"][
+        "applied"] is False
+    r = client.patch(f"/references/{rid}", json={"criteria_keys": {"is it round": "Roundness"}})
+    assert r.status_code == 200, r.text
+    ref = _entry(_assess(client, body), "is the table circular")["detail"]["reference"]
+    assert ref["applied"] is True and ref["examples"][0]["criterion"] == "is it round"
 
 
 # ---------------------------------------------------------------------------
@@ -823,6 +967,63 @@ def test_auto_tags_all_versus_any(client, model, auto_refs):
                                           "tags_match": "any"}})
     assert set(job["result"]["references"]["pool"]) == {
         auto_refs["pass"], auto_refs["fail"], auto_refs["pos"]}
+
+
+def test_auto_admits_and_picks_by_key(client, model):
+    """The pool admits a reference by key, and never by the name of a keyed
+    criterion; the per-item pick looks the key up (``examples_by_key``)."""
+    by_key = _reference(client, tags=["auto-key"], criteria=[_shape(SQUARE, "auto-shape")],
+                        reason="auto keyed square")
+    by_name = _reference(client, tags=["auto-key"], criteria=[_shape(RECTANGLE)],
+                         reason="auto rectangle, no key")
+    job = _assess(client, {
+        "criteria": [_shape(RECTANGLE, "AUTO-SHAPE")], "references": _auto("auto-key"),
+    })
+    block = job["result"]["references"]
+    assert block["pool"] == [by_key]          # by_name matches only the NAME: not admitted
+    assert (block["criteria"][RECTANGLE]["matched_by"],
+            block["criteria"][RECTANGLE]["matched"]) == ("key", "AUTO-SHAPE")
+    ref = _entry(job, RECTANGLE)["detail"]["reference"]
+    assert ref["applied"] is True and ref["mode"] == "auto"
+    assert [(e["reference_id"], e["criterion"]) for e in ref["examples"]] == [(by_key, SQUARE)]
+    assert by_name not in json.dumps(model.selections())
+
+    # A key that no pool reference carries scores unguided, and says which key.
+    model.calls.clear()
+    job = _assess(client, {
+        "criteria": [_shape(RECTANGLE, "auto-shape"), _shape("is this a kite", "kite-key")],
+        "references": _auto("auto-key"),
+    })
+    ref = _entry(job, "is this a kite")["detail"]["reference"]
+    assert ref["applied"] is False
+    assert "usable criterion with key 'kite-key' at confidence" in ref["note"]
+    assert _entry(job, RECTANGLE)["detail"]["reference"]["applied"] is True
+
+
+def test_an_old_auto_plan_still_guides_by_name(client, model, auto_refs):
+    """A plan queued before keys — no ``matched_by``, no ``examples_by_key`` —
+    picks by name exactly as it always did."""
+    import analysis
+    from api.schemas import AssessRequest
+    from references.resolve import resolve_references
+    from references.store import reference_registry
+
+    request = AssessRequest.model_validate({
+        "document": {"type": "text", "data": "x"},
+        "criteria": [_house()], "references": _auto("auto-a"),
+    })
+    plan = asyncio.run(resolve_references(request, reference_registry)).plan
+    plan.pop("examples_by_key")
+    for entry in plan["criteria"].values():
+        entry.pop("matched_by")
+    assert set(plan["criteria"][HOUSE]) == {"matched", "options"}   # the old shape
+
+    doc = analysis.load_document_bytes(_png(), "p.png", "image/png", keep_source=True)
+    result = asyncio.run(analysis.analyze_document(doc, request.criteria, references_plan=plan))
+    ref = result["assessment"]["per_criterion_scores"][HOUSE]["detail"]["reference"]
+    assert ref["applied"] is True
+    assert {e["reference_id"] for e in ref["examples"]} == {auto_refs["pass"], auto_refs["fail"]}
+    assert result["references"]["criteria"][HOUSE]["matched_by"] == "name"
 
 
 def test_auto_position_check_uses_the_selected_pass_example(client, model, auto_refs):

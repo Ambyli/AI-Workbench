@@ -1,7 +1,8 @@
 """Per-type criterion options: the models, their defaults, and their caps.
 
 A criterion's top level holds only what every type shares — ``name``,
-``type``, ``weight``, ``depends_on``, ``score``. Everything that only means
+``key`` (reference matching only), ``type``, ``weight``, ``depends_on``,
+``score``. Everything that only means
 something to one evaluation path lives in ``options``, validated by the model
 for that path:
 
@@ -236,9 +237,11 @@ class ReferenceOptions(BaseModel):
         default=None,
         min_length=1,
         max_length=NAME_MAX_CHARS,
-        description="Which reference criterion is the example (matched case-insensitively). "
-                    "Defaults to this criterion's own name. Named but in no listed "
-                    "reference: a 400.",
+        description="Which reference criterion is the example, by its NAME (matched "
+                    "case-insensitively). Wins over the criterion's `key`. Omitted: the "
+                    "reference criteria with the criterion's `key`, else its own name — "
+                    "the matching order is criterion → key → name. Named but in no "
+                    "listed reference: a 400.",
     )
     position: Literal["off", "check"] = Field(
         default="off",
@@ -632,6 +635,9 @@ def criterion_types() -> dict[str, Any]:
     return {
         "shared_fields": {
             "name": f"string, 1-{NAME_MAX_CHARS} characters, unique in the request",
+            "key": f"optional string, 1-{NAME_MAX_CHARS} characters (stripped): matches "
+                   "reference examples only (see `reference.match`), never shown to the "
+                   "model; may repeat in a request, unique within one reference",
             "type": "llm | text | cv | detector (default llm)",
             "weight": "number > 0 (default 1)",
             "depends_on": "name of another scored criterion that must PASS first",
@@ -672,6 +678,12 @@ def criterion_types() -> dict[str, Any]:
             "defaults": ReferenceOptions().resolve("<name>"),
             "applies_to": "llm criteria, and cv criteria answered by the llm fallback",
             "requires": "a `references` list on the request",
+            # The one matching order (references.resolve.match_target).
+            "match": "options.reference.criterion (a reference criterion NAME), else the "
+                     "criterion's `key` (the reference criteria with that key — a keyed "
+                     "criterion never falls back to its name), else its own `name`; "
+                     "case-insensitive, usable reference criteria only. The same order for "
+                     "explicit ids, the `auto` pool and each item's `auto` pick",
             "caps": {
                 "max_per_request": REFERENCE_MAX_PER_REQUEST,
                 "max_per_criterion": REFERENCE_MAX_PER_CRITERION,

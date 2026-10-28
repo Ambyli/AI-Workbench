@@ -23,7 +23,7 @@ from api.criterion_options import (
     TextOptions,
     criterion_types,
 )
-from api.schemas import AssessRequest, CriterionInput, validation_message
+from api.schemas import AssessRequest, CriterionInput, check_unique_keys, validation_message
 from config import (
     CRITERION_NAME_MAX_CHARS,
     DETECTOR_MIN_SCORE,
@@ -355,6 +355,61 @@ def test_text_min_count_cap_is_the_config_knob():
         CriterionInput(name="total", type="text", options={"min_count": TEXT_MIN_COUNT_CAP + 1})
 
 
+# ── key: reference matching only ───────────────────────────────────────────
+
+
+def test_key_is_optional_stripped_and_round_trips():
+    assert CriterionInput(name="x").key is None
+    c = CriterionInput.model_validate({"name": "x", "key": "  is this a shape  "})
+    assert c.key == "is this a shape"
+    assert c.model_dump()["key"] == "is this a shape"
+    assert CriterionInput.model_validate(c.model_dump()).key == "is this a shape"
+    # A key is no option: it changes nothing a criterion resolves to.
+    assert c.resolved_options() == CriterionInput(name="x").resolved_options()
+
+
+@pytest.mark.parametrize("key, fragment", [
+    ("", "a key cannot be blank"),
+    ("   ", "a key cannot be blank"),
+    ("k" * (CRITERION_NAME_MAX_CHARS + 1), "at most 200 characters"),
+    (7, "valid string"),
+])
+def test_bad_keys_are_refused_with_the_field_named(key, fragment):
+    message = _error({"name": "x", "key": key})
+    assert "criteria.0.key" in message and fragment in message
+
+
+def test_a_key_at_the_name_cap_is_accepted():
+    assert CriterionInput(name="x", key="k" * CRITERION_NAME_MAX_CHARS).key
+
+
+@pytest.mark.parametrize("criterion", [
+    {"name": "has a roof", "type": "llm"},
+    {"name": "Total", "type": "text"},
+    {"name": "sharpness", "type": "cv"},
+    {"name": "has a house", "type": "cv", "options": {"fallback": "llm"}},
+    {"name": "has bicycle", "type": "detector"},
+])
+def test_a_key_is_accepted_on_every_type(criterion):
+    assert _request({**criterion, "key": "k"}).criteria[0].key == "k"
+
+
+def test_keys_may_repeat_on_assess_but_are_unique_in_a_reference():
+    request = _request(
+        {"name": "is this square", "key": "shape"},
+        {"name": "is this rectangle", "key": "SHAPE"},
+        {"name": "unkeyed"},
+        {"name": "also unkeyed"},
+    )
+    assert [c.key for c in request.criteria] == ["shape", "SHAPE", None, None]
+    with pytest.raises(ValueError) as exc:
+        check_unique_keys(request.criteria)
+    assert str(exc.value).startswith(
+        "key 'SHAPE' is on both 'is this square' and 'is this rectangle'"
+    )
+    check_unique_keys(request.criteria[1:])  # one key, two key-less: fine
+
+
 # ── options.reference ──────────────────────────────────────────────────────
 
 
@@ -414,3 +469,10 @@ def test_criterion_types_has_a_reference_block():
     assert "GET /models" in block["requires_model"]
     assert "reference" in criterion_types()["types"]["llm"]["options_schema"]["properties"]
     assert "reference" not in criterion_types()["types"]["text"]["options_schema"]["properties"]
+    # The matching order, stated where a caller reads the reference options.
+    match = block["match"]
+    assert match.index("options.reference.criterion") < match.index("`key`") < match.index(
+        "`name`")
+    assert "never falls back to its name" in match
+    assert "key" in criterion_types()["shared_fields"]
+    assert "never shown to the model" in criterion_types()["shared_fields"]["key"]

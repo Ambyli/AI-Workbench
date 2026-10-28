@@ -19,8 +19,12 @@ What is pinned here:
   * the description — generated only when none was sent;
   * ``from_job`` — 404 / 409 / 410, the job's answers and accepted regions,
     and the legacy rebuild for a job without ``result.request``;
-  * PATCH, DELETE (409 while a live job uses it, ``?force=true``), the list
-    filters, the files route's name grammar;
+  * criterion keys — unique (case-folded) within a reference, a ``from_job``
+    inheriting the job's keys (and refusing a repeated one unless
+    ``criteria`` is sent), ``key`` in the summary;
+  * PATCH (metadata, and ``criteria_keys``: set, clear, refusals, nothing
+    else in the record touched), DELETE (409 while a live job uses it,
+    ``?force=true``), the list filters, the files route's name grammar;
   * failure — nothing answered → ``failed``; a pending reference whose job is
     gone is reconciled to ``failed``;
   * retention — after the sweeper runs with a TTL of 0 the creation job is
@@ -383,6 +387,11 @@ def test_multipart_is_the_same_request(client, model):
      "exactly one of 'document' or 'from_job'"),
     ({"document": _doc(), "criteria": [_house()],
       "regions": {HOUSE: [{"box": [30, 10, 20, 50]}]}}, "x1 < x2"),
+    ({"document": _doc(), "criteria": [
+        {**_house(), "key": "shape"},
+        {"name": "a roof", "type": "llm", "key": "SHAPE", "options": {"hint": "presence"}}]},
+     "key 'SHAPE' is on both 'has a house' and 'a roof'"),
+    ({"document": _doc(), "criteria": [{**_house(), "key": "  "}]}, "a key cannot be blank"),
 ])
 def test_malformed_input_is_a_400_at_submit(client, model, body, needle):
     r = client.post("/references", json=body)
@@ -498,6 +507,40 @@ def test_from_job_rebuilds_a_legacy_job_with_a_warning(client, model):
     assert house["expected"]["source"] == "pipeline"
 
 
+def _roof(**extra) -> dict:
+    return {"name": "a roof", "type": "llm", "options": {"hint": "presence"}, **extra}
+
+
+def test_from_job_inherits_the_jobs_keys(client, model):
+    job = _assess(client, [{**_house(boxes=True), "key": "home"}])
+    model.calls.clear()
+    ref = _create(client, {"from_job": job["job_id"], "description": "keyed"})
+    assert ref["record"]["criteria"][HOUSE]["input"]["key"] == "home"
+    assert ref["criteria"][0]["key"] == "home"          # the summary shows it
+    # The key is not part of the question: the job's answer was enough.
+    assert ref["record"]["criteria"][HOUSE]["expected"]["source"] == "pipeline"
+    assert model.calls == []
+
+
+def test_from_job_with_a_repeated_key_needs_explicit_criteria(client, model):
+    job = _assess(client, [{**_house(boxes=True), "key": "Shape"}, _roof(key="shape")])
+    r = client.post("/references", json={"from_job": job["job_id"]})
+    assert r.status_code == 400, r.text
+    detail = r.json()["detail"]
+    assert "key 'shape' is on both 'has a house' and 'a roof'" in detail
+    assert "send `criteria` explicitly" in detail
+
+    ref = _create(client, {
+        "from_job": job["job_id"],
+        "criteria": [{**_house(boxes=True), "key": "house"}, _roof(key="roof")],
+        "description": "explicit",
+    })
+    keys = {name: e["input"]["key"] for name, e in ref["record"]["criteria"].items()}
+    assert keys == {HOUSE: "house", "a roof": "roof"}
+    # Different keys from the job's, the same question: its answers still apply.
+    assert ref["record"]["criteria"][HOUSE]["observed"]["job_id"] == job["job_id"]
+
+
 # ---------------------------------------------------------------------------
 # PATCH, DELETE, list, files
 # ---------------------------------------------------------------------------
@@ -525,6 +568,81 @@ def test_patch_edits_metadata_only(client, model):
     assert r.status_code == 400 and "a new answer key is a new reference" in r.json()["detail"]
     assert client.patch(f"/references/{rid}", json={}).status_code == 400
     assert client.patch("/references/r000000000000", json={"title": "x"}).status_code == 404
+
+
+def _without(record: dict, *keys: str) -> str:
+    """``record`` serialised (order kept) with the named keys of every
+    criterion's ``input`` dropped — what must stay byte-identical."""
+    out = json.loads(json.dumps(record))
+    for entry in out["criteria"].values():
+        for key in keys:
+            entry["input"].pop(key, None)
+    return json.dumps(out)
+
+
+def test_patch_criteria_keys_sets_and_clears_keys_and_nothing_else(client, model):
+    ref = _create(client, {
+        "document": _doc(),
+        "criteria": [_house(), _roof()],
+        "breakdown": {HOUSE: {"score": 9, "reason": "a house"}, "a roof": {"score": 2}},
+        "regions": {HOUSE: [{"box": [10, 20, 110, 120]}], "a roof": []},
+        "description": "q", "title": "keyed later",
+    })
+    rid, before = ref["reference_id"], ref["record"]
+    assert [c["key"] for c in ref["criteria"]] == [None, None]
+    composite = client.get(f"/references/{rid}/files/{before['criteria'][HOUSE]['composite']}")
+
+    r = client.patch(f"/references/{rid}", json={"criteria_keys": {HOUSE: " Shape ", "a roof": "roof"}})
+    assert r.status_code == 200, r.text
+    after = r.json()
+    assert {c["name"]: c["key"] for c in after["criteria"]} == {HOUSE: "Shape", "a roof": "roof"}
+    assert after["record"]["criteria"][HOUSE]["input"]["key"] == "Shape"
+    # Only input.key moved: answers, regions, slugs, composites, the page.
+    assert _without(after["record"], "key") == _without(before, "key")
+    assert after["title"] == "keyed later" and after["updated_at"] > ref["updated_at"]
+    # The file copy follows the row; the composite is the same image.
+    stored = client.get(f"/references/{rid}/files/record.json").json()
+    assert stored == after["record"]
+    again = client.get(f"/references/{rid}/files/{before['criteria'][HOUSE]['composite']}")
+    assert again.content == composite.content
+
+    r = client.patch(f"/references/{rid}", json={"criteria_keys": {"a roof": None}})
+    assert r.status_code == 200, r.text
+    cleared = r.json()["record"]
+    assert {c["name"]: c["key"] for c in r.json()["criteria"]} == {HOUSE: "Shape", "a roof": None}
+
+    for body, status, needle in [
+        ({"criteria_keys": {"a chimney": "x"}}, 400, "names ['a chimney'], which are not criteria"),
+        ({"criteria_keys": {"a roof": "SHAPE"}}, 400,
+         "key 'SHAPE' is on both 'has a house' and 'a roof'"),
+        ({"criteria_keys": {"a roof": "   "}}, 400, "the key for 'a roof' cannot be blank"),
+        ({"criteria_keys": {}}, 400, "criteria_keys is empty"),
+        ({"criteria_keys": None}, 400, "criteria_keys is an object"),
+        ({"criteria_keys": {"a roof": "k" * 201}}, 400, "at most 200 characters"),
+    ]:
+        r = client.patch(f"/references/{rid}", json=body)
+        assert r.status_code == status and needle in r.json()["detail"], (body, r.text)
+    # Refused patches wrote nothing.
+    assert client.get(f"/references/{rid}").json()["record"] == cleared
+
+    # Swapping two keys in one patch is fine: uniqueness is of the result.
+    r = client.patch(f"/references/{rid}", json={"criteria_keys": {HOUSE: "roof", "a roof": "Shape"}})
+    assert r.status_code == 200, r.text
+    assert {c["name"]: c["key"] for c in r.json()["criteria"]} == {HOUSE: "roof", "a roof": "Shape"}
+
+
+def test_patch_criteria_keys_needs_a_ready_reference(client):
+    from references.model import new_reference_id
+    from references.store import reference_registry
+
+    rid = new_reference_id()
+    _run(reference_registry.create(rid, source_kind="document", job_id=None))
+    try:
+        r = client.patch(f"/references/{rid}", json={"criteria_keys": {HOUSE: "x"}})
+        assert r.status_code == 409 and "is pending" in r.json()["detail"]
+        assert client.get(f"/references/{rid}").json()["record"] is None
+    finally:
+        _run(reference_registry.delete(rid))
 
 
 def test_delete_refuses_while_a_live_job_uses_it_unless_forced(client, model):
@@ -555,6 +673,7 @@ def test_list_filters_by_status_and_tag(client, model):
     assert [r["reference_id"] for r in listing["references"]] == [tagged["reference_id"]]
     assert listing["total"] == 1
     assert listing["references"][0]["criteria"][0]["name"] == HOUSE
+    assert listing["references"][0]["criteria"][0]["key"] is None
     assert "record" not in listing["references"][0]
 
     ready = client.get("/references", params={"status": "ready", "limit": 200}).json()

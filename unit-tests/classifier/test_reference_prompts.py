@@ -14,8 +14,11 @@
   * the box loop's prompts: ``build_bbox_prompt`` and ``build_verify_prompt``
     without examples are BYTE-FOR-BYTE what they were before the loop could
     be shown any (``BBOX_GOLDEN`` / ``VERIFY_GOLDEN``, captured first); with
-    them, the captions per verdict for a composite and a crop, the guard,
-    the CANDIDATE wording, both system sentences and the content order;
+    them, the captions per verdict for a composite and a crop (a crop is
+    "from another document"), the guard, the CANDIDATE wording, both
+    system sentences, the guided verify's other-documents note and
+    reason-first answer, and the content order (composites in the verify
+    too);
   * ``plan_calls`` — contrastive pairing at three images, one example per
     call at two, the call cap; ``combine`` — any / all / mean;
   * ``box_selection`` / ``box_examples`` — what the loop is shown, on a stub
@@ -282,18 +285,22 @@ def test_box_captions_per_verdict_for_a_composite_and_a_crop():
     assert _box("FAIL").caption() == (
         "REFERENCE EXAMPLE — 'the utility's logo' was FAIL here — the outlined thing is NOT "
         "the utility's logo; do not box it.")
+    # A crop says it is from ANOTHER document and was PASS "there": a reference
+    # is normally a different company's page (the composites keep "here").
     assert _box(crop=True).caption() == (
-        "REFERENCE EXAMPLE — a crop showing 'the utility's logo' (PASS here).")
+        "REFERENCE EXAMPLE (from another document) — a crop showing 'the utility's logo' "
+        "(PASS there).")
     assert _box("MARGINAL", crop=True).caption() == (
-        "REFERENCE EXAMPLE — a crop showing 'the utility's logo' (MARGINAL here, a "
-        "borderline case).")
+        "REFERENCE EXAMPLE (from another document) — a crop showing 'the utility's logo' "
+        "(MARGINAL there, a borderline case).")
     assert _box("FAIL", crop=True).caption() == (
-        "REFERENCE EXAMPLE — a crop of something that is NOT the utility's logo (FAIL here); "
-        "do not box it.")
-    # A crop has no outline drawn on it, so its caption never claims one.
+        "REFERENCE EXAMPLE (from another document) — a crop of something that is NOT the "
+        "utility's logo (FAIL there); do not box it.")
     for verdict in ("PASS", "MARGINAL", "FAIL"):
-        assert "coloured box" not in _box(verdict, crop=True).caption()
-        assert "outlined" not in _box(verdict, crop=True).caption()
+        crop = _box(verdict, crop=True).caption()
+        # A crop has no outline drawn on it, so its caption never claims one.
+        assert "coloured box" not in crop and "outlined" not in crop
+        assert " here" not in crop and "(from another document)" in crop
 
 
 def test_the_guided_ask_shows_examples_then_the_guard_then_the_candidate():
@@ -343,7 +350,8 @@ def test_the_guided_refine_names_the_zoomed_candidate_and_keeps_the_feedback():
     content = _parts(guided)
     assert [p["type"] for p in content] == ["text", "image_url", "text", "image_url", "text"]
     assert content[0]["text"] == (
-        "REFERENCE EXAMPLE — a crop showing 'the amount due' (PASS here).")
+        "REFERENCE EXAMPLE (from another document) — a crop showing 'the amount due' "
+        "(PASS there).")
     text, before = content[-1]["text"], _parts(plain)[-1]["text"]
     assert text.startswith("Locate this feature in the zoomed CANDIDATE image: the amount due")
     assert ("The CANDIDATE image is a zoomed-in crop of a larger document, and the feature "
@@ -369,18 +377,58 @@ def test_the_guided_verify_shows_example_crops_then_the_candidate_crop():
     assert content[5]["image_url"]["url"].endswith("Q0FORA==")
     text, before = content[6]["text"], _parts(plain)[-1]["text"]
     assert text.startswith(f"Is this visible in the CANDIDATE crop: {LOGO}?\n\n")
-    assert VERIFY_REFERENCE_NOTE.format(name=LOGO) in text
-    assert "judge the CANDIDATE crop, not the reference" in text
-    # The 1-10 contract is the unguided one: the same scale and scaffold.
+    # The examples are from OTHER documents: the candidate will look different,
+    # a name in the criterion is the candidate's own, and a difference from the
+    # reference is no reason to score lower.
+    note = VERIFY_REFERENCE_NOTE.format(name=LOGO)
+    assert note == (
+        "The reference image(s) above come from OTHER documents. Each shows an example of "
+        "the kind of thing 'the utility's logo' means; on the CANDIDATE it will usually look "
+        "different (a different company, design or layout), and any name in the criterion "
+        "refers to the CANDIDATE's own document, not to the reference's. Do not score lower "
+        "because the CANDIDATE looks different from a reference: score whether the CANDIDATE "
+        "crop shows the utility's logo. A reference captioned FAIL shows something that does "
+        "NOT count.")
+    assert note in text and "looks like here" not in text
+    # The 1-10 scale is the unguided one; the guided answer writes its reason first.
     scale = before[before.index("Score 1-10:"):before.index("'reason'")]
     assert scale in text
-    assert text.endswith(before[before.index("Return ONLY this JSON object"):])
+    assert ("Write 'reason' first, what you actually see in the CANDIDATE crop, in one "
+            "sentence; then 'score'.") in text
+    guided_scaffold = text[text.index("{"):]
+    plain_scaffold = before[before.index("{"):]
+    assert guided_scaffold == '{\n  "reason": "...",\n  "score": 0\n}'
+    assert list(json.loads(guided_scaffold)) == ["reason", "score"]
+    assert list(json.loads(plain_scaffold)) == ["score", "reason"]      # unguided unchanged
     assert VERIFY_SYSTEM_SENTENCE == (
-        "Reference crops come first; judge ONLY the crop marked CANDIDATE.")
+        "Reference examples from other documents come first; judge ONLY the crop marked "
+        "CANDIDATE.")
     assert guided["messages"][0]["content"] == (
         f"{plain['messages'][0]['content']} {VERIFY_SYSTEM_SENTENCE}")
     for key in ("model", "max_tokens", "response_format", "chat_template_kwargs"):
         assert guided[key] == plain[key]
+
+
+def test_the_guided_verify_can_show_composites():
+    """``verify_examples`` (the experiment's ``--verify-images composite``):
+    the composites with their own captions, in the same order — examples,
+    the CANDIDATE heading, the candidate crop, the question."""
+    guided = build_verify_prompt(
+        "Q0FORA==", LOGO, references=[_box(), _box("FAIL", image="RkFJTA==")],
+    )
+    content = _parts(guided)
+    assert [p["type"] for p in content] == [
+        "text", "image_url", "text", "image_url", "text", "image_url", "text"]
+    assert content[0]["text"] == (
+        "REFERENCE EXAMPLE — 'the utility's logo' was PASS here; the coloured box outlines it.")
+    assert content[1]["image_url"]["url"].endswith("UEFTUw==")
+    assert content[2]["text"] == _box("FAIL").caption()
+    assert content[3]["image_url"]["url"].endswith("RkFJTA==")
+    assert content[4]["text"] == f"{VERIFY_CANDIDATE_HEADING}:"
+    assert content[5]["image_url"]["url"].endswith("Q0FORA==")
+    assert content[6]["text"].startswith(f"Is this visible in the CANDIDATE crop: {LOGO}?")
+    assert VERIFY_REFERENCE_NOTE.format(name=LOGO) in content[6]["text"]
+    assert guided["messages"][0]["content"].endswith(VERIFY_SYSTEM_SENTENCE)
 
 
 # ── plan_calls / combine ───────────────────────────────────────────────────

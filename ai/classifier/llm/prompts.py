@@ -22,7 +22,8 @@ other:
                             (``BoxExample``) showing what to box.
     build_verify_prompt() — the enforcement loop's check: the CROP alone, "is
                             <criterion> visible in this?", 1-10 — or, behind
-                            its knob, after example crops of the feature.
+                            its knob, after examples from other documents
+                            (reason written before score).
     BoxExample            — one example as the loop's prompts need it: a
                             composite or a region crop, with its verdict.
     build_describe_prompt() — a reference example's catalogue line: ONE page
@@ -76,7 +77,8 @@ example and the candidate). A guided scoring call shows composites
 (``analysis.llm_eval`` plans the calls to fit); a guided box-loop call shows
 at most one PASS-side and one FAIL example (``analysis.references.
 box_selection``): the ask composites (region crops under the position check),
-the refine and verify region crops.
+the refine and verify region crops (the verify composites when its caller
+passes ``verify_examples`` — ``bin/grounding_experiment.py`` only).
 ``build_llm_prompt(..., references=None)``, ``build_bbox_prompt`` and
 ``build_verify_prompt`` without references are byte-for-byte the plain
 prompts — no examples, no extra system sentence — which tests pin by hash.
@@ -630,37 +632,50 @@ def build_verify_prompt(
     would reintroduce exactly the context the check is trying to remove.
 
     ``references`` (the ``CLASSIFIER_REFERENCE_BOX_VERIFY`` knob,
-    ``llm.boxes``) are region crops of OTHER pages — the reference's feature
-    cut from its own original — shown first, each captioned, then the
+    ``llm.boxes``) are examples from OTHER documents — region crops (the
+    reference's feature cut from its own original), or the composites when a
+    caller passes ``verify_examples`` (``bin/grounding_experiment.py
+    --verify-images composite``) — shown first, each captioned, then the
     CANDIDATE heading, the candidate crop, and the question asked of "the
     CANDIDATE crop" with ``VERIFY_REFERENCE_NOTE``; ``VERIFY_SYSTEM_SENTENCE``
-    joins the system prompt. An example crop is not page context: it says
-    nothing about where the candidate crop came from, only what the feature
-    looks like, which is the blind spot the verify has (shown only the
-    company heading and asked about a logo, it can say yes). The 1-10
-    contract is unchanged. None or [] is byte-for-byte the prompt without
-    them (pinned by hash).
+    joins the system prompt. An example is not page context: it says nothing
+    about where the candidate crop came from, only what KIND of thing the
+    criterion means, which is the blind spot the verify has (shown only the
+    company heading and asked about a logo, it can say yes).
+
+    The wording says the examples come from other documents because a
+    reference is normally a different company's: the first wording ("what X
+    looks like here") made the model score a correct logo 1 on every attempt
+    because it did not look like the reference's logo. A guided verify also
+    writes its ``reason`` BEFORE its ``score`` (the scaffold's key order), so
+    it says what it sees before it judges; ``_score_of`` reads the key
+    whatever its position, and the 1-10 scale is unchanged. None or [] is
+    byte-for-byte the prompt without them (pinned by hash).
 
     Args:
         crop_b64:   Base64 JPEG of the padded crop, taken from the ORIGINAL
                     page image (not the ≤1000-px working copy — the crop of a
                     downscaled page is too soft to judge).
         name:       The criterion being verified.
-        references: Example region crops to show before the candidate crop.
+        references: Examples to show before the candidate crop.
 
     Returns:
         A dict ready to POST to the vLLM /v1/chat/completions endpoint.
     """
-    scaffold = json.dumps({"score": 0, "reason": "..."}, indent=2)
     if references:
+        scaffold = json.dumps({"reason": "...", "score": 0}, indent=2)
         opening = (
             f"Is this visible in the CANDIDATE crop: {name}?\n\n"
             f"{VERIFY_REFERENCE_NOTE.format(name=name)}\n\n"
             "The CANDIDATE crop is a close crop of a larger photo or document. Judge "
             "only what you can see in it.\n\n"
         )
-        seen = "'reason' says what you actually see in the CANDIDATE crop, in one sentence."
+        seen = (
+            "Write 'reason' first, what you actually see in the CANDIDATE crop, in one "
+            "sentence; then 'score'."
+        )
     else:
+        scaffold = json.dumps({"score": 0, "reason": "..."}, indent=2)
         opening = (
             f"Is this visible in the attached image: {name}?\n\n"
             "The image is a close crop of a larger photo or document. Judge only "

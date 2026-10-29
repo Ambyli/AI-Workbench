@@ -25,7 +25,8 @@ What is asserted here, in the order the loop does it:
     the candidate, each ``guide_*`` flag (default: its knob) turns its step
     off alone, no examples or the knobs off send exactly today's prompts,
     the labels are unchanged, the guided-call log (a failed call included),
-    and ``example_crop``'s working-size cap.
+    ``verify_examples`` replacing what verify alone is shown (None: the
+    crops, as before), and ``example_crop``'s working-size cap.
 
 Run with::
 
@@ -651,6 +652,39 @@ def test_the_guided_call_log_records_a_failed_call(monkeypatch, page, working):
     # The retry's feedback is today's sentence, inside the guided ask.
     assert "covered 100% of the image" in model.last_text(1)
     assert set(loc.as_dict()) == {"attempts", "accepted_attempt", "calls"}
+
+
+def test_verify_examples_replace_what_verify_alone_is_shown(monkeypatch, page, working):
+    """``verify_examples`` (the experiment's ``--verify-images composite``)
+    replaces the crops in the VERIFY call only — refine still gets the crops —
+    and the log counts what was actually sent."""
+    model = ScriptedModel(_three_calls())
+    _, loc = _guided_run(model, monkeypatch, page, working, verify_examples=ASK_EXAMPLES[:1])
+    ask, refine, verify = (model.images(i) for i in range(3))
+    assert ask[:2] == ["QVNLUA==", "QVNLRg=="]
+    assert refine[:2] == ["Q1JPUA==", "Q1JPRg=="] and len(refine) == 3
+    assert verify[:1] == ["QVNLUA=="] and len(verify) == 2      # one composite + candidate
+    assert model.user_text(2) == ASK_EXAMPLES[0].caption()     # the composite's caption
+    assert loc.guided == {"ask": True, "refine": True, "verify": True}
+    assert [(c["kind"], c["images"]) for c in loc.guided_calls] == [
+        ("box_ask", 3), ("box_refine", 3), ("box_verify", 2)]
+
+
+def test_verify_examples_none_keeps_the_crops_and_empty_shows_nothing(
+    monkeypatch, page, working
+):
+    model = ScriptedModel(_three_calls())
+    _, loc = _guided_run(model, monkeypatch, page, working, verify_examples=None)
+    assert model.images(2)[:2] == ["Q1JPUA==", "Q1JPRg=="]     # today's behaviour
+    assert loc.guided_calls[-1] == {"kind": "box_verify", "attempt": 1, "images": 3, "ok": True}
+
+    # An empty override is nothing to show: the verify is the unguided one.
+    model = ScriptedModel(_three_calls())
+    _, loc = _guided_run(model, monkeypatch, page, working, verify_examples=[])
+    assert len(model.images(2)) == 1 and len(model.images(1)) == 3
+    assert model.user_text(2).startswith("Is this visible in the attached image")
+    assert loc.guided == {"ask": True, "refine": True, "verify": False}
+    assert [c["kind"] for c in loc.guided_calls] == ["box_ask", "box_refine"]
 
 
 def test_example_crop_pads_like_the_verify_crop_and_caps_at_the_working_size(page):

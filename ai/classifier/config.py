@@ -298,6 +298,14 @@ REFERENCE_GUARD: str = (
 # is the reference's working page with the criterion's outline drawn on it; a
 # crop is cut from its ORIGINAL page around the first region and has no
 # outline drawn, so it cannot say "the coloured box outlines it".
+#
+# The crop captions (refine and verify, and the ask under the position check)
+# say the example is FROM ANOTHER DOCUMENT and was PASS "there", not "here": a
+# reference is normally a different company's document from the candidate,
+# and a verify told what the feature "looks like here" scored a correct logo
+# 1 on every attempt because it was not the example's brand (measured on the
+# box — bills from different utilities, 0 of 20 logos accepted with crops in
+# the verify). The composite captions are unchanged.
 BOX_CAPTIONS: dict[tuple[str, bool], str] = {
     ("PASS", False): "REFERENCE EXAMPLE — '{criterion}' was PASS here; the coloured box "
                      "outlines it.",
@@ -305,11 +313,12 @@ BOX_CAPTIONS: dict[tuple[str, bool], str] = {
                          "case; the coloured box outlines it.",
     ("FAIL", False): "REFERENCE EXAMPLE — '{criterion}' was FAIL here — the outlined thing "
                      "is NOT {criterion}; do not box it.",
-    ("PASS", True): "REFERENCE EXAMPLE — a crop showing '{criterion}' (PASS here).",
-    ("MARGINAL", True): "REFERENCE EXAMPLE — a crop showing '{criterion}' (MARGINAL here, a "
-                        "borderline case).",
-    ("FAIL", True): "REFERENCE EXAMPLE — a crop of something that is NOT {criterion} (FAIL "
-                    "here); do not box it.",
+    ("PASS", True): "REFERENCE EXAMPLE (from another document) — a crop showing "
+                    "'{criterion}' (PASS there).",
+    ("MARGINAL", True): "REFERENCE EXAMPLE (from another document) — a crop showing "
+                        "'{criterion}' (MARGINAL there, a borderline case).",
+    ("FAIL", True): "REFERENCE EXAMPLE (from another document) — a crop of something that "
+                    "is NOT {criterion} (FAIL there); do not box it.",
 }
 
 # Said once after the ask's / refine's examples. Three things: the examples
@@ -330,20 +339,34 @@ BOX_CANDIDATE_HEADING: str = "CANDIDATE — locate the feature only in this imag
 VERIFY_CANDIDATE_HEADING: str = "CANDIDATE — judge only this crop"
 
 # One sentence appended to each guided call's system prompt, as the scoring
-# call's is.
+# call's is. The verify's says the examples are from OTHER documents, and
+# says "examples", not "crops" — the experiment can show it composites
+# (bin/grounding_experiment.py --verify-images composite).
 BOX_SYSTEM_SENTENCE: str = (
     "Reference examples come first; locate the feature ONLY in the image marked CANDIDATE."
 )
 VERIFY_SYSTEM_SENTENCE: str = (
-    "Reference crops come first; judge ONLY the crop marked CANDIDATE."
+    "Reference examples from other documents come first; judge ONLY the crop marked "
+    "CANDIDATE."
 )
 
-# The guided verify's reminder, after its question. A FAIL crop shows what
-# the feature is NOT, which its caption already says; this keeps the model
-# scoring the candidate, not how much the two crops resemble each other.
+# The guided verify's reminder, after its question. A reference is normally a
+# different company's document, so the example shows the KIND of thing the
+# criterion means, not what it looks like on the candidate. The first wording
+# ("the reference crop(s) above show what X looks like here") made the model
+# score a correct logo 1 because it was not the reference's logo — while it
+# stayed neutral on the amount due and the account number, whose look does
+# not depend on the brand. So: the candidate will usually look different, a
+# name in the criterion means the candidate's own document, and a difference
+# from the reference is no reason to score lower. A FAIL example shows what
+# does NOT count, which its caption also says. `{name}` is the criterion.
 VERIFY_REFERENCE_NOTE: str = (
-    "The reference crop(s) above show what {name} looks like here — or, captioned FAIL, "
-    "what it is NOT; judge the CANDIDATE crop, not the reference."
+    "The reference image(s) above come from OTHER documents. Each shows an example of the "
+    "kind of thing '{name}' means; on the CANDIDATE it will usually look different (a "
+    "different company, design or layout), and any name in the criterion refers to the "
+    "CANDIDATE's own document, not to the reference's. Do not score lower because the "
+    "CANDIDATE looks different from a reference: score whether the CANDIDATE crop shows "
+    "{name}. A reference captioned FAIL shows something that does NOT count."
 )
 
 # ---------------------------------------------------------------------------

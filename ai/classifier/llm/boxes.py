@@ -48,7 +48,10 @@ each step behind its own knob, read here and nowhere else:
              (``crop_examples``, cut by ``example_crop``) before the zoomed
              candidate crop, so a look-alike in the window is not boxed.
     verify   REFERENCE_BOX_VERIFY: the same crops before the candidate crop —
-             "is it in the CANDIDATE crop?", still 1-10.
+             "is it in the CANDIDATE crop?", still 1-10, reason first. A
+             caller may show it other examples instead (``verify_examples``;
+             only ``bin/grounding_experiment.py --verify-images composite``
+             does — the service passes none).
 
 The examples are chosen and loaded by ``analysis.references`` once per unit
 and are the same on every attempt; validation, the gate, the area checks, the
@@ -456,6 +459,7 @@ async def locate_criterion(
     model: Optional[ModelSpec] = None,
     ask_examples: Optional[list[prompts.BoxExample]] = None,
     crop_examples: Optional[list[prompts.BoxExample]] = None,
+    verify_examples: Optional[list[prompts.BoxExample]] = None,
     guide_ask: Optional[bool] = None,
     guide_refine: Optional[bool] = None,
     guide_verify: Optional[bool] = None,
@@ -494,7 +498,13 @@ async def locate_criterion(
                           per unit by ``analysis.references`` and the same on
                           every attempt.
         crop_examples:    Region crops of the same examples, for REFINE and
-                          VERIFY.
+                          (unless ``verify_examples``) VERIFY.
+        verify_examples:  What VERIFY shows instead of ``crop_examples`` —
+                          ``bin/grounding_experiment.py --verify-images
+                          composite`` passes the ask's composites. None (the
+                          service: ``analysis.llm_eval`` passes nothing) →
+                          ``crop_examples``, exactly as before. Refine always
+                          shows ``crop_examples``.
         guide_ask / guide_refine / guide_verify:
                           Show that step its examples (default the
                           REFERENCE_BOX_ASK / _REFINE / _VERIFY knobs, read
@@ -529,7 +539,8 @@ async def locate_criterion(
     # attempt, so attempts differ only by their feedback.
     shown_ask = list(ask_examples or []) if guide_ask else []
     shown_refine = list(crop_examples or []) if guide_refine else []
-    shown_verify = list(crop_examples or []) if guide_verify else []
+    verify_source = crop_examples if verify_examples is None else verify_examples
+    shown_verify = list(verify_source or []) if guide_verify else []
     loc.guided = {
         "ask": bool(shown_ask), "refine": bool(shown_refine), "verify": bool(shown_verify),
     }

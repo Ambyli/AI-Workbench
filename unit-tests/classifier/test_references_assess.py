@@ -660,7 +660,8 @@ def test_a_guided_locate_job_runs_the_guided_loop(client, model, refs, knobs, mo
         (prompt,) = _box_prompts(model, step)
         assert FakeModel.images(prompt) == 3
         assert FakeModel.texts(prompt)[0] == (
-            "REFERENCE EXAMPLE — a crop showing 'has a house' (PASS here).")
+            "REFERENCE EXAMPLE (from another document) — a crop showing 'has a house' "
+            "(PASS there).")
 
     assert loc["references"] == [{
         "item": 0, "applied": True, "ask_images": "composite",
@@ -838,7 +839,8 @@ def test_the_position_check_shows_the_ask_crops(client, model, refs, knobs):
     (ask,) = _box_prompts(model, "ask")
     assert FakeModel.images(ask) == 2
     assert FakeModel.texts(ask)[0] == (
-        "REFERENCE EXAMPLE — a crop showing 'has a house' (PASS here).")
+        "REFERENCE EXAMPLE (from another document) — a crop showing 'has a house' "
+        "(PASS there).")
     (ref,) = entry["localization"]["references"]
     assert ref["ask_images"] == "crop" and ref["applied"] is True
 

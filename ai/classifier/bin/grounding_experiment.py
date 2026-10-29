@@ -99,6 +99,13 @@ alone, ``all`` every one. Without examples only ``off`` runs. ``--repeats``
 (default 5) runs each image x criterion x configuration that many times —
 Muse samples at temperature 1.0, so one run of each is an anecdote.
 
+``--verify-images`` (default ``crop``) is what the verify call is shown when
+it carries examples (``verify`` and ``all``): ``crop``, the examples' region
+crops, as the service does; ``composite``, the same composites the ask is
+shown (the reference page with the feature outlined, the composite captions)
+— ``llm.boxes.locate_criterion(verify_examples=...)``, which the service never
+passes. Refine always sees the crops.
+
 What it prints, per configuration, per criterion and overall:
 
     attempt-1 valid     how often the FIRST box survived validation. This is
@@ -147,6 +154,29 @@ What it prints, per configuration, per criterion and overall:
 Rule of thumb from the plan: if attempt-1 validity is under ~50%, make the
 detector the primary source and the LLM loop the fallback.
 
+``--out`` writes ``{"summary", "records"}``; ``summary.config`` carries
+``verify_images``. One record per run (image x criterion x configuration x
+repeat), with the numbers above per run, and — to say WHY, not just how often:
+
+    verify_images   what a guided verify was shown on this run.
+    attempt_log     ``[a.as_dict() for a in loc.attempts]`` — each attempt's
+                    box (``bbox_grid`` / ``bbox_px``, coarse and refined),
+                    ``verify_score``, ``verify_reason`` and ``reject`` (the
+                    sentence the retry is told), as ``localization.attempts``
+                    has them.
+    answers         every model request of the run in call order, as the
+                    model answered it: ``{kind: ask | refine | verify,
+                    attempt, request, bbox (ask / refine) | score (verify),
+                    reason, ok}``. ``attempt`` is the loop attempt (from the
+                    call label, ``bbox/<criterion>#<n>``), ``request`` the
+                    request within it (> 1 is a parse retry). ``score`` is
+                    the model's own number, before the loop clamps it. When
+                    the answer would not parse (or the request failed) ``ok``
+                    is false and ``raw`` holds its content (or the error), cut
+                    to 400 characters. The prompt is never stored — it holds
+                    the images.
+    call_log        per request: kind, seconds, prompt tokens, ok (HTTP).
+
 Process flow position: none — a standalone operator tool. It imports the same
 `llm.boxes` loop the pipeline runs, so what it measures is what production
 does, not a reimplementation of it. Usage rows are captured in-process (it has
@@ -161,6 +191,7 @@ import base64
 import json
 import math
 import pathlib
+import re
 import statistics
 import sys
 import time
@@ -173,6 +204,7 @@ from common.vision import PageGeometry, Region  # noqa: E402
 
 from detector import client as detector_client  # noqa: E402
 from llm import boxes as llm_boxes  # noqa: E402
+from llm import client as llm_client  # noqa: E402
 from llm import usage as llm_usage  # noqa: E402
 from config import (  # noqa: E402
     GROUNDING_DEFAULT_CRITERIA,
@@ -486,14 +518,21 @@ def _against_truth(
             "center_error_grid": round(error(copies[best]), 1), "landed_on": landed_on}
 
 
+# The loop's call labels: "bbox/<criterion>#<attempt>", "refine/…", "verify/…".
+_LABEL = re.compile(r"^(?:bbox|refine|verify)/.*#(\d+)$")
+
+
 class _CallLog:
     """Every model request the loop makes, as ``llm.client`` reports it to
-    ``llm.usage.record_call``: its kind, seconds and prompt tokens. Installed
-    in place of the usage writer for the run — the script has no job and no
-    database pool, and the per-call cost is one of the numbers it reports."""
+    ``llm.usage.record_call``: its kind, seconds and prompt tokens (``rows``),
+    and what the model answered (``answers``). Installed in place of the usage
+    writer for the run — the script has no job and no database pool, and the
+    per-call cost is one of the numbers it reports. The prompt is never kept:
+    it holds the images."""
 
     def __init__(self) -> None:
         self.rows: list[dict] = []
+        self.answers: list[dict] = []
 
     async def record(self, **fields) -> None:
         counts = fields.get("counts") or {}
@@ -503,6 +542,39 @@ class _CallLog:
             "prompt_tokens": counts.get("prompt"),
             "ok": fields.get("error") is None,
         })
+        self.answers.append(_answer(fields))
+
+
+def _answer(fields: dict) -> dict:
+    """One request's answer: parsed the way ``llm.client`` parses it
+    (``_parse_content``), else its raw content — or the error — cut to 400
+    characters. Never raises: a record must not cost the run."""
+    kind = fields.get("kind")
+    match = _LABEL.match(fields.get("label") or "")
+    out: dict = {
+        "kind": kind,
+        "attempt": int(match.group(1)) if match else None,
+        "request": fields.get("attempt"),
+    }
+    data, error = fields.get("data"), fields.get("error")
+    try:
+        parsed = llm_client._parse_content(data)
+    except Exception:  # noqa: BLE001 — the raw text is the evidence
+        parsed = None
+    if parsed is None:
+        try:
+            raw = data["choices"][0]["message"].get("content")
+        except Exception:  # noqa: BLE001
+            raw = None
+        if raw is None:
+            raw = str(error) if error is not None else json.dumps(data)[:400]
+        return {**out, "reason": None, "ok": False, "raw": str(raw)[:400]}
+    if kind == "verify":
+        out["score"] = parsed.get("score")
+    else:
+        out["bbox"] = parsed.get("bbox")
+    reason = parsed.get("reason")
+    return {**out, "reason": None if reason is None else str(reason)[:400], "ok": True}
 
 
 # ---------------------------------------------------------------------------
@@ -564,6 +636,7 @@ async def run(args) -> dict:
           f"area {LLM_BBOX_MIN_AREA:.3%}-{LLM_BBOX_MAX_AREA:.0%}, refine {LLM_BBOX_REFINE}")
     print(f"examples: {reference_path.name if reference_path else (', '.join(args.references) if args.references else 'none')}")
     print(f"configs : {', '.join(configs)}, {args.repeats} repeat(s) each")
+    print(f"verify  : shown {args.verify_images}s when it carries examples")
     print(f"images  : {len(paths)} under {directory}\n")
 
     log = _CallLog()
@@ -604,6 +677,7 @@ async def run(args) -> dict:
                 for config in configs:
                     guide_ask, guide_refine, guide_verify = CONFIGS[config]
                     first_row = len(log.rows)
+                    first_answer = len(log.answers)
                     t0 = time.monotonic()
                     regions, loc = await llm_boxes.locate_criterion(
                         label,
@@ -616,6 +690,11 @@ async def run(args) -> dict:
                         model=spec,
                         ask_examples=ask_examples,
                         crop_examples=crop_examples,
+                        # composite: the ask's composites; crop: None, so
+                        # the loop uses crop_examples as the service does.
+                        verify_examples=(
+                            ask_examples if args.verify_images == "composite" else None
+                        ),
                         guide_ask=guide_ask,
                         guide_refine=guide_refine,
                         guide_verify=guide_verify,
@@ -642,6 +721,7 @@ async def run(args) -> dict:
                         "attempts": len(loc.attempts),
                         "calls": loc.calls,
                         "guided": dict(loc.guided),
+                        "verify_images": args.verify_images,
                         "detector_iou": accepted.detector_iou if accepted else None,
                         "detector_boxes": len(detector.get(label) or []),
                         "seconds": round(elapsed, 2),
@@ -649,6 +729,8 @@ async def run(args) -> dict:
                         "truth_px": boxes["criteria"].get(label),
                         **_against_truth(accepted.bbox_px if accepted else None, label,
                                          boxes, geometry),
+                        "attempt_log": [a.as_dict() for a in loc.attempts],
+                        "answers": log.answers[first_answer:],
                         "call_log": log.rows[first_row:],
                     }
                     records.append(record)
@@ -668,7 +750,8 @@ async def run(args) -> dict:
                           f"  ({elapsed:.1f}s)")
         print()
 
-    summary = _summarise(records, time.monotonic() - started, spec.id, configs, bool(truth))
+    summary = _summarise(records, time.monotonic() - started, spec.id, configs, bool(truth),
+                         args.verify_images)
     _print_summary(summary)
     if args.out:
         out = pathlib.Path(args.out)
@@ -690,7 +773,8 @@ def _mean(values: list, digits: int = 3):
 
 
 def _summarise(
-    records: list[dict], elapsed: float, model_id: str, configs: list[str], scored: bool
+    records: list[dict], elapsed: float, model_id: str, configs: list[str], scored: bool,
+    verify_images: str,
 ) -> dict:
     """Per configuration: the rates overall and per criterion, and what each
     call kind cost."""
@@ -768,6 +852,7 @@ def _summarise(
             "min_area": LLM_BBOX_MIN_AREA,
             "max_area": LLM_BBOX_MAX_AREA,
             "refine": LLM_BBOX_REFINE,
+            "verify_images": verify_images,
             "detector": detector_client.status(),
         },
     }
@@ -872,6 +957,12 @@ def main() -> None:
         "--configs", default=",".join(CONFIGS),
         help="which calls see the examples, comma-separated: "
              f"{', '.join(CONFIGS)} (default: all five)",
+    )
+    parser.add_argument(
+        "--verify-images", choices=("crop", "composite"), default="crop",
+        help="what a guided verify is shown (the verify and all configs): crop, the "
+             "examples' region crops as the service does (default), or composite, the "
+             "same composites the ask is shown",
     )
     parser.add_argument(
         "--repeats", type=int, default=5,

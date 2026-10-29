@@ -1643,8 +1643,8 @@ criterion's examples ([§ The LLM enforcement loop](#the-llm-enforcement-loop)):
 | Knob | Call | Shown before the candidate |
 |---|---|---|
 | `CLASSIFIER_REFERENCE_BOX_ASK` | ask | the examples' **composites** — the reference page with the feature outlined: *"REFERENCE EXAMPLE — 'the utility's logo' was PASS here; the coloured box outlines it."* Under `position: "check"` their **region crops** instead (below) |
-| `CLASSIFIER_REFERENCE_BOX_REFINE` | refine | the examples' **region crops** — each reference's ORIGINAL page cut around its first region, padded by `CLASSIFIER_LLM_BBOX_CROP_PAD`, no outline: *"REFERENCE EXAMPLE — a crop showing 'the utility's logo' (PASS here)."* |
-| `CLASSIFIER_REFERENCE_BOX_VERIFY` | verify | the same region crops; the question becomes *"Is this visible in the CANDIDATE crop: …?"*, still 1–10 |
+| `CLASSIFIER_REFERENCE_BOX_REFINE` | refine | the examples' **region crops** — each reference's ORIGINAL page cut around its first region, padded by `CLASSIFIER_LLM_BBOX_CROP_PAD`, no outline: *"REFERENCE EXAMPLE (from another document) — a crop showing 'the utility's logo' (PASS there)."* |
+| `CLASSIFIER_REFERENCE_BOX_VERIFY` | verify | the same region crops; the question becomes *"Is this visible in the CANDIDATE crop: …?"*, still 1–10, with the reason written first (below) |
 
 What the loop may be shown is chosen once per unit, after the gate passed:
 
@@ -1677,6 +1677,32 @@ the examples have no grid, so answer only on the CANDIDATE's grid, and that
 feature. Then comes a `CANDIDATE` heading, and one system-prompt sentence
 (*"Reference examples come first; locate the feature ONLY in the image marked
 CANDIDATE."*). The rejection feedback and the call labels are unchanged.
+
+**The guided verify assumes the examples come from other documents**,
+because a reference is normally a different company's page than the
+candidate. An earlier wording told the model what the feature "looks like
+here", and the model scored a correct logo 1 on every attempt (0 of 20
+accepted, on two pairs of bills) because it was not the reference's brand. It
+stayed neutral on the amount due and the account number, whose look does not
+depend on the brand. Now:
+
+* the crop captions say *"(from another document)"* and *"PASS there"*;
+* the system sentence is *"Reference examples from other documents come
+  first; judge ONLY the crop marked CANDIDATE."*;
+* after the question comes *"The reference image(s) above come from OTHER
+  documents. Each shows an example of the kind of thing '…' means; on the
+  CANDIDATE it will usually look different (a different company, design or
+  layout), and any name in the criterion refers to the CANDIDATE's own
+  document, not to the reference's. Do not score lower because the CANDIDATE
+  looks different from a reference: score whether the CANDIDATE crop shows ….
+  A reference captioned FAIL shows something that does NOT count."*;
+* it writes its reason first. The scaffold is `{"reason": "...", "score":
+  0}`, and the prompt says *"Write 'reason' first, what you actually see in
+  the CANDIDATE crop, in one sentence; then 'score'."* The 1–10 scale and
+  the validator are unchanged.
+
+The composite captions, the ask guard and every unguided prompt are
+unchanged.
 
 **Cost per guided criterion, per item:** `max(#PASS-side, #FAIL)` scoring
 calls instead of 1 (at three images), plus, under `auto`, one selection call
@@ -2450,6 +2476,11 @@ of the criterion — header, payment slip or bill 2's right-hand page),
 false-accept rate, `bbox: null` rate, accepted rate, how often a missed logo
 landed on the `text naming the utility` decoy, and prompt tokens and seconds
 per call kind. The numbers and the knob defaults chosen from them go here.
+In the first run, the guided verify scored correct logos 1 against another
+utility's example. Its wording has since changed
+([§ What the model is shown](#what-the-model-is-shown-and-what-it-costs)),
+so measure the `verify` and `all` configs again, with `--verify-images crop`
+and with `composite`, reading the model's reasons in each record's `answers`.
 
 **The grid step.** `CLASSIFIER_LLM_BBOX_GRID_STEP` (100 grid units) spaces the
 lines on the ask image and on the refine crop (which gets its own grid in its
@@ -2601,6 +2632,28 @@ any copy; IoU and the centre error are against the best-matching copy
 miss, `landed on` names the other criterion or decoy whose box holds the
 centre, criteria first: the identification case, a logo asked for and a
 line of `text naming the utility` boxed.
+
+`--verify-images crop|composite` (default `crop`) sets what a guided verify
+is shown in the `verify` and `all` configs. `crop` is the examples' region
+crops, as the service does. `composite` is the same composites the ask is
+shown, with the composite captions (`llm.boxes.locate_criterion(...,
+verify_examples=...)`; the service never passes it). Refine always sees the
+crops. The run header and `summary.config` print the choice, and every
+record carries it.
+
+The `--out` JSON records each run's reasons as well as its numbers:
+
+* `attempt_log` is each attempt as `localization.attempts` has it: its box,
+  `verify_score`, `verify_reason`, and the `reject` sentence the retry is
+  told.
+* `answers` is every model request in call order: `{kind: ask | refine |
+  verify, attempt, request, bbox | score, reason, ok}`.
+  * `attempt` is the loop attempt, taken from the call label; `request` > 1
+    is a parse retry.
+  * `score` is the model's own number, before clamping.
+  * An answer that does not parse keeps its raw content, or the error, cut to
+    400 characters, with `ok: false`.
+  * The prompt is never stored.
 
 If attempt-1 validity is under ~50%, prefer `detector` criteria as the primary
 source and keep `llm` criteria with `options.boxes` for labels the detector

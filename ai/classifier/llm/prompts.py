@@ -16,9 +16,15 @@ other:
                             dataclass, so ``llm`` never imports ``references``.
     build_bbox_prompt()   — the enforcement loop's "where is it?": one
                             criterion, one image, a box on a 0-1000 grid, and
-                            the previous attempts' rejections as feedback.
+                            the previous attempts' rejections as feedback —
+                            preceded, behind the CLASSIFIER_REFERENCE_BOX_*
+                            knobs, by up to two captioned EXAMPLES
+                            (``BoxExample``) showing what to box.
     build_verify_prompt() — the enforcement loop's check: the CROP alone, "is
-                            <criterion> visible in this?", 1-10.
+                            <criterion> visible in this?", 1-10 — or, behind
+                            its knob, after example crops of the feature.
+    BoxExample            — one example as the loop's prompts need it: a
+                            composite or a region crop, with its verdict.
     build_describe_prompt() — a reference example's catalogue line: ONE page
                             image, "what is this, in a sentence or two" — no
                             criterion, no judgement.
@@ -62,14 +68,18 @@ none, for .txt / .docx): the plain scoring call the page, ``build_bbox_prompt``
 that page (gridded) or a refine crop, ``build_verify_prompt`` the ONE crop,
 ``build_describe_prompt`` the reference page,
 ``build_reference_selection_prompt`` the candidate page (the references
-themselves are a text catalogue, not images). Only a scoring call WITH
-reference examples carries more — the example composite(s) first, then the
-candidate — and never more than the model's ``max_images_per_prompt``, which
-must match its server's ``--limit-mm-per-prompt`` (muse-glimmer: 3, a PASS
-example, a FAIL example and the candidate; ``analysis.llm_eval`` plans the
-calls to fit).
-``build_llm_prompt(..., references=None)`` is byte-for-byte the plain prompt
-— no examples, no extra system sentence — which a test pins by hash.
+themselves are a text catalogue, not images). Only a call WITH reference
+examples carries more — the example image(s) first, then the candidate — and
+never more than the model's ``max_images_per_prompt``, which must match its
+server's ``--limit-mm-per-prompt`` (muse-glimmer: 3, a PASS example, a FAIL
+example and the candidate). A guided scoring call shows composites
+(``analysis.llm_eval`` plans the calls to fit); a guided box-loop call shows
+at most one PASS-side and one FAIL example (``analysis.references.
+box_selection``): the ask composites (region crops under the position check),
+the refine and verify region crops.
+``build_llm_prompt(..., references=None)``, ``build_bbox_prompt`` and
+``build_verify_prompt`` without references are byte-for-byte the plain
+prompts — no examples, no extra system sentence — which tests pin by hash.
 
 PREFIX CACHING. The scoring prompt puts everything that depends only on the
 ITEM first — system prompt, page image, context line, DOCUMENT TEXT block —
@@ -81,8 +91,14 @@ re-prefill up to ~15k tokens of identical text per criterion. Keep it first;
 ``classifier_llm_cached_prompt_tokens_total{kind="score"}`` shows the saving.
 
 The rubric strings (HINT_RUBRICS) and the extracted-text block heading
-(DOCUMENT_TEXT_HEADING) live in config.py § LLM prompt text, so prompt wording
-can be tuned without touching the assembly logic here.
+(DOCUMENT_TEXT_HEADING) live in config.py § LLM prompt text, and the wording
+the examples add (captions, guards, headings, system sentences —
+``REFERENCE_GUARD``, ``BOX_CAPTIONS`` and the rest) in config.py § Prompt
+wording — the reference examples, so prompt wording can be tuned without
+touching the assembly logic here. This module imports those names, so
+``from llm.prompts import BOX_CANDIDATE_HEADING`` still works.
+``SCORING_SCAFFOLD`` stays here: it is the answer contract ``llm.validate``
+parses, not wording.
 
 Process flow position: called by ``analysis.llm_eval`` (the scoring prompt),
 ``llm.boxes`` (the loop's two) and ``analysis.references`` (the describe
@@ -94,26 +110,31 @@ from dataclasses import dataclass
 from typing import Optional
 
 from config import (
+    BOX_CANDIDATE_HEADING,
+    BOX_CAPTIONS,
+    BOX_REFERENCE_GUARD,
+    BOX_SYSTEM_SENTENCE,
+    CANDIDATE_HEADING,
     DOCUMENT_TEXT_HEADING,
     HINT_RUBRICS,
     LLM_BBOX_GRID,
     REFERENCE_DESCRIPTION_MAX_CHARS,
+    REFERENCE_GUARD,
+    VERIFY_CANDIDATE_HEADING,
+    VERIFY_REFERENCE_NOTE,
+    VERIFY_SYSTEM_SENTENCE,
 )
 from llm.models import ModelSpec, get_registry
 from logger import logger
 
-# The answer the scoring call is asked for, verbatim in the prompt.
+# The answer the scoring call is asked for, verbatim in the prompt. NOT
+# wording, and deliberately not in config.py with the prompt text: it is the
+# answer CONTRACT that llm/validate.py parses (find_answer looks for "score";
+# clamp_answer reads score / confidence / reason and recomputes verdict).
+# Renaming, adding or dropping a key here is a code change on both sides,
+# and it changes the scoring prompt's golden hashes in
+# unit-tests/classifier/test_reference_prompts.py.
 SCORING_SCAFFOLD: dict = {"score": 0, "verdict": "...", "confidence": 0, "reason": "..."}
-
-# The text block that separates the examples from what is being scored.
-CANDIDATE_HEADING = "CANDIDATE — score only this image"
-
-# Said once, beside the examples: what an example is for and what it is not.
-REFERENCE_GUARD = (
-    "The image(s) above are reference examples with known answers, shown so you know "
-    "what this criterion means here. Do not reward resemblance the criterion does not "
-    "ask about, and do not score the examples."
-)
 
 
 def _model(model: Optional[ModelSpec]) -> ModelSpec:
@@ -165,6 +186,53 @@ class ReferenceExample:
             f"REFERENCE EXAMPLE — in this reference '{self.criterion}' was PASS "
             f"({self.score}){why}; {where}."
         )
+
+
+@dataclass(frozen=True)
+class BoxExample:
+    """One example for the box loop's ask, refine or verify call.
+
+    Only examples WITH a region reach the loop (a whole page teaches no
+    location), chosen by ``analysis.references.box_selection``; like
+    ``ReferenceExample`` it is plain data, so ``llm`` never imports
+    ``references`` or ``analysis``.
+
+    Attributes:
+        criterion: The reference criterion's name (the example's question).
+        verdict:   Its expected verdict — PASS, MARGINAL or FAIL.
+        image_b64: The composite (the reference's working image with the
+                   criterion's outline drawn on it) or, when ``crop``, the
+                   reference's ORIGINAL page cut around its first region
+                   (``llm.boxes.example_crop``), no outline drawn.
+        crop:      True for a region crop — it selects the crop captions.
+    """
+
+    criterion: str
+    verdict: str
+    image_b64: str
+    crop: bool = False
+
+    def caption(self) -> str:
+        """The sentence shown just before this example's image (``BOX_CAPTIONS``;
+        a verdict outside the three reads as PASS, as ``ReferenceExample``'s
+        does)."""
+        template = BOX_CAPTIONS.get((self.verdict, self.crop)) or BOX_CAPTIONS[("PASS", self.crop)]
+        return template.format(criterion=self.criterion)
+
+
+def _example_parts(references: list[BoxExample]) -> list[dict]:
+    """Each example as its caption then its image — the loop's guided prompts
+    open with these, before the guard and the candidate."""
+    parts: list[dict] = []
+    for example in references:
+        parts.append({"type": "text", "text": example.caption()})
+        parts.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{example.image_b64}"},
+            }
+        )
+    return parts
 
 
 def build_llm_prompt(
@@ -398,6 +466,7 @@ def build_bbox_prompt(
     gridlines: bool = False,
     grid_step: int = 100,
     zoomed: bool = False,
+    references: Optional[list[BoxExample]] = None,
     model: Optional[ModelSpec] = None,
 ) -> dict:
     """Ask for ONE criterion's bounding box on the attached page image.
@@ -419,34 +488,57 @@ def build_bbox_prompt(
     ORIGINAL page pixels without the working scale ever appearing in the
     prompt.
 
+    ``references`` (the ``CLASSIFIER_REFERENCE_BOX_ASK`` / ``_REFINE`` knobs,
+    ``llm.boxes``) come FIRST, each as its caption then its image, followed by
+    ``BOX_REFERENCE_GUARD``, the CANDIDATE heading and the candidate, then the
+    usual text with "the attached image" / "THIS image" naming "the CANDIDATE
+    image" ("the zoomed CANDIDATE image" on the refine pass), and
+    ``BOX_SYSTEM_SENTENCE`` in the system prompt. They show the model WHAT to
+    box — the loop's weakness is identification (a logo asked for, the
+    company heading boxed), not placement. The feedback block is unchanged.
+    None or [] is byte-for-byte the prompt without them (pinned by hash).
+
     Args:
-        image_b64: Base64 JPEG of the ONE page image (see the module
-                   docstring — never a second image alongside it).
-        name:      The criterion to locate.
-        feedback:  One sentence per previous rejected attempt, newest last.
-                   Empty on attempt 1.
-        grid:      Grid span (default 1000).
-        gridlines: The attached image carries a labelled grid every
-                   ``grid_step`` units (common.vision.draw_grid_overlay).
-        grid_step: Spacing of that grid, for the sentence that describes it.
-        zoomed:    The attached image is a crop of a larger page.
+        image_b64:  Base64 JPEG of the ONE page image (or refine crop) the
+                    box is asked on — the only image unless ``references``.
+        name:       The criterion to locate.
+        feedback:   One sentence per previous rejected attempt, newest last.
+                    Empty on attempt 1.
+        grid:       Grid span (default 1000).
+        gridlines:  The attached image carries a labelled grid every
+                    ``grid_step`` units (common.vision.draw_grid_overlay).
+        grid_step:  Spacing of that grid, for the sentence that describes it.
+        zoomed:     The attached image is a crop of a larger page.
+        references: Examples to show before the candidate — composites, or
+                    region crops (the refine pass, and the ask under the
+                    position check).
 
     Returns:
         A dict ready to POST to the vLLM /v1/chat/completions endpoint.
     """
     span = int(grid)
+    # How the prompt names the image it asks about. Unguided these are the
+    # exact strings it always had; with examples the candidate is one image
+    # of several, so every sentence about it names it.
+    if references:
+        attached = "the zoomed CANDIDATE image" if zoomed else "the CANDIDATE image"
+        this_image = grid_over = "the CANDIDATE image"
+        spans, crop_is = "The CANDIDATE image spans", "The CANDIDATE image is"
+    else:
+        attached, this_image, grid_over = "the attached image", "THIS image", "the image"
+        spans, crop_is = "The image spans", "This image is"
     aids = ""
     if gridlines:
         aids += (
-            f"\nA coordinate grid is drawn over the image: thin red lines every "
+            f"\nA coordinate grid is drawn over {grid_over}: thin red lines every "
             f"{int(grid_step)} units, numbered along every edge. Read x off the numbers "
             "along the top and bottom, y off the numbers along the left and right, and "
             "interpolate between lines.\n"
         )
     if zoomed:
         aids += (
-            "\nThis image is a zoomed-in crop of a larger document, and the feature "
-            f"should be inside it. Answer on THIS image's 0 to {span} grid.\n"
+            f"\n{crop_is} a zoomed-in crop of a larger document, and the feature "
+            f"should be inside it. Answer on {this_image}'s 0 to {span} grid.\n"
         )
     scaffold = json.dumps(
         {"bbox": [0, 0, 0, 0], "confidence": 0, "reason": "..."}, indent=2
@@ -460,8 +552,8 @@ def build_bbox_prompt(
         )
 
     user_text = (
-        f"Locate this feature in the attached image: {name}\n\n"
-        f"The image spans 0 to {span} in BOTH directions, whatever its real "
+        f"Locate this feature in {attached}: {name}\n\n"
+        f"{spans} 0 to {span} in BOTH directions, whatever its real "
         "pixel size. Answer with the tightest rectangle that contains the "
         f"feature, as [x1, y1, x2, y2] with x1 < x2 and y1 < y2, every number "
         f"between 0 and {span}.\n"
@@ -469,7 +561,7 @@ def build_bbox_prompt(
         "Rules:\n"
         f"  - A box covering the whole image is NOT an answer. Box the feature, "
         "not the photograph.\n"
-        "  - If the feature is not visible in THIS image, answer with "
+        f"  - If the feature is not visible in {this_image}, answer with "
         '"bbox": null — do not guess a location.\n'
         "  - 'confidence' is 0-100: how sure you are that the box contains the "
         "feature.\n"
@@ -478,41 +570,54 @@ def build_bbox_prompt(
         f"{scaffold}"
     )
 
+    system_prompt = (
+        "You locate features in images. You answer with coordinates "
+        "and nothing else. Return ONLY a valid JSON object."
+    )
+    user_content: list[dict] = []
+    if references:
+        system_prompt += f" {BOX_SYSTEM_SENTENCE}"
+        user_content.extend(_example_parts(references))
+        user_content.append(
+            {
+                "type": "text",
+                "text": f"{BOX_REFERENCE_GUARD.format(span=span)}\n\n{BOX_CANDIDATE_HEADING}:",
+            }
+        )
+    user_content.append(
+        {
+            "type": "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"},
+        }
+    )
+    user_content.append({"type": "text", "text": user_text})
+
     # Small budget (models.yaml max_tokens.box): the answer is ~60 tokens of
     # JSON. It is still four figures for a reasoning model because reasoning
     # tokens are spent before it — a budget exhausted mid-reasoning returns
     # empty content, which call_model_json treats as a parse failure.
     prompt = _model(model).body(
         [
-            {
-                "role": "system",
-                "content": _system_prompt(
-                    "You locate features in images. You answer with coordinates "
-                    "and nothing else. Return ONLY a valid JSON object.",
-                    model,
-                ),
-            },
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"},
-                    },
-                    {"type": "text", "text": user_text},
-                ],
-            },
+            {"role": "system", "content": _system_prompt(system_prompt, model)},
+            {"role": "user", "content": user_content},
         ],
         "box",
     )
     logger.debug(
-        "build_bbox_prompt: '%s' grid=%d feedback=%d line(s) gridlines=%s zoomed=%s",
-        name, span, len(feedback or []), gridlines, zoomed,
+        "build_bbox_prompt: '%s' grid=%d feedback=%d line(s) gridlines=%s zoomed=%s "
+        "examples=%d",
+        name, span, len(feedback or []), gridlines, zoomed, len(references or []),
     )
     return prompt
 
 
-def build_verify_prompt(crop_b64: str, name: str, *, model: Optional[ModelSpec] = None) -> dict:
+def build_verify_prompt(
+    crop_b64: str,
+    name: str,
+    *,
+    references: Optional[list[BoxExample]] = None,
+    model: Optional[ModelSpec] = None,
+) -> dict:
     """Ask whether ``name`` is visible in a CROP, with no other context.
 
     This is the half of the loop that makes a box mean something. A model
@@ -520,53 +625,79 @@ def build_verify_prompt(crop_b64: str, name: str, *, model: Optional[ModelSpec] 
     contains solar panels is not evidence; a model that sees 300×300 pixels
     with no surroundings and still says "solar panels" is.
 
-    The crop is the ONE image in this call — the page it came from is
-    deliberately absent, because showing the page back would reintroduce
-    exactly the context the check is trying to remove.
+    The candidate crop is the only image of the CANDIDATE in this call — the
+    page it came from is deliberately absent, because showing the page back
+    would reintroduce exactly the context the check is trying to remove.
+
+    ``references`` (the ``CLASSIFIER_REFERENCE_BOX_VERIFY`` knob,
+    ``llm.boxes``) are region crops of OTHER pages — the reference's feature
+    cut from its own original — shown first, each captioned, then the
+    CANDIDATE heading, the candidate crop, and the question asked of "the
+    CANDIDATE crop" with ``VERIFY_REFERENCE_NOTE``; ``VERIFY_SYSTEM_SENTENCE``
+    joins the system prompt. An example crop is not page context: it says
+    nothing about where the candidate crop came from, only what the feature
+    looks like, which is the blind spot the verify has (shown only the
+    company heading and asked about a logo, it can say yes). The 1-10
+    contract is unchanged. None or [] is byte-for-byte the prompt without
+    them (pinned by hash).
 
     Args:
-        crop_b64: Base64 JPEG of the padded crop, taken from the ORIGINAL
-                  page image (not the ≤1000-px working copy — the crop of a
-                  downscaled page is too soft to judge).
-        name:     The criterion being verified.
+        crop_b64:   Base64 JPEG of the padded crop, taken from the ORIGINAL
+                    page image (not the ≤1000-px working copy — the crop of a
+                    downscaled page is too soft to judge).
+        name:       The criterion being verified.
+        references: Example region crops to show before the candidate crop.
 
     Returns:
         A dict ready to POST to the vLLM /v1/chat/completions endpoint.
     """
     scaffold = json.dumps({"score": 0, "reason": "..."}, indent=2)
+    if references:
+        opening = (
+            f"Is this visible in the CANDIDATE crop: {name}?\n\n"
+            f"{VERIFY_REFERENCE_NOTE.format(name=name)}\n\n"
+            "The CANDIDATE crop is a close crop of a larger photo or document. Judge "
+            "only what you can see in it.\n\n"
+        )
+        seen = "'reason' says what you actually see in the CANDIDATE crop, in one sentence."
+    else:
+        opening = (
+            f"Is this visible in the attached image: {name}?\n\n"
+            "The image is a close crop of a larger photo or document. Judge only "
+            "what you can see here.\n\n"
+        )
+        seen = "'reason' says what you actually see, in one sentence."
     user_text = (
-        f"Is this visible in the attached image: {name}?\n\n"
-        "The image is a close crop of a larger photo or document. Judge only "
-        "what you can see here.\n\n"
+        f"{opening}"
         "Score 1-10:\n"
         "  10 = clearly and unmistakably visible\n"
         "   7 = visible\n"
         "   4 = something that might be it, but you are not sure\n"
         "   1 = not visible at all\n\n"
-        "'reason' says what you actually see, in one sentence.\n\n"
+        f"{seen}\n\n"
         "Return ONLY this JSON object:\n\n"
         f"{scaffold}"
     )
+    system_prompt = (
+        "You say what is in an image crop. You judge only the crop "
+        "you are shown. Return ONLY a valid JSON object."
+    )
+    user_content: list[dict] = []
+    if references:
+        system_prompt += f" {VERIFY_SYSTEM_SENTENCE}"
+        user_content.extend(_example_parts(references))
+        user_content.append({"type": "text", "text": f"{VERIFY_CANDIDATE_HEADING}:"})
+    user_content.append(
+        {
+            "type": "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{crop_b64}"},
+        }
+    )
+    user_content.append({"type": "text", "text": user_text})
     return _model(model).body(
         [
-            {
-                "role": "system",
-                "content": _system_prompt(
-                    "You say what is in an image crop. You judge only the crop "
-                    "you are shown. Return ONLY a valid JSON object.",
-                    model,
-                ),
-            },
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{crop_b64}"},
-                    },
-                    {"type": "text", "text": user_text},
-                ],
-            },
+            {"role": "system", "content": _system_prompt(system_prompt, model)},
+            {"role": "user", "content": user_content},
         ],
         "box",
     )

@@ -145,6 +145,12 @@ services:
       - CLASSIFIER_LLM_BBOX_REFINE=${CLASSIFIER_LLM_BBOX_REFINE:-true}
       - CLASSIFIER_LLM_BBOX_REFINE_ZOOM=${CLASSIFIER_LLM_BBOX_REFINE_ZOOM:-2.5}
       - CLASSIFIER_LLM_BBOX_REFINE_MIN_SPAN=${CLASSIFIER_LLM_BBOX_REFINE_MIN_SPAN:-0.2}
+      # Show a criterion's reference examples to the loop's ask, refine and
+      # verify calls (each its own knob; off until measured with
+      # bin/grounding_experiment.py). See API.md § The LLM enforcement loop.
+      - CLASSIFIER_REFERENCE_BOX_ASK=${CLASSIFIER_REFERENCE_BOX_ASK:-false}
+      - CLASSIFIER_REFERENCE_BOX_REFINE=${CLASSIFIER_REFERENCE_BOX_REFINE:-false}
+      - CLASSIFIER_REFERENCE_BOX_VERIFY=${CLASSIFIER_REFERENCE_BOX_VERIFY:-false}
       # References — saved worked examples shown to the vision model beside a
       # candidate. Their own root on the classifier_data volume (never swept:
       # a reference is kept until DELETE, so the count cap bounds the disk),

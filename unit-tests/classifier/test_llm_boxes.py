@@ -20,7 +20,12 @@ What is asserted here, in the order the loop does it:
   * the 0-1000 grid converts through a NON-SQUARE page correctly (the axis
     bug that a square fixture would hide);
   * the detector cross-check lands in ``attrs.detector_iou`` when phase 2's
-    boxes are there, and is absent when they are not.
+    boxes are there, and is absent when they are not;
+  * reference examples (ZT-527): ask, refine and verify carry theirs before
+    the candidate, each ``guide_*`` flag (default: its knob) turns its step
+    off alone, no examples or the knobs off send exactly today's prompts,
+    the labels are unchanged, the guided-call log (a failed call included),
+    and ``example_crop``'s working-size cap.
 
 Run with::
 
@@ -40,6 +45,7 @@ from common.vision import PageGeometry, Region
 from api.schemas import CriterionInput
 from llm import boxes as llm_boxes
 from llm import client as llm_client
+from llm.prompts import BoxExample
 
 # A page that is NOT square, so an x/y axis mix-up in grid_to_pixels shows up
 # as a wrong number rather than the same number twice.
@@ -67,9 +73,23 @@ class ScriptedModel:
         return self.answers.pop(0) if self.answers else None
 
     def user_text(self, index: int) -> str:
-        """The text part of the nth call's user message."""
+        """The FIRST text part of the nth call's user message — on a guided
+        prompt that is an example's caption; ``last_text`` is the question."""
         content = self.calls[index][1]["messages"][-1]["content"]
         return next(part["text"] for part in content if part["type"] == "text")
+
+    def last_text(self, index: int) -> str:
+        """The LAST text part of the nth call's user message — the question
+        itself, guided or not."""
+        content = self.calls[index][1]["messages"][-1]["content"]
+        return [part["text"] for part in content if part["type"] == "text"][-1]
+
+    def images(self, index: int) -> list[str]:
+        """The nth call's image payloads (base64), in order."""
+        content = self.calls[index][1]["messages"][-1]["content"]
+        prefix = "data:image/jpeg;base64,"
+        return [part["image_url"]["url"][len(prefix):]
+                for part in content if part["type"] == "image_url"]
 
     def labels(self) -> list[str]:
         return [label for label, _ in self.calls]
@@ -497,6 +517,153 @@ def test_refine_without_an_original_image_is_recorded_not_fatal(monkeypatch, wor
     assert attempt.refined is False
     assert "not available to crop for the refine pass" in attempt.refine_reject
     assert loc.calls == 1  # no refine call, and no verify call either (no page)
+
+
+# ---------------------------------------------------------------------------
+# Reference examples in the loop (ZT-527)
+# ---------------------------------------------------------------------------
+#
+# The loop is handed examples (built by analysis.references.box_examples) and
+# shows each step its own behind its flag — guide_ask / guide_refine /
+# guide_verify, defaulting to the CLASSIFIER_REFERENCE_BOX_* knobs. Pinned:
+# the order (examples, then the candidate), each flag alone, the unguided
+# prompts byte for byte, the labels, and the log llm_eval records from.
+
+ASK_EXAMPLES = [
+    BoxExample("has solar panels", "PASS", "QVNLUA==", crop=False),
+    BoxExample("has solar panels", "FAIL", "QVNLRg==", crop=False),
+]
+CROP_EXAMPLES = [
+    BoxExample("has solar panels", "PASS", "Q1JPUA==", crop=True),
+    BoxExample("has solar panels", "FAIL", "Q1JPRg==", crop=True),
+]
+STEPS = ("ask", "refine", "verify")
+
+
+def _three_calls():
+    """ask → refine → verify, accepted on attempt 1."""
+    return [
+        {"bbox": GOOD_BOX},
+        {"bbox": [400, 400, 600, 600]},
+        {"score": 9, "reason": "panels"},
+    ]
+
+
+def _guided_run(model, monkeypatch, page, working, **kwargs):
+    """The loop with the refine pass on, both example lists, every flag on."""
+    kwargs.setdefault("ask_examples", ASK_EXAMPLES)
+    kwargs.setdefault("crop_examples", CROP_EXAMPLES)
+    for step in STEPS:
+        kwargs.setdefault(f"guide_{step}", True)
+    return _run(model, monkeypatch, page, working_image=working, refine=True, **kwargs)
+
+
+def test_ask_refine_and_verify_carry_their_examples_before_the_candidate(
+    monkeypatch, page, working
+):
+    model = ScriptedModel(_three_calls())
+    _, loc = _guided_run(model, monkeypatch, page, working)
+
+    # The labels are today's: llm.client maps their prefixes to the call kind.
+    assert model.labels() == [
+        "bbox/has solar panels#1",
+        "refine/has solar panels#1",
+        "verify/has solar panels#1",
+    ]
+    assert loc.calls == 3 and loc.accepted_attempt == 1
+    ask, refine, verify = (model.images(i) for i in range(3))
+    # Composites for the ask, then the candidate page (no grid here).
+    assert ask == ["QVNLUA==", "QVNLRg==", "ZmFrZQ=="]
+    # Crops for refine and verify, then the candidate's zoomed / verify crop.
+    assert refine[:2] == verify[:2] == ["Q1JPUA==", "Q1JPRg=="]
+    assert len(refine) == len(verify) == 3
+    # Each example is preceded by its caption; the question names the candidate.
+    assert model.user_text(0) == ASK_EXAMPLES[0].caption()
+    assert model.user_text(1) == model.user_text(2) == CROP_EXAMPLES[0].caption()
+    assert model.last_text(0).startswith("Locate this feature in the CANDIDATE image")
+    assert model.last_text(1).startswith("Locate this feature in the zoomed CANDIDATE image")
+    assert model.last_text(2).startswith("Is this visible in the CANDIDATE crop")
+
+
+@pytest.mark.parametrize("off", STEPS)
+def test_each_flag_turns_its_own_step_off(monkeypatch, page, working, off):
+    model = ScriptedModel(_three_calls())
+    _, loc = _guided_run(model, monkeypatch, page, working, **{f"guide_{off}": False})
+    shown = {step: len(model.images(i)) for i, step in enumerate(STEPS)}
+    assert shown == {step: 1 if step == off else 3 for step in STEPS}
+    assert loc.guided == {step: step != off for step in STEPS}
+    assert [c["kind"] for c in loc.guided_calls] == [
+        f"box_{step}" for step in STEPS if step != off]
+
+
+def test_the_flags_default_to_the_knobs_read_at_call_time(monkeypatch, page, working):
+    monkeypatch.setattr(llm_boxes, "REFERENCE_BOX_ASK", True)
+    monkeypatch.setattr(llm_boxes, "REFERENCE_BOX_REFINE", False)
+    monkeypatch.setattr(llm_boxes, "REFERENCE_BOX_VERIFY", True)
+    model = ScriptedModel(_three_calls())
+    _, loc = _run(model, monkeypatch, page, working_image=working, refine=True,
+                  ask_examples=ASK_EXAMPLES, crop_examples=CROP_EXAMPLES)
+    assert [len(model.images(i)) for i in range(3)] == [3, 1, 3]
+    assert loc.guided == {"ask": True, "refine": False, "verify": True}
+
+
+def test_knobs_off_or_no_examples_send_exactly_todays_prompts(monkeypatch, page, working):
+    plain = ScriptedModel(_three_calls())
+    _run(plain, monkeypatch, page, working_image=working, refine=True)
+
+    # The knobs off, examples handed in anyway.
+    for knob in ("REFERENCE_BOX_ASK", "REFERENCE_BOX_REFINE", "REFERENCE_BOX_VERIFY"):
+        monkeypatch.setattr(llm_boxes, knob, False)
+    off = ScriptedModel(_three_calls())
+    _, off_loc = _run(off, monkeypatch, page, working_image=working, refine=True,
+                      ask_examples=ASK_EXAMPLES, crop_examples=CROP_EXAMPLES)
+    # Every flag on, nothing to show.
+    empty = ScriptedModel(_three_calls())
+    _, empty_loc = _guided_run(empty, monkeypatch, page, working,
+                               ask_examples=[], crop_examples=None)
+
+    # Labels and prompt bodies, byte for byte (the prompts' own hashes are in
+    # test_reference_prompts.py).
+    assert off.calls == plain.calls and empty.calls == plain.calls
+    for loc in (off_loc, empty_loc):
+        assert loc.guided == {step: False for step in STEPS}
+        assert loc.guided_calls == []
+
+
+def test_the_guided_call_log_records_a_failed_call(monkeypatch, page, working):
+    """``guided_calls`` is what llm_eval turns into references.json rows and
+    the metric; a call that returned nothing is ``ok: False``. It never
+    reaches ``as_dict()``."""
+    model = ScriptedModel([
+        {"bbox": FULL_FRAME},                  # attempt 1: answered, rejected
+        {"bbox": GOOD_BOX},                    # attempt 2: ask
+        None,                                  #            refine FAILED
+        {"score": 9, "reason": "panels"},      #            verify
+    ])
+    _, loc = _guided_run(model, monkeypatch, page, working, crop_examples=CROP_EXAMPLES[:1])
+    assert loc.guided_calls == [
+        {"kind": "box_ask", "attempt": 1, "images": 3, "ok": True},
+        {"kind": "box_ask", "attempt": 2, "images": 3, "ok": True},
+        {"kind": "box_refine", "attempt": 2, "images": 2, "ok": False},
+        {"kind": "box_verify", "attempt": 2, "images": 2, "ok": True},
+    ]
+    assert loc.accepted_attempt == 2 and loc.attempts[1].refined is False
+    # The retry's feedback is today's sentence, inside the guided ask.
+    assert "covered 100% of the image" in model.last_text(1)
+    assert set(loc.as_dict()) == {"attempts", "accepted_attempt", "calls"}
+
+
+def test_example_crop_pads_like_the_verify_crop_and_caps_at_the_working_size(page):
+    big = np.zeros((3000, 4000, 3), dtype=np.uint8)
+    # 3200×2400 + 25% each side clamps to the whole 4000×3000 page, then fits.
+    crop = llm_boxes.example_crop(big, [400.0, 300.0, 3600.0, 2700.0], pad=0.25)
+    assert crop.shape[:2] == (750, 1000)
+    # Under the working size it is exactly the verify crop — never enlarged.
+    box = [400.0, 600.0, 500.0, 700.0]
+    assert llm_boxes.example_crop(page, box, pad=0.10).shape[:2] == (120, 120)
+    assert (llm_boxes.example_crop(page, box, pad=0.10)
+            == llm_boxes.crop_for(page, box, pad=0.10)).all()
+    assert llm_boxes.example_crop(None, [0, 0, 10, 10]) is None
 
 
 # ---------------------------------------------------------------------------

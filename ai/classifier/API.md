@@ -767,11 +767,14 @@ distribution for a `logprobs` model; [§ Confidence](#confidence--measured-then-
 > call with ten images. Every call that is not reference-guided — the plain
 > scoring call, the box loop's ask / refine / verify, a reference's describe
 > call, the `auto` selection call — sends exactly one image. Only a
-> reference-guided scoring call carries more: up to the model's
+> reference-guided call carries more: up to the model's
 > `max_images_per_prompt` (muse-glimmer: 3) — a PASS example, a FAIL example
-> and the candidate ([§ References](#references)). `muse-glimmer` runs with
-> `--limit-mm-per-prompt '{"image": 3}'` for this; its registry entry must
-> match it.
+> and the candidate ([§ References](#references)). That is every guided
+> scoring call, and — behind the `CLASSIFIER_REFERENCE_BOX_*` knobs, off by
+> default — the box loop's ask / refine / verify
+> ([§ What the model is shown](#what-the-model-is-shown-and-what-it-costs)).
+> `muse-glimmer` runs with `--limit-mm-per-prompt '{"image": 3}'` for this;
+> its registry entry must match it.
 
 A document with no page image sends a text-only prompt (still
 `response_format: json_object`), and the system prompt tells the model to judge
@@ -1632,12 +1635,65 @@ combination (noted in `detail.reference.note`); when every call fails the unit
 fails exactly as a plain scoring call's failure does. A reference **deleted
 after submit** fails the units it guided (`status: "error"`), nothing else.
 
-The box loop then runs unchanged on the combined score, with one image —
-references never reach the ask, refine or verify calls.
+**The box loop** then runs on the combined score, gated exactly as before.
+With the three knobs off (the default) it sends one image per call, exactly
+as it did before references existed. Each knob shows one of its calls the
+criterion's examples ([§ The LLM enforcement loop](#the-llm-enforcement-loop)):
+
+| Knob | Call | Shown before the candidate |
+|---|---|---|
+| `CLASSIFIER_REFERENCE_BOX_ASK` | ask | the examples' **composites** — the reference page with the feature outlined: *"REFERENCE EXAMPLE — 'the utility's logo' was PASS here; the coloured box outlines it."* Under `position: "check"` their **region crops** instead (below) |
+| `CLASSIFIER_REFERENCE_BOX_REFINE` | refine | the examples' **region crops** — each reference's ORIGINAL page cut around its first region, padded by `CLASSIFIER_LLM_BBOX_CROP_PAD`, no outline: *"REFERENCE EXAMPLE — a crop showing 'the utility's logo' (PASS here)."* |
+| `CLASSIFIER_REFERENCE_BOX_VERIFY` | verify | the same region crops; the question becomes *"Is this visible in the CANDIDATE crop: …?"*, still 1–10 |
+
+What the loop may be shown is chosen once per unit, after the gate passed:
+
+* **Only examples with regions.** A whole-page example teaches no location.
+* **A FAIL example only when its reference criterion's hint is `presence`.**
+  The reference's hint counts, not the candidate's: a `key` match can pair
+  different hints. Under `presence`, FAIL means "not there", so whatever is
+  outlined is NOT the feature (*"… was FAIL here — the outlined thing is NOT
+  the utility's logo; do not box it."*). Under `quality` / `auto`, FAIL can
+  mean "there, but bad", and showing it as "do not box this" would steer the
+  model off the right object. A plan queued before this change carries no
+  hint, so it is shown PASS-side examples only.
+* **At most one PASS-side example (PASS before MARGINAL), plus one FAIL at
+  three images.** With no PASS-side example, an eligible FAIL is shown alone
+  at three images. At two images only a PASS-side example is shown. Every
+  attempt shows the same examples.
+* **The ask under the position check sees crops, not composites.** A crop
+  shows the feature without the page around it, so the ask cannot be nudged
+  toward the example's spot. The check then compares the accepted box with
+  those examples' own regions, so it cannot pass on its own guidance.
+  Callers change nothing.
+* **Loading an example never fails the unit.** A reference deleted after
+  submit, or a `page.jpg` that is missing or does not decode, drops that
+  example from every step, with a note. The score is final by then.
+
+The prompt adds a guard after the examples. It says the examples show
+*what* to box and that on the candidate it may be somewhere else. It says
+the examples have no grid, so answer only on the CANDIDATE's grid, and that
+`"bbox": null` is still the answer when the candidate does not show the
+feature. Then comes a `CANDIDATE` heading, and one system-prompt sentence
+(*"Reference examples come first; locate the feature ONLY in the image marked
+CANDIDATE."*). The rejection feedback and the call labels are unchanged.
 
 **Cost per guided criterion, per item:** `max(#PASS-side, #FAIL)` scoring
 calls instead of 1 (at three images), plus, under `auto`, one selection call
-per item shared by every criterion.
+per item shared by every criterion. The box loop with a knob on makes **the
+same number of calls**, but each guided call carries 1 + examples images:
+
+* Every criterion re-processes the candidate. Without examples, the ask's
+  system prompt and gridded page are one prefix shared by every criterion on
+  the page, served from muse-glimmer's prefix cache. With examples first,
+  each criterion sends a different prefix (retries of one criterion still
+  share theirs).
+* Each guided call holds its `max_concurrent` slot longer.
+
+Prompt tokens and seconds per call kind are measured by
+`bin/grounding_experiment.py` (*measurement pending — filled in from the
+box run before any knob defaults on*). After turning a knob on, watch
+`classifier_llm_call_seconds{kind="ask"}` (and `refine` / `verify`).
 
 ### The position check
 
@@ -1657,6 +1713,10 @@ and the smallest centre distance / √2. No model call.
 
 A `score: false` criterion reports the check and changes nothing. A `check`
 against an example that is the whole page is a 400 at submit (explicit ids).
+The check stays independent of what the loop was shown. With
+`CLASSIFIER_REFERENCE_BOX_ASK` on, the ask of a `check` criterion is shown the
+examples' region crops, never their composites, so it cannot copy the
+example's position. The check reads only the examples' stored regions.
 
 ### Refusals at submit
 
@@ -1686,7 +1746,8 @@ and those jobs' guided units then fail on the missing reference.
 Metrics: `classifier_references{status}`, `classifier_reference_bytes`,
 `classifier_reference_dirs`, `classifier_references_created_total{outcome}`,
 `classifier_reference_describe_total{outcome}`,
-`classifier_reference_calls_total{kind=selection|scoring, outcome}`.
+`classifier_reference_calls_total{kind=selection|scoring|box_ask|box_refine|box_verify, outcome}`
+(a box call that returned no usable answer is `failed`).
 
 ---
 
@@ -1939,7 +2000,7 @@ Inside `job.result`, `schema_version: 3` — here for a two-page invoice plus a
 | `page_geometry` | One entry per item, each with its `item`; `page` equals `item` (the global index the layers are drawn on). An item with no page image (.txt / .docx) has `width` / `height` / `working_scale` / `pdf_points` `null`; `pdf_points` is also `null` for an image or an SVG page |
 | `detector` | What the open-vocabulary detector did for the whole job (was `document_info.detector`) |
 | `artifacts` | The job's files — each [labelled](#file-labels) with `kind`, `format`, `item`, `document`, `criteria`, exactly as the manifest endpoint labels them — and, under `items`, each item's combined layer URLs (items with a page image only) |
-| `references` | `null` when the request listed none. Otherwise `{mode: explicit \| auto, requested, pool (auto: the ids fixed at submit; else null), pool_truncated, resolved (the ids used — auto: those some item's selection kept), inherited, criteria: {name: {matched, matched_by: criterion \| key \| name, use, combine, position, examples: [{reference_id, criterion, polarity, expected}]}}, selection: [{item, status: ok \| failed \| skipped, matches: [{id, confidence, reason}], dropped, error, reason}], calls (guided scoring calls), selection_calls}`. Under `auto`, `criteria[*].examples` is empty — each item's picks are in `selection` and each unit's `detail.reference`. `matched_by` is the [matching order](#how-a-criterion-finds-its-examples--the-matching-order) rule that applied and `matched` its value (a reference criterion's name, or the key) |
+| `references` | `null` when the request listed none. Otherwise `{mode: explicit \| auto, requested, pool (auto: the ids fixed at submit; else null), pool_truncated, resolved (the ids used — auto: those some item's selection kept), inherited, criteria: {name: {matched, matched_by: criterion \| key \| name, use, combine, position, examples: [{reference_id, criterion, polarity, expected}]}}, selection: [{item, status: ok \| failed \| skipped, matches: [{id, confidence, reason}], dropped, error, reason}], calls (guided scoring calls — the box loop's guided calls are in `references.json`, not counted here), selection_calls}`. Under `auto`, `criteria[*].examples` is empty — each item's picks are in `selection` and each unit's `detail.reference`. `matched_by` is the [matching order](#how-a-criterion-finds-its-examples--the-matching-order) rule that applied and `matched` its value (a reference criterion's name, or the key) |
 | `request` | `{"criteria": [...], "model": "<id>"}` — `model` is the job's model, resolved (the request's `model`, else the registry default); the criteria exactly as validated (`key`, null when unset; `depends_on`, `weight`, every option as sent; inherited ones when `criteria` was omitted). What `POST /references` `from_job` rebuilds a job's criteria from |
 | `usage` | What the job's vision-model requests cost — the `totals` block of [`GET /jobs/{job_id}/usage`](#get-jobsjob_idusage): `calls` (every HTTP request, parse retries included), `errors`, `seconds`, `prompt_tokens` / `cached_tokens` / `completion_tokens` / `reasoning_tokens` / `total_tokens` (`null` when no call reported one), `models`, `first_call_at` / `last_call_at`, and `usage_url` for the per-call rows. `calls: 0` when nothing asked the model (`text` / `cv` criteria only). Added by the queue after the runner returns, so a `reference` job's result carries it too. See [§ Model usage](#model-usage) |
 
@@ -1957,7 +2018,7 @@ that existed before describe the AGGREGATED answer:
 | `reason` / `detail` | One or two sentences / structured diagnostics |
 | `regions` | Where, in original page pixels — the union over every item, each region's `page` its item; capped at `CLASSIFIER_INLINE_REGIONS_MAX` (`regions_truncated` says so) |
 | `artifacts` | Per-criterion links — `items`: per item it found something on, that item's layer URLs filtered to the criterion (rendered on first fetch) and its loop `attempts`; `text`: one link per text layer its units read (each tagged `item`, or `document` for scope `document`); `null` when there is neither geometry nor text |
-| `localization` | `llm` criteria: the enforcement loop's record, `{"attempts": [], "accepted_attempt": null, "calls": 0}` when it did not run. With one item it is that item's record verbatim; with several it is merged — every attempt tagged with its `item`, `calls` summed, `accepted_attempt` `null` and `accepted: [{"item", "attempt"}]` listing each accepted box. `null` for the other types |
+| `localization` | `llm` criteria: the enforcement loop's record, `{"attempts": [], "accepted_attempt": null, "calls": 0}` when it did not run. With one item it is that item's record verbatim; with several it is merged — every attempt tagged with its `item`, `calls` summed, `accepted_attempt` `null` and `accepted: [{"item", "attempt"}]` listing each accepted box. `null` for the other types. **`references`** — only when the request listed references and the criterion has a guide — is what the loop was shown: always a list, one entry per unit whose loop ran, each `{item, applied, ask_images: composite \| crop \| null, examples: [{reference_id, criterion, polarity, composite}], ask, refine, verify, note}`. `ask` / `refine` / `verify` say whether that step's calls carry examples. `applied: false` means no step did, and `note` says why: the `CLASSIFIER_REFERENCE_BOX_*` knobs are off, no example has a region, the guide never applied, or an example failed to load. Merged across items and documents by concatenation. Absent without references, so those results are unchanged |
 | `options_used` | Options after defaults and caps, `aggregate` resolved |
 | `error` | Why, when `status` is `error` |
 | `complete` | `false` when any of the criterion's units errored — its answer ignores part of what was asked, and the assessment is incomplete too |
@@ -1975,7 +2036,7 @@ item order; for a `text` criterion with `scope: "document"`, one per document
 | `reason` / `detail` / `error` | That unit's explanation — a skipped unit's reason names the dependency |
 | `regions` | A **count** of that unit's regions. The geometry itself is in the criterion's `regions` (by `page`), per item in `artifacts.items`, and complete in `regions.json` — a list here would repeat it once per unit |
 | `text_layer` | The link to the text layer that unit read (`text.p{n}.<key>.json`, or `text.d{i}.<key>.json`), or `null` |
-| `localization` | `llm` units only: that item's enforcement-loop record |
+| `localization` | `llm` units only: that item's enforcement-loop record (with its one-entry `references` list when the criterion has a guide) |
 
 **A failed criterion fails alone.** A model HTTP error, an answer that could
 not be parsed after `MAX_LLM_RETRIES`, a detector outage — each gives that
@@ -2072,7 +2133,7 @@ and page each n is.
 | `p{n}.base.jpg` | per item with a page image | The un-annotated page, JPEG q85. Every preview of item n is composited from it |
 | `p{n}.svg` / `p{n}.layer.png` / `p{n}.preview.jpg` | **on first fetch** | Item n's layer, rendered from regions.json by `regions.artifacts.render_layer`, then cached in the directory |
 | `p{n}.<slug>.svg` / `.layer.png` / `.preview.jpg` | **on first fetch** | One criterion's layer on item n, the same way — fetched by name, or as `p{n}.svg?criterion=<slug>` |
-| `references.json` | when the request listed `references` | The plan's summary (the result's `references` block), the `auto` `catalogue`, every item's `selection` with the model's raw answer beside the validated one, and `calls` — which composite (`reference_id`, `criterion`, `composite`, `polarity`) went into which guided call, with its image count, score and error. JSON, so the byte cap never drops it |
+| `references.json` | when the request listed `references` | The plan's summary (the result's `references` block), the `auto` `catalogue`, every item's `selection` with the model's raw answer beside the validated one, and `calls` — which example (`reference_id`, `criterion`, `composite`, `polarity`) went into which guided call, each with its `kind`: `scoring` (its `call`, image count, score and error) or the box loop's `box_ask` / `box_refine` / `box_verify` (its `attempt`, image count, `example_images: composite \| crop` and `ok`). One list; filter by `kind`. JSON, so the byte cap never drops it |
 
 A job nobody looks at costs a JSON file, its text layers and a JPEG per page.
 The result's `artifacts.items` (and each criterion's `artifacts.items`) lists
@@ -2336,6 +2397,16 @@ attempt 1 ── ask ────── one criterion, the page image its scorin
    └── retry ────────── re-ask with the rejection as feedback, up to the
                         criterion's options.max_attempts (default and cap
                         CLASSIFIER_LLM_BBOX_MAX_ATTEMPTS, 3)
+
+with references, each knob (off by default) puts the criterion's examples
+FIRST in its call — same calls, more images:
+   ask    ◄── CLASSIFIER_REFERENCE_BOX_ASK     composites (crops under the
+                                               position check), then the
+                                               gridded CANDIDATE
+   refine ◄── CLASSIFIER_REFERENCE_BOX_REFINE  region crops, then the zoomed
+                                               CANDIDATE crop
+   verify ◄── CLASSIFIER_REFERENCE_BOX_VERIFY  region crops, then the
+                                               CANDIDATE crop
 ```
 
 The verify call is what makes a box mean something: the page is deliberately
@@ -2356,6 +2427,29 @@ lines from 0/8 to 7/8 and the mean y error from 48 units to 2.4. Both are on
 by default and both are recorded on the attempt. What the second pass cannot
 fix is *identification*: asked for a logo, a model that boxes the heading
 naming the same company 90 units lower is precisely placed on the wrong thing.
+
+**Why reference examples in the loop.** Identification is what an example
+fixes: an outlined example of the right thing shows the model *which* thing
+to box. The verify call has the same blind spot. Shown only the company
+heading and asked "is the logo visible?", it can say yes; with the example's
+logo crop beside it, it should say no. Verify is also the step most likely to
+accept the wrong thing: shown two crops, a model can score resemblance, or
+score the reference crop, which always shows the feature. So
+`CLASSIFIER_REFERENCE_BOX_VERIFY` goes on only if false accepts do not rise.
+What the loop is shown, the selection rules and the cost are in
+[§ What the model is shown](#what-the-model-is-shown-and-what-it-costs).
+The three knobs stay off until measured.
+
+*Measurement — pending.* `bin/grounding_experiment.py --truth
+unit-tests/classifier/documents/grounding_truth.json --reference-image …` on
+the two bills (bill 1 → bill 2 and bill 2 → bill 1; different utilities, so
+this tests generalisation), five configurations (`off`, `ask`, `refine`,
+`verify`, `all`) × 5 repeats, asking the logo, the amount due and the
+account number. Per configuration: hit rate (accepted centre inside ANY copy
+of the criterion — header, payment slip or bill 2's right-hand page),
+false-accept rate, `bbox: null` rate, accepted rate, how often a missed logo
+landed on the `text naming the utility` decoy, and prompt tokens and seconds
+per call kind. The numbers and the knob defaults chosen from them go here.
 
 **The grid step.** `CLASSIFIER_LLM_BBOX_GRID_STEP` (100 grid units) spaces the
 lines on the ask image and on the refine crop (which gets its own grid in its
@@ -2463,7 +2557,8 @@ located criterion (`2 ×` with `CLASSIFIER_LLM_BBOX_REFINE=false`), each capped
 at the criterion's model's `max_tokens.box` (muse-glimmer: 1024) and each
 counted against that model's `max_concurrent`. Every call goes to the same
 model the criterion was scored on; a text-only model never runs the loop
-(boxes are refused at submit). Metric:
+(boxes are refused at submit). Reference examples add images to these calls,
+never calls. Metric:
 `classifier_llm_bbox_attempts_total{outcome=accepted|rejected_invalid|rejected_verify|exhausted}`.
 
 **Before trusting it on a new model**, run the grounding experiment:
@@ -2471,11 +2566,41 @@ model the criterion was scored on; a text-only model never runs the loop
 ```bash
 # On the box (it talks to a models.yaml entry's URL directly — the default
 # unless --model names another vision entry)
-docker compose exec classifier python bin/grounding_experiment.py
-docker compose exec classifier python bin/grounding_experiment.py --model qwen2.5-vl
-docker compose exec classifier python bin/grounding_experiment.py \
+docker exec classifier uv run --no-sync python bin/grounding_experiment.py
+docker exec classifier uv run --no-sync python bin/grounding_experiment.py --model qwen2.5-vl
+docker exec classifier uv run --no-sync python bin/grounding_experiment.py \
   --images /data/roof-photos --criteria /data/criteria.json --out /data/grounding.json
+
+# With and without reference examples, scored against the truth boxes (the
+# container has no unit-tests/ folder: copy the bills and the truth file in,
+# then run once per bill as the reference — never its own candidate)
+docker exec classifier mkdir -p /data/grounding
+docker cp unit-tests/classifier/documents/utility_bill.jpeg   classifier:/data/grounding/
+docker cp unit-tests/classifier/documents/utility_bill_2.jpeg classifier:/data/grounding/
+docker cp unit-tests/classifier/documents/grounding_truth.json classifier:/data/grounding/
+docker exec classifier uv run --no-sync python bin/grounding_experiment.py --images /data/grounding \
+  --truth /data/grounding/grounding_truth.json \
+  --reference-image /data/grounding/utility_bill_2.jpeg --out /data/grounding/ref2.json
+docker exec classifier uv run --no-sync python bin/grounding_experiment.py --images /data/grounding \
+  --truth /data/grounding/grounding_truth.json \
+  --reference-image /data/grounding/utility_bill.jpeg --out /data/grounding/ref1.json
 ```
+
+`--configs` (default `off,ask,refine,verify,all`) names which calls see the
+examples; `--repeats` (default 5) repeats each, since the model samples at
+temperature 1.0; `--references r…` takes the examples from stored references
+instead of a truth-boxed image.
+
+The truth file is, per image, `{"criteria": {name: [[x1, y1, x2, y2], …]},
+"decoys": {name: [[x1, y1, x2, y2], …]}}` in original upright page pixels (a
+bare box is a list of one). Every real copy of a criterion is one of its
+boxes. Only `criteria` are asked; `--reference-image` draws each example
+from the criterion's first box. A **hit** is the accepted box's centre inside
+any copy; IoU and the centre error are against the best-matching copy
+(highest IoU, then the closest centre). **Decoys** are never asked. For a
+miss, `landed on` names the other criterion or decoy whose box holds the
+centre, criteria first: the identification case, a logo asked for and a
+line of `text naming the utility` boxed.
 
 If attempt-1 validity is under ~50%, prefer `detector` criteria as the primary
 source and keep `llm` criteria with `options.boxes` for labels the detector

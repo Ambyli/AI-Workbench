@@ -45,7 +45,9 @@ The rules around the rules:
     Several: every attempt, tagged with its ``item``, the total ``calls``,
     and ``accepted`` listing ``{"item", "attempt"}`` per accepted box
     (``accepted_attempt`` is null — an attempt number means nothing across
-    items).
+    items). ``references`` (what the loop was shown, one entry per unit,
+    already tagged with its ``item``) is the members' lists concatenated, at
+    both levels; absent when no member has one.
 
     aggregate_level()     — one level, over labelled members.
     pages_outcome()       — one document's pages, for per-item gating of a
@@ -90,6 +92,7 @@ def _merged_localization(members: list[Member]) -> Optional[dict]:
         return None
     attempts: list[dict] = []
     accepted: list[dict] = []
+    references: Optional[list[dict]] = None
     calls = 0
     for m in located:
         loc = m.outcome.localization
@@ -100,7 +103,14 @@ def _merged_localization(members: list[Member]) -> Optional[dict]:
             accepted.extend(loc.get("accepted", []))
         elif loc.get("accepted_attempt") is not None:
             accepted.append({"item": m.item, "attempt": loc["accepted_attempt"]})
-    return {"attempts": attempts, "accepted_attempt": None, "accepted": accepted, "calls": calls}
+        if "references" in loc:
+            # Each entry was tagged with its item when it was made, so both
+            # levels just concatenate.
+            references = (references or []) + list(loc["references"])
+    merged = {"attempts": attempts, "accepted_attempt": None, "accepted": accepted, "calls": calls}
+    if references is not None:
+        merged["references"] = references
+    return merged
 
 
 def _union(members: list[Member]) -> list:

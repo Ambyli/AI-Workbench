@@ -2654,6 +2654,52 @@ The `--out` JSON records each run's reasons as well as its numbers:
   * An answer that does not parse keeps its raw content, or the error, cut to
     400 characters, with `ok: false`.
   * The prompt is never stored.
+* `reference_image` is the page the examples came from, and `reference_note`
+  says why a pair ran unguided.
+
+**A test set of many pages.** Running every page × criterion × config at
+once takes hours, so the run is split in two steps, and the examples come
+from the set itself:
+
+* `--references-from-truth` (with `--truth`) builds each candidate's example,
+  per criterion and repeat, from ONE other page of the truth file that has a
+  box for that criterion. It uses the page's first box, built exactly as
+  `--reference-image` builds one.
+* The example page is never the candidate. With `--groups` (`{"file.jpg":
+  group}`), it is also never a page of the candidate's group. A project's
+  other pages are likely the same utility's, and the same template is not
+  what the run measures.
+* The pick is deterministic: the eligible pages are sorted and
+  `(crc32(candidate) + repeat) % n` is taken, so the repeats rotate through
+  different references. A pair with no eligible page runs unguided, and a
+  note says so.
+* `--groups-from-selection <selection.json> --write-groups <groups.json>`
+  writes the groups (each `pages[].image` → its `links[].project_id`) and
+  exits.
+* `--subset` (`{"file.jpg": ["criterion", …]}`) asks only those pairs.
+* `--write-failures <file>` writes, after a run, the `--subset` of pairs whose
+  `off` runs hit in under 50% of their repeats, and prints how many.
+
+```bash
+docker exec classifier mkdir -p /data/grounding_ops
+docker cp images         classifier:/data/grounding_ops/images
+docker cp truth.json     classifier:/data/grounding_ops/truth.json
+docker cp selection.json classifier:/data/grounding_ops/selection.json
+docker exec classifier uv run --no-sync python bin/grounding_experiment.py \
+  --groups-from-selection /data/grounding_ops/selection.json \
+  --write-groups /data/grounding_ops/groups.json
+# Step 1 — the baseline on everything; writes the pairs it fails
+docker exec classifier uv run --no-sync python bin/grounding_experiment.py \
+  --images /data/grounding_ops/images --truth /data/grounding_ops/truth.json \
+  --configs off --write-failures /data/grounding_ops/failures.json \
+  --out /data/grounding_ops/baseline.json
+# Step 2 — the guided configs on those pairs only
+docker exec classifier uv run --no-sync python bin/grounding_experiment.py \
+  --images /data/grounding_ops/images --truth /data/grounding_ops/truth.json \
+  --subset /data/grounding_ops/failures.json \
+  --references-from-truth --groups /data/grounding_ops/groups.json \
+  --configs ask,refine,verify,all --out /data/grounding_ops/guided.json
+```
 
 If attempt-1 validity is under ~50%, prefer `detector` criteria as the primary
 source and keep `llm` criteria with `options.boxes` for labels the detector

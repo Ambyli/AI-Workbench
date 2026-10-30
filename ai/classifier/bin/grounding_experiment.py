@@ -55,6 +55,31 @@ Usage::
     uv run --no-sync python bin/grounding_experiment.py --images /data/grounding \\
         --truth /data/grounding/grounding_truth.json --references r0123456789ab
 
+    # A test set of many pages, in two steps (every page x criterion x config
+    # at once is hours). Copy the set in — images/, truth.json and the set's
+    # selection.json — and derive the groups (one per project: a project's
+    # pages are likely one utility's, so never each other's example):
+    docker exec classifier mkdir -p /data/grounding_ops
+    docker cp images         classifier:/data/grounding_ops/images
+    docker cp truth.json     classifier:/data/grounding_ops/truth.json
+    docker cp selection.json classifier:/data/grounding_ops/selection.json
+    docker exec classifier uv run --no-sync python bin/grounding_experiment.py \\
+        --groups-from-selection /data/grounding_ops/selection.json \\
+        --write-groups /data/grounding_ops/groups.json
+    # Step 1 — the baseline, no examples, on everything; writes the pairs
+    # that hit in under half their repeats:
+    docker exec classifier uv run --no-sync python bin/grounding_experiment.py \\
+        --images /data/grounding_ops/images --truth /data/grounding_ops/truth.json \\
+        --configs off --write-failures /data/grounding_ops/failures.json \\
+        --out /data/grounding_ops/baseline.json
+    # Step 2 — the guided configurations on those pairs only, each example
+    # another page of the set, outside the candidate's project:
+    docker exec classifier uv run --no-sync python bin/grounding_experiment.py \\
+        --images /data/grounding_ops/images --truth /data/grounding_ops/truth.json \\
+        --subset /data/grounding_ops/failures.json \\
+        --references-from-truth --groups /data/grounding_ops/groups.json \\
+        --configs ask,refine,verify,all --out /data/grounding_ops/guided.json
+
 ``--criteria`` is a JSON object mapping file name to the criteria to ask
 about, e.g.::
 
@@ -98,6 +123,29 @@ the examples: ``off`` none, ``ask`` / ``refine`` / ``verify`` that call
 alone, ``all`` every one. Without examples only ``off`` runs. ``--repeats``
 (default 5) runs each image x criterion x configuration that many times —
 Muse samples at temperature 1.0, so one run of each is an anecdote.
+
+``--references-from-truth`` (a set of many pages, with ``--truth``) takes
+each example from the set itself: for every candidate x criterion x repeat,
+ONE other page of the truth file with a box for that criterion, built from
+its first box exactly as ``--reference-image`` builds one (cached per page
+and criterion). Never the candidate, and — with ``--groups``, a JSON
+``{"file.jpg": group}`` — never a page of the candidate's group: a project's
+other pages are likely the same utility's bills, and an example from the
+same template is not the generalisation being measured. The page is picked
+deterministically: the eligible pages sorted, ``(crc32(candidate) + repeat)
+% n`` — a rerun picks the same, and the repeats rotate through different
+references. A pair with no eligible page runs unguided, noted. Every record
+says which page was its example (``reference_image``, ``reference_note``).
+``--groups-from-selection <selection.json> --write-groups <groups.json>``
+writes the groups a test set's ``selection.json`` implies (each
+``pages[].image`` to its ``links[].project_id``) and exits.
+
+``--subset`` (``{"file.jpg": ["criterion", ...]}``) asks only those pairs;
+an image not listed is skipped. ``--write-failures <file>`` writes, after a
+run, the ``--subset`` of pairs whose ``off`` runs hit in under 50% of their
+repeats (a run that accepted nothing is a miss) and prints how many: step 1
+of the recipe above measures the baseline on everything, step 2 runs the
+guided configurations only where the baseline fails.
 
 ``--verify-images`` (default ``crop``) is what the verify call is shown when
 it carries examples (``verify`` and ``all``): ``crop``, the examples' region
@@ -159,6 +207,10 @@ detector the primary source and the LLM loop the fallback.
 repeat), with the numbers above per run, and — to say WHY, not just how often:
 
     verify_images   what a guided verify was shown on this run.
+    reference_image the page the examples were drawn from — the
+                    ``--reference-image``, or ``--references-from-truth``'s
+                    page for this repeat; null with stored references or
+                    none. ``reference_note`` says why a pair ran unguided.
     attempt_log     ``[a.as_dict() for a in loc.attempts]`` — each attempt's
                     box (``bbox_grid`` / ``bbox_px``, coarse and refined),
                     ``verify_score``, ``verify_reason`` and ``reject`` (the
@@ -195,6 +247,7 @@ import re
 import statistics
 import sys
 import time
+import zlib
 
 # The classifier's modules import each other by bare name (the container's
 # WORKDIR). Running this from `bin/` needs the parent on the path.
@@ -451,6 +504,115 @@ async def _stored_guide(
     return box_guide.ask, box_guide.crops
 
 
+# ``--references-from-truth``: the example for (candidate, criterion, repeat).
+# The note a pair gets when no page can serve as its example.
+NO_TRUTH_REFERENCE = (
+    "no other page in --truth has a box for this criterion outside the candidate's group "
+    "— run unguided"
+)
+
+
+def _truth_reference(
+    candidate: str,
+    label: str,
+    repeat: int,
+    truth: dict[str, Truth],
+    groups: dict[str, frozenset[str]],
+    available: set[str],
+) -> str | None:
+    """``--references-from-truth``: the ONE other page that is ``candidate``'s
+    example for ``label`` on this ``repeat``, or None when no page qualifies.
+
+    Eligible: a page of the truth file with a box for ``label``, present
+    under ``--images``, neither the candidate nor in a group it shares
+    (``--groups``; a page with no group shares none). Picked
+    deterministically — the eligible pages sorted, then ``(crc32(candidate) +
+    repeat) % n`` — so a rerun picks the same page and the repeats rotate
+    through different references (each repeat is a different example, not
+    the same one five times)."""
+    mine = groups.get(candidate, frozenset())
+    eligible = sorted(
+        name for name, entry in truth.items()
+        if name != candidate and name in available and entry["criteria"].get(label)
+        and not mine & groups.get(name, frozenset())
+    )
+    if not eligible:
+        return None
+    return eligible[(zlib.crc32(candidate.encode("utf-8")) + repeat) % len(eligible)]
+
+
+def _load_groups(path: pathlib.Path) -> dict[str, frozenset[str]]:
+    """``--groups``: file name → its group, as ``{name: group}`` — a string or
+    number, or a list for a page in several (it then shares a group with
+    every page in any of them). A page that is not listed is in no group:
+    only itself is excluded as its own reference."""
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise SystemExit(f"{path}: expected {{filename: group}}")
+    groups: dict[str, frozenset[str]] = {}
+    for name, group in data.items():
+        values = group if isinstance(group, list) else [group]
+        if not values or not all(isinstance(v, (str, int)) and not isinstance(v, bool)
+                                 for v in values):
+            raise SystemExit(f"{path}: {name!r}: a group is a string, a number or a list of them")
+        groups[name] = frozenset(str(v) for v in values)
+    return groups
+
+
+def _groups_from_selection(path: pathlib.Path) -> dict[str, object]:
+    """``--groups-from-selection``: the ``--groups`` mapping a test set's
+    ``selection.json`` implies — each ``pages[].image`` → the project id of
+    its ``links[].project_id`` (a sorted list when it links to several). A
+    project's pages are likely the same utility's bills, so a page is never
+    another's example within one project. Ids only: nothing else is read."""
+    data = json.loads(path.read_text(encoding="utf-8"))
+    pages = data.get("pages") if isinstance(data, dict) else None
+    if not isinstance(pages, list):
+        raise SystemExit(f"{path}: expected {{\"pages\": [{{\"image\", \"links\": [...]}}, ...]}}")
+    groups: dict[str, object] = {}
+    for page in pages:
+        image = page.get("image") if isinstance(page, dict) else None
+        if not isinstance(image, str):
+            raise SystemExit(f"{path}: a page without an 'image' file name")
+        ids = sorted({link.get("project_id") for link in page.get("links") or []
+                      if isinstance(link, dict) and link.get("project_id") is not None})
+        if ids:
+            groups[image] = ids[0] if len(ids) == 1 else ids
+    return groups
+
+
+def _load_subset(path: pathlib.Path) -> dict[str, list[str]]:
+    """``--subset`` (and what ``--write-failures`` writes): file name → the
+    criteria to ask on it."""
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or not all(
+        isinstance(v, list) and all(isinstance(c, str) for c in v) for v in data.values()
+    ):
+        raise SystemExit(f"{path}: expected {{filename: [criterion, ...]}}")
+    return data
+
+
+# A pair whose baseline (``off``) hit rate is under this goes to
+# ``--write-failures`` — the pairs the guided configurations are run on next.
+FAILURE_HIT_RATE = 0.5
+
+
+def _failures(records: list[dict]) -> tuple[dict[str, list[str]], int]:
+    """``--write-failures``: the ``--subset`` of pairs whose ``off`` runs hit
+    in under FAILURE_HIT_RATE of their repeats (a run that accepted nothing
+    is a miss), in run order, and how many pairs were measured. Pairs with no
+    truth box are not measured."""
+    runs: dict[tuple[str, str], list[bool]] = {}
+    for r in records:
+        if r["config"] == "off" and r["hit"] is not None:
+            runs.setdefault((r["image"], r["criterion"]), []).append(bool(r["hit"]))
+    failing: dict[str, list[str]] = {}
+    for (image, criterion), hits in runs.items():
+        if _rate(hits) < FAILURE_HIT_RATE:
+            failing.setdefault(image, []).append(criterion)
+    return failing, len(runs)
+
+
 # ---------------------------------------------------------------------------
 # Scoring one run against the truth
 # ---------------------------------------------------------------------------
@@ -598,6 +760,17 @@ async def run(args) -> dict:
             pathlib.Path(args.criteria).resolve() if args.criteria else None,
             [p.name for p in paths],
         )
+    if args.subset:
+        # Only the listed pairs; an image not listed is skipped.
+        subset = _load_subset(pathlib.Path(args.subset).resolve())
+        wanted = sum(len(set(v)) for v in subset.values())
+        criteria_map = {
+            name: [c for c in labels if c in set(subset.get(name, []))]
+            for name, labels in criteria_map.items()
+        }
+        kept = sum(len(v) for v in criteria_map.values())
+        print(f"subset  : {kept} of the {wanted} pair(s) in {args.subset} found among the "
+              "images and their criteria")
 
     spec = _model(args.model)
     configs = [c.strip() for c in args.configs.split(",") if c.strip()]
@@ -611,8 +784,20 @@ async def run(args) -> dict:
     image_examples: dict[str, tuple[list[BoxExample], list[BoxExample]]] = {}
     stored: dict[str, list[dict]] = {}
     stored_pages: set[str] = set()
-    if reference_path is not None and args.references:
-        raise SystemExit("give --reference-image or --references, not both")
+    if sum(bool(x) for x in (reference_path, args.references, args.references_from_truth)) > 1:
+        raise SystemExit(
+            "give one of --reference-image, --references, --references-from-truth"
+        )
+    if args.references_from_truth and not truth:
+        raise SystemExit("--references-from-truth draws its examples from --truth: give one")
+    if args.groups and not args.references_from_truth:
+        raise SystemExit("--groups only says which pages may not be each other's example: "
+                         "it needs --references-from-truth")
+    if args.write_failures and not truth:
+        raise SystemExit("--write-failures needs --truth: a failure is a missed hit")
+    groups = _load_groups(pathlib.Path(args.groups).resolve()) if args.groups else {}
+    by_name = {p.name: p for p in paths}
+    truth_examples: dict[tuple[str, str], tuple[list[BoxExample], list[BoxExample]] | None] = {}
     if reference_path is not None:
         if not (truth.get(reference_path.name) or {}).get("criteria"):
             raise SystemExit(
@@ -625,16 +810,44 @@ async def run(args) -> dict:
                                          truth[reference_path.name]["criteria"])
     elif args.references:
         stored, stored_pages = _stored_examples(args.references)
-    examples_given = bool(image_examples or stored)
+    elif args.references_from_truth and spec.max_images_per_prompt < 2:
+        raise SystemExit(f"--model {spec.id} takes 1 image per prompt: no room for an example")
+    examples_given = bool(image_examples or stored or args.references_from_truth)
     if not examples_given and configs != ["off"]:
-        print("no --reference-image / --references: only the 'off' configuration is measured")
+        print("no --reference-image / --references / --references-from-truth: only the "
+              "'off' configuration is measured")
         configs = ["off"]
+    if args.write_failures and "off" not in configs:
+        raise SystemExit("--write-failures reads the 'off' runs: include off in --configs")
+
+    def truth_example(
+        page: str, label: str
+    ) -> tuple[list[BoxExample], list[BoxExample]] | None:
+        """``page``'s example for ``label`` (its first box), built once per
+        (page, criterion) as ``--reference-image`` builds it; None when the
+        page will not load (the pair then runs unguided — never fatal)."""
+        key = (page, label)
+        if key not in truth_examples:
+            try:
+                truth_examples[key] = _image_examples(
+                    by_name[page], {label: truth[page]["criteria"][label]}
+                )[label]
+            except SystemExit as exc:   # _image_examples: "unreadable"
+                print(f"    {exc}", file=sys.stderr)
+                truth_examples[key] = None
+        return truth_examples[key]
 
     print(f"model   : {spec.id} ({spec.served_name}) at {spec.url}")
     print(f"detector: {'on — ' + str(detector_client.status()['url_host']) if detector_client.is_configured() else 'off'}")
     print(f"loop    : {args.attempts} attempt(s), verify >= {LLM_BBOX_VERIFY_PASS}, "
           f"area {LLM_BBOX_MIN_AREA:.3%}-{LLM_BBOX_MAX_AREA:.0%}, refine {LLM_BBOX_REFINE}")
-    print(f"examples: {reference_path.name if reference_path else (', '.join(args.references) if args.references else 'none')}")
+    if args.references_from_truth:
+        excluded = (f"outside its group (--groups {args.groups}, {len(groups)} page(s) "
+                    "grouped)" if args.groups else "other than itself (no --groups)")
+        print(f"examples: from --truth: one other page per candidate x criterion x repeat, "
+              f"{excluded}")
+    else:
+        print(f"examples: {reference_path.name if reference_path else (', '.join(args.references) if args.references else 'none')}")
     print(f"configs : {', '.join(configs)}, {args.repeats} repeat(s) each")
     print(f"verify  : shown {args.verify_images}s when it carries examples")
     print(f"images  : {len(paths)} under {directory}\n")
@@ -674,6 +887,23 @@ async def run(args) -> dict:
             else:
                 ask_examples, crop_examples = [], []
             for repeat in range(1, args.repeats + 1):
+                # One example per (candidate, criterion, repeat), the same in
+                # every configuration so the configurations compare fairly.
+                reference_image = reference_path.name if reference_path else None
+                reference_note = None
+                if args.references_from_truth:
+                    reference_image = _truth_reference(
+                        path.name, label, repeat, truth, groups, set(by_name)
+                    )
+                    built = (truth_example(reference_image, label)
+                             if reference_image is not None else None)
+                    if reference_image is None:
+                        reference_note = NO_TRUTH_REFERENCE
+                    elif built is None:
+                        reference_note = f"{reference_image} would not load — run unguided"
+                    ask_examples, crop_examples = built or ([], [])
+                    print(f"    {label[:30]} #{repeat}: example {reference_image or 'none'} "
+                          f"{'(' + reference_note + ')' if reference_note else ''}".rstrip())
                 for config in configs:
                     guide_ask, guide_refine, guide_verify = CONFIGS[config]
                     first_row = len(log.rows)
@@ -722,6 +952,8 @@ async def run(args) -> dict:
                         "calls": loc.calls,
                         "guided": dict(loc.guided),
                         "verify_images": args.verify_images,
+                        "reference_image": reference_image,
+                        "reference_note": reference_note,
                         "detector_iou": accepted.detector_iou if accepted else None,
                         "detector_boxes": len(detector.get(label) or []),
                         "seconds": round(elapsed, 2),
@@ -753,6 +985,14 @@ async def run(args) -> dict:
     summary = _summarise(records, time.monotonic() - started, spec.id, configs, bool(truth),
                          args.verify_images)
     _print_summary(summary)
+    if args.write_failures:
+        failing, measured = _failures(records)
+        pathlib.Path(args.write_failures).write_text(
+            json.dumps(failing, indent=2), encoding="utf-8"
+        )
+        print(f"\n{sum(len(v) for v in failing.values())} of {measured} pair(s) hit in under "
+              f"{FAILURE_HIT_RATE:.0%} of their 'off' runs — wrote {args.write_failures} "
+              "(use it as --subset)")
     if args.out:
         out = pathlib.Path(args.out)
         out.write_text(
@@ -954,6 +1194,36 @@ def main() -> None:
              "matched by criterion name",
     )
     parser.add_argument(
+        "--references-from-truth", action="store_true",
+        help="for each candidate x criterion x repeat, take the example from ONE other page "
+             "of --truth with a box for it, outside the candidate's --groups group; rotates "
+             "across repeats",
+    )
+    parser.add_argument(
+        "--groups", default=None,
+        help='JSON {"file.jpg": group}: with --references-from-truth, a page never serves '
+             "as the example for a page of its own group (default: only itself is excluded)",
+    )
+    parser.add_argument(
+        "--groups-from-selection", default=None, metavar="SELECTION_JSON",
+        help="write the --groups file a test set's selection.json implies (pages[].image -> "
+             "its links[].project_id) to --write-groups, and exit — no model call",
+    )
+    parser.add_argument(
+        "--write-groups", default=None, metavar="GROUPS_JSON",
+        help="where --groups-from-selection writes",
+    )
+    parser.add_argument(
+        "--subset", default=None,
+        help='JSON {"file.jpg": ["criterion", ...]}: ask only these pairs (what '
+             "--write-failures writes); images not listed are skipped",
+    )
+    parser.add_argument(
+        "--write-failures", default=None, metavar="SUBSET_JSON",
+        help="after the run, write the --subset of pairs whose 'off' runs hit in under "
+             f"{FAILURE_HIT_RATE:.0%}% of their repeats (needs --truth and the off config)",
+    )
+    parser.add_argument(
         "--configs", default=",".join(CONFIGS),
         help="which calls see the examples, comma-separated: "
              f"{', '.join(CONFIGS)} (default: all five)",
@@ -982,6 +1252,15 @@ def main() -> None:
     args = parser.parse_args()
     if args.repeats < 1:
         parser.error("--repeats must be at least 1")
+    if bool(args.groups_from_selection) != bool(args.write_groups):
+        parser.error("--groups-from-selection and --write-groups go together")
+    if args.groups_from_selection:
+        groups = _groups_from_selection(pathlib.Path(args.groups_from_selection))
+        pathlib.Path(args.write_groups).write_text(json.dumps(groups, indent=2),
+                                                   encoding="utf-8")
+        projects = {str(g) for v in groups.values() for g in (v if isinstance(v, list) else [v])}
+        print(f"wrote {args.write_groups}: {len(groups)} page(s) in {len(projects)} group(s)")
+        return
     asyncio.run(run(args))
 
 

@@ -31,10 +31,23 @@ reference up by id.
                        reference store once per job and cached. A reference
                        DELETED after submit raises ``EvaluationError`` — that
                        criterion's units fail (status "error"), nothing else.
+        crop_b64()     an example's region crop as base64 — its ORIGINAL
+                       page cut around its first region
+                       (``llm.boxes.example_crop``), cached; None when the
+                       page is gone or unreadable.
+        box_examples() what the BOX LOOP shows one unit (a ``BoxGuide``):
+                       ``box_selection``'s examples, loaded — composites for
+                       the ask (crops under the position check), crops for
+                       refine and verify. Never raises: an example that
+                       cannot be loaded is dropped from every step, noted.
+                       Built by ``analysis.llm_eval`` only when a
+                       CLASSIFIER_REFERENCE_BOX_* knob is on.
         finish()       the opt-in POSITION check, run by the scheduler on a
                        finished unit (see below).
-        record_calls() what each guided scoring call carried, for
-                       ``references.json``.
+        record_calls() what each guided call carried, for
+                       ``references.json`` — each with its ``kind``
+                       (``scoring``, ``box_ask``, ``box_refine``,
+                       ``box_verify``).
         summary()      the result's top-level ``references`` block.
         artifact()     the ``references.json`` body.
     plan_calls()     which examples share a scoring call: with room for three
@@ -45,6 +58,10 @@ reference up by id.
                      CLASSIFIER_REFERENCE_MAX_PER_CRITERION calls.
     combine()        several guided answers → one: ``any`` the best (with its
                      reason), ``all`` the lowest, ``mean`` the rounded mean.
+    box_selection()  which examples the box loop is shown: regions only,
+                     PASS then MARGINAL then FAIL (a FAIL only when its
+                     reference criterion's hint is presence), one PASS-side
+                     slot plus, at three images, one FAIL slot.
     describe_page()  ONE single-image call: a short, neutral description of a
                      reference's page, for the catalogue ``references:
                      "auto"`` reads. Made by the creation job
@@ -68,8 +85,8 @@ runs on the JOB's model (``DocumentContext.default_model``), the describe
 call on the creation job's.
 
 Process flow position: ``JobReferences`` is built by ``analysis.pipeline``,
-read by ``analysis.llm_eval`` / ``cv_eval`` (guide, images) and
-``analysis.scheduler`` (finish); ``describe_page`` is called by
+read by ``analysis.llm_eval`` / ``cv_eval`` (guide, images, box examples)
+and ``analysis.scheduler`` (finish); ``describe_page`` is called by
 ``jobs.runners.run_reference``.
 """
 
@@ -95,12 +112,14 @@ from config import (
 )
 # A module, not names: tests script the model at `llm.client._send`, under
 # the limit, and every call must reach the one object they replaced.
+from llm import boxes as llm_boxes
 from llm import client as llm_client
 from llm.models import ModelSpec, get_registry
-from llm.prompts import build_describe_prompt, build_reference_selection_prompt
+from llm.prompts import BoxExample, build_describe_prompt, build_reference_selection_prompt
 from llm.validate import description_validator, selection_validator
 from logger import logger
 from metrics import reference_calls_total
+from references.model import PAGE_FILE
 from references.render import catalogue_text
 from references.store import reference_files
 from utils import verdict_from_score
@@ -171,6 +190,68 @@ def combine(answers: list[tuple[int, dict]], rule: str) -> tuple[dict, int]:
     return dict(answer), call
 
 
+def box_selection(
+    examples: list[dict[str, Any]], max_images: int
+) -> tuple[list[dict[str, Any]], Optional[str]]:
+    """Which of a criterion's examples the BOX LOOP is shown, in order, and
+    — when none — why.
+
+    Only examples WITH regions (``region_source`` not ``whole_page`` and a
+    non-empty ``regions``): a whole page has no outline to teach where. A
+    FAIL example only when its REFERENCE criterion's ``hint`` is
+    ``presence`` — there FAIL means "not there", so whatever is outlined is
+    NOT the feature; under ``quality`` / ``auto`` FAIL can mean "there, but
+    bad" (an illegible signature) and showing it as "do not box this" would
+    steer the model off the right object. A plan queued before ``hint``
+    existed has none: not presence.
+
+    The order is PASS, then MARGINAL, then FAIL, each in list order —
+    deliberately unlike ``plan_calls``, which keeps PASS and MARGINAL
+    together in list order: a MARGINAL outline is a borderline instance, the
+    weaker teacher of WHAT to box, so a PASS outline takes the one PASS-side
+    slot when there is one.
+
+    The budget is ``max_images − 1`` (the candidate takes one), and the loop
+    stays one call per step: one PASS-side slot, plus at three or more
+    images one FAIL slot. With no PASS-side example an eligible FAIL rides
+    alone at three or more (the only save so far may be "it boxed the
+    heading"); at two only a PASS-side example is ever shown; at one, none
+    (the submit refuses references below two images, so ``/assess`` cannot
+    reach it).
+    """
+    framed = [
+        e for e in examples
+        if e.get("region_source") != "whole_page" and e.get("regions")
+    ]
+    if not framed:
+        return [], (
+            "no example has a region to show the box loop (a whole-page example "
+            "teaches no location)"
+        )
+    if max_images < 2:
+        return [], (
+            f"the model takes {max_images} image(s) per prompt — no room for an "
+            "example beside the candidate"
+        )
+    positive = (
+        [e for e in framed if e["polarity"] == "pass"]
+        + [e for e in framed if e["polarity"] == "marginal"]
+    )
+    negative = [e for e in framed if e["polarity"] == "fail" and e.get("hint") == "presence"]
+    chosen = positive[:1] + (negative[:1] if max_images >= 3 else [])
+    if chosen:
+        return chosen, None
+    if negative:
+        return [], (
+            f"only a FAIL example has a region, and at {max_images} images per prompt "
+            "the box loop is shown a PASS-side example only"
+        )
+    return [], (
+        "only FAIL examples have regions, and the box loop is shown a FAIL only when "
+        "its reference criterion's hint is presence"
+    )
+
+
 # ---------------------------------------------------------------------------
 # One criterion's guidance, and the job's
 # ---------------------------------------------------------------------------
@@ -204,11 +285,35 @@ class CriterionGuide:
 
 
 @dataclass
+class BoxGuide:
+    """What the box loop is shown for one unit (``JobReferences.box_examples``).
+
+    Attributes:
+        ask:        The ask's examples — composites, or region crops under
+                    the position check.
+        crops:      The same examples as region crops, for refine and verify.
+        records:    ``{reference_id, criterion, polarity, composite}`` per
+                    example in them, for ``localization.references`` and
+                    ``references.json``.
+        ask_images: ``"composite"`` | ``"crop"`` — what the ask is shown.
+        note:       Why there are none, or which were dropped; None when
+                    there is nothing to say.
+    """
+
+    ask: list[BoxExample] = field(default_factory=list)
+    crops: list[BoxExample] = field(default_factory=list)
+    records: list[dict[str, Any]] = field(default_factory=list)
+    ask_images: str = "composite"
+    note: Optional[str] = None
+
+
+@dataclass
 class JobReferences:
     """One job's reference plan, and what the job did with it."""
 
     plan: dict[str, Any]
     _images: dict[tuple[str, str], str] = field(default_factory=dict)
+    _crops: dict[tuple[str, str], str] = field(default_factory=dict)
     _calls: list[dict[str, Any]] = field(default_factory=list)
     # auto: one selection per item — the future (memo) and what it decided.
     _selecting: dict[int, "asyncio.Future[Optional[list[dict]]]"] = field(default_factory=dict)
@@ -395,8 +500,102 @@ class JobReferences:
         self._images[key] = encoded
         return encoded
 
+    async def crop_b64(self, example: dict[str, Any]) -> Optional[str]:
+        """An example's region crop, base64 — cut from the reference's
+        ORIGINAL page (``page.jpg``, the frame its regions are in) around its
+        FIRST region by ``llm.boxes.example_crop``, the way the verify crop is
+        cut from the candidate's. The first region is the right one: a
+        pipeline region is the one accepted box, and a caller's first region
+        is the one it named first. A polygon is cut by its bounds. Read and
+        decoded once per job (cached by ``(reference_id, criterion)``).
+
+        None when ``page.jpg`` is gone (a reference deleted after submit) or
+        does not decode."""
+        key = (example["reference_id"], example["criterion"])
+        cached = self._crops.get(key)
+        if cached is not None:
+            return cached
+        raw = await asyncio.to_thread(reference_files.open, example["reference_id"], PAGE_FILE)
+        if raw is None:
+            return None
+        bounds = list(Region.from_dict(example["regions"][0]).bounds())
+
+        def cut() -> Optional[str]:
+            import cv2
+            import numpy as np
+
+            page = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if page is None:
+                return None
+            crop = llm_boxes.example_crop(page, bounds)
+            return None if crop is None else llm_client.encode_image_to_base64(crop)
+
+        encoded = await asyncio.to_thread(cut)
+        if encoded is not None:
+            self._crops[key] = encoded
+        return encoded
+
+    async def box_examples(
+        self, guide: CriterionGuide, spec: ModelSpec, *, position_check: bool
+    ) -> BoxGuide:
+        """The examples the box loop shows for one unit of ``guide``'s
+        criterion on ``spec``.
+
+        Chosen by ``box_selection`` (regions only, FAIL only under a
+        presence hint, one PASS-side + one FAIL at most), then loaded: the
+        ask's composites through the ``image_b64`` cache — or, under the
+        position check (``options.reference.position: "check"``), the region
+        crops, so the ask is shown the feature without the page around it
+        and cannot be nudged toward the example's spot, which is exactly what
+        the check then compares against — and every example's region crop
+        (``crop_b64``) for refine and verify.
+
+        **Never raises.** The score is final by now and the loop never moves
+        it, so an example that cannot be loaded — a reference deleted after
+        submit (``EvaluationError``), a missing or undecodable ``page.jpg``,
+        any other failure — is dropped from EVERY step, with a note, so
+        every step sees the same examples. Called by ``analysis.llm_eval``
+        only after the loop's gate passed and a knob is on, so a page that is
+        not located never decodes a reference page.
+        """
+        chosen, note = box_selection(guide.examples, spec.max_images_per_prompt)
+        out = BoxGuide(ask_images="crop" if position_check else "composite", note=note)
+        dropped: list[str] = []
+        for example in chosen:
+            rid = example["reference_id"]
+            try:
+                composite = None if position_check else await self.image_b64(example)
+                crop = await self.crop_b64(example)
+            except Exception as exc:  # noqa: BLE001 — a lost example never fails the unit
+                dropped.append(f"{rid}: {exc}")
+                continue
+            if crop is None:
+                dropped.append(f"{rid}: its page image ({PAGE_FILE}) is missing or unreadable")
+                continue
+            verdict = example["expected"]["verdict"]
+            out.ask.append(BoxExample(
+                criterion=example["criterion"], verdict=verdict,
+                image_b64=crop if position_check else composite, crop=position_check,
+            ))
+            out.crops.append(BoxExample(
+                criterion=example["criterion"], verdict=verdict, image_b64=crop, crop=True,
+            ))
+            out.records.append({
+                "reference_id": rid, "criterion": example["criterion"],
+                "polarity": example["polarity"], "composite": example["composite"],
+            })
+        if dropped:
+            out.note = (
+                "no example could be loaded for the box loop — " if not out.ask
+                else "dropped from the box loop, could not be loaded — "
+            ) + "; ".join(dropped)
+            logger.warning("references: box examples for '%s': %s", guide.name, out.note)
+        return out
+
     def record_calls(self, name: str, item: int, calls: list[dict[str, Any]]) -> None:
-        """What one unit's guided calls carried, for ``references.json``."""
+        """What one unit's guided calls carried, for ``references.json`` —
+        each entry with its ``kind``: ``scoring``, or the box loop's
+        ``box_ask`` / ``box_refine`` / ``box_verify``."""
         for call in calls:
             self._calls.append({"criterion": name, "item": item, **call})
 
@@ -504,7 +703,9 @@ class JobReferences:
                 {k: v for k, v in record.items() if k != "raw"}
                 for _, record in sorted(self._selections.items())
             ],
-            "calls": len(self._calls),
+            # The guided SCORING calls — references.json lists the box loop's
+            # guided calls too, each with its `kind`.
+            "calls": sum(1 for c in self._calls if c.get("kind", "scoring") == "scoring"),
             "selection_calls": sum(
                 1 for r in self._selections.values() if r["status"] in ("ok", "failed")
             ),
@@ -512,7 +713,8 @@ class JobReferences:
 
     def artifact(self) -> dict[str, Any]:
         """The ``references.json`` body: the plan, and every guided call's
-        images — which composite went into which call."""
+        images — which example went into which call, scoring and box loop
+        alike (each call's ``kind`` says which)."""
         return {
             "summary": self.summary(),
             "catalogue": self.plan.get("catalogue"),

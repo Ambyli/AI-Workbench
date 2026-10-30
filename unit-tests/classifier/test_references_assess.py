@@ -26,7 +26,15 @@ What is pinned here:
     pool and pick by key, and an old `auto` plan without `matched_by`;
   * the images per call — 2 for one example, 3 for a contrastive PASS + FAIL
     call, one example per call when the model takes only two; the box loop
-    and an unguided criterion still send one;
+    (knobs off) and an unguided criterion still send one;
+  * the box loop WITH examples (the CLASSIFIER_REFERENCE_BOX_* knobs patched
+    on): a guided `score: false` locate job, `localization.references` and
+    the `references.json` / metric kinds with a failed box call, one entry
+    per page on a two-page criterion, the notes when the loop ran unguided,
+    a missing `page.jpg` or a reference deleted before the loop (dropped,
+    the unit `ok`), a FAIL not shown unless its reference is `presence` (an
+    old plan without `hint` included), the position check's ask crops, and a
+    position check unchanged by what the loop was shown;
   * `combine` any / all / mean, a partial failure (noted) and a total one
     (the unit errors), a reference deleted after submit (the unit errors);
   * the position check — hit, miss (capped), unlocated (not capped), and a
@@ -113,6 +121,8 @@ class FakeModel:
         if kind == "bbox":
             body = {"bbox": self.bbox, "confidence": 90, "reason": "it"}
         elif kind == "verify":
+            if isinstance(self.verify, Exception):
+                raise self.verify
             body = {"score": self.verify, "reason": "it"}
         elif kind == "describe":
             body = {"description": "a page"}
@@ -571,6 +581,285 @@ def test_the_box_loop_still_sends_one_image(client, model, refs):
     for kind, prompt in model.calls:
         kinds.setdefault(kind, set()).add(FakeModel.images(prompt))
     assert kinds["score"] == {2} and kinds["bbox"] == {1} and kinds["verify"] == {1}
+
+
+# ---------------------------------------------------------------------------
+# Reference examples in the box loop (ZT-527) — the CLASSIFIER_REFERENCE_BOX_*
+# knobs on. The test above is the knobs-off pin.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def knobs(monkeypatch):
+    """Set the three knobs where they are read (``llm.boxes``)."""
+    from llm import boxes as llm_boxes
+
+    def set_knobs(ask=True, refine=True, verify=True):
+        monkeypatch.setattr(llm_boxes, "REFERENCE_BOX_ASK", ask)
+        monkeypatch.setattr(llm_boxes, "REFERENCE_BOX_REFINE", refine)
+        monkeypatch.setattr(llm_boxes, "REFERENCE_BOX_VERIFY", verify)
+
+    return set_knobs
+
+
+def _box_prompts(model: FakeModel, step: str) -> list[dict]:
+    """The loop's prompts for one step: ``ask``, ``refine`` (the zoomed ask)
+    or ``verify``."""
+    if step == "verify":
+        return [p for k, p in model.calls if k == "verify"]
+    zoomed = step == "refine"
+    return [p for k, p in model.calls
+            if k == "bbox" and ("zoomed" in FakeModel.texts(p)[-1]) == zoomed]
+
+
+def _calls_total(kind: str, outcome: str) -> float:
+    from prometheus_client import REGISTRY
+
+    return REGISTRY.get_sample_value(
+        "classifier_reference_calls_total", {"kind": kind, "outcome": outcome}) or 0.0
+
+
+def _record(rid: str, polarity: str) -> dict:
+    from references.model import composite_name
+
+    return {"reference_id": rid, "criterion": HOUSE, "polarity": polarity,
+            "composite": composite_name(HOUSE)}
+
+
+def test_a_guided_locate_job_runs_the_guided_loop(client, model, refs, knobs, monkeypatch):
+    """A ZT-526 locate job — `score: false`, presence, boxes — with a PASS and
+    a presence FAIL example: every step carries them, before the candidate."""
+    from llm import boxes as llm_boxes
+    from references.model import composite_name
+
+    knobs()
+    monkeypatch.setattr(llm_boxes, "LLM_BBOX_REFINE", True)
+    job = _assess(client, {
+        "criteria": [{"name": HOUSE, "type": "llm", "score": False,
+                      "options": {"hint": "presence", "boxes": True}}],
+        "references": [refs["pass"], refs["fail"]],
+    })
+    entry = _entry(job)
+    assert entry["status"] == "ok" and entry["score"] is None
+    loc = entry["localization"]
+    assert loc["accepted_attempt"] == 1 and loc["calls"] == 3
+
+    (ask,) = _box_prompts(model, "ask")
+    assert FakeModel.images(ask) == 3
+    texts = FakeModel.texts(ask)
+    assert texts[0] == ("REFERENCE EXAMPLE — 'has a house' was PASS here; the coloured box "
+                        "outlines it.")
+    assert texts[1] == ("REFERENCE EXAMPLE — 'has a house' was FAIL here — the outlined thing "
+                        "is NOT has a house; do not box it.")
+    assert texts[2].endswith("CANDIDATE — locate the feature only in this image:")
+    # The ask's example IS the stored composite — what production renders once.
+    stored = client.get(f"/references/{refs['pass']}/files/{composite_name(HOUSE)}").content
+    assert ask["messages"][1]["content"][1]["image_url"]["url"].endswith(
+        base64.b64encode(stored).decode())
+    for step in ("refine", "verify"):
+        (prompt,) = _box_prompts(model, step)
+        assert FakeModel.images(prompt) == 3
+        assert FakeModel.texts(prompt)[0] == (
+            "REFERENCE EXAMPLE (from another document) — a crop showing 'has a house' "
+            "(PASS there).")
+
+    assert loc["references"] == [{
+        "item": 0, "applied": True, "ask_images": "composite",
+        "examples": [_record(refs["pass"], "pass"), _record(refs["fail"], "fail")],
+        "ask": True, "refine": True, "verify": True, "note": None,
+    }]
+    assert entry["items"][0]["localization"]["references"] == loc["references"]
+
+
+def test_box_calls_are_recorded_with_their_kind_including_a_failed_one(
+    client, model, refs, knobs
+):
+    knobs(refine=False)
+    model.verify = httpx.ConnectError("verify down")   # every verify call fails
+    before = {(k, o): _calls_total(k, o) for k in ("scoring", "box_ask", "box_verify")
+              for o in ("ok", "failed")}
+    job = _assess(client, {"criteria": [_house(boxes=True)], "references": [refs["pass"]]})
+    entry = _entry(job)
+    # Nothing accepted, the score untouched — the loop never moves it.
+    assert entry["status"] == "ok" and entry["score"] == 9
+    assert entry["localization"]["accepted_attempt"] is None
+    assert entry["localization"]["references"][0]["applied"] is True
+
+    delta = {key: _calls_total(*key) - value for key, value in before.items()}
+    assert delta == {("scoring", "ok"): 1, ("scoring", "failed"): 0,
+                     ("box_ask", "ok"): 3, ("box_ask", "failed"): 0,
+                     ("box_verify", "ok"): 0, ("box_verify", "failed"): 3}
+
+    stored = client.get(f"/jobs/{job['job_id']}/artifacts/references.json").json()
+    assert [c["kind"] for c in stored["calls"]] == ["scoring"] + ["box_ask", "box_verify"] * 3
+    scoring, ask, verify = stored["calls"][:3]
+    assert scoring["images"] == 2 and "attempt" not in scoring
+    assert ask == {"criterion": HOUSE, "item": 0, "kind": "box_ask", "attempt": 1,
+                   "images": 2, "example_images": "composite",
+                   "examples": [_record(refs["pass"], "pass")], "ok": True}
+    assert (verify["kind"], verify["example_images"], verify["ok"]) == ("box_verify", "crop", False)
+    # The top-level count stays the guided SCORING calls.
+    assert job["result"]["references"]["calls"] == 1
+
+
+def test_a_two_page_criterion_merges_one_entry_per_page(client, model, refs, knobs):
+    knobs()
+    r = client.post("/assess", json={
+        "documents": [_doc(), _doc()], "criteria": [_house(boxes=True)],
+        "references": [refs["pass"]],
+    })
+    assert r.status_code == 202, r.text
+    job = _wait(client, f"/jobs/{r.json()['job_id']}", lambda b: b.get("phase") == "completed")
+    entry = _entry(job)
+    merged = entry["localization"]["references"]
+    assert [(e["item"], e["applied"]) for e in merged] == [(0, True), (1, True)]
+    assert [u["localization"]["references"] for u in entry["items"]] == [[merged[0]], [merged[1]]]
+
+
+def test_unguided_loops_say_why(client, model, refs, knobs):
+    """The loop runs as today — one image — and the entry says why: a
+    whole-page-only guide, the knobs off, or a guide that never applied."""
+    knobs()
+    job = _assess(client, {"criteria": [_house(boxes=True)], "references": [refs["whole"]]})
+    assert {FakeModel.images(p) for k, p in model.calls if k in ("bbox", "verify")} == {1}
+    assert _entry(job)["localization"]["references"] == [{
+        "item": 0, "applied": False, "ask_images": None, "examples": [],
+        "ask": False, "refine": False, "verify": False,
+        "note": "no example has a region to show the box loop (a whole-page example "
+                "teaches no location)",
+    }]
+
+    knobs(ask=False, refine=False, verify=False)
+    job = _assess(client, {"criteria": [_house(boxes=True)], "references": [refs["pass"]]})
+    (entry,) = _entry(job)["localization"]["references"]
+    assert entry["applied"] is False
+    assert entry["note"] == "the CLASSIFIER_REFERENCE_BOX_* knobs are off"
+
+    knobs()
+    job = _assess(client, {"criteria": [{"name": "a barn", "type": "llm", "options": {
+        "hint": "presence", "boxes": True}}], "references": [refs["pass"]]})
+    (entry,) = _entry(job, "a barn")["localization"]["references"]
+    assert entry["applied"] is False and "no listed reference" in entry["note"]
+
+
+def test_a_missing_page_jpg_drops_the_example_and_keeps_the_unit(client, model, knobs):
+    from references.store import reference_files
+
+    rid = _reference(client, reason="its page goes missing")
+    assert reference_files.delete_file(rid, "page.jpg")
+    knobs()
+    job = _assess(client, {"criteria": [_house(boxes=True)], "references": [rid]})
+    entry = _entry(job)
+    assert entry["status"] == "ok" and entry["score"] == 9
+    assert entry["localization"]["accepted_attempt"] == 1
+    (ref,) = entry["localization"]["references"]
+    assert ref["applied"] is False and ref["examples"] == []
+    assert f"{rid}: its page image (page.jpg) is missing" in ref["note"]
+    assert {FakeModel.images(p) for k, p in model.calls if k in ("bbox", "verify")} == {1}
+    assert client.delete(f"/references/{rid}").status_code == 204
+
+
+def test_a_reference_deleted_before_the_loop_drops_the_example_and_keeps_the_unit(
+    client, model, knobs, monkeypatch
+):
+    """Deleted after the scoring call read its composite and before the loop
+    loaded anything: the scoring answer stands and the loop runs unguided."""
+    import analysis
+    from analysis.references import JobReferences
+    from api.schemas import AssessRequest
+    from references.resolve import resolve_references
+    from references.store import reference_files, reference_registry
+
+    rid = _reference(client, reason="deleted mid-job")
+    request = AssessRequest.model_validate({
+        "document": {"type": "text", "data": "x"},
+        "criteria": [_house(boxes=True)], "references": [rid],
+    })
+    plan = asyncio.run(resolve_references(request, reference_registry)).plan
+    original = JobReferences.box_examples
+
+    async def deleted_first(self, guide, spec, *, position_check):
+        reference_files.delete(rid)
+        self._images.clear()        # as if the scoring call had never cached it
+        return await original(self, guide, spec, position_check=position_check)
+
+    monkeypatch.setattr(JobReferences, "box_examples", deleted_first)
+    knobs()
+    doc = analysis.load_document_bytes(_png(), "p.png", "image/png", keep_source=True)
+    result = asyncio.run(analysis.analyze_document(doc, request.criteria, references_plan=plan))
+    entry = result["assessment"]["per_criterion_scores"][HOUSE]
+    assert entry["status"] == "ok" and entry["score"] == 9
+    (ref,) = entry["localization"]["references"]
+    assert ref["applied"] is False
+    assert "was deleted after this job was submitted" in ref["note"]
+    assert client.delete(f"/references/{rid}").status_code == 204
+
+
+def test_a_fail_is_shown_to_the_loop_only_under_a_presence_hint(
+    client, model, refs, knobs
+):
+    import analysis
+    from api.schemas import AssessRequest
+    from references.resolve import resolve_references
+    from references.store import reference_registry
+
+    auto_fail = _reference(client, criteria=[{"name": HOUSE, "type": "llm",
+                                              "options": {"hint": "auto"}}],
+                           score=2, reason="an auto-hint barn")
+    knobs()
+    job = _assess(client, {"criteria": [_house(boxes=True)],
+                           "references": [refs["pass"], auto_fail]})
+    # The scoring call is still contrastive; the loop sees the PASS alone.
+    assert [FakeModel.images(p) for p in model.scoring()] == [3]
+    (ask,) = _box_prompts(model, "ask")
+    assert FakeModel.images(ask) == 2 and "was PASS here" in FakeModel.texts(ask)[0]
+    (ref,) = _entry(job)["localization"]["references"]
+    assert ref["examples"] == [_record(refs["pass"], "pass")]
+
+    # A plan queued before `hint` existed: its FAIL is not presence either.
+    request = AssessRequest.model_validate({
+        "document": {"type": "text", "data": "x"},
+        "criteria": [_house(boxes=True)], "references": [refs["pass"], refs["fail"]],
+    })
+    plan = asyncio.run(resolve_references(request, reference_registry)).plan
+    for example in plan["criteria"][HOUSE]["examples"]:
+        assert example.pop("hint") == "presence"
+    model.calls.clear()
+    doc = analysis.load_document_bytes(_png(), "p.png", "image/png", keep_source=True)
+    result = asyncio.run(analysis.analyze_document(doc, request.criteria, references_plan=plan))
+    (ask,) = _box_prompts(model, "ask")
+    assert FakeModel.images(ask) == 2
+    (ref,) = result["assessment"]["per_criterion_scores"][HOUSE]["localization"]["references"]
+    assert [e["polarity"] for e in ref["examples"]] == ["pass"]
+
+
+def test_the_position_check_shows_the_ask_crops(client, model, refs, knobs):
+    knobs()
+    entry = _entry(_positioned(client, refs))
+    (ask,) = _box_prompts(model, "ask")
+    assert FakeModel.images(ask) == 2
+    assert FakeModel.texts(ask)[0] == (
+        "REFERENCE EXAMPLE (from another document) — a crop showing 'has a house' "
+        "(PASS there).")
+    (ref,) = entry["localization"]["references"]
+    assert ref["ask_images"] == "crop" and ref["applied"] is True
+
+
+def test_the_position_check_is_unchanged_by_what_the_loop_was_shown(
+    client, model, refs, knobs
+):
+    """The check compares the accepted box with the examples' OWN regions;
+    showing the loop those examples changes neither its inputs nor its
+    verdict."""
+    model.bbox = FAR_BOX
+    knobs(ask=False, refine=False, verify=False)
+    unguided = _entry(_positioned(client, refs))
+    knobs()
+    guided = _entry(_positioned(client, refs))
+    assert guided["localization"]["references"][0]["applied"] is True
+    assert guided["detail"]["reference"]["position"] == unguided["detail"]["reference"]["position"]
+    assert guided["detail"]["reference"]["position"]["status"] == "miss"
+    assert (guided["score"], guided["verdict"]) == (unguided["score"], unguided["verdict"])
 
 
 # ---------------------------------------------------------------------------

@@ -31,14 +31,29 @@ matched.
 With ``options.boxes`` the bounding-box enforcement loop (``llm.boxes``)
 runs right after, gated on the (combined) presence score exactly as before —
 hint presence/auto, score >= LLM_BBOX_PRESENCE_MIN, a page image to crop —
-for at most ``options.max_attempts`` attempts. It never changes the score,
-and it always sends one image: references do not reach the loop.
+for at most ``options.max_attempts`` attempts. It never changes the score.
+When the guide applied and a CLASSIFIER_REFERENCE_BOX_* knob is on, the
+examples the loop may show are built AFTER the gate passed
+(``JobReferences.box_examples``: regions only, FAIL only under a presence
+hint, composites for the ask — region crops under the position check — and
+region crops for refine and verify) and handed to the loop, which shows each
+step its examples when that step's knob is on. Every unit of a criterion
+with a guide records what the loop was shown as ONE
+``localization.references`` entry tagged with its ``item`` (``applied:
+false`` with a note when nothing was shown — the knobs off, no example with
+a region, a load failure), each call that carried examples in
+``references.json`` (``kind: box_ask | box_refine | box_verify``) and in
+``classifier_reference_calls_total``. Without references in the request the
+key is absent and the loop sends one image, exactly as before.
 
     evaluate()       — the shared evaluator interface.
     evaluate_with()  — the same for a name and RESOLVED llm options, which is
                        how a `cv` criterion's "llm" fallback reaches it (its
                        ``reference`` guide passed through).
     _guided()        — the reference-guided scoring calls, combined.
+    _box_reference_entry() — what the loop was shown: the unit's
+                       ``localization.references`` entry, references.json
+                       rows and the metric.
     _budgeted()      — the text layer truncated to the prompt budget.
 
 Every call goes through ``llm.client``, so the model's ``max_concurrent``
@@ -62,7 +77,7 @@ from common.jobs import progress
 
 from analysis.context import DocumentContext
 from analysis.outcome import Outcome, empty_localization
-from analysis.references import CriterionGuide, combine, plan_calls
+from analysis.references import BoxGuide, CriterionGuide, combine, plan_calls
 from analysis.result_specs import (
     AGGREGATE_FIELD,
     METRIC_FIELD,
@@ -273,6 +288,20 @@ async def evaluate_with(
         )
         return outcome
 
+    # The loop's reference examples: built only now (the gate passed) and
+    # only when a knob would show them, so a page that is not located — or a
+    # deployment with the knobs off — never decodes a reference page.
+    box_guide: Optional[BoxGuide] = None
+    knobs_on = (
+        llm_boxes.REFERENCE_BOX_ASK or llm_boxes.REFERENCE_BOX_REFINE
+        or llm_boxes.REFERENCE_BOX_VERIFY
+    )
+    if reference is not None and reference.applied and knobs_on:
+        box_guide = await ctx.references.box_examples(
+            reference, spec,
+            position_check=(opts.get("reference") or {}).get("position") == "check",
+        )
+
     regions, loc = await llm_boxes.locate_criterion(
         name,
         image_b64=image_b64,
@@ -282,10 +311,70 @@ async def evaluate_with(
         working_image=ctx.working_image,
         ask_b64=await ctx.ask_image_b64(),
         model=spec,
+        ask_examples=box_guide.ask if box_guide else None,
+        crop_examples=box_guide.crops if box_guide else None,
     )
     outcome.regions = regions
     outcome.localization = loc.as_dict()
+    if reference is not None:
+        outcome.localization["references"] = [
+            _box_reference_entry(name, ctx, reference, box_guide, loc, knobs_on)
+        ]
     return outcome
+
+
+def _box_reference_entry(
+    name: str,
+    ctx: DocumentContext,
+    guide: CriterionGuide,
+    box_guide: Optional[BoxGuide],
+    loc: llm_boxes.Localization,
+    knobs_on: bool,
+) -> dict:
+    """One unit's ``localization.references`` entry — what the box loop was
+    shown — after recording each call that carried examples in
+    ``references.json`` and ``classifier_reference_calls_total``.
+
+    Tagged with its ``item`` here, so the aggregate merge is plain
+    concatenation. ``applied`` is whether any step carried examples; when
+    none did, the ``note`` says why (the guide's own note, the knobs, or
+    ``box_examples``')."""
+    examples = box_guide.records if box_guide else []
+    for call in loc.guided_calls:
+        reference_calls_total.labels(
+            kind=call["kind"], outcome="ok" if call["ok"] else "failed",
+        ).inc()
+    if loc.guided_calls:
+        ctx.references.record_calls(name, ctx.item, [
+            {
+                "kind": call["kind"],
+                "attempt": call["attempt"],
+                "images": call["images"],
+                "example_images": (
+                    box_guide.ask_images if call["kind"] == "box_ask" else "crop"
+                ),
+                "examples": examples,
+                "ok": call["ok"],
+            }
+            for call in loc.guided_calls
+        ])
+    applied = any(loc.guided.values())
+    if not guide.applied:
+        note = guide.note
+    elif not knobs_on:
+        note = "the CLASSIFIER_REFERENCE_BOX_* knobs are off"
+    else:
+        note = box_guide.note if box_guide else None
+    return {
+        "item": ctx.item,
+        "applied": applied,
+        "ask_images": box_guide.ask_images if loc.guided["ask"] else None,
+        "examples": examples,
+        "ask": loc.guided["ask"],
+        "refine": loc.guided["refine"],
+        "verify": loc.guided["verify"],
+        "note": note,
+    }
 
 
 async def _guided(
@@ -376,6 +465,7 @@ async def _guided(
     )
     ctx.references.record_calls(name, ctx.item, [
         {
+            "kind": "scoring",
             "call": k,
             "images": call_rows[k]["images"],
             "examples": [

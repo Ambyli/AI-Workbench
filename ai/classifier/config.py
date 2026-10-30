@@ -3,7 +3,8 @@
 All tuneable values live here — environment-driven settings AND the
 module-level constants the pipeline used to keep next to the code that used
 them (content-type allowlist, working image size, fuzzy-credit floor, the LLM
-hint rubrics and prompt headings, the SSRF blocklist). Anything a deployment
+hint rubrics and prompt headings, the reference examples' prompt wording, the
+SSRF blocklist). Anything a deployment
 or a prompt engineer might want to change without reading the pipeline is in
 this file; the other modules import from here and hold no constants of their
 own beyond function registries.
@@ -261,6 +262,112 @@ HINT_RUBRICS: dict[str, dict[str, str]] = {
 # caching — see llm/prompts.py), which is why the presence rubric says
 # "provided above".
 DOCUMENT_TEXT_HEADING: str = "DOCUMENT TEXT (extracted, may contain OCR errors)"
+
+# ---------------------------------------------------------------------------
+# Prompt wording — the reference examples (llm/prompts.py)
+# ---------------------------------------------------------------------------
+# What a reference-guided prompt adds around its example images: headings,
+# guards, captions and system-prompt sentences. With no examples none of it is
+# sent — the plain scoring, ask and verify prompts are byte-for-byte what they
+# were, pinned by hash in unit-tests/classifier/test_reference_prompts.py,
+# which also asserts some of these strings verbatim. llm/prompts.py imports
+# every name here, so `from llm.prompts import BOX_CANDIDATE_HEADING` (as that
+# test does) keeps working.
+#
+# Not here on purpose: llm/prompts.py SCORING_SCAFFOLD (the answer contract
+# llm/validate.py parses, not wording), ReferenceExample.caption() (built from
+# the example's score and reason) and the scoring call's own system-prompt
+# sentence for examples (inline in build_llm_prompt).
+#
+# ── The scoring call's examples (ReferenceExample; build_llm_prompt) ───────
+# The text block that separates the examples from what is being scored.
+CANDIDATE_HEADING: str = "CANDIDATE — score only this image"
+
+# Said once, beside the examples: what an example is for and what it is not.
+REFERENCE_GUARD: str = (
+    "The image(s) above are reference examples with known answers, shown so you know "
+    "what this criterion means here. Do not reward resemblance the criterion does not "
+    "ask about, and do not score the examples."
+)
+
+# ── The box loop's examples (BoxExample; build_bbox_prompt / build_verify_prompt)
+# All the wording the loop's guided prompts add, in one place so it is tuned
+# here. With no examples none of it is sent.
+#
+# The caption shown before each example image, by (verdict, crop). A composite
+# is the reference's working page with the criterion's outline drawn on it; a
+# crop is cut from its ORIGINAL page around the first region and has no
+# outline drawn, so it cannot say "the coloured box outlines it".
+#
+# The crop captions (refine and verify, and the ask under the position check)
+# say the example is FROM ANOTHER DOCUMENT and was PASS "there", not "here": a
+# reference is normally a different company's document from the candidate,
+# and a verify told what the feature "looks like here" scored a correct logo
+# 1 on every attempt because it was not the example's brand (measured on the
+# box — bills from different utilities, 0 of 20 logos accepted with crops in
+# the verify). The composite captions are unchanged.
+BOX_CAPTIONS: dict[tuple[str, bool], str] = {
+    ("PASS", False): "REFERENCE EXAMPLE — '{criterion}' was PASS here; the coloured box "
+                     "outlines it.",
+    ("MARGINAL", False): "REFERENCE EXAMPLE — '{criterion}' was MARGINAL here, a borderline "
+                         "case; the coloured box outlines it.",
+    ("FAIL", False): "REFERENCE EXAMPLE — '{criterion}' was FAIL here — the outlined thing "
+                     "is NOT {criterion}; do not box it.",
+    ("PASS", True): "REFERENCE EXAMPLE (from another document) — a crop showing "
+                    "'{criterion}' (PASS there).",
+    ("MARGINAL", True): "REFERENCE EXAMPLE (from another document) — a crop showing "
+                        "'{criterion}' (MARGINAL there, a borderline case).",
+    ("FAIL", True): "REFERENCE EXAMPLE (from another document) — a crop of something that "
+                    "is NOT {criterion} (FAIL there); do not box it.",
+}
+
+# Said once after the ask's / refine's examples. Three things: the examples
+# show WHAT to box, and on the candidate it may be elsewhere (deliberately not
+# "do not copy the position" — on bills from one utility or one form layout
+# the position is a fair hint); the examples carry no grid, so a position on
+# them is no answer; and `bbox: null` still is one. `{span}` is the grid.
+BOX_REFERENCE_GUARD: str = (
+    "The image(s) above are reference examples, shown so you know WHAT to box. On the "
+    "CANDIDATE it may be in a different place, so find it on the CANDIDATE image itself. "
+    "The examples have no grid and their coordinates mean nothing here: answer only on "
+    "the CANDIDATE image's 0 to {span} grid. If the CANDIDATE does not show the feature, "
+    '"bbox": null is still the answer.'
+)
+
+# The headings that separate the examples from the image being asked about.
+BOX_CANDIDATE_HEADING: str = "CANDIDATE — locate the feature only in this image"
+VERIFY_CANDIDATE_HEADING: str = "CANDIDATE — judge only this crop"
+
+# One sentence appended to each guided call's system prompt, as the scoring
+# call's is. The verify's says the examples are from OTHER documents, and
+# says "examples", not "crops" — the experiment can show it composites
+# (bin/grounding_experiment.py --verify-images composite).
+BOX_SYSTEM_SENTENCE: str = (
+    "Reference examples come first; locate the feature ONLY in the image marked CANDIDATE."
+)
+VERIFY_SYSTEM_SENTENCE: str = (
+    "Reference examples from other documents come first; judge ONLY the crop marked "
+    "CANDIDATE."
+)
+
+# The guided verify's reminder, after its question. A reference is normally a
+# different company's document, so the example shows the KIND of thing the
+# criterion means, not what it looks like on the candidate. The first wording
+# ("the reference crop(s) above show what X looks like here") made the model
+# score a correct logo 1 because it was not the reference's logo — while it
+# stayed neutral on the amount due and the account number, whose look does
+# not depend on the brand. So: the candidate will usually look different, a
+# name in the criterion means the candidate's own document, and a difference
+# from the reference is no reason to score lower. A FAIL example shows what
+# does NOT count, which its caption also says. `{name}` is the criterion.
+VERIFY_REFERENCE_NOTE: str = (
+    "The reference image(s) above come from OTHER documents. Each shows an example of the "
+    "kind of thing '{name}' means; on the CANDIDATE it will usually look different (a "
+    "different company, design or layout), and any name in the criterion refers to the "
+    "CANDIDATE's own document, not to the reference's. Do not score lower because the "
+    "CANDIDATE looks different from a reference: score whether the CANDIDATE crop shows "
+    "{name}. A reference captioned FAIL shows something that does NOT count."
+)
 
 # ---------------------------------------------------------------------------
 # LLM call behaviour
@@ -686,6 +793,24 @@ LLM_BBOX_REFINE_ZOOM: float = max(
 LLM_BBOX_REFINE_MIN_SPAN: float = min(
     1.0, max(0.05, float(os.environ.get("CLASSIFIER_LLM_BBOX_REFINE_MIN_SPAN", "0.2")))
 )
+
+# REFERENCE_BOX_ASK / _REFINE / _VERIFY show a criterion's reference examples
+# to the loop's ask, refine and verify calls (ZT-527) — until now they guided
+# only the scoring call. Only examples WITH a region, at most one PASS-side
+# and (at three images per prompt) one FAIL whose reference criterion's hint
+# is presence; the ask sees composites (region crops under the position
+# check), refine and verify see region crops (analysis.references
+# .box_selection). The loop's documented weakness is IDENTIFICATION — asked
+# for a logo, it precisely boxes the heading naming the same company — and an
+# outlined example of the right thing is what fixes that; the verify crop has
+# the same blind spot. Calls per attempt are unchanged; each carries 1 +
+# examples images, and the ask loses the cross-criterion prefix cache. All
+# three off is exactly the loop without references. Off until measured with
+# bin/grounding_experiment.py (--truth, --reference-image) on the box; the
+# measured numbers go here and in API.md § The LLM enforcement loop.
+REFERENCE_BOX_ASK: bool = _env_flag("CLASSIFIER_REFERENCE_BOX_ASK", "false")
+REFERENCE_BOX_REFINE: bool = _env_flag("CLASSIFIER_REFERENCE_BOX_REFINE", "false")
+REFERENCE_BOX_VERIFY: bool = _env_flag("CLASSIFIER_REFERENCE_BOX_VERIFY", "false")
 
 # Presence score at or above which a criterion is worth locating. Not an env
 # knob: it is the service-wide PASS line (utils.verdict_from_score), and a

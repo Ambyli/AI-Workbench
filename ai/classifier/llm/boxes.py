@@ -34,6 +34,33 @@ claim, not a measurement, so nothing here trusts one:
              covered 100% of the image …; try again, smaller"), up to
              LLM_BBOX_MAX_ATTEMPTS.
 
+**Reference examples** (ZT-527), when the request lists references that
+guide the criterion, ride along in the same calls — never extra calls —
+each step behind its own knob, read here and nowhere else:
+
+    ask      REFERENCE_BOX_ASK: up to one PASS-side and one FAIL example
+             (``ask_examples``) captioned BEFORE the gridded candidate —
+             composites, the reference page with the feature outlined, or
+             region crops under the position check — so the model knows WHAT
+             to box. Identification is the loop's documented weakness: asked
+             for a logo, it boxes the heading that names the company.
+    refine   REFERENCE_BOX_REFINE: the examples' region crops
+             (``crop_examples``, cut by ``example_crop``) before the zoomed
+             candidate crop, so a look-alike in the window is not boxed.
+    verify   REFERENCE_BOX_VERIFY: the same crops before the candidate crop —
+             "is it in the CANDIDATE crop?", still 1-10, reason first. A
+             caller may show it other examples instead (``verify_examples``;
+             only ``bin/grounding_experiment.py --verify-images composite``
+             does — the service passes none).
+
+The examples are chosen and loaded by ``analysis.references`` once per unit
+and are the same on every attempt; validation, the gate, the area checks, the
+rejection wording and the labels are untouched. With the knobs off (or no
+examples) every prompt is byte-for-byte the unguided one. The loop never
+imports ``analysis``: it returns what carried examples
+(``Localization.guided`` / ``guided_calls``) and ``analysis.llm_eval``
+records it.
+
 **Every attempt comes back**, accepted or not. A rejected box is evidence
 about the model, and ``?criterion=<slug>&attempt=2`` on the artifact file
 endpoint renders it on its own so it can be looked at. The accepted one is
@@ -47,7 +74,8 @@ rejected keeps its score and comes back with ``accepted_attempt: null``.
 
 Cost: one ask per attempt, plus one refine and one verify per attempt whose
 box validated — so at most ``3 × max_attempts`` small calls per located
-criterion, on top of that criterion's own scoring call. That is why the loop
+criterion, on top of that criterion's own scoring call (examples add images
+to those calls, never calls). That is why the loop
 is opt-in per criterion (``options.boxes``), capped per criterion
 (``options.max_attempts``, never above LLM_BBOX_MAX_ATTEMPTS) and gated on the
 presence score. Every call goes to the criterion's model (``model``, the
@@ -81,6 +109,9 @@ from config import (
     LLM_BBOX_REFINE_ZOOM,
     LLM_BBOX_VERIFY_PASS,
     MAX_WORKING_DIMENSION,
+    REFERENCE_BOX_ASK,
+    REFERENCE_BOX_REFINE,
+    REFERENCE_BOX_VERIFY,
 )
 # Imported as modules, not by name, so a test can script the model by
 # replacing `llm.client.call_model_json` — the same reason the pipeline imports
@@ -203,11 +234,32 @@ class BoxAttempt:
 
 @dataclass
 class Localization:
-    """Every attempt for one criterion, and which (if any) was accepted."""
+    """Every attempt for one criterion, and which (if any) was accepted.
+
+    ``guided`` and ``guided_calls`` say what the reference examples reached,
+    for the caller (``analysis.llm_eval``) to turn into
+    ``localization.references``, ``references.json`` entries and metrics —
+    the loop itself never imports ``analysis``. Neither is in ``as_dict()``:
+    without references the record is exactly what it always was.
+
+    Attributes:
+        guided:       ``{"ask", "refine", "verify"}`` — whether that step's
+                      calls carry examples (its knob on and examples given),
+                      fixed for the unit; a step that never ran still says
+                      what it would have carried.
+        guided_calls: One ``{kind: box_ask | box_refine | box_verify,
+                      attempt, images, ok}`` per call that carried examples;
+                      ``images`` counts the candidate, ``ok`` is False when
+                      ``call_model_json`` returned None.
+    """
 
     attempts: list[BoxAttempt] = field(default_factory=list)
     accepted_attempt: Optional[int] = None
     calls: int = 0
+    guided: dict[str, bool] = field(
+        default_factory=lambda: {"ask": False, "refine": False, "verify": False}
+    )
+    guided_calls: list[dict[str, Any]] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -405,6 +457,12 @@ async def locate_criterion(
     refine: Optional[bool] = None,
     ask_b64: Optional[str] = None,
     model: Optional[ModelSpec] = None,
+    ask_examples: Optional[list[prompts.BoxExample]] = None,
+    crop_examples: Optional[list[prompts.BoxExample]] = None,
+    verify_examples: Optional[list[prompts.BoxExample]] = None,
+    guide_ask: Optional[bool] = None,
+    guide_refine: Optional[bool] = None,
+    guide_verify: Optional[bool] = None,
 ) -> tuple[list[Region], Localization]:
     """Run the full ask → validate → refine → verify → retry loop for one criterion.
 
@@ -435,6 +493,28 @@ async def locate_criterion(
         model:            The registry entry every ask / refine / verify call
                           goes to (its ``max_tokens.box`` budget); None → the
                           registry default.
+        ask_examples:     Reference examples for the ASK (composites, or
+                          region crops under the position check), built once
+                          per unit by ``analysis.references`` and the same on
+                          every attempt.
+        crop_examples:    Region crops of the same examples, for REFINE and
+                          (unless ``verify_examples``) VERIFY.
+        verify_examples:  What VERIFY shows instead of ``crop_examples`` —
+                          ``bin/grounding_experiment.py --verify-images
+                          composite`` passes the ask's composites. None (the
+                          service: ``analysis.llm_eval`` passes nothing) →
+                          ``crop_examples``, exactly as before. Refine always
+                          shows ``crop_examples``.
+        guide_ask / guide_refine / guide_verify:
+                          Show that step its examples (default the
+                          REFERENCE_BOX_ASK / _REFINE / _VERIFY knobs, read
+                          here at call time — the one place they are read). A
+                          step shows examples only when its flag is on AND
+                          its list is non-empty; otherwise its prompt is the
+                          unguided one, byte for byte. The labels never
+                          change (``llm.client`` maps their prefixes to the
+                          call kind); what carried examples is ``guided`` /
+                          ``guided_calls`` on the Localization.
 
     Returns:
         ``(regions, localization)``. ``regions`` holds one Region per attempt
@@ -445,10 +525,25 @@ async def locate_criterion(
         gridlines = LLM_BBOX_GRIDLINES
     if refine is None:
         refine = LLM_BBOX_REFINE
+    if guide_ask is None:
+        guide_ask = REFERENCE_BOX_ASK
+    if guide_refine is None:
+        guide_refine = REFERENCE_BOX_REFINE
+    if guide_verify is None:
+        guide_verify = REFERENCE_BOX_VERIFY
     max_attempts = max(1, min(int(max_attempts), LLM_BBOX_MAX_ATTEMPTS))
     loc = Localization()
     feedback: list[str] = []
     best_detector = _best_detector_region(detector_regions)
+    # What each step shows, fixed for the unit: the same examples on every
+    # attempt, so attempts differ only by their feedback.
+    shown_ask = list(ask_examples or []) if guide_ask else []
+    shown_refine = list(crop_examples or []) if guide_refine else []
+    verify_source = crop_examples if verify_examples is None else verify_examples
+    shown_verify = list(verify_source or []) if guide_verify else []
+    loc.guided = {
+        "ask": bool(shown_ask), "refine": bool(shown_refine), "verify": bool(shown_verify),
+    }
 
     if ask_b64 is None:
         ask_b64 = ask_image_b64(image_b64, working_image, gridlines=gridlines)
@@ -468,11 +563,13 @@ async def locate_criterion(
         answer = await client.call_model_json(
             prompts.build_bbox_prompt(
                 ask_b64, name, feedback=feedback,
-                gridlines=grid_on_ask, grid_step=LLM_BBOX_GRID_STEP, model=model,
+                gridlines=grid_on_ask, grid_step=LLM_BBOX_GRID_STEP,
+                references=shown_ask, model=model,
             ),
             label=f"bbox/{name}#{number}",
             model=model,
         )
+        _log_guided(loc, "box_ask", number, shown_ask, answer)
         if answer is None:
             attempt.reject = (
                 "the model did not return a usable answer for this attempt"
@@ -532,11 +629,12 @@ async def locate_criterion(
                             _with_grid(crop) if gridlines else crop
                         ),
                         name, gridlines=gridlines, grid_step=LLM_BBOX_GRID_STEP,
-                        zoomed=True, model=model,
+                        zoomed=True, references=shown_refine, model=model,
                     ),
                     label=f"refine/{name}#{number}",
                     model=model,
                 )
+                _log_guided(loc, "box_refine", number, shown_refine, fine)
                 fine_bbox, fine_reject = (
                     validate_bbox(fine.get("bbox"), present="bbox" in fine)
                     if isinstance(fine, dict)
@@ -562,7 +660,8 @@ async def locate_criterion(
                     )
             _cross_check(attempt, name, geometry, best_detector)
 
-        # Step 3 — verify by crop. The ONE image in this call is the crop.
+        # Step 3 — verify by crop. The candidate's only image in this call is
+        # the crop (example crops, when shown, are of other pages).
         crop = crop_for(original_image, attempt.bbox_px or [])
         if crop is None:
             attempt.reject = (
@@ -574,11 +673,13 @@ async def locate_criterion(
         loc.calls += 1
         verdict = await client.call_model_json(
             prompts.build_verify_prompt(
-                client.encode_image_to_base64(crop), name, model=model,
+                client.encode_image_to_base64(crop), name,
+                references=shown_verify, model=model,
             ),
             label=f"verify/{name}#{number}",
             model=model,
         )
+        _log_guided(loc, "box_verify", number, shown_verify, verdict)
         attempt.verify_score = _score_of(verdict)
         attempt.verify_reason = (
             str(verdict.get("reason"))[:400] if isinstance(verdict, dict) else None
@@ -676,7 +777,26 @@ def crop_window(image: Any, window: list[float], *, grid: float = LLM_BBOX_GRID)
     bottom = min(height, int(math.ceil(y2 * height / grid)))
     right = max(right, left + 1)
     bottom = max(bottom, top + 1)
-    crop = image[top:bottom, left:right]
+    return _fit_working(image[top:bottom, left:right])
+
+
+def example_crop(page_bgr: Any, bounds: list[float], pad: float = LLM_BBOX_CROP_PAD) -> Optional[Any]:
+    """A reference example's region as the loop shows it: cut out of the
+    reference's ORIGINAL page exactly as the verify crop is cut from the
+    candidate's (``crop_for``, padded by ``pad``), then brought down to the
+    working size — ``crop_for`` never shrinks, and a region of a 4000-px
+    photo can be most of it. ``bounds`` is ``[x1, y1, x2, y2]`` in that
+    page's pixels (a polygon's bounds will do). None when there is no image.
+
+    Used by ``analysis.references`` (the refine / verify examples, and the
+    ask's under the position check) and ``bin/grounding_experiment.py``."""
+    crop = crop_for(page_bgr, list(bounds), pad)
+    return None if crop is None else _fit_working(crop)
+
+
+def _fit_working(crop: Any) -> Any:
+    """``crop`` shrunk to at most MAX_WORKING_DIMENSION on its long side
+    (never enlarged), so it costs the model no more than a working page."""
     h, w = crop.shape[:2]
     if max(h, w) > MAX_WORKING_DIMENSION:
         import cv2
@@ -705,6 +825,18 @@ def window_to_full(
 # ---------------------------------------------------------------------------
 # Small helpers
 # ---------------------------------------------------------------------------
+
+
+def _log_guided(
+    loc: Localization, kind: str, attempt: int, shown: list[Any], answer: Any
+) -> None:
+    """Record one call that carried examples (``Localization.guided_calls``);
+    a call with none shown is not a guided call and is not logged."""
+    if shown:
+        loc.guided_calls.append({
+            "kind": kind, "attempt": attempt, "images": len(shown) + 1,
+            "ok": answer is not None,
+        })
 
 
 def _cross_check(

@@ -182,7 +182,14 @@ def _inherit(request: AssessRequest, refs: list[Reference]) -> AssessRequest:
 
 
 def _example(ref: Reference, name: str, entry: dict[str, Any]) -> dict[str, Any]:
-    """One example as the worker needs it — plain data, no store handle."""
+    """One example as the worker needs it — plain data, no store handle.
+
+    ``hint`` is the REFERENCE criterion's own ``options.hint`` (None when its
+    input has none): the box loop shows a FAIL example only when it is
+    ``presence``, where FAIL means "not there" (``analysis.references.
+    box_selection``). It is optional on purpose — the runner checks only the
+    payload's ``schema``, so a plan queued before it reads as None and the
+    loop is shown PASS-side examples only; no schema bump, no drain."""
     expected = entry["expected"]
     verdict = expected["verdict"]
     page = (ref.record or {}).get("page") or {}
@@ -196,6 +203,7 @@ def _example(ref: Reference, name: str, entry: dict[str, Any]) -> dict[str, Any]
         "regions": list(entry.get("regions") or []),
         "composite": entry.get("composite"),
         "geometry": page.get("geometry"),
+        "hint": ((entry.get("input") or {}).get("options") or {}).get("hint"),
     }
 
 

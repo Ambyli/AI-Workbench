@@ -79,6 +79,15 @@ Usage::
         --subset /data/grounding_ops/failures.json \\
         --references-from-truth --groups /data/grounding_ops/groups.json \\
         --configs ask,refine,verify,all --out /data/grounding_ops/guided.json
+    # The same with a FAIL example of a look-alike beside the PASS one, for
+    # the criterion whose look-alikes are marked as the `usage look-alike`
+    # decoy:
+    docker exec classifier uv run --no-sync python bin/grounding_experiment.py \\
+        --images /data/grounding_ops/images --truth /data/grounding_ops/truth.json \\
+        --subset /data/grounding_ops/failures.json \\
+        --references-from-truth --groups /data/grounding_ops/groups.json \\
+        --fail-from-decoys "usage look-alike=usage history" \\
+        --configs ask,refine,verify,all --out /data/grounding_ops/guided_fail.json
 
 ``--criteria`` is a JSON object mapping file name to the criteria to ask
 about, e.g.::
@@ -92,9 +101,10 @@ A bare list instead of an object applies those criteria to every image.
 
 ``--truth`` says where things really are, per file name: ``criteria`` —
 the criteria to ask, each with EVERY real copy of it on the page — and
-``decoys`` — things never asked, only used to name where a missed box landed.
-Each box is ``[x1, y1, x2, y2]`` in ORIGINAL upright page pixels (the frame
-regions are stored in); a bare box stands for a list of one. With it, the
+``decoys`` — things never asked, used to name where a missed box landed (and,
+with ``--fail-from-decoys``, as FAIL examples). Each box is ``[x1, y1, x2,
+y2]`` in ORIGINAL upright page pixels (the frame regions are stored in); a
+bare box stands for a list of one. With it, the
 criteria asked are the truth file's ``criteria``, and ``--criteria`` is
 ignored. ``unit-tests/classifier/documents/grounding_truth.json`` holds the
 two photographed bills' logo, amount due and account number — every copy:
@@ -139,6 +149,32 @@ says which page was its example (``reference_image``, ``reference_note``).
 ``--groups-from-selection <selection.json> --write-groups <groups.json>``
 writes the groups a test set's ``selection.json`` implies (each
 ``pages[].image`` to its ``links[].project_id``) and exits.
+
+``--fail-from-decoys DECOY=CRITERION`` (repeatable; needs
+``--references-from-truth``) adds a FAIL example after the PASS one — the
+pairing production sends at three images per prompt when the reference
+criterion's hint is presence (``analysis.references.box_selection``). It
+measures IDENTIFICATION: a look-alike the loop boxes instead of the real
+thing (a graph that resembles the monthly usage chart), marked in the truth
+file as a decoy. ``DECOY`` is a decoy name; ``CRITERION`` a truth criterion,
+exact or a case-insensitive substring of exactly one (unknown or ambiguous is
+refused). For every candidate x mapped criterion x repeat the FAIL example
+is ONE other page with a box under that decoy name and no group shared with
+the candidate — the PASS rule — picked deterministically and rotated across
+repeats like the PASS pick but with its own salt, so the two are chosen
+independently (the PASS page itself may be picked: a page with the real
+chart and a look-alike is good contrast). It is built from that page's FIRST
+decoy box exactly as a PASS example is built from a truth box — the
+composite (``references.render.composite``) and the crop
+(``llm.boxes.example_crop``), with ``--reference-text`` its text — captioned
+FAIL ("the outlined thing is NOT <criterion>; do not box it"), and shown
+after the PASS example in the ask, refine and verify (the composites in a
+``--verify-images composite`` verify). PASS only, with a
+``fail_reference_note``, when no page is eligible, the page will not load,
+the pair has no PASS example, or the model takes fewer than 3 images per
+prompt. ``off`` and unmapped criteria are unchanged. Step 2 below with
+``--fail-from-decoys "usage look-alike=usage history"`` is the measurement;
+``landed on`` (below) counts how often accepted boxes landed on the decoy.
 
 ``--subset`` (``{"file.jpg": ["criterion", ...]}``) asks only those pairs;
 an image not listed is skipped. ``--write-failures <file>`` writes, after a
@@ -214,7 +250,14 @@ What it prints, per configuration, per criterion and overall:
     landed on           (--truth) for an accepted box that is not a hit, the
                         OTHER criterion or decoy whose box holds its centre
                         (criteria first) — the identification case: the logo
-                        asked for, ``text naming the utility`` boxed.
+                        asked for, ``text naming the utility`` boxed; the
+                        usage chart asked for, a ``usage look-alike`` boxed.
+                        Per configuration, per criterion and overall
+                        (``landed_on_rates``, a share of the runs), so a
+                        FAIL example's effect is read here.
+    FAIL example        (--fail-from-decoys) ``fail_example_rate``: of the
+                        mapped criterion's runs in a configuration that shows
+                        examples, how many carried the FAIL beside the PASS.
     mean attempts       how many rounds an accepted criterion needed.
     detector IoU        with DETECTOR_URL set, mean overlap between the
                         accepted box and the detector's best box for the same
@@ -238,6 +281,12 @@ repeat), with the numbers above per run, and — to say WHY, not just how often:
                     ``--reference-image``, or ``--references-from-truth``'s
                     page for this repeat; null with stored references or
                     none. ``reference_note`` says why a pair ran unguided.
+    fail_reference_image  (--fail-from-decoys) the page the FAIL example came
+                    from on this repeat; null for an unmapped criterion or
+                    when none was picked. ``fail_reference_note`` says why a
+                    mapped pair showed the PASS only (null when the FAIL was
+                    there). ``summary.config`` holds ``fail_from_decoys``
+                    (``{criterion: decoy}``) and ``max_images_per_prompt``.
     attempt_log     ``[a.as_dict() for a in loc.attempts]`` — each attempt's
                     box (``bbox_grid`` / ``bbox_px``, coarse and refined),
                     ``verify_score``, ``verify_reason`` and ``reject`` (the
@@ -393,8 +442,8 @@ def _load_truth(path: pathlib.Path) -> dict[str, Truth]:
     """``--truth``: file name → ``{"criteria": {name: [box, ...]}, "decoys":
     {name: [box, ...]}}``, every box ``[x1, y1, x2, y2]`` in original upright
     pixels (a bare box for a list of one). Every real copy of a criterion is
-    one of its boxes; decoys are never asked — they only name where a missed
-    box landed."""
+    one of its boxes; decoys are never asked — they name where a missed box
+    landed, and with ``--fail-from-decoys`` become FAIL examples."""
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise SystemExit(
@@ -474,16 +523,27 @@ async def _detector_boxes(working, labels: list[str], geometry: PageGeometry):
 
 
 def _image_examples(
-    path: pathlib.Path, criteria: dict[str, list[list[float]]], *, with_text: bool = False,
+    path: pathlib.Path,
+    criteria: dict[str, list[list[float]]],
+    *,
+    with_text: bool = False,
+    verdict: str = "PASS",
 ) -> dict[str, tuple[list[BoxExample], list[BoxExample]]]:
-    """``--reference-image``: per criterion, ``(ask, crops)`` — one PASS
-    example built from the image's FIRST truth box for it (list the primary
-    copy first; decoys are never examples), as production would show it: the
-    composite drawn by ``references.render.composite`` (the caller's
-    ``manual`` stroke), the crop cut by ``llm.boxes.example_crop`` — and,
-    ``with_text`` (``--reference-text``), the box's text, OCR'd by
+    """``--reference-image``: per criterion, ``(ask, crops)`` — one example
+    built from the FIRST box listed for it (list the primary copy first), as
+    production would show it: the composite drawn by
+    ``references.render.composite`` (the caller's ``manual`` stroke), the
+    crop cut by ``llm.boxes.example_crop`` — and, ``with_text``
+    (``--reference-text``), the box's text, OCR'd by
     ``analysis.references.region_text`` exactly as a job reads a stored
-    reference's (None when there is no engine or no text)."""
+    reference's (None when there is no engine or no text).
+
+    ``verdict`` is ``PASS`` for a truth box. ``FAIL`` is ``--fail-from-decoys``:
+    the boxes are a DECOY's (a look-alike), still labelled with the
+    criterion, so the captions say "the outlined thing is NOT <criterion>; do
+    not box it" (composite) / "a crop of something that is NOT <criterion>"
+    (crop) — the FAIL example production shows beside a PASS one at three
+    images per prompt (``analysis.references.box_selection``)."""
     from references.render import composite
 
     original, working, geometry = _load(path)
@@ -498,10 +558,10 @@ def _image_examples(
         crop = encode_image_to_base64(llm_boxes.example_crop(original, [x1, y1, x2, y2]))
         text = _box_text(original, [x1, y1, x2, y2]) if with_text else None
         if with_text:
-            print(f"    example text {path.name} / {criterion}: {text!r}")
+            print(f"    example text {path.name} / {criterion} ({verdict}): {text!r}")
         out[criterion] = (
-            [BoxExample(criterion=criterion, verdict="PASS", image_b64=drawn, text=text)],
-            [BoxExample(criterion=criterion, verdict="PASS", image_b64=crop, crop=True,
+            [BoxExample(criterion=criterion, verdict=verdict, image_b64=drawn, text=text)],
+            [BoxExample(criterion=criterion, verdict=verdict, image_b64=crop, crop=True,
                         text=text)],
         )
     return out
@@ -629,6 +689,104 @@ def _truth_reference(
     if not eligible:
         return None
     return eligible[(zlib.crc32(candidate.encode("utf-8")) + repeat) % len(eligible)]
+
+
+# ``--fail-from-decoys``: the FAIL example beside the PASS one. The notes a
+# pair gets when it is shown the PASS example only.
+NO_FAIL_REFERENCE = (
+    "no other page in --truth has a {decoy!r} decoy box outside the candidate's group — "
+    "PASS only"
+)
+FAIL_NEEDS_PASS = "no PASS example for this pair — a FAIL is only shown beside one"
+FAIL_NEEDS_ROOM = (
+    "--model {model} takes {images} image(s) per prompt; PASS + FAIL + the candidate need 3 "
+    "— PASS only"
+)
+
+
+def _fail_map(specs: list[str], truth: dict[str, Truth]) -> dict[str, str]:
+    """``--fail-from-decoys DECOY=CRITERION`` (repeatable) → ``{criterion:
+    decoy}``.
+
+    ``DECOY`` is a decoy name in the truth file (exact, else the one name
+    equal to it ignoring case). ``CRITERION`` names a truth criterion:
+    exactly, else the one criterion equal to it ignoring case, else the ONE
+    criterion containing it ignoring case — so a long criterion need not be
+    pasted (``"usage look-alike=usage history"``). Unknown, ambiguous, or a
+    criterion mapped twice (it has one FAIL slot) is refused, naming what
+    there is to choose from."""
+    decoys = sorted({d for entry in truth.values() for d in entry["decoys"]})
+    criteria = sorted({c for entry in truth.values() for c in entry["criteria"]})
+
+    def one(value: str, names: list[str], *, substring: bool) -> list[str]:
+        if value in names:
+            return [value]
+        folded = [n for n in names if n.casefold() == value.casefold()]
+        if folded or not substring:
+            return folded
+        return [n for n in names if value.casefold() in n.casefold()]
+
+    out: dict[str, str] = {}
+    for spec in specs:
+        decoy, sep, wanted = (part.strip() for part in spec.partition("="))
+        if not sep or not decoy or not wanted:
+            raise SystemExit(f"--fail-from-decoys {spec!r}: expected DECOY=CRITERION")
+        found = one(decoy, decoys, substring=False)
+        if not found:
+            raise SystemExit(
+                f"--fail-from-decoys {spec!r}: no decoy named {decoy!r} in --truth "
+                f"(decoys: {', '.join(map(repr, decoys)) or 'none'})"
+            )
+        matches = one(wanted, criteria, substring=True)
+        if not matches:
+            raise SystemExit(
+                f"--fail-from-decoys {spec!r}: {wanted!r} matches no criterion in --truth "
+                f"(criteria: {', '.join(map(repr, criteria)) or 'none'})"
+            )
+        if len(matches) > 1:
+            raise SystemExit(
+                f"--fail-from-decoys {spec!r}: {wanted!r} is ambiguous — it matches "
+                f"{', '.join(map(repr, matches))}; give more of the criterion's name"
+            )
+        criterion = matches[0]
+        if criterion in out:
+            raise SystemExit(
+                f"--fail-from-decoys {spec!r}: {criterion!r} is already mapped to decoy "
+                f"{out[criterion]!r} — a criterion has one FAIL example"
+            )
+        out[criterion] = found[0]
+    return out
+
+
+def _truth_fail_reference(
+    candidate: str,
+    decoy: str,
+    repeat: int,
+    truth: dict[str, Truth],
+    groups: dict[str, frozenset[str]],
+    available: set[str],
+) -> str | None:
+    """``--fail-from-decoys``: the ONE other page whose first ``decoy`` box is
+    ``candidate``'s FAIL example on this ``repeat``, or None when no page
+    qualifies.
+
+    Eligible as ``_truth_reference``'s PASS pick is — present under
+    ``--images``, not the candidate, no group shared with it (``--groups``) —
+    but with a box under the DECOY name. The PASS reference's own page is
+    allowed: a page with the real feature AND a look-alike is good contrast.
+    Picked deterministically and rotated across repeats like the PASS pick,
+    with its own salt (the decoy name), so the FAIL page is chosen
+    independently of the PASS page."""
+    mine = groups.get(candidate, frozenset())
+    eligible = sorted(
+        name for name, entry in truth.items()
+        if name != candidate and name in available and entry["decoys"].get(decoy)
+        and not mine & groups.get(name, frozenset())
+    )
+    if not eligible:
+        return None
+    salt = f"fail:{decoy}:{candidate}".encode("utf-8")
+    return eligible[(zlib.crc32(salt) + repeat) % len(eligible)]
 
 
 def _load_groups(path: pathlib.Path) -> dict[str, frozenset[str]]:
@@ -891,9 +1049,16 @@ async def run(args) -> dict:
                          "it needs --references-from-truth")
     if args.write_failures and not truth:
         raise SystemExit("--write-failures needs --truth: a failure is a missed hit")
+    if args.fail_from_decoys and not args.references_from_truth:
+        raise SystemExit("--fail-from-decoys adds a FAIL example beside the PASS one "
+                         "--references-from-truth picks: it needs --references-from-truth")
+    # {criterion: decoy}: which criteria get a FAIL example, from which decoy.
+    fail_map = _fail_map(args.fail_from_decoys, truth) if args.fail_from_decoys else {}
+    fail_room = spec.max_images_per_prompt >= 3
     groups = _load_groups(pathlib.Path(args.groups).resolve()) if args.groups else {}
     by_name = {p.name: p for p in paths}
     truth_examples: dict[tuple[str, str], tuple[list[BoxExample], list[BoxExample]] | None] = {}
+    fail_examples: dict[tuple[str, str, str], tuple[list[BoxExample], list[BoxExample]] | None] = {}
     if reference_path is not None:
         if not (truth.get(reference_path.name) or {}).get("criteria"):
             raise SystemExit(
@@ -935,6 +1100,25 @@ async def run(args) -> dict:
                 truth_examples[key] = None
         return truth_examples[key]
 
+    def fail_example(
+        page: str, label: str, decoy: str
+    ) -> tuple[list[BoxExample], list[BoxExample]] | None:
+        """``page``'s FAIL example for ``label``: its FIRST ``decoy`` box,
+        built once per (page, criterion, decoy) exactly as a PASS example is
+        built from a truth box, captioned FAIL; None when the page will not
+        load (the pair then shows the PASS only — never fatal)."""
+        key = (page, label, decoy)
+        if key not in fail_examples:
+            try:
+                fail_examples[key] = _image_examples(
+                    by_name[page], {label: truth[page]["decoys"][decoy]},
+                    with_text=args.reference_text, verdict="FAIL",
+                )[label]
+            except SystemExit as exc:   # _image_examples: "unreadable"
+                print(f"    {exc}", file=sys.stderr)
+                fail_examples[key] = None
+        return fail_examples[key]
+
     print(f"model   : {spec.id} ({spec.served_name}) at {spec.url}")
     print(f"detector: {'on — ' + str(detector_client.status()['url_host']) if detector_client.is_configured() else 'off'}")
     print(f"loop    : {args.attempts} attempt(s), verify >= {LLM_BBOX_VERIFY_PASS}, "
@@ -946,6 +1130,12 @@ async def run(args) -> dict:
               f"{excluded}")
     else:
         print(f"examples: {reference_path.name if reference_path else (', '.join(args.references) if args.references else 'none')}")
+    for criterion, decoy in fail_map.items():
+        print(f"fail    : {criterion!r} also shown a FAIL example — the first {decoy!r} decoy box "
+              "of one other page per candidate x repeat, same group rule, own rotation")
+    if fail_map and not fail_room:
+        print(f"fail    : --model {spec.id} takes {spec.max_images_per_prompt} image(s) per "
+              "prompt; PASS + FAIL + the candidate need 3 — every pair shows the PASS only")
     print(f"configs : {', '.join(configs)}, {args.repeats} repeat(s) each")
     print(f"verify  : shown {args.verify_images}s when it carries examples")
     aids = _aids(args)
@@ -1013,6 +1203,36 @@ async def run(args) -> dict:
                     ask_examples, crop_examples = built or ([], [])
                     print(f"    {label[:30]} #{repeat}: example {reference_image or 'none'} "
                           f"{'(' + reference_note + ')' if reference_note else ''}".rstrip())
+                # --fail-from-decoys: a FAIL example AFTER the PASS one, in
+                # every step that shows examples (new lists — the PASS pair
+                # is cached and shared across repeats).
+                fail_reference_image = None
+                fail_reference_note = None
+                decoy = fail_map.get(label)
+                if decoy is not None:
+                    if not ask_examples:
+                        fail_reference_note = FAIL_NEEDS_PASS
+                    elif not fail_room:
+                        fail_reference_note = FAIL_NEEDS_ROOM.format(
+                            model=spec.id, images=spec.max_images_per_prompt)
+                    else:
+                        fail_reference_image = _truth_fail_reference(
+                            path.name, decoy, repeat, truth, groups, set(by_name)
+                        )
+                        built_fail = (fail_example(fail_reference_image, label, decoy)
+                                      if fail_reference_image is not None else None)
+                        if fail_reference_image is None:
+                            fail_reference_note = NO_FAIL_REFERENCE.format(decoy=decoy)
+                        elif built_fail is None:
+                            fail_reference_note = (
+                                f"{fail_reference_image} would not load — PASS only")
+                        else:
+                            ask_examples = list(ask_examples) + built_fail[0]
+                            crop_examples = list(crop_examples) + built_fail[1]
+                    print(f"    {label[:30]} #{repeat}: FAIL example "
+                          f"{fail_reference_image or 'none'} "
+                          f"{'(' + fail_reference_note + ')' if fail_reference_note else ''}"
+                          .rstrip())
                 for config in configs:
                     guide_ask, guide_refine, guide_verify = CONFIGS[config]
                     first_row = len(log.rows)
@@ -1068,6 +1288,10 @@ async def run(args) -> dict:
                         **aids,
                         "reference_image": reference_image,
                         "reference_note": reference_note,
+                        # --fail-from-decoys: the FAIL example's page (null:
+                        # none shown, or an unmapped criterion) and why not.
+                        "fail_reference_image": fail_reference_image,
+                        "fail_reference_note": fail_reference_note,
                         # What the example captions quoted (any guided step's
                         # examples are the same; null when none was shown).
                         "example_text": (
@@ -1103,7 +1327,7 @@ async def run(args) -> dict:
         print()
 
     summary = _summarise(records, time.monotonic() - started, spec.id, configs, bool(truth),
-                         args.verify_images, aids)
+                         args.verify_images, aids, fail_map, spec.max_images_per_prompt)
     _print_summary(summary)
     if args.write_failures:
         failing, measured = _failures(records)
@@ -1145,10 +1369,12 @@ def _mean(values: list, digits: int = 3):
 
 def _summarise(
     records: list[dict], elapsed: float, model_id: str, configs: list[str], scored: bool,
-    verify_images: str, aids: dict | None = None,
+    verify_images: str, aids: dict | None = None, fail_map: dict | None = None,
+    max_images: int | None = None,
 ) -> dict:
     """Per configuration: the rates overall and per criterion, and what each
-    call kind cost."""
+    call kind cost. ``fail_map`` (``--fail-from-decoys``, ``{criterion:
+    decoy}``) and the model's ``max_images`` go into ``config``."""
 
     def block(rows: list[dict]) -> dict:
         valid_first = [r["attempt_1_valid"] for r in rows]
@@ -1177,6 +1403,16 @@ def _summarise(
                    if a.get("refine_mode")]
         if refines:
             out["marks_refined_rate"] = round(_rate([m == "marks" for m in refines]), 3)
+        # --fail-from-decoys: of the runs of a MAPPED criterion in a config
+        # that shows examples, how many carried the FAIL beside the PASS (the
+        # rest have a fail_reference_note saying why not).
+        mapped = [r for r in rows if any(CONFIGS[r["config"]])
+                  and (r.get("fail_reference_image") or r.get("fail_reference_note"))]
+        if mapped:
+            out["fail_example_rate"] = round(_rate([
+                bool(r.get("fail_reference_image")) and not r.get("fail_reference_note")
+                for r in mapped
+            ]), 3)
         truthed = [r for r in rows if r["hit"] is not None]
         if scored and truthed:
             landed: dict[str, int] = {}
@@ -1232,6 +1468,8 @@ def _summarise(
             "verify_images": verify_images,
             **(aids or {}),
             "marks_max": LLM_BBOX_MARKS_MAX,
+            "fail_from_decoys": dict(fail_map or {}),
+            "max_images_per_prompt": max_images,
             "detector": detector_client.status(),
         },
     }
@@ -1276,6 +1514,10 @@ def _print_summary(summary: dict) -> None:
         if marks_rate is not None:
             print(f"  marks refined {marks_rate:.0%} of the refines (the rest fell back to "
                   "the grid — attempt_log[].marks_fallback says why)")
+        fail_rate = block["overall"].get("fail_example_rate")
+        if fail_rate is not None:
+            print(f"  FAIL example beside the PASS in {fail_rate:.0%} of the mapped runs "
+                  "(the rest: fail_reference_note says why)")
         for kind, cost in block["calls_per_kind"].items():
             tokens = cost["mean_prompt_tokens"]
             seconds = cost["mean_seconds"]
@@ -1341,6 +1583,14 @@ def main() -> None:
         help="for each candidate x criterion x repeat, take the example from ONE other page "
              "of --truth with a box for it, outside the candidate's --groups group; rotates "
              "across repeats",
+    )
+    parser.add_argument(
+        "--fail-from-decoys", action="append", default=None, metavar="DECOY=CRITERION",
+        help="with --references-from-truth: also show a FAIL example after the PASS one, "
+             "the first DECOY box of one other page (outside the candidate's group, its own "
+             "rotation) — 'the outlined thing is NOT <criterion>'. CRITERION is exact, or a "
+             "case-insensitive substring of exactly one truth criterion. Needs 3 images per "
+             "prompt (else PASS only, noted). Repeatable, one decoy per criterion",
     )
     parser.add_argument(
         "--groups", default=None,

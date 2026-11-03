@@ -35,13 +35,22 @@ reference up by id.
                        page cut around its first region
                        (``llm.boxes.example_crop``), cached; None when the
                        page is gone or unreadable.
+        text_of()      what the text inside an example's region says —
+                       CLASSIFIER_REFERENCE_BOX_TEXT: a reference keeps no
+                       text layer, so its ORIGINAL page is OCR'd around the
+                       first region (``region_text``) once per job, under
+                       the process-wide OCR limit, and cached beside the
+                       crop; None when there is no engine, no page, no text,
+                       or the pass failed (never raises).
         box_examples() what the BOX LOOP shows one unit (a ``BoxGuide``):
                        ``box_selection``'s examples, loaded — composites for
                        the ask (crops under the position check), crops for
-                       refine and verify. Never raises: an example that
-                       cannot be loaded is dropped from every step, noted.
-                       Built by ``analysis.llm_eval`` only when a
-                       CLASSIFIER_REFERENCE_BOX_* knob is on.
+                       refine and verify; with CLASSIFIER_REFERENCE_BOX_TEXT
+                       each one's region text too, for its caption. Never
+                       raises: an example that cannot be loaded is dropped
+                       from every step, noted. Built by ``analysis.llm_eval``
+                       only when a CLASSIFIER_REFERENCE_BOX_ASK / _REFINE /
+                       _VERIFY knob is on.
         finish()       the opt-in POSITION check, run by the scheduler on a
                        finished unit (see below).
         record_calls() what each guided call carried, for
@@ -62,6 +71,11 @@ reference up by id.
                      PASS then MARGINAL then FAIL (a FAIL only when its
                      reference criterion's hint is presence), one PASS-side
                      slot plus, at three images, one FAIL slot.
+    region_text()    the text inside a region of a page: the region cut
+                     with some context (the OCR detector misses a thin strip
+                     of one line), recognised, and only the lines centred
+                     inside the region itself kept — as a caption quotes it
+                     (``llm.prompts.example_text``).
     describe_page()  ONE single-image call: a short, neutral description of a
                      reference's page, for the catalogue ``references:
                      "auto"`` reads. Made by the creation job
@@ -100,10 +114,15 @@ from typing import Any, Optional
 
 from common.vision import PageGeometry, Region, center_distance, iou, normalize_region
 
+from analysis.context import OCR_PASSES
+from analysis.ocr import get_ocr_engine
 from analysis.outcome import EvaluationError, Outcome
 from api.schemas import CriterionInput
 from config import (
     REFERENCE_AUTO_MIN_CONFIDENCE,
+    REFERENCE_BOX_TEXT,
+    REFERENCE_BOX_TEXT_MIN_SPAN,
+    REFERENCE_BOX_TEXT_PAD,
     REFERENCE_DESCRIPTION_MAX_CHARS,
     REFERENCE_MAX_PER_CRITERION,
     REFERENCE_POSITION_CAP,
@@ -115,7 +134,12 @@ from config import (
 from llm import boxes as llm_boxes
 from llm import client as llm_client
 from llm.models import ModelSpec, get_registry
-from llm.prompts import BoxExample, build_describe_prompt, build_reference_selection_prompt
+from llm.prompts import (
+    BoxExample,
+    build_describe_prompt,
+    build_reference_selection_prompt,
+    example_text,
+)
 from llm.validate import description_validator, selection_validator
 from logger import logger
 from metrics import reference_calls_total
@@ -252,6 +276,70 @@ def box_selection(
     )
 
 
+def region_text(
+    page_bgr: Any,
+    bounds: list[float],
+    engine: Any,
+    *,
+    pad: float = REFERENCE_BOX_TEXT_PAD,
+    min_span: float = REFERENCE_BOX_TEXT_MIN_SPAN,
+) -> Optional[str]:
+    """What the text inside ``bounds`` (``[x1, y1, x2, y2]`` in ``page_bgr``'s
+    pixels) says, as a caption quotes it (``llm.prompts.example_text``), or
+    None when there is none.
+
+    The region is cut WITH CONTEXT — ``pad`` of its size on each side, then
+    grown to at least ``min_span`` of the page on each axis
+    (``llm.boxes.crop_rect``, the arithmetic the verify crop uses) — because
+    the OCR detector finds nothing in a thin strip of one line that it reads
+    easily inside a slightly taller crop. ``engine`` (any
+    ``common.documents.OCREngine``) recognises it, its line boxes in the
+    crop's pixels. Only the lines whose CENTRE lies inside the region itself
+    are kept, in the engine's reading order, so the context never adds a
+    neighbouring line; when none does (the region is a piece of one long
+    line), the line overlapping the region most is the answer — if that
+    overlap is at least half the region or half the line, so a text-less
+    region (a logo) next to text stays None. Lines
+    without a box are all kept. Blocking (one ONNX pass): run it in a worker
+    thread, under the OCR limit. May raise what the engine raises —
+    ``JobReferences.text_of`` catches it.
+    """
+    if page_bgr is None or getattr(page_bgr, "size", 0) == 0 or engine is None:
+        return None
+    left, top, right, bottom = llm_boxes.crop_rect(
+        page_bgr.shape, list(bounds), pad, min_span=min_span,
+    )
+    result = engine.recognize(page_bgr[top:bottom, left:right])
+    lines = [line for line in (getattr(result, "lines", None) or [])
+             if str(line.get("text") or "").strip()]
+    if not lines:
+        return None
+    rx1, ry1, rx2, ry2 = (bounds[0] - left, bounds[1] - top, bounds[2] - left, bounds[3] - top)
+    region_area = max(0.0, rx2 - rx1) * max(0.0, ry2 - ry1)
+    kept: list[str] = []
+    best, best_overlap = None, 0.0
+    for line in lines:
+        box = llm_boxes.line_bounds(line)
+        if box is None:
+            kept.append(str(line["text"]))
+            continue
+        cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+        if rx1 <= cx <= rx2 and ry1 <= cy <= ry2:
+            kept.append(str(line["text"]))
+            continue
+        overlap = (max(0.0, min(box[2], rx2) - max(box[0], rx1))
+                   * max(0.0, min(box[3], ry2) - max(box[1], ry1)))
+        # A fallback candidate only when it really is the region's line:
+        # half the region (a piece of a long line) or half the line (a line
+        # just off-centre) — never a neighbour's corner.
+        line_area = (box[2] - box[0]) * (box[3] - box[1])
+        if overlap >= 0.5 * min(region_area, line_area) and overlap > best_overlap:
+            best, best_overlap = str(line["text"]), overlap
+    if not kept and best is not None:
+        kept = [best]
+    return example_text(" ".join(kept))
+
+
 # ---------------------------------------------------------------------------
 # One criterion's guidance, and the job's
 # ---------------------------------------------------------------------------
@@ -293,8 +381,9 @@ class BoxGuide:
                     the position check.
         crops:      The same examples as region crops, for refine and verify.
         records:    ``{reference_id, criterion, polarity, composite}`` per
-                    example in them, for ``localization.references`` and
-                    ``references.json``.
+                    example in them (plus ``text`` with
+                    CLASSIFIER_REFERENCE_BOX_TEXT), for
+                    ``localization.references`` and ``references.json``.
         ask_images: ``"composite"`` | ``"crop"`` — what the ask is shown.
         note:       Why there are none, or which were dropped; None when
                     there is nothing to say.
@@ -314,6 +403,9 @@ class JobReferences:
     plan: dict[str, Any]
     _images: dict[tuple[str, str], str] = field(default_factory=dict)
     _crops: dict[tuple[str, str], str] = field(default_factory=dict)
+    # CLASSIFIER_REFERENCE_BOX_TEXT: each example's region text, None
+    # included (a logo has none; asking again would OCR it again).
+    _texts: dict[tuple[str, str], Optional[str]] = field(default_factory=dict)
     _calls: list[dict[str, Any]] = field(default_factory=list)
     # auto: one selection per item — the future (memo) and what it decided.
     _selecting: dict[int, "asyncio.Future[Optional[list[dict]]]"] = field(default_factory=dict)
@@ -535,8 +627,56 @@ class JobReferences:
             self._crops[key] = encoded
         return encoded
 
+    async def text_of(self, example: dict[str, Any]) -> Optional[str]:
+        """What the text inside an example's FIRST region says
+        (CLASSIFIER_REFERENCE_BOX_TEXT), as its caption quotes it — the region
+        of the reference's ORIGINAL page (``page.jpg``, the frame its regions
+        are in) recognised by ``region_text`` with this process's OCR engine
+        (``analysis.ocr``), in a worker thread under the process-wide OCR
+        limit. Once per job per ``(reference_id, criterion)``, None included.
+
+        **Never raises**: no engine (CLASSIFIER_OCR_ENGINE=none), a missing or
+        undecodable ``page.jpg``, an OCR error or a region with no legible
+        text (a logo) are all None — the example is shown without its
+        sentence, as the loop's examples are never worth failing a unit."""
+        key = (example["reference_id"], example["criterion"])
+        if key in self._texts:
+            return self._texts[key]
+        text: Optional[str] = None
+        try:
+            engine = get_ocr_engine()
+            raw = (
+                await asyncio.to_thread(reference_files.open, example["reference_id"], PAGE_FILE)
+                if engine is not None else None
+            )
+            if raw is not None:
+                bounds = list(Region.from_dict(example["regions"][0]).bounds())
+
+                def read() -> Optional[str]:
+                    import cv2
+                    import numpy as np
+
+                    page = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
+                    return None if page is None else region_text(page, bounds, engine)
+
+                async with OCR_PASSES:
+                    text = await asyncio.to_thread(read)
+        except Exception as exc:  # noqa: BLE001 — a caption sentence never fails the unit
+            logger.warning(
+                "references: no region text for %s / %r: %s",
+                example.get("reference_id"), example.get("criterion"), exc,
+            )
+            text = None
+        self._texts[key] = text
+        return text
+
     async def box_examples(
-        self, guide: CriterionGuide, spec: ModelSpec, *, position_check: bool
+        self,
+        guide: CriterionGuide,
+        spec: ModelSpec,
+        *,
+        position_check: bool,
+        with_text: Optional[bool] = None,
     ) -> BoxGuide:
         """The examples the box loop shows for one unit of ``guide``'s
         criterion on ``spec``.
@@ -557,7 +697,15 @@ class JobReferences:
         every step sees the same examples. Called by ``analysis.llm_eval``
         only after the loop's gate passed and a knob is on, so a page that is
         not located never decodes a reference page.
+
+        ``with_text`` (default CLASSIFIER_REFERENCE_BOX_TEXT) also reads each
+        shown example's region text (``text_of``) onto its ``BoxExample``s —
+        ask and crop alike, so every step's caption quotes it — and into its
+        record as ``text`` (None when there was none). Off, neither the
+        examples nor the records change.
         """
+        if with_text is None:
+            with_text = REFERENCE_BOX_TEXT
         chosen, note = box_selection(guide.examples, spec.max_images_per_prompt)
         out = BoxGuide(ask_images="crop" if position_check else "composite", note=note)
         dropped: list[str] = []
@@ -572,18 +720,24 @@ class JobReferences:
             if crop is None:
                 dropped.append(f"{rid}: its page image ({PAGE_FILE}) is missing or unreadable")
                 continue
+            text = await self.text_of(example) if with_text else None
             verdict = example["expected"]["verdict"]
             out.ask.append(BoxExample(
                 criterion=example["criterion"], verdict=verdict,
                 image_b64=crop if position_check else composite, crop=position_check,
+                text=text,
             ))
             out.crops.append(BoxExample(
                 criterion=example["criterion"], verdict=verdict, image_b64=crop, crop=True,
+                text=text,
             ))
-            out.records.append({
+            record = {
                 "reference_id": rid, "criterion": example["criterion"],
                 "polarity": example["polarity"], "composite": example["composite"],
-            })
+            }
+            if with_text:
+                record["text"] = text
+            out.records.append(record)
         if dropped:
             out.note = (
                 "no example could be loaded for the box loop — " if not out.ask

@@ -23,9 +23,20 @@ other:
     build_verify_prompt() — the enforcement loop's check: the CROP alone, "is
                             <criterion> visible in this?", 1-10 — or, behind
                             its knob, after examples from other documents
-                            (reason written before score).
+                            (reason written before score); behind
+                            CLASSIFIER_LLM_BBOX_VERIFY_PARTIAL (``partial``)
+                            it also asks whether the crop cuts the feature
+                            off, which never moves the score.
+    build_marks_prompt()  — the refine pass in marks mode
+                            (CLASSIFIER_LLM_BBOX_REFINE_MODE=marks): the
+                            zoomed crop with every OCR text line outlined and
+                            numbered, "which mark(s) are <criterion>?" —
+                            ``{"reason", "marks": [n, ...]}``.
     BoxExample            — one example as the loop's prompts need it: a
-                            composite or a region crop, with its verdict.
+                            composite or a region crop, with its verdict —
+                            and, behind CLASSIFIER_REFERENCE_BOX_TEXT, the
+                            text inside its region, which its caption quotes
+                            (``example_text`` normalises and cuts it).
     build_describe_prompt() — a reference example's catalogue line: ONE page
                             image, "what is this, in a sentence or two" — no
                             criterion, no judgement.
@@ -81,7 +92,10 @@ the refine and verify region crops (the verify composites when its caller
 passes ``verify_examples`` — ``bin/grounding_experiment.py`` only).
 ``build_llm_prompt(..., references=None)``, ``build_bbox_prompt`` and
 ``build_verify_prompt`` without references are byte-for-byte the plain
-prompts — no examples, no extra system sentence — which tests pin by hash.
+prompts — no examples, no extra system sentence — which tests pin by hash;
+so is ``build_verify_prompt(..., partial=False)``, and a ``BoxExample``
+without ``text`` captions exactly as before. ``build_marks_prompt`` attaches
+ONE image (the marked crop) unless guided, like the refine ask it replaces.
 
 PREFIX CACHING. The scoring prompt puts everything that depends only on the
 ITEM first — system prompt, page image, context line, DOCUMENT TEXT block —
@@ -96,15 +110,19 @@ The rubric strings (HINT_RUBRICS) and the extracted-text block heading
 (DOCUMENT_TEXT_HEADING) live in config.py § LLM prompt text, and the wording
 the examples add (captions, guards, headings, system sentences —
 ``REFERENCE_GUARD``, ``BOX_CAPTIONS`` and the rest) in config.py § Prompt
-wording — the reference examples, so prompt wording can be tuned without
-touching the assembly logic here. This module imports those names, so
+wording — the reference examples, beside the box loop's opt-in wording (an
+example's text ``BOX_CAPTION_TEXT``, the marks ask ``MARKS_*``, the verify's
+``VERIFY_PARTIAL_*``), so prompt wording can be tuned without touching the
+assembly logic here. This module imports those names, so
 ``from llm.prompts import BOX_CANDIDATE_HEADING`` still works.
 ``SCORING_SCAFFOLD`` stays here: it is the answer contract ``llm.validate``
-parses, not wording.
+parses, not wording — as does ``MARKS_SCAFFOLD``, the one ``llm.boxes``
+parses.
 
 Process flow position: called by ``analysis.llm_eval`` (the scoring prompt),
-``llm.boxes`` (the loop's two) and ``analysis.references`` (the describe
-call); the result goes to ``llm.client``.
+``llm.boxes`` (the loop's ask, refine — grid or marks — and verify) and
+``analysis.references`` (the describe call, and ``example_text`` for an
+example's caption); the result goes to ``llm.client``.
 """
 
 import json
@@ -113,6 +131,7 @@ from typing import Optional
 
 from config import (
     BOX_CANDIDATE_HEADING,
+    BOX_CAPTION_TEXT,
     BOX_CAPTIONS,
     BOX_REFERENCE_GUARD,
     BOX_SYSTEM_SENTENCE,
@@ -120,9 +139,16 @@ from config import (
     DOCUMENT_TEXT_HEADING,
     HINT_RUBRICS,
     LLM_BBOX_GRID,
+    MARKS_FEEDBACK_HEADING,
+    MARKS_PROMPT,
+    MARKS_REFERENCE_GUARD,
+    MARKS_SYSTEM_PROMPT,
+    REFERENCE_BOX_TEXT_MAX_CHARS,
     REFERENCE_DESCRIPTION_MAX_CHARS,
     REFERENCE_GUARD,
     VERIFY_CANDIDATE_HEADING,
+    VERIFY_PARTIAL_QUESTION,
+    VERIFY_PARTIAL_SCAFFOLD,
     VERIFY_REFERENCE_NOTE,
     VERIFY_SYSTEM_SENTENCE,
 )
@@ -137,6 +163,11 @@ from logger import logger
 # and it changes the scoring prompt's golden hashes in
 # unit-tests/classifier/test_reference_prompts.py.
 SCORING_SCAFFOLD: dict = {"score": 0, "verdict": "...", "confidence": 0, "reason": "..."}
+
+# The marks ask's answer, verbatim in the prompt — the contract
+# llm.boxes.parse_marks reads ("marks": the chosen numbers, null or [] for
+# none). Reason first, so the model quotes the lines before it picks them.
+MARKS_SCAFFOLD: dict = {"reason": "...", "marks": [0]}
 
 
 def _model(model: Optional[ModelSpec]) -> ModelSpec:
@@ -207,19 +238,43 @@ class BoxExample:
                    reference's ORIGINAL page cut around its first region
                    (``llm.boxes.example_crop``), no outline drawn.
         crop:      True for a region crop — it selects the crop captions.
+        text:      What the text inside the example's region says
+                   (CLASSIFIER_REFERENCE_BOX_TEXT, OCR'd by
+                   ``analysis.references.region_text``), or None — then the
+                   caption is exactly the one without it.
     """
 
     criterion: str
     verdict: str
     image_b64: str
     crop: bool = False
+    text: Optional[str] = None
 
     def caption(self) -> str:
         """The sentence shown just before this example's image (``BOX_CAPTIONS``;
         a verdict outside the three reads as PASS, as ``ReferenceExample``'s
-        does)."""
+        does), plus ``BOX_CAPTION_TEXT`` quoting ``text`` when there is any."""
         template = BOX_CAPTIONS.get((self.verdict, self.crop)) or BOX_CAPTIONS[("PASS", self.crop)]
-        return template.format(criterion=self.criterion)
+        caption = template.format(criterion=self.criterion)
+        text = example_text(self.text)
+        if text:
+            caption += BOX_CAPTION_TEXT[self.crop].format(text=text)
+        return caption
+
+
+def example_text(raw: Optional[str], max_chars: int = REFERENCE_BOX_TEXT_MAX_CHARS) -> Optional[str]:
+    """An example's region text as a caption quotes it: whitespace collapsed,
+    double quotes made single (it sits inside double quotes), cut to
+    ``max_chars`` with an ellipsis — or None when nothing is left. Idempotent,
+    so a caller may store what it returns and pass it back."""
+    if not raw:
+        return None
+    text = " ".join(str(raw).split()).replace('"', "'")
+    if not text:
+        return None
+    if len(text) > max_chars:
+        text = text[: max(1, max_chars - 1)].rstrip() + "…"
+    return text
 
 
 def _example_parts(references: list[BoxExample]) -> list[dict]:
@@ -619,6 +674,7 @@ def build_verify_prompt(
     *,
     references: Optional[list[BoxExample]] = None,
     model: Optional[ModelSpec] = None,
+    partial: bool = False,
 ) -> dict:
     """Ask whether ``name`` is visible in a CROP, with no other context.
 
@@ -652,18 +708,28 @@ def build_verify_prompt(
     whatever its position, and the 1-10 scale is unchanged. None or [] is
     byte-for-byte the prompt without them (pinned by hash).
 
+    ``partial`` (CLASSIFIER_LLM_BBOX_VERIFY_PARTIAL, ``llm.boxes``) adds a
+    ``"partial"`` key LAST in the scaffold and ``VERIFY_PARTIAL_QUESTION``
+    after the reason sentence: does the crop show the feature but cut part of
+    it off? It is a separate field on purpose — the score is still "is it
+    visible", on the same scale, so LLM_BBOX_VERIFY_PASS keeps its meaning;
+    ``partial`` only changes what a REJECTED attempt's retry is told. False
+    is byte-for-byte the prompt without it (pinned by hash).
+
     Args:
         crop_b64:   Base64 JPEG of the padded crop, taken from the ORIGINAL
                     page image (not the ≤1000-px working copy — the crop of a
                     downscaled page is too soft to judge).
         name:       The criterion being verified.
         references: Examples to show before the candidate crop.
+        partial:    Also ask whether the crop cuts the feature off.
 
     Returns:
         A dict ready to POST to the vLLM /v1/chat/completions endpoint.
     """
+    extra = dict(VERIFY_PARTIAL_SCAFFOLD) if partial else {}
     if references:
-        scaffold = json.dumps({"reason": "...", "score": 0}, indent=2)
+        scaffold = json.dumps({"reason": "...", "score": 0, **extra}, indent=2)
         opening = (
             f"Is this visible in the CANDIDATE crop: {name}?\n\n"
             f"{VERIFY_REFERENCE_NOTE.format(name=name)}\n\n"
@@ -674,14 +740,18 @@ def build_verify_prompt(
             "Write 'reason' first, what you actually see in the CANDIDATE crop, in one "
             "sentence; then 'score'."
         )
+        crop = "the CANDIDATE crop"
     else:
-        scaffold = json.dumps({"score": 0, "reason": "..."}, indent=2)
+        scaffold = json.dumps({"score": 0, "reason": "...", **extra}, indent=2)
         opening = (
             f"Is this visible in the attached image: {name}?\n\n"
             "The image is a close crop of a larger photo or document. Judge only "
             "what you can see here.\n\n"
         )
         seen = "'reason' says what you actually see, in one sentence."
+        crop = "the crop"
+    if partial:
+        seen += " " + VERIFY_PARTIAL_QUESTION.format(crop=crop, name=name)
     user_text = (
         f"{opening}"
         "Score 1-10:\n"
@@ -709,6 +779,92 @@ def build_verify_prompt(
         }
     )
     user_content.append({"type": "text", "text": user_text})
+    return _model(model).body(
+        [
+            {"role": "system", "content": _system_prompt(system_prompt, model)},
+            {"role": "user", "content": user_content},
+        ],
+        "box",
+    )
+
+
+def build_marks_prompt(
+    image_b64: str,
+    name: str,
+    *,
+    marks: int,
+    feedback: list[str] | None = None,
+    references: Optional[list[BoxExample]] = None,
+    model: Optional[ModelSpec] = None,
+) -> dict:
+    """Ask which numbered mark(s) on the refine crop are ``name``.
+
+    The refine pass in marks mode (CLASSIFIER_LLM_BBOX_REFINE_MODE=marks,
+    ``llm.boxes``): the attached image is the zoomed crop of the ORIGINAL
+    page, with every OCR text line in it outlined and numbered 1..``marks``
+    (``common.vision.draw_marks_overlay``). Placing a box is replaced by
+    recognising a line, so the answer is as precise as the OCR's boxes;
+    several numbers are one feature written over several lines (a label and
+    its value). The answer is ``MARKS_SCAFFOLD`` — reason first, quoting the
+    lines picked — and ``"marks": null`` (or ``[]``) says none of the lines is
+    the feature, after which the loop tries the grid refine.
+
+    ``feedback`` is the earlier attempts' rejections, under
+    ``MARKS_FEEDBACK_HEADING`` (their coordinates are on the whole page, not
+    this crop — what helps is their meaning: "it cut the label off").
+    ``references`` (the CLASSIFIER_REFERENCE_BOX_REFINE knob) come first, as
+    in ``build_bbox_prompt``, with ``MARKS_REFERENCE_GUARD`` (the grid guard
+    talks about a grid this image does not have), the CANDIDATE heading and
+    the same system sentence. All wording is in config.py § Prompt wording.
+
+    Args:
+        image_b64:  Base64 JPEG of the marked refine crop.
+        name:       The criterion to find.
+        marks:      How many marks are drawn (numbered 1..marks).
+        feedback:   One sentence per previous rejected attempt, newest last.
+        references: Examples to show before the candidate.
+
+    Returns:
+        A dict ready to POST to the vLLM /v1/chat/completions endpoint.
+    """
+    if references:
+        attached, crop_is, this_image = (
+            "the zoomed CANDIDATE image", "The CANDIDATE image is", "the CANDIDATE image",
+        )
+    else:
+        attached, crop_is, this_image = "the attached image", "This image is", "this image"
+    feedback_block = ""
+    if feedback:
+        feedback_block = (
+            f"\n{MARKS_FEEDBACK_HEADING}\n"
+            + "\n".join(f"  - {line}" for line in feedback)
+            + "\n"
+        )
+    user_text = MARKS_PROMPT.format(
+        attached=attached, crop_is=crop_is, this_image=this_image, name=name,
+        count=int(marks), feedback=feedback_block,
+        scaffold=json.dumps(MARKS_SCAFFOLD, indent=2),
+    )
+    system_prompt = MARKS_SYSTEM_PROMPT
+    user_content: list[dict] = []
+    if references:
+        system_prompt += f" {BOX_SYSTEM_SENTENCE}"
+        user_content.extend(_example_parts(references))
+        user_content.append(
+            {"type": "text", "text": f"{MARKS_REFERENCE_GUARD}\n\n{BOX_CANDIDATE_HEADING}:"}
+        )
+    user_content.append(
+        {
+            "type": "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"},
+        }
+    )
+    user_content.append({"type": "text", "text": user_text})
+    logger.debug(
+        "build_marks_prompt: '%s' marks=%d feedback=%d line(s) examples=%d",
+        name, int(marks), len(feedback or []), len(references or []),
+    )
+    # The same small budget as the ask it replaces (models.yaml max_tokens.box).
     return _model(model).body(
         [
             {"role": "system", "content": _system_prompt(system_prompt, model)},

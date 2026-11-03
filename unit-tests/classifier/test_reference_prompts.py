@@ -19,6 +19,12 @@
     system sentences, the guided verify's other-documents note and
     reason-first answer, and the content order (composites in the verify
     too);
+  * the box loop's opt-in prompts: ``build_marks_prompt`` (``MARKS_GOLDEN``)
+    and ``build_verify_prompt(partial=True)`` (``VERIFY_PARTIAL_GOLDEN``)
+    pinned by hash, ``partial=False`` and a ``BoxExample`` without ``text``
+    pinned to today's, the example-text caption per kind of image, the marks
+    ask's guard and feedback block, and the partial question beside an
+    unchanged 1-10 scale;
   * ``plan_calls`` — contrastive pairing at three images, one example per
     call at two, the call cap; ``combine`` — any / all / mean;
   * ``box_selection`` / ``box_examples`` — what the loop is shown, on a stub
@@ -44,14 +50,18 @@ from llm.prompts import (
     BOX_REFERENCE_GUARD,
     BOX_SYSTEM_SENTENCE,
     CANDIDATE_HEADING,
+    MARKS_REFERENCE_GUARD,
     VERIFY_CANDIDATE_HEADING,
+    VERIFY_PARTIAL_QUESTION,
     VERIFY_REFERENCE_NOTE,
     VERIFY_SYSTEM_SENTENCE,
     BoxExample,
     ReferenceExample,
     build_bbox_prompt,
     build_llm_prompt,
+    build_marks_prompt,
     build_verify_prompt,
+    example_text,
 )
 from llm.validate import description_validator
 
@@ -117,6 +127,21 @@ VERIFY_GOLDEN = [
      "0210b15fa5b5cf05a6f4076e89e8561d05a85910773164d4e1ca1dd893f39e08"),
 ]
 
+# The box loop's opt-in prompts, pinned when they were added: the marks
+# refine (CLASSIFIER_LLM_BBOX_REFINE_MODE=marks) plain and with feedback, and
+# the verify with CLASSIFIER_LLM_BBOX_VERIFY_PARTIAL. Their wording is in
+# config.py § Prompt wording; regenerate on purpose, as above.
+MARKS_GOLDEN = [
+    ((("ZmFrZQ==", "the amount due"), {"marks": 12}),
+     "8545b8b32e3ea0598f1e4d408a3a43788c0e5508255f7157d161a546412c64ba"),
+    ((("ZmFrZQ==", "the account number"), {"marks": 5, "feedback": _FEEDBACK}),
+     "abf29dd2f2a959fc27b1606759052eb8e4ad4c0c5ed698f2f4f5f69589c81ce9"),
+]
+VERIFY_PARTIAL_GOLDEN = [
+    ((("ZmFrZQ==", "the amount due"), {"partial": True}),
+     "5f42ee819b04498b2f50adcf9be873aad365014f06b1bcc21e4775e3294fd602"),
+]
+
 
 def _hash(prompt: dict) -> str:
     raw = json.dumps(prompt, sort_keys=True, ensure_ascii=False).encode("utf-8")
@@ -173,6 +198,27 @@ def test_the_verify_without_examples_is_byte_identical_to_before(call, digest, r
     args, kwargs = call
     if references != "omitted":
         kwargs = {**kwargs, "references": references}
+    assert _hash(build_verify_prompt(*args, **kwargs)) == digest
+
+
+@pytest.mark.parametrize("call, digest", VERIFY_GOLDEN)
+def test_the_verify_with_partial_off_is_byte_identical_to_before(call, digest):
+    args, kwargs = call
+    assert _hash(build_verify_prompt(*args, **kwargs, partial=False)) == digest
+
+
+@pytest.mark.parametrize("call, digest", MARKS_GOLDEN)
+@pytest.mark.parametrize("references", ["omitted", None, []])
+def test_the_marks_prompt_is_pinned(call, digest, references):
+    args, kwargs = call
+    if references != "omitted":
+        kwargs = {**kwargs, "references": references}
+    assert _hash(build_marks_prompt(*args, **kwargs)) == digest
+
+
+@pytest.mark.parametrize("call, digest", VERIFY_PARTIAL_GOLDEN)
+def test_the_verify_with_partial_is_pinned(call, digest):
+    args, kwargs = call
     assert _hash(build_verify_prompt(*args, **kwargs)) == digest
 
 
@@ -429,6 +475,94 @@ def test_the_guided_verify_can_show_composites():
     assert content[6]["text"].startswith(f"Is this visible in the CANDIDATE crop: {LOGO}?")
     assert VERIFY_REFERENCE_NOTE.format(name=LOGO) in content[6]["text"]
     assert guided["messages"][0]["content"].endswith(VERIFY_SYSTEM_SENTENCE)
+
+
+# ── The box loop's opt-in wording ──────────────────────────────────────────
+
+
+def test_an_example_caption_quotes_its_text_and_none_is_todays_caption():
+    """CLASSIFIER_REFERENCE_BOX_TEXT: the text is appended per kind of image;
+    without it (None, empty, blank) the caption is byte-for-byte today's."""
+    for verdict in ("PASS", "MARGINAL", "FAIL"):
+        for crop in (False, True):
+            plain = _box(verdict, crop=crop).caption()
+            for nothing in (None, "", "  \n "):
+                assert BoxExample(LOGO, verdict, "UEFTUw==", crop=crop,
+                                  text=nothing).caption() == plain
+    assert BoxExample(LOGO, "PASS", "UEFTUw==", text="Meter #: 4471 0923").caption() == (
+        "REFERENCE EXAMPLE — 'the utility's logo' was PASS here; the coloured box outlines "
+        'it. The outlined area reads: "Meter #: 4471 0923".')
+    assert BoxExample(LOGO, "FAIL", "UEFTUw==", crop=True, text="Ohio Edison").caption() == (
+        "REFERENCE EXAMPLE (from another document) — a crop of something that is NOT the "
+        "utility's logo (FAIL there); do not box it. The text at its centre reads: "
+        '"Ohio Edison".')
+
+
+def test_example_text_collapses_quotes_and_cuts():
+    assert example_text('  Meter #:\n 4471   "0923" ') == "Meter #: 4471 '0923'"
+    long = example_text("Amount due " + "9" * 200)
+    assert len(long) == 80 and long.endswith("…") and long.startswith("Amount due 999")
+    assert example_text(long) == long                           # idempotent
+    assert example_text(None) is None and example_text(" \t") is None
+    assert example_text("abcdef", max_chars=4) == "abc…"
+
+
+def test_the_marks_prompt_asks_for_mark_numbers_on_one_image():
+    from llm.models import get_registry
+
+    prompt = build_marks_prompt("Q0FORA==", "the amount due", marks=12)
+    content = _parts(prompt)
+    assert [p["type"] for p in content] == ["image_url", "text"]
+    assert content[0]["image_url"]["url"].endswith("Q0FORA==")
+    text = content[1]["text"]
+    assert text.startswith("Find this feature in the attached image: the amount due\n\n")
+    assert "There are 12 marks, numbered 1 to 12." in text
+    assert "a label on one line, its value on the next" in text
+    assert '"marks": null' in text
+    assert "Earlier answers" not in text                       # no feedback, no block
+    scaffold = text[text.index("{"):]
+    assert list(json.loads(scaffold)) == ["reason", "marks"]   # reason first
+    assert prompt["messages"][0]["content"].startswith("You pick numbered marks in images.")
+    assert prompt["max_tokens"] == get_registry().default.max_tokens["box"]
+    # Feedback rides along, said to be on the whole page's grid.
+    with_feedback = _parts(build_marks_prompt("Q0FORA==", "the amount due", marks=3,
+                                              feedback=["it cut the label off"]))[-1]["text"]
+    assert ("Earlier answers for this feature were rejected (any coordinates below are on "
+            "the whole page, not on this crop):\n  - it cut the label off\n") in with_feedback
+
+
+def test_the_guided_marks_prompt_shows_examples_then_its_own_guard():
+    plain = build_marks_prompt("Q0FORA==", "the amount due", marks=4)
+    guided = build_marks_prompt("Q0FORA==", "the amount due", marks=4,
+                                references=[_box(crop=True, criterion="the amount due")])
+    content = _parts(guided)
+    assert [p["type"] for p in content] == ["text", "image_url", "text", "image_url", "text"]
+    assert content[2]["text"] == f"{MARKS_REFERENCE_GUARD}\n\n{BOX_CANDIDATE_HEADING}:"
+    assert "grid" not in MARKS_REFERENCE_GUARD                  # the grid guard does not fit
+    assert '"marks": null is still the answer' in MARKS_REFERENCE_GUARD
+    text = content[-1]["text"]
+    assert text.startswith("Find this feature in the zoomed CANDIDATE image: the amount due")
+    assert "The CANDIDATE image is a zoomed-in crop" in text
+    assert "or it is not in the CANDIDATE image" in text
+    assert guided["messages"][0]["content"] == (
+        f"{plain['messages'][0]['content']} {BOX_SYSTEM_SENTENCE}")
+
+
+def test_the_partial_verify_asks_a_separate_question_and_keeps_the_scale():
+    plain = _parts(build_verify_prompt("Q0FORA==", "the amount due"))[-1]["text"]
+    asked = _parts(build_verify_prompt("Q0FORA==", "the amount due", partial=True))[-1]["text"]
+    scale = plain[plain.index("Score 1-10:"):plain.index("'reason'")]
+    assert scale in asked                                       # the 1-10 scale unchanged
+    question = VERIFY_PARTIAL_QUESTION.format(crop="the crop", name="the amount due")
+    assert (f"'reason' says what you actually see, in one sentence. {question}\n\n"
+            "Return ONLY this JSON object:") in asked
+    assert "does not change the score" in question
+    assert list(json.loads(asked[asked.index("{"):])) == ["score", "reason", "partial"]
+    guided = _parts(build_verify_prompt("Q0FORA==", "the amount due", partial=True,
+                                        references=[_box(crop=True)]))[-1]["text"]
+    assert VERIFY_PARTIAL_QUESTION.format(crop="the CANDIDATE crop", name="the amount due") \
+        in guided
+    assert list(json.loads(guided[guided.index("{"):])) == ["reason", "score", "partial"]
 
 
 # ── plan_calls / combine ───────────────────────────────────────────────────

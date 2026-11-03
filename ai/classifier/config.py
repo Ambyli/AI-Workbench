@@ -272,7 +272,9 @@ DOCUMENT_TEXT_HEADING: str = "DOCUMENT TEXT (extracted, may contain OCR errors)"
 # were, pinned by hash in unit-tests/classifier/test_reference_prompts.py,
 # which also asserts some of these strings verbatim. llm/prompts.py imports
 # every name here, so `from llm.prompts import BOX_CANDIDATE_HEADING` (as that
-# test does) keeps working.
+# test does) keeps working. The same goes for the box loop's opt-in asks at
+# the end of the section — an example's text, the marks refine, the verify's
+# "cut off" field — each sent only behind its own setting.
 #
 # Not here on purpose: llm/prompts.py SCORING_SCAFFOLD (the answer contract
 # llm/validate.py parses, not wording), ReferenceExample.caption() (built from
@@ -367,6 +369,92 @@ VERIFY_REFERENCE_NOTE: str = (
     "CANDIDATE's own document, not to the reference's. Do not score lower because the "
     "CANDIDATE looks different from a reference: score whether the CANDIDATE crop shows "
     "{name}. A reference captioned FAIL shows something that does NOT count."
+)
+
+# ── An example's text (REFERENCE_BOX_TEXT; BoxExample.caption) ────────────
+# Appended to an example's caption when its region's text is known, by crop
+# (a composite has the region outlined; a crop is cut around it, padded, so
+# the region is its centre). `{text}` is the OCR'd text, whitespace
+# collapsed, double quotes made single, cut to REFERENCE_BOX_TEXT_MAX_CHARS
+# (llm.prompts.example_text). Without text the caption is exactly as above.
+BOX_CAPTION_TEXT: dict[bool, str] = {
+    False: ' The outlined area reads: "{text}".',
+    True: ' The text at its centre reads: "{text}".',
+}
+
+# ── The refine pass by numbered marks (LLM_BBOX_REFINE_MODE=marks;
+#    build_marks_prompt) ───────────────────────────────────────────────────
+# The marked crop's question. The OCR lines in the refine window are outlined
+# and numbered 1..N on tabs at their left end (common.vision
+# .draw_marks_overlay); the answer is `{"reason", "marks": [n, ...]}`, reason
+# first so the model quotes the lines before it picks them. Several marks
+# are one feature (a label line and its value line). `"marks": null` says
+# none of the lines is the feature — the loop then tries the grid, which can
+# box a logo. Placeholders: {attached} / {crop_is} / {this_image} name the
+# image ("the attached image" / "This image is" / "this image"; with
+# examples "the zoomed CANDIDATE image" / "The CANDIDATE image is" / "the
+# CANDIDATE image"), {name} the criterion, {count} the marks, {feedback} the
+# rejections block (MARKS_FEEDBACK_HEADING, or ""), {scaffold} the answer.
+MARKS_SYSTEM_PROMPT: str = (
+    "You pick numbered marks in images. You answer with mark numbers and nothing else. "
+    "Return ONLY a valid JSON object."
+)
+MARKS_PROMPT: str = (
+    "Find this feature in {attached}: {name}\n\n"
+    "{crop_is} a zoomed-in crop of a larger document. Every line of text found in it is "
+    "outlined and numbered: the number is on a coloured tab at the left end of its line. "
+    "There are {count} marks, numbered 1 to {count}.\n"
+    "{feedback}\n"
+    "Rules:\n"
+    "  - Answer with the number of every mark whose line IS part of the feature, and no "
+    "others. A feature written over several lines (a label on one line, its value on the "
+    "next) is all of those numbers.\n"
+    "  - If the feature is not one of the marked lines (a logo or a picture with no text, "
+    'or it is not in {this_image}), answer "marks": null.\n'
+    "  - Write 'reason' first: quote the text of the line(s) you picked, in one "
+    "sentence; then 'marks'.\n\n"
+    "Return ONLY this JSON object:\n\n"
+    "{scaffold}"
+)
+# The earlier attempts' rejections, when there were any. They name boxes on
+# the WHOLE page's grid, which this crop does not have — said so, so the
+# model takes their meaning ("it cut the label off"), not their numbers.
+MARKS_FEEDBACK_HEADING: str = (
+    "Earlier answers for this feature were rejected (any coordinates below are on the "
+    "whole page, not on this crop):"
+)
+# Said once after the refine's examples in marks mode — BOX_REFERENCE_GUARD
+# talks about a grid this image does not have.
+MARKS_REFERENCE_GUARD: str = (
+    "The image(s) above are reference examples, shown so you know WHAT to pick. On the "
+    "CANDIDATE it may be in a different place, so find it among the CANDIDATE image's own "
+    "numbered marks. The examples carry no marks: answer only with the CANDIDATE image's "
+    'mark numbers. If no marked line on the CANDIDATE is the feature, "marks": null is '
+    "still the answer."
+)
+
+# ── The verify's "cut off" field (LLM_BBOX_VERIFY_PARTIAL;
+#    build_verify_prompt, llm/boxes.py) ────────────────────────────────────
+# The question, after the verify's reason sentence, and the key added to its
+# answer scaffold (last, after score and reason). `partial` never moves the
+# score: a crop that cuts the label off is scored on the same 1-10 scale as
+# ever, so LLM_BBOX_VERIFY_PASS keeps its meaning. {crop} is "the crop" (or
+# "the CANDIDATE crop" with examples), {name} the criterion.
+VERIFY_PARTIAL_QUESTION: str = (
+    "'partial' is true when {crop} shows {name}, or part of it, but cuts some of it off at "
+    "an edge — part of its label, a digit or its outline is outside {crop}; it is false "
+    "when all of it is inside {crop}, and false when it is not in {crop} at all. 'partial' "
+    "does not change the score: score what {crop} shows on the scale above."
+)
+VERIFY_PARTIAL_SCAFFOLD: dict = {"partial": False}
+# The retry's feedback for a REJECTED attempt whose verify said partial —
+# instead of "…did not show X (verify score n); look elsewhere". It is the
+# next ask's prompt, so changing it changes behaviour. {box} is the box as
+# the model wrote it, {name} the criterion, {score} the verify score.
+VERIFY_PARTIAL_REJECT: str = (
+    "the crop of your previous box {box} showed {name} but cut part of it off (verify "
+    "score {score}); box the same place again, larger, so that all of it is inside — its "
+    "label and every digit"
 )
 
 # ---------------------------------------------------------------------------
@@ -794,6 +882,48 @@ LLM_BBOX_REFINE_MIN_SPAN: float = min(
     1.0, max(0.05, float(os.environ.get("CLASSIFIER_LLM_BBOX_REFINE_MIN_SPAN", "0.2")))
 )
 
+# LLM_BBOX_REFINE_MODE is HOW the refine pass asks. `grid` (the default) is
+# the pass above: the zoomed crop with its own grid, a box on it. `marks`
+# draws a numbered tag on every OCR text line in the refine window instead
+# (the text layer the criterion's options.ocr already produced — no extra OCR
+# pass) and asks which mark(s) are the feature; the refined box is the union
+# of the chosen lines' boxes, so it fits the text exactly. Measured misses
+# are mostly PLACEMENT — the right line, 15 px off, or "$193.33" boxed
+# without its "Amount due" label — and a line the OCR outlined cannot be
+# misplaced. Several marks may be chosen (a label line and its value line).
+# The grid pass runs instead, and the attempt records why
+# (`marks_fallback`), when the page has no OCR line boxes (native text), the
+# window holds none (a logo) or more than LLM_BBOX_MARKS_MAX, or the answer
+# is unusable or says none of the lines is the feature. Anything but
+# "marks" reads as "grid". CLASSIFIER_LLM_BBOX_REFINE=false turns both off.
+#
+# LLM_BBOX_MARKS_MIN_INSIDE (not an env knob): the share of a line's area
+# that must lie inside the window for it to be marked — a long line the
+# window clips in half is still the line the feature may be on.
+LLM_BBOX_REFINE_MODE: str = (
+    os.environ.get("CLASSIFIER_LLM_BBOX_REFINE_MODE", "grid").strip().lower() or "grid"
+)
+LLM_BBOX_MARKS_MAX: int = max(1, int(os.environ.get("CLASSIFIER_LLM_BBOX_MARKS_MAX", "40")))
+LLM_BBOX_MARKS_MIN_INSIDE: float = 0.5
+
+# LLM_BBOX_VERIFY_PARTIAL adds a `partial` field to the verify answer: the
+# crop shows the right thing but cuts part of it off (its label, a digit).
+# It never moves the score — the 1-10 scale and LLM_BBOX_VERIFY_PASS mean
+# what they always did — but when such an attempt is REJECTED, the retry is
+# told it was on the right thing and to box the same place larger
+# (VERIFY_PARTIAL_REJECT) instead of "look elsewhere". No extra call;
+# recorded as `verify_partial` on the attempt.
+#
+# LLM_BBOX_VERIFY_MIN_SPAN grows the verify crop (after LLM_BBOX_CROP_PAD),
+# centred and kept inside the page, to at least this fraction of the page on
+# EACH axis — so the crop of a one-line field keeps its label beside it. The
+# box, and everything recorded, are unchanged; only what the verify sees
+# grows. 0 is the crop as it always was.
+LLM_BBOX_VERIFY_PARTIAL: bool = _env_flag("CLASSIFIER_LLM_BBOX_VERIFY_PARTIAL", "false")
+LLM_BBOX_VERIFY_MIN_SPAN: float = min(
+    1.0, max(0.0, float(os.environ.get("CLASSIFIER_LLM_BBOX_VERIFY_MIN_SPAN", "0")))
+)
+
 # REFERENCE_BOX_ASK / _REFINE / _VERIFY show a criterion's reference examples
 # to the loop's ask, refine and verify calls (ZT-527) — until now they guided
 # only the scoring call. Only examples WITH a region, at most one PASS-side
@@ -811,6 +941,25 @@ LLM_BBOX_REFINE_MIN_SPAN: float = min(
 REFERENCE_BOX_ASK: bool = _env_flag("CLASSIFIER_REFERENCE_BOX_ASK", "false")
 REFERENCE_BOX_REFINE: bool = _env_flag("CLASSIFIER_REFERENCE_BOX_REFINE", "false")
 REFERENCE_BOX_VERIFY: bool = _env_flag("CLASSIFIER_REFERENCE_BOX_VERIFY", "false")
+
+# REFERENCE_BOX_TEXT describes each box-loop example in words as well: its
+# caption adds what the text inside its region says (BOX_CAPTION_TEXT, e.g.
+# `The outlined area reads: "Meter #: 4471 0923".`), cut to
+# REFERENCE_BOX_TEXT_MAX_CHARS. A reference keeps no text layer, so the
+# region is OCR'd from the reference's page.jpg once per job
+# (analysis.references.region_text), under the CLASSIFIER_OCR_WORKERS limit,
+# with context around it — padded by REFERENCE_BOX_TEXT_PAD and grown to at
+# least REFERENCE_BOX_TEXT_MIN_SPAN of the page on each axis — and only the
+# lines centred inside the region itself kept. The context is for the OCR
+# detector: on the fixture bills it found nothing at all in a 427×65 crop of
+# a perfectly legible "Account #078-360-268-2-8" line, and read it once the
+# crop was 5% of the page tall. A region with no legible text (a logo) gets
+# no sentence; a failure never fails the unit. Only matters with a
+# REFERENCE_BOX_* knob on.
+REFERENCE_BOX_TEXT: bool = _env_flag("CLASSIFIER_REFERENCE_BOX_TEXT", "false")
+REFERENCE_BOX_TEXT_MAX_CHARS: int = 80
+REFERENCE_BOX_TEXT_PAD: float = 0.1
+REFERENCE_BOX_TEXT_MIN_SPAN: float = 0.05
 
 # Presence score at or above which a criterion is worth locating. Not an env
 # knob: it is the service-wide PASS line (utils.verdict_from_score), and a

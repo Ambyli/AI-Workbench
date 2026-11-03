@@ -17,7 +17,8 @@
                  item through context vars), written by ``client._post``.
     validate.py  believing the answer only so far: find the criterion's answer,
                  clamp it, recompute the verdict from the clamped score.
-    boxes.py     not believing it at all: ask -> validate -> verify by crop ->
+    boxes.py     not believing it at all: ask -> validate -> refine (on a
+                 grid, or by numbered OCR-line marks) -> verify by crop ->
                  retry, the bounding-box enforcement loop.
 
 IMAGES PER PROMPT. Every prompt builder here takes ONE image — the page, a

@@ -154,6 +154,33 @@ shown (the reference page with the feature outlined, the composite captions)
 — ``llm.boxes.locate_criterion(verify_examples=...)``, which the service never
 passes. Refine always sees the crops.
 
+The loop's opt-in placement aids, each defaulting to the container's own
+setting (so a bare run measures what production does) and passed to
+``llm.boxes.locate_criterion`` / the example builders explicitly:
+
+    --refine-mode grid|marks    CLASSIFIER_LLM_BBOX_REFINE_MODE: marks numbers
+                                the OCR lines in the refine window and asks
+                                which. The script OCRs each image ONCE
+                                (``analysis.ocr.get_ocr_engine``, as the
+                                service's text layer does) and caches it;
+                                with no engine the attempts fall back to the
+                                grid and say so.
+    --reference-text / --no-…   CLASSIFIER_REFERENCE_BOX_TEXT: each example's
+                                caption quotes its region's text, OCR'd as the
+                                service does (``analysis.references
+                                .region_text``).
+    --verify-partial / --no-…   CLASSIFIER_LLM_BBOX_VERIFY_PARTIAL: the verify
+                                also answers ``partial``; a rejected partial
+                                crop's retry says "same place, larger".
+    --verify-min-span F         CLASSIFIER_LLM_BBOX_VERIFY_MIN_SPAN: the
+                                verify crop grown to at least F of the page.
+
+The header prints them, ``summary.config`` holds them, and every record
+carries them (``refine_mode``, ``reference_text``, ``verify_partial``,
+``verify_min_span``); with marks, each configuration's summary adds
+``marks_refined_rate`` (of the attempts that refined, how many the marks
+pass refined rather than the grid fallback).
+
 What it prints, per configuration, per criterion and overall:
 
     attempt-1 valid     how often the FIRST box survived validation. This is
@@ -215,11 +242,15 @@ repeat), with the numbers above per run, and — to say WHY, not just how often:
                     box (``bbox_grid`` / ``bbox_px``, coarse and refined),
                     ``verify_score``, ``verify_reason`` and ``reject`` (the
                     sentence the retry is told), as ``localization.attempts``
-                    has them.
+                    has them — with the aids on, ``refine_mode``, ``marks``
+                    (the chosen mark numbers), ``marks_shown``,
+                    ``marks_fallback`` and ``verify_partial`` too.
     answers         every model request of the run in call order, as the
                     model answered it: ``{kind: ask | refine | verify,
-                    attempt, request, bbox (ask / refine) | score (verify),
-                    reason, ok}``. ``attempt`` is the loop attempt (from the
+                    attempt, request, bbox (ask / grid refine) | marks (marks
+                    refine, label ``refine/marks/…``) | score (verify, plus
+                    ``partial`` when it answered one), reason, ok}``.
+                    ``attempt`` is the loop attempt (from the
                     call label, ``bbox/<criterion>#<n>``), ``request`` the
                     request within it (> 1 is a parse retry). ``score`` is
                     the model's own number, before the loop clamps it. When
@@ -227,6 +258,9 @@ repeat), with the numbers above per run, and — to say WHY, not just how often:
                     is false and ``raw`` holds its content (or the error), cut
                     to 400 characters. The prompt is never stored — it holds
                     the images.
+    example_text    the text the run's example captions quoted (the first
+                    example's; null without --reference-text, without text,
+                    or in the ``off`` configuration, which shows none).
     call_log        per request: kind, seconds, prompt tokens, ok (HTTP).
 
 Process flow position: none — a standalone operator tool. It imports the same
@@ -263,12 +297,17 @@ from config import (  # noqa: E402
     GROUNDING_DEFAULT_CRITERIA,
     GROUNDING_IMAGE_SUFFIXES,
     LLM_BBOX_GRID,
+    LLM_BBOX_MARKS_MAX,
     LLM_BBOX_MAX_ATTEMPTS,
     LLM_BBOX_MAX_AREA,
     LLM_BBOX_MIN_AREA,
     LLM_BBOX_REFINE,
+    LLM_BBOX_REFINE_MODE,
+    LLM_BBOX_VERIFY_MIN_SPAN,
+    LLM_BBOX_VERIFY_PARTIAL,
     LLM_BBOX_VERIFY_PASS,
     MAX_WORKING_DIMENSION,
+    REFERENCE_BOX_TEXT,
 )
 from llm.client import encode_image_to_base64  # noqa: E402
 from llm.models import ModelSpec, get_registry  # noqa: E402
@@ -435,13 +474,16 @@ async def _detector_boxes(working, labels: list[str], geometry: PageGeometry):
 
 
 def _image_examples(
-    path: pathlib.Path, criteria: dict[str, list[list[float]]]
+    path: pathlib.Path, criteria: dict[str, list[list[float]]], *, with_text: bool = False,
 ) -> dict[str, tuple[list[BoxExample], list[BoxExample]]]:
     """``--reference-image``: per criterion, ``(ask, crops)`` — one PASS
     example built from the image's FIRST truth box for it (list the primary
     copy first; decoys are never examples), as production would show it: the
     composite drawn by ``references.render.composite`` (the caller's
-    ``manual`` stroke), the crop cut by ``llm.boxes.example_crop``."""
+    ``manual`` stroke), the crop cut by ``llm.boxes.example_crop`` — and,
+    ``with_text`` (``--reference-text``), the box's text, OCR'd by
+    ``analysis.references.region_text`` exactly as a job reads a stored
+    reference's (None when there is no engine or no text)."""
     from references.render import composite
 
     original, working, geometry = _load(path)
@@ -454,11 +496,56 @@ def _image_examples(
                         source="manual")
         drawn = base64.b64encode(composite(working, geometry, [region])).decode("ascii")
         crop = encode_image_to_base64(llm_boxes.example_crop(original, [x1, y1, x2, y2]))
+        text = _box_text(original, [x1, y1, x2, y2]) if with_text else None
+        if with_text:
+            print(f"    example text {path.name} / {criterion}: {text!r}")
         out[criterion] = (
-            [BoxExample(criterion=criterion, verdict="PASS", image_b64=drawn)],
-            [BoxExample(criterion=criterion, verdict="PASS", image_b64=crop, crop=True)],
+            [BoxExample(criterion=criterion, verdict="PASS", image_b64=drawn, text=text)],
+            [BoxExample(criterion=criterion, verdict="PASS", image_b64=crop, crop=True,
+                        text=text)],
         )
     return out
+
+
+def _box_text(original, box: list[float]) -> str | None:
+    """``--reference-text``: what the text inside ``box`` (original pixels)
+    says, as the service's caption would quote it — or None (no engine, no
+    text, an OCR error: an example is shown without its sentence, never
+    fatal)."""
+    from analysis.ocr import get_ocr_engine
+    from analysis.references import region_text
+
+    try:
+        return region_text(original, box, get_ocr_engine())
+    except Exception as exc:  # noqa: BLE001 — as JobReferences.text_of
+        print(f"    region text failed: {exc}", file=sys.stderr)
+        return None
+
+
+# ``--refine-mode marks``: each image's OCR lines (``TextLayer.lines``' shape,
+# original pixels), recognised once per run.
+_OCR_LINES: dict[str, list[dict] | None] = {}
+
+
+def _ocr_lines(path: pathlib.Path, original) -> list[dict] | None:
+    """The image's OCR text lines, as the service's text layer holds them for
+    a photo (``recognize_text_layer`` → ``engine.recognize(page)``): one pass
+    per image, cached. None when no OCR engine is available — the marks
+    refine then falls back to the grid, and each attempt records why."""
+    key = str(path.resolve())
+    if key not in _OCR_LINES:
+        from analysis.ocr import get_ocr_engine
+
+        engine = get_ocr_engine()
+        if engine is None:
+            print(f"    {path.name}: no OCR engine — the marks refine will fall back to the grid",
+                  file=sys.stderr)
+            _OCR_LINES[key] = None
+        else:
+            t0 = time.monotonic()
+            _OCR_LINES[key] = list(engine.recognize(original).lines)
+            print(f"    OCR: {len(_OCR_LINES[key])} line(s) in {time.monotonic() - t0:.1f}s")
+    return _OCR_LINES[key]
 
 
 def _stored_examples(reference_ids: list[str]) -> tuple[dict[str, list[dict]], set[str]]:
@@ -490,15 +577,18 @@ def _stored_examples(reference_ids: list[str]) -> tuple[dict[str, list[dict]], s
 
 
 async def _stored_guide(
-    label: str, by_name: dict[str, list[dict]], spec: ModelSpec
+    label: str, by_name: dict[str, list[dict]], spec: ModelSpec, *, with_text: bool = False,
 ) -> tuple[list[BoxExample], list[BoxExample]]:
     """One criterion's ``(ask, crops)`` from stored references, chosen and
-    loaded exactly as a job's ``box_examples`` does (no position check)."""
+    loaded exactly as a job's ``box_examples`` does (no position check;
+    ``with_text`` is ``--reference-text``)."""
     from analysis.references import CriterionGuide, JobReferences
 
     examples = by_name.get(label.casefold().strip(), [])
     guide = CriterionGuide(label, "explicit", {}, examples)
-    box_guide = await JobReferences(plan={}).box_examples(guide, spec, position_check=False)
+    box_guide = await JobReferences(plan={}).box_examples(
+        guide, spec, position_check=False, with_text=with_text,
+    )
     if box_guide.note:
         print(f"    {label}: {box_guide.note}")
     return box_guide.ask, box_guide.crops
@@ -680,8 +770,10 @@ def _against_truth(
             "center_error_grid": round(error(copies[best]), 1), "landed_on": landed_on}
 
 
-# The loop's call labels: "bbox/<criterion>#<attempt>", "refine/…", "verify/…".
+# The loop's call labels: "bbox/<criterion>#<attempt>", "refine/…" (the marks
+# refine: "refine/marks/…"), "verify/…".
 _LABEL = re.compile(r"^(?:bbox|refine|verify)/.*#(\d+)$")
+_MARKS_LABEL = "refine/marks/"
 
 
 class _CallLog:
@@ -733,6 +825,10 @@ def _answer(fields: dict) -> dict:
         return {**out, "reason": None, "ok": False, "raw": str(raw)[:400]}
     if kind == "verify":
         out["score"] = parsed.get("score")
+        if "partial" in parsed:
+            out["partial"] = parsed.get("partial")
+    elif (fields.get("label") or "").startswith(_MARKS_LABEL):
+        out["marks"] = parsed.get("marks")
     else:
         out["bbox"] = parsed.get("bbox")
     reason = parsed.get("reason")
@@ -807,7 +903,8 @@ async def run(args) -> dict:
         if spec.max_images_per_prompt < 2:
             raise SystemExit(f"--model {spec.id} takes 1 image per prompt: no room for an example")
         image_examples = _image_examples(reference_path,
-                                         truth[reference_path.name]["criteria"])
+                                         truth[reference_path.name]["criteria"],
+                                         with_text=args.reference_text)
     elif args.references:
         stored, stored_pages = _stored_examples(args.references)
     elif args.references_from_truth and spec.max_images_per_prompt < 2:
@@ -830,7 +927,8 @@ async def run(args) -> dict:
         if key not in truth_examples:
             try:
                 truth_examples[key] = _image_examples(
-                    by_name[page], {label: truth[page]["criteria"][label]}
+                    by_name[page], {label: truth[page]["criteria"][label]},
+                    with_text=args.reference_text,
                 )[label]
             except SystemExit as exc:   # _image_examples: "unreadable"
                 print(f"    {exc}", file=sys.stderr)
@@ -850,6 +948,12 @@ async def run(args) -> dict:
         print(f"examples: {reference_path.name if reference_path else (', '.join(args.references) if args.references else 'none')}")
     print(f"configs : {', '.join(configs)}, {args.repeats} repeat(s) each")
     print(f"verify  : shown {args.verify_images}s when it carries examples")
+    aids = _aids(args)
+    print(f"aids    : refine mode {aids['refine_mode']}"
+          f"{' (at most ' + str(LLM_BBOX_MARKS_MAX) + ' marks)' if aids['refine_mode'] == 'marks' else ''}, "
+          f"reference text {'on' if aids['reference_text'] else 'off'}, "
+          f"verify partial {'on' if aids['verify_partial'] else 'off'}, "
+          f"verify min span {aids['verify_min_span']:g}")
     print(f"images  : {len(paths)} under {directory}\n")
 
     log = _CallLog()
@@ -878,12 +982,17 @@ async def run(args) -> dict:
         detector = await _detector_boxes(working, labels, geometry)
         boxes: Truth = truth.get(path.name) or {"criteria": {}, "decoys": {}}
         print(f"{path.name} ({geometry.width}x{geometry.height})")
+        # The marks refine's lines: one OCR pass per image, as the service's
+        # text layer is one pass per page.
+        text_lines = _ocr_lines(path, original) if aids["refine_mode"] == "marks" else None
 
         for label in labels:
             if image_examples:
                 ask_examples, crop_examples = image_examples.get(label, ([], []))
             elif stored:
-                ask_examples, crop_examples = await _stored_guide(label, stored, spec)
+                ask_examples, crop_examples = await _stored_guide(
+                    label, stored, spec, with_text=args.reference_text,
+                )
             else:
                 ask_examples, crop_examples = [], []
             for repeat in range(1, args.repeats + 1):
@@ -928,6 +1037,10 @@ async def run(args) -> dict:
                         guide_ask=guide_ask,
                         guide_refine=guide_refine,
                         guide_verify=guide_verify,
+                        text_lines=text_lines,
+                        refine_mode=aids["refine_mode"],
+                        verify_partial=aids["verify_partial"],
+                        verify_min_span=aids["verify_min_span"],
                     )
                     elapsed = time.monotonic() - t0
                     first = loc.attempts[0] if loc.attempts else None
@@ -952,8 +1065,15 @@ async def run(args) -> dict:
                         "calls": loc.calls,
                         "guided": dict(loc.guided),
                         "verify_images": args.verify_images,
+                        **aids,
                         "reference_image": reference_image,
                         "reference_note": reference_note,
+                        # What the example captions quoted (any guided step's
+                        # examples are the same; null when none was shown).
+                        "example_text": (
+                            next((e.text for e in crop_examples + ask_examples if e.text), None)
+                            if aids["reference_text"] and any(CONFIGS[config]) else None
+                        ),
                         "detector_iou": accepted.detector_iou if accepted else None,
                         "detector_boxes": len(detector.get(label) or []),
                         "seconds": round(elapsed, 2),
@@ -983,7 +1103,7 @@ async def run(args) -> dict:
         print()
 
     summary = _summarise(records, time.monotonic() - started, spec.id, configs, bool(truth),
-                         args.verify_images)
+                         args.verify_images, aids)
     _print_summary(summary)
     if args.write_failures:
         failing, measured = _failures(records)
@@ -1003,6 +1123,17 @@ async def run(args) -> dict:
     return summary
 
 
+def _aids(args) -> dict:
+    """The loop's opt-in aids this run sets — passed to the loop explicitly,
+    printed in the header, kept in ``summary.config`` and on every record."""
+    return {
+        "refine_mode": "marks" if args.refine_mode == "marks" else "grid",
+        "reference_text": bool(args.reference_text),
+        "verify_partial": bool(args.verify_partial),
+        "verify_min_span": float(args.verify_min_span),
+    }
+
+
 def _rate(values: list[bool]) -> float:
     return (sum(1 for v in values if v) / len(values)) if values else 0.0
 
@@ -1014,7 +1145,7 @@ def _mean(values: list, digits: int = 3):
 
 def _summarise(
     records: list[dict], elapsed: float, model_id: str, configs: list[str], scored: bool,
-    verify_images: str,
+    verify_images: str, aids: dict | None = None,
 ) -> dict:
     """Per configuration: the rates overall and per criterion, and what each
     call kind cost."""
@@ -1040,6 +1171,12 @@ def _summarise(
             "mean_detector_iou": round(statistics.fmean(ious), 3) if ious else None,
             "iou_at_least_0_5_rate": round(_rate([i >= 0.5 for i in ious]), 3) if ious else None,
         }
+        # Marks mode: of the attempts that went through a refine, how many
+        # the marks pass refined (the rest fell back to the grid).
+        refines = [a.get("refine_mode") for r in rows for a in r["attempt_log"]
+                   if a.get("refine_mode")]
+        if refines:
+            out["marks_refined_rate"] = round(_rate([m == "marks" for m in refines]), 3)
         truthed = [r for r in rows if r["hit"] is not None]
         if scored and truthed:
             landed: dict[str, int] = {}
@@ -1093,6 +1230,8 @@ def _summarise(
             "max_area": LLM_BBOX_MAX_AREA,
             "refine": LLM_BBOX_REFINE,
             "verify_images": verify_images,
+            **(aids or {}),
+            "marks_max": LLM_BBOX_MARKS_MAX,
             "detector": detector_client.status(),
         },
     }
@@ -1133,6 +1272,10 @@ def _print_summary(summary: dict) -> None:
                 print(f"    landed on {other!r}: {rate:.0%} of runs")
         print("-" * len(header))
         print(_row("OVERALL", block["overall"]))
+        marks_rate = block["overall"].get("marks_refined_rate")
+        if marks_rate is not None:
+            print(f"  marks refined {marks_rate:.0%} of the refines (the rest fell back to "
+                  "the grid — attempt_log[].marks_fallback says why)")
         for kind, cost in block["calls_per_kind"].items():
             tokens = cost["mean_prompt_tokens"]
             seconds = cost["mean_seconds"]
@@ -1235,6 +1378,29 @@ def main() -> None:
              "same composites the ask is shown",
     )
     parser.add_argument(
+        "--refine-mode", choices=("grid", "marks"),
+        default="marks" if LLM_BBOX_REFINE_MODE == "marks" else "grid",
+        help="how the refine pass asks: grid, or marks — the OCR lines in the window "
+             "numbered (each image OCR'd once); default: CLASSIFIER_LLM_BBOX_REFINE_MODE",
+    )
+    parser.add_argument(
+        "--reference-text", action=argparse.BooleanOptionalAction, default=REFERENCE_BOX_TEXT,
+        help="quote each example's region text in its caption (OCR'd as the service does); "
+             "default: CLASSIFIER_REFERENCE_BOX_TEXT",
+    )
+    parser.add_argument(
+        "--verify-partial", action=argparse.BooleanOptionalAction,
+        default=LLM_BBOX_VERIFY_PARTIAL,
+        help="the verify also answers 'partial' (the crop cut the feature off); a rejected "
+             "partial crop's retry says 'same place, larger'; default: "
+             "CLASSIFIER_LLM_BBOX_VERIFY_PARTIAL",
+    )
+    parser.add_argument(
+        "--verify-min-span", type=float, default=LLM_BBOX_VERIFY_MIN_SPAN, metavar="F",
+        help="grow the verify crop to at least F (0-1) of the page on each axis; default: "
+             "CLASSIFIER_LLM_BBOX_VERIFY_MIN_SPAN",
+    )
+    parser.add_argument(
         "--repeats", type=int, default=5,
         help="runs per image x criterion x configuration (default: 5 — the model "
              "samples at temperature 1.0)",
@@ -1252,6 +1418,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.repeats < 1:
         parser.error("--repeats must be at least 1")
+    if not 0.0 <= args.verify_min_span <= 1.0:
+        parser.error("--verify-min-span is a fraction of the page, 0-1")
     if bool(args.groups_from_selection) != bool(args.write_groups):
         parser.error("--groups-from-selection and --write-groups go together")
     if args.groups_from_selection:

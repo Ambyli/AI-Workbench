@@ -1669,6 +1669,22 @@ What the loop may be shown is chosen once per unit, after the gate passed:
 * **Loading an example never fails the unit.** A reference deleted after
   submit, or a `page.jpg` that is missing or does not decode, drops that
   example from every step, with a note. The score is final by then.
+* **Its text, opt-in** (`CLASSIFIER_REFERENCE_BOX_TEXT`, off). Every step's
+  caption of an example then quotes what its region says: *"… the coloured
+  box outlines it. The outlined area reads: "Meter #: 4471 0923"."* on a
+  composite, *"… (PASS there). The text at its centre reads: "…"."* on a
+  crop. A reference keeps no text layer, so its region of `page.jpg` is
+  recognised once per job, under `CLASSIFIER_OCR_WORKERS`, with context
+  around it (padded 10%, and at least 5% of the page on each axis — on the
+  fixture bills the OCR detector found nothing in a 427×65 crop of a legible
+  account-number line, and read it in a crop 5% of the page tall), keeping
+  only the lines centred inside the region (or, for a piece of one long line,
+  the line overlapping it most).
+  Whitespace is collapsed, `"` becomes `'`, and the text is cut to 80
+  characters. A region with no legible text (a logo), no OCR engine, or an
+  OCR failure gives the caption without the sentence, and never fails the
+  unit. Each example's `localization.references[].examples[]` entry (and
+  `references.json`) then carries `text` (null when there was none).
 
 The prompt adds a guard after the examples. It says the examples show
 *what* to box and that on the candidate it may be somewhere else. It says
@@ -2416,13 +2432,19 @@ attempt 1 ── ask ────── one criterion, the page image its scorin
    │                    the grid on the crop, ask again, map the answer back
    │                    into the page frame. An unusable second answer keeps
    │                    the coarse box; both are recorded
+   │                    ◄ _REFINE_MODE=marks (off): number the OCR lines in
+   │                    the crop instead of the grid, "which mark(s)?", the
+   │                    box = their union; the grid pass is the fallback
    ├── verify ───────── crop that box out of the ORIGINAL page (+25% padding,
    │                    CLASSIFIER_LLM_BBOX_CROP_PAD), send the CROP ALONE:
    │                    "is <criterion> visible in this? 1–10". Accept at
    │                    CLASSIFIER_LLM_BBOX_VERIFY_PASS (7)
+   │                    ◄ _VERIFY_MIN_SPAN (0): grow the crop to a share of
+   │                    the page; _VERIFY_PARTIAL (off): also "is it cut off?"
    └── retry ────────── re-ask with the rejection as feedback, up to the
                         criterion's options.max_attempts (default and cap
-                        CLASSIFIER_LLM_BBOX_MAX_ATTEMPTS, 3)
+                        CLASSIFIER_LLM_BBOX_MAX_ATTEMPTS, 3) — "same place,
+                        larger" for a partial crop (_VERIFY_PARTIAL)
 
 with references, each knob (off by default) puts the criterion's examples
 FIRST in its call — same calls, more images:
@@ -2482,6 +2504,70 @@ utility's example. Its wording has since changed
 so measure the `verify` and `all` configs again, with `--verify-images crop`
 and with `composite`, reading the model's reasons in each record's `answers`.
 
+**Placement aids — all off until measured.** A box-loop miss is either
+*placement* (the right thing, but the box is a few pixels off or too tight: a
+thin text line 15 px off, `$193.33` boxed without its `Amount due` label) or
+*identification* (the wrong thing boxed). Reference examples can only help
+identification, and placement misses swamp it. Four settings, each OFF by
+default and each byte-identical to the loop without it when off:
+
+* **Refine by numbered marks** — `CLASSIFIER_LLM_BBOX_REFINE_MODE=marks`
+  (default `grid`). After the coarse ask validates, the refine crop (the same
+  window, cut from the ORIGINAL page) shows every OCR text line that lies at
+  least half inside the window, outlined and numbered on a tab at its left
+  end, in reading order (`common.vision.draw_marks_overlay`), instead of the
+  grid. The model answers `{"reason": "...", "marks": [n, …]}`, quoting the
+  lines first. Several marks are one feature — a label line and its value
+  line become one box. The refined box is the union of the chosen lines'
+  boxes, so it fits the text exactly. The lines are the criterion's own text
+  layer, the one its `options.ocr` produced for the scoring call, so there is
+  no extra OCR pass. Earlier attempts' rejections ride along, under a note
+  that their coordinates are on the whole page. With
+  `CLASSIFIER_REFERENCE_BOX_REFINE` the region crops come first, with a
+  marks-worded guard. **The grid refine runs instead** — one more call — and
+  the attempt says why in `marks_fallback` when:
+  * the page has no OCR line boxes (native PDF/SVG text, `ocr: "never"`, or
+    OCR found nothing);
+  * no line lies inside the window (a logo, a photo);
+  * the window holds more than `CLASSIFIER_LLM_BBOX_MARKS_MAX` (40) lines;
+  * the answer is unusable (no answer, no `marks`, not whole numbers, a
+    number that was not drawn);
+  * the answer is `"marks": null` or `[]` — none of the lines is the feature,
+    and a picture can still be boxed on the grid.
+
+  `CLASSIFIER_LLM_BBOX_REFINE=false` turns both refines off. The coordinate
+  path: coarse box (page grid) → `refine_window` (page grid) → `window_rect`
+  (original pixels, the rect `crop_window` cuts) → `to_crop_px` (the crop's
+  pixels after it is fitted to ≤1000 px) for the drawing; the chosen lines'
+  union stays in original pixels (`bbox_px`, clamped) and is converted to the
+  page grid (`bbox_grid`, `pixels_to_grid`) — so a marks-refined `bbox_grid`
+  is derived, not a number the model wrote.
+* **"Cut off" verify** — `CLASSIFIER_LLM_BBOX_VERIFY_PARTIAL=true`. The verify
+  answer gains `"partial": true|false`: the crop shows the feature, or part
+  of it, but cuts some of it off at an edge. It does not move the score —
+  the 1–10 scale and `CLASSIFIER_LLM_BBOX_VERIFY_PASS` mean what they always
+  did. When the attempt is rejected AND partial, the retry is told *"the
+  crop of your previous box […] showed <criterion> but cut part of it off
+  (verify score n); box the same place again, larger, so that all of it is
+  inside — its label and every digit"* instead of *"…; look elsewhere"*. No
+  extra calls. Recorded as `verify_partial`.
+* **Minimum verify-crop span** — `CLASSIFIER_LLM_BBOX_VERIFY_MIN_SPAN` (0).
+  Above 0, the verify crop (after `CLASSIFIER_LLM_BBOX_CROP_PAD`) is grown,
+  centred on the box, to at least that fraction of the page on EACH axis,
+  and slid back inside the page at an edge. A wide text line is already wider
+  than the width floor, so only its height grows, which keeps its label in
+  view; a small square feature gets context on both axes, as the refine
+  window's minimum does. Only the crop the verify sees grows: the box,
+  `bbox_px`, the regions and the reference crops are unchanged, and nothing
+  new is recorded.
+* **An example's text** — `CLASSIFIER_REFERENCE_BOX_TEXT=true`
+  ([§ What the model is shown](#what-the-model-is-shown-and-what-it-costs)):
+  each box-loop example's caption quotes the text inside its region.
+
+The whole-page marks ask (marks instead of the grid on the coarse ask) is not
+built: a bill page holds 60–150 OCR lines, and one text line is under the
+page-level area floor the ask is validated against.
+
 **The grid step.** `CLASSIFIER_LLM_BBOX_GRID_STEP` (100 grid units) spaces the
 lines on the ask image and on the refine crop (which gets its own grid in its
 own frame); both the drawn overlay (`common.vision.draw_grid_overlay`) and the
@@ -2498,7 +2584,7 @@ a prompt that does not mention a grid.
 
 | Condition | Why |
 |---|---|
-| `options.boxes: true` | Off by default — up to 3 extra calls per attempt |
+| `options.boxes: true` | Off by default — up to 3 extra calls per attempt (4 in marks mode when the marks pass falls back to the grid refine) |
 | hint `presence` or `auto` | "image sharpness" is a property of the whole page; boxing it would be a fabrication |
 | the criterion's scoring call gave it **≥ 7** | Below that the model has just said the feature is absent |
 | the document has a page image | `.txt` / `.docx` have no pixel space for a box |
@@ -2562,6 +2648,25 @@ whose coarse box validated and so went through the refine pass: `bbox_grid`
 is then the refined box when `refined` is `true`, and the coarse box kept
 (with a `refine_reject` sentence) when it is `false`.
 
+Behind the opt-in settings above, an attempt adds (each key absent when its
+setting is off, so the record is otherwise exactly the one above):
+
+| Key | When | What |
+|---|---|---|
+| `refine_mode` | `CLASSIFIER_LLM_BBOX_REFINE_MODE=marks` and a refine ran | `marks` when the marks pass produced the box, `grid` when it fell back |
+| `marks` | the marks pass produced the box | the chosen mark numbers (1-based, as drawn), sorted — ids only, never the lines' text |
+| `marks_shown` | a marks call was made | how many lines were numbered |
+| `marks_fallback` | `refine_mode: "grid"` | why the grid refine ran (one sentence) |
+| `verify_partial` | `CLASSIFIER_LLM_BBOX_VERIFY_PARTIAL=true` and the verify said | the verify's `partial` — the crop cut the feature off |
+
+```json
+{"attempt": 1, "bbox_grid": [50.0, 116.7, 412.5, 142.5], "bbox_px": [40, 140, 330, 171],
+ "valid": true, "accepted": true, "verify_score": 9, "verify_reason": "Amount due $193.33",
+ "verify_partial": false,
+ "coarse_bbox_grid": [100, 200, 300, 400], "refine_window_grid": [0, 50, 450, 550],
+ "refined": true, "refine_mode": "marks", "marks_shown": 3, "marks": [2, 3]}
+```
+
 `attrs.detector_iou` (the IoU against the detector's best box for the same
 criterion) is still computed by `llm.boxes.locate_criterion` when it is handed
 detector regions — `bin/grounding_experiment.py` does — but an `/assess` job
@@ -2584,7 +2689,9 @@ behaviour, not just the log.
 
 **Cost.** One ask per attempt, plus one refine and one verify per attempt
 whose coarse box validated — at most `3 × max_attempts` small calls per
-located criterion (`2 ×` with `CLASSIFIER_LLM_BBOX_REFINE=false`), each capped
+located criterion (`2 ×` with `CLASSIFIER_LLM_BBOX_REFINE=false`; in marks
+mode a marks call that falls back to the grid adds the grid refine, so at most
+`4 ×`), each capped
 at the criterion's model's `max_tokens.box` (muse-glimmer: 1024) and each
 counted against that model's `max_concurrent`. Every call goes to the same
 model the criterion was scored on; a text-only model never runs the loop
@@ -2641,13 +2748,35 @@ verify_examples=...)`; the service never passes it). Refine always sees the
 crops. The run header and `summary.config` print the choice, and every
 record carries it.
 
+The placement aids are flags too, each defaulting to the container's own
+setting and passed to the loop explicitly: `--refine-mode grid|marks`,
+`--reference-text` / `--no-reference-text`, `--verify-partial` /
+`--no-verify-partial`, `--verify-min-span F`. In marks mode the script OCRs
+each image once (the service's engine) and caches it. The header prints them,
+`summary.config` holds them (with `marks_max`), and every record carries
+`refine_mode`, `reference_text`, `verify_partial` and `verify_min_span`, plus
+`example_text`, what the example captions quoted. With marks, each
+configuration's summary adds `marks_refined_rate`: of the attempts that
+refined, how many the marks pass refined rather than the grid fallback.
+
+```bash
+# The baseline, then marks + an 8% verify floor + the cut-off field (no examples)
+docker exec classifier uv run --no-sync python bin/grounding_experiment.py --images /data/grounding \
+  --truth /data/grounding/grounding_truth.json --configs off --out /data/grounding/grid.json
+docker exec classifier uv run --no-sync python bin/grounding_experiment.py --images /data/grounding \
+  --truth /data/grounding/grounding_truth.json --configs off --refine-mode marks \
+  --verify-partial --verify-min-span 0.08 --out /data/grounding/marks.json
+```
+
 The `--out` JSON records each run's reasons as well as its numbers:
 
 * `attempt_log` is each attempt as `localization.attempts` has it: its box,
   `verify_score`, `verify_reason`, and the `reject` sentence the retry is
   told.
 * `answers` is every model request in call order: `{kind: ask | refine |
-  verify, attempt, request, bbox | score, reason, ok}`.
+  verify, attempt, request, bbox | marks | score, reason, ok}` — `marks` for
+  a marks refine (label `refine/marks/…`), and `partial` beside a verify's
+  `score` when it answered one.
   * `attempt` is the loop attempt, taken from the call label; `request` > 1
     is a parse retry.
   * `score` is the model's own number, before clamping.

@@ -36,6 +36,11 @@ them in.
                               literal "Photoshop layer".
     render_preview            the page with the layer burned in, JPEG.
 
+    draw_grid_overlay /       question aids drawn on an image a vision model
+    draw_marks_overlay        is ASKED about, never stored: a labelled 0-1000
+                              coordinate grid, or numbered outlines on boxes
+                              something measured (OCR lines) for it to pick.
+
     draw_regions              a SECOND opinion on the same geometry: regions
                               re-drawn onto the original page with a caption
                               per region (score, verdict, attempt, source).
@@ -76,6 +81,10 @@ from .annotate import (
 from .grid_overlay import (
     DEFAULT_GRID_STEP,
     draw_grid_overlay,
+)
+from .marks_overlay import (
+    MARK_COLOURS,
+    draw_marks_overlay,
 )
 from .geometry import (
     DEFAULT_GRID,
@@ -134,6 +143,9 @@ __all__ = [
     # grid overlay
     "DEFAULT_GRID_STEP",
     "draw_grid_overlay",
+    # marks overlay
+    "MARK_COLOURS",
+    "draw_marks_overlay",
     # geometry
     "DEFAULT_GRID",
     "box_region",

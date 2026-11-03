@@ -46,6 +46,12 @@ a region, a load failure), each call that carried examples in
 ``classifier_reference_calls_total``. Without references in the request the
 key is absent and the loop sends one image, exactly as before.
 
+The loop is also handed the line boxes of the text layer the scoring call
+read (``TextLayer.lines``, ORIGINAL page pixels): the marks refine
+(CLASSIFIER_LLM_BBOX_REFINE_MODE=marks) numbers the ones in its window, so
+it needs no OCR pass of its own. A native-text page has none, and the loop
+falls back to the grid. In grid mode they are not read.
+
     evaluate()       — the shared evaluator interface.
     evaluate_with()  — the same for a name and RESOLVED llm options, which is
                        how a `cv` criterion's "llm" fallback reaches it (its
@@ -313,6 +319,10 @@ async def evaluate_with(
         model=spec,
         ask_examples=box_guide.ask if box_guide else None,
         crop_examples=box_guide.crops if box_guide else None,
+        # The marks refine's OCR lines: the layer this criterion's
+        # options.ocr already produced (ORIGINAL page pixels, the frame
+        # `original_image` is in). Read only in marks mode.
+        text_lines=layer.lines,
     )
     outcome.regions = regions
     outcome.localization = loc.as_dict()

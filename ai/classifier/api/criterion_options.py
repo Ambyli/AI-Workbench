@@ -6,12 +6,35 @@ A criterion's top level holds only what every type shares — ``name``,
 something to one evaluation path lives in ``options``, validated by the model
 for that path:
 
-    llm       LLMOptions       hint, boxes, max_attempts, ocr, reference, model,
-                               aggregate
+    llm       LLMOptions       hint, boxes, max_attempts, refine,
+                               verify_partial, verify_min_span, ocr,
+                               reference, model, aggregate
     text      TextOptions      pattern, match, case_sensitive, fuzzy_threshold,
                                min_count, ocr, scope, aggregate
     cv        CVOptions        fallback, reference, model, aggregate
     detector  DetectorOptions  threshold, aggregate
+
+**The box loop's settings, per criterion** (ZT-527). ``refine``,
+``verify_partial`` and ``verify_min_span`` on ``llm`` options, and
+``reference.boxes`` (``{ask, refine, verify}``) and ``reference.text``,
+tune the bounding-box loop (``llm.boxes``) for THIS criterion: the refine
+pass by numbered OCR-line marks, the verify's "cut off" field, a taller
+verify crop, and which of the loop's calls are shown the criterion's
+reference examples (and whether their captions quote the region's text).
+Each is optional; unset (None) is the SERVICE DEFAULT, the env var of the
+same meaning (``CLASSIFIER_LLM_BBOX_REFINE_MODE``, ``_VERIFY_PARTIAL``,
+``_VERIFY_MIN_SPAN``, ``CLASSIFIER_REFERENCE_BOX_ASK`` / ``_REFINE`` /
+``_VERIFY``, ``CLASSIFIER_REFERENCE_BOX_TEXT`` — all off by default). Set,
+the criterion's value wins. ``resolve()`` fills the default in, so
+``options_used`` shows what actually ran, and ``box_loop_settings`` turns
+the resolved options into the keywords ``analysis.llm_eval`` hands the loop
+— the one place the service reads those env vars (``llm.boxes`` keeps its
+own defaults only for a direct caller, ``bin/grounding_experiment.py``).
+They tune the loop, so they are refused unless ``boxes`` is true, and on a
+``cv`` criterion (its llm fallback never locates); on ``text`` /
+``detector`` they are unknown keys. The marks cap
+(``CLASSIFIER_LLM_BBOX_MARKS_MAX``) stays service-wide. None of them ever
+moves a score or a verdict: the loop runs after scoring.
 
 ``model`` picks the registry model (``models.yaml``, GET /models) that
 answers the criterion — on ``llm``, and on a ``cv`` name answered by its llm
@@ -57,7 +80,8 @@ echoed on every result as ``options_used``.
 ``criterion_types()`` is the payload of ``GET /criterion-types``: each
 type's JSON schema straight from pydantic, its resolved defaults, and its
 caps — so a caller can build a form, or check a request, against the
-container that will run it.
+container that will run it — plus a ``box_loop`` block naming the
+per-criterion loop settings and this container's defaults for them.
 
 Process flow position: the bottom of the ``api`` package next to
 ``api.schemas``, which is the only module that imports it for validation.
@@ -74,10 +98,21 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from common.documents import MAX_PATTERN_CHARS
 
+# The box loop's service defaults (LLM_BBOX_REFINE_MODE … REFERENCE_BOX_TEXT)
+# are module-level names read at RESOLVE time, so a test sets the service
+# default by patching them here.
 from config import (
     CRITERION_NAME_MAX_CHARS as NAME_MAX_CHARS,
     DETECTOR_MIN_SCORE,
+    LLM_BBOX_MARKS_MAX,
     LLM_BBOX_MAX_ATTEMPTS,
+    LLM_BBOX_REFINE_MODE,
+    LLM_BBOX_VERIFY_MIN_SPAN,
+    LLM_BBOX_VERIFY_PARTIAL,
+    REFERENCE_BOX_ASK,
+    REFERENCE_BOX_REFINE,
+    REFERENCE_BOX_TEXT,
+    REFERENCE_BOX_VERIFY,
     REFERENCE_MAX_PER_CRITERION,
     REFERENCE_MAX_PER_REQUEST,
     REFERENCE_POSITION_CAP,
@@ -94,6 +129,7 @@ from cv.quality import check_blur, check_exposure
 from detector import client as detector_client
 
 OcrMode = Literal["auto", "always", "never"]
+RefineMode = Literal["grid", "marks"]
 
 # Server caps a caller cannot exceed — NAME_MAX_CHARS and MIN_COUNT_CAP are
 # the config env knobs under their local names (api.schemas imports them here).
@@ -218,12 +254,58 @@ class _Options(BaseModel):
         return {}
 
 
+def service_refine_mode() -> str:
+    """The service default for ``options.refine`` — CLASSIFIER_LLM_BBOX_REFINE_
+    MODE, read as ``llm.boxes`` reads it: ``marks``, or anything else is
+    ``grid``."""
+    return "marks" if LLM_BBOX_REFINE_MODE == "marks" else "grid"
+
+
+class ReferenceBoxes(BaseModel):
+    """``options.reference.boxes`` — which of the box loop's calls are shown
+    the criterion's reference examples. Each step unset is the service
+    default (its CLASSIFIER_REFERENCE_BOX_* knob, off unless the deployment
+    turned it on); ``{}`` therefore means "the defaults"."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    ask: Optional[bool] = Field(
+        default=None,
+        description="Show the examples to the ASK call — composites (the reference page with "
+                    "the feature outlined), region crops under position 'check'. The fix for "
+                    "IDENTIFICATION: the model boxing a look-alike. Unset: "
+                    "CLASSIFIER_REFERENCE_BOX_ASK.",
+    )
+    refine: Optional[bool] = Field(
+        default=None,
+        description="Show the examples' region crops to the REFINE call (grid or marks). "
+                    "Unset: CLASSIFIER_REFERENCE_BOX_REFINE.",
+    )
+    verify: Optional[bool] = Field(
+        default=None,
+        description="Show the examples' region crops to the VERIFY call. Unset: "
+                    "CLASSIFIER_REFERENCE_BOX_VERIFY.",
+    )
+
+    def resolve(self) -> dict[str, bool]:
+        """``{ask, refine, verify}`` — each the value sent, else its knob."""
+        return {
+            "ask": REFERENCE_BOX_ASK if self.ask is None else self.ask,
+            "refine": REFERENCE_BOX_REFINE if self.refine is None else self.refine,
+            "verify": REFERENCE_BOX_VERIFY if self.verify is None else self.verify,
+        }
+
+
 class ReferenceOptions(BaseModel):
     """``options.reference`` — how the request's references guide one criterion.
 
     Only meaningful when the request lists ``references``; sending it without
     them is a 400. Every field has a default, so ``{}`` means "guided, the
     defaults" — the same as omitting it on a request that has references.
+
+    ``boxes`` and ``text`` guide the BOX LOOP rather than the scoring call
+    (the module docstring's per-criterion loop settings): they need
+    ``options.boxes: true`` (``LLMOptions``) and are refused on ``cv``.
     """
 
     model_config = ConfigDict(extra="forbid", strict=True)
@@ -262,6 +344,23 @@ class ReferenceOptions(BaseModel):
         description="How several examples' answers become one score: 'any' the best "
                     "(with its reason), 'all' the lowest, 'mean' the rounded mean.",
     )
+    boxes: Optional[ReferenceBoxes] = Field(
+        default=None,
+        description="Which box-loop calls are shown the examples: {\"ask\", \"refine\", "
+                    "\"verify\"}, each a boolean, each unset = its "
+                    "CLASSIFIER_REFERENCE_BOX_* service default (off). Same calls, more "
+                    "images: each guided call carries 1 + examples images. Examples with "
+                    "regions only; a FAIL only when its reference criterion's hint is "
+                    "presence. Needs options.boxes: true; refused on cv.",
+    )
+    text: Optional[bool] = Field(
+        default=None,
+        description="Each box-loop example's caption also quotes the text inside its region "
+                    "(OCR'd from the reference page once per job, cut to 80 characters). "
+                    "Only matters when a `boxes` step is on. Unset: "
+                    "CLASSIFIER_REFERENCE_BOX_TEXT (off). Needs options.boxes: true; refused "
+                    "on cv.",
+    )
 
     def resolve(self, name: str) -> dict[str, Any]:
         return {
@@ -270,7 +369,18 @@ class ReferenceOptions(BaseModel):
             "position": self.position,
             "min_iou": REFERENCE_POSITION_MIN_IOU if self.min_iou is None else self.min_iou,
             "combine": self.combine,
+            # The box loop's: what will run, the service defaults filled in.
+            "boxes": (self.boxes or ReferenceBoxes()).resolve(),
+            "text": REFERENCE_BOX_TEXT if self.text is None else self.text,
         }
+
+    def loop_keys_sent(self) -> list[str]:
+        """The box-loop keys the caller set (``reference.boxes`` /
+        ``reference.text``), for the refusals that need ``boxes``."""
+        return [
+            f"reference.{key}" for key, value in (("boxes", self.boxes), ("text", self.text))
+            if value is not None
+        ]
 
 
 def _reference_field() -> Any:
@@ -333,6 +443,40 @@ class LLMOptions(_Options):
             "exceed, the server's CLASSIFIER_LLM_BBOX_MAX_ATTEMPTS."
         ),
     )
+    # The box loop's per-criterion settings (module docstring). Unset = the
+    # service default; each needs `boxes: true` (_loop_options_need_boxes).
+    refine: Optional[RefineMode] = Field(
+        default=None,
+        description=(
+            "How the loop's refine pass asks. 'grid': the zoomed crop with its own "
+            "grid, a box on it. 'marks': every OCR text line in the window outlined "
+            "and numbered, 'which mark(s)?', the box the union of those lines — "
+            "exact on a text field (an amount due), wrong for a chart or a logo "
+            "(it picks text lines); falls back to the grid (one more call) when the "
+            "window holds no lines or more than CLASSIFIER_LLM_BBOX_MARKS_MAX. "
+            "Unset: CLASSIFIER_LLM_BBOX_REFINE_MODE (grid). Needs boxes: true."
+        ),
+    )
+    verify_partial: Optional[bool] = Field(
+        default=None,
+        description=(
+            "The verify also answers whether the crop cuts the feature off; a "
+            "rejected cut-off crop's retry is told 'same place, larger' instead of "
+            "'look elsewhere'. Never moves the score; no extra call. Unset: "
+            "CLASSIFIER_LLM_BBOX_VERIFY_PARTIAL (false). Needs boxes: true."
+        ),
+    )
+    verify_min_span: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Grow the verify crop, centred and inside the page, to at least this "
+            "share of the page on each axis (0-1; ~0.08 keeps a one-line field's "
+            "label in view). The box itself is unchanged. Unset: "
+            "CLASSIFIER_LLM_BBOX_VERIFY_MIN_SPAN (0, the padded box). Needs boxes: true."
+        ),
+    )
     ocr: OcrMode = Field(
         default="auto",
         description=(
@@ -363,6 +507,28 @@ class LLMOptions(_Options):
                 )
         return self
 
+    @model_validator(mode="after")
+    def _loop_options_need_boxes(self) -> "LLMOptions":
+        """The loop's settings without the loop would silently do nothing —
+        refused, as ``position: "check"`` is, naming every one sent."""
+        if self.boxes:
+            return self
+        sent = [
+            key for key, value in (
+                ("refine", self.refine), ("verify_partial", self.verify_partial),
+                ("verify_min_span", self.verify_min_span),
+            ) if value is not None
+        ]
+        if self.reference is not None:
+            sent += self.reference.loop_keys_sent()
+        if sent:
+            raise ValueError(
+                f"{', '.join(sent)} {'tunes' if len(sent) == 1 else 'tune'} the "
+                "bounding-box loop, which runs only with options.boxes: true; set "
+                f"boxes: true or drop {'it' if len(sent) == 1 else 'them'}"
+            )
+        return self
+
     @field_validator("max_attempts")
     @classmethod
     def _cap_attempts(cls, value: Optional[int]) -> Optional[int]:
@@ -379,6 +545,16 @@ class LLMOptions(_Options):
             "hint": self.hint,
             "boxes": self.boxes,
             "max_attempts": self.max_attempts or LLM_BBOX_MAX_ATTEMPTS,
+            # The loop's settings as they will run: the criterion's value, else
+            # the service default — present whether or not boxes is on.
+            "refine": self.refine or service_refine_mode(),
+            "verify_partial": (
+                LLM_BBOX_VERIFY_PARTIAL if self.verify_partial is None else self.verify_partial
+            ),
+            "verify_min_span": (
+                LLM_BBOX_VERIFY_MIN_SPAN if self.verify_min_span is None
+                else self.verify_min_span
+            ),
             "ocr": self.ocr,
             "aggregate": self.resolved_aggregate(default_aggregate("llm", self.hint)),
         }
@@ -499,6 +675,17 @@ class CVOptions(_Options):
             )
         return self
 
+    @model_validator(mode="after")
+    def _no_loop_options_on_cv(self) -> "CVOptions":
+        sent = self.reference.loop_keys_sent() if self.reference is not None else []
+        if sent:
+            raise ValueError(
+                f"{', '.join(sent)} {'tunes' if len(sent) == 1 else 'tune'} the "
+                "bounding-box loop, and a cv criterion's llm fallback runs without boxes; "
+                "use an llm criterion with options.boxes: true"
+            )
+        return self
+
     def resolve(self, name: str) -> dict[str, Any]:
         default = "detector" if detector_client.is_configured() else "llm"
         resolved = {
@@ -556,6 +743,35 @@ def without_model(resolved: dict[str, Any]) -> dict[str, Any]:
     a reference saved under one model guides the criterion under any other
     (``references.resolve``, ``api.references``)."""
     return {k: v for k, v in resolved.items() if k != "model"}
+
+
+def box_loop_settings(resolved: dict[str, Any]) -> dict[str, Any]:
+    """What the box loop runs with for one criterion, from its RESOLVED llm
+    options — keyed by the keywords that take them:
+
+        refine_mode, verify_partial, verify_min_span   llm.boxes.locate_criterion
+        guide_ask, guide_refine, guide_verify          (reference.boxes)
+        reference_text                                 JobReferences.box_examples
+                                                       (``with_text``; reference.text)
+
+    ``resolve()`` already put the service default under every key the
+    caller left unset. A key missing altogether — ``reference`` is in the
+    resolved options only when sent, and a dict resolved elsewhere may lack
+    the loop's keys — takes the service default here, from the same
+    ``resolve()``, so the two can never disagree. Called by
+    ``analysis.llm_eval`` once the loop's gate has passed."""
+    defaults = LLMOptions().resolve("")
+    reference = {**ReferenceOptions().resolve(""), **(resolved.get("reference") or {})}
+    steps = reference["boxes"]
+    return {
+        "refine_mode": resolved.get("refine", defaults["refine"]),
+        "verify_partial": bool(resolved.get("verify_partial", defaults["verify_partial"])),
+        "verify_min_span": float(resolved.get("verify_min_span", defaults["verify_min_span"])),
+        "guide_ask": bool(steps["ask"]),
+        "guide_refine": bool(steps["refine"]),
+        "guide_verify": bool(steps["verify"]),
+        "reference_text": bool(reference["text"]),
+    }
 
 
 # The message a reference on a criterion the model does not answer gets.
@@ -698,6 +914,34 @@ def criterion_types() -> dict[str, Any]:
                 "cap": REFERENCE_POSITION_CAP,
                 "requires": "options.boxes: true and hint presence / auto",
             },
+        },
+        # The bounding-box loop's per-criterion settings (llm criteria with
+        # options.boxes: true). Unset = this container's service default.
+        "box_loop": {
+            "applies_to": "llm criteria with options.boxes: true (refused without it, and on "
+                          "cv, whose llm fallback never locates)",
+            "options": {
+                "refine": "grid | marks — how the refine pass asks",
+                "verify_partial": "bool — the verify also says whether the crop cuts the "
+                                  "feature off",
+                "verify_min_span": "0-1 — grow the verify crop to this share of the page",
+                "reference.boxes": "{ask, refine, verify} bools — which calls are shown the "
+                                   "criterion's reference examples",
+                "reference.text": "bool — each example's caption quotes its region's text",
+            },
+            "precedence": "the criterion's value, else this container's service default "
+                          "(the env var); options_used shows the value that ran",
+            "service_defaults": {
+                "refine": service_refine_mode(),
+                "verify_partial": LLM_BBOX_VERIFY_PARTIAL,
+                "verify_min_span": LLM_BBOX_VERIFY_MIN_SPAN,
+                "reference.boxes": ReferenceBoxes().resolve(),
+                "reference.text": REFERENCE_BOX_TEXT,
+            },
+            # Service-wide on purpose: a window with more OCR lines than this
+            # refines on the grid instead of the marks.
+            "marks_max": LLM_BBOX_MARKS_MAX,
+            "score": "never changes a score or a verdict — the loop runs after scoring",
         },
         # options.model on llm criteria (and a cv criterion's llm fallback);
         # the request-level `model` sets the default for the job.

@@ -81,7 +81,8 @@ Usage::
         --configs ask,refine,verify,all --out /data/grounding_ops/guided.json
     # The same with a FAIL example of a look-alike beside the PASS one, for
     # the criterion whose look-alikes are marked as the `usage look-alike`
-    # decoy:
+    # decoy (pages without the real chart list it under `absent`, so a box
+    # there is counted wrong and "not found" right):
     docker exec classifier uv run --no-sync python bin/grounding_experiment.py \\
         --images /data/grounding_ops/images --truth /data/grounding_ops/truth.json \\
         --subset /data/grounding_ops/failures.json \\
@@ -100,21 +101,36 @@ about, e.g.::
 A bare list instead of an object applies those criteria to every image.
 
 ``--truth`` says where things really are, per file name: ``criteria`` —
-the criteria to ask, each with EVERY real copy of it on the page — and
+the criteria to ask, each with EVERY real copy of it on the page —
 ``decoys`` — things never asked, used to name where a missed box landed (and,
-with ``--fail-from-decoys``, as FAIL examples). Each box is ``[x1, y1, x2,
-y2]`` in ORIGINAL upright page pixels (the frame regions are stored in); a
-bare box stands for a list of one. With it, the
-criteria asked are the truth file's ``criteria``, and ``--criteria`` is
-ignored. ``unit-tests/classifier/documents/grounding_truth.json`` holds the
-two photographed bills' logo, amount due and account number — every copy:
-the header, the payment slip, bill 2's right-hand page — and one decoy, the
-lines of text that name the utility (what a model boxes when it mistakes the
-company name for the logo)::
+with ``--fail-from-decoys``, as FAIL examples) — and ``absent`` — criteria
+that are NOT on the page, asked anyway, where the right answer is no box at
+all. Each box is ``[x1, y1, x2, y2]`` in ORIGINAL upright page pixels (the
+frame regions are stored in); a bare box stands for a list of one. With it,
+the criteria asked are the truth file's ``criteria`` plus its ``absent``
+ones, and ``--criteria`` is ignored. ``unit-tests/classifier/documents/
+grounding_truth.json`` holds the two photographed bills' logo, amount due and
+account number — every copy: the header, the payment slip, bill 2's
+right-hand page — and one decoy, the lines of text that name the utility
+(what a model boxes when it mistakes the company name for the logo)::
 
     {"utility_bill.jpeg": {
         "criteria": {"the utility's logo": [[x1, y1, x2, y2], ...], ...},
-        "decoys": {"text naming the utility": [[x1, y1, x2, y2], ...]}}, ...}
+        "decoys": {"text naming the utility": [[x1, y1, x2, y2], ...]},
+        "absent": ["the monthly usage chart"]}, ...}
+
+``absent`` (optional, a list of names; ``criteria`` may then be omitted)
+measures the other half of identification: a page WITHOUT the feature,
+usually with a look-alike on it (a bar graph that is not the usage chart —
+mark it as a decoy). An absent criterion is asked exactly like any other —
+it is in the image's criteria list — and its runs are scored ``expected:
+"absent"``: CORRECT when the loop accepted no box (the model answered
+``bbox: null``, or every attempt was rejected), WRONG when it accepted one;
+``landed_on`` still names the decoy or criterion a wrong box landed on. A
+name both in ``absent`` and in ``criteria`` or ``decoys`` is refused. Absent
+pairs never count toward the hit rate: the summary reports them on their own
+(below), and an absent pair is never a PASS example's source
+(``--references-from-truth`` takes examples only from ``criteria`` boxes).
 
 The examples: ``--reference-image <file>`` builds one PASS example per
 criterion from that image's FIRST truth box for it — the composite exactly as a stored
@@ -179,9 +195,10 @@ prompt. ``off`` and unmapped criteria are unchanged. Step 2 below with
 ``--subset`` (``{"file.jpg": ["criterion", ...]}``) asks only those pairs;
 an image not listed is skipped. ``--write-failures <file>`` writes, after a
 run, the ``--subset`` of pairs whose ``off`` runs hit in under 50% of their
-repeats (a run that accepted nothing is a miss) and prints how many: step 1
-of the recipe above measures the baseline on everything, step 2 runs the
-guided configurations only where the baseline fails.
+repeats (a run that accepted nothing is a miss) — and of ``absent`` pairs
+whose ``off`` runs were CORRECT in under 50% of theirs — and prints how
+many: step 1 of the recipe above measures the baseline on everything, step 2
+runs the guided configurations only where the baseline fails.
 
 ``--verify-images`` (default ``crop``) is what the verify call is shown when
 it carries examples (``verify`` and ``all``): ``crop``, the examples' region
@@ -255,6 +272,16 @@ What it prints, per configuration, per criterion and overall:
                         Per configuration, per criterion and overall
                         (``landed_on_rates``, a share of the runs), so a
                         FAIL example's effect is read here.
+    absent              (--truth with ``absent``) the absent pairs on their
+                        own, never in the rates above that need a truth box
+                        (hit, false accept, IoU, centre error): ``n``,
+                        ``correct_rate`` (no box accepted), ``wrong_accept_
+                        rate`` (a box accepted where there is nothing to
+                        find), ``bbox_null_rate`` (how often the model said
+                        so itself rather than running out of attempts) and
+                        ``landed_on_rates`` (where the wrong boxes went — the
+                        look-alike decoy, usually). Per configuration, per
+                        criterion and overall (``absent`` in each block).
     FAIL example        (--fail-from-decoys) ``fail_example_rate``: of the
                         mapped criterion's runs in a configuration that shows
                         examples, how many carried the FAIL beside the PASS.
@@ -277,6 +304,11 @@ detector the primary source and the LLM loop the fallback.
 repeat), with the numbers above per run, and — to say WHY, not just how often:
 
     verify_images   what a guided verify was shown on this run.
+    expected        (--truth) ``present`` (the pair has truth boxes; ``hit``
+                    and the rest score it), ``absent`` (``correct`` scores
+                    it; ``hit`` is null) or null (no truth for the pair).
+    correct         an ``absent`` run only: true when no box was accepted.
+                    Null on every other run — a present pair is ``hit``.
     reference_image the page the examples were drawn from — the
                     ``--reference-image``, or ``--references-from-truth``'s
                     page for this repeat; null with stored references or
@@ -331,6 +363,7 @@ import statistics
 import sys
 import time
 import zlib
+from typing import Any
 
 # The classifier's modules import each other by bare name (the container's
 # WORKDIR). Running this from `bin/` needs the parent on the path.
@@ -413,8 +446,9 @@ def _load_criteria(path: pathlib.Path | None, names: list[str]) -> dict[str, lis
     return {name: [str(c) for c in data.get(name, [])] for name in names}
 
 
-# One image's truth: {"criteria": {name: [box, ...]}, "decoys": {name: [box, ...]}}.
-Truth = dict[str, dict[str, list[list[float]]]]
+# One image's truth: {"criteria": {name: [box, ...]}, "decoys": {name: [box,
+# ...]}, "absent": [name, ...]} — every part present after _load_truth.
+Truth = dict[str, Any]
 
 
 def _is_box(value) -> bool:
@@ -440,33 +474,59 @@ def _boxes(path: pathlib.Path, where: str, value) -> list[list[float]]:
 
 def _load_truth(path: pathlib.Path) -> dict[str, Truth]:
     """``--truth``: file name → ``{"criteria": {name: [box, ...]}, "decoys":
-    {name: [box, ...]}}``, every box ``[x1, y1, x2, y2]`` in original upright
-    pixels (a bare box for a list of one). Every real copy of a criterion is
-    one of its boxes; decoys are never asked — they name where a missed box
-    landed, and with ``--fail-from-decoys`` become FAIL examples."""
+    {name: [box, ...]}, "absent": [name, ...]}``, every box ``[x1, y1, x2,
+    y2]`` in original upright pixels (a bare box for a list of one). Every
+    real copy of a criterion is one of its boxes; decoys are never asked —
+    they name where a missed box landed, and with ``--fail-from-decoys``
+    become FAIL examples; ``absent`` names criteria that are NOT on the page,
+    asked anyway and scored right when no box is accepted.
+
+    ``decoys`` and ``absent`` are optional (each image comes back with all
+    three parts); ``criteria`` may be left out only when ``absent`` is given.
+    ``absent`` is a list of non-empty names, repeats collapsed in order. A
+    name in two parts — a criterion that is also a decoy, or absent and
+    boxed — is refused: a feature is either on the page or not."""
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise SystemExit(
             f"{path}: expected {{filename: {{\"criteria\": {{name: [box, ...]}}, "
-            "\"decoys\": {name: [box, ...]}}}}"
+            "\"decoys\": {name: [box, ...]}, \"absent\": [name, ...]}}"
         )
     truth: dict[str, Truth] = {}
     for image, entry in data.items():
-        if (not isinstance(entry, dict) or not isinstance(entry.get("criteria"), dict)
-                or not isinstance(entry.get("decoys", {}), dict)
-                or set(entry) - {"criteria", "decoys"}):
+        shape = (
+            f"{path}: {image!r} must be {{\"criteria\": {{...}}, \"decoys\": {{...}}, "
+            "\"absent\": [...]}} (decoys optional; criteria optional with absent)"
+        )
+        if not isinstance(entry, dict) or set(entry) - {"criteria", "decoys", "absent"}:
+            raise SystemExit(shape)
+        if not isinstance(entry.get("criteria", {} if "absent" in entry else None), dict):
+            raise SystemExit(shape)
+        if not isinstance(entry.get("decoys", {}), dict):
+            raise SystemExit(shape)
+        absent = entry.get("absent", [])
+        if not isinstance(absent, list) or not all(
+            isinstance(name, str) and name.strip() for name in absent
+        ):
             raise SystemExit(
-                f"{path}: {image!r} must be {{\"criteria\": {{...}}, \"decoys\": {{...}}}} "
-                "(decoys optional)"
+                f"{path}: {image!r} / absent must be a list of criterion names, got {absent!r}"
             )
         truth[image] = {
             part: {name: _boxes(path, f"{image!r} / {part} / {name!r}", value)
                    for name, value in (entry.get(part) or {}).items()}
             for part in ("criteria", "decoys")
         }
+        truth[image]["absent"] = list(dict.fromkeys(absent))
         both = set(truth[image]["criteria"]) & set(truth[image]["decoys"])
         if both:
             raise SystemExit(f"{path}: {image!r}: {sorted(both)} is both a criterion and a decoy")
+        for part, what in (("criteria", "a criterion with boxes"), ("decoys", "a decoy")):
+            both = set(truth[image]["absent"]) & set(truth[image][part])
+            if both:
+                raise SystemExit(
+                    f"{path}: {image!r}: {sorted(both)} is both absent and {what} — a "
+                    "feature is either on the page (boxed) or not (absent)"
+                )
     return truth
 
 
@@ -675,7 +735,9 @@ def _truth_reference(
 
     Eligible: a page of the truth file with a box for ``label``, present
     under ``--images``, neither the candidate nor in a group it shares
-    (``--groups``; a page with no group shares none). Picked
+    (``--groups``; a page with no group shares none). A page where ``label``
+    is ``absent`` has no box for it and is never eligible — a PASS example
+    is always a real copy. Picked
     deterministically — the eligible pages sorted, then ``(crc32(candidate) +
     repeat) % n`` — so a rerun picks the same page and the repeats rotate
     through different references (each repeat is a different example, not
@@ -684,6 +746,7 @@ def _truth_reference(
     eligible = sorted(
         name for name, entry in truth.items()
         if name != candidate and name in available and entry["criteria"].get(label)
+        and label not in entry.get("absent", ())
         and not mine & groups.get(name, frozenset())
     )
     if not eligible:
@@ -712,11 +775,15 @@ def _fail_map(specs: list[str], truth: dict[str, Truth]) -> dict[str, str]:
     equal to it ignoring case). ``CRITERION`` names a truth criterion:
     exactly, else the one criterion equal to it ignoring case, else the ONE
     criterion containing it ignoring case — so a long criterion need not be
-    pasted (``"usage look-alike=usage history"``). Unknown, ambiguous, or a
-    criterion mapped twice (it has one FAIL slot) is refused, naming what
-    there is to choose from."""
+    pasted (``"usage look-alike=usage history"``). The criteria are every
+    name the truth file asks — boxed or ``absent`` — since a FAIL example of
+    a look-alike is what stops a wrong box on a page without the feature.
+    Unknown, ambiguous, or a criterion mapped twice (it has one FAIL slot) is
+    refused, naming what there is to choose from."""
     decoys = sorted({d for entry in truth.values() for d in entry["decoys"]})
-    criteria = sorted({c for entry in truth.values() for c in entry["criteria"]})
+    criteria = sorted({
+        c for entry in truth.values() for c in [*entry["criteria"], *entry.get("absent", ())]
+    })
 
     def one(value: str, names: list[str], *, substring: bool) -> list[str]:
         if value in names:
@@ -848,15 +915,23 @@ FAILURE_HIT_RATE = 0.5
 def _failures(records: list[dict]) -> tuple[dict[str, list[str]], int]:
     """``--write-failures``: the ``--subset`` of pairs whose ``off`` runs hit
     in under FAILURE_HIT_RATE of their repeats (a run that accepted nothing
-    is a miss), in run order, and how many pairs were measured. Pairs with no
-    truth box are not measured."""
+    is a miss) — and of ``absent`` pairs whose ``off`` runs were CORRECT (no
+    box accepted) in under FAILURE_HIT_RATE of theirs — in run order, and how
+    many pairs were measured. Pairs with no truth at all are not measured."""
     runs: dict[tuple[str, str], list[bool]] = {}
     for r in records:
-        if r["config"] == "off" and r["hit"] is not None:
-            runs.setdefault((r["image"], r["criterion"]), []).append(bool(r["hit"]))
+        if r["config"] != "off":
+            continue
+        if r.get("expected") == "absent":
+            good = bool(r["correct"])
+        elif r["hit"] is not None:
+            good = bool(r["hit"])
+        else:
+            continue
+        runs.setdefault((r["image"], r["criterion"]), []).append(good)
     failing: dict[str, list[str]] = {}
-    for (image, criterion), hits in runs.items():
-        if _rate(hits) < FAILURE_HIT_RATE:
+    for (image, criterion), good in runs.items():
+        if _rate(good) < FAILURE_HIT_RATE:
             failing.setdefault(image, []).append(criterion)
     return failing, len(runs)
 
@@ -888,9 +963,11 @@ def _against_truth(
     truth: Truth,
     geometry: PageGeometry,
 ) -> dict:
-    """``{hit, truth_copy, iou, center_error_grid, landed_on}`` for one run;
-    every key None when this image has no truth box for ``label``. An
-    unaccepted run is not a hit and has no IoU.
+    """``{expected, correct, hit, truth_copy, iou, center_error_grid,
+    landed_on}`` for one run. ``expected`` is ``present`` when this image has
+    truth boxes for ``label``, ``absent`` when its truth lists ``label`` as
+    absent, and None (every other key None too) when it has neither. An
+    unaccepted present run is not a hit and has no IoU.
 
     A HIT is the accepted box's centre inside ANY copy of the criterion (a
     bill repeats its logo, amount and account number on the payment slip, and
@@ -898,14 +975,22 @@ def _against_truth(
     units) are against the best-matching copy — the highest IoU, the closest
     centre on a tie — and ``truth_copy`` is its index. ``landed_on`` names,
     for a miss, the OTHER criterion or decoy with a box holding the centre
-    (criteria first, then decoys; None when it landed on nothing listed)."""
+    (criteria first, then decoys; None when it landed on nothing listed).
+
+    An ABSENT run has no copy to hit: ``correct`` is True when nothing was
+    accepted (``bbox: null``, or every attempt rejected) and False when a box
+    was — that box is wrong by definition, and ``landed_on`` names what it
+    landed on, the same way. ``hit`` and the copy keys stay None, so an
+    absent run can never reach a hit rate; ``correct`` is None on a present
+    run."""
+    if label in truth.get("absent", ()):
+        return _scored("absent", correct=accepted is None,
+                       landed_on=None if accepted is None else _landed_on(accepted, label, truth))
     copies = truth["criteria"].get(label)
     if not copies:
-        return {"hit": None, "truth_copy": None, "iou": None, "center_error_grid": None,
-                "landed_on": None}
+        return _scored(None)
     if accepted is None:
-        return {"hit": False, "truth_copy": None, "iou": None, "center_error_grid": None,
-                "landed_on": None}
+        return _scored("present", hit=False)
     centre = _centre(accepted)
 
     def error(box: list[float]) -> float:
@@ -917,15 +1002,29 @@ def _against_truth(
 
     best = max(range(len(copies)), key=lambda i: (_iou(accepted, copies[i]), -error(copies[i])))
     hit = any(_inside(centre, box) for box in copies)
-    landed_on = None
-    if not hit:
-        others = [(name, boxes) for name, boxes in truth["criteria"].items() if name != label]
-        others += list(truth["decoys"].items())
-        landed_on = next(
-            (name for name, boxes in others if any(_inside(centre, b) for b in boxes)), None,
-        )
-    return {"hit": hit, "truth_copy": best, "iou": round(_iou(accepted, copies[best]), 4),
-            "center_error_grid": round(error(copies[best]), 1), "landed_on": landed_on}
+    return _scored("present", hit=hit, truth_copy=best,
+                   iou=round(_iou(accepted, copies[best]), 4),
+                   center_error_grid=round(error(copies[best]), 1),
+                   landed_on=None if hit else _landed_on(accepted, label, truth))
+
+
+def _scored(expected: str | None, *, correct: bool | None = None, hit: bool | None = None,
+            truth_copy: int | None = None, iou: float | None = None,
+            center_error_grid: float | None = None, landed_on: str | None = None) -> dict:
+    """One run's truth keys, always all of them, in one order."""
+    return {"expected": expected, "correct": correct, "hit": hit, "truth_copy": truth_copy,
+            "iou": iou, "center_error_grid": center_error_grid, "landed_on": landed_on}
+
+
+def _landed_on(accepted: list[float], label: str, truth: Truth) -> str | None:
+    """The OTHER criterion or decoy whose box holds ``accepted``'s centre —
+    criteria first, then decoys — or None when it landed on nothing listed."""
+    centre = _centre(accepted)
+    others = [(name, boxes) for name, boxes in truth["criteria"].items() if name != label]
+    others += list(truth["decoys"].items())
+    return next(
+        (name for name, boxes in others if any(_inside(centre, b) for b in boxes)), None,
+    )
 
 
 # The loop's call labels: "bbox/<criterion>#<attempt>", "refine/…" (the marks
@@ -1005,9 +1104,12 @@ async def run(args) -> dict:
     if truth:
         if args.criteria:
             print("--truth given: the criteria asked are the truth file's; --criteria is ignored")
-        # Only the criteria are asked; decoys only name where a miss landed.
+        # The criteria are asked, and so are the absent ones (the right answer
+        # there is no box); decoys only name where a miss landed.
         criteria_map = {
-            p.name: list((truth.get(p.name) or {}).get("criteria", {})) for p in paths
+            p.name: [*(truth.get(p.name) or {}).get("criteria", {}),
+                     *(truth.get(p.name) or {}).get("absent", [])]
+            for p in paths
         }
     else:
         criteria_map = _load_criteria(
@@ -1170,7 +1272,7 @@ async def run(args) -> dict:
 
         image_b64 = encode_image_to_base64(working)
         detector = await _detector_boxes(working, labels, geometry)
-        boxes: Truth = truth.get(path.name) or {"criteria": {}, "decoys": {}}
+        boxes: Truth = truth.get(path.name) or {"criteria": {}, "decoys": {}, "absent": []}
         print(f"{path.name} ({geometry.width}x{geometry.height})")
         # The marks refine's lines: one OCR pass per image, as the service's
         # text layer is one pass per page.
@@ -1316,7 +1418,11 @@ async def run(args) -> dict:
                         if accepted
                         else (first.reject if first else "no answer")
                     )
-                    hit = "" if record["hit"] is None else ("  HIT" if record["hit"] else "  miss")
+                    if record["expected"] == "absent":
+                        hit = "  absent: right" if record["correct"] else "  absent: WRONG"
+                    else:
+                        hit = "" if record["hit"] is None else (
+                            "  HIT" if record["hit"] else "  miss")
                     iou = (
                         f", iou {record['detector_iou']:.2f}"
                         if record["detector_iou"] is not None
@@ -1360,6 +1466,16 @@ def _aids(args) -> dict:
 
 def _rate(values: list[bool]) -> float:
     return (sum(1 for v in values if v) / len(values)) if values else 0.0
+
+
+def _landed_rates(rows: list[dict]) -> dict[str, float]:
+    """``{name: share of rows}`` for the criteria / decoys accepted boxes
+    landed on (``landed_on``), sorted by name."""
+    landed: dict[str, int] = {}
+    for r in rows:
+        if r["landed_on"]:
+            landed[r["landed_on"]] = landed.get(r["landed_on"], 0) + 1
+    return {other: round(count / len(rows), 3) for other, count in sorted(landed.items())}
 
 
 def _mean(values: list, digits: int = 3):
@@ -1413,12 +1529,10 @@ def _summarise(
                 bool(r.get("fail_reference_image")) and not r.get("fail_reference_note")
                 for r in mapped
             ]), 3)
+        # Present pairs only (an absent run's `hit` is None): the hit rate
+        # never sees a page without the feature.
         truthed = [r for r in rows if r["hit"] is not None]
         if scored and truthed:
-            landed: dict[str, int] = {}
-            for r in truthed:
-                if r["landed_on"]:
-                    landed[r["landed_on"]] = landed.get(r["landed_on"], 0) + 1
             out.update({
                 "hit_rate": round(_rate([r["hit"] for r in truthed]), 3),
                 "false_accept_rate": round(
@@ -1426,10 +1540,18 @@ def _summarise(
                 ),
                 "mean_truth_iou": _mean([r["iou"] for r in truthed]),
                 "mean_center_error_grid": _mean([r["center_error_grid"] for r in truthed], 1),
-                "landed_on_rates": {
-                    other: round(count / len(truthed), 3) for other, count in sorted(landed.items())
-                },
+                "landed_on_rates": _landed_rates(truthed),
             })
+        # Absent pairs on their own: right is no box at all.
+        absent = [r for r in rows if r.get("expected") == "absent"]
+        if scored and absent:
+            out["absent"] = {
+                "n": len(absent),
+                "correct_rate": round(_rate([r["correct"] for r in absent]), 3),
+                "wrong_accept_rate": round(_rate([not r["correct"] for r in absent]), 3),
+                "bbox_null_rate": round(_rate([r["bbox_null"] for r in absent]), 3),
+                "landed_on_rates": _landed_rates(absent),
+            }
         return out
 
     def calls(rows: list[dict]) -> dict:
@@ -1493,6 +1615,19 @@ def _row(name: str, row: dict) -> str:
     )
 
 
+def _print_absent(row: dict) -> None:
+    """A block's absent pairs, under its row — never in its hit columns
+    (which count present pairs only)."""
+    absent = row.get("absent")
+    if not absent:
+        return
+    print(f"    absent: {absent['n']} run(s) — right (no box) {absent['correct_rate']:.0%}, "
+          f"wrong accept {absent['wrong_accept_rate']:.0%}, "
+          f"said bbox null {absent['bbox_null_rate']:.0%}")
+    for other, rate in absent["landed_on_rates"].items():
+        print(f"      wrong box landed on {other!r}: {rate:.0%} of absent runs")
+
+
 def _print_summary(summary: dict) -> None:
     header = (
         f"{'criterion':<28}{'n':>4}{'a1 valid':>10}{'verify':>9}"
@@ -1508,8 +1643,10 @@ def _print_summary(summary: dict) -> None:
             print(_row(name, row))
             for other, rate in (row.get("landed_on_rates") or {}).items():
                 print(f"    landed on {other!r}: {rate:.0%} of runs")
+            _print_absent(row)
         print("-" * len(header))
         print(_row("OVERALL", block["overall"]))
+        _print_absent(block["overall"])
         marks_rate = block["overall"].get("marks_refined_rate")
         if marks_rate is not None:
             print(f"  marks refined {marks_rate:.0%} of the refines (the rest fell back to "
@@ -1562,10 +1699,11 @@ def main() -> None:
     parser.add_argument(
         "--truth", default=None,
         help='JSON: {"file.jpg": {"criteria": {"name": [[x1, y1, x2, y2], ...]}, '
-             '"decoys": {"name": [...]}}} in original page pixels, every copy listed; '
-             "its criteria are asked (decoys never are) and every accepted box is "
-             "scored against them (hit on any copy, false accept, IoU, centre error, "
-             "landed on)",
+             '"decoys": {"name": [...]}, "absent": ["name", ...]}} in original page '
+             "pixels, every copy listed; its criteria and absent names are asked (decoys "
+             "never are) and every accepted box is scored against them (hit on any copy, "
+             "false accept, IoU, centre error, landed on); an absent pair is right when "
+             "no box is accepted, reported apart from the hit rate",
     )
     parser.add_argument(
         "--reference-image", default=None,
@@ -1614,7 +1752,9 @@ def main() -> None:
     parser.add_argument(
         "--write-failures", default=None, metavar="SUBSET_JSON",
         help="after the run, write the --subset of pairs whose 'off' runs hit in under "
-             f"{FAILURE_HIT_RATE:.0%}% of their repeats (needs --truth and the off config)",
+             # argparse %-formats help: the format's own % is doubled into %%.
+             f"{FAILURE_HIT_RATE:.0%}% of their repeats — or, for an absent pair, were right "
+             "(no box) in under that share (needs --truth and the off config)",
     )
     parser.add_argument(
         "--configs", default=",".join(CONFIGS),

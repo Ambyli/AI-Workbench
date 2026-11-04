@@ -32,25 +32,37 @@ With ``options.boxes`` the bounding-box enforcement loop (``llm.boxes``)
 runs right after, gated on the (combined) presence score exactly as before —
 hint presence/auto, score >= LLM_BBOX_PRESENCE_MIN, a page image to crop —
 for at most ``options.max_attempts`` attempts. It never changes the score.
-When the guide applied and a CLASSIFIER_REFERENCE_BOX_* knob is on, the
-examples the loop may show are built AFTER the gate passed
+
+**The loop runs with the CRITERION's settings**
+(``api.criterion_options.box_loop_settings`` over its resolved options):
+``options.refine``, ``options.verify_partial``, ``options.verify_min_span``,
+``options.reference.boxes`` and ``options.reference.text``, each already
+resolved to the criterion's value or, unset, the service default (the
+CLASSIFIER_LLM_BBOX_* / CLASSIFIER_REFERENCE_BOX_* env vars), and passed to
+the loop and the example builder EXPLICITLY — so two criteria on one page
+can run the loop two ways, and ``options_used`` says how each ran. The loop's
+own env defaults are for direct callers only. With nothing set and the env
+defaults off, every keyword is today's value and every prompt is today's.
+
+When the guide applied and the criterion's ``reference.boxes`` turns a step
+on, the examples the loop may show are built AFTER the gate passed
 (``JobReferences.box_examples``: regions only, FAIL only under a presence
 hint, composites for the ask — region crops under the position check — and
-region crops for refine and verify) and handed to the loop, which shows each
-step its examples when that step's knob is on. Every unit of a criterion
-with a guide records what the loop was shown as ONE
-``localization.references`` entry tagged with its ``item`` (``applied:
-false`` with a note when nothing was shown — the knobs off, no example with
-a region, a load failure), each call that carried examples in
+region crops for refine and verify; with ``reference.text`` each one's region
+text) and handed to the loop, which shows each step its examples when that
+step is on. Every unit of a criterion with a guide records what the loop was
+shown as ONE ``localization.references`` entry tagged with its ``item``
+(``applied: false`` with a note when nothing was shown — every step off, no
+example with a region, a load failure), each call that carried examples in
 ``references.json`` (``kind: box_ask | box_refine | box_verify``) and in
 ``classifier_reference_calls_total``. Without references in the request the
 key is absent and the loop sends one image, exactly as before.
 
 The loop is also handed the line boxes of the text layer the scoring call
 read (``TextLayer.lines``, ORIGINAL page pixels): the marks refine
-(CLASSIFIER_LLM_BBOX_REFINE_MODE=marks) numbers the ones in its window, so
-it needs no OCR pass of its own. A native-text page has none, and the loop
-falls back to the grid. In grid mode they are not read.
+(``options.refine: "marks"``) numbers the ones in its window, so it needs no
+OCR pass of its own. A native-text page has none, and the loop falls back to
+the grid. In grid mode they are not read.
 
     evaluate()       — the shared evaluator interface.
     evaluate_with()  — the same for a name and RESOLVED llm options, which is
@@ -94,6 +106,7 @@ from analysis.result_specs import (
     with_metric,
 )
 from analysis.outcome import EvaluationError
+from api.criterion_options import box_loop_settings
 from api.schemas import CriterionInput
 # Modules, not names: a test scripts the model by replacing
 # `llm.client.call_model` / `call_model_json`, and must reach the one object
@@ -294,18 +307,20 @@ async def evaluate_with(
         )
         return outcome
 
+    # The loop's settings for THIS criterion: its own values, else the
+    # service defaults (resolve() filled them in), passed explicitly.
+    loop = box_loop_settings(opts)
     # The loop's reference examples: built only now (the gate passed) and
-    # only when a knob would show them, so a page that is not located — or a
-    # deployment with the knobs off — never decodes a reference page.
+    # only when a step would show them, so a page that is not located — or a
+    # criterion whose reference.boxes leaves every step off — never decodes
+    # a reference page.
     box_guide: Optional[BoxGuide] = None
-    knobs_on = (
-        llm_boxes.REFERENCE_BOX_ASK or llm_boxes.REFERENCE_BOX_REFINE
-        or llm_boxes.REFERENCE_BOX_VERIFY
-    )
+    knobs_on = loop["guide_ask"] or loop["guide_refine"] or loop["guide_verify"]
     if reference is not None and reference.applied and knobs_on:
         box_guide = await ctx.references.box_examples(
             reference, spec,
             position_check=(opts.get("reference") or {}).get("position") == "check",
+            with_text=loop["reference_text"],
         )
 
     regions, loc = await llm_boxes.locate_criterion(
@@ -319,10 +334,16 @@ async def evaluate_with(
         model=spec,
         ask_examples=box_guide.ask if box_guide else None,
         crop_examples=box_guide.crops if box_guide else None,
+        guide_ask=loop["guide_ask"],
+        guide_refine=loop["guide_refine"],
+        guide_verify=loop["guide_verify"],
         # The marks refine's OCR lines: the layer this criterion's
         # options.ocr already produced (ORIGINAL page pixels, the frame
         # `original_image` is in). Read only in marks mode.
         text_lines=layer.lines,
+        refine_mode=loop["refine_mode"],
+        verify_partial=loop["verify_partial"],
+        verify_min_span=loop["verify_min_span"],
     )
     outcome.regions = regions
     outcome.localization = loc.as_dict()
@@ -347,8 +368,11 @@ def _box_reference_entry(
 
     Tagged with its ``item`` here, so the aggregate merge is plain
     concatenation. ``applied`` is whether any step carried examples; when
-    none did, the ``note`` says why (the guide's own note, the knobs, or
-    ``box_examples``')."""
+    none did, the ``note`` says why (the guide's own note, every step off —
+    ``knobs_on`` is the criterion's resolved ``reference.boxes`` — or
+    ``box_examples``'). Every step off reads as it always did while the
+    service defaults are off too; with a default on, the criterion's own
+    ``reference.boxes`` is what turned them off, and the note says so."""
     examples = box_guide.records if box_guide else []
     for call in loc.guided_calls:
         reference_calls_total.labels(
@@ -372,7 +396,12 @@ def _box_reference_entry(
     if not guide.applied:
         note = guide.note
     elif not knobs_on:
-        note = "the CLASSIFIER_REFERENCE_BOX_* knobs are off"
+        defaults = box_loop_settings({})
+        note = (
+            "options.reference.boxes turns every step off for this criterion"
+            if defaults["guide_ask"] or defaults["guide_refine"] or defaults["guide_verify"]
+            else "the CLASSIFIER_REFERENCE_BOX_* knobs are off"
+        )
     else:
         note = box_guide.note if box_guide else None
     return {

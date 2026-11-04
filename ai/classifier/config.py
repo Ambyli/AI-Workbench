@@ -882,6 +882,17 @@ LLM_BBOX_REFINE_MIN_SPAN: float = min(
     1.0, max(0.05, float(os.environ.get("CLASSIFIER_LLM_BBOX_REFINE_MIN_SPAN", "0.2")))
 )
 
+# ── The loop's per-criterion settings: these env vars are SERVICE DEFAULTS ──
+# LLM_BBOX_REFINE_MODE, LLM_BBOX_VERIFY_PARTIAL, LLM_BBOX_VERIFY_MIN_SPAN and
+# REFERENCE_BOX_ASK / _REFINE / _VERIFY / _TEXT below are each the default for
+# one criterion option — `options.refine`, `options.verify_partial`,
+# `options.verify_min_span`, `options.reference.boxes.{ask,refine,verify}`,
+# `options.reference.text` — used when an llm criterion with `boxes: true`
+# leaves it unset (api.criterion_options resolves them; `options_used` shows
+# the value that ran). A criterion that sets one wins; all off by default.
+# LLM_BBOX_MARKS_MAX is service-wide (no option). bin/grounding_experiment.py
+# defaults its flags to them too.
+#
 # LLM_BBOX_REFINE_MODE is HOW the refine pass asks. `grid` (the default) is
 # the pass above: the zoomed crop with its own grid, a box on it. `marks`
 # draws a numbered tag on every OCR text line in the refine window instead

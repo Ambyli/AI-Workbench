@@ -429,10 +429,17 @@ def test_criterion_types_describes_every_type(client):
     body = client.get("/criterion-types").json()
     assert set(body["types"]) == {"llm", "text", "cv", "detector"}
     llm = body["types"]["llm"]
-    assert llm["defaults"] == {"hint": "auto", "boxes": False, "max_attempts": 3, "ocr": "auto",
+    # The box loop's per-criterion settings resolve to the service defaults
+    # (all off here) — the one change unset options show.
+    assert llm["defaults"] == {"hint": "auto", "boxes": False, "max_attempts": 3,
+                               "refine": "grid", "verify_partial": False, "verify_min_span": 0.0,
+                               "ocr": "auto",
                                "aggregate": {"pages": "worst", "documents": "worst"}}
     assert llm["caps"] == {"max_attempts": 3}
-    assert "boxes" in llm["options_schema"]["properties"]
+    for key in ("boxes", "refine", "verify_partial", "verify_min_span"):
+        assert key in llm["options_schema"]["properties"]
+    assert set(body["box_loop"]["options"]) == {
+        "refine", "verify_partial", "verify_min_span", "reference.boxes", "reference.text"}
     assert body["types"]["cv"]["defaults"]["fallback"] == "llm"  # no DETECTOR_URL here
     assert "aggregate" in body and "rules" in body["aggregate"]
 

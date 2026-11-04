@@ -135,7 +135,16 @@ def _same(a: CriterionInput, b: CriterionInput) -> bool:
     not part of a criterion's identity (``without_model``): the same question
     answered on two models is one criterion — the first reference's options
     (model included) are the ones inherited. The ``key`` is part of it
-    (compared case-folded): one name keyed two ways would be found two ways."""
+    (compared case-folded): one name keyed two ways would be found two ways.
+
+    The box loop's per-criterion settings (``refine``, ``verify_partial``,
+    ``verify_min_span``, ``reference.boxes`` / ``.text``) ARE compared, as
+    resolved: a stored ``input`` holds what its creator sent (``null`` when
+    unset, nothing at all in a record written before the settings existed),
+    and both sides resolve an unset one to THIS container's service default.
+    So "unset" and "set to the current default" are the same criterion (the
+    first reference's input is inherited, unset staying unset), while two
+    references that would run the loop differently today are a conflict."""
     return (
         a.type == b.type
         and without_model(a.resolved_options()) == without_model(b.resolved_options())

@@ -110,7 +110,9 @@ def list_criterion_types():
     The schema is generated from the same pydantic models /assess validates
     against, so it cannot drift from what the endpoint accepts. ``defaults``
     are resolved for THIS container (a `cv` criterion's fallback depends on
-    whether DETECTOR_URL is set); ``caps`` are the server limits a request
+    whether DETECTOR_URL is set; an `llm` criterion's box-loop settings and
+    ``reference.boxes`` / ``.text`` show the service defaults, also listed
+    in the ``box_loop`` block); ``caps`` are the server limits a request
     may not exceed.
 
     Each type also carries ``result``: the shape of the ``detail`` it returns

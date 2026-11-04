@@ -36,7 +36,7 @@ reference up by id.
                        (``llm.boxes.example_crop``), cached; None when the
                        page is gone or unreadable.
         text_of()      what the text inside an example's region says —
-                       CLASSIFIER_REFERENCE_BOX_TEXT: a reference keeps no
+                       ``options.reference.text``: a reference keeps no
                        text layer, so its ORIGINAL page is OCR'd around the
                        first region (``region_text``) once per job, under
                        the process-wide OCR limit, and cached beside the
@@ -45,12 +45,14 @@ reference up by id.
         box_examples() what the BOX LOOP shows one unit (a ``BoxGuide``):
                        ``box_selection``'s examples, loaded — composites for
                        the ask (crops under the position check), crops for
-                       refine and verify; with CLASSIFIER_REFERENCE_BOX_TEXT
-                       each one's region text too, for its caption. Never
-                       raises: an example that cannot be loaded is dropped
-                       from every step, noted. Built by ``analysis.llm_eval``
-                       only when a CLASSIFIER_REFERENCE_BOX_ASK / _REFINE /
-                       _VERIFY knob is on.
+                       refine and verify; with ``with_text`` (the
+                       criterion's ``options.reference.text``) each one's
+                       region text too, for its caption. Never raises: an
+                       example that cannot be loaded is dropped from every
+                       step, noted. Built by ``analysis.llm_eval`` only when
+                       the criterion's ``options.reference.boxes`` (unset:
+                       the CLASSIFIER_REFERENCE_BOX_* service defaults)
+                       turns a step on.
         finish()       the opt-in POSITION check, run by the scheduler on a
                        finished unit (see below).
         record_calls() what each guided call carried, for
@@ -381,8 +383,8 @@ class BoxGuide:
                     the position check.
         crops:      The same examples as region crops, for refine and verify.
         records:    ``{reference_id, criterion, polarity, composite}`` per
-                    example in them (plus ``text`` with
-                    CLASSIFIER_REFERENCE_BOX_TEXT), for
+                    example in them (plus ``text`` with ``with_text``,
+                    ``options.reference.text``), for
                     ``localization.references`` and ``references.json``.
         ask_images: ``"composite"`` | ``"crop"`` — what the ask is shown.
         note:       Why there are none, or which were dropped; None when
@@ -403,7 +405,7 @@ class JobReferences:
     plan: dict[str, Any]
     _images: dict[tuple[str, str], str] = field(default_factory=dict)
     _crops: dict[tuple[str, str], str] = field(default_factory=dict)
-    # CLASSIFIER_REFERENCE_BOX_TEXT: each example's region text, None
+    # options.reference.text: each example's region text, None
     # included (a logo has none; asking again would OCR it again).
     _texts: dict[tuple[str, str], Optional[str]] = field(default_factory=dict)
     _calls: list[dict[str, Any]] = field(default_factory=list)
@@ -629,7 +631,7 @@ class JobReferences:
 
     async def text_of(self, example: dict[str, Any]) -> Optional[str]:
         """What the text inside an example's FIRST region says
-        (CLASSIFIER_REFERENCE_BOX_TEXT), as its caption quotes it — the region
+        (``options.reference.text``), as its caption quotes it — the region
         of the reference's ORIGINAL page (``page.jpg``, the frame its regions
         are in) recognised by ``region_text`` with this process's OCR engine
         (``analysis.ocr``), in a worker thread under the process-wide OCR
@@ -695,10 +697,13 @@ class JobReferences:
         submit (``EvaluationError``), a missing or undecodable ``page.jpg``,
         any other failure — is dropped from EVERY step, with a note, so
         every step sees the same examples. Called by ``analysis.llm_eval``
-        only after the loop's gate passed and a knob is on, so a page that is
-        not located never decodes a reference page.
+        only after the loop's gate passed and the criterion's
+        ``options.reference.boxes`` turns a step on, so a page that is not
+        located never decodes a reference page.
 
-        ``with_text`` (default CLASSIFIER_REFERENCE_BOX_TEXT) also reads each
+        ``with_text`` — the service passes the criterion's resolved
+        ``options.reference.text``; left out (a direct caller), the
+        CLASSIFIER_REFERENCE_BOX_TEXT default — also reads each
         shown example's region text (``text_of``) onto its ``BoxExample``s —
         ask and crop alike, so every step's caption quotes it — and into its
         record as ``text`` (None when there was none). Off, neither the

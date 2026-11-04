@@ -23,7 +23,8 @@ claim, not a measurement, so nothing here trusts one:
              units off on one axis and the refined one lands within a few;
              the coarse box is kept when the second answer is unusable, and
              both are recorded (``coarse_bbox_grid``, ``refined``).
-             MARKS MODE (LLM_BBOX_REFINE_MODE=marks): the same crop, but
+             MARKS MODE (``refine_mode="marks"``, a criterion's
+             ``options.refine``): the same crop, but
              instead of the grid every OCR text line inside the window
              (``text_lines``, the criterion's own text layer, ORIGINAL page
              pixels) is outlined and numbered (common.vision
@@ -37,10 +38,10 @@ claim, not a measurement, so nothing here trusts one:
              (``refine_mode``, ``marks``, ``marks_shown``,
              ``marks_fallback``).
     verify    crop that box out of the ORIGINAL page (+LLM_BBOX_CROP_PAD on
-             each side, grown to at least LLM_BBOX_VERIFY_MIN_SPAN of the
-             page on each axis when that is set), send the crop ALONE, and
+             each side, grown to at least ``verify_min_span`` of the page
+             on each axis when that is set), send the crop ALONE, and
              ask whether the feature is visible in it. Accept at
-             LLM_BBOX_VERIFY_PASS or better. With LLM_BBOX_VERIFY_PARTIAL
+             LLM_BBOX_VERIFY_PASS or better. With ``verify_partial``
              the answer also says whether the crop cuts the feature off
              (``verify_partial``) — never moving the score.
                                                 (llm.prompts.build_verify_prompt)
@@ -62,9 +63,23 @@ after it is fitted to the working size (``to_crop_px``); a box on the crop's
 own grid back to the page grid (``window_to_full``). The ≤1000-px WORKING
 copy only ever appears as the ask image — its 0-1000 grid is the page's.
 
+**Per criterion, not per service.** The opt-in settings — the marks refine
+(``refine_mode``), the cut-off verify (``verify_partial``), the verify
+crop's floor (``verify_min_span``) and which steps see reference examples
+(``guide_ask`` / ``guide_refine`` / ``guide_verify``) — are keyword
+arguments. The service passes each criterion's own (its ``options.refine``,
+``options.verify_partial``, ``options.verify_min_span``,
+``options.reference.boxes``), resolved against the service defaults by
+``api.criterion_options`` and handed over by ``analysis.llm_eval``; the
+module-level defaults below (LLM_BBOX_REFINE_MODE, LLM_BBOX_VERIFY_PARTIAL,
+LLM_BBOX_VERIFY_MIN_SPAN, REFERENCE_BOX_ASK / _REFINE / _VERIFY) are read
+here only when a DIRECT caller leaves a keyword out —
+``bin/grounding_experiment.py``. LLM_BBOX_MARKS_MAX stays service-wide.
+
 **Reference examples** (ZT-527), when the request lists references that
 guide the criterion, ride along in the same calls — never extra calls —
-each step behind its own knob, read here and nowhere else:
+each step behind its own flag (``guide_*``; for a direct caller left out,
+its knob):
 
     ask      REFERENCE_BOX_ASK: up to one PASS-side and one FAIL example
              (``ask_examples``) captioned BEFORE the gridded candidate —
@@ -83,7 +98,7 @@ each step behind its own knob, read here and nowhere else:
 
 The examples are chosen and loaded by ``analysis.references`` once per unit
 and are the same on every attempt; validation, the gate, the area checks, the
-rejection wording and the labels are untouched. With the knobs off (or no
+rejection wording and the labels are untouched. With every step off (or no
 examples) every prompt is byte-for-byte the unguided one. The loop never
 imports ``analysis``: it returns what carried examples
 (``Localization.guided`` / ``guided_calls``) and ``analysis.llm_eval``
@@ -193,7 +208,7 @@ class BoxAttempt:
         refine_window_grid: The page-frame window the refine crop covered.
         refined:       True when ``bbox_grid`` came from the refine pass.
         refine_reject: Why the refine answer was not used, when it was not.
-        refine_mode:   Marks mode only (LLM_BBOX_REFINE_MODE=marks): which
+        refine_mode:   Marks mode only (``refine_mode="marks"``): which
                        pass refined this attempt — ``"marks"``, or
                        ``"grid"`` when it fell back. None in grid mode.
         marks:         The mark numbers the model chose (1-based, as shown),
@@ -202,7 +217,7 @@ class BoxAttempt:
         marks_shown:   How many marks the marks call drew (none made: None).
         marks_fallback: Why the grid refine ran instead of the marks.
         verify_partial: The verify's ``partial`` answer (the crop cut the
-                       feature off) — only with LLM_BBOX_VERIFY_PARTIAL, and
+                       feature off) — only with ``verify_partial``, and
                        None when the verify did not say.
 
     In marks mode ``bbox_grid`` of a marks-refined attempt is the union box
@@ -319,7 +334,8 @@ class Localization:
 
     Attributes:
         guided:       ``{"ask", "refine", "verify"}`` — whether that step's
-                      calls carry examples (its knob on and examples given),
+                      calls carry examples (its ``guide_*`` flag on and
+                      examples given),
                       fixed for the unit; a step that never ran still says
                       what it would have carried.
         guided_calls: One ``{kind: box_ask | box_refine | box_verify,
@@ -634,9 +650,10 @@ async def locate_criterion(
                           ``crop_examples``, exactly as before. Refine always
                           shows ``crop_examples``.
         guide_ask / guide_refine / guide_verify:
-                          Show that step its examples (default the
-                          REFERENCE_BOX_ASK / _REFINE / _VERIFY knobs, read
-                          here at call time — the one place they are read). A
+                          Show that step its examples. The service passes the
+                          criterion's resolved ``options.reference.boxes``;
+                          left out (a direct caller), the REFERENCE_BOX_ASK /
+                          _REFINE / _VERIFY knobs, read here at call time. A
                           step shows examples only when its flag is on AND
                           its list is non-empty; otherwise its prompt is the
                           unguided one, byte for byte. The labels never
@@ -650,15 +667,20 @@ async def locate_criterion(
                           .llm_eval`` passes the layer the criterion's
                           ``options.ocr`` produced (no extra OCR pass). None
                           → no marks (the grid refine, noted in marks mode).
-        refine_mode:      ``"grid"`` | ``"marks"`` (default
-                          LLM_BBOX_REFINE_MODE; anything else is grid).
+        refine_mode:      ``"grid"`` | ``"marks"`` — the service passes the
+                          criterion's resolved ``options.refine`` (default,
+                          for a direct caller, LLM_BBOX_REFINE_MODE; anything
+                          else is grid).
         marks_max:        Most marks one marks call may show (default
-                          LLM_BBOX_MARKS_MAX); more → the grid refine.
+                          LLM_BBOX_MARKS_MAX, service-wide); more → the grid
+                          refine.
         verify_partial:   Ask the verify whether the crop cuts the feature
-                          off (default LLM_BBOX_VERIFY_PARTIAL).
+                          off — ``options.verify_partial`` (direct-caller
+                          default LLM_BBOX_VERIFY_PARTIAL).
         verify_min_span:  Grow the verify crop to this share of the page on
-                          each axis (default LLM_BBOX_VERIFY_MIN_SPAN; 0 =
-                          the padded box as always).
+                          each axis — ``options.verify_min_span``
+                          (direct-caller default LLM_BBOX_VERIFY_MIN_SPAN; 0
+                          = the padded box as always).
 
     Returns:
         ``(regions, localization)``. ``regions`` holds one Region per attempt
@@ -1314,7 +1336,7 @@ def _score_of(verdict: Any) -> Optional[int]:
 
 
 def _partial_of(verdict: Any) -> Optional[bool]:
-    """The verify call's ``partial`` (LLM_BBOX_VERIFY_PARTIAL): a JSON
+    """The verify call's ``partial`` (``verify_partial``): a JSON
     boolean, ``0`` / ``1``, or ``"true"`` / ``"false"`` / ``"yes"`` /
     ``"no"`` in any case — a model in JSON mode occasionally quotes it; None
     when it did not say."""

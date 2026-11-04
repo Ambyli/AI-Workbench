@@ -18,7 +18,12 @@ without it when off:
     inside the page; the box itself unchanged;
 
 and that ``analysis.llm_eval`` hands the loop the criterion's own text layer.
-The prompts themselves are pinned in ``test_reference_prompts.py``.
+The prompts themselves are pinned in ``test_reference_prompts.py``. Each
+setting is also a per-criterion option (``options.refine``,
+``options.reference.text``, ``options.verify_partial``,
+``options.verify_min_span``) whose service default is the env var named
+above; the options, their precedence and their plumbing are pinned in
+``test_box_loop_options.py`` — here the loop takes them as keywords.
 
 Run with::
 
@@ -649,8 +654,12 @@ def test_box_examples_carry_the_text_only_when_asked(monkeypatch):
 
 def _analyze_marks(monkeypatch, criterion, *, answers):
     """The whole pipeline on ``test_llm_boxes``' synthetic 400×600 PNG, the
-    refine pass ON in marks mode, the model scripted."""
+    refine pass ON in marks mode, the model scripted. Marks is the SERVICE
+    default here (``CLASSIFIER_LLM_BBOX_REFINE_MODE``, patched where the
+    service resolves it, ``api.criterion_options``); a criterion's own
+    ``options.refine`` is test_box_loop_options.py's."""
     import analysis
+    from api import criterion_options
 
     from test_llm_boxes import _png_bytes, _scoring_call
 
@@ -659,7 +668,7 @@ def _analyze_marks(monkeypatch, criterion, *, answers):
     monkeypatch.setattr(llm_client, "call_model_json", model)
     monkeypatch.setattr(llm_boxes, "LLM_BBOX_REFINE", True)
     monkeypatch.setattr(llm_boxes, "LLM_BBOX_GRIDLINES", False)
-    monkeypatch.setattr(llm_boxes, "LLM_BBOX_REFINE_MODE", "marks")
+    monkeypatch.setattr(criterion_options, "LLM_BBOX_REFINE_MODE", "marks")
     doc = analysis.load_document_bytes(_png_bytes(), "page.png", "image/png", keep_source=True)
     result = asyncio.run(analysis.analyze_document(doc, [criterion]))
     return result, model

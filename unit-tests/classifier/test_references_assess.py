@@ -27,6 +27,10 @@ What is pinned here:
   * the images per call — 2 for one example, 3 for a contrastive PASS + FAIL
     call, one example per call when the model takes only two; the box loop
     (knobs off) and an unguided criterion still send one;
+  * a criterion's own `options.reference.boxes` / `.text` over the knobs
+    (their service defaults): one criterion of two guided with the knobs
+    off, one unguided with them on (and the note saying why), and the
+    region text reaching the captions;
   * the box loop WITH examples (the CLASSIFIER_REFERENCE_BOX_* knobs patched
     on): a guided `score: false` locate job, `localization.references` and
     the `references.json` / metric kinds with a failed box call, one entry
@@ -274,6 +278,14 @@ def _entry(job, name=HOUSE) -> dict:
      "CLASSIFIER_REFERENCE_MAX_PER_REQUEST"),
     ({"criteria": [_house(reference={"combine": "best"})], "references": ["r000000000000"]},
      "combine"),
+    # The box loop's per-criterion options need the loop, and their
+    # reference half needs references.
+    ({"criteria": [_house(reference={"boxes": {"ask": True}})], "references": ["r000000000000"]},
+     "reference.boxes tunes the bounding-box loop, which runs only with options.boxes: true"),
+    ({"criteria": [_house(boxes=True, reference={"text": True})]},
+     "the request lists no `references`"),
+    ({"criteria": [_house(refine="marks")]}, "refine tunes the bounding-box loop"),
+    ({"criteria": [_house(boxes=True, verify_min_span=2)]}, "options.verify_min_span"),
 ])
 def test_static_refusals(client, model, body, needle):
     assert needle in _refuse(client, body)
@@ -591,13 +603,15 @@ def test_the_box_loop_still_sends_one_image(client, model, refs):
 
 @pytest.fixture
 def knobs(monkeypatch):
-    """Set the three knobs where they are read (``llm.boxes``)."""
-    from llm import boxes as llm_boxes
+    """Set the three knobs — the SERVICE defaults of a criterion's
+    ``options.reference.boxes`` — where the service reads them
+    (``api.criterion_options``, at resolve time)."""
+    from api import criterion_options
 
     def set_knobs(ask=True, refine=True, verify=True):
-        monkeypatch.setattr(llm_boxes, "REFERENCE_BOX_ASK", ask)
-        monkeypatch.setattr(llm_boxes, "REFERENCE_BOX_REFINE", refine)
-        monkeypatch.setattr(llm_boxes, "REFERENCE_BOX_VERIFY", verify)
+        monkeypatch.setattr(criterion_options, "REFERENCE_BOX_ASK", ask)
+        monkeypatch.setattr(criterion_options, "REFERENCE_BOX_REFINE", refine)
+        monkeypatch.setattr(criterion_options, "REFERENCE_BOX_VERIFY", verify)
 
     return set_knobs
 
@@ -778,10 +792,10 @@ def test_a_reference_deleted_before_the_loop_drops_the_example_and_keeps_the_uni
     plan = asyncio.run(resolve_references(request, reference_registry)).plan
     original = JobReferences.box_examples
 
-    async def deleted_first(self, guide, spec, *, position_check):
+    async def deleted_first(self, guide, spec, *, position_check, **kwargs):
         reference_files.delete(rid)
         self._images.clear()        # as if the scoring call had never cached it
-        return await original(self, guide, spec, position_check=position_check)
+        return await original(self, guide, spec, position_check=position_check, **kwargs)
 
     monkeypatch.setattr(JobReferences, "box_examples", deleted_first)
     knobs()
@@ -860,6 +874,84 @@ def test_the_position_check_is_unchanged_by_what_the_loop_was_shown(
     assert guided["detail"]["reference"]["position"] == unguided["detail"]["reference"]["position"]
     assert guided["detail"]["reference"]["position"]["status"] == "miss"
     assert (guided["score"], guided["verdict"]) == (unguided["score"], unguided["verdict"])
+
+
+# ---------------------------------------------------------------------------
+# options.reference.boxes / .text — the knobs, per criterion. The knobs are
+# their service defaults; the criterion's value wins.
+# ---------------------------------------------------------------------------
+
+
+def test_reference_boxes_guides_one_criterions_loop_with_the_knobs_off(client, model, refs):
+    """Two criteria guided by the same example, one page: the one whose
+    reference.boxes turns ask and verify on is shown it there; the one
+    beside it runs today's loop."""
+    job = _assess(client, {"criteria": [
+        _house(boxes=True, reference={"boxes": {"ask": True, "verify": True}}),
+        {"name": "is there a house", "type": "llm", "options": {
+            "hint": "presence", "boxes": True, "reference": {"criterion": HOUSE}}},
+    ], "references": [refs["pass"]]})
+    guided = _entry(job)
+    assert guided["options_used"]["reference"]["boxes"] == {
+        "ask": True, "refine": False, "verify": True}
+    (entry,) = guided["localization"]["references"]
+    assert (entry["applied"], entry["ask"], entry["refine"], entry["verify"]) == (
+        True, True, False, True)
+    assert entry["examples"] == [_record(refs["pass"], "pass")]
+    other = _entry(job, "is there a house")
+    assert other["options_used"]["reference"]["boxes"] == {
+        "ask": False, "refine": False, "verify": False}
+    (unguided,) = other["localization"]["references"]
+    assert unguided["applied"] is False
+    assert unguided["note"] == "the CLASSIFIER_REFERENCE_BOX_* knobs are off"
+    # One criterion's ask and verify carry the example (2 images), the other's
+    # the candidate alone.
+    for kind in ("bbox", "verify"):
+        assert sorted(FakeModel.images(p) for k, p in model.calls if k == kind) == [1, 2]
+
+
+def test_reference_boxes_off_on_a_criterion_beats_the_knobs_on(client, model, refs, knobs):
+    knobs()
+    job = _assess(client, {"criteria": [_house(boxes=True, reference={
+        "boxes": {"ask": False, "refine": False, "verify": False}})],
+        "references": [refs["pass"]]})
+    (entry,) = _entry(job)["localization"]["references"]
+    assert entry["applied"] is False and entry["examples"] == []
+    assert entry["note"] == "options.reference.boxes turns every step off for this criterion"
+    assert {FakeModel.images(p) for k, p in model.calls if k in ("bbox", "verify")} == {1}
+
+
+def test_reference_text_on_a_criterion_quotes_each_examples_region(
+    client, model, refs, monkeypatch
+):
+    """reference.text reaches box_examples (with_text) with the
+    CLASSIFIER_REFERENCE_BOX_TEXT default off; unset, no text is read."""
+    from analysis.references import JobReferences
+
+    read: list[str] = []
+
+    async def text_of(self, example):
+        read.append(example["reference_id"])
+        return "Meter #: 4471"
+
+    monkeypatch.setattr(JobReferences, "text_of", text_of)
+    job = _assess(client, {"criteria": [_house(boxes=True, reference={
+        "boxes": {"ask": True}, "text": True})], "references": [refs["pass"]]})
+    (ask,) = _box_prompts(model, "ask")
+    assert FakeModel.texts(ask)[0].endswith(' The outlined area reads: "Meter #: 4471".')
+    (entry,) = _entry(job)["localization"]["references"]
+    assert entry["examples"] == [{**_record(refs["pass"], "pass"), "text": "Meter #: 4471"}]
+    assert read == [refs["pass"]]
+    assert _entry(job)["options_used"]["reference"]["text"] is True
+
+    model.calls.clear()
+    read.clear()
+    job = _assess(client, {"criteria": [_house(boxes=True, reference={
+        "boxes": {"ask": True}})], "references": [refs["pass"]]})
+    (ask,) = _box_prompts(model, "ask")
+    assert "reads:" not in FakeModel.texts(ask)[0]
+    assert "text" not in _entry(job)["localization"]["references"][0]["examples"][0]
+    assert read == []
 
 
 # ---------------------------------------------------------------------------

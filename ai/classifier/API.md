@@ -264,6 +264,8 @@ ai/classifier/
                        job type's progress STAGES
   bin/
     grounding_experiment.py   operator tool — runs where the model is
+    reference_box_assess.py   operator tool — the box loop measured end to end through
+                              the API: stored references, /assess jobs, the job result
     confidence_calibration.py operator tool — measures the confidence signals, fits a
                               calibration (§ Confidence)
 ```
@@ -2923,6 +2925,62 @@ docker exec classifier uv run --no-sync python bin/grounding_experiment.py \
 If attempt-1 validity is under ~50%, prefer `detector` criteria as the primary
 source and keep `llm` criteria with `options.boxes` for labels the detector
 cannot name.
+
+**End to end, through the API — `bin/reference_box_assess.py`.** The
+experiment calls `llm.boxes.locate_criterion` directly, with examples it
+builds itself, so it skips everything around the loop: stored references,
+key matching, `box_selection` (a FAIL example reaches the loop only under a
+`presence` reference criterion) and the per-criterion options. This script
+measures the same truth file the production way, over HTTP against the
+container's own uvicorn (`--base-url`, default `http://127.0.0.1:8000`):
+
+* **References** — one `POST /references` per (truth page, criterion,
+  polarity) that can teach something: PASS from the criterion's first truth
+  box (score 10), FAIL from the first box of its `--fail-from-decoys` decoy
+  (score 1). Each holds ONE scored copy of the locate criterion (same name
+  and `--key`, hint `presence`, `boxes: true`), so key matching hands each
+  candidate criterion exactly its own examples. Fully supplied, with a
+  generic title and description and the tag `zt527-e2e`: no model call. The
+  run refuses to start past `CLASSIFIER_REFERENCE_MAX_COUNT`, waits for
+  `ready`, and leaves a `failed` one out.
+* **Jobs** — one `/assess` per (candidate page, repeat), every criterion the
+  truth asks of it (`absent` ones included) as the production locate
+  criterion (`hint: presence`, `score: false`, `boxes: true`, its `key`, its
+  `--options` overlay), with one PASS and (mapped, at 3 images per prompt)
+  one FAIL reference per criterion — picked like the experiment's examples:
+  outside the candidate's group, rotated across repeats, PASS and FAIL
+  independently. `--no-references` is the baseline through the same path.
+  `--concurrency` (4) jobs in flight.
+* **Scoring** — from the job result only: the accepted attempt against the
+  truth exactly as the experiment scores it (hit, `absent` correct,
+  `landed_on`), the loop's calls, and from `localization.references` whether
+  the PASS and FAIL examples reached the loop. `--out` keeps ids, outcomes and
+  the box-loop settings that ran — never a reason.
+* **Clean-up** — in a `finally` (an error, Ctrl-C): every job (each as soon as
+  its record is in `--out`), the references' creation jobs, and every
+  reference the run created. `--purge` deletes every reference tagged
+  `zt527-e2e` after a run that was killed outright.
+
+The loop runs in the SERVICE, so its env knobs are the container's (`.env`,
+`make up classifier`), not the script's. Two configs make the comparison:
+
+```bash
+# Baseline — no references, no options
+docker exec classifier uv run --no-sync python bin/reference_box_assess.py \
+  --images /data/grounding_ops/images --truth /data/grounding_ops/truth.json \
+  --groups /data/grounding_ops/groups.json --repeats 5 \
+  --key "total the customer owes=amount_due_figure" --key "usage history=usage_history" \
+  --no-references --label baseline --out /data/grounding_ops/e2e_baseline.json
+# Per-criterion options plus references, a FAIL example of the usage look-alike
+docker exec classifier uv run --no-sync python bin/reference_box_assess.py \
+  --images /data/grounding_ops/images --truth /data/grounding_ops/truth.json \
+  --groups /data/grounding_ops/groups.json --repeats 5 \
+  --key "total the customer owes=amount_due_figure" --key "usage history=usage_history" \
+  --options 'total the customer owes={"refine":"marks","reference":{"boxes":{"ask":true,"refine":true,"verify":true}}}' \
+  --options 'usage history={"reference":{"boxes":{"ask":true,"refine":true,"verify":true}}}' \
+  --fail-from-decoys "lookalike false usage history=usage history" \
+  --label guided --out /data/grounding_ops/e2e_guided.json
+```
 
 ### The box loop's options — per criterion
 

@@ -29,6 +29,11 @@ services:
     stop_grace_period: 900s
     environment:
       STORE_MODEL_IN_DB: "True"
+      # LiteLLM Enterprise license. The proxy reads it from its own
+      # environment at start (litellm/proxy/auth/litellm_license.py), not
+      # through litellm_config.yaml. Empty = unlicensed; see .env.example for
+      # what an empty value costs.
+      LITELLM_LICENSE: ${LITELLM_LICENSE:-}
       # Overflow hook for the chain aliases (hooks/overflow/, mounted below).
       # Defaults match hooks/settings.py, the one place the hooks read the
       # environment; see ai/litellm/LITELLM.md > Chain aliases.

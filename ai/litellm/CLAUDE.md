@@ -41,6 +41,7 @@ Also in the root `CLAUDE.md` § Cross-folder rules — read the named entry ther
 
 One line each; full detail in `.env.example` (LiteLLM block) and the `LITELLM.md` sections named. All are passed through the compose `environment:`; apply with `make up litellm`.
 
+- `LITELLM_LICENSE` (empty) — LiteLLM Enterprise key, read by the proxy itself at start (`litellm/proxy/auth/litellm_license.py`), not by `litellm_config.yaml`. Empty = unlicensed, but an empty value is still tried as a key (failed `license.litellm.ai` calls + an error line each start); unlicensed, enterprise-only features answer `403` (`LITELLM.md § Pass-through auth`).
 - `OVERFLOW_BUSY_AFTER_S` (`2`) — seconds `num_requests_waiting` > 0 before a backend is busy and dropped from chains; lower spills (to Claude, with both locals busy) sooner. `§ Tuning`.
 - `OVERFLOW_IDLE_AFTER_S` (`5`) — seconds the queue stays at 0 before a busy backend is used again; keep it above `OVERFLOW_BUSY_AFTER_S` (flapping).
 - `OVERFLOW_POLL_INTERVAL_S` / `OVERFLOW_PROBE_TIMEOUT_S` (`1` / `0.75`) — `/metrics` probe cadence (floor 0.2) and per-probe timeout; a failed probe = down; keep the timeout below the interval.

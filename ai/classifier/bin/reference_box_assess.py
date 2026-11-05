@@ -133,7 +133,8 @@ What it prints, per criterion: runs; for pairs with truth boxes the hit rate
 and false accepts (accepted, not a hit); for ``absent`` pairs the correct
 rate (nothing accepted) and wrong accepts; where wrong boxes landed; how often
 the loop ran, was shown examples, and was shown a FAIL example (of the runs
-that were sent one); the mean loop calls; unit errors; and with ``refine:
+that were sent one); the mean loop calls; unit errors, by kind (the error's text before its
+first colon, never the detail); and with ``refine:
 "marks"`` how many refines the marks pass made and how many fell back
 because the window held more OCR lines than the service's
 ``CLASSIFIER_LLM_BBOX_MARKS_MAX`` — the number that says whether 40 is
@@ -155,6 +156,7 @@ import pathlib
 import sys
 import time
 import zlib
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -392,9 +394,9 @@ def reference_form(spec: RefSpec, key: Optional[str], size: tuple[int, int]) -> 
 
 
 def error_kind(error: Any) -> Optional[str]:
-    """A reference's error, reduced to its kind: the text before the first
-    colon, at most 60 characters — never the rest, which may quote scores or
-    warnings."""
+    """A reference's or a unit's error, reduced to its kind: the text before
+    the first colon, at most 60 characters — never the rest, which may quote
+    scores, warnings or the model's answer."""
     if not error:
         return None
     return str(error).split(":", 1)[0].strip()[:60] or "error"
@@ -565,6 +567,7 @@ def score_entry(entry: Optional[dict], result: dict, label: str, truth_entry: ge
     used_reference = used.get("reference") or {}
     return {
         "status": entry.get("status"),
+        "error_kind": error_kind(entry.get("error")),
         "loop_ran": bool(attempts),
         "accepted": accepted is not None,
         "accepted_attempt": loc.get("accepted_attempt"),
@@ -643,7 +646,8 @@ def summarise(records: list[dict]) -> dict:
     """Per criterion and overall: hit rate and false accepts (pairs with
     truth boxes), correct rate and wrong accepts (``absent`` pairs), where
     wrong boxes landed, how often the loop ran / was guided / was shown a
-    FAIL (of the runs sent one), mean loop calls, unit errors."""
+    FAIL (of the runs sent one), mean loop calls, unit errors (and their
+    kinds)."""
 
     def block(rows: list[dict]) -> dict:
         present = [r for r in rows if r.get("expected") == "present"]
@@ -652,6 +656,10 @@ def summarise(records: list[dict]) -> dict:
         out: dict[str, Any] = {
             "n": len(rows),
             "errors": sum(1 for r in rows if r.get("status") != "ok"),
+            # A unit's error kind, or the status itself for a job that never
+            # finished (job_failed, job_timed_out) or a missing entry.
+            "error_kinds": dict(Counter(r.get("error_kind") or r.get("status")
+                                        for r in rows if r.get("status") != "ok")),
             "loop_ran_rate": round(ge._rate([r.get("loop_ran") for r in rows]), 3),
             "accepted_rate": round(ge._rate([r.get("accepted") for r in rows]), 3),
             "loop_guided_rate": round(ge._rate([
@@ -707,6 +715,9 @@ def print_summary(summary: dict, config: str) -> None:
         print(f"{name[:60]}: {row['n']} run(s), {row['errors']} error(s), loop ran "
               f"{pct(row['loop_ran_rate'])}, accepted {pct(row['accepted_rate'])}, "
               f"mean calls {row['mean_calls']}")
+        if row.get("error_kinds"):
+            print("    errors: " + ", ".join(f"{kind} ×{n}"
+                                          for kind, n in row["error_kinds"].items()))
         present = row.get("present")
         if present:
             print(f"    present ({present['n']}): hit {pct(present['hit_rate'])}, false accept "

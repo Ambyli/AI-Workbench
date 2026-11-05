@@ -946,9 +946,14 @@ LLM_BBOX_VERIFY_MIN_SPAN: float = min(
 # outlined example of the right thing is what fixes that; the verify crop has
 # the same blind spot. Calls per attempt are unchanged; each carries 1 +
 # examples images, and the ask loses the cross-criterion prefix cache. All
-# three off is exactly the loop without references. Off until measured with
-# bin/grounding_experiment.py (--truth, --reference-image) on the box; the
-# measured numbers go here and in API.md § The LLM enforcement loop.
+# three off is exactly the loop without references. Measured on real utility
+# bills (ZT-527): the three together took the amount due on the hardest pages
+# from 14% to 74% hit with no page that already passed made worse, and with a
+# FAIL reference of a look-alike chart the usage history's wrong boxes fell
+# from 98% to 7% on bills without the real chart; VERIFY alone made 5 passing
+# pages worse, so the three go on together. They stay OFF as service
+# defaults: a document opts in per criterion (options.reference.boxes).
+# Numbers: API.md § The LLM enforcement loop.
 REFERENCE_BOX_ASK: bool = _env_flag("CLASSIFIER_REFERENCE_BOX_ASK", "false")
 REFERENCE_BOX_REFINE: bool = _env_flag("CLASSIFIER_REFERENCE_BOX_REFINE", "false")
 REFERENCE_BOX_VERIFY: bool = _env_flag("CLASSIFIER_REFERENCE_BOX_VERIFY", "false")

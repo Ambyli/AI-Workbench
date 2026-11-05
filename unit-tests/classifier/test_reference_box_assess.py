@@ -384,6 +384,15 @@ def test_a_present_pair_hits_on_its_centre():
     assert missing["status"] == "missing" and missing["hit"] is None
 
 
+def test_a_unit_error_keeps_only_its_kind():
+    failed = {**_entry([]), "status": "error",
+              "error": "no JSON in response: the bill says $412.07 is due"}
+    scored = rba.score_entry(failed, _result(None), USAGE, TRUTH_C)
+    assert scored["error_kind"] == "no JSON in response"
+    assert "412" not in json.dumps(scored)
+    assert rba.score_entry(_entry([]), _result(None), USAGE, TRUTH_C)["error_kind"] is None
+
+
 def test_the_summary_keeps_present_and_absent_apart():
     def record(**kw):
         base = {"criterion": USAGE, "status": "ok", "loop_ran": True, "accepted": False,
@@ -407,7 +416,7 @@ def test_the_summary_keeps_present_and_absent_apart():
                                    "cap of 40"}, {"refine_mode": "grid", "marks_fallback":
                                                   "no OCR text line lies inside the window"}]
     row = rba.summarise(records)["per_criterion"][USAGE]
-    assert row["n"] == 5 and row["errors"] == 1
+    assert row["n"] == 5 and row["errors"] == 1 and row["error_kinds"] == {"job_failed": 1}
     assert row["marks_refined_rate"] == 0.333 and row["marks_over_cap"] == 1
     assert row["present"]["hit_rate"] == 0.5 and row["present"]["false_accept_rate"] == 0.5
     assert row["absent"] == {"n": 2, "correct_rate": 0.5, "wrong_accept_rate": 0.5,

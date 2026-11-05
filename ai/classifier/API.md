@@ -1772,9 +1772,19 @@ same number of calls**, but each guided call carries 1 + examples images:
   share theirs).
 * Each guided call holds its `max_concurrent` slot longer.
 
-Prompt tokens and seconds per call kind are measured by
-`bin/grounding_experiment.py` (*measurement pending — filled in from the
-box run before any knob defaults on*). After turning a knob on, watch
+Measured on muse-glimmer (`bin/grounding_experiment.py`, utility bills,
+one example per call), prompt tokens per call without → with examples:
+
+| Call | Without | With one example | Extra seconds |
+|---|---|---|---|
+| ask (composite) | ~1,300 | ~2,400 | +1 to 1.5 |
+| refine (region crop) | ~950–1,100 | ~1,250–1,350 | +0.1 to 0.5 |
+| verify (region crop) | ~200–430 | ~400–550 | +0.2 to 0.5 |
+| verify (composite, experiment only) | ~200–430 | ~1,350–1,550 | +0.3 to 0.6 |
+
+Guided runs need FEWER calls when the example helps: a box accepted on
+the first attempt saves the retries (the hard amount-due pages fell from
+8.1 calls per run to 3.9). After turning an option on, watch
 `classifier_llm_call_seconds{kind="ask"}` (and `refine` / `verify`).
 
 ### The position check
@@ -2534,27 +2544,72 @@ score the reference crop, which always shows the feature. So
 `CLASSIFIER_REFERENCE_BOX_VERIFY` goes on only if false accepts do not rise.
 What the loop is shown, the selection rules and the cost are in
 [§ What the model is shown](#what-the-model-is-shown-and-what-it-costs).
-The three knobs — the service defaults — stay off until measured; a
-criterion turns its own steps on with `options.reference.boxes`
+The three knobs are the service defaults and stay OFF; a criterion turns
+its own steps on with `options.reference.boxes`
 ([§ Turning the box-loop options on for a document](#turning-the-box-loop-options-on-for-a-document)).
 
-*Measurement — pending.* `bin/grounding_experiment.py --truth
-unit-tests/classifier/documents/grounding_truth.json --reference-image …` on
-the two bills (bill 1 → bill 2 and bill 2 → bill 1; different utilities, so
-this tests generalisation), five configurations (`off`, `ask`, `refine`,
-`verify`, `all`) × 5 repeats, asking the logo, the amount due and the
-account number. Per configuration: hit rate (accepted centre inside ANY copy
-of the criterion — header, payment slip or bill 2's right-hand page),
-false-accept rate, `bbox: null` rate, accepted rate, how often a missed logo
-landed on the `text naming the utility` decoy, and prompt tokens and seconds
-per call kind. The numbers and the knob defaults chosen from them go here.
-In the first run, the guided verify scored correct logos 1 against another
-utility's example. Its wording has since changed
-([§ What the model is shown](#what-the-model-is-shown-and-what-it-costs)),
-so measure the `verify` and `all` configs again, with `--verify-images crop`
-and with `composite`, reading the model's reasons in each record's `answers`.
+**Measured (ZT-527, muse-glimmer, November 2026).** Hit = the accepted
+box's centre inside a hand-reviewed truth box (any real copy); a "wrong box"
+is an accepted box that misses; for an item the page does not have, the
+right answer is no box. Every example came from ANOTHER project's page.
 
-**Placement aids — all off until measured.** A box-loop miss is either
+* **Two fixture bills, then a same-template pair** (`grounding_truth.json`;
+  logo, amount due, account number). Today's loop already found the logo
+  every time, so there was nothing to fix. The first guided-verify wording
+  ("what X looks like here") scored every correct logo 1 against another
+  utility's logo (0 of 20 accepted); reworded to "examples from OTHER
+  documents … score whether the CANDIDATE shows it", verify became neutral
+  (20 of 20). Composites in the verify matched crops at ~2.5× the tokens,
+  so the verify keeps crops.
+* **57 real utility bills** from the Operations Assistant deal-review queue
+  (the amount-due line and the usage-history chart, truth reviewed by hand,
+  `bin/grounding_experiment.py`). On the 7 amount-due pages the loop missed
+  more than half the time:
+
+  | Setup | Hit | Wrong box | Calls per run |
+  |---|---|---|---|
+  | Today (no examples) | 14% | 9% | 8.1 |
+  | `reference.boxes` (all three) | 74% | 0% | 4.4 |
+  | + `refine: "marks"` | 71% | 3% | 5.5 |
+  | + marks, `verify_partial`, `verify_min_span: 0.08` | 80% | 0% | 4.7 |
+  | + all four (adds `reference.text`) | 91% | 0% | 3.9 |
+
+  On the 84 pairs that already passed, the three reference steps together
+  made no page worse (amount due 95.6 → 98.9%, wrong boxes 3.3 → 0%);
+  VERIFY on its own made 5 pages worse, so the three go on together. Each
+  grounding option cost 1–4 points on those passing pages. On 9 bills
+  whose only chart is a look-alike (no real usage chart), the right answer
+  "not found" went 2% → 44% with references and **93%** with a FAIL
+  reference of the look-alike beside the PASS one.
+* **End to end through `POST /assess`** (`bin/reference_box_assess.py`:
+  stored references, key matching, per-criterion options), on the 57 bills
+  (3 repeats) and on a HOLDOUT of 21 bills never used for tuning (5
+  repeats), today's loop against the per-document setup below:
+
+  | | Holdout | 57 bills |
+  |---|---|---|
+  | Amount due: hit | 87.5 → **93.8%** | 83.3 → **95.5%** |
+  | Amount due: wrong box | 3.8 → 5.0% | 5.8 → 1.9% |
+  | Usage: hit (page has the chart) | 83.3 → 83.3% | 98.3 → 96.6% |
+  | Usage: wrong box | 16.7 → **3.3%** | 0 → 0% |
+  | Usage: right "not found" (no chart) | 100 → 100% | 50 → **100%** |
+  | Usage: box on the look-alike | 9.5 → 1.9% | 15.8 → **0%** |
+
+  The amount due with references but no marks scored 90.0% / 8.8% on the
+  holdout: references do the work, and marks do not hurt.
+
+**Defaults.** Every service default stays OFF; a document opts in per
+criterion. The measured setup: a one-line text field (the amount due) with
+`refine: "marks"` + `reference.boxes` (all three); a chart (the usage
+history) with `reference.boxes` (all three, no marks) + a FAIL reference of
+each look-alike. `verify_partial`, `verify_min_span` and `reference.text`
+stay off: no consistent gain end to end (`reference.text` lifted the
+hardest pages, 80 → 91%, but cost a little on pages that already worked).
+Small sets: read a few points either way as noise; the large moves (wrong
+usage boxes, look-alike landings, the hard amount-due pages) held in every
+run.
+
+**Placement aids — all off by default** (measured above). A box-loop miss is either
 *placement* (the right thing, but the box is a few pixels off or too tight: a
 thin text line 15 px off, `$193.33` boxed without its `Amount due` label) or
 *identification* (the wrong thing boxed). Reference examples can only help
@@ -3067,12 +3122,16 @@ The recipe, per document type (a utility bill, a permit, a proposal):
 3. **Pick the options per field:**
    * **A one-line text field** — an amount due, an account number, a due
      date: `refine: "marks"` (the box becomes the OCR lines the model
-     picks, label and value together, so it fits the text),
-     `verify_min_span: 0.08` (the verify crop keeps the label beside the
-     number), `verify_partial: true` (a crop that cut off a digit is
-     retried in the same place, larger), and `reference.boxes` with
-     `reference.text: true` (on a page full of numbers, the example — and
-     its quoted text — says WHICH one).
+     picks, label and value together, so it fits the text) and
+     `reference.boxes` with all three steps (on a page full of numbers,
+     the example says WHICH one). That is the measured setup (amount due,
+     end to end: 83–88% → 94–96% hit). For a field that is still hard to
+     identify, add `reference.text: true` (the example's own words in its
+     caption), `verify_min_span: 0.08` (the verify crop keeps the label
+     beside the number) and `verify_partial: true` (a crop that cut off a
+     digit is retried in the same place, larger): together they lifted the
+     hardest pages 80 → 91% but cost 1–4 points on pages that already
+     worked, so they stay off unless needed.
    * **A picture** — a usage chart, a logo, a stamp, a signature: leave
      `refine` on the grid, and turn `reference.boxes` on. Marks numbers OCR
      text LINES; a chart is not one, so the model can only pick its axis
@@ -3085,7 +3144,7 @@ The recipe, per document type (a utility bill, a permit, a proposal):
    `marks`, `verify_partial`). The measurements behind this recipe are in
    [§ The LLM enforcement loop](#the-llm-enforcement-loop).
 
-An amount due — every aid on:
+An amount due — the measured setup (marks + the three reference steps):
 
 ```json
 {
@@ -3099,11 +3158,8 @@ An amount due — every aid on:
         "hint": "presence",
         "boxes": true,
         "refine": "marks",
-        "verify_partial": true,
-        "verify_min_span": 0.08,
         "reference": {
-          "boxes": {"ask": true, "refine": true, "verify": true},
-          "text": true
+          "boxes": {"ask": true, "refine": true, "verify": true}
         }
       }
     }
@@ -3111,7 +3167,12 @@ An amount due — every aid on:
 }
 ```
 
-A usage chart — examples, no marks, and a FAIL reference of a look-alike
+For a field that is still hard to identify, add `"verify_partial": true`
+and `"verify_min_span": 0.08` beside `refine`, and `"text": true` inside
+`reference`.
+
+A usage chart — the measured setup (the three reference steps, no marks)
+and a FAIL reference of a look-alike
 (`r0f9e8d7c6b5a`) beside the PASS one (`r1a2b3c4d5e6f`):
 
 ```json
@@ -3125,7 +3186,9 @@ A usage chart — examples, no marks, and a FAIL reference of a look-alike
       "options": {
         "hint": "presence",
         "boxes": true,
-        "reference": {"boxes": {"ask": true, "verify": true}}
+        "reference": {
+          "boxes": {"ask": true, "refine": true, "verify": true}
+        }
       }
     }
   ]

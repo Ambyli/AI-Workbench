@@ -11,7 +11,11 @@ Two halves:
     ``options.reference`` dropped when a job has no references); the
     ``--key`` / ``--options`` matching; scoring one criterion of a job result
     (hit, absent, ``landed_on``, what the loop was shown, no
-    ``verify_reason``); the summary;
+    ``verify_reason``, ``marks_lines`` kept); the summary (``marks_lines``
+    per tier, ``sent_as``, ``size_mismatch`` counted and left out of every
+    rate); ``--pdf-dir`` (each page's PDF by its stem, one page only,
+    ``application/pdf``, a PDF read at another size than the JPG a
+    ``size_mismatch``);
   * END TO END, in process: the real app (its queue, stores and routes —
     Postgres, like ``test_references_assess.py``) driven by the script's own
     ``main`` through a ``TestClient``, the model scripted at
@@ -25,7 +29,10 @@ Two halves:
     FAIL, says "not found" on the absent page — CORRECT — and, in the
     ``--no-references`` baseline, boxes the look-alike — WRONG, landed on
     the decoy; and everything (jobs, creation jobs, references) is deleted
-    afterwards, an error mid-run included.
+    afterwards, an error mid-run included. And ``--pdf-dir`` end to end: a
+    digital invoice sent as its PDF is numbered from its own lines
+    (``marks_lines: native``), a PDF of another size is a ``size_mismatch``,
+    a page without one goes as the image.
 
 Run with::
 
@@ -411,18 +418,120 @@ def test_the_summary_keeps_present_and_absent_apart():
         record(status="job_failed", loop_ran=False, calls=0, loop_references=None),
     ]
     records[0]["attempt_log"] = [
-        {"refine_mode": "marks"}, {"refine_mode": "grid", "marks_fallback":
-                                   "93 OCR text lines lie inside the refine window, over the "
-                                   "cap of 40"}, {"refine_mode": "grid", "marks_fallback":
-                                                  "no OCR text line lies inside the window"}]
+        {"refine_mode": "marks", "marks_lines": "native"},
+        {"refine_mode": "grid", "marks_fallback":
+         "93 native text lines lie inside the refine window, over the cap of 40"},
+        {"refine_mode": "grid", "marks_lines": "ocr", "marks_fallback":
+         "the model answered marks: null — none of the marked lines is the feature"},
+        {"refine_mode": "marks", "marks_lines": "native"}]
     row = rba.summarise(records)["per_criterion"][USAGE]
     assert row["n"] == 5 and row["errors"] == 1 and row["error_kinds"] == {"job_failed": 1}
-    assert row["marks_refined_rate"] == 0.333 and row["marks_over_cap"] == 1
+    assert row["marks_refined_rate"] == 0.5 and row["marks_over_cap"] == 1
+    # Which lines each marks CALL numbered — a call whose answer fell back
+    # still counts; an over-cap fallback made no call.
+    assert row["marks_lines"] == {"native": 2, "ocr": 1}
+    assert row["size_mismatch"] == 0 and row["sent_as"] == {"image": 5}
     assert row["present"]["hit_rate"] == 0.5 and row["present"]["false_accept_rate"] == 0.5
     assert row["absent"] == {"n": 2, "correct_rate": 0.5, "wrong_accept_rate": 0.5,
                              "bbox_null_rate": 0.5, "landed_on_rates": {LOOKALIKE: 0.5}}
     assert row["fail_sent"] == 2 and row["fail_reached_of_sent"] == 0.5
     rba.print_summary(rba.summarise(records), "guided")            # prints, never raises
+
+
+# ---------------------------------------------------------------------------
+# --pdf-dir: the page sent as its PDF, scored in the JPG's frame
+# ---------------------------------------------------------------------------
+
+
+def test_the_attempt_log_keeps_marks_lines():
+    attempt = {"attempt": 1, "bbox_px": [120.0, 120.0, 280.0, 240.0], "accepted": True,
+               "refine_mode": "marks", "marks_shown": 5, "marks_lines": "native", "marks": [1],
+               "verify_reason": "never copied"}
+    scored = rba.score_entry(_entry([attempt]), _result(None), USAGE, TRUTH_C)
+    assert scored["attempt_log"] == [{k: v for k, v in attempt.items() if k != "verify_reason"}]
+    assert "marks_lines" in rba._ATTEMPT_KEYS
+
+
+def test_a_pdf_read_at_another_size_is_a_size_mismatch():
+    hit = {"attempt": 1, "bbox_px": [120.0, 120.0, 280.0, 240.0], "accepted": True}
+    per = {"status": "ok", "localization": {"attempts": [hit], "accepted_attempt": 1,
+                                            "calls": 2}}
+
+    def result(width, height):
+        return {"page_geometry": [{"item": 0, "width": width, "height": height}],
+                "assessment": {"per_criterion_scores": {USAGE: per}}}
+
+    truth = {"c.jpg": TRUTH_C}
+    pdf = rba.JobSpec("c.jpg", 1, [USAGE], job_id="j1", sent_as="pdf")
+    # The PDF read at the JPG's size: scored as any job is.
+    (same,) = rba.job_records(pdf, result(400, 300), truth, {}, "pdf", truth_size=(400, 300))
+    assert (same["sent_as"], same["status"], same["hit"]) == ("pdf", "ok", True)
+    assert "page_size" not in same
+    # At another size: neither a hit nor a miss, both sizes beside it, the
+    # loop's record kept.
+    (other,) = rba.job_records(pdf, result(1240, 1755), truth, {}, "pdf",
+                               truth_size=(400, 300))
+    assert other["status"] == "size_mismatch"
+    assert (other["expected"], other["hit"], other["correct"], other["iou"]) == (
+        None, None, None, None)
+    assert (other["page_size"], other["truth_size"]) == ([1240, 1755], [400, 300])
+    assert other["attempt_log"][0]["bbox_px"] == hit["bbox_px"]
+    # An image job is never checked: its truth IS its frame.
+    image = rba.JobSpec("c.jpg", 1, [USAGE], job_id="j2")
+    (plain,) = rba.job_records(image, result(1240, 1755), truth, {}, "x", truth_size=(400, 300))
+    assert (plain["sent_as"], plain["status"]) == ("image", "ok")
+    (failed,) = rba.failed_job_records(pdf, "failed", {}, "pdf")
+    assert failed["sent_as"] == "pdf"
+
+
+def test_size_mismatches_are_counted_and_left_out_of_every_rate():
+    def record(**kw):
+        base = {"criterion": AMOUNT, "status": "ok", "loop_ran": True, "accepted": True,
+                "calls": 3, "fail_reached": False, "bbox_null": False, "landed_on": None,
+                "hit": True, "correct": None, "iou": 0.9, "expected": "present",
+                "loop_references": None, "fail_reference": {"id": None}, "sent_as": "pdf",
+                "attempt_log": [{"refine_mode": "marks", "marks_lines": "native"}]}
+        return {**base, **kw}
+
+    records = [
+        record(),
+        record(sent_as="image", hit=False, attempt_log=[
+            {"refine_mode": "marks", "marks_lines": "ocr"}]),
+        record(status="size_mismatch", expected=None, hit=None, iou=None),
+        record(status="size_mismatch", expected=None, hit=None, iou=None),
+    ]
+    summary = rba.summarise(records)
+    for row in (summary["per_criterion"][AMOUNT], summary["overall"]):
+        assert row["n"] == 2 and row["size_mismatch"] == 2 and row["errors"] == 0
+        assert row["sent_as"] == {"image": 1, "pdf": 1}
+        assert row["present"]["n"] == 2 and row["present"]["hit_rate"] == 0.5
+        assert row["marks_lines"] == {"native": 1, "ocr": 1}       # mismatches not counted
+    rba.print_summary(summary, "pdf")                                 # prints, never raises
+
+
+def test_pdf_pages_finds_each_pages_pdf_by_its_stem(tmp_path):
+    pdfs = tmp_path / "pdfs"
+    pdfs.mkdir()
+    shutil.copyfile(DOCS / "invoice_native.pdf", pdfs / "bill-1.pdf")
+    shutil.copyfile(DOCS / "invoice_native.pdf", pdfs / "bill-2.PDF.pdf")
+    found = rba.pdf_pages(pdfs, ["bill-1.jpg", "bill-2.PDF.jpg", "bill-3.jpg"])
+    assert found == {"bill-1.jpg": pdfs / "bill-1.pdf", "bill-2.PDF.jpg": pdfs / "bill-2.PDF.pdf"}
+    assert rba.pdf_pages(pdfs, []) == {}
+    # One page each, or nothing is created; a directory that is not there.
+    shutil.copyfile(DOCS / "invoice_two_page.pdf", pdfs / "bill-3.pdf")
+    with pytest.raises(SystemExit, match="has 2 pages"):
+        rba.pdf_pages(pdfs, ["bill-3.jpg"])
+    (pdfs / "bill-4.pdf").write_bytes(b"not a pdf")
+    with pytest.raises(SystemExit, match="does not open"):
+        rba.pdf_pages(pdfs, ["bill-4.jpg"])
+    with pytest.raises(SystemExit, match="not a directory"):
+        rba.pdf_pages(tmp_path / "missing", ["bill-1.jpg"])
+
+
+def test_a_pdf_goes_as_application_pdf():
+    assert rba._content_type("bill-1.pdf") == "application/pdf"
+    assert rba._content_type("bill-1.JPG") == "image/jpeg"
+    assert rba.build_parser().parse_args(["--pdf-dir", "x"]).pdf_dir == "x"
 
 
 # ---------------------------------------------------------------------------
@@ -707,3 +816,99 @@ def _subset(tmp) -> pathlib.Path:
     path = tmp / "subset.json"
     path.write_text(json.dumps({"b.jpg": [USAGE]}), encoding="utf-8")
     return path
+
+
+class MarksModel(PageModel):
+    """``PageModel`` that also answers the marks refine: mark 1."""
+
+    async def __call__(self, prompt):
+        if "numbered marks" in prompt["messages"][0]["content"]:
+            self.calls.append(("marks", prompt))
+            body = {"reason": "scripted", "marks": [1]}
+            return {"choices": [{"message": {"content": json.dumps(body)}}]}
+        return await super().__call__(prompt)
+
+
+def test_end_to_end_pdf_pages_are_sent_as_pdfs_and_numbered_from_their_own_lines(
+    client, tmp_path, monkeypatch, capsys
+):
+    """``--pdf-dir`` through the real app, with the amount due on marks:
+
+      * ``inv.jpg`` — a JPG render of the repo's digital invoice at the
+        service's 150 dpi — goes as ``inv.pdf``: read at the JPG's size, so
+        it is scored, and its marks are the PDF's OWN lines (``marks_lines:
+        native``, no fallback) — the plan's end-to-end case;
+      * ``letter.png`` goes as ``letter.pdf`` (the invoice again), read at
+        another size than the letter the truth is in: ``size_mismatch``,
+        counted, scored as nothing;
+      * ``plain.png`` has no PDF: sent as the image; a photo with no OCR
+        engine in the session falls back to the grid, every tier named.
+    """
+    import cv2
+
+    from common.documents import load_document
+    from llm import boxes as llm_boxes
+    from llm import client as llm_client
+
+    invoice = (DOCS / "invoice_native.pdf").read_bytes()
+    images, pdfs = tmp_path / "images", tmp_path / "pdfs"
+    images.mkdir()
+    pdfs.mkdir()
+    render = load_document(invoice, "invoice_native.pdf").pages[0].image_bgr
+    (images / "inv.jpg").write_bytes(cv2.imencode(".jpg", render)[1].tobytes())
+    shutil.copyfile(DOCS / "photo_of_letter.png", images / "letter.png")
+    shutil.copyfile(DOCS / "photo_of_letter.png", images / "plain.png")
+    (pdfs / "inv.pdf").write_bytes(invoice)
+    (pdfs / "letter.pdf").write_bytes(invoice)
+    # The truth: the ask's refine window (the scripted ask boxes [150, 120,
+    # 350, 180] on the page grid → window [0, 50, 500, 250]), so mark 1 —
+    # the window's first line — is a hit.
+    sizes = {"inv.jpg": (1240, 1755), "letter.png": (1000, 1300), "plain.png": (1000, 1300)}
+    assert rba.image_size((images / "inv.jpg").read_bytes()) == sizes["inv.jpg"]
+    truth = tmp_path / "truth.json"
+    truth.write_text(json.dumps({
+        name: {"criteria": {AMOUNT: [_px([0, 50, 500, 250], size)]}}
+        for name, size in sizes.items()}), encoding="utf-8")
+    model = MarksModel()
+    monkeypatch.setattr(llm_client, "_send", model)
+    monkeypatch.setattr(llm_boxes, "LLM_BBOX_REFINE", True)
+
+    out = tmp_path / "pdf.json"
+    summary = rba.main([
+        "--images", str(images), "--truth", str(truth), "--repeats", "1", "--poll", "0.05",
+        "--timeout", "120", "--no-references", "--pdf-dir", str(pdfs),
+        "--options", 'total the customer owes={"refine":"marks"}',
+        "--label", "pdf", "--out", str(out)], client=client)
+    report = json.loads(out.read_text(encoding="utf-8"))
+    assert report["complete"] is True and report["config"]["pdf_dir"] == str(pdfs)
+    by_image = {r["image"]: r for r in report["records"]}
+    assert {i: r["sent_as"] for i, r in by_image.items()} == {
+        "inv.jpg": "pdf", "letter.png": "pdf", "plain.png": "image"}
+
+    inv = by_image["inv.jpg"]
+    assert (inv["status"], inv["expected"], inv["hit"]) == ("ok", "present", True)
+    (attempt,) = inv["attempt_log"]
+    assert (attempt["refine_mode"], attempt["marks_lines"], attempt["marks"]) == (
+        "marks", "native", [1])
+    assert "marks_fallback" not in attempt
+
+    letter = by_image["letter.png"]
+    assert (letter["status"], letter["hit"], letter["expected"]) == ("size_mismatch", None, None)
+    assert (letter["page_size"], letter["truth_size"]) == ([1240, 1755], [1000, 1300])
+
+    plain = by_image["plain.png"]
+    assert plain["status"] == "ok" and plain["expected"] == "present"
+    (attempt,) = plain["attempt_log"]
+    assert attempt["refine_mode"] == "grid" and "marks_lines" not in attempt
+    assert attempt["marks_fallback"].endswith(
+        "window OCR: unavailable — no OCR engine, or the pass failed)")
+
+    row = summary["per_criterion"][AMOUNT]
+    assert (row["n"], row["size_mismatch"], row["sent_as"]) == (2, 1, {"image": 1, "pdf": 1})
+    assert row["marks_lines"] == {"native": 1} and row["marks_refined_rate"] == 0.5
+    printed = capsys.readouterr().out
+    assert "pdfs    : 2 of 3 page(s) sent as their PDF" in printed
+    assert "1 more left out as size_mismatch" in printed
+    assert "marks calls by lines: native ×1" in printed
+    for job_id in {r["job_id"] for r in report["records"]}:
+        assert client.get(f"/jobs/{job_id}").status_code == 404

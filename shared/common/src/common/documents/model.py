@@ -8,7 +8,14 @@ which may carry
   * a rasterised image (BGR numpy array) — always for image/PDF/SVG kinds,
     never for txt/docx, which have no rendered surface, and
   * a text layer — native (PDF text objects, SVG ``<text>``, .txt bytes,
-    .docx runs), OCR'd (filled in later by ``ocr.apply_ocr``), or absent.
+    .docx runs), OCR'd (filled in later by ``ocr.apply_ocr``), or absent, and
+  * line GEOMETRY of two kinds that must not be confused: ``ocr_lines``, the
+    recogniser's lines, which ARE the text (``text`` is exactly their
+    ``"\\n".join``, so a character offset maps back to a polygon), and
+    ``native_lines``, a PDF / SVG page's own text lines as PyMuPDF places
+    them — exact boxes, but NOT aligned to ``text`` (PyMuPDF's reading-order
+    text is not the words re-joined), so nothing that maps offsets may read
+    them. The classifier's box loop numbers them (its marks refine).
 
 Downstream code therefore never branches on the upload's file type: it asks
 ``document.page_images()`` for something to run OpenCV or a vision model on,
@@ -58,6 +65,21 @@ class Page:
                         locate=True)`` map a character offset back to the
                         polygon it was recognised from, so a text hit can be
                         drawn on the page instead of merely counted.
+        native_lines:   A PDF or SVG page's own text lines, as the loader
+                        measured them from PyMuPDF's word boxes
+                        (``loaders._native_lines``) — ``{"text", "box"}``,
+                        ``box`` a 4-point polygon in THIS page's image
+                        pixels (the frame ``ocr_lines`` uses, ``/Rotate``
+                        applied), in reading order. Empty for every other
+                        kind, for a page with no native words (a scan), and
+                        when the measurement failed. GEOMETRY ONLY: unlike
+                        ``ocr_lines`` they are NOT aligned to ``text`` — the
+                        native ``text`` is PyMuPDF's reading-order string,
+                        not these lines re-joined — so ``match_text``'s
+                        offset → polygon mapping must never read them, and
+                        they never go into ``ocr_lines``. They describe the
+                        page, not a text layer: an OCR layer of the same
+                        page carries them too (``TextLayer.native_lines``).
     """
 
     index: int
@@ -68,6 +90,7 @@ class Page:
     width: int = 0
     height: int = 0
     ocr_lines: list[dict] = field(default_factory=list)
+    native_lines: list[dict] = field(default_factory=list)
 
     def has_image(self) -> bool:
         """True when this page carries a rasterised image."""
@@ -202,6 +225,13 @@ class TextLayer:
                     ``text == "\\n".join(line["text"] ...)`` exactly as
                     ``apply_ocr`` guarantees for ``Page.ocr_lines``. Empty for
                     native text.
+        native_lines: The page's own PDF / SVG text lines
+                    (``Page.native_lines``: ``{"text", "box"}``, image
+                    pixels) — whatever this layer's text source, because the
+                    geometry belongs to the page, not to how its text was
+                    read: an OCR layer of a digital PDF carries them as the
+                    native layer does. Geometry only, never aligned to
+                    ``text``; nothing that maps a text offset reads them.
     """
 
     page: int
@@ -209,6 +239,7 @@ class TextLayer:
     source: TextSource = "none"
     confidence: Optional[float] = None
     lines: list[dict] = field(default_factory=list)
+    native_lines: list[dict] = field(default_factory=list)
 
     @classmethod
     def of_page(cls, page: Page) -> "TextLayer":
@@ -219,6 +250,7 @@ class TextLayer:
             source=page.text_source,
             confidence=page.ocr_confidence,
             lines=list(page.ocr_lines),
+            native_lines=list(page.native_lines),
         )
 
     def chars(self) -> int:
@@ -226,7 +258,9 @@ class TextLayer:
         return len(self.text.strip())
 
     def as_dict(self) -> dict[str, Any]:
-        """JSON-safe summary (no line polygons — those belong in regions)."""
+        """JSON-safe summary (no line polygons — those belong in regions;
+        ``native_lines`` are not counted either, so the summary — the
+        classifier's ``document_info`` — is the same with or without them)."""
         return {
             "page": self.page,
             "source": self.source,
@@ -240,7 +274,9 @@ def page_with_layer(page: Page, layer: Optional[TextLayer]) -> Page:
     """A shallow copy of ``page`` carrying ``layer`` as its text.
 
     The image array is SHARED, not copied — a view costs a dataclass, not a
-    page render. ``None`` returns the page itself.
+    page render. ``None`` returns the page itself. ``native_lines`` are the
+    page's own (``replace`` keeps them): they are the same whichever layer
+    the view carries.
     """
     if layer is None:
         return page

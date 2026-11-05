@@ -449,7 +449,8 @@ class LLMOptions(_Options):
         default=None,
         description=(
             "How the loop's refine pass asks. 'grid': the zoomed crop with its own "
-            "grid, a box on it. 'marks': every OCR text line in the window outlined "
+            "grid, a box on it. 'marks': every text line in the window (a digital "
+            "PDF's own, else the OCR layer's, else an OCR pass of the window) outlined "
             "and numbered, 'which mark(s)?', the box the union of those lines — "
             "exact on a text field (an amount due), wrong for a chart or a logo "
             "(it picks text lines); falls back to the grid (one more call) when the "
@@ -938,8 +939,8 @@ def criterion_types() -> dict[str, Any]:
                 "reference.boxes": ReferenceBoxes().resolve(),
                 "reference.text": REFERENCE_BOX_TEXT,
             },
-            # Service-wide on purpose: a window with more OCR lines than this
-            # refines on the grid instead of the marks.
+            # Service-wide on purpose: a window with more text lines than this
+            # (in the marks tier it reached) refines on the grid instead.
             "marks_max": LLM_BBOX_MARKS_MAX,
             "score": "never changes a score or a verdict — the loop runs after scoring",
         },

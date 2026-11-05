@@ -325,7 +325,9 @@ repeat), with the numbers above per run, and — to say WHY, not just how often:
                     sentence the retry is told), as ``localization.attempts``
                     has them — with the aids on, ``refine_mode``, ``marks``
                     (the chosen mark numbers), ``marks_shown``,
-                    ``marks_fallback`` and ``verify_partial`` too.
+                    ``marks_lines`` (always ``ocr`` here: the script hands
+                    the loop each image's OCR lines and no PDF or window
+                    tier), ``marks_fallback`` and ``verify_partial`` too.
     answers         every model request of the run in call order, as the
                     model answered it: ``{kind: ask | refine | verify,
                     attempt, request, bbox (ask / grid refine) | marks (marks

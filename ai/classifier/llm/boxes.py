@@ -25,17 +25,23 @@ claim, not a measurement, so nothing here trusts one:
              both are recorded (``coarse_bbox_grid``, ``refined``).
              MARKS MODE (``refine_mode="marks"``, a criterion's
              ``options.refine``): the same crop, but
-             instead of the grid every OCR text line inside the window
-             (``text_lines``, the criterion's own text layer, ORIGINAL page
-             pixels) is outlined and numbered (common.vision
-             .draw_marks_overlay), and the model says which mark(s) are the
-             feature (llm.prompts.build_marks_prompt); the refined box is
-             the union of those lines' boxes, so it fits the text exactly —
-             a placement the model cannot get a few pixels wrong. The grid
-             refine runs instead when the page has no line boxes, the
-             window holds none (a logo) or more than LLM_BBOX_MARKS_MAX, or
-             the answer is unusable or ``null``; the attempt records which
-             (``refine_mode``, ``marks``, ``marks_shown``,
+             instead of the grid every text line inside the window is
+             outlined and numbered (common.vision.draw_marks_overlay), and
+             the model says which mark(s) are the feature
+             (llm.prompts.build_marks_prompt); the refined box is the union
+             of those lines' boxes, so it fits the text exactly — a
+             placement the model cannot get a few pixels wrong. The lines
+             come from the FIRST of three tiers with one inside the window
+             (``marks_lines``, ORIGINAL page pixels each): a digital PDF /
+             SVG page's own lines (``native_lines``, exact, no OCR), the
+             criterion's OCR text layer (``text_lines``), then an OCR pass
+             of the window alone (``window_lines``, injected — a mixed PDF
+             whose native header kept ``ocr: "auto"`` from reading the
+             page). The grid refine runs instead when no tier has a line in
+             the window (a logo), the chosen tier holds more than
+             LLM_BBOX_MARKS_MAX there, or the answer is unusable or
+             ``null``; the attempt records which (``refine_mode``,
+             ``marks``, ``marks_shown``, ``marks_lines``,
              ``marks_fallback``).
     verify    crop that box out of the ORIGINAL page (+LLM_BBOX_CROP_PAD on
              each side, grown to at least ``verify_min_span`` of the page
@@ -75,6 +81,12 @@ module-level defaults below (LLM_BBOX_REFINE_MODE, LLM_BBOX_VERIFY_PARTIAL,
 LLM_BBOX_VERIFY_MIN_SPAN, REFERENCE_BOX_ASK / _REFINE / _VERIFY) are read
 here only when a DIRECT caller leaves a keyword out —
 ``bin/grounding_experiment.py``. LLM_BBOX_MARKS_MAX stays service-wide.
+
+**Never ``analysis``.** The marks pass's window OCR is a callable the
+service hands in (``window_lines``, ``analysis.context.DocumentContext
+.window_lines``: the OCR engine, the OCR limit and its failures live
+there); the loop only awaits it, and a callable that raises is a grid
+fallback, never a failed unit.
 
 **Reference examples** (ZT-527), when the request lists references that
 guide the criterion, ride along in the same calls — never extra calls —
@@ -135,7 +147,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from common.vision import (
     PageGeometry,
@@ -179,6 +191,17 @@ from llm.models import ModelSpec
 from logger import logger
 from metrics import llm_bbox_attempts
 
+# The marks pass's window OCR, injected by the service (``analysis.context
+# .DocumentContext.window_lines``): a rect ``(left, top, right, bottom)`` in
+# ORIGINAL page pixels → the text lines recognised inside it, their boxes in
+# the same pixels, or None when there is no engine or the pass failed.
+WindowLines = Callable[[tuple[int, int, int, int]], Awaitable[Optional[list[dict]]]]
+
+# The marks pass's line sources, in the order it tries them: the name it
+# records as ``marks_lines``, and how its fallback sentences say "<n> … text
+# lines" of it.
+MARKS_TIERS = {"native": "native", "ocr": "OCR", "window": "window-OCR"}
+
 
 # ---------------------------------------------------------------------------
 # The record of one attempt
@@ -215,6 +238,11 @@ class BoxAttempt:
                        when the marks pass produced the box. Ids only — the
                        lines' text is never recorded here.
         marks_shown:   How many marks the marks call drew (none made: None).
+        marks_lines:   Which tier those marks were (``MARKS_TIERS``):
+                       ``"native"`` (the PDF / SVG page's own lines),
+                       ``"ocr"`` (the criterion's OCR text layer) or
+                       ``"window"`` (an OCR pass of the window alone) — set
+                       whenever a marks call was made, None otherwise.
         marks_fallback: Why the grid refine ran instead of the marks.
         verify_partial: The verify's ``partial`` answer (the crop cut the
                        feature off) — only with ``verify_partial``, and
@@ -241,6 +269,7 @@ class BoxAttempt:
     refine_mode: Optional[str] = None
     marks: Optional[list[int]] = None
     marks_shown: Optional[int] = None
+    marks_lines: Optional[str] = None
     marks_fallback: Optional[str] = None
     verify_partial: Optional[bool] = None
 
@@ -283,6 +312,8 @@ class BoxAttempt:
                 out["refine_mode"] = self.refine_mode
                 if self.marks_shown is not None:
                     out["marks_shown"] = self.marks_shown
+                if self.marks_lines:
+                    out["marks_lines"] = self.marks_lines
                 if self.marks:
                     out["marks"] = list(self.marks)
                 if self.marks_fallback:
@@ -607,6 +638,8 @@ async def locate_criterion(
     marks_max: Optional[int] = None,
     verify_partial: Optional[bool] = None,
     verify_min_span: Optional[float] = None,
+    native_lines: Optional[list[dict]] = None,
+    window_lines: Optional[WindowLines] = None,
 ) -> tuple[list[Region], Localization]:
     """Run the full ask → validate → refine → verify → retry loop for one criterion.
 
@@ -663,17 +696,31 @@ async def locate_criterion(
         text_lines:       The page's OCR text lines — ``common.documents
                           .TextLayer.lines``, ``{"text", "confidence",
                           "box"}`` with ``box`` a 4-point polygon in ORIGINAL
-                          page pixels — for the marks refine. ``analysis
-                          .llm_eval`` passes the layer the criterion's
-                          ``options.ocr`` produced (no extra OCR pass). None
-                          → no marks (the grid refine, noted in marks mode).
+                          page pixels — the marks refine's SECOND tier.
+                          ``analysis.llm_eval`` passes the layer the
+                          criterion's ``options.ocr`` produced (no extra OCR
+                          pass); empty for a native layer. None → the tier
+                          is skipped (noted if marks falls back).
         refine_mode:      ``"grid"`` | ``"marks"`` — the service passes the
                           criterion's resolved ``options.refine`` (default,
                           for a direct caller, LLM_BBOX_REFINE_MODE; anything
                           else is grid).
         marks_max:        Most marks one marks call may show (default
-                          LLM_BBOX_MARKS_MAX, service-wide); more → the grid
-                          refine.
+                          LLM_BBOX_MARKS_MAX, service-wide); more in the
+                          chosen tier → the grid refine.
+        native_lines:     The page's own PDF / SVG text lines —
+                          ``TextLayer.native_lines``, ``{"text", "box"}``,
+                          ORIGINAL page pixels, exact — the marks refine's
+                          FIRST tier. Empty for a photo or a scan. Read
+                          only in marks mode.
+        window_lines:     The marks refine's THIRD tier: an async callable
+                          ``rect → lines | None`` (``WindowLines``) that
+                          OCRs just the refine window, ``rect`` and the
+                          lines in ORIGINAL page pixels. Awaited only when
+                          neither earlier tier has a line in the window;
+                          None (``options.ocr: "never"``, a direct caller)
+                          → the tier is off. Its None, or an exception, is
+                          a grid fallback, never a failed unit.
         verify_partial:   Ask the verify whether the crop cuts the feature
                           off — ``options.verify_partial`` (direct-caller
                           default LLM_BBOX_VERIFY_PARTIAL).
@@ -803,7 +850,8 @@ async def locate_criterion(
                     marked = await _refine_by_marks(
                         attempt, loc, name, number, crop=crop, window=window,
                         image_shape=original_image.shape, geometry=geometry,
-                        text_lines=text_lines, marks_max=int(marks_max),
+                        text_lines=text_lines, native_lines=native_lines,
+                        window_lines=window_lines, marks_max=int(marks_max),
                         feedback=list(feedback), shown=shown_refine, model=model,
                     )
                 if not marked:
@@ -1068,71 +1116,73 @@ async def _refine_by_marks(
     feedback: list[str],
     shown: list[prompts.BoxExample],
     model: Optional[ModelSpec],
+    native_lines: Optional[list[dict]] = None,
+    window_lines: Optional[WindowLines] = None,
 ) -> bool:
     """The marks refine. True when it set the attempt's box; False when the
     grid refine must run instead, with ``marks_fallback`` saying why.
 
-    The OCR lines mostly inside the window (``lines_in_window``, ORIGINAL
-    pixels) are numbered in reading order, mapped onto ``crop``
-    (``to_crop_px``) and drawn there (``draw_marks_overlay``); the model's
-    chosen numbers (``parse_marks``) pick lines whose UNION, in original
-    pixels, is the refined box — clamped to the page for ``bbox_px``, and
-    converted to the page grid for ``bbox_grid``. One call, made only when
-    there is something to mark and not too much of it.
+    The lines of the first tier with any mostly inside the window
+    (``marks_lines_in``: native, then the OCR layer, then window OCR;
+    ``lines_in_window``, ORIGINAL pixels) are numbered in reading order,
+    mapped onto ``crop`` (``to_crop_px``) and drawn there
+    (``draw_marks_overlay``); the model's chosen numbers (``parse_marks``)
+    pick lines whose UNION, in original pixels, is the refined box —
+    clamped to the page for ``bbox_px``, and converted to the page grid for
+    ``bbox_grid``. One call, made only when there is something to mark and
+    not too much of it; ``marks_lines`` records the tier it marked.
+
+    A tier over ``marks_max`` falls back to the grid; the next tier is NOT
+    tried: it reads the same text in the same window, so it would find as
+    many lines — and the window tier would spend an OCR pass to learn it.
     """
     attempt.refine_mode = "marks"
-    why: Optional[str] = None
-    if text_lines is None:
-        why = "no text lines were given for the marks pass"
-    else:
-        lines = [b for b in (line_bounds(line) for line in text_lines) if b is not None]
-        rect = window_rect(window, image_shape)
-        inside = lines_in_window(lines, rect)
-        if not lines:
-            why = "the page's text layer has no line boxes (native text, or OCR found none)"
-        elif not inside:
-            why = "no OCR text line lies inside the refine window"
-        elif len(inside) > marks_max:
-            why = (
-                f"{len(inside)} OCR text lines lie inside the refine window, over the cap "
-                f"of {marks_max}"
-            )
-        else:
-            loc.calls += 1
-            attempt.marks_shown = len(inside)
-            answer = await client.call_model_json(
-                prompts.build_marks_prompt(
-                    client.encode_image_to_base64(
-                        _with_marks(crop, to_crop_px(inside, rect, crop.shape))
-                    ),
-                    name, marks=len(inside), feedback=feedback, references=shown,
-                    model=model,
+    rect = window_rect(window, image_shape)
+    tier, inside, why = await marks_lines_in(
+        rect, native_lines=native_lines, text_lines=text_lines, window_lines=window_lines,
+    )
+    if tier is not None and len(inside) > marks_max:
+        why = (
+            f"{len(inside)} {MARKS_TIERS[tier]} text lines lie inside the refine window, "
+            f"over the cap of {marks_max}"
+        )
+    elif tier is not None:
+        loc.calls += 1
+        attempt.marks_shown = len(inside)
+        attempt.marks_lines = tier
+        answer = await client.call_model_json(
+            prompts.build_marks_prompt(
+                client.encode_image_to_base64(
+                    _with_marks(crop, to_crop_px(inside, rect, crop.shape))
                 ),
-                label=f"refine/marks/{name}#{number}",
+                name, marks=len(inside), feedback=feedback, references=shown,
                 model=model,
-            )
-            _log_guided(loc, "box_refine", number, shown, answer)
-            chosen, why = parse_marks(answer, len(inside))
-            if chosen:
-                x1, y1, x2, y2 = union_box([inside[i - 1] for i in chosen])
-                attempt.marks = chosen
-                attempt.refined = True
-                attempt.bbox_px = _clamped_box([(x1, y1), (x2, y2)], geometry)
-                px = attempt.bbox_px
-                # One decimal, as the record shows it: a retry's feedback
-                # quotes this box, and the model writes grid numbers short.
-                attempt.bbox_grid = [
-                    round(v, 1) for v in pixels_to_grid(
-                        [(px[0], px[1]), (px[2], px[3])], geometry, LLM_BBOX_GRID
-                    )
-                ]
-                logger.info(
-                    "locate_criterion: '%s' attempt %d refined by marks %s of %d → %s "
-                    "(coarse %s)",
-                    name, number, chosen, len(inside), _fmt(attempt.bbox_grid),
-                    _fmt(attempt.coarse_bbox_grid or []),
+            ),
+            label=f"refine/marks/{name}#{number}",
+            model=model,
+        )
+        _log_guided(loc, "box_refine", number, shown, answer)
+        chosen, why = parse_marks(answer, len(inside))
+        if chosen:
+            x1, y1, x2, y2 = union_box([inside[i - 1] for i in chosen])
+            attempt.marks = chosen
+            attempt.refined = True
+            attempt.bbox_px = _clamped_box([(x1, y1), (x2, y2)], geometry)
+            px = attempt.bbox_px
+            # One decimal, as the record shows it: a retry's feedback
+            # quotes this box, and the model writes grid numbers short.
+            attempt.bbox_grid = [
+                round(v, 1) for v in pixels_to_grid(
+                    [(px[0], px[1]), (px[2], px[3])], geometry, LLM_BBOX_GRID
                 )
-                return True
+            ]
+            logger.info(
+                "locate_criterion: '%s' attempt %d refined by %s marks %s of %d → %s "
+                "(coarse %s)",
+                name, number, tier, chosen, len(inside), _fmt(attempt.bbox_grid),
+                _fmt(attempt.coarse_bbox_grid or []),
+            )
+            return True
     attempt.refine_mode = "grid"
     attempt.marks_fallback = why
     logger.info(
@@ -1142,11 +1192,87 @@ async def _refine_by_marks(
     return False
 
 
+async def marks_lines_in(
+    rect: tuple[int, int, int, int],
+    *,
+    native_lines: Optional[list[dict]],
+    text_lines: Optional[list[dict]],
+    window_lines: Optional[WindowLines],
+) -> tuple[Optional[str], list[list[float]], Optional[str]]:
+    """The lines the marks pass numbers: ``(tier, inside, None)`` for the
+    FIRST tier with at least one line mostly inside ``rect``
+    (``window_rect``, ORIGINAL pixels) — ``inside`` that tier's line bounds
+    there, in reading order (``lines_in_window``) — else ``(None, [],
+    why)``.
+
+    The tiers, exact and free first (``MARKS_TIERS``):
+
+      native  ``native_lines`` — a digital PDF / SVG page's own lines, from
+              its words: exact, no recogniser, there whatever
+              ``options.ocr`` read;
+      ocr     ``text_lines`` — the criterion's OCR text layer, the one its
+              scoring call read (none on a native layer);
+      window  ``await window_lines(rect)`` — an OCR pass of the window
+              alone, only when neither of the others reached it: a scanned
+              page whose 20+ native characters (a stamped header) kept
+              ``ocr: "auto"`` from reading it.
+
+    ``why`` names every tier and what it held, so a fallback says what was
+    tried: "none given" (no list), "none on the page" (no usable box),
+    "none in the window"; for the window tier "off" (no callable —
+    ``ocr: "never"``, or a direct caller), "unavailable — no OCR engine, or
+    the pass failed" (it returned None or raised; the unit goes on), or
+    "found none".
+    """
+    states: list[str] = []
+    for tier, lines, label in (("native", native_lines, "native lines"),
+                               ("ocr", text_lines, "OCR layer")):
+        inside, state = _tier_in_window(lines, rect)
+        if inside:
+            return tier, inside, None
+        states.append(f"{label}: {state}")
+    if window_lines is None:
+        states.append("window OCR: off")
+    else:
+        try:
+            found = await window_lines(rect)
+        except Exception as exc:  # noqa: BLE001 — an aid never fails the unit
+            logger.warning("locate_criterion: window OCR raised (%s); grid refine",
+                           type(exc).__name__)
+            found = None
+        if found is None:
+            states.append("window OCR: unavailable — no OCR engine, or the pass failed")
+        else:
+            inside, _ = _tier_in_window(found, rect)
+            if inside:
+                return "window", inside, None
+            states.append("window OCR: found none")
+    return None, [], (
+        "no text line lies inside the refine window (" + "; ".join(states) + ")"
+    )
+
+
+def _tier_in_window(
+    lines: Optional[list[dict]], rect: tuple[int, int, int, int]
+) -> tuple[list[list[float]], str]:
+    """One tier's line bounds mostly inside ``rect`` (reading order), and,
+    when there are none, what the tier held: "none given" / "none on the
+    page" / "none in the window"."""
+    if lines is None:
+        return [], "none given"
+    bounds = [b for b in (line_bounds(line) for line in lines) if b is not None]
+    if not bounds:
+        return [], "none on the page"
+    inside = lines_in_window(bounds, rect)
+    return inside, ("" if inside else "none in the window")
+
+
 def line_bounds(line: Any) -> Optional[list[float]]:
-    """One OCR line's ``[x1, y1, x2, y2]`` — the bounds of its ``box`` (a
-    4-point polygon ``[[x, y], …]``, as ``RapidOCREngine`` gives it, or
-    already ``[x1, y1, x2, y2]``) in the same pixels as the box. None for a
-    line with no usable box, or one with no width or height."""
+    """One text line's ``[x1, y1, x2, y2]`` — an OCR line's or a native
+    one's: the bounds of its ``box`` (a 4-point polygon ``[[x, y], …]``, as
+    ``RapidOCREngine`` and ``Page.native_lines`` give it, or already
+    ``[x1, y1, x2, y2]``) in the same pixels as the box. None for a line
+    with no usable box, or one with no width or height."""
     box = line.get("box") if isinstance(line, dict) else None
     try:
         if isinstance(box, (list, tuple)) and box and isinstance(box[0], (list, tuple)):

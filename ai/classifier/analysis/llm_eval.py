@@ -58,11 +58,15 @@ example with a region, a load failure), each call that carried examples in
 ``classifier_reference_calls_total``. Without references in the request the
 key is absent and the loop sends one image, exactly as before.
 
-The loop is also handed the line boxes of the text layer the scoring call
-read (``TextLayer.lines``, ORIGINAL page pixels): the marks refine
-(``options.refine: "marks"``) numbers the ones in its window, so it needs no
-OCR pass of its own. A native-text page has none, and the loop falls back to
-the grid. In grid mode they are not read.
+The loop is also handed the marks refine's (``options.refine: "marks"``)
+three tiers of text lines, ORIGINAL page pixels each, and numbers the first
+that has one in its window: the page's own PDF / SVG lines
+(``TextLayer.native_lines`` — exact, so a digital PDF needs no OCR at all),
+the line boxes of the text layer the scoring call read (``TextLayer.lines``
+— no second pass of the page), then an OCR pass of the window alone
+(``DocumentContext.window_lines``, injected as a callable so ``llm`` never
+imports ``analysis``) — left out under the criterion's ``options.ocr:
+"never"``, which promised no recognition. In grid mode none is read.
 
     evaluate()       — the shared evaluator interface.
     evaluate_with()  — the same for a name and RESOLVED llm options, which is
@@ -337,10 +341,14 @@ async def evaluate_with(
         guide_ask=loop["guide_ask"],
         guide_refine=loop["guide_refine"],
         guide_verify=loop["guide_verify"],
-        # The marks refine's OCR lines: the layer this criterion's
-        # options.ocr already produced (ORIGINAL page pixels, the frame
-        # `original_image` is in). Read only in marks mode.
+        # The marks refine's tiers, all in ORIGINAL page pixels (the frame
+        # `original_image` is in), read only in marks mode: the page's own
+        # PDF / SVG lines, the OCR layer this criterion's options.ocr
+        # already produced, then OCR of the window alone — never under
+        # ocr: "never", which asked for no recognition.
+        native_lines=layer.native_lines,
         text_lines=layer.lines,
+        window_lines=None if opts["ocr"] == "never" else ctx.window_lines,
         refine_mode=loop["refine_mode"],
         verify_partial=loop["verify_partial"],
         verify_min_span=loop["verify_min_span"],

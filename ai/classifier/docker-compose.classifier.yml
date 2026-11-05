@@ -145,6 +145,26 @@ services:
       - CLASSIFIER_LLM_BBOX_REFINE=${CLASSIFIER_LLM_BBOX_REFINE:-true}
       - CLASSIFIER_LLM_BBOX_REFINE_ZOOM=${CLASSIFIER_LLM_BBOX_REFINE_ZOOM:-2.5}
       - CLASSIFIER_LLM_BBOX_REFINE_MIN_SPAN=${CLASSIFIER_LLM_BBOX_REFINE_MIN_SPAN:-0.2}
+      # Opt-in aids, all off until measured with bin/grounding_experiment.py:
+      # the refine pass by numbered OCR-line marks (grid | marks) and its cap
+      # on lines, the verify's "cut off" field, and a minimum verify-crop
+      # span (fraction of the page; 0 = the padded box). Each but the marks
+      # cap is a SERVICE DEFAULT: an llm criterion overrides it with
+      # options.refine / options.verify_partial / options.verify_min_span.
+      - CLASSIFIER_LLM_BBOX_REFINE_MODE=${CLASSIFIER_LLM_BBOX_REFINE_MODE:-grid}
+      - CLASSIFIER_LLM_BBOX_MARKS_MAX=${CLASSIFIER_LLM_BBOX_MARKS_MAX:-40}
+      - CLASSIFIER_LLM_BBOX_VERIFY_PARTIAL=${CLASSIFIER_LLM_BBOX_VERIFY_PARTIAL:-false}
+      - CLASSIFIER_LLM_BBOX_VERIFY_MIN_SPAN=${CLASSIFIER_LLM_BBOX_VERIFY_MIN_SPAN:-0}
+      # Show a criterion's reference examples to the loop's ask, refine and
+      # verify calls (each its own knob; off until measured with
+      # bin/grounding_experiment.py), and quote each example's region text
+      # in its caption. Service defaults: a criterion overrides them with
+      # options.reference.boxes.{ask,refine,verify} / options.reference.text.
+      # See API.md § The box loop's options — per criterion.
+      - CLASSIFIER_REFERENCE_BOX_ASK=${CLASSIFIER_REFERENCE_BOX_ASK:-false}
+      - CLASSIFIER_REFERENCE_BOX_REFINE=${CLASSIFIER_REFERENCE_BOX_REFINE:-false}
+      - CLASSIFIER_REFERENCE_BOX_VERIFY=${CLASSIFIER_REFERENCE_BOX_VERIFY:-false}
+      - CLASSIFIER_REFERENCE_BOX_TEXT=${CLASSIFIER_REFERENCE_BOX_TEXT:-false}
       # References — saved worked examples shown to the vision model beside a
       # candidate. Their own root on the classifier_data volume (never swept:
       # a reference is kept until DELETE, so the count cap bounds the disk),

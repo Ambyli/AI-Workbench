@@ -83,8 +83,12 @@ reference_calls_total = Counter(
     "classifier_reference_calls_total",
     "Vision-model calls made on behalf of references (analysis/references.py, "
     "analysis/llm_eval.py)",
-    # selection — one `references: "auto"` selection call per item (any outcome)
-    # scoring   — one reference-guided scoring call (any outcome)
+    # selection  — one `references: "auto"` selection call per item (any outcome)
+    # scoring    — one reference-guided scoring call (any outcome)
+    # box_ask    — one box-loop ask that carried examples (CLASSIFIER_REFERENCE_BOX_ASK)
+    # box_refine — one refine call that carried example crops (_BOX_REFINE)
+    # box_verify — one verify call that carried example crops (_BOX_VERIFY)
+    #              a box call is `failed` when it returned no usable answer
     ["kind", "outcome"],  # outcome: ok | failed
 )
 # Model usage records (llm/usage.py): a row that could not be written. The

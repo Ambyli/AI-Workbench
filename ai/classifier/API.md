@@ -189,7 +189,9 @@ ai/classifier/
   api/                 the HTTP layer
     schemas.py         AssessRequest (a documents list), DocumentInput, CriterionInput + the cross-criterion rules
     criterion_options.py  LLMOptions / TextOptions / CVOptions / DetectorOptions: defaults, caps,
-                       options.aggregate and its defaults table; ReferenceOptions (options.reference)
+                       options.aggregate and its defaults table; ReferenceOptions (options.reference);
+                       the box loop's per-criterion settings resolved against the service
+                       defaults (box_loop_settings — the one place the service reads those env vars)
     assess.py          POST /assess — JSON or multipart, one model, the submit-time checks and the item cap
     introspection.py   GET /models, /criterion-types, /hints, /cv-detectors, /document-kinds, /health
     artifacts.py       the four /jobs/{id}/artifacts routes and the lazy layer renderer
@@ -262,6 +264,8 @@ ai/classifier/
                        job type's progress STAGES
   bin/
     grounding_experiment.py   operator tool — runs where the model is
+    reference_box_assess.py   operator tool — the box loop measured end to end through
+                              the API: stored references, /assess jobs, the job result
     confidence_calibration.py operator tool — measures the confidence signals, fits a
                               calibration (§ Confidence)
 ```
@@ -557,6 +561,20 @@ previous container runs unchanged (matched by name). `make build classifier &&
 make up classifier`; `GET /criterion-types` → `shared_fields.key` confirms the
 new build is live.
 
+**The box loop's per-criterion options** (`refine`, `verify_partial`,
+`verify_min_span`, `reference.boxes`, `reference.text` —
+[§ The box loop's options](#the-box-loops-options--per-criterion)) are code
+only too: the `CLASSIFIER_LLM_BBOX_REFINE_MODE` / `_VERIFY_PARTIAL` /
+`_VERIFY_MIN_SPAN` and `CLASSIFIER_REFERENCE_BOX_*` env vars keep their
+names and their (off) defaults and become the service defaults; no drain —
+a queued payload or stored reference without the keys runs as before.
+**Deploy the classifier BEFORE any caller sends the options** (the
+Operations Assistant, ZT-526): an older container refuses them as unknown
+keys, a 400 on every request. `GET /criterion-types` → `box_loop` confirms
+the build. Results change only in what `options_used` / `GET
+/criterion-types` show (the new keys at their defaults) and in
+`request.criteria` (the new keys, `null` when unset).
+
 ---
 
 ## Documents
@@ -767,11 +785,15 @@ distribution for a `logprobs` model; [§ Confidence](#confidence--measured-then-
 > call with ten images. Every call that is not reference-guided — the plain
 > scoring call, the box loop's ask / refine / verify, a reference's describe
 > call, the `auto` selection call — sends exactly one image. Only a
-> reference-guided scoring call carries more: up to the model's
+> reference-guided call carries more: up to the model's
 > `max_images_per_prompt` (muse-glimmer: 3) — a PASS example, a FAIL example
-> and the candidate ([§ References](#references)). `muse-glimmer` runs with
-> `--limit-mm-per-prompt '{"image": 3}'` for this; its registry entry must
-> match it.
+> and the candidate ([§ References](#references)). That is every guided
+> scoring call, and — behind a criterion's `options.reference.boxes` (service
+> default: the `CLASSIFIER_REFERENCE_BOX_*` knobs, off) — the box loop's ask /
+> refine / verify
+> ([§ What the model is shown](#what-the-model-is-shown-and-what-it-costs)).
+> `muse-glimmer` runs with `--limit-mm-per-prompt '{"image": 3}'` for this;
+> its registry entry must match it.
 
 A document with no page image sends a text-only prompt (still
 `response_format: json_object`), and the system prompt tells the model to judge
@@ -1006,7 +1028,7 @@ in `options`:
 
 | `type` | `options`, with defaults |
 |---|---|
-| `llm` | `hint` (`quality` \| `presence` \| `auto`, default `auto`), `boxes` (default **`false`** — the [bounding-box loop](#the-llm-enforcement-loop)), `max_attempts` (default and cap `CLASSIFIER_LLM_BBOX_MAX_ATTEMPTS`; may be lowered, never raised), `ocr` (`auto` \| `always` \| `never`, default `auto` — the text layer sent with the prompt), `reference` (how the request's references guide it — [§ References](#references); only with `references`), `model` (a registry id from `GET /models`; default: the request's `model`, else the registry default — [§ Models](#models)), `aggregate` |
+| `llm` | `hint` (`quality` \| `presence` \| `auto`, default `auto`), `boxes` (default **`false`** — the [bounding-box loop](#the-llm-enforcement-loop)), `max_attempts` (default and cap `CLASSIFIER_LLM_BBOX_MAX_ATTEMPTS`; may be lowered, never raised), the box loop's per-criterion settings `refine` (`grid` \| `marks`), `verify_partial` (bool) and `verify_min_span` (0–1) — each only with `boxes: true`, each unset = the service default (off), see [§ The box loop's options](#the-box-loops-options--per-criterion) — `ocr` (`auto` \| `always` \| `never`, default `auto` — the text layer sent with the prompt), `reference` (how the request's references guide it, its `boxes` / `text` the loop — [§ References](#references); only with `references`), `model` (a registry id from `GET /models`; default: the request's `model`, else the registry default — [§ Models](#models)), `aggregate` |
 | `text` | `pattern` (default: the name; max 500 characters), `match` (`contains` default \| `exact` \| `regex` \| `fuzzy`), `case_sensitive` (`false`), `fuzzy_threshold` (`0.85`, 0–1), `min_count` (`1`, 1–1000, `CLASSIFIER_TEXT_MIN_COUNT_CAP`), `ocr` (`auto`), `scope` (`page` default \| `document` — [text across pages](#text-across-pages--scope-document)), `aggregate` |
 | `cv` | `fallback` (`detector` \| `llm`) — what answers when no OpenCV detector matches the name. Default: `detector` when `DETECTOR_URL` is configured on this container, `llm` otherwise. `reference` and `model` (only when the llm fallback is what answers — `model` picks the fallback's registry model). `aggregate` |
 | `detector` | `threshold` (0–1, default `DETECTOR_MIN_SCORE`), `aggregate` |
@@ -1025,6 +1047,15 @@ nothing is queued:
   a value past a cap
   (`criteria.0: options.max_attempts: max_attempts 9 exceeds this server's cap
   (CLASSIFIER_LLM_BBOX_MAX_ATTEMPTS=3)…`);
+* a box-loop setting (`refine`, `verify_partial`, `verify_min_span`,
+  `reference.boxes`, `reference.text`) without `options.boxes: true`
+  (`criteria.0: options: refine tunes the bounding-box loop, which runs only
+  with options.boxes: true; set boxes: true or drop it` — every one sent is
+  named), `verify_min_span` outside 0–1, a `refine` other than `grid` /
+  `marks`; on a `text` / `detector` / `cv` criterion they are unknown keys
+  (`options.refine: Extra inputs are not permitted`), and `reference.boxes`
+  / `reference.text` on a `cv` criterion are refused by name (its llm
+  fallback never locates) — [§ The box loop's options](#the-box-loops-options--per-criterion);
 * an old top-level key (`hint`, `pattern`, `match`, `case_sensitive`,
   `fuzzy_threshold`, `min_count`) — "these keys moved into 'options'";
 * an unusable text pattern (empty, over 500 characters, an invalid regex),
@@ -1052,7 +1083,11 @@ nothing is queued:
 
 Each result echoes `options_used`: the options after defaults and caps, so
 `pattern` shows the name it defaulted to and `max_attempts` the cap it was
-held to. `options.model` appears there only when sent; the model that
+held to. An `llm` criterion's `refine`, `verify_partial` and
+`verify_min_span` are always there, and `reference.boxes` / `reference.text`
+whenever `reference` is: each the criterion's value, else this container's
+service default — the value the loop ran with (or would have, had it run).
+`options.model` appears there only when sent; the model that
 actually answered is `detail.model`. `options.model` is not part of a
 criterion's identity — a reference saved under one model guides the same
 criterion on any other.
@@ -1602,9 +1637,12 @@ llm fallback; only with `references` on the request (a 400 otherwise):
 | `position` | `off` | `check` = the position check below. Needs `options.boxes: true` and hint `presence` / `auto`; refused on `cv` (its llm fallback runs without boxes) |
 | `min_iou` | `CLASSIFIER_REFERENCE_POSITION_MIN_IOU` (0.3) | Overlap that counts as a position hit |
 | `combine` | `any` | How several examples' answers become one: `any` the best (with its reason), `all` the lowest, `mean` the rounded mean (verdict from it; Python rounding, so 6.5 → 6) |
+| `boxes` | unset: each step its service default — `{"ask": CLASSIFIER_REFERENCE_BOX_ASK, "refine": …_REFINE, "verify": …_VERIFY}`, all `false` | Which of the [box loop](#the-llm-enforcement-loop)'s calls are shown the examples: `{"ask": bool, "refine": bool, "verify": bool}`, each optional (a step left out keeps its default). `ask` sees the composites (region crops under `position: "check"`), `refine` and `verify` the region crops. Only examples with a region; a FAIL only when its reference criterion's hint is `presence`. **Same calls, more images**: each guided call carries 1 + examples images (2 with a PASS, 3 with a PASS and a FAIL), and a guided ask loses the prefix cache it shares with the page's other criteria. Needs `options.boxes: true` (400 otherwise); refused on `cv`. [§ What the model is shown](#what-the-model-is-shown-and-what-it-costs) |
+| `text` | unset: `CLASSIFIER_REFERENCE_BOX_TEXT` (`false`) | Each box-loop example's caption also quotes the text inside its region (*"The outlined area reads: "Amount due $193.33"."*), OCR'd from the reference's page once per job (no model call; one OCR pass per example under `CLASSIFIER_OCR_WORKERS`), cut to 80 characters. Only matters when a `boxes` step is on. Needs `options.boxes: true`; refused on `cv` |
 
 It is in `options_used` only when sent, so an unguided criterion's result is
-unchanged.
+unchanged. When it is, `boxes` and `text` there are the values that ran — the
+criterion's, else the service defaults.
 
 ### What the model is shown, and what it costs
 
@@ -1632,12 +1670,122 @@ combination (noted in `detail.reference.note`); when every call fails the unit
 fails exactly as a plain scoring call's failure does. A reference **deleted
 after submit** fails the units it guided (`status: "error"`), nothing else.
 
-The box loop then runs unchanged on the combined score, with one image —
-references never reach the ask, refine or verify calls.
+**The box loop** then runs on the combined score, gated exactly as before.
+With every step off (the default) it sends one image per call, exactly as it
+did before references existed. The criterion's `options.reference.boxes`
+turns each step on or off for that criterion; a step it leaves unset takes
+its `CLASSIFIER_REFERENCE_BOX_*` service default
+([§ The box loop's options](#the-box-loops-options--per-criterion)). Each
+step on shows its calls the criterion's examples
+([§ The LLM enforcement loop](#the-llm-enforcement-loop)):
+
+| Step (`reference.boxes.*`; service default) | Call | Shown before the candidate |
+|---|---|---|
+| `ask` (`CLASSIFIER_REFERENCE_BOX_ASK`) | ask | the examples' **composites** — the reference page with the feature outlined: *"REFERENCE EXAMPLE — 'the utility's logo' was PASS here; the coloured box outlines it."* Under `position: "check"` their **region crops** instead (below) |
+| `refine` (`CLASSIFIER_REFERENCE_BOX_REFINE`) | refine | the examples' **region crops** — each reference's ORIGINAL page cut around its first region, padded by `CLASSIFIER_LLM_BBOX_CROP_PAD`, no outline: *"REFERENCE EXAMPLE (from another document) — a crop showing 'the utility's logo' (PASS there)."* |
+| `verify` (`CLASSIFIER_REFERENCE_BOX_VERIFY`) | verify | the same region crops; the question becomes *"Is this visible in the CANDIDATE crop: …?"*, still 1–10, with the reason written first (below) |
+
+What the loop may be shown is chosen once per unit, after the gate passed:
+
+* **Only examples with regions.** A whole-page example teaches no location.
+* **A FAIL example only when its reference criterion's hint is `presence`.**
+  The reference's hint counts, not the candidate's: a `key` match can pair
+  different hints. Under `presence`, FAIL means "not there", so whatever is
+  outlined is NOT the feature (*"… was FAIL here — the outlined thing is NOT
+  the utility's logo; do not box it."*). Under `quality` / `auto`, FAIL can
+  mean "there, but bad", and showing it as "do not box this" would steer the
+  model off the right object. A plan queued before this change carries no
+  hint, so it is shown PASS-side examples only.
+* **At most one PASS-side example (PASS before MARGINAL), plus one FAIL at
+  three images.** With no PASS-side example, an eligible FAIL is shown alone
+  at three images. At two images only a PASS-side example is shown. Every
+  attempt shows the same examples.
+* **The ask under the position check sees crops, not composites.** A crop
+  shows the feature without the page around it, so the ask cannot be nudged
+  toward the example's spot. The check then compares the accepted box with
+  those examples' own regions, so it cannot pass on its own guidance.
+  Callers change nothing.
+* **Loading an example never fails the unit.** A reference deleted after
+  submit, or a `page.jpg` that is missing or does not decode, drops that
+  example from every step, with a note. The score is final by then.
+* **Its text, opt-in** (`options.reference.text`; service default
+  `CLASSIFIER_REFERENCE_BOX_TEXT`, off). Every step's
+  caption of an example then quotes what its region says: *"… the coloured
+  box outlines it. The outlined area reads: "Meter #: 4471 0923"."* on a
+  composite, *"… (PASS there). The text at its centre reads: "…"."* on a
+  crop. A reference keeps no text layer, so its region of `page.jpg` is
+  recognised once per job, under `CLASSIFIER_OCR_WORKERS`, with context
+  around it (padded 10%, and at least 5% of the page on each axis — on the
+  fixture bills the OCR detector found nothing in a 427×65 crop of a legible
+  account-number line, and read it in a crop 5% of the page tall), keeping
+  only the lines centred inside the region (or, for a piece of one long line,
+  the line overlapping it most).
+  Whitespace is collapsed, `"` becomes `'`, and the text is cut to 80
+  characters. A region with no legible text (a logo), no OCR engine, or an
+  OCR failure gives the caption without the sentence, and never fails the
+  unit. Each example's `localization.references[].examples[]` entry (and
+  `references.json`) then carries `text` (null when there was none).
+
+The prompt adds a guard after the examples. It says the examples show
+*what* to box and that on the candidate it may be somewhere else. It says
+the examples have no grid, so answer only on the CANDIDATE's grid, and that
+`"bbox": null` is still the answer when the candidate does not show the
+feature. Then comes a `CANDIDATE` heading, and one system-prompt sentence
+(*"Reference examples come first; locate the feature ONLY in the image marked
+CANDIDATE."*). The rejection feedback and the call labels are unchanged.
+
+**The guided verify assumes the examples come from other documents**,
+because a reference is normally a different company's page than the
+candidate. An earlier wording told the model what the feature "looks like
+here", and the model scored a correct logo 1 on every attempt (0 of 20
+accepted, on two pairs of bills) because it was not the reference's brand. It
+stayed neutral on the amount due and the account number, whose look does not
+depend on the brand. Now:
+
+* the crop captions say *"(from another document)"* and *"PASS there"*;
+* the system sentence is *"Reference examples from other documents come
+  first; judge ONLY the crop marked CANDIDATE."*;
+* after the question comes *"The reference image(s) above come from OTHER
+  documents. Each shows an example of the kind of thing '…' means; on the
+  CANDIDATE it will usually look different (a different company, design or
+  layout), and any name in the criterion refers to the CANDIDATE's own
+  document, not to the reference's. Do not score lower because the CANDIDATE
+  looks different from a reference: score whether the CANDIDATE crop shows ….
+  A reference captioned FAIL shows something that does NOT count."*;
+* it writes its reason first. The scaffold is `{"reason": "...", "score":
+  0}`, and the prompt says *"Write 'reason' first, what you actually see in
+  the CANDIDATE crop, in one sentence; then 'score'."* The 1–10 scale and
+  the validator are unchanged.
+
+The composite captions, the ask guard and every unguided prompt are
+unchanged.
 
 **Cost per guided criterion, per item:** `max(#PASS-side, #FAIL)` scoring
 calls instead of 1 (at three images), plus, under `auto`, one selection call
-per item shared by every criterion.
+per item shared by every criterion. The box loop with a knob on makes **the
+same number of calls**, but each guided call carries 1 + examples images:
+
+* Every criterion re-processes the candidate. Without examples, the ask's
+  system prompt and gridded page are one prefix shared by every criterion on
+  the page, served from muse-glimmer's prefix cache. With examples first,
+  each criterion sends a different prefix (retries of one criterion still
+  share theirs).
+* Each guided call holds its `max_concurrent` slot longer.
+
+Measured on muse-glimmer (`bin/grounding_experiment.py`, utility bills,
+one example per call), prompt tokens per call without → with examples:
+
+| Call | Without | With one example | Extra seconds |
+|---|---|---|---|
+| ask (composite) | ~1,300 | ~2,400 | +1 to 1.5 |
+| refine (region crop) | ~950–1,100 | ~1,250–1,350 | +0.1 to 0.5 |
+| verify (region crop) | ~200–430 | ~400–550 | +0.2 to 0.5 |
+| verify (composite, experiment only) | ~200–430 | ~1,350–1,550 | +0.3 to 0.6 |
+
+Guided runs need FEWER calls when the example helps: a box accepted on
+the first attempt saves the retries (the hard amount-due pages fell from
+8.1 calls per run to 3.9). After turning an option on, watch
+`classifier_llm_call_seconds{kind="ask"}` (and `refine` / `verify`).
 
 ### The position check
 
@@ -1657,12 +1805,17 @@ and the smallest centre distance / √2. No model call.
 
 A `score: false` criterion reports the check and changes nothing. A `check`
 against an example that is the whole page is a 400 at submit (explicit ids).
+The check stays independent of what the loop was shown. With the ask step
+on (`reference.boxes.ask`, or its default `CLASSIFIER_REFERENCE_BOX_ASK`),
+the ask of a `check` criterion is shown the
+examples' region crops, never their composites, so it cannot copy the
+example's position. The check reads only the examples' stored regions.
 
 ### Refusals at submit
 
 | Status | Rule |
 |---|---|
-| 400 | `options.reference` with no `references`; `options.reference` on a `text` / `detector` / OpenCV-answered `cv` criterion; `position: "check"` without `boxes` or with hint `quality`, or on `cv`; an empty list, duplicate ids, a malformed id, more than `CLASSIFIER_REFERENCE_MAX_PER_REQUEST`; `references` on a criterion (that uses them) whose model has `max_images_per_prompt` < 2 or is text-only; `auto` with a text-only job model; unknown ids (all named); an inheritance conflict (both references named — a differing `key` included); `auto` without `criteria`; an `options.reference.criterion` no listed reference has (an unmatched `key` or name is not refused — [matching order](#how-a-criterion-finds-its-examples--the-matching-order)); more than `CLASSIFIER_REFERENCE_MAX_PER_CRITERION` examples for one criterion; `position: "check"` against a whole-page example |
+| 400 | `options.reference` with no `references`; `options.reference` on a `text` / `detector` / OpenCV-answered `cv` criterion; `position: "check"` without `boxes` or with hint `quality`, or on `cv`; an empty list, duplicate ids, a malformed id, more than `CLASSIFIER_REFERENCE_MAX_PER_REQUEST`; `references` on a criterion (that uses them) whose model has `max_images_per_prompt` < 2 or is text-only; `auto` with a text-only job model; unknown ids (all named); an inheritance conflict (both references named — a differing `key` included); `auto` without `criteria`; an `options.reference.criterion` no listed reference has (an unmatched `key` or name is not refused — [matching order](#how-a-criterion-finds-its-examples--the-matching-order)); more than `CLASSIFIER_REFERENCE_MAX_PER_CRITERION` examples for one criterion; `position: "check"` against a whole-page example; `reference.boxes` or `reference.text` without `options.boxes: true` (with the loop's other settings sent, all named), or on a `cv` criterion — [§ The box loop's options](#the-box-loops-options--per-criterion) |
 | 409 | A listed reference is not `ready` (`pending` or `failed`) |
 
 ### Retention
@@ -1686,7 +1839,8 @@ and those jobs' guided units then fail on the missing reference.
 Metrics: `classifier_references{status}`, `classifier_reference_bytes`,
 `classifier_reference_dirs`, `classifier_references_created_total{outcome}`,
 `classifier_reference_describe_total{outcome}`,
-`classifier_reference_calls_total{kind=selection|scoring, outcome}`.
+`classifier_reference_calls_total{kind=selection|scoring|box_ask|box_refine|box_verify, outcome}`
+(a box call that returned no usable answer is `failed`).
 
 ---
 
@@ -1939,7 +2093,7 @@ Inside `job.result`, `schema_version: 3` — here for a two-page invoice plus a
 | `page_geometry` | One entry per item, each with its `item`; `page` equals `item` (the global index the layers are drawn on). An item with no page image (.txt / .docx) has `width` / `height` / `working_scale` / `pdf_points` `null`; `pdf_points` is also `null` for an image or an SVG page |
 | `detector` | What the open-vocabulary detector did for the whole job (was `document_info.detector`) |
 | `artifacts` | The job's files — each [labelled](#file-labels) with `kind`, `format`, `item`, `document`, `criteria`, exactly as the manifest endpoint labels them — and, under `items`, each item's combined layer URLs (items with a page image only) |
-| `references` | `null` when the request listed none. Otherwise `{mode: explicit \| auto, requested, pool (auto: the ids fixed at submit; else null), pool_truncated, resolved (the ids used — auto: those some item's selection kept), inherited, criteria: {name: {matched, matched_by: criterion \| key \| name, use, combine, position, examples: [{reference_id, criterion, polarity, expected}]}}, selection: [{item, status: ok \| failed \| skipped, matches: [{id, confidence, reason}], dropped, error, reason}], calls (guided scoring calls), selection_calls}`. Under `auto`, `criteria[*].examples` is empty — each item's picks are in `selection` and each unit's `detail.reference`. `matched_by` is the [matching order](#how-a-criterion-finds-its-examples--the-matching-order) rule that applied and `matched` its value (a reference criterion's name, or the key) |
+| `references` | `null` when the request listed none. Otherwise `{mode: explicit \| auto, requested, pool (auto: the ids fixed at submit; else null), pool_truncated, resolved (the ids used — auto: those some item's selection kept), inherited, criteria: {name: {matched, matched_by: criterion \| key \| name, use, combine, position, examples: [{reference_id, criterion, polarity, expected}]}}, selection: [{item, status: ok \| failed \| skipped, matches: [{id, confidence, reason}], dropped, error, reason}], calls (guided scoring calls — the box loop's guided calls are in `references.json`, not counted here), selection_calls}`. Under `auto`, `criteria[*].examples` is empty — each item's picks are in `selection` and each unit's `detail.reference`. `matched_by` is the [matching order](#how-a-criterion-finds-its-examples--the-matching-order) rule that applied and `matched` its value (a reference criterion's name, or the key) |
 | `request` | `{"criteria": [...], "model": "<id>"}` — `model` is the job's model, resolved (the request's `model`, else the registry default); the criteria exactly as validated (`key`, null when unset; `depends_on`, `weight`, every option as sent; inherited ones when `criteria` was omitted). What `POST /references` `from_job` rebuilds a job's criteria from |
 | `usage` | What the job's vision-model requests cost — the `totals` block of [`GET /jobs/{job_id}/usage`](#get-jobsjob_idusage): `calls` (every HTTP request, parse retries included), `errors`, `seconds`, `prompt_tokens` / `cached_tokens` / `completion_tokens` / `reasoning_tokens` / `total_tokens` (`null` when no call reported one), `models`, `first_call_at` / `last_call_at`, and `usage_url` for the per-call rows. `calls: 0` when nothing asked the model (`text` / `cv` criteria only). Added by the queue after the runner returns, so a `reference` job's result carries it too. See [§ Model usage](#model-usage) |
 
@@ -1957,8 +2111,8 @@ that existed before describe the AGGREGATED answer:
 | `reason` / `detail` | One or two sentences / structured diagnostics |
 | `regions` | Where, in original page pixels — the union over every item, each region's `page` its item; capped at `CLASSIFIER_INLINE_REGIONS_MAX` (`regions_truncated` says so) |
 | `artifacts` | Per-criterion links — `items`: per item it found something on, that item's layer URLs filtered to the criterion (rendered on first fetch) and its loop `attempts`; `text`: one link per text layer its units read (each tagged `item`, or `document` for scope `document`); `null` when there is neither geometry nor text |
-| `localization` | `llm` criteria: the enforcement loop's record, `{"attempts": [], "accepted_attempt": null, "calls": 0}` when it did not run. With one item it is that item's record verbatim; with several it is merged — every attempt tagged with its `item`, `calls` summed, `accepted_attempt` `null` and `accepted: [{"item", "attempt"}]` listing each accepted box. `null` for the other types |
-| `options_used` | Options after defaults and caps, `aggregate` resolved |
+| `localization` | `llm` criteria: the enforcement loop's record, `{"attempts": [], "accepted_attempt": null, "calls": 0}` when it did not run. With one item it is that item's record verbatim; with several it is merged — every attempt tagged with its `item`, `calls` summed, `accepted_attempt` `null` and `accepted: [{"item", "attempt"}]` listing each accepted box. `null` for the other types. **`references`** — only when the request listed references and the criterion has a guide — is what the loop was shown: always a list, one entry per unit whose loop ran, each `{item, applied, ask_images: composite \| crop \| null, examples: [{reference_id, criterion, polarity, composite}], ask, refine, verify, note}`. `ask` / `refine` / `verify` say whether that step's calls carry examples. `applied: false` means no step did, and `note` says why: the `CLASSIFIER_REFERENCE_BOX_*` knobs are off (the criterion set no `reference.boxes` step on), `options.reference.boxes` turns every step off for this criterion (a service default was on), no example has a region, the guide never applied, or an example failed to load. Merged across items and documents by concatenation. Absent without references, so those results are unchanged |
+| `options_used` | Options after defaults and caps, `aggregate` resolved; an `llm` criterion's box-loop settings (`refine`, `verify_partial`, `verify_min_span`, and `reference.boxes` / `.text` when `reference` was sent) as they ran — the criterion's, else the service default ([§ The box loop's options](#the-box-loops-options--per-criterion)) |
 | `error` | Why, when `status` is `error` |
 | `complete` | `false` when any of the criterion's units errored — its answer ignores part of what was asked, and the assessment is incomplete too |
 | `aggregate_used` | The rules applied, `{"pages", "documents"}`; `"pages": null` plus a `note` for a document-scope `text` criterion |
@@ -1975,7 +2129,7 @@ item order; for a `text` criterion with `scope: "document"`, one per document
 | `reason` / `detail` / `error` | That unit's explanation — a skipped unit's reason names the dependency |
 | `regions` | A **count** of that unit's regions. The geometry itself is in the criterion's `regions` (by `page`), per item in `artifacts.items`, and complete in `regions.json` — a list here would repeat it once per unit |
 | `text_layer` | The link to the text layer that unit read (`text.p{n}.<key>.json`, or `text.d{i}.<key>.json`), or `null` |
-| `localization` | `llm` units only: that item's enforcement-loop record |
+| `localization` | `llm` units only: that item's enforcement-loop record (with its one-entry `references` list when the criterion has a guide) |
 
 **A failed criterion fails alone.** A model HTTP error, an answer that could
 not be parsed after `MAX_LLM_RETRIES`, a detector outage — each gives that
@@ -2072,7 +2226,7 @@ and page each n is.
 | `p{n}.base.jpg` | per item with a page image | The un-annotated page, JPEG q85. Every preview of item n is composited from it |
 | `p{n}.svg` / `p{n}.layer.png` / `p{n}.preview.jpg` | **on first fetch** | Item n's layer, rendered from regions.json by `regions.artifacts.render_layer`, then cached in the directory |
 | `p{n}.<slug>.svg` / `.layer.png` / `.preview.jpg` | **on first fetch** | One criterion's layer on item n, the same way — fetched by name, or as `p{n}.svg?criterion=<slug>` |
-| `references.json` | when the request listed `references` | The plan's summary (the result's `references` block), the `auto` `catalogue`, every item's `selection` with the model's raw answer beside the validated one, and `calls` — which composite (`reference_id`, `criterion`, `composite`, `polarity`) went into which guided call, with its image count, score and error. JSON, so the byte cap never drops it |
+| `references.json` | when the request listed `references` | The plan's summary (the result's `references` block), the `auto` `catalogue`, every item's `selection` with the model's raw answer beside the validated one, and `calls` — which example (`reference_id`, `criterion`, `composite`, `polarity`) went into which guided call, each with its `kind`: `scoring` (its `call`, image count, score and error) or the box loop's `box_ask` / `box_refine` / `box_verify` (its `attempt`, image count, `example_images: composite \| crop` and `ok`). One list; filter by `kind`. JSON, so the byte cap never drops it |
 
 A job nobody looks at costs a JSON file, its text layers and a JPEG per page.
 The result's `artifacts.items` (and each criterion's `artifacts.items`) lists
@@ -2329,13 +2483,36 @@ attempt 1 ── ask ────── one criterion, the page image its scorin
    │                    the grid on the crop, ask again, map the answer back
    │                    into the page frame. An unusable second answer keeps
    │                    the coarse box; both are recorded
+   │                    ◄ options.refine: "marks" (default
+   │                    _REFINE_MODE, grid): number the OCR lines in the
+   │                    crop instead of the grid, "which mark(s)?", the box
+   │                    = their union; the grid pass is the fallback
    ├── verify ───────── crop that box out of the ORIGINAL page (+25% padding,
    │                    CLASSIFIER_LLM_BBOX_CROP_PAD), send the CROP ALONE:
    │                    "is <criterion> visible in this? 1–10". Accept at
    │                    CLASSIFIER_LLM_BBOX_VERIFY_PASS (7)
+   │                    ◄ options.verify_min_span (default _VERIFY_MIN_SPAN,
+   │                    0): grow the crop to a share of the page;
+   │                    options.verify_partial (default _VERIFY_PARTIAL,
+   │                    off): also "is it cut off?"
    └── retry ────────── re-ask with the rejection as feedback, up to the
                         criterion's options.max_attempts (default and cap
-                        CLASSIFIER_LLM_BBOX_MAX_ATTEMPTS, 3)
+                        CLASSIFIER_LLM_BBOX_MAX_ATTEMPTS, 3) — "same place,
+                        larger" for a partial crop (verify_partial)
+
+with references, each step of the criterion's options.reference.boxes
+(default its knob, off) puts the criterion's examples FIRST in its call —
+same calls, more images:
+   ask    ◄── reference.boxes.ask     (CLASSIFIER_REFERENCE_BOX_ASK)
+              composites (crops under the position check), then the
+              gridded CANDIDATE
+   refine ◄── reference.boxes.refine  (CLASSIFIER_REFERENCE_BOX_REFINE)
+              region crops, then the zoomed CANDIDATE crop
+   verify ◄── reference.boxes.verify  (CLASSIFIER_REFERENCE_BOX_VERIFY)
+              region crops, then the CANDIDATE crop
+
+every ◄ is per criterion: the criterion's value, else the service default
+(the env var named); all off by default
 ```
 
 The verify call is what makes a box mean something: the page is deliberately
@@ -2357,6 +2534,154 @@ by default and both are recorded on the attempt. What the second pass cannot
 fix is *identification*: asked for a logo, a model that boxes the heading
 naming the same company 90 units lower is precisely placed on the wrong thing.
 
+**Why reference examples in the loop.** Identification is what an example
+fixes: an outlined example of the right thing shows the model *which* thing
+to box. The verify call has the same blind spot. Shown only the company
+heading and asked "is the logo visible?", it can say yes; with the example's
+logo crop beside it, it should say no. Verify is also the step most likely to
+accept the wrong thing: shown two crops, a model can score resemblance, or
+score the reference crop, which always shows the feature. So
+`CLASSIFIER_REFERENCE_BOX_VERIFY` goes on only if false accepts do not rise.
+What the loop is shown, the selection rules and the cost are in
+[§ What the model is shown](#what-the-model-is-shown-and-what-it-costs).
+The three knobs are the service defaults and stay OFF; a criterion turns
+its own steps on with `options.reference.boxes`
+([§ Turning the box-loop options on for a document](#turning-the-box-loop-options-on-for-a-document)).
+
+**Measured (ZT-527, muse-glimmer, November 2026).** Hit = the accepted
+box's centre inside a hand-reviewed truth box (any real copy); a "wrong box"
+is an accepted box that misses; for an item the page does not have, the
+right answer is no box. Every example came from ANOTHER project's page.
+
+* **Two fixture bills, then a same-template pair** (`grounding_truth.json`;
+  logo, amount due, account number). Today's loop already found the logo
+  every time, so there was nothing to fix. The first guided-verify wording
+  ("what X looks like here") scored every correct logo 1 against another
+  utility's logo (0 of 20 accepted); reworded to "examples from OTHER
+  documents … score whether the CANDIDATE shows it", verify became neutral
+  (20 of 20). Composites in the verify matched crops at ~2.5× the tokens,
+  so the verify keeps crops.
+* **57 real utility bills** from the Operations Assistant deal-review queue
+  (the amount-due line and the usage-history chart, truth reviewed by hand,
+  `bin/grounding_experiment.py`). On the 7 amount-due pages the loop missed
+  more than half the time:
+
+  | Setup | Hit | Wrong box | Calls per run |
+  |---|---|---|---|
+  | Today (no examples) | 14% | 9% | 8.1 |
+  | `reference.boxes` (all three) | 74% | 0% | 4.4 |
+  | + `refine: "marks"` | 71% | 3% | 5.5 |
+  | + marks, `verify_partial`, `verify_min_span: 0.08` | 80% | 0% | 4.7 |
+  | + all four (adds `reference.text`) | 91% | 0% | 3.9 |
+
+  On the 84 pairs that already passed, the three reference steps together
+  made no page worse (amount due 95.6 → 98.9%, wrong boxes 3.3 → 0%);
+  VERIFY on its own made 5 pages worse, so the three go on together. Each
+  grounding option cost 1–4 points on those passing pages. On 9 bills
+  whose only chart is a look-alike (no real usage chart), the right answer
+  "not found" went 2% → 44% with references and **93%** with a FAIL
+  reference of the look-alike beside the PASS one.
+* **End to end through `POST /assess`** (`bin/reference_box_assess.py`:
+  stored references, key matching, per-criterion options), on the 57 bills
+  (3 repeats) and on a HOLDOUT of 21 bills never used for tuning (5
+  repeats), today's loop against the per-document setup below:
+
+  | | Holdout | 57 bills |
+  |---|---|---|
+  | Amount due: hit | 87.5 → **93.8%** | 83.3 → **95.5%** |
+  | Amount due: wrong box | 3.8 → 5.0% | 5.8 → 1.9% |
+  | Usage: hit (page has the chart) | 83.3 → 83.3% | 98.3 → 96.6% |
+  | Usage: wrong box | 16.7 → **3.3%** | 0 → 0% |
+  | Usage: right "not found" (no chart) | 100 → 100% | 50 → **100%** |
+  | Usage: box on the look-alike | 9.5 → 1.9% | 15.8 → **0%** |
+
+  The amount due with references but no marks scored 90.0% / 8.8% on the
+  holdout: references do the work, and marks do not hurt.
+
+**Defaults.** Every service default stays OFF; a document opts in per
+criterion. The measured setup: a one-line text field (the amount due) with
+`refine: "marks"` + `reference.boxes` (all three); a chart (the usage
+history) with `reference.boxes` (all three, no marks) + a FAIL reference of
+each look-alike. `verify_partial`, `verify_min_span` and `reference.text`
+stay off: no consistent gain end to end (`reference.text` lifted the
+hardest pages, 80 → 91%, but cost a little on pages that already worked).
+Small sets: read a few points either way as noise; the large moves (wrong
+usage boxes, look-alike landings, the hard amount-due pages) held in every
+run.
+
+**Placement aids — all off by default** (measured above). A box-loop miss is either
+*placement* (the right thing, but the box is a few pixels off or too tight: a
+thin text line 15 px off, `$193.33` boxed without its `Amount due` label) or
+*identification* (the wrong thing boxed). Reference examples can only help
+identification, and placement misses swamp it. Four settings, each a
+per-criterion option whose service default is an env var
+([§ The box loop's options](#the-box-loops-options--per-criterion)), each
+OFF by default and each byte-identical to the loop without it when off:
+
+* **Refine by numbered marks** — `options.refine: "marks"` (service default
+  `CLASSIFIER_LLM_BBOX_REFINE_MODE`, `grid`). Made for text fields (an amount
+  due, an account number); a chart or a logo has no text line to mark, or
+  only its labels, so leave those on the grid
+  ([§ Turning the box-loop options on](#turning-the-box-loop-options-on-for-a-document)).
+  After the coarse ask validates, the refine crop (the same
+  window, cut from the ORIGINAL page) shows every OCR text line that lies at
+  least half inside the window, outlined and numbered on a tab at its left
+  end, in reading order (`common.vision.draw_marks_overlay`), instead of the
+  grid. The model answers `{"reason": "...", "marks": [n, …]}`, quoting the
+  lines first. Several marks are one feature — a label line and its value
+  line become one box. The refined box is the union of the chosen lines'
+  boxes, so it fits the text exactly. The lines are the criterion's own text
+  layer, the one its `options.ocr` produced for the scoring call, so there is
+  no extra OCR pass. Earlier attempts' rejections ride along, under a note
+  that their coordinates are on the whole page. With
+  `reference.boxes.refine` on, the region crops come first, with a
+  marks-worded guard. **The grid refine runs instead** — one more call — and
+  the attempt says why in `marks_fallback` when:
+  * the page has no OCR line boxes (native PDF/SVG text, `ocr: "never"`, or
+    OCR found nothing);
+  * no line lies inside the window (a logo, a photo);
+  * the window holds more than `CLASSIFIER_LLM_BBOX_MARKS_MAX` (40) lines;
+  * the answer is unusable (no answer, no `marks`, not whole numbers, a
+    number that was not drawn);
+  * the answer is `"marks": null` or `[]` — none of the lines is the feature,
+    and a picture can still be boxed on the grid.
+
+  `CLASSIFIER_LLM_BBOX_REFINE=false` turns both refines off. The coordinate
+  path: coarse box (page grid) → `refine_window` (page grid) → `window_rect`
+  (original pixels, the rect `crop_window` cuts) → `to_crop_px` (the crop's
+  pixels after it is fitted to ≤1000 px) for the drawing; the chosen lines'
+  union stays in original pixels (`bbox_px`, clamped) and is converted to the
+  page grid (`bbox_grid`, `pixels_to_grid`) — so a marks-refined `bbox_grid`
+  is derived, not a number the model wrote.
+* **"Cut off" verify** — `options.verify_partial: true` (service default
+  `CLASSIFIER_LLM_BBOX_VERIFY_PARTIAL`, `false`). The verify
+  answer gains `"partial": true|false`: the crop shows the feature, or part
+  of it, but cuts some of it off at an edge. It does not move the score —
+  the 1–10 scale and `CLASSIFIER_LLM_BBOX_VERIFY_PASS` mean what they always
+  did. When the attempt is rejected AND partial, the retry is told *"the
+  crop of your previous box […] showed <criterion> but cut part of it off
+  (verify score n); box the same place again, larger, so that all of it is
+  inside — its label and every digit"* instead of *"…; look elsewhere"*. No
+  extra calls. Recorded as `verify_partial`.
+* **Minimum verify-crop span** — `options.verify_min_span`, 0–1 (service
+  default `CLASSIFIER_LLM_BBOX_VERIFY_MIN_SPAN`, 0).
+  Above 0, the verify crop (after `CLASSIFIER_LLM_BBOX_CROP_PAD`) is grown,
+  centred on the box, to at least that fraction of the page on EACH axis,
+  and slid back inside the page at an edge. A wide text line is already wider
+  than the width floor, so only its height grows, which keeps its label in
+  view; a small square feature gets context on both axes, as the refine
+  window's minimum does. Only the crop the verify sees grows: the box,
+  `bbox_px`, the regions and the reference crops are unchanged, and nothing
+  new is recorded.
+* **An example's text** — `options.reference.text: true` (service default
+  `CLASSIFIER_REFERENCE_BOX_TEXT`, `false`)
+  ([§ What the model is shown](#what-the-model-is-shown-and-what-it-costs)):
+  each box-loop example's caption quotes the text inside its region.
+
+The whole-page marks ask (marks instead of the grid on the coarse ask) is not
+built: a bill page holds 60–150 OCR lines, and one text line is under the
+page-level area floor the ask is validated against.
+
 **The grid step.** `CLASSIFIER_LLM_BBOX_GRID_STEP` (100 grid units) spaces the
 lines on the ask image and on the refine crop (which gets its own grid in its
 own frame); both the drawn overlay (`common.vision.draw_grid_overlay`) and the
@@ -2373,7 +2698,7 @@ a prompt that does not mention a grid.
 
 | Condition | Why |
 |---|---|
-| `options.boxes: true` | Off by default — up to 3 extra calls per attempt |
+| `options.boxes: true` | Off by default — up to 3 extra calls per attempt (4 with `refine: "marks"` when the marks pass falls back to the grid refine) |
 | hint `presence` or `auto` | "image sharpness" is a property of the whole page; boxing it would be a fabrication |
 | the criterion's scoring call gave it **≥ 7** | Below that the model has just said the feature is absent |
 | the document has a page image | `.txt` / `.docx` have no pixel space for a box |
@@ -2423,8 +2748,9 @@ about the model, and it is renderable on its own:
       ]
     }]
   },
-  "options_used": {"hint": "presence", "boxes": true, "max_attempts": 3, "ocr": "auto",
-                   "aggregate": {"pages": "any", "documents": "all"}},
+  "options_used": {"hint": "presence", "boxes": true, "max_attempts": 3,
+                   "refine": "grid", "verify_partial": false, "verify_min_span": 0.0,
+                   "ocr": "auto", "aggregate": {"pages": "any", "documents": "all"}},
   "…": "…"
 }
 ```
@@ -2436,6 +2762,25 @@ only rejected boxes and the criterion's score is untouched.
 whose coarse box validated and so went through the refine pass: `bbox_grid`
 is then the refined box when `refined` is `true`, and the coarse box kept
 (with a `refine_reject` sentence) when it is `false`.
+
+Behind the opt-in settings above, an attempt adds (each key absent when its
+setting is off, so the record is otherwise exactly the one above):
+
+| Key | When | What |
+|---|---|---|
+| `refine_mode` | `refine: "marks"` (the criterion's, or its service default) and a refine ran | `marks` when the marks pass produced the box, `grid` when it fell back |
+| `marks` | the marks pass produced the box | the chosen mark numbers (1-based, as drawn), sorted — ids only, never the lines' text |
+| `marks_shown` | a marks call was made | how many lines were numbered |
+| `marks_fallback` | `refine_mode: "grid"` | why the grid refine ran (one sentence) |
+| `verify_partial` | `verify_partial: true` (the criterion's, or its service default) and the verify said | the verify's `partial` — the crop cut the feature off |
+
+```json
+{"attempt": 1, "bbox_grid": [50.0, 116.7, 412.5, 142.5], "bbox_px": [40, 140, 330, 171],
+ "valid": true, "accepted": true, "verify_score": 9, "verify_reason": "Amount due $193.33",
+ "verify_partial": false,
+ "coarse_bbox_grid": [100, 200, 300, 400], "refine_window_grid": [0, 50, 450, 550],
+ "refined": true, "refine_mode": "marks", "marks_shown": 3, "marks": [2, 3]}
+```
 
 `attrs.detector_iou` (the IoU against the detector's best box for the same
 criterion) is still computed by `llm.boxes.locate_criterion` when it is handed
@@ -2459,11 +2804,14 @@ behaviour, not just the log.
 
 **Cost.** One ask per attempt, plus one refine and one verify per attempt
 whose coarse box validated — at most `3 × max_attempts` small calls per
-located criterion (`2 ×` with `CLASSIFIER_LLM_BBOX_REFINE=false`), each capped
+located criterion (`2 ×` with `CLASSIFIER_LLM_BBOX_REFINE=false`; in marks
+mode a marks call that falls back to the grid adds the grid refine, so at most
+`4 ×`), each capped
 at the criterion's model's `max_tokens.box` (muse-glimmer: 1024) and each
 counted against that model's `max_concurrent`. Every call goes to the same
 model the criterion was scored on; a text-only model never runs the loop
-(boxes are refused at submit). Metric:
+(boxes are refused at submit). Reference examples add images to these calls,
+never calls. Metric:
 `classifier_llm_bbox_attempts_total{outcome=accepted|rejected_invalid|rejected_verify|exhausted}`.
 
 **Before trusting it on a new model**, run the grounding experiment:
@@ -2471,15 +2819,413 @@ model the criterion was scored on; a text-only model never runs the loop
 ```bash
 # On the box (it talks to a models.yaml entry's URL directly — the default
 # unless --model names another vision entry)
-docker compose exec classifier python bin/grounding_experiment.py
-docker compose exec classifier python bin/grounding_experiment.py --model qwen2.5-vl
-docker compose exec classifier python bin/grounding_experiment.py \
+docker exec classifier uv run --no-sync python bin/grounding_experiment.py
+docker exec classifier uv run --no-sync python bin/grounding_experiment.py --model qwen2.5-vl
+docker exec classifier uv run --no-sync python bin/grounding_experiment.py \
   --images /data/roof-photos --criteria /data/criteria.json --out /data/grounding.json
+
+# With and without reference examples, scored against the truth boxes (the
+# container has no unit-tests/ folder: copy the bills and the truth file in,
+# then run once per bill as the reference — never its own candidate)
+docker exec classifier mkdir -p /data/grounding
+docker cp unit-tests/classifier/documents/utility_bill.jpeg   classifier:/data/grounding/
+docker cp unit-tests/classifier/documents/utility_bill_2.jpeg classifier:/data/grounding/
+docker cp unit-tests/classifier/documents/grounding_truth.json classifier:/data/grounding/
+docker exec classifier uv run --no-sync python bin/grounding_experiment.py --images /data/grounding \
+  --truth /data/grounding/grounding_truth.json \
+  --reference-image /data/grounding/utility_bill_2.jpeg --out /data/grounding/ref2.json
+docker exec classifier uv run --no-sync python bin/grounding_experiment.py --images /data/grounding \
+  --truth /data/grounding/grounding_truth.json \
+  --reference-image /data/grounding/utility_bill.jpeg --out /data/grounding/ref1.json
+```
+
+`--configs` (default `off,ask,refine,verify,all`) names which calls see the
+examples; `--repeats` (default 5) repeats each, since the model samples at
+temperature 1.0; `--references r…` takes the examples from stored references
+instead of a truth-boxed image.
+
+The truth file is, per image, `{"criteria": {name: [[x1, y1, x2, y2], …]},
+"decoys": {name: [[x1, y1, x2, y2], …]}, "absent": [name, …]}` in original
+upright page pixels (a bare box is a list of one; `decoys` and `absent` are
+optional, and `criteria` may be left out when `absent` is given). Every real
+copy of a criterion is one of its boxes. The `criteria` and the `absent`
+names are asked; `--reference-image` draws each example from the
+criterion's first box. A **hit** is the accepted box's centre inside any
+copy; IoU and the centre error are against the best-matching copy (highest
+IoU, then the closest centre). **Decoys** are never asked. For a miss,
+`landed on` names the other criterion or decoy whose box holds the centre,
+criteria first: the identification case, a logo asked for and a line of
+`text naming the utility` boxed.
+
+**Expected absent.** `absent` lists criteria that are NOT on the page — a
+bill without the monthly usage chart, usually with a look-alike graph on it
+(mark that as a decoy). Each is asked exactly like a boxed criterion, and
+its runs are scored `expected: "absent"` (a boxed pair's are `"present"`):
+**correct** when the loop accepted no box (the model answered `bbox: null`,
+or every attempt was rejected), **wrong** when it accepted one — and
+`landed_on` still names the decoy or criterion the wrong box landed on.
+Absent runs never enter the hit rate, false-accept rate, IoU or centre
+error: each configuration's summary (overall and per criterion) reports
+them in their own `absent` block — `n`, `correct_rate`,
+`wrong_accept_rate`, `bbox_null_rate` (how often the model said so itself)
+and `landed_on_rates` — and the printed table adds an `absent:` line under
+the row. Each record carries `expected` and, on an absent run, `correct`.
+A name both absent and boxed (or a decoy) on one page is refused, and a page
+where a criterion is absent is never its PASS example
+(`--references-from-truth` draws only from boxes).
+
+`--verify-images crop|composite` (default `crop`) sets what a guided verify
+is shown in the `verify` and `all` configs. `crop` is the examples' region
+crops, as the service does. `composite` is the same composites the ask is
+shown, with the composite captions (`llm.boxes.locate_criterion(...,
+verify_examples=...)`; the service never passes it). Refine always sees the
+crops. The run header and `summary.config` print the choice, and every
+record carries it.
+
+The placement aids are flags too — the script has no criteria, so its flags
+stand in for the per-criterion options (`options.refine`,
+`options.reference.text`, `options.verify_partial`,
+`options.verify_min_span`) — each defaulting to the container's own service
+default and passed to the loop explicitly: `--refine-mode grid|marks`,
+`--reference-text` / `--no-reference-text`, `--verify-partial` /
+`--no-verify-partial`, `--verify-min-span F`. In marks mode the script OCRs
+each image once (the service's engine) and caches it. The header prints them,
+`summary.config` holds them (with `marks_max`), and every record carries
+`refine_mode`, `reference_text`, `verify_partial` and `verify_min_span`, plus
+`example_text`, what the example captions quoted. With marks, each
+configuration's summary adds `marks_refined_rate`: of the attempts that
+refined, how many the marks pass refined rather than the grid fallback.
+
+```bash
+# The baseline, then marks + an 8% verify floor + the cut-off field (no examples)
+docker exec classifier uv run --no-sync python bin/grounding_experiment.py --images /data/grounding \
+  --truth /data/grounding/grounding_truth.json --configs off --out /data/grounding/grid.json
+docker exec classifier uv run --no-sync python bin/grounding_experiment.py --images /data/grounding \
+  --truth /data/grounding/grounding_truth.json --configs off --refine-mode marks \
+  --verify-partial --verify-min-span 0.08 --out /data/grounding/marks.json
+```
+
+The `--out` JSON records each run's reasons as well as its numbers:
+
+* `attempt_log` is each attempt as `localization.attempts` has it: its box,
+  `verify_score`, `verify_reason`, and the `reject` sentence the retry is
+  told.
+* `answers` is every model request in call order: `{kind: ask | refine |
+  verify, attempt, request, bbox | marks | score, reason, ok}` — `marks` for
+  a marks refine (label `refine/marks/…`), and `partial` beside a verify's
+  `score` when it answered one.
+  * `attempt` is the loop attempt, taken from the call label; `request` > 1
+    is a parse retry.
+  * `score` is the model's own number, before clamping.
+  * An answer that does not parse keeps its raw content, or the error, cut to
+    400 characters, with `ok: false`.
+  * The prompt is never stored.
+* `reference_image` is the page the examples came from, and `reference_note`
+  says why a pair ran unguided.
+
+**A test set of many pages.** Running every page × criterion × config at
+once takes hours, so the run is split in two steps, and the examples come
+from the set itself:
+
+* `--references-from-truth` (with `--truth`) builds each candidate's example,
+  per criterion and repeat, from ONE other page of the truth file that has a
+  box for that criterion. It uses the page's first box, built exactly as
+  `--reference-image` builds one.
+* The example page is never the candidate. With `--groups` (`{"file.jpg":
+  group}`), it is also never a page of the candidate's group. A project's
+  other pages are likely the same utility's, and the same template is not
+  what the run measures.
+* The pick is deterministic: the eligible pages are sorted and
+  `(crc32(candidate) + repeat) % n` is taken, so the repeats rotate through
+  different references. A pair with no eligible page runs unguided, and a
+  note says so.
+* `--groups-from-selection <selection.json> --write-groups <groups.json>`
+  writes the groups (each `pages[].image` → its `links[].project_id`) and
+  exits.
+* `--subset` (`{"file.jpg": ["criterion", …]}`) asks only those pairs.
+* `--write-failures <file>` writes, after a run, the `--subset` of pairs whose
+  `off` runs hit in under 50% of their repeats — and of absent pairs whose
+  `off` runs were correct (no box) in under 50% of theirs — and prints how
+  many.
+* `--fail-from-decoys DECOY=CRITERION` (repeatable, with
+  `--references-from-truth`) adds a FAIL example of a look-alike after the
+  PASS one: the first `DECOY` box of one other page outside the candidate's
+  group, captioned *"the outlined thing is NOT <criterion>; do not box it"*
+  — the pairing the service sends at three images per prompt. `CRITERION`
+  is exact or a case-insensitive substring of exactly one asked criterion
+  (boxed or absent). Its effect is read in `landed_on_rates` and, on pages
+  without the feature, the `absent` block's `correct_rate`.
+
+```bash
+docker exec classifier mkdir -p /data/grounding_ops
+docker cp images         classifier:/data/grounding_ops/images
+docker cp truth.json     classifier:/data/grounding_ops/truth.json
+docker cp selection.json classifier:/data/grounding_ops/selection.json
+docker exec classifier uv run --no-sync python bin/grounding_experiment.py \
+  --groups-from-selection /data/grounding_ops/selection.json \
+  --write-groups /data/grounding_ops/groups.json
+# Step 1 — the baseline on everything; writes the pairs it fails
+docker exec classifier uv run --no-sync python bin/grounding_experiment.py \
+  --images /data/grounding_ops/images --truth /data/grounding_ops/truth.json \
+  --configs off --write-failures /data/grounding_ops/failures.json \
+  --out /data/grounding_ops/baseline.json
+# Step 2 — the guided configs on those pairs only
+docker exec classifier uv run --no-sync python bin/grounding_experiment.py \
+  --images /data/grounding_ops/images --truth /data/grounding_ops/truth.json \
+  --subset /data/grounding_ops/failures.json \
+  --references-from-truth --groups /data/grounding_ops/groups.json \
+  --configs ask,refine,verify,all --out /data/grounding_ops/guided.json
 ```
 
 If attempt-1 validity is under ~50%, prefer `detector` criteria as the primary
 source and keep `llm` criteria with `options.boxes` for labels the detector
 cannot name.
+
+**End to end, through the API — `bin/reference_box_assess.py`.** The
+experiment calls `llm.boxes.locate_criterion` directly, with examples it
+builds itself, so it skips everything around the loop: stored references,
+key matching, `box_selection` (a FAIL example reaches the loop only under a
+`presence` reference criterion) and the per-criterion options. This script
+measures the same truth file the production way, over HTTP against the
+container's own uvicorn (`--base-url`, default `http://127.0.0.1:8000`):
+
+* **References** — one `POST /references` per (truth page, criterion,
+  polarity) that can teach something: PASS from the criterion's first truth
+  box (score 10), FAIL from the first box of its `--fail-from-decoys` decoy
+  (score 1). Each holds ONE scored copy of the locate criterion (same name
+  and `--key`, hint `presence`, `boxes: true`), so key matching hands each
+  candidate criterion exactly its own examples. Fully supplied, with a
+  generic title and description and the tag `zt527-e2e`: no model call. The
+  run refuses to start past `CLASSIFIER_REFERENCE_MAX_COUNT`, waits for
+  `ready`, and leaves a `failed` one out.
+* **Jobs** — one `/assess` per (candidate page, repeat), every criterion the
+  truth asks of it (`absent` ones included) as the production locate
+  criterion (`hint: presence`, `score: false`, `boxes: true`, its `key`, its
+  `--options` overlay), with one PASS and (mapped, at 3 images per prompt)
+  one FAIL reference per criterion — picked like the experiment's examples:
+  outside the candidate's group, rotated across repeats, PASS and FAIL
+  independently. `--no-references` is the baseline through the same path.
+  `--concurrency` (4) jobs in flight.
+* **Scoring** — from the job result only: the accepted attempt against the
+  truth exactly as the experiment scores it (hit, `absent` correct,
+  `landed_on`), the loop's calls, and from `localization.references` whether
+  the PASS and FAIL examples reached the loop. `--out` keeps ids, outcomes and
+  the box-loop settings that ran — never a reason.
+* **Clean-up** — in a `finally` (an error, Ctrl-C): every job (each as soon as
+  its record is in `--out`), the references' creation jobs, and every
+  reference the run created. `--purge` deletes every reference tagged
+  `zt527-e2e` after a run that was killed outright.
+
+The loop runs in the SERVICE, so its env knobs are the container's (`.env`,
+`make up classifier`), not the script's. Two configs make the comparison:
+
+```bash
+# Baseline — no references, no options
+docker exec classifier uv run --no-sync python bin/reference_box_assess.py \
+  --images /data/grounding_ops/images --truth /data/grounding_ops/truth.json \
+  --groups /data/grounding_ops/groups.json --repeats 5 \
+  --key "total the customer owes=amount_due_figure" --key "usage history=usage_history" \
+  --no-references --label baseline --out /data/grounding_ops/e2e_baseline.json
+# Per-criterion options plus references, a FAIL example of the usage look-alike
+docker exec classifier uv run --no-sync python bin/reference_box_assess.py \
+  --images /data/grounding_ops/images --truth /data/grounding_ops/truth.json \
+  --groups /data/grounding_ops/groups.json --repeats 5 \
+  --key "total the customer owes=amount_due_figure" --key "usage history=usage_history" \
+  --options 'total the customer owes={"refine":"marks","reference":{"boxes":{"ask":true,"refine":true,"verify":true}}}' \
+  --options 'usage history={"reference":{"boxes":{"ask":true,"refine":true,"verify":true}}}' \
+  --fail-from-decoys "lookalike false usage history=usage history" \
+  --label guided --out /data/grounding_ops/e2e_guided.json
+```
+
+### The box loop's options — per criterion
+
+The loop's opt-in settings are options on each `llm` criterion, so a request
+can turn on what helps one field and leave the next field alone: the marks
+refine for an amount due, reference examples for a chart, nothing for a
+signature. Each is optional, and each needs `options.boxes: true`. **Unset,
+it is the service default** — the env var named below, which ships off — so
+a request that sets none of them runs the loop exactly as before.
+
+On an `llm` criterion's `options`, beside `boxes` and `max_attempts`:
+
+| Option | Values | Unset = service default | What it does | What it costs | Refused (400) when |
+|---|---|---|---|---|---|
+| `refine` | `"grid"` \| `"marks"` | `CLASSIFIER_LLM_BBOX_REFINE_MODE` (`grid`) | How the refine pass asks. `grid`: the zoomed crop with its own grid, a box on it. `marks`: every OCR text line in the zoomed window outlined and numbered, *"which mark(s)?"*, the refined box the union of the chosen lines — so it fits the text exactly. Reads the criterion's own text layer (`options.ocr`); falls back to the grid when the page has no line boxes, the window holds none or more than `CLASSIFIER_LLM_BBOX_MARKS_MAX` (40, service-wide), or the answer is unusable | No extra call and no extra image: the refine call shows the marked crop instead of the gridded one. A marks answer that falls back to the grid adds that call (at most `4 × max_attempts` calls). No extra OCR pass | `boxes` not `true`; any other value (`"Marks"` too); on `text` / `detector` / `cv` (an unknown key) |
+| `verify_partial` | `true` \| `false` | `CLASSIFIER_LLM_BBOX_VERIFY_PARTIAL` (`false`) | The verify also answers `"partial"`: the crop shows the feature but cuts some of it off. Never moves the score or `CLASSIFIER_LLM_BBOX_VERIFY_PASS`; a REJECTED attempt that was partial is retried with *"box the same place again, larger"* instead of *"look elsewhere"*. Recorded as `verify_partial` on the attempt | Nothing: one more field in the verify's answer | `boxes` not `true`; not a boolean; on `text` / `detector` / `cv` |
+| `verify_min_span` | `0`–`1` | `CLASSIFIER_LLM_BBOX_VERIFY_MIN_SPAN` (`0`) | Grows the verify crop, centred on the box and kept inside the page, to at least this share of the page on each axis (after the 25% padding) — a one-line field's crop then keeps its label beside it. Try `0.08`. Only what the verify SEES grows: the box, `bbox_px` and the regions are unchanged | No extra call; a larger verify crop (more image pixels in that one call) | `boxes` not `true`; below 0 or above 1; not a number; on `text` / `detector` / `cv` |
+
+Under `options.reference` (with `references` on the request — [§ References](#inheritance-auto-and-optionsreference)):
+
+| Option | Values | Unset = service default | What it does | What it costs | Refused (400) when |
+|---|---|---|---|---|---|
+| `reference.boxes` | `{"ask": bool, "refine": bool, "verify": bool}`, each optional | each step its knob: `CLASSIFIER_REFERENCE_BOX_ASK` / `_REFINE` / `_VERIFY` (all `false`) | Which of the loop's calls are shown the criterion's examples, before the candidate: the ask the composites (region crops under `position: "check"`), refine and verify the region crops. Only examples with a region; a FAIL only when its reference criterion's hint is `presence`; at most one PASS-side and one FAIL. The fix for IDENTIFICATION — the loop boxing a look-alike | No extra calls: each guided call carries 1 + examples images (2 with a PASS, 3 with a PASS and a FAIL — the model's `max_images_per_prompt`), holds its `max_concurrent` slot longer, and a guided ask loses the prefix cache the page's other criteria share | `boxes` not `true`; no `references` on the request; an unknown step or a non-boolean; on `cv` (its llm fallback never locates); on `text` / `detector` (`options.reference` itself) |
+| `reference.text` | `true` \| `false` | `CLASSIFIER_REFERENCE_BOX_TEXT` (`false`) | Each box-loop example's caption also quotes the text inside its region — *"The outlined area reads: "Amount due $193.33"."* — so the model knows the wording to look for. Only matters when a `reference.boxes` step is on; a region with no legible text (a logo) gets no sentence | No model call: one OCR pass per example per job (under `CLASSIFIER_OCR_WORKERS`), a sentence in each caption | as `reference.boxes` |
+
+**Precedence.** A value the criterion sets wins — `false` and `0` included
+(a criterion can turn a step OFF on a service whose default is on). A key it
+leaves unset (or sends as `null`) takes the service default, as this
+container reads it. A `reference.boxes` step left out of the object keeps its
+own default (`{"ask": true}` with `CLASSIFIER_REFERENCE_BOX_REFINE=true` is
+ask and refine). The marks cap `CLASSIFIER_LLM_BBOX_MARKS_MAX` is
+service-wide, and `CLASSIFIER_LLM_BBOX_REFINE=false` turns the refine pass
+off for every criterion, `refine: "marks"` included.
+
+**What the result shows.** `options_used` is what RAN: every `llm`
+criterion's `options_used` carries `refine`, `verify_partial` and
+`verify_min_span`, and `reference.boxes` / `reference.text` whenever
+`reference` was sent — each the criterion's value, else the service default.
+`request.criteria` keeps what was SENT (`null` when unset). What the loop
+was shown is `localization.references` (`ask` / `refine` / `verify`; with
+every step off, `applied: false` and a note — *"options.reference.boxes turns
+every step off for this criterion"* when a service default was on). `GET
+/criterion-types` lists the keys (`types.llm.options_schema`,
+`reference.options_schema`) and this container's defaults (`types.llm.defaults`,
+`reference.defaults`, and the `box_loop` block). **None of them ever changes
+a score or a verdict** — the loop runs after scoring.
+
+**Compatibility.** No payload-schema bump and no queue drain: a payload
+queued, a reference saved or an `auto` plan built before these options
+existed has none of the keys and runs exactly as before (on the service
+defaults). With nothing set and the service defaults off, a result is
+byte-identical to the previous build's, except that `options_used` and `GET
+/criterion-types`' defaults now show `refine: "grid"`, `verify_partial:
+false`, `verify_min_span: 0` (and `reference.boxes` / `reference.text` inside
+a `reference` that was sent), and `request.criteria` echoes the new keys as
+`null`. Inheriting criteria from references compares RESOLVED options: an
+unset key and the same key set to this container's default are one
+criterion; two references that would run the loop differently are an
+inheritance conflict (400, send `criteria`).
+
+**Deploy order: the classifier first.** `/assess` refuses an unknown option
+key (a 400 at submit), so a caller that sends `refine`, `verify_partial`,
+`verify_min_span`, `reference.boxes` or `reference.text` to a container
+without this build gets a 400 for every request. Deploy the classifier
+BEFORE any caller sends them — the Operations Assistant's locate jobs
+(ZT-526) included: `make build classifier && make up classifier`, check
+`GET /criterion-types` → `box_loop` is there, then ship the caller. Code
+only — no env change, no `models.yaml` edit, no drain.
+
+### Turning the box-loop options on for a document
+
+The recipe, per document type (a utility bill, a permit, a proposal):
+
+1. **Locate with the loop.** Each field you want a box for is an `llm`
+   criterion with `hint: "presence"` and `boxes: true` (`score: false` when
+   you want only the box). The loop runs only when the scoring call gave the
+   field 7 or more.
+2. **Save references** of the same document type — another customer's page,
+   ideally another utility's — with `POST /references`: each criterion's
+   expected answer and its region, the outline the loop learns WHAT to box
+   from. Give the reference criteria `hint: "presence"` (a FAIL example is
+   only ever shown under it). List their ids in `references` (or use
+   `"auto"`).
+3. **Pick the options per field:**
+   * **A one-line text field** — an amount due, an account number, a due
+     date: `refine: "marks"` (the box becomes the OCR lines the model
+     picks, label and value together, so it fits the text) and
+     `reference.boxes` with all three steps (on a page full of numbers,
+     the example says WHICH one). That is the measured setup (amount due,
+     end to end: 83–88% → 94–96% hit). For a field that is still hard to
+     identify, add `reference.text: true` (the example's own words in its
+     caption), `verify_min_span: 0.08` (the verify crop keeps the label
+     beside the number) and `verify_partial: true` (a crop that cut off a
+     digit is retried in the same place, larger): together they lifted the
+     hardest pages 80 → 91% but cost 1–4 points on pages that already
+     worked, so they stay off unless needed.
+   * **A picture** — a usage chart, a logo, a stamp, a signature: leave
+     `refine` on the grid, and turn `reference.boxes` on. Marks numbers OCR
+     text LINES; a chart is not one, so the model can only pick its axis
+     labels or a nearby line, and in the measurement the marks refine
+     slightly hurt a chart criterion. To stop a **look-alike** — another
+     bar graph, a temperature chart — being boxed as the usage chart, list
+     a FAIL reference of the look-alike beside the PASS one (below).
+4. **Check what ran**: `options_used`, `localization.references` (which
+   steps carried examples) and `localization.attempts` (`refine_mode`,
+   `marks`, `verify_partial`). The measurements behind this recipe are in
+   [§ The LLM enforcement loop](#the-llm-enforcement-loop).
+
+An amount due — the measured setup (marks + the three reference steps):
+
+```json
+{
+  "documents": [{"type": "base64", "data": "<base64>", "filename": "bill.jpg"}],
+  "references": ["r1a2b3c4d5e6f"],
+  "criteria": [
+    {
+      "name": "the amount due on this bill",
+      "type": "llm",
+      "options": {
+        "hint": "presence",
+        "boxes": true,
+        "refine": "marks",
+        "reference": {
+          "boxes": {"ask": true, "refine": true, "verify": true}
+        }
+      }
+    }
+  ]
+}
+```
+
+For a field that is still hard to identify, add `"verify_partial": true`
+and `"verify_min_span": 0.08` beside `refine`, and `"text": true` inside
+`reference`.
+
+A usage chart — the measured setup (the three reference steps, no marks)
+and a FAIL reference of a look-alike
+(`r0f9e8d7c6b5a`) beside the PASS one (`r1a2b3c4d5e6f`):
+
+```json
+{
+  "documents": [{"type": "base64", "data": "<base64>", "filename": "bill.jpg"}],
+  "references": ["r1a2b3c4d5e6f", "r0f9e8d7c6b5a"],
+  "criteria": [
+    {
+      "name": "the monthly energy usage chart",
+      "type": "llm",
+      "options": {
+        "hint": "presence",
+        "boxes": true,
+        "reference": {
+          "boxes": {"ask": true, "refine": true, "verify": true}
+        }
+      }
+    }
+  ]
+}
+```
+
+Both can be one request — each criterion runs the loop its own way.
+
+**How a FAIL reference comes to exist.** A FAIL example is a reference whose
+criterion's expected answer is FAIL (score 1–3) and whose region outlines
+the thing that is NOT the feature. The usual way to get one is a job that
+went wrong: an `/assess` that boxed a temperature graph as the usage chart.
+Save that job's page as a reference and mark the criterion FAIL — its
+accepted box, on the look-alike, becomes the region:
+
+```json
+{
+  "from_job": "0f1e2d3c4b5a",
+  "from_job_item": 0,
+  "breakdown": {"the monthly energy usage chart": {
+    "score": 1, "reason": "a bar graph of average daily temperature, not energy usage"}},
+  "title": "Temperature graph — not the usage chart"
+}
+```
+
+(With a `document` instead, send the criterion, a FAIL `breakdown` and a
+`regions` box around the look-alike yourself.) The reference criterion's
+hint must be **`presence`**: only there does FAIL mean "not there", so the
+outline can only be the look-alike. Under `quality` / `auto`, FAIL can mean
+"there, but bad" (an illegible signature), and the loop never shows such an
+example as "do not box this". Shown, its caption reads *"REFERENCE EXAMPLE —
+'the monthly energy usage chart' was FAIL here — the outlined thing is NOT
+the monthly energy usage chart; do not box it."*, after the PASS example, in
+every step `reference.boxes` turns on — so on a page that has only the
+look-alike, "not found" (`bbox: null`) is the answer the examples point to.
+A FAIL takes the third image, so it is shown only on a model with
+`max_images_per_prompt` ≥ 3.
 
 ### Layer formats
 
@@ -2658,9 +3404,12 @@ curl http://localhost:4001/v1/classifier/criterion-types -H "Authorization: Bear
     "llm": {
       "options_schema": {"type": "object", "additionalProperties": false,
                          "properties": {"hint": {"…": "…"}, "boxes": {"…": "…"},
-                                        "max_attempts": {"…": "…"}, "ocr": {"…": "…"},
+                                        "max_attempts": {"…": "…"}, "refine": {"…": "…"},
+                                        "verify_partial": {"…": "…"},
+                                        "verify_min_span": {"…": "…"}, "ocr": {"…": "…"},
                                         "model": {"…": "…"}}},
-      "defaults": {"hint": "auto", "boxes": false, "max_attempts": 3, "ocr": "auto",
+      "defaults": {"hint": "auto", "boxes": false, "max_attempts": 3, "refine": "grid",
+                   "verify_partial": false, "verify_min_span": 0.0, "ocr": "auto",
                    "aggregate": {"pages": "worst", "documents": "worst"}},
       "caps": {"max_attempts": 3}
     },
@@ -2683,6 +3432,23 @@ curl http://localhost:4001/v1/classifier/criterion-types -H "Authorization: Bear
     "excluded": "…", "text_scope_document": "…"
   },
   "aggregate_detail": {"rule": "…", "level": "…", "from": "…", "values": "…"},
+  "reference": {"options_schema": {"…": "…"},
+                "defaults": {"use": true, "criterion": "<name>", "position": "off",
+                             "min_iou": 0.3, "combine": "any",
+                             "boxes": {"ask": false, "refine": false, "verify": false},
+                             "text": false},
+                "…": "…"},
+  "box_loop": {
+    "applies_to": "llm criteria with options.boxes: true (refused without it, and on cv, …)",
+    "options": {"refine": "grid | marks — …", "verify_partial": "…", "verify_min_span": "…",
+                "reference.boxes": "…", "reference.text": "…"},
+    "precedence": "the criterion's value, else this container's service default (the env var); …",
+    "service_defaults": {"refine": "grid", "verify_partial": false, "verify_min_span": 0.0,
+                         "reference.boxes": {"ask": false, "refine": false, "verify": false},
+                         "reference.text": false},
+    "marks_max": 40,
+    "score": "never changes a score or a verdict — the loop runs after scoring"
+  },
   "model": {"applies_to": "llm criteria, and cv criteria answered by the llm fallback",
             "precedence": "options.model, then the request's `model`, then the registry default",
             "default": "muse-glimmer",
@@ -2741,9 +3507,22 @@ in one sentence: `options.reference.criterion`, else `key`, else `name`, and
 a keyed criterion never falls back to its name),
 `caps` (`max_per_request`, `max_per_criterion`, `images_per_llm_prompt`) and
 the `position` knobs (`min_iou`, `max_offset`, `cap`). `llm` and `cv`
-`options_schema` list `reference`; `text` and `detector` do not.
+`options_schema` list `reference`; `text` and `detector` do not. Its
+`defaults` show `boxes` and `text` resolved to this container's service
+defaults.
 `shared_fields.key` describes the criterion's `key`; it is new in this build,
 so its presence is how a caller tells the build matches by key.
+
+The top-level **`box_loop`** block is the bounding-box loop's per-criterion
+settings ([§ The box loop's options](#the-box-loops-options--per-criterion)):
+`options` names each key (`refine`, `verify_partial`, `verify_min_span` on
+an `llm` criterion's options; `reference.boxes`, `reference.text` under its
+`reference`), `precedence` the rule (the criterion's value, else the service
+default), `service_defaults` THIS container's defaults (the
+`CLASSIFIER_LLM_BBOX_*` / `CLASSIFIER_REFERENCE_BOX_*` env vars, as
+resolved), and `marks_max` the service-wide `CLASSIFIER_LLM_BBOX_MARKS_MAX`.
+Its presence is how a caller tells the build takes these options (deploy the
+classifier first).
 
 ---
 

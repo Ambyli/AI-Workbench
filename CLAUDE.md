@@ -12,7 +12,7 @@ A uv workspace monorepo, mostly **AI infrastructure** for one Ubuntu box (`zeo@1
 | `scripts/deploy.py` | What `make up` runs ([§ Deploys](#deploys-make-up)). |
 | `unit-tests/<service>/`, `shared/common/tests/` | Tests ([§ Testing](#testing)). |
 | `widget/` | The tray widget (`claude_observer`); the root `config.json` is the widget's. |
-| `.env.example` | Every variable with its comment (the box's copy is `.env`). |
+| `.env.example` | Every variable with its comment; 1:1 with the local `.env`, which differs only in values ([§ Env vars](#env-vars-and-the-port-registry)). The box's copy is its own `.env`. |
 | `Makefile` | `make up|build|logs|exec|network <stack> [service]`; `STACKS` order matters (`signals` before `route-policy`, `edge` last). |
 
 ## Subfolder CLAUDE.md files
@@ -71,6 +71,7 @@ Rules:
 ## Env vars and the PORT REGISTRY
 
 - `.env.example` documents every variable; a new one goes there (with its comment), into the compose `environment:` as `${VAR:-default}` (or `${VAR:?…}` when required), and onto its stack's CLAUDE.md list. A literal `$` in `.env` is `$$`. `openwebui`, `n8n`, `supabase` compose files are pure `${…}` templates — edit `.env`. A changed `.env` value needs `make up <stack>`, not a restart.
+- **`.env.example` and the local `.env` are 1:1.** Same variables, same order and sections, same comments, line for line; only the values differ. Any variable or comment added, removed, renamed or moved in one is changed in the other in the same change. `.env.example` keeps placeholders or defaults, and a value from `.env` is never copied into it (`.env` holds secrets; it is gitignored, so it is edited in place and never printed). A new variable goes into `.env` with its `.env.example` default. The box's own `.env` is a separate copy; tell the user what to add there.
 - Host ports live in the `PORT REGISTRY` block at the top of `.env` as `PORT_*`; never hard-code one in a compose file. Postgres group: `5432` litellm_db, `5433` roofix-db, `5435` n8n-db, `5436` hive-metastore-db, `5437` superset-db, `5438` supabase-db, `5439` classifier-db, `5440` sandbox-db, `5441` route-policy-db (`5434` is a host Postgres on the box). Next free HTTP ports: `8026`, then `8029`. A new port also goes into `ai/AI_INFRA.md § Ports at a glance`.
 - Wiring tests check that a stack's variables are listed in its own CLAUDE.md (`unit-tests/deploy/test_deploy.py` → `ai/edge/CLAUDE.md`, `unit-tests/route-policy/test_wiring.py` → `ai/route-policy/CLAUDE.md`, which also checks route-policy's row in the Postman table below).
 

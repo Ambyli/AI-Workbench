@@ -60,8 +60,10 @@ def test_type_defaults_to_llm_and_options_resolve():
     c = CriterionInput(name="has a roof")
     assert c.type == "llm"
     assert c.resolved_options() == {
-        "hint": "auto", "boxes": False, "max_attempts": LLM_BBOX_MAX_ATTEMPTS, "ocr": "auto",
-        "aggregate": {"pages": "worst", "documents": "worst"},
+        "hint": "auto", "boxes": False, "max_attempts": LLM_BBOX_MAX_ATTEMPTS,
+        # The box loop's settings, resolved to the (off) service defaults.
+        "refine": "grid", "verify_partial": False, "verify_min_span": 0.0,
+        "ocr": "auto", "aggregate": {"pages": "worst", "documents": "worst"},
     }
 
 
@@ -422,6 +424,7 @@ def test_reference_resolves_only_when_sent():
     assert guided["reference"] == {
         "use": True, "criterion": "has a roof", "position": "off",
         "min_iou": REFERENCE_POSITION_MIN_IOU, "combine": "any",
+        "boxes": {"ask": False, "refine": False, "verify": False}, "text": False,
     }
     assert {k: v for k, v in guided.items() if k != "reference"} == plain
     cv = CriterionInput(name="has a house", type="cv",
@@ -462,7 +465,8 @@ def test_criterion_types_has_a_reference_block():
 
     block = criterion_types()["reference"]
     assert block["options_schema"]["additionalProperties"] is False
-    assert set(block["defaults"]) == {"use", "criterion", "position", "min_iou", "combine"}
+    assert set(block["defaults"]) == {
+        "use", "criterion", "position", "min_iou", "combine", "boxes", "text"}
     assert block["caps"]["max_per_criterion"] == REFERENCE_MAX_PER_CRITERION
     # Images per prompt is per MODEL now (GET /models), not a global cap.
     assert "images_per_llm_prompt" not in block["caps"]

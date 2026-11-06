@@ -14,24 +14,47 @@ Division of labour:
 Flow:
   1. ``api.assess`` registers a row (phase "staging") and
      calls ``queue.enqueue()``, which writes the payload, flips the row to
-     "pending", and wakes a worker.
+     "pending" (only from "staging" — a cancel or a delete that landed
+     mid-submit is never undone), and wakes a worker.
   2. One of CLASSIFIER_MAX_CONCURRENT pool workers atomically claims the row
      (→ "processing") and calls ``handle_job``, which reads the payload,
      dispatches on the row's ``metadata.type`` (``JOB_TYPES``: "assess" →
      ``run_assess``, "reference" → ``run_reference``), and deletes the
-     payload once it finishes (a job cancelled by shutdown keeps its payload
-     so the requeued row can be re-run). A row of a removed job type
+     payload once it finishes (a job whose runner was cancelled keeps its
+     payload — see Cancel below). A row of a removed job type
      ("compare", "locate" — queued by an older container) fails with a
      message naming it. A "reference" job that fails for ANY reason —
      including a payload that never landed — marks its reference
-     ``failed``; a cancelled one leaves it ``pending`` for the requeue.
+     ``failed``; a cancelled one leaves that to whoever cancelled it.
      ``handle_job`` also tags every model call the job makes with its id and
      type (``llm.usage`` context vars) and, when the runner returns, adds
      the job's ``usage`` totals to the result.
-  3. The pool persists the result / error (→ "completed" | "failed") and
-     calls ``_on_finish`` for metrics.
+  3. The pool persists the result / error (→ "completed" | "failed") —
+     only while the row is still "processing" — and calls ``_on_finish``
+     for metrics.
   4. Callers poll GET /jobs/{job_id} — and GET /jobs/{job_id}/progress for
      how far along it is.
+
+Cancel (``POST /jobs/{id}/cancel``, ``common.jobs.router``). The registry
+flips the row to "cancelled" at once, in one transaction that refuses a
+finished job. What happens next depends on the phase it was in:
+  * "staging" / "pending" — no worker owns the job: the router's
+    ``on_cancel`` hook (``on_cancel_request``) runs ``finish_cancelled``
+    there and then. A pending row in "cancelled" is never claimed.
+  * "processing" — the pool owns it. ``WorkerPool`` runs ``handle_job`` as a
+    child task and re-reads the row every ``CANCEL_CHECK_INTERVAL_S``; on
+    "cancelled" (or the row gone — ``DELETE /jobs/{id}`` on a running job)
+    it cancels the child, waits for it to unwind, writes nothing (its
+    terminal writes are guarded, so a runner that finishes a moment after
+    the cancel cannot overwrite it either), and calls ``_on_pool_cancel`` →
+    ``finish_cancelled`` in the worker task. The ``CancelledError`` reaches
+    the runner at its next await: the model request is dropped, and its
+    worker, model and OCR slots are free within about a second.
+``finish_cancelled`` is the ONE cleanup, whoever calls it: the payload, the
+``cancelled`` progress state, a reference job's reference, and — for a
+deleted job — the usage rows and artifacts a runner wrote after the DELETE
+hook ran. ``handle_job`` itself never decides it: to the handler a shutdown
+and a cancel are the same ``CancelledError``.
 
 Progress (``common.jobs.progress``). ``enqueue`` writes the ``queued``
 snapshot (0%, attempt 0) while the row is still "staging", so no worker can
@@ -66,15 +89,21 @@ from common.jobs.progress import ProgressGauge, Stage, mark_queued, next_attempt
 from common.jobs.progress_postgres import PostgresProgressStore
 from common.jobs.worker import WorkerPool
 
-from config import MAX_CONCURRENT, PAYLOAD_DIR, PROGRESS_FLUSH_INTERVAL_S, WORKER_POLL_INTERVAL_S
+from config import (
+    CANCEL_CHECK_INTERVAL_S,
+    MAX_CONCURRENT,
+    PAYLOAD_DIR,
+    PROGRESS_FLUSH_INTERVAL_S,
+    WORKER_POLL_INTERVAL_S,
+)
 from db import database
 from jobs.runners import run_assess, run_reference
 from llm import usage as llm_usage
 from logger import logger
 from metrics import job_duration, job_queue_depth, jobs_in_flight, jobs_total
 from middleware import request_id_var
-from references.store import reference_registry, refresh_gauges
-from regions.sweeper import ArtifactSweeper
+from references.store import reference_files, reference_registry, refresh_gauges
+from regions.sweeper import ArtifactSweeper, delete_artifacts_for_job
 
 # The default job type (a row with no metadata.type is an assess), and every
 # type this container runs. Rows of the removed types fail by name.
@@ -120,12 +149,17 @@ class ClassifierQueue:
         # and the history into job_progress beside them, on the same pool.
         # main's lifespan creates the table, after the jobs table it references.
         self.progress = PostgresProgressStore(pool=database)
+        # Cancel-aware: each running job's row is re-read every
+        # CANCEL_CHECK_INTERVAL_S, and a cancelled or deleted one has its
+        # handle_job cancelled; _on_pool_cancel cleans up after it unwound.
         self.pool = WorkerPool(
             registry,
             self.handle_job,
             concurrency=MAX_CONCURRENT,
             poll_interval=WORKER_POLL_INTERVAL_S,
             on_finish=self._on_finish,
+            cancel_check_interval=CANCEL_CHECK_INTERVAL_S,
+            on_cancel=self._on_pool_cancel,
             name="classifier-worker",
             logger=logger,
         )
@@ -159,18 +193,42 @@ class ClassifierQueue:
         The row must have been registered in phase "staging" so no worker can
         claim it before the payload exists. Raises if the payload write fails,
         after marking the job failed — the caller turns that into a 500.
+
+        Both writes are guarded to "staging". A cancel (or a DELETE) can land
+        between the register and the flip — the job id is not even returned
+        yet, but a caller listing ``GET /jobs`` can see it — and an unguarded
+        flip would put a cancelled job back in the queue. When the flip
+        misses, the job was cancelled or deleted mid-submit: this runs
+        ``finish_cancelled`` for what it just wrote (the payload, the queued
+        snapshot) — the router's hook may have run BEFORE they existed — and
+        returns the queue depth as usual; the caller answers 202 with the job
+        id, and the job reads ``cancelled`` (or 404).
         """
         try:
             await self.payloads.write(job_id, payload)
         except Exception as exc:
             logger.error("enqueue: payload write failed for job_id=%s: %s", job_id, exc)
-            await self.registry.set_error(job_id, f"could not persist job payload: {exc}")
+            if not await self.registry.set_error(
+                job_id, f"could not persist job payload: {exc}", from_phases=("staging",)
+            ):
+                logger.warning("enqueue: job_id=%s was cancelled or deleted mid-submit", job_id)
             raise
         # Before the flip to "pending": while the row is "staging" no worker
         # can claim it, so this 0% can never land on top of a running gauge.
         job_type = payload.get("type", JOB_TYPE) if isinstance(payload, dict) else JOB_TYPE
         await mark_queued(self.progress, job_id, stages=_stages(job_type), logger=logger)
-        await self.registry.set_phase(job_id, "pending")
+        if not await self.registry.set_phase(job_id, "pending", from_phases=("staging",)):
+            job = await self.registry.get(job_id)
+            logger.info("enqueue: job_id=%s was %s mid-submit — not queued", job_id,
+                        "deleted" if job is None else f"moved to {job.phase!r}")
+            # A deleted row has no metadata left; the payload names the type
+            # and, for a creation job, the reference.
+            metadata = job.metadata if job is not None else {
+                "type": job_type,
+                "reference_id": payload.get("reference_id") if isinstance(payload, dict) else None,
+            }
+            await self.finish_cancelled(job_id, metadata, gone=job is None)
+            return await self.refresh_queue_depth()
         self.pool.notify()
         return await self.refresh_queue_depth()
 
@@ -180,6 +238,90 @@ class ClassifierQueue:
         pending = counts.get("pending", 0)
         job_queue_depth.set(pending)
         return pending
+
+    # ── Cancel ────────────────────────────────────────────────────────────
+    async def on_cancel_request(self, job_id: str, was_phase: str) -> None:
+        """The jobs router's ``on_cancel`` hook: ``POST /jobs/{id}/cancel``
+        succeeded and the row now says "cancelled".
+
+        A "staging" / "pending" job has no worker, so it is finished here and
+        counted (``jobs_total{status="cancelled"}``). A "processing" one is
+        left alone: its worker sees the phase within
+        ``CANCEL_CHECK_INTERVAL_S``, stops the runner, and the pool's
+        ``on_finish`` / ``on_cancel`` count and clean up — after the runner
+        can no longer write. The router swallows anything raised here.
+        """
+        if was_phase not in ("staging", "pending"):
+            return
+        try:
+            job = await self.registry.get(job_id)
+        except Exception as exc:  # noqa: BLE001 — the payload can still go
+            logger.warning("cancel: could not read job %s: %s", job_id, exc)
+            metadata, gone = {}, False
+        else:
+            metadata, gone = (job.metadata if job is not None else {}), job is None
+        logger.info("cancel: job_id=%s cancelled while %s", job_id, was_phase)
+        await self.finish_cancelled(job_id, metadata, gone=gone)
+        jobs_total.labels(type=metadata.get("type", JOB_TYPE), status="cancelled").inc()
+
+    async def _on_pool_cancel(self, job: JobBase, gone: bool) -> None:
+        """WorkerPool ``on_cancel``: a running job was cancelled (or its row
+        deleted) and ``handle_job`` has unwound — runs in the worker task,
+        never inside the cancelled one. The job's request id is restored
+        around the cleanup so its log lines trace to the request that queued
+        it, as the job's own did."""
+        token = request_id_var.set(job.metadata.get("request_id", "-"))
+        try:
+            await self.finish_cancelled(job.job_id, job.metadata, gone=gone)
+        finally:
+            request_id_var.reset(token)
+
+    async def finish_cancelled(
+        self, job_id: str, metadata: Optional[dict[str, Any]], *, gone: bool
+    ) -> None:
+        """Everything a cancelled job leaves behind, once nothing can write
+        for it any more. THE one cleanup — the router's hook (a job no worker
+        owns), the pool (a running one) and ``enqueue`` (a submit the cancel
+        overtook) all call it, possibly more than once for one job, so every
+        step is idempotent. Never raises: each step is logged and swallowed.
+
+        1. The payload (the input is never needed again).
+        2. While the row exists, its progress snapshot → ``cancelled``
+           (``PostgresProgressStore.cancelled``: where it stopped, plus one
+           history event). The job's ``llm_calls`` rows stay readable at
+           ``GET /jobs/{id}/usage``, and its partial artifact directory is
+           swept with the row after JOB_TTL_HOURS — both as for a job that
+           failed.
+        3. A "reference" creation job's reference → ``failed`` (a ``ready``
+           one is never demoted), its files removed — the pair
+           ``references.store.reconcile`` uses — and the gauges refreshed.
+        4. ``gone`` (the row was deleted while the job ran): the usage rows
+           and artifacts again (``delete_job_side_data``) — the DELETE's own
+           hook ran while the runner could still write them. A row that
+           vanished since the cancel (step 2 finds no row: route-policy
+           cancels and then deletes at once, and the worker may have seen
+           the cancel first) counts as gone too.
+        5. The queue-depth gauge.
+        """
+        metadata = metadata if isinstance(metadata, dict) else {}
+        try:
+            await self.payloads.delete(job_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("cancel: could not remove the payload of job %s: %s", job_id, exc)
+        if not gone:
+            try:
+                gone = not await self.progress.cancelled(job_id)
+            except Exception as exc:  # noqa: BLE001 — progress never fails anything
+                logger.warning("cancel: could not mark the progress of job %s cancelled: %s",
+                               job_id, exc)
+        if metadata.get("type") == "reference":
+            await _cancel_reference(job_id, metadata.get("reference_id"))
+        if gone:
+            await delete_job_side_data(job_id)
+        try:
+            await self.refresh_queue_depth()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("cancel: could not refresh the queue depth: %s", exc)
 
     # ── Consumer side (called by the pool) ────────────────────────────────
     async def handle_job(self, job: JobBase) -> dict:
@@ -230,13 +372,23 @@ class ClassifierQueue:
                     result = await run_assess(payload)
             return await _with_usage(job.job_id, result)
         except asyncio.CancelledError:
-            # A shutdown mid-job: `docker compose stop` / `make up classifier`
-            # sends SIGTERM, uvicorn runs the lifespan shutdown, and
-            # `pool.stop()` cancels this task. The row is left in "processing"
-            # on purpose so the next start's `recover()` requeues it — and the
-            # worker that picks it up needs the INPUT to re-run it. Deleting the
-            # payload here is what used to turn every graceful restart into a
-            # "payload missing" failure for the jobs that were in flight.
+            # Two things cancel this task, and keeping the payload is right
+            # for both — so this branch never asks which:
+            #   * A shutdown mid-job: `docker compose stop` / `make up
+            #     classifier` sends SIGTERM, uvicorn runs the lifespan
+            #     shutdown, and `pool.stop()` cancels the worker, which
+            #     cancels this task. The row is left in "processing" on
+            #     purpose so the next start's `recover()` requeues it — and
+            #     the worker that picks it up needs the INPUT to re-run it.
+            #     Deleting the payload here is what used to turn every
+            #     graceful restart into a "payload missing" failure for the
+            #     jobs that were in flight.
+            #   * A user's cancel (or a DELETE) of the running job: the pool's
+            #     cancel check cancels this task, and once it has unwound,
+            #     `finish_cancelled` (via `_on_pool_cancel`, in the worker
+            #     task) removes the payload with the rest. Cleaning up here
+            #     instead would run inside a cancelled task — see
+            #     common.jobs.worker on why that is the wrong place.
             keep_payload = True
             raise
         except Exception as exc:
@@ -255,6 +407,8 @@ class ClassifierQueue:
                 await self.payloads.delete(job.job_id)
 
     def _on_finish(self, job: JobBase, phase: str, elapsed: float, error: Optional[str]) -> None:
+        # phase: completed | failed | cancelled (a running job the pool
+        # stopped for a cancel or a delete — counted here, not by the router).
         job_type = job.metadata.get("type", "assess")
         jobs_total.labels(type=job_type, status=phase).inc()
         job_duration.labels(type=job_type).observe(elapsed)
@@ -300,6 +454,49 @@ async def _fail_reference(job: JobBase, exc: BaseException) -> None:
         await refresh_gauges()
     except Exception as db_exc:  # pragma: no cover — DB unavailable
         logger.error("queue: could not mark reference %s failed: %s", reference_id, db_exc)
+
+
+async def _cancel_reference(job_id: str, reference_id: Optional[str]) -> None:
+    """A cancelled creation job's reference → ``failed`` and its files gone
+    (only a ``pending`` one moves — ``ReferenceRegistry.fail`` — so a
+    reference readied a moment before the cancel stays ready). Never raises;
+    the startup reconcile is the backstop."""
+    if not reference_id:
+        return
+    try:
+        if await reference_registry.fail(reference_id, f"creation job {job_id} was cancelled"):
+            reference_files.delete(reference_id)
+            logger.warning("cancel: reference %s failed — its creation job %s was cancelled",
+                           reference_id, job_id)
+        await refresh_gauges()
+    except Exception as exc:  # noqa: BLE001 — DB unavailable
+        logger.error("cancel: could not mark reference %s failed: %s", reference_id, exc)
+
+
+async def delete_job_side_data(job_id: str) -> None:
+    """What hangs off a job besides its row: the artifact directory, then the
+    model-usage rows. ``main`` wires it as the jobs router's ``on_delete``
+    hook (DELETE /jobs/{id}), and ``finish_cancelled`` runs it again for a
+    job deleted while it ran — its runner may have written both after the
+    hook.
+
+    Each step is guarded on its own and logged — a filesystem error on the
+    directory must not leave the usage rows behind — so it never raises. As
+    the DELETE hook it runs before the router's own row check, so a DELETE on
+    a job the sweeper already expired still removes its usage, then answers
+    404. (``job_progress`` rows need nothing: they cascade with the row.)
+    """
+    try:
+        delete_artifacts_for_job(job_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("delete: could not remove artifacts for job %s: %s", job_id, exc)
+    try:
+        removed = await llm_usage.usage_store.delete_job(job_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("delete: could not remove model usage rows for job %s: %s", job_id, exc)
+        return
+    if removed:
+        logger.info("delete: removed %d model usage row(s) for job %s", removed, job_id)
 
 
 # ---------------------------------------------------------------------------

@@ -4,10 +4,14 @@ CLASSIFIER_JOB_TTL_HOURS used to be a policy nothing enforced. This module is
 what makes it real — for artifact directories AND for the expired job rows
 themselves.
 
-    delete_artifacts_for_job() — the ``on_delete`` hook handed to
+    delete_artifacts_for_job() — the directory half of
+                                 ``jobs.queue.delete_job_side_data``, the
+                                 ``on_delete`` hook handed to
                                  ``common.jobs.router.build_router``, so
                                  DELETE /jobs/{id} takes the directory with the
-                                 row rather than leaving files nothing points at.
+                                 row rather than leaving files nothing points
+                                 at (and the cleanup after a running job is
+                                 deleted takes what it wrote since).
     _refresh_gauges()          — point ``classifier_artifact_bytes`` /
                                  ``_dirs`` at what is actually on disk. Called
                                  on every sweep, write, cache and delete.
@@ -21,7 +25,8 @@ must not take the sweeper down for the life of the container.
 
 Process flow position: the sweeper instance lives in ``jobs.queue`` with the
 other process-wide singletons and is started from ``main``'s lifespan;
-``delete_artifacts_for_job`` is wired into the jobs router there too.
+``delete_artifacts_for_job`` is called by ``jobs.queue.delete_job_side_data``,
+which ``main`` wires into the jobs router.
 """
 
 import asyncio
@@ -34,11 +39,13 @@ from regions.store import store
 
 
 def delete_artifacts_for_job(job_id: str) -> None:
-    """``on_delete`` hook for ``common.jobs.router.build_router``.
+    """Remove one job's artifact directory — the first step of
+    ``jobs.queue.delete_job_side_data`` (the jobs router's ``on_delete``
+    hook, and the cleanup after a running job is deleted).
 
     Called before the row is deleted, so ``DELETE /jobs/{id}`` takes the
     directory with it rather than leaving files nothing points at. Exceptions
-    here are logged and swallowed by the router — the caller asked for the
+    here are logged and swallowed by the caller — the caller asked for the
     row to be gone, and it will be.
     """
     if store.delete(job_id):

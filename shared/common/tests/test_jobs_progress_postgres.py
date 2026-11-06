@@ -21,7 +21,7 @@ import pytest
 import pytest_asyncio
 
 from common.jobs.postgres import PostgresRegistry
-from common.jobs.progress import DONE, ProgressGauge, Stage, checkpoint, plan
+from common.jobs.progress import CANCELLED, DONE, ProgressGauge, Stage, checkpoint, plan
 from common.jobs.progress_postgres import PostgresProgressStore
 
 _DSN = os.environ.get("TEST_POSTGRES_DSN")
@@ -204,6 +204,72 @@ async def test_requeued_resets_running_snapshots_to_queued(stores):
     # The next run is a new attempt.
     assert await store.next_attempt(stuck) == 2
     assert (await registry.get(finished)).metadata["progress"]["state"] == "queued"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_ends_a_running_snapshot_where_it_stopped(stores):
+    """A cancel skips the gauge's final flush; cancelled() writes the state
+    the gauge never does — same attempt, stages and percent, the next seq,
+    and one event."""
+    registry, store = stores
+    job_id = await registry.register({}, initial_phase="processing")
+    await store.queued(job_id, stages=STAGES)
+    gauge = ProgressGauge(job_id, STAGES, store=store, attempt=1)
+    gauge.plan("units", 4)
+    gauge.advance("units", 2, label="halfway")
+    await gauge.flush()
+    before = (await registry.get(job_id)).metadata["progress"]
+    assert before["state"] == "running"
+
+    assert await store.cancelled(job_id) is True
+    snap = (await registry.get(job_id)).metadata["progress"]
+    assert snap["state"] == CANCELLED and snap["label"] == "cancelled"
+    assert snap["attempt"] == 1 and snap["seq"] == before["seq"] + 1
+    assert snap["percent"] == before["percent"] and snap["stages"] == before["stages"]
+    assert (snap["stage"], snap["index"], snap["length"]) == ("units", 2, 4)
+    events = (await store.history(job_id, attempt=1))["events"]
+    assert events[-1]["state"] == CANCELLED and events[-1]["seq"] == snap["seq"]
+    assert events[-1]["percent"] == before["percent"] and events[-1]["stage"] == "units"
+
+    # Idempotent: a second call (the queue's own cleanup racing the
+    # router's) writes nothing more.
+    assert await store.cancelled(job_id, label="cancelled again") is True
+    again = await store.history(job_id, attempt=1)
+    assert len(again["events"]) == len(events)
+    assert (await registry.get(job_id)).metadata["progress"]["label"] == "cancelled"
+    # The run is over: the next attempt number is unchanged by the cancel.
+    assert await store.next_attempt(job_id) == 2
+
+
+@pytest.mark.asyncio
+async def test_cancelled_before_any_run_follows_the_queued_event(stores):
+    registry, store = stores
+    queued = await registry.register({}, initial_phase="pending")
+    await store.queued(queued, stages=STAGES)
+    assert await store.cancelled(queued) is True
+    snap = (await registry.get(queued)).metadata["progress"]
+    assert (snap["state"], snap["attempt"], snap["seq"], snap["percent"]) == (CANCELLED, 0, 2, 0)
+    history = await store.history(queued)
+    assert history["attempt"] == 0
+    assert [(e["seq"], e["state"]) for e in history["events"]] == [(1, "queued"), (2, CANCELLED)]
+
+    # No snapshot at all (cancelled mid-submit, before the queued write).
+    bare = await registry.register({"type": "assess"}, initial_phase="staging")
+    assert await store.cancelled(bare) is True
+    job = await registry.get(bare)
+    assert job.metadata["type"] == "assess"  # merged, not replaced
+    assert (job.metadata["progress"]["state"], job.metadata["progress"]["seq"]) == (CANCELLED, 1)
+    assert [(e["seq"], e["state"]) for e in (await store.history(bare))["events"]] == [(1, CANCELLED)]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_on_a_job_that_is_gone_is_false(stores):
+    registry, store = stores
+    job_id = await registry.register({})
+    await registry.delete(job_id)
+    assert await store.cancelled(job_id) is False
+    assert await store.cancelled("never-existed") is False
+    assert (await _fetch("SELECT count(*) AS n FROM job_progress"))[0]["n"] == 0
 
 
 @pytest.mark.asyncio

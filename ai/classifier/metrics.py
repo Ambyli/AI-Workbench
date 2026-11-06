@@ -28,7 +28,9 @@ from prometheus_client import Counter, Gauge, Histogram
 jobs_total = Counter(
     "classifier_jobs_total",
     "Total jobs by type and final status",
-    ["type", "status"],  # type: assess, status: pending|completed|failed
+    # type: assess | reference; status: pending (submitted) | completed |
+    # failed | cancelled (POST /jobs/{id}/cancel, or a running job deleted)
+    ["type", "status"],
 )
 job_duration = Histogram(
     "classifier_job_duration_seconds",

@@ -21,20 +21,26 @@ remote failure; every one becomes a ``status``:
 2. ``POST /assess`` -- JSON: the transcript as ONE ``text`` document, one
    ``llm`` criterion per question with ``options: {hint: presence, ocr:
    never}``, and ``model``. ``202 {job_id}``.
-3. ``GET /jobs/{job_id}`` every ``poll_s`` until ``completed`` / ``failed``,
-   or until ``timeout_s`` (counted from the start of the cycle) has passed.
+3. ``GET /jobs/{job_id}`` every ``poll_s`` until ``completed`` / ``failed``
+   / ``cancelled`` (someone else cancelled it: ``failed``), or until
+   ``timeout_s`` (counted from the start of the cycle) has passed.
 4. Read ``result.assessment.per_criterion_scores`` (each criterion's
    ``score`` and ``reason``, capped at 200 characters) and ``result.usage``.
 5. **Always** ``DELETE /jobs/{job_id}`` -- on success, on failure, on a
-   timeout (after ``POST /jobs/{job_id}/cancel``, which the classifier does
-   not mount today; the DELETE is what counts), and when the task itself is
-   cancelled at shutdown. ``/assess`` keeps the text as a payload until the
-   job ends and as a text-layer artifact until ``JOB_TTL_HOURS``; the DELETE
-   removes the row, the artifacts, the progress history and the job's
-   ``llm_calls`` rows, so the usage numbers are copied into the outcome
-   first. A job deleted while it still runs may write its artifact directory
-   afterwards; the classifier's sweeper removes a directory whose job row is
-   gone (``CLASSIFIER_ARTIFACT_SWEEP_INTERVAL_S``).
+   timeout and when the task itself is cancelled at shutdown; the last two
+   (any job not seen in a terminal phase) first send
+   ``POST /jobs/{job_id}/cancel``, which stops a running job within about a
+   second (the classifier's ``CANCEL_CHECK_INTERVAL_S``) and frees its
+   ``max_concurrent`` slots -- on ``qwen3.5-4b`` this service's own two. The
+   cancel's answer is not read (a 409 for a job that just finished, or a
+   404 from an older classifier, changes nothing); the DELETE is what
+   counts. ``/assess`` keeps the text as a payload until the job ends and as
+   a text-layer artifact until ``JOB_TTL_HOURS``; the DELETE removes the
+   row, the artifacts, the progress history and the job's ``llm_calls``
+   rows, so the usage numbers are copied into the outcome first. A running
+   job deleted (the DELETE alone also stops it) loses what it writes in its
+   last second too: the classifier cleans up again once its runner has
+   unwound.
 
 Statuses: ``ok`` (every criterion scored), ``incomplete`` (some did -- the
 partial scores are returned), ``failed`` (the job failed, its result is
@@ -79,7 +85,8 @@ CLEANUP_TIMEOUT_S = 5.0
 _QUOTE_WINDOW = 24
 
 _WAITING_PHASES = ("staging", "pending")
-_TERMINAL_PHASES = ("completed", "failed")
+# Every phase a classifier job ends in (its GET /jobs/{id}?wait= terminal tuple).
+_TERMINAL_PHASES = ("completed", "failed", "cancelled")
 
 # host -> every address it resolves to. Runs in a worker thread.
 Resolver = Callable[[str], Iterable[str]]
@@ -370,6 +377,10 @@ class ClassifierClient:
         if cycle.phase == "failed":
             error = job.get("error")
             return "failed", f"the job failed: {error}" if isinstance(error, str) and error else "the job failed"
+        if cycle.phase == "cancelled":
+            # Not by us (we cancel only past the deadline or at shutdown):
+            # an operator's POST /jobs/{id}/cancel. No result to read.
+            return "failed", "the job was cancelled on the classifier"
         result = job.get("result")
         assessment = result.get("assessment") if isinstance(result, dict) else None
         per = assessment.get("per_criterion_scores") if isinstance(assessment, dict) else None
@@ -409,7 +420,10 @@ class ClassifierClient:
             try:
                 await self._http.post(f"{self.base_url}/jobs/{job_id}/cancel", timeout=CLEANUP_TIMEOUT_S)
             except httpx.HTTPError:
-                pass  # best effort; not mounted by the classifier today
+                # Best effort, answer unread (200, or a 409 / 404 that changes
+                # nothing): the cancel stops a running job and frees its model
+                # slots within about a second; the DELETE below stops it too.
+                pass
         try:
             r = await self._http.delete(f"{self.base_url}/jobs/{job_id}", timeout=CLEANUP_TIMEOUT_S)
         except httpx.HTTPError as exc:

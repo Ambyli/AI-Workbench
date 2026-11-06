@@ -599,6 +599,16 @@ PROGRESS_FLUSH_INTERVAL_S: float = max(
 # limit breaks every caller off the LAN.
 JOB_WAIT_MAX_S: float = 60.0
 
+# How often a worker re-reads its running job's row to see whether it was
+# cancelled (POST /jobs/{id}/cancel) or deleted (DELETE /jobs/{id}) —
+# common.jobs.worker.WorkerPool's cancel_check_interval, wired in
+# jobs/queue.py. A cancelled job's runner is cancelled within about this long,
+# which frees its worker, its model and OCR slots, and drops its HTTP request
+# to the model server. The cost is one primary-key read per second per RUNNING
+# job — at most CLASSIFIER_MAX_CONCURRENT at once — inside DB_POOL_HEADROOM
+# below. A constant, not an env var: nothing about a deployment changes it.
+CANCEL_CHECK_INTERVAL_S: float = 1.0
+
 # The one asyncpg pool's ceiling is computed in db.py (``pool_max()``):
 # MAX_CONCURRENT + the model registry's Σ max_concurrent + DB_POOL_HEADROOM —
 # every worker, every model slot (each call writes one llm_calls row), plus
@@ -606,7 +616,8 @@ JOB_WAIT_MAX_S: float = 60.0
 #
 # The headroom is the connections that are neither a worker nor a model slot:
 # the HTTP routes (GET /jobs polls, /references, /usage), each running job's
-# progress flush, and the artifact sweeper. A round number, not a measured
+# progress flush and cancel check (CANCEL_CHECK_INTERVAL_S — a short read,
+# once a second), and the artifact sweeper. A round number, not a measured
 # one: a pool that is too small never errors (a caller waits for a
 # connection), and the whole ceiling sits far under Postgres's default
 # max_connections of 100 — classifier-db's only client is this service.

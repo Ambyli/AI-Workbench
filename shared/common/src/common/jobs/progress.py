@@ -33,7 +33,11 @@ The pieces:
                      workers copy the context), flushes the snapshot and the
                      new events to the store every ``flush_interval`` while
                      anything changed, and on exit writes the terminal state
-                     (``done`` at 100, or ``failed``) in one final flush.
+                     (``done`` at 100, or ``failed``) in one final flush. A
+                     gauge never says ``cancelled`` itself: a cancelled job
+                     skips the final flush, and whoever cleans up after the
+                     cancel writes that state (``PostgresProgressStore.
+                     cancelled``).
     checkpoint() / plan() / task()
                      the module helpers a job's code calls. They resolve the
                      current gauge and are no-ops when there is none, so a
@@ -66,8 +70,12 @@ something the job declares, not something inferred from its logs.
     swallowed (the events stay buffered for the next flush, up to a cap);
     the module helpers swallow their own errors too. Same rule as the
     classifier's ``llm.usage.record_call``.
-  * A cancelled job (a shutdown mid-run) skips the final flush: the queue
-    requeues it, and the next run is a new ATTEMPT with its own history.
+  * A cancelled job skips the final flush — the gauge cannot tell why it was
+    cancelled. A shutdown mid-run: the queue requeues it, and the next run is
+    a new ATTEMPT with its own history. A user's cancel (``POST
+    /jobs/{id}/cancel``): the cleanup that runs after the handler has
+    unwound writes the ``cancelled`` state (``PostgresProgressStore.
+    cancelled``), on the same attempt.
 
 Every change appends one event ``{seq, at, stage, label, index, length,
 percent, state}`` to an in-memory buffer; ``seq`` counts from 1 within an
@@ -92,11 +100,13 @@ from typing import Any, AsyncIterator, Iterator, Optional, Protocol, Sequence
 
 _log = logging.getLogger("common.jobs.progress")
 
-# Snapshot / event states.
+# Snapshot / event states. CANCELLED is never produced by a gauge — only by
+# PostgresProgressStore.cancelled(), after a cancelled job's handler unwound.
 QUEUED = "queued"
 RUNNING = "running"
 DONE = "done"
 FAILED = "failed"
+CANCELLED = "cancelled"
 
 # While a job runs, percent is held just under 100: a stage whose counter has
 # filled is not a finished job (the terminal write, the result, are still to
@@ -458,8 +468,10 @@ class ProgressGauge:
         ``failed`` (the exception propagates), and either is written in one
         final, forced flush before this returns — so a terminal snapshot
         always lands before whatever the caller writes next (the job's
-        result). A cancel stops the flusher and skips the final flush: the
-        requeued run is a new attempt. Store errors are logged, never raised.
+        result). A cancel stops the flusher and skips the final flush: a
+        shutdown's requeued run is a new attempt, and a user's cancel is
+        recorded by its cleanup (``PostgresProgressStore.cancelled``). Store
+        errors are logged, never raised.
         """
         token = current_gauge.set(self)
         with self._lock:

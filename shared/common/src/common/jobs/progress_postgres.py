@@ -53,7 +53,9 @@ enqueue; each run takes ``next_attempt()`` = the highest attempt so far + 1,
 so a job requeued after a restart keeps its first run's history beside the
 second's. ``requeued()`` puts the snapshot of every job a restart sent back
 to the queue back to ``queued`` — without it a requeued job would show 43%
-while it waits for a worker.
+while it waits for a worker. ``cancelled()`` ends a cancelled job's
+snapshot as ``cancelled`` — a gauge skips its final flush on a cancel, so
+without it a cancelled job would read "running 43%" for good.
 
 Like ``PostgresRegistry(pool=...)`` it borrows a pool it never creates or
 closes: an ``asyncpg.Pool``, or anything whose ``acquire()`` is an async
@@ -74,7 +76,7 @@ from typing import Any, Optional, Sequence
 
 import asyncpg
 
-from .progress import QUEUED, RUNNING, Stage, queued_snapshot
+from .progress import CANCELLED, QUEUED, RUNNING, Stage, now_iso, queued_snapshot
 
 _log = logging.getLogger("common.jobs.progress")
 
@@ -267,6 +269,61 @@ class PostgresProgressStore:
                     events,
                 )
         return len(found)
+
+    async def cancelled(self, job_id: str, *, label: str = "cancelled") -> bool:
+        """End a cancelled job's snapshot as ``cancelled`` and add one
+        ``cancelled`` event to that attempt's history.
+
+        The snapshot keeps its attempt, stages, stage, counters and percent —
+        where the job was when it stopped — with ``state: cancelled``,
+        ``label`` and the next ``seq``; a job that never had a snapshot gets
+        the queued shape (attempt 0, 0%). One transaction, the row read
+        ``FOR UPDATE``, like ``requeued()``. Idempotent: a snapshot already
+        ``cancelled`` is left as it is. Returns False when the job row is
+        gone (a delete wins; its history went with it), True otherwise.
+
+        Run it after the job's handler has unwound — a gauge still running
+        could flush ``running`` over it.
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    f"SELECT metadata->'progress' AS progress FROM {self.jobs_table} "
+                    "WHERE id = $1 FOR UPDATE",
+                    job_id,
+                )
+                if row is None:
+                    return False
+                previous = row["progress"]
+                if isinstance(previous, str):
+                    previous = json.loads(previous)
+                previous = previous if isinstance(previous, dict) else {}
+                if previous.get("state") == CANCELLED:
+                    return True
+                attempt = int(previous.get("attempt") or 0)
+                seq = int(previous.get("seq") or 0) + 1
+                snapshot = dict(previous) if previous else queued_snapshot(attempt=attempt)
+                snapshot.update(
+                    state=CANCELLED, label=label, attempt=attempt, seq=seq, updated_at=now_iso()
+                )
+                percent = snapshot.get("percent")
+                await conn.execute(
+                    f"UPDATE {self.jobs_table} SET metadata = metadata || "
+                    "jsonb_build_object('progress', $1::jsonb), updated_at = $2 WHERE id = $3",
+                    json.dumps(snapshot),
+                    datetime.now(timezone.utc),
+                    job_id,
+                )
+                await conn.execute(
+                    f"INSERT INTO {self.table} "
+                    "(job_id, attempt, seq, at, stage, label, idx, length, percent, state) "
+                    "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) "
+                    "ON CONFLICT (job_id, attempt, seq) DO NOTHING",
+                    job_id, attempt, seq, _ts(snapshot["updated_at"]), snapshot.get("stage"),
+                    label, _int_or_none(snapshot.get("index")), _int_or_none(snapshot.get("length")),
+                    float(percent) if isinstance(percent, (int, float)) else None, CANCELLED,
+                )
+        return True
 
     # ── Reads ─────────────────────────────────────────────────────────────
     async def next_attempt(self, job_id: str) -> int:

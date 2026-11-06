@@ -23,9 +23,10 @@ Every endpoint handler lives in ``api/``:
                        examples, each built by a "reference" job
     api.usage          GET /jobs/{job_id}/usage, GET /usage — the model
                        calls each job made (llm_calls), which outlive the job
-    common.jobs.router GET /jobs, GET /jobs/{id}, DELETE /jobs/{id}, and
-                       GET /jobs/{id}/progress (build_progress_router) — how
-                       far along a job is, and its checkpoint history
+    common.jobs.router GET /jobs, GET /jobs/{id}, POST /jobs/{id}/cancel,
+                       DELETE /jobs/{id}, and GET /jobs/{id}/progress
+                       (build_progress_router) — how far along a job is, and
+                       its checkpoint history
 
 /locate and /assess/compare were removed and answer 404 like any unknown
 route; /locate's job is ``score: false`` on a criterion of /assess.
@@ -51,8 +52,10 @@ Overall request flow for /assess:
      CLASSIFIER_OCR_WORKERS across the process), aggregate each criterion
      (pages → documents), weigh per item and overall, and store the
      artifacts.
-  7. Caller polls GET /jobs/{job_id} until phase="completed" or "failed"
-     (``?wait=<s>`` holds each poll until then, up to JOB_WAIT_MAX_S) —
+  7. Caller polls GET /jobs/{job_id} until phase="completed", "failed" or
+     "cancelled" (``?wait=<s>`` holds each poll until then, up to
+     JOB_WAIT_MAX_S; POST /jobs/{job_id}/cancel stops a job within about
+     CANCEL_CHECK_INTERVAL_S — see jobs/queue.py § Cancel) —
      ``metadata.progress`` says how far along it is meanwhile (the job's
      ``common.jobs.progress`` gauge, flushed about once a second), and
      GET /jobs/{job_id}/progress pages through its checkpoint history.
@@ -91,7 +94,7 @@ from api import assess, introspection, references as references_api
 from api import usage as usage_api
 from config import JOB_WAIT_MAX_S, LOG_LEVEL
 from db import database
-from jobs.queue import jobs_registry, queue, sweeper
+from jobs.queue import delete_job_side_data, jobs_registry, queue, sweeper
 from llm import client as llm_client
 from llm import models as llm_models
 from llm import usage as llm_usage
@@ -100,7 +103,6 @@ from middleware import CorrelationIDMiddleware, RequestIDFilter
 from references.store import reconcile as reconcile_references
 from references.store import reference_registry
 from references.store import refresh_gauges as refresh_reference_gauges
-from regions.sweeper import delete_artifacts_for_job
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -206,46 +208,38 @@ Instrumentator(
     excluded_handlers=["/metrics", "/health"],
 ).instrument(app).expose(app)
 
-# Mount /jobs, /jobs/{id}, DELETE /jobs/{id} — see common.jobs.router.
-# No cancel endpoint: the worker doesn't currently observe a cancel signal
-# mid-analysis. If we later teach the worker to poll for phase="cancelled"
-# and bail out, flip include_cancel=True here.
+# Mount GET /jobs, GET /jobs/{id}, POST /jobs/{id}/cancel and DELETE
+# /jobs/{id} — see common.jobs.router.
+#
+# The cancel route flips the row to "cancelled" at once (one transaction that
+# refuses a finished job: 409 already_<phase>). It is mounted because the
+# queue's WorkerPool is cancel-aware (CANCEL_CHECK_INTERVAL_S): a running
+# job's worker sees the phase within about a second and cancels its runner.
+# on_cancel finishes a job no worker owns yet (staging / pending) — see
+# jobs/queue.py § Cancel; a processing job is the pool's to finish.
 #
 # on_delete takes the job's artifact directory AND its model-usage rows with
 # the row, so DELETE /jobs/{id} can never leave layer files that nothing
 # points at. The usage rows are the one thing the TTL sweeper leaves behind
 # (they outlive the job on purpose), so this delete is the only way they go.
+# A DELETE on a RUNNING job stops it like a cancel (the pool sees the row
+# gone), and the pool runs the same cleanup again once the runner has
+# unwound, for what it wrote after this hook.
 #
 # terminal_phases turns on GET /jobs/{id}?wait= (the long-poll): the request
-# is held until the job is completed or failed — the only phases a job ends
-# in (the worker pool's set_result / set_error; staging, pending and
-# processing all move on) — or JOB_WAIT_MAX_S passes.
-
-
-async def _delete_job_side_data(job_id: str) -> None:
-    """``on_delete`` hook: the artifact directory, then the usage rows.
-
-    Each step is guarded on its own — the router swallows a hook failure as a
-    whole, and a filesystem error on the directory must not leave the usage
-    rows behind. Runs before the router's own row check, so a DELETE on a job
-    the sweeper already expired still removes its usage, then answers 404.
-    """
-    try:
-        delete_artifacts_for_job(job_id)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("delete: could not remove artifacts for job %s: %s", job_id, exc)
-    removed = await llm_usage.usage_store.delete_job(job_id)
-    if removed:
-        logger.info("delete: removed %d model usage row(s) for job %s", removed, job_id)
-
-
+# is held until the job is completed, failed or cancelled — the only phases a
+# job ends in (the worker pool's set_result / set_error, the cancel route;
+# staging, pending and processing all move on) — or JOB_WAIT_MAX_S passes.
+# A phase a job can END in that is missing here makes every wait on it run to
+# the cap.
 app.include_router(
     build_router(
         jobs_registry,
         include_delete=True,
-        include_cancel=False,
-        on_delete=_delete_job_side_data,
-        terminal_phases=("completed", "failed"),
+        include_cancel=True,
+        on_delete=delete_job_side_data,
+        on_cancel=queue.on_cancel_request,
+        terminal_phases=("completed", "failed", "cancelled"),
         max_wait_s=JOB_WAIT_MAX_S,
     )
 )

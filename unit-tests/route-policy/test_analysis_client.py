@@ -1,7 +1,8 @@
 """The /assess cycle (route_policy/analysis/classifier_client.py) against a
 fake document classifier (rp_helpers.FakeClassifier, an httpx.MockTransport).
 
-* every status: ok, incomplete, failed (job failed, nothing scored),
+* every status: ok, incomplete, failed (job failed, nothing scored, job
+  cancelled on the classifier),
   refused (4xx, unknown / unavailable model), unavailable (down, 5xx),
   timeout, not_local;
 * the locality guard: an authenticated entry, a host resolving to a public
@@ -106,6 +107,16 @@ def test_timeout_cancels_then_deletes():
     assert out.scores == {} and out.job_id == "job0001"
     assert fake.cancelled == ["job0001"] and fake.deleted == ["job0001"]
     assert fake.requests.index(("POST", "/jobs/job0001/cancel")) < fake.requests.index(("DELETE", "/jobs/job0001"))
+
+
+def test_a_job_cancelled_on_the_classifier_is_failed_and_still_deleted():
+    """``cancelled`` is terminal: the poll ends at once, there is no result to
+    read, and nothing is cancelled again — only deleted."""
+    fake = FakeClassifier(final="cancelled")
+    out = assess(fake)
+    assert out.status == "failed" and out.error == "the job was cancelled on the classifier"
+    assert out.scores == {} and out.job_id == "job0001"
+    assert fake.cancelled == [] and fake.deleted == ["job0001"]
 
 
 def test_a_cancelled_cycle_still_deletes_its_job():

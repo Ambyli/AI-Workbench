@@ -419,7 +419,8 @@ async def assess(request: Request):
 
     Accepts JSON or multipart (see the module docstring); both are parsed
     into the same ``AssessRequest``. Poll ``GET /jobs/{job_id}`` until
-    ``phase`` is "completed" or "failed".
+    ``phase`` is "completed", "failed" or "cancelled" (``POST
+    /jobs/{job_id}/cancel``).
     """
     content_type = (request.headers.get("content-type") or "").lower()
     if content_type.startswith(("multipart/form-data", "application/x-www-form-urlencoded")):

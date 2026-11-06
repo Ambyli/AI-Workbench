@@ -38,7 +38,14 @@ to exactly one caller (safe across tasks and processes),
 
 * ``WorkerPool`` (from ``common.jobs.worker``) — N asyncio workers looping on
   ``claim_next``, with wake/poll, crash recovery, and an ``on_finish`` metrics
-  hook. The consumer supplies ``async handler(JobBase) -> dict``.
+  hook. The consumer supplies ``async handler(JobBase) -> dict``. Opt-in
+  cancel awareness (``cancel_check_interval``): the handler runs as a child
+  task, the worker re-reads the row each interval and cancels the child when
+  the row turns ``cancelled`` (``registry.cancel``) or is deleted, its
+  terminal writes are guarded (``from_phases``) so a late result never
+  overwrites a cancel, and an ``on_cancel(job, gone)`` hook cleans up after
+  the handler has unwound. That pool is what makes ``POST /jobs/{id}/cancel``
+  stop the work on a persistent registry; the classifier runs one.
 
 * ``FilePayloadStore`` (from ``common.jobs.payloads``) — one JSON file per job
   for inputs too large for ``metadata`` (images, request bodies), so a queued
@@ -60,7 +67,10 @@ cannot see:
   also writes the log line, so logging a milestone and moving the gauge are
   one call. ``async with gauge.running()`` flushes it to a store about once a
   second and writes the terminal ``done`` / ``failed`` state before the
-  handler returns. Progress never fails a job.
+  handler returns. Progress never fails a job. The fourth terminal state,
+  ``cancelled``, is never the gauge's: a cancel skips its final flush, and
+  the cleanup after a user's cancel writes it (``PostgresProgressStore.
+  cancelled``).
 
 * ``PostgresProgressStore`` (from ``common.jobs.progress_postgres``) — the
   snapshot in the job row's ``metadata.progress`` (so ``GET /jobs/{id}``

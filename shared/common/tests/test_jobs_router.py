@@ -2,8 +2,10 @@
 
 Uses FastAPI's TestClient which drives the app end-to-end. Verifies that
 both the InMemoryRegistry (sync) and SqliteRegistry (async) paths mount
-cleanly and return the expected shapes, and the long-poll
-(``terminal_phases`` + ``?wait=``) over a scripted async registry.
+cleanly and return the expected shapes, the cancel route with its
+``on_cancel`` hook (200 / 404 / 409, the hook only after a real cancel, a
+raising hook swallowed), and the long-poll (``terminal_phases`` +
+``?wait=``) over a scripted async registry.
 """
 
 from __future__ import annotations
@@ -218,6 +220,78 @@ def test_sync_router_calls_a_sync_on_delete():
     assert seen == ["whatever"]
 
 
+# ── Cancel route + on_cancel hook (async, sqlite) ──────────────────────────
+def test_async_cancel_route_answers_and_calls_on_cancel(sqlite_app_factory):
+    """200 with the shape callers read, then the hook with the phase the job
+    was in; a second cancel is a 409, an unknown job a 404 — and neither of
+    those reaches the hook."""
+    seen: list[tuple[str, str]] = []
+
+    async def hook(job_id: str, was_phase: str) -> None:
+        seen.append((job_id, was_phase))
+
+    app, reg = sqlite_app_factory(include_cancel=True, on_cancel=hook)
+    pending = asyncio.run(reg.register(_Meta(tag="p"), "pending"))
+    running = asyncio.run(reg.register(_Meta(tag="r"), "processing"))
+    done = asyncio.run(reg.register(_Meta(tag="d"), "pending"))
+    asyncio.run(reg.set_result(done, {"ok": True}))
+    with TestClient(app) as client:
+        r = client.post(f"/jobs/{pending}/cancel")
+        assert r.status_code == 200
+        assert r.json() == {"job_id": pending, "cancelled": True, "was_phase": "pending"}
+        assert client.get(f"/jobs/{pending}").json()["phase"] == "cancelled"
+        assert client.post(f"/jobs/{running}/cancel").json()["was_phase"] == "processing"
+
+        r = client.post(f"/jobs/{pending}/cancel")
+        assert r.status_code == 409 and "already_cancelled" in r.json()["detail"]
+        r = client.post(f"/jobs/{done}/cancel")
+        assert r.status_code == 409 and "already_completed" in r.json()["detail"]
+        assert client.get(f"/jobs/{done}").json()["phase"] == "completed"
+        assert client.post("/jobs/ghost/cancel").status_code == 404
+    assert seen == [(pending, "pending"), (running, "processing")]
+
+
+def test_async_cancel_survives_an_on_cancel_that_raises(sqlite_app_factory):
+    """The cancel already happened; side-cleanup that throws must not turn it
+    into a 500."""
+
+    def hook(job_id: str, was_phase: str) -> None:  # a sync hook on the async router
+        raise RuntimeError("payload directory is on fire")
+
+    app, reg = sqlite_app_factory(include_cancel=True, on_cancel=hook)
+    job_id = asyncio.run(reg.register(_Meta(tag="x"), "pending"))
+    with TestClient(app) as client:
+        r = client.post(f"/jobs/{job_id}/cancel")
+        assert r.status_code == 200 and r.json()["cancelled"] is True
+        assert client.get(f"/jobs/{job_id}").json()["phase"] == "cancelled"
+
+
+def test_sync_router_calls_on_cancel():
+    reg = InMemoryRegistry()
+    seen: list[tuple[str, str]] = []
+    app = FastAPI()
+    app.include_router(build_router(
+        reg, include_cancel=True, on_cancel=lambda job_id, was: seen.append((job_id, was)),
+    ))
+    observed: dict = {}
+
+    def worker() -> None:
+        with reg.job(_Meta(tag="t"), initial_phase="running") as job:
+            observed["job_id"] = job.job_id
+            job.wait_or_cancel(timeout=5.0)
+
+    with TestClient(app) as client:
+        t = threading.Thread(target=worker)
+        t.start()
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and "job_id" not in observed:
+            time.sleep(0.02)
+        assert client.post(f"/jobs/{observed['job_id']}/cancel").status_code == 200
+        t.join(timeout=5.0)
+        assert client.post("/jobs/ghost/cancel").status_code == 404
+    assert seen == [(observed["job_id"], "running")]
+
+
 # ── Long-poll: terminal_phases + ?wait= ────────────────────────────────────
 TERMINAL = ("completed", "failed")
 # Small enough that the suite stays fast, large enough that a deadline is
@@ -310,6 +384,19 @@ def test_long_poll_clamps_a_wait_above_the_cap():
         r, took = _timed_get(client, "/jobs/j", wait=3600)
     assert r.status_code == 200 and r.json()["phase"] == "processing"
     assert 0.15 <= took < 5
+
+
+def test_long_poll_answers_a_cancelled_job_at_once_when_cancelled_is_terminal():
+    """A service whose jobs can end ``cancelled`` lists it, or every wait on
+    a cancelled job runs to the cap (the classifier's terminal tuple)."""
+    terminal = ("completed", "failed", "cancelled")
+    reg = _ScriptedRegistry(j=["cancelled"], k=["processing", "processing", "cancelled"])
+    with TestClient(_long_poll_app(reg, terminal_phases=terminal)) as client:
+        r, took = _timed_get(client, "/jobs/j", wait=30)
+        assert r.status_code == 200 and r.json()["phase"] == "cancelled"
+        assert reg.reads["j"] == 1 and took < 5
+        r, took = _timed_get(client, "/jobs/k", wait=30)
+        assert r.json()["phase"] == "cancelled" and reg.reads["k"] == 3 and took < 5
 
 
 def test_long_poll_404s_when_the_job_is_deleted_mid_wait():

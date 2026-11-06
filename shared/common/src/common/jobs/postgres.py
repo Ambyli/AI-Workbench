@@ -20,6 +20,16 @@ operations ``common.jobs.worker.WorkerPool`` drives (``claim_next`` /
 ``common.jobs.router.build_router`` mounts it with no changes and a service
 can swap one backend for the other without touching its consumers.
 
+Cancel-safe writes. ``cancel()`` is one transaction — ``SELECT … FOR UPDATE``,
+then the UPDATE — so it can never overwrite a job that finished between its
+read and its write. ``set_phase`` / ``set_result`` / ``set_error`` take an
+optional ``from_phases`` guard (``AND phase = ANY(…)``) and say whether a row
+was written: a cancel-aware ``WorkerPool`` stores a result only while the row
+is still in its claimed phase. Under READ COMMITTED the guarded UPDATE waits
+for a cancel holding the row lock and then re-checks the phase against the
+committed row, so of a cancel and a result racing on one job exactly one
+lands. Unguarded, every write is the same statement it always was.
+
 Two ways to give it a connection pool:
 
 * ``PostgresRegistry(dsn)`` — the registry owns a pool: ``init()`` creates
@@ -205,45 +215,78 @@ class PostgresRegistry:
             )
         return job_id
 
-    async def set_phase(self, job_id: str, phase: str) -> None:
-        pool = self._require_pool()
-        async with pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE jobs SET phase = $1, updated_at = $2 WHERE id = $3",
-                phase,
-                _now_utc(),
-                job_id,
-            )
+    async def set_phase(
+        self,
+        job_id: str,
+        phase: str,
+        *,
+        from_phases: Optional[Iterable[str]] = None,
+    ) -> bool:
+        """Move the job to ``phase``. Returns whether a row was written.
+
+        ``from_phases`` guards the write: the row moves only while its phase
+        is one of them (the classifier flips ``staging`` → ``pending`` this
+        way, so a cancel that landed mid-submit is never undone). Without it
+        the write is unconditional, exactly as it always was, and False only
+        means the job does not exist.
+        """
+        return await self._update(
+            "UPDATE jobs SET phase = $1, updated_at = $2 WHERE id = $3",
+            [phase, _now_utc(), job_id],
+            from_phases,
+        )
 
     async def set_result(
-        self, job_id: str, result: dict[str, Any], phase: str = "completed"
-    ) -> None:
+        self,
+        job_id: str,
+        result: dict[str, Any],
+        phase: str = "completed",
+        *,
+        from_phases: Optional[Iterable[str]] = None,
+    ) -> bool:
         """Store the result JSON and transition to ``phase`` (default
-        ``"completed"``)."""
-        pool = self._require_pool()
-        async with pool.acquire() as conn:
-            await conn.execute(
-                f"UPDATE jobs SET phase = $1, result = $2::{self.result_type}, updated_at = $3 "
-                "WHERE id = $4",
-                phase,
-                json.dumps(result),
-                _now_utc(),
-                job_id,
-            )
+        ``"completed"``). Returns whether a row was written; ``from_phases``
+        guards it as in ``set_phase`` — a cancel-aware ``WorkerPool`` passes
+        its claimed phase, so a result never lands on a cancelled job."""
+        return await self._update(
+            f"UPDATE jobs SET phase = $1, result = $2::{self.result_type}, updated_at = $3 "
+            "WHERE id = $4",
+            [phase, json.dumps(result), _now_utc(), job_id],
+            from_phases,
+        )
 
     async def set_error(
-        self, job_id: str, error: str, phase: str = "failed"
-    ) -> None:
+        self,
+        job_id: str,
+        error: str,
+        phase: str = "failed",
+        *,
+        from_phases: Optional[Iterable[str]] = None,
+    ) -> bool:
+        """Store ``error`` and transition to ``phase`` (default ``"failed"``).
+        Returns whether a row was written; ``from_phases`` guards it as in
+        ``set_phase``."""
+        return await self._update(
+            "UPDATE jobs SET phase = $1, error = $2, updated_at = $3 "
+            "WHERE id = $4",
+            [phase, error, _now_utc(), job_id],
+            from_phases,
+        )
+
+    async def _update(
+        self, sql: str, args: list[Any], from_phases: Optional[Iterable[str]]
+    ) -> bool:
+        """Run one ``UPDATE … WHERE id = …``, with ``AND phase = ANY(…)``
+        appended when guarded; whether it touched a row."""
+        guard = _guard_phases(from_phases)
+        if guard is not None:
+            args = [*args, guard]
+            sql += f" AND phase = ANY(${len(args)}::text[])"
         pool = self._require_pool()
         async with pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE jobs SET phase = $1, error = $2, updated_at = $3 "
-                "WHERE id = $4",
-                phase,
-                error,
-                _now_utc(),
-                job_id,
-            )
+            status = await conn.execute(sql, *args)
+        # asyncpg returns tags like "UPDATE 1" or "UPDATE 0".
+        return not status.endswith(" 0")
 
     async def update_metadata(
         self, job_id: str, fields: dict[str, Any]
@@ -291,29 +334,39 @@ class PostgresRegistry:
     async def cancel(self, job_id: str) -> tuple[bool, str]:
         """Mark a job as cancelled by setting ``phase="cancelled"``.
 
-        Like the SQLite backend, the Postgres backend has no in-memory
-        cancel event — a worker that wants to cooperatively abort must
-        poll ``get(job_id).phase`` and bail out when it observes
-        ``"cancelled"``. Wiring the worker to do this is the consumer's job.
+        Atomic: one transaction reads the phase ``FOR UPDATE`` and writes the
+        new one, so a job that completes or fails in between is refused
+        (``already_<phase>``), never overwritten — and a guarded result write
+        racing it waits for the lock, re-reads the phase and misses.
 
-        Returns ``(ok, phase_or_reason)`` same as the other backends.
+        The registry only flips the phase; it has no in-memory cancel event.
+        Stopping the work is the worker's side: a ``WorkerPool`` built with
+        ``cancel_check_interval`` re-reads the row while its handler runs and
+        cancels the handler when it sees ``"cancelled"`` (or the row gone).
+        A plain pool never looks: its handler runs on, and its unguarded
+        result write lands over the ``"cancelled"``.
+
+        Returns ``(ok, phase_or_reason)`` same as the other backends:
+        ``(True, was_phase)``, ``(False, "not_found")`` or
+        ``(False, "already_<phase>")`` for a job already in a terminal phase.
         """
         pool = self._require_pool()
         async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT phase FROM jobs WHERE id = $1", job_id
-            )
-            if row is None:
-                return False, "not_found"
-            was_phase = row["phase"]
-            if was_phase in ("completed", "failed", "cancelled"):
-                return False, f"already_{was_phase}"
-            await conn.execute(
-                "UPDATE jobs SET phase = $1, updated_at = $2 WHERE id = $3",
-                "cancelled",
-                _now_utc(),
-                job_id,
-            )
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT phase FROM jobs WHERE id = $1 FOR UPDATE", job_id
+                )
+                if row is None:
+                    return False, "not_found"
+                was_phase = row["phase"]
+                if was_phase in _TERMINAL_PHASES:
+                    return False, f"already_{was_phase}"
+                await conn.execute(
+                    "UPDATE jobs SET phase = $1, updated_at = $2 WHERE id = $3",
+                    "cancelled",
+                    _now_utc(),
+                    job_id,
+                )
         return True, was_phase
 
     async def delete(self, job_id: str) -> bool:
@@ -446,6 +499,21 @@ def _dump_metadata(metadata: BaseModel | dict[str, Any]) -> str:
     if isinstance(metadata, BaseModel):
         return metadata.model_dump_json()
     return json.dumps(metadata)
+
+
+def _guard_phases(from_phases: Optional[Iterable[str]]) -> Optional[list[str]]:
+    """A write's ``from_phases`` as a list, or None for an unguarded write.
+    Refuses a bare string (it would iterate into one-letter "phases") and an
+    empty guard (a write no row could ever pass) — the same checks as
+    ``common.jobs.sqlite``'s."""
+    if from_phases is None:
+        return None
+    if isinstance(from_phases, str):
+        raise TypeError("from_phases takes a collection of phase names, not one string")
+    phases = list(from_phases)
+    if not phases:
+        raise ValueError("from_phases names no phase: the write could never land")
+    return phases
 
 
 def _row_to_jobbase(row: asyncpg.Record) -> JobBase:

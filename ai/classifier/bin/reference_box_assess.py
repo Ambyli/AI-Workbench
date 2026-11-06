@@ -228,7 +228,9 @@ _BBOX_NULL = "you answered bbox: null"
 # ``--poll`` sleep, so a waiter never spins.
 JOB_WAIT_S = 30.0
 FAST_ANSWER_S = 1.0
-JOB_TERMINAL = ("completed", "failed")
+# Every phase a job ends in — the service's own terminal tuple (a job someone
+# cancels with POST /jobs/{id}/cancel ends "cancelled").
+JOB_TERMINAL = ("completed", "failed", "cancelled")
 
 
 # ---------------------------------------------------------------------------
@@ -689,8 +691,8 @@ def job_records(job: JobSpec, result: dict, truth: dict[str, ge.Truth],
 
 
 def failed_job_records(job: JobSpec, why: str, keys: dict[str, str], config: str) -> list[dict]:
-    """The records of a job that never produced a result (failed, timed
-    out): every criterion ``status: job_<why>``, nothing accepted."""
+    """The records of a job that never produced a result (failed, cancelled,
+    timed out): every criterion ``status: job_<why>``, nothing accepted."""
     return [{
         "image": job.page, "page_id": page_id(job.page), "criterion": label,
         "key": keys.get(label), "repeat": job.repeat, "config": config, "job_id": job.job_id,
@@ -725,7 +727,8 @@ def summarise(records: list[dict]) -> dict:
             "sent_as": dict(sorted(Counter(r.get("sent_as") or "image" for r in rows).items())),
             "errors": sum(1 for r in rows if r.get("status") != "ok"),
             # A unit's error kind, or the status itself for a job that never
-            # finished (job_failed, job_timed_out) or a missing entry.
+            # finished (job_failed, job_cancelled, job_timed_out) or a
+            # missing entry.
             "error_kinds": dict(Counter(r.get("error_kind") or r.get("status")
                                         for r in rows if r.get("status") != "ok")),
             "loop_ran_rate": round(ge._rate([r.get("loop_ran") for r in rows]), 3),
@@ -1074,8 +1077,11 @@ def run_jobs(client: Any, state: Run, args: argparse.Namespace,
                 if phase == "completed":
                     records = job_records(job, body.get("result") or {}, truth, keys, config,
                                           truth_size=truth_sizes.get(job.page))
-                elif phase == "failed":
-                    records = failed_job_records(job, "failed", keys, config)
+                elif phase in ("failed", "cancelled"):
+                    # cancelled: someone stopped it (POST /jobs/{id}/cancel).
+                    # Terminal — a wait on it answers at once, so it is never
+                    # waited on again.
+                    records = failed_job_records(job, phase, keys, config)
                 elif seconds > args.timeout:
                     records = failed_job_records(job, "timed_out", keys, config)
                 else:

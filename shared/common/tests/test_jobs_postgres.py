@@ -178,6 +178,136 @@ async def test_cancel_transitions_phase_and_refuses_terminal(
     assert reason3 == "not_found"
 
 
+async def test_cancel_refuses_every_terminal_phase_and_leaves_the_row(
+    registry: PostgresRegistry,
+) -> None:
+    done = await registry.register({"n": 1})
+    failed = await registry.register({"n": 2})
+    running = await registry.register({"n": 3}, "processing")
+    await registry.set_result(done, {"ok": True})
+    await registry.set_error(failed, "boom")
+    assert await registry.cancel(done) == (False, "already_completed")
+    assert await registry.cancel(failed) == (False, "already_failed")
+    assert (await registry.get(done)).result == {"ok": True}
+    assert (await registry.get(failed)).error == "boom"
+    assert await registry.cancel(running) == (True, "processing")
+
+
+async def test_guarded_writes_say_whether_they_landed(registry: PostgresRegistry) -> None:
+    job_id = await registry.register({"n": 1})
+    assert await registry.set_phase(job_id, "processing", from_phases=("pending",)) is True
+    assert await registry.set_phase(job_id, "pending", from_phases=("staging",)) is False
+    assert (await registry.get(job_id)).phase == "processing"
+    assert await registry.set_result(job_id, {"x": 1}, from_phases=("pending",)) is False
+    assert await registry.set_error(job_id, "no", from_phases=["staging", "pending"]) is False
+    got = await registry.get(job_id)
+    assert (got.phase, got.result, got.error) == ("processing", None, None)
+    assert await registry.set_result(job_id, {"x": 1}, from_phases=("processing",)) is True
+    assert await registry.set_error(job_id, "late", from_phases=("processing",)) is False
+    got = await registry.get(job_id)
+    assert (got.phase, got.result, got.error) == ("completed", {"x": 1}, None)
+
+
+async def test_unguarded_writes_still_land_anywhere_and_report_a_missing_row(
+    registry: PostgresRegistry,
+) -> None:
+    job_id = await registry.register({"n": 1})
+    await registry.cancel(job_id)
+    # Exactly the old behaviour: no guard, so it overwrites even a cancel.
+    assert await registry.set_result(job_id, {"ok": True}) is True
+    assert (await registry.get(job_id)).phase == "completed"
+    assert await registry.set_phase("ghost", "pending") is False
+    assert await registry.set_result("ghost", {}) is False
+    assert await registry.set_error("ghost", "x") is False
+
+
+async def test_a_guard_that_names_no_phase_is_refused(registry: PostgresRegistry) -> None:
+    job_id = await registry.register({"n": 1})
+    with pytest.raises(TypeError):
+        await registry.set_phase(job_id, "pending", from_phases="processing")
+    with pytest.raises(ValueError):
+        await registry.set_result(job_id, {}, from_phases=())
+
+
+async def test_a_cancel_holding_the_row_lock_wins_over_a_guarded_result(
+    registry: PostgresRegistry,
+) -> None:
+    """READ COMMITTED: the guarded UPDATE waits for the cancel's row lock,
+    then re-checks the phase against the committed row — and misses. The
+    other connection runs exactly cancel()'s statements, held open."""
+    import asyncio
+
+    job_id = await registry.register({"n": 1}, "processing")
+    conn = await asyncpg.connect(_DSN)
+    try:
+        tx = conn.transaction()
+        await tx.start()
+        await conn.execute("SELECT phase FROM jobs WHERE id = $1 FOR UPDATE", job_id)
+        await conn.execute("UPDATE jobs SET phase = 'cancelled' WHERE id = $1", job_id)
+        write = asyncio.create_task(
+            registry.set_result(job_id, {"late": True}, from_phases=("processing",))
+        )
+        await asyncio.sleep(0.3)
+        assert not write.done()  # waiting on the lock
+        await tx.commit()
+        assert await asyncio.wait_for(write, 5) is False
+    finally:
+        await conn.close()
+    got = await registry.get(job_id)
+    assert (got.phase, got.result) == ("cancelled", None)
+
+
+async def test_a_cancel_waits_for_a_result_holding_the_row_lock_and_refuses(
+    registry: PostgresRegistry,
+) -> None:
+    """The other order: the guarded result write holds the lock, cancel()'s
+    SELECT … FOR UPDATE waits for it, then sees ``completed``."""
+    import asyncio
+
+    job_id = await registry.register({"n": 1}, "processing")
+    conn = await asyncpg.connect(_DSN)
+    try:
+        tx = conn.transaction()
+        await tx.start()
+        status = await conn.execute(
+            "UPDATE jobs SET phase = 'completed', result = '{\"ok\": true}'::jsonb "
+            "WHERE id = $1 AND phase = ANY($2::text[])",
+            job_id, ["processing"],
+        )
+        assert status == "UPDATE 1"
+        cancel = asyncio.create_task(registry.cancel(job_id))
+        await asyncio.sleep(0.3)
+        assert not cancel.done()  # waiting on the lock
+        await tx.commit()
+        assert await asyncio.wait_for(cancel, 5) == (False, "already_completed")
+    finally:
+        await conn.close()
+    got = await registry.get(job_id)
+    assert (got.phase, got.result) == ("completed", {"ok": True})
+
+
+async def test_a_cancel_and_a_guarded_result_racing_have_one_winner(
+    registry: PostgresRegistry,
+) -> None:
+    """Whichever lands first, the other is refused, and the row says what
+    the winner wrote — over and over, on two pooled connections."""
+    import asyncio
+
+    for i in range(20):
+        job_id = await registry.register({"i": i}, "processing")
+        stored, (cancelled, why) = await asyncio.gather(
+            registry.set_result(job_id, {"i": i}, from_phases=("processing",)),
+            registry.cancel(job_id),
+        )
+        got = await registry.get(job_id)
+        assert stored != cancelled, (stored, cancelled, why)
+        if stored:
+            assert why == "already_completed" and got.phase == "completed"
+            assert got.result == {"i": i}
+        else:
+            assert why == "processing" and got.phase == "cancelled" and got.result is None
+
+
 async def test_delete(registry: PostgresRegistry) -> None:
     job_id = await registry.register(
         _Meta(type="assess", request_id="r"), "pending"

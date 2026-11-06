@@ -3,12 +3,17 @@
 Four settings, each OFF by default and each byte-identical to the loop
 without it when off:
 
-  * ``CLASSIFIER_LLM_BBOX_REFINE_MODE=marks`` — the refine crop shows the OCR
+  * ``CLASSIFIER_LLM_BBOX_REFINE_MODE=marks`` — the refine crop shows the
     text lines in its window, outlined and numbered, and the model picks
     mark(s); the box is the union of those lines. Pinned: the coordinate
     path (grid window → original pixels → the fitted crop, and back), the
     reading order, the drawing landing on the real pixels, the union, the
-    answer parsing, every fallback to the grid refine and what each records;
+    answer parsing, the three line tiers (a PDF's native lines, then the
+    OCR layer's, then OCR of the window — ``marks_lines``; window OCR never
+    under ``ocr: "never"``, None without an engine, an error a grid
+    fallback with the unit ``ok``), ``DocumentContext.window_lines``' crop
+    and offset, a digital PDF numbered from its own lines through the
+    pipeline, every fallback to the grid refine and what each records;
   * ``CLASSIFIER_REFERENCE_BOX_TEXT`` — a reference example's region text,
     OCR'd once per job (``analysis.references.region_text`` / ``text_of``),
     on its ``BoxExample`` and record; never failing the unit;
@@ -35,6 +40,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import pathlib
 
 import cv2
 import numpy as np
@@ -229,6 +235,7 @@ def test_marks_refine_unions_the_chosen_lines(monkeypatch, page):
     data = attempt.as_dict()
     assert data["refine_mode"] == "marks" and data["marks"] == [2, 3]
     assert data["marks_shown"] == 3 and "marks_fallback" not in data
+    assert data["marks_lines"] == "ocr"                     # no native lines given
     assert data["coarse_bbox_grid"] == [100.0, 200.0, 300.0, 400.0]
     assert data["refine_window_grid"] == WINDOW
     # The marks call shows ONE image, the marked crop at the window's size,
@@ -264,10 +271,12 @@ def test_marks_with_examples_show_them_first(monkeypatch, page):
 @pytest.mark.parametrize(
     "kwargs, answers, why",
     [
-        ({"text_lines": None}, [], "no text lines were given"),
-        ({"text_lines": []}, [], "has no line boxes"),
-        ({"text_lines": [{"text": "x", "box": None}]}, [], "has no line boxes"),
-        ({"text_lines": [LINES[1]]}, [], "no OCR text line lies inside the refine window"),
+        ({"text_lines": None}, [], (
+            "no text line lies inside the refine window (native lines: none given; OCR "
+            "layer: none given; window OCR: off)")),
+        ({"text_lines": []}, [], "OCR layer: none on the page;"),
+        ({"text_lines": [{"text": "x", "box": None}]}, [], "OCR layer: none on the page;"),
+        ({"text_lines": [LINES[1]]}, [], "OCR layer: none in the window;"),
         ({"marks_max": 2}, [], "3 OCR text lines lie inside the refine window, over the cap of 2"),
         ({}, [None], "usable answer for the marks pass"),
         ({}, [{"reason": "a picture", "marks": None}], "marks: null"),
@@ -298,6 +307,8 @@ def test_every_fallback_runs_the_grid_refine_and_says_why(
     assert data["refine_mode"] == "grid" and why in data["marks_fallback"]
     assert "marks" not in data
     assert ("marks_shown" in data) is marks_called
+    # The tier is recorded whenever a marks call was made, answer or not.
+    assert data.get("marks_lines") == ("ocr" if marks_called else None)
     # The grid prompt is today's refine prompt, untouched by the attempt.
     assert "zoomed-in crop" in model.last_text(len(answers) + 1)
 
@@ -336,6 +347,202 @@ def test_the_mode_defaults_to_the_setting_and_reads_anything_else_as_grid(monkey
     _, loc = _run(model, monkeypatch, page, text_lines=LINES, refine_mode="Grid-ish")
     assert model.labels()[1] == f"refine/{NAME}#1"
     assert "refine_mode" not in loc.attempts[0].as_dict()
+
+
+# ---------------------------------------------------------------------------
+# The three tiers of lines: native, the OCR layer, OCR of the window
+# ---------------------------------------------------------------------------
+
+
+# A digital PDF's own lines (``Page.native_lines``' shape): one in the
+# refine window, one far outside it.
+NATIVE_IN = {"text": "Amount due $193.33", "box": _poly(40, 300, 330, 330)}
+NATIVE_OUT = {"text": "Page 1 of 2", "box": _poly(500, 1100, 700, 1130)}
+
+
+class WindowOCR:
+    """A ``window_lines`` stand-in: records each rect it is asked for and
+    answers ``lines`` (or raises ``error``)."""
+
+    def __init__(self, lines=None, error=None):
+        self.lines, self.error = lines, error
+        self.rects = []
+
+    async def __call__(self, rect):
+        self.rects.append(tuple(rect))
+        if self.error is not None:
+            raise self.error
+        return self.lines
+
+
+def test_native_lines_win_over_the_ocr_layer(monkeypatch, page):
+    window = WindowOCR([{"text": "w", "box": _poly(40, 140, 200, 170)}])
+    model = ScriptedModel([{"bbox": GOOD_BOX}, {"marks": [1]}, {"score": 9}])
+    _, loc = _marks_run(model, monkeypatch, page, native_lines=[NATIVE_IN, NATIVE_OUT],
+                        window_lines=window)
+    attempt = loc.attempts[0]
+    data = attempt.as_dict()
+    assert (data["marks_lines"], data["marks_shown"], data["marks"]) == ("native", 1, [1])
+    assert attempt.bbox_px == [40.0, 300.0, 330.0, 330.0]      # the native line, exactly
+    assert "There are 1 marks, numbered 1 to 1." in model.last_text(1)
+    assert window.rects == []                                   # never asked
+
+
+def test_the_ocr_layer_when_no_native_line_is_in_the_window(monkeypatch, page):
+    window = WindowOCR([])
+    model = ScriptedModel([{"bbox": GOOD_BOX}, {"marks": [2, 3]}, {"score": 9}])
+    _, loc = _marks_run(model, monkeypatch, page, native_lines=[NATIVE_OUT],
+                        window_lines=window)
+    data = loc.attempts[0].as_dict()
+    assert (data["marks_lines"], data["marks_shown"]) == ("ocr", 3)
+    assert loc.attempts[0].bbox_px == [40.0, 140.0, 330.0, 171.0]   # B ∪ C, as before
+    assert window.rects == []
+
+
+def test_window_ocr_when_neither_reaches_the_window(monkeypatch, page):
+    # A native layer (no OCR lines) on a page whose native lines miss the
+    # window: the window is OCR'd, at the rect the crop is cut from, and its
+    # lines (ORIGINAL pixels) are the marks.
+    window = WindowOCR([{"text": "Total due", "confidence": 0.9, "box": _poly(40, 400, 300, 430)},
+                        {"text": "x", "box": None}])
+    model = ScriptedModel([{"bbox": GOOD_BOX}, {"marks": [1]}, {"score": 9}])
+    _, loc = _marks_run(model, monkeypatch, page, native_lines=[NATIVE_OUT], text_lines=[],
+                        window_lines=window)
+    assert window.rects == [RECT]
+    data = loc.attempts[0].as_dict()
+    assert (data["marks_lines"], data["marks_shown"]) == ("window", 1)
+    assert loc.attempts[0].bbox_px == [40.0, 400.0, 300.0, 430.0]
+    assert model.labels() == [f"bbox/{NAME}#1", f"refine/marks/{NAME}#1", f"verify/{NAME}#1"]
+
+
+@pytest.mark.parametrize(
+    "window, state",
+    [
+        (None, "window OCR: off"),
+        (WindowOCR(None), "window OCR: unavailable — no OCR engine, or the pass failed"),
+        (WindowOCR(error=RuntimeError("onnx fell over")),
+         "window OCR: unavailable — no OCR engine, or the pass failed"),
+        (WindowOCR([]), "window OCR: found none"),
+        # A line the engine boxed outside the window (it cannot, on a crop —
+        # but the tier still checks) is not a mark.
+        (WindowOCR([{"text": "far", "box": _poly(500, 900, 700, 930)}]),
+         "window OCR: found none"),
+    ],
+    ids=["off", "no-engine", "raised", "empty", "outside"],
+)
+def test_no_tier_in_the_window_names_every_tier_and_refines_on_the_grid(
+    monkeypatch, page, window, state
+):
+    model = ScriptedModel([
+        {"bbox": GOOD_BOX}, {"bbox": [400, 400, 600, 600]}, {"score": 9, "reason": "panels"}])
+    _, loc = _marks_run(model, monkeypatch, page, native_lines=[NATIVE_OUT], text_lines=[],
+                        window_lines=window)
+    assert model.labels() == [f"bbox/{NAME}#1", f"refine/{NAME}#1", f"verify/{NAME}#1"]
+    assert loc.accepted_attempt == 1                                     # the unit goes on
+    data = loc.attempts[0].as_dict()
+    assert data["refine_mode"] == "grid" and "marks_lines" not in data
+    assert data["marks_fallback"] == (
+        "no text line lies inside the refine window (native lines: none in the window; "
+        f"OCR layer: none on the page; {state})")
+
+
+def test_a_tier_over_the_cap_falls_back_without_trying_the_next(monkeypatch, page):
+    """The native tier reached the window with too many lines: the OCR layer
+    (the same text) and window OCR (an OCR pass to learn as much) are not
+    tried."""
+    native = [{"text": t, "box": _poly(*b)} for t, b in (("A", LINE_A), ("B", LINE_B),
+                                                        ("C", LINE_C))]
+    window = WindowOCR([{"text": "w", "box": _poly(40, 400, 300, 430)}])
+    model = ScriptedModel([{"bbox": GOOD_BOX}, {"bbox": [400, 400, 600, 600]}, {"score": 9}])
+    _, loc = _marks_run(model, monkeypatch, page, native_lines=native, text_lines=[LINES[2]],
+                        window_lines=window, marks_max=2)
+    data = loc.attempts[0].as_dict()
+    assert data["marks_fallback"] == (
+        "3 native text lines lie inside the refine window, over the cap of 2")
+    assert "marks_lines" not in data and "marks_shown" not in data   # no marks call
+    assert window.rects == []
+
+
+def test_grid_mode_reads_no_tier(monkeypatch, page):
+    window = WindowOCR([{"text": "w", "box": _poly(40, 400, 300, 430)}])
+    model = ScriptedModel([{"bbox": GOOD_BOX}, {"bbox": [400, 400, 600, 600]}, {"score": 9}])
+    _, loc = _run(model, monkeypatch, page, refine_mode="grid", native_lines=[NATIVE_IN],
+                  text_lines=LINES, window_lines=window)
+    assert window.rects == []
+    assert not {"refine_mode", "marks_lines", "marks_fallback"} & set(loc.attempts[0].as_dict())
+
+
+def test_marks_lines_in_reports_the_first_tier_with_a_line_in_the_window():
+    async def window(rect):
+        return [{"text": "w", "box": _poly(40, 400, 300, 430)}]
+
+    def run(**kwargs):
+        kwargs = {"native_lines": None, "text_lines": None, "window_lines": None, **kwargs}
+        return asyncio.run(llm_boxes.marks_lines_in(RECT, **kwargs))
+
+    assert run(native_lines=[NATIVE_IN], text_lines=LINES)[:2] == ("native", [
+        [40.0, 300.0, 330.0, 330.0]])
+    tier, inside, why = run(text_lines=LINES)
+    assert (tier, inside, why) == ("ocr", [LINE_A, LINE_B, LINE_C], None)
+    assert run(window_lines=window)[:2] == ("window", [[40.0, 400.0, 300.0, 430.0]])
+    assert run() == (None, [], "no text line lies inside the refine window (native lines: "
+                               "none given; OCR layer: none given; window OCR: off)")
+
+
+# ---------------------------------------------------------------------------
+# DocumentContext.window_lines — the service's window OCR
+# ---------------------------------------------------------------------------
+
+
+def _context(image=None):
+    from common.documents import Document, Page
+
+    from analysis.context import DocumentContext
+
+    image = np.full((600, 400, 3), 200, dtype=np.uint8) if image is None else image
+    page = Page(index=0, image_bgr=image, width=image.shape[1], height=image.shape[0])
+    return DocumentContext.build(Document(kind="image", pages=[page]))
+
+
+def test_window_lines_reads_the_crop_and_shifts_its_boxes_back(monkeypatch):
+    from analysis import context
+
+    engine = FakeEngine([("Amount due", (10, 5, 120, 25)), ("no box", None)])
+    monkeypatch.setattr(context, "get_ocr_engine", lambda: engine)
+    lines = asyncio.run(_context().window_lines((100, 200, 300, 260)))
+    assert engine.seen == [(60, 200)]                      # just the window, h × w
+    assert lines == [
+        {"text": "Amount due", "confidence": 0.9, "box": _poly(110.0, 205.0, 220.0, 225.0)},
+        {"text": "no box", "confidence": 0.9, "box": None},
+    ]
+    # A rect past the page is clamped to it.
+    asyncio.run(_context().window_lines((300, 500, 900, 900)))
+    assert engine.seen[-1] == (100, 100)
+
+
+def test_window_lines_is_none_rather_than_an_error(monkeypatch):
+    from analysis import context
+
+    class Broken:
+        def __init__(self):
+            self.calls = 0
+
+        def recognize(self, image):
+            self.calls += 1
+            raise RuntimeError("onnx fell over")
+
+    # No engine (the test session's CLASSIFIER_OCR_ENGINE=none): None, no pass.
+    assert asyncio.run(_context().window_lines((0, 0, 100, 100))) is None
+    broken = Broken()
+    monkeypatch.setattr(context, "get_ocr_engine", lambda: broken)
+    assert asyncio.run(_context().window_lines((0, 0, 100, 100))) is None
+    assert broken.calls == 1
+    # Nothing to cut: an empty rect, a page with no image.
+    assert asyncio.run(_context().window_lines((50, 50, 50, 80))) is None
+    ctx = _context()
+    ctx.page.image_bgr = None
+    assert asyncio.run(ctx.window_lines((0, 0, 100, 100))) is None
+    assert broken.calls == 1
 
 
 # ---------------------------------------------------------------------------
@@ -697,8 +904,9 @@ def test_llm_eval_passes_its_text_layer_to_the_marks_refine(monkeypatch):
 
 
 def test_a_page_without_line_boxes_falls_back_in_the_pipeline(monkeypatch):
-    """The test session runs with CLASSIFIER_OCR_ENGINE=none: the layer has no
-    lines, so the grid refines and the attempt says why."""
+    """The test session runs with CLASSIFIER_OCR_ENGINE=none: a photo has no
+    native lines, the layer no OCR lines, and the window OCR has no engine —
+    so the grid refines and the attempt says so, tier by tier."""
     from test_llm_boxes import _criterion, _entry
 
     result, model = _analyze_marks(
@@ -709,4 +917,146 @@ def test_a_page_without_line_boxes_falls_back_in_the_pipeline(monkeypatch):
     attempt = _entry(result)["localization"]["attempts"][0]
     assert attempt["refine_mode"] == "grid"
     assert attempt["marks_fallback"] == (
-        "the page's text layer has no line boxes (native text, or OCR found none)")
+        "no text line lies inside the refine window (native lines: none on the page; OCR "
+        "layer: none on the page; window OCR: unavailable — no OCR engine, or the pass failed)")
+
+
+def test_the_pipeline_ocrs_the_window_when_no_layer_reaches_it(monkeypatch):
+    """``ocr: "auto"`` with an engine on a page whose layer the scoring call
+    read: the marks come from the layer when it reaches the window — and
+    from window OCR (``marks_lines: "window"``) when the layer is empty."""
+    from analysis import context
+
+    from test_llm_boxes import _criterion, _entry
+
+    # The layer's pass finds nothing; the window's finds the line.
+    class LayerBlankWindowText(FakeEngine):
+        def recognize(self, image):
+            if len(self.seen) == 0:
+                self.seen.append(image.shape[:2])
+                from common.documents import OCRResult
+
+                return OCRResult()
+            return super().recognize(image)
+
+    engine = LayerBlankWindowText([("Amount due", (20, 40, 140, 70))])
+    monkeypatch.setattr(context, "get_ocr_engine", lambda: engine)
+    result, model = _analyze_marks(
+        monkeypatch, _criterion(boxes=True),
+        answers=[{"bbox": [50, 100, 450, 350]}, {"marks": [1]}, {"score": 9}],
+    )
+    assert model.labels() == [f"bbox/{NAME}#1", f"refine/marks/{NAME}#1", f"verify/{NAME}#1"]
+    # The ask's window on the 400×600 page starts at its top-left corner, so
+    # the crop's pixels are the page's.
+    left, top, right, bottom = llm_boxes.window_rect(llm_boxes.refine_window(
+        [50, 100, 450, 350], zoom=llm_boxes.LLM_BBOX_REFINE_ZOOM,
+        min_span=llm_boxes.LLM_BBOX_REFINE_MIN_SPAN), (600, 400))
+    assert (left, top) == (0, 0)
+    assert engine.seen == [(600, 400), (bottom - top, right - left)]   # page, then window
+    attempt = _entry(result)["localization"]["attempts"][0]
+    assert (attempt["marks_lines"], attempt["marks"]) == ("window", [1])
+    assert attempt["bbox_px"] == [20.0, 40.0, 140.0, 70.0]   # crop at the page origin
+    # Not a text layer: document_info lists the one page pass only.
+    assert [p["ran"] for p in result["documents"][0]["document_info"]["ocr"]["layers"]] == [True]
+
+
+def test_ocr_never_never_ocrs_the_window(monkeypatch):
+    """``options.ocr: "never"`` promised no recognition: the loop is not
+    handed the window OCR, and the fallback says it was off."""
+    from analysis import context
+
+    from test_llm_boxes import _criterion, _entry
+
+    asked = []
+
+    async def window_lines(self, rect):
+        asked.append(rect)
+        return []
+
+    monkeypatch.setattr(context.DocumentContext, "window_lines", window_lines)
+    result, model = _analyze_marks(
+        monkeypatch, _criterion(boxes=True, ocr="never"),
+        answers=[{"bbox": [50, 100, 450, 350]}, {"bbox": [400, 400, 600, 600]}, {"score": 9}],
+    )
+    assert asked == []
+    attempt = _entry(result)["localization"]["attempts"][0]
+    assert attempt["marks_fallback"].endswith("window OCR: off)")
+
+
+INVOICE = pathlib.Path(__file__).resolve().parent / "documents" / "invoice_native.pdf"
+
+
+def _analyze_invoice(monkeypatch, criterion, *, answers):
+    """``_analyze_marks`` on the repo's digital invoice PDF (one page, 1240 ×
+    1755 px at the service's 150 dpi; ≥ 20 native characters, so ``auto``
+    never OCRs it)."""
+    import analysis
+    from api import criterion_options
+
+    from test_llm_boxes import _scoring_call
+
+    monkeypatch.setattr(llm_client, "call_model", _scoring_call(10))
+    model = ScriptedModel(answers)
+    monkeypatch.setattr(llm_client, "call_model_json", model)
+    monkeypatch.setattr(llm_boxes, "LLM_BBOX_REFINE", True)
+    monkeypatch.setattr(llm_boxes, "LLM_BBOX_GRIDLINES", False)
+    monkeypatch.setattr(criterion_options, "LLM_BBOX_REFINE_MODE", "marks")
+    doc = analysis.load_document_bytes(INVOICE.read_bytes(), INVOICE.name, "application/pdf",
+                                       keep_source=True)
+    result = asyncio.run(analysis.analyze_document(doc, [criterion]))
+    return result, model, doc
+
+
+def test_a_digital_pdf_is_numbered_from_its_own_lines(monkeypatch):
+    """The plan's reason for being: a native PDF's amount due used to fall
+    back to the grid ("no line boxes"). Its own lines are the marks now —
+    exact boxes, no OCR pass (the session has no engine at all)."""
+    from test_llm_boxes import _criterion, _entry
+
+    # The ask covers the "Total Due … $4,850.00" row; the window (20% of the
+    # page tall) holds the table's rows: 12 lines, the total's two 10 and 11.
+    result, model, doc = _analyze_invoice(
+        monkeypatch, _criterion(boxes=True),
+        answers=[{"bbox": [80, 400, 900, 460]}, {"marks": [10, 11]}, {"score": 9}],
+    )
+    assert model.labels() == [f"bbox/{NAME}#1", f"refine/marks/{NAME}#1", f"verify/{NAME}#1"]
+    entry = _entry(result)
+    assert entry["status"] == "ok"
+    attempt = entry["localization"]["attempts"][0]
+    assert (attempt["refine_mode"], attempt["marks_lines"], attempt["marks_shown"]) == (
+        "marks", "native", 12)
+    assert "marks_fallback" not in attempt
+    native = {line["text"]: line["box"] for line in doc.pages[0].native_lines}
+    (x1, y1), _, (x2, y2), _ = native["Total Due"]
+    (_, _), _, (x4, y4), _ = native["$4,850.00"]
+    assert attempt["bbox_px"] == [x1, y1, x4, y4]           # the two lines' union, exactly
+    # The scoring call read the native layer, unchanged: no OCR lines in it.
+    assert entry["detail"]["text_sent"]["source"] == "native"
+    assert result["documents"][0]["document_info"]["ocr"]["layers"][0]["ran"] is False
+
+
+def test_a_window_ocr_error_on_a_pdf_falls_back_and_the_unit_is_ok(monkeypatch):
+    """A blank stretch of the digital invoice: no native line there, a native
+    layer (no OCR lines), so the window is OCR'd — by an engine that raises.
+    The grid refines; the unit, and its score, are untouched."""
+    from analysis import context
+
+    from test_llm_boxes import _criterion, _entry
+
+    class Broken:
+        def recognize(self, image):
+            raise RuntimeError("onnx fell over")
+
+    monkeypatch.setattr(context, "get_ocr_engine", lambda: Broken())
+    result, model, _ = _analyze_invoice(
+        monkeypatch, _criterion(boxes=True),
+        answers=[{"bbox": [100, 800, 500, 900]}, {"bbox": [400, 400, 600, 600]}, {"score": 9}],
+    )
+    assert model.labels() == [f"bbox/{NAME}#1", f"refine/{NAME}#1", f"verify/{NAME}#1"]
+    entry = _entry(result)
+    assert entry["status"] == "ok" and entry["score"] == 10
+    attempt = entry["localization"]["attempts"][0]
+    assert attempt["marks_fallback"] == (
+        "no text line lies inside the refine window (native lines: none in the window; OCR "
+        "layer: none on the page; window OCR: unavailable — no OCR engine, or the pass failed)")
+    assert entry["localization"]["accepted_attempt"] == 1

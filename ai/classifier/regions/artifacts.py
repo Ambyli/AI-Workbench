@@ -164,10 +164,14 @@ def text_layer_payload(
     ``text`` is byte-for-byte the string ``match_text`` searched (the layer's
     own text, unmodified), so a failed match can be diagnosed from this file
     alone. ``lines`` are the OCR lines with their polygons in ORIGINAL page
-    pixels; empty for native text — a .txt / .docx has no geometry, and a
-    native PDF's layer is PyMuPDF's reading-order text, whose line geometry is
-    not recorded (text hits on it are still located, via
-    ``common.documents.pdf_text_regions``).
+    pixels — ``layer.lines`` only, so ``text`` stays exactly their
+    ``"\\n".join``; empty for native text — a .txt / .docx has no geometry,
+    and a native PDF's layer is PyMuPDF's reading-order text (text hits on it
+    are still located, via ``common.documents.pdf_text_regions``). The
+    layer's ``native_lines`` (the PDF / SVG page's own line boxes, which the
+    box loop's marks refine numbers) are NOT written: they carry no offsets
+    into ``text``, and a ``lines`` entry that did not would break the file's
+    one promise.
     """
     return {
         "key": key,

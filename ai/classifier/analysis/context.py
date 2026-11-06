@@ -64,6 +64,12 @@ with no text / llm criteria never loads the OCR engine.
                    result links to; ``name`` is the artifact file,
                    ``text.p{n}.<key>.json``.
     ocr_passes     what actually ran on this item, for ``document_info.ocr``.
+    window_lines() the OCR lines inside ONE rectangle of the original page —
+                   the box loop's marks refine, when neither the page's
+                   native lines nor the criterion's OCR layer reach its
+                   window. Not memoised and not a layer: no artifact file,
+                   no ``ocr_passes`` entry (the attempt's ``marks_lines:
+                   "window"`` records it), and None rather than an error.
 
 Every layer, native or recognised, is handed to ``layer_sink`` the moment it
 is created — the pipeline wires that to the job's artifact directory, so the
@@ -354,6 +360,63 @@ class DocumentContext:
             }
         )
         return layer, (_engine_name(engine) if layer.source == "ocr" else None)
+
+    async def window_lines(self, rect: tuple[int, int, int, int]) -> Optional[list[dict]]:
+        """The text lines OCR finds inside ``rect`` of the ORIGINAL page —
+        ``(left, top, right, bottom)`` in its pixels, the window
+        ``llm.boxes.window_rect`` gives — as ``[{"text", "confidence",
+        "box"}]`` with every box shifted back by the crop's offset, so it is
+        in the same original pixels as ``TextLayer.lines``.
+
+        The box loop's marks refine calls it (``llm.boxes.locate_criterion
+        (window_lines=...)``, injected by ``analysis.llm_eval`` — the loop
+        never imports this package) when neither the page's native lines nor
+        the criterion's OCR layer has a line in its window: a mixed PDF whose
+        stamped native header kept ``ocr: "auto"`` from reading the page.
+        Cut and recognised as ``analysis.references.region_text`` does: the
+        crop alone (the engine upscales a small one), in a worker thread,
+        under the process-wide ``OCR_PASSES`` limit.
+
+        Not memoised — each window is its own — and not a text layer: it is
+        not written as an artifact or listed in ``ocr_passes``
+        (``document_info``); the attempt's ``marks_lines: "window"`` is the
+        record. **Never raises**: no image, an empty rect, no engine
+        (CLASSIFIER_OCR_ENGINE=none) or an engine error (logged) is None,
+        and the loop refines on the grid — an aid never fails the unit.
+        """
+        image = self.page.image_bgr
+        if image is None or getattr(image, "size", 0) == 0:
+            return None
+        try:
+            engine = get_ocr_engine()
+            if engine is None:
+                return None
+            height, width = image.shape[:2]
+            left, top, right, bottom = (int(v) for v in rect)
+            left, top = max(0, left), max(0, top)
+            right, bottom = min(width, right), min(height, bottom)
+            if right <= left or bottom <= top:
+                return None
+            crop = image[top:bottom, left:right]
+            async with OCR_PASSES:
+                logger.info("window_lines: OCR of a %dx%d window (item=%d)",
+                            right - left, bottom - top, self.item)
+                result = await asyncio.to_thread(engine.recognize, crop)
+            lines: list[dict] = []
+            for line in getattr(result, "lines", None) or []:
+                box = line.get("box")
+                lines.append({
+                    "text": str(line.get("text", "")),
+                    "confidence": line.get("confidence"),
+                    "box": None if box is None else [
+                        [round(float(x) + left, 2), round(float(y) + top, 2)] for x, y in box
+                    ],
+                })
+            return lines
+        except Exception as exc:  # noqa: BLE001 — an aid never fails the unit
+            logger.warning("window_lines: OCR of the refine window failed (item=%d): %s",
+                           self.item, exc)
+            return None
 
     async def text_document(
         self, mode: str, min_native_chars: int = OCR_MIN_NATIVE_CHARS

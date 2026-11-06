@@ -10,11 +10,13 @@ and dispatches to the per-kind loader:
                              registered by ``ensure_image_support``) or AVIF
                              (Pillow's own plugin, ≥ 11.3).
     pdf   → ``_load_pdf``    per-page native text via PyMuPDF plus a raster
-                             render at ``render_dpi``, capped at ``max_pages``.
+                             render at ``render_dpi``, capped at ``max_pages``,
+                             and the page's native text LINES
+                             (``_native_lines`` → ``Page.native_lines``).
     svg   → ``_load_svg``    one page, rendered by MuPDF like a one-page PDF
-                             (native text from ``<text>``, a raster render
-                             capped at ``max_render_pixels``), plus a warning
-                             per external reference it did not draw.
+                             (native text and lines from ``<text>``, a raster
+                             render capped at ``max_render_pixels``), plus a
+                             warning per external reference it did not draw.
     txt   → ``_load_txt``    one page, text only, no image.
     docx  → ``_load_docx``   one page, paragraphs and table cells in document
                              order, no image.
@@ -52,6 +54,19 @@ Design notes worth knowing before editing:
     functions from worker threads (``asyncio.to_thread``) — several jobs at
     once. The PDF render holds it per page, not per document, so a 20-page
     render does not stall a short ``pdf_text_regions`` lookup for seconds.
+  * PDF points → page pixels is ONE function, ``_points_to_pixels``: the
+    rectangle through the page's ``rotation_matrix`` (PyMuPDF answers word
+    and search boxes in the UNROTATED page, the render is rotated by
+    ``/Rotate``), then scaled by the render's own size over the rotated
+    page's. ``pdf_text_regions`` and ``_native_lines`` both use it, so a
+    native line box and a text hit's box on the same words are the same
+    rectangle, at every rotation.
+  * ``Page.native_lines`` are geometry, not text: PyMuPDF's
+    ``get_text("text")`` (the page's ``text``) is not its words re-joined
+    line by line, so the lines carry no character offsets and are kept OUT
+    of ``ocr_lines`` — ``textmatch`` maps offsets through ``ocr_lines`` and
+    must never meet them. Measuring them never fails a load: any error is
+    an empty list.
 
 Requires the ``documents`` extra: ``pymupdf`` (PDF, SVG), ``python-docx`` (DOCX),
 ``pillow`` + ``numpy`` (images), ``pillow-heif`` (HEIC/HEIF). Each is imported
@@ -66,7 +81,7 @@ from __future__ import annotations
 
 import math
 import threading
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from .detect import (
     DocumentKind,
@@ -103,6 +118,15 @@ _MAX_REF_WARNINGS = 10
 # A reported URL is cut to this many characters — a data-exfiltration URL can
 # be kilobytes long, and the warning only has to identify it.
 _MAX_WARNING_URL = 200
+
+# A native line is split wherever the gap between two neighbouring words is
+# more than this many times the line's height. PyMuPDF's (block, line) is
+# whatever the PDF's producer wrote in one text run, and a table row's label
+# and amount are often ONE run with a column's width of blank between them;
+# OCR's detector boxes them apart, so the marks the classifier numbers on a
+# native page are split the same way. An ordinary word space is a fraction
+# of a line's height, so 2.0 keeps a sentence whole and cuts a column gap.
+NATIVE_LINE_SPLIT_GAP = 2.0
 
 # PyMuPDF is not thread-safe; every call into it in this module holds this
 # (see the module docstring). Re-entrant so a helper can call another.
@@ -234,11 +258,15 @@ def _load_image(raw: bytes, decoder: ImageDecoder) -> list[Page]:
 
 
 def _load_pdf(raw: bytes, max_pages: int, render_dpi: int) -> tuple[list[Page], int]:
-    """Extract native text and a raster render for each PDF page.
+    """Extract native text, a raster render and the native text lines for
+    each PDF page.
 
     Both outputs matter: the text layer is exact when the PDF was generated
     digitally, and the render is what CV detectors and vision models see (and
-    what OCR reads when the text layer is empty — a scan).
+    what OCR reads when the text layer is empty — a scan). The lines
+    (``_native_lines``, measured against the render's size) are the text
+    layer's geometry for a consumer that needs WHERE a line is, not its
+    character offsets — empty on a scan.
 
     Args:
         raw:        PDF bytes.
@@ -276,6 +304,8 @@ def _load_pdf(raw: bytes, max_pages: int, render_dpi: int) -> tuple[list[Page], 
                 # lock with its shape, reshaped and converted outside it.
                 samples = bytes(pix.samples)
                 width, height, channels = pix.width, pix.height, pix.n
+                # In the render's pixels, so measured after it; never raises.
+                lines = _native_lines(page, width, height)
                 del pix, page
             arr = np.frombuffer(samples, dtype=np.uint8).reshape(height, width, channels)
             if channels == 4:
@@ -289,6 +319,7 @@ def _load_pdf(raw: bytes, max_pages: int, render_dpi: int) -> tuple[list[Page], 
                     text_source="native" if native.strip() else "none",
                     width=width,
                     height=height,
+                    native_lines=lines,
                 )
             )
         truncated = max(0, total - limit)
@@ -334,7 +365,9 @@ def _load_svg(raw: bytes, render_dpi: int, max_pixels: int) -> tuple[list[Page],
     MuPDF opens the SVG as a one-page document: ``get_text`` reads its
     ``<text>`` elements (so a text search hits words, not markup) and
     ``get_pixmap`` draws it on white. The zoom is ``_svg_zoom``'s — the
-    requested DPI unless that breaks ``max_pixels``.
+    requested DPI unless that breaks ``max_pixels``. The ``<text>`` lines'
+    boxes are measured as a PDF page's are (``_native_lines``, against the
+    render's size, so a capped zoom is accounted for).
 
     External references are never drawn (MuPDF fetches nothing); each one is
     reported as a warning so a caller can tell a deliberately blank region
@@ -380,6 +413,9 @@ def _load_svg(raw: bytes, render_dpi: int, max_pixels: int) -> tuple[list[Page],
                 del pix
             except Exception as exc:
                 raise UnsupportedDocumentError(f"Could not render SVG: {exc}") from exc
+            # Outside the try on purpose: it never raises, and a failure to
+            # measure lines is no reason to call the SVG unrenderable.
+            lines = _native_lines(page, width, height)
             del page
     finally:
         with _PYMUPDF_LOCK:
@@ -398,6 +434,7 @@ def _load_svg(raw: bytes, render_dpi: int, max_pixels: int) -> tuple[list[Page],
         text_source="native" if native.strip() else "none",
         width=width,
         height=height,
+        native_lines=lines,
     )
     return [page_out], _ref_warnings(raw)
 
@@ -641,8 +678,111 @@ def svg_page_size(
 
 
 # ---------------------------------------------------------------------------
-# Native-PDF geometry for a text hit
+# Native-PDF geometry: points → pixels, a page's lines, a text hit's boxes
 # ---------------------------------------------------------------------------
+
+
+def _points_to_pixels(
+    pdf_page: Any, width: float, height: float
+) -> Callable[[tuple[float, float, float, float]], tuple[float, float, float, float]]:
+    """The one conversion from a PyMuPDF rectangle to the page's pixels.
+
+    ``search_for`` and ``get_text("words")`` answer in the UNROTATED page
+    space, in points; the render — and ``pdf_page.rect`` — are rotated by
+    the page's ``/Rotate``. So a rectangle goes through ``rotation_matrix``
+    first (identity at ``/Rotate 0``; without it a ``/Rotate 270`` plan-set
+    sheet put every box on the wrong axis), then is scaled by the render's
+    own size over the rotated page's (``width / rect.width``), which is
+    right whatever zoom drew it — a DPI, or ``_svg_zoom``'s capped one.
+
+    Args:
+        pdf_page: A loaded PyMuPDF page. The caller holds ``_PYMUPDF_LOCK``.
+        width / height: The page's render size in pixels (``Page.width`` /
+                  ``Page.height``).
+
+    Returns:
+        ``(x0, y0, x1, y1)`` in points → the same rectangle in page pixels,
+        ``x0 <= x1`` and ``y0 <= y1``. Not clamped: the caller decides.
+    """
+    import pymupdf
+
+    rect = pdf_page.rect  # rotated — the render's frame
+    sx = width / rect.width if rect.width else 1.0
+    sy = height / rect.height if rect.height else 1.0
+    to_rendered = pdf_page.rotation_matrix  # identity when /Rotate is 0
+
+    def convert(box: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
+        shown = pymupdf.Rect(*box) * to_rendered
+        return shown.x0 * sx, shown.y0 * sy, shown.x1 * sx, shown.y1 * sy
+
+    return convert
+
+
+def _native_lines(pdf_page: Any, width: int, height: int) -> list[dict]:
+    """A PDF / SVG page's own text lines in its render's pixels — the
+    geometry a recogniser would have found, measured exactly instead.
+
+    From ``get_text("words")`` (``(x0, y0, x1, y1, word, block, line,
+    word_no)``, unrotated points):
+
+      1. the words are grouped by ``(block, line)`` — PyMuPDF's own text
+         lines — in that order, each in ``word_no`` order;
+      2. a line is split wherever the gap between neighbouring words is more
+         than ``NATIVE_LINE_SPLIT_GAP`` × the line's height, so a label and
+         its amount a column apart are two lines, as OCR's detector boxes
+         them (measured along x in the unrotated page — the direction a
+         horizontal line runs; a vertical run is never split);
+      3. each piece's word rectangles are unioned and converted to pixels by
+         ``_points_to_pixels`` (``/Rotate`` applied), clamped to the image,
+         as the 4-point polygon ``[[x0, y0], [x1, y0], [x1, y1], [x0, y1]]``
+         OCR lines use; a piece the clamp leaves with no area is dropped.
+
+    Returns ``[{"text", "box"}]`` in reading order, ``text`` the piece's
+    words joined by single spaces. That text is a label for a person reading
+    the record, NOT the page's ``text`` re-cut: PyMuPDF's reading-order
+    string differs (hyphenation, spacing, column order), which is why these
+    lines never join ``ocr_lines``.
+
+    Never raises — a page whose words cannot be read or converted gives
+    ``[]``, and its load goes on. The caller holds ``_PYMUPDF_LOCK``.
+    """
+    try:
+        if not width or not height:
+            return []
+        words = pdf_page.get_text("words") or []
+        if not words:
+            return []
+        convert = _points_to_pixels(pdf_page, width, height)
+        runs: dict[tuple[int, int], list] = {}
+        for word in words:
+            runs.setdefault((int(word[5]), int(word[6])), []).append(word)
+
+        out: list[dict] = []
+        for key in sorted(runs):
+            run = sorted(runs[key], key=lambda w: int(w[7]))
+            line_height = max(w[3] for w in run) - min(w[1] for w in run)
+            pieces: list[list] = [[run[0]]]
+            for prev, word in zip(run, run[1:]):
+                if line_height > 0 and word[0] - prev[2] > NATIVE_LINE_SPLIT_GAP * line_height:
+                    pieces.append([word])
+                else:
+                    pieces[-1].append(word)
+            for piece in pieces:
+                x0, y0, x1, y1 = convert((
+                    min(w[0] for w in piece), min(w[1] for w in piece),
+                    max(w[2] for w in piece), max(w[3] for w in piece),
+                ))
+                x0, x1 = (round(max(0.0, min(float(width), v)), 2) for v in (x0, x1))
+                y0, y1 = (round(max(0.0, min(float(height), v)), 2) for v in (y0, y1))
+                if x1 <= x0 or y1 <= y0:
+                    continue
+                out.append({
+                    "text": " ".join(str(w[4]) for w in piece),
+                    "box": [[x0, y0], [x1, y0], [x1, y1], [x0, y1]],
+                })
+        return out
+    except Exception:  # noqa: BLE001 — geometry is a bonus; never fail a load
+        return []
 
 
 def _normalise_token(token: str) -> str:
@@ -732,9 +872,11 @@ def pdf_text_regions(
     **Rotated pages.** ``search_for`` and ``get_text("words")`` answer in the
     UNROTATED page space, while the render — and ``page.rect`` — are rotated
     by the page's ``/Rotate``. Each rectangle is mapped through
-    ``rotation_matrix`` before scaling; without it a ``/Rotate 270`` plan-set
-    sheet put every box on the wrong axis. ``pdf_rect`` stays unrotated,
-    because that is the space PDF tooling (annotations, ``search_for``) uses.
+    ``rotation_matrix`` before scaling (``_points_to_pixels``, the conversion
+    ``Page.native_lines`` are measured with too); without it a ``/Rotate
+    270`` plan-set sheet put every box on the wrong axis. ``pdf_rect`` stays
+    unrotated, because that is the space PDF tooling (annotations,
+    ``search_for``) uses.
 
     **SVG.** Pass ``filetype="svg"`` and the same machinery answers for an
     SVG's ``<text>``: MuPDF opens it as a one-page document in points. The
@@ -782,10 +924,7 @@ def pdf_text_regions(
             if page.index >= doc.page_count:
                 return []
             pdf_page = doc.load_page(page.index)
-            rect = pdf_page.rect            # rotated — the render's frame
-            sx = page.width / rect.width if rect.width else 1.0
-            sy = page.height / rect.height if rect.height else 1.0
-            to_rendered = pdf_page.rotation_matrix  # identity when /Rotate is 0
+            to_pixels = _points_to_pixels(pdf_page, page.width, page.height)
 
             found: list[tuple[tuple[float, float, float, float], str, float]] = []
             if mode in ("contains", "exact") and pattern:
@@ -800,12 +939,12 @@ def pdf_text_regions(
                         found.append((box, getattr(hit, "text", ""), getattr(hit, "ratio", 1.0)))
 
             for (x0, y0, x1, y1), text, ratio in found:
-                shown = pymupdf.Rect(x0, y0, x1, y1) * to_rendered
+                px0, py0, px1, py1 = to_pixels((x0, y0, x1, y1))
                 regions.append(
                     Region(
                         page=page.index,
                         kind="box",
-                        points=[(shown.x0 * sx, shown.y0 * sy), (shown.x1 * sx, shown.y1 * sy)],
+                        points=[(px0, py0), (px1, py1)],
                         label=region_label,
                         score=1.0,
                         source="pdf-text",

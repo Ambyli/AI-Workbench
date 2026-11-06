@@ -292,7 +292,10 @@ def recognize_text_layer(
         None, or when recognition came back empty — an empty OCR result must
         not replace a native layer or report itself as ``"ocr"``;
       * otherwise a fresh ``source="ocr"`` layer with the recogniser's text,
-        mean confidence and line polygons.
+        mean confidence and line polygons — and the page's own
+        ``native_lines``, which describe the page whichever text was read
+        from it (a mixed PDF read under ``always`` keeps its exact native
+        line boxes beside the OCR lines).
 
     Apply the result to a view of the document with
     ``model.with_text_layers`` and search it with ``textmatch.match_text``;
@@ -310,6 +313,7 @@ def recognize_text_layer(
         source="ocr",
         confidence=result.confidence,
         lines=list(result.lines),
+        native_lines=list(page.native_lines),
     )
 
 

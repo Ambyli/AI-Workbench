@@ -40,7 +40,14 @@ both. That is this package.
                                 images are one page with no text; txt/docx
                                 are one page with text and no image. The
                                 image decoder is injectable so a caller can
-                                keep its own EXIF-aware decode path.
+                                keep its own EXIF-aware decode path. A PDF or
+                                SVG page also carries ``native_lines``: its
+                                text lines' exact boxes in page pixels
+                                (PyMuPDF's words, split at column gaps of
+                                ``NATIVE_LINE_SPLIT_GAP`` × the line height,
+                                ``/Rotate`` applied) — geometry only, never
+                                in ``ocr_lines``, never offset-aligned to
+                                the text.
 
     apply_ocr(doc, engine)    → fills the text layer for pages that lack one
                                 (mode ``auto``), or all of them (``always``).
@@ -113,6 +120,7 @@ from .loaders import (
     DEFAULT_MAX_PAGES,
     DEFAULT_MAX_RENDER_PIXELS,
     DEFAULT_RENDER_DPI,
+    NATIVE_LINE_SPLIT_GAP,
     ImageDecoder,
     available_image_formats,
     default_image_decoder,
@@ -169,6 +177,7 @@ __all__ = [
     "DEFAULT_MAX_PAGES",
     "DEFAULT_MAX_RENDER_PIXELS",
     "DEFAULT_RENDER_DPI",
+    "NATIVE_LINE_SPLIT_GAP",
     "ImageDecoder",
     "available_image_formats",
     "default_image_decoder",

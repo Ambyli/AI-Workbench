@@ -80,17 +80,32 @@ prompt) after the PASS one: *"… was FAIL here — the outlined thing is NOT
 …; do not box it."* A page with both a truth box and a mapped decoy box for
 one criterion gets two references, one of each.
 
+**PDF vs JPG** (``--pdf-dir DIR``). A candidate page whose ``DIR/<stem>.pdf``
+exists (``stem`` the JPG's name without its extension) is SENT as that
+one-page PDF (``application/pdf``) instead of the JPG — the way a CRM
+attachment reaches production, so on a digital PDF the marks refine numbers
+the PDF's own lines (``marks_lines: "native"``). Everything else stays keyed
+by the JPG name and keeps using the JPG: the truth, ``--groups``,
+``--subset``, and the references, which are still made from the JPG pages.
+Each record says ``sent_as: "pdf" | "image"``. The truth boxes are in the
+JPG's pixels (``image_size``), so a PDF job whose result ``page_geometry`` is
+another size is ``status: "size_mismatch"``: scored as neither a hit nor a
+miss, left out of every rate and count but its own (``size_mismatch`` in the
+summary). A PDF of more than one page is refused before anything is
+created. Run the same flags with and without ``--pdf-dir`` to compare.
+
 **What it never prints or writes**: truth boxes, images, OCR text, model
 reasons (``verify_reason``, the scoring ``reason``), or page content in a
 reference's title, description or breakdown reason. It prints ids, counts
 and rates. ``--out`` holds, per run (candidate page x criterion x repeat):
-the page file name, criterion, key, repeat, config label, job id, the
-reference ids sent (and the pages they came from), the outcome (``accepted``,
-``bbox_px`` — the model's accepted box, ``expected`` / ``hit`` / ``correct``
-/ ``iou`` / ``landed_on``), the loop's calls and attempts (boxes, scores,
-the service's own rejection sentences — no reasons), what the loop and the
-scoring call were shown (applied, steps, polarities), and the box-loop
-settings that ran (``options_used``).
+the page file name, criterion, key, repeat, config label, job id, whether
+the page went as a PDF or the image (``sent_as``), the reference ids sent
+(and the pages they came from), the outcome (``accepted``, ``bbox_px`` — the
+model's accepted box, ``expected`` / ``hit`` / ``correct`` / ``iou`` /
+``landed_on``), the loop's calls and attempts (boxes, scores, the service's
+own rejection sentences, which tier the marks were — ``marks_lines`` — no
+reasons), what the loop and the scoring call were shown (applied, steps,
+polarities), and the box-loop settings that ran (``options_used``).
 
 **It runs where the service is**, in the classifier container, against its
 own uvicorn (``--base-url``, default ``http://127.0.0.1:8000``)::
@@ -120,6 +135,11 @@ own uvicorn (``--base-url``, default ``http://127.0.0.1:8000``)::
         --fail-from-decoys "lookalike false usage history=usage history" \\
         --label guided --out /data/grounding_ops/e2e_guided.json
 
+    # Config 2 again, every page that has a PDF sent AS the PDF
+    docker exec classifier uv run --no-sync python bin/reference_box_assess.py \\
+        ... the same flags ... --pdf-dir /data/grounding_ops/pdf \\
+        --label guided-pdf --out /data/grounding_ops/e2e_guided_pdf.json
+
 The truth file is the experiment's (``grounding_experiment._load_truth``:
 ``criteria``, ``decoys``, ``absent``), and so are ``--groups`` and
 ``--subset``. ``--key`` / ``--options`` / ``--fail-from-decoys`` name a
@@ -134,17 +154,20 @@ and false accepts (accepted, not a hit); for ``absent`` pairs the correct
 rate (nothing accepted) and wrong accepts; where wrong boxes landed; how often
 the loop ran, was shown examples, and was shown a FAIL example (of the runs
 that were sent one); the mean loop calls; unit errors, by kind (the error's text before its
-first colon, never the detail); and with ``refine:
-"marks"`` how many refines the marks pass made and how many fell back
-because the window held more OCR lines than the service's
+first colon, never the detail); how many runs went as a PDF and how many
+were left out as a ``size_mismatch``; and with ``refine: "marks"`` how many
+refines the marks pass made, which tier its marks were (``marks_lines``:
+``native`` / ``ocr`` / ``window`` calls) and how many fell back because the
+window held more text lines than the service's
 ``CLASSIFIER_LLM_BBOX_MARKS_MAX`` — the number that says whether 40 is
 enough.
 
 Process flow position: none — a standalone operator tool, an HTTP client of
 the running service. It imports ``grounding_experiment`` for the truth
-format, the picks and the scoring (so both measure the same way), and
+format, the picks and the scoring (so both measure the same way),
 ``api.schemas`` only to check the locate criteria before anything is
-created.
+created, and ``common.documents.pdf_page_count`` only to check
+``--pdf-dir``'s PDFs are one page each.
 """
 
 from __future__ import annotations
@@ -421,7 +444,9 @@ class Guide:
 
 @dataclass
 class JobSpec:
-    """One ``/assess`` job: a candidate page on one repeat."""
+    """One ``/assess`` job: a candidate page on one repeat. ``page`` is the
+    JPG's name — the truth key — even when the page is ``sent_as: "pdf"``
+    (``--pdf-dir``)."""
 
     page: str
     repeat: int
@@ -429,6 +454,7 @@ class JobSpec:
     guides: dict[str, Guide] = field(default_factory=dict)
     job_id: Optional[str] = None
     submitted_at: Optional[float] = None
+    sent_as: str = "image"             # "image" | "pdf"
 
     def reference_ids(self) -> list[str]:
         """The ``references`` list: per criterion its PASS then its FAIL id,
@@ -539,7 +565,7 @@ def job_form(
 # model's words).
 _ATTEMPT_KEYS = ("attempt", "bbox_grid", "bbox_px", "valid", "accepted", "verify_score",
                  "reject", "coarse_bbox_grid", "refined", "refine_reject", "refine_mode",
-                 "marks", "marks_shown", "marks_fallback", "verify_partial")
+                 "marks", "marks_shown", "marks_lines", "marks_fallback", "verify_partial")
 _LOOP_OPTIONS = ("refine", "verify_partial", "verify_min_span")
 
 
@@ -600,15 +626,32 @@ def score_entry(entry: Optional[dict], result: dict, label: str, truth_entry: ge
     }
 
 
+def page_size(result: dict) -> tuple[int, int]:
+    """The ``(width, height)`` the service read the job's page at — its
+    first ``page_geometry`` frame, ``(0, 0)`` when it has none."""
+    geometry = (result.get("page_geometry") or [{}])[0] or {}
+    return int(geometry.get("width") or 0), int(geometry.get("height") or 0)
+
+
 def job_records(job: JobSpec, result: dict, truth: dict[str, ge.Truth],
-                keys: dict[str, str], label_of_config: str) -> list[dict]:
-    """The ``--out`` records of one finished job, one per criterion."""
+                keys: dict[str, str], label_of_config: str,
+                truth_size: Optional[tuple[int, int]] = None) -> list[dict]:
+    """The ``--out`` records of one finished job, one per criterion.
+
+    A job ``sent_as: "pdf"`` is checked against ``truth_size``, the JPG's
+    size (``image_size``, the frame the truth boxes are in): when the
+    service read the PDF at any other size, every record of the job is
+    ``status: "size_mismatch"`` with its truth keys emptied
+    (``ge._scored(None)`` — neither a hit nor a miss) and both sizes beside
+    it; the loop's record is kept, for looking at."""
     per = ((result.get("assessment") or {}).get("per_criterion_scores")) or {}
     truth_entry = truth.get(job.page) or {"criteria": {}, "decoys": {}, "absent": []}
+    sent = page_size(result)
+    mismatch = job.sent_as == "pdf" and truth_size is not None and sent != tuple(truth_size)
     records = []
     for label in job.labels:
         guide = job.guides.get(label) or Guide()
-        records.append({
+        record = {
             "image": job.page,
             "page_id": page_id(job.page),
             "criterion": label,
@@ -616,13 +659,19 @@ def job_records(job: JobSpec, result: dict, truth: dict[str, ge.Truth],
             "repeat": job.repeat,
             "config": label_of_config,
             "job_id": job.job_id,
+            "sent_as": job.sent_as,
             "references": job.reference_ids(),
             "pass_reference": {"id": guide.pass_id, "page": guide.pass_page},
             "fail_reference": {"id": guide.fail_id, "page": guide.fail_page},
             "reference_note": guide.note,
             "fail_reference_note": guide.fail_note,
             **score_entry(per.get(label), result, label, truth_entry),
-        })
+        }
+        if mismatch:
+            record.update(ge._scored(None))
+            record.update({"status": "size_mismatch", "page_size": list(sent),
+                           "truth_size": list(truth_size)})
+        records.append(record)
     return records
 
 
@@ -632,8 +681,9 @@ def failed_job_records(job: JobSpec, why: str, keys: dict[str, str], config: str
     return [{
         "image": job.page, "page_id": page_id(job.page), "criterion": label,
         "key": keys.get(label), "repeat": job.repeat, "config": config, "job_id": job.job_id,
-        "references": job.reference_ids(), "status": f"job_{why}", "loop_ran": False,
-        "accepted": False, "calls": 0, "fail_reached": False, **ge._scored(None),
+        "sent_as": job.sent_as, "references": job.reference_ids(), "status": f"job_{why}",
+        "loop_ran": False, "accepted": False, "calls": 0, "fail_reached": False,
+        **ge._scored(None),
     } for label in job.labels]
 
 
@@ -647,14 +697,19 @@ def summarise(records: list[dict]) -> dict:
     truth boxes), correct rate and wrong accepts (``absent`` pairs), where
     wrong boxes landed, how often the loop ran / was guided / was shown a
     FAIL (of the runs sent one), mean loop calls, unit errors (and their
-    kinds)."""
+    kinds), how many runs went as a PDF (``sent_as``), and the
+    ``size_mismatch`` runs — counted, and left out of everything else (``n``
+    included): their truth is in another frame."""
 
-    def block(rows: list[dict]) -> dict:
+    def block(every: list[dict]) -> dict:
+        rows = [r for r in every if r.get("status") != "size_mismatch"]
         present = [r for r in rows if r.get("expected") == "present"]
         absent = [r for r in rows if r.get("expected") == "absent"]
         sent_fail = [r for r in rows if (r.get("fail_reference") or {}).get("id")]
         out: dict[str, Any] = {
             "n": len(rows),
+            "size_mismatch": len(every) - len(rows),
+            "sent_as": dict(sorted(Counter(r.get("sent_as") or "image" for r in rows).items())),
             "errors": sum(1 for r in rows if r.get("status") != "ok"),
             # A unit's error kind, or the status itself for a job that never
             # finished (job_failed, job_timed_out) or a missing entry.
@@ -671,13 +726,16 @@ def summarise(records: list[dict]) -> dict:
                 if sent_fail else None),
             "mean_calls": ge._mean([r.get("calls") for r in rows], 2),
         }
-        # refine: "marks" — of the refines, how many the marks pass made, and
-        # how many fell back because the window held more OCR lines than the
-        # SERVICE's CLASSIFIER_LLM_BBOX_MARKS_MAX.
+        # refine: "marks" — of the refines, how many the marks pass made;
+        # which tier each marks call numbered (native PDF lines, the OCR
+        # layer's, window OCR's); and how many fell back because the window
+        # held more lines than the SERVICE's CLASSIFIER_LLM_BBOX_MARKS_MAX.
         attempts = [a for r in rows for a in r.get("attempt_log") or []]
         refines = [a.get("refine_mode") for a in attempts if a.get("refine_mode")]
         if refines:
             out["marks_refined_rate"] = round(ge._rate([m == "marks" for m in refines]), 3)
+            out["marks_lines"] = dict(sorted(Counter(
+                a["marks_lines"] for a in attempts if a.get("marks_lines")).items()))
             out["marks_over_cap"] = sum(
                 1 for a in attempts if "over the cap" in str(a.get("marks_fallback") or ""))
         if present:
@@ -715,6 +773,10 @@ def print_summary(summary: dict, config: str) -> None:
         print(f"{name[:60]}: {row['n']} run(s), {row['errors']} error(s), loop ran "
               f"{pct(row['loop_ran_rate'])}, accepted {pct(row['accepted_rate'])}, "
               f"mean calls {row['mean_calls']}")
+        if row.get("sent_as", {}).get("pdf") or row.get("size_mismatch"):
+            print(f"    sent as PDF {row['sent_as'].get('pdf', 0)} of {row['n']} scored run(s); "
+                  f"{row['size_mismatch']} more left out as size_mismatch (the PDF read at "
+                  "another size than the JPG the truth is in)")
         if row.get("error_kinds"):
             print("    errors: " + ", ".join(f"{kind} ×{n}"
                                           for kind, n in row["error_kinds"].items()))
@@ -735,7 +797,9 @@ def print_summary(summary: dict, config: str) -> None:
               f"{pct(row['fail_reached_rate'])} of runs ({pct(row['fail_reached_of_sent'])} of "
               f"the {row['fail_sent']} sent one)")
         if "marks_refined_rate" in row:
+            tiers = ", ".join(f"{tier} ×{n}" for tier, n in row["marks_lines"].items()) or "none"
             print(f"    marks refined {pct(row['marks_refined_rate'])} of the refines; "
+                  f"marks calls by lines: {tiers}; "
                   f"{row['marks_over_cap']} fell back over the service's marks cap")
 
 
@@ -787,6 +851,33 @@ def _validate_criteria(criteria: list[dict], references: bool) -> None:
                          f"{validation_message(exc)}")
 
 
+def pdf_pages(pdf_dir: pathlib.Path, pages: list[str]) -> dict[str, pathlib.Path]:
+    """``--pdf-dir``: ``{page: DIR/<stem>.pdf}`` for every candidate page
+    (a JPG's name) whose PDF exists — the pages sent as a PDF. Exits when
+    the directory is missing, or a PDF is not ONE page: a longer one would
+    be several items, and the truth is one page's. Names never printed —
+    page ids."""
+    if not pdf_dir.is_dir():
+        raise SystemExit(f"--pdf-dir {pdf_dir}: not a directory")
+    from common.documents import UnsupportedDocumentError, pdf_page_count
+
+    found: dict[str, pathlib.Path] = {}
+    for page in pages:
+        path = pdf_dir / f"{pathlib.Path(page).stem}.pdf"
+        if not path.is_file():
+            continue
+        try:
+            count = pdf_page_count(path.read_bytes())
+        except UnsupportedDocumentError:
+            raise SystemExit(
+                f"--pdf-dir: the PDF of page {page_id(page)} does not open") from None
+        if count != 1:
+            raise SystemExit(f"--pdf-dir: the PDF of page {page_id(page)} has {count} pages; "
+                             "send one-page PDFs (the truth is one page's)")
+        found[page] = path
+    return found
+
+
 def run(args: argparse.Namespace, client: Any, state: Run) -> dict:
     """Steps 1-3; ``main`` runs ``cleanup`` in its ``finally``. ``client`` is
     an ``httpx.Client`` with the service's base URL (a ``TestClient`` in the
@@ -833,9 +924,14 @@ def run(args: argparse.Namespace, client: Any, state: Run) -> dict:
         raise SystemExit(f"--model {model_id!r} is not in GET /models")
     max_images = int(spec.get("max_images_per_prompt") or 1)
     config = args.label or ("baseline" if not references else "guided")
+    pdfs = pdf_pages(pathlib.Path(args.pdf_dir).resolve(), sorted(candidates)) \
+        if args.pdf_dir else {}
     print(f"service : {args.base_url}  model {model_id} ({max_images} image(s) per prompt)")
     print(f"config  : {config}; {len(candidates)} page(s), {sum(map(len, candidates.values()))} "
           f"pair(s), {args.repeats} repeat(s), {args.concurrency} job(s) in flight")
+    if args.pdf_dir:
+        print(f"pdfs    : {len(pdfs)} of {len(candidates)} page(s) sent as their PDF "
+              "(--pdf-dir); the rest, and every reference, as the image")
 
     # Step 1 — the references.
     if references:
@@ -866,7 +962,9 @@ def run(args: argparse.Namespace, client: Any, state: Run) -> dict:
         max_images=max_images,
         max_per_request=int(limits.get("max_per_request") or 10),
     )
-    run_jobs(client, state, args, images, truth, keys, overlays, config)
+    for job in state.jobs:
+        job.sent_as = "pdf" if job.page in pdfs else "image"
+    run_jobs(client, state, args, images, truth, keys, overlays, config, pdfs=pdfs)
 
     # Step 3 — the summary (the records were scored as each job finished).
     state.summary = summarise(state.records)
@@ -924,19 +1022,27 @@ def wait_for_references(client: Any, state: Run, args: argparse.Namespace) -> No
 
 def run_jobs(client: Any, state: Run, args: argparse.Namespace,
              images: dict[str, pathlib.Path], truth: dict[str, ge.Truth],
-             keys: dict[str, str], overlays: dict[str, dict], config: str) -> None:
+             keys: dict[str, str], overlays: dict[str, dict], config: str,
+             *, pdfs: Optional[dict[str, pathlib.Path]] = None) -> None:
     """At most ``--concurrency`` jobs in flight: submit, poll, and as each
-    finishes score it, write ``--out``, then delete the job."""
+    finishes score it, write ``--out``, then delete the job. A job
+    ``sent_as: "pdf"`` uploads ``pdfs[page]`` instead of the image, and is
+    scored against the image's size (``image_size``, read once per page)."""
+    pdfs = pdfs or {}
+    truth_sizes: dict[str, tuple[int, int]] = {}
     queue = list(state.jobs)
     flying: list[JobSpec] = []
     done = 0
     while queue or flying:
         while queue and len(flying) < args.concurrency:
             job = queue.pop(0)
-            raw = images[job.page].read_bytes()
+            source = pdfs[job.page] if job.sent_as == "pdf" else images[job.page]
+            raw = source.read_bytes()
+            if job.sent_as == "pdf" and job.page not in truth_sizes:
+                truth_sizes[job.page] = image_size(images[job.page].read_bytes())
             body = _check(
                 client.post("/assess", data=job_form(job, keys, overlays, args.model),
-                            files={"file": (job.page, raw, _content_type(job.page))}),
+                            files={"file": (source.name, raw, _content_type(source.name))}),
                 f"POST /assess ({page_id(job.page)} #{job.repeat})",
             )
             job.job_id, job.submitted_at = body["job_id"], time.monotonic()
@@ -947,7 +1053,8 @@ def run_jobs(client: Any, state: Run, args: argparse.Namespace,
             phase = body.get("phase")
             seconds = round(time.monotonic() - (job.submitted_at or 0), 1)
             if phase == "completed":
-                records = job_records(job, body.get("result") or {}, truth, keys, config)
+                records = job_records(job, body.get("result") or {}, truth, keys, config,
+                                      truth_size=truth_sizes.get(job.page))
             elif phase == "failed":
                 records = failed_job_records(job, "failed", keys, config)
             elif seconds > args.timeout:
@@ -966,8 +1073,8 @@ def run_jobs(client: Any, state: Run, args: argparse.Namespace,
 
 def _content_type(name: str) -> str:
     suffix = pathlib.Path(name).suffix.lower()
-    return {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}.get(
-        suffix, "application/octet-stream")
+    return {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+            ".pdf": "application/pdf"}.get(suffix, "application/octet-stream")
 
 
 def _delete_job(client: Any, state: Run, job_id: Optional[str]) -> None:
@@ -989,6 +1096,7 @@ def write_out(args: argparse.Namespace, state: Run, config: str) -> None:
             "repeats": args.repeats, "references": not args.no_references,
             "keys": list(args.key or []), "options": list(args.options or []),
             "fail_from_decoys": list(args.fail_from_decoys or []),
+            "pdf_dir": args.pdf_dir,
         },
         "complete": state.complete,
         "summary": state.summary,
@@ -1095,6 +1203,10 @@ def build_parser() -> argparse.ArgumentParser:
                              "PASS (repeatable, one decoy per criterion)")
     parser.add_argument("--no-references", action="store_true",
                         help="the same jobs without references: the baseline")
+    parser.add_argument("--pdf-dir", default=None,
+                        help="send a candidate page as DIR/<its stem>.pdf when that one-page "
+                             "PDF exists; the truth, groups, subset and references stay the "
+                             "JPG's, and a PDF read at another size is a size_mismatch")
     parser.add_argument("--label", default=None,
                         help="the config label on every record (default: baseline / guided)")
     parser.add_argument("--model", default=None,

@@ -2385,9 +2385,10 @@ match can be diagnosed from the file alone. `lines` are the OCR lines with
 their polygons in ORIGINAL page pixels, and `text` is exactly their
 `"\n".join`; `lines` is empty for native text — a .txt / .docx has no
 geometry, and a native PDF's layer is PyMuPDF's reading-order text, whose line
-geometry is not recorded (hits on it are still located, as `pdf-text`
-regions). `source: "none"` with an empty `text` is a real answer: `ocr:
-never` on a scan.
+geometry is not recorded here (hits on it are still located, as `pdf-text`
+regions; the PDF's own line boxes, which the marks refine numbers, carry no
+offsets into `text` and are never written as `lines`). `source: "none"` with
+an empty `text` is a real answer: `ocr: never` on a scan.
 
 Each `text` unit links its layer — and so does each `llm` unit, for the
 layer its prompt carried — from its `items` entry (`text_layer`), and the
@@ -2484,9 +2485,11 @@ attempt 1 ── ask ────── one criterion, the page image its scorin
    │                    into the page frame. An unusable second answer keeps
    │                    the coarse box; both are recorded
    │                    ◄ options.refine: "marks" (default
-   │                    _REFINE_MODE, grid): number the OCR lines in the
-   │                    crop instead of the grid, "which mark(s)?", the box
-   │                    = their union; the grid pass is the fallback
+   │                    _REFINE_MODE, grid): number the text lines in the
+   │                    crop instead of the grid (the PDF's own, else the
+   │                    OCR layer's, else OCR of the window), "which
+   │                    mark(s)?", the box = their union; the grid pass is
+   │                    the fallback
    ├── verify ───────── crop that box out of the ORIGINAL page (+25% padding,
    │                    CLASSIFIER_LLM_BBOX_CROP_PAD), send the CROP ALONE:
    │                    "is <criterion> visible in this? 1–10". Accept at
@@ -2596,7 +2599,10 @@ right answer is no box. Every example came from ANOTHER project's page.
   | Usage: box on the look-alike | 9.5 → 1.9% | 15.8 → **0%** |
 
   The amount due with references but no marks scored 90.0% / 8.8% on the
-  holdout: references do the work, and marks do not hurt.
+  holdout: references do the work, and marks do not hurt. Every one of these
+  runs sent JPG renders, so marks always had OCR lines; on a digital PDF the
+  marks refine now numbers the PDF's own lines (below), measured as PDF vs
+  JPG with `bin/reference_box_assess.py --pdf-dir`.
 
 **Defaults.** Every service default stays OFF; a document opts in per
 criterion. The measured setup: a one-line text field (the amount due) with
@@ -2624,23 +2630,47 @@ OFF by default and each byte-identical to the loop without it when off:
   only its labels, so leave those on the grid
   ([§ Turning the box-loop options on](#turning-the-box-loop-options-on-for-a-document)).
   After the coarse ask validates, the refine crop (the same
-  window, cut from the ORIGINAL page) shows every OCR text line that lies at
+  window, cut from the ORIGINAL page) shows every text line that lies at
   least half inside the window, outlined and numbered on a tab at its left
   end, in reading order (`common.vision.draw_marks_overlay`), instead of the
   grid. The model answers `{"reason": "...", "marks": [n, …]}`, quoting the
   lines first. Several marks are one feature — a label line and its value
   line become one box. The refined box is the union of the chosen lines'
-  boxes, so it fits the text exactly. The lines are the criterion's own text
-  layer, the one its `options.ocr` produced for the scoring call, so there is
-  no extra OCR pass. Earlier attempts' rejections ride along, under a note
+  boxes, so it fits the text exactly. The lines come from the FIRST of three
+  tiers that has one inside the window, recorded as `marks_lines`:
+  1. **`native`** — a digital PDF's (or an SVG's) own text lines,
+     `common.documents` `Page.native_lines`: PyMuPDF's word boxes grouped
+     into its lines and split at a column gap (more than twice the line's
+     height, so a label and its amount a column apart are two marks, as OCR
+     boxes them), in page pixels with `/Rotate` applied. Exact, and no OCR
+     at all — whatever `options.ocr` is;
+  2. **`ocr`** — the OCR lines of the criterion's own text layer, the one its
+     `options.ocr` produced for the scoring call (no second pass of the
+     page; a native layer has none);
+  3. **`window`** — an OCR pass of the refine window alone, when neither of
+     the others reached it: a scanned bill whose 20+ characters of native
+     text (a stamped header) kept `ocr: "auto"` from reading the page. Never
+     under `ocr: "never"`; under the `CLASSIFIER_OCR_WORKERS` limit; not a
+     text layer (no `text.p{n}.*.json`, no `document_info.ocr` entry — the
+     attempt's `marks_lines: "window"` is its record). No engine, or an
+     engine error, is a grid fallback, never a failed unit.
+
+  Earlier attempts' rejections ride along, under a note
   that their coordinates are on the whole page. With
   `reference.boxes.refine` on, the region crops come first, with a
-  marks-worded guard. **The grid refine runs instead** — one more call — and
+  marks-worded guard. The marks prompt is the same whichever tier drew the
+  lines. **The grid refine runs instead** — one more call — and
   the attempt says why in `marks_fallback` when:
-  * the page has no OCR line boxes (native PDF/SVG text, `ocr: "never"`, or
-    OCR found nothing);
-  * no line lies inside the window (a logo, a photo);
-  * the window holds more than `CLASSIFIER_LLM_BBOX_MARKS_MAX` (40) lines;
+  * no tier has a line inside the window (a logo, a photo, `ocr: "never"`
+    on a scan) — the sentence names each tier and what it held, e.g. *"no
+    text line lies inside the refine window (native lines: none on the page;
+    OCR layer: none in the window; window OCR: off)"*; window OCR is `off`
+    under `ocr: "never"`, and `unavailable — no OCR engine, or the pass
+    failed` when it could not run;
+  * the tier it reached holds more than `CLASSIFIER_LLM_BBOX_MARKS_MAX` (40)
+    lines in the window (*"45 native text lines lie inside the refine
+    window, over the cap of 40"*) — the next tier is not tried: it reads the
+    same text, so it would find as many;
   * the answer is unusable (no answer, no `marks`, not whole numbers, a
     number that was not drawn);
   * the answer is `"marks": null` or `[]` — none of the lines is the feature,
@@ -2771,7 +2801,8 @@ setting is off, so the record is otherwise exactly the one above):
 | `refine_mode` | `refine: "marks"` (the criterion's, or its service default) and a refine ran | `marks` when the marks pass produced the box, `grid` when it fell back |
 | `marks` | the marks pass produced the box | the chosen mark numbers (1-based, as drawn), sorted — ids only, never the lines' text |
 | `marks_shown` | a marks call was made | how many lines were numbered |
-| `marks_fallback` | `refine_mode: "grid"` | why the grid refine ran (one sentence) |
+| `marks_lines` | a marks call was made | which tier those lines came from: `native` (the PDF / SVG page's own lines), `ocr` (the criterion's OCR text layer) or `window` (an OCR pass of the refine window) |
+| `marks_fallback` | `refine_mode: "grid"` | why the grid refine ran (one sentence, naming the tiers tried when none reached the window) |
 | `verify_partial` | `verify_partial: true` (the criterion's, or its service default) and the verify said | the verify's `partial` — the crop cut the feature off |
 
 ```json
@@ -2779,7 +2810,7 @@ setting is off, so the record is otherwise exactly the one above):
  "valid": true, "accepted": true, "verify_score": 9, "verify_reason": "Amount due $193.33",
  "verify_partial": false,
  "coarse_bbox_grid": [100, 200, 300, 400], "refine_window_grid": [0, 50, 450, 550],
- "refined": true, "refine_mode": "marks", "marks_shown": 3, "marks": [2, 3]}
+ "refined": true, "refine_mode": "marks", "marks_shown": 3, "marks_lines": "ocr", "marks": [2, 3]}
 ```
 
 `attrs.detector_iou` (the IoU against the detector's best box for the same
@@ -3010,7 +3041,19 @@ container's own uvicorn (`--base-url`, default `http://127.0.0.1:8000`):
   truth exactly as the experiment scores it (hit, `absent` correct,
   `landed_on`), the loop's calls, and from `localization.references` whether
   the PASS and FAIL examples reached the loop. `--out` keeps ids, outcomes and
-  the box-loop settings that ran — never a reason.
+  the box-loop settings that ran — never a reason. With marks, each
+  criterion's summary adds `marks_refined_rate`, `marks_over_cap` and
+  `marks_lines` (how many marks calls numbered `native` / `ocr` / `window`
+  lines).
+* **PDF vs JPG** — `--pdf-dir DIR`: a candidate page whose `DIR/<stem>.pdf`
+  exists (the JPG's name without its extension) is SENT as that one-page
+  PDF (`application/pdf`); everything else stays keyed by the JPG name and
+  uses the JPG — the truth, `--groups`, `--subset`, and the references,
+  which are still made from the JPG pages. Each record says `sent_as: pdf |
+  image`. The truth boxes are in the JPG's pixels, so a PDF job whose
+  `page_geometry` size differs from the JPG's is `status: "size_mismatch"`,
+  scored as neither a hit nor a miss, and counted in the summary
+  (`size_mismatch`).
 * **Clean-up** — in a `finally` (an error, Ctrl-C): every job (each as soon as
   its record is in `--out`), the references' creation jobs, and every
   reference the run created. `--purge` deletes every reference tagged
@@ -3050,7 +3093,7 @@ On an `llm` criterion's `options`, beside `boxes` and `max_attempts`:
 
 | Option | Values | Unset = service default | What it does | What it costs | Refused (400) when |
 |---|---|---|---|---|---|
-| `refine` | `"grid"` \| `"marks"` | `CLASSIFIER_LLM_BBOX_REFINE_MODE` (`grid`) | How the refine pass asks. `grid`: the zoomed crop with its own grid, a box on it. `marks`: every OCR text line in the zoomed window outlined and numbered, *"which mark(s)?"*, the refined box the union of the chosen lines — so it fits the text exactly. Reads the criterion's own text layer (`options.ocr`); falls back to the grid when the page has no line boxes, the window holds none or more than `CLASSIFIER_LLM_BBOX_MARKS_MAX` (40, service-wide), or the answer is unusable | No extra call and no extra image: the refine call shows the marked crop instead of the gridded one. A marks answer that falls back to the grid adds that call (at most `4 × max_attempts` calls). No extra OCR pass | `boxes` not `true`; any other value (`"Marks"` too); on `text` / `detector` / `cv` (an unknown key) |
+| `refine` | `"grid"` \| `"marks"` | `CLASSIFIER_LLM_BBOX_REFINE_MODE` (`grid`) | How the refine pass asks. `grid`: the zoomed crop with its own grid, a box on it. `marks`: every text line in the zoomed window outlined and numbered, *"which mark(s)?"*, the refined box the union of the chosen lines — so it fits the text exactly. The lines are a digital PDF's own (exact, no OCR), else the OCR lines of the criterion's own text layer (`options.ocr`), else an OCR pass of the window alone (not under `ocr: "never"`) — recorded as `marks_lines`; falls back to the grid when no tier has a line in the window, the tier it reached holds more than `CLASSIFIER_LLM_BBOX_MARKS_MAX` (40, service-wide) there, or the answer is unusable | No extra call and no extra image: the refine call shows the marked crop instead of the gridded one. A marks answer that falls back to the grid adds that call (at most `4 × max_attempts` calls). No extra OCR pass of the page; an OCR pass of the refine window only when neither the PDF's lines nor the layer's reach it | `boxes` not `true`; any other value (`"Marks"` too); on `text` / `detector` / `cv` (an unknown key) |
 | `verify_partial` | `true` \| `false` | `CLASSIFIER_LLM_BBOX_VERIFY_PARTIAL` (`false`) | The verify also answers `"partial"`: the crop shows the feature but cuts some of it off. Never moves the score or `CLASSIFIER_LLM_BBOX_VERIFY_PASS`; a REJECTED attempt that was partial is retried with *"box the same place again, larger"* instead of *"look elsewhere"*. Recorded as `verify_partial` on the attempt | Nothing: one more field in the verify's answer | `boxes` not `true`; not a boolean; on `text` / `detector` / `cv` |
 | `verify_min_span` | `0`–`1` | `CLASSIFIER_LLM_BBOX_VERIFY_MIN_SPAN` (`0`) | Grows the verify crop, centred on the box and kept inside the page, to at least this share of the page on each axis (after the 25% padding) — a one-line field's crop then keeps its label beside it. Try `0.08`. Only what the verify SEES grows: the box, `bbox_px` and the regions are unchanged | No extra call; a larger verify crop (more image pixels in that one call) | `boxes` not `true`; below 0 or above 1; not a number; on `text` / `detector` / `cv` |
 
@@ -3121,7 +3164,7 @@ The recipe, per document type (a utility bill, a permit, a proposal):
    `"auto"`).
 3. **Pick the options per field:**
    * **A one-line text field** — an amount due, an account number, a due
-     date: `refine: "marks"` (the box becomes the OCR lines the model
+     date: `refine: "marks"` (the box becomes the text lines the model
      picks, label and value together, so it fits the text) and
      `reference.boxes` with all three steps (on a page full of numbers,
      the example says WHICH one). That is the measured setup (amount due,

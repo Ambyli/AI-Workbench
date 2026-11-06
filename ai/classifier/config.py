@@ -384,7 +384,8 @@ BOX_CAPTION_TEXT: dict[bool, str] = {
 
 # ── The refine pass by numbered marks (LLM_BBOX_REFINE_MODE=marks;
 #    build_marks_prompt) ───────────────────────────────────────────────────
-# The marked crop's question. The OCR lines in the refine window are outlined
+# The marked crop's question. The text lines in the refine window (llm.boxes'
+# marks tiers: the page's own PDF lines, OCR's, window OCR's) are outlined
 # and numbered 1..N on tabs at their left end (common.vision
 # .draw_marks_overlay); the answer is `{"reason", "marks": [n, ...]}`, reason
 # first so the model quotes the lines before it picks them. Several marks
@@ -895,18 +896,21 @@ LLM_BBOX_REFINE_MIN_SPAN: float = min(
 #
 # LLM_BBOX_REFINE_MODE is HOW the refine pass asks. `grid` (the default) is
 # the pass above: the zoomed crop with its own grid, a box on it. `marks`
-# draws a numbered tag on every OCR text line in the refine window instead
-# (the text layer the criterion's options.ocr already produced — no extra OCR
-# pass) and asks which mark(s) are the feature; the refined box is the union
-# of the chosen lines' boxes, so it fits the text exactly. Measured misses
-# are mostly PLACEMENT — the right line, 15 px off, or "$193.33" boxed
-# without its "Amount due" label — and a line the OCR outlined cannot be
-# misplaced. Several marks may be chosen (a label line and its value line).
-# The grid pass runs instead, and the attempt records why
-# (`marks_fallback`), when the page has no OCR line boxes (native text), the
-# window holds none (a logo) or more than LLM_BBOX_MARKS_MAX, or the answer
-# is unusable or says none of the lines is the feature. Anything but
-# "marks" reads as "grid". CLASSIFIER_LLM_BBOX_REFINE=false turns both off.
+# draws a numbered tag on every text line in the refine window instead and
+# asks which mark(s) are the feature; the refined box is the union of the
+# chosen lines' boxes, so it fits the text exactly. The lines are the first
+# of three tiers with one in the window (`marks_lines` on the attempt): a
+# digital PDF / SVG page's own lines (exact, no OCR), the OCR text layer the
+# criterion's options.ocr already produced, then an OCR pass of the window
+# alone (never under ocr: "never"). Measured misses are mostly PLACEMENT —
+# the right line, 15 px off, or "$193.33" boxed without its "Amount due"
+# label — and a measured line cannot be misplaced. Several marks may be
+# chosen (a label line and its value line). The grid pass runs instead, and
+# the attempt records why (`marks_fallback`, naming each tier tried), when
+# no tier has a line in the window (a logo), the chosen tier holds more
+# than LLM_BBOX_MARKS_MAX there, or the answer is unusable or says none of
+# the lines is the feature. Anything but "marks" reads as "grid".
+# CLASSIFIER_LLM_BBOX_REFINE=false turns both off.
 #
 # LLM_BBOX_MARKS_MIN_INSIDE (not an env knob): the share of a line's area
 # that must lie inside the window for it to be marked — a long line the

@@ -29,8 +29,9 @@ other:
                             off, which never moves the score.
     build_marks_prompt()  — the refine pass in marks mode
                             (CLASSIFIER_LLM_BBOX_REFINE_MODE=marks): the
-                            zoomed crop with every OCR text line outlined and
-                            numbered, "which mark(s) are <criterion>?" —
+                            zoomed crop with every text line outlined and
+                            numbered (a PDF's own lines, or OCR's), "which
+                            mark(s) are <criterion>?" —
                             ``{"reason", "marks": [n, ...]}``.
     BoxExample            — one example as the loop's prompts need it: a
                             composite or a region crop, with its verdict —
@@ -801,9 +802,11 @@ def build_marks_prompt(
 
     The refine pass in marks mode (CLASSIFIER_LLM_BBOX_REFINE_MODE=marks,
     ``llm.boxes``): the attached image is the zoomed crop of the ORIGINAL
-    page, with every OCR text line in it outlined and numbered 1..``marks``
-    (``common.vision.draw_marks_overlay``). Placing a box is replaced by
-    recognising a line, so the answer is as precise as the OCR's boxes;
+    page, with every text line in it outlined and numbered 1..``marks``
+    (``common.vision.draw_marks_overlay``) — a digital PDF's own lines, or
+    OCR's (``llm.boxes.marks_lines_in``); the wording says neither, so the
+    prompt is the same whichever drew them. Placing a box is replaced by
+    recognising a line, so the answer is as precise as the lines' boxes;
     several numbers are one feature written over several lines (a label and
     its value). The answer is ``MARKS_SCAFFOLD`` — reason first, quoting the
     lines picked — and ``"marks": null`` (or ``[]``) says none of the lines is

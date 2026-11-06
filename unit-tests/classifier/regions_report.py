@@ -143,6 +143,15 @@ ARTIFACT_PATTERNS = (
 # from the result's ``artifacts.layers``, whenever the page had an image.
 LAYERS_TO_FETCH = ("svg", "preview")
 
+# Each GET /jobs/{id} long-polls: ``?wait=`` holds it in the service until
+# the job ends or POLL_WAIT_S passes (the service caps a wait at 60 s,
+# ai/classifier/API.md § GET /jobs/{job_id}), so a job costs one or two
+# requests — through LiteLLM each one is a metered call. Under HttpTransport's
+# 120 s read timeout. A classifier older than the long-poll ignores ``wait``
+# and answers at once: a non-terminal answer back in under FAST_ANSWER_S is
+# followed by the old POLL_INTERVAL_S sleep, so the loop never spins.
+POLL_WAIT_S = 30.0
+FAST_ANSWER_S = 1.0
 POLL_INTERVAL_S = 1.5
 TERMINAL_PHASES = ("completed", "failed", "cancelled")
 
@@ -576,11 +585,16 @@ def submit(case: Case, transport: Any) -> Any:
 
 
 def poll(transport: Any, job_id: str, timeout_s: float) -> dict:
-    """Poll ``GET /jobs/{id}`` until the phase is terminal or time runs out."""
+    """Poll ``GET /jobs/{id}`` until the phase is terminal or time runs out —
+    each request a long-poll of up to POLL_WAIT_S (see the constants)."""
     deadline = time.monotonic() + timeout_s
     job: dict = {}
-    while time.monotonic() < deadline:
-        response = transport.request("GET", f"/v1/classifier/jobs/{job_id}")
+    while (remaining := deadline - time.monotonic()) > 0:
+        asked = time.monotonic()
+        response = transport.request(
+            "GET", f"/v1/classifier/jobs/{job_id}",
+            params={"wait": round(min(POLL_WAIT_S, remaining), 1)},
+        )
         if response.status_code != 200:
             raise RuntimeError(
                 f"GET /jobs/{job_id} returned {response.status_code}: {response.text[:300]}"
@@ -588,7 +602,8 @@ def poll(transport: Any, job_id: str, timeout_s: float) -> dict:
         job = response.json()
         if job.get("phase") in TERMINAL_PHASES:
             return job
-        time.sleep(POLL_INTERVAL_S)
+        if time.monotonic() - asked < FAST_ANSWER_S:
+            time.sleep(POLL_INTERVAL_S)
     job.setdefault("phase", "timeout")
     job["error"] = f"still {job.get('phase')} after {timeout_s:.0f}s"
     return job

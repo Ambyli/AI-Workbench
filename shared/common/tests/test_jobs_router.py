@@ -2,7 +2,8 @@
 
 Uses FastAPI's TestClient which drives the app end-to-end. Verifies that
 both the InMemoryRegistry (sync) and SqliteRegistry (async) paths mount
-cleanly and return the expected shapes.
+cleanly and return the expected shapes, and the long-poll
+(``terminal_phases`` + ``?wait=``) over a scripted async registry.
 """
 
 from __future__ import annotations
@@ -11,13 +12,14 @@ import asyncio
 import threading
 import time
 from pathlib import Path
+from typing import Optional
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import BaseModel
 
-from common.jobs import InMemoryRegistry
+from common.jobs import InMemoryRegistry, JobBase
 from common.jobs.router import build_router
 from common.jobs.sqlite import SqliteRegistry
 
@@ -214,3 +216,199 @@ def test_sync_router_calls_a_sync_on_delete():
     with TestClient(app) as client:
         client.delete("/jobs/whatever")
     assert seen == ["whatever"]
+
+
+# ── Long-poll: terminal_phases + ?wait= ────────────────────────────────────
+TERMINAL = ("completed", "failed")
+# Small enough that the suite stays fast, large enough that a deadline is
+# measurable on Windows' ~15 ms timer.
+CHECK_S = 0.02
+
+
+class _ScriptedRegistry:
+    """An async registry whose n-th ``get`` of a job answers the n-th phase of
+    its script (the last one repeats); ``None`` in a script is the row gone.
+    Counts the reads, so a test can see how often the route looked."""
+
+    def __init__(self, **scripts: list[Optional[str]]):
+        self.scripts = scripts
+        self.reads: dict[str, int] = {}
+
+    async def get(self, job_id: str) -> Optional[JobBase]:
+        script = self.scripts.get(job_id)
+        if script is None:
+            return None
+        n = self.reads.get(job_id, 0)
+        self.reads[job_id] = n + 1
+        phase = script[min(n, len(script) - 1)]
+        if phase is None:
+            return None
+        return JobBase(
+            job_id=job_id, phase=phase, created_at="2026-11-06T00:00:00+00:00",
+            updated_at="2026-11-06T00:00:00+00:00", elapsed_seconds=0.0, metadata={},
+        )
+
+    async def list_all(self):
+        return {"active_count": 0, "jobs": []}
+
+
+def _long_poll_app(registry, **router_kwargs) -> FastAPI:
+    router_kwargs.setdefault("terminal_phases", TERMINAL)
+    router_kwargs.setdefault("wait_check_interval_s", CHECK_S)
+    app = FastAPI()
+    app.include_router(build_router(registry, **router_kwargs))
+    return app
+
+
+def _timed_get(client: TestClient, path: str, **params):
+    start = time.monotonic()
+    response = client.get(path, params=params)
+    return response, time.monotonic() - start
+
+
+def test_long_poll_answers_at_once_when_the_job_is_already_terminal():
+    reg = _ScriptedRegistry(j=["completed"])
+    with TestClient(_long_poll_app(reg)) as client:
+        r, took = _timed_get(client, "/jobs/j", wait=30)
+    assert r.status_code == 200 and r.json()["phase"] == "completed"
+    assert reg.reads["j"] == 1 and took < 5
+
+
+def test_long_poll_wakes_when_the_job_finishes_mid_wait():
+    reg = _ScriptedRegistry(j=["processing", "processing", "processing", "failed"])
+    with TestClient(_long_poll_app(reg)) as client:
+        r, took = _timed_get(client, "/jobs/j", wait=30)
+    assert r.status_code == 200 and r.json()["phase"] == "failed"
+    # Three re-reads after the first, then it answered — long before 30 s.
+    assert reg.reads["j"] == 4 and 3 * CHECK_S * 0.5 <= took < 5
+
+
+def test_long_poll_answers_the_running_job_at_the_deadline():
+    reg = _ScriptedRegistry(j=["processing"])
+    with TestClient(_long_poll_app(reg)) as client:
+        r, took = _timed_get(client, "/jobs/j", wait=0.3)
+    assert r.status_code == 200 and r.json()["phase"] == "processing"
+    assert 0.25 <= took < 5
+    assert reg.reads["j"] > 2      # it kept looking until the deadline
+
+
+def test_long_poll_never_sleeps_past_the_deadline():
+    """A check interval longer than the wait is cut to the wait."""
+    reg = _ScriptedRegistry(j=["pending"])
+    with TestClient(_long_poll_app(reg, wait_check_interval_s=10.0)) as client:
+        r, took = _timed_get(client, "/jobs/j", wait=0.2)
+    assert r.json()["phase"] == "pending"
+    assert took < 2
+    # The first read, then one at the deadline (two if the loop woke a clock
+    # tick early — asyncio may, by its clock resolution — and slept the rest).
+    assert 2 <= reg.reads["j"] <= 3
+
+
+def test_long_poll_clamps_a_wait_above_the_cap():
+    reg = _ScriptedRegistry(j=["processing"])
+    with TestClient(_long_poll_app(reg, max_wait_s=0.2)) as client:
+        r, took = _timed_get(client, "/jobs/j", wait=3600)
+    assert r.status_code == 200 and r.json()["phase"] == "processing"
+    assert 0.15 <= took < 5
+
+
+def test_long_poll_404s_when_the_job_is_deleted_mid_wait():
+    reg = _ScriptedRegistry(j=["processing", "processing", None])
+    with TestClient(_long_poll_app(reg)) as client:
+        r = client.get("/jobs/j", params={"wait": 30})
+        assert r.status_code == 404 and r.json()["detail"] == "no job 'j'"
+        assert client.get("/jobs/ghost", params={"wait": 30}).status_code == 404
+    assert reg.reads["j"] == 3
+
+
+def test_long_poll_without_wait_answers_at_once():
+    reg = _ScriptedRegistry(j=["processing"])
+    with TestClient(_long_poll_app(reg)) as client:
+        r, took = _timed_get(client, "/jobs/j")
+        assert r.json()["phase"] == "processing" and reg.reads["j"] == 1 and took < 5
+        r = client.get("/jobs/j", params={"wait": 0})
+        assert r.status_code == 200 and reg.reads["j"] == 2
+
+
+@pytest.mark.parametrize("wait", ["-1", "nan", "inf", "soon"])
+def test_long_poll_refuses_a_wait_that_is_not_a_finite_number_of_seconds(wait):
+    reg = _ScriptedRegistry(j=["processing"])
+    with TestClient(_long_poll_app(reg)) as client:
+        assert client.get("/jobs/j", params={"wait": wait}).status_code == 422
+    assert reg.reads == {}
+
+
+def test_long_poll_stops_when_the_client_disconnects():
+    """Driven as raw ASGI: the client is gone right after its request, so the
+    wait ends at the first check instead of running for 30 s."""
+    reg = _ScriptedRegistry(j=["processing"])
+    app = _long_poll_app(reg)
+    sent: list[dict] = []
+
+    async def drive() -> None:
+        messages = iter([{"type": "http.request", "body": b"", "more_body": False}])
+
+        async def receive() -> dict:
+            return next(messages, {"type": "http.disconnect"})
+
+        async def send(message: dict) -> None:
+            sent.append(message)
+
+        scope = {
+            "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+            "method": "GET", "scheme": "http", "path": "/jobs/j", "raw_path": b"/jobs/j",
+            "root_path": "", "query_string": b"wait=30", "headers": [],
+            "client": ("testclient", 1), "server": ("testserver", 80),
+        }
+        await asyncio.wait_for(app(scope, receive, send), timeout=10)
+
+    start = time.monotonic()
+    asyncio.run(drive())
+    assert time.monotonic() - start < 5
+    assert reg.reads["j"] <= 2
+
+
+def test_wait_is_ignored_without_terminal_phases():
+    """The route is today's: no ``wait`` parameter, so FastAPI drops it and a
+    client sending it to an older server just gets an immediate answer."""
+    reg = _ScriptedRegistry(j=["processing"])
+    app = _long_poll_app(reg, terminal_phases=None)
+    with TestClient(app) as client:
+        r, took = _timed_get(client, "/jobs/j", wait=30)
+        assert r.status_code == 200 and r.json()["phase"] == "processing"
+        assert reg.reads["j"] == 1 and took < 5
+        params = client.get("/openapi.json").json()["paths"]["/jobs/{job_id}"]["get"]["parameters"]
+    assert [p["name"] for p in params] == ["job_id"]
+
+    sync_app = FastAPI()
+    sync_app.include_router(build_router(InMemoryRegistry()))
+    with TestClient(sync_app) as client:
+        assert client.get("/jobs/nope", params={"wait": 30}).status_code == 404
+
+
+def test_the_wait_parameter_is_documented_with_its_cap():
+    with TestClient(_long_poll_app(_ScriptedRegistry(), max_wait_s=60.0)) as client:
+        params = client.get("/openapi.json").json()["paths"]["/jobs/{job_id}"]["get"]["parameters"]
+    (wait,) = [p for p in params if p["name"] == "wait"]
+    assert wait["in"] == "query" and wait["required"] is False
+    assert "clamped to 60" in wait["description"] and "completed, failed" in wait["description"]
+
+
+def test_terminal_phases_with_a_sync_registry_is_refused():
+    with pytest.raises(ValueError, match="async registry"):
+        build_router(InMemoryRegistry(), terminal_phases=TERMINAL)
+
+
+@pytest.mark.parametrize(
+    "kwargs, error",
+    [
+        ({"terminal_phases": ()}, ValueError),
+        ({"terminal_phases": "completed"}, TypeError),
+        ({"terminal_phases": TERMINAL, "max_wait_s": -1.0}, ValueError),
+        ({"terminal_phases": TERMINAL, "max_wait_s": float("inf")}, ValueError),
+        ({"terminal_phases": TERMINAL, "wait_check_interval_s": 0.0}, ValueError),
+    ],
+)
+def test_long_poll_settings_that_could_never_end_are_refused(kwargs, error):
+    with pytest.raises(error):
+        build_router(_ScriptedRegistry(), **kwargs)

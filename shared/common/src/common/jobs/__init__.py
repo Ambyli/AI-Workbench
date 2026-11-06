@@ -23,6 +23,12 @@ Three backends, same conceptual shape:
 
 All three backends produce ``JobBase`` snapshots (see ``common.jobs.model``)
 and can be mounted onto a FastAPI app via ``common.jobs.router.build_router``.
+Given ``terminal_phases`` (async registries only), its ``GET /jobs/{id}``
+long-polls: ``?wait=<seconds>`` holds the request until the job reaches one
+of those phases or ``max_wait_s`` (default 60) passes, so a caller waiting on
+a job makes one or two requests instead of one every second or two — each of
+which a metered gateway in front would count. The classifier mounts it that
+way; without ``terminal_phases`` the route is unchanged.
 
 The two persistent backends also work as a durable FIFO work queue:
 ``claim_next(from_phase, to_phase)`` atomically hands the oldest waiting job

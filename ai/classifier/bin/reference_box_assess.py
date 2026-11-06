@@ -180,6 +180,8 @@ import sys
 import time
 import zlib
 from collections import Counter
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor
+from concurrent.futures import wait as wait_futures
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -216,6 +218,17 @@ NO_FAIL_REFERENCE = (
 )
 # The loop's own sentence for "the model answered bbox: null".
 _BBOX_NULL = "you answered bbox: null"
+# GET /jobs/{id} long-polls (``?wait=``, API.md § GET /jobs/{job_id}): the
+# service holds each request until the job ends or JOB_WAIT_S passes (it caps
+# a wait at 60 s; the client's 300 s timeout is far above). Each job in flight
+# is waited on in its own thread, so a job is seen the moment it ends —
+# ``job_seconds`` stays as exact as before — at one or two requests per job
+# instead of one per ``--poll``. A classifier that predates ``wait`` answers
+# at once: a non-terminal answer back in under FAST_ANSWER_S is followed by a
+# ``--poll`` sleep, so a waiter never spins.
+JOB_WAIT_S = 30.0
+FAST_ANSWER_S = 1.0
+JOB_TERMINAL = ("completed", "failed")
 
 
 # ---------------------------------------------------------------------------
@@ -1024,51 +1037,77 @@ def run_jobs(client: Any, state: Run, args: argparse.Namespace,
              images: dict[str, pathlib.Path], truth: dict[str, ge.Truth],
              keys: dict[str, str], overlays: dict[str, dict], config: str,
              *, pdfs: Optional[dict[str, pathlib.Path]] = None) -> None:
-    """At most ``--concurrency`` jobs in flight: submit, poll, and as each
-    finishes score it, write ``--out``, then delete the job. A job
+    """At most ``--concurrency`` jobs in flight: submit, wait (one waiter
+    thread per job, ``wait_for_job``), and as each finishes score it, write
+    ``--out``, then delete the job — all on this thread. A job
     ``sent_as: "pdf"`` uploads ``pdfs[page]`` instead of the image, and is
     scored against the image's size (``image_size``, read once per page)."""
     pdfs = pdfs or {}
     truth_sizes: dict[str, tuple[int, int]] = {}
     queue = list(state.jobs)
-    flying: list[JobSpec] = []
+    flying: dict[Future, JobSpec] = {}
     done = 0
-    while queue or flying:
-        while queue and len(flying) < args.concurrency:
-            job = queue.pop(0)
-            source = pdfs[job.page] if job.sent_as == "pdf" else images[job.page]
-            raw = source.read_bytes()
-            if job.sent_as == "pdf" and job.page not in truth_sizes:
-                truth_sizes[job.page] = image_size(images[job.page].read_bytes())
-            body = _check(
-                client.post("/assess", data=job_form(job, keys, overlays, args.model),
-                            files={"file": (source.name, raw, _content_type(source.name))}),
-                f"POST /assess ({page_id(job.page)} #{job.repeat})",
-            )
-            job.job_id, job.submitted_at = body["job_id"], time.monotonic()
-            flying.append(job)
+    waiters = ThreadPoolExecutor(max_workers=args.concurrency, thread_name_prefix="job-wait")
+    try:
+        while queue or flying:
+            while queue and len(flying) < args.concurrency:
+                job = queue.pop(0)
+                source = pdfs[job.page] if job.sent_as == "pdf" else images[job.page]
+                raw = source.read_bytes()
+                if job.sent_as == "pdf" and job.page not in truth_sizes:
+                    truth_sizes[job.page] = image_size(images[job.page].read_bytes())
+                body = _check(
+                    client.post("/assess", data=job_form(job, keys, overlays, args.model),
+                                files={"file": (source.name, raw, _content_type(source.name))}),
+                    f"POST /assess ({page_id(job.page)} #{job.repeat})",
+                )
+                job.job_id, job.submitted_at = body["job_id"], time.monotonic()
+                flying[waiters.submit(wait_for_job, client, job, args)] = job
+            finished, _ = wait_futures(flying, return_when=FIRST_COMPLETED)
+            # In submission order, so the records' order does not depend on
+            # which waiter thread happened to return first.
+            for future in [f for f in flying if f in finished]:
+                job = flying.pop(future)
+                body, answered = future.result()   # a waiter's error is raised here
+                phase = body.get("phase")
+                seconds = round(answered - (job.submitted_at or 0), 1)
+                if phase == "completed":
+                    records = job_records(job, body.get("result") or {}, truth, keys, config,
+                                          truth_size=truth_sizes.get(job.page))
+                elif phase == "failed":
+                    records = failed_job_records(job, "failed", keys, config)
+                elif seconds > args.timeout:
+                    records = failed_job_records(job, "timed_out", keys, config)
+                else:
+                    flying[waiters.submit(wait_for_job, client, job, args)] = job
+                    continue
+                for record in records:
+                    record["job_seconds"] = seconds
+                state.records.extend(records)
+                done += 1
+                write_out(args, state, config)
+                _delete_job(client, state, job.job_id)
+                print(f"  job {done}/{len(state.jobs)} {job.job_id} {phase}")
+    finally:
+        # Never block on a waiter still out (an error, Ctrl-C): ``cleanup``
+        # deletes its job next, and the service answers a wait on a deleted
+        # job with a 404 within a second, which ends the thread.
+        waiters.shutdown(wait=False, cancel_futures=True)
+
+
+def wait_for_job(client: Any, job: JobSpec, args: argparse.Namespace) -> tuple[dict, float]:
+    """One long-poll of ``GET /jobs/{id}``, on a waiter thread: the body and
+    when it came back (``time.monotonic``). The wait is cut to what is left of
+    ``--timeout``; see JOB_WAIT_S for the fallback sleep."""
+    left = args.timeout - (time.monotonic() - (job.submitted_at or 0))
+    asked = time.monotonic()
+    body = _check(client.get(f"/jobs/{job.job_id}",
+                             params={"wait": round(min(JOB_WAIT_S, max(0.0, left)), 1)}),
+                  f"GET /jobs/{job.job_id}")
+    answered = time.monotonic()
+    if body.get("phase") not in JOB_TERMINAL and answered - asked < FAST_ANSWER_S:
         time.sleep(args.poll)
-        for job in list(flying):
-            body = _check(client.get(f"/jobs/{job.job_id}"), f"GET /jobs/{job.job_id}")
-            phase = body.get("phase")
-            seconds = round(time.monotonic() - (job.submitted_at or 0), 1)
-            if phase == "completed":
-                records = job_records(job, body.get("result") or {}, truth, keys, config,
-                                      truth_size=truth_sizes.get(job.page))
-            elif phase == "failed":
-                records = failed_job_records(job, "failed", keys, config)
-            elif seconds > args.timeout:
-                records = failed_job_records(job, "timed_out", keys, config)
-            else:
-                continue
-            for record in records:
-                record["job_seconds"] = seconds
-            state.records.extend(records)
-            flying.remove(job)
-            done += 1
-            write_out(args, state, config)
-            _delete_job(client, state, job.job_id)
-            print(f"  job {done}/{len(state.jobs)} {job.job_id} {phase}")
+    return body, answered
 
 
 def _content_type(name: str) -> str:
@@ -1212,7 +1251,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", default=None,
                         help="the job's registry model (default: the service's default)")
     parser.add_argument("--concurrency", type=int, default=4, help="jobs in flight (default 4)")
-    parser.add_argument("--poll", type=float, default=2.0, help="poll interval, seconds")
+    parser.add_argument("--poll", type=float, default=2.0,
+                        help="seconds between job polls when the classifier answers a "
+                             "GET /jobs/{id}?wait= at once (one older than the long-poll); "
+                             "also the references' poll interval (default 2)")
     parser.add_argument("--timeout", type=float, default=1800.0,
                         help="seconds one job (or the references) may take (default 1800)")
     parser.add_argument("--out", default=None, help="write the records and summary here")

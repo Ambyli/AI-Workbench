@@ -498,6 +498,77 @@ identity header. Open WebUI used the same pattern via
 [ai/openwebui/OPENWEBUI.md § Single sign-on](../openwebui/OPENWEBUI.md#single-sign-on)
 covers why, and the reasoning about reachability applies here unchanged.
 
+## Counting LiteLLM SGRs
+
+LiteLLM Enterprise licensing meters **Successful Gateway Requests (SGRs)**:
+every call LiteLLM logs with a success status, counted once per request; a
+missing status counts as a success. Superset's **LiteLLM SGRs** dashboard
+(`https://chat.zeoenergy.com/superset/dashboard/litellm-sgrs/`) counts them
+per month from `LiteLLM_SpendLogs` (`postgres_litellm.public.litellm_spendlogs`,
+one row per call since June 2026):
+
+- **LiteLLM SGRs per month** — bars stacked by bucket, the month's total on
+  top of each.
+- **LiteLLM SGRs by month and bucket** — a pivot table (months × buckets, with
+  totals) holding the exact numbers to copy into an email. Set its time grain
+  to quarter or year in Explore for those totals.
+
+What is counted (the SQL's header comment says the same):
+
+- **Success** = `coalesce(nullif(status, ''), 'success') <> 'failure'`, one
+  row per `request_id` (the table's primary key).
+- **UTC months.** `starttime` is stored in UTC, so `date_trunc('month', …)`
+  cuts at 00:00 UTC on the 1st; a US-local month boundary moves a few hours of
+  traffic between months.
+- **No JSON parsing** (`metadata` etc.): Trino timed out on JSON functions at
+  this volume (~1M rows a month). `target` is the pass-through's `host:port`
+  from `api_base`, else `model_group`.
+
+| bucket | Rows |
+|---|---|
+| `model` | every other non-empty `call_type` (`acompletion`, `aresponses`, `anthropic_messages`, `aspeech`, …) |
+| `mcp` | `call_mcp_tool`, `list_mcp_tools` |
+| `a2a` | `asend_message`, `send_message` (LiteLLM 1.95.0's A2A call types) |
+| `pass-through: job status` | `pass_through_endpoint` to `…/jobs/<id>` or `…/jobs/<id>/progress`, any query string: the `GET` status polls **and the one `DELETE /jobs/{id}` per job** — the method is not logged |
+| `pass-through: other` | every other pass-through call, `…/jobs/<id>/artifacts/…` downloads included |
+| `other` | empty `call_type` (so far only failures, so none) |
+
+For scale, October 2026: 867,660 SGRs — `pass-through: job status` 650,896
+(41,038 classifier jobs), `pass-through: other` 208,832 (165,283 of them
+classifier artifact downloads), `model` 6,846, `mcp` 1,086.
+
+### How it is provisioned
+
+The image's `CMD` runs `superset/bootstrap.sh` before gunicorn on every start
+(apache/superset's own `CMD` only starts gunicorn), and Superset starts
+whether or not it succeeds. After registering the `trino` connection it runs
+`superset/provision_sgr.py`:
+
+| Object | Source | On every start |
+|---|---|---|
+| Virtual dataset `litellm_sgr_monthly` on `trino` | SQL: `superset/assets/litellm_sgr_monthly.sql`; columns: `COLUMNS` in `superset/sgr_spec.py` | SQL and columns re-synced from the repo; edits made in the UI are overwritten |
+| Charts **LiteLLM SGRs per month** / **by month and bucket**, dashboard **LiteLLM SGRs** | `superset/sgr_spec.py`, fixed UUIDs | created only when missing, never updated, so edits made in the UI survive |
+
+The provisioner never fails the boot: each step commits or rolls back on its
+own and logs, under `[provision_sgr]` (`make logs trino superset`). It does
+not run the SQL; the columns' types are the ones Superset records when it
+syncs them from Trino. To get a shipped chart or the dashboard back, delete
+it in the UI and restart.
+
+### Changing it
+
+1. Edit the SQL — one `SELECT`, no `;`, `%` or Jinja braces — and, if its
+   columns or buckets change, `COLUMNS` / `BUCKETS` / `BUCKET_COLORS` in
+   `superset/sgr_spec.py`.
+2. Run it through the Trino MCP's `run_query`, then
+   `UV_LINK_MODE=copy uv run --no-sync python -m pytest unit-tests/trino -q -p no:cacheprovider`
+   (columns, buckets, chart params and the image wiring in step).
+3. `make build trino superset && make up trino superset` (swap: the new copy
+   provisions before it turns healthy).
+
+A chart-param or layout change in `sgr_spec.py` only reaches an object that
+does not exist yet: delete that chart or the dashboard in the UI first.
+
 ## Object store: RustFS
 
 The warehouse bucket lives on `lake-s3`, a single-node

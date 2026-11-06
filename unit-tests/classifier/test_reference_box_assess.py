@@ -15,7 +15,10 @@ Two halves:
     per tier, ``sent_as``, ``size_mismatch`` counted and left out of every
     rate); ``--pdf-dir`` (each page's PDF by its stem, one page only,
     ``application/pdf``, a PDF read at another size than the JPG a
-    ``size_mismatch``);
+    ``size_mismatch``); waiting on the jobs (each job long-polled —
+    ``GET /jobs/{id}?wait=`` — on its own waiter thread, the wait cut to the
+    time left, a ``--poll`` sleep only after an answer that came back at
+    once, as from a classifier that ignores ``wait``);
   * END TO END, in process: the real app (its queue, stores and routes —
     Postgres, like ``test_references_assess.py``) driven by the script's own
     ``main`` through a ``TestClient``, the model scripted at
@@ -49,6 +52,8 @@ import json
 import pathlib
 import shutil
 import sys
+import threading
+import time
 
 import pytest
 
@@ -532,6 +537,126 @@ def test_a_pdf_goes_as_application_pdf():
     assert rba._content_type("bill-1.pdf") == "application/pdf"
     assert rba._content_type("bill-1.JPG") == "image/jpeg"
     assert rba.build_parser().parse_args(["--pdf-dir", "x"]).pdf_dir == "x"
+
+
+# ---------------------------------------------------------------------------
+# Waiting on the jobs: GET /jobs/{id}?wait=, one waiter thread per job
+# ---------------------------------------------------------------------------
+
+
+class _Response:
+    def __init__(self, status_code: int, body: dict):
+        self.status_code, self._body = status_code, body
+        self.content = json.dumps(body).encode()
+
+    def json(self) -> dict:
+        return self._body
+
+
+class JobsClient:
+    """The three calls ``run_jobs`` makes, no app: ``POST /assess`` → a new
+    job; ``GET /jobs/{id}`` → that job's next phase in ``phases`` (the last
+    repeats), after ``hold_s`` — a long-polling service holding the request —
+    or at once, as a classifier that ignores ``wait`` answers; ``DELETE`` →
+    204. Records every GET's time and params; the waiter threads call it at
+    once, hence the lock."""
+
+    def __init__(self, phases: list[str], hold_s: float = 0.0):
+        self.phases, self.hold_s = phases, hold_s
+        self.lock = threading.Lock()
+        self.gets: dict[str, list[tuple[float, dict]]] = {}
+        self.posted: list[str] = []
+        self.deleted: list[str] = []
+        self.in_flight = self.peak = 0
+
+    def post(self, path, data=None, files=None):
+        with self.lock:
+            job_id = f"j{len(self.posted) + 1}"
+            self.posted.append(job_id)
+            self.in_flight += 1
+            self.peak = max(self.peak, self.in_flight)
+        return _Response(202, {"job_id": job_id, "phase": "pending"})
+
+    def get(self, path, params=None):
+        job_id = path.rsplit("/", 1)[1]
+        with self.lock:
+            calls = self.gets.setdefault(job_id, [])
+            calls.append((time.monotonic(), dict(params or {})))
+            phase = self.phases[min(len(calls), len(self.phases)) - 1]
+        if self.hold_s and phase not in rba.JOB_TERMINAL:
+            time.sleep(self.hold_s)
+        return _Response(200, {"job_id": job_id, "phase": phase, "result": {}})
+
+    def delete(self, path, params=None):
+        with self.lock:
+            self.deleted.append(path.rsplit("/", 1)[1])
+            self.in_flight -= 1
+        return _Response(204, {})
+
+
+def _run_jobs(tmp_path, monkeypatch, client, *, jobs=3, **flags):
+    """``run_jobs`` over ``client`` with ``jobs`` one-criterion jobs; the
+    records are stubbed to ``{job_id, job_seconds}`` per job."""
+    page = tmp_path / "p.png"
+    page.write_bytes(b"not decoded here")
+    monkeypatch.setattr(rba, "job_records",
+                        lambda job, result, *a, **k: [{"job_id": job.job_id, "phase": "ok"}])
+    argv = ["--concurrency", "2", "--poll", "0.2", "--timeout", "60"]
+    for name, value in flags.items():
+        argv += [f"--{name}", str(value)]                 # the later flag wins
+    args = rba.build_parser().parse_args(argv)
+    state = rba.Run(jobs=[rba.JobSpec("p.png", n, [AMOUNT]) for n in range(1, jobs + 1)])
+    rba.run_jobs(client, state, args, {"p.png": page}, {}, {}, {}, "test")
+    return state
+
+
+def test_run_jobs_long_polls_each_job_in_its_own_waiter(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(rba, "FAST_ANSWER_S", 0.05)
+    client = JobsClient(["processing", "completed"], hold_s=0.1)
+    state = _run_jobs(tmp_path, monkeypatch, client, poll=5)
+    # Two requests a job: the one held until the deadline, the one that saw
+    # it end — and no --poll sleep after a held answer (5 s here).
+    assert {job_id: len(calls) for job_id, calls in client.gets.items()} == {
+        "j1": 2, "j2": 2, "j3": 2}
+    for calls in client.gets.values():
+        assert all(0 < params["wait"] <= rba.JOB_WAIT_S for _, params in calls)
+        assert calls[1][0] - calls[0][0] < 2
+    # --concurrency 2: never three in flight; every job scored, then deleted.
+    assert client.peak == 2 and sorted(client.deleted) == ["j1", "j2", "j3"]
+    assert sorted(r["job_id"] for r in state.records) == ["j1", "j2", "j3"]
+    assert all(isinstance(r["job_seconds"], float) for r in state.records)
+    assert capsys.readouterr().out.count(" completed") == 3
+
+
+def test_run_jobs_sleeps_between_polls_of_a_classifier_that_ignores_wait(
+    tmp_path, monkeypatch
+):
+    client = JobsClient(["pending", "processing", "completed"])
+    _run_jobs(tmp_path, monkeypatch, client, jobs=2)
+    for calls in client.gets.values():
+        assert len(calls) == 3
+        # Answered at once and not done: --poll (0.2 s) before the next ask.
+        gaps = [later[0] - earlier[0] for earlier, later in zip(calls, calls[1:])]
+        assert all(gap >= 0.15 for gap in gaps)
+
+
+def test_run_jobs_cuts_the_wait_to_the_time_left_and_times_out(tmp_path, monkeypatch):
+    client = JobsClient(["processing"])
+    state = _run_jobs(tmp_path, monkeypatch, client, jobs=1, timeout=0.5, poll=0.1)
+    (record,) = state.records
+    assert record["status"] == "job_timed_out" and record["job_seconds"] > 0.5
+    waits = [params["wait"] for _, params in client.gets["j1"]]
+    assert waits[0] <= 0.5 and waits[-1] == 0.0 and waits == sorted(waits, reverse=True)
+    assert client.deleted == ["j1"]
+
+
+def test_a_waiters_error_reaches_the_run(tmp_path, monkeypatch):
+    class Gone(JobsClient):
+        def get(self, path, params=None):
+            return _Response(404, {"detail": "no job 'j1'"})
+
+    with pytest.raises(SystemExit, match="GET /jobs/j1: HTTP 404"):
+        _run_jobs(tmp_path, monkeypatch, Gone(["processing"]), jobs=1)
 
 
 # ---------------------------------------------------------------------------

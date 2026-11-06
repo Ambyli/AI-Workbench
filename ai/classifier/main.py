@@ -51,7 +51,8 @@ Overall request flow for /assess:
      CLASSIFIER_OCR_WORKERS across the process), aggregate each criterion
      (pages → documents), weigh per item and overall, and store the
      artifacts.
-  7. Caller polls GET /jobs/{job_id} until phase="completed" or "failed" —
+  7. Caller polls GET /jobs/{job_id} until phase="completed" or "failed"
+     (``?wait=<s>`` holds each poll until then, up to JOB_WAIT_MAX_S) —
      ``metadata.progress`` says how far along it is meanwhile (the job's
      ``common.jobs.progress`` gauge, flushed about once a second), and
      GET /jobs/{job_id}/progress pages through its checkpoint history.
@@ -88,7 +89,7 @@ from common.jobs.router import build_progress_router, build_router
 from api import artifacts as artifacts_api
 from api import assess, introspection, references as references_api
 from api import usage as usage_api
-from config import LOG_LEVEL
+from config import JOB_WAIT_MAX_S, LOG_LEVEL
 from db import database
 from jobs.queue import jobs_registry, queue, sweeper
 from llm import client as llm_client
@@ -214,6 +215,11 @@ Instrumentator(
 # the row, so DELETE /jobs/{id} can never leave layer files that nothing
 # points at. The usage rows are the one thing the TTL sweeper leaves behind
 # (they outlive the job on purpose), so this delete is the only way they go.
+#
+# terminal_phases turns on GET /jobs/{id}?wait= (the long-poll): the request
+# is held until the job is completed or failed — the only phases a job ends
+# in (the worker pool's set_result / set_error; staging, pending and
+# processing all move on) — or JOB_WAIT_MAX_S passes.
 
 
 async def _delete_job_side_data(job_id: str) -> None:
@@ -239,6 +245,8 @@ app.include_router(
         include_delete=True,
         include_cancel=False,
         on_delete=_delete_job_side_data,
+        terminal_phases=("completed", "failed"),
+        max_wait_s=JOB_WAIT_MAX_S,
     )
 )
 

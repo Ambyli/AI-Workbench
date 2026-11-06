@@ -113,6 +113,19 @@ Rules that apply whichever way you set it:
 - **Key and team lists are not combined.** If the key's own `metadata` has a non-empty list, that list is used and the team's is ignored; the team's list applies only to keys with none of their own.
 - **`allowed_routes` still applies first.** A key with a non-empty `allowed_routes` must allow the route there too (most keys leave it empty).
 
+##### With the script
+
+[`scripts/passthrough_routes.py`](scripts/passthrough_routes.py) does everything below for a key or a team, with `DEFAULT_LITELLM_MASTER_KEY` from the repo-root `.env`. It writes `metadata` (the read-modify-write for a key, the merge `PATCH` for a team), so it works with or without a license. It refuses a route that is not a mounted pass-through, and reads the result back after writing:
+
+```bash
+uv run --no-sync python ai/litellm/scripts/passthrough_routes.py routes                       # what can be granted
+uv run --no-sync python ai/litellm/scripts/passthrough_routes.py show --key sk-...            # key's list, team's list, which applies
+uv run --no-sync python ai/litellm/scripts/passthrough_routes.py add --key sk-... /v1/classifier /v1/detector
+uv run --no-sync python ai/litellm/scripts/passthrough_routes.py remove --team <team_id> /v1/detector
+```
+
+`set` replaces the list, `clear` deletes it; `--dry-run` shows the change without writing; `--url` defaults to `https://api.zeoenergy.com`. The leading slash is optional — in Git Bash on Windows leave it off (`v1/classifier`) or prefix the command with `MSYS_NO_PATHCONV=1`, because Git Bash rewrites an argument starting with `/` into a Windows path (`C:/Program Files/Git/v1/classifier`). The manual equivalents follow.
+
 ##### A new key
 
 Put the list in `metadata` on `/key/generate`:
@@ -181,6 +194,10 @@ curl -s -o /dev/null -w '%{http_code}\n' http://localhost:4001/v1/classifier/hea
 ##### Revoking
 
 Write the list back without the route (same read-modify-write as above for a key; `PATCH /team/{team_id}` with the shortened list for a team). To remove the entry entirely from a team, `PATCH` it with `{"metadata": {"allowed_passthrough_routes": null}}`.
+
+### Licensing: counting SGRs
+
+LiteLLM Enterprise licensing meters **Successful Gateway Requests** (SGRs): every call the proxy logs to `LiteLLM_SpendLogs` with a success status (a missing status counts), once per request. Pass-through calls are logged like any other, so the `/v1/classifier` pass-through above dominates the count — October 2026: 859,728 of 867,660, 650,896 of them job-status calls (`GET /jobs/{id}` and `…/progress` polls, plus the one `DELETE /jobs/{id}` per job). Superset's **LiteLLM SGRs** dashboard counts them per UTC month by bucket (model, MCP, A2A, pass-through job status / other) with exact numbers in a pivot table. Definition, SQL and how to change it: [`ai/trino/TRINO.md` § Counting LiteLLM SGRs](../trino/TRINO.md#counting-litellm-sgrs).
 
 ### Chain aliases and the overflow hook
 

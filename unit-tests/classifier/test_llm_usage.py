@@ -74,6 +74,13 @@ def _response(content: str = '{"score": 9}', usage=None, *, model="muse-glimmer"
     return data
 
 
+def _public(answer: dict) -> dict:
+    """The answer without the private keys llm.confidence reads: the default
+    model measures confidence from logprobs (models.yaml), so a score call
+    also carries ``_score_dist`` / ``_confidence_note``."""
+    return {k: v for k, v in answer.items() if not k.startswith("_")}
+
+
 def _errors() -> float:
     return REGISTRY.get_sample_value("classifier_llm_usage_write_errors_total") or 0.0
 
@@ -126,7 +133,10 @@ def test_an_ok_call_writes_one_row_with_every_field(store, monkeypatch):
         with llm_usage.unit_scope(criterion="has a house", item=2, document=1):
             return await llm_client.call_model(prompt, label="score/has a house")
 
-    assert _run(_in_job("job-ok", call)) == {"score": 9}
+    answer = _run(_in_job("job-ok", call))
+    assert _public(answer) == {"score": 9}
+    # No logprobs in the scripted response: no distribution, and a note why.
+    assert answer["_score_dist"] is None and "no entries" in answer["_confidence_note"]
     (row,) = _run(store.calls("job-ok"))
     assert row["job_id"] == "job-ok" and row["job_type"] == "assess"
     assert (row["criterion"], row["item"], row["document"]) == ("has a house", 2, 1)
@@ -203,7 +213,7 @@ def test_a_failed_write_never_fails_the_call(store, monkeypatch):
     monkeypatch.setattr(llm_client, "_send", send)
     monkeypatch.setattr(store, "_insert", broken_insert)
     before = _errors()
-    assert _run(llm_client.call_model({}, label="score/x")) == {"score": 9}
+    assert _public(_run(llm_client.call_model({}, label="score/x"))) == {"score": 9}
     assert _errors() - before == 1
 
 
@@ -217,7 +227,7 @@ def test_a_row_that_cannot_be_built_never_fails_the_call(store, monkeypatch):
     monkeypatch.setattr(llm_client, "_send", send)
     monkeypatch.setattr(llm_usage, "build_row", broken_build)
     before = _errors()
-    assert _run(llm_client.call_model({}, label="score/x")) == {"score": 9}
+    assert _public(_run(llm_client.call_model({}, label="score/x"))) == {"score": 9}
     assert _errors() - before == 1
 
 

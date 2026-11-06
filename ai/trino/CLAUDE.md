@@ -12,6 +12,7 @@ Trino coordinator + Hive Metastore (+ Postgres) + `lake-s3` (RustFS S3 store) + 
 - **Networks:** `analytics_net` (data plane, plain bridge on purpose) + `ai_shared` (only coordinator, `lake-s3`, `superset`, `trino-mcp`). `TRINO.md § Networks`.
 - **RustFS** (`ghcr.io/rustfs/rustfs:1.0.1`, pinned, never `latest`): path-style only (`RUSTFS_SERVER_DOMAINS` stays unset); its console / admin API live under `/rustfs/` and cannot be moved. `TRINO.md § Object store: RustFS`.
 - **Never edit HMS's tables by hand** (`hive-metastore-db`); the Iceberg connector relies on its invariants.
+- **The LiteLLM SGR dashboard is provisioned on every Superset start**: the image's `CMD` runs `superset/bootstrap.sh` before gunicorn (the base image's never would), which runs `superset/provision_sgr.py` — the `litellm_sgr_monthly` dataset's SQL is re-synced from `superset/assets/litellm_sgr_monthly.sql` and its columns from `superset/sgr_spec.py` each time; charts / dashboard are created only when their fixed UUID is missing, so UI edits survive. SQL columns and buckets stay in step with `sgr_spec.py` (`unit-tests/trino`); ship with `make build trino superset && make up trino superset`. `TRINO.md § Counting LiteLLM SGRs`.
 
 ## Cross-folder rules
 

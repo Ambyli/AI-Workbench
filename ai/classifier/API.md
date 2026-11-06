@@ -298,14 +298,18 @@ imports back.
 
 `POST /assess` returns **202 Accepted** immediately with a job ID. Poll
 `GET /jobs/{job_id}` until `phase` is `"completed"` or `"failed"`, then read
-the `result` field. While it runs, `metadata.progress` says how far along it
-is (see [§ Progress](#progress)).
+the `result` field — preferably long-polled, `?wait=30`, which holds each
+request until the job ends (at most 60 s; see
+[`GET /jobs/{job_id}`](#get-jobsjob_id) for why and the client pattern).
+While it runs, `metadata.progress` says how far along it is (see
+[§ Progress](#progress)).
 
 ```
 POST /assess  →  {"job_id": "abc123", "phase": "pending"}
                          ↓  poll
 GET /jobs/abc123  →  {"phase": "processing", "metadata": {"progress": {"percent": 43.2, …}}}
 GET /jobs/abc123  →  {"phase": "completed", "result": {...}, "metadata": {...}}
+GET /jobs/abc123?wait=30  →  held until the job ends (or 30 s), then the same body
 ```
 
 Job tracking is powered by the shared `common.jobs` package
@@ -4094,11 +4098,47 @@ curl "http://localhost:8005/usage?since=2026-10-01&job_type=assess" | jq '{total
 
 ### `GET /jobs/{job_id}`
 
-Poll for the status and result of a submitted job.
+Poll for the status and result of a submitted job — once, or **long-polled**
+with `wait`.
+
+| Param | Effect |
+|---|---|
+| `wait` | Seconds to hold the request until the job's `phase` is `completed` or `failed` (default `0` — answer at once). A finite number ≥ 0; above **60** it is clamped to 60, not refused (`-1`, `nan`, `inf` are a **422**) |
 
 ```bash
 curl http://localhost:4001/v1/classifier/jobs/abc123 -H "Authorization: Bearer sk-1234"
+
+# Long-poll: answers the moment the job ends, or after 30 s with it still running
+curl "http://localhost:4001/v1/classifier/jobs/abc123?wait=30" -H "Authorization: Bearer sk-1234"
 ```
+
+**The long-poll.** With `wait`, the service re-reads the job row every 0.5 s
+(a primary-key read in classifier-db, holding no connection between reads)
+until its phase is terminal or the wait is used up, then answers exactly as
+without it — the same body, the same 200; read `phase` to know which. A job
+deleted mid-wait is a **404**; a client that hangs up ends the wait. Why it
+exists: through LiteLLM's `/v1/classifier` pass-through every poll is one
+logged, metered request (LiteLLM Enterprise counts successful gateway
+requests), and a client polling every second or two made ~20 per job — 94%
+of all successful gateway calls in October 2026. Long-polled, a job costs one
+or two. The 60 s cap (`JOB_WAIT_MAX_S` in `config.py`, a constant, not an env
+var) sits under the tightest timeout in front of the service: Cloudflare's
+~100 s origin response limit (a `524`) on `api.zeoenergy.com`; the edge's
+`listen classifier` and LiteLLM's pass-through both allow 600 s. A held
+request shows up as a slow `GET /jobs/{job_id}` in the HTTP latency metrics —
+that is the wait, not the database.
+
+**Client pattern.** Send `wait=min(30, time left)` in a loop until the phase
+is terminal or your own deadline passes. An older classifier ignores `wait`
+(FastAPI drops an undeclared query parameter) and answers at once, so if a
+non-terminal answer came back in under a second, sleep your old poll
+interval before asking again — never loop without one. Keep the client's
+read timeout above the wait (the repo's pollers: `regions_report.py`'s 120 s,
+`bin/reference_box_assess.py`'s 300 s). Both do this (`regions_report.poll`,
+also behind `plan_set_report.py`; `reference_box_assess.wait_for_job`, one
+waiter thread per job in flight). Route-policy's classifier client still
+polls on its own short interval — it talks to the service directly, not
+through LiteLLM.
 
 ```json
 {

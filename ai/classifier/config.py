@@ -588,6 +588,17 @@ PROGRESS_FLUSH_INTERVAL_S: float = max(
     0.2, float(os.environ.get("CLASSIFIER_PROGRESS_FLUSH_INTERVAL_S", "1"))
 )
 
+# The most GET /jobs/{id}?wait= may hold a request (common.jobs.router's
+# long-poll; a larger wait is clamped to it). A waiting caller asks once or
+# twice per job instead of every second or two — through LiteLLM's
+# /v1/classifier pass-through each poll is one metered request, and the polls
+# were 94% of them (Oct 2026). 60 s because the tightest timeout in front of
+# the service is Cloudflare's ~100 s origin response limit (a 524) on
+# api.zeoenergy.com; the edge's `listen classifier` and LiteLLM's pass-through
+# both allow 600 s. A constant, not an env var: raising it past Cloudflare's
+# limit breaks every caller off the LAN.
+JOB_WAIT_MAX_S: float = 60.0
+
 # The one asyncpg pool's ceiling is computed in db.py (``pool_max()``):
 # MAX_CONCURRENT + the model registry's Σ max_concurrent + DB_POOL_HEADROOM —
 # every worker, every model slot (each call writes one llm_calls row), plus

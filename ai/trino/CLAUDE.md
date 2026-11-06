@@ -38,7 +38,7 @@ One line each; full detail in `.env.example` (`## Trino data lake` block) and `T
 - `HMS_DB_USER` / `_PASSWORD` / `_NAME` (`hive` / `hive` / `metastore`) — `hive-metastore-db`; only HMS talks to it.
 - `SUPERSET_DB_USER` / `_PASSWORD` / `_NAME` (`superset` ×3) — `superset-db` (dashboards, saved queries, accounts).
 - `SUPERSET_SECRET_KEY` (required) — Flask session signing; `openssl rand -hex 32`.
-- `SUPERSET_ADMIN_PASSWORD` (required) — bootstrap admin, first start only (`superset/bootstrap.sh`); later sign-ins come via `oauth2-proxy-superset`'s `X-Forwarded-Email`.
+- `SUPERSET_ADMIN_PASSWORD` (required) — bootstrap admin, first start only (`superset/bootstrap.sh`); unusable from a browser (no password form under `AUTH_REMOTE_USER`), later sign-ins come via `oauth2-proxy-superset`'s `X-Forwarded-Email`. New accounts are `Alpha` (no SQL Lab); the first Admin is `superset fab create-admin` before that person's first visit, or an `ab_user_role` row after — `TRINO.md § Superset sign-in and roles`.
 - `TRINO_MCP_MAX_ROWS` (`10000`) — `run_query` row clamp (spliced `LIMIT` + `fetchmany`).
 - `TRINO_MCP_MAX_RUNTIME_S` (`30`) — sent as `session_properties.query_max_execution_time`; the coordinator's `query.max-execution-time` is the backup.
 - `TRINO_JDBC_USERS` (required) — `user:password[,…]` for `:8443`; no `,` `:` or whitespace in passwords; `make up trino trino-auth-init` to rotate.

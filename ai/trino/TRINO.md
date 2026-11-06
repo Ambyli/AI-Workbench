@@ -480,7 +480,8 @@ and is served from the root of `SUPERSET_PUBLIC_HOST`
 `chat.zeoenergy.com/superset/`. It trusts `X-Forwarded-Email`
 (`SUPERSET_REMOTE_USER_HEADER`) as the session user with no separate password
 check; the first visit creates the account (username = the e-mail, role
-`Alpha`).
+`Alpha` — starting as Admin and changing roles:
+[§ Superset sign-in and roles](#superset-sign-in-and-roles)).
 
 **How the header becomes a login.** Flask-AppBuilder 4.4.1, the version
 `apache/superset:4.0.2` pins, never reads request headers for
@@ -547,6 +548,69 @@ Open WebUI is the other service that trusts `X-Forwarded-Email`; it also
 verifies it with Google using the forwarded access token, and binds
 `127.0.0.1:8007` only —
 [ai/openwebui/OPENWEBUI.md § Single sign-on](../openwebui/OPENWEBUI.md#single-sign-on).
+
+## Superset sign-in and roles
+
+**Signing in.** Open `https://superset.zeoenergy.com/` and sign in with Google
+on the usual Zeo AI sign-in page (the same `zeoai.access@zeoenergy.com` group
+gate as chat). There is no Superset password and no Superset login form: the
+first visit creates your account from the e-mail `oauth2-proxy-superset`
+passes (username = the e-mail), and every later visit signs you straight in.
+
+**What the first visit gives you: `Alpha`** (`AUTH_USER_REGISTRATION_ROLE` in
+`superset/superset_config.py`). In Superset 4.0.2 that means:
+
+| | `Alpha` | `Admin` |
+|---|---|---|
+| Dashboards, charts, datasets (view, explore, build your own) | yes | yes |
+| Edit the provisioned SGR charts / dashboard in place (they have no owner) | no — "Save as" a copy | yes |
+| SQL Lab | no — admin-only (`ADMIN_ONLY_VIEW_MENUS` in `superset/security/manager.py`) | yes |
+| Users, roles, database connections | no | yes |
+
+The bootstrap `admin` account (`SUPERSET_ADMIN_PASSWORD`, created by
+`superset/bootstrap.sh`) cannot be used from a browser: under
+`AUTH_REMOTE_USER` the identity is always the e-mail the proxy passes, and
+there is no password form to sign in as anyone else.
+
+**Starting as `Admin` — before your first visit.** Your sign-in finds an
+existing account by username and keeps its roles, so pre-create the account
+as an Admin once the database is set up (after the first `make up trino
+superset`) and before you open Superset. On the box, from the repo root:
+
+```bash
+make exec trino superset CMD="superset fab create-admin \
+  --username you@zeoenergy.com --firstname First --lastname Last \
+  --email you@zeoenergy.com --password $(openssl rand -hex 16)"
+```
+
+The username must be the exact e-mail you sign in with. The password is
+required by the command and never used. If the account already exists the
+command stops with `Error! User already exists` and changes nothing — use the
+next step instead.
+
+**Making an existing account `Admin`.** Flask-AppBuilder's CLI has no
+change-role command (`create-admin` / `create-user` refuse an existing
+username), so the first Admin is a row in `superset-db`:
+
+```bash
+docker exec -it superset-db sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+```
+
+```sql
+INSERT INTO ab_user_role (user_id, role_id)
+SELECT u.id, r.id FROM ab_user u, ab_role r
+WHERE u.username = 'you@zeoenergy.com' AND r.name = 'Admin'
+ON CONFLICT DO NOTHING;   -- (user_id, role_id) is unique: safe to re-run
+```
+
+Then log out of Superset (top-right menu) and visit again so the session picks
+up the role. Once one Admin exists, manage everyone else in the UI:
+**Settings → List Users → edit** — e.g. add the built-in `sql_lab` role to give
+an `Alpha` user SQL Lab without making them Admin.
+
+**Removing access.** Take the person out of the Google group: the proxy refuses
+them at the next cookie refresh, whatever their Superset role. Their Superset
+account stays (inactive users can be set in **List Users**).
 
 ## Counting LiteLLM SGRs
 

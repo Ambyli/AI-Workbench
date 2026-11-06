@@ -17,7 +17,7 @@ Self-hosted n8n workflow engine (+ its Postgres `n8n-db`) for prototyping automa
 
 Also in the root `CLAUDE.md` § Cross-folder rules — read the named entry there for the full picture.
 
-- **n8n is not exposed** — nothing in `ai/oauth2-proxy` or `ai/cloudflared` routes to it. Exposing it adds its own hostname there (a second oauth2-proxy instance + a tunnel rule) and sets `N8N_HOST` / `N8N_PATH` / `N8N_EDITOR_BASE_URL` / `N8N_WEBHOOK_URL` / `N8N_PROXY_HOPS` to match. (root `CLAUDE.md` § Cross-folder rules)
+- **n8n is not exposed** — nothing in `ai/oauth2-proxy` or `ai/cloudflared` routes to it. Exposing it adds its own hostname there (another oauth2-proxy instance, `oauth2-proxy-n8n`, built like `oauth2-proxy-superset`, + a tunnel rule) and sets `N8N_HOST` / `N8N_PATH` / `N8N_EDITOR_BASE_URL` / `N8N_WEBHOOK_URL` / `N8N_PROXY_HOPS` to match. (root `CLAUDE.md` § Cross-folder rules)
 - **Smaller couplings** (n8n's AI nodes → `ai/litellm`) — `N8N_AI_OPENAI_API_BASE=http://litellm:4000/v1` (service DNS on `ai_shared`, never `localhost`) and the key from `DEFAULT_LITELLM_MASTER_KEY`, so the OpenAI / LangChain credential picker lists LiteLLM's models; `DEFAULT_LITELLM_MASTER_KEY` must be populated. Override per credential only for an external provider. (root `CLAUDE.md` § Cross-folder rules)
 - **Postgres port group** — `PORT_N8N_DB` 5435 is in the `PORT REGISTRY` Postgres group. (root `CLAUDE.md` § Env vars and the PORT REGISTRY)
 

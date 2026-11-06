@@ -185,7 +185,7 @@ Then `make up openwebui` to recreate — and then purge Cloudflare, or nothing v
 
 Two consequences beyond stale branding: the edge serves those cached responses to **anonymous** clients (oauth2-proxy never sees the request), and browsers that loaded the old assets keep them for their own 4 h `max-age` even after a purge.
 
-The permanent fix is a dashboard Cache Rule that bypasses the cache for the hostname — [ai/cloudflared/CLOUDFLARED.md § Cache rule](../cloudflared/CLOUDFLARED.md#cache-rule--bypass-for-chatzeoenergycom). Until that exists, purge after every asset change: Cloudflare dashboard → Caching → Configuration → Purge Everything.
+The permanent fix is a dashboard Cache Rule that bypasses the cache for the hostname — [ai/cloudflared/CLOUDFLARED.md § Cache rule](../cloudflared/CLOUDFLARED.md#cache-rule--bypass-for-the-authenticated-hostnames). Until that exists, purge after every asset change: Cloudflare dashboard → Caching → Configuration → Purge Everything.
 
 To tell the layers apart:
 

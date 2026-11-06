@@ -148,7 +148,7 @@ For service `S`:
    recreated exactly as before; `make up` never asks the edge about them.
 6. **Retire the old copy.** `docker stop` honours the service's
    `stop_grace_period`, so in-flight requests finish (900 s for `litellm`
-   and `oauth2-proxy`). Then `docker rm`.
+   and `oauth2-proxy-openwebui`). Then `docker rm`.
 
 **Why callers see no errors during the swap:**
 
@@ -156,7 +156,8 @@ For service `S`:
   copies run. When the old copy closes its listener on SIGTERM, new connections
   to it are refused immediately. Python (`socket.create_connection`, httpx/anyio,
   aiohttp) and Go clients then try the next address. Open WebUI → LiteLLM and
-  cloudflared → oauth2-proxy work this way.
+  cloudflared → `oauth2-proxy-openwebui` / `oauth2-proxy-superset` work this
+  way.
 - **From the LAN,** traffic goes through the edge. The old copy fails its
   HAProxy health check, and `retry-on conn-failure` plus `option redispatch 1`
   resend a refused connection to the new copy.
@@ -182,7 +183,7 @@ environment, such as roofix's `.env` setting if it was exported, does nothing.
 | Stack | Swap (no downtime) | Recreate, and why |
 |---|---|---|
 | litellm | `litellm` | `db`: Postgres data directory. `prometheus`: the TSDB is locked by one process. |
-| oauth2-proxy | `oauth2-proxy`, `oauth2-assets` | — |
+| oauth2-proxy | `oauth2-proxy-openwebui`, `oauth2-proxy-superset`, `oauth2-assets` | — |
 | cloudflared | `cloudflared` (`ai-cloudflared-<hash>`) | — |
 | searxng | `searxng` | — |
 | kokoro | `kokoro-api` | `kokoro-app`: GPU |
@@ -231,7 +232,7 @@ service over TLS, [TLS](#tls)):
 |---|---|---|---|---|---|
 | `PORT_LITELLM` 4001 | 4001 | `litellm:4000` | `GET /health/liveliness` | swap | 900 s |
 | `PORT_LITELLM_TLS` 443 | 4443 (TLS, `name lan-tls`) | `litellm:4000` (same backend) | same | swap | 900 s |
-| `PORT_OAUTH2_PROXY` 4180 | 4180 | `oauth2-proxy:4180` | `GET /ping` | swap | 900 s |
+| `PORT_OAUTH2_PROXY` 4180 | 4180 | `oauth2-proxy-openwebui:4180` | `GET /ping` | swap | 900 s |
 | `PORT_KOKORO_API` 8004 | 8004 | `kokoro-api:8000` | `GET /health` | swap | 300 s |
 | `PORT_MADLAD_API` 8008 | 8008 | `madlad-api:8000` | `GET /health` | swap | 300 s |
 | `PORT_SEARXNG` 8009 | 8009 | `searxng:8080` | `GET /healthz` | swap | 300 s |
@@ -267,7 +268,7 @@ as `edge:<port>` from `ai_shared`:
   (`127.0.0.11`) every second. `server-template app 3` holds up to three
   copies; `init-addr none` lets the edge start before the services exist.
 - **Timeouts.** The default `timeout server` and `timeout client` are 300 s.
-  `litellm` and `oauth2-proxy` get 900 s, Open WebUI's own outermost limit: a
+  `litellm` and `oauth2-proxy-openwebui` get 900 s, Open WebUI's own outermost limit: a
   long reasoning answer, or a non-streamed request, can be silent for minutes
   (the chain deployments' per-read timeouts are 240 s local and 300 s
   Claude). `signals` gets 75 s: route-policy's calls end at their 80 ms
@@ -285,12 +286,13 @@ as `edge:<port>` from `ai_shared`:
 **Who goes through the edge.** LAN and `localhost` clients on the published
 ports, such as Claude Code at `localhost:4001`, curl, and DBeaver for Superset.
 Container-to-container traffic does not: Open WebUI → `litellm:4000`,
-cloudflared → `oauth2-proxy:4180`, oauth2-proxy → `superset:8088`, the
+cloudflared → `oauth2-proxy-openwebui:4180` / `oauth2-proxy-superset:4180`,
+`oauth2-proxy-superset` → `superset:8088`, the
 LiteLLM pass-throughs → `classifier:8000` / `detector:8000`, route-policy →
 `signals:8000`, and so on all go
-straight to the service by DNS. Public chat traffic (cloudflared →
-oauth2-proxy) never touches the edge. One internal caller does, on purpose:
-oauth2-proxy reaches the status page at `edge:8407`.
+straight to the service by DNS. Public traffic (cloudflared → the
+`oauth2-proxy-*` instances) never touches the edge. One internal caller does,
+on purpose: `oauth2-proxy-openwebui` reaches the status page at `edge:8407`.
 
 **What backends see.** For edge traffic, the TCP peer is now the edge's
 `ai_shared` address. The LAN client's address is appended to
@@ -299,17 +301,21 @@ configured, so nothing depends on the peer address today. If you add one,
 make it read `X-Forwarded-For`.
 
 **Superset's header-auth trust boundary is tighter, not looser.** Superset runs
-`AUTH_REMOTE_USER` and trusts `X-Auth-Request-Email` as the logged-in user with
-no password. That is only safe when oauth2-proxy set the header. Before the
-edge, `PORT_SUPERSET` published Superset directly on all interfaces, so anyone
-on the LAN could send that header and log in as anyone (`TRINO.md` § Header-auth
-trust boundary). oauth2-proxy reaches `superset:8088` directly, never through
-the edge, so a header arriving on the edge's 8016 is always a spoof. The edge
-deletes `X-Auth-Request-Email`, `-User` and `-Preferred-Username`, plus
-`X-Forwarded-Email` and `-User`, on that listener. The LAN port can no longer
-be used to impersonate anyone. Sign in through `chat.zeoenergy.com/superset/`
-as before. If you set `SUPERSET_REMOTE_USER_HEADER` to another header name,
-add a `del-header` for it in `haproxy.cfg`.
+`AUTH_REMOTE_USER` and trusts `X-Forwarded-Email` (`SUPERSET_REMOTE_USER_HEADER`)
+as the logged-in user with no password. That is only safe when
+`oauth2-proxy-superset` set the header. Before the edge, `PORT_SUPERSET`
+published Superset directly on all interfaces, so anyone on the LAN could send
+that header and log in as anyone (`TRINO.md` § Header-auth trust boundary).
+`oauth2-proxy-superset` reaches `superset:8088` directly, never through the
+edge, so a header arriving on the edge's 8016 is always a spoof. The edge
+deletes `X-Forwarded-Email` and `-User`, plus the old `X-Auth-Request-Email`,
+`-User` and `-Preferred-Username`, on that listener — and every header with an
+underscore in its name (`del-header _ -m sub`), because Superset's gunicorn
+(21.2.0) files `X_Forwarded_Email` under the same WSGI key as
+`X-Forwarded-Email` and an exact-name delete would miss it. The LAN port can no
+longer be used to impersonate anyone. Sign in through
+`https://superset.zeoenergy.com/`. If you set `SUPERSET_REMOTE_USER_HEADER` to
+another header name, add a `del-header` for it in `haproxy.cfg`.
 
 ### LAN allow-list
 
@@ -425,8 +431,8 @@ that one target DOWN with a 404 until someone turns it on.)
 ### Status page
 
 **`https://chat.zeoenergy.com/edge/`**, after Google sign-in. `OAUTH2_PROXY_UPSTREAMS`
-includes `http://edge:8407/edge/`, the same pattern as `/superset/` and
-`/rustfs/`; oauth2-proxy forwards the path unchanged. `frontend status` on
+includes `http://edge:8407/edge/`, the same pattern as `/rustfs/`;
+`oauth2-proxy-openwebui` forwards the path unchanged. `frontend status` on
 `edge:8407` (internal only, never published) serves two things:
 
 - **`/edge/`: the status page,**
@@ -1161,7 +1167,7 @@ check.
   reachable origins, so this is not the "two connectors, one can't reach the
   origin" failure in [CLOUDFLARED.md](../cloudflared/CLOUDFLARED.md). It lasts
   only until the old copy retires.
-- **Long stops.** Retiring `litellm` or `oauth2-proxy` can take up to 900 s
+- **Long stops.** Retiring `litellm` or `oauth2-proxy-openwebui` can take up to 900 s
   while long chats finish. `make up` waits for it.
   - Verify that SIGTERM reaches the server: time a `docker stop` on an idle
     copy. A full grace-period wait on an idle container means the entrypoint

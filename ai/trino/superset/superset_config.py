@@ -1,16 +1,27 @@
 """Superset config.
 
-Header-auth SSO via oauth2-proxy. Superset does NOT run its own OAuth
-flow; the ``X-Auth-Request-Email`` header oauth2-proxy sets identifies
-the session user, and the very first hit auto-creates the local
-Superset account.
+Header-auth SSO via oauth2-proxy-superset (ai/oauth2-proxy), which serves
+Superset at the root of its own hostname, SUPERSET_PUBLIC_HOST
+(superset.zeoenergy.com). Superset does NOT run its own OAuth flow; the
+``X-Forwarded-Email`` header that proxy sets identifies the session user, and
+the very first hit auto-creates the local Superset account.
 
-SECURITY: this is safe ONLY when Superset is unreachable from anywhere
-except oauth2-proxy. If PORT_SUPERSET (host publish, default 8016) is
-bound to 0.0.0.0, anyone on the LAN can spoof the header and log in as
-any Superset account. Bind to 127.0.0.1 in docker-compose.trino.yml, or
-drop the publish entirely, before exposing this on an untrusted
-network. See ai/trino/TRINO.md § Header-auth trust boundary.
+How the sign-in happens, in Flask-AppBuilder 4.4.1 (the version
+apache/superset:4.0.2 pins): under AUTH_REMOTE_USER, the /login/ view
+(AuthRemoteUserView.login) reads ``request.environ[AUTH_REMOTE_USER_ENV_VAR]``
+and logs that username in. It never reads request headers itself, and the
+default key, REMOTE_USER, is set by nothing behind a proxy. So
+AUTH_REMOTE_USER_ENV_VAR below names the WSGI environ key the header arrives
+under: gunicorn files X-Forwarded-Email as HTTP_X_FORWARDED_EMAIL.
+
+SECURITY: this is safe ONLY when nothing but oauth2-proxy-superset can put
+that key there. That proxy deletes every client copy of X-Forwarded-Email,
+underscore spellings included, before it sets the real one. PORT_SUPERSET
+(host publish, default 8016) is published by ai/edge, whose `listen superset`
+deletes the identity headers AND every header with an underscore in its
+name: gunicorn 21.2.0 files X_Forwarded_Email under the same environ key.
+Bind that port to 127.0.0.1, or drop it, before exposing the host on an
+untrusted network. See ai/trino/TRINO.md § Header-auth trust boundary.
 """
 from __future__ import annotations
 
@@ -31,52 +42,55 @@ SQLALCHEMY_DATABASE_URI = (
 # ── Trusted-header auth ─────────────────────────────────────────────────
 AUTH_TYPE = AUTH_REMOTE_USER
 
-# The base FAB REMOTE_USER manager reads request.environ["REMOTE_USER"].
-# We swap in the oauth2-proxy header instead. See bootstrap.sh for the
-# admin creation on first boot.
+# The header oauth2-proxy-superset sets on every authenticated request
+# (OAUTH2_PROXY_PASS_USER_HEADERS). Not X-Auth-Request-Email: oauth2-proxy
+# only ever puts X-Auth-Request-* on RESPONSES, and it does not delete a
+# client's own copy on the way in. Changing it also needs a `del-header` for
+# the new name in ai/edge/haproxy.cfg's `listen superset`.
+_REMOTE_USER_HEADER = os.environ.get(
+    "SUPERSET_REMOTE_USER_HEADER", "X-Forwarded-Email"
+)
+
+
+def _wsgi_environ_key(header: str) -> str:
+    """The WSGI environ key a request header arrives under (PEP 3333)."""
+    return "HTTP_" + header.strip().upper().replace("-", "_")
+
+
+# Read by FAB's AuthRemoteUserView.login. See bootstrap.sh for the admin
+# creation on first boot.
+AUTH_REMOTE_USER_ENV_VAR = _wsgi_environ_key(_REMOTE_USER_HEADER)
 AUTH_ROLES_SYNC_AT_LOGIN = True
 AUTH_USER_REGISTRATION = True
 AUTH_USER_REGISTRATION_ROLE = "Alpha"
 
-
-from flask import request  # noqa: E402  (needs SECRET_KEY set first)
-from flask_appbuilder.security.manager import BaseSecurityManager  # noqa: E402
-from superset.security import SupersetSecurityManager  # noqa: E402
-
-
-_REMOTE_USER_HEADER = os.environ.get(
-    "SUPERSET_REMOTE_USER_HEADER", "X-Auth-Request-Email"
-)
-
-
-class HeaderRemoteUserSecurityManager(SupersetSecurityManager):
-    """Trust ``X-Auth-Request-Email`` from oauth2-proxy as the session
-    user. Falls back to ``REMOTE_USER`` for local dev without a proxy.
-    """
-
-    def get_user_identifier(self, req):  # noqa: D401 - FAB hook name
-        header = req.headers.get(_REMOTE_USER_HEADER)
-        if header:
-            return header
-        return req.environ.get("REMOTE_USER")
-
-
-CUSTOM_SECURITY_MANAGER = HeaderRemoteUserSecurityManager
-
 # ── Behind a reverse proxy ──────────────────────────────────────────────
-# cloudflared → oauth2-proxy → superset is two hops. Superset needs to
-# walk that many entries back through X-Forwarded-For / -Proto to build
-# correct absolute URLs (dashboard permalinks, SQL Lab share links).
+# Public path: Cloudflare → cloudflared → oauth2-proxy-superset → superset.
+# Each count is how many proxies WRITE that header (cloudflared 2026.10.0
+# ingress/origin_proxy.go, oauth2-proxy v7.15.5 pkg/upstream/http.go), which
+# ProxyFix needs to pick the right entry:
+#   x_for 2    Cloudflare sets the client's address and oauth2-proxy appends
+#              cloudflared's; cloudflared adds nothing.
+#   x_proto 1  Cloudflare sets https and both proxies pass it through. At 2,
+#              ProxyFix would ignore the single value and build http:// URLs
+#              -- FAB's post-login redirect (next=request.url) among them.
+#   x_host 0   nobody sets X-Forwarded-Host; both proxies keep the Host header
+#              (SUPERSET_PUBLIC_HOST), and a client-sent one must not steer it.
+#   x_port 0, x_prefix 0   served from the root; nothing sets them.
+# LAN requests through the edge's PORT_SUPERSET carry one X-Forwarded-For
+# entry and no X-Forwarded-Proto, so they keep the edge's address and http.
 ENABLE_PROXY_FIX = True
 PROXY_FIX_CONFIG = {
     "x_for": 2,
-    "x_proto": 2,
-    "x_host": 2,
-    "x_port": 2,
-    "x_prefix": 2,
+    "x_proto": 1,
+    "x_host": 0,
+    "x_port": 0,
+    "x_prefix": 0,
 }
 
-# Static-asset URL prefix when served under a subpath. oauth2-proxy will
-# route /superset/* to this container, so the Flask blueprint mount
-# needs to match.
+# Served from the root of SUPERSET_PUBLIC_HOST, so no APPLICATION_ROOT or
+# STATIC_ASSETS_PREFIX: Superset 4.0.2 cannot run under a path prefix (its
+# pages load /static/..., call /api/v1/... and redirect to /login/), which is
+# why it left chat.zeoenergy.com/superset/. This address is `superset run`'s
+# listener; the image's gunicorn binds 0.0.0.0:8088 itself (run-server.sh).
 SUPERSET_WEBSERVER_ADDRESS = "0.0.0.0"

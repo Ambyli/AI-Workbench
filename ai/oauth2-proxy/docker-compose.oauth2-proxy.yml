@@ -3,23 +3,41 @@ networks:
     external: true
     name: ai_shared
 
+# One oauth2-proxy per public hostname, each named after the service it fronts:
+# oauth2-proxy-openwebui (chat.zeoenergy.com) and oauth2-proxy-superset
+# (SUPERSET_PUBLIC_HOST). oauth2-proxy routes upstreams by path only, never by
+# Host, so a second hostname needs a second instance. Never name one after the
+# bare service (`openwebui`, `superset`): on ai_shared that is the real
+# service's DNS name, and superset:8088 would resolve to the proxy itself.
+# See ai/oauth2-proxy/OAUTH2_PROXY.md.
 services:
-  oauth2-proxy:
+  oauth2-proxy-openwebui:
     # Pinned release, alpine flavour. The default image is distroless (no
     # shell, no wget), which leaves nothing to run a healthcheck with; the
     # `-alpine` tag is the same binary on alpine. Was `latest` (= v7.15.5 on
-    # 2026-10-14). Bump this line, `make build oauth2-proxy`, `make up oauth2-proxy`.
+    # 2026-10-14). Bump this line and oauth2-proxy-superset's together, then
+    # `make build oauth2-proxy`, `make up oauth2-proxy`.
     image: quay.io/oauth2-proxy/oauth2-proxy:v7.15.5-alpine
     # Deployed side by side by `make up oauth2-proxy` (scripts/deploy.py): a
-    # new `oauth2-proxy-<hash>` starts next to the old one, and the old one
-    # retires once the new one is healthy. Hence no container_name and no
-    # `ports:` -- PORT_OAUTH2_PROXY is published by ai/edge. cloudflared
-    # reaches it by service name (oauth2-proxy:4180) and needs no change.
-    # See ai/edge/EDGE.md.
+    # new `oauth2-proxy-openwebui-<hash>` starts next to the old one, and the
+    # old one retires once the new one is healthy. Hence no container_name
+    # and no `ports:` -- PORT_OAUTH2_PROXY is published by ai/edge
+    # (`listen oauth2-proxy-openwebui`). cloudflared reaches it by service name
+    # (oauth2-proxy-openwebui:4180). See ai/edge/EDGE.md.
     labels:
       com.zeo.deploy: swap
     networks:
-      - shared
+      shared:
+        # TEMPORARY, for the rename from `oauth2-proxy`: the Cloudflare
+        # tunnel's chat.zeoenergy.com rule targets http://oauth2-proxy:4180
+        # until it is repointed in the Zero Trust dashboard, and this alias
+        # keeps that name resolving to the new service meanwhile. Once the
+        # rule reads http://oauth2-proxy-openwebui:4180 and
+        # `curl -sfL https://chat.zeoenergy.com/oauth2/ping` passes, delete
+        # these two lines (back to `- shared`) and `make up oauth2-proxy`.
+        # OAUTH2_PROXY.md § Renaming / cutover.
+        aliases:
+          - oauth2-proxy
     restart: unless-stopped
     # Every Open WebUI chat passes through here, inside its 900 s budget;
     # let the retiring copy finish them.
@@ -44,11 +62,12 @@ services:
       OAUTH2_PROXY_REVERSE_PROXY: "${OAUTH2_PROXY_REVERSE_PROXY}"
 
       # Identity passed upstream. USER_HEADERS → X-Forwarded-Email /
-      # X-Forwarded-User (Open WebUI trusted-header SSO); XAUTHREQUEST →
-      # X-Auth-Request-* (Superset). PASS_ACCESS_TOKEN → X-Forwarded-Access-
-      # Token, the user's Google access token, which Open WebUI's patched
-      # trusted-header sign-in uses to VERIFY the identity with Google and
-      # fetch name + picture. See ai/openwebui/OPENWEBUI.md § Single sign-on.
+      # X-Forwarded-User (Open WebUI trusted-header SSO). PASS_ACCESS_TOKEN →
+      # X-Forwarded-Access-Token, the user's Google access token, which Open
+      # WebUI's patched trusted-header sign-in uses to VERIFY the identity
+      # with Google and fetch name + picture. See ai/openwebui/OPENWEBUI.md
+      # § Single sign-on. XAUTHREQUEST only adds X-Auth-Request-* to
+      # RESPONSES (nginx auth_request mode); no upstream receives them.
       OAUTH2_PROXY_PASS_USER_HEADERS: "${OAUTH2_PROXY_PASS_USER_HEADERS}"
       OAUTH2_PROXY_SET_XAUTHREQUEST: "${OAUTH2_PROXY_SET_XAUTHREQUEST}"
       OAUTH2_PROXY_PASS_ACCESS_TOKEN: "${OAUTH2_PROXY_PASS_ACCESS_TOKEN}"
@@ -87,13 +106,108 @@ services:
       # routing (longest-prefix match in OAUTH2_PROXY_UPSTREAMS).
       OAUTH2_PROXY_SKIP_AUTH_ROUTES: "${OAUTH2_PROXY_SKIP_AUTH_ROUTES}"
 
+  # Superset at the root of its own hostname, SUPERSET_PUBLIC_HOST
+  # (superset.zeoenergy.com). Superset 4.0.2 cannot run under a path prefix:
+  # its pages load /static/..., call /api/v1/... and redirect to /login/, and
+  # on chat.zeoenergy.com everything outside a path upstream is Open WebUI's.
+  # So Superset is the exception to "a new UI goes under chat/<path>/": the
+  # Cloudflare tunnel maps SUPERSET_PUBLIC_HOST to
+  # http://oauth2-proxy-superset:4180. Same Google client, Workspace group,
+  # service account, templates and cookie secret as oauth2-proxy-openwebui
+  # (shared .env values); its own host, cookie name and upstreams, set below.
+  # See OAUTH2_PROXY.md § Superset on its own hostname.
+  oauth2-proxy-superset:
+    # Same tag as oauth2-proxy-openwebui above; bump both together.
+    image: quay.io/oauth2-proxy/oauth2-proxy:v7.15.5-alpine
+    # Swapped side by side by `make up oauth2-proxy`, like the instance above.
+    # It has no LAN port and no edge `listen` (LAN clients reach Superset on
+    # its own PORT_SUPERSET), so the swap never waits on the edge.
+    labels:
+      com.zeo.deploy: swap
+    networks:
+      - shared
+    restart: unless-stopped
+    # Superset's longest request is a chart query or a SQL Lab run, and its
+    # frontend abandons any request after SUPERSET_WEBSERVER_TIMEOUT (60 s,
+    # the 4.0.2 default; superset's own stop_grace_period is 60 s). 90 s
+    # lets the retiring copy finish one of those plus its response body.
+    stop_grace_period: 90s
+    healthcheck:
+      # Same probe as oauth2-proxy-openwebui: /ping answers before any auth
+      # check.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:4180/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    volumes:
+      - ./sa-key.json:/etc/oauth2-proxy/sa-key.json:ro
+      - ./templates:/etc/oauth2-proxy/templates:ro
+    environment:
+      # Shared with oauth2-proxy-openwebui, sourced from .env: one provider
+      # and listener, one Google client, one session lifetime, one access
+      # gate, one set of branded pages and the same public /assets/ path.
+      OAUTH2_PROXY_PROVIDER: "${OAUTH2_PROXY_PROVIDER}"
+      OAUTH2_PROXY_HTTP_ADDRESS: "${OAUTH2_PROXY_HTTP_ADDRESS}"
+      OAUTH2_PROXY_REVERSE_PROXY: "${OAUTH2_PROXY_REVERSE_PROXY}"
+      OAUTH2_PROXY_CLIENT_ID: "${OPENWEBUI_GOOGLE_CLIENT_ID}"
+      OAUTH2_PROXY_CLIENT_SECRET: "${OPENWEBUI_GOOGLE_CLIENT_SECRET}"
+      OAUTH2_PROXY_COOKIE_SECRET: "${OAUTH2_PROXY_COOKIE_SECRET}"
+      OAUTH2_PROXY_COOKIE_EXPIRE: "${OAUTH2_PROXY_COOKIE_EXPIRE}"
+      OAUTH2_PROXY_COOKIE_REFRESH: "${OAUTH2_PROXY_COOKIE_REFRESH}"
+      OAUTH2_PROXY_EMAIL_DOMAINS: "${OAUTH2_PROXY_EMAIL_DOMAINS}"
+      OAUTH2_PROXY_GOOGLE_GROUPS: "${OAUTH2_PROXY_GOOGLE_GROUPS}"
+      OAUTH2_PROXY_GOOGLE_ADMIN_EMAIL: "${OAUTH2_PROXY_GOOGLE_ADMIN_EMAIL}"
+      OAUTH2_PROXY_GOOGLE_SERVICE_ACCOUNT_JSON: "${OAUTH2_PROXY_GOOGLE_SERVICE_ACCOUNT_JSON}"
+      OAUTH2_PROXY_CUSTOM_TEMPLATES_DIR: "${OAUTH2_PROXY_CUSTOM_TEMPLATES_DIR}"
+      OAUTH2_PROXY_SKIP_AUTH_ROUTES: "${OAUTH2_PROXY_SKIP_AUTH_ROUTES}"
+
+      # This instance's hostname. The Google OAuth client must also list
+      # https://<SUPERSET_PUBLIC_HOST>/oauth2/callback as a redirect URI.
+      OAUTH2_PROXY_REDIRECT_URL: "https://${SUPERSET_PUBLIC_HOST:-superset.zeoenergy.com}/oauth2/callback"
+      OAUTH2_PROXY_COOKIE_DOMAINS: "${SUPERSET_PUBLIC_HOST:-superset.zeoenergy.com}"
+      OAUTH2_PROXY_WHITELIST_DOMAINS: "${SUPERSET_PUBLIC_HOST:-superset.zeoenergy.com}"
+      # Its own cookie name (chat's is the default `_oauth2_proxy`), so the
+      # two sessions never collide even if a cookie domain is ever widened.
+      OAUTH2_PROXY_COOKIE_NAME: "_oauth2_proxy_superset"
+      # `lax`: nothing frames Superset cross-site. Chat needs `none` only for
+      # the sandbox iframes inside Open WebUI.
+      OAUTH2_PROXY_COOKIE_SAMESITE: "lax"
+
+      # Superset at the root; /assets/ is the sign-in page's logo, served by
+      # the same oauth2-assets sidecar (skip-auth). Superset's own files are
+      # under /static/, so the prefix never shadows one of its routes.
+      OAUTH2_PROXY_UPSTREAMS: "http://superset:8088/,http://oauth2-assets:80/assets/"
+      # A chart's data request returns its headers only when the query ends,
+      # and Superset's frontend waits up to 60 s for it
+      # (SUPERSET_WEBSERVER_TIMEOUT). oauth2-proxy's default is 30 s, after
+      # which it would answer 502 to a query Superset was still running.
+      OAUTH2_PROXY_UPSTREAM_TIMEOUT: "60s"
+
+      # Identity. Superset signs the user in from X-Forwarded-Email
+      # (SUPERSET_REMOTE_USER_HEADER in ai/trino), which PASS_USER_HEADERS
+      # sets after deleting every copy the client sent, underscore spellings
+      # (X_Forwarded_Email) included. Pinned here rather than shared, so
+      # turning the shared knob off for Open WebUI cannot break this sign-in.
+      OAUTH2_PROXY_PASS_USER_HEADERS: "true"
+      # Off: SET_XAUTHREQUEST only adds X-Auth-Request-* to RESPONSES (nginx
+      # auth_request mode). Superset never receives them, and oauth2-proxy
+      # does not delete a client's own X-Auth-Request-* on the way in, so
+      # nothing behind it may trust that header family.
+      OAUTH2_PROXY_SET_XAUTHREQUEST: "false"
+      # Off: Superset needs only the e-mail. Open WebUI takes the token to
+      # verify the identity with Google; Superset has no such step, so
+      # forwarding it would only put a live Google credential into every
+      # Superset request for nothing to use.
+      OAUTH2_PROXY_PASS_ACCESS_TOKEN: "false"
+
   # Serves the repo's assets/ folder over the ai_shared network at
-  # http://oauth2-assets:80/assets/*. oauth2-proxy routes /assets/* here
-  # via multi-upstream longest-prefix match; skip-auth lets browsers fetch
-  # the logo pre-login. Only files under assets/ are exposed.
+  # http://oauth2-assets:80/assets/*. Both oauth2-proxy instances route
+  # /assets/* here via multi-upstream longest-prefix match; skip-auth lets
+  # browsers fetch the logo pre-login. Only files under assets/ are exposed.
   oauth2-assets:
     image: nginx:alpine
-    # Swapped side by side by `make up` like oauth2-proxy above; the hash
+    # Swapped side by side by `make up` like the two proxies above; the hash
     # covers the bind-mounted assets/ folder, so a new logo deploys too.
     labels:
       com.zeo.deploy: swap

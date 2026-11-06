@@ -15,8 +15,10 @@ role, TLS required), plus an Iceberg lakehouse on `lake-s3`. Consumers:
   Phoenix MCP, so any tool-calling model can run federated SQL. Claude
   Code connects through LiteLLM's `/mcp/trino` — see
   [§ Using it from Claude Code](#using-it-from-claude-code).
-- **Humans** — Superset at `chat.zeoenergy.com/superset/` behind
-  oauth2-proxy.
+- **Humans** — Superset at `https://superset.zeoenergy.com/`
+  (`SUPERSET_PUBLIC_HOST`), behind its own oauth2-proxy instance,
+  `oauth2-proxy-superset` — see [§ Header-auth trust
+  boundary](#header-auth-trust-boundary).
 - **External BI tools** — Trino JDBC on `PORT_TRINO` (default 8013),
   HTTPS + password auth. See [§ JDBC authentication](#jdbc-authentication).
 
@@ -48,8 +50,8 @@ the whole stack takes ~90 s.
 | Trino JDBC | `jdbc:trino://<host>:8013?SSL=true&SSLVerification=NONE` | For DBeaver / DataGrip — see [§ JDBC authentication](#jdbc-authentication) |
 | Trino HTTP (internal) | `http://trino-coordinator:8080` | Container networks only, never published; username-only auth for `trino-mcp` / Superset |
 | lake-s3 S3 API | `http://<host>:8014` | S3-compatible, path-style only; keys are `LAKE_S3_ACCESS_KEY` / `LAKE_S3_SECRET_KEY` |
-| lake-s3 console | `https://chat.zeoenergy.com/rustfs/console/` | Behind oauth2-proxy; LAN fallback `http://<host>:8015/rustfs/console/` — see [§ Object store: RustFS](#object-store-rustfs) |
-| Superset | `https://chat.zeoenergy.com/superset/` | Behind oauth2-proxy |
+| lake-s3 console | `https://chat.zeoenergy.com/rustfs/console/` | Behind `oauth2-proxy-openwebui`; LAN fallback `http://<host>:8015/rustfs/console/` — see [§ Object store: RustFS](#object-store-rustfs) |
+| Superset | `https://superset.zeoenergy.com/` (`SUPERSET_PUBLIC_HOST`) | Behind `oauth2-proxy-superset`, served from the root; LAN `http://<host>:8016/` (edge, identity headers stripped, so it signs no one in) |
 | trino-mcp | `http://trino-mcp:8080/mcp` | Internal only, registered with LiteLLM; external clients use `http://<host>:4001/mcp/trino` |
 | HMS Postgres | `psql -h localhost -p 5436 -U hive metastore` | Operator inspection only |
 | Superset Postgres | `psql -h localhost -p 5437 -U superset superset` | Operator inspection only |
@@ -469,41 +471,89 @@ authentication failed` → wrong secret or unescaped `$`).
 
 ## Header-auth trust boundary
 
-Superset is configured with `AUTH_TYPE = AUTH_REMOTE_USER` in
-`superset/superset_config.py`. It trusts `X-Auth-Request-Email` from
-oauth2-proxy as the session user with no separate password check.
+Superset runs `AUTH_TYPE = AUTH_REMOTE_USER` (`superset/superset_config.py`)
+and is served from the root of `SUPERSET_PUBLIC_HOST`
+(`superset.zeoenergy.com`) by its own oauth2-proxy instance,
+`oauth2-proxy-superset`
+([OAUTH2_PROXY.md § Superset on its own hostname](../oauth2-proxy/OAUTH2_PROXY.md#superset-on-its-own-hostname)):
+4.0.2 cannot run under a path prefix, so it is no longer at
+`chat.zeoenergy.com/superset/`. It trusts `X-Forwarded-Email`
+(`SUPERSET_REMOTE_USER_HEADER`) as the session user with no separate password
+check; the first visit creates the account (username = the e-mail, role
+`Alpha`).
 
-**This is only safe when nothing but oauth2-proxy can hand Superset that
-header.** `superset` is swapped side by side by `make up` (see
-[ai/edge/EDGE.md](../edge/EDGE.md)), so `PORT_SUPERSET` (default 8016) is
-published by the `ai/edge` HAProxy rather than by `docker-compose.trino.yml`.
-oauth2-proxy reaches `superset:8088` directly over `ai_shared`, never through
-the edge, so the edge deletes `X-Auth-Request-Email` / `-User` /
-`-Preferred-Username` and `X-Forwarded-Email` / `-User` on that port: a LAN
-client can no longer spoof the header and log in as any Superset account, as it
-could while the port was published straight from this stack. Keep it that way:
+**How the header becomes a login.** Flask-AppBuilder 4.4.1, the version
+`apache/superset:4.0.2` pins, never reads request headers for
+`AUTH_REMOTE_USER`: its `/login/` view (`AuthRemoteUserView.login` in
+`flask_appbuilder/security/views.py`) logs in
+`request.environ[AUTH_REMOTE_USER_ENV_VAR]`, default `REMOTE_USER`, which
+nothing behind a proxy sets. So `superset_config.py` sets
+`AUTH_REMOTE_USER_ENV_VAR` to the WSGI environ key of the header,
+`HTTP_X_FORWARDED_EMAIL`. Superset sends a visitor without a session to
+`/login/?next=…` itself, and the view returns them to the page. (The config
+used to override a `get_user_identifier` method FAB 4.4.1 does not have, and
+named `X-Auth-Request-Email`, which oauth2-proxy only ever puts on responses:
+the header never signed anyone in.)
 
-- never route oauth2-proxy (or anything that sets the header legitimately)
-  through the edge;
-- if `SUPERSET_REMOTE_USER_HEADER` changes, add a `del-header` for the new name
-  in `ai/edge/haproxy.cfg`;
+**This is only safe when nothing but `oauth2-proxy-superset` can hand Superset
+that header:**
+
+- `oauth2-proxy-superset` deletes every client copy of `X-Forwarded-Email` —
+  any spelling, `X_Forwarded_Email` included — before it sets the real one
+  (`PASS_USER_HEADERS`). It does **not** delete a client's own
+  `X-Auth-Request-*`, which is why that family must never be trusted.
+- `superset` is swapped side by side by `make up` (see
+  [ai/edge/EDGE.md](../edge/EDGE.md)), so `PORT_SUPERSET` (default 8016) is
+  published by the `ai/edge` HAProxy rather than by `docker-compose.trino.yml`.
+  `oauth2-proxy-superset` reaches `superset:8088` directly over `ai_shared`,
+  never through the edge, so the edge's `listen superset` deletes
+  `X-Forwarded-Email` / `-User` and `X-Auth-Request-Email` / `-User` /
+  `-Preferred-Username`, plus every header whose name contains an underscore:
+  gunicorn 21.2.0 (Superset 4.0.2's) files `X_Forwarded_Email` under the same
+  environ key as `X-Forwarded-Email`, and an exact-name delete would let that
+  spelling through. A LAN client can neither spoof the header nor sign in on
+  8016.
+- Any container on `ai_shared` can still call `superset:8088` with any header —
+  the same posture as Trino's username-only `:8080`
+  ([§ JDBC authentication](#jdbc-authentication)).
+
+Keep it that way:
+
+- never route `oauth2-proxy-superset` (or anything that sets the header
+  legitimately) through the edge;
+- if `SUPERSET_REMOTE_USER_HEADER` changes, it must be a request header
+  oauth2-proxy sets (`X-Forwarded-*`, never `X-Auth-Request-*`), and the edge
+  needs a `del-header` for the new name in `ai/edge/haproxy.cfg`;
 - before exposing this host on an untrusted network, still bind the edge's
   `PORT_SUPERSET` mapping to loopback in `ai/edge/docker-compose.edge.yml`
   (`"127.0.0.1:${PORT_SUPERSET:-8016}:8016"`), or drop it and reach Superset
-  only via `chat.zeoenergy.com/superset/`.
+  only via `https://superset.zeoenergy.com/`.
 
-Superset is now the only service in the stack that trusts a proxy-set
-identity header. Open WebUI used the same pattern via
-`WEBUI_AUTH_TRUSTED_EMAIL_HEADER` and has since been moved to its own OIDC —
-[ai/openwebui/OPENWEBUI.md § Single sign-on](../openwebui/OPENWEBUI.md#single-sign-on)
-covers why, and the reasoning about reachability applies here unchanged.
+Superset's own session outlives a change of Google account in the same
+browser: the old Superset user stays signed in until you log out of Superset
+(top-right menu). Revocation is unaffected — `oauth2-proxy-superset` refuses
+every request from someone removed from the group at the next cookie refresh.
+
+**Behind the proxy.** `PROXY_FIX_CONFIG` counts the proxies that WRITE each
+`X-Forwarded-*` header on the public path (Cloudflare → cloudflared →
+`oauth2-proxy-superset` → superset): `x_for` 2 (Cloudflare sets the client,
+oauth2-proxy appends cloudflared), `x_proto` 1 (only Cloudflare writes it; at
+2 ProxyFix ignored the one value and Superset built `http://` URLs, its
+post-login redirect among them), and `x_host` / `x_port` / `x_prefix` 0
+(nobody sets them; both proxies keep the `Host` header). Served from the root,
+so no `APPLICATION_ROOT` or `STATIC_ASSETS_PREFIX`.
+
+Open WebUI is the other service that trusts `X-Forwarded-Email`; it also
+verifies it with Google using the forwarded access token, and binds
+`127.0.0.1:8007` only —
+[ai/openwebui/OPENWEBUI.md § Single sign-on](../openwebui/OPENWEBUI.md#single-sign-on).
 
 ## Counting LiteLLM SGRs
 
 LiteLLM Enterprise licensing meters **Successful Gateway Requests (SGRs)**:
 every call LiteLLM logs with a success status, counted once per request; a
 missing status counts as a success. Superset's **LiteLLM SGRs** dashboard
-(`https://chat.zeoenergy.com/superset/dashboard/litellm-sgrs/`) counts them
+(`https://superset.zeoenergy.com/superset/dashboard/litellm-sgrs/`) counts them
 per month from `LiteLLM_SpendLogs` (`postgres_litellm.public.litellm_spendlogs`,
 one row per call since June 2026):
 

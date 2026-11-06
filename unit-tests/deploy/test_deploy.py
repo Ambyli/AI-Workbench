@@ -1327,7 +1327,8 @@ def _env_example() -> str:
 
 def test_every_swap_labelled_service_really_swaps():
     swaps = _swap_services()
-    assert {"litellm", "oauth2-proxy", "cloudflared", "searxng", "supabase-api"} <= set(swaps)
+    assert {"litellm", "oauth2-proxy-openwebui", "oauth2-proxy-superset", "cloudflared", "searxng",
+            "supabase-api"} <= set(swaps)
     for key, (stack, svc, _doc) in swaps.items():
         assert deploy.classify(key, svc) == (deploy.SWAP, ""), f"{stack}/{key}"
 
@@ -1352,6 +1353,32 @@ def test_every_edge_backend_is_on_ai_shared_and_swap_or_portless_recreate():
             assert cls == deploy.SWAP, f"{stack}/{name} is {cls}"
         assert bind and port
     assert recreate == EDGE_RECREATE_BACKENDS
+
+
+def test_no_two_services_answer_to_one_name_on_ai_shared():
+    # Docker DNS answers a service key, its container_name and its network
+    # aliases. Two services sharing one of those names on ai_shared would
+    # split traffic between them -- e.g. a proxy named `superset` would make
+    # superset:8088 resolve to the proxy itself. Hence `oauth2-proxy-<service>`.
+    owners = {}
+    for path in _compose_files():
+        doc = _yaml().safe_load(path.read_text(encoding="utf-8"))
+        shared = {k for k, v in (doc.get("networks") or {}).items() if (v or {}).get("name") == "ai_shared"}
+        for key, svc in (doc.get("services") or {}).items():
+            nets = svc.get("networks") or {}
+            if isinstance(nets, list):
+                nets = {n: None for n in nets}
+            joined = [cfg or {} for name, cfg in nets.items() if name in shared]
+            if not joined:
+                continue
+            names = {key} | ({svc["container_name"]} if svc.get("container_name") else set())
+            for cfg in joined:
+                names |= set(cfg.get("aliases") or [])
+            for name in names:
+                owners.setdefault(name, set()).add(f"{path.parent.name}/{key}")
+    assert "superset" in owners and "oauth2-proxy-superset" in owners
+    clashes = {name: sorted(who) for name, who in owners.items() if len(who) > 1}
+    assert not clashes, f"names answered by more than one service on ai_shared: {clashes}"
 
 
 def test_edge_publishes_exactly_its_lan_listeners():

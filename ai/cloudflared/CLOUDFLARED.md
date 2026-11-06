@@ -91,7 +91,7 @@ at the edge with the real reason only in the connector's log:
 ERR Request failed error="Unable to reach the origin service…
     dial tcp [::1]:4001: connect: connection refused"
 ERR Request failed error="Unable to reach the origin service…
-    lookup oauth2-proxy on 127.0.0.53:53: server misbehaving"
+    lookup oauth2-proxy-openwebui on 127.0.0.53:53: server misbehaving"
 ```
 
 The first is a host-port origin used from a container. The second is the
@@ -117,26 +117,33 @@ host-targeted ingress rule breaks.
 
 | Hostname | Origin | Notes |
 |---|---|---|
-| `chat.zeoenergy.com` | `http://oauth2-proxy:4180` | SSO front door for Open WebUI and every path upstream in `OAUTH2_PROXY_UPSTREAMS`: `/sandboxes/*`, `/superset/*`, `/rustfs/*`, `/edge/*`. Not `/n8n/*`: n8n is not exposed ([N8N.md § Access](../n8n/N8N.md#access-not-exposed)) |
+| `chat.zeoenergy.com` | `http://oauth2-proxy-openwebui:4180` | SSO front door for Open WebUI and every path upstream in `OAUTH2_PROXY_UPSTREAMS`: `/sandboxes/*`, `/rustfs/*`, `/edge/*`. Not `/n8n/*`: n8n is not exposed ([N8N.md § Access](../n8n/N8N.md#access-not-exposed)). Until this row is repointed it reads `http://oauth2-proxy:4180`, which the service's temporary network alias still answers ([OAUTH2_PROXY.md § Renaming / cutover](../oauth2-proxy/OAUTH2_PROXY.md#renaming--cutover)) |
+| `superset.zeoenergy.com` | `http://oauth2-proxy-superset:4180` | Superset at the root, behind its own oauth2-proxy instance: 4.0.2 cannot run under a path prefix, so it is not a path on `chat`. The name is `SUPERSET_PUBLIC_HOST`; the Google OAuth client lists `https://superset.zeoenergy.com/oauth2/callback` ([OAUTH2_PROXY.md § Superset on its own hostname](../oauth2-proxy/OAUTH2_PROXY.md#superset-on-its-own-hostname)) |
 | `api.zeoenergy.com` | `http://litellm:4000` | **Bypasses oauth2-proxy** — LiteLLM's own key auth is the only gate. Off-LAN path only: on the office LAN the same name resolves to the box and reaches the LAN edge instead ([split-horizon](#dns-01-certificate-for-apizeoenergycom-on-the-lan-edge-split-horizon)). Leave its DNS record alone; never add an `A` record for `api` |
 | `rdp.zeoenergy.com` | `tcp://host.docker.internal:3389` | RDP listens on the host, not in Docker |
 | _(catch-all)_ | `http_status:404` | |
 
-Adding a hostname served by a container needs **no** compose or `.env` change —
-only a dashboard rule plus, if it should be behind SSO, an entry in
-`OAUTH2_PROXY_UPSTREAMS`. Prefer putting a new service behind
+Adding a path under `chat.zeoenergy.com` needs **no** dashboard change — only
+an entry in `OAUTH2_PROXY_UPSTREAMS`. Prefer putting a new service behind
 `chat.zeoenergy.com/<path>/` over giving it its own hostname: it inherits the
-existing Google sign-in cookie instead of being exposed unauthenticated.
+existing Google sign-in cookie instead of being exposed unauthenticated. A UI
+that cannot run under a path prefix is the exception: it gets its own
+hostname, a dashboard rule pointing at its own `oauth2-proxy-<service>`
+instance (oauth2-proxy matches paths only, so one instance serves one
+hostname), and a place in the cache-bypass rule below — the way
+`superset.zeoenergy.com` is built. Add a rule for it; never edit the `chat`
+one.
 
 ---
 
-## Cache rule — bypass for `chat.zeoenergy.com`
+## Cache rule — bypass for the authenticated hostnames
 
 Cloudflare caches by file extension by default — `.png`, `.ico`, `.svg`, `.css`,
 `.js`, fonts — for 4 h when the origin sends no `Cache-Control`, and it does so
-**regardless of request cookies**. Everything on `chat.zeoenergy.com` sits behind
-oauth2-proxy, and neither oauth2-proxy nor Open WebUI's static handler sets
-`Cache-Control`, so the edge caches *authenticated* responses and then serves
+**regardless of request cookies**. Everything on `chat.zeoenergy.com` and
+`superset.zeoenergy.com` sits behind oauth2-proxy, and neither oauth2-proxy nor
+Open WebUI's static handler sets `Cache-Control` (Superset's `/static/` files are
+the same risk), so the edge caches *authenticated* responses and then serves
 them to anyone who asks: an anonymous
 `curl -sI https://chat.zeoenergy.com/static/favicon.png` returns `200` with
 `cf-cache-status: HIT` where oauth2-proxy would have returned `403`. It is also
@@ -146,16 +153,22 @@ after a recreate — see
 
 Like the ingress rules, this lives in the dashboard, not the repo:
 
-1. Caching → Cache Rules → Create rule. Name: `chat – bypass (authenticated origin)`.
-2. Match: **Hostname** equals `chat.zeoenergy.com`. Optionally AND **URI Path**
-   does not start with `/assets/` — the unauthenticated logo sidecar is safe to
-   cache.
+1. Caching → Cache Rules → Create rule (or edit the existing one, named
+   `chat – bypass (authenticated origin)`).
+2. Match: **Hostname** is in `chat.zeoenergy.com` `superset.zeoenergy.com`
+   (expression `http.host in {"chat.zeoenergy.com" "superset.zeoenergy.com"}`).
+   Optionally AND **URI Path** does not start with `/assets/` — the
+   unauthenticated logo sidecar is safe to cache. Every hostname behind an
+   oauth2-proxy instance belongs in this list, added before it goes live.
 3. Cache eligibility: **Bypass cache**. Deploy.
 4. Caching → Configuration → **Purge Everything**, once, to evict what is
-   already cached.
+   already cached. (Not needed for a hostname added to the rule before it
+   served anything.)
 
-Verify with the `curl -sI` above: `cf-cache-status` should read `DYNAMIC` or
-`BYPASS`, and the anonymous request should get oauth2-proxy's `403`.
+Verify with the `curl -sI` above, and for Superset
+`curl -sI https://superset.zeoenergy.com/static/assets/images/superset-logo-horiz.png`:
+`cf-cache-status` should read `DYNAMIC` or `BYPASS`, and the anonymous request
+should get oauth2-proxy's `403`.
 `api.zeoenergy.com` needs no rule — LiteLLM answers JSON on extension-less
 paths, which Cloudflare never caches by default.
 

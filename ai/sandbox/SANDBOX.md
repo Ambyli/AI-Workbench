@@ -374,8 +374,8 @@ Because the artifact iframe navigates to `${SANDBOX_PROXY_URL}/{sandbox_id}/`, t
 **Traffic path:**
 
 ```
-browser ──HTTPS── cloudflared ──HTTP── oauth2-proxy ──HTTP── sandbox-proxy ──HTTP── sandbox-{id}:80
-   (chat.zeoenergy.com/sandboxes/{id}/*)                       (Caddy)          (sandbox_net)
+browser ──HTTPS── cloudflared ──HTTP── oauth2-proxy-openwebui ──HTTP── sandbox-proxy ──HTTP── sandbox-{id}:80
+   (chat.zeoenergy.com/sandboxes/{id}/*)                                 (Caddy)          (sandbox_net)
 ```
 
 Concretely:

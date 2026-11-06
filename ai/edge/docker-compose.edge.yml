@@ -10,8 +10,9 @@
 # refused by a retiring copy is retried on the other (haproxy.cfg).
 #
 # Container-to-container traffic does not come through here: Open WebUI,
-# cloudflared, oauth2-proxy, etc. keep calling `litellm:4000` and friends by
-# service name. Only LAN / localhost clients on the published ports do.
+# cloudflared, the oauth2-proxy-* instances, etc. keep calling `litellm:4000`
+# and friends by service name. Only LAN / localhost clients on the published
+# ports do.
 #
 # It also publishes the ports of three recreate-class HTTP APIs (classifier,
 # sandbox-runner, detector). They are not swapped -- each compose file says
@@ -19,13 +20,13 @@
 # of the client getting "connection refused".
 #
 # Inside the container each service gets a FIXED listener equal to its default
-# host port (4001 litellm, 4180 oauth2-proxy, ...); the left-hand side is the
-# operator's PORT_* value. Never published, reachable only inside the
-# container or as edge:<port> on ai_shared:
+# host port (4001 litellm, 4180 oauth2-proxy-openwebui, ...); the left-hand
+# side is the operator's PORT_* value. Never published, reachable only inside
+# the container or as edge:<port> on ai_shared:
 #   127.0.0.1:8404  stats CSV; scripts/deploy.py reads it to wait for a new
 #                   copy to be UP, and the healthcheck below probes it
 #   8405            Prometheus exporter, scraped by the litellm stack's prometheus
-#   8407            read-only status page, behind oauth2-proxy at
+#   8407            read-only status page, behind oauth2-proxy-openwebui at
 #                   chat.zeoenergy.com/edge/
 # Every published port rejects clients outside EDGE_ALLOWED_CIDRS (below).
 #

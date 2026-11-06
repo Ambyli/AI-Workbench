@@ -4,7 +4,8 @@
 # roofix-db, sandbox-db) plus an Iceberg lakehouse on RustFS (`lake-s3`,
 # an S3-compatible object store). Consumers:
 #   * models via LiteLLM MCP (mcp_servers.trino → trino-mcp:8080/mcp)
-#   * humans via Superset behind oauth2-proxy (/superset/*)
+#   * humans via Superset at SUPERSET_PUBLIC_HOST (superset.zeoenergy.com),
+#     behind its own oauth2-proxy-superset instance (ai/oauth2-proxy)
 #   * external BI tools via JDBC on PORT_TRINO — HTTPS + password auth.
 #     trino-auth-init (one-shot) generates the self-signed cert and the
 #     bcrypt password.db from TRINO_JDBC_USERS; plain HTTP :8080 is never
@@ -448,9 +449,10 @@ services:
   # Built locally to preinstall the Trino SQLAlchemy driver + psycopg2 so
   # the first bootstrap can register the Trino connection non-interactively.
   #
-  # Header-auth: SUPERSET_AUTH_TYPE=AUTH_REMOTE_USER trusts the
-  # X-Auth-Request-Email header oauth2-proxy sets — no second sign-in.
-  # See ai/trino/superset/superset_config.py for the trust boundary.
+  # Header-auth: AUTH_TYPE=AUTH_REMOTE_USER trusts the X-Forwarded-Email
+  # header oauth2-proxy-superset sets — no second sign-in. Served from the
+  # root of SUPERSET_PUBLIC_HOST: 4.0.2 cannot run under a path prefix. See
+  # ai/trino/superset/superset_config.py for the trust boundary.
   superset:
     build:
       context: ./superset
@@ -459,10 +461,10 @@ services:
     # `superset-<hash>` starts next to the old one, and the old one retires
     # once the new one is healthy. bootstrap.sh is idempotent, so the new
     # copy re-running it beside the old one is safe. No container_name
-    # (oauth2-proxy reaches superset:8088 by service name) and no `ports:`:
-    # PORT_SUPERSET is published by ai/edge, which strips the
-    # X-Auth-Request-* headers on that port -- see the header-auth note above
-    # and ai/edge/EDGE.md.
+    # (oauth2-proxy-superset reaches superset:8088 by service name) and no
+    # `ports:`: PORT_SUPERSET is published by ai/edge, which strips the
+    # identity headers on that port -- see the header-auth note above and
+    # ai/edge/EDGE.md.
     labels:
       com.zeo.deploy: swap
     restart: unless-stopped
@@ -475,9 +477,11 @@ services:
       # Bootstrap uses this to create a default Trino connection on first
       # run. Change here — no restart re-registration.
       TRINO_URL: trino://trino-mcp@trino-coordinator:8080
-      # oauth2-proxy sets this on every authenticated request; Superset
-      # trusts the header to identify the session user.
-      SUPERSET_REMOTE_USER_HEADER: X-Auth-Request-Email
+      # oauth2-proxy-superset sets this on every authenticated request
+      # (PASS_USER_HEADERS, after deleting any copy the client sent);
+      # Superset trusts the header to identify the session user. A new name
+      # also needs a `del-header` in ai/edge/haproxy.cfg's `listen superset`.
+      SUPERSET_REMOTE_USER_HEADER: X-Forwarded-Email
     networks:
       - shared
       - analytics_net

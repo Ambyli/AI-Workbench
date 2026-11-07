@@ -22,7 +22,8 @@ class JobBase(BaseModel):
         job_id: 12-char hex identifier assigned at registration.
         phase: Freeform string; each consumer defines its own convention.
             Interceptor-api uses ``"cloning" | "capturing" | "cleaning_up"``;
-            classifier uses ``"pending" | "processing" | "completed" | "failed"``.
+            classifier uses ``"staging" | "pending" | "processing" |
+            "completed" | "failed" | "cancelled"``.
         created_at: ISO-8601 UTC timestamp when the job was registered.
         updated_at: ISO-8601 UTC timestamp of the last phase / result / error
             transition. Equals ``created_at`` for a job that hasn't transitioned.

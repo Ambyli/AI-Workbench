@@ -84,6 +84,10 @@ services:
       # max_concurrent — muse-glimmer: 6 of its --max-num-seqs 8, leaving 2
       # for the LiteLLM chat chains). See API.md § Concurrency and durability.
       - CLASSIFIER_MAX_CONCURRENT=${CLASSIFIER_MAX_CONCURRENT:-4}
+      # Jobs that may be waiting OR running at once; past it POST /assess and
+      # POST /references answer 429 + Retry-After. 0 = no limit (the
+      # default). See API.md § Concurrency and durability.
+      - CLASSIFIER_QUEUE_LIMIT=${CLASSIFIER_QUEUE_LIMIT:-0}
       - CLASSIFIER_MAX_UNITS_PER_JOB=${CLASSIFIER_MAX_UNITS_PER_JOB:-6}
       - CLASSIFIER_OCR_WORKERS=${CLASSIFIER_OCR_WORKERS:-4}
       # How often a running job's progress gauge is written to classifier-db

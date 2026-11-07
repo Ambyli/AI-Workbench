@@ -1194,31 +1194,49 @@ a remote failure is a status, never an exception:
    per criterion in tie order, `model`. N criteria cost N model calls, run
    concurrently up to the model's `max_concurrent` in `models.yaml`.
 3. **Poll** `GET /jobs/{id}` every `ROUTE_POLICY_CLASSIFY_POLL_S` until
-   `completed` / `failed`, or `ROUTE_POLICY_CLASSIFY_TIMEOUT_S` (180 s,
-   counted from the start of the cycle) has passed.
+   `completed` / `failed` / `cancelled` (cancelled by someone else: stored
+   as `failed`), or `ROUTE_POLICY_CLASSIFY_TIMEOUT_S` (180 s, counted from
+   the start of the cycle) has passed.
 4. **Read** `assessment.per_criterion_scores` (each `score`, and `reason`
    cut to 200 characters) and `result.usage`.
 5. **Always `DELETE /jobs/{id}`** -- after a result, a failure, a timeout
-   (preceded by `POST /jobs/{id}/cancel`, which the classifier does not
-   mount today; the DELETE is what counts) and a cancellation at shutdown.
+   and a cancellation at shutdown. The last two first send
+   `POST /jobs/{id}/cancel` (its answer is not read): the classifier stops a
+   running job within about a second (`CANCEL_CHECK_INTERVAL_S`), which
+   frees its `max_concurrent` slots -- on `qwen3.5-4b`, this service's own
+   two. The DELETE is what counts; on a running job it stops it the same way.
 
 **Why the job is deleted.** `/assess` keeps the text as a payload until the
 job finishes and as a text-layer artifact until the classifier's
 `JOB_TTL_HOURS`. The DELETE removes the row, the artifacts (text layers
 included), the progress history and the job's `llm_calls` rows -- so the
 usage (calls, tokens, seconds) is copied into route-policy's `analyses` row
-first. A job deleted while it still runs may write its artifact directory
-afterwards; the classifier's sweeper removes a directory whose job row is
-gone (every `CLASSIFIER_ARTIFACT_SWEEP_INTERVAL_S`). A DELETE that fails is
+first. A job deleted while it still runs is stopped within about a second,
+and what it wrote in that second (usage rows, its artifact directory) is
+removed once its runner has unwound; anything left behind is a directory
+whose job row is gone, which the classifier's sweeper removes (every
+`CLASSIFIER_ARTIFACT_SWEEP_INTERVAL_S`). A DELETE that fails is
 logged and counted (`classifier_delete`); that job then expires with
 `JOB_TTL_HOURS`.
 
 Statuses: `ok` (every criterion scored), `incomplete` (some did; the partial
 scores are used), `failed` (the job failed, its result is unreadable, or no
-criterion was scored), `refused` (a 4xx from `/assess`, an unknown or
-unavailable model), `unavailable` (no connection, a 5xx), `timeout`,
-`not_local`. An `error` (≤ 300 characters) that would quote the submitted
-text is withheld.
+criterion was scored), `refused` (a 4xx other than 429 from `/assess`, an
+unknown or unavailable model), `unavailable` (no connection, a 5xx, or a
+**429** — the classifier's queue is at its `CLASSIFIER_QUEUE_LIMIT`; the
+error carries its `Retry-After`), `timeout`, `not_local`. An `error` (≤ 300
+characters) that would quote the submitted text is withheld.
+
+**A full classifier queue.** With `CLASSIFIER_QUEUE_LIMIT` set on the
+classifier (`ai/classifier/API.md § Concurrency and durability`), a submit
+to a queue already holding that many jobs (waiting or running) is a 429
+before any job exists: the cycle ends `unavailable` at once — no retry
+inside the cycle (the next user message is a new attempt), and nothing to
+cancel or delete. The change in behaviour: when document jobs fill the
+queue, a route analysis now fails in milliseconds instead of waiting in the
+FIFO until `ROUTE_POLICY_CLASSIFY_TIMEOUT_S`. Everything downstream is as
+for any failed classification: the `analyses` row is stored as
+`unavailable`, `topic-llm` abstains, and routing is unaffected.
 
 ### The analysis queue
 
@@ -1960,7 +1978,10 @@ or an empty URL sends every `auto` turn to `local-private`),
     `models.yaml` entry still `authenticated: false`?
   - `refused`: the classifier does not know the model (restart it after a
     `models.yaml` edit) or refused the request (the error says why);
-  - `unavailable`: the classifier is down or answering 5xx;
+  - `unavailable`: the classifier is down or answering 5xx — or 429, its
+    queue full (`CLASSIFIER_QUEUE_LIMIT`; the error says
+    `answered 429` with the `Retry-After`): document jobs are filling it;
+    see `classifier_jobs_open` / `classifier_jobs_rejected_total`;
   - `timeout`: the classifier's queue is backed up with document jobs, or
     the model is slow (raise `ROUTE_POLICY_CLASSIFY_TIMEOUT_S` only after
     looking at `queue_ms`).
@@ -2064,7 +2085,7 @@ TEST_POSTGRES_DSN=postgresql://postgres@localhost:55441/postgres \
 | `test_writes.py` | No database wait holds `/decide`: deferred and dropped writes, shutdown, bounded reads |
 | `test_llm_classifier.py` | The evaluator: config validation, route checks, fingerprint, verdict keys (stable across tool rounds, changed by an edit), ageing, every vote and abstain reason, analysis requests, background tasks, the tie order surviving a jsonb round trip, the `default-llm` wiring (version, pin, the reworded code criterion) |
 | `test_verdict.py` | `choose`: winners, ties, `otherwise` confidence, errored criteria |
-| `test_analysis_client.py` | The `/assess` cycle on a fake classifier: every status, the locality guard (authenticated, public, mixed and unresolvable hosts refused before submitting; private / loopback / ULA local), caches, DELETE always (after a cancel on timeout, and when cancelled), no submitted text in any error |
+| `test_analysis_client.py` | The `/assess` cycle on a fake classifier: every status, the locality guard (authenticated, public, mixed and unresolvable hosts refused before submitting; private / loopback / ULA local), caches, DELETE always (after a cancel on timeout, and when cancelled), a job cancelled on the classifier read as `failed` and not cancelled again, a 429 (full queue) read as `unavailable` with its `Retry-After` and no resubmit or DELETE, no submitted text in any error |
 | `test_analysis_queue.py` | Dedupe, overflow, skip-if-stored, the written row (scores by route, winner's reason, usage, provenance; failures with no scores), write failures, shutdown (waiting dropped, running cancelled and still deleted) |
 | `test_shadows.py` | Resolving shadows, skipped unloadable ones, derived ids, the primary response unchanged by a shadow, the shadow row and its evaluations, idempotency, provenance of analysis requests, a primary with an `llm_classifier`, isolation (a raising shadow, a hung database, the task cap), `/evaluate` reading without enqueueing |
 | `test_db.py` (`postgres`) | Startup, seeding (with shadow slots), immutability, migrations (0003 on a phase-4 database with rows), the phase-2 → phase-3 and phase-4 → `default@3` upgrades (a turn pinned across the deploy), idempotent `/decide` / `/observe` in either order, shadow rows and both views (the 0003 columns), the `analyses` table (first write wins, caps, the CHECK), the whole classifier loop on a fake classifier (job deleted, verdict voted next turn, no text stored), one classification per turn, the turn lookup on real rows (each shadow pinned from its own rows), the startup warm-up and a shadow's signals call on a fake sidecar, an edit making a verdict unreachable, a stored draft compiling like its file, the reads |

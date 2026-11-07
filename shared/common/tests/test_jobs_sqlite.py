@@ -133,6 +133,86 @@ def test_cancel_transitions_phase_and_refuses_terminal(db_path: str) -> None:
     assert reason3 == "not_found"
 
 
+def test_cancel_refuses_every_terminal_phase_and_leaves_the_row(db_path: str) -> None:
+    reg = SqliteRegistry(db_path)
+    _run(reg.init())
+    done = _run(reg.register(_Meta(type="assess", request_id="d")))
+    failed = _run(reg.register(_Meta(type="assess", request_id="f")))
+    running = _run(reg.register(_Meta(type="assess", request_id="p"), "processing"))
+    _run(reg.set_result(done, {"ok": True}))
+    _run(reg.set_error(failed, "boom"))
+    assert _run(reg.cancel(done)) == (False, "already_completed")
+    assert _run(reg.cancel(failed)) == (False, "already_failed")
+    assert _run(reg.get(done)).result == {"ok": True}
+    assert _run(reg.get(failed)).error == "boom"
+    assert _run(reg.cancel(running)) == (True, "processing")
+
+
+def test_guarded_writes_say_whether_they_landed(db_path: str) -> None:
+    reg = SqliteRegistry(db_path)
+    _run(reg.init())
+    job_id = _run(reg.register(_Meta(type="assess", request_id="g")))
+    # set_phase: only from a listed phase.
+    assert _run(reg.set_phase(job_id, "processing", from_phases=("pending",))) is True
+    assert _run(reg.set_phase(job_id, "pending", from_phases=("staging",))) is False
+    assert _run(reg.get(job_id)).phase == "processing"
+    # set_result / set_error: refused outside the guard, nothing written.
+    assert _run(reg.set_result(job_id, {"x": 1}, from_phases=("pending",))) is False
+    assert _run(reg.set_error(job_id, "no", from_phases=["staging", "pending"])) is False
+    got = _run(reg.get(job_id))
+    assert (got.phase, got.result, got.error) == ("processing", None, None)
+    assert _run(reg.set_result(job_id, {"x": 1}, from_phases=("processing",))) is True
+    assert _run(reg.set_error(job_id, "late", from_phases=("processing",))) is False
+    got = _run(reg.get(job_id))
+    assert (got.phase, got.result, got.error) == ("completed", {"x": 1}, None)
+
+
+def test_unguarded_writes_still_land_anywhere_and_report_a_missing_row(db_path: str) -> None:
+    reg = SqliteRegistry(db_path)
+    _run(reg.init())
+    job_id = _run(reg.register(_Meta(type="assess", request_id="u")))
+    _run(reg.cancel(job_id))
+    # Exactly the old behaviour: no guard, so it overwrites even a cancel.
+    assert _run(reg.set_result(job_id, {"ok": True})) is True
+    assert _run(reg.get(job_id)).phase == "completed"
+    assert _run(reg.set_phase("ghost", "pending")) is False
+    assert _run(reg.set_result("ghost", {})) is False
+    assert _run(reg.set_error("ghost", "x")) is False
+
+
+def test_a_guard_that_names_no_phase_is_refused(db_path: str) -> None:
+    reg = SqliteRegistry(db_path)
+    _run(reg.init())
+    job_id = _run(reg.register(_Meta(type="assess", request_id="b")))
+    with pytest.raises(TypeError):
+        _run(reg.set_phase(job_id, "pending", from_phases="processing"))
+    with pytest.raises(ValueError):
+        _run(reg.set_result(job_id, {}, from_phases=()))
+
+
+def test_a_cancel_and_a_guarded_result_racing_have_one_winner(db_path: str) -> None:
+    """Parity with the Postgres race test: whichever lands first, the other
+    is refused, and the row says what the winner wrote."""
+    reg = SqliteRegistry(db_path)
+    _run(reg.init())
+
+    async def race():
+        outcomes = []
+        for i in range(20):
+            job_id = await reg.register(_Meta(type="assess", request_id=str(i)), "processing")
+            stored, (cancelled, _) = await asyncio.gather(
+                reg.set_result(job_id, {"i": i}, from_phases=("processing",)),
+                reg.cancel(job_id),
+            )
+            row = await reg.get(job_id)
+            outcomes.append((stored, cancelled, row.phase))
+        return outcomes
+
+    for stored, cancelled, phase in _run(race()):
+        assert stored != cancelled
+        assert phase == ("completed" if stored else "cancelled")
+
+
 def test_delete(db_path: str) -> None:
     reg = SqliteRegistry(db_path)
     _run(reg.init())
@@ -254,6 +334,108 @@ def test_count_by_phase(db_path: str) -> None:
         _run(reg.register(_Meta(type="assess", request_id="x")))
     _run(reg.claim_next())
     assert _run(reg.count_by_phase()) == {"pending": 2, "processing": 1}
+
+
+# ── Bounded admission (register(max_open=), count_open) ───────────────────
+# The same cases as test_jobs_postgres.py's, for the interface parity the
+# module promises.
+def test_max_open_admits_up_to_the_limit_and_refuses_with_no_row(db_path: str) -> None:
+    from common.jobs import QueueFull
+
+    reg = SqliteRegistry(db_path)
+    _run(reg.init())
+    ids = [_run(reg.register({"i": i}, "pending", max_open=3)) for i in range(3)]
+    assert len(set(ids)) == 3
+    with pytest.raises(QueueFull) as info:
+        _run(reg.register({"i": 3}, "pending", max_open=3))
+    assert (info.value.open_jobs, info.value.limit) == (3, 3)
+    assert _run(reg.count_by_phase()) == {"pending": 3}
+
+
+def test_terminal_rows_do_not_count_staging_and_custom_phases_do(db_path: str) -> None:
+    from common.jobs import QueueFull
+
+    reg = SqliteRegistry(db_path)
+    _run(reg.init())
+    for phase in ("completed", "failed", "cancelled"):
+        _run(reg.register({"done": phase}, phase))
+    assert _run(reg.count_open()) == 0
+    staged = _run(reg.register({}, "staging"))
+    for phase in ("processing", "capturing"):
+        _run(reg.register({"open": phase}, phase))
+    assert _run(reg.count_open()) == 3
+    with pytest.raises(QueueFull):
+        _run(reg.register({}, "staging", max_open=3))
+    assert _run(reg.cancel(staged)) == (True, "staging")  # a cancel frees its slot
+    _run(reg.register({}, "staging", max_open=3))
+    assert _run(reg.count_open()) == 3
+
+
+def test_open_rows_already_over_the_limit_refuse_until_they_drain(db_path: str) -> None:
+    from common.jobs import QueueFull
+
+    reg = SqliteRegistry(db_path)
+    _run(reg.init())
+    ids = [_run(reg.register({"i": i}, "pending")) for i in range(4)]
+    with pytest.raises(QueueFull) as info:
+        _run(reg.register({}, "pending", max_open=2))
+    assert info.value.open_jobs == 4
+    for job_id in ids[:2]:
+        _run(reg.set_error(job_id, "boom"))
+    with pytest.raises(QueueFull):
+        _run(reg.register({}, "pending", max_open=2))
+    _run(reg.delete(ids[2]))
+    _run(reg.register({}, "pending", max_open=2))
+    assert _run(reg.count_open()) == 2
+
+
+def test_concurrent_registers_on_separate_connections_never_overshoot(db_path: str) -> None:
+    """20 submits racing for 5 slots. Each register opens its own aiosqlite
+    connection — its own thread — so the count and the insert of one can
+    interleave with another's unless BEGIN IMMEDIATE serialises them."""
+    from common.jobs import QueueFull
+
+    reg = SqliteRegistry(db_path)
+    _run(reg.init())
+
+    async def race():
+        return await asyncio.gather(
+            *(reg.register({"racer": i}, "staging", max_open=5) for i in range(20)),
+            return_exceptions=True,
+        )
+
+    outcomes = _run(race())
+    admitted = [o for o in outcomes if isinstance(o, str)]
+    refused = [o for o in outcomes if isinstance(o, QueueFull)]
+    assert len(admitted) == 5 and len(refused) == 15, outcomes
+    assert _run(reg.count_by_phase()) == {"staging": 5}
+
+
+def test_max_open_none_is_unbounded_and_below_one_is_refused(db_path: str) -> None:
+    reg = SqliteRegistry(db_path)
+    _run(reg.init())
+    for i in range(8):
+        _run(reg.register({"i": i}, "pending", max_open=None))
+    assert _run(reg.count_open()) == 8
+    with pytest.raises(ValueError, match="None means no limit"):
+        _run(reg.register({}, "pending", max_open=0))
+    with pytest.raises(TypeError):
+        _run(reg.register({}, "pending", max_open=True))
+    assert _run(reg.count_open()) == 8
+
+
+def test_count_open_counts_every_unfinished_phase(db_path: str) -> None:
+    reg = SqliteRegistry(db_path)
+    _run(reg.init())
+    assert _run(reg.count_open()) == 0
+    a = _run(reg.register({}, "staging"))
+    b = _run(reg.register({}))
+    _run(reg.register({}))
+    _run(reg.claim_next())
+    assert _run(reg.count_open()) == 3
+    _run(reg.set_error(a, "boom"))
+    _run(reg.set_phase(b, "completed"))
+    assert _run(reg.count_open()) == 1
 
 
 # ── expired_job_ids (retention) ────────────────────────────────────────────

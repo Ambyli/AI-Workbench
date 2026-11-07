@@ -149,6 +149,12 @@ runs IN THE SERVICE with the SERVICE's settings: an env knob such as
 ``CLASSIFIER_LLM_BBOX_MARKS_MAX`` is the classifier container's (its ``.env``
 and ``make up classifier``), never this process's.
 
+A full queue does not end a run: while the service is at its
+``CLASSIFIER_QUEUE_LIMIT`` a submit answers 429 + ``Retry-After``, and every
+``POST /assess`` / ``POST /references`` here waits that long and resubmits
+(a line printed each time), for up to ten minutes per submit
+(``QUEUE_FULL_WAIT_S``).
+
 What it prints, per criterion: runs; for pairs with truth boxes the hit rate
 and false accepts (accepted, not a hit); for ``absent`` pairs the correct
 rate (nothing accepted) and wrong accepts; where wrong boxes landed; how often
@@ -166,8 +172,9 @@ Process flow position: none — a standalone operator tool, an HTTP client of
 the running service. It imports ``grounding_experiment`` for the truth
 format, the picks and the scoring (so both measure the same way),
 ``api.schemas`` only to check the locate criteria before anything is
-created, and ``common.documents.pdf_page_count`` only to check
-``--pdf-dir``'s PDFs are one page each.
+created, ``common.documents.pdf_page_count`` only to check
+``--pdf-dir``'s PDFs are one page each, and ``common.net.retry_after_s`` to
+read a 429's ``Retry-After``.
 """
 
 from __future__ import annotations
@@ -191,6 +198,7 @@ for _path in (str(_BIN.parent), str(_BIN)):
         sys.path.insert(0, _path)
 
 import grounding_experiment as ge  # noqa: E402
+from common.net import retry_after_s  # noqa: E402
 from common.vision import PageGeometry  # noqa: E402
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8000"
@@ -228,7 +236,19 @@ _BBOX_NULL = "you answered bbox: null"
 # ``--poll`` sleep, so a waiter never spins.
 JOB_WAIT_S = 30.0
 FAST_ANSWER_S = 1.0
-JOB_TERMINAL = ("completed", "failed")
+# Every phase a job ends in — the service's own terminal tuple (a job someone
+# cancels with POST /jobs/{id}/cancel ends "cancelled").
+JOB_TERMINAL = ("completed", "failed", "cancelled")
+# POST /assess and POST /references answer 429 + Retry-After while the
+# service's queue is at CLASSIFIER_QUEUE_LIMIT (API.md § Concurrency and
+# durability) — no job was created. Every submit here waits that long and
+# resubmits (``_post_admitted``), at most QUEUE_FULL_RETRY_MAX_S per sleep
+# and QUEUE_FULL_WAIT_S in all for one submit; past that the 429 is handled
+# like any refusal (the run stops on an /assess, the reference is failed).
+# Without it one 429 ended a long run (``_check`` exits on any status ≥ 300).
+QUEUE_FULL_WAIT_S = 600.0
+QUEUE_FULL_RETRY_DEFAULT_S = 10.0
+QUEUE_FULL_RETRY_MAX_S = 60.0
 
 
 # ---------------------------------------------------------------------------
@@ -689,8 +709,8 @@ def job_records(job: JobSpec, result: dict, truth: dict[str, ge.Truth],
 
 
 def failed_job_records(job: JobSpec, why: str, keys: dict[str, str], config: str) -> list[dict]:
-    """The records of a job that never produced a result (failed, timed
-    out): every criterion ``status: job_<why>``, nothing accepted."""
+    """The records of a job that never produced a result (failed, cancelled,
+    timed out): every criterion ``status: job_<why>``, nothing accepted."""
     return [{
         "image": job.page, "page_id": page_id(job.page), "criterion": label,
         "key": keys.get(label), "repeat": job.repeat, "config": config, "job_id": job.job_id,
@@ -725,7 +745,8 @@ def summarise(records: list[dict]) -> dict:
             "sent_as": dict(sorted(Counter(r.get("sent_as") or "image" for r in rows).items())),
             "errors": sum(1 for r in rows if r.get("status") != "ok"),
             # A unit's error kind, or the status itself for a job that never
-            # finished (job_failed, job_timed_out) or a missing entry.
+            # finished (job_failed, job_cancelled, job_timed_out) or a
+            # missing entry.
             "error_kinds": dict(Counter(r.get("error_kind") or r.get("status")
                                         for r in rows if r.get("status") != "ok")),
             "loop_ran_rate": round(ge._rate([r.get("loop_ran") for r in rows]), 3),
@@ -843,6 +864,26 @@ def _check(response, what: str) -> dict:
             detail = response.text[:300]
         raise SystemExit(f"{what}: HTTP {response.status_code}: {str(detail)[:400]}")
     return response.json() if response.content else {}
+
+
+def _post_admitted(client: Any, path: str, what: str, **kwargs: Any):
+    """``client.post(path, **kwargs)``, waiting out a full queue: on a 429
+    sleep its ``Retry-After`` (``common.net.retry_after_s`` — seconds or an
+    HTTP-date; QUEUE_FULL_RETRY_DEFAULT_S without one, at most
+    QUEUE_FULL_RETRY_MAX_S) and resubmit, printing a line each time, until
+    QUEUE_FULL_WAIT_S have passed. Returns the last response — a 429 still,
+    once the wait is spent; the caller treats it as any refusal."""
+    deadline = time.monotonic() + QUEUE_FULL_WAIT_S
+    while True:
+        response = client.post(path, **kwargs)
+        left = deadline - time.monotonic()
+        if response.status_code != 429 or left <= 0:
+            return response
+        delay = min(left, retry_after_s(response.headers.get("Retry-After"),
+                                        default=QUEUE_FULL_RETRY_DEFAULT_S,
+                                        cap=QUEUE_FULL_RETRY_MAX_S))
+        print(f"  {what}: the classifier queue is full (429) — resubmitting in {delay:.0f} s")
+        time.sleep(delay)
 
 
 def _validate_criteria(criteria: list[dict], references: bool) -> None:
@@ -999,8 +1040,8 @@ def create_references(client: Any, state: Run, images: dict[str, pathlib.Path],
             raw = raws[spec.page] = images[spec.page].read_bytes()
             if len(raws) > 4:           # keep a few pages in memory, not the set
                 raws.pop(next(iter(raws)))
-        response = client.post(
-            "/references",
+        response = _post_admitted(
+            client, "/references", f"POST /references ({page_id(spec.page)})",
             data=reference_form(spec, keys.get(spec.criterion), image_size(raw)),
             files={"file": (spec.page, raw, _content_type(spec.page))},
         )
@@ -1056,10 +1097,12 @@ def run_jobs(client: Any, state: Run, args: argparse.Namespace,
                 raw = source.read_bytes()
                 if job.sent_as == "pdf" and job.page not in truth_sizes:
                     truth_sizes[job.page] = image_size(images[job.page].read_bytes())
+                what = f"POST /assess ({page_id(job.page)} #{job.repeat})"
                 body = _check(
-                    client.post("/assess", data=job_form(job, keys, overlays, args.model),
-                                files={"file": (source.name, raw, _content_type(source.name))}),
-                    f"POST /assess ({page_id(job.page)} #{job.repeat})",
+                    _post_admitted(client, "/assess", what,
+                                   data=job_form(job, keys, overlays, args.model),
+                                   files={"file": (source.name, raw, _content_type(source.name))}),
+                    what,
                 )
                 job.job_id, job.submitted_at = body["job_id"], time.monotonic()
                 flying[waiters.submit(wait_for_job, client, job, args)] = job
@@ -1074,8 +1117,11 @@ def run_jobs(client: Any, state: Run, args: argparse.Namespace,
                 if phase == "completed":
                     records = job_records(job, body.get("result") or {}, truth, keys, config,
                                           truth_size=truth_sizes.get(job.page))
-                elif phase == "failed":
-                    records = failed_job_records(job, "failed", keys, config)
+                elif phase in ("failed", "cancelled"):
+                    # cancelled: someone stopped it (POST /jobs/{id}/cancel).
+                    # Terminal — a wait on it answers at once, so it is never
+                    # waited on again.
+                    records = failed_job_records(job, phase, keys, config)
                 elif seconds > args.timeout:
                     records = failed_job_records(job, "timed_out", keys, config)
                 else:

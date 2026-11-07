@@ -23,21 +23,28 @@ Every endpoint handler lives in ``api/``:
                        examples, each built by a "reference" job
     api.usage          GET /jobs/{job_id}/usage, GET /usage — the model
                        calls each job made (llm_calls), which outlive the job
-    common.jobs.router GET /jobs, GET /jobs/{id}, DELETE /jobs/{id}, and
-                       GET /jobs/{id}/progress (build_progress_router) — how
-                       far along a job is, and its checkpoint history
+    common.jobs.router GET /jobs, GET /jobs/{id}, POST /jobs/{id}/cancel,
+                       DELETE /jobs/{id}, and GET /jobs/{id}/progress
+                       (build_progress_router) — how far along a job is, and
+                       its checkpoint history
 
 /locate and /assess/compare were removed and answer 404 like any unknown
 route; /locate's job is ``score: false`` on a criterion of /assess.
 
 Overall request flow for /assess:
   1. HTTP request arrives → CorrelationIDMiddleware assigns [request_id].
-  2. ``api.assess.assess`` validates the request (per-type criterion
+  2. ``api.assess.assess`` first asks the queue for room
+     (``queue.check_room`` — with CLASSIFIER_QUEUE_LIMIT set, a full queue
+     is a 429 + Retry-After before the body is even read; see
+     ``queue_full`` below), then validates the request (per-type criterion
      options, caps, dependencies), resolves every document's bytes (base64,
      inline text, or an SSRF-checked URL fetch), detects each kind, counts
      the items (every page of every document) and refuses more than
      CLASSIFIER_MAX_ITEMS — all before anything is queued.
-  3. Job record created in Postgres via ``jobs_registry.register(..., "staging")``.
+  3. Job record created in Postgres via ``queue.admit(...)`` — the
+     registry's ``register(..., "staging", max_open=CLASSIFIER_QUEUE_LIMIT)``,
+     the authoritative check (one transaction, so the last slot goes to one
+     submit).
   4. Payload (every document's bytes + validated criteria) written to
      PAYLOAD_DIR/<job_id>.json, then the row is flipped to "pending" and idle
      workers are woken.
@@ -51,8 +58,10 @@ Overall request flow for /assess:
      CLASSIFIER_OCR_WORKERS across the process), aggregate each criterion
      (pages → documents), weigh per item and overall, and store the
      artifacts.
-  7. Caller polls GET /jobs/{job_id} until phase="completed" or "failed"
-     (``?wait=<s>`` holds each poll until then, up to JOB_WAIT_MAX_S) —
+  7. Caller polls GET /jobs/{job_id} until phase="completed", "failed" or
+     "cancelled" (``?wait=<s>`` holds each poll until then, up to
+     JOB_WAIT_MAX_S; POST /jobs/{job_id}/cancel stops a job within about
+     CANCEL_CHECK_INTERVAL_S — see jobs/queue.py § Cancel) —
      ``metadata.progress`` says how far along it is meanwhile (the job's
      ``common.jobs.progress`` gauge, flushed about once a second), and
      GET /jobs/{job_id}/progress pages through its checkpoint history.
@@ -81,7 +90,8 @@ so its cost stays readable at GET /jobs/{id}/usage — and only DELETE
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from prometheus_fastapi_instrumentator import Instrumentator
 
 from common.jobs.router import build_progress_router, build_router
@@ -91,16 +101,16 @@ from api import assess, introspection, references as references_api
 from api import usage as usage_api
 from config import JOB_WAIT_MAX_S, LOG_LEVEL
 from db import database
-from jobs.queue import jobs_registry, queue, sweeper
+from jobs.queue import QueueFullError, delete_job_side_data, jobs_registry, queue, sweeper
 from llm import client as llm_client
 from llm import models as llm_models
 from llm import usage as llm_usage
 from logger import logger
+from metrics import jobs_open, jobs_rejected
 from middleware import CorrelationIDMiddleware, RequestIDFilter
 from references.store import reconcile as reconcile_references
 from references.store import reference_registry
 from references.store import refresh_gauges as refresh_reference_gauges
-from regions.sweeper import delete_artifacts_for_job
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -152,7 +162,9 @@ async def lifespan(app: FastAPI):
       - ``queue.start()``: requeue jobs the previous process left in
         "processing" / "staging" (and put their progress snapshot back to
         ``queued``), sweep orphan payload files, and start
-        CLASSIFIER_MAX_CONCURRENT worker tasks.
+        CLASSIFIER_MAX_CONCURRENT worker tasks — logging
+        CLASSIFIER_QUEUE_LIMIT beside it (a WARNING when it is the smaller,
+        so some workers will stay idle).
       - ``sweeper.start()``: prune artifact directories and job rows past
         JOB_TTL_HOURS once immediately (a container that was down through a
         whole TTL window catches up on boot), then every
@@ -206,46 +218,66 @@ Instrumentator(
     excluded_handlers=["/metrics", "/health"],
 ).instrument(app).expose(app)
 
-# Mount /jobs, /jobs/{id}, DELETE /jobs/{id} — see common.jobs.router.
-# No cancel endpoint: the worker doesn't currently observe a cancel signal
-# mid-analysis. If we later teach the worker to poll for phase="cancelled"
-# and bail out, flip include_cancel=True here.
+
+# A submit refused at CLASSIFIER_QUEUE_LIMIT (jobs/queue.py: check_room, the
+# pre-check before the body is read, or admit, the authoritative one at
+# registration). 429 with FastAPI's own {"detail": …} shape — the same one
+# the edge's 503 uses — and Retry-After in whole seconds: the queue's
+# estimate from its recent job run times, 2–60 s (10 until a job has
+# finished). No job id exists, so there is nothing for a caller to cancel or
+# delete. Counted (classifier_jobs_rejected_total{type, reason="queue_full"};
+# jobs_total{status="pending"} never sees it) and logged once per refusal.
+# The edge's `listen classifier` retries connection failures only, so a 429
+# passes it untouched; LiteLLM's /v1/classifier pass-through copies the
+# upstream status, body and headers (all but hop-by-hop ones, as read in its
+# 1.93 source — API.md § Deploying this version has the `curl -i` that
+# confirms it on the running image).
+@app.exception_handler(QueueFullError)
+async def queue_full(request: Request, exc: QueueFullError) -> JSONResponse:
+    jobs_rejected.labels(type=exc.job_type, reason="queue_full").inc()
+    jobs_open.set(exc.open_jobs)
+    logger.info(
+        "queue: refused a %s submit (429) — %d jobs open, CLASSIFIER_QUEUE_LIMIT=%d, "
+        "Retry-After %d s", exc.job_type, exc.open_jobs, exc.limit, exc.retry_after_s,
+    )
+    return JSONResponse(
+        status_code=429,
+        content={"detail": exc.detail},
+        headers={"Retry-After": str(exc.retry_after_s)},
+    )
+
+# Mount GET /jobs, GET /jobs/{id}, POST /jobs/{id}/cancel and DELETE
+# /jobs/{id} — see common.jobs.router.
+#
+# The cancel route flips the row to "cancelled" at once (one transaction that
+# refuses a finished job: 409 already_<phase>). It is mounted because the
+# queue's WorkerPool is cancel-aware (CANCEL_CHECK_INTERVAL_S): a running
+# job's worker sees the phase within about a second and cancels its runner.
+# on_cancel finishes a job no worker owns yet (staging / pending) — see
+# jobs/queue.py § Cancel; a processing job is the pool's to finish.
 #
 # on_delete takes the job's artifact directory AND its model-usage rows with
 # the row, so DELETE /jobs/{id} can never leave layer files that nothing
 # points at. The usage rows are the one thing the TTL sweeper leaves behind
 # (they outlive the job on purpose), so this delete is the only way they go.
+# A DELETE on a RUNNING job stops it like a cancel (the pool sees the row
+# gone), and the pool runs the same cleanup again once the runner has
+# unwound, for what it wrote after this hook.
 #
 # terminal_phases turns on GET /jobs/{id}?wait= (the long-poll): the request
-# is held until the job is completed or failed — the only phases a job ends
-# in (the worker pool's set_result / set_error; staging, pending and
-# processing all move on) — or JOB_WAIT_MAX_S passes.
-
-
-async def _delete_job_side_data(job_id: str) -> None:
-    """``on_delete`` hook: the artifact directory, then the usage rows.
-
-    Each step is guarded on its own — the router swallows a hook failure as a
-    whole, and a filesystem error on the directory must not leave the usage
-    rows behind. Runs before the router's own row check, so a DELETE on a job
-    the sweeper already expired still removes its usage, then answers 404.
-    """
-    try:
-        delete_artifacts_for_job(job_id)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("delete: could not remove artifacts for job %s: %s", job_id, exc)
-    removed = await llm_usage.usage_store.delete_job(job_id)
-    if removed:
-        logger.info("delete: removed %d model usage row(s) for job %s", removed, job_id)
-
-
+# is held until the job is completed, failed or cancelled — the only phases a
+# job ends in (the worker pool's set_result / set_error, the cancel route;
+# staging, pending and processing all move on) — or JOB_WAIT_MAX_S passes.
+# A phase a job can END in that is missing here makes every wait on it run to
+# the cap.
 app.include_router(
     build_router(
         jobs_registry,
         include_delete=True,
-        include_cancel=False,
-        on_delete=_delete_job_side_data,
-        terminal_phases=("completed", "failed"),
+        include_cancel=True,
+        on_delete=delete_job_side_data,
+        on_cancel=queue.on_cancel_request,
+        terminal_phases=("completed", "failed", "cancelled"),
         max_wait_s=JOB_WAIT_MAX_S,
     )
 )

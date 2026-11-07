@@ -54,6 +54,7 @@ def build_router(
     include_cancel: bool = False,
     include_delete: bool = False,
     on_delete: Optional[Callable[[str], Any]] = None,
+    on_cancel: Optional[Callable[[str, str], Any]] = None,
     terminal_phases: Optional[Iterable[str]] = None,
     max_wait_s: float = 60.0,
     wait_check_interval_s: float = 0.5,
@@ -64,13 +65,21 @@ def build_router(
         ``GET  {prefix}``              — list active jobs (JobsListResponse).
         ``GET  {prefix}/{job_id}``     — one job's snapshot (JobBase), 404 if unknown;
                                          ``?wait=`` with ``terminal_phases`` (below).
-        ``POST {prefix}/{job_id}/cancel`` — only if ``include_cancel=True``.
+        ``POST {prefix}/{job_id}/cancel`` — only if ``include_cancel=True``:
+                                         200 ``{job_id, cancelled: true, was_phase}``,
+                                         404 for an unknown job, 409
+                                         ``already_<phase>`` for a finished one.
         ``DELETE {prefix}/{job_id}``   — only if ``include_delete=True``.
 
     ``include_cancel`` and ``include_delete`` default to ``False`` so
     consumers opt in. Interceptor-api mounts with ``include_cancel=True``
-    (operators can abort a stuck capture); classifier mounts with
-    ``include_delete=True`` (its jobs persist and need explicit cleanup).
+    (operators can abort a stuck capture; its in-memory registry signals the
+    capture thread). The classifier mounts both: ``include_delete=True`` (its
+    jobs persist and need explicit cleanup) and ``include_cancel=True`` — a
+    persistent registry's cancel only flips the phase, and what stops the
+    running job is its ``WorkerPool``, built with ``cancel_check_interval``.
+    Mount the cancel route over a persistent registry only with such a pool:
+    with a plain one the job runs on and its result overwrites the cancel.
 
     ``on_delete`` is called with the job id **before** the row is deleted, so
     a consumer can clean up whatever it hangs off a job — the classifier uses
@@ -79,6 +88,13 @@ def build_router(
     one, since it has no loop to run it in). Failures are logged and
     swallowed: side-cleanup that throws must not turn a successful delete
     into a 500, and the row is the thing the caller asked to be gone.
+
+    ``on_cancel`` is called with ``(job_id, was_phase)`` **after** a
+    successful cancel (never for a 404 or a 409), so a consumer can clean up
+    a job no worker owns — the classifier finishes a ``staging`` /
+    ``pending`` job there and leaves a ``processing`` one to its pool. Sync
+    or async and swallowed on failure exactly like ``on_delete``: the cancel
+    already happened, and the answer says so.
 
     ``terminal_phases`` turns on the long-poll: ``GET {prefix}/{job_id}``
     then takes ``wait`` (query, seconds, default 0, ``>= 0``; above
@@ -106,10 +122,13 @@ def build_router(
 
     if is_async:
         _register_async(
-            router, registry, include_cancel, include_delete, on_delete, long_poll
+            router, registry, include_cancel, include_delete, on_delete, long_poll,
+            on_cancel,
         )
     else:
-        _register_sync(router, registry, include_cancel, include_delete, on_delete)
+        _register_sync(
+            router, registry, include_cancel, include_delete, on_delete, on_cancel
+        )
 
     return router
 
@@ -145,14 +164,17 @@ def _long_poll_settings(
     return phases, float(max_wait_s), float(wait_check_interval_s)
 
 
-def _run_delete_hook_sync(on_delete: Optional[Callable[[str], Any]], job_id: str) -> None:
-    """Invoke a sync ``on_delete`` hook, never raising."""
-    if on_delete is None:
+def _run_hook_sync(
+    hook: Optional[Callable[..., Any]], name: str, job_id: str, *args: Any
+) -> None:
+    """Invoke a sync ``on_delete`` / ``on_cancel`` hook with ``(job_id,
+    *args)``, never raising."""
+    if hook is None:
         return
     try:
-        result = on_delete(job_id)
+        result = hook(job_id, *args)
     except Exception as exc:
-        _log.warning("on_delete hook failed for job %s: %s", job_id, exc)
+        _log.warning("%s hook failed for job %s: %s", name, job_id, exc)
         return
     if inspect.isawaitable(result):
         # A sync route has no event loop to await in. Close the coroutine so
@@ -160,24 +182,26 @@ def _run_delete_hook_sync(on_delete: Optional[Callable[[str], Any]], job_id: str
         # what the consumer has to fix.
         getattr(result, "close", lambda: None)()
         _log.warning(
-            "on_delete hook for job %s returned an awaitable, but this router "
+            "%s hook for job %s returned an awaitable, but this router "
             "was built for a SYNC registry — pass a sync callable",
+            name,
             job_id,
         )
 
 
-async def _run_delete_hook_async(
-    on_delete: Optional[Callable[[str], Any]], job_id: str
+async def _run_hook_async(
+    hook: Optional[Callable[..., Any]], name: str, job_id: str, *args: Any
 ) -> None:
-    """Invoke a sync-or-async ``on_delete`` hook, never raising."""
-    if on_delete is None:
+    """Invoke a sync-or-async ``on_delete`` / ``on_cancel`` hook with
+    ``(job_id, *args)``, never raising."""
+    if hook is None:
         return
     try:
-        result = on_delete(job_id)
+        result = hook(job_id, *args)
         if inspect.isawaitable(result):
             await result
     except Exception as exc:
-        _log.warning("on_delete hook failed for job %s: %s", job_id, exc)
+        _log.warning("%s hook failed for job %s: %s", name, job_id, exc)
 
 
 def _register_sync(
@@ -186,6 +210,7 @@ def _register_sync(
     include_cancel: bool,
     include_delete: bool,
     on_delete: Optional[Callable[[str], Any]] = None,
+    on_cancel: Optional[Callable[[str, str], Any]] = None,
 ) -> None:
     @router.get("", response_model=JobsListResponse)
     def list_jobs() -> JobsListResponse:
@@ -211,6 +236,7 @@ def _register_sync(
                     status_code=409,
                     detail=f"cannot cancel {job_id!r}: {phase_or_reason}",
                 )
+            _run_hook_sync(on_cancel, "on_cancel", job_id, phase_or_reason)
             return {
                 "job_id": job_id,
                 "cancelled": True,
@@ -220,7 +246,7 @@ def _register_sync(
     if include_delete:
         @router.delete("/{job_id}", status_code=204)
         def delete_job(job_id: str) -> None:
-            _run_delete_hook_sync(on_delete, job_id)
+            _run_hook_sync(on_delete, "on_delete", job_id)
             if not registry.delete(job_id):
                 raise HTTPException(
                     status_code=404, detail=f"no job {job_id!r}"
@@ -234,6 +260,7 @@ def _register_async(
     include_delete: bool,
     on_delete: Optional[Callable[[str], Any]] = None,
     long_poll: Optional[tuple[frozenset[str], float, float]] = None,
+    on_cancel: Optional[Callable[[str, str], Any]] = None,
 ) -> None:
     @router.get("", response_model=JobsListResponse)
     async def list_jobs() -> JobsListResponse:
@@ -262,6 +289,7 @@ def _register_async(
                     status_code=409,
                     detail=f"cannot cancel {job_id!r}: {phase_or_reason}",
                 )
+            await _run_hook_async(on_cancel, "on_cancel", job_id, phase_or_reason)
             return {
                 "job_id": job_id,
                 "cancelled": True,
@@ -271,7 +299,7 @@ def _register_async(
     if include_delete:
         @router.delete("/{job_id}", status_code=204)
         async def delete_job(job_id: str) -> None:
-            await _run_delete_hook_async(on_delete, job_id)
+            await _run_hook_async(on_delete, "on_delete", job_id)
             if not await registry.delete(job_id):
                 raise HTTPException(
                     status_code=404, detail=f"no job {job_id!r}"

@@ -19,6 +19,23 @@ atomically take the oldest one. ``reset_phase("processing", "pending")`` at
 startup recovers jobs a crashed process left half-done. See
 ``common.jobs.worker.WorkerPool`` for the reference consumer.
 
+Cancel-safe writes, in parity with ``PostgresRegistry``: ``cancel()`` reads
+and writes under ``BEGIN IMMEDIATE`` (the write lock), so it can never
+overwrite a job that finished in between, and ``set_phase`` / ``set_result``
+/ ``set_error`` take an optional ``from_phases`` guard (``AND phase IN (…)``)
+and say whether a row was written — one statement, so the check and the write
+are one atomic step. Unguarded, every write is the same statement it always
+was.
+
+Bounded admission, in parity with ``PostgresRegistry`` too:
+``register(..., max_open=N)`` counts the OPEN jobs (every phase but completed
+/ failed / cancelled) and inserts under one ``BEGIN IMMEDIATE``, so a submit
+that would make more than N open raises ``common.jobs.QueueFull`` with no row
+written, and two racing for the last slot cannot both get it (the write lock
+serialises them across connections and processes). ``count_open()`` is the
+same count outside the lock. Without ``max_open`` ``register`` is the single
+INSERT it always was.
+
 Optional dep: ``aiosqlite``. If a consumer imports this module without
 having aiosqlite installed, they get a clean ``ImportError`` at import time.
 """
@@ -35,13 +52,19 @@ from uuid import uuid4
 import aiosqlite
 from pydantic import BaseModel
 
+from .admission import QueueFull, check_max_open
 from .model import JobBase, JobsListResponse
 
 # Phases a retention sweep may delete. A job still pending or processing is
 # never expired, however old — see ``expired_job_ids``. Mirrored by
 # ``common.vision.store._TERMINAL_PHASES``, which decides the same thing for
-# a job snapshot rather than a SQL row.
+# a job snapshot rather than a SQL row. Every other phase is OPEN — what
+# ``count_open()`` and ``register(max_open=)`` count.
 _TERMINAL_PHASES = ("completed", "failed", "cancelled")
+
+_COUNT_OPEN_SQL = (
+    f"SELECT COUNT(*) FROM jobs WHERE phase NOT IN ({','.join('?' for _ in _TERMINAL_PHASES)})"
+)
 
 
 _SCHEMA = """
@@ -98,49 +121,125 @@ class SqliteRegistry:
         self,
         metadata: BaseModel | dict[str, Any],
         initial_phase: str = "pending",
+        *,
+        max_open: Optional[int] = None,
     ) -> str:
-        """Insert a new job in ``initial_phase`` and return its id."""
+        """Insert a new job in ``initial_phase`` and return its id.
+
+        ``max_open`` bounds the queue as in ``PostgresRegistry.register``:
+        with N, the job is admitted only while fewer than N jobs are open
+        (any phase but completed / failed / cancelled), else
+        ``common.jobs.QueueFull(open_jobs, N)`` and nothing is written. The
+        count and the INSERT run under one ``BEGIN IMMEDIATE`` (the write
+        lock). ``None`` (the default) is the plain INSERT; below 1 is a
+        ``ValueError``.
+        """
+        limit = check_max_open(max_open)
         job_id = uuid4().hex[:12]
         now = _now_iso()
         meta_json = _dump_metadata(metadata)
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                "INSERT INTO jobs (id, phase, created_at, updated_at, metadata) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (job_id, initial_phase, now, now, meta_json),
-            )
-            await db.commit()
+        insert = (
+            "INSERT INTO jobs (id, phase, created_at, updated_at, metadata) "
+            "VALUES (?, ?, ?, ?, ?)"
+        )
+        if limit is None:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(insert, (job_id, initial_phase, now, now, meta_json))
+                await db.commit()
+            return job_id
+        async with aiosqlite.connect(self.db_path, isolation_level=None) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                async with db.execute(_COUNT_OPEN_SQL, _TERMINAL_PHASES) as cur:
+                    open_jobs = int((await cur.fetchone())[0])
+                if open_jobs >= limit:
+                    raise QueueFull(open_jobs, limit)  # rolled back below
+                await db.execute(insert, (job_id, initial_phase, now, now, meta_json))
+                await db.execute("COMMIT")
+            except BaseException:
+                # QueueFull included. Same cleanup as claim_next: a failed
+                # ROLLBACK must never replace the original error.
+                try:
+                    await db.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
         return job_id
 
-    async def set_phase(self, job_id: str, phase: str) -> None:
+    async def count_open(self) -> int:
+        """How many jobs are open — in any phase but completed / failed /
+        cancelled. The count ``register``'s ``max_open`` checks, outside its
+        lock: a cheap pre-check, never the admission itself."""
         async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                "UPDATE jobs SET phase = ?, updated_at = ? WHERE id = ?",
-                (phase, _now_iso(), job_id),
-            )
-            await db.commit()
+            async with db.execute(_COUNT_OPEN_SQL, _TERMINAL_PHASES) as cur:
+                return int((await cur.fetchone())[0])
+
+    async def set_phase(
+        self,
+        job_id: str,
+        phase: str,
+        *,
+        from_phases: Optional[Iterable[str]] = None,
+    ) -> bool:
+        """Move the job to ``phase``. Returns whether a row was written.
+
+        ``from_phases`` guards the write: the row moves only while its phase
+        is one of them. Without it the write is unconditional, exactly as it
+        always was, and False only means the job does not exist.
+        """
+        return await self._update(
+            "UPDATE jobs SET phase = ?, updated_at = ? WHERE id = ?",
+            [phase, _now_iso(), job_id],
+            from_phases,
+        )
 
     async def set_result(
-        self, job_id: str, result: dict[str, Any], phase: str = "completed"
-    ) -> None:
+        self,
+        job_id: str,
+        result: dict[str, Any],
+        phase: str = "completed",
+        *,
+        from_phases: Optional[Iterable[str]] = None,
+    ) -> bool:
         """Store the result JSON and transition to ``phase`` (default
-        ``"completed"``). Result is stored as compact JSON."""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                "UPDATE jobs SET phase = ?, result = ?, updated_at = ? WHERE id = ?",
-                (phase, json.dumps(result), _now_iso(), job_id),
-            )
-            await db.commit()
+        ``"completed"``). Result is stored as compact JSON. Returns whether a
+        row was written; ``from_phases`` guards it as in ``set_phase``."""
+        return await self._update(
+            "UPDATE jobs SET phase = ?, result = ?, updated_at = ? WHERE id = ?",
+            [phase, json.dumps(result), _now_iso(), job_id],
+            from_phases,
+        )
 
     async def set_error(
-        self, job_id: str, error: str, phase: str = "failed"
-    ) -> None:
+        self,
+        job_id: str,
+        error: str,
+        phase: str = "failed",
+        *,
+        from_phases: Optional[Iterable[str]] = None,
+    ) -> bool:
+        """Store ``error`` and transition to ``phase`` (default ``"failed"``).
+        Returns whether a row was written; ``from_phases`` guards it as in
+        ``set_phase``."""
+        return await self._update(
+            "UPDATE jobs SET phase = ?, error = ?, updated_at = ? WHERE id = ?",
+            [phase, error, _now_iso(), job_id],
+            from_phases,
+        )
+
+    async def _update(
+        self, sql: str, params: list[Any], from_phases: Optional[Iterable[str]]
+    ) -> bool:
+        """Run one ``UPDATE … WHERE id = ?``, with ``AND phase IN (…)``
+        appended when guarded; whether it touched a row."""
+        guard = _guard_phases(from_phases)
+        if guard is not None:
+            sql += f" AND phase IN ({','.join('?' for _ in guard)})"
+            params = [*params, *guard]
         async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                "UPDATE jobs SET phase = ?, error = ?, updated_at = ? WHERE id = ?",
-                (phase, error, _now_iso(), job_id),
-            )
+            cur = await db.execute(sql, params)
             await db.commit()
+            return cur.rowcount > 0
 
     async def update_metadata(
         self, job_id: str, fields: dict[str, Any]
@@ -187,29 +286,47 @@ class SqliteRegistry:
     async def cancel(self, job_id: str) -> tuple[bool, str]:
         """Mark a job as cancelled by setting ``phase="cancelled"``.
 
-        The SQLite backend has no in-memory cancel event — a worker that
-        wants to cooperatively abort must poll ``get(job_id).phase`` and
-        bail out when it observes ``"cancelled"``. Wiring the worker to do
-        this is the consumer's job.
+        Atomic: the read and the write run under ``BEGIN IMMEDIATE`` on one
+        connection, so a job that completes or fails in between is refused
+        (``already_<phase>``), never overwritten.
 
-        Returns ``(ok, phase_or_reason)`` same as the in-memory backend.
+        The registry only flips the phase; it has no in-memory cancel event.
+        Stopping the work is the worker's side: a ``WorkerPool`` built with
+        ``cancel_check_interval`` re-reads the row while its handler runs and
+        cancels the handler when it sees ``"cancelled"`` (or the row gone).
+
+        Returns ``(ok, phase_or_reason)`` same as the in-memory backend:
+        ``(True, was_phase)``, ``(False, "not_found")`` or
+        ``(False, "already_<phase>")`` for a job already in a terminal phase.
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with aiosqlite.connect(self.db_path, isolation_level=None) as db:
             db.row_factory = aiosqlite.Row
-            async with db.execute(
-                "SELECT phase FROM jobs WHERE id = ?", (job_id,)
-            ) as cur:
-                row = await cur.fetchone()
-            if row is None:
-                return False, "not_found"
-            was_phase = row["phase"]
-            if was_phase in ("completed", "failed", "cancelled"):
-                return False, f"already_{was_phase}"
-            await db.execute(
-                "UPDATE jobs SET phase = ?, updated_at = ? WHERE id = ?",
-                ("cancelled", _now_iso(), job_id),
-            )
-            await db.commit()
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                async with db.execute(
+                    "SELECT phase FROM jobs WHERE id = ?", (job_id,)
+                ) as cur:
+                    row = await cur.fetchone()
+                if row is None:
+                    await db.execute("COMMIT")
+                    return False, "not_found"
+                was_phase = row["phase"]
+                if was_phase in _TERMINAL_PHASES:
+                    await db.execute("COMMIT")
+                    return False, f"already_{was_phase}"
+                await db.execute(
+                    "UPDATE jobs SET phase = ?, updated_at = ? WHERE id = ?",
+                    ("cancelled", _now_iso(), job_id),
+                )
+                await db.execute("COMMIT")
+            except BaseException:
+                # Same cleanup as claim_next: a failed ROLLBACK (the COMMIT may
+                # already have landed) must never replace the original error.
+                try:
+                    await db.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
         return True, was_phase
 
     async def delete(self, job_id: str) -> bool:
@@ -373,6 +490,21 @@ def _dump_metadata(metadata: BaseModel | dict[str, Any]) -> str:
     if isinstance(metadata, BaseModel):
         return metadata.model_dump_json()
     return json.dumps(metadata)
+
+
+def _guard_phases(from_phases: Optional[Iterable[str]]) -> Optional[list[str]]:
+    """A write's ``from_phases`` as a list, or None for an unguarded write.
+    Refuses a bare string (it would iterate into one-letter "phases") and an
+    empty guard (a write no row could ever pass) — the same checks as
+    ``common.jobs.postgres``'s."""
+    if from_phases is None:
+        return None
+    if isinstance(from_phases, str):
+        raise TypeError("from_phases takes a collection of phase names, not one string")
+    phases = list(from_phases)
+    if not phases:
+        raise ValueError("from_phases names no phase: the write could never land")
+    return phases
 
 
 def _load_json(raw: Optional[str]) -> Optional[dict[str, Any]]:

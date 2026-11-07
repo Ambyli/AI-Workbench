@@ -31,7 +31,9 @@ from typing import Dict, Mapping, Optional
 # Statuses an analysis can end in (ClassifierClient.assess). The first two
 # carry scores; the rest are failures, recorded so their rates can be read in
 # Trino, and never retried for the same prefix (the next user message is a
-# new prefix, so a new attempt).
+# new prefix, so a new attempt). `unavailable` is the classifier out of reach,
+# a 5xx, or a 429 (its queue at CLASSIFIER_QUEUE_LIMIT); `refused` is any
+# other 4xx, or an unknown / unavailable model.
 USABLE_STATUSES = ("ok", "incomplete")
 FAILED_STATUSES = ("unavailable", "refused", "failed", "timeout", "not_local")
 STATUSES = USABLE_STATUSES + FAILED_STATUSES

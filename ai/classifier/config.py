@@ -534,7 +534,8 @@ JOB_TTL_HOURS: int = int(os.environ.get("JOB_TTL_HOURS", "24"))
 # The jobs table in classifier-db is the queue (see common.jobs.postgres.claim_next,
 # FOR UPDATE SKIP LOCKED).
 # CLASSIFIER_MAX_CONCURRENT worker tasks each claim one pending job at a
-# time, so at most that many jobs run simultaneously.
+# time, so at most that many jobs run simultaneously; CLASSIFIER_QUEUE_LIMIT
+# (QUEUE_LIMIT, below) bounds how many may be waiting or running at all.
 #
 # Inside a job, the unit of work is (criterion, item): one criterion on one
 # page of one document (a `text` criterion with options.scope "document" is
@@ -566,7 +567,43 @@ JOB_TTL_HOURS: int = int(os.environ.get("JOB_TTL_HOURS", "24"))
 # WORKER_POLL_INTERVAL_S is the fallback wake-up for idle workers. New jobs
 # posted to this process wake a worker instantly; the poll only matters for
 # rows written by another process (or left behind by a crash).
+#
+# QUEUE_LIMIT (CLASSIFIER_QUEUE_LIMIT) is the end of the line: how many jobs
+# may be OPEN at once — every unfinished row, staging + pending + processing,
+# so waiting AND running. A submit (POST /assess, POST /references) that
+# would make more is refused with a 429 and a Retry-After before anything is
+# queued (jobs/queue.py: check_room, then admit — common.jobs'
+# register(max_open=), atomic across connections). Counting running jobs is
+# what makes the three cases work:
+#   = MAX_CONCURRENT   every accepted job starts at once; nothing waits.
+#   < MAX_CONCURRENT   at most QUEUE_LIMIT jobs ever run; the other workers
+#                      stay idle (startup logs a WARNING saying so).
+#   > MAX_CONCURRENT   QUEUE_LIMIT − MAX_CONCURRENT jobs may wait — the old
+#                      behaviour with an end to the line.
+# 0 (the default) = no limit: every submit is admitted, as before. A cancelled
+# or deleted job frees its slot at once (cancelled is terminal); rows a
+# restart requeues still count, so a container that comes back above the
+# limit answers 429 until they drain. Lower it only once every caller treats
+# a 429 as "wait Retry-After, resubmit".
+#
+# The Retry-After a refusal carries is an ESTIMATE, not a constant: jobs run
+# from ~2 s (route-policy's) to minutes (multi-page documents), and through
+# LiteLLM's /v1/classifier every retry is a metered request. It is the median
+# of the last QUEUE_RETRY_AFTER_HISTORY finished jobs' run time (claim to
+# result; completed and failed — a cancel's says nothing about how long a job
+# takes) × how many slots must free up (open − limit + 1: 1, unless a restart
+# or a lowered limit left more open) / the jobs that can run at once
+# (min(limit, MAX_CONCURRENT)), rounded up, clamped to
+# [QUEUE_RETRY_AFTER_MIN_S, QUEUE_RETRY_AFTER_MAX_S] — and
+# QUEUE_RETRY_AFTER_DEFAULT_S (the edge's own 503 value) until a job has
+# finished since startup. Constants, not env vars: nothing about a deployment
+# changes them.
 MAX_CONCURRENT: int = max(1, int(os.environ.get("CLASSIFIER_MAX_CONCURRENT", "4")))
+QUEUE_LIMIT: int = max(0, int(os.environ.get("CLASSIFIER_QUEUE_LIMIT", "0") or "0"))
+QUEUE_RETRY_AFTER_DEFAULT_S: int = 10
+QUEUE_RETRY_AFTER_MIN_S: int = 2
+QUEUE_RETRY_AFTER_MAX_S: int = 60
+QUEUE_RETRY_AFTER_HISTORY: int = 50
 MAX_UNITS_PER_JOB: int = max(
     1, int(os.environ.get("CLASSIFIER_MAX_UNITS_PER_JOB", "6"))
 )
@@ -599,6 +636,16 @@ PROGRESS_FLUSH_INTERVAL_S: float = max(
 # limit breaks every caller off the LAN.
 JOB_WAIT_MAX_S: float = 60.0
 
+# How often a worker re-reads its running job's row to see whether it was
+# cancelled (POST /jobs/{id}/cancel) or deleted (DELETE /jobs/{id}) —
+# common.jobs.worker.WorkerPool's cancel_check_interval, wired in
+# jobs/queue.py. A cancelled job's runner is cancelled within about this long,
+# which frees its worker, its model and OCR slots, and drops its HTTP request
+# to the model server. The cost is one primary-key read per second per RUNNING
+# job — at most CLASSIFIER_MAX_CONCURRENT at once — inside DB_POOL_HEADROOM
+# below. A constant, not an env var: nothing about a deployment changes it.
+CANCEL_CHECK_INTERVAL_S: float = 1.0
+
 # The one asyncpg pool's ceiling is computed in db.py (``pool_max()``):
 # MAX_CONCURRENT + the model registry's Σ max_concurrent + DB_POOL_HEADROOM —
 # every worker, every model slot (each call writes one llm_calls row), plus
@@ -606,7 +653,8 @@ JOB_WAIT_MAX_S: float = 60.0
 #
 # The headroom is the connections that are neither a worker nor a model slot:
 # the HTTP routes (GET /jobs polls, /references, /usage), each running job's
-# progress flush, and the artifact sweeper. A round number, not a measured
+# progress flush and cancel check (CANCEL_CHECK_INTERVAL_S — a short read,
+# once a second), and the artifact sweeper. A round number, not a measured
 # one: a pool that is too small never errors (a caller waits for a
 # connection), and the whole ceiling sits far under Postgres's default
 # max_connections of 100 — classifier-db's only client is this service.

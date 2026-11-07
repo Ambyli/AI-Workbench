@@ -3,7 +3,8 @@ fake document classifier (rp_helpers.FakeClassifier, an httpx.MockTransport).
 
 * every status: ok, incomplete, failed (job failed, nothing scored, job
   cancelled on the classifier),
-  refused (4xx, unknown / unavailable model), unavailable (down, 5xx),
+  refused (4xx, unknown / unavailable model), unavailable (down, 5xx, a
+  429 from a full classifier queue — never resubmitted, nothing deleted),
   timeout, not_local;
 * the locality guard: an authenticated entry, a host resolving to a public
   address (or to a mix), and a host that does not resolve are refused
@@ -98,6 +99,27 @@ def test_unavailable_when_down_or_5xx():
     fake = FakeClassifier(assess_status=503)
     out = assess(fake)
     assert out.status == "unavailable" and out.error == "POST /assess answered 503"
+
+
+def test_a_full_classifier_queue_is_unavailable_not_refused_and_not_retried():
+    """A 429 (the classifier at its CLASSIFIER_QUEUE_LIMIT) is the service
+    busy, not this request wrong: ``unavailable`` with the Retry-After in the
+    error, one submit only (the next user message is the retry), and no
+    cancel or DELETE — no job was created."""
+    detail = ("the classifier queue is full: 32 jobs waiting or running, the "
+              "CLASSIFIER_QUEUE_LIMIT cap (32). Retry after 14 s.")
+    fake = FakeClassifier(assess_status=429, assess_detail=detail, assess_headers={"Retry-After": "14"})
+    out = assess(fake)
+    assert out.status == "unavailable" and out.job_id is None and out.scores == {}
+    assert "429" in out.error and "Retry-After: 14" in out.error and "CLASSIFIER_QUEUE_LIMIT" in out.error
+    assert len(out.error) <= 300
+    assert len(fake.submitted) == 1
+    assert fake.requests.count(("POST", "/assess")) == 1
+    assert fake.cancelled == [] and fake.deleted == []
+    assert not any(method == "DELETE" or path.startswith("/jobs") for method, path in fake.requests)
+    # A 429 without the header still says so.
+    out = assess(FakeClassifier(assess_status=429, assess_detail=detail))
+    assert out.status == "unavailable" and "Retry-After: not given" in out.error
 
 
 def test_timeout_cancels_then_deletes():

@@ -20,7 +20,14 @@ remote failure; every one becomes a ``status``:
    unavailable model is ``refused``.
 2. ``POST /assess`` -- JSON: the transcript as ONE ``text`` document, one
    ``llm`` criterion per question with ``options: {hint: presence, ocr:
-   never}``, and ``model``. ``202 {job_id}``.
+   never}``, and ``model``. ``202 {job_id}``. A ``429`` is the classifier's
+   queue at its ``CLASSIFIER_QUEUE_LIMIT`` -- the service is busy, not this
+   request wrong -- so it is ``unavailable`` (its ``Retry-After`` in the
+   error), not ``refused``; it is not retried inside the cycle (the next
+   user message is a new attempt), and no job exists to cancel or delete.
+   When document jobs fill the queue, a route analysis therefore fails in
+   milliseconds instead of waiting in the FIFO until ``timeout_s``; routing
+   falls back exactly as it does for any other failure.
 3. ``GET /jobs/{job_id}`` every ``poll_s`` until ``completed`` / ``failed``
    / ``cancelled`` (someone else cancelled it: ``failed``), or until
    ``timeout_s`` (counted from the start of the cycle) has passed.
@@ -44,9 +51,10 @@ remote failure; every one becomes a ``status``:
 
 Statuses: ``ok`` (every criterion scored), ``incomplete`` (some did -- the
 partial scores are returned), ``failed`` (the job failed, its result is
-unreadable, or no criterion was scored), ``refused`` (a 4xx from ``/assess``,
-or an unknown / unavailable model), ``unavailable`` (the classifier could not
-be reached, or answered 5xx), ``timeout``, ``not_local``.
+unreadable, or no criterion was scored), ``refused`` (a 4xx other than 429
+from ``/assess``, or an unknown / unavailable model), ``unavailable`` (the
+classifier could not be reached, answered 5xx, or answered 429 -- its queue
+is full), ``timeout``, ``not_local``.
 
 **The submitted text never leaves this object** other than in the
 ``/assess`` body: it is not logged, and an ``error`` that would quote it
@@ -318,6 +326,13 @@ class ClassifierClient:
         except httpx.HTTPError as exc:
             # The type only: this request carries the transcript (analyses.error stores the reason).
             raise _Stop("unavailable", f"POST /assess: {type(exc).__name__}") from None
+        if r.status_code == 429:
+            # The classifier's queue is full (CLASSIFIER_QUEUE_LIMIT): busy,
+            # not a refusal of this request. No job id, so nothing to clean
+            # up, and no retry here -- the next user message is a new attempt.
+            retry_after = (r.headers.get("Retry-After") or "").strip()[:40] or "not given"
+            raise _Stop("unavailable", f"POST /assess answered 429, the classifier's queue is full "
+                                       f"(Retry-After: {retry_after}): {self._detail(r)}")
         if 400 <= r.status_code < 500:
             raise _Stop("refused", f"POST /assess answered {r.status_code}: {self._detail(r)}")
         if r.status_code not in (200, 202):

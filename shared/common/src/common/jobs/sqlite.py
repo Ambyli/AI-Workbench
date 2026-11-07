@@ -27,6 +27,15 @@ and say whether a row was written — one statement, so the check and the write
 are one atomic step. Unguarded, every write is the same statement it always
 was.
 
+Bounded admission, in parity with ``PostgresRegistry`` too:
+``register(..., max_open=N)`` counts the OPEN jobs (every phase but completed
+/ failed / cancelled) and inserts under one ``BEGIN IMMEDIATE``, so a submit
+that would make more than N open raises ``common.jobs.QueueFull`` with no row
+written, and two racing for the last slot cannot both get it (the write lock
+serialises them across connections and processes). ``count_open()`` is the
+same count outside the lock. Without ``max_open`` ``register`` is the single
+INSERT it always was.
+
 Optional dep: ``aiosqlite``. If a consumer imports this module without
 having aiosqlite installed, they get a clean ``ImportError`` at import time.
 """
@@ -43,13 +52,19 @@ from uuid import uuid4
 import aiosqlite
 from pydantic import BaseModel
 
+from .admission import QueueFull, check_max_open
 from .model import JobBase, JobsListResponse
 
 # Phases a retention sweep may delete. A job still pending or processing is
 # never expired, however old — see ``expired_job_ids``. Mirrored by
 # ``common.vision.store._TERMINAL_PHASES``, which decides the same thing for
-# a job snapshot rather than a SQL row.
+# a job snapshot rather than a SQL row. Every other phase is OPEN — what
+# ``count_open()`` and ``register(max_open=)`` count.
 _TERMINAL_PHASES = ("completed", "failed", "cancelled")
+
+_COUNT_OPEN_SQL = (
+    f"SELECT COUNT(*) FROM jobs WHERE phase NOT IN ({','.join('?' for _ in _TERMINAL_PHASES)})"
+)
 
 
 _SCHEMA = """
@@ -106,19 +121,58 @@ class SqliteRegistry:
         self,
         metadata: BaseModel | dict[str, Any],
         initial_phase: str = "pending",
+        *,
+        max_open: Optional[int] = None,
     ) -> str:
-        """Insert a new job in ``initial_phase`` and return its id."""
+        """Insert a new job in ``initial_phase`` and return its id.
+
+        ``max_open`` bounds the queue as in ``PostgresRegistry.register``:
+        with N, the job is admitted only while fewer than N jobs are open
+        (any phase but completed / failed / cancelled), else
+        ``common.jobs.QueueFull(open_jobs, N)`` and nothing is written. The
+        count and the INSERT run under one ``BEGIN IMMEDIATE`` (the write
+        lock). ``None`` (the default) is the plain INSERT; below 1 is a
+        ``ValueError``.
+        """
+        limit = check_max_open(max_open)
         job_id = uuid4().hex[:12]
         now = _now_iso()
         meta_json = _dump_metadata(metadata)
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                "INSERT INTO jobs (id, phase, created_at, updated_at, metadata) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (job_id, initial_phase, now, now, meta_json),
-            )
-            await db.commit()
+        insert = (
+            "INSERT INTO jobs (id, phase, created_at, updated_at, metadata) "
+            "VALUES (?, ?, ?, ?, ?)"
+        )
+        if limit is None:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(insert, (job_id, initial_phase, now, now, meta_json))
+                await db.commit()
+            return job_id
+        async with aiosqlite.connect(self.db_path, isolation_level=None) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                async with db.execute(_COUNT_OPEN_SQL, _TERMINAL_PHASES) as cur:
+                    open_jobs = int((await cur.fetchone())[0])
+                if open_jobs >= limit:
+                    raise QueueFull(open_jobs, limit)  # rolled back below
+                await db.execute(insert, (job_id, initial_phase, now, now, meta_json))
+                await db.execute("COMMIT")
+            except BaseException:
+                # QueueFull included. Same cleanup as claim_next: a failed
+                # ROLLBACK must never replace the original error.
+                try:
+                    await db.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
         return job_id
+
+    async def count_open(self) -> int:
+        """How many jobs are open — in any phase but completed / failed /
+        cancelled. The count ``register``'s ``max_open`` checks, outside its
+        lock: a cheap pre-check, never the admission itself."""
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(_COUNT_OPEN_SQL, _TERMINAL_PHASES) as cur:
+                return int((await cur.fetchone())[0])
 
     async def set_phase(
         self,

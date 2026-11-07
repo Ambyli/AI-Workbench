@@ -234,7 +234,9 @@ class FakeClassifier:
       ``cancelled``), 409 ``already_<phase>`` once it is terminal, 404 for an
       unknown job;
     * ``assess_status`` / ``assess_detail``: answer POST /assess with this
-      instead of 202; ``down``: every request is a connection error;
+      instead of 202, plus ``assess_headers`` (e.g. a 429's ``Retry-After``,
+      as the classifier sends at its CLASSIFIER_QUEUE_LIMIT); ``down``:
+      every request is a connection error;
       ``delay_s``: every answer waits this long; ``delete_status``: what
       DELETE answers for a job it knows (204).
 
@@ -256,6 +258,7 @@ class FakeClassifier:
         self.never_finish: bool = kw.pop("never_finish", False)
         self.assess_status: int = kw.pop("assess_status", 202)
         self.assess_detail: Any = kw.pop("assess_detail", None)
+        self.assess_headers: Dict[str, str] = kw.pop("assess_headers", {})
         self.delete_status: int = kw.pop("delete_status", 204)
         self.down: bool = kw.pop("down", False)
         self.delay_s: float = kw.pop("delay_s", 0.0)
@@ -305,7 +308,8 @@ class FakeClassifier:
             with self._lock:
                 self.submitted.append(body)
             if self.assess_status != 202:
-                return self._json(self.assess_status, {"detail": self.assess_detail or "refused"})
+                return httpx.Response(self.assess_status, headers=self.assess_headers,
+                                      json={"detail": self.assess_detail or "refused"})
             with self._lock:
                 job_id = f"job{len(self.submitted):04d}"
                 self.jobs[job_id] = {"body": body, "polls": 0}

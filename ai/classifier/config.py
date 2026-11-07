@@ -534,7 +534,8 @@ JOB_TTL_HOURS: int = int(os.environ.get("JOB_TTL_HOURS", "24"))
 # The jobs table in classifier-db is the queue (see common.jobs.postgres.claim_next,
 # FOR UPDATE SKIP LOCKED).
 # CLASSIFIER_MAX_CONCURRENT worker tasks each claim one pending job at a
-# time, so at most that many jobs run simultaneously.
+# time, so at most that many jobs run simultaneously; CLASSIFIER_QUEUE_LIMIT
+# (QUEUE_LIMIT, below) bounds how many may be waiting or running at all.
 #
 # Inside a job, the unit of work is (criterion, item): one criterion on one
 # page of one document (a `text` criterion with options.scope "document" is
@@ -566,7 +567,43 @@ JOB_TTL_HOURS: int = int(os.environ.get("JOB_TTL_HOURS", "24"))
 # WORKER_POLL_INTERVAL_S is the fallback wake-up for idle workers. New jobs
 # posted to this process wake a worker instantly; the poll only matters for
 # rows written by another process (or left behind by a crash).
+#
+# QUEUE_LIMIT (CLASSIFIER_QUEUE_LIMIT) is the end of the line: how many jobs
+# may be OPEN at once — every unfinished row, staging + pending + processing,
+# so waiting AND running. A submit (POST /assess, POST /references) that
+# would make more is refused with a 429 and a Retry-After before anything is
+# queued (jobs/queue.py: check_room, then admit — common.jobs'
+# register(max_open=), atomic across connections). Counting running jobs is
+# what makes the three cases work:
+#   = MAX_CONCURRENT   every accepted job starts at once; nothing waits.
+#   < MAX_CONCURRENT   at most QUEUE_LIMIT jobs ever run; the other workers
+#                      stay idle (startup logs a WARNING saying so).
+#   > MAX_CONCURRENT   QUEUE_LIMIT − MAX_CONCURRENT jobs may wait — the old
+#                      behaviour with an end to the line.
+# 0 (the default) = no limit: every submit is admitted, as before. A cancelled
+# or deleted job frees its slot at once (cancelled is terminal); rows a
+# restart requeues still count, so a container that comes back above the
+# limit answers 429 until they drain. Lower it only once every caller treats
+# a 429 as "wait Retry-After, resubmit".
+#
+# The Retry-After a refusal carries is an ESTIMATE, not a constant: jobs run
+# from ~2 s (route-policy's) to minutes (multi-page documents), and through
+# LiteLLM's /v1/classifier every retry is a metered request. It is the median
+# of the last QUEUE_RETRY_AFTER_HISTORY finished jobs' run time (claim to
+# result; completed and failed — a cancel's says nothing about how long a job
+# takes) × how many slots must free up (open − limit + 1: 1, unless a restart
+# or a lowered limit left more open) / the jobs that can run at once
+# (min(limit, MAX_CONCURRENT)), rounded up, clamped to
+# [QUEUE_RETRY_AFTER_MIN_S, QUEUE_RETRY_AFTER_MAX_S] — and
+# QUEUE_RETRY_AFTER_DEFAULT_S (the edge's own 503 value) until a job has
+# finished since startup. Constants, not env vars: nothing about a deployment
+# changes them.
 MAX_CONCURRENT: int = max(1, int(os.environ.get("CLASSIFIER_MAX_CONCURRENT", "4")))
+QUEUE_LIMIT: int = max(0, int(os.environ.get("CLASSIFIER_QUEUE_LIMIT", "0") or "0"))
+QUEUE_RETRY_AFTER_DEFAULT_S: int = 10
+QUEUE_RETRY_AFTER_MIN_S: int = 2
+QUEUE_RETRY_AFTER_MAX_S: int = 60
+QUEUE_RETRY_AFTER_HISTORY: int = 50
 MAX_UNITS_PER_JOB: int = max(
     1, int(os.environ.get("CLASSIFIER_MAX_UNITS_PER_JOB", "6"))
 )

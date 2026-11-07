@@ -22,6 +22,10 @@ guarantee a service needs before it sends conversation text to another
 box-internal service (``common.signals``' client checks the sidecar's host
 with it), so a misconfigured URL can never carry that text off the box.
 
+And the other side of a refusal: :func:`retry_after_s` reads a 429's / 503's
+``Retry-After`` (seconds or an HTTP-date) into a bounded sleep, for a client
+that waits out a busy service and resubmits.
+
 Public API:
     validate_url(url, blocked_networks=None)  → None, or raises BlockedURLError
     fetch_url(url, *, timeout, ...)           → bytes, or raises BlockedURLError
@@ -34,6 +38,8 @@ Public API:
                                                 resolved (cache an unresolved one briefly)
     resolves_locally(host, resolver=None)     → bool
     resolve_host(host)                        → [address, ...] (getaddrinfo)
+    retry_after_s(value, *, default, cap)     → seconds to wait, from a
+                                                Retry-After header (0 ≤ s ≤ cap)
     BlockedURLError                           — ValueError subclass
     FetchError                                — ValueError subclass, ``.reason``
     DEFAULT_BLOCKED_NETWORKS                  — the RFC1918 + loopback list
@@ -41,6 +47,7 @@ Public API:
 
 from .fetch import FetchError, fetch_url
 from .locality import LocalityVerdict, check_locality, locality_problem, resolve_host, resolves_locally
+from .retry import retry_after_s
 from .ssrf import (
     DEFAULT_BLOCKED_NETWORKS,
     BlockedURLError,
@@ -57,5 +64,6 @@ __all__ = [
     "locality_problem",
     "resolve_host",
     "resolves_locally",
+    "retry_after_s",
     "validate_url",
 ]

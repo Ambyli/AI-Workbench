@@ -110,6 +110,11 @@ class InMemoryRegistry:
             registry itself doesn't enforce it; the consumer's port pool /
             semaphore does. Populates ``max_concurrent`` and ``available``
             fields on the ``GET /jobs`` response.
+
+    No bounded admission: unlike the persistent registries, ``register``
+    takes no ``max_open`` and there is no ``count_open`` — it is not a work
+    queue (nothing claims from it; a job lives inside its caller's ``with``
+    block), so whatever bounds the work bounds the jobs.
     """
 
     def __init__(self, *, max_concurrent: Optional[int] = None) -> None:

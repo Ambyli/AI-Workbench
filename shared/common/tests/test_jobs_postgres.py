@@ -387,6 +387,139 @@ async def test_reset_phase_and_count_by_phase(registry: PostgresRegistry) -> Non
     assert await registry.count_by_phase() == {"pending": 3}
 
 
+# ── Bounded admission (register(max_open=), count_open) ───────────────────
+async def test_max_open_admits_up_to_the_limit_and_refuses_with_no_row(
+    registry: PostgresRegistry,
+) -> None:
+    from common.jobs import QueueFull
+
+    ids = [await registry.register({"i": i}, "pending", max_open=3) for i in range(3)]
+    assert len(set(ids)) == 3
+    with pytest.raises(QueueFull) as info:
+        await registry.register({"i": 3}, "pending", max_open=3)
+    assert (info.value.open_jobs, info.value.limit) == (3, 3)
+    assert "3 job(s) waiting or running" in str(info.value)
+    # Nothing was written for the refusal.
+    assert await registry.count_by_phase() == {"pending": 3}
+    assert (await registry.list_all(limit=10)).active_count == 3
+
+
+async def test_terminal_rows_do_not_count_staging_and_custom_phases_do(
+    registry: PostgresRegistry,
+) -> None:
+    from common.jobs import QueueFull
+
+    for phase in ("completed", "failed", "cancelled"):
+        await registry.register({"done": phase}, phase)
+    assert await registry.count_open() == 0
+    # The classifier's "staging", a running job, an interceptor-style phase.
+    for phase in ("staging", "processing", "capturing"):
+        await registry.register({"open": phase}, phase)
+    assert await registry.count_open() == 3
+    with pytest.raises(QueueFull) as info:
+        await registry.register({}, "staging", max_open=3)
+    assert info.value.open_jobs == 3
+    # One finishing frees its slot at once — a cancel included.
+    staged = [j for j in (await registry.list_all(limit=20)).jobs if j.phase == "staging"][0]
+    assert await registry.cancel(staged.job_id) == (True, "staging")
+    assert await registry.count_open() == 2
+    await registry.register({}, "staging", max_open=3)
+    assert await registry.count_open() == 3
+
+
+async def test_open_rows_already_over_the_limit_refuse_until_they_drain(
+    registry: PostgresRegistry,
+) -> None:
+    """As after a restart (rows requeued) or a lowered limit: QueueFull
+    reports the real count, and admission resumes only below the limit."""
+    from common.jobs import QueueFull
+
+    ids = [await registry.register({"i": i}, "pending") for i in range(5)]
+    with pytest.raises(QueueFull) as info:
+        await registry.register({}, "pending", max_open=2)
+    assert (info.value.open_jobs, info.value.limit) == (5, 2)
+    for job_id in ids[:3]:
+        await registry.set_result(job_id, {"ok": True})
+    with pytest.raises(QueueFull):
+        await registry.register({}, "pending", max_open=2)  # 2 open: still full
+    await registry.delete(ids[3])  # a DELETE frees a slot too
+    await registry.register({}, "pending", max_open=2)
+    assert await registry.count_open() == 2
+
+
+async def test_concurrent_registers_on_separate_connections_never_overshoot(
+    registry: PostgresRegistry,
+) -> None:
+    """The race the advisory lock exists for: 20 submits on 20 connections
+    (20 registries, a pool of one each — as 20 processes would be) racing
+    for 5 slots. A count-then-insert without the lock lets several see room."""
+    import asyncio
+
+    from common.jobs import QueueFull
+
+    racers = [PostgresRegistry(_DSN, min_size=1, max_size=1) for _ in range(20)]
+    for r in racers:
+        await r.init()
+    try:
+        outcomes = await asyncio.gather(
+            *(r.register({"racer": i}, "staging", max_open=5) for i, r in enumerate(racers)),
+            return_exceptions=True,
+        )
+    finally:
+        for r in racers:
+            await r.close()
+    admitted = [o for o in outcomes if isinstance(o, str)]
+    refused = [o for o in outcomes if isinstance(o, QueueFull)]
+    assert len(admitted) == 5 and len(refused) == 15, outcomes
+    assert all(e.open_jobs == 5 and e.limit == 5 for e in refused)
+    assert await registry.count_open() == 5
+    assert await registry.count_by_phase() == {"staging": 5}
+
+
+async def test_max_open_none_is_unbounded_and_below_one_is_refused(
+    registry: PostgresRegistry,
+) -> None:
+    for i in range(12):
+        await registry.register({"i": i}, "pending", max_open=None)
+    assert await registry.count_open() == 12
+    for bad in (0, -1):
+        with pytest.raises(ValueError, match="None means no limit"):
+            await registry.register({}, "pending", max_open=bad)
+    for bad in (True, 2.5, "3"):
+        with pytest.raises(TypeError):
+            await registry.register({}, "pending", max_open=bad)
+    assert await registry.count_open() == 12  # nothing written by a refusal
+
+
+async def test_count_open_counts_every_unfinished_phase(registry: PostgresRegistry) -> None:
+    assert await registry.count_open() == 0
+    a = await registry.register({}, "staging")
+    b = await registry.register({})
+    await registry.register({})
+    await registry.claim_next()
+    assert await registry.count_open() == 3
+    await registry.set_error(a, "boom")
+    assert await registry.count_open() == 2
+    await registry.set_phase(b, "completed")
+    assert await registry.count_open() == 1
+
+
+async def test_max_open_works_on_an_external_pool(registry: PostgresRegistry) -> None:
+    """The classifier hands the registry its own pool (``pool=``): the
+    admission's transaction runs on a connection from it like any write."""
+    from common.jobs import QueueFull
+
+    pool = await asyncpg.create_pool(_DSN, min_size=1, max_size=2)
+    try:
+        shared = PostgresRegistry(pool=pool)
+        await shared.register({}, "staging", max_open=1)
+        with pytest.raises(QueueFull):
+            await shared.register({}, "staging", max_open=1)
+        assert await shared.count_open() == 1
+    finally:
+        await pool.close()
+
+
 # ── Retention ─────────────────────────────────────────────────────────────
 async def _backdate(job_id: str, seconds: float) -> None:
     """Move a job's created_at ``seconds`` into the past."""

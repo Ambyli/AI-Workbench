@@ -12,7 +12,12 @@ Division of labour:
   this module                        — ClassifierQueue: enqueue, handle_job, lifecycle
 
 Flow:
-  1. ``api.assess`` registers a row (phase "staging") and
+  0. With CLASSIFIER_QUEUE_LIMIT set, ``api.assess`` / ``api.references``
+     first ask ``queue.check_room()`` — before the body is read, so a full
+     queue costs no URL fetch — and register through ``queue.admit()``; both
+     raise ``QueueFullError``, which ``main`` answers 429 + Retry-After. See
+     Queue limit below.
+  1. ``api.assess`` registers a row (phase "staging", ``admit``) and
      calls ``queue.enqueue()``, which writes the payload, flips the row to
      "pending" (only from "staging" — a cancel or a delete that landed
      mid-submit is never undone), and wakes a worker.
@@ -56,6 +61,28 @@ deleted job — the usage rows and artifacts a runner wrote after the DELETE
 hook ran. ``handle_job`` itself never decides it: to the handler a shutdown
 and a cancel are the same ``CancelledError``.
 
+Queue limit (CLASSIFIER_QUEUE_LIMIT, ``config.QUEUE_LIMIT``; 0 = none). The
+limit counts OPEN jobs — every row not completed / failed / cancelled, so
+staging, pending and processing alike — which is what lets it narrow
+concurrency as well as cap the wait: at the limit of MAX_CONCURRENT nothing
+waits, below it some workers stay idle, above it ``limit − MAX_CONCURRENT``
+jobs may wait. Two checks, both raising ``QueueFullError`` (never an
+HTTPException — ``jobs/`` does not import FastAPI; ``main``'s exception
+handler answers 429, counts and logs it):
+  * ``check_room`` — the cheap pre-check, the first line of each submit
+    handler: one ``count_open()``, no lock. It spares a full queue the body,
+    the URL fetches and the SVG image fetches; it cannot decide a race.
+  * ``admit`` — the authoritative one, in place of ``registry.register``:
+    ``register(..., "staging", max_open=limit)`` counts and inserts in one
+    transaction under an advisory lock, so the last slot goes to exactly one
+    submit. A staging row counts from the moment it exists, so the slot is
+    taken at registration, before the payload is written.
+A cancelled or deleted job frees its slot at once; rows a restart requeues
+keep theirs, so a container that comes back above the limit refuses until
+they drain. The refusal's ``Retry-After`` is ``retry_after_s`` — an estimate
+from the run times of the last ``QUEUE_RETRY_AFTER_HISTORY`` finished jobs
+(``_on_finish`` keeps them), see ``retry_after_estimate``.
+
 Progress (``common.jobs.progress``). ``enqueue`` writes the ``queued``
 snapshot (0%, attempt 0) while the row is still "staging", so no worker can
 have claimed it yet and a running gauge can never be overwritten by it.
@@ -80,8 +107,14 @@ modules can reach them without importing the app they are mounted on.
 """
 
 import asyncio
-from typing import Any, Optional
+import math
+import statistics
+from collections import deque
+from typing import Any, Iterable, Optional
 
+from pydantic import BaseModel
+
+from common.jobs import QueueFull
 from common.jobs.model import JobBase
 from common.jobs.payloads import FilePayloadStore
 from common.jobs.postgres import PostgresRegistry
@@ -94,13 +127,25 @@ from config import (
     MAX_CONCURRENT,
     PAYLOAD_DIR,
     PROGRESS_FLUSH_INTERVAL_S,
+    QUEUE_LIMIT,
+    QUEUE_RETRY_AFTER_DEFAULT_S,
+    QUEUE_RETRY_AFTER_HISTORY,
+    QUEUE_RETRY_AFTER_MAX_S,
+    QUEUE_RETRY_AFTER_MIN_S,
     WORKER_POLL_INTERVAL_S,
 )
 from db import database
 from jobs.runners import run_assess, run_reference
 from llm import usage as llm_usage
 from logger import logger
-from metrics import job_duration, job_queue_depth, jobs_in_flight, jobs_total
+from metrics import (
+    job_duration,
+    job_queue_depth,
+    job_queue_limit,
+    jobs_in_flight,
+    jobs_open,
+    jobs_total,
+)
 from middleware import request_id_var
 from references.store import reference_files, reference_registry, refresh_gauges
 from regions.sweeper import ArtifactSweeper, delete_artifacts_for_job
@@ -133,17 +178,86 @@ STAGES: dict[str, tuple[Stage, ...]] = {
     ),
 }
 
+# The phases a job ends in — main's jobs router has the same three as its
+# ``terminal_phases``, and common.jobs' registries treat every OTHER phase as
+# open (``count_open``, ``register(max_open=)``). Here: the open-jobs gauge,
+# read from ``count_by_phase``.
+TERMINAL_PHASES = ("completed", "failed", "cancelled")
+
+# The job outcomes whose run time feeds the Retry-After estimate: a cancelled
+# job's elapsed is when someone stopped it, not how long a job takes.
+_TIMED_OUTCOMES = frozenset({"completed", "failed"})
+
+
+class QueueFullError(Exception):
+    """A submit refused because CLASSIFIER_QUEUE_LIMIT jobs are already open.
+
+    Raised by ``ClassifierQueue.check_room`` / ``admit`` before any job row
+    exists, and answered by ``main``'s exception handler: a 429 whose body is
+    FastAPI's ``{"detail": …}`` shape (``detail`` below) and whose
+    ``Retry-After`` header is ``retry_after_s``. Plain ``Exception``, not an
+    ``HTTPException`` — ``jobs/`` does not import FastAPI.
+    """
+
+    def __init__(self, job_type: str, open_jobs: int, limit: int, retry_after_s: int) -> None:
+        self.job_type = job_type
+        self.open_jobs = int(open_jobs)
+        self.limit = int(limit)
+        self.retry_after_s = int(retry_after_s)
+        super().__init__(self.detail)
+
+    @property
+    def detail(self) -> str:
+        """The 429's ``detail``: what is full, the cap, and the wait."""
+        return (
+            f"the classifier queue is full: {self.open_jobs} jobs waiting or running, the "
+            f"CLASSIFIER_QUEUE_LIMIT cap ({self.limit}). Retry after {self.retry_after_s} s."
+        )
+
+
+def retry_after_estimate(
+    durations: Iterable[float], open_jobs: int, *, limit: int, workers: int
+) -> int:
+    """The ``Retry-After`` (whole seconds) for a submit refused at ``limit``.
+
+    ``durations`` are recent jobs' run times (claim → result, seconds). The
+    wait is how long until enough slots free up: the median run time × the
+    slots needed (``open_jobs − limit + 1`` — one, unless a restart or a
+    lowered limit left more open than the limit) ÷ the jobs that finish in
+    parallel (``min(limit, workers)``), rounded up and clamped to
+    [QUEUE_RETRY_AFTER_MIN_S, QUEUE_RETRY_AFTER_MAX_S]. No durations yet (no
+    job finished since startup), or no limit, gives
+    QUEUE_RETRY_AFTER_DEFAULT_S — the edge's own 503 value. Pure: the same
+    inputs, the same answer.
+    """
+    samples = [float(d) for d in durations]
+    if not samples or limit < 1:
+        return QUEUE_RETRY_AFTER_DEFAULT_S
+    busy = max(1, min(int(limit), int(workers)))
+    excess = max(1, int(open_jobs) - int(limit) + 1)
+    wait = math.ceil(statistics.median(samples) * excess / busy)
+    return max(QUEUE_RETRY_AFTER_MIN_S, min(QUEUE_RETRY_AFTER_MAX_S, wait))
+
 
 class ClassifierQueue:
     """Owns the payload store and worker pool for one registry.
 
     main.py builds one instance at import time and drives it from the
     FastAPI lifespan (``start`` / ``stop``) and the submit endpoints
-    (``enqueue``).
+    (``check_room``, ``admit``, ``enqueue``).
     """
 
     def __init__(self, registry: PostgresRegistry) -> None:
         self.registry = registry
+        # CLASSIFIER_QUEUE_LIMIT (0 = none). An attribute rather than a
+        # module constant read in place so a test can set it on the one
+        # queue the app uses.
+        self.queue_limit = QUEUE_LIMIT
+        # The run times (seconds, claim → result) of the last
+        # QUEUE_RETRY_AFTER_HISTORY completed / failed jobs — what a
+        # refusal's Retry-After is estimated from. In memory: a restart
+        # starts over at the default.
+        self.durations: deque[float] = deque(maxlen=QUEUE_RETRY_AFTER_HISTORY)
         self.payloads = FilePayloadStore(PAYLOAD_DIR)
         # The snapshot goes into the registry's own rows (metadata.progress)
         # and the history into job_progress beside them, on the same pool.
@@ -176,9 +290,24 @@ class ClassifierQueue:
         except Exception as exc:  # noqa: BLE001 — progress never stops a start
             logger.warning("queue: could not reset the progress of requeued jobs: %s", exc)
         swept = await self.payloads.sweep(self.registry)
-        pending = await self.refresh_queue_depth()
+        pending, open_jobs = await self._refresh_gauges()
+        limit = self.queue_limit
+        job_queue_limit.set(limit)
         logger.info("queue: recovery requeued=%d orphan_payloads_removed=%d pending=%d "
-                    "max_concurrent=%d", requeued, swept, pending, MAX_CONCURRENT)
+                    "max_concurrent=%d queue_limit=%d", requeued, swept, pending,
+                    self.pool.concurrency, limit)
+        if 0 < limit < self.pool.concurrency:
+            logger.warning(
+                "queue: CLASSIFIER_QUEUE_LIMIT=%d is below CLASSIFIER_MAX_CONCURRENT=%d — "
+                "at most %d jobs run at once; %d workers stay idle",
+                limit, self.pool.concurrency, limit, self.pool.concurrency - limit,
+            )
+        if limit and open_jobs >= limit:
+            logger.info(
+                "queue: %d jobs are already open (waiting or running), at or over "
+                "CLASSIFIER_QUEUE_LIMIT=%d — submits answer 429 until it drains",
+                open_jobs, limit,
+            )
         self.pool.start()
 
     async def stop(self) -> None:
@@ -187,6 +316,46 @@ class ClassifierQueue:
         await self.pool.stop()
 
     # ── Producer side (called from the submit endpoints) ──────────────────
+    async def check_room(self, job_type: str) -> None:
+        """The fast pre-check: raise ``QueueFullError`` when the queue is
+        already at CLASSIFIER_QUEUE_LIMIT. The first line of each submit
+        handler, so a full queue answers before the body is read, a URL
+        fetched or an SVG image inlined. One ``count_open()`` — no lock, so
+        it can let two racing submits through; ``admit`` decides those.
+        Returns at once, with no query, when there is no limit."""
+        limit = self.queue_limit
+        if limit <= 0:
+            return
+        open_jobs = await self.registry.count_open()
+        if open_jobs >= limit:
+            raise self._full(job_type, open_jobs, limit)
+
+    async def admit(self, metadata: BaseModel | dict[str, Any], job_type: str) -> str:
+        """Register the job's row in phase "staging" and return its id — or
+        raise ``QueueFullError`` with no row written when CLASSIFIER_QUEUE_LIMIT
+        jobs are already open. The authoritative check: the registry counts
+        and inserts in one transaction under an advisory lock
+        (``register(max_open=)``), so the last slot goes to one submit only.
+        With no limit it is the plain register it replaced."""
+        limit = self.queue_limit
+        try:
+            return await self.registry.register(
+                metadata, initial_phase="staging", max_open=limit if limit > 0 else None
+            )
+        except QueueFull as exc:
+            raise self._full(job_type, exc.open_jobs, exc.limit) from None
+
+    def retry_after_s(self, open_jobs: int) -> int:
+        """The Retry-After for a refusal with ``open_jobs`` open: the estimate
+        (``retry_after_estimate``) from the recent run times this queue has
+        seen, its limit and its worker count."""
+        return retry_after_estimate(
+            self.durations, open_jobs, limit=self.queue_limit, workers=self.pool.concurrency
+        )
+
+    def _full(self, job_type: str, open_jobs: int, limit: int) -> QueueFullError:
+        return QueueFullError(job_type, open_jobs, limit, self.retry_after_s(open_jobs))
+
     async def enqueue(self, job_id: str, payload: dict[str, Any]) -> int:
         """Persist ``payload``, publish the job to the workers, return queue depth.
 
@@ -233,11 +402,21 @@ class ClassifierQueue:
         return await self.refresh_queue_depth()
 
     async def refresh_queue_depth(self) -> int:
-        """Re-read the pending count from the registry into the gauge."""
+        """Re-read the phase counts into the gauges; return the pending count
+        (the queue depth)."""
+        pending, _ = await self._refresh_gauges()
+        return pending
+
+    async def _refresh_gauges(self) -> tuple[int, int]:
+        """One ``count_by_phase`` read into both gauges: the depth (pending
+        only) and the open jobs (every phase not terminal — what
+        CLASSIFIER_QUEUE_LIMIT counts). Returns ``(pending, open)``."""
         counts = await self.registry.count_by_phase()
         pending = counts.get("pending", 0)
+        open_jobs = sum(n for phase, n in counts.items() if phase not in TERMINAL_PHASES)
         job_queue_depth.set(pending)
-        return pending
+        jobs_open.set(open_jobs)
+        return pending, open_jobs
 
     # ── Cancel ────────────────────────────────────────────────────────────
     async def on_cancel_request(self, job_id: str, was_phase: str) -> None:
@@ -412,6 +591,9 @@ class ClassifierQueue:
         job_type = job.metadata.get("type", "assess")
         jobs_total.labels(type=job_type, status=phase).inc()
         job_duration.labels(type=job_type).observe(elapsed)
+        if phase in _TIMED_OUTCOMES:
+            # What the next refusal's Retry-After is estimated from.
+            self.durations.append(elapsed)
         # Depth gauge is refreshed by the next enqueue/claim; keep the hook sync + cheap.
 
 

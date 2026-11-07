@@ -336,6 +336,108 @@ def test_count_by_phase(db_path: str) -> None:
     assert _run(reg.count_by_phase()) == {"pending": 2, "processing": 1}
 
 
+# ── Bounded admission (register(max_open=), count_open) ───────────────────
+# The same cases as test_jobs_postgres.py's, for the interface parity the
+# module promises.
+def test_max_open_admits_up_to_the_limit_and_refuses_with_no_row(db_path: str) -> None:
+    from common.jobs import QueueFull
+
+    reg = SqliteRegistry(db_path)
+    _run(reg.init())
+    ids = [_run(reg.register({"i": i}, "pending", max_open=3)) for i in range(3)]
+    assert len(set(ids)) == 3
+    with pytest.raises(QueueFull) as info:
+        _run(reg.register({"i": 3}, "pending", max_open=3))
+    assert (info.value.open_jobs, info.value.limit) == (3, 3)
+    assert _run(reg.count_by_phase()) == {"pending": 3}
+
+
+def test_terminal_rows_do_not_count_staging_and_custom_phases_do(db_path: str) -> None:
+    from common.jobs import QueueFull
+
+    reg = SqliteRegistry(db_path)
+    _run(reg.init())
+    for phase in ("completed", "failed", "cancelled"):
+        _run(reg.register({"done": phase}, phase))
+    assert _run(reg.count_open()) == 0
+    staged = _run(reg.register({}, "staging"))
+    for phase in ("processing", "capturing"):
+        _run(reg.register({"open": phase}, phase))
+    assert _run(reg.count_open()) == 3
+    with pytest.raises(QueueFull):
+        _run(reg.register({}, "staging", max_open=3))
+    assert _run(reg.cancel(staged)) == (True, "staging")  # a cancel frees its slot
+    _run(reg.register({}, "staging", max_open=3))
+    assert _run(reg.count_open()) == 3
+
+
+def test_open_rows_already_over_the_limit_refuse_until_they_drain(db_path: str) -> None:
+    from common.jobs import QueueFull
+
+    reg = SqliteRegistry(db_path)
+    _run(reg.init())
+    ids = [_run(reg.register({"i": i}, "pending")) for i in range(4)]
+    with pytest.raises(QueueFull) as info:
+        _run(reg.register({}, "pending", max_open=2))
+    assert info.value.open_jobs == 4
+    for job_id in ids[:2]:
+        _run(reg.set_error(job_id, "boom"))
+    with pytest.raises(QueueFull):
+        _run(reg.register({}, "pending", max_open=2))
+    _run(reg.delete(ids[2]))
+    _run(reg.register({}, "pending", max_open=2))
+    assert _run(reg.count_open()) == 2
+
+
+def test_concurrent_registers_on_separate_connections_never_overshoot(db_path: str) -> None:
+    """20 submits racing for 5 slots. Each register opens its own aiosqlite
+    connection — its own thread — so the count and the insert of one can
+    interleave with another's unless BEGIN IMMEDIATE serialises them."""
+    from common.jobs import QueueFull
+
+    reg = SqliteRegistry(db_path)
+    _run(reg.init())
+
+    async def race():
+        return await asyncio.gather(
+            *(reg.register({"racer": i}, "staging", max_open=5) for i in range(20)),
+            return_exceptions=True,
+        )
+
+    outcomes = _run(race())
+    admitted = [o for o in outcomes if isinstance(o, str)]
+    refused = [o for o in outcomes if isinstance(o, QueueFull)]
+    assert len(admitted) == 5 and len(refused) == 15, outcomes
+    assert _run(reg.count_by_phase()) == {"staging": 5}
+
+
+def test_max_open_none_is_unbounded_and_below_one_is_refused(db_path: str) -> None:
+    reg = SqliteRegistry(db_path)
+    _run(reg.init())
+    for i in range(8):
+        _run(reg.register({"i": i}, "pending", max_open=None))
+    assert _run(reg.count_open()) == 8
+    with pytest.raises(ValueError, match="None means no limit"):
+        _run(reg.register({}, "pending", max_open=0))
+    with pytest.raises(TypeError):
+        _run(reg.register({}, "pending", max_open=True))
+    assert _run(reg.count_open()) == 8
+
+
+def test_count_open_counts_every_unfinished_phase(db_path: str) -> None:
+    reg = SqliteRegistry(db_path)
+    _run(reg.init())
+    assert _run(reg.count_open()) == 0
+    a = _run(reg.register({}, "staging"))
+    b = _run(reg.register({}))
+    _run(reg.register({}))
+    _run(reg.claim_next())
+    assert _run(reg.count_open()) == 3
+    _run(reg.set_error(a, "boom"))
+    _run(reg.set_phase(b, "completed"))
+    assert _run(reg.count_open()) == 1
+
+
 # ── expired_job_ids (retention) ────────────────────────────────────────────
 def _age(reg: SqliteRegistry, job_id: str, hours: float, *, suffix: str = "") -> None:
     """Backdate a row's created_at, optionally in a different ISO spelling.

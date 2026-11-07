@@ -29,6 +29,9 @@ POST takes the same two encodings /assess does, parsed into ONE model
 Then, before anything is queued — every one of these is an error on THIS
 request, never a creation job that fails a minute later:
 
+  0. (first of all, before the body is read) room in the queue
+     (``queue.check_room``) — at CLASSIFIER_QUEUE_LIMIT open jobs a 429 with
+     a Retry-After;
   1. the model (``ReferenceRequest``): shape, criteria rules, keys unique
      within the reference, breakdown verdicts, region shapes and grid
      ranges — 400;
@@ -61,8 +64,9 @@ request, never a creation job that fails a minute later:
                      not the question);
   4. every breakdown / regions key names a criterion; every pixel region lies
      inside the page (``grid`` regions are converted to pixels here) — 400;
-  5. register the creation job ("staging", metadata type "reference"), insert
-     the ``pending`` reference, write the payload, wake a worker — 202.
+  5. register the creation job ("staging", metadata type "reference" —
+     ``queue.admit``, a 429 if the queue filled meanwhile), insert the
+     ``pending`` reference, write the payload, wake a worker — 202.
 
 The creation job (``jobs.runners.run_reference``) does the rest and marks the
 reference ``ready`` or ``failed``. References are kept until DELETE: nothing
@@ -588,7 +592,14 @@ def _caller_answers(model: ReferenceRequest, src: _Source) -> None:
 async def create_reference(request: Request):
     """Save a worked example. Returns 202 with the reference id and the job
     that builds it; poll ``GET /references/{id}`` until ``status`` is
-    "ready" or "failed"."""
+    "ready" or "failed".
+
+    A full queue (CLASSIFIER_QUEUE_LIMIT) is a 429 + Retry-After, checked
+    first (``queue.check_room``, before the body is read) and again at
+    registration (``queue.admit``) — which comes BEFORE the reference row,
+    so a refused submit leaves no reference, no job and no payload.
+    """
+    await queue.check_room("reference")
     content_type = (request.headers.get("content-type") or "").lower()
     if content_type.startswith(("multipart/form-data", "application/x-www-form-urlencoded")):
         model, upload = await _from_form(request)
@@ -626,11 +637,13 @@ async def create_reference(request: Request):
     _caller_answers(model, src)
 
     reference_id = new_reference_id()
-    job_id = await jobs_registry.register(
+    # The job row first ("staging", the authoritative queue-limit check):
+    # a 429 here leaves nothing behind — the reference row is created next.
+    job_id = await queue.admit(
         ClassifierMetadata(
             type="reference", request_id=request_id_var.get("-"), reference_id=reference_id,
         ),
-        initial_phase="staging",
+        "reference",
     )
     await reference_registry.create(
         reference_id,

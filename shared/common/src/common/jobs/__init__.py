@@ -36,6 +36,19 @@ to exactly one caller (safe across tasks and processes),
 ``reset_phase(from, to)`` recovers jobs a crashed worker left mid-flight, and
 ``count_by_phase()`` drives queue-depth gauges.
 
+They can also bound that queue. ``register(metadata, phase, max_open=N)``
+admits a job only while fewer than N are OPEN — every phase but completed /
+failed / cancelled, so waiting and running alike — counting and inserting as
+one atomic step (Postgres: one transaction behind an advisory lock; SQLite:
+one ``BEGIN IMMEDIATE``), and otherwise raises ``QueueFull`` (``.open_jobs``,
+``.limit``; from ``common.jobs.admission``, exported here) with nothing
+written. ``count_open()`` is the same count without the atomicity — a cheap
+pre-check. Without ``max_open`` nothing changes. The classifier turns
+``QueueFull`` into a 429 with a ``Retry-After`` (``CLASSIFIER_QUEUE_LIMIT``).
+``InMemoryRegistry`` has neither: its jobs live inside a caller's ``with``
+block, and a service in front of it bounds them with its own port pool or
+semaphore.
+
 * ``WorkerPool`` (from ``common.jobs.worker``) — N asyncio workers looping on
   ``claim_next``, with wake/poll, crash recovery, and an ``on_finish`` metrics
   hook. The consumer supplies ``async handler(JobBase) -> dict``. Opt-in
@@ -87,6 +100,7 @@ dep at top-level and will raise a clear ImportError if the consumer forgot
 to depend on it.
 """
 
+from .admission import QueueFull
 from .model import JobBase, JobsListResponse
 from .memory import InMemoryRegistry, JobHandle
 
@@ -95,4 +109,5 @@ __all__ = [
     "JobsListResponse",
     "InMemoryRegistry",
     "JobHandle",
+    "QueueFull",
 ]

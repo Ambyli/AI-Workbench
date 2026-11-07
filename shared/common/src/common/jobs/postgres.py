@@ -13,9 +13,10 @@ right shape for services that:
 * need the state store to sit in its own network segment for isolation
   (the sandbox subsystem does this — see ``ai/sandbox/SANDBOX.md``).
 
-The public interface matches ``SqliteRegistry`` exactly — CRUD, the queue
-operations ``common.jobs.worker.WorkerPool`` drives (``claim_next`` /
-``reset_phase`` / ``count_by_phase``), and the retention query
+The public interface matches ``SqliteRegistry`` exactly — CRUD (with the
+bounded admission below), the queue operations
+``common.jobs.worker.WorkerPool`` drives (``claim_next`` / ``reset_phase`` /
+``count_by_phase``, plus ``count_open``), and the retention query
 ``common.vision.ArtifactStore.sweep`` prefers (``expired_job_ids``) — so
 ``common.jobs.router.build_router`` mounts it with no changes and a service
 can swap one backend for the other without touching its consumers.
@@ -29,6 +30,18 @@ is still in its claimed phase. Under READ COMMITTED the guarded UPDATE waits
 for a cancel holding the row lock and then re-checks the phase against the
 committed row, so of a cancel and a result racing on one job exactly one
 lands. Unguarded, every write is the same statement it always was.
+
+Bounded admission. ``register(..., max_open=N)`` refuses a job that would make
+more than N OPEN — not terminal: waiting, staging and running alike, and any
+consumer's own phases — with ``common.jobs.QueueFull`` and no row written.
+The count and the INSERT run in one transaction behind a transaction-scoped
+advisory lock (``pg_advisory_xact_lock``), so admissions are serialised
+across connections and processes: a plain count-then-insert under READ
+COMMITTED would let two submits racing for the last slot both see room. The
+lock is held for those two statements only, and nothing else takes it — a
+claim, a result write or a cancel never waits on it. ``count_open()`` is the
+same count without the lock, a cheap pre-check. Without ``max_open`` (every
+existing caller) ``register`` is the single INSERT it always was.
 
 Two ways to give it a connection pool:
 
@@ -54,12 +67,23 @@ from uuid import uuid4
 import asyncpg
 from pydantic import BaseModel
 
+from .admission import QueueFull, check_max_open
 from .model import JobBase, JobsListResponse
 
 # Phases a retention sweep may delete. A job still pending or processing is
 # never expired, however old — see ``expired_job_ids``. The same set as
-# ``common.jobs.sqlite._TERMINAL_PHASES`` and ``common.vision.store``.
+# ``common.jobs.sqlite._TERMINAL_PHASES`` and ``common.vision.store``. Every
+# other phase is OPEN — what ``count_open()`` and ``register(max_open=)``
+# count.
 _TERMINAL_PHASES = ("completed", "failed", "cancelled")
+
+# The transaction-scoped advisory lock ``register(max_open=)`` serialises
+# admissions on: the bytes "jobs:adm" as a 64-bit key. Advisory locks are
+# per database, so every registry on one database (one ``jobs`` table)
+# shares it — which is the point.
+_ADMIT_LOCK_KEY = int.from_bytes(b"jobs:adm", "big")
+
+_COUNT_OPEN_SQL = "SELECT count(*) FROM jobs WHERE phase <> ALL($1::text[])"
 
 
 # ``{result_type}`` is ``JSONB`` (the default) or ``JSON`` — see the
@@ -197,23 +221,56 @@ class PostgresRegistry:
         self,
         metadata: BaseModel | dict[str, Any],
         initial_phase: str = "pending",
+        *,
+        max_open: Optional[int] = None,
     ) -> str:
-        """Insert a new job in ``initial_phase`` and return its id."""
+        """Insert a new job in ``initial_phase`` and return its id.
+
+        ``max_open`` bounds the queue: with N, the job is admitted only while
+        fewer than N jobs are open (any phase but completed / failed /
+        cancelled — the new row counts from the moment it is written, so a
+        submit takes its slot at registration, before its payload lands);
+        otherwise ``common.jobs.QueueFull(open_jobs, N)`` is raised and
+        nothing is written. The count and the INSERT run in one transaction
+        under ``pg_advisory_xact_lock``, so N concurrent submits on separate
+        connections — or separate processes — can never overshoot. ``None``
+        (the default) is the single INSERT with no transaction and no lock;
+        below 1 is a ``ValueError`` (``check_max_open``).
+        """
+        limit = check_max_open(max_open)
         job_id = uuid4().hex[:12]
         now = _now_utc()
         meta_json = _dump_metadata(metadata)
+        insert = (
+            "INSERT INTO jobs (id, phase, created_at, updated_at, metadata) "
+            "VALUES ($1, $2, $3, $4, $5::jsonb)"
+        )
         pool = self._require_pool()
         async with pool.acquire() as conn:
-            await conn.execute(
-                "INSERT INTO jobs (id, phase, created_at, updated_at, metadata) "
-                "VALUES ($1, $2, $3, $4, $5::jsonb)",
-                job_id,
-                initial_phase,
-                now,
-                now,
-                meta_json,
-            )
+            if limit is None:
+                await conn.execute(insert, job_id, initial_phase, now, now, meta_json)
+                return job_id
+            async with conn.transaction():
+                # Held until the transaction ends — a commit, or the rollback
+                # QueueFull causes — so the next admitter counts after this
+                # one's row is committed (READ COMMITTED: each statement sees
+                # every commit before it started).
+                await conn.execute("SELECT pg_advisory_xact_lock($1)", _ADMIT_LOCK_KEY)
+                open_jobs = int(await conn.fetchval(_COUNT_OPEN_SQL, list(_TERMINAL_PHASES)))
+                if open_jobs >= limit:
+                    raise QueueFull(open_jobs, limit)
+                await conn.execute(insert, job_id, initial_phase, now, now, meta_json)
         return job_id
+
+    async def count_open(self) -> int:
+        """How many jobs are open — in any phase but completed / failed /
+        cancelled: waiting and running alike. The count ``register``'s
+        ``max_open`` checks, without its lock: a cheap pre-check (one
+        ``count(*)`` over the table, which retention keeps to a TTL window),
+        never the admission itself — two callers can both see room here."""
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            return int(await conn.fetchval(_COUNT_OPEN_SQL, list(_TERMINAL_PHASES)))
 
     async def set_phase(
         self,

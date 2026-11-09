@@ -291,13 +291,21 @@ services:
       PORT_SANDBOX_DB: ${PORT_SANDBOX_DB:-5440}
       # Phoenix production Postgres (off-box, read-only role). Same vars
       # the Roofix bridge uses — one definition in .env feeds both.
-      # Consumed by catalogs/postgres_phoenix.properties.
-      PHOENIX_DB_HOST: ${PHOENIX_DB_HOST}
-      PHOENIX_DB_PORT: ${PHOENIX_DB_PORT:-5432}
-      PHOENIX_DB_NAME: ${PHOENIX_DB_NAME}
-      PHOENIX_DB_USER: ${PHOENIX_DB_USER}
-      PHOENIX_DB_PASSWORD: ${PHOENIX_DB_PASSWORD}
-      PHOENIX_DB_SSLMODE: ${PHOENIX_DB_SSLMODE:-require}
+      # Consumed by catalogs/postgres_phoenix_prod.properties.
+      PHOENIX_PROD_DB_HOST: ${PHOENIX_PROD_DB_HOST}
+      PHOENIX_PROD_DB_PORT: ${PHOENIX_PROD_DB_PORT:-5432}
+      PHOENIX_PROD_DB_NAME: ${PHOENIX_PROD_DB_NAME}
+      PHOENIX_PROD_DB_USER: ${PHOENIX_PROD_DB_USER}
+      PHOENIX_PROD_DB_PASSWORD: ${PHOENIX_PROD_DB_PASSWORD}
+      PHOENIX_PROD_DB_SSLMODE: ${PHOENIX_PROD_DB_SSLMODE:-require}
+      # Phoenix staging Postgres (off-box, read-only role, Trino only).
+      # Consumed by catalogs/postgres_phoenix_stage.properties.
+      PHOENIX_STAGE_DB_HOST: ${PHOENIX_STAGE_DB_HOST}
+      PHOENIX_STAGE_DB_PORT: ${PHOENIX_STAGE_DB_PORT:-5432}
+      PHOENIX_STAGE_DB_NAME: ${PHOENIX_STAGE_DB_NAME}
+      PHOENIX_STAGE_DB_USER: ${PHOENIX_STAGE_DB_USER}
+      PHOENIX_STAGE_DB_PASSWORD: ${PHOENIX_STAGE_DB_PASSWORD}
+      PHOENIX_STAGE_DB_SSLMODE: ${PHOENIX_STAGE_DB_SSLMODE:-require}
       # Supabase Postgres for the AI agents project (off-box, TLS
       # required). Consumed by catalogs/supabase_ai_agents.properties.
       AI_AGENTS_DB_HOST: ${AI_AGENTS_DB_HOST}

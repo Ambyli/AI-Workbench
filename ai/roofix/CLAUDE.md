@@ -5,7 +5,7 @@ The Roofix ↔ Phoenix bridge: one event-sourced worker (`roofix`, FastAPI + APS
 ## Rules
 
 - **`DRY_RUN=true` is the default and stays so on a fresh deploy**: the bridge fetches, parses, decides and logs, but writes nothing to Phoenix (a write returns the intended SQL + params). Flip to `false` only after inspecting a full tick; narrow `LISTENER_QUERY` to one project for first live writes.
-- **Phoenix is written directly with psycopg2, Gmail read directly with the Google API + OAuth — not via MCP.** The MCP variants were reverted (Phoenix MCP write tools weren't ready). Don't reintroduce MCP clients here without being asked. `PHOENIX_DB_*` must be set; `PHOENIX_AGENT_USER_ID` is provisioned by hand.
+- **Phoenix is written directly with psycopg2, Gmail read directly with the Google API + OAuth — not via MCP.** The MCP variants were reverted (Phoenix MCP write tools weren't ready). Don't reintroduce MCP clients here without being asked. `PHOENIX_PROD_DB_*` must be set; `PHOENIX_AGENT_USER_ID` is provisioned by hand.
 - **Gmail OAuth is interactive once, locally**: `credentials.json` + `token.json` in `ROOFIX_BRIDGE_CONFIG_DIR` (bind-mounted read-only at `/config`); first login runs `components/gmail_client.py` on a laptop (`ROOFIX.md § Gmail OAuth setup`).
 - **The AI fallback goes through LiteLLM** (`ROOFIX_LLM_URL`, default `http://litellm:4000`, `BRAIN_MODEL`). Swapping the model is a LiteLLM config / `BRAIN_MODEL` change, never a bridge code change.
 - **Roofix session refresh is a manual operator flow**: the `roofix` profile lives in the interceptor; capture it on a laptop with a visible browser (`uv run cdp-spy`), tar it, `POST /profiles/roofix/refresh` (`INTERCEPTOR.md § Refreshing a profile (operator flow)`). Re-capture when `/capture` returns `login_wall: true`.
@@ -35,7 +35,7 @@ One line each; full detail in `.env.example` and `ROOFIX.md § Configuration`.
 - `ROOFIX_PROCESSED_LABEL` (`roofix/processed`) — label put on every evaluated message, excluded in `LISTENER_QUERY`.
 - `ESCALATION_RECIPIENTS` (empty) — forward escalations here; empty leaves them unread in Gmail.
 - `GMAIL_CREDENTIALS_PATH` (`/config/credentials.json`) / `GMAIL_TOKEN_PATH` (`/config/token.json`) — OAuth client secret / refresh token.
-- `PHOENIX_DB_HOST` / `_PORT` / `_NAME` / `_USER` / `_PASSWORD` / `_SSLMODE` (secrets) — direct psycopg2 connection to Phoenix.
+- `PHOENIX_PROD_DB_HOST` / `_PORT` / `_NAME` / `_USER` / `_PASSWORD` / `_SSLMODE` (secrets) — direct psycopg2 connection to Phoenix production (Trino's `postgres_phoenix_prod` reads the same vars).
 - `PHOENIX_AGENT_USER_ID` (unset — required for writes) — the dedicated Phoenix user writes are attributed to.
 - `PHOENIX_ROOFIX_ID_COLUMN` (`migration_external_id`) — where Roofix ids are stamped.
 - `ROOFIX_DB_USER` / `_PASSWORD` / `_NAME` (`roofix`) — `roofix-db` (`ProcessedStore`); same default in compose and `app.py`'s DSN. On `ai_shared`: override the password before exposing it.

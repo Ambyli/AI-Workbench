@@ -15,7 +15,7 @@ import os
 # up test values. AGENT_USER_ID must be set for any write to succeed.
 os.environ.setdefault("PHOENIX_AGENT_USER_ID", "1399")
 os.environ.setdefault("DRY_RUN", "true")
-# Deliberately leave PHOENIX_DB_HOST unset — DRY_RUN writes must not call
+# Deliberately leave PHOENIX_PROD_DB_HOST unset — DRY_RUN writes must not call
 # connect(). If a code path tries, the test will fail with a KeyError which
 # is exactly the diagnostic we want.
 

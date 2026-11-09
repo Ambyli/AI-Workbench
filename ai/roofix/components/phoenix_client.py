@@ -121,7 +121,7 @@ class PhoenixClient:
         self.dry_run = DRY_RUN if dry_run is None else dry_run
         # Lazy pool: created on first ``_cursor``/``ping`` call so importing
         # this module (or building an instance for a smoke test) doesn't
-        # require PHOENIX_DB_* env vars to be set yet.
+        # require PHOENIX_PROD_DB_* env vars to be set yet.
         self._pool: Optional[psycopg2.pool.ThreadedConnectionPool] = None
         self._pool_lock = threading.Lock()
         self._min_conns = min_conns
@@ -151,13 +151,13 @@ class PhoenixClient:
                 self._pool = psycopg2.pool.ThreadedConnectionPool(
                     self._min_conns,
                     self._max_conns,
-                    host=os.environ["PHOENIX_DB_HOST"],
-                    port=os.getenv("PHOENIX_DB_PORT", "5432"),
-                    dbname=os.environ["PHOENIX_DB_NAME"],
-                    user=os.environ["PHOENIX_DB_USER"],
-                    password=os.environ["PHOENIX_DB_PASSWORD"],
+                    host=os.environ["PHOENIX_PROD_DB_HOST"],
+                    port=os.getenv("PHOENIX_PROD_DB_PORT", "5432"),
+                    dbname=os.environ["PHOENIX_PROD_DB_NAME"],
+                    user=os.environ["PHOENIX_PROD_DB_USER"],
+                    password=os.environ["PHOENIX_PROD_DB_PASSWORD"],
                     options="-c search_path=phoenix",
-                    sslmode=os.getenv("PHOENIX_DB_SSLMODE", "require"),
+                    sslmode=os.getenv("PHOENIX_PROD_DB_SSLMODE", "require"),
                 )
         return self._pool
 

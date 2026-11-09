@@ -110,12 +110,12 @@ Sub-cases that short-circuit before the action branches:
 | `GMAIL_CREDENTIALS_PATH` | `/config/credentials.json` | OAuth 2.0 client secrets file from GCP. See [Gmail OAuth setup](#gmail-oauth-setup). |
 | `GMAIL_TOKEN_PATH` | `/config/token.json` | Refresh-token file. Written by the first successful login; reused thereafter. |
 | `ROOFIX_BRIDGE_CONFIG_DIR` | `./roofix/config` | Host dir containing `credentials.json` + `token.json`. Bind-mounted into the container at `/config` read-only. |
-| `PHOENIX_DB_HOST` | _(required)_ | Phoenix Postgres hostname. |
-| `PHOENIX_DB_PORT` | `5432` | Phoenix Postgres port. |
-| `PHOENIX_DB_NAME` | _(required)_ | Database name. |
-| `PHOENIX_DB_USER` | _(required)_ | DB user with read + write on the `phoenix` schema. |
-| `PHOENIX_DB_PASSWORD` | _(required)_ | DB password. |
-| `PHOENIX_DB_SSLMODE` | `require` | psycopg2 SSL mode (`require` / `verify-ca` / `verify-full` / `disable`). |
+| `PHOENIX_PROD_DB_HOST` | _(required)_ | Phoenix production Postgres hostname. |
+| `PHOENIX_PROD_DB_PORT` | `5432` | Phoenix Postgres port. |
+| `PHOENIX_PROD_DB_NAME` | _(required)_ | Database name. |
+| `PHOENIX_PROD_DB_USER` | _(required)_ | DB user with read + write on the `phoenix` schema. |
+| `PHOENIX_PROD_DB_PASSWORD` | _(required)_ | DB password. |
+| `PHOENIX_PROD_DB_SSLMODE` | `require` | psycopg2 SSL mode (`require` / `verify-ca` / `verify-full` / `disable`). |
 | `PHOENIX_AGENT_USER_ID` | _(unset — required for writes)_ | Dedicated Phoenix user id the bridge writes as. Provision manually. |
 | `PHOENIX_ROOFIX_ID_COLUMN` | `migration_external_id` | Where the Roofix project id is stamped on the project row. |
 | `ROOFIX_DB_USER` | `roofix` | User for the compose-managed `roofix-db` Postgres backing `ProcessedStore`. |

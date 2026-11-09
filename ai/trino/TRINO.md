@@ -8,8 +8,9 @@ Postgres instances this repo runs (`litellm_db`, `roofix-db`, `sandbox-db`,
 per-call model usage, `postgres_classifier` — and the route-policy service's
 `route-policy-db` — every routing decision and what answered it,
 `postgres_route_policy`),
-the off-box Phoenix production Postgres (`postgres_phoenix`, read-only
-role, TLS required), plus an Iceberg lakehouse on `lake-s3`. Consumers:
+the off-box Phoenix production and staging Postgres (`postgres_phoenix_prod`
+/ `postgres_phoenix_stage`, read-only roles, TLS required), plus an Iceberg
+lakehouse on `lake-s3`. Consumers:
 
 - **Models** — LiteLLM registers `trino-mcp:8080/mcp` alongside the
   Phoenix MCP, so any tool-calling model can run federated SQL. Claude
@@ -178,7 +179,7 @@ Clients that pinned the old fingerprint must re-trust.
 
 | Tool | Purpose |
 |---|---|
-| `list_catalogs()` | Every catalog Trino sees — `aws_glue`, `bigquery_supernova_dev`, `iceberg`, `postgres_classifier`, `postgres_litellm`, `postgres_phoenix`, `postgres_roofix`, `postgres_route_policy`, `postgres_sandbox`, `postgres_supabase`, `supabase_ai_agents`, `supabase_enerflo_leads`, `supabase_operations_assistant`, `system` |
+| `list_catalogs()` | Every catalog Trino sees — `aws_glue`, `bigquery_supernova_dev`, `iceberg`, `postgres_classifier`, `postgres_litellm`, `postgres_phoenix_prod`, `postgres_phoenix_stage`, `postgres_roofix`, `postgres_route_policy`, `postgres_sandbox`, `postgres_supabase`, `supabase_ai_agents`, `supabase_enerflo_leads`, `supabase_operations_assistant`, `system` |
 | `list_schemas(catalog)` | Schemas under a catalog |
 | `list_tables(catalog, schema)` | Tables under a schema |
 | `describe_table(catalog, schema, table)` | `[{"name":…, "type":…}, …]` |
@@ -225,7 +226,7 @@ committing it.
 
 Everything in [§ Adding a catalog](#adding-a-catalog) applies here too:
 there is no per-catalog access control, so a Claude Code session with this
-server can read every catalog, `postgres_phoenix` production and
+server can read every catalog, `postgres_phoenix_prod` (production) and
 `postgres_supabase`'s `auth.users` included. The SELECT-only rule and the
 row / runtime clamps are the only limits. Full list of LiteLLM-hosted MCP
 servers: [`ai/litellm/LITELLM_MCP.md`](../litellm/LITELLM_MCP.md#add-mcp-servers-to-claude-code).
@@ -273,7 +274,7 @@ models get an accurate hint.
 - Convention: `<source>_<dataset>` — name by where the data lives, then
   what it is. `postgres_<subsystem>` for Postgres instances we run or
   are handed directly (`postgres_litellm`, `postgres_roofix`,
-  `postgres_sandbox`, `postgres_phoenix`, `postgres_supabase`,
+  `postgres_sandbox`, `postgres_phoenix_prod`, `postgres_phoenix_stage`, `postgres_supabase`,
   `postgres_classifier`, `postgres_route_policy`);
   `supabase_<project>` for Supabase-hosted projects (`supabase_ai_agents`,
   `supabase_enerflo_leads`, `supabase_operations_assistant`); `aws_glue` for the Glue Data Catalog;
@@ -311,7 +312,7 @@ the port in `.env`.
 
 ### Hosted Postgres gotchas
 
-Learned the hard way on `postgres_phoenix`, `supabase_ai_agents`, and
+Learned the hard way on `postgres_phoenix_prod`, `supabase_ai_agents`, and
 `supabase_enerflo_leads`:
 
 - **TLS.** Managed Postgres (Supabase, Phoenix, RDS) rejects plaintext.
@@ -839,7 +840,7 @@ integrity, serde info shape); a manual UPDATE will silently break
   in the `trino_auth` volume with a CA-issued key+cert PEM when there is
   a stable hostname for the box.
 - **Per-catalog access control** — every `TRINO_JDBC_USERS` login and
-  `trino-mcp` can read every catalog, including Phoenix production and
+  `trino-mcp` can read every catalog, including Phoenix production / staging and
   the Supabase projects. Trino's file-based access control
   (`access-control.name=file` + a `rules.json` mapping users/groups to
   catalogs and schemas) is the cheap fix once some sources need to be

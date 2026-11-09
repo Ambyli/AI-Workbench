@@ -54,13 +54,15 @@ async def list_catalogs() -> list[str]:
     don't know which data source holds the answer.
 
     Typical result: ``["aws_glue", "bigquery_supernova_dev", "iceberg",
-    "postgres_litellm", "postgres_phoenix", "postgres_roofix",
+    "postgres_classifier", "postgres_litellm", "postgres_phoenix_prod",
+    "postgres_phoenix_stage", "postgres_roofix", "postgres_route_policy",
     "postgres_sandbox", "postgres_supabase", "supabase_ai_agents",
     "supabase_enerflo_leads", "supabase_operations_assistant", "system"]``.
     Catalogs are named ``<source>_<dataset>``: ``iceberg`` is the
     lakehouse (Parquet on the on-box S3 store); ``postgres_*`` federate the subsystem Postgres
     instances we run (including ``postgres_supabase``, the self-hosted
-    Supabase instance) plus the Phoenix production DB; ``supabase_*`` are
+    Supabase instance) plus the Phoenix production and staging DBs
+    (``postgres_phoenix_prod`` / ``postgres_phoenix_stage``); ``supabase_*`` are
     Supabase-HOSTED Postgres projects; ``aws_glue`` is the AWS Glue Data
     Catalog (what Athena queries); ``bigquery_*`` are Google BigQuery
     projects, one schema per BigQuery dataset. All read-only.

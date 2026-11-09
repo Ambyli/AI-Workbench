@@ -703,7 +703,7 @@
               "host": ["{{litellm}}"],
               "path": ["mcp", "trino"]
             },
-            "description": "URL to register with Claude Code:\n\n    claude mcp add --transport http -s user trino {{litellm}}/mcp/trino \\\n      --header \"Authorization: Bearer {{virtual master key}}\"\n\nBacked by `mcp_servers.trino` → http://trino-mcp:8080/mcp (no host port of its own — LiteLLM is the only way in from outside Docker). Tools: `list_catalogs`, `list_schemas`, `list_tables`, `describe_table`, `run_query`. SELECT-only, clamped to `TRINO_MCP_MAX_ROWS` rows and `TRINO_MCP_MAX_RUNTIME_S` seconds, but with no per-catalog access control — a connected client can read every catalog, including `postgres_phoenix` (production) and `postgres_supabase` (BYPASSRLS). A virtual key must be allowed the `trino` MCP server. See ai/trino/TRINO.md § Using it from Claude Code."
+            "description": "URL to register with Claude Code:\n\n    claude mcp add --transport http -s user trino {{litellm}}/mcp/trino \\\n      --header \"Authorization: Bearer {{virtual master key}}\"\n\nBacked by `mcp_servers.trino` → http://trino-mcp:8080/mcp (no host port of its own — LiteLLM is the only way in from outside Docker). Tools: `list_catalogs`, `list_schemas`, `list_tables`, `describe_table`, `run_query`. SELECT-only, clamped to `TRINO_MCP_MAX_ROWS` rows and `TRINO_MCP_MAX_RUNTIME_S` seconds, but with no per-catalog access control — a connected client can read every catalog, including `postgres_phoenix_prod` (production), `postgres_phoenix_stage` (staging) and `postgres_supabase` (BYPASSRLS). A virtual key must be allowed the `trino` MCP server. See ai/trino/TRINO.md § Using it from Claude Code."
           },
           "response": []
         },

@@ -93,6 +93,7 @@ if _COMMON_SRC.is_dir() and str(_COMMON_SRC) not in sys.path:
     sys.path.insert(0, str(_COMMON_SRC))
 
 from common.env import load_env  # noqa: E402
+from common.net import retry_after_s  # noqa: E402
 from common.vision import (  # noqa: E402
     PageGeometry,
     Region,
@@ -154,6 +155,15 @@ POLL_WAIT_S = 30.0
 FAST_ANSWER_S = 1.0
 POLL_INTERVAL_S = 1.5
 TERMINAL_PHASES = ("completed", "failed", "cancelled")
+
+# POST /assess answers 429 + Retry-After while the classifier's queue is at
+# CLASSIFIER_QUEUE_LIMIT (ai/classifier/API.md § Concurrency and
+# durability); :func:`submit` waits that long and resubmits — at most
+# QUEUE_FULL_RETRY_MAX_S per sleep, QUEUE_FULL_WAIT_S in all per case —
+# rather than recording the case as refused.
+QUEUE_FULL_WAIT_S = 600.0
+QUEUE_FULL_RETRY_DEFAULT_S = 10.0
+QUEUE_FULL_RETRY_MAX_S = 60.0
 
 # Suffixes we know how to re-render a page image from. Anything else (.txt,
 # .docx) has no pixel space, which the report states rather than hides.
@@ -563,7 +573,28 @@ def _needs_remote(criterion: dict) -> bool:
 
 
 def submit(case: Case, transport: Any) -> Any:
-    """POST the case, returning the raw response."""
+    """POST the case, returning the raw response — after waiting out a full
+    queue: while the classifier is at its CLASSIFIER_QUEUE_LIMIT a submit
+    answers 429 + Retry-After (no job created), so sleep that long
+    (``common.net.retry_after_s``: seconds or an HTTP-date,
+    QUEUE_FULL_RETRY_DEFAULT_S without one, at most QUEUE_FULL_RETRY_MAX_S)
+    and resubmit, printing a line each time, for up to QUEUE_FULL_WAIT_S. A
+    429 still standing after that is returned like any other refusal."""
+    deadline = time.monotonic() + QUEUE_FULL_WAIT_S
+    while True:
+        response = _post_case(case, transport)
+        left = deadline - time.monotonic()
+        if response.status_code != 429 or left <= 0:
+            return response
+        delay = min(left, retry_after_s(response.headers.get("Retry-After"),
+                                        default=QUEUE_FULL_RETRY_DEFAULT_S,
+                                        cap=QUEUE_FULL_RETRY_MAX_S))
+        print(f"  {case.name}: the classifier queue is full (429) — resubmitting in {delay:.0f} s")
+        time.sleep(delay)
+
+
+def _post_case(case: Case, transport: Any) -> Any:
+    """One POST of the case (the files are re-read each time)."""
     if case.json_body is not None:
         return transport.request(
             "POST", case.path, json=case.json_body, headers=case.headers

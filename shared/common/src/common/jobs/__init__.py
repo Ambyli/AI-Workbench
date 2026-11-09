@@ -36,9 +36,29 @@ to exactly one caller (safe across tasks and processes),
 ``reset_phase(from, to)`` recovers jobs a crashed worker left mid-flight, and
 ``count_by_phase()`` drives queue-depth gauges.
 
+They can also bound that queue. ``register(metadata, phase, max_open=N)``
+admits a job only while fewer than N are OPEN — every phase but completed /
+failed / cancelled, so waiting and running alike — counting and inserting as
+one atomic step (Postgres: one transaction behind an advisory lock; SQLite:
+one ``BEGIN IMMEDIATE``), and otherwise raises ``QueueFull`` (``.open_jobs``,
+``.limit``; from ``common.jobs.admission``, exported here) with nothing
+written. ``count_open()`` is the same count without the atomicity — a cheap
+pre-check. Without ``max_open`` nothing changes. The classifier turns
+``QueueFull`` into a 429 with a ``Retry-After`` (``CLASSIFIER_QUEUE_LIMIT``).
+``InMemoryRegistry`` has neither: its jobs live inside a caller's ``with``
+block, and a service in front of it bounds them with its own port pool or
+semaphore.
+
 * ``WorkerPool`` (from ``common.jobs.worker``) — N asyncio workers looping on
   ``claim_next``, with wake/poll, crash recovery, and an ``on_finish`` metrics
-  hook. The consumer supplies ``async handler(JobBase) -> dict``.
+  hook. The consumer supplies ``async handler(JobBase) -> dict``. Opt-in
+  cancel awareness (``cancel_check_interval``): the handler runs as a child
+  task, the worker re-reads the row each interval and cancels the child when
+  the row turns ``cancelled`` (``registry.cancel``) or is deleted, its
+  terminal writes are guarded (``from_phases``) so a late result never
+  overwrites a cancel, and an ``on_cancel(job, gone)`` hook cleans up after
+  the handler has unwound. That pool is what makes ``POST /jobs/{id}/cancel``
+  stop the work on a persistent registry; the classifier runs one.
 
 * ``FilePayloadStore`` (from ``common.jobs.payloads``) — one JSON file per job
   for inputs too large for ``metadata`` (images, request bodies), so a queued
@@ -60,7 +80,10 @@ cannot see:
   also writes the log line, so logging a milestone and moving the gauge are
   one call. ``async with gauge.running()`` flushes it to a store about once a
   second and writes the terminal ``done`` / ``failed`` state before the
-  handler returns. Progress never fails a job.
+  handler returns. Progress never fails a job. The fourth terminal state,
+  ``cancelled``, is never the gauge's: a cancel skips its final flush, and
+  the cleanup after a user's cancel writes it (``PostgresProgressStore.
+  cancelled``).
 
 * ``PostgresProgressStore`` (from ``common.jobs.progress_postgres``) — the
   snapshot in the job row's ``metadata.progress`` (so ``GET /jobs/{id}``
@@ -77,6 +100,7 @@ dep at top-level and will raise a clear ImportError if the consumer forgot
 to depend on it.
 """
 
+from .admission import QueueFull
 from .model import JobBase, JobsListResponse
 from .memory import InMemoryRegistry, JobHandle
 
@@ -85,4 +109,5 @@ __all__ = [
     "JobsListResponse",
     "InMemoryRegistry",
     "JobHandle",
+    "QueueFull",
 ]

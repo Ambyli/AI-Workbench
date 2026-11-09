@@ -26,6 +26,9 @@ quality criteria apply as before.
 Then, before anything is queued — every one of these is a 400 on THIS
 request rather than a job that fails in a worker a minute later:
 
+  0. (first of all, before the body is read) room in the queue:
+     ``queue.check_room`` — at CLASSIFIER_QUEUE_LIMIT open jobs it is a 429
+     with a Retry-After, and none of the work below is done;
   1. validate the request (per-type options, caps, text patterns, unique
      names, dependencies, cycles, ``score: false`` only where there is
      geometry, the static reference rules, the ``model`` / ``options.model``
@@ -54,8 +57,10 @@ request rather than a job that fails in a worker a minute later:
      here, because the worker never touches the network. A link that cannot
      be fetched is blanked and becomes a ``documents[].warnings`` line; it
      never fails the request;
-  4. register a job row in phase "staging", write the payload, flip the row
-     to "pending", wake a worker — ``_enqueue`` — and return 202.
+  4. register a job row in phase "staging" (``queue.admit`` — the
+     authoritative queue-limit check, a 429 if the queue filled meanwhile),
+     write the payload, flip the row to "pending", wake a worker —
+     ``_enqueue`` — and return 202.
 
 ``/locate`` and ``/assess/compare`` no longer exist and answer 404 like any
 unknown route; ``/locate``'s job is now ``score: false`` on a criterion here.
@@ -89,7 +94,7 @@ from cv import get_detector
 # A module, not names: is_configured() reads DETECTOR_URL at call time.
 from detector import client as detector_client
 from jobs.payloads import SubmittedDocument, build_assess_payload
-from jobs.queue import jobs_registry, queue
+from jobs.queue import queue
 # A module, not names: the registry is looked up at call time (tests swap it).
 from llm import models as llm_models
 from logger import logger
@@ -419,8 +424,16 @@ async def assess(request: Request):
 
     Accepts JSON or multipart (see the module docstring); both are parsed
     into the same ``AssessRequest``. Poll ``GET /jobs/{job_id}`` until
-    ``phase`` is "completed" or "failed".
+    ``phase`` is "completed", "failed" or "cancelled" (``POST
+    /jobs/{job_id}/cancel``).
+
+    A full queue (CLASSIFIER_QUEUE_LIMIT) is a 429 + Retry-After
+    (``jobs.queue.QueueFullError``, answered by ``main``) — checked FIRST,
+    before the body is read, so it costs no URL or SVG image fetch. A
+    malformed request therefore gets its 429 while the queue is full and its
+    400 on the retry.
     """
+    await queue.check_room("assess")
     content_type = (request.headers.get("content-type") or "").lower()
     if content_type.startswith(("multipart/form-data", "application/x-www-form-urlencoded")):
         model, uploads = await _from_form(request)
@@ -447,7 +460,10 @@ async def assess(request: Request):
         [f"{c.name}({c.type})" for c in model.criteria],
     )
 
-    job_id = await jobs_registry.register(
+    # The row, in "staging" — or a 429 when the queue filled up while this
+    # request was being read (admit is the authoritative check; nothing is
+    # written then).
+    job_id = await queue.admit(
         ClassifierMetadata(
             type="assess",
             request_id=request_id_var.get("-"),
@@ -455,7 +471,7 @@ async def assess(request: Request):
             # while it is queued or running. None (left out) without references.
             references=resolved.reference_ids or None,
         ),
-        initial_phase="staging",
+        "assess",
     )
     depth = await _enqueue(
         job_id,

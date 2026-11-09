@@ -58,6 +58,7 @@ from config import (
     MAX_UNITS_PER_JOB,
     OCR_WORKERS,
     PDF_RENDER_DPI,
+    QUEUE_LIMIT,
     REFERENCE_AUTO_MIN_CONFIDENCE,
     REFERENCE_AUTO_POOL_MAX,
     REFERENCE_DIR,
@@ -337,6 +338,10 @@ def list_document_kinds():
                 "pdf_render_dpi": PDF_RENDER_DPI,
                 "svg_max_render_pixels": DEFAULT_MAX_RENDER_PIXELS,
                 "max_concurrent_jobs": MAX_CONCURRENT,
+                # CLASSIFIER_QUEUE_LIMIT; null when 0 (no limit).
+                "queue_limit": QUEUE_LIMIT or None,
+                "queue": "jobs waiting or running at once; past it POST /assess and "
+                         "POST /references answer 429 with a Retry-After (null: no limit)",
                 "max_units_per_job": MAX_UNITS_PER_JOB,
                 "ocr_workers": OCR_WORKERS,
                 # Text budget, images per prompt, model calls in flight and

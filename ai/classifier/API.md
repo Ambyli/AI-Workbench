@@ -227,7 +227,7 @@ ai/classifier/
     collect.py         visible_regions, inline_regions
     artifacts.py       regions.json, text.p{n}.<key>.json, the base images, the manifest (item map),
                        the per-item byte cap, render_layer
-    sweeper.py         the TTL task, the DELETE hook, the disk gauges
+    sweeper.py         the TTL task, the DELETE hook's directory half, the disk gauges
   references/          stored worked examples — never imports analysis or llm
     model.py           the Reference row, the id and file-name grammar, guides_llm
     store.py           ReferenceRegistry (`reference_examples` in classifier-db), the
@@ -260,8 +260,9 @@ ai/classifier/
   jobs/
     payloads.py        the one payload shape (schema 3: a list of documents)
     runners.py         run_assess, run_reference (the job POST /references queues)
-    queue.py           ClassifierQueue + the registry / queue / sweeper singletons, and each
-                       job type's progress STAGES
+    queue.py           ClassifierQueue + the registry / queue / sweeper singletons, each
+                       job type's progress STAGES, the cancel cleanup (finish_cancelled)
+                       and the DELETE hook (delete_job_side_data)
   bin/
     grounding_experiment.py   operator tool — runs where the model is
     reference_box_assess.py   operator tool — the box loop measured end to end through
@@ -297,12 +298,16 @@ imports back.
 ## Async job pattern
 
 `POST /assess` returns **202 Accepted** immediately with a job ID. Poll
-`GET /jobs/{job_id}` until `phase` is `"completed"` or `"failed"`, then read
-the `result` field — preferably long-polled, `?wait=30`, which holds each
-request until the job ends (at most 60 s; see
+`GET /jobs/{job_id}` until `phase` is `"completed"`, `"failed"` or
+`"cancelled"`, then read the `result` field — preferably long-polled,
+`?wait=30`, which holds each request until the job ends (at most 60 s; see
 [`GET /jobs/{job_id}`](#get-jobsjob_id) for why and the client pattern).
 While it runs, `metadata.progress` says how far along it is (see
-[§ Progress](#progress)).
+[§ Progress](#progress)). A job you no longer want is stopped with
+[`POST /jobs/{job_id}/cancel`](#post-jobsjob_idcancel) — within about a
+second, even mid-analysis. With `CLASSIFIER_QUEUE_LIMIT` set, a submit to a
+full queue is a **429** with a `Retry-After` instead of a 202: wait that
+long and resubmit ([§ Concurrency and durability](#concurrency-and-durability)).
 
 ```
 POST /assess  →  {"job_id": "abc123", "phase": "pending"}
@@ -310,6 +315,7 @@ POST /assess  →  {"job_id": "abc123", "phase": "pending"}
 GET /jobs/abc123  →  {"phase": "processing", "metadata": {"progress": {"percent": 43.2, …}}}
 GET /jobs/abc123  →  {"phase": "completed", "result": {...}, "metadata": {...}}
 GET /jobs/abc123?wait=30  →  held until the job ends (or 30 s), then the same body
+POST /jobs/abc123/cancel  →  {"job_id": "abc123", "cancelled": true, "was_phase": "processing"}
 ```
 
 Job tracking is powered by the shared `common.jobs` package
@@ -370,9 +376,81 @@ in the one process) — and the model-call one is per MODEL:
 | `max_concurrent` (per model, [`models.yaml`](models.yaml)) | requests to THAT model in flight across ALL jobs, every call type — scoring, box ask, refine, verify, select, describe. Each model has its own limit, acquired in `llm/client.py` around the HTTP request itself, so no call path gets around it and a slow model never takes another's slots; a retry takes a fresh slot. Size it to the model: `muse-glimmer` schedules 8 sequences (`--max-num-seqs 8`) and the classifier takes 6, leaving 2 for the LiteLLM chat chains that also use it — their overflow hook spills chat to the next order (eventually Claude) once vLLM's waiting queue stays non-empty, so filling all 8 here would push chat off the local model | muse-glimmer: 6 |
 | `CLASSIFIER_OCR_WORKERS` | OCR passes at once (one ONNX inference each, in a worker thread) | 4 |
 
-Phases: `staging` → `pending` → `processing` → `completed` | `failed`.
-`staging` is the few milliseconds between the row being created and its
-payload landing on disk; workers never claim it.
+Phases: `staging` → `pending` → `processing` → `completed` | `failed`, or
+`cancelled` from any of the first three
+([`POST /jobs/{job_id}/cancel`](#post-jobsjob_idcancel)). `staging` is the
+few milliseconds between the row being created and its payload landing on
+disk; workers never claim it, and the flip to `pending` happens only from
+`staging`, so a cancel that lands mid-submit stays cancelled.
+
+**The end of the line: `CLASSIFIER_QUEUE_LIMIT`** (default `0` = no limit).
+Without it every submit is a 202 and a burst waits out the whole backlog
+behind it (p95 submit → finish was 739 s against a p50 of 21 s, Nov 2026).
+With it set, the limit counts every **open** job — `staging` + `pending` +
+`processing`, waiting AND running — and a submit that would make more is
+refused with **429** before anything is queued. Counting the running jobs is
+what makes it a concurrency knob as well as a cap on the wait:
+
+| Limit vs `CLASSIFIER_MAX_CONCURRENT` | Effect |
+|---|---|
+| equal | every accepted job starts at once; nothing waits |
+| smaller | at most `limit` jobs ever run; the other workers stay idle (startup logs a WARNING) |
+| larger | `limit − CLASSIFIER_MAX_CONCURRENT` jobs may wait — the old behaviour with an end to the line |
+
+Both submit endpoints, [`POST /assess`](#post-assess) and
+[`POST /references`](#post-references), check twice. First thing in the
+handler, before the body is read, a cheap count (`count_open()`): a full
+queue answers before any `type: "url"` fetch (up to 120 s each) or SVG image
+fetch is done — so a malformed request gets its 429 while the queue is full,
+and its 400 on the retry. Then at registration, the authoritative check: the
+`staging` row is inserted only if fewer than `limit` jobs are open, counted
+and inserted in one transaction behind a Postgres advisory lock
+(`common.jobs.postgres.PostgresRegistry.register(max_open=)`), so two
+submits racing for the last slot cannot both get it — the slot is taken at
+registration, before the payload is written. A reference refused there
+leaves no reference row, no job row and no payload.
+
+The 429 is FastAPI's shape, with `Retry-After` in whole seconds:
+
+```
+HTTP/1.1 429 Too Many Requests
+Retry-After: 14
+
+{"detail": "the classifier queue is full: 32 jobs waiting or running, the CLASSIFIER_QUEUE_LIMIT cap (32). Retry after 14 s."}
+```
+
+`Retry-After` is an **estimate**, not a constant — jobs run from ~2 s
+(route-policy's) to minutes (a multi-page document), and through
+`/v1/classifier` every retry is a metered gateway request: the median run
+time (claim → result) of the last 50 completed or failed jobs × the slots
+that must free up (`open − limit + 1`: one, unless a restart or a lowered
+limit left more open) ÷ the jobs that finish in parallel (`min(limit,
+CLASSIFIER_MAX_CONCURRENT)`), rounded up and clamped to 2–60 s; 10 s (the
+edge's own 503 value) until a job has finished since startup. The constants
+are in `config.py`, not env vars. There is no job id, so a refused caller
+has nothing to cancel or delete — it waits `Retry-After` and resubmits.
+
+A job that ends frees its slot at once — completed, failed, or cancelled
+([`POST /jobs/{job_id}/cancel`](#post-jobsjob_idcancel)); a
+[`DELETE /jobs/{job_id}`](#delete-jobsjob_id) of an unfinished job frees it
+too (the row is gone). A running job's runner takes up to
+`CANCEL_CHECK_INTERVAL_S` (1 s) to stop after its slot is freed, so with a
+limit below `CLASSIFIER_MAX_CONCURRENT` (idle workers waiting) a stopped job
+and the one admitted in its place can overlap for up to that second. A
+restart requeues the rows it left open and they keep
+their slots, so a container that comes back with more open than the limit
+(or one whose limit was lowered) answers 429 until they drain — startup
+logs that. The edge's `listen classifier` retries connection failures only,
+so a 429 passes it untouched, and LiteLLM's pass-through forwards the status,
+the body and the header. Route-policy records a 429 as `unavailable` (no
+retry inside the cycle — the next message is a new attempt); the in-repo
+batch tools (`bin/reference_box_assess.py`, `regions_report.py`) sleep
+`Retry-After` and resubmit for up to 10 minutes. **Lower the limit only once
+every caller treats a 429 that way** — the Operations Assistant (ZT-526)
+included; until then keep it at 32 or more (a limit of 32 would have refused
+nothing in a day of production traffic; 24 would have refused 2.4 % of
+submits) or 0. `GET /document-kinds` → `limits.queue_limit` shows the live
+value (`null` = none).
 
 Job inputs (the document bytes, resolved AT SUBMIT, plus the validated
 criteria) are written to `PAYLOAD_DIR` (default `/data/payloads`, on the
@@ -396,7 +474,14 @@ counted. Raise it if `classifier_llm_call_seconds{outcome="error", model=…}`
 shows calls dying at the limit; lowering that model's `max_concurrent`
 shortens each call instead. Fetching a `type: "url"` document has its own fixed 120 s timeout.
 
-Metrics: `classifier_job_queue_depth` (rows in `pending`),
+Metrics: `classifier_jobs_total{type, status}` (`pending` at submit, then
+`completed` | `failed` | `cancelled` — a cancel, or a running job deleted),
+`classifier_job_queue_depth` (rows in `pending`), `classifier_jobs_open`
+(`staging` + `pending` + `processing` — what `CLASSIFIER_QUEUE_LIMIT` counts;
+refreshed with the depth and on every refusal) against
+`classifier_job_queue_limit` (set at start, 0 = none),
+`classifier_jobs_rejected_total{type, reason="queue_full"}` (the 429s — a
+refused submit never counts as `pending`),
 `classifier_jobs_in_flight` (rows being processed), `classifier_llm_calls_total{status, model}`
 and `classifier_llm_latency_seconds` (every successful model request,
 unlabelled on purpose), plus a per-request breakdown by call **kind** and
@@ -480,13 +565,18 @@ finished — `100` means done, not "the last counter filled up".
 | `running` | A worker is on it |
 | `done` | Finished — `percent` is 100. Written before the job's `phase` turns `completed` |
 | `failed` | The job itself failed; `label` is `failed: <error>` and `percent` stays where it stopped. Written before `phase` turns `failed` |
+| `cancelled` | Stopped by [`POST /jobs/{job_id}/cancel`](#post-jobsjob_idcancel); `percent`, `stage` and the counters stay where it stopped. Written AFTER `phase` turns `cancelled` — once the runner has stopped, within about a second |
 
 `index` / `length` are the running stage's; `label` is the last checkpoint's
 (`"<criterion> · item <n>"` when a unit finishes). The snapshot is written at
 most once per `CLASSIFIER_PROGRESS_FLUSH_INTERVAL_S` (default 1 s, floor
 0.2), only when something moved, in one transaction with the history rows —
 so a poll can be up to a second behind. The terminal `done` / `failed` is
-always written, before the job's result.
+always written, before the job's result. `cancelled` is the one state the
+gauge never writes: a cancel stops it without a final flush (checkpoints
+since its last flush are lost), and the cancel's cleanup then writes
+`cancelled` on top of the last snapshot stored — for a job cancelled in its
+first second, or before it ran, that is attempt 0's `queued` one.
 
 **Attempts.** A job interrupted by a restart is requeued and run again from
 the start; each run is a new **attempt** (1, 2, …) with its own history, and
@@ -578,6 +668,25 @@ keys, a 400 on every request. `GET /criterion-types` → `box_loop` confirms
 the build. Results change only in what `options_used` / `GET
 /criterion-types` show (the new keys at their defaults) and in
 `request.criteria` (the new keys, `null` when unset).
+
+**The queue limit** (`CLASSIFIER_QUEUE_LIMIT`,
+[§ Concurrency and durability](#concurrency-and-durability)) defaults to 0 —
+no limit — in the code, the compose file and `.env.example`, so deploying
+the code changes nothing. To turn it on, add `CLASSIFIER_QUEUE_LIMIT=32` to
+the box's `.env` and `make up classifier` (a recreate: the edge answers
+`503` + `Retry-After` for a few seconds, and startup requeues open jobs,
+which count against the limit). No schema change, no drain. The shared
+`common.jobs` change (`register(max_open=)`, `count_open()`) ships inside the
+classifier image; the sandbox and the interceptor need no redeploy.
+`make up route-policy` in either order (it records a 429 as `unavailable`).
+Check `GET /document-kinds` → `limits.queue_limit` (32), then chart
+`classifier_jobs_open` against `classifier_job_queue_limit` and
+`classifier_jobs_rejected_total`. To see the 429 end to end, in a quiet
+window set the limit to 1, submit twice with `curl -i` both on `:8005` and on
+`https://api.zeoenergy.com/v1/classifier/assess` — both should show `429`
+and `Retry-After` (LiteLLM forwards the header) — then put 32 back. Lower it
+below 32 only once the Operations Assistant (ZT-526) waits `Retry-After` and
+resubmits on a 429.
 
 ---
 
@@ -1457,6 +1566,7 @@ caller's own `breakdown` / `regions` still win.
 | 404 | `from_job`: no such job |
 | 409 | `from_job`: the job is not a completed `/assess` job (still running, failed, or a reference job); its criteria no longer validate on this container. **And** `CLASSIFIER_REFERENCE_MAX_COUNT` (500) references already exist |
 | 410 | `from_job`: the job's artifacts are gone — the TTL sweeper or a `DELETE` took the directory, or the byte cap dropped `p{item}.base.jpg` |
+| 429 | The queue is full: `CLASSIFIER_QUEUE_LIMIT` jobs are already waiting or running. Checked before the body is read, and again when the creation job is registered — before the reference row, so nothing is left behind. `Retry-After` says how long to wait ([§ Concurrency and durability](#concurrency-and-durability)) |
 
 ### The creation job
 
@@ -3695,7 +3805,9 @@ OCR status, the limits, and the regions block.
           "text_layer_artifact": "text.p<item>.<key>.json per item and distinct setting; text.d<document>.<key>.json for a scope-document text search"},
   "limits": {"max_items": 20, "items": "every page of every document is one item; the cap is inclusive and counted at submit",
              "pdf_render_dpi": 150, "svg_max_render_pixels": 25000000,
-             "max_concurrent_jobs": 4, "max_units_per_job": 6, "ocr_workers": 4,
+             "max_concurrent_jobs": 4,
+             "queue_limit": 32, "queue": "jobs waiting or running at once; past it POST /assess and POST /references answer 429 with a Retry-After (null: no limit)",
+             "max_units_per_job": 6, "ocr_workers": 4,
              "models": "per model — GET /models (text_char_budget, max_images_per_prompt, max_concurrent, timeout_s)",
              "default_model": {"id": "muse-glimmer", "llm_text_char_budget": 60000,
                                "images_per_llm_prompt": 3, "max_concurrent": 6}},
@@ -3730,6 +3842,10 @@ image per prompt; `contrastive` (a PASS and a FAIL example in one call) needs
 
 `ocr.available` loads the engine to answer honestly — `false` when
 `CLASSIFIER_OCR_ENGINE=none` **and** when the engine failed to load.
+
+`limits.queue_limit` is `CLASSIFIER_QUEUE_LIMIT` — `null` when it is 0 (no
+limit; the example shows 32, the value recommended for the box). See
+[§ Concurrency and durability](#concurrency-and-durability) for what it counts.
 
 ---
 
@@ -3787,7 +3903,13 @@ more than `CLASSIFIER_MAX_ITEMS` items ([§ Items and the cap](#items-and-the-ca
 and every reference rule ([§ References — Refusals](#refusals-at-submit));
 **409** when a listed reference is not ready;
 **415** for
-a Content-Type that is neither JSON nor multipart; **502** when a document URL
+a Content-Type that is neither JSON nor multipart; **429** + `Retry-After`
+when `CLASSIFIER_QUEUE_LIMIT` jobs are already waiting or running — checked
+FIRST, before the body is read (so a malformed request gets its 400 only on
+the retry), and again at registration; no job is created, so wait
+`Retry-After` seconds and resubmit
+([§ Concurrency and durability](#concurrency-and-durability));
+**502** when a document URL
 cannot be fetched; **500** if the payload could not be persisted. A page image
 under `CLASSIFIER_MIN_IMAGE_WIDTH` × `CLASSIFIER_MIN_IMAGE_HEIGHT` (32 × 32 px)
 fails the JOB with "Image too small". It is a thumbnail-catcher only — OCR
@@ -3803,7 +3925,10 @@ crop of one text line submitted as its own document (what `regions_report.py
 Save a worked example. **Returns** `202 Accepted` —
 `{"reference_id": "r1a2b3c4d5e6f", "status": "pending", "job_id": "abc123"}`.
 The body, the creation job and every refusal are in
-[§ References](#references).
+[§ References](#references). Like `POST /assess`, a full queue
+(`CLASSIFIER_QUEUE_LIMIT`) is a **429** + `Retry-After` before the body is
+read, and nothing is created — no reference, no job
+([§ Concurrency and durability](#concurrency-and-durability)).
 
 ```bash
 curl http://localhost:4001/v1/classifier/references \
@@ -4103,7 +4228,7 @@ with `wait`.
 
 | Param | Effect |
 |---|---|
-| `wait` | Seconds to hold the request until the job's `phase` is `completed` or `failed` (default `0` — answer at once). A finite number ≥ 0; above **60** it is clamped to 60, not refused (`-1`, `nan`, `inf` are a **422**) |
+| `wait` | Seconds to hold the request until the job's `phase` is `completed`, `failed` or `cancelled` (default `0` — answer at once). A finite number ≥ 0; above **60** it is clamped to 60, not refused (`-1`, `nan`, `inf` are a **422**) |
 
 ```bash
 curl http://localhost:4001/v1/classifier/jobs/abc123 -H "Authorization: Bearer sk-1234"
@@ -4160,12 +4285,14 @@ through LiteLLM.
 ```
 
 `metadata.progress` is the job's progress snapshot — `state` `queued` →
-`running` → `done` | `failed`, and `percent` — see [§ Progress](#progress).
-While the job runs it is the field to watch; the history is at
-`GET /jobs/{job_id}/progress`.
+`running` → `done` | `failed` | `cancelled`, and `percent` — see
+[§ Progress](#progress). While the job runs it is the field to watch; the
+history is at `GET /jobs/{job_id}/progress`.
 
-`phase` values: `staging` → `pending` → `processing` → `completed` | `failed`
-(see § Async job pattern). A model outage does **not** fail the job — it fails
+`phase` values: `staging` → `pending` → `processing` → `completed` | `failed`,
+or `cancelled` from any of the first three (see § Async job pattern and
+[`POST /jobs/{job_id}/cancel`](#post-jobsjob_idcancel); a cancelled job has
+no `result` and no `error`). A model outage does **not** fail the job — it fails
 the criterion and the job completes with `complete: false`. `failed` means the
 job itself could not run: a thumbnail-sized page image, an undecodable file,
 or a payload from an older container (`metadata.type` `compare` / `locate`,
@@ -4225,6 +4352,60 @@ curl "http://localhost:4001/v1/classifier/jobs?limit=10" -H "Authorization: Bear
 
 ---
 
+### `POST /jobs/{job_id}/cancel`
+
+Stop a job: its `phase` turns `cancelled` **at once**, and a running job's
+analysis stops within about a second. No body.
+
+```bash
+curl -X POST http://localhost:4001/v1/classifier/jobs/abc123/cancel -H "Authorization: Bearer sk-1234"
+```
+
+```json
+{"job_id": "abc123", "cancelled": true, "was_phase": "processing"}
+```
+
+| Status | When |
+|---|---|
+| **200** | Cancelled. `was_phase` is the phase it was in: `staging`, `pending` or `processing` |
+| **404** | No such job (`no active job '<id>'`) — never submitted, deleted, or expired by the TTL sweeper |
+| **409** | It had already ended: `cannot cancel '<id>': already_completed` (or `already_failed`, `already_cancelled`). The job is untouched — its result stays |
+
+**What happens.** The phase flip is one transaction that reads the row
+`FOR UPDATE`, so a job that finishes at the same moment is either completed
+(and the cancel is a 409) or cancelled (and its result is never stored) —
+never both. Then:
+
+- **`staging` / `pending`** — no worker has it. It is never claimed, and the
+  request itself cleans up: the queued payload is deleted and the progress
+  snapshot turns `cancelled`.
+- **`processing`** — each worker re-reads its running job's row every
+  `CANCEL_CHECK_INTERVAL_S` (1 s, a `config.py` constant). Seeing
+  `cancelled`, it cancels the job's runner: every in-flight model request is
+  dropped (the model server sees the client disconnect) and the job's worker,
+  model and OCR slots are free for the next job. Its terminal writes are
+  guarded too, so a runner that finishes in that second cannot store a
+  result over the cancel. Once the runner has stopped, the payload is
+  deleted and the progress snapshot turns `cancelled`
+  ([§ Progress](#progress)) — so `metadata.progress.state` is the field that
+  says the work has actually stopped.
+
+`GET /jobs/{job_id}?wait=` treats `cancelled` as terminal and answers at
+once. The cancelled job keeps no `result` and no `error`. **What is kept:**
+its model-usage rows (the calls it made before it stopped, at
+[`GET /jobs/{job_id}/usage`](#get-jobsjob_idusage)) and whatever partial
+artifact directory it wrote, swept with the row after `JOB_TTL_HOURS` like
+any finished job's. **A reference creation job** (`POST /references`) fails
+its reference: `status: "failed"`, `error: "creation job <id> was
+cancelled"`, its files removed (a reference that was already `ready` stays
+ready). Counted in `classifier_jobs_total{status="cancelled"}`.
+
+**Cancel, then DELETE** to remove it and everything it left (route-policy's
+classifier client does exactly that for a job it gave up on). A DELETE on its
+own also stops a running job — see below.
+
+---
+
 ### `DELETE /jobs/{job_id}`
 
 Delete a job record, **its artifact directory** (text layers included), **its
@@ -4235,6 +4416,12 @@ the job is unknown. Both removals are wired in as
 never leave files that nothing points at. The hook runs before the row check:
 a DELETE on a job the TTL sweeper already removed still deletes its usage
 rows (the one thing the sweeper leaves behind) and then answers 404.
+
+**A running job is stopped**, as by a cancel: its worker sees the row gone
+within about a second (`CANCEL_CHECK_INTERVAL_S`) and cancels the runner.
+What the runner wrote between the hook and that moment — usage rows from
+calls that just finished, an artifact directory — is removed again once it
+has stopped, so the DELETE leaves nothing behind.
 
 ---
 

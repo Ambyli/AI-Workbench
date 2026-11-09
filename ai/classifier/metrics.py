@@ -28,7 +28,9 @@ from prometheus_client import Counter, Gauge, Histogram
 jobs_total = Counter(
     "classifier_jobs_total",
     "Total jobs by type and final status",
-    ["type", "status"],  # type: assess, status: pending|completed|failed
+    # type: assess | reference; status: pending (submitted) | completed |
+    # failed | cancelled (POST /jobs/{id}/cancel, or a running job deleted)
+    ["type", "status"],
 )
 job_duration = Histogram(
     "classifier_job_duration_seconds",
@@ -38,6 +40,27 @@ job_duration = Histogram(
 job_queue_depth = Gauge(
     "classifier_job_queue_depth",
     "Number of jobs currently waiting in phase=pending",
+)
+# The queue limit (CLASSIFIER_QUEUE_LIMIT, jobs/queue.py). `jobs_open` is what
+# the limit counts — every unfinished row, waiting or running — refreshed with
+# the depth gauge above (each submit, cancel and start) and on every refusal;
+# chart it against `job_queue_limit` (set at start; 0 = no limit). A refused
+# submit never reaches jobs_total{status="pending"}: it has no job id.
+jobs_open = Gauge(
+    "classifier_jobs_open",
+    "Jobs waiting or running (phases staging + pending + processing) — what "
+    "CLASSIFIER_QUEUE_LIMIT counts",
+)
+job_queue_limit = Gauge(
+    "classifier_job_queue_limit",
+    "CLASSIFIER_QUEUE_LIMIT: jobs that may be waiting or running at once (0 = no limit)",
+)
+jobs_rejected = Counter(
+    "classifier_jobs_rejected_total",
+    "Submits refused before a job was created, by job type and reason",
+    # type: assess | reference; reason: queue_full (a 429 — the queue was at
+    # CLASSIFIER_QUEUE_LIMIT)
+    ["type", "reason"],
 )
 jobs_in_flight = Gauge(
     "classifier_jobs_in_flight",

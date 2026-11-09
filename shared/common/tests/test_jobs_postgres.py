@@ -178,6 +178,136 @@ async def test_cancel_transitions_phase_and_refuses_terminal(
     assert reason3 == "not_found"
 
 
+async def test_cancel_refuses_every_terminal_phase_and_leaves_the_row(
+    registry: PostgresRegistry,
+) -> None:
+    done = await registry.register({"n": 1})
+    failed = await registry.register({"n": 2})
+    running = await registry.register({"n": 3}, "processing")
+    await registry.set_result(done, {"ok": True})
+    await registry.set_error(failed, "boom")
+    assert await registry.cancel(done) == (False, "already_completed")
+    assert await registry.cancel(failed) == (False, "already_failed")
+    assert (await registry.get(done)).result == {"ok": True}
+    assert (await registry.get(failed)).error == "boom"
+    assert await registry.cancel(running) == (True, "processing")
+
+
+async def test_guarded_writes_say_whether_they_landed(registry: PostgresRegistry) -> None:
+    job_id = await registry.register({"n": 1})
+    assert await registry.set_phase(job_id, "processing", from_phases=("pending",)) is True
+    assert await registry.set_phase(job_id, "pending", from_phases=("staging",)) is False
+    assert (await registry.get(job_id)).phase == "processing"
+    assert await registry.set_result(job_id, {"x": 1}, from_phases=("pending",)) is False
+    assert await registry.set_error(job_id, "no", from_phases=["staging", "pending"]) is False
+    got = await registry.get(job_id)
+    assert (got.phase, got.result, got.error) == ("processing", None, None)
+    assert await registry.set_result(job_id, {"x": 1}, from_phases=("processing",)) is True
+    assert await registry.set_error(job_id, "late", from_phases=("processing",)) is False
+    got = await registry.get(job_id)
+    assert (got.phase, got.result, got.error) == ("completed", {"x": 1}, None)
+
+
+async def test_unguarded_writes_still_land_anywhere_and_report_a_missing_row(
+    registry: PostgresRegistry,
+) -> None:
+    job_id = await registry.register({"n": 1})
+    await registry.cancel(job_id)
+    # Exactly the old behaviour: no guard, so it overwrites even a cancel.
+    assert await registry.set_result(job_id, {"ok": True}) is True
+    assert (await registry.get(job_id)).phase == "completed"
+    assert await registry.set_phase("ghost", "pending") is False
+    assert await registry.set_result("ghost", {}) is False
+    assert await registry.set_error("ghost", "x") is False
+
+
+async def test_a_guard_that_names_no_phase_is_refused(registry: PostgresRegistry) -> None:
+    job_id = await registry.register({"n": 1})
+    with pytest.raises(TypeError):
+        await registry.set_phase(job_id, "pending", from_phases="processing")
+    with pytest.raises(ValueError):
+        await registry.set_result(job_id, {}, from_phases=())
+
+
+async def test_a_cancel_holding_the_row_lock_wins_over_a_guarded_result(
+    registry: PostgresRegistry,
+) -> None:
+    """READ COMMITTED: the guarded UPDATE waits for the cancel's row lock,
+    then re-checks the phase against the committed row — and misses. The
+    other connection runs exactly cancel()'s statements, held open."""
+    import asyncio
+
+    job_id = await registry.register({"n": 1}, "processing")
+    conn = await asyncpg.connect(_DSN)
+    try:
+        tx = conn.transaction()
+        await tx.start()
+        await conn.execute("SELECT phase FROM jobs WHERE id = $1 FOR UPDATE", job_id)
+        await conn.execute("UPDATE jobs SET phase = 'cancelled' WHERE id = $1", job_id)
+        write = asyncio.create_task(
+            registry.set_result(job_id, {"late": True}, from_phases=("processing",))
+        )
+        await asyncio.sleep(0.3)
+        assert not write.done()  # waiting on the lock
+        await tx.commit()
+        assert await asyncio.wait_for(write, 5) is False
+    finally:
+        await conn.close()
+    got = await registry.get(job_id)
+    assert (got.phase, got.result) == ("cancelled", None)
+
+
+async def test_a_cancel_waits_for_a_result_holding_the_row_lock_and_refuses(
+    registry: PostgresRegistry,
+) -> None:
+    """The other order: the guarded result write holds the lock, cancel()'s
+    SELECT … FOR UPDATE waits for it, then sees ``completed``."""
+    import asyncio
+
+    job_id = await registry.register({"n": 1}, "processing")
+    conn = await asyncpg.connect(_DSN)
+    try:
+        tx = conn.transaction()
+        await tx.start()
+        status = await conn.execute(
+            "UPDATE jobs SET phase = 'completed', result = '{\"ok\": true}'::jsonb "
+            "WHERE id = $1 AND phase = ANY($2::text[])",
+            job_id, ["processing"],
+        )
+        assert status == "UPDATE 1"
+        cancel = asyncio.create_task(registry.cancel(job_id))
+        await asyncio.sleep(0.3)
+        assert not cancel.done()  # waiting on the lock
+        await tx.commit()
+        assert await asyncio.wait_for(cancel, 5) == (False, "already_completed")
+    finally:
+        await conn.close()
+    got = await registry.get(job_id)
+    assert (got.phase, got.result) == ("completed", {"ok": True})
+
+
+async def test_a_cancel_and_a_guarded_result_racing_have_one_winner(
+    registry: PostgresRegistry,
+) -> None:
+    """Whichever lands first, the other is refused, and the row says what
+    the winner wrote — over and over, on two pooled connections."""
+    import asyncio
+
+    for i in range(20):
+        job_id = await registry.register({"i": i}, "processing")
+        stored, (cancelled, why) = await asyncio.gather(
+            registry.set_result(job_id, {"i": i}, from_phases=("processing",)),
+            registry.cancel(job_id),
+        )
+        got = await registry.get(job_id)
+        assert stored != cancelled, (stored, cancelled, why)
+        if stored:
+            assert why == "already_completed" and got.phase == "completed"
+            assert got.result == {"i": i}
+        else:
+            assert why == "processing" and got.phase == "cancelled" and got.result is None
+
+
 async def test_delete(registry: PostgresRegistry) -> None:
     job_id = await registry.register(
         _Meta(type="assess", request_id="r"), "pending"
@@ -255,6 +385,139 @@ async def test_reset_phase_and_count_by_phase(registry: PostgresRegistry) -> Non
     assert await registry.count_by_phase() == {"pending": 2, "processing": 1}
     assert await registry.reset_phase("processing", "pending") == 1
     assert await registry.count_by_phase() == {"pending": 3}
+
+
+# ── Bounded admission (register(max_open=), count_open) ───────────────────
+async def test_max_open_admits_up_to_the_limit_and_refuses_with_no_row(
+    registry: PostgresRegistry,
+) -> None:
+    from common.jobs import QueueFull
+
+    ids = [await registry.register({"i": i}, "pending", max_open=3) for i in range(3)]
+    assert len(set(ids)) == 3
+    with pytest.raises(QueueFull) as info:
+        await registry.register({"i": 3}, "pending", max_open=3)
+    assert (info.value.open_jobs, info.value.limit) == (3, 3)
+    assert "3 job(s) waiting or running" in str(info.value)
+    # Nothing was written for the refusal.
+    assert await registry.count_by_phase() == {"pending": 3}
+    assert (await registry.list_all(limit=10)).active_count == 3
+
+
+async def test_terminal_rows_do_not_count_staging_and_custom_phases_do(
+    registry: PostgresRegistry,
+) -> None:
+    from common.jobs import QueueFull
+
+    for phase in ("completed", "failed", "cancelled"):
+        await registry.register({"done": phase}, phase)
+    assert await registry.count_open() == 0
+    # The classifier's "staging", a running job, an interceptor-style phase.
+    for phase in ("staging", "processing", "capturing"):
+        await registry.register({"open": phase}, phase)
+    assert await registry.count_open() == 3
+    with pytest.raises(QueueFull) as info:
+        await registry.register({}, "staging", max_open=3)
+    assert info.value.open_jobs == 3
+    # One finishing frees its slot at once — a cancel included.
+    staged = [j for j in (await registry.list_all(limit=20)).jobs if j.phase == "staging"][0]
+    assert await registry.cancel(staged.job_id) == (True, "staging")
+    assert await registry.count_open() == 2
+    await registry.register({}, "staging", max_open=3)
+    assert await registry.count_open() == 3
+
+
+async def test_open_rows_already_over_the_limit_refuse_until_they_drain(
+    registry: PostgresRegistry,
+) -> None:
+    """As after a restart (rows requeued) or a lowered limit: QueueFull
+    reports the real count, and admission resumes only below the limit."""
+    from common.jobs import QueueFull
+
+    ids = [await registry.register({"i": i}, "pending") for i in range(5)]
+    with pytest.raises(QueueFull) as info:
+        await registry.register({}, "pending", max_open=2)
+    assert (info.value.open_jobs, info.value.limit) == (5, 2)
+    for job_id in ids[:3]:
+        await registry.set_result(job_id, {"ok": True})
+    with pytest.raises(QueueFull):
+        await registry.register({}, "pending", max_open=2)  # 2 open: still full
+    await registry.delete(ids[3])  # a DELETE frees a slot too
+    await registry.register({}, "pending", max_open=2)
+    assert await registry.count_open() == 2
+
+
+async def test_concurrent_registers_on_separate_connections_never_overshoot(
+    registry: PostgresRegistry,
+) -> None:
+    """The race the advisory lock exists for: 20 submits on 20 connections
+    (20 registries, a pool of one each — as 20 processes would be) racing
+    for 5 slots. A count-then-insert without the lock lets several see room."""
+    import asyncio
+
+    from common.jobs import QueueFull
+
+    racers = [PostgresRegistry(_DSN, min_size=1, max_size=1) for _ in range(20)]
+    for r in racers:
+        await r.init()
+    try:
+        outcomes = await asyncio.gather(
+            *(r.register({"racer": i}, "staging", max_open=5) for i, r in enumerate(racers)),
+            return_exceptions=True,
+        )
+    finally:
+        for r in racers:
+            await r.close()
+    admitted = [o for o in outcomes if isinstance(o, str)]
+    refused = [o for o in outcomes if isinstance(o, QueueFull)]
+    assert len(admitted) == 5 and len(refused) == 15, outcomes
+    assert all(e.open_jobs == 5 and e.limit == 5 for e in refused)
+    assert await registry.count_open() == 5
+    assert await registry.count_by_phase() == {"staging": 5}
+
+
+async def test_max_open_none_is_unbounded_and_below_one_is_refused(
+    registry: PostgresRegistry,
+) -> None:
+    for i in range(12):
+        await registry.register({"i": i}, "pending", max_open=None)
+    assert await registry.count_open() == 12
+    for bad in (0, -1):
+        with pytest.raises(ValueError, match="None means no limit"):
+            await registry.register({}, "pending", max_open=bad)
+    for bad in (True, 2.5, "3"):
+        with pytest.raises(TypeError):
+            await registry.register({}, "pending", max_open=bad)
+    assert await registry.count_open() == 12  # nothing written by a refusal
+
+
+async def test_count_open_counts_every_unfinished_phase(registry: PostgresRegistry) -> None:
+    assert await registry.count_open() == 0
+    a = await registry.register({}, "staging")
+    b = await registry.register({})
+    await registry.register({})
+    await registry.claim_next()
+    assert await registry.count_open() == 3
+    await registry.set_error(a, "boom")
+    assert await registry.count_open() == 2
+    await registry.set_phase(b, "completed")
+    assert await registry.count_open() == 1
+
+
+async def test_max_open_works_on_an_external_pool(registry: PostgresRegistry) -> None:
+    """The classifier hands the registry its own pool (``pool=``): the
+    admission's transaction runs on a connection from it like any write."""
+    from common.jobs import QueueFull
+
+    pool = await asyncpg.create_pool(_DSN, min_size=1, max_size=2)
+    try:
+        shared = PostgresRegistry(pool=pool)
+        await shared.register({}, "staging", max_open=1)
+        with pytest.raises(QueueFull):
+            await shared.register({}, "staging", max_open=1)
+        assert await shared.count_open() == 1
+    finally:
+        await pool.close()
 
 
 # ── Retention ─────────────────────────────────────────────────────────────

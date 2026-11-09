@@ -49,8 +49,14 @@
         "header": [],
         "url": {
           "raw": "{{litellm}}/v1/madlad/health",
-          "host": ["{{litellm}}"],
-          "path": ["v1", "madlad", "health"]
+          "host": [
+            "{{litellm}}"
+          ],
+          "path": [
+            "v1",
+            "madlad",
+            "health"
+          ]
         },
         "description": "Liveness probe on madlad-api (the proxy container). Returns {\"status\": \"ok\"} once the FastAPI app has started — does NOT verify madlad-app (the inference container) is reachable, since the model is lazy-loaded on the first /translate or /languages call. Docker's own healthcheck for madlad-api polls this endpoint. See MADLAD.md § Health check."
       },
@@ -63,8 +69,14 @@
         "header": [],
         "url": {
           "raw": "{{litellm}}/v1/madlad/languages",
-          "host": ["{{litellm}}"],
-          "path": ["v1", "madlad", "languages"]
+          "host": [
+            "{{litellm}}"
+          ],
+          "path": [
+            "v1",
+            "madlad",
+            "languages"
+          ]
         },
         "description": "List the ~400 target languages MADLAD-400 supports. Response shape: {\"languages\": [{\"code\": \"af\", \"name\": \"Afrikaans\"}, {\"code\": \"am\", \"name\": \"Amharic\"}, …]}. Codes are ISO 639-1 where available, ISO 639-3 for low-resource languages, occasionally with a regional suffix (e.g. `zh_CN`). Names are resolved via the `langcodes` library. Use a returned `code` as `target_lang` in POST /translate.\n\nFirst call after container start triggers the lazy model download (~1-3 min for the ~3 GB CT2 checkpoint). Subsequent calls are instant. Proxied to madlad-app's /languages inside the ai_shared network; returns 502 with `Cannot reach madlad-app: …` if the inference container is down. See MADLAD.md § Supported languages."
       },
@@ -75,17 +87,30 @@
       "request": {
         "method": "POST",
         "header": [
-          { "key": "Content-Type", "value": "application/json" }
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
         ],
         "body": {
           "mode": "raw",
           "raw": "{\n  \"text\": \"Good morning\",\n  \"target_lang\": \"ja\"\n}",
-          "options": { "raw": { "language": "json" } }
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
         },
         "url": {
           "raw": "{{litellm}}/v1/madlad/translate",
-          "host": ["{{litellm}}"],
-          "path": ["v1", "madlad", "translate"]
+          "host": [
+            "{{litellm}}"
+          ],
+          "path": [
+            "v1",
+            "madlad",
+            "translate"
+          ]
         },
         "description": "Translate a single string. Body: {\"text\": string, \"target_lang\": string}. Source language is auto-detected by MADLAD — there is no `src` field. `target_lang` must be one of the codes returned by GET /languages (ISO 639-1 preferred, e.g. `es`, `fr`, `ja`, `zh`, `de`, `pt`, `ar`, `hi`, `ko`).\n\nResponse shape: {\"translated\": \"<string>\"}. First call after container start triggers the ~1-3 min lazy load. Steady-state latency is dominated by the model forward pass; the beam-search + repetition guards default to ~3-4× a greedy decode (see MADLAD.md § Decoding parameters for the current beam_size=4 / repetition_penalty=1.1 / no_repeat_ngram_size=3 / max_decoding_length=1024 defaults and when to tune).\n\nErrors: 400 for malformed JSON, 422 for missing fields, 502 with `Cannot reach madlad-app: …` if the inference container is unreachable. See MADLAD.md § Usage."
       },
@@ -100,18 +125,35 @@
           "request": {
             "method": "POST",
             "header": [
-              { "key": "Content-Type", "value": "application/json" },
-              { "key": "Accept", "value": "application/json, text/event-stream" }
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json, text/event-stream"
+              }
             ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 1,\n  \"method\": \"initialize\",\n  \"params\": {\n    \"protocolVersion\": \"2024-11-05\",\n    \"capabilities\": {},\n    \"clientInfo\": { \"name\": \"postman\", \"version\": \"0.0\" }\n  }\n}",
-              "options": { "raw": { "language": "json" } }
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
             "url": {
               "raw": "{{litellm}}/v1/madlad/mcp/",
-              "host": ["{{litellm}}"],
-              "path": ["v1", "madlad", "mcp", ""]
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "madlad",
+                "mcp",
+                ""
+              ]
             },
             "description": "MCP handshake. Response headers include `mcp-session-id` — copy it into the `mcpSessionId` collection variable. Response body is a JSON-RPC result advertising FastMCP's server info + capabilities."
           },
@@ -122,19 +164,39 @@
           "request": {
             "method": "POST",
             "header": [
-              { "key": "Content-Type", "value": "application/json" },
-              { "key": "Accept", "value": "application/json, text/event-stream" },
-              { "key": "Mcp-Session-Id", "value": "{{mcpSessionId}}" }
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json, text/event-stream"
+              },
+              {
+                "key": "Mcp-Session-Id",
+                "value": "{{mcpSessionId}}"
+              }
             ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 2,\n  \"method\": \"tools/list\",\n  \"params\": {}\n}",
-              "options": { "raw": { "language": "json" } }
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
             "url": {
               "raw": "{{litellm}}/v1/madlad/mcp/",
-              "host": ["{{litellm}}"],
-              "path": ["v1", "madlad", "mcp", ""]
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "madlad",
+                "mcp",
+                ""
+              ]
             },
             "description": "Enumerate available tools. madlad-api exposes exactly one: `translate(text: str, target_lang: str) -> str`. `text` is the source (any language, auto-detected); `target_lang` is an ISO 639-1 code (see GET /languages). Returns the translated string, or an `Error translating: …` string on upstream failure (the MCP tool does not raise — it swallows the httpx error into the return value)."
           },
@@ -145,19 +207,39 @@
           "request": {
             "method": "POST",
             "header": [
-              { "key": "Content-Type", "value": "application/json" },
-              { "key": "Accept", "value": "application/json, text/event-stream" },
-              { "key": "Mcp-Session-Id", "value": "{{mcpSessionId}}" }
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json, text/event-stream"
+              },
+              {
+                "key": "Mcp-Session-Id",
+                "value": "{{mcpSessionId}}"
+              }
             ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 3,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"translate\",\n    \"arguments\": {\n      \"text\": \"Good morning\",\n      \"target_lang\": \"ja\"\n    }\n  }\n}",
-              "options": { "raw": { "language": "json" } }
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
             "url": {
               "raw": "{{litellm}}/v1/madlad/mcp/",
-              "host": ["{{litellm}}"],
-              "path": ["v1", "madlad", "mcp", ""]
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "madlad",
+                "mcp",
+                ""
+              ]
             },
             "description": "Invoke the `translate` tool via MCP. Result body has a text-content block containing the translated string (e.g. `おはよう` for the example). Equivalent in effect to POST /translate — same lazy-load behavior on the first call, same beam-search decoding defaults. Difference is transport: this path is what chat models routed through LiteLLM's mcp_servers.madlad_translate hit when they decide to translate mid-conversation. See MADLAD.md § LiteLLM integration for the chat-completions → tool-call round-trip pattern."
           },

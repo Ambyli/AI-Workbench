@@ -45,8 +45,14 @@
         "header": [],
         "url": {
           "raw": "{{supabase}}/auth/v1/health",
-          "host": ["{{supabase}}"],
-          "path": ["auth", "v1", "health"]
+          "host": [
+            "{{supabase}}"
+          ],
+          "path": [
+            "auth",
+            "v1",
+            "health"
+          ]
         },
         "description": "GoTrue liveness. Returns { version, name, description } and 200 once auth has connected to Postgres. No API key required — this is the cheapest proof that the gateway is routing and the auth container is up.\n\nErrors: 503 from Envoy while supabase-auth is still starting (it waits on supabase-db being healthy, which can be ~90s on first boot). Connection refused means the gateway itself is down — check `make logs supabase supabase-api`.\n\nSee ai/supabase/SUPABASE.md § Verifying."
       },
@@ -65,8 +71,14 @@
         ],
         "url": {
           "raw": "{{supabase}}/rest/v1/",
-          "host": ["{{supabase}}"],
-          "path": ["rest", "v1", ""]
+          "host": [
+            "{{supabase}}"
+          ],
+          "path": [
+            "rest",
+            "v1",
+            ""
+          ]
         },
         "description": "PostgREST's OpenAPI description of every table and view exposed by SUPABASE_PGRST_DB_SCHEMAS (default public,graphql_public). Returns a JSON OpenAPI document; on a fresh instance `definitions` is essentially empty because no application tables exist.\n\nErrors: 401 with a JWSError / 'No API key found in request' when the `apikey` header is missing or was signed with a different SUPABASE_JWT_SECRET than the one PostgREST is running with. 500 from PostgREST usually means SUPABASE_JWT_JWKS was set non-empty, flipping it to asymmetric verification — see SUPABASE.md § Asymmetric keys.\n\nSee ai/supabase/SUPABASE.md § Access."
       },
@@ -89,11 +101,23 @@
         ],
         "url": {
           "raw": "{{supabase}}/rest/v1/:table?select=*&limit=10",
-          "host": ["{{supabase}}"],
-          "path": ["rest", "v1", ":table"],
+          "host": [
+            "{{supabase}}"
+          ],
+          "path": [
+            "rest",
+            "v1",
+            ":table"
+          ],
           "query": [
-            { "key": "select", "value": "*" },
-            { "key": "limit", "value": "10" }
+            {
+              "key": "select",
+              "value": "*"
+            },
+            {
+              "key": "limit",
+              "value": "10"
+            }
           ],
           "variable": [
             {
@@ -114,8 +138,14 @@
         "header": [],
         "url": {
           "raw": "{{supabase}}/storage/v1/status",
-          "host": ["{{supabase}}"],
-          "path": ["storage", "v1", "status"]
+          "host": [
+            "{{supabase}}"
+          ],
+          "path": [
+            "storage",
+            "v1",
+            "status"
+          ]
         },
         "description": "Storage API liveness. Returns 200 with an empty body once storage has migrated its schema and reached PostgREST and imgproxy.\n\nErrors: 503 while storage is still starting — in this compose file it waits for supabase-db, rest AND imgproxy to be healthy (tighter than upstream, which only waits for them to have started). A persistent 5xx usually means the storage schema migration failed; check `make logs supabase storage`.\n\nSee ai/supabase/SUPABASE.md § Verifying."
       },
@@ -134,8 +164,14 @@
         ],
         "url": {
           "raw": "{{supabase}}/functions/v1/hello",
-          "host": ["{{supabase}}"],
-          "path": ["functions", "v1", "hello"]
+          "host": [
+            "{{supabase}}"
+          ],
+          "path": [
+            "functions",
+            "v1",
+            "hello"
+          ]
         },
         "description": "Invoke the `hello` edge function — ai/supabase/volumes/functions/hello/index.ts, a plain Deno.serve handler. Returns { message, method, timestamp }.\n\nThis function is OURS, not upstream's sample: upstream's imports @supabase/server and authenticates with the new publishable/secret keys, which 401 in this deployment's legacy HS256 mode.\n\nErrors: 401 when SUPABASE_FUNCTIONS_VERIFY_JWT=true and the Bearer token is missing or invalid (the setting applies to ALL functions — there is no per-function override). 503 while supabase-functions is starting; it waits on the gateway being healthy.\n\nSee ai/supabase/SUPABASE.md § Vendored config."
       },
@@ -154,8 +190,17 @@
         ],
         "url": {
           "raw": "{{supabase}}/realtime/v1/api/tenants/realtime-dev/health",
-          "host": ["{{supabase}}"],
-          "path": ["realtime", "v1", "api", "tenants", "realtime-dev", "health"]
+          "host": [
+            "{{supabase}}"
+          ],
+          "path": [
+            "realtime",
+            "v1",
+            "api",
+            "tenants",
+            "realtime-dev",
+            "health"
+          ]
         },
         "description": "Realtime tenant health — the same check the container's own healthcheck runs. Returns { data: { healthy, db_connected, connected_cluster } }.\n\n`realtime-dev` is the tenant name Realtime derives from the hostname it is reached at, which is why the Envoy cluster config addresses the container as realtime-dev.supabase-realtime and the compose file adds that as a network alias on supabase_net.\n\nErrors: 401 when the Bearer token was signed with a different SUPABASE_JWT_SECRET. `healthy: false` with `db_connected: false` after a secret rotation is the one-shot-secret trap — Realtime stores the tenant's jwt_secret encrypted under SUPABASE_REALTIME_DB_ENC_KEY. See SUPABASE.md § Secrets that are one-shot."
       },
@@ -168,15 +213,27 @@
         "auth": {
           "type": "basic",
           "basic": [
-            { "key": "username", "value": "{{dashboardUser}}", "type": "string" },
-            { "key": "password", "value": "{{dashboardPassword}}", "type": "string" }
+            {
+              "key": "username",
+              "value": "{{dashboardUser}}",
+              "type": "string"
+            },
+            {
+              "key": "password",
+              "value": "{{dashboardPassword}}",
+              "type": "string"
+            }
           ]
         },
         "header": [],
         "url": {
           "raw": "{{supabase}}/",
-          "host": ["{{supabase}}"],
-          "path": [""]
+          "host": [
+            "{{supabase}}"
+          ],
+          "path": [
+            ""
+          ]
         },
         "description": "The Supabase Studio dashboard. Envoy puts HTTP basic auth in front of it using SUPABASE_DASHBOARD_USERNAME / SUPABASE_DASHBOARD_PASSWORD (the entrypoint SHA1-hashes the password into the Envoy user list at container start). Returns Studio's HTML.\n\nOpen this one in a browser rather than Postman. If Studio loads but its panels fail with CORS errors, SUPABASE_PUBLIC_URL does not exactly match the origin you typed — Envoy CORS is an exact match, and a trailing slash is enough to break it.\n\nErrors: 401 on wrong credentials. 503 while supabase-studio is still starting (the gateway waits for it to be healthy, and Studio in turn waits for postgres-meta).\n\nSee ai/supabase/SUPABASE.md § Access."
       },

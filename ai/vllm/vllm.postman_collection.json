@@ -64,8 +64,12 @@
             "header": [],
             "url": {
               "raw": "{{vllm_qwen3_8}}/health",
-              "host": ["{{vllm_qwen3_8}}"],
-              "path": ["health"]
+              "host": [
+                "{{vllm_qwen3_8}}"
+              ],
+              "path": [
+                "health"
+              ]
             },
             "description": "Liveness probe. Returns 200 with empty body once vLLM finishes loading the model (start_period: 300s in the compose healthcheck — model download + weight load takes minutes on cold start). Returns connection refused if the container is stopped; returns 503 during startup before the engine is ready."
           },
@@ -78,8 +82,13 @@
             "header": [],
             "url": {
               "raw": "{{vllm_qwen3_8}}/v1/models",
-              "host": ["{{vllm_qwen3_8}}"],
-              "path": ["v1", "models"]
+              "host": [
+                "{{vllm_qwen3_8}}"
+              ],
+              "path": [
+                "v1",
+                "models"
+              ]
             },
             "description": "OpenAI-compatible model list. Returns exactly one entry with id `qwen3.8` (from --served-model-name), regardless of the underlying HF repo. Use this to confirm the served alias before firing chat/completions. If the container is stopped: connection refused."
           },
@@ -90,17 +99,30 @@
           "request": {
             "method": "POST",
             "header": [
-              { "key": "Content-Type", "value": "application/json" }
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
             ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"model\": \"qwen3.8\",\n  \"messages\": [\n    {\"role\": \"user\", \"content\": \"Explain tensor parallelism in one sentence.\"}\n  ],\n  \"max_tokens\": 256,\n  \"temperature\": 0.7\n}",
-              "options": { "raw": { "language": "json" } }
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
             "url": {
               "raw": "{{vllm_qwen3_8}}/v1/chat/completions",
-              "host": ["{{vllm_qwen3_8}}"],
-              "path": ["v1", "chat", "completions"]
+              "host": [
+                "{{vllm_qwen3_8}}"
+              ],
+              "path": [
+                "v1",
+                "chat",
+                "completions"
+              ]
             },
             "description": "Chat completion against qwen3.8 (Qwen3.8-27B-AWQ-INT4, 131072-token context). The `model` field must match the --served-model-name (`qwen3.8`) — vLLM 400s on any other value. Supports `chat_template_kwargs: {\"reasoning_effort\": \"low|medium|high|xhigh\"}` (default `medium` from the fixed template). If the container is stopped: connection refused."
           },
@@ -111,17 +133,29 @@
           "request": {
             "method": "POST",
             "header": [
-              { "key": "Content-Type", "value": "application/json" }
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
             ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"model\": \"qwen3.8\",\n  \"prompt\": \"The three laws of robotics are:\\n1.\",\n  \"max_tokens\": 128,\n  \"temperature\": 0.7\n}",
-              "options": { "raw": { "language": "json" } }
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
             "url": {
               "raw": "{{vllm_qwen3_8}}/v1/completions",
-              "host": ["{{vllm_qwen3_8}}"],
-              "path": ["v1", "completions"]
+              "host": [
+                "{{vllm_qwen3_8}}"
+              ],
+              "path": [
+                "v1",
+                "completions"
+              ]
             },
             "description": "Legacy text-completion endpoint against qwen3.8 (131072-token context). Bypasses the chat template — the prompt is fed to the model verbatim, so reasoning/tool parsers don't fire. Prefer /v1/chat/completions for anything that needs the qwen_fixed_chat_template.jinja fixes. If the container is stopped: connection refused."
           },
@@ -140,8 +174,12 @@
             "header": [],
             "url": {
               "raw": "{{vllm_qwen3_8_solo}}/health",
-              "host": ["{{vllm_qwen3_8_solo}}"],
-              "path": ["health"]
+              "host": [
+                "{{vllm_qwen3_8_solo}}"
+              ],
+              "path": [
+                "health"
+              ]
             },
             "description": "Liveness probe. Returns 200 with empty body once vLLM finishes loading the model (start_period: 300s in the compose healthcheck; weights are shared with qwen3.8 via the vllm_data volume, so a second download is not needed). Returns connection refused if the container is stopped; returns 503 during startup before the engine is ready."
           },
@@ -154,8 +192,13 @@
             "header": [],
             "url": {
               "raw": "{{vllm_qwen3_8_solo}}/v1/models",
-              "host": ["{{vllm_qwen3_8_solo}}"],
-              "path": ["v1", "models"]
+              "host": [
+                "{{vllm_qwen3_8_solo}}"
+              ],
+              "path": [
+                "v1",
+                "models"
+              ]
             },
             "description": "OpenAI-compatible model list. Returns exactly one entry with id `qwen3.8-solo` (from --served-model-name). Use this to confirm the served alias before firing chat/completions — the `qwen3.8` alias belongs to the two-GPU container on port 8003, not this one. If the container is stopped: connection refused."
           },
@@ -166,18 +209,31 @@
           "request": {
             "method": "POST",
             "header": [
-              { "key": "Content-Type", "value": "application/json" }
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
             ],
             "url": {
               "raw": "{{vllm_qwen3_8_solo}}/v1/chat/completions",
-              "host": ["{{vllm_qwen3_8_solo}}"],
-              "path": ["v1", "chat", "completions"]
+              "host": [
+                "{{vllm_qwen3_8_solo}}"
+              ],
+              "path": [
+                "v1",
+                "chat",
+                "completions"
+              ]
             },
             "description": "Chat completion against qwen3.8-solo (131072-token context, single GPU). The `model` field must match the --served-model-name (`qwen3.8-solo`) — vLLM 400s on any other value. Supports `chat_template_kwargs: {\"reasoning_effort\": \"low|medium|high|xhigh\"}` (default `medium` from the fixed template). Expect roughly half the decode throughput of the TP=2 `qwen3.8` container and a 3-request concurrency cap; excess requests queue. If the container is stopped: connection refused.",
             "body": {
               "mode": "raw",
               "raw": "{\n  \"model\": \"qwen3.8-solo\",\n  \"messages\": [\n    {\"role\": \"user\", \"content\": \"Explain tensor parallelism in one sentence.\"}\n  ],\n  \"max_tokens\": 256,\n  \"temperature\": 0.7\n}",
-              "options": { "raw": { "language": "json" } }
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             }
           },
           "response": []
@@ -187,18 +243,30 @@
           "request": {
             "method": "POST",
             "header": [
-              { "key": "Content-Type", "value": "application/json" }
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
             ],
             "url": {
               "raw": "{{vllm_qwen3_8_solo}}/v1/completions",
-              "host": ["{{vllm_qwen3_8_solo}}"],
-              "path": ["v1", "completions"]
+              "host": [
+                "{{vllm_qwen3_8_solo}}"
+              ],
+              "path": [
+                "v1",
+                "completions"
+              ]
             },
             "description": "Legacy text-completion endpoint against qwen3.8-solo (131072-token context). Bypasses the chat template — the prompt is fed to the model verbatim, so reasoning/tool parsers don't fire. Prefer /v1/chat/completions for anything that needs the qwen_fixed_chat_template.jinja fixes. If the container is stopped: connection refused.",
             "body": {
               "mode": "raw",
               "raw": "{\n  \"model\": \"qwen3.8-solo\",\n  \"prompt\": \"The three laws of robotics are:\\n1.\",\n  \"max_tokens\": 128,\n  \"temperature\": 0.7\n}",
-              "options": { "raw": { "language": "json" } }
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             }
           },
           "response": []
@@ -216,8 +284,12 @@
             "header": [],
             "url": {
               "raw": "{{vllm_qwen3_6}}/health",
-              "host": ["{{vllm_qwen3_6}}"],
-              "path": ["health"]
+              "host": [
+                "{{vllm_qwen3_6}}"
+              ],
+              "path": [
+                "health"
+              ]
             },
             "description": "Liveness probe. Returns 200 empty once the engine is ready (start_period: 300s). Returns 503 during model load; connection refused if the container is stopped."
           },
@@ -230,8 +302,13 @@
             "header": [],
             "url": {
               "raw": "{{vllm_qwen3_6}}/v1/models",
-              "host": ["{{vllm_qwen3_6}}"],
-              "path": ["v1", "models"]
+              "host": [
+                "{{vllm_qwen3_6}}"
+              ],
+              "path": [
+                "v1",
+                "models"
+              ]
             },
             "description": "OpenAI-compatible model list. Returns exactly one entry with id `qwen3.6` (--served-model-name). If the container is stopped: connection refused."
           },
@@ -242,17 +319,30 @@
           "request": {
             "method": "POST",
             "header": [
-              { "key": "Content-Type", "value": "application/json" }
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
             ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"model\": \"qwen3.6\",\n  \"messages\": [\n    {\"role\": \"user\", \"content\": \"Write a haiku about garbage collection.\"}\n  ],\n  \"max_tokens\": 256,\n  \"temperature\": 0.7\n}",
-              "options": { "raw": { "language": "json" } }
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
             "url": {
               "raw": "{{vllm_qwen3_6}}/v1/chat/completions",
-              "host": ["{{vllm_qwen3_6}}"],
-              "path": ["v1", "chat", "completions"]
+              "host": [
+                "{{vllm_qwen3_6}}"
+              ],
+              "path": [
+                "v1",
+                "chat",
+                "completions"
+              ]
             },
             "description": "Chat completion against qwen3.6 (Qwen3.6-27B-AWQ-INT4, 131072-token context). `model` must be `qwen3.6`. Concurrency is limited: --max-num-seqs 3, so a fourth simultaneous request queues behind the batch. If the container is stopped: connection refused."
           },
@@ -263,17 +353,29 @@
           "request": {
             "method": "POST",
             "header": [
-              { "key": "Content-Type", "value": "application/json" }
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
             ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"model\": \"qwen3.6\",\n  \"prompt\": \"Once upon a time in a distributed system,\",\n  \"max_tokens\": 128,\n  \"temperature\": 0.7\n}",
-              "options": { "raw": { "language": "json" } }
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
             "url": {
               "raw": "{{vllm_qwen3_6}}/v1/completions",
-              "host": ["{{vllm_qwen3_6}}"],
-              "path": ["v1", "completions"]
+              "host": [
+                "{{vllm_qwen3_6}}"
+              ],
+              "path": [
+                "v1",
+                "completions"
+              ]
             },
             "description": "Legacy text-completion endpoint against qwen3.6 (131072-token context). Bypasses the chat template. If the container is stopped: connection refused."
           },
@@ -292,8 +394,12 @@
             "header": [],
             "url": {
               "raw": "{{vllm_qwen_vl}}/health",
-              "host": ["{{vllm_qwen_vl}}"],
-              "path": ["health"]
+              "host": [
+                "{{vllm_qwen_vl}}"
+              ],
+              "path": [
+                "health"
+              ]
             },
             "description": "Liveness probe. Returns 200 empty once the engine is ready (start_period: 180s — smaller model, faster load). Returns 503 during startup; connection refused if the container is stopped."
           },
@@ -306,8 +412,13 @@
             "header": [],
             "url": {
               "raw": "{{vllm_qwen_vl}}/v1/models",
-              "host": ["{{vllm_qwen_vl}}"],
-              "path": ["v1", "models"]
+              "host": [
+                "{{vllm_qwen_vl}}"
+              ],
+              "path": [
+                "v1",
+                "models"
+              ]
             },
             "description": "OpenAI-compatible model list. Returns one entry with id `Qwen/Qwen2.5-VL-7B-Instruct` (no --served-model-name override in the compose command). If the container is stopped: connection refused."
           },
@@ -318,17 +429,30 @@
           "request": {
             "method": "POST",
             "header": [
-              { "key": "Content-Type", "value": "application/json" }
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
             ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"model\": \"Qwen/Qwen2.5-VL-7B-Instruct\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": [\n        {\"type\": \"text\", \"text\": \"Describe this image in one sentence.\"},\n        {\"type\": \"image_url\", \"image_url\": {\"url\": \"https://upload.wikimedia.org/wikipedia/commons/thumb/4/47/PNG_transparency_demonstration_1.png/280px-PNG_transparency_demonstration_1.png\"}}\n      ]\n    }\n  ],\n  \"max_tokens\": 256\n}",
-              "options": { "raw": { "language": "json" } }
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
             "url": {
               "raw": "{{vllm_qwen_vl}}/v1/chat/completions",
-              "host": ["{{vllm_qwen_vl}}"],
-              "path": ["v1", "chat", "completions"]
+              "host": [
+                "{{vllm_qwen_vl}}"
+              ],
+              "path": [
+                "v1",
+                "chat",
+                "completions"
+              ]
             },
             "description": "Multimodal chat completion against Qwen2.5-VL-7B-Instruct (8192-token context — image tokens count against this, so keep image dimensions modest). `model` must be the full HF repo id. Pass images via `image_url` blocks — HTTP(S) URLs are fetched by vLLM (needs egress) or base64 data URIs are decoded inline. If the container is stopped: connection refused."
           },
@@ -339,17 +463,29 @@
           "request": {
             "method": "POST",
             "header": [
-              { "key": "Content-Type", "value": "application/json" }
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
             ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"model\": \"Qwen/Qwen2.5-VL-7B-Instruct\",\n  \"prompt\": \"A short poem about pixels:\",\n  \"max_tokens\": 128,\n  \"temperature\": 0.7\n}",
-              "options": { "raw": { "language": "json" } }
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
             "url": {
               "raw": "{{vllm_qwen_vl}}/v1/completions",
-              "host": ["{{vllm_qwen_vl}}"],
-              "path": ["v1", "completions"]
+              "host": [
+                "{{vllm_qwen_vl}}"
+              ],
+              "path": [
+                "v1",
+                "completions"
+              ]
             },
             "description": "Legacy text-completion endpoint (text-only — no image blocks here, use /v1/chat/completions for multimodal). 8192-token context. If the container is stopped: connection refused."
           },
@@ -368,8 +504,12 @@
             "header": [],
             "url": {
               "raw": "{{vllm_muse_glimmer}}/health",
-              "host": ["{{vllm_muse_glimmer}}"],
-              "path": ["health"]
+              "host": [
+                "{{vllm_muse_glimmer}}"
+              ],
+              "path": [
+                "health"
+              ]
             },
             "description": "Liveness probe. Returns 200 with empty body once vLLM finishes loading the target AND the DFlash drafter (start_period: 600s in the compose healthcheck — cold start pulls ~69 GB then shards across two GPUs). Returns connection refused if the container is stopped; returns 503 during startup before the engine is ready."
           },
@@ -382,8 +522,13 @@
             "header": [],
             "url": {
               "raw": "{{vllm_muse_glimmer}}/v1/models",
-              "host": ["{{vllm_muse_glimmer}}"],
-              "path": ["v1", "models"]
+              "host": [
+                "{{vllm_muse_glimmer}}"
+              ],
+              "path": [
+                "v1",
+                "models"
+              ]
             },
             "description": "OpenAI-compatible model list. Returns exactly one entry with id `muse-glimmer` (from --served-model-name); the DFlash drafter is not listed as a servable model. Use this to confirm the served alias before firing chat/completions. If the container is stopped: connection refused."
           },
@@ -394,18 +539,31 @@
           "request": {
             "method": "POST",
             "header": [
-              { "key": "Content-Type", "value": "application/json" }
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
             ],
             "url": {
               "raw": "{{vllm_muse_glimmer}}/v1/chat/completions",
-              "host": ["{{vllm_muse_glimmer}}"],
-              "path": ["v1", "chat", "completions"]
+              "host": [
+                "{{vllm_muse_glimmer}}"
+              ],
+              "path": [
+                "v1",
+                "chat",
+                "completions"
+              ]
             },
             "description": "Chat completion against muse-glimmer (262144-token context). The `model` field must match the --served-model-name (`muse-glimmer`) — vLLM 400s on any other value. Reasoning is returned in `reasoning_content` (muse_glimmer reasoning parser); depth is controlled by a system-prompt line `Reasoning strength: low|medium|high|xhigh`, not a chat_template_kwarg. Tool calls are parsed by the muse_glimmer tool parser into standard `tool_calls`; multiple calls arrive as consecutive assistant messages. Omit temperature/top_p/top_k to inherit Meta's published defaults via --generation-config auto. Output is bit-identical with or without DFlash — speculation only changes latency. If the container is stopped: connection refused.",
             "body": {
               "mode": "raw",
               "raw": "{\n  \"model\": \"muse-glimmer\",\n  \"messages\": [\n    {\"role\": \"system\", \"content\": \"Reasoning strength: medium\"},\n    {\"role\": \"user\", \"content\": \"Explain DFlash speculative decoding in two sentences.\"}\n  ],\n  \"max_tokens\": 512\n}",
-              "options": { "raw": { "language": "json" } }
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             }
           },
           "response": []
@@ -415,18 +573,31 @@
           "request": {
             "method": "POST",
             "header": [
-              { "key": "Content-Type", "value": "application/json" }
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
             ],
             "url": {
               "raw": "{{vllm_muse_glimmer}}/v1/chat/completions",
-              "host": ["{{vllm_muse_glimmer}}"],
-              "path": ["v1", "chat", "completions"]
+              "host": [
+                "{{vllm_muse_glimmer}}"
+              ],
+              "path": [
+                "v1",
+                "chat",
+                "completions"
+              ]
             },
             "description": "Multimodal chat completion — text + image_url content parts. Up to 4096 visual tokens per image; vLLM's default --limit-mm-per-prompt allows one image per request (400 `At most 1 image(s) may be provided in one request` beyond that — raise the limit in docker-compose.vllm.yml if needed); muse-glimmer runs with `--limit-mm-per-prompt '{\"image\": 3}'` for the classifier's reference-guided calls. If the container is stopped: connection refused.",
             "body": {
               "mode": "raw",
               "raw": "{\n  \"model\": \"muse-glimmer\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": [\n        {\"type\": \"text\", \"text\": \"What is shown here?\"},\n        {\"type\": \"image_url\", \"image_url\": {\"url\": \"https://upload.wikimedia.org/wikipedia/commons/thumb/4/47/PNG_transparency_demonstration_1.png/280px-PNG_transparency_demonstration_1.png\"}}\n      ]\n    }\n  ],\n  \"max_tokens\": 256\n}",
-              "options": { "raw": { "language": "json" } }
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             }
           },
           "response": []
@@ -436,18 +607,30 @@
           "request": {
             "method": "POST",
             "header": [
-              { "key": "Content-Type", "value": "application/json" }
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
             ],
             "url": {
               "raw": "{{vllm_muse_glimmer}}/v1/completions",
-              "host": ["{{vllm_muse_glimmer}}"],
-              "path": ["v1", "completions"]
+              "host": [
+                "{{vllm_muse_glimmer}}"
+              ],
+              "path": [
+                "v1",
+                "completions"
+              ]
             },
             "description": "Legacy text-completion endpoint against muse-glimmer (262144-token context). Bypasses the chat template — the prompt is fed verbatim, so the muse_glimmer reasoning/tool parsers don't fire and channel markers may appear raw in the output. Prefer /v1/chat/completions. If the container is stopped: connection refused.",
             "body": {
               "mode": "raw",
               "raw": "{\n  \"model\": \"muse-glimmer\",\n  \"prompt\": \"The three laws of robotics are:\\n1.\",\n  \"max_tokens\": 128\n}",
-              "options": { "raw": { "language": "json" } }
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             }
           },
           "response": []
@@ -473,17 +656,30 @@
           "request": {
             "method": "POST",
             "header": [
-              { "key": "Content-Type", "value": "application/json" }
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
             ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"model\": \"qwen3.8\",\n  \"messages\": [\n    {\"role\": \"user\", \"content\": \"Say hi via LiteLLM.\"}\n  ],\n  \"max_tokens\": 128\n}",
-              "options": { "raw": { "language": "json" } }
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
             "url": {
               "raw": "{{litellm}}/v1/chat/completions",
-              "host": ["{{litellm}}"],
-              "path": ["v1", "chat", "completions"]
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "chat",
+                "completions"
+              ]
             },
             "description": "Same qwen3.8 chat completion, routed through LiteLLM. `model` is the alias from litellm_config.yaml, not the HF repo id. Requires a valid virtual key with access to this alias. If the qwen3.8 container is stopped: LiteLLM returns 500 with an upstream connect error (`connection refused` from http://qwen3.8:8000)."
           },
@@ -494,17 +690,30 @@
           "request": {
             "method": "POST",
             "header": [
-              { "key": "Content-Type", "value": "application/json" }
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
             ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"model\": \"qwen3.8-solo\",\n  \"messages\": [\n    {\"role\": \"user\", \"content\": \"Say hi via LiteLLM.\"}\n  ],\n  \"max_tokens\": 128\n}",
-              "options": { "raw": { "language": "json" } }
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
             "url": {
               "raw": "{{litellm}}/v1/chat/completions",
-              "host": ["{{litellm}}"],
-              "path": ["v1", "chat", "completions"]
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "chat",
+                "completions"
+              ]
             },
             "description": "Same qwen3.8-solo chat completion, routed through LiteLLM. `model` is the alias from litellm_config.yaml (`qwen3.8-solo` -> http://qwen3.8-solo:8000/v1) — deliberately separate from `qwen3.8` so LiteLLM never round-robins onto a container that is down. Requires a valid virtual key with access to this alias. If the qwen3.8-solo container is stopped: LiteLLM returns 500 with an upstream connect error (`connection refused` from http://qwen3.8-solo:8000)."
           },
@@ -515,17 +724,30 @@
           "request": {
             "method": "POST",
             "header": [
-              { "key": "Content-Type", "value": "application/json" }
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
             ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"model\": \"qwen3.6\",\n  \"messages\": [\n    {\"role\": \"user\", \"content\": \"Say hi via LiteLLM.\"}\n  ],\n  \"max_tokens\": 128\n}",
-              "options": { "raw": { "language": "json" } }
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
             "url": {
               "raw": "{{litellm}}/v1/chat/completions",
-              "host": ["{{litellm}}"],
-              "path": ["v1", "chat", "completions"]
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "chat",
+                "completions"
+              ]
             },
             "description": "Same qwen3.6 chat completion, routed through LiteLLM. `model` is the alias. If the qwen3.6 container is stopped: LiteLLM returns 500 with an upstream connect error."
           },
@@ -536,17 +758,30 @@
           "request": {
             "method": "POST",
             "header": [
-              { "key": "Content-Type", "value": "application/json" }
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
             ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"model\": \"Qwen/Qwen2.5-VL-7B-Instruct\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": [\n        {\"type\": \"text\", \"text\": \"What is shown here?\"},\n        {\"type\": \"image_url\", \"image_url\": {\"url\": \"https://upload.wikimedia.org/wikipedia/commons/thumb/4/47/PNG_transparency_demonstration_1.png/280px-PNG_transparency_demonstration_1.png\"}}\n      ]\n    }\n  ],\n  \"max_tokens\": 256\n}",
-              "options": { "raw": { "language": "json" } }
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
             "url": {
               "raw": "{{litellm}}/v1/chat/completions",
-              "host": ["{{litellm}}"],
-              "path": ["v1", "chat", "completions"]
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "chat",
+                "completions"
+              ]
             },
             "description": "Multimodal chat completion routed through LiteLLM. `model` must match whatever alias litellm_config.yaml maps to vllm-qwen-vl (typically the full HF repo id since the container doesn't set --served-model-name). If the vllm-qwen-vl container is stopped: LiteLLM returns 500 with an upstream connect error."
           },
@@ -557,17 +792,30 @@
           "request": {
             "method": "POST",
             "header": [
-              { "key": "Content-Type", "value": "application/json" }
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
             ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"model\": \"muse-glimmer\",\n  \"messages\": [\n    {\"role\": \"user\", \"content\": \"Say hi via LiteLLM.\"}\n  ],\n  \"max_tokens\": 128\n}",
-              "options": { "raw": { "language": "json" } }
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
             "url": {
               "raw": "{{litellm}}/v1/chat/completions",
-              "host": ["{{litellm}}"],
-              "path": ["v1", "chat", "completions"]
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "chat",
+                "completions"
+              ]
             },
             "description": "Same muse-glimmer chat completion, routed through LiteLLM. `model` is the alias from litellm_config.yaml (`muse-glimmer` -> http://muse-glimmer:8000/v1), which also injects Meta's sampling defaults (temperature 1.0, top_p 0.95, top_k 64) and advertises `supports_vision: true`. Requires a valid virtual key with access to this alias. If the muse-glimmer container is stopped: LiteLLM returns 500 with an upstream connect error (`connection refused` from http://muse-glimmer:8000)."
           },

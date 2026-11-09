@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "llama",
-    "description": "llama.cpp `llama-server` endpoints — GGUF-quantized models exposed via an OpenAI-compatible HTTP surface plus llama.cpp-native extras. Every service in `ai/llama/docker-compose.llama.yml` is a standalone llama-server; the default deploy publishes the `glm5.2` container on `localhost:8010` (see `PORT_LLAMA_GLM52` in `.env`) with model alias `glm5.2`. The other two services are `qwen3.8-flash` on `localhost:8017` (`PORT_LLAMA_QWEN38_FLASH`, variable `llamaQwen38Flash`) and `glm5.3-flash` on `localhost:8020` (`PORT_LLAMA_GLM53_FLASH`, variable `llamaGlm53Flash`) \u2014 the latter is the CPU + RAM-only GLM-5.3-Flash service with no GPU, so budget minutes for time-to-first-token on large prompts. The fourth, `qwen3.5-4b` on `localhost:8028` (`PORT_LLAMA_QWEN35_4B`, variable `llamaQwen35_4b`, folder 'qwen3.5-4b'), is a small CPU-only model that only the document classifier's model registry calls (route-policy's `llm_classifier` evaluator) — it is not in LiteLLM. Set the collection variable `llama` to the direct-port base URL (default http://localhost:8010) — no auth is required on the direct port per LLAMA.md.\n\nThe 'Via LiteLLM' folder routes chat through the unified LiteLLM proxy at `{{litellm}}/v1/chat/completions` using the same `glm5.2` alias (registered in `ai/litellm/litellm_config.yaml` → `model_list`). LiteLLM requires bearer auth via a virtual master key.\n\nNotes:\n- `/v1/embeddings` is only mounted when `llama-server` is launched with `--embedding` (or `--pooling`). The current `glm5.2` command in `docker-compose.llama.yml` does NOT enable it, so no embeddings request is included by default. Add `--embedding` to the service `command:` block and uncomment the equivalent request if you need it.\n- First request after container start is slow — llama.cpp runs a warmup pass on the first inference call (see LLAMA.md § Non-obvious constraints).\n- The healthcheck has a 900 s `start_period` to cover the initial GGUF download; `/health` will 503 while the model is still loading.",
+    "description": "llama.cpp `llama-server` endpoints — GGUF-quantized models exposed via an OpenAI-compatible HTTP surface plus llama.cpp-native extras. Every service in `ai/llama/docker-compose.llama.yml` is a standalone llama-server; the default deploy publishes the `glm5.2` container on `localhost:8010` (see `PORT_LLAMA_GLM52` in `.env`) with model alias `glm5.2`. The other two services are `qwen3.8-flash` on `localhost:8017` (`PORT_LLAMA_QWEN38_FLASH`, variable `llamaQwen38Flash`) and `glm5.3-flash` on `localhost:8020` (`PORT_LLAMA_GLM53_FLASH`, variable `llamaGlm53Flash`) — the latter is the CPU + RAM-only GLM-5.3-Flash service with no GPU, so budget minutes for time-to-first-token on large prompts. The fourth, `qwen3.5-4b` on `localhost:8028` (`PORT_LLAMA_QWEN35_4B`, variable `llamaQwen35_4b`, folder 'qwen3.5-4b'), is a small CPU-only model that only the document classifier's model registry calls (route-policy's `llm_classifier` evaluator) — it is not in LiteLLM. Set the collection variable `llama` to the direct-port base URL (default http://localhost:8010) — no auth is required on the direct port per LLAMA.md.\n\nThe 'Via LiteLLM' folder routes chat through the unified LiteLLM proxy at `{{litellm}}/v1/chat/completions` using the same `glm5.2` alias (registered in `ai/litellm/litellm_config.yaml` → `model_list`). LiteLLM requires bearer auth via a virtual master key.\n\nNotes:\n- `/v1/embeddings` is only mounted when `llama-server` is launched with `--embedding` (or `--pooling`). The current `glm5.2` command in `docker-compose.llama.yml` does NOT enable it, so no embeddings request is included by default. Add `--embedding` to the service `command:` block and uncomment the equivalent request if you need it.\n- First request after container start is slow — llama.cpp runs a warmup pass on the first inference call (see LLAMA.md § Non-obvious constraints).\n- The healthcheck has a 900 s `start_period` to cover the initial GGUF download; `/health` will 503 while the model is still loading.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
     "_postman_id": "llama-collection"
   },
@@ -28,13 +28,13 @@
       "key": "llamaGlm53Flash",
       "value": "http://localhost:8020",
       "type": "string",
-      "description": "Direct-port base URL for the `glm5.3-flash` llama-server container. Published on `${PORT_LLAMA_GLM53_FLASH}` (default 8020) \u2192 container port 8000. On `ai_shared` it's http://glm5.3-flash:8000. Model alias is `glm5.3-flash`. This service runs GLM-5.3-Flash entirely on CPU + system RAM (no GPU) with MTP speculative decoding, so expect a long time-to-first-token on big prompts (LLAMA.md \u00a7 `glm5.3-flash` \u2014 GLM-5.3-Flash on CPU and RAM only)."
+      "description": "Direct-port base URL for the `glm5.3-flash` llama-server container. Published on `${PORT_LLAMA_GLM53_FLASH}` (default 8020) → container port 8000. On `ai_shared` it's http://glm5.3-flash:8000. Model alias is `glm5.3-flash`. This service runs GLM-5.3-Flash entirely on CPU + system RAM (no GPU) with MTP speculative decoding, so expect a long time-to-first-token on big prompts (LLAMA.md § `glm5.3-flash` — GLM-5.3-Flash on CPU and RAM only)."
     },
     {
       "key": "llamaQwen35_4b",
       "value": "http://localhost:8028",
       "type": "string",
-      "description": "Direct-port base URL for the `qwen3.5-4b` llama-server container (folder 'qwen3.5-4b'). Published on `${PORT_LLAMA_QWEN35_4B}` (default 8028) \u2192 container port 8000. On `ai_shared` it's http://qwen3.5-4b:8000 \u2014 the URL of the `qwen3.5-4b` entry in `ai/classifier/models.yaml`. Model alias is `qwen3.5-4b`. CPU only, thinking off by default, not registered in LiteLLM (LLAMA.md \u00a7 `qwen3.5-4b` \u2014 a small CPU model for route-policy)."
+      "description": "Direct-port base URL for the `qwen3.5-4b` llama-server container (folder 'qwen3.5-4b'). Published on `${PORT_LLAMA_QWEN35_4B}` (default 8028) → container port 8000. On `ai_shared` it's http://qwen3.5-4b:8000 — the URL of the `qwen3.5-4b` entry in `ai/classifier/models.yaml`. Model alias is `qwen3.5-4b`. CPU only, thinking off by default, not registered in LiteLLM (LLAMA.md § `qwen3.5-4b` — a small CPU model for route-policy)."
     },
     {
       "key": "litellm",
@@ -57,8 +57,12 @@
         "header": [],
         "url": {
           "raw": "{{llama}}/health",
-          "host": ["{{llama}}"],
-          "path": ["health"]
+          "host": [
+            "{{llama}}"
+          ],
+          "path": [
+            "health"
+          ]
         },
         "description": "Liveness probe. Returns `{\"status\":\"ok\"}` once the GGUF weights have finished loading. Returns 503 while the model is still loading — expected during the ~900 s `start_period` on first launch (initial UD-IQ1_S download is ~176 GB). LLAMA.md § No tests."
       },
@@ -71,8 +75,13 @@
         "header": [],
         "url": {
           "raw": "{{llama}}/v1/models",
-          "host": ["{{llama}}"],
-          "path": ["v1", "models"]
+          "host": [
+            "{{llama}}"
+          ],
+          "path": [
+            "v1",
+            "models"
+          ]
         },
         "description": "OpenAI-compatible model listing. Returns `{\"object\":\"list\",\"data\":[{\"id\":\"glm5.2\",\"object\":\"model\",...}]}` where the `id` matches the alias set via `-a` in the compose command (LLAMA.md § Configuration knobs). Use this to sanity-check that the alias the client sends in `\"model\"` matches what llama-server actually advertises."
       },
@@ -85,8 +94,12 @@
         "header": [],
         "url": {
           "raw": "{{llama}}/props",
-          "host": ["{{llama}}"],
-          "path": ["props"]
+          "host": [
+            "{{llama}}"
+          ],
+          "path": [
+            "props"
+          ]
         },
         "description": "llama.cpp-native server introspection. Returns default sampler params, model alias, model path, embedded chat template, build info, and enabled modalities. Handy for verifying that `--jinja` picked up GLM's chat template (LLAMA.md § Common pitfalls: forgetting `--jinja` gives raw-completion behavior)."
       },
@@ -97,17 +110,30 @@
       "request": {
         "method": "POST",
         "header": [
-          { "key": "Content-Type", "value": "application/json" }
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
         ],
         "body": {
           "mode": "raw",
           "raw": "{\n  \"model\": \"{{llamaModel}}\",\n  \"messages\": [\n    { \"role\": \"user\", \"content\": \"Hello!\" }\n  ]\n}",
-          "options": { "raw": { "language": "json" } }
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
         },
         "url": {
           "raw": "{{llama}}/v1/chat/completions",
-          "host": ["{{llama}}"],
-          "path": ["v1", "chat", "completions"]
+          "host": [
+            "{{llama}}"
+          ],
+          "path": [
+            "v1",
+            "chat",
+            "completions"
+          ]
         },
         "description": "OpenAI-compatible chat completion. Response shape mirrors OpenAI: `{id, object:\"chat.completion\", choices:[{message:{role,content},finish_reason}], usage:{...}}`. GLM's chat template is applied server-side because the compose command sets `--jinja` — without that flag the roles are ignored and you get raw-completion behavior (LLAMA.md § Common pitfalls). Add `\"stream\": true` for SSE streaming."
       },
@@ -118,17 +144,30 @@
       "request": {
         "method": "POST",
         "header": [
-          { "key": "Content-Type", "value": "application/json" }
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
         ],
         "body": {
           "mode": "raw",
           "raw": "{\n  \"model\": \"qwen3.8-flash\",\n  \"messages\": [\n    { \"role\": \"user\", \"content\": \"Hello!\" }\n  ]\n}",
-          "options": { "raw": { "language": "json" } }
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
         },
         "url": {
           "raw": "{{llamaQwen38Flash}}/v1/chat/completions",
-          "host": ["{{llamaQwen38Flash}}"],
-          "path": ["v1", "chat", "completions"]
+          "host": [
+            "{{llamaQwen38Flash}}"
+          ],
+          "path": [
+            "v1",
+            "chat",
+            "completions"
+          ]
         },
         "description": "OpenAI-compatible chat completion against the `qwen3.8-flash` llama-server container (port 8017 by default). The service is launched with thinking-mode sampling defaults (`--temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0`) baked into the compose `command:` block — see LLAMA.md § `qwen3.8-flash` sampling defaults. Override any of those per-request by passing `temperature`, `top_p`, `top_k`, `min_p`, or `presence_penalty` in the JSON body. Add `\"stream\": true` for SSE streaming."
       },
@@ -164,7 +203,7 @@
             "completions"
           ]
         },
-        "description": "OpenAI-compatible chat completion against the `glm5.3-flash` llama-server container (port 8020 by default) \u2014 GLM-5.3-Flash running entirely on CPU + RAM with MTP speculative decoding. Server defaults baked into the compose `command:` block: `--temp 1.0 --top-p 0.95`, chat-template `reasoning_effort=low`, `--reasoning-budget 8192`, `--n-predict 32768`. Override sampling per request via `temperature` / `top_p`; override the thinking level with `chat_template_kwargs: {\"reasoning_effort\": \"low\" | \"high\" | \"max\"}` (anything else is treated as `max`). Streaming (`\"stream\": true`) is strongly recommended \u2014 on a long uncached prompt the first token can take minutes because prompt processing runs on CPU. Errors: 503 while the model is still downloading / mlocking (first start: ~148 GB). LLAMA.md \u00a7 `glm5.3-flash` \u2014 GLM-5.3-Flash on CPU and RAM only."
+        "description": "OpenAI-compatible chat completion against the `glm5.3-flash` llama-server container (port 8020 by default) — GLM-5.3-Flash running entirely on CPU + RAM with MTP speculative decoding. Server defaults baked into the compose `command:` block: `--temp 1.0 --top-p 0.95`, chat-template `reasoning_effort=low`, `--reasoning-budget 8192`, `--n-predict 32768`. Override sampling per request via `temperature` / `top_p`; override the thinking level with `chat_template_kwargs: {\"reasoning_effort\": \"low\" | \"high\" | \"max\"}` (anything else is treated as `max`). Streaming (`\"stream\": true`) is strongly recommended — on a long uncached prompt the first token can take minutes because prompt processing runs on CPU. Errors: 503 while the model is still downloading / mlocking (first start: ~148 GB). LLAMA.md § `glm5.3-flash` — GLM-5.3-Flash on CPU and RAM only."
       },
       "response": []
     },
@@ -173,18 +212,34 @@
       "request": {
         "method": "POST",
         "header": [
-          { "key": "Content-Type", "value": "application/json" },
-          { "key": "Accept", "value": "text/event-stream" }
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "Accept",
+            "value": "text/event-stream"
+          }
         ],
         "body": {
           "mode": "raw",
           "raw": "{\n  \"model\": \"{{llamaModel}}\",\n  \"messages\": [\n    { \"role\": \"user\", \"content\": \"Write a short haiku about GPUs.\" }\n  ],\n  \"stream\": true\n}",
-          "options": { "raw": { "language": "json" } }
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
         },
         "url": {
           "raw": "{{llama}}/v1/chat/completions",
-          "host": ["{{llama}}"],
-          "path": ["v1", "chat", "completions"]
+          "host": [
+            "{{llama}}"
+          ],
+          "path": [
+            "v1",
+            "chat",
+            "completions"
+          ]
         },
         "description": "OpenAI-compatible chat completion with Server-Sent Events. Response is a stream of `data: {...}` chunks terminated by `data: [DONE]`, each chunk containing a `choices[0].delta.content` fragment. Postman shows the raw event stream in the response body."
       },
@@ -195,17 +250,29 @@
       "request": {
         "method": "POST",
         "header": [
-          { "key": "Content-Type", "value": "application/json" }
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
         ],
         "body": {
           "mode": "raw",
           "raw": "{\n  \"model\": \"{{llamaModel}}\",\n  \"prompt\": \"The three primary colors are\",\n  \"max_tokens\": 32,\n  \"temperature\": 0.7\n}",
-          "options": { "raw": { "language": "json" } }
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
         },
         "url": {
           "raw": "{{llama}}/v1/completions",
-          "host": ["{{llama}}"],
-          "path": ["v1", "completions"]
+          "host": [
+            "{{llama}}"
+          ],
+          "path": [
+            "v1",
+            "completions"
+          ]
         },
         "description": "OpenAI-compatible text completion (legacy, no chat template). Response shape: `{id, object:\"text_completion\", choices:[{text, index, finish_reason}], usage:{...}}`. Prefer `/v1/chat/completions` for anything that should honor GLM's chat template — this endpoint feeds the prompt string verbatim to the model."
       },
@@ -216,17 +283,28 @@
       "request": {
         "method": "POST",
         "header": [
-          { "key": "Content-Type", "value": "application/json" }
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
         ],
         "body": {
           "mode": "raw",
           "raw": "{\n  \"prompt\": \"Building a website can be done in 10 simple steps:\",\n  \"n_predict\": 64,\n  \"temperature\": 0.7,\n  \"stop\": [\"\\n\\n\"]\n}",
-          "options": { "raw": { "language": "json" } }
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
         },
         "url": {
           "raw": "{{llama}}/completion",
-          "host": ["{{llama}}"],
-          "path": ["completion"]
+          "host": [
+            "{{llama}}"
+          ],
+          "path": [
+            "completion"
+          ]
         },
         "description": "llama.cpp-native completion. Distinct from `/v1/completions`: exposes llama.cpp-specific sampler knobs (`n_predict`, `mirostat`, `top_k`, `min_p`, `repeat_penalty`, `grammar`, `json_schema`, `cache_prompt`, `slot_id`, ...) that the OpenAI-shaped endpoints don't. Response shape: `{content, tokens_predicted, tokens_evaluated, timings, stop, ...}`. Add `\"stream\": true` for NDJSON streaming (one `{content, stop}` object per line)."
       },
@@ -237,17 +315,28 @@
       "request": {
         "method": "POST",
         "header": [
-          { "key": "Content-Type", "value": "application/json" }
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
         ],
         "body": {
           "mode": "raw",
           "raw": "{\n  \"content\": \"Hello, world!\",\n  \"add_special\": false,\n  \"with_pieces\": false\n}",
-          "options": { "raw": { "language": "json" } }
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
         },
         "url": {
           "raw": "{{llama}}/tokenize",
-          "host": ["{{llama}}"],
-          "path": ["tokenize"]
+          "host": [
+            "{{llama}}"
+          ],
+          "path": [
+            "tokenize"
+          ]
         },
         "description": "llama.cpp-native tokenizer. Returns `{\"tokens\": [int, int, ...]}` — the model's tokenization of `content`. Pass `\"add_special\": true` to include BOS/EOS markers, `\"with_pieces\": true` to also get the string piece for each token id. Useful for context-window budgeting before firing a large completion at a 65 k-context server (see `-c 65536` in the compose command)."
       },
@@ -258,17 +347,28 @@
       "request": {
         "method": "POST",
         "header": [
-          { "key": "Content-Type", "value": "application/json" }
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
         ],
         "body": {
           "mode": "raw",
           "raw": "{\n  \"tokens\": [9707, 11, 1879, 0]\n}",
-          "options": { "raw": { "language": "json" } }
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
         },
         "url": {
           "raw": "{{llama}}/detokenize",
-          "host": ["{{llama}}"],
-          "path": ["detokenize"]
+          "host": [
+            "{{llama}}"
+          ],
+          "path": [
+            "detokenize"
+          ]
         },
         "description": "llama.cpp-native detokenizer. Returns `{\"content\": \"...\"}` — the string reconstructed from the token id array. Inverse of `/tokenize`. Handy when consuming logprobs or streaming diagnostics that surface raw token ids."
       },
@@ -285,8 +385,12 @@
             "header": [],
             "url": {
               "raw": "{{llamaQwen35_4b}}/health",
-              "host": ["{{llamaQwen35_4b}}"],
-              "path": ["health"]
+              "host": [
+                "{{llamaQwen35_4b}}"
+              ],
+              "path": [
+                "health"
+              ]
             },
             "description": "Liveness probe for `qwen3.5-4b`. Returns `{\"status\":\"ok\"}` once the 2.74 GB Q4_K_M GGUF has downloaded and loaded; 503 while it is still loading (the healthcheck's `start_period` is 600 s for the first download). LLAMA.md § `qwen3.5-4b` — a small CPU model for route-policy."
           },
@@ -297,17 +401,30 @@
           "request": {
             "method": "POST",
             "header": [
-              { "key": "Content-Type", "value": "application/json" }
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
             ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"model\": \"qwen3.5-4b\",\n  \"messages\": [\n    { \"role\": \"user\", \"content\": \"Is this request about code? \\\"my python script crashes with KeyError\\\". Answer as JSON: {\\\"score\\\": 1-10, \\\"reason\\\": \\\"...\\\"}\" }\n  ],\n  \"response_format\": { \"type\": \"json_object\" },\n  \"chat_template_kwargs\": { \"enable_thinking\": false },\n  \"max_tokens\": 128\n}",
-              "options": { "raw": { "language": "json" } }
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
             "url": {
               "raw": "{{llamaQwen35_4b}}/v1/chat/completions",
-              "host": ["{{llamaQwen35_4b}}"],
-              "path": ["v1", "chat", "completions"]
+              "host": [
+                "{{llamaQwen35_4b}}"
+              ],
+              "path": [
+                "v1",
+                "chat",
+                "completions"
+              ]
             },
             "description": "OpenAI-compatible chat completion shaped like a classifier scoring call: `response_format: {\"type\": \"json_object\"}` (llama-server turns it into a JSON grammar) and `chat_template_kwargs: {\"enable_thinking\": false}` — the same kwarg the classifier's `qwen3.5-4b` registry entry sends in its `extra_body`, and the server's own default (`--chat-template-kwargs`). Expect `choices[0].message.content` to be the JSON alone, with no `<think>` block and no `reasoning_content`, in a few dozen completion tokens; `timings` (llama.cpp's addition to the response) shows prompt and generation speed on CPU. Server defaults: `--temp 0.7 --top-p 0.8 --top-k 20 --min-p 0.0 --presence-penalty 0.0` (the model card's instruct preset without its presence penalty), `--n-predict 512` caps `max_tokens`. 503 while the model is loading. LLAMA.md § `qwen3.5-4b` — a small CPU model for route-policy."
           },
@@ -325,22 +442,39 @@
             "auth": {
               "type": "bearer",
               "bearer": [
-                { "key": "token", "value": "{{virtual master key}}", "type": "string" }
+                {
+                  "key": "token",
+                  "value": "{{virtual master key}}",
+                  "type": "string"
+                }
               ]
             },
             "method": "POST",
             "header": [
-              { "key": "Content-Type", "value": "application/json" }
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
             ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"model\": \"{{llamaModel}}\",\n  \"messages\": [\n    { \"role\": \"user\", \"content\": \"Hello via LiteLLM!\" }\n  ]\n}",
-              "options": { "raw": { "language": "json" } }
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
             "url": {
               "raw": "{{litellm}}/v1/chat/completions",
-              "host": ["{{litellm}}"],
-              "path": ["v1", "chat", "completions"]
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "chat",
+                "completions"
+              ]
             },
             "description": "Same OpenAI-compatible chat surface as the direct-port `/v1/chat/completions`, but proxied through LiteLLM. The `\"model\"` field must be `glm5.2` — that's the `model_name` LiteLLM matches on to route to the `openai/glm5.2` provider block. LiteLLM strips its virtual key and forwards to llama-server with `api_key: none`. Response shape is identical to the direct call. LLAMA.md § LiteLLM integration."
           },
@@ -352,23 +486,43 @@
             "auth": {
               "type": "bearer",
               "bearer": [
-                { "key": "token", "value": "{{virtual master key}}", "type": "string" }
+                {
+                  "key": "token",
+                  "value": "{{virtual master key}}",
+                  "type": "string"
+                }
               ]
             },
             "method": "POST",
             "header": [
-              { "key": "Content-Type", "value": "application/json" },
-              { "key": "Accept", "value": "text/event-stream" }
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "text/event-stream"
+              }
             ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"model\": \"{{llamaModel}}\",\n  \"messages\": [\n    { \"role\": \"user\", \"content\": \"Stream a two-line poem about tensor cores.\" }\n  ],\n  \"stream\": true\n}",
-              "options": { "raw": { "language": "json" } }
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
             "url": {
               "raw": "{{litellm}}/v1/chat/completions",
-              "host": ["{{litellm}}"],
-              "path": ["v1", "chat", "completions"]
+              "host": [
+                "{{litellm}}"
+              ],
+              "path": [
+                "v1",
+                "chat",
+                "completions"
+              ]
             },
             "description": "Streaming chat via LiteLLM. Same SSE `data: {...}` / `data: [DONE]` shape as the direct-port streaming request; LiteLLM passes chunks through as they arrive from llama-server. Look at LiteLLM logs (`make logs litellm`) if the stream stalls — the `stream_timeout` in `litellm_config.yaml` caps how long the proxy waits between chunks."
           },

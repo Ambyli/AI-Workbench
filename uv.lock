@@ -656,6 +656,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+apidocs = [
+    { name = "jsonschema" },
+]
 documents = [
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
@@ -679,6 +682,7 @@ dev = [
     { name = "asyncpg" },
     { name = "fastapi" },
     { name = "httpx" },
+    { name = "jsonschema" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "pillow" },
@@ -695,6 +699,7 @@ dev = [
 requires-dist = [
     { name = "httpx", marker = "extra == 'net'", specifier = ">=0.27" },
     { name = "httpx", marker = "extra == 'signals'", specifier = ">=0.27" },
+    { name = "jsonschema", marker = "extra == 'apidocs'", specifier = ">=4.23" },
     { name = "numpy", marker = "extra == 'documents'", specifier = ">=1.26" },
     { name = "onnxruntime", marker = "extra == 'documents'", specifier = ">=1.22.0" },
     { name = "pillow", marker = "extra == 'documents'", specifier = ">=11.3.0" },
@@ -707,7 +712,7 @@ requires-dist = [
     { name = "requests", specifier = ">=2.33" },
     { name = "websocket-client", specifier = ">=1.9" },
 ]
-provides-extras = ["documents", "net", "signals"]
+provides-extras = ["documents", "net", "signals", "apidocs"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -715,6 +720,7 @@ dev = [
     { name = "asyncpg" },
     { name = "fastapi" },
     { name = "httpx" },
+    { name = "jsonschema", specifier = ">=4.23" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "pillow", specifier = ">=11.3.0" },
     { name = "pillow-heif", specifier = ">=1.8.1,<2" },

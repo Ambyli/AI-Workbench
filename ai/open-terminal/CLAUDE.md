@@ -1,6 +1,6 @@
 # ai/open-terminal
 
-Open Terminal: Open WebUI's code-execution backend (it replaces the Pyodide code interpreter) — one fat Linux container with a persistent per-user `/home`, exposed as native function-calling tools plus a file sidebar, upload target and xterm pane. It runs a **locally built** `open-terminal-zeo:<tag>` (upstream + `patch_entrypoint.py`). Guide: [`OPEN_TERMINAL.md`](OPEN_TERMINAL.md). Compose: `docker-compose.open-terminal.yml`. API: `open-terminal.postman_collection.json`.
+Open Terminal: Open WebUI's code-execution backend (it replaces the Pyodide code interpreter) — one fat Linux container with a persistent per-user `/home`, exposed as native function-calling tools plus a file sidebar, upload target and xterm pane. It runs a **locally built** `open-terminal-zeo:<tag>` (upstream + `patch_entrypoint.py`). Guide: [`OPEN_TERMINAL.md`](OPEN_TERMINAL.md). Compose: `docker-compose.open-terminal.yml`. API: `open-terminal.postman_collection.json` + `open-terminal.schemas.json`.
 
 ## Rules
 
@@ -12,6 +12,7 @@ Open Terminal: Open WebUI's code-execution backend (it replaces the Pyodide code
 - **Terminal tools are native function calling only** — a model on `function_calling: legacy` gets none (the pill shows and does nothing). Selecting a terminal force-clears the Code Interpreter toggle.
 - **Custom image = unmerged upstream fix PR #118** for issue #119 (`capsh` as the unprivileged user dies with `unable to raise CAP_SETPCAP for BSET changes` whenever the allowlist is set; `SETPCAP` in `cap_add` does not help). `patch_entrypoint.py` rewrites it to `sudo -E capsh … --user=user` and fails the build if the script changed shape or already has the fix. When #118 ships: delete the Dockerfile + script and point the compose back at `ghcr.io/open-webui/open-terminal` — don't keep patching a fixed base. Never drop `--user=user` or set `user: root`.
 - **Recreate-class** (per-user accounts, PTY sessions). An allowlist change is `make up open-terminal` (the firewall is built at start). `down -v` drops `open_terminal_home` — every user's files, no backup.
+- **An image-tag bump re-checks `open-terminal.schemas.json`** (an open subset of the upstream API) against the new release (root `CLAUDE.md` § Postman collections).
 
 ## Cross-folder rules
 

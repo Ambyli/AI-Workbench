@@ -1,6 +1,6 @@
 # ai/madlad
 
-MADLAD-400 translation: `madlad-app` (CTranslate2 model, GPU) behind `madlad-api` (stateless proxy: `/translate`, `/languages`, the `translate` MCP tool). Guide: [`MADLAD.md`](MADLAD.md). Compose: `docker-compose.madlad.yml`. API: `madlad.postman_collection.json`.
+MADLAD-400 translation: `madlad-app` (CTranslate2 model, GPU) behind `madlad-api` (stateless proxy: `/translate`, `/languages`, the `translate` MCP tool). Guide: [`MADLAD.md`](MADLAD.md). Compose: `docker-compose.madlad.yml`. API: `madlad.postman_collection.json` + `madlad.schemas.json`.
 
 ## Rules
 

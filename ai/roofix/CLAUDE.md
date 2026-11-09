@@ -12,7 +12,7 @@ The Roofix ↔ Phoenix bridge: one event-sourced worker (`roofix`, FastAPI + APS
 - **Keep the `-label:${ROOFIX_PROCESSED_LABEL}` clause in `LISTENER_QUERY`**, or processed emails refill the 25-message fetch window every tick. Backfill the label on old rows with `POST /labels/backfill`.
 - **`config/field_mapping.json` is a stub on purpose** (Michael owns the mapping): milestone writes log "no milestone mapping" and skip until it is filled in. Not a bug to fix.
 - **Both services are recreate-class**: two `roofix` copies would double-tick APScheduler, and the processed-email store upserts rather than claims. Never label it swap.
-- Endpoint changes update `roofix.postman_collection.json` and `ROOFIX.md § Endpoints` together (root `CLAUDE.md` § Postman collections).
+- Endpoint changes update `roofix.postman_collection.json`, `roofix.schemas.json` and `ROOFIX.md § Endpoints` together (`scripts/api_schemas.py render`; root `CLAUDE.md` § Postman collections).
 
 ## Cross-folder rules
 

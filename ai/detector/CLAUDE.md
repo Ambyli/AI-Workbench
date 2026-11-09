@@ -13,7 +13,7 @@ Open-vocabulary object detector (OWLv2): an image plus free-text labels in, boxe
 - **No auth on the service.** The LiteLLM `/v1/detector` pass-through does the bearer check; never publish `PORT_DETECTOR` on an untrusted network. URL inputs go through `common.net.validate_url` (every resolved address); `labels` capped at `DETECTOR_MAX_LABELS`; images under 32 px refused; no `docker.sock`. [`DETECTOR.md § Security posture`](DETECTOR.md#security-posture).
 - **The model path is not unit-tested on purpose** (mocking the transformer tests the mock) — verify a `detectors/` change against `unit-tests/classifier/Neighborhood.jpeg` per `DETECTOR.md § Verifying a change`.
 - **Run `unit-tests/detector` in its own pytest process**, never with `unit-tests/classifier` (both ship a top-level `config.py`).
-- **An API change updates `detector.postman_collection.json` and `DETECTOR.md`** (root `CLAUDE.md` § Postman collections).
+- **An API change updates `detector.postman_collection.json`, `detector.schemas.json` and `DETECTOR.md`** together (`scripts/api_schemas.py render`; root `CLAUDE.md` § Postman collections).
 
 ## Cross-folder rules
 

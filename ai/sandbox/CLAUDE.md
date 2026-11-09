@@ -14,7 +14,7 @@ Runs untrusted, model-generated web apps (Streamlit, Gradio, Flask, FastAPI, Vit
 - **Sessions + idle TTL.** `create` / `run` return a `session_id`; passing it back reuses the container. The reaper enforces `SANDBOX_HARD_TTL_SECONDS` and `SANDBOX_IDLE_TTL_SECONDS` (via `metadata->>'last_used_at'`, bumped on every reuse call). Teardown: `close`, `DELETE /session/{id}`, `DELETE /jobs/{id}`.
 - **Env passed to a sandbox is immutable after spawn**; runner-controlled keys (`HTTP_PROXY`, `HTTPS_PROXY`, `PYTHONUNBUFFERED`, …) are refused and re-applied by the spawner.
 - **Classes:** `sandbox-proxy`, `sandbox-egress` swap; `sandbox-runner` recreate (slot semaphore, reaper), `sandbox-db` recreate. Use `make exec sandbox sandbox-proxy CMD='…'` for swap containers.
-- API shape changes update `sandbox-runner.postman_collection.json` and `ENDPOINTS.md` in the same change (root `CLAUDE.md` § Postman collections).
+- API shape changes update `sandbox-runner.postman_collection.json`, `sandbox-runner.schemas.json` and `ENDPOINTS.md` in the same change (`scripts/api_schemas.py render`; root `CLAUDE.md` § Postman collections).
 
 ## Cross-folder rules
 

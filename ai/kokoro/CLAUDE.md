@@ -1,6 +1,6 @@
 # ai/kokoro
 
-Kokoro-82M text-to-speech: `kokoro-app` (the model, GPU) behind `kokoro-api` (a stateless proxy with an OpenAI-compatible `POST /v1/audio/speech` and the `text_to_speech` MCP tool). Guide: [`KOKORO.md`](KOKORO.md). Compose: `docker-compose.kokoro.yml`. API: `kokoro.postman_collection.json`.
+Kokoro-82M text-to-speech: `kokoro-app` (the model, GPU) behind `kokoro-api` (a stateless proxy with an OpenAI-compatible `POST /v1/audio/speech` and the `text_to_speech` MCP tool). Guide: [`KOKORO.md`](KOKORO.md). Compose: `docker-compose.kokoro.yml`. API: `kokoro.postman_collection.json` + `kokoro.schemas.json`.
 
 ## Rules
 

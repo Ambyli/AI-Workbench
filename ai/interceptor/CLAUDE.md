@@ -11,7 +11,7 @@ Generic HTTP + MCP front-end for `common.cdp_interceptor`: opens a URL in headle
 - **`${…}` resolves only in a `fill` value inside `login_actions`**; anywhere else in `login_actions` it is a 400, in `actions` / `page_script` it is plain text. `login_actions` allow no `evaluate` and no `screenshot`, run once per capture and are never retried (a bad password must not lock the account). Never log or return a resolved value.
 - **Profiles are uploaded, not logged into here**: capture on a laptop (`uv run cdp-spy`), upload a `.tar.gz` (not `.zip`) to `POST /profiles/{name}/refresh`. Re-capture on `login_wall: true` unless `login_actions` cover it.
 - **Concurrency**: different profiles run in parallel; a second capture on the same profile runs on a temporary clone whose refreshed cookies are discarded; the port pool (`INTERCEPTOR_MAX_CONCURRENT`) caps everything, `429` past it.
-- Endpoint changes update `interceptor.postman_collection.json` and `INTERCEPTOR.md` together (root `CLAUDE.md` § Postman collections).
+- Endpoint changes update `interceptor.postman_collection.json`, `interceptor.schemas.json` and `INTERCEPTOR.md` together (`scripts/api_schemas.py render`; root `CLAUDE.md` § Postman collections).
 
 ## Cross-folder rules
 

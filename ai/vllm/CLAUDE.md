@@ -9,6 +9,7 @@ vLLM model servers on the box's three RTX A6000s: `qwen3.8-solo` (GPU 2, chain o
 - `--max-num-seqs` is a ceiling, not a reservation; the KV pool decides what runs.
 - `qwen3.8` and `qwen3.8-solo` stay separate LiteLLM aliases (one `model_name` would round-robin onto the one that is down).
 - `qwen3.8` (and `qwen3.8-flash` in `ai/llama`) mount `ai/jinja/qwen_fixed_chat_template.jinja` — patch it once, recreate both.
+- **An image-tag bump re-checks `vllm.schemas.json`** (an open subset of the upstream API) against the new release (root `CLAUDE.md` § Postman collections).
 
 ## Cross-folder rules
 

@@ -85,7 +85,7 @@ Any Python package or module a second project could plausibly want within six mo
 
 ## Result shapes declared beside the producer
 
-Every structured result a service returns has a shape declared next to its producer (a decorator), registered under the key consumers look it up by, served by an endpoint, and checked by a test that runs the real producer (failing on an undeclared key, a missing required key or a wrong value). Adding a producer or a key updates its declaration in the same change. Today: the classifier's `@describes` / `@result_spec` (`ai/classifier/CLAUDE.md`) and route-policy's `@declares(OutputSpec)` (`ai/route-policy/CLAUDE.md`).
+Every structured result a service returns has a shape declared next to its producer (a decorator), registered under the key consumers look it up by, served by an endpoint, and checked by a test that runs the real producer (failing on an undeclared key, a missing required key or a wrong value). Adding a producer or a key updates its declaration in the same change. Today: the classifier's `@describes` / `@result_spec` (`ai/classifier/CLAUDE.md`) and route-policy's `@declares(OutputSpec)` (`ai/route-policy/CLAUDE.md`). Route-policy's vote `detail` sub-schemas in `route-policy.schemas.json` are generated from its declarations (§ Postman collections), so a declaration change regenerates them.
 
 ## `ai/AI_INFRA.md` stays in sync
 

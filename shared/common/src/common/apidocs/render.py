@@ -15,10 +15,12 @@ a ``## Request and response schemas`` appendix with one ``###`` subsection
 per endpoint, in the file's order. Without the markers the block is appended
 at the end of the doc; with them, only what is between them changes.
 
-**Display form** (:func:`display_schema`): 2-space JSON, every ``$ref``
-inlined (a recursive definition stays under ``$defs``), and Pydantic's
+**Display form** (:func:`display_schema`, :func:`format_json`): every
+``$ref`` inlined (a recursive definition stays under ``$defs``), Pydantic's
 ``title`` keyword dropped wherever it is a keyword -- a property that is
-NAMED ``title`` stays.
+NAMED ``title`` stays -- and 2-space JSON in which a value holding only
+scalars (``{"type": "string"}``, ``["id", "version"]``) stays on one line
+when it fits in 100 columns.
 
 Both outputs keep their file's newline style. :func:`render_service` does
 one service and reports what changed; ``check=True`` writes nothing (what
@@ -66,8 +68,40 @@ def display_schema(schema: Any) -> Any:
     return transform(inlined, drop_title)
 
 
+LINE_WIDTH = 100
+
+
+def _flat(value: Any) -> bool:
+    """Scalars, lists of scalars, and objects of those: what may sit on one line."""
+    def scalar_list(v: Any) -> bool:
+        return isinstance(v, list) and not any(isinstance(x, (dict, list)) for x in v)
+
+    if isinstance(value, dict):
+        return all(not isinstance(v, (dict, list)) or scalar_list(v) for v in value.values())
+    return not isinstance(value, (dict, list)) or scalar_list(value)
+
+
+def format_json(value: Any, *, indent: int = 0, prefix: int = 0) -> str:
+    """``value`` as 2-space-indented JSON, with every flat value (``_flat``)
+    that fits in :data:`LINE_WIDTH` on one line -- ``{"type": "string"}``,
+    ``"required": ["id", "version"]`` -- so a schema reads as a shape, not a
+    column of brackets. ``prefix`` is what precedes it on its first line."""
+    one_line = json.dumps(value, ensure_ascii=False)
+    if not isinstance(value, (dict, list)) or not value or \
+            (_flat(value) and indent + prefix + len(one_line) <= LINE_WIDTH):
+        return one_line
+    pad = " " * (indent + 2)
+    if isinstance(value, dict):
+        lines = []
+        for key, item in value.items():
+            head = json.dumps(key, ensure_ascii=False) + ": "
+            lines.append(pad + head + format_json(item, indent=indent + 2, prefix=len(head)))
+        return "{\n" + ",\n".join(lines) + "\n" + " " * indent + "}"
+    return "[\n" + ",\n".join(pad + format_json(item, indent=indent + 2) for item in value) + "\n" + " " * indent + "]"
+
+
 def schema_block(schema: Any) -> str:
-    return "```json\n" + json.dumps(display_schema(schema), indent=2, ensure_ascii=False) + "\n```"
+    return "```json\n" + format_json(display_schema(schema)) + "\n```"
 
 
 def _line(label: str, body: Body) -> str:

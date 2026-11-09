@@ -566,11 +566,17 @@ def _describe(error: Any) -> str:
     if kind == "required":
         missing = [name for name in rule if isinstance(instance, dict) and name not in instance]
         return "missing required " + ", ".join(repr(n) for n in missing)
-    if kind in ("additionalProperties", "unevaluatedProperties"):
-        if isinstance(instance, dict):
+    if kind in ("additionalProperties", "unevaluatedProperties") and isinstance(instance, dict):
+        if kind == "additionalProperties":
             declared = set((error.schema.get("properties") or {}))
             patterns = list((error.schema.get("patternProperties") or {}))
             extra = [k for k in instance if k not in declared and not any(re.search(p, k) for p in patterns)]
+        else:
+            # What an allOf / $ref evaluated is the validator's to know; its
+            # message names the keys (keys only, never values).
+            found = re.search(r"\((.*) (?:was|were) unexpected\)", error.message)
+            extra = [k for k in instance if found and repr(k) in found.group(1)] if found else []
+        if extra:
             names = ", ".join(repr(k if len(k) <= 60 else k[:59] + "…") for k in extra[:10])
             return f"has undeclared properties: {names}" + (" …" if len(extra) > 10 else "")
         return f"fails {kind}"

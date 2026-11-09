@@ -335,6 +335,8 @@ def test_validate_reports_paths_and_rules_never_values():
     assert any(e.startswith("$.route: matches no anyOf branch (closest:") for e in errors)
     assert schemas.validate(schema, {"id": "6f0e8c1e-8f7e-4c55-9a39-0f3f7ab5d001", "messages": []}) == []
     assert schemas.validate(schema, {"messages": []}) == ["$: missing required 'id'"]
+    composed = {"type": "object", "allOf": [{"properties": {"a": {}}}], "unevaluatedProperties": False}
+    assert schemas.validate(composed, {"a": SECRET, "b": SECRET}) == ["$: has undeclared properties: 'b'"]
 
 
 def test_json_path():
@@ -359,6 +361,29 @@ def test_display_schema_inlines_refs_and_drops_title_keywords_only():
     # A recursive definition stays a reference, kept once under $defs.
     assert out["properties"]["tree"]["properties"]["kids"]["items"] == {"$ref": "#/$defs/Node"}
     assert set(out["$defs"]) == {"Node"}
+
+
+def test_format_json_keeps_flat_values_on_one_line():
+    value = {"type": "object", "required": ["id", "version"],
+             "properties": {"id": {"type": "string"}, "tags": {"type": ["string", "null"], "enum": ["a", None]},
+                            "long": {"description": "x" * 120}, "empty": {}}}
+    text = render.format_json(value)
+    assert json.loads(text) == value
+    assert text.splitlines() == [
+        "{",
+        '  "type": "object",',
+        '  "required": ["id", "version"],',
+        '  "properties": {',
+        '    "id": {"type": "string"},',
+        '    "tags": {"type": ["string", "null"], "enum": ["a", null]},',
+        '    "long": {',
+        f'      "description": "{"x" * 120}"',
+        "    },",
+        '    "empty": {}',
+        "  }",
+        "}",
+    ]
+    assert render.format_json([]) == "[]" and render.format_json("é") == '"é"'
 
 
 def _collection_for_render() -> Dict[str, Any]:

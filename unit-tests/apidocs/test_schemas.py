@@ -61,7 +61,6 @@ PENDING = {
     "madlad",
     "open-terminal",
     "roofix",
-    "route-policy",
     "sandbox-runner",
     "searxng",
     "signals",

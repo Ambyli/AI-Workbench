@@ -10,7 +10,8 @@ one canonical JSON form. The logic is ``common.apidocs``.
     render [--check] [<service>...]
         Write each entry into its endpoint's first Postman item (a final
         ``#### Schemas`` section; later items of the endpoint point to it)
-        and into the endpoint doc's generated appendix. ``<service>`` is a
+        and into ``<doc stem>_SCHEMAS.md`` beside the endpoint doc, which
+        links to it from a generated block. ``<service>`` is a
         schemas file's stem (``route-policy``); none = every one. With
         ``--check`` nothing is written and the exit status is 1 when a copy
         is stale (what ``unit-tests/apidocs`` runs).

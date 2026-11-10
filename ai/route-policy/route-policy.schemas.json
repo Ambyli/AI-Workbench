@@ -1,5 +1,5 @@
 {
-  "$comment": "Request/response JSON Schemas (draft 2020-12) for route-policy.postman_collection.json, rendered into its items' descriptions and ROUTE_POLICY.md's appendix. Edit here, then: uv run --no-sync python scripts/api_schemas.py render. A schema whose $comment says `generated from …` is rewritten by unit-tests/route-policy/test_api_schemas.py (API_SCHEMAS_UPDATE=1): never edit one.",
+  "$comment": "Request/response JSON Schemas (draft 2020-12) for route-policy.postman_collection.json, rendered into its items' descriptions and ROUTE_POLICY_SCHEMAS.md (linked from ROUTE_POLICY.md). Edit here, then: uv run --no-sync python scripts/api_schemas.py render. A schema whose $comment says `generated from …` is rewritten by unit-tests/route-policy/test_api_schemas.py (API_SCHEMAS_UPDATE=1): never edit one.",
   "service": "route-policy",
   "doc": "ROUTE_POLICY.md",
   "$defs": {

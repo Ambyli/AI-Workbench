@@ -1,5 +1,5 @@
 """Copy a schemas file into the places people read: the Postman item
-descriptions and the endpoint doc's appendix.
+descriptions and a generated Markdown file beside the endpoint doc.
 
 **Postman.** The FIRST item of each endpoint (collection order) ends its
 ``request.description`` with a ``#### Schemas`` section: the request body and
@@ -9,11 +9,16 @@ The section is always the description's last; rendering replaces it (or
 appends it) and touches nothing before it, so a second run changes nothing.
 An item whose endpoint has no entry loses any section it had.
 
-**Markdown.** The doc named by the file's ``doc`` gets one generated block
-between ``<!-- api-schemas:begin -->`` and ``<!-- api-schemas:end -->`` --
-a ``## Request and response schemas`` appendix with one ``###`` subsection
-per endpoint, in the file's order. Without the markers the block is appended
-at the end of the doc; with them, only what is between them changes.
+**Markdown.** The schemas go to ``<doc stem>_SCHEMAS.md`` beside the doc
+the file's ``doc`` names (``ROUTE_POLICY.md`` -> ``ROUTE_POLICY_SCHEMAS.md``,
+:attr:`SchemaFile.schemas_doc_path`), generated whole: a title, a header
+saying where it comes from, one ``##`` section per endpoint in the file's
+order (:func:`schemas_markdown`). The doc itself keeps one short generated
+block between ``<!-- api-schemas:begin -->`` and ``<!-- api-schemas:end -->``
+-- a ``## Request and response schemas`` heading and a line linking to that
+file (:func:`link_block`). Without the markers the block is appended at the
+end of the doc; with them, only what is between them changes. The sibling
+takes the doc's newline style.
 
 **Display form** (:func:`display_schema`, :func:`format_json`): every
 ``$ref`` inlined (a recursive definition stays under ``$defs``), Pydantic's
@@ -22,16 +27,18 @@ NAMED ``title`` stays -- and 2-space JSON in which a value holding only
 scalars (``{"type": "string"}``, ``["id", "version"]``) stays on one line
 when it fits in 100 columns.
 
-Both outputs keep their file's newline style. :func:`render_service` does
-one service and reports what changed; ``check=True`` writes nothing (what
-``scripts/api_schemas.py render --check`` and the tests run). Stdlib only.
+Every output keeps its file's newline style. :func:`render_service` does
+one service -- the collection, the doc's block, the sibling file -- and
+reports what changed (a missing sibling counts); ``check=True`` writes
+nothing (what ``scripts/api_schemas.py render --check`` and the tests run).
+Stdlib only.
 """
 
 from __future__ import annotations
 
 import json
 import pathlib
-from typing import Any, Dict, List, Mapping
+from typing import Any, Dict, List, Mapping, Optional
 
 from . import postman
 from .schemas import Body, Endpoint, SchemaFile, def_name, inline_refs, load_schemas, transform
@@ -39,7 +46,7 @@ from .schemas import Body, Endpoint, SchemaFile, def_name, inline_refs, load_sch
 SECTION_HEADING = "#### Schemas"
 BEGIN = "<!-- api-schemas:begin -->"
 END = "<!-- api-schemas:end -->"
-APPENDIX_HEADING = "## Request and response schemas"
+LINK_HEADING = "## Request and response schemas"
 
 
 # -- display ----------------------------------------------------------------------------
@@ -193,28 +200,42 @@ def apply_to_collection(collection: Dict[str, Any], schema_file: SchemaFile) -> 
 # -- Markdown ---------------------------------------------------------------------------------
 
 
-def markdown_appendix(schema_file: SchemaFile) -> str:
-    """The appendix (heading included, markers not)."""
+def schemas_markdown(schema_file: SchemaFile) -> str:
+    """The whole ``<doc stem>_SCHEMAS.md`` (LF line ends, trailing newline):
+    a title, where it comes from, one ``##`` section per endpoint."""
     name = schema_file.path.name
-    parts = [
-        APPENDIX_HEADING,
-        f"Generated from [`{name}`]({name}) by `uv run --no-sync python scripts/api_schemas.py render` "
-        "(root `CLAUDE.md` § Postman collections) — edit that file, never this section; an entry whose "
-        "`$comment` says `generated from …` comes from the code and is rewritten by the service's "
-        "`test_api_schemas.py`. An error status not listed under an endpoint answers the generic error "
-        "body the Postman collection's description names.",
-    ]
+    header = (f"Generated from [`{name}`]({name}) by `uv run --no-sync python scripts/api_schemas.py render` "
+              "(root `CLAUDE.md` § Postman collections) — edit that file, never this one; an entry whose "
+              "`$comment` says `generated from …` comes from the code and is rewritten by the service's "
+              "`test_api_schemas.py`. An error status not listed under an endpoint answers the generic error "
+              "body the Postman collection's description names.")
+    doc = schema_file.doc_path
+    if doc is not None:
+        header += f" Each endpoint's prose: [`{doc.name}`]({doc.name})."
+    parts = [f"# {schema_file.service} request and response schemas", header]
     for key, endpoint in schema_file.endpoints.items():
-        parts.append(f"### `{key}`")
+        parts.append(f"## `{key}`")
         parts.append(endpoint_markdown(endpoint))
-    return "\n\n".join(parts)
+    return "\n\n".join(parts) + "\n"
+
+
+def link_block(schema_file: SchemaFile) -> str:
+    """What the endpoint doc holds between the markers (markers not
+    included): a heading and one line pointing to the generated file."""
+    target, source = schema_file.schemas_doc_path, schema_file.path.name
+    if target is None:
+        raise ValueError(f"{source} names no `doc`")
+    return (f"{LINK_HEADING}\n\n"
+            f"Every endpoint's request and response JSON Schemas: [`{target.name}`]({target.name}), generated "
+            f"from [`{source}`]({source}) by `scripts/api_schemas.py render`.")
 
 
 def apply_to_markdown(text: str, schema_file: SchemaFile) -> str:
-    """``text`` with the generated block replaced, or appended when it has
-    no markers. Raises ValueError on a broken pair of markers."""
+    """The endpoint doc ``text`` with its generated link block replaced, or
+    appended when it has no markers. Raises ValueError on a broken pair of
+    markers."""
     newline = postman.newline_of(text)
-    block = f"{BEGIN}\n{markdown_appendix(schema_file)}\n{END}"
+    block = f"{BEGIN}\n{link_block(schema_file)}\n{END}"
     if newline != "\n":
         block = block.replace("\n", newline)
     begins, ends = text.count(BEGIN), text.count(END)
@@ -230,13 +251,14 @@ def apply_to_markdown(text: str, schema_file: SchemaFile) -> str:
 
 
 def render_service(schemas_path: "postman.PathLike", *, check: bool = False) -> List[pathlib.Path]:
-    """Render one schemas file into its collection and its doc. Returns the
-    files whose content differs from what the render produces (written
-    unless ``check``)."""
+    """Render one schemas file into its collection, its doc's link block and
+    the doc's ``*_SCHEMAS.md``. Returns the files whose content differs from
+    what the render produces -- a missing ``*_SCHEMAS.md`` included --
+    written unless ``check``."""
     schema_file = load_schemas(schemas_path)
     changed: List[pathlib.Path] = []
 
-    def update(path: pathlib.Path, old: str, new: str) -> None:
+    def update(path: pathlib.Path, old: Optional[str], new: str) -> None:
         if new != old:
             changed.append(path)
             if not check:
@@ -247,10 +269,17 @@ def render_service(schemas_path: "postman.PathLike", *, check: bool = False) -> 
     collection = json.loads(old)
     apply_to_collection(collection, schema_file)
     update(collection_path, old, postman.dumps(collection, postman.newline_of(old)))
-    doc = schema_file.doc_path
-    if doc is not None:
+    doc, target = schema_file.doc_path, schema_file.schemas_doc_path
+    if doc is not None and target is not None:
         old = postman.read_text(doc)
         update(doc, old, apply_to_markdown(old, schema_file))
+        newline = postman.newline_of(old)
+        text = schemas_markdown(schema_file)
+        try:
+            current: Optional[str] = postman.read_text(target)
+        except FileNotFoundError:
+            current = None
+        update(target, current, text if newline == "\n" else text.replace("\n", newline))
     return changed
 
 

@@ -5,7 +5,7 @@
     {
       "$comment": "what this is and how to re-render it",
       "service": "<collection-stem>",
-      "doc": "ROUTE_POLICY.md",            # the endpoint doc that gets the appendix (optional)
+      "doc": "ROUTE_POLICY.md",            # the endpoint doc; the schemas go to ROUTE_POLICY_SCHEMAS.md (optional)
       "$defs": {...},                      # shared definitions, "$ref": "#/$defs/<name>"
       "endpoints": {
         "POST /v1/x/run": {
@@ -355,6 +355,14 @@ class SchemaFile:
     def doc_path(self) -> Optional[pathlib.Path]:
         doc = self.data.get("doc")
         return self.path.parent / doc if doc else None
+
+    @property
+    def schemas_doc_path(self) -> Optional[pathlib.Path]:
+        """``<doc stem>_SCHEMAS.md`` beside the endpoint doc (``ROUTE_POLICY.md``
+        -> ``ROUTE_POLICY_SCHEMAS.md``): the generated file holding every
+        endpoint's schemas. None without a ``doc``."""
+        doc = self.doc_path
+        return doc.with_name(f"{doc.stem}_SCHEMAS{doc.suffix}") if doc is not None else None
 
     def schemas(self) -> Iterator[Tuple[str, Any]]:
         """``(label, standalone schema)`` for every schema the file holds:

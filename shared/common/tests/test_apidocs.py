@@ -422,41 +422,67 @@ def test_apply_to_collection_is_idempotent_and_touches_only_the_section(tmp_path
     assert postman.get_description(next(postman.requests(collection)).request) == "Liveness."
 
 
-def test_apply_to_markdown_appends_then_replaces_between_markers(tmp_path):
-    path = _service(tmp_path, "svc", _collection(), _endpoints_ok(), defs=DEFS)
+def test_schemas_markdown_is_the_whole_sibling_file(tmp_path):
+    path = _service(tmp_path, "svc", _collection(), _endpoints_ok(), defs=DEFS, doc="SVC.md")
+    sf = schemas.load_schemas(path)
+    assert sf.schemas_doc_path == path.parent / "SVC_SCHEMAS.md"
+    text = render.schemas_markdown(sf)
+    assert text.startswith("# svc request and response schemas\n\nGenerated from [`svc.schemas.json`]")
+    assert "never this one" in text and "Each endpoint's prose: [`SVC.md`](SVC.md)." in text
+    assert [line for line in text.splitlines() if line.startswith("## ")] == [
+        "## `GET /health`", "## `POST /run`", "## `MCP run`"]
+    assert text.endswith("```\n") and "\r" not in text
+    assert schemas.load_schemas(_service(tmp_path, "nodoc", _collection(), _endpoints_ok(),
+                                         defs=DEFS)).schemas_doc_path is None
+
+
+def test_apply_to_markdown_writes_only_a_link_block(tmp_path):
+    path = _service(tmp_path, "svc", _collection(), _endpoints_ok(), defs=DEFS, doc="SVC.md")
     sf = schemas.load_schemas(path)
     doc = "# Svc\r\n\r\nProse.\r\n"
     once = render.apply_to_markdown(doc, sf)
-    assert once.startswith("# Svc\r\n\r\nProse.\r\n\r\n<!-- api-schemas:begin -->\r\n## Request and response schemas")
-    assert once.endswith("<!-- api-schemas:end -->\r\n")
-    assert once.replace("\r\n", "").count("\n") == 0                       # CRLF kept throughout
-    assert "### `POST /run`" in once and "### `MCP run`" in once
+    assert once == ("# Svc\r\n\r\nProse.\r\n\r\n<!-- api-schemas:begin -->\r\n## Request and response schemas\r\n\r\n"
+                    "Every endpoint's request and response JSON Schemas: [`SVC_SCHEMAS.md`](SVC_SCHEMAS.md), "
+                    "generated from [`svc.schemas.json`](svc.schemas.json) by `scripts/api_schemas.py render`.\r\n"
+                    "<!-- api-schemas:end -->\r\n")
     assert render.apply_to_markdown(once, sf) == once
-    edited = once.replace("Prose.", "Prose, edited.") + "\r\nAfter.\r\n"
-    data = json.loads(path.read_text("utf-8"))
-    del data["endpoints"]["MCP run"]
-    schemas.dump_schemas(data, path)
-    replaced = render.apply_to_markdown(edited, schemas.load_schemas(path))
-    assert "Prose, edited." in replaced and replaced.endswith("<!-- api-schemas:end -->\r\n\r\nAfter.\r\n")
-    assert "### `MCP run`" not in replaced
+    # A doc that held the old appendix: only what is between the markers changes.
+    edited = once.replace("Prose.", "Prose, edited.").replace("render`.", "render`.\r\n\r\n### `GET /old`") + \
+        "\r\nAfter.\r\n"
+    replaced = render.apply_to_markdown(edited, sf)
+    assert replaced == once.replace("Prose.", "Prose, edited.") + "\r\nAfter.\r\n"
     with pytest.raises(ValueError):
         render.apply_to_markdown("<!-- api-schemas:end -->\n<!-- api-schemas:begin -->\n", sf)
+    with pytest.raises(ValueError, match="names no `doc`"):
+        render.link_block(schemas.load_schemas(_service(tmp_path, "nodoc", _collection(), _endpoints_ok())))
 
 
 def test_render_service_check_then_write(tmp_path):
     path = _service(tmp_path, "svc", _collection_for_render(), _endpoints_ok(), defs=DEFS, doc="SVC.md",
                     newline="\r\n")
-    (path.parent / "SVC.md").write_bytes(b"# Svc\n")
-    collection_path = path.parent / "svc.postman_collection.json"
+    folder = path.parent
+    (folder / "SVC.md").write_bytes(b"# Svc\r\n")
+    collection_path = folder / "svc.postman_collection.json"
     before = collection_path.read_bytes()
     stale = render.render_service(path, check=True)
-    assert sorted(p.name for p in stale) == ["SVC.md", "svc.postman_collection.json"]
-    assert collection_path.read_bytes() == before                         # check writes nothing
-    assert len(render.render_service(path)) == 2
+    assert sorted(p.name for p in stale) == ["SVC.md", "SVC_SCHEMAS.md", "svc.postman_collection.json"]
+    assert collection_path.read_bytes() == before and not (folder / "SVC_SCHEMAS.md").exists()   # check writes nothing
+    assert len(render.render_service(path)) == 3
     assert render.render_service(path, check=True) == []
     written = collection_path.read_bytes()
     assert b"\r\n" in written and written.replace(b"\r\n", b"").count(b"\n") == 0
-    assert "## Request and response schemas" in (path.parent / "SVC.md").read_text("utf-8")
+    sibling = (folder / "SVC_SCHEMAS.md").read_bytes()
+    assert sibling.startswith(b"# svc request and response schemas\r\n")              # the doc's newline style
+    assert sibling.replace(b"\r\n", b"").count(b"\n") == 0
+    assert b"## Request and response schemas" in (folder / "SVC.md").read_bytes()
+    # Each copy going stale on its own is reported, and only it.
+    (folder / "SVC_SCHEMAS.md").write_bytes(sibling.replace(b"## `POST /run`", b"## `POST /ran`"))
+    assert [p.name for p in render.render_service(path, check=True)] == ["SVC_SCHEMAS.md"]
+    (folder / "SVC_SCHEMAS.md").unlink()
+    assert [p.name for p in render.render_service(path, check=True)] == ["SVC_SCHEMAS.md"]
+    render.render_service(path)
+    (folder / "SVC.md").write_bytes((folder / "SVC.md").read_bytes().replace(b"SVC_SCHEMAS.md)", b"X.md)"))
+    assert [p.name for p in render.render_service(path, check=True)] == ["SVC.md"]
 
 
 # ---------------------------------------------------------------------------

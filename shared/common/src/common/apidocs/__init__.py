@@ -6,8 +6,9 @@ Every ``ai/`` service with an HTTP API ships a Postman v2.1 collection
 a JSON Schema (draft 2020-12) for each endpoint's request body and response
 bodies (root ``CLAUDE.md`` § Postman collections). The schemas file is the
 one source; ``scripts/api_schemas.py render`` copies each entry into its
-endpoint's first Postman item and into the endpoint doc's generated
-appendix, and the tests check both copies, every collection body against
+endpoint's first Postman item and into ``<doc stem>_SCHEMAS.md``, a
+generated file beside the endpoint doc (which links to it from a short
+generated block), and the tests check every copy, every collection body against
 its request schema (``unit-tests/apidocs``) and each service's real
 responses against its response schemas (``unit-tests/<service>/
 test_api_schemas.py``).
@@ -22,8 +23,8 @@ Modules:
                inline_refs(), check_schema() and validate() (jsonschema),
                dump_schemas()
     render     display_schema(), endpoint_markdown(), postman_section(),
-               apply_to_collection(), markdown_appendix(), apply_to_markdown(),
-               render_service()
+               apply_to_collection(), schemas_markdown(), link_block(),
+               apply_to_markdown(), render_service()
     generate   from_pydantic(), from_output_spec(), from_result_spec(),
                from_detector_spec(), by_discriminator(), from_mcp_tools() /
                from_mcp(), apply_generated()

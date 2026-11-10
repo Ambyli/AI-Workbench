@@ -10,7 +10,7 @@ A uv workspace monorepo, mostly **AI infrastructure** for one Ubuntu box (`zeo@1
 | `ai/jinja/` | Chat templates bind-mounted into several model servers. |
 | `shared/common/` | The `common` package every Python project imports ([§ Shared Python code](#shared-python-code-sharedcommon)). |
 | `scripts/deploy.py` | What `make up` runs ([§ Deploys](#deploys-make-up)). |
-| `scripts/api_schemas.py` | Renders the endpoint schemas into the Postman collections and endpoint docs ([§ Postman collections](#postman-collections)). |
+| `scripts/api_schemas.py` | Renders the endpoint schemas into the Postman collections and each endpoint doc's generated `*_SCHEMAS.md` ([§ Postman collections](#postman-collections)). |
 | `unit-tests/<service>/`, `shared/common/tests/` | Tests ([§ Testing](#testing)). |
 | `widget/` | The tray widget (`claude_observer`); the root `config.json` is the widget's. |
 | `.env.example` | Every variable with its comment; 1:1 with the local `.env`, which differs only in values ([§ Env vars](#env-vars-and-the-port-registry)). The box's copy is its own `.env`. |
@@ -121,7 +121,7 @@ Open WebUI is omitted on purpose (a UI; its traffic is LiteLLM's).
 - **Our services' schemas** are exhaustive and closed (`additionalProperties: false`).
 - **Upstream servers' schemas** (vLLM, llama.cpp, LiteLLM, SearXNG, Supabase, Open Terminal) cover the fields this stack uses, are open, and carry a `$comment` naming the upstream spec and image tag. An image-tag bump re-checks them.
 - **Generated entries:** entries whose `$comment` says `generated from …` come from the code (Pydantic models, route-policy's `OutputSpec`, the classifier's `ResultSpec` / `DetectorSpec`, FastMCP tool signatures). They are rewritten by the service's `test_api_schemas.py` run with `API_SCHEMAS_UPDATE=1`; never hand-edit one.
-- **The displayed copies:** `uv run --no-sync python scripts/api_schemas.py render` copies every entry into the description of its endpoint's first Postman item (a final `#### Schemas` section; sibling items point to it) and into the endpoint doc's generated `## Request and response schemas` appendix (between `<!-- api-schemas:begin -->` / `<!-- api-schemas:end -->`). Never edit either copy.
+- **The displayed copies:** `uv run --no-sync python scripts/api_schemas.py render` copies every entry into the description of its endpoint's first Postman item (a final `#### Schemas` section; sibling items point to it) and into `<doc-stem>_SCHEMAS.md`, a generated file beside the endpoint doc (`ROUTE_POLICY.md` → `ROUTE_POLICY_SCHEMAS.md`; one `##` section per endpoint), which the doc links to from a generated `## Request and response schemas` block between `<!-- api-schemas:begin -->` / `<!-- api-schemas:end -->`. Never edit any of these copies.
 - **Rollout:** a collection whose schemas file is not written yet is in `PENDING` (`unit-tests/apidocs/test_schemas.py`), which only shrinks.
 
 **Keep them in sync with the code.** An endpoint added, renamed or removed, or a change to its request / response shape, path or query params, auth or headers, updates its collection in the SAME change:

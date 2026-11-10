@@ -18,8 +18,8 @@ For each ``ai/<stack>/<stem>.postman_collection.json``:
      (``{{variables}}`` resolved from the collection's ``variable``
      defaults); an item listed in ``invalid_examples`` must FAIL instead;
   5. **the rendered copies are current** -- ``scripts/api_schemas.py render
-     --check``: the ``#### Schemas`` sections in the collection and the
-     endpoint doc's appendix;
+     --check``: the ``#### Schemas`` sections in the collection, the
+     endpoint doc's link block and its ``*_SCHEMAS.md`` (stale or missing);
   6. **the rollout ratchet** -- a collection in ``PENDING`` skips 1 and 4,
      and the test fails once a pending collection is complete, so the set
      only shrinks (it goes when it is empty).

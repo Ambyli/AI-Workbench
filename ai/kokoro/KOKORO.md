@@ -179,3 +179,9 @@ curl -X POST "http://localhost:8004/generate?text=%E3%83%8F%E3%83%AD%E3%83%BC&vo
 Note that OpenAI voice aliases (`alloy`, `echo`, `fable`, `onyx`, `nova`, `shimmer`) always map to English voices. To speak another language via `/v1/audio/speech`, pass a Kokoro voice name in the `voice` field.
 
 Japanese and Mandarin use extra G2P dependencies (`misaki[ja]`, `misaki[zh]`), which are installed as part of `kokoro-app`.
+
+<!-- api-schemas:begin -->
+## Request and response schemas
+
+Every endpoint's request and response JSON Schemas: [`KOKORO_SCHEMAS.md`](KOKORO_SCHEMAS.md), generated from [`kokoro.schemas.json`](kokoro.schemas.json) by `scripts/api_schemas.py render`.
+<!-- api-schemas:end -->

@@ -587,6 +587,19 @@ def test_from_mcp_tools():
     assert out["run"]["additionalProperties"] is True and tools[0].inputSchema.get("additionalProperties") is None
 
 
+def test_from_mcp_tools_takes_fastmcp_tools():
+    """FastMCP 3's list_tools() lists its own Tool objects: no `inputSchema`,
+    the wire schema behind `to_mcp_tool()` (or `parameters`)."""
+    closed = {"type": "object", "additionalProperties": False, "properties": {"x": {"type": "string"}}}
+    wire = SimpleNamespace(name="a", to_mcp_tool=lambda: SimpleNamespace(inputSchema=closed))
+    bare = SimpleNamespace(name="b", parameters={"type": "object", "properties": {}})
+    out = generate.from_mcp_tools([wire, bare], source="svc.mcp")
+    assert out["a"] == {"$comment": "generated from svc.mcp:a — do not edit", **closed}
+    assert out["b"]["additionalProperties"] is True
+    with pytest.raises(TypeError, match="no input schema"):
+        generate.from_mcp_tools([SimpleNamespace(name="c")], source="svc.mcp")
+
+
 def test_apply_generated_writes_reports_and_prunes():
     document: Dict[str, Any] = {"$defs": {"old": {"$comment": "generated from gone — do not edit"},
                                           "hand": {"type": "string"}},

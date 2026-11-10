@@ -198,3 +198,9 @@ Codes follow ISO 639-1 where available (e.g. `en`, `es`, `fr`, `de`, `ja`, `zh`,
 ### License note
 
 MADLAD-400 checkpoints on HuggingFace are released by Google under the **Apache 2.0** license — commercial use is permitted with no restrictions on output. This is the reason MADLAD was chosen over Aya Expanse (CC-BY-NC, non-commercial) and NLLB (CC-BY-NC).
+
+<!-- api-schemas:begin -->
+## Request and response schemas
+
+Every endpoint's request and response JSON Schemas: [`MADLAD_SCHEMAS.md`](MADLAD_SCHEMAS.md), generated from [`madlad.schemas.json`](madlad.schemas.json) by `scripts/api_schemas.py render`.
+<!-- api-schemas:end -->

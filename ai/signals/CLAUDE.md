@@ -14,6 +14,7 @@ Route-policy's CPU sidecar: small ONNX / fastText models turn a conversation's t
 - **Caps (413):** 20,000 chars per text, 200,000 per request, 64 texts — they live in `common.signals.wire`, not here.
 - **`/health` is 503 until every model is loaded and warmed** (~10 s): it is the compose healthcheck, the swap gate and the edge's check.
 - **No thresholds here** — `min_score`, `min_share`, the injection threshold, example sets are route-policy ruleset config.
+- **An API change updates `signals.postman_collection.json`, `signals.schemas.json` and `SIGNALS.md` together** (`scripts/api_schemas.py render` writes the schemas into the collection and the generated `SIGNALS_SCHEMAS.md`; root `CLAUDE.md` § Postman collections). The schemas are hand-written and closed (the request and answer from `common.signals.wire`, so a wire change updates them too); `unit-tests/signals/test_api_schemas.py` validates the app's real responses on fake models — every endpoint, every status, every task status.
 - Measure on the box with `make exec signals signals CMD='python -m signals.bench'` (`--threads 1,2,4 --n 30`); it loads a second copy of the models on the same cores, so run it when the box is quiet.
 
 ## Cross-folder rules

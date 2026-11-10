@@ -390,3 +390,9 @@ Sanity checks worth making on any change to `detectors/`:
 | Spurious boxes covering the whole image | Threshold too low. Also true of OWLv2 generally — a full-frame box is usually the model saying "I have nothing". |
 | OOM on GPU 2 | `qwen3.8-solo` grew, or `DETECTOR_MODEL` was pointed at the `large` checkpoint. Drop back to `base`, or set `DETECTOR_DEVICE=cpu`. |
 | Classifier criteria come back `status: "error"` naming the detector | The classifier's `DETECTOR_URL` is set but the detector did not answer (refused, timed out after `DETECTOR_TIMEOUT_S`, a `503` while the model loads). Only the criteria that asked the detector fail, and the job is `complete: false` — there is no silent fall-through to the LLM ([API.md § The detector](../classifier/API.md#the-detector)). With `DETECTOR_URL` empty a `detector` criterion is refused at submit instead. |
+
+<!-- api-schemas:begin -->
+## Request and response schemas
+
+Every endpoint's request and response JSON Schemas: [`DETECTOR_SCHEMAS.md`](DETECTOR_SCHEMAS.md), generated from [`detector.schemas.json`](detector.schemas.json) by `scripts/api_schemas.py render`.
+<!-- api-schemas:end -->

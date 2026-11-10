@@ -53,17 +53,12 @@ SCHEMA_FILES = sorted(ROOT.glob(f"ai/*/*{schemas.SUFFIX}"))
 # one is complete. Delete the set (and that test) when it is empty.
 PENDING = {
     "classifier",
-    "detector",
     "interceptor",
-    "kokoro",
     "litellm",
     "llama",
-    "madlad",
     "open-terminal",
-    "roofix",
     "sandbox-runner",
     "searxng",
-    "signals",
     "supabase",
     "vllm",
 }

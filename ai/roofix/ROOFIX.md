@@ -434,3 +434,9 @@ There is no separate scraper service any more: the Playwright proposal scraper (
 - **`PHOENIX_AGENT_USER_ID` must be provisioned manually.** Create a dedicated Phoenix agent user and set the env var so writes are attributable.
 - **Phase 1** — `create_project` and `notify_rep` paths exist but are stubbed. Wire a CloudTalk MCP when needed.
 - **Session refresh is manual.** interceptor cannot present a login UI — operators capture a profile on a laptop and upload the `.tgz` to `/profiles/roofix/refresh` (see [INTERCEPTOR.md § Refreshing a profile](../interceptor/INTERCEPTOR.md#refreshing-a-profile-operator-flow)).
+
+<!-- api-schemas:begin -->
+## Request and response schemas
+
+Every endpoint's request and response JSON Schemas: [`ROOFIX_SCHEMAS.md`](ROOFIX_SCHEMAS.md), generated from [`roofix.schemas.json`](roofix.schemas.json) by `scripts/api_schemas.py render`.
+<!-- api-schemas:end -->

@@ -25,7 +25,8 @@ over the model, the spec or the tools.
   ``detail`` by its ``type``), as ``if`` / ``then`` pairs a validator
   enforces.
 * :func:`from_mcp_tools` / :func:`from_mcp` -- each FastMCP tool's
-  ``inputSchema``.
+  ``inputSchema``, as ``tools/list`` sends it (:func:`input_schema`: an MCP
+  ``Tool``'s, or a FastMCP 3 ``Tool``'s ``to_mcp_tool()``).
 
 Stdlib only.
 """
@@ -160,13 +161,28 @@ def by_discriminator(discriminator: str, target: str, cases: Mapping[str, str], 
     return out
 
 
+def input_schema(tool: Any) -> Dict[str, Any]:
+    """A tool's arguments schema as ``tools/list`` sends it: an MCP ``Tool``'s
+    ``inputSchema``; for a FastMCP tool (``list_tools()`` of FastMCP 3 lists
+    its own ``Tool`` objects, which have no ``inputSchema``) the one its
+    ``to_mcp_tool()`` carries, else its ``parameters``."""
+    schema = getattr(tool, "inputSchema", None)
+    if schema is None and callable(getattr(tool, "to_mcp_tool", None)):
+        schema = tool.to_mcp_tool().inputSchema
+    if schema is None:
+        schema = getattr(tool, "parameters", None)
+    if not isinstance(schema, Mapping):
+        raise TypeError(f"tool {getattr(tool, 'name', tool)!r} has no input schema")
+    return dict(schema)
+
+
 def from_mcp_tools(tools: Iterable[Any], *, source: str) -> Dict[str, Dict[str, Any]]:
-    """Tool name -> its ``inputSchema`` (objects as listed by
-    ``mcp.list_tools()``: ``.name``, ``.inputSchema``), with
-    ``additionalProperties`` stated (``true`` where the tool left it open)."""
+    """Tool name -> its arguments schema (:func:`input_schema`; objects as
+    listed by ``mcp.list_tools()``), with ``additionalProperties`` stated
+    (``true`` where the tool left it open)."""
     out: Dict[str, Dict[str, Any]] = {}
     for tool in tools:
-        schema = state_additional_properties(copy.deepcopy(tool.inputSchema), True)
+        schema = state_additional_properties(copy.deepcopy(input_schema(tool)), True)
         out[tool.name] = {"$comment": generated_comment(f"{source}:{tool.name}"), **schema}
     return out
 

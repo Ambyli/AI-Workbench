@@ -535,3 +535,9 @@ SIGNALS_MODELS_DIR=/tmp/signals-models PYTHONPATH=shared/common/src \
 ```
 
 The same model checks run in every image build (`python -m signals.runtime --check`).
+
+<!-- api-schemas:begin -->
+## Request and response schemas
+
+Every endpoint's request and response JSON Schemas: [`SIGNALS_SCHEMAS.md`](SIGNALS_SCHEMAS.md), generated from [`signals.schemas.json`](signals.schemas.json) by `scripts/api_schemas.py render`.
+<!-- api-schemas:end -->

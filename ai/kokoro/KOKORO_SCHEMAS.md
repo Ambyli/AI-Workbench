@@ -19,7 +19,7 @@ Response `200` (`application/json`) — kokoro-api is up; kokoro-app and the mod
 
 ## `GET /voices`
 
-kokoro-app's body; kokoro-api passes it through, and answers 502 `{"detail": "Cannot reach kokoro-app: …"}` for any kokoro-app failure.
+kokoro-app's body, passed through. A 4xx of kokoro-app's keeps its status and `detail`; kokoro-app unreachable or a 5xx of its own is a 502 `{"detail": "Cannot reach kokoro-app: …"}`.
 
 Response `200` (`application/json`):
 
@@ -43,7 +43,7 @@ Response `200` (`application/json`):
 
 ## `GET /languages`
 
-kokoro-app's body; kokoro-api passes it through, and answers 502 `{"detail": "Cannot reach kokoro-app: …"}` for any kokoro-app failure.
+kokoro-app's body, passed through. A 4xx of kokoro-app's keeps its status and `detail`; kokoro-app unreachable or a 5xx of its own is a 502 `{"detail": "Cannot reach kokoro-app: …"}`.
 
 Response `200` (`application/json`):
 
@@ -83,13 +83,13 @@ Response `200` (`application/json`):
 
 ## `POST /generate`
 
-`text` (required) and `voice` (default `af_heart`) are query parameters; there is no body. kokoro-api answers 502 `{"detail": "Cannot reach kokoro-app: …"}` for any kokoro-app failure -- an unknown voice too (kokoro-app's own 400). The internal kokoro-app item of the collection calls kokoro-app's own /generate, which answers 200 `application/json` `{"audio": "<the WAV bytes as hex>"}` instead (kokoro-api decodes it), and its 400s directly.
+`text` (required) and `voice` (default `af_heart`) are query parameters; there is no body. An unknown voice is kokoro-app's 400 `{"detail": "Unknown voice '<voice>'. Available: [...]"}`, passed through like any kokoro-app 4xx (its status and `detail` kept); kokoro-app unreachable or a 5xx of its own is a 502 `{"detail": "Cannot reach kokoro-app: …"}`. The internal kokoro-app item of the collection calls kokoro-app's own /generate, which answers 200 `application/json` `{"audio": "<the WAV bytes as hex>"}` instead (kokoro-api decodes it), and its 400s directly.
 
 Response `200` (`audio/wav`) — kokoro-api: the WAV bytes (24 kHz) of the first chunk Kokoro's pipeline yields.
 
 ## `POST /v1/audio/speech`
 
-OpenAI-compatible: `voice` maps an OpenAI alias (alloy, echo, fable, onyx, nova, shimmer) to an English Kokoro voice and passes any other name through. Any kokoro-app failure is a 502 `{"detail": "Cannot reach kokoro-app: …"}`.
+OpenAI-compatible: `voice` maps an OpenAI alias (alloy, echo, fable, onyx, nova, shimmer) to an English Kokoro voice and passes any other name through. An unknown voice is kokoro-app's 400 `{"detail": "Unknown voice '<voice>'. Available: [...]"}`, passed through like any kokoro-app 4xx (its status and `detail` kept); kokoro-app unreachable or a 5xx of its own is a 502 `{"detail": "Cannot reach kokoro-app: …"}`.
 
 Request body (`application/json`):
 
@@ -119,11 +119,11 @@ Request body (`application/json`):
 }
 ```
 
-Response `200` (`audio/wav`) — the WAV bytes. Through LiteLLM (`{{litellm}}`) the same bytes arrive labelled `audio/mpeg`: LiteLLM's proxy sets that type for every TTS model but Gemini's.
+Response `200` (`audio/wav`) — the WAV bytes. Through LiteLLM (`{{litellm}}`) the same WAV bytes arrive labelled `audio/mpeg`: LiteLLM's proxy (its `/v1/audio/speech` handler in `proxy_server.py`) sets that type for every TTS model whose name is not a Gemini TTS one, whatever the upstream sent -- go by the bytes (`RIFF…WAVE`), not the header.
 
 ## `GET /audio/:audioFilename`
 
-A WAV the `text_to_speech` tool wrote. 400 for a name holding `..`, `/` or `\`; 404 for a file that is not there -- every `text_to_speech` call deletes the files before it writes its own.
+A WAV the `text_to_speech` tool wrote. 400 for a name holding `..`, `/` or `\`; 404 for a file that is not there: kokoro-api clears the directory at startup, and a `text_to_speech` save deletes WAVs older than `AUDIO_MAX_AGE_SECONDS` (a day; a WAV the tool hands out again gets a fresh age).
 
 Response `200` (`audio/wav`) — the file.
 
@@ -287,7 +287,7 @@ Result (`result.structuredContent`):
   "properties": {
     "result": {
       "type": "string",
-      "description": "`${AUDIO_BASE_URL}/audio/<12 hex>.wav`, a URL GET /audio/:audioFilename serves until the next call; `Error generating audio: <httpx error>` when kokoro-app cannot be reached or answers an error status. FastMCP wraps a `str` return as `{\"result\": …}`"
+      "description": "`${AUDIO_BASE_URL}/audio/<12 hex>.wav`, a URL GET /audio/:audioFilename serves for at least `AUDIO_MAX_AGE_SECONDS` (a day) unless kokoro-api restarts (the same text and voice again return the same URL); `Error generating audio: <kokoro-app's detail>` for a 4xx of kokoro-app's (an unknown voice); `Error generating audio: <httpx error>` when kokoro-app cannot be reached or answers a 5xx. FastMCP wraps a `str` return as `{\"result\": …}`"
     }
   }
 }

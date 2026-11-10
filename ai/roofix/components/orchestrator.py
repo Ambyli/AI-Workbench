@@ -154,14 +154,22 @@ def _note_phoenix_result(ev: dict, ctx: dict) -> None:
 
 
 def _extracted_to_payload(extracted) -> dict:
-    """Convert an ExtractedProposal (or test fake) into a plain dict.
+    """Convert an ExtractedProposal (or test fake) into a plain, JSON-able dict.
 
     Uses ``getattr(..., None)`` so it works with the real dataclass, subclass
-    fakes, and MagicMocks. Only the fields ensure_entity_and_project reads (or
-    that a future consumer might read) are copied — that keeps the payload
-    inspectable in audit / debug output.
+    fakes, and MagicMocks. Only ``EXTRACTED_PAYLOAD_FIELDS`` are copied (the
+    fields ensure_entity_and_project and _execute read, plus audit context) —
+    that keeps the payload inspectable in audit / debug output.
+
+    ``acceptance_signals`` is flattened to its ``as_dict()``: the payload rides
+    on the event, and the brain's AI fallback ``json.dumps`` the whole event —
+    an ``AcceptanceSignals`` object there made that call raise.
     """
-    return {f: getattr(extracted, f, None) for f in _EXTRACTED_PAYLOAD_FIELDS}
+    payload = {f: getattr(extracted, f, None) for f in _EXTRACTED_PAYLOAD_FIELDS}
+    signals = payload.get("acceptance_signals")
+    if hasattr(signals, "as_dict"):
+        payload["acceptance_signals"] = signals.as_dict()
+    return payload
 
 
 async def _scrape_and_extract(
@@ -345,15 +353,22 @@ async def _execute(
     """Carry out (or log) the brain's decision for a single event.
 
     Branches on ``decision["action"]``:
+      - ``"escalate"`` OR needs_human (whatever the action) → log for human
+        review, forward if configured, skip any Phoenix write.
       - ``"ignore"``        → log the ignore, do nothing else.
-      - ``"escalate"`` / needs_human → log for human review, skip Phoenix write.
       - ``"update_chatter"`` → call ``phoenix.update_chatter(project_id, note)``.
       - ``"update_milestone"`` → look up the milestone mapping, call
         ``phoenix.update_milestone(project_id, block_name, status_id)``.
+      - ``"create_project"`` → ``phoenix.ensure_entity_and_project(payload)``.
       - anything else      → log as unsupported (Phase 0 gate).
 
     When ``phoenix is None`` or ``DRY_RUN=True``, the Phoenix write is skipped
     and a dry-run note is logged instead.
+
+    Stamps on ``decision`` for app.py: ``_forwarded`` when the escalation
+    branch ran, and ``_phoenix_write_ok`` (``res.ok``) whenever a Phoenix
+    write call ran — app.py counts the False ones as /status
+    ``phoenix_write_failures``.
 
     Called by: `process_batch` (once per event, after ``decide()`` returns).
     """
@@ -362,59 +377,6 @@ async def _execute(
     pref = decision.get("target") or ""
 
     match action:
-        # ── Ignore ────────────────────────────────────────────────────
-        # Terminal decision — log, then mark processed so next tick doesn't
-        # re-parse this same email into this same ignore. Whether we ALSO
-        # mark it read in Gmail is app.py's call (currently rule-source only;
-        # AI-decided ignores stay unread for operator review).
-        case "ignore":
-            log.log(
-                "orchestrator",
-                "ignore",
-                True,
-                decision["reasoning"],
-                event_type=etype,
-                project_ref=pref,
-            )
-            if processed_store:
-                await asyncio.to_thread(
-                    processed_store.mark_ok,
-                    ev.get("message_id"),
-                    {
-                        "action": "ignore",
-                        "source": decision.get("source", "rule"),
-                        "reasoning": decision["reasoning"],
-                    },
-                )
-
-        # ── Noop: project already exists in Phoenix ───────────────────
-        # Brain emitted this when ``context.get("project_id")`` was
-        # set for a CREATE_PROJECT_EVENTS event — Phoenix already has the project,
-        # so a create would be a duplicate. Terminal decision: audit-log,
-        # mark processed. No Phoenix write. app.py will mark the email
-        # read (this is a rule-source terminal decision, same class as
-        # rule-based ignore).
-        case "noop_project_exists":
-            log.log(
-                "orchestrator",
-                "noop_project_exists",
-                True,
-                decision["reasoning"],
-                event_type=etype,
-                project_ref=pref,
-            )
-            if processed_store:
-                await asyncio.to_thread(
-                    processed_store.mark_ok,
-                    ev.get("message_id"),
-                    {
-                        "action": "noop_project_exists",
-                        "source": decision.get("source", "rule"),
-                        "reasoning": decision["reasoning"],
-                        "project_id": pref,
-                    },
-                )
-
         # ── Escalate / Needs human ────────────────────────────────────
         # Log for human review, skip Phoenix write. Attempt to forward the
         # original email to ESCALATION_RECIPIENTS if configured:
@@ -425,7 +387,14 @@ async def _execute(
         #   - no recipients → mark_ok, _forwarded=False. Original stays unread
         #                    so the operator reviews via the Roofix inbox.
         # In all three sub-cases the email is marked processed exactly once.
-        case "escalate" | _ if decision.get("needs_human"):
+        #
+        # First case on purpose: ``needs_human`` wins over whatever action
+        # came with it (an AI ``ignore`` / ``update_chatter`` the model
+        # flagged for a human is escalated, not executed). A plain guard,
+        # not ``case "escalate" | _ if needs_human`` -- a guard covers
+        # the whole or-pattern, so that form let an ``escalate`` with
+        # needs_human=false fall through to the unsupported-action case.
+        case _ if action == "escalate" or decision.get("needs_human"):
             log.log(
                 "escalate",
                 action,
@@ -484,6 +453,59 @@ async def _execute(
                     },
                 )
 
+        # ── Ignore ────────────────────────────────────────────────────
+        # Terminal decision — log, then mark processed so next tick doesn't
+        # re-parse this same email into this same ignore. Whether we ALSO
+        # mark it read in Gmail is app.py's call (currently rule-source only;
+        # AI-decided ignores stay unread for operator review).
+        case "ignore":
+            log.log(
+                "orchestrator",
+                "ignore",
+                True,
+                decision["reasoning"],
+                event_type=etype,
+                project_ref=pref,
+            )
+            if processed_store:
+                await asyncio.to_thread(
+                    processed_store.mark_ok,
+                    ev.get("message_id"),
+                    {
+                        "action": "ignore",
+                        "source": decision.get("source", "rule"),
+                        "reasoning": decision["reasoning"],
+                    },
+                )
+
+        # ── Noop: project already exists in Phoenix ───────────────────
+        # Brain emitted this when ``context.get("project_id")`` was
+        # set for a CREATE_PROJECT_EVENTS event — Phoenix already has the project,
+        # so a create would be a duplicate. Terminal decision: audit-log,
+        # mark processed. No Phoenix write. app.py will mark the email
+        # read (this is a rule-source terminal decision, same class as
+        # rule-based ignore).
+        case "noop_project_exists":
+            log.log(
+                "orchestrator",
+                "noop_project_exists",
+                True,
+                decision["reasoning"],
+                event_type=etype,
+                project_ref=pref,
+            )
+            if processed_store:
+                await asyncio.to_thread(
+                    processed_store.mark_ok,
+                    ev.get("message_id"),
+                    {
+                        "action": "noop_project_exists",
+                        "source": decision.get("source", "rule"),
+                        "reasoning": decision["reasoning"],
+                        "project_id": pref,
+                    },
+                )
+
         # ── Offline dry-run ───────────────────────────────────────────
         # If phoenix client is None, log and stop. No Phoenix write.
         case _ if phoenix is None:
@@ -504,6 +526,7 @@ async def _execute(
                 int(pref),
                 decision["payload"]["note_text"],
             )
+            decision["_phoenix_write_ok"] = bool(res.ok)
             log.log(
                 "phoenix",
                 action,
@@ -535,6 +558,7 @@ async def _execute(
                     mapping["block_name"],
                     mapping["status_id"],
                 )
+                decision["_phoenix_write_ok"] = bool(res.ok)
                 log.log(
                     "phoenix",
                     action,
@@ -599,6 +623,7 @@ async def _execute(
             # reads whichever fields it needs (name, address, contract price,
             # etc.) and ignores keys it doesn't care about.
             res = await asyncio.to_thread(phoenix.ensure_entity_and_project, payload)
+            decision["_phoenix_write_ok"] = bool(res.ok)
 
             log.log(
                 "phoenix",

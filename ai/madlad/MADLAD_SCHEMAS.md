@@ -19,7 +19,7 @@ Response `200` (`application/json`) — madlad-api is up; madlad-app is not chec
 
 ## `GET /v1/madlad/languages`
 
-madlad-app's body, passed through. Any madlad-app failure -- unreachable, or an error status of its own -- is a 502 `{"detail": "Cannot reach madlad-app: …"}`.
+madlad-app's body, passed through. A 4xx of madlad-app's is passed through with its status and `detail`; madlad-app unreachable or a 5xx of its own is a 502 `{"detail": "Cannot reach madlad-app: …"}`.
 
 Response `200` (`application/json`):
 
@@ -55,7 +55,7 @@ Response `200` (`application/json`):
 
 ## `POST /v1/madlad/translate`
 
-madlad-app's body, passed through. Any madlad-app failure is a 502 `{"detail": "Cannot reach madlad-app: …"}` -- an unknown `target_lang` too (madlad-app's own 400), and a model that produced nothing (its 500).
+madlad-app's body, passed through. An unknown `target_lang` is madlad-app's 400 `{"detail": "Unknown target_lang '<code>'. Use /languages to list supported codes."}`, passed through with that status and detail (any madlad-app 4xx is); madlad-app unreachable or a 5xx -- a model that produced nothing is its 500 -- is a 502 `{"detail": "Cannot reach madlad-app: …"}`. A body that is not JSON is FastAPI's 422 (`json_invalid`), as is a missing field.
 
 Request body (`application/json`):
 
@@ -246,7 +246,7 @@ Result (`result.structuredContent`):
   "properties": {
     "result": {
       "type": "string",
-      "description": "The translated text; `Error translating: <httpx error>` when madlad-app cannot be reached or answers an error status (an unknown target_lang included). FastMCP wraps a `str` return as `{\"result\": …}`"
+      "description": "The translated text; `Error translating: <madlad-app's detail>` for a 4xx of madlad-app's (an unknown target_lang); `Error translating: <httpx error>` when madlad-app cannot be reached or answers a 5xx. FastMCP wraps a `str` return as `{\"result\": …}`"
     }
   }
 }

@@ -202,7 +202,7 @@ _ACCEPTED_INPUT = {
     "phone": "5555550100",
     "street_address": "324 Whitely Street",
     "city": "Bridgeport",
-    "state_text": "Ohio",
+    "state": "Ohio",
     "state_abbr": "OH",
     "zip_code": "43912",
     "homeowner_ref": "1781287165189x930665508813911000",

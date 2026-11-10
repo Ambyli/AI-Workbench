@@ -8,6 +8,7 @@ MADLAD-400 translation: `madlad-app` (CTranslate2 model, GPU) behind `madlad-api
 - **Tool-only.** MADLAD is not in LiteLLM's `model_list` and cannot be called via `/v1/chat/completions`; a chat model invokes the `translate` MCP tool (`madlad_translate` in `litellm_config.yaml`), or callers use the `/v1/madlad` pass-through.
 - **`MADLAD_MODEL` must be a pre-converted CTranslate2 checkpoint** — there is no conversion step and no torch / transformers in the image.
 - The model lazy-loads on the first request (~1–3 min, cached in `madlad_data`); the healthcheck allows 10 minutes for that first download.
+- **madlad-app's 4xx pass through** (an unknown `target_lang` is its 400, detail kept, also in the MCP tool's text); only unreachable / 5xx is madlad-api's 502. Tests: `unit-tests/madlad` (no model needed).
 - **License is the reason for this model** (Apache-2.0, commercial use). Don't swap in Aya Expanse or NLLB (CC-BY-NC).
 
 ## Cross-folder rules

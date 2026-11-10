@@ -281,8 +281,12 @@ async def _run_one_batch(
                             )
 
                     # ── Step 2: mark_read for the "clear from inbox" classes ─
+                    # An escalation is action "escalate" OR needs_human (the
+                    # orchestrator escalates both); unforwarded, it stays unread.
                     action = d.get("action")
-                    if action == "escalate" and not d.get("_forwarded"):
+                    if (action == "escalate" or d.get("needs_human")) and not d.get(
+                        "_forwarded"
+                    ):
                         continue
                     if action == "ignore" and d.get("source") != "rule":
                         continue
@@ -306,6 +310,11 @@ async def _run_one_batch(
 def _record_tick(records: list, error: Optional[str]) -> None:
     """``records`` is the list of {"event", "decision"} objects returned by
     ``orchestrator_run``. We only tally decision-side fields here.
+
+    ``phoenix_write_failures`` counts decisions whose Phoenix write call ran
+    and returned ok=False — the orchestrator stamps ``_phoenix_write_ok`` on
+    every decision that made one (update_chatter, update_milestone with a
+    mapping, create_project's ensure_entity_and_project), once per event.
     """
     with _STATE_LOCK:
         _STATE["last_tick_at"] = datetime.now(timezone.utc).isoformat(
@@ -321,6 +330,8 @@ def _record_tick(records: list, error: Optional[str]) -> None:
             _STATE["decisions_by_source"][d.get("source", "")] += 1
             if d.get("needs_human") or d.get("action") == "escalate":
                 _STATE["escalations_total"] += 1
+            if d.get("_phoenix_write_ok") is False:
+                _STATE["phoenix_write_failures"] += 1
 
 
 async def _scheduled_tick() -> None:

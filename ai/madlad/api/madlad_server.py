@@ -6,6 +6,7 @@ Exposes an MCP `translate` tool for LiteLLM routing, plus direct
 """
 
 import os
+from typing import Any
 
 import httpx
 from fastapi import FastAPI, HTTPException
@@ -22,6 +23,30 @@ app = FastAPI(title="MADLAD Translation API", lifespan=mcp_app.lifespan)
 http_timeout = httpx.Timeout(120.0, connect=10.0)
 
 
+def _app_error(exc: httpx.HTTPError) -> tuple[int, Any]:
+    """``(status, detail)`` for a failed madlad-app call.
+
+    An upstream 4xx is the caller's mistake (an unknown ``target_lang`` is
+    madlad-app's 400): keep its status and its ``detail``. Anything else --
+    unreachable, timed out, an upstream 5xx -- is a 502.
+    """
+    if isinstance(exc, httpx.HTTPStatusError) and 400 <= exc.response.status_code < 500:
+        response = exc.response
+        try:
+            body = response.json()
+        except ValueError:
+            body = None
+        if isinstance(body, dict) and "detail" in body:
+            return response.status_code, body["detail"]
+        return response.status_code, response.text or response.reason_phrase
+    return 502, f"Cannot reach madlad-app: {exc}"
+
+
+def _raise_app_error(exc: httpx.HTTPError):
+    status, detail = _app_error(exc)
+    raise HTTPException(status_code=status, detail=detail)
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -34,7 +59,7 @@ def list_languages():
         r.raise_for_status()
         return r.json()
     except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=f"Cannot reach madlad-app: {exc}")
+        _raise_app_error(exc)
 
 
 class TranslateRequest(BaseModel):
@@ -53,7 +78,7 @@ def translate_endpoint(req: TranslateRequest):
         r.raise_for_status()
         return r.json()
     except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=f"Cannot reach madlad-app: {exc}")
+        _raise_app_error(exc)
 
 
 @mcp.tool()
@@ -77,7 +102,10 @@ def translate(text: str, target_lang: str) -> str:
         r.raise_for_status()
         return r.json()["translated"]
     except httpx.HTTPError as exc:
-        return f"Error translating: {exc}"
+        # A 4xx from madlad-app (an unknown target_lang) says what to fix:
+        # relay its detail; unreachable / 5xx keeps httpx's own message.
+        status, detail = _app_error(exc)
+        return f"Error translating: {detail if status != 502 else exc}"
 
 
 app.mount("/mcp", mcp_app)

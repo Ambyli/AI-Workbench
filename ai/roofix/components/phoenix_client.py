@@ -731,11 +731,12 @@ class PhoenixClient:
     def ensure_entity_and_project(self, extracted: dict) -> Result:
         """Idempotent find-or-create for a Roofix proposal.
 
-        Expects a dict shaped like ExtractedProposal.__dict__ (or the dataclass
-        itself's dict form). Reads these fields:
-            roofix_id, display_text, customer_name (or full_name),
-            first_name, last_name, email, phone,
-            street_address, city, state_text, state_abbr, zip_code
+        Expects a dict keyed by ExtractedProposal field names (the
+        orchestrator's ``_extracted_payload``, built from
+        ``constants.EXTRACTED_PAYLOAD_FIELDS``). Reads these fields:
+            roofix_id, display_text, full_name, first_name, last_name,
+            email, phone, street_address, city, state (the name, e.g.
+            "Ohio"), state_abbr, zip_code, homeowner_ref
 
         Flow:
             1. find_entity_by_identity(name, email, street_address).
@@ -755,7 +756,7 @@ class PhoenixClient:
         # ── Entity ──────────────────────────────────────────────────────────
         first = extracted.get("first_name")
         last = extracted.get("last_name")
-        name = extracted.get("full_name") or extracted.get("customer_name")
+        name = extracted.get("full_name")
         if not name and (first or last):
             name = " ".join(p for p in (first, last) if p)
 
@@ -782,7 +783,7 @@ class PhoenixClient:
             entity_id = ent_matches[0]["id"]
         else:
             state_id = self.resolve_state_id(
-                state_text=extracted.get("state_text"),
+                state_text=extracted.get("state"),
                 state_abbr=extracted.get("state_abbr"),
             )
             cr = self.create_entity(
@@ -821,7 +822,7 @@ class PhoenixClient:
             project_id = proj_matches[0]["id"]
         else:
             state_id = self.resolve_state_id(
-                state_text=extracted.get("state_text"),
+                state_text=extracted.get("state"),
                 state_abbr=extracted.get("state_abbr"),
             )
             project_name = (

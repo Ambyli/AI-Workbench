@@ -1,5 +1,5 @@
 {
-  "$comment": "Request/response JSON Schemas (draft 2020-12) for roofix.postman_collection.json, rendered into its items' descriptions and ROOFIX_SCHEMAS.md (linked from ROOFIX.md). Edit here, then: uv run --no-sync python scripts/api_schemas.py render. Hand-written from app.py and the record it returns (components/orchestrator.py: parser.ParsedEvent.as_dict(), brain.Decision.as_dict(), the scrape's ExtractedProposal fields in constants.EXTRACTED_PAYLOAD_FIELDS); checked by unit-tests/apidocs only (ai/roofix/tests does not exercise HTTP). Schemas only: no value here comes from real mail.",
+  "$comment": "Request/response JSON Schemas (draft 2020-12) for roofix.postman_collection.json, rendered into its items' descriptions and ROOFIX_SCHEMAS.md (linked from ROOFIX.md). Edit here, then: uv run --no-sync python scripts/api_schemas.py render. Hand-written from app.py and the record it returns (components/orchestrator.py: parser.ParsedEvent.as_dict(), brain.Decision.as_dict(), the scrape's ExtractedProposal fields in constants.EXTRACTED_PAYLOAD_FIELDS); checked by unit-tests/apidocs; ai/roofix/tests/test_extracted_payload.py and test_execute.py validate real pipeline records (event, decision, extracted payload) and GET /status bodies against it, without HTTP. Schemas only: no value here comes from real mail.",
   "service": "roofix",
   "doc": "ROOFIX.md",
   "$defs": {
@@ -115,12 +115,11 @@
     "extracted_payload": {
       "type": "object",
       "additionalProperties": false,
-      "description": "`constants.EXTRACTED_PAYLOAD_FIELDS` read off the scrape's ExtractedProposal with getattr(..., None): what create_project hands to Phoenix",
+      "description": "`constants.EXTRACTED_PAYLOAD_FIELDS`: those fields of the scrape's ExtractedProposal, under the same names (`acceptance_signals` as a plain object), what create_project hands to Phoenix's ensure_entity_and_project",
       "required": [
         "roofix_id",
         "is_accepted",
         "display_text",
-        "customer_name",
         "full_name",
         "first_name",
         "last_name",
@@ -128,16 +127,14 @@
         "phone",
         "street_address",
         "city",
-        "state_text",
+        "state",
         "state_abbr",
         "zip_code",
-        "contract_price",
+        "homeowner_ref",
         "actual_contract_price",
         "funding_type",
         "trade",
         "job_status",
-        "hic_status",
-        "hic_signature_present",
         "acceptance_signals",
         "error"
       ],
@@ -151,10 +148,6 @@
         "display_text": {
           "$ref": "#/$defs/nullable_string",
           "description": "\"Name - Address\" combined"
-        },
-        "customer_name": {
-          "type": "null",
-          "description": "Always null: ExtractedProposal has no such field (the name is `full_name`)"
         },
         "full_name": {
           "$ref": "#/$defs/nullable_string"
@@ -177,9 +170,9 @@
         "city": {
           "$ref": "#/$defs/nullable_string"
         },
-        "state_text": {
-          "type": "null",
-          "description": "Always null: ExtractedProposal's field is `state`"
+        "state": {
+          "$ref": "#/$defs/nullable_string",
+          "description": "The state's name, e.g. `Ohio`: Phoenix resolves `state_abbr` first, then this"
         },
         "state_abbr": {
           "$ref": "#/$defs/nullable_string"
@@ -187,9 +180,9 @@
         "zip_code": {
           "$ref": "#/$defs/nullable_string"
         },
-        "contract_price": {
-          "type": "null",
-          "description": "Always null: ExtractedProposal has `estimated_price` and `actual_contract_price`"
+        "homeowner_ref": {
+          "$ref": "#/$defs/nullable_string",
+          "description": "The Roofix homeowner's Bubble id: a new Phoenix entity's `migration_external_id` and a new project's `migration_entity_id`"
         },
         "actual_contract_price": {
           "type": [
@@ -205,14 +198,6 @@
         },
         "job_status": {
           "$ref": "#/$defs/nullable_string"
-        },
-        "hic_status": {
-          "type": "null",
-          "description": "Always null: ExtractedProposal has no such field"
-        },
-        "hic_signature_present": {
-          "type": "null",
-          "description": "Always null: the signal lives in `acceptance_signals`"
         },
         "acceptance_signals": {
           "$ref": "#/$defs/acceptance_signals"
@@ -334,7 +319,7 @@
       ],
       "properties": {
         "action": {
-          "description": "update_chatter | update_milestone | create_project | noop_project_exists | escalate | ignore from the rules; the AI fallback may name another (then it is logged as not enabled and retried next tick)"
+          "description": "update_chatter | update_milestone | create_project | noop_project_exists | escalate | ignore from the rules; the AI fallback may name another (then it is logged as not enabled and retried next tick). With `needs_human` true the escalation branch runs whatever the action"
         },
         "event_type": {
           "type": "string"
@@ -350,7 +335,7 @@
         },
         "needs_human": {
           "type": "boolean",
-          "description": "True: surfaced for a human (escalation)"
+          "description": "True: surfaced for a human (escalated, whatever the `action`)"
         },
         "source": {
           "enum": [
@@ -365,7 +350,11 @@
         },
         "_forwarded": {
           "type": "boolean",
-          "description": "Present when the escalation branch ran (needs_human): whether the email was forwarded to ESCALATION_RECIPIENTS (true: marked read; false: left unread)"
+          "description": "Present when the escalation branch ran (`action` escalate, or `needs_human` true): whether the email was forwarded to ESCALATION_RECIPIENTS (true: marked read; false: left unread)"
+        },
+        "_phoenix_write_ok": {
+          "type": "boolean",
+          "description": "Present when a Phoenix write ran (update_chatter; update_milestone with a mapping; an accepted create_project's ensure_entity_and_project): its `ok` -- a DRY_RUN write is true. Each false one is counted in GET /status `phoenix_write_failures`"
         }
       },
       "if": {
@@ -577,8 +566,9 @@
                 "description": "Decisions with needs_human or action escalate"
               },
               "phoenix_write_failures": {
-                "const": 0,
-                "description": "Never incremented by the code: always 0"
+                "type": "integer",
+                "minimum": 0,
+                "description": "Decisions whose Phoenix write returned ok=false, once per event: a DB error, PHOENIX_AGENT_USER_ID unset, a mapped milestone block name that does not resolve to one process block, an ambiguous entity / project match on create_project. A DRY_RUN write succeeds, and a milestone event with no mapping writes nothing: neither is counted"
               },
               "dry_run": {
                 "type": "boolean",

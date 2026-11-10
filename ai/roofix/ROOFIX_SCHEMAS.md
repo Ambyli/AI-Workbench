@@ -64,7 +64,11 @@ Response `200` (`application/json`) — the in-memory tick counters (they reset 
       "minimum": 0,
       "description": "Decisions with needs_human or action escalate"
     },
-    "phoenix_write_failures": {"const": 0, "description": "Never incremented by the code: always 0"},
+    "phoenix_write_failures": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Decisions whose Phoenix write returned ok=false, once per event: a DB error, PHOENIX_AGENT_USER_ID unset, a mapped milestone block name that does not resolve to one process block, an ambiguous entity / project match on create_project. A DRY_RUN write succeeds, and a milestone event with no mapping writes nothing: neither is counted"
+    },
     "dry_run": {
       "type": "boolean",
       "description": "The effective DRY_RUN (default true): check it before /tick"
@@ -226,7 +230,6 @@ Response `200` (`application/json`) — `{records, count}`, or `{error, records:
                       "roofix_id",
                       "is_accepted",
                       "display_text",
-                      "customer_name",
                       "full_name",
                       "first_name",
                       "last_name",
@@ -234,16 +237,14 @@ Response `200` (`application/json`) — `{records, count}`, or `{error, records:
                       "phone",
                       "street_address",
                       "city",
-                      "state_text",
+                      "state",
                       "state_abbr",
                       "zip_code",
-                      "contract_price",
+                      "homeowner_ref",
                       "actual_contract_price",
                       "funding_type",
                       "trade",
                       "job_status",
-                      "hic_status",
-                      "hic_signature_present",
                       "acceptance_signals",
                       "error"
                     ],
@@ -254,10 +255,6 @@ Response `200` (`application/json`) — `{records, count}`, or `{error, records:
                         "type": ["string", "null"],
                         "description": "\"Name - Address\" combined"
                       },
-                      "customer_name": {
-                        "type": "null",
-                        "description": "Always null: ExtractedProposal has no such field (the name is `full_name`)"
-                      },
                       "full_name": {"type": ["string", "null"]},
                       "first_name": {"type": ["string", "null"]},
                       "last_name": {"type": ["string", "null"]},
@@ -265,28 +262,20 @@ Response `200` (`application/json`) — `{records, count}`, or `{error, records:
                       "phone": {"type": ["string", "null"]},
                       "street_address": {"type": ["string", "null"]},
                       "city": {"type": ["string", "null"]},
-                      "state_text": {
-                        "type": "null",
-                        "description": "Always null: ExtractedProposal's field is `state`"
+                      "state": {
+                        "type": ["string", "null"],
+                        "description": "The state's name, e.g. `Ohio`: Phoenix resolves `state_abbr` first, then this"
                       },
                       "state_abbr": {"type": ["string", "null"]},
                       "zip_code": {"type": ["string", "null"]},
-                      "contract_price": {
-                        "type": "null",
-                        "description": "Always null: ExtractedProposal has `estimated_price` and `actual_contract_price`"
+                      "homeowner_ref": {
+                        "type": ["string", "null"],
+                        "description": "The Roofix homeowner's Bubble id: a new Phoenix entity's `migration_external_id` and a new project's `migration_entity_id`"
                       },
                       "actual_contract_price": {"type": ["number", "null"]},
                       "funding_type": {"type": ["string", "null"]},
                       "trade": {"type": ["string", "null"]},
                       "job_status": {"type": ["string", "null"]},
-                      "hic_status": {
-                        "type": "null",
-                        "description": "Always null: ExtractedProposal has no such field"
-                      },
-                      "hic_signature_present": {
-                        "type": "null",
-                        "description": "Always null: the signal lives in `acceptance_signals`"
-                      },
                       "acceptance_signals": {
                         "type": "object",
                         "additionalProperties": false,
@@ -334,7 +323,7 @@ Response `200` (`application/json`) — `{records, count}`, or `{error, records:
                 ],
                 "properties": {
                   "action": {
-                    "description": "update_chatter | update_milestone | create_project | noop_project_exists | escalate | ignore from the rules; the AI fallback may name another (then it is logged as not enabled and retried next tick)"
+                    "description": "update_chatter | update_milestone | create_project | noop_project_exists | escalate | ignore from the rules; the AI fallback may name another (then it is logged as not enabled and retried next tick). With `needs_human` true the escalation branch runs whatever the action"
                   },
                   "event_type": {"type": "string"},
                   "target": {
@@ -346,7 +335,7 @@ Response `200` (`application/json`) — `{records, count}`, or `{error, records:
                   "reasoning": {"description": "Why: read during the watch period"},
                   "needs_human": {
                     "type": "boolean",
-                    "description": "True: surfaced for a human (escalation)"
+                    "description": "True: surfaced for a human (escalated, whatever the `action`)"
                   },
                   "source": {"enum": ["rule", "ai"], "description": "Who decided"},
                   "message_id": {
@@ -355,7 +344,11 @@ Response `200` (`application/json`) — `{records, count}`, or `{error, records:
                   },
                   "_forwarded": {
                     "type": "boolean",
-                    "description": "Present when the escalation branch ran (needs_human): whether the email was forwarded to ESCALATION_RECIPIENTS (true: marked read; false: left unread)"
+                    "description": "Present when the escalation branch ran (`action` escalate, or `needs_human` true): whether the email was forwarded to ESCALATION_RECIPIENTS (true: marked read; false: left unread)"
+                  },
+                  "_phoenix_write_ok": {
+                    "type": "boolean",
+                    "description": "Present when a Phoenix write ran (update_chatter; update_milestone with a mapping; an accepted create_project's ensure_entity_and_project): its `ok` -- a DRY_RUN write is true. Each false one is counted in GET /status `phoenix_write_failures`"
                   }
                 },
                 "if": {
@@ -516,7 +509,6 @@ Response `200` (`application/json`) — `{records, count}`, or `{error, records:
                       "roofix_id",
                       "is_accepted",
                       "display_text",
-                      "customer_name",
                       "full_name",
                       "first_name",
                       "last_name",
@@ -524,16 +516,14 @@ Response `200` (`application/json`) — `{records, count}`, or `{error, records:
                       "phone",
                       "street_address",
                       "city",
-                      "state_text",
+                      "state",
                       "state_abbr",
                       "zip_code",
-                      "contract_price",
+                      "homeowner_ref",
                       "actual_contract_price",
                       "funding_type",
                       "trade",
                       "job_status",
-                      "hic_status",
-                      "hic_signature_present",
                       "acceptance_signals",
                       "error"
                     ],
@@ -544,10 +534,6 @@ Response `200` (`application/json`) — `{records, count}`, or `{error, records:
                         "type": ["string", "null"],
                         "description": "\"Name - Address\" combined"
                       },
-                      "customer_name": {
-                        "type": "null",
-                        "description": "Always null: ExtractedProposal has no such field (the name is `full_name`)"
-                      },
                       "full_name": {"type": ["string", "null"]},
                       "first_name": {"type": ["string", "null"]},
                       "last_name": {"type": ["string", "null"]},
@@ -555,28 +541,20 @@ Response `200` (`application/json`) — `{records, count}`, or `{error, records:
                       "phone": {"type": ["string", "null"]},
                       "street_address": {"type": ["string", "null"]},
                       "city": {"type": ["string", "null"]},
-                      "state_text": {
-                        "type": "null",
-                        "description": "Always null: ExtractedProposal's field is `state`"
+                      "state": {
+                        "type": ["string", "null"],
+                        "description": "The state's name, e.g. `Ohio`: Phoenix resolves `state_abbr` first, then this"
                       },
                       "state_abbr": {"type": ["string", "null"]},
                       "zip_code": {"type": ["string", "null"]},
-                      "contract_price": {
-                        "type": "null",
-                        "description": "Always null: ExtractedProposal has `estimated_price` and `actual_contract_price`"
+                      "homeowner_ref": {
+                        "type": ["string", "null"],
+                        "description": "The Roofix homeowner's Bubble id: a new Phoenix entity's `migration_external_id` and a new project's `migration_entity_id`"
                       },
                       "actual_contract_price": {"type": ["number", "null"]},
                       "funding_type": {"type": ["string", "null"]},
                       "trade": {"type": ["string", "null"]},
                       "job_status": {"type": ["string", "null"]},
-                      "hic_status": {
-                        "type": "null",
-                        "description": "Always null: ExtractedProposal has no such field"
-                      },
-                      "hic_signature_present": {
-                        "type": "null",
-                        "description": "Always null: the signal lives in `acceptance_signals`"
-                      },
                       "acceptance_signals": {
                         "type": "object",
                         "additionalProperties": false,
@@ -624,7 +602,7 @@ Response `200` (`application/json`) — `{records, count}`, or `{error, records:
                 ],
                 "properties": {
                   "action": {
-                    "description": "update_chatter | update_milestone | create_project | noop_project_exists | escalate | ignore from the rules; the AI fallback may name another (then it is logged as not enabled and retried next tick)"
+                    "description": "update_chatter | update_milestone | create_project | noop_project_exists | escalate | ignore from the rules; the AI fallback may name another (then it is logged as not enabled and retried next tick). With `needs_human` true the escalation branch runs whatever the action"
                   },
                   "event_type": {"type": "string"},
                   "target": {
@@ -636,7 +614,7 @@ Response `200` (`application/json`) — `{records, count}`, or `{error, records:
                   "reasoning": {"description": "Why: read during the watch period"},
                   "needs_human": {
                     "type": "boolean",
-                    "description": "True: surfaced for a human (escalation)"
+                    "description": "True: surfaced for a human (escalated, whatever the `action`)"
                   },
                   "source": {"enum": ["rule", "ai"], "description": "Who decided"},
                   "message_id": {
@@ -645,7 +623,11 @@ Response `200` (`application/json`) — `{records, count}`, or `{error, records:
                   },
                   "_forwarded": {
                     "type": "boolean",
-                    "description": "Present when the escalation branch ran (needs_human): whether the email was forwarded to ESCALATION_RECIPIENTS (true: marked read; false: left unread)"
+                    "description": "Present when the escalation branch ran (`action` escalate, or `needs_human` true): whether the email was forwarded to ESCALATION_RECIPIENTS (true: marked read; false: left unread)"
+                  },
+                  "_phoenix_write_ok": {
+                    "type": "boolean",
+                    "description": "Present when a Phoenix write ran (update_chatter; update_milestone with a mapping; an accepted create_project's ensure_entity_and_project): its `ok` -- a DRY_RUN write is true. Each false one is counted in GET /status `phoenix_write_failures`"
                   }
                 },
                 "if": {

@@ -15,8 +15,9 @@ collection body, the rendered copies -- are ``unit-tests/apidocs``).
     fake detector family is put in its place, so every request runs the real
     parsing, decode, grouping and ``build_response``:
 
-    * ``/health`` loaded (200) and not loaded (503, with and without a loader
-      error); ``/metrics``;
+    * ``/health`` loaded (200) and after a failed load (503 -- the only way
+      it is served unloaded: the lifespan loads before uvicorn accepts a
+      connection); ``/metrics``;
     * ``POST /detect`` -- multipart, JSON base64 and JSON URL (the fetch
       replaced; the SSRF check is not), every collection body, and the
       errors, which must be the generic ``{"detail": "<str>"}``;
@@ -202,10 +203,10 @@ def test_health_and_metrics(schema_file, app_module, monkeypatch):
     assert check(schema_file, "GET", "/health", client.get("/health"))["loaded"] is True
     monkeypatch.setattr(app_module, "_detector", None)
     monkeypatch.setattr(app_module, "_load_error", "NotImplementedError: Grounding DINO is not implemented")
-    assert check(schema_file, "GET", "/health", client.get("/health"))["status"] == "degraded"
-    monkeypatch.setattr(app_module, "_load_error", None)
-    assert check(schema_file, "GET", "/health", client.get("/health"))["error"] is None
-    assert client.get("/health").status_code == 503
+    degraded = client.get("/health")
+    assert degraded.status_code == 503
+    body = check(schema_file, "GET", "/health", degraded)
+    assert body["status"] == "degraded" and body["error"].startswith("NotImplementedError: ")
     check(schema_file, "GET", "/metrics", client.get("/metrics"))
     RAN.add("health")
 
@@ -301,9 +302,12 @@ def test_mcp_tools(schema_file, loaded, monkeypatch):
             ok = check_mcp(schema_file, "MCP detect_objects", _wire(await client.call_tool_mcp(
                 "detect_objects", {"image": image, "labels": ["tree", "house", "car"], "max_per_label": 1})))
             assert "detections" not in ok and ok["by_label"]["car"] == []
-            bad_labels = check_mcp(schema_file, "MCP detect_objects", _wire(await client.call_tool_mcp(
-                "detect_objects", {"image": image, "labels": [" "]})))
-            assert set(bad_labels) == {"error"}
+            # Bad arguments: the same 400 POST /detect gives them.
+            for bad in ({"labels": [" "]}, {"labels": ["tree"], "threshold": 2},
+                        {"labels": ["tree"], "max_per_label": 0}):
+                refused = check_mcp(schema_file, "MCP detect_objects", _wire(await client.call_tool_mcp(
+                    "detect_objects", {"image": image, **bad})))
+                assert set(refused) == {"error", "status"} and refused["status"] == 400, (bad, refused)
             blocked = check_mcp(schema_file, "MCP detect_objects", _wire(await client.call_tool_mcp(
                 "detect_objects", {"image": "http://127.0.0.1/roof.jpg", "labels": ["tree"]})))
             assert blocked["status"] == 400

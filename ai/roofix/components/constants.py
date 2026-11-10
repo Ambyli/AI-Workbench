@@ -180,14 +180,21 @@ ESTIMATE_TYPE = "custom.estimate1"
 
 
 # ── Orchestrator: extracted-proposal payload whitelist ─────────────────────
-# Fields the orchestrator forwards from ExtractedProposal into the payload it
-# hands ``phoenix.ensure_entity_and_project``. Kept exhaustive so downstream
-# gets everything the extractor produced — Phoenix ignores keys it doesn't use.
+# The ExtractedProposal attributes the orchestrator copies, under the SAME
+# names, into the ``_extracted_payload`` dict it hands
+# ``phoenix.ensure_entity_and_project`` (and returns in /tick's records).
+# Every name must be an ExtractedProposal field -- a name it lacks is silently
+# null (tests/test_extracted_payload.py checks both directions). Consumers:
+#   * ensure_entity_and_project reads roofix_id, display_text, full_name,
+#     first_name, last_name, email, phone, street_address, city, state,
+#     state_abbr, zip_code, homeowner_ref;
+#   * the orchestrator's create_project branch reads roofix_id, is_accepted;
+#   * the rest is audit context (the /tick response, the AI fallback's
+#     prompt, which json-dumps the event).
 EXTRACTED_PAYLOAD_FIELDS = (
     "roofix_id",
     "is_accepted",
     "display_text",
-    "customer_name",
     "full_name",
     "first_name",
     "last_name",
@@ -195,16 +202,14 @@ EXTRACTED_PAYLOAD_FIELDS = (
     "phone",
     "street_address",
     "city",
-    "state_text",
+    "state",
     "state_abbr",
     "zip_code",
-    "contract_price",
+    "homeowner_ref",
     "actual_contract_price",
     "funding_type",
     "trade",
     "job_status",
-    "hic_status",
-    "hic_signature_present",
     "acceptance_signals",
     "error",
 )

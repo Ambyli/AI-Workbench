@@ -43,7 +43,7 @@ Response `200` (`application/json`) — the weights are loaded:
 }
 ```
 
-Response `503` (`application/json`) — the weights are not resident: a failed model load (a bad DETECTOR_MODEL, a Grounding DINO id, no disk):
+Response `503` (`application/json`) — the weights are not resident, which only follows a failed model load (a bad DETECTOR_MODEL, a Grounding DINO id, no disk): the lifespan loads the weights before uvicorn accepts a connection, so during the first-start load there is no answer at all (the edge answers its own 503 + Retry-After):
 
 ```json
 {
@@ -71,10 +71,7 @@ Response `503` (`application/json`) — the weights are not resident: a failed m
       "description": "DETECTOR_DEVICE as configured; `device` falls back to `cpu` when torch sees no GPU"
     },
     "loaded": {"const": false},
-    "error": {
-      "type": ["string", "null"],
-      "description": "The loader's error, `<ExceptionType>: <message>`"
-    },
+    "error": {"type": "string", "description": "The loader's error, `<ExceptionType>: <message>`"},
     "default_threshold": {"type": "number", "description": "DETECTOR_DEFAULT_THRESHOLD"},
     "max_image_side": {"type": "integer", "minimum": 64, "description": "DETECTOR_MAX_IMAGE_SIDE"},
     "max_labels": {"type": "integer", "minimum": 1, "description": "DETECTOR_MAX_LABELS"}
@@ -495,13 +492,13 @@ Result (`result.structuredContent`):
           {
             "type": "object",
             "additionalProperties": false,
-            "required": ["error"],
+            "required": ["error", "status"],
             "description": "Errors are returned as data, not as a JSON-RPC error",
             "properties": {
               "error": {"type": "string"},
               "status": {
                 "enum": [400, 502, 503],
-                "description": "The status the same failure gets on POST /detect; absent for a bad `labels` / `threshold` / `max_per_label`"
+                "description": "The status the same failure gets on POST /detect: 400 for bad `labels` / `threshold` / `max_per_label`, a blocked URL or an undecodable / too small / unsupported image; 502 an image URL that could not be fetched; 503 the model is not loaded"
               }
             }
           }

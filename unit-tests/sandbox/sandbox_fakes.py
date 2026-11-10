@@ -116,8 +116,21 @@ class FakeContainer:
 
     def get_archive(self, path):
         self.get_archive_calls.append(path)
-        rel = path[len("/app/"):]
         buf = io.BytesIO()
+        if path.rstrip("/") == "/app":
+            # The whole tree, rooted at `app/` like Docker's archive of a
+            # directory (the listing in get_files, the source download).
+            with tarfile.open(fileobj=buf, mode="w") as tar:
+                for name in ["", *sorted(self.dirs)]:
+                    info = tarfile.TarInfo(posixpath.join("app", name).rstrip("/"))
+                    info.type = tarfile.DIRTYPE
+                    tar.addfile(info)
+                for name, data in sorted(self.files.items()):
+                    info = tarfile.TarInfo(f"app/{name}")
+                    info.size = len(data)
+                    tar.addfile(info, io.BytesIO(data))
+            return iter([buf.getvalue()]), {"name": "app", "mode": _GO_MODE_DIR | 0o755}
+        rel = path[len("/app/"):]
         if rel in self.dirs:
             with tarfile.open(fileobj=buf, mode="w") as tar:
                 info = tarfile.TarInfo(posixpath.basename(rel))

@@ -931,3 +931,9 @@ uv run cdp-spy --url https://roofix.io/project/abc123 --profile-dir C:\data\prof
 - `login_actions` handle a plain form login only — one attempt per capture, no verification codes / MFA / CAPTCHA, and (because the form has to be in the top document) not a login form inside an iframe.
 - No MCP-side cancellation — cancel is HTTP-only. An LLM cannot reclaim a stuck capture it started; that's an operator's job.
 - Screenshots are action steps only — at most 10 per request, none in `login_actions`, none after the actions finish (put the last one at the end of `actions`) — and there is no element-level clipping. Viewport is fixed at the headless `1920×1080` window; full-page height is clamped to `max_height` (≤ 16384).
+
+<!-- api-schemas:begin -->
+## Request and response schemas
+
+Every endpoint's request and response JSON Schemas: [`INTERCEPTOR_SCHEMAS.md`](INTERCEPTOR_SCHEMAS.md), generated from [`interceptor.schemas.json`](interceptor.schemas.json) by `scripts/api_schemas.py render`.
+<!-- api-schemas:end -->

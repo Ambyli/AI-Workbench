@@ -89,6 +89,7 @@ TEXT_RESULT = ResultSpec(
         "min_count": FieldSpec("Hits required to PASS", "integer", stable=True),
         "fuzzy_threshold": FieldSpec(
             "Similarity a fuzzy window must reach; null for other modes", "number", stable=True,
+            nullable=True,
         ),
         "text_source": FieldSpec(
             "native | ocr | none — or `mixed` when summed across members that differ",

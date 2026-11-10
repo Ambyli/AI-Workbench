@@ -153,7 +153,7 @@ LLM_RESULT = ResultSpec(
         "metric": METRIC_FIELD,
         "value": FieldSpec(
             "The model's score, 1-10 — null for a `score: false` criterion, whose "
-            "judgement is not reported", "number",
+            "judgement is not reported", "number", nullable=True,
         ),
         "hint": FieldSpec("The rubric the model was asked to use", "string", stable=True),
         "model": FieldSpec(
@@ -176,7 +176,7 @@ LLM_RESULT = ResultSpec(
             "unresolved: [{values, mass}], samples: null | {asked, answered, agreement, "
             "stated_mean}, note}` — the distribution keys are null when source is "
             "`stated`; the whole block is null for a `score: false` criterion",
-            "object",
+            "object", nullable=True,
         ),
         "reference": REFERENCE_FIELD,
         "aggregate": AGGREGATE_FIELD,

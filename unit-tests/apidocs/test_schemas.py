@@ -52,12 +52,9 @@ SCHEMA_FILES = sorted(ROOT.glob(f"ai/*/*{schemas.SUFFIX}"))
 # rollout). Checks 1 and 4 skip them; test_pending_only_shrinks fails once
 # one is complete. Delete the set (and that test) when it is empty.
 PENDING = {
-    "classifier",
-    "interceptor",
     "litellm",
     "llama",
     "open-terminal",
-    "sandbox-runner",
     "searxng",
     "supabase",
     "vllm",

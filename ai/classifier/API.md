@@ -3642,7 +3642,13 @@ Each type also carries **`result`**, the shape of the `detail` it returns:
 `metric_from` says where the headline number lives: `detail` (the `metric`
 names a detail key), `measurements` (a `cv` measurement; its keys per detector
 in `GET /cv-detectors`) or `score` (the `llm` score). A field without `when`
-is always present; `stable` marks what survives a `mean` aggregate.
+is always present; `stable` marks what survives a `mean` aggregate;
+`nullable` marks a value that may be `null` (the llm `value` and `confidence`
+under `score: false`, the text `fuzzy_threshold` outside `fuzzy` mode).
+`kind` is one of `number`, `integer`, `string`, `boolean`, `array`, `object`
+(`analysis.result_specs.KINDS`, checked where a field is declared) — the
+`detail` schemas in `classifier.schemas.json` are generated from these
+declarations.
 `aggregate_detail` describes the block every aggregated `detail` gains. See
 [§ Result details](#result-details--the-same-shape-on-every-type).
 
@@ -4514,3 +4520,9 @@ TEST_POSTGRES_DSN=postgresql://postgres@localhost:55439/postgres \
   conftest puts `ai/classifier` on `sys.path`.
 - Use `--no-sync`: `uv sync --package classifier` prunes the shared workspace
   venv to the classifier's dependencies.
+
+<!-- api-schemas:begin -->
+## Request and response schemas
+
+Every endpoint's request and response JSON Schemas: [`API_SCHEMAS.md`](API_SCHEMAS.md), generated from [`classifier.schemas.json`](classifier.schemas.json) by `scripts/api_schemas.py render`.
+<!-- api-schemas:end -->

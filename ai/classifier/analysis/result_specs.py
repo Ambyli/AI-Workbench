@@ -58,14 +58,26 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 
+# The JSON kinds a field may declare. Each is a JSON Schema type: the
+# `detail` schemas in classifier.schemas.json are generated from these
+# declarations (common.apidocs.generate.from_result_spec), so a kind outside
+# this set is refused where it is declared rather than at generation.
+KINDS = frozenset({"number", "integer", "string", "boolean", "array", "object"})
+
+
 @dataclass(frozen=True)
 class FieldSpec:
     """One ``detail`` key."""
 
     description: str
-    kind: str                       # JSON kind: number | integer | string | boolean | array | object
+    kind: str                       # JSON kind, one of KINDS
     stable: bool = False            # same meaning on every member → kept under `mean`
     when: Optional[str] = None      # present only in this case; None = always present
+    nullable: bool = False          # the value may be null (the description says when)
+
+    def __post_init__(self) -> None:
+        if self.kind not in KINDS:
+            raise ValueError(f"unknown kind {self.kind!r}; expected one of {sorted(KINDS)}")
 
 
 @dataclass(frozen=True)
@@ -99,6 +111,7 @@ class ResultSpec:
                     "description": f.description,
                     **({"when": f.when} if f.when else {}),
                     **({"stable": True} if f.stable else {}),
+                    **({"nullable": True} if f.nullable else {}),
                 }
                 for key, f in self.fields.items()
             },

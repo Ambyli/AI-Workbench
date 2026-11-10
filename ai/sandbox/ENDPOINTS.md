@@ -1055,3 +1055,9 @@ Called out here so operators don't hunt for endpoints that don't exist.
 - **No auth on any endpoint.** Access control is enforced at the network level (`sandbox-runner` is only reachable on `ai_shared`) and at LiteLLM (for the pass-through routes).
 - **No idle-TTL polling.** The reaper enforces `SANDBOX_HARD_TTL_SECONDS` only; `SANDBOX_DEFAULT_TTL_SECONDS` is recorded on the job row but not acted on. See [SANDBOX.md § Tearing down a stuck sandbox](SANDBOX.md#tearing-down-a-stuck-sandbox).
 - **No pagination on `/jobs`.** Fixed limit of 20 in the registry; add a `limit` query param and thread it through `list_all()` if you need more.
+
+<!-- api-schemas:begin -->
+## Request and response schemas
+
+Every endpoint's request and response JSON Schemas: [`ENDPOINTS_SCHEMAS.md`](ENDPOINTS_SCHEMAS.md), generated from [`sandbox-runner.schemas.json`](sandbox-runner.schemas.json) by `scripts/api_schemas.py render`.
+<!-- api-schemas:end -->

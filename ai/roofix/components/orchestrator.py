@@ -619,6 +619,23 @@ async def _execute(
                 )
                 return
 
+            # Deterministic policy gate for high-impact Phoenix writes:
+            # allow only rule-sourced decisions or explicitly human-approved ones.
+            decision_source = str(decision.get("source", "")).strip().lower()
+            human_approved = bool(decision.get("human_approved"))
+            allow_phoenix_write = (decision_source == "rule") or human_approved
+            if not allow_phoenix_write:
+                decision["_phoenix_write_ok"] = False
+                log.log(
+                    "orchestrator",
+                    action,
+                    False,
+                    "policy denied phoenix write (requires source=rule or human_approved=true)",
+                    event_type=etype,
+                    project_ref=pref,
+                )
+                return
+
             # Hand the full extracted proposal dict straight to Phoenix — it
             # reads whichever fields it needs (name, address, contract price,
             # etc.) and ignores keys it doesn't care about.

@@ -102,10 +102,11 @@ def translate(text: str, target_lang: str) -> str:
         r.raise_for_status()
         return r.json()["translated"]
     except httpx.HTTPError as exc:
-        # A 4xx from madlad-app (an unknown target_lang) says what to fix:
-        # relay its detail; unreachable / 5xx keeps httpx's own message.
-        status, detail = _app_error(exc)
-        return f"Error translating: {detail if status != 502 else exc}"
+        # Do not expose upstream error text in MCP output; treat as untrusted.
+        status, _detail = _app_error(exc)
+        if 400 <= status < 500:
+            return "Error translating: invalid translation request parameters."
+        return "Error translating: upstream translation service unavailable."
 
 
 app.mount("/mcp", mcp_app)
